@@ -1,7 +1,8 @@
 # M0146-0014 — parity-closure sweep
 
-Status: open (the milestone's exit report). Sweep M0146-0014a done
-2026-10-09.
+Status: held [!] 2026-10-13 on the S4 lineage budget (the milestone's exit
+report; sweeps 0014a–d done, the last on 2026-10-13). Five findings from
+0014d (F1–F5) wait unfiled in the task's escalation for the owner.
 
 ## Purpose
 
@@ -100,6 +101,45 @@ records at HEAD `1fd148e3a`:
 - **Route counts:** B8 32, COSTTIE 30, RELPAGES 16, B-15 7,
   RENDERING 5, PARAM-APPEND 2, GEQO-RNG 2, INCSORT-ROWS 2, and four
   single records.
+
+## 2026-10-13 (M0146-0014d)
+
+`analysis/m0146/m0146-0014/routing-20261013/ROUTING.md` covers 84
+records at code `7e6d8b13f`:
+
+| scale | match | divergent |
+|---|---|---|
+| SF0.25 | 70 | 29 |
+| SF1 | 44 | 55 |
+
+- **What changed since 0014c.** Two owner classes resolved: the probe
+  multiplier was retired (M0146-0159), and the descent and qual-op terms of
+  B-15 were ported (M0146-0172). Their records were re-analysed with the
+  moved and new ones: 13 SF0.25 records, in two plan-text passes.
+- **SF1 runs on a stale load.** The goopg SF1 cluster stores `char(n)`
+  unpadded and `numeric` as text (M0146-0172, M0146-0174).
+  - A record that diverges at SF1 only (28) is the owner residual
+    STALE-SF1, re-measured after the reload.
+  - A record shared with SF0.25 takes the SF0.25 route.
+- **Owner residuals:**
+  - COSTTIE 17;
+  - GEQO-RNG 1;
+  - RELPAGES 2: `item` is 1242 pages against PG's 1284 at SF0.25 (hio.c
+    bulk extension);
+  - ESTIMATE+RELPAGES 1;
+  - PARAM-APPEND 1;
+  - STALE-SF1 28.
+- **Rendering:** Q5 (Var deparse through an Append's SubqueryScan child)
+  and Q6 (a PARAM_EXEC printed as `$0`, where PG prints the referent) route
+  to M0146-0042.
+- **Recorded unfiled (S4 lineage hold on M0146-0014; see its escalation):**
+  - 0014d-F1, a correlated SubPlan conjunct applied unpriced above the
+    join (Q32, Q92). This is a regression since M0146-0130.
+  - 0014d-F2, a full Sort offered beside the Incremental Sort (Q60).
+  - 0014d-F3, the index-only-scan heap-fetch term and int4 index density
+    (Q24).
+  - 0014d-F4, a Hash Semi Join over a pulled subquery rel (Q70).
+  - 0014d-F5, a Parallel Append priced below its own child (Q76).
 
 ## Closing condition
 

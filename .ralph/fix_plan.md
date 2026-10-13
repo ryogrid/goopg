@@ -28577,13 +28577,61 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     Gather\. Both splices now peel only worker\-safe wrappers
     \(`wrapperRunsInWorkers`\)\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH parameterisation 3 -> 2, aggregation-strategy 2 -> 1, sort-strategy 2 -> 1, parallelism 5 -> 4 (Q17); TPC-DS Q10/Q35 plans change, counts unchanged
-- [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
+- [!] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above
   or presented to the owner as a named, measured, waived residual —
   "no unnamed first-divergence records" is the acceptance bar.
   Kind: recon
   Parent: none
+  > ## ESCALATION 2026\-10\-13 \(S4 lineage budget\) — M0146\-0014 held \[\!\]
+  > The last five completed descendants \(M0146\-0148, 0014c, 0149, 0150, 0014d\) all carry `Movement: none`\. The
+  > routing refreshes \(0014a–d\) are recons by construction; their movement lands in the tasks they file\.
+  > - **What was attempted / proved:** 0014d \(this loop\) routed all 84 first\-divergence records at code `7e6d8b13f`
+  >   \(SF0\.25 match 70, SF1 44\); every record has a live task or a named owner residual
+  >   \(`analysis/m0146/m0146\-0014/routing\-20261013/ROUTING\.md`\)\.
+  > - **Blocker:** the guard forbids filing the five new mechanism findings below as descendants\. They are recorded
+  >   here, unfiled, with their evidence; each is a TPC\-DS plan\-instrument task \(expected movement: SF0\.25 match\)\.
+  > - **Expected movement if re\-opened:** F1 Q32/Q92 \(both scales, a regression since M0146\-0130\), F2 Q60, F3 Q24,
+  >   F4 Q70 — up to \+5 SF0\.25 matches; F5 is a cost\-model correctness item\.
+  > - **Size:** each finding is a one\-to\-two\-loop slice\.
+  >
+  > Owner: re\-open \(or pin a LINEAGE\-BASELINE\) so F1–F5 can be filed under M0146\-0014, or place them elsewhere\.
+  >
+  > - **0014d\-F1 — a correlated SubPlan conjunct is applied unpriced above the join \(TPC\-DS Q32, Q92\)**: Since M0146\-0130 \(`a6905e365`\) the conjunct `ws\_ext\_discount\_amt > \(SubPlan 1\)` is not
+  >   in the \{web\_sales, item\} join restrictlist; goopg applies it as a top `Filter:` that no join path pays for\. Q92
+  >   SF0\.25 elects a nested loop at 2277\.04 = 2221\.05 \+ 160 x 0\.35, with no charge for 160 SubPlan calls at 138\.7 each\.
+  >   PG keeps it as the inner\-unique hash join\'s Join Filter, paid on 3 matched rows: 8941\.29\. Q32 has the same
+  >   fingerprint\. Before 0130 goopg had PG\'s shape for Q92 \(8994\.36\)\. Both scales\.
+  >   - PG: `distribute\_qual\_to\_rels` \(initsplan\.c\) places the clause at relids \{web\_sales, item\}; `cost\_qual\_eval`
+  >     charges the SubPlan\'s `per\_call\_cost` in `final\_cost\_hashjoin` / `final\_cost\_nestloop` \(costsize\.c\)\.
+  >   - First step: dump where Q92\'s conjunct is placed \(`correlatedScalarSublinkLeaf` / the seam choosing leaf, join
+  >     clause or top Filter\) and confirm it is missing from the \{item, web\_sales\} restrictlist; keep a two\-rel
+  >     correlated\-SubPlan conjunct as a join restrictinfo so every join path pays `joinQualEvalCost`\.
+  > - **0014d\-F2 — the ordered\-paths step offers a full Sort beside the Incremental Sort \(TPC\-DS Q60\)**: PG\'s `create\_ordered\_paths` \(planner\.c, the presorted\_keys arm\) adds only an
+  >   Incremental Sort when the input path has a non\-empty presorted prefix; goopg\'s `addOrderedPaths` also adds a full
+  >   Sort, which wins Q60 SF0\.25 by about 0\.6 \(0\.002%\)\.
+  >   - First step: in goopg\'s ordered\-paths arm skip the full\-Sort candidate for an input whose presorted prefix is
+  >     non\-empty, as PG does; re\-run the fire set \(Q4 may share the rule\)\.
+  > - **0014d\-F3 — index\-only\-scan heap\-fetch term and int4 index density \(TPC\-DS Q24\)**: Q24 SF0\.25 elects a Parallel Index Only Scan on `store\_returns\_pkey` \(1441\.32, no heap\-fetch I/O\)
+  >   where PG keeps a Parallel Seq Scan \(1653\.62\); PG\'s index\-only scan must carry \~212 more, i\.e\. heap fetches
+  >   \(`cost\_index` allvisfrac, costsize\.c\)\. Full index\-only scans on `item\_pkey` / `customer\_pkey` price \+101 / \+255
+  >   higher in PG\. Separately, goopg\'s int4 pkeys hold \~458 tuples per page, past PG\'s maximum for 16\-byte tuples
+  >   \(40 vs \~52 pages for item\_pkey\)\.
+  >   - First step: read\-only `relpages, relallvisible` for store\_returns, item, customer on :65438 \(tpcds025\) and a
+  >     private SF0\.25 clone; PG `SET enable\_seqscan=off; EXPLAIN SELECT sr\_item\_sk, sr\_ticket\_number FROM
+  >     store\_returns`; then decide whether goopg\'s relallvisible \(VACUUM VM accounting\) or the index density differs\.
+  > - **0014d\-F4 — a Hash Semi Join with a pulled subquery rel as the hashed inner \(TPC\-DS Q70\)**: PG elects `Hash Semi Join` \(38304\.53\) hashing the 2\-row `tmp1` subquery under the
+  >   main join\'s Gather; goopg elects a Nested Loop with tmp1 outer and a Materialize over the Gather \(38320\.63\)\. PG\'s
+  >   arm built from goopg\'s own inputs would cost \~38262, so goopg likely never generates it\. Both scales\.
+  >   - First step: instrument `addPath` on the joinrel \{store\_sales, d1, store, tmp1\} for Q70 SF0\.25 and list every hash
+  >     candidate; if none hashes tmp1, find the gate \(`hash\_inner\_and\_outer` JOIN\_SEMI, joinpath\.c\)\.
+  > - **0014d\-F5 — a Parallel Append is priced below its own first child \(TPC\-DS Q76\)**: Q76 SF0\.25: goopg\'s Parallel Append costs 14166\.13 over a first child of 17941\.59; PG\'s `cost\_append`
+  >   \(costsize\.c, parallel\-aware arm\) sums the partial children to 37614\.25\. The query totals are 15612 vs 39026\. It
+  >   does not decide Q76\'s first divergence but distorts any Append\-vs\-other choice\. Also seen: Q5\'s 2\-key Hash Right
+  >   Join adds \~4049 over its inputs where PG adds \~945 \(`approx\_tuple\_count` / inner\-unique\)\.
+  >   - First step: decompose goopg\'s Parallel Append cost for Q76 against PG\'s `cost\_append` partial arm \(per\-child
+  >     cost, parallel divisor, the non\-partial rule M0146\-0137 changed\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -28698,6 +28746,10 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 6 → 4 at both scales \(Q71
     \(`chaseKeyExprColumns`, gated by `keyExprReachesKeptScan`\)\.
     - Q54\'s three key lines now equal PG\'s; its `my\_customers` CTE naming remains\.
 Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54 keeps a record on my\_customers naming\)
+  - Routed 2026\-10\-13 by M0146\-0014d \(next slices\): TPC\-DS Q5 — a Var above an Append resolves at its first child
+    \(`Subquery Scan on "\*SELECT\* 2"`, ruleutils\.c set\_deparse\_plan / get\_variable\), where goopg descends into the
+    subquery; Q6 — a SubPlan\'s PARAM\_EXEC prints its referent \(`i\.i\_category`, find\_param\_referent\) where goopg
+    prints `$0`\. Both scales; `analysis/m0146/m0146\-0014/routing\-20261013/agent\-groupB\.md`\.
   - Slice 2026\-10\-08 \(`1745ad42f`\): key chases pass through a DISTINCT dedupe; a bitmap Recheck param
     renders as its Index Cond sibling\.
     - Q54\'s `my\_customers\.\*` now prints `customer\.\*`, and Q49\'s first key is `\(\'web\'::text\)`\.
@@ -32118,3 +32170,18 @@ Movement: none — recon — the two SF1 losses are stale\-load artefacts; SF0\.
   - Rank: below item 10 — regress\-only witness, no TPC query named \(S7 carve\-out\)\.
   - First step: skip the ordered producer for an index the restriction producer already built a clause path for
     \(the same rule `restrictionPathIsIndexOnly` applies to its index\-only twin\), then re\-run the fire set\.
+- [x] **M0146\-0014d — parity\-closure sweep: routing refresh 2026\-10\-13 \(TPC\-DS SF0\.25 \+ SF1\)** \(code `7e6d8b13f`;
+  M0146\-0014 stays open as the milestone\'s final exit report\)\.
+  Kind: recon
+  Parent: M0146-0014
+  - Done 2026\-10\-13: all 84 first\-divergence records \(SF0\.25 29, SF1 55; match 70 / 44\) route to a live task or a
+    named owner residual — `analysis/m0146/m0146\-0014/routing\-20261013/ROUTING\.md`\.
+    - The 13 SF0\.25 records whose earlier route closed or went stale \(B8 retired by M0146\-0159, B\-15 ported by
+      M0146\-0172\) were re\-analysed in two read\-only plan\-text passes \(`agent\-groupA\.md`, `agent\-groupB\.md`\)\.
+    - SF1\-only records \(28\) are the new owner residual STALE\-SF1: the stale load decides them \(M0146\-0174\); they
+      are re\-measured after the reload\.
+    - Owner residuals: COSTTIE 17, GEQO\-RNG 1, RELPAGES 2, ESTIMATE\+RELPAGES 1, PARAM\-APPEND 1 \(0005dp \[\!\]\),
+      STALE\-SF1 28\. Rendering Q5/Q6 route to M0146\-0042\.
+    - Five new mechanism findings \(F1–F5\) are recorded unfiled in M0146\-0014\'s S4 escalation \(lineage budget\)\.
+      Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md`\.
+Movement: none — recon
