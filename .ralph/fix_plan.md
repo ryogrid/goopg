@@ -25887,7 +25887,7 @@ M0146-0001 re-baseline census on the new default arm.
       and ignores the join\'s stamped `PlanRows` \(14 queries\)\. Filed
       M0146\-0009k\.
     Movement: none — recon
-- [ ] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [x] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
   Kind: impl
   Parent: M0146\-0005
@@ -25904,6 +25904,21 @@ M0146-0001 re-baseline census on the new default arm.
     subtree\) or a residual remains; first\-divergence record is PARAM\-APPEND, item\-3 rank via
     Parent: M0146\-0005\.
     STALE\-OK: M0146\-0049 \(re\-opened 2026\-10\-06; the real blocker is its open child 0049e, still cited here\)
+  - **VERIFIED 2026\-10\-14 — the premise is discharged\.** Evidence `analysis/m0146/m0146\-0005dp/`\.
+    - Q54 SF0\.25 now drives the item NL into PG\'s parameterised Append: a Bitmap Heap Scan on catalog\_sales
+      \(Bitmap Index Scan on catalog\_sales\_pkey\) and an Index Scan using web\_sales\_pkey, both keyed on
+      `item\.i\_item\_sk`\. The my\_customers subtree costs 6383\.84 against PG\'s 6537\.35 \(was 19832\)\.
+    - Q54 still diverges above that subtree\. PG joins the one\-row unique\-ified my\_customers to a Gather over
+      Parallel Hash Join\(store\_sales, date\_dim\) by a nested loop; goopg hashes my\_customers under a parallel
+      hash join with store\_sales and probes date\_dim last\.
+    - First divergence: goopg sizes `\{store\_sales, date\_dim\}` at 76335 rows, PG at 3441\. The date\_dim
+      filter `d\_month\_seq >= \(InitPlan 1\) AND d\_month\_seq <= \(InitPlan 2\)` gets 0\.111 \(two separate
+      DEFAULT\_INEQ\_SEL\) where PG pairs the bounds into DEFAULT\_RANGE\_INEQ\_SEL 0\.005\. goopg\'s
+      `rangeBoundOf` pairs a bound only against a literal Const; PG pairs any pseudo\-constant other side\.
+      Filed as M0146\-0184\.
+    - Rendering residual: the member Bitmap Heap Scan prints `Filter: \(cs\_item\_sk = item\.i\_item\_sk\)` where PG
+      prints `Recheck Cond:` — ledgered under M0146\-0042\.
+Movement: none — verification only: the premise was discharged by M0146-0049e (e75280c05); the remaining Q54 divergence is routed to M0146-0184
   - [x] **M0146\-0005dt — recon: what Q54\'s parameterised Append needs**
     \(2026\-10\-03\)\.
     Kind: recon
@@ -32706,3 +32721,19 @@ Movement: yes — match SF1 63 -> 64 (TPC-DS Q14), SF0.25 76 -> 76; CATEGORIES-E
   Kind: impl
   Parent: M0146-0014
   - First step: decompose the Hash Right Join's cost terms for Q5 SF0.25 against PG's `final_cost_hashjoin`.
+- [ ] **M0146-0184 — a range pair whose bounds are InitPlan params is not collapsed to DEFAULT_RANGE_INEQ_SEL (TPC-DS Q54)**
+  (filed 2026-10-14 by the M0146-0005dp verification). Q54 SF0.25: date_dim's `d_month_seq >= (InitPlan 1) AND
+  d_month_seq <= (InitPlan 2)` is estimated at 0.111 (two DEFAULT_INEQ_SEL factors) where PG's
+  `clauselist_selectivity` (clausesel.c) pairs the two bounds and returns DEFAULT_RANGE_INEQ_SEL 0.005. A bare
+  probe gives goopg 8117 rows vs PG 365 (`analysis/m0146/m0146-0005dp/range-initplan-probe.txt`). Downstream,
+  `{store_sales, date_dim}` is 76335 rows vs PG 3441, so goopg's Gather over the Parallel Hash Join (26608) loses
+  to the serial hash (24624) and PG's NL over the one-row my_customers never forms.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: `rangeBoundOf` (internal/optimizer/rangequery.go) pairs a bound only through
+    `normalizeColumnConstRange` (literal Const). PG's test is `is_pseudo_constant_clause_relids` on the other
+    operand (a Param, an InitPlan output, a stable expression over them) with `NumRelids == 1` on the clause;
+    widen the pairing to that and check the punt rule still fires (each bound is DEFAULT_INEQ_SEL for a
+    non-Const operand, scalarineqsel).
+  - Expected movement: TPC-DS Q54 first divergence (join-order / parallelism); check the other InitPlan-bounded
+    BETWEENs in the corpus (d_month_seq bands).

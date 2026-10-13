@@ -1,0 +1,25 @@
+# EXPLAIN SELECT d_date_sk FROM date_dim WHERE d_month_seq >= (SELECT 1200) AND d_month_seq <= (SELECT 1203)
+## goopg (SF0.25 private clone, stats refreshed)
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Gather  (cost=0.02..2663.07 rows=8116 width=4)
+   Workers Planned: 1
+   ->  Parallel Seq Scan on date_dim  (cost=0.02..2500.75 rows=8117 width=268)
+         Filter: ((d_month_seq >= (InitPlan 1).col1) AND (d_month_seq <= (InitPlan 2).col1))
+         InitPlan 1
+           ->  Result  (cost=0.00..0.01 rows=1 width=1)
+         InitPlan 2
+           ->  Result  (cost=0.00..0.01 rows=1 width=1)
+(8 rows)
+
+## PG 18.3 reference tpcds025
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Seq Scan on date_dim  (cost=0.02..2519.75 rows=365 width=4)
+   Filter: ((d_month_seq >= (InitPlan 1).col1) AND (d_month_seq <= (InitPlan 2).col1))
+   InitPlan 1
+     ->  Result  (cost=0.00..0.01 rows=1 width=4)
+   InitPlan 2
+     ->  Result  (cost=0.00..0.01 rows=1 width=4)
+(6 rows)
+

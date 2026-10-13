@@ -99,3 +99,24 @@ as **M0146-0049**, with M0146-0005dp marked `[!]` on it.
 - **TPC-H Q2** (M0145-0008y), through the M0146-0012 half.
 - **Measurement:** the fire set at both scales (`CATEGORIES-EXCL-MATCH`
   `parameterisation` / `join-method`, match), plus the sweep values gate.
+
+## Outcome (verified 2026-10-14, M0146-0005dp close)
+
+The expected Q54 movement happened. Evidence is in
+`analysis/m0146/m0146-0005dp/`.
+
+- At SF0.25, goopg drives the item nested loop into PG's parameterised
+  Append: a Bitmap Heap Scan on catalog_sales and an Index Scan using
+  web_sales_pkey, both keyed on `item.i_item_sk`.
+- The `my_customers` subtree costs 6383.84 against PG's 6537.35 (it was
+  19832).
+- Q54 still diverges above that subtree, for a statistics reason this
+  recon did not cover:
+  - goopg sizes `{store_sales, date_dim}` at 76335 rows, PG at 3441;
+  - the cause is the `d_month_seq` band bounded by two InitPlan outputs;
+  - goopg multiplies two DEFAULT_INEQ_SEL factors (0.111), where PG's
+    `clauselist_selectivity` collapses the pair to DEFAULT_RANGE_INEQ_SEL
+    (0.005);
+  - this is filed as M0146-0184.
+- The member Bitmap Heap Scan prints its probe clause as `Filter:` where
+  PG prints `Recheck Cond:`. This is a rendering gap under M0146-0042.
