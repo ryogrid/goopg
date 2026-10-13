@@ -1394,7 +1394,14 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			// Filter above the avg agg) marks a level PG may wall off
 			// (SubqueryScan v1 keeps the InitPlan inside): do not chase
 			// an Aggs-synth out from under it.
-			if filterBlocksChase(n) {
+			//
+			// A plain GROUP BY key of the aggregate under that Filter is not
+			// an Aggs-synth: PG keeps it as a Var in the Agg's target list
+			// and deparses through the HAVING, InitPlan or not — TPC-DS
+			// Q14's rollup Sort Key `item.i_brand_id` over a UNION ALL
+			// member whose HAVING compares against an InitPlan
+			// (M0146-0042).
+			if filterBlocksChase(n) && !chaseOnGroupKeyOf(n.Child, cur) {
 				return nil, false
 			}
 			c := childNodeOf(n)
@@ -2017,6 +2024,23 @@ func childProjectThroughFilters(n optimizer.Node) *optimizer.Project {
 // v1) means an Aggs-synth from below would print internals of a level
 // PG walls off. Plain-predicate Filters step through (position
 // preservation is definitional).
+// chaseOnGroupKeyOf reports whether cur names a plain GROUP BY position of
+// the simple, non-grouping-sets Aggregate child — a column the Agg's target
+// list carries as a Var, which a HAVING Filter above it cannot wall off.
+func chaseOnGroupKeyOf(child optimizer.Node, cur optimizer.Expr) bool {
+	agg, ok := child.(*optimizer.Aggregate)
+	col, isCol := cur.(*optimizer.ColumnRef)
+	if !ok || !isCol || agg.GroupingSets != nil || col.Index < 0 || col.Index >= len(agg.GroupExprs) {
+		return false
+	}
+	out := agg.Output()
+	if col.Index >= len(out) || out[col.Index].Name != col.Name {
+		return false
+	}
+	g, isGroupCol := agg.GroupExprs[col.Index].(*optimizer.ColumnRef)
+	return isGroupCol && g != nil && !exprHasSubplanOrOuterRef(g)
+}
+
 func filterBlocksChase(f *optimizer.Filter) bool {
 	return f != nil && f.Predicate != nil && exprHasSubplanOrOuterRef(f.Predicate)
 }
