@@ -32121,7 +32121,7 @@ Movement: none — instrument artefact — no TPC query runs MERGE; regress merg
     `SAOPKeys` coverage\. Design: `docs/design/0100\-0149/m0146\-0170\-subplan\-lateral\-nestloop\-param\.md`\.
 Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; its value is TPC\-DS Q32\'s sf025 checksum
   under M0146\-0159
-- [ ] **M0146-0171 — PG\-shaped parameterised probes run 1\.2–1\.26x slower than the x2 shapes \(TPC\-DS SF0\.25
+- [x] **M0146-0171 — PG\-shaped parameterised probes run 1\.2–1\.26x slower than the x2 shapes \(TPC\-DS SF0\.25
   Q17/Q25/Q83\)** \(filed 2026\-10\-13 by M0146\-0159\)\. After the multiplier retirement these three now match PG\'s
   plan and run Q17 0\.80 → 1\.01s, Q25 0\.78 → 0\.98s, Q83 2\.01 → 2\.41s \(3\-round medians,
   `analysis/m0146/m0146\-0159/repeated\-runs\.txt`\)\. The executor\-side per\-probe cost Option A accepted
@@ -32139,6 +32139,13 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
     - Next: `PagePruneXIDSet` \(6\.2%, the per\-fetch prune check — PG\'s `heap\_page\_prune\_opt` exits early\),
       `parseHeapTupleAlias` \(9\.7%\), index tuple deform/compare\. Design
       `docs/design/0100\-0149/m0146\-0171\-probe\-runtime\.md`\.
+  - Done 2026\-10\-13: the regression premise no longer holds\. HEAD runs Q17 0\.55–0\.90 s, Q25 0\.35–0\.73 s and Q83 1\.72 s,
+    all at or below the x2\-shape figures the task was filed against \(0\.80 / 0\.78 / 2\.01 s\)\.
+    - Slice 2 \(an incremental attribute compare, \_bt\_compare\'s early exit\) measured flat and was not landed: an equality
+      probe ties on its single search column\.
+    - The remaining per\-probe gap to PG \(\~1\.4x on the isolated loop\) is distributed constant\-factor executor work with
+      PG\'s buffer count \(30 vs 28\.6 per probe\); it stays with M0146\-0088\'s ledgered probe residual\.
+Movement: none — executor runtime, no plan instrument; Q17/Q25/Q83 no longer slower than the x2 shapes
 - [x] **M0146-0172 — TPC\-DS SF1 Q72 runs 65x slower since M0146\-0009p: goopg elects the item\-only inventory route**
   \(filed 2026\-10\-13 by M0146\-0009p\)\. With PG\'s parameterised rows \(0009p\), goopg prices its item\-only route
   \(`inventory\_pkey` probe on `inv\_item\_sk` rows=236, then the date\-dimension joins over 13819 rows\) at 54874, under its

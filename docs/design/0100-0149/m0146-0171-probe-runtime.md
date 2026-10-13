@@ -1,7 +1,9 @@
 # M0146-0171 — the per-probe runtime of PG-shaped parameterised index probes
 
-Status: open — slice 1 landed 2026-10-13 (`4e4b32af9`). The remaining gap is
-about 1.4x on the isolated probe loop.
+Status: closed 2026-10-13. Slice 1 landed (`4e4b32af9`); the regression the
+task names (PG-shaped probes slower than goopg's x2 shapes) no longer holds.
+The remaining ~1.4x gap to PG on the isolated loop stays with M0146-0088's
+ledgered probe residual.
 Parent: M0146-0159. Evidence: `analysis/m0146/m0146-0171/`.
 
 ## Problem
@@ -62,3 +64,25 @@ attribute 4.
 
 These are the next slices' candidates. PG's `heap_page_prune_opt` returns
 early on a cheap `PageIsFull` / `prune_xid` test.
+
+## Close-out (2026-10-13)
+
+- **Re-measure on HEAD** (same private SF0.25 clone):
+
+  | query | HEAD now | x2 shape when filed | PG shape when filed |
+  |---|---|---|---|
+  | Q17 | 0.55–0.90 s | 0.80 s | 1.01 s |
+  | Q25 | 0.35–0.73 s | 0.78 s | 0.98 s |
+  | Q83 | 1.72 s | 2.01 s | 2.41 s |
+
+- **Slice 2, measured and not landed.** An incremental attribute compare in
+  `comparePGIndexTuples` (`_bt_compare`'s early exit) measured flat,
+  540–565 ms in both arms. An equality probe's leaf compares tie on the
+  single search column, so no attribute is skipped.
+- **What is left.**
+  - The inclusive profile is spread out: join-filter evaluation 16%,
+    HOT-chain follow 15%, leaf compares 14%, heap header parse 11% (cache
+    misses on first touch).
+  - Buffer touches per probe match PG (about 30 vs 28.6).
+  - No single structural waste remains. The constant-factor gap is M0146-0088's
+    ledgered residual.
