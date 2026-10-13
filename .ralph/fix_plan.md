@@ -4817,6 +4817,55 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - Multi\-timeline WAL and the standby `STANDBY\_SNAPSHOT\_READY` item belong to M0122\-0013 \(replication\)\.
     - Next slice: the topmost of these still owned here — WAL summarization \(M0095\-0002 names it\) or the
       `WALInsertLock` call\-site rewrite; re\-verify first\.
+  - **2026\-10\-13 WAL summarizer design slice** \(backlog entry "WAL summarization not running", M0095\-0002\'s
+    deferral\): design doc `docs/design/0100\-0149/0122\-0009\-wal\-summarizer\.md` written and agent\-reviewed
+    \(milestone workflow steps 3–4\)\. Verdict: approved for S1\.
+    - The review confirmed the BlockRefTable on\-disk format byte by byte against `common/blkreftable\.c` and
+      corrected 15 statements in the draft\.
+    - Slices, in order: S1 `blkreftable` package \+ serializer → S2 offline summarizer, compared byte for byte with
+      a scratch PG 18\.3 → S3 live goroutine and S4a SQL functions → S4b / S5 `wal\_summary\_keep\_time` → S6a → S7
+      WS\-002 un\-defer\. S6b–S6f are producer\-side WAL gaps\.
+    - Next slice: S1\.
+    - The review also found WAL\-logging gaps that matter without the summarizer\. They are filed as
+      M0122\-0009a/b/c below\.
+- [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
+  M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
+  renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed
+  because the rename is atomic\.
+  - Why it breaks: a standby, or a PITR restore from a base backup taken before the REINDEX, keeps the OLD index
+    file, then replays post\-REINDEX index records and FPIs written against the NEW layout\. The result is a mixed,
+    corrupt index → wrong results there\.
+  - PG instead builds the new index under a NEW relfilenode, WAL\-logged \(`index\_concurrently\_build`; the build
+    logs its pages\), and swaps catalog entries \(`index\_concurrently\_swap`, `catalog/index\.c`\)\.
+  Kind: bug
+  Parent: M0122\-0009
+  - Rank: below item 10 under the S7 carve\-out \(correctness, no plan instrument\) unless the owner places it\.
+    Escalated in the baton as a wrong\-results\-on\-standby defect \(S2\)\.
+  - First step: reproduce with a physical standby or a base backup \+ replay across a REINDEX CONCURRENTLY, then
+    move to PG\'s new\-relfilenode \+ catalog\-swap shape, or WAL\-log the swapped file \(log\_newpage\_range\-style\)\.
+- [ ] **M0122\-0009b — ALTER TABLE/INDEX … SET TABLESPACE copies the file with no WAL** \(filed 2026\-10\-13 by the
+  M0122\-0009 summarizer design review\)\. `relocateRelationPhysicalFile` \(`operators\_ddl\.go` \~:609\) copies and
+  fsyncs the main fork under the SAME relfilenode, in the new tablespace\.
+  - PG assigns a new relfilenode and WAL\-logs the copied pages \(`RelationCopyStorage` → `log\_newpage`,
+    `catalog/storage\.c`\), so a standby or PITR replay recreates the moved relation\.
+  - Without WAL, a replica never sees the move\. Moving a relation away and back inside one backup window also
+    leaves stale pages at the original path\.
+  Kind: bug
+  Parent: M0122\-0009
+  - Rank: below item 10 \(S7 carve\-out\) unless the owner places it\.
+  - First step: a standby/replay repro across SET TABLESPACE; then a new relfilenode plus WAL\-logged copy, as PG\.
+- [ ] **M0122\-0009c — VACUUM tail truncation writes no XLOG\_SMGR\_TRUNCATE in production** \(filed 2026\-10\-13 by the
+  M0122\-0009 summarizer design review\)\. `vacuum\.go` \~:368 truncates through `bufpool\.go` \~:1433, but the
+  `LogSmgrTruncateTo` hook is only set in tests\. The comment calling a missing hook "a no\-op" is wrong: the file is
+  still truncated, just unlogged\.
+  - PG logs XLOG\_SMGR\_TRUNCATE before truncating \(`RelationTruncate`, `catalog/storage\.c`\), so a standby
+    truncates too\. The WAL summarizer also needs it to set the limit block\.
+  Kind: bug
+  Parent: M0122\-0009
+  - Rank: below item 10 \(S7 carve\-out\) unless the owner places it\. Parity, not corruption: the extra tail blocks
+    on a replica are past the relation\'s end\.
+  - First step: wire `LogSmgrTruncateTo` in the production pool setup \(`internal/initdb/open\.go`\) and pin it with
+    a recovery test\.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
   - **Cross\-handle structural gate LANDED 2026\-09\-22 \(loop \#10\)** as
     `4beed2920`. Movement: none — a concurrency protocol; `PLAN-SHAPE same=99
