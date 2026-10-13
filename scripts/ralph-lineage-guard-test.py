@@ -79,7 +79,7 @@ case("B: new P0- task without Parent -> violation", base, base + task("P0-E4"), 
 case("B: new M0143 task with Parent: none -> ok", base, base + task("M0143-0009", parent="none"), None)
 case("B: new M0136 (out of range) without Parent -> ok", base, base + task("M0136-0100"), None)
 case("B: new M0145 task without Parent -> violation", base, base + task("M0145-0009"), "B")
-case("B: new M0146 (out of range) without Parent -> ok", base, base + task("M0146-0001"), None)
+case("B: new M0146 task without Parent -> violation", base, base + task("M0146-0001"), "B")
 case("B: new nested M0141 subtask without Parent -> violation", base,
      base + task("M0141-S2b-8", indent="  "), "B")
 case("B: legacy task edited (not new) without Parent -> ok",
@@ -272,6 +272,28 @@ escpin = ESCPIN + "".join([ESCROOT] + ESCCHAIN)
 case("A: pin tokens written with escapes pin the normalised ids -> ok",
      escpin,
      escpin + task("M0142\\-0009a-5", " ", parent="M0142\\-0009a-4"), None)
+
+# --- Rule A: FILEABLE-ROOTS owner exemption -----------------------------------
+FR = ("# Fix plan\n\n## Current Priority\n"
+      "FILEABLE-ROOTS: M0142-0008\n1. x\n\n## M0142 — stuff\n\n")
+bfr = FR + "".join([ROOT] + chain(5))
+case("A: FILEABLE-ROOTS root accepts a new open child despite exhaustion",
+     bfr, bfr + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), None)
+ROOT2 = task("M0143-0001", "x", parent="none")
+CHAIN2 = [task(f"M0143-0001-{i}", "x",
+               parent="M0143-0001" if i == 0 else f"M0143-0001-{i-1}",
+               movement="none") for i in range(5)]
+bfr2 = FR + "".join([ROOT] + chain(5) + [ROOT2] + CHAIN2)
+case("A: FILEABLE-ROOTS exempts only the listed root",
+     bfr2, bfr2 + task("M0143-0001-5", " ", parent="M0143-0001-4"), "A")
+case("A: FILEABLE-ROOTS added in the same commit does not self-exempt",
+     b, FR + "".join([ROOT] + chain(5)) + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), "A")
+bfr_tail = plan(ROOT, *chain(5)) + "FILEABLE-ROOTS: M0142-0008\n"
+case("A: FILEABLE-ROOTS outside the banner is ignored",
+     bfr_tail, bfr_tail + task("M0142-0008a-5", " ", parent="M0142-0008a-4"), "A")
+case("A: FILEABLE-ROOTS root [ ]->[!] flip -> violation",
+     FR + "".join([task("M0142-0008", " ", extra="legacy root")] + chain(5)),
+     FR + "".join([task("M0142-0008", "!", extra="legacy root")] + chain(5)), "A")
 
 # --- Rule F fixtures (advisory, asserted separately below) --------------------
 FPLAN = (HEADER

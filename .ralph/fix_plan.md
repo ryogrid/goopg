@@ -62,6 +62,52 @@ banner at the next `## ` line).
 - **S8 Nothing selectable** (all remaining work blocked on the owner):
   write one escalation block into `.ralph/working_set.md` listing each
   blocker, and end the loop without code changes. Do not invent work.
+- **S9 Parity replenishment** (owner directive 2026-10-13; this pass is
+  owner-delegated — S8's "do not invent work" does not apply to it):
+  when no item 0-9 holds a selectable ACTIONABLE task — the standing
+  census root M0146-0014 is a filing channel, not stock, and does not
+  count, nor do S7-carve-out/below-item-10 descendants — run ONE
+  replenishment pass BEFORE item 10:
+  (1) Census freshness — reuse the newest
+  `analysis/m0146/m0146-0014/routing-*/` artifact iff its ROUTING.md's
+  recorded capture sha is an ancestor of HEAD AND no commit since
+  touches `internal/optimizer`, `internal/planner`, `internal/executor`
+  or `*cost*|*stat*|*selfuncs*` paths; otherwise capture fresh
+  (`scripts/jointree-parity-capture.sh` per corpus) and re-run
+  `scripts/pg-plan-parity-diff.py --verbose`. If the captures cannot
+  run (e.g. the source server is live and the capture refuses), item
+  10 is live FOR THIS LOOP.
+  (2) A record is ACTIONABLE when it is non-MATCH and its census route
+  is not a live (`[ ]` or `[!]`) task, not a waived/owner residual
+  (COSTTIE, GEQO-RNG, RELPAGES, ESTIMATE+RELPAGES, STALE-SF1), and not
+  the leaf-count/lateral classes owned by M0145-0003/0010. For TPC-H,
+  each non-MATCH query is actionable unless a live task names it.
+  (3) Rank the differ's nine categories by actionable-record count
+  summed across all three corpora; file exactly ONE task —
+  `Parent: M0146-0014`, `Kind: impl` — citing corpus + query id +
+  category + current verdict + expected instrument. Scope: first step
+  records where goopg's plan selection diverges from PG 18.3 (the
+  first-divergence point); then implement in order and drive the query
+  to MATCH. Prefer the SF0.25 record when a query diverges at both
+  scales (SF1 measurement is stale-load-compromised). The filed task
+  inherits item-3 rank under S7 (named family + plan-instrument
+  rationale) — it is selected before item 10.
+  (4) Bounds — ONE filing per pass, never a batch. A pass that files
+  nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
+  entry and re-runs only after HEAD advances past that sha in the
+  planner-relevant paths above — otherwise item 10 is live for that
+  loop. A replenishment task that closes `Movement: none` must name
+  why its premise/record was stale; after TWO consecutive such closes
+  without a landed fix, stop filing and write the S8 escalation.
+FILEABLE-ROOTS: M0146-0014
+(owner directive 2026-10-13 — filings under the standing census root
+are exempt from the Rule-A lineage budget: the sweep's purpose IS
+filing findings, and a `none`-streak of routing sweeps must not freeze
+the parity supply. This IS a true exemption — it supersedes the
+"not an exemption" note on the 2026-10-13 LINEAGE-BASELINE pin for
+this root, which stays as the historical record. M0146-0014 stays
+`[ ]`; flipping it to `[!]` is a guard violation — the owner de-lists
+it to hold the lineage.)
 - **M-NIGHTLY** filing is unconditional (the paragraph at this section's
   tail); **selecting** one ahead of the order above is allowed only when
   it breaks the build or a gate this banner's work needs.
@@ -249,6 +295,7 @@ banner at the next `## ` line).
 9. **M0143 remaining tasks**, top to bottom (includes the parser failures).
 10. M-NIGHTLY open items, then the pre-existing milestones
    (M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110).
+   (Reachable only after the S9 pass above files nothing.)
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
 the start of its own line: `Kind: recon|impl`, `Parent: <task-id|none>`, and on
@@ -966,6 +1013,45 @@ parity-queue-exhausted state the loop hit at 18:56, commit `5953fe051`'s
   an owner-side op, tracked as the M0142-0005 escalation's existing
   ask) and M0119-0006 / M0122-0008's `[!]` (ambiguous pseudo-id
   children — pins unsafe, established decision).
+
+OWNER DECISIONS 2026-10-13 (c) — parity self-replenishment (delegated;
+the owner's ask: when the parity stock runs out, the loop itself files
+the next breakdown→fix task instead of falling to item 10):
+
+- **New selection rule S9 (parity replenishment)** — see the Selection
+  rules block. When items 0-9 hold no actionable task, the loop runs
+  ONE census pass before item 10: largest actionable
+  CATEGORIES-EXCL-MATCH category across the three corpora → one
+  query → file ONE `Kind: impl` task under M0146-0014 (first
+  divergence point vs PG 18.3, fix in order, drive to MATCH). The
+  filing inherits item-3 rank under S7 and is selected before item 10.
+  Bounds: one filing per pass, a `none`-closing pass leaves an
+  `exhausted at <sha>` note and re-runs only after planner-relevant
+  commits land, two consecutive `none` replenishment tasks escalate.
+- **`FILEABLE-ROOTS:` banner token + guard support** — M0146-0014 is
+  listed: filings under it are exempt from the Rule-A lineage budget
+  (the census's purpose IS filing findings; yesterday's freeze was a
+  `none`-streak of routing sweeps starving the supply, not inert work).
+  This IS a true exemption — it supersedes the "not an exemption"
+  caveat on this root's 2026-10-13 pin, which stays as the record.
+  Machine side: parsed from the BASELINE (a candidate cannot
+  self-exempt), and a `[ ]`→`[!]` flip on a listed root is a
+  violation — the owner de-lists it to hold the lineage.
+  `scripts/ralph-lineage-guard.py` + its test suite carry the
+  mechanism (cases: listed-root accept, unlisted-root reject,
+  candidate-side token ignored, token outside the banner ignored,
+  `[!]`-flip violation).
+- **Rule B widened to M0146** — `NEWID_RE` is now
+  `M01(3[7-9]|4[0-6])|P0-`: an S9 filing missing `Parent:` would
+  silently drop to the below-item-10 pool; the guard now requires the
+  field so S9 cannot fail invisibly. Harness-scope prose updated to
+  match reality (AGENT.md/PROMPT.md now say M0137–M0146; the
+  commit-msg `plan_parity_task` regex is unused, untouched).
+- **Breadth trade-off acknowledged:** the exemption covers 0014's whole
+  subtree — grandchild impl work under filed findings is exempt too.
+  Accepted: the subtree is parity work by construction, and the S9
+  bounds (one filing/pass, stale-premise accounting, two-`none`
+  escalation) bound the abuse channel.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -28771,6 +28857,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   > RESOLVED 2026\-10\-13 \(OWNER DECISIONS 2026\-10\-13\): re\-opened `\[\!\]`→`\[ \]` with the banner
   > LINEAGE\-BASELINE pin \(0148/0014c/0149/0150/0014d\); F1–F5 filed as **M0146\-0176 through M0146\-0180**
   > \(Parent: M0146\-0014, item\-3 order 0176→0177→0178→0179→0180\)\.
+  > **Standing channel 2026\-10\-13 \(c\):** this root is the permanent census/filing
+  > channel (banner S9); FILEABLE-ROOTS exempts its filings from the lineage
+  > budget and it stays `[ ]` — it is never `[!]`-marked for exhaustion.
   >
   > - **0014d\-F1 — a correlated SubPlan conjunct is applied unpriced above the join \(TPC\-DS Q32, Q92\)**: Since M0146\-0130 \(`a6905e365`\) the conjunct `ws\_ext\_discount\_amt > \(SubPlan 1\)` is not
   >   in the \{web\_sales, item\} join restrictlist; goopg applies it as a top `Filter:` that no join path pays for\. Q92
