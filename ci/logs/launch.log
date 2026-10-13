@@ -334,3 +334,62 @@ nightly batch already running (lock: /home/ryo/.ralph/locks/goopg-nightly-run.lo
 2026-09-30T01:52:02+09:00 [RUN]	S1 barrier reached
 2026-09-30T02:28:41+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
 2026-09-30T02:37:00+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-01T01:21:04+09:00 [RUN]	start run_id=20261001-012059 sha=b871573b dirty=1175 src_fp=9fcd2391e3dc78a6 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-01T01:21:23+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-01T01:57:56+09:00 [RUN]	S1 barrier reached
+2026-10-01T02:28:58+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-01T02:37:13+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-02T01:04:14+09:00 [RUN]	start run_id=20261002-010412 sha=0f145f8e dirty=1221 src_fp=9a5a3a334d246ae4 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-02T01:04:34+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-02T01:40:23+09:00 [RUN]	S1 barrier reached
+2026-10-02T02:09:24+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-02T02:17:39+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-03T00:24:56+09:00 [RUN]	start run_id=20261003-002454 sha=eacb7aa2 dirty=1276 src_fp=456c8a391dfe0c11 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-03T00:25:15+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-03T01:02:57+09:00 [RUN]	S1 barrier reached
+2026-10-03T01:33:17+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-03T01:41:54+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-04T01:48:11+09:00 [RUN]	start run_id=20261004-014809 sha=40763456 dirty=1359 src_fp=5a9b0356715e5f02 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-04T01:48:30+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-04T02:23:03+09:00 [RUN]	S1 barrier reached
+2026-10-04T02:53:47+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-04T03:02:05+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-05T01:15:10+09:00 [RUN]	start run_id=20261005-011508 sha=b5d5330e dirty=1410 src_fp=2e65dc52d0a7468e stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-05T01:15:28+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-05T01:50:42+09:00 [RUN]	S1 barrier reached
+2026-10-05T02:21:02+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-05T02:29:16+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-06T00:57:07+09:00 [RUN]	start run_id=20261006-005659 sha=f0752473 dirty=1471 src_fp=90c807ce9dc44f25 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-06T00:57:33+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-06T01:35:04+09:00 [RUN]	S1 barrier reached
+2026-10-06T02:12:52+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-06T02:21:36+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-07T01:40:33+09:00 [RUN]	start run_id=20261007-014030 sha=8c0c672b dirty=1531 src_fp=cea690ee4186a937 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-07T01:40:53+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-07T02:17:10+09:00 [RUN]	S1 barrier reached
+2026-10-07T02:38:05+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-07T02:46:31+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-08T01:18:44+09:00 [RUN]	start run_id=20261008-011842 sha=51b79e57 dirty=1593 src_fp=1d1ae255fc81cad2 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-08T01:19:06+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-08T01:55:31+09:00 [RUN]	S1 barrier reached
+2026-10-08T02:32:35+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-08T02:40:54+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-09T01:43:15+09:00 [RUN]	start run_id=20261009-014313 sha=e5fa2c33 dirty=1661 src_fp=e3159d5fda058365 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-09T01:43:34+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-09T02:21:13+09:00 [RUN]	S1 barrier reached
+2026-10-09T03:00:43+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-09T03:09:38+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-10T00:57:38+09:00 [RUN]	start run_id=20261010-005735 sha=7633ac7e dirty=1760 src_fp=3a0a209b20a0ebcd stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-10T00:57:58+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-10T01:32:01+09:00 [RUN]	S1 barrier reached
+2026-10-10T02:06:54+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-10T02:15:08+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-12T03:32:55+09:00 [RUN]	start run_id=20261012-033252 sha=9b1d866d dirty=1831 src_fp=33eb7093059ff041 stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-12T03:33:13+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-12T04:18:32+09:00 [RUN]	S1 barrier reached
+2026-10-12T04:52:53+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-10-12T05:01:21+09:00 [RUN]	log-push: committed + pushed batch logs to origin/plan-parity-with-pg-take2-ralph2
+2026-10-13T00:50:07+09:00 [RUN]	start run_id=20261013-005003 sha=7c7a8bd8 dirty=1876 src_fp=c4ab26aedf3a65dd stages=preflight,units,race,testport,pgbench,tpch,tpcds,summary
+2026-10-13T00:50:26+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-10-13T01:36:39+09:00 [RUN]	S1 barrier reached
+2026-10-13T02:12:28+09:00 [RUN]	end status_rc=0 (0 pass / 2 fail / 3 inconclusive) — see summary.md

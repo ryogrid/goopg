@@ -72,7 +72,9 @@ banner at the next `## ` line).
   `analysis/m0146/m0146-0014/routing-*/` artifact iff its ROUTING.md's
   recorded capture sha is an ancestor of HEAD AND no commit since
   touches `internal/optimizer`, `internal/planner`, `internal/executor`
-  or `*cost*|*stat*|*selfuncs*` paths; otherwise capture fresh
+  or `*cost*|*stat*|*selfuncs*` paths AND no corpus reload is recorded
+  after the artifact (e.g. the 2026-10-13 SF1 stale-load reload — a
+  corpus change does not move HEAD); otherwise capture fresh
   (`scripts/jointree-parity-capture.sh` per corpus) and re-run
   `scripts/pg-plan-parity-diff.py --verbose`. If the captures cannot
   run (e.g. the source server is live and the capture refuses), item
@@ -1009,9 +1011,11 @@ parity-queue-exhausted state the loop hit at 18:56, commit `5953fe051`'s
   `pgdata.HOLD` markers were known-cause host-reboot unclean-shutdown
   markers (stale postmaster.pid, dead pid, ~18:20); no evidence value.
   Cleared and restarted via `scripts/ref-clusters-ensure.sh`.
-- **Not actioned:** the SF1 TPC-DS reload (stale-load corpus rebuild —
-  an owner-side op, tracked as the M0142-0005 escalation's existing
-  ask) and M0119-0006 / M0122-0008's `[!]` (ambiguous pseudo-id
+- **SF1 TPC-DS reload DONE later on 2026-10-13** — see the `char(n)`
+  stale-load task's RESOLVED block (SF1 `data` rebuilt with the current
+  build, relpages now byte-identical to PG, witness Q96 elects PG's
+  shape again; PG reference `store` ANALYZEd).
+- **Not actioned:** M0119-0006 / M0122-0008's `[!]` (ambiguous pseudo-id
   children — pins unsafe, established decision).
 
 OWNER DECISIONS 2026-10-13 (c) — parity self-replenishment (delegated;
@@ -24313,7 +24317,7 @@ M0146-0001 re-baseline census on the new default arm.
     subquery\'s jointree — a deeper replan than this leaf splice\) and
     volatile\-qual pushdown \(PG admits volatiles into grouped
     subqueries; goopg declines\) remain open\.
-- [ ] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
+- [x] **The goopg TPC\-DS measurement clusters hold `char\(n\)` values stored
   unpadded by an older build** \(found 2026\-09\-25 by M0146\-0005d\):
   on a private clone of `data\-sf025` \(loaded 2026\-09\-16\), a stored
   `char\(20\)` reads back `Javier` with `octet\_length` 6 where PG returns
@@ -24368,6 +24372,25 @@ M0146-0001 re-baseline census on the new default arm.
   > there. Cluster lifecycle stays owner\-window work — not loop work —
   > because it takes gate clusters down; until it runs, TPC\-DS
   > divergences on `char`\-heavy tables may be data artifacts.
+  >
+  > **RESOLVED 2026\-10\-13 \(owner, delegated\): all three actions done.**
+  > SF0\.25 was already reloaded fresh earlier today; SF1 was rebuilt now —
+  > `data` wiped, `goopg init`, `shared_buffers=2048MB` /
+  > `work_mem=512MB` / `autovacuum=on`, `scripts/tpcds-load.sh`
+  > \(25/25 tables, ANALYZE, CHECKPOINT\). Verification: `relpages` is
+  > byte-identical to PG on every probed table — catalog_sales
+  > 41067→37448, customer 2046→2872, item 736→1284, store_sales
+  > 59539→51784, time_dim 1067→1408, web_sales 20552→18824 — and witness
+  > query Q96 now elects PG's `time_dim_pkey` nested-loop probe with the
+  > store_sales Parallel Seq Scan at 58984.58 \(PG 58984; the stale-load
+  > match losses Q47/Q96 should clear on the next SF1 capture\). PG
+  > reference `store` ANALYZEd \(pg_stats 29 rows — the no-statistics
+  > default-estimate divergence in SF1 Q8 should also clear\). The stale
+  > pre-reload dir was removed after verification. **Follow-on is loop
+  > work:** every census/routing artifact predating this reload has stale
+  > SF1 rows — the next M0146-0014 sweep pass must re-capture SF1 \(and
+  > the sweep/fire-set baselines\) rather than reuse `routing-20261013/`.
+  Movement: none — owner cluster lifecycle; the instrument effect lands on the next SF1 census
 - [x] **The executor test fixture\'s ANALYZE records `RowCount: 0` for rows
   it cannot see** \(filed 2026\-09\-25 by M0146\-0005c\): in `spillFixture`,
   rows written with `writeHeapRow`, and even rows loaded with `INSERT …
