@@ -4800,6 +4800,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     together and re-baselines every pinned ACL string in the suite, which is
     why it is its own task.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra**.
+  - **2026\-10\-13 re\-verification slice** \(selected via banner item 10 — items 3–9 had no selectable row\): the
+    cluster\'s open `unimplemented\_feat\.json` entries were checked against HEAD, as the milestone\'s workflow step 1
+    requires\.
+    - Entry "WAL segment recycling to reuse old segments" → `resolved`\. It was implemented under this task
+      \(`docs/design/0100\-0149/0122\-0009\-wal\-segment\-recycling\.md`; code
+      `internal/access/transam/xlog/writer\.go` `removeOldSegments` / `computeSpareSegments`\); the audit was stale\.
+      Recycling tests pass at HEAD\.
+    - Still open, with their owners:
+      - MultiXact WAL / durable `pg\_multixact` \(two entries\): M0131\-S24 owns it\.
+      - `WALInsertLock` array: partial; the 8\-stripe scaffold is dead code until the call\-site rewrite\.
+      - WAL writer Wait pipelining\.
+      - `XLogInsert`/`XLogFlush` API naming\.
+      - `MarkPageHalfDead` producers\.
+      - WAL summarization \(`pg\_available\_wal\_summaries` returns 0 rows; M0095\-0002\)\.
+      - Multi\-timeline WAL and the standby `STANDBY\_SNAPSHOT\_READY` item belong to M0122\-0013 \(replication\)\.
+    - Next slice: the topmost of these still owned here — WAL summarization \(M0095\-0002 names it\) or the
+      `WALInsertLock` call\-site rewrite; re\-verify first\.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
   - **Cross\-handle structural gate LANDED 2026\-09\-22 \(loop \#10\)** as
     `4beed2920`. Movement: none — a concurrency protocol; `PLAN-SHAPE same=99

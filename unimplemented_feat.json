@@ -457,7 +457,7 @@
    "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
    "task_id": "M0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "`wal_recycle` ... remain deferred"
    ],
@@ -472,7 +472,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/retention.go:21 unlinks segments, not recycling by rename"
+   "code_audit": "RESOLVED (2026-10-13 re-verification, M0122-0009): the 2026-07-02 audit is stale. Recycling landed under M0122-0009 (design docs/design/0100-0149/0122-0009-wal-segment-recycling.md): internal/access/transam/xlog/writer.go state.removeOldSegments recycles the newest obsolete segments into free future slots (recycleSegmentFile: rename + zero-fill + fsync) up to computeSpareSegments' XLOGfileslop count (min_wal_size floor, CheckPointDistanceEstimate term, max_wal_size cap); cmd/goopg/main.go wires WALMinSize and CheckPointDistanceEstimateFn. Tests retention_test.go TestRemoveOldSegmentsRecyclesUpToMinWALSize, TestComputeSpareSegments* and TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax pass at HEAD. Divergence kept on purpose: a recycled segment is zero-filled because goopg's reader bounds end-of-WAL by a zero tail, not by CRC alone."
   },
   {
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
