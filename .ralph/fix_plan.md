@@ -3954,6 +3954,18 @@ heuristic stays live.)
   - Design `docs/design/0100-0149/m0146-0015f-bpchar-hash-semantics-parity.md`;
     evidence `analysis/m0146/m0146-0015f/`.
 
+- [ ] **testport/TestE2E_FailoverPGtoGoopg** — testport TestE2E\_FailoverPGtoGoopg FAILed \(subtest: async\)
+  (AI-20261014-001833-001; repro: `go test -v -run '^TestE2E_FailoverPGtoGoopg$' ./internal/testport/`,
+  evidence `ci/logs/20261014-001833/testport/go-test.log`; first seen in the 2026-10-14 nightly).
+  Kind: impl
+  Parent: none
+  - Failure line: `e2e_failover_pg_to_goopg_test.go:95: async failover lost too many rows: count(*)=2
+    lower_bound=18 killCommitted=38`. That is 2 rows after the async failover where the test admits a loss down
+    to 18 of the 38 committed before the kill.
+  - Not yet triaged: first establish whether it reproduces on HEAD or is a one-night timing flake (the nightly
+    host was saturated by the batch); if goopg really loses rows a PG primary had shipped, it is an S2
+    data-loss finding and needs an escalation block for owner placement.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 M0130 (Cluster-directory compat with PG 18.3 + PG physical replication).
@@ -32721,7 +32733,7 @@ Movement: yes — match SF0.25 75 -> 76, SF1 62 -> 63 (TPC-DS Q70)
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
     - Follow\-ups: M0146\-0182 \(split\-chain Gather Merge display cost\), M0146\-0183 \(Q5 2\-key Hash Right Join\)\.
 Movement: yes — match SF1 63 -> 64 (TPC-DS Q14), SF0.25 76 -> 76; CATEGORIES-EXCL-MATCH SF1 join-order 32 -> 31
-- [ ] **M0146-0182 — the partial-aggregate split chain prints its Gather Merge without parallel_setup_cost**
+- [x] **M0146-0182 — the partial-aggregate split chain prints its Gather Merge without parallel_setup_cost**
   (filed 2026-10-14 at M0146-0180 close). TPC-DS Q76 SF0.25: goopg prints `Gather Merge (cost=37913.74..37982.60
   rows=3443)` over a Sort starting at 37913.74; PG prints `39026.66..40214.93 rows=10044` (startup +
   parallel_setup_cost and the comparison term; rows = partial groups times the divisor). The Finalize above already
@@ -32730,6 +32742,19 @@ Movement: yes — match SF1 63 -> 64 (TPC-DS Q14), SF0.25 76 -> 76; CATEGORIES-E
   Parent: M0146-0180
   - First step: stamp the Finalize/GatherMerge/Sort/Partial nodes `createFinalizeAggSortedPlan` builds from
     their paths (stampPlanCost); check the hashed arm's chain for the same gap.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0182\-split\-aggregate\-chain\-costs\.md`, evidence
+    `analysis/m0146/m0146\-0182/`\)\.
+    - Both arms build their chain in one step \(`splitAggregate` / `splitAggregateTransportSorted\*`\) and
+      `createPlanNode` stamped only the Finalize; the Gather \(Merge\), worker Sort and Partial printed the legacy
+      display estimate\. The hashed arm had the same gap \(Q2\'s Gather started above its Finalize\)\.
+    - Fix: the hashed arm stamps its Gather and Partial; `stampSortedSplitChain` stamps the Gather Merge, Sort and
+      Partial of either sorted arm from their paths\.
+    - Q76 SF0\.25 Gather Merge 38954\.59\.\.40199\.71 rows 10525 \(PG 39026\.66\.\.40214\.93 rows 10044\); Q2 Gather
+      24155\.47\.\.27681\.67 rows 32389 \(PG 27328\.85\.\.30846\.58 rows 32311\)\.
+    - SF0\.25 sweep: 14 queries\' plan text moved, cost figures only \(identical with costs stripped\)\.
+    - Test: `TestExplainSplitAggregateChainCosts` \(both arms; fails with either arm\'s stamping removed\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: none — display-only: the chain's EXPLAIN costs now come from its paths; the classifier compares shapes, so match 76/64 and CATEGORIES-EXCL-MATCH are unchanged
 - [ ] **M0146-0183 — a 2-key Hash Right Join adds ~4049 over its inputs where PG adds ~945 (TPC-DS Q5)**
   (filed 2026-10-14 from the "also seen" note of M0146-0180). Suspects: `approx_tuple_count` over two hash
   clauses, or inner-unique not detected for the composite key.

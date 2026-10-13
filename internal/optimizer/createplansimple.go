@@ -248,6 +248,12 @@ func createFinalizeAggPlan(p *Path) (Node, outputLayout) {
 	if built.PartialSource.Child != child {
 		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gather, partial))
 	}
+	// M0146-0182: the Gather and the Partial splitAggregate built carry the
+	// costs of the paths they implement, as every search-produced node does.
+	if g, ok := built.Child.(*Gather); ok {
+		stampPlanCost(g, gather)
+		stampPlanCost(built.PartialSource, partial)
+	}
 	return built, layout
 }
 
@@ -336,7 +342,36 @@ func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
 	if built.PartialSource.Child != child {
 		perWorkerDisplayRows(built.PartialSource.Child, gatherPathDivisor(gm, sub))
 	}
+	stampSortedSplitChain(built, gm, sub, sortedInput)
 	return built, layout
+}
+
+// stampSortedSplitChain gives the nodes the sorted split built between the
+// Finalize and its input the costs of the paths they implement (M0146-0182).
+// Unstamped, they fell to the legacy display estimate: TPC-DS Q76's Gather
+// Merge printed its Sort's startup, without parallel_setup_cost, and the
+// per-worker group count as its rows, where PG prints cost_gather_merge's
+// figures over compute_gather_rows. gm is the GatherMerge path and sub its
+// child: the worker Sort over the Partial (presorted arm), or the sorted
+// Partial over its Sort (sorted-input arm).
+func stampSortedSplitChain(built *Aggregate, gm, sub *Path, sortedInput bool) {
+	merge, ok := built.Child.(*GatherMerge)
+	if !ok || len(sub.Children) != 1 {
+		return
+	}
+	stampPlanCost(merge, gm)
+	below := sub.Children[0]
+	if sortedInput {
+		stampPlanCost(built.PartialSource, sub)
+		if srt, ok := built.PartialSource.Child.(*Sort); ok {
+			stampPlanCost(srt, below)
+		}
+		return
+	}
+	if srt, ok := merge.Child.(*Sort); ok && srt.Child == Node(built.PartialSource) {
+		stampPlanCost(srt, sub)
+		stampPlanCost(built.PartialSource, below)
+	}
 }
 
 // createDistinctPlan is the PathDistinct arm (C-16): emit the path's
