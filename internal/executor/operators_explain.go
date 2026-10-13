@@ -2024,6 +2024,28 @@ func childProjectThroughFilters(n optimizer.Node) *optimizer.Project {
 // v1) means an Aggs-synth from below would print internals of a level
 // PG walls off. Plain-predicate Filters step through (position
 // preservation is definitional).
+// memoizeParentLoop is the nested loop whose inner side is m, when its
+// outer input comes first in the loop's row (a Join's Left, an index join's
+// Outer) — the row m's cache keys read. nil otherwise.
+func memoizeParentLoop(reg *subPlanReg, m *optimizer.Memoize) optimizer.Node {
+	nm := reg.names()
+	if nm == nil || m == nil {
+		return nil
+	}
+	parent := nm.parent[nodePtr(m)]
+	switch j := parent.(type) {
+	case *optimizer.Join:
+		if j.Right == optimizer.Node(m) && j.Left != nil {
+			return j
+		}
+	case *optimizer.NestedLoopIndexJoin:
+		if j.InnerMemo == m && j.Outer != nil {
+			return j
+		}
+	}
+	return nil
+}
+
 // chaseOnGroupKeyOf reports whether cur names a plain GROUP BY position of
 // the simple, non-grouping-sets Aggregate child — a column the Agg's target
 // list carries as a Var, which a HAVING Filter above it cannot wall off.
@@ -2956,8 +2978,21 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
 		if len(p.KeyExprs) > 0 {
 			parts := make([]string, 0, len(p.KeyExprs))
+			// M0146-0042: a cache key is the parameterising loop's OUTER
+			// column, and PG deparses it there (show_memoize_info →
+			// get_variable on the outer Var): through a kept Subquery Scan
+			// it prints the scan's alias, TPC-DS Q44's `v11.item_sk`. The
+			// keys index the loop's outer row, the left part of the join's
+			// row, so they resolve positionally as the Join Filter does.
+			loop := memoizeParentLoop(reg, p)
 			for _, ke := range p.KeyExprs {
-				parts = append(parts, formatExprQual(ke, reg, qualify))
+				var txt string
+				if loop != nil {
+					reg.withJoinRow(loop, func() { txt = formatExprQual(ke, reg, qualify) })
+				} else {
+					txt = formatExprQual(ke, reg, qualify)
+				}
+				parts = append(parts, txt)
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 			// M0146-0005cy: show_memoize_info prints the comparison mode
