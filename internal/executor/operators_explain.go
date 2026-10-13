@@ -768,12 +768,14 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// owner's slot merely because the statement-wide IDs happen to
 				// share a number.
 				var prevParamSources map[int]*optimizer.ColumnRef
-				var prevParamOwner optimizer.Node
+				var prevParamOwner, prevParamScope optimizer.Node
 				if reg != nil {
 					prevParamSources = reg.execParamSources
 					reg.execParamSources = subPlanExecParamSources(sp.expr)
 					prevParamOwner = reg.execParamOwner
 					reg.execParamOwner = sp.paramOwner
+					prevParamScope = reg.execParamScope
+					reg.execParamScope = sp.paramScope
 				}
 				// A sublink body brings its own range-table entries
 				// (Q30's `ctr2` lives only inside SubPlan 1), and they
@@ -797,6 +799,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				if reg != nil {
 					reg.execParamSources = prevParamSources
 					reg.execParamOwner = prevParamOwner
+					reg.execParamScope = prevParamScope
 				}
 			}
 		}
@@ -3823,6 +3826,9 @@ type subPlanReg struct {
 	// execParamOwner, when set, is where execParamSources resolve instead of
 	// the ancestor (subPlanEntry.paramOwner); body-scoped like the map.
 	execParamOwner optimizer.Node
+	// execParamScope, when set, is the plan node that evaluates the sublink
+	// (subPlanEntry.paramScope), tried before execParamOwner; body-scoped.
+	execParamScope optimizer.Node
 }
 
 // subPlanExecParamSources extracts the PARAM_EXEC sources supplied by one
@@ -4040,6 +4046,18 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 	if source == nil {
 		return fallback
 	}
+	// The evaluating node first: a relation scan resolves its own column
+	// only when the source belongs to it, so a source from another relation
+	// falls through to the owner scope unchanged. A source whose relation
+	// index was erased (0) would match on the name alone and could take a
+	// same-named column of the scan, so it skips this step.
+	if scope := reg.execParamScope; scope != nil && source.SourceTableIdx != 0 {
+		if _, candidate := explainRelBaseName(scope); candidate {
+			if qualified := resolveExecParamSourceInOwner(reg.rel, scope, source); qualified != "" {
+				return qualified
+			}
+		}
+	}
 	owner := reg.ancestorNode()
 	if reg.execParamOwner != nil {
 		owner = reg.execParamOwner
@@ -4209,6 +4227,15 @@ type subPlanEntry struct {
 	// Filter (M0146-0012a): the join, or the loop's outer input. The body
 	// renders after that context is gone, so it is captured at assignment.
 	paramOwner optimizer.Node
+	// paramScope is the plan node whose own expression holds the sublink —
+	// the node being rendered at assignment. PG's find_param_referent prints
+	// a SubPlan's PARAM_EXEC argument in the context of the plan node that
+	// evaluates the SubPlan (ruleutils.c get_parameter), so an argument that
+	// reads that node's own relation resolves there first: a parameterised
+	// inner scan's Filter whose sublink correlates on the inner relation
+	// itself (TPC-DS Q6's `j.i_category = i.i_category` on the item_pkey
+	// probe) is not the loop's outer input that paramOwner names.
+	paramScope optimizer.Node
 }
 
 // assign returns the SubPlan number already given to e, or
@@ -4261,7 +4288,7 @@ func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed 
 	case r.paramRow != nil:
 		owner = r.paramRow
 	}
-	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan, paramOwner: owner})
+	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan, paramOwner: owner, paramScope: r.current})
 	return n
 }
 
