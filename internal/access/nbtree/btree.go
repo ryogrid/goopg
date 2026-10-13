@@ -2993,7 +2993,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		const itemIDSize = 4 // matches storage.itemIDSize
 		rightBudget -= itemIDSize + MaxAlign(len(inheritedHK))
 	}
-	mid, splitOK := bt.format().compactSplitLoc(allItems, pageDataBudget(), rightBudget)
+	mid, splitOK := bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget,
+		splitFillFactorMult(op.IsLeaf(), oldNext == storage.InvalidBlockNumber))
 	if !splitOK {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
@@ -3823,6 +3824,41 @@ func (f indexFormat) compactFootprint(items []item) int {
 // the tiebreaker TID when no key attribute distinguishes the two halves — a
 // pivot that is larger than the plain item it was derived from.
 func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) (int, bool) {
+	return f.compactSplitLocFill(items, leftBudget, rightBudget, 0)
+}
+
+// BTreeNonLeafFillFactor mirrors upstream's BTREE_NONLEAF_FILLFACTOR
+// (postgres/src/include/access/nbtree.h): the share of a rightmost INTERNAL
+// page a split leaves on the left.
+const BTreeNonLeafFillFactor = 70
+
+// splitFillFactorMult is _bt_findsplitloc's choice of `fillfactormult` for a
+// split with `usemult` set (nbtsplitloc.c): a RIGHTMOST page is split so the
+// left half keeps fillfactor% of the space — the leaf fillfactor on the leaf
+// level, BTREE_NONLEAF_FILLFACTOR above it — because ascending insertions only
+// ever land on the right half again, and an even split would leave every left
+// page half empty for good (an int4 serial key's index came out 1.75x PG's
+// size, M0146-0178). Every other split balances free space (0, usemult off).
+// Not ported: the per-index fillfactor reloption (BTGetFillFactor; goopg uses
+// BTreeDefaultFillFactor as the bulk loader does) and _bt_afternewitemoff's
+// localized-monotonic arm for non-rightmost leaves — deferral ledger.
+func splitFillFactorMult(leaf, rightmost bool) float64 {
+	if !rightmost {
+		return 0
+	}
+	if leaf {
+		return BTreeDefaultFillFactor / 100.0
+	}
+	return BTreeNonLeafFillFactor / 100.0
+}
+
+// compactSplitLocFill is compactSplitLoc with _bt_deltasortsplits' weighting:
+// fillMult == 0 picks the cut whose halves' free space is most even
+// (`usemult` off); fillMult in (0,1) picks the smallest
+// |fillMult*leftfree - (1-fillMult)*rightfree| (`usemult` on). Free space is
+// each half's budget less its compact footprint, the left half also paying for
+// the separator, as _bt_recsplitloc charges it.
+func (f indexFormat) compactSplitLocFill(items []item, leftBudget, rightBudget int, fillMult float64) (int, bool) {
 	n := len(items)
 	if n < 2 {
 		return 0, false
@@ -3852,7 +3888,7 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 	for r := nr - 1; r >= 0; r-- {
 		suffix[r] = suffix[r+1] + f.runFootprint(items[starts[r]].key, starts[r+1]-starts[r])
 	}
-	bestMid, bestSkew, found := 0, 0, false
+	bestMid, bestSkew, found := 0, 0.0, false
 	r := 0
 	for m := 1; m < n; m++ {
 		for starts[r+1] <= m {
@@ -3868,9 +3904,13 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 		if left+sepCharge > leftBudget || right > rightBudget {
 			continue
 		}
-		skew := left - right
-		if skew < 0 {
-			skew = -skew
+		var skew float64
+		if fillMult > 0 {
+			leftFree := float64(leftBudget - left - sepCharge)
+			rightFree := float64(rightBudget - right)
+			skew = math.Abs(fillMult*leftFree - (1-fillMult)*rightFree)
+		} else {
+			skew = math.Abs(float64(left - right))
 		}
 		if !found || skew < bestSkew {
 			bestMid, bestSkew, found = m, skew, true

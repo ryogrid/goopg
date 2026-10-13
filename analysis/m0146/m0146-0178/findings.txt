@@ -1,0 +1,29 @@
+M0146-0178 slice 1 — TPC-DS Q24 index-only-scan heap-fetch term and int4 index density, 2026-10-13
+
+1. Heap-fetch term (cost_index allvisfrac). PG :65438 tpcds025 vs goopg private SF0.25 clone:
+     relation        PG relpages  PG relallvisible   goopg relpages  goopg relallvisible
+     store_returns   1232         1196               1196            1196
+     item            1284         1236               1242            1242
+     customer        2872         2853               2854            2854
+   PG's heaps carry trailing pages its COPY bulk extension added (RelationAddBlocks, hio.c) that are not
+   all-visible, so allvisfrac < 1 and an IOS pays heap fetches (store_returns_pkey +~212). goopg's heap has no such
+   pages (allvisfrac = 1). This is the RELPAGES owner residual (M0146-0009h ledger) — not fixed here.
+
+2. Index size the planner uses. goopg's pg_class.relpages is 0 for indexes; estimateIndexGeometry falls back to a
+   width estimate (item_pkey 40 pages) because catalog.IndexRealPages resolves a DBOid-0 index under
+   DefaultDBOid (base/1) while the file lives in the session database's directory (base/5) — the same mismatch
+   M0145-0029 slice 5 fixed for relallvisible (InMemory.RelAllVisibleBlocks). PG reads the real file size
+   (plancat.c get_relation_info, RelationGetNumberOfBlocks). Not fixed here: the real goopg files are bloated
+   (item 1), so reading them now would move plans AWAY from PG until the clusters are reloaded.
+
+3. Index density (this slice). Real goopg index files vs PG relpages (all 24 SF0.25 indexes, total 31521 vs
+   23762 pages): ascending-key dimension pkeys are ~1.75x PG (item_pkey 90 vs 52, customer_pkey 494 vs 276,
+   date_dim_pkey 360 vs 202); random-order fact keys are ~0.95x. PG loads the same way (PRIMARY KEY in tpcds.sql,
+   then COPY), so the gap is the split rule: _bt_findsplitloc splits a RIGHTMOST page at the fillfactor (leaf 90,
+   internal 70); goopg always split for the most even halves.
+   Oracle (ascending-insert-oracle.sql on a scratch PG 18.3): 18000 keys -> 52 pages, 100000 -> 276, 500 -> 4,
+   (k/10, k%10) x 50000 -> 138, bigint 18000 -> 52, a fillfactor=70 index -> 65.
+   goopg before: 90 / 494 / 4 / 247 / 90 / 90.  After: 52 / 276 / 4 / 139 / 52 / 52 (per-index fillfactor not
+   supported — ledgered).
+
+Plans: no TPC-DS/TPC-H plan change (fire set) — the gate clusters keep their old index files until reloaded.

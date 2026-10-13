@@ -32594,6 +32594,24 @@ Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.
     (tpcds025) and a private SF0.25 clone; PG `SET enable_seqscan=off; EXPLAIN SELECT sr_item_sk,
     sr_ticket_number FROM store_returns`; then decide whether goopg's relallvisible (VACUUM VM
     accounting) or the index density differs.
+  - 2026\-10\-13 slice 1 landed \(design `docs/design/0100\-0149/m0146\-0178\-btree\-rightmost\-split\-fillfactor\.md`,
+    evidence `analysis/m0146/m0146\-0178/`\)\. Three mechanisms, not one:
+    - Heap\-fetch term: PG\'s heaps keep trailing bulk\-extension pages that are not all\-visible
+      \(store\_returns 1232 pages / 1196 all\-visible; goopg 1196 / 1196\), so PG\'s `allvisfrac` is below 1\. This is
+      the RELPAGES owner residual\.
+    - Index pages: `catalog\.IndexRealPages` resolves a DBOid\-0 index under `base/1`, while the file is in
+      `base/5`, so the planner uses a width estimate \(item\_pkey 40 pages; the real file is 90, PG 52\)\. This is the
+      same mismatch M0145\-0029 slice 5 fixed for `relallvisible`\.
+    - Index density, fixed: `\_bt\_findsplitloc` splits a rightmost page at the fillfactor \(leaf 90, internal 70\);
+      goopg split evenly\. Ascending inserts now build PG\'s page counts \(18000 int4 keys: 52, was 90; 100000:
+      276, was 494\)\. Test `TestAscendingInsertsSplitRightmostAtFillfactor`\.
+    - No plan moved: the gate clusters keep their old index files\.
+    - Remaining, in order: \(1\) owner reload of the goopg TPC\-DS clusters, so their indexes are rebuilt under the
+      new rule; \(2\) slice 2, resolving `IndexRealPages` through the catalog\'s database and threading `searchCtx\.cat`
+      into `estimateIndexGeometry` — done earlier it would price today\'s half\-empty files; \(3\) the heap
+      residual\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(no change\), TPC\-H
+      acceptance arm PASS, regress A/B 5 index suites identical, nbtree `\-race`\.
 - [ ] **M0146-0179 — a Hash Semi Join with a pulled subquery rel as the hashed inner (TPC-DS Q70)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F4). PG elects `Hash Semi Join`
   (38304.53) hashing the 2-row `tmp1` subquery under the main join's Gather; goopg elects a Nested
