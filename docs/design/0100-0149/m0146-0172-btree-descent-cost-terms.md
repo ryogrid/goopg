@@ -114,6 +114,11 @@ All are in the deferral ledger.
 - **SF1 cost comparisons sit on stale heaps.** `catalog_sales` and
   `store_sales` (numeric as text) are 10–13% above PG. An owner reload is
   needed; the evidence is added to the `char(n)` reload item.
+  - M0146-0174 (recon, closed 2026-10-13) traced the SF1 Q47/Q96 match
+    losses to the same load: unpadded `char(n)` makes `time_dim` and `item`
+    cheaper to scan than in PG. On the fresh SF0.25 load, goopg prices both
+    Q96 routes within 0.1% of PG
+    (`analysis/m0146/m0146-0174/findings.txt`).
 - **Index geometry.** goopg's btree files are smaller than PG's
   (`inventory_pkey` 7697 against 12606 pages), so looped probes price
   slightly below PG's.
