@@ -215,6 +215,16 @@ banner at the next `## ` line).
    multiplier.** The retirement impl is first among new item-3 work;
    it unblocks M0145-0008ag → 0009p/0060 (0060's other blocker 0061 has
    landed). The probe-runtime residual is M0146-0088's ledgered ~1.9x.
+   **Chain landed 2026-10-13:** M0146-0159 `[x]` (`de45f8a6f`),
+   M0145-0008ag `[x]`, M0146-0009p `[x]` (`b27c58316`), M0146-0060
+   `[x]` (`4557c69d4`), plus M0146-0170/0169/0171/0172/0174 and seven
+   M0146-0042 slices — the day's queue drained. **Next item-3 work
+   (OWNER DECISIONS 2026-10-13): the parity-closure sweep's five
+   mechanism findings, filed as M0146-0176 → 0177 → 0178 → 0179 →
+   0180** (each a one-to-two-loop slice; 0176 is a plan regression
+   since M0146-0130). M0146-0005dp re-opened alongside (its 0049/0049e
+   gate landed). M0146-0014 re-opened under the pin above — new
+   findings from its sweeps file under it again.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -365,6 +375,15 @@ parked on pseudo-id grounds). With `regress` a Movement instrument as
 of today this family can claim honest movement — 0015g itself moved
 regress foreign_data 2459→2428. Not an exemption: later completions
 accumulate a fresh budget.)
+
+LINEAGE-BASELINE: M0146-0014 M0146-0148 M0146-0014c M0146-0149 M0146-0150 M0146-0014d
+(owner pin 2026-10-13, delegated — resolves the 2026-10-13 S4
+escalation on the parity-closure sweep. The five are routing recons —
+their movement lands in the tasks they file, so `Movement: none` is
+structural, not inert. Pinning empties the window so the sweep's five
+unfiled first-divergence findings (0014d-F1..F5) can be filed as
+M0146-0176..0180. Not an exemption: later completions accumulate a
+fresh budget.)
 
 OWNER DECISIONS 2026-09-22 (progress-report review
 `tmp/progress-planner-rewrite-260922-2/01-progress-assessment.md`; details
@@ -913,6 +932,41 @@ and consuming correctness/regress-coverage work ahead of it"):
   says "S2 findings pending owner placement" is a claim, not state;
   this decision is the state.
 
+OWNER DECISIONS 2026-10-13 (b) — evening (delegated; resolves the
+parity-queue-exhausted state the loop hit at 18:56, commit `5953fe051`'s
+"items 3-9 had no selectable row → item 10"):
+
+- **M0146-0014 re-opened + pinned.** Its last-5 none streak was routing
+  recons — movement lands in the filings, so S4 is structural here.
+  LINEAGE-BASELINE: M0146-0014 0148 0014c 0149 0150 0014d.
+- **F1–F5 filed as M0146-0176…0180** (Parent: M0146-0014) and named the
+  next item-3 work in order 0176 → 0177 → 0178 → 0179 → 0180. Each
+  carries a first-divergence record and expected match movement —
+  parity, not carve-out work.
+- **M0146-0005dp re-opened** — its "re-select when M0146-0049 lands"
+  gate is met (0049 `[x]`, 0049e `e75280c05`). Verify premise vs
+  residual; PARAM-APPEND first-divergence record.
+- **M0142-0008 chain: parked, accurately.** Post-producer reachability
+  was re-measured ZERO (M0142-0008a-3i-reach-verify + route-a step 2);
+  the residual is the leaf-count/lateral class owned by the M0145-0003
+  line. The chain's entries and the UNFROZEN block now say so — no new
+  recon filed.
+- **M0146-0067 and M0146-0007 residue annotated** — both are
+  regress-only/no-TPC-witness classes; they rank below item 10 under
+  the S7 carve-out (0067 note added; 0007's "resumes under normal
+  item-3 order" superseded).
+- **M0142-0005g closed `[x]`** — recon complete (no sub-term diverges;
+  the gap is corpus content + sampling noise); remaining action is the
+  corpus-side ask on the M0142-0005 escalation.
+- **PG reference clusters released from HOLD** — the :65432/:65438
+  `pgdata.HOLD` markers were known-cause host-reboot unclean-shutdown
+  markers (stale postmaster.pid, dead pid, ~18:20); no evidence value.
+  Cleared and restarted via `scripts/ref-clusters-ensure.sh`.
+- **Not actioned:** the SF1 TPC-DS reload (stale-load corpus rebuild —
+  an owner-side op, tracked as the M0142-0005 escalation's existing
+  ask) and M0119-0006 / M0122-0008's `[!]` (ambiguous pseudo-id
+  children — pins unsafe, established decision).
+
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
 `M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
@@ -926,7 +980,16 @@ reachability must still be demonstrated by the producer route, not credited
 to the lift). The sanctioned route is the
 previously-unfiled producer, now filed as **M0142-0008-producer** below: teach
 an IN-unnesting (or EXISTS-variant) path to set `.SJInfo` on a
-DP-search-visible `JoinSemi` link, the way c19 did for ANTI. csq-R2's
+DP-search-visible `JoinSemi` link, the way c19 did for ANTI. **Status
+2026-10-13 (owner): the producer landed `[x]` (`1f76d83d9`) and
+post-producer reachability was re-measured as ZERO** —
+`M0142-0008a-3i-reach-verify` and the `route-a` step-2 re-measure found
+no `.SJInfo`-bearing pair reaches the arm; the residual blockers are the
+`leaf-count` (Q16/Q94/Q35 undecomposable composite leaves) and `lateral`
+(Q69/Q10) classes, owned by the M0145-0003 line, not by this chain.
+The 0008c-1a/3d/4 impls stay parked until that line admits the leaves —
+they are NOT selectable work; the earlier "unreachable" entry notes are
+accurate post-producer, not stale. csq-R2's
 ledger row is updated with this decision (`.ralph/deferral_ledger.md`,
 row dated 2026-09-20).
 
@@ -11073,7 +11136,7 @@ cross-layer programme that has never been scoped.
     `docs/design/0100-0149/m0142-0005f-tpch-corpus-layout-parity.md`;
     evidence `tmp/m0142-0005f-census.{sh,txt}`. Follow-up carried by the
     M0142-0005 root's ESCALATION block (lineage budget exhausted — S4).
-- [ ] **M0142-0005g — recon: `patternClauseSelectivity` vs PG on
+- [x] **M0142-0005g — recon: `patternClauseSelectivity` vs PG on
   `LIKE '%x%'` — 2× divergence feeding `loopCount`.**
   Parent: M0142-0005c. Kind: recon.
   `part WHERE p_name LIKE '%green%'` (TPC-H Q9): goopg estimates 12121, PG
@@ -11117,6 +11180,10 @@ cross-layer programme that has never been scoped.
     none achievable via `patternsel` changes** — any task to align the
     number must operate on the corpus, which is the M0142-0005
     escalation's existing ask.
+  - Done 2026-10-13 (owner): recon complete — findings recorded above; the
+    remaining action is the corpus-side ask already on the M0142-0005
+    escalation. Closing so the phantom-selectable row stops appearing.
+  Movement: none — recon
 - [x] **M0142-0006 — apply `semiJoinMatchFraction` in `estimateNLIndexJoin`** —
   `estimateNLIndexJoin` (`cardinality.go:239-241`) returns `EstimateRows(j.Outer)` for
   SEMI/ANTI, while its sibling `estimateJoin` (`:608-625`) applies the match
@@ -13537,7 +13604,10 @@ cross-layer programme that has never been scoped.
   `.SJInfo` on a DP-search-visible `JoinSemi` link, the same way c19 did
   for ANTI). Read design doc §58 before re-running this recon again.
   Still not
-  picked up. Deferred for the same reason as 3c
+  picked up. Deferred for the same reason as 3c — **and re-verified
+  post-producer 2026-10-13 (owner note): reachability is still ZERO;
+  the residual blocker is the `leaf-count`/`lateral` class owned by the
+  M0145-0003 line. Parked, not selectable.**
   otherwise: `sortInnerAndOuter`/`matchUnsortedOuterMerge`/
   `matchUnsortedOuterMergePartial` (merge) and `addPartialNestLoopPaths`
   (parallel NL), PG oracle `sort_inner_and_outer`/`match_unsorted_outer`,
@@ -13560,6 +13630,9 @@ cross-layer programme that has never been scoped.
   unreachable in production the moment it lands too, for the same
   structural reason (no `parser.JoinSemi` producer reaches the search yet),
   independent of Q78's firewall. Do not pick up ahead of that unblock.
+  **Post-producer note 2026-10-13 (owner): producer `[x]` landed and
+  reachability re-measured ZERO — residual blocker is the leaf-count /
+  lateral class owned by the M0145-0003 line; parked, not selectable.**
 - [x] **M0142-0008-producer — teach an unnesting path to set `.SJInfo` on a
   DP-search-visible `JoinSemi` link (THE unblock for the whole chain)** —
   filed 2026-09-20 on the owner's unfreeze decision. Recon has converged on
@@ -25705,7 +25778,7 @@ M0146-0001 re-baseline census on the new default arm.
       and ignores the join\'s stamped `PlanRows` \(14 queries\)\. Filed
       M0146\-0009k\.
     Movement: none — recon
-- [!] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
+- [ ] **M0146\-0005dp — a parameterised Append with index\-scan children** \(filed 2026\-10\-02 by the slice\-114 routing census\)\.
   Q54: PG drives an item NL into a parameterised Append \(Bitmap Heap catalog\_sales \+ Index Scan web\_sales\_pkey\); goopg never emits an Append with index children \(my\_customers subtree 19832 vs 6537\)\.
   Kind: impl
   Parent: M0146\-0005
@@ -25716,6 +25789,11 @@ M0146-0001 re-baseline census on the new default arm.
     single `\*IndexScan` — no `NestLoopParam` over a general inner subtree\.
     Re\-select when M0146\-0049 lands\.
     STALE\-OK: M0146\-0005dt \(cited as the filing recon, not the blocker\)
+  - **RE\-OPENED 2026\-10\-13 \(owner, delegated\):** the gate is met — M0146\-0049 is `\[x\]` and
+    the real blocker 0049e landed 2026\-10\-07 \(`e75280c05`\)\. Verify whether the 0049/0049e work
+    discharged this premise \(a parameterised Append with index\-scan children for Q54's my\_customers
+    subtree\) or a residual remains; first\-divergence record is PARAM\-APPEND, item\-3 rank via
+    Parent: M0146\-0005\.
     STALE\-OK: M0146\-0049 \(re\-opened 2026\-10\-06; the real blocker is its open child 0049e, still cited here\)
   - [x] **M0146\-0005dt — recon: what Q54\'s parameterised Append needs**
     \(2026\-10\-03\)\.
@@ -26736,6 +26814,12 @@ Movement: none — instrument artefact — syntax\-gap fix with no TPC witness; 
   appendrel at both scales), which stays filed under this root. The
   ledgered regress-fidelity residue (0007f–0007i rows) resumes under
   normal item-3 order.
+  **Superseded 2026-10-13 (S7 carve-out):** the remaining residue is
+  regress-fidelity only — "expected movement: regress `subselect`/`with`
+  plan text only; no TPC-DS category" — so open residue under this root
+  ranks below item 10. Select a residue slice only when a corpus query or
+  named regress case calls for it; M0146-0065 (the Q2 TPC witness) is
+  already `[x]`.
   > ## ESCALATION 2026\-10\-10 \(S4 lineage budget\) — M0146\-0007 held \[\!\] again
   > The five most recent completed descendants \(0119, 0123, 0124, 0129, 0145\) all carry `Movement: none`\.
   > M0146\-0145 \(this loop, 04e2eee04\) spent the last slot\.
@@ -28664,7 +28748,7 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     Gather\. Both splices now peel only worker\-safe wrappers
     \(`wrapperRunsInWorkers`\)\.
   Movement: yes — TPC-H CATEGORIES-EXCL-MATCH parameterisation 3 -> 2, aggregation-strategy 2 -> 1, sort-strategy 2 -> 1, parallelism 5 -> 4 (Q17); TPC-DS Q10/Q35 plans change, counts unchanged
-- [!] **M0146-0014 — parity-closure sweep** (recon; the milestone's
+- [ ] **M0146-0014 — parity-closure sweep** (recon; the milestone's
   exit report). Re-run the first-divergence census on both corpora and
   prove every remaining record is either assigned to a live task above
   or presented to the owner as a named, measured, waived residual —
@@ -28684,6 +28768,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   > - **Size:** each finding is a one\-to\-two\-loop slice\.
   >
   > Owner: re\-open \(or pin a LINEAGE\-BASELINE\) so F1–F5 can be filed under M0146\-0014, or place them elsewhere\.
+  > RESOLVED 2026\-10\-13 \(OWNER DECISIONS 2026\-10\-13\): re\-opened `\[\!\]`→`\[ \]` with the banner
+  > LINEAGE\-BASELINE pin \(0148/0014c/0149/0150/0014d\); F1–F5 filed as **M0146\-0176 through M0146\-0180**
+  > \(Parent: M0146\-0014, item\-3 order 0176→0177→0178→0179→0180\)\.
   >
   > - **0014d\-F1 — a correlated SubPlan conjunct is applied unpriced above the join \(TPC\-DS Q32, Q92\)**: Since M0146\-0130 \(`a6905e365`\) the conjunct `ws\_ext\_discount\_amt > \(SubPlan 1\)` is not
   >   in the \{web\_sales, item\} join restrictlist; goopg applies it as a top `Filter:` that no join path pays for\. Q92
@@ -31101,6 +31188,8 @@ Movement: none — instrument artefact — typing fix; fire set width\-only \(su
   links\.
   Kind: impl
   Parent: M0146\-0028
+  - Rank: below item 10 under the S7 carve\-out — no TPC witness \(M0146\-0028 §14\); expected
+    `Movement:` is regress/`none`\. Select when a corpus query or regress case names it\.
   - **Held `\[\!\]` 2026\-10\-09** by the S4 lineage escalation in M0146\-0005 \(its last five completed descendants, 0111–0115, all carry `Movement: none`\)\. Only the owner reopens it\.
   - **RE-OPENED 2026\-10\-12 \(owner, delegated\):** M0146\-0005's pin
     \(LINEAGE\-BASELINE 0111–0115\) resolves the exhaustion this hold
@@ -32331,3 +32420,63 @@ Movement: none — recon — the two SF1 losses are stale\-load artefacts; SF0\.
     - Five new mechanism findings \(F1–F5\) are recorded unfiled in M0146\-0014\'s S4 escalation \(lineage budget\)\.
       Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md`\.
 Movement: none — recon
+- [ ] **M0146-0176 — a correlated SubPlan conjunct is applied unpriced above the join (TPC-DS Q32, Q92)**
+  (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F1; plan regression since M0146-0130
+  `a6905e365`). The conjunct `ws_ext_discount_amt > (SubPlan 1)` is not in the {web_sales, item} join
+  restrictlist; goopg applies it as a top `Filter:` that no join path pays for. Q92 SF0.25 elects a
+  nested loop at 2277.04 = 2221.05 + 160 x 0.35, with no charge for 160 SubPlan calls at 138.7 each.
+  PG keeps it as the inner-unique hash join's Join Filter, paid on 3 matched rows: 8941.29. Q32 has
+  the same fingerprint. Before 0130 goopg had PG's shape for Q92 (8994.36). Both scales.
+  PG: `distribute_qual_to_rels` (initsplan.c) places the clause at relids {web_sales, item};
+  `cost_qual_eval` charges the SubPlan's `per_call_cost` in `final_cost_hashjoin` /
+  `final_cost_nestloop` (costsize.c).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: dump where Q92's conjunct is placed (`correlatedScalarSublinkLeaf` / the seam choosing
+    leaf, join clause or top Filter) and confirm it is missing from the {item, web_sales} restrictlist;
+    keep a two-rel correlated-SubPlan conjunct as a join restrictinfo so every join path pays
+    `joinQualEvalCost`.
+- [ ] **M0146-0177 — the ordered-paths step offers a full Sort beside the Incremental Sort (TPC-DS Q60)**
+  (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F2). PG's `create_ordered_paths`
+  (planner.c, the presorted_keys arm) adds only an Incremental Sort when the input path has a non-empty
+  presorted prefix; goopg's `addOrderedPaths` also adds a full Sort, which wins Q60 SF0.25 by about
+  0.6 (0.002%).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: in goopg's ordered-paths arm skip the full-Sort candidate for an input whose presorted
+    prefix is non-empty, as PG does; re-run the fire set (Q4 may share the rule).
+- [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
+  (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
+  Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
+  Scan (1653.62); PG's index-only scan must carry ~212 more, i.e. heap fetches (`cost_index`
+  allvisfrac, costsize.c). Full index-only scans on `item_pkey` / `customer_pkey` price +101 / +255
+  higher in PG. Separately, goopg's int4 pkeys hold ~458 tuples per page, past PG's maximum for
+  16-byte tuples (40 vs ~52 pages for item_pkey).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: read-only `relpages, relallvisible` for store_returns, item, customer on :65438
+    (tpcds025) and a private SF0.25 clone; PG `SET enable_seqscan=off; EXPLAIN SELECT sr_item_sk,
+    sr_ticket_number FROM store_returns`; then decide whether goopg's relallvisible (VACUUM VM
+    accounting) or the index density differs.
+- [ ] **M0146-0179 — a Hash Semi Join with a pulled subquery rel as the hashed inner (TPC-DS Q70)**
+  (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F4). PG elects `Hash Semi Join`
+  (38304.53) hashing the 2-row `tmp1` subquery under the main join's Gather; goopg elects a Nested
+  Loop with tmp1 outer and a Materialize over the Gather (38320.63). PG's arm built from goopg's own
+  inputs would cost ~38262, so goopg likely never generates it. Both scales.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: instrument `addPath` on the joinrel {store_sales, d1, store, tmp1} for Q70 SF0.25 and
+    list every hash candidate; if none hashes tmp1, find the gate (`hash_inner_and_outer` JOIN_SEMI,
+    joinpath.c).
+- [ ] **M0146-0180 — a Parallel Append is priced below its own first child (TPC-DS Q76)**
+  (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F5). Q76 SF0.25: goopg's Parallel
+  Append costs 14166.13 over a first child of 17941.59; PG's `cost_append` (costsize.c,
+  parallel-aware arm) sums the partial children to 37614.25. The query totals are 15612 vs 39026.
+  **Plan-instrument rationale:** it does not decide Q76's first divergence but it distorts every
+  Append-vs-other cost comparison — expected movement on the plan instruments (fire set /
+  CATEGORIES-EXCL-MATCH) once Append costing stops under-pricing itself. Also seen: Q5's 2-key Hash
+  Right Join adds ~4049 over its inputs where PG adds ~945 (`approx_tuple_count` / inner-unique).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: decompose goopg's Parallel Append cost for Q76 against PG's `cost_append` partial arm
+    (per-child cost, parallel divisor, the non-partial rule M0146-0137 changed).
