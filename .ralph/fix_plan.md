@@ -32605,7 +32605,7 @@ Movement: yes — match SF0.25 72 -> 74 (TPC-DS Q32, Q92); CATEGORIES-EXCL-MATCH
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H fire set \(no plan
       change\) \+ acceptance arm PASS, regress A/B 5 cases identical\.
 Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 13 -> 12
-- [ ] **M0146\-0181 — EXPLAIN names a narrowed aggregate\'s argument wrongly in a Join Filter \(TPC\-DS Q58 SF0\.25\)**
+- [x] **M0146\-0181 — EXPLAIN names a narrowed aggregate\'s argument wrongly in a Join Filter \(TPC\-DS Q58 SF0\.25\)**
   \(filed 2026\-10\-13 by M0146\-0177\)\.
   - With M0146\-0177 the upper narrowing reaches Q58\'s three grouped subqueries under its top Incremental Sort\.
     Their Merge Join Join Filters then print `sum\(ss\_items\.item\_id\)` / `sum\(cs\_items\.item\_id\)` where PG
@@ -32619,6 +32619,21 @@ Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.
     Join Filter on their sums, Incremental Sort on top; a partial\-aggregate shape did not reproduce it\. Then trace
     the Join Filter column through `joinResidualColumn` / `expandAggOutputRef` / `chaseAggregateResultArgs` to
     where the narrowed `Agg\.Arg` index is read against an un\-narrowed row\.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0181\-inlined\-cte\-deparse\-join\-row\.md`, evidence
+    `analysis/m0146/m0146\-0181/`\)\.
+    - Route \(temporary stack print\): `formatJoinFilter` sets `reg\.joinRow`; `ws\_items\.ws\_item\_rev` is a
+      transparent inlined CTE column, so `formatThroughInlinedCTE` chased it to the body\'s `sum\(ws\_ext\_sales\_price\)`
+      and formatted it with the join row still set\. The argument\'s index 0 \(the aggregate\'s input\) was then read
+      positionally against the join row, whose position 0 is the other CTE\'s `item\_id`\.
+    - Fix: the body expression formats with the join row cleared; a non\-column result through a body PG keeps as a
+      subquery \(`cteBodyKeptAsSubquery`: Aggregate / WindowAgg / Distinct / Limit on the top spine\) is
+      parenthesised, as `get\_variable` prints a non\-Var target\.
+    - Q58 SF0\.25 / SF1 Join Filters now print PG\'s terms and parentheses \(clause order differs with the branch
+      order\); Q64 SF1\'s Memoize `Cache Key` moved from `item\.i\_category` to PG\'s `catalog\_sales\.cs\_item\_sk`\.
+    - Test: `TestExplainInlinedCTEAggregateInJoinFilter` \(PG 18\.3 text; fails with either half reverted\)\.
+    - Regress A/B \(with, subselect, join, aggregates\): identical\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: none — rendering-only: Q58/Q64 EXPLAIN text moved to PG's; the classifier compares shapes, so match 76/64 and CATEGORIES-EXCL-MATCH are unchanged
 - [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq

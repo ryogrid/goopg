@@ -5017,7 +5017,42 @@ func formatThroughInlinedCTE(cs *optimizer.CTEScan, col *optimizer.ColumnRef, re
 	}
 	restore := reg.enter(cs.Child)
 	defer restore()
-	return formatExprQual(src, reg, qualify), true
+	// M0146-0181: the source indexes the body's own nodes, never the join
+	// row the reference sat in. Left set, a join residual's positional
+	// resolve read a narrowed aggregate's argument against that row: TPC-DS
+	// Q58's `ws_items.ws_item_rev` printed `sum(ss_items.item_id)`.
+	var out string
+	reg.withJoinRow(nil, func() { out = formatExprQual(src, reg, qualify) })
+	// A body PG keeps as a subquery (not is_simple_subquery: grouped,
+	// windowed, DISTINCT or LIMITed) is read through an OUTER_VAR once its
+	// Subquery Scan is removed, and get_variable parenthesises a non-Var
+	// target: Q58's `(sum(web_sales.ws_ext_sales_price))`.
+	if _, isCol := src.(*optimizer.ColumnRef); !isCol && cteBodyKeptAsSubquery(cs.Child) {
+		out = "(" + out + ")"
+	}
+	return out, true
+}
+
+// cteBodyKeptAsSubquery reports whether the CTE body n is one PG's
+// is_simple_subquery (prepjointree.c) refuses to pull up: its top spine,
+// through the row-preserving wrappers, reaches an aggregate, a window
+// function, a DISTINCT or a LIMIT before any scan or join.
+func cteBodyKeptAsSubquery(n optimizer.Node) bool {
+	for n != nil {
+		switch t := n.(type) {
+		case *optimizer.Aggregate, *optimizer.WindowAgg, *optimizer.Distinct, *optimizer.DistinctOn, *optimizer.Limit:
+			return true
+		case *optimizer.Project:
+			n = t.Child
+		case *optimizer.Materialize:
+			n = t.Child
+		default:
+			if n = childNodeOf(n); n == nil {
+				return false
+			}
+		}
+	}
+	return false
 }
 
 // explainHashMem is the session's hash_mem in bytes, the limit
