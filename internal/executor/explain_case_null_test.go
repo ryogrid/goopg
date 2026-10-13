@@ -14,7 +14,7 @@ import (
 func TestCaseNullArmIsTyped(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ce (a int, n numeric, t text, m numeric(7,2))")
+	runSQL(t, ctx, "CREATE TABLE ce (a int, n numeric, t text, m numeric(7,2), c char(10), v varchar(10))")
 	ps := optimizer.DefaultPlannerSettings()
 	ps.MaxParallelWorkersPerGather = 0
 	for _, c := range []struct{ where, want string }{
@@ -26,6 +26,11 @@ func TestCaseNullArmIsTyped(t *testing.T) {
 		// -1, so a numeric(7,2) column's CASE labels its NULL plain numeric
 		// (TPC-DS Q43's sort key).
 		{"CASE WHEN a > 0 THEN m ELSE NULL END > 1", "Filter: (CASE WHEN (a > 0) THEN m ELSE NULL::numeric END > '1'::numeric)"},
+		// M0146-0042: format_type(type, -1) spells blank-padded char bpchar
+		// and varchar character varying (TPC-DS Q36/Q86/Q70's i_category
+		// CASE).
+		{"CASE WHEN a > 0 THEN c END = 'x'", "Filter: (CASE WHEN (a > 0) THEN c ELSE NULL::bpchar END = 'x'::bpchar)"},
+		{"CASE WHEN a > 0 THEN v END = 'x'", "Filter: ((CASE WHEN (a > 0) THEN v ELSE NULL::character varying END)::text = 'x'::text)"},
 	} {
 		q := "SELECT * FROM ce WHERE " + c.where
 		var lines []string

@@ -5370,6 +5370,19 @@ func nullConstTypeLabel(t catalog.Type) string {
 		return "double precision"
 	case "date":
 		return "date"
+	// format_type(type, -1) spellings, checked against PG 18.3's
+	// `CASE ... ELSE NULL::<type> END`: blank-padded char without a typmod
+	// is the internal name bpchar (TPC-DS Q36/Q86/Q70's i_category CASE).
+	case "char", "bpchar", "character":
+		return "bpchar"
+	case "varchar", "character varying":
+		return "character varying"
+	case "float4", "real":
+		return "real"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
 	}
 	return ""
 }
