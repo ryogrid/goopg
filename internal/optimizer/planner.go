@@ -2071,13 +2071,23 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// M0146-0028b: not for a pulled-up derived table — the index
 		// producer rebuilds the scan from the statement's own WHERE alone
 		// and would drop the pulled body's quals.
+		//
+		// M0146-0060: it now fires only for a LIKE prefix, the one restriction
+		// whose index path the search does not build (PG derives the
+		// `col ~>=~ 'pfx' AND col ~<~ 'pfy'` index quals in
+		// match_pattern_prefix, indxpath.c / like_support.c). Every other
+		// uncorrelated restriction is the costed search's call: with
+		// statistics it elects PG's Index / Bitmap / Index Only Scan, and on
+		// a relation where PG keeps its Seq Scan the rule no longer overrides
+		// it with a heuristic index scan that never competed on cost.
 		if isSimpleSingle && whereQual != nil && len(ctx.pulledDerived) == 0 && planIsBareSeqScanTree(node) {
 			onlyFrom := len(s.From) == 1 && s.From[0].Only
-			whereForIndex := injectLikeRangePredicates(whereQual)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
-				return nil, err
-			} else if ok {
-				node = idxNode
+			if whereForIndex := injectLikeRangePredicates(whereQual); whereForIndex != whereQual {
+				if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+					return nil, err
+				} else if ok {
+					node = idxNode
+				}
 			}
 		}
 	} else {

@@ -189,7 +189,10 @@ func (s *searchCtx) restrictionPathIsIndexOnly(cat catalog.Catalog, rel *RelOptI
 // (indexOnlyResidualAdmissible).
 func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
 	needed []catalog.Column, conjuncts []Expr) ([]indexPathClause, bool) {
-	if idx == nil || idx.HasPredicate {
+	// PG's hash AM cannot return index tuples (amcanreturn is NULL,
+	// hashhandler in hash.c), so a `USING hash` index never drives an Index
+	// Only Scan (M0146-0060).
+	if idx == nil || idx.DeclaredHash || !partialIndexUsable(tbl, idx, conjuncts) {
 		return nil, false
 	}
 	covered, ok := indexCoversColumns(idx, needed)

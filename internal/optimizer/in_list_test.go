@@ -36,7 +36,7 @@ func TestInListSAOPIndexScan(t *testing.T) {
 	}
 
 	stmt := parseOne(t, "SELECT l_orderkey FROM lineitem WHERE l_shipmode IN ('MAIL', 'SHIP')")
-	node, err := Plan(stmt, c)
+	node, err := planIndexSubject(stmt, c)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

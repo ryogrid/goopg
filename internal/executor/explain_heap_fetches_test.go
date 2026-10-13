@@ -51,6 +51,9 @@ func extractHeapFetches(t *testing.T, jsonRow string) (float64, bool) {
 // required a heap fetch (page not ALL_VISIBLE). This is the horizons.spec
 // enabler — pruner_query reads ...->'Plan'->'Heap Fetches'.
 func TestExplainHeapFetchesIndexOnlyScan(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
@@ -67,19 +70,19 @@ func TestExplainHeapFetchesIndexOnlyScan(t *testing.T) {
 
 	// Sanity: the planner must promote this to an IndexOnlyScan, else the
 	// Heap Fetches assertions below are meaningless.
-	if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
+	if ios := findIndexOnlyScan(planOneIndexScan(t, q, ctx.Catalog)); ios == nil {
 		t.Fatalf("plan for %q has no IndexOnlyScan", q)
 	}
 
 	// COSTS OFF text render must carry the upstream IOS label.
-	planLines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+q)
+	planLines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) "+q, indexOnlySettings())
 	if !strings.Contains(strings.Join(planLines, "\n"), "Index Only Scan using hft_data_key on hft") {
 		t.Errorf("COSTS OFF render missing IOS label:\n%s", strings.Join(planLines, "\n"))
 	}
 
 	// Before VACUUM the heap page is not ALL_VISIBLE → both entries need a
 	// heap fetch.
-	rows := runExplainRows(t, ctx, "EXPLAIN (FORMAT JSON, BUFFERS, ANALYZE) "+q)
+	rows := explainLinesWithSettings(t, ctx, "EXPLAIN (FORMAT JSON, BUFFERS, ANALYZE) "+q, indexOnlySettings())
 	if len(rows) != 1 {
 		t.Fatalf("EXPLAIN JSON: got %d rows, want 1", len(rows))
 	}
@@ -94,7 +97,7 @@ func TestExplainHeapFetchesIndexOnlyScan(t *testing.T) {
 	// After VACUUM the page is ALL_VISIBLE → the IOS fast path returns rows
 	// from the index key with zero heap fetches.
 	vacuumThen(t, ctx, "hft")
-	rows = runExplainRows(t, ctx, "EXPLAIN (FORMAT JSON, BUFFERS, ANALYZE) "+q)
+	rows = explainLinesWithSettings(t, ctx, "EXPLAIN (FORMAT JSON, BUFFERS, ANALYZE) "+q, indexOnlySettings())
 	hf, ok = extractHeapFetches(t, rows[0])
 	if !ok {
 		t.Fatalf("no IndexOnlyScan node emitted \"Heap Fetches\" after VACUUM:\n%s", rows[0])
@@ -104,7 +107,7 @@ func TestExplainHeapFetchesIndexOnlyScan(t *testing.T) {
 	}
 
 	// Text ANALYZE render carries the "Heap Fetches: N" detail line.
-	textLines := runExplainRows(t, ctx, "EXPLAIN ANALYZE "+q)
+	textLines := explainLinesWithSettings(t, ctx, "EXPLAIN ANALYZE "+q, indexOnlySettings())
 	if !strings.Contains(strings.Join(textLines, "\n"), "Heap Fetches:") {
 		t.Errorf("text ANALYZE render missing 'Heap Fetches:' line:\n%s", strings.Join(textLines, "\n"))
 	}

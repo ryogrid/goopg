@@ -67,11 +67,14 @@ func setupRangeScanFixture(t *testing.T) (*Context, func()) {
 // Filter is dropped for a single-conjunct WHERE) and returns the correct
 // rows (id >= 1995-01-01 → ids 3, 4, 5, 6).
 func TestRangeIndexScanLowerBoundOnly(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	ctx, cleanup := setupRangeScanFixture(t)
 	defer cleanup()
 
 	sql := "SELECT id FROM events WHERE ts >= timestamp '1995-01-01'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
 	// Verify planner chose IndexScan directly (no Filter: the single >=
 	// conjunct is fully implemented by the scan).
@@ -122,24 +125,24 @@ func TestRangeIndexScanLowerBoundOnly(t *testing.T) {
 // indexed timestamp column uses Filter(IndexScan) and returns exactly
 // the rows in the range (1994-01-01 <= ts < 1996-01-01 → ids 2, 3, 4).
 func TestRangeIndexScanTwoSided(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	ctx, cleanup := setupRangeScanFixture(t)
 	defer cleanup()
 
 	sql := "SELECT id FROM events WHERE ts >= timestamp '1994-01-01' AND ts < timestamp '1996-01-01'"
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 
-	// Verify planner chose Filter(IndexScan).
+	// The costed search binds both bounds as index quals and keeps no
+	// residual Filter — PG's `Index Cond: ((ts >= …) AND (ts < …))` shape.
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)
 	}
-	f, ok := proj.Child.(*optimizer.Filter)
+	idx, ok := proj.Child.(*optimizer.IndexScan)
 	if !ok {
-		t.Fatalf("child=%T want *planner.Filter(IndexScan)", proj.Child)
-	}
-	idx, ok := f.Child.(*optimizer.IndexScan)
-	if !ok {
-		t.Fatalf("Filter.Child=%T want *planner.IndexScan", f.Child)
+		t.Fatalf("child=%T want *planner.IndexScan with both bounds as index quals", proj.Child)
 	}
 	if idx.LowKey == nil {
 		t.Fatal("IndexScan.LowKey should be non-nil")
@@ -160,7 +163,7 @@ func TestRangeIndexScanTwoSided(t *testing.T) {
 	// Rows with 1994-01-01 <= ts < 1996-01-01: ids 2 (1994-06-15), 3 (1995-01-01), 4 (1995-06-01)
 	// Note: 1996-01-01 is exclusive (< not <=), so the scan itself stops
 	// EXCLUSIVELY (M0134-0001 S4: HighOp=OpLt) and id=5 (1996-01-01) is not
-	// emitted; the kept Filter re-applies the predicate as a second guard.
+	// emitted.
 	if len(rows) != 3 {
 		t.Fatalf("rows=%d want 3 (ids 2,3,4); rows=%v", len(rows), rows)
 	}

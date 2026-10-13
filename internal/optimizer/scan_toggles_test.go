@@ -13,11 +13,10 @@ package optimizer
 //	enable_indexscan=off              Bitmap Heap Scan
 //	enable_indexscan+bitmapscan=off   Seq Scan
 //
-// goopg's scan choice is rule-based, so a disabled shape is DECLINED by its
-// producer rather than priced out of the running; the third row therefore lands
-// on the Seq Scan directly (no bitmap producer runs for this single-table
-// rule-based plan). Rows 1, 2 and 4 — and the invariant that the toggles change
-// NOTHING when untouched — are what this test pins.
+// The costed search makes the defaults' election from x8's statistics; a
+// disabled shape is declined by its producer. Rows 1, 2 and 4 — and the
+// invariant that the toggles change NOTHING when untouched — are what this
+// test pins.
 
 import (
 	"testing"
@@ -41,6 +40,12 @@ func scanToggleCatalog(t *testing.T) catalog.Catalog {
 		false, "btree", false); err != nil {
 		t.Fatal(err)
 	}
+	// Analyzed statistics, so the defaults' index election is the costed
+	// search's (M0146-0060: the rule-based producer no longer overrides a
+	// costed Seq Scan, and an in-memory catalog with no stats sizes x8 as
+	// near-empty, where a Seq Scan rightly wins).
+	tbl.Stats = &catalog.TableStats{RowCount: 10000, Pages: 45, Analyzed: true,
+		Columns: []catalog.ColumnStats{{NDistinct: 10000}, {NDistinct: 100}}}
 	return c
 }
 
@@ -103,7 +108,13 @@ func TestScanMethodTogglesGateTheScanShape(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stmt := parseOne(t, tc.sql)
-			node, err := Plan(stmt, withScanToggles(cat, tc.index, tc.bitmap, tc.indexOnly))
+			// The wire path sets both halves: the catalog toggles
+			// (sessionPlanCatalog) and the search's PlannerSettings
+			// (dispatch.go reads enable_seqscan/indexscan/bitmapscan).
+			ps := DefaultPlannerSettings()
+			ps.EnableIndexScan = !tc.index
+			ps.EnableBitmapScan = !tc.bitmap
+			node, err := PlanWithSettings(stmt, withScanToggles(cat, tc.index, tc.bitmap, tc.indexOnly), ps)
 			if err != nil {
 				t.Fatalf("Plan: %v", err)
 			}

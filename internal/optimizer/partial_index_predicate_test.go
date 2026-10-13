@@ -161,7 +161,7 @@ func TestPartialIndexChosenWhenPredicateEqualsQual(t *testing.T) {
 	// *IndexOnlyScan — both prove the same predicate-implication path, but
 	// this keeps the assertion shape simple and matches the acceptance case.
 	stmt := parseOne(t, "SELECT seqno, random FROM hash_i4_heap WHERE seqno = 9999")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

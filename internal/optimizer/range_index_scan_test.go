@@ -46,7 +46,7 @@ func rangeIndexCatalog(t *testing.T) catalog.Catalog {
 func TestPlanRangeScanSingleLowerBound(t *testing.T) {
 	cat := rangeIndexCatalog(t)
 	stmt := parseOne(t, "SELECT l_linenumber FROM lineitem WHERE l_shipdate >= timestamp '1994-01-01'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -76,11 +76,12 @@ func TestPlanRangeScanSingleLowerBound(t *testing.T) {
 }
 
 // TestPlanRangeScanTwoSidedTimestamp verifies that a two-sided range on an
-// indexed timestamp column produces Filter(IndexScan{LowKey!=nil, HighKey!=nil}).
+// indexed timestamp column produces IndexScan{LowKey!=nil, HighKey!=nil} with
+// both bounds as index quals and no residual Filter — PG's shape.
 func TestPlanRangeScanTwoSidedTimestamp(t *testing.T) {
 	cat := rangeIndexCatalog(t)
 	stmt := parseOne(t, "SELECT l_linenumber FROM lineitem WHERE l_shipdate >= timestamp '1994-01-01' AND l_shipdate < timestamp '1995-01-01'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -88,13 +89,9 @@ func TestPlanRangeScanTwoSidedTimestamp(t *testing.T) {
 	if !ok {
 		t.Fatalf("root=%T want *Project", node)
 	}
-	f, ok := proj.Child.(*Filter)
+	idx, ok := proj.Child.(*IndexScan)
 	if !ok {
-		t.Fatalf("child=%T want *Filter(IndexScan)", proj.Child)
-	}
-	idx, ok := f.Child.(*IndexScan)
-	if !ok {
-		t.Fatalf("Filter.Child=%T want *IndexScan", f.Child)
+		t.Fatalf("child=%T want *IndexScan with both bounds as index quals", proj.Child)
 	}
 	if idx.Key != nil {
 		t.Fatalf("IndexScan.Key should be nil for range scan, got %T", idx.Key)
@@ -141,7 +138,7 @@ func TestPlanRangeScanFallbackNoIndex(t *testing.T) {
 func TestPlanRangeScanVarchar(t *testing.T) {
 	cat := rangeIndexCatalog(t)
 	stmt := parseOne(t, "SELECT p_partkey FROM part WHERE p_type > 'A'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -184,7 +181,7 @@ func TestPlanRangeScanRecordsStrictOpAndDropsSingleFilter(t *testing.T) {
 
 	// Single strict conjunct: HighOp=OpLt recorded, redundant Filter dropped.
 	stmt := parseOne(t, "SELECT c1 FROM t WHERE c2 < 100")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -212,7 +209,7 @@ func TestPlanRangeScanRecordsStrictOpAndDropsSingleFilter(t *testing.T) {
 	// Multi-conjunct WHERE: the range conjunct is absorbed but the Filter MUST
 	// stay — it still re-checks the non-range conjunct (c3 = 'x').
 	stmt2 := parseOne(t, "SELECT c1 FROM t WHERE c2 < 100 AND c3 = 'x'")
-	node2, err := Plan(stmt2, cat)
+	node2, err := planIndexSubject(stmt2, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

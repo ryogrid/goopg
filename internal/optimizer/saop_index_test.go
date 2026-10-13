@@ -108,19 +108,28 @@ func TestSAOPMovedShapes(t *testing.T) {
 		{"int PK IN", "SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3, 5)", 3},
 		{"varchar IN", "SELECT i_item_sk FROM item WHERE i_item_id IN ('A', 'B')", 2},
 		{"any array spelling", "SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[2, 3])", 2},
-		{"single element", "SELECT i_item_id FROM item WHERE i_item_sk IN (7)", 1},
+		// PG's transformAExprIn turns a one-element IN list into `=`:
+		// `Index Cond: (i_item_sk = 7)` (PG 18.3), so the probe is a plain
+		// equality key, not a ScalarArrayOp (wantN 0 = expect Key).
+		{"single element", "SELECT i_item_id FROM item WHERE i_item_sk IN (7)", 0},
 		{"null element kept", "SELECT i_item_id FROM item WHERE i_item_sk IN (7, NULL)", 2},
 		{"duplicate elements kept", "SELECT i_item_id FROM item WHERE i_item_sk IN (7, 7, 8)", 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			node, err := Plan(parseOne(t, tc.sql), c)
+			node, err := planIndexSubject(parseOne(t, tc.sql), c)
 			if err != nil {
 				t.Fatalf("Plan: %v", err)
 			}
 			scan := findIndexScan(node)
 			if scan == nil {
 				t.Fatalf("%s: want IndexScan, got plan without one", tc.sql)
+			}
+			if tc.wantN == 0 {
+				if scan.Key == nil || len(scan.SAOPKeys) != 0 {
+					t.Fatalf("%s: want a plain equality Key (PG's `=`), got Key=%v SAOPKeys=%d", tc.sql, scan.Key, len(scan.SAOPKeys))
+				}
+				return
 			}
 			if len(scan.SAOPKeys) != tc.wantN {
 				t.Fatalf("%s: SAOPKeys has %d elements, want %d", tc.sql, len(scan.SAOPKeys), tc.wantN)
@@ -138,7 +147,7 @@ func TestSAOPMovedShapes(t *testing.T) {
 // `Index Cond: (i_item_sk = ANY (...))`) must move Seq→Index.
 func TestSAOPQ45ShapeMoves(t *testing.T) {
 	c := saopFixture(t)
-	node, err := Plan(parseOne(t,
+	node, err := planIndexSubject(parseOne(t,
 		"SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)"), c)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)

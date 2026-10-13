@@ -59,7 +59,7 @@ func newTypesIndexCatalog(t *testing.T) catalog.Catalog {
 func TestPlanVarcharColumnPicksIndexScan(t *testing.T) {
 	cat := newTypesIndexCatalog(t)
 	stmt := parseOne(t, "SELECT p_partkey FROM part WHERE p_type = 'ECONOMY ANODIZED BRASS'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestPlanVarcharColumnPicksIndexScan(t *testing.T) {
 func TestPlanCharColumnPicksIndexScan(t *testing.T) {
 	cat := newTypesIndexCatalog(t)
 	stmt := parseOne(t, "SELECT c_custkey FROM customer WHERE c_mktsegment = 'FURNITURE'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestPlanCharColumnPicksIndexScan(t *testing.T) {
 func TestPlanTimestampColumnPicksIndexScan(t *testing.T) {
 	cat := newTypesIndexCatalog(t)
 	stmt := parseOne(t, "SELECT l_linenumber FROM lineitem WHERE l_shipdate = timestamp '1995-01-01'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

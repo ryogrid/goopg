@@ -34,7 +34,7 @@ func nonConstRHSCatalog(t *testing.T) catalog.Catalog {
 func TestRangeIndexScanWithIntervalRHS_TPCH_Q1(t *testing.T) {
 	cat := nonConstRHSCatalog(t)
 	stmt := parseOne(t, "SELECT l_orderkey FROM lineitem WHERE l_shipdate <= date '1998-12-01' - interval '90 day'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestRangeIndexScanWithIntervalRHS_TPCH_Q6(t *testing.T) {
 	stmt := parseOne(t,
 		"SELECT l_orderkey FROM lineitem "+
 			"WHERE l_shipdate >= date '1994-01-01' AND l_shipdate < date '1994-01-01' + interval '1 year'")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

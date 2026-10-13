@@ -319,17 +319,17 @@ func TestPlanPgbenchSelectUsesIndexScanRule(t *testing.T) {
 		{sql: "SELECT abalance FROM pgbench_accounts WHERE 1 = aid", wantExpr: "int"},
 	}
 	for _, tc := range tests {
-		node, err := Plan(parseOne(t, tc.sql), cat)
+		node, err := planIndexSubject(parseOne(t, tc.sql), cat)
 		if err != nil {
-			t.Fatalf("Plan(%q): %v", tc.sql, err)
+			t.Fatalf("planIndexSubject(%q): %v", tc.sql, err)
 		}
 		proj, ok := node.(*Project)
 		if !ok {
-			t.Fatalf("Plan(%q) root=%T want *Project", tc.sql, node)
+			t.Fatalf("planIndexSubject(%q) root=%T want *Project", tc.sql, node)
 		}
 		idx, ok := proj.Child.(*IndexScan)
 		if !ok {
-			t.Fatalf("Plan(%q) child=%T want *IndexScan", tc.sql, proj.Child)
+			t.Fatalf("planIndexSubject(%q) child=%T want *IndexScan", tc.sql, proj.Child)
 		}
 		if idx.Index.Name != "pgbench_accounts_aid_idx" {
 			t.Fatalf("index=%q want pgbench_accounts_aid_idx", idx.Index.Name)
