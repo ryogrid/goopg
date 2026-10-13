@@ -27643,6 +27643,12 @@ Movement: yes — ea-ratchet 9 -> 1 (M0146-0009s re-pin; 53 -> 1 over the umbrel
     parse\-level form PG uses\), plan both bodies, and keep the cheaper
     per expected calls; then admit the correlated conjuncts as leaf
     restrictions in the EXISTS body \(`scalarSublinkBody`\'s twin\)\.
+  - 2026\-10\-13 witness re\-check: regress `memoize` has one \(`postgres/src/test/regress/expected/memoize\.out`
+    \~line 420\)\. An `EXISTS \(SELECT 1 FROM tenk1 t1 JOIN tenk1 t2 \.\.\. OFFSET 0\)` body plans as a per\-row
+    `EXISTS\(SubPlan 1\)` whose correlated conjuncts are leaf Filters \(`t0\.two <> four` on t2, `t0\.ten = twenty` on
+    t1\), under a Nested Loop with Memoize\. No hashed alternative appears there\.
+    - TPC\-H/TPC\-DS PG plans still show no EXISTS SubPlan, so the witness is regress\-only\.
+    - Rank: below item 10 under the S7 carve\-out \(same rule as M0146\-0175\)\.
 - [x] **M0146\-0012c — retire the one\-relation rule\'s correlated half**
   \(filed 2026\-10\-05 by M0146\-0012\)\. `planIndexScanFromWhere` under
   the `planIsBareSeqScanTree` arm of `planSelectWithSettings` still builds
