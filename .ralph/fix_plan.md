@@ -30624,7 +30624,7 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
       PASS \(nothing fired\), ea\-ratchet PASS, regress A/B 14 cases
       \(`aggregates` loses the agg\_sort\_order hunk; known flips\)\.
   Movement: none — fire set flat at both scales; the fix moves regress aggregates\' agg\_sort\_order plan to PG\'s
-- [ ] **M0146\-0060 — the single\-table rule\-based index producer overrides
+- [x] **M0146\-0060 — the single\-table rule\-based index producer overrides
   the search\'s costed seq scan for an uncorrelated restriction** \(filed
   2026\-10\-05 by M0146\-0009r\)\. With `agg\_sort\_order` \(100 rows\),
   `SELECT \* FROM agg\_sort\_order WHERE c2 < 100` plans PG\'s Seq Scan
@@ -30670,6 +30670,13 @@ Movement: none — instrument artefact — wrong\-results fix with no TPC witnes
   - **Hold lifted 2026\-10\-13:** both named blockers are resolved — M0146\-0061 \[x\] \(range bitmap path\) and
     M0145\-0008ag \[x\] \(closed by M0146\-0159\'s retirement, `de45f8a6f`\)\. First step: re\-apply the gate and check the
     `dsc` fixture elects PG\'s Bitmap Heap Scan / Index Only Scan, then move the 10 fixtures to seq\-scans\-off\.
+  - Done 2026\-10\-13 \(`4557c69d4`\): the rule fires only for a LIKE prefix; the search gained `$n` / constant\-cast
+    keys, NULL IN\-list elements, proven partial indexes \(restrict \+ IOS\) and hash\-equality\-only; 28 index\-subject
+    tests request their shape with seq/bitmap scans off \(PG\'s plan under those settings, checked\)\. agg\_sort\_order
+    matches PG \(Seq Scan 2\.25\); regress hash\_index PASSes; TPC fires none\. Design
+    `docs/design/0100\-0149/m0146\-0060\-single\-table\-index\-election\.md`\.
+    - Filed M0146\-0173 \(timestamp/interval arithmetic errors and `\.000000` output\)\.
+Movement: none — instrument artefact — no TPC\-H / TPC\-DS query changed plan \(fires=none\); regress hash\_index now PASS
 - [x] **M0146\-0061 — the search builds no Bitmap Heap Scan path for a range
   restriction** \(filed 2026\-10\-05 by M0146\-0060\)\. PG 18\.3 plans
   `SELECT a, c FROM dsc WHERE a > 97` \(3000 rows, 60 matching, `dsc\_a` on
@@ -32050,3 +32057,14 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   > M0146\-0009p\'s PG\-faithful row estimate makes goopg elect a non\-PG route that runs 3\.3s → 216s at SF1\. Kept
   > \(R3: no reverts on runtime\); reverting is the owner\'s call\. The fix is a cost\-model divergence in Q72\'s
   > subtree under the d2 hash \(this task\)\.
+- [ ] **M0146-0173 — timestamp / interval arithmetic: wrong output and spurious errors** \(filed 2026\-10\-13 by
+  M0146\-0060\)\. Against PG 18\.3: `SELECT timestamp \'2020\-01\-01\' \+ interval \'5 minutes\'` prints
+  `2020\-01\-01 00:05:00\.000000` \(PG `2020\-01\-01 00:05:00`\); `g \* interval \'1 minute\'` raises `operator \* requires
+  numeric operands`; `timestamp \+ \(text\)::interval` and `timestamp \+ make\_interval\(mins => g\)` raise `operator \+ requires
+  numeric operands`; one\-argument `to\_timestamp\(double\)` raises `requires exactly 2 arguments`\. Probe
+  `tmp/m0060/p3\.sql`\. Same class as M0146\-0040 \(`date \+ integer`\)\.
+  Kind: bug
+  Parent: M0146\-0060
+  - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out\)\.
+  - First step: the BinaryOp `\+` / `\*` typing arms for timestamp/interval and int/interval \(PG timestamp\_pl\_interval,
+    interval\_mul, mul\_d\_interval\) and the timestamp output path for a folded constant\.
