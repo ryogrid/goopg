@@ -28750,6 +28750,9 @@ Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54
     evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
     probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
 Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
+  - Slice 2026\-10\-13 \(`8944f2bff`\): a key through a Finalize/Partial aggregate\'s pruned GROUP BY column deparses
+    to the target\-list Var; TPC\-DS Q66 text\-identical at both scales \(SF0\.25 68 → 69, SF1 44 → 45\)\.
+Movement: none — instrument artefact — text\-only \(Q66 already MATCH\); text\-identical SF0\.25 68 → 69, SF1 44 → 45 is not an S3 instrument
   - Slice 2026\-10\-13 \(`549070713`\): a computed Sort/Window key deparses each aggregate output column through the
     Agg\'s target list; TPC\-DS Q36/Q86 text\-identical at both scales \(SF0\.25 66 → 68, SF1 42 → 44\)\.
 Movement: yes — text\-identical SF0\.25 66→68, SF1 42→44; CATEGORIES\-EXCL\-MATCH rendering SF0\.25 2→1, SF1 4→3

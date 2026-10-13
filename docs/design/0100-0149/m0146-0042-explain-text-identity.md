@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`549070713`, window keys over an aggregate).
+2026-10-13 (`8944f2bff`, split-aggregate passthrough key).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -611,6 +611,27 @@ Results:
   - text-identical SF0.25 66 → 68, SF1 42 → 44 (Q36, Q86).
   - `rendering` category SF0.25 2 → 1, SF1 4 → 3.
   - Values are identical, and regress content is identical.
+
+## Slice — a pruned GROUP BY column through a split aggregate (2026-10-13, `8944f2bff`)
+
+- **Witness.** TPC-DS Q66 at both scales.
+  - Each UNION ALL member groups by `d_year` under `d_year = 2001`, so the
+    planner prunes it from the group key and carries it as a passthrough
+    column.
+  - The members are parallel: Finalize over Partial, under a Gather Merge.
+  - The outer Group and Sort Keys printed the subquery's `year`; PG prints
+    `date_dim.d_year`.
+- **PG.** The pruned column stays a plain Var in the member's target list,
+  and `get_variable` deparses the Append's OUTER_VAR through the first
+  member to it.
+- **Change.** The passthrough rule in `resolveKeySourceAt` (simple
+  aggregates only, until now) runs in every aggregate mode, with the
+  output-name guard. The Finalize's passthrough reads the Partial's tail
+  through the Gather, and the Partial's reads its input.
+- **Result.**
+  - text-identical SF0.25 68 → 69, SF1 44 → 45.
+  - Values are identical, regress is identical, and the fire set is Q66
+    only.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
