@@ -28750,6 +28750,10 @@ Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54
     evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
     probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
 Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
+  - Slice 2026\-10\-13 \(`8094e1dd6`\): an omitted CASE ELSE prints `NULL::bpchar` / `character varying` / `real` /
+    timestamp types \(format\_type\(type, \-1\)\); TPC\-DS Q36/Q86/Q70 Sort Keys match PG\'s CASE text; aligned lines SF0\.25
+    3680 → 3683, SF1 3097 → 3100\. Q36/Q86 still differ in the Window clause \(GROUPING deparse, next slice\)\.
+Movement: none — instrument artefact — text\-identical flat \(Q36/Q86 keep the Window\-clause difference\); aligned lines \+3 per scale
   - Slice 2026\-10\-13 \(`d2b0ba67d`\): a key above a UNION ALL appendrel deparses through the Append\'s first child
     and stops at a kept `"\*SELECT\* n"` member \(set\_deparse\_plan / get\_variable\); TPC\-DS Q5 text\-identical at both
     scales \(SF0\.25 65 → 66, SF1 41 → 42\); Q14 10 → 2 differing lines\.

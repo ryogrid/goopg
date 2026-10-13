@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`d2b0ba67d`, TPC-DS Q5).
+2026-10-13 (`8094e1dd6`, CASE NULL labels).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -568,6 +568,26 @@ Results:
   - TPC-H Q18's key now prints the quoted `"ANY_subquery"`. PG prints
     `lineitem_1.l_orderkey` there; that divergence is pre-existing and in the
     ledger.
+
+## Slice — an omitted CASE ELSE prints its type for char, varchar, real and timestamps (2026-10-13, `8094e1dd6`)
+
+- **Witness.** TPC-DS Q36 and Q86 (both scales) and Q70. In their Sort Keys,
+  PG prints `CASE WHEN (sub.lochierarchy = 0) THEN sub.i_category ELSE
+  NULL::bpchar END`; goopg printed no ELSE.
+- **PG.** ruleutils always prints the parser's NULL defresult, through
+  `get_const_expr`, as `NULL::` plus `format_type(type, -1)`.
+- **Cause.** `nullConstTypeLabel` had no spelling for blank-padded char.
+- **Change.** The label table gains the spellings PG 18.3 prints, each checked
+  on a scratch PG: `bpchar`, `character varying`, `real`,
+  `timestamp without time zone` and `timestamp with time zone`.
+- **Result.**
+  - Values are identical, and the fire set is Q36, Q70 and Q86.
+  - Aligned identical lines: SF0.25 3680 → 3683, SF1 3097 → 3100.
+  - Text-identical stays flat. Q36/Q86 still differ in the Window clause:
+    goopg prints the Agg's output names (`grouping`, `sum`) where PG deparses
+    `GROUPING(item.i_category)` through the Agg's target list. That is the
+    next slice.
+  - Regress content is identical.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
