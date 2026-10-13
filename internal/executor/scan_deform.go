@@ -628,8 +628,10 @@ func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
 }
 
 // deformIndexLeafBound computes the EX1-02b bound an IndexScan leaf deforms:
-// the union of the incoming parent-walk bound and the leaf-local Cond refs,
-// belt-and-braces widened with the index's heap key-column ordinals.
+// the union of the incoming parent-walk bound and the leaf-local Cond refs.
+// Only when no consumer bound is recorded (None, or the count(*)-style Zero
+// an index leaf would otherwise read as full width) is it widened with the
+// index's heap key-column ordinals.
 //
 // The key PROBE exprs (Key/Keys/LowKey/HighKey) are NEVER folded here: on an
 // NLI inner they reference OUTER columns (outer-space indexes), so folding
@@ -641,6 +643,17 @@ func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
 func deformIndexLeafBound(incoming int, cond optimizer.Expr, index *catalog.Index, table *catalog.Table) int {
 	bound := deformFoldRefs(incoming, cond)
 	if bound == deformBoundFull {
+		return bound
+	}
+	// M0146-0171: a consumer-derived bound is the whole answer. PG deforms a
+	// fetched heap tuple only up to the highest attribute a consumer reads
+	// (slot_getsomeattrs from the quals and target list); a btree index scan
+	// never re-reads its key columns from the heap tuple — the descent reads
+	// the index tuple, and every recheck is a Cond already folded above. The
+	// key-column widening only stood in for a missing consumer set: on TPC-DS
+	// Q17's catalog_sales_pkey probe it deformed through cs_order_number
+	// (18 of 34 columns) for a Filter that reads cs_bill_customer_sk (4).
+	if bound >= 0 {
 		return bound
 	}
 	if index != nil && table != nil {
