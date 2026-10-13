@@ -75,8 +75,9 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 		relPages := baseRelPages(tbl, relTuples)
 		// M0146-0061: the columns a useful ordering could name, for a range
 		// probe's pathkeys (the plain restriction producer's colExprs).
+		// M0146-0188: the full-index shape needs them too, for its ordering.
 		var colExprs map[string]Expr
-		if !bare && s.hasUsefulPathkeys(rel) {
+		if s.hasUsefulPathkeys(rel) {
 			colExprs = mergeableColumnExprsFor(rel.Relids, s.clausesAll())
 			addQueryPathkeyColumnExprs(colExprs, s.queryPathkeys, s.relInfos[i].sourceIdx)
 		}
@@ -109,6 +110,26 @@ func (s *searchCtx) addIndexOnlyPaths(cat catalog.Catalog) {
 			setCheapest(rel)
 		}
 	}
+}
+
+// orderedFullIndexOnlyCovers reports whether addIndexOnlyPaths will file the
+// full-index index-only path for idx on rel — the conditions of its bare arm:
+// enable_indexonlyscan on, the statement's needed columns known and covered
+// by idx, a bare leaf, and no nullable unbound key column. When it will, that
+// path carries the index's useful ordering (M0146-0188), so it IS PG's one
+// build_index_paths path for the index (index-only because check_index_only
+// allows it) and addOrderedIndexPaths files no plain twin beside it.
+func (s *searchCtx) orderedFullIndexOnlyCovers(cat catalog.Catalog, rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index) bool {
+	if s == nil || cat == nil || rel == nil || tbl == nil || idx == nil || !s.neededColsKnown ||
+		indexOnlyHardDisabled(cat) || !scanLeafIsBare(rel.baseLeaf) || !indexUnboundKeysNotNull(tbl, idx, 0) {
+		return false
+	}
+	needed := s.neededColumnsOfRel(rel, tbl)
+	if len(needed) == 0 {
+		return false
+	}
+	_, ok := indexCoversColumns(idx, needed)
+	return ok
 }
 
 // neededColumnsOf is the per-relation half of `check_index_only`'s question:
@@ -389,6 +410,18 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// index whether the path is index-only or not.
 	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown && len(colExprs) > 0 && indexIsOrderable(idx) {
 		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
+	}
+	// M0146-0188: the full-index shape carries the index's useful ordering as
+	// well. PG's build_index_paths builds ONE path per index and makes it
+	// index-only when check_index_only allows, so the ordered full scan IS the
+	// Index Only Scan (TPC-DS Q77's web_page_pkey driving its nested loops);
+	// goopg filed it keyless and lost it to the ordered plain Index Scan
+	// (addOneOrderedIndexPath), whose guards are repeated here — the caller
+	// already applied the unbound-key NULL rule.
+	if len(clauses) == 0 && len(colExprs) > 0 && indexIsOrderable(idx) && !idx.HasPredicate {
+		if keys, dir := indexPathOrdering(idx, colExprs, false); len(keys) > 0 {
+			serial.Pathkeys, serial.IndexScanDir = keys, dir
+		}
 	}
 	addPath(rel, serial, "indexonly")
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,

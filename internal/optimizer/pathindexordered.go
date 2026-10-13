@@ -154,6 +154,11 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 			if !idx.HasStorage() {
 				continue
 			}
+			// M0146-0188: PG builds one path per index, index-only when it can
+			// be; the index-only producer files that ordered path here.
+			if s.orderedFullIndexOnlyCovers(cat, rel, tbl, idx) {
+				continue
+			}
 			if s.addOneOrderedIndexPath(rel, tbl, idx, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}

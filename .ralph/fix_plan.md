@@ -32873,7 +32873,7 @@ Movement: none — the record was a probe, not a corpus query: no TPC-DS or TPC-
     - Test: `TestExplainParamAppendBitmapRecheck` \(fails with the split disabled\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — match SF0.25 75 -> 76 (TPC-DS Q54); CATEGORIES-EXCL-MATCH SF0.25 qual-placement 5 -> 4
-- [ ] **M0146-0188 — an index-only path carries no pathkeys, so PG's ordered Index Only Scan appears as an Index Scan (TPC-DS Q77)**
+- [x] **M0146-0188 — an index-only path carries no pathkeys, so PG's ordered Index Only Scan appears as an Index Scan (TPC-DS Q77)**
   (filed 2026-10-14 by M0146-0185). goopg's `indexonly` producer files web_page_pkey's full index-only scan with
   pathkeys=0 (dominated), while `index.ordered` files the plain Index Scan sorted on the key; PG keeps the Index Only
   Scan (0.14..14.04, pathkeys) and drives Q77's ws/wr nested loops with it. Scan-type divergence.
@@ -32881,6 +32881,16 @@ Movement: yes — match SF0.25 75 -> 76 (TPC-DS Q54); CATEGORIES-EXCL-MATCH SF0.
   Parent: M0146-0014
   - First step: give the index-only path its index pathkeys (build_index_pathkeys) where PG's index_only_scan
     candidate is useful for ordering, and compare costs with PG's 0.14..14.04 on web_page_pkey.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0188\-ordered\-index\-only\-scan\.md`, evidence
+    `analysis/m0146/m0146\-0188/`\)\.
+    - PG builds one path per index \(index\-only when check\_index\_only allows\); goopg filed a keyless full\-index
+      index\-only path beside a plain ordered Index Scan, which won every ordering contest \(and fuzz ties\)\.
+    - Fix: the full\-index index\-only path carries `indexPathOrdering`\'s useful keys; `orderedFullIndexOnlyCovers`
+      makes addOrderedIndexPaths skip an index the index\-only producer will cover\.
+    - Fixture `ORDER BY k LIMIT 10` and Q77\'s web\_page\_pkey scans plan PG\'s Index Only Scan\.
+    - Test: `TestExplainOrderedIndexOnlyScan` \(fails with both producers at HEAD\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: none — Q77's web_page_pkey scans now match PG's scan type but Q77 keeps its categories (ws side, M0146-0189); match 76/64 unchanged
 - [ ] **M0146-0189 — TPC-DS Q77's ws side: goopg splits a parallel partial aggregate where PG aggregates over NL(IOS, Material(Gather))**
   (filed 2026-10-14 by M0146-0185). Q77 SF0.25 ws: PG GroupAggregate over Nested Loop (Index Only Scan web_page_pkey,
   Materialize(Gather(Parallel Hash Join))) = 3068.93..8854.17; goopg Finalize GroupAggregate / Gather Merge / Partial
