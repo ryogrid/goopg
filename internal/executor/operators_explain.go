@@ -2090,6 +2090,74 @@ func expandAggOutputRefsInFilter(filt optimizer.Expr, agg *optimizer.Aggregate) 
 	return filt
 }
 
+// sortInputAggregate is the Aggregate whose output a key list indexes: the
+// child itself (through Filters), or — for a WindowAgg's PARTITION BY /
+// ORDER BY, whose child is the Sort that orders the window's input — the
+// aggregate under that Sort, which republishes the aggregate's columns
+// position for position.
+func sortInputAggregate(child optimizer.Node) *optimizer.Aggregate {
+	if agg := childAggregateThroughFilters(child); agg != nil {
+		return agg
+	}
+	switch s := child.(type) {
+	case *optimizer.Sort:
+		return childAggregateThroughFilters(s.Child)
+	case *optimizer.IncrementalSort:
+		return childAggregateThroughFilters(s.Child)
+	}
+	return nil
+}
+
+// aggOutputKeyExpr is Entry (i) of sortKeyParts for one column of a child
+// Aggregate's output, factored out so a computed key's columns take it too
+// (M0146-0042): a group key chases to its source, an aggregate result
+// expands to its call, a grouping mask to its GROUPING(...) call. hit is
+// false when col names none of them, and the caller keeps col.
+func aggOutputKeyExpr(col *optimizer.ColumnRef, agg *optimizer.Aggregate, reg *subPlanReg, qualify bool) (keyExpr optimizer.Expr, hit bool) {
+	keyExpr = col
+	// Entry (i) — Sort above agg: Arm-S guard, then
+	// the Slice-2 chase down past republishing
+	// layers; a chase-miss falls back to the Arm-S
+	// render (Slice-1 behaviour, byte-identical).
+	// Aggs-section keys fall through to R65's call
+	// expansion (now Star/Distinct-capable).
+	if src, hit := sortGroupKeySource(col, agg); hit {
+		if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
+			keyExpr = chased
+		} else if _, isCol := src.(*optimizer.ColumnRef); !isCol {
+			// M0146-0042: a computed group key (TPC-DS Q54's
+			// `(revenue / 50)::int`) indexes the aggregate's
+			// input; its columns deparse there, through a kept
+			// Subquery Scan to `my_revenue.revenue`, as the
+			// Group Key line itself prints them.
+			keyExpr = src
+			if chased, ok := chaseKeyExprColumns(src, agg.Child, reg, qualify); ok {
+				keyExpr = chased
+			}
+		} else {
+			keyExpr = src
+		}
+	} else if expanded, hit := expandAggOutputRef(col, agg); hit {
+		keyExpr = expanded
+		// M0146-0042: an argument the aggregate's input
+		// computes — a UNION ALL member's own aggregate,
+		// deparsed through the Append's first branch — nests
+		// as PG prints it: TPC-DS Q56's
+		// `(sum((sum(store_sales.ss_ext_sales_price))))`.
+		if i := col.Index - len(agg.GroupExprs); i >= 0 && i < len(agg.Aggs) {
+			if chasedAgg, ok := chaseAggregateResultArgs(agg.Aggs[i], agg.Child, reg); ok {
+				if call, ok := synthAggCall(&chasedAgg); ok {
+					keyExpr = call
+				}
+			}
+		}
+	} else if g, hit := groupingMaskCall(agg, col.Index); hit {
+		// M0146-0005cf: PG's `(GROUPING(a, b))`.
+		keyExpr = g
+	}
+	return keyExpr, keyExpr != optimizer.Expr(col)
+}
+
 // emitNodeDetailLines writes the PG-style detail lines that
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
@@ -2114,47 +2182,31 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 		// `(sum(...)) DESC`; unexpanded keys behave exactly as
 		// before.
 		keyExpr := k.Expr
+		if agg := sortInputAggregate(child); agg != nil {
+			if _, isCol := k.Expr.(*optimizer.ColumnRef); !isCol {
+				// M0146-0042: a computed key over the aggregate's outputs —
+				// a WindowAgg's PARTITION BY over a grouping-sets rollup —
+				// deparses each output column through the Agg's target
+				// list, as get_variable does for every OUTER_VAR it meets:
+				// TPC-DS Q36/Q86's `((GROUPING(item.i_category) +
+				// GROUPING(item.i_class)))` and `((sum(...) / sum(...)))`.
+				changed := false
+				if out, ok := optimizer.CloneExprReplacingColumnRefs(k.Expr, func(c *optimizer.ColumnRef) optimizer.Expr {
+					if e, hit := aggOutputKeyExpr(c, agg, reg, qualify); hit {
+						changed = true
+						return e
+					}
+					return c
+				}); ok && changed {
+					keyExpr = out
+				}
+			}
+		}
 		if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
 			if agg := childAggregateThroughFilters(child); agg != nil {
-				// Entry (i) — Sort above agg: Arm-S guard, then
-				// the Slice-2 chase down past republishing
-				// layers; a chase-miss falls back to the Arm-S
-				// render (Slice-1 behaviour, byte-identical).
-				// Aggs-section keys fall through to R65's call
-				// expansion (now Star/Distinct-capable).
-				if src, hit := sortGroupKeySource(col, agg); hit {
-					if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
-						keyExpr = chased
-					} else if _, isCol := src.(*optimizer.ColumnRef); !isCol {
-						// M0146-0042: a computed group key (TPC-DS Q54's
-						// `(revenue / 50)::int`) indexes the aggregate's
-						// input; its columns deparse there, through a kept
-						// Subquery Scan to `my_revenue.revenue`, as the
-						// Group Key line itself prints them.
-						keyExpr = src
-						if chased, ok := chaseKeyExprColumns(src, agg.Child, reg, qualify); ok {
-							keyExpr = chased
-						}
-					} else {
-						keyExpr = src
-					}
-				} else if expanded, hit := expandAggOutputRef(col, agg); hit {
-					keyExpr = expanded
-					// M0146-0042: an argument the aggregate's input
-					// computes — a UNION ALL member's own aggregate,
-					// deparsed through the Append's first branch — nests
-					// as PG prints it: TPC-DS Q56's
-					// `(sum((sum(store_sales.ss_ext_sales_price))))`.
-					if i := col.Index - len(agg.GroupExprs); i >= 0 && i < len(agg.Aggs) {
-						if chasedAgg, ok := chaseAggregateResultArgs(agg.Aggs[i], agg.Child, reg); ok {
-							if call, ok := synthAggCall(&chasedAgg); ok {
-								keyExpr = call
-							}
-						}
-					}
-				} else if g, hit := groupingMaskCall(agg, col.Index); hit {
-					// M0146-0005cf: PG's `(GROUPING(a, b))`.
-					keyExpr = g
+				// Entry (i) — Sort above agg (aggOutputKeyExpr).
+				if e, hit := aggOutputKeyExpr(col, agg, reg, qualify); hit {
+					keyExpr = e
 				}
 			} else if proj := childProjectThroughFilters(child); proj != nil {
 				// Entry (ii) — grouping-input / order-by Sort
