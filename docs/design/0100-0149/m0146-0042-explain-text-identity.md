@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`8944f2bff`, split-aggregate passthrough key).
+2026-10-13 (`854083b44`, group key through a HAVING InitPlan).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -632,6 +632,31 @@ Results:
   - text-identical SF0.25 68 → 69, SF1 44 → 45.
   - Values are identical, regress is identical, and the fire set is Q66
     only.
+
+## Slice — a group key through a HAVING that holds an InitPlan (2026-10-13, `854083b44`)
+
+- **Witness.** TPC-DS Q14, SF0.25. The ROLLUP's Sort Key printed `i_brand_id`
+  where PG prints `item.i_brand_id`. The first UNION ALL member's HAVING
+  compares against an InitPlan, and `filterBlocksChase` stopped every key
+  chase at a sublink-bearing Filter.
+- **Why the block exists.** It keeps an aggregate result that PG walls off
+  behind a kept Subquery Scan from being synthesised out from under it
+  (Q44).
+- **Change.** `chaseOnGroupKeyOf` lets the chase continue through such a
+  Filter when it is on a plain group key of the simple aggregate beneath. PG
+  keeps that key as a Var in the Agg's target list, so the HAVING's InitPlan
+  does not wall it off.
+- **Result.**
+  - text-identical SF0.25 69 → 70.
+  - Values are identical, regress is identical, and the fire set is Q14
+    only (Q44 unchanged).
+- **Found, not done.** Q59's Hash Cond prints its two conjuncts in written
+  order; PG prints them in EquivalenceClass order. The outer
+  `d_week_seq1 = d_week_seq2 - 52` joins the EC that subquery y's own WHERE
+  opened before `s_store_id1 = s_store_id2`'s, and
+  `generate_join_implied_equalities` walks the ECs in order. The order
+  comes from the join restrictlist, which is plan state (hash and merge key
+  order), so it is ledgered rather than patched in EXPLAIN.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
