@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`854083b44`, group key through a HAVING InitPlan).
+2026-10-13 (`52bf18eac`, Memoize cache key). The text-only queue is empty; Q59 waits on EC-ordered join clauses (plan state).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -657,6 +657,27 @@ Results:
   `generate_join_implied_equalities` walks the ECs in order. The order
   comes from the join restrictlist, which is plan state (hash and merge key
   order), so it is ledgered rather than patched in EXPLAIN.
+
+## Slice — a Memoize cache key deparses against the loop's outer row (2026-10-13, `52bf18eac`)
+
+- **Witness.** TPC-DS Q44, SF0.25. `Cache Key: item_sk` where PG prints
+  `v11.item_sk` and `v21.item_sk`. The Index Cond beneath the same Memoize
+  already printed `v11.item_sk`.
+- **PG.** `show_memoize_info` deparses the key, which is the parameterising
+  loop's outer Var, through the outer plan. A kept Subquery Scan prints its
+  alias.
+- **Change.** `memoizeParentLoop` finds the loop whose inner side is the
+  Memoize (a Join's Right or an index join's InnerMemo; outer first in its
+  row). The keys format with that loop as the join row, resolving
+  positionally as the Join Filter does.
+- **Result.**
+  - text-identical SF0.25 70 → 71.
+  - Values are identical, regress is identical, and the fire set is Q44
+    only.
+- **Queue state.** This slice empties the text-only queue. The remaining
+  non-identical MATCH query, Q59, needs EquivalenceClass-ordered join
+  clauses (plan state, ledgered). Q78's rendering rides a cost-tie join-order
+  swap.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 

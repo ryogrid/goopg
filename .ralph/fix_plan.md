@@ -28750,6 +28750,11 @@ Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54
     evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
     probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
 Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
+  - Slice 2026\-10\-13 \(`52bf18eac`\): a Memoize cache key deparses against the parameterising loop\'s outer row; TPC\-DS
+    Q44 prints `v11\.item\_sk` \(text\-identical SF0\.25 70 → 71\)\.
+    - The text\-only queue is empty: Q59 waits on EquivalenceClass\-ordered join clauses \(plan state, ledgered
+      2026\-10\-13\); Q78\'s rendering rides its cost\-tie join\-order swap\.
+Movement: none — instrument artefact — text\-only \(Q44 already MATCH\); text\-identical SF0\.25 70 → 71
   - Slice 2026\-10\-13 \(`854083b44`\): a key chase passes a sublink\-bearing HAVING Filter when it is on a plain group
     key of the aggregate below; TPC\-DS Q14\'s rollup Sort Key prints `item\.i\_brand\_id` \(text\-identical SF0\.25 69 → 70\)\.
     - Found: Q59\'s Hash Cond conjunct order is EquivalenceClass order in PG \(join restrictlist\); ledgered \(plan state, not
