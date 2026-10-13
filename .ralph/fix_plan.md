@@ -32829,7 +32829,7 @@ Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, parameterisa
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS;
       regress A/B identical except a join\.sql no\-ORDER\-BY row order that flips run to run\.
 Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 16 -> 14, sort-strategy 19 -> 17, qual-placement 8 -> 6; SF0.25 match 76 -> 75, join-order 17 -> 18, sort-strategy 10 -> 11 (Q4 COSTTIE flip)
-- [ ] **M0146-0186 — a single-relation scan gets a Gather with no parallel_setup_cost where PG keeps the serial scan**
+- [x] **M0146-0186 — a single-relation scan gets a Gather with no parallel_setup_cost where PG keeps the serial scan**
   (filed 2026-10-14 by M0146-0184). SF0.25 probe `SELECT d_date_sk FROM date_dim WHERE d_month_seq >= (SELECT 1200)
   AND d_month_seq <= (SELECT 1203)`: goopg plans `Gather (cost=0.02..2508.05 rows=365)` / `Workers Planned: 1` over a
   Parallel Seq Scan; PG plans `Seq Scan on date_dim (cost=0.02..2519.75 rows=365)`. A path-model Gather would start at
@@ -32839,6 +32839,21 @@ Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 16 -> 14, sort-strategy 
   Parent: M0146-0014
   - First step: find which producer builds this Gather for a one-relation query (DPPATH trace, `gather` producer)
     and compare its cost with cost_gather (costsize.c).
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0186\-post\-pass\-stands\-down\-on\-costed\-search\.md`,
+    evidence `analysis/m0146/m0146\-0186/`\)\.
+    - The search was right \(Gather 1000\.\.3061 dominated by the 2500\.73 serial scan\); the post\-search
+      `MaybeAddGather` re\-added a Gather by its size rule, because its coexistence rule only stood down when a Gather
+      was already present\.
+    - Fix: a plain target whose spine reaches a costed searched node \(`spineReachesCostedSearch`\) keeps the search\'s
+      verdict; debug\_parallel\_query still forces; split\-aggregate and Gather Merge arms unchanged\.
+    - Probe plans PG\'s serial Seq Scan\. No TPC\-DS plan moved \(sweep same=99, fire set unchanged\); TPC\-H values
+      identical and times within noise\.
+    - Regress: aggregates \+1 line \(the `balk` UDA case lost a coincidental size\-rule Gather; the real gap is the
+      deferred user\-aggregate split, M0134\-0001 S10a\); select\_parallel / write\_parallel / partition\_aggregate
+      identical\.
+    - Test: `TestPostPassStandsDownOnACostedSearchedSubtree` \(fails with the stand\-down disabled\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: none — the record was a probe, not a corpus query: no TPC-DS or TPC-H plan moved (sweep same=99, fire set match 75/64 unchanged); regress aggregates 942 -> 943 diff lines (balk UDA case)
 - [ ] **M0146-0187 — an appendrel member's parameterised Bitmap Heap Scan prints its probe as Filter, not Recheck Cond (TPC-DS Q54)**
   (filed 2026-10-14 by M0146-0184; previously ledgered under M0146-0005dp). Q54's item NL drives a parameterised
   Append whose Bitmap Heap Scan on catalog_sales prints `Filter: (cs_item_sk = item.i_item_sk)` where PG prints

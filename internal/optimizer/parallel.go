@@ -210,6 +210,22 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	if ok && (partialSubtreeScansCTE(tgt.node) || !partialSubtreeExprsParallelSafe(tgt.node)) {
 		ok = false
 	}
+	// M0146-0186: the path model already decided this subtree. A plain
+	// target whose spine reaches a node the join search committed was costed
+	// there: generate_gather_paths offered the Gather over the rel's partial
+	// path and add_path compared it with the serial winner, so a serial
+	// subtree here is a Gather that LOST. Adding one by the size rule
+	// overrides that verdict — TPC-DS SF0.25's one-relation `date_dim` scan
+	// printed `Gather (cost=0.00..2503.07)` over a Parallel Seq Scan the search
+	// had priced at 1000..3061 against a 2500.73 serial scan, where PG keeps the
+	// Seq Scan. The split-aggregate and Gather Merge targets are their own
+	// tournaments and keep their arms, and debug_parallel_query forces past
+	// the cost verdict as PG's does (standard_planner adds its Gather
+	// regardless of cost).
+	forcedParallel := s.DebugParallelQuery == "on" || s.DebugParallelQuery == "regress"
+	if ok && !forcedParallel && !tgt.splitAgg && tgt.mergeKeys == nil && spineReachesCostedSearch(tgt.node) {
+		ok = false
+	}
 	if !ok {
 		// R33 (K44): no top-level target — sublinks still get their
 		// own verdicts (Q9's top is a 1-row scan; its 15 InitPlans
@@ -250,6 +266,25 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	}
 
 	return rebuildWithGather(root, tgt, workers, s.LeaderParticipates)
+}
+
+// spineReachesCostedSearch reports whether walking n down its single-child
+// spine (parallelChildren) reaches a node the join search committed whose
+// searched rel holds costed paths. A one-relation problem commits the scan
+// itself; a join problem commits its join.
+func spineReachesCostedSearch(n Node) bool {
+	for depth := 0; n != nil && depth < 64; depth++ {
+		if sr, ok := n.(searchRootNode); ok && sr.isFromJoinSearch() {
+			rel := sr.searchedRel()
+			return rel != nil && len(rel.Pathlist) > 0
+		}
+		kids := parallelChildren(n)
+		if len(kids) != 1 {
+			return false
+		}
+		n = kids[0]
+	}
+	return false
 }
 
 // indexOrderReliedOn reports whether target is driven by an index scan whose

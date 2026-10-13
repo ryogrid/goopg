@@ -1,0 +1,19 @@
+## goopg HEAD (srv.log trace excerpt for the one-relation problems)
+DPTRACE seam-decline reason=size-or-no-joinlist nrels=0 nleaves=0
+DPTRACE seam-decline reason=size-or-no-joinlist nrels=0 nleaves=0
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=365 startup=0 total=2500.7349999999997 pathkeys=0 verdict=accepted outer=- inner=- width=268 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={0} kind=1 reqouter=- rows=215 startup=0 total=2049.55 pathkeys=0 verdict=accepted outer=- inner=- width=268 inputtotal=-1
+DPPATH path producer=gather relids={0} kind=11 reqouter=- rows=365 startup=1000 total=3086.05 pathkeys=0 verdict=dominated outer=- inner=- width=268 inputtotal=2049.55
+DPTRACE problem nrels=1 rels=date_dim
+DPTRACE cpadmit src=base rel={date_dim} cp=1 leaf=seq
+DPTRACE cpgather rel={date_dim} partials=1 verdict=admitted
+DPTRACE appendrel rel={date_dim} verdict=unmarked
+DPTRACE pveto site=base rel={date_dim} dir=- veto=admitted detail=leaf=seq workers=1
+DPTRACE end top={date_dim} pairs=0 declined=0 costs=0 status=ok
+DPPATH path producer=joinsearch.prebuilt relids={0} kind=0 reqouter=- rows=117 startup=0 total=2500.7349999999997 pathkeys=0 verdict=accepted outer=- inner=- width=268 inputtotal=-1
+DPPATH partial producer=scan.seq.partial relids={0} kind=1 reqouter=- rows=69 startup=0 total=2049.55 pathkeys=0 verdict=accepted outer=- inner=- width=268 inputtotal=-1
+DPPATH path producer=gather relids={0} kind=11 reqouter=- rows=117 startup=1000 total=3061.25 pathkeys=0 verdict=dominated outer=- inner=- width=268 inputtotal=2049.55
+DPTRACE problem nrels=1 rels=date_dim
+DPTRACE cpadmit src=base rel={date_dim} cp=1 leaf=seq
+DPTRACE cpgather rel={date_dim} partials=1 verdict=admitted
+DPTRACE appendrel rel={date_dim} verdict=unmarked
