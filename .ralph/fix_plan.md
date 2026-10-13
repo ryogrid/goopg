@@ -28945,6 +28945,10 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   >   Join adds \~4049 over its inputs where PG adds \~945 \(`approx\_tuple\_count` / inner\-unique\)\.
   >   - First step: decompose goopg\'s Parallel Append cost for Q76 against PG\'s `cost\_append` partial arm \(per\-child
   >     cost, parallel divisor, the non\-partial rule M0146\-0137 changed\)\.
+  - S9 replenishment pass 2026\-10\-14 \(census `analysis/m0146/m0146\-0014/routing\-20261014/`, capture at
+    `82c287bc7`\): item 3 exhausted \(0042\'s rendering records sit under join\-order first divergences; 0007 / 0012b /
+    0067 / 0175 rank below item 10\)\. Top actionable first\-divergence category: sort\-strategy \(17, 15 after COSTTIE
+    waivers\)\. Filed M0146\-0190 \(TPC\-DS SF0\.25 Q26\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -32911,3 +32915,17 @@ Movement: none — Q77's web_page_pkey scans now match PG's scan type but Q77 ke
     - Test: `TestGroupedRelPathkeysShareOneCoordinate` \(fails with the transport\-coordinate keys\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, join-method 10 -> 9, aggregation-strategy 4 -> 3, sort-strategy 11 -> 10, parallelism 11 -> 8, qual-placement 4 -> 3; SF1 join-method 14 -> 12, join-order 31 -> 30
+- [ ] **M0146-0190 — under a GroupAggregate goopg elects Gather Merge over a worker Sort where PG keeps Sort over Gather (TPC-DS Q26)**
+  (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014/`).
+  sort-strategy is the top first-divergence category across the corpora (17 records, 15 actionable after the
+  COSTTIE waivers). Record: TPC-DS SF0.25 Q26, verdict SHAPE-DIFF, first divergence `depth=2 [sort-strategy] under
+  GroupAggregate: PG Sort | goopg Gather Merge`. PG: GroupAggregate → Sort (14290.13..14290.19) → Gather → Nested
+  Loop; goopg: GroupAggregate → Gather Merge (14202.58..14205.54) → Sort → Nested Loop. Same pattern at SF0.25 Q33,
+  Q45 and SF1 Q18, Q26.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: on the PG OPTIMIZER_DEBUG build (tmp/pgdbg), dump Q26's final scan/join rel pathlist and check
+    whether PG builds the Gather Merge over the sorted partial path (generate_useful_gather_paths with
+    query_pathkeys) and at what cost; compare with goopg's gathermerge arm and its group-rel election, then drive
+    Q26 to MATCH.
+  - Expected movement: TPC-DS SF0.25 match (Q26/Q33/Q45) and CATEGORIES-EXCL-MATCH sort-strategy at both scales.
