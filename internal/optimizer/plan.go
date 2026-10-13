@@ -2115,6 +2115,12 @@ type SubqueryScan struct {
 }
 
 func (n *SubqueryScan) Pos() int       { return n.pos }
+
+// IsAppendRelMember reports whether n is a UNION ALL member PG keeps as a
+// subquery RTE (`Subquery Scan on "*SELECT* n"`, M0146-0093). A Var above the
+// Append deparses at this scan with its alias (ruleutils.c get_variable), not
+// through it into the member's own relations.
+func (n *SubqueryScan) IsAppendRelMember() bool { return n.appendRel != nil }
 func (n *SubqueryScan) Output() Schema { return n.schema }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -3317,6 +3323,14 @@ type SetOp struct {
 }
 
 func (n *SetOp) Pos() int       { return n.pos }
+
+// IsUnionAllAppendRel reports whether n is a link of a UNION ALL appendrel
+// built from a set-operation subquery in FROM (pull_up_simple_union_all), as
+// opposed to an inheritance / partition fan-out, which builds the same
+// *SetOp{All: true} without the label. EXPLAIN deparses a Var above the
+// former through the Append's first child (ruleutils.c set_deparse_plan); the
+// latter prints with the parent's alias.
+func (n *SetOp) IsUnionAllAppendRel() bool { return n.appendRel != nil }
 func (n *SetOp) Output() Schema {
 	if n.pinnedSchema != nil {
 		return n.pinnedSchema

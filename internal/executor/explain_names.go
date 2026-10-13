@@ -855,7 +855,14 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// a UNION (distinct) dedupes, is never an appendrel: PG deparses
 			// through its first input (set_deparse_plan), as TPC-DS Q8's
 			// `a1.ca_zip` and Q75's `date_dim.d_year` (M0146-0042).
-			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput {
+			// A UNION ALL appendrel built from a FROM-clause set operation is
+			// the third kind: its parent is a subquery RTE, setrefs turns the
+			// Var into an OUTER_VAR of the Append, and ruleutils deparses it
+			// through the first child — `"*SELECT* 2".wsr_web_site_sk` when
+			// that member stays a Subquery Scan, the scan's own column when
+			// it was pulled up (TPC-DS Q5's wsr arm, M0146-0042).
+			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput &&
+				!p.IsUnionAllAppendRel() {
 				return ""
 			}
 			crossed = true
@@ -884,9 +891,16 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// A join residual stops at it: the Subquery Scan PG keeps
 			// is a scan of the subquery RTE, and get_variable prints the
 			// Var with that RTE's alias (`a1.ca_zip`, M0146-0042).
-			if !requireSetOp && p.Alias != "" {
+			// A UNION ALL member PG keeps as a subquery RTE stops the
+			// set-operation walk too: it is the Append's child, and the Var
+			// prints with its `"*SELECT* n"` alias (TPC-DS Q5's wsr arm,
+			// M0146-0042), where a branch scan PG's trivial_subqueryscan
+			// removed is transparent.
+			if (!requireSetOp || p.IsAppendRelMember()) && p.Alias != "" {
 				if out := p.Output(); idx < len(out) {
-					return p.Alias + "." + out[idx].Name
+					// get_variable quotes both halves (quote_identifier):
+					// an appendrel member's alias is `"*SELECT* 2"`.
+					return pgQuoteIdent(p.Alias) + "." + pgQuoteIdent(out[idx].Name)
 				}
 				return ""
 			}
