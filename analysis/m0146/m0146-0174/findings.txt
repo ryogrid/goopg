@@ -1,0 +1,12 @@
+# M0146-0174 recon (2026-10-13, HEAD e47230bc3). PG 18.3 :65438 (tpcds025 / tpcds), goopg private clone of data-sf025.
+# Q96 at SF0.25 (fresh 2026-09-16 load) — goopg tracks PG on both routes:
+#   route                          PG 18.3     goopg
+#   nested loop (elected by both)  16673.36    16670.07
+#   hash route (enable_nestloop=off) 18218.03  18205.00
+#   time_dim Parallel Seq Scan      2170.35     2159.35
+# Q96 at SF1 (stale 2026-07-25 load): goopg's time_dim Parallel Seq Scan costs 1829.35 (same 86400 rows as SF0.25),
+#   ~330 below the fresh-load cost because the old load stores char(n) unpadded. The SF1 hash route won by ~100.
+# Q47 at SF1: goopg hashes item (Seq Scan 916.00) where PG probes item_pkey; PG's item scan would cost
+#   1284 pages + 18000*0.01 = 1464. Unpadded char(n) again. Q47 MATCHES PG at SF0.25.
+# Verdict: both SF1 match losses after M0146-0172 are stale-SF1-load artefacts (char(n) unpadded + numeric as text);
+#   the cost model tracks PG on fresh data. Resume = owner reload of the SF1 goopg TPC-DS cluster.

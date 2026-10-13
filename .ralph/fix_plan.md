@@ -24100,6 +24100,9 @@ M0146-0001 re-baseline census on the new default arm.
     `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
     and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
     goopg reference cluster holds unpadded `char\(n\)` values.
+  - More evidence 2026\-10\-13 \(M0146\-0174\): the stale SF1 heaps now decide two plan\-match losses — SF1 Q96
+    \(`time\_dim` scan 1829\.35 vs 2159\.35 on the fresh SF0\.25 load\) and SF1 Q47 \(`item` scan 916 vs PG\'s 1464\)\. Both
+    match PG at SF0\.25\. The SF1 match count is understated until the reload\.
   - More evidence 2026\-10\-13 \(M0146\-0172\): the SF1 load also predates the numeric codec flip \(`02995818d`,
     2026\-08\-11\) and stores every numeric column as decimal text\. `catalog\_sales` is 41067 heap pages against PG\'s
     37448 \(tuples 221 vs 200 bytes\), and the `store\_sales` Parallel Seq Scan costs 66740 against PG\'s 58984\. The
@@ -32084,7 +32087,7 @@ Movement: yes — TPC\-DS SF0\.25 match 68→70 \(SF1 45→44, TPC\-H 13→13\)
   - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out\)\.
   - First step: the BinaryOp `\+` / `\*` typing arms for timestamp/interval and int/interval \(PG timestamp\_pl\_interval,
     interval\_mul, mul\_d\_interval\) and the timestamp output path for a folded constant\.
-- [ ] **M0146-0174 — TPC\-DS SF1 Q47 and Q96 lose their PG match after M0146\-0172** \(filed 2026\-10\-13 by M0146\-0172,
+- [x] **M0146-0174 — TPC\-DS SF1 Q47 and Q96 lose their PG match after M0146\-0172** \(filed 2026\-10\-13 by M0146\-0172,
   kept per R3\)\. With btcostestimate\'s descent terms, SF1 Q96 elects a Parallel Hash Join on `time\_dim` \(70665\) over
   PG\'s nested loop with a `time\_dim\_pkey` probe \(about 70764 in goopg\), a 0\.14% margin; Q47 moves in join\-method /
   scan\-type\. Both are measured on the stale SF1 heap \(`store\_sales` Parallel Seq Scan 66740 vs PG 58984 — numeric
@@ -32095,6 +32098,16 @@ Movement: yes — TPC\-DS SF0\.25 match 68→70 \(SF1 45→44, TPC\-H 13→13\)
   - First step: decompose Q96\'s two routes node by node against PG \(the time\_dim probe per loop, the Parallel Hash
     build, the hash joins above\) with the store\_sales scan held equal; if the margin is the stale heap\'s width or
     pages, park on the owner SF1 reload\.
+  - Done 2026\-10\-13 \(recon\): both losses are stale\-SF1\-load artefacts, not cost\-model divergences\.
+    - Q96 at SF0\.25 \(fresh load\): goopg prices PG\'s nested loop at 16670\.07 \(PG 16673\.36\) and the hash route at
+      18205\.00 \(PG 18218\.03\) — within 0\.1%\. At SF1 goopg\'s `time\_dim` scan costs 1829\.35 against 2159\.35 for the same
+      86400 rows at SF0\.25: the old load stores `char\(n\)` unpadded, which cheapens the hash route by \~330, more than
+      the \~100 that decided it\.
+    - Q47 at SF1 hashes `item` \(Seq Scan 916\.00; PG\'s would cost 1284 pages \+ 180 = 1464\) where PG probes `item\_pkey`;
+      Q47 matches PG at SF0\.25\.
+    - Resume: the owner reload of the SF1 cluster \(the `char\(n\)` reload item\), then re\-measure\. Evidence
+      `analysis/m0146/m0146\-0174/findings\.txt`\.
+Movement: none — recon — the two SF1 losses are stale\-load artefacts; SF0\.25 costs track PG
 - [ ] **M0146-0175 — the ordered index producer builds a clauseless twin of an index that has restriction clauses**
   \(filed 2026\-10\-13 by M0146\-0172\)\. PG\'s build\_index\_paths builds ONE path per index and adds the clauseless
   ordered one only when no clause matches \(indxpath\.c\)\. goopg\'s `addOneOrderedIndexPath` \(pathindexordered\.go\) always
