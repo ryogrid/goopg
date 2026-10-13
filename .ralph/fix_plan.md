@@ -4826,6 +4826,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       a scratch PG 18\.3 → S3 live goroutine and S4a SQL functions → S4b / S5 `wal\_summary\_keep\_time` → S6a → S7
       WS\-002 un\-defer\. S6b–S6f are producer\-side WAL gaps\.
     - Next slice: S1\.
+  - **2026\-10\-13 S1 landed** — `internal/access/common/blkreftable`, a port of `common/blkreftable\.c`: the table,
+    both writers and the streaming reader\.
+    - Oracle: `testdata/brt\_harness\.c` links PG 18\.3\'s own `blkreftable\.c` from `libpgcommon\.a`\. 13 scripted cases
+      must be byte\-identical, PG\'s `pg\_walsummary` must read goopg\'s files, and reading PG\'s files must match
+      `pg\_walsummary`\'s text\.
+    - Two mutations \(sorting arrays; sorting by database before tablespace\) fail the byte test\.
+    - Next slice: S2 — summary file naming/listing \(`walsummary\.c`\) and the offline summarizer core over a
+      record source, checked against a scratch PG 18\.3 with `summarize\_wal=on` \(design doc §5\)\.
     - The review also found WAL\-logging gaps that matter without the summarizer\. They are filed as
       M0122\-0009a/b/c below\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the

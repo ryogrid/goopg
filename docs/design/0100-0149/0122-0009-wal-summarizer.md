@@ -1,6 +1,6 @@
 # WAL summarizer (M0122-0009)
 
-status: draft — agent-reviewed 2026-10-13, approved for S1 (see "Review" at the end)
+status: in progress — agent-reviewed 2026-10-13; S1 (blkreftable package) landed 2026-10-13; S2–S7 open
 date: 2026-10-13
 
 Slice "WAL summarizer" of M0122-0009 (WAL / recovery / crash-consistency infra).
@@ -724,6 +724,46 @@ Concrete divergences:
 - **Byte-identity details.** Array chunks keep insertion order, all-zero bitmaps are kept, and middle
   zero chunks are kept. A "clean" Go rewrite that sorts or compacts any of these would still be read
   correctly by `pg_walsummary`, but would fail Oracle A's byte equality. Keep the port literal.
+
+## S1 landed (2026-10-13)
+
+`internal/access/common/blkreftable` is a port of `common/blkreftable.c`.
+
+- **Types and operations:**
+  - `Table`, `Entry` with `MarkBlockModified` / `SetLimitBlock` / `Blocks`.
+  - The whole-table `Write` (`WriteBlockRefTable`).
+  - The entry-at-a-time `Writer` (`CreateBlockRefTableWriter` / `BlockRefTableWriteEntry`).
+  - The streaming `Reader` (`CreateBlockRefTableReader` / `BlockRefTableReaderNextRelation` /
+    `BlockRefTableReaderGetBlocks`), with PG's three error messages wrapped in `ErrCorrupt`.
+- **In-memory layout:** chunk usage and data follow PG.
+  - `nchunks` is the used length rather than PG's power-of-two allocation. Only the serialized count
+    is visible, and both trim trailing zero-usage chunks.
+  - Array chunks keep insertion order.
+  - A dropped chunk (usage 0) restarts as an array.
+- **Oracle:** better than the hand-derived bytes §5 planned. `testdata/brt_harness.c` links PG
+  18.3's own `blkreftable.c` from `postgres/local_install/lib/libpgcommon.a`. It replays each
+  `testdata/*.script` and writes PG's serialization (`*.brt`). PG's `pg_walsummary` output for
+  each file is `*.txt`.
+- **Tests:**
+  - **`TestWriteMatchesPostgres`:** both writers must be byte-identical to PG on 13 cases. They
+    cover:
+    - array order and dedup;
+    - the bitmap switch at the 4096th offset;
+    - limits inside an array, inside a bitmap, and at block 0 (an all-zero bitmap is still
+      written);
+    - trailing-chunk trimming with a kept middle zero chunk;
+    - a dropped bitmap chunk restarting as an array;
+    - a limit that may not rise;
+    - the tablespace-first sort;
+    - a 6000-operation random mix.
+  - **`TestReaderMatchesPgWalsummary`:** reading PG's files reproduces `pg_walsummary`'s text.
+    The batch size is 7, so the test also resumes reading in the middle of a chunk.
+  - **`TestPgWalsummaryReadsGoopgFile`:** PG's binary reads goopg-written files.
+  - **`TestReaderRejectsCorruptFiles`:** wrong magic, a bad checksum and a truncated file.
+- **Non-vacuity:** two mutations each fail the byte test, sorting array chunks and sorting by
+  database before tablespace.
+- **Not yet ported:** `BlockRefTableReaderGetBlocks`' fixed-size `chunk_data` has no bound check
+  in PG. The Go reader rejects a chunk size above 4096 as corrupt instead of overflowing.
 
 ## Review
 
