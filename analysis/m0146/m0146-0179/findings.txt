@@ -1,0 +1,29 @@
+M0146-0179 — TPC-DS Q70: PG hashes the 2-row tmp1 subquery in a Hash Semi Join; goopg elected an inner Nested Loop
+(tmp1 outer, Materialize over the Gather inner), 2026-10-13
+
+Trace (GOOPG_PGSHAPED_DP_TRACE=1, SF0.25): the Hash Semi Join IS generated (38282.48, startup 22038.67, no pathkeys)
+and accepted, then evicted by `join.nestloop inner outer {tmp1}` (38344.13, startup 22038.46, pathkeys=1): totals and
+startups are equal under STD_FUZZ_FACTOR, so add_path keeps the path with the better pathkeys.
+
+PG oracle: a PG 18.3 build with -DOPTIMIZER_DEBUG (tmp/pgdbg, git archive of postgres/, never in-tree) loaded with a
+pg_dump of :65438 tpcds025 prints every RelOptInfo. At PG's top joinrel the pathlist is the Hash Semi Join
+(jointype 4, 38318.91, pathkeys <>) and a Merge Join with s_state pathkeys; tmp1's SubqueryScan path has NO pathkeys.
+So PG has no ordered unique-outer nested loop to evict the hash semi join.
+
+Why: bisected on the debug build (variants*.sql). PG keeps the semijoin (does not reduce it to an inner join) under
+ROLLUP / CUBE / `s_state, ROLLUP(s_county)` / two grouping sets, even when s_state is not grouped; it reduces it under
+a plain GROUP BY and under GROUPING SETS ((a,b)) (planned as plain GROUP BY). Mechanism: pull_up_simple_subquery sets
+REPLACE_WRAP_ALL when parse->groupingSets (prepjointree.c) — every pulled output becomes a PlaceHolderVar, so the
+semijoin's RHS operand is no plain Var: rel_is_distinct_for cannot prove uniqueness (no reduce_unique_semijoins) and
+create_unique_path cannot take its free UNIQUE_PATH_NOOP arm (a paid sort/hash UniquePath has pathkeys NIL).
+
+goopg had two defects:
+  1. SemiRhsDistinct (the NOOP unique-ification) and pulledSemiRhsIsUnique ignored grouping sets.
+  2. nestLoopPlainOuters returned the RAW cheapest outer for JOIN_UNIQUE_OUTER (plain and materialised NL), not the
+     unique-ified path PG's match_unsorted_outer uses for every nested loop of that branch — harmless only while the
+     unique path was the free NOOP; with a paid one it joins RHS duplicates and keeps the raw ordering.
+
+After: Q70 SF0.25 plans PG's Hash Semi Join (Hash Cond: store.s_state = tmp1.s_state); result 3 rows = PG's.
+Fire set: SF0.25 match 75 -> 76, SF1 62 -> 63 (Q70 only). TPC-H acceptance arm 22/22 values. Regress A/B: subselect,
+groupingsets, aggregates identical; join changes one plan (sj_t1..sj_t4 self-join-elimination case, empty tables) —
+41 lines from PG's expected text before and after.

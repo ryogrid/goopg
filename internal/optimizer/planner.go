@@ -464,6 +464,14 @@ type resolveContext struct {
 	// Var.varlevelsup by counting how many parent links to walk.
 	// nil for the top-level SELECT.
 	parent *resolveContext
+	// groupingSetsWrapAll is pull_up_simple_subquery's
+	// `if (parse->groupingSets) rvcontext.wrap_option = REPLACE_WRAP_ALL`
+	// (prepjointree.c) for this statement's pulled sublink bodies: under real
+	// grouping sets PG wraps every pulled output in a PlaceHolderVar, so a
+	// semijoin's RHS operand is no plain Var — reduce_unique_semijoins cannot
+	// prove it unique and create_unique_path cannot take its free NOOP arm
+	// (M0146-0177/0179, TPC-DS Q70). Set before the sublink pull-up.
+	groupingSetsWrapAll bool
 	// settings is the per-statement planner context (plannersettings.go).
 	//
 	// It is resolved DIRECTLY, never by walking `parent`: `parent` is assigned
@@ -1989,6 +1997,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// arm — search below a pinned spine, then again above it — was
 		// deleted with the legacy pipeline, M0145-0008.)
 		if f, okf := node.(*Filter); okf {
+			ctx.groupingSetsWrapAll = statementHasGroupingSets(s)
 			ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
 			if ctx.jtPullup != nil {
 				// M0145-0007 slice 3 census (nlicensus.go).

@@ -32635,7 +32635,7 @@ Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.
       residual\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(no change\), TPC\-H
       acceptance arm PASS, regress A/B 5 index suites identical, nbtree `\-race`\.
-- [ ] **M0146-0179 — a Hash Semi Join with a pulled subquery rel as the hashed inner (TPC-DS Q70)**
+- [x] **M0146-0179 — a Hash Semi Join with a pulled subquery rel as the hashed inner (TPC-DS Q70)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F4). PG elects `Hash Semi Join`
   (38304.53) hashing the 2-row `tmp1` subquery under the main join's Gather; goopg elects a Nested
   Loop with tmp1 outer and a Materialize over the Gather (38320.63). PG's arm built from goopg's own
@@ -32645,6 +32645,22 @@ Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.
   - First step: instrument `addPath` on the joinrel {store_sales, d1, store, tmp1} for Q70 SF0.25 and
     list every hash candidate; if none hashes tmp1, find the gate (`hash_inner_and_outer` JOIN_SEMI,
     joinpath.c).
+  - Done 2026\-10\-13 \(design `docs/design/0100\-0149/m0146\-0179\-semijoin\-under\-grouping\-sets\.md`, evidence
+    `analysis/m0146/m0146\-0179/`\)\.
+    - The Hash Semi Join was generated and cheapest\. An inner Nested Loop over `tmp1` evicted it: costs were
+      fuzz\-equal and it carried `s\_state` pathkeys\.
+    - PG oracle: a PG 18\.3 `OPTIMIZER\_DEBUG` build \(`tmp/pgdbg`, loaded from a pg\_dump of tpcds025\)\. PG\'s
+      `tmp1` path has no pathkeys, and a bisection shows PG keeps the semijoin under real grouping sets\.
+      `pull\_up\_simple\_subquery`\'s `REPLACE\_WRAP\_ALL` PlaceHolderVars block both `reduce\_unique\_semijoins` and
+      the free NOOP unique\-ification\.
+    - Fix: `resolveContext\.groupingSetsWrapAll` \(`statementHasGroupingSets`\) disables both\.
+      `nestLoopPlainOuters` gives JOIN\_UNIQUE\_OUTER the unique\-ified outer, as `match\_unsorted\_outer` does;
+      before, it used the raw path\.
+    - Q70 SF0\.25 elects PG\'s Hash Semi Join; values equal PG\'s\. Regress A/B: `join` reshuffles one empty\-table
+      plan \(41 lines from PG before and after\); the others are identical\.
+    - Tests: `TestStatementHasGroupingSets`, `TestUniqueOuterNestLoopUsesUniquePath` \(fails on the raw\-outer code\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: yes — match SF0.25 75 -> 76, SF1 62 -> 63 (TPC-DS Q70)
 - [ ] **M0146-0180 — a Parallel Append is priced below its own first child (TPC-DS Q76)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F5). Q76 SF0.25: goopg's Parallel
   Append costs 14166.13 over a first child of 17941.59; PG's `cost_append` (costsize.c,

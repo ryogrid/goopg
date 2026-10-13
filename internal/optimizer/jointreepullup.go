@@ -876,7 +876,10 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 		// M0145-0008ae: `reduce_unique_semijoins` — a semijoin to a single
 		// rel that is unique for the join clauses gets no SpecialJoinInfo,
 		// so the search plans it as the inner join it is.
-		if pulledSemiRhsIsUnique(pb, sjRhs, spanning, spans, ctx.cat) {
+		// Under real grouping sets PG's pull-up wraps the RHS outputs in
+		// PlaceHolderVars (ctx.groupingSetsWrapAll), so neither proof sees a
+		// plain Var: the semijoin stays, and unique-ifying its RHS is paid.
+		if !ctx.groupingSetsWrapAll && pulledSemiRhsIsUnique(pb, sjRhs, spanning, spans, ctx.cat) {
 			notePullupClassify("semijoin-reduced-to-inner")
 			pos += n
 			continue
@@ -884,7 +887,7 @@ func classifyPulledQuals(pu *jtPullup, nReal int, spans []leafSpan, ctx *resolve
 		if sj := pulledSemiJoinInfo(pb.jointype, sjRhs, sjLeft, spanning, spans); sj != nil && !joinInfoListHas(ctx.joinInfoList, sj) {
 			// M0145-0008ab: a derived ANY_subquery proven distinct on its
 			// output unique-ifies for free — see SpecialJoinInfo.SemiRhsDistinct.
-			sj.SemiRhsDistinct = pb.derived && pb.distinct && pb.subtreeLeaves == 1
+			sj.SemiRhsDistinct = pb.derived && pb.distinct && pb.subtreeLeaves == 1 && !ctx.groupingSetsWrapAll
 			ctx.joinInfoList = append(ctx.joinInfoList, sj)
 		}
 		pos += n
