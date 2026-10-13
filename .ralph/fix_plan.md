@@ -32854,7 +32854,7 @@ Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 16 -> 14, sort-strategy 
     - Test: `TestPostPassStandsDownOnACostedSearchedSubtree` \(fails with the stand\-down disabled\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: none — the record was a probe, not a corpus query: no TPC-DS or TPC-H plan moved (sweep same=99, fire set match 75/64 unchanged); regress aggregates 942 -> 943 diff lines (balk UDA case)
-- [ ] **M0146-0187 — an appendrel member's parameterised Bitmap Heap Scan prints its probe as Filter, not Recheck Cond (TPC-DS Q54)**
+- [x] **M0146-0187 — an appendrel member's parameterised Bitmap Heap Scan prints its probe as Filter, not Recheck Cond (TPC-DS Q54)**
   (filed 2026-10-14 by M0146-0184; previously ledgered under M0146-0005dp). Q54's item NL drives a parameterised
   Append whose Bitmap Heap Scan on catalog_sales prints `Filter: (cs_item_sk = item.i_item_sk)` where PG prints
   `Recheck Cond:` (bitmapqualorig). It is Q54's only SF0.25 divergence (qual-placement); at SF1 web_sales' member
@@ -32863,6 +32863,16 @@ Movement: none — the record was a probe, not a corpus query: no TPC-DS or TPC-
   Parent: M0146-0014
   - First step: compare the PathParamAppend member bitmap construction (M0146-0049b/c) with the single-scan
     bitmap restriction arm and route the probe clause into the Recheck Cond the same way.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0187\-param\-append\-bitmap\-recheck\.md`, evidence
+    `analysis/m0146/m0146\-0187/`\)\.
+    - `bindParamProbe` keeps the member probe\'s recheck on `Cond` \(a lateral join has no merged row for
+      BitmapQual\'s coordinates\); EXPLAIN printed all of `Cond` as Filter\.
+    - Fix: `BitmapHeapScan\.ProbeRecheckN` counts the leading recheck conjuncts \(placed first by bindParamProbe\);
+      EXPLAIN prints them as Recheck Cond and the rest as Filter\. Execution unchanged\.
+    - Q54 SF0\.25 EXPLAIN text equals PG\'s; fixture plan text equals PG 18\.3\'s and results match\.
+    - Test: `TestExplainParamAppendBitmapRecheck` \(fails with the split disabled\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: yes — match SF0.25 75 -> 76 (TPC-DS Q54); CATEGORIES-EXCL-MATCH SF0.25 qual-placement 5 -> 4
 - [ ] **M0146-0188 — an index-only path carries no pathkeys, so PG's ordered Index Only Scan appears as an Index Scan (TPC-DS Q77)**
   (filed 2026-10-14 by M0146-0185). goopg's `indexonly` producer files web_page_pkey's full index-only scan with
   pathkeys=0 (dominated), while `index.ordered` files the plain Index Scan sorted on the key; PG keeps the Index Only

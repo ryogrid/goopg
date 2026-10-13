@@ -2856,22 +2856,39 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// two are different things and both belong here: BitmapQual is the
 		// recheck list (lossy pages only), Cond is the per-tuple residual the
 		// scan carries when it is an NLI inner (plan.go, BitmapHeapScan.Cond).
-		if len(p.BitmapQual) > 0 {
-			var rc optimizer.Expr = p.BitmapQual[0]
-			for _, q := range p.BitmapQual[1:] {
+		recheck := p.BitmapQual
+		cond := p.Cond
+		// M0146-0187: a parameterised probe (bindParamProbe) keeps its recheck
+		// on Cond; its leading ProbeRecheckN conjuncts are PG's bitmapqualorig.
+		if len(recheck) == 0 && p.ProbeRecheckN > 0 && cond != nil {
+			if parts := optimizer.SplitAnd(cond); len(parts) >= p.ProbeRecheckN {
+				recheck = parts[:p.ProbeRecheckN]
+				cond = nil
+				for _, q := range parts[p.ProbeRecheckN:] {
+					if cond == nil {
+						cond = q
+					} else {
+						cond = &optimizer.BinaryOp{Op: parser.OpAnd, Left: cond, Right: q}
+					}
+				}
+			}
+		}
+		if len(recheck) > 0 {
+			var rc optimizer.Expr = recheck[0]
+			for _, q := range recheck[1:] {
 				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
 			}
 			rc = qualifyForeignColumns(rc, p, reg)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
 		}
 		filt := attachedFilter
-		if p.Cond != nil {
+		if cond != nil {
 			if filt == nil {
-				filt = p.Cond
+				filt = cond
 			} else {
 				// The scan's own quals lead: PG appends a parameterized
 				// path's ppi_clauses after the restriction quals.
-				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: p.Cond, Right: filt}
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: cond, Right: filt}
 			}
 		}
 		if filt != nil {

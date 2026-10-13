@@ -3605,8 +3605,15 @@ type BitmapHeapScan struct {
 	// Distinct from `BitmapQual`: that is the RECHECK list, re-evaluated only
 	// when a bitmap entry is lossy or the AM demands it. `Cond` is evaluated on
 	// every tuple, lossy or not.
-	Cond   Expr
-	schema Schema
+	Cond Expr
+	// ProbeRecheckN counts the leading AND-conjuncts of Cond that are a
+	// parameterised probe's recheck — PG's bitmapqualorig, printed as
+	// `Recheck Cond:` — rather than per-tuple residuals. bindParamProbe keeps
+	// the recheck on Cond (a lateral join has no merged row for BitmapQual's
+	// coordinates), so execution is unchanged; only EXPLAIN splits the two
+	// (M0146-0187). Zero means Cond is all residual.
+	ProbeRecheckN int
+	schema        Schema
 	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
 	// was chosen as the worker-read driving scan under a Gather/GatherMerge
 	// (PG sets it in create_bitmap_heap_path, pathnode.c:1115, gated on

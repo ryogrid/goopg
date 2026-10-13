@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS pa_o, pa_s1, pa_s2;
+CREATE TABLE pa_o (k int, tag int);
+CREATE TABLE pa_s1 (k int, v int);
+CREATE TABLE pa_s2 (k int, v int);
+INSERT INTO pa_o SELECT g, g % 100 FROM generate_series(1, 1000) g;
+INSERT INTO pa_s1 SELECT g % 1000, g FROM generate_series(1, 100000) g;
+INSERT INTO pa_s2 SELECT g % 1000, g FROM generate_series(1, 100000) g;
+CREATE INDEX pa_s1_k ON pa_s1 (k);
+CREATE INDEX pa_s2_k ON pa_s2 (k);
+ANALYZE pa_o; ANALYZE pa_s1; ANALYZE pa_s2;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT o.k, u.v FROM pa_o o, (SELECT k, v FROM pa_s1 UNION ALL SELECT k, v FROM pa_s2) u WHERE u.k = o.k AND o.tag = 7;

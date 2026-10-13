@@ -400,10 +400,10 @@ func bindParamProbe(what string, probe Node, idxPath *Path, outerLay outputLayou
 		bis.Key, bis.Keys = nil, keys
 	}
 	out := bhs.Output()
+	// The recheck conjuncts lead Cond and ProbeRecheckN counts them, so EXPLAIN
+	// prints them as PG's `Recheck Cond:` and the residual after them as
+	// `Filter:` (M0146-0187).
 	conds := []Expr{}
-	if bhs.Cond != nil {
-		conds = append(conds, bhs.Cond)
-	}
 	for k, c := range idxPath.IndexClauses {
 		if idxPath.IndexInfo == nil || c.indexCol >= len(idxPath.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: %s bitmap clause names no index column", what))
@@ -422,6 +422,10 @@ func bindParamProbe(what string, probe Node, idxPath *Path, outerLay outputLayou
 		conds = append(conds, &BinaryOp{Op: parser.OpEq,
 			Left:  &ColumnRef{Index: col, Name: out[col].Name, Type: out[col].Type},
 			Right: keys[k]})
+	}
+	bhs.ProbeRecheckN = len(conds)
+	if bhs.Cond != nil {
+		conds = append(conds, bhs.Cond)
 	}
 	bhs.BitmapQual = nil
 	bhs.Cond = combineAnd(conds)
