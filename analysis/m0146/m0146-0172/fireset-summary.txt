@@ -1,0 +1,17 @@
+# SF0.25
+PLAN-PARITY: queries=99 match=68 shapediff=31 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=24 join-method=14 scan-type=11 parameterisation=15 aggregation-strategy=5 sort-strategy=14 parallelism=15 qual-placement=3 rendering=2
+PLAN-PARITY: queries=99 match=70 shapediff=29 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=22 join-method=12 scan-type=10 parameterisation=13 aggregation-strategy=5 sort-strategy=13 parallelism=14 qual-placement=4 rendering=2
+# SF1
+PLAN-PARITY: queries=99 match=45 shapediff=54 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=44 join-method=21 scan-type=24 parameterisation=25 aggregation-strategy=9 sort-strategy=24 parallelism=39 qual-placement=9 rendering=4
+PLAN-PARITY: queries=99 match=44 shapediff=55 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=44 join-method=22 scan-type=25 parameterisation=26 aggregation-strategy=9 sort-strategy=24 parallelism=40 qual-placement=9 rendering=4
+# TPC-H
+PLAN-PARITY: queries=22 match=13 shapediff=9 unparsed=0 missingnode=0 error=0 timeout=0
+PLAN-PARITY: queries=22 match=13 shapediff=9 unparsed=0 missingnode=0 error=0 timeout=0
+FIRE-SET-TIMEOUTS: ... introduced=none unchanged=none missing=none
+FIRE-SET-TIMEOUTS: ... introduced=none unchanged=none missing=none
+FIRE-SET-TIMEOUTS: ... introduced=none unchanged=none missing=none
+# values: sf025 85/85 identical, sf1 82/82 identical (sorted result diff, baseline vs candidate)

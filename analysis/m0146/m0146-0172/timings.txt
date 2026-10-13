@@ -1,0 +1,6 @@
+# Private clone of bench/tpcds/runtime_goopg/data (SF1), same clone for both binaries, server age held.
+# wall-clock seconds, psql -f query<N>.sql, PG = :65438 db tpcds (read-only)
+Q72 head(210248631) 219.93                 candidate 3.40 2.77 2.91   (101 rows both)
+Q47 head 12.54 8.44   candidate 8.59 7.56   pg 5.01 2.67
+Q96 head  0.93 0.93   candidate 0.92 0.86   pg 0.16 0.13
+Q68 head  1.20 1.15   candidate 1.38 1.07   pg 0.61 0.12

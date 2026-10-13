@@ -24100,6 +24100,10 @@ M0146-0001 re-baseline census on the new default arm.
     `bench/tpcds/README.md`, then re\-run the sweep, the fire\-set baseline
     and M0146\-0001\'s census. Also check, read\-only, whether the TPC\-H
     goopg reference cluster holds unpadded `char\(n\)` values.
+  - More evidence 2026\-10\-13 \(M0146\-0172\): the SF1 load also predates the numeric codec flip \(`02995818d`,
+    2026\-08\-11\) and stores every numeric column as decimal text\. `catalog\_sales` is 41067 heap pages against PG\'s
+    37448 \(tuples 221 vs 200 bytes\), and the `store\_sales` Parallel Seq Scan costs 66740 against PG\'s 58984\. The
+    SF0\.25 load \(post\-flip\) matches PG \(9359 vs 9416\)\. Evidence `analysis/m0146/m0146\-0172/catalog\-sales\-heap\-pages\.txt`\.
   - Related 2026\-09\-26 \(M0146\-0005o\): the PG SF1 reference\'s `store`
     table shows the no\-statistics default estimate \(40 rows, cost 10.40\)
     in TPC\-DS Q8, so SF1 Q8 diverges on reference statistics. A statistics
@@ -32043,7 +32047,7 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   Parent: M0146\-0159
   - First step: profile Q17 at SF0\.25 on a private clone \(perf, the probe loop\) against PG\'s same plan to locate the
     per\-probe gap \(index descent, heap fetch, param rebinding\)\.
-- [ ] **M0146-0172 — TPC\-DS SF1 Q72 runs 65x slower since M0146\-0009p: goopg elects the item\-only inventory route**
+- [x] **M0146-0172 — TPC\-DS SF1 Q72 runs 65x slower since M0146\-0009p: goopg elects the item\-only inventory route**
   \(filed 2026\-10\-13 by M0146\-0009p\)\. With PG\'s parameterised rows \(0009p\), goopg prices its item\-only route
   \(`inventory\_pkey` probe on `inv\_item\_sk` rows=236, then the date\-dimension joins over 13819 rows\) at 54874, under its
   own PG\-shaped route \(55265\); PG\'s route costs 52196 in PG\. The remaining gap: the \{cs, hd, d1, cd\} subtree under the
@@ -32057,6 +32061,18 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   > M0146\-0009p\'s PG\-faithful row estimate makes goopg elect a non\-PG route that runs 3\.3s → 216s at SF1\. Kept
   > \(R3: no reverts on runtime\); reverting is the owner\'s call\. The fix is a cost\-model divergence in Q72\'s
   > subtree under the d2 hash \(this task\)\.
+  **RESOLVED 2026\-10\-13 by this task \(`7e6d8b13f`\) — no revert needed\.**
+  - Done 2026\-10\-13: the decomposition found two gaps\.
+    - The subtree\'s 3620 is the stale SF1 load: `catalog\_sales` still stores numeric as text \(pre\-`02995818d`\), 41067
+      heap pages vs PG\'s 37448\. That is owner\-reload data, not the cost model; both routes scan it\.
+    - The election turned on three missing btcostestimate/genericcostestimate terms: the log2\(N\) descent,
+      qual\_op\_cost per index tuple, and num\_outer\_scans = 1 for an unparameterised path \(goopg multiplied numSA by
+      an unset loopCount of 0, so an unparameterised SAOP or skip scan priced all its descents as one index page:
+      968 vs PG 1814\.67\)\. Ported; the skip probe now costs 1808\.91\.
+  - SF1 Q72 on one private clone: HEAD 219\.9s → 2\.9s, PG\'s route\. Fire set: SF0\.25 match 68 → 70, SF1 45 → 44 \(Q47/Q96
+    filed as M0146\-0174\), values identical on 167 fired queries\. Design
+    `docs/design/0100\-0149/m0146\-0172\-btree\-descent\-cost\-terms\.md`, evidence `analysis/m0146/m0146\-0172/`\.
+Movement: yes — TPC\-DS SF0\.25 match 68→70 \(SF1 45→44, TPC\-H 13→13\)
 - [ ] **M0146-0173 — timestamp / interval arithmetic: wrong output and spurious errors** \(filed 2026\-10\-13 by
   M0146\-0060\)\. Against PG 18\.3: `SELECT timestamp \'2020\-01\-01\' \+ interval \'5 minutes\'` prints
   `2020\-01\-01 00:05:00\.000000` \(PG `2020\-01\-01 00:05:00`\); `g \* interval \'1 minute\'` raises `operator \* requires
@@ -32068,3 +32084,24 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   - Rank: below item 10 — correctness\-only, no owner placement \(S7 carve\-out\)\.
   - First step: the BinaryOp `\+` / `\*` typing arms for timestamp/interval and int/interval \(PG timestamp\_pl\_interval,
     interval\_mul, mul\_d\_interval\) and the timestamp output path for a folded constant\.
+- [ ] **M0146-0174 — TPC\-DS SF1 Q47 and Q96 lose their PG match after M0146\-0172** \(filed 2026\-10\-13 by M0146\-0172,
+  kept per R3\)\. With btcostestimate\'s descent terms, SF1 Q96 elects a Parallel Hash Join on `time\_dim` \(70665\) over
+  PG\'s nested loop with a `time\_dim\_pkey` probe \(about 70764 in goopg\), a 0\.14% margin; Q47 moves in join\-method /
+  scan\-type\. Both are measured on the stale SF1 heap \(`store\_sales` Parallel Seq Scan 66740 vs PG 58984 — numeric
+  stored as text\)\. Runtimes are unchanged against HEAD \(Q47 8\.4 → 7\.6s, Q96 0\.93 → 0\.89s\)\. Plans
+  `tmp/m0172\-fireset/tpcds\-sf1/` \(local\), timings `analysis/m0146/m0146\-0172/timings\.txt`\.
+  Kind: recon
+  Parent: M0146\-0172
+  - First step: decompose Q96\'s two routes node by node against PG \(the time\_dim probe per loop, the Parallel Hash
+    build, the hash joins above\) with the store\_sales scan held equal; if the margin is the stale heap\'s width or
+    pages, park on the owner SF1 reload\.
+- [ ] **M0146-0175 — the ordered index producer builds a clauseless twin of an index that has restriction clauses**
+  \(filed 2026\-10\-13 by M0146\-0172\)\. PG\'s build\_index\_paths builds ONE path per index and adds the clauseless
+  ordered one only when no clause matches \(indxpath\.c\)\. goopg\'s `addOneOrderedIndexPath` \(pathindexordered\.go\) always
+  builds it, so regress join\'s `j2\.id1 = any \(array\[1\]\)` now ties the SAOP path exactly \(8\.17 each, PG ties at
+  12\.17\) and keeps the `ANY` as a Filter where PG prints `Index Cond`\.
+  Kind: impl
+  Parent: M0146\-0172
+  - Rank: below item 10 — regress\-only witness, no TPC query named \(S7 carve\-out\)\.
+  - First step: skip the ordered producer for an index the restriction producer already built a clause path for
+    \(the same rule `restrictionPathIsIndexOnly` applies to its index\-only twin\), then re\-run the fire set\.
