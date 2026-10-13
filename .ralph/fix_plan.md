@@ -32509,7 +32509,7 @@ Movement: none — recon — the two SF1 losses are stale\-load artefacts; SF0\.
     - Five new mechanism findings \(F1–F5\) are recorded unfiled in M0146\-0014\'s S4 escalation \(lineage budget\)\.
       Design: `docs/design/0100\-0149/m0146\-0014\-parity\-closure\-sweep\.md`\.
 Movement: none — recon
-- [ ] **M0146-0176 — a correlated SubPlan conjunct is applied unpriced above the join (TPC-DS Q32, Q92)**
+- [x] **M0146-0176 — a correlated SubPlan conjunct is applied unpriced above the join (TPC-DS Q32, Q92)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F1; plan regression since M0146-0130
   `a6905e365`). The conjunct `ws_ext_discount_amt > (SubPlan 1)` is not in the {web_sales, item} join
   restrictlist; goopg applies it as a top `Filter:` that no join path pays for. Q92 SF0.25 elects a
@@ -32525,6 +32525,23 @@ Movement: none — recon
     leaf, join clause or top Filter) and confirm it is missing from the {item, web_sales} restrictlist;
     keep a two-rel correlated-SubPlan conjunct as a join restrictinfo so every join path pays
     `joinQualEvalCost`.
+  - Done 2026\-10\-13 \(design `docs/design/0100\-0149/m0146\-0176\-sublink\-rebase\-lateral\-frame\.md`, evidence
+    `analysis/m0146/m0146\-0176/`\)\.
+    - Cause: M0146\-0170 \(`566d9721c`\), not 0130\. Its fix made `keptRebase\.rebaseOne` refuse any SubPlan holding a
+      lateral join\. Q92\'s SubPlan probes `date\_dim\_pkey` from a nested loop, so the conjunct was never pre\-lowered,
+      kept relids \{web\_sales\} and stayed above the join \(`REBASEFAIL cause=nested\-sublink\-lateral`\)\.
+    - Fix: `rebaseNode` walks a `Lateral` join\'s right child one frame deeper \(`lowerTraverseNodeHooked` node hook\)\.
+      The join\'s nestloop param stays a frame ref and only escaping refs become SubPlan parameters\. The refusal is
+      gone\.
+    - Q92 and Q32 SF0\.25 now have PG\'s hash join with the SubPlan as Join Filter; values equal PG\'s\.
+    - TPC\-H corpus: only Q2 fires; its values match and its plan moves to PG\'s join structure\. It runs 0\.18 → 0\.71 s
+      \(PG 0\.20 s in that shape — ledgered as executor overhead\)\.
+    - Regress A/B \(`subselect`, `join`, `with`, `aggregates`\) is identical\.
+    - `TestCorrelatedSubPlanKeepsInnerNestloopParam` now pins the qual\'s level too, and fails with the refusal
+      restored\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(both scales\), TPC\-H fire set
+      \(values MATCH\), ea\-ratchet PASS \(1\)\.
+Movement: yes — match SF0.25 72 -> 74 (TPC-DS Q32, Q92); CATEGORIES-EXCL-MATCH SF1 join-method 22 -> 20, scan-type 25 -> 23, parallelism 40 -> 38
 - [ ] **M0146-0177 — the ordered-paths step offers a full Sort beside the Incremental Sort (TPC-DS Q60)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F2). PG's `create_ordered_paths`
   (planner.c, the presorted_keys arm) adds only an Incremental Sort when the input path has a non-empty

@@ -1,0 +1,28 @@
+M0146-0176 — correlated SubPlan conjunct applied unpriced above the join (TPC-DS Q32, Q92), 2026-10-13
+
+Cause (not M0146-0130): M0146-0170 (566d9721c, 2026-10-13 05:33) made keptRebase.rebaseOne refuse every kept
+sublink whose plan holds a lateral join (planContainsLateralJoin -> REBASEFAIL cause=nested-sublink-lateral,
+seen with GOOPG_NLI_CENSUS=1 on Q92). preLowerSpanningScalarSublinks therefore could not pre-lower Q92's
+`ws_ext_discount_amt > (SubPlan 1)` — whose body is a nested loop with a parameterised date_dim_pkey probe — so
+the conjunct kept relids {web_sales} only and was applied as a Filter on the finished 3-rel join (unpriced:
+2277.04 = 2221.05 + 160 x 0.35).
+
+Fix: rebaseNode walks a Lateral Join's right child one frame deeper (lowerTraverseNodeHooked + a node hook).
+Level-1 refs there are the join's nestloop param (joinOp.openLateral pushes the left row per call) and stay
+frame refs; only refs that escape further become SubPlan parameters. The 0170 refusal is removed from rebaseOne.
+
+Q92 SF0.25 after: Hash Join (web_sales x item), Join Filter: (ws_ext_discount_amt > (SubPlan 1)), cost 8870.89
+(PG 8959.93; rest of the gap is relpages). Q32 SF0.25: PG's shape (Hash Join + Join Filter, Gather below).
+Values: Q92 NULL / Q32 2444.35, identical to PG :65438 tpcds025.
+
+Fire set (fireset-summary.txt): SF0.25 match 72 -> 74 (Q32, Q92); SF1 match 46 -> 46 with join-method 22 -> 20,
+scan-type 25 -> 23, parallelism 40 -> 38 (stale SF1 load keeps both divergent elsewhere). No new timeouts.
+TPC-H corpus (fireset-tpch-summary.txt): only Q2 fires; values MATCH (463 rows, identical digests). Plan moves to
+PG's join structure (supplier->partsupp nested loop hashed against the parallel part scan, SubPlan at that join):
+[join-order,parallelism] -> [join-order,parameterisation]; the rest is PG hashing on the SubPlan as a second key
+(ledgered, exprCarriesSublink). Runtime 0.18 s -> 0.71 s (one sample); PG's own Q2 in this shape: 0.20 s warm on
+:65432 — the goopg-in-PG-shape gap is per-row executor overhead (M0146-0088 residual), not planner.
+
+Regress A/B (HEAD worktree vs candidate, normalised diffs): subselect, join, with, aggregates identical.
+Test: TestCorrelatedSubPlanKeepsInnerNestloopParam now also pins the qual's level (a parameterised scan, as PG
+18.3 files it on `Index Scan using it_pkey on it`); it fails with the 0170 refusal restored.

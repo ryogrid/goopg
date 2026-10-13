@@ -21,8 +21,26 @@ type lowerExprFn func(e Expr) (repl Expr, handled bool, ok bool)
 // applying fx and writing back replacements. Returns false when an
 // unmodelled node kind is encountered or fx reports failure.
 func lowerTraverseNode(n Node, fx lowerExprFn) bool {
+	return lowerTraverseNodeHooked(n, fx, nil)
+}
+
+// lowerNodeHook lets a caller take over one node of the walk: handled=true
+// means the hook walked that node and its subtree itself and ok is the
+// result. The hook sees every node, including the descendants it hands back
+// to lowerTraverseNodeHooked.
+type lowerNodeHook func(n Node) (handled, ok bool)
+
+// lowerTraverseNodeHooked is lowerTraverseNode with a node hook. The keptRebase
+// pass uses it to walk a lateral join's right child one frame deeper
+// (M0146-0176).
+func lowerTraverseNodeHooked(n Node, fx lowerExprFn, hook lowerNodeHook) bool {
 	if n == nil {
 		return true
+	}
+	if hook != nil {
+		if handled, ok := hook(n); handled {
+			return ok
+		}
 	}
 	rewriteAll := func(es []Expr) bool {
 		for i, e := range es {
@@ -79,7 +97,7 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 		if !one(&x.Cond) || !rewriteAll(x.BitmapQual) {
 			return false
 		}
-		return lowerTraverseNode(x.Outer, fx)
+		return lowerTraverseNodeHooked(x.Outer, fx, hook)
 	case *BitmapIndexScan:
 		if !one(&x.Key) || !rewriteAll(x.Keys) || !one(&x.LowKey) || !one(&x.HighKey) {
 			return false
@@ -87,22 +105,22 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 		return rewriteAll(x.Pred)
 	case *BitmapAnd:
 		for _, in := range x.Inputs {
-			if !lowerTraverseNode(in, fx) {
+			if !lowerTraverseNodeHooked(in, fx, hook) {
 				return false
 			}
 		}
 		return true
 	case *BitmapOr:
 		for _, in := range x.Inputs {
-			if !lowerTraverseNode(in, fx) {
+			if !lowerTraverseNodeHooked(in, fx, hook) {
 				return false
 			}
 		}
 		return true
 	case *Filter:
-		return one(&x.Predicate) && lowerTraverseNode(x.Child, fx)
+		return one(&x.Predicate) && lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Project:
-		return rewriteAll(x.Targets) && lowerTraverseNode(x.Child, fx)
+		return rewriteAll(x.Targets) && lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Aggregate:
 		if !rewriteAll(x.GroupExprs) {
 			return false
@@ -126,32 +144,32 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 				}
 			}
 		}
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Sort:
 		for i := range x.Keys {
 			if !one(&x.Keys[i].Expr) {
 				return false
 			}
 		}
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Limit:
 		return one(&x.Limit) && one(&x.Offset) && rewriteAll(x.TiesKeys) &&
-			lowerTraverseNode(x.Child, fx)
+			lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Distinct:
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *DistinctOn:
 		// KeyCols are schema indices, not expressions.
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *Join:
 		if !one(&x.Predicate) || !one(&x.LeftKey) || !one(&x.RightKey) {
 			return false
 		}
-		return lowerTraverseNode(x.Left, fx) && lowerTraverseNode(x.Right, fx)
+		return lowerTraverseNodeHooked(x.Left, fx, hook) && lowerTraverseNodeHooked(x.Right, fx, hook)
 	case *NestedLoopIndexJoin:
 		if !one(&x.Predicate) {
 			return false
 		}
-		return lowerTraverseNode(x.Outer, fx) && lowerTraverseNode(x.Inner, fx)
+		return lowerTraverseNodeHooked(x.Outer, fx, hook) && lowerTraverseNodeHooked(x.Inner, fx, hook)
 	case *Values:
 		for _, row := range x.Rows {
 			if !rewriteAll(row) {
@@ -162,12 +180,12 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 	case *OrdinalityWrap:
 		// S4a scalar-residual rewrite wraps the outer side in an
 		// ordinal tag; it carries no expressions of its own.
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	case *LockRows:
 		if !one(&x.LimitCount) || !one(&x.OffsetCount) {
 			return false
 		}
-		return lowerTraverseNode(x.Child, fx)
+		return lowerTraverseNodeHooked(x.Child, fx, hook)
 	}
 	// Unmodelled node kind (WindowAgg, SRFs, CTE machinery, SetOp, ...):
 	// bail — the sublink stays on the stack path.
