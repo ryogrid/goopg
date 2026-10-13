@@ -1,0 +1,42 @@
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=15544.91..15588.51 rows=100 width=298)
+   ->  Finalize GroupAggregate  (cost=15544.91..16997.23 rows=3331 width=298)
+         Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+         ->  Gather Merge  (cost=14506.73..14573.35 rows=3331 width=298)
+               Workers Planned: 3
+               ->  Sort  (cost=14506.73..14540.04 rows=3331 width=298)
+                     Sort Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                     ->  Partial HashAggregate  (cost=14278.53..14311.84 rows=3331 width=298)
+                           Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                           ->  Parallel Append  (cost=1000.58..14112.00 rows=10744 width=290)
+                                 ->  Parallel Hash Join  (cost=1480.53..17943.16 rows=9765 width=502)
+                                       Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+                                       ->  Nested Loop  (cost=0.30..16437.29 rows=9765 width=294)
+                                             ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=10233 width=212)
+                                                   Filter: (ss_customer_sk IS NULL)
+                                             ->  Memoize  (cost=0.30..0.52 rows=1 width=268)
+                                                   Cache Key: store_sales.ss_sold_date_sk
+                                                   Cache Mode: logical
+                                                   ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.51 rows=1 width=268)
+                                                         Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                       ->  Parallel Hash  (cost=1347.88..1347.88 rows=10588 width=1906)
+                                             ->  Parallel Seq Scan on item  (cost=0.00..1347.88 rows=10588 width=1906)
+                                 ->  Nested Loop  (cost=0.58..13555.66 rows=486 width=2200)
+                                       ->  Nested Loop  (cost=0.29..12147.81 rows=486 width=294)
+                                             ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=488 width=286)
+                                                   Filter: (cs_bill_customer_sk IS NULL)
+                                             ->  Index Scan using date_dim_pkey on date_dim date_dim_1  (cost=0.29..3.33 rows=1 width=268)
+                                                   Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                       ->  Index Scan using item_pkey on item item_1  (cost=0.29..2.90 rows=1 width=1906)
+                                             Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                 ->  Nested Loop  (cost=0.58..5861.93 rows=30 width=2200)
+                                       ->  Nested Loop  (cost=0.29..5635.97 rows=30 width=1932)
+                                             ->  Parallel Seq Scan on web_sales  (cost=0.00..5446.82 rows=30 width=286)
+                                                   Filter: (ws_promo_sk IS NULL)
+                                             ->  Index Scan using item_pkey on item item_2  (cost=0.29..6.30 rows=1 width=1906)
+                                                   Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                                       ->  Index Scan using date_dim_pkey on date_dim date_dim_2  (cost=0.29..7.53 rows=1 width=268)
+                                             Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+(38 rows)
+

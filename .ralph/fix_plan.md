@@ -32661,7 +32661,7 @@ Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.
     - Tests: `TestStatementHasGroupingSets`, `TestUniqueOuterNestLoopUsesUniquePath` \(fails on the raw\-outer code\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — match SF0.25 75 -> 76, SF1 62 -> 63 (TPC-DS Q70)
-- [ ] **M0146-0180 — a Parallel Append is priced below its own first child (TPC-DS Q76)**
+- [x] **M0146-0180 — a Parallel Append is priced below its own first child (TPC-DS Q76)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F5). Q76 SF0.25: goopg's Parallel
   Append costs 14166.13 over a first child of 17941.59; PG's `cost_append` (costsize.c,
   parallel-aware arm) sums the partial children to 37614.25. The query totals are 15612 vs 39026.
@@ -32673,3 +32673,36 @@ Movement: yes — match SF0.25 75 -> 76, SF1 62 -> 63 (TPC-DS Q70)
   Parent: M0146-0014
   - First step: decompose goopg's Parallel Append cost for Q76 against PG's `cost_append` partial arm
     (per-child cost, parallel divisor, the non-partial rule M0146-0137 changed).
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0180\-partial\-agg\-over\-setop\-partial\-path\.md`,
+    evidence `analysis/m0146/m0146\-0180/`\)\.
+    - The Append path itself was PG\-priced: the search\'s partial SetOp path cost 37396, close to PG\'s 37614\.
+      The printed 14112 came from the partial\-aggregate split, which seeded its input from the committed serial
+      winner \(a Gather, startup 1000\.58\) and divided its run cost by the parallel divisor \(`parallelSeedCost`\)\.
+    - Cause: `searchedCheapestPartialInput` read `cheapest\_partial\_path` only from a join search\'s rel\. Over a
+      UNION ALL the input rel is the SETOP rel, whose `PartialPathlist\[0\]` is the Parallel Append\.
+    - Fix: the helper also answers for a node tagged with its SETOP rel \(`setOpBranchRelNode`\)\. It rebuilds that
+      path under a Gather, which the split unwraps\.
+    - Q76 SF0\.25: Parallel Append 0\.58\.\.37552 \(PG 0\.58\.\.37614\); the query total is 38969 \(PG 39026, was 15612\)\.
+      The catalog\_sales branch\'s Parallel Hash Join vs PG\'s Nested Loop is pre\-existing \(rows 582 vs 509\)\.
+    - A three\-table UNION ALL GROUP BY probe now plans PG\'s Finalize/Gather Merge/Partial HashAggregate/Parallel
+      Append shape; HEAD planned a serial HashAggregate\.
+    - Regress A/B \(union, select\_parallel, partition\_aggregate, aggregates\): identical\.
+    - Test: `TestExplainPartialAggOverUnionAll` \(fails with the new arm disabled\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+    - Follow\-ups: M0146\-0182 \(split\-chain Gather Merge display cost\), M0146\-0183 \(Q5 2\-key Hash Right Join\)\.
+Movement: yes — match SF1 63 -> 64 (TPC-DS Q14), SF0.25 76 -> 76; CATEGORIES-EXCL-MATCH SF1 join-order 32 -> 31
+- [ ] **M0146-0182 — the partial-aggregate split chain prints its Gather Merge without parallel_setup_cost**
+  (filed 2026-10-14 at M0146-0180 close). TPC-DS Q76 SF0.25: goopg prints `Gather Merge (cost=37913.74..37982.60
+  rows=3443)` over a Sort starting at 37913.74; PG prints `39026.66..40214.93 rows=10044` (startup +
+  parallel_setup_cost and the comparison term; rows = partial groups times the divisor). The Finalize above already
+  starts at 38945, so the path is priced; the split chain's nodes are display-derived, not stamped from the path.
+  Kind: impl
+  Parent: M0146-0180
+  - First step: stamp the Finalize/GatherMerge/Sort/Partial nodes `createFinalizeAggSortedPlan` builds from
+    their paths (stampPlanCost); check the hashed arm's chain for the same gap.
+- [ ] **M0146-0183 — a 2-key Hash Right Join adds ~4049 over its inputs where PG adds ~945 (TPC-DS Q5)**
+  (filed 2026-10-14 from the "also seen" note of M0146-0180). Suspects: `approx_tuple_count` over two hash
+  clauses, or inner-unique not detected for the composite key.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: decompose the Hash Right Join's cost terms for Q5 SF0.25 against PG's `final_cost_hashjoin`.

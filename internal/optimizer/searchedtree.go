@@ -501,6 +501,29 @@ func searchedCheapestPartialInput(n Node, cp costParams) (Node, *Path) {
 		}
 		return r, pp
 	}
+	// M0146-0180: a set operation's SETOP rel is the input rel too — PG's
+	// UNION ALL input is an appendrel whose cheapest_partial_path is the
+	// Parallel Append (add_paths_to_append_rel), priced as cost_append's
+	// partial arm. Without this the split seeded from the committed serial
+	// winner, a Gather, and divided its run cost: TPC-DS Q76's Parallel
+	// Append showed 1000.58..14112 where PG shows 0.58..37614. The set-op
+	// node is built straight from the path, so no boundary rebuild applies.
+	if c, ok := n.(setOpBranchRelNode); ok {
+		rel := c.setOpBranchRel()
+		if rel == nil || len(rel.PartialPathlist) == 0 || rel.PartialPathlist[0] == nil {
+			return nil, nil
+		}
+		pp := rel.PartialPathlist[0]
+		g := makeGatherPath(rel, pp, cp, false)
+		if g == nil {
+			return nil, nil
+		}
+		r, _ := createPlanNode(g)
+		if r == nil {
+			return nil, nil
+		}
+		return r, pp
+	}
 	switch x := n.(type) {
 	case *Project:
 		if c, p := searchedCheapestPartialInput(x.Child, cp); c != nil {
