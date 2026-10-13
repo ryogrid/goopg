@@ -54,7 +54,7 @@ F1–F5 are recorded, unfiled, in M0146-0014's S4 escalation: the lineage budget
   14166.13 over a 17941.59 child, where PG's `cost_append` sums partial children to 37614.25.
 - **Noted, not filed separately:**
   - **Q5's 2-key Hash Right Join** adds about 4049 over its inputs, where PG adds about 945. That points at
-    `approx_tuple_count` using one clause, or a missed inner-unique branch; it is in the 0014d-F3/0180 probe
+    `approx_tuple_count` using one clause, or a missed inner-unique branch; it is in the 0014d-F3/F5 probe
     queue, see `agent-groupB.md`.
   - **int4 primary-key indexes** price at about 458 tuples per page, past PG's maximum for 16-byte tuples;
     this is part of 0014d-F3.

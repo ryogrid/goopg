@@ -1,8 +1,8 @@
 # M0146-0042 — EXPLAIN text-identity burn-down
 
-Status: held `[!]` 2026-10-09 by the S4 lineage escalation in M0146-0005
-(its last five completed descendants, M0146-0111 to 0115, all carry
-`Movement: none`). Only the owner reopens it.
+Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
+pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
+2026-10-13 (`b5bf2cfec`, TPC-DS Q6).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -511,6 +511,34 @@ Results:
 - Not covered (ledger): on a hash join's hashed side PG keeps `Subquery
   Scan` over an inlined DISTINCT CTE, and goopg strips it. That is a
   shape gap in the strip pass for inlined CTE leaves.
+
+## Slice — a SubPlan's PARAM_EXEC resolves in its evaluating node (2026-10-13, `b5bf2cfec`)
+
+- **Witness.** TPC-DS Q6 at both scales.
+  - Since M0146-0130, Q6's `i_current_price > 1.2 * (SubPlan 2)` sits in the
+    Filter of the parameterised inner `Index Scan using item_pkey on item i`.
+  - goopg printed the SubPlan body's `Filter: (i_category = $0)`; PG prints
+    `(i_category = i.i_category)`.
+- **PG.** `get_parameter` / `find_param_referent` (ruleutils.c) prints a
+  PARAM_EXEC argument in the context of the plan node that evaluates the
+  SubPlan.
+- **Cause.** goopg resolved the source only in the owner M0146-0012a records:
+  the join, or the parameterised loop's outer input. That suits an argument
+  read from the outer relation. Q6's reads the inner scan's own relation, so
+  the walk over the outer input found no match.
+- **Change.** The registry records the node being rendered when the sublink is
+  assigned (`subPlanEntry.paramScope`), and `formatExecParamRef` tries it
+  before the owner.
+  - The resolver still demands exactly one proven relation.
+  - A source whose relation index was erased (0) skips the scope step, because
+    a name-only match could take a same-named column of the scan.
+- **Result.**
+  - Q6 is text-identical at both scales: SF0.25 64 → 65, SF1 40 → 41.
+  - PLAN-PARITY match SF0.25 70 → 71, SF1 44 → 45; parameterisation −1 at
+    each scale.
+  - Q6's values are identical, and the fire set is Q6 only.
+  - `TestExplainSubPlanParamReferentOnParameterisedInner` (postmaster) fails
+    on HEAD.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 

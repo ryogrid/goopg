@@ -28746,9 +28746,13 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 6 → 4 at both scales \(Q71
     \(`chaseKeyExprColumns`, gated by `keyExprReachesKeptScan`\)\.
     - Q54\'s three key lines now equal PG\'s; its `my\_customers` CTE naming remains\.
 Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54 keeps a record on my\_customers naming\)
+  - Slice 2026\-10\-13 \(`b5bf2cfec`\): a SubPlan\'s PARAM\_EXEC argument resolves first in the plan node that
+    evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
+    probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
+Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
   - Routed 2026\-10\-13 by M0146\-0014d \(next slices\): TPC\-DS Q5 — a Var above an Append resolves at its first child
     \(`Subquery Scan on "\*SELECT\* 2"`, ruleutils\.c set\_deparse\_plan / get\_variable\), where goopg descends into the
-    subquery; Q6 — a SubPlan\'s PARAM\_EXEC prints its referent \(`i\.i\_category`, find\_param\_referent\) where goopg
+    subquery; Q6 \(done, `b5bf2cfec`\) — a SubPlan\'s PARAM\_EXEC prints its referent \(`i\.i\_category`, find\_param\_referent\) where goopg
     prints `$0`\. Both scales; `analysis/m0146/m0146\-0014/routing\-20261013/agent\-groupB\.md`\.
   - Slice 2026\-10\-08 \(`1745ad42f`\): key chases pass through a DISTINCT dedupe; a bitmap Recheck param
     renders as its Index Cond sibling\.
