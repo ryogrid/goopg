@@ -32915,7 +32915,7 @@ Movement: none — Q77's web_page_pkey scans now match PG's scan type but Q77 ke
     - Test: `TestGroupedRelPathkeysShareOneCoordinate` \(fails with the transport\-coordinate keys\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, join-method 10 -> 9, aggregation-strategy 4 -> 3, sort-strategy 11 -> 10, parallelism 11 -> 8, qual-placement 4 -> 3; SF1 join-method 14 -> 12, join-order 31 -> 30
-- [ ] **M0146-0190 — under a GroupAggregate goopg elects Gather Merge over a worker Sort where PG keeps Sort over Gather (TPC-DS Q26)**
+- [x] **M0146-0190 — under a GroupAggregate goopg elects Gather Merge over a worker Sort where PG keeps Sort over Gather (TPC-DS Q26)**
   (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014/`).
   sort-strategy is the top first-divergence category across the corpora (17 records, 15 actionable after the
   COSTTIE waivers). Record: TPC-DS SF0.25 Q26, verdict SHAPE-DIFF, first divergence `depth=2 [sort-strategy] under
@@ -32929,3 +32929,17 @@ Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.
     query_pathkeys) and at what cost; compare with goopg's gathermerge arm and its group-rel election, then drive
     Q26 to MATCH.
   - Expected movement: TPC-DS SF0.25 match (Q26/Q33/Q45) and CATEGORIES-EXCL-MATCH sort-strategy at both scales.
+  - Done 2026\-10\-14 \(design `docs/design/0100-0149/m0146-0190-scanjoin-gather-merge-admission.md`, evidence
+    `analysis/m0146/m0146-0190/`\)\.
+    - Cause: PG builds the worker\-sort Gather Merge on the topmost scan/join rel \(generate\_useful\_gather\_paths,
+      override\_rows false, the rel\'s rows\), where Q26\'s Nested Loop over a lower Gather Merge \(14285\.24\.\.14292\.59\)
+      rejects it on add\_path\'s startup\-aware tie\-break; goopg filed the aggregate over it straight onto the grouped rel\.
+    - Fix: `scanJoinRelKeepsGatherMerge` runs that add\_path test against the searched rel\'s candidates \(rel rows,
+      ConsiderStartup, EC pathkeys; search\-stamped Gather/Gather Merge candidates skipped \-\- Q28\) before both
+      worker\-sort Gather Merge arms\.
+    - SF0\.25 match 77 \-> 79 \(Q26, Q40\); SF1 64 \-> 65 \(Q19, Q40 in; Q45 out: goopg\'s 657\-row group input vs PG\'s
+      473 puts its NL over Gather Merge within the fuzz \-\- ledgered\)\.
+    - Test: `TestScanJoinRelDropsATiedGatherMerge`\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS, regress
+      A/B \(select\_parallel, aggregates, partition\_aggregate, groupingsets, write\_parallel, union\) identical\.
+Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 10 -> 7, parallelism 8 -> 7, join-method 9 -> 8, scan-type 7 -> 6, aggregation-strategy 3 -> 2; SF1 sort-strategy 17 -> 16, parallelism 18 -> 17, join-order 30 -> 29

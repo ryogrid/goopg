@@ -1,0 +1,28 @@
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  GroupAggregate
+         Group Key: item.i_item_id
+         ->  Sort
+               Sort Key: item.i_item_id
+               ->  Gather
+                     Workers Planned: 3
+                     ->  Nested Loop
+                           ->  Nested Loop
+                                 ->  Nested Loop
+                                       ->  Parallel Hash Join
+                                             Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Parallel Seq Scan on catalog_sales
+                                             ->  Parallel Hash
+                                                   ->  Parallel Seq Scan on date_dim
+                                                         Filter: (d_year = 2002)
+                                       ->  Index Scan using customer_demographics_pkey on customer_demographics
+                                             Index Cond: (cd_demo_sk = catalog_sales.cs_bill_cdemo_sk)
+                                             Filter: ((cd_gender = 'M'::bpchar) AND (cd_marital_status = 'W'::bpchar) AND (cd_education_status = 'Unknown'::bpchar))
+                                 ->  Index Scan using item_pkey on item
+                                       Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                           ->  Index Scan using promotion_pkey on promotion
+                                 Index Cond: (p_promo_sk = catalog_sales.cs_promo_sk)
+                                 Filter: ((p_channel_email = 'N'::bpchar) OR (p_channel_event = 'N'::bpchar))
+(24 rows)
+

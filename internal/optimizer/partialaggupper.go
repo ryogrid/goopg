@@ -465,6 +465,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// planner.c:7351/:7704). The guard is then satisfied honestly rather
 	// than bypassed: there is genuinely no Gather left in the input, so the
 	// two-Gather hazard it protects against cannot arise.
+	scanJoinChild := child // M0146-0190: the serial input the search candidates describe
 	if g, ok := gatherToUnwrapForPartialAgg(child); ok {
 		child = g
 		// The aggregate's B-01c input target was derived against the child
@@ -768,15 +769,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			}, partialAggNoSplitProducer)
 			workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
 				presortedKeys, cp, workers, d, perWorkerRows)
-			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-			gmSpec := *aggNode
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
-				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-					0, 1, nAggs, inWidth),
-				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
-			}, partialAggGatherMergeProducer)
+			if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
+				// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+				gmSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
+					Rel: grouped, Rows: 1,
+					Cost: costAgg(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
+						0, 1, nAggs, inWidth),
+					Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+				}, partialAggGatherMergeProducer)
+			}
 		} else {
 			// PLAIN: one candidate, priced by the hashed arm at 0 group columns
 			// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
@@ -854,15 +857,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// worker-side construction this mirrors field for field.
 		workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
 			gatheredKeys, cp, workers, d, perWorkerRows)
-		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-		gmSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
-			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inWidth),
-			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
-		}, partialAggGatherMergeProducer)
+		if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			gmSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
+				Rel: grouped, Rows: finalGroups,
+				Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
+					nGroupCols, finalGroups, nAggs, inWidth),
+				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+			}, partialAggGatherMergeProducer)
+		}
 	}
 	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
@@ -1043,6 +1048,55 @@ func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey,
 		Children:      []*Path{workerSort},
 	}
 	return workerGM, gmCrossedRows
+}
+
+// scanJoinRelKeepsGatherMerge reports whether the worker-sort Gather Merge
+// would survive add_path on the scan/join rel (M0146-0190).
+//
+// Upstream builds that Gather Merge in generate_useful_gather_paths on the
+// topmost scan/join rel (apply_scanjoin_target_to_paths), where it joins the
+// rel's pathlist like any other path. add_paths_to_grouping_rel then
+// aggregates only the paths that survived. goopg files the aggregate over it
+// straight onto the grouped rel, so a Gather Merge that PG drops still
+// competed there. TPC-DS Q26 is the case: PG's search keeps a Nested Loop
+// over a lower Gather Merge with the same ordering and a fuzz-equal cost but
+// an earlier start. The new Gather Merge is cheaper in total only, so
+// add_path's tight-fuzz tie-break rejects it, and PG's grouped rel never sees
+// it. The search rel's candidates stand in for that pathlist, priced and keyed
+// as the searchcand arm (groupingpaths.go) takes them.
+func scanJoinRelKeepsGatherMerge(child Node, seed, gm *Path, cp costParams) bool {
+	sr := searchedJoinInputRelOf(child)
+	if sr == nil || seed == nil || gm == nil || len(gm.Children) != 1 {
+		return true
+	}
+	scratch := &RelOptInfo{ConsiderStartup: sr.ConsiderStartup, ConsiderParamStartup: sr.ConsiderParamStartup}
+	if sr.usefulKeys != nil {
+		scratch.pathkeyClass = sr.usefulKeys.equivalentWithin
+	}
+	// On a scan/join rel generate_useful_gather_paths runs with
+	// override_rows false, so the Gather Merge carries the rel's rows, not
+	// compute_gather_rows, and cost_gather_merge charges those.
+	probe := *gm
+	probe.Rel, probe.Rows = scratch, seed.Rows
+	probe.Cost = gatherMergeCost(cp, gm.Children[0].Cost, gm.Children[0].ParallelWorkers, seed.Rows)
+	candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+	for i, cand := range sr.Pathlist {
+		// A Gather or Gather Merge the search already stamped on the rel is
+		// goopg's copy of what generate_useful_gather_paths builds in this
+		// very call; upstream's rel holds no gathered path yet. TPC-DS Q28's
+		// scan rel carries this Gather Merge itself.
+		if i >= len(candKeys) || len(candKeys[i]) == 0 ||
+			cand.Kind == PathGather || cand.Kind == PathGatherMerge {
+			continue
+		}
+		old := *cand
+		old.Rel, old.Rows, old.Pathkeys = scratch, seed.Rows, candKeys[i]
+		switch comparePaths(&probe, &old) {
+		case relBDominates, relEqual:
+			return false
+		}
+	}
+	return true
 }
 
 func upperSplitVerdict(split *Path) string {
