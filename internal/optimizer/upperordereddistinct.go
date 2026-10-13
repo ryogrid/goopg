@@ -180,7 +180,7 @@ func electOrderedDistinct(u *upperRels, distinctNode *Distinct, keys []SortKey, 
 	for i, c := range cands {
 		offer := *c
 		offer.Pathkeys = translated[i]
-		addOrderedPaths(ordered, &offer, sortKeys, cp, limitTuples)
+		addOrderedPaths(ordered, &offer, distinctNode, sortKeys, cp, limitTuples)
 	}
 	setCheapest(ordered)
 
@@ -199,6 +199,19 @@ func electOrderedDistinct(u *upperRels, distinctNode *Distinct, keys []SortKey, 
 		b.pos = stmtPos
 		if dpTrace {
 			fmt.Fprintf(os.Stderr, "DPDISTINCT elected shape=Sort-over-%T\n", b.Child)
+		}
+	case *IncrementalSort:
+		// M0146-0177: the presorted arm of addOrderedPaths now builds over
+		// a node-less PathDistinct candidate too — same one-level rule as
+		// the *Sort case.
+		switch b.Child.(type) {
+		case *Distinct, *DistinctOn:
+		default:
+			return decline("incrementalsort-child-not-distinct")
+		}
+		b.pos = stmtPos
+		if dpTrace {
+			fmt.Fprintf(os.Stderr, "DPDISTINCT elected shape=IncrementalSort-over-%T\n", b.Child)
 		}
 	case *Distinct, *DistinctOn:
 		if dpTrace {

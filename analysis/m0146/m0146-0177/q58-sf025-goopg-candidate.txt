@@ -1,0 +1,82 @@
+                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                    
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  
+   ->  Incremental Sort  
+         Sort Key: item.i_item_id, (sum(store_sales.ss_ext_sales_price))
+         Presorted Key: item.i_item_id
+         ->  Merge Join  
+               Merge Cond: (item.i_item_id = item_1.i_item_id)
+               Join Filter: ((sum(store_sales.ss_ext_sales_price) >= (0.9 * sum(catalog_sales.cs_ext_sales_price))) AND (sum(store_sales.ss_ext_sales_price) <= (1.1 * sum(catalog_sales.cs_ext_sales_price))) AND (sum(store_sales.ss_ext_sales_price) >= (0.9 * sum(ss_items.item_id))) AND (sum(store_sales.ss_ext_sales_price) <= (1.1 * sum(ss_items.item_id))) AND (sum(catalog_sales.cs_ext_sales_price) >= (0.9 * sum(store_sales.ss_ext_sales_price))) AND (sum(catalog_sales.cs_ext_sales_price) <= (1.1 * sum(store_sales.ss_ext_sales_price))) AND (sum(ss_items.item_id) >= (0.9 * sum(store_sales.ss_ext_sales_price))) AND (sum(ss_items.item_id) <= (1.1 * sum(store_sales.ss_ext_sales_price))))
+               ->  GroupAggregate  
+                     Group Key: item.i_item_id
+                     InitPlan 1
+                       ->  Seq Scan on date_dim date_dim_6  
+                             Filter: (d_date = '2001-06-16'::date)
+                     ->  Gather Merge  
+                           Workers Planned: 3
+                           ->  Sort  
+                                 Sort Key: item.i_item_id
+                                 ->  Nested Loop  
+                                       ->  Parallel Hash Join  
+                                             Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Parallel Seq Scan on store_sales  
+                                             ->  Parallel Hash  
+                                                   ->  Parallel Hash Semi Join  
+                                                         Hash Cond: (date_dim.d_date = date_dim_1.d_date)
+                                                         ->  Parallel Seq Scan on date_dim  
+                                                         ->  Parallel Hash  
+                                                               ->  Parallel Seq Scan on date_dim date_dim_1  
+                                                                     Filter: (d_week_seq = (InitPlan 1).col1)
+                                       ->  Index Scan using item_pkey on item  
+                                             Index Cond: (i_item_sk = store_sales.ss_item_sk)
+               ->  Materialize  
+                     ->  Merge Join  
+                           Merge Cond: (item_1.i_item_id = item_2.i_item_id)
+                           Join Filter: ((sum(catalog_sales.cs_ext_sales_price) >= (0.9 * sum(cs_items.item_id))) AND (sum(catalog_sales.cs_ext_sales_price) <= (1.1 * sum(cs_items.item_id))) AND (sum(cs_items.item_id) >= (0.9 * sum(catalog_sales.cs_ext_sales_price))) AND (sum(cs_items.item_id) <= (1.1 * sum(catalog_sales.cs_ext_sales_price))))
+                           ->  GroupAggregate  
+                                 Group Key: item_1.i_item_id
+                                 InitPlan 2
+                                   ->  Seq Scan on date_dim date_dim_7  
+                                         Filter: (d_date = '2001-06-16'::date)
+                                 ->  Gather Merge  
+                                       Workers Planned: 3
+                                       ->  Sort  
+                                             Sort Key: item_1.i_item_id
+                                             ->  Nested Loop  
+                                                   ->  Parallel Hash Join  
+                                                         Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_2.d_date_sk)
+                                                         ->  Parallel Seq Scan on catalog_sales  
+                                                         ->  Parallel Hash  
+                                                               ->  Parallel Hash Semi Join  
+                                                                     Hash Cond: (date_dim_2.d_date = date_dim_3.d_date)
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_2  
+                                                                     ->  Parallel Hash  
+                                                                           ->  Parallel Seq Scan on date_dim date_dim_3  
+                                                                                 Filter: (d_week_seq = (InitPlan 2).col1)
+                                                   ->  Index Scan using item_pkey on item item_1  
+                                                         Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                           ->  Materialize  
+                                 ->  GroupAggregate  
+                                       Group Key: item_2.i_item_id
+                                       InitPlan 3
+                                         ->  Seq Scan on date_dim date_dim_8  
+                                               Filter: (d_date = '2001-06-16'::date)
+                                       ->  Sort  
+                                             Sort Key: item_2.i_item_id
+                                             ->  Gather  
+                                                   Workers Planned: 2
+                                                   ->  Nested Loop  
+                                                         ->  Parallel Hash Join  
+                                                               Hash Cond: (web_sales.ws_sold_date_sk = date_dim_4.d_date_sk)
+                                                               ->  Parallel Seq Scan on web_sales  
+                                                               ->  Parallel Hash  
+                                                                     ->  Parallel Hash Semi Join  
+                                                                           Hash Cond: (date_dim_4.d_date = date_dim_5.d_date)
+                                                                           ->  Parallel Seq Scan on date_dim date_dim_4  
+                                                                           ->  Parallel Hash  
+                                                                                 ->  Parallel Seq Scan on date_dim date_dim_5  
+                                                                                       Filter: (d_week_seq = (InitPlan 3).col1)
+                                                         ->  Index Scan using item_pkey on item item_2  
+                                                               Index Cond: (i_item_sk = web_sales.ws_item_sk)
+(78 rows)
+

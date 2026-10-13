@@ -257,7 +257,8 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	unordered := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
 	sizeUpperRelFromNode(unordered, upperOrderedInput(10))
 	lines := captureTrace(t, func() {
-		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp, -1)
+		in := upperOrderedInput(10)
+		addOrderedPaths(unordered, newPrebuiltPath(unordered, in), in, keys, cp, -1)
 	})
 	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedSortProducer+" relids=- ") || !strings.Contains(lines[0], "verdict=accepted") {
@@ -272,7 +273,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	seed := newPrebuiltPath(ordered, upperOrderedInput(10))
 	seed.Pathkeys = append(append([]PathKey{}, keys...), PathKey{Expr: &ColumnRef{Index: 2, Name: "w"}, SortAsc: true})
 	lines = captureTrace(t, func() {
-		addOrderedPaths(ordered, seed, keys, cp, -1)
+		addOrderedPaths(ordered, seed, seed.node, keys, cp, -1)
 	})
 	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedInputProducer+" relids=- ") {
@@ -449,8 +450,8 @@ func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
 		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
 		Rel: ordered, ParallelSafe: true,
 	}
-	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
-	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, sortedAgg, sortedAgg.node, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, hashedAgg.node, orderKeys, cp, -1)
 	setCheapest(ordered)
 	best := getCheapestFractionalPath(ordered, 0)
 	if best == nil {
@@ -458,6 +459,53 @@ func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
 	}
 	if best.Kind == PathSort {
 		t.Fatalf("hashed+Sort won (cost=%.2f); want the no-sort sorted path — startup dominance did not drop it", best.Cost.Total)
+	}
+}
+
+// TestOrderedPresortedAggOffersIncrementalSortOnly pins M0146-0177 against
+// PG 18.3's create_ordered_paths (planner.c): an input whose pathkeys deliver
+// a leading prefix of the ORDER BY gets an Incremental Sort and no full Sort
+// ("We'll just do a sort if there are no presorted keys and an incremental
+// sort when there are presorted keys"). The grouping election offers
+// node-less PathAgg candidates; the presorted arm used to require the input's
+// own node, so they got the full Sort only and TPC-DS Q60 elected it. The
+// node the sort runs over now comes in as statsNode; with none, the full Sort
+// stays the only offer.
+func TestOrderedPresortedAggOffersIncrementalSortOnly(t *testing.T) {
+	cp := defaultCostParams()
+	cp.enableIncrementalSort = true
+	idCol := &ColumnRef{Index: 0, Name: "i_item_id", Type: catalog.Type{Name: "bpchar"}}
+	sumCol := &ColumnRef{Index: 1, Name: "total_sales", Type: catalog.Type{Name: "numeric"}}
+	orderKeys := []PathKey{{Expr: idCol, SortAsc: true}, {Expr: sumCol, SortAsc: true}}
+	offer := func(ordered *RelOptInfo) *Path {
+		return &Path{
+			Kind: PathAgg, Cost: Cost{Startup: 37197, Total: 37200}, Rows: 36,
+			Pathkeys: []PathKey{{Expr: idCol, SortAsc: true}},
+			Rel:      ordered, ParallelSafe: true,
+		}
+	}
+	producers := func(statsNode Node) []string {
+		ordered := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
+		ordered.NCols = 2
+		ordered.AvgVarBytes = 8
+		var out []string
+		for _, l := range dppathLines(captureTrace(t, func() {
+			addOrderedPaths(ordered, offer(ordered), statsNode, orderKeys, cp, -1)
+		})) {
+			for _, f := range strings.Fields(l) {
+				if strings.HasPrefix(f, "producer=upper.ordered.") {
+					out = append(out, strings.TrimPrefix(f, "producer="))
+				}
+			}
+		}
+		return out
+	}
+	if got := producers(upperOrderedInput(36)); len(got) != 1 || got[0] != upperOrderedIncrementalSortProducer {
+		t.Fatalf("presorted node-less PathAgg offered %v; want only %s (PG builds no full Sort beside it)",
+			got, upperOrderedIncrementalSortProducer)
+	}
+	if got := producers(nil); len(got) != 1 || got[0] != upperOrderedSortProducer {
+		t.Fatalf("with no stats node the offer is %v; want only %s", got, upperOrderedSortProducer)
 	}
 }
 
@@ -483,8 +531,8 @@ func TestOrderedStacksSortWithoutTranslatedPathkeys(t *testing.T) {
 		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
 		Rel: ordered, ParallelSafe: true,
 	}
-	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
-	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, sortedAgg, sortedAgg.node, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, hashedAgg.node, orderKeys, cp, -1)
 	setCheapest(ordered)
 	best := getCheapestFractionalPath(ordered, 0)
 	if best == nil {

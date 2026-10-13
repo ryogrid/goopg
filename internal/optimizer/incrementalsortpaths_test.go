@@ -113,7 +113,7 @@ func TestAddIncrementalSortPathsDeclinesACandidateTheBoundaryCannotRebuild(t *te
 	ordered.SearchCandidates = []*Path{cand1}
 	ordered.SearchCandidateKeys = [][]PathKey{cand1.Pathkeys}
 
-	addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
+	addOrderedPaths(ordered, seed, seed.node, sortPathkeys, cp, -1)
 
 	for _, p := range ordered.Pathlist {
 		if p.Kind == PathIncrementalSort {
@@ -144,7 +144,7 @@ func TestAddIncrementalSortPathsSkipsAFullyContainedCandidate(t *testing.T) {
 	ordered.SearchCandidates = []*Path{full1}
 	ordered.SearchCandidateKeys = [][]PathKey{full1.Pathkeys}
 
-	addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
+	addOrderedPaths(ordered, seed, seed.node, sortPathkeys, cp, -1)
 
 	for _, p := range ordered.Pathlist {
 		if p.Kind == PathIncrementalSort {
@@ -169,7 +169,7 @@ func TestAddIncrementalSortPathsSkipsAZeroPrefixCandidate(t *testing.T) {
 	ordered.SearchCandidates = []*Path{cand}
 	ordered.SearchCandidateKeys = [][]PathKey{cand.Pathkeys}
 
-	addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
+	addOrderedPaths(ordered, seed, seed.node, sortPathkeys, cp, -1)
 
 	for _, p := range ordered.Pathlist {
 		if p.Kind == PathIncrementalSort {
@@ -215,7 +215,7 @@ func TestAddOrderedPathsIncrementallySortsAPresortedSeed(t *testing.T) {
 		seed.Pathkeys = sortPathkeys[:1]
 		cp := defaultCostParams()
 		cp.enableIncrementalSort = on
-		addOrderedPaths(ordered, seed, sortPathkeys, cp, -1)
+		addOrderedPaths(ordered, seed, seed.node, sortPathkeys, cp, -1)
 		var kinds []PathKind
 		for _, p := range ordered.Pathlist {
 			kinds = append(kinds, p.Kind)

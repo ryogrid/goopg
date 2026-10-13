@@ -168,6 +168,12 @@ func upperNarrowChildren(n Node) []Node {
 		return []Node{x.Child}
 	case *Sort:
 		return []Node{x.Child}
+	case *IncrementalSort:
+		// M0146-0177: Sort's sibling. Without it an ORDER BY elected as an
+		// Incremental Sort stopped the descent, so the aggregate below kept
+		// its full input width (TPC-DS Q54's inner Sort then sorted the
+		// un-narrowed Subquery Scan row).
+		return []Node{x.Child}
 	case *Limit:
 		return []Node{x.Child}
 	case *Distinct:

@@ -379,7 +379,7 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		offer := *c
 		offer.Pathkeys = translated[i]
 		applyHavingQualsToOffer(&offer, havingQuals, agg.node, cp)
-		addOrderedPaths(ordered, &offer, sortKeys, cp, limitTuples)
+		addOrderedPaths(ordered, &offer, node, sortKeys, cp, limitTuples)
 	}
 	// M0140-0006b-2: the upper-rel Gather reader (same funnel as
 	// createOrderedPaths above). No-op today; on decline the restore below

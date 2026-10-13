@@ -32542,7 +32542,7 @@ Movement: none — recon
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(both scales\), TPC\-H fire set
       \(values MATCH\), ea\-ratchet PASS \(1\)\.
 Movement: yes — match SF0.25 72 -> 74 (TPC-DS Q32, Q92); CATEGORIES-EXCL-MATCH SF1 join-method 22 -> 20, scan-type 25 -> 23, parallelism 40 -> 38
-- [ ] **M0146-0177 — the ordered-paths step offers a full Sort beside the Incremental Sort (TPC-DS Q60)**
+- [x] **M0146-0177 — the ordered-paths step offers a full Sort beside the Incremental Sort (TPC-DS Q60)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F2). PG's `create_ordered_paths`
   (planner.c, the presorted_keys arm) adds only an Incremental Sort when the input path has a non-empty
   presorted prefix; goopg's `addOrderedPaths` also adds a full Sort, which wins Q60 SF0.25 by about
@@ -32551,6 +32551,36 @@ Movement: yes — match SF0.25 72 -> 74 (TPC-DS Q32, Q92); CATEGORIES-EXCL-MATCH
   Parent: M0146-0014
   - First step: in goopg's ordered-paths arm skip the full-Sort candidate for an input whose presorted
     prefix is non-empty, as PG does; re-run the fire set (Q4 may share the rule).
+  - Done 2026\-10\-13 \(design `docs/design/0100\-0149/m0146\-0177\-ordered\-incremental\-sort\-nodeless\.md`, evidence
+    `analysis/m0146/m0146\-0177/`\)\.
+    - Cause: `addOrderedPaths`\' presorted arm needed `input\.node`\. The grouping and DISTINCT elections offer
+      node\-less PathAgg / PathDistinct candidates, so Q60\'s presorted aggregate got the full Sort only\.
+      `addIncrementalSortPaths` skips node\-less inputs too\.
+    - Fix: a `statsNode` argument \(the node the sort runs over\) feeds the Incremental Sort\'s group estimate\. The
+      DISTINCT winner switch accepts an Incremental Sort\.
+    - Sibling: `upperNarrowChildren` had no `IncrementalSort` arm\. Q54\'s inner Sort then printed `sum\(\.\.\.\) / 50`
+      instead of PG\'s `my\_revenue\.revenue / 50`\. The arm is added\.
+    - Q58 SF0\.25 now prints wrong `sum\(\)` argument names in its Join Filter\. Values are identical; filed as
+      M0146\-0181\.
+    - Tests: `TestOrderedPresortedAggOffersIncrementalSortOnly`, `TestExplainIncrementalSortOverGrouping`
+      \(each fails with its half reverted\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H fire set \(no plan
+      change\) \+ acceptance arm PASS, regress A/B 5 cases identical\.
+Movement: yes — match SF0.25 74 -> 75 (TPC-DS Q60); CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 13 -> 12
+- [ ] **M0146\-0181 — EXPLAIN names a narrowed aggregate\'s argument wrongly in a Join Filter \(TPC\-DS Q58 SF0\.25\)**
+  \(filed 2026\-10\-13 by M0146\-0177\)\.
+  - With M0146\-0177 the upper narrowing reaches Q58\'s three grouped subqueries under its top Incremental Sort\.
+    Their Merge Join Join Filters then print `sum\(ss\_items\.item\_id\)` / `sum\(cs\_items\.item\_id\)` where PG
+    prints `\(sum\(web\_sales\.ws\_ext\_sales\_price\)\)` / `\(sum\(catalog\_sales\.cs\_ext\_sales\_price\)\)`\.
+  - Values are identical \(widened Q58 returns the same 4 rows before and after\)\. The deparse resolves the narrowed
+    argument\'s new input position against the wrong row\. Plans:
+    `analysis/m0146/m0146\-0177/q58\-sf025\-goopg\-\*\.txt`\.
+  Kind: impl
+  Parent: M0146\-0042
+  - First step: build a fixture with Q58\'s shape — plain GroupAggregates over a Gather Merge, merge\-joined with a
+    Join Filter on their sums, Incremental Sort on top; a partial\-aggregate shape did not reproduce it\. Then trace
+    the Join Filter column through `joinResidualColumn` / `expandAggOutputRef` / `chaseAggregateResultArgs` to
+    where the narrowed `Agg\.Arg` index is read against an un\-narrowed row\.
 - [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
