@@ -2,7 +2,7 @@
 
 Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
 pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
-2026-10-13 (`8094e1dd6`, CASE NULL labels).
+2026-10-13 (`549070713`, window keys over an aggregate).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -588,6 +588,29 @@ Results:
     `GROUPING(item.i_category)` through the Agg's target list. That is the
     next slice.
   - Regress content is identical.
+
+## Slice — a computed key over an aggregate's outputs deparses through the Agg (2026-10-13, `549070713`)
+
+- **Witness.** TPC-DS Q36 and Q86 at both scales. A WindowAgg over a
+  `ROLLUP` aggregate partitions by `grouping(i_category)+grouping(i_class)`
+  and a CASE over `grouping(i_class)`, and orders by `sum(...)/sum(...)`.
+  goopg printed the aggregate's output names, `(grouping + grouping)` and
+  `(sum / sum)`, in the Window clause and in the Sort below it.
+- **PG.** `get_variable` deparses every OUTER_VAR through the child Agg's
+  target list:
+  `((GROUPING(item.i_category) + GROUPING(item.i_class)))`,
+  `((sum(store_sales.ss_net_profit) / sum(store_sales.ss_ext_sales_price)))`.
+- **Change.**
+  - `aggOutputKeyExpr` factors `sortKeyParts`' per-column expansion out
+    unchanged (group key chase, aggregate call, GROUPING mask).
+  - A computed key rewrites each of its columns through that helper.
+  - `sortInputAggregate` finds the aggregate under a WindowAgg's input Sort,
+    so the Window clause, which reuses `sortKeyParts`, takes the same
+    expansion.
+- **Result.**
+  - text-identical SF0.25 66 → 68, SF1 42 → 44 (Q36, Q86).
+  - `rendering` category SF0.25 2 → 1, SF1 4 → 3.
+  - Values are identical, and regress content is identical.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 

@@ -28750,6 +28750,9 @@ Movement: none — instrument artefact — text\-only; rendering unchanged \(Q54
     evaluates it \(find\_param\_referent\); TPC\-DS Q6 prints `i\.i\_category`, not `$0`, on the parameterised item\_pkey
     probe, and is text\-identical at both scales \(SF0\.25 64 → 65, SF1 40 → 41\)\.
 Movement: yes — PLAN\-PARITY match SF0\.25 70→71, SF1 44→45; CATEGORIES\-EXCL\-MATCH parameterisation SF0\.25 13→12, SF1 26→25; text\-identical SF0\.25 64→65, SF1 40→41
+  - Slice 2026\-10\-13 \(`549070713`\): a computed Sort/Window key deparses each aggregate output column through the
+    Agg\'s target list; TPC\-DS Q36/Q86 text\-identical at both scales \(SF0\.25 66 → 68, SF1 42 → 44\)\.
+Movement: yes — text\-identical SF0\.25 66→68, SF1 42→44; CATEGORIES\-EXCL\-MATCH rendering SF0\.25 2→1, SF1 4→3
   - Slice 2026\-10\-13 \(`8094e1dd6`\): an omitted CASE ELSE prints `NULL::bpchar` / `character varying` / `real` /
     timestamp types \(format\_type\(type, \-1\)\); TPC\-DS Q36/Q86/Q70 Sort Keys match PG\'s CASE text; aligned lines SF0\.25
     3680 → 3683, SF1 3097 → 3100\. Q36/Q86 still differ in the Window clause \(GROUPING deparse, next slice\)\.
