@@ -32755,12 +32755,27 @@ Movement: yes — match SF1 63 -> 64 (TPC-DS Q14), SF0.25 76 -> 76; CATEGORIES-E
     - Test: `TestExplainSplitAggregateChainCosts` \(both arms; fails with either arm\'s stamping removed\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: none — display-only: the chain's EXPLAIN costs now come from its paths; the classifier compares shapes, so match 76/64 and CATEGORIES-EXCL-MATCH are unchanged
-- [ ] **M0146-0183 — a 2-key Hash Right Join adds ~4049 over its inputs where PG adds ~945 (TPC-DS Q5)**
+- [x] **M0146-0183 — a 2-key Hash Right Join adds ~4049 over its inputs where PG adds ~945 (TPC-DS Q5)**
   (filed 2026-10-14 from the "also seen" note of M0146-0180). Suspects: `approx_tuple_count` over two hash
   clauses, or inner-unique not detected for the composite key.
   Kind: impl
   Parent: M0146-0014
   - First step: decompose the Hash Right Join's cost terms for Q5 SF0.25 against PG's `final_cost_hashjoin`.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0183\-outer\-join\-inner\-unique\.md`, evidence
+    `analysis/m0146/m0146\-0183/`\)\.
+    - PG\'s 44\.99 above \(startup \+ probe scan \+ 2\-clause probe hashing\) is final\_cost\_hashjoin\'s inner\-unique
+      branch: `web\_returns` is unique on the hash keys, outer\_matched\_rows rounds to 0, and every probe row pays
+      the unmatched term 0\.005 x 179956 x 1 x 0\.05\.
+    - goopg proved inner\-uniqueness for INNER only; PG\'s add\_paths\_to\_joinrel asks for INNER/LEFT/RIGHT/FULL\.
+      `innerUniqueJoinType` now gates the hash and nested\-loop arms \(the merge arm already covered outer joins\)\.
+    - Q5 SF0\.25 Hash Right Join 780\.00\.\.8221\.33 \(PG 780\.00\.\.8268\.33; the 47 left is the probe scan\)\.
+    - Q77 SF0\.25 flips Merge Left Join → Hash Left Join on a 0\.10 near\-tie that PG\'s add\_path would resolve the
+      same way; PG keeps the merge because its inputs are IOS \+ NL\. Filed M0146\-0185\.
+    - Regress A/B: subselect/aggregates identical; join \-15 and partition\_join \-7 diff lines from PG\.
+    - Tests: `TestExplainOuterJoinInnerUniqueHashCost`, `TestHashJoinFinalCostInputNonInnerJoinTypes` \(both fail
+      with the widening reverted\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: yes — regress join 17945 -> 17930 and partition_join 6310 -> 6303 diff lines; CATEGORIES-EXCL-MATCH SF0.25 join-method 9 -> 10 (Q77 near-tie flip, filed M0146-0185); match 76/64 unchanged
 - [ ] **M0146-0184 — a range pair whose bounds are InitPlan params is not collapsed to DEFAULT_RANGE_INEQ_SEL (TPC-DS Q54)**
   (filed 2026-10-14 by the M0146-0005dp verification). Q54 SF0.25: date_dim's `d_month_seq >= (InitPlan 1) AND
   d_month_seq <= (InitPlan 2)` is estimated at 0.111 (two DEFAULT_INEQ_SEL factors) where PG's
@@ -32777,3 +32792,13 @@ Movement: none — display-only: the chain's EXPLAIN costs now come from its pat
     non-Const operand, scalarineqsel).
   - Expected movement: TPC-DS Q54 first divergence (join-order / parallelism); check the other InitPlan-bounded
     BETWEENs in the corpus (d_month_seq bands).
+- [ ] **M0146-0185 — TPC-DS Q77's web channel: PG scans web_page_pkey under a nested loop where goopg seq-scans and hashes**
+  (filed 2026-10-14 by M0146-0183). Q77 SF0.25: each of PG's `ws` / `wr` grouped subqueries is a GroupAggregate
+  over a Nested Loop with `Join Filter: (web_page.wp_web_page_sk = web_sales.ws_web_page_sk)` driven by an Index
+  Only Scan using web_page_pkey (sorted, so the two merge-left-join); goopg seq-scans web_page under a hash / merge
+  join and sorts. Since M0146-0183 goopg's top Hash Left Join (11030.86) beats its Merge Left Join (11030.96) by
+  0.10, which moved CATEGORIES-EXCL-MATCH SF0.25 join-method 9 -> 10. Plans: `analysis/m0146/m0146-0183/q77-sf025-*`.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: compare the `ws` subquery's join pathlists (web_sales x web_page x date_dim) with PG's via the
+    OPTIMIZER_DEBUG build (tmp/pgdbg) and find why goopg's IOS-driven sorted nested loop is not kept.

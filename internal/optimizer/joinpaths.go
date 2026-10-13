@@ -416,11 +416,12 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		mu.path = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
 	}
 	// M0146-0005f: final_cost_nestloop takes the same early-exit branch for
-	// an INNER pair whose inner rel is proven unique (extra->inner_unique),
+	// a pair whose inner rel is proven unique (extra->inner_unique; INNER and,
+	// since M0146-0183, the outer joins — innerUniqueJoinType),
 	// with the inner-join factors (outer_match_frac = the clause selectivity,
 	// match_count = the inner's rows). A unique-ified pair is left alone: PG
 	// computes its factors with the SEMI SpecialJoinInfo.
-	if !semi.apply && jt == parser.JoinInner && uniq == uniqueSideNone &&
+	if !semi.apply && innerUniqueJoinType(jt) && uniq == uniqueSideNone &&
 		s.innerRelProvenUnique(outer, inner, clauses, true) {
 		frac, matchCount := s.innerUniqueMatchFactors(inner, clauses)
 		semi = semiAntiJoinFactors{apply: true, outerMatchFrac: frac, matchCount: matchCount}

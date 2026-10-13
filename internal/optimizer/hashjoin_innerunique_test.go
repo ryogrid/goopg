@@ -76,10 +76,6 @@ func TestHashJoinFinalCostInputDeclinesUnsoundEvidence(t *testing.T) {
 		mut  func(*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo, []*restrictInfo) parser.JoinType
 	}{
 		{
-			name: "LEFT join",
-			mut:  func(_ *searchCtx, _, _, _ *RelOptInfo, _ []*restrictInfo) parser.JoinType { return parser.JoinLeft },
-		},
-		{
 			name: "incomplete composite",
 			mut: func(_ *searchCtx, _, _, _ *RelOptInfo, keys []*restrictInfo) parser.JoinType {
 				keys[1] = nil
@@ -195,18 +191,30 @@ func TestHashJoinInnerUniqueUsesSharedTotalCoordinateFractionForPartialOuter(t *
 	}
 }
 
-func TestHashJoinFinalCostInputPreservesNonInnerJoinTypes(t *testing.T) {
+func TestHashJoinFinalCostInputNonInnerJoinTypes(t *testing.T) {
 	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
 	base := hashJoinInputs{
 		outerRows: 100, innerRows: 40, numHashClauses: len(keys),
 		innerBucketSize: 0.1, innerWidth: 48,
 	}
 	want := hashJoinCost(s.cp, base)
-	// LEFT takes PG's non-unique arm: no Inner Unique factors, but
-	// approx_tuple_count's hash-clause selectivity (M0146-0005e).
-	left := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinLeft, keys, keys)
-	if left.innerUnique || left.hashClauseSel != r90InnerJoinSelectivity(s, keys) {
-		t.Fatalf("LEFT input = %+v, want non-unique with the hash-clause selectivity", left)
+	// M0146-0183: an outer join asks innerrel_is_unique too
+	// (add_paths_to_joinrel's default arm), and compute_semi_anti_join_factors
+	// takes the outer join's own SpecialJoinInfo, whose eqjoinsel arm is the
+	// inner-join one — so LEFT / RIGHT / FULL get INNER's factors.
+	inner0 := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinRight, parser.JoinFull} {
+		got := s.hashJoinFinalCostInputFor(joinrel, outer, inner, jt, keys, keys)
+		if !got.innerUnique || got.outerMatchFrac != inner0.outerMatchFrac || got.matchCount != inner0.matchCount {
+			t.Fatalf("jointype %v input = %+v, want INNER's inner-unique factors %+v", jt, got, inner0)
+		}
+	}
+	// RIGHT_SEMI keeps the generic bucket walk (approx_tuple_count's
+	// hash-clause selectivity, M0146-0005e): goopg does not ask
+	// innerrel_is_unique for the reversed semi join.
+	rsemi := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinRightSemi, keys, keys)
+	if rsemi.innerUnique || rsemi.hashClauseSel != r90InnerJoinSelectivity(s, keys) {
+		t.Fatalf("RIGHT_SEMI input = %+v, want non-unique with the hash-clause selectivity", rsemi)
 	}
 	// SEMI and ANTI take final_cost_hashjoin's early-exit branch with the
 	// pair's compute_semi_anti_join_factors (M0146-0005dj): the bucket walk
