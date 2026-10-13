@@ -628,6 +628,11 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
 		joinrel.usefulKeys = s.pathkeyUsefulnessFor(joinrelids)
+		// M0146-0185: canonical pathkeys, only where no special join can
+		// null-extend a class member (the same gate as ecReduce).
+		if s.clauses != nil && s.clauses.ecReduce && joinrel.usefulKeys != nil {
+			joinrel.pathkeyClass = joinrel.usefulKeys.equivalentWithin
+		}
 		joinrel.memberRels = append(append([]*RelOptInfo(nil), rel1.baseMembers()...), rel2.baseMembers()...)
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.

@@ -1,0 +1,8 @@
+baseline: PLAN-PARITY: queries=99 match=76 shapediff=23 unparsed=0 missingnode=0 error=0 timeout=0
+baseline: CATEGORIES-EXCL-MATCH: join-order=17 join-method=10 scan-type=7 parameterisation=9 aggregation-strategy=4 sort-strategy=10 parallelism=11 qual-placement=5 rendering=1
+baseline: PLAN-PARITY: queries=99 match=64 shapediff=35 unparsed=0 missingnode=0 error=0 timeout=0
+baseline: CATEGORIES-EXCL-MATCH: join-order=31 join-method=16 scan-type=21 parameterisation=11 aggregation-strategy=10 sort-strategy=19 parallelism=18 qual-placement=8 rendering=2
+candidate: PLAN-PARITY: queries=99 match=75 shapediff=24 unparsed=0 missingnode=0 error=0 timeout=0
+candidate: CATEGORIES-EXCL-MATCH: join-order=18 join-method=10 scan-type=7 parameterisation=9 aggregation-strategy=4 sort-strategy=11 parallelism=11 qual-placement=5 rendering=1
+candidate: PLAN-PARITY: queries=99 match=64 shapediff=35 unparsed=0 missingnode=0 error=0 timeout=0
+candidate: CATEGORIES-EXCL-MATCH: join-order=31 join-method=14 scan-type=21 parameterisation=11 aggregation-strategy=10 sort-strategy=17 parallelism=18 qual-placement=6 rendering=2

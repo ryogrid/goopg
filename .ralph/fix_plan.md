@@ -32804,7 +32804,7 @@ Movement: yes — regress join 17945 -> 17930 and partition_join 6310 -> 6303 di
     - Test: `TestExplainRangeWithInitPlanBounds` \(the band forms fail with the fallback disabled\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, parameterisation 10 -> 9, aggregation-strategy 5 -> 4, sort-strategy 11 -> 10, parallelism 12 -> 11, qual-placement 4 -> 5 (Q54: 6 categories -> 1); match 76/64 unchanged
-- [ ] **M0146-0185 — TPC-DS Q77's web channel: PG scans web_page_pkey under a nested loop where goopg seq-scans and hashes**
+- [x] **M0146-0185 — TPC-DS Q77's web channel: PG scans web_page_pkey under a nested loop where goopg seq-scans and hashes**
   (filed 2026-10-14 by M0146-0183). Q77 SF0.25: each of PG's `ws` / `wr` grouped subqueries is a GroupAggregate
   over a Nested Loop with `Join Filter: (web_page.wp_web_page_sk = web_sales.ws_web_page_sk)` driven by an Index
   Only Scan using web_page_pkey (sorted, so the two merge-left-join); goopg seq-scans web_page under a hash / merge
@@ -32814,6 +32814,21 @@ Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, parameterisa
   Parent: M0146-0014
   - First step: compare the `ws` subquery's join pathlists (web_sales x web_page x date_dim) with PG's via the
     OPTIMIZER_DEBUG build (tmp/pgdbg) and find why goopg's IOS-driven sorted nested loop is not kept.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0185\-canonical\-pathkeys\-in\-add\-path\.md`, evidence
+    `analysis/m0146/m0146\-0185/`\)\.
+    - PG \(OPTIMIZER\_DEBUG\): the wr joinrel keeps NL unsorted 2351\.05 and NL sorted 2362\.49; its merge
+      \(2346\.60\.\.2347\.00\) ties the sorted NL within fuzz on the same canonical pathkey and loses on startup\.
+    - goopg built the same pair \(merge 2318\.82\.\.2319\.23 by wr\_web\_page\_sk, NL 0\.44\.\.2330\.71 by
+      wp\_web\_page\_sk\) but compared pathkeys syntactically, kept both, and elected the merge\.
+    - Fix: `comparePathkeysDimRel` \(add\_path, partial add, setCheapest\) treats keys on members of one class the rel
+      enforces as equal \(`equivalentWithin`, the containment siblings\' predicate\); set on join rels under `ecReduce`\.
+    - Q77 web channel: PG\'s Merge Left Join and the wr NL shape\. SF1 join\-method 16 \-> 14, sort 19 \-> 17,
+      qual\-placement 8 \-> 6\. SF0\.25 Q4 flips MATCH \-> SHAPE\-DIFF on a ~1e\-6 cost tie \(COSTTIE\)\.
+    - Filed M0146\-0188 \(index\-only path has no pathkeys\) and M0146\-0189 \(Q77 ws partial\-agg split vs PG\'s NL\)\.
+    - Test: `TestAddPathCanonicalPathkeysEvictFuzzyTiedMerge` \(fails with the syntactic comparison\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS;
+      regress A/B identical except a join\.sql no\-ORDER\-BY row order that flips run to run\.
+Movement: yes — CATEGORIES-EXCL-MATCH SF1 join-method 16 -> 14, sort-strategy 19 -> 17, qual-placement 8 -> 6; SF0.25 match 76 -> 75, join-order 17 -> 18, sort-strategy 10 -> 11 (Q4 COSTTIE flip)
 - [ ] **M0146-0186 — a single-relation scan gets a Gather with no parallel_setup_cost where PG keeps the serial scan**
   (filed 2026-10-14 by M0146-0184). SF0.25 probe `SELECT d_date_sk FROM date_dim WHERE d_month_seq >= (SELECT 1200)
   AND d_month_seq <= (SELECT 1203)`: goopg plans `Gather (cost=0.02..2508.05 rows=365)` / `Workers Planned: 1` over a
@@ -32833,3 +32848,19 @@ Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, parameterisa
   Parent: M0146-0014
   - First step: compare the PathParamAppend member bitmap construction (M0146-0049b/c) with the single-scan
     bitmap restriction arm and route the probe clause into the Recheck Cond the same way.
+- [ ] **M0146-0188 — an index-only path carries no pathkeys, so PG's ordered Index Only Scan appears as an Index Scan (TPC-DS Q77)**
+  (filed 2026-10-14 by M0146-0185). goopg's `indexonly` producer files web_page_pkey's full index-only scan with
+  pathkeys=0 (dominated), while `index.ordered` files the plain Index Scan sorted on the key; PG keeps the Index Only
+  Scan (0.14..14.04, pathkeys) and drives Q77's ws/wr nested loops with it. Scan-type divergence.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: give the index-only path its index pathkeys (build_index_pathkeys) where PG's index_only_scan
+    candidate is useful for ordering, and compare costs with PG's 0.14..14.04 on web_page_pkey.
+- [ ] **M0146-0189 — TPC-DS Q77's ws side: goopg splits a parallel partial aggregate where PG aggregates over NL(IOS, Material(Gather))**
+  (filed 2026-10-14 by M0146-0185). Q77 SF0.25 ws: PG GroupAggregate over Nested Loop (Index Only Scan web_page_pkey,
+  Materialize(Gather(Parallel Hash Join))) = 3068.93..8854.17; goopg Finalize GroupAggregate / Gather Merge / Partial
+  GroupAggregate / Sort / Hash Join. Plans: `analysis/m0146/m0146-0185/q77-sf025-*`.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: compare the grouping rel's candidates (DPPATH grouping trace) with PG's; check whether goopg's
+    sorted NL input with a Gather inner reaches the grouping election.
