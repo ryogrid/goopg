@@ -12150,6 +12150,7 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 		// no restriction conjunct is left for the heap fetch
 		// (costsize.c:822-830). numSAScans 1: plain equality, no
 		// ScalarArrayOp product.
+		numIndexQuals: 1,
 	}
 	idxCost := costIndexScan(cp, in)
 	// The seq rival evaluates the one equality per tuple scanned.

@@ -339,7 +339,8 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// R1 (plan-parity-fix-take2): every local conjunct not consumed as an
 		// index qual is a qpqual, as the seq rival counts them
 		// (costsize.c:806-820).
-		numQualOps: qpquals,
+		numQualOps:    qpquals,
+		numIndexQuals: float64(len(clauses)),
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at

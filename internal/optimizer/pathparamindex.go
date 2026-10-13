@@ -437,7 +437,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// is drawn from `bound`, so `len(bound)-len(clauses) >= 0` and the
 		// count can never go negative (a negative would CREDIT the index
 		// path — the very asymmetry R1 removes).
-		numQualOps: paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numQualOps:    paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numIndexQuals: float64(len(clauses)),
 	})
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.
@@ -610,6 +611,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 		totalTablePages:  totalPages,
 		loopCount:        loopCount,
 		numQualOps:       paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numIndexQuals:    float64(len(clauses)),
 		numSAScans:       numSA,
 		boundSelectivity: boundSel,
 	})

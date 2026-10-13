@@ -198,7 +198,9 @@ func TestRangeScanCompositeIndexKeepsFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT x FROM btg WHERE y < 0")
+	// Six rows: the seq scan is the cheaper plan, as in PG, so the index
+	// shape under test is requested with seq/bitmap scans off.
+	lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT x FROM btg WHERE y < 0", indexOnlySettings())
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Index Cond: (y < 0)") {
 		t.Errorf("expected `Index Cond: (y < 0)`; got:\n%s", joined)
@@ -207,7 +209,7 @@ func TestRangeScanCompositeIndexKeepsFilter(t *testing.T) {
 		t.Errorf("composite index must KEEP its Filter (trailing-column leak guard); got:\n%s", joined)
 	}
 
-	rows := runQuery(t, ctx, "SELECT y FROM btg WHERE y < 0")
+	rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT y FROM btg WHERE y < 0", indexOnlySettings()))
 	if len(rows) != 2 {
 		t.Fatalf("got %d rows, want 2 (y=-2,-1; boundary y=0 and NULL excluded)", len(rows))
 	}

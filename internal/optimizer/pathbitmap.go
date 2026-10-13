@@ -199,7 +199,8 @@ func (s *searchCtx) buildOneBitmapPath(
 		// "the full freight for all the scan clauses" (assume-rechecked-
 		// always), so every local conjunct counts — not minus
 		// index-satisfied ones.
-		numQualOps: localQualOpCount(leaf),
+		numQualOps:    localQualOpCount(leaf),
+		numIndexQuals: float64(len(indexClauses)),
 	}
 	tuplesFetched := clampRowEst(selectivity * relTuples)
 
@@ -662,6 +663,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
+		numIndexQuals: float64(len(clauses)),
 	})
 	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
 	// relations supplying the parameter. The path cost stays per-execution — PG

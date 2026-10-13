@@ -572,6 +572,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
 		numQualOps:       qpquals,
+		numIndexQuals:    float64(len(clauses)),
 		numSAScans:       numSAScans,
 		boundSelectivity: boundSel,
 	}

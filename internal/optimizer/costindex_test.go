@@ -123,8 +123,9 @@ func TestCostIndexScanCorrelationInterpolation(t *testing.T) {
 //	  numIndexTuples = 1000, numIndexPages = ceil(1000*20/1000) = 20
 //	  20 * random_page_cost(4)                       =  80
 //	  1000 * cpu_index_tuple_cost(0.005)             =   5
-//	  descent = (1+1) * 50 * cpu_operator_cost(.0025)=   0.25   (startup AND total)
-//	  -> startup 0.25, total 85.25
+//	  descent = (ceil(log2(1000)) + (1+1) * 50)
+//	            * cpu_operator_cost(.0025) = (10+100)*.0025 = 0.275 (startup AND total)
+//	  -> startup 0.275, total 85.275
 //	heap side:
 //	  tuples_fetched = 1000
 //	  T=100, b=ceil(524288*100/120)=436907 -> T<=b branch:
@@ -133,7 +134,7 @@ func TestCostIndexScanCorrelationInterpolation(t *testing.T) {
 //	  csquared = 0 -> run += 400
 //	  cpu = 1000 * cpu_tuple_cost(0.01) = 10
 //
-//	startup = 0.25, total = 0.25 + (85.25-0.25) + 400 + 10 = 495.25
+//	startup = 0.275, total = 0.275 + (85.275-0.275) + 400 + 10 = 495.275
 func TestCostIndexScanFullScanArithmetic(t *testing.T) {
 	cp := defaultCostParams()
 	got := costIndexScan(cp, indexScanInputs{
@@ -146,13 +147,13 @@ func TestCostIndexScanFullScanArithmetic(t *testing.T) {
 		correlation:     0,
 		totalTablePages: 100,
 	})
-	if !approxCost(got.Startup, 0.25) {
-		t.Errorf("startup = %v; want 0.25 (the B-tree descent)", got.Startup)
+	if !approxCost(got.Startup, 0.275) {
+		t.Errorf("startup = %v; want 0.275 (the B-tree descent)", got.Startup)
 	}
 	// Page terms 480 (80 index + 400 heap) at random_page_cost, plus CPU
-	// terms 15.25 — PG's arithmetic (the x2 calibration was retired at
+	// terms 15.275 — PG's arithmetic (the x2 calibration was retired at
 	// M0146-0159).
-	want := 480.0 + 15.25
+	want := 480.0 + 15.275
 	if !approxCost(got.Total, want) {
 		t.Errorf("total = %v; want %v", got.Total, want)
 	}
@@ -185,9 +186,13 @@ func TestR59ProbePinLineitem920(t *testing.T) {
 		totalTablePages: 168880,
 		loopCount:       1500000,
 		numQualOps: 2,
+		// The probe binds one equality join clause.
+		numIndexQuals: 1,
 	}, 0)
-	if !approxCost(got.Startup, 0.375) {
-		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
+	// ceil(log2(6001255)) = 23 comparisons (0.0575) plus the treeHeight-2
+	// descent (0.375) — PG prints the same 0.43 startup for this probe.
+	if !approxCost(got.Startup, 0.4325) {
+		t.Errorf("startup = %v; want 0.4325 (the log2 + treeHeight-2 descent)", got.Startup)
 	}
 	// Post-cut (R59 §2 arm landed) the SCOPE §3 band was [1.2, 2.0] and the
 	// pin 1.2488 — both priced with the x2 probe calibration. M0146-0159
@@ -195,8 +200,11 @@ func TestR59ProbePinLineitem920(t *testing.T) {
 	// traced inputs: index-side ML over 1×1.5M touches caps at the 8588-page
 	// index → 8588×4/1.5M = 0.0229 + 5.11×0.005 cpuIndex = 0.0485; heap
 	// 0.7274/2 = 0.3637; CPU 0.075; 0.375 + 0.0485 + 0.3637 + 0.075 = 0.8622.
-	if !approxCost(got.Total, 0.862180734688098) {
-		t.Errorf("total = %v; want 0.862180734688098", got.Total)
+	// M0146-0172 adds btcostestimate's remaining terms: the 0.0575 log2
+	// descent, rint(5.11) = 5 index tuples (-0.0006) and qual_op_cost on
+	// each of them (5 x 0.0025 = 0.0125) — 0.9316.
+	if !approxCost(got.Total, 0.931616) {
+		t.Errorf("total = %v; want 0.931616", got.Total)
 	}
 }
 
@@ -216,16 +224,22 @@ func TestR59ProbePinOrders1013(t *testing.T) {
 		totalTablePages: 168880,
 		loopCount:       150000,
 		numQualOps: 0,
+		// The probe binds one equality join clause.
+		numIndexQuals: 1,
 	}, 0)
-	if !approxCost(got.Startup, 0.375) {
-		t.Errorf("startup = %v; want 0.375 (the treeHeight-2 descent)", got.Startup)
+	// ceil(log2(1500000)) = 21 comparisons (0.0525) plus the treeHeight-2
+	// descent (0.375).
+	if !approxCost(got.Startup, 0.4275) {
+		t.Errorf("startup = %v; want 0.4275 (the log2 + treeHeight-2 descent)", got.Startup)
 	}
 	// Post-cut the §3 band was [2.0, 3.0] and the pin 2.2051 — priced with
 	// the x2 probe calibration M0146-0159 retired. Without it the random-page
-	// terms halve. PG's traced total for this probe was 1.54; the remaining
-	// gap (now below PG) is not decomposed here.
-	if !approxCost(got.Total, 1.4093780003749998) {
-		t.Errorf("total = %v; want 1.4093780003749998", got.Total)
+	// terms halve. M0146-0172's btcostestimate terms then add the 0.0525
+	// log2 descent, rint(15.72) = 16 index tuples (+0.0014) and qual_op_cost
+	// on each (16 x 0.0025 = 0.04): 1.5033 against PG's traced 1.54 (the
+	// remaining gap is not decomposed here).
+	if !approxCost(got.Total, 1.50326) {
+		t.Errorf("total = %v; want 1.50326", got.Total)
 	}
 }
 
@@ -241,7 +255,8 @@ func TestCostIndexScanStartupIsDescentOnly(t *testing.T) {
 		treeHeight: 3, selectivity: 1.0, totalTablePages: 500,
 	}
 	got := costIndexScan(cp, in)
-	wantStartup := float64(3+1) * pageCPUMultiplier * cp.cpuOperatorCost
+	// ceil(log2(50000)) = 16 comparisons, then (height+1) pages at 50 each.
+	wantStartup := (16 + float64(3+1)*pageCPUMultiplier) * cp.cpuOperatorCost
 	if !approxCost(got.Startup, wantStartup) {
 		t.Fatalf("startup = %v; want the descent %v", got.Startup, wantStartup)
 	}
@@ -378,10 +393,11 @@ func TestBtreeUniqueIndexClampsToOneTuple(t *testing.T) {
 	}
 
 	// It must land at the single-tuple price, not merely lower: one index page
-	// plus one index tuple plus the descent.
+	// plus one index tuple plus the descent — ceil(log2(100000)) = 17
+	// comparisons and (height+1) pages at 50 cpu_operator_cost each.
 	want := 1*cp.randomPageCost +
 		1*cp.cpuIndexTupleCost +
-		float64(in.treeHeight+1)*pageCPUMultiplier*cp.cpuOperatorCost
+		(17+float64(in.treeHeight+1)*pageCPUMultiplier)*cp.cpuOperatorCost
 	if math.Abs(clamped-want) > 1e-9 {
 		t.Errorf("clamped index cost = %v, want %v (one page, one tuple, one descent)", clamped, want)
 	}

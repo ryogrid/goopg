@@ -150,6 +150,7 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams) 
 		totalTablePages:         float64(relPages),
 		loopCount:               outerRows,
 		numQualOps:              float64(len(bound) - len(clauses)),
+		numIndexQuals:           float64(len(clauses)),
 	})
 	innerRel.Rows = probeRows
 	probePath := &Path{
