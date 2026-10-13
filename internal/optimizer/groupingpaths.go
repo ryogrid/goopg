@@ -669,7 +669,15 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Rel: grouped, Rows: numGroups,
 					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
 						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth),
-					Pathkeys: sorted.Pathkeys, Children: []*Path{&sorted},
+					// M0146-0189: the group keys' pathkeys, as every other
+					// grouping arm files (the sort and search-candidate arms,
+					// the partial split). The seed's own keys name the same
+					// ordering in the joined tree's coordinates; PG's canonical
+					// pathkeys make the two one, but syntactic ones made add_path
+					// call them PATHKEYS_DIFFERENT, so a fuzzily-tied, slow-start
+					// Finalize split survived beside this fast-start path and won
+					// on total (TPC-DS Q77's ws).
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{&sorted},
 				}, groupAggSortedProducer)
 				isSorted = true // upstream offers no Sort over this same path
 			}

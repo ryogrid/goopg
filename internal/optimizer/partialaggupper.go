@@ -1214,7 +1214,7 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
 			nGroupCols, finalGroups, nAggs, inWidth),
-		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		Pathkeys:        finalizeGroupPathkeys(aggNode),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
 	}
@@ -1288,7 +1288,7 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
 			nGroupCols, finalGroups, nAggs, inWidth),
-		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		Pathkeys:        finalizeGroupPathkeys(aggNode),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
 	}
@@ -1388,6 +1388,19 @@ func parallelSeedCost(serial Cost, d float64) Cost {
 		run = 0
 	}
 	return Cost{Startup: serial.Startup, Total: serial.Startup + run/d}
+}
+
+// finalizeGroupPathkeys is the ordering a sorted Finalize delivers, named as
+// every serial grouping arm names it: the group keys over the aggregate's
+// input row (groupKeysSortKeys). The Gather Merge below merges on the
+// transport row's positions (mergeKeys), which createFinalizeAggSortedPlan
+// re-derives itself; on the grouped rel's path the transport form named the
+// same ordering differently, add_path called the two PATHKEYS_DIFFERENT, and
+// a fuzzily-tied, slow-start split survived beside PG's fast-start serial
+// aggregate and won on total — PG's canonical group pathkeys make them one
+// (TPC-DS Q77's ws, M0146-0189).
+func finalizeGroupPathkeys(aggNode *Aggregate) []PathKey {
+	return pathkeysForSortKeys(groupKeysSortKeys(aggNode))
 }
 
 // upperSplitWorkers sizes the split's worker count.

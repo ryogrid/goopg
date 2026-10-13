@@ -32891,7 +32891,7 @@ Movement: yes — match SF0.25 75 -> 76 (TPC-DS Q54); CATEGORIES-EXCL-MATCH SF0.
     - Test: `TestExplainOrderedIndexOnlyScan` \(fails with both producers at HEAD\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: none — Q77's web_page_pkey scans now match PG's scan type but Q77 keeps its categories (ws side, M0146-0189); match 76/64 unchanged
-- [ ] **M0146-0189 — TPC-DS Q77's ws side: goopg splits a parallel partial aggregate where PG aggregates over NL(IOS, Material(Gather))**
+- [x] **M0146-0189 — TPC-DS Q77's ws side: goopg splits a parallel partial aggregate where PG aggregates over NL(IOS, Material(Gather))**
   (filed 2026-10-14 by M0146-0185). Q77 SF0.25 ws: PG GroupAggregate over Nested Loop (Index Only Scan web_page_pkey,
   Materialize(Gather(Parallel Hash Join))) = 3068.93..8854.17; goopg Finalize GroupAggregate / Gather Merge / Partial
   GroupAggregate / Sort / Hash Join. Plans: `analysis/m0146/m0146-0185/q77-sf025-*`.
@@ -32899,3 +32899,15 @@ Movement: none — Q77's web_page_pkey scans now match PG's scan type but Q77 ke
   Parent: M0146-0014
   - First step: compare the grouping rel's candidates (DPPATH grouping trace) with PG's; check whether goopg's
     sorted NL input with a Gather inner reaches the grouping election.
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0189\-grouped\-rel\-pathkey\-coordinates\.md`, evidence
+    `analysis/m0146/m0146\-0189/`\)\.
+    - PG keeps the fast\-start NL GroupAggregate because every grouped candidate is within STD\_FUZZ\_FACTOR and they
+      share one canonical group pathkey; goopg built the same serial candidate \(3049\.90\.\.8771\.07\) but the sorted
+      Finalize split keyed its pathkeys on the transport row \(Index 0 vs 62\), so add\_path kept both and the split
+      won on total\. The presorted serial arm also filed the input node\'s keys\.
+    - Fix: `finalizeGroupPathkeys` \(group keys over the aggregate input\) on both sorted Finalize constructions; the
+      presorted arm files `pathkeysForSortKeys\(keys\)`\.
+    - SF0\.25 match 76 \-> 77 \(Q85\); SF1 Q85 matches, Q52 flips on a 0\.03 COSTTIE \(GM\-over\-Sort vs Sort\-over\-Gather\)\.
+    - Test: `TestGroupedRelPathkeysShareOneCoordinate` \(fails with the transport\-coordinate keys\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, join-method 10 -> 9, aggregation-strategy 4 -> 3, sort-strategy 11 -> 10, parallelism 11 -> 8, qual-placement 4 -> 3; SF1 join-method 14 -> 12, join-order 31 -> 30
