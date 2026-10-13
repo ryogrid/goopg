@@ -32776,7 +32776,7 @@ Movement: none — display-only: the chain's EXPLAIN costs now come from its pat
       with the widening reverted\)\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
 Movement: yes — regress join 17945 -> 17930 and partition_join 6310 -> 6303 diff lines; CATEGORIES-EXCL-MATCH SF0.25 join-method 9 -> 10 (Q77 near-tie flip, filed M0146-0185); match 76/64 unchanged
-- [ ] **M0146-0184 — a range pair whose bounds are InitPlan params is not collapsed to DEFAULT_RANGE_INEQ_SEL (TPC-DS Q54)**
+- [x] **M0146-0184 — a range pair whose bounds are InitPlan params is not collapsed to DEFAULT_RANGE_INEQ_SEL (TPC-DS Q54)**
   (filed 2026-10-14 by the M0146-0005dp verification). Q54 SF0.25: date_dim's `d_month_seq >= (InitPlan 1) AND
   d_month_seq <= (InitPlan 2)` is estimated at 0.111 (two DEFAULT_INEQ_SEL factors) where PG's
   `clauselist_selectivity` (clausesel.c) pairs the two bounds and returns DEFAULT_RANGE_INEQ_SEL 0.005. A bare
@@ -32792,6 +32792,18 @@ Movement: yes — regress join 17945 -> 17930 and partition_join 6310 -> 6303 di
     non-Const operand, scalarineqsel).
   - Expected movement: TPC-DS Q54 first divergence (join-order / parallelism); check the other InitPlan-bounded
     BETWEENs in the corpus (d_month_seq bands).
+  - Done 2026\-10\-14 \(design `docs/design/0100\-0149/m0146\-0184\-range\-pair\-pseudoconstant\-bounds\.md`, evidence
+    `analysis/m0146/m0146\-0184/`\)\.
+    - `rangeBoundOf` falls back to `normalizeColumnPseudoConstRange`; `isRangePseudoConstant` \(a walkExprRefs
+      callback, registered in the switch inventory\) admits literals, bind params, InitPlan sublinks and
+      casts/arithmetic over them; function calls decline\.
+    - Fixture rows equal PG 18\.3\'s exactly \(100 / 100 / 6667\)\. Q54 SF0\.25 takes PG\'s shape; its last
+      divergence is the member Bitmap Heap Scan\'s `Filter:` vs `Recheck Cond:` \(filed M0146\-0187\)\.
+    - SF1 Q54 also takes PG\'s NL\-over\-unique\-my\_customers shape; residual join order / Gather Merge differ\.
+    - Filed M0146\-0186 \(single\-rel Gather without parallel\_setup\_cost, seen on the probe\)\.
+    - Test: `TestExplainRangeWithInitPlanBounds` \(the band forms fail with the fallback disabled\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS\.
+Movement: yes — CATEGORIES-EXCL-MATCH SF0.25 join-order 18 -> 17, parameterisation 10 -> 9, aggregation-strategy 5 -> 4, sort-strategy 11 -> 10, parallelism 12 -> 11, qual-placement 4 -> 5 (Q54: 6 categories -> 1); match 76/64 unchanged
 - [ ] **M0146-0185 — TPC-DS Q77's web channel: PG scans web_page_pkey under a nested loop where goopg seq-scans and hashes**
   (filed 2026-10-14 by M0146-0183). Q77 SF0.25: each of PG's `ws` / `wr` grouped subqueries is a GroupAggregate
   over a Nested Loop with `Join Filter: (web_page.wp_web_page_sk = web_sales.ws_web_page_sk)` driven by an Index
@@ -32802,3 +32814,22 @@ Movement: yes — regress join 17945 -> 17930 and partition_join 6310 -> 6303 di
   Parent: M0146-0014
   - First step: compare the `ws` subquery's join pathlists (web_sales x web_page x date_dim) with PG's via the
     OPTIMIZER_DEBUG build (tmp/pgdbg) and find why goopg's IOS-driven sorted nested loop is not kept.
+- [ ] **M0146-0186 — a single-relation scan gets a Gather with no parallel_setup_cost where PG keeps the serial scan**
+  (filed 2026-10-14 by M0146-0184). SF0.25 probe `SELECT d_date_sk FROM date_dim WHERE d_month_seq >= (SELECT 1200)
+  AND d_month_seq <= (SELECT 1203)`: goopg plans `Gather (cost=0.02..2508.05 rows=365)` / `Workers Planned: 1` over a
+  Parallel Seq Scan; PG plans `Seq Scan on date_dim (cost=0.02..2519.75 rows=365)`. A path-model Gather would start at
+  parallel_setup_cost (1000) and lose; the 0.02 startup suggests the post-pass stamps it. Before M0146-0184 the same
+  shape printed `Gather (cost=0.02..2663.07 rows=8116)` (analysis/m0146/m0146-0005dp/range-initplan-probe.txt).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: find which producer builds this Gather for a one-relation query (DPPATH trace, `gather` producer)
+    and compare its cost with cost_gather (costsize.c).
+- [ ] **M0146-0187 — an appendrel member's parameterised Bitmap Heap Scan prints its probe as Filter, not Recheck Cond (TPC-DS Q54)**
+  (filed 2026-10-14 by M0146-0184; previously ledgered under M0146-0005dp). Q54's item NL drives a parameterised
+  Append whose Bitmap Heap Scan on catalog_sales prints `Filter: (cs_item_sk = item.i_item_sk)` where PG prints
+  `Recheck Cond:` (bitmapqualorig). It is Q54's only SF0.25 divergence (qual-placement); at SF1 web_sales' member
+  prints the same way. The single-scan bitmap arm already sets Recheck Cond (M0146-0012 slice 1).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: compare the PathParamAppend member bitmap construction (M0146-0049b/c) with the single-scan
+    bitmap restriction arm and route the probe clause into the Recheck Cond the same way.

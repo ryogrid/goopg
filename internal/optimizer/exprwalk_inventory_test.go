@@ -142,6 +142,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// unenumerated type answers "not proven", which keeps the index guard.
 	"pseudoconstant_gate.go:SublinkIsInitPlan":        nonRecursiveClassifier, // M0145-0008o: sublink kind -> InitPlan or SubPlan, no recursion
 	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
+	"rangequery.go:isRangePseudoConstant":             nonRecursiveClassifier, // M0146-0184: a walkExprRefs Visit callback; the recursion is the driver's
 
 	// M0146-0005do: equivalence-class member test — a walkExprRefs Visit
 	// callback (scopeVeto); the switch only classifies a node as column /
