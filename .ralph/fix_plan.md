@@ -32130,6 +32130,15 @@ Movement: none — instrument artefact — fire\-set fires=none at HEAD costs; i
   Parent: M0146\-0159
   - First step: profile Q17 at SF0\.25 on a private clone \(perf, the probe loop\) against PG\'s same plan to locate the
     per\-probe gap \(index descent, heap fetch, param rebinding\)\.
+  - Slice 1 2026\-10\-13 \(`4e4b32af9`\): an index scan deforms a fetched heap tuple only to the highest attribute a
+    consumer reads \(PG slot\_getsomeattrs\); the index key columns no longer widen a consumer\-derived bound\.
+    - Q17\'s `catalog\_sales\_pkey` probe deformed 18 of 34 columns for a Filter on attribute 4; `decodeRowRangeInfo`
+      fell from 21\.2% to 6\.4% of the probe\-loop profile\.
+    - Isolated probe loop 628–708 → 501–596 ms \(PG 392\); Q17 warm 0\.75 → 0\.68 s\. Deform\-poison run over all 99 TPC\-DS
+      SF0\.25 queries: 0 violations\.
+    - Next: `PagePruneXIDSet` \(6\.2%, the per\-fetch prune check — PG\'s `heap\_page\_prune\_opt` exits early\),
+      `parseHeapTupleAlias` \(9\.7%\), index tuple deform/compare\. Design
+      `docs/design/0100\-0149/m0146\-0171\-probe\-runtime\.md`\.
 - [x] **M0146-0172 — TPC\-DS SF1 Q72 runs 65x slower since M0146\-0009p: goopg elects the item\-only inventory route**
   \(filed 2026\-10\-13 by M0146\-0009p\)\. With PG\'s parameterised rows \(0009p\), goopg prices its item\-only route
   \(`inventory\_pkey` probe on `inv\_item\_sk` rows=236, then the date\-dimension joins over 13819 rows\) at 54874, under its

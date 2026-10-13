@@ -1,0 +1,7 @@
+# M0146-0171 slice 1 (2026-10-13): index-scan heap deform stops at the consumer bound.
+# Private clone of data-sf025, same clone for both binaries, 4 runs each; PG 18.3 = :65438 tpcds025.
+# probe.sql: NL over 20000 store_sales rows probing catalog_sales_pkey (cs_item_sk) with a cs_bill_customer_sk Filter.
+probe loop (ms)   HEAD 707.6 628.6 630.5 699.5   candidate 596.3 519.2 500.8 571.7   PG 391.5
+Q17 wall (s)      HEAD 1.019 1.018 0.752 0.764   candidate 1.023 1.022 0.657 0.696
+Q17 EXPLAIN ANALYZE (before): goopg 565 ms vs PG 160 ms; catalog_sales_pkey probe 0.049 ms/loop vs PG 0.013 (7511 loops, ~26 rows per probe filtered)
+Deform-poison corpus run: all 99 TPC-DS SF0.25 queries with the poison armed -> 0 deform-bound violations.
