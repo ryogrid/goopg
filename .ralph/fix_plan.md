@@ -5566,6 +5566,11 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\.
     - Next: gap 8 — write a vacuum\-concurrent\-with\-splits stress test, then remove `lockStructural` \(the parent
       found by `resolveParentDownlink` may then move right before it is latched: re\-find it like `getStackBuf`\)\.
+  - **2026\-10\-15 vacuum\-with\-splits stress test landed** \(`TestStructuralLockVacuumWithSplits`\)\.
+    - 10 rounds: even key segments vacuumed away \(pages deleted\) while 8 handles insert the odd segments\.
+    - Shared 0/10; per\-handle mutexes 0/15; both stress tests clean under `\-race` without the cross\-handle lock\.
+    - Movement: none\. Next: gap 8 \(remove `lockStructural`\), gated by both stress tests, `\-race`, pgbench and the
+      isolation ports\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

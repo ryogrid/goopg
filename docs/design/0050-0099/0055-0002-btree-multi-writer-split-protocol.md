@@ -257,6 +257,27 @@ left by a crash: no writer sees another writer's half split any more.
 flag set and not set; with the refusals disabled the flagged cases fail.
 Reproducer: shared 0/20, unshared 0/10. The vacuum and DDL isolation ports pass.
 
+**Vacuum\-with\-splits stress \(2026\-10\-15\).** `TestStructuralLockVacuumWithSplits`
+covers the deletion half of what the structural lock protects. Each of 10 rounds:
+
+- inserts the even key segments, then vacuums them away segment by segment, so
+  their pages empty and are deleted;
+- meanwhile eight handles insert the odd segments in random order, splitting the
+  neighbouring pages;
+- requires afterwards that every odd key is found with its TID, that no even key
+  is found, and that a full scan is ordered and complete;
+- requires at least one deleted page, so the round really exercised deletion.
+
+| configuration | failures |
+|---|---|
+| shared lock | 0 / 10 |
+| per\-handle mutexes \(no cross\-handle lock\) | 0 / 15 |
+| per\-handle mutexes, both stress tests under `\-race` | 3 clean runs |
+
+Vacuum's existing under\-latch checks keep a moved parent safe: the downlink is
+re\-checked on the latched parent, and the deletion is abandoned when it moved.
+A `\_bt\_getstackbuf`\-style re\-find would only make deletion succeed more often.
+
 ## 5. Tests
 
 - Multi-writer split stress with random keys.
