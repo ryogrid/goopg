@@ -765,6 +765,25 @@ Concrete divergences:
 - **Not yet ported:** `BlockRefTableReaderGetBlocks`' fixed-size `chunk_data` has no bound check
   in PG. The Go reader rejects a chunk size above 4096 as corrupt instead of overflowing.
 
+## S2a landed (2026-10-14)
+
+S2 is split. S2a is `internal/backup/walsummary`, a port of `backup/walsummary.c` plus SummarizeWAL's file write.
+S2b is the classifier and the offline `SummarizeWAL` core.
+
+- **What S2a contains:**
+  - `File.Name` / `ParseFilename` / `IsFilename` (exactly 40 uppercase hex digits);
+  - `List` (GetWalSummaries' exclusive bounds) and `Filter` (FilterWalSummaries' inclusive bounds);
+  - `AreComplete`, `Open`/`Read`, and `RemoveIfOlderThan` (whole-second mtime);
+  - `Write`: temp.summary, then durable\_rename's fsync / rename / fsync / directory fsync.
+  - `List` returns name order where PG returns readdir order; no caller relies on the order.
+- **Oracle:** nine summary files written by a scratch PG 18.3 with `summarize_wal=on`, in `testdata/pg18-summaries`.
+  - `List` reproduces that server's `pg_available_wal_summaries()`.
+  - Rebuilding each table and writing it back with `Write` is byte-identical to PG's file, under PG's name.
+  - PG's `pg_walsummary` prints the same output for goopg's file and PG's.
+- **Non-vacuity:** giving `Filter` List's predicate fails the boundary test.
+- **Next:** S2b, the record classifier (§4.3) and the `SummarizeWAL` port over a record source. The scratch PG data
+  in `tmp/walsum-pg` (port 5547) provides its WAL oracle.
+
 ## Review
 
 The agent review (milestone 0122 Workflow step 4) is in

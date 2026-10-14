@@ -4951,6 +4951,9 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       - `shared\_memory\_size` / `num\_os\_semaphores` have no goopg equivalent;
       - FUNC\_MAX\_ARGS / INDEX\_MAX\_KEYS are advertised but not enforced;
       - the startup packet still refuses backend\-start contexts\.
+    - **Not selectable \(found 2026\-10\-14\):** the root M0122\-0008 has been `\[!\]` since 2026\-10\-12 \(lineage
+      budget; the owner\'s "hold STANDS"\)\. Under S7 its children are held too\. Slices 1–7 were selected from a
+      stale baton\. Stop here until the owner re\-opens the root\.
     - Remaining: 178 unregistered PG parameters\. Several have semantics \(`transaction\_read\_only`,
       `quote\_all\_identifiers`, `transform\_null\_equals`, `array\_nulls`\), so they must not be registered
       inert\.
@@ -5146,6 +5149,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       record source, checked against a scratch PG 18\.3 with `summarize\_wal=on` \(design doc §5\)\.
     - The review also found WAL\-logging gaps that matter without the summarizer\. They are filed as
       M0122\-0009a/b/c below\.
+  - **2026\-10\-14 S2a landed** — `internal/backup/walsummary`, a port of `backup/walsummary\.c` plus SummarizeWAL\'s
+    temp\-file \+ durable\_rename write\. S2 is split: S2a is the files, S2b the classifier and the offline core\.
+    - Contents: names \(40 uppercase hex\), `List` \(exclusive bounds\) and `Filter` \(inclusive bounds\),
+      `AreComplete`, `Open`/`Read`, `RemoveIfOlderThan` and `Write`\.
+    - Oracle: nine summary files from a scratch PG 18\.3 with `summarize\_wal=on` \(`testdata/pg18\-summaries`\)\.
+      `List` equals PG\'s `pg\_available\_wal\_summaries\(\)`; `Write` reproduces every file byte for byte;
+      `pg\_walsummary` output is identical\.
+    - Gates: units, tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next slice: S2b, the record classifier \(design §4\.3\) and the SummarizeWAL port\. The scratch PG data is in
+      `tmp/walsum\-pg` \(port 5547, stopped\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed
