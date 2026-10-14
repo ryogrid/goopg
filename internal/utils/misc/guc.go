@@ -36,6 +36,23 @@ func (e *ValidationError) SQLState() string {
 	return "22023"
 }
 
+// cantChangeError is set_config_option's refusal (guc.c) when a SET, or a
+// value from the startup packet, targets a parameter whose context forbids
+// it: SQLSTATE 55P02 with the message for that context. goopg used to answer
+// every context with "cannot be changed now" and SQLSTATE 22023.
+func cantChangeError(v *Variable) error {
+	msg := "parameter %q cannot be changed now" // PGC_SIGHUP
+	switch v.Context {
+	case ContextInternal:
+		msg = "parameter %q cannot be changed"
+	case ContextPostmaster:
+		msg = "parameter %q cannot be changed without restarting the server"
+	case ContextSuBackend, ContextBackend:
+		msg = "parameter %q cannot be set after connection start"
+	}
+	return &ValidationError{Msg: fmt.Sprintf(msg, v.Name), Code: "55P02"}
+}
+
 // Type is the value type of a GUC. Mirrors guc.c's PGC_BOOL / PGC_INT /
 // PGC_REAL / PGC_STRING / PGC_ENUM.
 type Type int
@@ -420,7 +437,7 @@ func (v *Variable) Set(value string, source Source) error {
 	// Source-based gating: SET / SET LOCAL only allowed when context
 	// permits SQL-driven changes.
 	if (source == SourceSession || source == SourceLocal) && v.Context < ContextSuset {
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		return cantChangeError(v)
 	}
 	canon, err := v.canonicalize(value)
 	if err != nil {

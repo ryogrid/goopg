@@ -45,6 +45,48 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextInternal, Flags: FlagDisallowInFile,
 		Scope: ScopeServer,
 	}))
+	// The other PGC_INTERNAL "Preset Options" (guc_tables.c): read-only
+	// reports of compile-time limits and server state. Clients query some of
+	// them on connect (`SHOW max_identifier_length`); goopg answered
+	// "unrecognized configuration parameter" (M0122-0008 slice 7). The
+	// limits are PG's NAMEDATALEN-1, FUNC_MAX_ARGS, INDEX_MAX_KEYS, RELSEG_SIZE
+	// and XLOG_BLCKSZ, which goopg's on-disk format and catalogs follow.
+	for _, c := range []struct {
+		name, boot string
+		unit       Unit
+	}{
+		{"max_identifier_length", "63", UnitNone},
+		{"max_function_args", "100", UnitNone},
+		{"max_index_keys", "32", UnitNone},
+		{"segment_size", "131072", UnitBlocks}, // RELSEG_SIZE: 1GB segments
+		{"wal_block_size", "8192", UnitNone},
+	} {
+		r.MustRegister(NewVariable(Variable{
+			Name: c.name, Type: TypeInt, Unit: c.unit, BootVal: c.boot,
+			Context: ContextInternal, Flags: FlagDisallowInFile,
+			Scope: ScopeServer,
+		}))
+	}
+	r.MustRegister(NewVariable(Variable{
+		Name: "debug_assertions", Type: TypeBool, BootVal: "off",
+		Context: ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
+	// data_checksums and huge_pages_status describe the running cluster: the
+	// boot values are PG's, and cmd/goopg records the real state at start
+	// (pg_control's data_checksum_version; goopg never maps huge pages), as
+	// PG's startup does with SetConfigOption(PGC_S_DYNAMIC_DEFAULT).
+	r.MustRegister(NewVariable(Variable{
+		Name: "data_checksums", Type: TypeBool, BootVal: "off",
+		Context: ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "huge_pages_status", Type: TypeEnum, BootVal: "unknown",
+		EnumOptions: []string{"off", "on", "unknown"},
+		Context:     ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_encoding", Type: TypeString, BootVal: "UTF8",
 		Context: ContextUserset, Flags: FlagReport,

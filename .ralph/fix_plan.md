@@ -4938,6 +4938,42 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       - `io\_workers` / `restore\_command` / `wal\_init\_zero` contexts;
       - `io\_max\_concurrency`;
       - OWNER: the plan\-shaping defaults\.
+  - Slice 7 done 2026\-10\-14: the PGC\_INTERNAL preset parameters clients read are registered\.
+    - `max\_identifier\_length`, `max\_function\_args`, `max\_index\_keys`, `segment\_size` \(1GB\),
+      `wal\_block\_size`, `debug\_assertions`, `data\_checksums` and `huge\_pages\_status`\.
+    - cmd/goopg records `data\_checksums` from pg\_control and sets `huge\_pages\_status` = off at start\.
+    - A SET refused by context now uses set\_config\_option\'s message per context and SQLSTATE 55P02\. It was
+      always "cannot be changed now" under 22023\.
+    - Output is byte\-identical to the scratch PG for SHOW and the refusals, SQLSTATE included\.
+    - Tests: `TestPresetOptionsAreReported`, `TestSetRefusalFollowsContext` and `TestRecordClusterStateGUCs`\.
+    - Ledgered:
+      - `data\_directory` / `config\_file` / `hba\_file` / `ident\_file` need a GUC\_SUPERUSER\_ONLY read gate first;
+      - `shared\_memory\_size` / `num\_os\_semaphores` have no goopg equivalent;
+      - FUNC\_MAX\_ARGS / INDEX\_MAX\_KEYS are advertised but not enforced;
+      - the startup packet still refuses backend\-start contexts\.
+    - Remaining: 178 unregistered PG parameters\. Several have semantics \(`transaction\_read\_only`,
+      `quote\_all\_identifiers`, `transform\_null\_equals`, `array\_nulls`\), so they must not be registered
+      inert\.
+
+- [ ] **Read\-only transactions are not enforced; `default\_transaction\_read\_only` is ignored** \(found 2026\-10\-14
+  during the GUC registry work\)\.
+  Kind: bug
+  Placement: S2 defect awaiting owner placement \(writes accepted where PG raises 25006\)\. It is filed without a
+  parent because M0122\-0008\'s lineage budget is exhausted \(ralph\-lineage\-guard rule A\)\.
+  - Repro on a fresh cluster:
+    - `BEGIN READ ONLY; INSERT INTO t VALUES \(1\);` succeeds\. PG 18\.3 raises 25006 "cannot execute INSERT in
+      a read\-only transaction" \(`PreventCommandIfReadOnly` / `ExecCheckXactReadOnly`, executor/execMain\.c\)\.
+    - `SET default\_transaction\_read\_only = on; INSERT …` COMMITS the row\. PG sets XactReadOnly from
+      DefaultXactReadOnly in StartTransaction \(xact\.c\)\.
+    - `BEGIN; SET TRANSACTION READ ONLY; INSERT …` succeeds, and SET TRANSACTION answers tag `OK` \(PG: `SET`\)\.
+    - `SHOW transaction\_isolation` inside `BEGIN ISOLATION LEVEL SERIALIZABLE` prints `read committed`\.
+      `transaction\_read\_only` / `transaction\_deferrable` / `default\_transaction\_deferrable` are not
+      registered at all\.
+  - goopg tracks the BEGIN flag \(`Session.SetReadOnlyTxn`\), but only nextval/setval consult it\.
+  - First step: enforce read\-only in the DML/DDL entry points per ExecCheckXactReadOnly; seed it from
+    default\_transaction\_read\_only at transaction start; register the transaction\_\* characteristic GUCs as
+    views of the live transaction state \(check\_transaction\_read\_only / check\_XactIsoLevel rules\)\.
+  - Expected instrument: regress `transactions` \(read\-only cases\) and `guc`; a postmaster test of each repro\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

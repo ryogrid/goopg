@@ -501,6 +501,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
+		recordClusterStateGUCs(registry, *dataDir)
 		// AIO engine startup line: surfaces the chosen method,
 		// the worker count, and the in-flight cap so an operator
 		// triaging an I/O-bound workload can verify the live
@@ -1060,6 +1061,25 @@ func stringGUC(registry *misc.Registry, name string, fallback string) string {
 // intGUC reads an int-shaped GUC by name, returning fallback when
 // the registry is nil, the variable isn't registered, or its
 // Display value isn't a valid integer.
+// recordClusterStateGUCs sets the PGC_INTERNAL parameters that describe the
+// running cluster rather than a compile-time constant, the way PG's startup
+// stores them with SetConfigOption(..., PGC_S_DYNAMIC_DEFAULT):
+// data_checksums from pg_control's data_checksum_version (xlog.c
+// ReadControlFile), and huge_pages_status, which is "off" because goopg never
+// maps its shared state into huge pages (PG sets it in
+// CreateSharedMemoryAndSemaphores).
+func recordClusterStateGUCs(registry *misc.Registry, dataDir string) {
+	if registry == nil {
+		return
+	}
+	checksums := "off"
+	if ctl, err := control.ReadControlFile(dataDir); err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
+		checksums = "on"
+	}
+	_ = registry.Set("data_checksums", checksums, misc.SourceDefault)
+	_ = registry.Set("huge_pages_status", "off", misc.SourceDefault)
+}
+
 // xlogBlockSize is XLOG_BLCKSZ, the page size of the XBLOCKS-valued WAL GUCs.
 const xlogBlockSize = 8192
 

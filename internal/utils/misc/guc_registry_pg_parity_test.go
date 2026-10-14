@@ -1,6 +1,7 @@
 package misc
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -197,5 +198,61 @@ func TestGUCDefaultsAndRangesFollowPG(t *testing.T) {
 	s := NewSessionRegistry(r)
 	if err := s.Set("random_page_cost", "1e12", false); err != nil {
 		t.Errorf("SET random_page_cost = 1e12: %v (PG accepts up to DBL_MAX)", err)
+	}
+}
+
+// TestPresetOptionsAreReported pins slice 7: the PGC_INTERNAL "Preset Options"
+// clients read on connect (SQLAlchemy runs SHOW max_identifier_length) are
+// registered with PG 18.3's values and display, and cannot be SET.
+func TestPresetOptionsAreReported(t *testing.T) {
+	s := NewSessionRegistry(BuildDefaultRegistry())
+	for name, want := range map[string]string{
+		"max_identifier_length": "63",
+		"max_function_args":     "100",
+		"max_index_keys":        "32",
+		"segment_size":          "1GB",
+		"wal_block_size":        "8192",
+		"debug_assertions":      "off",
+		"data_checksums":        "off",
+		"huge_pages_status":     "unknown",
+	} {
+		v, got, ok := s.GetDisplay(name)
+		if !ok {
+			t.Errorf("SHOW %s: not registered", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("SHOW %s = %q, want %q", name, got, want)
+		}
+		if v.Context != pgGUCs[name].Context {
+			t.Errorf("%s context %v, want PG's %v", name, v.Context, pgGUCs[name].Context)
+		}
+		if err := s.Set(name, want, false); err == nil {
+			t.Errorf("SET %s succeeded; PG reports it cannot be changed", name)
+		}
+	}
+}
+
+// TestSetRefusalFollowsContext pins set_config_option's refusal (guc.c) for
+// a SET on a parameter whose context forbids it: SQLSTATE 55P02 and a message
+// per context. goopg answered every context with "cannot be changed now"
+// under SQLSTATE 22023.
+func TestSetRefusalFollowsContext(t *testing.T) {
+	s := NewSessionRegistry(BuildDefaultRegistry())
+	for name, want := range map[string]string{
+		"max_identifier_length": `parameter "max_identifier_length" cannot be changed`,
+		"shared_buffers":        `parameter "shared_buffers" cannot be changed without restarting the server`,
+		"checkpoint_timeout":    `parameter "checkpoint_timeout" cannot be changed now`,
+		"jit_debugging_support": `parameter "jit_debugging_support" cannot be set after connection start`,
+	} {
+		err := s.Set(name, "1", false)
+		var verr *ValidationError
+		if !errors.As(err, &verr) {
+			t.Errorf("SET %s: %v, want a ValidationError", name, err)
+			continue
+		}
+		if verr.Msg != want || verr.SQLState() != "55P02" {
+			t.Errorf("SET %s: %s %q, want 55P02 %q", name, verr.SQLState(), verr.Msg, want)
+		}
 	}
 }

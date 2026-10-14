@@ -274,8 +274,8 @@ func (s *SessionRegistry) prepareSet(name, value string) (v *Variable, placehold
 		placeholder = true
 	}
 	if v.Context < ContextSuset {
-		// Postmaster / SigHup / Internal contexts cannot be SET.
-		return nil, false, "", fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		// Postmaster / SigHup / Internal / backend-start contexts cannot be SET.
+		return nil, false, "", cantChangeError(v)
 	}
 	if perr := s.checkSetPrivilege(v); perr != nil {
 		return nil, false, "", perr
@@ -330,8 +330,9 @@ func (s *SessionRegistry) SetStartup(name, value string) error {
 	if v.Context < ContextSuset {
 		// Postmaster / SigHup / Internal contexts cannot be changed by the
 		// startup packet either — ProcessStartupPacket's GUC loop rejects
-		// them the same way a SQL SET does.
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		// them the same way a SQL SET does. (PG accepts the backend-start
+		// contexts here; goopg still refuses them — deferral ledger.)
+		return cantChangeError(v)
 	}
 	_, current, _ := s.Get(name)
 	canon, err := v.canonicalizeFrom(current, value)
