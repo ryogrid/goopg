@@ -215,7 +215,7 @@ func lerr(yylex yyLexer, msg string, pos int) {
 // as written.
 var knownSRF = map[string]bool{
 	"generate_series": true, "pg_input_error_info": true, "parse_ident": true,
-	"pg_get_publication_tables": true, "pg_available_wal_summaries": true,
+	"pg_get_publication_tables": true, "pg_available_wal_summaries": true, "pg_wal_summary_contents": true,
 	"verify_heapam": true, "unnest": true, "generate_subscripts": true,
 	"pg_options_to_table": true, "ts_token_type": true,
 }

@@ -57,3 +57,36 @@ gzipped.
   `maximum_lsn` flush bound and the historic end-of-WAL cases. These belong to the live loop (S3).
 - **goopg-native records with no XLogRecord header** (`Record.XLog == nil`) are passed over. This is S6a (design
   §4.4): HeapLock, HeapVisible and HeapVacuum payloads carry modifications the summary must see.
+
+## S4a landed (2026-10-14): `pg_available_wal_summaries` and `pg_wal_summary_contents`
+
+These are ports of `backup/walsummaryfuncs.c` over `internal/backup/walsummary`.
+
+- **`pg_available_wal_summaries()`** used to return no rows. It now lists `pg_wal/summaries`
+  (`GetWalSummaries(0, Invalid, Invalid)`).
+  - The analyzer had no column arm for it, so a reference to one of its columns (`ORDER BY start_lsn`) failed
+    with 42703. The empty stub hid this.
+- **`pg_wal_summary_contents(tli, start_lsn, end_lsn)`** is a new FROM-clause SRF.
+  - It is a `PgWalSummaryContents` plan node. Its arguments may be correlated, so the lateral binding follows
+    `PgGetSequenceData`.
+  - Per relation fork it emits the limit-block row (`is_limit_block = true`) first, then the modified blocks in
+    the file's stored order.
+  - It is strict.
+  - **Errors, with PG's text and position:**
+    - `invalid timeline N` (22023);
+    - the missing file, with PG's relative path (58P01);
+    - corruption (XX001);
+    - bad `pg_lsn` / bigint input (22P02), with the caret on the argument.
+
+**Evidence:**
+- The nine committed PG summary files were installed in a goopg cluster, and the same script ran against the
+  scratch PG 18.3 that wrote them. The output is byte-identical, error messages and SQLSTATEs included.
+  - The script covers the ordered listing, two files' contents in natural order, a lateral per-file count, and the
+    error cases.
+- `TestWalSummaryFunctionsMatchPostgres` (`internal/executor`) pins the same comparison against
+  `testdata/wal_summary_funcs.golden`. PG captured that file with `summarize_wal=off`, so it saw exactly the
+  committed files.
+- Non-vacuity: dropping the limit-block row fails the test.
+- The fire set shows no changed plan at SF0.25 or SF1, and the TPC-H acceptance arm is value-identical.
+
+**Not ported:** `pg_get_wal_summarizer_state()` (S4b) needs the live summarizer's state (S3).

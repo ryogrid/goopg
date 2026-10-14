@@ -4095,7 +4095,7 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 	case *optimizer.Values, *optimizer.GenerateSeries, *optimizer.UserSrfScan,
 		*optimizer.GenerateSubscripts, *optimizer.FromUnnest,
 		*optimizer.PgInputErrorInfo, *optimizer.PgGetPublicationTables,
-		*optimizer.PgGetSequenceData, *optimizer.PgSequenceParameters,
+		*optimizer.PgGetSequenceData, *optimizer.PgWalSummaryContents, *optimizer.PgSequenceParameters,
 		*optimizer.TSTokenType,
 		*optimizer.PgAvailableWalSummaries, *optimizer.PgGetCatalogForeignKeys,
 		*optimizer.ScalarFuncScan, *optimizer.PgPartitionTree,
@@ -7402,6 +7402,8 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return srfFunctionScanLabel("pg_get_publication_tables", "")
 	case *optimizer.PgGetSequenceData:
 		return srfFunctionScanLabel("pg_get_sequence_data", "")
+	case *optimizer.PgWalSummaryContents:
+		return srfFunctionScanLabel("pg_wal_summary_contents", "")
 	case *optimizer.PgInputErrorInfo:
 		return srfFunctionScanLabel("pg_input_error_info", "")
 	case *optimizer.PgOptionsToTable:

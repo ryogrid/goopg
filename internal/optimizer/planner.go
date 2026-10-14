@@ -4434,6 +4434,15 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.Arg) ||
 			exprContainsColumnRef(x.StartBlock) ||
 			exprContainsColumnRef(x.EndBlock)
+	case *PgWalSummaryContents:
+		// `FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli,
+		// s.start_lsn, s.end_lsn)`: correlated arguments bind per outer row.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgGetSequenceData:
 		// pg_dump's getSequences comma-joins pg_get_sequence_data(seqrelid) with
 		// pg_sequence; the seqrelid argument is a correlated *ColumnRef against
@@ -7076,6 +7085,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "pg_wal_summary_contents") {
+		return planPgWalSummaryContents(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "pg_sequence_parameters") {
 		return planPgSequenceParameters(rv, sourceIdx, lateralCtx)
 	}
@@ -8001,6 +8013,50 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgWalSummaryContents routes a FROM-clause invocation of
+// pg_wal_summary_contents(tli, start_lsn, end_lsn) into a PgWalSummaryContents
+// node. The arguments resolve against the lateral outer context, as for
+// planPgGetSequenceData. M0122-0009 S4a.
+func planPgWalSummaryContents(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	if len(tf.Args) != 3 {
+		return nil, rangeBinding{}, fmt.Errorf("function pg_wal_summary_contents takes 3 arguments, got %d", len(tf.Args))
+	}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_wal_summary_contents"
+	}
+	colNames := []string{"relfilenode", "reltablespace", "reldatabase", "relforknumber", "relblocknumber", "is_limit_block"}
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	colTypes := []string{"oid", "oid", "oid", "int2", "int8", "bool"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgWalSummaryContents{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

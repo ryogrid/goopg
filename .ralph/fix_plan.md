@@ -5171,6 +5171,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next slice: S4a \(`pg\_available\_wal\_summaries` / `pg\_wal\_summary\_contents` over walsummary\) or S3
       \(the live goroutine\)\. Per design §5, S4a depends only on S1 \+ S2\.
+  - **2026\-10\-14 S4a landed** — `pg\_available\_wal\_summaries\(\)` is real, and `pg\_wal\_summary\_contents\(\)` is a
+    new FROM\-clause SRF \(`PgWalSummaryContents`, lateral\-capable\)\.
+    - The analyzer lacked a column arm for `pg\_available\_wal\_summaries`, so `ORDER BY start\_lsn` failed with
+      42703\. Fixed\.
+    - Oracle: the same script on goopg and on the scratch PG 18\.3, over that server\'s own summary files, is
+      byte\-identical, errors and SQLSTATEs included\. `TestWalSummaryFunctionsMatchPostgres` pins it with a golden\.
+    - Gates: units, tpch\-spotcheck, TPC\-H acceptance arm \(values = m0190 baseline, 24 MATCH\), sf025 PASS, fire
+      set PASS \(no changed plan at either scale\)\.
+    - Movement: none — SQL functions over WAL summaries; no plan instrument \(the fire set confirms no plan
+      moved\)\.
+    - Next slice: S3 \(the live summarizer goroutine\), then S4b \(`pg\_get\_wal\_summarizer\_state`\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

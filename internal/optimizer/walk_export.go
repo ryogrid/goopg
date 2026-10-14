@@ -403,6 +403,8 @@ func nodeOwnExprs(n Node) []Expr {
 		}
 	case *PgGetSequenceData:
 		exprs = append(exprs, t.Args...)
+	case *PgWalSummaryContents:
+		exprs = append(exprs, t.Args...)
 	case *PgOptionsToTable:
 		if t.Arg != nil {
 			exprs = append(exprs, t.Arg)

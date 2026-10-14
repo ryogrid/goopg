@@ -2444,7 +2444,7 @@ func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string,
 	}
 	switch strings.ToLower(tf.Name) {
 	case "pg_input_error_info", "parse_ident", "pg_get_publication_tables",
-		"pg_available_wal_summaries", "pg_get_catalog_foreign_keys", "pg_get_sequence_data",
+		"pg_available_wal_summaries", "pg_wal_summary_contents", "pg_get_catalog_foreign_keys", "pg_get_sequence_data",
 		"pg_sequence_parameters", "ts_token_type", "verify_heapam", "pg_partition_tree",
 		"pg_partition_ancestors", "pg_options_to_table", "unnest", "regexp_matches",
 		"regexp_split_to_table", "generate_subscripts":
@@ -2536,6 +2536,40 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 		// with pg_catalog.pg_sequence. DU-002 slice 32 (M0110-0001).
 		names := []string{"last_value", "is_called"}
 		types := []string{"int8", "bool"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_available_wal_summaries":
+		// pg_available_wal_summaries() → (tli int8, start_lsn pg_lsn, end_lsn
+		// pg_lsn). Mirrors planPgAvailableWalSummaries; without this arm a
+		// reference to one of its columns (ORDER BY start_lsn) failed with 42703.
+		// M0122-0009 S4a.
+		names := []string{"tli", "start_lsn", "end_lsn"}
+		types := []string{"int8", "pg_lsn", "pg_lsn"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_wal_summary_contents":
+		// pg_wal_summary_contents(tli, start_lsn, end_lsn) → (relfilenode oid,
+		// reltablespace oid, reldatabase oid, relforknumber int2,
+		// relblocknumber int8, is_limit_block bool). Mirrors
+		// planPgWalSummaryContents. M0122-0009 S4a.
+		names := []string{"relfilenode", "reltablespace", "reldatabase", "relforknumber", "relblocknumber", "is_limit_block"}
+		types := []string{"oid", "oid", "oid", "int2", "int8", "bool"}
 		for i := range names {
 			if i < len(colAliases) && colAliases[i] != "" {
 				names[i] = colAliases[i]

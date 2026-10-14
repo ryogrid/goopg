@@ -273,7 +273,7 @@ func relConsiderParallel(leaf Node, tbl *catalog.Table, cat catalog.Catalog) boo
 		if !isParallelSafeExpr(x.Func, cat) {
 			return false
 		}
-	case *PgInputErrorInfo, *PgGetPublicationTables, *PgGetSequenceData,
+	case *PgInputErrorInfo, *PgGetPublicationTables, *PgGetSequenceData, *PgWalSummaryContents,
 		*PgSequenceParameters, *PgAvailableWalSummaries, *PgGetCatalogForeignKeys,
 		*PgPartitionTree, *PgOptionsToTable:
 		// Catalog SRFs backed by the same leader-only callbacks a worker

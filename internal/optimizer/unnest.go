@@ -1344,6 +1344,10 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, a := range n.Args {
 			walkExprTree(a, visit)
 		}
+	case *PgWalSummaryContents:
+		for _, a := range n.Args {
+			walkExprTree(a, visit)
+		}
 	case *PgOptionsToTable:
 		if n.Arg != nil {
 			walkExprTree(n.Arg, visit)

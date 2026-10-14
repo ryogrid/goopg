@@ -2554,6 +2554,22 @@ func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
+// PgWalSummaryContents implements pg_wal_summary_contents(tli int8, start_lsn
+// pg_lsn, end_lsn pg_lsn) as a FROM-clause SRF: one row per modified block of
+// the named WAL summary file, plus one is_limit_block row per relation fork
+// with a limit block (walsummaryfuncs.c). Args may be correlated against a
+// FROM sibling (`FROM pg_available_wal_summaries() s,
+// pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn)`), bound per outer
+// row like PgGetSequenceData. M0122-0009 S4a.
+type PgWalSummaryContents struct {
+	pos    int
+	Args   []Expr
+	schema Schema
+}
+
+func (n *PgWalSummaryContents) Pos() int       { return n.pos }
+func (n *PgWalSummaryContents) Output() Schema { return n.schema }
+
 // PgGetSequenceData implements pg_get_sequence_data(regclass) as a FROM-clause
 // SRF. pg_dump's getSequences comma-joins it with pg_catalog.pg_sequence
 // (`FROM pg_sequence, pg_get_sequence_data(seqrelid)`) to read each sequence's
@@ -2611,8 +2627,8 @@ func (n *TSTokenType) Output() Schema { return n.schema }
 
 // PgAvailableWalSummaries implements pg_available_wal_summaries() as a
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
-// for each available WAL summary file. goopg v0 has no WAL summarizer
-// (summarize_wal is always off), so this always returns 0 rows. M0095-0002.
+// for each WAL summary file under pg_wal/summaries (GetWalSummaries).
+// M0095-0002; real since M0122-0009 S4a.
 type PgAvailableWalSummaries struct {
 	pos    int
 	schema Schema

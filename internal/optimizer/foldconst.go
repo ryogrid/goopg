@@ -275,6 +275,10 @@ func foldPlanConstantsInner(node Node) {
 		for i := range n.Args {
 			n.Args[i] = FoldConstants(n.Args[i])
 		}
+	case *PgWalSummaryContents:
+		for i := range n.Args {
+			n.Args[i] = FoldConstants(n.Args[i])
+		}
 	case *PgOptionsToTable:
 		if n.Arg != nil {
 			n.Arg = FoldConstants(n.Arg)
