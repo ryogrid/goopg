@@ -210,10 +210,12 @@ func TestParseSplitLeftBlockDataRejectsMalformed(t *testing.T) {
 
 // TestRealTreeSplitsAreDescribable is the premise test. S11.5b deferred the
 // incremental form because goopg's split "is not upstream's"; this drives a real
-// tree through hundreds of splits and requires that every one of them EXCEPT the
-// root splits (where upstream's redo drops BTP_ROOT and goopg's runtime does not)
-// both describes and reproduces. Without it the encoder could silently fall back
-// to an image on every split and every other test here would still pass.
+// tree through hundreds of splits and requires that every one of them both
+// describes and reproduces. Root splits included: since M0122-0010 the split
+// drops BTP_ROOT from its left half as _bt_split does, so upstream's redo,
+// which also drops it, reproduces the page. Without this test the encoder could
+// silently fall back to an image on every split and every other test here
+// would still pass.
 func TestRealTreeSplitsAreDescribable(t *testing.T) {
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
 	defer mgr.Close()
@@ -237,17 +239,13 @@ func TestRealTreeSplitsAreDescribable(t *testing.T) {
 			t.Fatalf("split %d (root=%v level=%d) is not describable: %v", splits, isRoot, level, derr)
 		}
 		cerr := CheckSplitLeft(prePage, leftPage, level, rightBlk, d)
-		switch {
-		case isRoot:
+		if isRoot {
 			rootSplits++
-			if cerr == nil {
-				t.Errorf("split %d of a ROOT page reproduced the primary's page; upstream's redo drops BTP_ROOT", splits)
-			}
-		case cerr != nil:
-			t.Fatalf("split %d (level %d, blk %d) does not reproduce the left half: %v", splits, level, leftBlk, cerr)
-		default:
-			described++
 		}
+		if cerr != nil {
+			t.Fatalf("split %d (root=%v level %d, blk %d) does not reproduce the left half: %v", splits, isRoot, level, leftBlk, cerr)
+		}
+		described++
 		return storage.LSN(2000 + splits), nil
 	}
 
@@ -265,10 +263,10 @@ func TestRealTreeSplitsAreDescribable(t *testing.T) {
 	if splits < 20 {
 		t.Fatalf("only %d splits — the tree did not exercise the path", splits)
 	}
-	if described < splits-rootSplits {
-		t.Fatalf("%d/%d non-root splits reproduced the left half", described, splits-rootSplits)
+	if described < splits {
+		t.Fatalf("%d/%d splits reproduced the left half", described, splits)
 	}
 	if rootSplits == 0 {
-		t.Log("no root split observed (the fallback arm was not exercised here)")
+		t.Fatal("no root split observed: the root arm was not exercised")
 	}
 }

@@ -5545,6 +5545,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\.
     - Next: gap 6 \(atomic root split: hold left, right, new root and metapage together; remove the `createNewRoot`
       fallback into `parentPath\[0\]`\), then gap 5 \(finish incomplete splits on contact\)\.
+  - **2026\-10\-14 lock\-coupling slice 4 landed** \(gap 6\)\.
+    - The split drops BTRoot from its left half \(as `\_bt\_split`\); both halves stay latched while `newRootLocked`
+      writes the new root, the metapage and the left\'s flag clear in one `XLOG\_BTREE\_NEWROOT` record\.
+    - Unshared reproducer 3/15 → **0/15**; shared 0/20; `\-race` clean; `pg\_waldump` decodes 2 NEWROOT / 908 SPLIT /
+      874 INSERT\_UPPER; kill \-9 \+ recovery → index = heap\.
+    - `TestRealTreeSplitsAreDescribable` now requires root splits to reproduce too \(it pinned the old divergence\)\.
+    - Gates: nbtree \+ xlog \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: gap 7 \(vacuum: `\_bt\_leftsib\_splitflag`; recycle safety\), then gap 8 \(remove `lockStructural` — the
+      split side no longer needs it; vacuum unlink still does\)\. Gap 5 now only matters after a crash\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

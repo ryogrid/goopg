@@ -3068,6 +3068,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	resetPageItems(slot.Page())
 	op.Next = rightBlk
+	// A split root is no longer the root: its left half drops BTRoot inside
+	// the split, as _bt_split does (lopaque->btpo_flags &= ~BTP_ROOT), and the
+	// new root is published by createNewRoot while both halves stay latched.
+	wasRoot := op.IsRoot()
+	op.Flags &^= BTRoot
 	// M0055-0004-followup-finish-split: mark the LEFT page as
 	// incomplete-split before releasing latches. Cleared after
 	// the parent downlink insert succeeds. Crash-replay leaves
@@ -3235,23 +3240,18 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// boundary the level below no longer draws.
 	sepItem := downlinkItem(append([]byte(nil), sepKey...), rightBlk)
 
+	// If we just split the root, lift a new root (_bt_newroot) while both
+	// halves stay latched: nobody can split either half, or find the level
+	// above them missing, before the metapage names the new root.
+	if wasRoot {
+		err := bt.createNewRoot(held.take(), blk, rightBlk, sepItem.key, op.Level+1)
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		return err
+	}
+
 	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)
-
-	// If we just split the root, lift a new root.
-	if op.IsRoot() {
-		held.release()
-		// Strip BTRoot off the now-non-root left page.
-		if err := bt.clearRootFlag(blk); err != nil {
-			return err
-		}
-		if err := bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1); err != nil {
-			return err
-		}
-		// Parent (the new root) now references the left half;
-		// clear the INCOMPLETE_SPLIT marker. (M0055-0004-followup.)
-		return bt.clearIncompleteSplit(blk)
-	}
 
 	// Otherwise, insert the separator into the parent, re-found by the
 	// downlink to blk rather than trusted from the descent's path
@@ -3532,7 +3532,7 @@ func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
 	if len(path) == 0 {
 		// blk is the root — parent insert means a new root lift.
 		// Should have happened atomically; if not, redo it.
-		return bt.createNewRoot(blk, rightBlk, sepKey, op.Level+1)
+		return bt.createNewRoot(nil, blk, rightBlk, sepKey, op.Level+1)
 	}
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
@@ -3565,7 +3565,19 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 // index's key format nor its comparison semantics. See
 // docs/design/0002-0003-redo-records.md.)
 
-func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+//
+// leftSlot, when non-nil, is the old root's left half, still latched by the
+// split that just divided it (its right half is latched by the caller too):
+// the new root, the metapage and the left half's INCOMPLETE_SPLIT are then
+// changed in one critical section and one XLOG_BTREE_NEWROOT record, as
+// _bt_newroot does, and leftSlot is released on return. With leftSlot nil
+// (finishSplit, which holds nothing) the metapage is re-read first and a root
+// another writer already lifted is inserted into instead.
+func (bt *BTree) createNewRoot(leftSlot *storage.Slot, leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+	if leftSlot != nil {
+		defer bt.unpinW(leftSlot)
+		return bt.newRootLocked(leftSlot, leftBlk, rightBlk, rightKey, level)
+	}
 	// M0055-0004-followup-stage2-splitmu-removal (race-safe
 	// new-root publication): the caller is expected to hold
 	// `splitMu`, but a future Stage-2 design that lifts splitMu
@@ -3594,7 +3606,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 			// Defensive: meta.Root != leftBlk but parentPath is
 			// empty — meta moved again. Recurse to pick up the
 			// latest state.
-			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
+			return bt.createNewRoot(nil, leftBlk, rightBlk, rightKey, level)
 		}
 		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem, leftBlk, nil)
 	}
@@ -3664,6 +3676,71 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	bt.pool.Unpin(rootSlot)
 
 	return bt.updateRootMeta(rootBlk, level)
+}
+
+// newRootLocked is _bt_newroot for a root split whose halves are latched:
+// a new root page with downlinks to leftBlk and rightBlk, the metapage pointed
+// at it, and leftSlot's INCOMPLETE_SPLIT cleared, all under one
+// XLOG_BTREE_NEWROOT record (block 0 the root, block 1 the left half, block 2
+// the metapage). The left half is registered without an image, so it still
+// owes its first-touch full-page image (MarkDirtyCoveredByRecordLocked).
+func (bt *BTree) newRootLocked(leftSlot *storage.Slot, leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+	meta, err := bt.readMeta()
+	if err != nil {
+		return err
+	}
+	if meta.Root != leftBlk {
+		return fmt.Errorf("btree: index %d: metapage root is %d, not the split root %d", bt.rel.RelOid, meta.Root, leftBlk)
+	}
+	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)
+	if err != nil {
+		return err
+	}
+	rootSlot.Lock()
+	defer func() {
+		rootSlot.Unlock()
+		bt.pool.Unpin(rootSlot)
+	}()
+	initPage(rootSlot.Page(), BTPageOpaque{
+		Prev:  storage.InvalidBlockNumber,
+		Next:  storage.InvalidBlockNumber,
+		Level: level,
+		Flags: BTRoot,
+	})
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), downlinkItem(nil, leftBlk))
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), downlinkItem(append([]byte(nil), rightKey...), rightBlk))
+
+	leftOp := readOpaque(leftSlot.Page())
+	leftOp.Flags &^= BTIncompleteSplit | BTRoot
+	writeOpaque(leftSlot.Page(), leftOp)
+
+	emitter := bt.pool.LogBtreeNewRoot()
+	if emitter == nil {
+		if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
+			return err
+		}
+		bt.pool.MarkDirty(leftSlot)
+		return bt.updateRootMeta(rootBlk, level)
+	}
+	metaSlot, err := bt.pinW(MetaBlock)
+	if err != nil {
+		return err
+	}
+	defer bt.unpinW(metaSlot)
+	m := ReadPGMetaPage(metaSlot.Page())
+	m.Root = rootBlk
+	m.Level = level
+	m.FastRoot = rootBlk
+	m.FastLevel = level
+	WritePGMetaPage(metaSlot.Page(), m)
+	lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), leftBlk, MetaBlock, metaSlot.Page())
+	if err != nil {
+		return err
+	}
+	bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+	bt.pool.MarkDirtyWithLSNLocked(metaSlot, lsn)
+	bt.pool.MarkDirtyCoveredByRecordLocked(leftSlot, lsn)
+	return nil
 }
 
 // itemEncodedSize / pageHasSpaceFor moved onto indexFormat in M0130-S11.4

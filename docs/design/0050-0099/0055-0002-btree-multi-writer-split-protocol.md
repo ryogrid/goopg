@@ -128,9 +128,8 @@ order:
 5. **\(M\)** Finish incomplete splits on contact \(`\_bt\_moveright` for update,
    `\_bt\_stepright`, `\_bt\_getstackbuf`\). `finishSplit` exists but has no
    production caller. This needs gap 4 first.
-6. **\(M\)** Atomic root split: hold left, right, the new root and the metapage
-   together. Fix `createNewRoot`'s fallback, which inserts into `parentPath\[0\]`
-   \(the root\) whatever the level.
+6. **\(M, landed\)** Atomic root split: hold left, right, the new root and the
+   metapage together \(slice 4 below\).
 7. **\(M\)** Vacuum: refuse to delete a page whose left sibling is flagged
    \(`\_bt\_leftsib\_splitflag`\), and check that recycling is safe for pages a
    stale path can still name.
@@ -207,6 +206,35 @@ Unshared reproducer: 3/15 failures, down from 13/15 \(5/15 after slice 1\):
 A concurrent root lift needs two splitters of one index at once, which the
 shared structural lock rules out. Shared: 0/20, and the package passes under
 `\-race`.
+
+**Slice 4 \(gap 6\).** A root split now behaves as `\_bt\_split` \+ `\_bt\_newroot`:
+
+- The split drops `BTRoot` from its left half inside the split record
+  \(`lopaque\->btpo\_flags &= ~BTP\_ROOT`\). Upstream's split redo also drops it,
+  so a root split's left half is now logged incrementally like any other split.
+  `TestRealTreeSplitsAreDescribable` used to expect the opposite and now
+  requires root splits to reproduce too.
+- Both halves stay latched while `newRootLocked`:
+  - builds the new root;
+  - points the metapage at it;
+  - clears the left half's `INCOMPLETE\_SPLIT`;
+  - logs everything in one `XLOG\_BTREE\_NEWROOT` record \(block 0 the root,
+    block 1 the left half, block 2 the metapage\).
+- That replaces three separate critical sections: release, `clearRootFlag`
+  with a page record, then `createNewRoot`, then `clearIncompleteSplit`.
+- The metapage re\-read fallback \(insert into `parentPath\[0\]`, parent latched
+  before child\) remains only for `finishSplit`, which holds no latch.
+
+Unshared reproducer: **0/15** failures, down from 3/15. The "no level 1" error
+and both deadlocks are gone. Shared: 0/20, and the package passes under `\-race`.
+Live check: `pg\_waldump` decodes 2 `NEWROOT`, 908 `SPLIT\_L/R` and 874
+`INSERT\_UPPER` records from a 30 000\-row randomised build. After `kill \-9`
+and recovery from a redo point before the build, the index agrees with the heap
+\(30 000 = 30 000, and 310 point lookups all found\).
+
+With the lock removed, splits no longer fail, but `lockStructural` still guards
+vacuum's page unlink \(gap 7\). Gap 5 now matters only for incomplete splits
+left by a crash: no writer sees another writer's half split any more.
 
 ## 5. Tests
 
