@@ -130,9 +130,9 @@ order:
    production caller. This needs gap 4 first.
 6. **\(M, landed\)** Atomic root split: hold left, right, the new root and the
    metapage together \(slice 4 below\).
-7. **\(M\)** Vacuum: refuse to delete a page whose left sibling is flagged
-   \(`\_bt\_leftsib\_splitflag`\), and check that recycling is safe for pages a
-   stale path can still name.
+7. **\(M, landed\)** Vacuum: refuse to delete either half of an incomplete
+   split \(`\_bt\_leftsib\_splitflag`\), and latch the parent last \(slice 5
+   below\). Recycling pages a stale path can name: open.
 8. **\(L\)** Remove `lockStructural`; stress under `\-race`.
 
 **Slice 1 \(gaps 1–2\).** `getStackBuf` / `leftmostAtLevel` replace the blind
@@ -235,6 +235,27 @@ and recovery from a redo point before the build, the index agrees with the heap
 With the lock removed, splits no longer fail, but `lockStructural` still guards
 vacuum's page unlink \(gap 7\). Gap 5 now matters only for incomplete splits
 left by a crash: no writer sees another writer's half split any more.
+
+**Slice 5 \(gap 7\).** Page deletion in vacuum:
+
+- **Refusals \(`\_bt\_pagedel`\).** A page is not deleted when it is either half
+  of an incomplete split:
+  - it carries `BTIncompleteSplit` itself \(left half\);
+  - or its left sibling carries it and still points at the page \(right half,
+    `\_bt\_leftsib\_splitflag`\).
+
+  The WAL path reads both off its latched pages; the FPI fallback reads them with
+  one shared latch at a time, left to right. The page stays empty\-but\-live, as
+  for the other refusals.
+- **Latch order.** `acquireUnlinkPins` latches left, target and right, validates
+  the links, and only then latches the parent. Before, it latched the parent
+  first, the reverse of the split's order since slice 3. The global order is now
+  lower level before upper, and left to right within a level, for both splits and
+  deletion. Under the structural lock the parent cannot move in between.
+
+`TestVacuumRefusesIncompleteSplitHalves` covers the WAL and FPI paths with the
+flag set and not set; with the refusals disabled the flagged cases fail.
+Reproducer: shared 0/20, unshared 0/10. The vacuum and DDL isolation ports pass.
 
 ## 5. Tests
 

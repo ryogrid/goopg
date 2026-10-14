@@ -329,8 +329,12 @@ func (u *unlinkPins) release(bt *BTree) {
 
 // acquireUnlinkPins implements the acquisition half of upstream's
 // page-deletion protocol (`_bt_unlink_halfdead_page`, nbtpage.c): resolve the
-// nearest LIVE neighbours of `target`, latch parent → left → target → right,
-// then re-validate the links UNDER those latches. If anything moved, drop the
+// nearest LIVE neighbours of `target`, latch left → target → right, then
+// re-validate the links UNDER those latches, and only then latch the parent.
+// Same-level pages left to right, then the level above: the order a split
+// uses (child before parent, M0122-0010), so the two can never latch in
+// opposite orders. The parent is latched last, as _bt_lock_subtree_parent
+// does after the leaf. If anything moved, drop the
 // sibling latches and recompute — a split that spliced a live page next to
 // our left neighbour simply makes the next attempt pick that page as the new
 // left neighbour, which is the same self-correction the old re-derive-under-
@@ -343,13 +347,6 @@ func (bt *BTree) acquireUnlinkPins(target, parentBlk storage.BlockNumber, hasPar
 	pins := &unlinkPins{
 		leftBlk:  storage.InvalidBlockNumber,
 		rightBlk: storage.InvalidBlockNumber,
-	}
-	if hasParent {
-		s, err := bt.pinW(parentBlk)
-		if err != nil {
-			return nil, err
-		}
-		pins.parent = s
 	}
 	for attempt := 0; attempt < unlinkPinAttempts; attempt++ {
 		// Snapshot the target's own links unlatched, then walk outward
@@ -419,12 +416,59 @@ func (bt *BTree) acquireUnlinkPins(target, parentBlk storage.BlockNumber, hasPar
 			stable = readOpaque(pins.right.Page()).Prev == rightAdj
 		}
 		if stable {
+			if hasParent {
+				if pins.parent, err = bt.pinW(parentBlk); err != nil {
+					pins.release(bt)
+					return nil, err
+				}
+			}
 			return pins, nil
 		}
 		pins.releaseSiblings(bt)
 	}
 	pins.release(bt)
 	return nil, errUnlinkChainUnstable
+}
+
+// incompleteSplitBlocksDeletion reports whether target is either half of an
+// incomplete split, read off latched pages: the left half carries
+// BTIncompleteSplit itself; the right half is named by a left sibling that
+// carries it and still points at target (_bt_leftsib_splitflag). left may be
+// nil (leftmost page).
+func incompleteSplitBlocksDeletion(target, left *storage.Slot, targetBlk storage.BlockNumber) bool {
+	if readOpaque(target.Page()).Flags&BTIncompleteSplit != 0 {
+		return true
+	}
+	if left == nil {
+		return false
+	}
+	lop := readOpaque(left.Page())
+	return lop.Next == targetBlk && lop.Flags&BTIncompleteSplit != 0
+}
+
+// incompleteSplitBlocksDeletionUnlatched is incompleteSplitBlocksDeletion for
+// the FPI fallback, which latches nothing across its checks: target and its
+// btpo_prev are read one shared latch at a time, left to right.
+func (bt *BTree) incompleteSplitBlocksDeletionUnlatched(targetBlk storage.BlockNumber) (bool, error) {
+	ts, err := bt.pinR(targetBlk)
+	if err != nil {
+		return false, err
+	}
+	op := readOpaque(ts.Page())
+	bt.unpinR(ts)
+	if op.Flags&BTIncompleteSplit != 0 {
+		return true, nil
+	}
+	if op.Prev == storage.InvalidBlockNumber {
+		return false, nil
+	}
+	ls, err := bt.pinR(op.Prev)
+	if err != nil {
+		return false, err
+	}
+	lop := readOpaque(ls.Page())
+	bt.unpinR(ls)
+	return lop.Next == targetBlk && lop.Flags&BTIncompleteSplit != 0, nil
 }
 
 // unlinkEmptyLeaf updates sibling Prev/Next pointers to bypass the empty
@@ -541,6 +585,11 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 				return bt.abandonHalfDeadLeaf(leaf.blk)
 			}
 		}
+		if blocked, berr := bt.incompleteSplitBlocksDeletionUnlatched(leaf.blk); berr != nil {
+			return berr
+		} else if blocked {
+			return bt.abandonHalfDeadLeaf(leaf.blk)
+		}
 		return bt.unlinkEmptyLeafFPI(leaf)
 	}
 
@@ -593,6 +642,15 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	//
 	// Refusing leaves the page empty-but-live, exactly as the rightmost-child
 	// refusal does.
+	// _bt_pagedel never deletes either half of an incomplete split: the left
+	// half (flag on the target) has a right sibling with no downlink yet, and
+	// the right half (flag on a left sibling that still points at the target,
+	// _bt_leftsib_splitflag) has no downlink of its own. Both are left
+	// empty-but-live for a later pass, once the split is finished.
+	if incompleteSplitBlocksDeletion(pins.target, pins.left, leaf.blk) {
+		pins.release(bt)
+		return bt.abandonHalfDeadLeaf(leaf.blk)
+	}
 	var poffset uint16
 	if pins.parent != nil {
 		off, isRightmost, found, ferr := PGFindDownlinkOffset(pins.parent.Page(), leaf.blk)

@@ -5555,6 +5555,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\.
     - Next: gap 7 \(vacuum: `\_bt\_leftsib\_splitflag`; recycle safety\), then gap 8 \(remove `lockStructural` — the
       split side no longer needs it; vacuum unlink still does\)\. Gap 5 now only matters after a crash\.
+  - **2026\-10\-15 lock\-coupling slice 5 landed** \(gap 7\)\.
+    - Vacuum refuses to delete either half of an incomplete split \(`\_bt\_pagedel` / `\_bt\_leftsib\_splitflag`\), on the
+      WAL path and the FPI fallback\.
+    - `acquireUnlinkPins` latches left → target → right, then the parent \(was parent first\): one global order,
+      lower level before upper, left to right, shared with splits\.
+    - Tests: `TestVacuumRefusesIncompleteSplitHalves` \(negative control fails\); reproducer shared 0/20, unshared 0/10;
+      vacuum/DDL isolation ports pass\.
+    - Gates: nbtree \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: gap 8 — write a vacuum\-concurrent\-with\-splits stress test, then remove `lockStructural` \(the parent
+      found by `resolveParentDownlink` may then move right before it is latched: re\-find it like `getStackBuf`\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
