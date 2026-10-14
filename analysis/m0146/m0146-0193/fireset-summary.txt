@@ -1,0 +1,15 @@
+PLAN-PARITY: queries=99 match=79 shapediff=20 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=17 join-method=8 scan-type=6 parameterisation=10 aggregation-strategy=2 sort-strategy=7 parallelism=7 qual-placement=3 rendering=1
+PLAN-PARITY: queries=99 match=80 shapediff=19 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=16 join-method=8 scan-type=6 parameterisation=10 aggregation-strategy=1 sort-strategy=6 parallelism=6 qual-placement=3 rendering=1
+FIRE-SET-TIMEOUTS: fires=Q33 Q64 introduced=none unchanged=none missing=none
+PLAN-PARITY: queries=99 match=65 shapediff=34 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=29 join-method=12 scan-type=19 parameterisation=12 aggregation-strategy=9 sort-strategy=16 parallelism=17 qual-placement=4 rendering=2
+PLAN-PARITY: queries=99 match=65 shapediff=34 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=29 join-method=13 scan-type=19 parameterisation=13 aggregation-strategy=9 sort-strategy=16 parallelism=17 qual-placement=4 rendering=2
+FIRE-SET-TIMEOUTS: fires=Q77 introduced=none unchanged=none missing=none
+
+tpcds-sf025 baseline: Q33 SHAPE-DIFF [join-order,aggregation-strategy,sort-strategy,parallelism]; Q64 SHAPE-DIFF [join-order,scan-type,qual-placement]; Q77 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism]; 
+tpcds-sf025 candidate: Q33 MATCH []; Q64 SHAPE-DIFF [join-order,scan-type,qual-placement]; Q77 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism]; 
+tpcds-sf1 baseline: Q33 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism]; Q64 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism,qual-placement]; Q77 SHAPE-DIFF [join-order,scan-type,sort-strategy,parallelism]; 
+tpcds-sf1 candidate: Q33 SHAPE-DIFF [join-order,parameterisation,aggregation-strategy,sort-strategy,parallelism]; Q64 SHAPE-DIFF [join-order,scan-type,parameterisation,sort-strategy,parallelism,qual-placement]; Q77 SHAPE-DIFF [join-order,join-method,scan-type,parameterisation,sort-strategy,parallelism]; 

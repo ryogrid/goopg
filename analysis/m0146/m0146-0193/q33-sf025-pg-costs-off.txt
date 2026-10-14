@@ -1,0 +1,87 @@
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (sum((sum(store_sales.ss_ext_sales_price))))
+         ->  GroupAggregate
+               Group Key: item.i_manufact_id
+               ->  Merge Append
+                     Sort Key: item.i_manufact_id
+                     ->  GroupAggregate
+                           Group Key: item.i_manufact_id
+                           ->  Sort
+                                 Sort Key: item.i_manufact_id
+                                 ->  Hash Join
+                                       Hash Cond: (item.i_manufact_id = item_1.i_manufact_id)
+                                       ->  Gather
+                                             Workers Planned: 3
+                                             ->  Nested Loop
+                                                   ->  Nested Loop
+                                                         ->  Parallel Hash Join
+                                                               Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales
+                                                               ->  Parallel Hash
+                                                                     ->  Parallel Seq Scan on date_dim
+                                                                           Filter: ((d_year = 2001) AND (d_moy = 3))
+                                                         ->  Index Scan using customer_address_pkey on customer_address
+                                                               Index Cond: (ca_address_sk = store_sales.ss_addr_sk)
+                                                               Filter: (ca_gmt_offset = '-5'::numeric)
+                                                   ->  Index Scan using item_pkey on item
+                                                         Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                                       ->  Hash
+                                             ->  HashAggregate
+                                                   Group Key: item_1.i_manufact_id
+                                                   ->  Seq Scan on item item_1
+                                                         Filter: (i_category = 'Books'::bpchar)
+                     ->  GroupAggregate
+                           Group Key: item_2.i_manufact_id
+                           ->  Sort
+                                 Sort Key: item_2.i_manufact_id
+                                 ->  Hash Join
+                                       Hash Cond: (item_2.i_manufact_id = item_3.i_manufact_id)
+                                       ->  Gather
+                                             Workers Planned: 3
+                                             ->  Nested Loop
+                                                   ->  Nested Loop
+                                                         ->  Parallel Hash Join
+                                                               Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_1.d_date_sk)
+                                                               ->  Parallel Seq Scan on catalog_sales
+                                                               ->  Parallel Hash
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_1
+                                                                           Filter: ((d_year = 2001) AND (d_moy = 3))
+                                                         ->  Index Scan using customer_address_pkey on customer_address customer_address_1
+                                                               Index Cond: (ca_address_sk = catalog_sales.cs_bill_addr_sk)
+                                                               Filter: (ca_gmt_offset = '-5'::numeric)
+                                                   ->  Index Scan using item_pkey on item item_2
+                                                         Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                       ->  Hash
+                                             ->  HashAggregate
+                                                   Group Key: item_3.i_manufact_id
+                                                   ->  Seq Scan on item item_3
+                                                         Filter: (i_category = 'Books'::bpchar)
+                     ->  GroupAggregate
+                           Group Key: item_4.i_manufact_id
+                           ->  Gather Merge
+                                 Workers Planned: 2
+                                 ->  Sort
+                                       Sort Key: item_4.i_manufact_id
+                                       ->  Parallel Hash Semi Join
+                                             Hash Cond: (item_4.i_manufact_id = item_5.i_manufact_id)
+                                             ->  Nested Loop
+                                                   ->  Nested Loop
+                                                         ->  Parallel Hash Join
+                                                               Hash Cond: (web_sales.ws_sold_date_sk = date_dim_2.d_date_sk)
+                                                               ->  Parallel Seq Scan on web_sales
+                                                               ->  Parallel Hash
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_2
+                                                                           Filter: ((d_year = 2001) AND (d_moy = 3))
+                                                         ->  Index Scan using customer_address_pkey on customer_address customer_address_2
+                                                               Index Cond: (ca_address_sk = web_sales.ws_bill_addr_sk)
+                                                               Filter: (ca_gmt_offset = '-5'::numeric)
+                                                   ->  Index Scan using item_pkey on item item_4
+                                                         Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                                             ->  Parallel Hash
+                                                   ->  Parallel Seq Scan on item item_5
+                                                         Filter: (i_category = 'Books'::bpchar)
+(83 rows)
+

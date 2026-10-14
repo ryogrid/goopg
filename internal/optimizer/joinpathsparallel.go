@@ -391,18 +391,10 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 // chosen PATHS: the partial outer and the complete inner. It mirrors
 // tryMergeJoinPath line for line, with three deliberate differences:
 //
-//   - outersortkeys/innersortkeys that are NOT already delivered DECLINE
-//     instead of sorting. A per-worker sort is correct but unmodelled:
-//     `partialPathDrivingKind` has no PathSort arm and `drivingScan` has no
-//     *Sort arm, so a filed sort-under-partial would be priced and then
-//     refused at the Gather — or worse, admitted and mis-executed. The
-//     inner side is the exception it looks like: it is read whole by every
-//     worker, never partitioned, so sorting it needs no driving — but the
-//     same call must stay symmetrical with the serial twin to keep the two
-//     from disagreeing about anything but the parallel terms, and PG offers
-//     the no-sort shape first anyway (unsorted-outer site). Both sides
-//     decline-on-sort here; widening the inner is a follow-up the A/B can
-//     motivate, not a guess.
+//   - outersortkeys/innersortkeys that are not already delivered are
+//     sorted explicitly, as in the serial twin. The outer Sort runs per
+//     worker over its partition (M0146-0193; it used to decline here,
+//     before the partial-Sort arms of the path and node walks existed).
 //   - the row estimate is the per-worker one: `clamp_row_est` over the
 //     divisor (`final_cost_mergejoin`'s "For partial paths, scale row
 //     estimate", costsize.c:3875-3881), and the merge-tuple and residual
@@ -429,14 +421,37 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M6", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return
 	}
-	// No-sort gate (see above): the ordering must already be delivered.
-	if len(outerSortKeys) > 0 && !pathkeysContainedIn(o.Pathkeys, outerSortKeys) {
-		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M7", "osort="+strconv.Itoa(len(outerSortKeys))+" jt="+traceJoinTypeName(jt))
+	// PG calls try_partial_mergejoin_path only for the jointypes a
+	// partitioned outer can drive: never FULL or RIGHT, whose unmatched
+	// inner rows need every worker's verdict (sort_inner_and_outer /
+	// match_unsorted_outer, joinpath.c). The executor's twin is
+	// mergeJoinIsPartialCapable, and createPlan asserts it
+	// (assertPartialMergeJoinIsRunnable).
+	if !partialMergeJointype(jt) {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M6j", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	if len(innerSortKeys) > 0 && !pathkeysContainedIn(i.Pathkeys, innerSortKeys) {
-		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M8", "isort="+strconv.Itoa(len(innerSortKeys))+" jt="+traceJoinTypeName(jt))
-		return
+	// M0146-0193: the explicit sorts create_mergejoin_plan adds for
+	// outersortkeys / innersortkeys, as the serial twin (tryMergeJoinPath)
+	// builds them. The outer Sort runs per worker over its own partition:
+	// cost_sort on the partial path's per-worker rows, and the Sort keeps
+	// the partial path's worker count, as workerSortGatherMergePath's does.
+	// The node walks already see through a Sort on the spine (drivingScan,
+	// R56), and partialPathDrivingKind's PathSort arm (M0146-0027) descends
+	// it. The inner is
+	// read whole by every worker, so its Sort is an ordinary one. PG's
+	// sort_inner_and_outer partial arm builds exactly this (joinpath.c),
+	// and TPC-DS Q33's semi joins need it: a partial merge join with an
+	// explicitly sorted outer is what fuzz-dominates the Parallel Hash
+	// Semi Join in add_partial_path.
+	if len(outerSortKeys) > 0 && !pathkeysContainedInRel(o.Rel, o.Pathkeys, outerSortKeys) {
+		so := sortPathFor(o, outerSortKeys, cp)
+		so.ParallelSafe = o.ParallelSafe
+		so.ParallelWorkers = o.ParallelWorkers
+		o = so
+	}
+	if len(innerSortKeys) > 0 && !pathkeysContainedInRel(i.Rel, i.Pathkeys, innerSortKeys) {
+		i = sortPathFor(i, innerSortKeys, cp)
 	}
 	// `calc_non_nestloop_required_outer` (joinpath.c:1071), stricter than
 	// the serial twin: the hash twin refuses any nonzero requirement
@@ -635,4 +650,14 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 		ParallelHash:    true,
 	}, "join.hash.partial.parallelhash")
 	veto("PH-filed")
+}
+
+// partialMergeJointype is the jointype set a partial merge join may carry:
+// the ones mergeJoinIsPartialCapable admits at the node level (M0146-0193).
+func partialMergeJointype(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti:
+		return true
+	}
+	return false
 }

@@ -33019,7 +33019,7 @@ Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a stati
     - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
       \(select\_parallel, subselect, aggregates, write\_parallel\) identical\.
 Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-order 6 -> 5, parameterisation 3 -> 2, sort-strategy 2 -> 1, parallelism 3 -> 2
-- [ ] **M0146-0193 — PG's partial pathlist keeps a sorted partial Merge Join with a unique\-ified inner that fuzz\-dominates the Parallel Hash Semi Join goopg keeps (TPC-DS Q33)**
+- [x] **M0146-0193 — PG's partial pathlist keeps a sorted partial Merge Join with a unique\-ified inner that fuzz\-dominates the Parallel Hash Semi Join goopg keeps (TPC-DS Q33)**
   (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014c/`).
   Record: TPC-DS SF0.25 Q33, verdict SHAPE-DIFF \[join-order, aggregation-strategy, sort-strategy, parallelism\], first
   divergence `depth=5 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge`. The same record appears at
@@ -33039,3 +33039,15 @@ Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-o
     match\_unsorted\_outer over a partial outer with JOIN\_UNIQUE\_INNER, joinpath.c\)? Does `addToPartialPathlist`
     apply the fuzz\+pathkeys rule? Port the missing piece and drive Q33 to MATCH.
   - Expected movement: TPC-DS SF0.25 match \(Q33\) and CATEGORIES-EXCL-MATCH sort-strategy / parallelism.
+  - Done 2026\-10\-14 \(design `docs/design/0100-0149/m0146-0193-partial-merge-sorted-outer.md`, evidence
+    `analysis/m0146/m0146-0193/`\)\.
+    - Cause: `tryPartialMergeJoinPath` declined any partial merge join needing a sort \(vetoes M7/M8\); goopg filed no
+      `join.merge.partial` path at all for Q33\.
+    - Fix: build the explicit sorts as the serial twin does — a per\-worker outer Sort on the partial\'s per\-worker rows,
+      and an ordinary inner Sort; jointype gate `partialMergeJointype` \(INNER/LEFT/SEMI/ANTI\)\.
+    - SF0\.25 match 79 \-> 80 \(Q33\); SF1 65 \-> 65 \(Q77 record grew: join\-method, parameterisation\)\.
+    - Tests: `TestPartialMergeJoinSortsItsOuterPerWorker`, `TestPartialMergeJoinSite1SortsUnsortedOuterPerWorker`,
+      `TestPartialMergeJoinRefusesRightAndFull`; C\-19f hash\-join executor tests now turn merge off\.
+    - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
+      identical except a pre\-existing Hash Right Join row\-order flap in `join` \(HEAD flips too\)\.
+Movement: yes — TPC-DS SF0.25 match 79 -> 80 (Q33); CATEGORIES-EXCL-MATCH SF0.25 join-order 17 -> 16, aggregation-strategy 2 -> 1, sort-strategy 7 -> 6, parallelism 7 -> 6

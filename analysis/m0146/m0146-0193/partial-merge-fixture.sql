@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS pm_o, pm_i;
+CREATE TABLE pm_o (k int, v int);
+CREATE TABLE pm_i (k int, c int);
+INSERT INTO pm_o SELECT g % 5000, g FROM generate_series(1, 200000) g;
+INSERT INTO pm_i SELECT g, g % 3 FROM generate_series(1, 400) g;
+ANALYZE pm_o; ANALYZE pm_i;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET enable_gathermerge = off;
+EXPLAIN (COSTS OFF) SELECT pm_i.c, count(*), sum(pm_o.v) FROM pm_o JOIN pm_i ON pm_o.k = pm_i.k GROUP BY pm_i.c ORDER BY 1;
+SELECT pm_i.c, count(*), sum(pm_o.v) FROM pm_o JOIN pm_i ON pm_o.k = pm_i.k GROUP BY pm_i.c ORDER BY 1;
+DROP TABLE pm_o, pm_i;
