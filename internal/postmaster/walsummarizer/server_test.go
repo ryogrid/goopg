@@ -114,6 +114,30 @@ func TestServerSummarizesWAL(t *testing.T) {
 	exec("CHECKPOINT")
 	waitFiles(len(first) + 1)
 
+	// VACUUM sets visibility-map bits through native HeapVisible records,
+	// which carry no block reference; the summary still lists the VM page
+	// (fork 2), as PG's XLOG_HEAP2_VISIBLE block 0 would (design §4.4 item 2).
+	// The table is new, so whichever vacuum sets its bits (this one or
+	// autovacuum) runs while the summarizer is on. The row is polled for:
+	// the summary covering the VACUUM may be the second one written after
+	// the last wait, since re-enabling resumed at the off-period's redo.
+	exec("CREATE TABLE wv(a int)")
+	exec("INSERT INTO wv SELECT generate_series(1, 1000)")
+	exec("VACUUM wv")
+	exec("CHECKPOINT")
+	wv := exec("SELECT relfilenode FROM pg_class WHERE relname = 'wv'")[0][0]
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		vm := exec("SELECT count(*) FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn) c WHERE c.relfilenode = " + wv + " AND c.relforknumber = 2 AND c.relblocknumber = 0")
+		if vm[0][0] != "0" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no summary lists VM block 0 of wv after VACUUM; summaries %v", files())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	// A restart resumes from the files too.
 	if err := c.Restart(cluster.ShutdownFast); err != nil {
 		t.Fatal(err)

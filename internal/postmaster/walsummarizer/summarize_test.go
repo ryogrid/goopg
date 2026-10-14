@@ -139,6 +139,93 @@ func TestClassifierArms(t *testing.T) {
 	}
 }
 
+// TestNativeRecordArms: goopg-native records that modify a block without a
+// block reference (design §4.4 items 1-3) are written through the real WAL
+// writer, so they carry the (rmid, info) header goopg stamps on disk, and
+// read back; the summary marks what PG's block-ref'd equivalent would.
+func TestNativeRecordArms(t *testing.T) {
+	data := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data, walsummary.Dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	walDir := filepath.Join(data, "pg_wal")
+	w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, PageHeaders: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	heap := storage.RelFileNode{DBOid: 5, RelOid: 100}
+	shared := storage.RelFileNode{DBOid: 0, RelOid: 1262}
+	for _, payload := range [][]byte{
+		xlog.EncodeHeapLock(heap, 4, 2, 900, 1),
+		xlog.EncodeHeapVacuum(heap, 6, []uint16{1, 2}),
+		// A set marks the VM page and the heap page; a clear marks nothing.
+		xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: heap, HeapBlk: 32672 + 9, Flags: xlog.HeapVisibleSetAllVisible | xlog.HeapVisibleSetAllFrozen}),
+		xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: heap, HeapBlk: 11}),
+		xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: heap, HeapBlk: 12, Flags: xlog.HeapVisibleClearFrozenOnly}),
+		xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: shared, HeapBlk: 0, Flags: xlog.HeapVisibleSetAllVisible}),
+		xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: storage.RelFileNode{DBOid: 5, RelOid: 300}, Flags: xlog.HeapVisibleDropRelation}),
+	} {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	native, err := xlog.ReadAll(walDir, xlog.DefaultSegmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(native) != 7 {
+		t.Fatalf("read %d records, want 7", len(native))
+	}
+	for _, r := range native {
+		if r.XLog == nil || len(r.XLog.Blocks) != 0 {
+			t.Fatalf("native record at %X: XLog %v, want a header and no block refs", r.StartLSN, r.XLog)
+		}
+	}
+	end := native[len(native)-1].EndLSN + 0x100
+	recs := append(append([]xlog.Record{redo(0, 2)}, native...), redo(end, 2))
+	files, _, err := Summarize(data, 1, recs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files %v, want one", files)
+	}
+	got := fmt.Sprint(readSummary(t, data, files[0]))
+	const inv = blkreftable.InvalidBlockNumber
+	expect := fmt.Sprint([]entryWant{
+		{blkreftable.RelFileLocator{SpcOid: 1663, DbOid: 5, RelNumber: 100}, 0, inv, []uint32{4, 6, 32672 + 9}},
+		{blkreftable.RelFileLocator{SpcOid: 1663, DbOid: 5, RelNumber: 100}, 2, inv, []uint32{1}},
+		{blkreftable.RelFileLocator{SpcOid: 1663, DbOid: 5, RelNumber: 300}, 2, 0, nil},
+		{blkreftable.RelFileLocator{SpcOid: 1664, DbOid: 0, RelNumber: 1262}, 0, inv, []uint32{0}},
+		{blkreftable.RelFileLocator{SpcOid: 1664, DbOid: 0, RelNumber: 1262}, 2, inv, []uint32{0}},
+	})
+	if got != expect {
+		t.Errorf("summary entries\n got %s\nwant %s", got, expect)
+	}
+
+	// A real PG record of the same (rmid, info) has a block reference and is
+	// classified by it alone, even when its main data starts with a byte
+	// equal to a native kind.
+	pgLock := rec(0x100, 0x140, uint8(native[0].XLog.Header.Rmid), native[0].XLog.Header.Info,
+		append([]byte{xlog.RecordKindHeapLock}, make([]byte, 7)...), blk(0, 5, 100, 0, 8))
+	data2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data2, walsummary.Dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files, _, err = Summarize(data2, 1, []xlog.Record{redo(0, 2), pgLock, redo(0x200, 2)}, 0)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("PG heap lock: files %v, err %v", files, err)
+	}
+	if got, want := fmt.Sprint(readSummary(t, data2, files[0])), fmt.Sprint([]entryWant{
+		{blkreftable.RelFileLocator{SpcOid: 1663, DbOid: 5, RelNumber: 100}, 0, inv, []uint32{8}},
+	}); got != want {
+		t.Errorf("PG heap lock\n got %s\nwant %s", got, want)
+	}
+}
+
 // TestFastForwardAndOpenRange: WAL after a redo point written at
 // wal_level=minimal is skipped without a file, a summary starts again at
 // the next redo point, and records after the last redo point stay

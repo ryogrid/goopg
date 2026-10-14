@@ -8,8 +8,8 @@
 // block-reference loop) and the SummarizeWAL loop, run offline over a list
 // of decoded records. The live goroutine (S3) feeds the same core.
 //
-// The package imports only xlog, blkreftable and walsummary, so internal/backup
-// can import it later for incremental backup.
+// The package imports only xlog, storage, blkreftable and walsummary, so
+// internal/backup can import it later for incremental backup.
 package walsummarizer
 
 import (
@@ -19,6 +19,7 @@ import (
 	"github.com/goopg/goopg/internal/access/common/blkreftable"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/backup/walsummary"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // Resource managers and record types the summarizer inspects (rmgrlist.h,
@@ -75,14 +76,20 @@ func endRecPtr(r xlog.Record) uint64  { return r.EndLSN }
 // The decoder keeps a user tablespace's OID in TblOid but folds the two
 // built-in ones to 0: dbOid 0 means pg_global, anything else pg_default.
 func blockLocator(rel xlog.XLogBlockRef) blkreftable.RelFileLocator {
-	spc := rel.Rel.TblOid
+	return relLocator(rel.Rel)
+}
+
+// relLocator is blockLocator for a storage.RelFileNode, which goopg-native
+// payloads also carry with TblOid 0.
+func relLocator(rel storage.RelFileNode) blkreftable.RelFileLocator {
+	spc := rel.TblOid
 	if spc == 0 {
 		spc = defaultTablespaceOID
-		if rel.Rel.DBOid == 0 {
+		if rel.DBOid == 0 {
 			spc = globalTablespaceOID
 		}
 	}
-	return blkreftable.RelFileLocator{SpcOid: spc, DbOid: rel.Rel.DBOid, RelNumber: rel.Rel.RelOid}
+	return blkreftable.RelFileLocator{SpcOid: spc, DbOid: rel.DBOid, RelNumber: rel.RelOid}
 }
 
 func rawLocator(b []byte) blkreftable.RelFileLocator {
@@ -200,6 +207,54 @@ func summarizeXact(x *xlog.XLogDecodedRecord, tab *blkreftable.Table) error {
 	return nil
 }
 
+// summarizeNative classifies the goopg-native records that modify a block
+// without naming it in a block reference (design §4.4 items 1-3), so a
+// summary does not miss what PG's block-ref'd equivalent would have marked:
+//   - HeapLock (PG: XLOG_HEAP_LOCK, block 0 = the heap page) marks the page;
+//   - HeapVacuum (PG: XLOG_HEAP2_PRUNE_VACUUM_SCAN) marks the page. No live
+//     producer emits it any more; it is classified for older WAL;
+//   - HeapVisible (PG: XLOG_HEAP2_VISIBLE, block 0 = the VM page, block 1 =
+//     the heap page) marks both when it sets bits. A clear marks nothing:
+//     PG clears the map inside the heap record without a VM block
+//     reference. A dropped relation's map gets limit block 0, as the
+//     SMGR_TRUNCATE of its VM fork would set.
+//
+// The payloads carry no tablespace, so relLocator places them in pg_default
+// (pg_global for a shared relation), where goopg keeps every VM fork.
+func summarizeNative(payload []byte, tab *blkreftable.Table) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	switch payload[0] {
+	case xlog.RecordKindHeapLock:
+		rel, blk, _, _, _, err := xlog.DecodeHeapLock(payload)
+		if err != nil {
+			return err
+		}
+		tab.MarkBlockModified(relLocator(rel), mainFork, uint32(blk))
+	case xlog.RecordKindHeapVacuum:
+		rel, blk, _, err := xlog.DecodeHeapVacuum(payload)
+		if err != nil {
+			return err
+		}
+		tab.MarkBlockModified(relLocator(rel), mainFork, uint32(blk))
+	case xlog.RecordKindHeapVisible:
+		p, err := xlog.DecodeHeapVisible(payload)
+		if err != nil {
+			return err
+		}
+		loc := relLocator(p.Rel)
+		switch {
+		case p.Flags&xlog.HeapVisibleDropRelation != 0:
+			tab.SetLimitBlock(loc, vmFork, 0)
+		case p.Flags&(xlog.HeapVisibleSetAllVisible|xlog.HeapVisibleSetAllFrozen) != 0:
+			tab.MarkBlockModified(loc, vmFork, uint32(storage.VMBlockForHeapBlock(p.HeapBlk)))
+			tab.MarkBlockModified(loc, mainFork, uint32(p.HeapBlk))
+		}
+	}
+	return nil
+}
+
 // rangeSummarizer is one SummarizeWAL call, fed a record at a time: it
 // accumulates the BlockRefTable for the WAL from start until the next
 // boundary record. Both the offline Summarize and the live Summarizer drive
@@ -221,8 +276,13 @@ func newRangeSummarizer(tli uint32, start uint64) *rangeSummarizer {
 func (rs *rangeSummarizer) add(r xlog.Record) (done bool, err error) {
 	x := r.XLog
 	if x == nil {
-		// A goopg-native record without an XLogRecord header carries no
-		// block references the summarizer can see (design §4.4, S6a).
+		// A legacy bare-record stream has no XLogRecord header; only the
+		// native payload says what it modified.
+		if !rs.fastForward {
+			if err := summarizeNative(r.Payload, rs.tab); err != nil {
+				return false, fmt.Errorf("record at %X/%X: %w", uint32(readRecPtr(r)>>32), uint32(readRecPtr(r)), err)
+			}
+		}
 		rs.end = endRecPtr(r)
 		return false, nil
 	}
@@ -251,6 +311,12 @@ func (rs *rangeSummarizer) add(r xlog.Record) (done bool, err error) {
 		if !rs.fastForward {
 			err = summarizeXact(x, rs.tab)
 		}
+	}
+	// A goopg-native record is stamped with its PG analogue's (rmid, info)
+	// but has no block reference; a real PG record of those kinds always
+	// has one, so the two cannot be confused.
+	if err == nil && !rs.fastForward && len(x.Blocks) == 0 && xlog.IsGoopgNativeRecord(r) {
+		err = summarizeNative(r.Payload, rs.tab)
 	}
 	if err != nil {
 		return false, fmt.Errorf("record at %X/%X: %w", uint32(readRecPtr(r)>>32), uint32(readRecPtr(r)), err)

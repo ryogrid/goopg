@@ -55,8 +55,7 @@ gzipped.
 
 - **Reading from an arbitrary point** (`exact=false` / `XLogFindNextRecord`), the timeline `switch_lsn`, the
   `maximum_lsn` flush bound and the historic end-of-WAL cases. These belong to the live loop (S3).
-- **goopg-native records with no XLogRecord header** (`Record.XLog == nil`) are passed over. This is S6a (design
-  §4.4): HeapLock, HeapVisible and HeapVacuum payloads carry modifications the summary must see.
+- **goopg-native records** were passed over here. S6a (below) classifies them.
 
 ## S4a landed (2026-10-14): `pg_available_wal_summaries` and `pg_wal_summary_contents`
 
@@ -224,3 +223,36 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - `TestServerSummarizerState` now checks one `walsummarizer` activity row while running and none after stopping,
   and `reads > 0` with `read_bytes = reads * 8192`.
 - `TestIOCountersCountEachPageOnce`.
+
+## S6a landed (2026-10-14): classifier arms for goopg-native records
+
+- **Correction to the plan.** A native record is not header-less. The writer stamps it with its PG analogue's
+  `(rmid, info)` (`recordKindToRmgrInfo`), or `RmgrGoopgCatalog`/0 when it has none. Its main data is the native
+  payload, and it has **no block reference**. `Record.XLog == nil` occurs only in legacy bare-record streams.
+- **`summarizeNative`** runs for a record with no block reference whose header matches its kind byte
+  (`xlog.IsGoopgNativeRecord`). It also runs for a header-less legacy record. It marks what PG's block-ref'd
+  equivalent would:
+
+  | native kind | PG equivalent | marked |
+  |---|---|---|
+  | HeapLock (RM\_HEAP / LOCK) | `xl_heap_lock`, block 0 = heap page | the heap page |
+  | HeapVacuum (RM\_HEAP2 / PRUNE\_VACUUM\_SCAN) | prune record, block 0 = heap page | the heap page (no live producer; old WAL) |
+  | HeapVisible set (rmgr 128) | `XLOG_HEAP2_VISIBLE`, block 0 = VM page, block 1 = heap page | VM page `HeapBlk / 32672` and the heap page |
+  | HeapVisible clear | none: PG clears the map inside the heap record, without a VM block reference | nothing |
+  | HeapVisible drop relation | the VM fork's `SMGR_TRUNCATE` / drop | VM fork limit block 0 |
+
+- A real PG record of the same `(rmid, info)` always has a block reference, so it is never read as a native
+  payload, even when its first main-data byte equals a native kind.
+- **Tablespace.** The payloads carry `TblOid` 0, so the locator is pg\_default, or pg\_global for a shared
+  relation. Every VM fork is there: `VMSaveForks` writes only under `base/` and `global/`. A heap-page mark for a
+  relation in a user tablespace lands under the pg\_default locator. That page also has a first-touch FPI when
+  `full_page_writes` is on. The `spcOid` field, or conversion to `XLOG_HEAP2_VISIBLE`, stays a producer slice
+  (S6b).
+
+**Tests:**
+- `TestNativeRecordArms` writes the native payloads through the real `xlog.Writer` and reads them back with
+  `ReadAll`, so the on-disk header stamping is exercised. It checks the entries above, and that a PG heap-lock
+  record whose main data starts with the HeapLock kind byte is classified by its block reference alone.
+- `TestServerSummarizesWAL` now runs `VACUUM ws` and expects VM block 0 of `ws` in a summary.
+- Negative control: with the arm disabled, both tests fail. The live one reports "no summary lists VM block 0 of
+  ws after VACUUM".

@@ -4978,6 +4978,19 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     views of the live transaction state \(check\_transaction\_read\_only / check\_XactIsoLevel rules\)\.
   - Expected instrument: regress `transactions` \(read\-only cases\) and `guc`; a postmaster test of each repro\.
 
+- [ ] **`pg\_current\_wal\_lsn\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6a\)\.
+  Kind: bug
+  Placement: S2 defect awaiting owner placement \(a PG 18\.3 builtin errors 42883\)\. It is filed without a parent
+  because M0122\-0009\'s lineage is past the Movement\-none budget \(ralph\-lineage\-guard rule A\)\.
+  - Repro on a fresh cluster: `SELECT pg\_current\_wal\_lsn\(\)` → `function pg\_current\_wal\_lsn does not exist`
+    \(42883\)\. PG returns the write position as `pg\_lsn` \(`GetXLogWriteRecPtr`, xlogfuncs\.c\)\.
+  - Its siblings `pg\_current\_wal\_insert\_lsn` / `pg\_current\_wal\_flush\_lsn` have no implementation either; all
+    three appear only in the volatility list \(`internal/executor/pg\_nonimmutable\_builtins\.go`\) and pg\_proc\.
+  - First step: implement the three from the WAL writer's insert / write / flush positions, translated to PG LSNs
+    \(ReadRecPtr = StartLSN − 1\); 55000 "WAL control functions cannot be executed during recovery" on a standby\.
+  - Expected instrument: regress cases calling them \(and WS\-002\-style probes\); a postmaster test comparing the value
+    with `pg\_get\_wal\_summarizer\_state\(\)\.pending\_lsn` after a CHECKPOINT\.
+
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives
   `INTERVAL \'\+02:00\' HOUR TO MINUTE`; PG gives `<\+02>\-02`
@@ -5238,6 +5251,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       PASS\.
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next: S6a — classifier arms for goopg\-native payloads \(design §4\.4\)\. Read §4\.4 first\.
+  - **2026\-10\-14 S6a landed** — classifier arms for goopg\-native records\.
+    - Correction: native records are not header\-less\. They carry their PG analogue\'s `\(rmid, info\)` \(rmgr 128
+      for HeapVisible\) and no block reference\. `summarizeNative` runs on such records \(`IsGoopgNativeRecord`\)\.
+    - HeapLock / HeapVacuum mark the heap page\. A HeapVisible set marks the VM page `HeapBlk/32672` and the heap
+      page \(PG `XLOG\_HEAP2\_VISIBLE` blocks 0 and 1\)\. A clear marks nothing, as PG\. A drop gives VM limit 0\.
+    - Tests: `TestNativeRecordArms` \(real writer \+ ReadAll\); `TestServerSummarizesWAL` expects VM block 0 after
+      VACUUM\. With the arm disabled both fail\.
+    - Found: `pg\_current\_wal\_lsn\(\)` does not exist \(filed as an S2 defect, no parent\)\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next: S7 \(WS\-002 port\), or the S6b\.\.S6f producer changes \(SMGR\_CREATE for new tables first\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed
