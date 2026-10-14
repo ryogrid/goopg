@@ -603,14 +603,16 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
-	// wal_writer_flush_after sets the threshold (in bytes) above which
-	// the WAL writer loop issues an fdatasync in addition to writing.
-	// Default 1 MiB mirrors upstream's wal_writer_flush_after GUC. 0
-	// means always fsync on every loop iteration. See
+	// wal_writer_flush_after sets the threshold, in XLOG_BLCKSZ pages
+	// (GUC_UNIT_XBLOCKS; XLOG_BLCKSZ equals BLCKSZ, so UnitBlocks), above
+	// which the WAL writer loop issues an fdatasync in addition to writing.
+	// Default 128 pages (1MB) and range 0..INT_MAX follow guc_tables.c. 0
+	// means always fsync on every loop iteration. cmd/goopg converts it to
+	// bytes for the WAL writer. See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
-		MinVal: 0, MaxVal: 1 << 30,
+		Name: "wal_writer_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "128",
+		MinVal: 0, MaxVal: math.MaxInt32,
 		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
@@ -644,7 +646,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 
 	// checkpoint_flush_after / bgwriter_flush_after / backend_flush_after
-	// set the writeback threshold (in BLCKSZ pages) for the checkpointer /
+	// set the writeback threshold (in BLCKSZ pages, GUC_UNIT_BLOCKS) for the checkpointer /
 	// bgwriter / an individual backend's own dirty-victim-eviction writes;
 	// once a context's running total crosses its threshold, goopg issues
 	// a real sync_file_range(2) write-behind hint (0 disables it — see
@@ -656,19 +658,19 @@ func BuildDefaultRegistry() *Registry {
 	// (per-session); goopg applies it as a single process-wide threshold
 	// instead (see deferral ledger).
 	r.MustRegister(NewVariable(Variable{
-		Name: "checkpoint_flush_after", Type: TypeInt, BootVal: "32",
+		Name: "checkpoint_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "32",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "bgwriter_flush_after", Type: TypeInt, BootVal: "64",
+		Name: "bgwriter_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "64",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "backend_flush_after", Type: TypeInt, BootVal: "0",
+		Name: "backend_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "0",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextUserset,
 	}))

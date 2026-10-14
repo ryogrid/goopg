@@ -129,7 +129,7 @@
                                         # the in-memory WAL buffer
                                         # (change requires restart)
 #wal_writer_delay = 200                 # 1-10000 ms between WAL-writer rounds
-#wal_writer_flush_after = 1048576       # 0-1073741824 bytes; 0 fsyncs every round
+#wal_writer_flush_after = 128           # measured in pages (128 = 1MB), 0 fsyncs every round
 #commit_delay = 0                       # 0-100000 microseconds
 #commit_siblings = 5                    # 0-1000 range; min concurrent flushers
                                         # before commit_delay applies

@@ -4885,6 +4885,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical to HEAD\.
     - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
       `wal\_init\_zero` contexts \(need live consumers first\)\.
+  - Slice 3 done 2026\-10\-14: the four `\*\_flush\_after` parameters carry PG\'s block units\.
+    - SHOW gives `1MB` / `256kB` / `512kB` / `0`, identical to the scratch PG 18\.3 oracle\.
+    - `wal\_writer\_flush\_after` now stores pages \(default 128, max INT\_MAX\)\. cmd/goopg converts it to bytes
+      \(`walWriterFlushAfterBytes`\)\.
+    - `checkpoint\_flush\_after` / `bgwriter\_flush\_after` now reach the pool on reload
+      \(`ApplyWriterSettings`\)\.
+    - Ledgered: `wal\_buffers` is still bytes; PG uses XBLOCKS with \-1 = auto\.
+    - Test `TestFlushAfterGUCsUseBlockUnits`; the reload test covers the pool thresholds\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
+    - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
+      `wal\_init\_zero` contexts; `wal\_buffers` units\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

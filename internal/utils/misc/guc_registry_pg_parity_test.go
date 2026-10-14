@@ -66,3 +66,54 @@ func TestGUCRegistryReloadableContexts(t *testing.T) {
 		}
 	}
 }
+
+// TestFlushAfterGUCsUseBlockUnits pins slice 3: PG 18.3 declares
+// checkpoint_flush_after, bgwriter_flush_after and backend_flush_after
+// GUC_UNIT_BLOCKS and wal_writer_flush_after GUC_UNIT_XBLOCKS (guc_tables.c).
+// goopg had no unit on any of them and kept wal_writer_flush_after in bytes,
+// so SHOW printed 32 / 64 / 1048576 where PG prints 256kB / 512kB / 1MB, and
+// a PG-written `wal_writer_flush_after = 1MB` line was refused.
+func TestFlushAfterGUCsUseBlockUnits(t *testing.T) {
+	s := NewSessionRegistry(BuildDefaultRegistry())
+	for _, tc := range []struct{ name, stored, display string }{
+		{"checkpoint_flush_after", "32", "256kB"},
+		{"bgwriter_flush_after", "64", "512kB"},
+		{"backend_flush_after", "0", "0"},
+		{"wal_writer_flush_after", "128", "1MB"},
+	} {
+		v, eff, ok := s.Get(tc.name)
+		if !ok {
+			t.Errorf("%s: not registered", tc.name)
+			continue
+		}
+		if v.Unit != UnitBlocks {
+			t.Errorf("%s: Unit = %v, want UnitBlocks", tc.name, v.Unit)
+		}
+		if eff != tc.stored {
+			t.Errorf("%s: stored %q, want %q pages", tc.name, eff, tc.stored)
+		}
+		if _, got, _ := s.GetDisplay(tc.name); got != tc.display {
+			t.Errorf("SHOW %s = %q, want PG 18.3's %q", tc.name, got, tc.display)
+		}
+	}
+
+	// The parse direction, from a configuration file and from SET.
+	r := BuildDefaultRegistry()
+	if err := r.ApplyConfigEntries([]ConfigEntry{
+		{Name: "wal_writer_flush_after", Value: "2MB"},
+		{Name: "checkpoint_flush_after", Value: "1MB"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"wal_writer_flush_after": "256", "checkpoint_flush_after": "128"} {
+		if v, _ := r.Get(name); v.Value != want {
+			t.Errorf("%s from the config file: stored %q, want %q pages", name, v.Value, want)
+		}
+	}
+	if err := s.Set("backend_flush_after", "128kB", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, eff, _ := s.Get("backend_flush_after"); eff != "16" {
+		t.Errorf("SET backend_flush_after = '128kB' stored %q, want 16 pages", eff)
+	}
+}

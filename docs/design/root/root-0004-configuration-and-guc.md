@@ -563,7 +563,37 @@ Still open (ledgered):
 - `wal_init_zero` (PGC\_SUSET): read once into the WAL config.
 - `autovacuum_naptime` is reloadable in the registry, but the launcher's
   `NapInterval` is fixed at start.
-- `wal_writer_flush_after`, `checkpoint_flush_after`,
-  `bgwriter_flush_after` and `backend_flush_after` lack PG's block units.
-  For example, PG shows `1MB` for `wal_writer_flush_after`, where goopg
-  shows `1048576`.
+- The `*_flush_after` unit gap was closed by slice 3, below.
+
+## Block units for the writeback thresholds (2026-10-14, M0122-0008 slice 3)
+
+PG 18.3 declares `checkpoint_flush_after`, `bgwriter_flush_after` and
+`backend_flush_after` GUC\_UNIT\_BLOCKS, and `wal_writer_flush_after`
+GUC\_UNIT\_XBLOCKS (`guc_tables.c`). goopg registered all four without
+a unit and kept `wal_writer_flush_after` in bytes, with a default of 1048576.
+So SHOW printed `32`, `64` and `1048576` where PG prints `256kB`, `512kB`
+and `1MB`, and a PG-written `wal_writer_flush_after = 1MB` line was refused.
+
+- All four now carry `UnitBlocks`. XLOG\_BLCKSZ equals BLCKSZ (8192), so
+  one unit serves both of PG's.
+- `wal_writer_flush_after` now stores pages: default 128, range 0 to
+  INT\_MAX, as in PG. `cmd/goopg` converts it to bytes for the WAL writer
+  (`walWriterFlushAfterBytes`), both at start and on reload.
+- `checkpoint_flush_after` and `bgwriter_flush_after` were already
+  PGC\_SIGHUP, but only `Open` set the pool's thresholds.
+  `ApplyWriterSettings` now carries them as well.
+
+Verified against the scratch PG 18.3 oracle:
+
+- SHOW gives `1MB`, `256kB`, `512kB` and `0` on both servers.
+- PG's `pg_settings` reports unit `8kB` with boot values 128, 32, 64 and 0.
+- A reload of `wal_writer_flush_after = 2MB` and `checkpoint_flush_after =
+  512kB` applies with no warning.
+
+Tests: `TestFlushAfterGUCsUseBlockUnits` covers the display and both parse
+directions. `TestApplyWriterSettingsReachesRunningLoops` covers the pool
+thresholds.
+
+Still open (ledgered): `wal_buffers` is stored in bytes with a default of
+16MB. PG declares it XBLOCKS with -1, meaning 1/32 of `shared_buffers`,
+capped at one WAL segment (`check_wal_buffers`).

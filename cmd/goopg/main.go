@@ -485,7 +485,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			CommitDelayUs:         int64(intGUC(registry, "commit_delay", 0)),
 			CommitSiblings:        intGUC(registry, "commit_siblings", 5),
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
-			WalWriterFlushAfter:   int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
+			WalWriterFlushAfter:   walWriterFlushAfterBytes(registry),
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
 			CheckpointFlushAfter:  checkpointFlushAfter,
@@ -809,12 +809,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// The walwriter and bgwriter re-read their PGC_SIGHUP settings on a
 		// reload (M0122-0008); before this they were boot-time only.
 		rt.ApplyWriterSettings(initdb.WriterSettings{
-			WalWriterDelay:      time.Duration(intGUC(registry, "wal_writer_delay", 200)) * time.Millisecond,
-			WalWriterFlushAfter: int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
-			CommitDelayUs:       int64(intGUC(registry, "commit_delay", 0)),
-			CommitSiblings:      intGUC(registry, "commit_siblings", 5),
-			BgwriterDelay:       time.Duration(intGUC(registry, "bgwriter_delay", 200)) * time.Millisecond,
-			BgwriterMaxPages:    intGUC(registry, "bgwriter_lru_maxpages", 100),
+			WalWriterDelay:       time.Duration(intGUC(registry, "wal_writer_delay", 200)) * time.Millisecond,
+			WalWriterFlushAfter:  walWriterFlushAfterBytes(registry),
+			CommitDelayUs:        int64(intGUC(registry, "commit_delay", 0)),
+			CommitSiblings:       intGUC(registry, "commit_siblings", 5),
+			BgwriterDelay:        time.Duration(intGUC(registry, "bgwriter_delay", 200)) * time.Millisecond,
+			BgwriterMaxPages:     intGUC(registry, "bgwriter_lru_maxpages", 100),
+			CheckpointFlushAfter: intGUC(registry, "checkpoint_flush_after", 32),
+			BgwriterFlushAfter:   intGUC(registry, "bgwriter_flush_after", 64),
 		})
 	}
 	applyCheckpointGUCs()
@@ -1058,6 +1060,14 @@ func stringGUC(registry *misc.Registry, name string, fallback string) string {
 // intGUC reads an int-shaped GUC by name, returning fallback when
 // the registry is nil, the variable isn't registered, or its
 // Display value isn't a valid integer.
+// walWriterFlushAfterBytes reads wal_writer_flush_after, which PG stores in
+// XLOG_BLCKSZ pages (GUC_UNIT_XBLOCKS, default 128 = 1MB), as the byte count
+// the WAL writer takes.
+func walWriterFlushAfterBytes(registry *misc.Registry) int64 {
+	const xlogBlockSize = 8192 // XLOG_BLCKSZ
+	return int64(intGUC(registry, "wal_writer_flush_after", 128)) * xlogBlockSize
+}
+
 func intGUC(registry *misc.Registry, name string, fallback int) int {
 	if registry == nil {
 		return fallback

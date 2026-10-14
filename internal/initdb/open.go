@@ -135,6 +135,10 @@ type WriterSettings struct {
 	CommitSiblings      int
 	BgwriterDelay       time.Duration // <= 0: unchanged
 	BgwriterMaxPages    int
+	// CheckpointFlushAfter and BgwriterFlushAfter are the checkpointer's and
+	// bgwriter's writeback thresholds in BLCKSZ pages (PGC_SIGHUP).
+	CheckpointFlushAfter int
+	BgwriterFlushAfter   int
 }
 
 // ApplyWriterSettings pushes reloaded writer settings into the running
@@ -159,6 +163,10 @@ func (r *Runtime) ApplyWriterSettings(ws WriterSettings) {
 	if r.bgwriter != nil {
 		r.bgwriter.SetDelay(ws.BgwriterDelay)
 		r.bgwriter.SetMaxPages(ws.BgwriterMaxPages)
+	}
+	if r.Pool != nil {
+		r.Pool.SetCheckpointFlushAfter(ws.CheckpointFlushAfter)
+		r.Pool.SetBgwriterFlushAfter(ws.BgwriterFlushAfter)
 	}
 }
 
@@ -265,7 +273,7 @@ type OpenOptions struct {
 	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
 	WalWriterDelay time.Duration
 
-	// WalWriterFlushAfter is wal_writer_flush_after in bytes (BootVal 1MB),
+	// WalWriterFlushAfter is wal_writer_flush_after in bytes (the GUC's 128 pages = 1MB),
 	// forwarded to wal.Config for the background walwriter's fsync throttle.
 	WalWriterFlushAfter int64
 

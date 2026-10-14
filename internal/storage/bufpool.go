@@ -1297,6 +1297,10 @@ func (p *Pool) SetBgwriterFlushAfter(n int) {
 	p.bgwriterFlushAfterBlocks.Store(int32(n))
 }
 
+// CheckpointFlushAfter and BgwriterFlushAfter report the live thresholds.
+func (p *Pool) CheckpointFlushAfter() int { return int(p.checkpointFlushAfterBlocks.Load()) }
+func (p *Pool) BgwriterFlushAfter() int   { return int(p.bgwriterFlushAfterBlocks.Load()) }
+
 // SetBackendFlushAfter sets the writeback threshold applied to a backend's
 // own dirty-victim-eviction writes, in BLCKSZ pages (mirrors
 // backend_flush_after; <= 0, the upstream default, disables it).

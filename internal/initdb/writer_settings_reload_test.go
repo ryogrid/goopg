@@ -21,12 +21,14 @@ func TestApplyWriterSettingsReachesRunningLoops(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{
-		DataDir:             dir,
-		PoolSlots:           64,
-		WalWriterDelay:      200 * time.Millisecond,
-		WalWriterFlushAfter: 1 << 20,
-		BgwriterDelay:       200 * time.Millisecond,
-		BgwriterMaxPages:    100,
+		DataDir:              dir,
+		PoolSlots:            64,
+		WalWriterDelay:       200 * time.Millisecond,
+		WalWriterFlushAfter:  1 << 20,
+		BgwriterDelay:        200 * time.Millisecond,
+		BgwriterMaxPages:     100,
+		CheckpointFlushAfter: 32,
+		BgwriterFlushAfter:   64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -37,12 +39,14 @@ func TestApplyWriterSettingsReachesRunningLoops(t *testing.T) {
 	}
 
 	rt.ApplyWriterSettings(WriterSettings{
-		WalWriterDelay:      50 * time.Millisecond,
-		WalWriterFlushAfter: 64 << 10,
-		CommitDelayUs:       10,
-		CommitSiblings:      7,
-		BgwriterDelay:       30 * time.Millisecond,
-		BgwriterMaxPages:    0,
+		WalWriterDelay:       50 * time.Millisecond,
+		WalWriterFlushAfter:  64 << 10,
+		CommitDelayUs:        10,
+		CommitSiblings:       7,
+		BgwriterDelay:        30 * time.Millisecond,
+		BgwriterMaxPages:     0,
+		CheckpointFlushAfter: 128,
+		BgwriterFlushAfter:   0,
 	})
 	if got := rt.WalWriterDelay(); got != 50*time.Millisecond {
 		t.Errorf("wal_writer_delay = %v, want 50ms", got)
@@ -61,6 +65,14 @@ func TestApplyWriterSettingsReachesRunningLoops(t *testing.T) {
 	}
 	if got := rt.Bgwriter().MaxPages(); got != 0 {
 		t.Errorf("bgwriter_lru_maxpages = %d, want 0", got)
+	}
+	// checkpoint_flush_after and bgwriter_flush_after were reloadable in the
+	// registry but only Open set the pool's thresholds (slice 3).
+	if got := rt.Pool.CheckpointFlushAfter(); got != 128 {
+		t.Errorf("checkpoint_flush_after = %d, want 128", got)
+	}
+	if got := rt.Pool.BgwriterFlushAfter(); got != 0 {
+		t.Errorf("bgwriter_flush_after = %d, want 0", got)
 	}
 }
 
