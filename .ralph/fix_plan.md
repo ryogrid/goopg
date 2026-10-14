@@ -33060,7 +33060,7 @@ Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-o
     - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
       identical except a pre\-existing Hash Right Join row\-order flap in `join` \(HEAD flips too\)\.
 Movement: yes — TPC-DS SF0.25 match 79 -> 80 (Q33); CATEGORIES-EXCL-MATCH SF0.25 join-order 17 -> 16, aggregation-strategy 2 -> 1, sort-strategy 7 -> 6, parallelism 7 -> 6
-- [ ] **M0146-0194 — PG keeps Q72's item/warehouse/inventory joins under a Gather Merge sorted on the group keys; goopg gathers lower and sorts for the GroupAggregate (TPC-DS Q72)**
+- [x] **M0146-0194 — PG keeps Q72's item/warehouse/inventory joins under a Gather Merge sorted on the group keys; goopg gathers lower and sorts for the GroupAggregate (TPC-DS Q72)**
   (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014d/`).
   Record: TPC-DS SF0.25 Q72, verdict SHAPE-DIFF \[join-order, join-method, scan-type, parameterisation, sort-strategy,
   parallelism\], first divergence `depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Left | goopg Sort`.
@@ -33077,3 +33077,14 @@ Movement: yes — TPC-DS SF0.25 match 79 -> 80 (Q33); CATEGORIES-EXCL-MATCH SF0.
     side lacks the candidate or misprices it: the item join inside the workers, d1\.d\_week\_seq = d2\.d\_week\_seq as a
     Join Filter vs goopg\'s scan Filter, and the Gather Merge over the group\-key Sort. Drive Q72 to MATCH.
   - Expected movement: TPC-DS SF0.25 match \(Q72\) and CATEGORIES-EXCL-MATCH sort-strategy / join-order.
+  - Closed 2026\-10\-14 \(evidence `analysis/m0146/m0146\-0194/NOTES\.md`\) — the record is a near\-tie among PG\'s own
+    candidates\.
+    - tmp/pgdbg: PG\'s chosen GM\-presorted plan costs 15483\.78; with `enable_gathermerge = off` the Finalize/Partial
+      GroupAggregate split costs 15469\.42\. That is 0\.09% cheaper but has a worse startup, so add\_path\'s tight\-fuzz
+      comparison keeps the incumbent\.
+    - goopg\'s whole cost level sits about 290 below PG\'s, from known residual terms \(catalog\_sales relpages 10521 vs
+      10578, a d2 Memoize, inventory index cost\)\. Its pick among equally close shapes is the same COSTTIE class\.
+    - Side observation ledgered: goopg prices the d3 parameterised probe at 8\.31 where PG prices it at 0\.33
+      \(get\_loop\_count\)\.
+    - S9 two\-strike count: 1\.
+Movement: none — premise stale: the Q72 record is a near-tie among PG 18.3's own candidates (GM-presorted 15483.78 vs Gather split 15469.42, 0.09%, settled by add_path's startup tie-break), COSTTIE class

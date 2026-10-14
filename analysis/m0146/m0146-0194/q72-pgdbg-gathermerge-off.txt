@@ -1,0 +1,57 @@
+SET
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=15469.42..15469.43 rows=1 width=148)
+   ->  Sort  (cost=15469.42..15469.43 rows=1 width=148)
+         Sort Key: (count(*)) DESC, item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+         ->  Finalize GroupAggregate  (cost=15469.35..15469.41 rows=1 width=148)
+               Group Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+               ->  Sort  (cost=15469.35..15469.36 rows=3 width=148)
+                     Sort Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+                     ->  Gather  (cost=15468.99..15469.32 rows=3 width=148)
+                           Workers Planned: 3
+                           ->  Partial GroupAggregate  (cost=14468.99..14469.02 rows=1 width=148)
+                                 Group Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+                                 ->  Sort  (cost=14468.99..14469.00 rows=1 width=128)
+                                       Sort Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+                                       ->  Nested Loop Left Join  (cost=160.31..14468.98 rows=1 width=128)
+                                             ->  Nested Loop  (cost=160.16..14468.82 rows=1 width=128)
+                                                   Join Filter: (d3.d_date > (d1.d_date + 5))
+                                                   ->  Nested Loop  (cost=159.87..14468.48 rows=1 width=136)
+                                                         Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                                         ->  Nested Loop  (cost=159.59..14468.16 rows=1 width=42)
+                                                               ->  Nested Loop  (cost=159.45..14468.00 rows=1 width=28)
+                                                                     Join Filter: (d1.d_week_seq = d2.d_week_seq)
+                                                                     ->  Nested Loop  (cost=159.16..14169.41 rows=918 width=32)
+                                                                           ->  Nested Loop  (cost=158.73..12201.16 rows=19 width=24)
+                                                                                 ->  Nested Loop  (cost=158.30..12129.29 rows=96 width=28)
+                                                                                       ->  Hash Join  (cost=158.00..11041.92 rows=19287 width=24)
+                                                                                             Hash Cond: (catalog_sales.cs_bill_hdemo_sk = household_demographics.hd_demo_sk)
+                                                                                             ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10578.57 rows=116257 width=32)
+                                                                                             ->  Hash  (cost=143.00..143.00 rows=1200 width=4)
+                                                                                                   ->  Seq Scan on household_demographics  (cost=0.00..143.00 rows=1200 width=4)
+                                                                                                         Filter: (hd_buy_potential = '1001-5000'::bpchar)
+                                                                                       ->  Memoize  (cost=0.30..0.34 rows=1 width=12)
+                                                                                             Cache Key: catalog_sales.cs_sold_date_sk
+                                                                                             Cache Mode: logical
+                                                                                             ->  Index Scan using date_dim_pkey on date_dim d1  (cost=0.29..0.33 rows=1 width=12)
+                                                                                                   Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                                                                                   Filter: (d_year = 1998)
+                                                                                 ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.43..0.75 rows=1 width=4)
+                                                                                       Index Cond: (cd_demo_sk = catalog_sales.cs_bill_cdemo_sk)
+                                                                                       Filter: (cd_marital_status = 'S'::bpchar)
+                                                                           ->  Index Scan using inventory_pkey on inventory  (cost=0.43..101.84 rows=175 width=16)
+                                                                                 Index Cond: (inv_item_sk = catalog_sales.cs_item_sk)
+                                                                                 Filter: (inv_quantity_on_hand < catalog_sales.cs_quantity)
+                                                                     ->  Index Scan using date_dim_pkey on date_dim d2  (cost=0.29..0.31 rows=1 width=8)
+                                                                           Index Cond: (d_date_sk = inventory.inv_date_sk)
+                                                               ->  Index Scan using warehouse_pkey on warehouse  (cost=0.13..0.15 rows=1 width=22)
+                                                                     Index Cond: (w_warehouse_sk = inventory.inv_warehouse_sk)
+                                                         ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
+                                                               Index Cond: (i_item_sk = inventory.inv_item_sk)
+                                                   ->  Index Scan using date_dim_pkey on date_dim d3  (cost=0.29..0.33 rows=1 width=8)
+                                                         Index Cond: (d_date_sk = catalog_sales.cs_ship_date_sk)
+                                             ->  Index Only Scan using promotion_pkey on promotion  (cost=0.15..0.17 rows=1 width=4)
+                                                   Index Cond: (p_promo_sk = catalog_sales.cs_promo_sk)
+(52 rows)
+
