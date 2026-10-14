@@ -32946,7 +32946,7 @@ Movement: yes — match SF0.25 76 -> 77 (TPC-DS Q85); CATEGORIES-EXCL-MATCH SF0.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS, TPC\-H acceptance arm PASS, regress
       A/B \(select\_parallel, aggregates, partition\_aggregate, groupingsets, write\_parallel, union\) identical\.
 Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGORIES-EXCL-MATCH SF0.25 sort-strategy 10 -> 7, parallelism 8 -> 7, join-method 9 -> 8, scan-type 7 -> 6, aggregation-strategy 3 -> 2; SF1 sort-strategy 17 -> 16, parallelism 18 -> 17, join-order 30 -> 29
-- [ ] **M0146-0191 — under a set operation goopg merges an un\-deduplicated worker Sort where PG runs a per\-worker Unique below the Gather Merge (TPC-DS Q38)**
+- [x] **M0146-0191 — under a set operation goopg merges an un\-deduplicated worker Sort where PG runs a per\-worker Unique below the Gather Merge (TPC-DS Q38)**
   (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014b/`).
   sort-strategy is the top actionable first-divergence category (14 records, 10 actionable after waivers). Record:
   TPC-DS SF0.25 Q38, verdict SHAPE-DIFF, first divergence `depth=5 [sort-strategy] under Gather Merge: PG Unique |
@@ -32969,3 +32969,12 @@ Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGOR
     create\_final\_distinct\_paths first and the partial arm second; with fuzz\-equal costs the plain shape would win, so
     PG choosing the per\-worker Unique implies its plain Gather Merge never reached the DISTINCT rel\. Next step: gate the
     UNSPLIT arm on `scanJoinRelKeepsGatherMerge` \(partialaggupper\.go\), then measure Q38/Q87\.
+  - Closed 2026\-10\-14 \(evidence `analysis/m0146/m0146\-0191/NOTES\.md`\) — the record is a cost tie inside PG itself\.
+    - PG flips between the split and unsplit shapes with its ANALYZE sample\. Q38 web\_sales is split on :65438 but
+      unsplit on tmp/pgdbg; Q87 store\_sales is unsplit on :65438 but split on tmp/pgdbg\. The worker Unique estimates no
+      reduction, so the two shapes differ by its comparisons alone, about 0\.03%\.
+    - Lead ruled out: gating the UNSPLIT arm on `scanJoinRelKeepsGatherMerge` left the fire set identical at both
+      scales\. The branch\'s searched rel holds no sorted non\-gathered candidate, because the distinct keys come from
+      the top inner \(customer\)\. The edit was not landed; the sibling gap is ledgered\.
+    - S9 two\-strike count: 1 \(the first Movement\-none close after M0146\-0190\)\.
+Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a statistics-sample tie inside PG 18.3 (PG itself flips split/unsplit between :65438 and tmp/pgdbg), COSTTIE class
