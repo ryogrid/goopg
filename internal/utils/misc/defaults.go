@@ -262,20 +262,20 @@ func BuildDefaultRegistry() *Registry {
 	// only place that resolves the negative shorthand into positive
 	// coarsening thresholds.
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_xact", Type: TypeInt, BootVal: "64",
-		MinVal: 10, MaxVal: 1 << 30,
+		Name: "max_pred_locks_per_transaction", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: math.MaxInt32,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_relation", Type: TypeInt, BootVal: "-2",
-		MinVal: -1 << 30, MaxVal: 1 << 30,
+		Name: "max_pred_locks_per_relation", Type: TypeInt, BootVal: "-2",
+		MinVal: math.MinInt32, MaxVal: math.MaxInt32,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_page", Type: TypeInt, BootVal: "2",
-		MinVal: 0, MaxVal: 1 << 16,
+		Name: "max_pred_locks_per_page", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: math.MaxInt32,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
@@ -459,7 +459,7 @@ func BuildDefaultRegistry() *Registry {
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
-		Context: ContextUserset,
+		Context: ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:   ScopeServer,
 	}))
 
@@ -475,7 +475,7 @@ func BuildDefaultRegistry() *Registry {
 		Type:        TypeEnum,
 		BootVal:     "off",
 		EnumOptions: []string{"off", "on", "auto", "regress"},
-		Context:     ContextUserset,
+		Context:     ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:       ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -623,7 +623,7 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "commit_delay", Type: TypeInt, BootVal: "0",
 		MinVal: 0, MaxVal: 100000,
-		Context: ContextUserset,
+		Context: ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{

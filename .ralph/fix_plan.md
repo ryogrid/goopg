@@ -4857,6 +4857,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
   - First step: fix the three privilege\-relevant contexts and the three
     misspelled names; check each renamed/re\-contexted variable\'s consumer
     \(declared\-but\-unconsumed risk\)\.
+  - Slice 1 done 2026\-10\-14: `commit\_delay`, `compute\_query\_id` and `track\_io\_timing` are now
+    PGC\_SUSET; `max\_predicate\_locks\_per\_\{xact,relation,page\}` are now PG\'s
+    `max\_pred\_locks\_per\_\{transaction,relation,page\}` with guc\_tables\.c\'s ranges \(10/INT\_MIN/0 to
+    INT\_MAX\)\. postgresql\.conf\.sample follows PG\'s lines\.
+    - Consumer check: the three predicate\-lock GUCs have no consumer \(nothing calls
+      `mvcc\.Manager\.SetPredicateLockLimits`\); ledgered\. The three SUSET parameters keep their consumers \(startup
+      `boolGUC`/`intGUC`, the track\_io\_timing OnChange hook\)\.
+    - Test `TestGUCRegistryPrivilegeContextsAndPredLockNames`; `TestPredicateLockGUCDefaults` follows the PG names\.
+    - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99; regress guc / sysviews identical\.
+    - Remaining: 191 unregistered PG parameters, 4 goopg\-only names, 10 other context mismatches \(listed above\)\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

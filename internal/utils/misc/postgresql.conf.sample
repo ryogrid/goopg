@@ -439,13 +439,12 @@
 
 #max_locks_per_transaction = 64         # 10-2147483647 per-backend slots
                                         # (change requires restart)
-#max_predicate_locks_per_xact = 64      # 10-1073741824
+#max_pred_locks_per_transaction = 64    # min 10
                                         # (change requires restart)
-#max_predicate_locks_per_relation = -2  # negative = fraction;
-                                        # see internal/mvcc/predicate_locks.go
-                                        # (SIGHUP to apply)
-#max_predicate_locks_per_page = 2       # 0-65536
-                                        # (SIGHUP to apply)
+#max_pred_locks_per_relation = -2       # negative values mean
+                                        # (max_pred_locks_per_transaction
+                                        #  / -max_pred_locks_per_relation) - 1
+#max_pred_locks_per_page = 2            # min 0
 #max_prepared_transactions = 0          # 0-262143; zero disables 2PC
                                         # (change requires restart)
 #deadlock_timeout = 1000                # 1-2147483647 ms; wait before
