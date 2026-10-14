@@ -32999,6 +32999,9 @@ Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a stati
     the qual's verdict). Then check what executor support passing an initplan value into workers needs: the worker
     Context must receive the evaluated Param, not re-run the subquery inside each worker. Port is_parallel_safe's
     safe_param_ids rule together with that executor half, and drive Q22 to MATCH.
+  - Confirmed 2026\-10\-14 with a minimal SF0\.25 probe \(`routing\-20261014b/initplan\-parallel\-probe\.sql`\)\.
+    `store\_sales WHERE ss\_net\_paid > \(SELECT avg\(ss\_net\_paid\) FROM store\_sales\) GROUP BY ss\_item\_sk` is a parallel
+    split in PG and serial in goopg; with a constant in place of the subquery, goopg parallelises too\.
   - Separate residual seen in the same plan: goopg's Index Only Scan on order\_customer\_fkidx costs 45.17 against
     PG's 4.01 \(heap\-fetch term / relallvisible on the unvacuumed :65433 load — M0146\-0178 territory\)\.
   - Expected movement: TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H sort-strategy and parallelism.
