@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Node is implemented by every plan-tree node. Pos is the byte offset
@@ -3135,7 +3136,11 @@ func (n *Utility) Output() Schema {
 				{Name: "description", Type: catalog.Type{Name: "text"}},
 			}
 		}
-		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}
+		// GetPGVariableResultDesc (guc_funcs.c) names the column after the
+		// parameter's own spelling, not the identifier as typed (`SHOW
+		// datestyle` prints `DateStyle`), as the simple-query fast path
+		// already did.
+		return Schema{{Name: misc.CanonicalGUCName(stmt.Name), Type: catalog.Type{Name: "text"}}}
 	}
 	return nil
 }

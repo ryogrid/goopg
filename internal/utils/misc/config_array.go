@@ -93,3 +93,23 @@ func ConfigArrayItem(name string, value *string) (string, error) {
 	}
 	return canon, nil
 }
+
+// CanonicalGUCName is the spelling PostgreSQL gives a configuration
+// parameter: find_option's record name after map_old_guc_names (guc.c), the
+// name GetPGVariableResultDesc puts on SHOW's result column (`SHOW datestyle`
+// prints a `DateStyle` column). goopg's own registration supplies the name
+// for a parameter PostgreSQL does not have; an unknown or custom name is
+// returned as given.
+func CanonicalGUCName(name string) string {
+	lname := strings.ToLower(name)
+	if mapped, ok := mapOldGUCNames[lname]; ok {
+		lname = mapped
+	}
+	if pg, ok := pgGUCs[lname]; ok {
+		return pg.Name
+	}
+	if v, ok := builtinRegistry().Get(lname); ok {
+		return v.Name
+	}
+	return name
+}

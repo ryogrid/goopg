@@ -4794,7 +4794,7 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Design `docs/design/0100\-0149/0122\-0008\-set\-local\-outside\-block\.md`\.
   Movement: none — configuration subsystem; no plan instrument
 
-- [ ] **SHOW through the executor names its column in lower case** \(found
+- [x] **SHOW through the executor names its column in lower case** \(found
   2026\-10\-10\)\. `SET LOCAL DateStyle = \'SQL, DMY\' \; SHOW DateStyle`
   \(a multi\-statement message, so the executor\'s utilitySettingsOp\.nextShow\)
   labels the column `datestyle`; PG and goopg\'s single\-statement fast path
@@ -4802,6 +4802,14 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
   name\)\.
   Kind: bug
   Parent: M0122-0008
+  - Fixed 2026\-10\-14: the SHOW plan schema \(optimizer Utility\.Output\) names the column with
+    `misc\.CanonicalGUCName` — PG\'s record name after map\_old\_guc\_names \(pg\_gucs\_gen\.go\), then goopg\'s
+    registration, else the name as given\. Verified on a scratch PG 18\.3: `SHOW datestyle` → `DateStyle`, `SHOW
+    timezone` → `TimeZone`, `SHOW sort\_mem` → `work\_mem`\.
+    - Test `TestShowThroughExecutorNamesColumnCanonically` \(fails before the fix\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99; regress guc / date / horology
+      identical\.
+  Movement: none — correctness fix (SHOW column label), no plan instrument
 
 - [x] **proconfig / setconfig store the GUC name as typed** \(found
   2026\-10\-10\)\. `CREATE FUNCTION g\(\) … SET datestyle = iso, mdy` stores
@@ -28989,6 +28997,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
     - TPC\-H Q9, Q10, Q18, Q20 and Q21 sit on loads whose statistics differ \(lineitem 6001988 vs 5998990 rows;
       Q20 88111 vs 95012, Q21 165965 vs 269864 — cost levels driven by the estimates, not one mechanism\)\.
     No task was filed, so item 10 is live for the loop; re\-run after HEAD advances in the planner\-relevant paths\.
+  - S9 re\-check 2026\-10\-14 — **exhausted at `ccdbe68f4`** \(an executor DDL\-NOTICE commit\): fresh captures give the
+    same first\-divergence records at all three corpora as `routing\-20261014d` \(SF0\.25 81/99, SF1 66/99, TPC\-H
+    14/22\), so the proven\-mechanism verdict stands and item 10 stays live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
