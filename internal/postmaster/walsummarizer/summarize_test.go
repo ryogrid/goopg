@@ -2,6 +2,7 @@ package walsummarizer
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -306,4 +307,62 @@ fsync = off
 		}
 	}
 	t.Logf("%d summaries byte-identical to PG 18.3 (redo %s)", len(pgFiles), strconv.Quote(redoLSN))
+
+	// The live Summarizer over the same WAL, stopped partway and restarted
+	// from ResumePoint (GetOldestUnsummarizedLSN's exact start), must end
+	// with the same files and no gap.
+	live := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(live, walsummary.Dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runLive := func(recs []xlog.Record, start uint64) State {
+		s := NewSummarizer(live, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := s.Run(ctx, &sliceSource{recs: recs, cancel: cancel}, start); err != nil {
+			t.Fatal(err)
+		}
+		return s.State()
+	}
+	first := runLive(recs[:len(recs)/2], pgFiles[0].Start)
+	resume, ok, err := ResumePoint(live, 1)
+	if err != nil || !ok || resume != first.SummarizedLSN {
+		t.Fatalf("ResumePoint = %X %v %v, want the first run's summarized LSN %X", resume, ok, err, first.SummarizedLSN)
+	}
+	second := runLive(recs, resume)
+	liveFiles, _ := walsummary.List(live, 0, 0, 0)
+	if len(liveFiles) != len(files) {
+		t.Fatalf("live summarizer wrote %d files across a restart, offline %d", len(liveFiles), len(files))
+	}
+	if ok, missing := walsummary.AreComplete(liveFiles, pgFiles[0].Start, files[len(files)-1].End); !ok {
+		t.Errorf("live summaries have a gap at %X", missing)
+	}
+	for i, f := range liveFiles {
+		a, _ := os.ReadFile(f.Path(live))
+		b, _ := os.ReadFile(files[i].Path(out))
+		if f != files[i] || !bytes.Equal(a, b) {
+			t.Errorf("live summary %s differs from offline %s", f.Name(), files[i].Name())
+		}
+	}
+	if second.Running || second.SummarizedLSN != files[len(files)-1].End || second.PendingLSN < second.SummarizedLSN {
+		t.Errorf("final state %+v: want stopped, summarized to %X", second, files[len(files)-1].End)
+	}
+}
+
+// sliceSource replays records, then cancels its context to stop Run, as a
+// server shutdown would.
+type sliceSource struct {
+	recs   []xlog.Record
+	i      int
+	cancel context.CancelFunc
+}
+
+func (s *sliceSource) Next(ctx context.Context) (xlog.Record, error) {
+	if s.i >= len(s.recs) {
+		s.cancel()
+		<-ctx.Done()
+		return xlog.Record{}, ctx.Err()
+	}
+	s.i++
+	return s.recs[s.i-1], nil
 }

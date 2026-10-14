@@ -90,3 +90,38 @@ These are ports of `backup/walsummaryfuncs.c` over `internal/backup/walsummary`.
 - The fire set shows no changed plan at SF0.25 or SF1, and the TPC-H acceptance arm is value-identical.
 
 **Not ported:** `pg_get_wal_summarizer_state()` (S4b) needs the live summarizer's state (S3).
+
+## S3a landed (2026-10-14): the live summarizer core
+
+S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires it into the server.
+
+- **One implementation.** `rangeSummarizer` is a streaming port of one `SummarizeWAL` call: `add` consumes a record
+  and reports when a boundary ends the range; `finish` writes the file.
+  - The offline `Summarize` and the live `Summarizer.Run` both drive it.
+  - Oracle A (PG's own summaries) therefore checks the code the live loop runs.
+- **`Summarizer.Run(ctx, src, start)`** consumes a `Source` from an exact start and writes a summary per range.
+  - It publishes `State` (`SummarizedTLI` / `SummarizedLSN` / `LSNIsExact` / `PendingLSN` / `Running`, as in
+    `WalSummarizerData`) and closes a `Changed` channel per summary, for a future `WaitFor`.
+  - It returns nil when its context is cancelled.
+- **`ResumePoint`** is the exact-start half of `GetOldestUnsummarizedLSN`: the highest end among the summaries on
+  disk for the timeline.
+- **Flush bound.**
+  - `xlog.Writer.FlushedLSN()` is new.
+  - `RecordIterator.SetReadLimit` caps `Next`, so no record ending past the limit is returned, even when written.
+  - With the limit set to `FlushedLSN`, the summarizer never summarizes WAL a crash could still rewrite. That was
+    the design's "summarizing unflushed WAL" risk.
+  - The writer wakes subscribers only on append, so the S3b loop must re-poll on a timer while flushes catch up.
+
+**Evidence:**
+- `TestSummarizeMatchesPostgres` now also runs the live `Summarizer` over PG's WAL. It stops halfway, restarts
+  from `ResumePoint`, and runs to the end.
+  - The files equal the offline ones, which equal PG's, byte for byte.
+  - `AreComplete` finds no gap across the restart.
+- `TestRecordIteratorReadLimit` checks that a written record past the limit, even by one byte, is held back and
+  then released when the limit passes it.
+
+**Next, S3b:**
+- start and stop on `summarize_wal` in `Server.Run`, with reload reconcile;
+- the iterator source with the flush bound and a timed re-poll;
+- the no-summaries start (PG's `XLogFindNextRecord` from the oldest segment);
+- the retention clamp, the `wal_level=minimal` startup error, and the `pg_stat_io` reads counter.

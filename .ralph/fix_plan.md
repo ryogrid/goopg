@@ -5182,6 +5182,20 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — SQL functions over WAL summaries; no plan instrument \(the fire set confirms no plan
       moved\)\.
     - Next slice: S3 \(the live summarizer goroutine\), then S4b \(`pg\_get\_wal\_summarizer\_state`\)\.
+  - **2026\-10\-14 S3a landed** — the live summarizer core\. S3 is split: S3a is the core, S3b the server wiring\.
+    - `rangeSummarizer`: a streaming SummarizeWAL range, shared by the offline `Summarize` and the live
+      `Summarizer\.Run`\.
+    - `Summarizer\.Run` publishes `State` \(as WalSummarizerData\)\. `ResumePoint` gives the exact restart point\.
+    - `xlog\.Writer\.FlushedLSN` and `RecordIterator\.SetReadLimit` provide the flush bound\.
+    - Oracle A extended: the live summarizer over PG\'s WAL, restarted halfway, writes PG\'s files byte for byte
+      with no gap\. `TestRecordIteratorReadLimit` covers the bound\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next slice, S3b:
+      - `summarize\_wal` start/stop in Server\.Run, with reload reconcile;
+      - the iterator source with a timed re\-poll;
+      - the no\-summaries start \(XLogFindNextRecord\);
+      - the retention clamp, the wal\_level=minimal startup error and the pg\_stat\_io counter\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

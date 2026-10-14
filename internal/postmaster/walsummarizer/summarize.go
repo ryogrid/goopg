@@ -200,96 +200,116 @@ func summarizeXact(x *xlog.XLogDecodedRecord, tab *blkreftable.Table) error {
 	return nil
 }
 
-// summarizeRange is one SummarizeWAL call with exact=true over recs[i:], where
-// recs[i] is the first record at or after start. It returns where the summary
-// ended, the index of the first record it did not consume, and whether it
-// reached a boundary; reachedEnd means the records ran out first, so the
-// range is still open and no file is written (the live summarizer would wait
-// for more WAL). wrote is false when the range was fast-forwarded or empty.
-func summarizeRange(dataDir string, tli uint32, recs []xlog.Record, i int, start uint64) (end uint64, next int, wrote, reachedEnd bool, err error) {
-	tab := blkreftable.NewTable()
-	fastForward := true
-	end = start
-	for ; i < len(recs); i++ {
-		r := recs[i]
-		x := r.XLog
-		if x == nil {
-			// A goopg-native record without an XLogRecord header carries no
-			// block references the summarizer can see (design §4.4, S6a).
-			end = endRecPtr(r)
-			continue
-		}
-		switch x.Header.Rmid {
-		case rmXlogID:
-			isBoundary, ff, berr := boundary(x)
-			if berr != nil {
-				return 0, i, false, false, berr
-			}
-			if isBoundary {
-				if readRecPtr(r) > start {
-					end = readRecPtr(r)
-					goto done
-				}
-				fastForward = ff
-			}
-		case rmDbaseID:
-			if !fastForward {
-				err = summarizeDbase(x, tab)
-			}
-		case rmSmgrID:
-			if !fastForward {
-				err = summarizeSmgr(x, tab)
-			}
-		case rmXactID:
-			if !fastForward {
-				err = summarizeXact(x, tab)
-			}
-		}
-		if err != nil {
-			return 0, i, false, false, fmt.Errorf("record at %X/%X: %w", uint32(readRecPtr(r)>>32), uint32(readRecPtr(r)), err)
-		}
-		if !fastForward {
-			for _, b := range x.Blocks {
-				if int32(b.Rel.Fork) != fsmFork {
-					tab.MarkBlockModified(blockLocator(b), int32(b.Rel.Fork), uint32(b.Block))
-				}
-			}
-		}
-		end = endRecPtr(r)
+// rangeSummarizer is one SummarizeWAL call, fed a record at a time: it
+// accumulates the BlockRefTable for the WAL from start until the next
+// boundary record. Both the offline Summarize and the live Summarizer drive
+// it, so the two cannot drift apart.
+type rangeSummarizer struct {
+	tli         uint32
+	start, end  uint64
+	fastForward bool
+	tab         *blkreftable.Table
+}
+
+func newRangeSummarizer(tli uint32, start uint64) *rangeSummarizer {
+	return &rangeSummarizer{tli: tli, start: start, end: start, fastForward: true, tab: blkreftable.NewTable()}
+}
+
+// add feeds one record whose ReadRecPtr is at or after start. done reports
+// that r is a boundary ending this range at r's ReadRecPtr; r is then NOT
+// consumed and must be fed to the next range, which starts there.
+func (rs *rangeSummarizer) add(r xlog.Record) (done bool, err error) {
+	x := r.XLog
+	if x == nil {
+		// A goopg-native record without an XLogRecord header carries no
+		// block references the summarizer can see (design §4.4, S6a).
+		rs.end = endRecPtr(r)
+		return false, nil
 	}
-	return end, i, false, true, nil
-done:
-	if end > start && !fastForward {
-		if err := walsummary.Write(dataDir, walsummary.File{TLI: tli, Start: start, End: end}, tab); err != nil {
-			return 0, i, false, false, err
+	switch x.Header.Rmid {
+	case rmXlogID:
+		isBoundary, ff, berr := boundary(x)
+		if berr != nil {
+			return false, berr
 		}
-		wrote = true
+		if isBoundary {
+			if readRecPtr(r) > rs.start {
+				rs.end = readRecPtr(r)
+				return true, nil
+			}
+			rs.fastForward = ff
+		}
+	case rmDbaseID:
+		if !rs.fastForward {
+			err = summarizeDbase(x, rs.tab)
+		}
+	case rmSmgrID:
+		if !rs.fastForward {
+			err = summarizeSmgr(x, rs.tab)
+		}
+	case rmXactID:
+		if !rs.fastForward {
+			err = summarizeXact(x, rs.tab)
+		}
 	}
-	return end, i, wrote, false, nil
+	if err != nil {
+		return false, fmt.Errorf("record at %X/%X: %w", uint32(readRecPtr(r)>>32), uint32(readRecPtr(r)), err)
+	}
+	if !rs.fastForward {
+		for _, b := range x.Blocks {
+			if int32(b.Rel.Fork) != fsmFork {
+				rs.tab.MarkBlockModified(blockLocator(b), int32(b.Rel.Fork), uint32(b.Block))
+			}
+		}
+	}
+	rs.end = endRecPtr(r)
+	return false, nil
+}
+
+// finish writes the range's summary file, unless the range is empty or was
+// fast-forwarded (wal_level=minimal), and reports whether it wrote one.
+func (rs *rangeSummarizer) finish(dataDir string) (walsummary.File, bool, error) {
+	f := walsummary.File{TLI: rs.tli, Start: rs.start, End: rs.end}
+	if rs.end <= rs.start || rs.fastForward {
+		return f, false, nil
+	}
+	if err := walsummary.Write(dataDir, f, rs.tab); err != nil {
+		return f, false, err
+	}
+	return f, true, nil
 }
 
 // Summarize runs the summarizer over recs, a decoded WAL stream on timeline
 // tli, from start (an exact record start, as after a previous summary) to the
 // last redo point in recs, writing one summary file per completed range under
 // dataDir's pg_wal/summaries. It returns the files written, in order, and the
-// LSN where summarization would resume.
+// LSN where summarization would resume. Records after the last redo point stay
+// unsummarized; the live summarizer would wait for more WAL.
 func Summarize(dataDir string, tli uint32, recs []xlog.Record, start uint64) ([]walsummary.File, uint64, error) {
-	i := 0
-	for i < len(recs) && readRecPtr(recs[i]) < start {
-		i++
-	}
 	var files []walsummary.File
-	for {
-		end, next, wrote, reachedEnd, err := summarizeRange(dataDir, tli, recs, i, start)
-		if err != nil {
-			return files, start, err
+	cur := newRangeSummarizer(tli, start)
+	for _, r := range recs {
+		if readRecPtr(r) < start {
+			continue
 		}
-		if reachedEnd {
-			return files, start, nil
+		done, err := cur.add(r)
+		if err != nil {
+			return files, cur.start, err
+		}
+		if !done {
+			continue
+		}
+		f, wrote, err := cur.finish(dataDir)
+		if err != nil {
+			return files, cur.start, err
 		}
 		if wrote {
-			files = append(files, walsummary.File{TLI: tli, Start: start, End: end})
+			files = append(files, f)
 		}
-		start, i = end, next
+		cur = newRangeSummarizer(tli, cur.end)
+		if _, err := cur.add(r); err != nil { // the boundary record opens the next range
+			return files, cur.start, err
+		}
 	}
+	return files, cur.start, nil
 }

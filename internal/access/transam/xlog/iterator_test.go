@@ -3,6 +3,7 @@ package xlog
 import (
 	"bytes"
 	"context"
+	"sync/atomic"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -396,5 +397,53 @@ func TestRecordIteratorReadsPGRecordAfterDirectThenBufferedRawAppend(t *testing.
 	}
 	if string(rec2.Payload) != "second" {
 		t.Fatalf("second payload = %q, want second", rec2.Payload)
+	}
+}
+
+// TestRecordIteratorReadLimit pins SetReadLimit, the flush bound the WAL
+// summarizer reads under (walsummarizer.c reads only up to the flush
+// pointer): records ending past the limit are held back even though they
+// are written, and come through once the limit passes them.
+func TestRecordIteratorReadLimit(t *testing.T) {
+	w, dir := newTestWriter(t)
+	var ends []uint64
+	for _, p := range []string{"alpha", "beta", "gamma"} {
+		_, e, err := w.Append([]byte(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ends = append(ends, e)
+	}
+	var limit atomic.Uint64
+	limit.Store(ends[0])
+	it, err := NewRecordIterator(w, dir, 4096, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	it.SetReadLimit(limit.Load)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if rec, err := it.Next(ctx); err != nil || string(rec.Payload) != "alpha" {
+		t.Fatalf("first Next = %q, %v; want alpha", rec.Payload, err)
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelShort()
+	if rec, err := it.Next(short); err == nil {
+		t.Fatalf("Next returned %q past the read limit", rec.Payload)
+	}
+	// One byte short of beta's end still holds it back.
+	limit.Store(ends[1] - 1)
+	short2, cancelShort2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelShort2()
+	if rec, err := it.Next(short2); err == nil {
+		t.Fatalf("Next returned %q, which ends past the limit", rec.Payload)
+	}
+	limit.Store(ends[2])
+	for _, want := range []string{"beta", "gamma"} {
+		if rec, err := it.Next(ctx); err != nil || string(rec.Payload) != want {
+			t.Fatalf("Next = %q, %v; want %s", rec.Payload, err, want)
+		}
 	}
 }

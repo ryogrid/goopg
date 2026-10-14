@@ -806,6 +806,12 @@ func (w *Writer) WrittenLSN() uint64 {
 	return w.writeLSNAtomic.Load()
 }
 
+// FlushedLSN returns the highest LSN known to be durable (LogwrtResult.Flush):
+// a record whose EndLSN is at or below it survives a crash. Lock-free.
+func (w *Writer) FlushedLSN() uint64 {
+	return w.flushedLSNAtomic.Load()
+}
+
 // DrainedLSN returns the last byte position already written into segment
 // files. Bytes between DrainedLSN and WrittenLSN may still live only in the
 // in-memory WAL buffer.
