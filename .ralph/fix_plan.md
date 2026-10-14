@@ -4896,6 +4896,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
     - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
       `wal\_init\_zero` contexts; `wal\_buffers` units\.
+  - Slice 4 done 2026\-10\-14: `wal\_buffers` is counted in XLOG\_BLCKSZ pages with PG\'s boot \-1 auto\-tune\.
+    - `cmd/goopg` `resolveWALBuffers` applies PG\'s rule: shared\_buffers/32, capped at one segment, at least 8;
+      manual values below 4 become 4\.
+    - The resolved count is stored back, so SHOW shows `4MB` at the 128MB default\. It was `16777216`\.
+    - The byte\-valued bench / analysis scripts now use `MB`\.
+    - Ledgered: a reload warns for every postmaster entry even when it is unchanged \(PG warns only on a change\)\.
+      `pg\_settings` lists only 58 rows\.
+    - Test `TestResolveWALBuffersFollowsPG`\.
+    - Gates: units, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
+    - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
+      `wal\_init\_zero` contexts\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

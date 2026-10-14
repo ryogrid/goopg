@@ -28,8 +28,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Shared configuration for both systems
 SHARED_BUFFERS="2560MB"  # 2.5GB
-WAL_BUFFERS_MB="100MB"   # For PostgreSQL
-WAL_BUFFERS_BYTES="104857600"  # 100MB in bytes for goopg (goopg doesn't accept unit suffix)
+WAL_BUFFERS_MB="100MB"   # both servers; goopg takes the unit suffix too
 CHECKPOINT_TIMEOUT="24h"
 MAX_WAL_SIZE="1024GB"  # 1TB
 
@@ -85,7 +84,7 @@ echo "  Clients: $CLIENTS"
 echo "  Threads: $THREADS"
 echo "  Duration: ${DURATION}s"
 echo "  shared_buffers: $SHARED_BUFFERS"
-echo "  wal_buffers: 100MB (goopg: $WAL_BUFFERS_BYTES bytes, PostgreSQL: $WAL_BUFFERS_MB)"
+echo "  wal_buffers: $WAL_BUFFERS_MB"
 echo "  checkpoint_timeout: $CHECKPOINT_TIMEOUT"
 echo "  max_wal_size: $MAX_WAL_SIZE"
 echo "  data root: $BENCH_DATA_ROOT"
@@ -110,13 +109,13 @@ init_goopg() {
     mkdir -p "$(dirname "$GOOPG_DATA_DIR")"
     "$GOOPG_BIN" init -D "$GOOPG_DATA_DIR"
 
-    # Configure goopg (note: wal_buffers requires bytes, no unit suffix)
+    # Configure goopg
     cat >> "$GOOPG_DATA_DIR/postgresql.conf" <<EOF
 
 # Performance comparison settings
 max_connections = 200
 shared_buffers = $SHARED_BUFFERS
-wal_buffers = $WAL_BUFFERS_BYTES
+wal_buffers = $WAL_BUFFERS_MB
 checkpoint_timeout = $CHECKPOINT_TIMEOUT
 max_wal_size = $MAX_WAL_SIZE
 EOF

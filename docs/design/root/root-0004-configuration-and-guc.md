@@ -594,6 +594,38 @@ Tests: `TestFlushAfterGUCsUseBlockUnits` covers the display and both parse
 directions. `TestApplyWriterSettingsReachesRunningLoops` covers the pool
 thresholds.
 
-Still open (ledgered): `wal_buffers` is stored in bytes with a default of
-16MB. PG declares it XBLOCKS with -1, meaning 1/32 of `shared_buffers`,
-capped at one WAL segment (`check_wal_buffers`).
+`wal_buffers` followed in slice 4, below.
+
+## `wal_buffers` auto-tunes in pages (2026-10-14, M0122-0008 slice 4)
+
+PG 18.3 declares `wal_buffers` GUC\_UNIT\_XBLOCKS. Its boot value is -1,
+its range -1 to INT\_MAX/XLOG\_BLCKSZ, and it is PGC\_POSTMASTER.
+
+- `check_wal_buffers` / `XLOGChooseNumBuffers` (xlog.c) resolve -1 to
+  `NBuffers/32` pages, capped at one WAL segment and raised to at least 8.
+- A manual value below 4 becomes 4.
+- `XLOGShmemSize` stores the resolved count with `PGC_S_DYNAMIC_DEFAULT`.
+  If that cannot override an explicit `-1` from the file, it uses
+  `PGC_S_OVERRIDE` instead. So SHOW reports the resolved size and
+  `boot_val` stays -1.
+
+goopg stored bytes with a fixed 16MB default, where 0 disabled the buffer,
+so SHOW printed `16777216`.
+
+- The registry entry is now `UnitBlocks` with boot value -1.
+- `cmd/goopg`'s `resolveWALBuffers` applies PG's rule before
+  `initdb.Open`. It writes the count back with `SourceDefault`, or with
+  `SourceOverride` when the file says -1, and passes bytes on to the
+  writer. 0 is no longer reachable; the minimum is 4 pages.
+- Under the 128MB `shared_buffers` default the WAL buffer is now 4MB, not
+  16MB, as in PG. Clusters with at least 512MB of `shared_buffers` keep
+  16MB, the segment cap.
+- Byte-valued writers of the parameter were moved to units:
+  `bench/pgbench-compare/run_comparison.sh` and
+  `analysis/perf-optimize3/scripts/run_rw50.sh`. No live bench or nightly
+  cluster configuration sets it.
+
+Test: `TestResolveWALBuffersFollowsPG` (`cmd/goopg`) covers auto at three
+`shared_buffers` sizes, an explicit -1, a manual value and the minimum.
+Live, a fresh goopg cluster shows `4MB` at 128MB. The scratch PG oracle, at
+2GB, shows `16MB`, with `boot_val` -1 and source `default`.

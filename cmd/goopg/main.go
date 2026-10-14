@@ -444,7 +444,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
-		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
+		walBuffers := resolveWALBuffers(registry, poolSlots) * xlogBlockSize
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
 		// fsync=off (test harnesses only) turns every runtime durability
 		// sync into a no-op; write ordering/content are unchanged.
@@ -1060,12 +1060,60 @@ func stringGUC(registry *misc.Registry, name string, fallback string) string {
 // intGUC reads an int-shaped GUC by name, returning fallback when
 // the registry is nil, the variable isn't registered, or its
 // Display value isn't a valid integer.
+// xlogBlockSize is XLOG_BLCKSZ, the page size of the XBLOCKS-valued WAL GUCs.
+const xlogBlockSize = 8192
+
 // walWriterFlushAfterBytes reads wal_writer_flush_after, which PG stores in
 // XLOG_BLCKSZ pages (GUC_UNIT_XBLOCKS, default 128 = 1MB), as the byte count
 // the WAL writer takes.
 func walWriterFlushAfterBytes(registry *misc.Registry) int64 {
-	const xlogBlockSize = 8192 // XLOG_BLCKSZ
 	return int64(intGUC(registry, "wal_writer_flush_after", 128)) * xlogBlockSize
+}
+
+// resolveWALBuffers returns wal_buffers in XLOG_BLCKSZ pages, resolved the
+// way PG resolves it before sizing XLogCtl (check_wal_buffers and
+// XLOGChooseNumBuffers, xlog.c): -1 auto-tunes to shared_buffers/32 pages,
+// capped at one WAL segment and raised to at least 8; a manual value below 4
+// becomes 4. The resolved count is written back with the default source, as
+// XLOGShmemSize's SetConfigOption(PGC_S_DYNAMIC_DEFAULT) does, so SHOW
+// wal_buffers and pg_settings report it while the boot value stays -1.
+// sharedBufferSlots is NBuffers (0 = the registry could not size it: the
+// 128MB default's 16384).
+func resolveWALBuffers(registry *misc.Registry, sharedBufferSlots int) int64 {
+	n := intGUC(registry, "wal_buffers", -1)
+	if n == -1 {
+		nbuffers := sharedBufferSlots
+		if nbuffers <= 0 {
+			nbuffers = 16384
+		}
+		n = nbuffers / 32
+		if segPages := int(xlog.DefaultSegmentSize / xlogBlockSize); n > segPages {
+			n = segPages
+		}
+		if n < 8 {
+			n = 8
+		}
+		if registry != nil {
+			if v, ok := registry.Get("wal_buffers"); ok {
+				// An explicit -1 in the file outranks the dynamic default,
+				// so PG retries with PGC_S_OVERRIDE.
+				src := misc.SourceDefault
+				if v.Source != misc.SourceDefault {
+					src = misc.SourceOverride
+				}
+				_ = registry.Set("wal_buffers", strconv.Itoa(n), src)
+			}
+		}
+	}
+	if n < 4 {
+		n = 4
+		if registry != nil {
+			if v, ok := registry.Get("wal_buffers"); ok {
+				_ = registry.Set("wal_buffers", "4", v.Source)
+			}
+		}
+	}
+	return int64(n)
 }
 
 func intGUC(registry *misc.Registry, name string, fallback int) int {
