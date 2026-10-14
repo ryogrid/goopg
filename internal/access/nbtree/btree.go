@@ -3234,9 +3234,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		return bt.clearIncompleteSplit(blk)
 	}
 
-	// Otherwise, insert the separator into the parent.
-	parentBlk := path[len(path)-1]
-	parentPath := path[:len(path)-1]
+	// Otherwise, insert the separator into the parent, re-found by the
+	// downlink to blk rather than trusted from the descent's path
+	// (_bt_getstackbuf).
+	parentBlk, parentPath, err := bt.getStackBuf(path, blk, op.Level)
+	if err != nil {
+		return err
+	}
 	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
 		return err
 	}
@@ -3245,6 +3249,101 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// already cleared it under its own record (S11.5b-3), in which case this
 	// is a no-op; the parent's no-split path still leaves it to us.
 	return bt.clearIncompleteSplit(blk)
+}
+
+// getStackBuf is _bt_getstackbuf (nbtinsert.c) for a page split: it returns
+// the page on the level above childLevel that holds the downlink to childBlk,
+// and that page's ancestors. The descent's path is only a hint: the parent may
+// have split since, moving the downlink right, and when the tree has grown a
+// level above the path (another handle lifted the root) the path is empty, so
+// the search starts at the leftmost page of the parent level, as
+// _bt_insert_parent does via _bt_get_endpoint. It moves right along the level,
+// skipping half-dead and deleted pages, until the downlink is found.
+func (bt *BTree) getStackBuf(path []storage.BlockNumber, childBlk storage.BlockNumber, childLevel uint32) (storage.BlockNumber, []storage.BlockNumber, error) {
+	parentLevel := childLevel + 1
+	var start storage.BlockNumber
+	var ancestors []storage.BlockNumber
+	if len(path) > 0 {
+		start, ancestors = path[len(path)-1], path[:len(path)-1]
+	} else {
+		var err error
+		if start, ancestors, err = bt.leftmostAtLevel(parentLevel); err != nil {
+			return 0, nil, err
+		}
+	}
+	fellBack := len(path) == 0
+	for blk := start; ; {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			return 0, nil, err
+		}
+		op := readOpaque(slot.Page())
+		if op.Level != parentLevel && !fellBack {
+			// The hint is not on the parent level at all: start over from
+			// the level's leftmost page.
+			bt.unpinR(slot)
+			fellBack = true
+			if blk, ancestors, err = bt.leftmostAtLevel(parentLevel); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		if !op.IsHalfDead() && !op.IsDeleted() && op.Level == parentLevel {
+			items, perr := bt.format().pageItems(slot.Page())
+			if perr != nil {
+				bt.unpinR(slot)
+				return 0, nil, perr
+			}
+			for _, it := range items {
+				if it.ptr.Block == childBlk {
+					bt.unpinR(slot)
+					return blk, ancestors, nil
+				}
+			}
+		}
+		next := op.Next
+		bt.unpinR(slot)
+		if next == storage.InvalidBlockNumber {
+			return 0, nil, fmt.Errorf("btree: failed to re-find parent key in index %d for split page %d", bt.rel.RelOid, childBlk)
+		}
+		blk = next
+	}
+}
+
+// leftmostAtLevel is _bt_get_endpoint's leftmost descent: the leftmost page on
+// level and the pages above it, from the metapage's root down the first
+// downlinks.
+func (bt *BTree) leftmostAtLevel(level uint32) (storage.BlockNumber, []storage.BlockNumber, error) {
+	meta, err := bt.readMeta()
+	if err != nil {
+		return 0, nil, err
+	}
+	if meta.Level < level {
+		return 0, nil, fmt.Errorf("btree: index %d has no level %d (root level %d)", bt.rel.RelOid, level, meta.Level)
+	}
+	var ancestors []storage.BlockNumber
+	cur := meta.Root
+	for {
+		slot, err := bt.pinR(cur)
+		if err != nil {
+			return 0, nil, err
+		}
+		op := readOpaque(slot.Page())
+		if op.Level <= level {
+			bt.unpinR(slot)
+			return cur, ancestors, nil
+		}
+		items, perr := bt.format().pageItems(slot.Page())
+		bt.unpinR(slot)
+		if perr != nil {
+			return 0, nil, perr
+		}
+		if len(items) == 0 {
+			return 0, nil, fmt.Errorf("btree: internal page %d of index %d has no downlinks", cur, bt.rel.RelOid)
+		}
+		ancestors = append(ancestors, cur)
+		cur = items[0].ptr.Block
+	}
 }
 
 // clearIncompleteSplit (M0055-0004-followup-finish-split) unsets

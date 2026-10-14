@@ -5515,6 +5515,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\.
     - Next: the milestone group\'s larger items — Lehman/Yao lock\-coupled descent and `splitMu` removal \(design
       0055\-0002; the M0055\-0004 stage\-2 attempt hit unpin\-underflow races\)\.
+  - **2026\-10\-14 lock\-coupling slice 1 landed** \(design 0055\-0002 §4\.2, gaps 1–2 of an 8\-gap plan\)\.
+    - `getStackBuf` \(`\_bt\_getstackbuf`\) re\-finds a split page\'s parent by its downlink, moving right along the
+      parent level; `leftmostAtLevel` \(`\_bt\_get\_endpoint`\) covers an empty path\. Replaces the blind
+      `path\[len\(path\)\-1\]`\.
+    - Unshared reproducer: 15/15 → 5/15 failures; the `\[\-1\]` panic class is gone; the rest are gaps 5 \(finish
+      incomplete splits on contact\) and 6 \(atomic root split\)\. Shared: 0/20, `\-race` clean\.
+    - Tests: `TestGetStackBuf` \(empty path, stale hint, wrong\-level hint, unknown child\)\.
+    - Gates: nbtree \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: gap 3 \(clear the child\'s INCOMPLETE\_SPLIT inside the parent\'s insert record\), then gap 4 \(PG latch
+      order\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

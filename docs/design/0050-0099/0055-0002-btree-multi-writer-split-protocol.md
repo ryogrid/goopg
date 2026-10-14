@@ -109,6 +109,48 @@ fixed array of 256 cache\-line\-padded mutexes indexed by a hash of the
 use ≥ 90 % of the stripes\) and zero allocation. The reproducer stays green:
 0/20 invocations fail, plus clean `\-race` runs.
 
+### 4.2 Toward PG's lock\-coupled protocol \(M0122\-0010, 2026\-10\-14\)
+
+Plan of record for removing `lockStructural`. Each gap is a slice, in dependency
+order:
+
+1. **\(S, landed\)** Empty or stale `path`: start at the leftmost page of the
+   parent level \(`\_bt\_get\_endpoint`\).
+2. **\(M, landed\)** Re\-find the parent by downlink \(`\_bt\_getstackbuf`\):
+   move right along the parent level, skipping half\-dead and deleted pages,
+   until a downlink equals the split child. Otherwise fail with "failed to
+   re\-find parent key".
+3. **\(S\)** Clear the child's `INCOMPLETE\_SPLIT` inside the parent's no\-split
+   insert record, as `\_bt\_insertonpg` does. Today a separate
+   `clearIncompleteSplit` page record does it.
+4. **\(M\)** Latch in PG's order: keep the left page latched until the parent
+   is found, take the child before the parent, and release the right page once
+   the parent is pinned. Today all latches are released before going up a
+   level, and the split latches the parent before the child.
+5. **\(M\)** Finish incomplete splits on contact \(`\_bt\_moveright` for update,
+   `\_bt\_stepright`, `\_bt\_getstackbuf`\). `finishSplit` exists but has no
+   production caller. This needs gap 4 first.
+6. **\(M\)** Atomic root split: hold left, right, the new root and the metapage
+   together. Fix `createNewRoot`'s fallback, which inserts into `parentPath\[0\]`
+   \(the root\) whatever the level.
+7. **\(M\)** Vacuum: refuse to delete a page whose left sibling is flagged
+   \(`\_bt\_leftsib\_splitflag`\), and check that recycling is safe for pages a
+   stale path can still name.
+8. **\(L\)** Remove `lockStructural`; stress under `\-race`.
+
+**Slice 1 \(gaps 1–2\).** `getStackBuf` / `leftmostAtLevel` replace the blind
+`path\[len\(path\)\-1\]` at the split's parent step; `TestGetStackBuf` pins them.
+The acceptance instrument is `TestStructuralLockInteriorSplitWorkload` with
+`NBTREE\_UNSHARED\_STRUCTURAL\_LOCK=1`:
+
+| state | unshared invocations failed | failure classes |
+|---|---|---|
+| before | 15 / 15 | mostly `index out of range \[\-1\]` \(empty path\) |
+| after slice 1 | 5 / 15 | 4 "failed to re\-find parent key" \(gap 5\); 1 "no level 1 \(root level 0\)" \(gap 6\) |
+
+The shared\-lock configuration stays at 0/20 failures, and the package passes under
+`\-race`.
+
 ## 5. Tests
 
 - Multi-writer split stress with random keys.
