@@ -32963,3 +32963,9 @@ Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGOR
     shape. Then compare with goopg's `addPartialDistinctPaths` (distinctpaths.go) and its election, and drive Q38 to
     MATCH.
   - Expected movement: TPC-DS SF0.25 match (Q38, Q87) and CATEGORIES-EXCL-MATCH sort-strategy at both scales.
+  - Lead \(2026\-10\-14, from reading the code, not yet measured\): `addPartialDistinctPaths`\' UNSPLIT arm
+    \(distinctpaths\.go, `Unique \-> Gather Merge \-> Sort \-> <partial>`\) files the scan/join rel\'s Gather Merge
+    straight onto the DISTINCT rel, the mechanism M0146\-0190 fixed for the grouped rel\. PG adds
+    create\_final\_distinct\_paths first and the partial arm second; with fuzz\-equal costs the plain shape would win, so
+    PG choosing the per\-worker Unique implies its plain Gather Merge never reached the DISTINCT rel\. Next step: gate the
+    UNSPLIT arm on `scanJoinRelKeepsGatherMerge` \(partialaggupper\.go\), then measure Q38/Q87\.
