@@ -3954,7 +3954,7 @@ heuristic stays live.)
   - Design `docs/design/0100-0149/m0146-0015f-bpchar-hash-semantics-parity.md`;
     evidence `analysis/m0146/m0146-0015f/`.
 
-- [ ] **testport/TestE2E_FailoverPGtoGoopg** — testport TestE2E\_FailoverPGtoGoopg FAILed \(subtest: async\)
+- [x] **testport/TestE2E_FailoverPGtoGoopg** — testport TestE2E\_FailoverPGtoGoopg FAILed \(subtest: async\)
   (AI-20261014-001833-001; repro: `go test -v -run '^TestE2E_FailoverPGtoGoopg$' ./internal/testport/`,
   evidence `ci/logs/20261014-001833/testport/go-test.log`; first seen in the 2026-10-14 nightly).
   Kind: impl
@@ -3965,6 +3965,17 @@ heuristic stays live.)
   - Not yet triaged: first establish whether it reproduces on HEAD or is a one-night timing flake (the nightly
     host was saturated by the batch); if goopg really loses rows a PG primary had shipped, it is an S2
     data-loss finding and needs an escalation block for owner placement.
+  - Triaged 2026\-10\-14: a timing flake in the test\'s bound, not data loss\.
+    - HEAD passes 3/3 on an idle host\.
+    - The nightly async subtest ran 12\.7 s against \~9\.5 s normally: the batch saturated the host\.
+    - `goopg promote` drains every received record before promoting, and a drain timeout fails the promotion
+      \(cmd/goopg/standby\.go runPromote\)\. The promotion succeeded, so the missing 36 commits were never shipped
+      before the kill\. That is legal async loss in PG too\.
+    - The bound `killCommitted \- 20` assumed the stream lags by at most 20 commits, which no async guarantee says\.
+  - Fix \(test only\): both failover tests \(PG→goopg and the goopg→PG sibling\) now take the lower bound from the rows the
+    standby had already replayed before the kill\. Promotion must never roll those back, in PG or goopg\. They log
+    kept/committed/replayed\. 2/2 runs pass, e\.g\. "kept 65 of 66 \(65 replayed before the kill\)"\.
+Movement: none — correctness test hardening (nightly flake), no plan instrument
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
