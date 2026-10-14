@@ -32,3 +32,29 @@ Gather Merge` (SF0.25 Q33, SF1 Q18).
 
 - M0146-0191 — sort-strategy, "under Gather Merge: PG Unique | goopg Sort", TPC-DS SF0.25 Q38 (also Q87 at
   SF0.25 and Q38 at SF1).
+
+## Second filing from this census (after M0146-0191 closed as a PG-internal tie)
+
+M0146-0191's close showed that the Q38/Q87 partial-DISTINCT records are a statistics-sample tie inside PG 18.3,
+so they count as COSTTIE. Before filing again, each remaining sort-strategy record was checked for PG-side
+stability. On the scratch PG build (tmp/pgdbg, with its own ANALYZE sample), SF0.25 Q33 and Q72 plan exactly as
+on :65438, so neither record is a sample-flipping tie. Their records, however, span 4 and 6 categories. SF1 Q18
+matches at SF0.25, which puts it in the STALE-SF1 class.
+
+TPC-H Q22 (`depth=1 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort`) has a clear mechanism,
+not a near-tie. goopg plans the anti join entirely serially. Its filter compares against `(InitPlan 1).col1`, and
+goopg judges that uncorrelated scalar subquery as a SubPlan whose body holds a Gather (`isParallelSafeExpr` ->
+`subPlanParallelSafe`), so the qual is parallel-restricted. PG makes the initplan's output a PARAM_EXEC Param and
+lists it in `safe_param_ids` (`is_parallel_safe`, clauses.c), because the value is computed at the Gather and
+passed to the workers. Plans: `tpch-q22-pg.plans.txt`, `tpch-q22-goopg.plans.txt`.
+
+- Filed M0146-0192 — TPC-H Q22.
+
+Confirmed with a minimal probe on SF0.25 (`initplan-parallel-probe.sql`). Take
+`SELECT ss_item_sk, count(*) FROM store_sales WHERE ss_net_paid > (SELECT avg(ss_net_paid) FROM store_sales) GROUP BY ss_item_sk`:
+
+- PG plans Finalize HashAggregate → Gather → Partial HashAggregate → Parallel Seq Scan, with the
+  `(InitPlan 1).col1` filter inside the workers.
+- goopg plans a serial HashAggregate over a serial Seq Scan.
+- With the constant `ss_net_paid > 100` instead, both plan the parallel split. The initplan qual alone causes the
+  refusal.

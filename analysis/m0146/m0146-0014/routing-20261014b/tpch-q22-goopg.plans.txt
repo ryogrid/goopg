@@ -1,0 +1,17 @@
+GroupAggregate  (cost=21579.89..21596.34 rows=658 width=72)
+  Group Key: (substr((customer.c_phone)::text, 1, 2))
+  InitPlan 1
+    ->  Finalize Aggregate  (cost=6064.60..6064.62 rows=1 width=32)
+          ->  Gather  (cost=6064.35..6064.60 rows=2 width=32)
+                Workers Planned: 2
+                ->  Partial Aggregate  (cost=5064.35..5064.36 rows=1 width=32)
+                      ->  Parallel Seq Scan on customer customer_1  (cost=0.00..5059.38 rows=1988 width=624)
+                            Filter: ((c_acctbal > 0.00) AND (substr((c_phone)::text, 1, 2) = ANY ('{13,31,23,29,30,18,17}'::text[])))
+  ->  Sort  (cost=15515.28..15516.92 rows=658 width=1072)
+        Sort Key: (substr((customer.c_phone)::text, 1, 2))
+        ->  Nested Loop Anti Join  (cost=0.43..15484.48 rows=658 width=128)
+              ->  Seq Scan on customer  (cost=0.00..7137.50 rows=1750 width=624)
+                    Filter: ((c_acctbal > (InitPlan 1).col1) AND (substr((c_phone)::text, 1, 2) = ANY ('{13,31,23,29,30,18,17}'::text[])))
+              ->  Index Only Scan using order_customer_fkidx on orders  (cost=0.43..45.17 rows=16 width=32)
+                    Index Cond: (o_custkey = customer.c_custkey)
+

@@ -28952,6 +28952,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - S9 replenishment pass 2026\-10\-14, second \(census `analysis/m0146/m0146\-0014/routing\-20261014b/`, capture at
     `adaed8786`, after M0146\-0190 closed with movement\): item 3 exhausted again\. sort\-strategy 14 records, 10
     actionable after waivers; join\-order 14, 3 actionable\. Filed M0146\-0191 \(TPC\-DS SF0\.25 Q38\)\.
+  - S9 pass 2026\-10\-14, third \(same census, after M0146\-0191 closed as a PG\-internal tie\): each remaining
+    sort\-strategy record was checked for PG\-side stability on tmp/pgdbg first \(Q33 and Q72 are stable but span 4 and 6
+    categories; SF1 Q18 is STALE\-SF1\)\. Filed M0146\-0192 \(TPC\-H Q22, initplan Param parallel safety\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -32978,3 +32981,24 @@ Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGOR
       the top inner \(customer\)\. The edit was not landed; the sibling gap is ledgered\.
     - S9 two\-strike count: 1 \(the first Movement\-none close after M0146\-0190\)\.
 Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a statistics-sample tie inside PG 18.3 (PG itself flips split/unsplit between :65438 and tmp/pgdbg), COSTTIE class
+- [ ] **M0146-0192 — an uncorrelated scalar subquery's output is parallel\-restricted in goopg but a parallel\-safe initplan Param in PG (TPC-H Q22)**
+  (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014b/`).
+  Record: TPC-H Q22, verdict SHAPE-DIFF \[join-order, parameterisation, sort-strategy, parallelism\], first divergence
+  `depth=1 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort`.
+  - PG plans GroupAggregate \(13200.11..13290.65\) → Gather Merge → Sort → Nested Loop Anti Join over a Parallel Seq
+    Scan on customer. The scan's filter `c_acctbal > (InitPlan 1).col1` runs inside the workers.
+  - goopg plans GroupAggregate \(21579.89..21596.34\) → Sort → Nested Loop Anti Join over a serial Seq Scan.
+  - Likely mechanism, from the code: goopg judges the uncorrelated scalar subquery like a SubPlan
+    \(`isParallelSafeExpr` → `subPlanParallelSafe`, considerparallel.go\). Its body holds its own Gather, so the
+    qual is parallel-restricted and no partial path exists for customer. PG turns it into an initplan whose output
+    PARAM_EXEC Param is in `safe_param_ids` \(`is_parallel_safe`, clauses.c\), because ExecInitParallelPlan
+    evaluates it at the Gather and ships the value to the workers.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: confirm the refusal on a private TPC-H clone with the DPPATH trace (customer's consider_parallel and
+    the qual's verdict). Then check what executor support passing an initplan value into workers needs: the worker
+    Context must receive the evaluated Param, not re-run the subquery inside each worker. Port is_parallel_safe's
+    safe_param_ids rule together with that executor half, and drive Q22 to MATCH.
+  - Separate residual seen in the same plan: goopg's Index Only Scan on order\_customer\_fkidx costs 45.17 against
+    PG's 4.01 \(heap\-fetch term / relallvisible on the unvacuumed :65433 load — M0146\-0178 territory\)\.
+  - Expected movement: TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H sort-strategy and parallelism.
