@@ -244,17 +244,17 @@ func TestReportableHookFires(t *testing.T) {
 func TestOnChangeCallbackFires(t *testing.T) {
 	r := BuildDefaultRegistry()
 	var values []string
-	r.OnChange("enable_nestloop_index", func(value string) {
+	r.OnChange(GoopgEnableNestLoopIndex, func(value string) {
 		values = append(values, value)
 	})
 	sess := NewSessionRegistry(r)
-	if err := sess.Set("enable_nestloop_index", "off", false); err != nil {
+	if err := sess.Set(GoopgEnableNestLoopIndex, "off", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Set("enable_nestloop_index", "on", false); err != nil {
+	if err := sess.Set(GoopgEnableNestLoopIndex, "on", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Reset("enable_nestloop_index"); err != nil {
+	if err := sess.Reset(GoopgEnableNestLoopIndex); err != nil {
 		t.Fatal(err)
 	}
 	// Expect: ["off", "on", "on"] — Reset returns to the default
@@ -325,10 +325,10 @@ func TestApplyReloadEntriesAppliesSigHupSkipsPostmaster(t *testing.T) {
 func TestApplyReloadEntriesFiresOnChange(t *testing.T) {
 	r := BuildDefaultRegistry()
 	var got string
-	r.OnChange("enable_nestloop_index", func(value string) { got = value })
+	r.OnChange(GoopgEnableNestLoopIndex, func(value string) { got = value })
 
 	r.ApplyReloadEntries([]ConfigEntry{
-		{Name: "enable_nestloop_index", Value: "off", SourceFile: "postgresql.conf", SourceLine: 1},
+		{Name: GoopgEnableNestLoopIndex, Value: "off", SourceFile: "postgresql.conf", SourceLine: 1},
 	})
 
 	if got != "off" {

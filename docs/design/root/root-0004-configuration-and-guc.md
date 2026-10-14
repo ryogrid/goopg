@@ -629,3 +629,43 @@ Test: `TestResolveWALBuffersFollowsPG` (`cmd/goopg`) covers auto at three
 `shared_buffers` sizes, an explicit -1, a manual value and the minimum.
 Live, a fresh goopg cluster shows `4MB` at 128MB. The scratch PG oracle, at
 2GB, shows `16MB`, with `boot_val` -1 and source `default`.
+
+## goopg's own knobs move to the `goopg.` namespace (2026-10-14, M0122-0008 slice 5)
+
+PG 18.3 rejects a plain parameter name it does not define ("unrecognized
+configuration parameter"). goopg registered four such names:
+
+- `wal_sender_memory_buffer`, `enable_nestloop_index` and
+  `enable_opportunistic_prune`, all three live goopg-internal knobs;
+- `vacuum_multixact_freeze_max_age`, which had no consumer.
+  - It carried values that belong to PG's
+    `autovacuum_multixact_freeze_max_age` (default 400000000).
+  - Meanwhile the real `autovacuum_multixact_freeze_max_age` had a default of
+    4000000000 and a range of 1000000..5000000000.
+
+PG's home for a server-private parameter is a dotted custom-variable name,
+which is the form `DefineCustomBoolVariable` gives an extension's settings.
+
+- The three knobs are now `goopg.wal_sender_memory_buffer`,
+  `goopg.enable_nestloop_index` and `goopg.enable_opportunistic_prune`
+  (constants in `internal/utils/misc/goopg_gucs.go`).
+  - Their consumers (`cmd/goopg`, `postmaster/dispatch.go`) use the
+    constants.
+  - The old names are rejected exactly as PG rejects them.
+  - EXPLAIN (SETTINGS) prints `goopg.enable_nestloop_index = 'off'`.
+- `vacuum_multixact_freeze_max_age` is gone. `autovacuum_multixact_freeze_max_age`
+  takes guc\_tables.c's 400000000 and 10000..2000000000.
+- `TestRegistryNamesArePGOrGoopgNamespaced` pins the invariant: every
+  registered name is a PG 18.3 parameter or starts with `goopg.`.
+
+A default/range audit against PG's `pg_settings` (the scratch oracle)
+lists 37 differences.
+
+- Most are formatting only, such as unit-scaled or float-formatted values.
+- Several are real. Some of those shape plans and look like deliberate
+  measurement conventions, so they are owner decisions, not loop work:
+  - `work_mem` 512MB against PG's 4MB;
+  - `max_parallel_workers_per_gather` 4 against 2;
+  - `enable_partitionwise_join` / `_aggregate` on against off;
+  - `jit` off against on.
+- The others are ledgered.

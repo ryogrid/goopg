@@ -137,7 +137,7 @@
                                         # (change requires restart)
 #wal_sync_method = fdatasync            # fsync, fdatasync, open_sync, open_datasync
                                         # (change requires reload)
-#wal_sender_memory_buffer = 16777216    # 0-1073741824 bytes in-memory WAL ring
+#goopg.wal_sender_memory_buffer = 16777216 # 0-1073741824 bytes in-memory WAL ring
                                         # (change requires restart)
 #full_page_writes = on                  # log full pages after first mod since
                                         # last checkpoint (SIGHUP to apply)
@@ -235,8 +235,8 @@
 #enable_group_by_reordering = on
 #enable_self_join_elimination = on
 #enable_tidscan = on
-#enable_nestloop_index = on             # goopg-specific: index nested-loop join
-#enable_opportunistic_prune = on        # goopg-specific: inline HOT page-prune
+#goopg.enable_nestloop_index = on       # goopg-specific: index nested-loop join
+#goopg.enable_opportunistic_prune = on  # goopg-specific: inline HOT page-prune
 #parallel_leader_participation = on
 
 # - Planner Cost Constants -
@@ -332,7 +332,6 @@
 #vacuum_freeze_table_age = 150000000    # 0-2000000000 xids
 #vacuum_failsafe_age = 1600000000       # 0-2100000000 xids
 #vacuum_multixact_freeze_table_age = 150000000  # 0-2000000000 multixacts
-#vacuum_multixact_freeze_max_age = 400000000    # 1000000-5000000000 multixacts
 #vacuum_multixact_failsafe_age = 1500000000     # 0-2100000000 multixacts
 #autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
                                         # autovacuum worker pool
@@ -365,7 +364,7 @@
                                         # (change requires restart)
 #autovacuum_work_mem = -1               # KB; -1 uses maintenance_work_mem
                                         # (change requires restart)
-#autovacuum_multixact_freeze_max_age = 4000000000 # 1000000-5000000000 multixacts
+#autovacuum_multixact_freeze_max_age = 400000000 # 10000-2000000000 multixacts
                                         # (change requires restart)
 
 

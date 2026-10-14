@@ -390,7 +390,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// take2 P2-02c: enable_nestloop_index no longer bridges to a process
+	// take2 P2-02c: goopg.enable_nestloop_index no longer bridges to a process
 	// global either. All six planner-method bridges are gone; each of them let
 	// the most-recent SET win process-wide, steering every other session's
 	// plans. optimizer.SetNLIEnabled survives as the test hook and the env
@@ -443,7 +443,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
-		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
+		walSenderMemBuf := int64(intGUC(registry, misc.GoopgWalSenderMemoryBuffer, 16<<20))
 		walBuffers := resolveWALBuffers(registry, poolSlots) * xlogBlockSize
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
 		// fsync=off (test harnesses only) turns every runtime durability

@@ -4907,6 +4907,21 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
     - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
       `wal\_init\_zero` contexts\.
+  - Slice 5 done 2026\-10\-14: goopg\'s own knobs live in the `goopg\.` custom\-variable namespace\.
+    - Renamed: `goopg\.wal\_sender\_memory\_buffer`, `goopg\.enable\_nestloop\_index` and
+      `goopg\.enable\_opportunistic\_prune`\.
+    - The bogus `vacuum\_multixact\_freeze\_max\_age` is dropped\.
+    - `autovacuum\_multixact\_freeze\_max\_age` takes PG\'s 400000000 \[10000, 2000000000\]\. It was 4000000000\.
+    - Test `TestRegistryNamesArePGOrGoopgNamespaced`: every registered name is PG\'s or `goopg\.`\-prefixed\.
+    - Default/range audit vs PG pg\_settings: 37 differences, mostly formatting\. Ledgered:
+      - non\-plan ones;
+      - the plan\-shaping ones \(`work\_mem` 512MB, `max\_parallel\_workers\_per\_gather` 4, partitionwise on, jit
+        off\) as an owner decision\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
+    - Remaining:
+      - 191 unregistered PG parameters;
+      - `io\_workers` / `restore\_command` / `wal\_init\_zero` contexts;
+      - the non\-plan default/range differences\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

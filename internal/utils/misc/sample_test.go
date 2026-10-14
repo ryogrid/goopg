@@ -11,13 +11,14 @@ import (
 // optionally prefixed by a single `#` (every shipped entry is commented
 // out — see the sample's header). The name uses `\w` rather than `[a-z_]` because the registry
 // preserves PG's capitalised names (`DateStyle`, `TimeZone`,
-// `IntervalStyle`).
+// `IntervalStyle`). A dotted name is goopg's own custom-namespace knob
+// (`goopg.enable_nestloop_index`).
 //
 // The trailing `(?:#.*)?` discards an inline hint comment. Values
 // containing a `#` inside single quotes are not currently present in
 // the template; if one is ever added, this regex will need an explicit
 // `'...'` branch.
-var sampleEntryRE = regexp.MustCompile(`^#?\s*(\w+)\s*=\s*(.+?)\s*(?:#.*)?$`)
+var sampleEntryRE = regexp.MustCompile(`^#?\s*(\w+(?:\.\w+)*)\s*=\s*(.+?)\s*(?:#.*)?$`)
 
 // parseSampleEntries walks the embedded postgresql.conf.sample bytes and
 // returns lowercased-GUC-name -> raw-value-string. Enclosing single

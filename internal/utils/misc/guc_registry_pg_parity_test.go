@@ -1,6 +1,9 @@
 package misc
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestGUCRegistryPrivilegeContextsAndPredLockNames pins the first slice of the
 // "goopg's GUC registry diverges from PG 18.3's parameter set" task against
@@ -115,5 +118,38 @@ func TestFlushAfterGUCsUseBlockUnits(t *testing.T) {
 	}
 	if _, eff, _ := s.Get("backend_flush_after"); eff != "16" {
 		t.Errorf("SET backend_flush_after = '128kB' stored %q, want 16 pages", eff)
+	}
+}
+
+// TestRegistryNamesArePGOrGoopgNamespaced pins slice 5: every registered
+// parameter is either a PG 18.3 built-in (pg_gucs_gen.go, generated from
+// guc_tables.c) or one of goopg's own knobs in the "goopg." custom-variable
+// namespace. goopg used to register wal_sender_memory_buffer,
+// enable_nestloop_index, enable_opportunistic_prune and
+// vacuum_multixact_freeze_max_age as plain names, which PG rejects as
+// unrecognized configuration parameters.
+func TestRegistryNamesArePGOrGoopgNamespaced(t *testing.T) {
+	r := BuildDefaultRegistry()
+	for _, v := range r.All() {
+		if _, ok := pgGUCs[strings.ToLower(v.Name)]; ok {
+			continue
+		}
+		if !strings.HasPrefix(v.Name, "goopg.") {
+			t.Errorf("%q is neither a PG 18.3 parameter nor in the goopg. namespace", v.Name)
+		}
+	}
+	for _, old := range []string{
+		"wal_sender_memory_buffer", "enable_nestloop_index", "enable_opportunistic_prune",
+		"vacuum_multixact_freeze_max_age",
+	} {
+		if _, ok := r.Get(old); ok {
+			t.Errorf("%s is registered; PG 18.3 has no such parameter", old)
+		}
+	}
+	// The real PG parameter its bogus twin shadowed takes guc_tables.c's
+	// default and range.
+	v, _ := r.Get("autovacuum_multixact_freeze_max_age")
+	if v.BootVal != "400000000" || v.MinVal != 10000 || v.MaxVal != 2000000000 {
+		t.Errorf("autovacuum_multixact_freeze_max_age = %s [%v, %v], want 400000000 [10000, 2000000000]", v.BootVal, v.MinVal, v.MaxVal)
 	}
 }

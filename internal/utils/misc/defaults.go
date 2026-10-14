@@ -527,14 +527,19 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
-	// wal_sender_memory_buffer sizes (in bytes) the in-memory
+	// goopg.wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
 	// RecordIterator. 0 disables the ring; >0 mirrors every
 	// successful WAL write so senders can stream without
 	// disk reads. Default 16 MiB. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	//
+	// PG 18.3 has no such parameter. goopg's own knobs live in the
+	// "goopg." custom-variable namespace, the form PG gives an
+	// extension's parameters (DefineCustomIntVariable), so a plain name
+	// PG rejects is never accepted here (M0122-0008).
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_sender_memory_buffer", Type: TypeInt, BootVal: "16777216",
+		Name: GoopgWalSenderMemoryBuffer, Type: TypeInt, BootVal: "16777216",
 		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
@@ -931,9 +936,10 @@ func BuildDefaultRegistry() *Registry {
 
 	// Opportunistic page pruning (M0046-0002). When on, the HOT-update
 	// path tries to reclaim universally-dead tuples inline when a page
-	// is full, avoiding an unnecessary relation extension.
+	// is full, avoiding an unnecessary relation extension. A goopg-only
+	// knob, so it lives in the "goopg." namespace (M0122-0008).
 	r.MustRegister(NewVariable(Variable{
-		Name: "enable_opportunistic_prune", Type: TypeBool, BootVal: "on",
+		Name: GoopgEnableOpportunisticPrune, Type: TypeBool, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -1126,12 +1132,6 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "vacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "400000000",
-		MinVal: 1000000, MaxVal: 5000000000,
-		Context: ContextUserset,
-		Scope:   ScopeSession,
-	}))
-	r.MustRegister(NewVariable(Variable{
 		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1500000000",
 		MinVal: 0, MaxVal: 2100000000,
 		Context: ContextUserset,
@@ -1191,8 +1191,11 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "autovacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "4000000000",
-		MinVal: 1000000, MaxVal: 5000000000,
+		// guc_tables.c: 400000000, 10000..2000000000. goopg had 4000000000
+		// and 1000000..5000000000, and also registered a
+		// vacuum_multixact_freeze_max_age PG does not have (M0122-0008).
+		Name: "autovacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "400000000",
+		MinVal: 10000, MaxVal: 2000000000,
 		Context: ContextPostmaster,
 		Scope:   ScopeSession,
 	}))
@@ -1238,14 +1241,15 @@ func BuildDefaultRegistry() *Registry {
 		"enable_material", "enable_partition_pruning",
 		// M0054-0006: nested-loop index join rollback switch.
 		// `off` keeps the legacy Hash plan for joins that the
-		// rule would otherwise rewrite.
-		"enable_nestloop_index",
+		// rule would otherwise rewrite. goopg-only, so it is
+		// spelled in the "goopg." namespace (M0122-0008).
+		GoopgEnableNestLoopIndex,
 		// Additional planner method toggles present in catalog pg_settings
 		// but missing from the registry — needed so SET succeeds. M0097-0069.
 		"enable_partitionwise_join", "enable_partitionwise_aggregate",
 		"enable_parallel_hash", "enable_parallel_append",
 		"enable_gathermerge", "enable_incremental_sort",
-		// enable_memoize is no longer a no-op: like enable_nestloop_index
+		// enable_memoize is no longer a no-op: like goopg.enable_nestloop_index
 		// above, cmd/goopg/main.go bridges its OnChange to the planner's
 		// process-global kill-switch (S7).
 		"enable_async_append", "enable_memoize",
@@ -1258,7 +1262,7 @@ func BuildDefaultRegistry() *Registry {
 			Context: ContextUserset,
 			Scope:   ScopeSession | ScopeTransaction,
 			// All upstream enable_* planner-method GUCs are GUC_EXPLAIN
-			// (guc_tables.c); goopg's invented enable_nestloop_index
+			// (guc_tables.c); goopg's own goopg.enable_nestloop_index
 			// follows the same convention since it too gates a plan shape.
 			Flags: FlagExplain,
 		}))

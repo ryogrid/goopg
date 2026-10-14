@@ -716,7 +716,7 @@ type ReloadResult struct {
 // context is applied with SourceConfigFile, and — because the server
 // is already live, unlike at boot — each successful change also fires
 // the registry's OnChange bridge so process-global toggles (e.g.
-// enable_nestloop_index) observe the new value immediately.
+// goopg.enable_nestloop_index) observe the new value immediately.
 func (r *Registry) ApplyReloadEntries(entries []ConfigEntry) ReloadResult {
 	var res ReloadResult
 	present := make(map[string]bool, len(entries))

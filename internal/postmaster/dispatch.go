@@ -1440,7 +1440,7 @@ func sessionStatsTarget(sess *misc.SessionRegistry) int {
 // sessionWorkMem reads the effective `work_mem` GUC from the session
 // registry and returns it as bytes. Returns 0 (unlimited) when sess
 // is nil or the value can't be parsed.
-// sessionOpportunisticPrune reads the enable_opportunistic_prune GUC
+// sessionOpportunisticPrune reads the goopg.enable_opportunistic_prune GUC
 // (M0046-0002). Returns true (enabled) when sess is nil or the GUC value
 // can't be parsed, matching the BootVal "on" default.
 // sessionFreezeMinAge reads vacuum_freeze_min_age (M0046-0005).
@@ -1500,7 +1500,7 @@ func sessionOpportunisticPrune(sess *misc.SessionRegistry) bool {
 	if sess == nil {
 		return true // default on
 	}
-	_, eff, ok := sess.Get("enable_opportunistic_prune")
+	_, eff, ok := sess.Get(misc.GoopgEnableOpportunisticPrune)
 	if !ok {
 		return true // GUC not registered yet, default on
 	}
@@ -1984,7 +1984,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
-	readBool("enable_nestloop_index", &ps.EnableNestLoopIndex)
+	readBool(misc.GoopgEnableNestLoopIndex, &ps.EnableNestLoopIndex)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("geqo", &ps.Geqo)
