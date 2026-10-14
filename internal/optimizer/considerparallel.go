@@ -468,6 +468,13 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 			if !safe {
 				return false
 			}
+			// is_parallel_safe's safe_param_ids (clauses.c): an initplan's
+			// output Param is parallel-safe, because the leader evaluates
+			// the initplan and ships the value to the workers. Its body is
+			// not part of this scope, so it is not judged here (M0146-0192).
+			if sq, isSQ := x.(*SubqueryExpr); isSQ && InitPlanEvaluatedByLeader(sq) {
+				return false
+			}
 			switch v := x.(type) {
 			case *FuncCall:
 				if !funcCallIsParallelSafe(v, cat) {
@@ -858,4 +865,33 @@ func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTu
 		Target:          tgt,
 		TargetKnown:     tgtKnown,
 	}, "scan.seq.partial")
+}
+
+// InitPlanEvaluatedByLeader reports whether a scalar sublink is an initplan
+// whose value the leader computes once and hands to parallel workers, as
+// ExecInitParallelPlan does with a Gather's initParam (execParallel.c). PG
+// lists such an initplan's output Param in is_parallel_safe's safe_param_ids
+// (clauses.c), so a qual comparing against it may run inside the workers
+// (TPC-H Q22's `c_acctbal > (InitPlan 1).col1`).
+//
+// Only an uncorrelated EXPR sublink qualifies, and the test is
+// fail-closed. The flag must be set, there is no PARAM_EXEC binding, and it
+// is not the min/max rewrite's param initplan. The body must also hold no
+// outer reference or PARAM_EXEC read at any depth, since the IsNonCorrelated
+// flag's walker does not descend into nested sublinks. The executor's
+// worker launch (prepareWorkerInitPlans) evaluates exactly the sublinks
+// this predicate admits, so the two sides cannot disagree.
+func InitPlanEvaluatedByLeader(sq *SubqueryExpr) bool {
+	if sq == nil || sq.Plan == nil || !sq.IsNonCorrelated || sq.ParamInitPlan ||
+		len(sq.ParParam) > 0 || len(sq.Args) > 0 || planHasOuterRef(sq.Plan) {
+		return false
+	}
+	readsParam := false
+	walkPlanExprsDeep(sq.Plan, 0, func(e Expr, _ int) {
+		switch e.(type) {
+		case *ExecParamRef, *OuterColumnRef:
+			readsParam = true
+		}
+	})
+	return !readsParam
 }

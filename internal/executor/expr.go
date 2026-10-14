@@ -10974,6 +10974,9 @@ func existsImpl(x *optimizer.ExistsExpr, ctx *Context) (Datum, error) {
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
 func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	if v, ok := ctx.InitPlanValues[x]; ok {
+		return v, nil
+	}
 	// Check for query cancellation before each scalar SubPlan evaluation.
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {

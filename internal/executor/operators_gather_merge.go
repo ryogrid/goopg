@@ -182,10 +182,17 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	// from that same stream to keep the heap correct. One shared channel would
 	// interleave the streams and destroy the ordering the node exists to
 	// preserve.
+	// M0146-0192: initplan values for the workers, evaluated here in the
+	// leader (ExecInitParallelPlan's initParam).
+	initPlans, err := prepareWorkerInitPlans(ctx, o.plan.Child)
+	if err != nil {
+		return err
+	}
 	for i := 0; i < n; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
 		wctx := NewWorkerContext(ctx, arena, o.group.Context())
+		wctx.InitPlanValues = initPlans
 		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
 		// this worker's sort entries with an explicit index.
 		wctx.workerSlot = i

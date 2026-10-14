@@ -164,6 +164,15 @@ type Context struct {
 	ParamSet   []bool
 	ParamDirty []bool
 
+	// InitPlanValues holds, for a parallel worker, the value of every
+	// initplan the leader evaluated before launching it (M0146-0192): PG's
+	// ExecInitParallelPlan evaluates a Gather's initParam once and ships it
+	// to the workers. evalSubquery serves these instead of running the body,
+	// which may hold its own Gather and must never run inside a worker.
+	// Built by prepareWorkerInitPlans per launch and never mutated after,
+	// so workers read it without locking. Nil on a leader Context.
+	InitPlanValues map[*optimizer.SubqueryExpr]Datum
+
 	// CorrSubqOps caches pre-built, pre-opened operators for correlated
 	// scalar subqueries so the same plan can be rescanned for each outer
 	// row without repeated Build+openPrep (lock acquire + btree.Open)

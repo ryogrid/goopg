@@ -32981,7 +32981,7 @@ Movement: yes — match SF0.25 77 -> 79 (TPC-DS Q26, Q40), SF1 64 -> 65; CATEGOR
       the top inner \(customer\)\. The edit was not landed; the sibling gap is ledgered\.
     - S9 two\-strike count: 1 \(the first Movement\-none close after M0146\-0190\)\.
 Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a statistics-sample tie inside PG 18.3 (PG itself flips split/unsplit between :65438 and tmp/pgdbg), COSTTIE class
-- [ ] **M0146-0192 — an uncorrelated scalar subquery's output is parallel\-restricted in goopg but a parallel\-safe initplan Param in PG (TPC-H Q22)**
+- [x] **M0146-0192 — an uncorrelated scalar subquery's output is parallel\-restricted in goopg but a parallel\-safe initplan Param in PG (TPC-H Q22)**
   (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014b/`).
   Record: TPC-H Q22, verdict SHAPE-DIFF \[join-order, parameterisation, sort-strategy, parallelism\], first divergence
   `depth=1 [sort-strategy] under GroupAggregate: PG Gather Merge | goopg Sort`.
@@ -33005,3 +33005,14 @@ Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a stati
   - Separate residual seen in the same plan: goopg's Index Only Scan on order\_customer\_fkidx costs 45.17 against
     PG's 4.01 \(heap\-fetch term / relallvisible on the unvacuumed :65433 load — M0146\-0178 territory\)\.
   - Expected movement: TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H sort-strategy and parallelism.
+  - Done 2026\-10\-14 \(design `docs/design/0100-0149/m0146-0192-initplan-param-parallel-safety.md`, evidence
+    `analysis/m0146/m0146-0192/`\)\.
+    - Planner: `InitPlanEvaluatedByLeader` \(considerparallel\.go\) admits an uncorrelated scalar sublink with no
+      param or outer reads at any depth, and `isParallelSafeExpr` prunes it as safe \(PG\'s safe\_param\_ids\)\.
+    - Executor: `prepareWorkerInitPlans` evaluates every admitted initplan once in the leader at each worker launch
+      \(Gather, Gather Merge, cooperative Parallel Hash build\); `evalSubquery` serves `Context\.InitPlanValues`\.
+    - TPC\-H Q22 MATCH \(13 \-> 14\); TPC\-DS fire set unchanged \(79 / 65\)\.
+    - Test: `TestInitPlanQualRunsInsideParallelWorkers` \(PG 18\.3\'s exact plan text and the count\)\.
+    - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
+      \(select\_parallel, subselect, aggregates, write\_parallel\) identical\.
+Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-order 6 -> 5, parameterisation 3 -> 2, sort-strategy 2 -> 1, parallelism 3 -> 2
