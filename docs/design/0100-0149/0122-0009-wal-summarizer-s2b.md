@@ -256,3 +256,40 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - `TestServerSummarizesWAL` now runs `VACUUM ws` and expects VM block 0 of `ws` in a summary.
 - Negative control: with the arm disabled, both tests fail. The live one reports "no summary lists VM block 0 of
   ws after VACUUM".
+
+## S7 landed (2026-10-14): WS-002 `002_blocks.pl` ported
+
+- **Prerequisite: `pg_current_wal_lsn`, `pg_current_wal_insert_lsn`, `pg_current_wal_flush_lsn`** (xlogfuncs.c)
+  did not exist (42883). They are now executor builtins (`expr_walfuncs.go`) over the WAL writer:
+  - insert = `Writer.WrittenLSN` (the end of the last appended record, `GetXLogInsertRecPtr`);
+  - write = `DrainedLSN` (reached the segment files, `GetXLogWriteRecPtr`);
+  - flush = `FlushedLSN` (`GetFlushRecPtr`).
+
+  They are clamped so that flush ≤ write ≤ insert, as in PG. On a standby they raise 55000 "recovery is in
+  progress" with PG's hint. The planner's builtin return-type switch types them `pg_lsn`; before that they
+  went out as `text`.
+- **The port** (`TestPort_PgWalsummary002Blocks`) follows the upstream script step by step:
+  - `summarize_wal = on`, then the 400-row insert, `VACUUM FREEZE`, `pg_current_wal_insert_lsn`, `CHECKPOINT`;
+  - poll for a summary ending at or after that LSN, then poll for `pg_stat_io` walsummarizer WAL reads;
+  - update the row with `a = 2`, then `CHECKPOINT`;
+  - exactly one new summary;
+  - `pg_walsummary -i` prints exactly two lines, one of them `FORK main: block 0`.
+
+  goopg's summary lists `mytable` block 0 and block 5 (the new tuple's page). No goopg-only side write lands in
+  that range, so the design's "exactly 2 blocks" risk did not materialise.
+- **Adaptations:**
+  - The node gets upstream's `allows_streaming` settings, except `wal_log_hints`. It gets none of the
+    `has_archiving` settings, because goopg registers neither `archive_mode` nor `archive_command` and has no
+    archiver.
+  - Neither omission changes the UPDATE's summary: with `full_page_writes` on, the CHECKPOINT already makes
+    each page's first touch an FPI.
+  - `poll_query_until` accepts `true` as well as `t`. The test client renders a boolean column as `true`.
+    goopg types a bare `EXISTS (…)` column as `text` (filed separately), so that column comes back as `t`.
+- **Found:** boolean-valued `EXISTS`, `IN`, `= ANY`/`ALL`, `IS NULL`, `~`, `IS TRUE` and `IS DISTINCT FROM`
+  output columns are advertised as `text` instead of `boolean` (planner `exprType` has no arm for them). Filed in
+  fix\_plan.
+
+**Tests:**
+- `TestPort_PgWalsummary002Blocks`: 3 of 3 runs pass, each printing blocks 0 and 5.
+- `TestPgCurrentWALLSN`: insert = the end of the appended record; flush follows `FlushUpTo`; the ordering
+  invariant holds; a standby gets 55000.

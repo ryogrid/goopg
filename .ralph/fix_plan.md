@@ -4978,7 +4978,7 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     views of the live transaction state \(check\_transaction\_read\_only / check\_XactIsoLevel rules\)\.
   - Expected instrument: regress `transactions` \(read\-only cases\) and `guc`; a postmaster test of each repro\.
 
-- [ ] **`pg\_current\_wal\_lsn\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6a\)\.
+- [x] **`pg\_current\_wal\_lsn\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6a\)\.
   Kind: bug
   Placement: S2 defect awaiting owner placement \(a PG 18\.3 builtin errors 42883\)\. It is filed without a parent
   because M0122\-0009\'s lineage is past the Movement\-none budget \(ralph\-lineage\-guard rule A\)\.
@@ -4990,6 +4990,26 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     \(ReadRecPtr = StartLSN − 1\); 55000 "WAL control functions cannot be executed during recovery" on a standby\.
   - Expected instrument: regress cases calling them \(and WS\-002\-style probes\); a postmaster test comparing the value
     with `pg\_get\_wal\_summarizer\_state\(\)\.pending\_lsn` after a CHECKPOINT\.
+  - **2026\-10\-14 resolved** as the prerequisite of M0122\-0009 S7 \(WS\-002 calls `pg\_current\_wal\_insert\_lsn`\)\.
+    - All three are executor builtins over the WAL writer \(insert = WrittenLSN, write = DrainedLSN, flush =
+      FlushedLSN, clamped flush ≤ write ≤ insert\); 55000 with PG\'s hint on a standby; typed `pg\_lsn`\.
+    - Tests: `TestPgCurrentWALLSN`; WS\-002 uses the insert LSN\.
+    - Movement: none — no plan instrument\.
+
+- [ ] **Boolean predicate columns are advertised as `text`** \(found 2026\-10\-14 during M0122\-0009 S7\)\.
+  Kind: bug
+  Placement: S2 defect awaiting owner placement \(wrong result type on the wire: a typed client decodes `t` as a
+  string\)\. Filed without a parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
+  - Repro on a fresh cluster, `\\gdesc` of
+    `SELECT EXISTS \(SELECT 1\), 1 IN \(SELECT 1\), 1 IN \(1,2\), 1 = ANY \(ARRAY\[1\]\), 1 < ALL \(SELECT 2\),
+    NULL IS NULL, \'a\' ~ \'a\', true IS TRUE, 1 IS DISTINCT FROM 2`: every column is `text`\. PG 18\.3 types each
+    `boolean`\. `NOT EXISTS`, `EXISTS … OR false`, `BETWEEN`, `LIKE` and row `=` are already `boolean`\.
+  - Cause: the planner\'s `exprType` \(`internal/optimizer/planner\.go`\) has no arm for `\*ExistsExpr` / `\*InExpr`,
+    and its `UnaryOp` / `BinaryOp` arms miss IS \[NOT\] NULL, IS TRUE, regex match and IS DISTINCT FROM; the
+    fallback is `unknown`, which goes out as text \(OID 25\)\.
+  - First step: add the arms \(bool for every predicate node\), then sweep the remaining predicate shapes with
+    `\\gdesc` against PG\.
+  - Expected instrument: regress cases whose psql alignment depends on the column type; a wire\-type test\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives
@@ -5262,6 +5282,14 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next: S7 \(WS\-002 port\), or the S6b\.\.S6f producer changes \(SMGR\_CREATE for new tables first\)\.
+  - **2026\-10\-14 S7 landed** — WS\-002 `002\_blocks\.pl` ported faithfully \(`TestPort\_PgWalsummary002Blocks`\)\.
+    - Prerequisite implemented: `pg\_current\_wal\_lsn` / `\_insert\_lsn` / `\_flush\_lsn` \(was the filed defect\)\.
+    - `pg\_walsummary \-i` on the UPDATE\'s summary prints exactly 2 blocks \(0 and 5\); no goopg\-only side write\.
+    - Adapted: `wal\_log\_hints`, `archive\_mode`, `archive\_command` omitted \(unregistered GUCs; ledgered\)\.
+    - Found: boolean predicate columns advertised as `text` \(filed as an S2 defect, no parent\)\.
+    - Gates: units, testport WS\-001/002, tpch\-spotcheck, acceptance arm, fire set, sf025\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next: the S6b\.\.S6f producer changes \(design §5 item 6\), SMGR\_CREATE for new tables first\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

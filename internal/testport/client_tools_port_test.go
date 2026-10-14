@@ -16,9 +16,11 @@ package testport
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -250,94 +252,172 @@ func TestPort_PgWalsummary001Basic(t *testing.T) {
 	}
 }
 
-// TestPort_PgWalsummary002Blocks ports postgres/src/bin/pg_walsummary/t/002_blocks.pl.
+// TestPort_PgWalsummary002Blocks ports postgres/src/bin/pg_walsummary/t/002_blocks.pl
+// (M0122-0009 S7): with summarize_wal on, a summary appears after a
+// CHECKPOINT, the walsummarizer counts WAL reads in pg_stat_io, and the one
+// summary covering an UPDATE of a row in block 0 lists exactly two blocks of
+// the table — block 0 and the block the new tuple version went to — as
+// `pg_walsummary -i` prints them.
 //
-// Upstream tests:
-//   - cluster init with summarize_wal = on
-//   - CREATE TABLE, INSERT, VACUUM FREEZE, CHECKPOINT
-//   - pg_available_wal_summaries() returns summaries after checkpoint
-//   - pg_stat_io shows walsummarizer reads
-//   - pg_walsummary -i <file> reports modified blocks
-//
-// Adapted sub-cases (pass in v0):
-//   - cluster init (without summarize_wal = on — goopg rejects unknown GUCs at startup)
-//   - CREATE TABLE, INSERT rows, VACUUM, CHECKPOINT
-//   - pg_stat_io walsummarizer backend_type rows: verified against a real
-//     PostgreSQL 18.3 instance (M0122-0003) that pg_stat_io's row *shape* is
-//     unconditional on the BackendType enum (pgstat_tracks_io_bktype), not on
-//     whether that process ever ran — a fresh cluster with summarize_wal left
-//     at its default (off) still reports 2 all-zero walsummarizer rows
-//     (object='wal', context in ('init','normal')). goopg mirrors that shape.
-//
-// Deferred (requires WAL summarization not yet implemented in goopg v0):
-//   - summarize_wal GUC
-//   - pg_available_wal_summaries() built-in function
-//   - pg_walsummary -i <summary-file> block-level output
-//
-// Remove the t.Skip call and implement the full test once goopg supports
-// WAL summarization (summarize_wal GUC + pg_available_wal_summaries()).
+// The node is initialised as upstream's init(has_archiving => 1,
+// allows_streaming => 1) does, with Cluster.pm's settings appended to
+// postgresql.conf (init / enable_archiving). Adapted: wal_log_hints,
+// archive_mode and archive_command are left out, because goopg has no WAL
+// archiver and does not register them yet (the GUC registry task's
+// unregistered parameters; deferral ledger). None of them changes which
+// blocks the UPDATE's summary lists: wal_log_hints only adds FPIs for
+// hint-bit changes, and with full_page_writes on the CHECKPOINT before the
+// UPDATE already makes its first touch of each page an FPI.
 func TestPort_PgWalsummary002Blocks(t *testing.T) {
 	// upstream: postgres/src/bin/pg_walsummary/t/002_blocks.pl
 	bin := clientToolBin(t, "pg_walsummary")
 	if bin == "" {
 		t.Skip("pg_walsummary not in PATH or postgres/local_install/bin")
 	}
-
-	// Basic cluster-init + SQL portion.
-	// goopg v0 does not support the summarize_wal GUC so we omit it;
-	// upstream's has_archiving / allows_streaming are also omitted.
 	c := newCluster(t, "walsummary002")
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
+	}
+	for _, line := range []string{
+		// allows_streaming => 1
+		"wal_level = replica",
+		"max_wal_senders = 10",
+		"max_replication_slots = 10",
+		"autovacuum_worker_slots = 3",
+		"hot_standby = on",
+		"shared_buffers = 1MB",
+		"max_connections = 10",
+		"max_wal_size = 128MB",
+		"summarize_wal = on",
+	} {
+		if err := c.AppendPostgresqlConf(line); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-
-	// CREATE TABLE and INSERT — adapted: use VALUES instead of generate_series()
-	// (pg_current_wal_insert_lsn and generate_series not implemented in goopg v0).
-	if _, err := c.Query(context.Background(),
-		`CREATE TABLE walsummary_t (a int, b text)`); err != nil {
-		t.Fatalf("CREATE TABLE: %v", err)
+	ctx := context.Background()
+	query := func(sql string) [][]string {
+		t.Helper()
+		rows, err := c.Query(ctx, sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return rows
 	}
-	if _, err := c.Query(context.Background(),
-		`INSERT INTO walsummary_t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')`); err != nil {
-		t.Fatalf("INSERT: %v", err)
+	one := func(sql string) string {
+		t.Helper()
+		rows := query(sql)
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: want one value, got %v", sql, rows)
+		}
+		return rows[0][0]
 	}
-
-	// VACUUM (FREEZE keyword omitted — not supported in goopg v0 parser).
-	if _, err := c.Query(context.Background(), `VACUUM walsummary_t`); err != nil {
-		t.Fatalf("VACUUM: %v", err)
-	}
-
-	// CHECKPOINT via the goopg control plane.
-	if err := c.Checkpoint(); err != nil {
-		t.Fatalf("CHECKPOINT: %v", err)
-	}
-
-	// pg_available_wal_summaries returns 0 rows when summarize_wal = off.
-	rows, err := c.Query(context.Background(),
-		`SELECT count(*) FROM pg_available_wal_summaries()`)
-	if err != nil {
-		t.Fatalf("pg_available_wal_summaries: %v", err)
-	}
-	if len(rows) == 0 || rows[0][0] != "0" {
-		t.Errorf("pg_available_wal_summaries: want 0 rows, got %v", rows)
-	}
-
-	// pg_stat_io reports 2 all-zero walsummarizer rows (wal/init, wal/normal)
-	// even with summarize_wal = off — the row shape is unconditional on the
-	// BackendType, only the counts stay zero because the process never ran.
-	rows2, err := c.Query(context.Background(),
-		`SELECT count(*) FROM pg_stat_io WHERE backend_type = 'walsummarizer'`)
-	if err != nil {
-		t.Fatalf("pg_stat_io walsummarizer query: %v", err)
-	}
-	if len(rows2) == 0 || rows2[0][0] != "2" {
-		t.Errorf("pg_stat_io walsummarizer rows: want 2, got %v", rows2)
+	// pollQueryUntil is poll_query_until: re-run sql until psql would print
+	// 't'. cluster.Query renders a boolean column as "true"; "t" is also
+	// accepted because goopg types a bare EXISTS column as text (filed).
+	pollQueryUntil := func(sql string) bool {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Minute)
+		for {
+			if v := one(sql); v == "t" || v == "true" {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	// pg_walsummary -i <file> deferred: no WAL summary files exist when
-	// summarize_wal = off, so there is nothing for pg_walsummary to inspect.
+	// Create a table and insert a few test rows into it. VACUUM FREEZE it so
+	// that autovacuum doesn't induce any future modifications unexpectedly.
+	query(`CREATE TABLE mytable (a int, b text)`)
+	query(`INSERT INTO mytable
+SELECT
+	g, random()::text||random()::text||random()::text||random()::text
+FROM
+	generate_series(1, 400) g`)
+	query(`VACUUM FREEZE`)
+
+	// Record the current WAL insert LSN.
+	baseLSN := one(`SELECT pg_current_wal_insert_lsn()`)
+	t.Logf("just after insert, WAL insert LSN is %s", baseLSN)
+
+	// Now perform a CHECKPOINT.
+	query(`CHECKPOINT`)
+
+	// Wait for a new summary to show up, one that includes the inserts we
+	// just did.
+	if !pollQueryUntil(`SELECT EXISTS (
+    SELECT * from pg_available_wal_summaries()
+    WHERE end_lsn >= '` + baseLSN + `'
+)`) {
+		t.Fatal("WAL summarization caught up after insert: timed out")
+	}
+
+	// The WAL summarizer should have generated some IO statistics.
+	if !pollQueryUntil(`SELECT sum(reads) > 0 FROM pg_stat_io
+   WHERE backend_type = 'walsummarizer' AND object = 'wal'`) {
+		t.Fatal("Timed out while waiting for WAL summarizer to generate statistics for WAL reads")
+	}
+
+	// Find the highest LSN that is summarized on disk.
+	summarizedLSN := one(`SELECT MAX(end_lsn) AS summarized_lsn FROM pg_available_wal_summaries()`)
+	t.Logf("after insert, summarized through %s", summarizedLSN)
+
+	// Update a row in the first block of the table and trigger a checkpoint.
+	query(`UPDATE mytable SET b = 'abcdefghijklmnopqrstuvwxyz' || b || '01234567890'
+	WHERE a = 2`)
+	query(`CHECKPOINT`)
+
+	// Wait for a new summary to show up.
+	if !pollQueryUntil(`SELECT EXISTS (
+    SELECT * from pg_available_wal_summaries()
+    WHERE end_lsn > '` + summarizedLSN + `'
+)`) {
+		t.Fatal("got new WAL summary after update: timed out")
+	}
+
+	// Figure out the exact details for the new summary file.
+	details := query(`SELECT tli, start_lsn, end_lsn from pg_available_wal_summaries()
+	WHERE end_lsn > '` + summarizedLSN + `'`)
+	if len(details) != 1 {
+		t.Fatalf("got exactly one new WAL summary: got %v", details)
+	}
+	tli, startLSN, endLSN := details[0][0], details[0][1], details[0][2]
+	t.Logf("examining summary for TLI %s from %s to %s", tli, startLSN, endLSN)
+
+	// Reconstruct the full pathname for the WAL summary file.
+	// perl's sprintf "%08s" zero-pads each field to 8 characters.
+	pad := func(s string) string {
+		if len(s) < 8 {
+			s = strings.Repeat("0", 8-len(s)) + s
+		}
+		return s
+	}
+	startHi, startLo, _ := strings.Cut(startLSN, "/")
+	endHi, endLo, _ := strings.Cut(endLSN, "/")
+	filename := fmt.Sprintf("%s/pg_wal/summaries/%s%s%s%s%s.summary", c.DataDir(),
+		pad(tli), pad(startHi), pad(startLo), pad(endHi), pad(endLo))
+	if _, err := os.Stat(filename); err != nil {
+		t.Fatalf("WAL summary file exists: %v", err)
+	}
+
+	// Run pg_walsummary on it. We expect exactly two blocks to be modified,
+	// block 0 and one other.
+	res := runTool(t, bin, "-i", filename)
+	t.Log(res.Stdout)
+	lines := strings.Split(strings.TrimRight(res.Stdout, "\n"), "\n")
+	if !regexp.MustCompile(`(?m)FORK main: block 0$`).MatchString(res.Stdout) {
+		t.Errorf("stdout shows block 0 modified: %q", res.Stdout)
+	}
+	if res.Stderr != "" {
+		t.Errorf("stderr is empty: %q", res.Stderr)
+	}
+	if len(lines) != 2 {
+		t.Errorf("UPDATE modified 2 blocks: got %d lines %q", len(lines), res.Stdout)
+	}
 }
