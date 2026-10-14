@@ -5184,7 +5184,7 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     Fix ONCE there — it moves `relacl`, `typacl`, `paracl` and `datacl`
     together and re-baselines every pinned ACL string in the suite, which is
     why it is its own task.
-- [ ] **M0122-0009 — WAL / recovery / crash-consistency infra**.
+- [x] **M0122-0009 — WAL / recovery / crash-consistency infra**.
   - **2026\-10\-13 re\-verification slice** \(selected via banner item 10 — items 3–9 had no selectable row\): the
     cluster\'s open `unimplemented\_feat\.json` entries were checked against HEAD, as the milestone\'s workflow step 1
     requires\.
@@ -5385,6 +5385,14 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       next; small, ~100 lines in writer\.go; invariant: every pwrite completes before `flushUpTo`\'s fdatasync\) and the
       `XLogInsert`/`XLogFlush` rename \(\~234 call sites, no behaviour change — last\)\.
     - Next slice: Wait pipelining in `writeAt`\.
+  - **2026\-10\-14 closed\.** The WAL writer Wait pipelining entry is resolved as superseded: `Append` only copies into
+    the WAL buffer, the walwriter drains in the background \(`BackgroundWrite`, PG\'s `XLogBackgroundFlush`\), and a
+    backend writes only on overflow or at commit; `writeAt`\'s per\-chunk synchronous write \(1–4 chunks per drain\)
+    matches PG 18\'s `XLogWrite` `pg\_pwrite`\. Every backlog entry this task owned is now resolved except the API rename\.
+    - Residuals, each an unchecked task: M0122\-0009a/b/c \(filed 2026\-10\-13\); "In\-process WAL writer timeline switch
+      at promotion, then XLOG\_END\_OF\_RECOVERY"; "Visibility\-map changes as XLOG\_HEAP2\_VISIBLE"; "XLogInsert /
+      XLogFlush rename" \(owner decision\)\. Deferral\-ledger rows from this session cover the rest\.
+    - Movement: none — WAL / storage infrastructure; no plan instrument\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed
@@ -5423,6 +5431,36 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     on a replica are past the relation\'s end\.
   - First step: wire `LogSmgrTruncateTo` in the production pool setup \(`internal/initdb/open\.go`\) and pin it with
     a recovery test\.
+- [ ] **In\-process WAL writer timeline switch at promotion, then XLOG\_END\_OF\_RECOVERY** \(filed 2026\-10\-14 at the
+  M0122\-0009 close\)\.
+  Kind: impl
+  Parent: none
+  - Today promotion \(`cmd/goopg/standby\.go` `finalizePromotion`, `promoteAfterRecovery`\) bumps the timeline in
+    pg\_control and the history file but leaves the running WAL writer on the old TLI until restart\. PG switches at
+    once: the new TLI\'s first segment is a copy of the old one up to the switch point \(`XLogInitNewTimeline`\), and
+    `CreateEndOfRecoveryRecord` writes `XLOG\_END\_OF\_RECOVERY` as its first record\.
+  - Why it matters: the WAL summarizer\'s first range on the new TLI needs that boundary \(design
+    `0122\-0009\-wal\-summarizer\.md` §4\.4 item 7\); WAL written after promotion carries the wrong TLI until restart\.
+  - First step: a `Writer` timeline switch \(close the current segment, copy it to the new TLI\'s name up to the switch
+    LSN, continue there\), then emit the record\.
+  - Expected instrument: a promotion test reading the new TLI\'s segment with `pg\_waldump`\.
+- [ ] **Visibility\-map changes as XLOG\_HEAP2\_VISIBLE** \(filed 2026\-10\-14 at the M0122\-0009 close\)\.
+  Kind: impl
+  Parent: none
+  - goopg logs every VM change as a native rmgr\-128 `RecordKindHeapVisible` record with no block reference and no
+    tablespace \(design §4\.4 item 2\)\. A PG standby cannot replay rmgr 128\.
+  - PG logs a set as `XLOG\_HEAP2\_VISIBLE` \(block 0 = VM page, block 1 = heap page\); clears ride the heap records\'
+    `\*\_ALL\_VISIBLE\_CLEARED` flags\.
+  - First step: emit sets as `XLOG\_HEAP2\_VISIBLE` through the assembler and route goopg replay to the existing decoded
+    arm; keep a length\-versioned decode of the native record for old WAL\.
+  - Expected instrument: `pg\_waldump` decoding goopg\'s VACUUM WAL; the walsummarizer VM checks stay green\.
+- [ ] **XLogInsert / XLogFlush rename** \(backlog entry, M0042\-0003; filed 2026\-10\-14 at the M0122\-0009 close\)\.
+  Kind: impl
+  Parent: none
+  - Placement: owner decision\. About 234 call sites across 20 files, with no behaviour change\. goopg\'s
+    `Writer\.Append\(payload\)` takes a pre\-encoded record; it is not PG\'s `XLogBeginInsert` / `XLogRegisterData` /
+    `XLogInsert` protocol, so a rename alone would mislabel it\. Recommendation: close as won\'t\-do\.
+
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
   - **Cross\-handle structural gate LANDED 2026\-09\-22 \(loop \#10\)** as
     `4beed2920`. Movement: none — a concurrency protocol; `PLAN-SHAPE same=99

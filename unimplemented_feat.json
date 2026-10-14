@@ -394,7 +394,7 @@
    "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
    "task_id": "m0009",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Real perf-pipelining waits on a loop redesign that defers Wait across Appends"
    ],
@@ -409,7 +409,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Commit e49ec60d message states loop redesign defers Wait across Appends"
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009; superseded by the WAL buffer design): Writer.Append only copies into walBuf, so Appends no longer wait on I/O; the walwriter drains in the background (Writer.BackgroundWrite, PG's XLogBackgroundFlush) and a backend writes only on buffer overflow (drainReasonOverflow, PG's 'WAL buffer full' write) or at commit. state.writeAt still waits on each chunk (1-4 per drain: split only at segment boundaries and the ring wrap), as PG 18's XLogWrite issues synchronous pg_pwrite calls. Earlier audit: confirmed-open: Commit e49ec60d message states loop redesign defers Wait across Appends"
   },
   {
    "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
