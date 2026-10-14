@@ -406,7 +406,7 @@ fsync = off
 		s := NewSummarizer(live, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		if err := s.Run(ctx, &sliceSource{recs: recs, cancel: cancel}, start); err != nil {
+		if err := s.Run(ctx, &sliceSource{recs: recs, cancel: cancel}, start, true); err != nil {
 			t.Fatal(err)
 		}
 		return s.State()

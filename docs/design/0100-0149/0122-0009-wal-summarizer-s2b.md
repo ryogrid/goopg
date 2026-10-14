@@ -375,3 +375,35 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - `TestServerSummarizesWAL`: a rolled-back `CREATE TABLE wa` gives its init fork (3) limit block 0 in a summary. Only
   the abort record can produce that; the block-0 `SMGR_CREATE` limits the main fork only. With the abort list emptied,
   the check fails.
+
+## Oldest-WAL start landed (2026-10-14): `GetOldestUnsummarizedLSN` with no summaries
+
+- **PG:** with no summary on disk, `GetOldestUnsummarizedLSN` returns the start of the oldest WAL segment still in
+  `pg_wal`, with `lsn_is_exact = false`. `SummarizeWAL` then finds the first record there (`XLogFindNextRecord`) and
+  fast-forwards to the first redo point. Every range between redo points still on disk gets a summary.
+- **goopg before:** it started at the latest redo point. When `summarize_wal` was turned on, the WAL between older
+  redo points was never summarized, so an incremental backup reaching back into it would have found no summaries.
+- **Now:**
+  - `Service.runOnce` takes the oldest segment of the summarizer's timeline (`oldestSegmentLSN`) and finds its first
+    record with the new `xlog.FindNextRecord`. It starts there inexactly; `Summarizer.Run` gains `exact`, published as
+    `LSNIsExact`.
+  - The latest redo point remains the fallback when no segment is readable.
+  - The first range is fast-forwarded, which `newRangeSummarizer` already did: no file is written until the first
+    redo point.
+- **`xlog.FindNextRecord`** is `XLogFindNextRecord`'s page walk for a page-aligned LSN.
+  - A page with `XLP_FIRST_IS_CONTRECORD` begins with the tail of an earlier record; its `xlp_rem_len` bytes are
+    skipped (MAXALIGNed).
+  - A tail that fills the page moves the search to the next page.
+  - A zero page header, or a missing or short segment, means no record.
+  - goopg's own writer never lets a record straddle a segment boundary (it pads with `XLOG_NOOP`), but WAL received
+    from a PG primary can, so the skip is needed.
+- **Left out (ledgered):** PG walks the timeline history to the oldest timeline that still has WAL. goopg looks only
+  at the summarizer's timeline, because its writer changes timeline only at restart.
+
+**Tests:**
+- `TestFindNextRecord`: on WAL from the real writer with records spanning pages, every page lands where upstream's
+  walk would (asserted with at least 5 pages that begin with a continuation). Past the end, or on a timeline with no
+  segment, there is no record; an unaligned LSN is refused.
+- `TestServerSummarizesOlderWAL`: a table written before the last checkpoint that preceded `summarize_wal = on`
+  appears in a summary, and the summaries are contiguous. With the oldest-segment start disabled it fails; only the
+  latest-redo summary exists.

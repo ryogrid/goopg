@@ -239,10 +239,26 @@ func (s *Service) runOnce(ctx context.Context, sum *Summarizer) error {
 	if err != nil {
 		return err
 	}
+	exact := ok
+	if !ok {
+		// No summary yet: as GetOldestUnsummarizedLSN, start at the oldest
+		// WAL on disk, not exactly — SummarizeWAL then finds the first
+		// record there (XLogFindNextRecord) and fast-forwards to the first
+		// redo point, so every range between redo points still in pg_wal is
+		// summarized.
+		if seg, found := oldestSegmentLSN(s.cfg.WALDir, sum.TLI, s.cfg.SegSize); found {
+			rec, has, ferr := xlog.FindNextRecord(s.cfg.WALDir, sum.TLI, s.cfg.SegSize, seg)
+			if ferr != nil {
+				return ferr
+			}
+			if has {
+				start, ok = rec, true
+			}
+		}
+	}
 	for !ok {
-		// No summary yet: start at the latest redo point, a known record
-		// start. (PG starts at the oldest WAL on disk and searches forward
-		// with XLogFindNextRecord; see the deferral ledger.)
+		// No readable WAL segment yet: fall back to the latest redo point,
+		// a known record start.
 		if s.cfg.RedoLSN != nil {
 			if start = s.cfg.RedoLSN(); start != 0 {
 				ok = true
@@ -265,7 +281,7 @@ func (s *Service) runOnce(ctx context.Context, sum *Summarizer) error {
 	}
 	defer it.Close()
 	it.SetReadLimit(s.cfg.WAL.FlushedLSN)
-	return sum.Run(ctx, &pollSource{it: it, poll: s.cfg.PollInterval}, start)
+	return sum.Run(ctx, &pollSource{it: it, poll: s.cfg.PollInterval}, start, exact)
 }
 
 // pollSource re-polls the iterator every poll interval so a flush that is

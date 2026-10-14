@@ -119,13 +119,17 @@ func ResumePoint(dataDir string, tli uint32) (lsn uint64, ok bool, err error) {
 	return lsn, ok, nil
 }
 
-// Run summarizes src from start (an exact record start) until ctx is
-// cancelled, writing one summary per range between redo points and
-// publishing State after each. Records before start are skipped, so src may
-// be positioned earlier. It returns nil on cancellation.
-func (s *Summarizer) Run(ctx context.Context, src Source, start uint64) error {
+// Run summarizes src from start until ctx is cancelled, writing one summary
+// per range between redo points and publishing State after each. start is a
+// record start; exact says whether it is a previous summary's end (true) or
+// only the first record found in the oldest WAL (false), which
+// lsn_is_exact reports until the first range is done. Either way the first
+// range is fast-forwarded until a redo point unless it begins at one.
+// Records before start are skipped, so src may be positioned earlier. It
+// returns nil on cancellation.
+func (s *Summarizer) Run(ctx context.Context, src Source, start uint64, exact bool) error {
 	s.mu.Lock()
-	s.state = State{Initialized: true, SummarizedTLI: s.TLI, SummarizedLSN: start, LSNIsExact: true, PendingLSN: start, Running: true}
+	s.state = State{Initialized: true, SummarizedTLI: s.TLI, SummarizedLSN: start, LSNIsExact: exact, PendingLSN: start, Running: true}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()

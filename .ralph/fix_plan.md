@@ -5353,6 +5353,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, internal/postmaster/\.\.\., isolation ports, tpch\-spotcheck, acceptance arm, sf025\.
     - Movement: none — WAL / storage correctness; no plan instrument\.
     - Next: END\_OF\_RECOVERY at promotion \(§4\.4 item 7\), or the HeapVisible spcOid \(item 2\)\.
+  - **2026\-10\-14 oldest\-WAL start landed** — with no summaries on disk the summarizer starts at the oldest segment
+    \(GetOldestUnsummarizedLSN, exact=false\) via the new `xlog\.FindNextRecord` \(XLogFindNextRecord\), not the latest
+    redo point; resolves the S3b ledger row\'s item \(1\)\.
+    - Tests: `TestFindNextRecord`, `TestServerSummarizesOlderWAL` \(negative control fails\)\.
+    - Found: END\_OF\_RECOVERY \(§4\.4 item 7\) needs an in\-process timeline switch first: promotion leaves the running
+      writer on the old TLI until restart \(`finalizePromotion`\)\. Not selectable as a summarizer slice\.
+    - Gates: units, internal/postmaster/\.\.\., tpch\-spotcheck, sf025\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next: the `full\_page\_writes=off` start WARNING \(§4\.4 guard\) and the pid consistency residual; the remaining
+      §4\.4 producer gaps are M0122\-0009a/b/c \(awaiting placement\) and the HeapVisible record format \(item 2\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

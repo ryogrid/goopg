@@ -331,3 +331,73 @@ func TestServerSummarizerState(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// TestServerSummarizesOlderWAL: with no summaries on disk the summarizer
+// starts at the oldest WAL segment, not the latest redo point
+// (GetOldestUnsummarizedLSN, exact = false): it finds the first record there
+// (XLogFindNextRecord), fast-forwards to the first redo point and summarizes
+// every range still in pg_wal. So a table written before the last checkpoint
+// that preceded summarize_wal = on still shows up in a summary.
+func TestServerSummarizesOlderWAL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a goopg server")
+	}
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := cluster.New("walsumold", cluster.Options{
+		RepoRoot:     root,
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  60 * time.Second,
+		ShutdownWait: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(cluster.ShutdownFast)
+	ctx := context.Background()
+	exec := func(sql string) [][]string {
+		t.Helper()
+		rows, err := c.Query(ctx, sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return rows
+	}
+	exec("CREATE TABLE wo(a int)")
+	exec("INSERT INTO wo SELECT generate_series(1, 2000)")
+	exec("CHECKPOINT")
+	exec("INSERT INTO wo VALUES (0)")
+	exec("CHECKPOINT")
+	rel := exec("SELECT relfilenode FROM pg_class WHERE relname = 'wo'")[0][0]
+
+	if err := c.AppendPostgresqlConf("summarize_wal = on"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	exec("CHECKPOINT")
+	deadline := time.Now().Add(30 * time.Second)
+	for exec("SELECT count(*) FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn) c WHERE c.relfilenode = " + rel + " AND c.relforknumber = 0 AND c.relblocknumber = 1")[0][0] == "0" {
+		if time.Now().After(deadline) {
+			l, _ := walsummary.List(c.DataDir(), 0, 0, 0)
+			t.Fatalf("no summary lists block 1 of wo, written before summarize_wal was turned on; summaries %v", l)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	all, err := walsummary.List(c.DataDir(), 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, missing := walsummary.AreComplete(all, all[0].Start, all[len(all)-1].End); !ok {
+		t.Errorf("summaries %v have a gap at %X", all, missing)
+	}
+}
