@@ -133,7 +133,9 @@ order:
 7. **\(M, landed\)** Vacuum: refuse to delete either half of an incomplete
    split \(`\_bt\_leftsib\_splitflag`\), and latch the parent last \(slice 5
    below\). Recycling pages a stale path can name: open.
-8. **\(L\)** Remove `lockStructural`; stress under `\-race`.
+8. **\(L, landed\)** Remove `lockStructural` from splits and vacuum's page
+   unlink; stress under `\-race` \(slice 6 below\). Only `finishSplit` still
+   takes it, until gap 5 rebuilds it.
 
 **Slice 1 \(gaps 1–2\).** `getStackBuf` / `leftmostAtLevel` replace the blind
 `path\[len\(path\)\-1\]` at the split's parent step; `TestGetStackBuf` pins them.
@@ -278,6 +280,49 @@ Vacuum's existing under\-latch checks keep a moved parent safe: the downlink is
 re\-checked on the latched parent, and the deletion is abandoned when it moved.
 A `\_bt\_getstackbuf`\-style re\-find would only make deletion succeed more often.
 
+**Slice 6 \(gap 8, 2026\-10\-15\).** No tree\-wide lock on the paths production
+uses:
+
+- **Parent re\-find in vacuum.** `latchParentOf`, the `\_bt\_getstackbuf` call
+  inside `\_bt\_lock\_subtree\_parent`: once left, target and right are
+  latched, vacuum starts at the parent it resolved earlier and moves right along
+  the parent level until a page holds the target's downlink. The deletion
+  record names that page. A downlink only moves right, and only the target's
+  own deletion removes it. If the hint is no longer on the parent level, or the
+  level ends, the deletion is abandoned. `TestUnlinkPinsRefindMovedParent` gives
+  the leftmost parent\-level page as the hint for a leaf on the next one; it
+  fails without the move\-right.
+- **Lock removed.** `Insert`'s split path and `unlinkEmptyLeaf` no longer call
+  `lockStructural`. `finishSplit` still does: it has no production caller and
+  latches the parent before the child, so it stays serialised against itself
+  until gap 5. The stripe table stays until that last caller goes.
+- **Tests.** Both stress tests lost their per\-handle\-mutex knob, which no
+  longer means anything. Their odd rounds now run every goroutine through one
+  shared handle; in the vacuum test that includes vacuum, so pages it frees go
+  to the free list that splits allocate from.
+  `TestMultiWriterStress\_M0055\_Phase\_C` now gets a 256\-slot pool. 32
+  writers can split at once and one split pins up to five pages, so 32 slots ran
+  out \("no available buffer"\), as PG's "no unpinned buffers available" would
+  with shared\_buffers that small.
+
+| check | result |
+|---|---|
+| both stress tests, no lock | 0 / 15 invocations failed |
+| both stress tests and the parent test under `\-race` | 3 clean runs |
+| nbtree package | 3 clean runs, and 3 under `\-race` |
+| pages deleted per 10 vacuum rounds | about 550 before and after the re\-find; parent moves are rare there |
+
+Live check on a scratch server:
+
+- 16 pgbench clients inserted random 192\-byte keys while a session
+  deleted key ranges and ran `VACUUM`;
+- the WAL then held 2 339 `MARK\_PAGE\_HALFDEAD`/`UNLINK\_PAGE` pairs next
+  to 2 335 `SPLIT\_L/R` records;
+- index and heap agreed: 59 730 rows with the same `sum\(id\)`, both before and
+  after `kill \-9` and recovery.
+
+The vacuum and DDL isolation ports pass \(21\).
+
 ## 5. Tests
 
 - Multi-writer split stress with random keys.
@@ -289,4 +334,4 @@ A `\_bt\_getstackbuf`\-style re\-find would only make deletion succeed more ofte
 
 - No structural corruption under stress/recovery tests.
 - Writer throughput scales beyond single structural writer baseline.
-- splitMu no longer governs normal structural write flow.
+- splitMu no longer governs normal structural write flow \(met 2026\-10\-15 for splits and vacuum; `finishSplit` remains\).

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -12,22 +11,17 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestStructuralLockInteriorSplitWorkload drives the workload the shared
-// structural lock exists for: several handles of one index (one per backend)
+// TestStructuralLockInteriorSplitWorkload drives the workload the structural
+// lock existed for: several handles of one index (one per backend)
 // inserting interleaved keys in random order, with wide keys so that leaves
 // and then interior pages split while other handles descend and split
 // through them. Afterwards every key must be found with its TID, a full scan
 // must return each key once in order, and the tree must have grown interior
 // levels (meta level >= 2), so interior splits really happened.
-//
-// NBTREE_UNSHARED_STRUCTURAL_LOCK=1 gives each handle its own mutex — the
-// state before the cross-handle gate (4beed2920) — to measure whether this
-// workload reproduces the race the gate prevents (see the deferral ledger).
 func TestStructuralLockInteriorSplitWorkload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("inserts thousands of wide keys from several goroutines")
 	}
-	unshared := os.Getenv("NBTREE_UNSHARED_STRUCTURAL_LOCK") == "1"
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 1024})
@@ -38,14 +32,16 @@ func TestStructuralLockInteriorSplitWorkload(t *testing.T) {
 		_ = pool.Close()
 		_ = mgr.Close()
 	}()
-	// Measured 2026-10-14 on 16 CPUs with the shared lock removed
-	// (NBTREE_UNSHARED_STRUCTURAL_LOCK=1): one 8-handle round failed about 1
+	// Measured 2026-10-14 on 16 CPUs before PG's lock coupling, with the
+	// shared structural lock removed: one 8-handle round failed about 1
 	// time in 13, mostly as "index out of range [-1]" in insertIntoBlock;
-	// 40 rounds of 16 handles failed 15 invocations out of 15. With the
-	// shared lock: 0 failures in 20 invocations and 3 under -race.
+	// 40 rounds of 16 handles failed 15 invocations out of 15. Since
+	// 2026-10-15 no structural lock exists (M0122-0010 gap 8). Odd rounds
+	// insert through one handle shared by every goroutine, as when one
+	// handle serves several workers.
 	for round := 0; round < structuralRounds; round++ {
 		rel := storage.RelFileNode{DBOid: 1, RelOid: uint32(9100 + round), Fork: storage.MainFork}
-		if err := structuralWorkloadRound(pool, rel, int64(round), unshared); err != nil {
+		if err := structuralWorkloadRound(pool, rel, int64(round), round%2 == 1); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
 	}
@@ -55,7 +51,7 @@ const structuralRounds = 40
 
 // structuralWorkloadRound is one round of TestStructuralLockInteriorSplitWorkload
 // on a fresh relation.
-func structuralWorkloadRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, unshared bool) error {
+func structuralWorkloadRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, oneHandle bool) error {
 	first, err := Create(pool, rel)
 	if err != nil {
 		return err
@@ -63,16 +59,13 @@ func structuralWorkloadRound(pool *storage.Pool, rel storage.RelFileNode, seed i
 	const handles, perHandle = 16, 600
 	hs := []*BTree{first}
 	for len(hs) < handles {
-		h, err := Open(pool, rel)
-		if err != nil {
-			return err
+		h := first
+		if !oneHandle {
+			if h, err = Open(pool, rel); err != nil {
+				return err
+			}
 		}
 		hs = append(hs, h)
-	}
-	if unshared {
-		for _, h := range hs {
-			h.sharedSplitMu = &sync.Mutex{}
-		}
 	}
 	key := func(n int) []byte {
 		return EncodeVarchar([]byte(fmt.Sprintf("%08d-%0190d", n, n)))

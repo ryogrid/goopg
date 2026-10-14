@@ -40,8 +40,25 @@ func TestMultiWriterStress_M0055_Phase_C(t *testing.T) {
 	// M0056-followup-multiwriter-flake root cause found and fixed in
 	// M-NIGHTLY loop 13 (evictVictim's bufmap.Delete-before-flush race,
 	// storage/bufpool.go): un-skipped as this bug's regression guard.
-	bt, _, cleanup := newTestTree(t)
-	defer cleanup()
+	//
+	// The pool has room for every writer to split at once. Splits run
+	// concurrently since M0122-0010 removed the structural lock, and one
+	// split pins up to five pages (left, right, old right sibling, parent,
+	// new root); on newTestTree's 32 slots, 32 writers then exhaust the pool
+	// ("no available buffer"), as PG's "no unpinned buffers available" would
+	// with shared_buffers this small.
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	bt, err := Create(pool, storage.RelFileNode{DBOid: 1, RelOid: 9000, Fork: storage.MainFork})
+	if err != nil {
+		t.Fatal(err)
+	}
 	bt.ResetStats()
 
 	const writers = 32

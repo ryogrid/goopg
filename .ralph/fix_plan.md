@@ -5571,6 +5571,19 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Shared 0/10; per\-handle mutexes 0/15; both stress tests clean under `\-race` without the cross\-handle lock\.
     - Movement: none\. Next: gap 8 \(remove `lockStructural`\), gated by both stress tests, `\-race`, pgbench and the
       isolation ports\.
+  - **2026\-10\-15 slice 6 \(gap 8\) landed: splits and vacuum's page unlink take no tree\-wide lock\.**
+    - Vacuum re\-finds the parent by downlink after latching the siblings \(`latchParentOf`, the `\_bt\_getstackbuf` call
+      in `\_bt\_lock\_subtree\_parent`\); `TestUnlinkPinsRefindMovedParent` fails without the move\-right\.
+    - `Insert`'s split path and `unlinkEmptyLeaf` dropped `lockStructural`; only `finishSplit` \(no production caller,
+      parent before child\) still takes it\.
+    - Both stress tests now run odd rounds through one shared handle; no\-lock 0/15 invocations failed, `\-race` clean;
+      `TestMultiWriterStress\_M0055\_Phase\_C` given a 256\-slot pool \(32 concurrent splits exhausted 32 slots\)\.
+    - Live: 16 pgbench clients inserting while a session deleted and vacuumed — 2 339 page unlinks, 2 335 splits; index
+      = heap \(59 730 rows, same `sum\(id\)`\) before and after `kill \-9` recovery\. 21 vacuum/DDL/index isolation ports
+      pass\.
+    - Movement: none\. Next: gap 5 — finish crash\-left incomplete splits on contact \(`\_bt\_moveright` for update,
+      `\_bt\_stepright`\), rebuilding `finishSplit` on `getStackBuf` with the child held, then drop the last
+      `lockStructural` caller and the stripe table\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

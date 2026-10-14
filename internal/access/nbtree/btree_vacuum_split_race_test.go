@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,20 +21,21 @@ import (
 // deleted. Afterwards every odd key is found with its TID, no even key is found,
 // and a full scan returns exactly the odd keys, in order.
 //
-// NBTREE_UNSHARED_STRUCTURAL_LOCK=1 gives every handle (the vacuum handle
-// included) its own mutex, to measure what still depends on the shared lock.
+// No structural lock exists since 2026-10-15 (M0122-0010 gap 8). Odd rounds
+// run every goroutine, vacuum included, through one shared handle, so pages
+// vacuum frees go to the same free list the splits allocate from.
 func TestStructuralLockVacuumWithSplits(t *testing.T) {
 	if testing.Short() {
 		t.Skip("inserts and vacuums thousands of wide keys from several goroutines")
 	}
-	unshared := os.Getenv("NBTREE_UNSHARED_STRUCTURAL_LOCK") == "1"
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
 	defer mgr.Close()
-	var lsn atomic.Uint64
+	var lsn, unlinks atomic.Uint64
 	nextLSN := func() storage.LSN { return storage.LSN(lsn.Add(1)) }
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots: 1024,
 		LogBtreeUnlinkPage: func(storage.RelFileNode, storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
+			unlinks.Add(1)
 			return nextLSN(), nil
 		},
 		LogBtreeMarkPageHalfDead: func(storage.RelFileNode, storage.BtreeMarkPageHalfDeadRequest) (storage.LSN, error) {
@@ -48,13 +48,16 @@ func TestStructuralLockVacuumWithSplits(t *testing.T) {
 	defer pool.Close()
 	for round := 0; round < 10; round++ {
 		rel := storage.RelFileNode{DBOid: 1, RelOid: uint32(9400 + round), Fork: storage.MainFork}
-		if err := vacuumSplitRound(pool, rel, int64(round), unshared); err != nil {
+		if err := vacuumSplitRound(pool, rel, int64(round), round%2 == 1); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
 	}
+	// How many pages vacuum managed to delete: a deletion abandoned because
+	// the chain or the parent moved is safe but leaves the page in the tree.
+	t.Logf("pages deleted over 10 rounds: %d", unlinks.Load())
 }
 
-func vacuumSplitRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, unshared bool) error {
+func vacuumSplitRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, oneHandle bool) error {
 	const segments, perSegment, inserters = 40, 100, 8
 	key := func(n int) []byte { return EncodeVarchar([]byte(fmt.Sprintf("%08d-%0190d", n, n))) }
 	tid := func(n int) storage.ItemPointer {
@@ -74,11 +77,10 @@ func vacuumSplitRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, u
 		}
 	}
 	open := func() (*BTree, error) {
-		h, err := Open(pool, rel)
-		if err == nil && unshared {
-			h.sharedSplitMu = &sync.Mutex{}
+		if oneHandle {
+			return first, nil
 		}
-		return h, err
+		return Open(pool, rel)
 	}
 	var survivors []int
 	for n := 0; n < segments*perSegment; n++ {

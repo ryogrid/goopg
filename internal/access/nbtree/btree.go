@@ -899,9 +899,9 @@ func CompareKeys(a, b []byte) int {
 //     page's Slot.Lock only, so writers on different pages proceed
 //     in parallel.
 //   - split path: page splits (and their parent/root/meta updates)
-//     are serialised through splitMu to keep tree-structure changes
-//     atomic while Landing 3's full writer-coupling protocol is
-//     still staged.
+//     take no tree-wide lock (M0122-0010 gap 8); PG's lock coupling
+//     orders them — child latched before parent, the parent re-found
+//     by downlink, a root split done with both halves latched.
 type BTree struct {
 	pool     *storage.Pool
 	rel      storage.RelFileNode
@@ -921,25 +921,16 @@ type BTree struct {
 	// pgkeycmp.go and pgitemcodec.go.
 	keyFmt indexFormat
 
-	// splitMu serialises split-path inserts and metapage
-	// publication. (M0055-0004-followup-stage2-splitmu-removal:
-	// experimentally removed splitMu from the slow path; the
-	// existing buffer-pool eviction protocol made concurrent
-	// pin/unpin paths surface "unpin underflow" panics under
-	// 32-writer stress. The Stage 2 work needs an additional
-	// reader/writer interaction-safety guarantee in the
-	// buffer pool itself before the structural mutex can be
-	// fully retired. The protocol-level INCOMPLETE_SPLIT
-	// lifecycle from `(*BTree).finishSplit` runs unchanged;
-	// this commit lands the race-safe createNewRoot half of
-	// Stage 2 — concurrent root-lifts no longer orphan a
-	// separator, even when both writers see the same OLD
-	// root.)
-	splitMu sync.Mutex
-	// sharedSplitMu is the pool-owned, relation-scoped counterpart of splitMu.
-	// Normal Open/Create handles use it so independent backend handles cannot
-	// interleave structural changes; local splitMu remains a safe fallback for
-	// direct package test literals.
+	// splitMu and sharedSplitMu (the pool-owned, relation-scoped
+	// counterpart) once serialised every split and page deletion. Since
+	// M0122-0010 gap 8 only finishSplit takes them: it has no production
+	// caller and still latches the parent before the child, so it stays
+	// serialised against itself until gap 5 (finish incomplete splits on
+	// contact) rebuilds it on getStackBuf. Splits and vacuum's page unlink
+	// rely on page latches alone. (The 2026-05 attempt to drop splitMu hit
+	// "unpin underflow" panics under 32-writer stress; that was the
+	// evictVictim race, fixed since.)
+	splitMu       sync.Mutex
 	sharedSplitMu *sync.Mutex
 
 	// M0055-0001: write-path counters used by the baseline
@@ -2617,16 +2608,13 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 		return err
 	}
 
-	// Split path: serialise structure changes (split propagation,
-	// root lift, metapage rewrite), then retry from a fresh
-	// descent. (M0055-0004-followup-stage2-splitmu-removal: full
-	// removal needs additional buffer-pool concurrency-safety
-	// work beyond M0055's scope. The race-safe createNewRoot
-	// in this commit handles concurrent root-lifts; the rest
-	// of the structural-update path remains under splitMu.)
+	// Split path: retry from a fresh descent. No tree-wide lock is taken
+	// (M0122-0010 gap 8): as in _bt_doinsert, the page latches alone order
+	// concurrent splits. A split keeps its left page latched through the
+	// parent insert (child before parent), re-finds the parent by downlink
+	// (getStackBuf), and lifts a new root with both halves latched; vacuum
+	// latches in the same order and re-finds the parent the same way.
 	bt.stats.splits.Add(1) // M0055-0001 — counts insert calls that take the split-path retry.
-	bt.lockStructural()
-	defer bt.unlockStructural()
 
 	leafBlk, path, err := bt.descendToLeaf(key)
 	if err != nil {
