@@ -28955,6 +28955,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - S9 pass 2026\-10\-14, third \(same census, after M0146\-0191 closed as a PG\-internal tie\): each remaining
     sort\-strategy record was checked for PG\-side stability on tmp/pgdbg first \(Q33 and Q72 are stable but span 4 and 6
     categories; SF1 Q18 is STALE\-SF1\)\. Filed M0146\-0192 \(TPC\-H Q22, initplan Param parallel safety\)\.
+  - S9 pass 2026\-10\-14, fourth \(fresh census `analysis/m0146/m0146\-0014/routing\-20261014c/` at `b580d2344`, after
+    M0146\-0192 landed\): sort\-strategy 5 actionable, aggregation\-strategy 4, parallelism 4, join\-order 3\. Filed
+    M0146\-0193 \(TPC\-DS SF0\.25 Q33\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -33016,3 +33019,23 @@ Movement: none — premise stale: the Q38/Q87 partial-DISTINCT record is a stati
     - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
       \(select\_parallel, subselect, aggregates, write\_parallel\) identical\.
 Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-order 6 -> 5, parameterisation 3 -> 2, sort-strategy 2 -> 1, parallelism 3 -> 2
+- [ ] **M0146-0193 — PG's partial pathlist keeps a sorted partial Merge Join with a unique\-ified inner that fuzz\-dominates the Parallel Hash Semi Join goopg keeps (TPC-DS Q33)**
+  (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014c/`).
+  Record: TPC-DS SF0.25 Q33, verdict SHAPE-DIFF \[join-order, aggregation-strategy, sort-strategy, parallelism\], first
+  divergence `depth=5 [sort-strategy] under GroupAggregate: PG Sort | goopg Gather Merge`. The same record appears at
+  SF1. It is stable on tmp/pgdbg, which has its own ANALYZE sample.
+  - On each `i_manufact_id IN (SELECT … FROM item WHERE i_category = …)` branch, PG plans GroupAggregate → Sort →
+    Hash Join over a Gather and a Hash of HashAggregate\(item\_1\) \(20527.79..20529.83\). goopg plans GroupAggregate
+    → Gather Merge → Sort → Parallel Hash Semi Join \(20343.65..20357.10\).
+  - PG's partial pathlist for the semi\-join rel holds only a Merge Join of the sorted partial outer with the
+    unique\-ified inner \(UNIQUEPATH, JOIN\_UNIQUE\_INNER\), costing 19543.70..19548.37 and sorted on i\_manufact\_id.
+  - With `enable_mergejoin = off`, PG\'s Parallel Hash Semi Join appears at 3502.44..19411.03. It is cheaper, but
+    within STD\_FUZZ\_FACTOR and with worse pathkeys, so `add_partial_path` drops it \(`PATHKEYS_BETTER2` →
+    `accept_new = false`\).
+  Kind: impl
+  Parent: M0146-0014
+  - First step: on a private SF0.25 clone with the DPPATH trace, list goopg\'s partial pathlist for the same rel.
+    Does goopg build the partial Merge Join with a unique\-ified inner \(sort\_inner\_and\_outer /
+    match\_unsorted\_outer over a partial outer with JOIN\_UNIQUE\_INNER, joinpath.c\)? Does `addToPartialPathlist`
+    apply the fuzz\+pathkeys rule? Port the missing piece and drive Q33 to MATCH.
+  - Expected movement: TPC-DS SF0.25 match \(Q33\) and CATEGORIES-EXCL-MATCH sort-strategy / parallelism.
