@@ -28961,6 +28961,14 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - S9 pass 2026\-10\-14, fifth \(fresh census `analysis/m0146/m0146\-0014/routing\-20261014d/` at `9129d26f0`\):
     sort\-strategy and qual\-placement tie at 3 actionable records after removing measured ties \(Q16, Q39, Q45, Q61,
     Q69, Q76\)\. Filed M0146\-0194 \(TPC\-DS SF0\.25 Q72, PG\-stable, 2% margin\)\.
+  - S9 pass 2026\-10\-14, sixth — **exhausted at `9129d26f0`** \(census `routing\-20261014d`, still fresh: no
+    planner\-relevant commit since\)\. After M0146\-0194 closed as a PG\-internal near\-tie, the remaining records were
+    held to a proven\-mechanism bar, and none passed:
+    - Q19 is PG\-stable but sits 0\.2% off \(18929\.90 vs 18967\.96\);
+    - SF1 Q69 is sample\-sensitive at SF0\.25;
+    - TPC\-H Q9, Q10, Q18, Q20 and Q21 sit on loads whose statistics differ \(lineitem 6001988 vs 5998990 rows;
+      Q20 88111 vs 95012, Q21 165965 vs 269864 — cost levels driven by the estimates, not one mechanism\)\.
+    No task was filed, so item 10 is live for the loop; re\-run after HEAD advances in the planner\-relevant paths\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
