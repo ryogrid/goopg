@@ -5505,6 +5505,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — a concurrency regression test\.
     - Open: gap 2 \(prune `Pool\.BTreeStructuralLock`\'s map safely\), then the milestone group\'s larger items
       \(Lehman/Yao crab\-walk, `splitMu` removal\)\.
+  - **2026\-10\-14 lock\-table slice landed** — gap 2 closed without pruning: `Pool\.BTreeStructuralLock` is a fixed
+    array of 256 padded mutexes indexed by a hash of the RelFileNode, replacing the never\-pruned map\.
+    - A refcounted prune needs a handle close, which B\-tree handles do not have\. A stripe is stable across drops and
+      relfilenode reuse; relations sharing a stripe only wait, never deadlock \(no critical section takes a second
+      tree\'s structural lock — the three sections were read\)\.
+    - Tests: `TestBTreeStructuralLockStripes` \(stability, spread, 0 allocs\); reproducer 0/20 \+ `\-race` x2 green\.
+    - Gates: storage \+ nbtree packages, units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: the milestone group\'s larger items — Lehman/Yao lock\-coupled descent and `splitMu` removal \(design
+      0055\-0002; the M0055\-0004 stage\-2 attempt hit unpin\-underflow races\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

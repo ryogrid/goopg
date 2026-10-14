@@ -89,12 +89,25 @@ before the gate. Measured on 16 CPUs:
 
 One 8\-handle round failed only about 1 time in 13, hence the 40 rounds.
 
-**Known limitation.** `Pool.BTreeStructuralLock`'s map has no eviction, so one
-mutex per relation ever opened accumulates for the process lifetime. Pruning it
-in `InvalidateRel` is the obvious place and is deliberately NOT done: a
-concurrent holder releasing a mutex that has already left the map, followed by
-a relfilenode reuse, would hand the next handle a fresh mutex and defeat the
-gate for that window. Ledgered.
+**Lock table \(2026\-10\-14\).** `Pool.BTreeStructuralLock` used to keep a map with
+one mutex per relation ever opened, never pruned. Pruning it was unsafe, and a
+refcount needs a handle close, which goopg's B\-tree handles do not have. If a
+holder releases a mutex that has left the map and a reused relfilenode then
+hands the next handle a fresh mutex, the gate is defeated. The map is now a
+fixed array of 256 cache\-line\-padded mutexes indexed by a hash of the
+`RelFileNode`:
+
+- the same relation always maps to the same mutex, through drops and
+  relfilenode reuse;
+- memory is constant;
+- two relations sharing a stripe only wait for each other. Every structural
+  critical section \(split insert, deferred split completion, vacuum unlink\)
+  touches one tree and takes no other structural lock, so sharing cannot
+  deadlock.
+
+`TestBTreeStructuralLockStripes` pins stability, spread \(2000 consecutive OIDs
+use ≥ 90 % of the stripes\) and zero allocation. The reproducer stays green:
+0/20 invocations fail, plus clean `\-race` runs.
 
 ## 5. Tests
 

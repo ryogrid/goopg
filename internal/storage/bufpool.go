@@ -120,9 +120,9 @@ type Pool struct {
 	// btreeStructureLocks serialises structural B-tree changes per relation
 	// across every BTree handle opened from this pool. A backend constructs its
 	// own handle, so a mutex stored only on BTree cannot protect a split from a
-	// concurrent split or vacuum unlink issued by another connection.
-	btreeStructureMu    sync.Mutex
-	btreeStructureLocks map[RelFileNode]*sync.Mutex
+	// concurrent split or vacuum unlink issued by another connection. It is a
+	// fixed stripe array (see BTreeStructuralLock), so it never grows.
+	btreeStructureLocks [btreeStructureStripes]paddedMutex
 	// logFPI emits a full-page-image WAL record and returns the
 	// record's end LSN. nil disables FPI emission.
 	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
@@ -854,7 +854,6 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		mgr:                      mgr,
 		arena:                    a,
 		slots:                    make([]Slot, cfg.Slots),
-		btreeStructureLocks:      make(map[RelFileNode]*sync.Mutex),
 		wal:                      cfg.WAL,
 		logFPI:                   cfg.LogPageImage,
 		logBtreeSplit:            cfg.LogBtreeSplit,
@@ -897,19 +896,34 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	return p, nil
 }
 
+// btreeStructureStripes is the number of structural B-tree mutexes a pool
+// holds. Relations hash onto them.
+const btreeStructureStripes = 256
+
+// paddedMutex keeps neighbouring stripes on separate cache lines.
+type paddedMutex struct {
+	sync.Mutex
+	_ [56]byte
+}
+
 // BTreeStructuralLock returns the pool-owned mutex for rel's structural B-tree
-// updates. It is intentionally relation-scoped: unrelated indexes may split
-// concurrently, while independently opened handles for the same index share
-// one protocol gate.
+// updates. Independently opened handles for the same index always get the
+// same mutex, so their splits and vacuum unlinks are serialised.
+//
+// The mutexes are a fixed stripe array indexed by a hash of rel rather than a
+// per-relation map: a map never shrinks (one mutex per relation ever opened),
+// and pruning it is unsafe because handles have no close — a handle holding a
+// pruned mutex while a new handle for the same or a reused relfilenode gets a
+// fresh one would split concurrently. A stripe never changes, whatever is
+// dropped or reused. Two relations sharing a stripe only wait for each other:
+// every structural critical section (split insert, deferred split completion,
+// vacuum unlink) touches one tree and takes no other structural lock, so
+// sharing cannot deadlock.
 func (p *Pool) BTreeStructuralLock(rel RelFileNode) *sync.Mutex {
-	p.btreeStructureMu.Lock()
-	defer p.btreeStructureMu.Unlock()
-	if mu := p.btreeStructureLocks[rel]; mu != nil {
-		return mu
-	}
-	mu := new(sync.Mutex)
-	p.btreeStructureLocks[rel] = mu
-	return mu
+	h := uint64(rel.TblOid)*0x9E3779B97F4A7C15 ^ uint64(rel.DBOid)*0xC2B2AE3D27D4EB4F ^
+		uint64(rel.RelOid)*0x165667B19E3779F9 ^ uint64(rel.Fork)*0x27D4EB2F165667C5
+	h ^= h >> 29
+	return &p.btreeStructureLocks[h%btreeStructureStripes].Mutex
 }
 
 // LogBtreeSplit returns the configured atomic split-record hook.
