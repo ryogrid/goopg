@@ -28,6 +28,7 @@ func TestServerSummarizesWAL(t *testing.T) {
 	}
 	c, err := cluster.New("walsum", cluster.Options{
 		RepoRoot:     root,
+		PSQLPath:     filepath.Join(root, "postgres", "local_install", "bin", "psql"),
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  60 * time.Second,
 		ShutdownWait: 30 * time.Second,
@@ -177,6 +178,24 @@ func TestServerSummarizesWAL(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no summary gives the dropped wd limit block 0; summaries %v", files())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// A rolled-back CREATE TABLE: the abort record lists the relation, so
+	// its summary gives every non-FSM fork limit block 0. The init fork (3)
+	// tells it apart from the main fork's SMGR_CREATE at block 0, which the
+	// same range also holds.
+	res, err := c.PSQL("-X", "-qAt", "-c", "BEGIN; CREATE TABLE wa(a int); INSERT INTO wa VALUES (1); SELECT relfilenode FROM pg_class WHERE relname = 'wa'; ROLLBACK")
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("psql: %v %+v", err, res)
+	}
+	wa := strings.TrimSpace(res.Stdout)
+	exec("CHECKPOINT")
+	deadline = time.Now().Add(20 * time.Second)
+	for exec("SELECT count(*) FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn) c WHERE c.relfilenode = " + wa + " AND c.relforknumber = 3 AND c.is_limit_block AND c.relblocknumber = 0")[0][0] == "0" {
+		if time.Now().After(deadline) {
+			t.Fatalf("no summary gives the rolled-back wa (relfilenode %q) limit block 0; summaries %v", wa, files())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

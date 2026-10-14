@@ -340,3 +340,38 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
   - Negative controls: with the commit-record list emptied, or with the deferral disabled, the test fails.
 - The DROP-related isolation ports pass: intra-grant-inplace(-db), drop-index-concurrently-1, truncate-conflict,
   reindex-concurrently(-toast), alter-table-1..4, vacuum-concurrent-drop, partition-drop-index-locking.
+
+## S6c landed (2026-10-14): created relations in the abort record
+
+- **PG:** `RelationCreateStorage` registers a `PendingRelDelete` with `atCommit = false`. `XactLogAbortRecord` lists
+  those relations, `smgrDoPendingDeletes(false)` removes them after the abort record, and `xact_redo_abort` removes
+  them on replay.
+- **goopg before:** the session-local `rollbackDDLCreate` removed only the main-fork file, before the abort record.
+  The abort record named nothing, so replay or a standby kept the file.
+- **Now:**
+  - The six `RecordDDLCreate` sites (CREATE TABLE in its three forms, CREATE INDEX, the EXCLUDE stub index, CREATE
+    MATERIALIZED VIEW) call `createdRelationStorage`. It registers a create entry (`PendingRelDelete.AtCommit = false`)
+    for the relation's catalog RelFileNode.
+  - The abort-record hook lists the entries (`PendingAbortRelDeletes` → `EncodeXactAbortPGWithRels`). `Manager.finish`
+    removes them after the abort record, every fork and map with them.
+  - A commit forgets the entries.
+  - `rollbackDDLCreate` leaves a scheduled file alone (`DDLUndoEntry.StorageScheduled`). It still removes the catalog
+    entry and stamps the catalog rows.
+  - Replay was already in place (S6b's `dropXactRelFiles` covers the abort arm).
+- `pg_waldump` decodes goopg's records as PG's:
+  - `ABORT …; rels: base/5/16406 base/5/16407` for a rolled-back `CREATE TABLE … PRIMARY KEY`;
+  - `COMMIT …; rels: base/5/16409 base/5/16410` for a committed DROP of a table with a primary key.
+- **Regression caught in this slice:** adding `AtCommit` gave S6b's drop entries the zero value `false`, which made
+  them create entries: an autocommit DROP kept its file and listed nothing. Found by the `pg_waldump` probe, fixed
+  (`dropRelationStorage` sets `AtCommit: true`), and now covered by the unit test.
+- **Left out (ledgered):**
+  - A create inside a savepoint that rolls back is forgotten at commit, not removed. goopg keeps such a table in the
+    catalog (filed), so its storage must stay too.
+  - Prepared transactions and temp relations, as in S6b.
+
+**Tests:**
+- `TestPendingRelDeletes` also covers the abort side: creates are listed and removed at abort and forgotten at commit;
+  drops are not carried out at abort.
+- `TestServerSummarizesWAL`: a rolled-back `CREATE TABLE wa` gives its init fork (3) limit block 0 in a summary. Only
+  the abort record can produce that; the block-0 `SMGR_CREATE` limits the main fork only. With the abort list emptied,
+  the check fails.

@@ -24,8 +24,9 @@ func dropRelationStorage(ctx *Context, rel storage.RelFileNode, heap bool) error
 	pool, fsm, vm := ctx.Pool, ctx.FSM, ctx.VM
 	if ctx.TxnMgr != nil && ctx.WAL != nil && ctx.MaterializeWriterXID() == nil {
 		ctx.TxnMgr.AddPendingRelDelete(ctx.TxnMgr.TopLevelXid(ctx.Tx.XID), transam.PendingRelDelete{
-			Rel: rel,
-			Xid: effectiveWriterXID(ctx),
+			Rel:      rel,
+			Xid:      effectiveWriterXID(ctx),
+			AtCommit: true,
 			Drop: func() {
 				if err := removeRelationStorage(pool, fsm, vm, rel, heap); err != nil {
 					// PG warns and carries on: the transaction has committed.
@@ -39,6 +40,31 @@ func dropRelationStorage(ctx *Context, rel storage.RelFileNode, heap bool) error
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	return nil
+}
+
+// createdRelationStorage is RelationCreateStorage's pending delete
+// (catalog/storage.c): a relation CREATE TABLE / CREATE INDEX / CREATE
+// MATERIALIZED VIEW made is scheduled for removal if the transaction aborts.
+// The abort record lists it (XACT_XINFO_HAS_RELFILELOCATORS), the storage goes
+// after that record, and replay of the abort removes the files too, so a
+// crash after the abort leaves no orphan. It reports whether the removal was
+// scheduled; when it was not (no WAL writer or transaction manager), the
+// caller's ROLLBACK undo removes the file itself.
+func createdRelationStorage(ctx *Context, rel storage.RelFileNode, heap bool) bool {
+	if ctx.TxnMgr == nil || ctx.WAL == nil || ctx.MaterializeWriterXID() != nil {
+		return false
+	}
+	pool, fsm, vm := ctx.Pool, ctx.FSM, ctx.VM
+	ctx.TxnMgr.AddPendingRelDelete(ctx.TxnMgr.TopLevelXid(ctx.Tx.XID), transam.PendingRelDelete{
+		Rel: rel,
+		Xid: effectiveWriterXID(ctx),
+		Drop: func() {
+			if err := removeRelationStorage(pool, fsm, vm, rel, heap); err != nil {
+				slog.Warn("could not remove relation storage at abort", "rel", rel, "err", err)
+			}
+		},
+	})
+	return true
 }
 
 // removeRelationStorage drops rel's buffers and file, and for a heap its

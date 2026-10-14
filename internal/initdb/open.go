@@ -1242,7 +1242,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, false)
 			}
 		case transam.XactAbort:
-			payload, perr = xlog.EncodeXactAbortPG(xid)
+			// The relations the transaction created go into the abort record;
+			// their files are removed once it is written (XactLogAbortRecord).
+			payload, perr = xlog.EncodeXactAbortPGWithRels(xid, nil, txnMgr.PendingAbortRelDeletes(xid))
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}

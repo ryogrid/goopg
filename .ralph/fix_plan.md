@@ -5015,6 +5015,20 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     \(`ProcessRollbackUndos`\), including the cascaded objects \(views, partitions, inheritance children\)\.
   - Expected instrument: a testport case per repro; regress `alter\_table` / `inherit` rollback cases\.
 
+- [ ] **A CREATE TABLE inside a rolled\-back savepoint survives** \(found 2026\-10\-14 during M0122\-0009 S6c\)\.
+  Kind: bug
+  Placement: S2 defect awaiting owner placement \(wrong results: an object exists that the transaction never
+  created\)\. Filed without a parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
+  - Repro on a fresh cluster: `BEGIN; SAVEPOINT s; CREATE TABLE sp\(a int\); INSERT INTO sp VALUES \(1\); ROLLBACK TO
+    s; SELECT count\(\*\) FROM sp; COMMIT;` → the SELECT returns 0 rows instead of 42P01, and `sp` still exists after
+    COMMIT\. PG 18\.3 removes it at ROLLBACK TO \(the creation is part of the subtransaction\)\.
+  - Cause: `RecordDDLCreate` entries carry no savepoint depth, and `execRollbackTo` undoes only drops
+    \(`RollbackDDLDropsToDepth`\); creates are undone only by a top\-level ROLLBACK \(`ProcessRollbackUndos`\)\.
+  - First step: record the savepoint depth on `DDLUndoEntry`, undo the creates above the target depth in
+    `execRollbackTo`, and then remove a create entry\'s storage at commit when its subtransaction aborted
+    \(`endPendingRelDeletes` currently forgets it\)\.
+  - Expected instrument: a testport case of the repro; regress `transactions` savepoint DDL cases\.
+
 - [ ] **`pg\_relation\_filepath\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6b\)\.
   Kind: bug
   Parent: none
@@ -5328,6 +5342,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL / storage correctness; no plan instrument\.
     - Next: abort records listing created relations \(rollbackDDLCreate → pending abort deletes\), then END\_OF\_RECOVERY
       at promotion \(§4\.4 item 7\)\.
+  - **2026\-10\-14 S6c landed** — created relations in the abort record \(PG `RelationCreateStorage` atCommit=false\)\.
+    - The six `RecordDDLCreate` sites register a create entry; the abort record lists it; the storage goes after the
+      record; a commit forgets it\. `pg\_waldump` shows `ABORT …; rels: base/5/…`\.
+    - Caught and fixed a regression from adding the field: S6b\'s drops defaulted to create entries \(autocommit DROP
+      kept its file\)\.
+    - Found: a CREATE TABLE inside a savepoint that is rolled back survives \(filed as an S2 defect\)\.
+    - Tests: `TestPendingRelDeletes` \(abort side\), `TestServerSummarizesWAL` \(init\-fork limit row; negative
+      control fails\)\.
+    - Gates: units, internal/postmaster/\.\.\., isolation ports, tpch\-spotcheck, acceptance arm, sf025\.
+    - Movement: none — WAL / storage correctness; no plan instrument\.
+    - Next: END\_OF\_RECOVERY at promotion \(§4\.4 item 7\), or the HeapVisible spcOid \(item 2\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

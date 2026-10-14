@@ -10,7 +10,9 @@ import (
 // TestPendingRelDeletes pins the PendingRelDelete lifecycle
 // (catalog/storage.c): a commit lists and then removes what the transaction
 // dropped, except drops made inside a rolled-back subtransaction (or below
-// one); an abort removes nothing; a relation dropped twice is listed once.
+// one), and forgets what it created; an abort lists and removes what the
+// transaction created and carries out no drop; a relation dropped twice is
+// listed once.
 func TestPendingRelDeletes(t *testing.T) {
 	m := NewManager()
 	rel := func(n uint32) storage.RelFileNode { return storage.RelFileNode{DBOid: 5, RelOid: n} }
@@ -28,7 +30,7 @@ func TestPendingRelDeletes(t *testing.T) {
 	}
 	var removed []uint32
 	add := func(top, owner storage.TransactionID, n uint32) {
-		m.AddPendingRelDelete(top, PendingRelDelete{Rel: rel(n), Xid: owner, Drop: func() { removed = append(removed, n) }})
+		m.AddPendingRelDelete(top, PendingRelDelete{Rel: rel(n), Xid: owner, AtCommit: true, Drop: func() { removed = append(removed, n) }})
 	}
 
 	// Commit: listed for the commit record, removed after it, in drop order.
@@ -69,14 +71,42 @@ func TestPendingRelDeletes(t *testing.T) {
 		t.Errorf("entries left after commit: %v", got)
 	}
 
-	// Abort: nothing is removed and nothing is left behind.
+	// Abort: no drop is carried out; the relations the transaction created
+	// are listed for the abort record and removed after it.
 	removed = nil
+	created := func(top storage.TransactionID, n uint32) {
+		m.AddPendingRelDelete(top, PendingRelDelete{Rel: rel(n), Xid: top, Drop: func() { removed = append(removed, n) }})
+	}
 	tx, xid = begin()
 	add(xid, xid, 200)
+	created(xid, 201)
+	if got, want := m.PendingRelDeletes(xid), []storage.RelFileNode{rel(200)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("commit list %v, want %v", got, want)
+	}
+	m.SetXactMarkerLogger(func(x storage.TransactionID, kind XactMarker, _ bool) error {
+		if x == xid && kind == XactAbort {
+			seen = m.PendingAbortRelDeletes(x)
+		}
+		return nil
+	})
 	if err := m.Rollback(tx); err != nil {
 		t.Fatal(err)
 	}
-	if len(removed) != 0 || len(m.PendingRelDeletes(xid)) != 0 {
-		t.Errorf("abort removed %v, left %v", removed, m.PendingRelDeletes(xid))
+	if want := []storage.RelFileNode{rel(201)}; !reflect.DeepEqual(seen, want) {
+		t.Errorf("abort record lists %v, want %v", seen, want)
+	}
+	if want := []uint32{201}; !reflect.DeepEqual(removed, want) {
+		t.Errorf("removed at abort %v, want %v", removed, want)
+	}
+
+	// Commit forgets what the transaction created.
+	removed = nil
+	tx, xid = begin()
+	created(xid, 300)
+	if err := m.Commit(tx); err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 || len(m.PendingAbortRelDeletes(xid)) != 0 {
+		t.Errorf("commit removed created storage %v, left %v", removed, m.PendingAbortRelDeletes(xid))
 	}
 }

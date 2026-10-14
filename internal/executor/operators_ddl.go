@@ -4151,7 +4151,8 @@ afterExistsCheck:
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -5319,7 +5320,8 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		}
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
 		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
 		// The 42P16 guard at the top of this function already rejected a
@@ -5601,7 +5603,8 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	}
 	// Record for rollback.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -14653,7 +14656,8 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	// re-emits ` WHERE (pred)` on dump (no enforcement in v0). DU-002 slice 310.
 	applyExclusionPredicate(idx, ec.ExclusionWhere)
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.IndexRelFileNode(idx), false)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
@@ -14897,7 +14901,8 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	// Record for rollback before heap sync (index is live in catalog now).
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.IndexRelFileNode(idx), false)})
 	}
 	o.indexUpdateHeapStats(tbl, o.buildHeapTuples)
 	if catalogHeapSyncAvailable(o.ctx) {
@@ -21006,7 +21011,8 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	// the plain-view path (vt.ViewDef = s.RawDef). M0110-0001 (DU-002 slice 60).
 	tbl.ViewDef = s.RawDef
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
