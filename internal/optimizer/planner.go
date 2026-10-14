@@ -7079,6 +7079,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_wal_summarizer_state") {
+		return planPgGetWalSummarizerState(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
 	}
@@ -7935,6 +7938,34 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgGetWalSummarizerState routes a FROM-clause invocation of
+// pg_get_wal_summarizer_state() into a one-row PgAvailableWalSummaries node
+// with Func set. M0122-0009 S4b.
+func planPgGetWalSummarizerState(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_wal_summarizer_state"
+	}
+	colNames := []string{"summarized_tli", "summarized_lsn", "pending_lsn", "summarizer_pid"}
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	colTypes := []string{"int8", "pg_lsn", "pg_lsn", "int4"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_get_wal_summarizer_state", schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

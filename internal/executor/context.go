@@ -109,6 +109,10 @@ type Context struct {
 	// — that's the v0 behaviour for a server started without a WAL
 	// writer.
 	Checkpointer Checkpointer
+	// WalSummarizerState, when set, reads the WAL summarizer's state for
+	// pg_get_wal_summarizer_state(). nil reports a summarizer that never ran.
+	// M0122-0009 S4b.
+	WalSummarizerState func() WalSummarizerStatus
 
 	// OuterRows is the lexical-scope row stack used by correlated
 	// subqueries. evalSubquery / evalInExpr / evalExistsExpr push
@@ -1970,6 +1974,19 @@ func (c *Context) deadlockTimeout() time.Duration {
 		return lmgr.DefaultDeadlockTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// WalSummarizerStatus is the WAL summarizer's published state as
+// pg_get_wal_summarizer_state reports it (GetWalSummarizerState,
+// walsummarizer.c). Initialized is false until the summarizer has run;
+// Running is false once it has exited.
+type WalSummarizerStatus struct {
+	Initialized   bool
+	Running       bool
+	TLI           uint32
+	SummarizedLSN uint64
+	PendingLSN    uint64
+	PID           int
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

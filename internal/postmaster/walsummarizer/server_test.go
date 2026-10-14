@@ -2,7 +2,9 @@ package walsummarizer
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,5 +124,99 @@ func TestServerSummarizesWAL(t *testing.T) {
 	all := waitFiles(before + 1)
 	if ok, missing := walsummary.AreComplete(all, all[0].Start, all[len(all)-1].End); !ok {
 		t.Errorf("summaries %v have a gap at %X", all, missing)
+	}
+}
+
+// TestServerSummarizerState pins pg_get_wal_summarizer_state()
+// (GetWalSummarizerState) through the same off → on → off sequence a
+// scratch PG 18.3 answered with: 0, 0/0, 0/0, NULL before the summarizer
+// has run; the timeline, a pid and summarized_lsn <= pending_lsn while it
+// runs; pending_lsn = summarized_lsn and a NULL pid once it has stopped.
+func TestServerSummarizerState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a goopg server")
+	}
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := cluster.New("walsumstate", cluster.Options{
+		RepoRoot:     root,
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  60 * time.Second,
+		ShutdownWait: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(cluster.ShutdownFast)
+	ctx := context.Background()
+	state := func() []string {
+		t.Helper()
+		rows, err := c.Query(ctx, "SELECT summarized_tli, summarized_lsn, pending_lsn, coalesce(summarizer_pid::text, 'NULL') FROM pg_get_wal_summarizer_state()")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("pg_get_wal_summarizer_state: %v %v", rows, err)
+		}
+		return rows[0]
+	}
+	lsn := func(s string) uint64 {
+		var hi, lo uint64
+		if _, err := fmt.Sscanf(s, "%X/%X", &hi, &lo); err != nil {
+			t.Fatalf("bad pg_lsn %q", s)
+		}
+		return hi<<32 | lo
+	}
+	if got := strings.Join(state(), "|"); got != "0|0/0|0/0|NULL" {
+		t.Fatalf("before the summarizer ran: %s, want 0|0/0|0/0|NULL", got)
+	}
+	if err := c.AppendPostgresqlConf("summarize_wal = on"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Query(ctx, "CHECKPOINT"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	var run []string
+	for {
+		run = state()
+		if run[0] == "1" && run[3] != "NULL" && lsn(run[1]) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("summarizer never reported running: %v", run)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if lsn(run[1]) > lsn(run[2]) {
+		t.Errorf("running: summarized_lsn %s > pending_lsn %s", run[1], run[2])
+	}
+	if err := c.AppendPostgresqlConf("summarize_wal = off"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		st := state()
+		if st[3] == "NULL" {
+			if st[0] != "1" || st[1] != st[2] || lsn(st[1]) < lsn(run[1]) {
+				t.Errorf("stopped: %v, want tli 1 and pending_lsn = summarized_lsn >= %s", st, run[1])
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("summarizer never reported stopped: %v", st)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

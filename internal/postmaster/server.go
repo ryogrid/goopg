@@ -873,6 +873,21 @@ func (s *Server) reloadConfig() {
 	}
 }
 
+// walSummarizerStatus is pg_get_wal_summarizer_state's view of the running
+// summarizer. goopg runs it as a goroutine of the server process, so the pid
+// it reports is the server's.
+func (s *Server) walSummarizerStatus() executor.WalSummarizerStatus {
+	st := s.cfg.WalSummarizer.State()
+	return executor.WalSummarizerStatus{
+		Initialized:   st.Initialized,
+		Running:       st.Running,
+		TLI:           st.SummarizedTLI,
+		SummarizedLSN: st.SummarizedLSN,
+		PendingLSN:    st.PendingLSN,
+		PID:           os.Getpid(),
+	}
+}
+
 // summarizeWALEnabled reads summarize_wal from the server registry.
 func (s *Server) summarizeWALEnabled() bool {
 	if s.cfg.Registry == nil {

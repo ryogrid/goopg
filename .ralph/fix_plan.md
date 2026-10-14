@@ -5209,6 +5209,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next slice: S4b `pg\_get\_wal\_summarizer\_state` from `Service\.State`, plus the walsummarizer
       `pg\_stat\_io` / `pg\_stat\_activity` rows\. Then S5 `wal\_summary\_keep\_time`\.
+  - **2026\-10\-14 S4b landed** — `pg\_get\_wal\_summarizer\_state\(\)` is a one\-row FROM\-clause SRF over the
+    running summarizer\'s state\.
+    - Never ran: `0, 0/0, 0/0, NULL`\. Running: the tli, the LSNs and a pid\. Stopped: `pending = summarized`, NULL
+      pid\. All of this was checked on a fresh scratch PG 18\.3\.
+    - `TestServerSummarizerState` checks it on a real goopg server\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, acceptance arm \(m0190 values\), sf025,
+      fire set \(no changed plan\) PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next slice: S5 `wal\_summary\_keep\_time` \(MaybeRemoveOldWalSummaries\)\. Then the walsummarizer
+      `pg\_stat\_activity` / `pg\_stat\_io` rows, then S6a \(native\-record classifier arms\)\.
+    - The commit touches internal/optimizer, so S9\'s census must be re\-checked next loop\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

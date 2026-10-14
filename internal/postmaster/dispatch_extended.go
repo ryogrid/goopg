@@ -251,6 +251,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	ectx.Snap = snap
 	ectx.Params = datums
 	ectx.Checkpointer = s.cfg.Checkpointer
+	if s.cfg.WalSummarizer != nil {
+		ectx.WalSummarizerState = s.walSummarizerStatus
+	}
 	// M0127-P3.3: the simple path has always set this (dispatch.go); the
 	// extended path never did, so an extended-protocol query's spill files
 	// resolved to os.TempDir() instead of <datadir>/base/pgsql_tmp — the

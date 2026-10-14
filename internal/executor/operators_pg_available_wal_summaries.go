@@ -36,6 +36,10 @@ func (o *pgAvailableWalSummariesOp) Schema() optimizer.Schema { return o.plan.Ou
 
 func (o *pgAvailableWalSummariesOp) Open(ctx *Context) error {
 	o.rows, o.pos = nil, 0
+	if o.plan.Func == "pg_get_wal_summarizer_state" {
+		o.rows = []Row{walSummarizerStateRow(ctx)}
+		return nil
+	}
 	if ctx == nil || ctx.DataDir == "" {
 		return nil
 	}
@@ -50,6 +54,27 @@ func (o *pgAvailableWalSummariesOp) Open(ctx *Context) error {
 		o.rows = append(o.rows, Row{NewIntDatum(int64(f.TLI)), NewStringDatum(pgLSNText(f.Start)), NewStringDatum(pgLSNText(f.End))})
 	}
 	return nil
+}
+
+// walSummarizerStateRow is pg_get_wal_summarizer_state's row
+// (GetWalSummarizerState): 0, 0/0, 0/0, NULL before the summarizer has run;
+// once it has exited, pending_lsn falls back to summarized_lsn and the pid
+// is NULL.
+func walSummarizerStateRow(ctx *Context) Row {
+	var st WalSummarizerStatus
+	if ctx != nil && ctx.WalSummarizerState != nil {
+		st = ctx.WalSummarizerState()
+	}
+	if !st.Initialized {
+		return Row{NewIntDatum(0), NewStringDatum("0/0"), NewStringDatum("0/0"), NullDatum}
+	}
+	pending, pid := st.PendingLSN, NullDatum
+	if !st.Running || st.PID <= 0 {
+		pending = st.SummarizedLSN
+	} else {
+		pid = NewIntDatum(int64(st.PID))
+	}
+	return Row{NewIntDatum(int64(st.TLI)), NewStringDatum(pgLSNText(st.SummarizedLSN)), NewStringDatum(pgLSNText(pending)), pid}
 }
 
 func (o *pgAvailableWalSummariesOp) Next() (TupleSlot, error) {

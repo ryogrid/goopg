@@ -7395,6 +7395,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.FromRegexpSplitToTable:
 		return srfFunctionScanLabel("regexp_split_to_table", "")
 	case *optimizer.PgAvailableWalSummaries:
+		if f := n.(*optimizer.PgAvailableWalSummaries).Func; f != "" {
+			return srfFunctionScanLabel(f, "")
+		}
 		return srfFunctionScanLabel("pg_available_wal_summaries", "")
 	case *optimizer.PgGetCatalogForeignKeys:
 		return srfFunctionScanLabel("pg_get_catalog_foreign_keys", "")

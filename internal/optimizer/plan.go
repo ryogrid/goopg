@@ -2629,8 +2629,14 @@ func (n *TSTokenType) Output() Schema { return n.schema }
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
 // for each WAL summary file under pg_wal/summaries (GetWalSummaries).
 // M0095-0002; real since M0122-0009 S4a.
+//
+// The same zero-argument node also carries pg_get_wal_summarizer_state()
+// (Func set to that name): one row (summarized_tli int8, summarized_lsn
+// pg_lsn, pending_lsn pg_lsn, summarizer_pid int4) from the running
+// summarizer (walsummaryfuncs.c). M0122-0009 S4b.
 type PgAvailableWalSummaries struct {
 	pos    int
+	Func   string // "" or "pg_available_wal_summaries", or "pg_get_wal_summarizer_state"
 	schema Schema
 }
 

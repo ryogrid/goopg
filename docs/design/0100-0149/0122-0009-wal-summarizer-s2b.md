@@ -162,3 +162,24 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
   (S4b) remain.
 - goopg logs no `XLOG_SMGR_CREATE` for a new table, so its summary carries blocks but no limit row. This is a
   producer gap (design §4.4, S6).
+
+## S4b landed (2026-10-14): `pg_get_wal_summarizer_state()`
+
+- **Planner:** the zero-argument `PgAvailableWalSummaries` node gains a `Func` field, which also plans
+  `pg_get_wal_summarizer_state()` as a one-row FROM-clause SRF. goopg has no record-valued builtins, so PG's TAP
+  form `SELECT ... FROM pg_get_wal_summarizer_state()` is the supported shape.
+- **Executor:** it reads `executor.Context.WalSummarizerState`, set at both dispatch sites from
+  `Server.walSummarizerStatus`, a view of `walsummarizer.Service.State`.
+- **Values:** these follow `GetWalSummarizerState`, as checked on a fresh scratch PG 18.3:
+
+  | State | Row |
+  |---|---|
+  | Never ran | `0, 0/0, 0/0, NULL` |
+  | Running | the timeline, both LSNs, a pid |
+  | Stopped | `pending_lsn = summarized_lsn` and a NULL pid |
+
+  - goopg runs the summarizer as a goroutine, so the pid is the server's.
+
+**Evidence:**
+- `TestServerSummarizerState` drives the same off → on → off sequence on a real goopg server.
+- The fire set shows no changed plan at either scale. The TPC-H arm matches the m0190 values.

@@ -504,6 +504,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
+	if s.cfg.WalSummarizer != nil {
+		ectx.WalSummarizerState = s.walSummarizerStatus
+	}
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
 	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)
