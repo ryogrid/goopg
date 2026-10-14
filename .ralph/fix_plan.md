@@ -66,8 +66,10 @@ banner at the next `## ` line).
   owner-delegated — S8's "do not invent work" does not apply to it):
   when no item 0-9 holds a selectable ACTIONABLE task — the standing
   census root M0146-0014 is a filing channel, not stock, and does not
-  count, nor do S7-carve-out/below-item-10 descendants — run ONE
-  replenishment pass BEFORE item 10:
+  count; burn-down parents (today: M0146-0042, M0146-0007) count only
+  while they hold an ungated actionable slice or a fileable census
+  record of their own; nor do S7-carve-out/below-item-10 descendants
+  — run ONE replenishment pass BEFORE item 10:
   (1) Census freshness — reuse the newest
   `analysis/m0146/m0146-0014/routing-*/` artifact iff its ROUTING.md's
   recorded capture sha is an ancestor of HEAD AND no commit since
@@ -96,7 +98,12 @@ banner at the next `## ` line).
   rationale) — it is selected before item 10.
   (4) Bounds — ONE filing per pass, never a batch. A pass that files
   nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
-  entry and re-runs only after HEAD advances past that sha in the
+  entry — the note MUST list every open `[ ]` task ranked items 0-9
+  and the gate making it non-actionable, as `id(gate)` tokens using
+  the closed vocabulary `channel`, `below-item-10`, `owner-<what>`,
+  `blocked-on <id>` (e.g. `M0146-0178(owner-reload SF0.25)`), so an
+  owner gate such as a pending corpus reload is auditable in the
+  record — and re-runs only after HEAD advances past that sha in the
   planner-relevant paths above — otherwise item 10 is live for that
   loop. A replenishment task that closes `Movement: none` must name
   why its premise/record was stale; after TWO consecutive such closes
@@ -273,6 +280,12 @@ it to hold the lineage.)
    since M0146-0130). M0146-0005dp re-opened alongside (its 0049/0049e
    gate landed). M0146-0014 re-opened under the pin above — new
    findings from its sweeps file under it again.
+   **Next item-3 work (OWNER DECISIONS 2026-10-15): M0146-0178
+   slice 2** — `IndexRealPages` resolving an index's real file under
+   the catalog's database, `searchCtx.cat` threaded into
+   `estimateIndexGeometry`. Its owner gate cleared 2026-10-15 (the
+   SF0.25 corpus reload — see the task entry); 0176/0177/0179/0180
+   and the S9-filed 0190–0194 are all `[x]`.
 4. **M0141-S2a-fix2r** — re-apply the PG-faithful `hashAggEntrySize` change that
    was discarded for parity reasons (owner Q4: no reverts). Degradations it
    causes are filed as their own tasks, not reverted.
@@ -1056,6 +1069,35 @@ the next breakdown→fix task instead of falling to item 10):
   Accepted: the subtree is parity work by construction, and the S9
   bounds (one filing/pass, stale-premise accounting, two-`none`
   escalation) bound the abuse channel.
+
+OWNER DECISIONS 2026-10-15 (delegated; resolves the owner's direction
+"restore parity focus — the loop has been selecting item-10 tasks"):
+
+- **Cause found, not a selection-rule violation:** the loop skipped to
+  item 10 because the only open non-channel items-0-9 task,
+  M0146-0178, led its remaining-steps list with an owner gate
+  ("(1) owner reload of the goopg TPC-DS clusters") and the SF0.25
+  half of that reload had never run (SF1 was reloaded 2026-10-13).
+  S9's censuses correctly found every other record routed or waived.
+- **SF0.25 reload executed** (see M0146-0178's entry): `data-sf025`
+  re-initialised and reloaded from a clean-HEAD binary
+  (`32fe610c7`; fillfactor fix `d5d6f8c52` verified ancestor).
+  Indexes now match PG page counts on the int4 pkeys; every probed
+  heap's `relpages` equals PG `tpcds025`. Recorded reload →
+  `routing-20261014j` is stale per S9(1); next census re-captures.
+- **Auditability amendment (the systemic fix):** the loop never
+  violated S1 — but it skipped an open `[ ]` items-0-9 task on an
+  implicit owner-gate reading with NO auditable record
+  (`Skip-rationale: n/a`). S9(4) now requires every exhausted note,
+  and `.ralph/PROMPT.md`'s `Skip-rationale:` now requires every
+  items-0-9 bypass, to enumerate each open `[ ]` items-0-9 task as
+  `id(gate)` tokens with the closed vocabulary `channel` /
+  `below-item-10` / `owner-<what>` / `blocked-on <id>`. An owner gate
+  on a parity task can no longer hide inside an "exhausted" verdict.
+- **S9 stock clause tightened:** burn-down parents (today
+  M0146-0042, M0146-0007) are stock only while they hold an ungated
+  actionable slice of their own — a `[ ]` channel root must not by
+  itself keep items 0-9 "live" and starve the replenishment pass.
 
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
@@ -33239,7 +33281,15 @@ Movement: none — rendering-only: Q58/Q64 EXPLAIN text moved to PG's; the class
       276, was 494\)\. Test `TestAscendingInsertsSplitRightmostAtFillfactor`\.
     - No plan moved: the gate clusters keep their old index files\.
     - Remaining, in order: \(1\) owner reload of the goopg TPC\-DS clusters, so their indexes are rebuilt under the
-      new rule; \(2\) slice 2, resolving `IndexRealPages` through the catalog\'s database and threading `searchCtx\.cat`
+      new rule — **DONE \(owner, 2026\-10\-15\)**: SF1 was reloaded 2026\-10\-13 \(`eef67e635`, post\-fillfactor\)
+      and SF0\.25 `data\-sf025` was re\-initialised and reloaded 2026\-10\-15 from a clean\-HEAD binary
+      \(`32fe610c7`, ancestor check on `d5d6f8c52` PASS\)\. Verified on\-disk: item\_pkey 52 = PG 52,
+      customer\_pkey 276 = PG 276, date\_dim\_pkey 202 = PG 202 \(were 90 / 494 / —\); heap `relpages` now
+      equal PG `tpcds025` on every probed table \(item 1284, customer 2872, store\_sales 12936,
+      store\_returns 1232, date\_dim 1424, catalog\_sales 9416, time\_dim 1408, web\_sales 4744\)\.
+      **This corpus reload is recorded here — it invalidates `routing\-20261014j` under S9\(1\); the next
+      census pass must re\-capture\.**; \(2\) slice 2, resolving `IndexRealPages` through the catalog\'s database
+      and threading `searchCtx\.cat`
       into `estimateIndexGeometry` — done earlier it would price today\'s half\-empty files; \(3\) the heap
       residual\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(no change\), TPC\-H

@@ -121,7 +121,12 @@ wasted turns).
     line naming why not (blocking task id, S2 awaiting owner placement,
     sequence rule, measured non-improvement); `n/a` when the next step IS the
     top residual. Added 2026-10-02 (owner): "why not the biggest category"
-    must be auditable, not implicit.
+    must be auditable, not implicit. Amended 2026-10-15 (owner): when the
+    loop bypassed items 0-9 (an S9 pass that filed nothing, or selection of
+    item 10 or the below-item-10 fallback), `Skip-rationale:` must instead
+    enumerate every open `[ ]` task ranked items 0-9 as `id(gate)` tokens —
+    `channel`, `below-item-10`, `owner-<what>`, `blocked-on <id>` — and `n/a`
+    is not acceptable while any such task exists.
   - `Gates run:` which verification gates passed/failed this loop
   - `In-flight:` any gate/process you had to abandon: exact command, log/output
     path, PID state when killed, and what result was still needed (write `none`
