@@ -12,9 +12,9 @@ import (
 // --- M0131-S21b part 1: the metapage-and-downlink btree opcodes -------------
 //
 // XLOG_BTREE_INSERT_UPPER (0x10), XLOG_BTREE_INSERT_META (0x20) and
-// XLOG_BTREE_META_CLEANUP (0xE0). goopg emits none of them — its own downlink
-// inserts ride RecordKindBtreeSplit/NewRoot and it has no _bt_set_cleanup_info
-// — so before this slice every one of them fell into RM_BTREE's `default:` arm
+// XLOG_BTREE_META_CLEANUP (0xE0). When this slice landed goopg emitted none of
+// them; since M0122-0010 (2026-10-14) it emits INSERT_UPPER for a downlink
+// inserted without a split (EncodeBtreeInsertUpperPG) — before this slice every one of them fell into RM_BTREE's `default:` arm
 // and, since S16.3, REFUSED the start unless every mutated block happened to
 // carry a full-page image. A real PG index of more than one level emits
 // INSERT_UPPER on essentially every root-ward split, so the refusal fired on
@@ -336,4 +336,46 @@ func TestApplyRecordReplaysPGBtreeMetaCleanup(t *testing.T) {
 	if string(again) != string(got) {
 		t.Errorf("second apply at the same LSN rewrote the metapage")
 	}
+}
+
+// TestEncodeBtreeInsertUpperPGIsPGRecord: goopg's own INSERT_UPPER producer
+// (EncodeBtreeInsertUpperPG, M0122-0010) writes exactly the record
+// _bt_insertonpg registers — byte-identical to the hand-built PG record above —
+// and replaying it inserts the downlink and clears the child's flag.
+func TestEncodeBtreeInsertUpperPGIsPGRecord(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 5103, Fork: storage.MainFork}
+	const metaBlk, childBlk, rootBlk = storage.BlockNumber(0), storage.BlockNumber(1), storage.BlockNumber(2)
+	newItem := nbtree.PGBTPivotRaw([]byte("sep"), storage.BlockNumber(3))
+	got, err := EncodeBtreeInsertUpperPG(rel, rootBlk, 2, newItem, childBlk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := buildBtreeInsertPG(t, xlogBtreeInsertUpper, rel, rootBlk, 2, newItem, childBlk, nil)
+	if string(got) != string(want) {
+		t.Fatalf("EncodeBtreeInsertUpperPG differs from the PG-shaped record:\n got %x\nwant %x", got, want)
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+	defer mgr.Close()
+	meta := make(storage.Page, storage.BlockSize)
+	if err := nbtree.InitPGMetaPage(meta, rootBlk, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	btreeSeedRel(t, mgr, rel, meta, btreeLeafPage(t, true), btreeInternalPage(t, 1, childBlk))
+	applyPGRecord(t, mgr, got, 4200)
+	root := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, rootBlk, root); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := storage.PageLinePointerCount(root); err != nil || n != 2 {
+		t.Fatalf("root has %d items (err %v), want 2", n, err)
+	}
+	child := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, childBlk, child); err != nil {
+		t.Fatal(err)
+	}
+	if nbtree.ReadPGOpaque(child).Flags&nbtree.BTPIncompleteSplit != 0 {
+		t.Error("replay of goopg's INSERT_UPPER left BTP_INCOMPLETE_SPLIT set on the child")
+	}
+	_ = metaBlk
 }

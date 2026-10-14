@@ -5526,6 +5526,15 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\.
     - Next: gap 3 \(clear the child\'s INCOMPLETE\_SPLIT inside the parent\'s insert record\), then gap 4 \(PG latch
       order\)\.
+  - **2026\-10\-14 lock\-coupling slice 2 landed** \(gap 3\)\.
+    - A no\-split downlink insert into an internal page now logs `XLOG\_BTREE\_INSERT\_UPPER` \(was `INSERT\_LEAF`, a
+      parity bug\) with the child as block 1, and clears the child\'s flag in that same record
+      \(`insertUpperFinishChild`, `EncodeBtreeInsertUpperPG`, pool hook `LogBtreeInsertUpper`\)\.
+    - Evidence: encoder byte\-identical to the PG record; replay clears the flag; `TestInternalInsertFinishesChildSplit`
+      \(negative control fails\); `pg\_waldump` decodes 885 records; kill \-9 \+ recovery → index = heap \(30000\)\.
+    - Gates: nbtree \+ xlog \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: gap 4 \(PG latch order: keep the left page latched through `getStackBuf`, child before parent\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

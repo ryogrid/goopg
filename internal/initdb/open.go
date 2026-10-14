@@ -609,6 +609,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Internal-page insert that finishes a child split: PG's
+	// XLOG_BTREE_INSERT_UPPER (block 0 the parent, block 1 the child whose
+	// incomplete-split flag redo clears). M0122-0010.
+	logBtreeInsertUpper := func(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte, childBlk storage.BlockNumber) (storage.LSN, error) {
+		payload, err := xlog.EncodeBtreeInsertUpperPG(rel, blk, offnum, item, childBlk)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Logical heap-delete (xmax stamp) change record.
 	// oldTuple carries the pre-delete heap-tuple bytes for logical
 	// replication; nil when the caller doesn't need logical decoding.
@@ -848,6 +863,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
+
+		// M0122-0010: XLOG_BTREE_INSERT_UPPER for no-split downlink inserts.
+		LogBtreeInsertUpper: logBtreeInsertUpper,
+
 		LogHeapDelete:  logHeapDelete,
 		LogHeapVacuum:  logHeapVacuum,
 		LogBtreeVacuum: logBtreeVacuum,

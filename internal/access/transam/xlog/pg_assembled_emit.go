@@ -299,6 +299,25 @@ func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, old
 	return framedAssemble(RmgrHeap, xlogHeapUpdate, uint32(xmax), mainData, blocks)
 }
 
+// EncodeBtreeInsertUpperPG builds the xl_btree_insert record PG writes for an
+// insertion into an INTERNAL page (XLOG_BTREE_INSERT_UPPER, _bt_insertonpg):
+// main data xl_btree_insert{offnum}; block 0 the parent with the new downlink
+// tuple as block data; block 1 the child whose split this downlink finishes,
+// registered bare — redo clears its BTP_INCOMPLETE_SPLIT flag
+// (btree_xlog_insert's _bt_clear_incomplete_split, nbtxlog.c). Same relation,
+// so block 1 carries BKPBLOCK_SAME_REL, as XLogRecordAssemble sets it.
+func EncodeBtreeInsertUpperPG(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte, childBlk storage.BlockNumber) ([]byte, error) {
+	if len(item) == 0 {
+		return nil, fmt.Errorf("wal: btree-insert-upper item is empty")
+	}
+	mainData := make([]byte, sizeOfXLogBtreeInsertData)
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	return framedAssemble(RmgrBtree, xlogBtreeInsertUpper, 0, mainData, []BlockRef{
+		{ID: 0, Rel: rel, Block: blk, Data: item},
+		{ID: 1, Rel: rel, Block: childBlk, SameRel: true},
+	})
+}
+
 // sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
 const sizeOfXLogBtreeInsertData = 2
 

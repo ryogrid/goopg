@@ -120,9 +120,8 @@ order:
    move right along the parent level, skipping half\-dead and deleted pages,
    until a downlink equals the split child. Otherwise fail with "failed to
    re\-find parent key".
-3. **\(S\)** Clear the child's `INCOMPLETE\_SPLIT` inside the parent's no\-split
-   insert record, as `\_bt\_insertonpg` does. Today a separate
-   `clearIncompleteSplit` page record does it.
+3. **\(S, landed\)** Clear the child's `INCOMPLETE\_SPLIT` inside the parent's
+   no\-split insert record, as `\_bt\_insertonpg` does \(slice 2 below\).
 4. **\(M\)** Latch in PG's order: keep the left page latched until the parent
    is found, take the child before the parent, and release the right page once
    the parent is pinned. Today all latches are released before going up a
@@ -150,6 +149,38 @@ The acceptance instrument is `TestStructuralLockInteriorSplitWorkload` with
 
 The shared\-lock configuration stays at 0/20 failures, and the package passes under
 `\-race`.
+
+**Slice 2 \(gap 3\).** A downlink inserted into an internal page without a split
+used to go out as `XLOG\_BTREE\_INSERT\_LEAF`, a PG parity bug of its own. The
+child's flag was then cleared by a separate page record, so a crash between the
+two left a finished split flagged. `insertUpperFinishChild` now:
+
+- latches the child, parent before child, the split path's existing order;
+- clears the child's flag;
+- logs one `XLOG\_BTREE\_INSERT\_UPPER` record: block 0 the parent with the item,
+  block 1 the child, bare and `SAME\_REL` \(`EncodeBtreeInsertUpperPG`, the
+  `LogBtreeInsertUpper` pool hook\);
+- marks both pages covered by the record.
+
+The redo arm already existed for PG\-written records.
+
+Evidence:
+
+- the encoder is byte\-identical to the hand\-built PG record;
+- replaying goopg's record inserts the downlink and clears the flag;
+- `TestInternalInsertFinishesChildSplit`, whose negative control fails;
+- `pg\_waldump` decodes 885 `INSERT\_UPPER` records from a 30 000\-row randomised
+  index build;
+- after `kill \-9` and recovery from a redo point before the build, the index
+  agrees with the heap \(30 000 = 30 000, and 310 point lookups all found\).
+
+Unshared reproducer after slice 2: 13/15 failures, up from 5/15, all of the
+gap\-5 class \("failed to re\-find parent key"\). There is no new class and no panic
+or deadlock. Latching and logging the child lengthens the parent insert, which
+widens the window in which another handle's half\-finished split has no downlink
+yet; gap 5 closes that window. So the per\-slice acceptance rule is "no new
+failure class in the unshared run, 0/20 in the shared run", not a falling count.
+Shared: 0/20, `\-race` clean.
 
 ## 5. Tests
 

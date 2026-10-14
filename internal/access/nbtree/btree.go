@@ -2773,6 +2773,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			// disagreement must not strand the latch.
 		} else {
 			bt.traceInsert(blk, lineIdx, it)
+			if childBlk != storage.InvalidBlockNumber && !op.IsLeaf() {
+				// A downlink into an internal page finishes the child's
+				// split: clear its flag in the same record
+				// (_bt_insertonpg, XLOG_BTREE_INSERT_UPPER).
+				derr := bt.insertUpperFinishChild(slot, blk, lineIdx, it, childBlk)
+				held.release()
+				return derr
+			}
 			// Logical-record path (M0002 redo-records): if the pool
 			// has a btree-insert hook configured, emit a small
 			// change record on subsequent dirties of this page in
@@ -3249,6 +3257,43 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// already cleared it under its own record (S11.5b-3), in which case this
 	// is a no-op; the parent's no-split path still leaves it to us.
 	return bt.clearIncompleteSplit(blk)
+}
+
+// insertUpperFinishChild completes a no-split downlink insert into the
+// internal page in parentSlot (already done at lineIdx, latch held): it
+// clears childBlk's BTIncompleteSplit flag and logs both changes in ONE
+// XLOG_BTREE_INSERT_UPPER record, as _bt_insertonpg does with the child
+// buffer (cbuf) locked. Before this the parent insert went out as an
+// INSERT_LEAF record and the flag was cleared by a separate page record
+// afterwards, so a crash in between left a finished split flagged.
+//
+// The child is latched while the parent's latch is held, the order the split
+// path already uses. Both pages are registered without an image, so each
+// still owes its first-touch full-page image: MarkDirtyCoveredByRecordLocked
+// emits it when needed and raises pd_lsn to the record.
+func (bt *BTree) insertUpperFinishChild(parentSlot *storage.Slot, blk storage.BlockNumber, lineIdx int, it item, childBlk storage.BlockNumber) error {
+	childSlot, err := bt.pinW(childBlk)
+	if err != nil {
+		bt.pool.MarkDirty(parentSlot)
+		return fmt.Errorf("btree: pin incomplete-split child %d: %w", childBlk, err)
+	}
+	defer bt.unpinW(childSlot)
+	childOp := readOpaque(childSlot.Page())
+	childOp.Flags &^= BTIncompleteSplit
+	writeOpaque(childSlot.Page(), childOp)
+	logUpper := bt.pool.LogBtreeInsertUpper()
+	if logUpper == nil {
+		bt.pool.MarkDirty(parentSlot)
+		bt.pool.MarkDirty(childSlot)
+		return nil
+	}
+	lsn, err := logUpper(bt.rel, blk, pgPhysOffnum(parentSlot.Page(), lineIdx), bt.format().marshal(it), childBlk)
+	if err != nil {
+		return fmt.Errorf("btree: log internal insert: %w", err)
+	}
+	bt.pool.MarkDirtyCoveredByRecordLocked(parentSlot, lsn)
+	bt.pool.MarkDirtyCoveredByRecordLocked(childSlot, lsn)
+	return nil
 }
 
 // getStackBuf is _bt_getstackbuf (nbtinsert.c) for a page split: it returns

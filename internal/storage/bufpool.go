@@ -132,6 +132,9 @@ type Pool struct {
 	logHeapInsert LogHeapInsertFunc
 	// logBtreeInsert emits a logical B-tree non-split insert WAL record.
 	logBtreeInsert LogBtreeInsertFunc
+	// logBtreeInsertUpper emits the internal-page insert record that also
+	// finishes a child split (XLOG_BTREE_INSERT_UPPER).
+	logBtreeInsertUpper LogBtreeInsertUpperFunc
 	// logHeapDelete emits a logical heap-delete WAL record.
 	logHeapDelete LogHeapDeleteFunc
 	// logHeapLock emits a logical heap-lock WAL record.
@@ -664,6 +667,7 @@ type PoolConfig struct {
 	LogBtreeSplit            LogBtreeSplitFunc
 	LogHeapInsert            LogHeapInsertFunc
 	LogBtreeInsert           LogBtreeInsertFunc
+	LogBtreeInsertUpper      LogBtreeInsertUpperFunc
 	LogHeapDelete            LogHeapDeleteFunc
 	LogHeapLock              LogHeapLockFunc
 	LogHeapVacuum            LogHeapVacuumFunc
@@ -730,6 +734,11 @@ type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, t
 // the slot by key, because that needs the index's comparison semantics and
 // recovery holds a relfilenode with no catalog to resolve them from.
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte) (LSN, error)
+
+// LogBtreeInsertUpperFunc emits the record for a downlink inserted into an
+// internal page without a split: the parent insert at offnum plus clearing
+// childBlk's incomplete-split flag, in one record (XLOG_BTREE_INSERT_UPPER).
+type LogBtreeInsertUpperFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte, childBlk BlockNumber) (LSN, error)
 
 // LogHeapDeleteFunc emits one logical heap-delete (xmax stamp) redo record.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)
@@ -859,6 +868,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logBtreeSplit:            cfg.LogBtreeSplit,
 		logHeapInsert:            cfg.LogHeapInsert,
 		logBtreeInsert:           cfg.LogBtreeInsert,
+		logBtreeInsertUpper:      cfg.LogBtreeInsertUpper,
 		logHeapDelete:            cfg.LogHeapDelete,
 		logHeapLock:              cfg.LogHeapLock,
 		logHeapVacuum:            cfg.LogHeapVacuum,
@@ -947,6 +957,9 @@ func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
 
 // LogBtreeInsert returns the configured btree non-split insert change-record hook.
 func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
+
+// LogBtreeInsertUpper returns the configured internal-page insert hook.
+func (p *Pool) LogBtreeInsertUpper() LogBtreeInsertUpperFunc { return p.logBtreeInsertUpper }
 
 // LogHeapDelete returns the configured heap-delete change-record hook.
 func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
