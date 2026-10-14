@@ -679,6 +679,25 @@ Results:
   clauses (plan state, ledgered). Q78's rendering rides a cost-tie join-order
   swap.
 
+### Slice 2026-10-14 — InitPlan numbers follow the subquery RTE order (TPC-DS Q58)
+
+- **Witness.** TPC-DS Q58 at both scales. Its only divergence was the InitPlan numbering. PG numbers the three
+  inlined CTE branches' `d_week_seq = (select …)` initplans ss = 1, cs = 2, ws = 3. goopg, whose join prints cs
+  first, numbered them cs = 1, ss = 2.
+- **PG.** A plan id is the position in `glob->subplans`, i.e. planning order. `set_base_rel_sizes` plans the
+  subquery RTEs in range-table (source) order, whatever order the join later prints them in.
+- **Change.** `reservePGPlanIDs` (explain_plan_ids.go) walks a level's nested query levels through
+  `nestedLevelsInPlanningOrder`. A level is ordered by the smallest source position of any sublink inside it, and
+  only levels holding a sublink move. If any such level has a sublink of unknown position, the plan order stands.
+- **Result.**
+  - PLAN-PARITY match SF0.25 80 → 81, SF1 65 → 66 (Q58).
+  - parameterisation 10 → 9 at SF0.25 and 13 → 12 at SF1.
+  - Values are identical; regress (subselect, with, aggregates, select_parallel) is identical.
+- **Test.** `TestInitPlanNumbersFollowSubqueryRTEOrder` uses two grouped subqueries whose hash join prints the
+  second first. It fails without the change.
+- **Not ported.** The order is read from sublink source positions. That is CTE declaration order, while PG's RTE
+  order for an inlined CTE is its reference order in FROM. They agree in Q58.
+
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 
 | class | queries | PG | goopg |

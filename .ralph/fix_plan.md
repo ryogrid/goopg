@@ -29096,6 +29096,12 @@ Movement: yes — text\-identical SF0\.25 66→68, SF1 42→44; CATEGORIES\-EXCL
     timestamp types \(format\_type\(type, \-1\)\); TPC\-DS Q36/Q86/Q70 Sort Keys match PG\'s CASE text; aligned lines SF0\.25
     3680 → 3683, SF1 3097 → 3100\. Q36/Q86 still differ in the Window clause \(GROUPING deparse, next slice\)\.
 Movement: none — instrument artefact — text\-identical flat \(Q36/Q86 keep the Window\-clause difference\); aligned lines \+3 per scale
+  - Slice 2026\-10\-14: InitPlan numbers follow the subquery RTE order \(set\_base\_rel\_sizes plans subquery RTEs in
+    range\-table order\); `reservePGPlanIDs` orders nested query levels by their sublinks\' source position
+    \(`nestedLevelsInPlanningOrder`\)\. TPC\-DS Q58 matches at both scales\. Test
+    `TestInitPlanNumbersFollowSubqueryRTEOrder`\. Found by the S9 census at `6912d6e65` \(Q58\'s record was a
+    parameterisation\-labelled numbering difference with no other category\)\.
+Movement: yes — PLAN-PARITY match SF0.25 80 -> 81, SF1 65 -> 66 (Q58); CATEGORIES-EXCL-MATCH parameterisation SF0.25 10 -> 9, SF1 13 -> 12
   - Slice 2026\-10\-13 \(`d2b0ba67d`\): a key above a UNION ALL appendrel deparses through the Append\'s first child
     and stops at a kept `"\*SELECT\* n"` member \(set\_deparse\_plan / get\_variable\); TPC\-DS Q5 text\-identical at both
     scales \(SF0\.25 65 → 66, SF1 41 → 42\); Q14 10 → 2 differing lines\.

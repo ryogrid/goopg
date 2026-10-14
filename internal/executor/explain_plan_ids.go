@@ -127,7 +127,7 @@ func (r *subPlanReg) reservePGPlanIDs(root optimizer.Node) {
 		for _, ref := range refs {
 			sublink(ref)
 		}
-		for _, l := range nested {
+		for _, l := range r.nestedLevelsInPlanningOrder(nested) {
 			walk(l)
 		}
 	}
@@ -138,6 +138,65 @@ func (r *subPlanReg) reservePGPlanIDs(root optimizer.Node) {
 		}
 	}
 	walk(root)
+}
+
+// nestedLevelsInPlanningOrder orders a level's nested query levels the way
+// PG plans them (M0146-0042, TPC-DS Q58). set_base_rel_sizes plans the
+// subquery RTEs in range-table order, which is source order. goopg met them
+// in the chosen plan's order, so Q58's three inlined CTE branches, joined
+// cs-first, numbered their InitPlans 2, 1, 3 where PG numbers ss, cs, ws as
+// 1, 2, 3. The source order of a level is read from the smallest position of
+// any sublink inside it. Only a level holding a sublink can consume an id,
+// so only those levels move. When any such level has a sublink of unknown
+// position, the plan order stands (fail-closed, as for a level's own
+// sublinks above).
+func (r *subPlanReg) nestedLevelsInPlanningOrder(nested []optimizer.Node) []optimizer.Node {
+	if len(nested) < 2 {
+		return nested
+	}
+	minPos := make([]int, len(nested))
+	for i, l := range nested {
+		m := 0
+		known := true
+		var visit func(x optimizer.Node)
+		visit = func(x optimizer.Node) {
+			if x == nil || !known {
+				return
+			}
+			for _, ref := range optimizer.NodeSublinks(x) {
+				if ref.Expr == nil || ref.Expr.Pos() <= 0 {
+					known = false
+					return
+				}
+				if m == 0 || ref.Expr.Pos() < m {
+					m = ref.Expr.Pos()
+				}
+			}
+			for _, c := range renderChildren(x, r.cte) {
+				visit(c)
+			}
+		}
+		visit(l)
+		if !known {
+			return nested
+		}
+		minPos[i] = m
+	}
+	// Levels without sublinks keep their slots; the others are reordered
+	// among themselves by source position.
+	var slots []int
+	for i, m := range minPos {
+		if m > 0 {
+			slots = append(slots, i)
+		}
+	}
+	order := append([]int(nil), slots...)
+	sort.SliceStable(order, func(a, b int) bool { return minPos[order[a]] < minPos[order[b]] })
+	out := append([]optimizer.Node(nil), nested...)
+	for k, slot := range slots {
+		out[slot] = nested[order[k]]
+	}
+	return out
 }
 
 // preprocessRank is the part of the query a node's expressions come from, in
