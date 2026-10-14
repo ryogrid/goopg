@@ -407,3 +407,16 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - `TestServerSummarizesOlderWAL`: a table written before the last checkpoint that preceded `summarize_wal = on`
   appears in a summary, and the summaries are contiguous. With the oldest-segment start disabled it fails; only the
   latest-redo summary exists.
+
+## `full_page_writes = off` guard (2026-10-14)
+
+- §4.4's guard is in place. When the summarizer starts with `full_page_writes` off, it logs a WARNING
+  (`walsummarizer_fpw_off`, `ServiceConfig.FullPageWrites`, wired in `cmd/goopg` to `Pool.FullPageWrites`).
+- Why it is needed: pages that goopg dirties without a WAL block reference reach a summary only through their
+  first-touch FPI. These include MultiXact lock stamps and in-place `pg_database` writes (§4.4 item 9). PG has no such
+  warning, because it has no such pages.
+- The `unimplemented_feat.json` entry "WAL summarization not running" (M0095-0002) is marked resolved. The open
+  residuals are M0122-0009a/b/c and the §4.4 items still listed there.
+
+**Test:** `TestServiceWarnsWithoutFullPageWrites`: the warning is logged with `full_page_writes` off and not with it
+on.

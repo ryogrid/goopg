@@ -886,6 +886,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				return 0
 			},
 			Logger: logger,
+			FullPageWrites: func() bool {
+				return rt.Pool == nil || rt.Pool.FullPageWrites()
+			},
 			// wal_summary_keep_time is PGC_SIGHUP and stored in minutes.
 			KeepTime: func() time.Duration {
 				return time.Duration(intGUC(cfg.Registry, "wal_summary_keep_time", 14400)) * time.Minute

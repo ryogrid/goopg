@@ -5363,6 +5363,18 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next: the `full\_page\_writes=off` start WARNING \(§4\.4 guard\) and the pid consistency residual; the remaining
       §4\.4 producer gaps are M0122\-0009a/b/c \(awaiting placement\) and the HeapVisible record format \(item 2\)\.
+  - **2026\-10\-14 full\_page\_writes guard landed; WAL summarization backlog entry resolved\.**
+    - The summarizer warns at start when `full\_page\_writes` is off \(design §4\.4 guard\); test
+      `TestServiceWarnsWithoutFullPageWrites`\.
+    - `unimplemented\_feat\.json` "WAL summarization not running" \(M0095\-0002\) → `resolved` \(targeted edit\)\.
+    - **The WAL summarizer workstream is complete \(S1–S7, S6a–S6c, oldest\-WAL start, guard\)\.** What is left of it is
+      ledgered or filed: M0122\-0009a/b/c \(awaiting placement\), HeapVisible record format \(§4\.4 item 2\),
+      END\_OF\_RECOVERY \(needs an in\-process timeline switch\), the pid residual\.
+    - Gates: units, internal/postmaster/\.\.\., tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next slice under this task: the remaining items of the 2026\-10\-13 re\-verification list owned here — the
+      `WALInsertLock` call\-site rewrite \(the 8\-stripe scaffold is dead code\), WAL writer Wait pipelining,
+      `XLogInsert`/`XLogFlush` naming, `MarkPageHalfDead` producers\. Re\-verify each against HEAD first\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

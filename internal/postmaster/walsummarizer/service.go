@@ -39,6 +39,11 @@ type ServiceConfig struct {
 	// the server can hold a pg_stat_activity slot for it (backend_type
 	// walsummarizer) while it runs.
 	OnStart, OnStop func()
+	// FullPageWrites reports full_page_writes. Pages goopg dirties without a
+	// block reference (MultiXact lock stamps, in-place pg_database writes)
+	// reach a summary only through their first-touch FPI, so the summarizer
+	// warns when it starts with full_page_writes off (design §4.4 guard).
+	FullPageWrites func() bool
 }
 
 // Service runs the WAL summarizer when summarize_wal is on: the
@@ -105,6 +110,11 @@ func (s *Service) Reconcile(parent context.Context, enabled bool) {
 	sum, done := s.sum, s.done
 	s.mu.Unlock()
 	s.cfg.Logger.Info("WAL summarizer starting", "event", "walsummarizer_start", "tli", tli)
+	if s.cfg.FullPageWrites != nil && !s.cfg.FullPageWrites() {
+		s.cfg.Logger.Warn("WAL summaries may miss modified blocks while full_page_writes is off",
+			"event", "walsummarizer_fpw_off",
+			"detail", "goopg writes some pages without a WAL block reference; only their full-page images reach a summary")
+	}
 	onStart, onStop := s.cfg.OnStart, s.cfg.OnStop
 	go func() {
 		defer close(done)

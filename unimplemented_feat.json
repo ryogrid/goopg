@@ -2696,7 +2696,7 @@
    "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "always returns 0 rows (no WAL summarizer running since summarize_wal=off)"
    ],
@@ -2711,7 +2711,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_pg_available_wal_summaries.go:23 - Next() returns EOF immediately"
+   "code_audit": "RESOLVED 2026-10-14 (M0122-0009 S1..S7): internal/postmaster/walsummarizer runs while summarize_wal is on and writes PG-byte-identical pg_wal/summaries files (TestSummarizeMatchesPostgres); pg_available_wal_summaries / pg_wal_summary_contents / pg_get_wal_summarizer_state read them (internal/executor/operators_pg_available_wal_summaries.go); WS-002 002_blocks.pl ported (TestPort_PgWalsummary002Blocks). Residual producer gaps are M0122-0009a/b/c and design docs/design/0100-0149/0122-0009-wal-summarizer.md section 4.4."
   },
   {
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
