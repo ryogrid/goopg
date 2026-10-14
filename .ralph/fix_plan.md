@@ -5160,6 +5160,17 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next slice: S2b, the record classifier \(design §4\.3\) and the SummarizeWAL port\. The scratch PG data is in
       `tmp/walsum\-pg` \(port 5547, stopped\)\.
+  - **2026\-10\-14 S2b landed** — `internal/postmaster/walsummarizer`: the record classifier \(SMGR / DBASE / XACT
+    / XLOG boundaries, block references\) and SummarizeWAL over decoded records\.
+    `xlog\.ParseXactRecord` now reads the dropped\-relation chunk\.
+    - Oracle A: `TestSummarizeMatchesPostgres` runs a private PG 18\.3 \(summarize\_wal=on\) with a workload hitting
+      every arm\. goopg summarizes that WAL, and all 14 of PG\'s summary files match by name and byte for byte\.
+    - Non\-vacuity: breaking the LSN translation or the xact arm fails the oracle\.
+    - Design: `docs/design/0100\-0149/0122\-0009\-wal\-summarizer\-s2b\.md`\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next slice: S4a \(`pg\_available\_wal\_summaries` / `pg\_wal\_summary\_contents` over walsummary\) or S3
+      \(the live goroutine\)\. Per design §5, S4a depends only on S1 \+ S2\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed
