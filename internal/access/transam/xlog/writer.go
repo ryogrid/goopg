@@ -365,9 +365,10 @@ type Writer struct {
 	// core is constructed in `NewWriter` after `loadState` so it
 	// borrows the same `walBuf` / `memRing` rings as the legacy path
 	// (one allocation, two consumers — duplicating the rings would
-	// fork on-disk visibility). Dead code until the call-site
-	// rewrite consumes it; access in tests is guarded by the
-	// `stripeCore()` accessor below.
+	// fork on-disk visibility). The append paths reach it through
+	// `AppendXLogPayload` since the slice B call-site rewrite
+	// (644af04fe); tests reach it through the `stripeCore()` accessor
+	// below.
 	core *stripeWriterCore
 
 	// OnWALWrite and OnWALSync are optional hooks called before

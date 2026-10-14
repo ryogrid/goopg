@@ -5375,6 +5375,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Next slice under this task: the remaining items of the 2026\-10\-13 re\-verification list owned here — the
       `WALInsertLock` call\-site rewrite \(the 8\-stripe scaffold is dead code\), WAL writer Wait pipelining,
       `XLogInsert`/`XLogFlush` naming, `MarkPageHalfDead` producers\. Re\-verify each against HEAD first\.
+  - **2026\-10\-14 re\-verification of the four remaining backlog entries** \(read\-only survey, both "resolved" claims
+    checked by hand\)\.
+    - `WALInsertLock` array → `resolved`: 644af04fe mounted the 8\-stripe core; appends run under `appendMu\.RLock` on
+      their own stripe \(`AppendXLogPayload`\)\. Stale "Dead code until the call\-site rewrite" comment in writer\.go fixed\.
+    - `MarkPageHalfDead` producers → `resolved`: btree vacuum\'s `unlinkEmptyLeaf` emits `XLOG\_BTREE\_MARK\_PAGE\_HALFDEAD`
+      through the wired hook\.
+    - Still open: WAL writer Wait pipelining \(partial — `state\.writeAt` submits one AIO chunk and waits before the
+      next; small, ~100 lines in writer\.go; invariant: every pwrite completes before `flushUpTo`\'s fdatasync\) and the
+      `XLogInsert`/`XLogFlush` rename \(\~234 call sites, no behaviour change — last\)\.
+    - Next slice: Wait pipelining in `writeAt`\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

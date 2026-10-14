@@ -800,7 +800,7 @@
    "feature": "Implement WALInsertLock array to support parallel WAL inserts",
    "task_id": "M0042-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "WALInsertLock array for parallel inserts deferred"
    ],
@@ -815,7 +815,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009): commit 644af04fe (M0107-0007 slice B part 2) mounted the stripe core; Writer.tryAppend takes appendMu.RLock only and appends through s.core.AppendXLogPayload on the backend's stripe (internal/access/transam/xlog/writer.go stripeNum / newStripeWriterCore), so concurrent appenders run in parallel; appendMu is exclusive only around buffer drains. Earlier audit: PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
   },
   {
    "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
@@ -1768,7 +1768,7 @@
    "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "`MarkPageHalfDead` infrastructure stays in place for future use (no current producer outside the BtreeVacuum flag-trailer path)"
    ],
@@ -1782,6 +1782,7 @@
     "fix_plan": "no-match",
     "later_commits": "confirmed-open-code-audit: LogBtreeMarkPageHalfDead has zero non-test callers"
    },
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009): btree vacuum's unlinkEmptyLeaf (internal/access/nbtree/btree_vacuum.go) calls the pool's LogBtreeMarkPageHalfDead hook, wired in internal/initdb/open.go to xlog.EncodeBtreeMarkPageHalfDeadPG (XLOG_BTREE_MARK_PAGE_HALFDEAD); reached from VacuumIndexPages and CompleteDeferredDeletions. Deliberate divergence: one page deleted at a time, so topparent is always InvalidBlockNumber.",
    "confidence": "high"
   },
   {
