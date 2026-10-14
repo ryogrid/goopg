@@ -366,3 +366,24 @@ func (s *sliceSource) Next(ctx context.Context) (xlog.Record, error) {
 	s.i++
 	return s.recs[s.i-1], nil
 }
+
+// TestOldestSegmentLSN: XLogGetOldestSegno over pg_wal, per timeline,
+// ignoring non-segment names.
+func TestOldestSegmentLSN(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"000000010000000000000003", "000000010000000000000005", "000000020000000000000002",
+		"000000010000000000000001.partial", "archive_status", "00000002.history"} {
+		if err := os.WriteFile(filepath.Join(dir, n), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lsn, ok := oldestSegmentLSN(dir, 1, 16<<20); !ok || lsn != 3*(16<<20) {
+		t.Errorf("tli 1: %X %v, want 0/3000000", lsn, ok)
+	}
+	if lsn, ok := oldestSegmentLSN(dir, 2, 16<<20); !ok || lsn != 2*(16<<20) {
+		t.Errorf("tli 2: %X %v, want 0/2000000", lsn, ok)
+	}
+	if _, ok := oldestSegmentLSN(dir, 3, 16<<20); ok {
+		t.Error("tli 3 has no segment")
+	}
+}

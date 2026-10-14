@@ -184,6 +184,7 @@
                                         # (SIGHUP to apply)
 #summarize_wal = off                    # toggles the WAL-summarizer worker
                                         # (SIGHUP to apply)
+#wal_summary_keep_time = 14400          # in minutes (10 days); 0 disables removal
 
 # - Standby Servers -
 

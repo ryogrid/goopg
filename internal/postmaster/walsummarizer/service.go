@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/backup/walsummary"
 )
 
 // ServiceConfig wires the summarizer into a running server. The package
@@ -30,6 +32,9 @@ type ServiceConfig struct {
 	// RetryDelay is the pause after an error before summarization resumes.
 	// 0 means 10s, as WalSummarizerMain waits.
 	RetryDelay time.Duration
+	// KeepTime returns wal_summary_keep_time; nil or <= 0 disables summary
+	// file removal.
+	KeepTime func() time.Duration
 }
 
 // Service runs the WAL summarizer when summarize_wal is on: the
@@ -37,6 +42,10 @@ type ServiceConfig struct {
 // setting is on and which exits when it is turned off.
 type Service struct {
 	cfg ServiceConfig
+
+	// lastRemovalRedo is redo_pointer_at_last_summary_removal: removal runs
+	// once per checkpoint cycle. Touched only by the summarizer goroutine.
+	lastRemovalRedo uint64
 
 	mu     sync.Mutex
 	parent context.Context
@@ -85,6 +94,7 @@ func (s *Service) Reconcile(parent context.Context, enabled bool) {
 		tli = s.cfg.WAL.TimelineID()
 	}
 	s.sum = NewSummarizer(s.cfg.DataDir, tli)
+	s.sum.AfterSummary = s.maybeRemoveOld
 	sum, done := s.sum, s.done
 	s.mu.Unlock()
 	s.cfg.Logger.Info("WAL summarizer starting", "event", "walsummarizer_start", "tli", tli)
@@ -134,6 +144,57 @@ func (s *Service) KeepLSN() uint64 {
 		return 0
 	}
 	return st.SummarizedLSN
+}
+
+// maybeRemoveOld is MaybeRemoveOldWalSummaries: once per checkpoint cycle
+// (when the redo pointer has moved), remove summaries whose WAL is gone and
+// whose files are older than wal_summary_keep_time.
+func (s *Service) maybeRemoveOld() {
+	if s.cfg.KeepTime == nil || s.cfg.RedoLSN == nil {
+		return
+	}
+	keep := s.cfg.KeepTime()
+	if keep <= 0 {
+		return
+	}
+	redo := s.cfg.RedoLSN()
+	if redo == s.lastRemovalRedo {
+		return
+	}
+	s.lastRemovalRedo = redo
+	removed, err := walsummary.RemoveOld(s.cfg.DataDir, keep, time.Now(), func(tli uint32) (uint64, bool) {
+		return oldestSegmentLSN(s.cfg.WALDir, tli, s.cfg.SegSize)
+	})
+	if err != nil {
+		s.cfg.Logger.Error("WAL summary removal failed", "event", "walsummary_remove_error", "err", err)
+	}
+	for _, f := range removed {
+		s.cfg.Logger.Debug("removing file", "path", walsummary.Dir+"/"+f.Name())
+	}
+}
+
+// oldestSegmentLSN is XLogGetOldestSegno turned into an LSN: the start of the
+// oldest WAL segment file on disk for tli. ok is false when none exists.
+func oldestSegmentLSN(walDir string, tli uint32, segSize int64) (uint64, bool) {
+	if segSize <= 0 {
+		segSize = xlog.DefaultSegmentSize
+	}
+	ents, err := os.ReadDir(walDir)
+	if err != nil {
+		return 0, false
+	}
+	var oldest uint64
+	found := false
+	for _, e := range ents {
+		t, segno, ok := xlog.ParseXLogFileName(e.Name(), segSize)
+		if !ok || t != tli {
+			continue
+		}
+		if !found || segno < oldest {
+			oldest, found = segno, true
+		}
+	}
+	return oldest * uint64(segSize), found
 }
 
 // loop is WalSummarizerMain: find the start, summarize until cancelled,

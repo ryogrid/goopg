@@ -183,3 +183,25 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 **Evidence:**
 - `TestServerSummarizerState` drives the same off → on → off sequence on a real goopg server.
 - The fire set shows no changed plan at either scale. The TPC-H arm matches the m0190 values.
+
+## S5 landed (2026-10-14): `wal_summary_keep_time`
+
+- **The GUC** is registered as `guc_tables.c` defines it: minutes, default 14400 (SHOW `10d`), range 0..INT\_MAX/60,
+  PGC\_SIGHUP. Checked against the scratch PG's `pg_settings`.
+- **`walsummary.RemoveOld`** ports `MaybeRemoveOldWalSummaries`. Per timeline, a summary is removed only when both
+  hold:
+  - its WAL is gone: its end is at or before the start of the oldest segment on disk (`XLogGetOldestSegno`), or no
+    segment is left for that timeline;
+  - its mtime precedes now − keep\_time.
+
+  keep\_time 0 disables removal. `walsummary` stays a leaf: the oldest-segment lookup is passed in, and the
+  `pg_wal` scan, `oldestSegmentLSN`, lives in `walsummarizer`.
+- **When it runs:** the `Service` calls it after each summarized range, through `Summarizer.AfterSummary`.
+  - It runs at most once per redo-pointer value (`redo_pointer_at_last_summary_removal`), as in PG.
+  - `cmd/goopg` reads `wal_summary_keep_time` from the live registry, so a reload applies.
+
+**Tests:**
+- `TestRemoveOld` over PG's nine files: removes only what both conditions allow, removes nothing when keep is 0,
+  and removes every old-enough file when no WAL is left.
+- `TestOldestSegmentLSN`.
+- `TestWalSummaryKeepTimeGUC`.

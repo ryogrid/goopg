@@ -885,6 +885,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				return 0
 			},
 			Logger: logger,
+			// wal_summary_keep_time is PGC_SIGHUP and stored in minutes.
+			KeepTime: func() time.Duration {
+				return time.Duration(intGUC(cfg.Registry, "wal_summary_keep_time", 14400)) * time.Minute
+			},
 		})
 		retainer.KeepLSNFn = cfg.WalSummarizer.KeepLSN
 		rt.Checkpointer.SetRetainer(retainer)

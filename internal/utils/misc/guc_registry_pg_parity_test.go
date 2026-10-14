@@ -256,3 +256,17 @@ func TestSetRefusalFollowsContext(t *testing.T) {
 		}
 	}
 }
+
+// TestWalSummaryKeepTimeGUC: wal_summary_keep_time as guc_tables.c defines it
+// (minutes, 10 days, 0..INT_MAX/60, PGC_SIGHUP); SHOW prints PG's "10d".
+// M0122-0009 S5.
+func TestWalSummaryKeepTimeGUC(t *testing.T) {
+	s := NewSessionRegistry(BuildDefaultRegistry())
+	v, show, ok := s.GetDisplay("wal_summary_keep_time")
+	if !ok {
+		t.Fatal("wal_summary_keep_time is not registered")
+	}
+	if show != "10d" || v.Unit != UnitMin || v.MaxVal != math.MaxInt32/60 || v.Context != ContextSigHup {
+		t.Errorf("wal_summary_keep_time: SHOW %q, unit %v, max %v, context %v", show, v.Unit, v.MaxVal, v.Context)
+	}
+}

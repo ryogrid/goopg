@@ -211,6 +211,39 @@ func RemoveIfOlderThan(dataDir string, f File, cutoff time.Time) error {
 	return nil
 }
 
+// RemoveOld removes old summary files (MaybeRemoveOldWalSummaries,
+// walsummarizer.c): on each timeline, a summary whose WAL is gone — its end
+// is at or before oldestLSN(tli), the start of the oldest WAL segment still
+// on disk, or there is no WAL left for that timeline (ok=false) — is removed
+// when its modification time precedes now - keep. keep <= 0 disables
+// removal. It returns the files removed.
+func RemoveOld(dataDir string, keep time.Duration, now time.Time, oldestLSN func(tli uint32) (lsn uint64, ok bool)) ([]File, error) {
+	if keep <= 0 {
+		return nil, nil
+	}
+	files, err := List(dataDir, 0, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := now.Add(-keep)
+	var removed []File
+	for _, f := range files {
+		oldest, ok := oldestLSN(f.TLI)
+		if ok && f.End > oldest {
+			continue
+		}
+		path := f.Path(dataDir)
+		before, statErr := os.Lstat(path)
+		if err := RemoveIfOlderThan(dataDir, f, cutoff); err != nil {
+			return removed, err
+		}
+		if statErr == nil && before.ModTime().Unix() < cutoff.Unix() {
+			removed = append(removed, f)
+		}
+	}
+	return removed, nil
+}
+
 // Write stores table as the summary file f, the way SummarizeWAL does: it
 // writes pg_wal/summaries/temp.summary, then durable_renames it to its final
 // name. durable_rename fsyncs the old file, renames it, fsyncs the new name

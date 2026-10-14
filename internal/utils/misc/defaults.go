@@ -1579,6 +1579,16 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// wal_summary_keep_time: how long a WAL summary file whose WAL is gone
+	// is kept (guc_tables.c: minutes, 10 days, 0..INT_MAX/60, PGC_SIGHUP;
+	// 0 disables removal). The summarizer applies it once per checkpoint
+	// cycle (MaybeRemoveOldWalSummaries). M0122-0009 S5.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_summary_keep_time", Type: TypeInt, Unit: UnitMin, BootVal: "14400",
+		MinVal: 0, MaxVal: math.MaxInt32 / 60,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// Primary-side: how many concurrent replication connections /
 	// slots / how long the walsender waits for client status

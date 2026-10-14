@@ -269,3 +269,51 @@ func TestNameFormat(t *testing.T) {
 		t.Errorf("ParseFilename(%q) = %v %v, want %v", want, got, ok, f)
 	}
 }
+
+// TestRemoveOld ports MaybeRemoveOldWalSummaries' rule over PG's files: a
+// summary is removed only when its WAL is gone (end at or before the oldest
+// segment still on disk, or no WAL left for its timeline) AND its mtime
+// precedes now - wal_summary_keep_time; keep 0 removes nothing.
+func TestRemoveOld(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	keep := 10 * 24 * time.Hour
+	setup := func() (string, []File) {
+		data := pgDataDir(t)
+		all, _ := List(data, 0, 0, 0)
+		old, fresh := now.Add(-keep-time.Hour), now.Add(-time.Hour)
+		for i, f := range all {
+			m := old
+			if i == 1 {
+				m = fresh
+			}
+			if err := os.Chtimes(f.Path(data), m, m); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return data, all
+	}
+	// The oldest segment starts at 0/174F958's end: files 0 and 1 have no WAL
+	// left; file 1 is too recent; files 2.. still have WAL.
+	data, all := setup()
+	oldest := func(tli uint32) (uint64, bool) { return all[1].End, tli == 1 }
+	removed, err := RemoveOld(data, keep, now, oldest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != all[0] {
+		t.Fatalf("removed %v, want only %v", removed, all[0])
+	}
+	if left, _ := List(data, 0, 0, 0); len(left) != len(all)-1 {
+		t.Errorf("%d summaries left, want %d", len(left), len(all)-1)
+	}
+
+	data, all = setup()
+	if removed, _ := RemoveOld(data, 0, now, oldest); len(removed) != 0 {
+		t.Errorf("wal_summary_keep_time = 0 removed %v", removed)
+	}
+	// No WAL left on the timeline: every old-enough summary goes.
+	removed, err = RemoveOld(data, keep, now, func(uint32) (uint64, bool) { return 0, false })
+	if err != nil || len(removed) != len(all)-1 {
+		t.Errorf("with no WAL left: removed %d (%v), want %d", len(removed), err, len(all)-1)
+	}
+}

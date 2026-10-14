@@ -5220,6 +5220,15 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Next slice: S5 `wal\_summary\_keep\_time` \(MaybeRemoveOldWalSummaries\)\. Then the walsummarizer
       `pg\_stat\_activity` / `pg\_stat\_io` rows, then S6a \(native\-record classifier arms\)\.
     - The commit touches internal/optimizer, so S9\'s census must be re\-checked next loop\.
+  - **2026\-10\-14 S5 landed** — `wal\_summary\_keep\_time` is registered as in guc\_tables\.c \(SHOW `10d`\)\.
+    `walsummary\.RemoveOld` ports MaybeRemoveOldWalSummaries\.
+    - It runs after each summarized range, once per redo pointer\.
+    - A file is removed only when its WAL is gone and its mtime is older than keep\_time\.
+    - Tests: `TestRemoveOld`, `TestOldestSegmentLSN` and `TestWalSummaryKeepTimeGUC`\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next: the walsummarizer `pg\_stat\_activity` / `pg\_stat\_io` rows, or S6a \(classifier arms for goopg\-native
+      HeapLock / HeapVisible / HeapVacuum payloads, design §4\.4\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

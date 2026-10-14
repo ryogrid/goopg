@@ -43,6 +43,10 @@ type Summarizer struct {
 	// changed is closed and replaced on every published summary, so
 	// waiters (WaitForWalSummarization) can block on it.
 	changed chan struct{}
+
+	// AfterSummary, when set, runs after each summarized range, where
+	// WalSummarizerMain calls MaybeRemoveOldWalSummaries.
+	AfterSummary func()
 }
 
 // NewSummarizer returns a summarizer for timeline tli writing under dataDir.
@@ -115,6 +119,9 @@ func (s *Summarizer) Run(ctx context.Context, src Source, start uint64) error {
 				return err
 			}
 			s.publish(cur.end)
+			if s.AfterSummary != nil {
+				s.AfterSummary()
+			}
 			cur = newRangeSummarizer(s.TLI, cur.end)
 			if _, err := cur.add(r); err != nil {
 				return err
