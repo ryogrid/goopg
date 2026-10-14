@@ -1,0 +1,42 @@
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Finalize GroupAggregate
+         Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+         ->  Gather Merge
+               Workers Planned: 3
+               ->  Sort
+                     Sort Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                     ->  Partial HashAggregate
+                           Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                           ->  Parallel Append
+                                 ->  Parallel Hash Join
+                                       Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+                                       ->  Nested Loop
+                                             ->  Parallel Seq Scan on store_sales
+                                                   Filter: (ss_customer_sk IS NULL)
+                                             ->  Memoize
+                                                   Cache Key: store_sales.ss_sold_date_sk
+                                                   Cache Mode: logical
+                                                   ->  Index Scan using date_dim_pkey on date_dim
+                                                         Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                       ->  Parallel Hash
+                                             ->  Parallel Seq Scan on item
+                                 ->  Nested Loop
+                                       ->  Nested Loop
+                                             ->  Parallel Seq Scan on catalog_sales
+                                                   Filter: (cs_bill_customer_sk IS NULL)
+                                             ->  Index Scan using date_dim_pkey on date_dim date_dim_1
+                                                   Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                       ->  Index Scan using item_pkey on item item_1
+                                             Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                 ->  Nested Loop
+                                       ->  Nested Loop
+                                             ->  Parallel Seq Scan on web_sales
+                                                   Filter: (ws_promo_sk IS NULL)
+                                             ->  Index Scan using item_pkey on item item_2
+                                                   Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                                       ->  Index Scan using date_dim_pkey on date_dim date_dim_2
+                                             Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+(38 rows)
+

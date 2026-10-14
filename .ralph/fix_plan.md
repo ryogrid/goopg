@@ -28958,6 +28958,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - S9 pass 2026\-10\-14, fourth \(fresh census `analysis/m0146/m0146\-0014/routing\-20261014c/` at `b580d2344`, after
     M0146\-0192 landed\): sort\-strategy 5 actionable, aggregation\-strategy 4, parallelism 4, join\-order 3\. Filed
     M0146\-0193 \(TPC\-DS SF0\.25 Q33\)\.
+  - S9 pass 2026\-10\-14, fifth \(fresh census `analysis/m0146/m0146\-0014/routing\-20261014d/` at `9129d26f0`\):
+    sort\-strategy and qual\-placement tie at 3 actionable records after removing measured ties \(Q16, Q39, Q45, Q61,
+    Q69, Q76\)\. Filed M0146\-0194 \(TPC\-DS SF0\.25 Q72, PG\-stable, 2% margin\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -33057,3 +33060,20 @@ Movement: yes — TPC-H match 13 -> 14 (Q22); CATEGORIES-EXCL-MATCH TPC-H join-o
     - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99, TPC\-DS fire set PASS, regress A/B
       identical except a pre\-existing Hash Right Join row\-order flap in `join` \(HEAD flips too\)\.
 Movement: yes — TPC-DS SF0.25 match 79 -> 80 (Q33); CATEGORIES-EXCL-MATCH SF0.25 join-order 17 -> 16, aggregation-strategy 2 -> 1, sort-strategy 7 -> 6, parallelism 7 -> 6
+- [ ] **M0146-0194 — PG keeps Q72's item/warehouse/inventory joins under a Gather Merge sorted on the group keys; goopg gathers lower and sorts for the GroupAggregate (TPC-DS Q72)**
+  (filed 2026-10-14 by the S9 parity replenishment pass; census `analysis/m0146/m0146-0014/routing-20261014d/`).
+  Record: TPC-DS SF0.25 Q72, verdict SHAPE-DIFF \[join-order, join-method, scan-type, parameterisation, sort-strategy,
+  parallelism\], first divergence `depth=3 [sort-strategy] under GroupAggregate: PG Nested Loop Left | goopg Sort`.
+  The same record appears at SF1. It is stable on tmp/pgdbg, which has its own ANALYZE sample.
+  - PG \(15490.83\): GroupAggregate → Nested Loop Left \(promotion\) → Nested Loop \(d3\) → Gather Merge → Sort on
+    \(i\_item\_desc, w\_warehouse\_name, d1\.d\_week\_seq\) → the item / inventory / warehouse joins inside the workers.
+  - goopg \(15196.08\): GroupAggregate → Sort → Nested Loop Left → … → Gather over a smaller partial join, with item,
+    warehouse and d3 joined serially above the Gather.
+  - The margin is 2%, so this is not a fuzz tie.
+  Kind: impl
+  Parent: M0146-0014
+  - First step: on tmp/pgdbg, dump the partial pathlist for the rel PG gathers under the Gather Merge, with costs, and
+    find goopg\'s partial pathlist for the same relids \(DPPATH trace on a private SF0\.25 clone\). Then decide which
+    side lacks the candidate or misprices it: the item join inside the workers, d1\.d\_week\_seq = d2\.d\_week\_seq as a
+    Join Filter vs goopg\'s scan Filter, and the Gather Merge over the group\-key Sort. Drive Q72 to MATCH.
+  - Expected movement: TPC-DS SF0.25 match \(Q72\) and CATEGORIES-EXCL-MATCH sort-strategy / join-order.
