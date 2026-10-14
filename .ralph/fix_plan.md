@@ -5493,6 +5493,18 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       unchanged failing set; pgbench smoke.
     - The milestone row stays `[ ]`: this is one slice of "buffer pool & btree
       locking", not the whole item.
+  - **2026\-10\-14 reproducer landed** — `TestStructuralLockInteriorSplitWorkload`
+    \(`internal/access/nbtree/btree\_structural\_race\_test\.go`\) is the failing reproducer the gate lacked
+    \(ledger row 2026\-09\-22, gap 1\)\.
+    - 40 rounds, each on a fresh relation: 16 handles insert interleaved 200\-byte keys in random order\. Afterwards
+      every key must be found with its TID, a full scan must be ordered and complete, and the meta level must be
+      ≥ 2 \(interior splits\)\.
+    - With `NBTREE\_UNSHARED\_STRUCTURAL\_LOCK=1` \(per\-handle mutexes, the pre\-gate state\): 15/15 invocations fail
+      \(`index out of range \[\-1\]` in `insertIntoBlock`\)\. With the shared lock: 0/20, plus 3 clean `\-race` runs\.
+    - Gates: nbtree units \+ `\-race`, units, tpch\-spotcheck, sf025\.
+    - Movement: none — a concurrency regression test\.
+    - Open: gap 2 \(prune `Pool\.BTreeStructuralLock`\'s map safely\), then the milestone group\'s larger items
+      \(Lehman/Yao crab\-walk, `splitMu` removal\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

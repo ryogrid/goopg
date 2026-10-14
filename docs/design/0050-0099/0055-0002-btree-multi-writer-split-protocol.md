@@ -67,10 +67,27 @@ leaf splits, but it is a **functional smoke test, not a race pin**, and the
 file now says so. Measured 2026\-09\-22: with `sharedSplitMu` removed from the
 constructors it still passes under `-race -count=3`, because its per\-handle
 keys ascend and rightmost\-page splits stay consistent under the buffer\-pool
-page locks alone. **No existing test reproduces the interleaved
-structural\-change failure itself**; writing one is open work, and the gate is
-justified by the structural argument \(two handles, two mutexes, one tree\)
-rather than by a failing reproducer.
+page locks alone.
+
+**Reproducer \(2026\-10\-14\).** `TestStructuralLockInteriorSplitWorkload`
+\(`btree\_structural\_race\_test.go`\) is the failing reproducer the gate lacked.
+Each of 40 rounds, on a fresh relation:
+
+- 16 handles of one index insert interleaved 200\-byte keys in random order, so
+  leaves and then interior pages split while other handles descend through them;
+- every key must then be found with its TID;
+- a full scan must return every key once, in order;
+- the meta page must report level ≥ 2.
+
+`NBTREE\_UNSHARED\_STRUCTURAL\_LOCK=1` gives each handle its own mutex, the state
+before the gate. Measured on 16 CPUs:
+
+| configuration | invocations failed |
+|---|---|
+| per\-handle mutexes | 15 of 15 \(mostly `index out of range \[\-1\]` in `insertIntoBlock`\) |
+| shared lock | 0 of 20, plus 3 clean runs under `\-race` |
+
+One 8\-handle round failed only about 1 time in 13, hence the 40 rounds.
 
 **Known limitation.** `Pool.BTreeStructuralLock`'s map has no eviction, so one
 mutex per relation ever opened accumulates for the process lifetime. Pruning it

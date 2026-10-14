@@ -55,9 +55,9 @@ func TestOpenedHandlesShareStructuralLock(t *testing.T) {
 // `-race -count=3`. Its per-handle keys ascend, so the splits it drives are
 // rightmost-page splits, and the buffer-pool page locks keep that path
 // consistent on their own. `TestOpenedHandlesShareStructuralLock` is the
-// assertion that actually fails without the fix; if you want a reproducer for
-// the interleaved-structural-change failure itself, it has to be written, and
-// no existing test is one.
+// assertion that actually fails without the fix. The reproducer of the
+// interleaved-structural-change failure itself is
+// TestStructuralLockInteriorSplitWorkload (btree_structural_race_test.go).
 func TestOpenedHandlesConcurrentlyInsertAcrossSplits(t *testing.T) {
 	bt, pool, cleanup := newTestTree(t)
 	defer cleanup()
