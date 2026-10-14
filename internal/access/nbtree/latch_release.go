@@ -68,6 +68,15 @@ type wlatch struct {
 // hold takes ownership of a freshly pinned+latched slot (from pinW).
 func (w *wlatch) hold(s *storage.Slot) { w.s = s }
 
+// take hands the held slot to the caller, still latched, and gives up
+// ownership: the deferred release() no longer touches it. nil when nothing is
+// held.
+func (w *wlatch) take() *storage.Slot {
+	s := w.s
+	w.s = nil
+	return s
+}
+
 // release drops the latch if this holder still owns it. Safe to call any
 // number of times, including on a slot that was never held.
 func (w *wlatch) release() {

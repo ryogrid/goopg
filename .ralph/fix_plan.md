@@ -5535,6 +5535,16 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: nbtree \+ xlog \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
     - Movement: none\.
     - Next: gap 4 \(PG latch order: keep the left page latched through `getStackBuf`, child before parent\)\.
+  - **2026\-10\-14 lock\-coupling slice 3 landed** \(gap 4\)\.
+    - The split hands its left page, still latched, to the parent insert \(`heldChild`, `wlatch\.take`\), which releases
+      it after the record clearing its flag — child latched before parent, as `\_bt\_insert\_parent` keeps buf\.
+    - Unshared reproducer 13/15 → 3/15: 1 gap\-6 "no level 1"; 2 deadlocks through the `createNewRoot` fallback
+      \(parent latched before child after a raced root lift — gap 6\)\. Shared 0/20, `\-race` clean\.
+    - Tests: `TestWlatchTakeTransfersOwnership`; the reproducer\.
+    - Gates: nbtree \+ storage \+ xlog \(\+ `\-race`\), units, tpch\-spotcheck, sf025\.
+    - Movement: none\.
+    - Next: gap 6 \(atomic root split: hold left, right, new root and metapage together; remove the `createNewRoot`
+      fallback into `parentPath\[0\]`\), then gap 5 \(finish incomplete splits on contact\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

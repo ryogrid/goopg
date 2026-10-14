@@ -122,10 +122,9 @@ order:
    re\-find parent key".
 3. **\(S, landed\)** Clear the child's `INCOMPLETE\_SPLIT` inside the parent's
    no\-split insert record, as `\_bt\_insertonpg` does \(slice 2 below\).
-4. **\(M\)** Latch in PG's order: keep the left page latched until the parent
-   is found, take the child before the parent, and release the right page once
-   the parent is pinned. Today all latches are released before going up a
-   level, and the split latches the parent before the child.
+4. **\(M, landed\)** Latch in PG's order: the left page stays latched through
+   the parent search and insert, so the child is latched before the parent
+   \(slice 3 below\).
 5. **\(M\)** Finish incomplete splits on contact \(`\_bt\_moveright` for update,
    `\_bt\_stepright`, `\_bt\_getstackbuf`\). `finishSplit` exists but has no
    production caller. This needs gap 4 first.
@@ -181,6 +180,33 @@ widens the window in which another handle's half\-finished split has no downlink
 yet; gap 5 closes that window. So the per\-slice acceptance rule is "no new
 failure class in the unshared run, 0/20 in the shared run", not a falling count.
 Shared: 0/20, `\-race` clean.
+
+**Slice 3 \(gap 4\).** The split no longer releases its left page before going
+up a level:
+
+- the left page is handed, still latched, to the parent insert
+  \(`insertIntoBlock`'s `heldChild`, transferred with `wlatch.take`\);
+- the parent insert releases it once the record that clears its
+  `INCOMPLETE\_SPLIT` is written: the `INSERT\_UPPER` record, or the parent's own
+  split record;
+- the child is therefore always latched before its parent, and no other writer
+  can see the half split between the split and the parent insert;
+- a root split still releases the left page first, until gap 6 makes the root
+  lift atomic;
+- `getStackBuf` refuses a path hint naming the held child, which is only possible
+  after block reuse, and starts from the level's leftmost page instead.
+
+Unshared reproducer: 3/15 failures, down from 13/15 \(5/15 after slice 1\):
+
+- 1 is the gap\-6 "no level 1 \(root level 0\)";
+- 2 are latch deadlocks. In both, one handle's root split had raced a concurrent
+  root lift, taken the `createNewRoot` fallback into the new root, and then
+  latched the child after that parent: the last parent\-before\-child order, which
+  gap 6 removes. The other handle held that child and waited in `getStackBuf`.
+
+A concurrent root lift needs two splitters of one index at once, which the
+shared structural lock rules out. Shared: 0/20, and the package passes under
+`\-race`.
 
 ## 5. Tests
 
