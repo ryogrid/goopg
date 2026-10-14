@@ -35,6 +35,10 @@ type ServiceConfig struct {
 	// KeepTime returns wal_summary_keep_time; nil or <= 0 disables summary
 	// file removal.
 	KeepTime func() time.Duration
+	// OnStart and OnStop bracket each run of the summarizer goroutine, so
+	// the server can hold a pg_stat_activity slot for it (backend_type
+	// walsummarizer) while it runs.
+	OnStart, OnStop func()
 }
 
 // Service runs the WAL summarizer when summarize_wal is on: the
@@ -46,6 +50,8 @@ type Service struct {
 	// lastRemovalRedo is redo_pointer_at_last_summary_removal: removal runs
 	// once per checkpoint cycle. Touched only by the summarizer goroutine.
 	lastRemovalRedo uint64
+
+	io IOCounters
 
 	mu     sync.Mutex
 	parent context.Context
@@ -95,11 +101,19 @@ func (s *Service) Reconcile(parent context.Context, enabled bool) {
 	}
 	s.sum = NewSummarizer(s.cfg.DataDir, tli)
 	s.sum.AfterSummary = s.maybeRemoveOld
+	s.sum.IO = &s.io
 	sum, done := s.sum, s.done
 	s.mu.Unlock()
 	s.cfg.Logger.Info("WAL summarizer starting", "event", "walsummarizer_start", "tli", tli)
+	onStart, onStop := s.cfg.OnStart, s.cfg.OnStop
 	go func() {
 		defer close(done)
+		if onStart != nil {
+			onStart()
+		}
+		if onStop != nil {
+			defer onStop()
+		}
 		s.loop(ctx, sum)
 	}()
 }
@@ -127,6 +141,12 @@ func (s *Service) State() State {
 		return State{}
 	}
 	return sum.State()
+}
+
+// WALReads reports the WAL pages the summarizer has read and their bytes,
+// cumulative since the server started.
+func (s *Service) WALReads() (reads, bytes int64) {
+	return s.io.Reads.Load(), s.io.ReadBytes.Load()
 }
 
 // KeepLSN is the oldest LSN WAL retention must keep for the summarizer:

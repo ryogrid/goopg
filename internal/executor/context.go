@@ -1987,6 +1987,10 @@ type WalSummarizerStatus struct {
 	SummarizedLSN uint64
 	PendingLSN    uint64
 	PID           int
+	// WALReads / WALReadBytes are the WAL pages the summarizer has read,
+	// pg_stat_io's (walsummarizer, wal, normal) reads and read_bytes.
+	WALReads     int64
+	WALReadBytes int64
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

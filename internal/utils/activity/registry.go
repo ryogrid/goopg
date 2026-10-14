@@ -25,7 +25,10 @@ const (
 	CheckpointerIdx = 1
 	AutovacuumIdx   = 2
 	BgwriterIdx     = 3
-	// Indices 4–15 available for walsenders and future workers.
+	// WalSummarizerIdx is the WAL summarizer's slot, held while it runs
+	// (summarize_wal on). M0122-0009.
+	WalSummarizerIdx = 4
+	// Indices 5–15 available for future workers.
 )
 
 // activitySlot is a 64-byte cache-line-aligned per-backend state block.

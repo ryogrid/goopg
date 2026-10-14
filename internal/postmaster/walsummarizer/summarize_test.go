@@ -387,3 +387,17 @@ func TestOldestSegmentLSN(t *testing.T) {
 		t.Error("tli 3 has no segment")
 	}
 }
+
+// TestIOCountersCountEachPageOnce: a record stream counts every 8kB WAL
+// page it enters once, including pages a long record spans.
+func TestIOCountersCountEachPageOnce(t *testing.T) {
+	var c IOCounters
+	last := int64(-1)
+	c.countPages(0x28, 0x60, &last)     // page 0
+	c.countPages(0x60, 0x1F00, &last)   // still page 0
+	c.countPages(0x1F00, 0x2100, &last) // crosses into page 1
+	c.countPages(0x2100, 0x8010, &last) // spans pages 1..4
+	if r, b := c.Reads.Load(), c.ReadBytes.Load(); r != 5 || b != 5*8192 {
+		t.Errorf("reads %d bytes %d, want 5 and %d", r, b, 5*8192)
+	}
+}

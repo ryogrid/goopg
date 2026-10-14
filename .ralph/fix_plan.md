@@ -5229,6 +5229,15 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next: the walsummarizer `pg\_stat\_activity` / `pg\_stat\_io` rows, or S6a \(classifier arms for goopg\-native
       HeapLock / HeapVisible / HeapVacuum payloads, design §4\.4\)\.
+  - **2026\-10\-14 walsummarizer activity row and pg\_stat\_io reads landed\.**
+    - While running, the summarizer holds background slot 4 \(`backend\_type` walsummarizer\)\.
+    - `pg\_stat\_io` \(walsummarizer, wal, normal\) reads / read\_bytes count the WAL pages it reads, cumulative
+      across restarts\.
+    - Tests: `TestServerSummarizerState` \(activity row on/off, reads \> 0\) and `TestIOCountersCountEachPageOnce`\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, acceptance arm \(m0190 values\), sf025
+      PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next: S6a — classifier arms for goopg\-native payloads \(design §4\.4\)\. Read §4\.4 first\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

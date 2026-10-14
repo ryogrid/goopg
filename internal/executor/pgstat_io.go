@@ -275,6 +275,11 @@ func fetchIOStatRows(ctx *Context) [][]string {
 		poolCheckpointWritten = ctx.Pool.CheckpointWrittenCount()
 		poolCheckpointWriteTimeNanos = ctx.Pool.CheckpointWriteTimeNanos()
 	}
+	var sumReads, sumReadBytes int64
+	if ctx != nil && ctx.WalSummarizerState != nil {
+		st := ctx.WalSummarizerState()
+		sumReads, sumReadBytes = st.WALReads, st.WALReadBytes
+	}
 	var walFsyncCount, walFsyncTimeNanos int64
 	if ctx != nil && ctx.WAL != nil {
 		walFsyncCount = ctx.WAL.FsyncCount()
@@ -326,6 +331,11 @@ func fetchIOStatRows(ctx *Context) [][]string {
 						case ioOpWriteback:
 							count = poolBackendWriteback
 							timeMillis = strconv.FormatFloat(nsToMs(poolBackendWritebackTimeNanos), 'f', 3, 64)
+						}
+					case bt == ioBktWalSummarizer && obj == ioObjWal && ctxIdx == ioCtxNormal:
+						// The WAL summarizer's page reads (M0122-0009).
+						if op == ioOpRead {
+							count, bytes = sumReads, sumReadBytes
 						}
 					case bt == ioBktClientBackend && obj == ioObjWal && ctxIdx == ioCtxNormal:
 						if op == ioOpFsync {

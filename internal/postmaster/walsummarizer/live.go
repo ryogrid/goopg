@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/backup/walsummary"
@@ -31,6 +32,36 @@ type State struct {
 	Running       bool
 }
 
+// IOCounters counts the WAL pages the summarizer reads, for pg_stat_io's
+// (walsummarizer, wal, normal) reads / read_bytes cells. PG counts each
+// XLOG_BLCKSZ page WALRead fetches; the summarizer counts each page its
+// record stream enters. Cumulative across summarizer restarts.
+type IOCounters struct {
+	Reads     atomic.Int64
+	ReadBytes atomic.Int64
+}
+
+const walPageSize = 8192 // XLOG_BLCKSZ
+
+// countPages adds the pages [from, to] to c, skipping those at or before
+// *last, and advances *last.
+func (c *IOCounters) countPages(startLSN, endLSN uint64, last *int64) {
+	if c == nil || endLSN == 0 {
+		return
+	}
+	first, final := int64(startLSN/walPageSize), int64((endLSN-1)/walPageSize)
+	if first <= *last {
+		first = *last + 1
+	}
+	if final < first {
+		return
+	}
+	n := final - first + 1
+	c.Reads.Add(n)
+	c.ReadBytes.Add(n * walPageSize)
+	*last = final
+}
+
 // Summarizer is the live WAL summarizer: it consumes a Source and writes a
 // summary file at every redo point, as WalSummarizerMain / SummarizeWAL do.
 // It is safe to read its State from other goroutines while Run executes.
@@ -47,6 +78,9 @@ type Summarizer struct {
 	// AfterSummary, when set, runs after each summarized range, where
 	// WalSummarizerMain calls MaybeRemoveOldWalSummaries.
 	AfterSummary func()
+
+	// IO, when set, counts the WAL pages read.
+	IO *IOCounters
 }
 
 // NewSummarizer returns a summarizer for timeline tli writing under dataDir.
@@ -99,6 +133,7 @@ func (s *Summarizer) Run(ctx context.Context, src Source, start uint64) error {
 		s.mu.Unlock()
 	}()
 	cur := newRangeSummarizer(s.TLI, start)
+	lastPage := int64(-1)
 	for {
 		r, err := src.Next(ctx)
 		if err != nil {
@@ -110,6 +145,7 @@ func (s *Summarizer) Run(ctx context.Context, src Source, start uint64) error {
 		if readRecPtr(r) < start {
 			continue
 		}
+		s.IO.countPages(readRecPtr(r), endRecPtr(r), &lastPage)
 		done, err := cur.add(r)
 		if err != nil {
 			return err

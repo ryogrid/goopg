@@ -205,3 +205,22 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
   and removes every old-enough file when no WAL is left.
 - `TestOldestSegmentLSN`.
 - `TestWalSummaryKeepTimeGUC`.
+
+## Activity row and `pg_stat_io` reads (2026-10-14)
+
+- **`pg_stat_activity`:** while the summarizer goroutine runs, it holds the background slot
+  `activity.WalSummarizerIdx` (4), with backend\_type `walsummarizer`. The hooks are
+  `ServiceConfig.OnStart`/`OnStop`, wired in `cmd/goopg` as the bgwriter's slot is.
+  - Like goopg's other background rows, its pid prints NULL.
+- **`pg_stat_io`:** the `(walsummarizer, wal, normal)` reads / read\_bytes cells count the 8 kB WAL pages the
+  record stream enters (`IOCounters.countPages`).
+  - PG counts each XLOG\_BLCKSZ page `WALRead` fetches.
+  - The counters live on the `Service`, so they stay cumulative across summarizer restarts, like pg\_stat
+    counters.
+  - They reach the executor through `WalSummarizerStatus.WALReads` / `WALReadBytes`.
+  - WS-002 polls `sum(reads) > 0` here before it trusts the summaries.
+
+**Tests:**
+- `TestServerSummarizerState` now checks one `walsummarizer` activity row while running and none after stopping,
+  and `reads > 0` with `read_bytes = reads * 8192`.
+- `TestIOCountersCountEachPageOnce`.

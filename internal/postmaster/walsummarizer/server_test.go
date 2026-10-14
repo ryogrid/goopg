@@ -199,6 +199,25 @@ func TestServerSummarizerState(t *testing.T) {
 	if lsn(run[1]) > lsn(run[2]) {
 		t.Errorf("running: summarized_lsn %s > pending_lsn %s", run[1], run[2])
 	}
+	// While it runs: one pg_stat_activity row with backend_type
+	// walsummarizer, and its WAL page reads in pg_stat_io (WS-002 polls
+	// sum(reads) > 0 there).
+	one := func(sql string) string {
+		t.Helper()
+		rows, err := c.Query(ctx, sql)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("%s: %v %v", sql, rows, err)
+		}
+		return rows[0][0]
+	}
+	const actSQL = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'walsummarizer'"
+	const ioSQL = "SELECT reads > 0 AND read_bytes = reads * 8192 FROM pg_stat_io WHERE backend_type = 'walsummarizer' AND object = 'wal' AND context = 'normal'"
+	if got := one(actSQL); got != "1" {
+		t.Errorf("pg_stat_activity walsummarizer rows while running = %s, want 1", got)
+	}
+	if got := one(ioSQL); got != "true" {
+		t.Errorf("pg_stat_io walsummarizer WAL reads while running: %s, want reads > 0", got)
+	}
 	if err := c.AppendPostgresqlConf("summarize_wal = off"); err != nil {
 		t.Fatal(err)
 	}
@@ -211,6 +230,12 @@ func TestServerSummarizerState(t *testing.T) {
 		if st[3] == "NULL" {
 			if st[0] != "1" || st[1] != st[2] || lsn(st[1]) < lsn(run[1]) {
 				t.Errorf("stopped: %v, want tli 1 and pending_lsn = summarized_lsn >= %s", st, run[1])
+			}
+			if got := one(actSQL); got != "0" {
+				t.Errorf("pg_stat_activity walsummarizer rows after stopping = %s, want 0", got)
+			}
+			if got := one(ioSQL); got != "true" {
+				t.Errorf("pg_stat_io walsummarizer reads must stay cumulative after stopping: %s", got)
 			}
 			return
 		}

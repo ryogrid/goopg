@@ -878,7 +878,7 @@ func (s *Server) reloadConfig() {
 // it reports is the server's.
 func (s *Server) walSummarizerStatus() executor.WalSummarizerStatus {
 	st := s.cfg.WalSummarizer.State()
-	return executor.WalSummarizerStatus{
+	out := executor.WalSummarizerStatus{
 		Initialized:   st.Initialized,
 		Running:       st.Running,
 		TLI:           st.SummarizedTLI,
@@ -886,6 +886,8 @@ func (s *Server) walSummarizerStatus() executor.WalSummarizerStatus {
 		PendingLSN:    st.PendingLSN,
 		PID:           os.Getpid(),
 	}
+	out.WALReads, out.WALReadBytes = s.cfg.WalSummarizer.WALReads()
+	return out
 }
 
 // summarizeWALEnabled reads summarize_wal from the server registry.

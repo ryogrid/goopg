@@ -36,6 +36,7 @@ import (
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -888,6 +889,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// wal_summary_keep_time is PGC_SIGHUP and stored in minutes.
 			KeepTime: func() time.Duration {
 				return time.Duration(intGUC(cfg.Registry, "wal_summary_keep_time", 14400)) * time.Minute
+			},
+			// A pg_stat_activity row (backend_type walsummarizer) while
+			// the summarizer runs, as for the bgwriter's slot.
+			OnStart: func() {
+				if rt.Activity != nil {
+					rt.Activity.RegisterBackground(activity.WalSummarizerIdx, &activity.Backend{
+						PID: "walsummarizer-0", BackendType: "walsummarizer", State: "active",
+					})
+				}
+			},
+			OnStop: func() {
+				if rt.Activity != nil {
+					rt.Activity.ReleaseBackground(activity.WalSummarizerIdx, "walsummarizer-0")
+				}
 			},
 		})
 		retainer.KeepLSNFn = cfg.WalSummarizer.KeepLSN
