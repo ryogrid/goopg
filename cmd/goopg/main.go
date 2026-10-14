@@ -35,6 +35,7 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
+	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -595,6 +596,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// truncated-away multixact gives upstream.
 		cfg.MultiXact = multixact.NewStoreAt(multixact.MultiXactId(rt.NextMultiXact))
 
+		// PostmasterMain's sanity check (postmaster.c): WAL written at
+		// wal_level=minimal cannot be summarized.
+		if boolGUC(registry, "summarize_wal", false) && stringGUC(registry, "wal_level", "replica") == "minimal" {
+			fmt.Fprintln(stderr, `goopg start: WAL cannot be summarized when "wal_level" is "minimal"`)
+			return 1
+		}
+
 		// Autovacuum launcher (vacuum parity bundle): started when the
 		// `autovacuum` GUC is on (upstream default), sweeping every
 		// autovacuum_naptime seconds and reading its trigger thresholds from
@@ -856,6 +864,29 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
+		// WAL summarizer (M0122-0009 S3b): runs while summarize_wal is on;
+		// the server starts it, reconciles it on reload and stops it.
+		// Retention keeps the WAL it has not summarized yet.
+		ckpt := rt.Checkpointer
+		cfg.WalSummarizer = walsummarizer.NewService(walsummarizer.ServiceConfig{
+			DataDir: rt.DataDir,
+			WALDir:  filepath.Join(rt.DataDir, "pg_wal"),
+			WAL:     rt.WAL,
+			RedoLSN: func() uint64 {
+				// The checkpointer stores the redo point 1-based. Before
+				// its first checkpoint in this run, pg_control holds the
+				// redo point the server started from.
+				if r := ckpt.LastCheckpointRedoLSN(); r > 0 {
+					return r - 1
+				}
+				if ctl, err := control.ReadControlFile(rt.DataDir); err == nil && ctl != nil {
+					return ctl.CheckPointCopyRedo
+				}
+				return 0
+			},
+			Logger: logger,
+		})
+		retainer.KeepLSNFn = cfg.WalSummarizer.KeepLSN
 		rt.Checkpointer.SetRetainer(retainer)
 	}
 

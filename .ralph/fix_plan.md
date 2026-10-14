@@ -5196,6 +5196,19 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       - the iterator source with a timed re\-poll;
       - the no\-summaries start \(XLogFindNextRecord\);
       - the retention clamp, the wal\_level=minimal startup error and the pg\_stat\_io counter\.
+  - **2026\-10\-14 S3b landed** — the summarizer runs inside the server\.
+    - `walsummarizer\.Service` starts and stops with `summarize\_wal`: at start, on reload, and at shutdown\. After
+      an error it retries after 10 s\.
+    - Start position: `ResumePoint`; otherwise the latest redo point, from the checkpointer or pg\_control\.
+    - Reading: a flush\-bounded iterator with a 200 ms re\-poll\.
+    - Retention keeps WAL that is not yet summarized \(`KeepLSNFn`\)\.
+    - `wal\_level=minimal` with `summarize\_wal` on refuses startup with PG\'s text\.
+    - `TestServerSummarizesWAL` uses a real server: the table\'s blocks are summarized; off writes nothing; on
+      resumes; a restart continues; no gap\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), tpch\-spotcheck, sf025 PASS\.
+    - Movement: none — WAL summarizer infrastructure; no plan instrument\.
+    - Next slice: S4b `pg\_get\_wal\_summarizer\_state` from `Service\.State`, plus the walsummarizer
+      `pg\_stat\_io` / `pg\_stat\_activity` rows\. Then S5 `wal\_summary\_keep\_time`\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

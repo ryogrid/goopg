@@ -84,6 +84,12 @@ type SlotAwareRetainer struct {
 	// docs/design/0122-0009-wal-segment-recycling.md.
 	CheckPointDistanceEstimateFn func() float64
 
+	// KeepLSNFn, when non-nil, returns an LSN whose WAL must be kept as
+	// well, or 0 for no constraint: the WAL summarizer's oldest
+	// unsummarized LSN (KeepLogSeg's summarize_wal clamp, xlog.c), so
+	// segments are not removed before they are summarized.
+	KeepLSNFn func() uint64
+
 	// CompletionTarget mirrors checkpoint_completion_target, one of the
 	// XLOGfileslop distance-formula inputs. Only consulted when
 	// CheckPointDistanceEstimateFn is non-nil.
@@ -144,6 +150,11 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 	if r.Slots != nil {
 		if minSlot := r.Slots.MinRestartLSN(); minSlot > 0 && minSlot < keepLSN {
 			keepLSN = minSlot
+		}
+	}
+	if r.KeepLSNFn != nil {
+		if keep := r.KeepLSNFn(); keep > 0 && keep < keepLSN {
+			keepLSN = keep
 		}
 	}
 

@@ -53,6 +53,7 @@ import (
 	"github.com/goopg/goopg/internal/backup"
 	"github.com/goopg/goopg/internal/replication"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
+	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
@@ -224,6 +225,11 @@ type Config struct {
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
+
+	// WalSummarizer, when set, runs the WAL summarizer while summarize_wal
+	// is on: started in Run, reconciled on every reload, stopped at
+	// shutdown (WalSummarizerMain; M0122-0009 S3b).
+	WalSummarizer *walsummarizer.Service
 
 	// Activity is the backend-activity registry for
 	// pg_catalog.pg_stat_activity. nil disables tracking.
@@ -637,6 +643,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	// Start the autovacuum launcher if configured.
+	if s.cfg.WalSummarizer != nil {
+		s.cfg.WalSummarizer.Reconcile(runCtx, s.summarizeWALEnabled())
+		defer s.cfg.WalSummarizer.Stop()
+	}
 	if s.cfg.AutovacuumLauncher != nil {
 		s.cfg.AutovacuumLauncher.SetLogger(s.cfg.Logger)
 		go func() {
@@ -857,6 +867,19 @@ func (s *Server) reloadConfig() {
 	if s.cfg.ApplyCheckpointGUCs != nil {
 		s.cfg.ApplyCheckpointGUCs()
 	}
+	// summarize_wal is PGC_SIGHUP: the summarizer starts or stops with it.
+	if s.cfg.WalSummarizer != nil {
+		s.cfg.WalSummarizer.Reconcile(nil, s.summarizeWALEnabled())
+	}
+}
+
+// summarizeWALEnabled reads summarize_wal from the server registry.
+func (s *Server) summarizeWALEnabled() bool {
+	if s.cfg.Registry == nil {
+		return false
+	}
+	v, ok := s.cfg.Registry.Get("summarize_wal")
+	return ok && v.Display() == "on"
 }
 
 func (s *Server) stopControlPlane() {

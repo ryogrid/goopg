@@ -125,3 +125,40 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - the iterator source with the flush bound and a timed re-poll;
 - the no-summaries start (PG's `XLogFindNextRecord` from the oldest segment);
 - the retention clamp, the `wal_level=minimal` startup error, and the `pg_stat_io` reads counter.
+
+## S3b landed (2026-10-14): the summarizer runs in the server
+
+- **`walsummarizer.Service`** is the `WalSummarizerMain` analog.
+  - `Server.Run` reconciles it with `summarize_wal` at start, `reloadConfig` reconciles it on every reload (the
+    GUC is PGC\_SIGHUP), and it stops at shutdown.
+  - After an error it waits 10 s and resumes from the files, as `WalSummarizerMain` does.
+- **Start position:**
+  - `ResumePoint` (exact) when summaries exist.
+  - Otherwise the latest redo point: the checkpointer's (stored 1-based) or, before this run's first
+    checkpoint, pg\_control's `CheckPointCopyRedo`.
+  - On a fresh cluster the first summary starts at 0/1000028, where PG's starts.
+- **Reading:** an `xlog.RecordIterator` with `SetReadLimit(Writer.FlushedLSN)`. A `pollSource` re-polls every
+  200 ms, PG's sleep quantum, because the writer wakes readers only on append.
+- **Retention:** `SlotAwareRetainer.KeepLSNFn = Service.KeepLSN`, the summarized LSN. No segment is removed before
+  it is summarized (`KeepLogSeg`'s summarize\_wal clamp).
+- **`wal_level=minimal`:** with `summarize_wal` on, `goopg start` refuses with PG's text, `WAL cannot be summarized
+  when "wal_level" is "minimal"` (postmaster.c).
+- goopg's checkpointer already writes `XLOG_CHECKPOINT_REDO` (wal\_level replica) on online checkpoints, so live
+  summaries close at every CHECKPOINT, as in PG.
+
+**Evidence:** `TestServerSummarizesWAL` (a real goopg server via `testutil/cluster`):
+- a summary lists the new table's blocks;
+- `summarize_wal = off` plus a reload writes nothing across a CHECKPOINT;
+- `on` resumes;
+- a restart continues;
+- `AreComplete` finds no gap over the whole set.
+
+**Not yet ported (ledgered):**
+- With no summaries, PG starts at the oldest WAL on disk and searches forward (`XLogFindNextRecord`). goopg starts
+  at the latest redo point.
+- goopg opens its runtime before refusing `wal_level=minimal`, so one checkpoint is written; PG refuses before
+  startup.
+- `pg_stat_io`'s walsummarizer reads, the walsummarizer `pg_stat_activity` row, and `pg_get_wal_summarizer_state`
+  (S4b) remain.
+- goopg logs no `XLOG_SMGR_CREATE` for a new table, so its summary carries blocks but no limit row. This is a
+  producer gap (design §4.4, S6).
