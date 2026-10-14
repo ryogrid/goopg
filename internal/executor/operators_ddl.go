@@ -21385,8 +21385,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE with total cascade count.
-				if total > 0 {
+				// Emit NOTICE with total cascade count. reportDependentObjects
+				// (dependency.c) reports a single object in the message itself
+				// with no DETAIL (numReportedClient == 1): `drop cascades to
+				// table sa.t`, not `drop cascades to 1 other objects`.
+				if total == 1 && len(detailLines) == 1 {
+					o.ctx.AddNotice(detailLines[0])
+				} else if total > 0 {
 					detail := strings.Join(detailLines, "\n")
 					o.ctx.AddNoticeWithDetail(
 						fmt.Sprintf("drop cascades to %d other objects", total),

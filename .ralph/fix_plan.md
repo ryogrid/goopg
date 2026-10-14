@@ -4448,7 +4448,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       M0134\-0009\), alter\_generic \+1 match, rest identical/noise\.
     - Gates: units, executor/parser/postmaster, schema/pg\_dump/amcheck
       testport, tpch\-spotcheck, acceptance arm, sf025 PASS=99\.
-- [ ] **a one\-object DROP ... CASCADE NOTICE uses the multi\-object form**
+- [x] **a one\-object DROP ... CASCADE NOTICE uses the multi\-object form**
   \(found 2026\-10\-12\)\. goopg prints `drop cascades to 1 other objects`
   plus a DETAIL; PG prints `NOTICE: drop cascades to table sa.t` with no
   DETAIL when exactly one object is reported \(dependency\.c
@@ -4457,6 +4457,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   Parent: M0119-0006
   - First step: find the cascade NOTICE builder in operators\_ddl\.go and
     add the single\-object form\.
+  - Fixed 2026\-10\-14: the DROP SCHEMA \.\.\. CASCADE builder \(operators\_ddl\.go\) always used the
+    `N other objects` \+ DETAIL form; with exactly one reported object it now prints that object\'s line alone, as
+    reportDependentObjects does \(`drop cascades to table sa\.t`, verified on a scratch PG 18\.3\)\. The table,
+    view, sequence and function CASCADE builders already had the single\-object arm\.
+    - Test `TestDropSchemaCascadeNoticeSingleObjectForm` \(one and two dependents; fails before the fix\)\.
+    - Regress A/B: alter\_table \-1 line \(`drop cascades to operator family ctype\_hash\_ops …` now in PG\'s single
+      form\); namespace, create\_schema and dependency identical; drop\_if\_exists PASS on both\.
+    - Gates: units, postmaster, tpch\-spotcheck PASS\.
+Movement: yes — regress alter_table 3702 -> 3701 diff lines
 
 - [x] **current_database() reports "postgres" when connected to template1** —
   **FIXED 2026-09-22.** The filed question was routing-vs-reporting; the
