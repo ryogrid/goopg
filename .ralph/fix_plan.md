@@ -29218,6 +29218,9 @@ Movement: yes — PLAN-PARITY SF0.25 match 11 -> 12, SF1 match 13 -> 14 (slice 6
   - S9 re\-check 2026\-10\-14 — **exhausted at `d4c7966e9`** \(WAL summarizer S4b gave an optimizer plan node a
     `Func` field\)\. Census `routing\-20261014f` uses that commit\'s fire\-set captures and a fresh TPC\-H capture\.
     The records are identical to `routing\-20261014e` at all three corpora \(81/99, 66/99, 14/22\)\. No task is filed\.
+  - S9 re\-check 2026\-10\-14 — **exhausted at `91842230a`** \(the summarizer\'s pg\_stat\_io cell changed
+    internal/executor\)\. Census `routing\-20261014g` is a fresh capture of all three corpora\. The records are identical
+    to `routing\-20261014f` \(81/99, 66/99, 14/22\)\. No task is filed\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
