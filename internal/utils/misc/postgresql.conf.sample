@@ -310,7 +310,7 @@
 #jit_profiling_support = off            # register JIT-compiled functions with perf profiler
 #jit_tuple_deforming = on               # allow JIT compilation of tuple deforming
 #jit_provider = 'llvmjit'               # JIT provider to use
-#compute_query_id = off                 # compute query identifiers
+#compute_query_id = auto                # compute query identifiers
 #plan_cache_mode = auto                 # plan cache mode
 #check_function_bodies = on             # validate function bodies during creation
 #extra_float_digits = 1                 # float output precision adjustment
@@ -332,7 +332,7 @@
 #vacuum_freeze_table_age = 150000000    # 0-2000000000 xids
 #vacuum_failsafe_age = 1600000000       # 0-2100000000 xids
 #vacuum_multixact_freeze_table_age = 150000000  # 0-2000000000 multixacts
-#vacuum_multixact_failsafe_age = 1500000000     # 0-2100000000 multixacts
+#vacuum_multixact_failsafe_age = 1600000000     # 0-2100000000 multixacts
 #autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
                                         # autovacuum worker pool
                                         # (change requires restart)
@@ -351,7 +351,7 @@
 #autovacuum_vacuum_insert_scale_factor = 0.2    # fraction of table size added
 #autovacuum_analyze_threshold = 50      # min row modifications before analyze
 #autovacuum_analyze_scale_factor = 0.1  # fraction of table size added to threshold
-#autovacuum_vacuum_max_threshold = 200000000    # cap on the effective vacuum threshold
+#autovacuum_vacuum_max_threshold = 100000000    # cap on the effective vacuum threshold; -1 disables
 #autovacuum_vacuum_cost_delay = 2       # -1-100 ms (overrides vacuum_cost_delay)
 #autovacuum_vacuum_cost_limit = -1      # -1 means use vacuum_cost_limit
 #log_autovacuum_min_duration = 600000   # -1-2147483647 ms; -1 disables logging

@@ -4922,6 +4922,22 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
       - 191 unregistered PG parameters;
       - `io\_workers` / `restore\_command` / `wal\_init\_zero` contexts;
       - the non\-plan default/range differences\.
+  - Slice 6 done 2026\-10\-14: defaults and ranges that do not shape plans now follow guc\_tables\.c\.
+    - `autovacuum\_vacuum\_max\_threshold` is 100000000 \[\-1, INT\_MAX\]\. The launcher\'s cap now follows
+      autovacuum\.c: 0 caps at zero and \-1 disables the cap\.
+    - Defaults: `vacuum\_multixact\_failsafe\_age` 1600000000, `compute\_query\_id` auto\.
+    - Maxima: `io\_workers` 32, `bgwriter\_lru\_maxpages` INT\_MAX/2, `scram\_iterations` /
+      `wal\_sender\_timeout` INT\_MAX, and the cost GUCs DBL\_MAX\.
+    - Tests: `TestGUCDefaultsAndRangesFollowPG` and `TestAutovacuumVacuumMaxThresholdFollowsPG`\.
+    - Ledgered:
+      - `io\_max\_concurrency` auto: PG\'s value is per\-backend, goopg\'s a global cap;
+      - the launcher ignores the per\-table max\-threshold reloption\.
+    - Gates: units, postmaster/autovacuum, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical\.
+    - Remaining:
+      - 191 unregistered PG parameters;
+      - `io\_workers` / `restore\_command` / `wal\_init\_zero` contexts;
+      - `io\_max\_concurrency`;
+      - OWNER: the plan\-shaping defaults\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

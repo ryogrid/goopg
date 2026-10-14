@@ -322,7 +322,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "scram_iterations", Type: TypeInt, BootVal: "4096",
-		MinVal: 1, MaxVal: 1 << 30,
+		MinVal: 1, MaxVal: math.MaxInt32,
 		Context: ContextUserset, Flags: FlagReport,
 		Scope: ScopeSession,
 	}))
@@ -473,7 +473,7 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name:        "compute_query_id",
 		Type:        TypeEnum,
-		BootVal:     "off",
+		BootVal:     "auto",
 		EnumOptions: []string{"off", "on", "auto", "regress"},
 		Context:     ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:       ScopeServer,
@@ -688,7 +688,7 @@ func BuildDefaultRegistry() *Registry {
 	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
 	r.MustRegister(NewVariable(Variable{
 		Name: "bgwriter_lru_maxpages", Type: TypeInt, BootVal: "100",
-		MinVal: 0, MaxVal: 1000,
+		MinVal: 0, MaxVal: math.MaxInt32 / 2, // guc_tables.c: same limit as shared_buffers
 		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
@@ -710,7 +710,7 @@ func BuildDefaultRegistry() *Registry {
 	// Upstream's default is 3; we mirror it.
 	r.MustRegister(NewVariable(Variable{
 		Name: "io_workers", Type: TypeInt, BootVal: "3",
-		MinVal: 1, MaxVal: 1024,
+		MinVal: 1, MaxVal: 32, // MAX_IO_WORKERS (proc.h)
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
@@ -852,7 +852,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "random_page_cost", Type: TypeReal, BootVal: "4.0",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -869,21 +869,21 @@ func BuildDefaultRegistry() *Registry {
 	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_optimize_above_cost", Type: TypeReal, BootVal: "500000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_inline_above_cost", Type: TypeReal, BootVal: "500000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -1024,7 +1024,7 @@ func BuildDefaultRegistry() *Registry {
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
-		MinVal: 0, MaxVal: 1 << 30,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -1035,21 +1035,21 @@ func BuildDefaultRegistry() *Registry {
 	// can SET them without an "unrecognized configuration parameter" error.
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_tuple_cost", Type: TypeReal, BootVal: "0.01",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_index_tuple_cost", Type: TypeReal, BootVal: "0.005",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_operator_cost", Type: TypeReal, BootVal: "0.0025",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -1132,7 +1132,7 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1500000000",
+		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1600000000",
 		MinVal: 0, MaxVal: 2100000000,
 		Context: ContextUserset,
 		Scope:   ScopeSession,
@@ -1185,8 +1185,8 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "autovacuum_vacuum_max_threshold", Type: TypeInt, BootVal: "200000000",
-		MinVal: 0, MaxVal: 2147483647,
+		Name: "autovacuum_vacuum_max_threshold", Type: TypeInt, BootVal: "100000000",
+		MinVal: -1, MaxVal: math.MaxInt32, // guc_tables.c; -1 = no cap
 		Context: ContextSigHup,
 		Scope:   ScopeSession,
 	}))
@@ -1575,7 +1575,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
-		MinVal: 0, MaxVal: 1 << 30,
+		MinVal: 0, MaxVal: math.MaxInt32,
 		Context: ContextUserset, // PGC_USERSET (guc_tables.c); the walsender has no timeout yet
 		Scope:   ScopeServer,
 	}))

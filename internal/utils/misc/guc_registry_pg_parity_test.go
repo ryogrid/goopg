@@ -1,6 +1,7 @@
 package misc
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -151,5 +152,50 @@ func TestRegistryNamesArePGOrGoopgNamespaced(t *testing.T) {
 	v, _ := r.Get("autovacuum_multixact_freeze_max_age")
 	if v.BootVal != "400000000" || v.MinVal != 10000 || v.MaxVal != 2000000000 {
 		t.Errorf("autovacuum_multixact_freeze_max_age = %s [%v, %v], want 400000000 [10000, 2000000000]", v.BootVal, v.MinVal, v.MaxVal)
+	}
+}
+
+// TestGUCDefaultsAndRangesFollowPG pins slice 6: boot values and ranges taken
+// from guc_tables.c where goopg's registry differed. None of these shapes a
+// plan; the plan-shaping differences (work_mem, max_parallel_workers_per_gather,
+// enable_partitionwise_*, jit) are an owner decision and stay out.
+func TestGUCDefaultsAndRangesFollowPG(t *testing.T) {
+	r := BuildDefaultRegistry()
+	for _, tc := range []struct {
+		name     string
+		boot     string
+		min, max float64
+	}{
+		{"autovacuum_vacuum_max_threshold", "100000000", -1, math.MaxInt32},
+		{"vacuum_multixact_failsafe_age", "1600000000", 0, 2100000000},
+		{"io_workers", "3", 1, 32},
+		{"bgwriter_lru_maxpages", "100", 0, math.MaxInt32 / 2},
+		{"scram_iterations", "4096", 1, math.MaxInt32},
+		{"wal_sender_timeout", "60000", 0, math.MaxInt32},
+		{"seq_page_cost", "1", 0, math.MaxFloat64},
+		{"random_page_cost", "4", 0, math.MaxFloat64},
+		{"cpu_tuple_cost", "0.01", 0, math.MaxFloat64},
+		{"cpu_index_tuple_cost", "0.005", 0, math.MaxFloat64},
+		{"cpu_operator_cost", "0.0025", 0, math.MaxFloat64},
+		{"jit_above_cost", "100000", -1, math.MaxFloat64},
+		{"jit_inline_above_cost", "500000", -1, math.MaxFloat64},
+		{"jit_optimize_above_cost", "500000", -1, math.MaxFloat64},
+	} {
+		v, ok := r.Get(tc.name)
+		if !ok {
+			t.Errorf("%s: not registered", tc.name)
+			continue
+		}
+		if v.Value != tc.boot || v.MinVal != tc.min || v.MaxVal != tc.max {
+			t.Errorf("%s = %s [%v, %v], want PG's %s [%v, %v]", tc.name, v.Value, v.MinVal, v.MaxVal, tc.boot, tc.min, tc.max)
+		}
+	}
+	if v, _ := r.Get("compute_query_id"); v.BootVal != "auto" {
+		t.Errorf("compute_query_id boot = %q, want auto", v.BootVal)
+	}
+	// A cost PG accepts must be accepted here too.
+	s := NewSessionRegistry(r)
+	if err := s.Set("random_page_cost", "1e12", false); err != nil {
+		t.Errorf("SET random_page_cost = 1e12: %v (PG accepts up to DBL_MAX)", err)
 	}
 }

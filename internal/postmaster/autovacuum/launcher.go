@@ -316,7 +316,9 @@ func (l *Launcher) params() avParams {
 		vacThresh: 50, vacScale: 0.2,
 		anlThresh: 50, anlScale: 0.1,
 		insThresh: 1000, insScale: 0.2,
-		maxThreshold: 200_000_000,
+		// autovacuum_vacuum_max_threshold: guc_tables.c boot 100000000;
+		// -1 disables the cap (autovacuum.c: vac_max_thresh >= 0).
+		maxThreshold: 100_000_000,
 		freezeMaxAge: 200_000_000, freezeMinAge: 50_000_000, freezeTableAge: 150_000_000,
 		failsafeAge: 1_600_000_000,
 	}
@@ -366,7 +368,7 @@ func (l *Launcher) params() avParams {
 	if v, ok := gf("autovacuum_vacuum_insert_scale_factor"); ok {
 		p.insScale = v
 	}
-	if v, ok := g("autovacuum_vacuum_max_threshold"); ok && v > 0 {
+	if v, ok := g("autovacuum_vacuum_max_threshold"); ok && v >= -1 {
 		p.maxThreshold = v
 	}
 	if v, ok := g("autovacuum_freeze_max_age"); ok && v > 0 {
@@ -533,7 +535,7 @@ func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
 		reltuples = float64(tbl.Stats.RowCount)
 	}
 	vacthresh := float64(p.vacThresh) + p.vacScale*reltuples
-	if float64(p.maxThreshold) < vacthresh {
+	if p.maxThreshold >= 0 && float64(p.maxThreshold) < vacthresh {
 		vacthresh = float64(p.maxThreshold)
 	}
 	if float64(dead) > vacthresh {

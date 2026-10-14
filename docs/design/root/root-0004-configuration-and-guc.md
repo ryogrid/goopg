@@ -669,3 +669,41 @@ lists 37 differences.
   - `enable_partitionwise_join` / `_aggregate` on against off;
   - `jit` off against on.
 - The others are ledgered.
+
+## Defaults and ranges that do not shape plans (2026-10-14, M0122-0008 slice 6)
+
+The slice-5 audit's differences that do not shape plans now take
+guc\_tables.c's values. Each consumer was checked first.
+
+- `autovacuum_vacuum_max_threshold` now has a default of 100000000 and a
+  range of -1..INT\_MAX. goopg had 200000000 and a minimum of 0.
+  - The launcher hard-coded the old default.
+  - It read the setting only when it was positive, so 0 and -1 both fell
+    back silently.
+  - It now follows `relation_needs_vacanalyze` (autovacuum.c): any value of
+    0 or more caps the vacuum threshold, and -1 disables the cap.
+- `vacuum_multixact_failsafe_age` now defaults to 1600000000. Nothing reads
+  it yet.
+- `compute_query_id` now defaults to `auto`. Nothing reads it.
+- Maxima now follow PG:
+  - `io_workers`: 32 (MAX\_IO\_WORKERS);
+  - `bgwriter_lru_maxpages`: INT\_MAX/2;
+  - `scram_iterations` and `wal_sender_timeout`: INT\_MAX;
+  - the planner cost parameters (`seq_page_cost`, `random_page_cost`,
+    `cpu_*_cost`) and the `jit_*_cost` parameters: DBL\_MAX.
+  - goopg capped the cost parameters at 1e9 or 1e15, so a SET that PG
+    accepts failed here. Their values are unchanged.
+
+Tests: `TestGUCDefaultsAndRangesFollowPG` (`internal/utils/misc`) and
+`TestAutovacuumVacuumMaxThresholdFollowsPG` (`internal/postmaster/autovacuum`).
+
+Still open (ledgered):
+
+- `io_max_concurrency`: PG's -1 is a per-backend auto value, at most 64
+  handles. goopg's setting is a global in-flight cap, so adopting PG's value
+  as-is would throttle all I/O.
+- The launcher does not consult the per-table
+  `autovacuum_vacuum_max_threshold` reloption.
+- Some differences are formatting only: `log_file_mode` boot display,
+  memory units in `kB` against `8kB`, and the initdb-set encoding and
+  timezone.
