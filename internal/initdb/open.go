@@ -91,9 +91,13 @@ type Runtime struct {
 	// background WAL writer loop to exit. nil when the loop wasn't
 	// started (WalWriterDelay == 0 in tests).
 	walwriterStop chan struct{}
+	// walwriterDelay is the loop's live wal_writer_delay; walwriterKick
+	// wakes it after SetWalWriterDelay changes it (a reload).
+	walwriterDelay atomic.Int64 // time.Duration
+	walwriterKick  chan struct{}
 
 	// bgwriter is the background page-writer goroutine (M0048-0003).
-	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
+	// nil when BgwriterDelay == 0.
 	bgwriter *storage.Bgwriter
 
 	// immediateShutdown, when true, makes Close() skip the final
@@ -116,6 +120,53 @@ func (r *Runtime) SetImmediateShutdown() {
 		r.immediateShutdown = true
 	}
 }
+
+// WriterSettings carries the WAL-writer, group-commit and background-writer
+// parameters a configuration reload must reach on a running server. PG
+// declares wal_writer_delay, wal_writer_flush_after, bgwriter_delay and
+// bgwriter_lru_maxpages PGC_SIGHUP (guc_tables.c); its walwriter and
+// bgwriter re-read them on the next loop after SIGHUP. commit_delay and
+// commit_siblings are backend settings in PG; goopg's group-commit state is
+// shared by the writer, so the reload carries their configured values.
+type WriterSettings struct {
+	WalWriterDelay      time.Duration // <= 0: unchanged
+	WalWriterFlushAfter int64         // bytes
+	CommitDelayUs       int64
+	CommitSiblings      int
+	BgwriterDelay       time.Duration // <= 0: unchanged
+	BgwriterMaxPages    int
+}
+
+// ApplyWriterSettings pushes reloaded writer settings into the running
+// walwriter, WAL writer and bgwriter. Loops that were not started (tests
+// that open with a zero delay) are left alone.
+func (r *Runtime) ApplyWriterSettings(ws WriterSettings) {
+	if r == nil {
+		return
+	}
+	if r.WAL != nil {
+		r.WAL.SetWalWriterFlushAfter(ws.WalWriterFlushAfter)
+		r.WAL.SetCommitDelayUs(ws.CommitDelayUs)
+		r.WAL.SetCommitSiblings(ws.CommitSiblings)
+	}
+	if r.walwriterKick != nil && ws.WalWriterDelay > 0 &&
+		time.Duration(r.walwriterDelay.Swap(int64(ws.WalWriterDelay))) != ws.WalWriterDelay {
+		select {
+		case r.walwriterKick <- struct{}{}:
+		default:
+		}
+	}
+	if r.bgwriter != nil {
+		r.bgwriter.SetDelay(ws.BgwriterDelay)
+		r.bgwriter.SetMaxPages(ws.BgwriterMaxPages)
+	}
+}
+
+// WalWriterDelay and Bgwriter report the running loops' settings (tests).
+func (r *Runtime) WalWriterDelay() time.Duration {
+	return time.Duration(r.walwriterDelay.Load())
+}
+func (r *Runtime) Bgwriter() *storage.Bgwriter { return r.bgwriter }
 
 // OpenOptions controls Open.
 type OpenOptions struct {
@@ -2803,6 +2854,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if opts.WalWriterDelay > 0 && walWriter != nil {
 		stop := make(chan struct{})
 		rt.walwriterStop = stop
+		rt.walwriterDelay.Store(int64(opts.WalWriterDelay))
+		kick := make(chan struct{}, 1)
+		rt.walwriterKick = kick
 		go func() {
 			// This goroutine is now the walwriter process: register it in the
 			// activity registry so pool/AIO hooks attribute its I/O to
@@ -2822,6 +2876,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					// with no commits in flight. Fast no-op when nothing was
 					// written since the last flush.
 					_ = walWriter.BackgroundWrite()
+				case <-kick:
+					ticker.Reset(time.Duration(rt.walwriterDelay.Load()))
 				case <-stop:
 					return
 				}
@@ -2831,7 +2887,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Background page-writer goroutine (M0048-0003): proactively flushes
 	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
-	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
+	// bgwriter_lru_maxpages = 0 keeps the goroutine (it only skips the
+	// writes), as PG keeps its bgwriter, so a reload can raise it again.
+	if opts.BgwriterDelay > 0 {
 		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
 		// Pre-register the bgwriter background slot (M0122-0003 writeback
 		// simplification 3 follow-up) so OnLoopStart/OnLoopEnd below can

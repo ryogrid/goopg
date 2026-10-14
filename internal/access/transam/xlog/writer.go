@@ -644,6 +644,12 @@ func (w *Writer) SetCommitSiblings(n int) {
 // SetWalWriterFlushAfter live-updates wal_writer_flush_after (bytes; SIGHUP).
 func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Store(bytes) }
 
+// CommitDelayUs, CommitSiblings and WalWriterFlushAfter report the live
+// values the setters above maintain.
+func (w *Writer) CommitDelayUs() int64       { return w.commitDelayUs.Load() }
+func (w *Writer) CommitSiblings() int        { return int(w.commitSiblings.Load()) }
+func (w *Writer) WalWriterFlushAfter() int64 { return w.walWriterFlushAfter.Load() }
+
 // PageHeadersEnabled reports whether the writer is emitting
 // PG-compatible XLOG page headers (M0014-0001 step 2). Returns the
 // Config.PageHeaders value the writer was constructed with — static

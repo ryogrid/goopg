@@ -806,6 +806,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
+		// The walwriter and bgwriter re-read their PGC_SIGHUP settings on a
+		// reload (M0122-0008); before this they were boot-time only.
+		rt.ApplyWriterSettings(initdb.WriterSettings{
+			WalWriterDelay:      time.Duration(intGUC(registry, "wal_writer_delay", 200)) * time.Millisecond,
+			WalWriterFlushAfter: int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
+			CommitDelayUs:       int64(intGUC(registry, "commit_delay", 0)),
+			CommitSiblings:      intGUC(registry, "commit_siblings", 5),
+			BgwriterDelay:       time.Duration(intGUC(registry, "bgwriter_delay", 200)) * time.Millisecond,
+			BgwriterMaxPages:    intGUC(registry, "bgwriter_lru_maxpages", 100),
+		})
 	}
 	applyCheckpointGUCs()
 	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs

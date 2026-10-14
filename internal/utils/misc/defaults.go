@@ -597,9 +597,9 @@ func BuildDefaultRegistry() *Registry {
 	// Default 200ms mirrors upstream's wal_writer_delay GUC. See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_writer_delay", Type: TypeInt, BootVal: "200",
+		Name: "wal_writer_delay", Type: TypeInt, Unit: UnitMs, BootVal: "200",
 		MinVal: 1, MaxVal: 10000,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -611,7 +611,7 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
 		MinVal: 0, MaxVal: 1 << 30,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -637,9 +637,9 @@ func BuildDefaultRegistry() *Registry {
 	// writer goroutine wakes up to flush dirty buffer-pool pages.
 	// Default 200ms mirrors upstream's bgwriter_delay GUC (M0048-0003).
 	r.MustRegister(NewVariable(Variable{
-		Name: "bgwriter_delay", Type: TypeInt, BootVal: "200",
+		Name: "bgwriter_delay", Type: TypeInt, Unit: UnitMs, BootVal: "200",
 		MinVal: 10, MaxVal: 10000,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -674,12 +674,12 @@ func BuildDefaultRegistry() *Registry {
 	}))
 
 	// bgwriter_lru_maxpages caps how many dirty pages the background
-	// writer flushes per tick. 0 disables the bgwriter. Default 100
+	// writer flushes per tick. 0 stops the writes. Default 100
 	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
 	r.MustRegister(NewVariable(Variable{
 		Name: "bgwriter_lru_maxpages", Type: TypeInt, BootVal: "100",
 		MinVal: 0, MaxVal: 1000,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -1194,13 +1194,13 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "autovacuum_max_workers", Type: TypeInt, BootVal: "3",
 		MinVal: 1, MaxVal: 262143,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); the autovacuum launcher does not read it yet
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "autovacuum_work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "-1",
 		MinVal: -1, MaxVal: 2147483647,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); the autovacuum launcher does not read it yet
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -1567,7 +1567,7 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
 		MinVal: 0, MaxVal: 1 << 30,
-		Context: ContextSigHup,
+		Context: ContextUserset, // PGC_USERSET (guc_tables.c); the walsender has no timeout yet
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{

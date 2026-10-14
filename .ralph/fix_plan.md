@@ -4867,6 +4867,24 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Test `TestGUCRegistryPrivilegeContextsAndPredLockNames`; `TestPredicateLockGUCDefaults` follows the PG names\.
     - Gates: units, postmaster, tpch\-spotcheck, TPC\-H acceptance arm, sf025 PASS=99; regress guc / sysviews identical\.
     - Remaining: 191 unregistered PG parameters, 4 goopg\-only names, 10 other context mismatches \(listed above\)\.
+  - Slice 2 done 2026\-10\-14: a reload now reaches the walwriter, bgwriter and group\-commit settings
+    \(`initdb\.Runtime\.ApplyWriterSettings`, called from cmd/goopg\'s reload hook\)\.
+    - `wal\_writer\_delay`, `wal\_writer\_flush\_after`, `bgwriter\_delay` and `bgwriter\_lru\_maxpages` are now
+      PGC\_SIGHUP\. The two delays carry PG\'s `ms` unit, so a PG\-written `bgwriter\_delay = 50ms` applies\.
+    - `commit\_delay` / `commit\_siblings` were reloadable in the registry, but no reload reached the WAL writer;
+      it does now\.
+    - `bgwriter\_lru\_maxpages = 0` stops only the writes, as in PG\. The goroutine stays, so a reload can raise it\.
+    - `autovacuum\_max\_workers` and `autovacuum\_work\_mem` are now PGC\_SIGHUP, and `wal\_sender\_timeout` is
+      PGC\_USERSET\. All three are unconsumed; ledgered\.
+    - Kept PGC\_POSTMASTER, ledgered: `io\_workers`, `restore\_command` and `wal\_init\_zero` are read once at
+      start\. The `\*\_flush\_after` unit gap is also ledgered\.
+    - Live probe: after `goopg reload`, the log shows `changed=\[bgwriter\_delay wal\_writer\_delay
+      bgwriter\_lru\_maxpages commit\_delay\]` with no warning\.
+    - Tests: `TestApplyWriterSettingsReachesRunningLoops`, `TestBgwriterRunsWithZeroLRUMaxPages`,
+      `TestBgwriterReloadedSettingsTakeEffect` and `TestGUCRegistryReloadableContexts`\.
+    - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS; regress guc / sysviews identical to HEAD\.
+    - Remaining: 191 unregistered PG parameters; 4 goopg\-only names; `io\_workers` / `restore\_command` /
+      `wal\_init\_zero` contexts \(need live consumers first\)\.
 
 - [x] **SET TIME ZONE INTERVAL is stored verbatim** \(found 2026\-10\-10\)\.
   `SET TIME ZONE INTERVAL \'\+02:00\' HOUR TO MINUTE; SHOW timezone` gives

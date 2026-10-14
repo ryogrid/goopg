@@ -38,3 +38,31 @@ func TestGUCRegistryPrivilegeContextsAndPredLockNames(t *testing.T) {
 		}
 	}
 }
+
+// TestGUCRegistryReloadableContexts pins slice 2 of the same task: seven
+// parameters goopg registered with a context PG 18.3 does not use.
+//
+//   - wal_writer_delay, wal_writer_flush_after, bgwriter_delay and
+//     bgwriter_lru_maxpages are PGC_SIGHUP; goopg required a restart. The
+//     reload hook now pushes them into the running loops
+//     (initdb.Runtime.ApplyWriterSettings).
+//   - autovacuum_max_workers and autovacuum_work_mem are PGC_SIGHUP and
+//     wal_sender_timeout is PGC_USERSET. Nothing in goopg reads them yet (the
+//     autovacuum launcher runs a fixed single worker; the walsender has no
+//     timeout), so only the context the server reports and enforces changes.
+func TestGUCRegistryReloadableContexts(t *testing.T) {
+	r := BuildDefaultRegistry()
+	for _, name := range []string{
+		"wal_writer_delay", "wal_writer_flush_after", "bgwriter_delay", "bgwriter_lru_maxpages",
+		"autovacuum_max_workers", "autovacuum_work_mem", "wal_sender_timeout",
+	} {
+		v, ok := r.Get(name)
+		if !ok {
+			t.Errorf("%s: not registered", name)
+			continue
+		}
+		if pg := pgGUCs[name]; v.Context != pg.Context {
+			t.Errorf("%s: goopg context %v, PG 18.3 %v", name, v.Context, pg.Context)
+		}
+	}
+}

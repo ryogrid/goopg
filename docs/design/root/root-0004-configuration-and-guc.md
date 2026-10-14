@@ -496,3 +496,74 @@ Tests: `TestObjectDefaultGUCStubs` + `TestObjectDefaultGUCValuesAccepted`
 `TestSampleConfigCoversRegistry` (unchanged, now covers the three new names).
 Gates: `go build ./...` clean; `go test ./internal/config/...
 ./internal/catalog/...` PASS; live server SET/SHOW/pg_settings smoke.
+
+## Reload reaches the walwriter and bgwriter (2026-10-14, M0122-0008 slice 2)
+
+A reload changes the registry. It does not, by itself, change what a
+running loop does. Most consumers read their parameters once, in
+`cmd/goopg` before `initdb.Open`, so declaring such a parameter
+`ContextSigHup` would make a reload report success while nothing moves.
+Before a parameter's context is relaxed from postmaster to sighup, its
+consumer must be reachable from the reload path.
+
+- PG 18.3 declares `wal_writer_delay`, `wal_writer_flush_after`,
+  `bgwriter_delay` and `bgwriter_lru_maxpages` PGC\_SIGHUP
+  (`guc_tables.c`). Its walwriter and bgwriter re-read them after
+  `ProcessMainLoopInterrupts`, and the SIGHUP latch wakes them from their
+  sleep.
+- goopg registered all four PGC\_POSTMASTER. The walwriter ticker and
+  `storage.Bgwriter` took their values once, at start.
+- The writer already had `SetCommitDelayUs`, `SetCommitSiblings` and
+  `SetWalWriterFlushAfter`, but nothing called them. `commit_delay` and
+  `commit_siblings` were registered as reloadable, so a reload of either
+  one was a silent no-op.
+
+Change:
+
+- `initdb.Runtime.ApplyWriterSettings(WriterSettings)` pushes the six
+  values into the running loops:
+  - the walwriter delay is an atomic, and a kick channel resets the ticker;
+  - the WAL writer gets the three existing setters;
+  - `Bgwriter.SetDelay` and `SetMaxPages` hold atomics and kick the loop.
+- `cmd/goopg`'s reload hook (`cfg.ApplyCheckpointGUCs`, run by
+  `Server.reloadConfig`) now calls it after the checkpoint parameters.
+- `bgwriter_lru_maxpages = 0` now stops only the writes, as in PG. The
+  goroutine starts whenever `bgwriter_delay > 0`, so a reload can raise the
+  value again.
+- The four parameters are now `ContextSigHup`.
+- `wal_writer_delay` and `bgwriter_delay` now carry PG's `ms` unit. Without
+  it, a PG-written line such as `bgwriter_delay = 50ms` was rejected with
+  "variable does not accept unit".
+- `autovacuum_max_workers` and `autovacuum_work_mem` (PGC\_SIGHUP) and
+  `wal_sender_timeout` (PGC\_USERSET) take PG's contexts. They have no
+  consumer: the autovacuum launcher runs a fixed `WorkerLimit` of 1, and
+  the walsender has no timeout. Only what `SET` and a reload enforce
+  changes. This is ledgered.
+
+Verified live: `bgwriter_delay = 50ms`, `wal_writer_delay = 20ms`,
+`bgwriter_lru_maxpages = 0` and `commit_delay = 10` were appended to
+`postgresql.conf`, then `goopg reload` was run. The log shows
+`changed=[bgwriter_delay wal_writer_delay bgwriter_lru_maxpages
+commit_delay]` with no warning, and SHOW returns `50ms`, `20ms`, `0` and
+`10`.
+
+Tests:
+
+- `TestApplyWriterSettingsReachesRunningLoops` and
+  `TestBgwriterRunsWithZeroLRUMaxPages` (`internal/initdb`);
+- `TestBgwriterReloadedSettingsTakeEffect` (`internal/storage`): a one-hour
+  delay reloaded to 5ms takes effect without waiting out the hour;
+- `TestGUCRegistryReloadableContexts` (`internal/utils/misc`).
+
+Still open (ledgered):
+
+- `io_workers` (PGC\_SIGHUP): PG resizes its I/O worker pool on reload;
+  goopg's AIO engine fixes its worker count at start.
+- `restore_command` (PGC\_SIGHUP): read once when archive recovery starts.
+- `wal_init_zero` (PGC\_SUSET): read once into the WAL config.
+- `autovacuum_naptime` is reloadable in the registry, but the launcher's
+  `NapInterval` is fixed at start.
+- `wal_writer_flush_after`, `checkpoint_flush_after`,
+  `bgwriter_flush_after` and `backend_flush_after` lack PG's block units.
+  For example, PG shows `1MB` for `wal_writer_flush_after`, where goopg
+  shows `1048576`.

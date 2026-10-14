@@ -94,10 +94,7 @@
 # - Background Writer -
 
 #bgwriter_delay = 200                   # 10-10000 ms between rounds
-                                        # (change requires restart)
-#bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round;
-                                        # 0 disables background writing
-                                        # (change requires restart)
+#bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round, 0 disables
 #bgwriter_flush_after = 64              # 0-256 pages; 0 disables writeback
                                         # (SIGHUP to apply)
 
@@ -132,9 +129,7 @@
                                         # the in-memory WAL buffer
                                         # (change requires restart)
 #wal_writer_delay = 200                 # 1-10000 ms between WAL-writer rounds
-                                        # (change requires restart)
 #wal_writer_flush_after = 1048576       # 0-1073741824 bytes; 0 fsyncs every round
-                                        # (change requires restart)
 #commit_delay = 0                       # 0-100000 microseconds
 #commit_siblings = 5                    # 0-1000 range; min concurrent flushers
                                         # before commit_delay applies
