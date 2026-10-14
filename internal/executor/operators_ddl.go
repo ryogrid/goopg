@@ -6937,18 +6937,8 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	// this the file leaks on every drop. DropRelation's os.IsNotExist guard
 	// makes this safe to call even for a never-materialized (WITH NO DATA)
 	// or restart-downgraded-to-virtual matview that has no backing file yet.
-	rel := o.ctx.Catalog.RelFileNode(tbl)
-	o.ctx.Pool.InvalidateRel(rel)
-	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-		return &ExecError{Code: "XX000", Message: err.Error()}
-	}
-	if o.ctx.FSM != nil {
-		o.ctx.FSM.DropRelation(rel)
-	}
-	if o.ctx.VM != nil {
-		o.ctx.VM.DropRelation(rel)
-	}
-	return nil
+	// The removal waits for commit (dropRelationStorage).
+	return dropRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)
 }
 
 // viewsDependingOnView returns all views whose body directly references the given view name.
@@ -7641,8 +7631,8 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// M0097-0023.
 	dropName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
 	// Record the drop for ROLLBACK TO SAVEPOINT if we're inside a savepoint.
-	// The physical deletion is idempotent (os.IsNotExist guard in DropRelation),
-	// so restoring only the catalog entry is sufficient. M0097-0023.
+	// Restoring the catalog entry is sufficient: the storage is only removed
+	// if the dropping subtransaction commits (dropRelationStorage). M0097-0023.
 	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() && bsess.SavepointDepth() > 0 {
 		bsess.RecordDDLDrop(DDLDropUndoEntry{
 			Table:          tbl,
@@ -7664,20 +7654,14 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
 	restoreTempShadow(o.ctx, strings.ToLower(name.Name))
-	o.ctx.Pool.InvalidateRel(rel)
-	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-		return &ExecError{Code: "XX000", Message: err.Error()}
-	}
-	if o.ctx.FSM != nil {
-		o.ctx.FSM.DropRelation(rel)
-	}
-	if o.ctx.VM != nil {
-		o.ctx.VM.DropRelation(rel)
+	// The table's and its indexes' storage is removed at commit
+	// (dropRelationStorage), so a rolled-back DROP keeps the data.
+	if err := dropRelationStorage(o.ctx, rel, true); err != nil {
+		return err
 	}
 	for _, idxRel := range idxRels {
-		o.ctx.Pool.InvalidateRel(idxRel)
-		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
-			return &ExecError{Code: "XX000", Message: err.Error()}
+		if err := dropRelationStorage(o.ctx, idxRel, false); err != nil {
+			return err
 		}
 	}
 	// M0106-0011: DROP TABLE removes pg_class / pg_attribute / pg_index rows
@@ -8367,9 +8351,11 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		}
 		flagInval = true
 		droppedOIDs = append(droppedOIDs, dropOID)
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := dropRelationStorage(o.ctx, rel, false); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
 		}
 		// B5 Slice A: RecordKindDropIndex(21) retired — the index's pg_class row
 		// is xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged),
@@ -8436,8 +8422,7 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 		flagInval = true
 		droppedOIDs = append(droppedOIDs, d.OID)
 		if ctx.Pool != nil {
-			ctx.Pool.InvalidateRel(d.Rel)
-			_ = ctx.Pool.Manager().DropRelation(d.Rel)
+			_ = dropRelationStorage(ctx, d.Rel, false)
 			// B5 Slice A: RecordKindDropIndex(21) retired — the pg_class row is
 			// xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged).
 		}

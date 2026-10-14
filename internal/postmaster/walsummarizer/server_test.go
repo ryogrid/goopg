@@ -138,14 +138,57 @@ func TestServerSummarizesWAL(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// DROP TABLE removes the storage only at commit, and the commit record
+	// names the relation (XACT_XINFO_HAS_RELFILELOCATORS), so the summary
+	// gives its forks limit block 0, as SummarizeXactRecord does. A DROP
+	// rolled back to a savepoint keeps its rows: a partition is dropped
+	// during the statement rather than through the deferred-drop list, which
+	// used to remove its file at once and lose the rows.
+	exec("CREATE TABLE wp(a int) PARTITION BY RANGE (a)")
+	exec("CREATE TABLE wp1 PARTITION OF wp FOR VALUES FROM (0) TO (1000)")
+	exec("INSERT INTO wp SELECT generate_series(1, 100)")
+	exec("BEGIN; SAVEPOINT s; DROP TABLE wp1; ROLLBACK TO s; COMMIT")
+	if got := exec("SELECT count(*) FROM wp1")[0][0]; got != "100" {
+		t.Fatalf("after DROP rolled back to a savepoint, wp1 has %s rows, want 100", got)
+	}
+	exec("CREATE TABLE wd(a int)")
+	exec("INSERT INTO wd SELECT generate_series(1, 100)")
+	wd := exec("SELECT relfilenode FROM pg_class WHERE relname = 'wd'")[0][0]
+	// First let wd's creation (whose SMGR_CREATE also sets limit 0) be
+	// summarized, so the limit row checked below can only come from the
+	// commit record of the DROP.
+	created := exec("SELECT pg_current_wal_insert_lsn()")[0][0]
+	exec("CHECKPOINT")
+	deadline = time.Now().Add(20 * time.Second)
+	for exec("SELECT coalesce(max(end_lsn) >= '" + created + "', false) FROM pg_available_wal_summaries()")[0][0] != "true" {
+		if time.Now().After(deadline) {
+			t.Fatalf("wd's creation at %s was never summarized; summaries %v", created, files())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	before := exec("SELECT max(end_lsn) FROM pg_available_wal_summaries()")[0][0]
+	exec("DROP TABLE wd")
+	exec("CHECKPOINT")
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		lim := exec("SELECT count(*) FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn) c WHERE s.start_lsn >= '" + before + "' AND c.relfilenode = " + wd + " AND c.relforknumber = 0 AND c.is_limit_block AND c.relblocknumber = 0")
+		if lim[0][0] != "0" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no summary gives the dropped wd limit block 0; summaries %v", files())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	// A restart resumes from the files too.
 	if err := c.Restart(cluster.ShutdownFast); err != nil {
 		t.Fatal(err)
 	}
-	before := len(files())
+	nfiles := len(files())
 	exec("INSERT INTO ws VALUES (3)")
 	exec("CHECKPOINT")
-	all := waitFiles(before + 1)
+	all := waitFiles(nfiles + 1)
 	if ok, missing := walsummary.AreComplete(all, all[0].Start, all[len(all)-1].End); !ok {
 		t.Errorf("summaries %v have a gap at %X", all, missing)
 	}

@@ -293,3 +293,50 @@ S3 is split. S3a is the summarizer that runs over a live WAL stream. S3b wires i
 - `TestPort_PgWalsummary002Blocks`: 3 of 3 runs pass, each printing blocks 0 and 5.
 - `TestPgCurrentWALLSN`: insert = the end of the appended record; flush follows `FlushUpTo`; the ordering
   invariant holds; a standby gets 55000.
+
+## S6b landed (2026-10-14): dropped relations in the commit record, removed after it
+
+- **What was wrong (found while scoping §4.4 item 4):**
+  - goopg removed a dropped relation's buffers and files during the DROP statement.
+  - Inside a transaction block only plain tables and indexes were deferred, and those were removed at COMMIT but
+    **before** the commit record.
+  - A partition, a CASCADE target, or any drop under a savepoint lost its rows if the transaction or savepoint
+    rolled back.
+  - Commit records never named the dropped relations, and replay never removed their files.
+- **The PG design, ported:**
+  - **`RelationDropStorage` → `dropRelationStorage`** (`internal/executor/rel_drop_storage.go`). DROP TABLE (heap and
+    its indexes), DROP INDEX (immediate and deferred), and DROP MATERIALIZED VIEW schedule the storage removal on the
+    transaction manager. The entry is tagged with the (sub)transaction that dropped it.
+  - **`PendingRelDelete` / `smgrGetPendingDeletes` / `smgrDoPendingDeletes`** live in
+    `internal/access/transam/pending_rel_delete.go`.
+    - The commit-record hook (`initdb/open.go`) lists the live entries: those not under a rolled-back
+      subtransaction.
+    - `Manager.finish` runs their removal after the commit record and the proc-array clear, or forgets them on
+      abort.
+    - All 37 rollback call sites are covered, because none of them has to change.
+  - **`XactLogCommitRecord`'s relfilelocators chunk:** `EncodeXactCommitPGWithRels` /
+    `EncodeXactAbortPGWithRels` write `XACT_XINFO_HAS_RELFILELOCATORS` after the subxacts chunk and before invals.
+    TblOid 0 is written as 1663, or 1664 for a shared relation (DBOid 0), as `EncodeSmgrCreatePG` maps it.
+  - **`DropRelationFiles` on replay:** the RM\_XACT commit and abort arms (`dropXactRelFiles`) remove every fork of
+    each listed relation. Real-PG WAL is covered by the same arms.
+  - The summarizer's existing `summarizeXact` arm now sees the list: every non-FSM fork of a dropped relation gets
+    limit block 0, as PG's summary has.
+- **Left out (ledgered):**
+  - Abort records do not yet list the relations the aborting transaction created. goopg's session-local
+    `rollbackDDLCreate` still removes those.
+  - A prepared transaction's pending deletes are in memory only.
+  - The catalog half of a rolled-back non-deferred DROP (partition, CASCADE) is not restored: the storage survives,
+    but the table is missing from the catalog. Filed as an S2 defect.
+
+**Tests:**
+- `TestPendingRelDeletes`: listed before the commit record and removed after it, in drop order, deduplicated;
+  entries under a rolled-back subtransaction are skipped; abort removes nothing.
+- `TestXactRelFileLocatorsRoundTrip`: real writer + `ReadAll` → `ParseXactRecord` locators, including the shared and
+  user-tablespace mapping, with invals still intact; replay removes every listed fork and nothing else.
+- `TestServerSummarizesWAL`:
+  - DROP of a partition rolled back to a savepoint keeps its 100 rows. Before the fix it had 0.
+  - A committed DROP gives the table's main fork limit block 0 in a summary that starts after the table's creation
+    was summarized.
+  - Negative controls: with the commit-record list emptied, or with the deferral disabled, the test fails.
+- The DROP-related isolation ports pass: intra-grant-inplace(-db), drop-index-concurrently-1, truncate-conflict,
+  reindex-concurrently(-toast), alter-table-1..4, vacuum-concurrent-drop, partition-drop-index-locking.

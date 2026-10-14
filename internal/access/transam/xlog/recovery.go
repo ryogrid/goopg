@@ -2523,9 +2523,9 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			if xactCommitCarriesInvals(xlog.Header.Info, xlog.MainData) {
 				_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
 			}
-			return false, nil
+			return false, dropXactRelFiles(mgr, xlog)
 		case xlogXactAbort:
-			return false, nil
+			return false, dropXactRelFiles(mgr, xlog)
 		case xlogXactAssignment, xlogXactInvalidations:
 			// M0131-S21a: two recovery-bookkeeping records goopg never emits
 			// but that appear in any real-PG tail. Neither touches a page.
@@ -6480,6 +6480,31 @@ func replaySmgrCreate(mgr *storage.Manager, payload []byte) error {
 		return err
 	}
 	return applySmgrCreate(mgr, rel)
+}
+
+// dropXactRelFiles is xact_redo_commit / xact_redo_abort's DropRelationFiles:
+// every fork of each relation a commit or abort record lists in its
+// HAS_RELFILELOCATORS chunk is removed (the relations a committed transaction
+// dropped, or an aborted one created). Removing a file that is already gone is
+// a no-op, so replaying the record twice is harmless.
+func dropXactRelFiles(mgr *storage.Manager, x *XLogDecodedRecord) error {
+	parsed, err := ParseXactRecord(x.Header.Info, x.MainData)
+	if err != nil {
+		return err
+	}
+	for _, l := range parsed.DroppedRels {
+		rel := storage.RelFileNode{TblOid: l.SpcOid, DBOid: l.DbOid, RelOid: l.RelNumber}
+		if rel.TblOid == pgDefaultTableSpaceOID || rel.TblOid == pgGlobalTableSpaceOID {
+			rel.TblOid = 0 // goopg's convention, as decodeXLogSmgrCreate maps it
+		}
+		for fork := storage.ForkNumber(0); fork <= storage.InitFork; fork++ {
+			rel.Fork = fork
+			if err := mgr.DropRelation(rel); err != nil {
+				return fmt.Errorf("wal: xact redo: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // decodeXLogSmgrCreate parses a PG xl_smgr_create main-data body

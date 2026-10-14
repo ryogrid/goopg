@@ -507,8 +507,8 @@ Concrete divergences:
    - If the relfilenumber is reused and block 0 is re-extended, the `pinNewXID` SMGR_CREATE sets
      `limit 0` (`bufpool.go:1836`), so the incremental-backup outcome stays safe. The summary bytes
      still differ from PG's for the same workload.
-   - Fix: emit `HAS_RELFILELOCATORS` in `EncodeXactCommitPGWithSubxacts` from the transaction's
-     pending-delete list.
+   - **Landed (S6b, 2026-10-14):** a per-transaction pending-delete list fills `HAS_RELFILELOCATORS`
+     (see `0122-0009-wal-summarizer-s2b.md` §S6b).
 5. **In-place TRUNCATE** with no `XLOG_SMGR_TRUNCATE` (3).
    - PG assigns a new relfilenode and logs SMGR_CREATE (limit 0). goopg keeps the relfilenumber.
    - A limit 0 appears only when block 0 is re-extended.

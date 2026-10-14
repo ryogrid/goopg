@@ -4996,6 +4996,31 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Tests: `TestPgCurrentWALLSN`; WS\-002 uses the insert LSN\.
     - Movement: none — no plan instrument\.
 
+- [ ] **A rolled\-back DROP of a partition, an inheritance tree or a CASCADE target loses the table** \(found
+  2026\-10\-14 during M0122\-0009 S6b\)\.
+  Kind: bug
+  Placement: S2 defect awaiting owner placement \(data loss: a rolled\-back DROP removes the table\)\. Filed without a
+  parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
+  - Repro on a fresh cluster, each followed by a read of the table:
+    - `CREATE TABLE p\(a int\) PARTITION BY RANGE \(a\); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM \(0\) TO
+      \(1000\); INSERT …; BEGIN; DROP TABLE p; ROLLBACK;` → `p` has 0 rows and `p1` no longer exists;
+    - `BEGIN; DROP TABLE par CASCADE; ROLLBACK;` with an inheritance child → the child no longer exists;
+    - `BEGIN; DROP TABLE plain CASCADE; ROLLBACK;` with a dependent view → `plain` no longer exists\.
+    PG 18\.3 restores all of them \(catalog changes are transactional\)\.
+  - Since M0122\-0009 S6b the storage survives \(removal waits for commit\), but the catalog entries are removed during
+    the statement and only a ROLLBACK TO SAVEPOINT restores them \(`RecordDDLDrop` is written only at savepoint depth
+    \> 0\); a top\-level ROLLBACK does not\. The deferred path \(`AddPendingTableDrop`\) covers only a plain table
+    with no partition or inheritance relatives and no temp shadow\.
+  - First step: record the `DDLDropUndoEntry` at every depth and restore it in the top\-level ROLLBACK path
+    \(`ProcessRollbackUndos`\), including the cascaded objects \(views, partitions, inheritance children\)\.
+  - Expected instrument: a testport case per repro; regress `alter\_table` / `inherit` rollback cases\.
+
+- [ ] **`pg\_relation\_filepath\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6b\)\.
+  Kind: bug
+  Parent: none
+  - `SELECT pg\_relation\_filepath\(\'t\'\)` → 42883\. PG returns `base/<db>/<relfilenode>` \(dbsize\.c\)\.
+  - First step: an executor builtin from the catalog\'s RelFileNode \(tablespace, database, relfilenode\)\.
+
 - [ ] **Boolean predicate columns are advertised as `text`** \(found 2026\-10\-14 during M0122\-0009 S7\)\.
   Kind: bug
   Placement: S2 defect awaiting owner placement \(wrong result type on the wire: a typed client decodes `t` as a
@@ -5290,6 +5315,19 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Gates: units, testport WS\-001/002, tpch\-spotcheck, acceptance arm, fire set, sf025\.
     - Movement: none — WAL summarizer infrastructure; no plan instrument\.
     - Next: the S6b\.\.S6f producer changes \(design §5 item 6\), SMGR\_CREATE for new tables first\.
+  - **2026\-10\-14 S6b landed** — dropped relations in the commit record, their storage removed after it \(PG
+    `RelationDropStorage` / `PendingRelDelete` / `smgrDoPendingDeletes` / `DropRelationFiles`\)\.
+    - DROP TABLE / INDEX / MATERIALIZED VIEW schedule the removal on the transaction manager
+      \(`dropRelationStorage`\); the commit record lists them \(`XACT\_XINFO\_HAS\_RELFILELOCATORS`\); abort forgets
+      them; replay of a commit or abort removes every listed fork\.
+    - Fixes the storage half of a data\-loss bug: a partition / CASCADE / savepoint DROP that rolled back lost its
+      rows \(partition under ROLLBACK TO: 0 rows before, 100 after\)\.
+    - Tests: `TestPendingRelDeletes`, `TestXactRelFileLocatorsRoundTrip`, `TestServerSummarizesWAL` \(savepoint
+      partition drop \+ limit row; two negative controls fail\); 12 DROP\-related isolation ports pass\.
+    - Gates: units, internal/postmaster/\.\.\. \(explicit\), isolation ports, tpch\-spotcheck, acceptance arm, sf025\.
+    - Movement: none — WAL / storage correctness; no plan instrument\.
+    - Next: abort records listing created relations \(rollbackDDLCreate → pending abort deletes\), then END\_OF\_RECOVERY
+      at promotion \(§4\.4 item 7\)\.
 - [ ] **M0122\-0009a — REINDEX CONCURRENTLY swaps the rebuilt index file in with no WAL** \(filed 2026\-10\-13 by the
   M0122\-0009 summarizer design review\)\. `swapRelationPhysicalFile` \(`internal/executor/operators\_ddl\.go` \~:692\)
   renames the shadow build over the live relfilenode with `os\.Rename`\. Its comment says no WAL record is needed

@@ -111,6 +111,10 @@ type Manager struct {
 	// files at commit time.
 	relcacheInvalPending atomic.Bool
 
+	// pendingRelDel holds the relation storage each transaction dropped,
+	// removed only once it commits (pending_rel_delete.go).
+	pendingRelDel pendingRelDeletes
+
 	// catalogXminSource, when installed, returns the smallest catalog_xmin
 	// pinned by any active logical replication slot (0 = nothing pinned).
 	// OldestXmin folds it into the global pruning/truncation horizon so the
@@ -826,6 +830,13 @@ func (m *Manager) finish(tx Transaction, kind XactMarker, waitLocalFlush bool) e
 	m.waitMu.Lock()
 	m.commitCond.Broadcast()
 	m.waitMu.Unlock()
+
+	// Remove the storage the transaction dropped, now that its commit record
+	// is written, or forget it on abort (smgrDoPendingDeletes, which
+	// CommitTransaction / AbortTransaction run after ProcArrayEndTransaction).
+	if xid != storage.InvalidTransactionID {
+		m.endPendingRelDeletes(xid, kind == XactCommit)
+	}
 
 	if xid != storage.InvalidTransactionID {
 		m.onTxnEndMu.RLock()

@@ -1209,6 +1209,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		var perr error
 		switch kind {
 		case transam.XactCommit:
+			// The relations the transaction dropped go into the commit record
+			// (XACT_XINFO_HAS_RELFILELOCATORS); their files are removed once
+			// the record is written (transam pending_rel_delete.go).
+			dropped := txnMgr.PendingRelDeletes(xid)
 			// If the transaction wrote to a nailed catalog relation (pg_class,
 			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
 			// record and unlink both pg_internal.init files so the next backend
@@ -1217,7 +1221,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPG(xid, true)
+				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1235,7 +1239,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = xlog.EncodeXactCommitPG(xid, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, false)
 			}
 		case transam.XactAbort:
 			payload, perr = xlog.EncodeXactAbortPG(xid)
