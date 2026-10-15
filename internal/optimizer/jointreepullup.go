@@ -1657,6 +1657,9 @@ func pullUpAnyDerivedBody(in *InExpr, parent *resolveContext, cat catalog.Catalo
 	if planHasEscapingOuterRef(node, 1) {
 		return nil, "any-derived-body-correlated", false
 	}
+	if sq, ok := node.(*SubqueryScan); ok {
+		sq.anyLink = true
+	}
 	bodyCtx.cat = cat
 	bodyCtx.parent = parent
 	bodyCtx.settings = ps

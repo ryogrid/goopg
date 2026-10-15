@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0201 — TPC-H Q18: PG joins `customer` last by Parallel Hash Join above the `lineitem` probe; goopg hash\-joins it serially before the probe \(join\-method\)**
+- [x] **M0146-0201 — TPC-H Q18: PG joins `customer` last by Parallel Hash Join above the `lineitem` probe; goopg hash\-joins it serially before the probe \(join\-method\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016d/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3318,6 +3318,12 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     unqualified Sort Key \(rendering\)\.
   - Other record, possibly another mechanism: SF1 Q68 \(household\_demographics: PG Hash Join, goopg pkey probe; near\-tie\)\.
   - Expected instrument: TPC-H PLAN\-PARITY match 16 → 17 \(Q18\); CATEGORIES\-EXCL\-MATCH join\-method down\.
+  - Closed 2026\-10\-16: \(1\) `subtreeHasNoParallelHazard` refused `\*SubqueryScan` as unmodelled, so the ANY\_subquery
+    rel was parallel\-unsafe \(DP trace `veto=B2 leaf=other`\) and no joinrel above it had a partial path; it now descends
+    the label\. \(2\) The ANY wrapper's consumption was counted by SourceTableIdx in the body's numbering, colliding
+    with the outer first FROM item; `SubqueryScan\.anyLink` gives it the link's position 0, so it is stripped\.
+    Design: `docs/design/0100\-0149/m0146\-0201\-subqueryscan\-parallel\-safe\-any\-strip\.md`\.
+  Movement: yes — TPCH match 16 → 17 \(Q18\); SF0\.25 84 and SF1 71 byte\-identical\.
 - [x] **M0146-0200 — TPC-H Q21: PG keeps the EC\-derived `orders\.o\_orderkey = l2\.l\_orderkey` as the semi join's Join Filter over a parameterised `l2` probe; goopg drops it \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016c/ROUTING\.md`\)\.
   Kind: impl

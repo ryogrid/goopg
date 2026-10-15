@@ -2113,6 +2113,13 @@ type SubqueryScan struct {
 	// keeps as a subquery RTE under the appendrel; the label names the
 	// appendrel binding the parent references it by. M0146-0093.
 	appendRel *appendRelLabel
+	// anyLink marks the subquery RTE a pulled-up ANY sublink becomes
+	// (`ANY_subquery`, pullUpAnyDerivedBody). Its one output column is read
+	// only by the link equality, which is synthesised in the body's
+	// numbering rather than bound through the enclosing scope, so the
+	// triviality pass cannot count its consumption by SourceTableIdx.
+	// M0146-0201.
+	anyLink bool
 }
 
 func (n *SubqueryScan) Pos() int       { return n.pos }

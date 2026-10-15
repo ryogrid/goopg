@@ -368,6 +368,15 @@ func subtreeHasNoParallelHazard(n Node, cat catalog.Catalog) bool {
 			// Enumerated by parallelChildren; no expression channel of
 			// their own that a worker could not evaluate (LockRows is
 			// refused by subtreeHasUnsafeNode above).
+		case *SubqueryScan:
+			// M0146-0201: the "Subquery Scan on <alias>" label has no
+			// expression channel of its own — parallelChildren and every
+			// stamp/splice sibling already treat it as a pass-through
+			// (M0146-0005w). PG's SubqueryScanPath is parallel_safe
+			// when the rel may be considered and its subpath is
+			// (create_subqueryscan_path), so the walk descends. Refusing
+			// it marked TPC-H Q18's ANY_subquery rel unsafe and left the
+			// whole join tree without partial paths.
 		case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *GenerateSeries,
 			*GenerateSubscripts, *FromUnnest, *UserSrfScan, *CTEScan,
 			*MaterializedCTEScan, *ScalarFuncScan:

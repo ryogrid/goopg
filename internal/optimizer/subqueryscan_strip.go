@@ -245,6 +245,17 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 			continue
 		}
 		used, clean := leafUsedPositions(l.region, l.scan, isDerived)
+		if l.scan.anyLink {
+			// M0146-0201: a pulled-up ANY sublink's subquery RTE
+			// (convert_ANY_sublink_to_join) has one output, read by the
+			// link equality alone. Its reference carries the body's
+			// numbering, so the SourceTableIdx scan above counts the
+			// enclosing query's same-numbered relation instead: the
+			// consumption is the link's, position 0 (TPC-H Q18's
+			// `Subquery Scan on "ANY_subquery"`, which PG's setrefs
+			// removes).
+			used, clean = []int{0}, true
+		}
 		if !l.physical {
 			// M0146-0092: below a window stack the scan's tlist is the
 			// window input target, not the consumer's reference order.
