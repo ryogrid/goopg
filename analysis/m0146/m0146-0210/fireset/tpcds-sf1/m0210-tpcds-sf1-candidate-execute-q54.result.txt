@@ -1,0 +1,4 @@
+ segment | num_customers | segment_base 
+---------+---------------+--------------
+(0 rows)
+

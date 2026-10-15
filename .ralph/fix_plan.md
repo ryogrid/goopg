@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0210 — TPC\-DS SF1 Q54: goopg's semi\-join Unique estimates 1 row from a 2\-row input, and the join order above it differs from PG's \(qual\-placement\)**
+- [x] **M0146-0210 — TPC\-DS SF1 Q54: goopg's semi\-join Unique estimates 1 row from a 2\-row input, and the join order above it differs from PG's \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016k/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3321,6 +3321,31 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     `estimate\_num\_groups`\. Then check whether the Sort\-over\-Gather vs Gather Merge choice under the Unique is a
     fuzz\-boundary tie, as M0146\-0209 found\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q54\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
+  - Closed 2026\-10\-16: the lead was right\. Three ported mechanisms; design
+    `docs/design/0100\-0149/m0146\-0210\-gather\-rows\-distinct\-seed\.md`\.
+    - `EstimateRows\(\*Gather\|\*GatherMerge\)` now reads its stamped path rows, which are `compute\_gather\_rows`
+      \(1 × 1\.7 → 2\), instead of re\-estimating the per\-worker child \(1\)\.
+    - The DISTINCT seed reads its input path's cost through Project wrappers \(`limitInputPath`\), not the Project's
+      legacy display cost \(\+0\.04\)\.
+    - The partial\-DISTINCT gathered rows are now clamped \(`clampRowEst`\), as in the partial\-aggregate twin\.
+    - Result: Q54's DISTINCT keeps 2 rows, the join order above it is PG's, and the DISTINCT is `Unique → Sort →
+      Gather`\.
+    - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), tpcds\-sf025 PASS=99, tpcds\-fireset
+      PASS \(introduced=none\), ea\-ratchet PASS; TPC\-H plan text byte\-identical\.
+    - Follow\-up filed: M0146\-0211 \(five sibling upper seeds\)\.
+  Movement: yes — TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q54\); CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 4 → 3, join\-order 22 → 21; SF0\.25 85 held\.
+- [ ] **M0146-0211 — the grouping / partial\-aggregate / partial\-sort / ordered / upperrel seeds still charge a Project wrapper's legacy display cost** \(filed 2026\-10\-16 by M0146\-0210\)\.
+  Kind: impl
+  Parent: M0146-0210
+  - M0146\-0210 made the DISTINCT seed read its input path through Project wrappers \(`limitInputPath`\), as PG prices
+    an upper rel on `cheapest\_input\_path` \(the target is applied to the path itself, dummypp\)\.
+  - The same `legacyDisplayCostOf\(child\)` seed remains in `groupingpaths\.go:82`, `partialaggpaths\.go:248/330`,
+    `partialsortpaths\.go:217`, `upperordered\.go:98` and `upperrel\.go:197`\. Each adds a per\-row Project charge PG
+    does not make\.
+  - First step: apply the same look\-through to each seed, then measure the TPC\-H, SF0\.25 and SF1 captures\. Near\-tie
+    shapes may move both ways\.
+  - Expected instrument: CATEGORIES\-EXCL\-MATCH moves on the upper\-rel categories \(aggregation\-strategy,
+    sort\-strategy\); no match loss\.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl

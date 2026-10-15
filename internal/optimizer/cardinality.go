@@ -208,9 +208,21 @@ func EstimateRows(n Node) int64 {
 	case *Gather:
 		// Total-row estimate; the per-worker division PG shows under a
 		// Gather is a cost-model concern (the 0077 line), not a
-		// cardinality one.
+		// cardinality one. A Gather the path search built carries its
+		// path's rows, compute_gather_rows (per-worker rows × the parallel
+		// divisor, costsize.c:6625), which create_gather_plan copies into
+		// plan_rows; every reader above it sees that count (M0146-0210:
+		// TPC-DS Q54's 1 row per worker × 1.7 = 2, which sizes the DISTINCT
+		// above it). Re-estimating the child instead reads its per-worker
+		// rows.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return EstimateRows(x.Child)
 	case *GatherMerge:
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return EstimateRows(x.Child)
 	case *LockRows:
 		return EstimateRows(x.Child)

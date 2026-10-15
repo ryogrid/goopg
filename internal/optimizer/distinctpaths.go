@@ -70,7 +70,18 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 	seed := newPrebuiltPath(distinctRel, child)
 	seed.Rows = inputRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	// create_distinct_paths reads cheapest_input_path (planner.c:4816) at its
+	// own cost. goopg's Project wrapper is not a node there: PG applies the
+	// target to the scan/join paths themselves, pushed below a Gather when
+	// it is parallel-safe (apply_scanjoin_target_to_paths, dummypp). So the
+	// seed reads the stamped search node through the Projects, as
+	// limitInputPath does for create_limit_path. The legacy display
+	// estimate, which charges the Project per row, is only the fallback for
+	// an input the search did not build (M0146-0210: TPC-DS Q54's 0.04 tipped
+	// the DISTINCT onto the partial arm).
+	if pc, ok := limitInputPath(child); ok {
+		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
+	} else if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 
@@ -497,7 +508,11 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// generate_useful_gather_paths on the partial rel (planner.c:5017);
 	// this arm builds the same node directly, the partial-Group arm's
 	// construction verbatim.
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c:6625): clamp_row_est of the
+	// per-worker rows times the divisor, as every create_gather_merge_path
+	// caller passes it (the partial-aggregate twin, M0146-0009n). Unclamped,
+	// TPC-DS Q54's 1 × 1.7 priced the merge 0.04 under PG's (M0146-0210).
+	crossed := clampRowEst(partialGroups * d)
 	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
 	gmPath := &Path{
 		Kind: PathGatherMerge, Rel: distinctRel, Rows: crossed, Cost: gmCost,
@@ -575,7 +590,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// its comparisons, and PG keeps this shape (TPC-DS Q38/Q87's
 	// store_sales branch); the add_path contest against the split arms
 	// decides.
-	sortedCrossed := perWorkerRows * d
+	sortedCrossed := clampRowEst(perWorkerRows * d)
 	sgmCost := gatherMergeCost(cp, workerSort.Cost, workers, sortedCrossed)
 	sgmPath := &Path{
 		Kind: PathGatherMerge, Rel: distinctRel, Rows: sortedCrossed, Cost: sgmCost,
