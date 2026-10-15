@@ -1,7 +1,7 @@
 # M0146-0197 — a parameterised index path for every eligible index
 
-Status: open — the leading-prefix half landed 2026-10-15. The skip-scan half
-still picks a single index.
+Status: done 2026-10-16 — every eligible index gets its own parameterised
+path, for both the leading-prefix and the skip-scan probe shapes.
 
 ## Problem
 
@@ -56,9 +56,26 @@ decision point, so the change is inert (C6 evidence: identical captures). It
 becomes active wherever two indexes cover the same probe, for example once the
 TPC-H fk indexes are compact.
 
+## Skip-scan half (2026-10-16)
+
+`skipRunFor` is the per-index skip-probe rule from `pickIndexSkipRun`,
+unchanged. `pickIndexSkipRun` keeps its ranking for its own tests.
+`eligibleSkipRuns` lists every passing index, and `addOneParameterizedSkipPath`
+builds a path for each through `addParamSkipPathFor`. Each path keeps its own
+`maxSkipProbeRows` and lifetime guards. PG 18 builds the skip array into each
+index's own path (`build_index_paths`; `btcostestimate`'s `num_sa_scans`,
+`./postgres/src/backend/utils/adt/selfuncs.c:7444`).
+
+**Test.** `TestParameterizedSkipPathsCostEveryEligibleIndex`: two indexes skip
+one column and bind `l_suppkey`, and the smaller one must win on cost. The old
+single pick builds only the large one, at 66.52.
+
+**Measured** against the M0146-0178 baselines (`analysis/m0146/m0146-0197/skip/`):
+plan text byte-identical on the reloaded TPC-H corpus (15/22) and on SF0.25
+(80/99), and the fire-set SF1 A/B found no changed query. Inert today.
+
 ## Residual
 
-The skip-scan arm (`addOneParameterizedSkipPath` → `pickIndexSkipRun`) still
-builds one skip path, on one index. PG 18 builds a path per index there too
-(the skip array is part of each index's own path, `btcostestimate`). Resume
-point: iterate the skip-eligible indexes the same way.
+The legacy `tryBuildNLI` rewrite (`nl_index_join.go`) still picks one index
+through `pickIndexCoveringLeadingPrefix`. It is a pre-search rewrite, not a path
+producer.

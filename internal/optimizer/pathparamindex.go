@@ -565,10 +565,20 @@ const maxSkipProbeLifetimeRows = 5e8
 // executor still skips at run time), and a cumulative estimate beyond
 // `index->pages` reverts the same way (`index->pages < num_sa_scans`).
 func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, innerToOuter, innerExprs map[string]Expr, bound []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
-	idx, skip, run := pickIndexSkipRun(cat, tbl, innerToOuter)
-	if idx == nil {
-		return false
+	// M0146-0197: a skip path for every eligible index, as PG 18 builds the
+	// skip array into each index's own path; add_path keeps the cheapest.
+	added := false
+	for _, c := range eligibleSkipRuns(cat, tbl, innerToOuter) {
+		if s.addParamSkipPathFor(rel, tbl, cat, c.idx, c.skip, c.run, innerExprs, bound, req, relPages, relTuples, totalPages) {
+			added = true
+		}
 	}
+	return added
+}
+
+// addParamSkipPathFor builds the parameterised skip-scan path on one index —
+// the body addOneParameterizedSkipPath runs per eligible index.
+func (s *searchCtx) addParamSkipPathFor(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, idx *catalog.Index, skip, run int, innerExprs map[string]Expr, bound []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
 	clauses := indexSkipClauses(idx, bound, skip, run)
 	if len(clauses) == 0 {
 		return false
@@ -687,43 +697,69 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 func pickIndexSkipRun(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, int, int) {
 	var best *catalog.Index
 	bestSkip, bestRun := 0, 0
-	for _, idx := range cat.IndexesOnTable(tbl) {
-		if !isBTreeIndex(idx) || idx.HasPredicate || len(idx.Columns) < 2 {
-			continue
-		}
-		// The first bound position — 0 is the prefix picker's domain.
-		s := -1
-		for pos, col := range idx.Columns {
-			if _, ok := innerToOuter[col]; ok {
-				s = pos
-				break
-			}
-		}
-		if s <= 0 {
-			continue
-		}
-		// Contiguous bound run from s.
-		run := 0
-		for pos := s; pos < len(idx.Columns); pos++ {
-			if _, ok := innerToOuter[idx.Columns[pos]]; !ok {
-				break
-			}
-			run++
-		}
-		ok := true
-		for i := 0; i < s && ok; i++ {
-			if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
-				ok = false
-			}
-		}
-		if !ok || !indexSkipNullSafe(tbl, idx, s, run) {
-			continue
-		}
-		if best == nil || run > bestRun || (run == bestRun && s < bestSkip) {
-			best, bestSkip, bestRun = idx, s, run
+	for _, c := range eligibleSkipRuns(cat, tbl, innerToOuter) {
+		if best == nil || c.run > bestRun || (c.run == bestRun && c.skip < bestSkip) {
+			best, bestSkip, bestRun = c.idx, c.skip, c.run
 		}
 	}
 	return best, bestSkip, bestRun
+}
+
+// skipRunCandidate is one index's skip-scan probe shape: its first `skip` key
+// columns are enumerated and the next `run` are bound.
+type skipRunCandidate struct {
+	idx       *catalog.Index
+	skip, run int
+}
+
+// eligibleSkipRuns lists every index on tbl that admits a skip-scan probe
+// under innerToOuter, in IndexesOnTable order — PG 18 builds the skip array
+// into each index's own path (build_index_paths, btcostestimate's
+// num_sa_scans), so each eligible index gets a path and add_path picks
+// (M0146-0197). pickIndexSkipRun keeps the single-index ranking.
+func eligibleSkipRuns(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) []skipRunCandidate {
+	var out []skipRunCandidate
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if skip, run, ok := skipRunFor(tbl, idx, innerToOuter); ok {
+			out = append(out, skipRunCandidate{idx: idx, skip: skip, run: run})
+		}
+	}
+	return out
+}
+
+// skipRunFor applies the skip-probe eligibility rules documented on
+// pickIndexSkipRun to one index.
+func skipRunFor(tbl *catalog.Table, idx *catalog.Index, innerToOuter map[string]Expr) (skip, run int, ok bool) {
+	if !isBTreeIndex(idx) || idx.HasPredicate || len(idx.Columns) < 2 {
+		return 0, 0, false
+	}
+	// The first bound position — 0 is the prefix picker's domain.
+	s := -1
+	for pos, col := range idx.Columns {
+		if _, bound := innerToOuter[col]; bound {
+			s = pos
+			break
+		}
+	}
+	if s <= 0 {
+		return 0, 0, false
+	}
+	// Contiguous bound run from s.
+	for pos := s; pos < len(idx.Columns); pos++ {
+		if _, bound := innerToOuter[idx.Columns[pos]]; !bound {
+			break
+		}
+		run++
+	}
+	for i := 0; i < s; i++ {
+		if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
+			return 0, 0, false
+		}
+	}
+	if !indexSkipNullSafe(tbl, idx, s, run) {
+		return 0, 0, false
+	}
+	return s, run, true
 }
 
 // indexSkipNullSafe is `indexUnboundKeysNotNull` generalised to a bound run

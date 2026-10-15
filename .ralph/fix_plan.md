@@ -3301,7 +3301,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
+- [x] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
   2026\-10\-15 by M0146\-0195\)\. `addOneParameterizedIndexPath` \(`pathparamindex\.go`\) builds one path per
   parameterisation from `pickIndexCoveringLeadingPrefix` \(`nl\_index\_join\.go`: most bound columns, ties → first
   index by name\)\. PG's `build\_index\_paths` \(indxpath\.c\) builds a path for each usable index and `add\_path` keeps
@@ -3324,6 +3324,14 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
       PASS=99, fire set PASS\.
     - Movement: none — plans byte\-identical on both corpora\.
     - Remaining: the skip\-scan arm \(`pickIndexSkipRun`\) still builds one skip path on one index\.
+  - **2026\-10\-16 skip\-scan half landed — task CLOSED\.** `skipRunFor` \(rule unchanged\), `eligibleSkipRuns`,
+    `addParamSkipPathFor`: a skip path per eligible index, each with its own row/lifetime guards\. Test
+    `TestParameterizedSkipPathsCostEveryEligibleIndex` \(old pick: only the large index, 66\.52\)\.
+    - Captures vs the M0146\-0178 baselines \(`analysis/m0146/m0146\-0197/skip/`\): plan text byte\-identical on TPC-H
+      \(15/22\) and SF0\.25 \(80/99\); fire\-set SF1 A/B no changed query\.
+    - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), sf025 PASS=99, fire set PASS\.
+    - Residual \(ledger\): the legacy `tryBuildNLI` rewrite keeps a single pick\.
+Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's corpora)
 - [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
