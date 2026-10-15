@@ -3303,6 +3303,28 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0207 — TPC-H Q2: PG hash\-joins on `\(SubPlan 1\) = partsupp\.ps\_supplycost` as a second hash key with `part` outer; goopg keeps the SubPlan equality as a Join Filter and hashes `part` \(parameterisation\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016h/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census `routing\-20261016g`, still fresh at 0d1c2d879; SF1 Q68 was re\-routed by M0146\-0204\. Four categories tie
+    at 1 \(parameterisation TPC-H Q2, aggregation SF1 Q45, sort\-strategy SF1 Q18, qual\-placement SF1 Q54\); the
+    differ's category order puts parameterisation first\. Verdict SHAPE\-DIFF, first divergence at depth 1, the
+    top Hash Join under the Sort\.
+  - PG: `Hash Cond: \(part\.p\_partkey = partsupp\.ps\_partkey\) AND \(\(SubPlan 1\) = partsupp\.ps\_supplycost\)`,
+    outer `Gather` over `part` \(779 rows\), and the 160000\-row `nation ⋈ region ⋈ supplier ⋈ partsupp` hashed;
+    48872\.73\. goopg: `Hash Cond: \(partsupp\.ps\_partkey = part\.p\_partkey\)` plus `Join Filter: \(ps\_supplycost =
+    \(SubPlan 1\)\)`, with `part` hashed; 27264\.24\. The join tree below and the SubPlan body otherwise match\.
+  - Mechanism: SubPlan 1's only outer reference is `part\.p\_partkey`, so pull\_varnos gives the SubPlan relids \{part\}\.
+    The equality is then a hashjoinable join clause \{part\} vs \{partsupp\} \(`check\_hashjoinable`, initsplan\.c:3833\)\.
+    `final\_cost\_hashjoin` charges `hash\_qual\_cost\.per\_tuple`, SubPlan included, per outer row \(costsize\.c:4496\),
+    so `part`\-outer wins\. This is the join\-clause twin of M0146\-0203, which landed the restriction case\.
+  - First step: DP trace of Q2 \(audit arm `\-queries 2`\)\. Check whether the top join's clause list classifies
+    `ps\_supplycost = \(SubPlan 1\)` as a join clause with relids \{part, partsupp\} and whether it is hashjoinable
+    there\. Then check that hash\-path generation \(`hashclauses`\) admits it and that the hash qual cost charges the
+    SubPlan's per\-tuple cost per outer row\. Instrument `addPath` for the `part`\-outer two\-key candidate\.
+  - Expected instrument: TPC-H PLAN\-PARITY match 19 → 20 \(Q2\); CATEGORIES\-EXCL\-MATCH parameterisation down; TPC\-DS
+    SF0\.25 / SF1 byte\-identical or improved \(SubPlan hash keys may recur there\)\.
 - [ ] **M0146-0205 — WRONG RESULTS: COPY FROM inside an explicit transaction block survives ROLLBACK** \(filed
   2026\-10\-16 by M0146\-0204; S2\)\. On a fresh goopg server at `7010eab30`, `CREATE TABLE c5\(\.\.\.\); BEGIN; \\copy c5 FROM
   file \(4000 rows\); ROLLBACK; SELECT count\(\*\) FROM c5` returns 4000\. An inline `COPY c5 FROM STDIN` of 1 row in a second
