@@ -2884,6 +2884,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     captures of that commit's tree. The first\-divergence records in all three corpora are byte\-identical to
     `routing\-20261016l` \(20/22, 84/99, 73/99\)\. No task is filed. The open items\-0\-9 tasks and their gates are unchanged
     from the `08ea8482e` note above\.
+  - S9 re\-check 2026\-10\-16 — **exhausted at `2be3922a4`** \(M0122\-0012 slice 3 changed internal/executor\)\.
+    Census `routing\-20261016n` uses a fresh TPC\-H capture plus the fire\-set\-s3 candidate captures\. The records are
+    byte\-identical to `routing\-20261016m` \(20/22, 84/99, 73/99\)\. No task is filed; the gates are unchanged\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
