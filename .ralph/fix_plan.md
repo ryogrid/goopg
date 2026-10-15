@@ -1099,6 +1099,41 @@ OWNER DECISIONS 2026-10-15 (delegated; resolves the owner's direction
   actionable slice of their own — a `[ ]` channel root must not by
   itself keep items 0-9 "live" and starve the replenishment pass.
 
+OWNER DECISIONS 2026-10-15 (b) — TPC-H corpus realignment (delegated;
+resolves the owner's delegation "TPC-H corpus mismatch is a structural
+cap — judgement and execution delegated"):
+
+- **Realign executed:** the `:65433` bench corpus was replaced
+  row-for-row with the PG `:65432` reference corpus —
+  `pg_dump --data-only --inserts --rows-per-insert` (8 tables,
+  lineitem=5,998,835 / orders=1,500,000), loaded as batched INSERTs on
+  a clean-HEAD binary (`tmp/goopg-tpch-bin`, sha256 bc4d6b6e…, built at
+  285df1201; COPY was rejected as unsafe at this HEAD — standalone COPY
+  contexts carry no per-database catalog resolution, M0122-0015a
+  class). All 8 row counts match PG; `relpages` now sits within ~0.5%
+  of PG on every table (e.g. lineitem 129214 vs 129346, supplier
+  225 = 225). Data preserved at
+  `bench/tpch/runtime_goopg/data.pre-realign-20261015` (delete when the
+  realign is judged stable); old binary at `goopg-bin.old-20260920`.
+- **Anchors re-pinned:** `bench/tpch/spotcheck_expected.env` (Q13
+  33→35; Q12=2 structural invariant held),
+  `ci/batch/tpch-row-anchors.csv` (dataset tag 20261015; Q3 11356 /
+  Q10 20486 / Q11 517 / Q13 35 / Q16 18166 / Q18 12 / Q21 421),
+  `bench/tpch/baseline-digests.txt` (full 22-query re-capture).
+- **Fresh TPC-H parity truth:** `routing-realign-20261015` captured
+  post-realign — **12/22 MATCH, 10 SHAPE-DIFF**. vs routing-20261014j:
+  Q10 resolved (MATCH); Q3/Q5/Q7 newly SHAPE-DIFF. The 14-match figure
+  was partly corpus-noise coincidence; the 10 remaining records are now
+  honest planner divergences on identical data and are S9-actionable.
+- **Runtime regression surfaced:** TPC-H Q5 executes its new SHAPE-DIFF
+  plan (scan-type divergence) past the 900s digest cap — PG runs it in
+  seconds. Recorded as a BOTH-ERROR pin in baseline-digests.txt and a
+  note on the Q5 anchor row; it is a parity task candidate, not a data
+  problem.
+- **Staleness:** `routing-20261014j`'s tpch arm is invalidated by the
+  corpus change (S9(1) corpus-freshness clause). The sf025/sf1 arms of
+  that artifact remain governed by their own corpus state.
+
 **UNFROZEN (owner decision 2026-09-20) — selectable again:** the M0142-0008
 chain (`M0142-0008a-3`, `M0142-0008c-1a`, `M0142-0008c-3d`,
 `M0142-0008c-4`) is unfrozen by direct owner instruction. P0-E7's private-lane
@@ -5503,7 +5538,7 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     `Writer\.Append\(payload\)` takes a pre\-encoded record; it is not PG\'s `XLogBeginInsert` / `XLogRegisterData` /
     `XLogInsert` protocol, so a rename alone would mislabel it\. Recommendation: close as won\'t\-do\.
 
-- [ ] **M0122-0010 — Concurrency: buffer pool & btree locking**.
+- [x] **M0122-0010 — Concurrency: buffer pool & btree locking**.
   - **Cross\-handle structural gate LANDED 2026\-09\-22 \(loop \#10\)** as
     `4beed2920`. Movement: none — a concurrency protocol; `PLAN-SHAPE same=99
     changed=0`. Design: `docs/design/0050-0099/0055-0002-btree-multi-writer-split-protocol.md` §4.1.
@@ -5626,6 +5661,37 @@ Movement: yes — regress alter_table 3702 -> 3701 diff lines
     - Movement: none\. Next: gap 5 — finish crash\-left incomplete splits on contact \(`\_bt\_moveright` for update,
       `\_bt\_stepright`\), rebuilding `finishSplit` on `getStackBuf` with the child held, then drop the last
       `lockStructural` caller and the stripe table\.
+  - **2026\-10\-15 slice 7 \(gap 5\) landed; no structural mutex remains — task CLOSED\.**
+    - `finishSplit` is `\_bt\_finish\_split`: left half latched, flag re\-checked, right half latched while the metapage
+      decides root vs not, then a new root or the parent re\-found by `getStackBuf`, child latched before parent\.
+    - Called on contact: insert descent \(`descendForInsert`, `\_bt\_moveright` forupdate\), `insertIntoBlock`'s
+      target and move\-right \(`\_bt\_stepright`\), `getStackBuf` \(`\_bt\_getstackbuf`\), vacuum's `latchParentOf`\.
+    - Deleted: `lockStructural`, `splitMu`, `sharedSplitMu`, `Pool\.BTreeStructuralLock` and its stripe test,
+      `createNewRoot`'s unlatched metapage fallback, `clearRootFlag`\.
+    - Bug fixed on the way: a parent split did not clear a HELD child's flag under its own record \(only the
+      re\-pinned branch did\); `\_bt\_split` clears it as block 3\.
+    - Tests: `TestFinishIncompleteSplitOnContact` \(leaf/internal/root; all fail with finishing disabled\),
+      `TestGetStackBufFinishesIncompleteSplit`, `TestIncompleteSplitsFinishedConcurrently` \(16 handles, every 10th
+      split abandoned\); stress 0/15, nbtree `\-race` x3; live 3 `kill \-9` cycles mid\-load, index = heap after each\.
+    - Backlog: 3 `unimplemented\_feat\.json` entries resolved \(crab\-walk, splitMu removal, Stage\-2 removal\); the
+      category's pin\-count race was already resolved and B\-tree access is in `make race\-gate`\.
+    - Residuals filed as M0122\-0010a \(ledger row 2026\-10\-15\)\. Movement: none \(PARITY N/A, concurrency\)\.
+- [ ] **M0122\-0010a — B\-tree concurrency residuals against PG's nbtree protocol** \(filed 2026\-10\-15 when
+  M0122\-0010 closed\)\. None loses data today; each is a fidelity gap in how goopg's lock\-coupled protocol differs
+  from upstream\.
+  - Fast root: the metapage's fast root always equals the true root; PG keeps `btm\_fastroot` below a chain of
+    single\-page levels \(`\_bt\_getroot`, `\_bt\_insertonpg`'s split\_only\_page, INSERT\_META\)\.
+  - Free list per handle: pages one handle's vacuum frees are reused only by that handle; PG records them in the FSM,
+    shared by every backend \(`\_bt\_allocbuf`, `RecordFreeIndexPage`\)\.
+  - Deletion latch scope: goopg holds parent \+ left \+ target \+ right for one page; PG's two phases hold target \+
+    parent \(`\_bt\_mark\_page\_halfdead`\), then left \+ target \+ right \(`\_bt\_unlink\_halfdead\_page`\)\.
+  - `\_bt\_rightsib\_halfdeadflag` is not ported \(goopg skips dead runs instead\)\.
+  - The split path releases the right half before the parent search; PG's `\_bt\_insert\_parent` releases `rbuf` only
+    after `\_bt\_getstackbuf` returns\.
+  Kind: impl
+  Parent: M0122\-0010
+  - Rank: below item 10 under the S7 carve\-out \(correctness/fidelity, no plan instrument\) unless the owner places it\.
+  - First step: the free list → FSM move \(the only residual with an observable cost: index bloat across backends\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.

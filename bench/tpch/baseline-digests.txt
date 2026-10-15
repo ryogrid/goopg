@@ -22,37 +22,41 @@
 # commit". For a change that may legitimately alter results, diff against PG
 # instead — both merge-join bugs in this bundle were invisible goopg-vs-goopg.
 #
-# Captured 2026-09-20 at commit f3c6f0e24 (post-2026-09-20-canonical-8-FK-reload
-# HEAD; supersedes the 2026-09-03 8dc298e92 capture, which predated that reload
-# and so drifted on 9 ROWS-DIFF + 14 VALUE-DIFF labels — load drift, not
-# regression. Q6 additionally shows a SCHEMA-DIFF vs the old capture
-# (colsig 8c6c14235b8e3d44 -> 2e0a9e7c16d79cc6, same value digests): a
-# column-naming change landed between 8dc298e92 and the reload, unrelated
-# to this task. Arm:
-# `scripts/tpch-acceptance-arm.sh headbase`, PGSHAPED=1,
-# GOOPG_ANALYZE_SEED=20260905, PER_Q=900, default work_mem, GOGC=off
-# GOMEMLIMIT=12GiB, fresh memory-capped server on a private :65433 clone.
-Q1: OK colsig=767ce848ef814ee2 ordered=e38bfacc9d316abf unordered=18c1859fd5adec78 rows=4
-Q2: OK colsig=98559dc0378d935e ordered=08d93c5bb42c01eb unordered=a7655104482ba6a1 rows=463
-Q3: OK colsig=83ee73dd50fba86d ordered=50129f891d4c0644 unordered=8fc842cfbf25b033 rows=11354
-Q4: OK colsig=ab046cf17754992f ordered=40d9cad761059c52 unordered=58bb211047b254d6 rows=5
-Q5: OK colsig=23ed6d41a314eb4e ordered=79ef53d2f80827c0 unordered=449b7aa46905797a rows=5
-Q6: OK colsig=2e0a9e7c16d79cc6 ordered=5e13ec8e1b6c349c unordered=5e13ec8e1b6c349c rows=1
-Q7: OK colsig=effb45ed4c5e2661 ordered=18017dde4c0b0c76 unordered=45a72546cd1663bd rows=4
-Q8: OK colsig=8acb7c80bbac36a7 ordered=3e576d2aed08fa92 unordered=bb72386ca8dda3d5 rows=2
-Q9: OK colsig=d0a60022db317dc9 ordered=374805d5eb08e1f4 unordered=3e7908d77785c3c2 rows=175
-Q10: OK colsig=82959e9b048aa541 ordered=dd58ea90becee585 unordered=d3c53c81e971c54f rows=20421
-Q11: OK colsig=a94b0078c4bc16ef ordered=03b9f68fda590815 unordered=bac517afe21a2005 rows=755
-Q12: OK colsig=8c6c14235b8e3d44 ordered=bcc105d712b03041 unordered=886d9dc9a48e5f0a rows=2
-Q13: OK colsig=9694103490f49d86 ordered=73e32825e21be7a1 unordered=4dd69a2f2fb638df rows=33
-Q14: OK colsig=ab278eb7d8e03030 ordered=8a6e87aa849588e1 unordered=8a6e87aa849588e1 rows=1
+# Captured 2026-10-15 at commit 285df1201 on the corpus-realigned :65433
+# cluster — the bench corpus was replaced row-for-row with the PG :65432
+# reference corpus (pg_dump --data-only --inserts, all 8 tables;
+# lineitem=5,998,835 / orders=1,500,000) so both engines plan over
+# identical rows. Supersedes the 2026-09-20 f3c6f0e24 capture: every
+# load-dependent digest shifted with the new corpus — load drift, not
+# regression. Arm: tpch-runner -digest directly against :65433,
+# GOOPG_ANALYZE_SEED=20260905, PER_Q=900, GOGC=100 GOMEMLIMIT=12GiB.
+#
+# Q5 is a BOTH-ERROR pin: on the realigned corpus goopg picks a plan
+# (SHAPE-DIFF vs PG — scan-type) that exceeds the 900s per-query cap;
+# PG runs it in seconds. The ERROR line is kept verbatim so -diff flags
+# any change in the failure signature instead of silently missing it.
+#
+Q1: OK colsig=767ce848ef814ee2 ordered=8ae7b8554c036cc9 unordered=d521408c80a7b1dc rows=4
+Q2: OK colsig=98559dc0378d935e ordered=68119d021ea76fe1 unordered=68acf0784df2e99b rows=469
+Q3: OK colsig=83ee73dd50fba86d ordered=2c100154bf30b2f7 unordered=ae8c1176187ba37a rows=11356
+Q4: OK colsig=ab046cf17754992f ordered=125424f8158de417 unordered=85f1831061d8e6c7 rows=5
+Q5: ERROR — pq: canceling statement due to user request (57014)
+Q6: OK colsig=2e0a9e7c16d79cc6 ordered=c552d666a2a257c5 unordered=c552d666a2a257c5 rows=1
+Q7: OK colsig=effb45ed4c5e2661 ordered=48e82c59c9a74c00 unordered=b525190f1a0e6989 rows=4
+Q8: OK colsig=8acb7c80bbac36a7 ordered=2945f1d24f72127c unordered=9469eb9d7a66357b rows=2
+Q9: OK colsig=d0a60022db317dc9 ordered=5c47cfebfd0d4155 unordered=983714af934573d5 rows=175
+Q10: OK colsig=82959e9b048aa541 ordered=85d09d886cb389ae unordered=f89624b7be1f4683 rows=20486
+Q11: OK colsig=a94b0078c4bc16ef ordered=63ba1d822b7cb22b unordered=1b36ccefc479c12f rows=517
+Q12: OK colsig=8c6c14235b8e3d44 ordered=10d92d9bf7a4f3fc unordered=693668b5e953da0f rows=2
+Q13: OK colsig=9694103490f49d86 ordered=4b05cc0d1230221c unordered=58bc604ea17d0516 rows=35
+Q14: OK colsig=ab278eb7d8e03030 ordered=83eeb44c59fd0003 unordered=83eeb44c59fd0003 rows=1
 Q15-CREATEVIEW: OK colsig=cbf29ce484222325 ordered=cbf29ce484222325 unordered=0000000000000000 rows=0
-Q15a-VIEWBODY: OK colsig=7a934e0bc02f9878 ordered=9bc202939713c9fe unordered=663cdcd3f13e426b rows=10000
-Q15b-MAIN: OK colsig=25d4fdb3731a5fa2 ordered=a8122b93d4c80bca unordered=a8122b93d4c80bca rows=1
-Q16: OK colsig=95a4c8de6e558c15 ordered=49024c2672c7f79d unordered=c1ef56e5641689bf rows=18215
-Q17: OK colsig=d54de0dda81daf86 ordered=cc357a70c6dd8785 unordered=cc357a70c6dd8785 rows=1
-Q18: OK colsig=1c632e3bcd2ea332 ordered=e8763f588596e979 unordered=01d41241e069451f rows=11
-Q19: OK colsig=2e0a9e7c16d79cc6 ordered=65284b5b81e345ce unordered=65284b5b81e345ce rows=1
-Q20: OK colsig=5cd9dcbdb8104bbb ordered=72f5a5a14ac0122a unordered=0e6ec33a562ff1f2 rows=101
-Q21: OK colsig=8877f45c5e0db592 ordered=a9a037de2c5773d8 unordered=8fe8611e5a8afd03 rows=412
-Q22: OK colsig=6d31a4f5ee00a4d0 ordered=dd90b7eaba7da14c unordered=9813c26e4303edc4 rows=7
+Q15a-VIEWBODY: OK colsig=7a934e0bc02f9878 ordered=56ed2368ccbdaad6 unordered=946be2b266fb7975 rows=10000
+Q15b-MAIN: OK colsig=25d4fdb3731a5fa2 ordered=681fe69f4787b1e6 unordered=681fe69f4787b1e6 rows=1
+Q16: OK colsig=95a4c8de6e558c15 ordered=c0c2a3f5786ff5fd unordered=06490406eb2a3904 rows=18166
+Q17: OK colsig=d54de0dda81daf86 ordered=2a963ee5f19a29d5 unordered=2a963ee5f19a29d5 rows=1
+Q18: OK colsig=1c632e3bcd2ea332 ordered=f7be792d4ad1d224 unordered=589854a6d9c67289 rows=12
+Q19: OK colsig=2e0a9e7c16d79cc6 ordered=3b0c5cba91516eaf unordered=3b0c5cba91516eaf rows=1
+Q20: OK colsig=5cd9dcbdb8104bbb ordered=2ed300534461e198 unordered=92483d987d1ec347 rows=92
+Q21: OK colsig=8877f45c5e0db592 ordered=bd4028a404e88a40 unordered=195896c93d346c50 rows=421
+Q22: OK colsig=6d31a4f5ee00a4d0 ordered=8d606c7fca82e9ed unordered=e1b00cd48f09d289 rows=7

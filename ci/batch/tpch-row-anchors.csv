@@ -1,13 +1,13 @@
 query,rows,kind,dataset,source
 Q1,4,structural,any,GROUP BY returnflag/linestatus = 4 groups on any loaded data
-Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations
+Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations; NOTE 2026-10-15: on the realigned corpus goopg's chosen plan (SHAPE-DIFF vs PG — scan-type) exceeds the 900s per-query cap, so the structural 5 is currently unreachable in gate time — tracked as a parity record, not a data problem
 Q9,175,structural,any,nation x year groups (25 x 7)
 Q12,2,structural,any,GROUP BY l_shipmode IN (MAIL;SHIP) = 2 rows (spotcheck invariant)
 Q22,7,structural,any,7 country-code groups
-Q13,33,pinned,20260920,bench/tpch/spotcheck_expected.env (re-pinned 2026-09-20 reload — first canonical-8-FK load; load-dependent — re-pin after every reload)
-Q3,11354,load-dependent,20260920,tpch-runner anchor pass on the 2026-09-20 HammerDB reload (canonical 8-FK schema; lineitem=6,001,726)
-Q10,20421,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
-Q11,755,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
-Q16,18215,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
-Q18,11,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload)
-Q21,412,load-dependent,20260920,tpch-runner anchor pass 2026-09-20 (8-FK reload); NOTE: Q21 completed in ~2.6s on the FK-bearing cluster — the earlier ~231s figure was the FK-less cluster's plan; GC caveat retained: at GOGC=off-style growth under GOMEMLIMIT=18GiB Q21 reached 19.8G RSS and drew a host-level OOM kill; GOGC=100 + GOMEMLIMIT=12GiB is the proven-safe envelope
+Q13,35,pinned,20261015,bench/tpch/spotcheck_expected.env (re-pinned 2026-10-15 corpus realign — :65433 now carries the PG :65432 row set, lineitem=5,998,835 / orders=1,500,000; re-pin after every reload)
+Q3,11356,load-dependent,20261015,tpch-runner -digest pass on the 2026-10-15 corpus realign (PG :65432 corpus; 8-FK schema retained)
+Q10,20486,load-dependent,20261015,tpch-runner -digest pass 2026-10-15 (realigned corpus)
+Q11,517,load-dependent,20261015,tpch-runner -digest pass 2026-10-15 (realigned corpus)
+Q16,18166,load-dependent,20261015,tpch-runner -digest pass 2026-10-15 (realigned corpus)
+Q18,12,load-dependent,20261015,tpch-runner -digest pass 2026-10-15 (realigned corpus)
+Q21,421,load-dependent,20261015,tpch-runner -digest pass 2026-10-15 (realigned corpus); GC caveat retained: at GOGC=off-style growth under GOMEMLIMIT=18GiB Q21 reached 19.8G RSS and drew a host-level OOM kill; GOGC=100 + GOMEMLIMIT=12GiB is the proven-safe envelope (this capture ran in that envelope, ~1.9s)
