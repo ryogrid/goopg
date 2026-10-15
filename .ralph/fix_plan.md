@@ -2829,6 +2829,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-14 — **exhausted at `7dfe93df3`** \(S6b\'s pending relation deletes changed internal/executor\)\.
     Census `routing\-20261014i` is a fresh capture of all three corpora\. The records are identical to
     `routing\-20261014h` \(81/99, 66/99, 14/22\)\. No task is filed\.
+  - S9 pass 2026\-10\-16 at `24ca1e37a` \(optimizer commits \+ TPC-H reload since 2026\-10\-15\) — **filed M0146\-0198**
+    \(join\-method, Q43\); `routing\-20261016/ROUTING\.md`\. Matches: TPC-H 15/22, SF0\.25 80/99, SF1 67/99\.
   - S9 pass 2026\-10\-15 at `a00fb8110` \(corpora changed: SF0\.25 reload, TPC\-H realign\) — **filed M0146\-0195**
     \(join\-method, 4 actionable\); `routing\-20261015/ROUTING\.md`\. Q56/Q60 routed to M0141\-S2b\-4e\.
   - S9 re\-check 2026\-10\-14 — **exhausted at `c3dcb0f5f`** \(S6c\'s abort\-time relation deletes changed
@@ -3301,6 +3303,22 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0198 — TPC-DS Q43: goopg nested-loops `date_dim` after `store_sales ⋈ store` where PG hash-joins `store` after `store_sales ⋈ date_dim` \(join-method\)**
+  \(filed 2026-10-16 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261016/ROUTING.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census: join\-method is the top actionable category \(3, tied with scan\-type, parameterisation and qual\-placement;
+    differ order breaks the tie\): SF0\.25 Q43, SF1 Q68, TPC-H Q18\. Verdict SHAPE\-DIFF\.
+  - SF0\.25 Q43 \(first divergence depth 6, under Sort\): goopg `Seq Scan on store` estimates 1 row under
+    `s\_gmt\_offset = \-5` where PG estimates 12; goopg joins `store\_sales ⋈ store` first \(18495 rows\) and nested\-loops
+    `date\_dim` \(88 rows out\); PG joins `store\_sales ⋈ date\_dim` first \(Parallel Hash Join, 1110 rows\), then hash\-joins
+    `store` \(1062 rows\)\.
+  - First step: compare the restriction selectivity of `s\_gmt\_offset = \-5` on `store` \(goopg 1 row vs PG 12 of 12\)
+    against PG's `eqsel` / `var\_eq\_const` \(selfuncs\.c\): pg\_stats for `store\.s\_gmt\_offset` on :65438 tpcds025 vs the
+    goopg SF0\.25 clone \(MCV list, n\_distinct, null\_frac\), and the numeric constant's comparison against the MCVs\.
+  - Other join\-method records, possibly other mechanisms: SF1 Q68; TPC-H Q18 \(PG hash\-joins a parallel\-scanned
+    `customer` last, goopg joins `customer` earlier with a serial scan\)\.
+  - Expected instrument: TPC-DS SF0\.25 PLAN\-PARITY match 80 → 81 \(Q43\); CATEGORIES\-EXCL\-MATCH join\-method down\.
 - [x] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
   2026\-10\-15 by M0146\-0195\)\. `addOneParameterizedIndexPath` \(`pathparamindex\.go`\) builds one path per
   parameterisation from `pickIndexCoveringLeadingPrefix` \(`nl\_index\_join\.go`: most bound columns, ties → first
