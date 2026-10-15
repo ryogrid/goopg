@@ -615,7 +615,20 @@ func correlatedScalarSublinkBinding(c Expr, spans []leafSpan, b int) int {
 			case *OuterColumnRef:
 				ok = false
 			case *SubqueryExpr:
-				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 ||
+				// M0146-0203: a SubPlan already lowered to PARAM_EXEC form
+				// (the kept-sublink rebase's Args/ParParam, pulledsublink.go)
+				// is admitted too. Its correlation travels in Args, which are
+				// same-scope expressions this walk visits and tableForCol has
+				// already attributed to binding b, and localizeExprToLeaf
+				// rebases them with the rest of the conjunct; the inner plan
+				// then reads parameters, not the host row. PG distributes the
+				// clause by the Vars of its testexpr and args (pull_varnos),
+				// so TPC-H Q20's `ps_availqty > (SubPlan 1)` filters partsupp.
+				// With the non-PG scalar decorrelation switched on
+				// (GOOPG_SCALAR_UNNEST) the clause stays above, where that
+				// pass reads it off the body's top qual holder.
+				if x.Plan == nil || len(x.Args) != len(x.ParParam) ||
+					(len(x.Args) > 0 && scalarUnnestOn.Load()) ||
 					planEscapesBy(x.Plan, 1, outside) {
 					ok = false
 				}

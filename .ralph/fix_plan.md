@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0203 — TPC-H Q20: goopg seq\-scans `supplier` at 100\.00 and applies `n\_name = 'CANADA'` on the Nested Loop over a Memoize'd `nation\_pk` probe, where PG filters `nation` and bitmap\-probes `supplier` \(qual\-placement\)**
+- [x] **M0146-0203 — TPC-H Q20: goopg seq\-scans `supplier` at 100\.00 and applies `n\_name = 'CANADA'` on the Nested Loop over a Memoize'd `nation\_pk` probe, where PG filters `nation` and bitmap\-probes `supplier` \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016f/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3318,6 +3318,13 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     restriction placement; compare with PG `cost\_seqscan` inputs for supplier\.
   - Other record, possibly another mechanism: SF1 Q54 \(Join Filters swapped between two nested\-loop levels\)\.
   - Expected instrument: TPC-H PLAN\-PARITY match 18 → 19 \(Q20\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
+  - Closed 2026\-10\-16: neither suspect — the search had priced PG's plan cheapest, but the seam declined it
+    \(`residual\-hits\-pad`\): `ps\_availqty > \(SubPlan 1\)`, already in PARAM\_EXEC form from the kept\-sublink rebase,
+    was refused as partsupp's leaf restriction and held above the root over padded semi\-RHS columns; the fallback
+    syntactic plan carried the 100\.00 supplier scan\. `correlatedScalarSublinkBinding` now admits Args/ParParam
+    SubPlans \(off under GOOPG\_SCALAR\_UNNEST\)\.
+    Design: `docs/design/0100\-0149/m0146\-0203\-param\-subplan\-leaf\-restriction\.md`\.
+  Movement: yes — TPCH match 18 → 19 \(Q20\); SF0\.25 84 and SF1 71 byte\-identical\.
 - [x] **M0146-0202 — TPC-H Q9: the FK `lineitem\_partsupp\_fk` join selectivity misses its EC\-matched `l\_suppkey` column, so the lineitem probe is estimated at 39 rows where PG has 116871 \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016e/ROUTING\.md`\)\.
   Kind: impl
