@@ -110,6 +110,32 @@ func splitJoinClauses(outer, inner RelSet, clauses []*restrictInfo) (keys, resid
 	return keys, residual
 }
 
+// mergeableKeys splits the hash-capable keys into the mergeclauses and the
+// rest: a SubPlan key (restrictInfo.subplanKey) joins the residual, because a
+// merge join would have to sort its inputs on an expression that runs a
+// SubPlan (M0146-0207). Without SubPlan keys it returns its inputs unchanged.
+func mergeableKeys(keys, residual []*restrictInfo) (mkeys, mres []*restrictInfo) {
+	n := 0
+	for _, ri := range keys {
+		if ri != nil && ri.subplanKey {
+			n++
+		}
+	}
+	if n == 0 {
+		return keys, residual
+	}
+	mkeys = make([]*restrictInfo, 0, len(keys)-n)
+	mres = make([]*restrictInfo, 0, len(residual)+n)
+	for _, ri := range keys {
+		if ri != nil && ri.subplanKey {
+			mres = append(mres, ri)
+		} else {
+			mkeys = append(mkeys, ri)
+		}
+	}
+	return mkeys, append(mres, residual...)
+}
+
 // isKeyableFor is `clause_sides_match_join` for one clause: the equality's two
 // operands must land on opposite sides of this join, in either order.
 //
@@ -481,7 +507,10 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		// lifted its SEMI/ANTI decline once the design doc's §5 trace-through
 		// confirmed the lowering/execution path is generic (see mergeDeclined's
 		// comment above for the citation).
-		if len(keys) > 0 {
+		// M0146-0207: a SubPlan key is a hash clause only; the merge arms
+		// evaluate it with the residual.
+		mkeys, mres := mergeableKeys(keys, residual)
+		if len(mkeys) > 0 {
 			if !mergeDeclined {
 				// extra->inner_unique (joinpath.c:152-179): false for SEMI
 				// and ANTI, true for a unique-ified inner, else whether the
@@ -507,7 +536,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
-				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 				// and arm 4 — so a merge over an already-ordered outer is offered
 				// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -515,14 +544,14 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// here; goopg's nested-loop halves (`addNestLoopPath` /
 				// `addNLIPaths` / `addPartialNestLoopPaths`) follow this block,
 				// still ahead of the hash arm (M0146-0005bk).
-				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
 				// (joinpath.c:2071-2097) beside the serial arm above — every
 				// already-ordered partial outer (the cheapest is almost never
 				// the ordered one) against the cheapest parallel-safe complete
 				// inner. First candidate per outer only; the truncation search
 				// is a follow-up the A/B can motivate.
-				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 			}
 		}
 		// The nested loop keys on nothing, so the key set rejoins the

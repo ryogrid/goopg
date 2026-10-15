@@ -60,7 +60,8 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	classes := make(map[int][]member)
 	next := s.clauses.nclasses
 	for _, ri := range s.clauses.all {
-		if ri == nil || !ri.isEquijoin || ri.leftKey == nil || ri.rightKey == nil {
+		// M0146-0207: a SubPlan key is never a mergeclause.
+		if ri == nil || !ri.isEquijoin || ri.subplanKey || ri.leftKey == nil || ri.rightKey == nil {
 			continue
 		}
 		id := ri.ecID

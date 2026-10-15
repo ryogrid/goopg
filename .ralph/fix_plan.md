@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0207 — TPC-H Q2: PG hash\-joins on `\(SubPlan 1\) = partsupp\.ps\_supplycost` as a second hash key with `part` outer; goopg keeps the SubPlan equality as a Join Filter and hashes `part` \(parameterisation\)**
+- [x] **M0146-0207 — TPC-H Q2: PG hash\-joins on `\(SubPlan 1\) = partsupp\.ps\_supplycost` as a second hash key with `part` outer; goopg keeps the SubPlan equality as a Join Filter and hashes `part` \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016h/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3325,6 +3325,21 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     SubPlan's per\-tuple cost per outer row\. Instrument `addPath` for the `part`\-outer two\-key candidate\.
   - Expected instrument: TPC-H PLAN\-PARITY match 19 → 20 \(Q2\); CATEGORIES\-EXCL\-MATCH parameterisation down; TPC\-DS
     SF0\.25 / SF1 byte\-identical or improved \(SubPlan hash keys may recur there\)\.
+  - Closed 2026\-10\-16\. goopg kept every sublink\-bearing equality as a residual \(`exprCarriesSublink`, M0146\-0012a\)\.
+    The SubPlan's cost then rode the few hash matches of an inner\-unique `part` build, so partsupp\-outer won
+    \(27264\.24\)\. A PG `\-DOPTIMIZER\_DEBUG` build keeps only the part\-outer HashPath \(47670\.17\) at the top
+    joinrel: PG prices the SubPlan inside `hash\_qual\_cost`, per outer row \(costsize\.c:4458/4475/4497\)\.
+    - The PARAM\_EXEC SubPlan equality is now a hash\-only key: `restrictInfo\.subplanKey`,
+      `paramExecScalarSublinksOnly`\.
+    - It is priced through `qualEvalOps`' sublink pricing\.
+    - It is published through `hashKeyExprSide`, which is `exprSideUnder` with `scopeIgnore`\.
+    - The merge arms and the parameterised\-index arms skip it \(ledgered\)\.
+    - Design: `docs/design/0100\-0149/m0146\-0207\-subplan\-equality\-hash\-key\.md`\.
+    - Q2's cost gap \(50310\.96 vs PG 48872\.73\) is the `part` estimate, 899 vs 779 \(ledgered\)\.
+    - Gates: units rc=0, tpch\-spotcheck PASS \(Q12=2, Q13=35\), tpch\-acceptance\-arm PASS \(24 MATCH, Q2 469 rows\),
+      tpcds\-sf025 PASS=99 \(plan shapes 99 same\), tpcds\-fireset PASS \(no changed plan on SF0\.25 or SF1\), ea\-ratchet
+      PASS\.
+  Movement: yes — TPC\-H PLAN\-PARITY match 19 → 20 \(Q2\); CATEGORIES\-EXCL\-MATCH join\-order 1 → 0, parameterisation 1 → 0; SF0\.25 84 and SF1 71 unchanged\.
 - [ ] **M0146-0205 — WRONG RESULTS: COPY FROM inside an explicit transaction block survives ROLLBACK** \(filed
   2026\-10\-16 by M0146\-0204; S2\)\. On a fresh goopg server at `7010eab30`, `CREATE TABLE c5\(\.\.\.\); BEGIN; \\copy c5 FROM
   file \(4000 rows\); ROLLBACK; SELECT count\(\*\) FROM c5` returns 4000\. An inline `COPY c5 FROM STDIN` of 1 row in a second

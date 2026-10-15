@@ -73,7 +73,8 @@ type paramIndexClause struct {
 func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramIndexClause {
 	var out []paramIndexClause
 	for _, ri := range clauses {
-		if ri == nil || !ri.isEquijoin {
+		// M0146-0207: a SubPlan key is a hash clause only.
+		if ri == nil || !ri.isEquijoin || ri.subplanKey {
 			continue
 		}
 		var innerKey, outerKey Expr

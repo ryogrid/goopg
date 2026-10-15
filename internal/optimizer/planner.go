@@ -8487,8 +8487,15 @@ const (
 // time) and the Merge* leaves (executor-ctx-driven) join the ParamRef
 // class instead — commit 2's row-independence argument.
 func exprSide(e Expr, leftWidth int) joinSide {
+	return exprSideUnder(e, leftWidth, scopeVeto)
+}
+
+// exprSideUnder is exprSide with the inner-plan policy as a parameter.
+// hashKeyExprSide passes scopeIgnore for an operand whose only sublinks are
+// PARAM_EXEC SubPlans, whose sides are those of their Args (M0146-0207).
+func exprSideUnder(e Expr, leftWidth int, pol scopePolicy) joinSide {
 	side := sideUnknown
-	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+	ok := walkExprRefs(e, pol, exprVisitor{
 		Visit: func(x Expr) bool {
 			switch ref := x.(type) {
 			case *ColumnRef:

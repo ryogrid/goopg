@@ -54,8 +54,8 @@ func forEachEqualityForHash(pred Expr, leftWidth int, fn func(l, r Expr) bool) {
 		if !ok || bin.Op != parser.OpEq {
 			continue
 		}
-		lSide := exprSide(bin.Left, leftWidth)
-		rSide := exprSide(bin.Right, leftWidth)
+		lSide := hashKeyExprSide(bin.Left, leftWidth)
+		rSide := hashKeyExprSide(bin.Right, leftWidth)
 		switch {
 		case lSide == sideLeft && rSide == sideRight:
 			if !fn(bin.Left, bin.Right) {
@@ -67,6 +67,19 @@ func forEachEqualityForHash(pred Expr, leftWidth int, fn func(l, r Expr) bool) {
 			}
 		}
 	}
+}
+
+// hashKeyExprSide is exprSide for a hash-key operand: a scalar SubPlan in
+// PARAM_EXEC form (paramExecScalarSublinksOnly) lies on the side its Args
+// come from, since its body reads only those parameters (M0146-0207). Every
+// other inner plan still makes the operand sideMixed. forEachEqualityForHash
+// and conjunctIsOneOfKeys both use it, so the published key list and the
+// residual that excludes it agree.
+func hashKeyExprSide(e Expr, leftWidth int) joinSide {
+	if paramExecScalarSublinksOnly(e) {
+		return exprSideUnder(e, leftWidth, scopeIgnore)
+	}
+	return exprSide(e, leftWidth)
 }
 
 // splitAllEqualitiesForHash returns EVERY usable equi-pair of pred, in
@@ -287,7 +300,7 @@ func conjunctIsOneOfKeys(c Expr, keys []JoinKeyPair, leftWidth int) bool {
 		return false
 	}
 	l, r := bin.Left, bin.Right
-	if exprSide(l, leftWidth) == sideRight && exprSide(r, leftWidth) == sideLeft {
+	if hashKeyExprSide(l, leftWidth) == sideRight && hashKeyExprSide(r, leftWidth) == sideLeft {
 		l, r = r, l
 	}
 	for _, k := range keys {

@@ -358,7 +358,8 @@ func (s *searchCtx) addPartialIndexPath(rel *RelOptInfo, tbl *catalog.Table, ser
 func mergeableColumnExprsFor(relids RelSet, clauses []*restrictInfo) map[string]Expr {
 	out := make(map[string]Expr)
 	for _, ri := range clauses {
-		if ri == nil || !ri.isEquijoin {
+		// M0146-0207: a SubPlan key is never a mergeclause.
+		if ri == nil || !ri.isEquijoin || ri.subplanKey {
 			continue
 		}
 		var key Expr

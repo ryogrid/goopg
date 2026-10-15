@@ -319,7 +319,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// unenumerated Expr type makes ExprResultType decline, never guess.
 	"expr_result_type.go:ExprResultType": failClosedTypeResolver,
 
-	"planner.go:exprSide":                        nonRecursiveClassifier,
+	"planner.go:exprSideUnder":                   nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
 	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
 	"planner.go:inferExprType":                   nonRecursiveClassifier,

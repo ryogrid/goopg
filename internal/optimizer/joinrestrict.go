@@ -68,6 +68,13 @@ type restrictInfo struct {
 	// why the split is stored as relsets rather than as two FROM positions.
 	isEquijoin bool
 
+	// subplanKey marks an equijoin with a PARAM_EXEC SubPlan in an operand
+	// (M0146-0207, TPC-H Q2's `ps_supplycost = (SubPlan 1)`). It is a hash
+	// clause only: the merge and parameterised-index arms skip it, because
+	// neither sorts on nor probes with an expression that evaluates a SubPlan
+	// (PG's check_mergejoinable would also admit it; ledgered).
+	subplanKey bool
+
 	// opLeftRelids / opRightRelids are the relids of a comparison clause's two
 	// operands whatever its operator — what `get_join_variables`
 	// (selfuncs.c) hands examine_variable for `neqjoinsel` and friends. For
@@ -253,9 +260,15 @@ func buildRestrictInfosExcluding(conjuncts []Expr, inferredCount int, spans []le
 			lr, lok := relidsOfExpr(bin.Left, spans)
 			rr, rok := relidsOfExpr(bin.Right, spans)
 			// M0146-0012a: a sublink-bearing equality is a residual, never a
-			// hash/merge key (exprCarriesSublink).
-			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) && !exprCarriesSublink(e) {
+			// hash/merge key (exprCarriesSublink) — unless every sublink is a
+			// SubPlan in PARAM_EXEC form, whose correlation is the operand's
+			// own Args (M0146-0207): check_hashjoinable (initsplan.c:3833)
+			// rejects only a volatile clause, and a SubPlan is not one.
+			subplanKey := exprCarriesSublink(e)
+			if lok && rok && lr != 0 && rr != 0 && !relsOverlap(lr, rr) &&
+				(!subplanKey || paramExecScalarSublinksOnly(e)) {
 				ri.isEquijoin = true
+				ri.subplanKey = subplanKey
 				ri.leftKey, ri.rightKey = bin.Left, bin.Right
 				ri.leftRelids, ri.rightRelids = lr, rr
 			}

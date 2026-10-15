@@ -184,7 +184,11 @@ func joinQualPerTuple(cp costParams, quals []*restrictInfo) float64 {
 
 // hashClausesPerTuple is final_cost_hashjoin's `hash_qual_cost.per_tuple`:
 // cost_qual_eval (qualEvalOps) over the hash clauses. A plain `a = b` costs
-// one cpu_operator_cost; an expression key adds its own operators.
+// one cpu_operator_cost; an expression key adds its own operators. A
+// PARAM_EXEC SubPlan key (M0146-0207) carries its per-call cost through
+// qualEvalOps' sublink pricing, as cost_qual_eval_walker adds a SubPlan's
+// `per_call_cost`; the bucket walk pays it per comparison, so in TPC-H Q2
+// probing with the few `part` rows is the cheap direction.
 func hashClausesPerTuple(cp costParams, keys []*restrictInfo) float64 {
 	per := 0.0
 	for _, ri := range keys {
