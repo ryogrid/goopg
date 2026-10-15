@@ -344,8 +344,16 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// was the only candidate left. It was never a costing difference. At
 	// every parameterisation where both produced a path, the index path was
 	// already cheaper and `addPath` already discarded the bitmap.
-	idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter)
-	if idx == nil {
+	//
+	// M0146-0197: every eligible index gets its own path, as
+	// `build_index_paths` builds one per index and `add_path` keeps the
+	// cheapest (indxpath.c). goopg used to keep a single index — the one
+	// binding the most columns, ties to the first by name — so two indexes
+	// on the same column were never chosen between by cost: TPC-H's bloated
+	// `order_customer_fkidx` (7.07 per probe) beat a compact twin (4.65) only
+	// because its name sorted first.
+	idxs := eligibleLeadingPrefixIndexes(cat, tbl, innerToOuter)
+	if len(idxs) == 0 {
 		// No index starts a leading-prefix probe under this
 		// parameterisation — the only remaining way an index can drive the
 		// scan is a btree skip (M0146-0005v): a bound column PAST the first
@@ -353,6 +361,20 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// time. Same `bound` population, different eligibility rule.
 		return s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
 	}
+	for _, idx := range idxs {
+		s.addParamIndexPathFor(rel, tbl, cat, idx, bound, innerExprs, req, relPages, relTuples, totalPages)
+	}
+	// The leading-prefix paths existing do not preclude a skip path on a
+	// DIFFERENT index — PG's `create_index_paths` offers every usable index
+	// and lets add_path decide, so offer the skip candidate too.
+	s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
+	return true
+}
+
+// addParamIndexPathFor builds the parameterised leading-prefix probe path on
+// one index idx — `build_index_paths` for a single IndexOptInfo — and offers it
+// to add_path.
+func (s *searchCtx) addParamIndexPathFor(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, idx *catalog.Index, bound []paramIndexClause, innerExprs map[string]Expr, req RelSet, relPages int64, relTuples, totalPages float64) {
 	// The probe binds a gapless leading prefix, which may be SHORTER than
 	// `bound`: a clause on a column past the first unbound one is not an index
 	// qual at all. Splitting the two selectivities is PG's own split — the
@@ -464,8 +486,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// the search's candidate order and `IndexScan.Keys[i]` binds
 		// `Index.Columns[i]` positionally, so the reordering is the difference
 		// between the right answer and a probe that compares the wrong pair of
-		// columns. Never nil here: `pickIndexCoveringLeadingPrefix` accepted
-		// `idx` only because every one of its columns is bound.
+		// columns. Never empty here: `leadingPrefixProbeKeys` accepted `idx`
+		// only because its leading column is bound.
 		IndexClauses:  clauses,
 		RequiredOuter: req,
 		Target:        tgt,
@@ -483,11 +505,6 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		producer = "indexonly.parameterised"
 	}
 	addPath(rel, path, producer)
-	// The leading-prefix path existing does not preclude a skip path on a
-	// DIFFERENT index — PG's `create_index_paths` offers every usable index
-	// and lets add_path decide, so offer the skip candidate too.
-	s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
-	return true
 }
 
 // maxSkipProbeRows bounds the per-execution output of a parameterized

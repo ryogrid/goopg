@@ -3298,6 +3298,17 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Expected instrument: TPC-H PLAN\-PARITY where an index choice is decided by cost \(Q5's lineitem probe: PG's
     `idx\_lineitem\_orderkey\_fkidx` vs goopg's `lineitem\_pk` skip probe\); CATEGORIES\-EXCL\-MATCH scan\-type\.
   - Optimizer change: landing needs the acceptance arm \(M0146\-0178 escalation\)\.
+  - **2026\-10\-15 leading\-prefix half landed** \(design `docs/design/0100\-0149/m0146\-0197\-param\-index\-path\-per\-index\.md`\)\.
+    - `addOneParameterizedIndexPath` builds a path per eligible index \(`eligibleLeadingPrefixIndexes`, rule
+      `leadingPrefixProbeKeys`\); `tryBuildNLI` keeps its single pick\. Test `TestParameterizedPathsCostEveryEligibleIndex`
+      \(old pick: only the large index, 58\.61\)\.
+    - Captures HEAD vs patched \(`analysis/m0146/m0146\-0197/`\): TPC-H 12 → 12, SF0\.25 80 → 80, plan text
+      byte\-identical on both; fire\-set SF1 A/B: no changed query\. Inert today \(C6\), active once two indexes cover
+      a probe\.
+    - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(23 MATCH \+ Q5 EXPECTED\-ERROR\), sf025
+      PASS=99, fire set PASS\.
+    - Movement: none — plans byte\-identical on both corpora\.
+    - Remaining: the skip\-scan arm \(`pickIndexSkipRun`\) still builds one skip path on one index\.
 - [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
