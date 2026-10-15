@@ -3303,6 +3303,25 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0208 — TPC\-DS Q45: goopg estimates the OR\-with\-hashed\-SubPlan Join Filter at 0\.75 where PG has 0\.52, so it plans a partial \(Finalize\) GroupAggregate where PG plans a plain GroupAggregate over Sort over Gather \(aggregation\-strategy\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016i/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 6c0d1a3ac: aggregation\-strategy is the top actionable category \(2: SF0\.25 Q45, SF1 Q45\); sort\-strategy
+    SF1 Q18 and qual\-placement SF1 Q54 have 1 each\. Verdict SHAPE\-DIFF, first divergence depth 1 under the Limit: PG
+    `GroupAggregate` \| goopg `Finalize GroupAggregate`\. SF0\.25 is the primary record \(S9\(3\)\)\. Its 2026\-10\-13 COSTTIE
+    waiver was measured on a different record \(sort\-strategy, depth 2\), so it no longer applies\.
+  - Estimate: the Nested Loop's Join Filter is `substr\(ca\_zip, 1, 5\) = ANY \('\{\.\.\.\}'\) OR ANY \(i\_item\_id =
+    \(hashed SubPlan 1\)\.col1\)`\. PG keeps 0\.53 of the rows at SF0\.25 \(95 → 50\) and 0\.524 at SF1 \(292 → 153\)\.
+    goopg keeps 0\.75 \(91 → 68\) and 0\.749 \(283 → 212\)\. The larger group input makes goopg's partial aggregation the
+    cheaper plan\.
+  - PG's mechanism: the hashed SubPlan arm has no estimator\. It falls to `boolvarsel`'s default of 0\.5
+    \(clausesel\.c:956\)\. The OR is s1 \+ s2 − s1·s2 = 0\.524, so the `substr\(\.\.\.\) = ANY` arm is about 0\.048 \(an
+    expression with no statistics; scalararraysel over 9 constants\)\.
+  - First step: compute goopg's selectivity of each OR arm for this clause \(clauseSelectivity / the join\-clause
+    path, joinselectivity\.go\), and find which arm departs from PG's 0\.048 / 0\.5\. Then port the PG arm\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 84 → 85 and SF1 71 → 72 \(Q45\); CATEGORIES\-EXCL\-MATCH
+    aggregation\-strategy down\.
 - [x] **M0146-0207 — TPC-H Q2: PG hash\-joins on `\(SubPlan 1\) = partsupp\.ps\_supplycost` as a second hash key with `part` outer; goopg keeps the SubPlan equality as a Join Filter and hashes `part` \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016h/ROUTING\.md`\)\.
   Kind: impl
