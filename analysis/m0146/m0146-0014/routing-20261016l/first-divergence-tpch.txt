@@ -1,0 +1,27 @@
+Q1 MATCH (no structural divergence)
+Q2 MATCH (no structural divergence)
+Q3 MATCH (no structural divergence)
+Q4 MATCH (no structural divergence)
+Q5 MATCH (no structural divergence)
+Q6 MATCH (no structural divergence)
+Q7 MATCH (no structural divergence)
+Q8 MATCH (no structural divergence)
+Q9 MATCH (no structural divergence)
+Q10 MATCH (no structural divergence)
+Q11 MATCH (no structural divergence)
+Q12 MATCH (no structural divergence)
+Q13 depth=4 [scan-type] under Hash Join: PG Index Only Scan customer_pk on customer | goopg Seq Scan on customer
+Q14 MATCH (no structural divergence)
+Q15a-VIEWBODY MATCH (no structural divergence)
+Q16 depth=5 [scan-type] under Hash Join: PG Parallel Index Only Scan partsupp_pk on partsupp | goopg Parallel Seq Scan on partsupp
+Q17 MATCH (no structural divergence)
+Q18 MATCH (no structural divergence)
+Q19 MATCH (no structural divergence)
+Q20 MATCH (no structural divergence)
+Q21 MATCH (no structural divergence)
+Q22 MATCH (no structural divergence)
+FIRST-DIVERGENCE: queries=22 divergent=2 match=20
+CATEGORY-ROLLUP: scan-type=2
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):
+    1  scan-type        under Hash Join        PG Index Only Scan customer_pk on customer goopg Seq Scan on customer         depth=4
+    1  scan-type        under Hash Join        PG Parallel Index Only Scan partsupp_pk on partsupp goopg Parallel Seq Scan on partsupp depth=5

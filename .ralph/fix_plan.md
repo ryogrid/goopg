@@ -2836,6 +2836,20 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-14 — **exhausted at `c3dcb0f5f`** \(S6c\'s abort\-time relation deletes changed
     internal/executor\)\. Census `routing\-20261014j` is a fresh capture of all three corpora\. The records are identical
     to `routing\-20261014i` \(81/99, 66/99, 14/22\)\. No task is filed\.
+  - S9 pass 2026\-10\-16 — **exhausted at `08ea8482e`**\. Census `routing\-20261016l` on the M0146\-0211 captures \(code equal to
+    `1d2a14aa6`\): TPC\-H 20/22, SF0\.25 84/99, SF1 73/99\. No actionable record\. SF0\.25 Q84 is M0146\-0019 \(M0146\-0212\);
+    SF1 Q68/Q18 are M0146\-0019/COSTTIE; scan\-type is M0146\-0019\. Open items\-0\-9 tasks and their gates:
+    - M0146\-0014\(channel\), M0146\-0042\(channel\)\.
+    - M0146\-0007\(below\-item\-10\), M0146\-0012b\(below\-item\-10\), M0146\-0067\(below\-item\-10\),
+      M0146\-0175\(below\-item\-10\)\.
+    - M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0196/0206\(below\-item\-10\)\.
+    - M0146\-0205\(owner\-placement S2\)\.
+    - M0146\-0178\(owner\-close RELPAGES\)\.
+    - M0141\-S2b\-3b\(below\-item\-10\), M0141\-S2b\-4e\(below\-item\-10\), M0141\-S2b\-4\(blocked\-on M0141\-S2b\-4e\),
+      M0141\-S7\-exec\-d\(below\-item\-10\)\.
+    - M0141\-S3/S4/S5/S6\(owner\-close superseded by M0146\-0003 \[x\]\)\.
+    - M0142\-0008a\-3/0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\.
+    - The largest parity lever left is the owner corpus VACUUM \(M0146\-0019\): TPC\-H Q13/Q16, SF0\.25 Q23/Q84, SF1 Q68/Q18\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
