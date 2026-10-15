@@ -1084,6 +1084,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       pgbench smoke.
     - No ledger row: performance infrastructure, not a PostgreSQL semantic
       omission \(the doc states this\).
+  - **Scan\-qual hot\-path guards LANDED 2026\-10\-16 \(loop \#36\)**.
+    Movement: none — perf only. The S3 instrument is value/plan identity:
+    sf025 `PASS=99 PLAN-SHAPE same=99`, fire\-set `fires=none` \(SF0.25 84,
+    SF1 73\), and ea\-ratchet 1→1. Same design doc, "Slice 2".
+    - Profile of a filtered SF1 `store_sales` scan: `evalQual` ~44%,
+      `decodeRowRangeInfo` ~41%. The `evalFastExpr` BinaryOp arm now tests the
+      concat/bpchar helpers' own preconditions before calling them; the numeric
+      special\-spelling check gets an exact ASCII first\-byte gate
+      \(`TestNumericSpecialSpellingGateIsExact`\).
+    - Measured: the scan went from ~1970 ms to ~1590 ms. TPC\-H acceptance arm:
+      24 MATCH, 40.28 s → 39.73 s.
+    - `unimplemented_feat.json` M0076\-0002 \(filterOp batch wiring\)
+      re\-verified and marked resolved by `d6e42a7f7`. The SeqScanOp batch
+      entry stays open; it is the next M0122\-0012 slice and targets
+      `decodeRowRangeInfo`.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

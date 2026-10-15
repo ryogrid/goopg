@@ -177,3 +177,36 @@ its consumer must either carry row identity in the slot all the way to the
 consumer (the resjunk-ctid route) or be switched off under a `currentTID`
 consumer by the same walker. Reading ahead is a semantic change, not only a
 performance one.
+
+## Slice 2 (2026-10-16): scan-qual hot-path guards — measured, value-neutral
+
+A CPU profile of a filtered TPC-DS SF1 `store_sales` seq scan (numeric/integer
+range quals; private clone, capped server) put about 44 % in `evalQual` and
+about 41 % in `decodeRowRangeInfo`. `evalFastExpr` was 27 % flat. Two pieces
+of that time paid for checks that never succeed on such a qual:
+
+- **`evalFastExpr` BinaryOp arm (exprnode.go).** `concatOperandsAsText` and
+  `comparisonOperandsAsBpchar` were called on every binary operator, and each
+  copied four Datums before returning its operands unchanged. Their own
+  preconditions (`op == OpConcat`; a bpchar-typed side, `lbp > 0 || rbp > 0`)
+  are now tested at the call site, so semantics are identical. This was about
+  9 % of the scan.
+- **`numericPayloadIsSpecialSpelling` (numeric_storage.go).** It ran
+  `bytes.TrimSpace` before rejecting an ordinary digit string. A first-byte gate
+  now rejects any ASCII byte that is neither whitespace nor a spelling's
+  initial. Non-ASCII and whitespace bytes take the full path, so the answer is
+  exactly the trimmed comparison's. Pinned by
+  `TestNumericSpecialSpellingGateIsExact` against the reference
+  TrimSpace+EqualFold rule, which covers Unicode whitespace and every 1–2 byte
+  payload. This was about 3 %.
+
+Measured on the same clone and query with server age held constant: about
+1970 ms before and about 1590 ms after (median of the A/B). TPC-H acceptance arm:
+values identical (24 MATCH), total 40.28 s → 39.73 s, Q6 0.77 s → 0.56 s
+(`analysis/m0122/m0122-0012/accept`). Plans did not move: sf025
+`PLAN-SHAPE same=99`, and fire-set A/B `fires=none` on both TPC-DS corpora.
+
+The `decodeRowRangeInfo` share is the scan-resident batch successor's target.
+It is still open as the SeqScanOp predicate-batch entry in
+`unimplemented_feat.json`. The filterOp wiring entry (M0076-0002) is resolved
+by slice 1 (`d6e42a7f7`).

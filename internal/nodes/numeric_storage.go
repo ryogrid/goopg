@@ -143,6 +143,19 @@ var numericSpecialSpellings = [][]byte{
 // step copies the payload, which is what made the original expensive on
 // NumericData bodies (arbitrary binary sent through strings.Map).
 func numericPayloadIsSpecialSpelling(payload []byte) bool {
+	// M0122-0012: an ASCII first byte that is neither whitespace nor a
+	// spelling's initial stays first after trimming, so it rejects the
+	// payload before bytes.TrimSpace scans both ends (about 3% of a
+	// filtered numeric scan). Non-ASCII and whitespace bytes take the full
+	// path, so the answer is exactly the trimmed comparison's.
+	if len(payload) > 0 {
+		switch b := payload[0]; {
+		case b == 'n' || b == 'N' || b == 'i' || b == 'I' || b == '+' || b == '-':
+		case b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r':
+		case b < 0x80:
+			return false
+		}
+	}
 	t := bytes.TrimSpace(payload)
 	// "inf" is the shortest spelling, "-infinity" the longest; anything
 	// outside that band cannot match and skips the compares entirely.

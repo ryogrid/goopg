@@ -1642,7 +1642,7 @@
    "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
    "task_id": "M0076-0002",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "only the wiring into filterOp is the deferred piece"
    ],
@@ -1657,7 +1657,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed."
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed. RESOLVED 2026-10-16 (M0122-0012): re-verified at HEAD 67de73bed — d6e42a7f7 wired the batch path into filterOp (operators.go:568-667, batchEnabled/batchFilterEligible, disableFilterReadAhead under currentTID consumers, ffe1d020f); design docs/design/0100-0149/0122-0012-vector-filter-pipeline-recon.md. The scan-resident successor (SeqScanOp batch wiring) stays open as its own entry."
   },
   {
    "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
