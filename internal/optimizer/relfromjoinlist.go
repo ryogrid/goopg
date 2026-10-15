@@ -636,13 +636,18 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
+	// M0146-0200: an ANTI join's qual is never a class member (it is
+	// outerjoin-delayed in PG's distribute_qual_to_rels), so its RHS's
+	// clauses stay out of the equivalence classes.
+	s.clauses = buildRestrictInfosExcluding(prob.conjuncts, 0, itemSpans, antiRighthands(sjis))
 	// M0146-0022: one clause per equivalence class at an inner join, only
 	// where no special join can null-extend a class member. M0146-0128: a
 	// SEMI join null-extends nothing (PG's distribute_qual_to_rels makes its
 	// qual an ordinary class member), so a problem whose special joins are
-	// all SEMI reduces too.
-	s.clauses.ecReduce = onlySemiJoins(sjis)
+	// all SEMI reduces too. M0146-0200: nor does an ANTI join — its RHS is
+	// never visible above it and, with its qual kept out of the classes, is
+	// never a class member.
+	s.clauses.ecReduce = onlySemiOrAntiJoins(sjis)
 	s.orClauseSelDivisor = prob.orClauseSelDivisor
 	// M0146-0127: a clause derived through a semijoin's qual reads the RHS's
 	// columns, which exist only where the RHS is a whole join input.
@@ -833,6 +838,28 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 
 // onlySemiJoins reports whether every special join is a SEMI join — none can
 // null-extend an equivalence-class member (M0146-0128).
+// onlySemiOrAntiJoins reports whether every special join is SEMI or ANTI —
+// none of them null-extends a relation visible above it (M0146-0200).
+func onlySemiOrAntiJoins(sjis []*SpecialJoinInfo) bool {
+	for _, sj := range sjis {
+		if sj == nil || (sj.Jointype != parser.JoinSemi && sj.Jointype != parser.JoinAnti) {
+			return false
+		}
+	}
+	return true
+}
+
+// antiRighthands is the union of the ANTI joins' syntactic right-hand sides.
+func antiRighthands(sjis []*SpecialJoinInfo) RelSet {
+	var r RelSet
+	for _, sj := range sjis {
+		if sj != nil && sj.Jointype == parser.JoinAnti {
+			r |= sj.SynRighthand
+		}
+	}
+	return r
+}
+
 func onlySemiJoins(sjis []*SpecialJoinInfo) bool {
 	for _, sj := range sjis {
 		if sj == nil || sj.Jointype != parser.JoinSemi {

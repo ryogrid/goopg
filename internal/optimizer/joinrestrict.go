@@ -198,6 +198,18 @@ func relsSubset(sub, super RelSet) bool { return sub&^super == 0 }
 // inside the leaf nodes P5.1 wrapped, so admitting them here would let P5.6
 // charge their selectivity a second time.
 func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *restrictInfoList {
+	return buildRestrictInfosExcluding(conjuncts, inferredCount, spans, 0)
+}
+
+// buildRestrictInfosExcluding is buildRestrictInfos with `noEC` naming the
+// relations whose clauses are never equivalence-class sources: the RHS of an
+// ANTI join (M0146-0200). PG's distribute_qual_to_rels hands an outer join's
+// ON clause to process_equivalence only when it is not outerjoin-delayed, and
+// an ANTI join's qual is always delayed — TPC-H Q21's `l3.l_orderkey =
+// l1.l_orderkey` is a plain join clause, not a member of {o_orderkey,
+// l1.l_orderkey, l2.l_orderkey}. Nothing outside an ANTI join can name its
+// RHS, so every clause touching the RHS is that join's own qual.
+func buildRestrictInfosExcluding(conjuncts []Expr, inferredCount int, spans []leafSpan, noEC RelSet) *restrictInfoList {
 	l := &restrictInfoList{}
 
 	// explicitEnd mirrors buildJoinGraph's split: conjuncts at or after it are
@@ -251,7 +263,7 @@ func buildRestrictInfos(conjuncts []Expr, inferredCount int, spans []leafSpan) *
 		l.all = append(l.all, ri)
 
 		var key *columnIdent
-		if li, rid, isECEq := ecEqualityIdents(e); isECEq && ri.isEquijoin {
+		if li, rid, isECEq := ecEqualityIdents(e); isECEq && ri.isEquijoin && !relsOverlap(relids, noEC) {
 			ec.union(li, rid)
 			l.ecPairs[orderedPair(li, rid)] = true
 			i, lin := orderOf[li]
@@ -410,6 +422,13 @@ func (l *restrictInfoList) hasNoJoinClauseAtAll(rel *RelOptInfo) bool {
 // applied at the lowest level that can evaluate it (03 §5.4) and evaluating a
 // clause whose third relation is not present is not possible.
 func (l *restrictInfoList) clausesFor(outer, inner RelSet) []*restrictInfo {
+	return dropRedundantSemiDerived(l.clausesForAll(outer, inner))
+}
+
+// clausesForAll is clausesFor before dropRedundantSemiDerived: every clause
+// applicable at this split, semijoin-derived ones included, for the
+// reduction that picks one per class by member order.
+func (l *restrictInfoList) clausesForAll(outer, inner RelSet) []*restrictInfo {
 	if l == nil || outer == 0 || inner == 0 || relsOverlap(outer, inner) {
 		return nil
 	}
@@ -427,7 +446,7 @@ func (l *restrictInfoList) clausesFor(outer, inner RelSet) []*restrictInfo {
 		}
 		out = append(out, ri)
 	}
-	return dropRedundantSemiDerived(out)
+	return out
 }
 
 // dropRedundantSemiDerived keeps a semijoin-derived clause (M0146-0127) only
@@ -481,13 +500,34 @@ func dropRedundantSemiDerived(ris []*restrictInfo) []*restrictInfo {
 // per-input scans see duplicates). M0128-P1.3.
 func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo *SpecialJoinInfo) []*restrictInfo {
 	// Core set: clauses computable here that touch both sides.
-	base := l.clausesFor(outer, inner)
-	if sjinfo == nil {
-		// inner join — clausesFor, with one clause per equivalence class
+	if sjinfo == nil || sjinfo.Jointype == parser.JoinSemi {
+		// An inner join — and a SEMI join, whose qual is an ordinary class
+		// member (M0146-0200): build_joinrel_restrictlist takes
+		// generate_join_implied_equalities' one clause per class for every
+		// join type. The class's chosen clause may be a semijoin-derived one
+		// (TPC-H Q21's `orders.o_orderkey = l2.l_orderkey`, its first outer
+		// member against the RHS), so the reduction runs before
+		// dropRedundantSemiDerived, which then only removes a derived clause
+		// the reduction left beside a written one.
+		base := l.clausesForAll(outer, inner)
 		if l != nil {
-			return l.reduceEquivClassJoinClauses(outer, inner, base)
+			base = l.reduceEquivClassJoinClauses(outer, inner, base)
 		}
-		return base
+		base = dropRedundantSemiDerived(base)
+		if sjinfo == nil {
+			return base
+		}
+		return dedupRestrictInfoPtrs(append(base, l.nullableSideFilters(outer, inner, sjinfo)...))
+	}
+	base := l.clausesFor(outer, inner)
+	return dedupRestrictInfoPtrs(append(base, l.nullableSideFilters(outer, inner, sjinfo)...))
+}
+
+// nullableSideFilters is buildJoinRelRestrictList's outer-join half: the
+// clauses computable at this join that reference only the nullable side.
+func (l *restrictInfoList) nullableSideFilters(outer, inner RelSet, sjinfo *SpecialJoinInfo) []*restrictInfo {
+	if l == nil {
+		return nil
 	}
 
 	// For outer joins, also admit clauses on the nullable side as filter
@@ -509,8 +549,7 @@ func (l *restrictInfoList) buildJoinRelRestrictList(outer, inner RelSet, sjinfo 
 			extra = append(extra, ri)
 		}
 	}
-
-	return dedupRestrictInfoPtrs(append(base, extra...))
+	return extra
 }
 
 // reduceEquivClassJoinClauses is `generate_join_implied_equalities_normal`

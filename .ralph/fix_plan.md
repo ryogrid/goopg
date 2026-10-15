@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0200 — TPC-H Q21: PG keeps the EC\-derived `orders\.o\_orderkey = l2\.l\_orderkey` as the semi join's Join Filter over a parameterised `l2` probe; goopg drops it \(qual\-placement\)**
+- [x] **M0146-0200 — TPC-H Q21: PG keeps the EC\-derived `orders\.o\_orderkey = l2\.l\_orderkey` as the semi join's Join Filter over a parameterised `l2` probe; goopg drops it \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016c/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3319,6 +3319,12 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   - Other records, possibly other mechanisms: TPC-H Q20 \(join order, `Hash Right Semi Join`\); SF1 Q54 \(Join
     Filters at different nested\-loop levels\)\.
   - Expected instrument: TPC-H PLAN\-PARITY match 15 → 16 \(Q21\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
+  - Closed 2026\-10\-16: goopg reduced one clause per class only at inner joins, `dropRedundantSemiDerived` removed
+    the derived `o\_orderkey = l2\.l\_orderkey` PG picks \(first outer member\), and `ecReduce` was off because the ANTI
+    qual joined the class\. ANTI quals now stay out of the classes \(`buildRestrictInfosExcluding`, `antiRighthands`\),
+    `ecReduce` = `onlySemiOrAntiJoins`, and a SEMI join is reduced before the derived drop\.
+    Design: `docs/design/0100\-0149/m0146\-0200\-semi\-join\-ec\-restrictlist\.md`\.
+  Movement: yes — TPCH match 15 → 16 \(Q21\); SF0\.25 84 and SF1 71 byte\-identical\.
 - [x] **M0146-0199 — TPC-DS SF1 Q32/Q92: PG memoizes the `date\_dim\_pkey` probe inside SubPlan 1's Nested Loop; goopg probes it bare \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016b/ROUTING\.md`\)\.
   Kind: impl
