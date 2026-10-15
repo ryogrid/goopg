@@ -125,6 +125,21 @@ func indexRealPagesInDB(idx *Index, dbOid uint32) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// TableRealPagesIn is TableRealPages resolved through cat, as IndexRealPagesIn
+// is for indexes: a table in the postgres database carries DBOid 0 or the
+// namespace key DefaultDBOid while its file sits under the catalog's storage
+// database (cat.RelFileNode), and `estimate_rel_size` sizes the relation it
+// opened there (plancat.c). nil cat keeps TableRealPages.
+func TableRealPagesIn(cat Catalog, tbl *Table) (int64, bool) {
+	if tbl == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if cat == nil {
+		return TableRealPages(tbl)
+	}
+	return RelNBlocksFunc(cat.RelFileNode(tbl))
+}
+
 // TableRealPages reports tbl's real main-fork size in blocks, when the storage
 // hook is wired and the fork exists. It is `IndexRealPages`' sibling and PG's
 // own input: `estimate_rel_size` fills `rel->pages` from a live

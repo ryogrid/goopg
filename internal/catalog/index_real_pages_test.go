@@ -67,3 +67,29 @@ func rowHasCell(row []string, want string) bool {
 	}
 	return false
 }
+
+// TestTableRealPagesInUsesCatalogDatabase is IndexRealPagesIn's sibling for
+// heaps (M0146-0178 worker-count residual): a postgres-namespace table's file
+// sits under the catalog's storage database, which TableRealPages missed.
+func TestTableRealPagesInUsesCatalogDatabase(t *testing.T) {
+	c := NewInMemory()
+	c.SetDBOID(5)
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "heap_t"}, []Column{{Name: "a", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := RelNBlocksFunc
+	t.Cleanup(func() { RelNBlocksFunc = prev })
+	RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
+		if rel.DBOid == 5 && rel.RelOid == tbl.OID {
+			return 1284, true
+		}
+		return 0, false
+	}
+	if _, ok := TableRealPages(tbl); ok {
+		t.Fatal("TableRealPages found the file under the default database; the case no longer reproduces")
+	}
+	if got, ok := TableRealPagesIn(c, tbl); !ok || got != 1284 {
+		t.Errorf("TableRealPagesIn = %d, %v; want 1284 from database 5", got, ok)
+	}
+}

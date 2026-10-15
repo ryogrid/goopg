@@ -169,6 +169,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			// The size lookup needs only the pool and catalog, both available on
 			// the server here — unlike ectx, which does not exist yet on this path.
 			BlocksForTable: parallelBlocksForTableFrom(s.cfg.Pool, s.cfg.Catalog),
+			BlocksForIndex: parallelBlocksForIndexFrom(s.cfg.Catalog),
 		})
 	}
 

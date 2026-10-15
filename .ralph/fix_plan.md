@@ -3190,7 +3190,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Rank: below item 10 — regress\-only witness, no TPC query named \(S7 carve\-out\)\.
   - First step: skip the ordered producer for an index the restriction producer already built a clause path for
     \(the same rule `restrictionPathIsIndexOnly` applies to its index\-only twin\), then re\-run the fire set\.
-- [ ] **M0146-0195 — TPC-H lineitem order-key probe: PG's parameterised `idx_lineitem_orderkey_fkidx` Nested Loop, goopg's hash join \(Q3/Q7 join-method, Q5 scan-type\)**
+- [x] **M0146-0195 — TPC-H lineitem order-key probe: PG's parameterised `idx_lineitem_orderkey_fkidx` Nested Loop, goopg's hash join \(Q3/Q7 join-method, Q5 scan-type\)**
   \(filed 2026-10-15 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261015/ROUTING.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3282,6 +3282,12 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
       EXPLAIN picks `idx\_lineitem\_orderkey\_fkidx`/`order\_customer\_fkidx` as PG does\. Baseline Q5 re\-pinned to
       the real digest \(XFAIL retired — the next arm run would have fired XFAIL\-RESOLVED anyway\)\.
       tpch\-spotcheck Q12=2/Q13=35 PASS\.
+  - **2026\-10\-15 CLOSED — Q3, Q5 and Q7 MATCH on the reloaded corpus\.** After the owner's redo on a 7e9900a35 build
+    \(419dc5c9e\), a clean\-HEAD parallel plan\-only TPC-H capture \(`analysis/m0146/m0146\-0178/residual\-workers/m0178r\-tpch\-head\*`\)
+    against PG's `routing\-realign\-20261015`: match 12 → 15; CATEGORIES\-EXCL\-MATCH join\-method 5 → 2, scan\-type 8 → 4,
+    join\-order 5 → 3, parallelism 3 → 1\. Q10 keeps its match \(insert\-built indexes are PG\-sized, unlike the clone's
+    bulk\-built twins\)\. Q2 and SF0\.25 Q43 \(the reverse direction\) stay as separate census records\.
+Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
 - [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
   2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
   region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
@@ -3400,3 +3406,13 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     - Movement: none — parity held; the only category move \(parallelism 10 → 9\) is inside the ±3 noise band\.
     - Open: the two parallel worker\-count sites and `catalog\.TableRealPages` still use the default\-database lookup
       \(no catalog reaches them\); the heap trailing\-page term is the RELPAGES owner residual\.
+  - **2026\-10\-16 worker\-count slice landed** \(design §"Worker\-count sizing"\)\.
+    - `catalog\.TableRealPagesIn`; the upper\-rel split \(`upperSplitWorkersForScan`\) reads table and index sizes through
+      the statement's catalog \(`upperRels\.cat`\); the post\-pass reads index pages through
+      `ParallelSettings\.BlocksForIndex`, wired in both postmaster dispatch paths\.
+    - Tests `TestTableRealPagesInUsesCatalogDatabase`, `TestUpperSplitWorkersSizeOnCatalogDatabase`\.
+    - Captures vs the M0146\-0197 head arms and a fresh TPC-H HEAD arm on the reloaded corpus: plan text byte\-identical
+      on TPC-H and SF0\.25; fire\-set SF1 A/B no changed query\. Inert today\.
+    - Gates: units rc=0, postmaster tests, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), sf025 PASS=99,
+      fire set PASS\.
+    - Movement: none — plans byte\-identical\. Remaining: only the RELPAGES heap trailing\-page term \(owner residual\)\.

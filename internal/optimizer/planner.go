@@ -1293,6 +1293,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// call and so get their own — and stamped on every context this
 	// function builds below.
 	upper := newUpperRels()
+	upper.cat = cat
 
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to

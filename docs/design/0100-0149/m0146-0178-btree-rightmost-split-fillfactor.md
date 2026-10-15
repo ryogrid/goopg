@@ -148,6 +148,29 @@ but `bench/tpch/baseline-digests.txt` pinned Q5's timeout as an error, and
 recovered query is `XFAIL-RESOLVED`, which forces a re-pin. The patch was then
 applied unchanged and re-gated.
 
+**Worker-count sizing (2026-10-16 slice).** The same default-database lookup
+lived at the two parallel worker-count sites. PG's `compute_parallel_worker`
+(`./postgres/src/backend/optimizer/path/allpaths.c:4274`) sizes a scan on
+`rel->pages` and, for an index-only scan, `index->pages`, both read from the
+opened relations (`plancat.c`). Changes:
+
+- **`catalog.TableRealPagesIn`** is `IndexRealPagesIn`'s heap sibling,
+  resolving through `cat.RelFileNode`.
+- **The upper-rel split** (`upperSplitWorkersForScan`) receives the
+  statement's catalog. `upperRels` gains a `cat` field, set where
+  `planSelectWithSettings`, `createGroupingPaths` and `createDistinctPaths`
+  create it.
+- **The post-pass** (`computeParallelWorkersForScan`) reads index pages through
+  the new `ParallelSettings.BlocksForIndex`. Both postmaster dispatch paths wire
+  it to `IndexRealPagesIn`, never to `pool.NBlocks`, which would create a
+  missing fork. The table side already resolved through `cat.RelFileNode`
+  (`BlocksForTable`).
+
+Tests: `TestTableRealPagesInUsesCatalogDatabase` and
+`TestUpperSplitWorkersSizeOnCatalogDatabase`. In the latter, the index-only
+scan is sized on its 30000-page index; without the catalog the count falls back
+to a statistics guess of zero workers.
+
 **Residuals.**
 
 - The two parallel worker-count sites (`computeParallelWorkersForScan`,

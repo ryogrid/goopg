@@ -56,6 +56,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 		// thing a throwaway registry loses is the (kind, relids) identity
 		// a later upper rel would have shared.
 		u = newUpperRels()
+		u.cat = cat
 	}
 	// Non-simple modes (parallel Partial/Final) are not shaped here at
 	// all — the old rules skipped them too, and the only production caller

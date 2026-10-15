@@ -57,6 +57,7 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 	if u == nil {
 		u = newUpperRels()
+		u.cat = cat
 	}
 	cp := ps.costParams()
 	distinctRel := fetchUpperRel(u, UpperDistinct, 0, tupleFraction)
@@ -402,7 +403,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		traceUpperGate("distinct-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return
 	}
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if partial != nil && partial.ParallelWorkers > 0 {
 		workers = partial.ParallelWorkers
 	}

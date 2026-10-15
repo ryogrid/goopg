@@ -341,7 +341,7 @@ func spliceGatherOnPartialSpine(n Node) (Node, bool) {
 // here on the SPLICED child so workers, divisor and group counts measure the
 // subtree the plan actually executes per worker.
 func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if workers <= 0 {
 		traceUpperGate("agg-upper", "refused", "gate=workers route=partialgroup")
 		return nil
@@ -515,7 +515,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		traceUpperGate("agg-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return nil
 	}
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if partial != nil && partial.ParallelWorkers > 0 {
 		workers = partial.ParallelWorkers
 	}
@@ -1472,7 +1472,7 @@ func finalizeGroupPathkeys(aggNode *Aggregate) []PathKey {
 // never reads the heap, so the INDEX's page count is what bounds it
 // (`create_index_paths` passes `index->pages`). Measured on TPC-H q13/q16
 // (M0134-0189) and repeated here so the two sizings cannot disagree.
-func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
+func upperSplitWorkers(u *upperRels, child Node, cp costParams, ps PlannerSettings) int {
 	// M0145-0004: size over EVERY driving scan — a `*SetOp` driving node
 	// stands for all of its streamed member branches (drivingScans), and
 	// the split's worker count is the max across them, the same rule
@@ -1482,7 +1482,7 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 	// members outright.
 	best := 0
 	for _, scan := range drivingScans(child) {
-		if w := upperSplitWorkersForScan(scan, cp); w > best {
+		if w := upperSplitWorkersForScan(scan, cp, u.catalog()); w > best {
 			best = w
 		}
 	}
@@ -1495,7 +1495,7 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 // upperSplitWorkersForScan is the single-scan body of upperSplitWorkers,
 // split out so a SetOp driving node can size each member branch
 // independently.
-func upperSplitWorkersForScan(scan Node, cp costParams) int {
+func upperSplitWorkersForScan(scan Node, cp costParams, cat catalog.Catalog) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
@@ -1512,7 +1512,12 @@ func upperSplitWorkersForScan(scan Node, cp costParams) int {
 	// the exact failure `parallelRelationBlocks`' comment records having been
 	// bitten by once already. `baseRelPages` is the fallback for a table the
 	// storage hook cannot answer for (unit fixtures above all).
-	pages, ok := catalog.TableRealPages(tbl)
+	//
+	// Both sizes are read where cat places the relations (M0146-0178): a
+	// relation in the postgres database is keyed DefaultDBOid but stored
+	// under the catalog's database, and the default-database lookup missed
+	// its file.
+	pages, ok := catalog.TableRealPagesIn(cat, tbl)
 	if !ok || pages <= 0 {
 		relTuples := float64(tableRows(tbl))
 		if relTuples < 1 {
@@ -1521,7 +1526,7 @@ func upperSplitWorkersForScan(scan Node, cp costParams) int {
 		pages = baseRelPages(tbl, relTuples)
 	}
 	if ios, isIOS := scan.(*IndexOnlyScan); isIOS && ios.Index != nil {
-		if ipages, ok := catalog.IndexRealPages(ios.Index); ok && ipages > 0 {
+		if ipages, ok := catalog.IndexRealPagesIn(cat, ios.Index); ok && ipages > 0 {
 			pages = ipages
 		}
 	}

@@ -93,6 +93,10 @@ type ParallelSettings struct {
 	// the size gate falls back to the row estimate, which is an approximation
 	// and is recorded as such.
 	BlocksForTable func(*catalog.Table) (int64, bool)
+	// BlocksForIndex returns an index's size in blocks, resolved where the
+	// session's catalog places it (M0146-0178). Optional: nil falls back to
+	// the default-database lookup, catalog.IndexRealPages.
+	BlocksForIndex func(*catalog.Index) (int64, bool)
 }
 
 // MaybeAddGather returns root wrapped in a Gather when the plan is eligible,
@@ -1938,7 +1942,11 @@ func computeParallelWorkersForScan(scan Node, s ParallelSettings) int {
 	// saved (4.2s -> 7.1s); sized by the index it is below the threshold and
 	// stays serial, which is the right answer and PG's own rule.
 	if ios, isIOS := scan.(*IndexOnlyScan); isIOS && ios.Index != nil {
-		if pages, ok := catalog.IndexRealPages(ios.Index); ok && pages > 0 {
+		lookup := catalog.IndexRealPages
+		if s.BlocksForIndex != nil {
+			lookup = s.BlocksForIndex
+		}
+		if pages, ok := lookup(ios.Index); ok && pages > 0 {
 			blocks, known = pages, true
 		}
 	}

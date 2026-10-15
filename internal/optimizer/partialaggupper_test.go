@@ -1091,7 +1091,7 @@ func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	if seed.Cost.Total <= 0 {
 		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 	}
-	workers = upperSplitWorkers(child, cp, ps)
+	workers = upperSplitWorkers(nil, child, cp, ps)
 	if workers <= 0 {
 		t.Fatal("fixture admitted no workers — upperSplitWorkers refused the child")
 	}

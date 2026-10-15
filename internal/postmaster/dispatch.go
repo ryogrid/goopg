@@ -1565,6 +1565,7 @@ func applyParallelPostPassFrom(node optimizer.Node, get func(string) (string, bo
 		DebugParallelQuery:  debugParallelQueryFrom(get),
 		IsSerializable:      ectx.Tx.Isolation == transam.IsolationSerializable,
 		BlocksForTable:      parallelBlocksForTable(ectx),
+		BlocksForIndex:      parallelBlocksForIndex(ectx),
 	})
 }
 
@@ -1581,6 +1582,26 @@ func parallelBlocksForTable(ectx *executor.Context) func(*catalog.Table) (int64,
 		return nil
 	}
 	return parallelBlocksForTableFrom(ectx.Pool, ectx.Catalog)
+}
+
+// parallelBlocksForIndex is BlocksForTable's index sibling: an index-only
+// scan's worker count is sized on the index (compute_parallel_worker takes
+// index->pages), read where the session's catalog places the index file
+// (M0146-0178) — never through pool.NBlocks, which would create a missing
+// fork.
+func parallelBlocksForIndex(ectx *executor.Context) func(*catalog.Index) (int64, bool) {
+	if ectx == nil {
+		return nil
+	}
+	return parallelBlocksForIndexFrom(ectx.Catalog)
+}
+
+// parallelBlocksForIndexFrom is the catalog form, for the extended protocol.
+func parallelBlocksForIndexFrom(cat catalog.Catalog) func(*catalog.Index) (int64, bool) {
+	if cat == nil {
+		return nil
+	}
+	return func(idx *catalog.Index) (int64, bool) { return catalog.IndexRealPagesIn(cat, idx) }
 }
 
 // parallelBlocksForTableFrom is the pool/catalog form, for the extended

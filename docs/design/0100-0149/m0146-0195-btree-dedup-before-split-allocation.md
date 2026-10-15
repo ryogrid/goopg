@@ -1,9 +1,7 @@
 # M0146-0195 — B-tree: dedup before the split allocates its page
 
-Status: open. The storage fix landed 2026-10-15. Index bloat IS the Q3/Q5/Q7
-driver: with compact fk indexes actually in use, all three match PG (see
-"Corrected measurement"). The first measurement, which said the opposite, was
-invalid.
+Status: done 2026-10-15. On the corpus reloaded with the fix (owner, 419dc5c9e),
+TPC-H Q3, Q5 and Q7 match PG; the TPC-H match count is 12 → 15.
 
 ## Problem
 
@@ -157,6 +155,33 @@ What would bring goopg in line:
 - **Cost every index (M0146-0197).** goopg should build a parameterised path for
   every eligible index, as PG's `build_index_paths` does, so that cost picks
   among them.
+
+## Result on the real corpus (2026-10-15 evening)
+
+The owner restarted `:65433` on a 7e9900a35 build, which includes 7b356ec04, and
+redid the INSERT replay (419dc5c9e). The fk indexes came out PG-sized:
+
+| index | before | after | PG |
+|---|---|---|---|
+| `idx_lineitem_orderkey_fkidx` | 117050 | 16641 | 16468 |
+| `order_customer_fkidx` | 28617 | 2220 | 4121 |
+| `partsupp_supplier_fkidx` | 14775 | 814 | 2199 |
+
+Parallel plan-only TPC-H capture on the reloaded corpus with a clean-HEAD
+binary, against PG's `routing-realign-20261015`
+(`analysis/m0146/m0146-0178/residual-workers/m0178r-tpch-head*`):
+
+| measure | before | after |
+|---|---|---|
+| match | 12 / 22 | 15 / 22 |
+| join-method | 5 | 2 |
+| scan-type | 8 | 4 |
+| join-order | 5 | 3 |
+| parallelism | 3 | 1 |
+
+Q3, Q5 and Q7 MATCH. Q10 keeps its match: unlike the clone's bulk-built twins,
+insert-built indexes are PG-sized. Q5 completes in about 1 s, where it timed
+out at 900 s before.
 
 ## Residuals
 
