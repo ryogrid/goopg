@@ -1,0 +1,104 @@
+                     i_category                     |                      i_brand                       |    cc_name    | d_year |   avg_monthly_sales    | sum_sales |   psum   |   nsum   
+----------------------------------------------------+----------------------------------------------------+---------------+--------+------------------------+-----------+----------+----------
+ Music                                              | exportischolar #2                                  | Mid Atlantic  |   2001 | 10576.1758333333333333 |   3942.23 |  6432.23 |  6319.91
+ Children                                           | amalgexporti #2                                    | North Midwest |   2001 |  9994.8000000000000000 |   3364.66 |  7015.59 |  5064.34
+ Music                                              | edu packscholar #2                                 | Mid Atlantic  |   2001 |     11003.982500000000 |   4679.19 |  7194.61 |  4829.62
+ Men                                                | importoimporto #2                                  | North Midwest |   2001 | 10608.7658333333333333 |   4359.09 |  7023.99 |  4931.99
+ Music                                              | edu packscholar #2                                 | Mid Atlantic  |   2001 |     11003.982500000000 |   4829.62 |  4679.19 | 14825.25
+ Children                                           | exportiexporti #2                                  | NY Metro      |   2001 |  9780.9808333333333333 |   3620.46 |  4408.84 |  5168.42
+ Children                                           | edu packexporti #2                                 | North Midwest |   2001 | 10067.0033333333333333 |   3986.88 |  4992.73 |  6260.56
+ Women                                              | edu packamalg #2                                   | Mid Atlantic  |   2001 | 10775.2141666666666667 |   4721.23 |  7111.50 | 16178.61
+ Shoes                                              | amalgedu pack #2                                   | NY Metro      |   2001 |     10861.648333333333 |   4818.28 |  5731.10 |  7313.48
+ Music                                              | edu packscholar #2                                 | North Midwest |   2001 | 10734.7816666666666667 |   4727.52 | 13837.84 |  5603.52
+ Music                                              | edu packscholar #2                                 | North Midwest |   2001 | 10734.7816666666666667 |   4742.49 |  6731.90 |  6500.91
+ Shoes                                              | amalgedu pack #2                                   | NY Metro      |   2001 |     10861.648333333333 |   4934.85 |  7025.40 |  6338.89
+ Women                                              | amalgamalg #2                                      | Mid Atlantic  |   2001 | 10548.8183333333333333 |   4640.42 |  4949.51 |  6421.33
+ Men                                                | exportiimporto #2                                  | North Midwest |   2001 |  9608.8300000000000000 |   3732.64 |  6756.94 |  7236.87
+ Men                                                | importoimporto #2                                  | NY Metro      |   2001 |     10861.449166666667 |   4993.33 | 13919.85 |  6195.13
+ Music                                              | edu packscholar #2                                 | NY Metro      |   2001 |     10907.674166666667 |   5067.27 |  7637.02 |  6526.79
+ Shoes                                              | importoedu pack #2                                 | NY Metro      |   2001 |     10850.478333333333 |   5026.91 |  6861.97 | 14151.33
+ Children                                           | exportiexporti #2                                  | North Midwest |   2001 |  9728.2533333333333333 |   3945.99 |  5531.65 |  6344.54
+ Men                                                | importoimporto #2                                  | North Midwest |   2001 | 10608.7658333333333333 |   4877.11 |  6642.16 |  7093.75
+ Shoes                                              | amalgedu pack #2                                   | NY Metro      |   2001 |     10861.648333333333 |   5147.39 | 13229.35 |  5731.10
+ Men                                                | importoimporto #2                                  | North Midwest |   2001 | 10608.7658333333333333 |   4931.99 |  4359.09 |  5848.34
+ Music                                              | importoscholar #2                                  | NY Metro      |   2001 |     11318.674166666667 |   5646.63 |  6757.86 |  7198.15
+ Women                                              | edu packamalg #2                                   | North Midwest |   2001 | 10789.1700000000000000 |   5131.59 |  7203.50 |  6017.58
+ Music                                              | importoscholar #2                                  | Mid Atlantic  |   2001 | 10806.7525000000000000 |   5167.73 |  7981.53 |  6215.33
+ Women                                              | amalgamalg #2                                      | Mid Atlantic  |   2001 | 10548.8183333333333333 |   4949.51 |  5839.95 |  4640.42
+ Women                                              | importoamalg #2                                    | Mid Atlantic  |   2001 |     11163.070833333333 |   5565.11 |  5972.91 |  6544.79
+ Music                                              | importoscholar #2                                  | North Midwest |   2001 |     10983.624166666667 |   5393.47 |  5912.56 |  7817.28
+ Men                                                | amalgimporto #2                                    | Mid Atlantic  |   2001 |  9753.7891666666666667 |   4171.44 | 11010.24 |  5900.02
+ Women                                              | amalgamalg #2                                      | North Midwest |   2001 |  9151.7458333333333333 |   3583.43 |  5946.70 |  6260.35
+ Women                                              | importoamalg #2                                    | North Midwest |   2001 | 10492.7166666666666667 |   4963.49 |  6056.91 |  6474.28
+ Men                                                | exportiimporto #2                                  | North Midwest |   2001 |  9608.8300000000000000 |   4084.45 |  5165.31 |  6756.94
+ Shoes                                              | importoedu pack #2                                 | North Midwest |   2001 |     11069.090833333333 |   5557.39 |  5921.08 |  6233.85
+ Women                                              | edu packamalg #2                                   | North Midwest |   2001 | 10789.1700000000000000 |   5313.10 |  6017.58 |  6439.53
+ Children                                           | importoexporti #2                                  | NY Metro      |   2001 |  9711.4058333333333333 |   4261.44 |  4968.75 | 12918.34
+ Women                                              | edu packamalg #2                                   | North Midwest |   2001 | 10789.1700000000000000 |   5346.07 |  7323.24 |  7203.50
+ Shoes                                              | edu packedu pack #2                                | North Midwest |   2001 | 10033.0808333333333333 |   4600.57 |  4865.36 |  7145.00
+ Men                                                | edu packimporto #2                                 | NY Metro      |   2001 |  9397.7358333333333333 |   3968.17 |  4882.65 |  5390.22
+ Men                                                | importoimporto #2                                  | Mid Atlantic  |   2001 |     11340.357500000000 |   5913.74 |  5927.78 | 14980.88
+ Men                                                | importoimporto #2                                  | Mid Atlantic  |   2001 |     11340.357500000000 |   5927.78 |  6851.97 |  5913.74
+ Children                                           | exportiexporti #2                                  | NY Metro      |   2001 |  9780.9808333333333333 |   4408.84 | 11419.31 |  3620.46
+ Men                                                | exportiimporto #2                                  | Mid Atlantic  |   2001 | 10005.2316666666666667 |   4643.23 |  6435.60 |  7910.95
+ Music                                              | importoscholar #2                                  | NY Metro      |   2001 |     11318.674166666667 |   5966.42 |  6612.02 |  6296.21
+ Children                                           | importoexporti #2                                  | North Midwest |   2001 | 10329.3708333333333333 |   4992.43 |  6517.62 |  5763.87
+ Music                                              | importoscholar #2                                  | Mid Atlantic  |   2001 | 10806.7525000000000000 |   5499.68 |  6393.58 | 14634.88
+ Music                                              | edu packscholar #2                                 | Mid Atlantic  |   2001 |     11003.982500000000 |   5706.83 |  7122.41 |  7194.61
+ Music                                              | exportischolar #2                                  | NY Metro      |   2001 | 10370.3391666666666667 |   5124.68 |  6243.44 |  6420.31
+ Men                                                | importoimporto #2                                  | NY Metro      |   2001 |     10861.449166666667 |   5650.84 |  6455.97 |  6350.78
+ Women                                              | edu packamalg #2                                   | Mid Atlantic  |   2001 | 10775.2141666666666667 |   5564.73 |  5961.13 |  6987.34
+ Men                                                | importoimporto #2                                  | NY Metro      |   2001 |     10861.449166666667 |   5664.56 |  6195.13 |  6455.97
+ Women                                              | edu packamalg #2                                   | NY Metro      |   2001 | 10079.8700000000000000 |   4888.79 |  6032.57 |  5556.37
+ Women                                              | importoamalg #2                                    | Mid Atlantic  |   2001 |     11163.070833333333 |   5972.91 |  7467.48 |  5565.11
+ Shoes                                              | amalgedu pack #2                                   | Mid Atlantic  |   2001 | 10224.3125000000000000 |   5054.23 |  5580.93 |  6201.30
+ Children                                           | edu packexporti #2                                 | North Midwest |   2001 | 10067.0033333333333333 |   4897.68 |  4945.51 |  4992.73
+ Shoes                                              | edu packedu pack #2                                | North Midwest |   2001 | 10033.0808333333333333 |   4865.36 |  6837.01 |  4600.57
+ Men                                                | edu packimporto #2                                 | NY Metro      |   2001 |  9397.7358333333333333 |   4235.78 |  6964.30 |  5384.75
+ Music                                              | exportischolar #2                                  | Mid Atlantic  |   2001 | 10576.1758333333333333 |   5420.22 |  6701.28 |  5730.65
+ Children                                           | edu packexporti #2                                 | Mid Atlantic  |   2001 |  9922.4791666666666667 |   4770.54 |  6235.44 |  6166.19
+ Women                                              | edu packamalg #2                                   | Mid Atlantic  |   2001 | 10775.2141666666666667 |   5624.45 |  6987.34 |  7111.50
+ Shoes                                              | importoedu pack #2                                 | North Midwest |   2001 |     11069.090833333333 |   5921.08 | 13366.24 |  5557.39
+ Music                                              | edu packscholar #2                                 | North Midwest |   2001 | 10734.7816666666666667 |   5603.52 |  4727.52 |  5892.65
+ Women                                              | amalgamalg #2                                      | Mid Atlantic  |   2001 | 10548.8183333333333333 |   5418.23 |  5886.25 |  7464.33
+ Shoes                                              | amalgedu pack #2                                   | NY Metro      |   2001 |     10861.648333333333 |   5731.10 |  5147.39 |  4818.28
+ Men                                                | edu packimporto #2                                 | North Midwest |   2001 |  9293.6858333333333333 |   4169.03 |  5696.53 |  6588.94
+ Music                                              | edu packscholar #2                                 | NY Metro      |   2001 |     10907.674166666667 |   5783.09 |  6526.79 |  7148.82
+ Children                                           | edu packexporti #2                                 | North Midwest |   2001 | 10067.0033333333333333 |   4945.51 |  5297.00 |  4897.68
+ Shoes                                              | importoedu pack #2                                 | NY Metro      |   2001 |     10850.478333333333 |   5740.55 |  6660.89 |  6861.97
+ Shoes                                              | amalgedu pack #2                                   | Mid Atlantic  |   2001 | 10224.3125000000000000 |   5122.94 |  6233.70 |  6424.50
+ Children                                           | edu packexporti #2                                 | NY Metro      |   2001 |  9514.7425000000000000 |   4426.52 |  5521.06 |  5989.44
+ Women                                              | importoamalg #2                                    | North Midwest |   2001 | 10492.7166666666666667 |   5406.51 | 13292.63 |  6559.06
+ Children                                           | edu packexporti #2                                 | North Midwest |   2001 | 10067.0033333333333333 |   4992.73 |  4897.68 |  3986.88
+ Women                                              | amalgamalg #2                                      | NY Metro      |   2001 |  9619.2883333333333333 |   4546.71 |  5440.47 |  6585.96
+ Music                                              | importoscholar #2                                  | North Midwest |   2001 |     10983.624166666667 |   5912.56 |  6243.61 |  5393.47
+ Men                                                | amalgimporto #2                                    | NY Metro      |   2001 |  9861.5408333333333333 |   4793.48 |  6154.09 |  4918.03
+ Men                                                | importoimporto #2                                  | Mid Atlantic  |   2001 |     11340.357500000000 |   6274.13 |  7010.59 |  7645.42
+ Children                                           | exportiexporti #2                                  | North Midwest |   2001 |  9728.2533333333333333 |   4663.46 |  6141.89 |  5531.65
+ Men                                                | amalgimporto #2                                    | Mid Atlantic  |   2001 |  9753.7891666666666667 |   4694.38 |  6003.91 |  6093.64
+ Music                                              | exportischolar #2                                  | North Midwest |   2001 |     10939.975833333333 |   5884.23 |  5920.61 |  7559.62
+ Shoes                                              | amalgedu pack #2                                   | North Midwest |   2001 | 10571.6608333333333333 |   5516.72 |  6212.98 |  7256.74
+ Shoes                                              | importoedu pack #2                                 | Mid Atlantic  |   2001 |     10863.354166666667 |   5811.54 |  6756.45 | 15130.33
+ Music                                              | importoscholar #2                                  | NY Metro      |   2001 |     11318.674166666667 |   6267.57 |  6296.21 | 14417.06
+ Children                                           | amalgexporti #2                                    | Mid Atlantic  |   2001 |  9933.4125000000000000 |   4896.81 | 12175.03 |  5099.75
+ Shoes                                              | exportiedu pack #2                                 | Mid Atlantic  |   2001 |  9899.7700000000000000 |   4865.69 |  5627.42 |  6055.01
+ Music                                              | amalgscholar #2                                    | NY Metro      |   2001 |  9475.9216666666666667 |   4448.52 |  6440.82 |  5201.52
+ Music                                              | importoscholar #2                                  | NY Metro      |   2001 |     11318.674166666667 |   6296.21 |  5966.42 |  6267.57
+ Children                                           | amalgexporti #2                                    | NY Metro      |   2001 |  9600.9166666666666667 |   4579.10 |  4842.54 | 12920.18
+ Music                                              | exportischolar #2                                  | North Midwest |   2001 |     10939.975833333333 |   5920.61 |  6695.09 |  5884.23
+ Women                                              | exportiamalg #2                                    | North Midwest |   2001 |  9715.0016666666666667 |   4703.98 |  5319.41 |  5217.42
+ Shoes                                              | edu packedu pack #2                                | NY Metro      |   2001 | 10305.3258333333333333 |   5299.51 |  6485.37 |  7937.59
+ Music                                              | importoscholar #2                                  | Mid Atlantic  |   2001 | 10806.7525000000000000 |   5801.47 |  5844.81 |  6393.58
+ Women                                              | exportiamalg #2                                    | NY Metro      |   2001 |  9419.3241666666666667 |   4418.49 |  5811.78 |  5492.66
+ Children                                           | amalgexporti #2                                    | North Midwest |   2001 |  9994.8000000000000000 |   4997.31 |  5850.11 |  5568.71
+ Music                                              | exportischolar #2                                  | North Midwest |   2001 |     10939.975833333333 |   5949.74 |  7559.62 |  7322.97
+ Shoes                                              | importoedu pack #2                                 | NY Metro      |   2001 |     10850.478333333333 |   5867.32 |  5882.82 |  6660.89
+ Shoes                                              | importoedu pack #2                                 | NY Metro      |   2001 |     10850.478333333333 |   5882.82 |  6295.09 |  5867.32
+ Music                                              | importoscholar #2                                  | Mid Atlantic  |   2001 | 10806.7525000000000000 |   5844.81 |  6215.33 |  5801.47
+ Children                                           | amalgexporti #2                                    | NY Metro      |   2001 |  9600.9166666666666667 |   4641.91 |  5142.27 |  4866.67
+ Men                                                | amalgimporto #2                                    | NY Metro      |   2001 |  9861.5408333333333333 |   4918.03 |  4793.48 |  5195.06
+ Shoes                                              | edu packedu pack #2                                | NY Metro      |   2001 | 10305.3258333333333333 |   5372.60 |  6494.82 |  6485.37
+ Children                                           | amalgexporti #2                                    | North Midwest |   2001 |  9994.8000000000000000 |   5064.34 |  3364.66 |  7796.57
+ Women                                              | exportiamalg #2                                    | NY Metro      |   2001 |  9419.3241666666666667 |   4492.50 |  6729.27 |  4867.36
+(100 rows)
+

@@ -95,7 +95,9 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// on the way back out is therefore value-identical to what EXPLAIN
 	// already printed for it: nothing below the Sort moves.
 	seed := newPrebuiltPath(ordered, input)
-	pc := legacyDisplayCostOf(input)
+	// M0146-0211: create_ordered_paths prices input_path at its own cost
+	// (upperInputPathCost reads it through goopg's Project wrappers).
+	pc := upperInputPathCost(input)
 	// The seed's Rows already match: newPrebuiltPath carried rel.Rows (sized
 	// from this same input above) into it, and the sort prices sub.Rows —
 	// so the two agree by construction, not by coincidence.

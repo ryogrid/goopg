@@ -3334,7 +3334,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
       PASS \(introduced=none\), ea\-ratchet PASS; TPC\-H plan text byte\-identical\.
     - Follow\-up filed: M0146\-0211 \(five sibling upper seeds\)\.
   Movement: yes — TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q54\); CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 4 → 3, join\-order 22 → 21; SF0\.25 85 held\.
-- [ ] **M0146-0211 — the grouping / partial\-aggregate / partial\-sort / ordered / upperrel seeds still charge a Project wrapper's legacy display cost** \(filed 2026\-10\-16 by M0146\-0210\)\.
+- [x] **M0146-0211 — the grouping / partial\-aggregate / partial\-sort / ordered / upperrel seeds still charge a Project wrapper's legacy display cost** \(filed 2026\-10\-16 by M0146\-0210\)\.
   Kind: impl
   Parent: M0146-0210
   - M0146\-0210 made the DISTINCT seed read its input path through Project wrappers \(`limitInputPath`\), as PG prices
@@ -3346,6 +3346,31 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     shapes may move both ways\.
   - Expected instrument: CATEGORIES\-EXCL\-MATCH moves on the upper\-rel categories \(aggregation\-strategy,
     sort\-strategy\); no match loss\.
+  - Closed 2026\-10\-16: `upperInputPathCost` \(cardinality\.go\) now seeds the DISTINCT, grouping,
+    partial\-aggregate and ordered producers through Project wrappers\. Design
+    `docs/design/0100\-0149/m0146\-0211\-upper\-input\-path\-cost\.md`\.
+    - SF0\.25 Q84 regressed MATCH → SHAPE\-DIFF: Sort over Gather 8271\.21 vs Gather Merge 8271\.23\. The old 0\.11
+      Project charge had tipped that tie\. Filed as M0146\-0212; kept per R3\.
+    - SF1 73 and TPC\-H 20 held\.
+    - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), tpcds\-sf025 PASS=99, tpcds\-fireset
+      PASS \(introduced=none\), ea\-ratchet PASS\.
+  Movement: yes — TPC\-DS SF0\.25 PLAN\-PARITY match 85 → 84 \(Q84 regression, filed M0146\-0212\); SF1 73 and TPC\-H 20 held\.
+- [ ] **M0146-0212 — REGRESSION \(M0146\-0211\): TPC\-DS SF0\.25 Q84 plans Sort over Gather where PG plans Gather Merge \(sort\-strategy, parallelism\)** \(filed 2026\-10\-16 by M0146\-0211\)\.
+  Kind: impl
+  Parent: M0146-0211
+  - goopg now plans Sort \(8271\.18\.\.8271\.21\) over Gather; the Gather Merge it elected before costs 8269\.98\.\.8271\.23\.
+    The removed Project charge \(0\.11 on the Sort arm only\) had tipped the 0\.02 gap the PG way\.
+  - PG elects the Gather Merge \(8142\.56\.\.8143\.70\) although its own formulas give Sort over Gather 8143\.66\. A PG
+    mechanism is unmodelled: the LIMIT's fractional comparison, create\_ordered\_paths' partial\-path block, or the
+    add\_path tie\-break order\.
+  - First step: load Q84's six tables \(customer, customer\_address, customer\_demographics, household\_demographics,
+    income\_band, store\_returns from `:65438` tpcds025\) into the PG debug build \(`tmp/pgdbg`\)\. Probe
+    `create\_ordered\_paths` and `add\_path` for the ordered rel, as M0146\-0209 did, then port the deciding term\.
+    Never restore a charge chosen by result \(R6\)\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 84 → 85 \(Q84\)\.
+  > \#\# ESCALATION 2026\-10\-16 \(R3\) — M0146\-0211 lost SF0\.25 Q84
+  > The change was kept, not reverted: it removes a non\-PG, one\-armed Project charge\. SF0\.25 match 85 → 84, SF1 and
+  > TPC\-H held\. Owner: confirm keeping it, or direct otherwise\.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl

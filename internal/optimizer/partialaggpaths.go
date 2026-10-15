@@ -327,7 +327,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	// this honestly: DESIGN §3.1.
 	seed := newPrebuiltPath(partialRel, child)
 	seed.Rows = perWorkerRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 	seed.ParallelSafe = true

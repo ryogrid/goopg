@@ -79,9 +79,7 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	// estimate, which charges the Project per row, is only the fallback for
 	// an input the search did not build (M0146-0210: TPC-DS Q54's 0.04 tipped
 	// the DISTINCT onto the partial arm).
-	if pc, ok := limitInputPath(child); ok {
-		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
-	} else if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 

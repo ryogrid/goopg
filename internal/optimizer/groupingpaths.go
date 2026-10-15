@@ -79,7 +79,10 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// cost are the child's own, by the C-12 monotonicity argument.
 	seed := newPrebuiltPath(grouped, child)
 	seed.Rows = inputRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	// M0146-0211: the input path's own cost, through goopg's Project
+	// wrappers (upperInputPathCost), as create_grouping_paths prices
+	// cheapest_input_path.
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 	// R54 redesign (REDESIGN.md rev 2): size the seed from the search

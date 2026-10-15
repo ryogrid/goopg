@@ -84,6 +84,33 @@ func limitInputPath(child Node) (PlanCost, bool) {
 	return PlanCost{}, false
 }
 
+// upperInputPathCost is the cost an upper producer seeds from: its input
+// path at that path's own cost, as PG's upper rels price cheapest_input_path
+// (create_distinct_paths, create_grouping_paths, create_ordered_paths). goopg's
+// Project wrapper is not a node there: apply_scanjoin_target_to_paths applies
+// the target to the scan/join paths themselves (dummypp). So the stamped
+// search node is read through the Projects, as limitInputPath does for
+// create_limit_path. The legacy display estimate, which charges a Project per
+// row, is only the fallback for an input the search did not build
+// (M0146-0210/0211). The found node's own initPlan charge is kept; it is zero
+// while upper paths are being priced (chargeInitPlans runs at Plan()'s tail).
+func upperInputPathCost(child Node) PlanCost {
+	n := child
+	for {
+		p, isProj := n.(*Project)
+		if !isProj || p.Child == nil {
+			break
+		}
+		n = p.Child
+	}
+	if c, ok := n.(PlanCostCarrier); ok && n != child {
+		if pc, set := c.PlanCostInfo(); set && !pc.PerWorker && pc.PlanRows > 0 {
+			return withInitPlanCharge(n, pc)
+		}
+	}
+	return legacyDisplayCostOf(child)
+}
+
 // limitInputRows is the row count a Limit reads: its input path's rows
 // (the count create_limit_path adjusts), else the legacy estimate.
 func limitInputRows(child Node) int64 {
