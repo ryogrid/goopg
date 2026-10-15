@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0208 — TPC\-DS Q45: goopg estimates the OR\-with\-hashed\-SubPlan Join Filter at 0\.75 where PG has 0\.52, so it plans a partial \(Finalize\) GroupAggregate where PG plans a plain GroupAggregate over Sort over Gather \(aggregation\-strategy\)**
+- [x] **M0146-0208 — TPC\-DS Q45: goopg estimates the OR\-with\-hashed\-SubPlan Join Filter at 0\.75 where PG has 0\.52, so it plans a partial \(Finalize\) GroupAggregate where PG plans a plain GroupAggregate over Sort over Gather \(aggregation\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016i/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3322,6 +3322,16 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     path, joinselectivity\.go\), and find which arm departs from PG's 0\.048 / 0\.5\. Then port the PG arm\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 84 → 85 and SF1 71 → 72 \(Q45\); CATEGORIES\-EXCL\-MATCH
     aggregation\-strategy down\.
+  - Closed 2026\-10\-16: the substr arm was the departing one\. `orInListSelectivity` priced an OR arm's IN\-list only
+    over a bare column and declined `substr\(ca\_zip, 1, 5\)` to the whole\-OR 0\.5, so 0\.5 \+ 0\.5 − 0\.25 = 0\.75\.
+    - `orInListExprSelectivity` prices a single\-relation expression operand through the restriction sibling
+      `inListExprSelectivity`: 1/200 per element, the disjoint sum 9 × 0\.005\. The OR becomes 0\.5225, PG's figure\.
+    - Design: `docs/design/0100\-0149/m0146\-0208\-or\-inlist\-expression\-selectivity\.md`\.
+    - Q15 also changed plan and stays MATCH \(its estimate is now 55 rows, PG 54\)\.
+    - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), tpcds\-sf025 PASS=99 \(Q15/Q45
+      ck\-verified\), tpcds\-fireset PASS \(fires Q15 Q45, introduced=none\), ea\-ratchet PASS; TPC\-H plan text
+      byte\-identical\.
+  Movement: yes — TPC\-DS SF0\.25 PLAN\-PARITY match 84 → 85, SF1 71 → 72 \(Q45\); CATEGORIES\-EXCL\-MATCH aggregation\-strategy SF0\.25 1 → 0, SF1 6 → 5\.
 - [x] **M0146-0207 — TPC-H Q2: PG hash\-joins on `\(SubPlan 1\) = partsupp\.ps\_supplycost` as a second hash key with `part` outer; goopg keeps the SubPlan equality as a Join Filter and hashes `part` \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016h/ROUTING\.md`\)\.
   Kind: impl

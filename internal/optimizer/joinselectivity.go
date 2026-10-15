@@ -859,7 +859,10 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 		return decline()
 	}
 	cr, ok := e.Operand.(*ColumnRef)
-	if !ok || cr.Name == "" {
+	if !ok {
+		return s.orInListExprSelectivity(e)
+	}
+	if cr.Name == "" {
 		return decline()
 	}
 	isEquality := e.AnyOp == 0 || e.AnyOp == parser.OpEq
@@ -905,6 +908,45 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 		s1 = s1disjoint
 	}
 	return clampProbability(s1), false
+}
+
+// orInListExprSelectivity is orInListSelectivity for an operand that is an
+// expression over ONE relation rather than a bare column, as in TPC-DS Q45's
+// `substr(ca_zip, 1, 5) IN ('85669', …)` (M0146-0208). PG's OR arm is a
+// restriction clause there (treat_as_join_clause declines it). It is priced by
+// scalararraysel, which runs eqsel → var_eq_const per element. An expression
+// has no statistics, so each element is 1/get_variable_numdistinct, the
+// DEFAULT_NUM_DISTINCT 1/200 (selfuncs.c), and the disjoint sum gives 9 × 0.005
+// for Q45's list. The value is the restriction path's own
+// `inListExprSelectivity`, so the two siblings cannot disagree. Equality only;
+// an operand that spans relations, or a non-constant element, still declines.
+func (s *searchCtx) orInListExprSelectivity(e *InExpr) (float64, bool) {
+	decline := func() (float64, bool) { return defaultUnhandledClauseSel, true }
+	if e.AnyOp != 0 && e.AnyOp != parser.OpEq {
+		return decline()
+	}
+	rel, refs := -1, 0
+	single := true
+	visitColumnRefs(e.Operand, func(x Expr) {
+		cr := x.(*ColumnRef)
+		i, ok := s.relPosForSource(cr.SourceTableIdx)
+		if !ok || (rel >= 0 && i != rel) {
+			single = false
+			return
+		}
+		rel = i
+		refs++
+	})
+	if !single || refs == 0 {
+		return decline()
+	}
+	for _, elem := range e.List {
+		if !isConstExpr(elem) {
+			return decline()
+		}
+	}
+	// var_eq_const's no-statistics branch is a guess (isdefault).
+	return inListExprSelectivity(e, nil), true
 }
 
 // relPosForSource is the `ColumnRef.SourceTableIdx` → search-rel translation
