@@ -1,36 +1,31 @@
-Task: M0146-0195 — TPC-H fk-index probes (Q3/Q7 join-method, Q5 scan-type). [ ] — root cause established.
-  - 7b356ec04 (landed): insert split no longer leaks pages — the bloat's cause.
-  - 1781cc20b: CORRECTED measurement (previous "refuted" was invalid): with compact fk indexes actually used,
-    TPC-H match 12 -> 14 (Q3/Q5/Q7 MATCH; Q10 lost because goopg bulk-built indexes are denser than PG's).
-    Per-probe gap reproduced exactly: genericcostestimate's loop-amortised index-page term (PG 4121 pages -> 0.55,
-    goopg 28617 -> 2.63 per probe). Evidence analysis/m0146/m0146-0195/ (m0195-s2-* arms).
-  - Filed M0146-0197: goopg builds ONE parameterised index path per parameterisation by heuristic
-    (pickIndexCoveringLeadingPrefix: most bound cols, ties -> name order); PG builds per index (build_index_paths).
-  - Filed M0146-0196 (below item 10): REINDEX/DROP INDEX can't resolve relations in a CREATE DATABASE'd db.
-BLOCKERS (owner) — resolved/dealt 2026-10-15:
-  1. tpch-acceptance-arm: CLEARED — digestdiff gained an XFAIL baseline pin (EXPECTED-ERROR passes only the pinned
-     error; XFAIL-RESOLVED forces a re-pin). baseline-digests.txt Q5 is XFAIL. The parked slice-2 arm output
-     re-diffs to VERDICT: PASS. M0146-0178 de-escalated [ ]: resume = apply slice2.patch, re-run arm, commit.
-  2. :65433 reload by INSERT with a 7b356ec04 binary: EXECUTED — NEGATIVE RESULT, fk indexes rebuilt to the SAME
-     sizes (117050 / 28617 / 41512 pages). The dedup fix does not cover the real-corpus bloat path; compacting the
-     ref indexes needs M0146-0196 fixed first (REINDEX/DROP INDEX resolve only DefaultDBOid — reproduced on :65433).
+Task: M0146-0197 — parameterised index path per eligible index. Leading-prefix half LANDED 7e9900a35 (pushed);
+  task stays [ ] for the skip-scan half (pickIndexSkipRun still single-index).
+  - Inert on today's corpora: TPC-H 12->12, SF0.25 80->80, plan text byte-identical; fire-set SF1 A/B no change.
+  - Gates: units, tpch-spotcheck, acceptance arm PASS (23 MATCH + Q5 EXPECTED-ERROR), sf025 PASS=99, fire set PASS.
+Context (M0146-0195 family):
+  - 7b356ec04 dedup-allocation leak fix; f1fd9a8a9 M0146-0178 slice 2 (index pages via catalog database).
+  - Clone measurement: compact fk indexes in use → TPC-H 12 -> 14 (Q3/Q5/Q7 MATCH, Q10 lost).
+  - ESCALATION be711c43e RESOLVED by owner 2026-10-15 evening: :65433 now serves goopg-bin built at 7e9900a35
+    (sha256 8c47fc59…; pid 561965, readlink-verified); INSERT reload redone — idx_lineitem_orderkey_fkidx
+    117050->16641 (PG 16468), order_customer_fkidx 28617->2220 (PG 4121). Q5 completes in ~1s, digest ==
+    PG :65432; baseline Q5 re-pinned from XFAIL to the real value.
 NEXT LOOP:
-  1. Re-read banner; both blockers are cleared (see above) — the arm stamps again.
-  2. M0146-0178 resume: the slice2.patch content is already staged in the index (loop applied it 2026-10-15
-     evening) — re-run the arm, commit.
-  3. Then M0146-0195's next step: cost_index term decompose (committable now that the arm passes) — and note the
-     reload NEGATIVE result above: the fk-index bloat has a second driver beyond the dedup leak.
-Files: analysis/m0146/m0146-0195/*, design m0146-0195 (Corrected measurement section), fix_plan, ledger.
-Key symbols: pickIndexCoveringLeadingPrefix (nl_index_join.go), addOneParameterizedIndexPath (pathparamindex.go),
-  btreeIndexAMCostPages / indexPagesFetched (costindex.go), IndexesOnTable (sorted by name).
+  1. Re-read banner; check :65433's serving binary + fk-index occupancy (relfilenode 16452, read-only parse) for the
+     owner's redo.
+  2. Item 3 file order: M0146-0195 [ ] (owner-blocked on the reload redo for its measurement), M0146-0197 [ ]
+     skip-scan half (committable; likely inert too — measure first), M0146-0178 [ ] residuals (worker-count sites /
+     TableRealPages need a catalog threaded through ParallelSettings/upperRels).
+     Pick by impact: M0146-0178's worker-count residual or 0197's skip half; or run an S9 pass if both are inert.
+Files: internal/optimizer/{nl_index_join.go,pathparamindex.go,pathparamindex_test.go}, design m0146-0197.
+Key symbols: leadingPrefixProbeKeys, eligibleLeadingPrefixIndexes, addParamIndexPathFor, pickIndexSkipRun.
 Hypothesis/Findings:
-  - scripts/tpch-estimate-audit-arm.sh PRE_AUDIT_SQL works for clone-side setup; name twins a_<orig> to make them
-    win the heuristic tie, map back with sed for the diff.
-Next step: check blockers; else decide between M0146-0197 (arm-blocked) and the bulk-build density finding (landable).
-Top-residual: actionable join-method=4 (TPC-H Q2/Q3/Q7, SF0.25 Q43) — M0146-0195 owns Q3/Q7
-Skip-rationale: n/a — next step stays on M0146-0195's family.
-Gates run: no engine code changed (measurement + docs); pgbench smoke (hook).
+  - The bloated-index costs are the TPC-H Q3/Q5/Q7 driver; the engine-side fixes are in, the corpus is not rebuilt.
+Next step: check the owner's reload redo; else take M0146-0178's worker-count residual (catalog into
+  ParallelSettings.BlocksForIndex) or 0197's skip half, measuring before/after on a private clone.
+Top-residual: actionable join-method=4 (TPC-H Q2/Q3/Q7, SF0.25 Q43) — owner reload gates Q3/Q7
+Skip-rationale: Q3/Q7 blocked-on owner-reload :65433 (M0146-0195); Q2 / SF0.25 Q43 not yet diagnosed.
+Gates run: units rc=0, tpch-spotcheck PASS, tpch-acceptance-arm PASS, sf025 PASS=99, fire set PASS, pgbench (hook).
 In-flight: none.
-Owner items: (DONE 2026-10-15: arm unblocked via XFAIL pin; :65433 INSERT reload executed — negative result on index
-  bloat; M0146-0196 placed below item 10.) Still open: place the four S2 defects; XLogInsert/XLogFlush rename;
-  M0122-0008; M0122-0009a/b/c, M0122-0010a and filed follow-ups; COSTTIE flips; plan-shaping GUC defaults.
+Owner items: (DONE: :65433 restarted on 7e9900a35 + INSERT reload redone — fk indexes compact, Q5 fixed and
+  re-pinned) place the four S2 defects; XLogInsert/XLogFlush rename; M0122-0008; M0122-0009a/b/c, M0122-0010a and
+  filed follow-ups; COSTTIE flips; plan-shaping GUC defaults.

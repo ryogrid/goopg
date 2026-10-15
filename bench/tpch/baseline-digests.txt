@@ -31,19 +31,18 @@
 # regression. Arm: tpch-runner -digest directly against :65433,
 # GOOPG_ANALYZE_SEED=20260905, PER_Q=900, GOGC=100 GOMEMLIMIT=12GiB.
 #
-# Q5 is an XFAIL pin (owner decision 2026-10-15, M0146-0178 escalation):
-# on the realigned corpus goopg picks a plan (SHAPE-DIFF vs PG —
-# scan-type) that exceeds the 900s per-query cap; PG runs it in seconds.
-# The pin passes only the identical error (EXPECTED-ERROR); a different
-# error is ERROR-DIFF and a recovered OK is XFAIL-RESOLVED — the gate
-# fails until the baseline is re-pinned, so the pin cannot outlive the
-# cause. See cmd/tpch-runner/digestdiff.go.
+# Q5 history: an XFAIL pin (owner decision 2026-10-15, M0146-0178
+# escalation) covered the divergent-plan 900s timeout; after the
+# 2026-10-15 evening reload of :65433 on a >=7b356ec04 binary (fk-index
+# dedup fix), Q5 completes in ~1s with a plan matching PG and its digest
+# is bit-identical to PG :65432 — re-pinned to the real value the same
+# day. The XFAIL mechanism stays available; see digestdiff.go.
 #
 Q1: OK colsig=767ce848ef814ee2 ordered=8ae7b8554c036cc9 unordered=d521408c80a7b1dc rows=4
 Q2: OK colsig=98559dc0378d935e ordered=68119d021ea76fe1 unordered=68acf0784df2e99b rows=469
 Q3: OK colsig=83ee73dd50fba86d ordered=2c100154bf30b2f7 unordered=ae8c1176187ba37a rows=11356
 Q4: OK colsig=ab046cf17754992f ordered=125424f8158de417 unordered=85f1831061d8e6c7 rows=5
-Q5: XFAIL — pq: canceling statement due to user request (57014)
+Q5: OK colsig=23ed6d41a314eb4e ordered=428617a013365ffd unordered=216c2b662edee6b5 rows=5
 Q6: OK colsig=2e0a9e7c16d79cc6 ordered=c552d666a2a257c5 unordered=c552d666a2a257c5 rows=1
 Q7: OK colsig=effb45ed4c5e2661 ordered=48e82c59c9a74c00 unordered=b525190f1a0e6989 rows=4
 Q8: OK colsig=8acb7c80bbac36a7 ordered=2945f1d24f72127c unordered=9469eb9d7a66357b rows=2

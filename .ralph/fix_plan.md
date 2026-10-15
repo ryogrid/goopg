@@ -3273,6 +3273,15 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     - Owner action: restart `:65433` on a binary built at or after 7b356ec04 \(confirm with `readlink
       /proc/<pid>/exe`\), then repeat the INSERT reload\. Expected per the clone measurement: fk indexes near
       CREATE INDEX size, TPC-H Q3/Q5/Q7 toward MATCH\. \(REINDEX stays unavailable, M0146\-0196\.\)
+    - **RESOLVED 2026\-10\-15 \(owner\)**: `:65433` stopped via `goopg stop \-mode fast`, `goopg\-bin` replaced with a
+      clean\-worktree build of 7e9900a35 \(sha256 8c47fc59…; old kept as `goopg\-bin\.1781cc20b`\), restarted via
+      `ref\-clusters\-ensure\.sh \-\-only 65433` — `readlink /proc/561965/exe` confirms the new binary\. TRUNCATE \+
+      17,320\-statement INSERT replay; all 8 tables match PG row counts\. Index relpages: `idx\_lineitem\_orderkey\_fkidx`
+      117050 → 16641 \(PG 16468\), `order\_customer\_fkidx` 28617 → 2220 \(PG 4121\) — the dedup fix works on the
+      real corpus\. **Q5 now completes in \~1s \(was 900s timeout\)** and its digest is bit\-identical to PG :65432;
+      EXPLAIN picks `idx\_lineitem\_orderkey\_fkidx`/`order\_customer\_fkidx` as PG does\. Baseline Q5 re\-pinned to
+      the real digest \(XFAIL retired — the next arm run would have fired XFAIL\-RESOLVED anyway\)\.
+      tpch\-spotcheck Q12=2/Q13=35 PASS\.
 - [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
   2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
   region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
