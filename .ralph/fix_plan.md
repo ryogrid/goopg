@@ -3196,6 +3196,20 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     scan-type down\.
   - Gate note: any production change here needs the acceptance\-arm PASS stamp, unpassable since 2026\-10\-15
     until the owner acts \(M0146\-0178 escalation\)\.
+  - **2026\-10\-15 first step done; root cause fixed** \(design `docs/design/0100\-0149/m0146\-0195\-btree\-dedup\-before\-split\-allocation\.md`\)\.
+    - Not a cost formula: goopg's TPC-H fk indexes are 7\-18x PG's after the realign \(`idx\_lineitem\_orderkey\_fkidx`
+      117050 vs 16468, `order\_customer\_fkidx` 28617 vs 4121; pre\-realign 9549 / 1563\); 86\-92% of their leaf blocks
+      are empty, allocated pages\.
+    - Cause: the insert split allocated its right page before dedup/purge and abandoned it when dedup made room;
+      the live page never passes `popRecyclableBlock` under a recycle horizon, so the next split extended again\.
+      Fixed by allocating after the dedup decision \(nbtinsert\.c:998 before :1720\)\. Test
+      `TestDuplicateInsertsLeakNoPages` \(HEAD: 480/541 leaf blocks empty\)\. Scratch: 4\-way duplicate insert build
+      5423 → 607 blocks = CREATE INDEX\.
+    - Landable without the arm \(internal/access/nbtree only\): units, nbtree \+ `\-race`, tpch\-spotcheck, sf025 PASS=99\.
+    - Movement: none yet — `:65433`'s existing index files keep their empty pages\. **Owner action:** REINDEX the
+      TPC-H tables on `:65433` \(or reload\), then re\-capture TPC-H; expected Q3/Q5/Q7 probe costs fall toward PG's\.
+    - Residual: delete \+ VACUUM \+ reinsert still doubles an index — vacuumed pages sit on the deleting handle's free
+      list, PG's FSM is shared \(M0122\-0010a\)\.
 - [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq

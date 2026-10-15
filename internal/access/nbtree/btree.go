@@ -2806,60 +2806,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 	}
 
-	// Split. Pin a freshly-extended right page exclusively,
-	// redistribute items, stamp the high key, then drop both
-	// latches before walking up. `op` already holds this page's
+	// No room: first try to make some (dedup, then the dead-entry purge),
+	// and only if that fails split — pin a new right page, redistribute
+	// items, stamp the high key, walk up. `op` already holds this page's
 	// pre-split opaque header from the move-right loop above.
-	// The block that is currently left's right sibling (if any).
-	// After the split the new right page is spliced between them, so
-	// this sibling's btpo_prev must be relinked from blk to rightBlk
-	// (done below, atomically with the split). InvalidBlockNumber
-	// here means a rightmost split with no sibling to relink.
-	oldNext := op.Next
-	// M0055-0005 Phase D: prefer recycled blocks before
-	// extending the file.
-	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
-	if err != nil {
-		held.release()
-		return err
-	}
-	// rightSlot is already content-locked by pinNewOrRecycled (its
-	// locked-return contract) — no separate Lock() here.
-
-	// The right sibling inherits the original page's high key (or has none,
-	// if this was the rightmost page on its level). Read it off the LEFT page
-	// before anything is rewritten — after the refill below the left page
-	// carries the NEW separator instead.
-	inheritedHK, inheritedOK, err := PGHighKeyRaw(slot.Page())
-	if err != nil {
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
-		held.release()
-		return err
-	}
-	// The right sibling is never the root (the root stays the original blk
-	// during a split, until we lift), and it does not inherit the split page's
-	// garbage hint: the refill below writes only LIVE items (pageItems skips
-	// dead-marked ones), so the hint would be stale-set from birth.
-	//
-	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
-	// split REDO builds — so the page the primary writes and the page a replay
-	// of the same record builds are byte-identical, which is what lets the
-	// split record log this page as content rather than as an image.
-	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
-	initPage(rightSlot.Page(), rightOpaque)
-	// The high key must land BEFORE any data item: initPage wrote btpo_next,
-	// so the page already reports itself non-rightmost and the data-slot
-	// wrappers are already biased past P_HIKEY.
-	if inheritedOK {
-		if err := pgSetHighKeyRaw(rightSlot.Page(), inheritedHK); err != nil {
-			rightSlot.Unlock()
-			bt.pool.Unpin(rightSlot)
-			held.release()
-			return err
-		}
-	}
-
 	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th loop):
 	// snapshot the two checkpoints that matter for localizing a lost
 	// entry — right after pageItems()+appendSorted() (what the rewrite
@@ -2874,8 +2824,6 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	allItems, err := bt.format().pageItems(slot.Page())
 	if err != nil {
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
 		held.release()
 		return err
 	}
@@ -2933,24 +2881,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
-		// split needed. The right-side allocation is rolled back.
+		// split needed — and no right page was allocated for it.
 		resetPageItems(slot.Page())
 		if err := bt.refillDeduplicated(blk, slot.Page(), allItems); err != nil {
-			rightSlot.Unlock()
-			bt.pool.Unpin(rightSlot)
-			bt.recycleBlock(rightBlk)
 			held.release()
 			return err
 		}
-		// Drop the freshly-allocated right slot — split avoided.
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
-		// The split was abandoned: this block was extended for a right sibling
-		// that is never linked in, so return it to the free list. Leaking it
-		// meant every dedup-recovery grew the relfile by a page even though the
-		// logical content shrank — which the dead-entry purge amplified,
-		// because it makes recovery succeed far more often.
-		bt.recycleBlock(rightBlk)
 		// C3-S3 (S2-review blocker fix A): this rewrite SHIFTS SLOT
 		// NUMBERS, so it must bump pd_lsn — the deferred kill pass
 		// re-verifies leaf identity by LSN equality (D7) and a plain
@@ -2985,6 +2921,64 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		return nil
 	}
 	bt.traceRewrite(blk, "split", preLineCount, postPageItemsSnap, postDedupSnap)
+
+	// The block that is currently left's right sibling (if any).
+	// After the split the new right page is spliced between them, so
+	// this sibling's btpo_prev must be relinked from blk to rightBlk
+	// (done below, atomically with the split). InvalidBlockNumber
+	// here means a rightmost split with no sibling to relink.
+	oldNext := op.Next
+	// The right page is allocated only now, once dedup and the dead-entry
+	// purge have failed to make room: upstream's _bt_findinsertloc runs
+	// _bt_delete_or_dedup_one_page (nbtinsert.c:998) before _bt_split
+	// allocates the new page (nbtinsert.c:1720). Allocating first and then
+	// abandoning the split when dedup made room extended the file for a page
+	// nothing linked in, and the page — live, never deleted — failed
+	// popRecyclableBlock's recyclability check, so the next split extended
+	// again: an insert-built index of 4-way duplicate keys came out 9 times
+	// its size with 8 of every 9 leaf blocks empty (M0146-0195).
+	// M0055-0005 Phase D: prefer recycled blocks before extending the file.
+	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
+	if err != nil {
+		held.release()
+		return err
+	}
+	// rightSlot is already content-locked by pinNewOrRecycled (its
+	// locked-return contract) — no separate Lock() here.
+
+	// The right sibling inherits the original page's high key (or has none,
+	// if this was the rightmost page on its level). Read it off the LEFT page
+	// before anything is rewritten — after the refill below the left page
+	// carries the NEW separator instead.
+	inheritedHK, inheritedOK, err := PGHighKeyRaw(slot.Page())
+	if err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
+	}
+	// The right sibling is never the root (the root stays the original blk
+	// during a split, until we lift), and it does not inherit the split page's
+	// garbage hint: the refill below writes only LIVE items (pageItems skips
+	// dead-marked ones), so the hint would be stale-set from birth.
+	//
+	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
+	// split REDO builds — so the page the primary writes and the page a replay
+	// of the same record builds are byte-identical, which is what lets the
+	// split record log this page as content rather than as an image.
+	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
+	initPage(rightSlot.Page(), rightOpaque)
+	// The high key must land BEFORE any data item: initPage wrote btpo_next,
+	// so the page already reports itself non-rightmost and the data-slot
+	// wrappers are already biased past P_HIKEY.
+	if inheritedOK {
+		if err := pgSetHighKeyRaw(rightSlot.Page(), inheritedHK); err != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return err
+		}
+	}
 
 	// M0055-0002-followup-byte-split: byte-aware split-loc.
 	// Pick the entry whose cumulative encoded byte size lands
