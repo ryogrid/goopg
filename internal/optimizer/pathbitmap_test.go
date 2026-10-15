@@ -190,7 +190,7 @@ func TestBitmapPathCost_Positive(t *testing.T) {
 	maxEntries := bitmapMaxEntries(s.cp.workMem)
 
 	// Manually compute the bitmap path cost components.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(nil, idx, tbl, relTuples)
 	in := indexScanInputs{
 		relPages:        relPages,
 		relTuples:       relTuples,

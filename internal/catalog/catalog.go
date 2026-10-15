@@ -93,6 +93,38 @@ func IndexRealPages(idx *Index) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// IndexRealPagesIn is IndexRealPages resolved through cat: the file is looked
+// up where cat.IndexRelFileNode places it. An index in the postgres database
+// carries DBOid 0 or the namespace key DefaultDBOid (1), and its file sits
+// under the catalog's storage database (5 on a server, NamespaceDBOid).
+// `get_relation_info` (plancat.c:466) sizes the index relation it opened,
+// which is always in the current database; the package-level IndexRealPages
+// took DBOid 1 literally, found no file under base/1, and the planner fell
+// back to a width estimate (M0146-0178 slice 2: item_pkey priced at 40 pages,
+// real 52). nil cat keeps IndexRealPages.
+func IndexRealPagesIn(cat Catalog, idx *Index) (int64, bool) {
+	if idx == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if cat == nil {
+		return IndexRealPages(idx)
+	}
+	return RelNBlocksFunc(cat.IndexRelFileNode(idx))
+}
+
+// indexRealPagesInDB is IndexRealPagesIn for a caller that already holds the
+// catalog's lock and knows the storage database: an index with DBOid 0 or
+// DefaultDBOid lives in dbOid, as IndexRelFileNode resolves it.
+func indexRealPagesInDB(idx *Index, dbOid uint32) (int64, bool) {
+	if idx == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if idx.DBOid != 0 && idx.DBOid != DefaultDBOid {
+		dbOid = idx.DBOid
+	}
+	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
+}
+
 // TableRealPages reports tbl's real main-fork size in blocks, when the storage
 // hook is wired and the fork exists. It is `IndexRealPages`' sibling and PG's
 // own input: `estimate_rel_size` fills `rel->pages` from a live
@@ -8221,8 +8253,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// tuple, so it reports the table's own count. `-1` is retained for the
 		// unanalysed case — PG 14+ uses it to mean "unknown", distinct from a
 		// genuine zero.
+		// dbOid is the namespace key; the postgres database's namespace is
+		// DefaultDBOid while its files sit under the catalog's storage
+		// database (NamespaceDBOid), so map it back as IndexRelFileNode does.
+		storeDB := c.dbOid
+		if dbOid != 0 && dbOid != DefaultDBOid {
+			storeDB = dbOid
+		}
 		idxRelPages := "0"
-		if pages, ok := IndexRealPages(idx); ok && pages > 0 {
+		if pages, ok := indexRealPagesInDB(idx, storeDB); ok && pages > 0 {
 			idxRelPages = strconv.FormatInt(pages, 10)
 		}
 		idxRelTuples := "-1"

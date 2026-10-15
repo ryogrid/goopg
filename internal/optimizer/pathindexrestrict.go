@@ -543,7 +543,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		keys, dir = indexPathOrdering(idx, colExprs, false)
 	}
 
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	// A skip probe descends once per distinct skipped prefix
 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
 	// side over the whole index (skipScanDescents, boundSelectivity 1).

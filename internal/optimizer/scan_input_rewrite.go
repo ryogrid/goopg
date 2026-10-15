@@ -273,7 +273,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog, 
 			// conjunct — the selectivity input. SAOP/range
 			// rewrites stay uncosted (today's behavior, named
 			// follow-ups).
-			if ch.bounds.eqConjunct != nil && seqWinsEqualityProbe(ss.Table, idx, ch.bounds.eqConjunct, ps) {
+			if ch.bounds.eqConjunct != nil && seqWinsEqualityProbe(cat, ss.Table, idx, ch.bounds.eqConjunct, ps) {
 				continue
 			}
 			newScan = &IndexScan{

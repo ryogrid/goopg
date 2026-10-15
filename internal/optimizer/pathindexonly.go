@@ -343,7 +343,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	if qpquals < 0 {
 		qpquals = 0
 	}
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	in := indexScanInputs{
 		relPages:                relPages,
 		relTuples:               relTuples,

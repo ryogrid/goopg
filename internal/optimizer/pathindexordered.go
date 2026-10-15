@@ -218,7 +218,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	// so `check_index_only`'s answer is always no). What is left is
 	// `useful_pathkeys != NIL`, which the non-empty `keys` above just
 	// established.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,

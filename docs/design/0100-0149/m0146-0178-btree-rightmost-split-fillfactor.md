@@ -1,9 +1,9 @@
 # M0146-0178 — B-tree rightmost-page splits at the fillfactor
 
-Status: blocked [!] — slice 1 (split rule) landed 2026-10-13. Slice 2 (the
-planner reads real index sizes) is implemented and parked as a patch
-(2026-10-15): the TPC-H acceptance arm cannot PASS while baseline-digests pins
-Q5 as an error (escalated). The heap-fetch term is the RELPAGES owner residual.
+Status: open — slice 1 (split rule) landed 2026-10-13. Slice 2 (the planner
+reads real index sizes) was parked as a patch on 2026-10-15 and lands after the
+owner's XFAIL pin unblocked the acceptance arm (OWNER DECISIONS 2026-10-15 (c)).
+The heap-fetch term is the RELPAGES owner residual.
 
 ## Problem
 
@@ -86,7 +86,7 @@ Three mechanisms are involved (evidence: `analysis/m0146/m0146-0178/`):
    move plans away from PG.
 3. **Heap trailing pages:** the RELPAGES owner residual (bulk extension).
 
-## Slice 2 — index size read in the catalog's database (2026-10-15, parked)
+## Slice 2 — index size read in the catalog's database (2026-10-15)
 
 **Cause.** `get_relation_info` sizes the index relation it opened with
 `RelationGetNumberOfBlocks` (`./postgres/src/backend/optimizer/util/plancat.c:466`),
@@ -140,19 +140,13 @@ the patched binary:
 Q13=35); `tpcds-sf025` PASS=99 with MISMATCH=0; `tpcds-fireset` PASS
 (introduced=none).
 
-**Why it is parked.** `tpch-acceptance-arm` against `bench/tpch/baseline-digests.txt`
-cannot pass:
-
-- every compared query matches (23 MATCH);
-- Q5 times out in both arms, and `baseline-digests.txt` pins exactly that error
-  since the 2026-10-15 corpus realign;
-- `digestdiff` turns an identical error in both arms into `BOTH-ERROR`, which
-  fails the verdict by design (`TestDiffBothErrorDoesNotPass`).
-
-So no costing, executor or optimizer commit can get a PASS stamp, whatever it
-changes. The commit hook requires that stamp. AGENT.md G1 forbids committing
-around it without an owner row in `.ralph/gate-exceptions.md`, so the change
-waits as a patch. It applies cleanly to `d7c05acde`.
+**Parking and landing.** The change waited as a patch while
+`tpch-acceptance-arm` could not pass for any tree. Every compared query matched,
+but `bench/tpch/baseline-digests.txt` pinned Q5's timeout as an error, and
+`digestdiff` failed a both-arms error by design. The owner resolved it with an
+`XFAIL` pin: a baseline-pinned error now passes as `EXPECTED-ERROR`, and a
+recovered query is `XFAIL-RESOLVED`, which forces a re-pin. The patch was then
+applied unchanged and re-gated.
 
 **Residuals.**
 

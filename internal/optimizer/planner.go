@@ -12175,7 +12175,7 @@ func indexLeadsRegIdentifierArray(tbl *catalog.Table, idx *catalog.Index) bool {
 // is the shape PG lands on. Anything unmeasurable (no stats,
 // non-positive selectivity) returns false — today's behavior —
 // never a fabricated seq win.
-func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
+func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
 		return false
 	}
@@ -12221,7 +12221,7 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 	if sel > 1 {
 		sel = 1
 	}
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	T := float64(relPages)
 	if T < 1 {
 		T = 1
@@ -12435,7 +12435,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	// same cost functions the search uses. A 1-page table loses to a
 	// sequential scan; declining returns the caller to its Seq Scan
 	// fallback — the shape PG lands on.
-	if seqWinsEqualityProbe(tbl, idx, queryClause, ctx.settings) {
+	if seqWinsEqualityProbe(cat, tbl, idx, queryClause, ctx.settings) {
 		return nil, false, nil
 	}
 	return &IndexScan{

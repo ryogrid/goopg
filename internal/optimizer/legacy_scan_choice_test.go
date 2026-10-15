@@ -56,7 +56,7 @@ func TestSeqWinsTinyUniqueProbe(t *testing.T) {
 	// the index descent plus random heap fetch loses to one
 	// sequential page under cost_seqscan/cost_index.
 	tbl, idx := probeFixture(t, "reasonlike", 35, 1, 35)
-	if !seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+	if !seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
 		t.Error("1-page unique probe must decline the index (seq wins)")
 	}
 }
@@ -66,7 +66,7 @@ func TestSeqLosesLargeUniqueProbe(t *testing.T) {
 	// the guard against pricing the probe at selectivity 1.0, which
 	// would flip every legacy probe to sequential.
 	tbl, idx := probeFixture(t, "factlike", 1_440_000, 25_866, 1_440_000)
-	if seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+	if seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
 		t.Error("large-table unique probe must keep the index")
 	}
 }
@@ -85,7 +85,7 @@ func TestSeqDeclinesWithoutStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+	if seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
 		t.Error("missing stats must keep the index (today's behavior)")
 	}
 }

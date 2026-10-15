@@ -562,8 +562,9 @@ func indexCorrelationFor(idx *catalog.Index, stats *catalog.ColumnStats) float64
 // point is index-level catalog statistics, not a better formula.
 //
 // `relTuples` is the heap's pre-restriction row count; a B-tree has one entry
-// per live heap tuple, so it is also the index's tuple count.
-func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
+// per live heap tuple, so it is also the index's tuple count. cat locates the
+// index file (nil: the package-level default-database lookup).
+func estimateIndexGeometry(cat catalog.Catalog, idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
 	indexTuples = relTuples
 	if indexTuples < 1 {
 		indexTuples = 1
@@ -624,7 +625,12 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
 	// real, which alone held the bitmap-vs-index probe choice on the wrong
 	// side of PG's (M0134-0183). `perPage` is re-derived from the real count
 	// so the tree-height estimate below reads the real fanout.
-	if real, ok := catalog.IndexRealPages(idx); ok && real > 0 {
+	//
+	// The file is found through cat, in the catalog's database, as PG sizes
+	// the index relation it opened (M0146-0178 slice 2): the package-level
+	// lookup put a DBOid-less index in database 1, missed the file in
+	// database 5, and priced the width guess instead.
+	if real, ok := catalog.IndexRealPagesIn(cat, idx); ok && real > 0 {
 		indexPages = float64(real)
 		if perPage < indexTuples/indexPages {
 			perPage = math.Ceil(indexTuples / indexPages)

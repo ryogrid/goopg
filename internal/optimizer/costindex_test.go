@@ -314,8 +314,8 @@ func TestEstimateIndexGeometryDerivesPagesAndHeight(t *testing.T) {
 		t.Fatal("orders_pkey missing from the fixture")
 	}
 
-	smallPages, smallTuples, smallHeight := estimateIndexGeometry(idx, orders, 100)
-	bigPages, bigTuples, bigHeight := estimateIndexGeometry(idx, orders, 1_500_000)
+	smallPages, smallTuples, smallHeight := estimateIndexGeometry(nil, idx, orders, 100)
+	bigPages, bigTuples, bigHeight := estimateIndexGeometry(nil, idx, orders, 1_500_000)
 
 	if smallTuples != 100 || bigTuples != 1_500_000 {
 		t.Fatalf("index tuples = %v/%v; a B-tree has one entry per heap tuple", smallTuples, bigTuples)
@@ -440,14 +440,14 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
 	// Histogram [1..500], id<200 -> 0.4 less eq_selec 1/500 = 0.398: 1000
 	// heap rows become 398 index rows.
 	tbl := statsTable()
-	_, tuples, _ := estimateIndexGeometry(mkPartial(t, tbl), tbl, 1000)
+	_, tuples, _ := estimateIndexGeometry(nil, mkPartial(t, tbl), tbl, 1000)
 	if tuples != 398 {
 		t.Errorf("partial index tuples = %v, want 398 (1000 x 0.398)", tuples)
 	}
 
 	// Non-partial index on the same shape keeps the heap count.
 	plain := &catalog.Index{Name: "t_id", Columns: []string{"id"}}
-	if _, tuples, _ := estimateIndexGeometry(plain, tbl, 1000); tuples != 1000 {
+	if _, tuples, _ := estimateIndexGeometry(nil, plain, tbl, 1000); tuples != 1000 {
 		t.Errorf("plain index tuples = %v, want 1000", tuples)
 	}
 
@@ -458,20 +458,20 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
 	if pe, err := parser.ParseExpr("id < 200"); err == nil {
 		bareIdx.Predicate = pe
 	}
-	if _, tuples, _ := estimateIndexGeometry(bareIdx, bare, 1000); tuples != 1000 {
+	if _, tuples, _ := estimateIndexGeometry(nil, bareIdx, bare, 1000); tuples != 1000 {
 		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
 	}
 
 	// Unanalysed despite a stats struct (Analyzed false): same decline.
 	unanalyzed := statsTable()
 	unanalyzed.Stats.Analyzed = false
-	if _, tuples, _ := estimateIndexGeometry(mkPartial(t, unanalyzed), unanalyzed, 1000); tuples != 1000 {
+	if _, tuples, _ := estimateIndexGeometry(nil, mkPartial(t, unanalyzed), unanalyzed, 1000); tuples != 1000 {
 		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
 	}
 
 	// Unresolvable predicate (nil): decline, never "keep nothing".
 	nilPred := &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true}
-	if _, tuples, _ := estimateIndexGeometry(nilPred, tbl, 1000); tuples != 1000 {
+	if _, tuples, _ := estimateIndexGeometry(nil, nilPred, tbl, 1000); tuples != 1000 {
 		t.Errorf("nil-predicate partial index tuples = %v, want 1000 (declined)", tuples)
 	}
 }

@@ -381,7 +381,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// loop count `create_index_path` takes from `get_loop_count` — the SAME
 	// scan model the unparameterised ordered path uses (pathindexordered.go),
 	// not a second one.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	// M0146-0005bq: build_index_paths' single `index_only_scan` flag
 	// (indxpath.c) — when check_index_only finds the index covers every
 	// column the statement reads from this rel, the ONE path PG builds for
@@ -567,7 +567,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	// in prefix order and each group's probe is suffix-ordered — so the
 	// index's pathkeys are as valid here as on the prefix path.
 	keys, dir := indexPathOrdering(idx, innerExprs, false)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	numSA, boundCounted := skipScanDescents(tbl, idx, skip, relTuples, indexPages)
 	// `indexBoundQuals` vs `indexQuals` (selfuncs.c:7643-7680): the heap
 	// side always filters by the probe's quals (`selectivity`), but the

@@ -3357,3 +3357,13 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     - Expected movement once unblocked: CATEGORIES\-EXCL\-MATCH parallelism 10 → 9 at SF0\.25 \(Q77\); index\-scan
       node costs at PG's for 45 nodes\. Resume: `git apply analysis/m0146/m0146\-0178/slice2/slice2\.patch`, re\-run
       the arm, commit\.
+  - **2026\-10\-15 slice 2 LANDED** \(the parked patch, unchanged; design §"Slice 2"\)\.
+    - Gates on the staged tree, after the owner's `:65433` reload finished: units rc=0, tpch\-spotcheck PASS \(Q12=2,
+      Q13=35\), tpch\-acceptance\-arm PASS \(23 MATCH \+ Q5 EXPECTED\-ERROR\), sf025 PASS=99, fire set PASS
+      \(introduced=none\)\.
+    - Parity \(measured on the patched binary, `slice2/` and `analysis/m0146/m0146\-0195/m0195\-s2\-asis\*`\): SF0\.25 match
+      80 → 80, CATEGORIES\-EXCL\-MATCH identical except parallelism 10 → 9 \(Q77, inside the ±3 band\); TPC-H 12 → 12\.
+      45 of 49 changed index\-scan nodes moved to PG's cost\.
+    - Movement: none — parity held; the only category move \(parallelism 10 → 9\) is inside the ±3 noise band\.
+    - Open: the two parallel worker\-count sites and `catalog\.TableRealPages` still use the default\-database lookup
+      \(no catalog reaches them\); the heap trailing\-page term is the RELPAGES owner residual\.

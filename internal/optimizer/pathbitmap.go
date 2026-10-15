@@ -183,7 +183,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	}
 
 	// Index geometry — same as the regular index scan cost model.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 
 	selectivity := qualSelectivity
 	in := indexScanInputs{
@@ -463,7 +463,7 @@ func (s *searchCtx) chooseBitmapAnd(
 		for col := range indexCols[i] {
 			coveredCols[col] = true
 		}
-		indexPages := indexPagesForPath(paths[i], tbl, relTuples)
+		indexPages := indexPagesForPath(s.cat, paths[i], tbl, relTuples)
 		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries, relQualOpCount(rel))
 
 		for j := i + 1; j < len(paths); j++ {
@@ -490,7 +490,7 @@ func (s *searchCtx) chooseBitmapAnd(
 			// Sum index pages across the AND group for cache-aware estimate.
 			var andIP float64
 			for _, inner := range inners {
-				ip, _, _ := estimateIndexGeometry(inner.IndexInfo, tbl, relTuples)
+				ip, _, _ := estimateIndexGeometry(s.cat, inner.IndexInfo, tbl, relTuples)
 				andIP += ip
 			}
 			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
@@ -536,7 +536,7 @@ func (s *searchCtx) chooseBitmapAnd(
 
 	// Recompute heap-access cost atop the AND tree.
 	tuplesFetched := clampRowEst(andSelec * relTuples)
-	andIP := indexPagesForPath(bitmapAndPath, tbl, relTuples)
+	andIP := indexPagesForPath(s.cat, bitmapAndPath, tbl, relTuples)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
 	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel))
 
@@ -658,7 +658,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 	sel = clampSelectivity(sel)
 	tuplesFetched := clampRowEst(sel * relTuples)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,

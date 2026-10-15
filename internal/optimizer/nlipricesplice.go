@@ -140,7 +140,7 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams) 
 	probeRows := parameterizedBaserelRows(innerRel, idx,
 		parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
 	relPages := baseRelPages(tbl, relTuples)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	probeCost := costIndexScan(cp, indexScanInputs{
 		relPages: relPages, relTuples: relTuples,
 		indexPages: indexPages, indexTuples: indexTuples, treeHeight: treeHeight,
