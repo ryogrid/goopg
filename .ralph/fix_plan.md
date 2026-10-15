@@ -1099,6 +1099,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       re\-verified and marked resolved by `d6e42a7f7`. The SeqScanOp batch
       entry stays open; it is the next M0122\-0012 slice and targets
       `decodeRowRangeInfo`.
+  - **By\-value integer deform arm LANDED 2026\-10\-16 \(loop \#37\)**.
+    Movement: none — perf only. The S3 instrument is value/plan identity:
+    sf025 `PASS=99 PLAN-SHAPE same=99`, fire\-set `fires=none`, ea\-ratchet
+    PASS, and full `TestPort_RegressSuite` PASS. Same design doc, "Slice 3".
+    - `perf annotate`: 47.8% of `decodeRowRangeInfo` sat on the reload of the
+      stack\-returned 48\-byte `Datum`, a store\-forwarding stall.
+      `colTypeInfo.intWidth` now lets int2/int4/int8 decode in place \(PG
+      `fetch_att`\), pinned by `TestDeformIntFastArmMatchesDecoder`.
+    - Measured: the filtered SF1 `store_sales` scan went from ~1590 ms to
+      ~1250 ms \(−21%\). TPC\-H arm: values identical, 39.73 s → 38.91 s.
+    - Ruled out: an `OutputStyle`\-by\-pointer variant measured ~1%, inside
+      the noise, and was not kept.
+    - Next lever: the same stall on non\-integer columns \(numeric\) in the
+      generic decoder.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

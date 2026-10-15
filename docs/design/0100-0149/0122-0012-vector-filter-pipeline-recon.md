@@ -210,3 +210,41 @@ The `decodeRowRangeInfo` share is the scan-resident batch successor's target.
 It is still open as the SeqScanOp predicate-batch entry in
 `unimplemented_feat.json`. The filterOp wiring entry (M0076-0002) is resolved
 by slice 1 (`d6e42a7f7`).
+
+## Slice 3 (2026-10-16): by-value integer deform arm — store-forwarding stall removed
+
+After slice 2, `decodeRowRangeInfo` was 35.5 % of the filtered SF1 `store_sales` scan (`perf record -e cycles:u`),
+and almost all of it was flat in the loop itself, not in the value decoder. `perf annotate` put 47.8 % of the
+function's samples on one instruction: the first 16-byte load right after `decodePhysicalPGValueLowered` returns.
+
+- **Cause.** `Datum` is 48 bytes and 11 words, so it is too large for Go's register ABI and is returned through a
+  stack slot. Every `NewXxxDatum` arm writes that slot as three 16-byte zeroing stores, then a 1-byte `Kind` store
+  and 8-byte field stores. The caller then copies the slot with 16-byte loads. A load that spans a wider and a
+  narrower pending store cannot be store-forwarded, so it waits for the stores to retire. That happens once per
+  column per row.
+- **Ruled out.** Passing the 72-byte `array.OutputStyle` by pointer (the copy visible beside the call) measured
+  ~1 % (1580 → 1570 ms), inside the noise. That experiment was not kept.
+- **Change.** `colTypeInfo.intWidth` is resolved once per scan by `intWidthForLoweredName`: 2, 4 or 8 for the
+  int2/int4/int8 spellings, 0 for anything else, including arrays. When it is set, `decodeRowRangeInfo` writes
+  `NewIntDatum` straight into `dst[i]`. Alignment, the NULL bitmap, the missing-attribute arm and the exhausted-data
+  arm all run first, unchanged. A value shorter than its width falls through to the generic decoder, which reports
+  the error as before. This is PG's `fetch_att` for a by-value attribute (`postgres/src/include/access/tupmacs.h`),
+  which `slot_deform_tuple` reads in place.
+- **Sibling pin.** `TestDeformIntFastArmMatchesDecoder` checks the following against the generic path:
+  - every spelling's width is what the generic decoder consumes, as a `KindInt`;
+  - non-integer and array names get 0;
+  - row decodes with alignment padding, a NULL and the extreme values of each width agree (`reflect.DeepEqual`,
+    same end offset);
+  - truncated payloads give the same error.
+- **Measured.** Same SF1 clone and query, fresh server per arm, two rounds of 5 runs:
+  - HEAD `f42e9a99b`: 1585 / 1592 / 1585 / 1602 and 1582 / 1605 / 1602 / 1594 ms (warm runs).
+  - Candidate: 1279 / 1252 / 1300 / 1244 and 1245 / 1268 / 1167 / 1163 ms.
+  - That is ~1590 → ~1250 ms, −21 %. The `decodeRowRangeInfo` share fell from 35.5 % to 20.3 %.
+  - TPC-H acceptance arm: values identical (PASS vs `bench/tpch/baseline-digests.txt`), total 39.73 → 38.91 s.
+    HammerDB declares TPC-H's keys NUMERIC, so this arm rarely fires there.
+- **Plans and values.** sf025 `PASS=99 PLAN-SHAPE same=99`; fire-set `fires=none` on both corpora; full
+  `TestPort_RegressSuite` passes (Rule #5: decode-path change).
+
+The generic decoder still pays the same stall for every non-integer column, numeric included, which is the scan's
+remaining deform cost. The fix there is the same shape (decode into the destination, or a per-type arm). The
+SeqScanOp batch entry stays open in `unimplemented_feat.json`.

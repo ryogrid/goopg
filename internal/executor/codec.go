@@ -1480,6 +1480,28 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			dst[i] = NullDatum
 			continue
 		}
+		// M0122-0012: a by-value integer is read straight into the slot, as
+		// PG's fetch_att does. Through the generic decoder the 48-byte Datum
+		// comes back in a stack slot written with mixed-width stores and is
+		// reloaded at once with 16-byte loads, which cannot be forwarded: that
+		// stall was about half of a filtered store_sales scan's deform. A
+		// truncated value falls through so the generic arm reports it.
+		if info != nil {
+			switch w := info[i].intWidth; {
+			case w == 4 && len(data)-off >= 4:
+				dst[i] = NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[off:]))))
+				off += 4
+				continue
+			case w == 8 && len(data)-off >= 8:
+				dst[i] = NewIntDatum(int64(binary.LittleEndian.Uint64(data[off:])))
+				off += 8
+				continue
+			case w == 2 && len(data)-off >= 2:
+				dst[i] = NewIntDatum(int64(int16(binary.LittleEndian.Uint16(data[off:]))))
+				off += 2
+				continue
+			}
+		}
 		v, consumed, err := decodePhysicalPGValueLowered(&c.Type, tname, data[off:], sctx, st)
 		if err != nil {
 			return off, fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
