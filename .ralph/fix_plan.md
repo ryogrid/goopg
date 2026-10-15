@@ -3303,6 +3303,28 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0204 — TPC\-DS SF1 Q68: goopg probes `household\_demographics\_pkey` in a Nested Loop above the `store` join, where PG hash\-joins a 1800\-row seq\-scanned `household\_demographics` below it \(join\-method\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016g/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 355cf2d1f: five categories tie at 1 actionable record \(join\-method SF1 Q68, parameterisation TPC-H Q2,
+    aggregation SF1 Q45, sort\-strategy SF1 Q18, qual\-placement SF1 Q54\); the differ's category order puts join\-method
+    first\. Verdict SHAPE\-DIFF, first divergence depth 8 under the Nested Loop of the parallel subtree below
+    `Gather Merge`\. SF0\.25 Q68 is MATCH\.
+  - PG: `store\_sales ⋈ date\_dim` \(63104\.18, 687 rows\), then a Hash Join on `ss\_hdemo\_sk` over a Hash on a Seq Scan
+    of `household\_demographics` \(161\.00, 1800 rows\), then `store`, 63291\.35, 157 rows\. goopg: `store\_sales ⋈
+    date\_dim` \(63105\.03, 658 rows\), then `store`, then a Nested Loop probing `household\_demographics\_pkey`,
+    63300\.56, 150 rows\. Row estimates agree at every level, so the difference is in the costs\.
+  - PG's `cost\_hashjoin` arithmetic on goopg's inputs gives about 63294 for the hash\-first order, about 6 below
+    goopg's choice\. Suspects: \(a\) the partial hash join with a serial Hash inner on `household\_demographics` is not
+    generated \(goopg does build one for `store`\); \(b\) it is generated but priced higher, for example by the
+    seq scan's filter cost, the unnarrowed inner width, or the bucket\-size term\.
+  - First step: DP trace of SF1 Q68 \(estimate\-audit arm, `\-queries 68`, on a private clone\); check that the
+    hash\-`household\_demographics` candidate is in the pathlist \(instrument `addPath`\) and compare its cost terms
+    with PG's `final\_cost\_hashjoin`\. The gap is about 0\.01%, so also measure whether the record belongs in the
+    COSTTIE band; if it does, record it as a waived residual instead of changing costs\.
+  - Expected instrument: SF1 PLAN\-PARITY match 71 → 72 \(Q68\); CATEGORIES\-EXCL\-MATCH join\-method down; SF0\.25 Q68 stays
+    MATCH\.
 - [x] **M0146-0203 — TPC-H Q20: goopg seq\-scans `supplier` at 100\.00 and applies `n\_name = 'CANADA'` on the Nested Loop over a Memoize'd `nation\_pk` probe, where PG filters `nation` and bitmap\-probes `supplier` \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016f/ROUTING\.md`\)\.
   Kind: impl
