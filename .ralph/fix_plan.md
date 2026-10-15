@@ -3303,6 +3303,24 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0210 — TPC\-DS SF1 Q54: goopg's semi\-join Unique estimates 1 row from a 2\-row input, and the join order above it differs from PG's \(qual\-placement\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016k/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 3f5f73822 \(routing\-20261016j still fresh\): qual\-placement SF1 Q54 is the only actionable record left;
+    SF1 Q18 was re\-routed to COSTTIE by M0146\-0209\. Verdict SHAPE\-DIFF, first divergence depth 6 under the inner
+    GroupAggregate\. SF0\.25 Q54 is MATCH\.
+  - PG: `Unique` \(2 rows\) over `Sort` over `Gather` \(2\), then `⋈ customer\_address`, then `⋈ Materialize\(store\)` with
+    the ca/store Join Filter, then `⋈ Gather\(store\_sales ⋈ date\_dim\)` on `c\_customer\_sk = ss\_customer\_sk`\. goopg:
+    `Unique` \(1 row\) over `Gather Merge` \(2\), then `⋈ Gather\(store\_sales ⋈ date\_dim\)`, then `⋈ customer\_address`, then
+    `⋈ store`\. Top Nested Loop: PG 82996\.61, goopg 82979\.02\.
+  - Lead: PG sizes the semi\-join unique\-ification with `estimate\_num\_groups` over the RHS expressions, clamped to the
+    input's 2 rows\. goopg's 1 suggests it sizes from the per\-worker partial rows\.
+  - First step: DP trace of SF1 Q54 on a private clone\. Find the producer of the unique\-ified \{item, catalog/web\_sales,
+    date\_dim\_1, customer\} rel and its row estimate input; compare with PG's `create\_unique\_path` \(pathnode\.c\) and
+    `estimate\_num\_groups`\. Then check whether the Sort\-over\-Gather vs Gather Merge choice under the Unique is a
+    fuzz\-boundary tie, as M0146\-0209 found\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q54\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl
