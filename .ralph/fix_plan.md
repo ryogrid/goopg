@@ -1125,6 +1125,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       TPC\-H arm: values identical, 38.91 s → 36.56 s \(Q1 4.71 → 3.89 s\).
     - Next lever: expression evaluation — `evalFastExpr` 27.5%, `evalBinary`
       8%, `compareDatum` 6.5%.
+  - **NewBoolDatum result table LANDED 2026\-10\-16 \(loop \#39\)**.
+    Movement: none — perf only. The S3 instrument is value/plan identity:
+    sf025 `PASS=99 PLAN-SHAPE same=99`, fire\-set `fires=none`, ea\-ratchet
+    PASS. Same design doc, "Slice 5".
+    - `NewBoolDatum` copies `boolDatums[b]` instead of building, which avoids
+      the byte\-wide `Kind` store the caller's reload stalls on. Pinned by
+      `TestNewBoolDatumTable`.
+    - Measured: the SF1 filtered scan improved ~5% \(~1150 → ~1095 ms\).
+      TPC\-H arm: values identical, 36.56 s → 35.93 s.
+    - Ruled out: an `ExprIntConst` precomputed Datum measured neutral to
+      worse and was not kept.
+    - Next lever: the recursive `\(Datum, error\)` return in `evalFastExpr`
+      itself, which needs an in\-place evaluator \(structural\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

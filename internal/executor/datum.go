@@ -374,12 +374,20 @@ func (d Datum) NumericScaleValue() int16 { return d.Scale }
 
 // NewBoolDatum constructs a KindBool Datum with the given value.
 func NewBoolDatum(b bool) Datum {
-	d := Datum{Kind: KindBool}
 	if b {
-		d.Int = 1
+		return boolDatums[1]
 	}
-	return d
+	return boolDatums[0]
 }
+
+// boolDatums are NewBoolDatum's two results, copied out rather than built
+// (M0122-0012). A Datum is returned through a stack slot. Building one zeroes
+// that slot with 16-byte stores and then writes Kind as a single byte, and the
+// caller's 16-byte reload of a slot written that way cannot be store-forwarded.
+// Every comparison in a scan qual returns through here. Copying a stored Datum
+// writes the slot at full width, so the reload forwards; that measured about 5%
+// of a filtered TPC-DS store_sales scan. The array is never written.
+var boolDatums = [2]Datum{{Kind: KindBool}, {Kind: KindBool, Int: 1}}
 
 // NewIntDatum constructs a KindInt Datum.
 func NewIntDatum(i int64) Datum {

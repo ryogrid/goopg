@@ -279,3 +279,26 @@ Both return in registers.
 Across slices 2-4 the filtered scan went from ~1970 ms to ~1148 ms, and the TPC-H arm from 40.28 s to 36.56 s. The
 profile is now led by expression evaluation: `evalFastExpr` 27.5 %, `evalBinary` 8 %,
 `NumericInt64FromStoredPayload` 8 %, `compareDatum` 6.5 %.
+
+## Slice 5 (2026-10-16): NewBoolDatum copies a stored result
+
+After slice 4, `evalFastExpr` led the profile at 27.5 %. `perf annotate` spread its samples over Datum copies right
+after the recursive child calls (`exprnode.go` left/right operands) and after `evalBinary`. It is the slice-3 stall
+again, wherever the callee builds a fresh `Datum` with a byte-wide `Kind` store. Every comparison's result does
+that through `NewBoolDatum`.
+
+- **Change.** `NewBoolDatum` returns a copy of `boolDatums[0]` or `boolDatums[1]`, which hold the same two values it
+  used to build. The copy writes the return slot at full width, so the caller's reload forwards. The array is
+  unexported and never written. `TestNewBoolDatumTable` pins both values and checks that mutating a result cannot
+  reach the table.
+- **Ruled out.** Precomputing the `ExprIntConst` Datum at build time (returned via `constVal`) measured neutral to
+  slightly worse: ~1183 / ~1200 ms against HEAD's ~1160 / ~1145 ms. It was not kept.
+- **Measured.** Same SF1 clone and query, fresh server per arm, two rounds:
+  - HEAD `93dafe89c`: ~1142 / ~1173 ms (warm medians).
+  - Candidate: ~1104 / ~1088 ms. That is about −5 %.
+  - TPC-H acceptance arm: values identical, total 36.56 → 35.93 s (Q1 3.89 → 3.60 s).
+- **Gates.** sf025 `PASS=99 PLAN-SHAPE same=99`; fire-set `fires=none`; ea-ratchet PASS.
+
+Across slices 2-5 the filtered scan went from ~1970 ms to ~1095 ms, and the TPC-H arm from 40.28 s to 35.93 s. The
+remaining expression-evaluation cost is the recursive `(Datum, error)` return itself. Removing it means an
+evaluator that writes results in place: a structural change, filed as the next slice rather than done piecemeal.
