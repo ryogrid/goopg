@@ -2915,6 +2915,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-16 — **exhausted at `aa56ea7e6`** \(M0122\-0012 slice 4 changed internal/executor\)\.
     Census `routing\-20261016o` uses a fresh TPC\-H capture plus the fire\-set\-s4 candidate captures\. The records are
     byte\-identical to `routing\-20261016n` \(20/22, 84/99, 73/99\)\. No task is filed; the gates are unchanged\.
+  - S9 re\-check 2026\-10\-16 — **exhausted at `378ad9ecf`** \(M0122\-0012 slice 5 changed internal/executor\)\.
+    Census `routing\-20261016p` uses a fresh TPC\-H capture plus the fire\-set\-s5 candidate captures\. The records are
+    byte\-identical to `routing\-20261016o` \(20/22, 84/99, 73/99\)\. No task is filed; the gates are unchanged\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
