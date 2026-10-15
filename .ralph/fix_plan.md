@@ -2812,6 +2812,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-14 — **exhausted at `7dfe93df3`** \(S6b\'s pending relation deletes changed internal/executor\)\.
     Census `routing\-20261014i` is a fresh capture of all three corpora\. The records are identical to
     `routing\-20261014h` \(81/99, 66/99, 14/22\)\. No task is filed\.
+  - S9 pass 2026\-10\-15 at `a00fb8110` \(corpora changed: SF0\.25 reload, TPC\-H realign\) — **filed M0146\-0195**
+    \(join\-method, 4 actionable\); `routing\-20261015/ROUTING\.md`\. Q56/Q60 routed to M0141\-S2b\-4e\.
   - S9 re\-check 2026\-10\-14 — **exhausted at `c3dcb0f5f`** \(S6c\'s abort\-time relation deletes changed
     internal/executor\)\. Census `routing\-20261014j` is a fresh capture of all three corpora\. The records are identical
     to `routing\-20261014i` \(81/99, 66/99, 14/22\)\. No task is filed\.
@@ -3171,6 +3173,29 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Rank: below item 10 — regress\-only witness, no TPC query named \(S7 carve\-out\)\.
   - First step: skip the ordered producer for an index the restriction producer already built a clause path for
     \(the same rule `restrictionPathIsIndexOnly` applies to its index\-only twin\), then re\-run the fire set\.
+- [ ] **M0146-0195 — TPC-H lineitem order-key probe: PG's parameterised `idx_lineitem_orderkey_fkidx` Nested Loop, goopg's hash join \(Q3/Q7 join-method, Q5 scan-type\)**
+  \(filed 2026-10-15 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261015/ROUTING.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census: join-method is the top actionable category \(4: TPC-H Q2, Q3, Q7; SF0\.25 Q43\)\. Records on the
+    realigned TPC-H corpus \(`routing-realign-20261015`\), verdict SHAPE-DIFF:
+    - Q3 depth 3 under Gather: PG Nested Loop with `Index Scan using idx\_lineitem\_orderkey\_fkidx` \(0\.43\.\.1\.58,
+      9 rows\); goopg Parallel Hash Join over a Parallel Seq Scan on lineitem\.
+    - Q7 depth 4 under Hash Join: same probe in PG \(0\.43\.\.1\.20\); goopg Parallel Hash Join\.
+    - Q5 depth 7 \(scan\-type\): PG probes `idx\_lineitem\_orderkey\_fkidx` \(3\.31\), goopg `lineitem\_pk` \(7\.77\)\.
+      Q5's goopg plan runs past the 600s digest cap — the error `bench/tpch/baseline\-digests\.txt` pins, which
+      makes the acceptance arm unpassable \(M0146\-0178 escalation\); a fix here is the owner's option \(c\) path\.
+    - Same queries: goopg's `order\_customer\_fkidx` probes price \~0\.65 above PG's \(2\.21 vs 1\.56, 2\.29 vs 1\.64\)\.
+    - Q2 and SF0\.25 Q43 are the reverse direction \(PG Hash Join, goopg Nested Loop\); fold in only if the first
+      step finds the same cost term\.
+  - First step: on a private TPC-H clone, list goopg's lineitem paths for Q3's orders⋈lineitem join \(is the
+    parameterised `idx\_lineitem\_orderkey\_fkidx` path generated, and at what cost\) against PG's cost\_index terms
+    \(costsize\.c: index pages, tree height, correlation, Mackert\-Lohman\); check whether M0146\-0178 slice 2's
+    index\-page resolution changes the TPC-H figures\.
+  - Expected instrument: TPC-H PLAN-PARITY match 12 → up to 15 \(Q3, Q5, Q7\); CATEGORIES-EXCL-MATCH join-method and
+    scan-type down\.
+  - Gate note: any production change here needs the acceptance\-arm PASS stamp, unpassable since 2026\-10\-15
+    until the owner acts \(M0146\-0178 escalation\)\.
 - [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
