@@ -516,3 +516,119 @@ func TestVacuumTailTruncationKeepsVMSkippedBlocks(t *testing.T) {
 		t.Fatalf("post-truncate nblocks=%d want %d — live all-visible blocks were truncated away", n, nBlocks-1)
 	}
 }
+
+// TestVacuumTailTruncationDropsUnusedTail is the M0146-0206 repro: a tail
+// emptied by DELETE keeps its line pointers but they are LP_UNUSED after
+// reclamation, so the page no longer counts as non-empty
+// (count_nondeletable_pages checks ItemIdIsUsed, not the bare pointer
+// count). Before the fix the tail survived both passes.
+func TestVacuumTailTruncationDropsUnusedTail(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	// The LP_DEAD → LP_UNUSED second pass needs the lifecycle capability.
+	storage.SetHeapLinePointerLifecycle(true)
+	defer storage.SetHeapLinePointerLifecycle(false)
+
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+	tx2, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid2, _ := mvccMgr.AssignXID(tx2)
+	tx2.XID = xid2
+	mvccMgr.Commit(tx2)
+
+	const nBlocks, filled = 40, 10
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		tup := storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("live"))
+		if int(b) >= filled {
+			tup = storage.NewHeapTuple(xid1, xid2, []byte("dead")) // xmax committed below horizon
+		}
+		addTuple(t, pool, rel, b, tup)
+	}
+	pool.SetLogSmgrTruncateTo(func(storage.RelFileNode, storage.BlockNumber) error { return nil })
+
+	// Pass 1: the index-less scan leaves dead items LP_DEAD for the
+	// (simulated) index pass; LP_DEAD still counts as used, so no
+	// truncation may happen yet.
+	st1, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{Truncate: true})
+	if err != nil {
+		t.Fatalf("vacuum pass 1: %v", err)
+	}
+	if len(st1.DeadTIDs) == 0 {
+		t.Fatalf("pass 1 collected no dead TIDs (stats=%+v)", st1)
+	}
+	if n, _ := pool.NBlocks(rel); n != nBlocks {
+		t.Fatalf("pass 1 truncated to %d blocks while LP_DEAD items remained — index entries would dangle", n)
+	}
+	// The index pass completes: dead items become LP_UNUSED.
+	if _, err := VacuumDeadItems(pool, rel, st1.DeadTIDs); err != nil {
+		t.Fatalf("VacuumDeadItems: %v", err)
+	}
+
+	// Pass 2: the tail is now UNUSED-only and must go.
+	if _, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{Truncate: true}); err != nil {
+		t.Fatalf("vacuum pass 2: %v", err)
+	}
+	if n, _ := pool.NBlocks(rel); n != filled {
+		t.Fatalf("post-truncate nblocks=%d want %d — UNUSED-only tail survived", n, filled)
+	}
+}
+
+// TestVacuumTailTruncationTruncatesVM covers the other half of M0146-0206:
+// a heap tail truncation drops the visibility-map bits for the removed
+// blocks (visibilitymap_prepare_truncate), so a stale ALL_VISIBLE can never
+// inflate relallvisible past relpages or leak onto a re-extended block.
+func TestVacuumTailTruncationTruncatesVM(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	vm := storage.NewVisibilityMap()
+	mvccMgr := transam.NewManager()
+	tx1, _ := mvccMgr.Begin(transam.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+
+	const nBlocks, filled = 40, 10
+	if _, err := pool.ExtendRelationBatch(rel, nBlocks); err != nil {
+		t.Fatalf("ExtendRelationBatch: %v", err)
+	}
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		if int(b) < filled {
+			addTuple(t, pool, rel, b, storage.NewHeapTuple(xid1, storage.InvalidTransactionID, []byte("v")))
+		}
+		// Stale all-visible on every block — including the soon-truncated tail.
+		vm.SetAllVisible(rel, b)
+	}
+	pool.SetLogSmgrTruncateTo(func(storage.RelFileNode, storage.BlockNumber) error { return nil })
+
+	// Aggressive disables the VM page skip so the stale tail bits cannot
+	// make the empty tail look non-empty through the skip path.
+	if _, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{VM: vm, Truncate: true, Aggressive: true}); err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if n, _ := pool.NBlocks(rel); n != filled {
+		t.Fatalf("post-truncate nblocks=%d want %d", n, filled)
+	}
+	if got := vm.CountAllVisible(rel); got != filled {
+		t.Fatalf("CountAllVisible=%d want %d — stale VM bits past the new end", got, filled)
+	}
+	for b := storage.BlockNumber(filled); b < nBlocks; b++ {
+		if vm.AllVisible(rel, b) {
+			t.Fatalf("truncated block %d still ALL_VISIBLE", b)
+		}
+	}
+	// A re-extended block starts with a clean slate.
+	if _, err := pool.ExtendRelationBatch(rel, 1); err != nil {
+		t.Fatalf("re-extend: %v", err)
+	}
+	if vm.AllVisible(rel, filled) {
+		t.Fatalf("re-extended block %d inherited a stale ALL_VISIBLE bit", filled)
+	}
+}

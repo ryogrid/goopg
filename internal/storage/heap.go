@@ -604,6 +604,28 @@ func PageLinePointerCount(p Page) (int, error) {
 	return (lower - SizeOfPageHeaderData) / itemIDSize, nil
 }
 
+// PageUsedLinePointerCount returns the number of line pointers that are in
+// use — upstream's ItemIdIsUsed (NORMAL, REDIRECT, DEAD), so a page whose
+// slots were all reclaimed to LP_UNUSED counts as empty for VACUUM's tail
+// truncation (count_nondeletable_pages, vacuumlazy.c).
+func PageUsedLinePointerCount(p Page) (int, error) {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for i := 0; i < count; i++ {
+		item, err := readItemID(p, i)
+		if err != nil {
+			return 0, err
+		}
+		if item.Flags != ItemIDUnused {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // PageGetHeapFreeSpace reports how many bytes of tuple payload the page can
 // still accept, mirroring PG's PageGetHeapFreeSpace
 // (postgres/src/backend/storage/page/bufpage.c:988) layered over

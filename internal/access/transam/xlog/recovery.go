@@ -1236,7 +1236,14 @@ func replaySmgrTruncateTo(mgr *storage.Manager, payload []byte) error {
 	if rel.Fork != storage.MainFork {
 		return nil // auxiliary forks have no tail-truncation semantics yet
 	}
-	return mgr.TruncateRelationTo(rel, storage.BlockNumber(nBlocks))
+	if err := mgr.TruncateRelationTo(rel, storage.BlockNumber(nBlocks)); err != nil {
+		return err
+	}
+	// smgr_redo's SMGR_TRUNCATE_VM arm: the _vm fork is truncated and its
+	// last kept page's tail bits cleared, as visibilitymap_prepare_truncate
+	// (M0146-0206 — a stale all-visible bit past the heap's end would let a
+	// re-extended page inherit visibility it never earned).
+	return storage.VMTruncateForkForHeap(mgr, rel, storage.BlockNumber(nBlocks))
 }
 
 // EncodeSmgrTruncate encodes a relation-file truncation record.

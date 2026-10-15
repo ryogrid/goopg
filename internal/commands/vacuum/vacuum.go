@@ -241,7 +241,10 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			pool.Unpin(slot)
 			return stats, err
 		}
-		if cnt, cerr := storage.PageLinePointerCount(page); cerr == nil && (cnt > 0 || liveOnPage > 0) {
+		// A page is non-empty for tail truncation only while it holds a used
+		// line pointer (ItemIdIsUsed — count_nondeletable_pages): slots already
+		// reclaimed to LP_UNUSED no longer keep it.
+		if cnt, cerr := storage.PageUsedLinePointerCount(page); cerr == nil && (cnt > 0 || liveOnPage > 0) {
 			lastNonEmpty = blk
 		}
 		reclaimed := pr.Reclaimed()
@@ -261,7 +264,10 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			}
 			pageDirty = true
 			stats.Dead += reclaimed
-			lastNonEmpty = blk
+			// Reclaiming items does not make the page non-empty for tail
+			// truncation (vacuumlazy.c hastup counts only NORMAL/REDIRECT
+			// survivors): the used-pointer check above already reflects the
+			// post-prune state.
 		}
 		// Collect dead TIDs for index vacuum (M0047-0002): every LP_DEAD item
 		// on the page, whether this prune or an earlier on-access prune left
@@ -370,6 +376,11 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 				// (FreeSpaceMapPrepareTruncateRel): a free-space entry
 				// left for a removed block sends the next insert past EOF.
 				opts.FSM.TruncateRel(rel, keep)
+				// Same for the visibility map (visibilitymap_prepare_truncate):
+				// a stale all-visible bit past the new end would over-report
+				// relallvisible and hand a re-extended page visibility it
+				// never earned.
+				opts.VM.TruncateRel(rel, keep)
 			}
 		}
 	}

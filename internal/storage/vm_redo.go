@@ -82,6 +82,50 @@ func VMPageSetBits(p Page, heapBlk BlockNumber, bits uint8) (bool, error) {
 	return true, nil
 }
 
+// VMTruncateForkForHeap is smgr_redo's SMGR_TRUNCATE_VM arm
+// (visibilitymap_prepare_truncate): keep the VM pages that cover the heap's
+// remaining nblocks, clear the tail bits of the last one, and drop the rest.
+// goopg's truncate record carries no SMGR_TRUNCATE_VM flag — a main-fork
+// truncation ALWAYS prepares the VM, so a stale all-visible bit can never
+// outlive the heap pages it described. A missing _vm fork is a no-op.
+func VMTruncateForkForHeap(m *Manager, rel RelFileNode, nblocks BlockNumber) error {
+	vmRel := RelFileNode{DBOid: rel.DBOid, RelOid: rel.RelOid, Fork: VisibilityMapFork}
+	if !m.Exists(vmRel) {
+		return nil
+	}
+	// HEAPBLK_TO_MAPBLOCK / HEAPBLK_TO_MAPBYTE / HEAPBLK_TO_OFFSET.
+	truncBlock := nblocks / VMHeapBlocksPerPage
+	within := uint64(nblocks) % uint64(VMHeapBlocksPerPage)
+	truncByte := int(within) / VMPagesPerByte
+	truncOff := uint(within) % VMPagesPerByte
+	// The file may already be smaller than the truncation point (replay is
+	// idempotent; a second redo must not read past the fork's end).
+	if have, err := m.NBlocks(vmRel); err != nil {
+		return err
+	} else if have <= truncBlock {
+		return nil
+	}
+	newNBlocks := truncBlock
+	if truncByte != 0 || truncOff != 0 {
+		// The last remaining map page covers both kept and removed heap
+		// blocks: clear its tail bits before shortening the fork.
+		newNBlocks = truncBlock + 1
+		page := make([]byte, BlockSize)
+		if err := m.ReadBlock(vmRel, truncBlock, page); err != nil {
+			return err
+		}
+		data := page[vmDataOffset:]
+		for i := truncByte + 1; i < len(data); i++ {
+			data[i] = 0
+		}
+		data[truncByte] &= (1 << truncOff) - 1
+		if err := m.WriteBlock(vmRel, truncBlock, page); err != nil {
+			return err
+		}
+	}
+	return m.TruncateRelationTo(vmRel, newNBlocks)
+}
+
 // VMPageClearBits is the page mutation inside visibilitymap_clear: AND away the
 // given bits for heapBlk. Returns whether anything changed, matching upstream's
 // `cleared` return.
