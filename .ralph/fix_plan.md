@@ -3355,7 +3355,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), tpcds\-sf025 PASS=99, tpcds\-fireset
       PASS \(introduced=none\), ea\-ratchet PASS\.
   Movement: yes — TPC\-DS SF0\.25 PLAN\-PARITY match 85 → 84 \(Q84 regression, filed M0146\-0212\); SF1 73 and TPC\-H 20 held\.
-- [ ] **M0146-0212 — REGRESSION \(M0146\-0211\): TPC\-DS SF0\.25 Q84 plans Sort over Gather where PG plans Gather Merge \(sort\-strategy, parallelism\)** \(filed 2026\-10\-16 by M0146\-0211\)\.
+- [x] **M0146-0212 — REGRESSION \(M0146\-0211\): TPC\-DS SF0\.25 Q84 plans Sort over Gather where PG plans Gather Merge \(sort\-strategy, parallelism\)** \(filed 2026\-10\-16 by M0146\-0211\)\.
   Kind: impl
   Parent: M0146-0211
   - goopg now plans Sort \(8271\.18\.\.8271\.21\) over Gather; the Gather Merge it elected before costs 8269\.98\.\.8271\.23\.
@@ -3368,9 +3368,20 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     `create\_ordered\_paths` and `add\_path` for the ordered rel, as M0146\-0209 did, then port the deciding term\.
     Never restore a charge chosen by result \(R6\)\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 84 → 85 \(Q84\)\.
+  - Closed 2026\-10\-16: not a defect\. The record is the M0146\-0019 corpus\-VACUUM residual\. Evidence in
+    `analysis/m0146/m0146\-0212/FINDINGS\.md`\.
+    - A PG debug build loaded with the same tpcds025 tables plans Sort over Gather right after ANALYZE, and Gather
+      Merge once autovacuum has set the visibility map \(the cheaper index\-only probes move the tie\)\.
+    - goopg on its never\-vacuumed corpus \(relallvisible 0\) plans Sort over Gather\. After VACUUM on a private clone it
+      plans Gather Merge, PG's shape\.
+    - The pre\-0211 match came from the removed one\-armed Project charge\.
+    - Premise stale: the record is a corpus residual, not a costing defect\.
+  Movement: none — premise stale: SF0\.25 Q84 is the M0146\-0019 corpus\-VACUUM residual \(PG itself plans Sort over Gather on the unvacuumed tables\); M0146\-0211 is consistent with PG\.
   > \#\# ESCALATION 2026\-10\-16 \(R3\) — M0146\-0211 lost SF0\.25 Q84
   > The change was kept, not reverted: it removes a non\-PG, one\-armed Project charge\. SF0\.25 match 85 → 84, SF1 and
   > TPC\-H held\. Owner: confirm keeping it, or direct otherwise\.
+  > Update 2026\-10\-16 \(M0146\-0212 close\): PG plans the same Sort over Gather on the unvacuumed tables, and goopg
+  > plans Gather Merge after VACUUM\. The loss is the M0146\-0019 corpus residual, not a defect of 0211\.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl
