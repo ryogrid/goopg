@@ -3303,6 +3303,21 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0203 — TPC-H Q20: goopg seq\-scans `supplier` at 100\.00 and applies `n\_name = 'CANADA'` on the Nested Loop over a Memoize'd `nation\_pk` probe, where PG filters `nation` and bitmap\-probes `supplier` \(qual\-placement\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016f/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 692c9df93: qual\-placement is the top actionable category \(2: TPC-H Q20, SF1 Q54\)\. Verdict SHAPE\-DIFF,
+    first divergence depth 2 under the semi join: PG Nested Loop \(Seq Scan nation Filter n\_name, Bitmap Heap Scan
+    supplier on supplier\_nation\_fkidx\) 252\.34 \| goopg Nested Loop \(Seq Scan supplier, Memoize nation\_pk\) 104\.00 with
+    the nation restriction as the join's Filter\.
+  - Two suspects: \(a\) goopg's `supplier` seq scan costs 100\.00 here but 325\.00 in its own Q9 plan and PG's — no page
+    term, which may be what lets the order win; \(b\) the nation base restriction rides the join instead of the
+    parameterised probe \(PG would print it as the Index Scan's Filter\)\.
+  - First step: trace the supplier leaf's path costs \(DP\_TRACE=1, audit arm `\-queries 20`\) and the nation probe's
+    restriction placement; compare with PG `cost\_seqscan` inputs for supplier\.
+  - Other record, possibly another mechanism: SF1 Q54 \(Join Filters swapped between two nested\-loop levels\)\.
+  - Expected instrument: TPC-H PLAN\-PARITY match 18 → 19 \(Q20\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
 - [x] **M0146-0202 — TPC-H Q9: the FK `lineitem\_partsupp\_fk` join selectivity misses its EC\-matched `l\_suppkey` column, so the lineitem probe is estimated at 39 rows where PG has 116871 \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016e/ROUTING\.md`\)\.
   Kind: impl
