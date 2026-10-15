@@ -3303,6 +3303,24 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0202 — TPC-H Q9: the FK `lineitem\_partsupp\_fk` join selectivity misses its EC\-matched `l\_suppkey` column, so the lineitem probe is estimated at 39 rows where PG has 116871 \(sort\-strategy\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016e/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at a08d4ceb4: sort\-strategy ties qual\-placement at 2 \(TPC-H Q9, SF1 Q18\); differ order picks it\.
+    Verdict SHAPE\-DIFF, first divergence depth 0: PG `Sort` over `Finalize HashAggregate` \| goopg `GroupAggregate` over
+    `Gather Merge` — downstream of a join estimate 3000x low \(goopg Nested Loop 39 rows from 13034 outer; PG 116871 from
+    15640, about 6M/800k per outer row\)\.
+  - PG: `get\_foreign\_key\_join\_selectivity` \(costsize\.c:5651\) matches FK columns through equivalence classes
+    \(`fkinfo\->eclass\[i\]` against `rinfo\->parent\_ec`, :5718\-5733\), so the applied clause `s\_suppkey = l\_suppkey` of
+    the class \{ps\_suppkey, s\_suppkey, l\_suppkey\} covers the FK's `l\_suppkey` column; selectivity 1/800000\.
+  - goopg: `superkeyJoinSelectivity` \(joinrelsize\.go\) runs over `oneClausePerEquivClass` \(first explicit clause\);
+    `joinKeyPairOf` pairs lineitem with supplier, the FK is not covered, and eqjoinsel multiplies 1/200000 × 1/10000\.
+  - First step: port the EC arm of FK matching — a clause whose class contains both the FK column and its referenced
+    column covers that FK column \(and is consumed\), as `match\_eclasses\_to\_foreign\_key\_col` /
+    `get\_foreign\_key\_join\_selectivity` do; then re\-capture Q9\.
+  - Other record, possibly another mechanism: SF1 Q18 \(PG Sort \| goopg Gather Merge under GroupAggregate\)\.
+  - Expected instrument: TPC-H PLAN\-PARITY match 17 → 18 \(Q9\); CATEGORIES\-EXCL\-MATCH sort\-strategy down\.
 - [x] **M0146-0201 — TPC-H Q18: PG joins `customer` last by Parallel Hash Join above the `lineitem` probe; goopg hash\-joins it serially before the probe \(join\-method\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016d/ROUTING\.md`\)\.
   Kind: impl
