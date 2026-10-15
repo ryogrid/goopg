@@ -3303,6 +3303,21 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 4a75cefbb: sort\-strategy and qual\-placement tie at 1 \(SF1 Q18, SF1 Q54\); the differ's order puts
+    sort\-strategy first\. Verdict SHAPE\-DIFF, first divergence at depth 3 under the GroupAggregate: PG `Sort`
+    \(46169\.49\) over `Gather` \(46167\.84, 53 rows\) \| goopg `Gather Merge` \(46015\.57, 49 rows\)\. SF0\.25 Q18 is MATCH\.
+  - Near tie: goopg's own Gather would cost 45009\.43 \+ 1000 \+ 0\.1 × 49 = 46014\.33, plus a sort of 49 rows, against
+    Gather Merge's 46015\.57\. That is inside add\_path's fuzz\. Upstream, the estimates also differ: `d\_year = 2001`
+    gives 214 rows per worker vs PG's 252, and `catalog\_sales ⋈ date\_dim` 1788 vs 2105\.
+  - First step: DP/path trace of SF1 Q18 on a private clone\. Instrument `addPath` for both the Gather\+Sort and the
+    Gather Merge candidates at the grouping input, and compare with PG's `cost\_gather\_merge` / `cost\_sort` inputs
+    \(the PG debug build, tmp/pgdbg\)\. Then decide between a COSTTIE residual \(record and waive\), a stats\-sample
+    difference \(STALE\-SF1 / estimate\), or a costing defect to port\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q18\); CATEGORIES\-EXCL\-MATCH sort\-strategy down\.
 - [x] **M0146-0208 — TPC\-DS Q45: goopg estimates the OR\-with\-hashed\-SubPlan Join Filter at 0\.75 where PG has 0\.52, so it plans a partial \(Finalize\) GroupAggregate where PG plans a plain GroupAggregate over Sort over Gather \(aggregation\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016i/ROUTING\.md`\)\.
   Kind: impl
