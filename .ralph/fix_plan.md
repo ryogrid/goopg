@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0202 — TPC-H Q9: the FK `lineitem\_partsupp\_fk` join selectivity misses its EC\-matched `l\_suppkey` column, so the lineitem probe is estimated at 39 rows where PG has 116871 \(sort\-strategy\)**
+- [x] **M0146-0202 — TPC-H Q9: the FK `lineitem\_partsupp\_fk` join selectivity misses its EC\-matched `l\_suppkey` column, so the lineitem probe is estimated at 39 rows where PG has 116871 \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016e/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3321,6 +3321,11 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     `get\_foreign\_key\_join\_selectivity` do; then re\-capture Q9\.
   - Other record, possibly another mechanism: SF1 Q18 \(PG Sort \| goopg Gather Merge under GroupAggregate\)\.
   - Expected instrument: TPC-H PLAN\-PARITY match 17 → 18 \(Q9\); CATEGORIES\-EXCL\-MATCH sort\-strategy down\.
+  - Closed 2026\-10\-16: `ecFKPairs` adds equivalence\-class stand\-in pairs owned by the applied clause;
+    `fkCoveringClauses` requires each referencing column equated to its own referenced column \(the old cover test
+    accepted `l\_suppkey = s\_suppkey` toward an FK onto partsupp\)\. Q9's probe now 97734 rows \(PG 116871\)\.
+    Design: `docs/design/0100\-0149/m0146\-0202\-fk\-selectivity\-equivalence\-class\.md`\.
+  Movement: yes — TPCH match 17 → 18 \(Q9\); SF0\.25 84 and SF1 71 byte\-identical\.
 - [x] **M0146-0201 — TPC-H Q18: PG joins `customer` last by Parallel Hash Join above the `lineitem` probe; goopg hash\-joins it serially before the probe \(join\-method\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016d/ROUTING\.md`\)\.
   Kind: impl
