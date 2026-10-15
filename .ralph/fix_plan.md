@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
+- [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3318,6 +3318,17 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     \(the PG debug build, tmp/pgdbg\)\. Then decide between a COSTTIE residual \(record and waive\), a stats\-sample
     difference \(STALE\-SF1 / estimate\), or a costing defect to port\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q18\); CATEGORIES\-EXCL\-MATCH sort\-strategy down\.
+  - Closed 2026\-10\-16: a COSTTIE residual, not a costing defect\. Evidence in `analysis/m0146/m0146\-0209/FINDINGS\.md`\.
+    - A PG debug build with probes shows PG builds the Gather Merge \(45984\.01\), cheaper than Sort\-over\-Gather
+      \(45984\.22\)\. `add\_path` rejects it because it is fuzzily equal \(ratio 1\.00973\) to a serial sorted path \(46431\.42\),
+      and the tie\-break prefers the parallel\-safe incumbent\.
+    - goopg has the same candidates and the same tie\-break \(path\.go:1205\)\. Its serial path sits 1\.154% above the
+      GM, so both survive and the GM wins\.
+    - Part of the gap is the M0146\-0019 corpus residual: relallvisible is 0, so the cd2 index\-only probe costs 2\.67 vs
+      PG's 0\.88\. VACUUM on a private clone brings the ratio to 1\.01007, still about 3 cost units outside the fuzz\.
+    - The rest is ANALYZE\-sample noise \(rows: goopg 49, reference PG 53, a freshly analysed PG 45\)\.
+    - Premise stale: the record is a fuzz\-boundary tie, not a mechanism to port\.
+  Movement: none — premise stale: SF1 Q18 is a COSTTIE residual \(add\_path fuzz boundary, 0\.007% after the M0146\-0019 corpus VACUUM\); goopg's paths and add\_path tie\-break match PG's\.
 - [x] **M0146-0208 — TPC\-DS Q45: goopg estimates the OR\-with\-hashed\-SubPlan Join Filter at 0\.75 where PG has 0\.52, so it plans a partial \(Finalize\) GroupAggregate where PG plans a plain GroupAggregate over Sort over Gather \(aggregation\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016i/ROUTING\.md`\)\.
   Kind: impl
