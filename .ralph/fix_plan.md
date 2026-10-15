@@ -1138,6 +1138,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       worse and was not kept.
     - Next lever: the recursive `\(Datum, error\)` return in `evalFastExpr`
       itself, which needs an in\-place evaluator \(structural\).
+  - **Operand leaf copy measured 2026\-10\-16 \(loop \#40\) — NOT landed.**
+    Movement: none — measured non\-improvement. Same design doc, "Slice 6".
+    - Two variants copy a column/`ExprConstVal` operand straight into the
+      BinaryOp arm's local. The wrapper variant was −2.5% on store\_sales but
+      slower on TPC\-H Q6. The leaf\-only variant was inside the noise on both.
+    - Reading: the remaining `evalFastExpr` cost is tree\-walk control flow
+      \(per\-node dispatch, recursion\), not Datum copies. The next slice is
+      batch evaluation in the scan \(the SeqScanOp entry\), keeping the
+      `currentTID` read\-ahead rule.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

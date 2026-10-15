@@ -302,3 +302,27 @@ that through `NewBoolDatum`.
 Across slices 2-5 the filtered scan went from ~1970 ms to ~1095 ms, and the TPC-H arm from 40.28 s to 35.93 s. The
 remaining expression-evaluation cost is the recursive `(Datum, error)` return itself. Removing it means an
 evaluator that writes results in place: a structural change, filed as the next slice rather than done piecemeal.
+
+## Slice 6 (2026-10-16): operand leaf copy — measured inside the noise, not landed
+
+After slice 5, `perf annotate` still put about 17 % of `evalFastExpr` on the left-operand call
+(`left, err := evalFastExpr(...)` in the BinaryOp arm). After the return, the operand is copied three times: result
+slot → temporary → `left`. Two variants copied a leaf operand straight from where it lives into the caller's local.
+The leaf is a column of a `rowSlotView` or `*MaterializedSlot` (same bounds and deform-poison checks), or an
+`ExprConstVal`.
+
+- **Wrapper variant** (`evalFastOperandInto`; all operands go through the helper, non-leaves via `evalFastExpr`):
+  - store_sales scan: −2.5 % (per-round medians 1114 / 1113 / 1107 → 1095 / 1078 / 1084 ms).
+  - TPC-H Q6, a lineitem scan whose qual is an AND chain, was slower in both rounds (0.46 / 0.49 → 0.52 / 0.51 s).
+    For non-leaf operands the wrapper adds a call layer and a copy.
+- **Leaf-only variant** (`evalFastLeafInto` check, then the original call):
+  - store_sales: 1136 / ~1096 / 1134 → 1111 / 1106 / 1047 ms; round 2 went the wrong way.
+  - TPC-H Q1 / Q6 / Q14 over three rounds: no detectable difference.
+- **Verdict:** inside the noise, so neither variant was landed. The code was discarded before commit; no
+  `TestPort` or gate result from it is cited anywhere.
+
+**Reading.** The samples on that line sit on the instructions right after the recursive CALL returns. They are not on
+the copies. What remains is the cost of the tree-walk itself: a jump-table dispatch per node per row, and return
+and branch prediction across the recursion. Removing per-row Datum traffic does not reach it. The lever is
+evaluating each node over a batch of rows, so the dispatch is paid once per batch. That is the scan-resident batch
+successor (the SeqScanOp entry in `unimplemented_feat.json`), and it must keep the `currentTID` read-ahead rule above.
