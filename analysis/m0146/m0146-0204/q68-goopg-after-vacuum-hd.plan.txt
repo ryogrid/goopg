@@ -1,0 +1,39 @@
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=68048.69..68048.94 rows=100 width=530)
+   ->  Sort  (cost=68048.69..68050.12 rows=571 width=1702)
+         Sort Key: customer.c_last_name, store_sales.ss_ticket_number
+         ->  Nested Loop  (cost=64344.25..68026.87 rows=571 width=1702)
+               Join Filter: ((current_addr.ca_city)::text <> (customer_address.ca_city)::text)
+               ->  Nested Loop  (cost=64343.96..67814.66 rows=572 width=914)
+                     ->  GroupAggregate  (cost=64343.67..64432.18 rows=572 width=192)
+                           Group Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk, store_sales.ss_addr_sk, customer_address.ca_city
+                           ->  Gather Merge  (cost=64343.67..64412.16 rows=572 width=1020)
+                                 Workers Planned: 4
+                                 ->  Sort  (cost=63343.61..63343.97 rows=143 width=1020)
+                                       Sort Key: store_sales.ss_ticket_number, store_sales.ss_customer_sk, store_sales.ss_addr_sk, customer_address.ca_city
+                                       ->  Nested Loop  (cost=2415.29..63338.49 rows=143 width=1020)
+                                             ->  Hash Join  (cost=2415.00..63292.10 rows=150 width=232)
+                                                   Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                   ->  Hash Join  (cost=2413.70..63290.26 rows=157 width=90)
+                                                         Hash Cond: (store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk)
+                                                         ->  Parallel Hash Join  (cost=2230.20..63105.03 rows=658 width=78)
+                                                               Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales  (cost=0.00..58984.58 rows=720058 width=212)
+                                                               ->  Parallel Hash  (cost=2229.69..2229.69 rows=41 width=268)
+                                                                     ->  Parallel Seq Scan on date_dim  (cost=0.00..2229.69 rows=41 width=268)
+                                                                           Filter: ((d_dom >= 1) AND (d_dom <= 2) AND (d_year = ANY ('{1998,1999,2000}'::integer[])))
+                                                         ->  Hash  (cost=161.00..161.00 rows=1800 width=80)
+                                                               ->  Seq Scan on household_demographics  (cost=0.00..161.00 rows=1800 width=80)
+                                                                     Filter: ((hd_dep_count = 3) OR (hd_vehicle_count = 4))
+                                                   ->  Hash  (cost=1.15..1.15 rows=12 width=1812)
+                                                         ->  Seq Scan on store  (cost=0.00..1.15 rows=12 width=1812)
+                                                               Filter: ((s_city)::text = ANY ('{Fairview,Midway}'::text[]))
+                                             ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.31 rows=1 width=788)
+                                                   Index Cond: (ca_address_sk = store_sales.ss_addr_sk)
+                     ->  Index Scan using customer_pkey on customer  (cost=0.29..5.88 rows=1 width=726)
+                           Index Cond: (c_customer_sk = store_sales.ss_customer_sk)
+               ->  Index Scan using customer_address_pkey on customer_address current_addr  (cost=0.29..0.36 rows=1 width=788)
+                     Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+(35 rows)
+

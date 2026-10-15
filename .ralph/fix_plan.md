@@ -3303,7 +3303,42 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0204 — TPC\-DS SF1 Q68: goopg probes `household\_demographics\_pkey` in a Nested Loop above the `store` join, where PG hash\-joins a 1800\-row seq\-scanned `household\_demographics` below it \(join\-method\)**
+- [ ] **M0146-0205 — WRONG RESULTS: COPY FROM inside an explicit transaction block survives ROLLBACK** \(filed
+  2026\-10\-16 by M0146\-0204; S2\)\. On a fresh goopg server at `7010eab30`, `CREATE TABLE c5\(\.\.\.\); BEGIN; \\copy c5 FROM
+  file \(4000 rows\); ROLLBACK; SELECT count\(\*\) FROM c5` returns 4000\. An inline `COPY c5 FROM STDIN` of 1 row in a second
+  block also survives, giving 4001\. `INSERT` in the same kind of block rolls back correctly\. PG 18\.3 returns 0 both times
+  \(scratch PG on 5545\)\. Ledgered on 2026\-08\-13 under M0132\-S7 \("COPY ignores explicit blocks both protocols"\),
+  with resume point `dispatchCopyViaExecutor`, but never filed\.
+  Kind: impl
+  Parent: M0146-0204
+  - Rank: below item 10 — correctness\-only, no plan instrument \(S7 carve\-out\), unless the owner places it\.
+  - First step: `dispatchCopyViaExecutor` / the executor's copy path \(`copy\.go` "always runs in its own auto\-commit
+    transaction"\): when `connTx\.InExplicit\(\)`, join the block's transaction \(`connTx\.Tx\(\)`\) and make the commit
+    sites no\-ops, as the M0132\-S3 in\-block `Execute` did\. Test both protocols and COPY inside a SAVEPOINT\.
+  - Repro: `analysis/m0146/m0146\-0204/repro\-scratch\.sql`\.
+  > \#\# ESCALATION 2026\-10\-16 \(S2\) — M0146\-0205: COPY inside BEGIN … ROLLBACK keeps its rows
+  > Wrong results and loss of atomicity: a client that rolls back a failed load keeps its partial rows\. Filed under
+  > M0146\-0204\. Owner: place it, or confirm below item 10\.
+- [ ] **M0146-0206 — VACUUM tail truncation leaves the visibility map untruncated, so relallvisible exceeds relpages; a tail emptied by DELETE is not truncated** \(filed 2026\-10\-16 by M0146\-0204\)\.
+  Checked on a scratch goopg server against a scratch PG 18\.3:
+  - COPY 7200 rows, then `VACUUM`: PG gives relpages 53, relallvisible 53; goopg gives 53 and 64\.
+  - goopg's `\_vm` fork still marks blocks 53\-63, which are past the end of the heap, all\-visible and all\-frozen\.
+    PG clears them when it truncates \(`RelationTruncate` → `visibilitymap\_prepare\_truncate`\) and clamps
+    `new\_rel\_allvisible` to `new\_rel\_pages` \(vacuumlazy\.c:904\)\.
+  - Insert 20000 rows, delete 18000, `VACUUM` twice: PG truncates to 59 pages; goopg keeps 589\.
+  - goopg truncates the FSM on this path, but not the VM \(`internal/commands/vacuum/vacuum\.go`, after
+    `pool\.TruncateRelationTail`\)\.
+  - No wrong result was observed: in the probes, re\-extension cleared the stale bits, and the planner clamps
+    `allvisfrac`\. A stale all\-frozen bit on a re\-extended page could still let VACUUM skip that page\.
+  Kind: impl
+  Parent: M0146-0204
+  - Rank: below item 10 — correctness\-only \(S7 carve\-out\)\. It touches the plan instruments only through relpages
+    and relallvisible after the owner's corpus VACUUM \(M0146\-0019\)\.
+  - First step: add `VisibilityMap\.TruncateRel\(rel, nblocks\)`, clearing the bits of blocks ≥ nblocks, beside
+    `opts\.FSM\.TruncateRel`, and on the WAL replay of the truncate record \(smgr\_redo `SMGR\_TRUNCATE\_VM`\)\. Clamp the
+    relallvisible that VACUUM writes\. Then find why `lastNonEmpty` treats a page of LP\_UNUSED items as non\-empty
+    \(PG's `count\_nondeletable\_pages` checks `ItemIdIsUsed`\)\.
+- [x] **M0146-0204 — TPC\-DS SF1 Q68: goopg probes `household\_demographics\_pkey` in a Nested Loop above the `store` join, where PG hash\-joins a 1800\-row seq\-scanned `household\_demographics` below it \(join\-method\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016g/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3325,6 +3360,20 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     COSTTIE band; if it does, record it as a waived residual instead of changing costs\.
   - Expected instrument: SF1 PLAN\-PARITY match 71 → 72 \(Q68\); CATEGORIES\-EXCL\-MATCH join\-method down; SF0\.25 Q68 stays
     MATCH\.
+  - Closed 2026\-10\-16: neither suspect\. The cause is the corpus, not the planner\. Evidence in
+    `analysis/m0146/m0146\-0204/FINDINGS\.md`\.
+    - Both candidates are built, and the hash order was priced \(`join\.hash\.partial` 63301\.26 for
+      `\{ss, dd, hd\}`\)\. It lost only through the `household\_demographics` seq scan, 172 against PG's 161\.00:
+      64 heap blocks against 53\.
+    - goopg's file holds PG's exact tuple layout on 53 pages, plus 11 empty pages left by the COPY bulk extension\.
+      PG's autovacuum truncated that tail \(`lazy\_truncate\_heap`, 11 ≥ 64/16, vacuumlazy\.c:3189\); goopg's corpus
+      has never been vacuumed\.
+    - `VACUUM household\_demographics` on a private clone gives 53 blocks and PG's plan shape\.
+    - Re\-routed to the M0146\-0019 owner corpus\-VACUUM residual\. SF1 `catalog\_page` \(272 vs 242\) has the same cause\.
+    - Premise stale: the record was a corpus\-maintenance residual, not a costing mechanism\.
+    - Found on the way and filed: M0146\-0205 \(COPY in an explicit block survives ROLLBACK, S2\) and M0146\-0206
+      \(VACUUM truncation leaves the VM untruncated and relallvisible above relpages\)\.
+  Movement: none — premise stale: SF1 Q68's record is the M0146\-0019 corpus\-VACUUM residual \(an unvacuumed bulk\-extension tail on household\_demographics\); no planner change\.
 - [x] **M0146-0203 — TPC-H Q20: goopg seq\-scans `supplier` at 100\.00 and applies `n\_name = 'CANADA'` on the Nested Loop over a Memoize'd `nation\_pk` probe, where PG filters `nation` and bitmap\-probes `supplier` \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016f/ROUTING\.md`\)\.
   Kind: impl
