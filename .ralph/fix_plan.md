@@ -3303,6 +3303,22 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0200 — TPC-H Q21: PG keeps the EC\-derived `orders\.o\_orderkey = l2\.l\_orderkey` as the semi join's Join Filter over a parameterised `l2` probe; goopg drops it \(qual\-placement\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016c/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 891d2127f: qual\-placement is the top actionable category \(3: TPC-H Q20, Q21, SF1 Q54\); no SF0\.25
+    record in it\. Verdict SHAPE\-DIFF, first divergence depth 3 under Sort; plan shapes otherwise identical\.
+  - PG 18 `create\_nestloop\_path` \(pathnode\.c:2703\) drops a join restrict clause only when its `rinfo\_serial` is
+    one the parameterised inner enforces \(`get\_param\_path\_clause\_serials`, relnode\.c\)\. The inner enforces
+    `l2\.l\_orderkey = l1\.l\_orderkey`; the joinrel's EC clause pairs `orders` with `l2`, a different serial, so PG
+    keeps it as a redundant Join Filter\.
+  - First step: find where goopg removes the joinrel's EC\-derived clauses that a parameterised inner covers \(it
+    likely matches by equivalence class, not by clause identity\) and compare with the serial rule; check the
+    clause `generate\_join\_implied\_equalities` picks for this joinrel \(the outer member it pairs with `l2`\)\.
+  - Other records, possibly other mechanisms: TPC-H Q20 \(join order, `Hash Right Semi Join`\); SF1 Q54 \(Join
+    Filters at different nested\-loop levels\)\.
+  - Expected instrument: TPC-H PLAN\-PARITY match 15 → 16 \(Q21\); CATEGORIES\-EXCL\-MATCH qual\-placement down\.
 - [x] **M0146-0199 — TPC-DS SF1 Q32/Q92: PG memoizes the `date\_dim\_pkey` probe inside SubPlan 1's Nested Loop; goopg probes it bare \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016b/ROUTING\.md`\)\.
   Kind: impl
