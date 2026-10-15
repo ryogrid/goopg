@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0199 — TPC-DS SF1 Q32/Q92: PG memoizes the `date\_dim\_pkey` probe inside SubPlan 1's Nested Loop; goopg probes it bare \(parameterisation\)**
+- [x] **M0146-0199 — TPC-DS SF1 Q32/Q92: PG memoizes the `date\_dim\_pkey` probe inside SubPlan 1's Nested Loop; goopg probes it bare \(parameterisation\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016b/ROUTING\.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3319,6 +3319,12 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     \(costsize\.c\) inputs — `ndistinct` of `cs\_sold\_date\_sk` over 88 calls, `est\_entries`, hit ratio — with goopg's\.
   - Other record, possibly another mechanism: TPC-H Q2 \(depth 1 under Sort\)\.
   - Expected instrument: TPC-DS SF1 PLAN\-PARITY match 69 → 71 \(Q32, Q92\); CATEGORIES\-EXCL\-MATCH parameterisation down\.
+  - Closed 2026\-10\-16: two causes\. \(1\) `memoizeKeyNDistinct` multiplied raw ndistincts with no per\-relation
+    clamp or Yao/Dell'Era restriction term \(`estimate\_num\_groups`, selfuncs\.c:3721\), so 1830 distinct keys over 88
+    calls gave hit ratio 0 \(PG: 86 distinct, ~2%\)\. \(2\) The kept\-sublink rebase clones the SubPlan through
+    `clonePlanReplacingOuter`, which dropped `InnerMemo`; `rebindInnerMemo` rebuilds it \(also in `remapSourceTableIdx`\)\.
+    Design: `docs/design/0100\-0149/m0146\-0199\-memoize\-ndistinct\-restriction\.md`\.
+  Movement: yes — SF1 match 69 → 71 \(Q32, Q92\); SF0\.25 84 and TPC-H 15 byte\-identical\.
 - [x] **M0146-0198 — TPC-DS Q43: goopg nested-loops `date_dim` after `store_sales ⋈ store` where PG hash-joins `store` after `store_sales ⋈ date_dim` \(join-method\)**
   \(filed 2026-10-16 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261016/ROUTING.md`\)\.
   Kind: impl

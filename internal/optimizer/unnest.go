@@ -1594,6 +1594,33 @@ func resolveSubColInSchema(schema Schema, sc *ColumnRef) *ColumnRef {
 	return clone(found)
 }
 
+// rebindInnerMemo rebuilds a fused NLI's cache over a cloned or remapped
+// inner. The cache keys are the probe's own key expressions (memoizeNodeFor),
+// so they are read back off the new probe rather than carried over: the two
+// lists stay one list read twice, in the clone's coordinates. The cost stamp,
+// the entry estimate and the single-row flag describe the same probe and carry
+// over unchanged. A nil memo, or an inner that is no longer a keyed probe,
+// gets no cache — never a cache keyed on something the probe does not bind.
+func rebindInnerMemo(old *Memoize, inner Node) *Memoize {
+	if old == nil || inner == nil {
+		return nil
+	}
+	_, key, keys, ok := nliInnerProbe(inner)
+	if !ok {
+		return nil
+	}
+	if len(keys) == 0 && key != nil {
+		keys = []Expr{key}
+	}
+	if len(keys) != len(old.KeyExprs) {
+		return nil
+	}
+	m := *old
+	m.Child = inner
+	m.KeyExprs = keys
+	return &m
+}
+
 func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) (Node, error) {
 	if node == nil {
 		return nil, nil
@@ -1661,10 +1688,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			nli.Predicate = cloneExprReplacingOuter(n.Predicate, replace)
 		}
 		// `InnerMemo.Child` ALIASES `Inner` (plan.go), and the clone has a new
-		// `Inner`, so carrying the old wrapper would point the cache at the
-		// original scan. Drop it: the cache is an optimisation, and no cache is
-		// always correct.
-		nli.InnerMemo = nil
+		// `Inner`, so the old wrapper would point the cache at the original
+		// scan. It is rebuilt over the clone instead (M0146-0199): dropping it
+		// left a plan whose join was costed with the cache — TPC-DS SF1 Q32's
+		// kept SubPlan, cloned by the sublink rebase — but ran and printed
+		// without it.
+		nli.InnerMemo = rebindInnerMemo(n.InnerMemo, innerNode)
 		return &nli, nil
 	case *Filter:
 		child, err := clonePlanReplacingOuter(n.Child, replace)
@@ -2245,9 +2274,9 @@ func remapSourceTableIdx(node Node, offset int16) (Node, error) {
 		}
 		nl.schema = remapSchema(n.schema)
 		// InnerMemo.Child aliases the pre-remap Inner (same reasoning as
-		// clonePlanReplacingOuter's identical arm) — drop it rather than
-		// point the cache at a scan the remap replaced.
-		nl.InnerMemo = nil
+		// clonePlanReplacingOuter's identical arm) — rebuild it over the
+		// remapped scan rather than point the cache at the one it replaced.
+		nl.InnerMemo = rebindInnerMemo(n.InnerMemo, nl.Inner)
 		return &nl, nil
 	case *Filter:
 		f := *n
