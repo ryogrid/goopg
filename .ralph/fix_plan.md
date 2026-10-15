@@ -3303,7 +3303,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
-- [ ] **M0146-0198 — TPC-DS Q43: goopg nested-loops `date_dim` after `store_sales ⋈ store` where PG hash-joins `store` after `store_sales ⋈ date_dim` \(join-method\)**
+- [x] **M0146-0198 — TPC-DS Q43: goopg nested-loops `date_dim` after `store_sales ⋈ store` where PG hash-joins `store` after `store_sales ⋈ date_dim` \(join-method\)**
   \(filed 2026-10-16 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261016/ROUTING.md`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3319,6 +3319,11 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   - Other join\-method records, possibly other mechanisms: SF1 Q68; TPC-H Q18 \(PG hash\-joins a parallel\-scanned
     `customer` last, goopg joins `customer` earlier with a serial scan\)\.
   - Expected instrument: TPC-DS SF0\.25 PLAN\-PARITY match 80 → 81 \(Q43\); CATEGORIES\-EXCL\-MATCH join\-method down\.
+  - Closed 2026\-10\-16: root cause was the MCV compare, not the join search\. `statLiteralEqual` \(`selectivity\.go`\)
+    matched the ANALYZE\-stamped `\-5\.00` against the literal `\-5` byte for byte; `var\_eq\_const` uses `numeric\_eq`\.
+    New `statNumericEqual` compares number\-family values by value\. Design: `docs/design/0100\-0149/m0146\-0198\-mcv\-numeric\-equality\.md`\.
+  Movement: yes — SF0\.25 match 80 → 84 \(Q33, Q43, Q56, Q60\); SF1 67 → 69 \(Q33, Q60\); TPC-H byte\-identical \(15/22\)\.
+    Captures: `analysis/m0146/m0146\-0198/`\. SF1 Q68 and TPC-H Q18 \(other join\-method records\) unmoved — census\.
 - [x] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
   2026\-10\-15 by M0146\-0195\)\. `addOneParameterizedIndexPath` \(`pathparamindex\.go`\) builds one path per
   parameterisation from `pickIndexCoveringLeadingPrefix` \(`nl\_index\_join\.go`: most bound columns, ties → first
