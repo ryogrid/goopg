@@ -3303,6 +3303,22 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0199 — TPC-DS SF1 Q32/Q92: PG memoizes the `date\_dim\_pkey` probe inside SubPlan 1's Nested Loop; goopg probes it bare \(parameterisation\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016b/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at 7eec2fed8: parameterisation is the top actionable category \(3, tied with qual\-placement; differ
+    order breaks the tie\): TPC-H Q2, SF1 Q32, SF1 Q92\. scan\-type \(SF0\.25 Q23, TPC-H Q13/Q16\) re\-routed to the
+    M0146\-0019 owner corpus residual \(goopg corpora carry no visibility map; PG's were autovacuumed\)\.
+  - SF1 Q32 \(verdict SHAPE\-DIFF, first divergence depth 6, under Nested Loop\): PG `Memoize` \(Cache Key
+    `catalog\_sales\_1\.cs\_sold\_date\_sk`, 88 outer rows\) over `Index Scan using date\_dim\_pkey`, Nested Loop 996\.41;
+    goopg the bare Index Scan, 88 × 7\.54 → 1009\.29\. SF1 Q92 has the same shape \(depth 7\)\. Both MATCH at SF0\.25
+    \(`date\_dim` is the outer there, no Memoize\)\.
+  - First step: check whether goopg generates a Memoize candidate for this inner at all, inside the SubPlan's
+    join search \(instrument `addPath`, not the cost function\), then compare `cost\_memoize\_rescan`
+    \(costsize\.c\) inputs — `ndistinct` of `cs\_sold\_date\_sk` over 88 calls, `est\_entries`, hit ratio — with goopg's\.
+  - Other record, possibly another mechanism: TPC-H Q2 \(depth 1 under Sort\)\.
+  - Expected instrument: TPC-DS SF1 PLAN\-PARITY match 69 → 71 \(Q32, Q92\); CATEGORIES\-EXCL\-MATCH parameterisation down\.
 - [x] **M0146-0198 — TPC-DS Q43: goopg nested-loops `date_dim` after `store_sales ⋈ store` where PG hash-joins `store` after `store_sales ⋈ date_dim` \(join-method\)**
   \(filed 2026-10-16 by the M0146-0014 S9 pass, `analysis/m0146/m0146-0014/routing-20261016/ROUTING.md`\)\.
   Kind: impl
