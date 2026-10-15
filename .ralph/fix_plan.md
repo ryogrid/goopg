@@ -3260,6 +3260,19 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     - Owner request \(replaces the withdrawn one\): reload `:65433` by INSERT with a binary carrying 7b356ec04, so the
       fk indexes come out without the leak \(REINDEX is unavailable there, M0146\-0196\)\. Expected: Q3/Q5/Q7 MATCH\.
     - Filed M0146\-0197: build a parameterised path per eligible index, as `build\_index\_paths` does\.
+  - **2026\-10\-15 ESCALATION \(owner\): the `:65433` reload did NOT run on the fixed binary** — its negative result
+    \(index sizes unchanged, 117050 / 28617 / 41512\) does not test 7b356ec04\.
+    - The server process serving `:65433` \(pid 472797, started \~17:29\) executes
+      `bench/tpch/runtime\_goopg/goopg\-bin\.285df1201` \(`readlink /proc/<pid>/exe`\) — a build from 285df1201,
+      before the fix \(7b356ec04, 17:00\)\. A new `goopg\-bin` was written at 17:27, but the running server's exe is
+      the old one\.
+    - After the reload, `order\_customer\_fkidx` \(relfilenode 16452\) shows the same pattern as before: 26378 of
+      28617 leaf blocks hold only a high key — the dedup\-leak signature \(8 of 9 empty\)\.
+    - TRUNCATE is not the cause: `truncateTableAndPartitions` truncates each index file and rebuilds it empty
+      \(`operators\_ddl\.go`\)\.
+    - Owner action: restart `:65433` on a binary built at or after 7b356ec04 \(confirm with `readlink
+      /proc/<pid>/exe`\), then repeat the INSERT reload\. Expected per the clone measurement: fk indexes near
+      CREATE INDEX size, TPC-H Q3/Q5/Q7 toward MATCH\. \(REINDEX stays unavailable, M0146\-0196\.\)
 - [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
   2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
   region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
