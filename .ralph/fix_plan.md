@@ -3206,10 +3206,33 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
       `TestDuplicateInsertsLeakNoPages` \(HEAD: 480/541 leaf blocks empty\)\. Scratch: 4\-way duplicate insert build
       5423 → 607 blocks = CREATE INDEX\.
     - Landable without the arm \(internal/access/nbtree only\): units, nbtree \+ `\-race`, tpch\-spotcheck, sf025 PASS=99\.
-    - Movement: none yet — `:65433`'s existing index files keep their empty pages\. **Owner action:** REINDEX the
-      TPC-H tables on `:65433` \(or reload\), then re\-capture TPC-H; expected Q3/Q5/Q7 probe costs fall toward PG's\.
+    - \(Superseded below: the owner REINDEX request is withdrawn\.\)
     - Residual: delete \+ VACUUM \+ reinsert still doubles an index — vacuumed pages sit on the deleting handle's free
       list, PG's FSM is shared \(M0122\-0010a\)\.
+  - **2026\-10\-15 private\-clone measurement: index size does NOT drive Q3/Q5/Q7** \(`analysis/m0146/m0146\-0195/`\)\.
+    - `tpch\-estimate\-audit\-arm\.sh` gained `PRE\_AUDIT\_SQL` \(SQL on the arm's private clone before the audit\)\.
+    - As\-is clone: match 12/22\. Clone with compact twins of the 8 fk indexes \(`CREATE INDEX \.\.\._rb`, names mapped
+      back\): match 11/22 — Q3/Q5/Q7 unchanged, Q11 loses its match, Q18/Q21 diverge further\.
+    - Q5's orders probe keeps `order\_customer\_fkidx` at 2\.29/probe either way \(PG 1\.64\): the gap is another
+      `cost\_index` term, not index pages\. The owner REINDEX request is WITHDRAWN — it would not move Q3/Q5/Q7 and
+      Q11's current match rests on today's bloated sizes \(goopg fk indexes 6\-8x PG; goopg's bulk build is denser
+      than PG's\)\.
+    - Found: REINDEX / DROP INDEX cannot resolve relations in a CREATE DATABASE'd database → M0146\-0196\.
+    - Next: decompose one probe's cost term by term against PG's `cost\_index` \(costsize\.c\) — Q5/Q7's
+      `order\_customer\_fkidx` probe \(goopg 0\.43\.\.2\.21 rows=16, PG 0\.43\.\.1\.56\): index pages fetched,
+      Mackert\-Lohman heap pages with loop\_count, correlation, cpu terms; this is a costing change, so landing it
+      needs the acceptance arm \(M0146\-0178 escalation\)\.
+- [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
+  2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
+  region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
+  all fail "does not exist", while `SELECT count\(\*\) FROM region` works and `CREATE INDEX nation\_regionkey\_fkidx`
+  reports "already exists"\. PG resolves both against the current database \(`RangeVarGetRelidExtended`\)\.
+  Kind: impl
+  Parent: M0146\-0195
+  - Rank: below item 10 under the S7 carve\-out \(maintenance correctness, no plan instrument\) unless the owner
+    places it\. It blocks index maintenance on every non\-default database, including the bench clusters\.
+  - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
+    the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
 - [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq

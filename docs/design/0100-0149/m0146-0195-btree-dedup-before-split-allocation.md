@@ -1,7 +1,8 @@
 # M0146-0195 — B-tree: dedup before the split allocates its page
 
-Status: open — the root-cause fix landed 2026-10-15. The plans move only once the
-TPC-H indexes on `:65433` are rebuilt; that is an owner action.
+Status: open. The storage fix landed 2026-10-15. The same day, a private-clone
+measurement showed that index size is NOT what drives the Q3/Q5/Q7 divergence
+(see "Measurement" below).
 
 ## Problem
 
@@ -68,6 +69,47 @@ code, 480 of 541 leaf blocks were empty.
 | numeric, 4-way duplicates, insert-built | 5423 | 607 |
 | CREATE INDEX build of the same data | 607 | 607 |
 | int4, 15-way duplicates, insert-built | — | 428 |
+
+## Measurement on a private clone (2026-10-15)
+
+`scripts/tpch-estimate-audit-arm.sh` gained `PRE_AUDIT_SQL`, which runs SQL on
+the arm's private clone before the audit. Two plan-only captures were taken in
+parallel mode, with one HEAD binary (`7b356ec04`), against PG's
+`routing-realign-20261015` plans (`analysis/m0146/m0146-0195/`):
+
+| arm | match | CATEGORIES-EXCL-MATCH |
+|---|---|---|
+| clone as-is (bloated fk indexes) | 12 / 22 | join-order 5, join-method 5, scan-type 8, parallelism 3 |
+| clone with compact twins of the 8 fk indexes | 11 / 22 | join-order 7, join-method 6, scan-type 10, parallelism 4 |
+
+In the second arm, `CREATE INDEX <name>_rb`, with the names mapped back for the
+diff.
+
+What the second arm shows:
+
+- **Q3, Q5 and Q7 do not move.** Q5's `orders` probe keeps the old
+  `order_customer_fkidx` at the same 2.29 per probe, where PG charges 1.64. A
+  single-row equality probe barely depends on index size, so the gap is in
+  another `cost_index` term.
+- **Q11 loses its match, and Q18 and Q21 diverge further.** They take the
+  compact twins.
+
+So the hypothesis behind this task's first step is refuted for its three
+witnesses, and an index rebuild on `:65433` is not a fix for them.
+
+Index sizes also deviate in both directions, so neither arm is PG's state:
+
+- `:65433`'s fk indexes are 6–8× PG's (`supplier_nation_fkidx` 172 vs 30,
+  `partsupp_supplier_fkidx` 14775 vs 2199);
+- goopg's bulk build is denser than PG's (the lineitem fk index before the
+  realign: 9549 vs 16468).
+
+Q11's match today rests on the bloated sizes.
+
+**New defect.** A rebuild cannot be done through goopg in `tpch` anyway: in a
+CREATE DATABASE'd database, `REINDEX TABLE/INDEX` and `DROP INDEX` report
+"does not exist" for relations that SELECT and CREATE INDEX resolve. Filed as
+M0146-0196.
 
 ## Residuals
 

@@ -48,7 +48,11 @@
 #   NO_BUILD   1 = trust the existing images (use this to hold ONE binary
 #              across both arms, which is what makes them comparable)
 #   FORCE      1 = run even if the nightly CI batch holds the host
-#   TPCH_AUDIT_ARM_PORT        this arm's PRIVATE port (M0137-0007, default 5582)
+#   PRE_AUDIT_SQL  optional SQL run on THIS lane's private clone once it is up,
+#              before the audit, as tpch@tpch — e.g. an index rebuild that
+#              models an owner action on the shared cluster (M0146-0195). It
+#              runs on PG_PORT only, never on the source cluster.
+#   TPCH_AUDIT_ARM_PORT       this arm's PRIVATE port (M0137-0007, default 5582)
 #   TPCH_AUDIT_ARM_CLONE_WAIT  seconds to wait for :65433 to go quiet in the clone's
 #              `cp -a` FALLBACK path only; the default online pg_basebackup
 #              path never waits (M0137-0007, default 60)
@@ -56,7 +60,8 @@
 #
 # Exit codes: 3 refused/blocked (incl. source under HOLD, refused clone dst),
 # 4 build failed, 5 server not ready, 6 the served /proc/<pid>/exe is not the
-# binary this script built (sha256 mismatch / deleted); otherwise the audit's rc.
+# binary this script built (sha256 mismatch / deleted), 7 PRE_AUDIT_SQL failed;
+# otherwise the audit's rc.
 #
 set -uo pipefail
 
@@ -192,6 +197,13 @@ verify_served_binary() {
     echo "# served binary verified: pid ${pid} ${exe} sha256 ${sha}"
 }
 verify_served_binary || exit 6
+
+if [[ -n "${PRE_AUDIT_SQL:-}" ]]; then
+    echo "# PRE_AUDIT_SQL on the private clone :${PG_PORT}: ${PRE_AUDIT_SQL}"
+    PGPASSWORD=tpch "${REPO_ROOT}/postgres/local_install/bin/psql" -X -q -v ON_ERROR_STOP=1 \
+        -h "${PG_HOST}" -p "${PG_PORT}" -U tpch -d tpch -c "${PRE_AUDIT_SQL}" \
+        || { echo "FATAL: PRE_AUDIT_SQL failed" >&2; exit 7; }
+fi
 
 # Pin serial mode explicitly: this arm's contract (header comment ~line 40)
 # is an EXECUTED serial run with max_parallel_workers_per_gather=0, and
