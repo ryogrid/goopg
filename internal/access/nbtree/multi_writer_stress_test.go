@@ -15,12 +15,8 @@ import (
 // ranges. Asserts no lost or duplicate keys after the fence and
 // no deadlock (test driver completes within the test timeout).
 //
-// The current splitMu retains correctness; this test pins that
-// the additional INCOMPLETE_SPLIT lifecycle (set during split,
-// cleared after parent insert, finished by descend if stale)
-// does not introduce regressions on the existing protected
-// path. A future commit that removes splitMu will rely on the
-// same test as the regression gate.
+// Since M0122-0010 no structural mutex serialises the splits: page latches
+// and the incomplete-split protocol alone keep them correct.
 func TestMultiWriterStress_M0055_Phase_C(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping multi-writer stress in short mode")

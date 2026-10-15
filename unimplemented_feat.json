@@ -223,7 +223,7 @@
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Lehman/Yao crab-walk is deferred"
    ],
@@ -238,7 +238,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
   },
   {
    "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
@@ -1031,7 +1031,7 @@
    "feature": "Remove splitMu lock from btree operations for concurrency optimization",
    "task_id": "M0056-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1046,7 +1046,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:614 splitMu lock still present"
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open: internal/access/btree/btree.go:614 splitMu lock still present"
   },
   {
    "feature": "End-to-end validation of btree concurrent write protocol",
@@ -1094,7 +1094,7 @@
    "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
    "task_id": "M0055-0004-followup-stage2-splitmu-removal",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "lands two of three Stage 2 deliverables... DEFERRED (blocked on a storage-layer prerequisite)"
    ],
@@ -1109,7 +1109,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0056: Phase C splitMu removal in progress as of status line 1"
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open: docs/milestones/0056: Phase C splitMu removal in progress as of status line 1"
   },
   {
    "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",

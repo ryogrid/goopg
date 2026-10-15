@@ -2,7 +2,7 @@
 
 | field      | value |
 |------------|-------|
-| status     | draft |
+| status     | landed 2026-10-15 (M0122-0010) |
 | date       | 2026-05-06 |
 | supersedes | — |
 
@@ -125,17 +125,15 @@ order:
 4. **\(M, landed\)** Latch in PG's order: the left page stays latched through
    the parent search and insert, so the child is latched before the parent
    \(slice 3 below\).
-5. **\(M\)** Finish incomplete splits on contact \(`\_bt\_moveright` for update,
-   `\_bt\_stepright`, `\_bt\_getstackbuf`\). `finishSplit` exists but has no
-   production caller. This needs gap 4 first.
+5. **\(M, landed\)** Finish incomplete splits on contact \(`\_bt\_moveright` for
+   update, `\_bt\_stepright`, `\_bt\_getstackbuf`\) \(slice 7 below\).
 6. **\(M, landed\)** Atomic root split: hold left, right, the new root and the
    metapage together \(slice 4 below\).
 7. **\(M, landed\)** Vacuum: refuse to delete either half of an incomplete
    split \(`\_bt\_leftsib\_splitflag`\), and latch the parent last \(slice 5
    below\). Recycling pages a stale path can name: open.
-8. **\(L, landed\)** Remove `lockStructural` from splits and vacuum's page
-   unlink; stress under `\-race` \(slice 6 below\). Only `finishSplit` still
-   takes it, until gap 5 rebuilds it.
+8. **\(L, landed\)** Remove `lockStructural`; stress under `\-race` \(slices 6
+   and 7 below\). No structural mutex remains.
 
 **Slice 1 \(gaps 1–2\).** `getStackBuf` / `leftmostAtLevel` replace the blind
 `path\[len\(path\)\-1\]` at the split's parent step; `TestGetStackBuf` pins them.
@@ -323,6 +321,64 @@ Live check on a scratch server:
 
 The vacuum and DDL isolation ports pass \(21\).
 
+**Slice 7 \(gap 5, 2026\-10\-15\).** A split whose parent step never ran is
+finished by the next writer that reaches it:
+
+- **Causes.** An error between the split record and the downlink insert, or a
+  crash there; redo restores the half split.
+- **`finishSplit` is `\_bt\_finish\_split`.** It latches the left half and
+  re\-checks the flag, then latches the right half while the metapage says
+  whether the left half was the root. It then completes the split as the split
+  path does:
+  - a root split gets a new root with both halves latched;
+  - otherwise the downlink goes into the parent re\-found by `getStackBuf`,
+    with the left half latched until the record that clears its flag.
+
+  The unlatched metapage fallback in `createNewRoot` is gone, together with the
+  parent\-before\-child order it used.
+- **Where it is called.** Every place PG finishes one:
+  - the insert descent, `descendForInsert` \(`\_bt\_search` with forupdate, which
+    finishes in `\_bt\_moveright`\);
+  - `insertIntoBlock`'s target page and its move\-right \(`\_bt\_stepright`;
+    `\_bt\_insertonpg` never inserts into half a split\);
+  - `getStackBuf` on the parent level \(`\_bt\_getstackbuf`\);
+  - vacuum's `latchParentOf`.
+
+  Readers do not finish splits, as in PG. The rightmost\-leaf cache cannot meet
+  a flagged page, because a flagged page always has a right sibling.
+- **Lock removed.** `lockStructural`, both mutex fields and
+  `Pool.BTreeStructuralLock` with its 256 stripes are deleted.
+- **Bug found and fixed.** When the child arrived already latched \(slice 3\),
+  a split of the parent did not clear the child's flag in its own record. Only
+  the pin\-it\-here branch did. The flag then went out in a separate page record
+  after the parent step, unlike `\_bt\_split`, which clears it under the split
+  record \(block 3\). Both branches now clear it.
+
+Tests:
+
+- `testHookAbandonSplit` \(nil in production\) stops a chosen split after its
+  record and before its parent step.
+- `TestFinishIncompleteSplitOnContact` leaves a leaf, an internal and a root
+  split incomplete. It checks that readers still find every key, and that the
+  next writer reaching the left half finishes the split: the flag is cleared,
+  the downlink exists \(a new root in the root case\), and every key is found
+  and scanned in order. All three cases fail with finish\-on\-contact disabled.
+  The internal case also failed before the held\-child fix, because two pages
+  stayed flagged.
+- `TestGetStackBufFinishesIncompleteSplit` covers the parent\-search path.
+- `TestIncompleteSplitsFinishedConcurrently`: 16 handles insert while every
+  10th split is left incomplete, about 52 of 520. Writers finish all but 0–2 on
+  contact; `CompleteDeferredSplits` finishes the rest. No deadlock, nothing
+  left flagged, and every key is found.
+
+| check | result |
+|---|---|
+| stress tests \(splits, vacuum, 32\-writer, contact\) | 0 / 15 invocations failed |
+| nbtree package | clean, and 3 runs under `\-race` |
+| live check: 3 cycles of `kill \-9` during 16 inserters plus delete/`VACUUM` | index = heap after each recovery and after 16 000 more inserts |
+
+The vacuum and DDL isolation ports pass \(21\).
+
 ## 5. Tests
 
 - Multi-writer split stress with random keys.
@@ -334,4 +390,4 @@ The vacuum and DDL isolation ports pass \(21\).
 
 - No structural corruption under stress/recovery tests.
 - Writer throughput scales beyond single structural writer baseline.
-- splitMu no longer governs normal structural write flow \(met 2026\-10\-15 for splits and vacuum; `finishSplit` remains\).
+- splitMu no longer governs normal structural write flow \(met 2026\-10\-15: no structural mutex remains\).

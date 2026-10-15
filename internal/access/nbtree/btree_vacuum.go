@@ -196,7 +196,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		// unlink discarded it. Unlinking here shrinks that window
 		// to the handful of instructions inside unlinkEmptyLeaf
 		// itself, which now also re-verifies emptiness under
-		// splitMu before doing anything destructive.
+		// the leaf's latch before doing anything destructive.
 		if justEmptied != nil {
 			if err := bt.unlinkEmptyLeaf(*justEmptied); err != nil {
 				return totalRemoved, err
@@ -458,6 +458,15 @@ func (bt *BTree) latchParentOf(pins *unlinkPins, target, hint storage.BlockNumbe
 			bt.unpinW(slot)
 			return nil
 		}
+		if op.HasIncompleteSplit() {
+			// As _bt_getstackbuf: finish the split, then re-read the
+			// page. Finishing latches only pages above the held siblings.
+			bt.unpinW(slot)
+			if err := bt.finishSplit(blk, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		if !op.IsHalfDead() && !op.IsDeleted() {
 			_, _, found, ferr := PGFindDownlinkOffset(slot.Page(), target)
 			if ferr != nil {
@@ -538,7 +547,7 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// M-NIGHTLY (AI-20260706-201855-001, loop 9): the caller
 	// (VacuumIndexPages) marks a leaf BTHalfDead|BTDeleted while
 	// scanning it, then unpins it and moves on — it does NOT hold
-	// splitMu or any lock spanning the marking and this unlink
+	// any lock spanning the marking and this unlink
 	// call. The fast, non-split Insert path (tryInsertNoSplit)
 	// never checks BTHalfDead/BTDeleted before writing: it only
 	// checks keyExceedsHighKey/pageHasSpaceFor, and the leaf's
@@ -811,8 +820,8 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// reopen): this used to re-derive each live neighbour from the block's
 	// CURRENT on-disk link under the write pin, because a concurrent
 	// Insert-driven split on a DIFFERENT connection's *BTree instance can
-	// splice a brand-new live page into this chain (bt.splitMu serialises
-	// only within one instance), and stamping the stale walk result stomped
+	// splice a brand-new live page into this chain (the structural mutex
+	// of the time serialised only within one instance), and stamping the stale walk result stomped
 	// that split's relink — the mechanism behind block 678's persistent
 	// "left link/right link pair not in agreement" corruption. S11.5d-3b
 	// closes the same race at the front instead of the back: the split
