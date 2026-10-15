@@ -3222,6 +3222,18 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
       `order\_customer\_fkidx` probe \(goopg 0\.43\.\.2\.21 rows=16, PG 0\.43\.\.1\.56\): index pages fetched,
       Mackert\-Lohman heap pages with loop\_count, correlation, cpu terms; this is a costing change, so landing it
       needs the acceptance arm \(M0146\-0178 escalation\)\.
+  - **2026\-10\-15 CORRECTION: index bloat IS the Q3/Q5/Q7 driver** — the previous bullet's measurement was invalid\.
+    - goopg builds one parameterised index path per parameterisation \(`pickIndexCoveringLeadingPrefix`: most bound
+      columns, ties → first by name\); the `\_rb` twins tied with the bloated originals and were never costed\.
+    - Probe cost reproduced exactly: `order\_customer\_fkidx` probe from \~30000 customers PG 4\.98 vs goopg 7\.07; the
+      2\.09 gap is genericcostestimate's loop\-amortised index\-page term \(PG 4121 pages → 0\.55, goopg 28617 → 2\.63\)\.
+      A compact twin named to sort first is chosen at 4\.65, as predicted\.
+    - Re\-measured with twins `a\_<name>` \(sort first, mapped back\), HEAD \+ M0146\-0178 slice\-2 binary:
+      TPC-H match 12 → 14; Q3, Q5, Q7 MATCH; join\-method 5 → 3, scan\-type 8 → 5, parallelism 3 → 1; Q10 loses its
+      match \(goopg's bulk\-built twins, 1563 pages, are denser than PG's 4121\)\.
+    - Owner request \(replaces the withdrawn one\): reload `:65433` by INSERT with a binary carrying 7b356ec04, so the
+      fk indexes come out without the leak \(REINDEX is unavailable there, M0146\-0196\)\. Expected: Q3/Q5/Q7 MATCH\.
+    - Filed M0146\-0197: build a parameterised path per eligible index, as `build\_index\_paths` does\.
 - [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
   2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
   region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
@@ -3233,6 +3245,18 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     places it\. It blocks index maintenance on every non\-default database, including the bench clusters\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
+  2026\-10\-15 by M0146\-0195\)\. `addOneParameterizedIndexPath` \(`pathparamindex\.go`\) builds one path per
+  parameterisation from `pickIndexCoveringLeadingPrefix` \(`nl\_index\_join\.go`: most bound columns, ties → first
+  index by name\)\. PG's `build\_index\_paths` \(indxpath\.c\) builds a path for each usable index and `add\_path` keeps
+  the cheapest, so two indexes on the same column are chosen between by cost\.
+  Kind: impl
+  Parent: M0146\-0195
+  - Witness: TPC-H on a private clone with compact fk\-index twins — goopg kept the bloated `order\_customer\_fkidx`
+    at 7\.07 per probe over a 4\.65 twin until the twin's name sorted first \(`analysis/m0146/m0146\-0195/`\)\.
+  - Expected instrument: TPC-H PLAN\-PARITY where an index choice is decided by cost \(Q5's lineitem probe: PG's
+    `idx\_lineitem\_orderkey\_fkidx` vs goopg's `lineitem\_pk` skip probe\); CATEGORIES\-EXCL\-MATCH scan\-type\.
+  - Optimizer change: landing needs the acceptance arm \(M0146\-0178 escalation\)\.
 - [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq

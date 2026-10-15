@@ -1,8 +1,9 @@
 # M0146-0195 — B-tree: dedup before the split allocates its page
 
-Status: open. The storage fix landed 2026-10-15. The same day, a private-clone
-measurement showed that index size is NOT what drives the Q3/Q5/Q7 divergence
-(see "Measurement" below).
+Status: open. The storage fix landed 2026-10-15. Index bloat IS the Q3/Q5/Q7
+driver: with compact fk indexes actually in use, all three match PG (see
+"Corrected measurement"). The first measurement, which said the opposite, was
+invalid.
 
 ## Problem
 
@@ -110,6 +111,52 @@ Q11's match today rests on the bloated sizes.
 CREATE DATABASE'd database, `REINDEX TABLE/INDEX` and `DROP INDEX` report
 "does not exist" for relations that SELECT and CREATE INDEX resolve. Filed as
 M0146-0196.
+
+## Corrected measurement (2026-10-15, same day)
+
+The first measurement was invalid. goopg builds ONE parameterised index path
+per parameterisation: `pickIndexCoveringLeadingPrefix` (`nl_index_join.go`)
+takes the index that binds the most columns, and on a tie the first one by name
+(`IndexesOnTable` sorts by name). PG's `build_index_paths` instead builds a path
+for every usable index and lets `add_path` keep the cheapest. The `_rb` twins
+tied with the originals, so the bloated originals won without either being
+priced.
+
+**The probe cost reproduces exactly.** The gap grows with loop count. With
+`order\_customer\_fkidx` probed from ~30000 customers, PG charges 4.98 per probe
+and goopg 7.07. The difference, 2.09, is `genericcostestimate`'s index-page
+term under loop amortisation (`index_pages_fetched`, costsize.c:906):
+
+| index | pages | index-page cost per probe |
+|---|---|---|
+| PG's `order_customer_fkidx` | 4121 | 0.55 |
+| goopg's, after the realign | 28617 | 2.63 |
+
+A compact twin (1563 pages) named to sort first was chosen at 4.65 per probe,
+the predicted figure.
+
+**Re-measured** with twins named `a_<original>` and mapped back for the diff.
+Both arms used the HEAD + M0146-0178 slice-2 binary, against PG's
+`routing-realign-20261015`:
+
+| arm | match | join-method | scan-type | parallelism |
+|---|---|---|---|---|
+| clone as-is | 12 / 22 | 5 | 8 | 3 |
+| compact fk indexes in use | 14 / 22 | 3 | 5 | 1 |
+
+- Q3, Q5 and Q7 now MATCH; this task's targets.
+- Q2 and Q18 lose categories.
+- Q10 loses its match. goopg's bulk-built twins (1563 pages) are denser than
+  PG's indexes (4121), so they undercut PG's costs there.
+
+What would bring goopg in line:
+
+- **Bring the fk indexes to PG's size.** REINDEX is unavailable in `tpch`
+  (M0146-0196), but a reload of `:65433` by INSERT with the 7b356ec04 fix builds
+  them without the leak. That is an owner action.
+- **Cost every index (M0146-0197).** goopg should build a parameterised path for
+  every eligible index, as PG's `build_index_paths` does, so that cost picks
+  among them.
 
 ## Residuals
 
