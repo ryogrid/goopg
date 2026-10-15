@@ -1113,6 +1113,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       the noise, and was not kept.
     - Next lever: the same stall on non\-integer columns \(numeric\) in the
       generic decoder.
+  - **In\-place numeric deform arm LANDED 2026\-10\-16 \(loop \#38\)**.
+    Movement: none — perf only. The S3 instrument is value/plan identity:
+    sf025 `PASS=99 PLAN-SHAPE same=99`, fire\-set `fires=none`, ea\-ratchet
+    PASS, and full `TestPort_RegressSuite` PASS. Same design doc, "Slice 4".
+    - `colTypeInfo.isNumeric`: `decodeRowRangeInfo` calls
+      `decodePhysicalPGVarlena` \+ `NumericInt64FromStoredPayload` directly and
+      writes in place. Every declined payload takes the generic arm unchanged.
+      Pinned by `TestDeformNumericFastArmMatchesDecoder` \(mutation\-checked\).
+    - Measured: the SF1 filtered scan went from ~1250 ms to ~1148 ms \(−8%\).
+      TPC\-H arm: values identical, 38.91 s → 36.56 s \(Q1 4.71 → 3.89 s\).
+    - Next lever: expression evaluation — `evalFastExpr` 27.5%, `evalBinary`
+      8%, `compareDatum` 6.5%.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

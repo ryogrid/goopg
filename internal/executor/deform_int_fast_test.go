@@ -111,3 +111,99 @@ func TestDeformIntFastArmMatchesDecoder(t *testing.T) {
 		}
 	}
 }
+
+// TestDeformNumericFastArmMatchesDecoder pins decodeRowRangeInfo's in-place
+// numeric arm (M0122-0012) to the generic decoder's "numeric" arm. Values that
+// fit an int64 mantissa take the new arm. Wide mantissas, legacy decimal-text
+// payloads and the special spellings must fall through and decode exactly as
+// before.
+func TestDeformNumericFastArmMatchesDecoder(t *testing.T) {
+	for _, name := range []string{"numeric", "decimal"} {
+		if !numericFastForLoweredName(catalog.Type{Name: name}, name) {
+			t.Errorf("numericFastForLoweredName(%q) = false", name)
+		}
+		if numericFastForLoweredName(catalog.Type{Name: name, IsArray: true}, name) {
+			t.Errorf("numericFastForLoweredName(%q[]) = true", name)
+		}
+	}
+	for _, name := range []string{"int4", "float8", "text", "money"} {
+		if numericFastForLoweredName(catalog.Type{Name: name}, name) {
+			t.Errorf("numericFastForLoweredName(%q) = true", name)
+		}
+	}
+
+	// shortVarlena wraps a payload in a 1-byte varlena header, the form a
+	// pre-flip cluster stored its numeric text in.
+	shortVarlena := func(p string) []byte {
+		return append([]byte{byte((len(p)+1)<<1 | 1)}, p...)
+	}
+	texts := []string{"0", "1", "-1", "12.50", "-0.0001", "99999.99", "9223372036854775807",
+		"-9223372036854775808", "123456789012345678901234.5", "0.000000000000000000001"}
+	for _, typ := range []catalog.Type{{Name: "numeric"}, {Name: "numeric", Args: []int64{7, 2}}, {Name: "decimal"}} {
+		cols := []catalog.Column{
+			{Name: "k", Type: catalog.Type{Name: "int4"}},
+			{Name: "a", Type: typ},
+			{Name: "n", Type: typ},
+			{Name: "b", Type: typ},
+		}
+		for _, text := range texts {
+			m, s, err := parseNumeric(text)
+			if err != nil {
+				t.Fatalf("parseNumeric(%q): %v", text, err)
+			}
+			row := Row{NewIntDatum(1), newNumeric(m, int(s)), NullDatum, newNumeric(m, int(s))}
+			body, err := EncodeRowPG(cols, row)
+			if err != nil {
+				t.Fatalf("%s %q: encode: %v", typ.Name, text, err)
+			}
+			checkDeformAgrees(t, typ.Name+" "+text, cols, body, NullBitmapPG(row))
+		}
+		// Legacy text payloads and special spellings, as an older cluster
+		// stores them: int4 then a short varlena, no NULLs.
+		for _, legacy := range []string{"12.50", "-3", "NaN", "Infinity", "-Infinity", "123456789012345678901234.5"} {
+			body := []byte{1, 0, 0, 0}
+			body = append(body, shortVarlena(legacy)...)
+			lcols := cols[:2]
+			checkDeformAgrees(t, typ.Name+" legacy "+legacy, lcols, body, nil)
+		}
+	}
+	// A malformed varlena (length past the data) must report the generic
+	// arm's error, not be read by the fast arm.
+	cols := []catalog.Column{{Name: "a", Type: catalog.Type{Name: "numeric"}}}
+	bad := []byte{0x7f, 1, 2}
+	fast := make(Row, 1)
+	slow := make(Row, 1)
+	_, errF := decodeRowRangeInfo(fast, cols, resolveColTypeInfo(cols), bad, nil, 1, nil, array.DefaultOutputStyle(), 0, 1, 0)
+	_, errS := decodeRowRangeInfo(slow, cols, nil, bad, nil, 1, nil, array.DefaultOutputStyle(), 0, 1, 0)
+	if errS == nil || errF == nil || errF.Error() != errS.Error() {
+		t.Errorf("malformed varlena: fast err=%v, generic err=%v", errF, errS)
+	}
+}
+
+// checkDeformAgrees decodes one body through the resolved-info path (which
+// takes the in-place arms) and the info=nil path (generic decoder only), and
+// fails unless the rows, end offsets and errors agree.
+func checkDeformAgrees(t *testing.T, label string, cols []catalog.Column, body, bm []byte) {
+	t.Helper()
+	fast := make(Row, len(cols))
+	slow := make(Row, len(cols))
+	offF, errF := decodeRowRangeInfo(fast, cols, resolveColTypeInfo(cols), body, bm, len(cols), nil, array.DefaultOutputStyle(), 0, len(cols), 0)
+	offS, errS := decodeRowRangeInfo(slow, cols, nil, body, bm, len(cols), nil, array.DefaultOutputStyle(), 0, len(cols), 0)
+	if (errF == nil) != (errS == nil) || (errF != nil && errF.Error() != errS.Error()) || offF != offS {
+		t.Fatalf("%s: fast (off=%d err=%v) vs generic (off=%d err=%v)", label, offF, errF, offS, errS)
+	}
+	for i := range cols {
+		f, g := fast[i], slow[i]
+		// A big-mantissa numeric lives in an arena and its Int is a handle,
+		// which differs between two decodes; compare the value it renders.
+		if f.Kind == KindNumeric && g.Kind == KindNumeric && (f.Flags|g.Flags)&flagBigNumeric != 0 {
+			if f.Flags != g.Flags || numericText(f) != numericText(g) {
+				t.Fatalf("%s col %d: fast %s (flags %d) != generic %s (flags %d)", label, i, numericText(f), f.Flags, numericText(g), g.Flags)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(f, g) {
+			t.Fatalf("%s col %d: fast %#v != generic %#v", label, i, f, g)
+		}
+	}
+}

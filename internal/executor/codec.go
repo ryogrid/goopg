@@ -1501,6 +1501,19 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 				off += 2
 				continue
 			}
+			// A numeric whose stored NumericData fits an int64 mantissa is
+			// the generic arm's first exit; take it here for the same reason.
+			// Anything else (legacy text payloads, NaN/±Infinity, wide
+			// mantissas, malformed varlenas) goes to that arm unchanged.
+			if info[i].isNumeric {
+				if payload, n, err := decodePhysicalPGVarlena(data[off:]); err == nil {
+					if v, scale, ok := nodes.NumericInt64FromStoredPayload(payload); ok {
+						dst[i] = Datum{Kind: KindNumeric, Int: v, Scale: scale}
+						off += n
+						continue
+					}
+				}
+			}
 		}
 		v, consumed, err := decodePhysicalPGValueLowered(&c.Type, tname, data[off:], sctx, st)
 		if err != nil {

@@ -248,3 +248,34 @@ function's samples on one instruction: the first 16-byte load right after `decod
 The generic decoder still pays the same stall for every non-integer column, numeric included, which is the scan's
 remaining deform cost. The fix there is the same shape (decode into the destination, or a per-type arm). The
 SeqScanOp batch entry stays open in `unimplemented_feat.json`.
+
+## Slice 4 (2026-10-16): in-place numeric deform arm
+
+Slice 3's stall also hit every numeric column: the generic decoder's numeric arm builds its `Datum` in the
+stack-returned slot. The arm's first exit already does the real work through two small-result calls,
+`decodePhysicalPGVarlena` (payload, length, error) and `nodes.NumericInt64FromStoredPayload` (mantissa, scale, ok).
+Both return in registers.
+
+- **Change.** `colTypeInfo.isNumeric` (`numericFastForLoweredName`: plain `numeric`/`decimal`, not arrays) makes
+  `decodeRowRangeInfo` call those two directly and write `Datum{Kind: KindNumeric, Int, Scale}` into `dst[i]`.
+  Anything they decline goes to the generic arm unchanged: a varlena error, a legacy decimal-text payload,
+  NaN/±Infinity, or a mantissa past int64. The generic arm re-reads the varlena and reports the same result or
+  error.
+- **Sibling pin.** `TestDeformNumericFastArmMatchesDecoder` compares against the generic path:
+  - typmod'd and unconstrained numeric, plus `decimal`;
+  - int64 extremes, a wide mantissa, a NULL, legacy text payloads including the special spellings, and a malformed
+    varlena;
+  - big-mantissa values are compared by rendered text, because their `Int` is a per-decode arena handle.
+  - A mutation (mantissa + 1 in the arm) fails it.
+- **Measured.** Same SF1 clone and query, fresh server per arm, two rounds:
+  - HEAD `ee53c3319`: ~1250 ms warm (1253 / 1249 / 1245 / 1257, 1252 / 1249 / 1243 / 1255).
+  - Candidate: ~1148 ms (1151 / 1146 / 1152 / 1150, 1146 / 1146 / 1145 / 1158). That is −8 %.
+  - `decodeRowRangeInfo` share: 20.3 % → 13.3 %.
+  - TPC-H acceptance arm (lineitem holds eight numeric columns): values identical, total 38.91 → 36.56 s, Q1 4.71 →
+    3.89 s.
+- **Gates.** sf025 `PASS=99 PLAN-SHAPE same=99`; fire-set `fires=none`; ea-ratchet PASS; full `TestPort_RegressSuite`
+  PASS.
+
+Across slices 2-4 the filtered scan went from ~1970 ms to ~1148 ms, and the TPC-H arm from 40.28 s to 36.56 s. The
+profile is now led by expression evaluation: `evalFastExpr` 27.5 %, `evalBinary` 8 %,
+`NumericInt64FromStoredPayload` 8 %, `compareDatum` 6.5 %.

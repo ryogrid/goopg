@@ -81,6 +81,10 @@ type colTypeInfo struct {
 	// column in place, as PG's fetch_att does for a by-value attribute
 	// (postgres/src/include/access/tupmacs.h). See intWidthForLoweredName.
 	intWidth uint8
+	// isNumeric marks a plain (non-array) numeric/decimal column, which
+	// decodeRowRangeInfo decodes in place when its payload fits the int64
+	// mantissa fast path. See numericFastForLoweredName.
+	isNumeric bool
 }
 
 // resolveColTypeInfo resolves one colTypeInfo per column. Call it once, from
@@ -103,6 +107,7 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 			attByVal:   ta.TypByVal,
 			attStorage: ta.TypStorage,
 			intWidth:   intWidthForLoweredName(t, lower),
+			isNumeric:  numericFastForLoweredName(t, lower),
 		}
 	}
 	return info
@@ -199,4 +204,11 @@ func intWidthForLoweredName(t catalog.Type, lower string) uint8 {
 		return 8
 	}
 	return 0
+}
+
+// numericFastForLoweredName reports whether decodePhysicalPGValueLowered's
+// "numeric", "decimal" arm decodes this column. TestDeformNumericFastArmMatchesDecoder
+// pins the in-place arm to that one.
+func numericFastForLoweredName(t catalog.Type, lower string) bool {
+	return !t.IsArray && (lower == "numeric" || lower == "decimal")
 }
