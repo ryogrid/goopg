@@ -3303,6 +3303,21 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+- [ ] **M0146-0201 — TPC-H Q18: PG joins `customer` last by Parallel Hash Join above the `lineitem` probe; goopg hash\-joins it serially before the probe \(join\-method\)**
+  \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016d/ROUTING\.md`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Census at d1042cfb6: join\-method, sort\-strategy and qual\-placement tie at 2; differ order picks join\-method
+    \(TPC-H Q18, SF1 Q68\)\. Verdict SHAPE\-DIFF \[join\-order, join\-method, scan\-type\], first divergence depth 3 under
+    Gather: PG `Parallel Hash Join` \(customer, Parallel Hash over Parallel Seq Scan, 301873\.25\) | goopg `Nested Loop`
+    \(lineitem probe over a serial Hash Join with `customer`\)\. Totals: PG 404713\.55, goopg 388186\.47\.
+  - First step: price PG's shape in goopg — is `\(orders ⋈ agg\) ⋈ lineitem` then Parallel Hash Join `customer` generated
+    \(instrument `addPath` at the 4\-rel joinrel\), and how does its cost compare with goopg's winner; compare the
+    parallel hash cost terms \(`final\_cost\_hashjoin` with `parallel\_hash`, inner rows / workers\) with PG's\.
+  - Also visible: goopg keeps `Subquery Scan on "ANY\_subquery"` \(PG removes the trivial subquery scan\) and prints an
+    unqualified Sort Key \(rendering\)\.
+  - Other record, possibly another mechanism: SF1 Q68 \(household\_demographics: PG Hash Join, goopg pkey probe; near\-tie\)\.
+  - Expected instrument: TPC-H PLAN\-PARITY match 16 → 17 \(Q18\); CATEGORIES\-EXCL\-MATCH join\-method down\.
 - [x] **M0146-0200 — TPC-H Q21: PG keeps the EC\-derived `orders\.o\_orderkey = l2\.l\_orderkey` as the semi join's Join Filter over a parameterised `l2` probe; goopg drops it \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016c/ROUTING\.md`\)\.
   Kind: impl
