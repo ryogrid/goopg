@@ -247,6 +247,23 @@ OWNER DECISIONS history → `completed_milestones/completed_fix_plan_013.md`
 10-12 evening, 10-13, 10-13 (b) evening, 10-13 (c) parity self-
 replenishment, 10-15, 10-15 (b) TPC-H corpus realign).
 
+OWNER DECISIONS 2026-10-15 (c) — acceptance-arm unblock:
+- The M0146-0178 G1 escalation is resolved by an `XFAIL` pin in
+  `bench/tpch/baseline-digests.txt` + digestdiff support (option (b),
+  narrowed: only the baseline-pinned error passes as `EXPECTED-ERROR`;
+  recovery forces `XFAIL-RESOLVED` → re-pin). Option (a) was inert —
+  gate-exceptions waive only SKIP-BLOCKED, and the arm returns FAIL;
+  option (c) deadlocked — the Q5 plan fix itself needs the arm.
+- :65433 TPC-H index compaction: REINDEX is unavailable (M0146-0196 —
+  reproduced on :65433), so the cluster was reloaded by INSERT replay
+  under a 7b356ec04 binary — a NEGATIVE result: identical index sizes
+  (117050 / 28617 / 41512 pages). The remaining bloat driver is open
+  under M0146-0195; compacting the ref indexes goes through an 0196 fix
+  + REINDEX TABLE.
+- M0146-0196 stays below item 10 (S7 carve-out confirmed).
+- M0146-0178 de-escalated `[!]`→`[ ]`; resume = apply the parked
+  slice2.patch, re-run the arm, commit.
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -3207,6 +3224,15 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
       5423 → 607 blocks = CREATE INDEX\.
     - Landable without the arm \(internal/access/nbtree only\): units, nbtree \+ `\-race`, tpch\-spotcheck, sf025 PASS=99\.
     - \(Superseded below: the owner REINDEX request is withdrawn\.\)
+    - **Owner 2026\-10\-15:** the acceptance\-arm blocker is cleared \(XFAIL pin — see M0146\-0178 RESOLVED\), so the
+      next step below \(cost\_index term decompose\) is committable once it lands\.
+    - **Owner 2026\-10\-15 \(reload executed, NEGATIVE RESULT\):** :65433 was reloaded by INSERT replay under a
+      binary carrying 7b356ec04 \(and d7c05acde\) — TRUNCATE created fresh index files, yet the fk indexes came back
+      at the SAME sizes \(`idx\_lineitem\_orderkey\_fkidx` 117050, `order\_customer\_fkidx` 28617, `lineitem\_pk`
+      41512\)\. The dedup\-before\-split fix does not cover whatever path bloated these indexes on the real corpus —
+      the remaining bloat driver is a live question for this task \(the compact\-twin measurement says it matters:
+      12→14 when compact twins are used\)\. Route to compact the REF cluster's indexes: fix M0146\-0196 first
+      \(REINDEX/DROP INDEX resolve only DefaultDBOid — reproduced live on :65433\), then `REINDEX TABLE`\.
     - Residual: delete \+ VACUUM \+ reinsert still doubles an index — vacuumed pages sit on the deleting handle's free
       list, PG's FSM is shared \(M0122\-0010a\)\.
   - **2026\-10\-15 private\-clone measurement: index size does NOT drive Q3/Q5/Q7** \(`analysis/m0146/m0146\-0195/`\)\.
@@ -3243,6 +3269,8 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   Parent: M0146\-0195
   - Rank: below item 10 under the S7 carve\-out \(maintenance correctness, no plan instrument\) unless the owner
     places it\. It blocks index maintenance on every non\-default database, including the bench clusters\.
+    **Owner confirms 2026\-10\-15: below item 10 stands** — it gates owner maintenance only, and the Q5 pin removes
+    the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
 - [ ] **M0146\-0197 — a parameterised index path for EVERY eligible index, not one picked by heuristic** \(filed
@@ -3257,7 +3285,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Expected instrument: TPC-H PLAN\-PARITY where an index choice is decided by cost \(Q5's lineitem probe: PG's
     `idx\_lineitem\_orderkey\_fkidx` vs goopg's `lineitem\_pk` skip probe\); CATEGORIES\-EXCL\-MATCH scan\-type\.
   - Optimizer change: landing needs the acceptance arm \(M0146\-0178 escalation\)\.
-- [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
+- [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
   Scan (1653.62); PG's index-only scan must carry ~212 more, i.e. heap fetches (`cost_index`
@@ -3318,6 +3346,14 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     - The loop may not edit `\.ralph/gate\-exceptions\.md`, the hook, or weaken digestdiff\. Owner options: \(a\) a
       gate\-exceptions row for this task \+ gate; \(b\) a digestdiff rule accepting an error the baseline itself pins;
       \(c\) re\-pin Q5 once it completes \(raise the cap, or fix Q5's plan first\)\.
+    - **RESOLVED 2026\-10\-15 \(owner\) — option \(b\), narrowed to a baseline pin.** digestdiff gained an `XFAIL`
+      status: a baseline line `Q5: XFAIL — <detail>` passes only when the run reproduces the identical error
+      \(`EXPECTED\-ERROR`\); a different error is `ERROR\-DIFF`, a recovered OK is `XFAIL\-RESOLVED` \(still a gate
+      failure — forces re\-pin, so the pin cannot outlive its cause\), and `XFAIL` in a run log is
+      `XFAIL\-IN\-RUN`\. `bench/tpch/baseline\-digests\.txt` Q5 is now an XFAIL pin\. \(a\) was inert —
+      gate\-exceptions waive only `SKIP\-BLOCKED` stamps and the arm returned FAIL; \(c\) deadlocks because the
+      planner fix for Q5's plan itself needs the arm\. Verified: the parked slice\-2 arm output re\-diffed as
+      23 MATCH \+ 1 EXPECTED\-ERROR → `VERDICT: PASS`\.
     - Expected movement once unblocked: CATEGORIES\-EXCL\-MATCH parallelism 10 → 9 at SF0\.25 \(Q77\); index\-scan
       node costs at PG's for 45 nodes\. Resume: `git apply analysis/m0146/m0146\-0178/slice2/slice2\.patch`, re\-run
       the arm, commit\.

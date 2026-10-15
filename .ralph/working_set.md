@@ -1,45 +1,36 @@
-Task: M0122-0010 — Concurrency: buffer pool & btree locking. Slice 6 (gap 8) landed in 32fe610c7 (pushed); the task
-  stays [ ] for gap 5.
-  - Splits and vacuum's page unlink take no tree-wide lock. Vacuum re-finds the parent by downlink after latching
-    left/target/right (latchParentOf = _bt_getstackbuf inside _bt_lock_subtree_parent).
-  - Only finishSplit (no production caller, latches parent before child) still calls lockStructural.
-  - Stress tests: per-handle-mutex knob removed; odd rounds share one handle; no-lock 0/15, -race clean.
-  - TestMultiWriterStress_M0055_Phase_C now uses a 256-slot pool (32 concurrent splits exhausted 32 slots).
-  - Live: 2339 page unlinks alongside 2335 splits; index = heap before and after kill -9 recovery.
-S9: exhausted at c3dcb0f5f (routing-20261014j) — STALE as of 2026-10-15: owner reloaded the SF0.25
-  corpus (fillfactor-rebuilt indexes) AND realigned the TPC-H :65433 corpus to PG :65432's row set
-  (fresh TPC-H arm captured at routing-realign-20261015: 12/22 match, 10 honest divergences;
-  Q3/Q5/Q7/Q13/Q16/Q18/Q20/Q21/Q2/Q9 are the remaining records; Q5 also times out >900s executing its
-  divergent plan). S9(1) corpus-freshness clause → re-capture before next replenishment pass.
-ESCALATION (S2, awaiting owner), all filed without Parent: read-only txns not enforced; boolean predicate columns
-  typed text; rolled-back DROP of partition/inheritance/CASCADE loses the table (catalog half); CREATE TABLE in a
-  rolled-back savepoint survives.
-HELD: the GUC registry task and every other M0122-0008 child (root [!] since 2026-10-12). Do not select them.
+Task: M0146-0195 — TPC-H fk-index probes (Q3/Q7 join-method, Q5 scan-type). [ ] — root cause established.
+  - 7b356ec04 (landed): insert split no longer leaks pages — the bloat's cause.
+  - 1781cc20b: CORRECTED measurement (previous "refuted" was invalid): with compact fk indexes actually used,
+    TPC-H match 12 -> 14 (Q3/Q5/Q7 MATCH; Q10 lost because goopg bulk-built indexes are denser than PG's).
+    Per-probe gap reproduced exactly: genericcostestimate's loop-amortised index-page term (PG 4121 pages -> 0.55,
+    goopg 28617 -> 2.63 per probe). Evidence analysis/m0146/m0146-0195/ (m0195-s2-* arms).
+  - Filed M0146-0197: goopg builds ONE parameterised index path per parameterisation by heuristic
+    (pickIndexCoveringLeadingPrefix: most bound cols, ties -> name order); PG builds per index (build_index_paths).
+  - Filed M0146-0196 (below item 10): REINDEX/DROP INDEX can't resolve relations in a CREATE DATABASE'd db.
+BLOCKERS (owner) — resolved/dealt 2026-10-15:
+  1. tpch-acceptance-arm: CLEARED — digestdiff gained an XFAIL baseline pin (EXPECTED-ERROR passes only the pinned
+     error; XFAIL-RESOLVED forces a re-pin). baseline-digests.txt Q5 is XFAIL. The parked slice-2 arm output
+     re-diffs to VERDICT: PASS. M0146-0178 de-escalated [ ]: resume = apply slice2.patch, re-run arm, commit.
+  2. :65433 reload by INSERT with a 7b356ec04 binary: EXECUTED — NEGATIVE RESULT, fk indexes rebuilt to the SAME
+     sizes (117050 / 28617 / 41512 pages). The dedup fix does not cover the real-corpus bloat path; compacting the
+     ref indexes needs M0146-0196 fixed first (REINDEX/DROP INDEX resolve only DefaultDBOid — reproduced on :65433).
 NEXT LOOP:
-  1. Re-read the banner (S9 fresh unless new planner/executor commits).
-  2. Item 10 → M0122-0010 gap 5: finish crash-left incomplete splits on contact.
-     - PG: _bt_moveright (forupdate) / _bt_stepright / _bt_getstackbuf call _bt_finish_split when a page carries
-       INCOMPLETE_SPLIT (nbtsearch.c, nbtinsert.c).
-     - Rebuild finishSplit on getStackBuf with the left page held (child before parent), drop the metapage
-       fallback, call it from the insert descent's move-right and from getStackBuf; then remove lockStructural,
-       sharedSplitMu and Pool.BTreeStructuralLock (+ TestOpenedHandlesShareStructuralLock / stripe tests).
-     - Test: leave a page with BTIncompleteSplit and no downlink (simulate a crash), then insert into/through it and
-       require the downlink to appear and the flag to clear; kill -9 mid-split probe if feasible.
-  - S9 two-strike count = 1 (0194).
-Files: internal/access/nbtree/{btree.go (finishSplit, insertIntoBlock, getStackBuf, moveRight paths),
-  btree_vacuum.go (latchParentOf)}, design 0055-0002 §4.2 slice 6, README row 251.
-Key symbols: finishSplit, getStackBuf, insertUpperFinishChild, lockStructural, latchParentOf, acquireUnlinkPins.
+  1. Re-read banner; both blockers are cleared (see above) — the arm stamps again.
+  2. M0146-0178 resume: the slice2.patch content is already staged in the index (loop applied it 2026-10-15
+     evening) — re-run the arm, commit.
+  3. Then M0146-0195's next step: cost_index term decompose (committable now that the arm passes) — and note the
+     reload NEGATIVE result above: the fk-index bloat has a second driver beyond the dedup leak.
+Files: analysis/m0146/m0146-0195/*, design m0146-0195 (Corrected measurement section), fix_plan, ledger.
+Key symbols: pickIndexCoveringLeadingPrefix (nl_index_join.go), addOneParameterizedIndexPath (pathparamindex.go),
+  btreeIndexAMCostPages / indexPagesFetched (costindex.go), IndexesOnTable (sorted by name).
 Hypothesis/Findings:
-  - Parent moves under vacuum are rare in the stress test (deletion yield ~550/10 rounds before and after re-find).
-  - Free list is per handle (PG uses the shared FSM) — ledgered residual.
-  - Next date is 2026-10-15 (fix_plan/ledger rows use it).
-Next step: re-read the banner; then read finishSplit and the descent's move-right to plan gap 5.
-Top-residual: n/a (census exhausted at c3dcb0f5f, still fresh)
-Skip-rationale: n/a
-Gates run: nbtree x3 (+ -race x3) PASS, stress no-lock 0/15, 21 isolation ports PASS, units rc=0, tpch-spotcheck PASS
-  (Q12=2 Q13=33), sf025 PASS=99, pgbench smoke (hook), live kill -9 probe PASS.
+  - scripts/tpch-estimate-audit-arm.sh PRE_AUDIT_SQL works for clone-side setup; name twins a_<orig> to make them
+    win the heuristic tie, map back with sed for the diff.
+Next step: check blockers; else decide between M0146-0197 (arm-blocked) and the bulk-build density finding (landable).
+Top-residual: actionable join-method=4 (TPC-H Q2/Q3/Q7, SF0.25 Q43) — M0146-0195 owns Q3/Q7
+Skip-rationale: n/a — next step stays on M0146-0195's family.
+Gates run: no engine code changed (measurement + docs); pgbench smoke (hook).
 In-flight: none.
-Owner items: place the four S2 defects; decide the XLogInsert/XLogFlush rename (recommend won't-do); re-open or
-  close M0122-0008; place M0122-0009a/b/c and the two filed follow-ups; the COSTTIE flips (Q4 SF0.25, Q52 SF1);
-  the plan-shaping GUC defaults. (DONE 2026-10-15: SF0.25 reload for 0178 slice 2 — gate cleared; TPC-H
-  corpus realign to PG row set — anchors re-pinned, OWNER DECISIONS 2026-10-15 (b).)
+Owner items: (DONE 2026-10-15: arm unblocked via XFAIL pin; :65433 INSERT reload executed — negative result on index
+  bloat; M0146-0196 placed below item 10.) Still open: place the four S2 defects; XLogInsert/XLogFlush rename;
+  M0122-0008; M0122-0009a/b/c, M0122-0010a and filed follow-ups; COSTTIE flips; plan-shaping GUC defaults.
