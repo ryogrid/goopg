@@ -1,8 +1,9 @@
 # M0146-0178 — B-tree rightmost-page splits at the fillfactor
 
-Status: open — slice 1 (split rule) landed 2026-10-13. Slice 2 (the planner
-reads real index sizes) waits for the TPC-DS clusters to be reloaded. The
-heap-fetch term is the RELPAGES owner residual.
+Status: blocked [!] — slice 1 (split rule) landed 2026-10-13. Slice 2 (the
+planner reads real index sizes) is implemented and parked as a patch
+(2026-10-15): the TPC-H acceptance arm cannot PASS while baseline-digests pins
+Q5 as an error (escalated). The heap-fetch term is the RELPAGES owner residual.
 
 ## Problem
 
@@ -77,10 +78,87 @@ Three mechanisms are involved (evidence: `analysis/m0146/m0146-0178/`):
 ## Order of the remaining slices
 
 1. **Owner:** reload the goopg TPC-DS clusters (SF0.25 and SF1), so their
-   indexes are rebuilt by inserts under the new split rule.
+   indexes are rebuilt by inserts under the new split rule. Done 2026-10-15.
 2. **Slice 2:** resolve `IndexRealPages` through the catalog's database, as
    `InMemory.RelAllVisibleBlocks` does, and thread the catalog
    (`searchCtx.cat`) into `estimateIndexGeometry`. Done before the reload, the
    planner would read today's half-empty files (90 pages against PG's 52) and
    move plans away from PG.
 3. **Heap trailing pages:** the RELPAGES owner residual (bulk extension).
+
+## Slice 2 — index size read in the catalog's database (2026-10-15, parked)
+
+**Cause.** `get_relation_info` sizes the index relation it opened with
+`RelationGetNumberOfBlocks` (`./postgres/src/backend/optimizer/util/plancat.c:466`),
+and that relation is always in the current database. goopg's package-level
+`catalog.IndexRealPages` read the file at `(DBOid, OID)`, with `idx.DBOid` taken
+literally. An index created in the `postgres` database carries the namespace key
+`DefaultDBOid` (1), while its file sits under the catalog's storage database:
+`base/5` on a server (`NamespaceDBOid`, `InMemory.IndexRelFileNode`). The lookup
+found no file under `base/1`, so `estimateIndexGeometry` fell back to its
+width-derived guess. Example: TPC-DS `item_pkey` was priced at 40 pages; the real
+file has 52 pages, and so does PG's. This is the mismatch that M0145-0029 slice 5
+fixed for `relallvisible`.
+
+**Change** (`analysis/m0146/m0146-0178/slice2/slice2.patch`):
+
+- `catalog.IndexRealPagesIn(cat, idx)` resolves the file through
+  `cat.IndexRelFileNode`. A nil catalog falls back to the old lookup.
+- The pg_class view maps its namespace key back to the storage database the
+  same way, so `relpages` for an index reads the real file.
+- The catalog is threaded into `estimateIndexGeometry`, `indexPagesForPath` and
+  `seqWinsEqualityProbe`. Every caller already had it: `searchCtx.cat` or a
+  `cat` parameter.
+
+**Tests.**
+
+- `TestIndexRealPagesInUsesCatalogDatabase` (catalog, including the pg_class
+  cell).
+- `TestEstimateIndexGeometryReadsFileInCatalogDatabase` (optimizer). It also
+  asserts that the nil-catalog lookup still misses, so the case keeps
+  reproducing.
+
+**Measured on the reloaded SF0.25 corpus.** Both captures were taken through
+`scripts/jointree-parity-capture.sh`, with a clean-HEAD binary `d7c05acde` and
+the patched binary:
+
+| measure | HEAD | patched |
+|---|---|---|
+| match | 80 | 80 |
+| `CATEGORIES-EXCL-MATCH` | — | identical, except `parallelism` 10 → 9 (Q77) |
+| changed index-scan nodes vs PG | — | 45 closer, 4 farther |
+| plan totals vs PG | — | 45 closer, 36 farther |
+| sum of abs(log(goopg / PG)) | 11.940 | 11.899 |
+
+- Many index-scan nodes now equal PG exactly: Q30 `date_dim_pkey` 0.68,
+  Q46 `customer_pkey` 5.64 against 5.63, Q49 `web_sales_pkey` 7.94.
+- Q24, the task's witness, already matched at HEAD after the reload.
+- A plan total that moved away from PG reflects other cost terms, now that the
+  index input is right. Nothing was tuned (R6).
+
+**Gates on the patched tree.** units PASS; `tpch-spotcheck` PASS (Q12=2,
+Q13=35); `tpcds-sf025` PASS=99 with MISMATCH=0; `tpcds-fireset` PASS
+(introduced=none).
+
+**Why it is parked.** `tpch-acceptance-arm` against `bench/tpch/baseline-digests.txt`
+cannot pass:
+
+- every compared query matches (23 MATCH);
+- Q5 times out in both arms, and `baseline-digests.txt` pins exactly that error
+  since the 2026-10-15 corpus realign;
+- `digestdiff` turns an identical error in both arms into `BOTH-ERROR`, which
+  fails the verdict by design (`TestDiffBothErrorDoesNotPass`).
+
+So no costing, executor or optimizer commit can get a PASS stamp, whatever it
+changes. The commit hook requires that stamp. AGENT.md G1 forbids committing
+around it without an owner row in `.ralph/gate-exceptions.md`, so the change
+waits as a patch. It applies cleanly to `d7c05acde`.
+
+**Residuals.**
+
+- The two parallel worker-count sites (`computeParallelWorkersForScan`,
+  `upperSplitWorkersForScan`) and `catalog.TableRealPages` still use the
+  package-level lookup: no catalog reaches them. Both sizings miss the same
+  file, so they still agree with each other.
+- The heap trailing-page residual (RELPAGES).
+

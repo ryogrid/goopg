@@ -1,0 +1,511 @@
+diff --git a/internal/catalog/catalog.go b/internal/catalog/catalog.go
+index 0a804dd26..f06b987db 100644
+--- a/internal/catalog/catalog.go
++++ b/internal/catalog/catalog.go
+@@ -93,6 +93,38 @@ func IndexRealPages(idx *Index) (int64, bool) {
+ 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
+ }
+ 
++// IndexRealPagesIn is IndexRealPages resolved through cat: the file is looked
++// up where cat.IndexRelFileNode places it. An index in the postgres database
++// carries DBOid 0 or the namespace key DefaultDBOid (1), and its file sits
++// under the catalog's storage database (5 on a server, NamespaceDBOid).
++// `get_relation_info` (plancat.c:466) sizes the index relation it opened,
++// which is always in the current database; the package-level IndexRealPages
++// took DBOid 1 literally, found no file under base/1, and the planner fell
++// back to a width estimate (M0146-0178 slice 2: item_pkey priced at 40 pages,
++// real 52). nil cat keeps IndexRealPages.
++func IndexRealPagesIn(cat Catalog, idx *Index) (int64, bool) {
++	if idx == nil || RelNBlocksFunc == nil {
++		return 0, false
++	}
++	if cat == nil {
++		return IndexRealPages(idx)
++	}
++	return RelNBlocksFunc(cat.IndexRelFileNode(idx))
++}
++
++// indexRealPagesInDB is IndexRealPagesIn for a caller that already holds the
++// catalog's lock and knows the storage database: an index with DBOid 0 or
++// DefaultDBOid lives in dbOid, as IndexRelFileNode resolves it.
++func indexRealPagesInDB(idx *Index, dbOid uint32) (int64, bool) {
++	if idx == nil || RelNBlocksFunc == nil {
++		return 0, false
++	}
++	if idx.DBOid != 0 && idx.DBOid != DefaultDBOid {
++		dbOid = idx.DBOid
++	}
++	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
++}
++
+ // TableRealPages reports tbl's real main-fork size in blocks, when the storage
+ // hook is wired and the fork exists. It is `IndexRealPages`' sibling and PG's
+ // own input: `estimate_rel_size` fills `rel->pages` from a live
+@@ -8221,8 +8253,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
+ 		// tuple, so it reports the table's own count. `-1` is retained for the
+ 		// unanalysed case — PG 14+ uses it to mean "unknown", distinct from a
+ 		// genuine zero.
++		// dbOid is the namespace key; the postgres database's namespace is
++		// DefaultDBOid while its files sit under the catalog's storage
++		// database (NamespaceDBOid), so map it back as IndexRelFileNode does.
++		storeDB := c.dbOid
++		if dbOid != 0 && dbOid != DefaultDBOid {
++			storeDB = dbOid
++		}
+ 		idxRelPages := "0"
+-		if pages, ok := IndexRealPages(idx); ok && pages > 0 {
++		if pages, ok := indexRealPagesInDB(idx, storeDB); ok && pages > 0 {
+ 			idxRelPages = strconv.FormatInt(pages, 10)
+ 		}
+ 		idxRelTuples := "-1"
+diff --git a/internal/catalog/index_real_pages_test.go b/internal/catalog/index_real_pages_test.go
+new file mode 100644
+index 000000000..ce1540dca
+--- /dev/null
++++ b/internal/catalog/index_real_pages_test.go
+@@ -0,0 +1,69 @@
++package catalog
++
++import (
++	"testing"
++
++	"github.com/goopg/goopg/internal/parser"
++	"github.com/goopg/goopg/internal/storage"
++)
++
++// TestIndexRealPagesInUsesCatalogDatabase pins M0146-0178 slice 2. On a
++// server catalog (SetDBOID(5)) an index created in the postgres database
++// carries the namespace key DefaultDBOid (1) and its file sits under base/5.
++// The package-level IndexRealPages looks under base/1 and finds nothing, so
++// the planner priced a width guess (item_pkey: 40 pages against 52 real). IndexRealPagesIn resolves through the
++// catalog, as get_relation_info sizes the index it opened; so does the
++// pg_class view, whose postgres namespace is keyed DefaultDBOid.
++func TestIndexRealPagesInUsesCatalogDatabase(t *testing.T) {
++	c := NewInMemory()
++	c.SetDBOID(5)
++	tbl, err := c.CreateTable(parser.ObjectName{Name: "pages_t"}, []Column{{Name: "a", Type: Type{Name: "int4"}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	idx, err := c.CreateIndex(parser.ObjectName{Name: "pages_t_pkey"}, tbl, []string{"a"}, true, "btree", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if idx.DBOid != 0 && idx.DBOid != DefaultDBOid {
++		t.Fatalf("index carries DBOid %d; the case under test is the postgres namespace key", idx.DBOid)
++	}
++	prev := RelNBlocksFunc
++	t.Cleanup(func() { RelNBlocksFunc = prev })
++	RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
++		if rel.DBOid == 5 && rel.RelOid == idx.OID {
++			return 52, true
++		}
++		return 0, false
++	}
++	if _, ok := IndexRealPages(idx); ok {
++		t.Fatal("IndexRealPages found the file under the default database; the case no longer reproduces")
++	}
++	if got, ok := IndexRealPagesIn(c, idx); !ok || got != 52 {
++		t.Errorf("IndexRealPagesIn = %d, %v; want 52 from database 5", got, ok)
++	}
++	if got, ok := IndexRealPagesIn(nil, idx); ok {
++		t.Errorf("IndexRealPagesIn(nil) = %d; want the package-level miss", got)
++	}
++	found := false
++	for _, row := range c.PGClassRowsForDBOid(DefaultDBOid) {
++		if len(row) > 1 && row[1] == "pages_t_pkey" {
++			found = true
++			if !rowHasCell(row, "52") {
++				t.Errorf("pg_class row for pages_t_pkey %v carries no relpages 52", row)
++			}
++		}
++	}
++	if !found {
++		t.Fatal("pg_class has no row for pages_t_pkey")
++	}
++}
++
++func rowHasCell(row []string, want string) bool {
++	for _, cell := range row {
++		if cell == want {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/optimizer/costbitmap.go b/internal/optimizer/costbitmap.go
+index 1c4d961ff..f2eaac788 100644
+--- a/internal/optimizer/costbitmap.go
++++ b/internal/optimizer/costbitmap.go
+@@ -353,23 +353,23 @@ func bitmapAndScanCostEst(cp costParams, paths []*Path, relRows, T, indexPages,
+ // for a single BitmapIndexScan it returns the index's page count; for
+ // BitmapAnd/BitmapOr it sums across children. Returns 0 for non-bitmap paths
+ // or when index geometry is unavailable.
+-func indexPagesForPath(p *Path, tbl *catalog.Table, relTuples float64) float64 {
++func indexPagesForPath(cat catalog.Catalog, p *Path, tbl *catalog.Table, relTuples float64) float64 {
+ 	if p == nil || tbl == nil {
+ 		return 0
+ 	}
+ 	switch p.Kind {
+ 	case PathBitmapIndexScan:
+-		ip, _, _ := estimateIndexGeometry(p.IndexInfo, tbl, relTuples)
++		ip, _, _ := estimateIndexGeometry(cat, p.IndexInfo, tbl, relTuples)
+ 		return ip
+ 	case PathBitmapHeapScan:
+ 		if len(p.Children) > 0 {
+-			return indexPagesForPath(p.Children[0], tbl, relTuples)
++			return indexPagesForPath(cat, p.Children[0], tbl, relTuples)
+ 		}
+ 		return 0
+ 	case PathBitmapAnd, PathBitmapOr:
+ 		var sum float64
+ 		for _, child := range p.Children {
+-			sum += indexPagesForPath(child, tbl, relTuples)
++			sum += indexPagesForPath(cat, child, tbl, relTuples)
+ 		}
+ 		return sum
+ 	default:
+diff --git a/internal/optimizer/costindex.go b/internal/optimizer/costindex.go
+index 9512377fe..457554a93 100644
+--- a/internal/optimizer/costindex.go
++++ b/internal/optimizer/costindex.go
+@@ -562,8 +562,9 @@ func indexCorrelationFor(idx *catalog.Index, stats *catalog.ColumnStats) float64
+ // point is index-level catalog statistics, not a better formula.
+ //
+ // `relTuples` is the heap's pre-restriction row count; a B-tree has one entry
+-// per live heap tuple, so it is also the index's tuple count.
+-func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
++// per live heap tuple, so it is also the index's tuple count. cat locates the
++// index file (nil: the package-level default-database lookup).
++func estimateIndexGeometry(cat catalog.Catalog, idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
+ 	indexTuples = relTuples
+ 	if indexTuples < 1 {
+ 		indexTuples = 1
+@@ -624,7 +625,12 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
+ 	// real, which alone held the bitmap-vs-index probe choice on the wrong
+ 	// side of PG's (M0134-0183). `perPage` is re-derived from the real count
+ 	// so the tree-height estimate below reads the real fanout.
+-	if real, ok := catalog.IndexRealPages(idx); ok && real > 0 {
++	//
++	// The file is found through cat, in the catalog's database, as PG sizes
++	// the index relation it opened (M0146-0178 slice 2): the package-level
++	// lookup put a DBOid-less index in database 1, missed the file in
++	// database 5, and priced the width guess instead.
++	if real, ok := catalog.IndexRealPagesIn(cat, idx); ok && real > 0 {
+ 		indexPages = float64(real)
+ 		if perPage < indexTuples/indexPages {
+ 			perPage = math.Ceil(indexTuples / indexPages)
+diff --git a/internal/optimizer/costindex_test.go b/internal/optimizer/costindex_test.go
+index 7e865f6ee..c14be5867 100644
+--- a/internal/optimizer/costindex_test.go
++++ b/internal/optimizer/costindex_test.go
+@@ -314,8 +314,8 @@ func TestEstimateIndexGeometryDerivesPagesAndHeight(t *testing.T) {
+ 		t.Fatal("orders_pkey missing from the fixture")
+ 	}
+ 
+-	smallPages, smallTuples, smallHeight := estimateIndexGeometry(idx, orders, 100)
+-	bigPages, bigTuples, bigHeight := estimateIndexGeometry(idx, orders, 1_500_000)
++	smallPages, smallTuples, smallHeight := estimateIndexGeometry(nil, idx, orders, 100)
++	bigPages, bigTuples, bigHeight := estimateIndexGeometry(nil, idx, orders, 1_500_000)
+ 
+ 	if smallTuples != 100 || bigTuples != 1_500_000 {
+ 		t.Fatalf("index tuples = %v/%v; a B-tree has one entry per heap tuple", smallTuples, bigTuples)
+@@ -440,14 +440,14 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
+ 	// Histogram [1..500], id<200 -> 0.4 less eq_selec 1/500 = 0.398: 1000
+ 	// heap rows become 398 index rows.
+ 	tbl := statsTable()
+-	_, tuples, _ := estimateIndexGeometry(mkPartial(t, tbl), tbl, 1000)
++	_, tuples, _ := estimateIndexGeometry(nil, mkPartial(t, tbl), tbl, 1000)
+ 	if tuples != 398 {
+ 		t.Errorf("partial index tuples = %v, want 398 (1000 x 0.398)", tuples)
+ 	}
+ 
+ 	// Non-partial index on the same shape keeps the heap count.
+ 	plain := &catalog.Index{Name: "t_id", Columns: []string{"id"}}
+-	if _, tuples, _ := estimateIndexGeometry(plain, tbl, 1000); tuples != 1000 {
++	if _, tuples, _ := estimateIndexGeometry(nil, plain, tbl, 1000); tuples != 1000 {
+ 		t.Errorf("plain index tuples = %v, want 1000", tuples)
+ 	}
+ 
+@@ -458,20 +458,20 @@ func TestEstimateIndexGeometryPartialScalesTuples(t *testing.T) {
+ 	if pe, err := parser.ParseExpr("id < 200"); err == nil {
+ 		bareIdx.Predicate = pe
+ 	}
+-	if _, tuples, _ := estimateIndexGeometry(bareIdx, bare, 1000); tuples != 1000 {
++	if _, tuples, _ := estimateIndexGeometry(nil, bareIdx, bare, 1000); tuples != 1000 {
+ 		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
+ 	}
+ 
+ 	// Unanalysed despite a stats struct (Analyzed false): same decline.
+ 	unanalyzed := statsTable()
+ 	unanalyzed.Stats.Analyzed = false
+-	if _, tuples, _ := estimateIndexGeometry(mkPartial(t, unanalyzed), unanalyzed, 1000); tuples != 1000 {
++	if _, tuples, _ := estimateIndexGeometry(nil, mkPartial(t, unanalyzed), unanalyzed, 1000); tuples != 1000 {
+ 		t.Errorf("unanalysed partial index tuples = %v, want 1000 (declined)", tuples)
+ 	}
+ 
+ 	// Unresolvable predicate (nil): decline, never "keep nothing".
+ 	nilPred := &catalog.Index{Name: "t_id_prtl", Columns: []string{"id"}, HasPredicate: true}
+-	if _, tuples, _ := estimateIndexGeometry(nilPred, tbl, 1000); tuples != 1000 {
++	if _, tuples, _ := estimateIndexGeometry(nil, nilPred, tbl, 1000); tuples != 1000 {
+ 		t.Errorf("nil-predicate partial index tuples = %v, want 1000 (declined)", tuples)
+ 	}
+ }
+diff --git a/internal/optimizer/index_geometry_db_test.go b/internal/optimizer/index_geometry_db_test.go
+new file mode 100644
+index 000000000..ad4a6003e
+--- /dev/null
++++ b/internal/optimizer/index_geometry_db_test.go
+@@ -0,0 +1,41 @@
++package optimizer
++
++import (
++	"testing"
++
++	"github.com/goopg/goopg/internal/catalog"
++	"github.com/goopg/goopg/internal/parser"
++	"github.com/goopg/goopg/internal/storage"
++)
++
++// TestEstimateIndexGeometryReadsFileInCatalogDatabase pins M0146-0178 slice 2
++// at the planner: estimateIndexGeometry prices the index's real file, found in
++// the catalog's storage database, as get_relation_info sizes the index it
++// opened (plancat.c:466). Without the catalog the lookup missed the file and
++// the width-derived guess stood (TPC-DS item_pkey: 40 pages against 52 real).
++func TestEstimateIndexGeometryReadsFileInCatalogDatabase(t *testing.T) {
++	c := catalog.NewInMemory()
++	c.SetDBOID(5)
++	tbl, err := c.CreateTable(parser.ObjectName{Name: "geo_t"}, []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	idx, err := c.CreateIndex(parser.ObjectName{Name: "geo_t_pkey"}, tbl, []string{"a"}, true, "btree", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	prev := catalog.RelNBlocksFunc
++	t.Cleanup(func() { catalog.RelNBlocksFunc = prev })
++	catalog.RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
++		if rel.DBOid == 5 && rel.RelOid == idx.OID {
++			return 52, true
++		}
++		return 0, false
++	}
++	if pages, _, _ := estimateIndexGeometry(c, idx, tbl, 18000); pages != 52 {
++		t.Errorf("with the catalog: %v index pages, want the real 52", pages)
++	}
++	if pages, _, _ := estimateIndexGeometry(nil, idx, tbl, 18000); pages == 52 {
++		t.Errorf("without the catalog the default-database lookup found the file; the case no longer reproduces")
++	}
++}
+diff --git a/internal/optimizer/legacy_scan_choice_test.go b/internal/optimizer/legacy_scan_choice_test.go
+index daf125c20..f7012bb2a 100644
+--- a/internal/optimizer/legacy_scan_choice_test.go
++++ b/internal/optimizer/legacy_scan_choice_test.go
+@@ -56,7 +56,7 @@ func TestSeqWinsTinyUniqueProbe(t *testing.T) {
+ 	// the index descent plus random heap fetch loses to one
+ 	// sequential page under cost_seqscan/cost_index.
+ 	tbl, idx := probeFixture(t, "reasonlike", 35, 1, 35)
+-	if !seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
++	if !seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+ 		t.Error("1-page unique probe must decline the index (seq wins)")
+ 	}
+ }
+@@ -66,7 +66,7 @@ func TestSeqLosesLargeUniqueProbe(t *testing.T) {
+ 	// the guard against pricing the probe at selectivity 1.0, which
+ 	// would flip every legacy probe to sequential.
+ 	tbl, idx := probeFixture(t, "factlike", 1_440_000, 25_866, 1_440_000)
+-	if seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
++	if seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+ 		t.Error("large-table unique probe must keep the index")
+ 	}
+ }
+@@ -85,7 +85,7 @@ func TestSeqDeclinesWithoutStats(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if seqWinsEqualityProbe(tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
++	if seqWinsEqualityProbe(nil, tbl, idx, eqProbe(t), DefaultPlannerSettings()) {
+ 		t.Error("missing stats must keep the index (today's behavior)")
+ 	}
+ }
+diff --git a/internal/optimizer/nlipricesplice.go b/internal/optimizer/nlipricesplice.go
+index a9cbee05d..148f2425c 100644
+--- a/internal/optimizer/nlipricesplice.go
++++ b/internal/optimizer/nlipricesplice.go
+@@ -140,7 +140,7 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams)
+ 	probeRows := parameterizedBaserelRows(innerRel, idx,
+ 		parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
+ 	relPages := baseRelPages(tbl, relTuples)
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	probeCost := costIndexScan(cp, indexScanInputs{
+ 		relPages: relPages, relTuples: relTuples,
+ 		indexPages: indexPages, indexTuples: indexTuples, treeHeight: treeHeight,
+diff --git a/internal/optimizer/pathbitmap.go b/internal/optimizer/pathbitmap.go
+index 6248073a8..8fbff78c2 100644
+--- a/internal/optimizer/pathbitmap.go
++++ b/internal/optimizer/pathbitmap.go
+@@ -183,7 +183,7 @@ func (s *searchCtx) buildOneBitmapPath(
+ 	}
+ 
+ 	// Index geometry — same as the regular index scan cost model.
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
+ 
+ 	selectivity := qualSelectivity
+ 	in := indexScanInputs{
+@@ -463,7 +463,7 @@ func (s *searchCtx) chooseBitmapAnd(
+ 		for col := range indexCols[i] {
+ 			coveredCols[col] = true
+ 		}
+-		indexPages := indexPagesForPath(paths[i], tbl, relTuples)
++		indexPages := indexPagesForPath(s.cat, paths[i], tbl, relTuples)
+ 		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries, relQualOpCount(rel))
+ 
+ 		for j := i + 1; j < len(paths); j++ {
+@@ -490,7 +490,7 @@ func (s *searchCtx) chooseBitmapAnd(
+ 			// Sum index pages across the AND group for cache-aware estimate.
+ 			var andIP float64
+ 			for _, inner := range inners {
+-				ip, _, _ := estimateIndexGeometry(inner.IndexInfo, tbl, relTuples)
++				ip, _, _ := estimateIndexGeometry(s.cat, inner.IndexInfo, tbl, relTuples)
+ 				andIP += ip
+ 			}
+ 			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
+@@ -536,7 +536,7 @@ func (s *searchCtx) chooseBitmapAnd(
+ 
+ 	// Recompute heap-access cost atop the AND tree.
+ 	tuplesFetched := clampRowEst(andSelec * relTuples)
+-	andIP := indexPagesForPath(bitmapAndPath, tbl, relTuples)
++	andIP := indexPagesForPath(s.cat, bitmapAndPath, tbl, relTuples)
+ 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
+ 	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel))
+ 
+@@ -658,7 +658,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
+ 	}
+ 	sel = clampSelectivity(sel)
+ 	tuplesFetched := clampRowEst(sel * relTuples)
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
+ 	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
+ 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
+ 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
+diff --git a/internal/optimizer/pathbitmap_test.go b/internal/optimizer/pathbitmap_test.go
+index 53357684e..25c0723ab 100644
+--- a/internal/optimizer/pathbitmap_test.go
++++ b/internal/optimizer/pathbitmap_test.go
+@@ -190,7 +190,7 @@ func TestBitmapPathCost_Positive(t *testing.T) {
+ 	maxEntries := bitmapMaxEntries(s.cp.workMem)
+ 
+ 	// Manually compute the bitmap path cost components.
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(nil, idx, tbl, relTuples)
+ 	in := indexScanInputs{
+ 		relPages:        relPages,
+ 		relTuples:       relTuples,
+diff --git a/internal/optimizer/pathindexonly.go b/internal/optimizer/pathindexonly.go
+index edd4caa26..31ae461f6 100644
+--- a/internal/optimizer/pathindexonly.go
++++ b/internal/optimizer/pathindexonly.go
+@@ -343,7 +343,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
+ 	if qpquals < 0 {
+ 		qpquals = 0
+ 	}
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	in := indexScanInputs{
+ 		relPages:                relPages,
+ 		relTuples:               relTuples,
+diff --git a/internal/optimizer/pathindexordered.go b/internal/optimizer/pathindexordered.go
+index 5319c4cf5..fa4d52b42 100644
+--- a/internal/optimizer/pathindexordered.go
++++ b/internal/optimizer/pathindexordered.go
+@@ -218,7 +218,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table,
+ 	// so `check_index_only`'s answer is always no). What is left is
+ 	// `useful_pathkeys != NIL`, which the non-empty `keys` above just
+ 	// established.
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
+ 	in := indexScanInputs{
+ 		relPages:    relPages,
+ 		relTuples:   relTuples,
+diff --git a/internal/optimizer/pathindexrestrict.go b/internal/optimizer/pathindexrestrict.go
+index 8c9d3096c..786e7b803 100644
+--- a/internal/optimizer/pathindexrestrict.go
++++ b/internal/optimizer/pathindexrestrict.go
+@@ -543,7 +543,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
+ 		keys, dir = indexPathOrdering(idx, colExprs, false)
+ 	}
+ 
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	// A skip probe descends once per distinct skipped prefix
+ 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
+ 	// side over the whole index (skipScanDescents, boundSelectivity 1).
+diff --git a/internal/optimizer/pathparamindex.go b/internal/optimizer/pathparamindex.go
+index cf28bef4c..756db97f4 100644
+--- a/internal/optimizer/pathparamindex.go
++++ b/internal/optimizer/pathparamindex.go
+@@ -381,7 +381,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
+ 	// loop count `create_index_path` takes from `get_loop_count` — the SAME
+ 	// scan model the unparameterised ordered path uses (pathindexordered.go),
+ 	// not a second one.
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	// M0146-0005bq: build_index_paths' single `index_only_scan` flag
+ 	// (indxpath.c) — when check_index_only finds the index covers every
+ 	// column the statement reads from this rel, the ONE path PG builds for
+@@ -567,7 +567,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
+ 	// in prefix order and each group's probe is suffix-ordered — so the
+ 	// index's pathkeys are as valid here as on the prefix path.
+ 	keys, dir := indexPathOrdering(idx, innerExprs, false)
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	numSA, boundCounted := skipScanDescents(tbl, idx, skip, relTuples, indexPages)
+ 	// `indexBoundQuals` vs `indexQuals` (selfuncs.c:7643-7680): the heap
+ 	// side always filters by the probe's quals (`selectivity`), but the
+diff --git a/internal/optimizer/planner.go b/internal/optimizer/planner.go
+index 877b9d4ba..76f47037a 100644
+--- a/internal/optimizer/planner.go
++++ b/internal/optimizer/planner.go
+@@ -12175,7 +12175,7 @@ func indexLeadsRegIdentifierArray(tbl *catalog.Table, idx *catalog.Index) bool {
+ // is the shape PG lands on. Anything unmeasurable (no stats,
+ // non-positive selectivity) returns false — today's behavior —
+ // never a fabricated seq win.
+-func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
++func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
+ 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
+ 		return false
+ 	}
+@@ -12221,7 +12221,7 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
+ 	if sel > 1 {
+ 		sel = 1
+ 	}
+-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
++	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+ 	T := float64(relPages)
+ 	if T < 1 {
+ 		T = 1
+@@ -12435,7 +12435,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
+ 	// same cost functions the search uses. A 1-page table loses to a
+ 	// sequential scan; declining returns the caller to its Seq Scan
+ 	// fallback — the shape PG lands on.
+-	if seqWinsEqualityProbe(tbl, idx, queryClause, ctx.settings) {
++	if seqWinsEqualityProbe(cat, tbl, idx, queryClause, ctx.settings) {
+ 		return nil, false, nil
+ 	}
+ 	return &IndexScan{
+diff --git a/internal/optimizer/scan_input_rewrite.go b/internal/optimizer/scan_input_rewrite.go
+index 0255939b3..0e8548585 100644
+--- a/internal/optimizer/scan_input_rewrite.go
++++ b/internal/optimizer/scan_input_rewrite.go
+@@ -273,7 +273,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog,
+ 			// conjunct — the selectivity input. SAOP/range
+ 			// rewrites stay uncosted (today's behavior, named
+ 			// follow-ups).
+-			if ch.bounds.eqConjunct != nil && seqWinsEqualityProbe(ss.Table, idx, ch.bounds.eqConjunct, ps) {
++			if ch.bounds.eqConjunct != nil && seqWinsEqualityProbe(cat, ss.Table, idx, ch.bounds.eqConjunct, ps) {
+ 				continue
+ 			}
+ 			newScan = &IndexScan{

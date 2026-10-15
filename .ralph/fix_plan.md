@@ -3171,7 +3171,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
   - Rank: below item 10 — regress\-only witness, no TPC query named \(S7 carve\-out\)\.
   - First step: skip the ordered producer for an index the restriction producer already built a clause path for
     \(the same rule `restrictionPathIsIndexOnly` applies to its index\-only twin\), then re\-run the fire set\.
-- [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
+- [!] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
   Scan (1653.62); PG's index-only scan must carry ~212 more, i.e. heap fetches (`cost_index`
@@ -3210,3 +3210,28 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
       residual\.
     - Gates: units, postmaster, tpch\-spotcheck, sf025 PASS=99, TPC\-DS fire set PASS \(no change\), TPC\-H
       acceptance arm PASS, regress A/B 5 index suites identical, nbtree `\-race`\.
+  - **2026\-10\-15 slice 2 implemented and PARKED as a patch** \(`analysis/m0146/m0146\-0178/slice2/slice2\.patch`,
+    applies to `d7c05acde`; design doc §"Slice 2"\)\.
+    - Cause: an index in the `postgres` database carries the namespace key DefaultDBOid \(1\); its file sits under
+      `base/5`\. `catalog\.IndexRealPages` took the key literally, missed the file, and `estimateIndexGeometry`
+      priced the width guess\. `get\_relation\_info` sizes the opened relation \(plancat\.c:466\)\.
+    - Change: `catalog\.IndexRealPagesIn\(cat, idx\)` via `cat\.IndexRelFileNode`; the catalog threaded into
+      `estimateIndexGeometry`, `indexPagesForPath`, `seqWinsEqualityProbe`; the pg\_class view maps its namespace key
+      to the storage database\. Two tests\.
+    - Measured on the reloaded SF0\.25 corpus \(HEAD vs patched captures in `slice2/`\): match 80 → 80;
+      CATEGORIES\-EXCL\-MATCH identical except parallelism 10 → 9 \(Q77\); changed index\-scan nodes 45 closer to PG,
+      4 farther; plan totals 45 closer, 36 farther; Σ\|log goopg/PG\| 11\.940 → 11\.899\.
+    - Gates on the patched tree: units PASS, tpch\-spotcheck PASS \(Q12=2, Q13=35\), sf025 PASS=99, fire set PASS
+      \(introduced=none\)\. tpch\-acceptance\-arm: 23 MATCH \+ Q5 BOTH\-ERROR → VERDICT FAIL\.
+  - **ESCALATION 2026\-10\-15 \(gate unpassable, G1\) — marked `\[!\]`, OWNER ACTION NEEDED\.**
+    - The 2026\-10\-15 \(b\) realign pinned TPC\-H Q5 as an error in `bench/tpch/baseline\-digests\.txt` \(it runs past
+      the 600s cap on goopg's divergent plan\)\. `cmd/tpch\-runner` digestdiff fails a both\-arms\-identical error as
+      `BOTH\-ERROR` by design \(`TestDiffBothErrorDoesNotPass`\), so `tpch\-acceptance\-arm` FAILs for EVERY tree, HEAD
+      included\. `\.githooks/commit\-msg` requires its PASS stamp for any non\-test \.go under internal/optimizer,
+      internal/planner, internal/executor or a cost/stat/selfuncs path — i\.e\. all banner item\-3 implementation work\.
+    - The loop may not edit `\.ralph/gate\-exceptions\.md`, the hook, or weaken digestdiff\. Owner options: \(a\) a
+      gate\-exceptions row for this task \+ gate; \(b\) a digestdiff rule accepting an error the baseline itself pins;
+      \(c\) re\-pin Q5 once it completes \(raise the cap, or fix Q5's plan first\)\.
+    - Expected movement once unblocked: CATEGORIES\-EXCL\-MATCH parallelism 10 → 9 at SF0\.25 \(Q77\); index\-scan
+      node costs at PG's for 45 nodes\. Resume: `git apply analysis/m0146/m0146\-0178/slice2/slice2\.patch`, re\-run
+      the arm, commit\.
