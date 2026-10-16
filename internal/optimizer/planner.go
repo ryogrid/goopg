@@ -611,6 +611,12 @@ type resolveContext struct {
 	// resolved into SortKeys until far below the search. Empty in every
 	// context that is not a top-level FROM clause.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys are `PlannerInfo.group_pathkeys` and
+	// `distinct_pathkeys`, from the same derivation (M0146-0223):
+	// truncate_useless_pathkeys keeps a join ordering that either can use,
+	// whichever list became query_pathkeys.
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// neededCols / neededColsKnown: the statement's needed-column set,
 	// computed once per `planSelect` (pathindexonlyneed.go) and handed to the
@@ -1982,7 +1988,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// join search. See the comment there.
 		// C-07: `standard_qp_callback` runs here for the same reason
 		// `preprocess_limit` does — before `query_planner` builds a rel.
-		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.setQueryPathkeys(s)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
@@ -2131,7 +2137,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the search reads it. (`tupleFraction` was stamped for both arms at
 		// the convergent block above — C-17.)
 		// C-07: as in the `*Filter` arm above.
-		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.setQueryPathkeys(s)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)

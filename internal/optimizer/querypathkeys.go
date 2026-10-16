@@ -155,6 +155,15 @@ func deriveQueryPathkeys(s *parser.SelectStmt, ctx *resolveContext) []PathKey {
 	return chooseQueryPathkeys(deriveQueryPathkeySets(s, ctx))
 }
 
+// setQueryPathkeys stamps ctx with `query_pathkeys` and the two lists
+// truncate_useless_pathkeys reads beside it, `group_pathkeys` and
+// `distinct_pathkeys` (M0146-0223).
+func (ctx *resolveContext) setQueryPathkeys(s *parser.SelectStmt) {
+	sets := deriveQueryPathkeySets(s, ctx)
+	ctx.queryPathkeys = chooseQueryPathkeys(sets)
+	ctx.groupPathkeys, ctx.distinctPathkeys = sets.group, sets.distinct
+}
+
 // deriveQueryPathkeySets fills the five lists. Every goopg-specific decline is
 // here, and each one is an EMPTY list rather than a partial one wherever a
 // partial answer would claim an ordering the query does not want.

@@ -387,6 +387,8 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 		// (TPC-DS Q64's cs_item_sk order, PG's Incremental Sort input);
 		// without parallelModeOK it built no partial join paths.
 		queryPathkeys:      s.queryPathkeys,
+		groupPathkeys:      s.groupPathkeys,
+		distinctPathkeys:   s.distinctPathkeys,
 		parallelModeOK:     s.parallelModeOK,
 		cat:                s.cat,
 		itemSpans:          s.itemSpans,

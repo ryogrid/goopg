@@ -156,6 +156,10 @@ type joinlistProblem struct {
 	// so every sub-problem of one statement shares it — the same rule
 	// neededCols follows.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys carry `root->group_pathkeys` and
+	// `distinct_pathkeys` the same way (M0146-0223).
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// spineAbove reports that a pinned outer spine sits above this
 	// problem's tree: the spine's ON quals read the searched subtree's
@@ -675,6 +679,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
+	s.groupPathkeys, s.distinctPathkeys = prob.groupPathkeys, prob.distinctPathkeys
 	// M0146-0005b: set_cte_pathlist's converted pathkeys on the CTE-scan
 	// leaves, now that the clause list and query pathkeys it reads exist.
 	s.addCTEScanPathkeys()

@@ -185,6 +185,11 @@ type searchCtx struct {
 	// of the query, not of a relation. Read by `hasUsefulPathkeys`. Empty
 	// means "no special ordering requested", which is upstream's NIL.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys are `root->group_pathkeys` and
+	// `distinct_pathkeys` (M0146-0223), read by truncate_useless_pathkeys'
+	// grouping and distinct arms (pathkeys_useful.go).
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// neededCols / neededColsKnown are PG's `reltarget` + `attr_needed` for
 	// this statement, by COLUMN NAME — see pathindexonlyneed.go for the

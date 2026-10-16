@@ -14,9 +14,16 @@ package optimizer
 // goopg's pathkeys are syntactic, so the merge test is by expression: a
 // pathkey is merge-useful when it equals an operand of an equijoin clause
 // whose equivalence class (or, for a clause outside any class, the clause
-// itself) has a member whose relids are not inside the joinrel. The grouping,
-// distinct and set-op arms of truncate_useless_pathkeys are not ported: the
-// search keeps only the chosen query_pathkeys.
+// itself) has a member whose relids are not inside the joinrel.
+//
+// The grouping and distinct arms (pathkeys_useful_for_grouping /
+// _for_distinct, M0146-0223) keep the leading keys that are members of
+// group_pathkeys / distinct_pathkeys, in any order. Without them a join
+// ordered on a group key that is not the leading one was truncated to no
+// ordering, and its partial path lost to an unordered one PG rejects (TPC-DS
+// Q39's inv ⋈ item merge join, ordered on i_item_sk under GROUP BY
+// w_warehouse_sk, i_item_sk, d_moy). The set-op arm has nothing to read:
+// goopg derives no setop_pathkeys (querypathkeys.go).
 
 // pathkeyUsefulness is what a joinrel needs to truncate the pathkeys of its
 // paths, computed once when the joinrel is built.
@@ -25,12 +32,21 @@ type pathkeyUsefulness struct {
 	mergeExprs []Expr
 	// queryPathkeys is root->query_pathkeys.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys are root->group_pathkeys and
+	// root->distinct_pathkeys.
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 	// relids and classMembers answer the question PG's canonical pathkeys
 	// answer by construction: two expressions of this rel that are members of
 	// one equivalence class order the rel's rows identically, because the
 	// class's equality is enforced inside the rel (M0146-0005dv).
 	relids       RelSet
 	classMembers []classMember
+	// ecMembers are the members of every equivalence class in the search,
+	// enforced inside this rel or not. PG's canonical pathkeys name the
+	// class itself, so list_member_ptr matches an ordering on any member
+	// (classOf).
+	ecMembers []classMember
 }
 
 // classMember is one expression of an equivalence class, with the relations
@@ -47,7 +63,8 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	if s == nil {
 		return nil
 	}
-	u := &pathkeyUsefulness{queryPathkeys: s.queryPathkeys, relids: joinrelids}
+	u := &pathkeyUsefulness{queryPathkeys: s.queryPathkeys, groupPathkeys: s.groupPathkeys,
+		distinctPathkeys: s.distinctPathkeys, relids: joinrelids}
 	if s.clauses == nil {
 		return u
 	}
@@ -75,6 +92,10 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 			}
 		}
 		classes[id] = append(classes[id], member{ri.leftKey, ri.leftRelids}, member{ri.rightKey, ri.rightRelids})
+		if ri.ecID != noEquivClass {
+			u.ecMembers = append(u.ecMembers,
+				classMember{ri.leftKey, ri.leftRelids, id}, classMember{ri.rightKey, ri.rightRelids, id})
+		}
 	}
 	for _, ms := range classes {
 		outside := false
@@ -96,9 +117,9 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	return u
 }
 
-// truncateUselessPathkeys is truncate_useless_pathkeys over the merging and
-// ordering arms. A nil usefulness (a rel built outside the search) keeps the
-// keys whole.
+// truncateUselessPathkeys is truncate_useless_pathkeys over the merging,
+// ordering, grouping and distinct arms. A nil usefulness (a rel built outside
+// the search) keeps the keys whole.
 func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	if u == nil || len(keys) == 0 {
 		return keys
@@ -111,6 +132,12 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	if _, nOrd := u.countContainedIn(keys, u.queryPathkeys); nOrd > n {
 		n = nOrd
 	}
+	if nGrp := u.leadingMembersOf(keys, u.groupPathkeys); nGrp > n {
+		n = nGrp
+	}
+	if nDist := u.leadingMembersOf(keys, u.distinctPathkeys); nDist > n {
+		n = nDist
+	}
 	switch {
 	case n == 0:
 		return nil
@@ -118,6 +145,49 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 		return keys
 	}
 	return keys[:n:n]
+}
+
+// leadingMembersOf is pathkeys_useful_for_grouping and
+// pathkeys_useful_for_distinct: the number of leading keys that are members
+// of list, in any order. Membership is list_member_ptr on canonical pathkeys:
+// the same direction, nulls order and equivalence class (classOf).
+func (u *pathkeyUsefulness) leadingMembersOf(keys, list []PathKey) int {
+	if len(list) == 0 {
+		return 0
+	}
+	n := 0
+	for _, k := range keys {
+		member := false
+		for _, l := range list {
+			if pathKeyEqual(k, l) || (k.SortAsc == l.SortAsc && k.NullsFirst == l.NullsFirst &&
+				k.GroupingNulled == l.GroupingNulled && u.sameClass(k.Expr, l.Expr)) {
+				member = true
+				break
+			}
+		}
+		if !member {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// sameClass reports whether a and b are members of one equivalence class of
+// the search, wherever its equality is enforced. This is the identity of
+// PG's canonical pathkeys; equivalentWithin is the narrower question of
+// whether this rel's rows are ordered alike by both.
+func (u *pathkeyUsefulness) sameClass(a, b Expr) bool {
+	ida, idb := -1, -1
+	for _, m := range u.ecMembers {
+		if ida < 0 && exprEqual(m.expr, a) {
+			ida = m.id
+		}
+		if idb < 0 && exprEqual(m.expr, b) {
+			idb = m.id
+		}
+	}
+	return ida >= 0 && ida == idb
 }
 
 // usefulForMerging is pathkeys_useful_for_merging: the leading pathkeys, in

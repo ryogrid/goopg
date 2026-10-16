@@ -1237,6 +1237,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// fraction is, and in the SAME binding coordinates the conjuncts
 		// above are written in.
 		queryPathkeys: ctx.queryPathkeys,
+		// M0146-0223: `root->group_pathkeys` / `distinct_pathkeys`, for
+		// truncate_useless_pathkeys' grouping and distinct arms.
+		groupPathkeys:    ctx.groupPathkeys,
+		distinctPathkeys: ctx.distinctPathkeys,
 		// The statement's needed-column set (pathindexonlyneed.go), computed
 		// once in `planSelect` — the only frame holding the
 		// *parser.SelectStmt; the search boundary sees resolved nodes only.

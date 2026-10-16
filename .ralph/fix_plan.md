@@ -4564,7 +4564,7 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
       on the replica \(probe2/\)\.
     - Index geometry, a 16 shift, is owner\-gated \(M0146\-0216\)\. The sub\-problem boundary passing no partial paths is
       ledgered\.
-- [ ] **M0146\-0223 — parallelism: TPC\-DS Q39 — PG joins `item` above the Gather in the `inv` CTE; goopg joins it
+- [x] **M0146\-0223 — parallelism: TPC\-DS Q39 — PG joins `item` above the Gather in the `inv` CTE; goopg joins it
   inside the workers** \(filed 2026\-10\-17 by the S9 pass at 472e41064\)\.
   Kind: impl
   Parent: M0146-0014
@@ -4580,3 +4580,17 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
     add\_partial\_path for the item join, then compare goopg's DPPATH lines under PG statistics\. Check the item\_pkey IOS
     cost too: allvisfrac \(relallvisible\) or index geometry\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 89→90 \(Q39\), then SF1\.
+  - **LANDED 2026\-10\-17 \(loop \#73\): truncate\_useless\_pathkeys' grouping and distinct arms\.** Design
+    `docs/design/0100\-0149/m0146\-0223\-pathkeys\-useful\-for\-grouping\.md`; evidence `analysis/m0146/m0146\-0223/`\.
+    - Replica: PG's 4\-rel Merge Join partial \(\.\.25201\.06, ordered on inv\_item\_sk\) evicts the Hash Join partial
+      \(25108\.41\) on pathkeys within fuzz; its Gather \(27377\.76\) loses to the serial item join \(27306\.05\)\.
+    - goopg filed the same Merge Join with pathkeys=0: only the merging and ordering arms were ported, and
+      i\_item\_sk is a group key but not the leading one\. The IOS 478\.29 vs 531\.08 is relallvisible \(it matches under
+      PG statistics\) and is not the cause\.
+    - Fix: group\_pathkeys / distinct\_pathkeys ride to searchCtx; leadingMembersOf is list\_member\_ptr on canonical
+      pathkeys \(sameClass over every equivalence class\)\. The set\-op arm has no setop\_pathkeys producer\.
+    - Census: SF0\.25 89→90, SF1 76→77 \(Q39 MATCH at both\), TPC\-H 22/22; SF0\.25 under PG statistics 93→94\.
+    - Pin: TestTruncateUselessPathkeysGroupingAndDistinct, mutation\-checked\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS \(Q39 plan text changed\), fireset PASS \(Q39 results
+      byte\-identical at both scales\), TestPort\_RegressSuite\.
+Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
