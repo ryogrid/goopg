@@ -4564,3 +4564,19 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
       on the replica \(probe2/\)\.
     - Index geometry, a 16 shift, is owner\-gated \(M0146\-0216\)\. The sub\-problem boundary passing no partial paths is
       ledgered\.
+- [ ] **M0146\-0223 — parallelism: TPC\-DS Q39 — PG joins `item` above the Gather in the `inv` CTE; goopg joins it
+  inside the workers** \(filed 2026\-10\-17 by the S9 pass at 472e41064\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q39, category parallelism, verdict SHAPE\-DIFF at depth 4 \(under HashAggregate: PG Hash
+    Join Inner \| goopg Gather\)\. The same record appears at SF1, and both persist under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261017c/`\.
+  - S9 ranking: parallelism, qual\-placement, scan\-type and join\-order tie at 2\. Parallelism wins as one mechanism at
+    both scales\.
+  - PG: `HashAggregate → Hash Join \(item, Index Only Scan item\_pkey 531\.08\) → Gather → Hash Join \(warehouse\) → Parallel
+    Hash Join \(inventory, date\_dim\)`\. goopg: `HashAggregate → Gather → Hash Join \(warehouse\) → Hash Join \(item, IOS
+    478\.29\) → Parallel Hash Join`\.
+  - First step: on the exact PG replica \(tmp/m21\-refclone\), probe the 4\-rel joinrel's add\_path and
+    add\_partial\_path for the item join, then compare goopg's DPPATH lines under PG statistics\. Check the item\_pkey IOS
+    cost too: allvisfrac \(relallvisible\) or index geometry\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 89→90 \(Q39\), then SF1\.
