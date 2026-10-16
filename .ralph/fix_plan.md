@@ -4189,6 +4189,24 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     bit\-identical; any remaining divergence after the port attributes to the first divergent tour cost
     and re\-routes normally\. Re\-measure Q64 on both scales\.
   - Expected instrument: TPC\-DS PLAN\-PARITY match counts at both scales \(Q64\)\.
+  - **Slice 1 LANDED 2026\-10\-16 \(loop \#55\): GEQO draws PG's stream.** Design
+    `docs/design/0100-0149/m0146-0214-geqo-pg-prng.md`.
+    - `internal/utils/pgprng` \(pg\_prng\.c\) and `internal/utils/pgqsort` \(pg\_qsort, sort\_template\.h\) are
+      shared leaf ports. The ANALYZE samplers now use pgprng too, instead of their private copy.
+    - In geqo\.go, `geqoRNG` wraps pgprng; `initTour`, `linearRand`, `gimmeEdge` \(abs match\) and the pool\-size
+      override \(≥ 2\) follow PG statement for statement; `sortPool` is pg\_qsort, whose tie order selection
+      depends on. The threshold dispatch at relfromjoinlist\.go was audited: it is equivalent.
+    - Oracles built from PG's own code, no server: a pg\_prng stream harness, a pg\_qsort permutation harness
+      \(75 arrays\), and PG's own geqo\_\*\.c compiled into a draw\-order harness \(890 lines\). All are reproduced
+      exactly and mutation\-checked.
+    - Measured: census TPC\-H 22/22, SF0\.25 86/99, SF1 74/99, unchanged. Q64 is still SHAPE\-DIFF; its SF1 first
+      divergence moved from depth 6 to 5, and SF1 parameterisation went 7→6, inside noise. Fire set: Q64 executed
+      on both engines with byte\-identical results. Gates: units, tpch\-spotcheck, acceptance arm \(values
+      identical\), sf025 PASS=99 \(PLAN\-SHAPE changed=1: Q64\), tpcds\-fireset PASS, TestPort\_RegressSuite.
+    - Remaining: the walk is now PG's until `sort_pool`, from which tour worth steers it. goopg's Q64 costs
+      differ from PG's \(13866\.65 vs 13874\.27\). **Next slice:** add a `GOOPG_GEQO_TRACE` initial\-pool dump
+      \(tour, worth\) mirroring GEQO\_DEBUG `print_pool`, build a GEQO\_DEBUG PG oracle \(tmp/pgdbg recipe\), and
+      compare worths tour by tour. The first differing worth names the costing gap.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.

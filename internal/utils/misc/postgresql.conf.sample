@@ -258,7 +258,6 @@
 #hash_mem_multiplier = 2.0             # 1-1000
 
 # - Genetic Query Optimizer -
-# (goopg's planner never runs GEQO; these are accepted no-op compatibility stubs)
 
 #geqo = on
 #geqo_threshold = 12                    # 2-2147483647

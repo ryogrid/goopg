@@ -1310,11 +1310,10 @@ func BuildDefaultRegistry() *Registry {
 		}))
 	}
 
-	// GEQO (genetic query optimization) GUCs. goopg's planner is
-	// rule/cost-based and never runs GEQO, so these are pure no-op
-	// stubs — but psql tab-completion, ORMs, and tuning scripts issue
-	// `SET geqo_threshold = ...` etc., and pg_settings tooling expects
-	// the whole family present. Names, defaults, and ranges mirror
+	// GEQO (genetic query optimization) GUCs. The planner consumes them:
+	// internal/optimizer/geqo.go is a port of PG's GEQO, which runs at
+	// geqo_threshold and draws from PG's pg_prng seeded by geqo_seed
+	// (M0146-0214). Names, defaults, and ranges mirror
 	// postgres/src/backend/utils/misc/guc_tables.c (QUERY_TUNING_GEQO,
 	// all PGC_USERSET / GUC_EXPLAIN); numeric bounds come from
 	// src/include/optimizer/geqo.h. M0122-0007.

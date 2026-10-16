@@ -5,10 +5,11 @@ import "testing"
 // TestGeqoAndPlannerTuningGUCStubs asserts the GEQO GUC family and the three
 // remaining QUERY_TUNING_OTHER GUCs (constraint_exclusion,
 // cursor_tuple_fraction, recursive_worktable_factor) are registered with PG's
-// boot values, contexts, and bounds. goopg's planner is rule/cost-based and
-// never runs GEQO, so these are pure compatibility stubs — but tuning scripts,
-// ORMs, and psql tab-completion issue `SET geqo_threshold = ...` etc., which
-// must succeed instead of failing "unrecognized configuration parameter".
+// boot values, contexts, and bounds. The GEQO family is consumed by the
+// planner's GEQO port (internal/optimizer/geqo.go, M0146-0214). Tuning
+// scripts, ORMs, and psql tab-completion also issue `SET geqo_threshold = ...`
+// etc., which must succeed instead of failing "unrecognized configuration
+// parameter".
 // Names/defaults/ranges mirror postgres/src/backend/utils/misc/guc_tables.c
 // (numeric bounds from optimizer/geqo.h, cost.h, planmain.h). M0122-0007.
 func TestGeqoAndPlannerTuningGUCStubs(t *testing.T) {

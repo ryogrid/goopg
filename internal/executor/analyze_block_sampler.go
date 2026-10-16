@@ -1,6 +1,10 @@
 package executor
 
-import "math"
+import (
+	"math"
+
+	"github.com/goopg/goopg/internal/utils/pgprng"
+)
 
 // M0138-0002: a faithful port of PostgreSQL's two-stage ANALYZE sampling
 // mechanism — `BlockSampler`/`ReservoirState` (postgres/src/backend/utils/misc/sampling.c)
@@ -39,65 +43,17 @@ import "math"
 // the identical sampled TID set on a static relation) while the sampling
 // arithmetic downstream of those two seeds is PG's own.
 
-// pgPRNGState mirrors PostgreSQL's `pg_prng_state`
-// (postgres/src/include/common/pg_prng.h): the two 64-bit words of the
-// xoroshiro128** state vector.
-type pgPRNGState struct {
-	s0, s1 uint64
-}
-
-// splitmix64Next mirrors pg_prng.c's static splitmix64(), used only to
-// derive an initial xoroshiro128** state from a 64-bit seed.
-func splitmix64Next(state *uint64) uint64 {
-	*state += 0x9E3779B97f4A7C15
-	val := *state
-	val = (val ^ (val >> 30)) * 0xBF58476D1CE4E5B9
-	val = (val ^ (val >> 27)) * 0x94D049BB133111EB
-	return val ^ (val >> 31)
-}
-
-// pgPRNGSeed mirrors pg_prng_seed()/pg_prng_seed_check(): fills the state
-// vector via two splitmix64 draws, then substitutes Knuth's LCG constants
-// if that chanced to produce all-zeroes (a fixed point of xoroshiro128**).
-func pgPRNGSeed(seed uint64) pgPRNGState {
-	var st pgPRNGState
-	st.s0 = splitmix64Next(&seed)
-	st.s1 = splitmix64Next(&seed)
-	if st.s0 == 0 && st.s1 == 0 {
-		st.s0 = 0x5851F42D4C957F2D
-		st.s1 = 0x14057B7EF767814F
-	}
-	return st
-}
-
-func rotl64(x uint64, bits uint) uint64 {
-	return (x << bits) | (x >> (64 - bits))
-}
-
-// next mirrors pg_prng.c's static xoroshiro128ss(): one 64-bit draw,
-// advancing the state vector.
-func (s *pgPRNGState) next() uint64 {
-	s0 := s.s0
-	sx := s.s1 ^ s0
-	val := rotl64(s0*5, 7) * 9
-	s.s0 = rotl64(s0, 24) ^ sx ^ (sx << 16)
-	s.s1 = rotl64(sx, 37)
-	return val
-}
-
-// double mirrors pg_prng_double(): a uniform draw in [0, 1) using the top
-// 52 bits of the 64-bit word, matching PG's assumed double mantissa width.
-func (s *pgPRNGState) double() float64 {
-	v := s.next()
-	return math.Ldexp(float64(v>>(64-52)), -52)
-}
+// The generator itself is internal/utils/pgprng, the shared port of
+// pg_prng.c. GEQO's join search draws from the same implementation
+// (M0146-0214).
+type pgPRNGState = pgprng.State
 
 // samplerRandomFract mirrors sampling.c's sampler_random_fract(): a
 // uniform draw in (0, 1) — pg_prng_double can return exactly 0.0, which
 // Algorithm Z's log() calls cannot tolerate, so PG rejects and redraws.
 func samplerRandomFract(s *pgPRNGState) float64 {
 	for {
-		v := s.double()
+		v := s.Double()
 		if v != 0.0 {
 			return v
 		}
@@ -117,7 +73,7 @@ type blockSampler struct {
 }
 
 func newBlockSampler(nblocks uint32, samplesize int, seed uint64) *blockSampler {
-	return &blockSampler{N: nblocks, n: samplesize, rand: pgPRNGSeed(seed)}
+	return &blockSampler{N: nblocks, n: samplesize, rand: pgprng.Seed(seed)}
 }
 
 func (bs *blockSampler) hasMore() bool {
@@ -164,7 +120,7 @@ type reservoirState struct {
 }
 
 func newReservoirState(n int, seed uint64) *reservoirState {
-	rs := &reservoirState{rand: pgPRNGSeed(seed)}
+	rs := &reservoirState{rand: pgprng.Seed(seed)}
 	rs.W = math.Exp(-math.Log(samplerRandomFract(&rs.rand)) / float64(n))
 	return rs
 }

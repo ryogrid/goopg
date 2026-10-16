@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/utils/pgprng"
+	"github.com/goopg/goopg/internal/utils/pgqsort"
 )
 
 // geqoOn gates GEQO usage. Default ON, matching PG's `geqo` GUC default.
@@ -113,12 +116,20 @@ func numberGenerations(poolSize, genSetting int) int {
 }
 
 // initTour fills `tour` with a random permutation of 1..numGenes.
-// PG oracle: init_tour (geqo_recombination.c:33) — inside-out Fisher-Yates.
+// PG oracle: init_tour (geqo_recombination.c:33) — inside-out Fisher-Yates,
+// statement for statement. The loop starts at 1: PG makes no draw for
+// tour[0], and the stream must stay in step with PG's (M0146-0214).
 func initTour(tour []Gene, rng *geqoRNG) {
 	n := len(tour)
-	for i := 0; i < n; i++ {
+	if n > 0 {
+		tour[0] = 1
+	}
+	for i := 1; i < n; i++ {
 		j := rng.randint(0, i)
-		tour[i] = tour[j]
+		// i != j avoids reading an uninitialised element, as in PG.
+		if i != j {
+			tour[i] = tour[j]
+		}
 		tour[j] = Gene(i + 1)
 	}
 }
@@ -136,16 +147,18 @@ func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error)
 	// geqo_generations from the pool size — so the override is simply a
 	// non-zero value.
 	ps := s.cp.geqoPoolSize
-	if ps <= 0 {
+	// gimme_pool_size takes the setting only when it is >= 2: a legal pool
+	// has at least two individuals, so 1 is ignored like 0.
+	if ps < 2 {
 		ps = poolSize(nrels, effort)
 	}
 	gens := numberGenerations(ps, s.cp.geqoGenerations)
 
-	// PRNG: geqo_seed controls reproducibility (geqo_main.c). take2 P3-10 —
-	// the planner DOES have the session in scope now, so this reads the GUC
-	// rather than a fixed 0. PG's default of 0 keeps today's behaviour, which
-	// is what makes this change plan-neutral at the defaults.
-	rng := newGeqoRNG(geqoSeedState(s.cp.geqoSeed))
+	// PRNG: geqo_set_seed(root, Geqo_seed) (geqo_main.c) seeds PG's own
+	// generator with pg_prng_fseed. goopg runs the same generator, so with
+	// the same geqo_seed (default 0) every draw below is PG's draw
+	// (M0146-0214).
+	rng := newGeqoRNG(s.cp.geqoSeed)
 
 	pool := allocPool(ps, nrels)
 	defer freePool(pool)
@@ -237,13 +250,22 @@ func randomInitPool(pool *Pool, s *searchCtx, builder joinRelBuilder, rng *geqoR
 }
 
 // sortPool sorts the pool by ascending worth. PG oracle: sort_pool
-// (geqo_pool.c:134).
+// (geqo_pool.c:134), which is qsort with compare(). pg_qsort is not stable,
+// and tours with equal worth are common (different tours can build the same
+// join tree). Selection then draws pool positions, so the order PG leaves
+// the ties in is part of the result. It is reproduced with PG's qsort
+// (M0146-0214).
 func sortPool(pool *Pool) {
-	for i := 1; i < pool.size; i++ {
-		for j := i; j > 0 && pool.data[j].worth < pool.data[j-1].worth; j-- {
-			pool.data[j], pool.data[j-1] = pool.data[j-1], pool.data[j]
+	pgqsort.Sort(pool.data[:pool.size], func(a, b *Chromosome) int {
+		switch {
+		case a.worth == b.worth:
+			return 0
+		case a.worth > b.worth:
+			return 1
+		default:
+			return -1
 		}
-	}
+	})
 }
 
 // spreadChromosome inserts a chromosome into the pool, displacing the worst
@@ -298,17 +320,22 @@ func geqoSelection(pool *Pool, bias float64, momma, daddy *Chromosome, rng *geqo
 
 // linearRand returns a pool index with linear bias. PG oracle: linear_rand
 // (geqo_selection.c:87). f(x) = bias - 2(bias-1)x, inverted via quadratic.
-func linearRand(max int, bias float64, rng *geqoRNG) int {
+//
+// The arithmetic is PG's, operation for operation:
+// max * (bias - sqrtval) / 2.0 / (bias - 1.0). A different association
+// rounds differently and can truncate to a different index (M0146-0214).
+func linearRand(poolSize int, bias float64, rng *geqoRNG) int {
+	max := float64(poolSize)
 	for {
-		sqrtVal := bias*bias - 4*(bias-1)*rng.rand()
-		if sqrtVal < 0 {
+		sqrtval := (bias * bias) - 4.0*(bias-1.0)*rng.rand()
+		if sqrtval > 0.0 {
+			sqrtval = math.Sqrt(sqrtval)
+		}
+		index := max * (bias - sqrtval) / 2.0 / (bias - 1.0)
+		if index < 0.0 || index >= max {
 			continue
 		}
-		index := int((bias - math.Sqrt(sqrtVal)) / (2 * (bias - 1)) * float64(max))
-		if index < 0 || index >= max {
-			continue
-		}
-		return index
+		return int(index)
 	}
 }
 
@@ -525,8 +552,9 @@ func gimmeEdgeTable(momma, daddy []Gene, numGene int, et *edgeTable) {
 
 func gimmeEdge(et *edgeTable, city1, city2 int) {
 	for i, edge := range et.edges[city1] {
-		if edge == city2 {
-			// Present as positive — mark as shared (negate).
+		// PG compares abs(edge): an edge already marked shared stays one
+		// entry, however often the parents repeat it (gimme_edge).
+		if edge == city2 || edge == -city2 {
 			et.edges[city1][i] = -city2
 			return
 		}
@@ -685,48 +713,26 @@ func edgeFailure(et *edgeTable, gene []Gene, index, numGene int, rng *geqoRNG) i
 
 // --- PRNG ---
 
-// geqoRNG is a seeded PRNG for GEQO.
+// geqoRNG is GEQO's private generator, GeqoPrivateData.random_state:
+// PostgreSQL's pg_prng (M0146-0214).
 type geqoRNG struct {
-	state uint64
+	state pgprng.State
 }
 
-// geqoSeedState maps geqo_seed, a double in [0,1], onto the integer state
-// goopg's PRNG takes. PG seeds its own generator from the double directly
-// (geqo_set_seed -> pg_prng_fseed); the mapping matters only in that a given
-// seed must reproduce a given plan, not that it match PG's bit-for-bit.
-//
-// 0 — PG's default — returns 0 so newGeqoRNG keeps its existing fixed state,
-// which is what makes take2 P3-10 plan-neutral at the defaults.
-func geqoSeedState(seed float64) int64 {
-	if seed <= 0 {
-		return 0
-	}
-	if seed >= 1 {
-		seed = 1
-	}
-	return int64(seed * float64(math.MaxInt64/2))
+// newGeqoRNG mirrors geqo_set_seed: pg_prng_fseed(&random_state, seed).
+func newGeqoRNG(seed float64) *geqoRNG {
+	return &geqoRNG{state: pgprng.FSeed(seed)}
 }
 
-func newGeqoRNG(seed int64) *geqoRNG {
-	rng := &geqoRNG{}
-	if seed != 0 {
-		rng.state = uint64(seed)
-	} else {
-		rng.state = 1 // default seed
-	}
-	return rng
-}
-
-// rand returns a float64 in [0, 1).
+// rand mirrors geqo_rand: pg_prng_double, a float64 in [0, 1).
 func (r *geqoRNG) rand() float64 {
-	r.state = r.state*6364136223846793005 + 1442695040888963407
-	return float64(r.state>>33) / float64(1<<31)
+	return r.state.Double()
 }
 
-// randint returns an int in [lower, upper] inclusive.
+// randint returns an int in [lower, upper] inclusive. It mirrors
+// geqo_randint(root, upper, lower), whose arguments PG passes upper first:
+// pg_prng_uint64_range(lower, upper). A one-value range consumes no draw.
+// PG's callers never pass a negative bound.
 func (r *geqoRNG) randint(lower, upper int) int {
-	if lower >= upper {
-		return lower
-	}
-	return lower + int(r.rand()*float64(upper-lower+1))
+	return int(r.state.Uint64Range(uint64(lower), uint64(upper)))
 }
