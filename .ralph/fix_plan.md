@@ -4329,7 +4329,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
     `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
     `tmp/g14\-tpcds025\-stats\.sql`\.
-- [ ] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
+- [x] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
   Gather Merge\), goopg sorts only** \(filed 2026\-10\-16 by the S9 pass at 4334a3714\)\.
   Kind: impl
   Parent: M0146-0014
@@ -4346,3 +4346,28 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     partial path is generated and loses on cost\. Instrument addPath first \(memory
     planner\_verify\_both\_candidates\_generated\)\.
   - Expected instrument: TPC\-DS PLAN\-PARITY match at SF0\.25 \(Q38, Q87\), then SF1\.
+  - **LANDED 2026\-10\-16 \(loop \#60\).** Design `docs/design/0100\-0149/m0146\-0217\-partial\-distinct\-final\-rows\.md`;
+    evidence `analysis/m0146/m0146\-0217/`\.
+    - Both arms were generated, and goopg's split arm cost PG's to the cent \(8918\.69\.\.9031\.81\)\. A scratch\-PG probe
+      showed PG's split arm reports 890 rows against the unsplit 891: create\_final\_distinct\_paths runs over the
+      partial distinct rel, so it estimates over the Gather Merge's crossing rows\. add\_path keeps the fewer rows
+      among fuzzily equal costs\. Ported as splitFinalRows on both split arms\.
+    - Movement: Q38 MATCHES PG on an SF0\.25 clone with PG statistics imported\. Shipped SF0\.25 is unchanged \(86/99,
+      categories identical; goopg's per\-worker estimate is 387 against PG's 371\)\. Shipped SF1 goes 74→73: Q87
+      MATCH→SHAPE\-DIFF, which matches PG again with PG SF1 statistics imported\. Filed as M0146\-0218 \(R3\)\.
+    - Pin: TestPartialDistinctSplitArmReestimatesOverCrossingRows, mutation\-checked\.
+    - Gates: units, tpch\-spotcheck, acceptance arm \(24 MATCH on values\), sf025 PASS=99 same=99, tpcds\-fireset
+      \(Q38/Q87 SF1 results byte\-identical\), TestPort\_RegressSuite\.
+- [!] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
+  \(filed 2026\-10\-16 by M0146\-0217 under R3\)\.
+  Kind: regression
+  Parent: M0146-0014
+  - Record: SF1 Q87, categories join\-order/join\-method/sort\-strategy\. On goopg's own ANALYZE statistics, a
+    DISTINCT leg's Gather Merge crossing rows fall below the leg's DISTINCT estimate where PG's do not, so goopg now
+    keeps the split arm \(`Unique → Gather Merge → Unique → Sort`\) and PG keeps the unsplit one\.
+  - Evidence that this is an input gap, not logic: a private SF1 clone with `pg_dump \-\-statistics` from the
+    reference imported plans Q87 exactly as PG does \(`analysis/m0146/m0146\-0217/probe/g18\-q87\-imp\.txt`\)\.
+  - `[!]` blocked on the owner: clears when the reference statistics are imported into the SF1 corpus \(owner decision, M0146\-0215\)\. An
+    engine\-side fix would have to make goopg's ANALYZE sample PG's rows, which M0146\-0215 slice 1 showed is not
+    reproducible\.
+  - Expected instrument: SF1 PLAN\-PARITY match 73→74 \(Q87\) after the import\.

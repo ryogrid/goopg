@@ -605,3 +605,50 @@ func TestUniquePathCostIsCreateUpperUniquePath(t *testing.T) {
 		t.Fatalf("Unique cost %+v, want PG's 19352.41..19762.54", got)
 	}
 }
+
+// TestPartialDistinctSplitArmReestimatesOverCrossingRows pins M0146-0217.
+// create_partial_distinct_paths builds the split arms' final Unique with
+// create_final_distinct_paths over the PARTIAL distinct rel, so its rows are
+// estimate_num_groups over the Gather Merge's crossing rows, not the
+// DISTINCT's own estimate. With unique columns, 400001 rows plan one worker:
+// clamp_row_est(400001 / 1.7) × 1.7 rounds to 400000 crossing rows, one fewer
+// than the DISTINCT rel. PG's split arm then reports the fewer rows and
+// add_path keeps it among fuzzily equal costs (TPC-DS Q38/Q87's web_sales
+// leg, 890 against 891).
+func TestPartialDistinctSplitArmReestimatesOverCrossingRows(t *testing.T) {
+	prev := parallelOn.Load()
+	parallelOn.Store(true)
+	defer parallelOn.Store(prev)
+
+	const rows = 400_001
+	d := sizedDistinctFixture(t, rows, rows)
+	dr, _ := addPartialDistinctFor(t, d, upperSplitSettings())
+	if dr.Rows != rows {
+		t.Fatalf("DISTINCT rel rows %v, want %d", dr.Rows, rows)
+	}
+	split := 0
+	for _, p := range dr.Pathlist {
+		if p == nil || p.Kind != PathDistinct || len(p.Children) != 1 || p.Children[0].Kind != PathGatherMerge {
+			continue
+		}
+		gm := p.Children[0]
+		below := gm.Children[0]
+		if below.Kind == PathSort && len(below.Children) == 1 {
+			below = below.Children[0]
+		}
+		if below.Rel == dr || !below.ParallelSafe || (below.Kind != PathDistinct && below.Kind != PathAgg) {
+			continue // the unsplit arm: Gather Merge of the sorted input
+		}
+		split++
+		if gm.Rows >= rows {
+			t.Fatalf("crossing rows %v, want fewer than %d for the fixture to bite", gm.Rows, rows)
+		}
+		if p.Rows != gm.Rows {
+			t.Errorf("split arm's final Unique has %v rows, want estimate_num_groups over the %v crossing rows",
+				p.Rows, gm.Rows)
+		}
+	}
+	if split == 0 {
+		t.Fatal("add_path kept no split arm; the lower row count must keep it among fuzzily equal costs")
+	}
+}

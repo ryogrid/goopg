@@ -511,6 +511,22 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// caller passes it (the partial-aggregate twin, M0146-0009n). Unclamped,
 	// TPC-DS Q54's 1 × 1.7 priced the merge 0.04 under PG's (M0146-0210).
 	crossed := clampRowEst(partialGroups * d)
+	// The split arms' final Unique is built by create_final_distinct_paths
+	// over the PARTIAL distinct rel (planner.c, create_partial_distinct_paths),
+	// whose cheapest input is this Gather Merge. Its numDistinctRows is
+	// therefore estimate_num_groups over the CROSSING rows, and
+	// estimate_num_groups never returns more groups than input rows. When
+	// the merge carries fewer rows than the DISTINCT's own estimate, the split
+	// arms report fewer rows than the unsplit one: TPC-DS Q38/Q87's web_sales
+	// leg, 890 against 891. add_path then keeps the split arm among fuzzily
+	// equal costs, because its row count is lower (M0146-0217).
+	splitFinalRows := float64(estimateNumGroups(exprs, child, int64(crossed)))
+	if splitFinalRows > crossed {
+		splitFinalRows = crossed
+	}
+	if splitFinalRows < 1 {
+		splitFinalRows = 1
+	}
 	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
 	gmPath := &Path{
 		Kind: PathGatherMerge, Rel: distinctRel, Rows: crossed, Cost: gmCost,
@@ -525,7 +541,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// re-dedups cross-worker duplicates the merge brings adjacent.
 	finalPath := &Path{
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
-		Rel: distinctRel, Rows: finalRows,
+		Rel: distinctRel, Rows: splitFinalRows,
 		DisabledNodes: gmPath.DisabledNodes,
 		Cost:          uniquePathCost(gmCost.Startup, gmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      gmPath.Pathkeys,
@@ -572,7 +588,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	}
 	addPath(distinctRel, &Path{
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
-		Rel: distinctRel, Rows: finalRows,
+		Rel: distinctRel, Rows: splitFinalRows,
 		DisabledNodes: hgmPath.DisabledNodes,
 		Cost:          uniquePathCost(hgmCost.Startup, hgmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      hgmPath.Pathkeys,
