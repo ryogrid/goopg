@@ -1,37 +1,33 @@
-Task: M0122-0012 slice 6 — operand leaf copy MEASURED, NOT landed (d8b561537, docs only). Movement: none (measured
-  non-improvement).
-  - Also this loop: S9 re-check at 378ad9ecf was exhausted (45e82cda8, routing-20261016p; records byte-identical).
-Files: docs/design/0100-0149/0122-0012-vector-filter-pipeline-recon.md ("Slice 6"); .ralph/fix_plan.md.
-  No engine code changed. The experiment was discarded before commit.
-Key symbols: evalFastExpr (ExprBinaryOp arm), seqScanOp.evalQual / evalPrefilter, filterOp batch path (operators.go).
+Task: M0122-0012 slice 7 — batch qual evaluator LANDED (7d1e1c76c, pushed), no production caller yet. Movement: none.
+Files: internal/executor/{exprnode.go (evalFastBinaryApply + inline fastBinarySimple/fastIntOverflow),
+  exprnode_batch.go (evalFastExprBatch, exprBatchScratch), exprnode_batch_test.go};
+  docs/design/0100-0149/0122-0012b-scan-batch-qual.md (+README row); .ralph/fix_plan.md. The pending patch was removed.
+Key symbols: evalFastExprBatch, exprBatchScratch, evalFastBinaryApply, fastBinarySimple, seqScanOp.Next prefilter block
+  (operators_storage.go ~2100-2180), evalQual/evalPrefilter (scan_prefilter.go).
 Hypothesis/Findings:
-  - The wrapper variant (all operands via a helper) was −2.5% on store_sales but slower on TPC-H Q6 (AND chain).
-  - The leaf-only variant was inside the noise (store_sales 1136/1096/1134 vs 1111/1106/1047 ms; TPC-H flat).
-  - The remaining evalFastExpr cost is tree-walk control flow (dispatch, recursion), not Datum copies.
-  - TPC-H single-shot timings are ±15% noisy (same binary: Q1 4.38 vs 3.65 s); judge on repeated A/B only.
+  - Microbenchmark (store_sales qual, 64 rows): per-row 11.6 µs, batch 8.4 µs. End-to-end ceiling ~12% of the scan.
+  - Last loop's "fireset blocked" was a misread: internal/executor/ is outside the fire-set scope. The real rejection
+    was a code_tree mismatch after peer commit a181f6bfd landed mid-gate. Memory saved.
 Next step: re-read the banner.
-  - The S9 note at 378ad9ecf STILL HOLDS: no planner/executor commit since (d8b561537 is docs only), so item 10 is
-    live without a re-census.
-  - M0122-0012 slice 7: batch qual evaluation inside seqScanOp (the SeqScanOp entry in unimplemented_feat.json).
-    Write the design first: which node kinds batch, how the prefilter's partial deform interacts, and the
-    currentTID read-ahead rule (recon doc section "Correction 2026-09-23"). Then implement behind the same
-    admission rule as filterOp's batch path.
-Top-residual: corpus-VACUUM residual (M0146-0019, owner) — 6 records (TPC-H Q13/Q16, SF0.25 Q23/Q84, SF1 Q68/Q18).
-  OWNER ACTION DONE 2026-10-16: all three goopg corpora re-vacuumed on a181f6bfd (the M0146-0206 fix) —
-  tpch :65433 8/8 tables, tpcds :65436 SF1 25/25, :65437 SF0.25 25/25; relallvisible <= relpages everywhere
-  (was 0 on TPC-DS). The residual's premise is now stale — the next plan capture runs on the vacuumed corpus.
-Skip-rationale: items 0-9 bypassed by the S9 exhausted note at 378ad9ecf. Open items-0-9 tasks:
+  1. S9 pass: the census (routing-20261016p) is STALE twice over (owner corpus VACUUM on a181f6bfd, and 7d1e1c76c
+     touched internal/executor). Run fresh `jointree-parity-capture.sh` for tpch, tpcds-sf025 and tpcds-sf1. If the
+     SF1 capture refuses (bench/tpcds/runtime_goopg/data live — owner pid 1702919 on :65436, still up at 10:25), S9(1)
+     makes item 10 live for that loop. Probe: `scripts/jointree-parity-capture.sh tpcds-sf1 x tmp/x` → rc=3 FATAL.
+  2. If item 10 is live: slice 8 wires evalFastExprBatch into seqScanOp per design §4. Phases: page-mode prefix
+     deform, batch eval, survivors finished. Admission: exclude serializable, GiST/GIN SSI, sampler, enum/ACL
+     scans. Invariants: currentTID = emitted row, borrowRows, cancellation, early-error re-judge. Gates: + isolation
+     family. Measure the SF1 store_sales filtered scan (tmp/m0122-time.sql, clone on 5591), A/B against HEAD.
+Top-residual: unknown until the post-VACUUM census (SF0.25 was 86/99 in a post-VACUUM fire-set capture).
+Skip-rationale: items 0-9 bypassed because the S9 census could not run (SF1 capture refused: source live), so
+  item 10 was live this loop per S9(1). Open items-0-9 tasks:
   M0146-0014(channel), M0146-0042(channel), M0146-0007/0012b/0067/0175(below-item-10),
   M0146-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0196(below-item-10),
-  M0146-0205(below-item-10 S2, owner-confirmed), M0141-S2b-3b/S2b-4e/S7-exec-d(below-item-10),
-  M0141-S2b-4(blocked-on M0141-S2b-4e),
-  M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003/0010).
-  Closed by owner 2026-10-16: M0146-0206 (a181f6bfd), M0146-0178 (RELPAGES residual), M0141-S3..S6
-  (superseded by M0146-0003), four M0122-era S2 defects + M0146-0205 placed below item 10, M0146-0211
-  keep-confirmed (R3).
-Gates run: experiment gates (units, tpch-spotcheck, acceptance arm, sf025 99/99 same=99, fireset fires=none,
-  ea-ratchet, TestPort_RegressSuite) all PASSED on the wrapper variant, which was discarded anyway. The committed
-  tree is docs-only; pgbench smoke (hook) PASS.
+  M0146-0205(below-item-10), M0141-S2b-3b/S2b-4e/S7-exec-d(below-item-10),
+  M0141-S2b-4(blocked-on M0141-S2b-4e), M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003/0010).
+Gates run: units PASS; tpch-spotcheck PASS; acceptance arm PASS (values identical); tpcds-sf025 PASS=99 same=99;
+  ea-ratchet PASS; TestPort_RegressSuite PASS (same code tree, cached); pgbench smoke PASS. Fire-set not required.
 In-flight: none.
-Owner items: none — all cleared 2026-10-16 (corpus VACUUM done, placements recorded, stale rows closed, tmp/
-  pruned 97%→74%).
+Owner items: RESOLVED 2026-10-16 — the :65436 SF1 server (pid 1702919) and the :65437 SF0.25 server (both
+  /tmp/goopg-bin-vac0206, started by the owner for the corpus VACUUM) were stopped after CHECKPOINT; both
+  postmaster.pid files are gone, so the offline cp -a clone sources are free again (SF1 + SF0.25 captures and
+  the fire-set SF1 lane unblocked). Corpus vacuum results persist in the datadirs.
