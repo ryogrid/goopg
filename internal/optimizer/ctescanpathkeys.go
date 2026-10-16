@@ -46,6 +46,14 @@ func (s *searchCtx) addCTEScanPathkeys() {
 				continue
 			}
 			keys = s.cteScanPathkeys(rel, i, scan)
+		} else if i < len(s.relInfos) && s.relInfos[i].subproblemAlts != nil {
+			// M0146-0222: a searched sub-problem's WINNING tree delivers its
+			// ordering too. PG's sub-joinlist joinrel keeps every path's
+			// pathkeys, the cheapest one included. goopg filed only the
+			// runner-ups' (addSubproblemAltPaths), so a sub-problem won by its
+			// Gather Merge -> Sort lost the ordering at the boundary, and the
+			// grouping step sorted again (TPC-DS Q72).
+			keys = subproblemLeafPathkeys(rel.baseOffset, rel.baseLeaf)
 		} else if isSubplanLeaf(rel.baseLeaf) {
 			keys = s.subqueryLeafPathkeys(rel, i)
 		}

@@ -328,13 +328,15 @@ func (jl joinlist) leafRange() (lo, hi int, ok bool) {
 // every item to a rel — recursing on sub-joinlists — and then, unless there is
 // only one, search the orders in which they can be joined.
 //
-// `tupleFraction` is the query's fraction at the top level and 0 in every
-// recursive call, and the asymmetry is forced by the collapse this boundary
-// performs (file header): upstream can afford `consider_startup` on a
-// sub-problem's rel because the enclosing search still gets to choose among its
-// paths, while goopg must commit to one here. Committing to a startup-optimised
-// path for a sub-problem whose rows the enclosing join then consumes in full is
-// the expensive direction of that bet, so sub-problems are priced for all rows.
+// `tupleFraction` is the query's `root->tuple_fraction`, the same at every
+// level: PG sets `rel->consider_startup = (root->tuple_fraction > 0)` on every
+// rel it builds (relnode.c), sub-joinlists' included. goopg once passed 0 into
+// recursive calls, because the boundary committed the enclosing search to one
+// sub-problem path. Since M0146-0148 the enclosing search sees the
+// sub-problem's whole pathlist (baseRelInfo.subproblemAlts), so that premise is
+// gone. Pricing sub-problems without startup made add_path keep a
+// cheaper-total, later-starting path that PG rejects as COSTS_DIFFERENT
+// (TPC-DS Q72's warehouse probe, M0146-0222).
 func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float64) (joinlistRel, error) {
 	if len(jl) == 0 {
 		return joinlistRel{}, fmt.Errorf("join search: empty joinlist")
@@ -388,7 +390,7 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 					"join search: joinlist item %d is a pinned %s join with no SpecialJoinInfo in root->join_info_list; searched, it would be planned as an inner join",
 					i, joinTypeName(it.jointype))
 			}
-			r, err = makeRelFromJoinlist(it.sub, prob, 0)
+			r, err = makeRelFromJoinlist(it.sub, prob, tupleFraction)
 		}
 		if err != nil {
 			return joinlistRel{}, err

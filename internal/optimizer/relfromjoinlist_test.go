@@ -440,3 +440,28 @@ func TestDeconstructedJointreeFeedsTheRecursion(t *testing.T) {
 	}
 	rfjAssertBindingOrder(t, n, names)
 }
+
+// TestSubproblemSearchConsidersStartup pins M0146-0222 slice 3. PG sets
+// rel->consider_startup = (root->tuple_fraction > 0) on every rel it builds,
+// sub-joinlists' included. goopg once searched sub-problems with tuple
+// fraction 0. That premise ended when the enclosing search began reading the
+// sub-problem's whole pathlist (M0146-0148). Without startup interest, add_path
+// keeps a cheaper-total, later-starting path that PG rejects as COSTS_DIFFERENT
+// (TPC-DS Q72's warehouse join).
+func TestSubproblemSearchConsidersStartup(t *testing.T) {
+	names := []string{"a", "b", "c"}
+	prob := rfjProblem(names, []int64{1_000_000, 10, 20},
+		[]Expr{rfjEq(names, 0, 1), rfjEq(names, 0, 2)})
+	prob.tupleFraction = 0.1
+	jl := joinlist{subItem(joinlist{leafItem(1), leafItem(2)})}
+	r, err := makeRelFromJoinlist(jl, prob, prob.tupleFraction)
+	if err != nil {
+		t.Fatalf("makeRelFromJoinlist: %v", err)
+	}
+	if r.rel == nil {
+		t.Fatal("the sub-problem returned no rel")
+	}
+	if !r.rel.ConsiderStartup {
+		t.Fatal("a sub-problem searched under a LIMIT must consider startup, as PG's sub-joinlist rels do")
+	}
+}

@@ -1,7 +1,6 @@
 # M0146-0222 — TPC-DS Q72: Memoize on a unique join, and loop counts for probes driven by a prebuilt leaf
 
-Status: slice 1 (get_memoize_path's inner_unique test) and slice 2 (loop counts under a sub-problem leaf) landed
-2026-10-17. The record stays open (§5). Evidence: `analysis/m0146/m0146-0222/`.
+Status: slices 1-3 landed 2026-10-17; TPC-DS SF0.25 Q72 matches PG (§7). Evidence: `analysis/m0146/m0146-0222/`.
 
 ## 1. Record
 
@@ -133,3 +132,39 @@ puts PG's base parallel subtree at about 1159.32 and goopg's at 1159.45. The 0.1
 paths around the d2 join; PG's startup increment there (+0.16) is not a plain index probe's 0.29.
 
 **Next:** log the 6-rel partial paths (`add_partial_path`) on both sides and find the node whose startup differs.
+
+## 7. Slice 3 (landed): sub-problems consider startup, and their winner keeps its ordering
+
+The 6-rel probe (`probe4/`) found the 0.13. PG joins `warehouse` (5 rows) to the 6-rel parallel subtree with a
+Nested Loop over a Seq Scan or Material inner, startup 0.00. goopg filed that path first too (1159.4525..15460.32).
+But it then **also accepted** the index-probe join (1159.585..15459.36): better on total, worse on startup. PG keeps
+the incumbent there (COSTS_DIFFERENT under `consider_startup`).
+
+The cause was a goopg rule: `makeRelFromJoinlist` searched every sub-problem with tuple fraction 0, so its rels never
+considered startup. The justification was that the boundary committed the enclosing search to a single sub-problem
+path. That premise ended with M0146-0148, which hands the enclosing search the sub-problem's whole pathlist.
+`relnode.c` sets `rel->consider_startup = (root->tuple_fraction > 0)` on every rel, sub-joinlists' included, so the
+fraction now passes through unchanged.
+
+With startup considered, the sub-problem is won by its Gather Merge → Sort on the group keys. That exposed a second
+gap: only the sub-problem's *runner-up* trees had their ordering translated (`addSubproblemAltPaths`). The winning
+leaf entered with no pathkeys, so the grouping step sorted again. PG's sub-joinlist joinrel keeps every path's
+pathkeys. `addCTEScanPathkeys` now gives a sub-problem leaf's own prebuilt path its tree's ordering through
+`subproblemLeafPathkeys`.
+
+**Measured:**
+
+| corpus | before | after | movement |
+|---|---|---|---|
+| TPC-H | 22 / 22 | 22 / 22 | none |
+| TPC-DS SF0.25 | 88 / 99 | **89 / 99** | Q72 MATCH: `GroupAggregate → Nested Loop Left → Nested Loop → Gather Merge` |
+| TPC-DS SF1 | 76 / 99 | 76 / 99 | Q72's first divergence moves from depth 3 (sort-strategy) to depth 7 (qual-placement) |
+
+At SF1, CATEGORIES-EXCL-MATCH moves: sort-strategy 8 → 7, join-order 19 → 18, join-method 6 → 5, parallelism 7 → 6,
+parameterisation 4 → 3. The fired Q72 results are byte-identical at both scales, and the acceptance arm is
+value-identical.
+
+**Pins** (both mutation-checked):
+- `TestSubproblemSearchConsidersStartup`: a sub-problem searched under a LIMIT has `consider_startup`.
+- `TestSubproblemWinnerLeafCarriesItsOrdering`: the winner's Sort key arrives at enclosing coordinate offset+1;
+  a plain base leaf gains nothing.

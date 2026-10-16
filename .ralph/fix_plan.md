@@ -4506,7 +4506,7 @@ Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shippe
     - The first regress run after the fire set failed union / varchar / vacuum\_parallel\. The rerun on the same code
       passed all three, and vacuum\_parallel passes standalone: nondeterministic\.
 Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 slice 1, Q52 slice 2\)
-- [ ] **M0146\-0222 — sort\-strategy: TPC\-DS Q72 — PG sorts below the joins \(Gather Merge → Sort\) and keeps the order
+- [x] **M0146\-0222 — sort\-strategy: TPC\-DS Q72 — PG sorts below the joins \(Gather Merge → Sort\) and keeps the order
   through its Nested Loops; goopg sorts once above them** \(filed 2026\-10\-17 by the S9 pass at e3a7ae742\)\.
   Kind: impl
   Parent: M0146-0014
@@ -4546,7 +4546,18 @@ Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 
       cheaper\-total unsorted path\.
     - Root: PG's base parallel subtree starts at 1159\.32, goopg's at 1159\.45\. The difference originates in the 6\-rel
       partial paths around the d2 join; next, log add\_partial\_path on both sides\.
-  - **Next \(slice 3\): the arms' relative cost\.**
+  - **Slice 3 LANDED 2026\-10\-17 \(loop \#71\): sub\-problems consider startup; the winner keeps its ordering\.**
+    - The 0\.13 was PG's Material/Seq\-Scan warehouse join \(startup 0\), which goopg filed but then let a
+      cheaper\-total index join evict\. goopg searched sub\-problems with tuple fraction 0, so consider\_startup was off\.
+      makeRelFromJoinlist now passes the fraction through, as relnode\.c sets consider\_startup on every rel\.
+    - The sub\-problem is then won by its Gather Merge → Sort, whose ordering the boundary dropped \(only runner\-ups'
+      orderings were translated\)\. addCTEScanPathkeys now gives the winning leaf its ordering too\.
+    - Census: SF0\.25 88→89 \(Q72 MATCH\); SF1 76 \(Q72 now diverges at depth 7, qual\-placement\); TPC\-H 22/22\.
+    - Pins: TestSubproblemSearchConsidersStartup, TestSubproblemWinnerLeafCarriesItsOrdering; both mutation\-checked\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(Q72 plan text changed\), fireset PASS \(Q72 results
+      byte\-identical at both scales\), TestPort\_RegressSuite\.
+Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
+  - Residual, for the next S9 pass: SF1 Q72 qual\-placement at depth 7\.
     - With PG statistics, goopg's sorted arm is 15474\.87 against unsorted 15474\.80, a 0\.07 margin; PG has sorted
       15490\.79 against unsorted 15491\.68, a 0\.89 margin the other way\.
     - Compare the sub\-problem's gather\.merge\.sort \(15459\.75\) and gather \(15459\.68\) arms term by term against PG's
