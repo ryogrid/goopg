@@ -1296,6 +1296,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       construction; the existing applyAgg tests and the window callers were updated.
     - Q1 median went from ~1290 ms to ~1225 ms \(about −5%\); across slices 10\-16, ~1.91 s → ~1.22 s, level with
       PG's ~1.23 s.
+  - **Slice 17 — Projects fold their targets; lowered sublinks fold their Args LANDED 2026\-10\-16 \(loop \#54\).**
+    Movement: none — perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99
+    PLAN\-SHAPE same=99, TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS. Recon doc "Slice 17"; EX1\-02 design
+    amended.
+    - After Q1 reached parity, the per\-query census against PG :65432 put TPC\-H Q17 furthest behind: 6.19 s vs
+      1.53 s, with an identical plan. Its lineitem probe scan deformed and cloned all 16 columns per row, because
+      the deform\-bound walk reset to full at a reordered Project \(HammerDB's column order\) and at the join filter's
+      correlated SubPlan.
+    - Every non\-identity Project now folds its targets alone, which is PG's ExecBuildProjectionInfo `last_scan`
+      rule. A param\-lowered SubqueryExpr folds its Args in both walkers. Pinned by
+      `TestScanDeformProjectThrough` and `TestScanDeformLoweredSublinkArgs`, both mutation\-checked.
+    - Q17 warm median went from ~6400 ms to ~4400 ms \(−31%\); PG is ~1.53 s. Remaining Q17 cost: projectOp.Next
+      and cloneRowOwnedPrefix \(~8% each\) on the probe side, plus page reads.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

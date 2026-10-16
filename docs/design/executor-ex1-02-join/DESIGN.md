@@ -52,6 +52,24 @@ keys, residual refs, AND above-join refs alike:
   (expression, funcall, const widening past child width) resets to
   full. (No Project resjunk in goopg — resjunk-ctid lives on
   LockRows/rowmark.)
+- **Amended 2026\-10\-16 \(M0122\-0012 slice 17\).** As shipped, the
+  rule covered only order-preserving bare targets, and it stayed full
+  whenever the bound from above was full. Every other non-identity
+  `Project` now folds its targets alone,
+  `deformFoldRefs(deformBoundNone, Targets...)`, whatever the parent
+  reads. `projectOp` and the op-tree `OpProject` evaluate only the
+  targets against the child slot \(plus the slot's ctid fields, which
+  are not deformed columns\), so the targets are the child's only
+  consumers. This is PG's rule: `ExecBuildProjectionInfo` →
+  `ExecCreateExprSetupSteps` \(`execExpr.c`\) takes `last_scan` as the
+  highest attnum in the target list and emits one `EEOP_SCAN_FETCHSOME`.
+  A target the whitelist does not understand still declines to full.
+  The same slice taught both walkers \(`deformScanRefs`,
+  `deformSplitPredicate`\) that a param-lowered `SubqueryExpr` reads the
+  outer row only through its `Args`. An unlowered one still declines,
+  because it pushes the whole row and keys its cache by every column.
+  Pins: `TestScanDeformProjectThrough`,
+  `TestScanDeformLoweredSublinkArgs`.
 - Aggregate/Distinct/terminators/whitelist/poison: unchanged from
   EX1-01. `deformBoundNone/Full` stickiness, Gather closure capture,
   tail-poison flag: unchanged, extended by the same tests.
