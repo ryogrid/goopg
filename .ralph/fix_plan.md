@@ -3507,7 +3507,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > TPC\-H held\. Owner: confirm keeping it, or direct otherwise\.
   > Update 2026\-10\-16 \(M0146\-0212 close\): PG plans the same Sort over Gather on the unvacuumed tables, and goopg
   > plans Gather Merge after VACUUM\. The loss is the M0146\-0019 corpus residual, not a defect of 0211\.
-- [ ] **M0146\-0213 — TPC\-H Q16: goopg plans a Parallel Seq Scan on partsupp where PG plans a Parallel Index Only
+- [!] **M0146\-0213 — TPC\-H Q16: goopg plans a Parallel Seq Scan on partsupp where PG plans a Parallel Index Only
   Scan on partsupp\_pk** \(filed 2026\-10\-16 by the S9 post\-VACUUM census, `routing\-20261016q`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3530,6 +3530,26 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     Only Scan. `indexOnlyResidualAdmissible` admits an uncorrelated hashed SubPlan filter. So the likelier
     divergence is cost or worker count \(3 vs PG 4\), not a missing path. Confirm with an `addPath` trace for
     partsupp before changing anything \(memory planner\_verify\_both\_candidates\_generated\).
+  - **2026\-10\-16 diagnosed; engine fix landed; record blocked on an owner index rebuild \(`[!]`\).** Design:
+    `docs/design/0100-0149/m0146-0213-btree-split-after-new-item.md`.
+    - The `addPath` trace shows PG's Parallel Index Only Scan is generated \(`indexonly.partial`, rows 100000, 4
+      workers\) and loses at 27180.4 against the seq scan's 21257.8. The gap is exactly the index size: goopg's
+      `partsupp\_pk` is 5170 pages against PG's 3082, and 2088 × random\_page\_cost 4 = 8352.
+    - Leaf decode: equal 24\-byte tuples, but goopg's leaves are uniformly ~54% full. The 2026\-10\-15 INSERT replay
+      inserted interleaved ascending runs \(17,326 descents\) into an existing index, and the non\-rightmost
+      "split after new item" arm \(`\_bt\_afternewitemoff`, nbtsplitloc.c\) was unported.
+    - Ported as `afterNewItemOff` \(btree.go\). With the replay's exact inserts, goopg now builds 3973 pages against
+      PG 18.3's 4080 \(scratch cluster\); before, 5170. Pinned by `TestAfterNewItemOffDecisions` and
+      `TestLocalizedAscendingInsertsPackLeaves`, which fails without the port \(106 vs 68 blocks\).
+    - On a private clone, a bulk\-built copy \(3078 pages, as PG's 3082\) gives PG's Q16 plan: Parallel Index Only
+      Scan, 4 workers, run cost 18812 against PG's 18828.
+    - Gates: nbtree `\-race`, units, tpch\-spotcheck, sf025 PASS=99 PLAN\-SHAPE same=99, full TestPort\_RegressSuite.
+  - **ESCALATION \(owner\):** rebuild `:65433`'s `partsupp\_pk` the way PG's was built. Options: `REINDEX TABLE
+    partsupp` \(needs M0146\-0196, REINDEX in a CREATE DATABASE'd db\), or a reload that creates indexes after the
+    data. `lineitem\_pk` \(1.8×, the M0146\-0195 close row\) has the same cause. Expected: TPC\-H match 21 → 22. The task
+    stays `[!]` until then, so the census does not re\-file Q16.
+  Movement: none — instrument artefact: the corpus index was insert\-built by the replay, and the plan follows PG's
+  once it is rebuilt \(clone\-verified\).
   - Expected instrument: TPC\-H PLAN\-PARITY match 21 → 22.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.

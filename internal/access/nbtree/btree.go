@@ -2998,8 +2998,34 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		const itemIDSize = 4 // matches storage.itemIDSize
 		rightBudget -= itemIDSize + MaxAlign(len(inheritedHK))
 	}
-	mid, splitOK := bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget,
-		splitFillFactorMult(op.IsLeaf(), oldNext == storage.InvalidBlockNumber))
+	// _bt_findsplitloc's strategy (nbtsplitloc.c): fillfactor on a rightmost
+	// page, "split after new item" for a localized ascending grouping on any
+	// other leaf (M0146-0213), else 50:50.
+	rightmost := oldNext == storage.InvalidBlockNumber
+	fillMult := splitFillFactorMult(op.IsLeaf(), rightmost)
+	exactMid := -1
+	if op.IsLeaf() && !rightmost {
+		if newIdx := indexOfItem(allItems, it); newIdx > 0 {
+			if usemult, ok := bt.format().afterNewItemOff(allItems, newIdx); ok {
+				if usemult {
+					fillMult = BTreeDefaultFillFactor / 100.0
+				} else {
+					exactMid = newIdx + 1
+				}
+			}
+		}
+	}
+	var (
+		mid     int
+		splitOK bool
+	)
+	if exactMid > 0 && bt.format().compactSplitAtFits(allItems, pageDataBudget(), rightBudget, exactMid) {
+		mid, splitOK = exactMid, true
+	} else {
+		// An exact cut that does not fit falls back to 50:50, as upstream's
+		// defensive branch does.
+		mid, splitOK = bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget, fillMult)
+	}
 	if !splitOK {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
@@ -3988,8 +4014,8 @@ const BTreeNonLeafFillFactor = 70
 // page half empty for good (an int4 serial key's index came out 1.75x PG's
 // size, M0146-0178). Every other split balances free space (0, usemult off).
 // Not ported: the per-index fillfactor reloption (BTGetFillFactor; goopg uses
-// BTreeDefaultFillFactor as the bulk loader does) and _bt_afternewitemoff's
-// localized-monotonic arm for non-rightmost leaves — deferral ledger.
+// BTreeDefaultFillFactor as the bulk loader does). The non-rightmost leaf arm,
+// _bt_afternewitemoff, is afterNewItemOff below (M0146-0213).
 func splitFillFactorMult(leaf, rightmost bool) float64 {
 	if !rightmost {
 		return 0
@@ -3998,6 +4024,132 @@ func splitFillFactorMult(leaf, rightmost bool) float64 {
 		return BTreeDefaultFillFactor / 100.0
 	}
 	return BTreeNonLeafFillFactor / 100.0
+}
+
+// afterNewItemOff is _bt_afternewitemoff (nbtsplitloc.c), the "split after new
+// item" arm of _bt_findsplitloc for a NON-rightmost leaf (M0146-0213). It
+// recognises localized monotonically increasing insertion into a composite
+// index: the new item extends a grouping of its leading attribute(s), so later
+// inserts will land just to its right, and a 50:50 split would leave every left
+// half permanently half empty. That was TPC-H's partsupp_pk after the 2026-10-15
+// INSERT replay: interleaved ascending streams left 4668 of 5141 leaves about
+// 54 % full, 5170 pages against PG's 3082, which priced PG's Parallel Index Only
+// Scan out of Q16.
+//
+// items is the page's data items with the new one merged in, at newIdx. ok
+// reports that the optimization applies; usemult then says how (upstream's
+// *usemult). true means apply the leaf fillfactor multiplier; false means split
+// exactly after the new item, leaving it as lastleft.
+//
+// The conditions are upstream's, in order:
+//   - a composite key;
+//   - the new item not first on the page;
+//   - equal-sized tuples: every item the size of the new one, so no posting
+//     list. Upstream's minfirstrightsz / olddataitemstotal test; an equal-key run
+//     here is a posting on disk.
+//   - a tuple no wider than two int8 attributes;
+//   - _bt_keep_natts_fast against the item to its left: the first attribute
+//     equal by image, and not a duplicate on every key attribute.
+//
+// A new item to the right of every existing item needs nothing more. Otherwise
+// the left neighbour must also be heap-TID adjacent (_bt_adjacenthtid), and the
+// exact cut is used only when it does not lie right of where a fillfactor split
+// would cut.
+func (f indexFormat) afterNewItemOff(items []item, newIdx int) (usemult, ok bool) {
+	if !f.tupleKeys() || f.desc.NKeyAtts() == 1 || newIdx <= 0 || newIdx >= len(items) {
+		return false, false
+	}
+	newSz := f.bodySize(items[newIdx].key)
+	for i := range items {
+		if f.bodySize(items[i].key) != newSz {
+			return false, false
+		}
+		if i > 0 && f.compareKeyAttrs(items[i-1].key, items[i].key) == 0 {
+			return false, false
+		}
+	}
+	// MAXALIGN(sizeof(IndexTupleData) + sizeof(int64) * 2) + sizeof(ItemIdData),
+	// with the line pointer on both sides of the comparison.
+	if MaxAlign(newSz) > MaxAlign(SizeOfIndexTupleData+16) {
+		return false, false
+	}
+	keep, err := f.keepNAttsFast(items[newIdx-1].key, items[newIdx].key)
+	if err != nil {
+		return false, false
+	}
+	nkey := f.desc.NKeyAtts()
+	if keep <= 1 || keep > nkey {
+		return false, false
+	}
+	// The new item is right of every existing item (newitemoff > maxoff): the
+	// insertion pattern speaks for itself, no heap TID test.
+	if newIdx == len(items)-1 {
+		return true, true
+	}
+	if !adjacentHeapTID(items[newIdx-1].ptr, items[newIdx].ptr) {
+		return false, false
+	}
+	// interp = newitemoff / (maxoff + 1) on the ORIGINAL page. A non-rightmost
+	// page holds its high key at P_HIKEY, so data begins at offset 2 and the
+	// new item's offset is newIdx+2; maxoff is the existing data items plus the
+	// high key.
+	existing := len(items) - 1
+	interp := float64(newIdx+2) / float64(existing+1+1)
+	return interp > BTreeDefaultFillFactor/100.0, true
+}
+
+// keepNAttsFast is _bt_keep_natts_fast (nbtutils.c). It is keepNAtts with
+// image equality in place of the opclass, as _bt_afternewitemoff and the
+// posting-run checks use it.
+func (f indexFormat) keepNAttsFast(a, b []byte) (int, error) {
+	nkey := f.desc.NKeyAtts()
+	phys := f.desc.Physical()
+	av, an, err := DeformPGIndexTuple(a, phys, nkey)
+	if err != nil {
+		return 0, err
+	}
+	bv, bn, err := DeformPGIndexTuple(b, phys, nkey)
+	if err != nil {
+		return 0, err
+	}
+	for i := range nkey {
+		if an[i] != bn[i] || (!an[i] && !bytes.Equal(av[i], bv[i])) {
+			return i + 1, nil
+		}
+	}
+	return nkey + 1, nil
+}
+
+// indexOfItem finds `it` (key image and heap TID) in items, or -1. The split
+// works on the post-dedup list, where an item merged into a posting is no
+// longer present on its own; -1 then simply declines the optimization.
+func indexOfItem(items []item, it item) int {
+	for i := range items {
+		if items[i].ptr == it.ptr && bytes.Equal(items[i].key, it.key) {
+			return i
+		}
+	}
+	return -1
+}
+
+// adjacentHeapTID is _bt_adjacenthtid (nbtsplitloc.c): the same heap block, or
+// the next block's first offset.
+func adjacentHeapTID(low, high storage.ItemPointer) bool {
+	if low.Block == high.Block {
+		return true
+	}
+	return low.Block+1 == high.Block && high.Offset == 1
+}
+
+// compactSplitAtFits reports whether a cut whose first right item is items[m]
+// fits both pages, charged exactly as compactSplitLocFill charges a candidate.
+func (f indexFormat) compactSplitAtFits(items []item, leftBudget, rightBudget, m int) bool {
+	if m <= 0 || m >= len(items) {
+		return false
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	sepCharge := itemIDSize + MaxAlign(f.bodySize(items[m].key)) + MaxAlign(SizeOfItemPointerData)
+	return f.compactFootprint(items[:m])+sepCharge <= leftBudget && f.compactFootprint(items[m:]) <= rightBudget
 }
 
 // compactSplitLocFill is compactSplitLoc with _bt_deltasortsplits' weighting:
