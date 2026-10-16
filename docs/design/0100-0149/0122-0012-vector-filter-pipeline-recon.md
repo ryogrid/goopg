@@ -383,3 +383,40 @@ Not done here:
 - The group key is built as a string per row (`datumKey` + `setGroupKey`) and evaluated through the interpreter
   (`evalExprSlot`). Together these are ~5 % of Q1.
 - The integer literal in `1 - l_discount` is still promoted per row; PG coerces it to numeric at parse time.
+
+## Slice 11 (2026-10-16): the hashed aggregate's group key is built in place
+
+The hashed grouping loop (`aggregateOp`, operators_join_agg.go) built its key on every input row from strings:
+`datumKey` per grouping column, a type-tagged string such as `"s:" + value`, then `setGroupKey`'s
+`strings.Builder` join for a multi-column key. It then looked the result up in the group map. TPC-H Q1 groups
+6M lineitem rows on `(l_returnflag, l_linestatus)`, which is three small allocations per row in each of 4 workers.
+
+- **`appendDatumKey`** appends `datumKey`'s bytes to a buffer. It covers null, bool, int, small numeric and string in
+  place; every other kind, including the big-mantissa numeric lane, defers to `datumKey` itself.
+- **`appendGroupKey`** appends `setGroupKey`'s bytes, including the multi-set prefix and the bpchar padding strip
+  that `gkTrims` / `trimStringDatum` apply.
+- **The loop** builds the key into the reused `gkBuf` and looks it up as `groups[string(gkBuf)]`, a conversion Go
+  does not allocate for. The key string is created only when a row founds a group, so the map keys and the emission
+  order are byte-identical to before.
+- **Replaced:** `evalGroupKeysScratch` and its `gkKeys` scratch, by `evalGroupValsScratch`.
+- **Pin:** `TestAppendGroupKeyMatchesSetGroupKey` compares the two paths byte for byte over random rows of every
+  kind (big numerics, padded strings, bytes, time, interval), every set shape, with and without the multi-set prefix.
+  Dropping the trim fails it.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `73559041a` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1884 / 1880 / 1876 / 1887 | 1642 / 1647 / 1640 / 1638 |
+| 2 | 1857 / 1875 / 1876 / 1860 | 1653 / 1667 / 1641 / 1626 |
+| 3 | 1852 / 1869 / 1874 / 1873 | 1640 / 1665 / 1647 / 1627 |
+
+That is ~1875 → ~1645 ms, −12 %, far more than allocation's ~3 % share of the CPU profile suggested. Per-row
+allocation across four parallel workers costs more than its own samples show. The TPC-H acceptance arm returned
+identical values, with total 40.55 → 37.94 s and Q1 4.36 → 3.38 s. sf025 PASS=99 PLAN-SHAPE same=99, and the full
+`TestPort_RegressSuite` passed.
+
+Q1 against PG is now ~1.65 s vs ~1.23 s. What remains of the slice-10 list:
+- the per-row `strings.ToLower` in `applyAgg`;
+- interpreted group-key evaluation (`evalExprSlot`);
+- the int literal promoted per row.

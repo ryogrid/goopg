@@ -1201,6 +1201,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Pinned by `TestPromoteNumericOperandsMatchesPromoteToNumeric`.
     - Remaining Q1 levers: the per\-row `strings.ToLower` in applyAgg \(~1%\); the per\-row string group key and
       interpreted group\-key evaluation \(~5%\); the int literal's per\-row promotion \(PG coerces it at parse time\).
+  - **Slice 11 — the hashed aggregate's group key built in place LANDED 2026\-10\-16 \(loop \#48\).**
+    Movement: none — perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99
+    PLAN\-SHAPE same=99, TestPort\_RegressSuite PASS. Recon doc "Slice 11".
+    - `appendGroupKey` / `appendDatumKey` build `setGroupKey`'s exact bytes into a reused buffer. The lookup is
+      `groups\[string\(buf\)\]`, allocating only for a new group. Pinned by `TestAppendGroupKeyMatchesSetGroupKey`
+      \(mutation\-checked\).
+    - TPC\-H Q1 went from ~1875 ms to ~1645 ms \(−12%\). Acceptance arm: values identical, total 40.55 s → 37.94 s.
+    - Next Q1 levers: applyAgg's per\-row `strings.ToLower`, interpreted group\-key evaluation, and the int literal
+      promoted per row.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
