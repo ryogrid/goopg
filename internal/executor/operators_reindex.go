@@ -107,12 +107,20 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 
+	// M0146-0196: name resolution runs through ctxPlanCatalog — the
+	// per-connection search-path catalog keyed to the session's real
+	// database oid — not the raw base catalog, which resolves only under
+	// DefaultDBOid. Without this, every REINDEX form failed 42P01 (INDEX/
+	// TABLE) or silently no-op'd (SCHEMA) in a CREATE DATABASE'd database
+	// while SELECT could read the same relation — the same class of bug
+	// M0125-0028 fixed for ANALYZE/VACUUM's named targets.
 	switch o.stmt.ObjectType {
 	case "INDEX":
-		idx, ok := o.ctx.Catalog.LookupIndex(name)
+		cat := ctxPlanCatalog(o.ctx)
+		idx, ok := cat.LookupIndex(name)
 		if !ok {
 			// Try unqualified.
-			idx, ok = o.ctx.Catalog.LookupIndex(parser.ObjectName{Name: name.Name})
+			idx, ok = cat.LookupIndex(parser.ObjectName{Name: name.Name})
 		}
 		if !ok {
 			return nil, &ExecError{
@@ -133,9 +141,10 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 	case "TABLE":
-		tbl, ok := o.ctx.Catalog.LookupTable(name)
+		cat := ctxPlanCatalog(o.ctx)
+		tbl, ok := cat.LookupTable(name)
 		if !ok {
-			if tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Name: name.Name}); !ok {
+			if tbl, ok = cat.LookupTable(parser.ObjectName{Name: name.Name}); !ok {
 				return nil, &ExecError{
 					Code:    "42P01",
 					Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
@@ -183,7 +192,7 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 			schemaName = name.Schema
 		}
 		for _, tn := range o.schemaTableNamesByOID(schemaName) {
-			tbl, ok := o.ctx.Catalog.LookupTable(tn)
+			tbl, ok := o.ctx.Catalog.LookupTable(tn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !ok {
 				continue
 			}
@@ -535,14 +544,20 @@ func reindexLockWaitError(err error) error {
 // dropped while REINDEX SCHEMA waits on an earlier one is detected and
 // skipped instead of operating on stale catalog state. M0118-0008.
 func (o *reindexOp) schemaTableNamesByOID(schemaName string) []parser.ObjectName {
-	tables := o.ctx.Catalog.TablesInSchema(schemaName)
+	// M0146-0196: enumerate and re-resolve inside the CONNECTION's database
+	// namespace. TablesInSchema is not a SearchPathCatalog override, so the
+	// connection-namespace oid must be passed explicitly here — routing
+	// through ctxPlanCatalog would silently enumerate DefaultDBOid's schema
+	// (the pre-fix silent no-op this fixes).
+	nsOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	tables := o.ctx.Catalog.TablesInSchema(schemaName, nsOid)
 	type namedOID struct {
 		name parser.ObjectName
 		oid  uint32
 	}
 	named := make([]namedOID, 0, len(tables))
 	for _, tn := range tables {
-		tbl, ok := o.ctx.Catalog.LookupTable(tn)
+		tbl, ok := o.ctx.Catalog.LookupTable(tn, nsOid)
 		if !ok {
 			continue
 		}

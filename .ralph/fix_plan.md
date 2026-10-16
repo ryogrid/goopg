@@ -254,13 +254,16 @@ OWNER DECISIONS 2026-10-15 (c) — acceptance-arm unblock:
   recovery forces `XFAIL-RESOLVED` → re-pin). Option (a) was inert —
   gate-exceptions waive only SKIP-BLOCKED, and the arm returns FAIL;
   option (c) deadlocked — the Q5 plan fix itself needs the arm.
-- :65433 TPC-H index compaction: REINDEX is unavailable (M0146-0196 —
-  reproduced on :65433), so the cluster was reloaded by INSERT replay
-  under a 7b356ec04 binary — a NEGATIVE result: identical index sizes
-  (117050 / 28617 / 41512 pages). The remaining bloat driver is open
-  under M0146-0195; compacting the ref indexes goes through an 0196 fix
-  + REINDEX TABLE.
-- M0146-0196 stays below item 10 (S7 carve-out confirmed).
+- :65433 TPC-H index compaction: REINDEX was unavailable until
+  M0146-0196 closed 2026-10-16 (owner-placed); the cluster was reloaded
+  by INSERT replay under a 7b356ec04 binary — a NEGATIVE result:
+  identical index sizes (117050 / 28617 / 41512 pages). The remaining
+  bloat driver is open under M0146-0195; compacting a ref index goes
+  through `REINDEX INDEX <name>` — surgical, NOT `REINDEX TABLE`, which
+  would re-bulk-build the deliberately insert-built FK indexes (goopg's
+  bulk build is denser than PG's; Q10's match rests on PG-sized FK
+  indexes).
+- M0146-0196 closed by owner placement (was below item 10, S7).
 - M0146-0178 de-escalated `[!]`→`[ ]`; resume = apply the parked
   slice2.patch, re-run the arm, commit.
 
@@ -3440,7 +3443,7 @@ Movement: yes — CATEGORIES\-EXCL\-MATCH rendering 4 → 3 at both scales \(Q54
     join\-order 5 → 3, parallelism 3 → 1\. Q10 keeps its match \(insert\-built indexes are PG\-sized, unlike the clone's
     bulk\-built twins\)\. Q2 and SF0\.25 Q43 \(the reverse direction\) stay as separate census records\.
 Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
-- [ ] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
+- [x] **M0146\-0196 — REINDEX and DROP INDEX cannot resolve relations in a CREATE DATABASE'd database** \(filed
   2026\-10\-15 by M0146\-0195\)\. On a private clone of the TPC-H cluster, connected to db `tpch`: `REINDEX TABLE
   region`, `REINDEX TABLE public\.region`, `REINDEX INDEX region\_pk` and `DROP INDEX nation\_regionkey\_fkidx`
   all fail "does not exist", while `SELECT count\(\*\) FROM region` works and `CREATE INDEX nation\_regionkey\_fkidx`
@@ -3453,6 +3456,17 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     the operational pressure that motivated raising it\.
   - First step: `internal/executor/operators\_reindex\.go` and the DROP INDEX path — find the lookup that ignores
     the session database \(same family as M0125\-0028's bare\-ANALYZE/VACUUM fix\)\. Executor change: needs the arm\.
+  - **2026\-10\-16 CLOSED \(owner\-placed, reviewed\)** — the filing's DROP INDEX half was already fixed:
+    `execDropIndex` passes `NamespaceDBOid\(ctx\.CurrentDatabaseOid\)` \(operators\_ddl\.go\); verified working on a
+    private cluster\. What was actually broken: `REINDEX INDEX`/`TABLE` resolved names via raw
+    `ctx\.Catalog\.LookupIndex/LookupTable` \(DefaultDBOid only → 42P01\), and `REINDEX SCHEMA` enumerated
+    `TablesInSchema` under DefaultDBOid → **silent no\-op returning success**\. Fix: INDEX/TABLE arms resolve via
+    `ctxPlanCatalog` \(search\-path\-aware, same idiom as M0125\-0028's ANALYZE/VACUUM\); the SCHEMA arm uses raw
+    catalog \+ explicit `NamespaceDBOid` because `TablesInSchema` has no `SearchPathCatalog` override\. Tests:
+    `reindex\_dbid\_routing\_test\.go` \(3 tests: corrupt\-truncate → REINDEX → btree rescan per arm\)\. Verified live
+    on a private cluster: all three REINDEX forms succeed in a CREATE DATABASE'd db\. Recorded residual, not
+    blocking: `REINDEX DATABASE`/`SYSTEM` still parse but fall through the switch as silent no\-ops;
+    `LookupEnum`/`LookupToastRel` inside the rebuild paths are dbOid\-agnostic \(no caller impact today\)\.
 - [x] **M0146-0210 — TPC\-DS SF1 Q54: goopg's semi\-join Unique estimates 1 row from a 2\-row input, and the join order above it differs from PG's \(qual\-placement\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016k/ROUTING\.md`\)\.
   Kind: impl
