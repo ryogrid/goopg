@@ -636,7 +636,7 @@ func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pE
 		for g := 0; g < len(groupBounds)-1; g++ {
 			gStart, gEnd := groupBounds[g], groupBounds[g+1]
 			for i := gStart; i < gEnd; i++ {
-				if err := aggHelper.applyAgg(&running, call, asSlot(o.schema, o.rows[i]), -1); err != nil {
+				if err := aggHelper.applyAgg(&running, &call, asSlot(o.schema, o.rows[i]), -1); err != nil {
 					return err
 				}
 			}
@@ -695,7 +695,7 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 				if frameRowExcluded(o.plan.Frame.Exclusion, k, i, peerStart, peerEnd) {
 					continue
 				}
-				if err := aggHelper.applyAgg(&running, call, asSlot(o.schema, o.rows[k]), -1); err != nil {
+				if err := aggHelper.applyAgg(&running, &call, asSlot(o.schema, o.rows[k]), -1); err != nil {
 					return err
 				}
 			}

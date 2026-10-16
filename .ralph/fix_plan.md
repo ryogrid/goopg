@@ -1241,6 +1241,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       and is mutation\-checked.
     - Q1 median went from ~1460 ms to ~1310 ms \(about −10%\), with no overlap between arms; across slices 10\-15,
       ~1.91 s → ~1.31 s \(PG ~1.23 s\).
+  - **Slice 16 — applyAgg takes its AggregateCall by pointer LANDED 2026\-10\-16 \(loop \#53\).** Movement: none —
+    perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS. Recon doc "Slice 16".
+    - `optimizer.AggregateCall` is 320 bytes. The three per\-row aggregate loops \(the hashed drain, openSorted and
+      openSortedPartialEmit\) copied it in their `range` and again as applyAgg's by\-value argument: two copies per
+      aggregate per row. They now pass `&o.plan.Aggs[i]`. applyAgg only reads it, so the behaviour is unchanged by
+      construction; the existing applyAgg tests and the window callers were updated.
+    - Q1 median went from ~1290 ms to ~1225 ms \(about −5%\); across slices 10\-16, ~1.91 s → ~1.22 s, level with
+      PG's ~1.23 s.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

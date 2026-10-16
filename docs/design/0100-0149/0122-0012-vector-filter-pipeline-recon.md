@@ -544,3 +544,32 @@ larger than the function's profile share; the removed stack round trip also stal
 returned identical values.
 
 **Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
+
+## Slice 16 (2026-10-16): applyAgg takes its AggregateCall by pointer
+
+The per-row aggregate loops (the hashed drain in `Open`, `openSorted` and `openSortedPartialEmit`) iterated
+`for i, call := range o.plan.Aggs`, then called `applyAgg(st, call, slot, i)` with `call optimizer.AggregateCall`
+by value. `unsafe.Sizeof(AggregateCall{})` is 320 bytes. Its three `catalog.Type` fields, the slices and the
+expressions make it large. Q1 has eight aggregates, so each input row copied 8 × 2 × 320 B before any work. Slice
+6 left the expression tree walk alone, because the samples there were on the recursion, not on copies; this copy
+sits outside the walk.
+
+The loops now take `call := &o.plan.Aggs[i]`, and `applyAgg` takes `*optimizer.AggregateCall`. `applyAgg` never
+assigns to `call` or forwards it by value; every use is a field read or `call.Pos()`. So the change cannot alter
+behaviour, and the existing `applyAgg` tests (`join_agg_compile_test.go`, `parallel_agg_combine_test.go`) cover it.
+The window operator's two calls pass the address of their per-function local. `finishAgg` still takes the call by
+value: it runs once per group, not once per row.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `67c5a5091` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1330 / 1316 / 1281 / 1297 | 1261 / 1231 / 1220 / 1233 |
+| 2 | 1272 / 1257 / 1280 / 1285 | 1243 / 1212 / 1257 / 1274 |
+| 3 | 1299 / 1301 / 1283 / 1278 | 1205 / 1211 / 1206 / 1218 |
+
+That is median ~1290 → ~1225 ms, about −5 %. The candidate's median was lower in every round, but round 2 overlaps.
+Across slices 10-16, Q1 went from ~1.91 s to ~1.22 s, level with PG 18.3's ~1.23 s on the same corpus. The acceptance
+arm returned identical values.
+
+**Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.

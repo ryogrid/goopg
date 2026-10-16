@@ -2681,7 +2681,8 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 
 			o.currentRowVersion++
-			for i, call := range o.plan.Aggs {
+			for i := range o.plan.Aggs {
+				call := &o.plan.Aggs[i]
 				// For user-defined aggregates with shared transition state, only the
 				// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
 				// skip applyAgg — they will be synced from the leader's final state just
@@ -3214,7 +3215,8 @@ func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
 			curParts = parts
 		}
 		o.currentRowVersion++
-		for i, call := range o.plan.Aggs {
+		for i := range o.plan.Aggs {
+			call := &o.plan.Aggs[i]
 			// SharedStateSlot followers skip sfunc exactly as the hash
 			// drain and openSorted do (M0097-0035): they are synced from
 			// the leader's combined state on the FINALIZE side.
@@ -3714,7 +3716,8 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 			curParts = parts
 		}
 		o.currentRowVersion++
-		for i, call := range o.plan.Aggs {
+		for i := range o.plan.Aggs {
+			call := &o.plan.Aggs[i]
 			// For user-defined aggregates with shared transition state, only the
 			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
 			// skip applyAgg — they will be synced from the leader's final state just
@@ -3837,7 +3840,11 @@ func (o *aggregateOp) aggEvalList2(nodes [][]int32, idx, sub int, e optimizer.Ex
 	return evalExprSlot(e, slot, o.ctx)
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot, idx int) error {
+// applyAgg folds one input row into one aggregate's transition state. call
+// points into o.plan.Aggs: a 320-byte AggregateCall passed by value, and
+// before that copied by the caller's range loop, was two copies per aggregate
+// per row (M0122-0012 slice 16). applyAgg only reads it.
+func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, slot TupleSlot, idx int) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
