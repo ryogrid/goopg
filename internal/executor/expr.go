@@ -1870,10 +1870,15 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			}
 		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
-			a, b, err := promoteNumericOperands(left, right, op, pos)
-			if err != nil {
-				return Datum{}, err
+			promoteIntOperand(&left)
+			promoteIntOperand(&right)
+			if left.Kind != KindNumeric || right.Kind != KindNumeric {
+				var err error
+				if left, right, err = promoteNumericOperands(left, right, op, pos); err != nil {
+					return Datum{}, err
+				}
 			}
+			a, b := left, right
 			if op == parser.OpAdd {
 				return numericAdd(a, b)
 			}
@@ -1910,10 +1915,15 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return intervalDiv(left, factor, pos)
 		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
-			a, b, err := promoteNumericOperands(left, right, op, pos)
-			if err != nil {
-				return Datum{}, err
+			promoteIntOperand(&left)
+			promoteIntOperand(&right)
+			if left.Kind != KindNumeric || right.Kind != KindNumeric {
+				var err error
+				if left, right, err = promoteNumericOperands(left, right, op, pos); err != nil {
+					return Datum{}, err
+				}
 			}
+			a, b := left, right
 			switch op {
 			case parser.OpMul:
 				return numericMul(a, b)

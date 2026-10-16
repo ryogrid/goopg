@@ -1231,6 +1231,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       NumericBigValue is nil iff the flag is clear. Pinned by `TestIsBigNumericMatchesNumericBigValue`.
     - Q1 median went from ~1490 ms to ~1455 ms \(about −2.4%\). Next levers: the int literal promoted per row, and
       the stack\-returned arithmetic Datums.
+  - **Slice 15 — evalBinary promotes int operands in place LANDED 2026\-10\-16 \(loop \#52\).** Movement: none — perf
+    only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS. Recon doc "Slice 15".
+    - evalBinary's two numeric arms rewrite a KindInt operand as `numericFromInt` in place, via the inlined
+      `promoteIntOperand`. They call `promoteNumericOperands` only when an operand is still not numeric, so the
+      numeric/int\-literal case no longer returns a Datum pair through the stack. Pinned by
+      `TestEvalBinaryNumericArmsMatchPromoteToNumeric`, which covers all five operators and all operand pairings
+      and is mutation\-checked.
+    - Q1 median went from ~1460 ms to ~1310 ms \(about −10%\), with no overlap between arms; across slices 10\-15,
+      ~1.91 s → ~1.31 s \(PG ~1.23 s\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

@@ -510,6 +510,20 @@ func promoteNumericOperands(a, b Datum, op parser.OpCode, pos int) (Datum, Datum
 	return a, b, nil
 }
 
+// promoteIntOperand rewrites a KindInt operand as the scale-0 numeric that
+// toNumeric returns for it, in place (M0122-0012 slice 15). evalBinary's
+// numeric arms call it on both operands and reach promoteNumericOperands only
+// when one is still not numeric (a string, or a kind that raises 42883). The
+// common case, numeric with numeric or with an int literal, then stays inline,
+// and no Datum pair is returned through the stack. On TPC-H Q1, every row
+// computes 1 - l_discount and 1 + l_tax: PG coerces the literal at parse time,
+// while goopg promotes it per row.
+func promoteIntOperand(d *Datum) {
+	if d.Kind == KindInt {
+		*d = numericFromInt(d.Int)
+	}
+}
+
 func toNumeric(d Datum, op parser.OpCode, pos int) (Datum, error) {
 	switch d.Kind {
 	case KindNumeric:

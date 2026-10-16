@@ -512,3 +512,35 @@ That is median ~1490 → ~1455 ms, about −2.4 %. The candidate's median was lo
 overlaps. The acceptance arm returned identical values.
 
 **Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
+
+## Slice 15 (2026-10-16): evalBinary promotes int operands in place
+
+TPC-H Q1 computes `l_extendedprice * (1 - l_discount)` and `... * (1 + l_tax)` for every row. PG coerces the
+literal `1` to numeric at parse time. goopg keeps it as an int and promotes it at evaluation time:
+`evalBinary`'s numeric arms called `promoteNumericOperands`, which returned two 48-byte Datums through its stack
+slots (store-forwarding, the slice 3-5 pattern). That happened on all four arithmetic operations per row, including
+the two whose operands were both numeric already. The function was 4.5 % of Q1's profile.
+
+Both arms now rewrite a `KindInt` operand in place with `numericFromInt`, through `promoteIntOperand(*Datum)`, which
+inlines. They call `promoteNumericOperands` only when an operand is still not numeric (a string that failed to parse,
+or a kind that raises 42883). For an int, `toNumeric` returns exactly `numericFromInt`, so the result is identical.
+`TestEvalBinaryNumericArmsMatchPromoteToNumeric` compares `evalBinary` with promote-then-operate, for `+ - * / %`
+over numeric, big numeric, int, numeric-looking string and rejected operands, including the errors. It fails if
+the promoted literal's representation changes.
+
+A first attempt put the fast path in a helper that returned the pair. It was not inlinable (cost 129), so it would
+have kept the stack return; it was replaced before measurement.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `3a9d9a88c` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1487 / 1451 / 1456 / 1427 | 1328 / 1329 / 1307 / 1327 |
+| 2 | 1469 / 1464 / 1465 / 1456 | 1287 / 1310 / 1299 / 1309 |
+| 3 | 1479 / 1440 / 1469 / 1429 | 1324 / 1315 / 1312 / 1285 |
+
+That is median ~1460 → ~1310 ms, about −10 %, with no overlap between the arms. As with slice 11, the saving is
+larger than the function's profile share; the removed stack round trip also stalled its callers. The acceptance arm
+returned identical values.
+
+**Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
