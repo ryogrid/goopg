@@ -4506,3 +4506,17 @@ Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shippe
     - The first regress run after the fire set failed union / varchar / vacuum\_parallel\. The rerun on the same code
       passed all three, and vacuum\_parallel passes standalone: nondeterministic\.
 Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 slice 1, Q52 slice 2\)
+- [ ] **M0146\-0222 — sort\-strategy: TPC\-DS Q72 — PG sorts below the joins \(Gather Merge → Sort\) and keeps the order
+  through its Nested Loops; goopg sorts once above them** \(filed 2026\-10\-17 by the S9 pass at e3a7ae742\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q72, category sort\-strategy, verdict SHAPE\-DIFF at depth 3 \(under GroupAggregate: PG
+    Nested Loop Left \| goopg Sort\)\. The same record appears at SF1 Q72, and both persist under PG statistics\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261017b/`\.
+  - S9 ranking \(records persisting under PG statistics\): sort\-strategy 3, then parallelism, join\-order and
+    scan\-type at 2 each\.
+  - goopg's plan is cheaper by its own costing \(15267\.53 against PG's 15490\.83\)\.
+  - First step: on the exact PG replica \(tmp/m21\-refclone, the pg\_basebackup of the reference\), probe whether PG
+    generates goopg's `GroupAggregate → Sort → join tree` candidate, and at what cost\. Use the upper\-rel add\_path
+    elog pattern of M0146\-0221 probe/\. Then compare goopg's join\-tree costs against PG's term by term\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 88→89 \(Q72\), then SF1\.
