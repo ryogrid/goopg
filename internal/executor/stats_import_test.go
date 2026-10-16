@@ -294,3 +294,41 @@ func TestImportedNullFracReachesPlanner(t *testing.T) {
 		t.Fatalf("want rows=3000 (10000 x null_frac 0.3):\n%s", plan)
 	}
 }
+
+// TestImportedRelAllVisibleReachesPlanner pins the planner side of
+// M0146-0216. allvisfrac reads the STORED relallvisible (plancat.c
+// estimate_rel_size), so importing 0 against the full page count must change
+// the cost of the same index-only scan: its heap fetches scale with
+// 1 - allvisfrac.
+func TestImportedRelAllVisibleReachesPlanner(t *testing.T) {
+	ctx, tbl, cleanup := statsImportFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE INDEX simp_i ON simp (i)"); err != nil {
+		t.Fatal(err)
+	}
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+	if err := runDDL(t, ctx, "VACUUM simp"); err != nil {
+		t.Fatal(err)
+	}
+	set := func(n int) string {
+		t.Helper()
+		if _, err := runQueryWithErr(ctx, fmt.Sprintf(
+			"SELECT pg_restore_relation_stats('schemaname','public','relname','simp','relallvisible',%d::integer)", n)); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := runQueryWithErr(ctx, "EXPLAIN SELECT i FROM simp WHERE i < 5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(renderRows(rows), "\n")
+	}
+	full := set(tbl.Stats.Pages)
+	none := set(0)
+	if tbl.Stats.AllVisible != 0 || !tbl.Stats.AllVisibleSet {
+		t.Fatalf("stored relallvisible %+v, want 0 and set", tbl.Stats)
+	}
+	if full == none {
+		t.Fatalf("the plan ignores the stored relallvisible:\n%s", full)
+	}
+}

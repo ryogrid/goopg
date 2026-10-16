@@ -64,8 +64,8 @@ Argument handling (`stat_utils.c`):
 
 ## 3. Deferred (ledger rows)
 
-- `relallvisible` / `relallfrozen`: goopg reads them live from the visibility map and has no stored value to
-  overwrite. They are accepted and ignored. This is the same gap M0146-0216 addresses for VM state.
+- `relallfrozen`: goopg has no consumer for it; accepted and ignored. `relallvisible` was in the same state until
+  M0146-0216 stored it (`docs/design/0100-0149/m0146-0216-physical-parity-relallvisible.md`). It is now applied.
 - Element and range statistics (`most_common_elems`, `most_common_elem_freqs`, `elem_count_histogram`, the
   `range_*` kinds): goopg's ColumnStats does not represent them. Accepted and ignored for array and range
   columns; a WARNING otherwise, as PG gives.

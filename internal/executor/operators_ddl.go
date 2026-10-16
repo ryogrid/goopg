@@ -14934,9 +14934,10 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 //     autovacuum_enabled reloption is not false — a dump restore may have
 //     loaded statistics the user expects to keep.
 //
-// relallvisible needs no write: goopg reads it live from the VM. Published
-// and persisted exactly as VACUUM does (UpdateRelStats + persistRelSize);
-// a failed size write is non-fatal, as there.
+// relallvisible is counted from the visibility map and stored, as
+// index_update_stats does (visibilitymap_count; M0146-0216). Published and
+// persisted exactly as VACUUM does (UpdateRelStats + persistRelSize); a failed
+// size write is non-fatal, as there.
 func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
 	if tbl == nil || tbl.PartitionMethod != "" {
 		return
@@ -14952,6 +14953,7 @@ func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
 		return
 	}
 	o.ctx.Catalog.UpdateRelStats(tbl, int(nBlocks), int64(reltuples))
+	snapshotRelAllVisible(o.ctx, tbl, int(nBlocks))
 	_ = persistRelSize(o.ctx, tbl, int64(reltuples), int(nBlocks))
 }
 

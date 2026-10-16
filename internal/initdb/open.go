@@ -4319,6 +4319,9 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	type relSize struct {
 		rowCount int64
 		pages    int64
+		// allVisible is the stored relallvisible; -1 when the row carries
+		// none (written before M0146-0216, or NULL).
+		allVisible int64
 	}
 	sizeMap := make(map[uint32]relSize)
 	relStatsRel := storage.RelFileNode{
@@ -4334,12 +4337,16 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, relStatsCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return [3]int64{decoded[0].Int, decoded[1].Int, decoded[2].Int}, false, nil
+			allVisible := int64(-1)
+			if natts > 3 && !decoded[3].IsNull() {
+				allVisible = decoded[3].Int
+			}
+			return [4]int64{decoded[0].Int, decoded[1].Int, decoded[2].Int, allVisible}, false, nil
 		})
 	for _, r := range sizeRows {
-		v := r.([3]int64)
+		v := r.([4]int64)
 		if v[0] >= int64(catalog.FirstUserOID) {
-			sizeMap[uint32(v[0])] = relSize{rowCount: v[1], pages: v[2]}
+			sizeMap[uint32(v[0])] = relSize{rowCount: v[1], pages: v[2], allVisible: v[3]}
 		}
 	}
 
@@ -4419,6 +4426,9 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		if sz, ok := sizeMap[relid]; ok {
 			stats.RowCount = sz.rowCount
 			stats.Pages = int(sz.pages)
+			if sz.allVisible >= 0 {
+				stats.AllVisible, stats.AllVisibleSet = int32(sz.allVisible), true
+			}
 		}
 		cat.SetTableStats(tbl, stats)
 	}

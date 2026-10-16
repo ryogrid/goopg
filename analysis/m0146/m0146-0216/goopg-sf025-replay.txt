@@ -1,0 +1,12 @@
+catalog_returns_rep|784
+catalog_returns_rep_pkey|138
+catalog_sales_rep|9416
+catalog_sales_rep_pkey|1226
+inventory_rep|12768
+inventory_rep_pkey|12774
+store_returns_rep|1232
+store_returns_rep_pkey|277
+store_sales_rep|12936
+store_sales_rep_pkey|2496
+web_sales_rep|4744
+web_sales_rep_pkey|598

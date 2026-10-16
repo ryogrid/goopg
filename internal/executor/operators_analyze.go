@@ -154,6 +154,9 @@ func analyzeTableStats(ctx *Context, tbl *catalog.Table) error {
 		return err
 	}
 	ctx.Catalog.SetTableStats(tbl, stats)
+	// do_analyze_rel counts the visibility map (visibilitymap_count) and
+	// stores relallvisible through vac_update_relstats (M0146-0216).
+	snapshotRelAllVisible(ctx, tbl, stats.Pages)
 	// M0112: persist stats to pg_statistic so they survive restart.
 	if werr := persistStatsToPGStatistic(ctx, tbl, stats); werr != nil {
 		// Non-fatal: stats are in memory; log and continue.
@@ -604,10 +607,17 @@ func persistRelSize(ctx *Context, tbl *catalog.Table, rowCount int64, pages int)
 		RelOid: catalog.GoopgRelStatsRelationId,
 		Fork:   storage.MainFork,
 	}
+	// relallvisible: the stored value, or NULL when none is set (an old
+	// three-column row reads the same way). M0146-0216.
+	allVisible := NullDatum
+	if st := tbl.Stats; st != nil && st.AllVisibleSet {
+		allVisible = NewIntDatum(int64(st.AllVisible))
+	}
 	sizeRow := Row{
 		NewIntDatum(int64(tbl.OID)), // starelid
 		NewIntDatum(rowCount),       // rowcount (reltuples)
 		NewIntDatum(int64(pages)),   // pages (relpages)
+		allVisible,                  // relallvisible (M0146-0216)
 	}
 	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil {
 		return fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
@@ -629,7 +639,28 @@ func GoopgRelStatsColumns() []catalog.Column {
 		{Name: "starelid", Type: catalog.Type{Name: "oid"}},
 		{Name: "rowcount", Type: catalog.Type{Name: "int8"}},
 		{Name: "pages", Type: catalog.Type{Name: "int8"}},
+		// M0146-0216: the stored pg_class.relallvisible. Rows written
+		// before the column existed have three attributes and decode it
+		// as NULL: no stored value.
+		{Name: "allvisible", Type: catalog.Type{Name: "int4"}},
 	}
+}
+
+// snapshotRelAllVisible stores the relation's current all-visible block count
+// as its pg_class.relallvisible. It is the visibilitymap_count →
+// vac_update_relstats step that VACUUM (heap_vacuum_rel), ANALYZE
+// (do_analyze_rel) and index builds (index_update_stats) perform. The count is
+// clamped to relpages, as heap_vacuum_rel clamps it. M0146-0216.
+func snapshotRelAllVisible(ctx *Context, tbl *catalog.Table, pages int) {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || tbl == nil {
+		return
+	}
+	n := im.LiveRelAllVisibleBlocks(tbl)
+	if pages >= 0 && int(n) > pages {
+		n = int32(pages)
+	}
+	im.SetRelAllVisible(tbl, n)
 }
 
 // upstreamDefaultStatsTarget mirrors upstream PG's

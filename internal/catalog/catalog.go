@@ -177,8 +177,49 @@ func (c *InMemory) relAllVisibleCell(t *Table) string {
 	if c == nil || t == nil {
 		return "0"
 	}
+	if n, ok := storedRelAllVisible(t); ok {
+		return strconv.FormatInt(int64(n), 10)
+	}
 	dbOid, relOID := c.relAllVisibleKey(t)
 	return relAllVisibleFor(dbOid, relOID)
+}
+
+// storedRelAllVisible reports t's stored pg_class.relallvisible, when a VACUUM,
+// ANALYZE or statistics import has set one (TableStats.AllVisibleSet).
+func storedRelAllVisible(t *Table) (int32, bool) {
+	if s := t.Stats; s != nil && s.AllVisibleSet {
+		return s.AllVisible, true
+	}
+	return 0, false
+}
+
+// LiveRelAllVisibleBlocks counts t's all-visible blocks in the visibility map
+// now (visibilitymap_count), keyed as RelAllVisibleBlocks keys it. VACUUM and
+// ANALYZE snapshot it into the stored value.
+func (c *InMemory) LiveRelAllVisibleBlocks(t *Table) int32 {
+	if c == nil || t == nil || RelAllVisibleFunc == nil {
+		return 0
+	}
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return RelAllVisibleFunc(dbOid, relOID)
+}
+
+// SetRelAllVisible stores t's pg_class.relallvisible (vac_update_relstats),
+// replacing the Stats pointer as UpdateRelStats does, so a concurrent planner
+// never sees a torn struct. A nil Stats is created without marking the
+// relation analyzed.
+func (c *InMemory) SetRelAllVisible(t *Table, n int32) {
+	if c == nil || t == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var merged TableStats
+	if t.Stats != nil {
+		merged = *t.Stats
+	}
+	merged.AllVisible, merged.AllVisibleSet = n, true
+	t.Stats = &merged
 }
 
 // relAllVisibleKey is the (database, relfilenode) pair a table's VM bits are
@@ -204,12 +245,17 @@ func (c *InMemory) relAllVisibleKey(t *Table) (dbOid, relOID uint32) {
 // DBOid-less table under DefaultDBOid, while VACUUM keyed its VM bits under the
 // session's database, so on the `postgres` database it read 0 and priced every
 // index-only scan with all its heap fetches (M0145-0029 slice 5).
+//
+// It is the STORED value when one is set, as PG's planner reads pg_class
+// (M0146-0216), and the live map otherwise.
 func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
-	if c == nil || t == nil || RelAllVisibleFunc == nil {
+	if c == nil || t == nil {
 		return 0
 	}
-	dbOid, relOID := c.relAllVisibleKey(t)
-	return RelAllVisibleFunc(dbOid, relOID)
+	if n, ok := storedRelAllVisible(t); ok {
+		return n
+	}
+	return c.LiveRelAllVisibleBlocks(t)
 }
 
 // RelAllVisible reports the relation's VM-derived all-visible BLOCK COUNT
@@ -220,7 +266,13 @@ func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
 // which prices an index-only scan at exactly what the equivalent index scan
 // costs — the safe direction.
 func RelAllVisible(t *Table) int32 {
-	if t == nil || RelAllVisibleFunc == nil {
+	if t == nil {
+		return 0
+	}
+	if n, ok := storedRelAllVisible(t); ok {
+		return n
+	}
+	if RelAllVisibleFunc == nil {
 		return 0
 	}
 	dbOid := DefaultDBOid
@@ -1974,6 +2026,17 @@ type TableStats struct {
 	// !relhassubclass comment is about. M0125-0003; design
 	// docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md §D1.
 	Analyzed bool `json:"analyzed,omitempty"`
+
+	// AllVisible is the stored pg_class.relallvisible, which VACUUM and
+	// ANALYZE snapshot from the visibility map (vac_update_relstats) and
+	// pg_restore_relation_stats sets. PG's planner reads this STORED value
+	// for allvisfrac (plancat.c estimate_rel_size), not the live map, so it
+	// goes stale exactly as PG's does between maintenance passes.
+	// AllVisibleSet is false for a relation no such pass has touched since
+	// the field existed. The live map stands in then: before M0146-0216 goopg
+	// always read it live, and an old size sidecar row carries no value.
+	AllVisible    int32 `json:"all_visible,omitempty"`
+	AllVisibleSet bool  `json:"all_visible_set,omitempty"`
 }
 
 // ColumnStats is the per-column pg_statistic-shaped subset v0

@@ -4286,6 +4286,28 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     marking\); if a heap/index page count still differs, the fix belongs to hio\.c bulk extension,
     heap packing, or nbtree bulk build per S9\(5\)\(c\) — not the planner\.
   - Expected instrument: TPC\-DS PLAN\-PARITY \(Q52, Q76 and any record the census re\-attributes\)\.
+  - **Slice 1 2026\-10\-16 \(loop \#58\): census and attribution\.** Evidence `analysis/m0146/m0146\-0216/`; design
+    `docs/design/0100-0149/m0146-0216-physical-parity-relallvisible.md`\.
+    - Heap relpages and physical size are identical on every table at both scales\. relallvisible differs on 20/23
+      tables \(goopg fully all\-visible after the owner VACUUM; PG keeps tails, and has 0 on small tables autovacuum
+      never reached\)\.
+    - Index pages: the corpus predates the M0146\-0213 split port \(inventory\_pkey 14502 vs PG 12606\)\. Replaying the
+      same COPY on the current engine gives 0\-3% of PG \(inventory\_pkey 12774, web\_sales\_pkey exact\)\.
+  - **Slice 2 LANDED 2026\-10\-16 \(loop \#58\): stored pg\_class\.relallvisible\.** PG's planner reads the STORED
+    value \(plancat\.c\), set by vac\_update\_relstats at VACUUM, ANALYZE and index builds\. goopg read the live VM\.
+    - TableStats\.AllVisible/AllVisibleSet with snapshotRelAllVisible at those three sites\. The planner and the
+      pg\_class view read the stored value; a 4th sidecar column persists it \(an old 3\-column row reads as unset,
+      falling back to the live map, ledger\); pg\_restore\_relation\_stats applies it\.
+    - Pins: TestRelAllVisibleIsStoredLikePG \(postmaster: VACUUM sets it, UPDATE leaves it stale, import plus
+      restart\) and TestImportedRelAllVisibleReachesPlanner\. Mutation\-checked\.
+    - Measured: shipped\-corpus plans are unchanged \(sf025 same=99, fire set none\)\. With full PG stats including
+      relallvisible imported on a clone, SF0\.25 stays at 88/99 \(parallelism 5→4\)\. The 11 remaining divergences are
+      planner ones: sort\-strategy 5 \(Q4, Q38, Q72, Q77, Q87\), parallelism 2 \(Q16, Q39\), Q61, Q69, Q78, and Q64
+      \(index geometry\)\.
+    - Gates: units, internal/postmaster, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99, tpcds\-fireset PASS,
+      TestPort\_RegressSuite, TestPort\_Isolation\*\.
+    - Remaining: corpus index refresh \(owner reload\); the residual 0\-3% split\-location gap against
+      \_bt\_findsplitloc \(next engine slice\)\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.

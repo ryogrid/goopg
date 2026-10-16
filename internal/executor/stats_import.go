@@ -585,9 +585,10 @@ func evalPgRestoreRelationStats(x *optimizer.FuncCall, slot SlotView, ctx *Conte
 		// keeps no index relation statistics to set (ledger, M0146-0215).
 		return NewBoolDatum(result), nil
 	}
-	// relallvisible / relallfrozen are read live from the visibility map;
-	// there is no stored value to replace (ledger, M0146-0215 / M0146-0216).
-	if !a.has(relPages) && !updTuples {
+	// relallvisible is the stored pg_class value the planner reads
+	// (M0146-0216). relallfrozen has no consumer in goopg and is not kept
+	// (ledger, M0146-0215).
+	if !a.has(relPages) && !updTuples && !a.has(relAllVisible) {
 		return NewBoolDatum(result), nil
 	}
 	pages, rows := 0, int64(0)
@@ -612,6 +613,9 @@ func evalPgRestoreRelationStats(x *optimizer.FuncCall, slot SlotView, ctx *Conte
 		stats = &cp
 	}
 	stats.Pages, stats.RowCount, stats.Analyzed = pages, rows, analyzed
+	if a.has(relAllVisible) {
+		stats.AllVisible, stats.AllVisibleSet = int32(uint32(a.vals[relAllVisible].Int)), true
+	}
 	ctx.Catalog.SetTableStats(tbl, stats)
 	if werr := persistRelSize(ctx, tbl, rows, pages); werr != nil {
 		_ = werr
