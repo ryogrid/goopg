@@ -5544,7 +5544,7 @@ func datumToInt64Key(d Datum) (int64, bool) {
 	case KindInt:
 		return d.Int, true
 	case KindNumeric:
-		if d.NumericBigValue() != nil {
+		if isBigNumeric(d) {
 			return 0, false // overflow lane: not representable as int64
 		}
 		m, s := d.NumericMantissaValue(), int(d.Scale)

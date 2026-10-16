@@ -1223,6 +1223,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - `seqScanOp.Next` uses `PageGetHeapTupleNoCopy` \(PG's in\-place read under the pin\) instead of copying each
       tuple into a scratch buffer, which was 6.5% memmove on Q1. Every Data/Bitmap use precedes the tuple's RUnlock.
     - Q1 median went from ~1563 ms to ~1505 ms \(about −3.5%\).
+  - **Slice 14 — the numeric fast paths test the big\-lane flag LANDED 2026\-10\-16 \(loop \#51\).** Movement: none
+    — perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS. Recon doc "Slice 14".
+    - numericAdd/Sub/Mul/Div/Cmp, numericMant and datumToInt64Key test `isBigNumeric` \(an inlined flag test\)
+      instead of calling the non\-inlinable `NumericBigValue` for its nil result. That is exact, because
+      NumericBigValue is nil iff the flag is clear. Pinned by `TestIsBigNumericMatchesNumericBigValue`.
+    - Q1 median went from ~1490 ms to ~1455 ms \(about −2.4%\). Next levers: the int literal promoted per row, and
+      the stack\-returned arithmetic Datums.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

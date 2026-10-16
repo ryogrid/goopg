@@ -486,3 +486,29 @@ noise.
 
 **Gates:** units, the full `TestPort_Isolation*` family (this changes how the scan touches shared page memory),
 tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
+
+## Slice 14 (2026-10-16): the numeric fast paths test the big-lane flag
+
+numericAdd, numericSub, numericMul, numericDiv and numericCmp chose the int64 lane with
+`a.NumericBigValue() == nil && b.NumericBigValue() == nil`. `NumericBigValue` is not inlinable, so every numeric
+operation paid two calls just to learn that the flag was clear; on a flagged value it would also decode a
+`*big.Int` only to compare it with nil. The new helper `isBigNumeric(d)` is `d.Flags&flagBigNumeric != 0`, and it
+inlines at all 17 call sites. `numericMant` and `datumToInt64Key` use it too.
+
+The swap is exact. `NumericBigValue` returns nil only when the flag is clear; every flagged path returns a value,
+including a zero `big.Int` when the arena is gone. `TestIsBigNumericMatchesNumericBigValue` checks the two agree on
+the int64 lane, a stored big mantissa, a flagged datum with no arena and non-numeric kinds. It also checks that a
+big operand still takes the exact lane.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `fc4087fc1` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1507 / 1506 / 1499 / 1504 | 1462 / 1473 / 1461 / 1467 |
+| 2 | 1493 / 1510 / 1486 / 1474 | 1400 / 1417 / 1429 / 1447 |
+| 3 | 1490 / 1490 / 1472 / 1466 | 1444 / 1482 / 1491 / 1445 |
+
+That is median ~1490 → ~1455 ms, about −2.4 %. The candidate's median was lower in every round, but round 3
+overlaps. The acceptance arm returned identical values.
+
+**Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.

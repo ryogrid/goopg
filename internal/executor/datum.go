@@ -367,6 +367,13 @@ func (d Datum) NumericBigValue() *big.Int {
 	return bi
 }
 
+// isBigNumeric reports whether d is in the big-mantissa lane, which is exactly
+// when NumericBigValue returns non-nil (every flagged path returns a value). The
+// arithmetic hot paths test this instead of calling NumericBigValue for its nil
+// result: NumericBigValue is not inlinable, and on a flagged value it
+// materialises a *big.Int only to be compared against nil (M0122-0012).
+func isBigNumeric(d Datum) bool { return d.Flags&flagBigNumeric != 0 }
+
 // NumericScaleValue is the scale (digits after decimal) of KindNumeric.
 func (d Datum) NumericScaleValue() int16 { return d.Scale }
 
