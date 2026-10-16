@@ -3547,7 +3547,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > TPC\-H held\. Owner: confirm keeping it, or direct otherwise\.
   > Update 2026\-10\-16 \(M0146\-0212 close\): PG plans the same Sort over Gather on the unvacuumed tables, and goopg
   > plans Gather Merge after VACUUM\. The loss is the M0146\-0019 corpus residual, not a defect of 0211\.
-- [!] **M0146\-0213 — TPC\-H Q16: goopg plans a Parallel Seq Scan on partsupp where PG plans a Parallel Index Only
+- [x] **M0146\-0213 — TPC\-H Q16: goopg plans a Parallel Seq Scan on partsupp where PG plans a Parallel Index Only
   Scan on partsupp\_pk** \(filed 2026\-10\-16 by the S9 post\-VACUUM census, `routing\-20261016q`\)\.
   Kind: impl
   Parent: M0146-0014
@@ -3588,6 +3588,13 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     partsupp` \(needs M0146\-0196, REINDEX in a CREATE DATABASE'd db\), or a reload that creates indexes after the
     data. `lineitem\_pk` \(1.8×, the M0146\-0195 close row\) has the same cause. Expected: TPC\-H match 21 → 22. The task
     stays `[!]` until then, so the census does not re\-file Q16.
+  - **RESOLVED 2026\-10\-16 \(owner, review\-guided\):** M0146\-0196 closed first \(6a17a5154\), then `:65433` was
+    restarted on a 6a17a5154 build and both indexes rebuilt with **`REINDEX INDEX`, not `REINDEX TABLE`** —
+    surgical, so the deliberately insert\-built FK indexes \(near\-PG sizes that Q3/Q5/Q7/Q10's matches rest on\)
+    were not re\-bulk\-built. Measured on `:65433`: `partsupp\_pk` 5170 → **3078** \(PG 3082\), `lineitem\_pk` 41512 →
+    **23067** \(PG 23101\); every other index unchanged \(fk twins 16641/2220 intact\)\. Q16 now plans `Parallel
+    Index Only Scan using partsupp\_pk`, Workers Planned 4, cost 18812 vs PG's 19178 — the PG plan, and the Q16
+    result digest matches PG exactly \(md5 e0f93d05…, 18166 rows\)\. tpch\-spotcheck Q12=2/Q13=35 PASS\.
   Movement: none — instrument artefact: the corpus index was insert\-built by the replay, and the plan follows PG's
   once it is rebuilt \(clone\-verified\).
   - Expected instrument: TPC\-H PLAN\-PARITY match 21 → 22.
