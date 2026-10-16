@@ -4358,6 +4358,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Pin: TestPartialDistinctSplitArmReestimatesOverCrossingRows, mutation\-checked\.
     - Gates: units, tpch\-spotcheck, acceptance arm \(24 MATCH on values\), sf025 PASS=99 same=99, tpcds\-fireset
       \(Q38/Q87 SF1 results byte\-identical\), TestPort\_RegressSuite\.
+Movement: none — instrument artefact — the shipped census plans from goopg's own ANALYZE sample \(SF0\.25 86/99 held; SF1 74→73, Q87 filed M0146\-0218\); the PG\-statistics clones move Q38 \(SF0\.25\) and Q87 \(SF1\) to MATCH
 - [!] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
   \(filed 2026\-10\-16 by M0146\-0217 under R3\)\.
   Kind: regression
@@ -4371,3 +4372,27 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     engine\-side fix would have to make goopg's ANALYZE sample PG's rows, which M0146\-0215 slice 1 showed is not
     reproducible\.
   - Expected instrument: SF1 PLAN\-PARITY match 73→74 \(Q87\) after the import\.
+- [ ] **M0146\-0219 — aggregation\-strategy: TPC\-DS Q61 — PG plans each scalar FROM\-subquery aggregate as `Finalize
+  Aggregate → Gather → Partial Aggregate`, goopg as `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at
+  c2a4421fc\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q61, category aggregation\-strategy, verdict SHAPE\-DIFF at depth 3 \(under Nested Loop: PG
+    Finalize Aggregate \| goopg Aggregate\)\. The same pattern appears at SF1 as Q13 and Q48 \(depth 0\)\. Census:
+    `analysis/m0146/m0146\-0014/routing\-20261016z/`\.
+  - The record survives PG\-exact statistics: the SF1 census with the reference's statistics imported \(85/99\) keeps
+    Q13, Q23, Q26, Q48 and Q71 as aggregation\-strategy, and M0146\-0215's SF0\.25 import census keeps Q61\. So this
+    is planner logic, not sample variance\.
+  - S9 ranking: aggregation\-strategy 6, parallelism 4, sort\-strategy 3, join\-order 2, scan\-type 2\. This
+    excludes live\-task records and the records that the PG\-statistics import resolves \(routed to M0146\-0215 /
+    0218\)\.
+  - Costs \(SF0\.25 Q61, first subquery\):
+    - PG: Partial Aggregate 16964\.65, Gather 17964\.95, Finalize 17964\.98\.
+    - goopg: parallel join 16965\.92, Gather 17966\.22, Aggregate 17966\.24\.
+    The two are fuzzily equal, and add\_path's final tiny\-fuzz comparison keeps the strictly cheaper partial
+    path\.
+  - First step: check whether goopg generates the partial\-aggregate arm for a no\-GROUP\-BY aggregate in a FROM
+    subquery \(create\_partial\_grouping\_paths / gather\_grouping\_paths, planner\.c\), and how it is priced against
+    the plain arm\. Instrument addPath first \(memory planner\_verify\_both\_candidates\_generated\)\. Then compare
+    SF1 Q13/Q48, the top\-level form\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 86→87 \(Q61\), SF1 Q13/Q48\.
