@@ -4207,6 +4207,16 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       differ from PG's \(13866\.65 vs 13874\.27\). **Next slice:** add a `GOOPG_GEQO_TRACE` initial\-pool dump
       \(tour, worth\) mirroring GEQO\_DEBUG `print_pool`, build a GEQO\_DEBUG PG oracle \(tmp/pgdbg recipe\), and
       compare worths tour by tour. The first differing worth names the costing gap.
+  - **Slice 2 2026\-10\-16 \(loop \#56\): the remaining gap is physical. Gate: blocked\-on M0146\-0216\.** Design §6;
+    evidence in `analysis/m0146/m0146\-0214/physical/`\.
+    - Q64 leaf row estimates and seq\-scan costs are identical. Index scan costs differ \(`store\_returns\_pkey` IOS
+      4\.38 vs 5\.52 at SF0\.25\)\.
+    - pg\_class, goopg clone vs :65438: heap relpages and reltuples are identical; relallvisible differs on every
+      table \(goopg fully all\-visible\); index pages differ \(store\_returns\_pkey 277/280, store\_sales\_pkey
+      2481/2569\)\.
+    - Control: PG 18\.3 restored with `pg\_dump \-\-statistics` \(the reference's exact stats\) but freshly built
+      indexes picks a THIRD Q64 plan \(14022\.76 vs 13874\.27\)\. plancat\.c reads index pages, tree height and
+      heap blocks physically\. So Q64 needs physical parity first; resume this task after M0146\-0216\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -4238,3 +4248,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     marking\); if a heap/index page count still differs, the fix belongs to hio\.c bulk extension,
     heap packing, or nbtree bulk build per S9\(5\)\(c\) — not the planner\.
   - Expected instrument: TPC\-DS PLAN\-PARITY \(Q52, Q76 and any record the census re\-attributes\)\.
+  - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
+    draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
+    store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
+    `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
+    `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
+    `tmp/g14\-tpcds025\-stats\.sql`\.

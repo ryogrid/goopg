@@ -1,8 +1,9 @@
 # M0146-0214 — GEQO runs on PG's pg_prng and pg_qsort
 
 Status: slice 1 landed 2026-10-16. GEQO's random walk now reproduces PG 18.3's draw for draw. TPC-DS Q64, the
-GEQO-RNG record, still diverges: from `sort_pool` on, the walk follows tour fitness (path cost), which is not yet
-bit-identical to PG's. That is §5's next step.
+GEQO-RNG record, still diverges: from `sort_pool` on, the walk follows tour fitness (path cost). Slice 2 (§6)
+attributed the remaining divergence to physical inputs, the visibility map and index page counts, which
+M0146-0216 owns. The task is gated `blocked-on M0146-0216`.
 
 ## 1. The record
 
@@ -82,3 +83,27 @@ diverge. **Next step:** attribute the first fitness divergence.
 2. Build the PG oracle with `GEQO_DEBUG` (the `tmp/pgdbg` recipe).
 3. Compare the worths tour by tour. The first tour whose worth differs names the costing gap, which then routes
    like any other record.
+
+## 6. Slice 2 (2026-10-16): the fitness gap is physical
+
+Before instrumenting pool worths, the slice checked the cost inputs of Q64's leaves. At SF0.25, row estimates and
+seq-scan costs are identical in both captures, but index scans differ: `store_returns_pkey` costs 4.38 vs 5.52, and
+at SF1 4.74 vs 5.10 and `item_pkey` 7.41 vs 7.38. `pg_class` on a private clone of goopg's corpus against
+`:65438 tpcds025` (`analysis/m0146/m0146-0214/physical/`) shows:
+
+- heap `relpages` and `reltuples`: identical on every Q64 relation;
+- `relallvisible`: goopg is fully all-visible after the owner VACUUM, while PG keeps non-visible tails
+  (`store_returns` 1196/1232; `promotion`, `store` and `income_band` 0);
+- index pages: `store_returns_pkey` 277 vs 280, `store_sales_pkey` 2481 vs 2569.
+
+**Control experiment.** PG 18.3 on a scratch cluster restored with `pg_dump --statistics` from the reference had
+the reference's exact column and relation statistics, but freshly bulk-built indexes (198 and 1976 pages). It chose
+a third Q64 plan (cost 14022.76; the reference is 13874.27 and goopg 13866.65). PG reads index pages, tree height
+and heap block counts from the physical relations (`plancat.c` :475, :493, :1097); only `allvisfrac` comes from the
+statistic (:1112-1169). Identical statistics are therefore not enough: GEQO amplifies the physical deltas into a
+different tour, in PG itself.
+
+**Consequence.** Q64 needs physical parity first: VM all-visible state and index page counts at plan-identical
+precision. That is M0146-0216's scope (S9(5)(c)). After that, the tour-by-tour worth comparison of §5 becomes
+meaningful; before it, every tour's worth differs for a known reason. M0146-0214 is gated
+`blocked-on M0146-0216`.
