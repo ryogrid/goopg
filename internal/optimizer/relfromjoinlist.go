@@ -625,6 +625,17 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	// M0146-0222: the base relations' rows, for the enclosing problem's
+	// get_loop_count (baseRelInfo.subproblemBaseRows).
+	baseRows := map[int16]float64{}
+	for i, info := range infos {
+		if rel := s.findRel(RelSet(1) << uint(i)); rel != nil && info.sourceIdx >= 0 && info.table != nil {
+			baseRows[info.sourceIdx] = rel.Rows
+		}
+		for k, v := range info.subproblemBaseRows {
+			baseRows[k] = v
+		}
+	}
 	s.rootCheapestTotal = prob.rootCheapestTotal
 	// C-08: publish the item run beside the clause list — the
 	// param_source_rels derivation remaps statement-global SJI hands
@@ -827,7 +838,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// the built node by `initialRelRows` — the pathlist-and-rows collapse
 		// this boundary performs (file header; ledgered).
 		binding: rangeBinding{offset: base},
-		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts},
+		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows},
 		lo:      lo,
 		hi:      hi,
 		// R21 slice 1: the chosen path's parent rel — the search's own

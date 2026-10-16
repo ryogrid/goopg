@@ -28,6 +28,7 @@ package optimizer
 
 import (
 	"math"
+	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -441,7 +442,7 @@ func (s *searchCtx) addParamIndexPathFor(rel *RelOptInfo, tbl *catalog.Table, ca
 		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && fullyBound,
 		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
-		loopCount:       s.loopCountFor(rel, req),
+		loopCount:       s.loopCountForKeys(rel, req, paramOuterKeys(bound)),
 		// R1 (plan-parity-fix-take2): qpquals are the clauses evaluated on
 		// the HEAP tuple — PG's `cost_index` takes them as
 		// `baserestrictinfo + ppi_clauses` minus the index quals
@@ -606,7 +607,7 @@ func (s *searchCtx) addParamSkipPathFor(rel *RelOptInfo, tbl *catalog.Table, cat
 	if !boundCounted {
 		boundSel = 1
 	}
-	loopCount := s.loopCountFor(rel, req)
+	loopCount := s.loopCountForKeys(rel, req, paramOuterKeys(bound))
 	if rows > maxSkipProbeRows || (loopCount > 0 && rows*loopCount > maxSkipProbeLifetimeRows) {
 		return false
 	}
@@ -959,6 +960,19 @@ func (s *searchCtx) movableNonEquiJoinSelectivity(rel *RelOptInfo, req RelSet) f
 // probed rel is outside of can supply the parameter only once unique-ified, so
 // its unique row count stands in for its raw rows.
 func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
+	return s.loopCountForKeys(cur, req, nil)
+}
+
+// loopCountForKeys is loopCountFor with the parameter's outer values. Those
+// name, through their columns' SourceTableIdx, the base relations that
+// supply the parameter when an outer rel is a searched sub-problem leaf
+// (M0146-0222). Such a leaf stands for a whole sub-joinlist. PG keeps that as
+// a joinrel, and get_loop_count iterates the base relids of required_outer,
+// so a probe driven by one base relation inside it is repeated once per row
+// of that relation, not once per row of the sub-joinlist's result. TPC-DS Q72's
+// date_dim d3 probe on catalog_sales.cs_ship_date_sk is the case: the leaf
+// returns 1 row, while catalog_sales has 360397.
+func (s *searchCtx) loopCountForKeys(cur *RelOptInfo, req RelSet, outerKeys []Expr) float64 {
 	if req == 0 {
 		return 1
 	}
@@ -967,7 +981,11 @@ func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
 		if rel == nil || rel.Relids&req == 0 || rel.Rows <= 0 {
 			continue
 		}
-		rowcount := s.adjustRowcountForSemijoins(cur, rel, rel.Rows)
+		rows := rel.Rows
+		if base, ok := s.subproblemSupplierRows(rel, outerKeys); ok {
+			rows = base
+		}
+		rowcount := s.adjustRowcountForSemijoins(cur, rel, rows)
 		if result == 0 || rowcount < result {
 			result = rowcount
 		}
@@ -976,6 +994,29 @@ func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
 		return result
 	}
 	return 1
+}
+
+// subproblemSupplierRows returns the smallest base-relation row count among
+// the relations inside sub-problem leaf rel that the parameter values read,
+// or false when rel is not such a leaf or no value names a relation inside it.
+func (s *searchCtx) subproblemSupplierRows(rel *RelOptInfo, outerKeys []Expr) (float64, bool) {
+	if s == nil || len(outerKeys) == 0 || relLevel(rel.Relids) != 1 {
+		return 0, false
+	}
+	idx := bits.TrailingZeros32(uint32(rel.Relids))
+	if idx < 0 || idx >= len(s.relInfos) || s.relInfos[idx].subproblemBaseRows == nil {
+		return 0, false
+	}
+	base := s.relInfos[idx].subproblemBaseRows
+	best, found := 0.0, false
+	for _, k := range outerKeys {
+		walkColumnRefsImpl(k, nil, func(c *ColumnRef) {
+			if r, ok := base[c.SourceTableIdx]; ok && r > 0 && (!found || r < best) {
+				best, found = r, true
+			}
+		}, func() {})
+	}
+	return best, found
 }
 
 // adjustRowcountForSemijoins is `adjust_rowcount_for_semijoins`
@@ -1152,4 +1193,13 @@ func boundPrefixClauses(bound []paramIndexClause, clauses []indexPathClause) []p
 		}
 	}
 	return keep
+}
+
+// paramOuterKeys lists the outer values that bind a probe's clauses.
+func paramOuterKeys(bound []paramIndexClause) []Expr {
+	out := make([]Expr, 0, len(bound))
+	for _, c := range bound {
+		out = append(out, c.outerKey)
+	}
+	return out
 }

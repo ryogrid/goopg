@@ -229,9 +229,9 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 //     INNER joins into the search. Written as a real test anyway, against the
 //     joinrel's own type, so relaxing the pin does not silently admit the shape
 //     PG refuses here.
-//  6. the `inner_unique` ppi-serial coverage test (:752): goopg's search never
-//     marks a join inner-unique, so PG's arm is unreachable from the false
-//     branch. Ledgered.
+//  6. the `inner_unique` ppi-serial coverage test (:752): applied by the NLI
+//     arm's caller (nliMemoizeCandidate, M0146-0222), which holds the pair's
+//     extra->inner_unique (extraInnerUnique) and its residual join clauses.
 //  7. volatile functions in the inner's target list, base restrictions, or
 //     parameterised clauses (:773-799): subsumed by the key-shape test below —
 //     every cache key must be a bare `*ColumnRef`, and a column reference is

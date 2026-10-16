@@ -670,7 +670,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
-		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(rel, req))
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountForKeys(rel, req, boundOuterKeys(bound)))
 	child := &Path{
 		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
@@ -712,4 +712,13 @@ func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
 		}
 	}
 	return false
+}
+
+// boundOuterKeys lists the outer values of a bitmap probe's bound clauses.
+func boundOuterKeys(bound map[string]paramIndexClause) []Expr {
+	out := make([]Expr, 0, len(bound))
+	for _, c := range bound {
+		out = append(out, c.outerKey)
+	}
+	return out
 }

@@ -1,7 +1,7 @@
 # M0146-0222 — TPC-DS Q72: Memoize on a unique join, and loop counts for probes driven by a prebuilt leaf
 
-Status: slice 1 (get_memoize_path's inner_unique test) landed 2026-10-17. Slice 2 (loop counts under a prebuilt
-search leaf) is open. Evidence: `analysis/m0146/m0146-0222/`.
+Status: slice 1 (get_memoize_path's inner_unique test) and slice 2 (loop counts under a sub-problem leaf) landed
+2026-10-17. The record stays open (§5). Evidence: `analysis/m0146/m0146-0222/`.
 
 ## 1. Record
 
@@ -62,9 +62,48 @@ goopg's unsorted join was 15267.48, 224 lower. The plans differ in two places.
 
 **Pin:** `TestNLIMemoizeRefusesUniqueJoinWithFilter`. Mutation-checked: dropping the gate fails it.
 
-## 4. Slice 2 (open)
+## 4. Slice 2 (landed): get_loop_count through a sub-problem leaf
 
-`loopCountFor` must not take a prebuilt leaf's output rows as the loop count. PG's `get_loop_count` iterates the
-base rels in `required_outer`. For a parameter supplied by a column of a base rel that sits inside a prebuilt leaf,
-that is the base rel's own rows, as the inner search sized it. The resume point is `pathparamindex.go loopCountFor`:
-map the parameter's source column (`SourceTableIdx`) through the prebuilt leaf to the base rel it came from.
+Q72's explicit `JOIN` chain is longer than `join_collapse_limit` (8), so its first eight relations are searched as a
+sub-problem.
+
+- PG keeps the result as a joinrel whose base relids stay visible to the enclosing search.
+- goopg enters it as one leaf, with the sub-problem's output rows (1 here) and nothing else.
+
+`get_loop_count` takes the smallest row count among the base rels in `required_outer`. goopg's `loopCountFor` took
+the leaf's rows instead, which priced the `d3` probe on `catalog_sales.cs_ship_date_sk` as a single execution.
+
+- A sub-problem leaf now records `baseRelInfo.subproblemBaseRows`: the row count its own search gave each base
+  relation, keyed by source table, with nested sub-problems merged in.
+- `loopCountForKeys` resolves the probe's outer values (`paramIndexClause.outerKey`) through their columns'
+  `SourceTableIdx` to those base rows. When none resolves, it falls back to the leaf's own rows.
+- The three call sites pass their bound clauses: the parameterized index probe, the skip probe and the
+  parameterized bitmap path.
+
+**Measured:**
+- `d3` now prices at 0.29..0.33, identical to PG.
+- With PG statistics, goopg's unsorted join is 15466.64 against PG's 15491.68. Of the remaining 25, about 24.5 is
+  `inventory_pkey`'s stale geometry (100.60 against 101.89 per probe over about 19 rows; M0146-0216's owner reload).
+- Census verdicts are unchanged on every corpus. The fired Q72 results are byte-identical at both scales.
+
+**Pin:** `TestLoopCountReadsSubproblemBaseRows`, covering the supplying base relation, the fallbacks, and the
+smallest of two suppliers. Mutation-checked.
+
+The slice also updates `joinpathsmemoize.go`'s gate-6 comment, which slice 1 left stale.
+
+## 5. What still separates Q72 from PG
+
+With PG statistics (`probe2/`), goopg's outer top rel holds PG's two arms, but in the opposite order:
+
+| arm | goopg | PG |
+|---|---|---|
+| sorted (order from the Gather Merge below) | 15459.92..15474.87 | 15475.87..15490.79 |
+| unsorted | 1160.17..15474.80 (0.07 cheaper) | 1160.03..15491.68 (0.89 dearer) |
+
+1. **Index geometry** shifts both of goopg's arms by about 16 against PG's; this is owner-gated (M0146-0216).
+2. **A 0.96 difference in the arms' relative cost.** Next slice: compare the sub-problem's Gather Merge → Sort
+   (goopg 15459.75) and Gather (15459.68) arms term by term with PG's.
+3. **The sub-problem boundary passes no partial paths.** With `enable_gathermerge = off`, PG's best plan runs the
+   whole join, `d3` and `promotion` included, inside the workers under a Partial GroupAggregate. goopg cannot form
+   that, because a sub-problem leaf has no partial pathlist. The pathlist collapse at this boundary is already
+   ledgered.

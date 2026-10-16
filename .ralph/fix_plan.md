@@ -4532,6 +4532,17 @@ Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 
     - Pin: TestNLIMemoizeRefusesUniqueJoinWithFilter, mutation\-checked\.
     - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(Q72 plan text changed\), fireset PASS \(byte\-identical\),
       TestPort\_RegressSuite\.
-  - **Slice 2 \(next\): loopCountFor under a prebuilt leaf\.** PG's get\_loop\_count iterates the base rels in
-    required\_outer\. A parameter column inside a prebuilt leaf must use its base rel's own rows, not the leaf's output
-    rows\. Resume: pathparamindex\.go loopCountFor; map the parameter's source column through the leaf to its base rel\.
+  - **Slice 2 LANDED 2026\-10\-17 \(loop \#69\): get\_loop\_count through a sub\-problem leaf\.**
+    - A sub\-problem leaf records baseRelInfo\.subproblemBaseRows, keyed by source table\. loopCountForKeys maps a
+      probe's outer values through SourceTableIdx to those rows, at the param index, skip and bitmap producers\.
+    - The d3 probe is now 0\.29\.\.0\.33, PG\-identical; census verdicts unchanged\.
+    - Pin: TestLoopCountReadsSubproblemBaseRows, mutation\-checked\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS on rerun \(the first run stalled on a
+      4\-minute SF1 clone start past the capture's 120 s readiness window\), TestPort\_RegressSuite\.
+  - **Next \(slice 3\): the arms' relative cost\.**
+    - With PG statistics, goopg's sorted arm is 15474\.87 against unsorted 15474\.80, a 0\.07 margin; PG has sorted
+      15490\.79 against unsorted 15491\.68, a 0\.89 margin the other way\.
+    - Compare the sub\-problem's gather\.merge\.sort \(15459\.75\) and gather \(15459\.68\) arms term by term against PG's
+      on the replica \(probe2/\)\.
+    - Index geometry, a 16 shift, is owner\-gated \(M0146\-0216\)\. The sub\-problem boundary passing no partial paths is
+      ledgered\.

@@ -1007,6 +1007,14 @@ type baseRelInfo struct {
 	// the sub-problem's whole RelOptInfo, so every path it kept is a
 	// candidate there, not only the cheapest. Nil for any other leaf.
 	subproblemAlts func() []Node
+	// subproblemBaseRows records, for a searched sub-problem leaf, the row
+	// count its own search gave each base relation inside it, keyed by
+	// source table (ColumnRef.SourceTableIdx). Nested sub-problems' entries
+	// are merged in. PG keeps a sub-joinlist's result as a joinrel whose
+	// base relids stay visible, so get_loop_count (indxpath.c) still reads a
+	// base relation's own rows for a probe parameterized by one of its
+	// columns (M0146-0222). Nil for any other leaf.
+	subproblemBaseRows map[int16]float64
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
