@@ -1151,17 +1151,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(per\-node dispatch, recursion\), not Datum copies. The next slice is
       batch evaluation in the scan \(the SeqScanOp entry\), keeping the
       `currentTID` read\-ahead rule.
-  - **Batch qual evaluator READY 2026\-10\-16 \(loop \#41\), NOT committed — blocked on the
-    tpcds\-fireset gate.** The SF1 lane refuses while `bench/tpcds/runtime\_goopg/data` is live \(owner server
-    pid 1702919, `/tmp/goopg\-bin\-vac0206`, :65436, up since 08:59\). The hook accepts SKIP\-BLOCKED only under
-    an owner row in `.ralph/gate\-exceptions.md`. The change is saved as
-    `analysis/m0122/m0122\-0012/s7\-batch\-evaluator.pending.patch` \(code, test, design doc
-    `0122\-0012b\-scan\-batch\-qual.md`, README row\); the tree was restored to HEAD.
-    - Gates already PASSED on the combined tree \(HEAD f2c219817 \+ patch\): units, tpch\-spotcheck,
-      acceptance arm \(values identical\), sf025 PASS=99, fire\-set SF0.25 lane fires=none, ea\-ratchet,
-      TestPort\_RegressSuite. Only the SF1 lane is missing.
-    - Resume: `git apply` the patch, stage it, re\-run the gates \(stamps must match the staged code\_tree\),
-      commit, and delete the .pending.patch.
+  - **Batch qual evaluator LANDED 2026\-10\-16 \(loop \#42\), no caller yet.**
+    Movement: none — infrastructure; no production path changes \(plan text
+    identical\). Design: `docs/design/0100-0149/0122-0012b-scan-batch-qual.md`.
+    - Parked one loop as a pending patch. The cause was misread as the
+      fire\-set SF1 lane being blocked: `internal/executor/` is outside the
+      fire\-set scope, and the real rejection was a code\_tree mismatch after
+      peer commit a181f6bfd landed mid\-gate. Gates were re\-run on the
+      combined tree.
     - `evalFastExprBatch` \(exprnode\_batch.go\) is total over the slab: leaves
       and BinaryOp are specialised, AND/OR short\-circuit by sub\-selection,
       every other kind goes per row. On any error the caller re\-runs per row.
