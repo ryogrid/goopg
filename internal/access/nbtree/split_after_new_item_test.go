@@ -191,3 +191,60 @@ func TestLocalizedAscendingInsertsPackLeaves(t *testing.T) {
 			interleaved, ascending)
 	}
 }
+
+// TestInsertBuiltCompositeIndexMatchesPGPageCount pins the _bt_findsplitloc
+// port (M0146-0216: delta sort, split interval, suffix-truncation penalty,
+// duplicate strategies) against PostgreSQL 18.3. Each workload inserts 60000
+// unique (int4, int4) keys in a scrambled order into a two-column primary key,
+// with heap TIDs laid out as PG lays them: 226 two-int4 rows per heap page,
+// offsets from 1. The page counts are pg_relation_size / 8192 of the same
+// INSERT ... SELECT run on a PG 18.3 scratch cluster (the tmp/pgdbg build),
+// for example:
+//
+//	CREATE TABLE splitpin_a (k1 int, k2 int, PRIMARY KEY (k1, k2));
+//	INSERT INTO splitpin_a SELECT (g*7919)%5000, g/5000 FROM generate_series(1,60000) g;
+//
+// Before the port, goopg cut at the single best-balanced split and built
+// 269 / 249 / 304 pages.
+func TestInsertBuiltCompositeIndexMatchesPGPageCount(t *testing.T) {
+	const rows, perPage = 60000, 226
+	for _, tc := range []struct {
+		name   string
+		key    func(g int64) (int32, int32)
+		pgPage storage.BlockNumber
+	}{
+		{"a (g*7919)%5000, g/5000", func(g int64) (int32, int32) { return int32((g * 7919) % 5000), int32(g / 5000) }, 273},
+		{"b g%911, (g*104729)%1000003", func(g int64) (int32, int32) { return int32(g % 911), int32((g * 104729) % 1000003) }, 199},
+		{"c (g/50)%400, g", func(g int64) (int32, int32) { return int32((g / 50) % 400), int32(g) }, 288},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desc := pairDesc()
+			mgr := storage.NewManager(storage.ManagerConfig{DataDir: t.TempDir()})
+			pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 256})
+			if err != nil {
+				t.Fatalf("NewPool: %v", err)
+			}
+			defer func() { _ = pool.Close(); _ = mgr.Close() }()
+			rel := storage.RelFileNode{DBOid: 1, RelOid: 9216, Fork: storage.MainFork}
+			bt, err := CreateWithOptions(pool, rel, Options{KeyDesc: desc})
+			if err != nil {
+				t.Fatalf("CreateWithOptions: %v", err)
+			}
+			for g := int64(1); g <= rows; g++ {
+				k1, k2 := tc.key(g)
+				i := g - 1
+				tid := storage.ItemPointer{Block: storage.BlockNumber(i / perPage), Offset: uint16(i%perPage + 1)}
+				if err := bt.Insert(tup(t, desc.Attrs, [][]byte{int4Val(k1), int4Val(k2)}, tid), tid); err != nil {
+					t.Fatalf("Insert(%d,%d): %v", k1, k2, err)
+				}
+			}
+			n, err := pool.NBlocks(rel)
+			if err != nil {
+				t.Fatalf("NBlocks: %v", err)
+			}
+			if n != tc.pgPage {
+				t.Fatalf("built %d pages, PG 18.3 builds %d", n, tc.pgPage)
+			}
+		})
+	}
+}

@@ -4308,6 +4308,21 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       TestPort\_RegressSuite, TestPort\_Isolation\*\.
     - Remaining: corpus index refresh \(owner reload\); the residual 0\-3% split\-location gap against
       \_bt\_findsplitloc \(next engine slice\)\.
+  - **Slice 3 LANDED 2026\-10\-16 \(loop \#59\): \_bt\_findsplitloc's interval and suffix\-truncation penalty\.**
+    Design §6; evidence `analysis/m0146/m0146\-0216/split/`\.
+    - goopg cut a leaf at the single best\-balanced split. PG sorts all legal splits by delta \(pg\_qsort\), bounds an
+      interval \(LEAF\_SPLIT\_DISTANCE\), and picks the lowest \_bt\_keep\_natts\_fast penalty, with the
+      many\-duplicates and single\-value strategies\. Ported in nbtree/splitloc\.go; the shared splitCandidates
+      enumeration keeps both paths' pricing identical\.
+    - SF0\.25 replay \(scratch PG reproduces the reference exactly\): inventory 12774→**12606**, catalog\_sales
+      1226→**1250**, store\_returns 277→**280**, catalog\_returns 138→**137**, web\_sales 598 \(all = PG\);
+      store\_sales 2496→2567 \(PG 2569\)\. inventory is leaf\-sequence identical\. The store\_sales residual traces to
+      heap TIDs: PG's COPY reuses earlier pages' free space through the FSM \(hio\.c\); ledger\.
+    - Pin: TestInsertBuiltCompositeIndexMatchesPGPageCount \(PG\-measured 273/199/288; HEAD 269/249/304\),
+      mutation\-checked\.
+    - Gates: nbtree \-race, units, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99, TestPort\_RegressSuite,
+      TestPort\_Isolation\*\.
+    - Shipped corpora are unchanged until they are reloaded on this engine \(owner\-index\-refresh\)\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.

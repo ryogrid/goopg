@@ -3021,9 +3021,23 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	)
 	if exactMid > 0 && bt.format().compactSplitAtFits(allItems, pageDataBudget(), rightBudget, exactMid) {
 		mid, splitOK = exactMid, true
+	} else if op.IsLeaf() && bt.format().desc != nil {
+		// _bt_findsplitloc's interval and suffix-truncation penalty choice
+		// (M0146-0216). An exact cut that does not fit falls back to 50:50
+		// (fillfactormult 0.50, unweighted), as upstream's defensive branch
+		// does.
+		useMult := fillMult > 0
+		mult := fillMult
+		if !useMult {
+			mult = 0.50
+		}
+		var hikey []byte
+		if inheritedOK {
+			hikey = inheritedHK
+		}
+		mid, splitOK = bt.format().pgFindSplitLoc(allItems, indexOfItem(allItems, it), pageDataBudget(), rightBudget,
+			hikey, rightmost, mult, useMult)
 	} else {
-		// An exact cut that does not fit falls back to 50:50, as upstream's
-		// defensive branch does.
 		mid, splitOK = bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget, fillMult)
 	}
 	if !splitOK {
@@ -4159,9 +4173,42 @@ func (f indexFormat) compactSplitAtFits(items []item, leftBudget, rightBudget, m
 // each half's budget less its compact footprint, the left half also paying for
 // the separator, as _bt_recsplitloc charges it.
 func (f indexFormat) compactSplitLocFill(items []item, leftBudget, rightBudget int, fillMult float64) (int, bool) {
+	bestMid, bestSkew, found := 0, 0.0, false
+	for _, c := range f.splitCandidates(items, leftBudget, rightBudget) {
+		var skew float64
+		if fillMult > 0 {
+			skew = math.Abs(fillMult*float64(c.leftfree) - (1-fillMult)*float64(c.rightfree))
+		} else {
+			skew = math.Abs(float64(c.left - c.right))
+		}
+		if !found || skew < bestSkew {
+			bestMid, bestSkew, found = c.m, skew, true
+		}
+	}
+	return bestMid, found
+}
+
+// splitCand is one legal split point, upstream's SplitPoint (nbtsplitloc.c):
+// items[:m] go left, items[m:] right. left/right are the halves' compact
+// footprints; leftfree/rightfree are _bt_recsplitloc's free space, the left
+// half also paying for the new high key (firstright plus a heap TID, the leaf
+// worst case).
+type splitCand struct {
+	m                   int
+	left, right         int
+	leftfree, rightfree int
+	curdelta            int16
+}
+
+// splitCandidates enumerates every legal split of items, in ascending m, which
+// is the order _bt_findsplitloc records them in (by firstrightoff, with "new
+// item first on the right" before "new item last on the left"). It is shared
+// by compactSplitLocFill and pgFindSplitLoc, so both price a candidate the
+// same way.
+func (f indexFormat) splitCandidates(items []item, leftBudget, rightBudget int) []splitCand {
 	n := len(items)
 	if n < 2 {
-		return 0, false
+		return nil
 	}
 	const itemIDSize = 4 // matches storage.itemIDSize
 	// Run boundaries: starts[r] is the index of run r's first item, and
@@ -4188,7 +4235,7 @@ func (f indexFormat) compactSplitLocFill(items []item, leftBudget, rightBudget i
 	for r := nr - 1; r >= 0; r-- {
 		suffix[r] = suffix[r+1] + f.runFootprint(items[starts[r]].key, starts[r+1]-starts[r])
 	}
-	bestMid, bestSkew, found := 0, 0.0, false
+	var out []splitCand
 	r := 0
 	for m := 1; m < n; m++ {
 		for starts[r+1] <= m {
@@ -4204,19 +4251,10 @@ func (f indexFormat) compactSplitLocFill(items []item, leftBudget, rightBudget i
 		if left+sepCharge > leftBudget || right > rightBudget {
 			continue
 		}
-		var skew float64
-		if fillMult > 0 {
-			leftFree := float64(leftBudget - left - sepCharge)
-			rightFree := float64(rightBudget - right)
-			skew = math.Abs(fillMult*leftFree - (1-fillMult)*rightFree)
-		} else {
-			skew = math.Abs(float64(left - right))
-		}
-		if !found || skew < bestSkew {
-			bestMid, bestSkew, found = m, skew, true
-		}
+		out = append(out, splitCand{m: m, left: left, right: right,
+			leftfree: leftBudget - left - sepCharge, rightfree: rightBudget - right})
 	}
-	return bestMid, found
+	return out
 }
 
 // readPageItem (M0055-0002 Phase A) decodes a single item at the
