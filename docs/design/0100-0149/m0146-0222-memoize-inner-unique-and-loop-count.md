@@ -107,3 +107,29 @@ With PG statistics (`probe2/`), goopg's outer top rel holds PG's two arms, but i
    whole join, `d3` and `promotion` included, inside the workers under a Partial GroupAggregate. goopg cannot form
    that, because a sub-problem leaf has no partial pathlist. The pathlist collapse at this boundary is already
    ledgered.
+
+## 6. Slice 3 recon (2026-10-17): the arms' order is decided by startup tie-breaks
+
+Probes on the replica (`probe3/`) and goopg's trace give the 8-rel joinrel (cs, inventory, warehouse, item, cd, hd,
+d1, d2):
+
+- **PG** keeps the serial `(7 without item) ⋈ item` Nested Loop at 1159.74..15476.58, generated first. It rejects
+  `(7 without warehouse) ⋈ warehouse` at 1159.87..15475.63 and the top Gather at 1159.87..15475.63. All three are
+  fuzz-equal on total. On the tight fuzz each newcomer is better on total but worse on startup; the rel has
+  `consider_startup` (Q72's `LIMIT`), so the result is COSTS_DIFFERENT and `add_path` keeps the incumbent. PG's
+  unsorted arm is therefore 0.88 above its Gather Merge → Sort arm (15475.70).
+- **goopg** generates the same pairs in the same order, because its base order matches PG's range-table order. But
+  it costs them with the 0.13 startup on the other pair:
+
+  | pair | goopg |
+  |---|---|
+  | (7 without item) ⋈ item | 1159.87..15459.68, kept |
+  | (7 without warehouse) ⋈ warehouse | 1159.74..15460.64, rejected |
+
+  So goopg's unsorted arm sits 0.07 below its Gather Merge → Sort arm, and the top sort wins.
+
+The startups trace down: PG's outer 7-rel paths start at 1159.45 / 1159.74, goopg's at 1159.58 / 1159.61. That
+puts PG's base parallel subtree at about 1159.32 and goopg's at 1159.45. The 0.13 originates in the 6-rel partial
+paths around the d2 join; PG's startup increment there (+0.16) is not a plain index probe's 0.29.
+
+**Next:** log the 6-rel partial paths (`add_partial_path`) on both sides and find the node whose startup differs.

@@ -4539,6 +4539,13 @@ Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 
     - Pin: TestLoopCountReadsSubproblemBaseRows, mutation\-checked\.
     - Gates: units, spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS on rerun \(the first run stalled on a
       4\-minute SF1 clone start past the capture's 120 s readiness window\), TestPort\_RegressSuite\.
+  - **Slice 3 recon \(loop \#70\): the arms' order is decided by add\_path startup tie\-breaks\.** Design §6;
+    `analysis/m0146/m0146\-0222/probe3/`\.
+    - The two 8\-rel Nested Loops are fuzz\-equal\. Under consider\_startup the incumbent wins COSTS\_DIFFERENT, and both
+      engines generate the pairs in the same order\. But goopg's 0\.13 startup sits on the other pair, so it keeps the
+      cheaper\-total unsorted path\.
+    - Root: PG's base parallel subtree starts at 1159\.32, goopg's at 1159\.45\. The difference originates in the 6\-rel
+      partial paths around the d2 join; next, log add\_partial\_path on both sides\.
   - **Next \(slice 3\): the arms' relative cost\.**
     - With PG statistics, goopg's sorted arm is 15474\.87 against unsorted 15474\.80, a 0\.07 margin; PG has sorted
       15490\.79 against unsorted 15491\.68, a 0\.89 margin the other way\.

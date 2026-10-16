@@ -1,0 +1,10 @@
+M25J nl startup=1159.7400 total=15476.5846 accept=1 outer=(b 1 2 4 8 10 12 14) inner=(b 6) innertype=341
+M25J nl startup=1159.7400 total=15476.5847 accept=0 outer=(b 1 2 4 8 10 12 14) inner=(b 6) innertype=341
+M25J nl startup=1159.7400 total=15476.5846 accept=0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=339
+M25J nl startup=1159.8725 total=15475.6280 accept=0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=341
+M25J nl startup=1159.7400 total=15476.6096 accept=0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=360
+M25J nl startup=15475.4221 total=15476.6571 accept=1 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=339
+M25J nl startup=15475.5546 total=15475.7005 accept=0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=341
+M25J nl startup=15475.4221 total=15476.6821 accept=0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=360
+M25J nl startup=1159.7400 total=15476.5996 accept=0 outer=(b 4) inner=(b 1 2 6 8 10 12 14) innertype=360
+M25J nl startup=1159.8725 total=15487.7571 accept=0 outer=(b 4) inner=(b 1 2 6 8 10 12 14) innertype=360
