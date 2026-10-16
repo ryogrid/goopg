@@ -2957,6 +2957,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-16 — **exhausted at `378ad9ecf`** \(M0122\-0012 slice 5 changed internal/executor\)\.
     Census `routing\-20261016p` uses a fresh TPC\-H capture plus the fire\-set\-s5 candidate captures\. The records are
     byte\-identical to `routing\-20261016o` \(20/22, 84/99, 73/99\)\. No task is filed; the gates are unchanged\.
+  - S9 pass 2026\-10\-16 at `63f48ac7c` \(post\-corpus\-VACUUM, fresh captures of all three corpora\) — **filed
+    M0146\-0213** \(scan\-type, TPC\-H Q16\); `routing\-20261016q/ROUTING.md`\. Matches: TPC\-H 21/22, SF0.25 86/99, SF1
+    74/99\. The VACUUM resolved TPC\-H Q13, SF0.25 Q23/Q84 and SF1 Q68.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -3504,6 +3507,25 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > TPC\-H held\. Owner: confirm keeping it, or direct otherwise\.
   > Update 2026\-10\-16 \(M0146\-0212 close\): PG plans the same Sort over Gather on the unvacuumed tables, and goopg
   > plans Gather Merge after VACUUM\. The loss is the M0146\-0019 corpus residual, not a defect of 0211\.
+- [ ] **M0146\-0213 — TPC\-H Q16: goopg plans a Parallel Seq Scan on partsupp where PG plans a Parallel Index Only
+  Scan on partsupp\_pk** \(filed 2026\-10\-16 by the S9 post\-VACUUM census, `routing\-20261016q`\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-H Q16, category scan\-type, verdict SHAPE\-DIFF, first divergence at depth 5 under the Parallel
+    Hash Join's outer side.
+    - PG: `Parallel Index Only Scan using partsupp\_pk on partsupp \(cost=350.43..19178.43 rows=100000\)`, with
+      Gather Merge Workers Planned: 4.
+    - goopg: `Parallel Seq Scan on partsupp \(cost=0.00..21257.81 rows=129032\)`, with Workers Planned: 3.
+  - The index path has no index condition. PG offers it because `check\_index\_only` holds: the query reads only
+    ps\_partkey and ps\_suppkey, both key columns. The heap is all\-visible since the owner corpus VACUUM, which
+    makes the heap\-fetch term near zero \(`build\_index\_paths`, `cost\_index`,
+    `postgres/src/backend/optimizer/path/indxpath.c`, `costsize.c`\).
+  - Its route was the M0146\-0019 corpus\-VACUUM residual; after the VACUUM it still diverges, so it is actionable.
+  - First step: check whether goopg's search generates a qual\-less \(full\) index\-only path and its parallel
+    variant for partsupp at all \(instrument `addPath`; memory: goopg's optimizer may lack such a path inside a
+    join tree\). Then compare the per\-worker row and worker counts \(`compute\_parallel\_worker` over heap and
+    index pages\).
+  - Expected instrument: TPC\-H PLAN\-PARITY match 21 → 22.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
   Kind: impl
