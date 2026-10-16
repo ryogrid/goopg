@@ -4329,3 +4329,20 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
     `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
     `tmp/g14\-tpcds025\-stats\.sql`\.
+- [ ] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
+  Gather Merge\), goopg sorts only** \(filed 2026\-10\-16 by the S9 pass at 4334a3714\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q38 \(and Q87, same shape\), category sort\-strategy, verdict SHAPE\-DIFF at depth 5\. PG:
+    `SetOp Intersect → Unique → Gather Merge → Unique → Sort` \(a per\-worker Unique over the sorted partial path,
+    create\_partial\_distinct\_paths, planner\.c:4852\)\. goopg: `Unique → Gather Merge → Sort`, with no worker\-side
+    Unique\. The same record appears at SF1 \(Q38\)\. Census `analysis/m0146/m0146\-0014/routing\-20261016y/`\.
+  - S9 ranking \(actionable first divergences, both TPC\-DS corpora, live\-task records excluded\): sort\-strategy 8,
+    join\-order 8, aggregation\-strategy 7, parallelism 5\. Tie broken toward the class with one repeated mechanism
+    \(Q38/Q87 at both scales\)\.
+  - First step: goopg already ports create\_partial\_distinct\_paths \(optimizer/distinctpaths\.go
+    addPartialDistinctPaths\)\. Find why a DISTINCT that is a set\-operation leg \(the INTERSECT/EXCEPT inputs\) does
+    not get it: whether the leg is planned through a path that skips the upper\-rel DISTINCT pipeline, or the
+    partial path is generated and loses on cost\. Instrument addPath first \(memory
+    planner\_verify\_both\_candidates\_generated\)\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match at SF0\.25 \(Q38, Q87\), then SF1\.
