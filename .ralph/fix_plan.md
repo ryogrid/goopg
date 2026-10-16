@@ -4372,7 +4372,7 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     engine\-side fix would have to make goopg's ANALYZE sample PG's rows, which M0146\-0215 slice 1 showed is not
     reproducible\.
   - Expected instrument: SF1 PLAN\-PARITY match 73→74 \(Q87\) after the import\.
-- [ ] **M0146\-0219 — aggregation\-strategy: TPC\-DS Q61 — PG plans each scalar FROM\-subquery aggregate as `Finalize
+- [x] **M0146\-0219 — aggregation\-strategy: TPC\-DS Q61 — PG plans each scalar FROM\-subquery aggregate as `Finalize
   Aggregate → Gather → Partial Aggregate`, goopg as `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at
   c2a4421fc\)\.
   Kind: impl
@@ -4396,3 +4396,21 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     the plain arm\. Instrument addPath first \(memory planner\_verify\_both\_candidates\_generated\)\. Then compare
     SF1 Q13/Q48, the top\-level form\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 86→87 \(Q61\), SF1 Q13/Q48\.
+  - **LANDED 2026\-10\-16 \(loop \#62\).** Design
+    `docs/design/0100\-0149/m0146\-0219\-scanjoin\-gather\-admission\.md`; evidence `analysis/m0146/m0146\-0219/`\.
+    - The divergence did not depend on the FROM nesting: the first subquery on its own plans the same way\.
+    - goopg's no\-split `Aggregate → Gather` arm beat the split arm \(17966\.24 against 17966\.27\)\.
+    - A PG add\_path probe showed that PG never files that arm\. generate\_gather\_paths \(override\_rows false, rel
+      rows\) puts the Gather on the topmost scan/join rel at 1017\.56\.\.17964\.74\. There the serial Nested Loop
+      1002\.48\.\.18131\.32 dominates it: fuzz\-equal total, earlier start\. The grouped rel only aggregates the paths
+      that survived\.
+    - Ported as scanJoinRelKeepsGather, the twin of M0146\-0190's Gather Merge check\. It gates every arm built over
+      the no\-split Gather\.
+    - Census: SF0\.25 86→88 \(Q61, Q16\); SF1 73→74 \(Q16\); TPC\-H 22/22; no regressions\. SF1 Q13's aggregation now
+      matches, and its first divergence moved deeper to qual\-placement\.
+    - Residual aggregation\-strategy records at SF1, left to the next S9 pass: Q48 \(depth 0; join estimates 434 vs
+      PG 531\), Q23, Q26 and Q71\.
+    - Pin: TestScanJoinRelDropsATiedGather, mutation\-checked\.
+    - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(plan\-shape changed=2: Q16,
+      Q61\), tpcds\-fireset PASS \(fired results byte\-identical\), TestPort\_RegressSuite\.
+Movement: yes — TPC\-DS SF0\.25 match 86→88, SF1 match 73→74

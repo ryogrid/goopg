@@ -1,0 +1,4 @@
+DPPATH path producer=upper.groupagg.plain relids=- kind=6 reqouter=- rows=1 startup=18131.229476623488 total=18131.241976623485 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=14 inputtotal=18131.22697662349
+DPPATH path producer=upper.partialgroupagg.partial relids=- kind=6 reqouter=- rows=1 startup=16965.923882194682 total=16965.93638219468 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=14 inputtotal=16965.921382194683
+DPPATH path producer=upper.groupagg.split relids=- kind=18 reqouter=- rows=1 startup=17966.25413219468 total=17966.266632194678 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=14 inputtotal=17966.24638219468
+DPPATH path producer=upper.groupagg.gathered relids=- kind=6 reqouter=- rows=1 startup=17966.228882194682 total=17966.24138219468 disabled=0 pathkeys=0 verdict=accepted jointype=inner outer=- inner=- width=14 inputtotal=17966.221382194683
