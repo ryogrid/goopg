@@ -4231,6 +4231,23 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     column is the documented suspect\); then port the deciding PG term \(clauselist/selfuncs row\-width
     or null\-fraction estimate\)\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY \(Q76\), then SF1\.
+  - **Slice 1 2026\-10\-16 \(loop \#57\): attributed — the divergence is ANALYZE sample variance, not planner
+    logic\.** Evidence: `analysis/m0146/m0146\-0215/`\.
+    - The first divergence is the catalog\_sales branch: PG nested\-loops into item\_pkey on 512 rows per worker;
+      goopg uses a Parallel Hash Join on 585\. Every branch's `IS NULL` estimate differs\.
+    - null\_frac: PG cs\_bill\_customer\_sk 0\.0044 / ss\_customer\_sk 0\.0447 / ws\_promo\_sk 0\.000233; goopg
+      0\.00503 / 0\.0451 / 0\.0002; exact 0\.00478 / 0\.0446 / 0\.000272\. Both are 30000\-row samples of the same
+      rows; PG's sampler seed is random per process \(pg\_global\_prng\_state\), so no code port reproduces its
+      sample\.
+    - Control: the tmp/pgdbg scratch PG with the reference's exact stats \(pg\_dump \-\-statistics\) reproduces the
+      reference's Q76 shape\. With only those three null\_frac values set to goopg's
+      \(pg\_restore\_attribute\_stats\), PG 18\.3 picks **goopg's exact plan** \(rows=585\)\. goopg's planner is
+      PG\-identical on Q76\.
+    - Width 298 vs 163 is the known unnarrowed planner width; it does not decide this plan\.
+    - Route: PG 18's statistics import, `pg\_restore\_attribute\_stats` / `pg\_restore\_relation\_stats`
+      \(statistics/attribute\_stats\.c, relation\_stats\.c\), so a corpus can carry the reference's exact
+      statistics\. goopg has the names only in the pg\_proc seed\. Importing into the bench corpora is an owner
+      action; the functions are engine work and are the next slice\.
 - [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
