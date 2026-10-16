@@ -887,7 +887,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
 - [ ] **Read\-only transactions are not enforced; `default\_transaction\_read\_only` is ignored** \(found 2026\-10\-14
   during the GUC registry work\)\.
   Kind: bug
-  Placement: S2 defect awaiting owner placement \(writes accepted where PG raises 25006\)\. It is filed without a
+  Placement: below item 10 \(owner decision 2026\-10\-16, S7 carve\-out\) — filed, does not displace parity work\.
+    Formerly "S2 defect awaiting owner placement" \(writes accepted where PG raises 25006\)\. It is filed without a
   parent because M0122\-0008\'s lineage budget is exhausted \(ralph\-lineage\-guard rule A\)\.
   - Repro on a fresh cluster:
     - `BEGIN READ ONLY; INSERT INTO t VALUES \(1\);` succeeds\. PG 18\.3 raises 25006 "cannot execute INSERT in
@@ -907,7 +908,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
 - [ ] **A rolled\-back DROP of a partition, an inheritance tree or a CASCADE target loses the table** \(found
   2026\-10\-14 during M0122\-0009 S6b\)\.
   Kind: bug
-  Placement: S2 defect awaiting owner placement \(data loss: a rolled\-back DROP removes the table\)\. Filed without a
+  Placement: below item 10 \(owner decision 2026\-10\-16, S7 carve\-out\) — filed, does not displace parity work\.
+    Formerly "S2 defect awaiting owner placement" \(data loss: a rolled\-back DROP removes the table\)\. Filed without a
   parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
   - Repro on a fresh cluster, each followed by a read of the table:
     - `CREATE TABLE p\(a int\) PARTITION BY RANGE \(a\); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM \(0\) TO
@@ -925,7 +927,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
 
 - [ ] **A CREATE TABLE inside a rolled\-back savepoint survives** \(found 2026\-10\-14 during M0122\-0009 S6c\)\.
   Kind: bug
-  Placement: S2 defect awaiting owner placement \(wrong results: an object exists that the transaction never
+  Placement: below item 10 \(owner decision 2026\-10\-16, S7 carve\-out\) — filed, does not displace parity work\.
+    Formerly "S2 defect awaiting owner placement" \(wrong results: an object exists that the transaction never
   created\)\. Filed without a parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
   - Repro on a fresh cluster: `BEGIN; SAVEPOINT s; CREATE TABLE sp\(a int\); INSERT INTO sp VALUES \(1\); ROLLBACK TO
     s; SELECT count\(\*\) FROM sp; COMMIT;` → the SELECT returns 0 rows instead of 42P01, and `sp` still exists after
@@ -945,7 +948,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
 
 - [ ] **Boolean predicate columns are advertised as `text`** \(found 2026\-10\-14 during M0122\-0009 S7\)\.
   Kind: bug
-  Placement: S2 defect awaiting owner placement \(wrong result type on the wire: a typed client decodes `t` as a
+  Placement: below item 10 \(owner decision 2026\-10\-16, S7 carve\-out\) — filed, does not displace parity work\.
+    Formerly "S2 defect awaiting owner placement" \(wrong result type on the wire: a typed client decodes `t` as a
   string\)\. Filed without a parent \(M0122\-0009 lineage past the Movement\-none budget\)\.
   - Repro on a fresh cluster, `\\gdesc` of
     `SELECT EXISTS \(SELECT 1\), 1 IN \(SELECT 1\), 1 IN \(1,2\), 1 = ANY \(ARRAY\[1\]\), 1 < ALL \(SELECT 2\),
@@ -1147,6 +1151,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(per\-node dispatch, recursion\), not Datum copies. The next slice is
       batch evaluation in the scan \(the SeqScanOp entry\), keeping the
       `currentTID` read\-ahead rule.
+  - **Batch qual evaluator LANDED 2026\-10\-16 \(loop \#41\), no caller yet.**
+    Movement: none — infrastructure; no production path changes \(plan text
+    identical\). Design: `docs/design/0100-0149/0122-0012b-scan-batch-qual.md`.
+    - `evalFastExprBatch` \(exprnode\_batch.go\) is total over the slab: leaves
+      and BinaryOp are specialised, AND/OR short\-circuit by sub\-selection,
+      every other kind goes per row. On any error the caller re\-runs per row.
+      Pinned by `TestEvalFastExprBatchMatchesPerRow`; two mutations fail it.
+    - The BinaryOp work is shared via `evalFastBinaryApply`. Calling it per row
+      cost \+26% by value and \+14% by pointer. With the inlined common case
+      \(`fastBinarySimple` \+ `fastIntOverflow`\) the cost is \+1.5–2.5% in
+      the microbenchmark.
+    - Microbenchmark \(store\_sales qual, 64 rows\): per\-row 11.6 µs, batch 8.4
+      µs \(−28%\). The end\-to\-end ceiling is ~12% of the filtered scan.
+    - Next: wire it into seqScanOp \(design §4: page\-mode phases,
+      admission/exclusions, currentTID / borrowRows invariants, isolation
+      family\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -2124,7 +2144,7 @@ spill route is net-negative.
     Movement: none
     Kind: impl
     Parent: M0141-S2b-4
-- [ ] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
+- [x] **M0141-S3 — Partial-Sorted row emission** — a second Partial-mode code
   path (`Strategy = AggStrategySorted`) emitting real rows (group key + one
   serialized-state column per aggregate) instead of merging into
   `aggPartialAccum`; reuses `combineAggRuntime`'s existing rules; leaves the
@@ -2132,29 +2152,34 @@ spill route is net-negative.
   measurement to show a TPC-DS-specific, genuinely parallel-shaped residual
   large enough to justify it.** **Adopted by M0146-0003 (owner disposition
   2026-09-23): this chain runs under M0146, gated on the M0145-0008 flip —
-  do not select standalone before it.**
-- [ ] **M0141-S4 — `aggRuntime` serialize/deserialize** — PG's
+  do not select standalone before it.** Closed 2026-10-16 (owner): the row
+  stays superseded — the chain runs under M0146-0003, no standalone work
+  remains here.
+- [x] **M0141-S4 — `aggRuntime` serialize/deserialize** — PG's
   `aggserialfn`/`aggdeserialfn`, bounded to the decomposable whitelist's actual
   pointer surface (`numericSum`, `intSx`/`intSxx *big.Int`,
   `numericSx`/`numericSxx *big.Rat`, `userState`, the float/bool/count/sum
   scalars — `DISTINCT`/`WITHIN GROUP`/`array_agg`/`string_agg` are already
   refused by `AggregateIsDecomposable`). Needs S3 (defines the transport
-  shape). Runs under M0146-0003, gated on the M0145-0008 flip.
-- [ ] **M0141-S5 — GatherMerge-fed Finalize-Sorted** — a new merge-combine
+  shape). Runs under M0146-0003, gated on the M0145-0008 flip. Closed
+  2026-10-16 (owner): superseded — runs under M0146-0003.
+- [x] **M0141-S5 — GatherMerge-fed Finalize-Sorted** — a new merge-combine
   executor operator consuming the key-interleaved stream `GatherMerge`
   produces from S3/S4's rows, folding same-key runs across workers via
   `combineAggRuntime` before finalizing (today's Finalize path only handles
   "drain the Gather to EOF, read the whole accumulator", which is wrong for a
   merge-ordered stream where a key can recur). Needs S3+S4. Runs under
-  M0146-0003, gated on the M0145-0008 flip.
-- [ ] **M0141-S6 — wire and measure** — pick which of the two existing
+  M0146-0003, gated on the M0145-0008 flip. Closed 2026-10-16 (owner):
+  superseded — runs under M0146-0003.
+- [x] **M0141-S6 — wire and measure** — pick which of the two existing
   producers (`parallel.go`'s legacy pass, or `partialaggupper.go`'s costed-path
   version — note its own unresolved 7/22-vs-12/22 regression against the
   legacy pass, out of scope to fix here) hosts the new shape; fix the
   `Aggregate`/`GroupAggregate (N keys)` EXPLAIN mislabel (doc
   `parallel-query/06` §4.1 — both currently render as a hash aggregate
   regardless of `Strategy`); re-measure the full corpus. Needs S5. Runs
-  under M0146-0003, gated on the M0145-0008 flip.
+  under M0146-0003, gated on the M0145-0008 flip. Closed 2026-10-16
+  (owner): superseded — runs under M0146-0003.
 - [x] **M0141-S7 — re-adjudicate and implement Incremental Sort** — **verified
   (completed sub-entries archived → `completed_milestones/completed_fix_plan_015.md`)
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
@@ -3426,6 +3451,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     - Follow\-up filed: M0146\-0211 \(five sibling upper seeds\)\.
   Movement: yes — TPC\-DS SF1 PLAN\-PARITY match 72 → 73 \(Q54\); CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 4 → 3, join\-order 22 → 21; SF0\.25 85 held\.
 - [x] **M0146-0211 — the grouping / partial\-aggregate / partial\-sort / ordered / upperrel seeds still charge a Project wrapper's legacy display cost** \(filed 2026\-10\-16 by M0146\-0210\)\.
+  Owner confirm 2026\-10\-16 \(R3\): keep as landed\.
   Kind: impl
   Parent: M0146-0210
   - M0146\-0210 made the DISTINCT seed read its input path through Project wrappers \(`limitInputPath`\), as PG prices
@@ -3573,7 +3599,8 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   with resume point `dispatchCopyViaExecutor`, but never filed\.
   Kind: impl
   Parent: M0146-0204
-  - Rank: below item 10 — correctness\-only, no plan instrument \(S7 carve\-out\), unless the owner places it\.
+  - Rank: below item 10 — correctness\-only, no plan instrument \(S7 carve\-out\)\. Owner placement
+    2026\-10\-16: below item 10 CONFIRMED — filed, does not displace parity work\.
   - First step: `dispatchCopyViaExecutor` / the executor's copy path \(`copy\.go` "always runs in its own auto\-commit
     transaction"\): when `connTx\.InExplicit\(\)`, join the block's transaction \(`connTx\.Tx\(\)`\) and make the commit
     sites no\-ops, as the M0132\-S3 in\-block `Execute` did\. Test both protocols and COPY inside a SAVEPOINT\.
@@ -3581,7 +3608,13 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > \#\# ESCALATION 2026\-10\-16 \(S2\) — M0146\-0205: COPY inside BEGIN … ROLLBACK keeps its rows
   > Wrong results and loss of atomicity: a client that rolls back a failed load keeps its partial rows\. Filed under
   > M0146\-0204\. Owner: place it, or confirm below item 10\.
-- [ ] **M0146-0206 — VACUUM tail truncation leaves the visibility map untruncated, so relallvisible exceeds relpages; a tail emptied by DELETE is not truncated** \(filed 2026\-10\-16 by M0146\-0204\)\.
+- [x] **M0146-0206 — VACUUM tail truncation leaves the visibility map untruncated, so relallvisible exceeds relpages; a tail emptied by DELETE is not truncated** \(filed 2026\-10\-16 by M0146\-0204\)\.
+  DONE 2026\-10\-16 \(owner, a181f6bfd\): `VisibilityMap\.TruncateRel` beside `opts\.FSM\.TruncateRel`,
+  `VMTruncateForkForHeap` as the smgr\_redo `SMGR\_TRUNCATE\_VM` arm \(visibilitymap\_prepare\_truncate —
+  tail bits of the last surviving map page cleared, fork truncated, idempotent\), `PageUsedLinePointerCount`
+  \(ItemIdIsUsed\) for lastNonEmpty, reclaimed\-only pages no longer keep the tail\. relallvisible derives from
+  the map so the clamp is automatic\. Tests: VMTruncateRel / VMTruncateForkForHeap /
+  VacuumTailTruncationDropsUnusedTail / VacuumTailTruncationTruncatesVM\. units gate green\.
   Checked on a scratch goopg server against a scratch PG 18\.3:
   - COPY 7200 rows, then `VACUUM`: PG gives relpages 53, relallvisible 53; goopg gives 53 and 64\.
   - goopg's `\_vm` fork still marks blocks 53\-63, which are past the end of the heap, all\-visible and all\-frozen\.
@@ -3798,7 +3831,7 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     - Gates: units rc=0, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), sf025 PASS=99, fire set PASS\.
     - Residual \(ledger\): the legacy `tryBuildNLI` rewrite keeps a single pick\.
 Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's corpora)
-- [ ] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
+- [x] **M0146-0178 — index-only-scan heap-fetch term and int4 index density (TPC-DS Q24)**
   (filed 2026-10-13 by the owner from the M0146-0014d sweep finding F3). Q24 SF0.25 elects a Parallel
   Index Only Scan on `store_returns_pkey` (1441.32, no heap-fetch I/O) where PG keeps a Parallel Seq
   Scan (1653.62); PG's index-only scan must carry ~212 more, i.e. heap fetches (`cost_index`
@@ -3890,3 +3923,10 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: units rc=0, postmaster tests, tpch\-spotcheck PASS, tpch\-acceptance\-arm PASS \(24 MATCH\), sf025 PASS=99,
       fire set PASS\.
     - Movement: none — plans byte\-identical\. Remaining: only the RELPAGES heap trailing\-page term \(owner residual\)\.
+    - **Closed 2026\-10\-16 \(owner\) — RELPAGES residual.** The remaining heap\-fetch gap is a corpus
+      data\-layout artifact, not an engine defect: PG's bulk load leaves a non\-all\-visible tail
+      \(store\_returns 1232 pages / 1196 all\-visible\) so its allvisfrac < 1, while goopg's corpus is
+      fully all\-visible after the owner corpus VACUUM \(2026\-10\-16, on a181f6bfd: tpch 8/8, tpcds SF1
+      25/25, SF0\.25 25/25; relallvisible <= relpages everywhere\)\. Index density landed \(fillfactor
+      rightmost split; item\_pkey 52 = PG 52\) and slice 2 \(catalog\-resolved IndexRealPages\) landed\.
+      No parity lever remains in the record\.

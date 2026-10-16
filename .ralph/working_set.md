@@ -1,31 +1,37 @@
-Task: M0146-0197 — parameterised index path per eligible index. Leading-prefix half LANDED 7e9900a35 (pushed);
-  task stays [ ] for the skip-scan half (pickIndexSkipRun still single-index).
-  - Inert on today's corpora: TPC-H 12->12, SF0.25 80->80, plan text byte-identical; fire-set SF1 A/B no change.
-  - Gates: units, tpch-spotcheck, acceptance arm PASS (23 MATCH + Q5 EXPECTED-ERROR), sf025 PASS=99, fire set PASS.
-Context (M0146-0195 family):
-  - 7b356ec04 dedup-allocation leak fix; f1fd9a8a9 M0146-0178 slice 2 (index pages via catalog database).
-  - Clone measurement: compact fk indexes in use → TPC-H 12 -> 14 (Q3/Q5/Q7 MATCH, Q10 lost).
-  - ESCALATION be711c43e RESOLVED by owner 2026-10-15 evening: :65433 now serves goopg-bin built at 7e9900a35
-    (sha256 8c47fc59…; pid 561965, readlink-verified); INSERT reload redone — idx_lineitem_orderkey_fkidx
-    117050->16641 (PG 16468), order_customer_fkidx 28617->2220 (PG 4121). Q5 completes in ~1s, digest ==
-    PG :65432; baseline Q5 re-pinned from XFAIL to the real value.
-NEXT LOOP:
-  1. Re-read banner; check :65433's serving binary + fk-index occupancy (relfilenode 16452, read-only parse) for the
-     owner's redo.
-  2. Item 3 file order: M0146-0195 [ ] (owner-blocked on the reload redo for its measurement), M0146-0197 [ ]
-     skip-scan half (committable; likely inert too — measure first), M0146-0178 [ ] residuals (worker-count sites /
-     TableRealPages need a catalog threaded through ParallelSettings/upperRels).
-     Pick by impact: M0146-0178's worker-count residual or 0197's skip half; or run an S9 pass if both are inert.
-Files: internal/optimizer/{nl_index_join.go,pathparamindex.go,pathparamindex_test.go}, design m0146-0197.
-Key symbols: leadingPrefixProbeKeys, eligibleLeadingPrefixIndexes, addParamIndexPathFor, pickIndexSkipRun.
+Task: M0122-0012 slice 6 — operand leaf copy MEASURED, NOT landed (d8b561537, docs only). Movement: none (measured
+  non-improvement).
+  - Also this loop: S9 re-check at 378ad9ecf was exhausted (45e82cda8, routing-20261016p; records byte-identical).
+Files: docs/design/0100-0149/0122-0012-vector-filter-pipeline-recon.md ("Slice 6"); .ralph/fix_plan.md.
+  No engine code changed. The experiment was discarded before commit.
+Key symbols: evalFastExpr (ExprBinaryOp arm), seqScanOp.evalQual / evalPrefilter, filterOp batch path (operators.go).
 Hypothesis/Findings:
-  - The bloated-index costs are the TPC-H Q3/Q5/Q7 driver; the engine-side fixes are in, the corpus is not rebuilt.
-Next step: check the owner's reload redo; else take M0146-0178's worker-count residual (catalog into
-  ParallelSettings.BlocksForIndex) or 0197's skip half, measuring before/after on a private clone.
-Top-residual: actionable join-method=4 (TPC-H Q2/Q3/Q7, SF0.25 Q43) — owner reload gates Q3/Q7
-Skip-rationale: Q3/Q7 blocked-on owner-reload :65433 (M0146-0195); Q2 / SF0.25 Q43 not yet diagnosed.
-Gates run: units rc=0, tpch-spotcheck PASS, tpch-acceptance-arm PASS, sf025 PASS=99, fire set PASS, pgbench (hook).
+  - The wrapper variant (all operands via a helper) was −2.5% on store_sales but slower on TPC-H Q6 (AND chain).
+  - The leaf-only variant was inside the noise (store_sales 1136/1096/1134 vs 1111/1106/1047 ms; TPC-H flat).
+  - The remaining evalFastExpr cost is tree-walk control flow (dispatch, recursion), not Datum copies.
+  - TPC-H single-shot timings are ±15% noisy (same binary: Q1 4.38 vs 3.65 s); judge on repeated A/B only.
+Next step: re-read the banner.
+  - The S9 note at 378ad9ecf STILL HOLDS: no planner/executor commit since (d8b561537 is docs only), so item 10 is
+    live without a re-census.
+  - M0122-0012 slice 7: batch qual evaluation inside seqScanOp (the SeqScanOp entry in unimplemented_feat.json).
+    Write the design first: which node kinds batch, how the prefilter's partial deform interacts, and the
+    currentTID read-ahead rule (recon doc section "Correction 2026-09-23"). Then implement behind the same
+    admission rule as filterOp's batch path.
+Top-residual: corpus-VACUUM residual (M0146-0019, owner) — 6 records (TPC-H Q13/Q16, SF0.25 Q23/Q84, SF1 Q68/Q18).
+  OWNER ACTION DONE 2026-10-16: all three goopg corpora re-vacuumed on a181f6bfd (the M0146-0206 fix) —
+  tpch :65433 8/8 tables, tpcds :65436 SF1 25/25, :65437 SF0.25 25/25; relallvisible <= relpages everywhere
+  (was 0 on TPC-DS). The residual's premise is now stale — the next plan capture runs on the vacuumed corpus.
+Skip-rationale: items 0-9 bypassed by the S9 exhausted note at 378ad9ecf. Open items-0-9 tasks:
+  M0146-0014(channel), M0146-0042(channel), M0146-0007/0012b/0067/0175(below-item-10),
+  M0146-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0196(below-item-10),
+  M0146-0205(below-item-10 S2, owner-confirmed), M0141-S2b-3b/S2b-4e/S7-exec-d(below-item-10),
+  M0141-S2b-4(blocked-on M0141-S2b-4e),
+  M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003/0010).
+  Closed by owner 2026-10-16: M0146-0206 (a181f6bfd), M0146-0178 (RELPAGES residual), M0141-S3..S6
+  (superseded by M0146-0003), four M0122-era S2 defects + M0146-0205 placed below item 10, M0146-0211
+  keep-confirmed (R3).
+Gates run: experiment gates (units, tpch-spotcheck, acceptance arm, sf025 99/99 same=99, fireset fires=none,
+  ea-ratchet, TestPort_RegressSuite) all PASSED on the wrapper variant, which was discarded anyway. The committed
+  tree is docs-only; pgbench smoke (hook) PASS.
 In-flight: none.
-Owner items: (DONE: :65433 restarted on 7e9900a35 + INSERT reload redone — fk indexes compact, Q5 fixed and
-  re-pinned) place the four S2 defects; XLogInsert/XLogFlush rename; M0122-0008; M0122-0009a/b/c, M0122-0010a and
-  filed follow-ups; COSTTIE flips; plan-shaping GUC defaults.
+Owner items: none — all cleared 2026-10-16 (corpus VACUUM done, placements recorded, stale rows closed, tmp/
+  pruned 97%→74%).
