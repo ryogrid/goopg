@@ -3013,6 +3013,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/
     0166/0167/0168/0173/0205, M0141\-S2b\-3b/S2b\-4e/S7\-exec\-d\(below\-item\-10\); M0141\-S2b\-4\(blocked\-on M0141\-S2b\-4e\);
     M0142\-0008a\-3/0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\.
+  - S9 re\-check 2026\-10\-16 — **exhausted at `b5ffee1f9`** \(M0122\-0012 slice 11 changed internal/executor\)\. Census
+    `routing\-20261016s` is a fresh capture of all three corpora; its records are byte\-identical to `routing\-20261016r`
+    \(22/22, 86/99, 74/99\)\. No task is filed; the gates are unchanged\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
