@@ -343,3 +343,43 @@ waiting, not a bottleneck. Not landed; the code and its test were discarded befo
 non-improvements on the per-row filtered-scan path, after slices 2-5 took it from ~1970 ms to ~1095 ms. What remains
 needs the single-pass page restructure (0122-0012b §5). The next M0122-0012 work should profile a different workload,
 such as a hash join or aggregation (TPC-H Q1/Q9), before attempting another change.
+
+## Slice 10 (2026-10-16): TPC-H Q1 — numeric promotion passes numeric operands through
+
+Following slice 9's advice, a different workload was profiled. TPC-H Q1, the arm's slowest query, is a 4-worker
+aggregate over `lineitem` with numeric arithmetic. On a private clone it runs in ~1.91 s warm, against PG 18.3's
+~1.23 s on :65432. Its CPU profile:
+
+| symbol | share |
+|---|---|
+| `evalFastExpr` | 17 % |
+| `aggregateOp.applyAgg` | 9.9 % |
+| `evalBinary` | 9.7 % |
+| `promoteToNumeric` | 6.1 % |
+
+Per-row allocation (`mallocgcTiny`, string concatenation in the group key) is only ~3 %.
+
+`promoteToNumeric` runs on every numeric `+ - * /`. It returns both operands through `toNumeric`, which hands a
+numeric back unchanged, so the common numeric-numeric case paid two 48-byte Datum round trips per operation. That is
+the slice-3 stall pattern. `promoteNumericOperands` (numeric.go) calls `toNumeric` only for the side that is not yet
+numeric; `evalBinary`'s add/sub and mul/div/mod arms use it. `evalBinary` is shared by both evaluators, so the siblings
+change together. `TestPromoteNumericOperandsMatchesPromoteToNumeric` pins the result and error against
+`promoteToNumeric` for every pairing of numeric, int, numeric-looking string and rejected operands.
+
+**Measured:** Q1 on the private clone, three rounds, fresh server per arm:
+
+| round | HEAD median (ms) | candidate median (ms) |
+|---|---|---|
+| 1 | 2114 | 2025 |
+| 2 | 1959 | 1905 |
+| 3 | 1959 | 1909 |
+
+Every round favoured the candidate, by 2.5-4 %. The TPC-H acceptance arm passed with identical values. Its totals ran
+on a loaded host (load average ~2.8, a peer's pre-commit gate running alongside) and are not comparable with earlier
+slices.
+
+Not done here:
+- `applyAgg` lower-cases each aggregate's name per row (`strings.ToLower`, ~1 %).
+- The group key is built as a string per row (`datumKey` + `setGroupKey`) and evaluated through the interpreter
+  (`evalExprSlot`). Together these are ~5 % of Q1.
+- The integer literal in `1 - l_discount` is still promoted per row; PG coerces it to numeric at parse time.

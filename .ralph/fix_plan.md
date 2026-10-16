@@ -1192,6 +1192,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - **Scan\-qual micro\-optimization is exhausted** \(slices 6, 8, 9: three consecutive non\-improvements\). The next
       M0122\-0012 slice must profile a different workload \(hash join / aggregation, TPC\-H Q1/Q9\) before changing
       code.
+  - **Slice 10 — numeric promotion passes numeric operands through LANDED 2026\-10\-16 \(loop \#47\).**
+    Movement: none — perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99
+    PLAN\-SHAPE same=99, TestPort\_RegressSuite PASS. Recon doc "Slice 10".
+    - TPC\-H Q1 profile \(goopg ~1.91 s vs PG ~1.23 s\): evalFastExpr 17%, applyAgg 9.9%, evalBinary 9.7%,
+      promoteToNumeric 6.1%.
+    - `promoteNumericOperands` promotes only the non\-numeric side. Q1 measured 2.5–4% faster in each of three rounds.
+      Pinned by `TestPromoteNumericOperandsMatchesPromoteToNumeric`.
+    - Remaining Q1 levers: the per\-row `strings.ToLower` in applyAgg \(~1%\); the per\-row string group key and
+      interpreted group\-key evaluation \(~5%\); the int literal's per\-row promotion \(PG coerces it at parse time\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
