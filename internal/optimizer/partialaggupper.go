@@ -983,7 +983,9 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 	// perWorkerRows × d — the whole economic argument of the shape
 	// (Q37's 2 final groups against a 20-row sort each worker already
 	// narrowed).
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
 	gmPath := &Path{
 		Kind: PathGatherMerge, Rel: grouped, Rows: crossed, Cost: gmCost,
@@ -1204,7 +1206,8 @@ func subtreeRefusalKind(unsafe, gathered, noScan bool) string {
 func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
 	nGroupCols, nAggs, inWidth int, strategy AggStrategy) *Path {
-	crossedRows := partialGroups * d
+	// compute_gather_rows clamps (M0146-0221; see addPartialAggSortedSplitArm).
+	crossedRows := clampRowEst(partialGroups * d)
 
 	// PARTIAL arm — `create_agg_path(… AGGSPLIT_INITIAL_SERIAL …)`,
 	// planner.c:7606.
@@ -1285,7 +1288,9 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		// group expression no merge key can name.
 		return nil
 	}
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 
 	// PARTIAL arm — hashed per worker, like the split arm's: PG shows
 	// `Partial HashAggregate` under the worker Sort (TPC-H Q1), and
@@ -1381,7 +1386,9 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		// expression no merge key can name makes the arm unreachable.
 		return nil
 	}
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 
 	// WORKER SORT and PARTIAL — see sortedInputPartialAgg.
 	mergeKeys := pathkeysForSortKeys(sortKeys)

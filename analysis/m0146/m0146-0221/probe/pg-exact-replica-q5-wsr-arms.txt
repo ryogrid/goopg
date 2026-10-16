@@ -1,0 +1,10 @@
+M21U add_partial_path type=365 startup=16641.4252 total=16641.4952 rows=2.0 sub=362
+M21U add_partial_path type=365 startup=16641.4402 total=16641.4802 rows=2.0 sub=331
+M21U add_path type=368 startup=17641.4252 total=17641.9952 rows=5.0 accept=1 sub=-1
+M21U add_path type=369 startup=17641.4489 total=17642.0961 rows=5.0 accept=1 sub=-1
+M21U add_path type=365 startup=17642.0927 total=17642.3027 rows=6.0 accept=1 sub=362
+M21U add_path type=365 startup=17641.4489 total=17642.3415 rows=6.0 accept=0 sub=369
+M21U add_path type=365 startup=17641.4489 total=17642.3286 rows=6.0 accept=0 sub=369
+M21U add_path type=365 startup=17642.0902 total=17642.2102 rows=6.0 accept=0 sub=368
+M21U add_path type=365 startup=17642.2086 total=17642.3286 rows=6.0 accept=0 sub=369
+M21U add_path type=365 startup=17642.0927 total=17642.3027 rows=6.0 accept=1 sub=362

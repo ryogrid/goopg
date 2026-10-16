@@ -166,7 +166,7 @@ type partialAggTournament struct {
 	inputRows     float64
 	finalGroups   float64
 	partialGroups float64
-	crossedRows   float64 // partialGroups * divisor — the group-states that cross
+	crossedRows   float64 // compute_gather_rows: clamp(partialGroups * divisor), the group-states that cross
 }
 
 // splitWins reports the tournament's verdict: the cheapest path on the
@@ -342,7 +342,8 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 		grouped: grouped, partial: partialRel,
 		divisor: d, inputRows: inputRows,
 		finalGroups: finalGroups, partialGroups: partialGroups,
-		crossedRows: partialGroups * d,
+		// compute_gather_rows clamps (gather_grouping_paths, M0146-0221).
+		crossedRows: clampRowEst(partialGroups * d),
 	}
 
 	// ── the PARTIAL arm: create_agg_path(… AGGSPLIT_INITIAL_SERIAL …),

@@ -1,0 +1,104 @@
+ channel |      col_name       | d_year | d_qoy |                     i_category                     | sales_cnt | sales_amt 
+---------+---------------------+--------+-------+----------------------------------------------------+-----------+-----------
+ catalog | cs_bill_customer_sk |   1998 |     1 | Books                                              |         3 |    870.00
+ catalog | cs_bill_customer_sk |   1998 |     1 | Children                                           |         2 |          
+ catalog | cs_bill_customer_sk |   1998 |     1 | Electronics                                        |         4 |  25545.88
+ catalog | cs_bill_customer_sk |   1998 |     1 | Home                                               |         3 |   1666.62
+ catalog | cs_bill_customer_sk |   1998 |     1 | Jewelry                                            |         4 |   6168.36
+ catalog | cs_bill_customer_sk |   1998 |     1 | Men                                                |         6 |  15011.52
+ catalog | cs_bill_customer_sk |   1998 |     1 | Music                                              |         3 |   2825.14
+ catalog | cs_bill_customer_sk |   1998 |     1 | Shoes                                              |         4 |   7044.89
+ catalog | cs_bill_customer_sk |   1998 |     1 | Sports                                             |         1 |   8196.61
+ catalog | cs_bill_customer_sk |   1998 |     1 | Women                                              |         2 |   1485.80
+ catalog | cs_bill_customer_sk |   1998 |     2 | Children                                           |         3 |   3812.16
+ catalog | cs_bill_customer_sk |   1998 |     2 | Electronics                                        |         4 |    386.00
+ catalog | cs_bill_customer_sk |   1998 |     2 | Home                                               |         5 |    713.58
+ catalog | cs_bill_customer_sk |   1998 |     2 | Jewelry                                            |         2 |   1450.84
+ catalog | cs_bill_customer_sk |   1998 |     2 | Men                                                |         2 |    270.08
+ catalog | cs_bill_customer_sk |   1998 |     2 | Music                                              |         3 |   9375.73
+ catalog | cs_bill_customer_sk |   1998 |     2 | Shoes                                              |         3 |     70.98
+ catalog | cs_bill_customer_sk |   1998 |     2 | Women                                              |         3 |          
+ catalog | cs_bill_customer_sk |   1998 |     3 | Books                                              |         6 |   6489.85
+ catalog | cs_bill_customer_sk |   1998 |     3 | Children                                           |         2 |   7263.34
+ catalog | cs_bill_customer_sk |   1998 |     3 | Electronics                                        |         4 |    177.11
+ catalog | cs_bill_customer_sk |   1998 |     3 | Home                                               |         8 |  12100.28
+ catalog | cs_bill_customer_sk |   1998 |     3 | Jewelry                                            |         4 |   1383.96
+ catalog | cs_bill_customer_sk |   1998 |     3 | Men                                                |         9 |  12952.85
+ catalog | cs_bill_customer_sk |   1998 |     3 | Music                                              |         5 |   1120.58
+ catalog | cs_bill_customer_sk |   1998 |     3 | Shoes                                              |         3 |  20612.79
+ catalog | cs_bill_customer_sk |   1998 |     3 | Sports                                             |         2 |    437.24
+ catalog | cs_bill_customer_sk |   1998 |     3 | Women                                              |         3 |          
+ catalog | cs_bill_customer_sk |   1998 |     4 | Books                                              |         3 |   7731.36
+ catalog | cs_bill_customer_sk |   1998 |     4 | Children                                           |        10 |  21200.42
+ catalog | cs_bill_customer_sk |   1998 |     4 | Electronics                                        |         8 |   9512.86
+ catalog | cs_bill_customer_sk |   1998 |     4 | Home                                               |        11 |   2068.10
+ catalog | cs_bill_customer_sk |   1998 |     4 | Jewelry                                            |         4 |   4906.01
+ catalog | cs_bill_customer_sk |   1998 |     4 | Men                                                |         7 |  22036.31
+ catalog | cs_bill_customer_sk |   1998 |     4 | Music                                              |         8 |  17618.10
+ catalog | cs_bill_customer_sk |   1998 |     4 | Shoes                                              |         8 |  14002.84
+ catalog | cs_bill_customer_sk |   1998 |     4 | Sports                                             |         8 |   1448.52
+ catalog | cs_bill_customer_sk |   1998 |     4 | Women                                              |         7 |   5747.71
+ catalog | cs_bill_customer_sk |   1999 |     1 | Books                                              |         3 |  14143.16
+ catalog | cs_bill_customer_sk |   1999 |     1 | Children                                           |         4 |   3497.34
+ catalog | cs_bill_customer_sk |   1999 |     1 | Electronics                                        |         1 |   2706.24
+ catalog | cs_bill_customer_sk |   1999 |     1 | Jewelry                                            |         4 |   1341.90
+ catalog | cs_bill_customer_sk |   1999 |     1 | Men                                                |         4 |   5926.67
+ catalog | cs_bill_customer_sk |   1999 |     1 | Music                                              |         3 |   3456.14
+ catalog | cs_bill_customer_sk |   1999 |     1 | Shoes                                              |         1 |   1263.42
+ catalog | cs_bill_customer_sk |   1999 |     1 | Sports                                             |         1 |    130.69
+ catalog | cs_bill_customer_sk |   1999 |     1 | Women                                              |         5 |   2166.06
+ catalog | cs_bill_customer_sk |   1999 |     2 | Books                                              |         2 |   1994.10
+ catalog | cs_bill_customer_sk |   1999 |     2 | Children                                           |         3 |   4456.62
+ catalog | cs_bill_customer_sk |   1999 |     2 | Electronics                                        |         3 |   7985.16
+ catalog | cs_bill_customer_sk |   1999 |     2 | Home                                               |         3 |   1576.17
+ catalog | cs_bill_customer_sk |   1999 |     2 | Music                                              |         1 |          
+ catalog | cs_bill_customer_sk |   1999 |     2 | Shoes                                              |         1 |          
+ catalog | cs_bill_customer_sk |   1999 |     2 | Sports                                             |         2 |     82.50
+ catalog | cs_bill_customer_sk |   1999 |     2 | Women                                              |         3 |   1911.70
+ catalog | cs_bill_customer_sk |   1999 |     3 | Books                                              |         3 |   3459.75
+ catalog | cs_bill_customer_sk |   1999 |     3 | Children                                           |         3 |   3733.51
+ catalog | cs_bill_customer_sk |   1999 |     3 | Electronics                                        |         5 |   6688.97
+ catalog | cs_bill_customer_sk |   1999 |     3 | Home                                               |         4 |  15102.45
+ catalog | cs_bill_customer_sk |   1999 |     3 | Jewelry                                            |         4 |  10285.08
+ catalog | cs_bill_customer_sk |   1999 |     3 | Men                                                |         5 |   5212.82
+ catalog | cs_bill_customer_sk |   1999 |     3 | Music                                              |         4 |   1945.44
+ catalog | cs_bill_customer_sk |   1999 |     3 | Shoes                                              |         3 |    219.20
+ catalog | cs_bill_customer_sk |   1999 |     3 | Sports                                             |         7 |  17657.36
+ catalog | cs_bill_customer_sk |   1999 |     3 | Women                                              |         4 |    132.18
+ catalog | cs_bill_customer_sk |   1999 |     4 | Books                                              |         8 |  13362.75
+ catalog | cs_bill_customer_sk |   1999 |     4 | Children                                           |         8 |  17713.64
+ catalog | cs_bill_customer_sk |   1999 |     4 | Electronics                                        |         4 |    764.40
+ catalog | cs_bill_customer_sk |   1999 |     4 | Home                                               |        16 |  13136.92
+ catalog | cs_bill_customer_sk |   1999 |     4 | Jewelry                                            |         4 |   5738.58
+ catalog | cs_bill_customer_sk |   1999 |     4 | Men                                                |         2 |          
+ catalog | cs_bill_customer_sk |   1999 |     4 | Music                                              |         6 |   3872.88
+ catalog | cs_bill_customer_sk |   1999 |     4 | Shoes                                              |        14 |  13245.17
+ catalog | cs_bill_customer_sk |   1999 |     4 | Sports                                             |        12 |  11482.55
+ catalog | cs_bill_customer_sk |   1999 |     4 | Women                                              |         7 |  12283.69
+ catalog | cs_bill_customer_sk |   2000 |     1 | Books                                              |         5 |   2593.50
+ catalog | cs_bill_customer_sk |   2000 |     1 | Children                                           |         4 |  11478.58
+ catalog | cs_bill_customer_sk |   2000 |     1 | Electronics                                        |         1 |          
+ catalog | cs_bill_customer_sk |   2000 |     1 | Home                                               |         4 |   4777.47
+ catalog | cs_bill_customer_sk |   2000 |     1 | Jewelry                                            |         1 |          
+ catalog | cs_bill_customer_sk |   2000 |     1 | Men                                                |         1 |          
+ catalog | cs_bill_customer_sk |   2000 |     1 | Music                                              |         1 |          
+ catalog | cs_bill_customer_sk |   2000 |     1 | Shoes                                              |         3 |          
+ catalog | cs_bill_customer_sk |   2000 |     1 | Sports                                             |         3 |   1562.88
+ catalog | cs_bill_customer_sk |   2000 |     1 | Women                                              |         2 |          
+ catalog | cs_bill_customer_sk |   2000 |     2 | Books                                              |         2 |   1902.32
+ catalog | cs_bill_customer_sk |   2000 |     2 | Children                                           |         1 |          
+ catalog | cs_bill_customer_sk |   2000 |     2 | Electronics                                        |         2 |   1707.96
+ catalog | cs_bill_customer_sk |   2000 |     2 | Home                                               |         3 |    403.37
+ catalog | cs_bill_customer_sk |   2000 |     2 | Men                                                |         4 |   3979.51
+ catalog | cs_bill_customer_sk |   2000 |     2 | Music                                              |         1 |   4823.33
+ catalog | cs_bill_customer_sk |   2000 |     2 | Sports                                             |         3 |    623.82
+ catalog | cs_bill_customer_sk |   2000 |     2 | Women                                              |         2 |   3543.60
+ catalog | cs_bill_customer_sk |   2000 |     3 | Books                                              |         5 |  11116.72
+ catalog | cs_bill_customer_sk |   2000 |     3 | Children                                           |         6 |   5599.84
+ catalog | cs_bill_customer_sk |   2000 |     3 | Electronics                                        |         4 |   2136.96
+ catalog | cs_bill_customer_sk |   2000 |     3 | Home                                               |         2 |   2350.15
+ catalog | cs_bill_customer_sk |   2000 |     3 | Jewelry                                            |         4 |   3667.65
+ catalog | cs_bill_customer_sk |   2000 |     3 | Men                                                |         5 |   1243.16
+ catalog | cs_bill_customer_sk |   2000 |     3 | Music                                              |         2 |   2708.02
+(100 rows)
+

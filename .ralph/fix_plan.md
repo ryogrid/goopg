@@ -4467,3 +4467,19 @@ Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shippe
     agree\), then compare the split arm term by term against create\_partial\_grouping\_paths and cost\_gather\_merge\.
     Evidence is in `analysis/m0146/m0146\-0220/probe/`\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 87→88 \(Q5\)\.
+  - **Slice 1 LANDED 2026\-10\-17 \(loop \#65\): crossing rows are compute\_gather\_rows\.** Design
+    `docs/design/0100\-0149/m0146\-0221\-split\-arm\-cost\-terms\.md`; evidence `analysis/m0146/m0146\-0221/`\.
+    - Exact oracle: `pg_basebackup` of :65438 under the tmp/pgdbg debug build reproduces the reference plan exactly\.
+      A dump restore does not, because heap page counts scale reltuples\.
+    - PG's wsr arms: no\-split 17642\.3027, accepted \(identical in goopg after the \+358\.40 input shift\); split
+      17642\.3286, rejected\. goopg's split arm was 0\.0756 cheaper\.
+    - That gap is two terms\. \(1\) Unclamped crossing rows: 4\.8 against PG's 5, fixed in this slice\. \(2\) Missing
+      deserialfn cost in the Finalize, 0\.05: slice 2\.
+    - Census: SF1 74→75 \(Q80 → MATCH\); SF0\.25 87 and TPC\-H 22 unchanged\.
+    - Pin: TestSplitArmBoundariesCarryComputeGatherRows, mutation\-checked\.
+  - **Slice 2 \(next\): port get\_agg\_clause\_costs** \(costsize\.c / clauses\.c\)\.
+    - Per\-aggregate transfn/combinefn per row, deserialfn per row when deserializing, serialfn per group when
+      serializing, finalfn per group unless skipfinal, all from pg\_proc\.procost\.
+    - Needs a leaf\-package pg\_aggregate cost table, because the optimizer cannot import initdb, plus agg\-call →
+      aggfnoid resolution, and costAgg taking per\-aggregate terms and a split mode\.
+    - Expected instrument: Q5 → MATCH \(split 17642\.3265 against no\-split 17642\.3027\)\.

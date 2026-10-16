@@ -9,6 +9,7 @@ package optimizer
 import (
 	"bufio"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -1795,4 +1796,66 @@ func TestGatheredArmBoundariesCarryScanJoinRelRows(t *testing.T) {
 		t.Fatalf("no gathered no-split candidate survived on the rel: %d paths", len(grouped.Pathlist))
 	}
 	t.Logf("gathered boundaries checked: %v", seen)
+}
+
+// TestSplitArmBoundariesCarryComputeGatherRows pins M0146-0221 slice 1.
+// gather_grouping_paths passes compute_gather_rows, which clamps, for every
+// Gather and Gather Merge over a partial grouping path. TPC-DS Q5's wsr branch
+// has 2 groups per worker under 2 workers, so 2 × 2.4 = 4.8 crosses as 5. The
+// unclamped 4.8 priced goopg's split arm 0.02 under PG's and helped it win a
+// near-tie that PG's no-split arm wins.
+func TestSplitArmBoundariesCarryComputeGatherRows(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 1_000_000, 37, 2, 1)
+	ps := upperSplitSettings()
+	cp := ps.costParams()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	seed := newPrebuiltPath(grouped, agg.Child)
+	seed.Rows = float64(EstimateRows(agg.Child))
+	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+	const workers = 2
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	if math.Mod(37*d, 1) == 0 {
+		t.Fatalf("fixture crossing %v is integral; the clamp would not show", 37*d)
+	}
+	partial := &Path{
+		Rows:            seed.Rows / d,
+		Cost:            parallelSeedCost(seed.Cost, d),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+	}
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
+
+	n := 0
+	var walk func(p *Path)
+	walk = func(p *Path) {
+		if p == nil {
+			return
+		}
+		if p.Kind == PathGather || p.Kind == PathGatherMerge {
+			sub := p.Children[0]
+			if sub.Kind == PathSort {
+				sub = sub.Children[0]
+			}
+			if sub.Kind == PathAgg { // a split arm: group states cross
+				n++
+				if p.Rows != math.RoundToEven(p.Rows) || p.Rows < 1 {
+					t.Errorf("%v over the partial aggregate: rows=%v, not clamp_row_est'd", p.Kind, p.Rows)
+				}
+			}
+		}
+		for _, c := range p.Children {
+			walk(c)
+		}
+	}
+	for _, p := range grouped.Pathlist {
+		walk(p)
+	}
+	if n == 0 {
+		t.Fatalf("no split-arm boundary on the rel: %d paths", len(grouped.Pathlist))
+	}
 }
