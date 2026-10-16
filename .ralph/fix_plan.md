@@ -1210,6 +1210,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - TPC\-H Q1 went from ~1875 ms to ~1645 ms \(−12%\). Acceptance arm: values identical, total 40.55 s → 37.94 s.
     - Next Q1 levers: applyAgg's per\-row `strings.ToLower`, interpreted group\-key evaluation, and the int literal
       promoted per row.
+  - **Slice 12 — applyAgg's cached names and in\-place numeric sum LANDED 2026\-10\-16 \(loop \#49\).** Movement: none
+    — perf only. The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS. Recon doc "Slice 12".
+    - `aggLowerName` caches each lower\-cased aggregate name. The same\-scale int64 lane of the running numeric sum
+      is updated in place \(exactly numericAdd's result\). Pinned by `TestAggNumericSumInPlaceMatchesExact`, which
+      checks exact sums incl. overflow into the big lane and is mutation\-checked.
+    - Q1 went from ~1660 ms to ~1555 ms \(−6%\); across slices 10\-12, ~1.91 s → ~1.55 s \(PG ~1.23 s\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

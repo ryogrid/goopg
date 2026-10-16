@@ -2254,6 +2254,10 @@ type aggregateOp struct {
 	// instead of a fresh slice per row. The sorted path keeps its own allocations: it holds the
 	// previous row's key parts across rows (curParts).
 	gkVals Row
+	// aggLower / aggLowerSrc cache each aggregate's lower-cased name by
+	// aggregate index (aggLowerName).
+	aggLower    []string
+	aggLowerSrc []string
 	// gkBuf is the per-row group key, built in place by appendGroupKey so
 	// the map lookup allocates nothing for a row of an existing group
 	// (M0122-0012). It holds exactly setGroupKey's bytes.
@@ -2952,6 +2956,28 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 		parts = append(parts, datumKey(kv))
 	}
 	return vals, parts, nil
+}
+
+// aggLowerName is strings.ToLower(name) for aggregate idx, cached per
+// operator (M0122-0012): applyAgg dispatches on the lower-cased name for every
+// input row, and recomputing it was a per-row scan of each aggregate's name.
+// The cache is keyed on the source name too, so an operator whose plan is
+// swapped (tests) can never be served a stale entry.
+func (o *aggregateOp) aggLowerName(idx int, name string) string {
+	if idx >= 0 && idx < len(o.aggLowerSrc) && o.aggLowerSrc[idx] == name {
+		return o.aggLower[idx]
+	}
+	lower := strings.ToLower(name)
+	if idx >= 0 && idx < 1024 {
+		for len(o.aggLowerSrc) <= idx {
+			o.aggLowerSrc = append(o.aggLowerSrc, "")
+			o.aggLower = append(o.aggLower, "")
+		}
+		// Mark the slot filled only after both halves are written.
+		o.aggLower[idx] = lower
+		o.aggLowerSrc[idx] = name
+	}
+	return lower
 }
 
 // evalGroupValsScratch evaluates the grouping columns for the hashed grouping
@@ -3821,7 +3847,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		}
 	}
 
-	name := strings.ToLower(call.Name)
+	name := o.aggLowerName(idx, call.Name)
 	if call.Star {
 		if call.UserAgg != nil {
 			// User-defined star aggregate (e.g. newcnt(*)) — call sfunc with state only.
@@ -3965,6 +3991,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		case KindNumeric:
 			if !st.hasValue || st.numericSum.Kind != KindNumeric {
 				st.numericSum = Datum{Kind: KindNumeric, Scale: arg.Scale}
+			}
+			// M0122-0012: numericAdd's int64 lane, in place. With both
+			// operands outside the big-mantissa lane and at one scale,
+			// numericAdd aligns nothing and returns
+			// Datum{KindNumeric, Int: a+b, Scale} when the add does not
+			// overflow, which is exactly this update (st.numericSum carries
+			// no other field). Anything else takes numericAdd.
+			if st.numericSum.Flags&flagBigNumeric == 0 && arg.Flags&flagBigNumeric == 0 && st.numericSum.Scale == arg.Scale {
+				if r, ok := addInt64Overflow(st.numericSum.Int, arg.Int); ok {
+					st.numericSum.Int = r
+					break
+				}
 			}
 			s, err := numericAdd(st.numericSum, arg)
 			if err != nil {

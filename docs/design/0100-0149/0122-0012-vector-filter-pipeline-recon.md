@@ -420,3 +420,37 @@ Q1 against PG is now ~1.65 s vs ~1.23 s. What remains of the slice-10 list:
 - the per-row `strings.ToLower` in `applyAgg`;
 - interpreted group-key evaluation (`evalExprSlot`);
 - the int literal promoted per row.
+
+## Slice 12 (2026-10-16): applyAgg — cached aggregate names and an in-place numeric sum
+
+After slice 11, Q1's profile put `applyAgg` at 11 % flat. `perf annotate` split its time across four lines:
+- 34 % on `numericAdd` for the running sum (a stack-returned Datum);
+- 20 % on the argument evaluation's return;
+- 15 % on the per-row name tests;
+- 10 % on storing the sum.
+
+`strings.ToLower(call.Name)` ran on every row as well (1.3 % of Q1).
+
+- **`aggLowerName`** caches each aggregate's lower-cased name by aggregate index. The cache is keyed on the source
+  name, so a reused operator cannot be served a stale entry.
+- **In-place sum.** In `sum` / `avg` over `KindNumeric`, when neither the running sum nor the argument is in the
+  big-mantissa lane and both have the same scale, the sum is updated in place with `addInt64Overflow`. That is
+  exactly the value `numericAdd` returns in that case: `alignNumericInt64` changes nothing at one scale, and the
+  result Datum carries no other field. Mixed scales, big values and overflow take `numericAdd` as before.
+- **Pin:** `TestAggNumericSumInPlaceMatchesExact` checks `sum` against `math/big` over three columns: a same-scale
+  `numeric(15,2)` (the in-place path), mixed scales 0-3 (the aligned path), and near-int64 integers whose sum
+  overflows into the big lane. A `+1` mutation in the in-place update fails it.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `91d7e0143` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1685 / 1709 / 1689 / 1657 | 1567 / 1551 / 1533 / 1528 |
+| 2 | 1629 / 1622 / 1694 / 1685 | 1563 / 1552 / 1541 / 1561 |
+| 3 | 1631 / 1629 / 1634 / 1658 | 1560 / 1552 / 1579 / 1571 |
+
+That is ~1660 → ~1555 ms, −6 %. The acceptance arm's single-shot totals were flat (37.94 → 37.93 s), inside its
+known ±15 % per-query noise; values identical. sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`
+passed.
+
+Across slices 10-12, Q1 went from ~1.91 s to ~1.55 s, against PG 18.3's ~1.23 s.
