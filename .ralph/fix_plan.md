@@ -1172,6 +1172,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Next: wire it into seqScanOp \(design §4: page\-mode phases,
       admission/exclusions, currentTID / borrowRows invariants, isolation
       family\).
+  - **Slice 8 — a pure verdict pre-pass in seqScanOp — measured SLOWER, not landed \(2026\-10\-16, loop \#45\).**
+    Movement: none — measured non\-improvement. Design `0122\-0012b\-scan\-batch\-qual.md` §5.
+    - A window of up to 64 slots is fetched and prefix\-deformed under the held page RLock, batch\-evaluated, and one
+      verdict cached per slot. The loop's visibility, SSI, hint\-bit and `currentTID` order are unchanged. The values
+      pin passed; inverting the verdicts failed 6 subtests.
+    - SF1 store\_sales: per\-row ~1110 ms; window 64 ~1145 ms, 32 ~1190, 16 ~1233, 8 ~1314. Expression evaluation
+      fell 43% → 35%, but the duplicated tuple fetch and copy \(PageGetHeapTupleInto 2.9 → 6.2%\) and the window
+      overhead \(5.9%\) paid it back.
+    - A win needs a single\-pass restructure \(fetch and deform once, zero\-copy tuple view\), with a ~8% ceiling.
+      Not pursued; the evaluator stays as infrastructure.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

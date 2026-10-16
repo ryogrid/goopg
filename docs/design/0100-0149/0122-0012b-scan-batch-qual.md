@@ -129,3 +129,42 @@ unchanged.
 - **Values and plans.** The sf025 sweep values, the fire-set, the TPC-H arm digests and the isolation family must
   all be unchanged. The scan reads ahead within a page, so run the isolation family (memory
   `stats_changes_need_isolation_family`; slice 1's `currentTID` break was an isolation spec).
+
+## 5. Slice 8 (2026-10-16): a pure verdict pre-pass — measured slower, not landed
+
+Rather than the §4 restructure, slice 8 tried the smallest wiring that keeps `seqScanOp.Next` unchanged.
+- When the loop reached the prefilter for a slot with no verdict, a pre-pass ran under the page RLock the loop
+  already held.
+- The pre-pass fetched the next up-to-64 line pointers into its own tuple buffer and deformed their prefix columns.
+  It ran `evalFastExprBatch` over them and cached one verdict per slot: keep, reject, or undecided on a decode error,
+  a toasted prefix or any evaluation error.
+- The loop kept its visibility test, SSI hooks, hint bits, statistics and `currentTID` order. On reject it took the
+  rejection exit without decoding; on keep it skipped `evalPrefilter`.
+- Soundness: pruning and VACUUM need a cleanup lock, which a pinned page refuses, so a slot's tuple bytes are stable
+  under the scan's pin. Visibility was ignored and errors were swallowed, which is sound for the pure prefilter quals.
+- The values pin passed: batch on vs off over a 600-row table, eight quals, plus deleted-row and visible-row division
+  by zero. Inverting the cached verdicts failed six subtests.
+
+**Measured** on the SF1 `store_sales` filtered scan, same binary, kill switch `GOOPG_SCAN_BATCH_QUAL`, fresh server
+per arm:
+
+| window | warm medians (ms) |
+|---|---|
+| off (per row) | 1110 / 1114 / 1116 / 1100 |
+| 64 | 1145 / 1145 / 1147 |
+| 32 | 1197 / 1175 |
+| 16 | 1233 / 1236 |
+| 8 | 1314 / 1315 |
+
+The cost fits A + B / window with A ≈ 1125 ms: even an unbounded window stays above per-row. Profile at window 64:
+- expression evaluation fell from ~43 % of the scan to ~35 % (`evalFastExprBatch` 9.1, `evalFastBinaryApply` 7.8,
+  `compareDatum` 7.8, `evalBinary` 5.8, `evalAnd` 4.1);
+- the pre-pass paid that back: `fillBatchQualWindow` 5.9 % flat, `PageGetHeapTupleInto` 2.9 → 6.2 % (each tuple
+  copied out twice), and `memmove` up from ~4.4 to 5.8 %.
+
+The code was discarded before commit. **A batch qual can only win if the tuple is fetched and its prefix deformed
+ONCE.** That means the §4 single-pass restructure, with survivors finished from the pre-pass's decoded prefix and a
+zero-copy view of the page tuple instead of a second `PageGetHeapTupleInto`. Even then the measured ceiling is
+~8 % of the scan, against a substantial rewrite of the hottest loop in the executor. It is recorded here and not
+pursued further in M0122-0012; the evaluator (`evalFastExprBatch`) stays as infrastructure for the slice that
+takes that restructure on.
