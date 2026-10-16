@@ -89,10 +89,20 @@ banner at the next `## ` line).
   run (e.g. the source server is live and the capture refuses), item
   10 is live FOR THIS LOOP.
   (2) A record is ACTIONABLE when it is non-MATCH and its census route
-  is not a live (`[ ]` or `[!]`) task, not a waived/owner residual
-  (COSTTIE, GEQO-RNG, RELPAGES, ESTIMATE+RELPAGES, STALE-SF1), and not
-  the leaf-count/lateral classes owned by M0145-0003/0010. For TPC-H,
-  each non-MATCH query is actionable unless a live task names it.
+  is not a live (`[ ]` or `[!]`) task and not the leaf-count/lateral
+  classes owned by M0145-0003/0010. For TPC-H, each non-MATCH query is
+  actionable unless a live task names it. **Owner directive
+  2026-10-16: the formerly waived residual classes — COSTTIE,
+  GEQO-RNG, RELPAGES, ESTIMATE+RELPAGES, STALE-SF1 — are UN-WAIVED.**
+  Waived status was a routing convenience, not proof of plan equality;
+  the goal is a plan identical to PG 18.3 for every query on all three
+  corpora. Each such record re-ranks by its first-divergence category
+  like any other record. A waived record also re-opens whenever its
+  premise changes (corpus reload, page-count or cost-model change) —
+  e.g. owner verification on 2026-10-16 showed the SF1 corpus already
+  fresh-format (relpages identical to PG on all probed tables; char(n)
+  padding present), so the STALE-SF1 premise dissolved without a
+  reload.
   (3) Rank the differ's nine categories by actionable-record count
   summed across all three corpora; file exactly ONE task —
   `Parent: M0146-0014`, `Kind: impl` — citing corpus + query id +
@@ -100,7 +110,8 @@ banner at the next `## ` line).
   records where goopg's plan selection diverges from PG 18.3 (the
   first-divergence point); then implement in order and drive the query
   to MATCH. Prefer the SF0.25 record when a query diverges at both
-  scales (SF1 measurement is stale-load-compromised). The filed task
+  scales (smaller corpus, faster iteration; the SF1 stale-load premise
+  was cleared by owner verification 2026-10-16 — see (2)). The filed task
   inherits item-3 rank under S7 (named family + plan-instrument
   rationale) — it is selected before item 10.
   (4) Bounds — ONE filing per pass, never a batch. A pass that files
@@ -115,6 +126,41 @@ banner at the next `## ` line).
   loop. A replenishment task that closes `Movement: none` must name
   why its premise/record was stale; after TWO consecutive such closes
   without a landed fix, stop filing and write the S8 escalation.
+  (5) Plan-parity direction (owner directive 2026-10-16) — binds all
+      parity work, S9-filed or owner-seeded:
+      (a) Runtime is never a rejection reason. A change that moves a
+          record toward MATCH lands even when slower — a slower plan
+          that matches is not a regression (AGENT.md plan-parity rules;
+          R3: no reverts for runtime). When a *correct* but slower plan
+          makes a gate's stamp non-PASS (sf025 sweep TIMEOUT, fireset
+          new-timeout, acceptance-arm timeout), the task does not
+          revert: it escalates `[!]` naming the gate — the owner amends
+          the gate (XFAIL-class pin, raised timeout, or a
+          gate-exceptions row), per the M0146-0178 precedent.
+          Correctness regressions still block; `regress` Movement never
+          counts as parity movement.
+      (b) Same-logic only. Parity comes from porting PG 18.3's same or
+          substantially-same processing logic — planner, executor,
+          storage/access, bulk-load, ANALYZE sampling, GUC defaults
+          alike — and each fix cites the PG mechanism it ports.
+          Forbidden: query-text special-casing, forced/pinned plan
+          shapes, and cost-constant or threshold fudging that flips a
+          choice without a PG citation.
+      (c) Physical parity is parity work. When a divergence traces to
+          heap/index page count (relpages), VM all-visible state, or
+          tuple layout, the task fixes the responsible component —
+          copyfrom.c/hio.c bulk extension and VM marking, heap packing
+          and fillfactor, nbtree bulk build and page split, ANALYZE
+          sampling — not the planner. Page-count parity to
+          plan-identical precision is the acceptance bar.
+      (d) GEQO-RNG is actionable. goopg already carries the structural
+          GEQO port (`internal/optimizer/geqo.go`); the residual gap is
+          the RNG — port PG's pg_prng (splitmix64 fseed expansion +
+          xoroshiro128** + bitmask-reject `pg_prng_uint64_range`; a
+          working copy lives in `internal/executor/
+          analyze_block_sampler.go`). PG's `geqo_seed = 0` is already
+          deterministic (`pg_prng_fseed`), so captures need no seed
+          pinning.
 FILEABLE-ROOTS: M0146-0014
 (owner directive 2026-10-13 — filings under the standing census root
 are exempt from the Rule-A lineage budget: the sweep's purpose IS
@@ -4111,3 +4157,53 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       25/25, SF0\.25 25/25; relallvisible <= relpages everywhere\)\. Index density landed \(fillfactor
       rightmost split; item\_pkey 52 = PG 52\) and slice 2 \(catalog\-resolved IndexRealPages\) landed\.
       No parity lever remains in the record\.
+- [ ] **M0146\-0214 — GEQO\-RNG: goopg's GEQO uses a bespoke Knuth LCG where PG uses pg\_prng \(splitmix64
+  fseed + xoroshiro128\*\* + bitmask\-reject range\)** \(filed 2026\-10\-16 by owner directive;
+  un\-waives GEQO\-RNG under S9\(2\)\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS Q64 \(GEQO\-RNG\), SF0\.25 and SF1; category join\-order, verdict SHAPE\-DIFF — goopg's
+    genetic search picks a different tour at the GEQO tie\. PG `geqo\_seed=0` is deterministic
+    \(`pg\_prng\_fseed` at geqo\_main\.c\), so identical draws reproduce PG's tour\.
+  - First step: port pg\_prng into `internal/optimizer/geqo.go:693\-732` — a working splitmix64 +
+    xoroshiro128\*\* implementation already lives in `internal/executor/analyze\_block\_sampler\.go`
+    \(`pgPRNGState`\); match PG's draw sites and order \(geqo\_random\.c `pg\_prng\_uint64\_range`
+    bitmask\-rejection, `geqo\_selection` `linear_rand`\), and audit the `len\(items\)` vs
+    `levels\_needed` threshold dispatch at `relfromjoinlist\.go:729`\.
+  - Also fix the stale comments claiming GEQO is a no\-op stub: `internal/utils/misc/defaults\.go:1313`
+    and `internal/utils/misc/postgresql\.conf\.sample:260`\.
+  - Residual caveat: bit\-identical draws reproduce PG's tour only while tour fitness \(path costs\) is
+    bit\-identical; any remaining divergence after the port attributes to the first divergent tour cost
+    and re\-routes normally\. Re\-measure Q64 on both scales\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match counts at both scales \(Q64\)\.
+- [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
+  width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
+  owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS Q76, SF0\.25 first divergence depth 6 under Append \(PG Nested Loop Inner vs goopg
+    Parallel Hash Join Inner\); SF1 depth 8 \(PG Memoize vs goopg date\_dim\_pkey probe\)\. Census diff
+    lines: sf025 `cost=39239\.95\.\.39283\.55 rows=100 width=298` vs PG `39026\.66\.\.39070\.79 rows=100
+    width=163`; sf1 `131523\.79\.\.131580\.18` vs `131305\.26\.\.131362\.41`\.
+  - First step: attribute the width=298 vs 163 gap — the plan's result\-column width estimate — and the
+    estimate delta behind the routing's ESTIMATE component \(Q76's `IS NULL` predicate over a sampled
+    column is the documented suspect\); then port the deciding PG term \(clauselist/selfuncs row\-width
+    or null\-fraction estimate\)\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY \(Q76\), then SF1\.
+- [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
+  vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
+  \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: RELPAGES class — SF1 Q52 and the ESTIMATE\+RELPAGES records \(Q76\)\. Owner verification
+    2026\-10\-16: SF1 heaps are already fresh\-format — relpages identical to PG on all 10 probed tables
+    \(item 1284, customer 2872, store\_sales 51784, …\) — so the old 1242\-vs\-1284 premise is dead and
+    NO reload is needed\. The remaining physical delta is VM all\-visible state: goopg corpora sit at
+    relallvisible = relpages after the owner VACUUM while PG's bulk\-loaded tables keep a non\-visible
+    tail \(store\_sales 51747/51784, catalog\_sales 37427/37448\)\.
+  - First step: full per\-table `relpages`/`relallvisible`/`reltuples`/`pg_relation_size` census on
+    :65436 and :65437 vs :65438 `tpcds`/`tpcds025`, then attribute each diff: if goopg's COPY marks
+    bulk\-loaded pages all\-visible where PG's copyfrom\.c does not, that is component work \(COPY VM
+    marking\); if a heap/index page count still differs, the fix belongs to hio\.c bulk extension,
+    heap packing, or nbtree bulk build per S9\(5\)\(c\) — not the planner\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY \(Q52, Q76 and any record the census re\-attributes\)\.
