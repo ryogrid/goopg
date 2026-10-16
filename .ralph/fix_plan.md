@@ -4414,7 +4414,7 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(plan\-shape changed=2: Q16,
       Q61\), tpcds\-fireset PASS \(fired results byte\-identical\), TestPort\_RegressSuite\.
 Movement: yes — TPC\-DS SF0\.25 match 86→88, SF1 match 73→74
-- [ ] **M0146\-0220 — aggregation\-strategy: TPC\-DS SF1 Q48 — PG `Finalize Aggregate → Gather → Partial Aggregate`,
+- [x] **M0146\-0220 — aggregation\-strategy: TPC\-DS SF1 Q48 — PG `Finalize Aggregate → Gather → Partial Aggregate`,
   goopg `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at 9fcfbc795\)\.
   Kind: impl
   Parent: M0146-0014
@@ -4432,3 +4432,38 @@ Movement: yes — TPC\-DS SF0\.25 match 86→88, SF1 match 73→74
     method\) to see which serial path rejects the Gather\. Then check whether goopg's sr\.Pathlist holds that
     candidate, and whether scanJoinRelKeepsGather runs at all for this input \(searchedJoinInputRelOf non\-nil\)\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 74→75 \(Q48\); Q71/Q23 may share the mechanism\.
+  - **LANDED 2026\-10\-17 \(loop \#64\).** Design `docs/design/0100\-0149/m0146\-0220\-scanjoin\-gather\-rel\-rows\.md`;
+    evidence `analysis/m0146/m0146\-0220/`\.
+    - The keep\-check did run\. With PG statistics, the no\-split `Agg → Gather` won at 84021\.19 against the split
+      arm's 84021\.20, because its Gather was priced at compute\_gather\_rows = 4\.
+    - A scratch\-PG add\_path probe on SF1 \(reference restored with `pg_dump \-\-statistics`\) shows PG's scan/join\-rel
+      Gather carries rel\->rows = 5 \(override\_rows false\)\. Its plain arm is 84021\.03 and Finalize wins at
+      84020\.94\.
+    - Ported as scanJoinGatherRows: both no\-split boundaries, the Gather and the worker\-sort Gather Merge, are now
+      sized at the rel's rows, replacing M0146\-0009n's compute\_gather\_rows\.
+    - Shipped census: SF0\.25 88→87 \(Q5 lost\); SF1 74→74 \(Q71 gained, Q80 lost\); TPC\-H 22/22\.
+    - With PG statistics: SF1 86→88 \(Q48, Q71; Q80 also matches, so its shipped flip is estimate\-driven\); SF0\.25
+      91/99, where Q5 is lost even with PG statistics\. Filed M0146\-0221 \(R3\)\.
+    - Pin: TestGatheredArmBoundariesCarryScanJoinRelRows, mutation\-checked\.
+    - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(plan\-shape changed=21:
+      row/cost text on the worker\-sort Gather Merge\), tpcds\-fireset PASS \(40 fired results byte\-identical\),
+      TestPort\_RegressSuite\.
+Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shipped SF0\.25 88→87, Q5 filed M0146\-0221\)
+- [ ] **M0146\-0221 — aggregation\-strategy: TPC\-DS SF0\.25 Q5 MATCH→SHAPE\-DIFF after M0146\-0220 — goopg's split arm
+  wins the `wsr` GroupAggregate near\-tie that PG's no\-split arm wins** \(filed 2026\-10\-17 by M0146\-0220 under R3\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q5, aggregation\-strategy, depth 5 \(under Subquery Scan: PG GroupAggregate \| goopg
+    Finalize GroupAggregate\)\. The record persists with PG's statistics imported\. SF1 Q80 shows the same pattern on the
+    shipped corpus, but matches under PG statistics\.
+  - Numbers \(goopg with PG statistics\):
+    - no\-split `GroupAggregate → Sort → Gather`, 6 rows: 18000\.49\.\.18000\.70\.
+    - split `sortinput`, Finalize over Gather Merge, 5 rows: 17999\.85\.\.18000\.65\. It wins on the tight fuzz\.
+    - PG reference: no\-split 17642\.09\.\.17642\.30\.
+    - A scratch\-PG restore of tpcds025 rejects PG's split arm by about 0\.05\. That restore estimates 7 rows for wsr,
+      not 6, so it is not exact\.
+  - Also differs: goopg's `Subquery Scan` over the UNION ALL leg costs 8985 against PG's 8447\.
+  - First step: get an exact PG replica for Q5 \(or a reduced wsr\-only query on which the restore and the reference
+    agree\), then compare the split arm term by term against create\_partial\_grouping\_paths and cost\_gather\_merge\.
+    Evidence is in `analysis/m0146/m0146\-0220/probe/`\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 87→88 \(Q5\)\.

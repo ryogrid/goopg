@@ -1718,15 +1718,21 @@ func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
 	}
 }
 
-// TestGatheredArmBoundariesShareComputeGatherRows pins M0146-0009n: with a
-// searched partial path whose per-worker rows are not the serial seed's rows
-// over the divisor, the gathered (no-split) arm's Gather and its worker-sort
-// Gather Merge both carry `compute_gather_rows` (costsize.c) of the partial
-// input — per-worker rows × divisor, clamped. The Gather used to take the
-// seed's rows, so the two shapes were charged `parallel_tuple_cost` on
-// different counts and the Gather Merge won TPC-DS Q56's near-tie PG's
-// Sort-over-Gather wins.
-func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
+// TestGatheredArmBoundariesCarryScanJoinRelRows pins M0146-0220.
+//
+// Setup: a searched partial path whose per-worker rows are not the serial
+// seed's rows over the divisor.
+//
+// Check: the gathered (no-split) arm's Gather and its worker-sort Gather Merge
+// both carry the seed's rows, i.e. the scan/join rel's. Upstream builds both on
+// that rel with override_rows false, so create_gather_path and
+// create_gather_merge_path stamp rel->rows.
+//
+// History: M0146-0009n first gave the two boundaries the same count, which ended
+// a mismatch that decided TPC-DS Q56's near-tie. But it chose
+// compute_gather_rows, the count of the override_rows=true upper-rel calls. That
+// let TPC-DS SF1 Q48's no-split Gather undercut PG's Finalize Aggregate.
+func TestGatheredArmBoundariesCarryScanJoinRelRows(t *testing.T) {
 	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
 	defer restore()
 
@@ -1745,13 +1751,16 @@ func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
 	const workers = 4
 	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
 	partial := &Path{
-		Rows:            seed.Rows / d * 0.8,
+		// Per-worker rows ABOVE the rel's share, so compute_gather_rows
+		// exceeds the rel's rows and the rel-sized no-split boundaries are
+		// the cheaper shapes the rel keeps.
+		Rows:            seed.Rows / d * 1.2,
 		Cost:            parallelSeedCost(seed.Cost, d),
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
 	}
-	want := clampRowEst(partial.Rows * d)
-	if want == clampRowEst(seed.Rows) {
+	want := seed.Rows
+	if clampRowEst(partial.Rows*d) == want {
 		t.Fatalf("fixture does not separate the partial rows from the seed's: both %v", want)
 	}
 	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
@@ -1770,8 +1779,8 @@ func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
 			if sub.Kind != PathAgg { // the split arm's boundary crosses group states
 				seen[p.Kind]++
 				if p.Rows != want {
-					t.Errorf("%v over the partial input: rows=%v, want compute_gather_rows=%v (seed rows %v)",
-						p.Kind, p.Rows, want, seed.Rows)
+					t.Errorf("%v over the partial input: rows=%v, want the scan/join rel's %v (compute_gather_rows %v)",
+						p.Kind, p.Rows, want, clampRowEst(partial.Rows*d))
 				}
 			}
 		}

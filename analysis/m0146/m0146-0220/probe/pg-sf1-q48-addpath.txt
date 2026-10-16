@@ -1,0 +1,11 @@
+M20 add_path kind=1 nrels=4 type=368 startup=2856.7938 total=89643.6629 rows=857.0 accept=1 npaths=0
+M20 add_path kind=1 nrels=4 type=368 startup=2965.9725 total=84204.1769 rows=59.0 accept=1 npaths=0
+M20 add_path kind=1 nrels=4 type=368 startup=2965.8350 total=84004.1803 rows=167.0 accept=1 npaths=0
+M20 add_path kind=1 nrels=4 type=368 startup=2964.9925 total=84028.3455 rows=5.0 accept=1 npaths=0
+M20 add_path kind=1 nrels=5 type=368 startup=2966.2625 total=84021.0089 rows=5.0 accept=1 npaths=0
+M20 add_path kind=4 nrels=0 type=368 startup=84020.5114 total=84020.9214 rows=4.0 accept=1 npaths=0
+M20 input path type=368 startup=2966.2625 total=84021.0089 rows=5.0
+M20 input partial type=356 startup=1966.2625 total=83020.5089 rows=1.0
+M20 add_path kind=4 nrels=0 type=365 startup=84021.0214 total=84021.0314 rows=1.0 accept=1 npaths=0
+M20 add_path kind=4 nrels=0 type=365 startup=84020.9314 total=84020.9414 rows=1.0 accept=1 npaths=0
+M20 add_path kind=4 nrels=0 type=365 startup=84020.9314 total=84020.9414 rows=1.0 accept=1 npaths=0

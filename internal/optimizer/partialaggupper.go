@@ -704,13 +704,11 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// on the reduction ratio, which is the quantity the decision turns on
 	// (DESIGN §3.4).
 	//
-	// M0146-0009n: the rows crossing the boundary are `compute_gather_rows`
-	// (costsize.c) of the partial input — its per-worker rows times the
-	// divisor, clamped — not the serial seed's rows. With a searched partial
-	// path the two differ, and the worker-sort Gather Merge below is sized
-	// the PG way, so a seed-sized Gather lost or won their near-ties on the
-	// difference alone (TPC-DS Q56's store_sales branch).
-	gatheredRows := clampRowEst(perWorkerRows * d)
+	// M0146-0220: the rows crossing the boundary are the scan/join rel's own
+	// rows (scanJoinGatherRows). M0146-0009n had sized this Gather, and the
+	// worker-sort Gather Merge below, at compute_gather_rows; the two now
+	// agree with each other and with upstream.
+	gatheredRows := scanJoinGatherRows(seed, perWorkerRows, d)
 	nsGatherCost := gatherCost(cp, pseed.Cost, gatheredRows)
 	nsGather := &Path{
 		Kind: PathGather, Rel: grouped, Rows: gatheredRows, Cost: nsGatherCost,
@@ -774,7 +772,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 				}, partialAggNoSplitProducer)
 			}
 			workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
-				presortedKeys, cp, workers, d, perWorkerRows)
+				presortedKeys, cp, workers, gatheredRows)
 			if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
 				// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 				gmSpec := *aggNode
@@ -866,7 +864,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
 		// worker-side construction this mirrors field for field.
 		workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
-			gatheredKeys, cp, workers, d, perWorkerRows)
+			gatheredKeys, cp, workers, gatheredRows)
 		if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
 			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 			gmSpec := *aggNode
@@ -1023,25 +1021,23 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 // worker sort runs. Returns the Gather Merge path and the row count crossing
 // the merge boundary, which the caller needs for its own `costAgg` input.
 //
-// Rows crossing the merge boundary: every input row — a Sort emits what it
-// reads — i.e. the per-worker count the sort was priced with (`perWorkerRows`)
-// times the divisor `d`, clamped: `compute_gather_rows` (costsize.c), the
-// count the no-split arm's Gather takes too (M0146-0009n). Spelled out rather
-// than via `computeGatherRows`, which re-derives the divisor from the subpath
-// and this sort was planned with the caller's.
+// Rows crossing the merge boundary: crossRows, the scan/join rel's rows
+// (scanJoinGatherRows), the count the no-split arm's Gather takes too.
+// Upstream builds this Gather Merge in generate_useful_gather_paths on the
+// scan/join rel with override_rows false, so it carries rel->rows.
 //
 // The GatherMerge is built MANUALLY rather than through `makeGatherMergePath`:
 // that constructor only wraps an already-sorted subpath
 // (`partialPathDrivingKind` refuses Sort), while this arm builds the sort
 // itself — C-19e's `createPartialSortPaths` pattern (partialsortpaths.go),
 // whose worker-side construction this mirrors field for field.
-func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, d, perWorkerRows float64) (*Path, float64) {
+func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, crossRows float64) (*Path, float64) {
 	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(keys), cp, -1)
 	// `sortPathForBounded` prices ParallelSafe but never plans workers;
 	// without this the GatherMerge build below refuses the subpath
 	// (`gatherChildPlan` panics on 0 workers).
 	workerSort.ParallelWorkers = workers
-	gmCrossedRows := clampRowEst(perWorkerRows * d)
+	gmCrossedRows := crossRows
 	gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
 	workerGM := &Path{
 		Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
@@ -1058,6 +1054,26 @@ func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey,
 		Children:      []*Path{workerSort},
 	}
 	return workerGM, gmCrossedRows
+}
+
+// scanJoinGatherRows is the row count of the Gather and Gather Merge the
+// no-split arms aggregate over (M0146-0220). Upstream builds both on the
+// topmost scan/join rel: generate_gather_paths / generate_useful_gather_paths
+// run from apply_scanjoin_target_to_paths with override_rows false, so
+// create_gather_path and create_gather_merge_path stamp rel->rows, and
+// cost_gather charges parallel_tuple_cost on that. compute_gather_rows is
+// only for the override_rows=true calls on upper rels (gather_grouping_paths,
+// the partial-distinct rel). TPC-DS Q48 at SF1: the rel has 5 rows and the
+// per-worker estimate times the divisor is 4, so the compute_gather_rows
+// Gather undercut PG's Finalize Aggregate by 0.1 of parallel_tuple_cost and
+// won. The seed is the rel's cheapest serial path and carries the rel's rows.
+// Without one, the partial input's compute_gather_rows is the only estimate
+// left.
+func scanJoinGatherRows(seed *Path, perWorkerRows, d float64) float64 {
+	if seed != nil && seed.Rows > 0 {
+		return seed.Rows
+	}
+	return clampRowEst(perWorkerRows * d)
 }
 
 // scanJoinRelKeepsGatherMerge reports whether the worker-sort Gather Merge
