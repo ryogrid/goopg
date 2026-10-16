@@ -4414,3 +4414,21 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(plan\-shape changed=2: Q16,
       Q61\), tpcds\-fireset PASS \(fired results byte\-identical\), TestPort\_RegressSuite\.
 Movement: yes — TPC\-DS SF0\.25 match 86→88, SF1 match 73→74
+- [ ] **M0146\-0220 — aggregation\-strategy: TPC\-DS SF1 Q48 — PG `Finalize Aggregate → Gather → Partial Aggregate`,
+  goopg `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at 9fcfbc795\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q48, category aggregation\-strategy, verdict SHAPE\-DIFF at depth 0\. Census:
+    `analysis/m0146/m0146\-0014/routing\-20261016a/`\. The record persists with PG's statistics imported \(that
+    clone's census is 86/99\)\.
+  - S9 ranking \(live\-task and import\-routed records excluded\): aggregation\-strategy 4 \(SF1 Q23, Q26, Q48, Q71\),
+    sort\-strategy 3, then parallelism, join\-order, scan\-type and qual\-placement at 2 each\.
+  - Costs under PG statistics:
+    - goopg no\-split `Aggregate → Gather`: 84021\.19\. Its Gather is priced at compute\_gather\_rows = 4; this is the
+      M0146\-0219 ledger row\.
+    - PG Finalize: 84021\.11\.
+    - Had PG's scan/join\-rel Gather survived add\_path, PG's own plain arm would cost about 84020\.8 and win\.
+  - First step: probe PG's topmost scan/join rel for Q48 \(tmp/pgdbg add\_path elog on T\_Gather, the M0146\-0219
+    method\) to see which serial path rejects the Gather\. Then check whether goopg's sr\.Pathlist holds that
+    candidate, and whether scanJoinRelKeepsGather runs at all for this input \(searchedJoinInputRelOf non\-nil\)\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match 74→75 \(Q48\); Q71/Q23 may share the mechanism\.
