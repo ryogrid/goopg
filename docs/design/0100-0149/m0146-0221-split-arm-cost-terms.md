@@ -1,7 +1,7 @@
 # M0146-0221 — the partial-aggregate split arm's cost terms against PG's
 
-Status: slice 1 (clamped crossing rows) landed 2026-10-17; slice 2 (aggregate serialize/deserialize/final function
-costs) is open. Evidence: `analysis/m0146/m0146-0221/`.
+Status: slice 1 (clamped crossing rows) and slice 2 (the get_agg_clause_costs port) landed 2026-10-17. Evidence:
+`analysis/m0146/m0146-0221/` (`census/` for slice 1, `census2/` and `fireset2/` for slice 2).
 
 ## 1. Record
 
@@ -90,24 +90,85 @@ Q5 still diverges: after slice 1 the split arm is 17642.2765 against the no-spli
 Pin: `TestSplitArmBoundariesCarryComputeGatherRows` uses 37 groups × 2.4 = 88.8, which must cross as 89.
 Mutation-checked: unclamping every site fails it.
 
-## 5. Slice 2 (open): get_agg_clause_costs
+## 5. Slice 2 (landed): get_agg_clause_costs
 
-PG prices each aggregate from `pg_aggregate` and `pg_proc.procost`:
+PG prices each aggregate from `pg_aggregate` and `pg_proc.procost` (`get_agg_clause_costs`, `prepagg.c`):
 
-- transfn, or combinefn when combining, per input row;
-- plus deserialfn per input row when deserializing;
-- serialfn per group when serializing;
-- finalfn per group unless the final step is skipped;
-- plus the arguments' evaluation cost.
+- per transition state (AggTransInfo): the transfn per input row, or the combinefn when combining; plus the
+  deserialfn per row when deserializing; plus the serialfn per group when serializing;
+- per distinct aggregate (AggInfo): the finalfn per group, unless the final step is skipped;
+- plus the arguments' and FILTER's evaluation cost when not combining.
 
-goopg's `costAgg` uses `nAggs × cpu_operator_cost` for both the per-row and the per-group term. It is exact for
-procost-1 aggregates in the simple case, overcharges aggregates without a finalfn (e.g. `sum(int4)`), and misses the
-deserialize term.
+goopg's `costAgg` charged `nAggs × cpu_operator_cost` for both the per-row and the per-group term, in every split mode.
 
-The metadata exists only in `internal/initdb/pg_aggregate_bootstrap.go`, which the optimizer cannot import. The port
-needs:
-- a leaf-package table keyed by aggregate;
-- resolution of each aggregate call to its `pg_aggregate` row;
-- `costAgg` taking per-aggregate cost terms and a split mode.
+**The table.** `cmd/gen-pg-proc-data -aggcost` reads `pg_aggregate.dat` and `pg_proc.dat` and emits
+`internal/catalog/builtin_agg_costs_gen.go`. For each of the 161 built-in aggregates (keyed `name(argtypes)`) it
+records each support function's procost, 0 where there is none, and a transition identity
+(transfn | serialfn | deserialfn | combinefn | transtype | initval) for `find_compatible_trans` sharing.
 
-With the deserialize term alone, Q5's split arm would cost 17642.3265 against 17642.3027, and PG's choice follows.
+- A bare `aggfnoid` (non-overloaded aggregates such as `regr_count`) resolves through `pg_proc.dat`'s `prokind 'a'`
+  rows.
+- A support function whose name carries two procost values stops the generator; none does in PG 18.3.
+- Every support function there is procost 1.
+
+`catalog.LookupBuiltinAggCost(name, argTypes)` takes an exact signature first, then polymorphic `any*` matches.
+For an unknown type it accepts any overload set whose costs all agree; otherwise it reports false.
+
+`TestBuiltinAggCostTableAgreesWithPgAggregate` (initdb) checks every bootstrapped `pg_aggregate` row against the
+table: same count, and the same support functions present. The two are separate copies of one catalog, because the
+optimizer cannot import initdb.
+
+**The costing.** `aggClauseCosts(cp, agg, split)` (`optimizer/aggclausecosts.go`) computes `transCost.per_tuple` and
+`finalCost.per_tuple` for `aggSplitSimple`, `aggSplitInitialSerial` (the Partial Aggregate) and
+`aggSplitFinalDeserial` (the Finalize).
+
+- Identical calls share one AggInfo.
+- Calls over the same arguments with an equal transition identity share one AggTransInfo (`sum` and `avg` of a
+  numeric column).
+- A call it cannot resolve (user-defined aggregates, unnamed argument types) keeps the legacy one-unit pricing.
+
+`costAggClause` is `cost_agg` over those costs; `costAgg` is now the legacy-priced wrapper. Every grouping arm
+switched together, because they compete with one another:
+
+| arms | split mode |
+|---|---|
+| serial arms in `addGroupingPaths` | SIMPLE |
+| gathered no-split arms | SIMPLE |
+| partial arms | INITIAL_SERIAL |
+| finalize arms | FINAL_DESERIAL |
+
+Grouping sets keep the legacy pricing (ledger).
+
+**Measured:**
+
+| corpus | before | after | flips |
+|---|---|---|---|
+| TPC-H | 22 / 22 | 22 / 22 | none |
+| TPC-DS SF0.25 | 87 / 99 | **88 / 99** | Q5 → MATCH |
+| TPC-DS SF1 | 75 / 99 | **76 / 99** | Q52 → MATCH |
+| SF0.25, PG statistics imported | 91 / 99 | **92 / 99** | |
+| SF1, PG statistics imported | 88 / 99 | **90 / 99** | Q26, Q52 |
+
+No query regressed. In the PG-statistics census the only aggregation-strategy record left is SF1 Q23
+(`Finalize HashAggregate` inside a CTE). Executed values are unchanged: the 96 fired TPC-DS queries are byte-identical
+and the acceptance arm is value-identical. The SF0.25 sweep reports 46 plan texts changed, which are aggregate cost
+numbers.
+
+**Pins:**
+
+- `TestAggClauseCostsPortsGetAggClauseCosts`: Q5's four `sum(numeric)` under each split mode, `sum`/`avg` state
+  sharing, identical-call dedup, `count(*)` with no finalfn, and the user-aggregate fallback.
+- `TestLookupBuiltinAggCostResolvesOverloads`.
+
+`TestExplainLimitClampsToInputRows` pins a Limit relative to its input. Its input aggregate moved from 46.62 to 46.12,
+because `count(*)` has no finalfn. PG's 46.90 differs by the HAVING quals' evaluation cost, which goopg undercharges
+(ledger).
+
+## 6. Not ported (ledger)
+
+- The arguments' and FILTER's evaluation cost (`cost_qual_eval` of `transinfo->args` / `aggfilter`, and of
+  `aggdirectargs`). goopg has no per-operator expression costing, and the same gap affects HAVING quals.
+- Grouping sets (`groupingSetsHashedCost`, `costMixedRollups`, `costAggSortedRollup`) still price `nAggs` units.
+- User-defined aggregates use the legacy pricing. PG would read their support functions' procost: 100 for non-C
+  languages, by default.
+- Ordered-set and `ORDER BY` aggregates are never deduplicated; PG shares identical ones.

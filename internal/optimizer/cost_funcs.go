@@ -541,6 +541,16 @@ func costAggSortedRollup(cp costParams, inputRows, inputStartup, inputTotal floa
 }
 
 func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inWidth int) Cost {
+	return costAggClause(cp, strategy, inputRows, inputStartup, inputTotal, numGroupCols, numGroups, nAggs, inWidth,
+		legacyAggCosts(cp, nAggs))
+}
+
+// costAggClause is cost_agg (costsize.c) over the AggClauseCosts that
+// get_agg_clause_costs computed for the node's split mode (aggClauseCosts,
+// M0146-0221). costAgg prices every aggregate at one cpu_operator_cost per
+// input tuple and per group, whatever the split, which is the call sites'
+// pre-port behaviour.
+func costAggClause(cp costParams, strategy AggStrategy, inputRows, inputStartup, inputTotal float64, numGroupCols int, numGroups float64, nAggs int, inWidth int, ac aggCosts) Cost {
 	tuples := inputRows
 	if tuples < 0 {
 		tuples = 0
@@ -549,8 +559,8 @@ func costAgg(cp costParams, strategy AggStrategy, inputRows, inputStartup, input
 	if groups < 1 {
 		groups = 1
 	}
-	transPerTuple := cp.cpuOperatorCost * float64(nAggs)
-	finalPerGroup := cp.cpuOperatorCost * float64(nAggs)
+	transPerTuple := ac.transPerTuple
+	finalPerGroup := ac.finalPerGroup
 	groupCmpPerTuple := cp.cpuOperatorCost * float64(numGroupCols)
 
 	if strategy == AggStrategySorted && nAggs == 0 && numGroupCols > 0 {

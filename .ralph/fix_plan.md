@@ -4456,7 +4456,7 @@ Movement: yes — TPC\-DS SF0\.25 match 86→88, SF1 match 73→74
       row/cost text on the worker\-sort Gather Merge\), tpcds\-fireset PASS \(40 fired results byte\-identical\),
       TestPort\_RegressSuite\.
 Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shipped SF0\.25 88→87, Q5 filed M0146\-0221\)
-- [ ] **M0146\-0221 — aggregation\-strategy: TPC\-DS SF0\.25 Q5 MATCH→SHAPE\-DIFF after M0146\-0220 — goopg's split arm
+- [x] **M0146\-0221 — aggregation\-strategy: TPC\-DS SF0\.25 Q5 MATCH→SHAPE\-DIFF after M0146\-0220 — goopg's split arm
   wins the `wsr` GroupAggregate near\-tie that PG's no\-split arm wins** \(filed 2026\-10\-17 by M0146\-0220 under R3\)\.
   Kind: impl
   Parent: M0146-0014
@@ -4490,3 +4490,19 @@ Movement: yes — PG\-statistics SF1 match 86→88 \(shipped SF1 74→74, shippe
     - Needs a leaf\-package pg\_aggregate cost table, because the optimizer cannot import initdb, plus agg\-call →
       aggfnoid resolution, and costAgg taking per\-aggregate terms and a split mode\.
     - Expected instrument: Q5 → MATCH \(split 17642\.3265 against no\-split 17642\.3027\)\.
+  - **Slice 2 LANDED 2026\-10\-17 \(loop \#66\).**
+    - The table: cmd/gen\-pg\-proc\-data \-aggcost generates internal/catalog/builtin\_agg\_costs\_gen\.go from
+      pg\_aggregate\.dat and pg\_proc\.dat \(161 aggregates, procost per support function, transition identity\)\.
+    - The costing: optimizer aggClauseCosts \(SIMPLE / INITIAL\_SERIAL / FINAL\_DESERIAL, AggInfo and AggTransInfo
+      sharing\) feeds costAggClause at every grouping arm; grouping sets stay legacy\.
+    - The cross\-check: TestBuiltinAggCostTableAgreesWithPgAggregate \(initdb\) checks the table against the
+      bootstrapped pg\_aggregate rows\.
+    - Census: SF0\.25 87→88 \(Q5\), SF1 75→76 \(Q52\), TPC\-H 22/22, no regressions\. With PG statistics: SF0\.25
+      91→92, SF1 88→90 \(Q26, Q52\)\.
+    - Pins: TestAggClauseCostsPortsGetAggClauseCosts, TestLookupBuiltinAggCostResolvesOverloads\.
+      TestExplainLimitClampsToInputRows re\-derived: count\(\*\) has no finalfn; the HAVING qual\-cost gap is a ledger row\.
+    - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(46 plan texts, cost numbers\),
+      tpcds\-fireset PASS \(96 fired results byte\-identical\), TestPort\_RegressSuite\.
+    - The first regress run after the fire set failed union / varchar / vacuum\_parallel\. The rerun on the same code
+      passed all three, and vacuum\_parallel passes standalone: nondeterministic\.
+Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 slice 1, Q52 slice 2\)

@@ -1,0 +1,5 @@
+ store_only | catalog_only | store_and_catalog 
+------------+--------------+-------------------
+     136087 |        71998 |                 8
+(1 row)
+

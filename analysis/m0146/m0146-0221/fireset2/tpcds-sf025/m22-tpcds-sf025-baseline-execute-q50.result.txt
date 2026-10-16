@@ -1,0 +1,10 @@
+ s_store_name | s_company_id | s_street_number | s_street_name |  s_street_type  | s_suite_number |  s_city  |     s_county      | s_state |   s_zip    | 30 days | 31-INTERVAL '60 days' | 61-INTERVAL '90 days' | 91-INTERVAL '120 days' | >120 days 
+--------------+--------------+-----------------+---------------+-----------------+----------------+----------+-------------------+---------+------------+---------+-----------------------+-----------------------+------------------------+-----------
+ able         |            1 | 255             | Sycamore      | Dr.             | Suite 410      | Midway   | Williamson County | TN      | 31904      |      15 |                    12 |                    12 |                     16 |        19
+ ation        |            1 | 811             | Lee           | Circle          | Suite T        | Midway   | Williamson County | TN      | 31904      |      13 |                    15 |                    14 |                      8 |        27
+ bar          |            1 | 175             | 4th           | Court           | Suite C        | Midway   | Williamson County | TN      | 31904      |      22 |                    15 |                    11 |                     19 |        25
+ eing         |            1 | 226             | 12th          | Lane            | Suite D        | Fairview | Williamson County | TN      | 35709      |      22 |                    13 |                    16 |                     19 |        28
+ ese          |            1 | 27              | Lake          | Ln              | Suite 260      | Midway   | Williamson County | TN      | 31904      |      14 |                    11 |                    17 |                     15 |        28
+ ought        |            1 | 767             | Spring        | Wy              | Suite 250      | Midway   | Williamson County | TN      | 31904      |      20 |                    20 |                    14 |                     12 |        23
+(6 rows)
+

@@ -584,8 +584,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
-				0, 1, len(plainSpec.Aggs), inWidth),
+			Cost: costAggClause(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
+				0, 1, len(plainSpec.Aggs), inWidth, aggClauseCosts(cp, &plainSpec, aggSplitSimple)),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
 		return
@@ -671,8 +671,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
-						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
+						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth, aggClauseCosts(cp, &presortedSpec, aggSplitSimple)),
 					// M0146-0189: the group keys' pathkeys, as every other
 					// grouping arm files (the sort and search-candidate arms,
 					// the partial split). The seed's own keys name the same
@@ -711,8 +711,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth, aggClauseCosts(cp, &sortSpec, aggSplitSimple)),
 					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 				}, groupAggSortedProducer)
 			}
@@ -752,8 +752,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					addPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,
-						Cost: costAgg(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
-							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth),
+						Cost: costAggClause(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
+							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth, aggClauseCosts(cp, &candSpec, aggSplitSimple)),
 						Pathkeys: groupPathkeys, Children: []*Path{in},
 					}, groupAggSearchProducer)
 				}
@@ -768,8 +768,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &maSpec,
 					Rel: grouped, Rows: numGroups,
 					DisabledNodes: ma.DisabledNodes,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
-						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inWidth),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
+						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inWidth, aggClauseCosts(cp, &maSpec, aggSplitSimple)),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{ma},
 				}, groupAggMergeProducer)
 			}
@@ -795,8 +795,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
-						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxWidth),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
+						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxWidth, aggClauseCosts(cp, idxSpec, aggSplitSimple)),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
 			}
@@ -908,8 +908,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		!groupingSetsHashTooBig(cp, aggNode, seed, numGroups) {
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
-		hashCost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inWidth)
+		hashCost := costAggClause(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inWidth, aggClauseCosts(cp, &hashSpec, aggSplitSimple))
 		if aggNode.GroupingSets != nil {
 			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inWidth); ok {
 				hashCost = c
