@@ -382,6 +382,13 @@ Loop rule:
 placeholder is a comment, not a checkbox, so the plan-complete exit
 heuristic stays live.)
 
+- [x] units/internal/access/transam/xlog — TestCheckpointerSpreadHonoursDeadlines: spread checkpoint 559 ms against the 500 ms bound \(AI\-20261017\-005127\-001; repro: `go test \-timeout 10m \./internal/access/transam/xlog/`\)\.
+  - Stale, passes at HEAD 1390b3901: the package passed, and the test passed 3 of 3 in isolation\. It is a timing bound
+    under load: the 2026\-10\-17 00:51 nightly overlapped this loop's own gate runs, with host load average 7\.
+- [x] testport/TestPort\_CreateSchemaSurvivesRestart — server start timeout after 20 s \(AI\-20261017\-005127\-002; repro: `go test \-v \-run '^TestPort\_CreateSchemaSurvivesRestart$' \./internal/testport/`\)\.
+  - Stale, passes at HEAD 1390b3901 \(3\.8 s\)\. The same nightly\-plus\-loop load overlap; the next sibling restart tests
+    in the same run passed\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
