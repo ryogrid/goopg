@@ -4594,3 +4594,19 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
     - Gates: units, spotcheck, acceptance arm, sf025 PASS \(Q39 plan text changed\), fireset PASS \(Q39 results
       byte\-identical at both scales\), TestPort\_RegressSuite\.
 Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
+- [ ] **M0146\-0224 — qual\-placement: TPC\-DS Q78 — PG commutes the two outer joins to \(ss ⟕ cs\) ⟕ ws; goopg keeps
+  \(ss ⟕ ws\) ⟕ cs** \(filed 2026\-10\-17 by the S9 pass at 1a8760b93\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q78, category qual\-placement, verdict SHAPE\-DIFF at depth 2 \(under Sort: PG Merge Left
+    Join \| goopg Merge Left Join\)\. The same swap is the SF1 join\-order record at depth 2\. Both persist under PG
+    statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261017d/`\.
+  - S9 ranking: qual\-placement, scan\-type and join\-order tie at 2\. Q78 is one mechanism behind two of the tied
+    categories, at both scales\.
+  - PG: top `Merge Left Join` on ws \(42027\.86\.\.42481\.11\) over `Merge Left Join` on cs\. goopg: top on cs
+    \(42027\.89\.\.42542\.55\) over the ws join\. goopg's chosen plan is 61 dearer than PG's, so either goopg never
+    builds PG's join order, or it prices that order higher than PG does\.
+  - First step: on the exact PG replica \(tmp/m21\-refclone\), log add\_path for the 3\-rel joinrel \(ss, ws, cs\)\. Then
+    compare goopg's DPPATH lines under PG statistics: is the \(ss ⟕ cs\) ⟕ ws pair generated \(join\_is\_legal / outer\-join
+    identity 3\), and at what cost\?
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 90→91 \(Q78\), then SF1\.
