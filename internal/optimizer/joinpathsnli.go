@@ -334,6 +334,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		noteNLIPathGate(jt, "outer-unusable")
 		return
 	}
+	innerUnique := s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)
 	// M0145-0007's reframed question: count whether a parameterised inner
 	// exists at all before counting what happens to it.
 	filed := false
@@ -384,7 +385,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 			// changes nothing about which clauses the probe below it enforces, and
 			// re-deriving it per candidate would invite the two to disagree.
 			// M0127-P5.4b-ii-b-2.
-			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp)} {
+			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp, innerUnique, residual)} {
 				if in == nil {
 					continue
 				}
@@ -462,6 +463,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 // (C-08 invariant, cited the same way the two landed partial producers
 // cite it: by comment, with no field to test).
 func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors, mu mergeUnique) {
+	innerUnique := mu.innerUnique
 	// V0: the reader-only gate, shared with both landed partial producers
 	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
 	// and the next level's own partial producer reads a partial path.
@@ -598,7 +600,7 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 			// machinery to mirror — and nothing to check: with `req == 0`
 			// and an unparameterised outer there is no parameterisation
 			// left to translate. Stated, not skipped silently.
-			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp)} {
+			for _, in := range []*Path{i, nliMemoizeCandidate(s, outer, o, i, cp, innerUnique, residual)} {
 				if in == nil {
 					continue
 				}
@@ -754,8 +756,19 @@ func nestLoopOuterPaths(outer *RelOptInfo, uniq uniqueSide, sjinfo *SpecialJoinI
 // nliMemoizeCandidate is getMemoizePath for the NLI arm's inner candidates,
 // except a parameterised join inner (M0146-0049d3), whose Memoize wrapper has
 // no lowering yet: createNestLoopIndexJoinPlan unwraps a Memoize to a probe.
-func nliMemoizeCandidate(s *searchCtx, outer *RelOptInfo, o, i *Path, cp costParams) *Path {
+//
+// innerUnique and residual carry get_memoize_path's inner_unique test
+// (joinpath.c:752-767, M0146-0222). On a unique join, a Nested Loop stops at
+// the first match, so Memoize can mark an entry complete after one tuple only
+// when the parameterization enforces the whole join condition. When a
+// restrict clause is left as a join filter, PG builds no Memoize at all. TPC-DS
+// Q72's date_dim d2 probe is the case: d_date_sk is unique, and
+// d1.d_week_seq = d2.d_week_seq stays a join filter.
+func nliMemoizeCandidate(s *searchCtx, outer *RelOptInfo, o, i *Path, cp costParams, innerUnique bool, residual []*restrictInfo) *Path {
 	if i != nil && i.Kind == PathHashJoin {
+		return nil
+	}
+	if innerUnique && (i == nil || i.RequiredOuter == 0 || len(residual) > 0) {
 		return nil
 	}
 	return getMemoizePath(s, outer, o, i, cp)

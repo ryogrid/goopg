@@ -4520,3 +4520,18 @@ Movement: yes — TPC\-DS SF0\.25 match 87→88 \(Q5\), SF1 match 74→76 \(Q80 
     generates goopg's `GroupAggregate → Sort → join tree` candidate, and at what cost\. Use the upper\-rel add\_path
     elog pattern of M0146\-0221 probe/\. Then compare goopg's join\-tree costs against PG's term by term\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 88→89 \(Q72\), then SF1\.
+  - **Slice 1 LANDED 2026\-10\-17 \(loop \#68\): get\_memoize\_path's inner\_unique test\.** Design
+    `docs/design/0100\-0149/m0146\-0222\-memoize\-inner\-unique\-and\-loop\-count\.md`; evidence `analysis/m0146/m0146\-0222/`\.
+    - Exact replica: PG's input rel has the sorted NL at 15490\.79, which it picks, and an unsorted NL at 15491\.68\.
+      goopg's unsorted join was 15267\.48\.
+    - Difference 1: goopg memoized a unique date\_dim d2 probe that keeps a join filter; PG refuses it\. Ported as
+      extraInnerUnique plus the nliMemoizeCandidate gate\.
+    - Difference 2: goopg's d3 probe has loop\_count 1, because its outer is a prebuilt search leaf with rows=1; PG uses
+      catalog\_sales's 360397\. That is slice 2\.
+    - Census: verdicts unchanged \(SF0\.25 88, SF1 76, TPC\-H 22\); SF0\.25 CATEGORIES\-EXCL\-MATCH parameterisation 3→2\.
+    - Pin: TestNLIMemoizeRefusesUniqueJoinWithFilter, mutation\-checked\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(Q72 plan text changed\), fireset PASS \(byte\-identical\),
+      TestPort\_RegressSuite\.
+  - **Slice 2 \(next\): loopCountFor under a prebuilt leaf\.** PG's get\_loop\_count iterates the base rels in
+    required\_outer\. A parameter column inside a prebuilt leaf must use its base rel's own rows, not the leaf's output
+    rows\. Resume: pathparamindex\.go loopCountFor; map the parameter's source column through the leaf to its base rel\.

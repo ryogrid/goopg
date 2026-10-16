@@ -227,6 +227,9 @@ const (
 type mergeUnique struct {
 	side uniqueSide
 	path *Path
+	// innerUnique is the pair's extra->inner_unique (extraInnerUnique),
+	// which get_memoize_path reads for the partial nested loop too.
+	innerUnique bool
 }
 
 func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo, cp costParams) (parser.JoinType, uniqueSide, bool) {
@@ -434,7 +437,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// path (sort_inner_and_outer :1406-1418, match_unsorted_outer
 	// :1881-1890, consider_parallel_nestloop :2171-2178). Reading the raw
 	// side instead joins every duplicate of the semi join's RHS.
-	mu := mergeUnique{side: uniq}
+	mu := mergeUnique{side: uniq, innerUnique: s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)}
 	switch uniq {
 	case uniqueSideOuter:
 		mu.path = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)

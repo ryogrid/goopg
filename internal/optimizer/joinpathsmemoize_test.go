@@ -368,3 +368,31 @@ func TestCreatePlanRefusesFreeStandingMemoize(t *testing.T) {
 	}()
 	createPlanNode(&Path{Kind: PathMemoize, MemoizeInfo: &memoizePathInfo{}})
 }
+
+// TestNLIMemoizeRefusesUniqueJoinWithFilter pins M0146-0222 against
+// get_memoize_path's inner_unique test (joinpath.c:752-767). On a unique join,
+// Nested Loop stops at the first match, so a Memoize entry can be marked
+// complete after one tuple only when the parameterization enforces every join
+// clause. With a clause left over as a join filter, PG builds no Memoize at
+// all. TPC-DS Q72's date_dim d2 probe is the case: d_date_sk is unique, and
+// d1.d_week_seq = d2.d_week_seq stays a join filter. goopg cached it anyway,
+// which priced the probe 214 below PG's plain index scan.
+func TestNLIMemoizeRefusesUniqueJoinWithFilter(t *testing.T) {
+	cp := defaultCostParams()
+	outerRelids, innerRelids := relsetOf(0), relsetOf(1)
+	s := memoTestCtx(t, 10000, 0.02, true)
+	outer := scanRel(outerRelids, 10000, estScanPages(10000, 32))
+	inner, _ := memoInnerRel(innerRelids, outerRelids, 1)
+	ip := inner.CheapestParameterized[1]
+	filter := []*restrictInfo{{}}
+
+	if nliMemoizeCandidate(s, outer, outer.CheapestTotal, ip, cp, false, filter) == nil {
+		t.Fatal("a non-unique join with a join filter must still get its cache")
+	}
+	if nliMemoizeCandidate(s, outer, outer.CheapestTotal, ip, cp, true, nil) == nil {
+		t.Fatal("a unique join whose parameterization enforces every clause must still get its cache")
+	}
+	if p := nliMemoizeCandidate(s, outer, outer.CheapestTotal, ip, cp, true, filter); p != nil {
+		t.Fatal("a unique join with a join filter must get no Memoize (PG builds none)")
+	}
+}

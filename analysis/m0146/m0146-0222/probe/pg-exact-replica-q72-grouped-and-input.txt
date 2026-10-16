@@ -1,0 +1,42 @@
+M22U add_path type=368 startup=15476.0462 total=15476.3762 rows=3.0 accept=1 sub=-1 nkeys=0
+M22U add_path type=369 startup=15476.0862 total=15476.4687 rows=3.0 accept=1 sub=-1 nkeys=3
+M22U add_path type=369 startup=21567.5236 total=21877.3234 rows=3.0 accept=1 sub=-1 nkeys=3
+M22 input path type=331 startup=15475.8705 total=15490.7935 rows=1.0 nkeys=3
+M22 input path type=331 startup=1160.0325 total=15491.6777 rows=1.0 nkeys=0
+M22 input path type=331 startup=15233.1466 total=16079.1291 rows=1.0 nkeys=1
+M22 input path type=331 startup=15228.8862 total=16531.9597 rows=1.0 nkeys=3
+M22 input path type=331 startup=13208.3890 total=20291.0383 rows=1.0 nkeys=1
+M22 input path type=331 startup=4257.4527 total=20910.5381 rows=1.0 nkeys=1
+M22 input path type=331 startup=21257.9062 total=21892.4999 rows=1.0 nkeys=1
+M22 input path type=331 startup=160.0325 total=23522.9404 rows=1.0 nkeys=0
+M22 input path type=331 startup=2.3150 total=30477.6344 rows=1.0 nkeys=0
+M22 input path type=331 startup=2.0275 total=32166.3147 rows=1.0 nkeys=0
+M22 input path type=331 startup=1.7350 total=35598.8191 rows=1.0 nkeys=0
+M22 input path type=331 startup=1.4525 total=42745.8781 rows=1.0 nkeys=0
+M22 input path type=331 startup=3100.1577 total=84260.5221 rows=1.0 nkeys=1
+M22 input path type=331 startup=1.1600 total=103454.3063 rows=1.0 nkeys=0
+M22 input path type=331 startup=1.0250 total=146358.3410 rows=1.0 nkeys=0
+M22 input path type=331 startup=0.7325 total=442555.7562 rows=1.0 nkeys=0
+M22 input path type=331 startup=9671.9794 total=499983.3325 rows=1.0 nkeys=1
+M22 input path type=331 startup=0.7225 total=552068.5559 rows=1.0 nkeys=0
+M22 input path type=331 startup=0.7125 total=839361.4657 rows=1.0 nkeys=0
+M22 input path type=331 startup=8514.6894 total=892496.7150 rows=1.0 nkeys=1
+M22 input path type=331 startup=0.4300 total=2408425.0569 rows=1.0 nkeys=0
+M22 input path type=331 startup=0.2925 total=6262967.0601 rows=1.0 nkeys=0
+M22 input path type=331 startup=0.2825 total=8408924.2334 rows=1.0 nkeys=0
+M22 input path type=331 startup=0.0000 total=9977987.8246 rows=1.0 nkeys=0
+M22U add_path type=365 startup=15475.8705 total=15490.8185 rows=1.0 accept=1 sub=331 nkeys=3
+M22U add_path type=365 startup=15656.1479 total=16079.2591 rows=1.0 accept=0 sub=363 nkeys=3
+M22U add_path type=365 startup=15228.8862 total=16531.9847 rows=1.0 accept=1 sub=331 nkeys=3
+M22U add_path type=365 startup=16749.7237 total=20291.1683 rows=1.0 accept=0 sub=363 nkeys=3
+M22U add_path type=365 startup=12584.0054 total=20910.6681 rows=1.0 accept=1 sub=363 nkeys=3
+M22U add_path type=365 startup=21575.2130 total=21892.6299 rows=1.0 accept=1 sub=363 nkeys=3
+M22U add_path type=365 startup=43680.3499 total=84260.6521 rows=1.0 accept=0 sub=363 nkeys=3
+M22U add_path type=365 startup=254827.6659 total=499983.4625 rows=1.0 accept=0 sub=363 nkeys=3
+M22U add_path type=365 startup=450505.7122 total=892496.8450 rows=1.0 accept=0 sub=363 nkeys=3
+M22U add_path type=365 startup=15476.0862 total=15476.5237 rows=1.0 accept=0 sub=369 nkeys=3
+M22U add_path type=365 startup=21567.5236 total=21877.3784 rows=1.0 accept=1 sub=369 nkeys=3
+M22U add_path type=365 startup=15490.8085 total=15490.8185 rows=1.0 accept=0 sub=331 nkeys=0
+M22U add_path type=365 startup=15476.5137 total=15476.5237 rows=1.0 accept=0 sub=369 nkeys=0
+M22U add_path type=362 startup=15490.8285 total=15490.8335 rows=1.0 accept=1 sub=-1 nkeys=4
+M22U add_path type=373 startup=15490.8285 total=15490.8335 rows=1.0 accept=1 sub=-1 nkeys=4

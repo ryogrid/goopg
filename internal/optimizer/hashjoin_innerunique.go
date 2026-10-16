@@ -355,3 +355,25 @@ func prunedGroupKeysEquated(agg *Aggregate, equated map[int]bool) bool {
 	}
 	return true
 }
+
+// extraInnerUnique is add_paths_to_joinrel's extra->inner_unique
+// (joinpath.c:152-179) for one ordered pair:
+//   - false for SEMI and ANTI joins;
+//   - for JOIN_UNIQUE_INNER, true when the semijoin's min_lefthand lies
+//     inside the outer rel;
+//   - otherwise innerrel_is_unique over the pair's join clauses. jt is
+//     already INNER when a side is unique-ified, as JOIN_UNIQUE_OUTER passes
+//     JOIN_INNER.
+//
+// get_memoize_path reads it (M0146-0222). The cost paths read their own
+// fail-closed variant (innerUniqueMatchFactors' caller in joinpaths.go).
+func (s *searchCtx) extraInnerUnique(outer, inner *RelOptInfo, jt parser.JoinType, clauses []*restrictInfo,
+	uniq uniqueSide, sjinfo *SpecialJoinInfo) bool {
+	if uniq == uniqueSideInner {
+		return sjinfo != nil && relsSubset(sjinfo.MinLefthand, outer.Relids)
+	}
+	if !innerUniqueJoinType(jt) {
+		return false
+	}
+	return s.innerRelProvenUnique(outer, inner, clauses, true)
+}
