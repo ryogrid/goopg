@@ -3525,6 +3525,11 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
     variant for partsupp at all \(instrument `addPath`; memory: goopg's optimizer may lack such a path inside a
     join tree\). Then compare the per\-worker row and worker counts \(`compute\_parallel\_worker` over heap and
     index pages\).
+  - Recon note \(filing loop\): the paths should already exist. `addIndexOnlyPaths` \(pathindexonly.go, M0134\-0187\)
+    builds the full index\-only path, and its partial twin `indexonly.partial` \(M0134\-0189\) is a Parallel Index
+    Only Scan. `indexOnlyResidualAdmissible` admits an uncorrelated hashed SubPlan filter. So the likelier
+    divergence is cost or worker count \(3 vs PG 4\), not a missing path. Confirm with an `addPath` trace for
+    partsupp before changing anything \(memory planner\_verify\_both\_candidates\_generated\).
   - Expected instrument: TPC\-H PLAN\-PARITY match 21 → 22.
 - [x] **M0146-0209 — TPC\-DS SF1 Q18: goopg plans a Gather Merge over per\-worker Sorts below the grouping\-sets GroupAggregate, where PG plans a Sort over a Gather \(sort\-strategy\)**
   \(filed 2026\-10\-16 by the M0146\-0014 S9 pass, `analysis/m0146/m0146\-0014/routing\-20261016j/ROUTING\.md`\)\.
