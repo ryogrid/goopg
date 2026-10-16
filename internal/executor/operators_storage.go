@@ -1087,9 +1087,6 @@ type seqScanOp struct {
 	// the non-fast Build path and any compile failure fall back to.
 	pfSlab exprTreeSlab
 	pfIdx  int32
-	// tupleBuf is the per-scan scratch buffer PageGetHeapTupleInto copies
-	// each tuple into, so a scan costs no allocation per tuple.
-	tupleBuf []byte
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1987,14 +1984,18 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.pinned != nil {
 				o.pinned.RLock()
 			}
-			// Scratch-buffer read: the tuple's Data/Bitmap alias o.tupleBuf and
-			// are valid only until the next iteration reuses it. Safe here
-			// because the tuple is consumed entirely within this iteration
-			// (decode -> detoast -> cloneRowOwned) and no decode arm produces a
-			// Datum aliasing the tuple bytes — see PageGetHeapTupleInto's
-			// contract and TestDecodedRowDoesNotAliasSourceBuffer.
-			tuple, tbuf, err := storage.PageGetHeapTupleInto(page, o.curSlot, o.tupleBuf)
-			o.tupleBuf = tbuf
+			// Zero-copy read (M0122-0012), as PG reads a tuple in place under
+			// its buffer pin: the tuple's Data/Bitmap alias the page bytes.
+			// Safe because every use of them below happens before this tuple's
+			// RUnlock: decode, detoast and cloneRowOwnedPrefix all run under
+			// the RLock, and only tuple.Header (a value copy) is read after it.
+			// No decode arm produces a Datum aliasing the tuple bytes (varlenas
+			// land in the per-page arena or owned memory;
+			// TestDecodedRowDoesNotAliasSourceBuffer). A ring-buffer page is a
+			// private copy that stays valid until the scan leaves the page.
+			// The copy into a scratch buffer this replaced was ~6 % of a
+			// TPC-H Q1 scan.
+			tuple, err := storage.PageGetHeapTupleNoCopy(page, o.curSlot)
 			o.curSlot++
 			if err != nil {
 				if o.pinned != nil {

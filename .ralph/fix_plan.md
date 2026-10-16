@@ -1217,6 +1217,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       is updated in place \(exactly numericAdd's result\). Pinned by `TestAggNumericSumInPlaceMatchesExact`, which
       checks exact sums incl. overflow into the big lane and is mutation\-checked.
     - Q1 went from ~1660 ms to ~1555 ms \(−6%\); across slices 10\-12, ~1.91 s → ~1.55 s \(PG ~1.23 s\).
+  - **Slice 13 — the seq scan reads tuples in place LANDED 2026\-10\-16 \(loop \#50\).** Movement: none — perf only.
+    The S3 instrument is value/plan identity: acceptance arm PASS, sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS. Recon doc "Slice 13".
+    - `seqScanOp.Next` uses `PageGetHeapTupleNoCopy` \(PG's in\-place read under the pin\) instead of copying each
+      tuple into a scratch buffer, which was 6.5% memmove on Q1. Every Data/Bitmap use precedes the tuple's RUnlock.
+    - Q1 median went from ~1563 ms to ~1505 ms \(about −3.5%\).
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

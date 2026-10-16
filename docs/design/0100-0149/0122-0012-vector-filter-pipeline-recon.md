@@ -454,3 +454,35 @@ known ±15 % per-query noise; values identical. sf025 PASS=99 PLAN-SHAPE same=99
 passed.
 
 Across slices 10-12, Q1 went from ~1.91 s to ~1.55 s, against PG 18.3's ~1.23 s.
+
+## Slice 13 (2026-10-16): the seq scan reads tuples in place
+
+After slice 12, `runtime.memmove` was 6.5 % of TPC-H Q1, all of it from `seqScanOp.Next`.
+`PageGetHeapTupleInto` copied every tuple's bytes into a per-scan scratch buffer before decoding. PG reads a heap
+tuple in place under its buffer pin (`heapgettup_pagemode` returns a pointer into the page). `seqScanOp` now does
+the same with `PageGetHeapTupleNoCopy`, which the index scan's hot path already uses (M0092-0006).
+
+Why aliasing the page is safe here:
+- **Every read of `tuple.Data` / `tuple.Bitmap` happens before that tuple's `RUnlock`.** That covers the prefix
+  deform, the tail deform, detoast, the GiST-SSI match and `cloneRowOwnedPrefix`. After the unlock only
+  `tuple.Header`, a value copy, is read: the SSI conflict hooks and the hint-bit decision.
+- **No decode arm returns a Datum aliasing the tuple bytes.** Varlenas land in the per-page arena or in owned
+  memory; `TestDecodedRowDoesNotAliasSourceBuffer` pins this.
+- **Ring-buffer pages** are private copies that stay valid until the scan moves to the next page.
+
+The unused `tupleBuf` field was removed.
+
+**Measured:** Q1 on a private TPC-H clone, three rounds, fresh server per arm:
+
+| round | HEAD `ef43b333b` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 1598 / 1558 / 1575 / 1547 | 1511 / 1526 / 1495 / 1493 |
+| 2 | 1604 / 1590 / 1577 / 1557 | 1488 / 1504 / 1517 / 1496 |
+| 3 | 1517 / 1511 / 1559 / 1572 | 1511 / 1516 / 1516 / 1501 |
+
+That is median ~1563 → ~1505 ms, about −3.5 %. The candidate's median was lower in every round, but round 3
+overlaps. The acceptance arm returned identical values; its single-shot totals (37.93 → 38.01 s) are inside its
+noise.
+
+**Gates:** units, the full `TestPort_Isolation*` family (this changes how the scan touches shared page memory),
+tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
