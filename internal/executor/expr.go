@@ -18169,6 +18169,12 @@ case "pg_char_to_encoding":
 	// pg_stat_reset() → void: reset all cumulative statistics for the current
 	// database. goopg currently tracks only function stats, so this clears the
 	// shared function-stats store. Design 0118-0124.
+	// PG 18 statistics import, the calls pg_dump --statistics emits
+	// (statistics/attribute_stats.c, relation_stats.c). M0146-0215.
+	case "pg_restore_attribute_stats":
+		return evalPgRestoreAttributeStats(x, slot, ctx)
+	case "pg_restore_relation_stats":
+		return evalPgRestoreRelationStats(x, slot, ctx)
 	case "pg_stat_reset":
 		funcStats.resetAll()
 		relStats.resetAll()

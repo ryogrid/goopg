@@ -4248,6 +4248,27 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       \(statistics/attribute\_stats\.c, relation\_stats\.c\), so a corpus can carry the reference's exact
       statistics\. goopg has the names only in the pg\_proc seed\. Importing into the bench corpora is an owner
       action; the functions are engine work and are the next slice\.
+  - **Slice 2 LANDED 2026\-10\-16 \(loop \#57\): PG 18 statistics import\.** Design
+    `docs/design/0100-0149/m0146-0215-pg-statistics-import.md`\.
+    - `pg\_restore\_attribute\_stats` / `pg\_restore\_relation\_stats` \(executor/stats\_import\.go\) port
+      stat\_utils\.c's pair parsing and attribute\_stats\.c / relation\_stats\.c's semantics\. Values go through the
+      column type's input with typmod; the result merges into existing stats and persists through ANALYZE's
+      writers\. The FROM\-position form pg\_dump emits is planned as a ScalarFuncScan\.
+    - `catalog.ColumnStatsDistinct` is the one stadistinct conversion, shared with the startup reload\.
+      pg\_stats\.avg\_width now renders the integer stawidth\.
+    - Pins: TestPgRestoreAttributeStatsRoundTrip \(the pg\_stats text round\-trips to the restart form\),
+      …Semantics \(merge, WARNING/false, ERROR paths\), TestPgRestoreRelationStats,
+      TestImportedNullFracReachesPlanner\. Mutation\-checked\.
+    - Measured on a private SF0\.25 clone: the reference's 474 stats calls import cleanly in 1\.5 s, and SF0\.25
+      PLAN\-PARITY goes **86 → 88** \(Q76, Q99 MATCH, no regressions\), surviving two restarts\. The shipped corpora
+      are unchanged\.
+    - Gates: units, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 same=99, tpcds\-fireset PASS
+      \(no plan change\), TestPort\_RegressSuite\. Ledger rows: relallvisible, element/range kinds, clear
+      functions\.
+    - **Gate: owner\-import stats\.** The record moves only when the bench corpora carry the reference's
+      statistics: run the `pg\_restore\_\*\_stats` section of `pg\_dump \-\-statistics \-d tpcds025` \(and
+      `\-d tpcds` for SF1\) on the goopg clusters\. That replaces their ANALYZE statistics, so it is the owner's call
+      \(see the escalation in the baton\)\.
 - [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.

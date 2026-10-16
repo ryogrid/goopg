@@ -7074,6 +7074,14 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "parse_ident") {
 		return planScalarFuncScan(rv, sourceIdx, "text[]")
 	}
+	if strings.EqualFold(tf.Name, "pg_restore_attribute_stats") || strings.EqualFold(tf.Name, "pg_restore_relation_stats") {
+		// PG 18 statistics import in FROM position, the form pg_dump
+		// --statistics emits (`SELECT * FROM pg_catalog.pg_restore_..._stats(...)`):
+		// a scalar boolean function scanned once for one row, as
+		// ExecMakeTableFunctionResult does for any non-SETOF function.
+		// M0146-0215.
+		return planScalarFuncScan(rv, sourceIdx, "bool")
+	}
 	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
 		return planPgGetPublicationTables(rv, sourceIdx, lateralCtx)
 	}

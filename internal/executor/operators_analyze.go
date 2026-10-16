@@ -428,19 +428,44 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 			// (examine_attribute returns NULL upstream); write no row.
 			continue
 		}
-		attNum := int16(col.Ordinal + 1)
-		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
-		if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
-			row, cs = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
-		}
-		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+		if err := writeColumnStatRow(ctx, statRel, cols, tbl, col, cs); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if err := persistRelSize(ctx, tbl, stats.RowCount, stats.Pages); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// writeColumnStatRow appends one column's pg_statistic row: the per-column
+// step of persistStatsToPGStatistic, shared with pg_restore_attribute_stats
+// so an imported column is persisted by ANALYZE's own writer (M0146-0215).
+// An oversized row is truncated to fit, as there (B-02).
+func writeColumnStatRow(ctx *Context, statRel storage.RelFileNode, cols []catalog.Column, tbl *catalog.Table, col catalog.Column, cs catalog.ColumnStats) error {
+	attNum := int16(col.Ordinal + 1)
+	row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+	if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
+		row, _ = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
+	}
+	if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
+		return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+	}
+	return nil
+}
+
+// persistColumnStats writes one column's pg_statistic row to the connection's
+// database. It is pg_restore_attribute_stats' persistence step.
+func persistColumnStats(ctx *Context, tbl *catalog.Table, col catalog.Column, cs catalog.ColumnStats) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil {
+		return nil
+	}
+	statRel := storage.RelFileNode{
+		DBOid:  tableCatalogHeapDBOid(ctx),
+		RelOid: catalog.StatisticRelationId,
+		Fork:   storage.MainFork,
+	}
+	return writeColumnStatRow(ctx, statRel, pgStatisticColumnsPG18(), tbl, col, cs)
 }
 
 // pgStatisticMaxBoundBytes caps one histogram/MCV bound's width in the B-02

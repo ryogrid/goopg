@@ -99,7 +99,13 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 			}
 
 			N := VirtualNull
-			avgWidth := strconv.FormatFloat(cs.AvgWidth, 'g', -1, 32)
+			// pg_stats.avg_width is pg_statistic.stawidth, an integer: the
+			// writer stores int(AvgWidth+0.5) (buildUserPGStatisticRow), and
+			// the view shows that same value. Rendering the float showed
+			// fractions PG never shows, and a pg_dump --statistics of goopg
+			// then emitted '7.25'::integer, which the restore rejects
+			// (M0146-0215).
+			avgWidth := strconv.FormatInt(int64(cs.AvgWidth+0.5), 10)
 			// Correlation is float4 in pg_statistic (stanumbers3[0]). It is
 			// rendered NULL when zero, mirroring the writer, which omits the
 			// slot rather than storing a zero — and mirroring PG, which does

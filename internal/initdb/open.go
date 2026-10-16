@@ -4373,27 +4373,11 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if idx < 0 || idx >= len(colStats) {
 				continue
 			}
-			var distinctVal int64
-			var distinctFrac float64
-			if sr.StaDistinct < 0 {
-				// PG's negative convention: a fraction of the relation's
-				// rows. Restored as the fraction rather than being converted
-				// to a count, because converting needs a row count that this
-				// reload does not have (ledger pq-P6) — and the consumer that
-				// wants it, the parallel-aggregate split gate, wants the
-				// fraction anyway.
-				//
-				// Before this the negative case was discarded into 0, so a
-				// real PG heap's stadistinct read as "no estimate".
-				f := float64(-sr.StaDistinct)
-				if f > 1 {
-					f = 1
-				}
-				distinctFrac = f
-			}
-			if sr.StaDistinct > 0 {
-				distinctVal = int64(sr.StaDistinct)
-			}
+			// PG's sign convention: a negative stadistinct is a fraction of the
+			// relation's rows, a positive one a count. The fraction stays a
+			// fraction (ledger pq-P6); the conversion is shared with
+			// pg_restore_attribute_stats.
+			distinctVal, distinctFrac := catalog.ColumnStatsDistinct(float64(sr.StaDistinct))
 			cs := catalog.ColumnStats{
 				NDistinct:     distinctVal,
 				NDistinctFrac: distinctFrac,

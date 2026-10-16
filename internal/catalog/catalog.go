@@ -2056,6 +2056,28 @@ type ColumnStats struct {
 // statistics restored from a real PG heap arrive: initdb's pg_statistic reload
 // can recover a negative stadistinct only as a fraction, because converting it
 // to a count needs a row count the reload does not have (ledger row pq-P6).
+// ColumnStatsDistinct converts a stored pg_statistic.stadistinct into
+// ColumnStats' two fields. PG's sign convention: a negative value is a
+// fraction of the relation's rows (capped at 1), a positive one an absolute
+// count, zero unknown. It is the one conversion every reader of a stadistinct
+// shares: startup's pg_statistic reload, and pg_restore_attribute_stats
+// importing an n_distinct (M0146-0215). An imported column must read the
+// same before and after a restart. The fraction stays a fraction, not a
+// count, because the conversion would need a row count that neither caller
+// has (ledger pq-P6).
+func ColumnStatsDistinct(staDistinct float64) (count int64, frac float64) {
+	switch {
+	case staDistinct < 0:
+		frac = -staDistinct
+		if frac > 1 {
+			frac = 1
+		}
+	case staDistinct > 0:
+		count = int64(staDistinct)
+	}
+	return count, frac
+}
+
 func (cs ColumnStats) StaDistinct() float64 {
 	switch {
 	case cs.NDistinctFrac > 0.1:
