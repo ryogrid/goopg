@@ -1182,6 +1182,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       overhead \(5.9%\) paid it back.
     - A win needs a single\-pass restructure \(fetch and deform once, zero\-copy tuple view\), with a ~8% ceiling.
       Not pursued; the evaluator stays as infrastructure.
+  - **Slice 9 — a constant\-divisor arm in `NumericInt64FromStoredPayload` — measured inside the noise, not landed
+    \(2026\-10\-16, loop \#46\).** Movement: none — measured non\-improvement. Recon doc "Slice 9".
+    - The 128/64 DIVQ held ~20% of the function's samples. Dividing by a constant when the high word is zero
+      measured ~1180 ms against HEAD's ~1180 ms over six rounds: the latency was already hidden.
+    - **Scan\-qual micro\-optimization is exhausted** \(slices 6, 8, 9: three consecutive non\-improvements\). The next
+      M0122\-0012 slice must profile a different workload \(hash join / aggregation, TPC\-H Q1/Q9\) before changing
+      code.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

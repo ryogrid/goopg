@@ -326,3 +326,20 @@ the copies. What remains is the cost of the tree-walk itself: a jump-table dispa
 and branch prediction across the recursion. Removing per-row Datum traffic does not reach it. The lever is
 evaluating each node over a batch of rows, so the dispatch is paid once per batch. That is the scan-resident batch
 successor (the SeqScanOp entry in `unimplemented_feat.json`), and it must keep the `currentTID` read-ahead rule above.
+
+## Slice 9 (2026-10-16): numeric decode's 128-bit division — measured inside the noise, not landed
+
+After slice 8, `perf annotate` put about 20 % of `NumericInt64FromStoredPayload` (~9 % of the filtered SF1
+`store_sales` scan) on the instruction after `bits.Div64`. That is the 128/64 DIVQ that strips the trailing
+base-10000 digit's zero padding. A variant divided by a constant (10, 100, 1000, 10000) whenever the high word is
+zero, letting the compiler multiply and shift instead. It was exactly equivalent (`Div64(0, lo, p)` is `lo/p, lo%p`)
+and pinned by a randomized text-path oracle over scales 0-18; a wrong divisor failed it.
+
+Measured, six rounds, fresh server per arm: HEAD ~1180 ms, candidate ~1180 ms, with no consistent order between
+rounds. The DIVQ latency was already hidden by out-of-order execution; the samples on it were the instruction
+waiting, not a bottleneck. Not landed; the code and its test were discarded before commit.
+
+**The scan-qual micro-optimization route is exhausted.** Slices 6, 8 and 9 are three consecutive measured
+non-improvements on the per-row filtered-scan path, after slices 2-5 took it from ~1970 ms to ~1095 ms. What remains
+needs the single-pass page restructure (0122-0012b §5). The next M0122-0012 work should profile a different workload,
+such as a hash join or aggregation (TPC-H Q1/Q9), before attempting another change.
