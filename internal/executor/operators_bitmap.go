@@ -527,6 +527,17 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 		o.mctx = mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)
 	}
 
+	// SSI phantom coverage (M-NIGHTLY ReadWriteUnique4): PG's bitmap index
+	// scan predicate-locks every index leaf page it visits (btgetbitmap ->
+	// _bt_first/_bt_readpage PredicateLockPage), so a concurrent insert of a
+	// key in the scanned range conflicts in. goopg keeps no btree-page SIREAD
+	// locks; like indexScanOp's gap lock it takes the relation grain instead.
+	// Without this a SERIALIZABLE read through a bitmap plan held no predicate
+	// lock at all.
+	if o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView) {
+		ssiRecordRelationRead(ctx, o.rel)
+	}
+
 	// S5.6: when a parallel bitmap state is attached, the bitmap was already
 	// built by the leader and published there. Workers skip building the outer
 	// tree entirely — they claim pages from the shared allocator.
@@ -840,19 +851,60 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 // stalled by a lock parked between Next() calls.
 func (o *bitmapHeapScanOp) fetchOneTuple(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, error) {
 	o.pinned.RLock()
-	defer o.pinned.RUnlock()
+	slot, read, err := o.fetchOneTupleLocked(block, offset, recheck)
+	o.pinned.RUnlock()
+	// SSI read path (M-NIGHTLY ReadWriteUnique4), after the page lock is
+	// released as indexScanOp does: PG's bitmap heap fetch predicate-locks and
+	// conflict-checks every visible tuple before its recheck/filter
+	// (heapam_handler.c BitmapHeapScanNextBlock: PredicateLockTID +
+	// HeapCheckForSerializableConflictOut), and conflict-checks an invisible
+	// one's inserter. A non-nil error is the reader closing a dangerous
+	// structure to an already-committed writer (40001).
+	if read.visible {
+		if serr := ssiRecordTupleRead(o.ctx, o.rel, block, read.slot, read.xmin, read.xmax); serr != nil {
+			return nil, serr
+		}
+	} else if read.invisXmin != storage.InvalidTransactionID {
+		if serr := ssiRecordInvisibleTupleRead(o.ctx, o.rel, read.invisXmin); serr != nil {
+			return nil, serr
+		}
+	}
+	return slot, err
+}
+
+// bitmapSSIRead is what fetchOneTupleLocked saw of one heap TID, for the SSI
+// calls fetchOneTuple makes once the page lock is released.
+type bitmapSSIRead struct {
+	visible    bool
+	slot       uint16 // HOT-resolved live slot of a visible tuple
+	xmin, xmax storage.TransactionID
+	invisXmin  storage.TransactionID // inserter of a present-but-invisible tuple
+}
+
+func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset uint16, recheck bool) (TupleSlot, bitmapSSIRead, error) {
+	var read bitmapSSIRead
 	id, err := storage.PageGetItemID(o.pageBuf, offset)
 	if err != nil {
-		return nil, nil // entry reclaimed, skip
+		return nil, read, nil // entry reclaimed, skip
 	}
 	if id.Flags == storage.ItemIDUnused || id.Flags == storage.ItemIDDead {
-		return nil, nil // entry reclaimed, skip
+		return nil, read, nil // entry reclaimed, skip
 	}
 
 	// Follow HOT chain + MVCC visibility.
-	tuple, _, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
+	tuple, liveSlot, found := followHOTChainNoCopy(o.pageBuf, offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact, o.ctx.CmdID, o.ctx.comboStore())
 	if !found {
-		return nil, nil // tuple invisible, skip
+		// Present but invisible (a concurrent insert, or deleted at our
+		// snapshot): remember its inserter for the SSI phantom conflict-out.
+		if ssiActive(o.ctx) && id.Flags == storage.ItemIDNormal {
+			if raw, terr := storage.PageGetHeapTuple(o.pageBuf, offset); terr == nil {
+				read.invisXmin = raw.Header.Xmin
+			}
+		}
+		return nil, read, nil // tuple invisible, skip
+	}
+	if ssiActive(o.ctx) {
+		read = bitmapSSIRead{visible: true, slot: liveSlot, xmin: tuple.Header.Xmin, xmax: tuple.Header.Xmax}
 	}
 
 	// Lazily allocate scanRow.
@@ -862,17 +914,17 @@ func (o *bitmapHeapScanOp) fetchOneTuple(block storage.BlockNumber, offset uint1
 
 	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
 	if err := o.decodeScanRow(tuple.Data, tuple.Bitmap, storedNatts); err != nil {
-		return nil, nil // decode failure, skip
+		return nil, read, nil // decode failure, skip
 	}
 
 	// If recheck is required, evaluate the original index qual.
 	if recheck && len(o.plan.BitmapQual) > 0 {
 		passed, evalErr := o.evalBitmapQual()
 		if evalErr != nil {
-			return nil, evalErr
+			return nil, read, evalErr
 		}
 		if !passed {
-			return nil, nil // recheck failed, skip
+			return nil, read, nil // recheck failed, skip
 		}
 	}
 
@@ -883,14 +935,14 @@ func (o *bitmapHeapScanOp) fetchOneTuple(block storage.BlockNumber, offset uint1
 	if o.plan.Cond != nil {
 		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
 		if cerr != nil {
-			return nil, cerr
+			return nil, read, cerr
 		}
 		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
-			return nil, nil // filtered out; the caller skips a nil slot
+			return nil, read, nil // filtered out; the caller skips a nil slot
 		}
 	}
 
-	return o.emitRow(block, offset), nil
+	return o.emitRow(block, offset), read, nil
 }
 
 // emitRow builds the output slot for a fetched tuple at (block, offset).

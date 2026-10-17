@@ -126,9 +126,8 @@ func conjunctHasOnlyCorrelatedScalarSublinks(c Expr) bool {
 }
 
 // exprCarriesSublink reports whether e holds a sublink at this scope. Such a
-// clause is never a hash or merge key: goopg's join executors evaluate keys
-// without the SubPlan's parameter binding (PG can hash on `(SubPlan 1) =
-// ps_supplycost`, TPC-H Q2 — ledgered).
+// clause is a hash key only when paramExecScalarSublinksOnly admits it, and
+// never a merge key (restrictInfo.subplanKey).
 func exprCarriesSublink(e Expr) bool {
 	found := false
 	walkExprRefs(e, scopeIgnore, exprVisitor{
@@ -140,4 +139,38 @@ func exprCarriesSublink(e Expr) bool {
 		},
 	})
 	return found
+}
+
+// paramExecScalarSublinksOnly reports whether every sublink e holds is a
+// scalar SubPlan already lowered to PARAM_EXEC form: its outer references are
+// same-scope Args (one per ParParam), and its body reads nothing from outside
+// beyond those parameters. Such a SubPlan is an expression of its Args alone,
+// so an equality over it can key a hash join on the side its Args come from,
+// as PG hashes on `(SubPlan 1) = ps_supplycost` in TPC-H Q2 (M0146-0207).
+// The executor evaluates a key against the merged row of its side, which is
+// where the Args point. Off under GOOPG_SCALAR_UNNEST, whose post-planning
+// pass reads such a clause off the join's predicate (as
+// correlatedScalarSublinkBinding).
+func paramExecScalarSublinksOnly(e Expr) bool {
+	if scalarUnnestOn.Load() {
+		return false
+	}
+	found, ok := false, true
+	walked := walkExprRefs(e, scopeIgnore, exprVisitor{
+		Visit: func(n Expr) bool {
+			if !ok || len(ExprSubplans(n)) == 0 {
+				return ok
+			}
+			x, isSub := n.(*SubqueryExpr)
+			if !isSub || x.Plan == nil || len(x.Args) == 0 || len(x.Args) != len(x.ParParam) ||
+				planHasOuterRef(x.Plan) {
+				ok = false
+				return false
+			}
+			found = true
+			return true
+		},
+		OnUnknown: func(Expr) { ok = false },
+	})
+	return walked && ok && found
 }

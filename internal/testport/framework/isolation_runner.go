@@ -48,9 +48,17 @@ func isBackendTerminationError(err error, sqlText string) bool {
 }
 
 const (
-	// blockDetectWait is how long a step must run before we assume it is
-	// blocked waiting for a lock.
+	// blockDetectWait is how long a step must run before the runner asks
+	// whether it is blocked waiting for a lock (awaitStepOrBlock).
 	blockDetectWait = 300 * time.Millisecond
+	// blockProbePoll is how often a still-running step that is NOT in a lock
+	// wait is re-probed.
+	blockProbePoll = 50 * time.Millisecond
+	// blockProbeCap bounds how long a running step that never reports a lock
+	// wait is waited for before it is treated as blocked anyway — the
+	// pre-probe timing rule, kept as a fallback for any goopg wait path that
+	// does not report wait_event_type 'Lock'.
+	blockProbeCap = 1500 * time.Millisecond
 	// postStepDrainWait is how long we wait after a regular step completes for
 	// recently unblocked pending steps to either finish or emit follow-up
 	// notices before advancing to the next regular step.
@@ -366,7 +374,70 @@ type sessionConns struct {
 	dbs          map[string]*sql.DB
 	conns        map[string]*sql.Conn
 	pidToSession map[int]string
-	sharedDB     *sql.DB // for the no-connector fallback comparison in close()
+	sessionPID   map[string]int // inverse of pidToSession, for blockedProbe
+	sharedDB     *sql.DB        // for the no-connector fallback comparison in close()
+}
+
+// blockedProbe returns the lock-wait probe for one session's backend: whether
+// pg_stat_activity shows it in a wait_event_type 'Lock' wait. It is goopg's
+// stand-in for isolationtester's pg_isolation_test_session_is_blocked(pid,
+// interesting_pids) (isolationtester.c try_complete_step; lockfuncs.c), which
+// goopg registers (pg_proc OID 3378) but does not implement. Unlike upstream it
+// does not restrict the blockers to the spec's own sessions — the test cluster
+// is private to the spec. known is false when the probe cannot run (no PID or
+// a query error); the caller then falls back to the timing rule.
+func (sc *sessionConns) blockedProbe(ctx context.Context, session string) func() (blocked, known bool) {
+	pid, ok := sc.sessionPID[session]
+	if !ok || sc.sharedDB == nil {
+		return func() (bool, bool) { return false, false }
+	}
+	return func() (bool, bool) {
+		var waitType sql.NullString
+		err := sc.sharedDB.QueryRowContext(ctx,
+			"SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE pid = $1", pid).Scan(&waitType)
+		if err != nil {
+			return false, false
+		}
+		return waitType.Valid && waitType.String == "Lock", true
+	}
+}
+
+// awaitStepOrBlock waits for a running step — just launched, or already
+// reported waiting and re-checked after a later step (drainWithTimeout). It
+// returns (outcome, true) when the step completes, or (zero, false) when the
+// step is (still) blocked.
+//
+// isolationtester (try_complete_step) never decides "blocked" from elapsed
+// time: it waits on the step's socket and, while the step is still running,
+// asks pg_isolation_test_session_is_blocked whether the backend waits on a
+// lock. A step that is merely slow — a WAL segment zero-fill or a 2PC
+// state-file write on a loaded host — is waited for, not labelled waiting.
+// The same probe re-checks waiting steps after every later step
+// (run_permutation's STEP_NONBLOCK|STEP_RETRY pass): a step the later step
+// unblocked is waited for until it completes, rather than for a fixed window.
+// This mirrors that: after firstWait the probe decides, and a step that
+// is still running without a lock wait is re-probed every blockProbePoll. Past
+// blockProbeCap, or when the probe cannot run, the step is treated as blocked
+// (the timing rule this replaced), so a goopg wait path that reports no wait
+// event still surfaces, only later.
+func awaitStepOrBlock(outCh <-chan stepOutcome, firstWait time.Duration, probe func() (blocked, known bool)) (stepOutcome, bool) {
+	start := time.Now()
+	select {
+	case outcome := <-outCh:
+		return outcome, true
+	case <-time.After(firstWait):
+	}
+	for {
+		blocked, known := probe()
+		if !known || blocked || time.Since(start) >= blockProbeCap {
+			return stepOutcome{}, false
+		}
+		select {
+		case outcome := <-outCh:
+			return outcome, true
+		case <-time.After(blockProbePoll):
+		}
+	}
 }
 
 // openSessionConns opens one persistent connection per session.
@@ -392,6 +463,7 @@ func (r *IsolationRunner) openSessionConns(ctx context.Context, spec IsolationSp
 		dbs:          make(map[string]*sql.DB, len(sessionNames)),
 		conns:        make(map[string]*sql.Conn, len(sessionNames)),
 		pidToSession: make(map[int]string, len(sessionNames)),
+		sessionPID:   make(map[string]int, len(sessionNames)),
 		sharedDB:     sharedDB,
 	}
 	for _, sname := range sessionNames {
@@ -436,6 +508,7 @@ func (r *IsolationRunner) openSessionConns(ctx context.Context, spec IsolationSp
 		}
 		if pid, ok := backendPIDOf(ctx, conn); ok {
 			sc.pidToSession[pid] = sname
+			sc.sessionPID[sname] = pid
 		}
 	}
 	return sc, nil
@@ -509,6 +582,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 	notifyQueues := sc.notifyQueues
 	conns := sc.conns
 	pidToSession := sc.pidToSession
+	probeFor := func(session string) func() (bool, bool) { return sc.blockedProbe(ctx, session) }
 
 	// activeSteps tracks the cancel function and result channel for the most
 	// recently launched goroutine on each session's connection. The deferred
@@ -644,8 +718,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 			ch <- execStepFromQueue(sctx, c, sqlText, sess, queue)
 		}(stepCtx, conn, step.SQL, step.Session, q, outCh)
 
-		select {
-		case outcome := <-outCh:
+		if outcome, completed := awaitStepOrBlock(outCh, blockDetectWait, sc.blockedProbe(ctx, step.Session)); completed {
 			// Step completed immediately — release its context.
 			stepCancel()
 			activeSteps[step.Session] = nil
@@ -684,10 +757,10 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 				// s7a8(s8a1)): those must print AFTER it. Steps still blocked simply
 				// time out of the drain and stay pending.
 				gatedOnStar, ungated := partitionGatedOn(pending, step.Name)
-				ungated = drainWithTimeout(&sb, spec, sessionQueues, ungated, postStepDrainWait)
+				ungated = drainWithTimeout(&sb, spec, sessionQueues, ungated, postStepDrainWait, probeFor)
 				writeCompletedStep(&sb, step.Name, step.SQL, outcome)
 				pending = append(ungated, gatedOnStar...)
-				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait, probeFor)
 			} else {
 				// Honor completion blockers: delay reporting this step's
 				// completion until the markers are satisfied (e.g. "notices <n>").
@@ -700,11 +773,10 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 				// window to complete (matching PostgreSQL isolationtester order:
 				// unblocked waiting steps appear before the next regular step).
 				sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait, probeFor)
 			}
-
-		case <-time.After(blockDetectWait):
-			// Step appears blocked.  Drain notices that arrived before the
+		} else {
+			// Step is blocked on a lock.  Drain notices that arrived before the
 			// row-level wait (e.g. from RAISE NOTICE in PL/pgSQL predicates
 			// evaluated before the blocking point). These must appear BEFORE
 			// the "step name: sql <waiting ...>" line, matching PostgreSQL
@@ -993,14 +1065,13 @@ func partitionGatedOn(pending []pendingStep, stepName string) (gated, ungated []
 	return gated, ungated
 }
 
-func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep, window time.Duration) []pendingStep {
+func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep, window time.Duration, probeFor func(session string) func() (blocked, known bool)) []pendingStep {
 	if len(pending) == 0 {
 		return pending
 	}
 	remaining := pending[:0]
 	for _, p := range pending {
-		select {
-		case o := <-p.outCh:
+		if o, completed := awaitStepOrBlock(p.outCh, window, probeFor(p.session)); completed {
 			if p.cancelFn != nil {
 				p.cancelFn()
 			}
@@ -1009,7 +1080,7 @@ func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string
 				o.notices = p.queue.drain()
 			}
 			writeCompletedStep(sb, p.name, p.sql, o)
-		case <-time.After(window):
+		} else {
 			drainPendingStepNotices(sb, p)
 			remaining = append(remaining, p)
 		}

@@ -899,9 +899,9 @@ func CompareKeys(a, b []byte) int {
 //     page's Slot.Lock only, so writers on different pages proceed
 //     in parallel.
 //   - split path: page splits (and their parent/root/meta updates)
-//     are serialised through splitMu to keep tree-structure changes
-//     atomic while Landing 3's full writer-coupling protocol is
-//     still staged.
+//     take no tree-wide lock (M0122-0010 gap 8); PG's lock coupling
+//     orders them — child latched before parent, the parent re-found
+//     by downlink, a root split done with both halves latched.
 type BTree struct {
 	pool     *storage.Pool
 	rel      storage.RelFileNode
@@ -921,26 +921,12 @@ type BTree struct {
 	// pgkeycmp.go and pgitemcodec.go.
 	keyFmt indexFormat
 
-	// splitMu serialises split-path inserts and metapage
-	// publication. (M0055-0004-followup-stage2-splitmu-removal:
-	// experimentally removed splitMu from the slow path; the
-	// existing buffer-pool eviction protocol made concurrent
-	// pin/unpin paths surface "unpin underflow" panics under
-	// 32-writer stress. The Stage 2 work needs an additional
-	// reader/writer interaction-safety guarantee in the
-	// buffer pool itself before the structural mutex can be
-	// fully retired. The protocol-level INCOMPLETE_SPLIT
-	// lifecycle from `(*BTree).finishSplit` runs unchanged;
-	// this commit lands the race-safe createNewRoot half of
-	// Stage 2 — concurrent root-lifts no longer orphan a
-	// separator, even when both writers see the same OLD
-	// root.)
-	splitMu sync.Mutex
-	// sharedSplitMu is the pool-owned, relation-scoped counterpart of splitMu.
-	// Normal Open/Create handles use it so independent backend handles cannot
-	// interleave structural changes; local splitMu remains a safe fallback for
-	// direct package test literals.
-	sharedSplitMu *sync.Mutex
+	// (No structural mutex: a per-handle splitMu and then a pool-owned,
+	// relation-scoped one serialised every split and page deletion until
+	// M0122-0010 replaced them with PG's lock coupling — see design
+	// 0055-0002 §4.2. The 2026-05 attempt to drop splitMu hit "unpin
+	// underflow" panics under 32-writer stress; that was the evictVictim
+	// race, fixed since.)
 
 	// M0055-0001: write-path counters used by the baseline
 	// harness and Phase A/B regression tests. Backed by per-P
@@ -1090,22 +1076,6 @@ type BTree struct {
 	// temporal ordering — e.g. "did any rewrite event on this block happen
 	// after this specific insert". Guarded by insertLogMu.
 	logSeqNext uint64
-}
-
-func (bt *BTree) lockStructural() {
-	if bt.sharedSplitMu != nil {
-		bt.sharedSplitMu.Lock()
-		return
-	}
-	bt.splitMu.Lock()
-}
-
-func (bt *BTree) unlockStructural() {
-	if bt.sharedSplitMu != nil {
-		bt.sharedSplitMu.Unlock()
-		return
-	}
-	bt.splitMu.Unlock()
 }
 
 // btreeInsertLogEvent is one recorded insertItemSorted call (see
@@ -1905,7 +1875,7 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 
 // OpenWithOptions is the wired-up Open variant.
 func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs, sharedSplitMu: pool.BTreeStructuralLock(rel)}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
@@ -1955,7 +1925,7 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs, sharedSplitMu: pool.BTreeStructuralLock(rel)}
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit, keyFmt: indexFormat{desc: opts.KeyDesc}, deadTIDs: opts.DeadTIDs}
 
 	// Ensure the relation file starts at block 0 (see
 	// BulkCreateWithOptions for rationale).
@@ -2139,8 +2109,8 @@ func (bt *BTree) markDirtyWithPageRecord(slot *storage.Slot, blk storage.BlockNu
 	return nil
 }
 
-// updateRootMeta rewrites the metapage root pointer + level. Caller
-// must hold bt.splitMu (structural writer serialisation).
+// updateRootMeta rewrites the metapage root pointer + level. Callers are
+// root creation with the old root latched, and vacuum resetting an empty tree.
 func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	slot, err := bt.pinW(MetaBlock)
 	if err != nil {
@@ -2527,6 +2497,18 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 // (root..parent-of-leaf), used by writers to propagate separator
 // items up after a split. Readers ignore it.
 func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
+	return bt.descend(key, false)
+}
+
+// descendForInsert is descendToLeaf for a writer: like _bt_search with
+// forupdate set, it finishes every incomplete split it meets on the way down
+// (_bt_moveright), so the leaf it returns, and the pages above it, never carry
+// BTIncompleteSplit — _bt_insertonpg's precondition.
+func (bt *BTree) descendForInsert(key []byte) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
+	return bt.descend(key, true)
+}
+
+func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
 	meta, err := bt.readMeta()
 	if err != nil {
 		return 0, nil, err
@@ -2538,6 +2520,17 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			return 0, nil, err
 		}
 		op := readOpaque(slot.Page())
+
+		// A split whose parent step never ran (an error in between, or a
+		// crash: redo restores the half split) is finished by the next
+		// writer to reach its left page, which then re-reads the page.
+		if forUpdate && op.HasIncompleteSplit() {
+			bt.unpinR(slot)
+			if err := bt.finishSplit(cur, path); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
 
 		// Right-link recovery: a concurrent split may have moved
 		// our target keys to the right sibling. Follow op.Next
@@ -2561,19 +2554,6 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			if op.Next == storage.InvalidBlockNumber {
 				bt.rightmostLeafBlk.Store(uint64(cur))
 			}
-			// (M0055-0004-followup-stage2-splitmu-removal:
-			// eager finishSplit on descend was attempted but
-			// races with the fast-path concurrent descend
-			// produced unpin-underflow under -race stress.
-			// The flag remains observable; crash-replay
-			// completion is handled by an explicit
-			// `CompleteDeferredSplits` maintenance pass —
-			// implemented analogous to
-			// `CompleteDeferredDeletions` — rather than
-			// inline-on-descend. In steady-state operation
-			// the flag is set + cleared by the SAME slow-path
-			// goroutine while splitMu is held, so descenders
-			// never observe it.)
 			bt.unpinR(slot)
 			return cur, path, nil
 		}
@@ -2617,27 +2597,32 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 		return err
 	}
 
-	// Split path: serialise structure changes (split propagation,
-	// root lift, metapage rewrite), then retry from a fresh
-	// descent. (M0055-0004-followup-stage2-splitmu-removal: full
-	// removal needs additional buffer-pool concurrency-safety
-	// work beyond M0055's scope. The race-safe createNewRoot
-	// in this commit handles concurrent root-lifts; the rest
-	// of the structural-update path remains under splitMu.)
+	// Split path: retry from a fresh descent. No tree-wide lock is taken
+	// (M0122-0010 gap 8): as in _bt_doinsert, the page latches alone order
+	// concurrent splits. A split keeps its left page latched through the
+	// parent insert (child before parent), re-finds the parent by downlink
+	// (getStackBuf), and lifts a new root with both halves latched; vacuum
+	// latches in the same order and re-finds the parent the same way.
 	bt.stats.splits.Add(1) // M0055-0001 — counts insert calls that take the split-path retry.
-	bt.lockStructural()
-	defer bt.unlockStructural()
 
-	leafBlk, path, err := bt.descendToLeaf(key)
+	leafBlk, path, err := bt.descendForInsert(key)
 	if err != nil {
 		return err
 	}
 	// No child completes a split here: `it` is a leaf tuple, upstream's isleaf
 	// arm, which registers no cbuf (M0130-S11.5b-3).
-	return bt.insertIntoBlock(leafBlk, path, it, storage.InvalidBlockNumber)
+	return bt.insertIntoBlock(leafBlk, path, it, storage.InvalidBlockNumber, nil)
 }
 
 var errNeedsSplit = errors.New("btree: insert needs split")
+
+// testHookAbandonSplit, when set by a test, is asked after every split's
+// record is written whether to stop before the parent step; a true answer
+// fails the insert with errSplitAbandoned and leaves the split incomplete.
+// nil in production.
+var testHookAbandonSplit func(level uint32) bool
+
+var errSplitAbandoned = errors.New("btree: split abandoned before its parent step (test hook)")
 
 func (bt *BTree) tryInsertNoSplit(it item) error {
 	// M0055-0002-followup-rightmost-cache: try the cached
@@ -2652,7 +2637,7 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 			return err
 		}
 	}
-	leafBlk, _, err := bt.descendToLeaf(it.key)
+	leafBlk, _, err := bt.descendForInsert(it.key)
 	if err != nil {
 		return err
 	}
@@ -2662,7 +2647,8 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	defer bt.unpinW(slot)
 
-	if keyExceedsHighKey(bt.format(), slot.Page(), it.key) {
+	// The slow path finishes a split left incomplete since the descent.
+	if keyExceedsHighKey(bt.format(), slot.Page(), it.key) || readOpaque(slot.Page()).HasIncompleteSplit() {
 		return errNeedsSplit
 	}
 	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
@@ -2703,14 +2689,20 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 // Every internal-page insertion in goopg completes a child split, so this is
 // non-Invalid exactly when the pinned page turns out to be internal; the split
 // path below both clears the flag and logs the child as backup block 3.
-func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item, childBlk storage.BlockNumber) error {
+//
+// heldChild, when non-nil, is childBlk already pinned and exclusively latched
+// by the caller — the left half of the split one level down, kept latched
+// across the parent step as _bt_insert_parent keeps buf, so the child is
+// always latched before its parent. insertIntoBlock owns it from here and
+// releases it once the record that clears its flag is written, or on error.
+func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item, childBlk storage.BlockNumber, heldChild *storage.Slot) error {
+	child := wlatch{bt: bt}
+	child.hold(heldChild)
+	defer child.release()
 	// Lehman-Yao move-right: `blk` was decided by the caller (a fresh
-	// descendToLeaf under splitMu, or a path[] ancestor recorded before
-	// or during this connection's own split). `bt.splitMu` only
-	// serializes structural changes within THIS *BTree Go instance —
-	// each backend opens its own instance per statement — so a
-	// concurrent split on a DIFFERENT connection's instance for the
-	// SAME relation can move the key range `it` belongs in to blk's
+	// descent, or the parent getStackBuf found). No tree-wide lock
+	// is held, so a concurrent split — on this handle or another
+	// connection's — can move the key range `it` belongs in to blk's
 	// right sibling between that decision and this pin (M-NIGHTLY
 	// AI-20260709-010336-082: reproduced as a "high key invariant
 	// violated" internal-page finding). Detect via the same
@@ -2734,6 +2726,17 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		held.hold(slot)
 		op = readOpaque(slot.Page())
+		if op.HasIncompleteSplit() {
+			// _bt_insertonpg never inserts into half of a split: finish it
+			// first (_bt_stepright / _bt_moveright), then re-read the page.
+			// Finishing latches only this level and above, so a held child
+			// below keeps the latch order.
+			held.release()
+			if err := bt.finishSplit(blk, path); err != nil {
+				return err
+			}
+			continue
+		}
 		if itemOvershootsHighKey(bt.format(), slot.Page(), op, it.key) {
 			next := op.Next
 			held.release()
@@ -2773,6 +2776,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			// disagreement must not strand the latch.
 		} else {
 			bt.traceInsert(blk, lineIdx, it)
+			if childBlk != storage.InvalidBlockNumber && !op.IsLeaf() {
+				// A downlink into an internal page finishes the child's
+				// split: clear its flag in the same record
+				// (_bt_insertonpg, XLOG_BTREE_INSERT_UPPER).
+				derr := bt.insertUpperFinishChild(slot, blk, lineIdx, it, childBlk, child.take())
+				held.release()
+				return derr
+			}
 			// Logical-record path (M0002 redo-records): if the pool
 			// has a btree-insert hook configured, emit a small
 			// change record on subsequent dirties of this page in
@@ -2795,60 +2806,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 	}
 
-	// Split. Pin a freshly-extended right page exclusively,
-	// redistribute items, stamp the high key, then drop both
-	// latches before walking up. `op` already holds this page's
+	// No room: first try to make some (dedup, then the dead-entry purge),
+	// and only if that fails split — pin a new right page, redistribute
+	// items, stamp the high key, walk up. `op` already holds this page's
 	// pre-split opaque header from the move-right loop above.
-	// The block that is currently left's right sibling (if any).
-	// After the split the new right page is spliced between them, so
-	// this sibling's btpo_prev must be relinked from blk to rightBlk
-	// (done below, atomically with the split). InvalidBlockNumber
-	// here means a rightmost split with no sibling to relink.
-	oldNext := op.Next
-	// M0055-0005 Phase D: prefer recycled blocks before
-	// extending the file.
-	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
-	if err != nil {
-		held.release()
-		return err
-	}
-	// rightSlot is already content-locked by pinNewOrRecycled (its
-	// locked-return contract) — no separate Lock() here.
-
-	// The right sibling inherits the original page's high key (or has none,
-	// if this was the rightmost page on its level). Read it off the LEFT page
-	// before anything is rewritten — after the refill below the left page
-	// carries the NEW separator instead.
-	inheritedHK, inheritedOK, err := PGHighKeyRaw(slot.Page())
-	if err != nil {
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
-		held.release()
-		return err
-	}
-	// The right sibling is never the root (the root stays the original blk
-	// during a split, until we lift), and it does not inherit the split page's
-	// garbage hint: the refill below writes only LIVE items (pageItems skips
-	// dead-marked ones), so the hint would be stale-set from birth.
-	//
-	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
-	// split REDO builds — so the page the primary writes and the page a replay
-	// of the same record builds are byte-identical, which is what lets the
-	// split record log this page as content rather than as an image.
-	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
-	initPage(rightSlot.Page(), rightOpaque)
-	// The high key must land BEFORE any data item: initPage wrote btpo_next,
-	// so the page already reports itself non-rightmost and the data-slot
-	// wrappers are already biased past P_HIKEY.
-	if inheritedOK {
-		if err := pgSetHighKeyRaw(rightSlot.Page(), inheritedHK); err != nil {
-			rightSlot.Unlock()
-			bt.pool.Unpin(rightSlot)
-			held.release()
-			return err
-		}
-	}
-
 	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th loop):
 	// snapshot the two checkpoints that matter for localizing a lost
 	// entry — right after pageItems()+appendSorted() (what the rewrite
@@ -2863,8 +2824,6 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	allItems, err := bt.format().pageItems(slot.Page())
 	if err != nil {
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
 		held.release()
 		return err
 	}
@@ -2922,24 +2881,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
-		// split needed. The right-side allocation is rolled back.
+		// split needed — and no right page was allocated for it.
 		resetPageItems(slot.Page())
 		if err := bt.refillDeduplicated(blk, slot.Page(), allItems); err != nil {
-			rightSlot.Unlock()
-			bt.pool.Unpin(rightSlot)
-			bt.recycleBlock(rightBlk)
 			held.release()
 			return err
 		}
-		// Drop the freshly-allocated right slot — split avoided.
-		rightSlot.Unlock()
-		bt.pool.Unpin(rightSlot)
-		// The split was abandoned: this block was extended for a right sibling
-		// that is never linked in, so return it to the free list. Leaking it
-		// meant every dedup-recovery grew the relfile by a page even though the
-		// logical content shrank — which the dead-entry purge amplified,
-		// because it makes recovery succeed far more often.
-		bt.recycleBlock(rightBlk)
 		// C3-S3 (S2-review blocker fix A): this rewrite SHIFTS SLOT
 		// NUMBERS, so it must bump pd_lsn — the deferred kill pass
 		// re-verifies leaf identity by LSN equality (D7) and a plain
@@ -2975,6 +2922,64 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	bt.traceRewrite(blk, "split", preLineCount, postPageItemsSnap, postDedupSnap)
 
+	// The block that is currently left's right sibling (if any).
+	// After the split the new right page is spliced between them, so
+	// this sibling's btpo_prev must be relinked from blk to rightBlk
+	// (done below, atomically with the split). InvalidBlockNumber
+	// here means a rightmost split with no sibling to relink.
+	oldNext := op.Next
+	// The right page is allocated only now, once dedup and the dead-entry
+	// purge have failed to make room: upstream's _bt_findinsertloc runs
+	// _bt_delete_or_dedup_one_page (nbtinsert.c:998) before _bt_split
+	// allocates the new page (nbtinsert.c:1720). Allocating first and then
+	// abandoning the split when dedup made room extended the file for a page
+	// nothing linked in, and the page — live, never deleted — failed
+	// popRecyclableBlock's recyclability check, so the next split extended
+	// again: an insert-built index of 4-way duplicate keys came out 9 times
+	// its size with 8 of every 9 leaf blocks empty (M0146-0195).
+	// M0055-0005 Phase D: prefer recycled blocks before extending the file.
+	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
+	if err != nil {
+		held.release()
+		return err
+	}
+	// rightSlot is already content-locked by pinNewOrRecycled (its
+	// locked-return contract) — no separate Lock() here.
+
+	// The right sibling inherits the original page's high key (or has none,
+	// if this was the rightmost page on its level). Read it off the LEFT page
+	// before anything is rewritten — after the refill below the left page
+	// carries the NEW separator instead.
+	inheritedHK, inheritedOK, err := PGHighKeyRaw(slot.Page())
+	if err != nil {
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		held.release()
+		return err
+	}
+	// The right sibling is never the root (the root stays the original blk
+	// during a split, until we lift), and it does not inherit the split page's
+	// garbage hint: the refill below writes only LIVE items (pageItems skips
+	// dead-marked ones), so the hint would be stale-set from birth.
+	//
+	// M0130-S11.5b pinned this to SplitRightPageOpaque — the header upstream's
+	// split REDO builds — so the page the primary writes and the page a replay
+	// of the same record builds are byte-identical, which is what lets the
+	// split record log this page as content rather than as an image.
+	rightOpaque := SplitRightPageOpaque(op.Level, blk, op.Next)
+	initPage(rightSlot.Page(), rightOpaque)
+	// The high key must land BEFORE any data item: initPage wrote btpo_next,
+	// so the page already reports itself non-rightmost and the data-slot
+	// wrappers are already biased past P_HIKEY.
+	if inheritedOK {
+		if err := pgSetHighKeyRaw(rightSlot.Page(), inheritedHK); err != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			held.release()
+			return err
+		}
+	}
+
 	// M0055-0002-followup-byte-split: byte-aware split-loc.
 	// Pick the entry whose cumulative encoded byte size lands
 	// closest to half the total. For fixed-width keys this is
@@ -2993,7 +2998,48 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		const itemIDSize = 4 // matches storage.itemIDSize
 		rightBudget -= itemIDSize + MaxAlign(len(inheritedHK))
 	}
-	mid, splitOK := bt.format().compactSplitLoc(allItems, pageDataBudget(), rightBudget)
+	// _bt_findsplitloc's strategy (nbtsplitloc.c): fillfactor on a rightmost
+	// page, "split after new item" for a localized ascending grouping on any
+	// other leaf (M0146-0213), else 50:50.
+	rightmost := oldNext == storage.InvalidBlockNumber
+	fillMult := splitFillFactorMult(op.IsLeaf(), rightmost)
+	exactMid := -1
+	if op.IsLeaf() && !rightmost {
+		if newIdx := indexOfItem(allItems, it); newIdx > 0 {
+			if usemult, ok := bt.format().afterNewItemOff(allItems, newIdx); ok {
+				if usemult {
+					fillMult = BTreeDefaultFillFactor / 100.0
+				} else {
+					exactMid = newIdx + 1
+				}
+			}
+		}
+	}
+	var (
+		mid     int
+		splitOK bool
+	)
+	if exactMid > 0 && bt.format().compactSplitAtFits(allItems, pageDataBudget(), rightBudget, exactMid) {
+		mid, splitOK = exactMid, true
+	} else if op.IsLeaf() && bt.format().desc != nil {
+		// _bt_findsplitloc's interval and suffix-truncation penalty choice
+		// (M0146-0216). An exact cut that does not fit falls back to 50:50
+		// (fillfactormult 0.50, unweighted), as upstream's defensive branch
+		// does.
+		useMult := fillMult > 0
+		mult := fillMult
+		if !useMult {
+			mult = 0.50
+		}
+		var hikey []byte
+		if inheritedOK {
+			hikey = inheritedHK
+		}
+		mid, splitOK = bt.format().pgFindSplitLoc(allItems, indexOfItem(allItems, it), pageDataBudget(), rightBudget,
+			hikey, rightmost, mult, useMult)
+	} else {
+		mid, splitOK = bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget, fillMult)
+	}
 	if !splitOK {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
@@ -3050,6 +3096,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	resetPageItems(slot.Page())
 	op.Next = rightBlk
+	// A split root is no longer the root: its left half drops BTRoot inside
+	// the split, as _bt_split does (lopaque->btpo_flags &= ~BTP_ROOT), and the
+	// new root is published by createNewRoot while both halves stay latched.
+	wasRoot := op.IsRoot()
+	op.Flags &^= BTRoot
 	// M0055-0004-followup-finish-split: mark the LEFT page as
 	// incomplete-split before releasing latches. Cleared after
 	// the parent downlink insert succeeds. Crash-replay leaves
@@ -3114,10 +3165,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// 3 unregistered. Do it here instead; the caller's later call sees the flag
 	// already clear and becomes a no-op. Pinning a lower-level page while
 	// holding this level's latches is the DESCENT direction, which is why it
-	// cannot deadlock against a concurrent reader (and the whole split path is
-	// serialised by splitMu within this *BTree anyway).
+	// cannot deadlock against a concurrent reader; normally the caller hands
+	// the child over still latched, so nothing is pinned here at all.
 	var childSlot *storage.Slot
-	if childBlk != storage.InvalidBlockNumber {
+	if c := child.take(); c != nil {
+		childSlot = c
+	} else if childBlk != storage.InvalidBlockNumber {
 		childSlot, err = bt.pinW(childBlk)
 		if err != nil {
 			if sibSlot != nil {
@@ -3128,6 +3181,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			held.release()
 			return fmt.Errorf("btree: pin incomplete-split child %d: %w", childBlk, err)
 		}
+	}
+	// Both ways in — the child handed over still latched (M0122-0010 slice
+	// 3) or pinned here — clear its flag under this split's record.
+	if childSlot != nil {
 		childOp := readOpaque(childSlot.Page())
 		childOp.Flags &^= BTIncompleteSplit
 		writeOpaque(childSlot.Page(), childOp)
@@ -3215,28 +3272,38 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// boundary the level below no longer draws.
 	sepItem := downlinkItem(append([]byte(nil), sepKey...), rightBlk)
 
-	rightSlot.Unlock()
-	bt.pool.Unpin(rightSlot)
-	held.release()
-
-	// If we just split the root, lift a new root.
-	if op.IsRoot() {
-		// Strip BTRoot off the now-non-root left page.
-		if err := bt.clearRootFlag(blk); err != nil {
-			return err
-		}
-		if err := bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1); err != nil {
-			return err
-		}
-		// Parent (the new root) now references the left half;
-		// clear the INCOMPLETE_SPLIT marker. (M0055-0004-followup.)
-		return bt.clearIncompleteSplit(blk)
+	if hook := testHookAbandonSplit; hook != nil && hook(op.Level) {
+		// Leave the split incomplete, as a crash after the split record
+		// would: both halves written, the left one flagged, no downlink.
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		return errSplitAbandoned
 	}
 
-	// Otherwise, insert the separator into the parent.
-	parentBlk := path[len(path)-1]
-	parentPath := path[:len(path)-1]
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
+	// If we just split the root, lift a new root (_bt_newroot) while both
+	// halves stay latched: nobody can split either half, or find the level
+	// above them missing, before the metapage names the new root.
+	if wasRoot {
+		err := bt.createNewRoot(held.take(), blk, rightBlk, sepItem.key, op.Level+1)
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		return err
+	}
+
+	rightSlot.Unlock()
+	bt.pool.Unpin(rightSlot)
+
+	// Otherwise, insert the separator into the parent, re-found by the
+	// downlink to blk rather than trusted from the descent's path
+	// (_bt_getstackbuf). The left page stays latched until that insert has
+	// cleared its incomplete-split flag, as _bt_insert_parent keeps buf: the
+	// child is latched before its parent, and no other writer sees the half
+	// split in between.
+	parentBlk, parentPath, err := bt.getStackBuf(path, blk, op.Level)
+	if err != nil {
+		return err
+	}
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk, held.take()); err != nil {
 		return err
 	}
 	// Parent insert succeeded — clear the INCOMPLETE_SPLIT flag
@@ -3244,6 +3311,163 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// already cleared it under its own record (S11.5b-3), in which case this
 	// is a no-op; the parent's no-split path still leaves it to us.
 	return bt.clearIncompleteSplit(blk)
+}
+
+// insertUpperFinishChild completes a no-split downlink insert into the
+// internal page in parentSlot (already done at lineIdx, latch held): it
+// clears childBlk's BTIncompleteSplit flag and logs both changes in ONE
+// XLOG_BTREE_INSERT_UPPER record, as _bt_insertonpg does with the child
+// buffer (cbuf) locked. Before this the parent insert went out as an
+// INSERT_LEAF record and the flag was cleared by a separate page record
+// afterwards, so a crash in between left a finished split flagged.
+//
+// childSlot is the child already latched by the caller (the split one level
+// down keeps it latched, child before parent, as PG does), or nil to latch it
+// here. It is released on return. Both pages are registered without an image, so each
+// still owes its first-touch full-page image: MarkDirtyCoveredByRecordLocked
+// emits it when needed and raises pd_lsn to the record.
+func (bt *BTree) insertUpperFinishChild(parentSlot *storage.Slot, blk storage.BlockNumber, lineIdx int, it item, childBlk storage.BlockNumber, childSlot *storage.Slot) error {
+	if childSlot == nil {
+		var err error
+		if childSlot, err = bt.pinW(childBlk); err != nil {
+			bt.pool.MarkDirty(parentSlot)
+			return fmt.Errorf("btree: pin incomplete-split child %d: %w", childBlk, err)
+		}
+	}
+	defer bt.unpinW(childSlot)
+	childOp := readOpaque(childSlot.Page())
+	childOp.Flags &^= BTIncompleteSplit
+	writeOpaque(childSlot.Page(), childOp)
+	logUpper := bt.pool.LogBtreeInsertUpper()
+	if logUpper == nil {
+		bt.pool.MarkDirty(parentSlot)
+		bt.pool.MarkDirty(childSlot)
+		return nil
+	}
+	lsn, err := logUpper(bt.rel, blk, pgPhysOffnum(parentSlot.Page(), lineIdx), bt.format().marshal(it), childBlk)
+	if err != nil {
+		return fmt.Errorf("btree: log internal insert: %w", err)
+	}
+	bt.pool.MarkDirtyCoveredByRecordLocked(parentSlot, lsn)
+	bt.pool.MarkDirtyCoveredByRecordLocked(childSlot, lsn)
+	return nil
+}
+
+// getStackBuf is _bt_getstackbuf (nbtinsert.c) for a page split: it returns
+// the page on the level above childLevel that holds the downlink to childBlk,
+// and that page's ancestors. The descent's path is only a hint: the parent may
+// have split since, moving the downlink right, and when the tree has grown a
+// level above the path (another handle lifted the root) the path is empty, so
+// the search starts at the leftmost page of the parent level, as
+// _bt_insert_parent does via _bt_get_endpoint. It moves right along the level,
+// skipping half-dead and deleted pages and finishing incomplete splits, until
+// the downlink is found.
+func (bt *BTree) getStackBuf(path []storage.BlockNumber, childBlk storage.BlockNumber, childLevel uint32) (storage.BlockNumber, []storage.BlockNumber, error) {
+	parentLevel := childLevel + 1
+	var start storage.BlockNumber
+	var ancestors []storage.BlockNumber
+	if len(path) > 0 {
+		start, ancestors = path[len(path)-1], path[:len(path)-1]
+	} else {
+		var err error
+		if start, ancestors, err = bt.leftmostAtLevel(parentLevel); err != nil {
+			return 0, nil, err
+		}
+	}
+	fellBack := len(path) == 0
+	if start == childBlk && !fellBack {
+		// The caller holds childBlk exclusively (the split keeps its left
+		// half latched across this search), so a hint naming it — only
+		// possible after the block was recycled at another level — must not
+		// be read: start from the level's leftmost page.
+		fellBack = true
+		var err error
+		if start, ancestors, err = bt.leftmostAtLevel(parentLevel); err != nil {
+			return 0, nil, err
+		}
+	}
+	for blk := start; ; {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			return 0, nil, err
+		}
+		op := readOpaque(slot.Page())
+		if op.Level != parentLevel && !fellBack {
+			// The hint is not on the parent level at all: start over from
+			// the level's leftmost page.
+			bt.unpinR(slot)
+			fellBack = true
+			if blk, ancestors, err = bt.leftmostAtLevel(parentLevel); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		if op.Level == parentLevel && op.HasIncompleteSplit() {
+			// _bt_getstackbuf finishes an incomplete split on the parent
+			// level before reading the page, so the downlink is never
+			// inserted into half of a split; then it re-reads the page.
+			bt.unpinR(slot)
+			if err := bt.finishSplit(blk, ancestors); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		if !op.IsHalfDead() && !op.IsDeleted() && op.Level == parentLevel {
+			items, perr := bt.format().pageItems(slot.Page())
+			if perr != nil {
+				bt.unpinR(slot)
+				return 0, nil, perr
+			}
+			for _, it := range items {
+				if it.ptr.Block == childBlk {
+					bt.unpinR(slot)
+					return blk, ancestors, nil
+				}
+			}
+		}
+		next := op.Next
+		bt.unpinR(slot)
+		if next == storage.InvalidBlockNumber {
+			return 0, nil, fmt.Errorf("btree: failed to re-find parent key in index %d for split page %d", bt.rel.RelOid, childBlk)
+		}
+		blk = next
+	}
+}
+
+// leftmostAtLevel is _bt_get_endpoint's leftmost descent: the leftmost page on
+// level and the pages above it, from the metapage's root down the first
+// downlinks.
+func (bt *BTree) leftmostAtLevel(level uint32) (storage.BlockNumber, []storage.BlockNumber, error) {
+	meta, err := bt.readMeta()
+	if err != nil {
+		return 0, nil, err
+	}
+	if meta.Level < level {
+		return 0, nil, fmt.Errorf("btree: index %d has no level %d (root level %d)", bt.rel.RelOid, level, meta.Level)
+	}
+	var ancestors []storage.BlockNumber
+	cur := meta.Root
+	for {
+		slot, err := bt.pinR(cur)
+		if err != nil {
+			return 0, nil, err
+		}
+		op := readOpaque(slot.Page())
+		if op.Level <= level {
+			bt.unpinR(slot)
+			return cur, ancestors, nil
+		}
+		items, perr := bt.format().pageItems(slot.Page())
+		bt.unpinR(slot)
+		if perr != nil {
+			return 0, nil, perr
+		}
+		if len(items) == 0 {
+			return 0, nil, fmt.Errorf("btree: internal page %d of index %d has no downlinks", cur, bt.rel.RelOid)
+		}
+		ancestors = append(ancestors, cur)
+		cur = items[0].ptr.Block
+	}
 }
 
 // clearIncompleteSplit (M0055-0004-followup-finish-split) unsets
@@ -3277,10 +3501,10 @@ func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
 // BTIncompleteSplit (Phase 1 — leaf split — committed but the
 // parent-downlink insertion did not). Used by maintenance
 // passes (vacuum, post-recovery startup) to complete in-flight
-// splits that were interrupted by a crash. Steady-state
-// operation never produces such pages (the slow-path sets +
-// clears the flag under splitMu in the same critical
-// section).
+// splits that were interrupted by a crash. Writers also finish
+// such a split on contact (finishSplit); steady-state operation
+// never leaves one, because a split keeps its left page latched
+// until the record that clears the flag.
 func (bt *BTree) CompleteDeferredSplits() (int, error) {
 	rel := bt.rel
 	nBlocks, err := bt.pool.NBlocks(rel)
@@ -3299,7 +3523,7 @@ func (bt *BTree) CompleteDeferredSplits() (int, error) {
 		if !incomplete {
 			continue
 		}
-		if err := bt.finishSplit(blk); err != nil {
+		if err := bt.finishSplit(blk, nil); err != nil {
 			return completed, err
 		}
 		completed++
@@ -3307,83 +3531,73 @@ func (bt *BTree) CompleteDeferredSplits() (int, error) {
 	return completed, nil
 }
 
-// finishSplit (M0055-0004-followup-finish-split) re-runs the
-// parent-downlink insertion for a page that is still flagged
-// BTIncompleteSplit (e.g., after crash-replay where the writer's
-// split phase landed but the parent insert did not). Idempotent
-// — if the parent already references the page, the redundant
-// insert is detected by the parent's binary-search "already
-// present" check and the flag is simply cleared.
+// finishSplit is _bt_finish_split (nbtinsert.c) for a page met with
+// BTIncompleteSplit set: a split whose parent step never ran — an error
+// between the split record and the downlink insert, or a crash in between,
+// which redo leaves as the half split. Writers call it on contact: the insert
+// descent (_bt_moveright with forupdate), getStackBuf (_bt_getstackbuf) and
+// vacuum's parent search. path is the caller's ancestors of blk, only a hint
+// for getStackBuf; nil when unknown.
 //
-// Callers: writers descending the tree (before continuing
-// writes on this page); vacuum maintenance pass.
-func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
+// It latches blk and re-checks the flag (another writer may have finished the
+// split first), then completes the split exactly as the split path would: the
+// right sibling latched while the metapage says whether blk was the root; a
+// new root with both halves latched, or the downlink inserted into the parent
+// re-found by downlink, with blk latched until the record that clears its flag
+// is written — child before parent, the one latch order. The caller re-reads
+// blk afterwards.
+func (bt *BTree) finishSplit(blk storage.BlockNumber, path []storage.BlockNumber) error {
+	held := wlatch{bt: bt}
+	defer held.release()
 	slot, err := bt.pinW(blk)
 	if err != nil {
 		return err
 	}
+	held.hold(slot)
 	op := readOpaque(slot.Page())
 	if !op.HasIncompleteSplit() {
-		bt.unpinW(slot)
 		return nil
 	}
-	// Read the high key + Next to reconstruct the separator
-	// item that the original split was about to push up.
-	hk, hasHK, hkErr := bt.format().pageHighKey(slot.Page())
-	if hkErr != nil {
-		bt.unpinW(slot)
-		return hkErr
+	// The separator the split was pushing up is the left page's high key,
+	// with a downlink to the right sibling (_bt_insert_parent).
+	hk, hasHK, err := bt.format().pageHighKey(slot.Page())
+	if err != nil {
+		return err
 	}
-	if !hasHK {
-		// Defensive: malformed half-state (btpo_next says rightmost, so
-		// there is no separator to push up). Clear the flag and hope the
-		// parent caught up via some other path.
+	if !hasHK || op.Next == storage.InvalidBlockNumber {
+		// Malformed: a page with no right sibling has no split to finish.
 		op.Flags &^= BTIncompleteSplit
 		writeOpaque(slot.Page(), op)
-		bt.markDirtyWithPageRecord(slot, blk)
-		bt.unpinW(slot)
-		return nil
+		return bt.markDirtyWithPageRecord(slot, blk)
 	}
 	rightBlk := op.Next
 	sepKey := append([]byte(nil), hk...)
-	bt.unpinW(slot)
 
-	// Walk to the parent and insert the separator. We descend by
-	// the separator key so the parent path is reconstructed.
-	bt.lockStructural()
-	defer bt.unlockStructural()
-	_, path, err := bt.descendToLeaf(sepKey)
+	// Latch the right sibling, the page missing its downlink, while the
+	// metapage decides whether this was a root split.
+	rightSlot, err := bt.pinW(rightBlk)
 	if err != nil {
 		return err
 	}
-	if len(path) == 0 {
-		// blk is the root — parent insert means a new root lift.
-		// Should have happened atomically; if not, redo it.
-		return bt.createNewRoot(blk, rightBlk, sepKey, op.Level+1)
+	meta, err := bt.readMeta()
+	if err != nil {
+		bt.unpinW(rightSlot)
+		return err
 	}
-	parentBlk := path[len(path)-1]
-	parentPath := path[:len(path)-1]
-	sepItem := downlinkItem(sepKey, rightBlk)
-	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem, blk); err != nil {
+	if meta.Root == blk {
+		err := bt.createNewRoot(held.take(), blk, rightBlk, sepKey, op.Level+1)
+		bt.unpinW(rightSlot)
+		return err
+	}
+	bt.unpinW(rightSlot)
+	parentBlk, parentPath, err := bt.getStackBuf(path, blk, op.Level)
+	if err != nil {
+		return err
+	}
+	if err := bt.insertIntoBlock(parentBlk, parentPath, downlinkItem(sepKey, rightBlk), blk, held.take()); err != nil {
 		return err
 	}
 	return bt.clearIncompleteSplit(blk)
-}
-
-func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
-	slot, err := bt.pinW(blk)
-	if err != nil {
-		return err
-	}
-	op := readOpaque(slot.Page())
-	op.Flags &^= BTRoot
-	writeOpaque(slot.Page(), op)
-	err = bt.markDirtyWithPageRecord(slot, blk)
-	bt.unpinW(slot)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // (M0130-S11.4 slice 3b-2c-ii-B2-b-ii removed the by-key insert replay that
@@ -3392,105 +3606,80 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 // index's key format nor its comparison semantics. See
 // docs/design/0002-0003-redo-records.md.)
 
-func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
-	// M0055-0004-followup-stage2-splitmu-removal (race-safe
-	// new-root publication): the caller is expected to hold
-	// `splitMu`, but a future Stage-2 design that lifts splitMu
-	// must still serialise root publication. We RE-READ the
-	// meta here so even under a future relaxation, two
-	// concurrent splits that both target the OLD root cannot
-	// both create a new root; the loser falls back to inserting
-	// its separator into the CURRENT root via the regular
-	// path. Today, with splitMu held, the re-read is a defensive
-	// invariant check (and a no-op fast path).
+// createNewRoot lifts a new root above a root split (_bt_newroot). leftSlot
+// is the old root's left half, still latched by the split that divided it (or
+// by finishSplit completing one), and its right half is latched by the caller
+// too: the new root, the metapage and the left half's INCOMPLETE_SPLIT change
+// in one critical section and one XLOG_BTREE_NEWROOT record. leftSlot is
+// released on return.
+func (bt *BTree) createNewRoot(leftSlot *storage.Slot, leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+	defer bt.unpinW(leftSlot)
+	return bt.newRootLocked(leftSlot, leftBlk, rightBlk, rightKey, level)
+}
+
+// newRootLocked is _bt_newroot for a root split whose halves are latched:
+// a new root page with downlinks to leftBlk and rightBlk, the metapage pointed
+// at it, and leftSlot's INCOMPLETE_SPLIT cleared, all under one
+// XLOG_BTREE_NEWROOT record (block 0 the root, block 1 the left half, block 2
+// the metapage). The left half is registered without an image, so it still
+// owes its first-touch full-page image (MarkDirtyCoveredByRecordLocked).
+func (bt *BTree) newRootLocked(leftSlot *storage.Slot, leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
 	meta, err := bt.readMeta()
 	if err != nil {
 		return err
 	}
 	if meta.Root != leftBlk {
-		// Some other writer (under a future lock-free protocol)
-		// already lifted a new root above `leftBlk`. Insert our
-		// separator into the current root through the regular
-		// path.
-		sepItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
-		_, parentPath, err := bt.descendToLeaf(rightKey)
-		if err != nil {
-			return err
-		}
-		if len(parentPath) == 0 {
-			// Defensive: meta.Root != leftBlk but parentPath is
-			// empty — meta moved again. Recurse to pick up the
-			// latest state.
-			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
-		}
-		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem, leftBlk)
+		return fmt.Errorf("btree: index %d: metapage root is %d, not the split root %d", bt.rel.RelOid, meta.Root, leftBlk)
 	}
-
 	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)
 	if err != nil {
 		return err
 	}
 	rootSlot.Lock()
+	defer func() {
+		rootSlot.Unlock()
+		bt.pool.Unpin(rootSlot)
+	}()
 	initPage(rootSlot.Page(), BTPageOpaque{
 		Prev:  storage.InvalidBlockNumber,
 		Next:  storage.InvalidBlockNumber,
 		Level: level,
 		Flags: BTRoot,
 	})
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), downlinkItem(nil, leftBlk))
+	mustInsertItemSorted(bt.format(), rootSlot.Page(), downlinkItem(append([]byte(nil), rightKey...), rightBlk))
 
-	// Leftmost internal item: empty key, pointer to leftBlk.
-	leftItem := downlinkItem(nil, leftBlk)
-	rightItem := downlinkItem(append([]byte(nil), rightKey...), rightBlk)
-	mustInsertItemSorted(bt.format(), rootSlot.Page(), leftItem)
-	mustInsertItemSorted(bt.format(), rootSlot.Page(), rightItem)
+	leftOp := readOpaque(leftSlot.Page())
+	leftOp.Flags &^= BTIncompleteSplit | BTRoot
+	writeOpaque(leftSlot.Page(), leftOp)
 
-	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
-	// both the new root page (backup block 0) and the updated metapage
-	// (backup block 2) as full-page images. The metapage is mutated in
-	// memory HERE — before the emit — so its post-op bytes ride the same
-	// record; both pages' pd_lsn is then stamped to the record LSN (per-page
-	// replay idempotency). Both slots are held under splitMu (this path's
-	// structural-writer serialisation), so co-locking the metapage with the
-	// new root is race-free. Falls back to the legacy per-page FPI path when
-	// no hook is wired (test harnesses).
-	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
-		metaSlot, err := bt.pinW(MetaBlock)
-		if err != nil {
-			rootSlot.Unlock()
-			bt.pool.Unpin(rootSlot)
+	emitter := bt.pool.LogBtreeNewRoot()
+	if emitter == nil {
+		if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 			return err
 		}
-		m := ReadPGMetaPage(metaSlot.Page())
-		m.Root = rootBlk
-		m.Level = level
-		m.FastRoot = rootBlk
-		m.FastLevel = level
-		WritePGMetaPage(metaSlot.Page(), m)
-		// leftBlk is upstream's backup block 1: the child whose
-		// incomplete-split flag redo clears (_bt_newroot registers `lbuf`).
-		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), leftBlk, MetaBlock, metaSlot.Page())
-		if err != nil {
-			bt.unpinW(metaSlot)
-			rootSlot.Unlock()
-			bt.pool.Unpin(rootSlot)
-			return err
-		}
-		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
-		bt.pool.MarkDirtyWithLSNLocked(metaSlot, lsn)
-		bt.unpinW(metaSlot)
-		rootSlot.Unlock()
-		bt.pool.Unpin(rootSlot)
-		return nil
+		bt.pool.MarkDirty(leftSlot)
+		return bt.updateRootMeta(rootBlk, level)
 	}
-	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
-		rootSlot.Unlock()
-		bt.pool.Unpin(rootSlot)
+	metaSlot, err := bt.pinW(MetaBlock)
+	if err != nil {
 		return err
 	}
-	rootSlot.Unlock()
-	bt.pool.Unpin(rootSlot)
-
-	return bt.updateRootMeta(rootBlk, level)
+	defer bt.unpinW(metaSlot)
+	m := ReadPGMetaPage(metaSlot.Page())
+	m.Root = rootBlk
+	m.Level = level
+	m.FastRoot = rootBlk
+	m.FastLevel = level
+	WritePGMetaPage(metaSlot.Page(), m)
+	lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), leftBlk, MetaBlock, metaSlot.Page())
+	if err != nil {
+		return err
+	}
+	bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+	bt.pool.MarkDirtyWithLSNLocked(metaSlot, lsn)
+	bt.pool.MarkDirtyCoveredByRecordLocked(leftSlot, lsn)
+	return nil
 }
 
 // itemEncodedSize / pageHasSpaceFor moved onto indexFormat in M0130-S11.4
@@ -3823,9 +4012,203 @@ func (f indexFormat) compactFootprint(items []item) int {
 // the tiebreaker TID when no key attribute distinguishes the two halves — a
 // pivot that is larger than the plain item it was derived from.
 func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) (int, bool) {
+	return f.compactSplitLocFill(items, leftBudget, rightBudget, 0)
+}
+
+// BTreeNonLeafFillFactor mirrors upstream's BTREE_NONLEAF_FILLFACTOR
+// (postgres/src/include/access/nbtree.h): the share of a rightmost INTERNAL
+// page a split leaves on the left.
+const BTreeNonLeafFillFactor = 70
+
+// splitFillFactorMult is _bt_findsplitloc's choice of `fillfactormult` for a
+// split with `usemult` set (nbtsplitloc.c): a RIGHTMOST page is split so the
+// left half keeps fillfactor% of the space — the leaf fillfactor on the leaf
+// level, BTREE_NONLEAF_FILLFACTOR above it — because ascending insertions only
+// ever land on the right half again, and an even split would leave every left
+// page half empty for good (an int4 serial key's index came out 1.75x PG's
+// size, M0146-0178). Every other split balances free space (0, usemult off).
+// Not ported: the per-index fillfactor reloption (BTGetFillFactor; goopg uses
+// BTreeDefaultFillFactor as the bulk loader does). The non-rightmost leaf arm,
+// _bt_afternewitemoff, is afterNewItemOff below (M0146-0213).
+func splitFillFactorMult(leaf, rightmost bool) float64 {
+	if !rightmost {
+		return 0
+	}
+	if leaf {
+		return BTreeDefaultFillFactor / 100.0
+	}
+	return BTreeNonLeafFillFactor / 100.0
+}
+
+// afterNewItemOff is _bt_afternewitemoff (nbtsplitloc.c), the "split after new
+// item" arm of _bt_findsplitloc for a NON-rightmost leaf (M0146-0213). It
+// recognises localized monotonically increasing insertion into a composite
+// index: the new item extends a grouping of its leading attribute(s), so later
+// inserts will land just to its right, and a 50:50 split would leave every left
+// half permanently half empty. That was TPC-H's partsupp_pk after the 2026-10-15
+// INSERT replay: interleaved ascending streams left 4668 of 5141 leaves about
+// 54 % full, 5170 pages against PG's 3082, which priced PG's Parallel Index Only
+// Scan out of Q16.
+//
+// items is the page's data items with the new one merged in, at newIdx. ok
+// reports that the optimization applies; usemult then says how (upstream's
+// *usemult). true means apply the leaf fillfactor multiplier; false means split
+// exactly after the new item, leaving it as lastleft.
+//
+// The conditions are upstream's, in order:
+//   - a composite key;
+//   - the new item not first on the page;
+//   - equal-sized tuples: every item the size of the new one, so no posting
+//     list. Upstream's minfirstrightsz / olddataitemstotal test; an equal-key run
+//     here is a posting on disk.
+//   - a tuple no wider than two int8 attributes;
+//   - _bt_keep_natts_fast against the item to its left: the first attribute
+//     equal by image, and not a duplicate on every key attribute.
+//
+// A new item to the right of every existing item needs nothing more. Otherwise
+// the left neighbour must also be heap-TID adjacent (_bt_adjacenthtid), and the
+// exact cut is used only when it does not lie right of where a fillfactor split
+// would cut.
+func (f indexFormat) afterNewItemOff(items []item, newIdx int) (usemult, ok bool) {
+	if !f.tupleKeys() || f.desc.NKeyAtts() == 1 || newIdx <= 0 || newIdx >= len(items) {
+		return false, false
+	}
+	newSz := f.bodySize(items[newIdx].key)
+	for i := range items {
+		if f.bodySize(items[i].key) != newSz {
+			return false, false
+		}
+		if i > 0 && f.compareKeyAttrs(items[i-1].key, items[i].key) == 0 {
+			return false, false
+		}
+	}
+	// MAXALIGN(sizeof(IndexTupleData) + sizeof(int64) * 2) + sizeof(ItemIdData),
+	// with the line pointer on both sides of the comparison.
+	if MaxAlign(newSz) > MaxAlign(SizeOfIndexTupleData+16) {
+		return false, false
+	}
+	keep, err := f.keepNAttsFast(items[newIdx-1].key, items[newIdx].key)
+	if err != nil {
+		return false, false
+	}
+	nkey := f.desc.NKeyAtts()
+	if keep <= 1 || keep > nkey {
+		return false, false
+	}
+	// The new item is right of every existing item (newitemoff > maxoff): the
+	// insertion pattern speaks for itself, no heap TID test.
+	if newIdx == len(items)-1 {
+		return true, true
+	}
+	if !adjacentHeapTID(items[newIdx-1].ptr, items[newIdx].ptr) {
+		return false, false
+	}
+	// interp = newitemoff / (maxoff + 1) on the ORIGINAL page. A non-rightmost
+	// page holds its high key at P_HIKEY, so data begins at offset 2 and the
+	// new item's offset is newIdx+2; maxoff is the existing data items plus the
+	// high key.
+	existing := len(items) - 1
+	interp := float64(newIdx+2) / float64(existing+1+1)
+	return interp > BTreeDefaultFillFactor/100.0, true
+}
+
+// keepNAttsFast is _bt_keep_natts_fast (nbtutils.c). It is keepNAtts with
+// image equality in place of the opclass, as _bt_afternewitemoff and the
+// posting-run checks use it.
+func (f indexFormat) keepNAttsFast(a, b []byte) (int, error) {
+	nkey := f.desc.NKeyAtts()
+	phys := f.desc.Physical()
+	av, an, err := DeformPGIndexTuple(a, phys, nkey)
+	if err != nil {
+		return 0, err
+	}
+	bv, bn, err := DeformPGIndexTuple(b, phys, nkey)
+	if err != nil {
+		return 0, err
+	}
+	for i := range nkey {
+		if an[i] != bn[i] || (!an[i] && !bytes.Equal(av[i], bv[i])) {
+			return i + 1, nil
+		}
+	}
+	return nkey + 1, nil
+}
+
+// indexOfItem finds `it` (key image and heap TID) in items, or -1. The split
+// works on the post-dedup list, where an item merged into a posting is no
+// longer present on its own; -1 then simply declines the optimization.
+func indexOfItem(items []item, it item) int {
+	for i := range items {
+		if items[i].ptr == it.ptr && bytes.Equal(items[i].key, it.key) {
+			return i
+		}
+	}
+	return -1
+}
+
+// adjacentHeapTID is _bt_adjacenthtid (nbtsplitloc.c): the same heap block, or
+// the next block's first offset.
+func adjacentHeapTID(low, high storage.ItemPointer) bool {
+	if low.Block == high.Block {
+		return true
+	}
+	return low.Block+1 == high.Block && high.Offset == 1
+}
+
+// compactSplitAtFits reports whether a cut whose first right item is items[m]
+// fits both pages, charged exactly as compactSplitLocFill charges a candidate.
+func (f indexFormat) compactSplitAtFits(items []item, leftBudget, rightBudget, m int) bool {
+	if m <= 0 || m >= len(items) {
+		return false
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	sepCharge := itemIDSize + MaxAlign(f.bodySize(items[m].key)) + MaxAlign(SizeOfItemPointerData)
+	return f.compactFootprint(items[:m])+sepCharge <= leftBudget && f.compactFootprint(items[m:]) <= rightBudget
+}
+
+// compactSplitLocFill is compactSplitLoc with _bt_deltasortsplits' weighting:
+// fillMult == 0 picks the cut whose halves' free space is most even
+// (`usemult` off); fillMult in (0,1) picks the smallest
+// |fillMult*leftfree - (1-fillMult)*rightfree| (`usemult` on). Free space is
+// each half's budget less its compact footprint, the left half also paying for
+// the separator, as _bt_recsplitloc charges it.
+func (f indexFormat) compactSplitLocFill(items []item, leftBudget, rightBudget int, fillMult float64) (int, bool) {
+	bestMid, bestSkew, found := 0, 0.0, false
+	for _, c := range f.splitCandidates(items, leftBudget, rightBudget) {
+		var skew float64
+		if fillMult > 0 {
+			skew = math.Abs(fillMult*float64(c.leftfree) - (1-fillMult)*float64(c.rightfree))
+		} else {
+			skew = math.Abs(float64(c.left - c.right))
+		}
+		if !found || skew < bestSkew {
+			bestMid, bestSkew, found = c.m, skew, true
+		}
+	}
+	return bestMid, found
+}
+
+// splitCand is one legal split point, upstream's SplitPoint (nbtsplitloc.c):
+// items[:m] go left, items[m:] right. left/right are the halves' compact
+// footprints; leftfree/rightfree are _bt_recsplitloc's free space, the left
+// half also paying for the new high key (firstright plus a heap TID, the leaf
+// worst case).
+type splitCand struct {
+	m                   int
+	left, right         int
+	leftfree, rightfree int
+	curdelta            int16
+}
+
+// splitCandidates enumerates every legal split of items, in ascending m, which
+// is the order _bt_findsplitloc records them in (by firstrightoff, with "new
+// item first on the right" before "new item last on the left"). It is shared
+// by compactSplitLocFill and pgFindSplitLoc, so both price a candidate the
+// same way.
+func (f indexFormat) splitCandidates(items []item, leftBudget, rightBudget int) []splitCand {
 	n := len(items)
 	if n < 2 {
-		return 0, false
+		return nil
 	}
 	const itemIDSize = 4 // matches storage.itemIDSize
 	// Run boundaries: starts[r] is the index of run r's first item, and
@@ -3852,7 +4235,7 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 	for r := nr - 1; r >= 0; r-- {
 		suffix[r] = suffix[r+1] + f.runFootprint(items[starts[r]].key, starts[r+1]-starts[r])
 	}
-	bestMid, bestSkew, found := 0, 0, false
+	var out []splitCand
 	r := 0
 	for m := 1; m < n; m++ {
 		for starts[r+1] <= m {
@@ -3868,15 +4251,10 @@ func (f indexFormat) compactSplitLoc(items []item, leftBudget, rightBudget int) 
 		if left+sepCharge > leftBudget || right > rightBudget {
 			continue
 		}
-		skew := left - right
-		if skew < 0 {
-			skew = -skew
-		}
-		if !found || skew < bestSkew {
-			bestMid, bestSkew, found = m, skew, true
-		}
+		out = append(out, splitCand{m: m, left: left, right: right,
+			leftfree: leftBudget - left - sepCharge, rightfree: rightBudget - right})
 	}
-	return bestMid, found
+	return out
 }
 
 // readPageItem (M0055-0002 Phase A) decodes a single item at the

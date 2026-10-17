@@ -8,6 +8,9 @@ import (
 )
 
 func TestIndexScanEndToEndConstantKey(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	withAutovacuumOff(ctx)
@@ -18,7 +21,7 @@ func TestIndexScanEndToEndConstantKey(t *testing.T) {
 		t.Fatalf("CREATE INDEX: %v", err)
 	}
 
-	plan := planOne(t, "SELECT id, label FROM items WHERE id = 2", cat)
+	plan := planOneIndexScan(t, "SELECT id, label FROM items WHERE id = 2", cat)
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("root=%T want *planner.Project", plan)

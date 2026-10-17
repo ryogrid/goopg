@@ -1,0 +1,10 @@
+CREATE TABLE cs (item int, ord int, sold int, amt numeric, PRIMARY KEY (item, ord));
+CREATE TABLE it (id int PRIMARY KEY, m int);
+CREATE TABLE dd (sk int PRIMARY KEY, d int);
+INSERT INTO it SELECT g, g % 5 FROM generate_series(1, 50) g;
+INSERT INTO dd SELECT g, g FROM generate_series(1, 100) g;
+INSERT INTO cs SELECT g % 50 + 1, g, g % 100 + 1, (g % 97)::numeric FROM generate_series(1, 5000) g;
+ANALYZE cs; ANALYZE it; ANALYZE dd;
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT sum(amt) FROM cs, it WHERE it.id = cs.item AND it.m = 2 AND amt > (SELECT 1.3 * avg(amt) FROM cs, dd WHERE cs.item = it.id AND dd.sk = cs.sold AND dd.d <= 60);
+SELECT sum(amt) FROM cs, it WHERE it.id = cs.item AND it.m = 2 AND amt > (SELECT 1.3 * avg(amt) FROM cs, dd WHERE cs.item = it.id AND dd.sk = cs.sold AND dd.d <= 60);

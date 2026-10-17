@@ -1,6 +1,6 @@
 # WAL segment recycling (M0122-0009)
 
-status: accepted (partial — min_wal_size floor only)
+status: accepted — the min_wal_size floor (first slice) and the max_wal_size / CheckPointDistanceEstimate sizing (2026-07-09 follow-up) have both landed; re-verified 2026-10-13
 date: 2026-07-09
 supersedes: none
 
@@ -238,3 +238,23 @@ and `go test -race ./internal/wal/... ./internal/mvcc/...` PASS;
 `go test ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
 PASS (0 failed transactions, all 3 pgbench workloads).
+
+## Re-verification (2026-10-13)
+
+- `unimplemented_feat.json` still listed "WAL segment recycling" as `open`.
+  Its 2026-07-02 code audit predates this work and read `retention.go`'s old
+  header comment.
+- At HEAD, the code lives in `internal/access/transam/xlog/` (the old
+  `internal/wal/` package moved there): `state.removeOldSegments`,
+  `computeSpareSegments` and `recycleSegmentFile` in `writer.go`.
+- `cmd/goopg/main.go` wires `WALMinSize` and `CheckPointDistanceEstimateFn`.
+- The recycling and sizing tests pass:
+  - `TestRemoveOldSegmentsRecyclesUpToMinWALSize`
+  - `TestComputeSpareSegments*`
+  - `TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax`
+- The entry is now `resolved`.
+- Still deferred:
+  - timeline-aware recycling (`RemoveNonParentXlogFiles`; no timeline
+    switch exists yet);
+  - upstream's no-zero-fill rename. goopg's reader needs the zero tail
+    described above.

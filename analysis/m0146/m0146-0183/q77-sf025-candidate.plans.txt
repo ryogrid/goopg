@@ -1,0 +1,119 @@
+=== Q77
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=51297.29..51297.54 rows=100 width=96)
+   ->  Sort  (cost=51297.29..51297.84 rows=217 width=96)
+         Sort Key: ('store channel'::text), store.s_store_sk
+         ->  MixedAggregate  (cost=23389.81..51289.00 rows=217 width=96)
+               Hash Key: ('store channel'::text), store.s_store_sk
+               Hash Key: ('store channel'::text)
+               Group Key: ()
+               ->  Append  (cost=23389.81..51281.96 rows=108 width=96)
+                     ->  Merge Left Join  (cost=23389.81..23399.63 rows=12 width=64)
+                           Merge Cond: (store.s_store_sk = store_1.s_store_sk)
+                           ->  Finalize GroupAggregate  (cost=18920.27..18926.21 rows=12 width=32)
+                                 Group Key: store.s_store_sk
+                                 ->  Gather Merge  (cost=18920.27..18925.75 rows=37 width=32)
+                                       Workers Planned: 3
+                                       ->  Partial GroupAggregate  (cost=17920.23..17921.34 rows=12 width=32)
+                                             Group Key: store.s_store_sk
+                                             ->  Sort  (cost=17920.23..17920.46 rows=93 width=2292)
+                                                   Sort Key: store.s_store_sk
+                                                   ->  Hash Join  (cost=2051.06..17917.19 rows=93 width=48)
+                                                         Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                         ->  Parallel Hash Join  (cost=2049.79..17915.57 rows=97 width=44)
+                                                               Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                               ->  Parallel Seq Scan on store_sales  (cost=0.00..15256.18 rows=232218 width=212)
+                                                               ->  Parallel Hash  (cost=2049.55..2049.55 rows=19 width=268)
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_1  (cost=0.00..2049.55 rows=19 width=268)
+                                                                           Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                                                         ->  Hash  (cost=1.12..1.12 rows=12 width=1812)
+                                                               ->  Seq Scan on store  (cost=0.00..1.12 rows=12 width=1812)
+                           ->  Finalize GroupAggregate  (cost=4469.54..4472.52 rows=12 width=32)
+                                 Group Key: store_1.s_store_sk
+                                 ->  Gather Merge  (cost=4469.54..4472.19 rows=20 width=32)
+                                       Workers Planned: 1
+                                       ->  Partial GroupAggregate  (cost=3469.53..3469.88 rows=12 width=32)
+                                             Group Key: store_1.s_store_sk
+                                             ->  Sort  (cost=3469.53..3469.57 rows=17 width=2250)
+                                                   Sort Key: store_1.s_store_sk
+                                                   ->  Hash Join  (cost=1.57..3469.18 rows=17 width=308)
+                                                         Hash Cond: (store_returns.sr_store_sk = store_1.s_store_sk)
+                                                         ->  Nested Loop  (cost=0.30..3467.86 rows=18 width=304)
+                                                               ->  Parallel Seq Scan on store_returns  (cost=0.00..1617.62 rows=42162 width=170)
+                                                               ->  Memoize  (cost=0.30..0.41 rows=1 width=268)
+                                                                     Cache Key: store_returns.sr_returned_date_sk
+                                                                     Cache Mode: logical
+                                                                     ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.40 rows=1 width=268)
+                                                                           Index Cond: (d_date_sk = store_returns.sr_returned_date_sk)
+                                                                           Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                                                         ->  Hash  (cost=1.12..1.12 rows=12 width=1812)
+                                                               ->  Seq Scan on store store_1  (cost=0.00..1.12 rows=12 width=1812)
+                     ->  Nested Loop  (cost=16846.11..16850.39 rows=36 width=64)
+                           ->  Finalize GroupAggregate  (cost=13878.04..13881.06 rows=6 width=32)
+                                 Group Key: catalog_sales.cs_call_center_sk
+                                 ->  Gather Merge  (cost=13878.04..13880.83 rows=19 width=32)
+                                       Workers Planned: 3
+                                       ->  Partial GroupAggregate  (cost=12878.00..12878.60 rows=6 width=32)
+                                             Group Key: catalog_sales.cs_call_center_sk
+                                             ->  Sort  (cost=12878.00..12878.13 rows=51 width=554)
+                                                   Sort Key: catalog_sales.cs_call_center_sk
+                                                   ->  Parallel Hash Join  (cost=2049.79..12876.56 rows=51 width=44)
+                                                         Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_1.d_date_sk)
+                                                         ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10521.57 rows=116257 width=286)
+                                                         ->  Parallel Hash  (cost=2049.55..2049.55 rows=19 width=268)
+                                                               ->  Parallel Seq Scan on date_dim date_dim_2  (cost=0.00..2049.55 rows=19 width=268)
+                                                                     Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                           ->  GroupAggregate  (cost=2968.07..2968.32 rows=6 width=32)
+                                 Group Key: catalog_returns.cr_call_center_sk
+                                 ->  Sort  (cost=2968.07..2968.11 rows=16 width=466)
+                                       Sort Key: catalog_returns.cr_call_center_sk
+                                       ->  Nested Loop  (cost=0.30..2967.75 rows=16 width=304)
+                                             ->  Seq Scan on catalog_returns  (cost=0.00..1081.66 rows=36066 width=198)
+                                             ->  Memoize  (cost=0.30..0.50 rows=1 width=268)
+                                                   Cache Key: catalog_returns.cr_returned_date_sk
+                                                   Cache Mode: logical
+                                                   ->  Index Scan using date_dim_pkey on date_dim date_dim_3  (cost=0.29..0.49 rows=1 width=268)
+                                                         Index Cond: (d_date_sk = catalog_returns.cr_returned_date_sk)
+                                                         Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                     ->  Hash Left Join  (cost=11017.43..11030.86 rows=60 width=64)
+                           Hash Cond: (web_page.wp_web_page_sk = web_page_1.wp_web_page_sk)
+                           ->  Finalize GroupAggregate  (cost=8697.75..8709.21 rows=60 width=32)
+                                 Group Key: web_page.wp_web_page_sk
+                                 ->  Gather Merge  (cost=8697.75..8707.71 rows=79 width=32)
+                                       Workers Planned: 2
+                                       ->  Partial GroupAggregate  (cost=7697.72..7698.55 rows=33 width=32)
+                                             Group Key: web_page.wp_web_page_sk
+                                             ->  Sort  (cost=7697.72..7697.81 rows=33 width=1092)
+                                                   Sort Key: web_page.wp_web_page_sk
+                                                   ->  Hash Join  (cost=2053.14..7696.89 rows=33 width=48)
+                                                         Hash Cond: (web_sales.ws_web_page_sk = web_page.wp_web_page_sk)
+                                                         ->  Parallel Hash Join  (cost=2049.79..7693.44 rows=33 width=44)
+                                                               Hash Cond: (web_sales.ws_sold_date_sk = date_dim_2.d_date_sk)
+                                                               ->  Parallel Seq Scan on web_sales  (cost=0.00..5446.82 rows=74982 width=286)
+                                                               ->  Parallel Hash  (cost=2049.55..2049.55 rows=19 width=268)
+                                                                     ->  Parallel Seq Scan on date_dim date_dim_4  (cost=0.00..2049.55 rows=19 width=268)
+                                                                           Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                                                         ->  Hash  (cost=2.60..2.60 rows=60 width=538)
+                                                               ->  Seq Scan on web_page  (cost=0.00..2.60 rows=60 width=538)
+                           ->  Hash  (cost=2319.60..2319.60 rows=7 width=32)
+                                 ->  Subquery Scan on wr  (cost=2318.82..2319.60 rows=7 width=32)
+                                       ->  GroupAggregate  (cost=2318.82..2319.39 rows=7 width=32)
+                                             Group Key: web_page_1.wp_web_page_sk
+                                             ->  Merge Join  (cost=2318.82..2319.23 rows=7 width=48)
+                                                   Merge Cond: (web_returns.wr_web_page_sk = web_page_1.wp_web_page_sk)
+                                                   ->  Sort  (cost=2314.52..2314.59 rows=7 width=44)
+                                                         Sort Key: web_returns.wr_web_page_sk
+                                                         ->  Nested Loop  (cost=0.30..2314.35 rows=7 width=304)
+                                                               ->  Seq Scan on web_returns  (cost=0.00..511.20 rows=17920 width=186)
+                                                               ->  Memoize  (cost=0.30..0.67 rows=1 width=268)
+                                                                     Cache Key: web_returns.wr_returned_date_sk
+                                                                     Cache Mode: logical
+                                                                     ->  Index Scan using date_dim_pkey on date_dim date_dim_5  (cost=0.29..0.66 rows=1 width=268)
+                                                                           Index Cond: (d_date_sk = web_returns.wr_returned_date_sk)
+                                                                           Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                                                   ->  Sort  (cost=4.97..5.57 rows=60 width=4)
+                                                         Sort Key: web_page_1.wp_web_page_sk
+                                                         ->  Seq Scan on web_page web_page_1  (cost=0.00..2.60 rows=60 width=538)
+(114 rows)
+

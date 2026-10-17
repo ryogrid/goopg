@@ -1,0 +1,10 @@
+# tmp/m0172/skip2.sql on a private clone of data-sf025 vs PG 18.3 :65438 tpcds025
+# (max_parallel_workers_per_gather=0, enable_seqscan/bitmapscan off)
+                                      PG 18.3              goopg HEAD           goopg candidate
+inventory_pkey skip probe (const)     0.43..1814.67        0.38..968.32         0.43..1808.91
+  + inv_quantity_on_hand < 300        0.43..1815.95        0.38..969.59         0.43..1810.19
+item_pkey IN (8 consts)               0.29..38.59          -                    0.29..38.44
+param IOS inventory_pkey (loop 19)    0.43..827.70         0.38..754.33         0.43..767.45
+# HEAD's inputs (debug print, removed): numSA=210 loop=0 idxPages=7697 idxRun=84.47 -> the 210
+# descents were priced as one index page (numScans = numSA * loopCount = 0).
+# Remaining param-probe gap: goopg's inventory_pkey file is 7697 pages vs PG's 12606 (index geometry).

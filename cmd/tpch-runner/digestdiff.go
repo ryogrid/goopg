@@ -21,6 +21,15 @@ package main
 //   - NO-DIGEST is a failure, not a pass. It is how a run made WITHOUT -digest
 //     is stopped from reading as "everything matched" — precisely the reading
 //     that let P5.9 run 1's five silently-corrupt queries through.
+//
+// XFAIL is a baseline-only escape hatch for a query whose failure is pinned on
+// purpose (owner decision 2026-10-15: TPC-H Q5 exceeds the per-query cap on
+// goopg's divergent plan, so its error is the honest current state). A baseline
+// line `Q5: XFAIL — <detail>` passes (EXPECTED-ERROR) only when the run
+// reproduces the identical error; a different error is ERROR-DIFF, and a
+// recovered OK is XFAIL-RESOLVED — still a gate failure, forcing the baseline
+// to be re-pinned with the real digest so the pin cannot outlive its cause.
+// An XFAIL line in a RUN log (arm B) is never valid: XFAIL-IN-RUN.
 
 import (
 	"fmt"
@@ -72,6 +81,11 @@ func parseRunLog(text string) (map[string]qResult, []string) {
 			q = qResult{label: label, status: "OK"}
 		case strings.HasPrefix(rest, "ERROR "):
 			q = qResult{label: label, status: "ERROR", detail: errDetail(rest)}
+		case strings.HasPrefix(rest, "XFAIL "):
+			// Baseline-only pin: a query whose failure is recorded on purpose
+			// (e.g. a divergent plan exceeds the per-query cap). The runner
+			// never emits XFAIL; it appears only in hand-edited baselines.
+			q = qResult{label: label, status: "XFAIL", detail: errDetail(rest)}
 		default:
 			continue // "EXPLAIN plan:", "signal-file detected", etc.
 		}
@@ -121,9 +135,11 @@ type digestVerdict struct {
 	seq     int
 }
 
-// ok reports whether a verdict lets the diff pass. Only MATCH does: every other
-// outcome, ORDER-DIFF and NO-DIGEST included, needs a human to look.
-func (v digestVerdict) ok() bool { return v.verdict == "MATCH" }
+// ok reports whether a verdict lets the diff pass. MATCH does, and so does
+// EXPECTED-ERROR — the baseline explicitly pinned that exact failure, so the
+// run is identical to the pinned state. Every other outcome, ORDER-DIFF and
+// NO-DIGEST included, needs a human to look.
+func (v digestVerdict) ok() bool { return v.verdict == "MATCH" || v.verdict == "EXPECTED-ERROR" }
 
 // diffDigests compares two parsed arms. Labels are reported in arm A's run
 // order, with A-missing labels appended in B's order.
@@ -155,6 +171,22 @@ func diffDigests(a, b map[string]qResult) []digestVerdict {
 			v.verdict, v.detail = "MISSING-A", "present only in arm B"
 		case !inB:
 			v.verdict, v.detail = "MISSING-B", "present only in arm A"
+		case qb.status == "XFAIL":
+			// A run log must never carry a pin — only a baseline may.
+			v.verdict = "XFAIL-IN-RUN"
+			v.detail = "arm B carries an XFAIL pin; pins belong in the baseline, not in run output"
+		case qa.status == "XFAIL" && qb.status == "ERROR" && qa.detail == qb.detail:
+			v.verdict = "EXPECTED-ERROR"
+			v.detail = "baseline-pinned failure reproduced — " + qa.detail
+		case qa.status == "XFAIL" && qb.status == "ERROR":
+			v.verdict = "ERROR-DIFF"
+			v.detail = fmt.Sprintf("pinned A: %s | run B: %s", qa.detail, qb.detail)
+		case qa.status == "XFAIL":
+			// The run no longer reproduces the pinned failure (OK). That is
+			// good news — but the pin is now stale, so the gate fails until
+			// the baseline is re-pinned with the measured digest.
+			v.verdict = "XFAIL-RESOLVED"
+			v.detail = fmt.Sprintf("B=%s — the pinned failure is gone; re-pin the baseline with the real digest", qb.status)
 		case qa.status != qb.status:
 			v.verdict = "STATUS-DIFF"
 			v.detail = fmt.Sprintf("A=%s B=%s%s", qa.status, qb.status, firstErr(qa, qb))

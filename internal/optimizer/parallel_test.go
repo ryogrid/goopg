@@ -610,3 +610,35 @@ func TestPostPassOwnsTheNonAggregateGather(t *testing.T) {
 			"(analysis/planner-refactor-take3/c19h-census-rerun-20260907)")
 	}
 }
+
+// TestPostPassStandsDownOnACostedSearchedSubtree pins M0146-0186. A subtree
+// the join search committed was costed there — generate_gather_paths offered
+// the Gather over the rel's partial path and add_path compared it with the
+// serial winner — so a serial searched subtree is a Gather that lost, and the
+// size rule must not add one back (TPC-DS SF0.25's one-relation date_dim scan
+// printed a Gather PG never plans). An uncosted subtree keeps the size rule,
+// and debug_parallel_query still forces past the verdict as PG's does.
+func TestPostPassStandsDownOnACostedSearchedSubtree(t *testing.T) {
+	tbl := bigTable(t, "big")
+	searched := func(costed bool) Node {
+		scan := seqScanOver(tbl)
+		scan.markFromJoinSearch()
+		rel := newRelOptInfo(RelSet(1), 1_000_000, 4)
+		if costed {
+			rel.Pathlist = []*Path{{Kind: PathSeqScan, Rel: rel}}
+		}
+		scan.setSearchRel(rel)
+		return &Project{Child: scan, schema: Schema{{Name: "a"}}}
+	}
+	if planHasGather(MaybeAddGather(searched(true), parallelTestSettings())) {
+		t.Error("a searched, costed serial subtree must stay serial")
+	}
+	if !planHasGather(MaybeAddGather(searched(false), parallelTestSettings())) {
+		t.Error("a subtree the search did not cost keeps the size rule's Gather")
+	}
+	forced := parallelTestSettings()
+	forced.DebugParallelQuery = "on"
+	if !planHasGather(MaybeAddGather(searched(true), forced)) {
+		t.Error("debug_parallel_query = on must still force a Gather")
+	}
+}

@@ -66,11 +66,14 @@ func TestCreateFunctionFamily(t *testing.T) {
 	} {
 		assertParity(t, q)
 	}
-	// gram.y allows `= expr` as an argument default and makes RETURNS optional
-	// when every argument is OUT; legacy accepts neither, so this grammar must
-	// reject them too rather than silently widening the accepted language.
+	// gram.y allows `= expr` as an argument default; legacy did not, so this
+	// grammar rejects it too rather than silently widening the accepted
+	// language.
 	assertBothReject(t, "CREATE FUNCTION f(a int = 3) RETURNS int LANGUAGE sql AS 'x'")
-	assertBothReject(t, "CREATE FUNCTION f(OUT a int, OUT b int) LANGUAGE sql AS 'x'")
+	// gram.y makes RETURNS optional (the executor derives the result type from
+	// the OUT / INOUT parameters, or raises 42P13 without them — M0146-0165).
+	assertParity(t, "CREATE FUNCTION f(OUT a int, OUT b int) LANGUAGE sql AS 'x'")
+	assertParity(t, "CREATE OR REPLACE FUNCTION f(a int, INOUT b int) LANGUAGE plpgsql STRICT AS 'x'")
 	// Four errors legacy raises AFTER a successful parse, all of which the
 	// create_function_sql regress case checks byte-for-byte. The grammar has no
 	// way to fail mid-attribute-list (the reduce has already happened), so the

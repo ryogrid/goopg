@@ -20,6 +20,7 @@ func TestCreateUserMappingSameNameAcrossDistinctDBOidDoesNotCollide(t *testing.T
 	defer cleanup()
 
 	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER shared_srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER shared_srv (DefaultDBOid): %v", err)
 	}
@@ -27,6 +28,7 @@ func TestCreateUserMappingSameNameAcrossDistinctDBOidDoesNotCollide(t *testing.T
 		t.Fatalf("CREATE USER MAPPING (DefaultDBOid): %v", err)
 	}
 	ctx.CurrentDatabaseOid = otherDBOid
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER shared_srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER shared_srv (otherDBOid): %v", err)
 	}

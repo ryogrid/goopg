@@ -74,6 +74,17 @@ type colTypeInfo struct {
 	attLen     int16 // -1 == variable length (varlena)
 	attByVal   bool
 	attStorage byte // 'p' plain | 'e' external | 'x' extended | 'm' main
+
+	// intWidth is 2, 4 or 8 when the column is a plain (non-array) integer
+	// type whose decodePhysicalPGValueLowered arm is NewIntDatum over that
+	// many little-endian bytes, else 0. decodeRowRangeInfo reads such a
+	// column in place, as PG's fetch_att does for a by-value attribute
+	// (postgres/src/include/access/tupmacs.h). See intWidthForLoweredName.
+	intWidth uint8
+	// isNumeric marks a plain (non-array) numeric/decimal column, which
+	// decodeRowRangeInfo decodes in place when its payload fits the int64
+	// mantissa fast path. See numericFastForLoweredName.
+	isNumeric bool
 }
 
 // resolveColTypeInfo resolves one colTypeInfo per column. Call it once, from
@@ -95,6 +106,8 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 			attLen:     ta.TypLen,
 			attByVal:   ta.TypByVal,
 			attStorage: ta.TypStorage,
+			intWidth:   intWidthForLoweredName(t, lower),
+			isNumeric:  numericFastForLoweredName(t, lower),
 		}
 	}
 	return info
@@ -172,4 +185,30 @@ func colInfoMatches(cols []catalog.Column, info []colTypeInfo) bool {
 		}
 	}
 	return true
+}
+
+// intWidthForLoweredName returns the byte width decodePhysicalPGValueLowered
+// reads for an integer type name, or 0. The name lists MUST stay the same as
+// that switch's int2 / int4 / int8 arms; TestDeformIntFastArmMatchesDecoder
+// pins the two together over every spelling.
+func intWidthForLoweredName(t catalog.Type, lower string) uint8 {
+	if t.IsArray {
+		return 0
+	}
+	switch lower {
+	case "int2", "smallint", "smallserial", "serial2":
+		return 2
+	case "int4", "integer", "int", "serial", "serial4":
+		return 4
+	case "int8", "bigint", "bigserial", "serial8":
+		return 8
+	}
+	return 0
+}
+
+// numericFastForLoweredName reports whether decodePhysicalPGValueLowered's
+// "numeric", "decimal" arm decodes this column. TestDeformNumericFastArmMatchesDecoder
+// pins the in-place arm to that one.
+func numericFastForLoweredName(t catalog.Type, lower string) bool {
+	return !t.IsArray && (lower == "numeric" || lower == "decimal")
 }

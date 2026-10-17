@@ -353,23 +353,23 @@ func bitmapAndScanCostEst(cp costParams, paths []*Path, relRows, T, indexPages, 
 // for a single BitmapIndexScan it returns the index's page count; for
 // BitmapAnd/BitmapOr it sums across children. Returns 0 for non-bitmap paths
 // or when index geometry is unavailable.
-func indexPagesForPath(p *Path, tbl *catalog.Table, relTuples float64) float64 {
+func indexPagesForPath(cat catalog.Catalog, p *Path, tbl *catalog.Table, relTuples float64) float64 {
 	if p == nil || tbl == nil {
 		return 0
 	}
 	switch p.Kind {
 	case PathBitmapIndexScan:
-		ip, _, _ := estimateIndexGeometry(p.IndexInfo, tbl, relTuples)
+		ip, _, _ := estimateIndexGeometry(cat, p.IndexInfo, tbl, relTuples)
 		return ip
 	case PathBitmapHeapScan:
 		if len(p.Children) > 0 {
-			return indexPagesForPath(p.Children[0], tbl, relTuples)
+			return indexPagesForPath(cat, p.Children[0], tbl, relTuples)
 		}
 		return 0
 	case PathBitmapAnd, PathBitmapOr:
 		var sum float64
 		for _, child := range p.Children {
-			sum += indexPagesForPath(child, tbl, relTuples)
+			sum += indexPagesForPath(cat, child, tbl, relTuples)
 		}
 		return sum
 	default:

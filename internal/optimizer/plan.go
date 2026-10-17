@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Node is implemented by every plan-tree node. Pos is the byte offset
@@ -332,6 +333,14 @@ type ExistsExpr struct {
 	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
 	ParParam []int
 	Args     []Expr
+	// OuterRowPad is the FROM-cumulative offset of the leaf a correlated
+	// sublink's host conjunct was localized to (M0146-0130). The inner
+	// plan's references to this scope keep their FROM-cumulative indices,
+	// so the sublink runs against the leaf row shifted right by this many
+	// columns: the executor pushes the leaf row padded with OuterRowPad
+	// leading NULLs, and PARAM_EXEC lowering subtracts it from the host
+	// arguments it builds. 0 everywhere else.
+	OuterRowPad int
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -395,6 +404,8 @@ type SubqueryExpr struct {
 	// param changes. goopg runs it as a correlated sublink; EXPLAIN labels
 	// it `InitPlan N`.
 	ParamInitPlan bool
+	// OuterRowPad: see ExistsExpr.OuterRowPad (M0146-0130).
+	OuterRowPad int
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
@@ -2102,9 +2113,22 @@ type SubqueryScan struct {
 	// keeps as a subquery RTE under the appendrel; the label names the
 	// appendrel binding the parent references it by. M0146-0093.
 	appendRel *appendRelLabel
+	// anyLink marks the subquery RTE a pulled-up ANY sublink becomes
+	// (`ANY_subquery`, pullUpAnyDerivedBody). Its one output column is read
+	// only by the link equality, which is synthesised in the body's
+	// numbering rather than bound through the enclosing scope, so the
+	// triviality pass cannot count its consumption by SourceTableIdx.
+	// M0146-0201.
+	anyLink bool
 }
 
 func (n *SubqueryScan) Pos() int       { return n.pos }
+
+// IsAppendRelMember reports whether n is a UNION ALL member PG keeps as a
+// subquery RTE (`Subquery Scan on "*SELECT* n"`, M0146-0093). A Var above the
+// Append deparses at this scan with its alias (ruleutils.c get_variable), not
+// through it into the member's own relations.
+func (n *SubqueryScan) IsAppendRelMember() bool { return n.appendRel != nil }
 func (n *SubqueryScan) Output() Schema { return n.schema }
 
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -2537,6 +2561,22 @@ func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
+// PgWalSummaryContents implements pg_wal_summary_contents(tli int8, start_lsn
+// pg_lsn, end_lsn pg_lsn) as a FROM-clause SRF: one row per modified block of
+// the named WAL summary file, plus one is_limit_block row per relation fork
+// with a limit block (walsummaryfuncs.c). Args may be correlated against a
+// FROM sibling (`FROM pg_available_wal_summaries() s,
+// pg_wal_summary_contents(s.tli, s.start_lsn, s.end_lsn)`), bound per outer
+// row like PgGetSequenceData. M0122-0009 S4a.
+type PgWalSummaryContents struct {
+	pos    int
+	Args   []Expr
+	schema Schema
+}
+
+func (n *PgWalSummaryContents) Pos() int       { return n.pos }
+func (n *PgWalSummaryContents) Output() Schema { return n.schema }
+
 // PgGetSequenceData implements pg_get_sequence_data(regclass) as a FROM-clause
 // SRF. pg_dump's getSequences comma-joins it with pg_catalog.pg_sequence
 // (`FROM pg_sequence, pg_get_sequence_data(seqrelid)`) to read each sequence's
@@ -2594,10 +2634,16 @@ func (n *TSTokenType) Output() Schema { return n.schema }
 
 // PgAvailableWalSummaries implements pg_available_wal_summaries() as a
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
-// for each available WAL summary file. goopg v0 has no WAL summarizer
-// (summarize_wal is always off), so this always returns 0 rows. M0095-0002.
+// for each WAL summary file under pg_wal/summaries (GetWalSummaries).
+// M0095-0002; real since M0122-0009 S4a.
+//
+// The same zero-argument node also carries pg_get_wal_summarizer_state()
+// (Func set to that name): one row (summarized_tli int8, summarized_lsn
+// pg_lsn, pending_lsn pg_lsn, summarizer_pid int4) from the running
+// summarizer (walsummaryfuncs.c). M0122-0009 S4b.
 type PgAvailableWalSummaries struct {
 	pos    int
+	Func   string // "" or "pg_available_wal_summaries", or "pg_get_wal_summarizer_state"
 	schema Schema
 }
 
@@ -3119,7 +3165,11 @@ func (n *Utility) Output() Schema {
 				{Name: "description", Type: catalog.Type{Name: "text"}},
 			}
 		}
-		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}
+		// GetPGVariableResultDesc (guc_funcs.c) names the column after the
+		// parameter's own spelling, not the identifier as typed (`SHOW
+		// datestyle` prints `DateStyle`), as the simple-query fast path
+		// already did.
+		return Schema{{Name: misc.CanonicalGUCName(stmt.Name), Type: catalog.Type{Name: "text"}}}
 	}
 	return nil
 }
@@ -3307,6 +3357,14 @@ type SetOp struct {
 }
 
 func (n *SetOp) Pos() int       { return n.pos }
+
+// IsUnionAllAppendRel reports whether n is a link of a UNION ALL appendrel
+// built from a set-operation subquery in FROM (pull_up_simple_union_all), as
+// opposed to an inheritance / partition fan-out, which builds the same
+// *SetOp{All: true} without the label. EXPLAIN deparses a Var above the
+// former through the Append's first child (ruleutils.c set_deparse_plan); the
+// latter prints with the parent's alias.
+func (n *SetOp) IsUnionAllAppendRel() bool { return n.appendRel != nil }
 func (n *SetOp) Output() Schema {
 	if n.pinnedSchema != nil {
 		return n.pinnedSchema
@@ -3581,8 +3639,15 @@ type BitmapHeapScan struct {
 	// Distinct from `BitmapQual`: that is the RECHECK list, re-evaluated only
 	// when a bitmap entry is lossy or the AM demands it. `Cond` is evaluated on
 	// every tuple, lossy or not.
-	Cond   Expr
-	schema Schema
+	Cond Expr
+	// ProbeRecheckN counts the leading AND-conjuncts of Cond that are a
+	// parameterised probe's recheck — PG's bitmapqualorig, printed as
+	// `Recheck Cond:` — rather than per-tuple residuals. bindParamProbe keeps
+	// the recheck on Cond (a lateral join has no merged row for BitmapQual's
+	// coordinates), so execution is unchanged; only EXPLAIN splits the two
+	// (M0146-0187). Zero means Cond is all residual.
+	ProbeRecheckN int
+	schema        Schema
 	// Parallel mirrors PostgreSQL's Plan.parallel_aware: true when this scan
 	// was chosen as the worker-read driving scan under a Gather/GatherMerge
 	// (PG sets it in create_bitmap_heap_path, pathnode.c:1115, gated on

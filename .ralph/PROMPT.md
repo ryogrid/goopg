@@ -90,6 +90,13 @@ wasted turns).
   If its "NEXT LOOP" suggestion disagrees with the banner, the banner wins;
   rewrite the baton to match. (Resuming a genuinely `In-flight:` task is
   unaffected: finish it, then re-read the banner.)
+  **Likewise, a baton or status-block claim that a task "awaits owner
+  placement" (or "needs a place in the banner") is a claim, not a fact —
+  check the banner's item-2a/live-members text and the OWNER DECISIONS
+  blocks before treating a named task as unplaced** (added 2026-10-12:
+  five loops kept escalating M0146-0155 for placement hours after the
+  banner had already placed it, because each baton repeated the stale
+  claim).
 - **A baton that claims a GLOBAL blocker (e.g. "everything is owner-gated", "do
   not manufacture work") is a claim, not a fact — re-verify it against CURRENT
   state before reporting BLOCKED** (added 2026-09-22 after the commit-msg
@@ -114,7 +121,12 @@ wasted turns).
     line naming why not (blocking task id, S2 awaiting owner placement,
     sequence rule, measured non-improvement); `n/a` when the next step IS the
     top residual. Added 2026-10-02 (owner): "why not the biggest category"
-    must be auditable, not implicit.
+    must be auditable, not implicit. Amended 2026-10-15 (owner): when the
+    loop bypassed items 0-9 (an S9 pass that filed nothing, or selection of
+    item 10 or the below-item-10 fallback), `Skip-rationale:` must instead
+    enumerate every open `[ ]` task ranked items 0-9 as `id(gate)` tokens —
+    `channel`, `below-item-10`, `owner-<what>`, `blocked-on <id>` — and `n/a`
+    is not acceptable while any such task exists.
   - `Gates run:` which verification gates passed/failed this loop
   - `In-flight:` any gate/process you had to abandon: exact command, log/output
     path, PID state when killed, and what result was still needed (write `none`
@@ -475,8 +487,8 @@ non-authoritative commentary. Select the banner's first selectable item per
 its Selection rules; use judgment only among tasks the banner leaves equally
 ranked, or when the topmost task is blocked.
 
-Before selecting an M0137–M0145 or `P0-` task, read `AGENT.md`
-§"Plan-parity harness (M0137–M0145)". It is binding and overrides this file for
+Before selecting an M0137–M0146 or `P0-` task, read `AGENT.md`
+§"Plan-parity harness (M0137–M0146)". It is binding and overrides this file for
 those tasks. The loop never edits `CLAUDE.md`, the banner, or that section, never
 reverts, and never writes to the reference clusters; hooks enforce this when
 `RALPH_LOOP=1`.

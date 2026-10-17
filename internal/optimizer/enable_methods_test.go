@@ -1,6 +1,10 @@
 package optimizer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/utils/pgprng"
+)
 
 // TestEnableJoinMethodGUCsSetDisabledNodes pins take2 P2-05.
 //
@@ -184,13 +188,12 @@ func TestGeqoTuningGUCsReachTheSearch(t *testing.T) {
 		t.Errorf("real knobs lost in conversion: bias=%v seed=%v", cp.geqoBias, cp.geqoSeed)
 	}
 
-	// The seed mapping must keep PG's default a no-op, so the change is
-	// plan-neutral at the defaults, and must be monotone above it.
-	if geqoSeedState(0) != 0 {
-		t.Error("geqo_seed = 0 must leave the PRNG at its existing fixed state")
-	}
-	if !(geqoSeedState(0.5) > 0 && geqoSeedState(1) > geqoSeedState(0.5)) {
-		t.Errorf("seed mapping is not monotone: 0.5 -> %d, 1 -> %d",
-			geqoSeedState(0.5), geqoSeedState(1))
+	// geqo_set_seed is pg_prng_fseed(&random_state, Geqo_seed): the seed
+	// reaches PG's generator unchanged (M0146-0214).
+	for _, seed := range []float64{0, 0.5, 1} {
+		want := pgprng.FSeed(seed)
+		if got := newGeqoRNG(seed).state; got != want {
+			t.Errorf("newGeqoRNG(%v) state %+v, want pg_prng_fseed's %+v", seed, got, want)
+		}
 	}
 }

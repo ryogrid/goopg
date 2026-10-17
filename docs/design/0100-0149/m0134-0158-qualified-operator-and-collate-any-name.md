@@ -174,7 +174,8 @@ Neither fix alone changes anything observable — the psql query needs both.
    (12), column lists `FOR TABLE t (a, b)` (6), and comma-separated publication
    objects (6). Plus `pg_relation_is_publishable` (9) and
    `publication does not exist` cascades (22) downstream of those.
-2. **`qual_all_Op` and `subquery_Op` were not ported.** `ORDER BY x USING
+2. **`qual_all_Op` and `subquery_Op` were not ported.** *(subquery\_Op's
+   OPERATOR arm landed 2026-10-12, §6; `qual_all_Op` is still open.)* `ORDER BY x USING
    OPERATOR(pg_catalog.<)` and `x OPERATOR(pg_catalog.=) ANY (…)` remain 42601.
    `qual_Op` is used by exactly the four rules changed here; the other two are
    separate upstream nonterminals, and `sortby`'s existing comment records a
@@ -186,3 +187,32 @@ Neither fix alone changes anything observable — the psql query needs both.
    NOT instead of erroring. `op_run` rejoins the run inside `OPERATOR(...)`, so
    only the qualified spelling gets the honest `unsupported operator "!~~"`.
 4. **The operator qualifier is ignored** rather than resolved (§2).
+
+## 6. Follow-up (2026-10-12, M0122-0015b): `OPERATOR(...)` before ANY / SOME / ALL
+
+§5 item 2 claimed nothing a client sends needs `subquery_Op`'s OPERATOR arm.
+pg_dump does. Every pattern-based object selection (`-t`, `-T`, `--filter`)
+emits `c.relkind OPERATOR(pg_catalog.=) ANY (array['r', 'S', ...])`, so all
+three died with `syntax error at or near "ANY"`. `pg_dump -t mytable` did not
+work against goopg at all.
+
+- `subq_op` gains `| qual_op { $$ = qualOpName($1) }` (gram.y:16674). goyacc
+  starts `yyVAL` as `qual_op`'s symbol, so the ANY / SOME / ALL rules'
+  `$<p>2` is the OPERATOR keyword's offset, which is where upstream anchors
+  the A\_Expr.
+- The qualified spelling folds to the bare one, exactly like the binary rule
+  in §2.
+- No new parser conflicts (still the 60 known S/R).
+- Goldens: six new entries; no existing entry changed.
+- Tests: `TestQualifiedOperatorBeforeAnyAll` (parity plus fold pairs).
+  `TestPort_PgDump005Filterfile` ports
+  `postgres/src/bin/pg_dump/t/005_pg_dump_filterfile.pl` (69 of 92
+  assertions); its inventory row is promoted from `defer` to `port`.
+- Defects the port measured (filed as M0122-0015c..f):
+  - pg_dump of any database holding a user function dies at
+    `PREPARE dumpFunc(pg_catalog.oid)` with 42704, because a schema-qualified
+    type in PREPARE's parameter list does not resolve.
+  - User functions are visible in every database's pg_proc.
+  - pg_foreign_data_wrapper rows are visible in every database.
+  - `x = ANY (non-array)` is accepted; PG raises 42809 "op ANY/ALL (array)
+    requires array on right side", from make_scalar_array_op.

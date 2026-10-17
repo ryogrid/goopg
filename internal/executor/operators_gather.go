@@ -288,6 +288,14 @@ func (o *gatherOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// M0146-0192: the leader evaluates the initplans the workers reach and
+	// hands them the values (ExecInitParallelPlan's initParam).
+	initPlans, err := prepareWorkerInitPlans(ctx, o.plan.Child)
+	if err != nil {
+		o.startChannelCloser()
+		return err
+	}
+
 	// Worker arenas are allocated HERE, by the leader, before any goroutine
 	// starts: mctx.Acquire appends to parent.children without synchronisation,
 	// so concurrent acquisition is itself a slice-append race.
@@ -295,6 +303,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		o.arenas = append(o.arenas, arena)
 		wctx := NewWorkerContext(ctx, arena, o.group.Context())
+		wctx.InitPlanValues = initPlans
 		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
 		// this worker's sort entries with an explicit index.
 		wctx.workerSlot = i

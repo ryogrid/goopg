@@ -120,7 +120,7 @@ func TestParseAlterDatabaseConfig(t *testing.T) {
 			// flatten_set_variable_args; the display quoting is pg_dump's
 			// own client-side job, not goopg's).
 			sql:  "ALTER DATABASE postgres SET search_path TO public, pg_catalog",
-			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", configValue: "public,pg_catalog"},
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", configValue: "public, pg_catalog"},
 			ok:   true,
 		},
 		{

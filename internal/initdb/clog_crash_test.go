@@ -41,6 +41,15 @@ func TestCrashMidTransactionTableNotVisibleAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := newTxnConn(rt1, t)
+	// One committed transaction first, so the WAL holds xact history and the
+	// restart takes the crash-recovery sweep. With NO committed transaction
+	// since initdb the restart takes the old-cluster upgrade branch
+	// (clog.InitializeAsCommitted), which stamps the crashed xid Committed
+	// and resurrects the table — M0146-0152. HEAD passed this test without
+	// the commit only because the second Open registered tables from the
+	// M0114 JSON cache (written before the CREATE), retired by
+	// M0141-S2a-fix2r-c.
+	conn.run("CREATE TABLE committed_first (id int4)")
 	conn.run("BEGIN")
 	conn.run("CREATE TABLE crash_ghost (id int4, val text)")
 
@@ -95,5 +104,48 @@ func TestCommittedTableSurvivesCrashRestart(t *testing.T) {
 	// Phase 3: committed table must be present despite no SaveCatalog.
 	if _, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "committed_survivor"}); !ok {
 		t.Error("committed_survivor absent after crash-restart — clog filtered it incorrectly")
+	}
+}
+
+// TestCrashBeforeFirstCommitTableNotVisible pins M0146-0152: the same crash as
+// TestCrashMidTransactionTableNotVisibleAfterRestart, but with no transaction
+// committed since initdb. The WAL then holds no xact record and the on-disk
+// clog is empty, which Open used to read as an old (pre-M0030-0007) cluster:
+// it stamped every xid below NextXID Committed and the crashed CREATE TABLE
+// came back. PostgreSQL treats every xid below nextXid that never committed
+// as aborted. A cluster this binary initialised says so in
+// global/pg_goopg_features, and Open runs the crash-recovery sweep instead.
+func TestCrashBeforeFirstCommitTableNotVisible(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newTxnConn(rt1, t)
+	conn.run("BEGIN")
+	conn.run("CREATE TABLE crash_ghost (id int4, val text)")
+	if _, ok := rt1.Catalog.LookupTable(parser.ObjectName{Name: "crash_ghost"}); !ok {
+		t.Fatal("crash_ghost not in live catalog after CREATE TABLE — test setup broken")
+	}
+	rt1.Close() // no COMMIT / ROLLBACK: a crash
+
+	for restart := 1; restart <= 2; restart++ {
+		rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+		if err != nil {
+			t.Fatalf("re-open %d: %v", restart, err)
+		}
+		if _, ok := rt.Catalog.LookupTable(parser.ObjectName{Name: "crash_ghost"}); ok {
+			t.Errorf("restart %d: crash_ghost reappeared — the crashed xid was stamped committed", restart)
+		}
+		// The cluster stays usable: a new table commits and survives.
+		if restart == 1 {
+			newTxnConn(rt, t).run("CREATE TABLE after_crash (id int4)")
+		} else if _, ok := rt.Catalog.LookupTable(parser.ObjectName{Name: "after_crash"}); !ok {
+			t.Error("after_crash (committed after the crash) is missing")
+		}
+		rt.Close()
 	}
 }

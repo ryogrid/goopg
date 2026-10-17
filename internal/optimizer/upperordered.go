@@ -95,7 +95,9 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// on the way back out is therefore value-identical to what EXPLAIN
 	// already printed for it: nothing below the Sort moves.
 	seed := newPrebuiltPath(ordered, input)
-	pc := legacyDisplayCostOf(input)
+	// M0146-0211: create_ordered_paths prices input_path at its own cost
+	// (upperInputPathCost reads it through goopg's Project wrappers).
+	pc := upperInputPathCost(input)
 	// The seed's Rows already match: newPrebuiltPath carried rel.Rows (sized
 	// from this same input above) into it, and the sort prices sub.Rows —
 	// so the two agree by construction, not by coincidence.
@@ -114,6 +116,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 	// too — without re-deriving `searchedRelOf(input)`.
 	if sr := searchedRelOf(input); sr != nil {
 		ordered.SearchCandidates = sr.Pathlist
+		ordered.SearchCandidateClasses = sr.usefulKeys
 		// M0141-S2b-2b: re-earn every OTHER candidate's ordering claim
 		// against this rel's own published schema, the same rule
 		// `stampSearchPathkeys` already applies to the single WINNING path
@@ -135,7 +138,7 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 		traceOrderedCandidatePopulation(false, 0, 0)
 	}
 
-	addOrderedPaths(ordered, seed, pathkeysForSortKeys(keys), cp, limitTuples)
+	addOrderedPaths(ordered, seed, input, pathkeysForSortKeys(keys), cp, limitTuples)
 	// M0140-0006b-2: the upper-rel Gather reader. No-op today (no producer
 	// files partial paths on the ORDERED rel), wired so a future one does
 	// not repeat 0006b's "producer with no reader" trap.
@@ -159,7 +162,14 @@ func createOrderedPaths(u *upperRels, input Node, keys []SortKey, pos int, cp co
 // it. One input, so exactly one of the two producers fires per call. Split
 // from `createOrderedPaths` so the input arm — unreachable from a Node today —
 // is driven by a test with a hand-ordered seed rather than left untested.
-func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
+//
+// statsNode is the finished Node the input's rows come out of, which an
+// Incremental Sort's presorted-group estimate reads column statistics from
+// (`estimate_num_groups` in cost_incremental_sort). It is the input's own
+// node for a prebuilt seed; the grouping and DISTINCT elections offer
+// node-less PathAgg / PathDistinct candidates and pass the node their sort
+// runs over (M0146-0177). nil skips the Incremental Sort arm.
+func addOrderedPaths(ordered *RelOptInfo, input *Path, statsNode Node, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
 	if pathTraceEnabled {
 		contained, nCommon := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys)
 		traceOrderedSeedCandidate(input.Kind, len(input.Pathkeys), contained, nCommon, input.Cost.Total)
@@ -171,7 +181,8 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 			traceOrderedGroupingCandidate(input.AggStrategy, input.Rows)
 		}
 	}
-	if pathkeysContainedIn(input.Pathkeys, sortPathkeys) {
+	classes := ordered.SearchCandidateClasses
+	if contained, _ := classes.countContainedIn(input.Pathkeys, sortPathkeys); contained {
 		addPath(ordered, input, upperOrderedInputProducer)
 		return
 	}
@@ -181,10 +192,13 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 	// otherwise — never both (planner.c: "We'll just do a sort if there are
 	// no presorted keys and an incremental sort when there are presorted
 	// keys"). TPC-DS Q3's ORDER BY d_year, sum DESC, brand_id over a
-	// GroupAggregate grouped by d_year first.
-	if _, presorted := pathkeysCountContainedIn(input.Pathkeys, sortPathkeys); presorted > 0 &&
-		cp.enableIncrementalSort && input.node != nil {
-		addPath(ordered, incrementalSortPathOver(ordered, input, input.node, sortPathkeys, presorted, cp, limitTuples),
+	// GroupAggregate grouped by d_year first. The grouping election's
+	// candidates are node-less PathAggs; gating this arm on input.node left
+	// them with the full Sort only, which TPC-DS Q60 elected where PG builds
+	// the Incremental Sort (M0146-0177).
+	if _, presorted := classes.countContainedIn(input.Pathkeys, sortPathkeys); presorted > 0 &&
+		cp.enableIncrementalSort && statsNode != nil {
+		addPath(ordered, incrementalSortPathOver(ordered, input, statsNode, sortPathkeys, presorted, cp, limitTuples),
 			upperOrderedIncrementalSortProducer)
 	} else {
 		sorted := sortPathForBounded(input, sortPathkeys, cp, limitTuples)
@@ -218,7 +232,7 @@ func addOrderedPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, c
 			if cand == nil || i >= len(ordered.SearchCandidateKeys) {
 				continue
 			}
-			if !pathkeysContainedIn(ordered.SearchCandidateKeys[i], sortPathkeys) {
+			if contained, _ := classes.countContainedIn(ordered.SearchCandidateKeys[i], sortPathkeys); !contained {
 				continue
 			}
 			cNode := searchedCandidateInput(input.node, cand)

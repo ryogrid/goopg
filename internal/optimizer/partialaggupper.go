@@ -341,7 +341,7 @@ func spliceGatherOnPartialSpine(n Node) (Node, bool) {
 // here on the SPLICED child so workers, divisor and group counts measure the
 // subtree the plan actually executes per worker.
 func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings) *Path {
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if workers <= 0 {
 		traceUpperGate("agg-upper", "refused", "gate=workers route=partialgroup")
 		return nil
@@ -388,10 +388,10 @@ func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggN
 		traceUpperGate("agg-upper", "refused", "gate=keys route=partialgroup")
 		return nil
 	}
-	inNcols, inAvgVar := aggInputWidth(child, &unwrapped)
+	inWidth := aggInputPGWidth(child, &unwrapped)
 	return addPartialGroupArm(grouped, partialRel, pseed, &unwrapped, keyRefs, cp,
 		workers, d, perWorkerRows, partialGroups, finalGroups,
-		len(aggNode.GroupExprs), inNcols, inAvgVar)
+		len(aggNode.GroupExprs), inWidth)
 }
 
 // partial, when non-nil, is the searched rel's cheapest partial path and
@@ -465,6 +465,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// planner.c:7351/:7704). The guard is then satisfied honestly rather
 	// than bypassed: there is genuinely no Gather left in the input, so the
 	// two-Gather hazard it protects against cannot arise.
+	scanJoinChild := child // M0146-0190: the serial input the search candidates describe
 	if g, ok := gatherToUnwrapForPartialAgg(child); ok {
 		child = g
 		// The aggregate's B-01c input target was derived against the child
@@ -494,7 +495,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// unwrap above there is no Gather left, and on the post-pass route there
 	// never was one. Two Gathers would have every worker read the whole
 	// relation and return N+1 copies of every row.
-	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child) || subtreeHasParallelRestrictedQual(child), subtreeHasGather(child), drivingScan(child) == nil
 	if unsafe || gathered || noScan {
 		// M0146-0025's second route: the PARTIAL-GROUP arm alone retries on
 		// a child whose Gather is spliced out along the driving spine (the
@@ -507,14 +508,14 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// checks — unsafe, gathered, no-driving-scan — verbatim.
 		if ps.ParallelStatementOK && len(aggNode.Aggs) == 0 && aggNode.GroupingSets == nil && len(aggNode.GroupExprs) > 0 {
 			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
-				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				!subtreeHasUnsafeNode(gc) && !subtreeHasParallelRestrictedQual(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
 				return addPartialGroupOnlyPath(u, grouped, seed, aggNode, gc, cp, ps)
 			}
 		}
 		traceUpperGate("agg-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return nil
 	}
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if partial != nil && partial.ParallelWorkers > 0 {
 		workers = partial.ParallelWorkers
 	}
@@ -572,7 +573,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	inWidth := aggInputPGWidth(child, aggNode)
 
 	// ── the SPLIT family, offered only for a DECOMPOSABLE aggregate ─────────
 	//
@@ -603,7 +604,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		}
 		hashedPartialSurvives := !sortedEligible ||
 			hashedPartialAggSurvives(pseed, aggNode, cp, ps, perWorkerRows, partialGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar)
+				nGroupCols, nAggs, inWidth)
 		// M0146-0005ak: this arm is `Finalize -> Gather -> Partial`, and a
 		// Gather interleaves the workers' streams, so only a HASHED
 		// finalize can consume it: since the row transport (M0146-0003b)
@@ -617,7 +618,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		if hashedPartialSurvives {
 			split = addPartialAggSplitArm(grouped, partialRel, pseed, aggNode, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar, AggStrategyHashed)
+				nGroupCols, nAggs, inWidth, AggStrategyHashed)
 		}
 
 		// M0146-0003 S6: the PRESORTED split — `gather_grouping_paths`
@@ -642,7 +643,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			// partial pathlist.
 			sortedInput := addPartialAggSortedInputArm(grouped, partialRel, pseed, aggNode, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, nAggs, inNcols, inAvgVar)
+				nGroupCols, nAggs, inWidth)
 			if split == nil {
 				split = sortedInput
 			}
@@ -652,7 +653,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			if hashedPartialSurvives {
 				addPartialAggSortedSplitArm(grouped, partialRel, pseed, aggNode, cp,
 					workers, d, perWorkerRows, partialGroups, finalGroups,
-					nGroupCols, nAggs, inNcols, inAvgVar)
+					nGroupCols, nAggs, inWidth)
 			}
 		}
 	}
@@ -681,7 +682,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		if keyRefs, ok := partialGroupKeyRefs(aggNode); ok {
 			split = addPartialGroupArm(grouped, partialRel, pseed, aggNode, keyRefs, cp,
 				workers, d, perWorkerRows, partialGroups, finalGroups,
-				nGroupCols, inNcols, inAvgVar)
+				nGroupCols, inWidth)
 		}
 	}
 
@@ -703,19 +704,21 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// on the reduction ratio, which is the quantity the decision turns on
 	// (DESIGN §3.4).
 	//
-	// M0146-0009n: the rows crossing the boundary are `compute_gather_rows`
-	// (costsize.c) of the partial input — its per-worker rows times the
-	// divisor, clamped — not the serial seed's rows. With a searched partial
-	// path the two differ, and the worker-sort Gather Merge below is sized
-	// the PG way, so a seed-sized Gather lost or won their near-ties on the
-	// difference alone (TPC-DS Q56's store_sales branch).
-	gatheredRows := clampRowEst(perWorkerRows * d)
+	// M0146-0220: the rows crossing the boundary are the scan/join rel's own
+	// rows (scanJoinGatherRows). M0146-0009n had sized this Gather, and the
+	// worker-sort Gather Merge below, at compute_gather_rows; the two now
+	// agree with each other and with upstream.
+	gatheredRows := scanJoinGatherRows(seed, perWorkerRows, d)
 	nsGatherCost := gatherCost(cp, pseed.Cost, gatheredRows)
 	nsGather := &Path{
 		Kind: PathGather, Rel: grouped, Rows: gatheredRows, Cost: nsGatherCost,
 		ParallelWorkers: workers,
 		Children:        []*Path{pseed},
 	}
+	// Every arm over nsGather is an aggregate over the scan/join rel's simple
+	// Gather path, which upstream only aggregates if that Gather survived
+	// add_path on the scan/join rel (M0146-0219, scanJoinRelKeepsGather).
+	keepGather := scanJoinRelKeepsGather(scanJoinChild, seed, nsGather, cp)
 	// STRATEGY. The gathered arm is `addGroupingPaths`' own body over a
 	// PARALLEL input, and it has to offer the same shapes for the same
 	// reasons — offering only the hashed one is how TPC-H Q16 flipped from
@@ -755,28 +758,32 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			// the extended query_pathkeys files upstream). Both price the
 			// aggregate by the hashed arm at 0 group columns / 1 group —
 			// the PLAIN arm's own pricing, unchanged.
-			sortedGather := sortPathForBounded(nsGather,
-				pathkeysForSortKeys(presortedKeys), cp, -1)
-			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-			sortSpec := *aggNode
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &sortSpec,
-				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
-				Pathkeys: sortedGather.Pathkeys, Children: []*Path{sortedGather},
-			}, partialAggNoSplitProducer)
+			if keepGather {
+				sortedGather := sortPathForBounded(nsGather,
+					pathkeysForSortKeys(presortedKeys), cp, -1)
+				// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+				sortSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &sortSpec,
+					Rel: grouped, Rows: 1,
+					Cost: costAggClause(cp, AggStrategyHashed, gatheredRows, sortedGather.Cost.Startup, sortedGather.Cost.Total,
+						0, 1, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
+					Pathkeys: sortedGather.Pathkeys, Children: []*Path{sortedGather},
+				}, partialAggNoSplitProducer)
+			}
 			workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
-				presortedKeys, cp, workers, d, perWorkerRows)
-			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-			gmSpec := *aggNode
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
-				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
-				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
-			}, partialAggGatherMergeProducer)
+				presortedKeys, cp, workers, gatheredRows)
+			if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
+				// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+				gmSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &gmSpec,
+					Rel: grouped, Rows: 1,
+					Cost: costAggClause(cp, AggStrategyHashed, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
+						0, 1, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
+					Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+				}, partialAggGatherMergeProducer)
+			}
 		} else {
 			// PLAIN: one candidate, priced by the hashed arm at 0 group columns
 			// and 1 group — term-for-term PG's PLAIN arm, as C-15 does.
@@ -784,15 +791,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			// unsorted gathered input is exactly what upstream files —
 			// `make_ordered_path` over empty pathkeys returns the path
 			// unchanged.
-			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-			plainSpec := *aggNode
-			addPath(grouped, &Path{
-				Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
-				Rel: grouped, Rows: 1,
-				Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
-					0, 1, nAggs, inNcols, inAvgVar),
-				Children: []*Path{nsGather},
-			}, partialAggNoSplitProducer)
+			if keepGather {
+				// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+				plainSpec := *aggNode
+				addPath(grouped, &Path{
+					Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
+					Rel: grouped, Rows: 1,
+					Cost: costAggClause(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
+						0, 1, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
+					Children: []*Path{nsGather},
+				}, partialAggNoSplitProducer)
+			}
 		}
 		// R54 Step-0: upper-rel admission record. A nil split is still an
 		// admission — the gathered no-split arms were filed and cost
@@ -823,16 +832,18 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		gatheredKeys, gatheredSortOK = presortedKeys, true
 	}
 	if aggNode.GroupingSets == nil && gatheredSortOK {
-		sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(gatheredKeys), cp, -1)
-		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-		sortSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
-			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, gatheredRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-			Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-		}, partialAggNoSplitProducer)
+		if keepGather {
+			sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(gatheredKeys), cp, -1)
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			sortSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+				Rel: grouped, Rows: finalGroups,
+				Cost: costAggClause(cp, AggStrategySorted, gatheredRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+					nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
+				Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+			}, partialAggNoSplitProducer)
+		}
 
 		// R56: the WORKER-SORT no-split arm — `GroupAgg -> GatherMerge ->
 		// Sort -> pseed`, PG's winning Q7 shape
@@ -853,26 +864,28 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 		// `createPartialSortPaths` pattern (partialsortpaths.go), whose
 		// worker-side construction this mirrors field for field.
 		workerGM, gmCrossedRows := workerSortGatherMergePath(grouped, pseed,
-			gatheredKeys, cp, workers, d, perWorkerRows)
-		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
-		gmSpec := *aggNode
-		addPath(grouped, &Path{
-			Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
-			Rel: grouped, Rows: finalGroups,
-			Cost: costAgg(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-			Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
-		}, partialAggGatherMergeProducer)
+			gatheredKeys, cp, workers, gatheredRows)
+		if scanJoinRelKeepsGatherMerge(scanJoinChild, seed, workerGM, cp) {
+			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
+			gmSpec := *aggNode
+			addPath(grouped, &Path{
+				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &gmSpec,
+				Rel: grouped, Rows: finalGroups,
+				Cost: costAggClause(cp, AggStrategySorted, gmCrossedRows, workerGM.Cost.Startup, workerGM.Cost.Total,
+					nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
+				Pathkeys: workerGM.Pathkeys, Children: []*Path{workerGM},
+			}, partialAggGatherMergeProducer)
+		}
 	}
-	if groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil {
+	if keepGather && (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) {
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		hashSpec := *aggNode
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: finalGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, nsGather),
-			Cost: costAgg(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
-				nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+			Cost: costAggClause(cp, AggStrategyHashed, gatheredRows, nsGatherCost.Startup, nsGatherCost.Total,
+				nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitSimple)),
 			Children: []*Path{nsGather},
 		}, partialAggNoSplitProducer)
 	}
@@ -928,7 +941,7 @@ func partialGroupKeyRefs(agg *Aggregate) ([]Expr, bool) {
 // (partialGroupKeyRefs).
 func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, keyRefs []Expr,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, inWidth int) *Path {
 
 	// The worker's own sort on the group keys — `make_ordered_path`
 	// (planner.c:7644) over the partial input, through the same
@@ -955,7 +968,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &partialSpec,
 		Rel: partialRel, Rows: partialGroups,
 		Cost: costAgg(cp, AggStrategySorted, perWorkerRows, workerSort.Cost.Startup, workerSort.Cost.Total,
-			nGroupCols, partialGroups, 0, inNcols, inAvgVar),
+			nGroupCols, partialGroups, 0, inWidth),
 		DisabledNodes:   workerSort.DisabledNodes,
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
@@ -970,7 +983,9 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 	// perWorkerRows × d — the whole economic argument of the shape
 	// (Q37's 2 final groups against a 20-row sort each worker already
 	// narrowed).
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
 	gmPath := &Path{
 		Kind: PathGatherMerge, Rel: grouped, Rows: crossed, Cost: gmCost,
@@ -995,7 +1010,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 		Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
 		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, 0, inNcols, inAvgVar),
+			nGroupCols, finalGroups, 0, inWidth),
 		Pathkeys: gmPath.Pathkeys, Children: []*Path{gmPath},
 	}
 	addPath(grouped, finalPath, partialGroupMergeProducer)
@@ -1008,25 +1023,23 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 // worker sort runs. Returns the Gather Merge path and the row count crossing
 // the merge boundary, which the caller needs for its own `costAgg` input.
 //
-// Rows crossing the merge boundary: every input row — a Sort emits what it
-// reads — i.e. the per-worker count the sort was priced with (`perWorkerRows`)
-// times the divisor `d`, clamped: `compute_gather_rows` (costsize.c), the
-// count the no-split arm's Gather takes too (M0146-0009n). Spelled out rather
-// than via `computeGatherRows`, which re-derives the divisor from the subpath
-// and this sort was planned with the caller's.
+// Rows crossing the merge boundary: crossRows, the scan/join rel's rows
+// (scanJoinGatherRows), the count the no-split arm's Gather takes too.
+// Upstream builds this Gather Merge in generate_useful_gather_paths on the
+// scan/join rel with override_rows false, so it carries rel->rows.
 //
 // The GatherMerge is built MANUALLY rather than through `makeGatherMergePath`:
 // that constructor only wraps an already-sorted subpath
 // (`partialPathDrivingKind` refuses Sort), while this arm builds the sort
 // itself — C-19e's `createPartialSortPaths` pattern (partialsortpaths.go),
 // whose worker-side construction this mirrors field for field.
-func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, d, perWorkerRows float64) (*Path, float64) {
+func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, crossRows float64) (*Path, float64) {
 	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(keys), cp, -1)
 	// `sortPathForBounded` prices ParallelSafe but never plans workers;
 	// without this the GatherMerge build below refuses the subpath
 	// (`gatherChildPlan` panics on 0 workers).
 	workerSort.ParallelWorkers = workers
-	gmCrossedRows := clampRowEst(perWorkerRows * d)
+	gmCrossedRows := crossRows
 	gmCost := gatherMergeCost(cp, workerSort.Cost, workers, gmCrossedRows)
 	workerGM := &Path{
 		Kind: PathGatherMerge, Rel: grouped, Rows: gmCrossedRows, Cost: gmCost,
@@ -1043,6 +1056,118 @@ func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey,
 		Children:      []*Path{workerSort},
 	}
 	return workerGM, gmCrossedRows
+}
+
+// scanJoinGatherRows is the row count of the Gather and Gather Merge the
+// no-split arms aggregate over (M0146-0220). Upstream builds both on the
+// topmost scan/join rel: generate_gather_paths / generate_useful_gather_paths
+// run from apply_scanjoin_target_to_paths with override_rows false, so
+// create_gather_path and create_gather_merge_path stamp rel->rows, and
+// cost_gather charges parallel_tuple_cost on that. compute_gather_rows is
+// only for the override_rows=true calls on upper rels (gather_grouping_paths,
+// the partial-distinct rel). TPC-DS Q48 at SF1: the rel has 5 rows and the
+// per-worker estimate times the divisor is 4, so the compute_gather_rows
+// Gather undercut PG's Finalize Aggregate by 0.1 of parallel_tuple_cost and
+// won. The seed is the rel's cheapest serial path and carries the rel's rows.
+// Without one, the partial input's compute_gather_rows is the only estimate
+// left.
+func scanJoinGatherRows(seed *Path, perWorkerRows, d float64) float64 {
+	if seed != nil && seed.Rows > 0 {
+		return seed.Rows
+	}
+	return clampRowEst(perWorkerRows * d)
+}
+
+// scanJoinRelKeepsGatherMerge reports whether the worker-sort Gather Merge
+// would survive add_path on the scan/join rel (M0146-0190).
+//
+// Upstream builds that Gather Merge in generate_useful_gather_paths on the
+// topmost scan/join rel (apply_scanjoin_target_to_paths), where it joins the
+// rel's pathlist like any other path. add_paths_to_grouping_rel then
+// aggregates only the paths that survived. goopg files the aggregate over it
+// straight onto the grouped rel, so a Gather Merge that PG drops still
+// competed there. TPC-DS Q26 is the case: PG's search keeps a Nested Loop
+// over a lower Gather Merge with the same ordering and a fuzz-equal cost but
+// an earlier start. The new Gather Merge is cheaper in total only, so
+// add_path's tight-fuzz tie-break rejects it, and PG's grouped rel never sees
+// it. The search rel's candidates stand in for that pathlist, priced and keyed
+// as the searchcand arm (groupingpaths.go) takes them.
+func scanJoinRelKeepsGatherMerge(child Node, seed, gm *Path, cp costParams) bool {
+	sr := searchedJoinInputRelOf(child)
+	if sr == nil || seed == nil || gm == nil || len(gm.Children) != 1 {
+		return true
+	}
+	scratch := &RelOptInfo{ConsiderStartup: sr.ConsiderStartup, ConsiderParamStartup: sr.ConsiderParamStartup}
+	if sr.usefulKeys != nil {
+		scratch.pathkeyClass = sr.usefulKeys.equivalentWithin
+	}
+	// On a scan/join rel generate_useful_gather_paths runs with
+	// override_rows false, so the Gather Merge carries the rel's rows, not
+	// compute_gather_rows, and cost_gather_merge charges those.
+	probe := *gm
+	probe.Rel, probe.Rows = scratch, seed.Rows
+	probe.Cost = gatherMergeCost(cp, gm.Children[0].Cost, gm.Children[0].ParallelWorkers, seed.Rows)
+	candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+	for i, cand := range sr.Pathlist {
+		// A Gather or Gather Merge the search already stamped on the rel is
+		// goopg's copy of what generate_useful_gather_paths builds in this
+		// very call; upstream's rel holds no gathered path yet. TPC-DS Q28's
+		// scan rel carries this Gather Merge itself.
+		if i >= len(candKeys) || len(candKeys[i]) == 0 ||
+			cand.Kind == PathGather || cand.Kind == PathGatherMerge {
+			continue
+		}
+		old := *cand
+		old.Rel, old.Rows, old.Pathkeys = scratch, seed.Rows, candKeys[i]
+		switch comparePaths(&probe, &old) {
+		case relBDominates, relEqual:
+			return false
+		}
+	}
+	return true
+}
+
+// scanJoinRelKeepsGather is scanJoinRelKeepsGatherMerge's twin for the simple
+// Gather of the cheapest partial path (M0146-0219). generate_gather_paths
+// files that Gather on the topmost scan/join rel too (allpaths.c, called from
+// apply_scanjoin_target_to_paths with override_rows false, so it carries the
+// rel's rows), and add_paths_to_grouping_rel only aggregates it if add_path
+// kept it. TPC-DS Q61's scalar sums are the case: the Gather is 1% cheaper in
+// total than the rel's serial Nested Loop over a lower Gather but starts later,
+// so PG rejects it, and the only parallel candidate left on the grouped rel is
+// Finalize Aggregate -> Gather -> Partial Aggregate. goopg's `Agg -> Gather`
+// arms competed anyway and won the tie by a few hundredths. A Gather has no
+// pathkeys, so every candidate of the rel can dominate it, ordered or not.
+func scanJoinRelKeepsGather(child Node, seed, g *Path, cp costParams) bool {
+	sr := searchedJoinInputRelOf(child)
+	if sr == nil || seed == nil || g == nil || len(g.Children) != 1 {
+		return true
+	}
+	scratch := &RelOptInfo{ConsiderStartup: sr.ConsiderStartup, ConsiderParamStartup: sr.ConsiderParamStartup}
+	if sr.usefulKeys != nil {
+		scratch.pathkeyClass = sr.usefulKeys.equivalentWithin
+	}
+	probe := *g
+	probe.Rel, probe.Rows, probe.Pathkeys = scratch, seed.Rows, nil
+	probe.Cost = gatherCost(cp, g.Children[0].Cost, seed.Rows)
+	candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
+	for i, cand := range sr.Pathlist {
+		// As in the Gather Merge twin: a gathered path the search already
+		// stamped is goopg's copy of the one this call would build.
+		if cand == nil || cand.Kind == PathGather || cand.Kind == PathGatherMerge {
+			continue
+		}
+		old := *cand
+		old.Rel, old.Rows, old.Pathkeys = scratch, seed.Rows, nil
+		if i < len(candKeys) {
+			old.Pathkeys = candKeys[i]
+		}
+		switch comparePaths(&probe, &old) {
+		case relBDominates, relEqual:
+			return false
+		}
+	}
+	return true
 }
 
 func upperSplitVerdict(split *Path) string {
@@ -1080,13 +1205,14 @@ func subtreeRefusalKind(unsafe, gathered, noScan bool) string {
 // no-split arm above stays reachable for an aggregate that cannot be split.
 func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64, strategy AggStrategy) *Path {
-	crossedRows := partialGroups * d
+	nGroupCols, nAggs, inWidth int, strategy AggStrategy) *Path {
+	// compute_gather_rows clamps (M0146-0221; see addPartialAggSortedSplitArm).
+	crossedRows := clampRowEst(partialGroups * d)
 
 	// PARTIAL arm — `create_agg_path(… AGGSPLIT_INITIAL_SERIAL …)`,
 	// planner.c:7606.
-	partialCost := costAgg(cp, strategy, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	partialCost := costAggClause(cp, strategy, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+		nGroupCols, partialGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitInitialSerial))
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	partialPath := &Path{
@@ -1120,8 +1246,8 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 	split := &Path{
 		Kind: PathFinalizeAgg, AggStrategy: strategy, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
-		Cost: costAgg(cp, strategy, crossedRows, gatherAbove.Startup, gatherAbove.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+		Cost: costAggClause(cp, strategy, crossedRows, gatherAbove.Startup, gatherAbove.Total,
+			nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitFinalDeserial)),
 		ParallelWorkers: workers,
 		Children:        []*Path{gatherPath},
 	}
@@ -1153,7 +1279,7 @@ func addPartialAggSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode
 // honest claim rather than a translated one.
 func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, nAggs, inWidth int) *Path {
 
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
@@ -1162,14 +1288,16 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		// group expression no merge key can name.
 		return nil
 	}
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 
 	// PARTIAL arm — hashed per worker, like the split arm's: PG shows
 	// `Partial HashAggregate` under the worker Sort (TPC-H Q1), and
 	// `strategy` deliberately does not reach this arm — a sorted spec
 	// still hashes its partial.
-	partialCost := costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	partialCost := costAggClause(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+		nGroupCols, partialGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitInitialSerial))
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	partialPath := &Path{
@@ -1212,9 +1340,9 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	sorted := &Path{
 		Kind: PathFinalizeAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
-		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		Cost: costAggClause(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
+			nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitFinalDeserial)),
+		Pathkeys:        finalizeGroupPathkeys(aggNode),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
 	}
@@ -1250,7 +1378,7 @@ func addPartialAggSortedSplitArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 // merged-stream order the Finalize's sorted fold consumes.
 func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate,
 	cp costParams, workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) *Path {
+	nGroupCols, nAggs, inWidth int) *Path {
 
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
@@ -1258,12 +1386,14 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 		// expression no merge key can name makes the arm unreachable.
 		return nil
 	}
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c) clamps: gather_grouping_paths passes it
+	// for every Gather and Gather Merge over a partial grouping path (M0146-0221).
+	crossed := clampRowEst(partialGroups * d)
 
 	// WORKER SORT and PARTIAL — see sortedInputPartialAgg.
 	mergeKeys := pathkeysForSortKeys(sortKeys)
 	partialPath := sortedInputPartialAgg(partialRel, pseed, aggNode, cp, workers,
-		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, mergeKeys)
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inWidth, mergeKeys)
 	partialCost := partialPath.Cost
 
 	// BOUNDARY — `cost_gather_merge` over the ordered partial streams,
@@ -1286,9 +1416,9 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 	sorted := &Path{
 		Kind: PathFinalizeAgg, AggStrategy: AggStrategySorted, Agg: &finalSpec,
 		Rel: grouped, Rows: finalGroups,
-		Cost: costAgg(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
-		Pathkeys:        append([]PathKey(nil), mergeKeys...),
+		Cost: costAggClause(cp, AggStrategySorted, crossed, gmCost.Startup, gmCost.Total,
+			nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitFinalDeserial)),
+		Pathkeys:        finalizeGroupPathkeys(aggNode),
 		ParallelWorkers: workers,
 		Children:        []*Path{gmPath},
 	}
@@ -1314,12 +1444,12 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 // the transport-position merge keys. It inherits the Sort's disabled count,
 // as cost_agg adds its input's.
 func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, cp costParams, workers int,
-	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64, mergeKeys []PathKey) *Path {
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inWidth int, mergeKeys []PathKey) *Path {
 	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
 	workerSort.ParallelWorkers = workers
-	partialCost := costAgg(cp, AggStrategySorted, perWorkerRows,
+	partialCost := costAggClause(cp, AggStrategySorted, perWorkerRows,
 		workerSort.Cost.Startup, workerSort.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+		nGroupCols, partialGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitInitialSerial))
 	// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 	partialSpec := *aggNode
 	return &Path{
@@ -1344,17 +1474,17 @@ func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggrega
 // addToPartialPathlist's, so the fuzz, pathkeys and disabled_nodes rules are
 // the ones every other partial rival in this package is judged by.
 func hashedPartialAggSurvives(pseed *Path, aggNode *Aggregate, cp costParams, ps PlannerSettings,
-	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inNcols int, inAvgVar float64) bool {
+	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inWidth int) bool {
 	sortKeys, ok := transportGroupSortKeys(aggNode)
 	if !ok {
 		return true
 	}
 	sorted := sortedInputPartialAgg(pseed.Rel, pseed, aggNode, cp, pseed.ParallelWorkers,
-		perWorkerRows, partialGroups, nGroupCols, nAggs, inNcols, inAvgVar, pathkeysForSortKeys(sortKeys))
+		perWorkerRows, partialGroups, nGroupCols, nAggs, inWidth, pathkeysForSortKeys(sortKeys))
 	hashed := &Path{
 		Kind: PathAgg, AggStrategy: AggStrategyHashed, Rel: pseed.Rel, Rows: partialGroups,
-		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-			nGroupCols, partialGroups, nAggs, inNcols, inAvgVar),
+		Cost: costAggClause(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
+			nGroupCols, partialGroups, nAggs, inWidth, aggClauseCosts(cp, aggNode, aggSplitInitialSerial)),
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
 		ParallelSafe:  true,
 	}
@@ -1390,6 +1520,19 @@ func parallelSeedCost(serial Cost, d float64) Cost {
 	return Cost{Startup: serial.Startup, Total: serial.Startup + run/d}
 }
 
+// finalizeGroupPathkeys is the ordering a sorted Finalize delivers, named as
+// every serial grouping arm names it: the group keys over the aggregate's
+// input row (groupKeysSortKeys). The Gather Merge below merges on the
+// transport row's positions (mergeKeys), which createFinalizeAggSortedPlan
+// re-derives itself; on the grouped rel's path the transport form named the
+// same ordering differently, add_path called the two PATHKEYS_DIFFERENT, and
+// a fuzzily-tied, slow-start split survived beside PG's fast-start serial
+// aggregate and won on total — PG's canonical group pathkeys make them one
+// (TPC-DS Q77's ws, M0146-0189).
+func finalizeGroupPathkeys(aggNode *Aggregate) []PathKey {
+	return pathkeysForSortKeys(groupKeysSortKeys(aggNode))
+}
+
 // upperSplitWorkers sizes the split's worker count.
 //
 // It is `compute_parallel_worker` (allpaths.c:4274) through the SAME entry the
@@ -1405,7 +1548,7 @@ func parallelSeedCost(serial Cost, d float64) Cost {
 // never reads the heap, so the INDEX's page count is what bounds it
 // (`create_index_paths` passes `index->pages`). Measured on TPC-H q13/q16
 // (M0134-0189) and repeated here so the two sizings cannot disagree.
-func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
+func upperSplitWorkers(u *upperRels, child Node, cp costParams, ps PlannerSettings) int {
 	// M0145-0004: size over EVERY driving scan — a `*SetOp` driving node
 	// stands for all of its streamed member branches (drivingScans), and
 	// the split's worker count is the max across them, the same rule
@@ -1415,7 +1558,7 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 	// members outright.
 	best := 0
 	for _, scan := range drivingScans(child) {
-		if w := upperSplitWorkersForScan(scan, cp); w > best {
+		if w := upperSplitWorkersForScan(scan, cp, u.catalog()); w > best {
 			best = w
 		}
 	}
@@ -1428,7 +1571,7 @@ func upperSplitWorkers(child Node, cp costParams, ps PlannerSettings) int {
 // upperSplitWorkersForScan is the single-scan body of upperSplitWorkers,
 // split out so a SetOp driving node can size each member branch
 // independently.
-func upperSplitWorkersForScan(scan Node, cp costParams) int {
+func upperSplitWorkersForScan(scan Node, cp costParams, cat catalog.Catalog) int {
 	tbl := scanTable(scan)
 	if tbl == nil {
 		return 0
@@ -1445,7 +1588,12 @@ func upperSplitWorkersForScan(scan Node, cp costParams) int {
 	// the exact failure `parallelRelationBlocks`' comment records having been
 	// bitten by once already. `baseRelPages` is the fallback for a table the
 	// storage hook cannot answer for (unit fixtures above all).
-	pages, ok := catalog.TableRealPages(tbl)
+	//
+	// Both sizes are read where cat places the relations (M0146-0178): a
+	// relation in the postgres database is keyed DefaultDBOid but stored
+	// under the catalog's database, and the default-database lookup missed
+	// its file.
+	pages, ok := catalog.TableRealPagesIn(cat, tbl)
 	if !ok || pages <= 0 {
 		relTuples := float64(tableRows(tbl))
 		if relTuples < 1 {
@@ -1454,7 +1602,7 @@ func upperSplitWorkersForScan(scan Node, cp costParams) int {
 		pages = baseRelPages(tbl, relTuples)
 	}
 	if ios, isIOS := scan.(*IndexOnlyScan); isIOS && ios.Index != nil {
-		if ipages, ok := catalog.IndexRealPages(ios.Index); ok && ipages > 0 {
+		if ipages, ok := catalog.IndexRealPagesIn(cat, ios.Index); ok && ipages > 0 {
 			pages = ipages
 		}
 	}

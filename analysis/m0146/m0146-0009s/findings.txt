@@ -1,0 +1,26 @@
+M0146-0009s — ea-ratchet re-pin 9 -> 1 and routing of the last finding (2026-10-13, HEAD c47b7d5d7)
+
+Run: make ea-ratchet (fresh capture, TPC-DS SF0.25, 99 queries, 265 nodes scored) -> ea-ratchet-run.txt
+  baseline 9 findings, current 1; EA-RATCHET: PASS (8 fixed). Re-pinned with
+  EA_CAPTURE=tmp/c20a/ea-capture.txt make ea-ratchet-repin; the re-run reports baseline 1 / current 1, PASS.
+
+FIXED, by plan-shape convergence on PG (not by a new estimator):
+  Q14 (6 keys, cte:cross_items + sales/date_dim): goopg now unique-ifies the CTE Scan on cross_items and probes item
+    by index, as PG (M0146-0127 semijoin equality joins the ECs; M0146-0128). The sales + cross_items joinrels no
+    longer form. The CTE Scan itself estimates rows=1 in both engines (actual 16173) — PG parity.
+  Q23 (2 keys, cte:frequent_ss_items + sales): the joinrel still forms; goopg 43 rows vs PG 42 (actual 0), now
+    inside the PG-relative bar (M0146-0121 get_loop_count / M0146-0009q CTE Scan sizing).
+
+Remaining finding — Q78 Merge Left Join, relset date_dim+store_returns+store_sales+web_returns+web_sales:
+  goopg est 1403, actual 123049 (qerr 87.7); PG has no node at this relset ("-").
+  goopg joins store_sales' aggregate to web_sales' first; PG joins catalog_sales' first:
+    goopg  Merge Left Join rows=1403 (ss agg 1403 left join ws agg 471)
+    PG     Merge Left Join rows=1381 (ss agg 1381 left join cs agg 828)
+  Both estimate the left join at the outer GroupAggregate's group count (goopg 1403, PG 1381 — 1.6% apart); the
+  error is the shared GroupAggregate group estimate for (ss_item_sk, ss_customer_sk), equal in both engines.
+  The finding exists only because the join order differs, and that swap is Q78's COSTTIE record (0.06 cost apart,
+  measured 2026-10-09), waived under M0146-0014 (analysis/m0146/m0146-0014/routing-20261013/ROUTING.md).
+  Not statistics-driven: no estimator change is owed.
+
+Routing check: no first-divergence record in routing-20261013 routes to M0146-0009 (only the RELPAGES owner residual
+  cites the 0009h ledger row).

@@ -183,7 +183,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	}
 
 	// Index geometry — same as the regular index scan cost model.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 
 	selectivity := qualSelectivity
 	in := indexScanInputs{
@@ -199,7 +199,8 @@ func (s *searchCtx) buildOneBitmapPath(
 		// "the full freight for all the scan clauses" (assume-rechecked-
 		// always), so every local conjunct counts — not minus
 		// index-satisfied ones.
-		numQualOps: localQualOpCount(leaf),
+		numQualOps:    localQualOpCount(leaf),
+		numIndexQuals: float64(len(indexClauses)),
 	}
 	tuplesFetched := clampRowEst(selectivity * relTuples)
 
@@ -462,7 +463,7 @@ func (s *searchCtx) chooseBitmapAnd(
 		for col := range indexCols[i] {
 			coveredCols[col] = true
 		}
-		indexPages := indexPagesForPath(paths[i], tbl, relTuples)
+		indexPages := indexPagesForPath(s.cat, paths[i], tbl, relTuples)
 		curCost := bitmapScanCostEst(s.cp, paths[i], rel.Rows, T, indexPages, totalPages, maxEntries, relQualOpCount(rel))
 
 		for j := i + 1; j < len(paths); j++ {
@@ -489,7 +490,7 @@ func (s *searchCtx) chooseBitmapAnd(
 			// Sum index pages across the AND group for cache-aware estimate.
 			var andIP float64
 			for _, inner := range inners {
-				ip, _, _ := estimateIndexGeometry(inner.IndexInfo, tbl, relTuples)
+				ip, _, _ := estimateIndexGeometry(s.cat, inner.IndexInfo, tbl, relTuples)
 				andIP += ip
 			}
 			newCost := bitmapAndScanCostEst(s.cp, inners, rel.Rows, T, andIP, totalPages, maxEntries, relQualOpCount(rel))
@@ -535,7 +536,7 @@ func (s *searchCtx) chooseBitmapAnd(
 
 	// Recompute heap-access cost atop the AND tree.
 	tuplesFetched := clampRowEst(andSelec * relTuples)
-	andIP := indexPagesForPath(bitmapAndPath, tbl, relTuples)
+	andIP := indexPagesForPath(s.cat, bitmapAndPath, tbl, relTuples)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, andIP, totalPages, s.cp.effectiveCacheSize, maxEntries)
 	totalCost := costBitmapHeapScan(s.cp, andCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel))
 
@@ -657,18 +658,19 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 	sel = clampSelectivity(sel)
 	tuplesFetched := clampRowEst(sel * relTuples)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 	idxCost := costBitmapIndexScan(s.cp, indexScanInputs{
 		relPages: relPages, relTuples: relTuples, indexPages: indexPages,
 		indexTuples: indexTuples, treeHeight: treeHeight, selectivity: sel,
 		correlation: indexCorrelationFor(idx, leadingKeyStats(idx, tbl)), totalTablePages: totalPages,
+		numIndexQuals: float64(len(clauses)),
 	})
 	// `get_loop_count` (indxpath.c:2328): the smallest row count among the
 	// relations supplying the parameter. The path cost stays per-execution — PG
 	// pro-rates inside `compute_bitmap_pages` — so the join above still
 	// multiplies by the outer row count without double-counting.
 	pagesFetched, tuplesFetched := computeBitmapPagesLooped(tuplesFetched, relTuples, T, indexPages, totalPages,
-		s.cp.effectiveCacheSize, maxEntries, s.loopCountFor(rel, req))
+		s.cp.effectiveCacheSize, maxEntries, s.loopCountForKeys(rel, req, boundOuterKeys(bound)))
 	child := &Path{
 		Kind: PathBitmapIndexScan, Rel: rel, Rows: tuplesFetched, Cost: idxCost,
 		BitmapSelectivity: sel, IndexInfo: idx, IndexScanDir: NoMovementScanDirection,
@@ -677,7 +679,7 @@ func (s *searchCtx) buildOneParameterizedBitmapPath(
 	}
 	return &Path{
 		Kind: PathBitmapHeapScan, Rel: rel,
-		Rows:          parameterizedBaserelRows(rel, nil, sel, false),
+		Rows:          clampRowEst(parameterizedBaserelRows(rel, nil, sel, false) * s.movableNonEquiJoinSelectivity(rel, req)),
 		Cost:          costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, relQualOpCount(rel)),
 		// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on
 		// top of the index child's count.
@@ -710,4 +712,13 @@ func partialPredicateProvenBy(predicate Expr, conjuncts []Expr) bool {
 		}
 	}
 	return false
+}
+
+// boundOuterKeys lists the outer values of a bitmap probe's bound clauses.
+func boundOuterKeys(bound map[string]paramIndexClause) []Expr {
+	out := make([]Expr, 0, len(bound))
+	for _, c := range bound {
+		out = append(out, c.outerKey)
+	}
+	return out
 }

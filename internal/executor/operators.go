@@ -92,6 +92,18 @@ func (o *valuesOp) Open(ctx *Context) error {
 		// lister when available rather than the static empty VirtualRows.
 		if tbl.Name == "pg_prepared_statements" && ctx != nil && ctx.PrepStmtsRows != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PrepStmtsRows())
+		} else if tbl.VirtualRowsForDB != nil && ctx != nil {
+			// A per-database virtual catalog (pg_proc): the connection's
+			// database's rows. M0122-0015d.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, tbl.VirtualRowsForDB(ctx.CurrentDatabaseOid))
+		} else if tbl.Name == "pg_namespace" && tbl.Schema == "pg_catalog" && ctx != nil {
+			// pg_namespace is per-database: the connecting database's user
+			// schemas, not the default database's. M0119-0006.
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				o.rows = rematerialiseVirtualRowsFromStrings(tbl, im.PGNamespaceRowsForDBOid(ctx.CurrentDatabaseOid))
+			} else {
+				o.rows = rematerialiseVirtualRows(o.plan)
+			}
 		} else if tbl.Name == "pg_extension" && ctx != nil && ctx.ExtensionRows != nil {
 			// pg_extension is per-database: use the per-connection,
 			// database-scoped lister so an extension installed in one database

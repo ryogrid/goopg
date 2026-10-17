@@ -496,3 +496,214 @@ Tests: `TestObjectDefaultGUCStubs` + `TestObjectDefaultGUCValuesAccepted`
 `TestSampleConfigCoversRegistry` (unchanged, now covers the three new names).
 Gates: `go build ./...` clean; `go test ./internal/config/...
 ./internal/catalog/...` PASS; live server SET/SHOW/pg_settings smoke.
+
+## Reload reaches the walwriter and bgwriter (2026-10-14, M0122-0008 slice 2)
+
+A reload changes the registry. It does not, by itself, change what a
+running loop does. Most consumers read their parameters once, in
+`cmd/goopg` before `initdb.Open`, so declaring such a parameter
+`ContextSigHup` would make a reload report success while nothing moves.
+Before a parameter's context is relaxed from postmaster to sighup, its
+consumer must be reachable from the reload path.
+
+- PG 18.3 declares `wal_writer_delay`, `wal_writer_flush_after`,
+  `bgwriter_delay` and `bgwriter_lru_maxpages` PGC\_SIGHUP
+  (`guc_tables.c`). Its walwriter and bgwriter re-read them after
+  `ProcessMainLoopInterrupts`, and the SIGHUP latch wakes them from their
+  sleep.
+- goopg registered all four PGC\_POSTMASTER. The walwriter ticker and
+  `storage.Bgwriter` took their values once, at start.
+- The writer already had `SetCommitDelayUs`, `SetCommitSiblings` and
+  `SetWalWriterFlushAfter`, but nothing called them. `commit_delay` and
+  `commit_siblings` were registered as reloadable, so a reload of either
+  one was a silent no-op.
+
+Change:
+
+- `initdb.Runtime.ApplyWriterSettings(WriterSettings)` pushes the six
+  values into the running loops:
+  - the walwriter delay is an atomic, and a kick channel resets the ticker;
+  - the WAL writer gets the three existing setters;
+  - `Bgwriter.SetDelay` and `SetMaxPages` hold atomics and kick the loop.
+- `cmd/goopg`'s reload hook (`cfg.ApplyCheckpointGUCs`, run by
+  `Server.reloadConfig`) now calls it after the checkpoint parameters.
+- `bgwriter_lru_maxpages = 0` now stops only the writes, as in PG. The
+  goroutine starts whenever `bgwriter_delay > 0`, so a reload can raise the
+  value again.
+- The four parameters are now `ContextSigHup`.
+- `wal_writer_delay` and `bgwriter_delay` now carry PG's `ms` unit. Without
+  it, a PG-written line such as `bgwriter_delay = 50ms` was rejected with
+  "variable does not accept unit".
+- `autovacuum_max_workers` and `autovacuum_work_mem` (PGC\_SIGHUP) and
+  `wal_sender_timeout` (PGC\_USERSET) take PG's contexts. They have no
+  consumer: the autovacuum launcher runs a fixed `WorkerLimit` of 1, and
+  the walsender has no timeout. Only what `SET` and a reload enforce
+  changes. This is ledgered.
+
+Verified live: `bgwriter_delay = 50ms`, `wal_writer_delay = 20ms`,
+`bgwriter_lru_maxpages = 0` and `commit_delay = 10` were appended to
+`postgresql.conf`, then `goopg reload` was run. The log shows
+`changed=[bgwriter_delay wal_writer_delay bgwriter_lru_maxpages
+commit_delay]` with no warning, and SHOW returns `50ms`, `20ms`, `0` and
+`10`.
+
+Tests:
+
+- `TestApplyWriterSettingsReachesRunningLoops` and
+  `TestBgwriterRunsWithZeroLRUMaxPages` (`internal/initdb`);
+- `TestBgwriterReloadedSettingsTakeEffect` (`internal/storage`): a one-hour
+  delay reloaded to 5ms takes effect without waiting out the hour;
+- `TestGUCRegistryReloadableContexts` (`internal/utils/misc`).
+
+Still open (ledgered):
+
+- `io_workers` (PGC\_SIGHUP): PG resizes its I/O worker pool on reload;
+  goopg's AIO engine fixes its worker count at start.
+- `restore_command` (PGC\_SIGHUP): read once when archive recovery starts.
+- `wal_init_zero` (PGC\_SUSET): read once into the WAL config.
+- `autovacuum_naptime` is reloadable in the registry, but the launcher's
+  `NapInterval` is fixed at start.
+- The `*_flush_after` unit gap was closed by slice 3, below.
+
+## Block units for the writeback thresholds (2026-10-14, M0122-0008 slice 3)
+
+PG 18.3 declares `checkpoint_flush_after`, `bgwriter_flush_after` and
+`backend_flush_after` GUC\_UNIT\_BLOCKS, and `wal_writer_flush_after`
+GUC\_UNIT\_XBLOCKS (`guc_tables.c`). goopg registered all four without
+a unit and kept `wal_writer_flush_after` in bytes, with a default of 1048576.
+So SHOW printed `32`, `64` and `1048576` where PG prints `256kB`, `512kB`
+and `1MB`, and a PG-written `wal_writer_flush_after = 1MB` line was refused.
+
+- All four now carry `UnitBlocks`. XLOG\_BLCKSZ equals BLCKSZ (8192), so
+  one unit serves both of PG's.
+- `wal_writer_flush_after` now stores pages: default 128, range 0 to
+  INT\_MAX, as in PG. `cmd/goopg` converts it to bytes for the WAL writer
+  (`walWriterFlushAfterBytes`), both at start and on reload.
+- `checkpoint_flush_after` and `bgwriter_flush_after` were already
+  PGC\_SIGHUP, but only `Open` set the pool's thresholds.
+  `ApplyWriterSettings` now carries them as well.
+
+Verified against the scratch PG 18.3 oracle:
+
+- SHOW gives `1MB`, `256kB`, `512kB` and `0` on both servers.
+- PG's `pg_settings` reports unit `8kB` with boot values 128, 32, 64 and 0.
+- A reload of `wal_writer_flush_after = 2MB` and `checkpoint_flush_after =
+  512kB` applies with no warning.
+
+Tests: `TestFlushAfterGUCsUseBlockUnits` covers the display and both parse
+directions. `TestApplyWriterSettingsReachesRunningLoops` covers the pool
+thresholds.
+
+`wal_buffers` followed in slice 4, below.
+
+## `wal_buffers` auto-tunes in pages (2026-10-14, M0122-0008 slice 4)
+
+PG 18.3 declares `wal_buffers` GUC\_UNIT\_XBLOCKS. Its boot value is -1,
+its range -1 to INT\_MAX/XLOG\_BLCKSZ, and it is PGC\_POSTMASTER.
+
+- `check_wal_buffers` / `XLOGChooseNumBuffers` (xlog.c) resolve -1 to
+  `NBuffers/32` pages, capped at one WAL segment and raised to at least 8.
+- A manual value below 4 becomes 4.
+- `XLOGShmemSize` stores the resolved count with `PGC_S_DYNAMIC_DEFAULT`.
+  If that cannot override an explicit `-1` from the file, it uses
+  `PGC_S_OVERRIDE` instead. So SHOW reports the resolved size and
+  `boot_val` stays -1.
+
+goopg stored bytes with a fixed 16MB default, where 0 disabled the buffer,
+so SHOW printed `16777216`.
+
+- The registry entry is now `UnitBlocks` with boot value -1.
+- `cmd/goopg`'s `resolveWALBuffers` applies PG's rule before
+  `initdb.Open`. It writes the count back with `SourceDefault`, or with
+  `SourceOverride` when the file says -1, and passes bytes on to the
+  writer. 0 is no longer reachable; the minimum is 4 pages.
+- Under the 128MB `shared_buffers` default the WAL buffer is now 4MB, not
+  16MB, as in PG. Clusters with at least 512MB of `shared_buffers` keep
+  16MB, the segment cap.
+- Byte-valued writers of the parameter were moved to units:
+  `bench/pgbench-compare/run_comparison.sh` and
+  `analysis/perf-optimize3/scripts/run_rw50.sh`. No live bench or nightly
+  cluster configuration sets it.
+
+Test: `TestResolveWALBuffersFollowsPG` (`cmd/goopg`) covers auto at three
+`shared_buffers` sizes, an explicit -1, a manual value and the minimum.
+Live, a fresh goopg cluster shows `4MB` at 128MB. The scratch PG oracle, at
+2GB, shows `16MB`, with `boot_val` -1 and source `default`.
+
+## goopg's own knobs move to the `goopg.` namespace (2026-10-14, M0122-0008 slice 5)
+
+PG 18.3 rejects a plain parameter name it does not define ("unrecognized
+configuration parameter"). goopg registered four such names:
+
+- `wal_sender_memory_buffer`, `enable_nestloop_index` and
+  `enable_opportunistic_prune`, all three live goopg-internal knobs;
+- `vacuum_multixact_freeze_max_age`, which had no consumer.
+  - It carried values that belong to PG's
+    `autovacuum_multixact_freeze_max_age` (default 400000000).
+  - Meanwhile the real `autovacuum_multixact_freeze_max_age` had a default of
+    4000000000 and a range of 1000000..5000000000.
+
+PG's home for a server-private parameter is a dotted custom-variable name,
+which is the form `DefineCustomBoolVariable` gives an extension's settings.
+
+- The three knobs are now `goopg.wal_sender_memory_buffer`,
+  `goopg.enable_nestloop_index` and `goopg.enable_opportunistic_prune`
+  (constants in `internal/utils/misc/goopg_gucs.go`).
+  - Their consumers (`cmd/goopg`, `postmaster/dispatch.go`) use the
+    constants.
+  - The old names are rejected exactly as PG rejects them.
+  - EXPLAIN (SETTINGS) prints `goopg.enable_nestloop_index = 'off'`.
+- `vacuum_multixact_freeze_max_age` is gone. `autovacuum_multixact_freeze_max_age`
+  takes guc\_tables.c's 400000000 and 10000..2000000000.
+- `TestRegistryNamesArePGOrGoopgNamespaced` pins the invariant: every
+  registered name is a PG 18.3 parameter or starts with `goopg.`.
+
+A default/range audit against PG's `pg_settings` (the scratch oracle)
+lists 37 differences.
+
+- Most are formatting only, such as unit-scaled or float-formatted values.
+- Several are real. Some of those shape plans and look like deliberate
+  measurement conventions, so they are owner decisions, not loop work:
+  - `work_mem` 512MB against PG's 4MB;
+  - `max_parallel_workers_per_gather` 4 against 2;
+  - `enable_partitionwise_join` / `_aggregate` on against off;
+  - `jit` off against on.
+- The others are ledgered.
+
+## Defaults and ranges that do not shape plans (2026-10-14, M0122-0008 slice 6)
+
+The slice-5 audit's differences that do not shape plans now take
+guc\_tables.c's values. Each consumer was checked first.
+
+- `autovacuum_vacuum_max_threshold` now has a default of 100000000 and a
+  range of -1..INT\_MAX. goopg had 200000000 and a minimum of 0.
+  - The launcher hard-coded the old default.
+  - It read the setting only when it was positive, so 0 and -1 both fell
+    back silently.
+  - It now follows `relation_needs_vacanalyze` (autovacuum.c): any value of
+    0 or more caps the vacuum threshold, and -1 disables the cap.
+- `vacuum_multixact_failsafe_age` now defaults to 1600000000. Nothing reads
+  it yet.
+- `compute_query_id` now defaults to `auto`. Nothing reads it.
+- Maxima now follow PG:
+  - `io_workers`: 32 (MAX\_IO\_WORKERS);
+  - `bgwriter_lru_maxpages`: INT\_MAX/2;
+  - `scram_iterations` and `wal_sender_timeout`: INT\_MAX;
+  - the planner cost parameters (`seq_page_cost`, `random_page_cost`,
+    `cpu_*_cost`) and the `jit_*_cost` parameters: DBL\_MAX.
+  - goopg capped the cost parameters at 1e9 or 1e15, so a SET that PG
+    accepts failed here. Their values are unchanged.
+
+Tests: `TestGUCDefaultsAndRangesFollowPG` (`internal/utils/misc`) and
+`TestAutovacuumVacuumMaxThresholdFollowsPG` (`internal/postmaster/autovacuum`).
+
+Still open (ledgered):
+
+- `io_max_concurrency`: PG's -1 is a per-backend auto value, at most 64
+  handles. goopg's setting is a global in-flight cap, so adopting PG's value
+  as-is would throttle all I/O.
+- The launcher does not consult the per-table
+  `autovacuum_vacuum_max_threshold` reloption.
+- Some differences are formatting only: `log_file_mode` boot display,
+  memory units in `kB` against `8kB`, and the initdb-set encoding and
+  timezone.

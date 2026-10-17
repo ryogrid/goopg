@@ -1074,42 +1074,8 @@ func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, inn
 	var best *catalog.Index
 	var bestKeys []Expr
 	for _, idx := range cat.IndexesOnTable(tbl) {
-		if !isBTreeIndex(idx) {
-			continue
-		}
-		// Partial index without a proven predicate — decline, same rule and
-		// reason as `findBTreeIndexForColumn` / `addOneOrderedIndexPath`.
-		// A parameterized inner-side scan drops rows just as silently.
-		if idx.HasPredicate {
-			continue
-		}
-		if len(idx.Columns) == 0 {
-			continue
-		}
-		keys := make([]Expr, 0, len(idx.Columns))
-		for _, col := range idx.Columns {
-			outer, ok := innerToOuter[col]
-			if !ok {
-				// The first unbound column ends the probe. Columns after
-				// it are unreachable: a btree scan is ordered by the whole
-				// key, so an unbound column makes every later one a filter
-				// rather than a bound. This is PG's `amoptionalkey` rule —
-				// only the LEADING column must be bound (indxpath.c:1029).
-				break
-			}
-			keys = append(keys, outer)
-		}
-		if len(keys) == 0 {
-			// Leading column unbound: this index cannot start a scan for
-			// this parameterisation at all.
-			continue
-		}
-		// The columns after the bound prefix are unbound, and goopg stores
-		// no index entry whose key has a NULL column: a probe on the prefix
-		// would miss every inner row with a NULL there (`r.a = o.x` on
-		// (a, b) lost (10, NULL)). Only an index whose unbound key columns
-		// are all NOT NULL is complete for the probe.
-		if !indexUnboundKeysNotNull(tbl, idx, len(keys)) {
+		keys, ok := leadingPrefixProbeKeys(tbl, idx, innerToOuter)
+		if !ok {
 			continue
 		}
 		// Prefer the probe that BINDS the most columns — more bound
@@ -1126,6 +1092,67 @@ func pickIndexCoveringLeadingPrefix(cat catalog.Catalog, tbl *catalog.Table, inn
 		}
 	}
 	return best, bestKeys
+}
+
+// eligibleLeadingPrefixIndexes lists every index on tbl that can start a
+// probe bound by innerToOuter, in IndexesOnTable order — the candidate set
+// PG's build_index_paths walks, one path per index (indxpath.c), where
+// pickIndexCoveringLeadingPrefix keeps only one of them.
+func eligibleLeadingPrefixIndexes(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) []*catalog.Index {
+	var out []*catalog.Index
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if _, ok := leadingPrefixProbeKeys(tbl, idx, innerToOuter); ok {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
+// leadingPrefixProbeKeys is the per-index eligibility rule shared by
+// pickIndexCoveringLeadingPrefix and eligibleLeadingPrefixIndexes: idx can
+// drive a probe when it is a non-partial btree whose LEADING column is bound
+// (PG's amoptionalkey rule, indxpath.c:1029), and it returns the outer
+// expressions bound to the gapless leading prefix.
+func leadingPrefixProbeKeys(tbl *catalog.Table, idx *catalog.Index, innerToOuter map[string]Expr) ([]Expr, bool) {
+	if !isBTreeIndex(idx) {
+		return nil, false
+	}
+	// Partial index without a proven predicate — decline, same rule and
+	// reason as `findBTreeIndexForColumn` / `addOneOrderedIndexPath`.
+	// A parameterized inner-side scan drops rows just as silently.
+	if idx.HasPredicate {
+		return nil, false
+	}
+	if len(idx.Columns) == 0 {
+		return nil, false
+	}
+	keys := make([]Expr, 0, len(idx.Columns))
+	for _, col := range idx.Columns {
+		outer, ok := innerToOuter[col]
+		if !ok {
+			// The first unbound column ends the probe. Columns after
+			// it are unreachable: a btree scan is ordered by the whole
+			// key, so an unbound column makes every later one a filter
+			// rather than a bound. This is PG's `amoptionalkey` rule —
+			// only the LEADING column must be bound (indxpath.c:1029).
+			break
+		}
+		keys = append(keys, outer)
+	}
+	if len(keys) == 0 {
+		// Leading column unbound: this index cannot start a scan for
+		// this parameterisation at all.
+		return nil, false
+	}
+	// The columns after the bound prefix are unbound, and goopg stores
+	// no index entry whose key has a NULL column: a probe on the prefix
+	// would miss every inner row with a NULL there (`r.a = o.x` on
+	// (a, b) lost (10, NULL)). Only an index whose unbound key columns
+	// are all NOT NULL is complete for the probe.
+	if !indexUnboundKeysNotNull(tbl, idx, len(keys)) {
+		return nil, false
+	}
+	return keys, true
 }
 
 // splitFilterPredicateForNLI walks an AND-chained Filter predicate

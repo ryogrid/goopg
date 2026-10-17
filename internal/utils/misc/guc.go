@@ -18,11 +18,40 @@ import (
 // surface a HINT (e.g. the wire protocol's ExecError.Hint) should
 // `errors.As` for this type instead.
 type ValidationError struct {
-	Msg  string
-	Hint string
+	Msg    string
+	Hint   string
+	Detail string
+	// Code is the SQLSTATE when it is not 22023 (invalid_parameter_value),
+	// e.g. interval_in's 22007 raised from inside check_timezone.
+	Code string
 }
 
 func (e *ValidationError) Error() string { return e.Msg }
+
+// SQLState is the error's SQLSTATE: Code, defaulting to 22023.
+func (e *ValidationError) SQLState() string {
+	if e.Code != "" {
+		return e.Code
+	}
+	return "22023"
+}
+
+// cantChangeError is set_config_option's refusal (guc.c) when a SET, or a
+// value from the startup packet, targets a parameter whose context forbids
+// it: SQLSTATE 55P02 with the message for that context. goopg used to answer
+// every context with "cannot be changed now" and SQLSTATE 22023.
+func cantChangeError(v *Variable) error {
+	msg := "parameter %q cannot be changed now" // PGC_SIGHUP
+	switch v.Context {
+	case ContextInternal:
+		msg = "parameter %q cannot be changed"
+	case ContextPostmaster:
+		msg = "parameter %q cannot be changed without restarting the server"
+	case ContextSuBackend, ContextBackend:
+		msg = "parameter %q cannot be set after connection start"
+	}
+	return &ValidationError{Msg: fmt.Sprintf(msg, v.Name), Code: "55P02"}
+}
 
 // Type is the value type of a GUC. Mirrors guc.c's PGC_BOOL / PGC_INT /
 // PGC_REAL / PGC_STRING / PGC_ENUM.
@@ -132,6 +161,13 @@ const (
 	// FlagNoShowAll: guc.h GUC_NO_SHOW_ALL — omitted from SHOW ALL, still
 	// reachable by name.
 	FlagNoShowAll
+	// FlagListInput: guc.h GUC_LIST_INPUT — SET accepts a comma-separated
+	// list of values (flatten_set_variable_args); other variables reject
+	// more than one.
+	FlagListInput
+	// FlagListQuote: guc.h GUC_LIST_QUOTE — SET double-quotes each string
+	// element of the list unless it is a plain identifier.
+	FlagListQuote
 )
 
 // Variable is one GUC. Use NewVariable in BuildDefaultRegistry rather
@@ -149,7 +185,13 @@ type Variable struct {
 	MinVal      float64 // valid for Int/Real
 	MaxVal      float64
 	EnumOptions []string            // valid for Enum
-	CheckFn     func(string) error  // optional validation of the canonical value, every type
+	// EnumHidden maps a hidden config_enum_entry name (hidden = true in
+	// guc_tables.c) to the visible option with the same value: accepted
+	// on input, stored and shown as that option, and never listed in
+	// enumvals or the error HINT (`debug` -> `debug2` for the message-level
+	// enums). Keys are lower case.
+	EnumHidden map[string]string
+	CheckFn    func(string) error // optional validation of the canonical value, every type
 }
 
 // canonicalize normalises an incoming string value into the form we
@@ -319,12 +361,34 @@ func (v *Variable) canonicalizeType(current, value string) (string, error) {
 		}
 		return fStr, nil
 	case TypeString:
+		switch strings.ToLower(v.Name) {
+		case "client_encoding":
+			// check_client_encoding stores pg_encoding_to_char's spelling
+			// (`SET client_encoding = utf8` shows UTF8).
+			if canon := encodingNameToCanonical(value); canon != "" {
+				return canon, nil
+			}
+		case "timezone":
+			// check_timezone: the stored value is the name the zone shows
+			// as — the tz file's own spelling (`SET timezone = utc` shows
+			// UTC), the upper-cased POSIX spec, or the fixed-offset zone an
+			// INTERVAL / numeric offset becomes (<+02>-02).
+			return checkTimeZone(value)
+		case "log_timezone":
+			return checkLogTimeZone(value)
+		}
 		return value, nil
 	case TypeEnum:
 		for _, opt := range v.EnumOptions {
 			if strings.EqualFold(opt, value) {
 				return opt, nil
 			}
+		}
+		// config_enum_lookup_by_name matches hidden rows too; the value they
+		// carry shows as the first visible row with it
+		// (config_enum_lookup_by_value).
+		if opt, ok := v.EnumHidden[strings.ToLower(value)]; ok {
+			return opt, nil
 		}
 		// Upstream registers boolean synonyms for on/off-bearing enums as
 		// HIDDEN config_enum_entry rows (hidden = true) — see
@@ -373,7 +437,7 @@ func (v *Variable) Set(value string, source Source) error {
 	// Source-based gating: SET / SET LOCAL only allowed when context
 	// permits SQL-driven changes.
 	if (source == SourceSession || source == SourceLocal) && v.Context < ContextSuset {
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		return cantChangeError(v)
 	}
 	canon, err := v.canonicalize(value)
 	if err != nil {
@@ -626,6 +690,11 @@ func (r *Registry) ApplyConfigEntries(entries []ConfigEntry) error {
 	for _, e := range entries {
 		v, ok := r.Get(e.Name)
 		if !ok {
+			// A custom (dotted) name is a placeholder upstream — e.g. one
+			// ALTER SYSTEM wrote for an extension — not a startup failure.
+			if isCustomGUCName(e.Name) {
+				continue
+			}
 			errs = append(errs, fmt.Sprintf("%s:%d: unknown parameter %q", e.SourceFile, e.SourceLine, e.Name))
 			continue
 		}
@@ -664,12 +733,42 @@ type ReloadResult struct {
 // context is applied with SourceConfigFile, and — because the server
 // is already live, unlike at boot — each successful change also fires
 // the registry's OnChange bridge so process-global toggles (e.g.
-// enable_nestloop_index) observe the new value immediately.
+// goopg.enable_nestloop_index) observe the new value immediately.
 func (r *Registry) ApplyReloadEntries(entries []ConfigEntry) ReloadResult {
 	var res ReloadResult
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		present[strings.ToLower(e.Name)] = true
+	}
+	// "parameter %s removed from configuration file, reset to default"
+	// (ProcessConfigFileInternal): a variable whose value came from the
+	// configuration files but no longer appears in them reverts to its boot
+	// value — how ALTER SYSTEM RESET takes effect on pg_reload_conf().
+	for _, v := range r.vars {
+		if v.Source != SourceConfigFile || present[strings.ToLower(v.Name)] {
+			continue
+		}
+		if v.Context == ContextPostmaster {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("parameter %q cannot be changed without restarting the server", v.Name))
+			continue
+		}
+		if v.Context == ContextInternal {
+			continue
+		}
+		changed := v.Value != v.BootVal
+		v.Value = v.BootVal
+		v.Source = SourceDefault
+		if changed {
+			r.invokeOnChange(v.Name, v.Value)
+			res.Changed = append(res.Changed, v.Name)
+		}
+	}
 	for _, e := range entries {
 		v, ok := r.Get(e.Name)
 		if !ok {
+			if isCustomGUCName(e.Name) {
+				continue // a placeholder upstream, not an error
+			}
 			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: unrecognized configuration parameter %q", e.SourceFile, e.SourceLine, e.Name))
 			continue
 		}

@@ -157,11 +157,14 @@ fix_pg_query() {
     for qd in $qdays_list; do
         [[ $qnum -eq $qd ]] && sed -i 's/ days//g' "$f"
     done
-    # Queries needing subquery wrapper
-    local loch_list="36 70 86"
-    for ql in $loch_list; do
-        [[ $qnum -eq $ql ]] && { echo "select * from ("; cat "$f"; echo ") as sub"; } > "${f}.tmp" && mv "${f}.tmp" "$f"
-    done
+    # Queries needing the subquery wrapper, with the final ORDER BY/LIMIT
+    # outside it. The helper is idempotent: this function runs before every
+    # query on every bench run, and the old in-place wrap nested another
+    # `select * from (` per run (M0146-0140).
+    case "$qnum" in 36|70|86)
+        python3 -I "${REPO_ROOT}/scripts/tpcds_fix_loch_queries.py" "$f" >/dev/null || return 1
+        ;;
+    esac
     return 0
 }
 

@@ -109,6 +109,10 @@ type Context struct {
 	// — that's the v0 behaviour for a server started without a WAL
 	// writer.
 	Checkpointer Checkpointer
+	// WalSummarizerState, when set, reads the WAL summarizer's state for
+	// pg_get_wal_summarizer_state(). nil reports a summarizer that never ran.
+	// M0122-0009 S4b.
+	WalSummarizerState func() WalSummarizerStatus
 
 	// OuterRows is the lexical-scope row stack used by correlated
 	// subqueries. evalSubquery / evalInExpr / evalExistsExpr push
@@ -163,6 +167,15 @@ type Context struct {
 	ParamExec  []Datum
 	ParamSet   []bool
 	ParamDirty []bool
+
+	// InitPlanValues holds, for a parallel worker, the value of every
+	// initplan the leader evaluated before launching it (M0146-0192): PG's
+	// ExecInitParallelPlan evaluates a Gather's initParam once and ships it
+	// to the workers. evalSubquery serves these instead of running the body,
+	// which may hold its own Gather and must never run inside a worker.
+	// Built by prepareWorkerInitPlans per launch and never mutated after,
+	// so workers read it without locking. Nil on a leader Context.
+	InitPlanValues map[*optimizer.SubqueryExpr]Datum
 
 	// CorrSubqOps caches pre-built, pre-opened operators for correlated
 	// scalar subqueries so the same plan can be rescanned for each outer
@@ -454,6 +467,23 @@ type Context struct {
 	// the same SessionRegistry as SET / SET LOCAL.
 	SetSetting func(name, value string, isLocal bool) error
 
+	// PushFunctionConfig opens a GUC nest level and applies a routine's
+	// proconfig ("name=value" entries) for the length of the call, as
+	// fmgr_security_definer does; the returned pop closes the level. Wired to
+	// SessionRegistry.PushSaveLevel / PopSaveLevel; nil means the SET clauses
+	// cannot be applied in this context (see enterRoutineConfig).
+	PushFunctionConfig func(config []string) (pop func(), err error)
+
+	// PushSessionRole makes role ("" = superuser) the effective role for the
+	// session registry's PGC_SUSET privilege check while a SECURITY DEFINER
+	// routine runs; the returned func pops it. CheckSetPrivilege reports the
+	// error SET name would raise for lack of privilege (CREATE / ALTER
+	// FUNCTION ... SET validates its clauses with it). Wired to
+	// SessionRegistry.PushRole / PopRole / CheckSetPrivilege; nil means no
+	// privilege check in this context. M0146-0158.
+	PushSessionRole   func(role string) (pop func())
+	CheckSetPrivilege func(name string) error
+
 	// AllSettings returns the effective SHOW ALL view for this session.
 	AllSettings func() []SettingValue
 
@@ -482,6 +512,19 @@ type Context struct {
 	ResetSetting     func(name string) error
 	ResetAllSettings func()
 
+	// AlterSystem rewrites postgresql.auto.conf for ALTER SYSTEM (guc.c
+	// AlterSystemSetConfigFile): set=false removes name's entry (SET TO
+	// DEFAULT / RESET name), resetAll empties the file. Wired by the server
+	// from SessionRegistry.AlterSystem with the cluster's data directory;
+	// nil means ALTER SYSTEM is unsupported in this context. M0122-0008.
+	AlterSystem func(name, value string, set, resetAll bool) error
+
+	// ReloadConfig re-reads the configuration files into the running server
+	// (pg_reload_conf(); upstream SIGHUPs the postmaster). Wired by the
+	// server to the same path as SIGHUP / `goopg reload`; nil makes
+	// pg_reload_conf() return false. M0122-0008.
+	ReloadConfig func()
+
 	// BeginLocalTransaction and EndLocalTransaction bracket an explicit
 	// transaction so that SET LOCAL changes are discarded on COMMIT/ROLLBACK,
 	// and plain SET changes are reverted on ROLLBACK. EndLocalTransaction's
@@ -491,6 +534,10 @@ type Context struct {
 	// M0097-0023; committed flag added 0134-0001 P6/S15.
 	BeginLocalTransaction func()
 	EndLocalTransaction   func(committed bool)
+	// InTransactionBlock reports IsTransactionBlock(): an explicit BEGIN or
+	// a multi-statement message's implicit block. SET LOCAL outside one
+	// warns (WarnNoTransactionBlock). nil = assume inside.
+	InTransactionBlock func() bool
 
 	// PLpgSQLCommitChain commits (rollback=false) or rolls back (rollback=true)
 	// the current transaction and immediately begins a fresh one, updating
@@ -962,6 +1009,15 @@ type Context struct {
 	// in that case, preserving pre-M0134-0009 behaviour. M0134-0009.
 	SessionUser string
 
+	// SecurityDefinerUser is the owner a SECURITY DEFINER routine runs as
+	// while its body executes (fmgr_security_definer's
+	// SetUserIdAndSecContext(proowner, SECURITY_LOCAL_USERID_CHANGE)); empty
+	// outside one. It wins over SET ROLE / the session user in
+	// EffectiveUserName, and its presence is InLocalUserIdChange(): SET ROLE
+	// and SET SESSION AUTHORIZATION are refused. NonSuperuserRole carries the
+	// owner's privileges for the same span. M0146-0157.
+	SecurityDefinerUser string
+
 	// SetSessionAuthorization, when non-nil, updates the per-connection
 	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
 	// parser path (multi-statement batches). The caller (operators_utility_settings)
@@ -1096,6 +1152,9 @@ func (c *Context) SessionUserName() string {
 func (c *Context) EffectiveUserName() string {
 	if c == nil {
 		return "postgres"
+	}
+	if c.SecurityDefinerUser != "" {
+		return c.SecurityDefinerUser
 	}
 	if c.NonSuperuserRole != "" {
 		return c.NonSuperuserRole
@@ -1915,6 +1974,23 @@ func (c *Context) deadlockTimeout() time.Duration {
 		return lmgr.DefaultDeadlockTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// WalSummarizerStatus is the WAL summarizer's published state as
+// pg_get_wal_summarizer_state reports it (GetWalSummarizerState,
+// walsummarizer.c). Initialized is false until the summarizer has run;
+// Running is false once it has exited.
+type WalSummarizerStatus struct {
+	Initialized   bool
+	Running       bool
+	TLI           uint32
+	SummarizedLSN uint64
+	PendingLSN    uint64
+	PID           int
+	// WALReads / WALReadBytes are the WAL pages the summarizer has read,
+	// pg_stat_io's (walsummarizer, wal, normal) reads and read_bytes.
+	WALReads     int64
+	WALReadBytes int64
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

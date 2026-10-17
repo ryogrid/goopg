@@ -28,6 +28,7 @@ package optimizer
 
 import (
 	"math"
+	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -73,7 +74,8 @@ type paramIndexClause struct {
 func indexableJoinClausesFor(relids RelSet, clauses []*restrictInfo) []paramIndexClause {
 	var out []paramIndexClause
 	for _, ri := range clauses {
-		if ri == nil || !ri.isEquijoin {
+		// M0146-0207: a SubPlan key is a hash clause only.
+		if ri == nil || !ri.isEquijoin || ri.subplanKey {
 			continue
 		}
 		var innerKey, outerKey Expr
@@ -344,8 +346,16 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// was the only candidate left. It was never a costing difference. At
 	// every parameterisation where both produced a path, the index path was
 	// already cheaper and `addPath` already discarded the bitmap.
-	idx, _ := pickIndexCoveringLeadingPrefix(cat, tbl, innerToOuter)
-	if idx == nil {
+	//
+	// M0146-0197: every eligible index gets its own path, as
+	// `build_index_paths` builds one per index and `add_path` keeps the
+	// cheapest (indxpath.c). goopg used to keep a single index — the one
+	// binding the most columns, ties to the first by name — so two indexes
+	// on the same column were never chosen between by cost: TPC-H's bloated
+	// `order_customer_fkidx` (7.07 per probe) beat a compact twin (4.65) only
+	// because its name sorted first.
+	idxs := eligibleLeadingPrefixIndexes(cat, tbl, innerToOuter)
+	if len(idxs) == 0 {
 		// No index starts a leading-prefix probe under this
 		// parameterisation — the only remaining way an index can drive the
 		// scan is a btree skip (M0146-0005v): a bound column PAST the first
@@ -353,6 +363,20 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// time. Same `bound` population, different eligibility rule.
 		return s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
 	}
+	for _, idx := range idxs {
+		s.addParamIndexPathFor(rel, tbl, cat, idx, bound, innerExprs, req, relPages, relTuples, totalPages)
+	}
+	// The leading-prefix paths existing do not preclude a skip path on a
+	// DIFFERENT index — PG's `create_index_paths` offers every usable index
+	// and lets add_path decide, so offer the skip candidate too.
+	s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
+	return true
+}
+
+// addParamIndexPathFor builds the parameterised leading-prefix probe path on
+// one index idx — `build_index_paths` for a single IndexOptInfo — and offers it
+// to add_path.
+func (s *searchCtx) addParamIndexPathFor(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, idx *catalog.Index, bound []paramIndexClause, innerExprs map[string]Expr, req RelSet, relPages int64, relTuples, totalPages float64) {
 	// The probe binds a gapless leading prefix, which may be SHORTER than
 	// `bound`: a clause on a column past the first unbound one is not an index
 	// qual at all. Splitting the two selectivities is PG's own split — the
@@ -365,7 +389,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	probed := boundPrefixClauses(bound, clauses)
 	fullyBound := len(clauses) == len(idx.Columns)
 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, fullyBound)
-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound)
+	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, fullyBound), fullyBound) *
+		s.movableNonEquiJoinSelectivity(rel, req))
 	// The index's own ordering (`build_index_pathkeys`, pathkeys.c:740) AND the
 	// direction it was computed for, taken together so they cannot disagree
 	// (M0127-P5.5-a, pathindexcarrier.go). PG passes the same `useful_pathkeys`
@@ -380,7 +405,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 	// loop count `create_index_path` takes from `get_loop_count` — the SAME
 	// scan model the unparameterised ordered path uses (pathindexordered.go),
 	// not a second one.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	// M0146-0005bq: build_index_paths' single `index_only_scan` flag
 	// (indxpath.c) — when check_index_only finds the index covers every
 	// column the statement reads from this rel, the ONE path PG builds for
@@ -417,7 +442,7 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		uniqueEqualityOnAllKeys: idx != nil && idx.Unique && fullyBound,
 		correlation:             indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
 		totalTablePages: totalPages,
-		loopCount:       s.loopCountFor(rel, req),
+		loopCount:       s.loopCountForKeys(rel, req, paramOuterKeys(bound)),
 		// R1 (plan-parity-fix-take2): qpquals are the clauses evaluated on
 		// the HEAP tuple — PG's `cost_index` takes them as
 		// `baserestrictinfo + ppi_clauses` minus the index quals
@@ -436,7 +461,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// is drawn from `bound`, so `len(bound)-len(clauses) >= 0` and the
 		// count can never go negative (a negative would CREDIT the index
 		// path — the very asymmetry R1 removes).
-		numQualOps: paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numQualOps:    paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numIndexQuals: float64(len(clauses)),
 	})
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
 	// path-creation time. Assert-only — never applied, never costed.
@@ -462,8 +488,8 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		// the search's candidate order and `IndexScan.Keys[i]` binds
 		// `Index.Columns[i]` positionally, so the reordering is the difference
 		// between the right answer and a probe that compares the wrong pair of
-		// columns. Never nil here: `pickIndexCoveringLeadingPrefix` accepted
-		// `idx` only because every one of its columns is bound.
+		// columns. Never empty here: `leadingPrefixProbeKeys` accepted `idx`
+		// only because its leading column is bound.
 		IndexClauses:  clauses,
 		RequiredOuter: req,
 		Target:        tgt,
@@ -481,11 +507,6 @@ func (s *searchCtx) addOneParameterizedIndexPath(rel *RelOptInfo, tbl *catalog.T
 		producer = "indexonly.parameterised"
 	}
 	addPath(rel, path, producer)
-	// The leading-prefix path existing does not preclude a skip path on a
-	// DIFFERENT index — PG's `create_index_paths` offers every usable index
-	// and lets add_path decide, so offer the skip candidate too.
-	s.addOneParameterizedSkipPath(rel, tbl, cat, innerToOuter, innerExprs, bound, req, relPages, relTuples, totalPages)
-	return true
 }
 
 // maxSkipProbeRows bounds the per-execution output of a parameterized
@@ -546,10 +567,20 @@ const maxSkipProbeLifetimeRows = 5e8
 // executor still skips at run time), and a cumulative estimate beyond
 // `index->pages` reverts the same way (`index->pages < num_sa_scans`).
 func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, innerToOuter, innerExprs map[string]Expr, bound []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
-	idx, skip, run := pickIndexSkipRun(cat, tbl, innerToOuter)
-	if idx == nil {
-		return false
+	// M0146-0197: a skip path for every eligible index, as PG 18 builds the
+	// skip array into each index's own path; add_path keeps the cheapest.
+	added := false
+	for _, c := range eligibleSkipRuns(cat, tbl, innerToOuter) {
+		if s.addParamSkipPathFor(rel, tbl, cat, c.idx, c.skip, c.run, innerExprs, bound, req, relPages, relTuples, totalPages) {
+			added = true
+		}
 	}
+	return added
+}
+
+// addParamSkipPathFor builds the parameterised skip-scan path on one index —
+// the body addOneParameterizedSkipPath runs per eligible index.
+func (s *searchCtx) addParamSkipPathFor(rel *RelOptInfo, tbl *catalog.Table, cat catalog.Catalog, idx *catalog.Index, skip, run int, innerExprs map[string]Expr, bound []paramIndexClause, req RelSet, relPages int64, relTuples, totalPages float64) bool {
 	clauses := indexSkipClauses(idx, bound, skip, run)
 	if len(clauses) == 0 {
 		return false
@@ -559,12 +590,13 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	// bound, so a unique index cannot collapse the probe to one tuple, and
 	// PG's unique-index clamp does not apply.
 	sel := parameterizedIndexSelectivity(tbl, idx, probed, relTuples, false)
-	rows := parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false)
+	rows := clampRowEst(parameterizedBaserelRows(rel, idx, parameterizedIndexSelectivity(tbl, idx, bound, relTuples, false), false) *
+		s.movableNonEquiJoinSelectivity(rel, req))
 	// The emitted stream is globally key-ordered — groups are enumerated
 	// in prefix order and each group's probe is suffix-ordered — so the
 	// index's pathkeys are as valid here as on the prefix path.
 	keys, dir := indexPathOrdering(idx, innerExprs, false)
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	numSA, boundCounted := skipScanDescents(tbl, idx, skip, relTuples, indexPages)
 	// `indexBoundQuals` vs `indexQuals` (selfuncs.c:7643-7680): the heap
 	// side always filters by the probe's quals (`selectivity`), but the
@@ -575,7 +607,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 	if !boundCounted {
 		boundSel = 1
 	}
-	loopCount := s.loopCountFor(rel, req)
+	loopCount := s.loopCountForKeys(rel, req, paramOuterKeys(bound))
 	if rows > maxSkipProbeRows || (loopCount > 0 && rows*loopCount > maxSkipProbeLifetimeRows) {
 		return false
 	}
@@ -608,6 +640,7 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 		totalTablePages:  totalPages,
 		loopCount:        loopCount,
 		numQualOps:       paramIndexQualOpCount(rel.baseLeaf, len(bound), len(clauses)),
+		numIndexQuals:    float64(len(clauses)),
 		numSAScans:       numSA,
 		boundSelectivity: boundSel,
 	})
@@ -666,43 +699,69 @@ func (s *searchCtx) addOneParameterizedSkipPath(rel *RelOptInfo, tbl *catalog.Ta
 func pickIndexSkipRun(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, int, int) {
 	var best *catalog.Index
 	bestSkip, bestRun := 0, 0
-	for _, idx := range cat.IndexesOnTable(tbl) {
-		if !isBTreeIndex(idx) || idx.HasPredicate || len(idx.Columns) < 2 {
-			continue
-		}
-		// The first bound position — 0 is the prefix picker's domain.
-		s := -1
-		for pos, col := range idx.Columns {
-			if _, ok := innerToOuter[col]; ok {
-				s = pos
-				break
-			}
-		}
-		if s <= 0 {
-			continue
-		}
-		// Contiguous bound run from s.
-		run := 0
-		for pos := s; pos < len(idx.Columns); pos++ {
-			if _, ok := innerToOuter[idx.Columns[pos]]; !ok {
-				break
-			}
-			run++
-		}
-		ok := true
-		for i := 0; i < s && ok; i++ {
-			if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
-				ok = false
-			}
-		}
-		if !ok || !indexSkipNullSafe(tbl, idx, s, run) {
-			continue
-		}
-		if best == nil || run > bestRun || (run == bestRun && s < bestSkip) {
-			best, bestSkip, bestRun = idx, s, run
+	for _, c := range eligibleSkipRuns(cat, tbl, innerToOuter) {
+		if best == nil || c.run > bestRun || (c.run == bestRun && c.skip < bestSkip) {
+			best, bestSkip, bestRun = c.idx, c.skip, c.run
 		}
 	}
 	return best, bestSkip, bestRun
+}
+
+// skipRunCandidate is one index's skip-scan probe shape: its first `skip` key
+// columns are enumerated and the next `run` are bound.
+type skipRunCandidate struct {
+	idx       *catalog.Index
+	skip, run int
+}
+
+// eligibleSkipRuns lists every index on tbl that admits a skip-scan probe
+// under innerToOuter, in IndexesOnTable order — PG 18 builds the skip array
+// into each index's own path (build_index_paths, btcostestimate's
+// num_sa_scans), so each eligible index gets a path and add_path picks
+// (M0146-0197). pickIndexSkipRun keeps the single-index ranking.
+func eligibleSkipRuns(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) []skipRunCandidate {
+	var out []skipRunCandidate
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if skip, run, ok := skipRunFor(tbl, idx, innerToOuter); ok {
+			out = append(out, skipRunCandidate{idx: idx, skip: skip, run: run})
+		}
+	}
+	return out
+}
+
+// skipRunFor applies the skip-probe eligibility rules documented on
+// pickIndexSkipRun to one index.
+func skipRunFor(tbl *catalog.Table, idx *catalog.Index, innerToOuter map[string]Expr) (skip, run int, ok bool) {
+	if !isBTreeIndex(idx) || idx.HasPredicate || len(idx.Columns) < 2 {
+		return 0, 0, false
+	}
+	// The first bound position — 0 is the prefix picker's domain.
+	s := -1
+	for pos, col := range idx.Columns {
+		if _, bound := innerToOuter[col]; bound {
+			s = pos
+			break
+		}
+	}
+	if s <= 0 {
+		return 0, 0, false
+	}
+	// Contiguous bound run from s.
+	for pos := s; pos < len(idx.Columns); pos++ {
+		if _, bound := innerToOuter[idx.Columns[pos]]; !bound {
+			break
+		}
+		run++
+	}
+	for i := 0; i < s; i++ {
+		if idx.Columns[i] == "" || (i < len(idx.ColDescending) && idx.ColDescending[i]) {
+			return 0, 0, false
+		}
+	}
+	if !indexSkipNullSafe(tbl, idx, s, run) {
+		return 0, 0, false
+	}
+	return s, run, true
 }
 
 // indexSkipNullSafe is `indexUnboundKeysNotNull` generalised to a bound run
@@ -861,6 +920,33 @@ func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, 
 	return rows
 }
 
+// movableNonEquiJoinSelectivity is the share of
+// `get_parameterized_baserel_size`'s clauselist_selectivity over `ppi_clauses`
+// (costsize.c) that the parameterised producers' key selectivity does not
+// cover (M0146-0009p): every join clause movable into `rel` under `req`
+// (`join_clause_is_movable_into`) that is not an equijoin. The equijoins are
+// the probe-key candidates the producers already price; a comparison such as
+// TPC-DS Q72's `inv_quantity_on_hand < cs_quantity` binds no key but still
+// belongs to the parameterised path's clauses, so it filters the rows one
+// execution returns (PG: inventory_pkey probe rows=176, 1/3 of the 527 the
+// equalities alone give).
+func (s *searchCtx) movableNonEquiJoinSelectivity(rel *RelOptInfo, req RelSet) float64 {
+	if s == nil || s.clauses == nil || rel == nil {
+		return 1
+	}
+	sel := 1.0
+	for _, ri := range s.clauses.all {
+		if ri == nil || ri.isEquijoin || ri.relids == rel.Relids {
+			continue
+		}
+		if !joinClauseIsMovableInto(ri, rel.Relids, rel.Relids|req) {
+			continue
+		}
+		sel *= s.joinClauseSelectivity(ri)
+	}
+	return sel
+}
+
 // loopCountFor is `get_loop_count` (indxpath.c:3266): how many times a scan
 // parameterised by `req` is expected to be re-executed.
 //
@@ -874,6 +960,19 @@ func parameterizedBaserelRows(rel *RelOptInfo, idx *catalog.Index, sel float64, 
 // probed rel is outside of can supply the parameter only once unique-ified, so
 // its unique row count stands in for its raw rows.
 func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
+	return s.loopCountForKeys(cur, req, nil)
+}
+
+// loopCountForKeys is loopCountFor with the parameter's outer values. Those
+// name, through their columns' SourceTableIdx, the base relations that
+// supply the parameter when an outer rel is a searched sub-problem leaf
+// (M0146-0222). Such a leaf stands for a whole sub-joinlist. PG keeps that as
+// a joinrel, and get_loop_count iterates the base relids of required_outer,
+// so a probe driven by one base relation inside it is repeated once per row
+// of that relation, not once per row of the sub-joinlist's result. TPC-DS Q72's
+// date_dim d3 probe on catalog_sales.cs_ship_date_sk is the case: the leaf
+// returns 1 row, while catalog_sales has 360397.
+func (s *searchCtx) loopCountForKeys(cur *RelOptInfo, req RelSet, outerKeys []Expr) float64 {
 	if req == 0 {
 		return 1
 	}
@@ -882,7 +981,11 @@ func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
 		if rel == nil || rel.Relids&req == 0 || rel.Rows <= 0 {
 			continue
 		}
-		rowcount := s.adjustRowcountForSemijoins(cur, rel, rel.Rows)
+		rows := rel.Rows
+		if base, ok := s.subproblemSupplierRows(rel, outerKeys); ok {
+			rows = base
+		}
+		rowcount := s.adjustRowcountForSemijoins(cur, rel, rows)
 		if result == 0 || rowcount < result {
 			result = rowcount
 		}
@@ -891,6 +994,29 @@ func (s *searchCtx) loopCountFor(cur *RelOptInfo, req RelSet) float64 {
 		return result
 	}
 	return 1
+}
+
+// subproblemSupplierRows returns the smallest base-relation row count among
+// the relations inside sub-problem leaf rel that the parameter values read,
+// or false when rel is not such a leaf or no value names a relation inside it.
+func (s *searchCtx) subproblemSupplierRows(rel *RelOptInfo, outerKeys []Expr) (float64, bool) {
+	if s == nil || len(outerKeys) == 0 || relLevel(rel.Relids) != 1 {
+		return 0, false
+	}
+	idx := bits.TrailingZeros32(uint32(rel.Relids))
+	if idx < 0 || idx >= len(s.relInfos) || s.relInfos[idx].subproblemBaseRows == nil {
+		return 0, false
+	}
+	base := s.relInfos[idx].subproblemBaseRows
+	best, found := 0.0, false
+	for _, k := range outerKeys {
+		walkColumnRefsImpl(k, nil, func(c *ColumnRef) {
+			if r, ok := base[c.SourceTableIdx]; ok && r > 0 && (!found || r < best) {
+				best, found = r, true
+			}
+		}, func() {})
+	}
+	return best, found
 }
 
 // adjustRowcountForSemijoins is `adjust_rowcount_for_semijoins`
@@ -1067,4 +1193,13 @@ func boundPrefixClauses(bound []paramIndexClause, clauses []indexPathClause) []p
 		}
 	}
 	return keep
+}
+
+// paramOuterKeys lists the outer values that bind a probe's clauses.
+func paramOuterKeys(bound []paramIndexClause) []Expr {
+	out := make([]Expr, 0, len(bound))
+	for _, c := range bound {
+		out = append(out, c.outerKey)
+	}
+	return out
 }

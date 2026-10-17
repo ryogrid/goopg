@@ -53,6 +53,7 @@ import (
 	"github.com/goopg/goopg/internal/backup"
 	"github.com/goopg/goopg/internal/replication"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
+	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
@@ -224,6 +225,11 @@ type Config struct {
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
+
+	// WalSummarizer, when set, runs the WAL summarizer while summarize_wal
+	// is on: started in Run, reconciled on every reload, stopped at
+	// shutdown (WalSummarizerMain; M0122-0009 S3b).
+	WalSummarizer *walsummarizer.Service
 
 	// Activity is the backend-activity registry for
 	// pg_catalog.pg_stat_activity. nil disables tracking.
@@ -637,6 +643,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	// Start the autovacuum launcher if configured.
+	if s.cfg.WalSummarizer != nil {
+		s.cfg.WalSummarizer.Reconcile(runCtx, s.summarizeWALEnabled())
+		defer s.cfg.WalSummarizer.Stop()
+	}
 	if s.cfg.AutovacuumLauncher != nil {
 		s.cfg.AutovacuumLauncher.SetLogger(s.cfg.Logger)
 		go func() {
@@ -822,7 +832,7 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 // only fails to update the running configuration, matching
 // ProcessConfigFile's "log and keep the old values" behaviour.
 func (s *Server) reloadConfig() {
-	if s.cfg.ConfigPath == "" {
+	if s.cfg.ConfigPath == "" && s.cfg.DataDir == "" {
 		s.cfg.Logger.Info("control: reload requested but no config file was loaded at startup, nothing to do")
 		return
 	}
@@ -831,11 +841,24 @@ func (s *Server) reloadConfig() {
 		s.cfg.Logger.Warn("control: reload requested but no GUC registry is configured")
 		return
 	}
-	entries, err := misc.ParseConfigFile(s.cfg.ConfigPath)
+	var entries []misc.ConfigEntry
+	if s.cfg.ConfigPath != "" {
+		parsed, err := misc.ParseConfigFile(s.cfg.ConfigPath)
+		if err != nil {
+			s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
+			return
+		}
+		entries = parsed
+	}
+	// postgresql.auto.conf after postgresql.conf, as at boot: ALTER SYSTEM's
+	// values win, and one it RESET is absent here, so ApplyReloadEntries
+	// reverts it to its default.
+	autoEntries, err := misc.AutoConfEntries(s.cfg.DataDir)
 	if err != nil {
-		s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
+		s.cfg.Logger.Error("control: reload failed to parse "+misc.AutoConfFileName, "err", err)
 		return
 	}
+	entries = append(entries, autoEntries...)
 	result := registry.ApplyReloadEntries(entries)
 	for _, w := range result.Warnings {
 		s.cfg.Logger.Warn("control: reload", "issue", w)
@@ -844,6 +867,36 @@ func (s *Server) reloadConfig() {
 	if s.cfg.ApplyCheckpointGUCs != nil {
 		s.cfg.ApplyCheckpointGUCs()
 	}
+	// summarize_wal is PGC_SIGHUP: the summarizer starts or stops with it.
+	if s.cfg.WalSummarizer != nil {
+		s.cfg.WalSummarizer.Reconcile(nil, s.summarizeWALEnabled())
+	}
+}
+
+// walSummarizerStatus is pg_get_wal_summarizer_state's view of the running
+// summarizer. goopg runs it as a goroutine of the server process, so the pid
+// it reports is the server's.
+func (s *Server) walSummarizerStatus() executor.WalSummarizerStatus {
+	st := s.cfg.WalSummarizer.State()
+	out := executor.WalSummarizerStatus{
+		Initialized:   st.Initialized,
+		Running:       st.Running,
+		TLI:           st.SummarizedTLI,
+		SummarizedLSN: st.SummarizedLSN,
+		PendingLSN:    st.PendingLSN,
+		PID:           os.Getpid(),
+	}
+	out.WALReads, out.WALReadBytes = s.cfg.WalSummarizer.WALReads()
+	return out
+}
+
+// summarizeWALEnabled reads summarize_wal from the server registry.
+func (s *Server) summarizeWALEnabled() bool {
+	if s.cfg.Registry == nil {
+		return false
+	}
+	v, ok := s.cfg.Registry.Get("summarize_wal")
+	return ok && v.Display() == "on"
 }
 
 func (s *Server) stopControlPlane() {
@@ -1623,6 +1676,14 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	// SESSION AUTHORIZATION. M0134-0009.
 	connTx.LoginUser = loginUser
 	connTx.SessionUser = loginUser
+	// set_config_option's PGC_SUSET check: a non-superuser role may SET /
+	// RESET a superuser-only parameter only with SET on it
+	// (pg_parameter_acl). connTx.NonSuperuserRole is "" while the effective
+	// role is a superuser; a SECURITY DEFINER call overrides it through
+	// SessionRegistry.PushRole. M0146-0158.
+	sess.SetPrivilegeHook(
+		func() string { return connTx.NonSuperuserRole },
+		func(role, name string) bool { return executor.ParameterSetAllowed(s.cfg.Catalog, role, name) })
 	// Stable per-connection lock-manager identity for transaction-scoped LOCK
 	// TABLE heavyweight locks (M0118-0003 lock-nowait). Minted once from the
 	// same monotonic counter as per-statement BackendIDs so it never collides

@@ -150,7 +150,7 @@ log "=== goopg init + load (scale $SCALE) ==="
 cat >> "$GOOPG_DATA/postgresql.conf" <<EOF
 max_connections = 200
 shared_buffers = 2560MB
-wal_buffers = 134217728
+wal_buffers = 128MB
 checkpoint_timeout = 24h
 max_wal_size = 1024GB
 min_wal_size = 1024MB

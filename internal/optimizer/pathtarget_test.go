@@ -666,7 +666,10 @@ func TestOutputColumnNamesSkipsTreeInternalRefs(t *testing.T) {
 func TestOutputColumnNamesDeclinesLikeNeeded(t *testing.T) {
 	for _, sql := range []string{
 		"select * from pt_a a",
-		"with x as (select 1) select a.a_v from pt_a a",
+		// M0146-0147: a WITH list declines only for a body the walker
+		// cannot model (a recursive UNION) or a data-modifying CTE.
+		"with recursive x(n) as (select 1 union all select n + 1 from x) select a.a_v from pt_a a",
+		"with x as (delete from pt_b returning b_k) select a.a_v from pt_a a",
 		"select rank() over (order by a.a_v) from pt_a a",
 	} {
 		stmts, err := parser.Parse(sql)
@@ -2358,5 +2361,33 @@ func TestSlice3LiveDeltaModelArithmetic(t *testing.T) {
 	}
 	if wide, narrow := hashJoinCost(cp, inputs(10)), hashJoinCost(cp, inputs(7)); narrow.Total >= wide.Total {
 		t.Errorf("derived total %.0f not below statement total %.0f", narrow.Total, wide.Total)
+	}
+}
+
+// TestColumnNameCollectorsWalkCTEBodies pins M0146-0147: a WITH list no longer
+// makes the needed and above-tree column sets unknown. Each CTE body is
+// walked into the set (needed mode), so a body reading an enclosing level's
+// column keeps it — the outer `a.a_k` read by the sublink body's CTE is
+// needed — and the statement's own columns are still collected. PG's
+// check_index_only reads the attributes used, WITH or not; the decline had
+// cost TPC-DS Q95 its Index Only Scan on web_returns_pkey.
+func TestColumnNameCollectorsWalkCTEBodies(t *testing.T) {
+	parse := func(sql string) *parser.SelectStmt {
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stmts[0].(*parser.SelectStmt)
+	}
+	s := parse("with x as (select b.b_k from pt_b b) select a.a_v from pt_a a where a.a_k in (select b_k from x)")
+	if need, known := neededColumnNames(s); !known || !need["a_v"] || !need["a_k"] {
+		t.Errorf("needed set = (%v, %v); want known with a_v and a_k", need, known)
+	}
+	if out, known := outputColumnNames(s); !known || !out["a_v"] {
+		t.Errorf("above-tree set = (%v, %v); want known with a_v", out, known)
+	}
+	corr := parse("select a.a_v from pt_a a where exists (with c as (select b.b_k from pt_b b where b.b_k = a.a_k) select 1 from c)")
+	if need, known := neededColumnNames(corr); !known || !need["a_k"] {
+		t.Errorf("correlated CTE in a sublink body: needed set = (%v, %v); want known with the outer a_k", need, known)
 	}
 }

@@ -3,7 +3,6 @@ package optimizer
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -159,15 +158,6 @@ var flagResolvedState = map[string]func(string) string{
 		}
 		return "current"
 	},
-	// A float, not a boolean or a mode. It multiplies NL-index probe cost
-	// (cost_funcs.go), so it moves the hash-vs-NL crossover directly — the
-	// single most plan-shaping knob in the package. Rendered through
-	// strconv.FormatFloat with -1 precision so `unset(1)` round-trips: the
-	// token inside `unset(…)` re-exported verbatim reproduces the arm, which
-	// TestFlagLabelsRoundTrip asserts for every row.
-	"GOOPG_INDEX_PROBE_MULT": func(v string) string {
-		return strconv.FormatFloat(indexProbeMultFromEnv(v), 'g', -1, 64)
-	},
 	// M0141-S2b-2c / S7: gates addOrderedPaths' third arm (Incremental Sort
 	// over a losing search candidate). Default off — createPlanNode has no
 	// arm for PathIncrementalSort until the executor operator lands.
@@ -198,6 +188,7 @@ var flagProvenanceOrder = []string{
 	// been readable, and absent from every artefact, since M0126. It escaped
 	// the completeness guard because it is read through envFloatDefault rather
 	// than a literal os.Getenv, which the old regex detector could not see.
+	// Retired at M0146-0159 — see flagProvenanceRetired.
 	"GOOPG_INDEX_PROBE_MULT",
 	"GOOPG_MHJ_PACKING_OFF",
 	"GOOPG_GS_SHARE_SOURCE",
@@ -346,6 +337,12 @@ var flagProvenanceRetired = map[string]string{
 	// reference in a sublink body up like any other base rel — so the
 	// admission is unconditional and nothing reads the variable.
 	"GOOPG_PULLUP_CTE_LEAF": "M0145-0008ac",
+	// The x2 NL-index probe-cost calibration (C-20d). M0146-0068's corpus A/B
+	// measured it electing non-PG shapes, and the owner retired it (Option A,
+	// 2026-10-12): every random-page term is PG's random_page_cost again, so
+	// nothing reads the variable. `unset(2)` in an older artefact is the
+	// multiplied arm; `1` there reproduces this one.
+	"GOOPG_INDEX_PROBE_MULT": "M0146-0159",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

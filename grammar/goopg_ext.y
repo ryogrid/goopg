@@ -1156,7 +1156,9 @@ set_stmt:
 				// against the permissive value list below. setValueIsDefault
 				// inspects the token instead.
 				l := yylex.(*lexerState)
-				$$ = NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
+				s := NewSetStmt(0, $2, $3, l.setValueAtoms(), l.setValueIsDefault())
+				s.Args = l.setValueArgs()
+				$$ = s
 			}
 
 	/* SET [SESSION|LOCAL] AUTHORIZATION name|DEFAULT. SESSION is consumed by
@@ -1180,6 +1182,23 @@ set_stmt:
 	   and therefore a ColId, so this cannot ride set_guc_name. */
 	| SET set_scope TIME ZONE set_value_atom
 			{ $$ = tzSetStmt($2, $5) }
+	/* zone_value's ConstInterval arms (gram.y): INTERVAL 'x' [HOUR | MINUTE |
+	   HOUR TO MINUTE] and INTERVAL(p) 'x'. The value is flattened here, as
+	   flatten_set_variable_args does for the TypeCast, to INTERVAL
+	   '<interval_out>' — the form check_timezone parses. */
+	| SET set_scope TIME ZONE INTERVAL SCONST
+			{ $$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($6, ivQual{prec: -1}), false) }
+	| SET set_scope TIME ZONE INTERVAL SCONST interval_qual
+			{
+				q := $7
+				if !tzIntervalQualOK(q) {
+					yylex.(*lexerState).raise("time zone interval must be HOUR or HOUR TO MINUTE", true, $<p>7)
+					return 1
+				}
+				$$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($6, q), false)
+			}
+	| SET set_scope TIME ZONE INTERVAL '(' ICONST ')' SCONST
+			{ $$ = NewSetStmt(0, $2, "timezone", tzIntervalValue($9, ivQual{prec: $7}), false) }
 
 /* set_guc_name — GUCs may be dotted (`SET spec.session = 1`), which plain
    ColId could not express. */
@@ -1250,6 +1269,26 @@ reset_stmt:
 	   cannot reach it; legacy normalises the pair to the GUC's real name. */
 	| RESET SESSION AUTHORIZATION
 			{ $$ = NewResetStmt(0, false, "session_authorization") }
+
+/* alter_system_stmt — gram.y AlterSystemStmt (:11593): `ALTER SYSTEM SET
+   generic_set | ALTER SYSTEM RESET generic_reset`. generic_set is `var_name
+   {TO|=} var_list | var_name {TO|=} DEFAULT`, which set_stmt's own
+   set_guc_name / set_eq_to / set_value_list already express (the DEFAULT
+   spelling is told apart by token kind, as there); generic_reset is `var_name
+   | ALL`. Values are rebuilt from the tokens by setValueAtoms, exactly as SET
+   does. Position ZERO, like set_stmt / reset_stmt (§12.3 rule 4). M0122-0008. */
+alter_system_stmt:
+		ALTER SYSTEM_P SET set_guc_name set_eq_to set_value_list
+			{
+				l := yylex.(*lexerState)
+				s := NewAlterSystemStmt(0, $4, l.setValueAtoms(), l.setValueIsDefault(), false, false)
+				s.Args = l.setValueArgs()
+				$$ = s
+			}
+	| ALTER SYSTEM_P RESET set_guc_name
+			{ $$ = NewAlterSystemStmt(0, $4, "", false, true, false) }
+	| ALTER SYSTEM_P RESET ALL
+			{ $$ = NewAlterSystemStmt(0, "", "", false, true, true) }
 
 /* alter_table_stmt — P4.2 v0 (gram.y AlterTableStmt subset): single action
    of ADD COLUMN / ADD PRIMARY KEY / DROP COLUMN / ALTER COLUMN TYPE /
@@ -2056,9 +2095,21 @@ create_function_stmt:
 				}
 				$$ = applyFnAttrs(st, a)
 			}
-	/* gram.y makes RETURNS optional (inferring the type from the OUT
-	   arguments); legacy requires it — "expected keyword returns" — so there is
-	   no RETURNS-less alternative here. CREATE PROCEDURE never takes one. */
+	/* gram.y makes RETURNS optional: the executor infers the result type from
+	   the OUT / INOUT parameters (interpret_function_parameter_list's
+	   requiredResultType) and raises 42P13 when there are none (M0146-0165).
+	   The attribute list must be non-empty here: an empty fn_attrs would have
+	   to be reduced before RETURNS, which also starts the first alternative. */
+	| CREATE opt_or_replace FUNCTION qualified_name '(' opt_func_args ')' fn_attrs1
+			{
+				a := mustFnAttrs($8)
+				if msg, raw, at := fnAttrsCheck(yylex, a, "FUNCTION"); msg != "" {
+					yylex.(*lexerState).raise(msg, raw, at)
+					return 1
+				}
+				st := NewCreateFunctionStmt($<p>1, $2, objectNameFromQn($4), $6)
+				$$ = applyFnAttrs(st, a)
+			}
 	| CREATE opt_or_replace PROCEDURE qualified_name '(' opt_func_args ')' fn_attrs
 			{
 				a := mustFnAttrs($8)
@@ -2139,6 +2190,10 @@ fn_attrs:
 		/* empty */             { $$ = newFnAttrs() }
 	| fn_attrs fn_attr          { a := mustFnAttrs($1); $2.(func(*fnAttrs))(a); $$ = a }
 
+fn_attrs1:
+		fn_attr                 { a := newFnAttrs(); $1.(func(*fnAttrs))(a); $$ = a }
+	| fn_attrs1 fn_attr         { a := mustFnAttrs($1); $2.(func(*fnAttrs))(a); $$ = a }
+
 fn_attr:
 		LANGUAGE fn_lang_name
 			{
@@ -2202,13 +2257,13 @@ fn_attr:
 	| SUPPORT qualified_name      { $$ = func(a *fnAttrs) {} }
 	| SET fn_config_name fn_config_value
 			{
-				n, v := $2, $3
+				n, cv := $2, fnConfigOf($3)
 				$$ = func(a *fnAttrs) {
 					/* FROM CURRENT / TO DEFAULT record NO config op: goopg has
 					   no GUC snapshot to capture (function.go
 					   parseFunctionConfigSetClause returns ok=false). */
-					if v != fnConfigUnset {
-						a.configOps = append(a.configOps, NewFunctionConfigOp(false, false, n, v))
+					if cv != nil {
+						a.configOps = append(a.configOps, cv.op(n))
 					}
 				}
 			}
@@ -2238,8 +2293,15 @@ fn_config_name:
    DEFAULT, and both reduce at the same point. The keyword is recognised at the
    token instead, which also keeps `= 'default'` (a real value) distinct. */
 fn_config_value:
-		fn_eq_to fn_set_values      { if isDefaultKeywordAt(yylex, $<p>2) { $$ = fnConfigUnset } else { $$ = $2 } }
-	| FROM CURRENT_P                { $$ = fnConfigUnset }
+		fn_eq_to fn_set_values
+			{
+				if isDefaultKeywordAt(yylex, $<p>2) {
+					$$ = nil
+				} else {
+					$$ = &fnConfigVal{text: $2, args: setArgsAt(yylex, $<p>2)}
+				}
+			}
+	| FROM CURRENT_P                { $$ = nil }
 
 /* set_value_list keeps only its FIRST atom (its callers recover the rest from
    the token stream via lexerState.setValueAtoms, which scans a whole SET
@@ -2629,6 +2691,14 @@ opt_nowait:
 merge_stmt:
 		MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
 			{ $$ = NewMergeStmt($<p>1, $3, $5, $7, $8, $9) }
+	/* gram.y MergeStmt: opt_with_clause MERGE INTO … (M0146-0085). Anchored at
+	   the MERGE keyword, as `with_clause DELETE_P` anchors at DELETE. */
+	| with_clause MERGE opt_INTO_kw base_table_ref USING base_table_ref ON a_expr merge_when_list opt_returning
+			{
+				m := NewMergeStmt($<p>2, $4, $6, $8, $9, $10)
+				m.With = $1
+				$$ = m
+			}
 
 opt_INTO_kw:
 		/* empty */   { }
@@ -3114,11 +3184,11 @@ alter_fn_action:
 	   (ddl.go peeks for the word "schema" after SET). */
 	| SET fn_config_name fn_config_value
 			{
-				n, v := $2, $3
+				n, cv := $2, fnConfigOf($3)
 				if eqFold(n, "schema") {
-					$$ = alterFnSchema(v)
+					$$ = alterFnSchema(cv.textOrUnset())
 				} else {
-					$$ = alterFnConfig(NewFunctionConfigOp(false, false, n, v), v != fnConfigUnset)
+					$$ = alterFnConfig(cv.op(n), cv != nil)
 				}
 			}
 	| RESET ALL                      { $$ = alterFnConfig(NewFunctionConfigOp(false, true, "", ""), true) }

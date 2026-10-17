@@ -680,12 +680,18 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 
 	// Pre-allocate arenas and worker contexts. mctx.Acquire is NOT
 	// goroutine-safe (appends to parent.children without synchronisation).
+	// M0146-0192: the producers' initplan values, evaluated by the leader.
+	initPlans, err := prepareWorkerInitPlans(ctx, buildPlan)
+	if err != nil {
+		return false, err
+	}
 	var workerCtxs []*Context
 	var arenas []*mmgr.Context
 	for i := 0; i < maxProducers; i++ {
 		arena := mmgr.Acquire(ctx.Mctx, mmgr.KindStmt)
 		arenas = append(arenas, arena)
 		wctx := NewWorkerContext(ctx, arena, group.Context())
+		wctx.InitPlanValues = initPlans
 		// EX0-03c: stamp the fan-out slot so MergeWorkerContext can tag
 		// this producer's sort entries with an explicit index.
 		wctx.workerSlot = i

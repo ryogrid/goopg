@@ -107,6 +107,11 @@ func fieldSelectOnArg(x *parser.FieldSelect, arg Expr, ctx *resolveContext) (Exp
 
 	typ := exprType(arg)
 	fields, ok := compositeTypeFields(ctx.cat, typ)
+	outRecord := false
+	if !ok {
+		fields, ok = outParamRecordFields(ctx.cat, arg)
+		outRecord = ok
+	}
 	if !ok {
 		display := typ.Name
 		if display == "" {
@@ -128,6 +133,10 @@ func fieldSelectOnArg(x *parser.FieldSelect, arg Expr, ctx *resolveContext) (Exp
 		}
 	}
 	if idx < 0 {
+		if outRecord {
+			return nil, &PlanError{Pos: fieldSelectErrPos(x), Code: "42703",
+				Message: fmt.Sprintf("could not identify column %q in record data type", field)}
+		}
 		return nil, &PlanError{Pos: fieldSelectErrPos(x), Code: "42703",
 			Message: fmt.Sprintf("column %q not found in data type %s", field, strings.ToLower(typ.Name))}
 	}
@@ -219,6 +228,47 @@ func anonymousRecordFieldOrdinal(field string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// outParamRecordFields lists the fields of a user function call's record
+// result when the function has several output parameters: its OUT and INOUT
+// parameters in declaration order, as get_expr_result_type builds the
+// row type from proallargtypes / proargnames (funcapi.c). The candidate is
+// the overload whose input arity matches the call (M0146-0165).
+func outParamRecordFields(cat catalog.Catalog, arg Expr) ([]compositeField, bool) {
+	fc, ok := arg.(*FuncCall)
+	if !ok || cat == nil {
+		return nil, false
+	}
+	rs := cat.Routines()
+	if rs == nil {
+		return nil, false
+	}
+	name := parser.ObjectName{Name: fc.Name}
+	if dot := strings.LastIndexByte(fc.Name, '.'); dot > 0 {
+		name = parser.ObjectName{Schema: fc.Name[:dot], Name: fc.Name[dot+1:]}
+	}
+	for _, r := range rs.LookupByName(name) {
+		var fields []compositeField
+		for i, t := range r.ArgTypes {
+			mode := "i"
+			if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+				mode = r.ArgModes[i]
+			}
+			if mode != "o" && mode != "b" {
+				continue
+			}
+			fname := ""
+			if i < len(r.ArgNames) {
+				fname = strings.ToLower(r.ArgNames[i])
+			}
+			fields = append(fields, compositeField{name: fname, typ: t})
+		}
+		if r.NumInputArgs() == len(fc.Args) && len(fields) > 1 {
+			return fields, true
+		}
+	}
+	return nil, false
 }
 
 type compositeField struct {

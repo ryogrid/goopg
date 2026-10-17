@@ -244,17 +244,17 @@ func TestReportableHookFires(t *testing.T) {
 func TestOnChangeCallbackFires(t *testing.T) {
 	r := BuildDefaultRegistry()
 	var values []string
-	r.OnChange("enable_nestloop_index", func(value string) {
+	r.OnChange(GoopgEnableNestLoopIndex, func(value string) {
 		values = append(values, value)
 	})
 	sess := NewSessionRegistry(r)
-	if err := sess.Set("enable_nestloop_index", "off", false); err != nil {
+	if err := sess.Set(GoopgEnableNestLoopIndex, "off", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Set("enable_nestloop_index", "on", false); err != nil {
+	if err := sess.Set(GoopgEnableNestLoopIndex, "on", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Reset("enable_nestloop_index"); err != nil {
+	if err := sess.Reset(GoopgEnableNestLoopIndex); err != nil {
 		t.Fatal(err)
 	}
 	// Expect: ["off", "on", "on"] — Reset returns to the default
@@ -325,10 +325,10 @@ func TestApplyReloadEntriesAppliesSigHupSkipsPostmaster(t *testing.T) {
 func TestApplyReloadEntriesFiresOnChange(t *testing.T) {
 	r := BuildDefaultRegistry()
 	var got string
-	r.OnChange("enable_nestloop_index", func(value string) { got = value })
+	r.OnChange(GoopgEnableNestLoopIndex, func(value string) { got = value })
 
 	r.ApplyReloadEntries([]ConfigEntry{
-		{Name: "enable_nestloop_index", Value: "off", SourceFile: "postgresql.conf", SourceLine: 1},
+		{Name: GoopgEnableNestLoopIndex, Value: "off", SourceFile: "postgresql.conf", SourceLine: 1},
 	})
 
 	if got != "off" {
@@ -459,7 +459,7 @@ func TestCheckpointGUCDefaults(t *testing.T) {
 // (postgresql.conf templates, parameter probes, pgbench setups) keeps
 // behaving the same against goopg as against upstream.
 //
-// The `-2` default for `max_predicate_locks_per_relation` is the
+// The `-2` default for `max_pred_locks_per_relation` is the
 // upstream shorthand "use per_xact / 2 as the per-relation
 // threshold"; the GUC layer surfaces the negative value verbatim and
 // the server-side bridge into `mvcc.Manager.SetPredicateLockLimits`
@@ -473,9 +473,9 @@ func TestPredicateLockGUCDefaults(t *testing.T) {
 		name    string
 		bootVal string
 	}{
-		{"max_predicate_locks_per_xact", "64"},
-		{"max_predicate_locks_per_relation", "-2"},
-		{"max_predicate_locks_per_page", "2"},
+		{"max_pred_locks_per_transaction", "64"},
+		{"max_pred_locks_per_relation", "-2"},
+		{"max_pred_locks_per_page", "2"},
 	}
 	for _, c := range cases {
 		v, ok := r.Get(c.name)
@@ -491,20 +491,20 @@ func TestPredicateLockGUCDefaults(t *testing.T) {
 		}
 	}
 
-	// max_predicate_locks_per_xact rejects values below the upstream
+	// max_pred_locks_per_transaction rejects values below the upstream
 	// floor of 10 — a single predicate-lock entry per xact is too few
 	// to make coarsening meaningful.
-	if err := r.Set("max_predicate_locks_per_xact", "5", SourceConfigFile); err == nil {
-		t.Error("expected max_predicate_locks_per_xact=5 to be rejected (< 10)")
+	if err := r.Set("max_pred_locks_per_transaction", "5", SourceConfigFile); err == nil {
+		t.Error("expected max_pred_locks_per_transaction=5 to be rejected (< 10)")
 	}
-	// max_predicate_locks_per_relation accepts the negative shorthand.
-	if err := r.Set("max_predicate_locks_per_relation", "-4", SourceConfigFile); err != nil {
-		t.Errorf("max_predicate_locks_per_relation=-4: %v", err)
+	// max_pred_locks_per_relation accepts the negative shorthand.
+	if err := r.Set("max_pred_locks_per_relation", "-4", SourceConfigFile); err != nil {
+		t.Errorf("max_pred_locks_per_relation=-4: %v", err)
 	}
-	// max_predicate_locks_per_page rejects negatives — the page-level
+	// max_pred_locks_per_page rejects negatives — the page-level
 	// threshold has no negative-shorthand semantic upstream.
-	if err := r.Set("max_predicate_locks_per_page", "-1", SourceConfigFile); err == nil {
-		t.Error("expected max_predicate_locks_per_page=-1 to be rejected (must be >= 0)")
+	if err := r.Set("max_pred_locks_per_page", "-1", SourceConfigFile); err == nil {
+		t.Error("expected max_pred_locks_per_page=-1 to be rejected (must be >= 0)")
 	}
 }
 

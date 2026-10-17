@@ -108,19 +108,28 @@ func TestSAOPMovedShapes(t *testing.T) {
 		{"int PK IN", "SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3, 5)", 3},
 		{"varchar IN", "SELECT i_item_sk FROM item WHERE i_item_id IN ('A', 'B')", 2},
 		{"any array spelling", "SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[2, 3])", 2},
-		{"single element", "SELECT i_item_id FROM item WHERE i_item_sk IN (7)", 1},
+		// PG's transformAExprIn turns a one-element IN list into `=`:
+		// `Index Cond: (i_item_sk = 7)` (PG 18.3), so the probe is a plain
+		// equality key, not a ScalarArrayOp (wantN 0 = expect Key).
+		{"single element", "SELECT i_item_id FROM item WHERE i_item_sk IN (7)", 0},
 		{"null element kept", "SELECT i_item_id FROM item WHERE i_item_sk IN (7, NULL)", 2},
 		{"duplicate elements kept", "SELECT i_item_id FROM item WHERE i_item_sk IN (7, 7, 8)", 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			node, err := Plan(parseOne(t, tc.sql), c)
+			node, err := planIndexSubject(parseOne(t, tc.sql), c)
 			if err != nil {
 				t.Fatalf("Plan: %v", err)
 			}
 			scan := findIndexScan(node)
 			if scan == nil {
 				t.Fatalf("%s: want IndexScan, got plan without one", tc.sql)
+			}
+			if tc.wantN == 0 {
+				if scan.Key == nil || len(scan.SAOPKeys) != 0 {
+					t.Fatalf("%s: want a plain equality Key (PG's `=`), got Key=%v SAOPKeys=%d", tc.sql, scan.Key, len(scan.SAOPKeys))
+				}
+				return
 			}
 			if len(scan.SAOPKeys) != tc.wantN {
 				t.Fatalf("%s: SAOPKeys has %d elements, want %d", tc.sql, len(scan.SAOPKeys), tc.wantN)
@@ -138,7 +147,7 @@ func TestSAOPMovedShapes(t *testing.T) {
 // `Index Cond: (i_item_sk = ANY (...))`) must move Seq→Index.
 func TestSAOPQ45ShapeMoves(t *testing.T) {
 	c := saopFixture(t)
-	node, err := Plan(parseOne(t,
+	node, err := planIndexSubject(parseOne(t,
 		"SELECT i_item_id FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)"), c)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
@@ -217,7 +226,11 @@ func TestSAOPUnmovedShapes(t *testing.T) {
 
 // TestSAOPNumSAScansCost pins the B-14 cost slice in btreeIndexAMCost
 // (selfuncs.c:7086-7103, :7718-7719, :7762-7782): the descent charge scales
-// with the clamped scan count on the total side only.
+// with the clamped scan count on the total side only, and the descents'
+// index pages go through genericcostestimate's Mackert-Lohman arm. The
+// inputs leave loopCount unset — an unparameterised path, cost_index's
+// loop_count 1 — which is exactly where the descents used to be multiplied
+// by zero and priced as one page (M0146-0172).
 func TestSAOPNumSAScansCost(t *testing.T) {
 	cp := defaultCostParams()
 	base := indexScanInputs{
@@ -225,7 +238,15 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 		indexPages: 90, indexTuples: 10000, treeHeight: 2,
 		selectivity: 0.01, correlation: 0, totalTablePages: 200,
 	}
-	descent := float64(base.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
+	// ceil(log2(10000)) = 14 comparisons plus (height+1) pages at 50 each.
+	descent := (14 + float64(base.treeHeight+1)*pageCPUMultiplier) * cp.cpuOperatorCost
+	// One index page touched per descent (rint(100/n) tuples is under one
+	// page of this 90-page index): the single scan pays one random page,
+	// n descents pay Mackert-Lohman over n touches.
+	mlPages := func(touches float64) float64 {
+		return indexPagesFetched(touches, int64(base.indexPages), base.indexPages, base.totalTablePages, cp.effectiveCacheSize) * cp.randomPageCost
+	}
+	onePage := cp.randomPageCost
 
 	single := costIndexScan(cp, base)
 	if single.Startup != descent {
@@ -242,15 +263,19 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 		}
 	}
 
-	// 10 descents: startup unchanged (first descent), total up by 9 more.
+	// 10 descents: startup unchanged (first descent), total up by 9 more
+	// descents and by the pages ten descents touch instead of one.
 	in := base
 	in.numSAScans = 10
 	multi := costIndexScan(cp, in)
 	if multi.Startup != single.Startup {
 		t.Fatalf("SAOP startup = %v, want single-descent startup %v", multi.Startup, single.Startup)
 	}
-	if want := single.Total + 9*descent; math.Abs(multi.Total-want) > 1e-9 {
-		t.Fatalf("SAOP total = %v, want single total + 9 descents = %v", multi.Total, want)
+	if want := single.Total + 9*descent - onePage + mlPages(10); math.Abs(multi.Total-want) > 1e-9 {
+		t.Fatalf("SAOP total = %v, want single total + 9 descents + ML(10) pages - 1 page = %v", multi.Total, want)
+	}
+	if !(multi.Total > single.Total+9*descent) {
+		t.Fatalf("SAOP total = %v: ten descents must touch more than the single scan's one page", multi.Total)
 	}
 
 	// Clamp: 100000 descents on a 90-page index clamp to ceil(90/3) = 30.
@@ -259,8 +284,8 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 	// (selfuncs.c:7150 — the same division SAOP descents go through).
 	in.numSAScans = 100000
 	clamped := costIndexScan(cp, in)
-	if want := single.Total + 29*descent - 10*cp.cpuIndexTupleCost; math.Abs(clamped.Total-want) > 1e-9 {
-		t.Fatalf("clamped total = %v, want single total + 29 descents - 10 tuples = %v", clamped.Total, want)
+	if want := single.Total + 29*descent - 10*cp.cpuIndexTupleCost - onePage + mlPages(30); math.Abs(clamped.Total-want) > 1e-9 {
+		t.Fatalf("clamped total = %v, want single total + 29 descents - 10 tuples + ML(30) pages - 1 page = %v", clamped.Total, want)
 	}
 
 	// The shared index side feeds the bitmap cost too: the same descent
@@ -268,7 +293,7 @@ func TestSAOPNumSAScansCost(t *testing.T) {
 	bmBase := costBitmapIndexScan(cp, base)
 	in.numSAScans = 10
 	bmMulti := costBitmapIndexScan(cp, in)
-	if want := bmBase.Total + 9*descent; math.Abs(bmMulti.Total-want) > 1e-9 {
-		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 descents = %v", bmMulti.Total, want)
+	if want := bmBase.Total + 9*descent - onePage + mlPages(10); math.Abs(bmMulti.Total-want) > 1e-9 {
+		t.Fatalf("bitmap SAOP total = %v, want bitmap base + 9 descents + ML(10) pages - 1 page = %v", bmMulti.Total, want)
 	}
 }

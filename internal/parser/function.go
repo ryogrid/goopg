@@ -824,7 +824,34 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			stmt.Body = body
 			stmt.BeginAtomic = true
 			sawAs = true
+		// SET / RESET — FunctionSetResetClause, as in CREATE FUNCTION above.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet:
+			p.advance() // consume SET
+			op, ok, err := p.parseFunctionConfigSetClause()
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				stmt.ConfigOps = append(stmt.ConfigOps, op)
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset:
+			p.advance() // consume RESET
+			stmt.ConfigOps = append(stmt.ConfigOps, p.parseFunctionConfigResetClause())
 		case p.isFunctionAttribute():
+			// [EXTERNAL] SECURITY DEFINER / INVOKER — prosecdef, which a
+			// procedure records as a function does (M0146-0157).
+			if p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "security") || strings.EqualFold(p.cur().Value, "external")) {
+				if strings.EqualFold(p.cur().Value, "external") {
+					p.advance()
+				}
+				p.acceptIdentKeyword("security")
+				if p.acceptIdentKeyword("definer") {
+					stmt.SecurityDefiner = true
+				} else if p.acceptIdentKeyword("invoker") {
+					stmt.SecurityDefiner = false
+				}
+				continue
+			}
 			// Track WINDOW and STRICT attributes for validation in executor.
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "window") {
 				stmt.Window = true
@@ -1028,11 +1055,12 @@ func (p *parser) parseFunctionConfigSetClause() (FunctionConfigOp, bool, error) 
 	if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 		return FunctionConfigOp{}, false, nil
 	}
+	args, _, _ := scanSetArgs(p.tokens, p.idx)
 	values, err := p.parseSetValueAtoms()
 	if err != nil {
 		return FunctionConfigOp{}, false, err
 	}
-	return FunctionConfigOp{Name: name, Value: strings.Join(values, ",")}, true, nil
+	return FunctionConfigOp{Name: name, Value: strings.Join(values, ","), Args: args}, true, nil
 }
 
 // parseFunctionConfigResetClause parses `RESET name` / `RESET ALL`, the

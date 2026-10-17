@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/utils/adt/similarto"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // Support helpers for grammar actions (docs/design/not_ralph/
@@ -213,7 +215,7 @@ func lerr(yylex yyLexer, msg string, pos int) {
 // as written.
 var knownSRF = map[string]bool{
 	"generate_series": true, "pg_input_error_info": true, "parse_ident": true,
-	"pg_get_publication_tables": true, "pg_available_wal_summaries": true,
+	"pg_get_publication_tables": true, "pg_available_wal_summaries": true, "pg_wal_summary_contents": true, "pg_get_wal_summarizer_state": true,
 	"verify_heapam": true, "unnest": true, "generate_subscripts": true,
 	"pg_options_to_table": true, "ts_token_type": true,
 }
@@ -2556,17 +2558,19 @@ func applyFnAttrs(st *CreateFunctionStmt, a *fnAttrs) *CreateFunctionStmt {
 }
 
 // applyProcAttrs is the procedure's subset — CreateProcedureStmt has no
-// Leakproof / Parallel / Cost / Rows / ConfigOps fields.
+// Leakproof / Parallel / Cost / Rows fields.
 func applyProcAttrs(st *CreateProcedureStmt, a *fnAttrs) *CreateProcedureStmt {
 	// CREATE PROCEDURE's attribute loop (function.go parseCreateProcedureTail)
-	// handles LANGUAGE / AS / BEGIN ATOMIC / SET explicitly and sends every
-	// other attribute through consumeFunctionAttribute, which DROPS it — only
-	// WINDOW and STRICT are peeked at on the way past. So SECURITY DEFINER,
-	// the volatility words, COST and ROWS leave no trace on a procedure, and
-	// Volatile stays at its "v" default.
+	// handles LANGUAGE / AS / BEGIN ATOMIC / SET / RESET / [EXTERNAL]
+	// SECURITY explicitly and sends every other attribute through
+	// consumeFunctionAttribute, which DROPS it — only WINDOW and STRICT are
+	// peeked at on the way past. So the volatility words, COST and ROWS
+	// leave no trace on a procedure, and Volatile stays at its "v" default.
 	st.Language, st.Body = a.language, a.body
 	st.BeginAtomic = a.beginAtomic
 	st.Strict, st.Window = a.strict, a.window
+	st.SecurityDefiner = a.securityDefiner
+	st.ConfigOps = a.configOps
 	return st
 }
 
@@ -2584,6 +2588,39 @@ func tableArgs(base []FunctionArg, cols []FunctionArg) []FunctionArg {
 // records NO config op for: `SET x FROM CURRENT` and `SET x TO DEFAULT`
 // (function.go parseFunctionConfigSetClause returns ok=false for both).
 const fnConfigUnset = "\x00\x00unset"
+
+// fnConfigVal is a function SET clause's value: the comma-joined atom text
+// legacy records plus the typed list the executor flattens with the
+// variable's flags. A nil *fnConfigVal is FROM CURRENT / TO DEFAULT.
+type fnConfigVal struct {
+	text string
+	args []misc.SetArg
+}
+
+func fnConfigOf(n any) *fnConfigVal {
+	cv, _ := n.(*fnConfigVal)
+	return cv
+}
+
+// textOrUnset is the clause text, or fnConfigUnset for FROM CURRENT / TO
+// DEFAULT (what ALTER FUNCTION ... SET SCHEMA receives for those).
+func (cv *fnConfigVal) textOrUnset() string {
+	if cv == nil {
+		return fnConfigUnset
+	}
+	return cv.text
+}
+
+// op builds the SET config op for name. A nil receiver yields an op with an
+// empty value, which callers drop.
+func (cv *fnConfigVal) op(name string) FunctionConfigOp {
+	if cv == nil {
+		return NewFunctionConfigOp(false, false, name, fnConfigUnset)
+	}
+	op := NewFunctionConfigOp(false, false, name, cv.text)
+	op.Args = cv.args
+	return op
+}
 
 // fnReturn carries the three shapes of a RETURNS clause: a plain type, SETOF
 // that type, or TABLE (cols) — which legacy folds into trailing OUT arguments.
@@ -2826,10 +2863,54 @@ func trimArrayTail(name string) (string, bool) {
 // value, exactly as the generic `SET x = DEFAULT` path has it; LOCAL is an
 // ordinary value word here, not a scope.
 func tzSetStmt(local bool, v string) Stmt {
-	if strings.EqualFold(v, "default") {
+	// zone_value's DEFAULT and LOCAL both mean "no value": reset to the
+	// default (gram.y builds a VAR_SET_DEFAULT for a NULL zone_value).
+	if strings.EqualFold(v, "default") || strings.EqualFold(v, "local") {
 		return NewSetStmt(0, local, "timezone", "", true)
 	}
 	return NewSetStmt(0, local, "timezone", v, false)
+}
+
+// tzIntervalQualOK is gram.y zone_value's check on the interval qualifier:
+// only HOUR, MINUTE and HOUR TO MINUTE are allowed, without a precision.
+func tzIntervalQualOK(q ivQual) bool {
+	if q.prec >= 0 {
+		return false
+	}
+	switch {
+	case q.lo == "" || q.lo == q.hi:
+		return q.hi == "hour" || q.hi == "minute"
+	default:
+		return q.hi == "hour" && q.lo == "minute"
+	}
+}
+
+// tzIntervalValue is flatten_set_variable_args' TypeCast branch for SET TIME
+// ZONE INTERVAL: interval_in(body, typmod), then interval_out, rendered as
+// INTERVAL '<text>' — the form check_timezone parses. q.hi == "" with a
+// precision is INTERVAL(p) 'x' (full range). A body interval_in would reject
+// is passed through unchanged; check_timezone then rejects it.
+func tzIntervalValue(body string, q ivQual) string {
+	typmod := int64(-1)
+	unit := "second"
+	if q.hi != "" || q.prec >= 0 {
+		_, col, ok := IntervalQualTypmods(q.hi, q.lo, q.prec)
+		if !ok {
+			return "INTERVAL '" + strings.ReplaceAll(body, "'", "''") + "'"
+		}
+		typmod = col
+		if q.lo != "" {
+			unit = q.lo
+		} else if q.hi != "" {
+			unit = q.hi
+		}
+	}
+	months, days, micros, ok := ParseIntervalBodyWithDefault(body, unit)
+	if !ok {
+		return "INTERVAL '" + strings.ReplaceAll(body, "'", "''") + "'"
+	}
+	months, days, micros = datetime.AdjustIntervalForTypmod(months, days, micros, int32(typmod))
+	return "INTERVAL '" + datetime.FormatInterval(months, days, micros) + "'"
 }
 
 // fetchSpec carries FETCH/MOVE's direction+count before they collapse into the

@@ -93,6 +93,10 @@ type ParallelSettings struct {
 	// the size gate falls back to the row estimate, which is an approximation
 	// and is recorded as such.
 	BlocksForTable func(*catalog.Table) (int64, bool)
+	// BlocksForIndex returns an index's size in blocks, resolved where the
+	// session's catalog places it (M0146-0178). Optional: nil falls back to
+	// the default-database lookup, catalog.IndexRealPages.
+	BlocksForIndex func(*catalog.Index) (int64, bool)
 }
 
 // MaybeAddGather returns root wrapped in a Gather when the plan is eligible,
@@ -210,6 +214,22 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	if ok && (partialSubtreeScansCTE(tgt.node) || !partialSubtreeExprsParallelSafe(tgt.node)) {
 		ok = false
 	}
+	// M0146-0186: the path model already decided this subtree. A plain
+	// target whose spine reaches a node the join search committed was costed
+	// there: generate_gather_paths offered the Gather over the rel's partial
+	// path and add_path compared it with the serial winner, so a serial
+	// subtree here is a Gather that LOST. Adding one by the size rule
+	// overrides that verdict — TPC-DS SF0.25's one-relation `date_dim` scan
+	// printed `Gather (cost=0.00..2503.07)` over a Parallel Seq Scan the search
+	// had priced at 1000..3061 against a 2500.73 serial scan, where PG keeps the
+	// Seq Scan. The split-aggregate and Gather Merge targets are their own
+	// tournaments and keep their arms, and debug_parallel_query forces past
+	// the cost verdict as PG's does (standard_planner adds its Gather
+	// regardless of cost).
+	forcedParallel := s.DebugParallelQuery == "on" || s.DebugParallelQuery == "regress"
+	if ok && !forcedParallel && !tgt.splitAgg && tgt.mergeKeys == nil && spineReachesCostedSearch(tgt.node) {
+		ok = false
+	}
 	if !ok {
 		// R33 (K44): no top-level target — sublinks still get their
 		// own verdicts (Q9's top is a 1-row scan; its 15 InitPlans
@@ -250,6 +270,25 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	}
 
 	return rebuildWithGather(root, tgt, workers, s.LeaderParticipates)
+}
+
+// spineReachesCostedSearch reports whether walking n down its single-child
+// spine (parallelChildren) reaches a node the join search committed whose
+// searched rel holds costed paths. A one-relation problem commits the scan
+// itself; a join problem commits its join.
+func spineReachesCostedSearch(n Node) bool {
+	for depth := 0; n != nil && depth < 64; depth++ {
+		if sr, ok := n.(searchRootNode); ok && sr.isFromJoinSearch() {
+			rel := sr.searchedRel()
+			return rel != nil && len(rel.Pathlist) > 0
+		}
+		kids := parallelChildren(n)
+		if len(kids) != 1 {
+			return false
+		}
+		n = kids[0]
+	}
+	return false
 }
 
 // indexOrderReliedOn reports whether target is driven by an index scan whose
@@ -545,7 +584,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// aggregate to produce four groups, and measurement shows that serial
 		// tail pinning the query at ~7.1 s no matter how many workers run.
 		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
-			drivingScan(agg.Child) != nil {
+			drivingScan(agg.Child) != nil && !subtreeHasParallelRestrictedQual(agg.Child) {
 			// The gate has to run HERE, not after the walk. Refusing must let
 			// the loop fall through terminatesPartial(*Aggregate) and place
 			// the Gather BELOW the aggregate — and that fallback is precisely
@@ -1903,7 +1942,11 @@ func computeParallelWorkersForScan(scan Node, s ParallelSettings) int {
 	// saved (4.2s -> 7.1s); sized by the index it is below the threshold and
 	// stays serial, which is the right answer and PG's own rule.
 	if ios, isIOS := scan.(*IndexOnlyScan); isIOS && ios.Index != nil {
-		if pages, ok := catalog.IndexRealPages(ios.Index); ok && pages > 0 {
+		lookup := catalog.IndexRealPages
+		if s.BlocksForIndex != nil {
+			lookup = s.BlocksForIndex
+		}
+		if pages, ok := lookup(ios.Index); ok && pages > 0 {
 			blocks, known = pages, true
 		}
 	}
@@ -2709,4 +2752,42 @@ func partialSubtreeExprsParallelSafe(n Node) bool {
 		}
 	})
 	return safe
+}
+
+// subtreeHasParallelRestrictedQual reports whether a qual inside n — a
+// Filter, a join's residual, an index nested loop's residual — is not
+// parallel-safe: a correlated SubPlan (PARAM_EXEC args, so
+// subplan->parallel_safe is false), a PARAM_EXEC Param, a restricted
+// function (M0146-0130). PG never builds a partial path for a rel holding
+// such a qual (set_rel_consider_parallel, max_parallel_hazard_walker), so a
+// producer that runs ALL of n inside the workers — a partial aggregate or
+// distinct over n — must refuse. A Gather placed somewhere BELOW such a qual
+// is fine, which is why this is not part of subtreeHasUnsafeNode: TPC-DS
+// Q32's correlated Join Filter sits above PG's Gather.
+func subtreeHasParallelRestrictedQual(n Node) bool {
+	restricted := false
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || restricted {
+			return
+		}
+		var pred Expr
+		switch x := cur.(type) {
+		case *Filter:
+			pred = x.Predicate
+		case *Join:
+			pred = x.Predicate
+		case *NestedLoopIndexJoin:
+			pred = x.Predicate
+		}
+		if pred != nil && !isParallelSafeExpr(pred, nil) {
+			restricted = true
+			return
+		}
+		for _, c := range parallelChildren(cur) {
+			walk(c)
+		}
+	}
+	walk(n)
+	return restricted
 }

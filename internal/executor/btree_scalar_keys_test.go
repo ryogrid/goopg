@@ -456,6 +456,9 @@ func TestTimeTzCompositeKeyIsSelfDelimiting(t *testing.T) {
 // scan), which is why the plan is asserted to be an IndexScan — that assertion
 // is the mutation probe.
 func TestScalarRegIndexDDLMaintains(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
@@ -471,7 +474,7 @@ func TestScalarRegIndexDDLMaintains(t *testing.T) {
 		"INSERT INTO reg_idx VALUES ('pg_class')",
 		"INSERT INTO reg_idx VALUES ('reg_idx')",
 	)
-	rows := runQuery(t, ctx, "SELECT r FROM reg_idx WHERE r = 'reg_idx'")
+	rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT r FROM reg_idx WHERE r = 'reg_idx'", indexOnlySettings()))
 	if len(rows) != 1 {
 		t.Fatalf("rows=%d want 1 (%v) — the INSERT maintain path likely "+
 			"swallowed the key-encode error and left the index empty", len(rows), rows)
@@ -480,7 +483,7 @@ func TestScalarRegIndexDDLMaintains(t *testing.T) {
 	// is legal (the element renders as the OID, which the key round-trips), so
 	// either index node counts; the point is that the maintain path WROTE the
 	// entries the planner is willing to probe.
-	plan := planOne(t, "SELECT r FROM reg_idx WHERE r = 'reg_idx'", ctx.Catalog)
+	plan := planOneIndexScan(t, "SELECT r FROM reg_idx WHERE r = 'reg_idx'", ctx.Catalog)
 	if findIndexScan(plan) == nil && findIndexOnlyScan(plan) == nil {
 		t.Fatal("planner did not use the index for the regclass equality — the " +
 			"maintain path likely swallowed the key-encode error and left the index empty")

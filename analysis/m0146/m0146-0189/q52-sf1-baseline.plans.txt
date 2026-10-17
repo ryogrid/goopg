@@ -1,0 +1,24 @@
+=== Q52
+                                                        QUERY PLAN                                                        
+--------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=64037.29..64037.34 rows=21 width=226)
+   ->  Sort  (cost=64037.29..64037.34 rows=21 width=226)
+         Sort Key: (sum(store_sales.ss_ext_sales_price)) DESC, item.i_brand_id
+         ->  GroupAggregate  (cost=64036.36..64036.83 rows=21 width=226)
+               Group Key: item.i_brand, item.i_brand_id
+               ->  Sort  (cost=64036.36..64036.41 rows=20 width=2386)
+                     Sort Key: item.i_brand, item.i_brand_id
+                     ->  Gather  (cost=3069.06..64035.93 rows=20 width=2386)
+                           Workers Planned: 4
+                           ->  Nested Loop  (cost=2069.06..63033.93 rows=5 width=1940)
+                                 ->  Parallel Hash Join  (cost=2068.78..62943.60 rows=292 width=34)
+                                       Hash Cond: (store_sales.ss_sold_date_sk = dt.d_date_sk)
+                                       ->  Parallel Seq Scan on store_sales  (cost=0.00..58984.58 rows=720058 width=212)
+                                       ->  Parallel Hash  (cost=2068.55..2068.55 rows=18 width=268)
+                                             ->  Parallel Seq Scan on date_dim dt  (cost=0.00..2068.55 rows=18 width=268)
+                                                   Filter: ((d_moy = 12) AND (d_year = 2000))
+                                 ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=1906)
+                                       Index Cond: (i_item_sk = store_sales.ss_item_sk)
+                                       Filter: (i_manager_id = 1)
+(19 rows)
+

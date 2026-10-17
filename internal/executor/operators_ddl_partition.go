@@ -54,7 +54,7 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 				Message: "set-returning functions are not allowed in DEFAULT expressions"}
 		}
 		// Check catalog for user-defined SRFs.
-		if rs := ctx.Catalog.Routines(); rs != nil {
+		if rs := routineRegistry(ctx); rs != nil {
 			for _, r := range rs.LookupByName(v.Name) {
 				if r.ReturnsSet {
 					return &ExecError{Code: "0A000", Pos: v.Pos(),
@@ -291,7 +291,7 @@ func validatePartKeyExprInner(e parser.Expr, pos int, keyColNum int, ctx *Contex
 		}
 		// Check catalog for SRF or non-immutable.
 		var routines []*catalog.Routine
-		if rs := ctx.Catalog.Routines(); rs != nil {
+		if rs := routineRegistry(ctx); rs != nil {
 			routines = rs.LookupByName(v.Name)
 			for _, r := range routines {
 				if r.ReturnsSet {
@@ -304,7 +304,7 @@ func validatePartKeyExprInner(e parser.Expr, pos int, keyColNum int, ctx *Contex
 		// upstream predicate CheckPredicate/ComputeIndexAttrs use for indexes
 		// (contain_mutable_functions), so both goopg ports now share one
 		// classifier — see index_mutability.go. This site used to consult ONLY
-		// ctx.Catalog.Routines(), i.e. user-defined functions, so a bare volatile
+		// routineRegistry(ctx), i.e. user-defined functions, so a bare volatile
 		// BUILT-IN (`PARTITION BY RANGE ((a + (random()*10)::int))`) was accepted;
 		// funcCallIsNonImmutable falls through to the pg_proc.dat-derived
 		// built-in set when the name is not a user routine. M0134-0170.

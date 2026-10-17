@@ -347,6 +347,7 @@ func (s *searchCtx) superkeyJoinSelectivity(cat catalog.Catalog, outer, inner *R
 	if !live {
 		return est
 	}
+	pairs = append(pairs, s.ecFKPairs(clauses, pairs, outer.Relids, inner.Relids)...)
 
 	// C-05: `get_foreign_key_join_selectivity`'s SEMI/ANTI rule
 	// (costsize.c:5694-5697). For those jointypes a key is usable only when
@@ -465,6 +466,21 @@ type joinKeyPair struct {
 	rel    [2]int
 	col    [2]string
 	usable bool
+	// virtual marks an equivalence-class stand-in (M0146-0202): a pair read
+	// off another clause of the same class as the applied clause `owner`.
+	// It is evidence for a FOREIGN KEY only, and consuming it consumes
+	// `owner` — see ecFKPairs.
+	virtual bool
+	owner   int
+}
+
+// pairOwner is the index of the clause a pair stands for: its own position
+// for a real pair, the applied clause for an equivalence-class stand-in.
+func pairOwner(i int, p joinKeyPair) int {
+	if p.virtual {
+		return p.owner
+	}
+	return i
 }
 
 // joinKeyPairOf resolves a clause to its (relation, column) pair, or reports
@@ -574,7 +590,7 @@ func (s *searchCtx) provableKeys(cat catalog.Catalog, pairs []joinKeyPair, remov
 	// clause equates to something on the other side of this join.
 	equated := make(map[int]map[string]bool)
 	for i, p := range pairs {
-		if removed[i] || !p.usable {
+		if removed[pairOwner(i, p)] || !p.usable {
 			continue
 		}
 		for k := 0; k < 2; k++ {
@@ -683,7 +699,7 @@ func (s *searchCtx) keysCovering(cat catalog.Catalog, r int, cols map[string]boo
 		// PG's chicken-out (costsize.c:5760): `coveringClauses` answers nil
 		// unless every one of the key's columns has a clause behind it that we
 		// can actually remove.
-		covered := coveringClauses(pairs, removed, r, fk.Columns)
+		covered := fkCoveringClauses(pairs, removed, r, parent, fk)
 		if len(covered) == 0 {
 			continue
 		}
@@ -704,7 +720,9 @@ func coveringClauses(pairs []joinKeyPair, removed []bool, r int, key []string) [
 	var out []int
 	seen := make(map[string]bool, len(key))
 	for i, p := range pairs {
-		if removed[i] || !p.usable {
+		// A unique key is proven by applied clauses only; an equivalence-class
+		// stand-in (ecFKPairs) is foreign-key evidence (M0146-0202).
+		if p.virtual || removed[i] || !p.usable {
 			continue
 		}
 		for k := 0; k < 2; k++ {
@@ -722,6 +740,93 @@ func coveringClauses(pairs []joinKeyPair, removed []bool, r int, key []string) [
 	return out
 }
 
+// fkCoveringClauses is coveringClauses for a declared FK: each referencing
+// column must be equated to ITS referenced column of the parent relation —
+// match_foreign_keys_to_quals' test, through a loose clause on exactly those
+// two Vars or a class holding both (an ecFKPairs stand-in). A clause equating
+// the referencing column to some other relation covers nothing (M0146-0202).
+// One applied clause standing for two key columns is PG's nmatched_ec
+// mismatch, so it chickens out (costsize.c:5760).
+func fkCoveringClauses(pairs []joinKeyPair, removed []bool, child, parent int, fk catalog.ForeignKey) []int {
+	if len(fk.RefColumns) != len(fk.Columns) {
+		return nil
+	}
+	ref := make(map[string]string, len(fk.Columns))
+	for i, c := range fk.Columns {
+		ref[c] = fk.RefColumns[i]
+	}
+	var out []int
+	seen := make(map[string]bool, len(fk.Columns))
+	colOf := map[int]string{}
+	for i, p := range pairs {
+		if !p.usable {
+			continue
+		}
+		own := pairOwner(i, p)
+		if removed[own] {
+			continue
+		}
+		for k := 0; k < 2; k++ {
+			rc, isKey := ref[p.col[k]]
+			if p.rel[k] != child || !isKey || p.rel[1-k] != parent || p.col[1-k] != rc {
+				continue
+			}
+			if prev, dup := colOf[own]; dup {
+				if prev != p.col[k] {
+					return nil
+				}
+				break
+			}
+			colOf[own] = p.col[k]
+			out = append(out, own)
+			seen[p.col[k]] = true
+			break
+		}
+	}
+	if len(seen) != len(fk.Columns) {
+		return nil
+	}
+	return out
+}
+
+// ecFKPairs is the equivalence-class arm of PG's foreign-key matching
+// (M0146-0202): match_eclasses_to_foreign_key_col records an FK column as
+// matched when the referencing and referenced Vars share a class, and
+// get_foreign_key_join_selectivity then consumes ANY clause of that class
+// ("even if equivclass.c chose to generate a clause equating some other pair
+// of Vars, it could have generated one equating the FK's Vars",
+// costsize.c:5718-5733). TPC-H Q9 applies `s_suppkey = l_suppkey` at the
+// lineitem join; the class {ps_suppkey, s_suppkey, l_suppkey} still covers
+// lineitem_partsupp_fk's l_suppkey.
+//
+// For every applied clause in a class, each other clause of the class in the
+// statement's list that splits the same way across this join becomes a
+// stand-in pair owned by the applied one. Only the FK arm reads stand-ins;
+// the unique-index bound keeps to the applied clauses.
+func (s *searchCtx) ecFKPairs(clauses []*restrictInfo, pairs []joinKeyPair, outer, inner RelSet) []joinKeyPair {
+	if s == nil || s.clauses == nil {
+		return nil
+	}
+	var out []joinKeyPair
+	for i, ri := range clauses {
+		if ri == nil || ri.ecID == noEquivClass || !pairs[i].usable {
+			continue
+		}
+		for _, other := range s.clauses.all {
+			if other == nil || other == ri || other.ecID != ri.ecID {
+				continue
+			}
+			p, ok := s.joinKeyPairOf(other, outer, inner)
+			if !ok {
+				continue
+			}
+			p.virtual, p.owner = true, i
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // fkParentRel resolves the referenced side of a declared FK to a base relation
 // of this search, and returns that relation's index and its RAW tuple count.
 //
@@ -733,7 +838,7 @@ func coveringClauses(pairs []joinKeyPair, removed []bool, r int, key []string) [
 // in front of us.
 func (s *searchCtx) fkParentRel(fk catalog.ForeignKey, pairs []joinKeyPair, removed []bool, child int) (int, float64, bool) {
 	for i, p := range pairs {
-		if removed[i] || !p.usable {
+		if removed[pairOwner(i, p)] || !p.usable {
 			continue
 		}
 		for k := 0; k < 2; k++ {

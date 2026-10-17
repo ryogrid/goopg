@@ -71,13 +71,6 @@ func TestParallelLateralAntiProbeIdentity(t *testing.T) {
 	ctx, cleanup := nliJointypeFixture(t)
 	defer cleanup()
 
-	// PG's index-vs-bitmap election prices the two within 0.01; the
-	// calibrated 2x probe multiplier decides it toward the bitmap inner,
-	// which is the fused family's sibling shape and not this pin's subject.
-	// `SetIndexProbeCostMultiplier` exists for exactly this purpose (owner
-	// decision 2026-09-24, M0145-0008 option (c)).
-	defer optimizer.SetIndexProbeCostMultiplier("1")()
-
 	const sql = "SELECT o.id FROM nlij_outer o WHERE NOT EXISTS (SELECT 1 FROM nlij_inner i WHERE i.k = o.k)"
 
 	serialRows, err := runQueryWithErr(ctx, sql)

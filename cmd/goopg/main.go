@@ -35,6 +35,8 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
+	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
@@ -390,7 +392,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// take2 P2-02c: enable_nestloop_index no longer bridges to a process
+	// take2 P2-02c: goopg.enable_nestloop_index no longer bridges to a process
 	// global either. All six planner-method bridges are gone; each of them let
 	// the most-recent SET win process-wide, steering every other session's
 	// plans. optimizer.SetNLIEnabled survives as the test hook and the env
@@ -422,12 +424,29 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.ConfigPath = *confPath
 		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
 	}
+	// postgresql.auto.conf (ALTER SYSTEM) is read after postgresql.conf so its
+	// entries win, as ProcessConfigFileInternal does. A missing file is fine.
+	if *dataDir != "" {
+		autoEntries, err := misc.AutoConfEntries(*dataDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		if len(autoEntries) > 0 {
+			if err := registry.ApplyConfigEntries(autoEntries); err != nil {
+				fmt.Fprintf(stderr, "goopg start: %v\n", err)
+				return 1
+			}
+			cfg.Registry = registry
+			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
+		}
+	}
 	var rt *initdb.Runtime
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
-		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
-		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
+		walSenderMemBuf := int64(intGUC(registry, misc.GoopgWalSenderMemoryBuffer, 16<<20))
+		walBuffers := resolveWALBuffers(registry, poolSlots) * xlogBlockSize
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
 		// fsync=off (test harnesses only) turns every runtime durability
 		// sync into a no-op; write ordering/content are unchanged.
@@ -468,7 +487,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			CommitDelayUs:         int64(intGUC(registry, "commit_delay", 0)),
 			CommitSiblings:        intGUC(registry, "commit_siblings", 5),
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
-			WalWriterFlushAfter:   int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
+			WalWriterFlushAfter:   walWriterFlushAfterBytes(registry),
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
 			CheckpointFlushAfter:  checkpointFlushAfter,
@@ -484,6 +503,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
+		recordClusterStateGUCs(registry, *dataDir)
 		// AIO engine startup line: surfaces the chosen method,
 		// the worker count, and the in-flight cap so an operator
 		// triaging an I/O-bound workload can verify the live
@@ -576,6 +596,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// set rather than a wrong one — which is the same answer a
 		// truncated-away multixact gives upstream.
 		cfg.MultiXact = multixact.NewStoreAt(multixact.MultiXactId(rt.NextMultiXact))
+
+		// PostmasterMain's sanity check (postmaster.c): WAL written at
+		// wal_level=minimal cannot be summarized.
+		if boolGUC(registry, "summarize_wal", false) && stringGUC(registry, "wal_level", "replica") == "minimal" {
+			fmt.Fprintln(stderr, `goopg start: WAL cannot be summarized when "wal_level" is "minimal"`)
+			return 1
+		}
 
 		// Autovacuum launcher (vacuum parity bundle): started when the
 		// `autovacuum` GUC is on (upstream default), sweeping every
@@ -789,6 +816,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
+		// The walwriter and bgwriter re-read their PGC_SIGHUP settings on a
+		// reload (M0122-0008); before this they were boot-time only.
+		rt.ApplyWriterSettings(initdb.WriterSettings{
+			WalWriterDelay:       time.Duration(intGUC(registry, "wal_writer_delay", 200)) * time.Millisecond,
+			WalWriterFlushAfter:  walWriterFlushAfterBytes(registry),
+			CommitDelayUs:        int64(intGUC(registry, "commit_delay", 0)),
+			CommitSiblings:       intGUC(registry, "commit_siblings", 5),
+			BgwriterDelay:        time.Duration(intGUC(registry, "bgwriter_delay", 200)) * time.Millisecond,
+			BgwriterMaxPages:     intGUC(registry, "bgwriter_lru_maxpages", 100),
+			CheckpointFlushAfter: intGUC(registry, "checkpoint_flush_after", 32),
+			BgwriterFlushAfter:   intGUC(registry, "bgwriter_flush_after", 64),
+		})
 	}
 	applyCheckpointGUCs()
 	cfg.ApplyCheckpointGUCs = applyCheckpointGUCs
@@ -826,6 +865,50 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 		}
+		// WAL summarizer (M0122-0009 S3b): runs while summarize_wal is on;
+		// the server starts it, reconciles it on reload and stops it.
+		// Retention keeps the WAL it has not summarized yet.
+		ckpt := rt.Checkpointer
+		cfg.WalSummarizer = walsummarizer.NewService(walsummarizer.ServiceConfig{
+			DataDir: rt.DataDir,
+			WALDir:  filepath.Join(rt.DataDir, "pg_wal"),
+			WAL:     rt.WAL,
+			RedoLSN: func() uint64 {
+				// The checkpointer stores the redo point 1-based. Before
+				// its first checkpoint in this run, pg_control holds the
+				// redo point the server started from.
+				if r := ckpt.LastCheckpointRedoLSN(); r > 0 {
+					return r - 1
+				}
+				if ctl, err := control.ReadControlFile(rt.DataDir); err == nil && ctl != nil {
+					return ctl.CheckPointCopyRedo
+				}
+				return 0
+			},
+			Logger: logger,
+			FullPageWrites: func() bool {
+				return rt.Pool == nil || rt.Pool.FullPageWrites()
+			},
+			// wal_summary_keep_time is PGC_SIGHUP and stored in minutes.
+			KeepTime: func() time.Duration {
+				return time.Duration(intGUC(cfg.Registry, "wal_summary_keep_time", 14400)) * time.Minute
+			},
+			// A pg_stat_activity row (backend_type walsummarizer) while
+			// the summarizer runs, as for the bgwriter's slot.
+			OnStart: func() {
+				if rt.Activity != nil {
+					rt.Activity.RegisterBackground(activity.WalSummarizerIdx, &activity.Backend{
+						PID: "walsummarizer-0", BackendType: "walsummarizer", State: "active",
+					})
+				}
+			},
+			OnStop: func() {
+				if rt.Activity != nil {
+					rt.Activity.ReleaseBackground(activity.WalSummarizerIdx, "walsummarizer-0")
+				}
+			},
+		})
+		retainer.KeepLSNFn = cfg.WalSummarizer.KeepLSN
 		rt.Checkpointer.SetRetainer(retainer)
 	}
 
@@ -1031,6 +1114,81 @@ func stringGUC(registry *misc.Registry, name string, fallback string) string {
 // intGUC reads an int-shaped GUC by name, returning fallback when
 // the registry is nil, the variable isn't registered, or its
 // Display value isn't a valid integer.
+// recordClusterStateGUCs sets the PGC_INTERNAL parameters that describe the
+// running cluster rather than a compile-time constant, the way PG's startup
+// stores them with SetConfigOption(..., PGC_S_DYNAMIC_DEFAULT):
+// data_checksums from pg_control's data_checksum_version (xlog.c
+// ReadControlFile), and huge_pages_status, which is "off" because goopg never
+// maps its shared state into huge pages (PG sets it in
+// CreateSharedMemoryAndSemaphores).
+func recordClusterStateGUCs(registry *misc.Registry, dataDir string) {
+	if registry == nil {
+		return
+	}
+	checksums := "off"
+	if ctl, err := control.ReadControlFile(dataDir); err == nil && ctl != nil && ctl.DataChecksumVersion != 0 {
+		checksums = "on"
+	}
+	_ = registry.Set("data_checksums", checksums, misc.SourceDefault)
+	_ = registry.Set("huge_pages_status", "off", misc.SourceDefault)
+}
+
+// xlogBlockSize is XLOG_BLCKSZ, the page size of the XBLOCKS-valued WAL GUCs.
+const xlogBlockSize = 8192
+
+// walWriterFlushAfterBytes reads wal_writer_flush_after, which PG stores in
+// XLOG_BLCKSZ pages (GUC_UNIT_XBLOCKS, default 128 = 1MB), as the byte count
+// the WAL writer takes.
+func walWriterFlushAfterBytes(registry *misc.Registry) int64 {
+	return int64(intGUC(registry, "wal_writer_flush_after", 128)) * xlogBlockSize
+}
+
+// resolveWALBuffers returns wal_buffers in XLOG_BLCKSZ pages, resolved the
+// way PG resolves it before sizing XLogCtl (check_wal_buffers and
+// XLOGChooseNumBuffers, xlog.c): -1 auto-tunes to shared_buffers/32 pages,
+// capped at one WAL segment and raised to at least 8; a manual value below 4
+// becomes 4. The resolved count is written back with the default source, as
+// XLOGShmemSize's SetConfigOption(PGC_S_DYNAMIC_DEFAULT) does, so SHOW
+// wal_buffers and pg_settings report it while the boot value stays -1.
+// sharedBufferSlots is NBuffers (0 = the registry could not size it: the
+// 128MB default's 16384).
+func resolveWALBuffers(registry *misc.Registry, sharedBufferSlots int) int64 {
+	n := intGUC(registry, "wal_buffers", -1)
+	if n == -1 {
+		nbuffers := sharedBufferSlots
+		if nbuffers <= 0 {
+			nbuffers = 16384
+		}
+		n = nbuffers / 32
+		if segPages := int(xlog.DefaultSegmentSize / xlogBlockSize); n > segPages {
+			n = segPages
+		}
+		if n < 8 {
+			n = 8
+		}
+		if registry != nil {
+			if v, ok := registry.Get("wal_buffers"); ok {
+				// An explicit -1 in the file outranks the dynamic default,
+				// so PG retries with PGC_S_OVERRIDE.
+				src := misc.SourceDefault
+				if v.Source != misc.SourceDefault {
+					src = misc.SourceOverride
+				}
+				_ = registry.Set("wal_buffers", strconv.Itoa(n), src)
+			}
+		}
+	}
+	if n < 4 {
+		n = 4
+		if registry != nil {
+			if v, ok := registry.Get("wal_buffers"); ok {
+				_ = registry.Set("wal_buffers", "4", v.Source)
+			}
+		}
+	}
+	return int64(n)
+}
+
 func intGUC(registry *misc.Registry, name string, fallback int) int {
 	if registry == nil {
 		return fallback

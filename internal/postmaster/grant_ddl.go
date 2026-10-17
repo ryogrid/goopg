@@ -73,6 +73,18 @@ var allForeignDataWrapperPrivileges = []string{"USAGE"}
 // must first materialize the owner's implicit default ACL. DU-002 slice 340.
 const aclOwnerRole = "postgres"
 
+// effectiveRelOwner is a relation's owner for the owner-side GRANT / REVOKE
+// check: a relation created by the bootstrap superuser carries no Owner (the
+// empty string means "owned by postgres"), so `REVOKE … FROM postgres` on it
+// is the owner-side revoke-of-default. Comparing against the raw empty Owner
+// (M0134-0069) dropped every such REVOKE. M0122-0015c follow-up.
+func effectiveRelOwner(owner string) string {
+	if owner == "" {
+		return aclOwnerRole
+	}
+	return owner
+}
+
 // errGrantorMustBeCurrentUser mirrors PostgreSQL's aclchk.c ExecuteGrantStmt
 // check on an object-privilege GRANT/REVOKE's optional GRANTED BY clause: the
 // clause exists only for SQL-standard compatibility and is rejected unless it
@@ -230,8 +242,14 @@ func (s *Server) tryRecordTableGrant(stmt string, actingRole string, searchPath 
 			// after a valid re-GRANT. Twin of the aclKey fix in
 			// tryRecordTableRevoke above. M0134-0069 bucket 7.
 			aclKey := role
-			if strings.EqualFold(role, tbl.Owner) {
+			if strings.EqualFold(role, effectiveRelOwner(tbl.Owner)) {
 				aclKey = aclOwnerRole
+				// merge_acl_with_grant starts from acldefault when relacl is
+				// NULL, so a GRANT to the owner keeps the owner's full default
+				// ({postgres=arwdDxtm/postgres}) rather than recording only the
+				// granted letters — the same materialization the REVOKE twin
+				// below performs.
+				s.cfg.Catalog.MaterializeOwnerACL(tbl.OID, aclOwnerRole, allPrivs)
 			}
 			for _, p := range privs {
 				s.cfg.Catalog.GrantTablePrivilegeAs(tbl.OID, aclKey, p, withGrantOption, grantor)
@@ -369,7 +387,7 @@ func (s *Server) tryRecordTableRevoke(stmt string, searchPath []string) {
 			// explicit grant was ever recorded under that role name.
 			// M0134-0069 bucket 7. DU-002 slice 340.
 			aclKey := role
-			if strings.EqualFold(role, tbl.Owner) {
+			if strings.EqualFold(role, effectiveRelOwner(tbl.Owner)) {
 				aclKey = aclOwnerRole
 				s.cfg.Catalog.MaterializeOwnerACL(tbl.OID, aclOwnerRole, allPrivs)
 			}

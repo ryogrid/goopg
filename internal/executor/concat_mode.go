@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 
@@ -34,6 +35,13 @@ const (
 	concatText
 	// concatJSONB: jsonb_concat.
 	concatJSONB
+	// concatArrayCat / concatArrayAppend / concatArrayPrepend: array_cat,
+	// array_append, array_prepend (array_userfuncs.c). None is strict: a
+	// NULL array operand acts as an empty array and a NULL element is
+	// appended as a NULL element (M0146-0125).
+	concatArrayCat
+	concatArrayAppend
+	concatArrayPrepend
 )
 
 // concatModeOf is the `||` operator PG resolves for operands l and r. An
@@ -43,6 +51,22 @@ const (
 func concatModeOf(l, r optimizer.Expr) concatMode {
 	lt, lok := optimizer.ExprResultType(l)
 	rt, rok := optimizer.ExprResultType(r)
+	// Array operands (M0146-0125). An untyped NULL or string literal beside
+	// an array adopts the array type, so it is array_cat (a literal that is
+	// not an array is then malformed array input); a typed non-array operand
+	// is the element of array_append / array_prepend. A polymorphic or
+	// unresolved operand keeps the shape-based path.
+	la, ra := lok && isConcreteArrayType(lt), rok && isConcreteArrayType(rt)
+	switch {
+	case la && (ra || isBareNullExpr(r) || isBareStringLit(r)):
+		return concatArrayCat
+	case ra && (isBareNullExpr(l) || isBareStringLit(l)):
+		return concatArrayCat
+	case la && rok && !isArrayOrPolymorphicType(rt):
+		return concatArrayAppend
+	case ra && lok && !isArrayOrPolymorphicType(lt):
+		return concatArrayPrepend
+	}
 	lj, rj := lok && isJSONBType(lt), rok && isJSONBType(rt)
 	if (lj && (rj || isBareStringLit(r))) || (rj && isBareStringLit(l)) {
 		return concatJSONB
@@ -120,4 +144,127 @@ func parseJSONBText(s string) (jsonbValue, error) {
 		return jsonbValue{}, invalidJSONBError()
 	}
 	return v, nil
+}
+
+// isConcreteArrayType is an array type that is not a polymorphic
+// pseudo-type (anyarray, anycompatiblearray).
+func isConcreteArrayType(t catalog.Type) bool {
+	return isArrayOrPolymorphicType(t) && !strings.HasPrefix(strings.ToLower(t.Name), "any")
+}
+
+// isBareNullExpr is an untyped NULL literal.
+func isBareNullExpr(e optimizer.Expr) bool {
+	_, ok := e.(*optimizer.NullConst)
+	return ok
+}
+
+// arrayTextDims is an array literal's dimension count: its leading braces.
+// "{}" has none.
+func arrayTextDims(s string) int {
+	if s == "{}" {
+		return 0
+	}
+	n := 0
+	for n < len(s) && s[n] == '{' {
+		n++
+	}
+	return n
+}
+
+// isArrayText reports a value in array-literal form.
+func isArrayText(s string) bool {
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+// arrayElementText renders one element for array_out: NULL as the bare token
+// NULL, and a value quoted when it is empty, spells NULL, or contains a quote,
+// backslash, brace, comma or whitespace.
+func arrayElementText(d Datum, ctx *Context) string {
+	if d.IsNull() {
+		return "NULL"
+	}
+	s := formatDatumDateStyle(d, ctx)
+	needsQuote := s == "" || strings.EqualFold(s, "NULL")
+	for _, c := range s {
+		if c == '"' || c == '\\' || c == '{' || c == '}' || c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range s {
+		if c == '"' || c == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// evalArrayConcat is array_cat / array_append / array_prepend over the
+// text form goopg carries arrays in. array_cat returns NULL only when both
+// operands are NULL, and otherwise treats a NULL or empty operand as absent.
+// Equal dimension counts concatenate along the first dimension; arrays one
+// dimension apart concatenate the smaller as one element of the larger.
+func evalArrayConcat(left, right Datum, mode concatMode, ctx *Context) (Datum, error) {
+	switch mode {
+	case concatArrayAppend, concatArrayPrepend:
+		arr, elem := left, right
+		if mode == concatArrayPrepend {
+			arr, elem = right, left
+		}
+		inner := ""
+		if !arr.IsNull() {
+			s := formatDatumDateStyle(arr, ctx)
+			if isArrayText(s) {
+				inner = s[1 : len(s)-1]
+			}
+		}
+		e := arrayElementText(elem, ctx)
+		switch {
+		case inner == "":
+			return NewStringDatum("{" + e + "}"), nil
+		case mode == concatArrayAppend:
+			return NewStringDatum("{" + inner + "," + e + "}"), nil
+		default:
+			return NewStringDatum("{" + e + "," + inner + "}"), nil
+		}
+	}
+	if left.IsNull() && right.IsNull() {
+		return NullDatum, nil
+	}
+	if left.IsNull() {
+		return right, nil
+	}
+	if right.IsNull() {
+		return left, nil
+	}
+	ls, rs := formatDatumDateStyle(left, ctx), formatDatumDateStyle(right, ctx)
+	for _, v := range []string{ls, rs} {
+		if !isArrayText(v) {
+			// array_in on an untyped literal that is not an array.
+			return Datum{}, &ExecError{Code: "22P02", Message: fmt.Sprintf("malformed array literal: %q", v),
+				Detail: `Array value must start with "{" or dimension information.`}
+		}
+	}
+	ld, rd := arrayTextDims(ls), arrayTextDims(rs)
+	switch {
+	case ld == 0:
+		return right, nil
+	case rd == 0:
+		return left, nil
+	case ld == rd:
+		return NewStringDatum("{" + ls[1:len(ls)-1] + "," + rs[1:len(rs)-1] + "}"), nil
+	case ld+1 == rd:
+		return NewStringDatum("{" + ls + "," + rs[1:len(rs)-1] + "}"), nil
+	case ld == rd+1:
+		return NewStringDatum("{" + ls[1:len(ls)-1] + "," + rs + "}"), nil
+	}
+	return Datum{}, &ExecError{Code: "2202E", Message: "cannot concatenate incompatible arrays",
+		Detail: fmt.Sprintf("Arrays of %d and %d dimensions are not compatible for concatenation.", ld, rd)}
 }

@@ -28,6 +28,8 @@ package optimizer
 // range or SAOP column is not built yet — ledgered.
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -279,6 +281,13 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 		}
 		usable := true
 		for _, e := range in.List {
+			// A NULL element matches nothing under `=` and the executor's
+			// multi-descent probe skips it (ScalarArrayOp semantics), so it
+			// does not stop the list from being an index qual — PG keeps
+			// `col = ANY ('{7,NULL}')` as the Index Cond (M0146-0060).
+			if _, isNull := e.(*NullConst); isNull {
+				continue
+			}
 			if !restrictionKeyUsable(cat, tbl.Columns[cr.Index], e) {
 				usable = false
 				break
@@ -325,6 +334,22 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 // admitted) rather than a second Expr type switch, so the literal-kind list
 // lives in one place.
 func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) bool {
+	// A client bind parameter ($n, PG's PARAM_EXTERN) is a pseudo-constant
+	// for the whole statement — match_clause_to_indexcol takes any operand
+	// with no Var of the indexed relation and no volatile function. The
+	// executor encodes the bound value against the column type at run time,
+	// as it always did for the rule-based producer's $n keys (M0146-0060).
+	if _, isParam := val.(*ParamRef); isParam {
+		return true
+	}
+	// A constant cast — `'reg_idx'` resolved as `'reg_idx'::regclass` — is a
+	// Const after PG's eval_const_expressions, so it is an index qual there.
+	// The executor evaluates the key expression once per scan; the cast must
+	// already produce the column's own type, since the probe encodes the
+	// key's Datum against the column with no further coercion (M0146-0060).
+	if c, isCast := val.(*CastExpr); isCast {
+		return isConstantPlanExpr(c) && castTargetIsColumnType(c, col)
+	}
 	if t, isOuter := outerParamKeyType(val); isOuter {
 		// The probe encodes the key's runtime Datum against the column's
 		// btree byte key with no cast in between, so an outer key must carry
@@ -353,6 +378,36 @@ func restrictionKeyUsable(cat catalog.Catalog, col catalog.Column, val Expr) boo
 		}
 	}
 	return true
+}
+
+// partialIndexUsable reports whether idx may be scanned for a relation whose
+// restriction is conjuncts: always for a plain index, and for a partial index
+// only when a conjunct proves its predicate.
+func partialIndexUsable(tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) bool {
+	if !idx.HasPredicate {
+		return true
+	}
+	resolved, err := ResolveIndexPredicate(idx.Predicate, tbl)
+	if err != nil || resolved == nil {
+		return false
+	}
+	return partialPredicateProvenBy(resolved, conjuncts)
+}
+
+// castTargetIsColumnType reports whether a cast produces the column's type —
+// compared by pg_type OID where both names resolve, else by name — with the
+// array flag matching.
+func castTargetIsColumnType(c *CastExpr, col catalog.Column) bool {
+	target := strings.ToLower(strings.TrimSpace(c.TargetType))
+	if strings.HasSuffix(target, "[]") != col.Type.IsArray {
+		return false
+	}
+	target = strings.TrimSuffix(target, "[]")
+	colName := strings.ToLower(col.Type.Name)
+	if a, b := catalog.TypeNameToOID(target), catalog.TypeNameToOID(colName); a != 0 && b != 0 {
+		return a == b
+	}
+	return target == colName
 }
 
 // restrictionIndexSelectivity is the index quals' selectivity alone
@@ -384,12 +439,21 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	if idx == nil || len(idx.Columns) == 0 {
 		return false
 	}
-	// An unproven partial index would silently drop rows (no predicate-
-	// implication prover — same decline as the ordered arm, ledgered there).
-	if idx.HasPredicate {
+	// A partial index is scanned only when the restriction clauses prove its
+	// predicate (PG's `predOK`, check_index_predicates in indxpath.c) — the
+	// bitmap producer's partialPredicateProvenBy. An unproven one would
+	// silently drop the rows it does not index (M0146-0060).
+	if !partialIndexUsable(tbl, idx, conjuncts) {
 		return false
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
+	// A `USING hash` index (goopg builds it on a btree, DeclaredHash) answers
+	// equality only: PG's hash AM has no ordering, so no range or skip qual,
+	// and amsearcharray is false, so no ScalarArrayOp qual (hashhandler,
+	// hash.c) — only the `col = const` path below (M0146-0060).
+	if idx.DeclaredHash && len(clauses) != len(idx.Columns) {
+		return false
+	}
 	isRange := false
 	// Slice 2b: an equality prefix that stops short of the last index column
 	// may be followed by range bounds on the NEXT column (PG binds `b > 5`
@@ -479,7 +543,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		keys, dir = indexPathOrdering(idx, colExprs, false)
 	}
 
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	// A skip probe descends once per distinct skipped prefix
 	// (btcostestimate's num_sa_scans); a reverted estimate prices the index
 	// side over the whole index (skipScanDescents, boundSelectivity 1).
@@ -508,6 +572,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// qpquals = baserestrictinfo minus the index quals (costsize.c:806-820):
 		// the consumed equalities are applied by the probe, not re-checked.
 		numQualOps:       qpquals,
+		numIndexQuals:    float64(len(clauses)),
 		numSAScans:       numSAScans,
 		boundSelectivity: boundSel,
 	}
@@ -667,17 +732,44 @@ func indexUnboundKeysNotNull(tbl *catalog.Table, idx *catalog.Index, bound int) 
 // selectivity code reads MCVs and histograms through it.
 func normalizeColumnIndexKey(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 	if cr, ok := l.(*ColumnRef); ok && isIndexKeyOperand(r) {
-		return cr, r, false, true
+		return cr, coercedLiteralKey(r), false, true
 	}
 	if cr, ok := r.(*ColumnRef); ok && isIndexKeyOperand(l) {
-		return cr, l, true, true
+		return cr, coercedLiteralKey(l), true, true
 	}
 	return nil, nil, false, false
+}
+
+// coercedLiteralKey unwraps the resolver's implicit coercion of an untyped
+// literal to the column's type (`'reg_idx'` → `'reg_idx'::regclass`) to the
+// literal itself: the btree key encoder converts a literal against the
+// column's own type, array columns included, which is how the rule-based
+// producer probed these keys. In PG the coercion folds to a Const of the
+// column type (eval_const_expressions); the literal is goopg's equivalent.
+// An explicit or non-literal cast is kept as is (M0146-0060).
+func coercedLiteralKey(e Expr) Expr {
+	c, ok := e.(*CastExpr)
+	if !ok || c.Explicit {
+		return e
+	}
+	if _, isStr := c.Operand.(*StringConst); isStr {
+		return c.Operand
+	}
+	if _, isTyped := c.Operand.(*TypedStringLit); isTyped {
+		return c.Operand
+	}
+	return e
 }
 
 // isIndexKeyOperand is the pseudo-constant set normalizeColumnIndexKey admits.
 func isIndexKeyOperand(e Expr) bool {
 	if isConstExpr(e) {
+		return true
+	}
+	if _, isParam := e.(*ParamRef); isParam {
+		return true
+	}
+	if c, isCast := e.(*CastExpr); isCast && isConstantPlanExpr(c) {
 		return true
 	}
 	_, isOuter := outerParamKeyType(e)

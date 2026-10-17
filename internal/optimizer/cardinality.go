@@ -84,6 +84,33 @@ func limitInputPath(child Node) (PlanCost, bool) {
 	return PlanCost{}, false
 }
 
+// upperInputPathCost is the cost an upper producer seeds from: its input
+// path at that path's own cost, as PG's upper rels price cheapest_input_path
+// (create_distinct_paths, create_grouping_paths, create_ordered_paths). goopg's
+// Project wrapper is not a node there: apply_scanjoin_target_to_paths applies
+// the target to the scan/join paths themselves (dummypp). So the stamped
+// search node is read through the Projects, as limitInputPath does for
+// create_limit_path. The legacy display estimate, which charges a Project per
+// row, is only the fallback for an input the search did not build
+// (M0146-0210/0211). The found node's own initPlan charge is kept; it is zero
+// while upper paths are being priced (chargeInitPlans runs at Plan()'s tail).
+func upperInputPathCost(child Node) PlanCost {
+	n := child
+	for {
+		p, isProj := n.(*Project)
+		if !isProj || p.Child == nil {
+			break
+		}
+		n = p.Child
+	}
+	if c, ok := n.(PlanCostCarrier); ok && n != child {
+		if pc, set := c.PlanCostInfo(); set && !pc.PerWorker && pc.PlanRows > 0 {
+			return withInitPlanCharge(n, pc)
+		}
+	}
+	return legacyDisplayCostOf(child)
+}
+
 // limitInputRows is the row count a Limit reads: its input path's rows
 // (the count create_limit_path adjusts), else the legacy estimate.
 func limitInputRows(child Node) int64 {
@@ -137,7 +164,13 @@ func EstimateRows(n Node) int64 {
 	case *Sort:
 		return EstimateRows(x.Child)
 	case *IncrementalSort:
-		return EstimateRows(x.Child)
+		// M0146-0149: cost_incremental_sort's path->rows is its input
+		// clamped to two (costsize.c), and the plan node's rows are the
+		// path's — the twin of incrementalSortPathOver's Rows.
+		if r := EstimateRows(x.Child); r >= 2 {
+			return r
+		}
+		return 2
 	case *Project:
 		return EstimateRows(x.Child)
 	case *Distinct:
@@ -202,9 +235,21 @@ func EstimateRows(n Node) int64 {
 	case *Gather:
 		// Total-row estimate; the per-worker division PG shows under a
 		// Gather is a cost-model concern (the 0077 line), not a
-		// cardinality one.
+		// cardinality one. A Gather the path search built carries its
+		// path's rows, compute_gather_rows (per-worker rows × the parallel
+		// divisor, costsize.c:6625), which create_gather_plan copies into
+		// plan_rows; every reader above it sees that count (M0146-0210:
+		// TPC-DS Q54's 1 row per worker × 1.7 = 2, which sizes the DISTINCT
+		// above it). Re-estimating the child instead reads its per-worker
+		// rows.
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return EstimateRows(x.Child)
 	case *GatherMerge:
+		if r, ok := stampedUpperRows(&x.PlanCost); ok {
+			return r
+		}
 		return EstimateRows(x.Child)
 	case *LockRows:
 		return EstimateRows(x.Child)
@@ -957,6 +1002,19 @@ type baseRelInfo struct {
 	// fillable); it also kept the retired `outer-over-derived` firewall's
 	// `leafIsDerivedInput` from reading the nil `table` as "no statistics".
 	isSemiAntiSyntheticLeaf bool
+	// subproblemAlts builds a searched sub-problem leaf's ordered runner-up
+	// trees (M0146-0148): make_rel_from_joinlist hands the enclosing search
+	// the sub-problem's whole RelOptInfo, so every path it kept is a
+	// candidate there, not only the cheapest. Nil for any other leaf.
+	subproblemAlts func() []Node
+	// subproblemBaseRows records, for a searched sub-problem leaf, the row
+	// count its own search gave each base relation inside it, keyed by
+	// source table (ColumnRef.SourceTableIdx). Nested sub-problems' entries
+	// are merged in. PG keeps a sub-joinlist's result as a joinrel whose
+	// base relids stay visible, so get_loop_count (indxpath.c) still reads a
+	// base relation's own rows for a probe parameterized by one of its
+	// columns (M0146-0222). Nil for any other leaf.
+	subproblemBaseRows map[int16]float64
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist

@@ -1,0 +1,31 @@
+[ea] building /home/ryo/work/goopg/goopg/tmp/c20a/goopg-ea
+[ea] starting goopg on 127.0.0.1:5534 (data /home/ryo/work/goopg/goopg/tmp/c20a/data-sf025, cgroup goopg-ea-ratchet)
+[ea] ANALYZE
+[ea]   relations with reltuples > 0: 56
+[ea] capture done: 8025 lines; non-zero psql rc: none
+capture:   /home/ryo/work/goopg/goopg/tmp/c20a/ea-capture.txt
+pg plans:  /home/ryo/work/goopg/goopg/bench/tpcds/plans-pg
+queries:   99   nodes scored: 265   unmatched-in-PG: 7
+bar:       qerr > max(10.0, PG_qerr * 2.0)
+FINDINGS:  1
+
+    Q       qerr    goopg est     ACTUAL     pg est    pg qerr  node                   relset
+---------------------------------------------------------------------------------------------
+  Q78       87.7         1403     123049          -          -  Merge Left Join        date_dim+store_returns+store_sales+web_returns+web_sales
+
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 9   current: 1
+  FIXED    Q14:catalog_sales+cte:cross_items
+  FIXED    Q14:catalog_sales+cte:cross_items+date_dim
+  FIXED    Q14:cte:cross_items+date_dim+store_sales
+  FIXED    Q14:cte:cross_items+date_dim+web_sales
+  FIXED    Q14:cte:cross_items+store_sales
+  FIXED    Q14:cte:cross_items+web_sales
+  FIXED    Q23:catalog_sales+cte:frequent_ss_items
+  FIXED    Q23:cte:frequent_ss_items+web_sales
+
+EA-RATCHET: PASS (8 fixed — re-pin the baseline)
+
+real	4m6.503s
+user	7m46.969s
+sys	0m22.858s

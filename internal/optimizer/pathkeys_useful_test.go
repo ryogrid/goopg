@@ -59,3 +59,46 @@ func TestPathkeyUsefulnessForCrossingClass(t *testing.T) {
 		t.Fatalf("a class wholly inside the joinrel is not merge-useful: got %d", n)
 	}
 }
+
+// TestTruncateUselessPathkeysGroupingAndDistinct pins M0146-0223's
+// pathkeys_useful_for_grouping / _for_distinct: a join ordered on a group key
+// that is not the leading one keeps that key, matched by equivalence class
+// (TPC-DS Q39's inv ⋈ item merge join ordered on inv_item_sk under
+// GROUP BY w_warehouse_sk, i_item_sk, d_moy); a non-member stops the count,
+// and the direction must agree.
+func TestTruncateUselessPathkeysGroupingAndDistinct(t *testing.T) {
+	invItem := &ColumnRef{Index: 0, Name: "inv_item_sk"}
+	iItem := &ColumnRef{Index: 1, Name: "i_item_sk"}
+	wh := &ColumnRef{Index: 2, Name: "w_warehouse_sk"}
+	moy := &ColumnRef{Index: 3, Name: "d_moy"}
+	other := &ColumnRef{Index: 4, Name: "x"}
+	s := &searchCtx{
+		clauses: &restrictInfoList{
+			nclasses: 1,
+			all: []*restrictInfo{
+				{isEquijoin: true, leftKey: invItem, rightKey: iItem, leftRelids: relsetOf(0), rightRelids: relsetOf(1), ecID: 0},
+			},
+		},
+		groupPathkeys: []PathKey{{Expr: wh, SortAsc: true}, {Expr: iItem, SortAsc: true}, {Expr: moy, SortAsc: true}},
+	}
+	u := s.pathkeyUsefulnessFor(relsetOf(0, 1))
+	keys := []PathKey{{Expr: invItem, SortAsc: true}, {Expr: moy, SortAsc: true}, {Expr: other, SortAsc: true}}
+	if got := truncateUselessPathkeys(u, keys); len(got) != 2 {
+		t.Fatalf("group members inv_item_sk (by class), d_moy: got %d keys, want 2", len(got))
+	}
+	// The class is matched wherever it is enforced: a rel holding only
+	// inventory still keeps its inv_item_sk order for the group key i_item_sk.
+	if got := truncateUselessPathkeys(s.pathkeyUsefulnessFor(relsetOf(0, 2)), keys[:1]); len(got) != 1 {
+		t.Fatalf("class membership outside the rel: got %d keys, want 1", len(got))
+	}
+	if got := truncateUselessPathkeys(u, []PathKey{{Expr: other, SortAsc: true}, {Expr: moy, SortAsc: true}}); got != nil {
+		t.Fatalf("a leading non-member stops the count, got %d keys", len(got))
+	}
+	if got := truncateUselessPathkeys(u, []PathKey{{Expr: moy, SortAsc: false}}); got != nil {
+		t.Fatalf("a descending key is not a member of an ascending group list, got %d keys", len(got))
+	}
+	d := &pathkeyUsefulness{distinctPathkeys: []PathKey{{Expr: other, SortAsc: true}, {Expr: moy, SortAsc: true}}}
+	if got := truncateUselessPathkeys(d, []PathKey{{Expr: moy, SortAsc: true}, {Expr: other, SortAsc: true}}); len(got) != 2 {
+		t.Fatalf("distinct members in any order: got %d keys, want 2", len(got))
+	}
+}

@@ -1,0 +1,15 @@
+FIRE-SET: baseline=93d363d570342f99be0844980259d7196c3ce4ef (250d5568ee7a) candidate=worktree (bd4840fd82fe)
+# diff m0176b-tpcds-sf025-baseline (goopg tmp/m0176-fireset2/tpcds-sf025/m0176b-tpcds-sf025-baseline.plans.txt vs pg tmp/m0176-fireset2/tpcds-sf025/m0176b-tpcds-sf025-baseline-pg.plans.txt)
+PLAN-PARITY: queries=99 match=72 shapediff=27 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=21 join-method=12 scan-type=10 parameterisation=12 aggregation-strategy=5 sort-strategy=13 parallelism=14 qual-placement=4 rendering=1
+# diff m0176b-tpcds-sf025-candidate (goopg tmp/m0176-fireset2/tpcds-sf025/m0176b-tpcds-sf025-candidate.plans.txt vs pg tmp/m0176-fireset2/tpcds-sf025/m0176b-tpcds-sf025-candidate-pg.plans.txt)
+PLAN-PARITY: queries=99 match=74 shapediff=25 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=19 join-method=10 scan-type=8 parameterisation=11 aggregation-strategy=5 sort-strategy=13 parallelism=13 qual-placement=4 rendering=1
+FIRE-SET-TIMEOUTS: fires=Q32 Q92 introduced=none unchanged=none missing=none
+# diff m0176b-tpcds-sf1-baseline (goopg tmp/m0176-fireset2/tpcds-sf1/m0176b-tpcds-sf1-baseline.plans.txt vs pg tmp/m0176-fireset2/tpcds-sf1/m0176b-tpcds-sf1-baseline-pg.plans.txt)
+PLAN-PARITY: queries=99 match=46 shapediff=53 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=43 join-method=22 scan-type=25 parameterisation=25 aggregation-strategy=9 sort-strategy=24 parallelism=40 qual-placement=9 rendering=3
+# diff m0176b-tpcds-sf1-candidate (goopg tmp/m0176-fireset2/tpcds-sf1/m0176b-tpcds-sf1-candidate.plans.txt vs pg tmp/m0176-fireset2/tpcds-sf1/m0176b-tpcds-sf1-candidate-pg.plans.txt)
+PLAN-PARITY: queries=99 match=46 shapediff=53 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=43 join-method=20 scan-type=23 parameterisation=25 aggregation-strategy=9 sort-strategy=24 parallelism=38 qual-placement=9 rendering=3
+FIRE-SET-TIMEOUTS: fires=Q32 Q92 introduced=none unchanged=none missing=none

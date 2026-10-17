@@ -1,0 +1,26 @@
+M0209 GM useful nkeys=1 sub(startup=2101.6977 total=2128.1677 rows=10588.00) gm(startup=3101.7077 total=5153.1777 rows=18000.00) cheapestpartial(total=1393.8824 rows=10588.00)
+M0209 GM useful nkeys=1 sub(startup=76786.5967 total=77687.5642 rows=360387.00) gm(startup=77786.6547 total=250389.8862 rows=1441548.00) cheapestpartial(total=43524.3407 rows=360387.00)
+M0209 GM useful nkeys=1 sub(startup=77143.9847 total=77207.3922 rows=25363.00) gm(startup=78144.0428 total=90291.2424 rows=101451.00) cheapestpartial(total=75288.6258 rows=25363.00)
+M0209 GM useful nkeys=1 sub(startup=63452.6299 total=63888.7349 rows=174442.00) gm(startup=64452.6879 total=147999.5694 rows=697767.00) cheapestpartial(total=48265.3710 rows=174442.00)
+M0209 GM useful nkeys=1 sub(startup=44608.0990 total=44612.5540 rows=1782.00) gm(startup=45608.1570 total=46461.7447 rows=7129.00) cheapestpartial(total=44511.8774 rows=1782.00)
+M0209 GM useful nkeys=1 sub(startup=80437.7955 total=80468.4855 rows=12276.00) gm(startup=81437.8536 total=87317.5416 rows=49106.00) cheapestpartial(total=79604.0370 rows=12276.00)
+M0209 GM useful nkeys=1 sub(startup=44941.0652 total=44941.3802 rows=126.00) gm(startup=45941.1232 total=46001.2313 rows=502.00) cheapestpartial(total=44936.6695 rows=126.00)
+M0209 GM useful nkeys=1 sub(startup=89466.9469 total=89888.1944 rows=168499.00) gm(startup=90467.0050 total=171167.6737 rows=673996.00) cheapestpartial(total=74839.2282 rows=168499.00)
+M0209 GM useful nkeys=4 sub(startup=52535.3164 total=52619.2664 rows=33580.00) gm(startup=53535.3745 total=69618.1314 rows=134320.00) cheapestpartial(total=50010.8871 rows=33580.00)
+M0209 GM useful nkeys=1 sub(startup=44851.7200 total=44853.8775 rows=863.00) gm(startup=45851.7780 total=46264.9829 rows=3451.00) cheapestpartial(total=44809.6349 rows=863.00)
+M0209 GM useful nkeys=1 sub(startup=91215.8460 total=91245.4910 rows=11858.00) gm(startup=92215.9040 total=97895.2766 rows=47433.00) cheapestpartial(total=90413.4404 rows=11858.00)
+M0209 GM useful nkeys=4 sub(startup=66896.9257 total=66902.8332 rows=2363.00) gm(startup=67896.9838 total=69028.8347 rows=9453.00) cheapestpartial(total=66764.5220 rows=2363.00)
+M0209 GM useful nkeys=1 sub(startup=44959.5257 total=44959.6782 rows=61.00) gm(startup=45959.5838 total=45988.6799 rows=243.00) cheapestpartial(total=44957.7168 rows=61.00)
+M0209 GM useful nkeys=4 sub(startup=57280.5037 total=57361.5937 rows=32436.00) gm(startup=58280.5618 total=73815.4130 rows=129744.00) cheapestpartial(total=54850.1864 rows=32436.00)
+M0209 GM useful nkeys=1 sub(startup=45600.7586 total=45602.8411 rows=833.00) gm(startup=46600.8167 total=46999.8916 rows=3333.00) cheapestpartial(total=45560.3491 rows=833.00)
+M0209 GM useful nkeys=4 sub(startup=44961.6887 total=44962.1037 rows=166.00) gm(startup=45961.7468 total=46041.2506 rows=664.00) cheapestpartial(total=44955.5674 rows=166.00)
+M0209 GM useful nkeys=4 sub(startup=68948.0854 total=68953.7929 rows=2283.00) gm(startup=69948.1434 total=71041.4411 rows=9131.00) cheapestpartial(total=68820.7315 rows=2283.00)
+M0209 GM useful nkeys=1 sub(startup=45012.5526 total=45012.7001 rows=59.00) gm(startup=46012.6107 total=46040.7490 rows=235.00) cheapestpartial(total=45010.8173 rows=59.00)
+M0209 GM useful nkeys=4 sub(startup=44968.3293 total=44968.3593 rows=12.00) gm(startup=45968.3873 total=45974.0155 rows=47.00) cheapestpartial(total=44968.1142 rows=12.00)
+M0209 GM useful nkeys=4 sub(startup=45105.7557 total=45106.1557 rows=160.00) gm(startup=46105.8138 total=46182.6821 rows=642.00) cheapestpartial(total=45099.8982 rows=160.00)
+M0209 GM useful nkeys=4 sub(startup=44978.5632 total=44978.5907 rows=11.00) gm(startup=45978.6212 total=45984.0087 rows=45.00) cheapestpartial(total=44978.3729 rows=11.00)
+M0209 GSET input path type=303 startup=45984.1086 total=45984.2211 rows=45.00 sorted=1
+M0209 GSET input path type=301 startup=45962.6018 total=46431.4184 rows=45.00 sorted=1
+M0209 GSET input path type=304 startup=7338.4179 total=63284.7922 rows=45.00 sorted=1
+M0209 GSET input path type=304 startup=8883.4740 total=263187.3979 rows=45.00 sorted=1
+M0209 GSET input path type=296 startup=2965.5250 total=45982.8729 rows=45.00 sorted=0

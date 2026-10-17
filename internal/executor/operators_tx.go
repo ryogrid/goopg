@@ -357,7 +357,9 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	} else {
 		_ = ctx.Catalog.DropTable(entry.Name, dbOid)
 	}
-	if ctx.Pool != nil {
+	// A scheduled relation's storage goes after the abort record, which
+	// lists it (createdRelationStorage).
+	if ctx.Pool != nil && !entry.StorageScheduled {
 		ctx.Pool.InvalidateRel(rel)
 		_ = ctx.Pool.Manager().DropRelation(rel)
 	}
@@ -644,8 +646,8 @@ func (o *transactionOp) execRollbackTo() error {
 		}
 	}
 	// Restore catalog entries for DROP TABLEs performed inside the rolled-back
-	// savepoint. Physical files were already deleted (idempotent on re-drop).
-	// M0097-0023.
+	// savepoint. Their storage was only scheduled for removal under the
+	// now-aborted sub-XID, so it is kept (dropRelationStorage). M0097-0023.
 	newDepth := sess.SavepointDepth()
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)

@@ -13,13 +13,12 @@ package optimizer
 // `paramIndexScanCost` (pathparamindex.go) prices ONE bound probe off the
 // calibrated `indexProbeCost`, and it is deliberately not a scan model — 04 §1
 // forbids two independently-calibrated index cost models competing inside one
-// `addPath` comparison. This file is therefore the scan model, and it is tied
-// to the SAME calibration knob (`indexProbeCostMultiplier`) rather than to a
-// second one of its own: everywhere PG charges a RANDOM page fetch, goopg
-// charges the multiplier times that, because the multiplier exists precisely
-// because goopg's index access materialises eagerly and so runs slower than
-// `random_page_cost` predicts. Sequential fetches and CPU terms are PG-native,
-// since neither is what the multiplier was measured against.
+// `addPath` comparison. This file is therefore the scan model, and it shares
+// the probe's currency: everywhere PG charges a RANDOM page fetch, goopg
+// charges `random_page_cost`, as PG does. Until M0146-0159 both models carried
+// a goopg-only x2 calibration (`indexProbeCostMultiplier`) on their
+// random-page terms; it was retired for plan parity (owner decision
+// 2026-10-12, M0146-0068 Option A).
 //
 // BOTH `loop_count` arms are reproduced. The `loop_count > 1` arm prices a
 // parameterised path inside a nested loop and returns the cost of ONE
@@ -121,6 +120,13 @@ type indexScanInputs struct {
 	// (`btcostestimate`, selfuncs.c:7391-7577). 0 (unset) or 1 means a
 	// single descent and reproduces the pre-existing cost exactly.
 	numSAScans float64
+
+	// numIndexQuals is `list_length(indexQuals)` — the quals the index scan
+	// itself evaluates, one per clause the probe binds (a range's lower and
+	// upper bound are two). genericcostestimate charges `cpu_operator_cost`
+	// for each of them on every index tuple visited (`qual_op_cost`,
+	// selfuncs.c). 0 is a full-index scan with no index quals.
+	numIndexQuals float64
 
 	// boundSelectivity is the selectivity of `indexBoundQuals` alone —
 	// the quals PG counts toward `numIndexTuples`, which are a SUBSET of
@@ -263,7 +269,7 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 		pagesFetched := indexPagesFetched(tuplesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		randHeapPages = pagesFetched // costsize.c:609, the partial arm's heap figure
-		maxIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		maxIOCost = (pagesFetched * cp.randomPageCost) / in.loopCount
 
 		// The correlated bound applies the same formula one level up, at PAGE
 		// rather than tuple grain: each scan touches `selectivity * relPages`
@@ -271,18 +277,18 @@ func costIndexScanCore(cp costParams, in indexScanInputs, workers int) (cost Cos
 		pagesFetched = math.Ceil(in.selectivity * float64(in.relPages))
 		pagesFetched = indexPagesFetched(pagesFetched*in.loopCount, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
-		minIOCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		minIOCost = (pagesFetched * cp.randomPageCost) / in.loopCount
 	} else {
 		// max_IO_cost: the perfectly uncorrelated case (csquared = 0).
 		pagesFetched := indexPagesFetched(tuplesFetched, in.relPages, in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
 		pagesFetched = in.heapPagesAfterVM(pagesFetched)
 		randHeapPages = pagesFetched // costsize.c:657
-		maxIOCost = pagesFetched * cp.randomPageCost * indexProbeCostMultiplier
+		maxIOCost = pagesFetched * cp.randomPageCost
 
 		// min_IO_cost: the perfectly correlated case (csquared = 1). One random
 		// fetch, then sequential ones.
 		if correlatedPages := in.heapPagesAfterVM(math.Ceil(in.selectivity * float64(in.relPages))); correlatedPages > 0 {
-			minIOCost = cp.randomPageCost * indexProbeCostMultiplier
+			minIOCost = cp.randomPageCost
 			if correlatedPages > 1 {
 				minIOCost += (correlatedPages - 1) * cp.seqPageCost
 			}
@@ -374,17 +380,21 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 		numSA = math.Min(numSA, math.Ceil(in.indexPages/3))
 		numSA = math.Max(numSA, 1)
 	}
-	// `genericcostestimate` adjusts numIndexTuples to the PER-DESCENT count
-	// before sizing the page estimate and the tuple-CPU charge
-	// (selfuncs.c:7150 `numIndexTuples = rint(numIndexTuples / num_sa_scans)`):
+	// `btcostestimate` rounds numIndexTuples to the PER-DESCENT count
+	// (selfuncs.c:7740 `numIndexTuples = rint(numIndexTuples /
+	// num_sa_scans)`) on every non-unique path, a single descent included;
 	// num_sa_scans descents each see a 1/numSA slice of the matching tuples
 	// and pages. PG 18's skip arrays feed exactly this: distinct leading
-	// values × bounded suffix probes (M0146-0005v).
-	if numSA > 1 {
+	// values × bounded suffix probes (M0146-0005v). `genericcostestimate`
+	// then clamps the count to [1, index->tuples].
+	if !in.uniqueEqualityOnAllKeys {
 		numIndexTuples = math.RoundToEven(numIndexTuples / numSA)
-		if numIndexTuples < 1 {
-			numIndexTuples = 1
-		}
+	}
+	if numIndexTuples > in.indexTuples {
+		numIndexTuples = in.indexTuples
+	}
+	if numIndexTuples < 1 {
+		numIndexTuples = 1
 	}
 	numIndexPages := 1.0
 	if in.indexPages > 1 && in.indexTuples > 1 {
@@ -399,38 +409,50 @@ func btreeIndexAMCostPages(cp costParams, in indexScanInputs) (startup, total, i
 	// T = index size, "as if there were one tuple per page") and pro-rates
 	// the cost back to ONE execution by num_outer_scans = loopCount — never
 	// by numScans, since ScalarArrayOp repeats are internal to the scan.
-	// Index pages are random fetches, so the pro-rated cost carries goopg's
-	// probe calibration (see the file header) exactly as the heap bounds do.
-	// Gated on numScans, not loopCount, since numSA > 1 repeats scans at
-	// loopCount 1; the numScans <= 1 branch is the pre-existing arithmetic
-	// bit-identically. R59 (plan-parity-fix-take2).
-	numScans := numSA * in.loopCount
+	// Index pages are random fetches, priced like the heap bounds.
+	// num_outer_scans is cost_index's loop_count, which is 1 for an
+	// unparameterised path (get_loop_count); an unset loopCount is that 1, so
+	// an unparameterised SAOP or skip scan's numSA descents still take the
+	// repeated-scan arm (it used to multiply them by zero and charge one
+	// page). R59 (plan-parity-fix-take2), M0146-0172.
+	numOuterScans := in.loopCount
+	if numOuterScans < 1 {
+		numOuterScans = 1
+	}
+	numScans := numSA * numOuterScans
 	var indexPageCost float64
 	if numScans > 1 {
 		pagesFetched := indexPagesFetched(numIndexPages*numScans, int64(in.indexPages), in.indexPages, in.totalTablePages, cp.effectiveCacheSize)
-		indexPageCost = (pagesFetched * cp.randomPageCost * indexProbeCostMultiplier) / in.loopCount
+		indexPageCost = (pagesFetched * cp.randomPageCost) / numOuterScans
 	} else {
 		// A single index scan: spc_random_page_cost per page touched.
-		indexPageCost = numIndexPages * cp.randomPageCost * indexProbeCostMultiplier
+		indexPageCost = numIndexPages * cp.randomPageCost
 	}
 	total = indexPageCost
 	// Tuple-CPU is charged per descent — numIndexTuples is already the
 	// per-descent count, and PG multiplies it back by num_sa_scans
 	// (selfuncs.c:7268: `numIndexTuples * num_sa_scans *
-	// (cpu_index_tuple_cost + qual_op_cost)`).
-	total += numIndexTuples * numSA * cp.cpuIndexTupleCost
+	// (cpu_index_tuple_cost + qual_op_cost)`). qual_op_cost is one
+	// cpu_operator_cost per index qual, evaluated on every index tuple
+	// visited. (qual_arg_cost — the eval cost of the quals' non-index
+	// operands — is not charged: goopg's index keys are constants, Params
+	// and outer Vars, which cost nothing to evaluate.)
+	qualOpCost := cp.cpuOperatorCost * in.numIndexQuals
+	total += numIndexTuples * numSA * (cp.cpuIndexTupleCost + qualOpCost)
 
-	// The B-tree descent (selfuncs.c:7780): tree height plus the leaf page,
-	// at 50 cpu_operator_cost per page. Charged at startup as well as total —
-	// it is paid before the first tuple emerges, which is what makes an
-	// ordered index path's startup cost non-zero and therefore comparable
-	// against a sort's.
-	//
-	// With SAOP quals the descent is charged once per estimated descent
-	// (`btcostestimate`, selfuncs.c:7762-7782): once to startup, num_sa_scans
-	// times to total. P2-09b's remainder (the numIndexTuples/rint adjustment
-	// and the log2(N) descent term) stays out.
-	descent := float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
+	// The B-tree descent, charged at startup as well as total — it is paid
+	// before the first tuple emerges, which is what makes an ordered index
+	// path's startup cost non-zero and therefore comparable against a sort's.
+	// Two terms (btcostestimate, selfuncs.c:7762-7782), each once to startup
+	// and num_sa_scans times to total:
+	//   - about log2(N) comparisons to descend a btree of N index tuples, one
+	//     cpu_operator_cost each;
+	//   - tree height plus the leaf page, at 50 cpu_operator_cost per page.
+	var descent float64
+	if in.indexTuples > 1 {
+		descent = math.Ceil(math.Log(in.indexTuples)/math.Log(2.0)) * cp.cpuOperatorCost
+	}
+	descent += float64(in.treeHeight+1) * pageCPUMultiplier * cp.cpuOperatorCost
 	startup = descent
 	total += numSA * descent
 	return startup, total, numIndexPages
@@ -540,8 +562,9 @@ func indexCorrelationFor(idx *catalog.Index, stats *catalog.ColumnStats) float64
 // point is index-level catalog statistics, not a better formula.
 //
 // `relTuples` is the heap's pre-restriction row count; a B-tree has one entry
-// per live heap tuple, so it is also the index's tuple count.
-func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
+// per live heap tuple, so it is also the index's tuple count. cat locates the
+// index file (nil: the package-level default-database lookup).
+func estimateIndexGeometry(cat catalog.Catalog, idx *catalog.Index, tbl *catalog.Table, relTuples float64) (indexPages, indexTuples float64, treeHeight int) {
 	indexTuples = relTuples
 	if indexTuples < 1 {
 		indexTuples = 1
@@ -602,7 +625,12 @@ func estimateIndexGeometry(idx *catalog.Index, tbl *catalog.Table, relTuples flo
 	// real, which alone held the bitmap-vs-index probe choice on the wrong
 	// side of PG's (M0134-0183). `perPage` is re-derived from the real count
 	// so the tree-height estimate below reads the real fanout.
-	if real, ok := catalog.IndexRealPages(idx); ok && real > 0 {
+	//
+	// The file is found through cat, in the catalog's database, as PG sizes
+	// the index relation it opened (M0146-0178 slice 2): the package-level
+	// lookup put a DBOid-less index in database 1, missed the file in
+	// database 5, and priced the width guess instead.
+	if real, ok := catalog.IndexRealPagesIn(cat, idx); ok && real > 0 {
 		indexPages = float64(real)
 		if perPage < indexTuples/indexPages {
 			perPage = math.Ceil(indexTuples / indexPages)

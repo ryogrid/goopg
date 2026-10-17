@@ -249,3 +249,62 @@ func TestBgwriterMaxPagesLimit(t *testing.T) {
 		t.Errorf("WriteDirtyPages wrote %d pages, limit was %d", written, maxPerTick)
 	}
 }
+
+// TestBgwriterReloadedSettingsTakeEffect pins M0122-0008 slice 2:
+// bgwriter_delay and bgwriter_lru_maxpages are PGC_SIGHUP in PG 18.3, and a
+// reload reaches the running bgwriter. bgwriter_lru_maxpages = 0 stops the
+// writes; a shorter bgwriter_delay takes effect at once rather than after
+// the old sleep, as the SIGHUP latch wakes PG's bgwriter.
+func TestBgwriterReloadedSettingsTakeEffect(t *testing.T) {
+	const nPages = 10
+	pool, rel := newBgwriterPool(t, nPages+8)
+	seedPage := make(Page, BlockSize)
+	if err := InitPage(seedPage); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < nPages; i++ {
+		if _, err := pool.Manager().Extend(rel, seedPage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for blk := BlockNumber(0); blk < BlockNumber(nPages); blk++ {
+		slot, err := pool.Pin(BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			t.Fatalf("Pin %d: %v", blk, err)
+		}
+		pool.MarkDirty(slot)
+		pool.Unpin(slot)
+	}
+	dirty := func() int {
+		n := 0
+		for i := range pool.slots {
+			s := &pool.slots[i]
+			if s.isValid() && s.isDirty() {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Starts with a fast tick but no LRU writes.
+	bg := NewBgwriter(pool, 5*time.Millisecond, 0)
+	bg.Start()
+	defer bg.Stop()
+	time.Sleep(60 * time.Millisecond)
+	if n := dirty(); n != nPages {
+		t.Fatalf("bgwriter_lru_maxpages = 0 wrote pages: %d of %d still dirty", n, nPages)
+	}
+
+	// A one-hour delay, then a reload back to 5ms: the new delay must not
+	// wait out the hour.
+	bg.SetDelay(time.Hour)
+	bg.SetMaxPages(100)
+	bg.SetDelay(5 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for dirty() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := dirty(); n != 0 {
+		t.Errorf("reloaded bgwriter settings did not take effect: %d dirty pages remain", n)
+	}
+}

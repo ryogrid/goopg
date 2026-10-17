@@ -78,6 +78,11 @@ func c19fSettings() optimizer.PlannerSettings {
 	// M0146-0002's `parallel_hash = true` variant wins on these shapes when
 	// enabled; its own consumer check is TestParallelHashPathModelWinner.
 	ps.EnableParallelHash = false
+	// M0146-0193: a partial merge join may now sort its outer per worker,
+	// and on this fixture it is within the fuzz of the hash join with
+	// better pathkeys, so add_partial_path keeps it, as PG would. The
+	// subject here is the hash join's executor, so merge is turned off.
+	ps.EnableMergeJoin = false
 	ps.MinParallelTableScanSize = 1
 	ps.MinParallelIndexScanSize = 1
 	ps.MaxParallelWorkersPerGather = 4

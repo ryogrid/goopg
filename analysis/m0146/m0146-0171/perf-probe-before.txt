@@ -1,0 +1,14 @@
+    21.24%  [.] github.com/goopg/goopg/internal/executor.decodeRowRangeInfo
+     6.62%  [.] github.com/goopg/goopg/internal/storage.parseHeapTupleAlias
+     6.34%  [.] github.com/goopg/goopg/internal/access/nbtree.deformPGIndexTupleInto[go.shape.struct { github.com/goopg/goopg/internal/acces
+     4.91%  [.] github.com/goopg/goopg/internal/access/nbtree.comparePGIndexTuples
+     4.70%  [.] github.com/goopg/goopg/internal/executor.evalExprSlot
+     3.96%  [.] github.com/goopg/goopg/internal/storage.PagePruneXIDSet
+     3.68%  [.] github.com/goopg/goopg/internal/storage.(*Pool).Pin
+     3.39%  [.] github.com/goopg/goopg/internal/executor.(*indexScanOp).Next
+     2.83%  [.] runtime.memmove
+     2.73%  [.] github.com/goopg/goopg/internal/executor.decodePhysicalPGValueLowered
+     1.95%  [.] github.com/goopg/goopg/internal/access/nbtree.isPostingRaw
+     1.89%  [.] github.com/goopg/goopg/internal/storage.readItemID
+     1.86%  [.] github.com/goopg/goopg/internal/storage.(*bufmap).Lookup
+     1.76%  [.] runtime.mallocgcSmallScanNoHeader

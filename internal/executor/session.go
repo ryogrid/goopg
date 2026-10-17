@@ -58,6 +58,10 @@ type DDLUndoEntry struct {
 	// via InMemory.RegisterTable instead of leaving the slot empty, mirroring
 	// the TempTableShadows precedent (operators_ddl.go).
 	ShadowedTable *catalog.Table
+	// StorageScheduled marks a relation whose storage the transaction
+	// manager removes after the abort record (createdRelationStorage), so
+	// ROLLBACK leaves the file alone here.
+	StorageScheduled bool
 }
 
 // DDLDropUndoEntry records a DROP TABLE performed inside an active savepoint

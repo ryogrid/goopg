@@ -287,6 +287,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		if err != nil {
 			return s.writeQueryError(w, errcodes.SystemError, err.Error())
 		}
+		// The GUC side of this autocommit transaction (AtStart_GUC /
+		// AtEOXact_GUC): SET LOCAL and set_config(..., true) values last
+		// until the message ends, and an aborted message undoes its plain
+		// SETs. A message of more than one statement runs in PG's implicit
+		// transaction block (exec_simple_query use_implicit_block), where SET
+		// LOCAL draws no warning. Ended before ReadyForQuery on commit (so
+		// any ParameterStatus precedes it) and in the defer below on abort.
+		sess.BeginImplicitTransaction(len(stmts) > 1)
 	}
 	// Each Query message gets a fresh BackendID for the lock
 	// manager; the youngest-backend victim policy from M0012-0002
@@ -305,6 +313,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	// catalog (M0110-0001 DU-002 slice 444 deferral, 2026-07-04).
 	var ectx *executor.Context
 	defer func() {
+		sess.EndImplicitTransaction(commit)
 		if autoCommit && !commit {
 			if ectx != nil {
 				if bs, ok := ectx.Session.(*executor.BasicSession); ok {
@@ -495,6 +504,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
+	if s.cfg.WalSummarizer != nil {
+		ectx.WalSummarizerState = s.walSummarizerStatus
+	}
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
 	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)
@@ -515,6 +527,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
+		ectx.PushFunctionConfig = sessionPushFunctionConfig(sess)
+		ectx.PushSessionRole = func(role string) func() {
+			sess.PushRole(role)
+			return sess.PopRole
+		}
+		ectx.CheckSetPrivilege = sess.CheckSetPrivilege
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
 			out := make([]executor.SettingValue, 0, len(all))
@@ -541,7 +559,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.AlterSystem = func(name, value string, set, resetAll bool) error {
+			return sess.AlterSystem(s.cfg.DataDir, name, value, set, resetAll)
+		}
+		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.InTransactionBlock = sess.InTransactionBlock
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
@@ -818,14 +841,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
 			if prepStmts != nil && ps.Name != "" && ps.Query != nil {
-				// Validate declared parameter types.
-				for _, pt := range ps.ParamTypes {
-					if !isValidSQLTypeName(pt) {
-						return s.writeQueryError(w, "42704",
-							fmt.Sprintf("type %q does not exist", pt))
+				// Resolve the declared parameter types (typenameTypeId): a
+				// schema qualifier is checked and resolved away, user and
+				// table row types are accepted. M0122-0015c.
+				var declared []string
+				if ps.ParamTypes != nil {
+					declared = make([]string, len(ps.ParamTypes))
+					for k, pt := range ps.ParamTypes {
+						resolved, rerr := executor.ResolvePrepareParamType(ectx, pt, isValidSQLTypeName)
+						if rerr != nil {
+							return s.writeQueryError(w, errcodes.Code(rerr.Code), rerr.Message)
+						}
+						declared[k] = resolved
 					}
 				}
-				if ok := prepStmts.Store(ps.Name, ps.Query, stmtSQL(sql, stmts, i), ps.ParamTypes); !ok {
+				if ok := prepStmts.Store(ps.Name, ps.Query, stmtSQL(sql, stmts, i), declared); !ok {
 					return s.writeQueryError(w, "42P05",
 						fmt.Sprintf("prepared statement %q already exists", ps.Name))
 				}
@@ -844,7 +874,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 						}
 					}
 					// Infer parameter types from comparison contexts.
-					inferred := inferParamTypesFromStmt(ps.Query, ectx.Catalog, ps.ParamTypes)
+					inferred := inferParamTypesFromStmt(ps.Query, ectx.Catalog, declared)
 					if inferred != nil {
 						prepStmts.SetParamTypes(ps.Name, inferred)
 					}
@@ -1368,6 +1398,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
+		sess.EndImplicitTransaction(true)
 		// Forced GC only helps after a transaction that actually wrote (a
 		// read-only SELECT produces no retained heap worth a GC round). Gate
 		// on the write-XID predicate so pgbench -S never pays even the atomic
@@ -1412,7 +1443,7 @@ func sessionStatsTarget(sess *misc.SessionRegistry) int {
 // sessionWorkMem reads the effective `work_mem` GUC from the session
 // registry and returns it as bytes. Returns 0 (unlimited) when sess
 // is nil or the value can't be parsed.
-// sessionOpportunisticPrune reads the enable_opportunistic_prune GUC
+// sessionOpportunisticPrune reads the goopg.enable_opportunistic_prune GUC
 // (M0046-0002). Returns true (enabled) when sess is nil or the GUC value
 // can't be parsed, matching the BootVal "on" default.
 // sessionFreezeMinAge reads vacuum_freeze_min_age (M0046-0005).
@@ -1472,7 +1503,7 @@ func sessionOpportunisticPrune(sess *misc.SessionRegistry) bool {
 	if sess == nil {
 		return true // default on
 	}
-	_, eff, ok := sess.Get("enable_opportunistic_prune")
+	_, eff, ok := sess.Get(misc.GoopgEnableOpportunisticPrune)
 	if !ok {
 		return true // GUC not registered yet, default on
 	}
@@ -1534,6 +1565,7 @@ func applyParallelPostPassFrom(node optimizer.Node, get func(string) (string, bo
 		DebugParallelQuery:  debugParallelQueryFrom(get),
 		IsSerializable:      ectx.Tx.Isolation == transam.IsolationSerializable,
 		BlocksForTable:      parallelBlocksForTable(ectx),
+		BlocksForIndex:      parallelBlocksForIndex(ectx),
 	})
 }
 
@@ -1550,6 +1582,26 @@ func parallelBlocksForTable(ectx *executor.Context) func(*catalog.Table) (int64,
 		return nil
 	}
 	return parallelBlocksForTableFrom(ectx.Pool, ectx.Catalog)
+}
+
+// parallelBlocksForIndex is BlocksForTable's index sibling: an index-only
+// scan's worker count is sized on the index (compute_parallel_worker takes
+// index->pages), read where the session's catalog places the index file
+// (M0146-0178) — never through pool.NBlocks, which would create a missing
+// fork.
+func parallelBlocksForIndex(ectx *executor.Context) func(*catalog.Index) (int64, bool) {
+	if ectx == nil {
+		return nil
+	}
+	return parallelBlocksForIndexFrom(ectx.Catalog)
+}
+
+// parallelBlocksForIndexFrom is the catalog form, for the extended protocol.
+func parallelBlocksForIndexFrom(cat catalog.Catalog) func(*catalog.Index) (int64, bool) {
+	if cat == nil {
+		return nil
+	}
+	return func(idx *catalog.Index) (int64, bool) { return catalog.IndexRealPagesIn(cat, idx) }
 }
 
 // parallelBlocksForTableFrom is the pool/catalog form, for the extended
@@ -1956,7 +2008,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
-	readBool("enable_nestloop_index", &ps.EnableNestLoopIndex)
+	readBool(misc.GoopgEnableNestLoopIndex, &ps.EnableNestLoopIndex)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("geqo", &ps.Geqo)
@@ -2024,13 +2076,20 @@ const blockSizeBytesForPlanner = 8192
 // through `PlannerSettings` into the key. The inputs that are not session GUCs
 // — the transaction's isolation level, and the statement-shape refusals — are
 // enforced after the lookup by `optimizer.StripGather`.
+//
+// The search path closes the key: a cached plan has its unqualified names
+// already bound to relations, and `SET search_path = s1, public` must not be
+// served the plan another session (or this one, earlier) bound to public.t.
+// PostgreSQL's plancache replans for the same reason when
+// SearchPathMatchesCurrentEnvironment fails. M0146-0155.
 func sessionPlannerFingerprint(sess *misc.SessionRegistry) string {
 	ps := sessionPlannerSettings(sess)
 	return plannerCacheFingerprint(ps,
 		sessionScanToggleOff(sess, "enable_seqscan"),
 		sessionScanToggleOff(sess, "enable_indexscan"),
 		sessionScanToggleOff(sess, "enable_bitmapscan"),
-		sessionScanToggleOff(sess, "enable_indexonlyscan"))
+		sessionScanToggleOff(sess, "enable_indexonlyscan")) +
+		"\x1f" + strings.Join(searchPathSchemas(sess), ",")
 }
 
 // plannerCacheFingerprint formats every planner input the cache key must
@@ -2102,6 +2161,19 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(disableIndexOnlyScan),
 	}
 	return strings.Join(fields, "\x1f")
+}
+
+// sessionPushFunctionConfig is the executor's PushFunctionConfig over the
+// connection's SessionRegistry: a routine's SET clauses, applied in a GUC
+// nest level that the returned pop closes (fmgr_security_definer).
+func sessionPushFunctionConfig(sess *misc.SessionRegistry) func(config []string) (func(), error) {
+	return func(config []string) (func(), error) {
+		level, err := sess.PushSaveLevel(config)
+		if err != nil {
+			return nil, err
+		}
+		return func() { sess.PopSaveLevel(level) }, nil
+	}
 }
 
 func sessionPlanCatalog(sess *misc.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
@@ -2395,7 +2467,7 @@ func (s *Server) registerCompatNoopSchema(sql string, actingRole, sessionUser st
 	if schemaName == "" {
 		return nil
 	}
-	s.cfg.Catalog.RegisterSchema(schemaName)
+	s.cfg.Catalog.RegisterSchema(schemaName, catalog.NamespaceDBOid(s.currentDatabaseOidForCompat()))
 	// B1.1: persist via a real pg_namespace heap row (frozen-xid variant —
 	// this branch handles CREATE SCHEMA forms the parser rejects and runs
 	// without a live transaction). The parsed CompatNoopStmt path journals
@@ -4159,6 +4231,8 @@ func utilityTag(stmt parser.Stmt) string {
 		return "SET CONSTRAINTS"
 	case *parser.ResetStmt:
 		return "RESET"
+	case *parser.AlterSystemStmt:
+		return "ALTER SYSTEM"
 	case *parser.DiscardStmt:
 		// cmdtaglist.h tags each target: DISCARD ALL / PLANS / SEQUENCES /
 		// TEMP (TEMPORARY is parsed as TEMP).

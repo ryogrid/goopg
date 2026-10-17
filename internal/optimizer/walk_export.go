@@ -9,6 +9,13 @@ package optimizer
 // callers that need that recurse explicitly on the sublink node.
 func WalkPlanExprs(n Node, fn func(Expr)) { walkPlanExprs(n, fn) }
 
+// WalkPlanExprsDeep is WalkPlanExprs that also descends into every
+// sublink's inner Plan, at any depth. The executor's worker launch uses it
+// to find every initplan a worker could reach (M0146-0192).
+func WalkPlanExprsDeep(n Node, fn func(Expr)) {
+	walkPlanExprsDeep(n, 0, func(e Expr, _ int) { fn(e) })
+}
+
 // WalkExprTree invokes fn on e and every sub-expression beneath it.
 // Same sublink caveat as WalkPlanExprs.
 func WalkExprTree(e Expr, fn func(Expr)) { walkExprTree(e, fn) }
@@ -231,6 +238,7 @@ func nodeOwnExprs(n Node) []Expr {
 			exprs = append(exprs, t.Key)
 		}
 		exprs = append(exprs, t.Keys...)
+		exprs = append(exprs, t.SAOPKeys...)
 		exprs = append(exprs, t.RangePrefix...)
 		if t.LowKey != nil {
 			exprs = append(exprs, t.LowKey)
@@ -394,6 +402,8 @@ func nodeOwnExprs(n Node) []Expr {
 			exprs = append(exprs, t.Type)
 		}
 	case *PgGetSequenceData:
+		exprs = append(exprs, t.Args...)
+	case *PgWalSummaryContents:
 		exprs = append(exprs, t.Args...)
 	case *PgOptionsToTable:
 		if t.Arg != nil {

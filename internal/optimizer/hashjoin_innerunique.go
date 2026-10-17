@@ -11,9 +11,7 @@ import (
 // decided while the join clause and base-relation provenance are still in
 // scope.  Its zero value deliberately selects the old non-unique bucket walk.
 //
-// Goopg covers the INNER case and SEMI / ANTI.  A LEFT join with a unique
-// inner takes the same branch in PG (over its non-pushed-down join quals) and
-// is not ported yet.
+// Goopg covers SEMI / ANTI and every join type innerUniqueJoinType admits.
 type hashJoinFinalCostInput struct {
 	innerUnique bool
 	// earlyExit is PG's `jointype == JOIN_SEMI || jointype == JOIN_ANTI` half
@@ -75,13 +73,33 @@ func (s *searchCtx) hashJoinFinalCostInputFor(joinrel, outer, inner *RelOptInfo,
 		approx *= cs
 	}
 	base := hashJoinFinalCostInput{hashClauseSel: clampSelectivity(approx)}
-	if jt != parser.JoinInner || joinrel == nil || outer == nil || outer.Rows <= 0 ||
+	if !innerUniqueJoinType(jt) || joinrel == nil || outer == nil || outer.Rows <= 0 ||
 		!s.innerRelProvenUnique(outer, inner, keys, false) {
 		return base
 	}
 	base.innerUnique = true
 	base.outerMatchFrac, base.matchCount = s.innerUniqueMatchFactors(inner, clauses)
 	return base
+}
+
+// innerUniqueJoinType reports whether add_paths_to_joinrel (joinpath.c)
+// asks innerrel_is_unique for jt: every join type its switch sends to the
+// default arm — INNER and the outer joins, LEFT / RIGHT / FULL — where the
+// proof runs over the join's own (not pushed-down) clauses. SEMI and ANTI
+// take the early-exit branch by join type instead, and goopg's RIGHT_SEMI /
+// RIGHT_ANTI orientations stay on the generic bucket walk (ledgered).
+//
+// M0146-0183: the outer joins were missing, so TPC-DS Q5's `web_returns LEFT
+// JOIN web_sales` on (item_sk, order_number) — a Hash Right Join building the
+// unique web_returns — was priced by the generic walk: about 4049 above its
+// inputs where PG's inner-unique branch adds 945 (its unmatched-probe term,
+// 0.005 x 179956 x 0.05, is 44.99 of that).
+func innerUniqueJoinType(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinInner, parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+		return true
+	}
+	return false
 }
 
 // innerRelProvenUnique is the fail-closed half of PG's innerrel_is_unique
@@ -336,4 +354,26 @@ func prunedGroupKeysEquated(agg *Aggregate, equated map[int]bool) bool {
 		}
 	}
 	return true
+}
+
+// extraInnerUnique is add_paths_to_joinrel's extra->inner_unique
+// (joinpath.c:152-179) for one ordered pair:
+//   - false for SEMI and ANTI joins;
+//   - for JOIN_UNIQUE_INNER, true when the semijoin's min_lefthand lies
+//     inside the outer rel;
+//   - otherwise innerrel_is_unique over the pair's join clauses. jt is
+//     already INNER when a side is unique-ified, as JOIN_UNIQUE_OUTER passes
+//     JOIN_INNER.
+//
+// get_memoize_path reads it (M0146-0222). The cost paths read their own
+// fail-closed variant (innerUniqueMatchFactors' caller in joinpaths.go).
+func (s *searchCtx) extraInnerUnique(outer, inner *RelOptInfo, jt parser.JoinType, clauses []*restrictInfo,
+	uniq uniqueSide, sjinfo *SpecialJoinInfo) bool {
+	if uniq == uniqueSideInner {
+		return sjinfo != nil && relsSubset(sjinfo.MinLefthand, outer.Relids)
+	}
+	if !innerUniqueJoinType(jt) {
+		return false
+	}
+	return s.innerRelProvenUnique(outer, inner, clauses, true)
 }

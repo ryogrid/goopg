@@ -155,6 +155,15 @@ func deriveQueryPathkeys(s *parser.SelectStmt, ctx *resolveContext) []PathKey {
 	return chooseQueryPathkeys(deriveQueryPathkeySets(s, ctx))
 }
 
+// setQueryPathkeys stamps ctx with `query_pathkeys` and the two lists
+// truncate_useless_pathkeys reads beside it, `group_pathkeys` and
+// `distinct_pathkeys` (M0146-0223).
+func (ctx *resolveContext) setQueryPathkeys(s *parser.SelectStmt) {
+	sets := deriveQueryPathkeySets(s, ctx)
+	ctx.queryPathkeys = chooseQueryPathkeys(sets)
+	ctx.groupPathkeys, ctx.distinctPathkeys = sets.group, sets.distinct
+}
+
 // deriveQueryPathkeySets fills the five lists. Every goopg-specific decline is
 // here, and each one is an EMPTY list rather than a partial one wherever a
 // partial answer would claim an ordering the query does not want.
@@ -165,6 +174,11 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	sets := queryPathkeySets{}
 	sets.sort = presearchPathkeys(sortClauseItems(s), s, ctx)
 	sets.group = presearchPathkeys(groupClauseItems(s), s, ctx)
+	if s.GroupingSets == nil {
+		// remove_useless_groupby_columns returns early for grouping sets.
+		sets.group = pruneUselessGroupPathkeys(sets.group, ctx)
+		sets.group = adjustGroupPathkeysForGroupAgg(s, ctx, sets.group)
+	}
 	sets.window = presearchPathkeys(windowClauseItems(s), s, ctx)
 	sets.distinct = presearchPathkeys(distinctClauseItems(s), s, ctx)
 	// `setop_pathkeys` is upstream's `qp_extra->setop`: the grouping order a
@@ -178,6 +192,152 @@ func deriveQueryPathkeySets(s *parser.SelectStmt, ctx *resolveContext) queryPath
 	// `chooseQueryPathkeys` still implements the arm, so the precedence is
 	// complete the day a producer exists.
 	return sets
+}
+
+// pruneUselessGroupPathkeys drops the group keys remove_useless_groupby_columns
+// (initsplan.c) removes from the processed group clause before
+// standard_qp_callback builds group_pathkeys from it: a relation's grouped
+// columns beyond one of its unique keys are functionally determined by that
+// key. M0146-0134: Q64's `GROUP BY i_product_name, i_item_sk, ...` groups on
+// `i_item_sk, ...` (item_pkey), so the query pathkeys lead with i_item_sk,
+// which an input ordered on the equated cs_item_sk delivers. The same pruning
+// shapes the aggregate's own group keys (pruneUselessGroupByColumns).
+func pruneUselessGroupPathkeys(keys []PathKey, ctx *resolveContext) []PathKey {
+	if len(keys) < 2 || ctx == nil || ctx.cat == nil {
+		return keys
+	}
+	exprs := make([]Expr, len(keys))
+	for i, k := range keys {
+		exprs[i] = k.Expr
+	}
+	keep, _ := pruneUselessGroupByColumns(exprs, ctx, ctx.cat)
+	if keep == nil {
+		return keys
+	}
+	out := make([]PathKey, 0, len(keys))
+	for i, k := range keys {
+		if keep[i] {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// adjustGroupPathkeysForGroupAgg is adjust_group_pathkeys_for_groupagg
+// (planner.c), which standard_qp_callback runs whenever the query has
+// ORDER BY / DISTINCT aggregates — with or without a GROUP BY. It appends the
+// best-covering aggregate's sort keys to the group pathkeys, and those become
+// the query pathkeys, so the search files paths sorted for the aggregate.
+// M0146-0142: TPC-DS Q95's `count(DISTINCT ws1.ws_order_number)` has no
+// GROUP BY; PG feeds it from a Gather Merge sorted on ws_order_number, and
+// goopg asked the search for no order at all.
+//
+// The candidate rules are presortedAggKeysOrAbsent's (the aggregate stage's
+// twin): no ordered-set aggregates, a FILTER only over plain column/constant
+// arguments, constants dropped, and the selection is the shared
+// bestCoveringAggPathkeys. Goopg-specific declines, each leaving the group
+// pathkeys as they were rather than claiming a partial order:
+//   - a GROUP BY item that does not resolve to a searched column (the group
+//     list was truncated, so nothing may follow it);
+//   - an ordered aggregate whose sort key is neither a column nor a constant
+//     (goopg's pre-search pathkeys name columns only, and dropping that
+//     aggregate would change which set PG's selection elects).
+func adjustGroupPathkeysForGroupAgg(s *parser.SelectStmt, ctx *resolveContext, group []PathKey) []PathKey {
+	if !ctx.settings.EnablePresortedAggregate || ctx.cat == nil {
+		return group
+	}
+	for _, it := range groupClauseItems(s) {
+		if _, ok := resolvePresearchSortExpr(it.expr, s, ctx); !ok {
+			return group
+		}
+	}
+	calls, err := collectAggregateCalls(s, ctx.cat)
+	if err != nil {
+		return group
+	}
+	var candidates [][]PathKey
+	for _, fc := range calls {
+		if len(fc.WithinGroup) > 0 || (!fc.Distinct && len(fc.OrderBy) == 0) {
+			continue
+		}
+		if fc.Filter != nil && !parserArgsAllColumnOrConst(fc.Args) {
+			continue
+		}
+		pks, ok := orderedAggPresearchPathkeys(fc, s, ctx)
+		if !ok {
+			return group
+		}
+		if len(pks) > 0 {
+			candidates = append(candidates, pks)
+		}
+	}
+	if len(candidates) == 0 {
+		return group
+	}
+	if best := bestCoveringAggPathkeys(group, candidates); best != nil {
+		return best
+	}
+	return group
+}
+
+// orderedAggPresearchPathkeys is make_pathkeys_for_sortclauses over one
+// aggregate's sort list: aggdistinct for a DISTINCT aggregate (its ORDER BY
+// items, then the remaining arguments ascending, as aggregateSortlist builds
+// it), aggorder otherwise. Constant keys are dropped (pathkey_is_redundant
+// case 1); any other key that is not a searched column declines (false).
+func orderedAggPresearchPathkeys(fc *parser.FuncCall, s *parser.SelectStmt, ctx *resolveContext) ([]PathKey, bool) {
+	items := make([]presearchSortItem, 0, len(fc.OrderBy)+len(fc.Args))
+	for _, sb := range fc.OrderBy {
+		if sb.UsingOp != "" {
+			return nil, false
+		}
+		items = append(items, presearchSortItem{expr: sb.Expr, desc: sb.Desc, nullsFirst: sortByNullsFirst(sb)})
+	}
+	if fc.Distinct {
+		for _, a := range fc.Args {
+			items = append(items, defaultSortItem(a))
+		}
+	}
+	var keys []PathKey
+	for _, it := range items {
+		if parserIsPlainConst(it.expr) {
+			continue
+		}
+		col, ok := resolvePresearchSortExpr(it.expr, s, ctx)
+		if !ok {
+			return nil, false
+		}
+		pk := PathKey{Expr: col, SortAsc: !it.desc, NullsFirst: it.nullsFirst}
+		if pathkeyRedundantIn(pk, keys) {
+			continue
+		}
+		keys = append(keys, pk)
+	}
+	return keys, true
+}
+
+// parserIsPlainConst is isPlainConst on the written form: a literal.
+func parserIsPlainConst(e parser.Expr) bool {
+	switch e.(type) {
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.TypedStringLit, *parser.NullConst, *parser.BooleanConst:
+		return true
+	}
+	return false
+}
+
+// parserArgsAllColumnOrConst is aggArgsAllVarConst on the written form: PG
+// presorts a FILTERed aggregate only when every argument is a Var or a Const.
+func parserArgsAllColumnOrConst(args []parser.Expr) bool {
+	for _, a := range args {
+		if _, ok := a.(*parser.ColumnRef); ok {
+			continue
+		}
+		if !parserIsPlainConst(a) {
+			return false
+		}
+	}
+	return true
 }
 
 // presearchSortItem is one clause item on its way to a pathkey: the written
@@ -240,8 +400,11 @@ func sortClauseItems(s *parser.SelectStmt) []presearchSortItem {
 // question), so there is no "first rollup" to read and claiming the union's
 // ordering would over-state what any one set delivers.
 func groupClauseItems(s *parser.SelectStmt) []presearchSortItem {
-	if len(s.GroupBy) == 0 || s.GroupingSets != nil {
+	if len(s.GroupBy) == 0 {
 		return nil
+	}
+	if s.GroupingSets != nil {
+		return groupingSetsClauseItems(s)
 	}
 	// M0145-0008d: processedGroupOrder is the one derivation of the processed
 	// group clause, shared with Aggregate.GroupClause (groupclause.go). Besides
@@ -258,6 +421,62 @@ func groupClauseItems(s *parser.SelectStmt) []presearchSortItem {
 	}
 	for _, it := range order {
 		items = append(items, presearchSortItem{expr: s.GroupBy[it.idx], desc: it.desc, nullsFirst: it.nullsFirst})
+	}
+	return items
+}
+
+// groupingSetsClauseItems is standard_qp_callback's grouping-sets arm
+// (planner.c): "with grouping sets, just use the first RollupData's
+// groupClause" as group_pathkeys. The first rollup is the one the aggregate
+// builder elects (ExtractGroupingRollups over the sets as GROUP BY slots,
+// steered by ORDER BY through groupingSetsSortSlots), so the search is asked
+// for the order the sorted rollup sorts its input on. M0146-0138: TPC-DS
+// Q67's ROLLUP is fed by a worker-sorted Gather Merge in PG; without these
+// pathkeys goopg filed no sorted partial path and sorted above a Gather.
+// A set member that names no GROUP BY item, or a first rollup with no
+// columns (only the grand total), gives no pathkeys.
+func groupingSetsClauseItems(s *parser.SelectStmt) []presearchSortItem {
+	gs := s.GroupingSets
+	if gs == nil || len(gs.Sets) == 0 {
+		return nil
+	}
+	sets := make([][]int, 0, len(gs.Sets))
+	for _, set := range gs.Sets {
+		idxs := make([]int, 0, len(set))
+		seen := map[int]bool{}
+		for _, e := range set {
+			hit := -1
+			for i, g := range s.GroupBy {
+				if parserSortExprEqual(g, e, s) {
+					hit = i
+					break
+				}
+			}
+			if hit < 0 {
+				return nil
+			}
+			if !seen[hit] {
+				seen[hit] = true
+				idxs = append(idxs, hit)
+			}
+		}
+		sortIntsAscending(idxs)
+		sets = append(sets, idxs)
+	}
+	ident := make([]int, len(s.GroupBy))
+	for i := range ident {
+		ident[i] = i
+	}
+	rollups := ExtractGroupingRollups(sets, groupingSetsSortSlots(s, ident, len(s.GroupBy)))
+	if len(rollups) == 0 || len(rollups[0].Order) == 0 {
+		return nil
+	}
+	items := make([]presearchSortItem, 0, len(rollups[0].Order))
+	for _, gi := range rollups[0].Order {
+		if gi < 0 || gi >= len(s.GroupBy) {
+			return nil
+		}
+		items = append(items, defaultSortItem(s.GroupBy[gi]))
 	}
 	return items
 }

@@ -533,3 +533,50 @@ func producersIn(lines []string) map[string]bool {
 	}
 	return m
 }
+
+// TestAddPaths_NoPlainNestLoopForRight pins M0146-0144: match_unsorted_outer
+// sets nestjoinOK = false for JOIN_RIGHT, JOIN_RIGHT_ANTI and JOIN_FULL
+// (joinpath.c), so PG never offers a plain or materialised nested loop with
+// the nullable side outer; the LEFT orientation carries the nested loop. The
+// commuted (RIGHT) call must still offer its hash/merge family
+// (TestAddPaths_LeftReversedGeneratesTheRightFamily) — only the nested loop
+// is absent. Asserted on the DPPATH trace, i.e. on generation, not survival.
+func TestAddPaths_NoPlainNestLoopForRight(t *testing.T) {
+	a, b := relsetOf(0), relsetOf(1)
+	outer := scanRel(a, 500, 5)
+	inner := scanRel(b, 10000, 100)
+	clauses := []*restrictInfo{equiClause(a, b), plainClause(a | b)}
+	sj := mkSJ(parser.JoinLeft, a, b)
+
+	nestloopOffers := func(o, i *RelOptInfo, jt string) int {
+		joinrel := newRelOptInfo(a|b, 5000, 64)
+		lines := captureTrace(t, func() {
+			if err := addPathsToJoinrel(nil, joinrel, o, i, clauses, defaultCostParams(), sj); err != nil {
+				t.Fatalf("addPathsToJoinrel: %v", err)
+			}
+		})
+		n := 0
+		for _, l := range lines {
+			if strings.Contains(l, "producer=join.nestloop") && strings.Contains(l, "jointype="+jt) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := nestloopOffers(outer, inner, "left"); n == 0 {
+		t.Errorf("LEFT direction offered no plain nested loop; the gate must keep LEFT")
+	}
+	if n := nestloopOffers(inner, outer, "right"); n != 0 {
+		t.Errorf("RIGHT direction offered %d plain nested loop(s); PG's nestjoinOK refuses JOIN_RIGHT", n)
+	}
+	for _, jt := range []parser.JoinType{parser.JoinRight, parser.JoinRightAnti, parser.JoinRightSemi, parser.JoinFull} {
+		if nestJoinOK(jt) {
+			t.Errorf("nestJoinOK(%v) = true, want false", jt)
+		}
+	}
+	for _, jt := range []parser.JoinType{parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti} {
+		if !nestJoinOK(jt) {
+			t.Errorf("nestJoinOK(%v) = false, want true", jt)
+		}
+	}
+}

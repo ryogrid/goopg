@@ -245,6 +245,17 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 			continue
 		}
 		used, clean := leafUsedPositions(l.region, l.scan, isDerived)
+		if l.scan.anyLink {
+			// M0146-0201: a pulled-up ANY sublink's subquery RTE
+			// (convert_ANY_sublink_to_join) has one output, read by the
+			// link equality alone. Its reference carries the body's
+			// numbering, so the SourceTableIdx scan above counts the
+			// enclosing query's same-numbered relation instead: the
+			// consumption is the link's, position 0 (TPC-H Q18's
+			// `Subquery Scan on "ANY_subquery"`, which PG's setrefs
+			// removes).
+			used, clean = []int{0}, true
+		}
 		if !l.physical {
 			// M0146-0092: below a window stack the scan's tlist is the
 			// window input target, not the consumer's reference order.
@@ -294,6 +305,17 @@ func stripTrivialSubqueryScans(root Node, derived []Node, force bool) Node {
 		// columns — goopg's own narrowing, or a plain select list — is
 		// left to the consumption / physical-tlist test above.
 		if pr, isProject := l.parent.(*Project); isProject && projectComputes(pr) {
+			continue
+		}
+		// M0146-0146: the Sort twin of the rule above. A Sort directly on
+		// the leaf sorts the scan's own output, and Sort does not project:
+		// an ORDER BY key that is an expression (`CASE WHEN lochierarchy =
+		// 0 THEN i_category END`) is a resjunk entry of the scan's target
+		// list in PG (make_sort_input_target, planner.c), so the tlist is
+		// longer than the subplan's and setrefs keeps the node (TPC-DS
+		// Q36/Q70/Q86). goopg's Sort evaluates the key itself, which hid it
+		// from the consumption test.
+		if keys, isSort := sortNodeKeys(l.parent); isSort && sortKeysCompute(keys) {
 			continue
 		}
 		trivial[l.scan] = true
@@ -687,4 +709,26 @@ func projectComputes(pr *Project) bool {
 func filterIsConstTrue(f *Filter) bool {
 	b, ok := f.Predicate.(*BooleanConst)
 	return ok && b.Value
+}
+
+// sortNodeKeys returns the keys of a Sort or Incremental Sort node.
+func sortNodeKeys(n Node) ([]SortKey, bool) {
+	switch x := n.(type) {
+	case *Sort:
+		return x.Keys, true
+	case *IncrementalSort:
+		return x.Keys, true
+	}
+	return nil, false
+}
+
+// sortKeysCompute reports whether any sort key is an expression rather
+// than a column reference — projectComputes for ORDER BY keys.
+func sortKeysCompute(keys []SortKey) bool {
+	for _, k := range keys {
+		if _, ok := k.Expr.(*ColumnRef); !ok {
+			return true
+		}
+	}
+	return false
 }

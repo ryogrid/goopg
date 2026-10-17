@@ -82,7 +82,11 @@ func TestGatherMergeOverParallelIndexScanIdentity(t *testing.T) {
 	for _, workers := range []int{1, 2, 4} {
 		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
 			advanceStmtCounter(ctx)
-			node := planForTest(t, ctx, sql)
+			// enable_seqscan / enable_bitmapscan off: the plain range index
+			// scan this gate drives is PG's plan only under those settings on
+			// this never-ANALYZEd fixture (M0146-0159 retired the x2 probe
+			// calibration that used to elect it at default settings).
+			node := planOneIndexScan(t, sql, ctx.Catalog)
 			gathered, scan := spliceGatherMergeOverIndexScan(node, workers)
 			if scan == nil {
 				t.Fatalf("no IndexScan in the plan for %q; the test would prove nothing", sql)

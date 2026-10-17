@@ -261,18 +261,8 @@ func ReloadUserDatabaseSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemo
 }
 
 // reloadUserSchemasFromHeapForDB scans base/<heapDBOid>/2615 and re-registers
-// each live user schema.
-//
-// NOTE on what this does NOT fix: `RegisterSchemaDuringRecovery` writes the
-// process-wide schema map, so a reloaded schema is visible from every
-// database — exactly as it already is at RUNTIME, where a CREATE SCHEMA in one
-// database is likewise visible from another. That cross-database visibility is
-// a separate, pre-existing divergence from PostgreSQL (pg_namespace is
-// per-database there) and is ledgered. This pass deliberately restores the
-// runtime behaviour rather than inventing scoping here: a schema that silently
-// disappears across a restart is closer to data loss than a schema that is
-// over-visible, and making the two paths agree is the prerequisite for scoping
-// them together later.
+// each live user schema in that database's own schema set — pg_namespace is
+// per-database, at runtime and across a restart alike (M0119-0006).
 func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
 	type nsRow struct {
 		oid   uint32
@@ -299,16 +289,17 @@ func reloadUserSchemasFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory,
 	if err != nil {
 		return err
 	}
+	nsDB := catalog.NamespaceDBOid(heapDBOid)
 	for _, r := range rows {
 		ns := r.(nsRow)
 		if ns.oid < catalog.FirstUserOID || ns.name == "" {
 			continue
 		}
-		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid)
+		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid, nsDB)
 		if ns.owner != 0 {
-			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner)
+			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner, nsDB)
 		}
-		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset})
+		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset}, nsDB)
 	}
 	return nil
 }
@@ -1558,6 +1549,9 @@ func reloadDatabaseACLsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 		if !r.set {
 			continue
 		}
+		// The ACL store is keyed by the namespace oid every runtime reader
+		// resolves; the heap row by the pg_database oid (template1: 2 vs 1).
+		r.oid = catalog.NamespaceOidForPgDatabaseRow(r.oid)
 		entries, derr := executor.DecodeACLItemArray(r.acl, cat.RoleNameForOID)
 		if derr != nil {
 			return fmt.Errorf("pg_database datacl for oid %d: %w", r.oid, derr)
@@ -1800,16 +1794,42 @@ func reloadRoleMembershipsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 // full Routine metadata as JSON in proargdefaults (col 24, see
 // executor.DecodePGProcArgMeta) + the body in prosrc; builtins (the 3397
 // seed rows) stay compiled-in/seeded and are skipped by the OID filter.
+//
+// pg_proc is per-database: CREATE FUNCTION in a CREATE DATABASE'd database
+// writes its row to that database's heap (pgProcRel), so the reload scans the
+// default database's heap and then every other database's, registering each
+// routine in the database it came from. Scanning only the default heap lost
+// every other database's routines on restart (M0146-0156). The skip set
+// mirrors ReloadUserDatabaseSchemasFromHeap's.
 func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
-	rs := cat.Routines()
-	if rs == nil {
+	if cat.Routines() == nil {
 		return nil
 	}
+	if err := reloadUserRoutinesFromHeapForDB(mgr, cat, clog, cat.DBOID()); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserRoutinesFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserRoutinesFromHeapForDB scans base/<heapDBOid>/1255 and registers
+// each live user routine in that database (NamespaceDBOid(heapDBOid)).
+func reloadUserRoutinesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	rs := cat.Routines()
 	type procRow struct {
 		r   *catalog.Routine
 		tid storage.ItemPointer
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1255, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 1255, Fork: storage.MainFork}
 	cols := executor.PGProcColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_proc",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
@@ -1842,6 +1862,7 @@ func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 	}
 	for _, raw := range rows {
 		pr := raw.(procRow)
+		pr.r.DBOid = catalog.NamespaceDBOid(heapDBOid)
 		rs.CreateDuringRecovery(pr.r)
 		rs.SetHeapTID(pr.r.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
 	}
@@ -2495,16 +2516,39 @@ func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 // Must run after reloadUserRoutinesFromHeap (which skips prokind='a' rows)
 // and after the schema reload (RegisterUserAggregateDuringRecovery resolves
 // NamespaceOID by schema name).
+//
+// Like the routines reload it scans every database's pg_proc heap: an
+// aggregate created in a CREATE DATABASE'd database lives in that database's
+// heap and was lost on restart (M0146-0156).
 func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog) error {
-	rs := cat.Routines()
-	if rs == nil {
+	if cat.Routines() == nil {
 		return nil
 	}
+	if err := reloadUserAggregatesFromHeapForDB(mgr, cat, clog, cat.DBOID()); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := reloadUserAggregatesFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reloadUserAggregatesFromHeapForDB scans base/<heapDBOid>/1255's prokind='a'
+// rows into the aggregate registry.
+func reloadUserAggregatesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *transam.CLog, heapDBOid uint32) error {
+	rs := cat.Routines()
 	type aggRow struct {
 		r   *catalog.Routine
 		tid storage.ItemPointer
 	}
-	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1255, Fork: storage.MainFork}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 1255, Fork: storage.MainFork}
 	cols := executor.PGProcColumnsPG18()
 	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_proc(aggregates)",
 		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {

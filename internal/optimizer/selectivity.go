@@ -16,6 +16,7 @@
 package optimizer
 
 import (
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -396,11 +397,48 @@ func isBpcharTypeName(typeName string) bool {
 // via bpchartruelen (:675), i.e. trailing blanks are insignificant, so both
 // sides are stripped before the byte compare. That also covers the reverse
 // case (a literal carrying trailing blanks, which PG likewise ignores).
+//
+// Numbers compare by value for the same reason (M0146-0198): var_eq_const
+// (selfuncs.c) tests each MCV with the type's equality operator, and
+// numeric_eq / int4eq / float8eq ignore the textual form. ANALYZE stamps a
+// numeric(5,2) value as "-5.00" while the literal `-5` renders as "-5", so a
+// byte compare missed the MCV — TPC-DS Q43's `s_gmt_offset = -5` estimated
+// 1 row of store instead of PG's 12, and the join order followed.
 func statLiteralEqual(stamped, literal, typeName string) bool {
 	if isBpcharTypeName(typeName) {
 		return strings.TrimRight(stamped, " ") == strings.TrimRight(literal, " ")
 	}
-	return stamped == literal
+	if stamped == literal {
+		return true
+	}
+	if eq, ok := statNumericEqual(stamped, literal, typeName); ok {
+		return eq
+	}
+	return false
+}
+
+// statNumericEqual compares two renderings of a number-family value by value:
+// exactly (big.Rat) for numeric and the integer types, as float64 for
+// float4/float8. ok is false for any other type, or when either side does not
+// parse (numeric 'NaN', 'Infinity'), and the caller keeps the text compare.
+func statNumericEqual(a, b, typeName string) (eq, ok bool) {
+	switch strings.ToLower(typeName) {
+	case "numeric", "decimal", "int2", "int4", "int8", "smallint", "integer", "int", "bigint":
+		ra, okA := new(big.Rat).SetString(strings.TrimSpace(a))
+		rb, okB := new(big.Rat).SetString(strings.TrimSpace(b))
+		if !okA || !okB {
+			return false, false
+		}
+		return ra.Cmp(rb) == 0, true
+	case "float4", "float8", "real", "double precision":
+		fa, errA := strconv.ParseFloat(strings.TrimSpace(a), 64)
+		fb, errB := strconv.ParseFloat(strings.TrimSpace(b), 64)
+		if errA != nil || errB != nil {
+			return false, false
+		}
+		return fa == fb, true
+	}
+	return false, false
 }
 
 // eqSelectivityForColumn prices `col = const`. `tuples` is the relation's RAW

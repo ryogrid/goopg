@@ -1,0 +1,25 @@
+# M0146-0159 repeated A/B: 3 alternating rounds per arm, fresh private clone per round, Q96 first as warm-up;
+# elapsed = result-file mtime deltas (TPC-DS), arm elapsed= (TPC-H). baseline = HEAD bb0a8f154 (x2), retired = staged.
+== tpcds-sf025
+Q17: base 0.93 2.82 0.80 med 0.93s | retired 1.13 1.06 1.06 med 1.06s | x1.13
+Q21: base 0.66 0.51 0.49 med 0.51s | retired 0.51 0.51 0.50 med 0.51s | x0.99
+Q46: base 0.85 0.69 0.63 med 0.69s | retired 0.64 0.62 0.61 med 0.62s | x0.90
+Q61: base 0.80 0.61 0.58 med 0.61s | retired 0.59 0.60 0.58 med 0.59s | x0.97
+Q95: base 8.15 5.69 5.53 med 5.69s | retired 5.53 5.65 5.59 med 5.59s | x0.98
+== tpcds-sf1
+Q5: base 3.47 5.85 3.30 med 3.47s | retired 3.33 3.24 3.19 med 3.24s | x0.93
+Q6: base 1.31 1.27 1.26 med 1.27s | retired 1.28 1.21 1.31 med 1.28s | x1.01
+Q7: base 2.45 1.44 1.43 med 1.44s | retired 2.13 1.40 1.48 med 1.48s | x1.03
+Q16: base 8.51 6.87 6.70 med 6.87s | retired 6.76 6.54 6.74 med 6.74s | x0.98
+Q35: base 6.53 5.79 5.40 med 5.79s | retired 5.59 5.47 8.09 med 5.59s | x0.97
+Q47: base 8.11 8.05 7.99 med 8.05s | retired 10.19 8.21 8.06 med 8.21s | x1.02
+Q54: base 1.35 1.26 1.23 med 1.26s | retired 1.25 1.20 1.23 med 1.23s | x0.98
+Q67: base 12.53 10.35 12.92 med 12.53s | retired 10.48 12.77 10.40 med 10.48s | x0.84
+Q71: base 1.93 2.07 1.92 med 1.93s | retired 1.98 1.95 1.94 med 1.95s | x1.01
+== tpch (Q6 warm-up)
+baseline-r1: Q6: OK elapsed=2.78s Q9: OK elapsed=3.42s Q11: OK elapsed=0.27s 
+baseline-r2: Q6: OK elapsed=2.97s Q9: OK elapsed=3.07s Q11: OK elapsed=0.25s 
+baseline-r3: Q6: OK elapsed=2.66s Q9: OK elapsed=3.68s Q11: OK elapsed=0.26s 
+candidate-r1: Q6: OK elapsed=2.87s Q9: OK elapsed=3.51s Q11: OK elapsed=0.36s 
+candidate-r2: Q6: OK elapsed=2.54s Q9: OK elapsed=3.10s Q11: OK elapsed=0.27s 
+candidate-r3: Q6: OK elapsed=2.63s Q9: OK elapsed=3.25s Q11: OK elapsed=0.27s 

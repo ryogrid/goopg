@@ -252,9 +252,12 @@ func collectOutputColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// Shapes whose column usage this walker does not model; an unaccounted
 	// reference is a dropped column, so they decline as a group. Mirrors
 	// collectStmtColumnNames.
-	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
+	if s.SetOp != nil || s.SetOpOperand != nil ||
 		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	if !collectWithBodyColumnNames(s.With, dst) {
 		return false
 	}
 	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its
@@ -400,6 +403,29 @@ func collectSublinkOuterNames(e parser.Expr, dst map[string]bool) bool {
 	}
 }
 
+// collectWithBodyColumnNames walks every CTE body of a WITH list into dst,
+// in needed mode (M0146-0147). The WITH list used to decline the whole set.
+// Each body is its own query level with its own set, but a body may read an
+// enclosing level's columns as outer references (a WITH inside a sublink
+// body reads the sublink's outer query), and an inlined body is pulled into
+// the referencing scope. Collecting every body's names over-includes, which
+// only keeps more columns — the safe direction. PG's check_index_only
+// (indxpath.c) reads the attributes the query uses, WITH or not; the decline
+// cost TPC-DS Q95 its Index Only Scan on web_returns_pkey. A data-modifying
+// CTE, or a body the walker cannot model (a recursive UNION), still declines.
+func collectWithBodyColumnNames(w *parser.WithClause, dst map[string]bool) bool {
+	if w == nil {
+		return true
+	}
+	for _, cte := range w.CTEs {
+		if cte == nil || cte.DMLBody != nil || cte.Query == nil ||
+			!collectStmtColumnNames(cte.Query, dst) {
+			return false
+		}
+	}
+	return true
+}
+
 // collectStmtColumnNames walks one SELECT's non-FROM clauses. Derived tables
 // are skipped: each is planned by its own `planSelect` call and therefore gets
 // its own set.
@@ -409,9 +435,12 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	}
 	// Shapes whose column usage this walker does not model; an unaccounted
 	// reference is a dropped column, so they decline as a group.
-	if s.SetOp != nil || s.SetOpOperand != nil || s.With != nil ||
+	if s.SetOp != nil || s.SetOpOperand != nil ||
 		len(s.ValuesRows) != 0 ||
 		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	if !collectWithBodyColumnNames(s.With, dst) {
 		return false
 	}
 	// M0146-0005bq-b: a grouping-set clause reads exactly the expressions its

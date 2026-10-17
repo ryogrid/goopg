@@ -1,0 +1,25 @@
+M0146-0177 — the ordered-paths step offers a full Sort beside the Incremental Sort (TPC-DS Q60), 2026-10-13
+
+Cause: addOrderedPaths' presorted arm (PG create_ordered_paths: "We'll just do a sort if there are no presorted
+keys and an incremental sort when there are presorted keys") required input.node. The grouping election
+(upperorderedgrouping.go) and the DISTINCT election offer node-less PathAgg / PathDistinct candidates, so a
+presorted candidate fell to the full-Sort arm; addIncrementalSortPaths also skips node-less inputs, so no
+Incremental Sort was offered at all. Trace (GOOPG_PGSHAPED_DP_TRACE=1, Q60 SF0.25): seed kind=PathAgg ncommon=1,
+classes-presorted=1, node=false -> upper.ordered.sort only.
+
+Fix: addOrderedPaths takes statsNode (the node the sort runs over, for cost_incremental_sort's
+estimate_num_groups); createOrderedPaths passes its input, the grouping election the aggregate's ordered input
+node, the DISTINCT election its distinct node (and its winner switch now accepts an Incremental Sort).
+
+Sibling found by the fire set: upperNarrowChildren (B-01c upper narrowing descent) listed Sort but not
+IncrementalSort, so Q54 — whose top became an Incremental Sort — kept its aggregate un-narrowed and its inner Sort
+printed `sum(store_sales.ss_ext_sales_price) / 50` instead of PG's `my_revenue.revenue / 50`. Arm added.
+
+Results (fireset-summary.txt): SF0.25 match 74 -> 75 (Q60 MATCH), sort-strategy 13 -> 12; Q54 top now PG's
+Incremental Sort; rendering 1 -> 1. SF1 match 46 -> 46 (Q60 SF1 diverges elsewhere: stale load).
+Q58 (SF0.25) side effect: its top was already an Incremental Sort; the narrowing descent now reaches its
+aggregates, and EXPLAIN's Join Filter deparse prints the narrowed ws_items/cs_items sum() arguments as
+`sum(ss_items.item_id)` / `sum(cs_items.item_id)` (q58-sf025-goopg-*.txt). Values identical: widened Q58
+(band 0.01..100) returns the same 4 rows on HEAD and candidate. Filed as M0146-0181.
+TPC-H: no plan changes (fire set), acceptance arm 22/22 values identical (Q7/Q9 timing noise, no plan change).
+Regress A/B: aggregates, incremental_sort, select_distinct, limit, subselect identical.

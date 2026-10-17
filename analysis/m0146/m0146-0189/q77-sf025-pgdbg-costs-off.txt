@@ -1,0 +1,108 @@
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ('store channel'::text), store.s_store_sk
+         ->  MixedAggregate
+               Hash Key: ('store channel'::text), store.s_store_sk
+               Hash Key: ('store channel'::text)
+               Group Key: ()
+               ->  Append
+                     ->  Merge Left Join
+                           Merge Cond: (store.s_store_sk = store_1.s_store_sk)
+                           ->  GroupAggregate
+                                 Group Key: store.s_store_sk
+                                 ->  Nested Loop
+                                       Join Filter: (store.s_store_sk = store_sales.ss_store_sk)
+                                       ->  Index Only Scan using store_pkey on store
+                                       ->  Materialize
+                                             ->  Gather
+                                                   Workers Planned: 3
+                                                   ->  Parallel Hash Join
+                                                         Hash Cond: (store_sales.ss_sold_date_sk = date_dim.d_date_sk)
+                                                         ->  Parallel Seq Scan on store_sales
+                                                         ->  Parallel Hash
+                                                               ->  Parallel Seq Scan on date_dim
+                                                                     Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                           ->  Finalize GroupAggregate
+                                 Group Key: store_1.s_store_sk
+                                 ->  Gather Merge
+                                       Workers Planned: 1
+                                       ->  Partial GroupAggregate
+                                             Group Key: store_1.s_store_sk
+                                             ->  Merge Join
+                                                   Merge Cond: (store_returns.sr_store_sk = store_1.s_store_sk)
+                                                   ->  Sort
+                                                         Sort Key: store_returns.sr_store_sk
+                                                         ->  Nested Loop
+                                                               ->  Parallel Seq Scan on store_returns
+                                                               ->  Memoize
+                                                                     Cache Key: store_returns.sr_returned_date_sk
+                                                                     Cache Mode: logical
+                                                                     ->  Index Scan using date_dim_pkey on date_dim date_dim_1
+                                                                           Index Cond: (d_date_sk = store_returns.sr_returned_date_sk)
+                                                                           Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                                                   ->  Sort
+                                                         Sort Key: store_1.s_store_sk
+                                                         ->  Seq Scan on store store_1
+                     ->  Nested Loop
+                           ->  Finalize GroupAggregate
+                                 Group Key: catalog_sales.cs_call_center_sk
+                                 ->  Gather Merge
+                                       Workers Planned: 3
+                                       ->  Partial GroupAggregate
+                                             Group Key: catalog_sales.cs_call_center_sk
+                                             ->  Sort
+                                                   Sort Key: catalog_sales.cs_call_center_sk
+                                                   ->  Parallel Hash Join
+                                                         Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim_2.d_date_sk)
+                                                         ->  Parallel Seq Scan on catalog_sales
+                                                         ->  Parallel Hash
+                                                               ->  Parallel Seq Scan on date_dim date_dim_2
+                                                                     Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                           ->  Materialize
+                                 ->  Subquery Scan on cr
+                                       ->  GroupAggregate
+                                             Group Key: catalog_returns.cr_call_center_sk
+                                             ->  Sort
+                                                   Sort Key: catalog_returns.cr_call_center_sk
+                                                   ->  Nested Loop
+                                                         ->  Seq Scan on catalog_returns
+                                                         ->  Memoize
+                                                               Cache Key: catalog_returns.cr_returned_date_sk
+                                                               Cache Mode: logical
+                                                               ->  Index Scan using date_dim_pkey on date_dim date_dim_3
+                                                                     Index Cond: (d_date_sk = catalog_returns.cr_returned_date_sk)
+                                                                     Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                     ->  Merge Left Join
+                           Merge Cond: (web_page.wp_web_page_sk = web_page_1.wp_web_page_sk)
+                           ->  GroupAggregate
+                                 Group Key: web_page.wp_web_page_sk
+                                 ->  Nested Loop
+                                       Join Filter: (web_page.wp_web_page_sk = web_sales.ws_web_page_sk)
+                                       ->  Index Only Scan using web_page_pkey on web_page
+                                       ->  Materialize
+                                             ->  Gather
+                                                   Workers Planned: 2
+                                                   ->  Parallel Hash Join
+                                                         Hash Cond: (web_sales.ws_sold_date_sk = date_dim_4.d_date_sk)
+                                                         ->  Parallel Seq Scan on web_sales
+                                                         ->  Parallel Hash
+                                                               ->  Parallel Seq Scan on date_dim date_dim_4
+                                                                     Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+                           ->  GroupAggregate
+                                 Group Key: web_page_1.wp_web_page_sk
+                                 ->  Nested Loop
+                                       Join Filter: (web_page_1.wp_web_page_sk = web_returns.wr_web_page_sk)
+                                       ->  Index Only Scan using web_page_pkey on web_page web_page_1
+                                       ->  Materialize
+                                             ->  Nested Loop
+                                                   ->  Seq Scan on web_returns
+                                                   ->  Memoize
+                                                         Cache Key: web_returns.wr_returned_date_sk
+                                                         Cache Mode: logical
+                                                         ->  Index Scan using date_dim_pkey on date_dim date_dim_5
+                                                               Index Cond: (d_date_sk = web_returns.wr_returned_date_sk)
+                                                               Filter: ((d_date >= '2000-08-10'::date) AND (d_date <= '2000-09-09 00:00:00'::timestamp without time zone))
+(104 rows)
+

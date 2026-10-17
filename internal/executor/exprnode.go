@@ -274,6 +274,12 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 				(*s)[idx].payload[16] |= 8
 			case concatJSONB:
 				(*s)[idx].payload[16] |= 16
+			case concatArrayCat:
+				(*s)[idx].payload[16] |= 32
+			case concatArrayAppend:
+				(*s)[idx].payload[16] |= 64
+			case concatArrayPrepend:
+				(*s)[idx].payload[16] |= 128
 			}
 		}
 		return idx
@@ -456,72 +462,23 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
-		// The compiled position (payload[4:8]), not a literal 0: every error
-		// these three helpers raise is stamped with it on the interpreted twin.
-		// M0127-PS6.2.
-		pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
-		if n.payload[16]&4 != 0 && textShapeAmbiguous(left, right) {
-			return binaryTextComparison(op, left, right,
-				int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
-				n.payload[16]&1 != 0, n.payload[16]&2 != 0), nil
-		}
-		// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
-		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
-			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
-			res, handled, lsnErr := evalPgLSNBinary(op, left, right, pos)
-			if lsnErr != nil {
-				return Datum{}, lsnErr
+		// The common shape is evaluated inline: the shared function's call
+		// cost was 14-26% of a per-row qual (M0122-0012 slice 7). When
+		// fastBinarySimple holds, every preamble branch of
+		// evalFastBinaryApply is a no-op, and what is left is exactly this.
+		if fastBinarySimple(n, op, &left, &right) {
+			result, err := evalBinary(op, left, right, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))), ctx)
+			if err != nil {
+				return Datum{}, err
 			}
-			if handled {
-				return res, nil
+			if err := fastIntOverflow(n, &result); err != nil {
+				return Datum{}, err
 			}
+			return result, nil
 		}
-		lbp := int64(binary.LittleEndian.Uint32(n.payload[8:]))
-		rbp := int64(binary.LittleEndian.Uint32(n.payload[12:]))
-		left, right = concatOperandsAsText(op, left, right, lbp, rbp)
-		left, right = comparisonOperandsAsBpchar(op, left, right, lbp, rbp,
-			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
 		var result Datum
-		if op == parser.OpConcat {
-			mode := concatGuess
-			switch {
-			case n.payload[16]&8 != 0:
-				mode = concatText
-			case n.payload[16]&16 != 0:
-				mode = concatJSONB
-			}
-			result, err = evalConcat(left, right, pos, ctx, mode)
-		} else {
-			result, err = evalBinary(op, left, right, pos, ctx)
-		}
-		if err != nil {
-			return Datum{}, err
-		}
-		// Integer-overflow check, mirroring evalExprSlot. The fast path
-		// previously skipped this, silently returning out-of-range int2/int4
-		// arithmetic results. M0097 regression fix.
-		//
-		// No Pos on either raise site: this mirrors expr.go's evalExprSlot
-		// BinaryOp overflow check (interpreted twin) — int2pl/int4pl etc.
-		// (postgres/src/backend/utils/adt/int.c) never call errposition, so
-		// PG never attaches LINE-context to a runtime arithmetic overflow
-		// regardless of whether an operand was a literal or a column.
-		// M0134-0070; the interpreted twin was fixed in the same round —
-		// leaving only one twin Pos-less would silently reintroduce the
-		// sibling divergence M0127-PS6.2 fixed.
-		if result.Kind == KindInt {
-			switch n.payload[1] {
-			case ovfInt2:
-				if result.Int < -32768 || result.Int > 32767 {
-					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
-				}
-			case ovfInt4:
-				if result.Int < -2147483648 || result.Int > 2147483647 {
-					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
-				}
-			}
-		}
-		return result, nil
+		err = evalFastBinaryApply(n, op, &left, &right, ctx, &result)
+		return result, err
 
 	case ExprUnaryOp:
 		if n.childA == noExpr {
@@ -540,6 +497,125 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	default:
 		return Datum{}, fmt.Errorf("executor: evalFastExpr: unknown ExprKind %d at idx %d", n.Kind, idx)
 	}
+}
+
+// evalFastBinaryApply is the BinaryOp arm's work once both operands are in
+// hand: the character-string comparison, pg_lsn arithmetic, the bpchar and
+// concat operand coercions, evalBinary / evalConcat and the int2/int4
+// overflow checks. The per-row arm and evalFastExprBatch both call it, so the
+// two agree element for element by construction (M0122-0012).
+func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Context, out *Datum) error {
+	var err error
+	left, right := *lp, *rp
+	// The compiled position (payload[4:8]), not a literal 0: every error
+	// these three helpers raise is stamped with it on the interpreted twin.
+	// M0127-PS6.2.
+	pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
+	if n.payload[16]&4 != 0 && textShapeAmbiguous(left, right) {
+		*out = binaryTextComparison(op, left, right,
+			int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
+			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+		return nil
+	}
+	// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
+	if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
+		(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
+		res, handled, lsnErr := evalPgLSNBinary(op, left, right, pos)
+		if lsnErr != nil {
+			return lsnErr
+		}
+		if handled {
+			*out = res
+			return nil
+		}
+	}
+	lbp := int64(binary.LittleEndian.Uint32(n.payload[8:]))
+	rbp := int64(binary.LittleEndian.Uint32(n.payload[12:]))
+	// M0122-0012: both helpers return their operands unchanged unless
+	// their own preconditions hold (a concat; a bpchar-typed side), so
+	// those preconditions are tested here first. A scan qual's numeric
+	// or integer comparison then skips two calls that each copy four
+	// Datums: about 9% of a filtered TPC-DS store_sales scan.
+	if op == parser.OpConcat {
+		left, right = concatOperandsAsText(op, left, right, lbp, rbp)
+	}
+	if lbp > 0 || rbp > 0 {
+		left, right = comparisonOperandsAsBpchar(op, left, right, lbp, rbp,
+			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+	}
+	var result Datum
+	if op == parser.OpConcat {
+		mode := concatGuess
+		switch {
+		case n.payload[16]&8 != 0:
+			mode = concatText
+		case n.payload[16]&16 != 0:
+			mode = concatJSONB
+		case n.payload[16]&32 != 0:
+			mode = concatArrayCat
+		case n.payload[16]&64 != 0:
+			mode = concatArrayAppend
+		case n.payload[16]&128 != 0:
+			mode = concatArrayPrepend
+		}
+		result, err = evalConcat(left, right, pos, ctx, mode)
+	} else {
+		result, err = evalBinary(op, left, right, pos, ctx)
+	}
+	if err != nil {
+		return err
+	}
+	// Integer-overflow check, mirroring evalExprSlot. The fast path
+	// previously skipped this, silently returning out-of-range int2/int4
+	// arithmetic results. M0097 regression fix.
+	//
+	// No Pos on either raise site: this mirrors expr.go's evalExprSlot
+	// BinaryOp overflow check (interpreted twin) — int2pl/int4pl etc.
+	// (postgres/src/backend/utils/adt/int.c) never call errposition, so
+	// PG never attaches LINE-context to a runtime arithmetic overflow
+	// regardless of whether an operand was a literal or a column.
+	// M0134-0070; the interpreted twin was fixed in the same round —
+	// leaving only one twin Pos-less would silently reintroduce the
+	// sibling divergence M0127-PS6.2 fixed.
+	if err := fastIntOverflow(n, &result); err != nil {
+		return err
+	}
+	*out = result
+	return nil
+}
+
+// fastBinarySimple reports that every preamble branch of evalFastBinaryApply
+// is a no-op for these operands: no ambiguous character-string comparison,
+// no string operand (the pg_lsn probe), not a concat, no bpchar-typed side.
+// The BinaryOp result is then evalBinary's plus fastIntOverflow, which is
+// what the per-row arm computes inline.
+func fastBinarySimple(n *ExprNode, op parser.OpCode, left, right *Datum) bool {
+	return n.payload[16]&4 == 0 && left.Kind != KindString && right.Kind != KindString &&
+		op != parser.OpConcat && binary.LittleEndian.Uint64(n.payload[8:16]) == 0
+}
+
+// fastIntOverflow is the int2/int4 overflow check shared by the per-row
+// BinaryOp arm and evalFastBinaryApply.
+//
+// No Pos on either raise site: this mirrors expr.go's evalExprSlot BinaryOp
+// overflow check (the interpreted twin). int2pl/int4pl etc.
+// (postgres/src/backend/utils/adt/int.c) never call errposition, so PG never
+// attaches LINE context to a runtime arithmetic overflow, whether an operand
+// was a literal or a column. M0134-0070.
+func fastIntOverflow(n *ExprNode, result *Datum) error {
+	if result.Kind == KindInt {
+		switch n.payload[1] {
+		case ovfInt2:
+			if result.Int < -32768 || result.Int > 32767 {
+				return &ExecError{Code: "22003", Message: "smallint out of range"}
+			}
+		case ovfInt4:
+			if result.Int < -2147483648 || result.Int > 2147483647 {
+				return &ExecError{Code: "22003", Message: "integer out of range"}
+			}
+		}
+	}
+	return nil
 }
 
 // exprFoldable reports whether e can be evaluated once at build time and

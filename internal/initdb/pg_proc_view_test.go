@@ -656,3 +656,55 @@ func TestPgProcViewBuiltinTransformFuncs(t *testing.T) {
 		t.Errorf("prsd_lextype row = %v, want oid=3721 ns=11 rettype=2281(internal) argtypes=2281(internal) nargs=1 volatile=i", prsdLextype)
 	}
 }
+
+// TestPgProcViewIsPerDatabase pins M0122-0015d: pg_proc is per-database, so a
+// routine created in one database must not appear in another's pg_proc (the
+// 005_pg_dump_filterfile port measured sourcedb's functions in postgres,
+// template1 and every later database). Built-in rows are every database's;
+// the static VirtualRows answers for the default database; a connection's
+// real postgres oid reads the default namespace.
+func TestPgProcViewIsPerDatabase(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	const userDB = uint32(16500)
+	for _, r := range []*catalog.Routine{
+		{Schema: "public", Name: "in_default", ReturnType: catalog.Type{Name: "int"}, Language: "sql", Body: "select 1"},
+		{Schema: "public", Name: "in_userdb", ReturnType: catalog.Type{Name: "int"}, Language: "sql", Body: "select 1", DBOid: userDB},
+	} {
+		if _, err := cat.Routines().Create(r, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	if !ok || tbl.VirtualRowsForDB == nil {
+		t.Fatal("pg_proc has no per-database rows")
+	}
+	names := func(rows [][]string) map[string]bool {
+		m := map[string]bool{}
+		for _, r := range rows {
+			m[r[1]] = true
+		}
+		return m
+	}
+	builtins := len(builtinProcs) + len(catalog.BuiltinProcs())
+	for _, c := range []struct {
+		label string
+		rows  [][]string
+		want  string
+	}{
+		{"default (static)", tbl.VirtualRows(), "in_default"},
+		{"default", tbl.VirtualRowsForDB(catalog.DefaultDBOid), "in_default"},
+		{"postgres oid", tbl.VirtualRowsForDB(catalog.PostgresDBOid), "in_default"},
+		{"user db", tbl.VirtualRowsForDB(userDB), "in_userdb"},
+	} {
+		got := names(c.rows)
+		if len(c.rows) != builtins+1 || !got[c.want] {
+			t.Errorf("%s: %d rows (want %d), has %s=%v", c.label, len(c.rows), builtins+1, c.want, got[c.want])
+		}
+	}
+	if got := names(tbl.VirtualRowsForDB(16600)); got["in_default"] || got["in_userdb"] {
+		t.Errorf("an unrelated database sees user routines: %v", got)
+	}
+}

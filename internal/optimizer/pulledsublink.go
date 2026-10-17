@@ -216,7 +216,33 @@ func (rc *keptRebase) rebaseNode(n Node, linkDepth int, sc *keptScopeArgs) bool 
 		}
 		return e, false, true
 	}
-	if !lowerTraverseNode(n, fx) {
+	// A lateral join drives its right child once per left row and pushes
+	// that row as a frame (joinOp.openLateral → lateralJoinStream.bindOuter),
+	// so inside the right child Level 1 is the join's nestloop param — the
+	// decomposed nested-loop index join's probe key — and every escaping ref
+	// is one level further out. Walking the right child one frame deeper
+	// leaves the param alone and re-bases only the refs that really escape
+	// (M0146-0176; M0146-0170 had refused such plans outright, which kept
+	// TPC-DS Q32/Q92's SubPlan conjunct off the join that PG places it on).
+	// The join's own Predicate and keys evaluate outside that frame.
+	hook := func(n Node) (bool, bool) {
+		j, isJoin := n.(*Join)
+		if !isJoin || !j.Lateral {
+			return false, true
+		}
+		for _, p := range []*Expr{&j.Predicate, &j.LeftKey, &j.RightKey} {
+			if *p == nil {
+				continue
+			}
+			ne, okE := lowerTraverseExpr(*p, fx)
+			if !okE {
+				return true, false
+			}
+			*p = ne
+		}
+		return true, rc.rebaseNode(j.Left, linkDepth, sc) && rc.rebaseNode(j.Right, linkDepth+1, sc)
+	}
+	if !lowerTraverseNodeHooked(n, fx, hook) {
 		if rc.why == "" {
 			rc.why = "kept-subplan-unmodelled"
 		}
@@ -230,6 +256,14 @@ func (rc *keptRebase) rebaseNode(n Node, linkDepth int, sc *keptScopeArgs) bool 
 // uncorrelated kept sublink gets the clone with no params — the clone is still
 // required because the plan pointer is shared with the fallback's conjunct.
 func (rc *keptRebase) rebaseOne(x Expr, h *sublinkHandle) bool {
+	// Inside a lateral join (a decomposed nested-loop index join, R25) an
+	// OuterColumnRef{Level: 1} in the right child is that join's nestloop
+	// param, read from the frame the join pushes per outer row — not a ref to
+	// the enclosing query. Re-binding it to the host row made TPC-DS Q32's
+	// correlated SubPlan return NULL (M0146-0170); rebaseNode now walks a
+	// lateral join's right child one frame deeper, so the param stays a
+	// frame ref and only the escaping refs become SubPlan parameters
+	// (M0146-0176).
 	cl, err := clonePlanReplacingOuter(h.plan, nil)
 	if err != nil || cl == nil {
 		rc.why = "kept-subplan-clone"

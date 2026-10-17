@@ -1,0 +1,27 @@
+digest diff: A=bench/tpch/baseline-digests.txt B=tmp/m0178-arm
+  Q1              MATCH        rows=4
+  Q2              MATCH        rows=469
+  Q3              MATCH        rows=11356
+  Q4              MATCH        rows=5
+  Q5              BOTH-ERROR   both arms failed identically, nothing compared — pq: canceling statement due to user request (57014)
+  Q6              MATCH        rows=1
+  Q7              MATCH        rows=4
+  Q8              MATCH        rows=2
+  Q9              MATCH        rows=175
+  Q10             MATCH        rows=20486
+  Q11             MATCH        rows=517
+  Q12             MATCH        rows=2
+  Q13             MATCH        rows=35
+  Q14             MATCH        rows=1
+  Q15-CREATEVIEW  MATCH        rows=0
+  Q15a-VIEWBODY   MATCH        rows=10000
+  Q15b-MAIN       MATCH        rows=1
+  Q16             MATCH        rows=18166
+  Q17             MATCH        rows=1
+  Q18             MATCH        rows=12
+  Q19             MATCH        rows=1
+  Q20             MATCH        rows=92
+  Q21             MATCH        rows=421
+  Q22             MATCH        rows=7
+SUMMARY: 1 BOTH-ERROR, 23 MATCH
+VERDICT: FAIL

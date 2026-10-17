@@ -205,6 +205,25 @@ func funcCallResultType(x *FuncCall) (catalog.Type, bool) {
 		}
 	case "concat", "concat_ws", "format":
 		return catalog.Type{Name: "text"}, true
+	case "array_construct":
+		// ARRAY[e1, ...]: an array of its first element's type (a nested
+		// constructor is already an array). `||` picks array_cat /
+		// array_append / array_prepend from it (M0146-0125).
+		if len(x.Args) > 0 {
+			et, ok := ExprResultType(x.Args[0])
+			if !ok {
+				return catalog.Type{}, false
+			}
+			if et.IsArray {
+				return et, true
+			}
+			name := strings.ToLower(et.Name)
+			if strings.HasSuffix(name, "]") {
+				return catalog.Type{Name: strings.TrimSuffix(name, "[]"), IsArray: true}, true
+			}
+			return catalog.Type{Name: name, IsArray: true}, true
+		}
+		return catalog.Type{}, false
 	}
 	if x.Star || x.Variadic {
 		// `count(*)` and VARIADIC expansion do not have a literal argument

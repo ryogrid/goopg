@@ -16,6 +16,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // ppiCatalog builds a two-table catalog in the shape the TPC-H NLI candidates
@@ -482,5 +483,65 @@ func TestVariableNumDistinctNoDataBranches(t *testing.T) {
 	}
 	if got := variableNumDistinct(empty, 5000); got != 200 {
 		t.Errorf("numdistinct for a 5000-row relation with no stats = %v; want DEFAULT_NUM_DISTINCT", got)
+	}
+}
+
+// TestParameterizedPathsCostEveryEligibleIndex pins M0146-0197. Two indexes on
+// the same column: `a_cust_big` sorts first by name and is large, `b_cust_small`
+// is small. PG's build_index_paths builds a parameterised path for each and
+// add_path keeps the cheapest, so the small one wins on cost. goopg used to
+// build a path for the first index binding the most columns only — the large
+// one — and never priced the other (TPC-H's bloated order_customer_fkidx kept
+// winning over a compact twin, 7.07 against 4.65 per probe).
+func TestParameterizedPathsCostEveryEligibleIndex(t *testing.T) {
+	c := catalog.NewInMemory()
+	orders, err := c.CreateTable(parser.ObjectName{Name: "orders"}, []catalog.Column{
+		{Name: "o_orderkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "o_custkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, err := c.CreateIndex(parser.ObjectName{Name: "a_cust_big"}, orders, []string{"o_custkey"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := c.CreateIndex(parser.ObjectName{Name: "b_cust_small"}, orders, []string{"o_custkey"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := catalog.RelNBlocksFunc
+	t.Cleanup(func() { catalog.RelNBlocksFunc = prev })
+	catalog.RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
+		switch rel.RelOid {
+		case big.OID:
+			return 50_000, true
+		case small.OID:
+			return 500, true
+		}
+		return 0, false
+	}
+	ppiSetStats(orders, 1_500_000,
+		catalog.ColumnStats{NDistinct: -1},
+		catalog.ColumnStats{NDistinct: 100_000})
+	outer, inner := relsetOf(0), relsetOf(1)
+	s := ppiCtx(t, orders, 1_500_000, ppiEquiClause(outer, "c_custkey", inner, "o_custkey"))
+
+	s.addParameterizedIndexPaths(c)
+
+	var best *Path
+	for _, p := range s.findRel(inner).Pathlist {
+		if p.Kind != PathIndexScan || p.RequiredOuter == 0 || p.IndexInfo == nil {
+			continue
+		}
+		if best == nil || p.Cost.Total < best.Cost.Total {
+			best = p
+		}
+	}
+	if best == nil {
+		t.Fatal("no parameterised index path was generated")
+	}
+	if best.IndexInfo.Name != "b_cust_small" {
+		t.Fatalf("cheapest parameterised probe uses %s (%.2f); want the smaller b_cust_small", best.IndexInfo.Name, best.Cost.Total)
 	}
 }

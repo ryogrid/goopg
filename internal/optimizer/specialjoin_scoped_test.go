@@ -154,3 +154,44 @@ func TestScopedFullBarrierExpandsMin(t *testing.T) {
 		t.Errorf("FULL barrier: minR = %b, want 100", sj.MinRighthand)
 	}
 }
+
+// TestScopedUnqualifiedResolvesDerivedLeaves pins M0146-0224: a subquery leaf
+// whose output names are certain resolves an unqualified ON reference the way
+// PG's parse analysis does (the RTE's eref->colnames), so outer-join identity
+// 3 narrows min_lefthand as make_outerjoininfo does. TPC-DS Q78's
+// `ss LEFT JOIN ws ON … LEFT JOIN cs ON …` names the CTEs' columns bare; with
+// both links falling back to syn, (ss ⟕ cs) was never a legal pair.
+func TestScopedUnqualifiedResolvesDerivedLeaves(t *testing.T) {
+	cat := scopedTestCatalog(t)
+	got := scopedCollect(t,
+		"(SELECT x AS sk FROM a) ss LEFT JOIN (SELECT x AS wk FROM b) ws ON wk = sk "+
+			"LEFT JOIN (SELECT x AS ck FROM c) cs ON ck = sk",
+		cat)
+	if !strings.Contains(got, "synL={0,1} synR={2} minL={0} minR={2}") {
+		t.Errorf("identity 3: the second link's min_lefthand must narrow to {0}, got %s", got)
+	}
+	// A column alias list renames by position, as eref->colnames does.
+	got = scopedCollect(t,
+		"(SELECT x FROM a) ss(sk) LEFT JOIN (SELECT x FROM b) ws(wk) ON wk = sk "+
+			"LEFT JOIN (SELECT x FROM c) cs(ck) ON ck = sk",
+		cat)
+	if !strings.Contains(got, "synL={0,1} synR={2} minL={0} minR={2}") {
+		t.Errorf("column aliases: the second link's min_lefthand must narrow to {0}, got %s", got)
+	}
+	// A star leaves the names uncertain: syn fallback.
+	got = scopedCollect(t,
+		"(SELECT x AS sk FROM a) ss LEFT JOIN (SELECT * FROM b) ws ON x = sk "+
+			"LEFT JOIN (SELECT x AS ck FROM c) cs ON ck = sk",
+		cat)
+	if !strings.Contains(got, "synL={0,1} synR={2} minL={0,1} minR={2}") {
+		t.Errorf("a star subquery in scope must keep the syn fallback, got %s", got)
+	}
+	// An expression target FigureColname names is not modelled: syn fallback.
+	got = scopedCollect(t,
+		"(SELECT x AS sk FROM a) ss LEFT JOIN (SELECT x + 1 FROM b) ws ON sk = 1 "+
+			"LEFT JOIN (SELECT x AS ck FROM c) cs ON ck = sk",
+		cat)
+	if !strings.Contains(got, "synL={0,1} synR={2} minL={0,1} minR={2}") {
+		t.Errorf("an unnamed target in scope must keep the syn fallback, got %s", got)
+	}
+}

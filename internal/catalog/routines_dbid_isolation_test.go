@@ -91,3 +91,76 @@ func TestRoutinesCrossDatabaseIsolation(t *testing.T) {
 		t.Error("otherDB's add_calcdef still resolves after DropByName")
 	}
 }
+
+// TestRoutinesInDBHandle pins M0146-0156: a handle from InDB resolves calls
+// that pass no dbOid against its own database, shares the registry with every
+// other handle, normalises the connection's postgres OID to the default
+// namespace, and DropAllInDB removes exactly one database's routines.
+func TestRoutinesInDBHandle(t *testing.T) {
+	rs := NewRoutines()
+	const otherDB = uint32(99999)
+	name := parser.ObjectName{Name: "f"}
+	args := []Type{{Name: "int4"}}
+
+	other := rs.InDB(otherDB)
+	created, err := other.Create(&Routine{Schema: "public", Name: "f", ArgTypes: args}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.DBOid != otherDB {
+		t.Fatalf("Create through the handle stamped DBOid %d, want %d", created.DBOid, otherDB)
+	}
+	if got := other.LookupByName(name); len(got) != 1 || got[0].OID != created.OID {
+		t.Fatalf("handle LookupByName = %v, want the routine", got)
+	}
+	if got := rs.LookupByName(name); len(got) != 0 {
+		t.Fatalf("default handle sees the other database's routine: %v", got)
+	}
+	if got := rs.InDB(PostgresDBOid).LookupByName(name); len(got) != 0 {
+		t.Fatalf("postgres-OID handle sees the other database's routine: %v", got)
+	}
+	if _, ok := rs.Lookup(name, args, otherDB); !ok {
+		t.Fatal("an explicit dbOid still resolves against that database")
+	}
+	if rs.LookupByOID(created.OID) == nil {
+		t.Fatal("OID lookups span databases")
+	}
+
+	// Recovery keeps the database the reload stamped.
+	re := rs.CreateDuringRecovery(&Routine{OID: created.OID + 10, DBOid: otherDB, Schema: "public", Name: "g", ArgTypes: args})
+	if re.DBOid != otherDB {
+		t.Fatalf("CreateDuringRecovery DBOid = %d, want %d", re.DBOid, otherDB)
+	}
+
+	if _, err := rs.Create(&Routine{Schema: "public", Name: "f", ArgTypes: args}, false); err != nil {
+		t.Fatal(err)
+	}
+	rs.DropAllInDB(otherDB)
+	if got := other.LookupByName(name); len(got) != 0 {
+		t.Fatalf("after DropAllInDB the handle still sees %v", got)
+	}
+	if rs.LookupByOID(created.OID) != nil {
+		t.Fatal("after DropAllInDB the routine is still reachable by OID")
+	}
+	if got := rs.LookupByName(name); len(got) != 1 {
+		t.Fatalf("DropAllInDB removed the default database's routine too: %v", got)
+	}
+}
+
+// TestRoutinesReplaceKeepsOwner: CREATE OR REPLACE keeps proowner, as
+// ProcedureCreate does — a SECURITY DEFINER routine must not change whose
+// rights it runs with because another role replaced its body. M0146-0157.
+func TestRoutinesReplaceKeepsOwner(t *testing.T) {
+	rs := NewRoutines()
+	first, err := rs.Create(&Routine{Schema: "public", Name: "f", Owner: 16400}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := rs.Create(&Routine{Schema: "public", Name: "f", Owner: 16500, Body: "new"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.OID != first.OID || second.Owner != 16400 || second.Body != "new" {
+		t.Fatalf("replace = OID %d owner %d body %q, want OID %d owner 16400 body new", second.OID, second.Owner, second.Body, first.OID)
+	}
+}

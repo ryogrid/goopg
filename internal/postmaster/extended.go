@@ -551,6 +551,9 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 			// instead of being applied as a garbage role name. M0134-0155.
 			return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
 		}
+		if !sess.InTransactionBlock() {
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
+		}
 		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET LOCAL ROLE rolename — must be checked before the generic "SET LOCAL "
@@ -558,18 +561,36 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	// "role" (not a config.Registry variable — SET ROLE is tracked entirely
 	// via connTx.NonSuperuserRole) and fail with "unrecognized configuration
 	// parameter". Mirrors server/query.go's simple-query handling. M0119-0004.
+	// SET [LOCAL] TIME ZONE: zone_value's forms (INTERVAL qualifiers, LOCAL)
+	// need the grammar; without this case the generic "SET " split read
+	// "TIME" as the parameter name. Mirrors the simple-query path. M0122-0008.
+	case strings.HasPrefix(upper, "SET TIME ZONE "), strings.HasPrefix(upper, "SET LOCAL TIME ZONE "):
+		return s.executeExtendedQueryViaExecutor(ctx, sess, query, params, procNum, dbName, connTx)
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		if !sess.InTransactionBlock() {
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
+		}
 		setRoleFastPath(sess, connTx, matchable, "SET LOCAL ROLE", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		body := matchable[len("SET LOCAL "):]
-		name, value, ok := splitSet(body)
+		name, value, ok, err := splitSetFlattened(body)
 		if !ok {
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
 		}
+		if err != nil {
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+		}
+		if !sess.InTransactionBlock() {
+			// An Execute outside a block is its own transaction: warn and
+			// validate only (see the simple-query handleSet).
+			if err := sess.CheckSet(name, value); err != nil {
+				return nil, gucSetError(err)
+			}
+			return &extendedQueryResult{CommandTag: "SET", WarnFields: setLocalOutsideBlockNotice()}, nil
+		}
 		if err := sess.Set(name, value, true); err != nil {
-			msg, hint := gucSetErrorFields(err)
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+			return nil, gucSetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege
@@ -599,13 +620,15 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 		return &extendedQueryResult{CommandTag: "SET CONSTRAINTS"}, nil
 	case strings.HasPrefix(upper, "SET "):
 		body := matchable[len("SET "):]
-		name, value, ok := splitSet(body)
+		name, value, ok, err := splitSetFlattened(body)
 		if !ok {
 			return nil, &extendedQueryError{Code: errcodes.SyntaxError, Message: fmt.Sprintf("could not parse SET statement: %q", body)}
 		}
+		if err != nil {
+			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+		}
 		if err := sess.Set(name, value, false); err != nil {
-			msg, hint := gucSetErrorFields(err)
-			return nil, &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: msg, Hint: hint}
+			return nil, gucSetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case upper == "RESET ALL":
@@ -630,7 +653,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *misc.SessionReg
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
 		if err := sess.Reset(name); err != nil {
-			return nil, &extendedQueryError{Code: errcodes.UndefinedObject, Message: err.Error()}
+			return nil, gucResetError(err)
 		}
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	}

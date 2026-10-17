@@ -360,7 +360,7 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		return &Transaction{pos: s.Pos(), Verb: TxRollbackTo, Name: s.Name}, nil
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
-		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
+		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt, *parser.AlterSystemStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
 		*parser.SetTransactionStmt, *parser.SetConstraintsStmt,
 		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt,
@@ -464,6 +464,14 @@ type resolveContext struct {
 	// Var.varlevelsup by counting how many parent links to walk.
 	// nil for the top-level SELECT.
 	parent *resolveContext
+	// groupingSetsWrapAll is pull_up_simple_subquery's
+	// `if (parse->groupingSets) rvcontext.wrap_option = REPLACE_WRAP_ALL`
+	// (prepjointree.c) for this statement's pulled sublink bodies: under real
+	// grouping sets PG wraps every pulled output in a PlaceHolderVar, so a
+	// semijoin's RHS operand is no plain Var — reduce_unique_semijoins cannot
+	// prove it unique and create_unique_path cannot take its free NOOP arm
+	// (M0146-0177/0179, TPC-DS Q70). Set before the sublink pull-up.
+	groupingSetsWrapAll bool
 	// settings is the per-statement planner context (plannersettings.go).
 	//
 	// It is resolved DIRECTLY, never by walking `parent`: `parent` is assigned
@@ -544,6 +552,10 @@ type resolveContext struct {
 	// that arrived carrying plannerSet.appendrelMember; cleared for
 	// deeper scopes by the same one-level bound.
 	appendrelMember bool
+	// appendrelOtherMember narrows appendrelMember to a member PG pulls up
+	// into the parent query, so its one relation is RELOPT_OTHER_MEMBER_REL
+	// and skips compute_parallel_worker's size cutoffs (M0146-0132).
+	appendrelOtherMember bool
 
 	// scalarSublinkBody marks this resolveContext as a scalar sublink's
 	// body scope (M0146-0012, PlannerSettings.scalarSublinkBody): the seam
@@ -582,6 +594,15 @@ type resolveContext struct {
 	// a top-level FROM clause. M0127-P5.9-b; see `searchTupleFraction`.
 	tupleFraction float64
 
+	// rootCheapestTotal is set when an aggregate stage sits between the join
+	// search and the final rel (M0146-0150). PG applies the tuple fraction
+	// only at final_rel (get_cheapest_fractional_path, planner.c): the
+	// grouping step consumes the scan/join rel through its
+	// cheapest_total_path (create_grouping_paths' hashed and plain arms) and
+	// each presorted path (its sorted arm). So the search root hands up
+	// CheapestTotal there, while the fraction still drives ConsiderStartup.
+	rootCheapestTotal bool
+
 	// queryPathkeys is `PlannerInfo.query_pathkeys`: the ordering the
 	// statement itself wants from the scan/join level, in this context's
 	// binding coordinates (C-07/P3-06, querypathkeys.go). Derived by
@@ -590,6 +611,12 @@ type resolveContext struct {
 	// resolved into SortKeys until far below the search. Empty in every
 	// context that is not a top-level FROM clause.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys are `PlannerInfo.group_pathkeys` and
+	// `distinct_pathkeys`, from the same derivation (M0146-0223):
+	// truncate_useless_pathkeys keeps a join ordering that either can use,
+	// whichever list became query_pathkeys.
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// neededCols / neededColsKnown: the statement's needed-column set,
 	// computed once per `planSelect` (pathindexonlyneed.go) and handed to the
@@ -1272,6 +1299,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// call and so get their own — and stamped on every context this
 	// function builds below.
 	upper := newUpperRels()
+	upper.cat = cat
 
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
@@ -1691,6 +1719,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// above returns before this point for the union scope itself, so the
 	// flag reaches member scopes intact.
 	appendrelMember := plannerSet.appendrelMember
+	// M0146-0132: a member PG pulls up into the parent (is_simple_subquery
+	// && is_safe_append_member) is a RELOPT_OTHER_MEMBER_REL there, and
+	// compute_parallel_worker exempts it from the parallel size cutoffs.
+	// Decided on the member's own AST, before the rewrites below.
+	appendrelOtherMember := appendrelMember && isSafeAppendMemberStmt(s, scope) &&
+		!needsAggregateStage(s, cat) && !needsWindowStage(s)
 	plannerSet.appendrelMember = false
 	plannerSet.appendrelLabel = false
 	// M0146-0012: same one-scope bound for the scalar-sublink-body mark.
@@ -1758,6 +1792,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// inherit it.
 		if appendrelMember && ctx != nil {
 			ctx.appendrelMember = true
+			ctx.appendrelOtherMember = appendrelOtherMember
 		}
 		if scalarSublinkBody && ctx != nil {
 			ctx.scalarSublinkBody = true
@@ -1805,6 +1840,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the same pure `searchTupleFraction` call, just earlier and
 		// unconditional.
 		ctx.tupleFraction = searchTupleFraction(s.Limit, s.Offset)
+		ctx.rootCheapestTotal = needsAggregateStage(s, cat)
 	}
 
 	// M0146-0028: a pulled-up FROM subquery's WHERE is part of this scope's
@@ -1952,7 +1988,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// join search. See the comment there.
 		// C-07: `standard_qp_callback` runs here for the same reason
 		// `preprocess_limit` does — before `query_planner` builds a rel.
-		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.setQueryPathkeys(s)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
@@ -1968,6 +2004,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// arm — search below a pinned spine, then again above it — was
 		// deleted with the legacy pipeline, M0145-0008.)
 		if f, okf := node.(*Filter); okf {
+			ctx.groupingSetsWrapAll = statementHasGroupingSets(s)
 			ctx.jtPullup = pullUpSublinksIntoJointree(f.Predicate, ctx, cat, plannerSet)
 			if ctx.jtPullup != nil {
 				// M0145-0007 slice 3 census (nlicensus.go).
@@ -2050,13 +2087,23 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// M0146-0028b: not for a pulled-up derived table — the index
 		// producer rebuilds the scan from the statement's own WHERE alone
 		// and would drop the pulled body's quals.
+		//
+		// M0146-0060: it now fires only for a LIKE prefix, the one restriction
+		// whose index path the search does not build (PG derives the
+		// `col ~>=~ 'pfx' AND col ~<~ 'pfy'` index quals in
+		// match_pattern_prefix, indxpath.c / like_support.c). Every other
+		// uncorrelated restriction is the costed search's call: with
+		// statistics it elects PG's Index / Bitmap / Index Only Scan, and on
+		// a relation where PG keeps its Seq Scan the rule no longer overrides
+		// it with a heuristic index scan that never competed on cost.
 		if isSimpleSingle && whereQual != nil && len(ctx.pulledDerived) == 0 && planIsBareSeqScanTree(node) {
 			onlyFrom := len(s.From) == 1 && s.From[0].Only
-			whereForIndex := injectLikeRangePredicates(whereQual)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
-				return nil, err
-			} else if ok {
-				node = idxNode
+			if whereForIndex := injectLikeRangePredicates(whereQual); whereForIndex != whereQual {
+				if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !onlyFrom); err != nil {
+					return nil, err
+				} else if ok {
+					node = idxNode
+				}
 			}
 		}
 	} else {
@@ -2090,7 +2137,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// the search reads it. (`tupleFraction` was stamped for both arms at
 		// the convergent block above — C-17.)
 		// C-07: as in the `*Filter` arm above.
-		ctx.queryPathkeys = deriveQueryPathkeys(s, ctx)
+		ctx.setQueryPathkeys(s)
 		ctx.neededCols, ctx.neededColsKnown = neededColumnNames(s)
 		ctx.outputCols, ctx.outputColsKnown = outputColumnNames(s)
 		addPulledBodyColumnNames(ctx)
@@ -2165,6 +2212,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// uncorrelated sublink conjunct becomes a Result's One-Time Filter above
 	// the scope's FROM tree instead of a per-row Filter (create_gating_plan).
 	node = gatePseudoconstantQuals(node, cat)
+	// M0146-0129: an outer join whose ON clause is constant FALSE / NULL
+	// never reads its nullable side; PG plans that side as a dummy rel
+	// (populate_joinrel_with_paths' JOIN_LEFT arm).
+	node = dummyConstantFalseOuterJoinSides(node)
 
 	// Aggregate sublink promotion: when the outer SELECT has exactly one target
 	// that is a scalar subquery containing a single aggregate referencing outer
@@ -4390,6 +4441,15 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.Arg) ||
 			exprContainsColumnRef(x.StartBlock) ||
 			exprContainsColumnRef(x.EndBlock)
+	case *PgWalSummaryContents:
+		// `FROM pg_available_wal_summaries() s, pg_wal_summary_contents(s.tli,
+		// s.start_lsn, s.end_lsn)`: correlated arguments bind per outer row.
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	case *PgGetSequenceData:
 		// pg_dump's getSequences comma-joins pg_get_sequence_data(seqrelid) with
 		// pg_sequence; the seqrelid argument is a correlated *ColumnRef against
@@ -5473,7 +5533,7 @@ func foreignTableWithoutHandler(cat catalog.Catalog, tbl *catalog.Table) (string
 	if !ok || srv == nil {
 		return "", false
 	}
-	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName)
+	fdw, ok := im.LookupForeignDataWrapper(srv.FdwName, srv.DBOid)
 	if !ok || fdw == nil || fdw.HandlerOID != 0 {
 		return "", false
 	}
@@ -6651,7 +6711,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			candidates := rs.LookupByName(fc.Name)
 			for _, r := range candidates {
 				if r.ReturnsSet && (strings.EqualFold(r.Language, "sql") || strings.EqualFold(r.Language, "plpgsql")) {
-					if len(r.ArgTypes) == len(fc.Args) {
+					if r.NumInputArgs() == len(fc.Args) {
 						userSrfs = append(userSrfs, userSrfEntry{colIdx: i, fc: fc, routine: r})
 						break
 					}
@@ -7002,55 +7062,7 @@ func wrapOrdinality(node Node, b rangeBinding, rv parser.RangeVar, sourceIdx int
 // scalar column named alias — with colAliases (from rv.Columns, minus a
 // stripped WITH ORDINALITY tail) overriding names positionally. M0134-0015c.
 func userRoutineColumnSchema(cat catalog.Catalog, r *catalog.Routine, alias string, colAliases []string) []catalog.Column {
-	// If the routine has OUT parameters, expand them as separate columns
-	// (matches PostgreSQL's treatment of SETOF record functions with named
-	// OUT params).
-	var outCols []catalog.Column
-	for i, mode := range r.ArgModes {
-		if mode == "o" || mode == "b" {
-			name := ""
-			if i < len(r.ArgNames) {
-				name = r.ArgNames[i]
-			}
-			if name == "" {
-				name = fmt.Sprintf("column%d", len(outCols)+1)
-			}
-			typ := catalog.Type{Name: "text"}
-			if i < len(r.ArgTypes) {
-				typ = r.ArgTypes[i]
-			}
-			outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
-		}
-	}
-	if len(outCols) > 0 {
-		for i := range outCols {
-			if i < len(colAliases) {
-				outCols[i].Name = colAliases[i]
-			}
-		}
-		return outCols
-	}
-	retTypeName := r.ReturnType.Name
-	if retTypeName == "" {
-		retTypeName = "text"
-	}
-	// If the return type is a composite (table) type, expand its columns.
-	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
-		compositeCols := make([]catalog.Column, len(compTbl.Columns))
-		copy(compositeCols, compTbl.Columns)
-		for i := range compositeCols {
-			compositeCols[i].Ordinal = i
-			if i < len(colAliases) {
-				compositeCols[i].Name = colAliases[i]
-			}
-		}
-		return compositeCols
-	}
-	colName := alias
-	if len(colAliases) > 0 {
-		colName = colAliases[0]
-	}
-	return []catalog.Column{{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0}}
+	return catalog.RoutineResultColumns(cat, r, alias, colAliases)
 }
 
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
@@ -7068,17 +7080,31 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "parse_ident") {
 		return planScalarFuncScan(rv, sourceIdx, "text[]")
 	}
+	if strings.EqualFold(tf.Name, "pg_restore_attribute_stats") || strings.EqualFold(tf.Name, "pg_restore_relation_stats") {
+		// PG 18 statistics import in FROM position, the form pg_dump
+		// --statistics emits (`SELECT * FROM pg_catalog.pg_restore_..._stats(...)`):
+		// a scalar boolean function scanned once for one row, as
+		// ExecMakeTableFunctionResult does for any non-SETOF function.
+		// M0146-0215.
+		return planScalarFuncScan(rv, sourceIdx, "bool")
+	}
 	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
 		return planPgGetPublicationTables(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_wal_summarizer_state") {
+		return planPgGetWalSummarizerState(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_get_catalog_foreign_keys") {
 		return planPgGetCatalogForeignKeys(rv, sourceIdx)
 	}
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
+	}
+	if strings.EqualFold(tf.Name, "pg_wal_summary_contents") {
+		return planPgWalSummaryContents(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "pg_sequence_parameters") {
 		return planPgSequenceParameters(rv, sourceIdx, lateralCtx)
@@ -7931,6 +7957,34 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	return node, b, nil
 }
 
+// planPgGetWalSummarizerState routes a FROM-clause invocation of
+// pg_get_wal_summarizer_state() into a one-row PgAvailableWalSummaries node
+// with Func set. M0122-0009 S4b.
+func planPgGetWalSummarizerState(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_wal_summarizer_state"
+	}
+	colNames := []string{"summarized_tli", "summarized_lsn", "pending_lsn", "summarizer_pid"}
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	colTypes := []string{"int8", "pg_lsn", "pg_lsn", "int4"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgAvailableWalSummaries{pos: tf.Pos(), Func: "pg_get_wal_summarizer_state", schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // planPgGetCatalogForeignKeys routes a FROM-clause invocation of
 // pg_get_catalog_foreign_keys() into a PgGetCatalogForeignKeys plan node.
 // M0134-0146.
@@ -8005,6 +8059,50 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgWalSummaryContents routes a FROM-clause invocation of
+// pg_wal_summary_contents(tli, start_lsn, end_lsn) into a PgWalSummaryContents
+// node. The arguments resolve against the lateral outer context, as for
+// planPgGetSequenceData. M0122-0009 S4a.
+func planPgWalSummaryContents(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	if len(tf.Args) != 3 {
+		return nil, rangeBinding{}, fmt.Errorf("function pg_wal_summary_contents takes 3 arguments, got %d", len(tf.Args))
+	}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_wal_summary_contents"
+	}
+	colNames := []string{"relfilenode", "reltablespace", "reldatabase", "relforknumber", "relblocknumber", "is_limit_block"}
+	for i := range colNames {
+		if i < len(rv.Columns) {
+			colNames[i] = rv.Columns[i]
+		}
+	}
+	colTypes := []string{"oid", "oid", "oid", "int2", "int8", "bool"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgWalSummaryContents{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -8403,8 +8501,15 @@ const (
 // time) and the Merge* leaves (executor-ctx-driven) join the ParamRef
 // class instead — commit 2's row-independence argument.
 func exprSide(e Expr, leftWidth int) joinSide {
+	return exprSideUnder(e, leftWidth, scopeVeto)
+}
+
+// exprSideUnder is exprSide with the inner-plan policy as a parameter.
+// hashKeyExprSide passes scopeIgnore for an operand whose only sublinks are
+// PARAM_EXEC SubPlans, whose sides are those of their Args (M0146-0207).
+func exprSideUnder(e Expr, leftWidth int, pol scopePolicy) joinSide {
 	side := sideUnknown
-	ok := walkExprRefs(e, scopeVeto, exprVisitor{
+	ok := walkExprRefs(e, pol, exprVisitor{
 		Visit: func(x Expr) bool {
 			switch ref := x.(type) {
 			case *ColumnRef:
@@ -8677,6 +8782,22 @@ func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 	for _, sb := range s.OrderBy {
 		if hasAgg(sb.Expr) {
 			return true
+		}
+	}
+	// M0146-0143: as collectAggregateCalls — a named window's spec.
+	for _, nw := range s.WindowClause {
+		if nw.Def == nil {
+			continue
+		}
+		for _, p := range nw.Def.PartitionBy {
+			if hasAgg(p) {
+				return true
+			}
+		}
+		for _, o := range nw.Def.OrderBy {
+			if hasAgg(o.Expr) {
+				return true
+			}
 		}
 	}
 	return false
@@ -10317,7 +10438,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
-		return planInExpr(x, buildHavingParentCtx(agg))
+		if x.Subquery == nil {
+			return resolveInListAfterAggregate(x, agg)
+		}
+		return resolveInSubqueryAfterAggregate(x, agg)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, buildHavingParentCtx(agg))
 	case *parser.LikeEscapePattern:
@@ -10556,7 +10680,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 				break
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.ArrayConstructorExpr:
 		// ARRAY[e1, e2, ...] after GROUP BY — resolve each element
 		// through the post-aggregate surface (so group-by columns
@@ -10740,7 +10868,11 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			}
 			args = append(args, pa)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.InExpr:
 		if cmp, ok := oneElementInAsComparison(x); ok {
 			return resolveExprAfterWindow(cmp, win)
@@ -10867,6 +10999,23 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 			return nil, err
 		}
 	}
+	// M0146-0143: a named WINDOW clause's PARTITION BY / ORDER BY belongs to
+	// this query level too (`... OVER w ... WINDOW w AS (ORDER BY sum(b))`).
+	for _, nw := range s.WindowClause {
+		if nw.Def == nil {
+			continue
+		}
+		for _, p := range nw.Def.PartitionBy {
+			if err := visit(p); err != nil {
+				return nil, err
+			}
+		}
+		for _, o := range nw.Def.OrderBy {
+			if err := visit(o.Expr); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -10917,8 +11066,128 @@ func collectHavingSubqueryAggCalls(having parser.Expr, cat catalog.Catalog) []*p
 	return result
 }
 
+// resolveInListAfterAggregate is planInExpr's list form over the aggregate
+// output (M0146-0143): `sum(b) IN (3, 4)` after GROUP BY resolves its
+// operand and items through the aggregate surface, as every other
+// post-aggregate expression does. The subquery form keeps planInExpr with the
+// HAVING-parent context. The one-element rewrite is planInExpr's own
+// (transformAExprIn: `x IN (c)` is `x = c`).
+func resolveInListAfterAggregate(x *parser.InExpr, agg *aggregateSurface) (Expr, error) {
+	if cmp, ok := oneElementInAsComparison(x); ok {
+		return resolveExprAfterAggregate(cmp, agg)
+	}
+	op, err := resolveExprAfterAggregate(x.Operand, agg)
+	if err != nil {
+		return nil, err
+	}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp}
+	out.List = make([]Expr, len(x.List))
+	for i, e := range x.List {
+		r, err := resolveExprAfterAggregate(e, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.List[i] = r
+	}
+	return out, nil
+}
+
+// resolveInSubqueryAfterAggregate is planInExpr's subquery form over the
+// aggregate output (M0146-0143). The left operand belongs to THIS query level,
+// so it resolves through the aggregate surface (`sum(b) IN (SELECT ...)`,
+// regress subselect's `(1 = any(array_agg(f1))) = any (select false)`); only
+// the subquery body is planned in the HAVING-parent context, where this
+// level's grouped columns and aggregates are outer references. planInExpr
+// resolved the operand in that parent context as well, which names a level
+// that does not exist from here ("outer column ref ... out of range"). A
+// row operand over VALUES keeps planInExpr's expansion.
+func resolveInSubqueryAfterAggregate(x *parser.InExpr, agg *aggregateSurface) (Expr, error) {
+	ctx := buildHavingParentCtx(agg)
+	if _, row := x.Operand.(*parser.RowExpr); row || ctx == nil || ctx.cat == nil {
+		return planInExpr(x, ctx)
+	}
+	op, err := resolveExprAfterAggregate(x.Operand, agg)
+	if err != nil {
+		return nil, err
+	}
+	inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx, ctx.settings, rtableScopeFrom(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp,
+		Plan: inner, Subquery: x.Subquery, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
+// walkExpr visits every function call of ONE query level in e: it descends
+// every expression node that can hold one, but never a subquery (SubqueryExpr,
+// ExistsExpr, an IN's subquery, ARRAY(SELECT ...)), whose calls belong to
+// the inner query level.
+//
+// M0146-0143: the walk used to stop at CASE, IN lists, EXTRACT, COLLATE,
+// row/array/subscript/field expressions and the window spec, so an
+// aggregate written only there (`case when sum(b) > 2 then 1 end`, `rank()
+// over (order by sum(b))` — TPC-DS Q70) was never collected and the
+// aggregate stage failed "aggregate call could not be resolved". PG's
+// transformAggregateCall registers every Aggref at its query level wherever
+// it is written (parse_agg.c). A FuncCall's FILTER and its own ORDER BY stay
+// unwalked: an aggregate there is an error PG raises separately
+// ("aggregate functions are not allowed in FILTER", nested aggregates).
 func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
+	walkAll := func(es []parser.Expr) error {
+		for _, c := range es {
+			if err := walkExpr(c, fn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	switch x := e.(type) {
+	case *parser.CaseExpr:
+		if err := walkExpr(x.Operand, fn); err != nil {
+			return err
+		}
+		for _, w := range x.Whens {
+			if err := walkExpr(w.When, fn); err != nil {
+				return err
+			}
+			if err := walkExpr(w.Then, fn); err != nil {
+				return err
+			}
+		}
+		return walkExpr(x.Else, fn)
+	case *parser.InExpr:
+		if err := walkExpr(x.Operand, fn); err != nil {
+			return err
+		}
+		return walkAll(x.List)
+	case *parser.ExtractExpr:
+		return walkExpr(x.Source, fn)
+	case *parser.CollateExpr:
+		return walkExpr(x.Operand, fn)
+	case *parser.LikeEscapePattern:
+		if err := walkExpr(x.Pattern, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Escape, fn)
+	case *parser.SimilarToPattern:
+		if err := walkExpr(x.Left, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Pattern, fn)
+	case *parser.FieldSelect:
+		return walkExpr(x.Arg, fn)
+	case *parser.RowExpr:
+		return walkAll(x.Elems)
+	case *parser.ArraySubscriptExpr:
+		if err := walkExpr(x.Base, fn); err != nil {
+			return err
+		}
+		if err := walkExpr(x.Index, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Upper, fn)
+	case *parser.ArrayConstructorExpr:
+		return walkAll(x.Elements)
 	case *parser.BinaryOp:
 		if err := walkExpr(x.Left, fn); err != nil {
 			return err
@@ -10946,8 +11215,31 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 				return err
 			}
 		}
+		if x.Over != nil {
+			return walkWindowDef(x.Over, fn)
+		}
 	case *parser.IndirectionStar:
 		return walkExpr(x.Source, fn)
+	}
+	return nil
+}
+
+// walkWindowDef walks a window definition's PARTITION BY and ORDER BY — part
+// of the query level that owns the window (transformWindowDefinitions runs
+// in the query's own parse state, so an aggregate there is the query's).
+func walkWindowDef(w *parser.WindowDef, fn func(*parser.FuncCall) error) error {
+	if w == nil {
+		return nil
+	}
+	for _, p := range w.PartitionBy {
+		if err := walkExpr(p, fn); err != nil {
+			return err
+		}
+	}
+	for _, o := range w.OrderBy {
+		if err := walkExpr(o.Expr, fn); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -11905,7 +12197,7 @@ func indexLeadsRegIdentifierArray(tbl *catalog.Table, idx *catalog.Index) bool {
 // is the shape PG lands on. Anything unmeasurable (no stats,
 // non-positive selectivity) returns false — today's behavior —
 // never a fabricated seq win.
-func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
+func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, queryClause Expr, ps PlannerSettings) bool {
 	if tbl == nil || tbl.Stats == nil || tbl.Stats.RowCount <= 0 {
 		return false
 	}
@@ -11951,7 +12243,7 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 	if sel > 1 {
 		sel = 1
 	}
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
 	T := float64(relPages)
 	if T < 1 {
 		T = 1
@@ -11976,6 +12268,7 @@ func seqWinsEqualityProbe(tbl *catalog.Table, idx *catalog.Index, queryClause Ex
 		// no restriction conjunct is left for the heap fetch
 		// (costsize.c:822-830). numSAScans 1: plain equality, no
 		// ScalarArrayOp product.
+		numIndexQuals: 1,
 	}
 	idxCost := costIndexScan(cp, in)
 	// The seq rival evaluates the one equality per tuple scanned.
@@ -12164,7 +12457,7 @@ func planIndexScanFromWhereShape(where parser.Expr, ctx *resolveContext, cat cat
 	// same cost functions the search uses. A 1-page table loses to a
 	// sequential scan; declining returns the caller to its Seq Scan
 	// fallback — the shape PG lands on.
-	if seqWinsEqualityProbe(tbl, idx, queryClause, ctx.settings) {
+	if seqWinsEqualityProbe(cat, tbl, idx, queryClause, ctx.settings) {
 		return nil, false, nil
 	}
 	return &IndexScan{
@@ -14937,6 +15230,13 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog, ps PlannerSettings, s
 // planMerge converts a MERGE INTO statement into a Merge plan node.
 // M0096-0010.
 func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	// A leading WITH (M0146-0085): its CTEs are visible to the USING source,
+	// ON and WHEN clauses; data-modifying ones run first, as for DELETE.
+	restore, dmlPlans, err := preplanWithClause(s.With, nil, cat, ps, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01",
@@ -15129,7 +15429,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog, ps PlannerSettings, sco
 		m.Returning = exprs
 		m.ReturningSchema = schema
 	}
-	return m, nil
+	return wrapDMLCTEPrefix(m, dmlPlans), nil
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.
@@ -16242,6 +16542,10 @@ func exprType(e Expr) catalog.Type {
 		case "pg_trigger_depth":
 			// pg_trigger_depth() -> int4 (pg_proc.dat oid 3163). M0146-0080.
 			return catalog.Type{Name: "int4"}
+		case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
+			// xlogfuncs.c; pg_proc.dat oids 2849/2852/3330: prorettype pg_lsn.
+			// M0122-0009 S7.
+			return catalog.Type{Name: "pg_lsn"}
 		case "crc32", "crc32c", "bit_count":
 			// crc32/crc32c(bytea) -> int8 (pg_proc.dat:7954/7957); bit_count(bytea|bit)
 			// -> int8 (pg_proc.dat:1534/4201). Untyped these fall through to TypeOID 25,
@@ -17728,7 +18032,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				}
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}, nil
+		fc := &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}
+		if err := coerceCommonTypeArgs(fc); err != nil {
+			return nil, err
+		}
+		return fc, nil
 	case *parser.StarExpr:
 		// Unqualified * is not valid in expression context. A qualified t.* is a
 		// whole-row variable reference (e.g. `WHERE i.* != excluded.*`) — expand

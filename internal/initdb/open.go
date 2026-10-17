@@ -91,9 +91,13 @@ type Runtime struct {
 	// background WAL writer loop to exit. nil when the loop wasn't
 	// started (WalWriterDelay == 0 in tests).
 	walwriterStop chan struct{}
+	// walwriterDelay is the loop's live wal_writer_delay; walwriterKick
+	// wakes it after SetWalWriterDelay changes it (a reload).
+	walwriterDelay atomic.Int64 // time.Duration
+	walwriterKick  chan struct{}
 
 	// bgwriter is the background page-writer goroutine (M0048-0003).
-	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
+	// nil when BgwriterDelay == 0.
 	bgwriter *storage.Bgwriter
 
 	// immediateShutdown, when true, makes Close() skip the final
@@ -116,6 +120,61 @@ func (r *Runtime) SetImmediateShutdown() {
 		r.immediateShutdown = true
 	}
 }
+
+// WriterSettings carries the WAL-writer, group-commit and background-writer
+// parameters a configuration reload must reach on a running server. PG
+// declares wal_writer_delay, wal_writer_flush_after, bgwriter_delay and
+// bgwriter_lru_maxpages PGC_SIGHUP (guc_tables.c); its walwriter and
+// bgwriter re-read them on the next loop after SIGHUP. commit_delay and
+// commit_siblings are backend settings in PG; goopg's group-commit state is
+// shared by the writer, so the reload carries their configured values.
+type WriterSettings struct {
+	WalWriterDelay      time.Duration // <= 0: unchanged
+	WalWriterFlushAfter int64         // bytes
+	CommitDelayUs       int64
+	CommitSiblings      int
+	BgwriterDelay       time.Duration // <= 0: unchanged
+	BgwriterMaxPages    int
+	// CheckpointFlushAfter and BgwriterFlushAfter are the checkpointer's and
+	// bgwriter's writeback thresholds in BLCKSZ pages (PGC_SIGHUP).
+	CheckpointFlushAfter int
+	BgwriterFlushAfter   int
+}
+
+// ApplyWriterSettings pushes reloaded writer settings into the running
+// walwriter, WAL writer and bgwriter. Loops that were not started (tests
+// that open with a zero delay) are left alone.
+func (r *Runtime) ApplyWriterSettings(ws WriterSettings) {
+	if r == nil {
+		return
+	}
+	if r.WAL != nil {
+		r.WAL.SetWalWriterFlushAfter(ws.WalWriterFlushAfter)
+		r.WAL.SetCommitDelayUs(ws.CommitDelayUs)
+		r.WAL.SetCommitSiblings(ws.CommitSiblings)
+	}
+	if r.walwriterKick != nil && ws.WalWriterDelay > 0 &&
+		time.Duration(r.walwriterDelay.Swap(int64(ws.WalWriterDelay))) != ws.WalWriterDelay {
+		select {
+		case r.walwriterKick <- struct{}{}:
+		default:
+		}
+	}
+	if r.bgwriter != nil {
+		r.bgwriter.SetDelay(ws.BgwriterDelay)
+		r.bgwriter.SetMaxPages(ws.BgwriterMaxPages)
+	}
+	if r.Pool != nil {
+		r.Pool.SetCheckpointFlushAfter(ws.CheckpointFlushAfter)
+		r.Pool.SetBgwriterFlushAfter(ws.BgwriterFlushAfter)
+	}
+}
+
+// WalWriterDelay and Bgwriter report the running loops' settings (tests).
+func (r *Runtime) WalWriterDelay() time.Duration {
+	return time.Duration(r.walwriterDelay.Load())
+}
+func (r *Runtime) Bgwriter() *storage.Bgwriter { return r.bgwriter }
 
 // OpenOptions controls Open.
 type OpenOptions struct {
@@ -214,7 +273,7 @@ type OpenOptions struct {
 	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
 	WalWriterDelay time.Duration
 
-	// WalWriterFlushAfter is wal_writer_flush_after in bytes (BootVal 1MB),
+	// WalWriterFlushAfter is wal_writer_flush_after in bytes (the GUC's 128 pages = 1MB),
 	// forwarded to wal.Config for the background walwriter's fsync throttle.
 	WalWriterFlushAfter int64
 
@@ -550,6 +609,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Internal-page insert that finishes a child split: PG's
+	// XLOG_BTREE_INSERT_UPPER (block 0 the parent, block 1 the child whose
+	// incomplete-split flag redo clears). M0122-0010.
+	logBtreeInsertUpper := func(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte, childBlk storage.BlockNumber) (storage.LSN, error) {
+		payload, err := xlog.EncodeBtreeInsertUpperPG(rel, blk, offnum, item, childBlk)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Logical heap-delete (xmax stamp) change record.
 	// oldTuple carries the pre-delete heap-tuple bytes for logical
 	// replication; nil when the caller doesn't need logical decoding.
@@ -789,6 +863,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
+
+		// M0122-0010: XLOG_BTREE_INSERT_UPPER for no-split downlink inserts.
+		LogBtreeInsertUpper: logBtreeInsertUpper,
+
 		LogHeapDelete:  logHeapDelete,
 		LogHeapVacuum:  logHeapVacuum,
 		LogBtreeVacuum: logBtreeVacuum,
@@ -1150,6 +1228,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		var perr error
 		switch kind {
 		case transam.XactCommit:
+			// The relations the transaction dropped go into the commit record
+			// (XACT_XINFO_HAS_RELFILELOCATORS); their files are removed once
+			// the record is written (transam pending_rel_delete.go).
+			dropped := txnMgr.PendingRelDeletes(xid)
 			// If the transaction wrote to a nailed catalog relation (pg_class,
 			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
 			// record and unlink both pg_internal.init files so the next backend
@@ -1158,7 +1240,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPG(xid, true)
+				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1176,10 +1258,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = xlog.EncodeXactCommitPG(xid, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, false)
 			}
 		case transam.XactAbort:
-			payload, perr = xlog.EncodeXactAbortPG(xid)
+			// The relations the transaction created go into the abort record;
+			// their files are removed once it is written (XactLogAbortRecord).
+			payload, perr = xlog.EncodeXactAbortPGWithRels(xid, nil, txnMgr.PendingAbortRelDeletes(xid))
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
@@ -1325,7 +1409,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: scan wal for xact history: %w", xerr)
 	}
-	if clog.IsEmpty() && !hasXactHistory {
+	// M0146-0152: a cluster this binary initialised is never an old one, so
+	// an empty commit log with no xact record in the WAL only means nothing
+	// has committed yet — run the crash-recovery sweep, which stamps any xid
+	// that crashed in progress Aborted.
+	if clog.IsEmpty() && !hasXactHistory && !readGoopgFeatures(abs)[clogCompleteHistoryFeature] {
 		if uerr := clog.InitializeAsCommitted(txnMgr.NextXID()); uerr != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
@@ -1489,32 +1577,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// to reloadUserAggregatesFromHeap (after the routines reload below) —
 	// kinds 46-49 retired.
 
-	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
-	// If the JSON snapshot is present and valid, populate the catalog directly
-	// without scanning pg_class/pg_attribute pages. Falls through to the heap
-	// scan on a miss (file absent, version mismatch, or parse error).
-	cacheHit := false
-	if abs != "" {
-		var cerr error
-		if cacheHit, cerr = readCatalogCache(abs, cat.DBOID(), cat); cerr != nil {
-			slog.Warn("catalogCache: read failed, falling back to heap scan", "err", cerr)
-			cacheHit = false
-		}
-	}
-
 	// Load user tables from the pg_class/pg_attribute heap files (M0030-0003).
 	// This is the sole catalog recovery path: DDL writes rows here via
 	// syncTableToCatalogHeap, and WAL replay restores them after a crash.
 	// Safe on old clusters — skips if pg_class relfile is absent.
 	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
-	// Skipped when M0114 catalog cache provided a valid snapshot above.
-	if !cacheHit {
-		if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
-			_ = pool.Close()
-			_ = walWriter.Close()
-			_ = mgr.Close()
-			return nil, fmt.Errorf("goopg: user table heap load: %w", err)
-		}
+	//
+	// M0141-S2a-fix2r-c / M0146-0151: the M0114 JSON fast-start cache that
+	// used to pre-empt this scan is retired. It stored each column's type
+	// as a bare name, so a cache-hit restart registered every table without
+	// its typmods, array flags, identity, tablespace or database: an int4[]
+	// column read back as a scalar, char(n) lost its length, and the
+	// planner sized TPC-DS char(16) at 32 bytes. PG reads user relations
+	// from the catalogs every time (pg_internal.init caches only the nailed
+	// system relations). A cache file an older binary left is removed.
+	if abs != "" {
+		UnlinkCatalogCache(abs, cat.DBOID())
+	}
+	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
 	}
 
 	// M0106-0013: after loading user tables from heap, advance the OID
@@ -1547,15 +1631,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		if err := executor.SeedToastOIDCounter(pool, mainRels); err != nil {
 			slog.Warn("TOAST OID counter reseed failed", "err", err)
-		}
-	}
-
-	// M0114: write the catalog cache after a successful heap scan so the
-	// next startup can skip pg_class/pg_attribute scanning entirely.
-	// Non-fatal: a write failure just means a cold-start next time.
-	if abs != "" && !cacheHit {
-		if werr := writeCatalogCache(abs, cat.DBOID(), cat); werr != nil {
-			slog.Warn("catalogCache: write failed", "err", werr)
 		}
 	}
 
@@ -1598,6 +1673,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// are skipped, as is the shared DefaultDBOid namespace and the detected
 	// mirror DBOID (both already loaded above). Runs regardless of the M0114
 	// catalog-cache fast path — the cache only snapshots cat.DBOID()'s tables.
+	// template1 owns its own catalog namespace and storage directory
+	// (catalog.Template1NamespaceDBOid, base/2) instead of sharing postgres'
+	// DefaultDBOid one (0119-0006bv, Option A). A cluster initialised before
+	// that has no base/2: lay down the same template0 catalog image a CREATE
+	// DATABASE gets. Idempotent — existing files are never overwritten.
+	if abs != "" {
+		if err := CreatePerDatabaseScaffolding(abs, catalog.Template1NamespaceDBOid); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: template1 scaffolding: %w", err)
+		}
+	}
 	for _, dbName := range cat.ListDatabases() {
 		dbOid := cat.DatabaseOid(dbName)
 		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
@@ -2799,6 +2887,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if opts.WalWriterDelay > 0 && walWriter != nil {
 		stop := make(chan struct{})
 		rt.walwriterStop = stop
+		rt.walwriterDelay.Store(int64(opts.WalWriterDelay))
+		kick := make(chan struct{}, 1)
+		rt.walwriterKick = kick
 		go func() {
 			// This goroutine is now the walwriter process: register it in the
 			// activity registry so pool/AIO hooks attribute its I/O to
@@ -2818,6 +2909,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					// with no commits in flight. Fast no-op when nothing was
 					// written since the last flush.
 					_ = walWriter.BackgroundWrite()
+				case <-kick:
+					ticker.Reset(time.Duration(rt.walwriterDelay.Load()))
 				case <-stop:
 					return
 				}
@@ -2827,7 +2920,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Background page-writer goroutine (M0048-0003): proactively flushes
 	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
-	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
+	// bgwriter_lru_maxpages = 0 keeps the goroutine (it only skips the
+	// writes), as PG keeps its bgwriter, so a reload can raise it again.
+	if opts.BgwriterDelay > 0 {
 		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
 		// Pre-register the bgwriter background slot (M0122-0003 writeback
 		// simplification 3 follow-up) so OnLoopStart/OnLoopEnd below can
@@ -4224,6 +4319,9 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	type relSize struct {
 		rowCount int64
 		pages    int64
+		// allVisible is the stored relallvisible; -1 when the row carries
+		// none (written before M0146-0216, or NULL).
+		allVisible int64
 	}
 	sizeMap := make(map[uint32]relSize)
 	relStatsRel := storage.RelFileNode{
@@ -4239,12 +4337,16 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, relStatsCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return [3]int64{decoded[0].Int, decoded[1].Int, decoded[2].Int}, false, nil
+			allVisible := int64(-1)
+			if natts > 3 && !decoded[3].IsNull() {
+				allVisible = decoded[3].Int
+			}
+			return [4]int64{decoded[0].Int, decoded[1].Int, decoded[2].Int, allVisible}, false, nil
 		})
 	for _, r := range sizeRows {
-		v := r.([3]int64)
+		v := r.([4]int64)
 		if v[0] >= int64(catalog.FirstUserOID) {
-			sizeMap[uint32(v[0])] = relSize{rowCount: v[1], pages: v[2]}
+			sizeMap[uint32(v[0])] = relSize{rowCount: v[1], pages: v[2], allVisible: v[3]}
 		}
 	}
 
@@ -4278,27 +4380,11 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			if idx < 0 || idx >= len(colStats) {
 				continue
 			}
-			var distinctVal int64
-			var distinctFrac float64
-			if sr.StaDistinct < 0 {
-				// PG's negative convention: a fraction of the relation's
-				// rows. Restored as the fraction rather than being converted
-				// to a count, because converting needs a row count that this
-				// reload does not have (ledger pq-P6) — and the consumer that
-				// wants it, the parallel-aggregate split gate, wants the
-				// fraction anyway.
-				//
-				// Before this the negative case was discarded into 0, so a
-				// real PG heap's stadistinct read as "no estimate".
-				f := float64(-sr.StaDistinct)
-				if f > 1 {
-					f = 1
-				}
-				distinctFrac = f
-			}
-			if sr.StaDistinct > 0 {
-				distinctVal = int64(sr.StaDistinct)
-			}
+			// PG's sign convention: a negative stadistinct is a fraction of the
+			// relation's rows, a positive one a count. The fraction stays a
+			// fraction (ledger pq-P6); the conversion is shared with
+			// pg_restore_attribute_stats.
+			distinctVal, distinctFrac := catalog.ColumnStatsDistinct(float64(sr.StaDistinct))
 			cs := catalog.ColumnStats{
 				NDistinct:     distinctVal,
 				NDistinctFrac: distinctFrac,
@@ -4340,6 +4426,9 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		if sz, ok := sizeMap[relid]; ok {
 			stats.RowCount = sz.rowCount
 			stats.Pages = int(sz.pages)
+			if sz.allVisible >= 0 {
+				stats.AllVisible, stats.AllVisibleSet = int32(sz.allVisible), true
+			}
 		}
 		cat.SetTableStats(tbl, stats)
 	}

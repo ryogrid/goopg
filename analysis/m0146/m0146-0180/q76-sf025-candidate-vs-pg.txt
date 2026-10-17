@@ -1,0 +1,2 @@
+Q76 SHAPE-DIFF [join-method,scan-type] estimates(goopg cost=38969.32..39012.92 rows=100 width=298 | pg cost=39026.66..39070.79 rows=100 width=163)
+    note: normalisation: strip-pg-Hash

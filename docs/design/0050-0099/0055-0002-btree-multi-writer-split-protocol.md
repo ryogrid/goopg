@@ -2,7 +2,7 @@
 
 | field      | value |
 |------------|-------|
-| status     | draft |
+| status     | landed 2026-10-15 (M0122-0010) |
 | date       | 2026-05-06 |
 | supersedes | — |
 
@@ -67,17 +67,317 @@ leaf splits, but it is a **functional smoke test, not a race pin**, and the
 file now says so. Measured 2026\-09\-22: with `sharedSplitMu` removed from the
 constructors it still passes under `-race -count=3`, because its per\-handle
 keys ascend and rightmost\-page splits stay consistent under the buffer\-pool
-page locks alone. **No existing test reproduces the interleaved
-structural\-change failure itself**; writing one is open work, and the gate is
-justified by the structural argument \(two handles, two mutexes, one tree\)
-rather than by a failing reproducer.
+page locks alone.
 
-**Known limitation.** `Pool.BTreeStructuralLock`'s map has no eviction, so one
-mutex per relation ever opened accumulates for the process lifetime. Pruning it
-in `InvalidateRel` is the obvious place and is deliberately NOT done: a
-concurrent holder releasing a mutex that has already left the map, followed by
-a relfilenode reuse, would hand the next handle a fresh mutex and defeat the
-gate for that window. Ledgered.
+**Reproducer \(2026\-10\-14\).** `TestStructuralLockInteriorSplitWorkload`
+\(`btree\_structural\_race\_test.go`\) is the failing reproducer the gate lacked.
+Each of 40 rounds, on a fresh relation:
+
+- 16 handles of one index insert interleaved 200\-byte keys in random order, so
+  leaves and then interior pages split while other handles descend through them;
+- every key must then be found with its TID;
+- a full scan must return every key once, in order;
+- the meta page must report level ≥ 2.
+
+`NBTREE\_UNSHARED\_STRUCTURAL\_LOCK=1` gives each handle its own mutex, the state
+before the gate. Measured on 16 CPUs:
+
+| configuration | invocations failed |
+|---|---|
+| per\-handle mutexes | 15 of 15 \(mostly `index out of range \[\-1\]` in `insertIntoBlock`\) |
+| shared lock | 0 of 20, plus 3 clean runs under `\-race` |
+
+One 8\-handle round failed only about 1 time in 13, hence the 40 rounds.
+
+**Lock table \(2026\-10\-14\).** `Pool.BTreeStructuralLock` used to keep a map with
+one mutex per relation ever opened, never pruned. Pruning it was unsafe, and a
+refcount needs a handle close, which goopg's B\-tree handles do not have. If a
+holder releases a mutex that has left the map and a reused relfilenode then
+hands the next handle a fresh mutex, the gate is defeated. The map is now a
+fixed array of 256 cache\-line\-padded mutexes indexed by a hash of the
+`RelFileNode`:
+
+- the same relation always maps to the same mutex, through drops and
+  relfilenode reuse;
+- memory is constant;
+- two relations sharing a stripe only wait for each other. Every structural
+  critical section \(split insert, deferred split completion, vacuum unlink\)
+  touches one tree and takes no other structural lock, so sharing cannot
+  deadlock.
+
+`TestBTreeStructuralLockStripes` pins stability, spread \(2000 consecutive OIDs
+use ≥ 90 % of the stripes\) and zero allocation. The reproducer stays green:
+0/20 invocations fail, plus clean `\-race` runs.
+
+### 4.2 Toward PG's lock\-coupled protocol \(M0122\-0010, 2026\-10\-14\)
+
+Plan of record for removing `lockStructural`. Each gap is a slice, in dependency
+order:
+
+1. **\(S, landed\)** Empty or stale `path`: start at the leftmost page of the
+   parent level \(`\_bt\_get\_endpoint`\).
+2. **\(M, landed\)** Re\-find the parent by downlink \(`\_bt\_getstackbuf`\):
+   move right along the parent level, skipping half\-dead and deleted pages,
+   until a downlink equals the split child. Otherwise fail with "failed to
+   re\-find parent key".
+3. **\(S, landed\)** Clear the child's `INCOMPLETE\_SPLIT` inside the parent's
+   no\-split insert record, as `\_bt\_insertonpg` does \(slice 2 below\).
+4. **\(M, landed\)** Latch in PG's order: the left page stays latched through
+   the parent search and insert, so the child is latched before the parent
+   \(slice 3 below\).
+5. **\(M, landed\)** Finish incomplete splits on contact \(`\_bt\_moveright` for
+   update, `\_bt\_stepright`, `\_bt\_getstackbuf`\) \(slice 7 below\).
+6. **\(M, landed\)** Atomic root split: hold left, right, the new root and the
+   metapage together \(slice 4 below\).
+7. **\(M, landed\)** Vacuum: refuse to delete either half of an incomplete
+   split \(`\_bt\_leftsib\_splitflag`\), and latch the parent last \(slice 5
+   below\). Recycling pages a stale path can name: open.
+8. **\(L, landed\)** Remove `lockStructural`; stress under `\-race` \(slices 6
+   and 7 below\). No structural mutex remains.
+
+**Slice 1 \(gaps 1–2\).** `getStackBuf` / `leftmostAtLevel` replace the blind
+`path\[len\(path\)\-1\]` at the split's parent step; `TestGetStackBuf` pins them.
+The acceptance instrument is `TestStructuralLockInteriorSplitWorkload` with
+`NBTREE\_UNSHARED\_STRUCTURAL\_LOCK=1`:
+
+| state | unshared invocations failed | failure classes |
+|---|---|---|
+| before | 15 / 15 | mostly `index out of range \[\-1\]` \(empty path\) |
+| after slice 1 | 5 / 15 | 4 "failed to re\-find parent key" \(gap 5\); 1 "no level 1 \(root level 0\)" \(gap 6\) |
+
+The shared\-lock configuration stays at 0/20 failures, and the package passes under
+`\-race`.
+
+**Slice 2 \(gap 3\).** A downlink inserted into an internal page without a split
+used to go out as `XLOG\_BTREE\_INSERT\_LEAF`, a PG parity bug of its own. The
+child's flag was then cleared by a separate page record, so a crash between the
+two left a finished split flagged. `insertUpperFinishChild` now:
+
+- latches the child, parent before child, the split path's existing order;
+- clears the child's flag;
+- logs one `XLOG\_BTREE\_INSERT\_UPPER` record: block 0 the parent with the item,
+  block 1 the child, bare and `SAME\_REL` \(`EncodeBtreeInsertUpperPG`, the
+  `LogBtreeInsertUpper` pool hook\);
+- marks both pages covered by the record.
+
+The redo arm already existed for PG\-written records.
+
+Evidence:
+
+- the encoder is byte\-identical to the hand\-built PG record;
+- replaying goopg's record inserts the downlink and clears the flag;
+- `TestInternalInsertFinishesChildSplit`, whose negative control fails;
+- `pg\_waldump` decodes 885 `INSERT\_UPPER` records from a 30 000\-row randomised
+  index build;
+- after `kill \-9` and recovery from a redo point before the build, the index
+  agrees with the heap \(30 000 = 30 000, and 310 point lookups all found\).
+
+Unshared reproducer after slice 2: 13/15 failures, up from 5/15, all of the
+gap\-5 class \("failed to re\-find parent key"\). There is no new class and no panic
+or deadlock. Latching and logging the child lengthens the parent insert, which
+widens the window in which another handle's half\-finished split has no downlink
+yet; gap 5 closes that window. So the per\-slice acceptance rule is "no new
+failure class in the unshared run, 0/20 in the shared run", not a falling count.
+Shared: 0/20, `\-race` clean.
+
+**Slice 3 \(gap 4\).** The split no longer releases its left page before going
+up a level:
+
+- the left page is handed, still latched, to the parent insert
+  \(`insertIntoBlock`'s `heldChild`, transferred with `wlatch.take`\);
+- the parent insert releases it once the record that clears its
+  `INCOMPLETE\_SPLIT` is written: the `INSERT\_UPPER` record, or the parent's own
+  split record;
+- the child is therefore always latched before its parent, and no other writer
+  can see the half split between the split and the parent insert;
+- a root split still releases the left page first, until gap 6 makes the root
+  lift atomic;
+- `getStackBuf` refuses a path hint naming the held child, which is only possible
+  after block reuse, and starts from the level's leftmost page instead.
+
+Unshared reproducer: 3/15 failures, down from 13/15 \(5/15 after slice 1\):
+
+- 1 is the gap\-6 "no level 1 \(root level 0\)";
+- 2 are latch deadlocks. In both, one handle's root split had raced a concurrent
+  root lift, taken the `createNewRoot` fallback into the new root, and then
+  latched the child after that parent: the last parent\-before\-child order, which
+  gap 6 removes. The other handle held that child and waited in `getStackBuf`.
+
+A concurrent root lift needs two splitters of one index at once, which the
+shared structural lock rules out. Shared: 0/20, and the package passes under
+`\-race`.
+
+**Slice 4 \(gap 6\).** A root split now behaves as `\_bt\_split` \+ `\_bt\_newroot`:
+
+- The split drops `BTRoot` from its left half inside the split record
+  \(`lopaque\->btpo\_flags &= ~BTP\_ROOT`\). Upstream's split redo also drops it,
+  so a root split's left half is now logged incrementally like any other split.
+  `TestRealTreeSplitsAreDescribable` used to expect the opposite and now
+  requires root splits to reproduce too.
+- Both halves stay latched while `newRootLocked`:
+  - builds the new root;
+  - points the metapage at it;
+  - clears the left half's `INCOMPLETE\_SPLIT`;
+  - logs everything in one `XLOG\_BTREE\_NEWROOT` record \(block 0 the root,
+    block 1 the left half, block 2 the metapage\).
+- That replaces three separate critical sections: release, `clearRootFlag`
+  with a page record, then `createNewRoot`, then `clearIncompleteSplit`.
+- The metapage re\-read fallback \(insert into `parentPath\[0\]`, parent latched
+  before child\) remains only for `finishSplit`, which holds no latch.
+
+Unshared reproducer: **0/15** failures, down from 3/15. The "no level 1" error
+and both deadlocks are gone. Shared: 0/20, and the package passes under `\-race`.
+Live check: `pg\_waldump` decodes 2 `NEWROOT`, 908 `SPLIT\_L/R` and 874
+`INSERT\_UPPER` records from a 30 000\-row randomised build. After `kill \-9`
+and recovery from a redo point before the build, the index agrees with the heap
+\(30 000 = 30 000, and 310 point lookups all found\).
+
+With the lock removed, splits no longer fail, but `lockStructural` still guards
+vacuum's page unlink \(gap 7\). Gap 5 now matters only for incomplete splits
+left by a crash: no writer sees another writer's half split any more.
+
+**Slice 5 \(gap 7\).** Page deletion in vacuum:
+
+- **Refusals \(`\_bt\_pagedel`\).** A page is not deleted when it is either half
+  of an incomplete split:
+  - it carries `BTIncompleteSplit` itself \(left half\);
+  - or its left sibling carries it and still points at the page \(right half,
+    `\_bt\_leftsib\_splitflag`\).
+
+  The WAL path reads both off its latched pages; the FPI fallback reads them with
+  one shared latch at a time, left to right. The page stays empty\-but\-live, as
+  for the other refusals.
+- **Latch order.** `acquireUnlinkPins` latches left, target and right, validates
+  the links, and only then latches the parent. Before, it latched the parent
+  first, the reverse of the split's order since slice 3. The global order is now
+  lower level before upper, and left to right within a level, for both splits and
+  deletion. Under the structural lock the parent cannot move in between.
+
+`TestVacuumRefusesIncompleteSplitHalves` covers the WAL and FPI paths with the
+flag set and not set; with the refusals disabled the flagged cases fail.
+Reproducer: shared 0/20, unshared 0/10. The vacuum and DDL isolation ports pass.
+
+**Vacuum\-with\-splits stress \(2026\-10\-15\).** `TestStructuralLockVacuumWithSplits`
+covers the deletion half of what the structural lock protects. Each of 10 rounds:
+
+- inserts the even key segments, then vacuums them away segment by segment, so
+  their pages empty and are deleted;
+- meanwhile eight handles insert the odd segments in random order, splitting the
+  neighbouring pages;
+- requires afterwards that every odd key is found with its TID, that no even key
+  is found, and that a full scan is ordered and complete;
+- requires at least one deleted page, so the round really exercised deletion.
+
+| configuration | failures |
+|---|---|
+| shared lock | 0 / 10 |
+| per\-handle mutexes \(no cross\-handle lock\) | 0 / 15 |
+| per\-handle mutexes, both stress tests under `\-race` | 3 clean runs |
+
+Vacuum's existing under\-latch checks keep a moved parent safe: the downlink is
+re\-checked on the latched parent, and the deletion is abandoned when it moved.
+A `\_bt\_getstackbuf`\-style re\-find would only make deletion succeed more often.
+
+**Slice 6 \(gap 8, 2026\-10\-15\).** No tree\-wide lock on the paths production
+uses:
+
+- **Parent re\-find in vacuum.** `latchParentOf`, the `\_bt\_getstackbuf` call
+  inside `\_bt\_lock\_subtree\_parent`: once left, target and right are
+  latched, vacuum starts at the parent it resolved earlier and moves right along
+  the parent level until a page holds the target's downlink. The deletion
+  record names that page. A downlink only moves right, and only the target's
+  own deletion removes it. If the hint is no longer on the parent level, or the
+  level ends, the deletion is abandoned. `TestUnlinkPinsRefindMovedParent` gives
+  the leftmost parent\-level page as the hint for a leaf on the next one; it
+  fails without the move\-right.
+- **Lock removed.** `Insert`'s split path and `unlinkEmptyLeaf` no longer call
+  `lockStructural`. `finishSplit` still does: it has no production caller and
+  latches the parent before the child, so it stays serialised against itself
+  until gap 5. The stripe table stays until that last caller goes.
+- **Tests.** Both stress tests lost their per\-handle\-mutex knob, which no
+  longer means anything. Their odd rounds now run every goroutine through one
+  shared handle; in the vacuum test that includes vacuum, so pages it frees go
+  to the free list that splits allocate from.
+  `TestMultiWriterStress\_M0055\_Phase\_C` now gets a 256\-slot pool. 32
+  writers can split at once and one split pins up to five pages, so 32 slots ran
+  out \("no available buffer"\), as PG's "no unpinned buffers available" would
+  with shared\_buffers that small.
+
+| check | result |
+|---|---|
+| both stress tests, no lock | 0 / 15 invocations failed |
+| both stress tests and the parent test under `\-race` | 3 clean runs |
+| nbtree package | 3 clean runs, and 3 under `\-race` |
+| pages deleted per 10 vacuum rounds | about 550 before and after the re\-find; parent moves are rare there |
+
+Live check on a scratch server:
+
+- 16 pgbench clients inserted random 192\-byte keys while a session
+  deleted key ranges and ran `VACUUM`;
+- the WAL then held 2 339 `MARK\_PAGE\_HALFDEAD`/`UNLINK\_PAGE` pairs next
+  to 2 335 `SPLIT\_L/R` records;
+- index and heap agreed: 59 730 rows with the same `sum\(id\)`, both before and
+  after `kill \-9` and recovery.
+
+The vacuum and DDL isolation ports pass \(21\).
+
+**Slice 7 \(gap 5, 2026\-10\-15\).** A split whose parent step never ran is
+finished by the next writer that reaches it:
+
+- **Causes.** An error between the split record and the downlink insert, or a
+  crash there; redo restores the half split.
+- **`finishSplit` is `\_bt\_finish\_split`.** It latches the left half and
+  re\-checks the flag, then latches the right half while the metapage says
+  whether the left half was the root. It then completes the split as the split
+  path does:
+  - a root split gets a new root with both halves latched;
+  - otherwise the downlink goes into the parent re\-found by `getStackBuf`,
+    with the left half latched until the record that clears its flag.
+
+  The unlatched metapage fallback in `createNewRoot` is gone, together with the
+  parent\-before\-child order it used.
+- **Where it is called.** Every place PG finishes one:
+  - the insert descent, `descendForInsert` \(`\_bt\_search` with forupdate, which
+    finishes in `\_bt\_moveright`\);
+  - `insertIntoBlock`'s target page and its move\-right \(`\_bt\_stepright`;
+    `\_bt\_insertonpg` never inserts into half a split\);
+  - `getStackBuf` on the parent level \(`\_bt\_getstackbuf`\);
+  - vacuum's `latchParentOf`.
+
+  Readers do not finish splits, as in PG. The rightmost\-leaf cache cannot meet
+  a flagged page, because a flagged page always has a right sibling.
+- **Lock removed.** `lockStructural`, both mutex fields and
+  `Pool.BTreeStructuralLock` with its 256 stripes are deleted.
+- **Bug found and fixed.** When the child arrived already latched \(slice 3\),
+  a split of the parent did not clear the child's flag in its own record. Only
+  the pin\-it\-here branch did. The flag then went out in a separate page record
+  after the parent step, unlike `\_bt\_split`, which clears it under the split
+  record \(block 3\). Both branches now clear it.
+
+Tests:
+
+- `testHookAbandonSplit` \(nil in production\) stops a chosen split after its
+  record and before its parent step.
+- `TestFinishIncompleteSplitOnContact` leaves a leaf, an internal and a root
+  split incomplete. It checks that readers still find every key, and that the
+  next writer reaching the left half finishes the split: the flag is cleared,
+  the downlink exists \(a new root in the root case\), and every key is found
+  and scanned in order. All three cases fail with finish\-on\-contact disabled.
+  The internal case also failed before the held\-child fix, because two pages
+  stayed flagged.
+- `TestGetStackBufFinishesIncompleteSplit` covers the parent\-search path.
+- `TestIncompleteSplitsFinishedConcurrently`: 16 handles insert while every
+  10th split is left incomplete, about 52 of 520. Writers finish all but 0–2 on
+  contact; `CompleteDeferredSplits` finishes the rest. No deadlock, nothing
+  left flagged, and every key is found.
+
+| check | result |
+|---|---|
+| stress tests \(splits, vacuum, 32\-writer, contact\) | 0 / 15 invocations failed |
+| nbtree package | clean, and 3 runs under `\-race` |
+| live check: 3 cycles of `kill \-9` during 16 inserters plus delete/`VACUUM` | index = heap after each recovery and after 16 000 more inserts |
+
+The vacuum and DDL isolation ports pass \(21\).
 
 ## 5. Tests
 
@@ -90,4 +390,4 @@ gate for that window. Ledgered.
 
 - No structural corruption under stress/recovery tests.
 - Writer throughput scales beyond single structural writer baseline.
-- splitMu no longer governs normal structural write flow.
+- splitMu no longer governs normal structural write flow \(met 2026\-10\-15: no structural mutex remains\).

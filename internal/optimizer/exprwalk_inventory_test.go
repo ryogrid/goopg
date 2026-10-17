@@ -142,6 +142,8 @@ var exprSwitchInventory = map[string]walkerRole{
 	// unenumerated type answers "not proven", which keeps the index guard.
 	"pseudoconstant_gate.go:SublinkIsInitPlan":        nonRecursiveClassifier, // M0145-0008o: sublink kind -> InitPlan or SubPlan, no recursion
 	"pseudoconstant_gate.go:isPseudoconstantConjunct": nonRecursiveClassifier, // M0145-0008o: a walkExprRefs Visit callback; the recursion is the driver's
+	"rangequery.go:isRangePseudoConstant":             nonRecursiveClassifier, // M0146-0184: a walkExprRefs Visit callback; the recursion is the driver's
+	"considerparallel.go:InitPlanEvaluatedByLeader":   nonRecursiveClassifier, // M0146-0192: a walkPlanExprsDeep callback flagging param/outer reads; the recursion is the driver's
 
 	// M0146-0005do: equivalence-class member test — a walkExprRefs Visit
 	// callback (scopeVeto); the switch only classifies a node as column /
@@ -264,7 +266,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// aborts it (fail-closed: the conjunct stays a join residual), and the
 	// inner plan is judged by planEscapesBy. The census sees the five-arm
 	// admission dispatch inside the Visit closure.
-	"local_filters.go:correlatedScalarSublinkLeaf": nonRecursiveClassifier,
+	"local_filters.go:correlatedScalarSublinkBinding": nonRecursiveClassifier,
 	// Added by C-02b. Built on walkExprRefs (scopeVeto carries the
 	// recursion and the exhaustiveness — sublinks and unenumerated
 	// kinds abort the walk, fail-closed); what the census sees is the
@@ -317,7 +319,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	// unenumerated Expr type makes ExprResultType decline, never guess.
 	"expr_result_type.go:ExprResultType": failClosedTypeResolver,
 
-	"planner.go:exprSide":                        nonRecursiveClassifier,
+	"planner.go:exprSideUnder":                   nonRecursiveClassifier,
 	"planner.go:exprType":                        walkerPending, // 22 of 32 arms
 	"planner.go:findFirstNestedSRF":              walkerPending, // 6 of 32 arms
 	"planner.go:inferExprType":                   nonRecursiveClassifier,

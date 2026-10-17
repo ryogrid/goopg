@@ -76,6 +76,36 @@ func comparePathkeysDim(a, b []PathKey) dimensionCmp {
 	}
 }
 
+// comparePathkeysDimRel is comparePathkeysDim with PG's canonical-pathkey
+// equality for rel: two keys whose expressions sit in one equivalence class of
+// rel's search are the same pathkey (M0146-0185). TPC-DS Q77's `wr` join keeps
+// a merge join sorted by `wr_web_page_sk` beside a nested loop sorted by
+// `wp_web_page_sk`; PG sees one pathkey, so add_path compares them on cost
+// alone and the nested loop's fast start evicts the fuzzily-equal merge.
+func comparePathkeysDimRel(rel *RelOptInfo, a, b []PathKey) dimensionCmp {
+	if rel == nil || rel.pathkeyClass == nil {
+		return comparePathkeysDim(a, b)
+	}
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if pathKeyEqual(a[i], b[i]) {
+			continue
+		}
+		if a[i].SortAsc != b[i].SortAsc || a[i].NullsFirst != b[i].NullsFirst ||
+			a[i].GroupingNulled != b[i].GroupingNulled || !rel.pathkeyClass(a[i].Expr, b[i].Expr) {
+			return dimIncomparable
+		}
+	}
+	switch {
+	case len(a) == len(b):
+		return dimEqual
+	case len(a) > len(b):
+		return dimBetter1
+	default:
+		return dimBetter2
+	}
+}
+
 // pathkeysContainedIn reports whether the ordering `keys` satisfies the ordering
 // `required` — i.e. `required` is a prefix of `keys`. Reproduces
 // pathkeys_contained_in (pathkeys.c:343). A path sorted by (a, b, c) satisfies a

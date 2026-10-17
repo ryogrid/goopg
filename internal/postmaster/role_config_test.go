@@ -41,7 +41,7 @@ func TestParseAlterRoleConfig(t *testing.T) {
 			sql: `ALTER ROLE "My Role" IN DATABASE "My DB" SET search_path TO public, pg_catalog`,
 			want: alterRoleConfigOp{
 				roleName: "My Role", hasDatabase: true, dbName: "My DB",
-				configName: "search_path", configValue: "public,pg_catalog",
+				configName: "search_path", configValue: "public, pg_catalog",
 			},
 			ok: true,
 		},

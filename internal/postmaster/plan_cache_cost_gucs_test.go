@@ -45,7 +45,7 @@ var costGUCValues = map[string]string{
 	"hash_mem_multiplier": "1.0",
 	"enable_hashjoin":     "off", "enable_mergejoin": "off",
 	"enable_nestloop": "off", "enable_memoize": "off",
-	"enable_nestloop_index": "off",
+	"goopg.enable_nestloop_index": "off",
 	"enable_hashagg":        "off", "enable_presorted_aggregate": "off",
 	"geqo": "off", "geqo_threshold": "20",
 	"geqo_effort": "10", "geqo_pool_size": "100",

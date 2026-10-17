@@ -4,60 +4,18 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestOpenedHandlesShareStructuralLock pins the cross-connection half of the
-// structural-write protocol. Each backend opens its own BTree handle, but the
-// split and unlink paths must not interleave for one relation.
-func TestOpenedHandlesShareStructuralLock(t *testing.T) {
-	bt, pool, cleanup := newTestTree(t)
-	defer cleanup()
-
-	other, err := Open(pool, bt.rel)
-	if err != nil {
-		t.Fatalf("open second handle: %v", err)
-	}
-	if bt.sharedSplitMu == nil || other.sharedSplitMu == nil || bt.sharedSplitMu != other.sharedSplitMu {
-		t.Fatal("opened handles do not share a relation structural lock")
-	}
-
-	bt.lockStructural()
-	acquired := make(chan struct{})
-	go func() {
-		other.lockStructural()
-		close(acquired)
-		other.unlockStructural()
-	}()
-	select {
-	case <-acquired:
-		t.Fatal("second handle acquired the structural lock while first held it")
-	case <-time.After(20 * time.Millisecond):
-	}
-	bt.unlockStructural()
-	select {
-	case <-acquired:
-	case <-time.After(time.Second):
-		t.Fatal("second handle did not acquire structural lock after release")
-	}
-}
-
-// TestOpenedHandlesConcurrentlyInsertAcrossSplits exercises the shared gate
-// through its production call sites. The earlier ownership test proves that
-// both handles receive one mutex; this test proves their split paths can use
-// it while inserting distinct keys into the same relation.
-//
-// Read it as a functional smoke test, NOT as a race pin. Measured 2026-09-22:
-// with `sharedSplitMu` removed from the constructors — i.e. each handle back on
-// its own mutex, the bug this protocol fixes — this test still PASSES under
-// `-race -count=3`. Its per-handle keys ascend, so the splits it drives are
-// rightmost-page splits, and the buffer-pool page locks keep that path
-// consistent on their own. `TestOpenedHandlesShareStructuralLock` is the
-// assertion that actually fails without the fix; if you want a reproducer for
-// the interleaved-structural-change failure itself, it has to be written, and
-// no existing test is one.
+// TestOpenedHandlesConcurrentlyInsertAcrossSplits inserts distinct keys
+// through two independently opened handles of one index, as two backends
+// would, and checks every pointer after several leaf splits. It is a
+// functional smoke test: its per-handle keys ascend, so it only drives
+// rightmost-page splits. The concurrency pins are the stress tests in
+// btree_structural_race_test.go and btree_vacuum_split_race_test.go. (Before
+// M0122-0010 this file also pinned that both handles shared one structural
+// mutex; that mutex is gone.)
 func TestOpenedHandlesConcurrentlyInsertAcrossSplits(t *testing.T) {
 	bt, pool, cleanup := newTestTree(t)
 	defer cleanup()

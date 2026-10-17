@@ -29,7 +29,6 @@ type physicalFailoverMode struct {
 	sessionSyncCommit string
 	primaryExtraConf  []string
 	minCommits        int64
-	asyncLossBound    int64
 	exact             bool
 	workloadDeadline  time.Duration
 }
@@ -62,7 +61,6 @@ func TestE2E_FailoverPGtoGoopg(t *testing.T) {
 		{
 			name:             "async",
 			minCommits:       20,
-			asyncLossBound:   20,
 			workloadDeadline: 20 * time.Second,
 		},
 		{
@@ -232,6 +230,16 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 			killCommitted, mode.minCommits, mode.workloadDeadline)
 	}
 
+	// The async lower bound is what the standby had already REPLAYED when
+	// the primary died: promotion never rolls back replayed WAL, in PG or
+	// in goopg. A fixed "killCommitted - N" bound assumed the stream lags
+	// by at most N commits, which no async guarantee says; on a saturated
+	// nightly host the walsender had shipped 2 of 38 (AI-20261014-001833-001).
+	var preKillReplayed int64
+	if !mode.exact {
+		preKillReplayed = goopgCount(t, standby,
+			"SELECT count(*) FROM public.bench_log WHERE src = 'pre'")
+	}
 	if err := primary.Kill(); err != nil {
 		t.Fatalf("primary.Kill: %v", err)
 	}
@@ -259,14 +267,12 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 				preCount, killCommitted)
 		}
 	} else {
-		lo := killCommitted - mode.asyncLossBound
-		if lo < 0 {
-			lo = 0
+		if preCount < preKillReplayed {
+			t.Fatalf("async failover lost replayed rows: count(*)=%d replayed_before_kill=%d killCommitted=%d",
+				preCount, preKillReplayed, killCommitted)
 		}
-		if preCount < lo {
-			t.Fatalf("async failover lost too many rows: count(*)=%d lower_bound=%d killCommitted=%d",
-				preCount, lo, killCommitted)
-		}
+		t.Logf("async failover kept %d of %d committed rows (%d replayed before the kill)",
+			preCount, killCommitted, preKillReplayed)
 		if preCount > killCommitted {
 			t.Fatalf("async failover observed extra pre rows: count(*)=%d killCommitted=%d",
 				preCount, killCommitted)
@@ -299,6 +305,14 @@ func runPGBasebackup(t *testing.T, repo, bin string, primary *pgcluster.Cluster,
 	}
 }
 
+// configureGoopgStandbyFromPGBackup points a base backup taken from a PG
+// cluster at its new primary. The backup's postgresql.auto.conf is the
+// source cluster's — when that cluster was itself a standby it still names
+// the OLD primary — and the auto file overrides postgresql.conf, in goopg as
+// in PG. So the settings are appended to postgresql.auto.conf, where the
+// later occurrence wins, exactly as pg_basebackup -R does
+// (WriteRecoveryConfig); postgresql.conf gets them too, replacing PG's
+// full sample, which names parameters goopg does not register.
 func configureGoopgStandbyFromPGBackup(t *testing.T, dataDir, conninfo, slotName string) {
 	t.Helper()
 	conf := fmt.Sprintf(
@@ -306,6 +320,16 @@ func configureGoopgStandbyFromPGBackup(t *testing.T, dataDir, conninfo, slotName
 		conninfo, slotName)
 	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte(conf), 0o600); err != nil {
 		t.Fatalf("write postgresql.conf: %v", err)
+	}
+	auto, err := os.OpenFile(filepath.Join(dataDir, "postgresql.auto.conf"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open postgresql.auto.conf: %v", err)
+	}
+	if _, err := auto.WriteString(conf); err != nil {
+		t.Fatalf("append postgresql.auto.conf: %v", err)
+	}
+	if err := auto.Close(); err != nil {
+		t.Fatalf("close postgresql.auto.conf: %v", err)
 	}
 	if err := initdb.CreateStandbySignal(dataDir); err != nil {
 		t.Fatalf("CreateStandbySignal: %v", err)

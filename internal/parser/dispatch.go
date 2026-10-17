@@ -386,7 +386,8 @@ var routedCreatePairs = map[string]map[string]bool{
 		"index": true, // P5.12
 		"view": true, // P5.13
 		"materialized": true, // P5.14 (SET SCHEMA only, see alterMatviewRouted)
-		"event": true}, // P7.2 — ALTER EVENT TRIGGER
+		"event": true, // P7.2 — ALTER EVENT TRIGGER
+		"system": true}, // M0122-0008 — ALTER SYSTEM
 	"drop": {"table": true, "index": true, "view": true, "materialized": true, // P5.1
 		"function": true, "procedure": true, "routine": true, // P5.2
 		"type": true, "domain": true, // P5.5

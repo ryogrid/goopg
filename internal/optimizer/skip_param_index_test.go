@@ -27,6 +27,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // skipCatalog builds orders(o_a, o_b, o_c) — every column NOT NULL — with a
@@ -289,4 +290,67 @@ func TestCreateIndexScanPlanSkipEmission(t *testing.T) {
 		}
 	}()
 	createIndexScanPlan(bad)
+}
+
+// TestParameterizedSkipPathsCostEveryEligibleIndex is M0146-0197's skip-scan
+// half: two indexes admit the same skip shape (one enumerated column, then the
+// bound l_suppkey). PG 18 builds the skip array into each index's own path and
+// add_path keeps the cheapest; goopg used to build a skip path on the first
+// index by name only — here the large one.
+func TestParameterizedSkipPathsCostEveryEligibleIndex(t *testing.T) {
+	c := catalog.NewInMemory()
+	li, err := c.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_a", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_b", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, err := c.CreateIndex(parser.ObjectName{Name: "a_skip_big"}, li, []string{"l_a", "l_suppkey"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := c.CreateIndex(parser.ObjectName{Name: "b_skip_small"}, li, []string{"l_b", "l_suppkey"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := catalog.RelNBlocksFunc
+	t.Cleanup(func() { catalog.RelNBlocksFunc = prev })
+	catalog.RelNBlocksFunc = func(rel storage.RelFileNode) (int64, bool) {
+		switch rel.RelOid {
+		case big.OID:
+			return 50_000, true
+		case small.OID:
+			return 500, true
+		}
+		return 0, false
+	}
+	li.Stats = &catalog.TableStats{
+		Analyzed: true,
+		RowCount: 600_000,
+		Columns:  []catalog.ColumnStats{{NDistinct: 5}, {NDistinct: 5}, {NDistinct: 50_000}},
+	}
+	outer, inner := relsetOf(0), relsetOf(1)
+	s := ppiCtx(t, li, 600_000, ppiEquiClause(outer, "s_suppkey", inner, "l_suppkey"))
+
+	s.addParameterizedIndexPaths(c)
+
+	var best *Path
+	seen := map[string]bool{}
+	for _, p := range s.findRel(inner).Pathlist {
+		if p.IndexSkipPrefix == 0 || p.IndexInfo == nil {
+			continue
+		}
+		seen[p.IndexInfo.Name] = true
+		if best == nil || p.Cost.Total < best.Cost.Total {
+			best = p
+		}
+	}
+	if best == nil {
+		t.Fatal("no parameterised skip path was generated")
+	}
+	if best.IndexInfo.Name != "b_skip_small" {
+		t.Fatalf("cheapest skip probe uses %s (%.2f; skip paths kept: %v); want the smaller b_skip_small", best.IndexInfo.Name, best.Cost.Total, seen)
+	}
 }

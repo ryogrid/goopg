@@ -154,6 +154,9 @@ func analyzeTableStats(ctx *Context, tbl *catalog.Table) error {
 		return err
 	}
 	ctx.Catalog.SetTableStats(tbl, stats)
+	// do_analyze_rel counts the visibility map (visibilitymap_count) and
+	// stores relallvisible through vac_update_relstats (M0146-0216).
+	snapshotRelAllVisible(ctx, tbl, stats.Pages)
 	// M0112: persist stats to pg_statistic so they survive restart.
 	if werr := persistStatsToPGStatistic(ctx, tbl, stats); werr != nil {
 		// Non-fatal: stats are in memory; log and continue.
@@ -428,19 +431,44 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 			// (examine_attribute returns NULL upstream); write no row.
 			continue
 		}
-		attNum := int16(col.Ordinal + 1)
-		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
-		if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
-			row, cs = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
-		}
-		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+		if err := writeColumnStatRow(ctx, statRel, cols, tbl, col, cs); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if err := persistRelSize(ctx, tbl, stats.RowCount, stats.Pages); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// writeColumnStatRow appends one column's pg_statistic row: the per-column
+// step of persistStatsToPGStatistic, shared with pg_restore_attribute_stats
+// so an imported column is persisted by ANALYZE's own writer (M0146-0215).
+// An oversized row is truncated to fit, as there (B-02).
+func writeColumnStatRow(ctx *Context, statRel storage.RelFileNode, cols []catalog.Column, tbl *catalog.Table, col catalog.Column, cs catalog.ColumnStats) error {
+	attNum := int16(col.Ordinal + 1)
+	row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+	if n, serr := pgStatisticRowTupleLen(cols, row); serr == nil && n > storage.MaxHeapTupleSize {
+		row, _ = truncateColumnStatsToFit(tbl.OID, attNum, cols, cs)
+	}
+	if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
+		return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+	}
+	return nil
+}
+
+// persistColumnStats writes one column's pg_statistic row to the connection's
+// database. It is pg_restore_attribute_stats' persistence step.
+func persistColumnStats(ctx *Context, tbl *catalog.Table, col catalog.Column, cs catalog.ColumnStats) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil {
+		return nil
+	}
+	statRel := storage.RelFileNode{
+		DBOid:  tableCatalogHeapDBOid(ctx),
+		RelOid: catalog.StatisticRelationId,
+		Fork:   storage.MainFork,
+	}
+	return writeColumnStatRow(ctx, statRel, pgStatisticColumnsPG18(), tbl, col, cs)
 }
 
 // pgStatisticMaxBoundBytes caps one histogram/MCV bound's width in the B-02
@@ -579,10 +607,17 @@ func persistRelSize(ctx *Context, tbl *catalog.Table, rowCount int64, pages int)
 		RelOid: catalog.GoopgRelStatsRelationId,
 		Fork:   storage.MainFork,
 	}
+	// relallvisible: the stored value, or NULL when none is set (an old
+	// three-column row reads the same way). M0146-0216.
+	allVisible := NullDatum
+	if st := tbl.Stats; st != nil && st.AllVisibleSet {
+		allVisible = NewIntDatum(int64(st.AllVisible))
+	}
 	sizeRow := Row{
 		NewIntDatum(int64(tbl.OID)), // starelid
 		NewIntDatum(rowCount),       // rowcount (reltuples)
 		NewIntDatum(int64(pages)),   // pages (relpages)
+		allVisible,                  // relallvisible (M0146-0216)
 	}
 	if _, err := writeHeapRowCanonical(ctx, relStatsRel, GoopgRelStatsColumns(), sizeRow); err != nil {
 		return fmt.Errorf("goopg_relstats %q: %w", tbl.Name, err)
@@ -604,7 +639,28 @@ func GoopgRelStatsColumns() []catalog.Column {
 		{Name: "starelid", Type: catalog.Type{Name: "oid"}},
 		{Name: "rowcount", Type: catalog.Type{Name: "int8"}},
 		{Name: "pages", Type: catalog.Type{Name: "int8"}},
+		// M0146-0216: the stored pg_class.relallvisible. Rows written
+		// before the column existed have three attributes and decode it
+		// as NULL: no stored value.
+		{Name: "allvisible", Type: catalog.Type{Name: "int4"}},
 	}
+}
+
+// snapshotRelAllVisible stores the relation's current all-visible block count
+// as its pg_class.relallvisible. It is the visibilitymap_count →
+// vac_update_relstats step that VACUUM (heap_vacuum_rel), ANALYZE
+// (do_analyze_rel) and index builds (index_update_stats) perform. The count is
+// clamped to relpages, as heap_vacuum_rel clamps it. M0146-0216.
+func snapshotRelAllVisible(ctx *Context, tbl *catalog.Table, pages int) {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || tbl == nil {
+		return
+	}
+	n := im.LiveRelAllVisibleBlocks(tbl)
+	if pages >= 0 && int(n) > pages {
+		n = int32(pages)
+	}
+	im.SetRelAllVisible(tbl, n)
 }
 
 // upstreamDefaultStatsTarget mirrors upstream PG's
@@ -1221,6 +1277,26 @@ func datumVariablePayloadWidth(d Datum) int {
 	}
 }
 
+// analyzeVarsizeAny is the per-value width compute_scalar_stats adds to
+// total_width: `VARSIZE_ANY(DatumGetPointer(value))` (analyze.c:2008, 2124,
+// 2471), the stored varlena INCLUDING its header (M0141-S2a-fix2r-b). A
+// string or bytea body of at most VARATT_SHORT_MAX - 1 bytes is stored behind
+// a 1-byte short header (heaptuple.c's VARATT_CAN_MAKE_SHORT path), a longer
+// one behind the 4-byte header, so TPC-DS `c_customer_id char(16)` measures
+// 17 as on PG, not 16. datumVariablePayloadWidth's numeric arm already
+// includes the header.
+func analyzeVarsizeAny(d Datum) int {
+	w := datumVariablePayloadWidth(d)
+	switch d.Kind {
+	case KindString, KindBytes:
+		if w <= pgVarlenaShortMaxBody {
+			return w + 1
+		}
+		return w + 4
+	}
+	return w
+}
+
 // pgVarlenaShortMaxBody is PG's VARATT_SHORT_MAX (postgres/src/include/varatt.h:257)
 // minus VARHDRSZ_SHORT (:255) — the largest varlena BODY (header excluded) that
 // still fits a 1-byte "short" varlena header. numeric_size-equivalent width
@@ -1335,7 +1411,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 			continue
 		}
 		nonNull++
-		totalPayloadWidth += int64(datumVariablePayloadWidth(d))
+		totalPayloadWidth += int64(analyzeVarsizeAny(d))
 		kd := d
 		if bpcharCatalogType(colType) {
 			// n_distinct/MCV bucketing on bpchar runs over the bcTruelen
@@ -1363,8 +1439,10 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, totalRows int
 	// typlen-derived AvgWidth above and PG never overwrites it with a
 	// measured value (analyze.c's is_varwidth branch guards the
 	// total_width/nonnull_cnt division the same way).
+	// stawidth is an int32 (pg_statistic): PG assigns the double quotient
+	// to it, truncating (analyze.c:2584).
 	if !fixedWidth && nonNull > 0 {
-		stats.AvgWidth = float64(totalPayloadWidth) / float64(nonNull)
+		stats.AvgWidth = math.Trunc(float64(totalPayloadWidth) / float64(nonNull))
 	}
 
 	// Number of sampled values seen more than once — upstream's `nmultiple`

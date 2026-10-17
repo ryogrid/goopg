@@ -9,6 +9,7 @@ package optimizer
 import (
 	"bufio"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -415,10 +416,10 @@ func TestR56TracedDecompositionPins(t *testing.T) {
 
 	// The upper adds, isolated by pricing over a zero input.
 	sortedAdd := costAgg(cp, AggStrategySorted, leaderRows, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("sorted upper add", sortedAdd, 58.76, 0.01)
 	hashedAdd := costAgg(cp, AggStrategyHashed, leaderRows, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("hashed upper add", hashedAdd, 58.76, 0.01)
 	if sortedAdd != hashedAdd {
 		t.Errorf("sorted/hashed upper adds differ (%f vs %f): a strategy-dependent "+
@@ -427,11 +428,11 @@ func TestR56TracedDecompositionPins(t *testing.T) {
 	// The partial add prices per-worker rows into per-worker groups (no
 	// reduction at this level: 1468 groups out of 1468 rows).
 	partialAdd := costAgg(cp, AggStrategyHashed, workerRows, 0, 0,
-		nGroupCols, partialGroups, nAggs, 0, 0).Total
+		nGroupCols, partialGroups, nAggs, 0).Total
 	near("partial add", partialAdd, 33.03, 0.01)
 	// The split finalize prices the crossed group-states (1468×4=5872).
 	finalizeAdd := costAgg(cp, AggStrategyHashed, workerRows*workers, 0, 0,
-		nGroupCols, finalGroups, nAggs, 0, 0).Total
+		nGroupCols, finalGroups, nAggs, 0).Total
 	near("split finalize add", finalizeAdd, 58.75, 0.01)
 
 	// The margin itself: the leader Sort at N=5874.
@@ -1076,7 +1077,7 @@ func TestPartialGroupLowering(t *testing.T) {
 func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	grouped, partialRel *RelOptInfo, pseed *Path, cp costParams,
 	workers int, d, perWorkerRows, partialGroups, finalGroups float64,
-	nGroupCols, nAggs, inNcols int, inAvgVar float64) {
+	nGroupCols, nAggs, inWidth int) {
 	t.Helper()
 	cp = ps.costParams()
 	u := newUpperRels()
@@ -1091,7 +1092,7 @@ func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	if seed.Cost.Total <= 0 {
 		seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
 	}
-	workers = upperSplitWorkers(child, cp, ps)
+	workers = upperSplitWorkers(nil, child, cp, ps)
 	if workers <= 0 {
 		t.Fatal("fixture admitted no workers — upperSplitWorkers refused the child")
 	}
@@ -1123,19 +1124,19 @@ func sortedInputCtx(t *testing.T, agg *Aggregate, ps PlannerSettings) (
 	pseed.ParallelWorkers = workers
 	nGroupCols = len(agg.GroupExprs)
 	nAggs = len(agg.Aggs)
-	inNcols, inAvgVar = aggInputWidth(child, agg)
+	inWidth = aggInputPGWidth(child, agg)
 	return grouped, partialRel, pseed, cp, workers, d, perWorkerRows, partialGroups,
-		finalGroups, nGroupCols, nAggs, inNcols, inAvgVar
+		finalGroups, nGroupCols, nAggs, inWidth
 }
 
 // fileSortedInput calls the slice-3 arm directly on a fresh rel — the only
 // candidate on it — and returns the filed path.
 func fileSortedInput(t *testing.T, agg *Aggregate, ps PlannerSettings) *Path {
 	t.Helper()
-	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 		sortedInputCtx(t, agg, ps)
 	sorted := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-		workers, d, pwr, pg, fg, ngc, na, inc, iav)
+		workers, d, pwr, pg, fg, ngc, na, inw)
 	if sorted == nil {
 		t.Fatal("sorted-input arm returned nil — the merge-key gate refused")
 	}
@@ -1270,10 +1271,10 @@ func TestUpperSplitSortedInputArmRefusals(t *testing.T) {
 	// file anything.
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	agg.GroupExprs[0] = &IntegerConst{Value: 7}
-	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+	grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 		sortedInputCtx(t, agg, upperSplitSettings())
 	if got := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-		workers, d, pwr, pg, fg, ngc, na, inc, iav); got != nil {
+		workers, d, pwr, pg, fg, ngc, na, inw); got != nil {
 		t.Error("sorted-input arm filed over a group expr no merge key can name")
 	}
 	if len(grouped.Pathlist) != 0 {
@@ -1316,15 +1317,15 @@ func TestUpperSplitSortedInputArmElection(t *testing.T) {
 	defer restore()
 
 	contest := func(agg *Aggregate, wm int64) (*RelOptInfo, *Path, *Path) {
-		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inc, iav :=
+		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
 			sortedInputCtx(t, agg, upperSplitSettings())
 		if wm > 0 {
 			cp.workMem = wm
 		}
 		si := addPartialAggSortedInputArm(grouped, partialRel, pseed, agg, cp,
-			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+			workers, d, pwr, pg, fg, ngc, na, inw)
 		sp := addPartialAggSortedSplitArm(grouped, partialRel, pseed, agg, cp,
-			workers, d, pwr, pg, fg, ngc, na, inc, iav)
+			workers, d, pwr, pg, fg, ngc, na, inw)
 		return grouped, si, sp
 	}
 
@@ -1582,12 +1583,12 @@ func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
 
 	ps := upperSplitSettings()
 	survives := func(agg *Aggregate, inputTotal float64, enableSort bool) bool {
-		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inc, iav := sortedInputCtx(t, agg, ps)
+		_, _, pseed, cp, _, _, pwr, pg, _, ngc, na, inw := sortedInputCtx(t, agg, ps)
 		if inputTotal > 0 {
 			pseed.Cost = Cost{Startup: 0.4, Total: inputTotal}
 		}
 		cp.enableSort = enableSort
-		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inc, iav)
+		return hashedPartialAggSurvives(pseed, agg, cp, ps, pwr, pg, ngc, na, inw)
 	}
 
 	// Expensive input: the worker sort is inside the fuzz.
@@ -1718,15 +1719,21 @@ func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
 	}
 }
 
-// TestGatheredArmBoundariesShareComputeGatherRows pins M0146-0009n: with a
-// searched partial path whose per-worker rows are not the serial seed's rows
-// over the divisor, the gathered (no-split) arm's Gather and its worker-sort
-// Gather Merge both carry `compute_gather_rows` (costsize.c) of the partial
-// input — per-worker rows × divisor, clamped. The Gather used to take the
-// seed's rows, so the two shapes were charged `parallel_tuple_cost` on
-// different counts and the Gather Merge won TPC-DS Q56's near-tie PG's
-// Sort-over-Gather wins.
-func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
+// TestGatheredArmBoundariesCarryScanJoinRelRows pins M0146-0220.
+//
+// Setup: a searched partial path whose per-worker rows are not the serial
+// seed's rows over the divisor.
+//
+// Check: the gathered (no-split) arm's Gather and its worker-sort Gather Merge
+// both carry the seed's rows, i.e. the scan/join rel's. Upstream builds both on
+// that rel with override_rows false, so create_gather_path and
+// create_gather_merge_path stamp rel->rows.
+//
+// History: M0146-0009n first gave the two boundaries the same count, which ended
+// a mismatch that decided TPC-DS Q56's near-tie. But it chose
+// compute_gather_rows, the count of the override_rows=true upper-rel calls. That
+// let TPC-DS SF1 Q48's no-split Gather undercut PG's Finalize Aggregate.
+func TestGatheredArmBoundariesCarryScanJoinRelRows(t *testing.T) {
 	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
 	defer restore()
 
@@ -1745,13 +1752,16 @@ func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
 	const workers = 4
 	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
 	partial := &Path{
-		Rows:            seed.Rows / d * 0.8,
+		// Per-worker rows ABOVE the rel's share, so compute_gather_rows
+		// exceeds the rel's rows and the rel-sized no-split boundaries are
+		// the cheaper shapes the rel keeps.
+		Rows:            seed.Rows / d * 1.2,
 		Cost:            parallelSeedCost(seed.Cost, d),
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
 	}
-	want := clampRowEst(partial.Rows * d)
-	if want == clampRowEst(seed.Rows) {
+	want := seed.Rows
+	if clampRowEst(partial.Rows*d) == want {
 		t.Fatalf("fixture does not separate the partial rows from the seed's: both %v", want)
 	}
 	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
@@ -1770,8 +1780,8 @@ func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
 			if sub.Kind != PathAgg { // the split arm's boundary crosses group states
 				seen[p.Kind]++
 				if p.Rows != want {
-					t.Errorf("%v over the partial input: rows=%v, want compute_gather_rows=%v (seed rows %v)",
-						p.Kind, p.Rows, want, seed.Rows)
+					t.Errorf("%v over the partial input: rows=%v, want the scan/join rel's %v (compute_gather_rows %v)",
+						p.Kind, p.Rows, want, clampRowEst(partial.Rows*d))
 				}
 			}
 		}
@@ -1786,4 +1796,66 @@ func TestGatheredArmBoundariesShareComputeGatherRows(t *testing.T) {
 		t.Fatalf("no gathered no-split candidate survived on the rel: %d paths", len(grouped.Pathlist))
 	}
 	t.Logf("gathered boundaries checked: %v", seen)
+}
+
+// TestSplitArmBoundariesCarryComputeGatherRows pins M0146-0221 slice 1.
+// gather_grouping_paths passes compute_gather_rows, which clamps, for every
+// Gather and Gather Merge over a partial grouping path. TPC-DS Q5's wsr branch
+// has 2 groups per worker under 2 workers, so 2 × 2.4 = 4.8 crosses as 5. The
+// unclamped 4.8 priced goopg's split arm 0.02 under PG's and helped it win a
+// near-tie that PG's no-split arm wins.
+func TestSplitArmBoundariesCarryComputeGatherRows(t *testing.T) {
+	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
+	defer restore()
+
+	agg := sizedAggFixture(t, 1_000_000, 37, 2, 1)
+	ps := upperSplitSettings()
+	cp := ps.costParams()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 0)
+	sizeGroupingRelFromAgg(grouped, agg)
+	seed := newPrebuiltPath(grouped, agg.Child)
+	seed.Rows = float64(EstimateRows(agg.Child))
+	seed.Cost = costSeqscan(cp, estScanPages(seed.Rows, 32), seed.Rows, 0)
+	const workers = 2
+	d := getParallelDivisor(workers, ps.ParallelLeaderParticipation)
+	if math.Mod(37*d, 1) == 0 {
+		t.Fatalf("fixture crossing %v is integral; the clamp would not show", 37*d)
+	}
+	partial := &Path{
+		Rows:            seed.Rows / d,
+		Cost:            parallelSeedCost(seed.Cost, d),
+		ParallelSafe:    true,
+		ParallelWorkers: workers,
+	}
+	addPartialAggSplitPath(u, grouped, seed, agg, agg.Child, cp, ps, partial)
+
+	n := 0
+	var walk func(p *Path)
+	walk = func(p *Path) {
+		if p == nil {
+			return
+		}
+		if p.Kind == PathGather || p.Kind == PathGatherMerge {
+			sub := p.Children[0]
+			if sub.Kind == PathSort {
+				sub = sub.Children[0]
+			}
+			if sub.Kind == PathAgg { // a split arm: group states cross
+				n++
+				if p.Rows != math.RoundToEven(p.Rows) || p.Rows < 1 {
+					t.Errorf("%v over the partial aggregate: rows=%v, not clamp_row_est'd", p.Kind, p.Rows)
+				}
+			}
+		}
+		for _, c := range p.Children {
+			walk(c)
+		}
+	}
+	for _, p := range grouped.Pathlist {
+		walk(p)
+	}
+	if n == 0 {
+		t.Fatalf("no split-arm boundary on the rel: %d paths", len(grouped.Pathlist))
+	}
 }

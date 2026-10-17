@@ -2248,14 +2248,20 @@ type aggregateOp struct {
 	plan   *optimizer.Aggregate
 	child  Operator
 	schema optimizer.Schema
-	// gkVals / gkKeys are the hashed grouping loop's per-row scratch
-	// (M0145-0008f): the group-key values and their datumKey strings are
-	// rebuilt for every input row but retained only when the row founds a
-	// new group, so they live in reused buffers instead of two fresh slices
-	// per row. The sorted path keeps its own allocations: it holds the
+	// gkVals is the hashed grouping loop's per-row scratch (M0145-0008f):
+	// the group-key values are rebuilt for every input row but retained only
+	// when the row founds a new group, so they live in a reused buffer
+	// instead of a fresh slice per row. The sorted path keeps its own allocations: it holds the
 	// previous row's key parts across rows (curParts).
 	gkVals Row
-	gkKeys []string
+	// aggLower / aggLowerSrc cache each aggregate's lower-cased name by
+	// aggregate index (aggLowerName).
+	aggLower    []string
+	aggLowerSrc []string
+	// gkBuf is the per-row group key, built in place by appendGroupKey so
+	// the map lookup allocates nothing for a row of an existing group
+	// (M0122-0012). It holds exactly setGroupKey's bytes.
+	gkBuf []byte
 	// gkTrims[i] flags a bpchar-typed grouping expression: its bcTruelen
 	// image is what the group key must hash (PG's hashbpchar ignores
 	// trailing blanks so that char(20) 'x' and char(5) 'x' land in one
@@ -2627,14 +2633,18 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		// keys below are cut out of that one vector. This is the whole point
 		// of the single-pass shape — the source is read once and each row is
 		// routed into every set's hash table.
-		allVals, allKeys, err := o.evalGroupKeysScratch(slot)
+		allVals, err := o.evalGroupValsScratch(slot)
 		if err != nil {
 			return err
 		}
 		for si, set := range sets {
-			key := o.setGroupKey(si, set, allKeys, multiSet)
-			gr, ok := groups[key]
+			// M0122-0012: the key is built into gkBuf and looked up as
+			// string(gkBuf), which Go does not allocate for; the key string
+			// is materialised only when this row founds a group.
+			o.gkBuf = o.appendGroupKey(o.gkBuf[:0], si, set, allVals, multiSet)
+			gr, ok := groups[string(o.gkBuf)]
 			if !ok {
+				key := string(o.gkBuf)
 				// Evaluate passthrough (functionally-determined) columns from the first row.
 				var ptVals Row
 				if len(o.plan.Passthrough) > 0 {
@@ -2671,7 +2681,8 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			}
 
 			o.currentRowVersion++
-			for i, call := range o.plan.Aggs {
+			for i := range o.plan.Aggs {
+				call := &o.plan.Aggs[i]
 				// For user-defined aggregates with shared transition state, only the
 				// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
 				// skip applyAgg — they will be synced from the leader's final state just
@@ -2948,32 +2959,103 @@ func (o *aggregateOp) evalGroupExprs(slot TupleSlot) (Row, []string, error) {
 	return vals, parts, nil
 }
 
-// evalGroupKeysScratch is evalGroupExprs for the hashed grouping loop: the
-// values and keys land in the operator's reused scratch buffers, and the
-// values are NOT detached from the input arena — the caller materializes the
-// ones it retains (a new group's groupValues). The returned slices are valid
-// only until the next call. The datumKey strings are freshly built (every
-// arm copies), so a key stored in the group map never aliases the arena.
-func (o *aggregateOp) evalGroupKeysScratch(slot TupleSlot) (Row, []string, error) {
-	n := len(o.plan.GroupExprs)
-	if n == 0 {
-		return nil, nil, nil
+// aggLowerName is strings.ToLower(name) for aggregate idx, cached per
+// operator (M0122-0012): applyAgg dispatches on the lower-cased name for every
+// input row, and recomputing it was a per-row scan of each aggregate's name.
+// The cache is keyed on the source name too, so an operator whose plan is
+// swapped (tests) can never be served a stale entry.
+func (o *aggregateOp) aggLowerName(idx int, name string) string {
+	if idx >= 0 && idx < len(o.aggLowerSrc) && o.aggLowerSrc[idx] == name {
+		return o.aggLower[idx]
+	}
+	lower := strings.ToLower(name)
+	if idx >= 0 && idx < 1024 {
+		for len(o.aggLowerSrc) <= idx {
+			o.aggLowerSrc = append(o.aggLowerSrc, "")
+			o.aggLower = append(o.aggLower, "")
+		}
+		// Mark the slot filled only after both halves are written.
+		o.aggLower[idx] = lower
+		o.aggLowerSrc[idx] = name
+	}
+	return lower
+}
+
+// evalGroupValsScratch evaluates the grouping columns for the hashed grouping
+// loop into the operator's reused gkVals. The values are NOT detached from the
+// input arena: the caller materializes the ones it retains (a new group's
+// groupValues). The slice is valid only until the next call. appendGroupKey
+// builds the row's key from it (M0122-0012; this replaced
+// evalGroupKeysScratch, which also built a datumKey string per column).
+func (o *aggregateOp) evalGroupValsScratch(slot TupleSlot) (Row, error) {
+	if len(o.plan.GroupExprs) == 0 {
+		return nil, nil
 	}
 	vals := o.gkVals[:0]
-	keys := o.gkKeys[:0]
-	for i, g := range o.plan.GroupExprs {
+	for _, g := range o.plan.GroupExprs {
 		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		vals = append(vals, v)
-		if i < len(o.gkTrims) && o.gkTrims[i] {
-			v = trimStringDatum(v)
-		}
-		keys = append(keys, datumKey(v))
 	}
-	o.gkVals, o.gkKeys = vals, keys
-	return vals, keys, nil
+	o.gkVals = vals
+	return vals, nil
+}
+
+// appendGroupKey appends setGroupKey(si, set, allKeys, multiSet)'s bytes to
+// buf, where allKeys[i] would be datumKey of grouping value i, with the
+// bpchar padding stripped where gkTrims says so (evalGroupKeysScratch). It
+// builds the same key without allocating a string per column or per set;
+// TestAppendGroupKeyMatchesSetGroupKey pins the two together.
+func (o *aggregateOp) appendGroupKey(buf []byte, si int, set []int, vals Row, multiSet bool) []byte {
+	if len(set) == 0 && !multiSet {
+		return append(buf, "__all__"...)
+	}
+	if multiSet {
+		buf = strconv.AppendInt(buf, int64(si), 10)
+		buf = append(buf, '\x00')
+	}
+	for i, ci := range set {
+		if i > 0 {
+			buf = append(buf, '|')
+		}
+		v := vals[ci]
+		if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
+			// trimStringDatum's result, without forming a new Datum.
+			buf = append(buf, 's', ':')
+			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
+			continue
+		}
+		buf = appendDatumKey(buf, v)
+	}
+	return buf
+}
+
+// appendDatumKey appends datumKey(d)'s bytes to buf (M0122-0012). The common
+// kinds are encoded in place; any other kind defers to datumKey itself, so
+// the two cannot disagree.
+func appendDatumKey(buf []byte, d Datum) []byte {
+	switch d.Kind {
+	case KindNull:
+		return append(buf, 'n')
+	case KindBool:
+		if d.BoolValue() {
+			return append(buf, "b:t"...)
+		}
+		return append(buf, "b:f"...)
+	case KindInt:
+		return appendCanonicalNumericKey(buf, d.Int, 0)
+	case KindNumeric:
+		if d.Flags&flagBigNumeric != 0 {
+			return append(buf, datumKey(d)...)
+		}
+		return appendCanonicalNumericKey(buf, d.NumericMantissaValue(), int(d.Scale))
+	case KindString:
+		buf = append(buf, 's', ':')
+		return append(buf, d.StringValue()...)
+	}
+	return append(buf, datumKey(d)...)
 }
 
 // setGroupKey builds the hash key for grouping set si over one input row's
@@ -3133,7 +3215,8 @@ func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
 			curParts = parts
 		}
 		o.currentRowVersion++
-		for i, call := range o.plan.Aggs {
+		for i := range o.plan.Aggs {
+			call := &o.plan.Aggs[i]
 			// SharedStateSlot followers skip sfunc exactly as the hash
 			// drain and openSorted do (M0097-0035): they are synced from
 			// the leader's combined state on the FINALIZE side.
@@ -3633,7 +3716,8 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 			curParts = parts
 		}
 		o.currentRowVersion++
-		for i, call := range o.plan.Aggs {
+		for i := range o.plan.Aggs {
+			call := &o.plan.Aggs[i]
 			// For user-defined aggregates with shared transition state, only the
 			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
 			// skip applyAgg — they will be synced from the leader's final state just
@@ -3756,7 +3840,11 @@ func (o *aggregateOp) aggEvalList2(nodes [][]int32, idx, sub int, e optimizer.Ex
 	return evalExprSlot(e, slot, o.ctx)
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slot TupleSlot, idx int) error {
+// applyAgg folds one input row into one aggregate's transition state. call
+// points into o.plan.Aggs: a 320-byte AggregateCall passed by value, and
+// before that copied by the caller's range loop, was two copies per aggregate
+// per row (M0122-0012 slice 16). applyAgg only reads it.
+func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, slot TupleSlot, idx int) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
@@ -3766,7 +3854,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		}
 	}
 
-	name := strings.ToLower(call.Name)
+	name := o.aggLowerName(idx, call.Name)
 	if call.Star {
 		if call.UserAgg != nil {
 			// User-defined star aggregate (e.g. newcnt(*)) — call sfunc with state only.
@@ -3910,6 +3998,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call optimizer.AggregateCall, slo
 		case KindNumeric:
 			if !st.hasValue || st.numericSum.Kind != KindNumeric {
 				st.numericSum = Datum{Kind: KindNumeric, Scale: arg.Scale}
+			}
+			// M0122-0012: numericAdd's int64 lane, in place. With both
+			// operands outside the big-mantissa lane and at one scale,
+			// numericAdd aligns nothing and returns
+			// Datum{KindNumeric, Int: a+b, Scale} when the add does not
+			// overflow, which is exactly this update (st.numericSum carries
+			// no other field). Anything else takes numericAdd.
+			if st.numericSum.Flags&flagBigNumeric == 0 && arg.Flags&flagBigNumeric == 0 && st.numericSum.Scale == arg.Scale {
+				if r, ok := addInt64Overflow(st.numericSum.Int, arg.Int); ok {
+					st.numericSum.Int = r
+					break
+				}
 			}
 			s, err := numericAdd(st.numericSum, arg)
 			if err != nil {
@@ -5451,7 +5551,7 @@ func datumToInt64Key(d Datum) (int64, bool) {
 	case KindInt:
 		return d.Int, true
 	case KindNumeric:
-		if d.NumericBigValue() != nil {
+		if isBigNumeric(d) {
 			return 0, false // overflow lane: not representable as int64
 		}
 		m, s := d.NumericMantissaValue(), int(d.Scale)

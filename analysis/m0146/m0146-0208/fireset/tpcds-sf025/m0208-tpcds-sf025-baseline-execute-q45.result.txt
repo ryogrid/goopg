@@ -1,0 +1,7 @@
+   ca_zip   |  ca_city   |  sum  
+------------+------------+-------
+ 04698      | Woodlawn   | 45.37
+ 41521      | Newport    | 11.59
+ 76614      | Providence | 75.83
+(3 rows)
+

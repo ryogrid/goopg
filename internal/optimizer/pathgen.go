@@ -189,7 +189,7 @@ func addNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, jt parser
 	if i == nil {
 		return
 	}
-	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
+	for _, o := range nestLoopPlainOuters(outer, uniq, sjinfo, cp) {
 		addNestLoopPathFor(joinRel, outer, inner, o, i, cp, jt, quals, sjinfo, semi)
 	}
 }
@@ -216,18 +216,23 @@ func addMaterialNestLoopPath(joinRel, outer, inner *RelOptInfo, cp costParams, j
 	if matpath == nil {
 		return
 	}
-	for _, o := range nestLoopPlainOuters(outer, uniq, cp) {
+	for _, o := range nestLoopPlainOuters(outer, uniq, sjinfo, cp) {
 		addNestLoopPathFor(joinRel, outer, inner, o, matpath, cp, jt, quals, sjinfo, semi)
 	}
 }
 
 // nestLoopPlainOuters is match_unsorted_outer's outer loop for the plain
 // nested loop (M0146-0005m): every unparameterised outer path, so an ordered
-// non-cheapest outer yields an ordered nested loop. The JOIN_UNIQUE_OUTER
-// case keeps its single cheapest-total outer.
-func nestLoopPlainOuters(outer *RelOptInfo, uniq uniqueSide, cp costParams) []*Path {
+// non-cheapest outer yields an ordered nested loop. JOIN_UNIQUE_OUTER loops
+// over the cheapest-total path only, and — as for every nested loop of that
+// branch (joinpath.c: `outerpath = create_unique_path(...)`) — over its
+// unique-ified form, the same answer nestLoopOuterPaths gives the probe arm.
+// The raw path is only right when unique-ifying is free (UNIQUE_PATH_NOOP);
+// a paid one (sort or hash) both removes duplicates and carries no pathkeys,
+// which is what lets TPC-DS Q70's hash semi join win its tie (M0146-0179).
+func nestLoopPlainOuters(outer *RelOptInfo, uniq uniqueSide, sjinfo *SpecialJoinInfo, cp costParams) []*Path {
 	if uniq == uniqueSideOuter {
-		return []*Path{outer.CheapestTotal}
+		return nestLoopOuterPaths(outer, uniq, sjinfo, cp)
 	}
 	return nestLoopOuterPaths(outer, uniqueSideNone, nil, cp)
 }

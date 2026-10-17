@@ -103,7 +103,7 @@ func TestAggApplyCompiledPath(t *testing.T) {
 	o.compileAggExprs()
 	slot := SlotFromRow(nil, aggParityRow())
 	var st aggRuntime
-	if err := o.applyAgg(&st, plan.Aggs[0], slot, 0); err != nil {
+	if err := o.applyAgg(&st, &plan.Aggs[0], slot, 0); err != nil {
 		t.Fatalf("applyAgg: %v", err)
 	}
 	if !st.hasValue || st.sum != 7 {
@@ -112,7 +112,7 @@ func TestAggApplyCompiledPath(t *testing.T) {
 	// FILTER false row: same call, bool false at index 4.
 	row := Row{NewIntDatum(7), NewIntDatum(11), NullDatum, NewStringDatum("abc"), NewBoolDatum(false)}
 	var st2 aggRuntime
-	if err := o.applyAgg(&st2, plan.Aggs[0], SlotFromRow(nil, row), 0); err != nil {
+	if err := o.applyAgg(&st2, &plan.Aggs[0], SlotFromRow(nil, row), 0); err != nil {
 		t.Fatalf("applyAgg: %v", err)
 	}
 	if st2.hasValue {
@@ -158,7 +158,7 @@ func TestAggArg2FailurePerSite(t *testing.T) {
 			o.compileAggExprs()
 			slot := SlotFromRow(nil, aggParityRow())
 			var st aggRuntime
-			if err := o.applyAgg(&st, plan.Aggs[0], slot, 0); err != nil {
+			if err := o.applyAgg(&st, &plan.Aggs[0], slot, 0); err != nil {
 				t.Fatalf("applyAgg with failing Arg2: %v (must skip, not abort)", err)
 			}
 			if st.hasValue {
@@ -180,7 +180,7 @@ func TestAggApplyNoAllocs(t *testing.T) {
 	slot := SlotFromRow(nil, aggParityRow())
 	var st aggRuntime
 	if n := testing.AllocsPerRun(100, func() {
-		if err := o.applyAgg(&st, plan.Aggs[0], slot, 0); err != nil {
+		if err := o.applyAgg(&st, &plan.Aggs[0], slot, 0); err != nil {
 			t.Fatalf("applyAgg: %v", err)
 		}
 	}); n != 0 {

@@ -32,6 +32,10 @@ const (
 	// xactXinfoHasSubxacts is XACT_XINFO_HAS_SUBXACTS (xact.h:189): an
 	// xl_xact_subxacts{nsubxacts, subxacts[]} chunk follows.
 	xactXinfoHasSubxacts uint32 = 1 << 1
+	// xactXinfoHasRelfilelocators is XACT_XINFO_HAS_RELFILELOCATORS
+	// (xact.h:190): an xl_xact_relfilelocators{nrels, xlocators[]} chunk
+	// follows the subxacts chunk — the relations dropped at commit/abort.
+	xactXinfoHasRelfilelocators uint32 = 1 << 2
 
 	// sizeOfXactDbinfo is sizeof(xl_xact_dbinfo): dbId(4) + tsId(4).
 	sizeOfXactDbinfo = 8
@@ -58,6 +62,15 @@ type XactParsed struct {
 	// transaction, in the record's order. Empty when the transaction used no
 	// subtransactions (the common case).
 	Subxacts []uint32
+	// DroppedRels are the relations the transaction dropped (the
+	// HAS_RELFILELOCATORS chunk), raw as PG wrote them. The WAL summarizer
+	// sets their limit block to 0 (walsummarizer.c SummarizeXactRecord).
+	DroppedRels []XactRelFileLocator
+}
+
+// XactRelFileLocator is a RelFileLocator as an xact record carries it.
+type XactRelFileLocator struct {
+	SpcOid, DbOid, RelNumber uint32
 }
 
 // ParseXactRecord decodes the main data of an RM_XACT_ID commit or abort record
@@ -112,10 +125,32 @@ func ParseXactRecord(info uint8, mainData []byte) (XactParsed, error) {
 		for i := 0; i < n; i++ {
 			out.Subxacts[i] = binary.LittleEndian.Uint32(data[i*4 : i*4+4])
 		}
-		// Later chunks (relfilelocators, stats items, invals, twophase, gid,
-		// origin) are not consumed here; goopg's clog pass needs nothing beyond
-		// the subxact array, and the relcache-init-file signal is read
-		// separately by xactCommitCarriesInvals.
+		data = data[n*4:]
 	}
+	if out.Xinfo&xactXinfoHasRelfilelocators != 0 {
+		if len(data) < 4 {
+			return out, fmt.Errorf("wal: xact record xinfo has RELFILELOCATORS but only %d bytes remain", len(data))
+		}
+		n := int(int32(binary.LittleEndian.Uint32(data[:4])))
+		data = data[4:]
+		if n < 0 || n > maxParsedSubxacts {
+			return out, fmt.Errorf("wal: xact record declares %d dropped relations, refusing to decode", n)
+		}
+		if len(data) < n*sizeOfRelFileLocator {
+			return out, fmt.Errorf("wal: xact record declares %d dropped relations but only %d bytes remain", n, len(data))
+		}
+		out.DroppedRels = make([]XactRelFileLocator, n)
+		for i := 0; i < n; i++ {
+			b := data[i*sizeOfRelFileLocator:]
+			out.DroppedRels[i] = XactRelFileLocator{
+				SpcOid:    binary.LittleEndian.Uint32(b[0:4]),
+				DbOid:     binary.LittleEndian.Uint32(b[4:8]),
+				RelNumber: binary.LittleEndian.Uint32(b[8:12]),
+			}
+		}
+	}
+	// Later chunks (stats items, invals, twophase, gid, origin) are not
+	// consumed here; the relcache-init-file signal is read separately by
+	// xactCommitCarriesInvals.
 	return out, nil
 }

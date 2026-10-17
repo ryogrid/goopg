@@ -1,0 +1,13 @@
+M19 gather nrels=6 startup=1017.2725 total=17965.5380 rows=1.0 accept=0 npaths=2
+M19 gather nrels=6 startup=1017.2700 total=17964.3777 rows=1.0 accept=0 npaths=1
+M19 gather nrels=6 startup=1016.9775 total=20370.5200 rows=6419.0 accept=0 npaths=2
+M19 gather nrels=6 startup=2451.0597 total=19062.7876 rows=304.0 accept=1 npaths=0
+M19 gather nrels=6 startup=1002.3350 total=18131.1511 rows=1.0 accept=1 npaths=0
+M19 gather nrels=6 startup=3084.8700 total=18970.4702 rows=2.0 accept=1 npaths=0
+M19 gather nrels=7 startup=1017.5600 total=17964.7370 rows=1.0 accept=0 npaths=1
+M19 add_path upper type=368 startup=17964.6420 total=17964.9520 rows=3.0 psafe=0 accept=1
+M19 input path type=356 startup=1002.4825 total=18131.3240 rows=1.0
+M19 input partial type=356 startup=17.5600 total=16964.6370 rows=1.0
+M19 add_path upper type=365 startup=18131.3290 total=18131.3390 rows=1.0 psafe=0 accept=1
+M19 add_path upper type=365 startup=17964.9695 total=17964.9795 rows=1.0 psafe=0 accept=1
+M19 add_path upper type=365 startup=17964.9695 total=17964.9795 rows=1.0 psafe=0 accept=1

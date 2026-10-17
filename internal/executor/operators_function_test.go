@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -484,8 +485,10 @@ func TestExecCreateFunctionSetClausePopulatesConfig(t *testing.T) {
 	if !fn.Strict {
 		t.Error("STRICT after SET clause was not applied (combinable common_func_opt_item)")
 	}
-	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
-		t.Errorf("Config = %#v, want [search_path=app,public]", fn.Config)
+	// flatten_set_variable_args joins list elements with ", " (PG 18.3
+	// proconfig: {"search_path=app, public"}).
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app, public" {
+		t.Errorf("Config = %#v, want [search_path=app, public]", fn.Config)
 	}
 }
 
@@ -519,15 +522,15 @@ func TestExecAlterFunctionSetResetConfig(t *testing.T) {
 	if fn.Volatile != "v" {
 		t.Errorf("Volatile after combined SET = %q, want v", fn.Volatile)
 	}
-	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
-		t.Fatalf("Config after SET = %#v, want [search_path=app,public]", fn.Config)
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app, public" {
+		t.Fatalf("Config after SET = %#v, want [search_path=app, public]", fn.Config)
 	}
 
 	// A second SET on a different name appends.
 	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) SET work_mem = '64MB'", cat); err != nil {
 		t.Fatalf("ALTER FUNCTION SET work_mem: %v", err)
 	}
-	if len(fn.Config) != 2 || fn.Config[0] != "search_path=app,public" || fn.Config[1] != "work_mem=64MB" {
+	if len(fn.Config) != 2 || fn.Config[0] != "search_path=app, public" || fn.Config[1] != "work_mem=64MB" {
 		t.Fatalf("Config after second SET = %#v", fn.Config)
 	}
 
@@ -545,5 +548,49 @@ func TestExecAlterFunctionSetResetConfig(t *testing.T) {
 	}
 	if fn.Config != nil {
 		t.Errorf("Config after RESET ALL = %#v, want nil", fn.Config)
+	}
+}
+
+// TestExecFunctionConfigCanonicalNamesAndValidation pins update_proconfig_value
+// (functioncmds.c): proconfig stores each SET under the variable's own name
+// (GUCArrayAdd — `DateStyle=`, map_old_guc_names `sort_mem` -> work_mem),
+// RESET finds the entry by its normalised name (GUCArrayDelete), and an
+// unknown name, a non-SET-able variable or an invalid value fails the
+// statement (validate_option_array_item) instead of being stored.
+func TestExecFunctionConfigCanonicalNamesAndValidation(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION g() RETURNS int LANGUAGE sql SET datestyle = iso, mdy SET TIMEZONE = 'UTC' SET sort_mem = '1MB' AS $$ SELECT 1 $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	fn, ok := cat.Routines().Lookup(parser.ObjectName{Name: "g"}, nil)
+	if !ok {
+		t.Fatal("function not registered")
+	}
+	want := []string{"DateStyle=iso, mdy", "TimeZone=UTC", "work_mem=1MB"}
+	if strings.Join(fn.Config, "|") != strings.Join(want, "|") {
+		t.Errorf("proconfig = %#v, want %#v", fn.Config, want)
+	}
+	if err := runRoutineDDL(t, "ALTER FUNCTION g() RESET timezone", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION RESET: %v", err)
+	}
+	if strings.Join(fn.Config, "|") != "DateStyle=iso, mdy|work_mem=1MB" {
+		t.Errorf("proconfig after RESET = %#v", fn.Config)
+	}
+	for sql, code := range map[string]string{
+		`CREATE FUNCTION h() RETURNS int LANGUAGE sql SET no_such_guc = 1 AS $$ SELECT 1 $$`:        "42704",
+		`CREATE FUNCTION h() RETURNS int LANGUAGE sql SET shared_buffers = '1GB' AS $$ SELECT 1 $$`: "55P02",
+		`CREATE FUNCTION h() RETURNS int LANGUAGE sql SET work_mem = 'bogus' AS $$ SELECT 1 $$`:     "22023",
+		`ALTER FUNCTION g() RESET no_such_guc`:                                                       "42704",
+	} {
+		err := runRoutineDDL(t, sql, cat)
+		var ee *ExecError
+		if !errors.As(err, &ee) || ee.Code != code {
+			t.Errorf("%s: err = %v, want SQLSTATE %s", sql, err, code)
+		}
+	}
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Name: "h"}, nil); ok {
+		t.Error("a rejected CREATE FUNCTION registered the function")
 	}
 }

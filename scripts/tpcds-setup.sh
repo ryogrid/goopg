@@ -103,14 +103,13 @@ for f in query*.sql; do
     # Fix 2: query 30 — c_last_review_date_sk → c_last_review_date
     [[ "$qnum" == "30" ]] && sed -i 's/c_last_review_date_sk/c_last_review_date/g' "$f"
 
-    # Fix 3: queries needing subquery wrapper (column alias in WHERE)
-    case "$qnum" in 36|70|86)
-        mv "$f" "${f}.orig"
-        { echo "select * from ("; cat "${f}.orig"; echo ") as sub"; } > "$f"
-        rm "${f}.orig"
-        ;;
-    esac
 done
+# Fix 3: Q36/Q70/Q86 use the output alias `lochierarchy` inside an ORDER BY
+# expression. Wrap the SELECT in `select * from (...) as sub` and move the
+# final ORDER BY/LIMIT outside it (upstream split_sqls.py). Wrapping the whole
+# file instead left `limit 100;` inside the parentheses — a syntax error on
+# every engine (M0146-0140).
+python3 -I "${SCRIPT_DIR}/tpcds_fix_loch_queries.py" query36.sql query70.sql query86.sql
 cd "${REPO_ROOT}"
 log "  Queries fixed and ready"
 

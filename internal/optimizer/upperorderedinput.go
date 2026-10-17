@@ -382,6 +382,20 @@ func inputNodePathkeys(input Node) []PathKey {
 			}
 			renamed = true
 			n = t.Child
+		case *DistinctOn:
+			// M0146-0133: a Unique keeps its input's order —
+			// create_upper_unique_path (pathnode.c) sets `pathkeys =
+			// subpath->pathkeys`, and distinctOnOp streams the first row of
+			// each run of equal keys in arrival order. So a DISTINCT or a
+			// UNION dedup over a Sort still delivers that Sort's keys to
+			// the ORDER BY above: TPC-DS Q49's ORDER BY keeps the
+			// `('web'::text)` prefix of the union's Unique and needs only
+			// an Incremental Sort. The hashed form (a semijoin RHS's
+			// HashAggregate) keeps no order.
+			if t.Hashed || t.Child == nil || !agrees(t.Child.Output()) {
+				return nil
+			}
+			n = t.Child
 		default:
 			return nil
 		}

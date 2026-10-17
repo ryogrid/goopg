@@ -125,9 +125,12 @@ func TestPartialMergeJoinSite1OffersPreorderedShapes(t *testing.T) {
 	})
 }
 
-// (1b) The no-sort gate: an outer that does not deliver the keys files
-// nothing, even though the serial arm would sort it.
-func TestPartialMergeJoinSite1DeclinesUnsortedOuter(t *testing.T) {
+// (1b) M0146-0193: an outer that does not deliver the keys is sorted inside
+// each worker, as sort_inner_and_outer's partial arm does (joinpath.c,
+// try_partial_mergejoin_path with outersortkeys). The Sort keeps the partial
+// path's worker count and is priced on the per-worker rows, and the filed
+// shape stays gatherable. It used to decline here.
+func TestPartialMergeJoinSite1SortsUnsortedOuterPerWorker(t *testing.T) {
 	withParallelOn(t, func() {
 		s, joinrel, outer, inner, keys := pmjFixture(t)
 		outer.PartialPathlist[0].Pathkeys = nil
@@ -135,8 +138,40 @@ func TestPartialMergeJoinSite1DeclinesUnsortedOuter(t *testing.T) {
 		addPartialMergeJoinPath(s, joinrel, outer, inner, s.cp, parser.JoinInner, false,
 			[]PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(2), SortAsc: true}},
 			keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
-		if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
-			t.Fatalf("unordered partial outer filed %d paths; a sort under a partial is unmodelled", len(got))
+		got := pmjPartials(joinrel.PartialPathlist)
+		if len(got) != 1 {
+			t.Fatalf("unordered partial outer filed %d paths, want 1 over a per-worker Sort", len(got))
+		}
+		o := got[0].Children[0]
+		if o.Kind != PathSort || o.ParallelWorkers != outer.PartialPathlist[0].ParallelWorkers || !o.ParallelSafe {
+			t.Fatalf("outer child = %v (workers %d, safe %v), want a per-worker Sort carrying the partial's %d workers",
+				o.Kind, o.ParallelWorkers, o.ParallelSafe, outer.PartialPathlist[0].ParallelWorkers)
+		}
+		if o.Rows != outer.PartialPathlist[0].Rows {
+			t.Errorf("Sort rows = %v, want the per-worker %v", o.Rows, outer.PartialPathlist[0].Rows)
+		}
+		if !partialPathShapeIsGatherable(got[0]) {
+			t.Error("the sorted partial merge is not gatherable")
+		}
+	})
+}
+
+// (1c) The jointypes a partitioned outer cannot drive stay refused even now
+// that a sort no longer hides them: PG never calls try_partial_mergejoin_path
+// for FULL or RIGHT (joinpath.c), and assertPartialMergeJoinIsRunnable panics
+// on one.
+func TestPartialMergeJoinRefusesRightAndFull(t *testing.T) {
+	withParallelOn(t, func() {
+		for _, jt := range []parser.JoinType{parser.JoinRight, parser.JoinFull} {
+			s, joinrel, outer, inner, keys := pmjFixture(t)
+			outer.PartialPathlist[0].Pathkeys = nil
+			mergeTuplesFor, scanSelFor := pmjClosures(s, joinrel, outer, inner)
+			addPartialMergeJoinPath(s, joinrel, outer, inner, s.cp, jt, false,
+				[]PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(1), SortAsc: true}}, []PathKey{{Expr: col(2), SortAsc: true}},
+				keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
+			if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
+				t.Errorf("jointype %v filed %d partial merge paths, want none", jt, len(got))
+			}
 		}
 	})
 }

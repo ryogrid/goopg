@@ -28,6 +28,7 @@ func TestCreateUserMappingCurrentUserResolvesToConnectingRoleName(t *testing.T) 
 			}
 			im.RegisterRole("alice")
 
+			mustCreateFDW(t, ctx, "goopg_fdw")
 			if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 				t.Fatalf("CREATE SERVER: %v", err)
 			}
@@ -54,6 +55,7 @@ func TestCreateUserMappingCurrentUserFallsBackToBootstrapSuperuser(t *testing.T)
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -85,6 +87,7 @@ func TestDropUserMappingCurrentUserResolvesSameAsCreate(t *testing.T) {
 	}
 	im.RegisterRole("bob")
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -114,6 +117,7 @@ func TestCreateUserMappingPlainRoleNamePassesThrough(t *testing.T) {
 	im.RegisterRole("alice")
 	im.RegisterRole("myuser")
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}

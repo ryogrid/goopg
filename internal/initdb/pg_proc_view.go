@@ -363,7 +363,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 		OID:     catalog.ProcedureRelationId,
 		Virtual: true,
 	}
-	tbl.VirtualRows = func() [][]string {
+	// pg_proc is per-database: the built-in rows are every database's, the
+	// user routines only their own database's (Routine.DBOid) — a CREATE
+	// FUNCTION in one database used to show in every database's pg_proc
+	// (M0122-0015d). The values operator asks VirtualRowsForDB with the
+	// connection's database; the static VirtualRows is the default one's.
+	rowsFor := func(dbOid uint32) [][]string {
+		db := catalog.NamespaceDBOid(dbOid)
 		// Start with built-in stubs.
 		rows := make([][]string, 0, len(builtinProcs)+16)
 		for _, b := range builtinProcs {
@@ -402,6 +408,9 @@ func registerPgProcView(cat *catalog.InMemory) error {
 		}
 		// Append user-defined routines.
 		for _, r := range cat.Routines().List() {
+			if catalog.NamespaceDBOid(r.DBOid) != db {
+				continue
+			}
 			// Convert arg type names to space-separated OID strings.
 			argOIDs := make([]string, len(r.ArgTypes))
 			for i, t := range r.ArgTypes {
@@ -417,7 +426,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				ns = "2200"
 			default:
 				// Look up user-created schema OID via catalog.
-				if schOID := cat.SchemaOID(r.Schema); schOID != 0 {
+				if schOID := cat.SchemaOID(r.Schema, db); schOID != 0 {
 					ns = fmt.Sprintf("%d", schOID)
 				}
 			}
@@ -492,14 +501,24 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if nargDefaults > 0 {
 				argDefaultsLit = strings.Join(r.ArgDefaults, ";")
 			}
+			// pronargs / proargtypes cover the input parameters only (IN,
+			// INOUT, VARIADIC); proallargtypes lists every parameter
+			// (interpret_function_parameter_list, functioncmds.c). M0146-0165.
+			inArgOIDs := make([]string, 0, len(argOIDs))
+			for i, o := range argOIDs {
+				if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+					continue
+				}
+				inArgOIDs = append(inArgOIDs, o)
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
 				ns,
 				langNameToOIDStr(r.Language), // prolang: oid (matches PG; resolves dumpFunc join)
 				typeNameToOIDStr(r.ReturnType.Name),
-				strings.Join(argOIDs, " "),
-				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs
+				strings.Join(inArgOIDs, " "),
+				fmt.Sprintf("%d", len(inArgOIDs)), // pronargs
 				cat.ProcACLText(r.OID), // proacl: materialized from the GRANT store (NULL until first GRANT). DU-002 slice 345.
 				fmt.Sprintf("%d", r.OwnerOrDefault()), // proowner: ALTER FUNCTION/PROCEDURE ... OWNER TO, else bootstrap superuser. M0097-0150.
 				r.Body,
@@ -625,5 +644,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 		}
 		return rows
 	}
+	tbl.VirtualRows = func() [][]string { return rowsFor(catalog.DefaultDBOid) }
+	tbl.VirtualRowsForDB = rowsFor
 	return cat.RegisterVirtualTable(tbl)
 }

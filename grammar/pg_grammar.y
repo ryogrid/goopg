@@ -132,10 +132,11 @@
 %type <b>	opt_reindex_opts reindex_opt_list reindex_opt opt_verbose_kw opt_nowait
 %type <lrels>	lock_rel_list
 %type <lrel>	lock_rel
-%type <node>	at_constraint at_constr_tail fn_type fn_return fn_attrs fn_attr func_arg fn_drop_item opt_call_named_args call_named_arg_list call_named_arg
+%type <node>	at_constraint at_constr_tail fn_type fn_return fn_attrs fn_attrs1 fn_attr func_arg fn_drop_item opt_call_named_args call_named_arg_list call_named_arg
 %type <fargs>	opt_func_args func_arg_list_p
 %type <fitems>	fn_drop_extras
-%type <str>	fn_param_name fn_number fn_lang_name fn_set_values fn_body_list fn_config_name fn_config_value
+%type <str>	fn_param_name fn_number fn_lang_name fn_set_values fn_body_list fn_config_name
+%type <node>	fn_config_value
 %type <ival>	fn_arg_mode
 %type <expr>	opt_arg_default
 %type <expr>	opt_at_using
@@ -210,7 +211,7 @@
 %type <stmt>	create_event_trigger_stmt alter_event_trigger_stmt create_access_method_stmt
 %type <str>	am_type
 %type <strs>	evtrig_when evtrig_filter_list evtrig_sconst_list
-%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
+%type <stmt>	explainable_stmt merge_stmt copy_stmt alter_system_stmt alter_index_stmt alter_view_stmt listen_stmt notify_stmt unlisten_stmt alter_matview_stmt alter_sequence_stmt alter_type_stmt alter_domain_stmt drop_misc_stmt drop_database_stmt create_extension_stmt alter_schema_stmt create_policy_stmt create_trigger_stmt drop_trigger_stmt comment_stmt alter_function_stmt create_type_stmt drop_type_stmt create_domain_stmt drop_domain_stmt create_sequence_stmt do_stmt create_function_stmt drop_function_stmt call_stmt savepoint_stmt checkpoint_stmt discard_stmt deallocate_stmt prepare_stmt execute_stmt close_stmt declare_stmt fetch_stmt analyze_stmt vacuum_stmt reindex_stmt cluster_stmt lock_stmt tx_begin tx_commit tx_rollback alter_table_stmt create_index_stmt drop_index_stmt create_table_stmt_as drop_table_stmt truncate_stmt create_table_stmt delete_stmt delete_core update_stmt update_core insert_stmt insert_core set_stmt show_stmt reset_stmt create_view_stmt drop_view_stmt create_matview_stmt
 
 %type <telems>	opt_of_elements of_element_list
 %type <node>	of_element
@@ -433,6 +434,10 @@ explainable_stmt:
 				$$ = $1
 			}
 	| alter_table_stmt
+			{
+				$$ = $1
+			}
+	| alter_system_stmt
 			{
 				$$ = $1
 			}
@@ -3531,9 +3536,15 @@ within_group_clause:
 			}
 
 /* subq_op — gram.y :15150 subquery_Op subset: comparison operators legal
-   before ANY/SOME/ALL. Char literals + named terminals. */
+   before ANY/SOME/ALL. Char literals + named terminals, plus subquery_Op's
+   `OPERATOR '(' any_operator ')'` arm (gram.y:16674) through qual_op —
+   pg_dump's -t / -T / --filter emit `relkind OPERATOR(pg_catalog.=) ANY
+   (array[...])`, which failed with a syntax error at ANY (M0122-0015b).
+   yyVAL starts as qual_op's symbol, so $<p> is the OPERATOR keyword's
+   offset, where upstream anchors the A_Expr. */
 subq_op:
 		Op        { $$ = $1 }
+	| qual_op       { $$ = qualOpName($1) }
 	| '='           { $$ = "=" }
 	| '<'           { $$ = "<" }
 	| '>'           { $$ = ">" }

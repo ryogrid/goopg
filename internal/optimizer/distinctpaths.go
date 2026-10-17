@@ -57,6 +57,7 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 	if u == nil {
 		u = newUpperRels()
+		u.cat = cat
 	}
 	cp := ps.costParams()
 	distinctRel := fetchUpperRel(u, UpperDistinct, 0, tupleFraction)
@@ -69,7 +70,16 @@ func createDistinctPaths(u *upperRels, distinctNode *Distinct, cat catalog.Catal
 	}
 	seed := newPrebuiltPath(distinctRel, child)
 	seed.Rows = inputRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	// create_distinct_paths reads cheapest_input_path (planner.c:4816) at its
+	// own cost. goopg's Project wrapper is not a node there: PG applies the
+	// target to the scan/join paths themselves, pushed below a Gather when
+	// it is parallel-safe (apply_scanjoin_target_to_paths, dummypp). So the
+	// seed reads the stamped search node through the Projects, as
+	// limitInputPath does for create_limit_path. The legacy display
+	// estimate, which charges the Project per row, is only the fallback for
+	// an input the search did not build (M0146-0210: TPC-DS Q54's 0.04 tipped
+	// the DISTINCT onto the partial arm).
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 
@@ -281,7 +291,7 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 		Rel: distinctRel, Rows: numDistinct,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),
 		Cost: costAgg(cp, AggStrategyHashed, inputRows, seed.Cost.Startup, seed.Cost.Total,
-			len(child.Output()), numDistinct, 0, 0, 0),
+			len(child.Output()), numDistinct, 0, 0),
 		Children: []*Path{seed},
 	}
 
@@ -388,11 +398,11 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// the identical second route when the only refusal is a Gather on the
 	// driving spine (spliceGatherOnPartialSpine; TPC-DS Q38's input is
 	// exactly `Sort{Gather{NL…}}` before the strip above).
-	unsafe, gathered, noScan := subtreeHasUnsafeNode(child), subtreeHasGather(child), drivingScan(child) == nil
+	unsafe, gathered, noScan := subtreeHasUnsafeNode(child) || subtreeHasParallelRestrictedQual(child), subtreeHasGather(child), drivingScan(child) == nil
 	if unsafe || gathered || noScan {
 		if ps.ParallelStatementOK {
 			if gc, ok := spliceGatherOnPartialSpine(child); ok &&
-				!subtreeHasUnsafeNode(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
+				!subtreeHasUnsafeNode(gc) && !subtreeHasParallelRestrictedQual(gc) && !subtreeHasGather(gc) && drivingScan(gc) != nil {
 				child = gc
 				unsafe, gathered, noScan = false, false, false
 			}
@@ -402,7 +412,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		traceUpperGate("distinct-upper", "refused", "gate=subtree subtree="+subtreeRefusalKind(unsafe, gathered, noScan))
 		return
 	}
-	workers := upperSplitWorkers(child, cp, ps)
+	workers := upperSplitWorkers(u, child, cp, ps)
 	if partial != nil && partial.ParallelWorkers > 0 {
 		workers = partial.ParallelWorkers
 	}
@@ -496,7 +506,27 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// generate_useful_gather_paths on the partial rel (planner.c:5017);
 	// this arm builds the same node directly, the partial-Group arm's
 	// construction verbatim.
-	crossed := partialGroups * d
+	// compute_gather_rows (costsize.c:6625): clamp_row_est of the
+	// per-worker rows times the divisor, as every create_gather_merge_path
+	// caller passes it (the partial-aggregate twin, M0146-0009n). Unclamped,
+	// TPC-DS Q54's 1 × 1.7 priced the merge 0.04 under PG's (M0146-0210).
+	crossed := clampRowEst(partialGroups * d)
+	// The split arms' final Unique is built by create_final_distinct_paths
+	// over the PARTIAL distinct rel (planner.c, create_partial_distinct_paths),
+	// whose cheapest input is this Gather Merge. Its numDistinctRows is
+	// therefore estimate_num_groups over the CROSSING rows, and
+	// estimate_num_groups never returns more groups than input rows. When
+	// the merge carries fewer rows than the DISTINCT's own estimate, the split
+	// arms report fewer rows than the unsplit one: TPC-DS Q38/Q87's web_sales
+	// leg, 890 against 891. add_path then keeps the split arm among fuzzily
+	// equal costs, because its row count is lower (M0146-0217).
+	splitFinalRows := float64(estimateNumGroups(exprs, child, int64(crossed)))
+	if splitFinalRows > crossed {
+		splitFinalRows = crossed
+	}
+	if splitFinalRows < 1 {
+		splitFinalRows = 1
+	}
 	gmCost := gatherMergeCost(cp, partialPath.Cost, workers, crossed)
 	gmPath := &Path{
 		Kind: PathGatherMerge, Rel: distinctRel, Rows: crossed, Cost: gmCost,
@@ -511,7 +541,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// re-dedups cross-worker duplicates the merge brings adjacent.
 	finalPath := &Path{
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
-		Rel: distinctRel, Rows: finalRows,
+		Rel: distinctRel, Rows: splitFinalRows,
 		DisabledNodes: gmPath.DisabledNodes,
 		Cost:          uniquePathCost(gmCost.Startup, gmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      gmPath.Pathkeys,
@@ -540,7 +570,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 		Rel: partialRel, Rows: partialGroups,
 		DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, pseed),
 		Cost: costAgg(cp, AggStrategyHashed, perWorkerRows, pseed.Cost.Startup, pseed.Cost.Total,
-			len(cols), partialGroups, 0, 0, 0),
+			len(cols), partialGroups, 0, 0),
 		ParallelSafe:    true,
 		ParallelWorkers: workers,
 		Children:        []*Path{pseed},
@@ -558,7 +588,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	}
 	addPath(distinctRel, &Path{
 		Kind: PathDistinct, Unique: true, Distinct: distinctNode,
-		Rel: distinctRel, Rows: finalRows,
+		Rel: distinctRel, Rows: splitFinalRows,
 		DisabledNodes: hgmPath.DisabledNodes,
 		Cost:          uniquePathCost(hgmCost.Startup, hgmCost.Total, crossed, len(mergeKeys), cp),
 		Pathkeys:      hgmPath.Pathkeys,
@@ -574,7 +604,7 @@ func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, 
 	// its comparisons, and PG keeps this shape (TPC-DS Q38/Q87's
 	// store_sales branch); the add_path contest against the split arms
 	// decides.
-	sortedCrossed := perWorkerRows * d
+	sortedCrossed := clampRowEst(perWorkerRows * d)
 	sgmCost := gatherMergeCost(cp, workerSort.Cost, workers, sortedCrossed)
 	sgmPath := &Path{
 		Kind: PathGatherMerge, Rel: distinctRel, Rows: sortedCrossed, Cost: sgmCost,

@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS ipn_s, ipn_b;
+CREATE TABLE ipn_s (k int, v int);
+CREATE TABLE ipn_b (k int, v int);
+INSERT INTO ipn_s SELECT g % 10, g FROM generate_series(1, 100) g;
+INSERT INTO ipn_b SELECT g % 5000, g FROM generate_series(1, 50000) g;
+ANALYZE ipn_s; ANALYZE ipn_b;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT a.k, a.n, b.n FROM (SELECT k, count(*) n FROM ipn_s WHERE v > (SELECT avg(v) FROM ipn_s) GROUP BY k) a JOIN (SELECT k, count(*) n FROM ipn_b WHERE v > (SELECT avg(v) FROM ipn_b) GROUP BY k) b ON a.k = b.k;
+SELECT a.k, a.n, b.n FROM (SELECT k, count(*) n FROM ipn_s WHERE v > (SELECT avg(v) FROM ipn_s) GROUP BY k) a JOIN (SELECT k, count(*) n FROM ipn_b WHERE v > (SELECT avg(v) FROM ipn_b) GROUP BY k) b ON a.k = b.k ORDER BY 1 LIMIT 3;
+DROP TABLE ipn_s, ipn_b;

@@ -166,7 +166,7 @@ type partialAggTournament struct {
 	inputRows     float64
 	finalGroups   float64
 	partialGroups float64
-	crossedRows   float64 // partialGroups * divisor — the group-states that cross
+	crossedRows   float64 // compute_gather_rows: clamp(partialGroups * divisor), the group-states that cross
 }
 
 // splitWins reports the tournament's verdict: the cheapest path on the
@@ -327,7 +327,7 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	// this honestly: DESIGN §3.1.
 	seed := newPrebuiltPath(partialRel, child)
 	seed.Rows = perWorkerRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 	seed.ParallelSafe = true
@@ -335,20 +335,21 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 
 	nAggs := len(agg.Aggs)
 	nGroupCols := len(agg.GroupExprs)
-	inNcols, inAvgVar := aggInputWidth(child, agg)
+	inWidth := aggInputPGWidth(child, agg)
 	strategy := agg.Strategy
 
 	t := &partialAggTournament{
 		grouped: grouped, partial: partialRel,
 		divisor: d, inputRows: inputRows,
 		finalGroups: finalGroups, partialGroups: partialGroups,
-		crossedRows: partialGroups * d,
+		// compute_gather_rows clamps (gather_grouping_paths, M0146-0221).
+		crossedRows: clampRowEst(partialGroups * d),
 	}
 
 	// ── the PARTIAL arm: create_agg_path(… AGGSPLIT_INITIAL_SERIAL …),
 	// planner.c:7606. Per-worker rows in, per-worker groups out.
-	partialCost := costAgg(cp, strategy, perWorkerRows, seed.Cost.Startup, seed.Cost.Total,
-		nGroupCols, partialGroups, nAggs, inNcols, inAvgVar)
+	partialCost := costAggClause(cp, strategy, perWorkerRows, seed.Cost.Startup, seed.Cost.Total,
+		nGroupCols, partialGroups, nAggs, inWidth, aggClauseCosts(cp, agg, aggSplitInitialSerial))
 	partialPath := &Path{
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: partialRel, Rows: partialGroups, Cost: partialCost,
@@ -388,8 +389,8 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	t.split = &Path{
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: grouped, Rows: finalGroups,
-		Cost: costAgg(cp, strategy, t.crossedRows, gatherAbove.Startup, gatherAbove.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+		Cost: costAggClause(cp, strategy, t.crossedRows, gatherAbove.Startup, gatherAbove.Total,
+			nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, agg, aggSplitFinalDeserial)),
 		Children: []*Path{gatherPath},
 	}
 	addPath(grouped, t.split, partialAggSplitProducer)
@@ -409,8 +410,8 @@ func createPartialGroupingPaths(agg *Aggregate, workers int, leaderParticipates 
 	t.noSplit = &Path{
 		Kind: PathAgg, AggStrategy: strategy, Agg: agg,
 		Rel: grouped, Rows: finalGroups,
-		Cost: costAgg(cp, strategy, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
-			nGroupCols, finalGroups, nAggs, inNcols, inAvgVar),
+		Cost: costAggClause(cp, strategy, inputRows, nsGatherCost.Startup, nsGatherCost.Total,
+			nGroupCols, finalGroups, nAggs, inWidth, aggClauseCosts(cp, agg, aggSplitSimple)),
 		Children: []*Path{nsGather},
 	}
 	addPath(grouped, t.noSplit, partialAggNoSplitProducer)

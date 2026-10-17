@@ -104,8 +104,27 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 	// query the new arm touches. The positional group-key coverage
 	// check below is unchanged, so a merge on other keys still declines
 	// exactly like a mis-sorted Sort.
-	if len(cand.Children) == 0 || cand.Children[0] == nil ||
-		(cand.Children[0].Kind != PathSort && cand.Children[0].Kind != PathGatherMerge) {
+	//
+	// M0146-0131: create_agg_path (pathnode.c) copies subpath->pathkeys for
+	// AGG_SORTED whatever the subpath is, so two more inputs translate, as
+	// the node twin (aggregateEmissionPathkeys) already admits them:
+	//   - a `PathIncrementalSort` (make_ordered_path's partially presorted
+	//     arm) delivers its FULL pathkeys, as a Sort does;
+	//   - a `PathPrebuilt` input already sorted on the group keys (the
+	//     searched-candidate and is_sorted arms of addGroupingPaths), whose
+	//     pathkeys were validated against the input schema when filed.
+	// TPC-DS Q35's GroupAggregate over an Incremental Sort (presorted on
+	// ca_state) was declined here, so ORDER BY re-sorted it and its startup
+	// advantage under LIMIT 100 was lost. The positional group-key check
+	// below still decides; an input with no pathkeys (the index variant's
+	// seed) declines there.
+	if len(cand.Children) == 0 || cand.Children[0] == nil {
+		traceGroupDecline("no-sort-or-gathermerge-child", cand)
+		return nil
+	}
+	switch cand.Children[0].Kind {
+	case PathSort, PathGatherMerge, PathIncrementalSort, PathPrebuilt:
+	default:
 		traceGroupDecline("no-sort-or-gathermerge-child", cand)
 		return nil
 	}
@@ -286,7 +305,14 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 			anyTranslated = true
 		}
 	}
-	if !anyTranslated {
+	// With no candidate translating, every one needs the same Sort on the
+	// same rows, so the loop could only re-price — EXCEPT under a LIMIT
+	// fraction: the grouping step already picked by fraction BEFORE the
+	// ORDER BY Sort, where a hashed candidate's early startup counts, while
+	// PG's final rel compares the candidates after it, where each Sort's
+	// startup is its total (M0146-0138: TPC-DS Q18's sorted rollup
+	// GroupAggregate lost to a MixedAggregate this way).
+	if !anyTranslated && !(tupleFraction > 0 && len(cands) > 1) {
 		return decline("anyTranslated=false")
 	}
 
@@ -311,10 +337,12 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	savedPathlist := append([]*Path(nil), ordered.Pathlist...)
 	savedTotal, savedStartup, savedParam := ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized
 	savedSearchCandidates, savedSearchCandidateKeys := ordered.SearchCandidates, ordered.SearchCandidateKeys
+	savedSearchCandidateClasses := ordered.SearchCandidateClasses
 	restore := func(reason string) (Node, bool) {
 		ordered.Pathlist = savedPathlist
 		ordered.CheapestTotal, ordered.CheapestStartup, ordered.CheapestParameterized = savedTotal, savedStartup, savedParam
 		ordered.SearchCandidates, ordered.SearchCandidateKeys = savedSearchCandidates, savedSearchCandidateKeys
+		ordered.SearchCandidateClasses = savedSearchCandidateClasses
 		return decline(reason)
 	}
 	// M0141-S2b-7: this rel's own candidate set for `addIncrementalSortPaths`
@@ -334,6 +362,8 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 	// its own `searchedRelOf(input)` is nil.
 	ordered.SearchCandidates = cands
 	ordered.SearchCandidateKeys = translated
+	// Aggregate-output coordinates: the searched rel's classes do not apply.
+	ordered.SearchCandidateClasses = nil
 
 	sortKeys := pathkeysForSortKeys(keys)
 	for i, c := range cands {
@@ -349,7 +379,7 @@ func electOrderedGrouping(u *upperRels, agg *aggregateSurface, node Node, keys [
 		offer := *c
 		offer.Pathkeys = translated[i]
 		applyHavingQualsToOffer(&offer, havingQuals, agg.node, cp)
-		addOrderedPaths(ordered, &offer, sortKeys, cp, limitTuples)
+		addOrderedPaths(ordered, &offer, node, sortKeys, cp, limitTuples)
 	}
 	// M0140-0006b-2: the upper-rel Gather reader (same funnel as
 	// createOrderedPaths above). No-op today; on decline the restore below

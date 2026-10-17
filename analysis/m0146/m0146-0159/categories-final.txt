@@ -1,0 +1,14 @@
+# Final A/B after M0146-0170 landed: HEAD 566d9721c (x2) vs staged retirement (committed de45f8a6f).
+# Order per corpus: baseline, candidate. TPC-DS from tmp/m0159-fireset2; TPC-H from tmp/m0159-fireset-tpch.
+PLAN-PARITY: queries=99 match=56 shapediff=43 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=37 join-method=16 scan-type=22 parameterisation=17 aggregation-strategy=5 sort-strategy=15 parallelism=17 qual-placement=4 rendering=2
+PLAN-PARITY: queries=99 match=68 shapediff=31 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=24 join-method=14 scan-type=11 parameterisation=15 aggregation-strategy=5 sort-strategy=14 parallelism=15 qual-placement=3 rendering=2
+PLAN-PARITY: queries=99 match=42 shapediff=57 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=47 join-method=18 scan-type=32 parameterisation=27 aggregation-strategy=8 sort-strategy=20 parallelism=33 qual-placement=10 rendering=2
+PLAN-PARITY: queries=99 match=45 shapediff=54 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=44 join-method=21 scan-type=24 parameterisation=26 aggregation-strategy=9 sort-strategy=24 parallelism=39 qual-placement=9 rendering=4
+PLAN-PARITY: queries=22 match=11 shapediff=11 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=9 join-method=4 scan-type=9 parameterisation=1 aggregation-strategy=1 sort-strategy=2 parallelism=4 qual-placement=1 rendering=0
+PLAN-PARITY: queries=22 match=13 shapediff=9 unparsed=0 missingnode=0 error=0 timeout=0
+CATEGORIES-EXCL-MATCH: join-order=6 join-method=4 scan-type=5 parameterisation=2 aggregation-strategy=1 sort-strategy=2 parallelism=4 qual-placement=2 rendering=0

@@ -1,0 +1,16 @@
+# M0146-0171 slice 1 (2026-10-13): index-scan heap deform stops at the consumer bound.
+# Private clone of data-sf025, same clone for both binaries, 4 runs each; PG 18.3 = :65438 tpcds025.
+# probe.sql: NL over 20000 store_sales rows probing catalog_sales_pkey (cs_item_sk) with a cs_bill_customer_sk Filter.
+probe loop (ms)   HEAD 707.6 628.6 630.5 699.5   candidate 596.3 519.2 500.8 571.7   PG 391.5
+Q17 wall (s)      HEAD 1.019 1.018 0.752 0.764   candidate 1.023 1.022 0.657 0.696
+Q17 EXPLAIN ANALYZE (before): goopg 565 ms vs PG 160 ms; catalog_sales_pkey probe 0.049 ms/loop vs PG 0.013 (7511 loops, ~26 rows per probe filtered)
+Deform-poison corpus run: all 99 TPC-DS SF0.25 queries with the poison armed -> 0 deform-bound violations.
+
+# Close-out re-measure (2026-10-13, HEAD cf8d4480b = slice 1), same private SF0.25 clone, psql wall, 4 runs (2 cold-ish + 2 warm):
+Q17 0.868 0.899 0.546 0.549   (filed: x2 shape 0.80, PG shape 1.01)
+Q25 0.727 0.700 0.350 0.361   (filed: x2 shape 0.78, PG shape 0.98)
+Q83 1.732 1.723 1.724 1.718   (filed: x2 shape 2.01, PG shape 2.41)
+# Slice 2 attempt (not landed): incremental attribute compare in comparePGIndexTuples (_bt_compare's early exit)
+# measured flat on the probe loop (540-565 ms both arms) — an equality probe ties on its single search column, so
+# no attribute is skipped. Inclusive profile: joinPredicateMatch 16%, followHOTChain 15%, leaf compares 14%,
+# parseHeapTupleAlias 11% self (first-touch cache misses). Buffers per probe: goopg ~30, PG 28.6 (Q17 214659/7511).

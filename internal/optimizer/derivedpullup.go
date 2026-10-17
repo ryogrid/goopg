@@ -276,10 +276,27 @@ func expandPullupBodyStars(sub *parser.SelectStmt, cat catalog.Catalog) ([]parse
 		item := parser.FromExpr{Base: rv}
 		if conv, _, ok := cteAsDerivedItem(item); ok {
 			item = conv
-		} else if rv.Subquery == nil && rv.Schema == "" && planCTEs[strings.ToLower(rv.Name)] != nil {
-			// A CTE that is not inlined here: its output names are the
-			// CTE's, which this AST pass does not resolve.
-			return false
+		} else if e := planCTEs[strings.ToLower(rv.Name)]; rv.Subquery == nil && rv.Schema == "" && e != nil {
+			// A CTE that is not inlined here — a shared or MATERIALIZED one,
+			// or the worktable of an enclosing recursive CTE — reads as a
+			// CTE scan, whose `*` expands to the CTE's planned columns
+			// (alias-renamed, plannedCTE.table). M0146-0145: regress
+			// subselect's `with z as not materialized (select * from x)`
+			// inside a recursive term is pulled up onto the WorkTable Scan,
+			// as PG's inline_cte + pull_up_simple_subquery do.
+			if e.table == nil || len(rv.Columns) > 0 {
+				return false
+			}
+			qual := rv.Alias
+			if qual == "" {
+				qual = rv.Name
+			}
+			cols := make([]string, 0, len(e.table.Columns))
+			for _, c := range e.table.Columns {
+				cols = append(cols, c.Name)
+			}
+			items = append(items, fromItem{qual: qual, cols: cols})
+			return true
 		}
 		b := item.Base
 		qual := b.Alias

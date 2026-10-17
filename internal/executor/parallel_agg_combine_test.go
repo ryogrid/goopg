@@ -35,7 +35,7 @@ func applyAggValue(ctx *Context, call optimizer.AggregateCall, st *aggRuntime, v
 	slot := SlotFromRow(optimizer.Schema{{Name: "v"}}, Row{v})
 	c := call
 	c.Arg = &optimizer.ColumnRef{Index: 0}
-	return op.applyAgg(st, c, slot, -1)
+	return op.applyAgg(st, &c, slot, -1)
 }
 
 // finishAggValue runs the real finalize function.

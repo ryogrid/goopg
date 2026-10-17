@@ -458,6 +458,17 @@ func (o *callOp) Next() (TupleSlot, error) {
 		return nil, derr
 	}
 	defer leave()
+	restore, cerr := enterRoutineConfig(r, child, o.plan.Stmt.Pos())
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
+	if len(r.Config) > 0 {
+		// ExecuteCallStmt: a procedure with SET clauses runs atomically —
+		// fmgr_security_definer's GUC nest level cannot survive a
+		// transaction boundary — so COMMIT / ROLLBACK inside it raise 2D000.
+		child.PLpgSQLCommitChain = nil
+	}
 	child.Params = make([]Datum, len(r.ArgTypes))
 	frame := newPLpgSQLFrame()
 

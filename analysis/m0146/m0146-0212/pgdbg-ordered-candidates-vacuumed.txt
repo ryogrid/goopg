@@ -1,0 +1,44 @@
+M0212 ordered cand line=5390 type=297 startup=8145.9885 total=8147.3560 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212 ordered cand line=5390 type=301 startup=8056.1939 total=8245.5361 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212 ordered cand line=5390 type=301 startup=7950.8751 total=8450.6885 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212 ordered cand line=5390 type=301 startup=6138.1165 total=364757.4271 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212   kept type=301 startup=6138.1165 total=364757.4271
+M0212 ordered cand line=5471 type=297 startup=8145.9885 total=8147.3560 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212   kept type=301 startup=6138.1165 total=364757.4271
+M0212 ordered cand line=5390 type=297 startup=8145.9885 total=8147.3560 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212 ordered cand line=5390 type=301 startup=8056.1939 total=8245.5361 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212 ordered cand line=5390 type=301 startup=7950.8751 total=8450.6885 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212 ordered cand line=5390 type=301 startup=6138.1165 total=364757.4271 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212   kept type=301 startup=6138.1165 total=364757.4271
+M0212 ordered cand line=5471 type=297 startup=8145.9885 total=8147.3560 rows=12.00 psafe=0
+M0212   kept type=297 startup=8145.9885 total=8147.3560
+M0212   kept type=301 startup=8056.1939 total=8245.5361
+M0212   kept type=301 startup=7950.8751 total=8450.6885
+M0212   kept type=301 startup=6138.1165 total=364757.4271
+M0212 ordered cand line=5390 type=303 startup=32.6479 total=32.7879 rows=56.00 psafe=0
+M0212   kept type=303 startup=32.6479 total=32.7879
+M0212 ordered cand line=5390 type=303 startup=53.6392 total=53.7792 rows=56.00 psafe=0
+M0212   kept type=303 startup=53.6392 total=53.7792
+M0212 ordered cand line=5390 type=299 startup=69.4338 total=72.4088 rows=56.00 psafe=0
+M0212   kept type=303 startup=53.6392 total=53.7792

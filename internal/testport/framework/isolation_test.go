@@ -147,7 +147,8 @@ func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
 		queue:   q,
 	}}
 
-	remaining := drainWithTimeout(&sb, IsolationSpec{}, nil, pending, time.Millisecond)
+	stillBlocked := func(string) func() (bool, bool) { return func() (bool, bool) { return true, true } }
+	remaining := drainWithTimeout(&sb, IsolationSpec{}, nil, pending, time.Millisecond, stillBlocked)
 	if got, want := sb.String(), "s2: NOTICE:  hello after unblock\n"; got != want {
 		t.Fatalf("drainWithTimeout output = %q, want %q", got, want)
 	}

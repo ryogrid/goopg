@@ -1,5 +1,7 @@
 package parser
 
+import "github.com/goopg/goopg/internal/utils/misc"
+
 // Node is implemented by every AST node. Pos returns the byte offset
 // of the node's first token, used by error messages.
 type Node interface {
@@ -308,6 +310,9 @@ type MergeStmt struct {
 	// Returning holds the RETURNING target list. M0097-0016.
 	// Parsed but not executed (v0 no-op).
 	Returning []ResTarget
+	// With is a leading WITH clause (gram.y MergeStmt: opt_with_clause),
+	// whose CTEs the source, ON and WHEN clauses may reference. M0146-0085.
+	With *WithClause
 }
 
 func (s *MergeStmt) Pos() int  { return s.pos }
@@ -572,10 +577,36 @@ type SetStmt struct {
 	Name    string
 	Value   string // raw textual value; quotes stripped for string literals
 	Default bool   // TO DEFAULT (Value is unused)
+	// Args is the typed value list (gram.y var_list) the executor flattens
+	// with the variable's flags (misc.FlattenSetArgs); nil for the dedicated
+	// forms (TIME ZONE, ROLE, SESSION AUTHORIZATION), which use Value.
+	Args []misc.SetArg
 }
 
 func (s *SetStmt) Pos() int  { return s.pos }
 func (s *SetStmt) stmtNode() {}
+
+// AlterSystemStmt — `ALTER SYSTEM SET name { TO | = } value[, ...] | DEFAULT`
+// and `ALTER SYSTEM RESET { name | ALL }` (gram.y AlterSystemStmt, whose
+// setstmt is a VariableSetStmt of kind VAR_SET_VALUE / VAR_SET_DEFAULT /
+// VAR_RESET / VAR_RESET_ALL). Value is the SET value-atom join (quotes
+// stripped, list items joined with ", "), as SetStmt.Value; it is unused when
+// Default, Reset or ResetAll is set. M0122-0008.
+type AlterSystemStmt struct {
+	pos      int
+	Name     string
+	Value    string
+	Default  bool // SET name TO DEFAULT
+	Reset    bool // RESET name
+	ResetAll bool // RESET ALL
+	// Args is the typed value list, flattened by the executor exactly as
+	// SetStmt.Args (AlterSystemSetConfigFile calls the same
+	// flatten_set_variable_args through ExtractSetVariableArgs).
+	Args []misc.SetArg
+}
+
+func (s *AlterSystemStmt) Pos() int  { return s.pos }
+func (s *AlterSystemStmt) stmtNode() {}
 
 // SetConstraintsStmt — `SET CONSTRAINTS { ALL | name [, ...] }
 // { DEFERRED | IMMEDIATE }`. Controls the check timing of DEFERRABLE
@@ -2412,6 +2443,9 @@ type CompatNoopStmt struct {
 	// M0134-0115.
 	SchemaSubElementSchema string
 	SchemaHasSubElement    bool
+	// IfNotExists is CREATE SCHEMA IF NOT EXISTS (Tag == "CREATE SCHEMA"
+	// only): an existing schema is a NOTICE, not 42P06. M0119-0006.
+	IfNotExists bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
@@ -3805,6 +3839,9 @@ type FunctionConfigOp struct {
 	ResetAll bool   // RESET ALL
 	Name     string // GUC name (empty when ResetAll)
 	Value    string // comma-joined flattened value(s), SET only
+	// Args is the typed SET value list; the executor flattens it with the
+	// variable's flags (ExtractSetVariableArgs) before storing proconfig.
+	Args []misc.SetArg
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
@@ -3875,6 +3912,9 @@ type CreateProcedureStmt struct {
 	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT
 	Window          bool   // WINDOW attribute (invalid for procedures)
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	// ConfigOps are the procedure's SET / RESET clauses, recorded as
+	// CreateFunctionStmt's are, for pg_proc.proconfig (M0146-0155).
+	ConfigOps []FunctionConfigOp
 }
 
 func (s *CreateProcedureStmt) Pos() int  { return s.pos }

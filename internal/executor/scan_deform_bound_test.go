@@ -142,12 +142,15 @@ func TestScanDeformBoundChains(t *testing.T) {
 		}
 	})
 
-	t.Run("project-reorder-terminator", func(t *testing.T) {
+	t.Run("project-reorder-folds-targets", func(t *testing.T) {
+		// M0122-0012 slice 17: a reordered projection reads only its
+		// targets {2, 0}, and the filter below it reads column 1, so the
+		// leaf deforms columns 0..2. It used to reset to full.
 		reorder := &optimizer.Project{Child: filter(deformLt(deformCol(1), deformInt(1)), scan8()),
 			Targets: []optimizer.Expr{deformCol(2), deformCol(0)}}
 		op := mustBuildDeform(t, reorder)
-		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
-			t.Fatalf("bound=%d ncols=%d, want full 8/8", b, n)
+		if b, n := seqLeafBound(t, op); b != 3 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 3/8", b, n)
 		}
 	})
 
@@ -781,10 +784,11 @@ func TestScanDeformNLIOuterBound(t *testing.T) {
 	}
 }
 
-// TestScanDeformProjectThrough pins the EX1-02 project arm: an
-// order-preserving all-bare projection maps through by folding its targets
-// (bound = max mapped); expressions and consts reset to full. Reordered bare
-// targets keep resetting (pinned by project-reorder-terminator, unchanged).
+// TestScanDeformProjectThrough pins the project arm. A non-identity
+// projection folds its targets alone (EX1-02; extended to every target
+// shape in M0122-0012 slice 17): projectOp evaluates only the targets
+// against the child slot, which is PG's ExecBuildProjectionInfo last_scan
+// rule. A target the whitelist does not understand still declines to full.
 func TestScanDeformProjectThrough(t *testing.T) {
 	scan8 := func() *optimizer.SeqScan { return &optimizer.SeqScan{Table: deformTable(8)} }
 	proj := func(targets ...optimizer.Expr) *optimizer.Project {
@@ -812,19 +816,77 @@ func TestScanDeformProjectThrough(t *testing.T) {
 		}
 	})
 
-	t.Run("expression-resets", func(t *testing.T) {
-		p := proj(&optimizer.BinaryOp{Op: parser.OpAdd, Left: deformCol(0), Right: deformInt(1)})
+	t.Run("expression-folds", func(t *testing.T) {
+		p := proj(&optimizer.BinaryOp{Op: parser.OpAdd, Left: deformCol(3), Right: deformInt(1)})
+		op := mustBuildDeform(t, p)
+		if b, n := seqLeafBound(t, op); b != 4 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 4/8", b, n)
+		}
+	})
+
+	t.Run("const-target-folds", func(t *testing.T) {
+		p := proj(deformCol(0), deformInt(1))
+		op := mustBuildDeform(t, p)
+		if b, n := seqLeafBound(t, op); b != 1 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 1/8", b, n)
+		}
+	})
+
+	t.Run("reordered-under-full-parent", func(t *testing.T) {
+		// TPC-H Q17's probe side: a reordered projection under a parent
+		// whose bound is full. The parent reads the projection's output,
+		// never the child row, so the leaf still deforms only up to the
+		// highest target.
+		plan := &optimizer.Project{Child: proj(deformCol(5), deformCol(1), deformCol(4)),
+			Targets: []optimizer.Expr{&optimizer.FuncCall{Name: "f", Args: []optimizer.Expr{deformCol(0)}}}}
+		op := mustBuildDeform(t, plan)
+		if b, n := seqLeafBound(t, op); b != 6 || n != 8 {
+			t.Fatalf("bound=%d ncols=%d, want 6/8", b, n)
+		}
+	})
+
+	t.Run("unknown-target-declines", func(t *testing.T) {
+		p := proj(deformCol(0), &optimizer.FuncCall{Name: "f", Args: []optimizer.Expr{deformCol(1)}})
 		op := mustBuildDeform(t, p)
 		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
 			t.Fatalf("bound=%d ncols=%d, want full 8/8", b, n)
 		}
 	})
+}
 
-	t.Run("const-target-resets", func(t *testing.T) {
-		p := proj(deformCol(0), deformInt(1))
-		op := mustBuildDeform(t, p)
-		if b, n := seqLeafBound(t, op); b != 8 || n != 8 {
-			t.Fatalf("bound=%d ncols=%d, want full 8/8", b, n)
+// TestScanDeformLoweredSublinkArgs pins the sublink arm of both deform
+// walkers (M0122-0012 slice 17). A param-lowered scalar sublink reads the
+// outer row only through its Args (bindSubPlanParams), as a PG SubPlan's
+// args are what expr_setup_walker visits. So it folds the Args. An unlowered
+// one pushes the whole row and keys its cache by every column, so it
+// declines to full.
+func TestScanDeformLoweredSublinkArgs(t *testing.T) {
+	lowered := &optimizer.SubqueryExpr{ParParam: []int{0}, Args: []optimizer.Expr{deformCol(1)}}
+	unlowered := &optimizer.SubqueryExpr{}
+	pred := func(sq optimizer.Expr) optimizer.Expr { return deformLt(deformCol(4), sq) }
+
+	t.Run("scan-refs-lowered", func(t *testing.T) {
+		if got := deformFoldRefs(deformBoundNone, pred(lowered)); got != 4 {
+			t.Fatalf("bound=%d, want 4", got)
+		}
+	})
+	t.Run("scan-refs-unlowered", func(t *testing.T) {
+		if got := deformFoldRefs(deformBoundNone, pred(unlowered)); got != deformBoundFull {
+			t.Fatalf("bound=%d, want Full", got)
+		}
+	})
+	t.Run("split-lowered", func(t *testing.T) {
+		// Left width 3, right width 3: column 4 is right column 1, and the
+		// arg (column 1) is left column 1.
+		l, r := deformSplitPredicate(pred(lowered), 3, 3)
+		if l != 1 || r != 1 {
+			t.Fatalf("split=(%d, %d), want (1, 1)", l, r)
+		}
+	})
+	t.Run("split-unlowered", func(t *testing.T) {
+		l, r := deformSplitPredicate(pred(unlowered), 3, 3)
+		if l != deformBoundFull || r != deformBoundFull {
+			t.Fatalf("split=(%d, %d), want (Full, Full)", l, r)
 		}
 	})
 }

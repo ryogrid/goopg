@@ -152,6 +152,9 @@ func TestNumericUniqueCollapsesDisplayScale(t *testing.T) {
 // of the backslash) — the point of the test is that the KEY path produces them,
 // not merely that some path does.
 func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
+	// M0146-0060: the index path is this test's subject. On the small fixture
+	// PG's costed search would not elect it, and the rule-based producer no
+	// longer overrides that, so it plans with seq and bitmap scans off.
 	cases := []struct {
 		name, colType, insert, probe, want string
 	}{
@@ -205,10 +208,10 @@ func TestArrayIndexOnlyScanAnswersFromKey(t *testing.T) {
 			}
 
 			q := "SELECT a FROM arr_iosk WHERE a = '" + c.probe + "'"
-			if ios := findIndexOnlyScan(planOne(t, q, ctx.Catalog)); ios == nil {
+			if ios := findIndexOnlyScan(planOneIndexScan(t, q, ctx.Catalog)); ios == nil {
 				t.Fatalf("%s[] was NOT promoted to IndexOnlyScan — the re-armed fast path is unreachable", c.name)
 			}
-			rows := runQuery(t, ctx, q)
+			rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, q, indexOnlySettings()))
 			if len(rows) != 1 {
 				t.Fatalf("rows=%d want 1 (%v)", len(rows), rows)
 			}

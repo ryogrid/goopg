@@ -1014,8 +1014,8 @@ func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams, 
 	if topLevel {
 		return
 	}
-	lp, lnp := setOpBranchPick(setOpRel, left, setOpNode.Left, lChainOK)
-	rp, rnp := setOpBranchPick(setOpRel, right, setOpNode.Right, rChainOK)
+	lp, lnp := setOpBranchPick(setOpRel, left, setOpNode.Left, lChainOK, setOpNode.appendMemberLeft > 0)
+	rp, rnp := setOpBranchPick(setOpRel, right, setOpNode.Right, rChainOK, setOpNode.appendMemberRight > 0)
 	if (lp == nil && lnp == nil) || (rp == nil && rnp == nil) {
 		// `pa_subpaths_valid = false`: a branch offering neither a partial
 		// path nor a parallel-safe total path kills the whole arm.
@@ -1217,13 +1217,28 @@ func setOpBranchPartialChainOK(n Node) bool {
 // It is parallel-safe iff the whole-plan check says the worker may run it
 // (statementIsParallelSafe — refuses LockRows/unsafe relations/DML) — PG's
 // `parallel_safe` on the child's plan.
-func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK bool) (partial, nonPartial *Path) {
+//
+// M0146-0137: the strip stands in for the serial alternative only where PG
+// keeps one. A member PG keeps as a subquery RTE (keptSubquery,
+// SetOp.appendMember*) and that aggregates over a Gather is planned by
+// subquery_planner, whose final rel's add_path keeps the cheaper
+// Finalize-over-Gather path and drops the dominated serial one. That path is
+// never parallel_safe, and the final rel has no partial path either (grouping
+// leaves partial paths only on the partially-grouped rel), so the member
+// offers nothing to a Parallel Append — PG appends serially. TPC-DS Q66's
+// GROUP BY members were claimed whole with their Gather stripped and their
+// scans still priced per worker (`Seq Scan on catalog_sales` 10521.57 against
+// 12962.97 serial). A kept-subquery JOIN member keeps its strip: PG gives it a
+// partial pick instead, which goopg's branch partial pick does not yet reach
+// for every shape (TPC-DS Q76, ledgered), and the stripped whole is the
+// nearer stand-in.
+func setOpBranchPick(setOpRel, branch *RelOptInfo, branchNode Node, chainOK, keptSubquery bool) (partial, nonPartial *Path) {
 	var bp *Path
 	if chainOK {
 		bp = cheapestRunnableSetOpBranchPartial(branch)
 	}
 	var bnp *Path
-	if branchNode != nil {
+	if branchNode != nil && !(keptSubquery && aggregatesOverGather(branchNode)) {
 		if serial := StripGather(branchNode); serial != nil && statementIsParallelSafe(serial) {
 			if seed := seedPathForNode(setOpRel, serial); seed.ParallelSafe {
 				bnp = seed
@@ -1319,4 +1334,22 @@ func swapIntersectInputs(n *SetOp) *SetOp {
 	sw.pinnedSchema = n.Output()
 	sw.Left, sw.Right = n.Right, n.Left
 	return &sw
+}
+
+// aggregatesOverGather reports whether n holds an aggregate whose input
+// contains a Gather or Gather Merge — a grouping subquery planned with a
+// parallel input (M0146-0137).
+func aggregatesOverGather(n Node) bool {
+	if n == nil {
+		return false
+	}
+	if a, ok := n.(*Aggregate); ok && subtreeHasGather(a) {
+		return true
+	}
+	for _, c := range parallelChildren(n) {
+		if aggregatesOverGather(c) {
+			return true
+		}
+	}
+	return false
 }

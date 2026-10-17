@@ -415,6 +415,78 @@ func enterRoutineBody(ctx *Context, pos int) (func(), error) {
 	return leave, nil
 }
 
+// enterRoutineConfig is fmgr_security_definer (fmgr.c) for one call of r: a
+// SECURITY DEFINER routine runs as its owner, and a routine's SET clauses
+// (pg_proc.proconfig) apply for the length of the call.
+//
+//   - User: GetUserIdAndSecContext / SetUserIdAndSecContext(proowner,
+//     SECURITY_LOCAL_USERID_CHANGE). current_user becomes the owner
+//     (Context.SecurityDefinerUser) and privilege checks use the owner's
+//     rights (NonSuperuserRole, "" for a superuser owner). session_user is
+//     unchanged. M0146-0157.
+//   - GUCs: a GUC nest level, ProcessGUCArray with GUC_ACTION_SAVE, and
+//     AtEOXact_GUC(true, save_nestlevel) on return. They apply after the user
+//     switch, as in PG. M0146-0155.
+//
+// Call the returned func via defer, so an error leaving the routine restores
+// both (in PG the enclosing (sub)transaction abort does that). A routine with
+// neither runs unchanged; the GUC half also needs a session
+// (PushFunctionConfig).
+func enterRoutineConfig(r *catalog.Routine, ctx *Context, pos int) (func(), error) {
+	if r == nil || ctx == nil {
+		return func() {}, nil
+	}
+	restoreUser := enterSecurityDefiner(r, ctx)
+	if len(r.Config) == 0 || ctx.PushFunctionConfig == nil {
+		return restoreUser, nil
+	}
+	pop, err := ctx.PushFunctionConfig(r.Config)
+	if err != nil {
+		restoreUser()
+		// ProcessGUCArray reports no position.
+		return func() {}, execErrorFromGUCError(0, err)
+	}
+	return func() {
+		pop()
+		restoreUser()
+	}, nil
+}
+
+// enterSecurityDefiner switches ctx to r's owner when r is SECURITY DEFINER
+// and returns the restore. The owner is resolved through the catalog's role
+// registry; a routine whose owner cannot be named runs unchanged.
+func enterSecurityDefiner(r *catalog.Routine, ctx *Context) func() {
+	if !r.SecurityDefiner {
+		return func() {}
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || im == nil {
+		return func() {}
+	}
+	ownerOID := r.OwnerOrDefault()
+	owner, ok := im.RoleNameAtOID(ownerOID)
+	if !ok {
+		return func() {}
+	}
+	savedUser, savedRole := ctx.SecurityDefinerUser, ctx.NonSuperuserRole
+	ctx.SecurityDefinerUser = owner
+	if im.IsSuperuser(ownerOID) {
+		ctx.NonSuperuserRole = ""
+	} else {
+		ctx.NonSuperuserRole = owner
+	}
+	// The session registry checks PGC_SUSET privileges (the routine's own
+	// SET clauses included) against the owner too. M0146-0158.
+	popRole := func() {}
+	if ctx.PushSessionRole != nil {
+		popRole = ctx.PushSessionRole(ctx.NonSuperuserRole)
+	}
+	return func() {
+		popRole()
+		ctx.SecurityDefinerUser, ctx.NonSuperuserRole = savedUser, savedRole
+	}
+}
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {
@@ -429,6 +501,11 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			return Datum{}, &ExecError{Code: "54001", Pos: pos, Message: "stack depth limit exceeded"}
 		}
 	}
+	restore, err := enterRoutineConfig(r, ctx, pos)
+	if err != nil {
+		return Datum{}, err
+	}
+	defer restore()
 	// Cumulative function statistics (pgstat). When the calling session's
 	// track_functions GUC enables it, time the call and accumulate one
 	// invocation into the session's pending stats (flushed to the shared store
@@ -601,9 +678,12 @@ func internalArityError(name string, want, got int, pos int) error {
 }
 
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	body := r.Body
-	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+	if len(inNames) > 0 {
+		body = rewriteSQLNamedParams(body, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -630,8 +710,8 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
@@ -737,6 +817,11 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			if len(row) > 0 {
 				out = row[0]
 			}
+			// Several output parameters make the result a record of the final
+			// row's columns (M0146-0165).
+			if routineOutParamCount(r) > 1 {
+				out = NewStringDatum(recordText(row))
+			}
 			if _, nextErr2 := op.Next(); nextErr2 != EOF {
 				if nextErr2 != nil {
 					return Datum{}, wrapSQLFunctionContext(nextErr2, r.Name, stmtNum)
@@ -779,6 +864,11 @@ func executeSQLProcedureReturning(r *catalog.Routine, args []Datum, ctx *Context
 }
 
 func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	body := r.Body
 	if len(r.ArgNames) > 0 {
 		body = rewriteSQLNamedParams(body, r.ArgNames)
@@ -864,9 +954,17 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 // []Datum (first column of each row). Used by the ProjectSet operator for
 // user-defined SETOF functions in SELECT target lists. M0097-0020.
 func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	body := r.Body
-	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+	if len(inNames) > 0 {
+		body = rewriteSQLNamedParams(body, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -889,8 +987,8 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	child.Params = make([]Datum, len(args))
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
@@ -941,6 +1039,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		// non-SETOF composite convention elsewhere in this file
 		// (rowToCompositeText). Before this fix only row[0] was kept,
 		// silently dropping every column past the first. M0134-0059.
+		nOut := routineOutParamCount(r)
 		var compositeCols []catalog.Column
 		if compTbl, ok := ctxPlanCatalog(child).LookupTable(parser.ObjectName{Name: strings.ToLower(r.ReturnType.Name)}); ok && len(compTbl.Columns) > 0 {
 			compositeCols = compTbl.Columns
@@ -960,6 +1059,12 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			}
 			if compositeCols != nil && len(row) > 1 {
 				out = append(out, NewStringDatum(rowToCompositeText(compositeCols, row)))
+				continue
+			}
+			// Several output parameters (OUT, INOUT or RETURNS TABLE columns):
+			// each row is a record of them (M0146-0165).
+			if nOut > 1 {
+				out = append(out, NewStringDatum(recordText(row)))
 				continue
 			}
 			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
@@ -1003,7 +1108,73 @@ func datumForCompositeText(d Datum) string {
 	}
 }
 
+// declarePLpgSQLOutParams registers r's output parameters — OUT, INOUT and
+// RETURNS TABLE columns — as frame variables, as pl_comp.c do_compile does for
+// every output argument. An OUT parameter starts NULL; an INOUT one is already
+// bound to its input value, so its duplicate add is ignored.
+func declarePLpgSQLOutParams(r *catalog.Routine, frame *plpgsqlFrame) {
+	for i, mode := range r.ArgModes {
+		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			typ := catalog.Type{Name: "unknown"}
+			if i < len(r.ArgTypes) {
+				typ = normalizeCatalogType(r.ArgTypes[i])
+			}
+			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
+			frame.outParamNames = append(frame.outParamNames, r.ArgNames[i])
+		}
+	}
+}
+
+// routineHasOutParams reports whether r has an OUT or INOUT parameter.
+func routineHasOutParams(r *catalog.Routine) bool {
+	for _, m := range r.ArgModes {
+		if m == "o" || m == "b" {
+			return true
+		}
+	}
+	return false
+}
+
+// routineOutParamCount is the number of r's OUT and INOUT parameters.
+func routineOutParamCount(r *catalog.Routine) int {
+	n := 0
+	for _, m := range r.ArgModes {
+		if m == "o" || m == "b" {
+			n++
+		}
+	}
+	return n
+}
+
+// plpgsqlOutParamResult is the value a function with output parameters
+// produces at RETURN, at RETURN NEXT without an expression, or on reaching the
+// end of its body: the single output variable's value, or a record of all of
+// them in declaration order (pl_exec.c: the out-parameter row is the
+// function's result). An unnamed output is NULL.
+func plpgsqlOutParamResult(r *catalog.Routine, frame *plpgsqlFrame) Datum {
+	var vals []Datum
+	for i, mode := range r.ArgModes {
+		if mode != "o" && mode != "b" {
+			continue
+		}
+		val := NullDatum
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			if idx, ok := frame.lookup(r.ArgNames[i]); ok {
+				val = frame.values[idx]
+			}
+		}
+		vals = append(vals, val)
+	}
+	if len(vals) == 1 {
+		return vals[0]
+	}
+	return NewStringDatum(recordText(vals))
+}
+
 func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	// STRICT: if any argument is NULL, return empty set without executing the body.
 	if r.Strict {
 		for _, arg := range args {
@@ -1012,6 +1183,11 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			}
 		}
 	}
+	restore, cerr := enterRoutineConfig(r, ctx, pos)
+	if cerr != nil {
+		return nil, cerr
+	}
+	defer restore()
 	block, err := parsePLpgSQLBody(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
@@ -1026,32 +1202,23 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
 			return nil, err
 		}
 		child.Params[i] = coerced
-		if i < len(r.ArgNames) {
-			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+		if i < len(inNames) {
+			if err := frame.add(inNames[i], declared, coerced); err != nil {
 				return nil, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
 			}
 		}
 	}
 	// Initialize OUT parameters as NULL variables (RETURNS TABLE / OUT args not
 	// passed by caller). M0097-0028.
-	for i, mode := range r.ArgModes {
-		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
-			typ := catalog.Type{Name: "unknown"}
-			if i < len(r.ArgTypes) {
-				typ = normalizeCatalogType(r.ArgTypes[i])
-			}
-			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
-			frame.outParamNames = append(frame.outParamNames, r.ArgNames[i])
-		}
-	}
+	declarePLpgSQLOutParams(r, frame)
 	for _, d := range block.Declarations {
 		typ := catalogTypeFromColumnType(d.Type)
 		value := NullDatum
@@ -1081,11 +1248,14 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 	return frame.returnNextRows, nil
 }
 
+// routineRegistry returns the routine registry bound to the connection's
+// database (pg_proc is per-database; M0146-0156). Every executor path that
+// resolves, creates or alters a routine goes through it.
 func routineRegistry(ctx *Context) *catalog.Routines {
 	if ctx == nil || ctx.Catalog == nil {
 		return nil
 	}
-	return ctx.Catalog.Routines()
+	return ctx.Catalog.Routines().InDB(ctx.CurrentDatabaseOid)
 }
 
 func parseRoutineName(name string) parser.ObjectName {
@@ -1136,7 +1306,7 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 		// Mirrors PostgreSQL's "exact match beats implicit cast" resolution.
 		exact := make([]*catalog.Routine, 0, len(specific))
 		for _, c := range specific {
-			if routineArgsExactMatch(c.ArgTypes, args) {
+			if inTypes, _ := routineInputParams(c); routineArgsExactMatch(inTypes, args) {
 				exact = append(exact, c)
 			}
 		}
@@ -1154,25 +1324,75 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 // call-site arguments of its element type — each later collapsed into one
 // array value by bundleVariadicArgs — mirroring parse_func.c's
 // func_match_argtypes VARIADIC handling.
-func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) {
-	variadicPos := -1
-	for i, mode := range c.ArgModes {
-		if mode == "v" {
-			variadicPos = i
+// routineInputParams returns the types and names of r's input parameters —
+// IN, INOUT and VARIADIC, in declaration order. A call's arguments, $n and
+// parameter names in the body all refer to these (functioncmds.c
+// interpret_function_parameter_list counts only them in pronargs); OUT
+// parameters and RETURNS TABLE columns are results, not arguments. With
+// every parameter an input (the common case) it returns r's own slices.
+func routineInputParams(r *catalog.Routine) ([]catalog.Type, []string) {
+	hasOut := false
+	for _, m := range r.ArgModes {
+		if m == "o" {
+			hasOut = true
+			break
 		}
 	}
+	if !hasOut {
+		return r.ArgTypes, r.ArgNames
+	}
+	types := make([]catalog.Type, 0, len(r.ArgTypes))
+	var names []string
+	if len(r.ArgNames) > 0 {
+		names = make([]string, 0, len(r.ArgTypes))
+	}
+	for i, t := range r.ArgTypes {
+		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		types = append(types, t)
+		if names != nil {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			names = append(names, name)
+		}
+	}
+	return types, names
+}
+
+func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) {
+	// A call supplies the input parameters only: OUT parameters and RETURNS
+	// TABLE columns are not arguments (M0146-0084).
+	inTypes, _ := routineInputParams(c)
+	variadicPos := -1
+	in := 0
+	for i := range c.ArgTypes {
+		mode := ""
+		if i < len(c.ArgModes) {
+			mode = c.ArgModes[i]
+		}
+		if mode == "o" {
+			continue
+		}
+		if mode == "v" {
+			variadicPos = in
+		}
+		in++
+	}
 	if variadicPos < 0 {
-		if len(c.ArgTypes) != n {
+		if len(inTypes) != n {
 			return nil, false
 		}
-		return c.ArgTypes, true
+		return inTypes, true
 	}
 	if n < variadicPos {
 		return nil, false
 	}
-	elemType := catalog.Type{Name: strings.TrimSuffix(strings.ToLower(c.ArgTypes[variadicPos].Name), "[]")}
+	elemType := catalog.Type{Name: strings.TrimSuffix(strings.ToLower(inTypes[variadicPos].Name), "[]")}
 	types := make([]catalog.Type, n)
-	copy(types, c.ArgTypes[:variadicPos])
+	copy(types, inTypes[:variadicPos])
 	for i := variadicPos; i < n; i++ {
 		types[i] = elemType
 	}
@@ -1187,8 +1407,16 @@ func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) 
 // parameter, or the routine's declared VARIADIC position is beyond the
 // caller-supplied arguments.
 func bundleVariadicArgs(argModes []string, args []Datum) []Datum {
-	for vi, mode := range argModes {
+	// vi counts input positions only: an OUT parameter is not an argument, so
+	// one declared before the VARIADIC parameter must not shift it
+	// (M0146-0165).
+	vi := 0
+	for _, mode := range argModes {
+		if mode == "o" {
+			continue
+		}
 		if mode != "v" || vi > len(args) {
+			vi++
 			continue
 		}
 		bundled := make([]Datum, 0, vi+1)
@@ -1263,6 +1491,9 @@ func hasPolymorphicArgType(argTypes []catalog.Type) bool {
 }
 
 func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Call arguments, $n and parameter names refer to the input parameters
+	// only; OUT parameters and RETURNS TABLE columns are not arguments.
+	inTypes, inNames := routineInputParams(r)
 	if strings.ToLower(r.Language) != "plpgsql" {
 		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
 	}
@@ -1290,17 +1521,17 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
 		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
+		if i < len(inTypes) {
+			declared = normalizeCatalogType(inTypes[i])
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
 			return Datum{}, err
 		}
 		child.Params[i] = coerced
-		if i < len(r.ArgNames) {
-			argName := strings.ToLower(r.ArgNames[i])
-			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+		if i < len(inNames) {
+			argName := strings.ToLower(inNames[i])
+			if err := frame.add(inNames[i], declared, coerced); err != nil {
 				return Datum{}, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
 			}
 			// If this argument is a composite type, record its field schema.
@@ -1310,6 +1541,10 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 				}
 			}
 		}
+	}
+	hasOut := !r.IsProcedure && routineHasOutParams(r)
+	if hasOut {
+		declarePLpgSQLOutParams(r, frame)
 	}
 	for _, d := range block.Declarations {
 		typ := catalogTypeFromColumnType(d.Type)
@@ -1346,6 +1581,11 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	}
 	if flow == flowReturn {
 		return res, nil
+	}
+	// A function with output parameters returns them on reaching the end of its
+	// body; there is no "control reached end" error (M0146-0165).
+	if hasOut {
+		return plpgsqlOutParamResult(r, frame), nil
 	}
 	// VOID functions may fall off the end without an explicit RETURN. M0097-0025.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
@@ -1742,6 +1982,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if frame.trig != nil {
 				return Datum{}, flowReturnTriggerNull, nil
 			}
+			// With output parameters a bare RETURN returns them (M0146-0165).
+			if !r.IsProcedure && routineHasOutParams(r) {
+				return plpgsqlOutParamResult(r, frame), flowReturn, nil
+			}
 			if !strings.EqualFold(r.ReturnType.Name, "void") {
 				return Datum{}, flowNone, &ExecError{
 					Code:    "42601",
@@ -1765,6 +2009,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				return Datum{}, flowReturnTriggerNull, nil
 			}
 		}
+		// pl_gram.y make_return_stmt rejects this when the function is
+		// compiled; goopg compiles PL/pgSQL at the call, so it is raised here
+		// (M0146-0165).
+		if !r.IsProcedure && routineHasOutParams(r) {
+			return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(),
+				Message: "RETURN cannot have a parameter in function with OUT parameters"}
+		}
 		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
@@ -1783,33 +2034,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// RETURN NEXT — append one value to the SETOF accumulator. M0097-0073.
 		if s.Expr == nil {
 			// RETURN NEXT; (no expression) — collect current OUT param values.
-			// Used by RETURNS TABLE functions. M0097-0028.
-			var outNames []string
-			for i, mode := range r.ArgModes {
-				if (mode == "o" || mode == "b") && i < len(r.ArgNames) {
-					outNames = append(outNames, r.ArgNames[i])
-				}
-			}
-			if len(outNames) == 1 {
-				val := NullDatum
-				if idx, ok := frame.lookup(outNames[0]); ok {
-					val = frame.values[idx]
-				}
-				frame.returnNextRows = append(frame.returnNextRows, val)
-			} else if len(outNames) > 1 {
-				parts := make([]string, len(outNames))
-				for i, name := range outNames {
-					val := NullDatum
-					if idx, ok := frame.lookup(name); ok {
-						val = frame.values[idx]
-					}
-					if val.IsNull() {
-						parts[i] = ""
-					} else {
-						parts[i] = val.StringValue()
-					}
-				}
-				frame.returnNextRows = append(frame.returnNextRows, NewStringDatum("("+strings.Join(parts, ",")+")"))
+			// Used by RETURNS TABLE functions. M0097-0028. Non-string outputs
+			// render through their output function (M0146-0165).
+			if routineHasOutParams(r) {
+				frame.returnNextRows = append(frame.returnNextRows, plpgsqlOutParamResult(r, frame))
 			}
 			return Datum{}, flowNone, nil
 		}
@@ -3393,6 +3621,11 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	if err != nil {
 		return nil, false, &ExecError{Code: "P0000", Message: fmt.Sprintf("invalid trigger body for %s: %v", r.QualifiedName(), err)}
 	}
+	restore, cerr := enterRoutineConfig(r, ctx, 0)
+	if cerr != nil {
+		return nil, false, cerr
+	}
+	defer restore()
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx

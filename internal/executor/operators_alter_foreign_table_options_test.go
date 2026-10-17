@@ -17,6 +17,7 @@ func TestAlterForeignTableAlterColumnOptionsRoundtrip(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -88,6 +89,7 @@ func TestAlterForeignTableAlterColumnOptionsErrors(t *testing.T) {
 	if err := runDDL(t, ctx, `CREATE TABLE plain (c int)`); err != nil {
 		t.Fatalf("CREATE TABLE plain: %v", err)
 	}
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -120,6 +122,7 @@ func TestAlterForeignTableSetForeignOptionsRoundtrip(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -184,6 +187,7 @@ func TestAlterForeignTableSetForeignOptionsErrors(t *testing.T) {
 	if err := runDDL(t, ctx, `CREATE TABLE plain (c int)`); err != nil {
 		t.Fatalf("CREATE TABLE plain: %v", err)
 	}
+	mustCreateFDW(t, ctx, "goopg_fdw")
 	if err := runDDL(t, ctx, `CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
 		t.Fatalf("CREATE SERVER: %v", err)
 	}
@@ -203,4 +207,19 @@ func TestAlterForeignTableSetForeignOptionsErrors(t *testing.T) {
 	wantCode(t, runDDL(t, ctx, `ALTER FOREIGN TABLE ft OPTIONS (ADD host 'dup')`), "42710")
 	wantCode(t, runDDL(t, ctx, `ALTER FOREIGN TABLE ft OPTIONS (SET nosuch 'v')`), "42704")
 	wantCode(t, runDDL(t, ctx, `ALTER FOREIGN TABLE ft OPTIONS (DROP nosuch)`), "42704")
+}
+
+// mustCreateFDW creates the foreign-data wrapper a test's CREATE SERVER names,
+// in the context's current database: CREATE SERVER requires an existing
+// wrapper in that database (GetForeignDataWrapperByName, M0122-0015e). Only a
+// superuser may create a wrapper, so it runs as the bootstrap superuser and
+// restores the session's role.
+func mustCreateFDW(t *testing.T, ctx *Context, name string) {
+	t.Helper()
+	role := ctx.NonSuperuserRole
+	ctx.NonSuperuserRole = ""
+	defer func() { ctx.NonSuperuserRole = role }()
+	if err := runDDL(t, ctx, "CREATE FOREIGN DATA WRAPPER "+name); err != nil {
+		t.Fatalf("CREATE FOREIGN DATA WRAPPER %s: %v", name, err)
+	}
 }

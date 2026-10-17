@@ -55,6 +55,7 @@ package optimizer
 
 import (
 	"math"
+	"strconv"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
 )
@@ -228,9 +229,9 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 //     INNER joins into the search. Written as a real test anyway, against the
 //     joinrel's own type, so relaxing the pin does not silently admit the shape
 //     PG refuses here.
-//  6. the `inner_unique` ppi-serial coverage test (:752): goopg's search never
-//     marks a join inner-unique, so PG's arm is unreachable from the false
-//     branch. Ledgered.
+//  6. the `inner_unique` ppi-serial coverage test (:752): applied by the NLI
+//     arm's caller (nliMemoizeCandidate, M0146-0222), which holds the pair's
+//     extra->inner_unique (extraInnerUnique) and its residual join clauses.
 //  7. volatile functions in the inner's target list, base restrictions, or
 //     parameterised clauses (:773-799): subsumed by the key-shape test below —
 //     every cache key must be a bare `*ColumnRef`, and a column reference is
@@ -402,8 +403,9 @@ func memoizeKeyRelids(c indexPathClause, outerRelids RelSet) RelSet {
 	return 0
 }
 
-// memoizeKeyNDistinct is `estimate_num_groups` over the cache keys, at the
-// fidelity `getVariableNumDistinct` (P5.6-a) provides.
+// memoizeKeyNDistinct is `estimate_num_groups` over the cache keys
+// (selfuncs.c:3449), which `cost_memoize_rescan` calls with `calls` as the
+// input row count (costsize.c:2581).
 //
 // The combination rule for a multi-column key is PG's own and is worth naming
 // because it reads backwards: `estimate_num_groups` MULTIPLIES the per-column
@@ -413,24 +415,100 @@ func memoizeKeyRelids(c indexPathClause, outerRelids RelSet) RelSet {
 // less attractive cache — which is the opposite of its effect on a GROUP BY
 // estimate, and is why the same formula is right in both places.
 //
+// The keys are grouped by base relation, as upstream groups its Vars, and each
+// relation's product takes upstream's two per-relation corrections
+// (M0146-0199):
+//
+//   - the clamp to the relation's tuples, or a tenth of them when it
+//     contributes several keys, never below the largest single ndistinct;
+//   - the Yao/Dell'Era restriction term when the relation is filtered
+//     (`rel->rows < rel->tuples`): p of N rows drawn from n distinct values
+//     carry n·(1 - ((N-p)/N)^(N/n)) of them. Without it a key column of a
+//     restricted outer kept the table-wide count, which the `calls` clamp
+//     then pinned at `calls` — hit ratio 0 — where PG sees a few repeats
+//     (TPC-DS SF1 Q32: catalog_sales filtered to 88 rows, cs_sold_date_sk
+//     1830 distinct of 1.44M → 86, so PG's Memoize over the date_dim probe
+//     wins by 1.3%).
+//
+// A key repeated in the list is counted once, as `add_unique_group_var`
+// does. The multivariate-ndistinct lookup (`estimate_multivariate_ndistinct`)
+// is not consulted here; the GROUP BY port's exact-set cut
+// (`groupComboNDistinct`) is the one place goopg has it.
+//
 // The second return is PG's `SELFLAG_USED_DEFAULT`, and it is sticky: if ANY
 // key column fell back on a default, the whole estimate is a guess and
 // `costMemoizeRescan` replaces it with `calls`.
 func memoizeKeyNDistinct(s *searchCtx, innerPath *Path, outerRelids RelSet) (float64, bool) {
-	nd := 1.0
+	type relKeys struct {
+		tuples, rows float64
+		nds          []float64
+	}
 	anyDefault := false
+	numdistinct := 1.0
+	var order []int
+	byRel := map[int]*relKeys{}
+	seen := map[string]bool{}
 	for _, c := range innerPath.IndexClauses {
-		v := s.examineJoinVar(c.key, memoizeKeyRelids(c, outerRelids))
+		relids := memoizeKeyRelids(c, outerRelids)
+		v := s.examineJoinVar(c.key, relids)
 		colND, isDefault := getVariableNumDistinct(v)
 		if isDefault {
 			anyDefault = true
 		}
-		nd *= colND
+		i, cr, ok := s.resolveJoinVarColumn(c.key, relids)
+		if !ok || cr == nil {
+			// No single base relation to group under: the key multiplies in
+			// alone, as before.
+			numdistinct *= colND
+			continue
+		}
+		dup := strconv.Itoa(i) + "\x00" + cr.Name
+		if seen[dup] {
+			continue
+		}
+		seen[dup] = true
+		rk := byRel[i]
+		if rk == nil {
+			rk = &relKeys{tuples: v.tuples, rows: v.rows}
+			byRel[i] = rk
+			order = append(order, i)
+		}
+		rk.nds = append(rk.nds, colND)
 	}
-	if nd < 1 {
-		nd = 1
+	for _, i := range order {
+		rk := byRel[i]
+		reldistinct, relmax := 1.0, 1.0
+		for _, nd := range rk.nds {
+			reldistinct *= nd
+			if relmax < nd {
+				relmax = nd
+			}
+		}
+		if rk.tuples <= 0 {
+			// "Sanity check --- don't divide by zero if empty relation":
+			// upstream skips the relation's whole contribution.
+			continue
+		}
+		clamp := rk.tuples
+		if len(rk.nds) > 1 {
+			clamp *= 0.1
+			if clamp < relmax {
+				clamp = math.Min(relmax, rk.tuples)
+			}
+		}
+		if reldistinct > clamp {
+			reldistinct = clamp
+		}
+		if reldistinct > 0 && rk.rows > 0 && rk.rows < rk.tuples {
+			reldistinct *= 1 - math.Pow((rk.tuples-rk.rows)/rk.tuples, rk.tuples/reldistinct)
+		}
+		numdistinct *= clampRowEstF(reldistinct)
 	}
-	return nd, anyDefault
+	numdistinct = math.Ceil(numdistinct)
+	if numdistinct < 1 {
+		numdistinct = 1
+	}
+	return numdistinct, anyDefault
 }
 
 // memoizeKeyWidths is PG's `get_expr_width` (costsize.c:6404) summed over

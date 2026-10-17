@@ -1,0 +1,7 @@
+# Q95 SF0.25 (tmp/c20a/data-sf025, HEAD 55883889e, GOOPG_PGSHAPED_DP_TRACE=1)
+3624:DPTRACE cost lev=4 rel={customer_address+date_dim+web_site+ws1} rows=1 npaths=8 cheapest=gather reqouter={} total=7645.222652066219 second=nli secondtotal=8451.479276192442
+3639:DPTRACE cost lev=6 rel={customer_address+date_dim+web_returns+web_site+ws1+ws_wh} rows=1 npaths=5 cheapest=nli reqouter={} total=49098.77313368819 second=nli secondtotal=49905.02975781442
+3643:DPTRACE cost lev=7 rel={customer_address+date_dim+web_returns+web_site+ws1+ws_wh+ws_wh} rows=1 npaths=2 cheapest=nl reqouter={} total=85104.2444894386 second=nl secondtotal=88325.53066995258
+3272:DPPATH path producer=join.nestloop relids={0,1,2,3,4,5,6} kind=5 reqouter=- rows=1 startup=1092.855609496289 total=84297.98786531237 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0,1,2,3,5,6} inner={4} width=2000 inputtotal=49098.77313368819
+3274:DPPATH path producer=join.nestloop relids={0,1,2,3,4,5,6} kind=5 reqouter=- rows=1 startup=92.85560949628898 total=85104.2444894386 disabled=0 pathkeys=0 verdict=accepted jointype=semi outer={0,1,2,3,5,6} inner={4} width=2000 inputtotal=49905.02975781442
+# gather.merge.sort producers in the 7-rel problem: 0

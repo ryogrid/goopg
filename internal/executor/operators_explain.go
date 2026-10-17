@@ -768,12 +768,14 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				// owner's slot merely because the statement-wide IDs happen to
 				// share a number.
 				var prevParamSources map[int]*optimizer.ColumnRef
-				var prevParamOwner optimizer.Node
+				var prevParamOwner, prevParamScope optimizer.Node
 				if reg != nil {
 					prevParamSources = reg.execParamSources
 					reg.execParamSources = subPlanExecParamSources(sp.expr)
 					prevParamOwner = reg.execParamOwner
 					reg.execParamOwner = sp.paramOwner
+					prevParamScope = reg.execParamScope
+					reg.execParamScope = sp.paramScope
 				}
 				// A sublink body brings its own range-table entries
 				// (Q30's `ctr2` lives only inside SubPlan 1), and they
@@ -797,6 +799,7 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				if reg != nil {
 					reg.execParamSources = prevParamSources
 					reg.execParamOwner = prevParamOwner
+					reg.execParamScope = prevParamScope
 				}
 			}
 		}
@@ -1391,7 +1394,14 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			// Filter above the avg agg) marks a level PG may wall off
 			// (SubqueryScan v1 keeps the InitPlan inside): do not chase
 			// an Aggs-synth out from under it.
-			if filterBlocksChase(n) {
+			//
+			// A plain GROUP BY key of the aggregate under that Filter is not
+			// an Aggs-synth: PG keeps it as a Var in the Agg's target list
+			// and deparses through the HAVING, InitPlan or not — TPC-DS
+			// Q14's rollup Sort Key `item.i_brand_id` over a UNION ALL
+			// member whose HAVING compares against an InitPlan
+			// (M0146-0042).
+			if filterBlocksChase(n) && !chaseOnGroupKeyOf(n.Child, cur) {
 				return nil, false
 			}
 			c := childNodeOf(n)
@@ -1400,6 +1410,22 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 			}
 			node = c
 			continue
+		case *optimizer.Result:
+			// M0146-0129: a childless Result — a dummy rel (an outer join's
+			// constant-false nullable side) or a FROM-less projection —
+			// computes its outputs from its targets alone, so a computed
+			// target is the source text, exactly as for a Project:
+			// regress join.sql's `((1) IS NULL)` over `Result  One-Time
+			// Filter: false`.
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok || n.Child != nil || col.Index < 0 || col.Index >= len(n.Targets) {
+				return nil, false
+			}
+			t := n.Targets[col.Index]
+			if _, isCol := t.(*optimizer.ColumnRef); isCol || exprHasSubplanOrOuterRef(t) || exprHasTableZeroRef(t) {
+				return nil, false
+			}
+			return t, true
 		case *optimizer.Project:
 			if n.IsolatedScope {
 				return nil, false
@@ -1563,20 +1589,25 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 				node = partial.Child
 				continue
 			}
-			if n.Mode != optimizer.AggModeSimple {
-				return nil, false
-			}
 			// M0146-0042: a GROUP BY key the planner pruned (constant-
 			// pinned or functionally dependent) still reaches the output as
 			// a Passthrough column at the row's tail. PG keeps it in the
 			// Agg's target list as a plain Var and deparses through it
 			// like a group key — TPC-DS Q66's `date_dim.d_year` behind
-			// the subquery's `year`, where goopg printed `year`.
+			// the subquery's `year`, where goopg printed `year`. A
+			// Finalize / Partial pair carries it the same way: the
+			// Finalize's passthrough reads the Partial's tail through the
+			// Gather, and the Partial's reads its input (Q66's arms are
+			// parallel), so the rule holds in every mode.
 			var passthrough optimizer.Expr
 			if np := len(n.Passthrough); np > 0 && n.GroupingSets == nil {
-				if k := j - (len(n.Output()) - np); k >= 0 && k < np {
+				if k := j - (len(n.Output()) - np); k >= 0 && k < np && j >= len(n.GroupExprs) &&
+					(col.Name == "" || n.Output()[j].Name == col.Name) {
 					passthrough = n.Passthrough[k]
 				}
+			}
+			if passthrough == nil && n.Mode != optimizer.AggModeSimple {
+				return nil, false
 			}
 			if j < len(n.GroupExprs) || passthrough != nil {
 				g := passthrough
@@ -1993,6 +2024,45 @@ func childProjectThroughFilters(n optimizer.Node) *optimizer.Project {
 // v1) means an Aggs-synth from below would print internals of a level
 // PG walls off. Plain-predicate Filters step through (position
 // preservation is definitional).
+// memoizeParentLoop is the nested loop whose inner side is m, when its
+// outer input comes first in the loop's row (a Join's Left, an index join's
+// Outer) — the row m's cache keys read. nil otherwise.
+func memoizeParentLoop(reg *subPlanReg, m *optimizer.Memoize) optimizer.Node {
+	nm := reg.names()
+	if nm == nil || m == nil {
+		return nil
+	}
+	parent := nm.parent[nodePtr(m)]
+	switch j := parent.(type) {
+	case *optimizer.Join:
+		if j.Right == optimizer.Node(m) && j.Left != nil {
+			return j
+		}
+	case *optimizer.NestedLoopIndexJoin:
+		if j.InnerMemo == m && j.Outer != nil {
+			return j
+		}
+	}
+	return nil
+}
+
+// chaseOnGroupKeyOf reports whether cur names a plain GROUP BY position of
+// the simple, non-grouping-sets Aggregate child — a column the Agg's target
+// list carries as a Var, which a HAVING Filter above it cannot wall off.
+func chaseOnGroupKeyOf(child optimizer.Node, cur optimizer.Expr) bool {
+	agg, ok := child.(*optimizer.Aggregate)
+	col, isCol := cur.(*optimizer.ColumnRef)
+	if !ok || !isCol || agg.GroupingSets != nil || col.Index < 0 || col.Index >= len(agg.GroupExprs) {
+		return false
+	}
+	out := agg.Output()
+	if col.Index >= len(out) || out[col.Index].Name != col.Name {
+		return false
+	}
+	g, isGroupCol := agg.GroupExprs[col.Index].(*optimizer.ColumnRef)
+	return isGroupCol && g != nil && !exprHasSubplanOrOuterRef(g)
+}
+
 func filterBlocksChase(f *optimizer.Filter) bool {
 	return f != nil && f.Predicate != nil && exprHasSubplanOrOuterRef(f.Predicate)
 }
@@ -2071,6 +2141,74 @@ func expandAggOutputRefsInFilter(filt optimizer.Expr, agg *optimizer.Aggregate) 
 	return filt
 }
 
+// sortInputAggregate is the Aggregate whose output a key list indexes: the
+// child itself (through Filters), or — for a WindowAgg's PARTITION BY /
+// ORDER BY, whose child is the Sort that orders the window's input — the
+// aggregate under that Sort, which republishes the aggregate's columns
+// position for position.
+func sortInputAggregate(child optimizer.Node) *optimizer.Aggregate {
+	if agg := childAggregateThroughFilters(child); agg != nil {
+		return agg
+	}
+	switch s := child.(type) {
+	case *optimizer.Sort:
+		return childAggregateThroughFilters(s.Child)
+	case *optimizer.IncrementalSort:
+		return childAggregateThroughFilters(s.Child)
+	}
+	return nil
+}
+
+// aggOutputKeyExpr is Entry (i) of sortKeyParts for one column of a child
+// Aggregate's output, factored out so a computed key's columns take it too
+// (M0146-0042): a group key chases to its source, an aggregate result
+// expands to its call, a grouping mask to its GROUPING(...) call. hit is
+// false when col names none of them, and the caller keeps col.
+func aggOutputKeyExpr(col *optimizer.ColumnRef, agg *optimizer.Aggregate, reg *subPlanReg, qualify bool) (keyExpr optimizer.Expr, hit bool) {
+	keyExpr = col
+	// Entry (i) — Sort above agg: Arm-S guard, then
+	// the Slice-2 chase down past republishing
+	// layers; a chase-miss falls back to the Arm-S
+	// render (Slice-1 behaviour, byte-identical).
+	// Aggs-section keys fall through to R65's call
+	// expansion (now Star/Distinct-capable).
+	if src, hit := sortGroupKeySource(col, agg); hit {
+		if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
+			keyExpr = chased
+		} else if _, isCol := src.(*optimizer.ColumnRef); !isCol {
+			// M0146-0042: a computed group key (TPC-DS Q54's
+			// `(revenue / 50)::int`) indexes the aggregate's
+			// input; its columns deparse there, through a kept
+			// Subquery Scan to `my_revenue.revenue`, as the
+			// Group Key line itself prints them.
+			keyExpr = src
+			if chased, ok := chaseKeyExprColumns(src, agg.Child, reg, qualify); ok {
+				keyExpr = chased
+			}
+		} else {
+			keyExpr = src
+		}
+	} else if expanded, hit := expandAggOutputRef(col, agg); hit {
+		keyExpr = expanded
+		// M0146-0042: an argument the aggregate's input
+		// computes — a UNION ALL member's own aggregate,
+		// deparsed through the Append's first branch — nests
+		// as PG prints it: TPC-DS Q56's
+		// `(sum((sum(store_sales.ss_ext_sales_price))))`.
+		if i := col.Index - len(agg.GroupExprs); i >= 0 && i < len(agg.Aggs) {
+			if chasedAgg, ok := chaseAggregateResultArgs(agg.Aggs[i], agg.Child, reg); ok {
+				if call, ok := synthAggCall(&chasedAgg); ok {
+					keyExpr = call
+				}
+			}
+		}
+	} else if g, hit := groupingMaskCall(agg, col.Index); hit {
+		// M0146-0005cf: PG's `(GROUPING(a, b))`.
+		keyExpr = g
+	}
+	return keyExpr, keyExpr != optimizer.Expr(col)
+}
+
 // emitNodeDetailLines writes the PG-style detail lines that
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
@@ -2095,47 +2233,31 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 		// `(sum(...)) DESC`; unexpanded keys behave exactly as
 		// before.
 		keyExpr := k.Expr
+		if agg := sortInputAggregate(child); agg != nil {
+			if _, isCol := k.Expr.(*optimizer.ColumnRef); !isCol {
+				// M0146-0042: a computed key over the aggregate's outputs —
+				// a WindowAgg's PARTITION BY over a grouping-sets rollup —
+				// deparses each output column through the Agg's target
+				// list, as get_variable does for every OUTER_VAR it meets:
+				// TPC-DS Q36/Q86's `((GROUPING(item.i_category) +
+				// GROUPING(item.i_class)))` and `((sum(...) / sum(...)))`.
+				changed := false
+				if out, ok := optimizer.CloneExprReplacingColumnRefs(k.Expr, func(c *optimizer.ColumnRef) optimizer.Expr {
+					if e, hit := aggOutputKeyExpr(c, agg, reg, qualify); hit {
+						changed = true
+						return e
+					}
+					return c
+				}); ok && changed {
+					keyExpr = out
+				}
+			}
+		}
 		if col, ok := k.Expr.(*optimizer.ColumnRef); ok {
 			if agg := childAggregateThroughFilters(child); agg != nil {
-				// Entry (i) — Sort above agg: Arm-S guard, then
-				// the Slice-2 chase down past republishing
-				// layers; a chase-miss falls back to the Arm-S
-				// render (Slice-1 behaviour, byte-identical).
-				// Aggs-section keys fall through to R65's call
-				// expansion (now Star/Distinct-capable).
-				if src, hit := sortGroupKeySource(col, agg); hit {
-					if chased, ok := resolveKeySource(src, agg.Child, reg); ok {
-						keyExpr = chased
-					} else if _, isCol := src.(*optimizer.ColumnRef); !isCol {
-						// M0146-0042: a computed group key (TPC-DS Q54's
-						// `(revenue / 50)::int`) indexes the aggregate's
-						// input; its columns deparse there, through a kept
-						// Subquery Scan to `my_revenue.revenue`, as the
-						// Group Key line itself prints them.
-						keyExpr = src
-						if chased, ok := chaseKeyExprColumns(src, agg.Child, reg, qualify); ok {
-							keyExpr = chased
-						}
-					} else {
-						keyExpr = src
-					}
-				} else if expanded, hit := expandAggOutputRef(col, agg); hit {
-					keyExpr = expanded
-					// M0146-0042: an argument the aggregate's input
-					// computes — a UNION ALL member's own aggregate,
-					// deparsed through the Append's first branch — nests
-					// as PG prints it: TPC-DS Q56's
-					// `(sum((sum(store_sales.ss_ext_sales_price))))`.
-					if i := col.Index - len(agg.GroupExprs); i >= 0 && i < len(agg.Aggs) {
-						if chasedAgg, ok := chaseAggregateResultArgs(agg.Aggs[i], agg.Child, reg); ok {
-							if call, ok := synthAggCall(&chasedAgg); ok {
-								keyExpr = call
-							}
-						}
-					}
-				} else if g, hit := groupingMaskCall(agg, col.Index); hit {
-					// M0146-0005cf: PG's `(GROUPING(a, b))`.
-					keyExpr = g
+				// Entry (i) — Sort above agg (aggOutputKeyExpr).
+				if e, hit := aggOutputKeyExpr(col, agg, reg, qualify); hit {
+					keyExpr = e
 				}
 			} else if proj := childProjectThroughFilters(child); proj != nil {
 				// Entry (ii) — grouping-input / order-by Sort
@@ -2734,22 +2856,39 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// two are different things and both belong here: BitmapQual is the
 		// recheck list (lossy pages only), Cond is the per-tuple residual the
 		// scan carries when it is an NLI inner (plan.go, BitmapHeapScan.Cond).
-		if len(p.BitmapQual) > 0 {
-			var rc optimizer.Expr = p.BitmapQual[0]
-			for _, q := range p.BitmapQual[1:] {
+		recheck := p.BitmapQual
+		cond := p.Cond
+		// M0146-0187: a parameterised probe (bindParamProbe) keeps its recheck
+		// on Cond; its leading ProbeRecheckN conjuncts are PG's bitmapqualorig.
+		if len(recheck) == 0 && p.ProbeRecheckN > 0 && cond != nil {
+			if parts := optimizer.SplitAnd(cond); len(parts) >= p.ProbeRecheckN {
+				recheck = parts[:p.ProbeRecheckN]
+				cond = nil
+				for _, q := range parts[p.ProbeRecheckN:] {
+					if cond == nil {
+						cond = q
+					} else {
+						cond = &optimizer.BinaryOp{Op: parser.OpAnd, Left: cond, Right: q}
+					}
+				}
+			}
+		}
+		if len(recheck) > 0 {
+			var rc optimizer.Expr = recheck[0]
+			for _, q := range recheck[1:] {
 				rc = &optimizer.BinaryOp{Op: parser.OpAnd, Left: rc, Right: q}
 			}
 			rc = qualifyForeignColumns(rc, p, reg)
 			*rows = append(*rows, Row{NewStringDatum(indent + "Recheck Cond: " + wrapParen(formatExprQual(rc, reg, qualify)))})
 		}
 		filt := attachedFilter
-		if p.Cond != nil {
+		if cond != nil {
 			if filt == nil {
-				filt = p.Cond
+				filt = cond
 			} else {
 				// The scan's own quals lead: PG appends a parameterized
 				// path's ppi_clauses after the restriction quals.
-				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: p.Cond, Right: filt}
+				filt = &optimizer.BinaryOp{Op: parser.OpAnd, Left: cond, Right: filt}
 			}
 		}
 		if filt != nil {
@@ -2856,8 +2995,21 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
 		if len(p.KeyExprs) > 0 {
 			parts := make([]string, 0, len(p.KeyExprs))
+			// M0146-0042: a cache key is the parameterising loop's OUTER
+			// column, and PG deparses it there (show_memoize_info →
+			// get_variable on the outer Var): through a kept Subquery Scan
+			// it prints the scan's alias, TPC-DS Q44's `v11.item_sk`. The
+			// keys index the loop's outer row, the left part of the join's
+			// row, so they resolve positionally as the Join Filter does.
+			loop := memoizeParentLoop(reg, p)
 			for _, ke := range p.KeyExprs {
-				parts = append(parts, formatExprQual(ke, reg, qualify))
+				var txt string
+				if loop != nil {
+					reg.withJoinRow(loop, func() { txt = formatExprQual(ke, reg, qualify) })
+				} else {
+					txt = formatExprQual(ke, reg, qualify)
+				}
+				parts = append(parts, txt)
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
 			// M0146-0005cy: show_memoize_info prints the comparison mode
@@ -3350,6 +3502,12 @@ func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 	if residual == nil {
 		return ""
 	}
+	// M0146-0129: a lone constant prints bare — show_qual deparses the
+	// qual as written and ruleutils never parenthesizes a Const
+	// (`Join Filter: false` over a dummy nullable side).
+	if isLiteralOneTimeFilterConst(residual) {
+		return formatExprQual(residual, reg, qualify)
+	}
 	return wrapParen(formatExprQual(residual, reg, qualify))
 }
 
@@ -3648,6 +3806,10 @@ func isLiteralOneTimeFilterConst(e optimizer.Expr) bool {
 		return !x.Negated && optimizer.SublinkIsInitPlan(x)
 	case *optimizer.SubqueryExpr:
 		return optimizer.SublinkIsInitPlan(x)
+	case *optimizer.CastExpr:
+		// M0146-0129: `NULL::boolean` is a NULL Const in PG (printed bare).
+		_, isNull := x.Operand.(*optimizer.NullConst)
+		return isNull && x.Explicit
 	}
 	return false
 }
@@ -3797,6 +3959,9 @@ type subPlanReg struct {
 	// execParamOwner, when set, is where execParamSources resolve instead of
 	// the ancestor (subPlanEntry.paramOwner); body-scoped like the map.
 	execParamOwner optimizer.Node
+	// execParamScope, when set, is the plan node that evaluates the sublink
+	// (subPlanEntry.paramScope), tried before execParamOwner; body-scoped.
+	execParamScope optimizer.Node
 }
 
 // subPlanExecParamSources extracts the PARAM_EXEC sources supplied by one
@@ -3930,7 +4095,7 @@ func execParamOwnerChildren(n optimizer.Node) (children []optimizer.Node, recogn
 	case *optimizer.Values, *optimizer.GenerateSeries, *optimizer.UserSrfScan,
 		*optimizer.GenerateSubscripts, *optimizer.FromUnnest,
 		*optimizer.PgInputErrorInfo, *optimizer.PgGetPublicationTables,
-		*optimizer.PgGetSequenceData, *optimizer.PgSequenceParameters,
+		*optimizer.PgGetSequenceData, *optimizer.PgWalSummaryContents, *optimizer.PgSequenceParameters,
 		*optimizer.TSTokenType,
 		*optimizer.PgAvailableWalSummaries, *optimizer.PgGetCatalogForeignKeys,
 		*optimizer.ScalarFuncScan, *optimizer.PgPartitionTree,
@@ -4013,6 +4178,18 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 	source := reg.execParamSources[x.ID]
 	if source == nil {
 		return fallback
+	}
+	// The evaluating node first: a relation scan resolves its own column
+	// only when the source belongs to it, so a source from another relation
+	// falls through to the owner scope unchanged. A source whose relation
+	// index was erased (0) would match on the name alone and could take a
+	// same-named column of the scan, so it skips this step.
+	if scope := reg.execParamScope; scope != nil && source.SourceTableIdx != 0 {
+		if _, candidate := explainRelBaseName(scope); candidate {
+			if qualified := resolveExecParamSourceInOwner(reg.rel, scope, source); qualified != "" {
+				return qualified
+			}
+		}
 	}
 	owner := reg.ancestorNode()
 	if reg.execParamOwner != nil {
@@ -4183,6 +4360,15 @@ type subPlanEntry struct {
 	// Filter (M0146-0012a): the join, or the loop's outer input. The body
 	// renders after that context is gone, so it is captured at assignment.
 	paramOwner optimizer.Node
+	// paramScope is the plan node whose own expression holds the sublink —
+	// the node being rendered at assignment. PG's find_param_referent prints
+	// a SubPlan's PARAM_EXEC argument in the context of the plan node that
+	// evaluates the SubPlan (ruleutils.c get_parameter), so an argument that
+	// reads that node's own relation resolves there first: a parameterised
+	// inner scan's Filter whose sublink correlates on the inner relation
+	// itself (TPC-DS Q6's `j.i_category = i.i_category` on the item_pkey
+	// probe) is not the loop's outer input that paramOwner names.
+	paramScope optimizer.Node
 }
 
 // assign returns the SubPlan number already given to e, or
@@ -4235,7 +4421,7 @@ func (r *subPlanReg) assignHashed(e optimizer.Expr, plan optimizer.Node, hashed 
 	case r.paramRow != nil:
 		owner = r.paramRow
 	}
-	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan, paramOwner: owner})
+	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan, paramOwner: owner, paramScope: r.current})
 	return n
 }
 
@@ -4848,7 +5034,42 @@ func formatThroughInlinedCTE(cs *optimizer.CTEScan, col *optimizer.ColumnRef, re
 	}
 	restore := reg.enter(cs.Child)
 	defer restore()
-	return formatExprQual(src, reg, qualify), true
+	// M0146-0181: the source indexes the body's own nodes, never the join
+	// row the reference sat in. Left set, a join residual's positional
+	// resolve read a narrowed aggregate's argument against that row: TPC-DS
+	// Q58's `ws_items.ws_item_rev` printed `sum(ss_items.item_id)`.
+	var out string
+	reg.withJoinRow(nil, func() { out = formatExprQual(src, reg, qualify) })
+	// A body PG keeps as a subquery (not is_simple_subquery: grouped,
+	// windowed, DISTINCT or LIMITed) is read through an OUTER_VAR once its
+	// Subquery Scan is removed, and get_variable parenthesises a non-Var
+	// target: Q58's `(sum(web_sales.ws_ext_sales_price))`.
+	if _, isCol := src.(*optimizer.ColumnRef); !isCol && cteBodyKeptAsSubquery(cs.Child) {
+		out = "(" + out + ")"
+	}
+	return out, true
+}
+
+// cteBodyKeptAsSubquery reports whether the CTE body n is one PG's
+// is_simple_subquery (prepjointree.c) refuses to pull up: its top spine,
+// through the row-preserving wrappers, reaches an aggregate, a window
+// function, a DISTINCT or a LIMIT before any scan or join.
+func cteBodyKeptAsSubquery(n optimizer.Node) bool {
+	for n != nil {
+		switch t := n.(type) {
+		case *optimizer.Aggregate, *optimizer.WindowAgg, *optimizer.Distinct, *optimizer.DistinctOn, *optimizer.Limit:
+			return true
+		case *optimizer.Project:
+			n = t.Child
+		case *optimizer.Materialize:
+			n = t.Child
+		default:
+			if n = childNodeOf(n); n == nil {
+				return false
+			}
+		}
+	}
+	return false
 }
 
 // explainHashMem is the session's hash_mem in bytes, the limit
@@ -5317,6 +5538,19 @@ func nullConstTypeLabel(t catalog.Type) string {
 		return "double precision"
 	case "date":
 		return "date"
+	// format_type(type, -1) spellings, checked against PG 18.3's
+	// `CASE ... ELSE NULL::<type> END`: blank-padded char without a typmod
+	// is the internal name bpchar (TPC-DS Q36/Q86/Q70's i_category CASE).
+	case "char", "bpchar", "character":
+		return "bpchar"
+	case "varchar", "character varying":
+		return "character varying"
+	case "float4", "real":
+		return "real"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
 	}
 	return ""
 }
@@ -5392,6 +5626,11 @@ func explicitCastText(x *optimizer.CastExpr, reg *subPlanReg, qualify bool) (str
 	}
 	if lit, isLit := coercibleLiteral(x.Operand); isLit {
 		return castLiteralConstText(lit, strings.ToLower(x.TargetType), x.Typmod, typ)
+	}
+	// M0146-0129: `NULL::boolean` is a NULL Const of the target type after
+	// parse analysis; get_const_expr prints it `NULL::boolean`, unwrapped.
+	if _, isNull := x.Operand.(*optimizer.NullConst); isNull {
+		return "NULL::" + typ, true
 	}
 	return "(" + formatExprQual(x.Operand, reg, qualify) + ")::" + typ, true
 }
@@ -7156,6 +7395,9 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 	case *optimizer.FromRegexpSplitToTable:
 		return srfFunctionScanLabel("regexp_split_to_table", "")
 	case *optimizer.PgAvailableWalSummaries:
+		if f := n.(*optimizer.PgAvailableWalSummaries).Func; f != "" {
+			return srfFunctionScanLabel(f, "")
+		}
 		return srfFunctionScanLabel("pg_available_wal_summaries", "")
 	case *optimizer.PgGetCatalogForeignKeys:
 		return srfFunctionScanLabel("pg_get_catalog_foreign_keys", "")
@@ -7163,6 +7405,8 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 		return srfFunctionScanLabel("pg_get_publication_tables", "")
 	case *optimizer.PgGetSequenceData:
 		return srfFunctionScanLabel("pg_get_sequence_data", "")
+	case *optimizer.PgWalSummaryContents:
+		return srfFunctionScanLabel("pg_wal_summary_contents", "")
 	case *optimizer.PgInputErrorInfo:
 		return srfFunctionScanLabel("pg_input_error_info", "")
 	case *optimizer.PgOptionsToTable:

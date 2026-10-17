@@ -1,0 +1,8 @@
+   customer_id    |  customername   
+------------------+-----------------
+ AAAAAAAAGKGGBAAA | Brown, Steven
+ AAAAAAAAINJAAAAA | Malcolm, Adolfo
+ AAAAAAAAJHMNAAAA | , Chrystal
+ AAAAAAAAMAHGBAAA | Mccarthy, Cliff
+(4 rows)
+

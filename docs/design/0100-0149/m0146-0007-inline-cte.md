@@ -506,3 +506,74 @@ Still open (ledgered 2026-10-04):
 - a derived item that is a join operand inside a pulled body;
 - the EC member printed in a pulled join clause;
 - the pre-existing LEFT JOIN qual placement.
+
+## Slice 10 (M0146-0145): a pulled body's `*` over a shared CTE or the worktable
+
+Status: done 2026-10-10. Parent: M0146-0007.
+
+### Problem
+
+Regress `subselect`'s recursive pair plans `with z as not materialized
+(select * from x)` inside the recursive term of `x`, where `z` is read
+once.
+
+- **PG** inlines `z` and pulls it up. The filter
+  `length((x_1.a || x_1.a)) < 5` sits on the `WorkTable Scan` itself.
+- **goopg** inlined `z` but left a `Subquery Scan on z` over the
+  `WorkTable Scan`.
+
+### Cause
+
+The pull-up gate expands a body's `*` before it tests the body
+(`expandPullupBodyStars`, derivedpullup.go; M0146-0119). For a FROM item
+that names a CTE which is not itself inlined, the expansion declined:
+"its output names are the CTE's, which this AST pass does not resolve".
+
+That covers more than it should. It catches a shared CTE, a MATERIALIZED
+one, and the worktable of an enclosing recursive CTE (`x` here). The whole
+pull-up therefore declined.
+
+### PG behaviour
+
+- **Inlining.** `SS_process_ctes` (postgres/src/backend/optimizer/plan/
+  subselect.c:880, gate at :939) inlines a single-reference or NOT
+  MATERIALIZED CTE through `inline_cte` (:1137).
+- **Pull-up.** `pull_up_simple_subquery` (prepjointree.c:1272, gate
+  `is_simple_subquery` :1807) then flattens the resulting subquery. Its
+  FROM item may be any RTE, including an RTE_CTE.
+- **Star expansion.** The body's `*` was expanded at parse analysis.
+  `expandRTE`'s RTE_CTE arm (postgres/src/backend/parser/parse_relation.c:
+  3040) lists the CTE's own column names, alias list applied.
+
+### Change
+
+- **The CTE arm.** `expandPullupBodyStars` expands a non-inlined CTE
+  reference to `plannedCTE.table`'s columns. Those are the CTE's planned
+  output names, already alias-renamed, and the same columns a `*` over a
+  CTE scan expands to elsewhere.
+- **The decline that stays.** A column-alias list on the reference
+  (`x xx(p, q)`) still declines in this pass.
+
+### Effect
+
+- **The witness.** The regress witness now prints PG's shape:
+  `WorkTable Scan on x` with `Filter: (length((a || a)) < 5)`, and no
+  Subquery Scan. That is `subselect` −2 diff lines; the rest of the A/B is
+  the known `join` row-order flap and `stats_ext` listing noise.
+- **Probes.** Run against PG 18.3 with inline VALUES / generate\_series:
+  - the recursive pair and two MATERIALIZED-CTE bodies read through an
+    inlined `z` return PG's rows;
+  - `with m as materialized (...), z as (select * from m) ... where a > 1`
+    plans `CTE Scan on m` with the filter, as PG.
+- **Gates.**
+  - The fire set fired nothing; no TPC-DS or TPC-H query has this shape.
+  - The sweep passed 99/99, the TPC-H arm matched on values, and TPC-H
+    plans were identical. Units, tpch-spotcheck and ea-ratchet (1) passed.
+
+Test: `TestExpandPullupBodyStarsOverASharedCTE` (fails on HEAD) covers a
+bare `*`, a qualified `xx.*` beside a constant, and the alias-list decline.
+
+Still open (ledgered 2026-10-10): the reference-site column-alias list in
+this pass. The 2026-10-04 residue rows otherwise stand. Item (1) of the
+0007i row, "a `SELECT *` body is not pulled up", is closed by M0146-0119
+plus this slice.

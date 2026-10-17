@@ -154,6 +154,11 @@ func (s *searchCtx) addOrderedIndexPaths(cat catalog.Catalog) {
 			if !idx.HasStorage() {
 				continue
 			}
+			// M0146-0188: PG builds one path per index, index-only when it can
+			// be; the index-only producer files that ordered path here.
+			if s.orderedFullIndexOnlyCovers(cat, rel, tbl, idx) {
+				continue
+			}
 			if s.addOneOrderedIndexPath(rel, tbl, idx, colExprs, relPages, relTuples, totalPages) {
 				added = true
 			}
@@ -213,7 +218,7 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 	// so `check_index_only`'s answer is always no). What is left is
 	// `useful_pathkeys != NIL`, which the non-empty `keys` above just
 	// established.
-	indexPages, indexTuples, treeHeight := estimateIndexGeometry(idx, tbl, relTuples)
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(s.cat, idx, tbl, relTuples)
 	in := indexScanInputs{
 		relPages:    relPages,
 		relTuples:   relTuples,
@@ -353,7 +358,8 @@ func (s *searchCtx) addPartialIndexPath(rel *RelOptInfo, tbl *catalog.Table, ser
 func mergeableColumnExprsFor(relids RelSet, clauses []*restrictInfo) map[string]Expr {
 	out := make(map[string]Expr)
 	for _, ri := range clauses {
-		if ri == nil || !ri.isEquijoin {
+		// M0146-0207: a SubPlan key is never a mergeclause.
+		if ri == nil || !ri.isEquijoin || ri.subplanKey {
 			continue
 		}
 		var key Expr

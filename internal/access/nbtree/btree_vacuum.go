@@ -196,7 +196,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		// unlink discarded it. Unlinking here shrinks that window
 		// to the handful of instructions inside unlinkEmptyLeaf
 		// itself, which now also re-verifies emptiness under
-		// splitMu before doing anything destructive.
+		// the leaf's latch before doing anything destructive.
 		if justEmptied != nil {
 			if err := bt.unlinkEmptyLeaf(*justEmptied); err != nil {
 				return totalRemoved, err
@@ -285,12 +285,14 @@ const unlinkPinAttempts = 10
 // under them, and the values computed are the values logged are the values
 // written.
 type unlinkPins struct {
-	// parent is latched FIRST and, unlike the three level-siblings, is one
-	// level UP. Order matters: the internal-split path pins a lower-level
-	// child while holding this level's latches (S11.5b-3's
-	// BTP_INCOMPLETE_SPLIT clear), i.e. goopg latches strictly top-down, so
-	// a page deletion that took the parent last could deadlock against it.
+	// parent is latched LAST and, unlike the three level-siblings, is one
+	// level UP: a split keeps its child latched while it inserts the
+	// downlink, so every latch order is lower level before upper
+	// (M0122-0010); taking the parent first could deadlock against it.
 	parent *storage.Slot
+	// parentBlk is parent's block: the page latchParentOf found holding the
+	// downlink, which is right of the caller's hint when the parent split.
+	parentBlk storage.BlockNumber
 	// left, target, right are latched in that order — strictly left→right
 	// along the sibling chain, the same direction `_bt_split` takes
 	// (blk → rightBlk → oldNext), so the two cannot deadlock either.
@@ -329,8 +331,12 @@ func (u *unlinkPins) release(bt *BTree) {
 
 // acquireUnlinkPins implements the acquisition half of upstream's
 // page-deletion protocol (`_bt_unlink_halfdead_page`, nbtpage.c): resolve the
-// nearest LIVE neighbours of `target`, latch parent → left → target → right,
-// then re-validate the links UNDER those latches. If anything moved, drop the
+// nearest LIVE neighbours of `target`, latch left → target → right, then
+// re-validate the links UNDER those latches, and only then latch the parent.
+// Same-level pages left to right, then the level above: the order a split
+// uses (child before parent, M0122-0010), so the two can never latch in
+// opposite orders. The parent is latched last, as _bt_lock_subtree_parent
+// does after the leaf. If anything moved, drop the
 // sibling latches and recompute — a split that spliced a live page next to
 // our left neighbour simply makes the next attempt pick that page as the new
 // left neighbour, which is the same self-correction the old re-derive-under-
@@ -343,13 +349,6 @@ func (bt *BTree) acquireUnlinkPins(target, parentBlk storage.BlockNumber, hasPar
 	pins := &unlinkPins{
 		leftBlk:  storage.InvalidBlockNumber,
 		rightBlk: storage.InvalidBlockNumber,
-	}
-	if hasParent {
-		s, err := bt.pinW(parentBlk)
-		if err != nil {
-			return nil, err
-		}
-		pins.parent = s
 	}
 	for attempt := 0; attempt < unlinkPinAttempts; attempt++ {
 		// Snapshot the target's own links unlatched, then walk outward
@@ -419,12 +418,112 @@ func (bt *BTree) acquireUnlinkPins(target, parentBlk storage.BlockNumber, hasPar
 			stable = readOpaque(pins.right.Page()).Prev == rightAdj
 		}
 		if stable {
+			if hasParent {
+				if err := bt.latchParentOf(pins, target, parentBlk, readOpaque(pins.target.Page()).Level+1); err != nil {
+					pins.release(bt)
+					return nil, err
+				}
+			}
 			return pins, nil
 		}
 		pins.releaseSiblings(bt)
 	}
 	pins.release(bt)
 	return nil, errUnlinkChainUnstable
+}
+
+// latchParentOf latches the page on parentLevel that holds target's downlink,
+// starting at the hint and moving right: _bt_lock_subtree_parent's
+// _bt_getstackbuf call, made while target is latched. The hint was found
+// before the siblings were latched, and a split of the parent since then may
+// have moved the downlink right; a downlink never moves left, and it cannot go
+// away while target is latched, since only target's own deletion removes it.
+// Pages are latched one at a time, left to right on one level above the held
+// siblings — the order a split uses. When the downlink is not found (the hint
+// is no longer on parentLevel, or the level ends), pins.parent stays nil and
+// the caller abandons the deletion.
+func (bt *BTree) latchParentOf(pins *unlinkPins, target, hint storage.BlockNumber, parentLevel uint32) error {
+	for blk, steps := hint, 0; blk != storage.InvalidBlockNumber; steps++ {
+		if blk == target || blk == pins.leftBlk || blk == pins.rightBlk || steps > 1<<16 {
+			// A recycled hint naming a page we already hold would latch
+			// it twice; a cycle would never end.
+			return nil
+		}
+		slot, err := bt.pinW(blk)
+		if err != nil {
+			return err
+		}
+		op := readOpaque(slot.Page())
+		if op.Level != parentLevel {
+			bt.unpinW(slot)
+			return nil
+		}
+		if op.HasIncompleteSplit() {
+			// As _bt_getstackbuf: finish the split, then re-read the
+			// page. Finishing latches only pages above the held siblings.
+			bt.unpinW(slot)
+			if err := bt.finishSplit(blk, nil); err != nil {
+				return err
+			}
+			continue
+		}
+		if !op.IsHalfDead() && !op.IsDeleted() {
+			_, _, found, ferr := PGFindDownlinkOffset(slot.Page(), target)
+			if ferr != nil {
+				bt.unpinW(slot)
+				return ferr
+			}
+			if found {
+				pins.parent, pins.parentBlk = slot, blk
+				return nil
+			}
+		}
+		next := op.Next
+		bt.unpinW(slot)
+		blk = next
+	}
+	return nil
+}
+
+// incompleteSplitBlocksDeletion reports whether target is either half of an
+// incomplete split, read off latched pages: the left half carries
+// BTIncompleteSplit itself; the right half is named by a left sibling that
+// carries it and still points at target (_bt_leftsib_splitflag). left may be
+// nil (leftmost page).
+func incompleteSplitBlocksDeletion(target, left *storage.Slot, targetBlk storage.BlockNumber) bool {
+	if readOpaque(target.Page()).Flags&BTIncompleteSplit != 0 {
+		return true
+	}
+	if left == nil {
+		return false
+	}
+	lop := readOpaque(left.Page())
+	return lop.Next == targetBlk && lop.Flags&BTIncompleteSplit != 0
+}
+
+// incompleteSplitBlocksDeletionUnlatched is incompleteSplitBlocksDeletion for
+// the FPI fallback, which latches nothing across its checks: target and its
+// btpo_prev are read one shared latch at a time, left to right.
+func (bt *BTree) incompleteSplitBlocksDeletionUnlatched(targetBlk storage.BlockNumber) (bool, error) {
+	ts, err := bt.pinR(targetBlk)
+	if err != nil {
+		return false, err
+	}
+	op := readOpaque(ts.Page())
+	bt.unpinR(ts)
+	if op.Flags&BTIncompleteSplit != 0 {
+		return true, nil
+	}
+	if op.Prev == storage.InvalidBlockNumber {
+		return false, nil
+	}
+	ls, err := bt.pinR(op.Prev)
+	if err != nil {
+		return false, err
+	}
+	lop := readOpaque(ls.Page())
+	bt.unpinR(ls)
+	return lop.Next == targetBlk && lop.Flags&BTIncompleteSplit != 0, nil
 }
 
 // unlinkEmptyLeaf updates sibling Prev/Next pointers to bypass the empty
@@ -439,27 +538,16 @@ func (bt *BTree) acquireUnlinkPins(target, parentBlk storage.BlockNumber, hasPar
 // back to the per-page FPI path when the hook is unset (test
 // harnesses without a WAL writer).
 func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
-	// M-NIGHTLY (AI-20260706-201855-001): resolveParentDownlink
-	// below captures the parent's downlink slot index for the WAL
-	// record, well before applyParentDownlinkRemoval actually
-	// mutates the page. Between the two, a concurrent Insert-driven
-	// split (Insert/finishSplit, both under splitMu) can insert a
-	// new downlink into the SAME parent page ahead of the captured
-	// slot, shifting every later index right. Splits already
-	// serialise every OTHER structural mutation through splitMu;
-	// taking it here too closes the gap for splits originating from
-	// THIS *BTree Go instance. (M0122-0010: a split from a DIFFERENT
-	// connection's instance is NOT covered by splitMu — see
-	// applyParentDownlinkRemoval's own doc comment for how that
-	// cross-connection case is closed independently, by re-locating
-	// the downlink by block identity instead of trusting the index.)
-	bt.lockStructural()
-	defer bt.unlockStructural()
+	// No tree-wide lock (M0122-0010 gap 8). A split may run between any two
+	// steps below: resolveParentDownlink's answer is only a hint, and the
+	// WAL path latches left, target, right, then re-finds the parent by
+	// downlink (latchParentOf) and reads the downlink offset off that
+	// latched page, as _bt_lock_subtree_parent does.
 
 	// M-NIGHTLY (AI-20260706-201855-001, loop 9): the caller
 	// (VacuumIndexPages) marks a leaf BTHalfDead|BTDeleted while
 	// scanning it, then unpins it and moves on — it does NOT hold
-	// splitMu or any lock spanning the marking and this unlink
+	// any lock spanning the marking and this unlink
 	// call. The fast, non-split Insert path (tryInsertNoSplit)
 	// never checks BTHalfDead/BTDeleted before writing: it only
 	// checks keyExceedsHighKey/pageHasSpaceFor, and the leaf's
@@ -541,6 +629,11 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 				return bt.abandonHalfDeadLeaf(leaf.blk)
 			}
 		}
+		if blocked, berr := bt.incompleteSplitBlocksDeletionUnlatched(leaf.blk); berr != nil {
+			return berr
+		} else if blocked {
+			return bt.abandonHalfDeadLeaf(leaf.blk)
+		}
 		return bt.unlinkEmptyLeafFPI(leaf)
 	}
 
@@ -593,6 +686,15 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	//
 	// Refusing leaves the page empty-but-live, exactly as the rightmost-child
 	// refusal does.
+	// _bt_pagedel never deletes either half of an incomplete split: the left
+	// half (flag on the target) has a right sibling with no downlink yet, and
+	// the right half (flag on a left sibling that still points at the target,
+	// _bt_leftsib_splitflag) has no downlink of its own. Both are left
+	// empty-but-live for a later pass, once the split is finished.
+	if incompleteSplitBlocksDeletion(pins.target, pins.left, leaf.blk) {
+		pins.release(bt)
+		return bt.abandonHalfDeadLeaf(leaf.blk)
+	}
 	var poffset uint16
 	if pins.parent != nil {
 		off, isRightmost, found, ferr := PGFindDownlinkOffset(pins.parent.Page(), leaf.blk)
@@ -610,6 +712,10 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		pins.release(bt)
 		return bt.abandonHalfDeadLeaf(leaf.blk)
 	}
+	// The latched parent, right of resolveParentDownlink's answer when the
+	// parent split since; that answer stays only an ancestor hint for the
+	// cascade below.
+	parentBlk = pins.parentBlk
 
 	// ---- PHASE 1: xl_btree_mark_page_halfdead (M0130-S11.5d-3b-2) ----
 	//
@@ -714,8 +820,8 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// reopen): this used to re-derive each live neighbour from the block's
 	// CURRENT on-disk link under the write pin, because a concurrent
 	// Insert-driven split on a DIFFERENT connection's *BTree instance can
-	// splice a brand-new live page into this chain (bt.splitMu serialises
-	// only within one instance), and stamping the stale walk result stomped
+	// splice a brand-new live page into this chain (the structural mutex
+	// of the time serialised only within one instance), and stamping the stale walk result stomped
 	// that split's relink — the mechanism behind block 678's persistent
 	// "left link/right link pair not in agreement" corruption. S11.5d-3b
 	// closes the same race at the front instead of the back: the split

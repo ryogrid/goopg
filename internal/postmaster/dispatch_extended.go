@@ -169,6 +169,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 			// The size lookup needs only the pool and catalog, both available on
 			// the server here — unlike ectx, which does not exist yet on this path.
 			BlocksForTable: parallelBlocksForTableFrom(s.cfg.Pool, s.cfg.Catalog),
+			BlocksForIndex: parallelBlocksForIndexFrom(s.cfg.Catalog),
 		})
 	}
 
@@ -198,12 +199,19 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 	}
 	ownTx := !inBlock
+	if ownTx {
+		// The GUC side of this Execute's own transaction (see dispatch.go):
+		// set_config(..., true) values end with it, an abort undoes its plain
+		// SETs. An Execute is never an implicit block.
+		sess.BeginImplicitTransaction(false)
+	}
 	commit := false
 	var advisoryReleaseTarget any
 	defer func() {
 		// Only a transaction this Execute began is finalised here; a block's
 		// transaction outlives the Execute and is finalised by its COMMIT /
 		// ROLLBACK (or by connection teardown).
+		sess.EndImplicitTransaction(commit)
 		if ownTx && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -244,6 +252,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	ectx.Snap = snap
 	ectx.Params = datums
 	ectx.Checkpointer = s.cfg.Checkpointer
+	if s.cfg.WalSummarizer != nil {
+		ectx.WalSummarizerState = s.walSummarizerStatus
+	}
 	// M0127-P3.3: the simple path has always set this (dispatch.go); the
 	// extended path never did, so an extended-protocol query's spill files
 	// resolved to os.TempDir() instead of <datadir>/base/pgsql_tmp — the
@@ -269,6 +280,12 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
+		ectx.PushFunctionConfig = sessionPushFunctionConfig(sess)
+		ectx.PushSessionRole = func(role string) func() {
+			sess.PushRole(role)
+			return sess.PopRole
+		}
+		ectx.CheckSetPrivilege = sess.CheckSetPrivilege
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
 			out := make([]executor.SettingValue, 0, len(all))
@@ -295,7 +312,12 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.AlterSystem = func(name, value string, set, resetAll bool) error {
+			return sess.AlterSystem(s.cfg.DataDir, name, value, set, resetAll)
+		}
+		ectx.ReloadConfig = s.reloadConfig
 		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.InTransactionBlock = sess.InTransactionBlock
 		ectx.EndLocalTransaction = func(committed bool) {
 			sess.EndTransaction(committed)
 			// Re-sync is_superuser / the executor-context mirror after
@@ -626,6 +648,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 		s.publishPendingNotify(connTx)
 	}
 	commit = true
+	sess.EndImplicitTransaction(true)
 	s.writeBackConnTxState(ectx, connTx)
 
 	res.CommandTag = commandTagFor(node, op, rowCount)

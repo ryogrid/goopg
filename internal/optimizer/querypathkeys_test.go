@@ -261,12 +261,12 @@ func TestDeriveQueryPathkeys(t *testing.T) {
 			want: []string{"a/ASC/NL", "b/ASC/NL"},
 		},
 		{
-			// Grouping sets are declined whole: goopg has no rollup list to
-			// read a "first rollup's groupClause" from, and the flattened
-			// union over-states what any one set delivers.
-			name: "grouping sets decline",
+			// M0146-0138: grouping sets take the first rollup's groupClause
+			// (standard_qp_callback) — ExtractGroupingRollups over the sets
+			// as GROUP BY slots, the same rollup the aggregate elects.
+			name: "grouping sets use the first rollup",
 			sql:  "SELECT a, b, count(*) FROM t GROUP BY ROLLUP(a, b)",
-			want: nil,
+			want: []string{"a/ASC/NL", "b/ASC/NL"},
 		},
 		{
 			// A key naming no column of the searched relations ends the list.
@@ -509,5 +509,73 @@ func TestAddOrderedIndexPathsGateIsANoOpForTodaysProducer(t *testing.T) {
 	s.addOrderedIndexPaths(cat)
 	if got := orderedPathsOf(rel); len(got) != 0 {
 		t.Fatalf("got %d ordered index paths for a non-mergeable join clause; want 0", len(got))
+	}
+}
+
+// TestDeriveQueryPathkeysGroupingSetsUseTheFirstRollup is M0146-0138:
+// standard_qp_callback takes group_pathkeys from the first rollup's
+// groupClause when the query has grouping sets, so the search is asked for the
+// order the sorted rollup sorts its input on (TPC-DS Q67's worker-sorted
+// Gather Merge under its ROLLUP). The chain is shortest set first — GROUPING
+// SETS ((b), (a, b)) sorts on b, then a — and a lone grand total asks for
+// nothing.
+func TestDeriveQueryPathkeysGroupingSetsUseTheFirstRollup(t *testing.T) {
+	ctx := qpkCtx(t)
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{"SELECT a, b, count(*) FROM t GROUP BY ROLLUP(a, b)", []string{"a/ASC/NL", "b/ASC/NL"}},
+		{"SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((b), (a, b))", []string{"b/ASC/NL", "a/ASC/NL"}},
+		{"SELECT count(*) FROM t GROUP BY GROUPING SETS (())", nil},
+	} {
+		got := deriveQueryPathkeys(qpkParse(t, tc.sql), ctx)
+		if !qpkEqual(got, tc.want) {
+			t.Errorf("%s: query pathkeys = %v, want %v", tc.sql, qpkKeys(got), tc.want)
+		}
+	}
+}
+
+// TestDeriveQueryPathkeysOrderedAggregates pins M0146-0142:
+// standard_qp_callback runs adjust_group_pathkeys_for_groupagg (planner.c)
+// whenever there are ORDER BY / DISTINCT aggregates, with or without a
+// GROUP BY, and the result becomes the query pathkeys. TPC-DS Q95's
+// count(DISTINCT ws_order_number) has no GROUP BY; PG asks the search for
+// ws_order_number order and feeds the aggregate from a sorted Gather Merge.
+func TestDeriveQueryPathkeysOrderedAggregates(t *testing.T) {
+	ctx := qpkCtx(t)
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		// No GROUP BY: the aggregate's own keys.
+		{"SELECT count(DISTINCT a) FROM t", []string{"a/ASC/NL"}},
+		// Appended behind the GROUP BY keys.
+		{"SELECT b, count(DISTINCT a) FROM t GROUP BY b", []string{"b/ASC/NL", "a/ASC/NL"}},
+		// aggorder keeps its direction; the constant delimiter is dropped.
+		{"SELECT string_agg(a::text, ',' ORDER BY c DESC) FROM t", []string{"c/DESC/NF"}},
+		// The set covering the most aggregates wins (b covers two).
+		{"SELECT count(DISTINCT a), sum(DISTINCT b), avg(DISTINCT b) FROM t", []string{"b/ASC/NL"}},
+		// A stronger compatible set absorbs a weaker one.
+		{"SELECT count(DISTINCT a), string_agg(b::text, ',' ORDER BY a, b) FROM t", []string{"a/ASC/NL", "b/ASC/NL"}},
+		// Plain aggregates add nothing.
+		{"SELECT count(a), sum(b) FROM t", nil},
+		// goopg decline: a sort key that is not a column claims no order.
+		{"SELECT count(DISTINCT a + 1) FROM t", nil},
+		// FILTER over a non-Var argument is never presorted (planner.c).
+		{"SELECT count(DISTINCT a + 1) FILTER (WHERE c > 0), count(DISTINCT b) FROM t", []string{"b/ASC/NL"}},
+	} {
+		got := deriveQueryPathkeys(qpkParse(t, tc.sql), ctx)
+		if !qpkEqual(got, tc.want) {
+			t.Errorf("%s: query pathkeys = %v, want %v", tc.sql, qpkKeys(got), tc.want)
+		}
+	}
+
+	// enable_presorted_aggregate = off: adjust_group_pathkeys_for_groupagg
+	// returns at once.
+	off := qpkCtx(t)
+	off.settings.EnablePresortedAggregate = false
+	if got := deriveQueryPathkeys(qpkParse(t, "SELECT count(DISTINCT a) FROM t"), off); len(got) != 0 {
+		t.Errorf("enable_presorted_aggregate=off: query pathkeys = %v, want none", qpkKeys(got))
 	}
 }

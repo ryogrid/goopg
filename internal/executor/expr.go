@@ -663,7 +663,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if !nameOK {
 					return NullDatum, &ExecError{Code: "42602", Pos: x.Pos(), Message: "invalid name syntax"}
 				}
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					// Thread the connection's dbOid like regIdentifierInput's
 					// regproc/regprocedure arm does — an unscoped LookupByName
 					// resolves DefaultDBOid and leaks another database's
@@ -718,7 +718,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 				if isProcedure {
 					var routines *catalog.Routines
 					if ctx != nil && ctx.Catalog != nil {
-						routines = ctx.Catalog.Routines()
+						routines = routineRegistry(ctx)
 					}
 					// format_procedure (regproc.c:326) qualifies only the NAME —
 					// quote_qualified_identifier(schema,name)(arglist) when the
@@ -754,7 +754,7 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 					return NewStringDatum(name), nil
 				}
 				if ctx != nil && ctx.Catalog != nil {
-					if r := ctx.Catalog.Routines().LookupByOID(uint32(oid)); r != nil {
+					if r := routineRegistry(ctx).LookupByOID(uint32(oid)); r != nil {
 						// Schema-qualify exactly like the regprocedure/
 						// regoperator branches below: pg_dump's own connection
 						// always runs with search_path='', so
@@ -1870,10 +1870,15 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			}
 		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
-			a, b, err := promoteToNumeric(left, right, op, pos)
-			if err != nil {
-				return Datum{}, err
+			promoteIntOperand(&left)
+			promoteIntOperand(&right)
+			if left.Kind != KindNumeric || right.Kind != KindNumeric {
+				var err error
+				if left, right, err = promoteNumericOperands(left, right, op, pos); err != nil {
+					return Datum{}, err
+				}
 			}
+			a, b := left, right
 			if op == parser.OpAdd {
 				return numericAdd(a, b)
 			}
@@ -1910,10 +1915,15 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Dat
 			return intervalDiv(left, factor, pos)
 		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
-			a, b, err := promoteToNumeric(left, right, op, pos)
-			if err != nil {
-				return Datum{}, err
+			promoteIntOperand(&left)
+			promoteIntOperand(&right)
+			if left.Kind != KindNumeric || right.Kind != KindNumeric {
+				var err error
+				if left, right, err = promoteNumericOperands(left, right, op, pos); err != nil {
+					return Datum{}, err
+				}
 			}
+			a, b := left, right
 			switch op {
 			case parser.OpMul:
 				return numericMul(a, b)
@@ -7870,19 +7880,12 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 }
 
 // sessionTimeZoneLocation resolves the session's TimeZone GUC to a
-// *time.Location with exactly the renderer's semantics (sessionLocation,
-// internal/utils/misc/timestamptz_out.go:37): "" → UTC, and any spelling Go's
-// tzdata does not know (POSIX-style fixed offsets like "+05:30") falls back to
-// UTC — so EXTRACT/date_part and FormatTimestampTZ always agree. M0134-0076.
+// *time.Location through the renderer's own resolver (misc.ZoneLocation: tz
+// database zones and POSIX specs such as the <+02>-02 a SET TIME ZONE
+// INTERVAL stores; "" → UTC) — so EXTRACT/date_part and FormatTimestampTZ
+// always agree. M0134-0076, M0122-0008.
 func sessionTimeZoneLocation(zone string) *time.Location {
-	if zone == "" {
-		return time.UTC
-	}
-	loc, err := time.LoadLocation(zone)
-	if err != nil {
-		return time.UTC
-	}
-	return loc
+	return misc.ZoneLocation(zone)
 }
 
 // julianNumber ports DTK_JULIAN (postgres/src/backend/utils/adt/timestamp.c:5651):
@@ -10617,7 +10620,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	}
 
 	// Push outer row for correlated subquery resolution.
-	outerRow := slotToRow(slot)
+	outerRow := padOuterRow(slotToRow(slot), sqOp.OuterRowPad)
 	ctx.OuterRows = append(ctx.OuterRows, outerRow)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
@@ -10944,7 +10947,7 @@ func evalExistsExpr(x *optimizer.ExistsExpr, row Row, ctx *Context) (Datum, erro
 // cache operations always run at the host depth.
 func existsWithScope(x *optimizer.ExistsExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
-		ctx.OuterRows = append(ctx.OuterRows, row)
+		ctx.OuterRows = append(ctx.OuterRows, padOuterRow(row, x.OuterRowPad))
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
@@ -10981,6 +10984,9 @@ func existsImpl(x *optimizer.ExistsExpr, ctx *Context) (Datum, error) {
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
 func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	if v, ok := ctx.InitPlanValues[x]; ok {
+		return v, nil
+	}
 	// Check for query cancellation before each scalar SubPlan evaluation.
 	if ctx.Ctx != nil {
 		if err := ctx.Ctx.Err(); err != nil {
@@ -11065,7 +11071,7 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 // operations always run at the host depth.
 func subqueryWithScope(x *optimizer.SubqueryExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
 	if !lowered {
-		ctx.OuterRows = append(ctx.OuterRows, row)
+		ctx.OuterRows = append(ctx.OuterRows, padOuterRow(row, x.OuterRowPad))
 		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
@@ -12233,6 +12239,13 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			if ctx != nil && ctx.SetSetting != nil {
 				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
+					// A typed GUC error keeps its SQLSTATE (42501 for a
+					// superuser-only parameter, M0146-0158) and, as
+					// set_config_by_name reports it, no position.
+					var verr *misc.ValidationError
+					if errors.As(err, &verr) {
+						return Datum{}, execErrorFromGUCError(0, err)
+					}
 					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
 				}
 				getSetting := ctx.GetSettingDisplay
@@ -12261,6 +12274,20 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			return NewIntDatum(0), nil
 		}
 		return NewIntDatum(int64(ctx.TriggerDepth)), nil
+	case "pg_reload_conf":
+		// pg_reload_conf() → bool (misc/signalfuncs.c): signal the postmaster
+		// to re-read the configuration files — postgresql.conf, then
+		// postgresql.auto.conf, which is how ALTER SYSTEM values take effect.
+		// EXECUTE is revoked from PUBLIC (system_functions.sql), so a
+		// non-superuser gets the function's permission error. M0122-0008.
+		if ctx != nil && ctx.NonSuperuserRole != "" {
+			return Datum{}, &ExecError{Code: "42501", Pos: x.Pos(), Message: "permission denied for function pg_reload_conf"}
+		}
+		if ctx == nil || ctx.ReloadConfig == nil {
+			return NewBoolDatum(false), nil
+		}
+		ctx.ReloadConfig()
+		return NewBoolDatum(true), nil
 	case "pg_backend_pid":
 		// pg_backend_pid() → int4: the PID of the server process attached to the
 		// current session. goopg is a single OS process multiplexing connections,
@@ -14767,7 +14794,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			if ctx == nil || ctx.Catalog == nil {
 				return NullDatum, nil
 			}
-			rs := ctx.Catalog.Routines()
+			rs := routineRegistry(ctx)
 			if rs == nil {
 				return NullDatum, nil
 			}
@@ -14832,7 +14859,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExprSlot(x.Args[0], slot, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
 						// RETURNS TABLE: PG's pg_get_function_result renders the
 						// table columns (stored here as trailing OUT args) as
@@ -16664,21 +16691,20 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 
 	case "array_cat":
-		// array_cat(anyarray, anyarray) → anyarray
+		// array_cat(anyarray, anyarray) → anyarray. Shares `||`'s
+		// evaluator: NULL only for two NULLs, a NULL or empty operand
+		// otherwise ignored, arrays one dimension apart nested
+		// (array_userfuncs.c); argument errors propagate (M0146-0125).
 		if len(x.Args) == 2 {
 			a1, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
 			a2, e2 := evalExprSlot(x.Args[1], slot, ctx)
-			if e1 != nil || e2 != nil {
-				return NullDatum, nil
+			if e2 != nil {
+				return Datum{}, e2
 			}
-			var elems []string
-			if !a1.IsNull() {
-				elems = append(elems, parseTextArray(a1.StringValue())...)
-			}
-			if !a2.IsNull() {
-				elems = append(elems, parseTextArray(a2.StringValue())...)
-			}
-			return NewStringDatum(formatTextArray(elems)), nil
+			return evalArrayConcat(a1, a2, concatArrayCat, ctx)
 		}
 
 	case "array_remove":
@@ -17604,9 +17630,15 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
 	case "coalesce":
+		// ExecEvalCoalesce: the first non-NULL argument; an argument that
+		// fails raises its error (it used to be skipped as if NULL, so
+		// coalesce(1/0, 5) answered 5). M0146-0126.
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err == nil && !v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if !v.IsNull() {
 				return v, nil
 			}
 		}
@@ -17614,9 +17646,12 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 	case "nullif":
 		if len(x.Args) == 2 {
 			a, e1 := evalExprSlot(x.Args[0], slot, ctx)
+			if e1 != nil {
+				return Datum{}, e1
+			}
 			b, e2 := evalExprSlot(x.Args[1], slot, ctx)
-			if e1 != nil || e2 != nil {
-				return NullDatum, nil
+			if e2 != nil {
+				return Datum{}, e2
 			}
 			if !a.IsNull() && !b.IsNull() && a.Format() == b.Format() {
 				return NullDatum, nil
@@ -17627,7 +17662,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		best := NullDatum
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				continue
 			}
 			if best.IsNull() {
@@ -17644,7 +17682,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		best := NullDatum
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				continue
 			}
 			if best.IsNull() {
@@ -17661,7 +17702,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		cnt := 0
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err == nil && !v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if !v.IsNull() {
 				cnt++
 			}
 		}
@@ -17670,7 +17714,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		cnt := 0
 		for _, arg := range x.Args {
 			v, err := evalExprSlot(arg, slot, ctx)
-			if err != nil || v.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
 				cnt++
 			}
 		}
@@ -17969,6 +18016,8 @@ case "pg_char_to_encoding":
 		return NewTimeDatum(misc.TimestampTZToTimestamp(ctx.Now, timeZoneFromCtx(ctx))), nil
 	case "pg_is_in_recovery":
 		return NewBoolDatum(ctx.IsStandby), nil
+	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
+		return evalPgCurrentWALLSN(name, ctx)
 	case "pg_promote":
 		// pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
 		// Returns true if this server is a standby and promotion was triggered.
@@ -18120,6 +18169,12 @@ case "pg_char_to_encoding":
 	// pg_stat_reset() → void: reset all cumulative statistics for the current
 	// database. goopg currently tracks only function stats, so this clears the
 	// shared function-stats store. Design 0118-0124.
+	// PG 18 statistics import, the calls pg_dump --statistics emits
+	// (statistics/attribute_stats.c, relation_stats.c). M0146-0215.
+	case "pg_restore_attribute_stats":
+		return evalPgRestoreAttributeStats(x, slot, ctx)
+	case "pg_restore_relation_stats":
+		return evalPgRestoreRelationStats(x, slot, ctx)
 	case "pg_stat_reset":
 		funcStats.resetAll()
 		relStats.resetAll()
@@ -20105,7 +20160,7 @@ func searchPathSchemas(ctx *Context) []string {
 		}
 		// User-created schemas: present if registered, even when empty.
 		if ctx != nil && ctx.Catalog != nil {
-			if ctx.Catalog.SchemaExists(s) {
+			if ctx.Catalog.SchemaExists(s, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 				out = append(out, s)
 			}
 		}
@@ -21146,6 +21201,46 @@ func evalRowToRowComparison(op parser.OpCode, left, right []optimizer.Expr, slot
 // evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
+// recordFieldText renders one non-NULL field of a record's text form as
+// record_out does (rowtypes.c): the field's output text, double-quoted when it
+// is empty or holds a comma, parenthesis, double quote, backslash or
+// whitespace, with each quote and backslash doubled.
+func recordFieldText(d Datum) string {
+	s := string(d.AppendValueText(nil))
+	needsQuote := s == ""
+	for _, c := range s {
+		if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+			needsQuote = true
+			break
+		}
+	}
+	if !needsQuote {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, c := range s {
+		if c == '"' || c == '\\' {
+			b.WriteRune(c)
+		}
+		b.WriteRune(c)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// recordText renders fields as a record's text form "(f1,f2,…)"; a NULL
+// field is empty.
+func recordText(fields []Datum) string {
+	parts := make([]string, len(fields))
+	for i, d := range fields {
+		if !d.IsNull() {
+			parts[i] = recordFieldText(d)
+		}
+	}
+	return "(" + strings.Join(parts, ",") + ")"
+}
+
 func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// M0146-0047: a whole-row reference whose NOT NULL column reads NULL is
 	// an outer join's null-extended row — PG's whole-row Var is NULL there.
@@ -21170,34 +21265,7 @@ func evalRowExpr(x *optimizer.RowExpr, slot SlotView, ctx *Context) (Datum, erro
 			continue
 		}
 		allNull = false
-		s := string(d.AppendValueText(nil))
-		// Quote values that need it in composite syntax: commas, parens,
-		// double-quotes, backslashes, whitespace, or empty string.
-		needsQuote := false
-		if s == "" {
-			needsQuote = true
-		} else {
-			for _, c := range s {
-				if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
-					needsQuote = true
-					break
-				}
-			}
-		}
-		if needsQuote {
-			var b strings.Builder
-			b.WriteByte('"')
-			for _, c := range s {
-				if c == '"' || c == '\\' {
-					b.WriteByte('\\')
-				}
-				b.WriteRune(c)
-			}
-			b.WriteByte('"')
-			parts[i] = b.String()
-		} else {
-			parts[i] = s
-		}
+		parts[i] = recordFieldText(d)
 	}
 	// When all elements are NULL AND the row has zero elements, return NullDatum.
 	// For non-empty rows, even if all elements are NULL, return "()" to match
@@ -21345,25 +21413,11 @@ func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""
 	}
-	// Procedures always show mode prefixes (IN/OUT/INOUT/VARIADIC).
-	// Functions only show mode prefix when at least one param is OUT or INOUT;
-	// if all params are IN/VARIADIC, omit the prefix (PG compat).
+	// The bare IN prefix is printed for procedures only (print_function_arguments,
+	// ruleutils.c PROARGMODE_IN: "IN " when prokind is PROCEDURE, else ""), so
+	// a function with OUT parameters shows `x integer, OUT y integer`
+	// (M0146-0165).
 	showMode := r.IsProcedure
-	if !showMode {
-		for _, m := range r.ArgModes {
-			// For RETURNS TABLE the OUT-mode args are table columns; they belong to
-			// the result (rendered by pg_get_function_result), not the arg list, so
-			// they must not flip showMode on. PG's print_function_arguments excludes
-			// PROARGMODE_TABLE args entirely.
-			if r.ReturnsTable && m == "o" {
-				continue
-			}
-			if m == "o" || m == "b" {
-				showMode = true
-				break
-			}
-		}
-	}
 	parts := make([]string, 0, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
 		// Skip RETURNS TABLE columns: they are stored as trailing OUT args but
@@ -21914,6 +21968,11 @@ func enterSublinkCTEWindow(ctx *Context, correlated bool) func() {
 // concatGuess, for operands whose types are unknown or array-typed, keeps the
 // shape-based array handling.
 func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datum, error) {
+	switch mode {
+	case concatArrayCat, concatArrayAppend, concatArrayPrepend:
+		// Non-strict array operators: they see NULL operands (M0146-0125).
+		return evalArrayConcat(left, right, mode, ctx)
+	}
 	// || requires at least one string-typed operand. When one side is text
 	// (or string-like), the other side is coerced to text. When both sides
 	// are non-string (e.g. integer || numeric), PostgreSQL raises
@@ -21954,8 +22013,8 @@ func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datu
 	if mode == concatJSONB {
 		return jsonbConcat(left.StringValue(), right.StringValue())
 	}
-	ls := formatDatumDateStyle(left, ctx)
-	rs := formatDatumDateStyle(right, ctx)
+	ls := concatOperandText(left, ctx)
+	rs := concatOperandText(right, ctx)
 	if mode == concatText {
 		return NewStringDatum(ls + rs), nil
 	}
@@ -21995,4 +22054,37 @@ func evalConcat(left, right Datum, pos int, ctx *Context, mode concatMode) (Datu
 		return NewStringDatum("{" + ls + "," + inner + "}"), nil
 	}
 	return NewStringDatum(ls + rs), nil
+}
+
+// concatOperandText renders one `||` operand. PostgreSQL's anytextcat /
+// textanycat are SQL functions `$1::text || $2`, so a non-text operand goes
+// through its CAST to text, not its output function. The two differ for bool:
+// booltext gives "true" / "false" where boolout gives "t" / "f"
+// (M0146-0086). concat() and format() use the output function and keep t/f.
+func concatOperandText(d Datum, ctx *Context) string {
+	if d.Kind == KindBool {
+		if d.BoolValue() {
+			return "true"
+		}
+		return "false"
+	}
+	return formatDatumDateStyle(d, ctx)
+}
+
+// padOuterRow is the host row a sublink's inner plan resolves its outer
+// references against. A sublink whose host conjunct was localized to a leaf
+// at FROM-cumulative offset pad (optimizer OuterRowPad, M0146-0130) still
+// addresses that leaf's columns at their FROM-cumulative indices, so the
+// leaf row is shifted right by pad NULL columns; the inner plan never reads
+// the padding, which stands for the scope's other relations.
+func padOuterRow(row Row, pad int) Row {
+	if pad <= 0 {
+		return row
+	}
+	out := make(Row, pad+len(row))
+	for i := 0; i < pad; i++ {
+		out[i] = NullDatum
+	}
+	copy(out[pad:], row)
+	return out
 }

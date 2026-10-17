@@ -223,7 +223,7 @@
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Lehman/Yao crab-walk is deferred"
    ],
@@ -238,7 +238,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
   },
   {
    "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
@@ -394,7 +394,7 @@
    "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
    "task_id": "m0009",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Real perf-pipelining waits on a loop redesign that defers Wait across Appends"
    ],
@@ -409,7 +409,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Commit e49ec60d message states loop redesign defers Wait across Appends"
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009; superseded by the WAL buffer design): Writer.Append only copies into walBuf, so Appends no longer wait on I/O; the walwriter drains in the background (Writer.BackgroundWrite, PG's XLogBackgroundFlush) and a backend writes only on buffer overflow (drainReasonOverflow, PG's 'WAL buffer full' write) or at commit. state.writeAt still waits on each chunk (1-4 per drain: split only at segment boundaries and the ring wrap), as PG 18's XLogWrite issues synchronous pg_pwrite calls. Earlier audit: confirmed-open: Commit e49ec60d message states loop redesign defers Wait across Appends"
   },
   {
    "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
@@ -457,7 +457,7 @@
    "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
    "task_id": "M0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "`wal_recycle` ... remain deferred"
    ],
@@ -472,7 +472,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/retention.go:21 unlinks segments, not recycling by rename"
+   "code_audit": "RESOLVED (2026-10-13 re-verification, M0122-0009): the 2026-07-02 audit is stale. Recycling landed under M0122-0009 (design docs/design/0100-0149/0122-0009-wal-segment-recycling.md): internal/access/transam/xlog/writer.go state.removeOldSegments recycles the newest obsolete segments into free future slots (recycleSegmentFile: rename + zero-fill + fsync) up to computeSpareSegments' XLOGfileslop count (min_wal_size floor, CheckPointDistanceEstimate term, max_wal_size cap); cmd/goopg/main.go wires WALMinSize and CheckPointDistanceEstimateFn. Tests retention_test.go TestRemoveOldSegmentsRecyclesUpToMinWALSize, TestComputeSpareSegments* and TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax pass at HEAD. Divergence kept on purpose: a recycled segment is zero-filled because goopg's reader bounds end-of-WAL by a zero tail, not by CRC alone."
   },
   {
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
@@ -800,7 +800,7 @@
    "feature": "Implement WALInsertLock array to support parallel WAL inserts",
    "task_id": "M0042-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "WALInsertLock array for parallel inserts deferred"
    ],
@@ -815,7 +815,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009): commit 644af04fe (M0107-0007 slice B part 2) mounted the stripe core; Writer.tryAppend takes appendMu.RLock only and appends through s.core.AppendXLogPayload on the backend's stripe (internal/access/transam/xlog/writer.go stripeNum / newStripeWriterCore), so concurrent appenders run in parallel; appendMu is exclusive only around buffer drains. Earlier audit: PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
   },
   {
    "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
@@ -1031,7 +1031,7 @@
    "feature": "Remove splitMu lock from btree operations for concurrency optimization",
    "task_id": "M0056-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1046,7 +1046,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:614 splitMu lock still present"
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open: internal/access/btree/btree.go:614 splitMu lock still present"
   },
   {
    "feature": "End-to-end validation of btree concurrent write protocol",
@@ -1094,7 +1094,7 @@
    "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
    "task_id": "M0055-0004-followup-stage2-splitmu-removal",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "lands two of three Stage 2 deliverables... DEFERRED (blocked on a storage-layer prerequisite)"
    ],
@@ -1109,7 +1109,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0056: Phase C splitMu removal in progress as of status line 1"
+   "code_audit": "RESOLVED 2026-10-15 (M0122-0010, design 0055-0002 §4.2): no structural mutex remains — splitMu, the pool-owned BTreeStructuralLock stripes and lockStructural are deleted. Writers follow PG's lock coupling: a split keeps its left page latched through the parent insert (child before parent), re-finds the parent by downlink (getStackBuf = _bt_getstackbuf), lifts a new root with both halves latched (_bt_newroot), and finishes incomplete splits on contact (finishSplit = _bt_finish_split); vacuum latches siblings before the parent and re-finds it (latchParentOf). Pinned by TestStructuralLockInteriorSplitWorkload, TestStructuralLockVacuumWithSplits, TestIncompleteSplitsFinishedConcurrently and -race runs. Earlier: confirmed-open: docs/milestones/0056: Phase C splitMu removal in progress as of status line 1"
   },
   {
    "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",
@@ -1642,7 +1642,7 @@
    "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
    "task_id": "M0076-0002",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "only the wiring into filterOp is the deferred piece"
    ],
@@ -1657,7 +1657,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed."
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed. RESOLVED 2026-10-16 (M0122-0012): re-verified at HEAD 67de73bed — d6e42a7f7 wired the batch path into filterOp (operators.go:568-667, batchEnabled/batchFilterEligible, disableFilterReadAhead under currentTID consumers, ffe1d020f); design docs/design/0100-0149/0122-0012-vector-filter-pipeline-recon.md. The scan-resident successor (SeqScanOp batch wiring) stays open as its own entry."
   },
   {
    "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
@@ -1768,7 +1768,7 @@
    "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "`MarkPageHalfDead` infrastructure stays in place for future use (no current producer outside the BtreeVacuum flag-trailer path)"
    ],
@@ -1782,6 +1782,7 @@
     "fix_plan": "no-match",
     "later_commits": "confirmed-open-code-audit: LogBtreeMarkPageHalfDead has zero non-test callers"
    },
+   "code_audit": "RESOLVED 2026-10-14 (re-verified under M0122-0009): btree vacuum's unlinkEmptyLeaf (internal/access/nbtree/btree_vacuum.go) calls the pool's LogBtreeMarkPageHalfDead hook, wired in internal/initdb/open.go to xlog.EncodeBtreeMarkPageHalfDeadPG (XLOG_BTREE_MARK_PAGE_HALFDEAD); reached from VacuumIndexPages and CompleteDeferredDeletions. Deliberate divergence: one page deleted at a time, so topparent is always InvalidBlockNumber.",
    "confidence": "high"
   },
   {
@@ -2696,7 +2697,7 @@
    "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "always returns 0 rows (no WAL summarizer running since summarize_wal=off)"
    ],
@@ -2711,7 +2712,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_pg_available_wal_summaries.go:23 - Next() returns EOF immediately"
+   "code_audit": "RESOLVED 2026-10-14 (M0122-0009 S1..S7): internal/postmaster/walsummarizer runs while summarize_wal is on and writes PG-byte-identical pg_wal/summaries files (TestSummarizeMatchesPostgres); pg_available_wal_summaries / pg_wal_summary_contents / pg_get_wal_summarizer_state read them (internal/executor/operators_pg_available_wal_summaries.go); WS-002 002_blocks.pl ported (TestPort_PgWalsummary002Blocks). Residual producer gaps are M0122-0009a/b/c and design docs/design/0100-0149/0122-0009-wal-summarizer.md section 4.4."
   },
   {
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",

@@ -1,0 +1,99 @@
+== tpcds-sf025 baseline (x2=baseline, retired=candidate, PG=candidate-pg)
+      2 ->  Bitmap Heap Scan on item  
+      2 ->  Bitmap Heap Scan on item item_1  
+      1 ->  Bitmap Heap Scan on item item_2  
+      5 ->  Bitmap Index Scan on item_pkey  
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item ics  
+      2 ->  Index Scan using item_pkey on item iss  
+      2 ->  Index Scan using item_pkey on item iws  
+      2 ->  Index Scan using store_sales_pkey on store_sales  
+      1 ->  Index Scan using store_sales_pkey on store_sales store_sales_1  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  
+== tpcds-sf025 candidate (x2=baseline, retired=candidate, PG=candidate-pg)
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item  
+      2 ->  Index Scan using item_pkey on item ics  
+      2 ->  Index Scan using item_pkey on item iss  
+      2 ->  Index Scan using item_pkey on item item_1  
+      1 ->  Index Scan using item_pkey on item item_2  
+      2 ->  Index Scan using item_pkey on item iws  
+      2 ->  Index Scan using store_sales_pkey on store_sales  
+      1 ->  Index Scan using store_sales_pkey on store_sales store_sales_1  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  
+== tpcds-sf025 candidate-pg (x2=baseline, retired=candidate, PG=candidate-pg)
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item  
+      2 ->  Index Scan using item_pkey on item ics  
+      2 ->  Index Scan using item_pkey on item iss  
+      2 ->  Index Scan using item_pkey on item item_1  
+      1 ->  Index Scan using item_pkey on item item_2  
+      2 ->  Index Scan using item_pkey on item iws  
+      2 ->  Index Scan using store_sales_pkey on store_sales  
+      1 ->  Index Scan using store_sales_pkey on store_sales store_sales_1  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  
+== tpcds-sf1 baseline (x2=baseline, retired=candidate, PG=candidate-pg)
+      2 ->  Bitmap Heap Scan on item  
+      2 ->  Bitmap Heap Scan on item item_1  
+      1 ->  Bitmap Heap Scan on item item_2  
+      2 ->  Bitmap Heap Scan on store_sales  
+      1 ->  Bitmap Heap Scan on store_sales store_sales_1  
+      5 ->  Bitmap Index Scan on item_pkey  
+      3 ->  Bitmap Index Scan on store_sales_pkey  
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item iws  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  
+== tpcds-sf1 candidate (x2=baseline, retired=candidate, PG=candidate-pg)
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item  
+      2 ->  Index Scan using item_pkey on item item_1  
+      1 ->  Index Scan using item_pkey on item item_2  
+      2 ->  Index Scan using item_pkey on item iws  
+      2 ->  Index Scan using store_sales_pkey on store_sales  
+      1 ->  Index Scan using store_sales_pkey on store_sales store_sales_1  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  
+== tpcds-sf1 candidate-pg (x2=baseline, retired=candidate, PG=candidate-pg)
+      1 ->  Index Scan using catalog_sales_pkey on catalog_sales  
+      2 ->  Index Scan using date_dim_pkey on date_dim  
+      2 ->  Index Scan using date_dim_pkey on date_dim date_dim_1  
+      1 ->  Index Scan using date_dim_pkey on date_dim date_dim_2  
+      2 ->  Index Scan using item_pkey on item  
+      2 ->  Index Scan using item_pkey on item item_1  
+      1 ->  Index Scan using item_pkey on item item_2  
+      2 ->  Index Scan using item_pkey on item iws  
+      2 ->  Index Scan using store_sales_pkey on store_sales  
+      1 ->  Index Scan using store_sales_pkey on store_sales store_sales_1  
+      1 ->  Index Scan using web_sales_pkey on web_sales  
+      1 ->  Parallel Seq Scan on store_sales store_sales_1  
+      2 ->  Parallel Seq Scan on store_sales store_sales_2  
+      1 ->  Parallel Seq Scan on store_sales store_sales_3  

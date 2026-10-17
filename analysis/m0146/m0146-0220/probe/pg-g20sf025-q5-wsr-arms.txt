@@ -1,0 +1,16 @@
+M20U add_path type=368 startup=17825.0901 total=17825.8951 rows=7.0 accept=1 sub=-1
+M20U add_path type=369 startup=17825.1138 total=17826.0268 rows=7.0 accept=1 sub=-1
+M20U add_path type=365 startup=17825.8645 total=17826.1095 rows=7.0 accept=1 sub=362
+M20U add_path type=365 startup=17825.1138 total=17826.1568 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.1138 total=17826.3243 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.8538 total=17825.9938 rows=7.0 accept=0 sub=368
+M20U add_path type=365 startup=17826.1843 total=17826.3243 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.8645 total=17826.1095 rows=7.0 accept=1 sub=362
+M20U add_path type=368 startup=17825.0901 total=17825.8951 rows=7.0 accept=1 sub=-1
+M20U add_path type=369 startup=17825.1138 total=17826.0268 rows=7.0 accept=1 sub=-1
+M20U add_path type=365 startup=17825.8645 total=17826.1095 rows=7.0 accept=1 sub=362
+M20U add_path type=365 startup=17825.1138 total=17826.1568 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.1138 total=17826.3243 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.8538 total=17825.9938 rows=7.0 accept=0 sub=368
+M20U add_path type=365 startup=17826.1843 total=17826.3243 rows=7.0 accept=0 sub=369
+M20U add_path type=365 startup=17825.8645 total=17826.1095 rows=7.0 accept=1 sub=362

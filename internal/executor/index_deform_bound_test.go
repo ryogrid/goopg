@@ -56,8 +56,8 @@ func idxDeformScan8(cond optimizer.Expr) *optimizer.IndexScan {
 }
 
 // TestIndexDeformBoundThreading pins the IndexScan arm: bound = union of the
-// parent walk and the leaf-local Cond refs, widened with the index key
-// columns (belt-and-braces, never load-bearing).
+// parent walk and the leaf-local Cond refs; the index key columns widen it
+// only when no consumer bound is recorded.
 func TestIndexDeformBoundThreading(t *testing.T) {
 	filter := func(pred optimizer.Expr, child optimizer.Node) *optimizer.Filter {
 		return &optimizer.Filter{Child: child, Predicate: pred}
@@ -78,13 +78,14 @@ func TestIndexDeformBoundThreading(t *testing.T) {
 		}
 	})
 
-	t.Run("key-cols-widen", func(t *testing.T) {
-		// Cond reads c1 but the index sits on c6: unioning the key column
-		// widens to 7/8 instead of narrowing to 2/8.
+	t.Run("key-cols-not-widened-past-consumers", func(t *testing.T) {
+		// M0146-0171: Cond reads c1 and the index sits on c6. PG deforms only
+		// what a consumer reads (slot_getsomeattrs), never the key columns,
+		// so the bound stays 2/8 instead of widening to 7/8.
 		p := idxDeformScan8(deformLt(deformCol(1), deformInt(1)))
 		p.Index.Columns = []string{"c6"}
-		if b := idxDeformIndexScan(t, p); b != 7 {
-			t.Fatalf("bound=%d, want 7", b)
+		if b := idxDeformIndexScan(t, p); b != 2 {
+			t.Fatalf("bound=%d, want 2", b)
 		}
 	})
 
@@ -871,11 +872,6 @@ func TestBitmapDeformLossyRecheckPoison(t *testing.T) {
 func TestIndexOnlyDeformColdAndVisible(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
-	// PG prices the index and bitmap paths here within 0.01 of each other;
-	// goopg's calibrated 2x probe multiplier would decide them, so the test
-	// plans with PG's constants (multiplier 1). Owner decision 2026-09-24,
-	// M0145-0008 option (c).
-	defer optimizer.SetIndexProbeCostMultiplier("1")()
 	// The live block-count reader the server installs (initdb.Open): PG
 	// sizes these never-ANALYZEd tables from RelationGetNumberOfBlocks
 	// (estimate_rel_size's 10-page floor), and without the reader the

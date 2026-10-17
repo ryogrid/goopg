@@ -1,6 +1,9 @@
 package parser
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // TestParseAlterFunctionOwner pins the `ALTER FUNCTION/PROCEDURE/ROUTINE
 // name(args) OWNER TO ...` parse shape (M0097-0150). Previously OWNER TO was
@@ -172,7 +175,8 @@ func TestParseAlterFunctionGenericSetReset(t *testing.T) {
 				t.Fatalf("ConfigOps = %#v, want %#v", af.ConfigOps, tc.wantOps)
 			}
 			for i, op := range af.ConfigOps {
-				if op != tc.wantOps[i] {
+				op.Args = nil // the typed list is pinned by set_args_test.go
+				if !reflect.DeepEqual(op, tc.wantOps[i]) {
 					t.Errorf("ConfigOps[%d] = %#v, want %#v", i, op, tc.wantOps[i])
 				}
 			}
@@ -246,7 +250,8 @@ func TestParseCreateFunctionSetClause(t *testing.T) {
 				t.Fatalf("ConfigOps = %#v, want %#v", cf.ConfigOps, tc.wantOps)
 			}
 			for i, op := range cf.ConfigOps {
-				if op != tc.wantOps[i] {
+				op.Args = nil // the typed list is pinned by set_args_test.go
+				if !reflect.DeepEqual(op, tc.wantOps[i]) {
 					t.Errorf("ConfigOps[%d] = %#v, want %#v", i, op, tc.wantOps[i])
 				}
 			}

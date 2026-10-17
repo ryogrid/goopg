@@ -1,0 +1,148 @@
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 2 4) type=358 startup=24548.9107 total=25181.5437 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=356 startup=2964.1100 total=28157.3941 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 2 4) type=356 startup=1964.1000 total=25481.2813 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=359 startup=3719.8889 total=27286.5260 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 2 4) type=359 startup=2719.8889 total=25088.8910 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=359 startup=26646.9251 total=27542.8840 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=27296.2520 total=27472.7820 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 3 4) type=358 startup=24549.6353 total=24606.6003 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.9550 total=26771.0784 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.8125 total=27265.4876 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=25548.7098 total=27212.2081 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=25548.5673 total=27706.6173 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=25549.6753 total=27088.9003 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=25548.6998 total=27099.9873 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.9450 total=24885.9418 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=341 innertotal=0.1500
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.9550 total=24411.0432 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=361 innertotal=0.1600
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.8125 total=24570.6626 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=360 innertotal=1.0750
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=359 startup=2964.9250 total=26557.7281 rows=11767.0 accept=1
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27P rel=(b 1 3 4) type=359 startup=1964.9250 total=24342.3709 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=27296.2520 total=27472.7820 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.8125 total=27412.5426 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.9450 total=27423.7001 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=27295.2764 total=27483.8689 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=358 startup=25548.6998 total=27129.4048 rows=11767.0 accept=0
+2026-10-17 08:01:14.221 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=359 startup=26646.6376 total=26780.2513 rows=11767.0 accept=0
+2026-10-17 08:01:14.225 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=368 startup=25548.9107 total=27358.2437 rows=11767.0 accept=0
+2026-10-17 08:01:14.225 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=369 startup=25548.9507 total=27564.2062 rows=11767.0 accept=1
+2026-10-17 08:01:14.225 JST [3401935] LOG:  M27S rel=(b 1 2 4) type=369 startup=26407.2609 total=27799.3734 rows=11767.0 accept=1
+2026-10-17 08:01:14.227 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=368 startup=2964.9250 total=26519.0709 rows=11767.0 accept=1
+2026-10-17 08:01:14.227 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=369 startup=25549.6753 total=26989.2628 rows=11767.0 accept=0
+2026-10-17 08:01:14.227 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=369 startup=25568.0882 total=26960.2007 rows=11767.0 accept=1
+2026-10-17 08:01:14.227 JST [3401935] LOG:  M27S rel=(b 1 3 4) type=369 startup=25597.3897 total=27218.4199 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28083.2279 total=28259.7579 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=358 startup=25408.3290 total=25465.2940 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3720.0314 total=27558.0543 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3719.8889 total=28052.4635 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=25549.0932 total=27835.7345 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=25548.9507 total=28330.1437 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=26407.4034 total=28070.9017 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26408.3690 total=27947.5940 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26407.3934 total=27958.6809 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.0432 total=25744.6355 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=341 innertotal=0.1500
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.0532 total=25269.7369 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=361 innertotal=0.1600
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24548.9107 total=25429.3562 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=360 innertotal=1.0750
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=3721.0014 total=27344.7040 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=359 startup=24550.0232 total=25201.0646 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28083.2279 total=28259.7579 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3719.8889 total=28199.5185 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3720.0214 total=28210.6760 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28082.2524 total=28270.8449 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26407.3934 total=27988.0984 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=27433.6135 total=27567.2273 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=358 startup=24568.4316 total=25201.0646 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=1965.2125 total=25500.8021 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.9228 total=25765.0315 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=3721.0014 total=27306.0469 rows=11767.0 accept=1
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27P rel=(b 1 2 3 4) type=359 startup=2721.0014 total=25108.4119 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:01:14.229 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=26666.4459 total=27562.4049 rows=11767.0 accept=0
+2026-10-17 08:01:14.232 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=368 startup=25568.4316 total=27377.7646 rows=11767.0 accept=0
+2026-10-17 08:01:14.232 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=25568.4716 total=27583.7271 rows=11767.0 accept=1
+2026-10-17 08:01:14.232 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26408.3690 total=27847.9565 rows=11767.0 accept=0
+2026-10-17 08:01:14.232 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26426.7818 total=27818.8943 rows=11767.0 accept=1
+2026-10-17 08:01:14.232 JST [3401935] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26456.0834 total=28077.1135 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 2 4) type=358 startup=24548.9107 total=25181.5437 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=356 startup=2964.1100 total=28157.3941 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 2 4) type=356 startup=1964.1000 total=25481.2813 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=359 startup=3719.8889 total=27286.5260 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 2 4) type=359 startup=2719.8889 total=25088.8910 rows=3796.0 outer=(b 1 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=358 startup=27295.5274 total=28047.7204 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=359 startup=26646.9251 total=27542.8840 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=27296.2520 total=27472.7820 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 3 4) type=358 startup=24549.6353 total=24606.6003 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.9550 total=26771.0784 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.8125 total=27265.4876 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=25548.7098 total=27212.2081 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=25548.5673 total=27706.6173 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=25549.6753 total=27088.9003 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=25548.6998 total=27099.9873 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.9450 total=24885.9418 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=341 innertotal=0.1500
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.9550 total=24411.0432 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=361 innertotal=0.1600
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 3 4) type=356 startup=1963.8125 total=24570.6626 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=360 innertotal=1.0750
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=359 startup=2964.9250 total=26557.7281 rows=11767.0 accept=1
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27P rel=(b 1 3 4) type=359 startup=1964.9250 total=24342.3709 rows=3796.0 outer=(b 1 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=27296.2520 total=27472.7820 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.8125 total=27412.5426 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=356 startup=2963.9450 total=27423.7001 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=27295.2764 total=27483.8689 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=358 startup=25548.6998 total=27129.4048 rows=11767.0 accept=0
+2026-10-17 08:02:20.497 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=359 startup=26646.6376 total=26780.2513 rows=11767.0 accept=0
+2026-10-17 08:02:20.500 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=368 startup=25548.9107 total=27358.2437 rows=11767.0 accept=0
+2026-10-17 08:02:20.500 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=369 startup=25548.9507 total=27564.2062 rows=11767.0 accept=1
+2026-10-17 08:02:20.500 JST [3403626] LOG:  M27S rel=(b 1 2 4) type=369 startup=26407.2609 total=27799.3734 rows=11767.0 accept=1
+2026-10-17 08:02:20.502 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=368 startup=2964.9250 total=26519.0709 rows=11767.0 accept=1
+2026-10-17 08:02:20.502 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=369 startup=25549.6753 total=26989.2628 rows=11767.0 accept=0
+2026-10-17 08:02:20.502 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=369 startup=25568.0882 total=26960.2007 rows=11767.0 accept=1
+2026-10-17 08:02:20.502 JST [3403626] LOG:  M27S rel=(b 1 3 4) type=369 startup=25597.3897 total=27218.4199 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28083.2279 total=28259.7579 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=358 startup=25408.3290 total=25465.2940 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=358 total=25465.2940 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3720.0314 total=27558.0543 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3719.8889 total=28052.4635 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=25549.0932 total=27835.7345 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=25548.9507 total=28330.1437 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=26407.4034 total=28070.9017 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26408.3690 total=27947.5940 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26407.3934 total=27958.6809 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.0432 total=25744.6355 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=341 innertotal=0.1500
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=356 total=25744.6355 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.0532 total=25269.7369 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=361 innertotal=0.1600
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=356 total=25269.7369 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24548.9107 total=25429.3562 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=360 innertotal=1.0750
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=356 total=25429.3562 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=3721.0014 total=27344.7040 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=359 startup=24550.0232 total=25201.0646 rows=3796.0 outer=(b 1 2 4) inner=(b 3) innertype=339 innertotal=1.0500
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=359 total=25201.0646 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28083.2279 total=28259.7579 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3719.8889 total=28199.5185 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=356 startup=3720.0214 total=28210.6760 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=28082.2524 total=28270.8449 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=26407.3934 total=27988.0984 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=27433.6135 total=27567.2273 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=358 startup=24568.4316 total=25201.0646 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=358 total=25201.0646 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=1965.2125 total=25500.8021 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=356 total=25500.8021 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=356 startup=24549.9228 total=25765.0315 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=0.3052
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=356 total=25765.0315 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=3721.0014 total=27306.0469 rows=11767.0 accept=1
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27P rel=(b 1 2 3 4) type=359 startup=2721.0014 total=25108.4119 rows=3796.0 outer=(b 1 3 4) inner=(b 2) innertype=342 innertotal=531.0764
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27A partial verdict type=359 total=25108.4119 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=358 startup=27315.0483 total=28067.2413 rows=11767.0 accept=0
+2026-10-17 08:02:20.504 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=359 startup=26666.4459 total=27562.4049 rows=11767.0 accept=0
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27G gather cheapest type=331 total=25201.0646 npartial=2
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=368 startup=25568.4316 total=27377.7646 rows=11767.0 accept=0
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=25568.4716 total=27583.7271 rows=11767.0 accept=1
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26408.3690 total=27847.9565 rows=11767.0 accept=0
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26426.7818 total=27818.8943 rows=11767.0 accept=1
+2026-10-17 08:02:20.507 JST [3403626] LOG:  M27S rel=(b 1 2 3 4) type=369 startup=26456.0834 total=28077.1135 rows=11767.0 accept=0

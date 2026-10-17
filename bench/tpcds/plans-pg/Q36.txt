@@ -1,1 +1,28 @@
-SKIP (oracle: SKIP_QUERYGEN) — dsqgen artefact, fails on PG too; matches the SF=1 sweep (scripts/tpcds-sf025-regression.sh:128).
+Limit  (cost=19740.05..19740.30 rows=100 width=178)
+  ->  Sort  (cost=19740.05..19742.55 rows=1001 width=178)
+        Sort Key: sub.lochierarchy DESC, (CASE WHEN (sub.lochierarchy = 0) THEN sub.i_category ELSE NULL::bpchar END), sub.rank_within_parent
+        ->  Subquery Scan on sub  (cost=19651.74..19701.79 rows=1001 width=178)
+              ->  WindowAgg  (cost=19651.74..19689.28 rows=1001 width=178)
+                    Window: w1 AS (PARTITION BY ((GROUPING(item.i_category) + GROUPING(item.i_class))), (CASE WHEN (GROUPING(item.i_class) = 0) THEN item.i_category ELSE NULL::bpchar END) ORDER BY ((sum(store_sales.ss_net_profit) / sum(store_sales.ss_ext_sales_price))) ROWS UNBOUNDED PRECEDING)
+                    ->  Sort  (cost=19651.74..19654.24 rows=1001 width=170)
+                          Sort Key: ((GROUPING(item.i_category) + GROUPING(item.i_class))), (CASE WHEN (GROUPING(item.i_class) = 0) THEN item.i_category ELSE NULL::bpchar END), ((sum(store_sales.ss_net_profit) / sum(store_sales.ss_ext_sales_price)))
+                          ->  MixedAggregate  (cost=2965.49..19601.85 rows=1001 width=170)
+                                Hash Key: item.i_category, item.i_class
+                                Hash Key: item.i_category
+                                Group Key: ()
+                                ->  Gather  (cost=2965.49..19497.78 rows=3291 width=114)
+                                      Workers Planned: 3
+                                      ->  Nested Loop  (cost=1965.49..18168.68 rows=1062 width=114)
+                                            ->  Hash Join  (cost=1965.20..17836.88 rows=1062 width=16)
+                                                  Hash Cond: (store_sales.ss_store_sk = store.s_store_sk)
+                                                  ->  Parallel Hash Join  (cost=1963.81..17831.60 rows=1110 width=20)
+                                                        Hash Cond: (store_sales.ss_sold_date_sk = d1.d_date_sk)
+                                                        ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=232218 width=24)
+                                                        ->  Parallel Hash  (cost=1961.12..1961.12 rows=215 width=4)
+                                                              ->  Parallel Seq Scan on date_dim d1  (cost=0.00..1961.12 rows=215 width=4)
+                                                                    Filter: (d_year = 2000)
+                                                  ->  Hash  (cost=1.24..1.24 rows=12 width=4)
+                                                        ->  Seq Scan on store  (cost=0.00..1.24 rows=12 width=4)
+                                                              Filter: (s_state = ANY ('{TN,TN,TN,TN,TN,TN,TN,TN}'::bpchar[]))
+                                            ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=106)
+                                                  Index Cond: (i_item_sk = store_sales.ss_item_sk)

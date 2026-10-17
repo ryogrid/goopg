@@ -70,8 +70,10 @@ package optimizer
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // joinlistProblem is everything one statement's joinlist recursion reads. It is
@@ -98,6 +100,12 @@ type joinlistProblem struct {
 	// clause's own join selectivity is divided (M0146-0005 slice 4).
 	orClauseSelDivisor map[Expr]float64
 
+	// semiRHSOperand maps each equality the seam derived through a SEMI
+	// join's qual (M0146-0127, semiRHSImpliedEqualities) to its RHS-side
+	// operand; the clause applies only where that operand's relation is a
+	// whole join input.
+	semiRHSOperand map[Expr]Expr
+
 	// leafSpans[i] is FROM item i's [lo,hi) binding-coordinate window —
 	// the coordinate space `relidsOfExpr` and `baseOffset` are both
 	// written in. One entry per FROM item: the leaf's own span, not an
@@ -109,6 +117,12 @@ type joinlistProblem struct {
 	cp  costParams
 	cat catalog.Catalog
 
+	// otherMemberRel: this statement's FROM is one relation that PG pulls up
+	// as a UNION ALL appendrel member (resolveContext.appendrelOtherMember);
+	// its search prices partial paths without the BASEREL size cutoffs
+	// (M0146-0132).
+	otherMemberRel bool
+
 	// joinInfoList is root->join_info_list: every SpecialJoinInfo for the
 	// statement, in bottom-up order. Carried by the top-level problem so
 	// `buildInitialRels` can store it on the search context. nil for
@@ -118,6 +132,10 @@ type joinlistProblem struct {
 	// tupleFraction is the query's `root->tuple_fraction`, applied to the
 	// TOP-level problem only (see makeRelFromJoinlist).
 	tupleFraction float64
+
+	// rootCheapestTotal: the top-level search root hands up CheapestTotal
+	// rather than the fractional pick (resolveContext.rootCheapestTotal).
+	rootCheapestTotal bool
 
 	// neededCols / neededColsKnown carry the statement's needed-column set to
 	// `searchCtx` (pathindexonlyneed.go) and to the boundary hole-filler.
@@ -138,6 +156,10 @@ type joinlistProblem struct {
 	// so every sub-problem of one statement shares it — the same rule
 	// neededCols follows.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys carry `root->group_pathkeys` and
+	// `distinct_pathkeys` the same way (M0146-0223).
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// spineAbove reports that a pinned outer spine sits above this
 	// problem's tree: the spine's ON quals read the searched subtree's
@@ -310,13 +332,15 @@ func (jl joinlist) leafRange() (lo, hi int, ok bool) {
 // every item to a rel — recursing on sub-joinlists — and then, unless there is
 // only one, search the orders in which they can be joined.
 //
-// `tupleFraction` is the query's fraction at the top level and 0 in every
-// recursive call, and the asymmetry is forced by the collapse this boundary
-// performs (file header): upstream can afford `consider_startup` on a
-// sub-problem's rel because the enclosing search still gets to choose among its
-// paths, while goopg must commit to one here. Committing to a startup-optimised
-// path for a sub-problem whose rows the enclosing join then consumes in full is
-// the expensive direction of that bet, so sub-problems are priced for all rows.
+// `tupleFraction` is the query's `root->tuple_fraction`, the same at every
+// level: PG sets `rel->consider_startup = (root->tuple_fraction > 0)` on every
+// rel it builds (relnode.c), sub-joinlists' included. goopg once passed 0 into
+// recursive calls, because the boundary committed the enclosing search to one
+// sub-problem path. Since M0146-0148 the enclosing search sees the
+// sub-problem's whole pathlist (baseRelInfo.subproblemAlts), so that premise is
+// gone. Pricing sub-problems without startup made add_path keep a
+// cheaper-total, later-starting path that PG rejects as COSTS_DIFFERENT
+// (TPC-DS Q72's warehouse probe, M0146-0222).
 func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float64) (joinlistRel, error) {
 	if len(jl) == 0 {
 		return joinlistRel{}, fmt.Errorf("join search: empty joinlist")
@@ -370,7 +394,7 @@ func makeRelFromJoinlist(jl joinlist, prob *joinlistProblem, tupleFraction float
 					"join search: joinlist item %d is a pinned %s join with no SpecialJoinInfo in root->join_info_list; searched, it would be planned as an inner join",
 					i, joinTypeName(it.jointype))
 			}
-			r, err = makeRelFromJoinlist(it.sub, prob, 0)
+			r, err = makeRelFromJoinlist(it.sub, prob, tupleFraction)
 		}
 		if err != nil {
 			return joinlistRel{}, err
@@ -599,10 +623,26 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
-	s, err := buildInitialRels(bindings, scans, infos, prob.cp, tupleFraction, sjis)
+	cp := prob.cp
+	if prob.otherMemberRel && len(prob.relInfos) == 1 && len(items) == 1 {
+		cp.otherMemberRel = true
+	}
+	s, err := buildInitialRels(bindings, scans, infos, cp, tupleFraction, sjis)
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	// M0146-0222: the base relations' rows, for the enclosing problem's
+	// get_loop_count (baseRelInfo.subproblemBaseRows).
+	baseRows := map[int16]float64{}
+	for i, info := range infos {
+		if rel := s.findRel(RelSet(1) << uint(i)); rel != nil && info.sourceIdx >= 0 && info.table != nil {
+			baseRows[info.sourceIdx] = rel.Rows
+		}
+		for k, v := range info.subproblemBaseRows {
+			baseRows[k] = v
+		}
+	}
+	s.rootCheapestTotal = prob.rootCheapestTotal
 	// C-08: publish the item run beside the clause list — the
 	// param_source_rels derivation remaps statement-global SJI hands
 	// through it (see paramSourceRelsForProblem's frame rule).
@@ -613,14 +653,33 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// `addParameterizedIndexPaths` reads `s.clauses`, and `joinSearch` sets it
 	// — so the list is published here, before the producers that consume it,
 	// and handed to `joinSearch` as well rather than left implicit.
-	s.clauses = buildRestrictInfos(prob.conjuncts, 0, itemSpans)
+	// M0146-0200: an ANTI join's qual is never a class member (it is
+	// outerjoin-delayed in PG's distribute_qual_to_rels), so its RHS's
+	// clauses stay out of the equivalence classes.
+	s.clauses = buildRestrictInfosExcluding(prob.conjuncts, 0, itemSpans, antiRighthands(sjis))
 	// M0146-0022: one clause per equivalence class at an inner join, only
-	// where no special join can null-extend a class member.
-	s.clauses.ecReduce = len(sjis) == 0
+	// where no special join can null-extend a class member. M0146-0128: a
+	// SEMI join null-extends nothing (PG's distribute_qual_to_rels makes its
+	// qual an ordinary class member), so a problem whose special joins are
+	// all SEMI reduces too. M0146-0200: nor does an ANTI join — its RHS is
+	// never visible above it and, with its qual kept out of the classes, is
+	// never a class member.
+	s.clauses.ecReduce = onlySemiOrAntiJoins(sjis)
 	s.orClauseSelDivisor = prob.orClauseSelDivisor
+	// M0146-0127: a clause derived through a semijoin's qual reads the RHS's
+	// columns, which exist only where the RHS is a whole join input.
+	for _, ri := range s.clauses.all {
+		if rhs, derived := prob.semiRHSOperand[ri.clause]; derived {
+			if r, ok := relidsOfExpr(rhs, itemSpans); ok && r != 0 {
+				ri.onlyBesideRel = r
+				s.semiDerivedRHS |= r
+			}
+		}
+	}
 	// C-07: `root->query_pathkeys`, published beside the clause list because
 	// `hasUsefulPathkeys` reads both.
 	s.queryPathkeys = prob.queryPathkeys
+	s.groupPathkeys, s.distinctPathkeys = prob.groupPathkeys, prob.distinctPathkeys
 	// M0146-0005b: set_cte_pathlist's converted pathkeys on the CTE-scan
 	// leaves, now that the clause list and query pathkeys it reads exist.
 	s.addCTEScanPathkeys()
@@ -710,6 +769,63 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	fill := func(coord int) (SchemaColumn, bool) {
+		for i := range items {
+			sp := itemSpans[i]
+			if coord < sp.lo || coord >= sp.hi {
+				continue
+			}
+			leafSchema := scans[i].Output()
+			pos := coord - sp.lo
+			if pos < 0 || pos >= len(leafSchema) {
+				return SchemaColumn{}, false
+			}
+			col := leafSchema[pos]
+			if col.Name == "" {
+				return SchemaColumn{}, false
+			}
+			// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
+			// projects its RHS columns above itself, so nothing outside
+			// the search can ever reference a semiAnti synthetic leaf's
+			// own coordinate range — it is always fillable, independent
+			// of the statement's needed/output-column sets (which may
+			// even be unknown here). Checked before neededColsKnown
+			// because that gate exists for the OTHER leaf kinds, where
+			// "unknown" must fail closed.
+			if infos[i].isSemiAntiSyntheticLeaf {
+				return col, true
+			}
+			if !prob.neededColsKnown {
+				return SchemaColumn{}, false
+			}
+			// M0146-0005bq-b: attributed to this leaf's alias, the same
+			// rule the index-only producer used to prune it — another
+			// alias of the same table reading the name by qualified
+			// reference does not read THIS leaf's column.
+			qual := ""
+			if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
+				qual = id.alias
+				if qual == "" && id.table != nil {
+					qual = id.table.Name
+				}
+			}
+			if prob.outputColsKnown && prob.outputCols != nil {
+				if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
+					return SchemaColumn{}, false
+				}
+				return col, true
+			}
+			if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
+				return SchemaColumn{}, false
+			}
+			return col, true
+		}
+		return SchemaColumn{}, false
+	}
+	node := createPlanAtSearchRootRange(p, base, width, fill)
+	// M0146-0148: the sub-problem's ordered runner-up paths, rebuilt on
+	// demand by the enclosing problem (baseRelInfo.subproblemAlts).
+	alts := func() []Node { return subproblemAltTrees(p, node, base, width, fill) }
 	return joinlistRel{
 		// The hole-filler licenses a PADDED boundary slot for exactly the
 		// coordinates a narrowed leaf legitimately dropped. Take2 P4-01
@@ -721,59 +837,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// falls the search back when the above-root residual references a
 		// padded coordinate — the totality assertion stays loud for real
 		// producer bugs (M0134-0187, DESIGN §21).
-		node: createPlanAtSearchRootRange(p, base, width, func(coord int) (SchemaColumn, bool) {
-			for i := range items {
-				sp := itemSpans[i]
-				if coord < sp.lo || coord >= sp.hi {
-					continue
-				}
-				leafSchema := scans[i].Output()
-				pos := coord - sp.lo
-				if pos < 0 || pos >= len(leafSchema) {
-					return SchemaColumn{}, false
-				}
-				col := leafSchema[pos]
-				if col.Name == "" {
-					return SchemaColumn{}, false
-				}
-				// c11 (design doc §46.4 item 1): a SEMI/ANTI join never
-				// projects its RHS columns above itself, so nothing outside
-				// the search can ever reference a semiAnti synthetic leaf's
-				// own coordinate range — it is always fillable, independent
-				// of the statement's needed/output-column sets (which may
-				// even be unknown here). Checked before neededColsKnown
-				// because that gate exists for the OTHER leaf kinds, where
-				// "unknown" must fail closed.
-				if infos[i].isSemiAntiSyntheticLeaf {
-					return col, true
-				}
-				if !prob.neededColsKnown {
-					return SchemaColumn{}, false
-				}
-				// M0146-0005bq-b: attributed to this leaf's alias, the same
-				// rule the index-only producer used to prune it — another
-				// alias of the same table reading the name by qualified
-				// reference does not read THIS leaf's column.
-				qual := ""
-				if id, _, ok := scanLeafFor(scans[i]); ok && id != nil {
-					qual = id.alias
-					if qual == "" && id.table != nil {
-						qual = id.table.Name
-					}
-				}
-				if prob.outputColsKnown && prob.outputCols != nil {
-					if neededColumnNamedFor(prob.outputCols, qual, col.Name) {
-						return SchemaColumn{}, false
-					}
-					return col, true
-				}
-				if neededColumnNamedFor(prob.neededCols, qual, col.Name) {
-					return SchemaColumn{}, false
-				}
-				return col, true
-			}
-			return SchemaColumn{}, false
-		}),
+		node: node,
 		// The searched tree enters the enclosing problem as a leaf at the first
 		// coordinate it publishes. Nothing else of the sub-problem crosses:
 		// `info` is deliberately table-less so that every producer that assumes
@@ -781,11 +845,101 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// the built node by `initialRelRows` — the pathlist-and-rows collapse
 		// this boundary performs (file header; ledgered).
 		binding: rangeBinding{offset: base},
-		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1},
+		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows},
 		lo:      lo,
 		hi:      hi,
 		// R21 slice 1: the chosen path's parent rel — the search's own
 		// RelOptInfo, which used to end here.
 		rel: p.Rel,
 	}, nil
+}
+
+// onlySemiJoins reports whether every special join is a SEMI join — none can
+// null-extend an equivalence-class member (M0146-0128).
+// onlySemiOrAntiJoins reports whether every special join is SEMI or ANTI —
+// none of them null-extends a relation visible above it (M0146-0200).
+func onlySemiOrAntiJoins(sjis []*SpecialJoinInfo) bool {
+	for _, sj := range sjis {
+		if sj == nil || (sj.Jointype != parser.JoinSemi && sj.Jointype != parser.JoinAnti) {
+			return false
+		}
+	}
+	return true
+}
+
+// antiRighthands is the union of the ANTI joins' syntactic right-hand sides.
+func antiRighthands(sjis []*SpecialJoinInfo) RelSet {
+	var r RelSet
+	for _, sj := range sjis {
+		if sj != nil && sj.Jointype == parser.JoinAnti {
+			r |= sj.SynRighthand
+		}
+	}
+	return r
+}
+
+func onlySemiJoins(sjis []*SpecialJoinInfo) bool {
+	for _, sj := range sjis {
+		if sj == nil || sj.Jointype != parser.JoinSemi {
+			return false
+		}
+	}
+	return true
+}
+
+// maxSubproblemAlts bounds how many ordered runner-up trees a sub-problem
+// hands up. PG keeps every path add_path kept; each rebuild here is a full
+// tree lowering, so the count is capped.
+const maxSubproblemAlts = 4
+
+// subproblemAltTrees rebuilds the ordered runner-up paths of a searched
+// sub-problem's rel as boundary trees, for the enclosing problem to offer
+// beside the winner (M0146-0148). make_rel_from_joinlist (allpaths.c) returns
+// the sub-problem's RelOptInfo, so the enclosing join search sees every path
+// it kept — TPC-DS Q72 SF1 builds its d3 and promotion nested loops on the
+// 8-rel sub-problem's sorted Gather Merge, which feeds the GroupAggregate with
+// no Sort, while goopg handed up only the cheaper Gather.
+//
+// Only unparameterised paths with pathkeys are rebuilt (an unordered runner-up
+// is dominated by the winner). Each is built with the winner's base, width and
+// hole-filler and kept only when it publishes the winner's exact row, so the
+// enclosing problem's coordinates hold for it; a rebuild that declines (a
+// boundary panic) is dropped, as searchedBoundaryRebuild drops one.
+func subproblemAltTrees(p *Path, winner Node, base, width int, fill func(int) (SchemaColumn, bool)) []Node {
+	if p == nil || p.Rel == nil || winner == nil {
+		return nil
+	}
+	var out []Node
+	for _, q := range p.Rel.Pathlist {
+		if q == nil || q == p || q.RequiredOuter != 0 || len(q.Pathkeys) == 0 {
+			continue
+		}
+		n := buildSubproblemAltTree(q, base, width, fill)
+		if n == nil || !outputSchemaEqual(n.Output(), winner.Output()) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) >= maxSubproblemAlts {
+			break
+		}
+	}
+	return out
+}
+
+// buildSubproblemAltTree lowers one runner-up path at the sub-problem's
+// boundary, declining (nil) where the lowering panics.
+func buildSubproblemAltTree(q *Path, base, width int, fill func(int) (SchemaColumn, bool)) (r Node) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			if dpTraceEnabled() {
+				fmt.Fprintf(os.Stderr, "DPPATH subproblem-alt declined: %v\n", rec)
+			}
+			r = nil
+		}
+	}()
+	r = createPlanAtSearchRootRange(q, base, width, fill)
+	if r != nil && q.Rel != nil {
+		applyECOrientation(r, q.Rel.ecWant)
+	}
+	return r
 }

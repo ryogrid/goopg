@@ -93,6 +93,53 @@ func IndexRealPages(idx *Index) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// IndexRealPagesIn is IndexRealPages resolved through cat: the file is looked
+// up where cat.IndexRelFileNode places it. An index in the postgres database
+// carries DBOid 0 or the namespace key DefaultDBOid (1), and its file sits
+// under the catalog's storage database (5 on a server, NamespaceDBOid).
+// `get_relation_info` (plancat.c:466) sizes the index relation it opened,
+// which is always in the current database; the package-level IndexRealPages
+// took DBOid 1 literally, found no file under base/1, and the planner fell
+// back to a width estimate (M0146-0178 slice 2: item_pkey priced at 40 pages,
+// real 52). nil cat keeps IndexRealPages.
+func IndexRealPagesIn(cat Catalog, idx *Index) (int64, bool) {
+	if idx == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if cat == nil {
+		return IndexRealPages(idx)
+	}
+	return RelNBlocksFunc(cat.IndexRelFileNode(idx))
+}
+
+// indexRealPagesInDB is IndexRealPagesIn for a caller that already holds the
+// catalog's lock and knows the storage database: an index with DBOid 0 or
+// DefaultDBOid lives in dbOid, as IndexRelFileNode resolves it.
+func indexRealPagesInDB(idx *Index, dbOid uint32) (int64, bool) {
+	if idx == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if idx.DBOid != 0 && idx.DBOid != DefaultDBOid {
+		dbOid = idx.DBOid
+	}
+	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
+}
+
+// TableRealPagesIn is TableRealPages resolved through cat, as IndexRealPagesIn
+// is for indexes: a table in the postgres database carries DBOid 0 or the
+// namespace key DefaultDBOid while its file sits under the catalog's storage
+// database (cat.RelFileNode), and `estimate_rel_size` sizes the relation it
+// opened there (plancat.c). nil cat keeps TableRealPages.
+func TableRealPagesIn(cat Catalog, tbl *Table) (int64, bool) {
+	if tbl == nil || RelNBlocksFunc == nil {
+		return 0, false
+	}
+	if cat == nil {
+		return TableRealPages(tbl)
+	}
+	return RelNBlocksFunc(cat.RelFileNode(tbl))
+}
+
 // TableRealPages reports tbl's real main-fork size in blocks, when the storage
 // hook is wired and the fork exists. It is `IndexRealPages`' sibling and PG's
 // own input: `estimate_rel_size` fills `rel->pages` from a live
@@ -130,8 +177,49 @@ func (c *InMemory) relAllVisibleCell(t *Table) string {
 	if c == nil || t == nil {
 		return "0"
 	}
+	if n, ok := storedRelAllVisible(t); ok {
+		return strconv.FormatInt(int64(n), 10)
+	}
 	dbOid, relOID := c.relAllVisibleKey(t)
 	return relAllVisibleFor(dbOid, relOID)
+}
+
+// storedRelAllVisible reports t's stored pg_class.relallvisible, when a VACUUM,
+// ANALYZE or statistics import has set one (TableStats.AllVisibleSet).
+func storedRelAllVisible(t *Table) (int32, bool) {
+	if s := t.Stats; s != nil && s.AllVisibleSet {
+		return s.AllVisible, true
+	}
+	return 0, false
+}
+
+// LiveRelAllVisibleBlocks counts t's all-visible blocks in the visibility map
+// now (visibilitymap_count), keyed as RelAllVisibleBlocks keys it. VACUUM and
+// ANALYZE snapshot it into the stored value.
+func (c *InMemory) LiveRelAllVisibleBlocks(t *Table) int32 {
+	if c == nil || t == nil || RelAllVisibleFunc == nil {
+		return 0
+	}
+	dbOid, relOID := c.relAllVisibleKey(t)
+	return RelAllVisibleFunc(dbOid, relOID)
+}
+
+// SetRelAllVisible stores t's pg_class.relallvisible (vac_update_relstats),
+// replacing the Stats pointer as UpdateRelStats does, so a concurrent planner
+// never sees a torn struct. A nil Stats is created without marking the
+// relation analyzed.
+func (c *InMemory) SetRelAllVisible(t *Table, n int32) {
+	if c == nil || t == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var merged TableStats
+	if t.Stats != nil {
+		merged = *t.Stats
+	}
+	merged.AllVisible, merged.AllVisibleSet = n, true
+	t.Stats = &merged
 }
 
 // relAllVisibleKey is the (database, relfilenode) pair a table's VM bits are
@@ -157,12 +245,17 @@ func (c *InMemory) relAllVisibleKey(t *Table) (dbOid, relOID uint32) {
 // DBOid-less table under DefaultDBOid, while VACUUM keyed its VM bits under the
 // session's database, so on the `postgres` database it read 0 and priced every
 // index-only scan with all its heap fetches (M0145-0029 slice 5).
+//
+// It is the STORED value when one is set, as PG's planner reads pg_class
+// (M0146-0216), and the live map otherwise.
 func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
-	if c == nil || t == nil || RelAllVisibleFunc == nil {
+	if c == nil || t == nil {
 		return 0
 	}
-	dbOid, relOID := c.relAllVisibleKey(t)
-	return RelAllVisibleFunc(dbOid, relOID)
+	if n, ok := storedRelAllVisible(t); ok {
+		return n
+	}
+	return c.LiveRelAllVisibleBlocks(t)
 }
 
 // RelAllVisible reports the relation's VM-derived all-visible BLOCK COUNT
@@ -173,7 +266,13 @@ func (c *InMemory) RelAllVisibleBlocks(t *Table) int32 {
 // which prices an index-only scan at exactly what the equivalent index scan
 // costs — the safe direction.
 func RelAllVisible(t *Table) int32 {
-	if t == nil || RelAllVisibleFunc == nil {
+	if t == nil {
+		return 0
+	}
+	if n, ok := storedRelAllVisible(t); ok {
+		return n
+	}
+	if RelAllVisibleFunc == nil {
 		return 0
 	}
 	dbOid := DefaultDBOid
@@ -508,6 +607,12 @@ type Table struct {
 	// without us bootstrapping a full system catalog.
 	Virtual     bool
 	VirtualRows func() [][]string
+	// VirtualRowsForDB, when set, returns the rows a connection to dbOid
+	// sees (a per-database catalog such as pg_proc); the executor prefers
+	// it over VirtualRows at run time. VirtualRows stays the default
+	// database's answer for plan time and callers with no connection.
+	// M0122-0015d.
+	VirtualRowsForDB func(dbOid uint32) [][]string
 
 	// View, when non-nil, marks this table as a SQL view. The
 	// stored value is the parser AST of the view's defining
@@ -1921,6 +2026,17 @@ type TableStats struct {
 	// !relhassubclass comment is about. M0125-0003; design
 	// docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md §D1.
 	Analyzed bool `json:"analyzed,omitempty"`
+
+	// AllVisible is the stored pg_class.relallvisible, which VACUUM and
+	// ANALYZE snapshot from the visibility map (vac_update_relstats) and
+	// pg_restore_relation_stats sets. PG's planner reads this STORED value
+	// for allvisfrac (plancat.c estimate_rel_size), not the live map, so it
+	// goes stale exactly as PG's does between maintenance passes.
+	// AllVisibleSet is false for a relation no such pass has touched since
+	// the field existed. The live map stands in then: before M0146-0216 goopg
+	// always read it live, and an old size sidecar row carries no value.
+	AllVisible    int32 `json:"all_visible,omitempty"`
+	AllVisibleSet bool  `json:"all_visible_set,omitempty"`
 }
 
 // ColumnStats is the per-column pg_statistic-shaped subset v0
@@ -2003,6 +2119,28 @@ type ColumnStats struct {
 // statistics restored from a real PG heap arrive: initdb's pg_statistic reload
 // can recover a negative stadistinct only as a fraction, because converting it
 // to a count needs a row count the reload does not have (ledger row pq-P6).
+// ColumnStatsDistinct converts a stored pg_statistic.stadistinct into
+// ColumnStats' two fields. PG's sign convention: a negative value is a
+// fraction of the relation's rows (capped at 1), a positive one an absolute
+// count, zero unknown. It is the one conversion every reader of a stadistinct
+// shares: startup's pg_statistic reload, and pg_restore_attribute_stats
+// importing an n_distinct (M0146-0215). An imported column must read the
+// same before and after a restart. The fraction stays a fraction, not a
+// count, because the conversion would need a row count that neither caller
+// has (ledger pq-P6).
+func ColumnStatsDistinct(staDistinct float64) (count int64, frac float64) {
+	switch {
+	case staDistinct < 0:
+		frac = -staDistinct
+		if frac > 1 {
+			frac = 1
+		}
+	case staDistinct > 0:
+		count = int64(staDistinct)
+	}
+	return count, frac
+}
+
 func (cs ColumnStats) StaDistinct() float64 {
 	switch {
 	case cs.NDistinctFrac > 0.1:
@@ -2310,12 +2448,15 @@ type Catalog interface {
 	// TablesInSchema returns the names of all non-virtual user tables in the given
 	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
 	TablesInSchema(schemaName string, dbOid ...uint32) []parser.ObjectName
-	// SchemaExists reports whether a schema has been registered.
-	SchemaExists(name string) bool
+	// SchemaExists reports whether a schema has been registered. The schema
+	// methods take InMemory's trailing dbOid (user schemas are per database;
+	// none = every database for lookups, DefaultDBOid for writes);
+	// SearchPathCatalog supplies the connection's. M0119-0006.
+	SchemaExists(name string, dbOid ...uint32) bool
 	// SchemaOID returns the OID of a registered schema (0 if not found). Used by
 	// syncTableToCatalogHeap to stamp a user table's pg_class.relnamespace with
 	// the real schema OID so the schema survives a restart (M0110-0003).
-	SchemaOID(name string) uint32
+	SchemaOID(name string, dbOid ...uint32) uint32
 	// SchemaNameForOID returns the registered schema name for the given namespace
 	// OID ("" if no schema carries that OID). It is the reverse of SchemaOID and
 	// is needed by the regtype/regcollation renderers to resolve a user type's /
@@ -2323,9 +2464,9 @@ type Catalog interface {
 	// M0119-0006 slice B). *InMemory is the sole implementer.
 	SchemaNameForOID(oid uint32) string
 	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
-	RegisterSchema(name string)
+	RegisterSchema(name string, dbOid ...uint32)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
-	UnregisterSchema(name string)
+	UnregisterSchema(name string, dbOid ...uint32)
 	// CreateExtension records a CREATE EXTENSION install in the runtime
 	// pg_extension registry. schema is the install namespace name (defaulted by
 	// the caller), version the extension version string. When the extension
@@ -2450,7 +2591,7 @@ type Catalog interface {
 	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
 	// in `GRANT … ON FOREIGN DATA WRAPPER <name> TO …` to the OID-keyed ACL
 	// store key. DU-002 slice 428.
-	ForeignDataWrapperOID(name string) uint32
+	ForeignDataWrapperOID(name string, dbOid ...uint32) uint32
 	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
 	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
 	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
@@ -2610,13 +2751,25 @@ type tableNamespace struct {
 	tables  map[string]*Table
 	indexes map[string]*Index
 	byTable map[uint32]map[string]*Index
+	// schemas holds this database's user schemas (CREATE SCHEMA), lowercase
+	// name → OID; pg_namespace is per-database in PostgreSQL. The bootstrap
+	// schemas every database starts with stay in InMemory.schemas (shared).
+	// schemaOwners / schemaHeapTIDs are this database's pg_namespace row
+	// owners and heap TIDs, for user and bootstrap schemas alike — each
+	// database has its own pg_namespace heap. M0119-0006.
+	schemas        map[string]uint32
+	schemaOwners   map[string]uint32
+	schemaHeapTIDs map[string]SchemaHeapTID
 }
 
 func newTableNamespace() *tableNamespace {
 	return &tableNamespace{
-		tables:  make(map[string]*Table),
-		indexes: make(map[string]*Index),
-		byTable: make(map[uint32]map[string]*Index),
+		tables:         make(map[string]*Table),
+		indexes:        make(map[string]*Index),
+		byTable:        make(map[uint32]map[string]*Index),
+		schemas:        make(map[string]uint32),
+		schemaOwners:   make(map[string]uint32),
+		schemaHeapTIDs: make(map[string]SchemaHeapTID),
 	}
 }
 
@@ -2852,24 +3005,19 @@ type InMemory struct {
 	// slice 446 (M0119-0004).
 	userTSConfigs []*UserTSConfig
 
-	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
-	// with the standard system schemas. Maps lowercase schema name → OID.
-	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
+	// schemas holds the bootstrap schemas every database has (pg_catalog,
+	// public, pg_toast, information_schema), lowercase name → OID. User
+	// schemas (CREATE SCHEMA) live in their database's tableNamespace.schemas
+	// (M0119-0006: they were process-wide, so a schema created in one
+	// database was visible — and droppable — from every other).
 	schemas map[string]uint32
 
-	// schemaOwners maps lowercase schema name → owning role OID, set by
-	// `ALTER SCHEMA name OWNER TO role` (DU-002 slice 440 resume point (3),
-	// M0110-0001). A schema absent from this map has no explicit owner
-	// change recorded and defaults to the bootstrap superuser (OID 10),
-	// matching pg_namespace.nspowner's previous hardcoded literal.
-	schemaOwners map[string]uint32
-
-	// schemaHeapTIDs maps lowercase schema name → the schema's LIVE
-	// pg_namespace heap-row TID (B1.1, doc 02a §3.3 TID-carrying cache
-	// contract): seeded by CREATE SCHEMA's heap INSERT and by the startup
-	// reload scan, refreshed by every ALTER's heap UPDATE, deleted with the
-	// schema. updateHeapRowCanonicalPG needs it to stamp the old version.
-	schemaHeapTIDs map[string]SchemaHeapTID
+	// A schema's LIVE pg_namespace heap-row TID (B1.1, doc 02a §3.3
+	// TID-carrying cache contract) is kept per database in
+	// tableNamespace.schemaHeapTIDs: seeded by CREATE SCHEMA's heap INSERT
+	// and by the startup reload scan, refreshed by every ALTER's heap UPDATE,
+	// deleted with the schema. updateHeapRowCanonicalPG needs it to stamp the
+	// old version.
 	// typeHeapTIDs maps a pg_type row's OID (domain/enum/range/composite +
 	// their array peers) → that row's LIVE pg_type heap TID (B2.1b, same
 	// §3.3 contract as schemaHeapTIDs). Seeded by every
@@ -4091,6 +4239,42 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
+// Template1NamespaceDBOid is template1's catalog-namespace AND storage oid
+// (base/2) — deliberately NOT its displayed pg_database.oid (1, rendered by
+// databaseDisplayOID). template1's real PostgreSQL oid 1 is also goopg's
+// DefaultDBOid sentinel, the namespace the postgres database reads and writes,
+// so a template1 connection used to share postgres' tables (a table created in
+// template1 was visible from postgres and vice versa, and pg_dumpall emitted
+// it under both). Owner decision 2026-09-25 (Option A): route template1 around
+// the sentinel to its own namespace; removing the sentinel (postgres at
+// namespace 5, one oid per database at every layer) is the real fix and stays
+// with M0122-0007 slices 4b-4e. 2 lies between the bootstrap oids (1, 4, 5)
+// and FirstUserOID, so no CREATE DATABASE can allocate it.
+// Design: docs/design/0100-0149/0119-0006bv-template1-namespace-collision.md.
+const Template1NamespaceDBOid uint32 = 2
+
+// PgDatabaseRowOid maps a database's namespace/storage oid — what
+// ResolveDatabaseOid returns — to the oid of its pg_database row, which is
+// what every global/1262 heap read and write keys on. They differ only for
+// template1 (namespace Template1NamespaceDBOid, row 1).
+func PgDatabaseRowOid(nsOid uint32) uint32 {
+	if nsOid == Template1NamespaceDBOid {
+		return 1
+	}
+	return nsOid
+}
+
+// NamespaceOidForPgDatabaseRow is PgDatabaseRowOid's inverse, for startup
+// reloads that read a pg_database row and key in-memory state (datacl) by the
+// namespace oid every runtime reader resolves. Row oid 1 is template1's
+// (postgres' row is c.DBOID(), 5).
+func NamespaceOidForPgDatabaseRow(rowOid uint32) uint32 {
+	if rowOid == 1 {
+		return Template1NamespaceDBOid
+	}
+	return rowOid
+}
+
 // emptyTableNamespace is the shared, never-mutated fallback ns() returns for
 // a dbOid with no namespace yet. A package-level singleton is safe here only
 // because ns() is read-only (see its own comment) — nothing ever writes
@@ -4207,7 +4391,7 @@ func NewInMemory() *InMemory {
 		databaseConnLimit:      make(map[string]int32),
 		databaseEncoding:       make(map[string]int32),
 		databaseOwner:          make(map[string]uint32),
-		databaseOid:            make(map[string]uint32),
+		databaseOid:            map[string]uint32{"template1": Template1NamespaceDBOid},
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -4249,7 +4433,6 @@ func NewInMemory() *InMemory {
 			// TestBootstrapNamespaceOIDsMatchPG18.
 			"information_schema": 13273,
 		},
-		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
 		predefinedRoles:    newPredefinedRoleMap(),
 		roleAttrs:          make(map[string]*RoleAttrs),
@@ -4787,7 +4970,7 @@ func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate, schem
 	if c.userAggregates == nil {
 		c.userAggregates = make(map[string]*UserAggregate)
 	}
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -5606,6 +5789,21 @@ func (c *InMemory) DropDatabase(name string) error {
 	if !c.databases[name] {
 		return ErrDatabaseNotFound
 	}
+	// Its user schemas go with it: the unscoped schema lookups search every
+	// database's schema set. M0119-0006.
+	if oid, ok := c.databaseOid[name]; ok {
+		if n, ok := c.namespaces[NamespaceDBOid(oid)]; ok && NamespaceDBOid(oid) != DefaultDBOid {
+			n.schemas = make(map[string]uint32)
+			n.schemaOwners = make(map[string]uint32)
+			n.schemaHeapTIDs = make(map[string]SchemaHeapTID)
+		}
+		// Its routines too (pg_proc is per-database): LookupByOID and List
+		// span every database, so a dropped database's functions would
+		// otherwise linger. M0146-0156.
+		if db := NamespaceDBOid(oid); db != DefaultDBOid && c.routines != nil {
+			c.routines.DropAllInDB(db)
+		}
+	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
 	delete(c.databaseEncoding, name)
@@ -5815,7 +6013,7 @@ func (c *InMemory) ResolveDatabaseOid(name string) (oid uint32, ok bool) {
 	case "postgres":
 		return c.DBOID(), true
 	case "template1":
-		return 1, true
+		return Template1NamespaceDBOid, true
 	case "template0":
 		return 4, true
 	}
@@ -7833,7 +8031,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		if schema == "" {
 			schema = "public"
 		}
-		nsOID := c.schemas[strings.ToLower(schema)]
+		nsOID := c.schemaOIDInLocked(schema, []uint32{dbOid})
 		if nsOID == 0 {
 			nsOID = 2200 // default to public
 		}
@@ -8113,7 +8311,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			if schema == "" {
 				schema = "public"
 			}
-			if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
+			if oid := c.schemaOIDInLocked(schema, []uint32{dbOid}); oid != 0 {
 				idxNsOID = oid
 			}
 		}
@@ -8155,8 +8353,15 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// tuple, so it reports the table's own count. `-1` is retained for the
 		// unanalysed case — PG 14+ uses it to mean "unknown", distinct from a
 		// genuine zero.
+		// dbOid is the namespace key; the postgres database's namespace is
+		// DefaultDBOid while its files sit under the catalog's storage
+		// database (NamespaceDBOid), so map it back as IndexRelFileNode does.
+		storeDB := c.dbOid
+		if dbOid != 0 && dbOid != DefaultDBOid {
+			storeDB = dbOid
+		}
 		idxRelPages := "0"
-		if pages, ok := IndexRealPages(idx); ok && pages > 0 {
+		if pages, ok := indexRealPagesInDB(idx, storeDB); ok && pages > 0 {
 			idxRelPages = strconv.FormatInt(pages, 10)
 		}
 		idxRelTuples := "-1"
@@ -8872,25 +9077,11 @@ func (c *InMemory) registerSystemTables() {
 		OID:     2615, // upstream's NamespaceRelationId
 		Virtual: true,
 	}
+	// The global VirtualRows is the default database's; the executor swaps
+	// in PGNamespaceRowsForDBOid(connection's database) — pg_namespace is
+	// per-database (M0119-0006).
 	pgNamespace.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		schemas := c.allSchemasLocked()
-		c.mu.RUnlock()
-		// Sort by OID for deterministic output.
-		sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
-		out := make([][]string, 0, len(schemas))
-		for _, s := range schemas {
-			if s.name == "pg_toast" {
-				continue // skip internal alias
-			}
-			out = append(out, []string{
-				strconv.Itoa(int(s.oid)), // oid
-				s.name,                   // nspname
-				strconv.Itoa(int(c.SchemaOwnerOID(s.name))), // nspowner (ALTER SCHEMA ... OWNER TO, DU-002 slice 440 resume point (3); defaults to bootstrap superuser)
-				c.NamespaceACLText(s.oid),                   // nspacl (NULL until a schema GRANT, slice 335)
-			})
-		}
-		return out
+		return c.PGNamespaceRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_namespace"] = pgNamespace
 
@@ -10651,7 +10842,7 @@ func (c *InMemory) registerSystemTables() {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := c.schemas[strings.ToLower(schema)]
+			nsOID := c.schemaOIDAnyLocked(schema)
 			if nsOID == 0 {
 				nsOID = c.schemas["public"]
 			}
@@ -11650,29 +11841,10 @@ func (c *InMemory) registerSystemTables() {
 	// OPTIONS clause, so the OPTIONS clause is skipped. fdwacl materializes via
 	// ForeignDataWrapperACLText so a `GRANT … ON FOREIGN DATA WRAPPER …`
 	// round-trips (DU-002 slice 428); DU-002 slice 375.
-	pgForeignDataWrapper.VirtualRows = func() [][]string {
-		fdws := c.ListForeignDataWrappers()
-		if len(fdws) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(fdws))
-		for _, f := range fdws {
-			owner := f.Owner
-			if owner == 0 {
-				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(f.OID), 10),          // oid
-				f.Name,                                         // fdwname
-				strconv.FormatUint(uint64(owner), 10),          // fdwowner
-				strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
-				strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
-				c.ForeignDataWrapperACLText(f.OID),             // fdwacl
-				optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
-	}
+	// pg_foreign_data_wrapper is per-database: the executor asks
+	// VirtualRowsForDB with the connection's database (M0122-0015e).
+	pgForeignDataWrapper.VirtualRows = func() [][]string { return c.PGForeignDataWrapperRowsForDBOid(DefaultDBOid) }
+	pgForeignDataWrapper.VirtualRowsForDB = c.PGForeignDataWrapperRowsForDBOid
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
@@ -13480,47 +13652,123 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool, dbOid ...uint
 	return nil
 }
 
-// TablesInSchema returns the names of all non-virtual user tables whose Schema
-// field matches schemaName (case-insensitive).  Virtual/system tables in
-// pg_catalog or information_schema are excluded.  Used by DROP SCHEMA CASCADE
-// to identify objects to cascade-drop. M0097-0020.
-// SchemaExists reports whether a schema with the given name has been registered.
-// Pre-populated with the standard system schemas; user schemas are added by
-// RegisterSchema (called from CREATE SCHEMA). M0097-drop_if_exists.
-func (c *InMemory) SchemaExists(name string) bool {
+// SchemaExists reports whether a schema with the given name exists: a
+// bootstrap schema, or a user schema of the given database (dbOid, a
+// namespace oid as NamespaceDBOid returns; the connection's real oid is
+// normalised). With no dbOid the lookup searches every database — the
+// pre-M0119-0006 process-wide behaviour, kept for callers that have no
+// database in hand (recovery replays, catalog-internal resolvers).
+func (c *InMemory) SchemaExists(name string, dbOid ...uint32) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, ok := c.schemas[strings.ToLower(name)]
+	_, ok := c.schemaOIDLocked(strings.ToLower(name), dbOid)
 	return ok
 }
 
-// SchemaOID returns the OID for the given schema name (0 if not found).
-func (c *InMemory) SchemaOID(name string) uint32 {
+// SchemaOID returns the OID for the given schema name (0 if not found), with
+// SchemaExists' database scoping.
+func (c *InMemory) SchemaOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.schemas[strings.ToLower(name)]
+	oid, _ := c.schemaOIDLocked(strings.ToLower(name), dbOid)
+	return oid
+}
+
+// schemaOIDLocked resolves a lowercase schema name: the shared bootstrap
+// schemas first, then the user schemas of dbOid's database — or, with no
+// dbOid, of every database (the default database first, then the others in
+// oid order, so the answer is deterministic). Must be called with c.mu held.
+func (c *InMemory) schemaOIDLocked(lc string, dbOid []uint32) (uint32, bool) {
+	if oid, ok := c.schemas[lc]; ok {
+		return oid, true
+	}
+	if len(dbOid) > 0 {
+		oid, ok := c.ns(NamespaceDBOid(dbOid[0])).schemas[lc]
+		return oid, ok
+	}
+	n, ok := c.schemaDatabaseLocked(lc)
+	if !ok {
+		return 0, false
+	}
+	return c.ns(n).schemas[lc], true
+}
+
+// schemaDatabaseLocked returns the namespace oid of the database holding the
+// user schema lc, searching the default database first and then the others
+// in oid order. Must be called with c.mu held.
+func (c *InMemory) schemaDatabaseLocked(lc string) (uint32, bool) {
+	if _, ok := c.ns(DefaultDBOid).schemas[lc]; ok {
+		return DefaultDBOid, true
+	}
+	dbs := make([]uint32, 0, len(c.namespaces))
+	for db, n := range c.namespaces {
+		if db == DefaultDBOid {
+			continue
+		}
+		if _, ok := n.schemas[lc]; ok {
+			dbs = append(dbs, db)
+		}
+	}
+	if len(dbs) == 0 {
+		return 0, false
+	}
+	sort.Slice(dbs, func(i, j int) bool { return dbs[i] < dbs[j] })
+	return dbs[0], true
+}
+
+// schemaOIDAnyLocked is schemaOIDLocked with no database: the lookup for
+// catalog-internal resolvers (a pg_*.…namespace column, a recovery replay)
+// that have no database in hand. Must be called with c.mu held.
+func (c *InMemory) schemaOIDAnyLocked(name string) uint32 {
+	oid, _ := c.schemaOIDLocked(strings.ToLower(name), nil)
+	return oid
+}
+
+// schemaOIDInLocked is schemaOIDLocked for a resolver that may carry its
+// caller's database: scoped to dbOid when given, else every database.
+// Must be called with c.mu held.
+func (c *InMemory) schemaOIDInLocked(name string, dbOid []uint32) uint32 {
+	oid, _ := c.schemaOIDLocked(strings.ToLower(name), dbOid)
+	return oid
+}
+
+// schemaDBOid is the namespace oid a schema write targets: the caller's
+// database (normalised), else DefaultDBOid.
+func schemaDBOid(dbOid []uint32) uint32 {
+	return NamespaceDBOid(resolveDBOid(dbOid))
 }
 
 // SchemaNameForOID returns the registered schema name for the given namespace
 // OID ("" if no schema carries that OID). It is the reverse of SchemaOID and is
 // used by the restart recovery path (loadUserTablesFromHeap /
 // loadUserIndexesFromHeap) to reconstruct a user table's schema from the
-// pg_class.relnamespace OID recovered from the heap. Pre-populated system
-// schemas (pg_catalog/public) are handled by their fixed OIDs at the call site;
-// this resolves user schemas registered via CREATE SCHEMA. M0110-0003.
+// pg_class.relnamespace OID recovered from the heap. Schema OIDs come from the
+// one cluster-wide counter, so an OID names one schema whichever database
+// holds it (CREATE DATABASE copies a template's schemas with their OIDs and
+// names alike). M0110-0003, M0119-0006.
 func (c *InMemory) SchemaNameForOID(oid uint32) string {
 	if oid == 0 {
 		return ""
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// The schemas map holds distinct OIDs per namespace (NewInMemory uses the
-	// real PG18 values), so this reverse scan is unambiguous. (It was previously
-	// nondeterministic because pg_toast wrongly shared public's OID 2200 — fixed
-	// at the source in NewInMemory rather than worked around here.)
+	// The bootstrap OIDs are distinct (NewInMemory uses the real PG18
+	// values), so this reverse scan is unambiguous.
 	for name, o := range c.schemas {
 		if o == oid {
 			return name
+		}
+	}
+	dbs := make([]uint32, 0, len(c.namespaces))
+	for db := range c.namespaces {
+		dbs = append(dbs, db)
+	}
+	sort.Slice(dbs, func(i, j int) bool { return dbs[i] < dbs[j] })
+	for _, db := range dbs {
+		for name, o := range c.namespaces[db].schemas {
+			if o == oid {
+				return name
+			}
 		}
 	}
 	return ""
@@ -13534,13 +13782,13 @@ type SchemaHeapTID struct {
 	Offset uint16
 }
 
-// SchemaHeapTID returns the live pg_namespace heap TID recorded for name,
-// with ok=false when none is known (builtin schemas before any ALTER, or a
-// pre-conversion data dir).
-func (c *InMemory) SchemaHeapTID(name string) (SchemaHeapTID, bool) {
+// SchemaHeapTID returns the live pg_namespace heap TID recorded for name in
+// dbOid's database (DefaultDBOid when omitted), with ok=false when none is
+// known (builtin schemas before any ALTER, or a pre-conversion data dir).
+func (c *InMemory) SchemaHeapTID(name string, dbOid ...uint32) (SchemaHeapTID, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	tid, ok := c.schemaHeapTIDs[strings.ToLower(name)]
+	tid, ok := c.ns(schemaDBOid(dbOid)).schemaHeapTIDs[strings.ToLower(name)]
 	return tid, ok
 }
 
@@ -13748,84 +13996,139 @@ func (c *InMemory) DropTSConfigHeapTID(oid uint32) {
 	delete(c.tsConfigHeapTIDs, oid)
 }
 
-// SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
-func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
+// SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name
+// in dbOid's database.
+func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.schemaHeapTIDs == nil {
-		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
-	}
-	c.schemaHeapTIDs[strings.ToLower(name)] = tid
+	c.getOrCreateNS(schemaDBOid(dbOid)).schemaHeapTIDs[strings.ToLower(name)] = tid
 }
 
 // DeleteSchemaHeapTID drops the TID entry (DROP SCHEMA).
-func (c *InMemory) DeleteSchemaHeapTID(name string) {
+func (c *InMemory) DeleteSchemaHeapTID(name string, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.schemaHeapTIDs, strings.ToLower(name))
+	delete(c.ns(schemaDBOid(dbOid)).schemaHeapTIDs, strings.ToLower(name))
 }
 
 // RenameSchemaHeapTID re-keys the TID entry (ALTER SCHEMA RENAME — the row
 // itself moved via heap UPDATE, so the caller passes the NEW tid too).
-func (c *InMemory) RenameSchemaHeapTID(oldName, newName string, tid SchemaHeapTID) {
+func (c *InMemory) RenameSchemaHeapTID(oldName, newName string, tid SchemaHeapTID, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.schemaHeapTIDs == nil {
-		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
-	}
-	delete(c.schemaHeapTIDs, strings.ToLower(oldName))
-	c.schemaHeapTIDs[strings.ToLower(newName)] = tid
+	n := c.getOrCreateNS(schemaDBOid(dbOid))
+	delete(n.schemaHeapTIDs, strings.ToLower(oldName))
+	n.schemaHeapTIDs[strings.ToLower(newName)] = tid
 }
 
-// RegisterSchema records a user-created schema. Called from execCreateSchema.
-func (c *InMemory) RegisterSchema(name string) {
+// RegisterSchema records a user-created schema in dbOid's database
+// (DefaultDBOid when omitted). Called from execCreateSchema. A name that is a
+// bootstrap schema or already exists in that database is left alone.
+func (c *InMemory) RegisterSchema(name string, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.schemas[lc]; !ok {
+	if _, ok := c.schemas[lc]; ok {
+		return
+	}
+	n := c.getOrCreateNS(schemaDBOid(dbOid))
+	if _, ok := n.schemas[lc]; !ok {
 		c.nextOID++
-		c.schemas[lc] = c.nextOID
+		n.schemas[lc] = c.nextOID
 	}
 }
 
-// UnregisterSchema removes a schema from the registry. Called from DROP SCHEMA.
-func (c *InMemory) UnregisterSchema(name string) {
+// CopyUserSchemas gives database dst the user schemas (and recorded owners)
+// of database src, keeping their OIDs and names — CREATE DATABASE ...
+// TEMPLATE copies the template's pg_namespace rows. Returns the copied names
+// in OID order so the caller can journal dst's heap rows. M0119-0006.
+func (c *InMemory) CopyUserSchemas(src, dst uint32) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.schemas, strings.ToLower(name))
+	from := c.ns(NamespaceDBOid(src))
+	if len(from.schemas) == 0 {
+		return nil
+	}
+	to := c.getOrCreateNS(NamespaceDBOid(dst))
+	names := make([]string, 0, len(from.schemas))
+	for name, oid := range from.schemas {
+		to.schemas[name] = oid
+		if owner, ok := from.schemaOwners[name]; ok {
+			to.schemaOwners[name] = owner
+		}
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool { return from.schemas[names[i]] < from.schemas[names[j]] })
+	return names
+}
+
+// UnregisterSchema removes a schema from dbOid's database (DefaultDBOid when
+// omitted). Called from DROP SCHEMA. A bootstrap schema (DROP SCHEMA public)
+// is removed from the shared set, as before — see the M0119-0006 ledger row.
+func (c *InMemory) UnregisterSchema(name string, dbOid ...uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unregisterSchemaLocked(strings.ToLower(name), schemaDBOid(dbOid))
+}
+
+func (c *InMemory) unregisterSchemaLocked(lc string, db uint32) {
+	n := c.ns(db)
+	if _, ok := n.schemas[lc]; ok {
+		delete(n.schemas, lc)
+		delete(n.schemaOwners, lc)
+		return
+	}
+	delete(c.schemas, lc)
 }
 
 // SchemaOwnerOID returns the owning role OID recorded for the given schema
-// (ALTER SCHEMA ... OWNER TO), or the bootstrap superuser (10) — the
-// long-standing pg_namespace.nspowner default — when no explicit owner
-// change has been recorded. DU-002 slice 440 resume point (3) (M0110-0001).
-func (c *InMemory) SchemaOwnerOID(name string) uint32 {
+// in dbOid's database (ALTER SCHEMA ... OWNER TO), or the bootstrap
+// superuser (10) — the long-standing pg_namespace.nspowner default — when no
+// explicit owner change has been recorded. With no dbOid the database is the
+// one holding the user schema (default database for a bootstrap schema).
+// DU-002 slice 440 resume point (3) (M0110-0001), M0119-0006.
+func (c *InMemory) SchemaOwnerOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if oid, ok := c.schemaOwners[strings.ToLower(name)]; ok {
+	if oid, ok := c.ns(c.schemaOwnerDBLocked(strings.ToLower(name), dbOid)).schemaOwners[strings.ToLower(name)]; ok {
 		return oid
 	}
 	return 10
 }
 
-// SetSchemaOwner records the owning role OID for a schema (ALTER SCHEMA ...
-// OWNER TO). Returns false if the schema does not exist. DU-002 slice 440
-// resume point (3) (M0110-0001).
-func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32) bool {
+// schemaOwnerDBLocked is the namespace oid whose pg_namespace row carries
+// lc's owner: the caller's database, else the database holding the user
+// schema, else DefaultDBOid. Must be called with c.mu held.
+func (c *InMemory) schemaOwnerDBLocked(lc string, dbOid []uint32) uint32 {
+	if len(dbOid) > 0 {
+		return NamespaceDBOid(dbOid[0])
+	}
+	if _, ok := c.schemas[lc]; !ok {
+		if db, ok := c.schemaDatabaseLocked(lc); ok {
+			return db
+		}
+	}
+	return DefaultDBOid
+}
+
+// SetSchemaOwner records the owning role OID for a schema in dbOid's
+// database (ALTER SCHEMA ... OWNER TO). Returns false if the schema does not
+// exist there. DU-002 slice 440 resume point (3) (M0110-0001), M0119-0006.
+func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	if _, ok := c.schemas[lc]; !ok {
+	if _, ok := c.schemaOIDLocked(lc, dbOid); !ok {
 		return false
 	}
-	c.schemaOwners[lc] = ownerOID
+	c.getOrCreateNS(c.schemaOwnerDBLocked(lc, dbOid)).schemaOwners[lc] = ownerOID
 	return true
 }
 
 // SetSchemaOwnerDuringRecovery is the discard-result recovery counterpart to
 // SetSchemaOwner, mirroring SetStatisticsOwnerDuringRecovery.
-func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32) {
-	c.SetSchemaOwner(name, ownerOID)
+func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32, dbOid ...uint32) {
+	c.SetSchemaOwner(name, ownerOID, dbOid...)
 }
 
 // RenameSchema renames a user schema (ALTER SCHEMA ... RENAME TO). Real
@@ -13845,48 +14148,59 @@ func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32) {
 // userCollations/userConversions (carry a Schema field but aren't in a
 // schema-keyed map, so likely unaffected — not verified) and any
 // schema-qualified function/type/domain registries.
-func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
+func (c *InMemory) RenameSchema(old, new string, dbOid ...uint32) ([]*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lcOld := strings.ToLower(old)
 	lcNew := strings.ToLower(new)
-	oid, ok := c.schemas[lcOld]
-	if !ok {
+	db := schemaDBOid(dbOid)
+	if _, exists := c.schemaOIDLocked(lcNew, []uint32{db}); exists {
+		if _, ok := c.schemaOIDLocked(lcOld, []uint32{db}); ok {
+			return nil, fmt.Errorf("schema %q already exists", new)
+		}
+	}
+	n := c.ns(db)
+	if oid, ok := n.schemas[lcOld]; ok {
+		delete(n.schemas, lcOld)
+		n.schemas[lcNew] = oid
+	} else if oid, ok := c.schemas[lcOld]; ok {
+		// A bootstrap schema (ALTER SCHEMA public RENAME) is renamed in the
+		// shared set — see the M0119-0006 ledger row.
+		delete(c.schemas, lcOld)
+		c.schemas[lcNew] = oid
+		n = c.getOrCreateNS(db)
+	} else {
 		return nil, fmt.Errorf("schema %q does not exist", old)
 	}
-	if _, exists := c.schemas[lcNew]; exists {
-		return nil, fmt.Errorf("schema %q already exists", new)
+	if owner, ok := n.schemaOwners[lcOld]; ok {
+		delete(n.schemaOwners, lcOld)
+		n.schemaOwners[lcNew] = owner
 	}
-	delete(c.schemas, lcOld)
-	c.schemas[lcNew] = oid
-	if owner, ok := c.schemaOwners[lcOld]; ok {
-		delete(c.schemaOwners, lcOld)
-		c.schemaOwners[lcNew] = owner
-	}
+	// Only this database's relations live in the renamed schema.
 	var movedSequences []*Table
-	for k, tbl := range c.ns(DefaultDBOid).tables {
+	for k, tbl := range n.tables {
 		if !strings.EqualFold(tbl.Schema, old) {
 			continue
 		}
 		tbl.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: tbl.Name})
 		if newK != k {
-			delete(c.ns(DefaultDBOid).tables, k)
-			c.ns(DefaultDBOid).tables[newK] = tbl
+			delete(n.tables, k)
+			n.tables[newK] = tbl
 		}
 		if tbl.IsSequence {
 			movedSequences = append(movedSequences, tbl)
 		}
 	}
-	for k, idx := range c.ns(DefaultDBOid).indexes {
+	for k, idx := range n.indexes {
 		if !strings.EqualFold(idx.Schema, old) {
 			continue
 		}
 		idx.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: idx.Name})
 		if newK != k {
-			delete(c.ns(DefaultDBOid).indexes, k)
-			c.ns(DefaultDBOid).indexes[newK] = idx
+			delete(n.indexes, k)
+			n.indexes[newK] = idx
 		}
 	}
 	for name, schema := range c.opClassSchemas {
@@ -13916,21 +14230,27 @@ func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
 // counterpart to RenameSchema used by the WAL-replay driver. Errors (e.g. a
 // stale record replaying after a later drop) are swallowed, mirroring
 // RenameStatisticsObjectDuringRecovery.
-func (c *InMemory) RenameSchemaDuringRecovery(old, new string) {
-	_, _ = c.RenameSchema(old, new)
+func (c *InMemory) RenameSchemaDuringRecovery(old, new string, dbOid ...uint32) {
+	_, _ = c.RenameSchema(old, new, dbOid...)
 }
 
 // RegisterSchemaDuringRecovery is the idempotent version of RegisterSchema
-// used by the WAL-replay driver. Unlike RegisterSchema it takes the OID from
-// the WAL record (so the recovered registry matches what the pre-crash server
-// assigned) and advances nextOID past it so subsequent allocations do not
-// collide. Re-applying a record whose schema already exists is a no-op.
-// Mirrors RegisterDatabaseDuringRecovery (M0054-0001) / RegisterIndexDuringRecovery.
-func (c *InMemory) RegisterSchemaDuringRecovery(name string, oid uint32) {
+// used by the startup reload / WAL-replay driver. Unlike RegisterSchema it
+// takes the OID from the persisted row (so the recovered registry matches
+// what the pre-crash server assigned) and advances nextOID past it so
+// subsequent allocations do not collide. A bootstrap name updates the shared
+// entry; any other name registers in dbOid's database (DefaultDBOid when
+// omitted). Mirrors RegisterDatabaseDuringRecovery (M0054-0001) /
+// RegisterIndexDuringRecovery.
+func (c *InMemory) RegisterSchemaDuringRecovery(name string, oid uint32, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
-	c.schemas[lc] = oid
+	if _, ok := c.schemas[lc]; ok {
+		c.schemas[lc] = oid
+	} else {
+		c.getOrCreateNS(schemaDBOid(dbOid)).schemas[lc] = oid
+	}
 	if oid >= c.nextOID {
 		c.nextOID = oid + 1
 	}
@@ -13938,10 +14258,10 @@ func (c *InMemory) RegisterSchemaDuringRecovery(name string, oid uint32) {
 
 // UnregisterSchemaDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropSchema.
-func (c *InMemory) UnregisterSchemaDuringRecovery(name string) {
+func (c *InMemory) UnregisterSchemaDuringRecovery(name string, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.schemas, strings.ToLower(name))
+	c.unregisterSchemaLocked(strings.ToLower(name), schemaDBOid(dbOid))
 }
 
 // RegisterTransformDuringRecovery is the idempotent version of
@@ -14143,7 +14463,7 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14175,7 +14495,7 @@ func (c *InMemory) FindCollation(name, schema string, dbOid ...uint32) *UserColl
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14191,7 +14511,7 @@ func (c *InMemory) DropCollation(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14215,7 +14535,7 @@ func (c *InMemory) RenameCollation(name, schema, newName string, dbOid ...uint32
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14247,7 +14567,7 @@ func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32, dbOid
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14269,11 +14589,11 @@ func (c *InMemory) SetCollationSchema(name, schema, newSchema string, dbOid ...u
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
-	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	newNsOID := c.schemaOIDInLocked(newSchema, dbOid)
 	if newNsOID == 0 {
 		newNsOID = c.schemas["public"]
 	}
@@ -14297,7 +14617,7 @@ func (c *InMemory) SetCollationSchema(name, schema, newSchema string, dbOid ...u
 func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14374,7 +14694,7 @@ func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14415,7 +14735,7 @@ func (c *InMemory) FindConversion(name, schema string, dbOid ...uint32) *UserCon
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14431,7 +14751,7 @@ func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14455,7 +14775,7 @@ func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14502,7 +14822,7 @@ func (c *InMemory) RenameConversion(name, schema, newName string, dbOid ...uint3
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14535,7 +14855,7 @@ func (c *InMemory) SetConversionOwner(name, schema string, ownerOID uint32, dbOi
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14558,11 +14878,11 @@ func (c *InMemory) SetConversionSchema(name, schema, newSchema string, dbOid ...
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
-	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	newNsOID := c.schemaOIDInLocked(newSchema, dbOid)
 	if newNsOID == 0 {
 		newNsOID = c.schemas["public"]
 	}
@@ -14724,7 +15044,7 @@ func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string, dbOid ...uint32) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14751,7 +15071,7 @@ func (c *InMemory) FindTSDict(name, schema string, dbOid ...uint32) *UserTSDict 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14767,7 +15087,7 @@ func (c *InMemory) DropTSDict(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -14864,7 +15184,7 @@ func (c *InMemory) PGTSDictRowsForDBOid(dbOid uint32) [][]string {
 func (c *InMemory) CreateTSDictDuringRecovery(ud *UserTSDict, schema string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15078,7 +15398,7 @@ func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.T
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15123,7 +15443,7 @@ func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.T
 func (c *InMemory) AlterTSDictOptionsDuringRecovery(name, schema, initOption string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15142,7 +15462,7 @@ func (c *InMemory) RenameTSDict(name, schema, newName string, dbOid ...uint32) e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15174,11 +15494,11 @@ func (c *InMemory) SetTSDictSchema(name, schema, newSchema string, dbOid ...uint
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
-	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	newNsOID := c.schemaOIDInLocked(newSchema, dbOid)
 	if newNsOID == 0 {
 		newNsOID = c.schemas["public"]
 	}
@@ -15216,7 +15536,7 @@ func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string, dbOid ...uint
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15243,7 +15563,7 @@ func (c *InMemory) FindTSConfig(name, schema string, dbOid ...uint32) *UserTSCon
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15259,7 +15579,7 @@ func (c *InMemory) DropTSConfig(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15308,7 +15628,7 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15345,7 +15665,7 @@ func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string, dbOid ...
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15369,7 +15689,7 @@ func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string, dbOid ...
 func (c *InMemory) RenameTSConfig(name, schema, newName string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15396,11 +15716,11 @@ func (c *InMemory) RenameTSConfig(name, schema, newName string) error {
 func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
-	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	newNsOID := c.schemaOIDAnyLocked(newSchema)
 	if newNsOID == 0 {
 		newNsOID = c.schemas["public"]
 	}
@@ -15427,7 +15747,7 @@ func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
 func (c *InMemory) AlterTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15470,7 +15790,7 @@ func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	oid := resolveDBOid(dbOid)
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDInLocked(schema, dbOid)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -15521,7 +15841,7 @@ func (c *InMemory) ReplaceTSConfigMappingDictDuringRecovery(name, schema string,
 func (c *InMemory) CreateTSConfigDuringRecovery(uc *UserTSConfig, schema string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -16807,7 +17127,7 @@ func (c *InMemory) extensionRowsLocked(dbFilter string) [][]string {
 	sort.Slice(rows, func(i, j int) bool { return rows[i].oid < rows[j].oid })
 	out := make([][]string, 0, len(rows))
 	for _, e := range rows {
-		nsOID := c.schemas[strings.ToLower(e.schema)]
+		nsOID := c.schemaOIDAnyLocked(e.schema)
 		out = append(out, []string{
 			strconv.Itoa(int(e.oid)), // oid
 			e.name,                   // extname
@@ -16822,16 +17142,25 @@ func (c *InMemory) extensionRowsLocked(dbFilter string) [][]string {
 	return out
 }
 
-// allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
-func (c *InMemory) allSchemasLocked() []struct {
+// allSchemasLocked returns the (name, oid) pairs of the schemas dbOid's
+// database has: the bootstrap schemas, its user schemas, and the sessions'
+// temporary namespaces. Must be called with mu held.
+func (c *InMemory) allSchemasLocked(dbOid uint32) []struct {
 	name string
 	oid  uint32
 } {
+	user := c.ns(NamespaceDBOid(dbOid)).schemas
 	out := make([]struct {
 		name string
 		oid  uint32
-	}, 0, len(c.schemas)+len(c.tempNamespaces))
+	}, 0, len(c.schemas)+len(user)+len(c.tempNamespaces))
 	for name, oid := range c.schemas {
+		out = append(out, struct {
+			name string
+			oid  uint32
+		}{name, oid})
+	}
+	for name, oid := range user {
 		out = append(out, struct {
 			name string
 			oid  uint32
@@ -16846,6 +17175,32 @@ func (c *InMemory) allSchemasLocked() []struct {
 			name string
 			oid  uint32
 		}{tempNamespaceName(owner), oid})
+	}
+	return out
+}
+
+// PGNamespaceRowsForDBOid returns the pg_namespace rows of dbOid's database
+// (a connection's real oid is normalised): the bootstrap schemas, that
+// database's user schemas with their owners, and the temporary namespaces.
+// M0119-0006.
+func (c *InMemory) PGNamespaceRowsForDBOid(dbOid uint32) [][]string {
+	db := NamespaceDBOid(dbOid)
+	c.mu.RLock()
+	schemas := c.allSchemasLocked(db)
+	c.mu.RUnlock()
+	// Sort by OID for deterministic output.
+	sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
+	out := make([][]string, 0, len(schemas))
+	for _, s := range schemas {
+		if s.name == "pg_toast" {
+			continue // skip internal alias
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(s.oid)), // oid
+			s.name,                   // nspname
+			strconv.Itoa(int(c.SchemaOwnerOID(s.name, db))), // nspowner (ALTER SCHEMA ... OWNER TO, DU-002 slice 440 resume point (3); defaults to bootstrap superuser)
+			c.NamespaceACLText(s.oid),                       // nspacl (NULL until a schema GRANT, slice 335)
+		})
 	}
 	return out
 }
@@ -18618,67 +18973,84 @@ type ForeignDataWrapper struct {
 	// '-', so dumpForeignDataWrapper omits the clause. DU-002 (M0119-0004).
 	HandlerOID   uint32
 	ValidatorOID uint32
+	// DBOid is the namespace oid of the database the FDW was created in:
+	// pg_foreign_data_wrapper is per-database, so the registry is keyed by
+	// fdwKey(DBOid, Name) like the foreign-server registry (M0122-0015e; an
+	// FDW created in postgres used to show in every database and its dump).
+	DBOid uint32
 }
 
-// RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
-// sight. Idempotent: re-registering an existing name returns the existing entry
-// without changing its OID (the OPTIONS are refreshed when non-empty).
-// DU-002 slice 375 (options: slice 380).
-func (c *InMemory) RegisterForeignDataWrapper(name string, options []string) *ForeignDataWrapper {
+// fdwKey is the fdws registry key: "<dbOid>:<name>", foreignServerKey's
+// scheme. M0122-0015e.
+func fdwKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
+}
+
+// RegisterForeignDataWrapper records an FDW in dbOid's database (trailing
+// variadic, DefaultDBOid when omitted), allocating a stable OID on first
+// sight. Idempotent: re-registering an existing name returns the existing
+// entry without changing its OID (the OPTIONS are refreshed when non-empty).
+// DU-002 slice 375 (options: slice 380; per-database: M0122-0015e).
+func (c *InMemory) RegisterForeignDataWrapper(name string, options []string, dbOid ...uint32) *ForeignDataWrapper {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fdws == nil {
 		c.fdws = make(map[string]*ForeignDataWrapper)
 	}
-	if f, ok := c.fdws[name]; ok {
+	db := resolveDBOid(dbOid)
+	if f, ok := c.fdws[fdwKey(db, name)]; ok {
 		if len(options) > 0 {
 			f.Options = options
 		}
 		return f
 	}
-	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options}
-	c.fdws[name] = f
+	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options, DBOid: db}
+	c.fdws[fdwKey(db, name)] = f
 	return f
 }
 
-// DropForeignDataWrapper removes an FDW from the registry. Returns true if found.
-// DU-002 slice 375.
-func (c *InMemory) DropForeignDataWrapper(name string) bool {
+// DropForeignDataWrapper removes an FDW from dbOid's registry (DefaultDBOid
+// when omitted). Returns true if found. DU-002 slice 375.
+func (c *InMemory) DropForeignDataWrapper(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fdws == nil {
 		return false
 	}
-	if _, ok := c.fdws[name]; ok {
-		delete(c.fdws, name)
+	k := fdwKey(resolveDBOid(dbOid), name)
+	if _, ok := c.fdws[k]; ok {
+		delete(c.fdws, k)
 		return true
 	}
 	return false
 }
 
-// ListForeignDataWrappers returns all registered FDWs sorted by name.
-// DU-002 slice 375.
-func (c *InMemory) ListForeignDataWrappers() []*ForeignDataWrapper {
+// ListForeignDataWrappers returns dbOid's FDWs (DefaultDBOid when omitted)
+// sorted by name. DU-002 slice 375; per-database: M0122-0015e.
+func (c *InMemory) ListForeignDataWrappers(dbOid ...uint32) []*ForeignDataWrapper {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.fdws) == 0 {
 		return nil
 	}
+	db := resolveDBOid(dbOid)
 	out := make([]*ForeignDataWrapper, 0, len(c.fdws))
 	for _, f := range c.fdws {
-		out = append(out, f)
+		if f.DBOid == db {
+			out = append(out, f)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// ForeignDataWrapperOID returns the stable OID of the named FDW, or 0 if no such
-// FDW is registered. Used by pg_foreign_server.VirtualRows to populate srvfdw.
-// DU-002 slice 376.
-func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
+// ForeignDataWrapperOID returns the stable OID of the named FDW in dbOid's
+// database (DefaultDBOid when omitted), or 0 if no such FDW is registered.
+// Used by pg_foreign_server's rows to populate srvfdw. DU-002 slice 376.
+func (c *InMemory) ForeignDataWrapperOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if f, ok := c.fdws[name]; ok {
+	if f, ok := c.fdws[fdwKey(resolveDBOid(dbOid), name)]; ok {
 		return f.OID
 	}
 	return 0
@@ -18699,8 +19071,9 @@ func (c *InMemory) LookupForeignDataWrapperByOID(oid uint32) *ForeignDataWrapper
 }
 
 // RegisterForeignDataWrapperDuringRecovery re-registers an FDW from the
-// pg_foreign_data_wrapper heap reload with its recovered OID (B3.4 — the FDW
-// gained restart durability with this slice; it had none before). Idempotent.
+// pg_foreign_data_wrapper heap reload with its recovered OID, in the database
+// whose heap held the row (fdw.DBOid; DefaultDBOid when zero). Idempotent.
+// B3.4 (restart durability); per-database: M0122-0015e.
 func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrapper) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -18708,22 +19081,26 @@ func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrap
 		c.fdws = make(map[string]*ForeignDataWrapper)
 	}
 	out := *fdw
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
 	out.Options = append([]string(nil), fdw.Options...)
-	c.fdws[fdw.Name] = &out
+	c.fdws[fdwKey(out.DBOid, fdw.Name)] = &out
 	if fdw.OID >= c.nextOID {
 		c.nextOID = fdw.OID + 1
 	}
 }
 
-// LookupForeignDataWrapper returns the named FDW's registry entry, or
-// (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
-// (which creates-or-fetches), this is a read-only lookup — used by
-// ALTER FOREIGN DATA WRAPPER, which must error 42704 undefined_object on a
-// nonexistent name rather than silently creating one. DU-002 slice 421.
-func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, bool) {
+// LookupForeignDataWrapper returns the named FDW's registry entry in dbOid's
+// database (DefaultDBOid when omitted), or (nil, false). Unlike
+// RegisterForeignDataWrapper (which creates-or-fetches), this is a read-only
+// lookup — used by ALTER FOREIGN DATA WRAPPER, which must error 42704
+// undefined_object on a nonexistent name rather than silently creating one.
+// DU-002 slice 421; per-database: M0122-0015e.
+func (c *InMemory) LookupForeignDataWrapper(name string, dbOid ...uint32) (*ForeignDataWrapper, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	f, ok := c.fdws[name]
+	f, ok := c.fdws[fdwKey(resolveDBOid(dbOid), name)]
 	return f, ok
 }
 
@@ -19671,6 +20048,33 @@ func (c *InMemory) UnregisterForeignServerDuringRecovery(name string, dbOid ...u
 	delete(c.foreignServers, foreignServerKey(resolveDBOid(dbOid), name))
 }
 
+// PGForeignDataWrapperRowsForDBOid builds the pg_foreign_data_wrapper rows
+// of dbOid's database (a connection's real oid is normalised), mirroring
+// PGForeignServerRowsForDBOid. M0122-0015e.
+func (c *InMemory) PGForeignDataWrapperRowsForDBOid(dbOid uint32) [][]string {
+	fdws := c.ListForeignDataWrappers(NamespaceDBOid(dbOid))
+	if len(fdws) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(fdws))
+	for _, f := range fdws {
+		owner := f.Owner
+		if owner == 0 {
+			owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(f.OID), 10),          // oid
+			f.Name,                                         // fdwname
+			strconv.FormatUint(uint64(owner), 10),          // fdwowner
+			strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
+			strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
+			c.ForeignDataWrapperACLText(f.OID),             // fdwacl
+			optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
+}
+
 // PGForeignServerRowsForDBOid builds the pg_foreign_server catalog row-set
 // for dbOid's own registered servers (mirrors PGForeignTableRowsForDBOid's
 // per-connection dbOid scoping). registerSystemTables's VirtualRows closure
@@ -19694,7 +20098,7 @@ func (c *InMemory) PGForeignServerRowsForDBOid(dbOid uint32) [][]string {
 			strconv.FormatUint(uint64(s.OID), 10), // oid
 			s.Name,                                // srvname
 			strconv.FormatUint(uint64(owner), 10), // srvowner
-			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName, s.DBOid)), 10), // srvfdw
 			s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
 			s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
 			c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
@@ -20173,7 +20577,7 @@ func (c *InMemory) RegisterUserOperatorDuringRecovery(op *UserOperator, schema s
 	if c.userOperators == nil {
 		c.userOperators = make(map[string]*UserOperator)
 	}
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -20434,7 +20838,7 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 	if c.userOperatorFamilies == nil {
 		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
 	}
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -20668,7 +21072,7 @@ func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass
 	if c.userOperatorClasses == nil {
 		c.userOperatorClasses = make(map[string]*UserOperatorClass)
 	}
-	nsOID := c.schemas[strings.ToLower(schema)]
+	nsOID := c.schemaOIDAnyLocked(schema)
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
@@ -25013,6 +25417,11 @@ func formatExprForAttrdef(e parser.Expr) string {
 	if e == nil {
 		return ""
 	}
+	// A folded negative literal deparses as PG's '-N'::type (get_const_expr).
+	// Keep in sync with the executor twin executor.defaultExprToSQL.
+	if neg := parser.FoldedNegativeLiteralSQL(e); neg != "" {
+		return neg
+	}
 	switch v := e.(type) {
 	case *parser.ColumnRef:
 		// A bare column reference. PG's pg_get_expr deparses a column ref inside a
@@ -25595,19 +26004,70 @@ func (c *SearchPathCatalog) effectiveDBOid(explicit []uint32) []uint32 {
 	return []uint32{NamespaceDBOid(c.DBOid)}
 }
 
+// Routines returns the routine registry bound to the querying connection's
+// database: pg_proc is per-database, so function resolution during planning
+// must see only that database's routines. M0146-0156.
+func (c *SearchPathCatalog) Routines() *Routines {
+	return c.Catalog.Routines().InDB(c.effectiveDBOid(nil)[0])
+}
+
+// SchemaExists / SchemaOID / RegisterSchema / UnregisterSchema key off the
+// querying connection's database, as LookupTable does: user schemas are
+// per-database (pg_namespace is, in PostgreSQL). M0119-0006.
+func (c *SearchPathCatalog) SchemaExists(name string, dbOid ...uint32) bool {
+	return c.Catalog.SchemaExists(name, c.effectiveDBOid(dbOid)...)
+}
+
+func (c *SearchPathCatalog) SchemaOID(name string, dbOid ...uint32) uint32 {
+	return c.Catalog.SchemaOID(name, c.effectiveDBOid(dbOid)...)
+}
+
+func (c *SearchPathCatalog) RegisterSchema(name string, dbOid ...uint32) {
+	c.Catalog.RegisterSchema(name, c.effectiveDBOid(dbOid)...)
+}
+
+func (c *SearchPathCatalog) UnregisterSchema(name string, dbOid ...uint32) {
+	c.Catalog.UnregisterSchema(name, c.effectiveDBOid(dbOid)...)
+}
+
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
 // current search_path when the name has no explicit schema qualifier, and to
 // key the lookup off the querying connection's real database (effectiveDBOid,
 // M0122-0007 slice 4c).
+//
+// An unqualified name is RangeVarGetRelid's walk of the active search path
+// (namespace.c): the session's temporary schema and pg_catalog come first,
+// then the path's schemas in order, and the first schema holding the name
+// wins. The underlying bare-name lookup answers temp, pg_catalog and public
+// relations, so its answer stands unless a schema listed before its own
+// holds the name too — `SET search_path = s1, public` then reads s1.t, not
+// public.t (M0146-0155: a function's SET search_path depends on it). A name
+// found in no listed schema keeps the bare answer, as before.
 func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
 	dbOid = c.effectiveDBOid(dbOid)
 	tbl, ok := c.Catalog.LookupTable(name, dbOid...)
-	if !ok && name.Schema == "" && c.GetSchemas != nil {
-		for _, sc := range c.GetSchemas() {
-			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...)
-			if ok {
-				return tbl, ok
-			}
+	if name.Schema != "" || c.GetSchemas == nil {
+		return tbl, ok
+	}
+	found := ""
+	if ok {
+		if tbl.Temp {
+			return tbl, ok
+		}
+		found = strings.ToLower(tbl.Schema)
+		switch found {
+		case "pg_catalog", "information_schema":
+			return tbl, ok
+		case "":
+			found = "public"
+		}
+	}
+	for _, sc := range c.GetSchemas() {
+		if ok && strings.EqualFold(sc, found) {
+			return tbl, ok
+		}
+		if t, hit := c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...); hit {
+			return t, true
 		}
 	}
 	return tbl, ok

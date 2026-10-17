@@ -108,6 +108,53 @@ func ctxPlanCatalog(ctx *Context) catalog.Catalog {
 	return ctx.Catalog
 }
 
+// checkCreationNamespace is RangeVarGetCreationNamespace /
+// QualifiedNameGetCreationNamespace (namespace.c) for the statements that
+// create a schema-qualified object: the named schema must exist in the
+// connection's database, else get_namespace_oid's 3F000 — before any other
+// check (a TEMP table in a missing schema reports the schema, not 0A000).
+// Only a plain CREATE TABLE points at the name (PG's RangeVar location reaches
+// the error there); CREATE TABLE AS / SELECT INTO and the other kinds carry
+// none. pg_temp names the session's temporary schema and is not looked up.
+// M0119-0006.
+func (o *ddlOp) checkCreationNamespace() error {
+	schema, pos := "", 0
+	switch s := o.plan.Stmt.(type) {
+	case *parser.CreateTableStmt:
+		schema = s.Name.Schema
+		if s.SelectSource == nil {
+			pos = s.Name.Pos()
+		}
+	case *parser.CreateViewStmt:
+		schema = s.Name.Schema
+	case *parser.CreateSequenceStmt:
+		schema = s.Name.Schema
+	case *parser.CreateMatViewStmt:
+		schema = s.Name.Schema
+	case *parser.CreateFunctionStmt:
+		schema = s.Name.Schema
+	case *parser.CreateProcedureStmt:
+		schema = s.Name.Schema
+	case *parser.CreateTypeStmt:
+		schema = s.Schema
+	case *parser.CreateDomainStmt:
+		schema = s.Schema
+	}
+	return o.requireSchema(schema, pos)
+}
+
+// requireSchema raises get_namespace_oid's 3F000 when schema (non-empty, not
+// the session's pg_temp) does not exist in the connection's database.
+func (o *ddlOp) requireSchema(schema string, pos int) error {
+	if schema == "" || strings.EqualFold(schema, "pg_temp") || strings.HasPrefix(strings.ToLower(schema), "pg_temp_") {
+		return nil
+	}
+	if o.ctx.Catalog.SchemaExists(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+		return nil
+	}
+	return &ExecError{Code: "3F000", Pos: pos, Message: fmt.Sprintf("schema %q does not exist", schema)}
+}
+
 func (o *ddlOp) Schema() optimizer.Schema { return nil }
 func (o *ddlOp) Open(ctx *Context) error {
 	if ctx.Catalog == nil {
@@ -123,6 +170,9 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	if err := o.checkCreationNamespace(); err != nil {
+		return nil, err
+	}
 	switch s := o.plan.Stmt.(type) {
 	case *parser.CreateTableStmt:
 		return nil, o.execCreateTable(s)
@@ -306,7 +356,7 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	// so it survives restart and is visible on a PG standby.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		extOID := im.ExtensionOID(s.Name, o.ctx.CurrentDatabase)
-		nsOID := im.SchemaOID(schema)
+		nsOID := im.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err := writeExtensionCatalogRow(o.ctx, extOID, nsOID, s.Name, version); err != nil {
 			return fmt.Errorf("pg_extension journal: %w", err)
 		}
@@ -1549,7 +1599,7 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if o.ctx.NonSuperuserRole != "" {
 		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create access method %q", s.Name)}
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires routine registry"}
 	}
@@ -1677,6 +1727,11 @@ func resolveFDWValidatorFunc(rs *catalog.Routines, funcName parser.ObjectName) (
 			continue
 		}
 		return r.OID, nil
+	}
+	// The built-in postgresql_fdw_validator (pg_catalog) — not a user routine.
+	// M0122-0015g.
+	if oid, ok := builtinFDWValidatorOID(funcName); ok {
+		return oid, nil
 	}
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(text[], oid) does not exist", funcName.String())}
 }
@@ -2041,6 +2096,22 @@ func (o *ddlOp) touchHeapMainForkFile(tbl *catalog.Table) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) (retErr error) {
+	// CreateForeignTable / the per-column attfdwoptions: the server's
+	// wrapper validates the table options (ForeignTableRelationId) and each
+	// column's options (AttributeRelationId). M0122-0015g.
+	if s.ForeignServer != "" {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			v := fdwValidatorForServer(im, s.ForeignServer, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if verr := validateFDWOptions(v, s.ForeignOptions, fdwOptionsCatalogForeignTbl); verr != nil {
+				return verr
+			}
+			for _, c := range s.Columns {
+				if verr := validateFDWOptions(v, c.FDWOptions, fdwOptionsCatalogAttribute); verr != nil {
+					return verr
+				}
+			}
+		}
+	}
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
 	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
@@ -4080,7 +4151,8 @@ afterExistsCheck:
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -5248,7 +5320,8 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		}
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 		// Register ON COMMIT {DELETE ROWS|DROP} for the commit-time pass.
 		// Mirrors DefineRelation → register_on_commit_action (tablecmds.c:19261).
 		// The 42P16 guard at the top of this function already rejected a
@@ -5530,7 +5603,8 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	}
 	// Record for rollback.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -6046,6 +6120,11 @@ func binaryOpSymbolForDefault(op parser.OpCode) string {
 func defaultExprToSQL(e parser.Expr) string {
 	if e == nil {
 		return ""
+	}
+	// A folded negative literal deparses as PG's '-N'::type (get_const_expr).
+	// Keep in sync with the catalog twin catalog.formatExprForAttrdef.
+	if neg := parser.FoldedNegativeLiteralSQL(e); neg != "" {
+		return neg
 	}
 	switch v := e.(type) {
 	case *parser.IntegerConst:
@@ -6861,18 +6940,8 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	// this the file leaks on every drop. DropRelation's os.IsNotExist guard
 	// makes this safe to call even for a never-materialized (WITH NO DATA)
 	// or restart-downgraded-to-virtual matview that has no backing file yet.
-	rel := o.ctx.Catalog.RelFileNode(tbl)
-	o.ctx.Pool.InvalidateRel(rel)
-	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-		return &ExecError{Code: "XX000", Message: err.Error()}
-	}
-	if o.ctx.FSM != nil {
-		o.ctx.FSM.DropRelation(rel)
-	}
-	if o.ctx.VM != nil {
-		o.ctx.VM.DropRelation(rel)
-	}
-	return nil
+	// The removal waits for commit (dropRelationStorage).
+	return dropRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)
 }
 
 // viewsDependingOnView returns all views whose body directly references the given view name.
@@ -7248,7 +7317,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 							return err
 						}
 					} else if d.kind == "function" && d.routine != nil {
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							_ = rs.DropRoutine(d.routine)
 						}
 					}
@@ -7565,8 +7634,8 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// M0097-0023.
 	dropName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
 	// Record the drop for ROLLBACK TO SAVEPOINT if we're inside a savepoint.
-	// The physical deletion is idempotent (os.IsNotExist guard in DropRelation),
-	// so restoring only the catalog entry is sufficient. M0097-0023.
+	// Restoring the catalog entry is sufficient: the storage is only removed
+	// if the dropping subtransaction commits (dropRelationStorage). M0097-0023.
 	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() && bsess.SavepointDepth() > 0 {
 		bsess.RecordDDLDrop(DDLDropUndoEntry{
 			Table:          tbl,
@@ -7588,20 +7657,14 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
 	restoreTempShadow(o.ctx, strings.ToLower(name.Name))
-	o.ctx.Pool.InvalidateRel(rel)
-	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-		return &ExecError{Code: "XX000", Message: err.Error()}
-	}
-	if o.ctx.FSM != nil {
-		o.ctx.FSM.DropRelation(rel)
-	}
-	if o.ctx.VM != nil {
-		o.ctx.VM.DropRelation(rel)
+	// The table's and its indexes' storage is removed at commit
+	// (dropRelationStorage), so a rolled-back DROP keeps the data.
+	if err := dropRelationStorage(o.ctx, rel, true); err != nil {
+		return err
 	}
 	for _, idxRel := range idxRels {
-		o.ctx.Pool.InvalidateRel(idxRel)
-		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
-			return &ExecError{Code: "XX000", Message: err.Error()}
+		if err := dropRelationStorage(o.ctx, idxRel, false); err != nil {
+			return err
 		}
 	}
 	// M0106-0011: DROP TABLE removes pg_class / pg_attribute / pg_index rows
@@ -7685,7 +7748,7 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 	if len(drops) == 0 {
 		return
 	}
-	rs := ctx.Catalog.Routines()
+	rs := routineRegistry(ctx)
 	for _, d := range drops {
 		if d.Routine == nil {
 			continue
@@ -8291,9 +8354,11 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		}
 		flagInval = true
 		droppedOIDs = append(droppedOIDs, dropOID)
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := dropRelationStorage(o.ctx, rel, false); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
 		}
 		// B5 Slice A: RecordKindDropIndex(21) retired — the index's pg_class row
 		// is xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged),
@@ -8360,8 +8425,7 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 		flagInval = true
 		droppedOIDs = append(droppedOIDs, d.OID)
 		if ctx.Pool != nil {
-			ctx.Pool.InvalidateRel(d.Rel)
-			_ = ctx.Pool.Manager().DropRelation(d.Rel)
+			_ = dropRelationStorage(ctx, d.Rel, false)
 			// B5 Slice A: RecordKindDropIndex(21) retired — the pg_class row is
 			// xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged).
 		}
@@ -8857,6 +8921,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return nil
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		// AlterTableNamespace resolves the relation first, then the target
+		// namespace (LookupCreationNamespace → get_namespace_oid's 3F000).
+		if err := o.requireSchema(s.SetSchema, 0); err != nil {
+			return err
 		}
 		oldSchema, oldBare := tbl.Schema, tbl.Name
 		tbl.Schema = s.SetSchema
@@ -11141,6 +11210,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if mergeErr != nil {
 						return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
 					}
+					if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+						v := fdwValidatorForServer(im, tbl.ForeignServerName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+						if verr := validateFDWOptions(v, merged, fdwOptionsCatalogAttribute); verr != nil {
+							return verr
+						}
+					}
 					tbl.Columns[i].FDWOptions = merged
 					found = true
 					break
@@ -11175,6 +11250,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			merged, mergeErr := applyFDWOptionChanges(tbl.ForeignOptions, act.FDWOptionChanges)
 			if mergeErr != nil {
 				return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+			}
+			// AlterTableCmd's ATExecGenericOptions: the server's wrapper
+			// validates the merged table options. M0122-0015g.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				v := fdwValidatorForServer(im, tbl.ForeignServerName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				if verr := validateFDWOptions(v, merged, fdwOptionsCatalogForeignTbl); verr != nil {
+					return verr
+				}
 			}
 			tbl.ForeignOptions = merged
 		case parser.AlterTableSetDefault:
@@ -14573,7 +14656,8 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	// re-emits ` WHERE (pred)` on dump (no enforcement in v0). DU-002 slice 310.
 	applyExclusionPredicate(idx, ec.ExclusionWhere)
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.IndexRelFileNode(idx), false)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
@@ -14817,7 +14901,8 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	// Record for rollback before heap sync (index is live in catalog now).
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.IndexRelFileNode(idx), false)})
 	}
 	o.indexUpdateHeapStats(tbl, o.buildHeapTuples)
 	if catalogHeapSyncAvailable(o.ctx) {
@@ -14849,9 +14934,10 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 //     autovacuum_enabled reloption is not false — a dump restore may have
 //     loaded statistics the user expects to keep.
 //
-// relallvisible needs no write: goopg reads it live from the VM. Published
-// and persisted exactly as VACUUM does (UpdateRelStats + persistRelSize);
-// a failed size write is non-fatal, as there.
+// relallvisible is counted from the visibility map and stored, as
+// index_update_stats does (visibilitymap_count; M0146-0216). Published and
+// persisted exactly as VACUUM does (UpdateRelStats + persistRelSize); a failed
+// size write is non-fatal, as there.
 func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
 	if tbl == nil || tbl.PartitionMethod != "" {
 		return
@@ -14867,6 +14953,7 @@ func (o *ddlOp) indexUpdateHeapStats(tbl *catalog.Table, reltuples float64) {
 		return
 	}
 	o.ctx.Catalog.UpdateRelStats(tbl, int(nBlocks), int64(reltuples))
+	snapshotRelAllVisible(o.ctx, tbl, int(nBlocks))
 	_ = persistRelSize(o.ctx, tbl, int64(reltuples), int(nBlocks))
 }
 
@@ -17210,10 +17297,104 @@ func argTypeOID(a parser.ColumnType) uint32 {
 // verbatim — the PL/pgSQL parser/interpreter that executes it
 // arrives in step 4+. Stage A pins LANGUAGE to plpgsql or sql;
 // other languages surface a typed diagnostic.
+// checkDuplicateParamNames is interpret_function_parameter_list's name rule
+// (functioncmds.c): two input parameters, or two output parameters, may not
+// share a name — 42P13 "parameter name "a" used more than once", at the
+// second one. A pure input (IN / VARIADIC) and a pure output (OUT, RETURNS
+// TABLE column) may. Without it the duplicate-name definitions polymorphism.sql
+// expects to fail were created, and a later testpolym(37) call resolved
+// against them (M0146-0084).
+func checkDuplicateParamNames(args []parser.FunctionArg) error {
+	isIn := func(m parser.FuncArgMode) bool { return m == parser.FuncArgIn || m == parser.FuncArgVariadic }
+	isOut := func(m parser.FuncArgMode) bool { return m == parser.FuncArgOut }
+	for i, fp := range args {
+		if fp.Name == "" {
+			continue
+		}
+		for _, prev := range args[:i] {
+			if (isIn(fp.Mode) && isOut(prev.Mode)) || (isIn(prev.Mode) && isOut(fp.Mode)) {
+				continue
+			}
+			if prev.Name != "" && prev.Name == fp.Name {
+				return &ExecError{Code: "42P13", Pos: fp.Pos(),
+					Message: fmt.Sprintf("parameter name %q used more than once", fp.Name)}
+			}
+		}
+	}
+	return nil
+}
+
+// resolveOutParamReturnType applies interpret_function_parameter_list's
+// requiredResultType and CreateFunction's check of it
+// (postgres/src/backend/commands/functioncmds.c). With output parameters
+// (OUT, INOUT) the result type is the single output's type, or record for
+// several. An omitted RETURNS takes it; a RETURNS that differs is rejected.
+// Without output parameters, RETURNS is required. Both errors carry no
+// position, as in PG. RETURNS TABLE keeps its parsed SETOF record
+// (M0146-0165).
+func resolveOutParamReturnType(s *parser.CreateFunctionStmt) error {
+	if s.ReturnsTable {
+		return nil
+	}
+	var outs []parser.ColumnType
+	for _, a := range s.Args {
+		if a.Mode == parser.FuncArgOut || a.Mode == parser.FuncArgInout {
+			outs = append(outs, a.Type)
+		}
+	}
+	if len(outs) == 0 {
+		if s.ReturnType.Name == "" {
+			return &ExecError{Code: "42P13", Message: "function result type must be specified"}
+		}
+		return nil
+	}
+	required := parser.ColumnType{Name: "record"}
+	if len(outs) == 1 {
+		required = outs[0]
+	}
+	if s.ReturnType.Name == "" {
+		s.ReturnType = required
+		return nil
+	}
+	if !sameRoutineType(s.ReturnType, required) {
+		return &ExecError{Code: "42P13", Message: fmt.Sprintf(
+			"function result type must be %s because of OUT parameters",
+			canonicalTypeName(routineArgTypeName(required), charTypeOID(required)))}
+	}
+	return nil
+}
+
+// sameRoutineType reports whether two parsed type names denote the same type,
+// by pg_type OID when both resolve and by name otherwise.
+func sameRoutineType(a, b parser.ColumnType) bool {
+	an, bn := strings.ToLower(routineArgTypeName(a)), strings.ToLower(routineArgTypeName(b))
+	ao, bo := catalog.TypeNameToOID(an), catalog.TypeNameToOID(bn)
+	if co := charTypeOID(a); co != 0 {
+		ao = co
+	}
+	if co := charTypeOID(b); co != 0 {
+		bo = co
+	}
+	if ao != 0 && bo != 0 {
+		return ao == bo
+	}
+	return an == bn
+}
+
 func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
+	}
+	if err := checkDuplicateParamNames(s.Args); err != nil {
+		return err
+	}
+	if err := resolveOutParamReturnType(s); err != nil {
+		return err
+	}
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
 	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
@@ -17296,7 +17477,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	// Validate SQL function body when check_function_bodies=on (default).
 	if lang == "sql" && !s.BeginAtomic {
-		if err := o.validateSQLFunctionBody(s, len(s.Args)); err != nil {
+		// $n numbers the input parameters only (M0146-0165).
+		nIn := 0
+		for _, a := range s.Args {
+			if a.Mode != parser.FuncArgOut {
+				nIn++
+			}
+		}
+		if err := o.validateSQLFunctionBody(s, nIn); err != nil {
 			return err
 		}
 	}
@@ -17348,8 +17536,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Cost:            s.Cost,
 		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
+		Owner:           o.currentDDLOwnerOID(),
 		Leakproof:       s.Leakproof,
-		Config:          catalog.ApplyFunctionConfigOps(nil, s.ConfigOps),
+		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}
 	// Extract dependency information for information_schema views (SQL functions only).
 	if lang == "sql" {
@@ -17512,7 +17701,11 @@ func (o *ddlOp) validateSQLFunctionBody(s *parser.CreateFunctionStmt, nArgs int)
 		last := stmts[len(stmts)-1]
 		switch l := last.(type) {
 		case *parser.SelectStmt:
-			if !s.ReturnsSet {
+			// A record or composite result takes several columns
+			// (check_sql_fn_retval); only a scalar result is checked here.
+			rowResult := retTypeRaw == "record" ||
+				(o.ctx.Catalog != nil && len(o.ctx.Catalog.LookupCompositeTypeFields(retTypeRaw)) > 0)
+			if !s.ReturnsSet && !rowResult {
 				// Check column count for scalar returns.
 				nTargets := len(l.Targets)
 				if l.ValuesRows != nil && len(l.Targets) == 0 {
@@ -17817,9 +18010,13 @@ func checkBodyOperatorTypes(stmts []parser.Stmt, args []parser.FunctionArg, func
 }
 
 func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return nil // no routine registry, silently skip
+	}
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
 	}
 	var argTypes []catalog.Type
 	for _, a := range s.Args {
@@ -17964,8 +18161,8 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		// RENAME/OWNER/SET SCHEMA above (those are genuinely separate
 		// top-level grammar productions, not combinable). DU-002 proconfig
 		// follow-up to M0097-0150.
-		if len(s.ConfigOps) > 0 {
-			r.Config = catalog.ApplyFunctionConfigOps(r.Config, s.ConfigOps)
+		if len(configOps) > 0 {
+			r.Config = catalog.ApplyFunctionConfigOps(r.Config, configOps)
 		}
 		// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
 		// resume point): log the full post-mutation snapshot of the four
@@ -17986,9 +18183,16 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 // Routines() registry (M0015 Stage B). Mirror of execCreateFunction
 // but without RETURNS — procedures use OUT/INOUT params instead.
 func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
+	}
+	if err := checkDuplicateParamNames(s.Args); err != nil {
+		return err
+	}
+	configOps, err := flattenFunctionConfigOps(o.ctx, s.Pos(), s.ConfigOps)
+	if err != nil {
+		return err
 	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
@@ -18080,7 +18284,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	// Validate SQL body: check if a CALL targets a procedure with output args.
 	// PG rejects this at function-creation time for SQL functions.
 	if lang == "sql" && !s.BeginAtomic && s.Body != "" {
-		if rs := o.ctx.Catalog.Routines(); rs != nil {
+		if rs := routineRegistry(o.ctx); rs != nil {
 			bodyStmts, _ := parser.Parse(s.Body)
 			for _, stmt := range bodyStmts {
 				call, ok := stmt.(*parser.CallStmt)
@@ -18125,7 +18329,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		BeginAtomic:     s.BeginAtomic,
 		IsProcedure:     true,
 		SecurityDefiner: s.SecurityDefiner,
+		Owner:           o.currentDDLOwnerOID(),
 		Volatile:        "v", // procedures default to volatile
+		Config:          catalog.ApplyFunctionConfigOps(nil, configOps),
 	}
 	created, err := rs.Create(r, s.OrReplace)
 	if err != nil {
@@ -18166,7 +18372,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if objKind == "" {
 		objKind = "procedure"
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
 	}
@@ -18298,7 +18504,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		for _, a := range s.Args {
 			argTypeName := a.Type.Name
 			if a.Type.Schema != "" {
-				if !o.ctx.Catalog.SchemaExists(a.Type.Schema) {
+				if !o.ctx.Catalog.SchemaExists(a.Type.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", a.Type.Schema))
 					return nil
 				}
@@ -18313,7 +18519,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			}
 		}
 	}
-	rs := o.ctx.Catalog.Routines()
+	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
 	}
@@ -19048,7 +19254,7 @@ func tableCatalogDBOids(ctx *Context) []uint32 {
 // carries a relnamespace that the restart-recovery path can reverse-map back to
 // the schema name — M0110-0003). An unregistered or nil-catalog schema falls
 // back to pg_catalog, preserving the pre-M0110-0003 behaviour.
-func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
+func namespaceOIDForSchema(cat catalog.Catalog, schema string, dbOid ...uint32) uint32 {
 	if schema == "" || schema == "public" {
 		return catalog.PublicNamespaceOID
 	}
@@ -19056,7 +19262,7 @@ func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 		return catalog.PGCatalogNamespaceOID
 	}
 	if cat != nil {
-		if oid := cat.SchemaOID(schema); oid != 0 {
+		if oid := cat.SchemaOID(schema, dbOid...); oid != 0 {
 			return oid
 		}
 	}
@@ -19195,7 +19401,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
@@ -19206,7 +19412,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	if err := writeForeignTableCatalogRow(ctx, tbl); err != nil {
 		return fmt.Errorf("pg_foreign_table: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	// B0.3 (doc 02a §4): index entries route to the SAME database as the
 	// heap rows — insertCanonicalSysBtreeLeaf resolves the dbOid via
 	// tableCatalogHeapDBOid, and a distinct-dbOid database has its own
@@ -19534,11 +19740,11 @@ func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class reloptions resync for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index resync for index: %w", err)
 	}
@@ -19633,11 +19839,11 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index for index: %w", err)
 	}
@@ -20709,11 +20915,20 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if !transam.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.CmdID, ctx.comboStore(), ctx.MultiXact) {
 				continue
 			}
-			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
-			// M0146-0063b: an index-only scan over the refreshed matview
-			// must not take these deleted rows' pages as all-visible.
-			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+			if serr := storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID); serr != nil {
+				continue
+			}
+			// Dirty the page and WAL-log the delete, as heap_delete does.
+			// The stamp alone left the buffer clean: no checkpoint wrote it,
+			// so after a restart every pre-REFRESH row not on a page the
+			// re-population happened to dirty came back alongside the new
+			// rows (M0146-0089). The VM clear inside keeps an index-only
+			// scan over the refreshed matview from taking these pages as
+			// all-visible (M0146-0063b).
+			if derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, nil); derr != nil {
+				s.Unlock()
+				ctx.Pool.Unpin(s)
+				return derr
 			}
 		}
 		s.Unlock()
@@ -20798,7 +21013,8 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	// the plain-view path (vt.ViewDef = s.RawDef). M0110-0001 (DU-002 slice 60).
 	tbl.ViewDef = s.RawDef
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
-		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false,
+			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
@@ -21032,7 +21248,7 @@ func (o *ddlOp) dropSchemaQualifiedNotice(name parser.ObjectName) bool {
 	if name.Schema == "" {
 		return false
 	}
-	if !o.ctx.Catalog.SchemaExists(name.Schema) {
+	if !o.ctx.Catalog.SchemaExists(name.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", name.Schema))
 		return true
 	}
@@ -21073,7 +21289,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				schemaName = name.Schema + "." + name.Name
 			}
 			// Use schema registry when available. If registered → exists (even if empty).
-			schemaRegistered := o.ctx.Catalog.SchemaExists(schemaName)
+			schemaRegistered := o.ctx.Catalog.SchemaExists(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			tables := o.ctx.Catalog.TablesInSchema(schemaName)
 			if s.IfExists && !schemaRegistered {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
@@ -21093,11 +21309,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return fmt.Errorf("drop-schema catalog heap: %w", err)
 				}
 			}
-			o.ctx.Catalog.UnregisterSchema(schemaName)
+			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
-				rs := o.ctx.Catalog.Routines()
+				rs := routineRegistry(o.ctx)
 				if rs != nil {
 					dropDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 					for _, r := range rs.List() {
@@ -21162,8 +21378,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE with total cascade count.
-				if total > 0 {
+				// Emit NOTICE with total cascade count. reportDependentObjects
+				// (dependency.c) reports a single object in the message itself
+				// with no DETAIL (numReportedClient == 1): `drop cascades to
+				// table sa.t`, not `drop cascades to 1 other objects`.
+				if total == 1 && len(detailLines) == 1 {
+					o.ctx.AddNotice(detailLines[0])
+				} else if total > 0 {
 					detail := strings.Join(detailLines, "\n")
 					o.ctx.AddNoticeWithDetail(
 						fmt.Sprintf("drop cascades to %d other objects", total),
@@ -21274,7 +21495,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if idx := strings.LastIndex(toType, "."); idx >= 0 {
 			toSchema = toType[:idx]
 		}
-		if fromSchema != "" && !o.ctx.Catalog.SchemaExists(fromSchema) {
+		if fromSchema != "" && !o.ctx.Catalog.SchemaExists(fromSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", fromSchema))
 				return nil
@@ -21282,7 +21503,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return &ExecError{Code: "3F000", Pos: s.Pos(),
 				Message: fmt.Sprintf("schema %q does not exist", fromSchema)}
 		}
-		if toSchema != "" && !o.ctx.Catalog.SchemaExists(toSchema) {
+		if toSchema != "" && !o.ctx.Catalog.SchemaExists(toSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", toSchema))
 				return nil
@@ -21579,7 +21800,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if len(funcDeps) == 1 {
 					dn := routineCascadeDisplayName(funcDeps[0])
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
-					if rs := o.ctx.Catalog.Routines(); rs != nil {
+					if rs := routineRegistry(o.ctx); rs != nil {
 						_ = rs.DropRoutine(funcDeps[0])
 					}
 				} else if len(funcDeps) > 1 {
@@ -21587,7 +21808,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					for i, r := range funcDeps {
 						dn := routineCascadeDisplayName(r)
 						detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							_ = rs.DropRoutine(r)
 						}
 					}
@@ -21711,7 +21932,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 		}
 		// Schema-qualified with non-existent schema.
-		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema) {
+		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", aggName.Schema))
 				return nil
@@ -21736,7 +21957,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// Check if arg type schema doesn't exist.
 				if idx := strings.LastIndex(argType, "."); idx >= 0 {
 					argSchema := argType[:idx]
-					if !o.ctx.Catalog.SchemaExists(argSchema) {
+					if !o.ctx.Catalog.SchemaExists(argSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						if s.IfExists {
 							o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", argSchema))
 							return nil
@@ -21787,7 +22008,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		rightType := s.ArgTypes[1]
 
 		// Schema-qualified operator name with non-existent schema.
-		if opNameObj.Schema != "" && !o.ctx.Catalog.SchemaExists(opNameObj.Schema) {
+		if opNameObj.Schema != "" && !o.ctx.Catalog.SchemaExists(opNameObj.Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", opNameObj.Schema))
 				return nil
@@ -21800,7 +22021,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		checkTypeSchema := func(t string) (schemaErr bool) {
 			if idx := strings.LastIndex(t, "."); idx >= 0 {
 				argSchema := t[:idx]
-				if !o.ctx.Catalog.SchemaExists(argSchema) {
+				if !o.ctx.Catalog.SchemaExists(argSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					if s.IfExists {
 						o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", argSchema))
 					}
@@ -22105,10 +22326,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				fdwName := s.Names[0].String()
 				// B3.4: capture the FDW's heap-row OID before the drop.
 				var fdwOID uint32
-				if fdw, found := im.LookupForeignDataWrapper(fdwName); found && fdw != nil {
+				if fdw, found := im.LookupForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); found && fdw != nil {
 					fdwOID = fdw.OID
 				}
-				if im.DropForeignDataWrapper(fdwName) {
+				if im.DropForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
 						// M0122-0007 foreign-server registry restart-durability
@@ -22475,7 +22696,7 @@ func (o *ddlOp) resolveOperatorRef(ref parser.ObjectName, otherLeft, otherRight,
 		otherLeft == ownLeft && otherRight == ownRight {
 		return 0, true
 	}
-	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
+	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if otherNsOID == 0 {
 		otherNsOID = ownNsOID
 	}
@@ -22737,7 +22958,15 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// target FDW must already exist. DU-002 slice 421.
 	if s.Tag == "ALTER FOREIGN DATA WRAPPER" && s.ObjType == "foreign-data wrapper" {
 		fdwName := s.ObjName.String()
-		fdw, found := im.LookupForeignDataWrapper(fdwName)
+		// AlterForeignDataWrapper: superuser only, checked before the lookup
+		// (foreigncmds.c) — the same SUPERUSER-attribute test CREATE uses.
+		// M0122-0015g.
+		if role := o.ctx.NonSuperuserRole; role != "" {
+			if oid, ok := im.RoleOID(role); !ok || !im.IsSuperuser(oid) {
+				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to alter foreign-data wrapper %q", fdwName), Hint: "Must be superuser to alter a foreign-data wrapper."}
+			}
+		}
+		fdw, found := im.LookupForeignDataWrapper(fdwName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
@@ -22748,33 +22977,62 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// def_list_append_merge OPTIONS pass). *Given false means the clause
 		// was absent — leave the existing OID unchanged; Given true with a nil
 		// Func means `NO HANDLER`/`NO VALIDATOR` — clear it.
+		handlerOID, validatorOID := fdw.HandlerOID, fdw.ValidatorOID
 		if s.FDWHandlerGiven {
 			if s.FDWHandlerFunc == nil {
-				fdw.HandlerOID = 0
+				handlerOID = 0
 			} else if oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc); rerr != nil {
 				return rerr
 			} else {
-				fdw.HandlerOID = oid
+				handlerOID = oid
 			}
 		}
 		if s.FDWValidatorGiven {
 			if s.FDWValidatorFunc == nil {
-				fdw.ValidatorOID = 0
+				validatorOID = 0
 			} else if oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc); rerr != nil {
 				return rerr
 			} else {
-				fdw.ValidatorOID = oid
+				validatorOID = oid
+				// AlterForeignDataWrapper: existing options of the wrapper
+				// and its dependents may not satisfy the new validator.
+				o.ctx.AddWarning("changing the foreign-data wrapper validator can cause the options for dependent objects to become invalid")
 			}
 		}
 		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
 		if mergeErr != nil {
 			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
 		}
+		// AlterForeignDataWrapper runs the (possibly new) validator over the
+		// merged options when an OPTIONS clause is given, before anything is
+		// stored. M0122-0015g.
+		if len(s.FDWOptionChanges) > 0 {
+			if verr := validateFDWOptions(validatorOID, merged, fdwOptionsCatalogWrapper); verr != nil {
+				return verr
+			}
+		}
+		fdw.HandlerOID, fdw.ValidatorOID = handlerOID, validatorOID
 		fdw.Options = merged
 		return nil
 	}
 	switch s.ObjType {
 	case "server":
+		// CreateForeignServer (foreigncmds.c) resolves the wrapper with
+		// GetForeignDataWrapperByName, which raises 42704 when it does not
+		// exist — in the connection's database, since pg_foreign_data_wrapper
+		// is per-database. goopg used to register the server against any name.
+		// M0122-0015e.
+		if s.TableName.Name != "" {
+			fdw, found := im.LookupForeignDataWrapper(s.TableName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			if !found {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.TableName.String())}
+			}
+			// transformGenericOptions(ForeignServerRelationId, ...,
+			// fdw->fdwvalidator). M0122-0015g.
+			if verr := validateFDWOptions(fdw.ValidatorOID, s.Options, fdwOptionsCatalogServer); verr != nil {
+				return verr
+			}
+		}
 		// Register server so DROP SERVER can succeed.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		// If the server references a FDW, store the association for DROP FDW CASCADE.
@@ -22826,7 +23084,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create foreign-data wrapper %q", s.ObjName.String()), Hint: "Must be superuser to create a foreign-data wrapper."}
 			}
 		}
-		if _, found := im.LookupForeignDataWrapper(s.ObjName.String()); found {
+		if _, found := im.LookupForeignDataWrapper(s.ObjName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); found {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: fmt.Sprintf("foreign-data wrapper %q already exists", s.ObjName.String())}
 		}
 		var handlerOID, validatorOID uint32
@@ -22844,7 +23102,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 			validatorOID = oid
 		}
-		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		// CreateForeignDataWrapper: transformGenericOptions over the wrapper's
+		// own options with its validator. M0122-0015g.
+		if verr := validateFDWOptions(validatorOID, s.Options, fdwOptionsCatalogWrapper); verr != nil {
+			return verr
+		}
+		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		fdw.HandlerOID = handlerOID
 		fdw.ValidatorOID = validatorOID
 		// B3.4: the FDW gains restart durability here (it had none before) —
@@ -22867,6 +23130,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// (M0122-0007 4e follow-up 38) instead of round-tripping the literal
 		// keyword text.
 		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+		// CreateUserMapping validates the options with the server's wrapper's
+		// validator (UserMappingRelationId). M0122-0015g.
+		if verr := validateFDWOptions(fdwValidatorForServer(im, s.TableName.String(), umDBOid), s.Options, fdwOptionsCatalogUserMapping); verr != nil {
+			return verr
+		}
 		umUser := o.resolveUserMappingRoleName(s.ObjName.String())
 		um := im.RegisterUserMapping(umUser, s.TableName.String(), s.Options, umDBOid)
 		// B3.4: the mapping journals as a real pg_user_mapping heap row +
@@ -22926,9 +23194,9 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 
 			// OperatorValidateParams (operatorcmds.c): commutator/join
@@ -23068,9 +23336,9 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if schema == "" {
 			schema = "public"
 		}
-		nsOID := o.ctx.Catalog.SchemaOID(schema)
+		nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if nsOID == 0 {
-			nsOID = o.ctx.Catalog.SchemaOID("public")
+			nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// B2.2 slice 5 (doc 02d §1): the family journals as a real
@@ -23186,7 +23454,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if schemaName != "" {
-			im.RegisterSchema(schemaName)
+			// CreateSchemaCommand (schemacmds.c): an existing name is
+			// NamespaceCreate's 42P06, or with IF NOT EXISTS a NOTICE and
+			// nothing else. RegisterSchema used to treat it as a no-op,
+			// so a duplicate CREATE SCHEMA "succeeded". M0119-0006.
+			if im.SchemaExists(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
+				if s.IfNotExists {
+					o.ctx.AddNotice(fmt.Sprintf("schema %q already exists, skipping", schemaName))
+					return nil
+				}
+				return &ExecError{Code: "42P06", Message: fmt.Sprintf("schema %q already exists", schemaName)}
+			}
+			im.RegisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			// B1.1 (doc 02c §1): persist the schema PG-style — a real
 			// pg_namespace heap INSERT + index entries (the WAL stream
 			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
@@ -23194,10 +23473,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// generic heap reload. Replaces the bespoke
 			// RecordKindCreateSchema record (M0110-0003, retired).
 			if o.ctx.Pool != nil {
-				oid := im.SchemaOID(schemaName)
-				owner := im.SchemaOwnerOID(schemaName)
+				oid := im.SchemaOID(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				owner := im.SchemaOwnerOID(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if err := syncSchemaToCatalogHeap(o.ctx, im, schemaName, oid, owner); err != nil {
-					im.UnregisterSchema(schemaName)
+					im.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}
@@ -24351,7 +24630,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
 		// ON SCHEMA was silently swallowed and never reached pg_description, so
 		// pg_dump could not re-emit it. DU-002 slice 145.
-		oid := im.SchemaOID(s.ObjName.Name)
+		oid := im.SchemaOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "3F000", Pos: s.Pos(),
 				Message: fmt.Sprintf("schema %q does not exist", s.ObjName.Name)}
@@ -24390,7 +24669,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// catalogId (tableoid=pg_foreign_data_wrapper=2328) and objsubid 0, then
 		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. DU-002
 		// slice 387.
-		oid := im.ForeignDataWrapperOID(s.ObjName.Name)
+		oid := im.ForeignDataWrapperOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.ObjName.Name)}
@@ -24826,13 +25105,13 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 	}
 	switch s.Action {
 	case "rename":
-		if !im.SchemaExists(s.Name) {
+		if !im.SchemaExists(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
-		if im.SchemaExists(s.NewName) {
+		if im.SchemaExists(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "42P06", Pos: s.Pos(), Message: fmt.Sprintf("schema %q already exists", s.NewName)}
 		}
-		moved, err := im.RenameSchema(s.Name, s.NewName)
+		moved, err := im.RenameSchema(s.Name, s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -24840,8 +25119,8 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		// (xl_heap_update; nspname is indexed → fresh entries in BOTH
 		// indexes), replacing RecordKindAlterSchemaRename (retired).
 		if o.ctx.Pool != nil {
-			oid := im.SchemaOID(s.NewName)
-			owner := im.SchemaOwnerOID(s.NewName)
+			oid := im.SchemaOID(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+			owner := im.SchemaOwnerOID(s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.NewName, oid, owner); err != nil {
 				return fmt.Errorf("alter-schema-rename catalog heap: %w", err)
 			}
@@ -24887,13 +25166,13 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !im.SetSchemaOwner(s.Name, ownerOID) {
+		if !im.SetSchemaOwner(s.Name, ownerOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
 		// B1.1: journal the owner change as a pg_namespace heap UPDATE
 		// (xl_heap_update), replacing RecordKindAlterSchemaOwner (retired).
 		if o.ctx.Pool != nil {
-			oid := im.SchemaOID(s.Name)
+			oid := im.SchemaOID(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.Name, oid, ownerOID); err != nil {
 				return fmt.Errorf("alter-schema-owner catalog heap: %w", err)
 			}
@@ -25053,7 +25332,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		ffLower := strings.ToLower(s.FinalFunc)
 		found := knownBuiltinAggFinalFuncs[ffLower]
 		if !found {
-			if rs := o.ctx.Catalog.Routines(); rs != nil {
+			if rs := routineRegistry(o.ctx); rs != nil {
 				if candidates := rs.LookupByName(parser.ObjectName{Name: s.FinalFunc}); len(candidates) > 0 {
 					found = true
 				}
@@ -25081,7 +25360,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	// Check if the sfunc is STRICT by looking it up in the routine registry.
 	// A strict sfunc skips NULL inputs (the aggregate state is unchanged on NULL rows). M0097-0035.
-	if rs := o.ctx.Catalog.Routines(); rs != nil && s.SFunc != "" {
+	if rs := routineRegistry(o.ctx); rs != nil && s.SFunc != "" {
 		sfuncName := parser.ObjectName{Name: s.SFunc}
 		if candidates := rs.LookupByName(sfuncName); len(candidates) > 0 {
 			agg.SFuncStrict = candidates[0].Strict
@@ -25095,9 +25374,9 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
@@ -25199,9 +25478,9 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	inTypeOID := catalog.TypeNameToOID(s.ForType)
 	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
@@ -25621,9 +25900,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			rt.NamespaceOID = nsOID
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
@@ -25666,9 +25945,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if nsOID == 0 {
-				nsOID = o.ctx.Catalog.SchemaOID("public")
+				nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			ct.NamespaceOID = nsOID
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
@@ -25722,9 +26001,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				if schema == "" {
 					schema = "public"
 				}
-				nsOID := o.ctx.Catalog.SchemaOID(schema)
+				nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if nsOID == 0 {
-					nsOID = o.ctx.Catalog.SchemaOID("public")
+					nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				}
 				ct.NamespaceOID = nsOID
 			}
@@ -25744,9 +26023,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	et.NamespaceOID = nsOID
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
@@ -26298,9 +26577,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	nsOID := o.ctx.Catalog.SchemaOID(schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if nsOID == 0 {
-		nsOID = o.ctx.Catalog.SchemaOID("public")
+		nsOID = o.ctx.Catalog.SchemaOID("public", catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	d.NamespaceOID = nsOID
 	// Resolve a user-defined enum base type's dynamically-allocated OID and

@@ -208,6 +208,27 @@ func (v *VisibilityMap) ClearAllFrozen(rel RelFileNode, blk BlockNumber) {
 	v.logChange(rel, blk, VMWALClearFrozenOnly)
 }
 
+// TruncateRel forgets the bits for blocks at or beyond nblocks, as
+// visibilitymap_prepare_truncate does when a heap is truncated: a stale
+// all-visible bit past the new end would over-report relallvisible, and a
+// re-extended block would inherit bits belonging to removed pages. No WAL
+// hook is needed — the heap's own truncate record precedes the change, and
+// its redo truncates the on-disk _vm fork (smgr_redo's SMGR_TRUNCATE_VM arm).
+// Nil-safe.
+func (v *VisibilityMap) TruncateRel(rel RelFileNode, nblocks BlockNumber) {
+	if v == nil {
+		return
+	}
+	key := vmKeyFor(rel)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	pages := v.pages[key]
+	if int(nblocks) >= len(pages) {
+		return
+	}
+	v.pages[key] = pages[:nblocks]
+}
+
 // DropRelation removes all VM entries for rel. Called on DROP TABLE / TRUNCATE
 // to prevent stale visibility bits from being returned for future relations
 // with the same OID.

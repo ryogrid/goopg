@@ -48,7 +48,7 @@ func compositeIndexCatalog(t *testing.T) catalog.Catalog {
 func TestCompositeIndexLeadingColumnEqualityPicked(t *testing.T) {
 	cat := compositeIndexCatalog(t)
 	stmt := parseOne(t, "SELECT ps_partkey FROM partsupp WHERE ps_partkey = 42")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestCompositeIndexNonLeadingColumnFallsBack(t *testing.T) {
 func TestCompositeIndexLeadingColumnRangePicked(t *testing.T) {
 	cat := compositeIndexCatalog(t)
 	stmt := parseOne(t, "SELECT l_orderkey FROM lineitem WHERE l_partkey >= 100 AND l_partkey < 200")
-	node, err := Plan(stmt, cat)
+	node, err := planIndexSubject(stmt, cat)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

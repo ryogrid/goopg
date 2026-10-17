@@ -70,6 +70,11 @@ const maxSearchRels = 32
 type searchCtx struct {
 	// orClauseSelDivisor: see joinlistProblem.orClauseSelDivisor.
 	orClauseSelDivisor map[Expr]float64
+	// semiDerivedRHS is the union of the SEMI join RHS relations (item
+	// coordinates) that M0146-0127's derived equalities read; a
+	// parameterised inner that needs one of them may sit only under an
+	// outer path that kept its columns (paramOuterKeepsRHS).
+	semiDerivedRHS RelSet
 
 	// joinrels is PG's `root->join_rel_level`: `joinrels[lev]` holds every
 	// RelOptInfo whose relset has exactly `lev` base rels. Index 0 is unused
@@ -109,6 +114,12 @@ type searchCtx struct {
 	// the root. Zero is the "fetch everything" default, which is the regime
 	// every search ran in before M0127-P5.7-b.
 	tupleFraction float64
+
+	// rootCheapestTotal makes finalPath (and GEQO's root) hand up the final
+	// rel's CheapestTotal instead of the fractional pick: an aggregate stage
+	// above consumes every row, and PG applies the fraction only at
+	// final_rel (M0146-0150; resolveContext.rootCheapestTotal).
+	rootCheapestTotal bool
 
 	// relInfos is the per-initial-rel estimate `buildInitialRels` was handed,
 	// kept because the parameterised index paths of P5.4b-ii-a need each base
@@ -174,6 +185,11 @@ type searchCtx struct {
 	// of the query, not of a relation. Read by `hasUsefulPathkeys`. Empty
 	// means "no special ordering requested", which is upstream's NIL.
 	queryPathkeys []PathKey
+	// groupPathkeys / distinctPathkeys are `root->group_pathkeys` and
+	// `distinct_pathkeys` (M0146-0223), read by truncate_useless_pathkeys'
+	// grouping and distinct arms (pathkeys_useful.go).
+	groupPathkeys    []PathKey
+	distinctPathkeys []PathKey
 
 	// neededCols / neededColsKnown are PG's `reltarget` + `attr_needed` for
 	// this statement, by COLUMN NAME — see pathindexonlyneed.go for the
@@ -311,7 +327,7 @@ func (s *searchCtx) finalPath() (*Path, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
+	p := s.rootPathOf(rel)
 	if p == nil {
 		// setCheapest leaves every slot nil only for an empty pathlist, which
 		// joinSearch already rejects per level; reaching here means the final
@@ -319,6 +335,20 @@ func (s *searchCtx) finalPath() (*Path, error) {
 		return nil, fmt.Errorf("join search: final rel %#08x has no cheapest path", uint32(rel.Relids))
 	}
 	return p, nil
+}
+
+// rootPathOf is the path the search root hands up from its final rel — the
+// one choice finalPath and GEQO's root share. With an aggregate stage above
+// (rootCheapestTotal) it is CheapestTotal: PG applies the tuple fraction only
+// at final_rel, above grouping, and create_grouping_paths reads the scan/join
+// rel's cheapest_total_path (TPC-DS Q70: the LIMIT fraction had elected an
+// ordered nested loop over the cheaper Hash Semi Join, M0146-0150).
+// Otherwise it is the fractional pick getCheapestFractionalPathOrdered makes.
+func (s *searchCtx) rootPathOf(rel *RelOptInfo) *Path {
+	if s.rootCheapestTotal && rel.CheapestTotal != nil {
+		return rel.CheapestTotal
+	}
+	return getCheapestFractionalPathOrdered(rel, s.tupleFraction, s.queryPathkeys)
 }
 
 // buildInitialRels populates level 1: one RelOptInfo per FROM item, each with
@@ -413,6 +443,9 @@ func buildInitialRels(bindings []rangeBinding, scans []Node, relInfos []baseRelI
 		// original leaf's identity — alias, schema, local-qual wrappers — to
 		// copy forward (createplanindex.go).
 		rel.baseLeaf = leaf
+		if relInfos[i].subproblemAlts != nil {
+			rel.altLeaves = relInfos[i].subproblemAlts()
+		}
 		// …and WHERE it sat, which is the half of 03 §10's map the leaf node
 		// itself cannot supply: a `*SeqScan` knows its own schema but not the
 		// offset at which that schema was spliced into the pre-search
@@ -513,6 +546,17 @@ func initialRelRows(leaf Node, info baseRelInfo) float64 {
 		// already-built join subtree: `filteredRows` was derived from a
 		// synthetic catalog.Table and means nothing, so read the subtree.
 		rows = EstimateRows(leaf)
+		// A searched join tree (a join_collapse_limit sub-problem, or a
+		// subquery whose plan is the search's tree under row-preserving
+		// wrappers) carries the RelOptInfo the search sized. PG's enclosing
+		// search reads that joinrel's own `rows` — make_rel_from_joinlist
+		// returns the RelOptInfo itself, and set_subquery_size_estimates
+		// reads the subquery's final rel — so do the same instead of
+		// re-estimating the built tree bottom-up, which drifts from the
+		// rel's size (TPC-DS Q72 SF1: 1623 against 5, M0146-0141).
+		if sr := searchedJoinInputRelOf(leaf); sr != nil && sr.Rows >= 1 {
+			return sr.Rows
+		}
 		// A CTE leaf keeps its own (possibly collapsed) estimate, as PG's
 		// `set_cte_size_estimates` does: the only adjustment is the
 		// `clamp_row_est` floor at 1 below
@@ -668,7 +712,7 @@ func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) 
 // which is what the seq-scan fabrication amounted to.
 func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
 	chargeDerivedLeafLevel(leaf)
-	sub := legacyDisplayCostOf(leaf)
+	sub := subplanLeafSubpathCost(leaf)
 	if rows < 0 {
 		rows = 0
 	}
@@ -676,6 +720,66 @@ func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
 		Startup: sub.StartupCost,
 		Total:   sub.TotalCost + cp.cpuTupleCost*rows,
 	}
+}
+
+// subplanLeafSubpathCost is the subpath cost cost_subqueryscan starts from
+// (M0146-0224). A derived leaf arrives as SubqueryScan → Project → body, and
+// the legacy display cost charges cpu_tuple_cost per row at both wrappers —
+// on top of the one costSubplanLeaf adds as cost_subqueryscan's own. PG
+// charges neither:
+//
+//   - the SubqueryScan IS the scan cost_subqueryscan prices, so its subpath is
+//     the node beneath it;
+//   - a projection over a projection-capable path adds only its target
+//     list's eval cost, with no cpu_tuple_cost (create_projection_path's
+//     dummypp arm, pathnode.c), and goopg prices target-list evaluation at
+//     zero everywhere.
+//
+// TPC-DS Q78's three grouped CTE legs entered the search at 0.03 per row above
+// their aggregates where PG has 0.01, which tied PG's outer-join order with
+// the written one. A wrapper is peeled only when it carries no path cost of
+// its own; its initPlan charge stays.
+func subplanLeafSubpathCost(leaf Node) PlanCost {
+	n := leaf
+	var initPlans float64
+	peel := func(w, child Node) bool {
+		if child == nil {
+			return false
+		}
+		if c, ok := w.(PlanCostCarrier); ok {
+			if _, set := c.PlanCostInfo(); set {
+				return false
+			}
+		}
+		initPlans += InitPlanChargeOf(w)
+		n = child
+		return true
+	}
+	if sq, ok := n.(*SubqueryScan); ok {
+		peel(sq, sq.Child)
+	}
+	if p, ok := n.(*Project); ok && projectionCapableNode(p.Child) {
+		peel(p, p.Child)
+	}
+	sub := legacyDisplayCostOf(n)
+	sub.StartupCost += initPlans
+	sub.TotalCost += initPlans
+	return sub
+}
+
+// projectionCapableNode is is_projection_capable_path (createplan.c) over
+// the node kinds it names capable: scans, joins, aggregation, window
+// aggregation, Gather and Result. The kinds PG lists as incapable (Sort,
+// Material, Memoize, Limit, LockRows, SetOp, Unique, Append, RecursiveUnion,
+// ProjectSet) and any goopg kind whose PG counterpart is ambiguous report
+// false, so their projection keeps its cpu_tuple_cost.
+func projectionCapableNode(n Node) bool {
+	switch n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan, *Join, *NestedLoopIndexJoin,
+		*Aggregate, *WindowAgg, *Gather, *GatherMerge, *Result:
+		return true
+	}
+	return false
 }
 
 // stampNeededColsOnRels copies the statement's needed-column set onto every rel

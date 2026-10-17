@@ -365,9 +365,10 @@ type Writer struct {
 	// core is constructed in `NewWriter` after `loadState` so it
 	// borrows the same `walBuf` / `memRing` rings as the legacy path
 	// (one allocation, two consumers — duplicating the rings would
-	// fork on-disk visibility). Dead code until the call-site
-	// rewrite consumes it; access in tests is guarded by the
-	// `stripeCore()` accessor below.
+	// fork on-disk visibility). The append paths reach it through
+	// `AppendXLogPayload` since the slice B call-site rewrite
+	// (644af04fe); tests reach it through the `stripeCore()` accessor
+	// below.
 	core *stripeWriterCore
 
 	// OnWALWrite and OnWALSync are optional hooks called before
@@ -644,6 +645,12 @@ func (w *Writer) SetCommitSiblings(n int) {
 // SetWalWriterFlushAfter live-updates wal_writer_flush_after (bytes; SIGHUP).
 func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Store(bytes) }
 
+// CommitDelayUs, CommitSiblings and WalWriterFlushAfter report the live
+// values the setters above maintain.
+func (w *Writer) CommitDelayUs() int64       { return w.commitDelayUs.Load() }
+func (w *Writer) CommitSiblings() int        { return int(w.commitSiblings.Load()) }
+func (w *Writer) WalWriterFlushAfter() int64 { return w.walWriterFlushAfter.Load() }
+
 // PageHeadersEnabled reports whether the writer is emitting
 // PG-compatible XLOG page headers (M0014-0001 step 2). Returns the
 // Config.PageHeaders value the writer was constructed with — static
@@ -798,6 +805,12 @@ func (w *Writer) WalBytes() int64 {
 // the checkpointer's max_wal_size trigger.
 func (w *Writer) WrittenLSN() uint64 {
 	return w.writeLSNAtomic.Load()
+}
+
+// FlushedLSN returns the highest LSN known to be durable (LogwrtResult.Flush):
+// a record whose EndLSN is at or below it survives a crash. Lock-free.
+func (w *Writer) FlushedLSN() uint64 {
+	return w.flushedLSNAtomic.Load()
 }
 
 // DrainedLSN returns the last byte position already written into segment

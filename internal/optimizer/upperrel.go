@@ -75,9 +75,23 @@ func (k UpperRelKind) String() string {
 // (relnode.c:1455) — every reader goes through `fetchUpperRel`.
 type upperRels struct {
 	rels [UpperFinal + 1][]*RelOptInfo
+	// cat is the statement's catalog, for the sizes the upper rels' parallel
+	// worker counts are computed from (relations and indexes are sized where
+	// the catalog places them, as get_relation_info does). nil in unit
+	// fixtures, which then use the default-database lookup.
+	cat catalog.Catalog
 }
 
 func newUpperRels() *upperRels { return &upperRels{} }
+
+// catalog returns u's statement catalog; nil for a nil registry or one built
+// without a catalog.
+func (u *upperRels) catalog() catalog.Catalog {
+	if u == nil {
+		return nil
+	}
+	return u.cat
+}
 
 // fetchUpperRel is `fetch_upper_rel` (relnode.c:1458-1497): find-or-create
 // the upper rel of `kind` for `relids`. `tupleFraction` is `root->tuple_fraction`,

@@ -1,0 +1,30 @@
+                                                                                                       QUERY PLAN                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=25118.98..25132.81 rows=100 width=196)
+   ->  GroupAggregate  (cost=25118.98..25209.85 rows=657 width=196)
+         Group Key: customer_address.ca_zip, customer_address.ca_city
+         ->  Gather Merge  (cost=25118.98..25196.71 rows=657 width=3974)
+               Workers Planned: 3
+               ->  Sort  (cost=24118.94..24119.47 rows=212 width=3974)
+                     Sort Key: customer_address.ca_zip, customer_address.ca_city
+                     ->  Nested Loop  (cost=2070.07..24110.75 rows=212 width=3458)
+                           Join Filter: ((substr((customer_address.ca_zip)::text, 1, 5) = ANY ('{85669,86197,88274,83405,86475,85392,85460,80348,81792}'::text[])) OR (ANY (item.i_item_id = (hashed SubPlan 1).col1)))
+                           ->  Nested Loop  (cost=2069.78..24016.69 rows=283 width=1552)
+                                 ->  Nested Loop  (cost=2069.49..23915.57 rows=283 width=764)
+                                       ->  Parallel Hash Join  (cost=2069.20..23822.98 rows=283 width=38)
+                                             Hash Cond: (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+                                             ->  Parallel Seq Scan on web_sales  (cost=0.00..21144.59 rows=232059 width=286)
+                                             ->  Parallel Hash  (cost=2068.55..2068.55 rows=52 width=268)
+                                                   ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=52 width=268)
+                                                         Filter: ((d_qoy = 1) AND (d_year = 2000))
+                                       ->  Index Scan using customer_pkey on customer  (cost=0.29..0.33 rows=1 width=726)
+                                             Index Cond: (c_customer_sk = web_sales.ws_bill_customer_sk)
+                                 ->  Index Scan using customer_address_pkey on customer_address  (cost=0.29..0.36 rows=1 width=788)
+                                       Index Cond: (ca_address_sk = customer.c_current_addr_sk)
+                           ->  Index Scan using item_pkey on item  (cost=0.29..0.31 rows=1 width=1906)
+                                 Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                           SubPlan 1
+                             ->  Index Scan using item_pkey on item item_1  (cost=0.29..43.05 rows=10 width=1906)
+                                   Index Cond: (i_item_sk = ANY ('{2,3,5,7,11,13,17,19,23,29}'::integer[]))
+(26 rows)
+

@@ -150,9 +150,35 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 		return deformScanRefs(x.Operand, maxRef)
 	case *optimizer.IsDistinctFromExpr:
 		return deformScanRefs(x.Left, maxRef) && deformScanRefs(x.Right, maxRef)
+	case *optimizer.SubqueryExpr:
+		args, ok := deformSublinkArgs(x)
+		if !ok {
+			return false
+		}
+		for _, a := range args {
+			if !deformScanRefs(a, maxRef) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
+}
+
+// deformSublinkArgs reports the outer-row expressions a scalar sublink reads
+// (M0122-0012 slice 17). A param-lowered sublink (ParParam set, D4.1) binds
+// its correlation params from Args (bindSubPlanParams). Its inner plan reads
+// those ParamExec slots, nothing is pushed on OuterRows, and the result cache
+// is keyed by the bound values. So Args are its only consumers of the outer
+// row, as a PG SubPlan's parParam/args are. An unlowered sublink pushes the
+// whole row and keys its cache by every column (subqueryCacheKey), so it
+// cannot be bounded and declines.
+func deformSublinkArgs(x *optimizer.SubqueryExpr) ([]optimizer.Expr, bool) {
+	if x == nil || len(x.ParParam) == 0 {
+		return nil, false
+	}
+	return x.Args, true
 }
 
 // deformFoldRefs folds exprs into the running bound, returning the updated
@@ -202,40 +228,6 @@ func isIdentityProject(p *optimizer.Project) bool {
 	return true
 }
 
-// isOrderedBareProject reports whether every target of p is a bare ColumnRef
-// with a non-negative index and the indices are non-decreasing. Identity
-// projections satisfy this too, but the identity arm runs first (for
-// identity the output space coincides with the child space, so the incoming
-// bound folds raw; here it must not). A reordered (decreasing) bare
-// projection maps an above prefix to a non-prefix set, which a prefix bound
-// cannot express, so only order-preserving projections map through.
-func isOrderedBareProject(p *optimizer.Project) bool {
-	prev := -1
-	for _, t := range p.Targets {
-		c, ok := t.(*optimizer.ColumnRef)
-		if !ok || c.Index < 0 || c.Index < prev {
-			return false
-		}
-		prev = c.Index
-	}
-	return true
-}
-
-// deformProjectThrough maps the incoming project-output-space bound through
-// an order-preserving all-bare projection. The projection materialises every
-// target, so each target is a genuine child-space consumer and folding all
-// of them covers every column the projection can read — including the
-// remapped above prefix (a subset for in-order targets), which is why the
-// incoming bound is not folded raw (output coordinates ≠ child coordinates).
-// Full stickiness is preserved: an incoming Full, or an incoming prefix
-// reaching past the projection width (unmappable), fails to full.
-func deformProjectThrough(p *optimizer.Project, incoming int) int {
-	if incoming == deformBoundFull || incoming >= len(p.Targets) {
-		return deformBoundFull
-	}
-	return deformFoldRefs(deformBoundNone, p.Targets...)
-}
-
 // deformBoundBelow computes the bound a parent threads to its child subtree
 // from the incoming bound. Every node here has a single child subtree; Join
 // and NestedLoopIndexJoin thread per-side bounds through deformJoinBounds /
@@ -278,12 +270,8 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 		// the leaf row), so they fold like any other consumer — the
 		// identity special case of the map-through rule. Folding can only
 		// widen to len(Targets)-1; a full-width identity re-widens to
-		// full, as it must. An all-bare order-preserving projection maps
-		// through the same way (it materialises every target; for
-		// in-order targets folding covers the remapped above prefix).
-		// Anything else (expressions, funcalls, consts, or reordered bare
-		// targets, whose above prefix would remap to a non-prefix set)
-		// resets to full width below.
+		// full, as it must. Every other projection folds its targets
+		// alone (below).
 		if isIdentityProject(p) {
 			// Identity targets are genuine consumers in child-output
 			// space (a root SELECT a,b reads columns 0..1 of the leaf
@@ -292,10 +280,19 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 			// re-widens to full, as it must.
 			return deformFoldRefs(incoming, p.Targets...)
 		}
-		if isOrderedBareProject(p) {
-			return deformProjectThrough(p, incoming)
-		}
-		return deformBoundFull
+		// Any other projection (M0122-0012 slice 17): projectOp and the
+		// op-tree OpProject evaluate p.Targets against the child slot and
+		// read nothing else of it. So the targets are the child's only
+		// consumers, whatever the parent reads of the projection's output,
+		// and the bound is their fold. This is PG's rule:
+		// ExecBuildProjectionInfo → ExecCreateExprSetupSteps
+		// (execExpr.c) sets last_scan to the highest attnum the target
+		// list references and emits one EEOP_SCAN_FETCHSOME for it. A
+		// target the whitelist does not understand still declines to
+		// full. Reordered bare targets used to reset to full here: HammerDB's
+		// lineitem column order makes TPC-H Q17's probe projection
+		// reordered, so all 16 columns were deformed and cloned per row.
+		return deformFoldRefs(deformBoundNone, p.Targets...)
 	case *optimizer.Aggregate:
 		// Reshape boundary: the incoming bound is in aggregate-output
 		// space and cannot map through it, so it is dropped. The arms
@@ -494,6 +491,19 @@ func deformSplitPredicate(pred optimizer.Expr, leftW, rightW int) (left, right i
 			return walk(x.Operand)
 		case *optimizer.IsDistinctFromExpr:
 			return walk(x.Left) && walk(x.Right)
+		case *optimizer.SubqueryExpr:
+			// Same rule as deformScanRefs: a lowered sublink reads the
+			// merged row only through its Args.
+			args, ok := deformSublinkArgs(x)
+			if !ok {
+				return false
+			}
+			for _, a := range args {
+				if !walk(a) {
+					return false
+				}
+			}
+			return true
 		default:
 			return false
 		}
@@ -628,8 +638,10 @@ func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
 }
 
 // deformIndexLeafBound computes the EX1-02b bound an IndexScan leaf deforms:
-// the union of the incoming parent-walk bound and the leaf-local Cond refs,
-// belt-and-braces widened with the index's heap key-column ordinals.
+// the union of the incoming parent-walk bound and the leaf-local Cond refs.
+// Only when no consumer bound is recorded (None, or the count(*)-style Zero
+// an index leaf would otherwise read as full width) is it widened with the
+// index's heap key-column ordinals.
 //
 // The key PROBE exprs (Key/Keys/LowKey/HighKey) are NEVER folded here: on an
 // NLI inner they reference OUTER columns (outer-space indexes), so folding
@@ -641,6 +653,17 @@ func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
 func deformIndexLeafBound(incoming int, cond optimizer.Expr, index *catalog.Index, table *catalog.Table) int {
 	bound := deformFoldRefs(incoming, cond)
 	if bound == deformBoundFull {
+		return bound
+	}
+	// M0146-0171: a consumer-derived bound is the whole answer. PG deforms a
+	// fetched heap tuple only up to the highest attribute a consumer reads
+	// (slot_getsomeattrs from the quals and target list); a btree index scan
+	// never re-reads its key columns from the heap tuple — the descent reads
+	// the index tuple, and every recheck is a Cond already folded above. The
+	// key-column widening only stood in for a missing consumer set: on TPC-DS
+	// Q17's catalog_sales_pkey probe it deformed through cs_order_number
+	// (18 of 34 columns) for a Filter that reads cs_bill_customer_sk (4).
+	if bound >= 0 {
 		return bound
 	}
 	if index != nil && table != nil {

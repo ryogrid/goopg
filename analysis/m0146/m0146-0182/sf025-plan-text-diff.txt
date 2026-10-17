@@ -1,0 +1,380 @@
+42c42
+<            ->  Gather  (cost=34529.04..34737.86 rows=10441 width=102)
+---
+>            ->  Gather  (cost=24155.47..27679.31 rows=32367 width=102)
+44c44
+<                  ->  Partial HashAggregate  (cost=34529.04..34633.45 rows=10441 width=102)
+---
+>                  ->  Partial HashAggregate  (cost=23155.47..23442.60 rows=10441 width=102)
+356c356
+<            ->  Gather  (cost=16758.25..16758.27 rows=1 width=8)
+---
+>            ->  Gather  (cost=17527.27..17527.59 rows=3 width=8)
+358c358
+<                  ->  Partial Aggregate  (cost=16758.25..16758.26 rows=1 width=8)
+---
+>                  ->  Partial Aggregate  (cost=16527.27..16527.28 rows=1 width=8)
+363c363
+<            ->  Gather  (cost=16758.25..16758.27 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.27..17527.59 rows=3 width=32)
+365c365
+<                  ->  Partial Aggregate  (cost=16758.25..16758.26 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.27..16527.28 rows=1 width=32)
+370c370
+<            ->  Gather  (cost=16758.25..16758.27 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.27..17527.59 rows=3 width=32)
+372c372
+<                  ->  Partial Aggregate  (cost=16758.25..16758.26 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.27..16527.28 rows=1 width=32)
+377c377
+<            ->  Gather  (cost=16759.69..16759.71 rows=1 width=8)
+---
+>            ->  Gather  (cost=17527.73..17528.05 rows=3 width=8)
+379c379
+<                  ->  Partial Aggregate  (cost=16759.69..16759.70 rows=1 width=8)
+---
+>                  ->  Partial Aggregate  (cost=16527.73..16527.74 rows=1 width=8)
+384c384
+<            ->  Gather  (cost=16759.69..16759.71 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.73..17528.05 rows=3 width=32)
+386c386
+<                  ->  Partial Aggregate  (cost=16759.69..16759.70 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.73..16527.74 rows=1 width=32)
+391c391
+<            ->  Gather  (cost=16759.69..16759.71 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.73..17528.05 rows=3 width=32)
+393c393
+<                  ->  Partial Aggregate  (cost=16759.69..16759.70 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.73..16527.74 rows=1 width=32)
+398c398
+<            ->  Gather  (cost=16768.93..16768.95 rows=1 width=8)
+---
+>            ->  Gather  (cost=17530.71..17531.03 rows=3 width=8)
+400c400
+<                  ->  Partial Aggregate  (cost=16768.93..16768.94 rows=1 width=8)
+---
+>                  ->  Partial Aggregate  (cost=16530.71..16530.72 rows=1 width=8)
+405c405
+<            ->  Gather  (cost=16768.93..16768.95 rows=1 width=32)
+---
+>            ->  Gather  (cost=17530.71..17531.03 rows=3 width=32)
+407c407
+<                  ->  Partial Aggregate  (cost=16768.93..16768.94 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16530.71..16530.72 rows=1 width=32)
+412c412
+<            ->  Gather  (cost=16768.93..16768.95 rows=1 width=32)
+---
+>            ->  Gather  (cost=17530.71..17531.03 rows=3 width=32)
+414c414
+<                  ->  Partial Aggregate  (cost=16768.93..16768.94 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16530.71..16530.72 rows=1 width=32)
+419c419
+<            ->  Gather  (cost=16756.93..16756.95 rows=1 width=8)
+---
+>            ->  Gather  (cost=17526.84..17527.16 rows=3 width=8)
+421c421
+<                  ->  Partial Aggregate  (cost=16756.93..16756.94 rows=1 width=8)
+---
+>                  ->  Partial Aggregate  (cost=16526.84..16526.85 rows=1 width=8)
+426c426
+<            ->  Gather  (cost=16756.93..16756.95 rows=1 width=32)
+---
+>            ->  Gather  (cost=17526.84..17527.16 rows=3 width=32)
+428c428
+<                  ->  Partial Aggregate  (cost=16756.93..16756.94 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16526.84..16526.85 rows=1 width=32)
+433c433
+<            ->  Gather  (cost=16756.93..16756.95 rows=1 width=32)
+---
+>            ->  Gather  (cost=17526.84..17527.16 rows=3 width=32)
+435c435
+<                  ->  Partial Aggregate  (cost=16756.93..16756.94 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16526.84..16526.85 rows=1 width=32)
+440c440
+<            ->  Gather  (cost=16757.47..16757.49 rows=1 width=8)
+---
+>            ->  Gather  (cost=17527.01..17527.34 rows=3 width=8)
+442c442
+<                  ->  Partial Aggregate  (cost=16757.47..16757.48 rows=1 width=8)
+---
+>                  ->  Partial Aggregate  (cost=16527.01..16527.03 rows=1 width=8)
+447c447
+<            ->  Gather  (cost=16757.47..16757.49 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.01..17527.34 rows=3 width=32)
+449c449
+<                  ->  Partial Aggregate  (cost=16757.47..16757.48 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.01..16527.03 rows=1 width=32)
+454c454
+<            ->  Gather  (cost=16757.47..16757.49 rows=1 width=32)
+---
+>            ->  Gather  (cost=17527.01..17527.34 rows=3 width=32)
+456c456
+<                  ->  Partial Aggregate  (cost=16757.47..16757.48 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=16527.01..16527.03 rows=1 width=32)
+669c669
+<            ->  Gather  (cost=38606.89..38606.91 rows=1 width=32)
+---
+>            ->  Gather  (cost=39576.51..39576.84 rows=3 width=32)
+671c671
+<                  ->  Partial Aggregate  (cost=38606.89..38606.90 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=38576.51..38576.53 rows=1 width=32)
+809c809
+<            ->  Gather  (cost=38606.89..38606.91 rows=1 width=32)
+---
+>            ->  Gather  (cost=39576.51..39576.84 rows=3 width=32)
+811c811
+<                  ->  Partial Aggregate  (cost=38606.89..38606.90 rows=1 width=32)
+---
+>                  ->  Partial Aggregate  (cost=38576.51..38576.53 rows=1 width=32)
+2160c2160
+<                ->  Gather Merge  (cost=18128.66..18128.82 rows=8 width=284)
+---
+>                ->  Gather Merge  (cost=18868.84..18898.37 rows=25 width=284)
+2162c2162
+<                      ->  Partial GroupAggregate  (cost=18128.66..18128.74 rows=8 width=284)
+---
+>                      ->  Partial GroupAggregate  (cost=17868.80..17895.42 rows=8 width=284)
+2164c2164
+<                            ->  Sort  (cost=18038.90..18071.54 rows=3264 width=2292)
+---
+>                            ->  Sort  (cost=17868.80..17871.44 rows=1056 width=2292)
+2201c2201
+<                                                                  ->  Gather  (cost=15849.24..15849.26 rows=1 width=32)
+---
+>                                                                  ->  Gather  (cost=16840.76..16841.08 rows=3 width=32)
+2203c2203
+<                                                                        ->  Partial GroupAggregate  (cost=15849.24..15849.25 rows=1 width=32)
+---
+>                                                                        ->  Partial GroupAggregate  (cost=15840.76..15840.77 rows=1 width=32)
+2222c2222
+<                                                                  ->  Gather  (cost=15849.24..15849.26 rows=1 width=32)
+---
+>                                                                  ->  Gather  (cost=16840.76..16841.08 rows=3 width=32)
+2224c2224
+<                                                                        ->  Partial GroupAggregate  (cost=15849.24..15849.25 rows=1 width=32)
+---
+>                                                                        ->  Partial GroupAggregate  (cost=15840.76..15840.77 rows=1 width=32)
+3124c3124
+<          ->  Gather Merge  (cost=7774.47..7776.87 rows=120 width=314)
+---
+>          ->  Gather Merge  (cost=8720.17..8764.17 rows=288 width=314)
+3126c3126
+<                ->  Partial GroupAggregate  (cost=7774.47..7775.67 rows=120 width=314)
+---
+>                ->  Partial GroupAggregate  (cost=7720.15..7730.90 rows=120 width=314)
+3128c3128
+<                      ->  Sort  (cost=7755.21..7763.77 rows=856 width=3440)
+---
+>                      ->  Sort  (cost=7720.15..7721.04 rows=358 width=3440)
+3326c3326
+<                            ->  Gather Merge  (cost=6518.24..6518.32 rows=4 width=1120)
+---
+>                            ->  Gather Merge  (cost=7515.46..7517.77 rows=10 width=1120)
+3328c3328
+<                                  ->  Partial GroupAggregate  (cost=6518.24..6518.28 rows=4 width=1120)
+---
+>                                  ->  Partial GroupAggregate  (cost=6515.43..6516.64 rows=4 width=1120)
+3330c3330
+<                                        ->  Sort  (cost=6516.21..6516.50 rows=29 width=2080)
+---
+>                                        ->  Sort  (cost=6515.43..6515.46 rows=12 width=2080)
+3357c3357
+<                            ->  Gather Merge  (cost=11811.68..11811.76 rows=4 width=1120)
+---
+>                            ->  Gather Merge  (cost=12805.90..12809.11 rows=12 width=1120)
+3359c3359
+<                                  ->  Partial GroupAggregate  (cost=11811.68..11811.72 rows=4 width=1120)
+---
+>                                  ->  Partial GroupAggregate  (cost=11805.86..11807.61 rows=4 width=1120)
+3361c3361
+<                                        ->  Sort  (cost=11807.69..11808.26 rows=57 width=2080)
+---
+>                                        ->  Sort  (cost=11805.86..11805.91 rows=19 width=2080)
+3561c3561
+<                                                                      ->  Gather Merge  (cost=18175.74..18175.76 rows=1 width=26)
+---
+>                                                                      ->  Gather Merge  (cost=18973.50..18981.47 rows=3 width=26)
+3563c3563
+<                                                                            ->  Partial GroupAggregate  (cost=18175.74..18175.75 rows=1 width=26)
+---
+>                                                                            ->  Partial GroupAggregate  (cost=17973.46..17981.07 rows=1 width=26)
+3565c3565
+<                                                                                  ->  Sort  (cost=18136.51..18167.89 rows=3138 width=2292)
+---
+>                                                                                  ->  Sort  (cost=17973.46..17975.99 rows=1013 width=2292)
+3845c3845
+<          ->  Gather Merge  (cost=37938.27..38006.85 rows=3429 width=298)
+---
+>          ->  Gather Merge  (cost=38969.32..40226.90 rows=10630 width=298)
+3847c3847
+<                ->  Sort  (cost=37938.27..37972.56 rows=3429 width=298)
+---
+>                ->  Sort  (cost=37969.28..37977.85 rows=3429 width=298)
+3849c3849
+<                      ->  Partial HashAggregate  (cost=37702.64..37736.93 rows=3429 width=298)
+---
+>                      ->  Partial HashAggregate  (cost=37716.50..37767.93 rows=3429 width=298)
+3898c3898
+<                                  ->  Gather Merge  (cost=17936.08..17936.32 rows=12 width=32)
+---
+>                                  ->  Gather Merge  (cost=18920.27..18925.75 rows=37 width=32)
+3900c3900
+<                                        ->  Partial GroupAggregate  (cost=17936.08..17936.20 rows=12 width=32)
+---
+>                                        ->  Partial GroupAggregate  (cost=17920.23..17921.34 rows=12 width=32)
+3902c3902
+<                                              ->  Sort  (cost=17931.77..17934.64 rows=287 width=2292)
+---
+>                                              ->  Sort  (cost=17920.23..17920.46 rows=93 width=2292)
+3916c3916
+<                                  ->  Gather Merge  (cost=3470.61..3470.85 rows=12 width=32)
+---
+>                                  ->  Gather Merge  (cost=4469.54..4472.19 rows=20 width=32)
+3918c3918
+<                                        ->  Partial GroupAggregate  (cost=3470.61..3470.73 rows=12 width=32)
+---
+>                                        ->  Partial GroupAggregate  (cost=3469.53..3469.88 rows=12 width=32)
+3920c3920
+<                                              ->  Sort  (cost=3470.18..3470.47 rows=29 width=2250)
+---
+>                                              ->  Sort  (cost=3469.53..3469.57 rows=17 width=2250)
+3937c3937
+<                                  ->  Gather Merge  (cost=12886.14..12886.26 rows=6 width=32)
+---
+>                                  ->  Gather Merge  (cost=13878.04..13880.83 rows=19 width=32)
+3939c3939
+<                                        ->  Partial GroupAggregate  (cost=12886.14..12886.20 rows=6 width=32)
+---
+>                                        ->  Partial GroupAggregate  (cost=12878.00..12878.60 rows=6 width=32)
+3941c3941
+<                                              ->  Sort  (cost=12883.80..12885.36 rows=156 width=554)
+---
+>                                              ->  Sort  (cost=12878.00..12878.13 rows=51 width=554)
+3965c3965
+<                                  ->  Gather Merge  (cost=7701.23..7702.43 rows=60 width=32)
+---
+>                                  ->  Gather Merge  (cost=8697.75..8707.71 rows=79 width=32)
+3967c3967
+<                                        ->  Partial GroupAggregate  (cost=7701.23..7701.83 rows=60 width=32)
+---
+>                                        ->  Partial GroupAggregate  (cost=7697.72..7698.55 rows=33 width=32)
+3969c3969
+<                                              ->  Sort  (cost=7700.07..7700.84 rows=77 width=1092)
+---
+>                                              ->  Sort  (cost=7697.72..7697.81 rows=33 width=1092)
+4506c4506
+<                                              ->  Gather  (cost=17171.90..17171.92 rows=1 width=8)
+---
+>                                              ->  Gather  (cost=18169.75..18170.07 rows=3 width=8)
+4508c4508
+<                                                    ->  Partial Aggregate  (cost=17171.90..17171.91 rows=1 width=8)
+---
+>                                                    ->  Partial Aggregate  (cost=17169.75..17169.76 rows=1 width=8)
+4525c4525
+<                                              ->  Gather  (cost=17171.87..17171.89 rows=1 width=8)
+---
+>                                              ->  Gather  (cost=18169.75..18170.07 rows=3 width=8)
+4527c4527
+<                                                    ->  Partial Aggregate  (cost=17171.87..17171.88 rows=1 width=8)
+---
+>                                                    ->  Partial Aggregate  (cost=17169.75..17169.76 rows=1 width=8)
+4544c4544
+<                                        ->  Gather  (cost=17171.85..17171.87 rows=1 width=8)
+---
+>                                        ->  Gather  (cost=18169.75..18170.07 rows=3 width=8)
+4546c4546
+<                                              ->  Partial Aggregate  (cost=17171.85..17171.86 rows=1 width=8)
+---
+>                                              ->  Partial Aggregate  (cost=17169.75..17169.76 rows=1 width=8)
+4563c4563
+<                                  ->  Gather  (cost=17172.00..17172.02 rows=1 width=8)
+---
+>                                  ->  Gather  (cost=18169.76..18170.08 rows=3 width=8)
+4565c4565
+<                                        ->  Partial Aggregate  (cost=17172.00..17172.01 rows=1 width=8)
+---
+>                                        ->  Partial Aggregate  (cost=17169.76..17169.77 rows=1 width=8)
+4582c4582
+<                            ->  Gather  (cost=17171.96..17171.98 rows=1 width=8)
+---
+>                            ->  Gather  (cost=18169.76..18170.08 rows=3 width=8)
+4584c4584
+<                                  ->  Partial Aggregate  (cost=17171.96..17171.97 rows=1 width=8)
+---
+>                                  ->  Partial Aggregate  (cost=17169.76..17169.77 rows=1 width=8)
+4601c4601
+<                      ->  Gather  (cost=17171.95..17171.97 rows=1 width=8)
+---
+>                      ->  Gather  (cost=18169.76..18170.08 rows=3 width=8)
+4603c4603
+<                            ->  Partial Aggregate  (cost=17171.95..17171.96 rows=1 width=8)
+---
+>                            ->  Partial Aggregate  (cost=17169.76..17169.77 rows=1 width=8)
+4620c4620
+<                ->  Gather  (cost=17171.92..17171.94 rows=1 width=8)
+---
+>                ->  Gather  (cost=18169.75..18170.08 rows=3 width=8)
+4622c4622
+<                      ->  Partial Aggregate  (cost=17171.92..17171.93 rows=1 width=8)
+---
+>                      ->  Partial Aggregate  (cost=17169.75..17169.77 rows=1 width=8)
+4639c4639
+<          ->  Gather  (cost=17171.87..17171.89 rows=1 width=8)
+---
+>          ->  Gather  (cost=18169.75..18170.07 rows=3 width=8)
+4641c4641
+<                ->  Partial Aggregate  (cost=17171.87..17171.88 rows=1 width=8)
+---
+>                ->  Partial Aggregate  (cost=17169.75..17169.76 rows=1 width=8)
+4705c4705
+<                      ->  Gather  (cost=5907.20..5907.22 rows=1 width=8)
+---
+>                      ->  Gather  (cost=6906.64..6906.89 rows=2 width=8)
+4707c4707
+<                            ->  Partial Aggregate  (cost=5907.20..5907.21 rows=1 width=8)
+---
+>                            ->  Partial Aggregate  (cost=5906.64..5906.65 rows=1 width=8)
+4724c4724
+<                      ->  Gather  (cost=5907.20..5907.22 rows=1 width=8)
+---
+>                      ->  Gather  (cost=6906.64..6906.89 rows=2 width=8)
+4726c4726
+<                            ->  Partial Aggregate  (cost=5907.20..5907.21 rows=1 width=8)
+---
+>                            ->  Partial Aggregate  (cost=5906.64..5906.65 rows=1 width=8)
+4926c4926
+<                ->  Gather  (cost=16671.48..16671.50 rows=1 width=8)
+---
+>                ->  Gather  (cost=17670.15..17670.48 rows=3 width=8)
+4928c4928
+<                      ->  Partial Aggregate  (cost=16671.48..16671.49 rows=1 width=8)
+---
+>                      ->  Partial Aggregate  (cost=16670.15..16670.17 rows=1 width=8)
+5012c5012
+<          ->  Gather Merge  (cost=13047.32..13048.76 rows=72 width=314)
+---
+>          ->  Gather Merge  (cost=13917.16..13958.19 rows=223 width=314)
+5014c5014
+<                ->  Partial GroupAggregate  (cost=13047.32..13048.04 rows=72 width=314)
+---
+>                ->  Partial GroupAggregate  (cost=12917.12..12931.93 rows=72 width=314)
+5016c5016
+<                      ->  Sort  (cost=13006.51..13024.65 rows=1814 width=3740)
+---
+>                      ->  Sort  (cost=12917.12..12918.59 rows=586 width=3740)

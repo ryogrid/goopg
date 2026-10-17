@@ -79,12 +79,18 @@ func mkBitmapProbeFixture(t *testing.T, indexes ...string) (*Context, func()) {
 // runProbeQuery plans (default settings) + builds + executes, returning rows.
 func runProbeQuery(ctx *Context, t *testing.T, sql string) []Row {
 	t.Helper()
+	return runProbeQueryWithSettings(ctx, t, sql, optimizer.DefaultPlannerSettings())
+}
+
+// runProbeQueryWithSettings is runProbeQuery under explicit planner settings.
+func runProbeQueryWithSettings(ctx *Context, t *testing.T, sql string, ps optimizer.PlannerSettings) []Row {
+	t.Helper()
 	advanceStmtCounter(ctx)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, optimizer.DefaultPlannerSettings())
+	plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
 	if err != nil {
 		t.Fatalf("plan %q: %v", sql, err)
 	}
@@ -236,11 +242,22 @@ func TestNLIBitmapProbeCompositeKeys(t *testing.T) {
 	ctx, cleanup := mkBitmapProbeFixture(t, "CREATE INDEX line_comp_idx ON line (l_key, l_c)")
 	defer cleanup()
 	const q = "SELECT o_key, l_c FROM ord JOIN line ON l_key = o_key AND l_c = o_val WHERE o_key BETWEEN 1 AND 4"
-	plan := explainProbeQuery(ctx, t, q)
+	// At default settings PG 18.3 probes this two-key equality with an Index
+	// Only Scan, and goopg agrees since M0146-0159 retired the x2 probe
+	// calibration. With enable_indexscan off PG takes the bitmap probe this
+	// test drives (Recheck Cond and Index Cond on both pairs).
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableIndexScan = false
+	var b strings.Builder
+	for _, r := range runProbeQueryWithSettings(ctx, t, "EXPLAIN "+q, ps) {
+		b.WriteString(datumTestString(r[0]))
+		b.WriteString("\n")
+	}
+	plan := b.String()
 	if !strings.Contains(plan, "Recheck Cond: ((l_key = ord.o_key) AND (l_c = ord.o_val))") {
 		t.Errorf("missing two-pair Recheck Cond:\n%s", plan)
 	}
-	if rows := runProbeQuery(ctx, t, q); len(rows) != 1 {
+	if rows := runProbeQueryWithSettings(ctx, t, q, ps); len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1 (only i=7 matches both pairs)", len(rows))
 	}
 }

@@ -94,10 +94,7 @@
 # - Background Writer -
 
 #bgwriter_delay = 200                   # 10-10000 ms between rounds
-                                        # (change requires restart)
-#bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round;
-                                        # 0 disables background writing
-                                        # (change requires restart)
+#bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round, 0 disables
 #bgwriter_flush_after = 64              # 0-256 pages; 0 disables writeback
                                         # (SIGHUP to apply)
 
@@ -128,13 +125,11 @@
 
 #wal_level = replica                    # minimal | replica | logical
                                         # (change requires restart)
-#wal_buffers = 16777216                 # 0-1073741824 bytes; 0 disables
-                                        # the in-memory WAL buffer
+#wal_buffers = -1                       # min 32kB, -1 sets based on shared_buffers
+                                        # (change requires restart)
                                         # (change requires restart)
 #wal_writer_delay = 200                 # 1-10000 ms between WAL-writer rounds
-                                        # (change requires restart)
-#wal_writer_flush_after = 1048576       # 0-1073741824 bytes; 0 fsyncs every round
-                                        # (change requires restart)
+#wal_writer_flush_after = 128           # measured in pages (128 = 1MB), 0 fsyncs every round
 #commit_delay = 0                       # 0-100000 microseconds
 #commit_siblings = 5                    # 0-1000 range; min concurrent flushers
                                         # before commit_delay applies
@@ -142,7 +137,7 @@
                                         # (change requires restart)
 #wal_sync_method = fdatasync            # fsync, fdatasync, open_sync, open_datasync
                                         # (change requires reload)
-#wal_sender_memory_buffer = 16777216    # 0-1073741824 bytes in-memory WAL ring
+#goopg.wal_sender_memory_buffer = 16777216 # 0-1073741824 bytes in-memory WAL ring
                                         # (change requires restart)
 #full_page_writes = on                  # log full pages after first mod since
                                         # last checkpoint (SIGHUP to apply)
@@ -189,6 +184,7 @@
                                         # (SIGHUP to apply)
 #summarize_wal = off                    # toggles the WAL-summarizer worker
                                         # (SIGHUP to apply)
+#wal_summary_keep_time = 14400          # in minutes (10 days); 0 disables removal
 
 # - Standby Servers -
 
@@ -240,8 +236,8 @@
 #enable_group_by_reordering = on
 #enable_self_join_elimination = on
 #enable_tidscan = on
-#enable_nestloop_index = on             # goopg-specific: index nested-loop join
-#enable_opportunistic_prune = on        # goopg-specific: inline HOT page-prune
+#goopg.enable_nestloop_index = on       # goopg-specific: index nested-loop join
+#goopg.enable_opportunistic_prune = on  # goopg-specific: inline HOT page-prune
 #parallel_leader_participation = on
 
 # - Planner Cost Constants -
@@ -262,7 +258,6 @@
 #hash_mem_multiplier = 2.0             # 1-1000
 
 # - Genetic Query Optimizer -
-# (goopg's planner never runs GEQO; these are accepted no-op compatibility stubs)
 
 #geqo = on
 #geqo_threshold = 12                    # 2-2147483647
@@ -285,11 +280,16 @@
 
 # - When To Log -
 
+#log_min_messages = warning             # debug5..debug1 | info | notice |
+                                        # warning | error | log | fatal | panic;
+                                        # accepted, goopg's log does not filter by it
 #log_statement = 'none'                 # none | ddl | mod | all
 #log_min_duration_statement = -1        # -1 disables; otherwise ms threshold
 
 # - What To Log -
 
+#log_error_verbosity = default          # terse | default | verbose; accepted,
+                                        # goopg's log does not format by it
 #log_line_prefix = '%m [%p] '           # supported escapes: %m %p %u %d %a %x %%
 #log_timezone = 'GMT'                   # accepted; goopg log timestamps are
                                         # not zone-formatted
@@ -310,7 +310,7 @@
 #jit_profiling_support = off            # register JIT-compiled functions with perf profiler
 #jit_tuple_deforming = on               # allow JIT compilation of tuple deforming
 #jit_provider = 'llvmjit'               # JIT provider to use
-#compute_query_id = off                 # compute query identifiers
+#compute_query_id = auto                # compute query identifiers
 #plan_cache_mode = auto                 # plan cache mode
 #check_function_bodies = on             # validate function bodies during creation
 #extra_float_digits = 1                 # float output precision adjustment
@@ -332,8 +332,7 @@
 #vacuum_freeze_table_age = 150000000    # 0-2000000000 xids
 #vacuum_failsafe_age = 1600000000       # 0-2100000000 xids
 #vacuum_multixact_freeze_table_age = 150000000  # 0-2000000000 multixacts
-#vacuum_multixact_freeze_max_age = 400000000    # 1000000-5000000000 multixacts
-#vacuum_multixact_failsafe_age = 1500000000     # 0-2100000000 multixacts
+#vacuum_multixact_failsafe_age = 1600000000     # 0-2100000000 multixacts
 #autovacuum_worker_slots = 16           # 1-262143; accepted, goopg has no
                                         # autovacuum worker pool
                                         # (change requires restart)
@@ -352,7 +351,7 @@
 #autovacuum_vacuum_insert_scale_factor = 0.2    # fraction of table size added
 #autovacuum_analyze_threshold = 50      # min row modifications before analyze
 #autovacuum_analyze_scale_factor = 0.1  # fraction of table size added to threshold
-#autovacuum_vacuum_max_threshold = 200000000    # cap on the effective vacuum threshold
+#autovacuum_vacuum_max_threshold = 100000000    # cap on the effective vacuum threshold; -1 disables
 #autovacuum_vacuum_cost_delay = 2       # -1-100 ms (overrides vacuum_cost_delay)
 #autovacuum_vacuum_cost_limit = -1      # -1 means use vacuum_cost_limit
 #log_autovacuum_min_duration = 600000   # -1-2147483647 ms; -1 disables logging
@@ -365,7 +364,7 @@
                                         # (change requires restart)
 #autovacuum_work_mem = -1               # KB; -1 uses maintenance_work_mem
                                         # (change requires restart)
-#autovacuum_multixact_freeze_max_age = 4000000000 # 1000000-5000000000 multixacts
+#autovacuum_multixact_freeze_max_age = 400000000 # 10000-2000000000 multixacts
                                         # (change requires restart)
 
 
@@ -434,13 +433,12 @@
 
 #max_locks_per_transaction = 64         # 10-2147483647 per-backend slots
                                         # (change requires restart)
-#max_predicate_locks_per_xact = 64      # 10-1073741824
+#max_pred_locks_per_transaction = 64    # min 10
                                         # (change requires restart)
-#max_predicate_locks_per_relation = -2  # negative = fraction;
-                                        # see internal/mvcc/predicate_locks.go
-                                        # (SIGHUP to apply)
-#max_predicate_locks_per_page = 2       # 0-65536
-                                        # (SIGHUP to apply)
+#max_pred_locks_per_relation = -2       # negative values mean
+                                        # (max_pred_locks_per_transaction
+                                        #  / -max_pred_locks_per_relation) - 1
+#max_pred_locks_per_page = 2            # min 0
 #max_prepared_transactions = 0          # 0-262143; zero disables 2PC
                                         # (change requires restart)
 #deadlock_timeout = 1000                # 1-2147483647 ms; wait before

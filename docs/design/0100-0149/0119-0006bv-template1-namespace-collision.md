@@ -153,3 +153,41 @@ write being skipped, and a user database not getting its own row). Both
 dissolved when the same files were read after a clean shutdown. Any on-disk
 catalog probe in this area must stop the server first, or it is reading the
 past.
+
+## 8. Implemented: Option A (2026-10-10, fba181f95)
+
+The owner chose Option A on 2026-09-25.
+
+- **template1's own namespace.** `catalog.Template1NamespaceDBOid = 2` is
+  template1's catalog-namespace and storage oid. 2 lies between the
+  bootstrap oids (1, 4, 5) and `FirstUserOID`, so `CREATE DATABASE` can never
+  allocate it.
+  - `DatabaseOid("template1")` and `ResolveDatabaseOid("template1")` return
+    it, so every per-database startup reload (tables, system catalogs,
+    schemas, extensions, …) now covers template1 without a special case.
+  - `databaseDisplayOID` is keyed by name, so the displayed
+    `pg_database.oid` stays 1.
+- **Storage.** `Open` scaffolds `base/2` from template0's catalog image when
+  it is missing (idempotent), as `CREATE DATABASE` does. Existing clusters
+  upgrade in place. initdb's `base/1` stays unused (§6).
+- **pg_database rows keep oid 1.** Every writer that addresses a global/1262
+  row by oid maps through `catalog.PgDatabaseRowOid`:
+  - the `CREATE DATABASE` template-row copy (without the mapping, the new
+    database's row was never written and the database vanished on
+    restart);
+  - `PersistDatConnLimit`;
+  - the datacl resync.
+
+  `reloadDatabaseACLsFromHeap` maps the other way with
+  `NamespaceOidForPgDatabaseRow`.
+- **Behaviour that follows from isolation.**
+  - `CREATE DATABASE` now copies template1's user tables, as PG does.
+    Before, it silently created an empty database.
+  - If template1 holds an index, `CREATE DATABASE` raises goopg's existing
+    "not yet supported" template-copy error.
+  - `pg_dump` of a template1 holding user data fails at `COPY`. That is the
+    open M0122-0015a defect, which every non-default database already has.
+- **The §7 extension face is fixed by the same change.** After a restart,
+  `pg_extension` reports template1=1, postgres=0.
+- **Option B remains the real fix** (M0122-0007 4b-4e): the `DefaultDBOid`
+  sentinel is still in place for postgres.

@@ -1682,14 +1682,14 @@ func TestSetOpBranchPickSkipsUnrunnablePartial(t *testing.T) {
 		Cost: Cost{Total: 70}, ParallelSafe: true, ParallelWorkers: 2}
 	branch := &RelOptInfo{PartialPathlist: []*Path{phj, runnable}}
 
-	partial, nonPartial := setOpBranchPick(&RelOptInfo{}, branch, nil, true)
+	partial, nonPartial := setOpBranchPick(&RelOptInfo{}, branch, nil, true, false)
 	if partial != runnable || nonPartial != nil {
 		t.Fatalf("pick = (%v, %v), want (runnable partial, nil)", partial, nonPartial)
 	}
 	// And when nothing runnable exists the pick is nil — PG's
 	// pa_subpaths_valid kill for this branch.
 	onlyPhj := &RelOptInfo{PartialPathlist: []*Path{phj}}
-	partial, nonPartial = setOpBranchPick(&RelOptInfo{}, onlyPhj, nil, true)
+	partial, nonPartial = setOpBranchPick(&RelOptInfo{}, onlyPhj, nil, true, false)
 	if partial != nil || nonPartial != nil {
 		t.Fatalf("pick = (%v, %v), want (nil, nil) with no runnable partial", partial, nonPartial)
 	}
@@ -1740,5 +1740,31 @@ func TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: partialPathDrivingKind = %v, want %v", tc.name, got, want)
 		}
+	}
+}
+
+// TestSetOpBranchPickKeptSubqueryGatherOffersNoWholePath is M0146-0137: a
+// GROUP BY member PG keeps as a subquery RTE is planned by subquery_planner,
+// whose final rel keeps the cheaper Finalize-over-Gather path and drops the
+// dominated serial one, so it has no parallel_safe path for a Parallel Append
+// to claim whole (TPC-DS Q66). A member without an aggregate over its Gather,
+// or a pulled-up member, still offers its stripped serial plan.
+func TestSetOpBranchPickKeptSubqueryGatherOffersNoWholePath(t *testing.T) {
+	tbl := &catalog.Table{Name: "t", Columns: []catalog.Column{{Name: "a", Type: catalog.Type{Name: "int4"}}}}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "a", Type: catalog.Type{Name: "int4"}}}}
+	gathered := &Gather{Child: scan}
+	grouped := &Aggregate{Child: &Gather{Child: scan}, GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "a"}}}
+	setOpRel := &RelOptInfo{ConsiderParallel: true}
+	if _, np := setOpBranchPick(setOpRel, nil, grouped, false, true); np != nil {
+		t.Fatalf("kept-subquery member aggregating over a Gather: non-partial pick %v, want nil", np)
+	}
+	if !aggregatesOverGather(grouped) || aggregatesOverGather(gathered) {
+		t.Fatal("aggregatesOverGather must see the aggregate over the Gather and only it")
+	}
+	if _, np := setOpBranchPick(setOpRel, nil, gathered, false, true); np == nil {
+		t.Fatal("kept-subquery join member: the stripped serial plan still stands in")
+	}
+	if _, np := setOpBranchPick(setOpRel, nil, gathered, false, false); np == nil {
+		t.Fatal("pulled-up member: the stripped serial plan must stand in as the non-partial pick")
 	}
 }

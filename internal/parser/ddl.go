@@ -622,9 +622,21 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// Standalone CREATE SCHEMA is intercepted by dispatch.go before parsing; this
 	// case handles multi-statement batches where the SQL parser runs first.
 	case p.acceptIdentKeyword("schema"):
+		// gram.y CreateSchemaStmt: CREATE SCHEMA [IF NOT EXISTS] [name]
+		// [AUTHORIZATION role]. The name is a ColId, so a quoted identifier
+		// keeps its spelling ("my.schema", "Mixed"); it used to be dropped,
+		// leaving the schema unregistered. M0119-0006.
+		var ifNotExists bool
+		if tok := p.cur(); tok.Kind != TokenQuotedIdent && strings.EqualFold(tok.Value, "if") &&
+			strings.EqualFold(p.peek(1).Value, "not") && strings.EqualFold(p.peek(2).Value, "exists") {
+			p.advance()
+			p.advance()
+			p.advance()
+			ifNotExists = true
+		}
 		var schemaName string
-		if tok := p.cur(); (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) &&
-			!strings.EqualFold(tok.Value, "authorization") {
+		if tok := p.cur(); tok.Kind == TokenQuotedIdent ||
+			((tok.Kind == TokenIdent || tok.Kind == TokenKeyword) && !strings.EqualFold(tok.Value, "authorization")) {
 			schemaName = tok.Value
 			p.advance()
 		}
@@ -652,7 +664,8 @@ func (p *parser) parseCreate() (Stmt, error) {
 			p.advance()
 		}
 		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName},
-			SchemaAuthRole: authRole, SchemaSubElementSchema: subElemSchema, SchemaHasSubElement: hasSubElem}, nil
+			SchemaAuthRole: authRole, SchemaSubElementSchema: subElemSchema, SchemaHasSubElement: hasSubElem,
+			IfNotExists: ifNotExists}, nil
 	// CREATE EXTENSION name [WITH] [SCHEMA s] [VERSION v] [CASCADE] — inserts a
 	// pg_extension row (e.g. amcheck). M0110-0003.
 	case p.acceptIdentKeyword("extension"):
@@ -9067,7 +9080,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER DOMAIN"}, nil
 	}
-	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR —
 	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
 	// its own dedicated case above, DU-002 slice 440 — "view" is
 	// intentionally not in this list; ALTER SCHEMA has its own dedicated
@@ -9076,7 +9089,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// domain follow-up.)
 	for _, objIdent := range []string{
 		"collation", "extension", "language",
-		"operator", "system",
+		"operator", // ALTER SYSTEM is routed to the grammar (M0122-0008)
 	} {
 		if p.acceptIdentKeyword(objIdent) {
 			// consume until ';' or EOF

@@ -48,6 +48,25 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// nestJoinOK is match_unsorted_outer's jointype gauntlet (joinpath.c):
+// "Nestloop only supports inner, left, semi, and anti joins". JOIN_RIGHT,
+// JOIN_RIGHT_ANTI and JOIN_FULL set nestjoinOK = false (and JOIN_RIGHT_SEMI
+// returns before any arm), so PG never runs a nested loop with the nullable
+// side outer — the LEFT orientation of the same pair carries the nested
+// loop instead. goopg's plain and materialised arms used to admit RIGHT, and
+// TPC-DS Q72 SF1 elected a `Nested Loop Right Join` (promotion outer over a
+// Materialize of the 2-row join) where PG has the LEFT nested loop with a
+// Materialized promotion inner (M0146-0144). The parameterised arm
+// (addNLIPaths) and the partial one (partialHashJoinTypeOK) already decline
+// these types.
+func nestJoinOK(jt parser.JoinType) bool {
+	switch jt {
+	case parser.JoinRight, parser.JoinRightAnti, parser.JoinRightSemi, parser.JoinFull:
+		return false
+	}
+	return true
+}
+
 // splitJoinClauses divides a joinrel's restriction list into the clauses a
 // keyed operator can KEY on for this pair of input relsets, and the residual
 // the operator must evaluate per tuple.
@@ -89,6 +108,32 @@ func splitJoinClauses(outer, inner RelSet, clauses []*restrictInfo) (keys, resid
 		residual = append(residual, ri)
 	}
 	return keys, residual
+}
+
+// mergeableKeys splits the hash-capable keys into the mergeclauses and the
+// rest: a SubPlan key (restrictInfo.subplanKey) joins the residual, because a
+// merge join would have to sort its inputs on an expression that runs a
+// SubPlan (M0146-0207). Without SubPlan keys it returns its inputs unchanged.
+func mergeableKeys(keys, residual []*restrictInfo) (mkeys, mres []*restrictInfo) {
+	n := 0
+	for _, ri := range keys {
+		if ri != nil && ri.subplanKey {
+			n++
+		}
+	}
+	if n == 0 {
+		return keys, residual
+	}
+	mkeys = make([]*restrictInfo, 0, len(keys)-n)
+	mres = make([]*restrictInfo, 0, len(residual)+n)
+	for _, ri := range keys {
+		if ri != nil && ri.subplanKey {
+			mres = append(mres, ri)
+		} else {
+			mkeys = append(mkeys, ri)
+		}
+	}
+	return mkeys, append(mres, residual...)
 }
 
 // isKeyableFor is `clause_sides_match_join` for one clause: the equality's two
@@ -182,6 +227,9 @@ const (
 type mergeUnique struct {
 	side uniqueSide
 	path *Path
+	// innerUnique is the pair's extra->inner_unique (extraInnerUnique),
+	// which get_memoize_path reads for the partial nested loop too.
+	innerUnique bool
 }
 
 func jointypeForDirection(sjinfo *SpecialJoinInfo, outer, inner *RelOptInfo, cp costParams) (parser.JoinType, uniqueSide, bool) {
@@ -389,7 +437,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// path (sort_inner_and_outer :1406-1418, match_unsorted_outer
 	// :1881-1890, consider_parallel_nestloop :2171-2178). Reading the raw
 	// side instead joins every duplicate of the semi join's RHS.
-	mu := mergeUnique{side: uniq}
+	mu := mergeUnique{side: uniq, innerUnique: s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)}
 	switch uniq {
 	case uniqueSideOuter:
 		mu.path = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
@@ -397,11 +445,12 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		mu.path = createUniquePath(inner, inner.CheapestTotal, sjinfo, cp)
 	}
 	// M0146-0005f: final_cost_nestloop takes the same early-exit branch for
-	// an INNER pair whose inner rel is proven unique (extra->inner_unique),
+	// a pair whose inner rel is proven unique (extra->inner_unique; INNER and,
+	// since M0146-0183, the outer joins — innerUniqueJoinType),
 	// with the inner-join factors (outer_match_frac = the clause selectivity,
 	// match_count = the inner's rows). A unique-ified pair is left alone: PG
 	// computes its factors with the SEMI SpecialJoinInfo.
-	if !semi.apply && jt == parser.JoinInner && uniq == uniqueSideNone &&
+	if !semi.apply && innerUniqueJoinType(jt) && uniq == uniqueSideNone &&
 		s.innerRelProvenUnique(outer, inner, clauses, true) {
 		frac, matchCount := s.innerUniqueMatchFactors(inner, clauses)
 		semi = semiAntiJoinFactors{apply: true, outerMatchFrac: frac, matchCount: matchCount}
@@ -461,7 +510,10 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 		// lifted its SEMI/ANTI decline once the design doc's §5 trace-through
 		// confirmed the lowering/execution path is generic (see mergeDeclined's
 		// comment above for the citation).
-		if len(keys) > 0 {
+		// M0146-0207: a SubPlan key is a hash clause only; the merge arms
+		// evaluate it with the residual.
+		mkeys, mres := mergeableKeys(keys, residual)
+		if len(mkeys) > 0 {
 			if !mergeDeclined {
 				// extra->inner_unique (joinpath.c:152-179): false for SEMI
 				// and ANTI, true for a unique-ified inner, else whether the
@@ -487,7 +539,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
-				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// PG's arm 2, `match_unsorted_outer` (:290), sits between arm 1
 				// and arm 4 — so a merge over an already-ordered outer is offered
 				// to `addPath` BEFORE the hash path, and wins an exact tie against
@@ -495,21 +547,23 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				// here; goopg's nested-loop halves (`addNestLoopPath` /
 				// `addNLIPaths` / `addPartialNestLoopPaths`) follow this block,
 				// still ahead of the hash arm (M0146-0005bk).
-				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				matchUnsortedOuterMerge(joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 				// E-20 Cut 3: PG's `consider_parallel_mergejoin`
 				// (joinpath.c:2071-2097) beside the serial arm above — every
 				// already-ordered partial outer (the cheapest is almost never
 				// the ordered one) against the cheapest parallel-safe complete
 				// inner. First candidate per outer only; the truncation search
 				// is a follow-up the A/B can motivate.
-				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, keys, residual, mergeTuplesFor, scanSelFor, paramSrc, mu)
+				matchUnsortedOuterMergePartial(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)
 			}
 		}
 		// The nested loop keys on nothing, so the key set rejoins the
 		// residual: it evaluates every clause, on every pair. Passing
 		// `clauses` whole rather than `append(keys, residual...)` also keeps
 		// the input order.
-		addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
+		if nestJoinOK(jt) {
+			addNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
+		}
 	}
 	// PG runs this inside the same `outerrel->pathlist` loop as the arms above
 	// (joinpath.c:1949), unconditionally for every jointype `nestjoinOK`
@@ -517,7 +571,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	addNLIPaths(s, joinrel, outer, inner, cp, jt, clauses, paramSrc, uniq, sjinfo, semi)
 	// The materialised inner comes after the parameterised probes, as in
 	// match_unsorted_outer's per-outer order (addMaterialNestLoopPath).
-	if !pathParamByRel(i, outer) {
+	if !pathParamByRel(i, outer) && nestJoinOK(jt) {
 		addMaterialNestLoopPath(joinrel, outer, inner, cp, jt, clauses, uniq, sjinfo, semi)
 	}
 	// R60 (plan-parity-fix take2): PG's post-serial-arms parallel block runs

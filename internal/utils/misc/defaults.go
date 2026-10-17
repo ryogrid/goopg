@@ -45,6 +45,48 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextInternal, Flags: FlagDisallowInFile,
 		Scope: ScopeServer,
 	}))
+	// The other PGC_INTERNAL "Preset Options" (guc_tables.c): read-only
+	// reports of compile-time limits and server state. Clients query some of
+	// them on connect (`SHOW max_identifier_length`); goopg answered
+	// "unrecognized configuration parameter" (M0122-0008 slice 7). The
+	// limits are PG's NAMEDATALEN-1, FUNC_MAX_ARGS, INDEX_MAX_KEYS, RELSEG_SIZE
+	// and XLOG_BLCKSZ, which goopg's on-disk format and catalogs follow.
+	for _, c := range []struct {
+		name, boot string
+		unit       Unit
+	}{
+		{"max_identifier_length", "63", UnitNone},
+		{"max_function_args", "100", UnitNone},
+		{"max_index_keys", "32", UnitNone},
+		{"segment_size", "131072", UnitBlocks}, // RELSEG_SIZE: 1GB segments
+		{"wal_block_size", "8192", UnitNone},
+	} {
+		r.MustRegister(NewVariable(Variable{
+			Name: c.name, Type: TypeInt, Unit: c.unit, BootVal: c.boot,
+			Context: ContextInternal, Flags: FlagDisallowInFile,
+			Scope: ScopeServer,
+		}))
+	}
+	r.MustRegister(NewVariable(Variable{
+		Name: "debug_assertions", Type: TypeBool, BootVal: "off",
+		Context: ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
+	// data_checksums and huge_pages_status describe the running cluster: the
+	// boot values are PG's, and cmd/goopg records the real state at start
+	// (pg_control's data_checksum_version; goopg never maps huge pages), as
+	// PG's startup does with SetConfigOption(PGC_S_DYNAMIC_DEFAULT).
+	r.MustRegister(NewVariable(Variable{
+		Name: "data_checksums", Type: TypeBool, BootVal: "off",
+		Context: ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "huge_pages_status", Type: TypeEnum, BootVal: "unknown",
+		EnumOptions: []string{"off", "on", "unknown"},
+		Context:     ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_encoding", Type: TypeString, BootVal: "UTF8",
 		Context: ContextUserset, Flags: FlagReport,
@@ -53,7 +95,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "DateStyle", Type: TypeString, BootVal: "ISO, MDY",
-		Context: ContextUserset, Flags: FlagReport,
+		Context: ContextUserset, Flags: FlagReport | FlagListInput,
 		Scope: ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -262,20 +304,20 @@ func BuildDefaultRegistry() *Registry {
 	// only place that resolves the negative shorthand into positive
 	// coarsening thresholds.
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_xact", Type: TypeInt, BootVal: "64",
-		MinVal: 10, MaxVal: 1 << 30,
+		Name: "max_pred_locks_per_transaction", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: math.MaxInt32,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_relation", Type: TypeInt, BootVal: "-2",
-		MinVal: -1 << 30, MaxVal: 1 << 30,
+		Name: "max_pred_locks_per_relation", Type: TypeInt, BootVal: "-2",
+		MinVal: math.MinInt32, MaxVal: math.MaxInt32,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "max_predicate_locks_per_page", Type: TypeInt, BootVal: "2",
-		MinVal: 0, MaxVal: 1 << 16,
+		Name: "max_pred_locks_per_page", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: math.MaxInt32,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
@@ -285,6 +327,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "listen_addresses", Type: TypeString, BootVal: "localhost",
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
+		Flags:   FlagListInput,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "port", Type: TypeInt, BootVal: "5432",
@@ -321,7 +364,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "scram_iterations", Type: TypeInt, BootVal: "4096",
-		MinVal: 1, MaxVal: 1 << 30,
+		MinVal: 1, MaxVal: math.MaxInt32,
 		Context: ContextUserset, Flags: FlagReport,
 		Scope: ScopeSession,
 	}))
@@ -458,7 +501,7 @@ func BuildDefaultRegistry() *Registry {
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
-		Context: ContextUserset,
+		Context: ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:   ScopeServer,
 	}))
 
@@ -472,9 +515,9 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name:        "compute_query_id",
 		Type:        TypeEnum,
-		BootVal:     "off",
+		BootVal:     "auto",
 		EnumOptions: []string{"off", "on", "auto", "regress"},
-		Context:     ContextUserset,
+		Context:     ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:       ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -526,33 +569,41 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
-	// wal_sender_memory_buffer sizes (in bytes) the in-memory
+	// goopg.wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
 	// RecordIterator. 0 disables the ring; >0 mirrors every
 	// successful WAL write so senders can stream without
 	// disk reads. Default 16 MiB. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	//
+	// PG 18.3 has no such parameter. goopg's own knobs live in the
+	// "goopg." custom-variable namespace, the form PG gives an
+	// extension's parameters (DefineCustomIntVariable), so a plain name
+	// PG rejects is never accepted here (M0122-0008).
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_sender_memory_buffer", Type: TypeInt, BootVal: "16777216",
+		Name: GoopgWalSenderMemoryBuffer, Type: TypeInt, BootVal: "16777216",
 		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
 
-	// wal_buffers sizes (in bytes) the bounded in-memory WAL
-	// buffer that holds generated WAL records before they hit
-	// segment files. Default 16 MiB matches PostgreSQL's
-	// default. Records ≤ wal_buffers stay in RAM until either
-	// (a) Append would overflow the buffer (drain just enough
-	// to make room) or (b) FlushUpTo demands a byte ≤ the
-	// requested LSN be on disk and durable. 0 disables the
-	// buffer entirely (every Append calls writeAt directly —
-	// pre-M0013 behaviour). Records larger than wal_buffers
-	// bypass the buffer in one shot rather than fragment.
-	// See docs/design/0013-0001-wal-buffers-architecture.md.
+	// wal_buffers sizes the bounded in-memory WAL buffer that holds
+	// generated WAL records before they hit segment files. Records ≤
+	// wal_buffers stay in RAM until either (a) Append would overflow the
+	// buffer (drain just enough to make room) or (b) FlushUpTo demands a
+	// byte ≤ the requested LSN be on disk and durable. Records larger than
+	// wal_buffers bypass the buffer in one shot rather than fragment. See
+	// docs/design/0013-0001-wal-buffers-architecture.md.
+	//
+	// As in guc_tables.c it is counted in XLOG_BLCKSZ pages
+	// (GUC_UNIT_XBLOCKS; UnitBlocks, the same 8kB), boot value -1 meaning
+	// auto-tune, range -1..INT_MAX/XLOG_BLCKSZ. cmd/goopg resolves -1 the
+	// way check_wal_buffers / XLOGChooseNumBuffers do (shared_buffers/32,
+	// clamped to 8 pages .. one WAL segment), raises a manual value below 4
+	// to 4, and stores the result back so SHOW reports it, as PG does.
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_buffers", Type: TypeInt, BootVal: "16777216",
-		MinVal: 0, MaxVal: 1 << 30,
+		Name: "wal_buffers", Type: TypeInt, Unit: UnitBlocks, BootVal: "-1",
+		MinVal: -1, MaxVal: math.MaxInt32 / 8192,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
@@ -587,6 +638,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "synchronous_standby_names", Type: TypeString, BootVal: "",
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
+		Flags:   FlagListInput,
 	}))
 
 	// wal_writer_delay sets the period (in milliseconds) of the
@@ -595,21 +647,23 @@ func BuildDefaultRegistry() *Registry {
 	// Default 200ms mirrors upstream's wal_writer_delay GUC. See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_writer_delay", Type: TypeInt, BootVal: "200",
+		Name: "wal_writer_delay", Type: TypeInt, Unit: UnitMs, BootVal: "200",
 		MinVal: 1, MaxVal: 10000,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
-	// wal_writer_flush_after sets the threshold (in bytes) above which
-	// the WAL writer loop issues an fdatasync in addition to writing.
-	// Default 1 MiB mirrors upstream's wal_writer_flush_after GUC. 0
-	// means always fsync on every loop iteration. See
+	// wal_writer_flush_after sets the threshold, in XLOG_BLCKSZ pages
+	// (GUC_UNIT_XBLOCKS; XLOG_BLCKSZ equals BLCKSZ, so UnitBlocks), above
+	// which the WAL writer loop issues an fdatasync in addition to writing.
+	// Default 128 pages (1MB) and range 0..INT_MAX follow guc_tables.c. 0
+	// means always fsync on every loop iteration. cmd/goopg converts it to
+	// bytes for the WAL writer. See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
 	r.MustRegister(NewVariable(Variable{
-		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
-		MinVal: 0, MaxVal: 1 << 30,
-		Context: ContextPostmaster,
+		Name: "wal_writer_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "128",
+		MinVal: 0, MaxVal: math.MaxInt32,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -621,7 +675,7 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "commit_delay", Type: TypeInt, BootVal: "0",
 		MinVal: 0, MaxVal: 100000,
-		Context: ContextUserset,
+		Context: ContextSuset, // PGC_SUSET (guc_tables.c)
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -635,14 +689,14 @@ func BuildDefaultRegistry() *Registry {
 	// writer goroutine wakes up to flush dirty buffer-pool pages.
 	// Default 200ms mirrors upstream's bgwriter_delay GUC (M0048-0003).
 	r.MustRegister(NewVariable(Variable{
-		Name: "bgwriter_delay", Type: TypeInt, BootVal: "200",
+		Name: "bgwriter_delay", Type: TypeInt, Unit: UnitMs, BootVal: "200",
 		MinVal: 10, MaxVal: 10000,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
 	// checkpoint_flush_after / bgwriter_flush_after / backend_flush_after
-	// set the writeback threshold (in BLCKSZ pages) for the checkpointer /
+	// set the writeback threshold (in BLCKSZ pages, GUC_UNIT_BLOCKS) for the checkpointer /
 	// bgwriter / an individual backend's own dirty-victim-eviction writes;
 	// once a context's running total crosses its threshold, goopg issues
 	// a real sync_file_range(2) write-behind hint (0 disables it — see
@@ -654,30 +708,30 @@ func BuildDefaultRegistry() *Registry {
 	// (per-session); goopg applies it as a single process-wide threshold
 	// instead (see deferral ledger).
 	r.MustRegister(NewVariable(Variable{
-		Name: "checkpoint_flush_after", Type: TypeInt, BootVal: "32",
+		Name: "checkpoint_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "32",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "bgwriter_flush_after", Type: TypeInt, BootVal: "64",
+		Name: "bgwriter_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "64",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "backend_flush_after", Type: TypeInt, BootVal: "0",
+		Name: "backend_flush_after", Type: TypeInt, Unit: UnitBlocks, BootVal: "0",
 		MinVal: 0, MaxVal: 256,
 		Context: ContextUserset,
 	}))
 
 	// bgwriter_lru_maxpages caps how many dirty pages the background
-	// writer flushes per tick. 0 disables the bgwriter. Default 100
+	// writer flushes per tick. 0 stops the writes. Default 100
 	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
 	r.MustRegister(NewVariable(Variable{
 		Name: "bgwriter_lru_maxpages", Type: TypeInt, BootVal: "100",
-		MinVal: 0, MaxVal: 1000,
-		Context: ContextPostmaster,
+		MinVal: 0, MaxVal: math.MaxInt32 / 2, // guc_tables.c: same limit as shared_buffers
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); reloaded via Runtime.ApplyWriterSettings
 		Scope:   ScopeServer,
 	}))
 
@@ -698,7 +752,7 @@ func BuildDefaultRegistry() *Registry {
 	// Upstream's default is 3; we mirror it.
 	r.MustRegister(NewVariable(Variable{
 		Name: "io_workers", Type: TypeInt, BootVal: "3",
-		MinVal: 1, MaxVal: 1024,
+		MinVal: 1, MaxVal: 32, // MAX_IO_WORKERS (proc.h)
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
@@ -781,8 +835,13 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
 		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning", "error"},
-		Context:     ContextUserset,
-		Scope:       ScopeSession | ScopeTransaction,
+		// client_message_level_options' hidden rows: debug = DEBUG2, shown
+		// as debug2; info = INFO, the only row with that level, so it
+		// shows as itself (config_enum_lookup_by_value returns the first
+		// row carrying the value, hidden or not).
+		EnumHidden: map[string]string{"debug": "debug2", "info": "info"},
+		Context:    ContextUserset,
+		Scope:      ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "statement_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
@@ -835,7 +894,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "random_page_cost", Type: TypeReal, BootVal: "4.0",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -852,21 +911,21 @@ func BuildDefaultRegistry() *Registry {
 	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_optimize_above_cost", Type: TypeReal, BootVal: "500000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_inline_above_cost", Type: TypeReal, BootVal: "500000",
-		MinVal: -1, MaxVal: 1e15,
+		MinVal: -1, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -904,7 +963,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
-		Flags:   FlagExplain,
+		Flags:   FlagExplain | FlagListInput | FlagListQuote,
 	}))
 
 	// transaction_isolation is what JDBC's getTransactionIsolation()
@@ -919,9 +978,10 @@ func BuildDefaultRegistry() *Registry {
 
 	// Opportunistic page pruning (M0046-0002). When on, the HOT-update
 	// path tries to reclaim universally-dead tuples inline when a page
-	// is full, avoiding an unnecessary relation extension.
+	// is full, avoiding an unnecessary relation extension. A goopg-only
+	// knob, so it lives in the "goopg." namespace (M0122-0008).
 	r.MustRegister(NewVariable(Variable{
-		Name: "enable_opportunistic_prune", Type: TypeBool, BootVal: "on",
+		Name: GoopgEnableOpportunisticPrune, Type: TypeBool, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -1006,7 +1066,7 @@ func BuildDefaultRegistry() *Registry {
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
-		MinVal: 0, MaxVal: 1 << 30,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -1017,21 +1077,21 @@ func BuildDefaultRegistry() *Registry {
 	// can SET them without an "unrecognized configuration parameter" error.
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_tuple_cost", Type: TypeReal, BootVal: "0.01",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_index_tuple_cost", Type: TypeReal, BootVal: "0.005",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_operator_cost", Type: TypeReal, BootVal: "0.0025",
-		MinVal: 0, MaxVal: 1e9,
+		MinVal: 0, MaxVal: math.MaxFloat64, // DBL_MAX (guc_tables.c)
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 		Flags:   FlagExplain,
@@ -1114,13 +1174,7 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "vacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "400000000",
-		MinVal: 1000000, MaxVal: 5000000000,
-		Context: ContextUserset,
-		Scope:   ScopeSession,
-	}))
-	r.MustRegister(NewVariable(Variable{
-		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1500000000",
+		Name: "vacuum_multixact_failsafe_age", Type: TypeInt, BootVal: "1600000000",
 		MinVal: 0, MaxVal: 2100000000,
 		Context: ContextUserset,
 		Scope:   ScopeSession,
@@ -1173,27 +1227,30 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "autovacuum_vacuum_max_threshold", Type: TypeInt, BootVal: "200000000",
-		MinVal: 0, MaxVal: 2147483647,
+		Name: "autovacuum_vacuum_max_threshold", Type: TypeInt, BootVal: "100000000",
+		MinVal: -1, MaxVal: math.MaxInt32, // guc_tables.c; -1 = no cap
 		Context: ContextSigHup,
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "autovacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "4000000000",
-		MinVal: 1000000, MaxVal: 5000000000,
+		// guc_tables.c: 400000000, 10000..2000000000. goopg had 4000000000
+		// and 1000000..5000000000, and also registered a
+		// vacuum_multixact_freeze_max_age PG does not have (M0122-0008).
+		Name: "autovacuum_multixact_freeze_max_age", Type: TypeInt, BootVal: "400000000",
+		MinVal: 10000, MaxVal: 2000000000,
 		Context: ContextPostmaster,
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "autovacuum_max_workers", Type: TypeInt, BootVal: "3",
 		MinVal: 1, MaxVal: 262143,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); the autovacuum launcher does not read it yet
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "autovacuum_work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "-1",
 		MinVal: -1, MaxVal: 2147483647,
-		Context: ContextPostmaster,
+		Context: ContextSigHup, // PGC_SIGHUP (guc_tables.c); the autovacuum launcher does not read it yet
 		Scope:   ScopeSession,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -1226,14 +1283,15 @@ func BuildDefaultRegistry() *Registry {
 		"enable_material", "enable_partition_pruning",
 		// M0054-0006: nested-loop index join rollback switch.
 		// `off` keeps the legacy Hash plan for joins that the
-		// rule would otherwise rewrite.
-		"enable_nestloop_index",
+		// rule would otherwise rewrite. goopg-only, so it is
+		// spelled in the "goopg." namespace (M0122-0008).
+		GoopgEnableNestLoopIndex,
 		// Additional planner method toggles present in catalog pg_settings
 		// but missing from the registry — needed so SET succeeds. M0097-0069.
 		"enable_partitionwise_join", "enable_partitionwise_aggregate",
 		"enable_parallel_hash", "enable_parallel_append",
 		"enable_gathermerge", "enable_incremental_sort",
-		// enable_memoize is no longer a no-op: like enable_nestloop_index
+		// enable_memoize is no longer a no-op: like goopg.enable_nestloop_index
 		// above, cmd/goopg/main.go bridges its OnChange to the planner's
 		// process-global kill-switch (S7).
 		"enable_async_append", "enable_memoize",
@@ -1246,17 +1304,16 @@ func BuildDefaultRegistry() *Registry {
 			Context: ContextUserset,
 			Scope:   ScopeSession | ScopeTransaction,
 			// All upstream enable_* planner-method GUCs are GUC_EXPLAIN
-			// (guc_tables.c); goopg's invented enable_nestloop_index
+			// (guc_tables.c); goopg's own goopg.enable_nestloop_index
 			// follows the same convention since it too gates a plan shape.
 			Flags: FlagExplain,
 		}))
 	}
 
-	// GEQO (genetic query optimization) GUCs. goopg's planner is
-	// rule/cost-based and never runs GEQO, so these are pure no-op
-	// stubs — but psql tab-completion, ORMs, and tuning scripts issue
-	// `SET geqo_threshold = ...` etc., and pg_settings tooling expects
-	// the whole family present. Names, defaults, and ranges mirror
+	// GEQO (genetic query optimization) GUCs. The planner consumes them:
+	// internal/optimizer/geqo.go is a port of PG's GEQO, which runs at
+	// geqo_threshold and draws from PG's pg_prng seeded by geqo_seed
+	// (M0146-0214). Names, defaults, and ranges mirror
 	// postgres/src/backend/utils/misc/guc_tables.c (QUERY_TUNING_GEQO,
 	// all PGC_USERSET / GUC_EXPLAIN); numeric bounds come from
 	// src/include/optimizer/geqo.h. M0122-0007.
@@ -1435,6 +1492,26 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession,
 	}))
+	// log_min_messages / log_error_verbosity (guc_tables.c, PGC_SUSET):
+	// registered with PG's option lists so a postgresql.conf or
+	// postgresql.auto.conf naming them — a pg_basebackup of a PG cluster
+	// carries its auto file — does not stop the server at startup
+	// (ProcessConfigFileInternal treats an unknown name as fatal there, so
+	// the failure itself is PG-faithful; the gap was the missing names).
+	// goopg's server log does not filter or format by them yet.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_min_messages", Type: TypeEnum, BootVal: "warning",
+		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "info", "notice", "warning", "error", "log", "fatal", "panic"},
+		EnumHidden:  map[string]string{"debug": "debug2"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_error_verbosity", Type: TypeEnum, BootVal: "default",
+		EnumOptions: []string{"terse", "default", "verbose"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 	// log_line_prefix: PGC_SIGHUP in upstream (guc_tables.c) — config-file
 	// only, never client-SET-able, unlike log_statement/log_min_duration_statement
 	// above. goopg's statement/duration log lines
@@ -1501,6 +1578,16 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// wal_summary_keep_time: how long a WAL summary file whose WAL is gone
+	// is kept (guc_tables.c: minutes, 10 days, 0..INT_MAX/60, PGC_SIGHUP;
+	// 0 disables removal). The summarizer applies it once per checkpoint
+	// cycle (MaybeRemoveOldWalSummaries). M0122-0009 S5.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_summary_keep_time", Type: TypeInt, Unit: UnitMin, BootVal: "14400",
+		MinVal: 0, MaxVal: math.MaxInt32 / 60,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// Primary-side: how many concurrent replication connections /
 	// slots / how long the walsender waits for client status
@@ -1539,8 +1626,8 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
-		MinVal: 0, MaxVal: 1 << 30,
-		Context: ContextSigHup,
+		MinVal: 0, MaxVal: math.MaxInt32,
+		Context: ContextUserset, // PGC_USERSET (guc_tables.c); the walsender has no timeout yet
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{

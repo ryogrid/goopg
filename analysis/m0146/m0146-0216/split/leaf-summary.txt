@@ -1,0 +1,12 @@
+goopg store_sales: leaves=2483 chained=2483 tuples=719876 mean_items=289.9 mean_free=2334
+  items-per-leaf histogram (top 8): 206:30, 208:27, 204:26, 210:22, 271:21, 316:21, 283:21, 214:21
+PG    store_sales: leaves=2556 chained=2556 tuples=719876 mean_items=281.6 mean_free=2499
+  items-per-leaf histogram (top 8): 214:25, 237:24, 325:22, 243:20, 249:20, 331:20, 290:19, 252:19
+goopg inventory: leaves=12715 chained=12715 tuples=2355000 mean_items=185.2 mean_free=2934
+  items-per-leaf histogram (top 8): 183:3299, 181:1779, 178:1728, 188:1675, 241:1624, 151:1519, 145:414, 235:155
+PG    inventory: leaves=12560 chained=12560 tuples=2355000 mean_items=187.5 mean_free=2882
+  items-per-leaf histogram (top 8): 180:5079, 185:3455, 240:1779, 155:1675, 290:155, 145:104, 150:103, 215:52
+goopg catalog_sales: leaves=1220 chained=1220 tuples=360397 mean_items=295.4 mean_free=2224
+  items-per-leaf histogram (top 8): 293:18, 299:16, 292:15, 301:14, 307:14, 310:14, 285:13, 269:13
+PG    catalog_sales: leaves=1244 chained=1244 tuples=360397 mean_items=289.7 mean_free=2338
+  items-per-leaf histogram (top 8): 281:18, 319:17, 291:15, 337:15, 285:15, 297:14, 292:14, 284:14

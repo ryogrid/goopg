@@ -19,6 +19,8 @@ package optimizer
 // (`createAggPlan`, createplansimple.go).
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -54,6 +56,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 		// thing a throwaway registry loses is the (kind, relids) identity
 		// a later upper rel would have shared.
 		u = newUpperRels()
+		u.cat = cat
 	}
 	// Non-simple modes (parallel Partial/Final) are not shaped here at
 	// all — the old rules skipped them too, and the only production caller
@@ -76,7 +79,10 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// cost are the child's own, by the C-12 monotonicity argument.
 	seed := newPrebuiltPath(grouped, child)
 	seed.Rows = inputRows
-	if pc := legacyDisplayCostOf(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
+	// M0146-0211: the input path's own cost, through goopg's Project
+	// wrappers (upperInputPathCost), as create_grouping_paths prices
+	// cheapest_input_path.
+	if pc := upperInputPathCost(child); pc.PlanRows > 0 || pc.TotalCost > 0 {
 		seed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
 	}
 	// R54 redesign (REDESIGN.md rev 2): size the seed from the search
@@ -295,6 +301,34 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		grouppathkeys = append(grouppathkeys, PathKey{Expr: aggNode.GroupExprs[k.Pos], SortAsc: !k.Desc, NullsFirst: k.NullsFirst})
 	}
 
+	cands := make([][]PathKey, len(candidates))
+	for i := range candidates {
+		cands[i] = candidates[i].pathkeys
+	}
+	bestpathkeys := bestCoveringAggPathkeys(grouppathkeys, cands)
+	if bestpathkeys == nil {
+		return nil, false
+	}
+
+	finalSortKeys := make([]SortKey, 0, len(bestpathkeys))
+	for _, pk := range bestpathkeys {
+		finalSortKeys = append(finalSortKeys, SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst})
+	}
+	return finalSortKeys, true
+}
+
+// bestCoveringAggPathkeys is adjust_group_pathkeys_for_groupagg's selection
+// loop (planner.c): take the first unprocessed aggregate's pathkeys (behind
+// the GROUP BY pathkeys), absorb every aggregate whose keys are equal, weaker
+// or stronger along the same prefix, then retry with the aggregates left over
+// while they could still cover more than the best set so far. It returns the
+// winning group-plus-aggregate pathkeys, or nil when there is no candidate.
+//
+// Shared by the aggregate stage (presortedAggKeysOrAbsent, over the built
+// Aggregate's expressions) and the pre-search query pathkeys
+// (adjustGroupPathkeysForGroupAgg, over FROM-level columns), so both read the
+// same aggregates the same way (M0146-0142).
+func bestCoveringAggPathkeys(grouppathkeys []PathKey, candidates [][]PathKey) []PathKey {
 	bestCount := 0
 	var bestpathkeys []PathKey
 	unprocessed := make([]int, len(candidates))
@@ -305,7 +339,7 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 		var currpathkeys []PathKey
 		covered := make([]bool, len(candidates))
 		for _, ui := range unprocessed {
-			pk := appendPathKeys(append([]PathKey(nil), grouppathkeys...), candidates[ui].pathkeys)
+			pk := appendPathKeys(append([]PathKey(nil), grouppathkeys...), candidates[ui])
 			if currpathkeys == nil {
 				currpathkeys = pk
 				covered[ui] = true
@@ -338,15 +372,7 @@ func presortedAggKeysOrAbsent(aggNode *Aggregate, ps PlannerSettings) ([]SortKey
 			bestpathkeys = currpathkeys
 		}
 	}
-	if bestpathkeys == nil {
-		return nil, false
-	}
-
-	finalSortKeys := make([]SortKey, 0, len(bestpathkeys))
-	for _, pk := range bestpathkeys {
-		finalSortKeys = append(finalSortKeys, SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst})
-	}
-	return finalSortKeys, true
+	return bestpathkeys
 }
 
 // groupKeysSortKeys is one SortKey per group expression, in the order and
@@ -415,6 +441,53 @@ func aggInputWidth(child Node, agg *Aggregate) (ncols int, avgVarBytes float64) 
 	return len(cols), nodeAvgVarBytes(cols)
 }
 
+// aggInputPGWidth is the PG width of the same input row aggInputWidth sizes —
+// the input path's `pathtarget->width`, the `input_width` cost_agg's spill arm
+// hands to `hash_agg_entry_size` and to `relation_byte_size`
+// (costsize.c:2801-2802, :2824; M0141-S2a-fix2r-a).
+//
+// Each column is sized as `set_rel_width` sizes a Var (costsize.c:6253):
+// `get_attavgwidth`'s ANALYZE stawidth when it is positive, else
+// `get_typavgwidth` (`typeWidth`). The stawidths are the searched input
+// rel's per-column map (`ColVarBytes`, filled from ColumnStats.AvgWidth); a
+// column it does not name falls back to its type width.
+func aggInputPGWidth(child Node, agg *Aggregate) int {
+	if child == nil {
+		return 0
+	}
+	cols := child.Output()
+	if agg != nil && agg.InputTargetKnown {
+		kept := make(Schema, 0, len(agg.InputTarget))
+		for _, idx := range agg.InputTarget {
+			if idx >= 0 && idx < len(cols) {
+				kept = append(kept, cols[idx])
+			}
+		}
+		cols = kept
+	}
+	if len(cols) == 0 {
+		return 0
+	}
+	var stawidths map[string]float64
+	if sr := searchedJoinInputRelOf(child); sr != nil {
+		stawidths = sr.ColVarBytes
+	}
+	w := 0
+	for _, c := range cols {
+		// stawidth is an int32 in pg_statistic; ANALYZE truncates its
+		// average the same way.
+		if sw := int(stawidths[strings.ToLower(c.Name)]); sw > 0 {
+			w += sw
+			continue
+		}
+		w += typeWidth(c.Type)
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
 // addGroupingPaths is the per-input body of `add_paths_to_grouping_rel`
 // (planner.c:7114) for goopg's one input: at most one hashed, one sorted
 // (Sort- or index-driven), and one plain candidate. Single candidate per
@@ -425,6 +498,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
 	numGroups := grouped.Rows
 	inNcols, inAvgVar := aggInputWidth(child, aggNode)
+	inWidth := aggInputPGWidth(child, aggNode)
 	// M0144-0003c: the Sort beneath a grouping candidate must be priced on the
 	// SAME narrowed row the aggregate above it is priced on.
 	//
@@ -469,9 +543,28 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		input := seed
 		producer := groupAggPlainProducer
 		if presorted {
-			// M0144-0003c: narrowed seed — both sort sites change together
-			// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
-			input = sortPathForBounded(sortSeed, pathkeysForSortKeys(presortedKeys), cp, -1)
+			// M0146-0142: add_paths_to_grouping_rel's AGG_PLAIN arm goes
+			// through make_ordered_path like AGG_SORTED does: an input whose
+			// pathkeys already contain the presorted-aggregate keys feeds the
+			// Aggregate with no Sort (TPC-DS Q95's count(DISTINCT
+			// ws_order_number) over a Gather Merge sorted on it, now that the
+			// query pathkeys ask the search for that order). Same is_sorted
+			// test as the grouped arm below.
+			wantKeys := pathkeysForSortKeys(presortedKeys)
+			var seedUseful *pathkeyUsefulness
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				seedUseful = sr.usefulKeys
+			}
+			if seedKeys := inputNodePathkeys(child); len(seedKeys) > 0 &&
+				func() bool { c, _ := seedUseful.countContainedIn(seedKeys, wantKeys); return c }() {
+				sorted := *seed
+				sorted.Pathkeys = seedKeys
+				input = &sorted
+			} else {
+				// M0144-0003c: narrowed seed — both sort sites change together
+				// (Hard-won Rule #2, the PLAIN and SORTED arms are one twin pair).
+				input = sortPathForBounded(sortSeed, wantKeys, cp, -1)
+			}
 			producer = groupAggSortedProducer
 		}
 		// R47 slice 1: per-candidate spec clone. All arms below used
@@ -491,8 +584,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		addPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
-			Cost: costAgg(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
-				0, 1, len(plainSpec.Aggs), inNcols, inAvgVar),
+			Cost: costAggClause(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
+				0, 1, len(plainSpec.Aggs), inWidth, aggClauseCosts(cp, &plainSpec, aggSplitSimple)),
 			Pathkeys: input.Pathkeys, Children: []*Path{input},
 		}, producer)
 		return
@@ -562,17 +655,33 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// a CTE scan over a sorted body, a sorted aggregate, a Sort); the
 			// searched-input candidates below cover the join-search case.
 			isSorted := false
+			// M0146-0134: the seed's ordering is compared through the
+			// searched rel's equivalence classes, as PG's canonical pathkeys
+			// are — make_ordered_path then builds ONE ordering step for the
+			// cheapest input: none, an Incremental Sort, or a Sort.
+			var seedUseful *pathkeyUsefulness
+			if sr := searchedJoinInputRelOf(child); sr != nil {
+				seedUseful = sr.usefulKeys
+			}
 			if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
-				pathkeysContainedIn(seedKeys, pathkeysForSortKeys(keys)) {
+				func() bool { c, _ := seedUseful.countContainedIn(seedKeys, pathkeysForSortKeys(keys)); return c }() {
 				sorted := *seed
 				sorted.Pathkeys = seedKeys
 				presortedSpec := *aggNode
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
-						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inNcols, inAvgVar),
-					Pathkeys: sorted.Pathkeys, Children: []*Path{&sorted},
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
+						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth, aggClauseCosts(cp, &presortedSpec, aggSplitSimple)),
+					// M0146-0189: the group keys' pathkeys, as every other
+					// grouping arm files (the sort and search-candidate arms,
+					// the partial split). The seed's own keys name the same
+					// ordering in the joined tree's coordinates; PG's canonical
+					// pathkeys make the two one, but syntactic ones made add_path
+					// call them PATHKEYS_DIFFERENT, so a fuzzily-tied, slow-start
+					// Finalize split survived beside this fast-start path and won
+					// on total (TPC-DS Q77's ws).
+					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{&sorted},
 				}, groupAggSortedProducer)
 				isSorted = true // upstream offers no Sort over this same path
 			}
@@ -588,7 +697,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				groupPathkeys := pathkeysForSortKeys(keys)
 				var sortedInput *Path
 				if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
-					if _, n := pathkeysCountContainedIn(seedKeys, groupPathkeys); n > 0 {
+					if _, n := seedUseful.countContainedIn(seedKeys, groupPathkeys); n > 0 {
 						incSeed := *sortSeed
 						incSeed.Pathkeys = seedKeys
 						sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
@@ -602,8 +711,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inNcols, inAvgVar),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth, aggClauseCosts(cp, &sortSpec, aggSplitSimple)),
 					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
 				}, groupAggSortedProducer)
 			}
@@ -619,7 +728,11 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					// Incremental Sort (M0146-0006), and one with no
 					// presorted key is not offered (only the cheapest input
 					// is fully sorted, above).
-					contained, nCommon := pathkeysCountContainedIn(candKeys[i], groupPathkeys)
+					// M0146-0134: through the searched rel's equivalence
+					// classes, as PG's canonical pathkeys compare — Q64's
+					// input ordered on cs_item_sk is presorted for the
+					// group key i_item_sk the join equates it with.
+					contained, nCommon := sr.usefulKeys.countContainedIn(candKeys[i], groupPathkeys)
 					if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
 						continue
 					}
@@ -639,8 +752,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					addPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,
-						Cost: costAgg(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
-							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inNcols, inAvgVar),
+						Cost: costAggClause(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
+							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth, aggClauseCosts(cp, &candSpec, aggSplitSimple)),
 						Pathkeys: groupPathkeys, Children: []*Path{in},
 					}, groupAggSearchProducer)
 				}
@@ -655,8 +768,8 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &maSpec,
 					Rel: grouped, Rows: numGroups,
 					DisabledNodes: ma.DisabledNodes,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
-						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inNcols, inAvgVar),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, ma.Cost.Startup, ma.Cost.Total,
+						len(maSpec.GroupExprs), numGroups, len(maSpec.Aggs), inWidth, aggClauseCosts(cp, &maSpec, aggSplitSimple)),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{ma},
 				}, groupAggMergeProducer)
 			}
@@ -678,12 +791,12 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				if c, ok := searchRelIndexPathCost(child, idxChild); ok {
 					idxSeed.Cost = c
 				}
-				idxNcols, idxAvgVar := aggInputWidth(idxChild, idxSpec)
+				idxWidth := aggInputPGWidth(idxChild, idxSpec)
 				addPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
 					Rel: grouped, Rows: numGroups,
-					Cost: costAgg(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
-						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxNcols, idxAvgVar),
+					Cost: costAggClause(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
+						len(idxSpec.GroupExprs), numGroups, len(idxSpec.Aggs), idxWidth, aggClauseCosts(cp, idxSpec, aggSplitSimple)),
 					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{idxSeed},
 				}, groupAggSortedIdxProducer)
 			}
@@ -733,7 +846,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				mSpec.Rollups = mixedSorted
 				mSpec.HashedRollups = mixedHashed
 				c, dis, ok := costMixedRollups(cp, &mSpec, mixedHashed, mixedSorted, sortSeed, inputRows,
-					input.Cost.Startup, input.Cost.Total, inNcols, inAvgVar, ps.EnableHashAgg)
+					input.Cost.Startup, input.Cost.Total, inWidth, ps.EnableHashAgg)
 				if !ok {
 					return
 				}
@@ -795,10 +908,10 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 		!groupingSetsHashTooBig(cp, aggNode, seed, numGroups) {
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
-		hashCost := costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
-			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inNcols, inAvgVar)
+		hashCost := costAggClause(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal,
+			len(hashSpec.GroupExprs), numGroups, len(hashSpec.Aggs), inWidth, aggClauseCosts(cp, &hashSpec, aggSplitSimple))
 		if aggNode.GroupingSets != nil {
-			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inNcols, inAvgVar); ok {
+			if c, ok := groupingSetsHashedCost(cp, &hashSpec, inputRows, inputStartup, inputTotal, inWidth); ok {
 				hashCost = c
 			}
 		}
@@ -847,7 +960,7 @@ func groupingSetsHashTooBig(cp costParams, a *Aggregate, seed *Path, numGroups f
 // columns, with the summed group count, charged every set's groups to one
 // table and lost the regress `groupingsets` cases' MixedAggregate to a
 // Sort-fed GroupAggregate once the summed count reached the input.
-func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup, inputTotal float64, inNcols int, inAvgVar float64) (Cost, bool) {
+func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup, inputTotal float64, inWidth int) (Cost, bool) {
 	perSet, ok := groupingSetGroupCounts(a, int64(inputRows))
 	if !ok {
 		return Cost{}, false
@@ -868,7 +981,7 @@ func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup
 		}
 		g := float64(perSet[i])
 		if first {
-			cost = costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(set), g, nAggs, inNcols, inAvgVar)
+			cost = costAgg(cp, AggStrategyHashed, inputRows, inputStartup, inputTotal, len(set), g, nAggs, inWidth)
 			if mixed {
 				// cost_agg AGG_MIXED: the sorted arm's startup plus the
 				// spill tail's startup share (the hashed arm's startup less
@@ -880,7 +993,7 @@ func groupingSetsHashedCost(cp costParams, a *Aggregate, inputRows, inputStartup
 			first = false
 			continue
 		}
-		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(set), g, nAggs, inNcols, inAvgVar)
+		c := costAgg(cp, AggStrategyHashed, inputRows, 0, 0, len(set), g, nAggs, inWidth)
 		cost.Total += c.Total
 	}
 	if first {

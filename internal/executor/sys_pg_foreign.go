@@ -150,7 +150,7 @@ func writeForeignServerCatalogRow(ctx *Context, srv *catalog.ForeignServer) erro
 	if !ok {
 		return nil
 	}
-	if fdw, found := im.LookupForeignDataWrapper(srv.FdwName); found && fdw != nil {
+	if fdw, found := im.LookupForeignDataWrapper(srv.FdwName, srv.DBOid); found && fdw != nil {
 		if werr := writeFdwCatalogRow(ctx, fdw); werr != nil {
 			return werr
 		}
@@ -167,7 +167,7 @@ func writeForeignServerCatalogRow(ctx *Context, srv *catalog.ForeignServer) erro
 		NewIntDatum(int64(srv.OID)),
 		NewStringDatum(srv.Name),
 		NewIntDatum(int64(owner)),
-		NewIntDatum(int64(im.ForeignDataWrapperOID(srv.FdwName))),
+		NewIntDatum(int64(im.ForeignDataWrapperOID(srv.FdwName, srv.DBOid))),
 		textOrNullDatum(srv.Type),
 		textOrNullDatum(srv.Version),
 		NullDatum, // srvacl

@@ -66,9 +66,12 @@ ENGINES="${ENGINES:-goopg pg}"
 # Set by run_one so the caller can react to a TIMEOUT (see restart_goopg).
 LAST_STATUS=""
 
-# PG queries to skip (dsqgen subquery-in-FROM generation artefacts;
-# these fail on upstream PostgreSQL too — see design doc §1.2).
-PG_SKIP="36 70 86"
+# PG queries to skip. Empty since M0146-0140: Q36/Q70/Q86 used to fail on
+# PostgreSQL too because tpcds-setup.sh wrapped the whole query, LIMIT and
+# `;` included, in `select * from (...) as sub`. The setup now applies
+# scripts/tpcds_fix_loch_queries.py (the upstream split_sqls.py form), so all
+# 99 queries run on PG. Kept as a knob for a future generator artefact.
+PG_SKIP="${PG_SKIP:-}"
 
 # parse_qlist "1,3,5-8" -> "1 3 5 6 7 8"; empty argument -> 1..99
 parse_qlist() {

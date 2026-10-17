@@ -172,7 +172,7 @@ const numericMaxDisplayScale = 16383
 // the big-int overflow lane (NumericBig != nil). Always returns a
 // fresh *big.Int so callers can mutate without aliasing the Datum.
 func numericMant(d Datum) *big.Int {
-	if d.NumericBigValue() != nil {
+	if isBigNumeric(d) {
 		return new(big.Int).Set(d.NumericBigValue())
 	}
 	return big.NewInt(d.NumericMantissaValue())
@@ -489,6 +489,41 @@ func promoteToNumeric(a, b Datum, op parser.OpCode, pos int) (Datum, Datum, erro
 	return an, bn, nil
 }
 
+// promoteNumericOperands is promoteToNumeric for evalBinary's numeric arms
+// (M0122-0012). An operand that is already numeric is passed through as is,
+// and only the other one goes through toNumeric, which returns a numeric
+// unchanged anyway. The result is identical; the difference is that the
+// common numeric-numeric case no longer returns two 48-byte Datums through
+// toNumeric's stack slots on every row (6 % of TPC-H Q1).
+func promoteNumericOperands(a, b Datum, op parser.OpCode, pos int) (Datum, Datum, error) {
+	var err error
+	if a.Kind != KindNumeric {
+		if a, err = toNumeric(a, op, pos); err != nil {
+			return Datum{}, Datum{}, err
+		}
+	}
+	if b.Kind != KindNumeric {
+		if b, err = toNumeric(b, op, pos); err != nil {
+			return Datum{}, Datum{}, err
+		}
+	}
+	return a, b, nil
+}
+
+// promoteIntOperand rewrites a KindInt operand as the scale-0 numeric that
+// toNumeric returns for it, in place (M0122-0012 slice 15). evalBinary's
+// numeric arms call it on both operands and reach promoteNumericOperands only
+// when one is still not numeric (a string, or a kind that raises 42883). The
+// common case, numeric with numeric or with an int literal, then stays inline,
+// and no Datum pair is returned through the stack. On TPC-H Q1, every row
+// computes 1 - l_discount and 1 + l_tax: PG coerces the literal at parse time,
+// while goopg promotes it per row.
+func promoteIntOperand(d *Datum) {
+	if d.Kind == KindInt {
+		*d = numericFromInt(d.Int)
+	}
+}
+
 func toNumeric(d Datum, op parser.OpCode, pos int) (Datum, error) {
 	switch d.Kind {
 	case KindNumeric:
@@ -532,7 +567,7 @@ func numericAdd(a, b Datum) (Datum, error) {
 	// M0074-0006: int64 fast-path. Skip big.Int when both
 	// operands are in the int64 lane and the aligned sum
 	// doesn't overflow.
-	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+	if !isBigNumeric(a) && !isBigNumeric(b) {
 		am, bm, ok := alignNumericInt64(a.NumericMantissaValue(), a.Scale,
 			b.NumericMantissaValue(), b.Scale)
 		if ok {
@@ -553,7 +588,7 @@ func numericSub(a, b Datum) (Datum, error) {
 	// M0074-0006: int64 fast-path. Skip big.Int when both
 	// operands are in the int64 lane and the aligned diff
 	// doesn't overflow.
-	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+	if !isBigNumeric(a) && !isBigNumeric(b) {
 		am, bm, ok := alignNumericInt64(a.NumericMantissaValue(), a.Scale,
 			b.NumericMantissaValue(), b.Scale)
 		if ok {
@@ -578,7 +613,7 @@ func numericMul(a, b Datum) (Datum, error) {
 	// M0074-0006: int64 fast-path. Skip big.Int when both
 	// operands are in the int64 lane and the product
 	// doesn't overflow.
-	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+	if !isBigNumeric(a) && !isBigNumeric(b) {
 		if r, ok := mulInt64Overflow(a.NumericMantissaValue(), b.NumericMantissaValue()); ok {
 			return Datum{Kind: KindNumeric, Int: r, Scale: int16(scale)}, nil
 		}
@@ -815,7 +850,7 @@ func numericMod(a, b Datum, pos int) (Datum, error) {
 }
 
 func numericDiv(a, b Datum, pos int) (Datum, error) {
-	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+	if !isBigNumeric(a) && !isBigNumeric(b) {
 		bmFast := b.NumericMantissaValue()
 		if bmFast == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
@@ -974,7 +1009,7 @@ func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int
 // CPU previously consumed by numericMant's per-call big.Int
 // allocation.
 func numericCmp(a, b Datum) (int, error) {
-	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+	if !isBigNumeric(a) && !isBigNumeric(b) {
 		if cmp, ok := numericCmpInt64Fast(a.NumericMantissaValue(), a.Scale,
 			b.NumericMantissaValue(), b.Scale); ok {
 			return cmp, nil

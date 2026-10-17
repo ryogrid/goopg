@@ -273,7 +273,7 @@ func relConsiderParallel(leaf Node, tbl *catalog.Table, cat catalog.Catalog) boo
 		if !isParallelSafeExpr(x.Func, cat) {
 			return false
 		}
-	case *PgInputErrorInfo, *PgGetPublicationTables, *PgGetSequenceData,
+	case *PgInputErrorInfo, *PgGetPublicationTables, *PgGetSequenceData, *PgWalSummaryContents,
 		*PgSequenceParameters, *PgAvailableWalSummaries, *PgGetCatalogForeignKeys,
 		*PgPartitionTree, *PgOptionsToTable:
 		// Catalog SRFs backed by the same leader-only callbacks a worker
@@ -368,6 +368,15 @@ func subtreeHasNoParallelHazard(n Node, cat catalog.Catalog) bool {
 			// Enumerated by parallelChildren; no expression channel of
 			// their own that a worker could not evaluate (LockRows is
 			// refused by subtreeHasUnsafeNode above).
+		case *SubqueryScan:
+			// M0146-0201: the "Subquery Scan on <alias>" label has no
+			// expression channel of its own — parallelChildren and every
+			// stamp/splice sibling already treat it as a pass-through
+			// (M0146-0005w). PG's SubqueryScanPath is parallel_safe
+			// when the rel may be considered and its subpath is
+			// (create_subqueryscan_path), so the walk descends. Refusing
+			// it marked TPC-H Q18's ANY_subquery rel unsafe and left the
+			// whole join tree without partial paths.
 		case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *GenerateSeries,
 			*GenerateSubscripts, *FromUnnest, *UserSrfScan, *CTEScan,
 			*MaterializedCTEScan, *ScalarFuncScan:
@@ -466,6 +475,13 @@ func isParallelSafeExpr(e Expr, cat catalog.Catalog) bool {
 	ok := walkExprRefs(e, scopeSignal, exprVisitor{
 		Visit: func(x Expr) bool {
 			if !safe {
+				return false
+			}
+			// is_parallel_safe's safe_param_ids (clauses.c): an initplan's
+			// output Param is parallel-safe, because the leader evaluates
+			// the initplan and ships the value to the workers. Its body is
+			// not part of this scope, so it is not judged here (M0146-0192).
+			if sq, isSQ := x.(*SubqueryExpr); isSQ && InitPlanEvaluatedByLeader(sq) {
 				return false
 			}
 			switch v := x.(type) {
@@ -778,7 +794,8 @@ func computeParallelWorkerForRel(cp costParams, heapPages int64, reloptionWorker
 //
 // Either applicable count below its threshold — min_parallel_table_scan_size
 // for the heap, min_parallel_index_scan_size for the index — returns 0 (:4300,
-// the RELOPT_BASEREL case; goopg's search has no inheritance children). Each
+// the RELOPT_BASEREL case; an appendrel member's search sets
+// cp.otherMemberRel and skips it, M0146-0132). Each
 // applicable count then climbs its own log3 ladder and, when both apply, the
 // SMALLER of the two answers wins (:4344). C-19c.
 func computeParallelWorker(cp costParams, heapPages, indexPages float64, reloptionWorkers int) int {
@@ -787,8 +804,13 @@ func computeParallelWorker(cp costParams, heapPages, indexPages float64, relopti
 	if reloptionWorkers > 0 {
 		workers = reloptionWorkers
 	} else {
-		if (heapPages >= 0 && heapPages < float64(cp.minParallelTableScanBlocks)) ||
-			(indexPages >= 0 && indexPages < float64(cp.minParallelIndexScanBlocks)) {
+		// M0146-0132: `rel->reloptkind == RELOPT_BASEREL` — an appendrel
+		// member (RELOPT_OTHER_MEMBER_REL) skips the cutoff and climbs the
+		// ladder from one worker, so TPC-DS Q5's ~721-page catalog_returns
+		// member gets PG's Parallel Seq Scan under the Parallel Append.
+		if !cp.otherMemberRel &&
+			((heapPages >= 0 && heapPages < float64(cp.minParallelTableScanBlocks)) ||
+				(indexPages >= 0 && indexPages < float64(cp.minParallelIndexScanBlocks))) {
 			return 0
 		}
 		if heapPages >= 0 {
@@ -852,4 +874,33 @@ func addPartialSeqScanPath(rel *RelOptInfo, cp costParams, relPages int64, relTu
 		Target:          tgt,
 		TargetKnown:     tgtKnown,
 	}, "scan.seq.partial")
+}
+
+// InitPlanEvaluatedByLeader reports whether a scalar sublink is an initplan
+// whose value the leader computes once and hands to parallel workers, as
+// ExecInitParallelPlan does with a Gather's initParam (execParallel.c). PG
+// lists such an initplan's output Param in is_parallel_safe's safe_param_ids
+// (clauses.c), so a qual comparing against it may run inside the workers
+// (TPC-H Q22's `c_acctbal > (InitPlan 1).col1`).
+//
+// Only an uncorrelated EXPR sublink qualifies, and the test is
+// fail-closed. The flag must be set, there is no PARAM_EXEC binding, and it
+// is not the min/max rewrite's param initplan. The body must also hold no
+// outer reference or PARAM_EXEC read at any depth, since the IsNonCorrelated
+// flag's walker does not descend into nested sublinks. The executor's
+// worker launch (prepareWorkerInitPlans) evaluates exactly the sublinks
+// this predicate admits, so the two sides cannot disagree.
+func InitPlanEvaluatedByLeader(sq *SubqueryExpr) bool {
+	if sq == nil || sq.Plan == nil || !sq.IsNonCorrelated || sq.ParamInitPlan ||
+		len(sq.ParParam) > 0 || len(sq.Args) > 0 || planHasOuterRef(sq.Plan) {
+		return false
+	}
+	readsParam := false
+	walkPlanExprsDeep(sq.Plan, 0, func(e Expr, _ int) {
+		switch e.(type) {
+		case *ExecParamRef, *OuterColumnRef:
+			readsParam = true
+		}
+	})
+	return !readsParam
 }

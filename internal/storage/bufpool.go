@@ -117,12 +117,6 @@ type Pool struct {
 	arena *arena
 	slots []Slot
 	wal   WALFlusher
-	// btreeStructureLocks serialises structural B-tree changes per relation
-	// across every BTree handle opened from this pool. A backend constructs its
-	// own handle, so a mutex stored only on BTree cannot protect a split from a
-	// concurrent split or vacuum unlink issued by another connection.
-	btreeStructureMu    sync.Mutex
-	btreeStructureLocks map[RelFileNode]*sync.Mutex
 	// logFPI emits a full-page-image WAL record and returns the
 	// record's end LSN. nil disables FPI emission.
 	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
@@ -132,6 +126,9 @@ type Pool struct {
 	logHeapInsert LogHeapInsertFunc
 	// logBtreeInsert emits a logical B-tree non-split insert WAL record.
 	logBtreeInsert LogBtreeInsertFunc
+	// logBtreeInsertUpper emits the internal-page insert record that also
+	// finishes a child split (XLOG_BTREE_INSERT_UPPER).
+	logBtreeInsertUpper LogBtreeInsertUpperFunc
 	// logHeapDelete emits a logical heap-delete WAL record.
 	logHeapDelete LogHeapDeleteFunc
 	// logHeapLock emits a logical heap-lock WAL record.
@@ -664,6 +661,7 @@ type PoolConfig struct {
 	LogBtreeSplit            LogBtreeSplitFunc
 	LogHeapInsert            LogHeapInsertFunc
 	LogBtreeInsert           LogBtreeInsertFunc
+	LogBtreeInsertUpper      LogBtreeInsertUpperFunc
 	LogHeapDelete            LogHeapDeleteFunc
 	LogHeapLock              LogHeapLockFunc
 	LogHeapVacuum            LogHeapVacuumFunc
@@ -730,6 +728,11 @@ type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, t
 // the slot by key, because that needs the index's comparison semantics and
 // recovery holds a relfilenode with no catalog to resolve them from.
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte) (LSN, error)
+
+// LogBtreeInsertUpperFunc emits the record for a downlink inserted into an
+// internal page without a split: the parent insert at offnum plus clearing
+// childBlk's incomplete-split flag, in one record (XLOG_BTREE_INSERT_UPPER).
+type LogBtreeInsertUpperFunc func(rel RelFileNode, blk BlockNumber, offnum uint16, item []byte, childBlk BlockNumber) (LSN, error)
 
 // LogHeapDeleteFunc emits one logical heap-delete (xmax stamp) redo record.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)
@@ -854,12 +857,12 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		mgr:                      mgr,
 		arena:                    a,
 		slots:                    make([]Slot, cfg.Slots),
-		btreeStructureLocks:      make(map[RelFileNode]*sync.Mutex),
 		wal:                      cfg.WAL,
 		logFPI:                   cfg.LogPageImage,
 		logBtreeSplit:            cfg.LogBtreeSplit,
 		logHeapInsert:            cfg.LogHeapInsert,
 		logBtreeInsert:           cfg.LogBtreeInsert,
+		logBtreeInsertUpper:      cfg.LogBtreeInsertUpper,
 		logHeapDelete:            cfg.LogHeapDelete,
 		logHeapLock:              cfg.LogHeapLock,
 		logHeapVacuum:            cfg.LogHeapVacuum,
@@ -897,21 +900,6 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	return p, nil
 }
 
-// BTreeStructuralLock returns the pool-owned mutex for rel's structural B-tree
-// updates. It is intentionally relation-scoped: unrelated indexes may split
-// concurrently, while independently opened handles for the same index share
-// one protocol gate.
-func (p *Pool) BTreeStructuralLock(rel RelFileNode) *sync.Mutex {
-	p.btreeStructureMu.Lock()
-	defer p.btreeStructureMu.Unlock()
-	if mu := p.btreeStructureLocks[rel]; mu != nil {
-		return mu
-	}
-	mu := new(sync.Mutex)
-	p.btreeStructureLocks[rel] = mu
-	return mu
-}
-
 // LogBtreeSplit returns the configured atomic split-record hook.
 func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 
@@ -933,6 +921,9 @@ func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
 
 // LogBtreeInsert returns the configured btree non-split insert change-record hook.
 func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
+
+// LogBtreeInsertUpper returns the configured internal-page insert hook.
+func (p *Pool) LogBtreeInsertUpper() LogBtreeInsertUpperFunc { return p.logBtreeInsertUpper }
 
 // LogHeapDelete returns the configured heap-delete change-record hook.
 func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
@@ -1296,6 +1287,10 @@ func (p *Pool) SetCheckpointFlushAfter(n int) {
 func (p *Pool) SetBgwriterFlushAfter(n int) {
 	p.bgwriterFlushAfterBlocks.Store(int32(n))
 }
+
+// CheckpointFlushAfter and BgwriterFlushAfter report the live thresholds.
+func (p *Pool) CheckpointFlushAfter() int { return int(p.checkpointFlushAfterBlocks.Load()) }
+func (p *Pool) BgwriterFlushAfter() int   { return int(p.bgwriterFlushAfterBlocks.Load()) }
 
 // SetBackendFlushAfter sets the writeback threshold applied to a backend's
 // own dirty-victim-eviction writes, in BLCKSZ pages (mirrors

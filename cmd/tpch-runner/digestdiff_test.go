@@ -189,6 +189,48 @@ func TestDiffBothErrorDoesNotPass(t *testing.T) {
 	}
 }
 
+// XFAIL pins a baseline failure: the run passes only when it reproduces the
+// identical error (EXPECTED-ERROR). A resolved or differently-failing query
+// still fails the diff — the pin cannot silently outlive its cause.
+func TestDiffXfailPin(t *testing.T) {
+	baseline := "Q5: XFAIL — pq: canceling statement due to user request (57014)\n" +
+		"Q1: OK elapsed=1.0s rows=4 colsig=1111111111111111 ordered=aaaaaaaaaaaaaaaa unordered=bbbbbbbbbbbbbbbb\n"
+
+	runSame := "Q5: ERROR after 900.00s — pq: canceling statement due to user request (57014)\n" +
+		"Q1: OK elapsed=1.0s rows=4 colsig=1111111111111111 ordered=aaaaaaaaaaaaaaaa unordered=bbbbbbbbbbbbbbbb\n"
+	a, _ := parseRunLog(baseline)
+	b, _ := parseRunLog(runSame)
+	report, pass := renderDigestDiff("base", "run", diffDigests(a, b), nil)
+	if !pass || !strings.Contains(report, "EXPECTED-ERROR") {
+		t.Errorf("pinned failure not accepted:\n%s", report)
+	}
+
+	// The pinned query now completes — the pin is stale and must be re-pinned.
+	runOK := "Q5: OK elapsed=2.0s rows=5 colsig=4444444444444444 ordered=0101010101010101 unordered=0202020202020202\n" +
+		"Q1: OK elapsed=1.0s rows=4 colsig=1111111111111111 ordered=aaaaaaaaaaaaaaaa unordered=bbbbbbbbbbbbbbbb\n"
+	c, _ := parseRunLog(runOK)
+	report, pass = renderDigestDiff("base", "run", diffDigests(a, c), nil)
+	if pass || !strings.Contains(report, "XFAIL-RESOLVED") {
+		t.Errorf("resolved pin did not force a re-pin:\n%s", report)
+	}
+
+	// A different error under the pin is still a failure.
+	runOther := "Q5: ERROR after 1.20s — pq: out of memory\n" +
+		"Q1: OK elapsed=1.0s rows=4 colsig=1111111111111111 ordered=aaaaaaaaaaaaaaaa unordered=bbbbbbbbbbbbbbbb\n"
+	d, _ := parseRunLog(runOther)
+	report, pass = renderDigestDiff("base", "run", diffDigests(a, d), nil)
+	if pass || !strings.Contains(report, "ERROR-DIFF") {
+		t.Errorf("different error under pin passed:\n%s", report)
+	}
+
+	// XFAIL in a run log (arm B) is never valid.
+	e, _ := parseRunLog(baseline)
+	report, pass = renderDigestDiff("run", "base", diffDigests(e, a), nil)
+	if pass || !strings.Contains(report, "XFAIL-IN-RUN") {
+		t.Errorf("XFAIL in arm B passed:\n%s", report)
+	}
+}
+
 func keysOf(m map[string]qResult) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

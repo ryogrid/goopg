@@ -70,7 +70,18 @@ type RecordIterator struct {
 	// Written only by the single goroutine driving Next, read by
 	// observers (the promotion drain), hence atomic.
 	parkedAtEnd atomic.Bool
+	// readLimit, when set, caps how far Next reads: no record ending past
+	// readLimit() is returned. The WAL summarizer bounds itself by the
+	// flush LSN this way (walsummarizer.c reads up to GetFlushRecPtr), so a
+	// summary never covers WAL a crash could still rewrite.
+	readLimit func() uint64
 }
+
+// SetReadLimit bounds Next by limit() (an LSN in WrittenLSN's convention,
+// e.g. Writer.FlushedLSN). A record whose EndLSN lies past the limit is not
+// returned until the limit passes it; Next keeps blocking as at the tail.
+// Call before the first Next.
+func (it *RecordIterator) SetReadLimit(limit func() uint64) { it.readLimit = limit }
 
 // errWALBytesUndrained marks the *transient* flavour of
 // ErrLSNNotWritten: the requested bytes lie inside WrittenLSN — so
@@ -157,6 +168,11 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 	}
 	for {
 		written := it.writer.WrittenLSN()
+		if it.readLimit != nil {
+			if l := it.readLimit(); l < written {
+				written = l
+			}
+		}
 		// In page-headers mode, advance the cursor past any
 		// page header that sits at the current boundary. The
 		// header bytes are part of the WAL stream byte count
@@ -263,6 +279,14 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 					continue
 				}
 				return Record{}, err
+			}
+			if it.readLimit != nil && rec.EndLSN > written {
+				// The record is written but not yet inside the limit
+				// (e.g. not yet flushed): wait, and re-read it later.
+				if err := it.parkUntilWake(ctx, false); err != nil {
+					return Record{}, err
+				}
+				continue
 			}
 			it.lastWaitPos = -1
 			it.lastWaitEnd = 0

@@ -119,7 +119,7 @@ func subPlanExprVolatile(e optimizer.Expr, ctx *Context) bool {
 				return
 			}
 			if ctx != nil && ctx.Catalog != nil {
-				if rs := ctx.Catalog.Routines(); rs != nil {
+				if rs := routineRegistry(ctx); rs != nil {
 					for _, r := range rs.LookupByName(parser.ObjectName{Name: name}) {
 						// Any overload volatile (or unmarked — the
 						// registry default, which PG treats as

@@ -290,6 +290,9 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 				// M0118-0008 (vacuum-no-cleanup-lock).
 				if as, aerr := vacuum.Analyze(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.MultiXact); aerr == nil {
 					o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
+					// heap_vacuum_rel: new_rel_allvisible from
+					// visibilitymap_count, stored by vac_update_relstats.
+					snapshotRelAllVisible(o.ctx, tbl, as.Pages)
 					// take2 P1-03: and PERSIST it. UpdateRelStats writes memory
 					// only, so before this an autovacuum-maintained cluster planned
 					// from stale sizes after every restart and only an explicit SQL

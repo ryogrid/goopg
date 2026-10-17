@@ -317,10 +317,21 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// round 2 (mirrors the parser-level fix in internal/parser/parser.go's
 	// parseSet — this fast path never reaches the parser for a
 	// single-statement simple-query message).
+	//
+	// zone_value has forms no text split can flatten — INTERVAL 'x' [HOUR
+	// TO MINUTE], INTERVAL(p) 'x', LOCAL — so with a storage backend the
+	// statement goes through the grammar (tz_* actions) and the executor's
+	// SET, like a multi-statement message's would. M0122-0008.
 	case strings.HasPrefix(upper, "SET LOCAL TIME ZONE "), upper == "SET LOCAL TIME ZONE":
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
 		value := strings.TrimSpace(matchable[len("SET LOCAL TIME ZONE"):])
 		return s.handleSet(w, sess, "timezone "+value, true)
 	case strings.HasPrefix(upper, "SET TIME ZONE "), upper == "SET TIME ZONE":
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
 		value := strings.TrimSpace(matchable[len("SET TIME ZONE"):])
 		return s.handleSet(w, sess, "timezone "+value, false)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
@@ -337,11 +348,19 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 				// a role name. M0134-0155.
 				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
 			}
-			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
-			role = strings.Trim(role, `"'`)
-			connTx.SnapshotLocalRoleIfNeeded(true)
-			applySetSessionAuthorization(connTx, role)
-			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			if !sess.InTransactionBlock() {
+				// Outside a block the local identity would end with the
+				// statement's own transaction: warn and change nothing.
+				if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+					return err
+				}
+			} else {
+				role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
+				role = strings.Trim(role, `"'`)
+				connTx.SnapshotLocalRoleIfNeeded(true)
+				applySetSessionAuthorization(connTx, role)
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -355,11 +374,18 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	// SESSION AUTHORIZATION" case above.
 	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
 		if connTx != nil {
-			role := stripSetToOrEquals(matchable[len("SET LOCAL ROLE"):])
-			role = strings.Trim(role, `"'`)
-			connTx.SnapshotLocalRoleIfNeeded(true)
-			applySetRole(connTx, role)
-			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			if !sess.InTransactionBlock() {
+				// See SET LOCAL SESSION AUTHORIZATION above.
+				if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+					return err
+				}
+			} else {
+				role := stripSetToOrEquals(matchable[len("SET LOCAL ROLE"):])
+				role = strings.Trim(role, `"'`)
+				connTx.SnapshotLocalRoleIfNeeded(true)
+				applySetRole(connTx, role)
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -453,7 +479,8 @@ func (s *Server) handleQuery(ctx context.Context, r *libpq.FrameReader, w *libpq
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
 		if err := sess.Reset(name); err != nil {
-			return s.writeQueryError(w, errcodes.UndefinedObject, err.Error())
+			qe := gucResetError(err)
+			return s.writeQueryError(w, qe.Code, qe.Message)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
@@ -546,34 +573,62 @@ func (s *Server) handleShowAll(w *libpq.FrameWriter, sess *misc.SessionRegistry)
 	return w.ReadyForQuery()
 }
 
-// gucSetErrorFields unwraps a SET-time GUC validation error, splitting the
-// ERROR message from an attached HINT (e.g. an enum GUC's "Available
-// values: ..." list — postgres/src/backend/utils/misc/guc.c's PGC_ENUM
-// branch of set_config_option attaches this as a separate errhint(), not
-// baked into the primary message). Non-ValidationError failures pass their
-// Error() text through unchanged with no extra fields.
-func gucSetErrorFields(err error) (msg, hint string) {
+// gucSetError maps a SET-time GUC validation failure to the wire error:
+// the SQLSTATE (22023 unless the check raised another, like interval_in's
+// 22007 inside check_timezone), the message, and the DETAIL / HINT that
+// PostgreSQL attaches separately (GUC_check_errdetail, an enum GUC's
+// "Available values: ..." errhint). Other failures pass their Error() text
+// through as 22023 with no extra fields.
+func gucSetError(err error) *extendedQueryError {
 	var verr *misc.ValidationError
 	if errors.As(err, &verr) {
-		return verr.Msg, verr.Hint
+		return &extendedQueryError{Code: errcodes.Code(verr.SQLState()), Message: verr.Msg, Detail: verr.Detail, Hint: verr.Hint}
 	}
-	return err.Error(), ""
+	return &extendedQueryError{Code: errcodes.InvalidParameterValue, Message: err.Error()}
+}
+
+// gucResetError maps a RESET failure: a typed GUC error keeps its SQLSTATE
+// (42501 for a superuser-only parameter, M0146-0158), anything else is an
+// unknown parameter (42704).
+func gucResetError(err error) *extendedQueryError {
+	var verr *misc.ValidationError
+	if errors.As(err, &verr) {
+		return gucSetError(err)
+	}
+	return &extendedQueryError{Code: errcodes.UndefinedObject, Message: err.Error()}
 }
 
 // handleSet applies a SET / SET LOCAL statement. Body is the text after
 // the keyword: "name = value", "name TO value", or "name value".
 func (s *Server) handleSet(w *libpq.FrameWriter, sess *misc.SessionRegistry, body string, isLocal bool) error {
-	name, value, ok := splitSet(body)
+	name, value, ok, err := splitSetFlattened(body)
 	if !ok {
 		return s.writeQueryError(w, errcodes.SyntaxError,
 			fmt.Sprintf("could not parse SET statement: %q", body))
 	}
-	if err := sess.Set(name, value, isLocal); err != nil {
-		msg, hint := gucSetErrorFields(err)
-		if hint == "" {
-			return s.writeQueryError(w, errcodes.InvalidParameterValue, msg)
+	if err != nil {
+		return s.writeQueryError(w, errcodes.InvalidParameterValue, err.Error())
+	}
+	apply := sess.Set
+	if isLocal && !sess.InTransactionBlock() {
+		// A lone SET LOCAL statement outside a block: warn, then validate
+		// only — the value would be discarded with the statement's own
+		// transaction, so nothing else is observable.
+		if err := w.WriteNoticeResponse(setLocalOutsideBlockNotice()); err != nil {
+			return err
 		}
-		return s.writeQueryError(w, errcodes.InvalidParameterValue, msg, libpq.ErrorField{Code: libpq.FieldHint, Value: hint})
+		apply = func(name, value string, _ bool) error { return sess.CheckSet(name, value) }
+	}
+	if err := apply(name, value, isLocal); err != nil {
+		e := gucSetError(err)
+		var extra []libpq.ErrorField
+		if e.Detail != "" {
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldDetail, Value: e.Detail})
+		}
+		if e.Hint != "" {
+			extra = append(extra, libpq.ErrorField{Code: libpq.FieldHint, Value: e.Hint})
+		}
+		return s.writeQueryError(w, e.Code, e.Message, extra...)
 	}
 	if err := w.WriteCommandComplete("SET"); err != nil {
 		return err
@@ -624,6 +679,50 @@ func setAuthzGenericSetForm(rest string) bool {
 	}
 	return len(rest) >= 2 && strings.EqualFold(rest[:2], "to") &&
 		(len(rest) == 2 || rest[2] == ' ' || rest[2] == '\t')
+}
+
+// splitSetFlattened is splitSet for the wire fast paths (simple and
+// extended protocol), plus the flattening the grammar path applies: a value
+// that parses as a var_list goes through flatten_set_variable_args —
+// identifiers downcased, list elements joined with ", " and, for
+// GUC_LIST_QUOTE variables, identifier-quoted; more than one element for a
+// scalar variable is err. Anything else (DEFAULT, TIME ZONE's LOCAL and
+// INTERVAL forms) keeps splitSet's value.
+func splitSetFlattened(body string) (name, value string, ok bool, err error) {
+	name, value, ok = splitSet(body)
+	if !ok {
+		return name, value, false, nil
+	}
+	if args, isList := parser.ParseSetArgList(splitSetRawValue(body)); isList && !isBareSetKeyword(args, "local") {
+		value, err = misc.FlattenSetArgs(strings.ToLower(name), args)
+	}
+	return name, value, true, err
+}
+
+// isBareSetKeyword reports whether args is the single unquoted word kw.
+// ParseSetArgList cannot tell an identifier from a string literal, so the
+// raw-text callers check the text themselves when it matters; here a lone
+// "local" is only ever SET TIME ZONE LOCAL (a reset upstream), which splitSet
+// already handles.
+func isBareSetKeyword(args []misc.SetArg, kw string) bool {
+	return len(args) == 1 && args[0].Kind == misc.SetArgString && strings.EqualFold(args[0].Val, kw)
+}
+
+// splitSetRawValue returns the value text of a SET body — what follows the
+// name and its optional '=' / TO — without splitSet's quote stripping.
+func splitSetRawValue(body string) string {
+	body = strings.TrimSpace(body)
+	end := 0
+	for end < len(body) && body[end] != ' ' && body[end] != '\t' && body[end] != '=' {
+		end++
+	}
+	rest := strings.TrimSpace(body[end:])
+	rest = strings.TrimPrefix(rest, "=")
+	rest = strings.TrimSpace(rest)
+	if strings.HasPrefix(strings.ToUpper(rest), "TO ") {
+		rest = strings.TrimSpace(rest[3:])
+	}
+	return rest
 }
 
 // splitSet splits "name = value", "name TO value", or "name value" into

@@ -179,6 +179,12 @@ type Path struct {
 	// parameterised index probe it builds there so the loop can bind its
 	// keys — PG's create_plan-time curOuterRels.
 	paramSink *[]paramProbeNode
+	// ParamFilter is a parameterised hash join's ppi clauses that no input
+	// enforces — get_joinrel_parampathinfo's equivalence-class clause between
+	// the required-outer rel and the probe side (M0146-0135). Applied as a
+	// Join Filter once the binding nested loop rebinds the required-outer
+	// operand (createNestLoopParamJoinPlan).
+	ParamFilter []paramFilterClause
 
 	// Jointype is the join this path PERFORMS — PG's `JoinPath.jointype`
 	// (pathnodes.h:2119: "JoinPath is used to represent all types of join
@@ -554,6 +560,14 @@ type Path struct {
 // (design ch. 05 §1) and every path over the rel reads it; costing never
 // re-estimates (design ch. 03 §1.1, invariant #2).
 type RelOptInfo struct {
+	// pathkeyClass, when set, reports whether two pathkey expressions belong
+	// to the same equivalence class of this rel's search — PG's canonical
+	// pathkeys (make_canonical_pathkey) make `ORDER BY a.x` and `ORDER BY b.y`
+	// one pathkey once `a.x = b.y` merged them. Only set on a join rel whose
+	// problem has no null-extending special join (restrictInfoList.ecReduce),
+	// where every row carries equal values in all of a class's members.
+	// M0146-0185.
+	pathkeyClass func(a, b Expr) bool
 	// ecWant is the search's EXPLAIN orientation of its equivalence-class
 	// equalities (orientECJoinClauses), recorded on the search's own upper
 	// rel so a candidate rebuilt from this rel's paths after the seam
@@ -694,6 +708,12 @@ type RelOptInfo struct {
 	// validate to nothing (no ordering claim survives, same truncation rule
 	// as the winner's).
 	SearchCandidateKeys [][]PathKey
+	// SearchCandidateClasses is the searched rel's equivalence classes
+	// (its usefulKeys), so the ORDERED rel compares SearchCandidateKeys and
+	// the seed's ordering with sortPathkeys the way PG's canonical pathkeys
+	// do (M0146-0134). nil wherever the candidates are not a searched rel's
+	// (electOrderedGrouping's aggregate candidates): syntactic comparison.
+	SearchCandidateClasses *pathkeyUsefulness
 
 	// BoundaryFill is the hole-filler closure this rel's boundary publication
 	// was stamped with (`createPlanAtSearchRootRange`'s `fill` parameter,
@@ -828,6 +848,10 @@ type rangeTblEntry struct {
 	// same `scanLeafFor` predicate, so a path is never COSTED over a leaf
 	// the builder cannot rebuild.
 	baseLeaf Node
+	// altLeaves are a searched sub-problem leaf's ordered runner-up trees
+	// (baseRelInfo.subproblemAlts), filed beside baseLeaf as further prebuilt
+	// paths by addCTEScanPathkeys (M0146-0148).
+	altLeaves []Node
 
 	// baseOffset is WHERE this base relation's columns sat before the search
 	// ran: the index, in the pre-search "binding" coordinate space, of the
@@ -1127,7 +1151,7 @@ func comparePaths(a, b *Path) pathRel {
 	if b.RequiredOuter == 0 {
 		bKeys = b.Pathkeys
 	}
-	keyscmp := comparePathkeysDim(aKeys, bKeys)
+	keyscmp := comparePathkeysDimRel(a.Rel, aKeys, bKeys)
 	if keyscmp == dimIncomparable {
 		// PATHKEYS_DIFFERENT: PG skips the dominance table entirely and
 		// keeps both (pathnode.c:512).
@@ -1309,7 +1333,7 @@ func addToPartialPathlist(list []*Path, newPath *Path) []*Path {
 	survivors := make([]*Path, 0, len(list)+1)
 	for i, old := range list {
 		removeOld := false
-		keys := comparePathkeysDim(newPath.Pathkeys, old.Pathkeys)
+		keys := comparePathkeysDimRel(newPath.Rel, newPath.Pathkeys, old.Pathkeys)
 		if keys != dimIncomparable {
 			switch {
 			case newPath.DisabledNodes != old.DisabledNodes:
@@ -1497,11 +1521,11 @@ func setCheapest(rel *RelOptInfo) {
 			continue
 		}
 		if cmp := comparePathCosts(cheapestStartup, path, startupCost); cmp > 0 ||
-			(cmp == 0 && comparePathkeysDim(cheapestStartup.Pathkeys, path.Pathkeys) == dimBetter2) {
+			(cmp == 0 && comparePathkeysDimRel(rel, cheapestStartup.Pathkeys, path.Pathkeys) == dimBetter2) {
 			cheapestStartup = path
 		}
 		if cmp := comparePathCosts(cheapestTotal, path, totalCost); cmp > 0 ||
-			(cmp == 0 && comparePathkeysDim(cheapestTotal.Pathkeys, path.Pathkeys) == dimBetter2) {
+			(cmp == 0 && comparePathkeysDimRel(rel, cheapestTotal.Pathkeys, path.Pathkeys) == dimBetter2) {
 			cheapestTotal = path
 		}
 	}

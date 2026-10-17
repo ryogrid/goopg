@@ -323,6 +323,11 @@ type sjiLeaf struct {
 	name   string
 	schema string // RangeVar schema, or the catalog table's for base relations
 	table  *catalog.Table // nil for subquery/tablefunc/CTE/shadowed/unknown
+	// cols are a table-less leaf's output column names (lower case) when
+	// every one of them is certain (derivedLeafColumns); colsKnown false
+	// leaves the leaf opaque to unqualified resolution (M0146-0224).
+	cols      []string
+	colsKnown bool
 	// leafIdx is the leaf index this name resolves to — a RelSet bit. It
 	// equals the leaf's position in sc.leaves under the legacy numbering;
 	// under the jointree numbering (M0145-0005 slice 6) a SEMI/ANTI right
@@ -399,6 +404,9 @@ func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int
 			lf.schema = tbl.Schema
 		}
 	}
+	if lf.table == nil {
+		lf.cols, lf.colsKnown = derivedLeafColumns(rv)
+	}
 	if lf.table != nil {
 		key := lf.alias
 		if key == "" {
@@ -407,6 +415,73 @@ func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int
 		sc.tableMap[key] = lf.table
 	}
 	sc.leaves = append(sc.leaves, lf)
+}
+
+// derivedLeafColumns names a table-less leaf's output columns, as PG's
+// parse analysis has them on the subquery or CTE RTE's eref->colnames
+// (addRangeTableEntryForSubquery / addRangeTableEntryForCTE, parse_relation.c):
+// the column alias list first, by position, then the body's own names. It
+// reports false whenever a name is not certain — a star, a set operation,
+// a target whose FigureColname this walker does not model, a table
+// function — so an unqualified ref in scope still bails to syn.
+func derivedLeafColumns(rv parser.RangeVar) ([]string, bool) {
+	var names []string
+	switch {
+	case rv.TableFunc != nil:
+		return nil, false
+	case rv.Subquery != nil:
+		s := rv.Subquery
+		if s.SetOp != nil || s.SetOpOperand != nil || len(s.ValuesRows) != 0 {
+			return nil, false
+		}
+		for _, tg := range s.Targets {
+			n, ok := certainTargetName(tg)
+			if !ok {
+				return nil, false
+			}
+			names = append(names, n)
+		}
+	case rv.Schema == "":
+		cte := lookupPlannedCTE(rv.Name)
+		if cte == nil {
+			return nil, false
+		}
+		for _, c := range cte.schema {
+			if !c.Resjunk {
+				names = append(names, strings.ToLower(c.Name))
+			}
+		}
+	default:
+		return nil, false
+	}
+	if len(rv.Columns) > len(names) {
+		return nil, false
+	}
+	for i, a := range rv.Columns {
+		names[i] = strings.ToLower(a)
+	}
+	return names, true
+}
+
+// certainTargetName is FigureColname for the targets whose name it is sure
+// of: an AS alias, a bare column reference and a plain function call.
+func certainTargetName(tg parser.ResTarget) (string, bool) {
+	if tg.Alias != "" {
+		return strings.ToLower(tg.Alias), true
+	}
+	switch e := tg.Expr.(type) {
+	case *parser.ColumnRef:
+		if e.Column == "" || e.Column == "*" {
+			return "", false
+		}
+		return strings.ToLower(e.Column), true
+	case *parser.FuncCall:
+		if e.Name.Name == "" {
+			return "", false
+		}
+		return strings.ToLower(e.Name.Name), true
+	}
+	return "", false
 }
 
 // sjiLeafMatchesQualifier mirrors bindingMatchesRelation (planner.go:15188):
@@ -454,18 +529,21 @@ func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool)
 	}
 	// Unqualified: mirror the unqualified branch (planner.go:15017-15087) —
 	// column scan first, then the single-candidate tableoid/ctid and
-	// whole-row-alias rules. A table-less leaf (subquery/tablefunc/CTE) in
-	// scope makes the column scan inconclusive: it might hold the column,
-	// so any attribution is a guess → syn fallback. (USING-hidden columns
-	// likewise bail via the multi-candidate arm — safe.)
+	// whole-row-alias rules. A table-less leaf whose output names are not
+	// certain (derivedLeafColumns) makes the column scan inconclusive: it
+	// might hold the column, so any attribution is a guess → syn fallback.
+	// A subquery or CTE leaf with certain names is scanned like a table
+	// (M0146-0224: TPC-DS Q78's ON clauses name the CTEs' columns bare).
+	// (USING-hidden columns likewise bail via the multi-candidate arm —
+	// safe.)
 	for i := rng[0]; i < rng[1]; i++ {
-		if sc.leaves[i].table == nil {
+		if sc.leaves[i].table == nil && !sc.leaves[i].colsKnown {
 			return 0, false
 		}
 	}
 	match := -1
 	for i := rng[0]; i < rng[1]; i++ {
-		if _, ok := sc.cat.LookupColumn(sc.leaves[i].table, ref.Column); !ok {
+		if !sjiLeafHasColumn(sc, sc.leaves[i], ref.Column) {
 			continue
 		}
 		if match != -1 {
@@ -494,6 +572,22 @@ func resolveSjiColumn(ref *parser.ColumnRef, sc *sjiScope, item int) (int, bool)
 		return 0, false
 	}
 	return sc.leaves[match].leafIdx, true
+}
+
+// sjiLeafHasColumn reports whether the leaf exposes the column: through the
+// catalog for a table, through its certain output names otherwise.
+func sjiLeafHasColumn(sc *sjiScope, lf sjiLeaf, column string) bool {
+	if lf.table != nil {
+		_, ok := sc.cat.LookupColumn(lf.table, column)
+		return ok
+	}
+	col := strings.ToLower(column)
+	for _, c := range lf.cols {
+		if c == col {
+			return true
+		}
+	}
+	return false
 }
 
 // sjiQualRelids is pull_varnos (PG: which base relids the qual mentions) over

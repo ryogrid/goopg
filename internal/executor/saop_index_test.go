@@ -48,10 +48,12 @@ func setupSAOPFixture(t *testing.T) (*Context, func()) {
 }
 
 // saopPlanAsserts runs sql, asserts the plan probes via SAOPKeys, and
-// returns the result rows.
+// returns the result rows. It plans with seq and bitmap scans off: on this
+// five-row fixture PG's costed search would not take the probe either, and
+// since M0146-0060 the rule-based producer no longer overrides that election.
 func saopPlanAsserts(t *testing.T, ctx *Context, sql string, wantKeys int) []Row {
 	t.Helper()
-	plan := planOne(t, sql, ctx.Catalog)
+	plan := planOneIndexScan(t, sql, ctx.Catalog)
 	proj, ok := plan.(*optimizer.Project)
 	if !ok {
 		t.Fatalf("%s: root=%T want *optimizer.Project", sql, plan)
@@ -138,7 +140,7 @@ func TestSAOPExplainRendersAnyCond(t *testing.T) {
 
 	// The Q45 gate's `= ANY` cond, at unit scale, as PG prints it: the
 	// folded array Const (M0146-0005ch).
-	lines := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT id FROM items WHERE id IN (2, 4)")
+	lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT id FROM items WHERE id IN (2, 4)", indexOnlySettings())
 	found := false
 	for _, ln := range lines {
 		if strings.Contains(ln, "Index Cond: (id = ANY ('{2,4}'::integer[]))") {

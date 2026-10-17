@@ -2,6 +2,7 @@ package postmaster
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/libpq"
@@ -17,6 +18,11 @@ import (
 // not a config.Registry variable; SET ROLE is tracked entirely via
 // connTx.NonSuperuserRole. `SET LOCAL SESSION AUTHORIZATION` already had a
 // dedicated case; `SET LOCAL ROLE` did not.
+//
+// Outside a transaction block the statement is its own transaction, so —
+// as in PG 18.3 — it draws the 25P01 "SET LOCAL can only be used in
+// transaction blocks" WARNING and leaves the role unchanged (M0122-0008;
+// this test used to pin the old leak, is_superuser=off afterwards).
 func TestSimpleProtocolSetLocalRoleAloneDoesNotError(t *testing.T) {
 	addr, _, stop := startCopyExecServer(t)
 	defer stop()
@@ -24,13 +30,20 @@ func TestSimpleProtocolSetLocalRoleAloneDoesNotError(t *testing.T) {
 	defer conn.Close()
 
 	writeQuery(t, conn, "SET LOCAL ROLE some_nonsuper_role")
+	warned := false
 	for _, f := range readUntilReady(t, conn) {
 		if f.Type == libpq.MsgErrorResponse {
 			t.Fatalf("SET LOCAL ROLE (no explicit txn): unexpected ErrorResponse: %s", f.Payload)
 		}
+		if f.Type == libpq.MsgNoticeResponse && strings.Contains(string(f.Payload), "SET LOCAL can only be used in transaction blocks") {
+			warned = true
+		}
 	}
-	if got := queryIsSuperuser(t, conn); got != "off" {
-		t.Fatalf("after SET LOCAL ROLE: is_superuser=%q, want %q", got, "off")
+	if !warned {
+		t.Error("SET LOCAL ROLE outside a block: no 25P01 warning")
+	}
+	if got := queryIsSuperuser(t, conn); got != "on" {
+		t.Fatalf("after a lone SET LOCAL ROLE: is_superuser=%q, want %q (unchanged)", got, "on")
 	}
 }
 

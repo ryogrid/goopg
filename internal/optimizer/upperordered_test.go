@@ -257,7 +257,8 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	unordered := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
 	sizeUpperRelFromNode(unordered, upperOrderedInput(10))
 	lines := captureTrace(t, func() {
-		addOrderedPaths(unordered, newPrebuiltPath(unordered, upperOrderedInput(10)), keys, cp, -1)
+		in := upperOrderedInput(10)
+		addOrderedPaths(unordered, newPrebuiltPath(unordered, in), in, keys, cp, -1)
 	})
 	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedSortProducer+" relids=- ") || !strings.Contains(lines[0], "verdict=accepted") {
@@ -272,7 +273,7 @@ func TestAddOrderedPathsOffersExactlyOneProducerPerInput(t *testing.T) {
 	seed := newPrebuiltPath(ordered, upperOrderedInput(10))
 	seed.Pathkeys = append(append([]PathKey{}, keys...), PathKey{Expr: &ColumnRef{Index: 2, Name: "w"}, SortAsc: true})
 	lines = captureTrace(t, func() {
-		addOrderedPaths(ordered, seed, keys, cp, -1)
+		addOrderedPaths(ordered, seed, seed.node, keys, cp, -1)
 	})
 	lines = dppathLines(lines)
 	if len(lines) != 1 || !strings.Contains(lines[0], "producer="+upperOrderedInputProducer+" relids=- ") {
@@ -449,8 +450,8 @@ func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
 		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
 		Rel: ordered, ParallelSafe: true,
 	}
-	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
-	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, sortedAgg, sortedAgg.node, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, hashedAgg.node, orderKeys, cp, -1)
 	setCheapest(ordered)
 	best := getCheapestFractionalPath(ordered, 0)
 	if best == nil {
@@ -458,6 +459,53 @@ func TestOrderedDropsHashedSortForPresortedGrouping(t *testing.T) {
 	}
 	if best.Kind == PathSort {
 		t.Fatalf("hashed+Sort won (cost=%.2f); want the no-sort sorted path — startup dominance did not drop it", best.Cost.Total)
+	}
+}
+
+// TestOrderedPresortedAggOffersIncrementalSortOnly pins M0146-0177 against
+// PG 18.3's create_ordered_paths (planner.c): an input whose pathkeys deliver
+// a leading prefix of the ORDER BY gets an Incremental Sort and no full Sort
+// ("We'll just do a sort if there are no presorted keys and an incremental
+// sort when there are presorted keys"). The grouping election offers
+// node-less PathAgg candidates; the presorted arm used to require the input's
+// own node, so they got the full Sort only and TPC-DS Q60 elected it. The
+// node the sort runs over now comes in as statsNode; with none, the full Sort
+// stays the only offer.
+func TestOrderedPresortedAggOffersIncrementalSortOnly(t *testing.T) {
+	cp := defaultCostParams()
+	cp.enableIncrementalSort = true
+	idCol := &ColumnRef{Index: 0, Name: "i_item_id", Type: catalog.Type{Name: "bpchar"}}
+	sumCol := &ColumnRef{Index: 1, Name: "total_sales", Type: catalog.Type{Name: "numeric"}}
+	orderKeys := []PathKey{{Expr: idCol, SortAsc: true}, {Expr: sumCol, SortAsc: true}}
+	offer := func(ordered *RelOptInfo) *Path {
+		return &Path{
+			Kind: PathAgg, Cost: Cost{Startup: 37197, Total: 37200}, Rows: 36,
+			Pathkeys: []PathKey{{Expr: idCol, SortAsc: true}},
+			Rel:      ordered, ParallelSafe: true,
+		}
+	}
+	producers := func(statsNode Node) []string {
+		ordered := fetchUpperRel(newUpperRels(), UpperOrdered, 0, 0)
+		ordered.NCols = 2
+		ordered.AvgVarBytes = 8
+		var out []string
+		for _, l := range dppathLines(captureTrace(t, func() {
+			addOrderedPaths(ordered, offer(ordered), statsNode, orderKeys, cp, -1)
+		})) {
+			for _, f := range strings.Fields(l) {
+				if strings.HasPrefix(f, "producer=upper.ordered.") {
+					out = append(out, strings.TrimPrefix(f, "producer="))
+				}
+			}
+		}
+		return out
+	}
+	if got := producers(upperOrderedInput(36)); len(got) != 1 || got[0] != upperOrderedIncrementalSortProducer {
+		t.Fatalf("presorted node-less PathAgg offered %v; want only %s (PG builds no full Sort beside it)",
+			got, upperOrderedIncrementalSortProducer)
+	}
+	if got := producers(nil); len(got) != 1 || got[0] != upperOrderedSortProducer {
+		t.Fatalf("with no stats node the offer is %v; want only %s", got, upperOrderedSortProducer)
 	}
 }
 
@@ -483,8 +531,8 @@ func TestOrderedStacksSortWithoutTranslatedPathkeys(t *testing.T) {
 		Kind: PathAgg, Cost: Cost{Startup: 68909, Total: 69911}, Rows: 5,
 		Rel: ordered, ParallelSafe: true,
 	}
-	addOrderedPaths(ordered, sortedAgg, orderKeys, cp, -1)
-	addOrderedPaths(ordered, hashedAgg, orderKeys, cp, -1)
+	addOrderedPaths(ordered, sortedAgg, sortedAgg.node, orderKeys, cp, -1)
+	addOrderedPaths(ordered, hashedAgg, hashedAgg.node, orderKeys, cp, -1)
 	setCheapest(ordered)
 	best := getCheapestFractionalPath(ordered, 0)
 	if best == nil {
@@ -798,6 +846,42 @@ func TestGroupingEmissionTranslatesGatherMergeChild(t *testing.T) {
 	}
 }
 
+// TestGroupingEmissionTranslatesIncrementalSortAndPresortedChild is
+// M0146-0131: create_agg_path copies subpath->pathkeys for AGG_SORTED, so a
+// sorted aggregate over an Incremental Sort (make_ordered_path's partially
+// presorted arm — the Incremental Sort delivers its FULL keys) or over a
+// searched input already sorted on the group keys emits group order, as the
+// node twin aggregateEmissionPathkeys says. TPC-DS Q35's Incremental Sort
+// input was declined, so ORDER BY re-sorted it and LIMIT 100 lost its startup
+// advantage. Keys that do not lead with the group still decline.
+func TestGroupingEmissionTranslatesIncrementalSortAndPresortedChild(t *testing.T) {
+	aggNode, groupCol, _ := r47slice2GroupFixture()
+	other := &ColumnRef{Index: 1, Name: "c1", Type: catalog.Type{Name: "int4"}}
+	spec := &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: aggNode.schema}
+	keys := []PathKey{{Expr: groupCol, SortAsc: true}}
+	cand := func(child *Path) *Path {
+		return &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: spec,
+			Rows: 5, Cost: Cost{Startup: 69094, Total: 70122},
+			Pathkeys: child.Pathkeys, Children: []*Path{child}}
+	}
+	orderCol := &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}
+	for name, child := range map[string]*Path{
+		"incremental sort": {Kind: PathIncrementalSort, Pathkeys: keys, Rows: 57066, PresortedCount: 1,
+			Children: []*Path{{Kind: PathPrebuilt, Rows: 57066, node: aggNode.Child}}},
+		"presorted input": {Kind: PathPrebuilt, Pathkeys: keys, Rows: 57066, node: aggNode.Child},
+	} {
+		got := groupingEmissionPathkeys(aggNode, cand(child))
+		if len(got) != 1 || !pathKeyEqual(got[0], PathKey{Expr: orderCol, SortAsc: true}) {
+			t.Errorf("%s: translated %+v, want the ORDER BY key", name, got)
+		}
+	}
+	bad := []PathKey{{Expr: other, SortAsc: true}, {Expr: groupCol, SortAsc: true}}
+	if got := groupingEmissionPathkeys(aggNode, cand(&Path{Kind: PathIncrementalSort, Pathkeys: bad,
+		Rows: 57066, PresortedCount: 1})); got != nil {
+		t.Errorf("incremental sort on other leading keys translated %d keys, want nil", len(got))
+	}
+}
+
 // TestElectOrderedGroupingOffersALoneCandidate is M0144-0011a-2: the loop's
 // candidate minimum is ONE, the way PG's is. `create_ordered_paths` iterates
 // `input_rel->pathlist` with no minimum at all
@@ -865,5 +949,46 @@ func TestElectOrderedGroupingStillDeclinesAnEmptyRel(t *testing.T) {
 	}
 	if after := fetchUpperRel(u, UpperOrdered, 0, 0); len(after.Pathlist) != beforeLen {
 		t.Fatalf("decline mutated the ORDERED rel: paths %d->%d", beforeLen, len(after.Pathlist))
+	}
+}
+
+// TestElectOrderedGroupingRunsUnderAFractionWithoutTranslation is
+// M0146-0138: with no candidate's emission order translating, every one needs
+// the same ORDER BY Sort, so the loop used to decline as a pure re-price. Under
+// a LIMIT fraction that is wrong: the grouping step picked by fraction BEFORE
+// the Sort, where a hashed candidate's early startup wins, while PG's final
+// rel compares the candidates after it, where each Sort's startup is its
+// total (TPC-DS Q18 SF1: the sorted rollup lost to a MixedAggregate). The
+// loop now runs and elects the lower-total candidate.
+func TestElectOrderedGroupingRunsUnderAFractionWithoutTranslation(t *testing.T) {
+	aggNode, groupCol, outSchema := r47slice2GroupFixture()
+	u := newUpperRels()
+	grouped := fetchUpperRel(u, UpperGroupAgg, 0, 100)
+	grouped.ConsiderStartup = true
+	mkSpec := func() *Aggregate {
+		return &Aggregate{Child: aggNode.Child, GroupExprs: []Expr{groupCol}, schema: outSchema}
+	}
+	// No pathkeys on the sorted candidate's input: its emission does not
+	// translate, like a grouping-sets rollup's.
+	sorted := &Path{Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 69000, Total: 70000}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	hashed := &Path{Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: mkSpec(),
+		Rows: 5, Cost: Cost{Startup: 50000, Total: 71000}, Rel: grouped,
+		Children: []*Path{newPrebuiltPath(grouped, aggNode.Child)}}
+	addPath(grouped, sorted, "test")
+	addPath(grouped, hashed, "test")
+	setCheapest(grouped)
+	agg := &aggregateSurface{node: aggNode}
+	keys := []SortKey{{Expr: &ColumnRef{Index: 0, Name: "o_orderpriority", Type: catalog.Type{Name: "bpchar"}}}}
+	if got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 0, -1, nil); ok || got != nil {
+		t.Fatalf("without a fraction the untranslated loop must decline (ok=%v)", ok)
+	}
+	got, ok := electOrderedGrouping(u, agg, aggNode, keys, 0, DefaultPlannerSettings().costParams(), 100, -1, nil)
+	if !ok || got == nil {
+		t.Fatal("under a LIMIT fraction the loop declined; want the post-Sort election")
+	}
+	if agg.node.Strategy != AggStrategySorted {
+		t.Fatalf("copy-back strategy = %v; want the lower-total sorted candidate", agg.node.Strategy)
 	}
 }

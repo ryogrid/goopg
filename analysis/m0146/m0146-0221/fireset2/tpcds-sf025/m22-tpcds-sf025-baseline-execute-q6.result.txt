@@ -1,0 +1,31 @@
+ state | cnt 
+-------+-----
+ WA    |  10
+ WV    |  10
+ AL    |  11
+ ID    |  11
+ PA    |  12
+ AR    |  13
+ MN    |  13
+ MO    |  15
+ MT    |  15
+ NE    |  16
+ LA    |  17
+ NC    |  17
+ OH    |  17
+ OK    |  17
+ CO    |  18
+ MI    |  18
+ TN    |  18
+ KS    |  20
+ MS    |  20
+ IN    |  23
+ IA    |  26
+ IL    |  27
+ GA    |  28
+ VA    |  30
+ KY    |  34
+       |  38
+ TX    |  67
+(27 rows)
+

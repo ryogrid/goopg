@@ -76,6 +76,8 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		return maybeInstrument(p, newPgGetCatalogForeignKeysOp(p), scope), nil
 	case *optimizer.PgGetSequenceData:
 		return maybeInstrument(p, newPgGetSequenceDataOp(p), scope), nil
+	case *optimizer.PgWalSummaryContents:
+		return maybeInstrument(p, newPgWalSummaryContentsOp(p), scope), nil
 	case *optimizer.PgSequenceParameters:
 		return maybeInstrument(p, newPgSequenceParametersOp(p), scope), nil
 	case *optimizer.TSTokenType:
@@ -485,6 +487,9 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 			return newUtilitySettingsOp(p), nil
 		}
 		if _, ok := p.Stmt.(*parser.ResetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.AlterSystemStmt); ok {
 			return newUtilitySettingsOp(p), nil
 		}
 		if _, ok := p.Stmt.(*parser.DiscardStmt); ok {

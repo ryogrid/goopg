@@ -36,6 +36,18 @@ type SessionRegistry struct {
 	custom  map[string]*Variable
 	inTx    bool
 
+	// xactOpen marks an autocommit transaction in progress — a simple-query
+	// message or an extended-protocol Execute that runs outside an explicit
+	// block (BeginImplicitTransaction). Like an explicit transaction it
+	// journals plain SET in txPrior and drops the local layer when it ends,
+	// which is AtEOXact_GUC for transactions the client never opened.
+	xactOpen bool
+	// implicitBlock marks the implicit transaction block PostgreSQL opens for
+	// a simple-query message holding more than one statement
+	// (exec_simple_query's use_implicit_block). SET LOCAL there is no
+	// out-of-block use and draws no warning.
+	implicitBlock bool
+
 	// txPrior is the undo journal for plain SET while inTx: for each
 	// session-layer key mutated since BeginTransaction, the value that key
 	// held in s.session before the first mutation in this transaction. A
@@ -44,6 +56,16 @@ type SessionRegistry struct {
 	// GucStack / AtEOXact_GUC(isCommit=false) at goopg's flat, non-nested
 	// fidelity. Design 0134-0001-p6-guc-transaction-rollback.
 	txPrior map[string]*string
+
+	// saveLevels are the GUC nest levels open for routines with SET clauses
+	// (PushSaveLevel / PopSaveLevel), innermost last.
+	saveLevels []*gucSaveLevel
+
+	// currentRole / mayGrant / roleStack back the PGC_SUSET privilege check
+	// (session_set_privilege.go). M0146-0158.
+	currentRole func() string
+	mayGrant    func(role, name string) bool
+	roleStack   []string
 
 	// onReportableChange, if non-nil, is called whenever a Report-flagged
 	// variable's effective value changes. The caller (the server) wires
@@ -198,10 +220,48 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	if strings.EqualFold(value, "DEFAULT") {
 		return s.Reset(name)
 	}
+	v, placeholder, canon, err := s.prepareSet(name, value)
+	if err != nil {
+		return err
+	}
+	if placeholder {
+		s.custom[strings.ToLower(name)] = v
+	}
+	key := strings.ToLower(name)
+	if isLocal {
+		// Outside any transaction block PostgreSQL still applies a local
+		// value; it lasts until the surrounding (autocommit) transaction
+		// ends, where EndImplicitTransaction drops the local layer. The
+		// "SET LOCAL can only be used in transaction blocks" warning is the
+		// SET LOCAL statement's (ExecSetVariableStmt), not set_config's, so
+		// callers raise it — see InTransactionBlock.
+		s.local[key] = canon
+	} else {
+		s.snapshotPrior(key)
+		s.session[key] = canon
+		s.markOverridden(key)
+		// SET (not SET LOCAL) clears any local override too — matches
+		// upstream which treats SET as "session value plus implicit
+		// reset of any LOCAL".
+		delete(s.local, key)
+	}
+	s.report(v, name)
+	// M0054-0006e-followup: process-global change callback. Fires
+	// AFTER the session/local layer is updated so callbacks see the
+	// post-Set effective value via .Get().
+	_, eff, _ := s.Get(name)
+	s.global.invokeOnChange(v.Name, eff)
+	return nil
+}
+
+// prepareSet resolves and validates name = value for Set: the variable
+// (a fresh placeholder when name is an unknown custom name — placeholder is
+// then true and the caller registers it), and the canonical value.
+func (s *SessionRegistry) prepareSet(name, value string) (v *Variable, placeholder bool, canon string, err error) {
 	v, ok := s.lookupVariable(name)
 	if !ok {
 		if !IsCustomGUCName(name) {
-			return fmt.Errorf("unrecognized configuration parameter %q", name)
+			return nil, false, "", fmt.Errorf("unrecognized configuration parameter %q", name)
 		}
 		v = NewVariable(Variable{
 			Name:    name,
@@ -211,45 +271,35 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 			Scope:   ScopeSession | ScopeTransaction,
 			Flags:   FlagCustom | FlagDisallowInFile | FlagNotInSample,
 		})
-		s.custom[strings.ToLower(name)] = v
+		placeholder = true
 	}
 	if v.Context < ContextSuset {
-		// Postmaster / SigHup / Internal contexts cannot be SET.
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		// Postmaster / SigHup / Internal / backend-start contexts cannot be SET.
+		return nil, false, "", cantChangeError(v)
+	}
+	if perr := s.checkSetPrivilege(v); perr != nil {
+		return nil, false, "", perr
 	}
 	_, current, _ := s.Get(name)
-	canon, err := v.canonicalizeFrom(current, value)
+	canon, err = v.canonicalizeFrom(current, value)
 	if err != nil {
-		return err
+		return nil, false, "", err
 	}
-	key := strings.ToLower(name)
-	if isLocal {
-		if !s.inTx {
-			// Postgres allows SET LOCAL outside a transaction; the
-			// value is set for the duration of the implicit
-			// transaction (which ends at the next ReadyForQuery). We
-			// model that by storing it in the local layer and then
-			// dropping it on the next ResetTransaction call.
-		}
-		s.local[key] = canon
-	} else {
-		s.snapshotPrior(key)
-		s.session[key] = canon
-		// SET (not SET LOCAL) clears any local override too — matches
-		// upstream which treats SET as "session value plus implicit
-		// reset of any LOCAL".
-		delete(s.local, key)
+	return v, placeholder, canon, nil
+}
+
+// CheckSet validates name = value exactly as Set does without storing it.
+// It is the net effect of a single-statement SET LOCAL outside a
+// transaction block: PostgreSQL applies the value, then discards it when the
+// statement's own transaction commits (AtEOXact_GUC), so only a validation
+// error can be observed — and no ParameterStatus, since the reported value
+// never changes between ReadyForQuery messages.
+func (s *SessionRegistry) CheckSet(name, value string) error {
+	if strings.EqualFold(value, "DEFAULT") {
+		return nil
 	}
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
-	// M0054-0006e-followup: process-global change callback. Fires
-	// AFTER the session/local layer is updated so callbacks see the
-	// post-Set effective value via .Get().
-	_, eff, _ := s.Get(name)
-	s.global.invokeOnChange(v.Name, eff)
-	return nil
+	_, _, _, err := s.prepareSet(name, value)
+	return err
 }
 
 // SetStartup records the value the connection supplied at session start — the
@@ -280,8 +330,9 @@ func (s *SessionRegistry) SetStartup(name, value string) error {
 	if v.Context < ContextSuset {
 		// Postmaster / SigHup / Internal contexts cannot be changed by the
 		// startup packet either — ProcessStartupPacket's GUC loop rejects
-		// them the same way a SQL SET does.
-		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
+		// them the same way a SQL SET does. (PG accepts the backend-start
+		// contexts here; goopg still refuses them — deferral ledger.)
+		return cantChangeError(v)
 	}
 	_, current, _ := s.Get(name)
 	canon, err := v.canonicalizeFrom(current, value)
@@ -291,10 +342,7 @@ func (s *SessionRegistry) SetStartup(name, value string) error {
 	key := strings.ToLower(name)
 	s.session[key] = canon
 	s.startup[key] = canon
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.report(v, name)
 	_, eff, _ := s.Get(name)
 	s.global.invokeOnChange(v.Name, eff)
 	return nil
@@ -322,10 +370,8 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 	key := strings.ToLower(name)
 	s.session[key] = canon
 	delete(s.local, key)
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.markOverridden(key)
+	s.report(v, name)
 	_, eff, _ := s.Get(name)
 	s.global.invokeOnChange(v.Name, eff)
 	return nil
@@ -336,13 +382,26 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 // value is restored (PG's reset_val semantics); otherwise the variable
 // falls through to the global value exactly as before.
 func (s *SessionRegistry) Reset(name string) error {
+	return s.reset(name, true)
+}
+
+// reset is Reset; checkPrivilege false is ResetAll's path, which resets every
+// variable without the per-parameter privilege check (ResetAllOptions does not
+// go through set_config_option).
+func (s *SessionRegistry) reset(name string, checkPrivilege bool) error {
 	v, ok := s.lookupVariable(name)
 	if !ok {
 		return fmt.Errorf("unrecognized configuration parameter %q", name)
 	}
+	if checkPrivilege {
+		if perr := s.checkSetPrivilege(v); perr != nil {
+			return perr
+		}
+	}
 	key := strings.ToLower(name)
 	s.snapshotPrior(key)
 	delete(s.local, key)
+	s.markOverridden(key)
 	if startup, ok := s.startup[key]; ok {
 		// Restore the session-start value (PG's reset_val) rather than
 		// exposing the global default — mirrors guc.c's RESET restoring
@@ -352,10 +411,7 @@ func (s *SessionRegistry) Reset(name string) error {
 	} else {
 		delete(s.session, key)
 	}
-	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
-		_, eff, _ := s.Get(name)
-		s.onReportableChange(v.Name, eff)
-	}
+	s.report(v, name)
 	// M0054-0006e-followup: invoke the process-global change callback for
 	// the post-Reset effective value (the startup value when one exists,
 	// else the global default).
@@ -373,7 +429,7 @@ func (s *SessionRegistry) Reset(name string) error {
 // no session-layer entry at all, so the eventual restore must delete rather
 // than write "". Design 0134-0001-p6-guc-transaction-rollback §Design 2.
 func (s *SessionRegistry) snapshotPrior(key string) {
-	if !s.inTx {
+	if !s.inTx && !s.xactOpen {
 		return
 	}
 	if _, already := s.txPrior[key]; already {
@@ -437,10 +493,10 @@ func isCustomGUCName(name string) bool {
 // SET TO DEFAULT and RESET ALL both route here.
 func (s *SessionRegistry) ResetAll() {
 	for name := range s.session {
-		_ = s.Reset(name)
+		_ = s.reset(name, false)
 	}
 	for name := range s.local {
-		_ = s.Reset(name)
+		_ = s.reset(name, false)
 	}
 }
 
@@ -449,8 +505,52 @@ func (s *SessionRegistry) ResetAll() {
 // Commit/Rollback; plain SET inside a transaction is journalled and reverted
 // on Rollback (see EndTransaction).
 func (s *SessionRegistry) BeginTransaction() {
+	if !s.xactOpen || s.inTx {
+		// A BEGIN inside an autocommit message promotes that transaction
+		// into the block (BeginTransactionBlock from TBLOCK_STARTED /
+		// TBLOCK_IMPLICIT_INPROGRESS), so its journal and local values carry
+		// over; only a fresh transaction starts a fresh journal.
+		s.txPrior = map[string]*string{}
+	}
 	s.inTx = true
+}
+
+// BeginImplicitTransaction starts the GUC side of an autocommit transaction:
+// a simple-query message (implicitBlock when it holds more than one
+// statement) or an extended-protocol Execute outside an explicit block. It is
+// a no-op inside an explicit block or an already open autocommit transaction.
+func (s *SessionRegistry) BeginImplicitTransaction(implicitBlock bool) {
+	if s == nil || s.inTx || s.xactOpen {
+		return
+	}
+	s.xactOpen = true
+	s.implicitBlock = implicitBlock
 	s.txPrior = map[string]*string{}
+}
+
+// EndImplicitTransaction ends what BeginImplicitTransaction started:
+// AtEOXact_GUC — local values are dropped and, when the transaction aborted,
+// plain SETs made during it are undone. If a BEGIN promoted the transaction
+// into an explicit block that is still open, the block owns that state and
+// only the autocommit marks are cleared. Idempotent.
+func (s *SessionRegistry) EndImplicitTransaction(committed bool) {
+	if s == nil || !s.xactOpen {
+		return
+	}
+	s.xactOpen = false
+	s.implicitBlock = false
+	if s.inTx {
+		return
+	}
+	s.endXact(committed)
+}
+
+// InTransactionBlock reports whether a statement runs inside a transaction
+// block — an explicit BEGIN or a multi-statement message's implicit block —
+// i.e. whether IsTransactionBlock() would hold. SET LOCAL outside one draws
+// WarnNoTransactionBlock's 25P01 warning.
+func (s *SessionRegistry) InTransactionBlock() bool {
+	return s != nil && (s.inTx || s.implicitBlock)
 }
 
 // EndTransaction discards the local layer and, on an aborted transaction
@@ -467,6 +567,13 @@ func (s *SessionRegistry) BeginTransaction() {
 // committed's flag mirrors AtEOXact_GUC(bool isCommit, …).
 // Design 0134-0001-p6-guc-transaction-rollback.
 func (s *SessionRegistry) EndTransaction(committed bool) {
+	s.endXact(committed)
+	s.inTx = false
+}
+
+// endXact is AtEOXact_GUC: drop the local layer and, on abort, restore the
+// journalled session values.
+func (s *SessionRegistry) endXact(committed bool) {
 	for name := range s.local {
 		v, _ := s.global.Get(name)
 		delete(s.local, name)
@@ -496,7 +603,6 @@ func (s *SessionRegistry) EndTransaction(committed bool) {
 		}
 	}
 	s.txPrior = map[string]*string{}
-	s.inTx = false
 }
 
 // ReportableVariables returns every variable in the global registry

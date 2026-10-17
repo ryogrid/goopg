@@ -299,6 +299,25 @@ func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, old
 	return framedAssemble(RmgrHeap, xlogHeapUpdate, uint32(xmax), mainData, blocks)
 }
 
+// EncodeBtreeInsertUpperPG builds the xl_btree_insert record PG writes for an
+// insertion into an INTERNAL page (XLOG_BTREE_INSERT_UPPER, _bt_insertonpg):
+// main data xl_btree_insert{offnum}; block 0 the parent with the new downlink
+// tuple as block data; block 1 the child whose split this downlink finishes,
+// registered bare — redo clears its BTP_INCOMPLETE_SPLIT flag
+// (btree_xlog_insert's _bt_clear_incomplete_split, nbtxlog.c). Same relation,
+// so block 1 carries BKPBLOCK_SAME_REL, as XLogRecordAssemble sets it.
+func EncodeBtreeInsertUpperPG(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte, childBlk storage.BlockNumber) ([]byte, error) {
+	if len(item) == 0 {
+		return nil, fmt.Errorf("wal: btree-insert-upper item is empty")
+	}
+	mainData := make([]byte, sizeOfXLogBtreeInsertData)
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	return framedAssemble(RmgrBtree, xlogBtreeInsertUpper, 0, mainData, []BlockRef{
+		{ID: 0, Rel: rel, Block: blk, Data: item},
+		{ID: 1, Rel: rel, Block: childBlk, SameRel: true},
+	})
+}
+
 // sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
 const sizeOfXLogBtreeInsertData = 2
 
@@ -355,6 +374,16 @@ func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, erro
 // (ParseXactRecord + the initdb clog pass) stamps the whole transaction tree
 // instead of only its top-level XID.
 func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithRels(xid, subxacts, nil, hasInvals)
+}
+
+// EncodeXactCommitPGWithRels is EncodeXactCommitPGWithSubxacts plus the
+// relations the transaction dropped: a non-empty rels adds
+// xinfo{HAS_RELFILELOCATORS} + xl_xact_relfilelocators{nrels, xlocators[]}
+// after the subxacts chunk, as XactLogCommitRecord writes it
+// (xact.c:5940-5946). Replay removes their files (xact_redo_commit →
+// DropRelationFiles) and the WAL summarizer gives each fork limit block 0.
+func EncodeXactCommitPGWithRels(xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, hasInvals bool) ([]byte, error) {
 	info := xlogXactCommit
 	var xinfo uint32
 	if hasInvals {
@@ -363,23 +392,59 @@ func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storag
 	if len(subxacts) > 0 {
 		xinfo |= xactXinfoHasSubxacts
 	}
+	if len(rels) > 0 {
+		xinfo |= xactXinfoHasRelfilelocators
+	}
 	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
 		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
 	}
-	if len(subxacts) > 0 {
-		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
-		for _, sub := range subxacts {
-			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
-		}
-	}
+	mainData = appendXactSubxacts(mainData, subxacts)
+	mainData = appendXactRelFileLocators(mainData, rels)
 	if hasInvals {
 		// nmsgs = 0 (goopg carries no message array). The invals chunk is last
 		// of the chunks goopg writes, matching upstream's order.
 		mainData = binary.LittleEndian.AppendUint32(mainData, 0)
 	}
 	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
+}
+
+// appendXactSubxacts appends xl_xact_subxacts{nsubxacts, subxacts[]} when
+// subxacts is non-empty.
+func appendXactSubxacts(mainData []byte, subxacts []storage.TransactionID) []byte {
+	if len(subxacts) == 0 {
+		return mainData
+	}
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
+	for _, sub := range subxacts {
+		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
+	}
+	return mainData
+}
+
+// appendXactRelFileLocators appends xl_xact_relfilelocators{nrels,
+// xlocators[]} when rels is non-empty. The tablespace is mapped as
+// EncodeSmgrCreatePG maps it: pg_global (1664) for a shared relation
+// (DBOid 0), pg_default (1663) for goopg's TblOid 0.
+func appendXactRelFileLocators(mainData []byte, rels []storage.RelFileNode) []byte {
+	if len(rels) == 0 {
+		return mainData
+	}
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(rels))))
+	for _, r := range rels {
+		spc := r.TblOid
+		switch {
+		case r.DBOid == 0:
+			spc = pgGlobalTableSpaceOID
+		case spc == 0:
+			spc = pgDefaultTableSpaceOID
+		}
+		mainData = binary.LittleEndian.AppendUint32(mainData, spc)
+		mainData = binary.LittleEndian.AppendUint32(mainData, r.DBOid)
+		mainData = binary.LittleEndian.AppendUint32(mainData, r.RelOid)
+	}
+	return mainData
 }
 
 // EncodeXactAbortPG builds a PostgreSQL xl_xact_abort record (xact_time s8 = 0,
@@ -394,16 +459,28 @@ func EncodeXactAbortPG(xid storage.TransactionID) ([]byte, error) {
 // prefix and order (xact.h:334-345), so the encoding is the commit one minus
 // the invals chunk aborts never carry.
 func EncodeXactAbortPGWithSubxacts(xid storage.TransactionID, subxacts []storage.TransactionID) ([]byte, error) {
+	return EncodeXactAbortPGWithRels(xid, subxacts, nil)
+}
+
+// EncodeXactAbortPGWithRels is EncodeXactAbortPGWithSubxacts plus the
+// relations created by the aborting transaction, which its abort removes
+// (XactLogAbortRecord's HAS_RELFILELOCATORS chunk, xact.c:6093-6099).
+func EncodeXactAbortPGWithRels(xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode) ([]byte, error) {
 	info := xlogXactAbort
-	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	var xinfo uint32
 	if len(subxacts) > 0 {
-		info |= xlogXactHasInfo
-		mainData = binary.LittleEndian.AppendUint32(mainData, xactXinfoHasSubxacts)
-		mainData = binary.LittleEndian.AppendUint32(mainData, uint32(int32(len(subxacts))))
-		for _, sub := range subxacts {
-			mainData = binary.LittleEndian.AppendUint32(mainData, uint32(sub))
-		}
+		xinfo |= xactXinfoHasSubxacts
 	}
+	if len(rels) > 0 {
+		xinfo |= xactXinfoHasRelfilelocators
+	}
+	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	if xinfo != 0 {
+		info |= xlogXactHasInfo
+		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
+	}
+	mainData = appendXactSubxacts(mainData, subxacts)
+	mainData = appendXactRelFileLocators(mainData, rels)
 	return framedAssemble(RmgrXact, info, uint32(xid), mainData, nil)
 }
 

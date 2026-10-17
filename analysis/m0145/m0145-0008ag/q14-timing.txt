@@ -1,0 +1,4 @@
+# Q14 wall-clock, TPC-DS SF0.25 (both statements)
+PG 18.3 :65438 tpcds025, 3 runs: 9.75s 10.21s 7.39s (median 9.75s)
+goopg post-retirement (de45f8a6f): sf025 sweep 18.61s; fire-set single run 18.48s (x2 baseline 21.65s)
+M0145-0008ag filing: goopg 24.9s vs PG 4.8s on the FIRST statement (4.9x)

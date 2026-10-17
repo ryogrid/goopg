@@ -1,0 +1,7 @@
+# catalog_sales heap: PG SF1 (37448 pages) vs goopg SF1 (41067 pages, loaded 2026-07-25 with numeric stored as text)
+  first tuple: len 205 t_hoff 24 infomask2 0x22 infomask 0x902
+bench/tpcds/runtime/pgdata/base/16586/16750 tuples/page 38.46 avg tuple len 200.4 avg free 118
+  top lens [(201, 3450), (205, 1016), (197, 809), (199, 754), (203, 483), (207, 214)]
+  first tuple: len 220 t_hoff 24 infomask2 0x22 infomask 0x902
+bench/tpcds/runtime_goopg/data/base/5/16493 tuples/page 35.10 avg tuple len 221.2 avg free 122
+  top lens [(220, 2338), (221, 1458), (219, 1447), (218, 431), (244, 227), (229, 215)]

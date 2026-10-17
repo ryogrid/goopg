@@ -105,9 +105,9 @@ type Routine struct {
 	// PROCEDURE/ROUTINE ... SET/RESET, in insertion order (mirrors
 	// InMemory's role/database-level roleSettings shape). nil renders as SQL
 	// NULL (matches upstream: a routine that never had a SET clause has no
-	// proconfig row at all). Dump-fidelity only — goopg does not push/pop
-	// these values around the routine's own execution (no per-call GUC
-	// scoping exists yet); see docs/design/0122-0007-function-set-config.md.
+	// proconfig row at all). Applied around each call by the executor's
+	// enterRoutineConfig (M0146-0155); see
+	// docs/design/0100-0149/m0146-0155-function-set-clauses.md.
 	Config []string
 
 	// Dependency tracking populated at CREATE FUNCTION time for information_schema views.
@@ -168,6 +168,19 @@ func (r *Routine) QualifiedName() string {
 // Signature is the upstream overload key: `(arg1_type,arg2_type,…)`.
 // Stage A uses type-name comparison directly; the future overload
 // resolver will normalise via the type system.
+// NumInputArgs is pronargs: the number of input parameters (IN, INOUT,
+// VARIADIC). OUT parameters and RETURNS TABLE columns are not arguments.
+func (r *Routine) NumInputArgs() int {
+	n := 0
+	for i := range r.ArgTypes {
+		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 func (r *Routine) Signature() string {
 	var parts []string
 	for i, t := range r.ArgTypes {
@@ -188,6 +201,19 @@ func (r *Routine) Signature() string {
 // single RWMutex — routine cardinality is tiny relative to table
 // rowcounts.
 type Routines struct {
+	*routineStore
+
+	// db is the database this handle resolves calls that pass no dbOid
+	// against (0 = DefaultDBOid). pg_proc is per-database in PostgreSQL, so
+	// a connection must find only its own database's routines: InDB hands
+	// out a handle bound to the connection's database over the same store,
+	// and the planner's SearchPathCatalog and the executor's
+	// routineRegistry return such handles. M0146-0156.
+	db uint32
+}
+
+// routineStore is the registry state every database's handle shares.
+type routineStore struct {
 	mu      sync.RWMutex
 	byKey   map[string]*Routine // schema.name(argtypes) → routine
 	byName  map[string][]string // schema.name → list of overload keys
@@ -198,6 +224,29 @@ type Routines struct {
 	// INSERT and by the startup reload, refreshed by every ALTER's heap
 	// UPDATE, deleted with the routine.
 	heapTIDs map[uint32]SchemaHeapTID
+}
+
+// InDB returns a handle over the same registry whose lookups default to
+// dbOid's routines (normalised with NamespaceDBOid, so the connection's real
+// postgres OID reads the default namespace). OID-keyed calls and List are
+// unaffected: routine OIDs are cluster-unique.
+func (rs *Routines) InDB(dbOid uint32) *Routines {
+	if rs == nil {
+		return nil
+	}
+	return &Routines{routineStore: rs.routineStore, db: NamespaceDBOid(dbOid)}
+}
+
+// dbFor resolves the database a call addresses: an explicit dbOid wins, then
+// the handle's own database, then DefaultDBOid.
+func (rs *Routines) dbFor(dbOid []uint32) uint32 {
+	if len(dbOid) > 0 && dbOid[0] != 0 {
+		return dbOid[0]
+	}
+	if rs.db != 0 {
+		return rs.db
+	}
+	return DefaultDBOid
 }
 
 // HeapTID returns the live pg_proc heap TID for the routine OID.
@@ -250,11 +299,11 @@ const FirstRoutineOID uint32 = 1 << 17
 
 // NewRoutines returns an empty registry.
 func NewRoutines() *Routines {
-	return &Routines{
+	return &Routines{routineStore: &routineStore{
 		byKey:   make(map[string]*Routine),
 		byName:  make(map[string][]string),
 		nextOID: FirstRoutineOID,
-	}
+	}}
 }
 
 // routineDBPrefix folds dbOid into a registry key, mirroring domainKey's
@@ -291,7 +340,7 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
 	if clone.DBOid == 0 {
-		clone.DBOid = DefaultDBOid
+		clone.DBOid = rs.dbFor(nil)
 	}
 	signature := clone.Signature()
 	rs.mu.Lock()
@@ -309,8 +358,10 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 		if existing.IsWindow != clone.IsWindow {
 			return nil, fmt.Errorf("%w: %s", ErrRoutineKindChange, clone.QualifiedName())
 		}
-		// CREATE OR REPLACE preserves the OID — upstream's contract.
+		// CREATE OR REPLACE preserves the OID and the owner — upstream's
+		// contract (ProcedureCreate keeps proowner when replacing).
 		clone.OID = existing.OID
+		clone.Owner = existing.Owner
 		rs.byKey[k] = &clone
 		return &clone, nil
 	}
@@ -345,11 +396,13 @@ func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
 	clone := *r
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
-	// WAL payloads don't carry a dbOid yet (restart-persistence follow-up
-	// above) — recovery always replays into DefaultDBOid, matching the
-	// single-database replay convention CreateSequenceCatalogRelation
-	// documents for the same reason.
-	clone.DBOid = DefaultDBOid
+	// The caller stamps the database whose pg_proc heap the row came from
+	// (reloadUserRoutinesFromHeapForDB); an unstamped routine replays into
+	// DefaultDBOid. M0146-0156: this used to force DefaultDBOid, so every
+	// database's routines collapsed into the default one on restart.
+	if clone.DBOid == 0 {
+		clone.DBOid = DefaultDBOid
+	}
 	k := routineKey(clone.DBOid, schema, clone.Name, clone.Signature())
 	if _, exists := rs.byKey[k]; !exists {
 		nk := nameKey(clone.DBOid, schema, clone.Name)
@@ -360,6 +413,26 @@ func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
 		rs.nextOID = clone.OID + 1
 	}
 	return &clone
+}
+
+// DropAllInDB removes every routine registered in dbOid's database, for
+// DROP DATABASE (the database's pg_proc heap goes with its directory).
+func (rs *Routines) DropAllInDB(dbOid uint32) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for k, r := range rs.byKey {
+		if r.DBOid != dbOid {
+			continue
+		}
+		delete(rs.byKey, k)
+		delete(rs.heapTIDs, r.OID)
+	}
+	prefix := routineDBPrefix(dbOid)
+	for nk := range rs.byName {
+		if strings.HasPrefix(nk, prefix) {
+			delete(rs.byName, nk)
+		}
+	}
 }
 
 // DropByOIDDuringRecovery is the idempotent counterpart to
@@ -454,7 +527,7 @@ func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type, dbOid ...uin
 func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, bool) {
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	sig := stub.Signature()
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
@@ -478,7 +551,7 @@ func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, 
 // When schema is empty, searches all schemas (search-path style).
 // dbOid is a trailing variadic parameter, mirroring Lookup.
 func (rs *Routines) LookupByName(name parser.ObjectName, dbOid ...uint32) []*Routine {
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
@@ -509,7 +582,7 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type, dbOid ...uint3
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
 	signature := stub.Signature()
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	// Resolve schema when not provided: try public first, then all schemas.
@@ -554,7 +627,7 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type, dbOid ...uint3
 // SQLSTATE 42725. When schema is empty, searches all schemas.
 func (rs *Routines) DropByName(name parser.ObjectName, dbOid ...uint32) error {
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	prefix := routineDBPrefix(db)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -636,7 +709,7 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 // schema is empty, searches all schemas.
 func (rs *Routines) ResolveByName(name parser.ObjectName, dbOid ...uint32) (*Routine, error) {
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
@@ -684,7 +757,7 @@ func (rs *Routines) ResolveBySigWithArgModes(name parser.ObjectName, argTypes []
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	signature := stub.Signature()
 	schema := name.Schema
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
@@ -1015,7 +1088,7 @@ func normalizeDropType(t string) string {
 // false, any param mode at position i matches. If ModeExplicit is true,
 // only matching modes are accepted.
 func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.FunctionArg, dbOid ...uint32) []*Routine {
-	db := resolveDBOid(dbOid)
+	db := rs.dbFor(dbOid)
 	dropTypes := make([]string, len(args))
 	for i, a := range args {
 		dropTypes[i] = normalizeDropType(a.Type.Name)
@@ -1078,4 +1151,64 @@ func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.F
 		}
 	}
 	return cands
+}
+
+// RoutineResultColumns lists the columns a FROM-clause call of r produces —
+// get_expr_result_type / get_func_result_type (funcapi.c) as
+// transformRangeFunction (parse_clause.c) uses them: one column per output
+// parameter (OUT, INOUT, RETURNS TABLE column; an unnamed one is columnN),
+// else the composite return type's columns, else one column of the return
+// type named alias. colAliases rename positionally. The planner's
+// FROM-function binding and the parse analyzer's scope both use it, so the
+// two agree on the names a query may reference (M0146-0165).
+func RoutineResultColumns(cat Catalog, r *Routine, alias string, colAliases []string) []Column {
+	// If the routine has OUT parameters, expand them as separate columns
+	// (matches PostgreSQL's treatment of SETOF record functions with named
+	// OUT params).
+	var outCols []Column
+	for i, mode := range r.ArgModes {
+		if mode == "o" || mode == "b" {
+			name := ""
+			if i < len(r.ArgNames) {
+				name = r.ArgNames[i]
+			}
+			if name == "" {
+				name = fmt.Sprintf("column%d", len(outCols)+1)
+			}
+			typ := Type{Name: "text"}
+			if i < len(r.ArgTypes) {
+				typ = r.ArgTypes[i]
+			}
+			outCols = append(outCols, Column{Name: name, Type: typ, Ordinal: len(outCols)})
+		}
+	}
+	if len(outCols) > 0 {
+		for i := range outCols {
+			if i < len(colAliases) {
+				outCols[i].Name = colAliases[i]
+			}
+		}
+		return outCols
+	}
+	retTypeName := r.ReturnType.Name
+	if retTypeName == "" {
+		retTypeName = "text"
+	}
+	// If the return type is a composite (table) type, expand its columns.
+	if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
+		compositeCols := make([]Column, len(compTbl.Columns))
+		copy(compositeCols, compTbl.Columns)
+		for i := range compositeCols {
+			compositeCols[i].Ordinal = i
+			if i < len(colAliases) {
+				compositeCols[i].Name = colAliases[i]
+			}
+		}
+		return compositeCols
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	return []Column{{Name: colName, Type: Type{Name: retTypeName}, Ordinal: 0}}
 }

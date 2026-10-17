@@ -691,6 +691,9 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	if synth := inferTransitiveEqualities(conjuncts); len(synth) > 0 {
 		conjuncts = append(conjuncts, synth...)
 	}
+	// M0146-0127: the closure's own input, kept for the semijoin pass below
+	// (outer ON quals join the list after this point and must stay out).
+	ecInner := append([]Expr(nil), conjuncts...)
 	// M0146-0005de: decide the operand order PG's equivalence classes
 	// derive each inner-join equality in (before the outer ON conjuncts join
 	// the list — those are not EC clauses in PG either); applied to the
@@ -840,6 +843,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// conjunct is placeable, so this loop is no longer inert as of c5: the
 	// search can now actually visit the synthetic leaf and satisfy relid
 	// sets that include it.
+	semiTail := len(conjuncts)
 	for _, lk := range semiAnti {
 		conjuncts = append(conjuncts, splitAnd(lk.pred)...)
 		// Step 2: the flattened body's own quals join the same stream —
@@ -867,6 +871,16 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 		conjuncts = append(conjuncts, pu.outerQuals...)
 	}
+	// M0146-0127: a semijoin's equalities are equivalence-class members in
+	// PG (distribute_qual_to_rels: no nullable side, so maybe_equivalence),
+	// so the class also equates the RHS to the LHS's other members. See
+	// semiecderive.go for where the derived clauses may apply.
+	var outerNullable RelSet
+	for _, lk := range outerLinks {
+		outerNullable |= lk.nullable
+	}
+	semiDerivedList, semiDerived := semiRHSImpliedEqualities(ecInner, conjuncts[semiTail:], spans, ctx.joinInfoList, outerNullable)
+	conjuncts = append(conjuncts, semiDerivedList...)
 	// M0146-0012a slice A: a correlated scalar sublink whose outer
 	// references name another relation makes its clause a join clause.
 	preLowerSpanningScalarSublinks(conjuncts, spans, ctx)
@@ -1190,6 +1204,8 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		scans:     leaves,
 		relInfos:  relInfos,
 		conjuncts: searchConjuncts,
+		// M0146-0127: the semijoin-derived equalities and their RHS operands.
+		semiRHSOperand: semiDerived,
 		// M0146-0005 slice 4: PG's norm_selec compensation for the join OR
 		// clauses extractRestrictionOrClauses derived restrictions from.
 		orClauseSelDivisor: orClauseSelDivisor,
@@ -1207,15 +1223,24 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// none is safe (see resolveContext.settings).
 		cp:  ctx.settings.costParams(),
 		cat: cat,
+		// M0146-0132: the member scope's one relation is an appendrel
+		// member (RELOPT_OTHER_MEMBER_REL), not a base rel.
+		otherMemberRel: ctx.appendrelOtherMember,
 		// `root->tuple_fraction`, carried on the context because the `*Limit`
 		// node does not exist yet at this point in `planSelect` (see
 		// `searchTupleFraction`).
 		tupleFraction: ctx.tupleFraction,
+		// M0146-0150: an aggregate stage above takes the cheapest-total path.
+		rootCheapestTotal: ctx.rootCheapestTotal,
 		// C-07: `root->query_pathkeys`, derived by `standard_qp_callback`
 		// (deriveQueryPathkeys) at the same point in `planSelect` the
 		// fraction is, and in the SAME binding coordinates the conjuncts
 		// above are written in.
 		queryPathkeys: ctx.queryPathkeys,
+		// M0146-0223: `root->group_pathkeys` / `distinct_pathkeys`, for
+		// truncate_useless_pathkeys' grouping and distinct arms.
+		groupPathkeys:    ctx.groupPathkeys,
+		distinctPathkeys: ctx.distinctPathkeys,
 		// The statement's needed-column set (pathindexonlyneed.go), computed
 		// once in `planSelect` — the only frame holding the
 		// *parser.SelectStmt; the search boundary sees resolved nodes only.

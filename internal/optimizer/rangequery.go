@@ -75,6 +75,9 @@ func rangeBoundOf(e Expr) (key string, isLo bool, col *ColumnRef, ok bool) {
 		return "", false, nil, false
 	}
 	cr, _, colOnRight, matched := normalizeColumnConstRange(b.Left, b.Right)
+	if !matched {
+		cr, colOnRight, matched = normalizeColumnPseudoConstRange(b.Left, b.Right)
+	}
 	if !matched || cr == nil {
 		return "", false, nil, false
 	}
@@ -90,6 +93,55 @@ func rangeBoundOf(e Expr) (key string, isLo bool, col *ColumnRef, ok bool) {
 	default:
 		return rangeVarKey(cr), false, cr, true
 	}
+}
+
+// normalizeColumnPseudoConstRange is the rest of clauselist_selectivity's
+// pairing test (clausesel.c): a bound pairs when one operand is the variable
+// and the other is pseudo-constant (is_pseudo_constant_clause_relids), not
+// only a literal. An InitPlan output or a bind parameter qualifies, so TPC-DS
+// Q54's `d_month_seq >= (InitPlan 1) AND d_month_seq <= (InitPlan 2)` is one
+// range — and, both bounds being DEFAULT_INEQ_SEL (scalarineqsel cannot
+// estimate a non-Const), PG collapses it to DEFAULT_RANGE_INEQ_SEL 0.005
+// where two separate factors gave 0.111 (M0146-0184).
+func normalizeColumnPseudoConstRange(l, r Expr) (*ColumnRef, bool, bool) {
+	if cr, ok := l.(*ColumnRef); ok && isRangePseudoConstant(r) {
+		return cr, false, true
+	}
+	if cr, ok := r.(*ColumnRef); ok && isRangePseudoConstant(l) {
+		return cr, true, true
+	}
+	return nil, false, false
+}
+
+// isRangePseudoConstant reports whether e holds no column of the current
+// level and nothing volatile: a literal, a bind parameter, an uncorrelated
+// scalar sublink PG plans as an InitPlan, or casts and operators over those.
+// A function call declines (volatility is not checked here), as does any
+// other node — fail-closed, which keeps the old separate-factor estimate.
+func isRangePseudoConstant(e Expr) bool {
+	if e == nil {
+		return false
+	}
+	ok := true
+	// scopeIgnore does not descend into a sublink's body; SublinkIsInitPlan
+	// decides that it is uncorrelated. An unrecognised node aborts the walk.
+	walked := walkExprRefs(e, scopeIgnore, exprVisitor{Visit: func(x Expr) bool {
+		switch n := x.(type) {
+		case *IntegerConst, *StringConst, *NumericConst, *BooleanConst, *TypedStringLit, *ParamRef, *CastExpr:
+		case *SubqueryExpr:
+			ok = SublinkIsInitPlan(n)
+		case *BinaryOp:
+			switch n.Op {
+			case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv:
+			default:
+				ok = false
+			}
+		default:
+			ok = false
+		}
+		return ok
+	}})
+	return walked && ok
 }
 
 // flipComparison mirrors an operator across its operands: `c < x` means the

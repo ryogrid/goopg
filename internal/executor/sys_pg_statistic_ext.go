@@ -108,7 +108,7 @@ func syncStatisticExtRow(ctx *Context, obj *catalog.StatisticsObject) error {
 	}
 
 	// stxnamespace: resolve the schema name to its namespace OID.
-	nsOID := namespaceOIDForSchema(ctx.Catalog, obj.Schema)
+	nsOID := namespaceOIDForSchema(ctx.Catalog, obj.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 
 	// stxstattarget: NULL when unset (PG default), else the int2 value.
 	targetDatum := NullDatum

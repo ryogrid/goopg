@@ -151,10 +151,10 @@ func (o *ddlOp) resolveDefaultPrivilegeSchemaOIDs(s *parser.AlterDefaultPrivileg
 	im := o.ctx.Catalog.(*catalog.InMemory)
 	out := make([]uint32, 0, len(s.Schemas))
 	for _, name := range s.Schemas {
-		if !im.SchemaExists(name) {
+		if !im.SchemaExists(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return nil, &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", name)}
 		}
-		out = append(out, im.SchemaOID(name))
+		out = append(out, im.SchemaOID(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)))
 	}
 	return out, nil
 }

@@ -1,0 +1,14 @@
+CREATE TABLE a1 (k int PRIMARY KEY);
+INSERT INTO a1 SELECT g FROM generate_series(1, 18000) g;
+CREATE TABLE a2 (k int PRIMARY KEY);
+INSERT INTO a2 SELECT g FROM generate_series(1, 100000) g;
+CREATE TABLE a3 (k int PRIMARY KEY);
+INSERT INTO a3 SELECT g FROM generate_series(1, 500) g;
+CREATE TABLE a4 (k int, j int, PRIMARY KEY (k, j));
+INSERT INTO a4 SELECT g / 10, g % 10 FROM generate_series(1, 50000) g;
+CREATE TABLE a5 (k int PRIMARY KEY) WITH (fillfactor = 100);
+CREATE INDEX a5_ff70 ON a5 (k) WITH (fillfactor = 70);
+INSERT INTO a5 SELECT g FROM generate_series(1, 18000) g;
+CREATE TABLE a6 (k bigint PRIMARY KEY);
+INSERT INTO a6 SELECT g FROM generate_series(1, 18000) g;
+SELECT relname, pg_relation_size(oid)/8192 AS pages FROM pg_class WHERE relname IN ('a1_pkey','a2_pkey','a3_pkey','a4_pkey','a5_pkey','a5_ff70','a6_pkey') ORDER BY 1;

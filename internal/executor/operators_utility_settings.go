@@ -25,6 +25,11 @@ type utilitySettingsOp struct {
 
 func newUtilitySettingsOp(p *optimizer.Utility) *utilitySettingsOp { return &utilitySettingsOp{plan: p} }
 
+// SetLocalOutsideBlockMessage is WarnNoTransactionBlock's 25P01 text for SET
+// LOCAL (xact.c CheckTransactionBlock: "%s can only be used in transaction
+// blocks"); the wire fast paths raise the same warning.
+const SetLocalOutsideBlockMessage = "SET LOCAL can only be used in transaction blocks"
+
 // execErrorFromGUCError wraps a SET-time validation error for the wire
 // protocol, preserving the HINT PostgreSQL attaches to some GUC failures
 // (e.g. an enum's "Available values: ..." list) instead of collapsing it
@@ -32,7 +37,7 @@ func newUtilitySettingsOp(p *optimizer.Utility) *utilitySettingsOp { return &uti
 func execErrorFromGUCError(pos int, err error) *ExecError {
 	var verr *misc.ValidationError
 	if errors.As(err, &verr) {
-		return &ExecError{Code: "22023", Pos: pos, Message: verr.Msg, Hint: verr.Hint}
+		return &ExecError{Code: verr.SQLState(), Pos: pos, Message: verr.Msg, Hint: verr.Hint, Detail: verr.Detail}
 	}
 	return &ExecError{Code: "22023", Pos: pos, Message: err.Error()}
 }
@@ -55,6 +60,19 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		o.done = true
 		if o.ctx == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
+		}
+		// ExecSetVariableStmt: WarnNoTransactionBlock(isTopLevel, "SET
+		// LOCAL") before anything else. The value is still applied; the
+		// surrounding transaction's end discards it.
+		if stmt.Local && o.ctx.InTransactionBlock != nil && !o.ctx.InTransactionBlock() {
+			o.ctx.AddWarningWithHint("25P01", SetLocalOutsideBlockMessage, "")
+		}
+		// GUC_NOT_WHILE_SEC_REST (guc.c set_config_option): role and
+		// session_authorization cannot change inside a security-definer
+		// function (InLocalUserIdChange). M0146-0157.
+		if (stmt.Name == "role" || stmt.Name == "session_authorization") && o.ctx.SecurityDefinerUser != "" {
+			return nil, &ExecError{Code: "42501",
+				Message: fmt.Sprintf("cannot set parameter %q within security-definer function", stmt.Name)}
 		}
 		// "role" — update non-superuser role tracking for privilege checks
 		// (e.g. TRUNCATE ownership, M0118-0008), mirroring the string-matching
@@ -116,10 +134,24 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if o.ctx.SetSetting == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
-		if err := o.ctx.SetSetting(stmt.Name, stmt.Value, stmt.Local); err != nil {
+		value := stmt.Value
+		if stmt.Args != nil {
+			v, err := misc.FlattenSetArgs(stmt.Name, stmt.Args)
+			if err != nil {
+				return nil, execErrorFromGUCError(stmt.Pos(), err)
+			}
+			value = v
+		}
+		if err := o.ctx.SetSetting(stmt.Name, value, stmt.Local); err != nil {
 			return nil, execErrorFromGUCError(stmt.Pos(), err)
 		}
 		return nil, EOF
+	case *parser.AlterSystemStmt:
+		if o.done {
+			return nil, EOF
+		}
+		o.done = true
+		return nil, o.execAlterSystem(stmt)
 	case *parser.ResetStmt:
 		if o.done {
 			return nil, EOF
@@ -133,6 +165,13 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 				o.ctx.ResetAllSettings()
 			}
 			return nil, EOF
+		}
+		// GUC_NOT_WHILE_SEC_REST (guc.c set_config_option): role and
+		// session_authorization cannot change inside a security-definer
+		// function (InLocalUserIdChange). M0146-0157.
+		if (stmt.Name == "role" || stmt.Name == "session_authorization") && o.ctx.SecurityDefinerUser != "" {
+			return nil, &ExecError{Code: "42501",
+				Message: fmt.Sprintf("cannot set parameter %q within security-definer function", stmt.Name)}
 		}
 		// "role" — restore superuser status (RESET ROLE). M0119-0004.
 		if stmt.Name == "role" {
@@ -212,7 +251,7 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 					tempTypeNames := im.SessionTempTableNames(owner)
 					im.DropSessionTempObjects(owner)
 					if len(tempTypeNames) > 0 {
-						if rs := o.ctx.Catalog.Routines(); rs != nil {
+						if rs := routineRegistry(o.ctx); rs != nil {
 							rs.DropRoutinesReferencingTypes(tempTypeNames)
 						}
 					}
@@ -301,4 +340,145 @@ func (o *utilitySettingsOp) gucShortDescriptions() map[string]string {
 		}
 	}
 	return out
+}
+
+// execAlterSystem runs ALTER SYSTEM (utility.c T_AlterSystemStmt +
+// guc.c AlterSystemSetConfigFile). PreventInTransactionBlock, then the
+// permission check — superuser, or else the ALTER SYSTEM privilege on the
+// parameter (pg_parameter_aclcheck), never for RESET ALL — then the
+// validation and file rewrite behind ctx.AlterSystem. The new value takes
+// effect on the next pg_reload_conf() or restart, as in PostgreSQL.
+func (o *utilitySettingsOp) execAlterSystem(stmt *parser.AlterSystemStmt) error {
+	if o.ctx == nil || o.ctx.AlterSystem == nil {
+		return &ExecError{Code: "0A000", Message: "ALTER SYSTEM is not supported in this context"}
+	}
+	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25001", Message: "ALTER SYSTEM cannot run inside a transaction block"}
+	}
+	name := strings.ToLower(stmt.Name)
+	// ExtractSetVariableArgs runs before the permission check upstream.
+	value := stmt.Value
+	if stmt.Args != nil && !stmt.Reset && !stmt.ResetAll {
+		v, err := misc.FlattenSetArgs(name, stmt.Args)
+		if err != nil {
+			return execErrorFromGUCError(0, err)
+		}
+		value = v
+	}
+	if role := o.ctx.NonSuperuserRole; role != "" {
+		if stmt.ResetAll {
+			return &ExecError{Code: "42501", Message: "permission denied to perform ALTER SYSTEM RESET ALL"}
+		}
+		if !parameterACLGrants(o.ctx, name, role, 'A') {
+			return &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied to set parameter %q", name)}
+		}
+	}
+	set := !stmt.Reset && !stmt.Default
+	if err := o.ctx.AlterSystem(name, value, set, stmt.ResetAll); err != nil {
+		var aerr *misc.AlterSystemError
+		if errors.As(err, &aerr) {
+			return &ExecError{Code: aerr.Code, Message: aerr.Msg, Hint: aerr.Hint, Detail: aerr.Detail}
+		}
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	return nil
+}
+
+// parameterACLGrants reports whether the parameter's pg_parameter_acl entry
+// grants privilege (an aclitem letter, e.g. 'A' for ALTER SYSTEM) to role or
+// to PUBLIC. A parameter with no entry grants nothing to a non-superuser,
+// which is upstream's default (pg_parameter_aclmask with no row).
+func parameterACLGrants(ctx *Context, name, role string, privilege byte) bool {
+	return parameterACLGrantsIn(ctx.Catalog, name, role, privilege)
+}
+
+// ParameterSetAllowed is the PGC_SUSET half of set_config_option's privilege
+// check for a non-superuser session role: role is a superuser, or holds SET on
+// the parameter (pg_parameter_aclcheck ACL_SET). The postmaster installs it as
+// the session registry's privilege hook. M0146-0158.
+func ParameterSetAllowed(cat catalog.Catalog, role, name string) bool {
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if oid, found := im.RoleOID(role); found && im.IsSuperuser(oid) {
+			return true
+		}
+	}
+	return parameterACLGrantsIn(cat, name, role, 's')
+}
+
+func parameterACLGrantsIn(cat catalog.Catalog, name, role string, privilege byte) bool {
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return false
+	}
+	oid := im.ParameterACLOID(name)
+	if oid == 0 {
+		return false
+	}
+	text := strings.Trim(im.ParameterACLText(oid), "{}")
+	for _, item := range strings.Split(text, ",") {
+		eq := strings.IndexByte(item, '=')
+		if eq < 0 {
+			continue
+		}
+		grantee := strings.Trim(item[:eq], `"`)
+		privs := item[eq+1:]
+		if slash := strings.IndexByte(privs, '/'); slash >= 0 {
+			privs = privs[:slash]
+		}
+		if (grantee == "" || strings.EqualFold(grantee, role)) && strings.IndexByte(privs, privilege) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// flattenFunctionConfigOps prepares CREATE/ALTER FUNCTION SET / RESET
+// clauses for proconfig the way functioncmds.c update_proconfig_value does:
+// each SET value list goes through flatten_set_variable_args
+// (ExtractSetVariableArgs), and every named entry through GUCArrayAdd /
+// GUCArrayDelete's validation and name normalisation (misc.ConfigArrayItem)
+// — so proconfig holds PostgreSQL's text (`DateStyle=iso, mdy`) and a bad
+// name or value fails the statement. It returns a copy; the parsed
+// statement is left untouched.
+//
+// Each named entry also passes the session's PGC_SUSET privilege check, as
+// validate_option_array_item does: a non-superuser cannot attach a
+// superuser-only parameter to a routine (M0146-0158).
+func flattenFunctionConfigOps(ctx *Context, pos int, ops []parser.FunctionConfigOp) ([]parser.FunctionConfigOp, error) {
+	if len(ops) == 0 {
+		return ops, nil
+	}
+	out := append([]parser.FunctionConfigOp(nil), ops...)
+	for i := range out {
+		op := &out[i]
+		if op.ResetAll {
+			continue
+		}
+		var value *string
+		if !op.Reset {
+			if op.Args != nil {
+				v, err := misc.FlattenSetArgs(op.Name, op.Args)
+				if err != nil {
+					return nil, execErrorFromGUCError(pos, err)
+				}
+				op.Value = v
+			}
+			value = &op.Value
+		}
+		name, err := misc.ConfigArrayItem(op.Name, value)
+		if err != nil {
+			var aerr *misc.AlterSystemError
+			if errors.As(err, &aerr) {
+				return nil, &ExecError{Code: aerr.Code, Pos: pos, Message: aerr.Msg, Hint: aerr.Hint, Detail: aerr.Detail}
+			}
+			return nil, execErrorFromGUCError(pos, err)
+		}
+		if ctx != nil && ctx.CheckSetPrivilege != nil {
+			if perr := ctx.CheckSetPrivilege(name); perr != nil {
+				return nil, execErrorFromGUCError(0, perr)
+			}
+		}
+		op.Name = name
+	}
+	return out, nil
 }

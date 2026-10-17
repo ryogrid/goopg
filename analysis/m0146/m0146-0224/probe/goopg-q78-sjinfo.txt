@@ -1,0 +1,3 @@
+goopg top-search SpecialJoinInfos for TPC-DS SF0.25 Q78 (0=ss, 1=ws, 2=cs), probe at newSearchCtx:
+before: LEFT synL={0} synR={1} minL={0} minR={1}; LEFT synL={0,1} synR={2} minL={0,1} minR={2} (LhsStrict false on both)
+after:  LEFT synL={0} synR={1} minL={0} minR={1}; LEFT synL={0,1} synR={2} minL={0} minR={2}

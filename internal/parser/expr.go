@@ -165,6 +165,34 @@ func NegatedLiteralSQL(operand Expr) string {
 	return ""
 }
 
+// FoldedNegativeLiteralSQL is NegatedLiteralSQL for the folded form: the
+// grammar's doNegate (playbook §12.5) turns `-5` into IntegerConst{-5} and
+// `-3.5` into NumericConst{"-3.5"} rather than a UnaryOp over the magnitude,
+// so the pg_dump deparse twins reach the negative constant itself.
+// get_const_expr prints any constant whose text leads with '-' as the quoted
+// value plus a cast typed from the literal (make_const): int4 when the value
+// fits, int8 otherwise, numeric for a decimal. Returns "" for anything else.
+// Without it a CHECK / DEFAULT / index expression dumped `-5` where PG dumps
+// `'-5'::integer` (M0122-0015c follow-up; regressed DU-002 slice 364 once the
+// folding landed).
+func FoldedNegativeLiteralSQL(e Expr) string {
+	switch lit := e.(type) {
+	case *IntegerConst:
+		if lit.Value >= 0 {
+			return ""
+		}
+		if lit.Value >= -(1 << 31) {
+			return "'" + strconv.FormatInt(lit.Value, 10) + "'::integer"
+		}
+		return "'" + strconv.FormatInt(lit.Value, 10) + "'::bigint"
+	case *NumericConst:
+		if len(lit.Value) > 1 && lit.Value[0] == '-' {
+			return "'" + lit.Value + "'::numeric"
+		}
+	}
+	return ""
+}
+
 // TypedStringLit represents the SQL-standard typed-string-literal
 // syntax — `<type> 'value'`. The two we care about for TPC-H:
 // `date '1998-12-01'` and `timestamp '1998-12-01 00:00:00'`. The

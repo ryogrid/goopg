@@ -444,11 +444,11 @@ If Go symbol operations fail:
 - One item per loop. Task-selection authority is exactly two places:
   `.ralph/PROMPT.md` (procedure and rules) and the `## Current Priority`
   section at the head of `.ralph/fix_plan.md` (rank order + the Selection
-  rules subsection, which holds S1/S2/S6/S7/S8 and the M-NIGHTLY selection
+  rules subsection, which holds S1/S2/S6/S7/S8/S9 and the M-NIGHTLY selection
   condition). Both always outrank `.ralph/working_set.md`'s "NEXT LOOP"
   note, which carries state, not priority — and any other document's rank
   statement is non-authoritative.
-- For M0137–M0145 and `P0-` tasks, §"Plan-parity harness" below is binding —
+- For M0137–M0146 and `P0-` tasks, §"Plan-parity harness" below is binding —
   read it before selecting one. **M-NIGHTLY filing is unconditional:** every
   loop reads `ci/logs/action-items.md` and files each new `## AI-` subject;
   its selection condition lives in the banner's Selection rules.
@@ -456,16 +456,16 @@ If Go symbol operations fail:
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
   is a hard requirement, not optional documentation. **Overridden for
-  M0137–M0145 only** — see §"Plan-parity harness" below, where the design doc is
+  M0137–M0146 only** — see §"Plan-parity harness" below, where the design doc is
   written when the task is *selected*.
 - For any non-trivial subsystem item, create/update the corresponding
   `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
   `docs/design/README.md`
   in the same loop and commit. (This same-loop indexing requirement is **not**
-  relaxed for M0137–M0145.)
+  relaxed for M0137–M0146.)
 - Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
   concrete `<id>-NNNN-*` filenames before implementation begins. **Overridden
-  for M0137–M0145 only**: the filename is reserved at task selection, not at
+  for M0137–M0146 only**: the filename is reserved at task selection, not at
   milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
@@ -490,10 +490,10 @@ If Go symbol operations fail:
   done.
 
 <!-- PLAN-PARITY-HARNESS:BEGIN -->
-## Plan-parity harness (M0137–M0145) — binding
+## Plan-parity harness (M0137–M0146) — binding
 
 Sections R and G7 apply to **every** Ralph loop task. The rest applies to
-tasks in M0137–M0145 and `P0-` tasks. Where this section disagrees with other
+tasks in M0137–M0146 and `P0-` tasks. Where this section disagrees with other
 sections of this file, it wins for those tasks (including over
 `docs/milestones/README.md` step 2 and "reserve a design-doc filename before
 coding"). Rationale and history: `docs/design/0100-0149/plan-parity-harness-background.md`
@@ -581,7 +581,7 @@ obstacle: do not look for another command that achieves the same effect.
 
 ### S — Selection
 
-**The selection rules (S1, S2, S6, S7, S8 and the M-NIGHTLY selection
+**The selection rules (S1, S2, S6, S7, S8, S9 and the M-NIGHTLY selection
 condition) moved 2026-09-24 to the `## Current Priority` banner's
 "Selection rules" subsection in `.ralph/fix_plan.md`** — that text is now
 the authority; the S-numbers are kept there for citation stability. What
@@ -592,8 +592,9 @@ remains below is filing/completion discipline, not rank.
   `Movement: none`. Write each field **at the start of its own line** — a field
   buried mid-sentence does not count and the guard rejects it.
   *Movement* = PG match count changed, or a `CATEGORIES-EXCL-MATCH:` category
-  moved beyond ±3, or `make ea-ratchet` findings decreased. `Movement: yes` must
-  cite one of those three instruments **with a number** on the same line;
+  moved beyond ±3, or `make ea-ratchet` findings decreased, or a `regress`
+  suite's diff count moved (e.g. `regress join 14868 -> 14730`). `Movement: yes`
+  must cite one of those four instruments **with a number** on the same line;
   anything else (a unit test now passing, a feature now working) is
   `Movement: none` — real work, but not movement toward this goal.
 - **S4 Lineage budget.** After **5 consecutive** completed descendants of one
@@ -611,6 +612,11 @@ remains below is filing/completion discipline, not rank.
   the last-5 window — the count restarts from that point while still
   accumulating every later completion (it is a baseline reset, not a root
   exemption). Only the owner writes this line; the loop escalates instead.
+  **Owner filing-channel exemption:** a `FILEABLE-ROOTS: <root> ...` banner
+  line names standing census roots (currently M0146-0014) whose filings ARE
+  exempt from the budget — the mark-`[!]` remedy does not apply to them
+  (flipping one is a guard violation); the owner de-lists the root to hold
+  it. See banner rule S9 for the replenishment procedure that uses it.
 - **S5** A recon may file an implementation task only if the task names its
   expected movement (queries, categories or ea-ratchet findings vs PG) and how
   it will be measured.
@@ -662,7 +668,7 @@ Run on the change, in the task that changes production code:
   and never generalises one task's exception into a standing one; without a row,
   a blocked gate means: mark the task `[!]`, escalate, select elsewhere.
 - **G2** Gate scripts write `tmp/gate-stamps/<gate>.json` (tree hash, binary
-  sha256, result). `.githooks/commit-msg` rejects an M0137–M0145 planner/executor
+  sha256, result). `.githooks/commit-msg` rejects an M0137–M0146 planner/executor
   commit without matching PASS stamps and a `CATEGORIES-EXCL-MATCH:` line (or
   `PARITY: N/A — <reason>`).
 - **G3 Captures**: private clone + binary built from HEAD, never a shared

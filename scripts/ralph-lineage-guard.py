@@ -14,7 +14,13 @@ when the candidate:
       Priority` banner: the listed completed descendants are pinned OUT of
       the last-5 window, so the count restarts from the re-open point while
       still accumulating every completion that lands afterwards.
-  Rule B (lineage required): adds a task whose id matches M0137..M0145 or P0-
+      `FILEABLE-ROOTS: <root> ...` lines in the banner (read from the
+      BASELINE, like FROZEN-PREFIXES, so a candidate cannot self-exempt)
+      name standing census/filing-channel roots exempt from Rule A — the
+      parity-closure sweep's purpose IS filing findings, and a `none`-
+      streak of its routing sweeps must not freeze the supply. A listed
+      root may not be flipped `[ ]` -> `[!]`; the owner de-lists it.
+  Rule B (lineage required): adds a task whose id matches M0137..M0146 or P0-
       without a `Parent:` line.
   Rule D (field hygiene — audit hole D): a NEWLY ADDED line may not
       (1) be a task's ONLY `Parent:` / `Movement: yes` declaration while
@@ -27,9 +33,10 @@ when the candidate:
           `Movement: none`, which is what the guard already assumes; nor a
           field on a baseline task that USED to declare it readably (the owner
           reshaping an existing entry is not the loop gaming it).
-      (2) claim `Movement: yes` without citing one of S3's three instruments on
-          the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`, or
-          `ea-ratchet` — together with a number. A non-conforming
+      (2) claim `Movement: yes` without citing one of S3's instruments on
+          the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`,
+          `ea-ratchet`, or a `regress` suite diff count — together with a
+          number. A non-conforming
           `Movement: yes` is additionally TREATED AS `none` for Rule A, so it
           cannot reset the lineage budget (three such lines in HEAD did).
       Only lines that are new in the candidate are reported, so pre-existing
@@ -106,12 +113,15 @@ PARENT_RE = re.compile(r"^\s*Parent:\s*`?([^\s`]+)`?")
 MOVE_RE = re.compile(r"^\s*Movement:\s*(\S+)")
 PARENT_INLINE_RE = re.compile(r"(?:^|\s)Parent:\s*`?([^\s`]+)`?")
 MOVE_INLINE_RE = re.compile(r"(?:^|\s)Movement:\s*(\S+)")
-NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-5])|P0-)")
+NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-6])|P0-)")
 # Rule D: `Movement: yes` must cite an instrument with a number on the SAME
-# line — a `match` count (this also covers CATEGORIES-EXCL-MATCH) or
-# `ea-ratchet`.
+# line — a `match` count (this also covers CATEGORIES-EXCL-MATCH),
+# `ea-ratchet`, or a `regress` diff count (owner decision 2026-10-12:
+# regress-suite diff lines are a real measured instrument — correctness
+# families whose work moves only regress diffs were tripping Rule A as
+# structural `none`s).
 MOVE_YES_RE = re.compile(r"(?:^|\s)Movement:\s*yes", re.I)
-INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b", re.I)
+INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b", re.I)
 NUMBER_RE = re.compile(r"[0-9]")
 
 
@@ -208,6 +218,7 @@ def _fields(cur, ln, n, inline):
 
 FROZEN_PREFIXES_TOKEN = "FROZEN-PREFIXES:"
 LINEAGE_BASELINE_TOKEN = "LINEAGE-BASELINE:"
+FILEABLE_ROOTS_TOKEN = "FILEABLE-ROOTS:"
 BANNER_HEADING = "## Current Priority"
 
 
@@ -258,6 +269,26 @@ def lineage_baselines(text):
     return out
 
 
+def fileable_roots(text):
+    """Set of root ids from owner-only banner lines `FILEABLE-ROOTS: <root>
+    <root> ...`. Filings under a listed root are exempt from the Rule A
+    lineage budget (the root is a standing census/filing channel — e.g. the
+    parity-closure sweep — whose purpose IS filing findings). Parsed from the
+    BASELINE so a candidate cannot self-exempt, like FROZEN-PREFIXES; a
+    listed root also may not be flipped `[ ]` -> `[!]` (the owner de-lists
+    it to hold the lineage)."""
+    out = set()
+    for ln in banner_lines(text):
+        i = ln.find(FILEABLE_ROOTS_TOKEN)
+        if i < 0:
+            continue
+        for tok in ln[i + len(FILEABLE_ROOTS_TOKEN):].split():
+            tok = tok.strip("`*,;.()").replace("\\", "")
+            if tok:
+                out.add(tok)
+    return out
+
+
 def root_of(tasks, t):
     seen = set()
     while t.parent and t.parent in tasks and t.parent not in seen:
@@ -288,11 +319,12 @@ def check(baseline, candidate):
         if NEWID_RE.match(t.id) and not t.has_parent:
             errs.append(
                 f"[B] new task {t.id} (line {t.line}) has no `Parent:` line. Every new "
-                f"M0137-M0145 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
+                f"M0137-M0146 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
                 f"or `Parent: none` for owner-filed tasks).")
 
     # Rule A
     pinned = lineage_baselines(candidate)
+    fileable = fileable_roots(baseline)
     completed_by_root = {}
     for t in corder:
         if t.parent is None or t.parent not in ctasks:
@@ -308,6 +340,8 @@ def check(baseline, candidate):
         if t.status != " " or t.parent is None or t.parent not in ctasks:
             continue
         root = root_of(ctasks, t)
+        if root in fileable:
+            continue
         if root in exhausted:
             ids = ", ".join(d.id for d in exhausted[root])
             errs.append(
@@ -326,6 +360,13 @@ def check(baseline, candidate):
         return next((p for p in prefixes if tid and tid.startswith(p)), None)
 
     for bt in sorted(btasks.values(), key=lambda t: t.idx):
+        if bt.id in fileable and bt.status == " ":
+            ct = ctasks.get(bt.id)
+            if ct is not None and ct.status == "!":
+                errs.append(
+                    f"[A] fileable root {bt.id} changed from [ ] to [!] (line "
+                    f"{ct.line}). FILEABLE-ROOTS roots stay [ ] — the owner "
+                    f"removes the listing to hold the lineage.")
         p = fz(bt.id)
         if p is None:
             continue
@@ -370,9 +411,10 @@ def check(baseline, candidate):
                 continue
             errs.append(
                 f"[D] task {t.id} (line {n}) claims `Movement: yes` without citing an "
-                f"instrument on the same line. `Movement: yes` must name one of S3's three "
+                f"instrument on the same line. `Movement: yes` must name one of S3's "
                 f"instruments WITH a number: a `match` count change, `CATEGORIES-EXCL-MATCH`, "
-                f"or `ea-ratchet` (e.g. `Movement: yes — match 539 -> 530`). Until then it "
+                f"`ea-ratchet`, or a `regress` suite diff count "
+                f"(e.g. `Movement: yes — match 539 -> 530`). Until then it "
                 f"counts as `Movement: none` and does NOT reset the lineage budget. Line: "
                 f"{ln.strip()[:120]}")
         for n, ln, field in t.midline_lines:

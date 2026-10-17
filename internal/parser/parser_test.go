@@ -491,8 +491,9 @@ func TestParseShowSetReset(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// gram.y zone_value: LOCAL { $$ = NULL; } — a reset, like DEFAULT.
 		s := stmts[0].(*SetStmt)
-		if s.Name != "timezone" || s.Value != "local" || s.Default {
+		if s.Name != "timezone" || !s.Default {
 			t.Fatalf("unexpected: %+v", s)
 		}
 	})

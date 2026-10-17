@@ -281,3 +281,17 @@ func groupingCallKey(gc *parser.GroupingCall) string {
 	b.WriteByte(')')
 	return b.String()
 }
+
+// statementHasGroupingSets reports whether s's GROUP BY leaves PG's
+// parse->groupingSets non-NIL. transformGroupClause (parse_clause.c) keeps a
+// grouping-set list for ROLLUP, CUBE and GROUPING SETS with more than one set
+// (or an empty one); `GROUPING SETS ((a, b))` plans as a plain GROUP BY a, b
+// (M0146-0179: PG 18.3 reduces a semijoin under it, and keeps one under
+// ROLLUP).
+func statementHasGroupingSets(s *parser.SelectStmt) bool {
+	if s == nil || s.GroupingSets == nil {
+		return false
+	}
+	sets := s.GroupingSets.Sets
+	return len(sets) != 1 || len(sets[0]) == 0
+}

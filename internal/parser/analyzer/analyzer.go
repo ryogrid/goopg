@@ -2394,7 +2394,7 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		if alias == "" {
 			alias = rv.TableFunc.Name
 		}
-		cols := tableFuncColumns(rv.TableFunc, alias, rv.Columns)
+		cols := tableFuncColumns(cat, rv.TableFunc, alias, rv.Columns)
 		return &catalog.Table{Name: alias, Columns: cols}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
@@ -2416,17 +2416,48 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 // wrapOrdinality (internal/planner/planner.go). The trailing alias is
 // stripped before dispatch so per-function cases below see only the
 // base-column aliases, same as the planner's colAliases[:len-1] slices.
-func tableFuncColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+func tableFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
 	ordColName := "ordinality"
 	if tf.WithOrdinality && len(colAliases) > 0 {
 		ordColName = colAliases[len(colAliases)-1]
 		colAliases = colAliases[:len(colAliases)-1]
 	}
 	cols := tableFuncBaseColumns(tf, alias, colAliases)
+	// A user-defined function the dispatch does not know: its result columns
+	// as the planner's binding has them (M0146-0165).
+	if uc := userFuncColumns(cat, tf, alias, colAliases); uc != nil {
+		cols = uc
+	}
 	if tf.WithOrdinality {
 		cols = append(cols, catalog.Column{Name: ordColName, Type: catalog.Type{Name: "int8"}, Ordinal: len(cols)})
 	}
 	return cols
+}
+
+// userFuncColumns returns the result columns of a user-defined function called
+// in FROM, mirroring planTableFuncRangeVar's user-routine arm (first candidate
+// by name), or nil when tf names no user routine or one of the built-in
+// functions the planner plans before consulting the routine registry.
+func userFuncColumns(cat catalog.Catalog, tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	if cat == nil || len(tf.RowsFuncs) > 0 || strings.EqualFold(tf.Name, "generate_series") {
+		return nil
+	}
+	switch strings.ToLower(tf.Name) {
+	case "pg_input_error_info", "parse_ident", "pg_get_publication_tables",
+		"pg_available_wal_summaries", "pg_wal_summary_contents", "pg_get_wal_summarizer_state", "pg_get_catalog_foreign_keys", "pg_get_sequence_data",
+		"pg_sequence_parameters", "ts_token_type", "verify_heapam", "pg_partition_tree",
+		"pg_partition_ancestors", "pg_options_to_table", "unnest", "regexp_matches",
+		"regexp_split_to_table", "generate_subscripts":
+		return nil
+	}
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	for _, r := range rs.LookupByName(parser.ObjectName{Name: tf.Name}) {
+		return catalog.RoutineResultColumns(cat, r, alias, colAliases)
+	}
+	return nil
 }
 
 // tableFuncBaseColumns dispatches on function name for tableFuncColumns,
@@ -2505,6 +2536,56 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 		// with pg_catalog.pg_sequence. DU-002 slice 32 (M0110-0001).
 		names := []string{"last_value", "is_called"}
 		types := []string{"int8", "bool"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_get_wal_summarizer_state":
+		// pg_get_wal_summarizer_state() → (summarized_tli int8, summarized_lsn
+		// pg_lsn, pending_lsn pg_lsn, summarizer_pid int4). Mirrors
+		// planPgGetWalSummarizerState. M0122-0009 S4b.
+		names := []string{"summarized_tli", "summarized_lsn", "pending_lsn", "summarizer_pid"}
+		types := []string{"int8", "pg_lsn", "pg_lsn", "int4"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_available_wal_summaries":
+		// pg_available_wal_summaries() → (tli int8, start_lsn pg_lsn, end_lsn
+		// pg_lsn). Mirrors planPgAvailableWalSummaries; without this arm a
+		// reference to one of its columns (ORDER BY start_lsn) failed with 42703.
+		// M0122-0009 S4a.
+		names := []string{"tli", "start_lsn", "end_lsn"}
+		types := []string{"int8", "pg_lsn", "pg_lsn"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_wal_summary_contents":
+		// pg_wal_summary_contents(tli, start_lsn, end_lsn) → (relfilenode oid,
+		// reltablespace oid, reldatabase oid, relforknumber int2,
+		// relblocknumber int8, is_limit_block bool). Mirrors
+		// planPgWalSummaryContents. M0122-0009 S4a.
+		names := []string{"relfilenode", "reltablespace", "reldatabase", "relforknumber", "relblocknumber", "is_limit_block"}
+		types := []string{"oid", "oid", "oid", "int2", "int8", "bool"}
 		for i := range names {
 			if i < len(colAliases) && colAliases[i] != "" {
 				names[i] = colAliases[i]

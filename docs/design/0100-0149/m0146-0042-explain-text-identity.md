@@ -1,8 +1,8 @@
 # M0146-0042 — EXPLAIN text-identity burn-down
 
-Status: held `[!]` 2026-10-09 by the S4 lineage escalation in M0146-0005
-(its last five completed descendants, M0146-0111 to 0115, all carry
-`Movement: none`). Only the owner reopens it.
+Status: open — re-opened 2026-10-12 by the owner (M0146-0005's LINEAGE-BASELINE
+pin of 0111–0115 lifted the 2026-10-09 S4 hold); slices continue, latest
+2026-10-13 (`52bf18eac`, Memoize cache key). The text-only queue is empty; Q59 waits on EC-ordered join clauses (plan state).
 
 Umbrella for the `rendering` class: EXPLAIN text differences on plans whose
 shape already matches PG 18.3. The instrument is text-identical, meaning
@@ -511,6 +511,192 @@ Results:
 - Not covered (ledger): on a hash join's hashed side PG keeps `Subquery
   Scan` over an inlined DISTINCT CTE, and goopg strips it. That is a
   shape gap in the strip pass for inlined CTE leaves.
+
+## Slice — a SubPlan's PARAM_EXEC resolves in its evaluating node (2026-10-13, `b5bf2cfec`)
+
+- **Witness.** TPC-DS Q6 at both scales.
+  - Since M0146-0130, Q6's `i_current_price > 1.2 * (SubPlan 2)` sits in the
+    Filter of the parameterised inner `Index Scan using item_pkey on item i`.
+  - goopg printed the SubPlan body's `Filter: (i_category = $0)`; PG prints
+    `(i_category = i.i_category)`.
+- **PG.** `get_parameter` / `find_param_referent` (ruleutils.c) prints a
+  PARAM_EXEC argument in the context of the plan node that evaluates the
+  SubPlan.
+- **Cause.** goopg resolved the source only in the owner M0146-0012a records:
+  the join, or the parameterised loop's outer input. That suits an argument
+  read from the outer relation. Q6's reads the inner scan's own relation, so
+  the walk over the outer input found no match.
+- **Change.** The registry records the node being rendered when the sublink is
+  assigned (`subPlanEntry.paramScope`), and `formatExecParamRef` tries it
+  before the owner.
+  - The resolver still demands exactly one proven relation.
+  - A source whose relation index was erased (0) skips the scope step, because
+    a name-only match could take a same-named column of the scan.
+- **Result.**
+  - Q6 is text-identical at both scales: SF0.25 64 → 65, SF1 40 → 41.
+  - PLAN-PARITY match SF0.25 70 → 71, SF1 44 → 45; parameterisation −1 at
+    each scale.
+  - Q6's values are identical, and the fire set is Q6 only.
+  - `TestExplainSubPlanParamReferentOnParameterisedInner` (postmaster) fails
+    on HEAD.
+
+## Slice — a key above a UNION ALL appendrel stops at a kept member (2026-10-13, `d2b0ba67d`)
+
+- **Witness.** TPC-DS Q5's wsr arm at both scales.
+  - The UNION ALL in FROM is an appendrel. Its join member stays a subquery
+    RTE, `Subquery Scan on "*SELECT* 2"`, which the Parallel Append puts
+    first.
+  - PG prints the Hash Conds above it as `"*SELECT* 2".wsr_web_site_sk`;
+    goopg printed `web_sales_1.ws_web_site_sk`.
+- **PG.** `set_deparse_plan` (ruleutils.c) makes an Append's outer_plan its
+  first child, and `get_variable` prints a Var of a kept subquery scan with
+  its alias, quoted by `quote_identifier`.
+- **Change.**
+  - `SubqueryScan.IsAppendRelMember` (the M0146-0093 label) stops the
+    set-operation key walk at a kept member. A branch scan PG's
+    trivial\_subqueryscan removes stays transparent (M0146-0005w).
+  - `SetOp.IsUnionAllAppendRel` lets the join-residual walk continue through
+    such an appendrel's first child. Inheritance and partition fan-outs keep
+    the parent-alias stop.
+  - The alias and column print through `pgQuoteIdent`.
+- **Result.**
+  - Q5 is text-identical at both scales: SF0.25 65 → 66, SF1 41 → 42.
+  - PLAN-PARITY match SF0.25 71 → 72, SF1 45 → 46.
+  - Q14's keys above its UNION ALL print `item.i_brand_id` (10 → 2 differing
+    lines).
+  - Values are identical, and the regress A/B over 27 cases is flat.
+  - TPC-H Q18's key now prints the quoted `"ANY_subquery"`. PG prints
+    `lineitem_1.l_orderkey` there; that divergence is pre-existing and in the
+    ledger.
+
+## Slice — an omitted CASE ELSE prints its type for char, varchar, real and timestamps (2026-10-13, `8094e1dd6`)
+
+- **Witness.** TPC-DS Q36 and Q86 (both scales) and Q70. In their Sort Keys,
+  PG prints `CASE WHEN (sub.lochierarchy = 0) THEN sub.i_category ELSE
+  NULL::bpchar END`; goopg printed no ELSE.
+- **PG.** ruleutils always prints the parser's NULL defresult, through
+  `get_const_expr`, as `NULL::` plus `format_type(type, -1)`.
+- **Cause.** `nullConstTypeLabel` had no spelling for blank-padded char.
+- **Change.** The label table gains the spellings PG 18.3 prints, each checked
+  on a scratch PG: `bpchar`, `character varying`, `real`,
+  `timestamp without time zone` and `timestamp with time zone`.
+- **Result.**
+  - Values are identical, and the fire set is Q36, Q70 and Q86.
+  - Aligned identical lines: SF0.25 3680 → 3683, SF1 3097 → 3100.
+  - Text-identical stays flat. Q36/Q86 still differ in the Window clause:
+    goopg prints the Agg's output names (`grouping`, `sum`) where PG deparses
+    `GROUPING(item.i_category)` through the Agg's target list. That is the
+    next slice.
+  - Regress content is identical.
+
+## Slice — a computed key over an aggregate's outputs deparses through the Agg (2026-10-13, `549070713`)
+
+- **Witness.** TPC-DS Q36 and Q86 at both scales. A WindowAgg over a
+  `ROLLUP` aggregate partitions by `grouping(i_category)+grouping(i_class)`
+  and a CASE over `grouping(i_class)`, and orders by `sum(...)/sum(...)`.
+  goopg printed the aggregate's output names, `(grouping + grouping)` and
+  `(sum / sum)`, in the Window clause and in the Sort below it.
+- **PG.** `get_variable` deparses every OUTER_VAR through the child Agg's
+  target list:
+  `((GROUPING(item.i_category) + GROUPING(item.i_class)))`,
+  `((sum(store_sales.ss_net_profit) / sum(store_sales.ss_ext_sales_price)))`.
+- **Change.**
+  - `aggOutputKeyExpr` factors `sortKeyParts`' per-column expansion out
+    unchanged (group key chase, aggregate call, GROUPING mask).
+  - A computed key rewrites each of its columns through that helper.
+  - `sortInputAggregate` finds the aggregate under a WindowAgg's input Sort,
+    so the Window clause, which reuses `sortKeyParts`, takes the same
+    expansion.
+- **Result.**
+  - text-identical SF0.25 66 → 68, SF1 42 → 44 (Q36, Q86).
+  - `rendering` category SF0.25 2 → 1, SF1 4 → 3.
+  - Values are identical, and regress content is identical.
+
+## Slice — a pruned GROUP BY column through a split aggregate (2026-10-13, `8944f2bff`)
+
+- **Witness.** TPC-DS Q66 at both scales.
+  - Each UNION ALL member groups by `d_year` under `d_year = 2001`, so the
+    planner prunes it from the group key and carries it as a passthrough
+    column.
+  - The members are parallel: Finalize over Partial, under a Gather Merge.
+  - The outer Group and Sort Keys printed the subquery's `year`; PG prints
+    `date_dim.d_year`.
+- **PG.** The pruned column stays a plain Var in the member's target list,
+  and `get_variable` deparses the Append's OUTER_VAR through the first
+  member to it.
+- **Change.** The passthrough rule in `resolveKeySourceAt` (simple
+  aggregates only, until now) runs in every aggregate mode, with the
+  output-name guard. The Finalize's passthrough reads the Partial's tail
+  through the Gather, and the Partial's reads its input.
+- **Result.**
+  - text-identical SF0.25 68 → 69, SF1 44 → 45.
+  - Values are identical, regress is identical, and the fire set is Q66
+    only.
+
+## Slice — a group key through a HAVING that holds an InitPlan (2026-10-13, `854083b44`)
+
+- **Witness.** TPC-DS Q14, SF0.25. The ROLLUP's Sort Key printed `i_brand_id`
+  where PG prints `item.i_brand_id`. The first UNION ALL member's HAVING
+  compares against an InitPlan, and `filterBlocksChase` stopped every key
+  chase at a sublink-bearing Filter.
+- **Why the block exists.** It keeps an aggregate result that PG walls off
+  behind a kept Subquery Scan from being synthesised out from under it
+  (Q44).
+- **Change.** `chaseOnGroupKeyOf` lets the chase continue through such a
+  Filter when it is on a plain group key of the simple aggregate beneath. PG
+  keeps that key as a Var in the Agg's target list, so the HAVING's InitPlan
+  does not wall it off.
+- **Result.**
+  - text-identical SF0.25 69 → 70.
+  - Values are identical, regress is identical, and the fire set is Q14
+    only (Q44 unchanged).
+- **Found, not done.** Q59's Hash Cond prints its two conjuncts in written
+  order; PG prints them in EquivalenceClass order. The outer
+  `d_week_seq1 = d_week_seq2 - 52` joins the EC that subquery y's own WHERE
+  opened before `s_store_id1 = s_store_id2`'s, and
+  `generate_join_implied_equalities` walks the ECs in order. The order
+  comes from the join restrictlist, which is plan state (hash and merge key
+  order), so it is ledgered rather than patched in EXPLAIN.
+
+## Slice — a Memoize cache key deparses against the loop's outer row (2026-10-13, `52bf18eac`)
+
+- **Witness.** TPC-DS Q44, SF0.25. `Cache Key: item_sk` where PG prints
+  `v11.item_sk` and `v21.item_sk`. The Index Cond beneath the same Memoize
+  already printed `v11.item_sk`.
+- **PG.** `show_memoize_info` deparses the key, which is the parameterising
+  loop's outer Var, through the outer plan. A kept Subquery Scan prints its
+  alias.
+- **Change.** `memoizeParentLoop` finds the loop whose inner side is the
+  Memoize (a Join's Right or an index join's InnerMemo; outer first in its
+  row). The keys format with that loop as the join row, resolving
+  positionally as the Join Filter does.
+- **Result.**
+  - text-identical SF0.25 70 → 71.
+  - Values are identical, regress is identical, and the fire set is Q44
+    only.
+- **Queue state.** This slice empties the text-only queue. The remaining
+  non-identical MATCH query, Q59, needs EquivalenceClass-ordered join
+  clauses (plan state, ledgered). Q78's rendering rides a cost-tie join-order
+  swap.
+
+### Slice 2026-10-14 — InitPlan numbers follow the subquery RTE order (TPC-DS Q58)
+
+- **Witness.** TPC-DS Q58 at both scales. Its only divergence was the InitPlan numbering. PG numbers the three
+  inlined CTE branches' `d_week_seq = (select …)` initplans ss = 1, cs = 2, ws = 3. goopg, whose join prints cs
+  first, numbered them cs = 1, ss = 2.
+- **PG.** A plan id is the position in `glob->subplans`, i.e. planning order. `set_base_rel_sizes` plans the
+  subquery RTEs in range-table (source) order, whatever order the join later prints them in.
+- **Change.** `reservePGPlanIDs` (explain_plan_ids.go) walks a level's nested query levels through
+  `nestedLevelsInPlanningOrder`. A level is ordered by the smallest source position of any sublink inside it, and
+  only levels holding a sublink move. If any such level has a sublink of unknown position, the plan order stands.
+- **Result.**
+  - PLAN-PARITY match SF0.25 80 → 81, SF1 65 → 66 (Q58).
+  - parameterisation 10 → 9 at SF0.25 and 13 → 12 at SF1.
+  - Values are identical; regress (subselect, with, aggregates, select_parallel) is identical.
+- **Test.** `TestInitPlanNumbersFollowSubqueryRTEOrder` uses two grouped subqueries whose hash join prints the
+  second first. It fails without the change.
+- **Not ported.** The order is read from sublink source positions. That is CTE declaration order, while PG's RTE
+  order for an inlined CTE is its reference order in FROM. They agree in Q58.
 
 ## Remaining classes (census of MATCH queries, 2026-10-05)
 

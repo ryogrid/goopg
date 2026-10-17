@@ -1,0 +1,411 @@
+M26P n=10 rel=(b 1 2 4 6 8 10 12 14 18 19) startup=159.8725 total=14490.2780 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 18) innertype=339 innerstart=0.0000 outerstart=159.8725
+M26P n=10 rel=(b 1 2 4 6 8 10 12 14 18 19) startup=159.8725 total=14491.7780 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 18) innertype=360 innerstart=0.0000 outerstart=159.8725
+M26P n=10 rel=(b 1 2 4 6 8 10 12 14 18 19) startup=160.0200 total=14475.6932 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 18) innertype=342 innerstart=0.1475 outerstart=159.8725
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.0200 total=17908.5407 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 18 19) inner=(b 16) innertype=339 innerstart=0.0000 outerstart=160.0200
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.0200 total=18273.7857 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 18 19) inner=(b 16) innertype=360 innerstart=0.0000 outerstart=160.0200
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.1650 total=14490.6210 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 16) inner=(b 18) innertype=339 innerstart=0.0000 outerstart=160.1650
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.1650 total=14492.1210 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 16) inner=(b 18) innertype=360 innerstart=0.0000 outerstart=160.1650
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.3125 total=14476.0362 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 16) inner=(b 18) innertype=342 innerstart=0.1475 outerstart=160.1650
+M26P n=11 rel=(b 1 2 4 6 8 10 12 14 16 18 19) startup=160.3125 total=14476.0362 rows=1.0 outer=(b 1 2 4 6 8 10 12 14 18 19) inner=(b 16) innertype=341 innerstart=0.2925 outerstart=160.0200
+M26P n=5 rel=(b 1 2 10 12 14) startup=1.4375 total=15328823.7581 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 10 12 14) startup=1.4375 total=6067327.3556 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 10 12 14) startup=1.7300 total=60794.7880 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.4375
+M26P n=5 rel=(b 1 2 10 12 14) startup=158.7325 total=15291636.8391 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 10 12 14) startup=158.7325 total=6030140.4366 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 10 12 14) startup=159.0250 total=23607.8690 rows=1.0 outer=(b 1 2 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=158.7325
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.2975 total=2214071943.6262 rows=4698.0 outer=(b 1 2 4 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.2975 total=4586004.3099 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.2975 total=5736677.8916 rows=4698.0 outer=(b 1 2 4 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.2975 total=619809.3773 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.3075 total=1050777.5228 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.3075 total=5016972.4554 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.4375 total=59573.1206 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.4375 total=63796.0664 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.4575 total=543148.7591 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.4575 total=547371.7049 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5700 total=59963.5955 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.4375
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5800 total=118300.0983 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5800 total=59375.6413 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.4375
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5900 total=112526.7895 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5900 total=543539.2340 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.4575
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5900 total=549268.2438 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.5900 total=871451.1187 rows=4698.0 outer=(b 1 2 4 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.6000 total=542951.2798 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.4575
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.6000 total=543494.9349 rows=4698.0 outer=(b 1 2 4 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 10 12) startup=1.6000 total=583228.7833 rows=4698.0 outer=(b 1 2 4 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 10 12) startup=158.7325 total=22386.2016 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 4 10 12) startup=158.7325 total=26609.1475 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 4 10 12) startup=158.8750 total=22188.7223 rows=4698.0 outer=(b 1 2 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=158.7325
+M26P n=5 rel=(b 1 2 4 12 14) startup=1.2975 total=36334302.1324 rows=3.0 outer=(b 1 2 4 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 12 14) startup=1.2975 total=92204830.6324 rows=3.0 outer=(b 1 2 4 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 12 14) startup=1.5900 total=118921.5501 rows=3.0 outer=(b 1 2 4 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.2975 total=1597050782.6485 rows=945282.0 outer=(b 1 2 4 10) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.2975 total=255772332.2926 rows=945282.0 outer=(b 1 2 4 10) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.3025 total=103044790.8513 rows=945282.0 outer=(b 1 2 4 6) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.3025 total=901121828.5649 rows=945282.0 outer=(b 1 2 4 6) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.4525 total=1473292.4055 rows=945282.0 outer=(b 1 2 6 10) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.4525 total=623327.1263 rows=945282.0 outer=(b 1 2 6 10) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.5850 total=2164105.4818 rows=945282.0 outer=(b 1 2 4 6) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.5950 total=579356.1722 rows=945282.0 outer=(b 1 2 4 6) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.5950 total=583625.0872 rows=945282.0 outer=(b 1 2 6 10) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.4525
+M26P n=5 rel=(b 1 2 4 6 10) startup=1.5950 total=587738.2489 rows=945282.0 outer=(b 1 2 4 10) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.3025 total=13350933729.8220 rows=28335.0 outer=(b 1 2 4 6) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.3025 total=31651460.0896 rows=28335.0 outer=(b 1 2 4 6) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.3075 total=48395110.7782 rows=28335.0 outer=(b 1 2 4 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.3075 total=8192092.4629 rows=28335.0 outer=(b 1 2 4 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.4625 total=547687.1056 rows=28335.0 outer=(b 1 2 6 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.4625 total=573163.9306 rows=28335.0 outer=(b 1 2 6 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.5950 total=2319277.1164 rows=28335.0 outer=(b 1 2 4 6) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.5950 total=549733.9991 rows=28335.0 outer=(b 1 2 4 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.5950 total=549735.6673 rows=28335.0 outer=(b 1 2 4 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.5950 total=550047.4182 rows=28335.0 outer=(b 1 2 6 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.4625
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.6050 total=546496.8564 rows=28335.0 outer=(b 1 2 4 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.6050 total=546496.8564 rows=28335.0 outer=(b 1 2 6 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.4625
+M26P n=5 rel=(b 1 2 4 6 12) startup=1.6050 total=577858.7424 rows=28335.0 outer=(b 1 2 4 6) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.3025 total=288939531454.0206 rows=1137213.0 outer=(b 1 2 4 6) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.3025 total=32930480296.3610 rows=1137213.0 outer=(b 1 2 4 6) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.4425 total=1921230874.0610 rows=1137213.0 outer=(b 1 2 4 8) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.4425 total=307616523.1285 rows=1137213.0 outer=(b 1 2 4 8) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.5975 total=1683865.8206 rows=1137213.0 outer=(b 1 2 6 8) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.5975 total=661323.1373 rows=1137213.0 outer=(b 1 2 6 8) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.7300 total=4702432.8318 rows=1137213.0 outer=(b 1 2 4 6) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.7400 total=604876.7081 rows=1137213.0 outer=(b 1 2 4 6) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.3025
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.7400 total=613560.0281 rows=1137213.0 outer=(b 1 2 6 8) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.5975
+M26P n=5 rel=(b 1 2 4 6 8) startup=1.7400 total=618056.9111 rows=1137213.0 outer=(b 1 2 4 8) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.2975 total=47906694526.1027 rows=188550.0 outer=(b 1 2 4 10) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.2975 total=5460403407.2227 rows=188550.0 outer=(b 1 2 4 10) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.4425 total=180239401.5475 rows=188550.0 outer=(b 1 2 4 8) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.4425 total=21051670.9447 rows=188550.0 outer=(b 1 2 4 8) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.5925 total=605029.1609 rows=188550.0 outer=(b 1 2 8 10) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.5925 total=774565.9734 rows=188550.0 outer=(b 1 2 8 10) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.7250 total=929462.5421 rows=188550.0 outer=(b 1 2 4 8) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.7350 total=597109.8817 rows=188550.0 outer=(b 1 2 8 10) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.7350 total=610245.8067 rows=188550.0 outer=(b 1 2 4 10) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 10) startup=1.7350 total=615053.5026 rows=188550.0 outer=(b 1 2 4 8) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.2975 total=1436104837.2574 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.2975 total=163814960.2974 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.3075 total=1436535805.4029 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.3075 total=164245928.4429 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.4425 total=2663532830.8292 rows=5652.0 outer=(b 1 2 4 8) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.4425 total=6813009.7624 rows=5652.0 outer=(b 1 2 4 8) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.5825 total=61861.9322 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.5825 total=66943.2364 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.5925 total=561599.3221 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.5925 total=566680.6262 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7150 total=62331.8780 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.5825
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7250 total=130915.3024 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7250 total=562069.2679 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7250 total=61624.3530 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.5825
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7350 total=131623.6724 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.2975
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7350 total=561361.7428 rows=5652.0 outer=(b 1 2 8 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.5925
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7350 total=561883.4479 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7350 total=960413.7503 rows=5652.0 outer=(b 1 2 4 8) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.4425
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7450 total=562591.8179 rows=5652.0 outer=(b 1 2 4 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.3075
+M26P n=5 rel=(b 1 2 4 8 12) startup=1.7450 total=613547.5646 rows=5652.0 outer=(b 1 2 4 8) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.4425
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4525 total=2214074834.6373 rows=4698.0 outer=(b 1 2 6 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4525 total=5739568.9028 rows=4698.0 outer=(b 1 2 6 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4575 total=1812811.3466 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4575 total=8477764.3466 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4625 total=1055948.3880 rows=4698.0 outer=(b 1 2 6 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.4625 total=5022143.3205 rows=4698.0 outer=(b 1 2 6 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7450 total=544344.6224 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.4575
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7450 total=544344.8990 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.4575
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7450 total=554439.1090 rows=4698.0 outer=(b 1 2 6 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7450 total=874342.1299 rows=4698.0 outer=(b 1 2 6 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7550 total=544462.3440 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.4575
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7550 total=548665.8001 rows=4698.0 outer=(b 1 2 6 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 10 12) startup=1.7550 total=586119.7944 rows=4698.0 outer=(b 1 2 6 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 10 12) startup=158.7325 total=1292048.7891 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 6 10 12) startup=158.7325 total=7957001.7891 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0200 total=22110.4926 rows=4698.0 outer=(b 1 6 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=158.5900
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0200 total=23088.2088 rows=4698.0 outer=(b 1 6 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=158.5900
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0200 total=23582.0649 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=158.7325
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0200 total=23582.3415 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=158.7325
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0300 total=22153.4901 rows=4698.0 outer=(b 1 6 10 12) inner=(b 2) innertype=361 innerstart=0.4400 outerstart=158.5900
+M26P n=5 rel=(b 1 2 6 10 12) startup=159.0300 total=23699.7865 rows=4698.0 outer=(b 1 2 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=158.7325
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.4525 total=47906697417.1138 rows=188550.0 outer=(b 1 2 6 10) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.4525 total=5460406298.2338 rows=188550.0 outer=(b 1 2 6 10) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.5925 total=319036834.2249 rows=188550.0 outer=(b 1 2 8 10) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.5925 total=51500081.6483 rows=188550.0 outer=(b 1 2 8 10) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.5975 total=180242292.5587 rows=188550.0 outer=(b 1 2 6 8) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.5975 total=21054561.9559 rows=188550.0 outer=(b 1 2 6 8) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.8800 total=932353.5532 rows=188550.0 outer=(b 1 2 6 8) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.8900 total=602601.2193 rows=188550.0 outer=(b 1 2 8 10) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.8900 total=613136.8179 rows=188550.0 outer=(b 1 2 6 10) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.4525
+M26P n=5 rel=(b 1 2 6 8 10) startup=1.8900 total=617944.5138 rows=188550.0 outer=(b 1 2 6 8) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.4625 total=1436540976.2681 rows=5652.0 outer=(b 1 2 6 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.4625 total=164251099.3081 rows=5652.0 outer=(b 1 2 6 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.5925 total=10107458.8596 rows=5652.0 outer=(b 1 2 8 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.5925 total=2088779.8596 rows=5652.0 outer=(b 1 2 8 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.5975 total=2663535721.8404 rows=5652.0 outer=(b 1 2 6 8) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.5975 total=6815900.7736 rows=5652.0 outer=(b 1 2 6 8) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.8800 total=563038.1952 rows=5652.0 outer=(b 1 2 8 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.8800 total=563038.5280 rows=5652.0 outer=(b 1 2 8 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.8900 total=563179.8230 rows=5652.0 outer=(b 1 2 8 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.5925
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.8900 total=567054.3131 rows=5652.0 outer=(b 1 2 6 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.8900 total=963304.7614 rows=5652.0 outer=(b 1 2 6 8) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.5975
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.9000 total=567762.6831 rows=5652.0 outer=(b 1 2 6 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.4625
+M26P n=5 rel=(b 1 2 6 8 12) startup=1.9000 total=616438.5757 rows=5652.0 outer=(b 1 2 6 8) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.5975
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.4375 total=238150148.3081 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.4375 total=27240991.6681 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.4375
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.4575 total=238633723.9466 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.4575 total=27724567.3066 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.4575
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5825 total=163357.4997 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5825 total=954351.7329 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5925 total=1454089.1227 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5925 total=1627405.2881 rows=937.0 outer=(b 1 2 8 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5925 total=442108606.9615 rows=937.0 outer=(b 1 2 8 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.5925 total=663094.8896 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8650 total=51357.2011 rows=937.0 outer=(b 1 8 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=1.4350
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8650 total=62783.3762 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.4375
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8650 total=63207.8838 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8750 total=51365.3561 rows=937.0 outer=(b 1 8 10 12) inner=(b 2) innertype=361 innerstart=0.4400 outerstart=1.4350
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8750 total=562945.2736 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8750 total=62900.8212 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.4375
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8750 total=63349.1638 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8850 total=546359.0147 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.4575
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8850 total=563086.5536 rows=937.0 outer=(b 1 2 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8850 total=655096.8276 rows=937.0 outer=(b 1 2 8 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8950 total=546476.4597 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.4575
+M26P n=5 rel=(b 1 2 8 10 12) startup=1.8950 total=598091.2754 rows=937.0 outer=(b 1 2 8 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.5925
+M26P n=5 rel=(b 1 2 8 10 12) startup=158.7325 total=238112961.3891 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 8 10 12) startup=158.7325 total=27203804.7491 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=158.7325
+M26P n=5 rel=(b 1 2 8 10 12) startup=159.1600 total=14170.2821 rows=937.0 outer=(b 1 8 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=158.7300
+M26P n=5 rel=(b 1 2 8 10 12) startup=159.1600 total=25596.4573 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=158.7325
+M26P n=5 rel=(b 1 2 8 10 12) startup=159.1700 total=14178.4371 rows=937.0 outer=(b 1 8 10 12) inner=(b 2) innertype=361 innerstart=0.4400 outerstart=158.7300
+M26P n=5 rel=(b 1 2 8 10 12) startup=159.1700 total=25713.9022 rows=937.0 outer=(b 1 2 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=158.7325
+M26P n=5 rel=(b 1 2 8 12 14) startup=1.5825 total=18431765.1697 rows=1.0 outer=(b 1 2 8 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 12 14) startup=1.5825 total=7289107.1722 rows=1.0 outer=(b 1 2 8 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.5825
+M26P n=5 rel=(b 1 2 8 12 14) startup=1.8750 total=63331.8493 rows=1.0 outer=(b 1 2 8 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.5825
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.5900 total=4877362.8968 rows=19.0 outer=(b 1 6 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=158.5900
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.5900 total=613468.9768 rows=19.0 outer=(b 1 6 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=158.5900
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.7150 total=50089.2827 rows=19.0 outer=(b 1 6 8 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=158.7150
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.7150 total=9030440.2577 rows=19.0 outer=(b 1 6 8 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=158.7150
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.7300 total=18839.8537 rows=19.0 outer=(b 1 8 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=158.7300
+M26P n=5 rel=(b 1 6 8 10 12) startup=158.7300 total=44291.8537 rows=19.0 outer=(b 1 8 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=158.7300
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0075 total=27970.8353 rows=19.0 outer=(b 1 6 8 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=158.7150
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0175 total=12206.9305 rows=19.0 outer=(b 1 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=158.7300
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0175 total=12231.5572 rows=19.0 outer=(b 1 6 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=158.5900
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0175 total=27401.0765 rows=19.0 outer=(b 1 6 8 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=158.7150
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0275 total=12207.4005 rows=19.0 outer=(b 1 8 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=158.7300
+M26P n=5 rel=(b 1 6 8 10 12) startup=159.0275 total=12233.9522 rows=19.0 outer=(b 1 6 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=158.5900
+M26P n=5 rel=(b 1 8 10 12 14) startup=1.4350 total=107672.2202 rows=133.0 outer=(b 1 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.4350
+M26P n=5 rel=(b 1 8 10 12 14) startup=1.4350 total=72543.8502 rows=133.0 outer=(b 1 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.4350
+M26P n=5 rel=(b 1 8 10 12 14) startup=158.7300 total=35356.9312 rows=133.0 outer=(b 1 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=158.7300
+M26P n=5 rel=(b 2 4 6 12 14) startup=0.8650 total=13809936.1108 rows=48511.0 outer=(b 2 4 12 14) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=0.8650
+M26P n=5 rel=(b 2 4 6 12 14) startup=0.8650 total=82641279.5837 rows=48511.0 outer=(b 2 4 12 14) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=0.8650
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.0200 total=715890.5473 rows=48511.0 outer=(b 2 6 12 14) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.0200
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.0200 total=759509.0973 rows=48511.0 outer=(b 2 6 12 14) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.0200
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.1525 total=719932.2740 rows=48511.0 outer=(b 2 6 12 14) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.0200
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.1525 total=726172.8983 rows=48511.0 outer=(b 2 4 12 14) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=0.8650
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.1625 total=713852.8981 rows=48511.0 outer=(b 2 4 12 14) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=0.8650
+M26P n=5 rel=(b 2 4 6 12 14) startup=1.1625 total=713852.8981 rows=48511.0 outer=(b 2 6 12 14) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.0200
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=1.5800 total=15328932.6913 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=1.5800 total=6067436.2888 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=1.8725 total=60903.7212 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=159.8450 total=15291660.7414 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=159.8450 total=6030164.3389 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 10 12 14) startup=160.1375 total=23631.7712 rows=1.0 outer=(b 1 2 4 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.5950 total=2214092308.0957 rows=4698.0 outer=(b 1 2 4 6 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.5950 total=5757042.3611 rows=4698.0 outer=(b 1 2 4 6 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.6000 total=1812920.2798 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.6000 total=8477873.2798 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.6050 total=1056600.9763 rows=4698.0 outer=(b 1 2 4 6 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.6050 total=5022795.9089 rows=4698.0 outer=(b 1 2 4 6 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.7450 total=544651.0349 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.7450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.7450 total=548873.9807 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.7450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8775 total=545041.5098 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.7450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8875 total=544453.5556 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8875 total=544453.5556 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.7450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8875 total=544453.8322 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8875 total=555091.6973 rows=4698.0 outer=(b 1 2 4 6 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8875 total=891815.5882 rows=4698.0 outer=(b 1 2 4 6 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8975 total=544571.2772 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8975 total=549318.3884 rows=4698.0 outer=(b 1 2 4 6 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=1.8975 total=603593.2528 rows=4698.0 outer=(b 1 2 4 6 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=159.0200 total=22416.9051 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=159.0200 total=26639.8510 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=159.1625 total=22219.4258 rows=4698.0 outer=(b 1 2 6 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=159.0200
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=159.8450 total=1292072.6914 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=159.8450 total=7957025.6914 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=160.1325 total=23605.9671 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=160.1325 total=23606.2438 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 10 12) startup=160.1425 total=23723.6888 rows=4698.0 outer=(b 1 2 4 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.5950 total=47906714890.5722 rows=188550.0 outer=(b 1 2 4 6 10) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.5950 total=5460423771.6922 rows=188550.0 outer=(b 1 2 4 6 10) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.7350 total=319041171.7583 rows=188550.0 outer=(b 1 2 4 8 10) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.7350 total=51504419.1817 rows=188550.0 outer=(b 1 2 4 8 10) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.7400 total=180259766.0170 rows=188550.0 outer=(b 1 2 4 6 8) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.7400 total=21072035.4142 rows=188550.0 outer=(b 1 2 4 6 8) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.8900 total=614858.0318 rows=188550.0 outer=(b 1 2 6 8 10) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.8900
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=1.8900 total=784394.8443 rows=188550.0 outer=(b 1 2 6 8 10) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.8900
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=2.0225 total=949827.0116 rows=188550.0 outer=(b 1 2 4 6 8) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=2.0325 total=606938.7527 rows=188550.0 outer=(b 1 2 4 8 10) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=2.0325 total=606938.7527 rows=188550.0 outer=(b 1 2 6 8 10) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.8900
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=2.0325 total=630610.2762 rows=188550.0 outer=(b 1 2 4 6 10) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.5950
+M26P n=6 rel=(b 1 2 4 6 8 10) startup=2.0325 total=635417.9721 rows=188550.0 outer=(b 1 2 4 6 8) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.6050 total=1436541628.8564 rows=5652.0 outer=(b 1 2 4 6 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.6050 total=164251751.8964 rows=5652.0 outer=(b 1 2 4 6 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.7350 total=10107589.7428 rows=5652.0 outer=(b 1 2 4 8 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.7350 total=2088910.7428 rows=5652.0 outer=(b 1 2 4 8 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.7400 total=2663553195.2987 rows=5652.0 outer=(b 1 2 4 6 8) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.7400 total=6833374.2319 rows=5652.0 outer=(b 1 2 4 6 8) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.8800 total=563406.6577 rows=5652.0 outer=(b 1 2 6 8 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.8800
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=1.8800 total=568487.9618 rows=5652.0 outer=(b 1 2 6 8 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.8800
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0125 total=563876.6035 rows=5652.0 outer=(b 1 2 6 8 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.8800
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0225 total=563169.0784 rows=5652.0 outer=(b 1 2 4 8 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0225 total=563169.0784 rows=5652.0 outer=(b 1 2 6 8 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.8800
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0225 total=563169.4112 rows=5652.0 outer=(b 1 2 4 8 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0325 total=563310.7062 rows=5652.0 outer=(b 1 2 4 8 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0325 total=567706.9014 rows=5652.0 outer=(b 1 2 4 6 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0325 total=980778.2198 rows=5652.0 outer=(b 1 2 4 6 8) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0425 total=568415.2714 rows=5652.0 outer=(b 1 2 4 6 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.6050
+M26P n=6 rel=(b 1 2 4 6 8 12) startup=2.0425 total=633912.0341 rows=5652.0 outer=(b 1 2 4 6 8) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.7400
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.5800 total=238150257.2413 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.5800 total=27241100.6013 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.6000 total=238633832.8798 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.6000 total=27724676.2398 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7250 total=163488.3829 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7250 total=954482.6161 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7350 total=1454220.0059 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7350 total=1631742.8215 rows=937.0 outer=(b 1 2 4 8 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7350 total=442112944.4948 rows=937.0 outer=(b 1 2 4 8 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.7350 total=663225.7728 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.8650 total=51419.1886 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.8650
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.8650 total=52260.9219 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.8650
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.8850 total=546421.0022 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.8850
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.8850 total=547262.7356 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.8850
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=1.9975 total=51496.1969 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.8650
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.1600 total=14232.2696 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.1600 total=15074.0029 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.2925 total=14309.2779 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=159.1600
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.3025 total=14192.7197 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=159.1600
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.8450 total=238112985.2914 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=159.8450 total=27203828.6514 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=160.2725 total=25620.3595 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=160.2825 total=25737.8045 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=159.8450
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0075 total=51379.6386 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.8650
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0075 total=62892.3094 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0075 total=63338.7670 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0175 total=546498.0105 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.8850
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0175 total=563076.1568 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0175 total=63009.7544 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.5800
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0175 total=63480.0470 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0275 total=546381.4523 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.8850
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0275 total=546467.9479 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0275 total=563217.4369 rows=937.0 outer=(b 1 2 4 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0275 total=659434.3609 rows=937.0 outer=(b 1 2 4 8 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0375 total=546585.3929 rows=937.0 outer=(b 1 2 4 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.6000
+M26P n=6 rel=(b 1 2 4 8 10 12) startup=2.0375 total=602428.8088 rows=937.0 outer=(b 1 2 4 8 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.7350
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=1.7250 total=18431896.0530 rows=1.0 outer=(b 1 2 4 8 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=1.7250 total=7289238.0555 rows=1.0 outer=(b 1 2 4 8 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.7250
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=1.8750 total=63332.9618 rows=1.0 outer=(b 1 2 8 12 14) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=1.8750
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=1.8750 total=63332.9868 rows=1.0 outer=(b 1 2 8 12 14) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=1.8750
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=2.0075 total=63332.0052 rows=1.0 outer=(b 1 2 8 12 14) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=1.8750
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=2.0175 total=63332.0193 rows=1.0 outer=(b 1 2 8 12 14) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=1.8750
+M26P n=6 rel=(b 1 2 4 8 12 14) startup=2.0175 total=63462.7326 rows=1.0 outer=(b 1 2 4 8 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.7250
+M26P n=6 rel=(b 1 2 6 10 12 14) startup=159.0200 total=15291667.5426 rows=1.0 outer=(b 1 2 6 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 10 12 14) startup=159.0200 total=6030171.1401 rows=1.0 outer=(b 1 2 6 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 10 12 14) startup=159.3125 total=23638.5725 rows=1.0 outer=(b 1 2 6 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.7450 total=238635226.2224 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.7450
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.7450 total=27726069.5824 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.7450
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8800 total=1455896.4583 rows=937.0 outer=(b 1 2 6 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=1.8800
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8800 total=664902.2252 rows=937.0 outer=(b 1 2 6 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=1.8800
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8850 total=2128952.0147 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=1.8850
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8850 total=800858.0147 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=1.8850
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8900 total=1637234.1591 rows=937.0 outer=(b 1 2 6 8 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=1.8900
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=1.8900 total=442118435.8325 rows=937.0 outer=(b 1 2 6 8 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=1.8900
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.0200 total=238112992.0926 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.0200 total=27203835.4526 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.1600 total=1596763.2821 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.1600 total=268669.2821 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4475 total=14176.3588 rows=937.0 outer=(b 1 6 8 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=159.0175
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4475 total=14369.8651 rows=937.0 outer=(b 1 6 8 10 12) inner=(b 2) innertype=341 innerstart=0.4300 outerstart=159.0175
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4475 total=14469.9058 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.1600
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4475 total=14469.9610 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.1600
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4475 total=25627.1608 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4575 total=14184.5138 rows=937.0 outer=(b 1 6 8 10 12) inner=(b 2) innertype=361 innerstart=0.4400 outerstart=159.0175
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4575 total=14393.8151 rows=937.0 outer=(b 1 6 8 10 12) inner=(b 2) innertype=361 innerstart=0.4400 outerstart=159.0175
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4575 total=14493.3810 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=159.1600
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=159.4575 total=25744.6057 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=159.0200
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1625 total=564752.6092 rows=937.0 outer=(b 1 2 6 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=1.8800
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1725 total=546658.6385 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.8850
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1725 total=546658.6937 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=1.8850
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1725 total=547861.2905 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.7450
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1725 total=564893.8892 rows=937.0 outer=(b 1 2 6 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=1.8800
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1825 total=546682.1136 rows=937.0 outer=(b 1 2 8 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=1.8850
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1825 total=547978.7355 rows=937.0 outer=(b 1 2 6 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.7450
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1825 total=664925.6986 rows=937.0 outer=(b 1 2 6 8 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=1.8900
+M26P n=6 rel=(b 1 2 6 8 10 12) startup=2.1925 total=607920.1464 rows=937.0 outer=(b 1 2 6 8 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=1.8900
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=1.8650 total=1251515.2911 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=1.8650
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=1.8650 total=3096818.0261 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=1.8650
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=159.1600 total=1214328.3721 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=159.1600 total=3059631.1071 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=159.1600
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=159.4525 total=14475.0524 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=159.1600
+M26P n=6 rel=(b 1 2 8 10 12 14) startup=2.1575 total=51661.9713 rows=1.0 outer=(b 1 2 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=1.8650
+M26P n=6 rel=(b 1 6 8 10 12 14) startup=159.0175 total=35363.0080 rows=133.0 outer=(b 1 6 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=159.0175
+M26P n=7 rel=(b 1 2 4 6 10 12 14) startup=160.1325 total=15291691.4449 rows=1.0 outer=(b 1 2 4 6 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 10 12 14) startup=160.1325 total=6030195.0424 rows=1.0 outer=(b 1 2 4 6 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 10 12 14) startup=160.4250 total=23662.4747 rows=1.0 outer=(b 1 2 4 6 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=1.8875 total=238635335.1556 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=1.8875
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=1.8875 total=27726178.5156 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=1.8875
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=159.4475 total=14238.3463 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=159.4475
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=159.4475 total=15080.0796 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=159.4475
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=159.5800 total=14315.3546 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=159.4475
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=159.5900 total=14198.7964 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=159.4475
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.1325 total=238113015.9949 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=339 innerstart=0.0000 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.1325 total=27203859.3549 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=360 innerstart=0.0000 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.2725 total=1596768.9346 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.2725 total=268674.9346 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.5600 total=14475.5583 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.5600 total=14475.6135 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.5600 total=25651.0630 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.5700 total=14499.0335 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=160.5700 total=25768.5080 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=160.1325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0225 total=1456027.3415 rows=937.0 outer=(b 1 2 4 6 8 12) inner=(b 10) innertype=339 innerstart=0.0000 outerstart=2.0225
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0225 total=665033.1084 rows=937.0 outer=(b 1 2 4 6 8 12) inner=(b 10) innertype=360 innerstart=0.0000 outerstart=2.0225
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0275 total=2128974.4523 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=2.0275
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0275 total=800880.4523 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=2.0275
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0325 total=1641571.6925 rows=937.0 outer=(b 1 2 4 6 8 10) inner=(b 12) innertype=360 innerstart=0.0000 outerstart=2.0325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.0325 total=442122773.3658 rows=937.0 outer=(b 1 2 4 6 8 10) inner=(b 12) innertype=339 innerstart=0.0000 outerstart=2.0325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.1725 total=546720.6260 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=2.1725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.1725 total=547562.3593 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=2.1725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3050 total=546797.6343 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=2.1725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3050 total=564883.4924 rows=937.0 outer=(b 1 2 4 6 8 12) inner=(b 10) innertype=341 innerstart=0.2825 outerstart=2.0225
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3150 total=546681.0761 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=2.0275
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3150 total=546681.0761 rows=937.0 outer=(b 1 2 6 8 10 12) inner=(b 4) innertype=361 innerstart=0.1425 outerstart=2.1725
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3150 total=546681.1312 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=2.0275
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3150 total=547970.2237 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=341 innerstart=0.4275 outerstart=1.8875
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3150 total=565024.7725 rows=937.0 outer=(b 1 2 4 6 8 12) inner=(b 10) innertype=361 innerstart=0.2925 outerstart=2.0225
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3250 total=546704.5512 rows=937.0 outer=(b 1 2 4 8 10 12) inner=(b 6) innertype=361 innerstart=0.2975 outerstart=2.0275
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3250 total=548087.6687 rows=937.0 outer=(b 1 2 4 6 10 12) inner=(b 8) innertype=361 innerstart=0.4375 outerstart=1.8875
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3250 total=669263.2319 rows=937.0 outer=(b 1 2 4 6 8 10) inner=(b 12) innertype=341 innerstart=0.2925 outerstart=2.0325
+M26P n=7 rel=(b 1 2 4 6 8 10 12) startup=2.3350 total=612257.6798 rows=937.0 outer=(b 1 2 4 6 8 10) inner=(b 12) innertype=361 innerstart=0.3025 outerstart=2.0325
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=159.4525 total=14476.1649 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=159.4525
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=159.4525 total=14476.1899 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=159.4525
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=159.5850 total=14475.2082 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=159.4525
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=160.2725 total=1214334.0246 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=160.2725 total=3059636.7596 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=160.5650 total=14480.7049 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=160.2725
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=2.0075 total=1251537.7286 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=2.0075
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=2.0075 total=3096840.4636 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=2.0075
+M26P n=7 rel=(b 1 2 4 8 10 12 14) startup=2.3000 total=51684.4089 rows=1.0 outer=(b 1 2 4 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=2.0075
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.4475 total=1214334.4488 rows=1.0 outer=(b 1 2 6 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=159.4475
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.4475 total=3059637.1838 rows=1.0 outer=(b 1 2 6 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=159.4475
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.4525 total=16164.0524 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=159.4525
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.4525 total=16254.0524 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=159.4525
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.7400 total=14475.3721 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.4525
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.7400 total=14475.3722 rows=1.0 outer=(b 1 2 8 10 12 14) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.4525
+M26P n=7 rel=(b 1 2 6 8 10 12 14) startup=159.7400 total=14481.1291 rows=1.0 outer=(b 1 2 6 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=159.4475
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.5850 total=16164.2082 rows=1.0 outer=(b 1 2 4 8 10 12 14) inner=(b 6) innertype=339 innerstart=0.0000 outerstart=159.5850
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.5850 total=16254.2082 rows=1.0 outer=(b 1 2 4 8 10 12 14) inner=(b 6) innertype=360 innerstart=0.0000 outerstart=159.5850
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.7400 total=14476.4846 rows=1.0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=339 innerstart=0.0000 outerstart=159.7400
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.7400 total=14476.5096 rows=1.0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=360 innerstart=0.0000 outerstart=159.7400
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.8725 total=14475.5280 rows=1.0 outer=(b 1 2 4 8 10 12 14) inner=(b 6) innertype=341 innerstart=0.2875 outerstart=159.5850
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=159.8725 total=14475.5280 rows=1.0 outer=(b 1 2 6 8 10 12 14) inner=(b 4) innertype=341 innerstart=0.1325 outerstart=159.7400
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=160.5600 total=1214340.1013 rows=1.0 outer=(b 1 2 4 6 8 10 12) inner=(b 14) innertype=360 innerstart=0.0000 outerstart=160.5600
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=160.5600 total=3059642.8363 rows=1.0 outer=(b 1 2 4 6 8 10 12) inner=(b 14) innertype=339 innerstart=0.0000 outerstart=160.5600
+M26P n=8 rel=(b 1 2 4 6 8 10 12 14) startup=160.8525 total=14486.7816 rows=1.0 outer=(b 1 2 4 6 8 10 12) inner=(b 14) innertype=341 innerstart=0.2925 outerstart=160.5600
+M26P n=9 rel=(b 1 2 4 6 8 10 12 14 16) startup=159.8725 total=17908.3755 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 16) innertype=339 innerstart=0.0000 outerstart=159.8725
+M26P n=9 rel=(b 1 2 4 6 8 10 12 14 16) startup=159.8725 total=18273.6205 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 16) innertype=360 innerstart=0.0000 outerstart=159.8725
+M26P n=9 rel=(b 1 2 4 6 8 10 12 14 16) startup=160.1650 total=14475.8710 rows=1.0 outer=(b 1 2 4 6 8 10 12 14) inner=(b 16) innertype=341 innerstart=0.2925 outerstart=159.8725
