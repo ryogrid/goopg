@@ -4610,3 +4610,23 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     compare goopg's DPPATH lines under PG statistics: is the \(ss ⟕ cs\) ⟕ ws pair generated \(join\_is\_legal / outer\-join
     identity 3\), and at what cost\?
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match 90→91 \(Q78\), then SF1\.
+  - **Slice 1 LANDED 2026\-10\-17 \(loop \#75\): outer\-join identity 3 over derived leaves\.** Design
+    `docs/design/0100\-0149/m0146\-0224\-outer\-join\-identity3\-derived\-leaves\.md`; evidence
+    `analysis/m0146/m0146\-0224/`\.
+    - goopg's top search never built \{ss, cs\}: the cs link's min\_lefthand was \{ss, ws\}, its syntactic side\.
+      resolveSjiColumn gave up on every unqualified column while a subquery/CTE leaf was in scope, and Q78's ON
+      clauses name the CTE columns bare\.
+    - Fix: derivedLeafColumns gives a table\-less leaf its output names when all are certain \(CTE schema, aliased or
+      bare\-column or function targets, column alias list\), as PG's eref\-\>colnames; the unqualified arm scans it like
+      a table\.
+    - Census: verdicts unchanged \(TPC\-H 22/22, SF0\.25 90, SF1 77\)\. SF1 Q78 now has PG's join order; its first
+      divergence moved from join\-order to qual\-placement at depth 2, the SF0\.25 record\.
+    - Pin: TestScopedUnqualifiedResolvesDerivedLeaves, mutation\-checked\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(no plan changed\), fireset PASS \(SF1 Q78
+      byte\-identical\), TestPort\_RegressSuite, internal/postmaster\.
+  - Slice 2 \(next\): cost\. On the replica PG keeps \(ss ⟕ cs\) ⟕ ws because it is 0\.06 cheaper \(42467\.7731 against
+    42467\.8331\); goopg's two orders tie to 1e\-11 at 42521\.2259\.
+    - PG costs the WHERE OR clause at the top joinrel \(path rows 762; qp\_qual per mergejointuples, which differs by
+      order\)\. goopg's top path rows are 1371 and the qual is applied above\.
+    - goopg's 2\-rel merges are dearer on run cost: ss ⟕ ws \+37, ss ⟕ cs \+44; the ws Materialize is 8862\.37 against
+      8852\.87\. Compare final\_cost\_mergejoin's terms one by one\.

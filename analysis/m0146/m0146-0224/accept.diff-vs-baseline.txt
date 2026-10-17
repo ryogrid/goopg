@@ -1,0 +1,27 @@
+digest diff: A=bench/tpch/baseline-digests.txt B=analysis/m0146/m0146-0224/accept
+  Q1              MATCH        rows=4
+  Q2              MATCH        rows=469
+  Q3              MATCH        rows=11356
+  Q4              MATCH        rows=5
+  Q5              MATCH        rows=5
+  Q6              MATCH        rows=1
+  Q7              MATCH        rows=4
+  Q8              MATCH        rows=2
+  Q9              MATCH        rows=175
+  Q10             MATCH        rows=20486
+  Q11             MATCH        rows=517
+  Q12             MATCH        rows=2
+  Q13             MATCH        rows=35
+  Q14             MATCH        rows=1
+  Q15-CREATEVIEW  MATCH        rows=0
+  Q15a-VIEWBODY   MATCH        rows=10000
+  Q15b-MAIN       MATCH        rows=1
+  Q16             MATCH        rows=18166
+  Q17             MATCH        rows=1
+  Q18             MATCH        rows=12
+  Q19             MATCH        rows=1
+  Q20             MATCH        rows=92
+  Q21             MATCH        rows=421
+  Q22             MATCH        rows=7
+SUMMARY: 24 MATCH
+VERDICT: PASS — every label matched on values, not merely on row count

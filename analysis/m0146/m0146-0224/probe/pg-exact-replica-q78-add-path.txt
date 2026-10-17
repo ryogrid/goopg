@@ -1,0 +1,64 @@
+add_path rel=(b 1 2 3) type=359 startup=3023.9000 total=42691.0470 rows=286748 nkeys=0 outer=(b 1) inner=(b 2) ityp=339 inner=0.0000..1948.7600 accept=1
+add_path rel=(b 1 2 3) type=359 startup=30932.9000 total=35079.9903 rows=286748 nkeys=0 outer=(b 2) inner=(b 1) ityp=339 inner=0.0000..20134.7600 accept=1
+add_path rel=(b 1 4) type=356 startup=0.3025 total=38717.6774 rows=3441 nkeys=0 outer=(b 1) inner=(b 4) ityp=361 inner=0.3025..0.3315 accept=1
+add_path rel=(b 1 2 3 4) type=356 startup=30933.2025 total=42834.7809 rows=1371 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=361 inner=0.3025..0.3315 accept=1
+add_path rel=(b 1 2 3 4) type=359 startup=33274.5750 total=38174.4233 rows=1371 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=339 inner=0.0000..2337.1125 accept=1
+add_path rel=(b 1 2 3 4) type=358 startup=27106.9772 total=27670.3647 rows=1371 nkeys=1 outer=(b 1 4) inner=(b 2) ityp=339 inner=0.0000..1948.7600 accept=1
+add_path rel=(b 1 2 3 4) type=358 startup=27106.9772 total=27670.3647 rows=1371 nkeys=0 outer=(b 1 4) inner=(b 2) ityp=339 inner=0.0000..1948.7600 accept=0
+add_path rel=(b 1 2 3 4) type=369 startup=26616.9281 total=27323.9256 rows=1371 nkeys=1 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3 4) type=369 startup=26618.1732 total=27343.8156 rows=1371 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3) type=358 startup=24028.4594 total=25512.6544 rows=95051 nkeys=1 outer=(b 1) inner=(b 2) ityp=339 inner=0.0000..511.2000 accept=1
+add_path rel=(b 1 2 3) type=358 startup=24028.4594 total=25512.6694 rows=95051 nkeys=0 outer=(b 1) inner=(b 2) ityp=339 inner=0.0000..511.2000 accept=0
+add_path rel=(b 1 2 3) type=358 startup=0.7075 total=25618.2421 rows=95051 nkeys=1 outer=(b 1) inner=(b 2) ityp=342 inner=0.2875..561.0875 accept=1
+add_path rel=(b 1 2 3) type=358 startup=14342.4130 total=39300.4680 rows=95051 nkeys=2 outer=(b 1) inner=(b 2) ityp=339 inner=0.0000..511.2000 accept=1
+add_path rel=(b 1 2 3) type=358 startup=12565.5167 total=38084.3092 rows=95051 nkeys=2 outer=(b 1) inner=(b 2) ityp=342 inner=0.2875..561.0875 accept=1
+add_path rel=(b 1 4) type=358 startup=24604.8271 total=25513.6421 rows=899 nkeys=0 outer=(b 1) inner=(b 4) ityp=339 inner=0.0000..2337.1125 accept=1
+add_path rel=(b 1 4) type=356 startup=0.7225 total=29199.0046 rows=899 nkeys=2 outer=(b 1) inner=(b 4) ityp=361 inner=0.3025..0.3586 accept=1
+add_path rel=(b 1 4) type=356 startup=12565.5317 total=38655.3692 rows=899 nkeys=2 outer=(b 1) inner=(b 4) ityp=361 inner=0.3025..0.3586 accept=1
+add_path rel=(b 1 2 3) type=369 startup=14342.4130 total=26010.4668 rows=95051 nkeys=1 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3) type=369 startup=14342.4726 total=27084.5099 rows=95051 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 4) type=369 startup=1000.7463 total=26628.7117 rows=899 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=1
+add_path rel=(b 1 4) type=369 startup=1068.8208 total=26645.5867 rows=899 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3 4) type=356 startup=11298.7025 total=25377.3406 rows=475 nkeys=2 outer=(b 1 2 3) inner=(b 4) ityp=361 inner=0.3025..0.3586 accept=1
+add_path rel=(b 1 2 3) type=368 startup=2258.9979 total=31270.0717 rows=166752 nkeys=0 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3) type=369 startup=25171.4283 total=45907.2808 rows=166752 nkeys=1 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=1
+add_path rel=(b 1 2 3) type=369 startup=18821.5602 total=38549.3977 rows=166752 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=1
+add_path rel=(b 1 2 3) type=369 startup=25171.5291 total=47370.1791 rows=166752 nkeys=2 outer=- inner=- ityp=-1 inner=0.0000..0.0000 accept=0
+add_path rel=(b 1 2 3 4) type=358 startup=38359.6739 total=39201.7689 rows=829 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=339 inner=0.0000..2337.1125 accept=1
+add_path rel=(b 1 2 3 4) type=356 startup=1622.9525 total=26316.5923 rows=829 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=361 inner=0.3025..0.3405 accept=1
+add_path rel=(b 1 2 3 4) type=356 startup=18821.8627 total=43323.3896 rows=829 nkeys=2 outer=(b 1 2 3) inner=(b 4) ityp=361 inner=0.3025..0.3405 accept=1
+add_path rel=(b 1 2 3) type=358 startup=27986.3061 total=28283.6279 rows=1371 nkeys=2 outer=(b 1) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=1
+add_path rel=(b 1 2 3) type=358 startup=28365.6044 total=28379.6094 rows=1371 nkeys=2 outer=(b 1) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=1
+add_path rel=(b 1 2 3) type=356 startup=27986.3061 total=39670.6754 rows=1371 nkeys=2 outer=(b 1) inner=(b 2) ityp=360 inner=8779.7359..8855.2451 accept=0
+add_path rel=(b 1 2 3) type=358 startup=27986.3061 total=28283.6279 rows=1371 nkeys=2 outer=(b 1) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=0
+add_path rel=(b 1 2 3) type=359 startup=28066.5654 total=28451.7104 rows=1371 nkeys=0 outer=(b 1) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=0
+add_path rel=(b 1 2 3) type=358 startup=27986.3061 total=28285.8679 rows=1371 nkeys=0 outer=(b 2) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 2 3) type=358 startup=28365.6044 total=28379.6094 rows=1371 nkeys=0 outer=(b 2) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 2 3) type=358 startup=27986.3061 total=28285.8679 rows=1371 nkeys=0 outer=(b 2) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 2 3) type=359 startup=28220.4811 total=28458.8379 rows=1371 nkeys=0 outer=(b 2) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 4 5) type=358 startup=33248.1205 total=33604.2455 rows=1371 nkeys=2 outer=(b 1) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=1
+add_path rel=(b 1 4 5) type=358 startup=33702.5157 total=33719.2957 rows=1371 nkeys=2 outer=(b 1) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=1
+add_path rel=(b 1 4 5) type=358 startup=33248.1205 total=33604.2455 rows=1371 nkeys=2 outer=(b 1) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=0
+add_path rel=(b 1 4 5) type=359 startup=33389.7180 total=33894.9455 rows=1371 nkeys=0 outer=(b 1) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=0
+add_path rel=(b 1 4 5) type=358 startup=33248.1205 total=33605.6005 rows=1371 nkeys=0 outer=(b 4) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 4 5) type=358 startup=33702.5157 total=33719.2957 rows=1371 nkeys=0 outer=(b 4) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 4 5) type=358 startup=33248.1205 total=33605.6005 rows=1371 nkeys=0 outer=(b 4) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 4 5) type=359 startup=33482.2955 total=33899.8155 rows=1371 nkeys=0 outer=(b 4) inner=(b 1) ityp=347 inner=19206.5702..19420.1802 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42467.8331 rows=762 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=1
+add_path rel=(b 1 2 3 4 5) type=358 startup=42565.9634 total=42582.8834 rows=762 nkeys=1 outer=(b 1 2 3) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=1
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42467.8331 rows=762 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42576.5038 total=42604.0013 rows=762 nkeys=1 outer=(b 1 2 3) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=0
+add_path rel=(b 1 2 3 4 5) type=359 startup=42169.4538 total=42758.5331 rows=762 nkeys=0 outer=(b 1 2 3) inner=(b 4) ityp=347 inner=14041.5502..14170.7127 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42469.1881 rows=762 nkeys=0 outer=(b 4) inner=(b 1 2 3) ityp=358 inner=27986.3061..28283.6279 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42565.9634 total=42582.8834 rows=762 nkeys=0 outer=(b 4) inner=(b 1 2 3) ityp=358 inner=27986.3061..28283.6279 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42469.1881 rows=762 nkeys=0 outer=(b 4) inner=(b 1 2 3) ityp=358 inner=27986.3061..28283.6279 accept=0
+add_path rel=(b 1 2 3 4 5) type=359 startup=42345.7431 total=42763.4031 rows=762 nkeys=0 outer=(b 4) inner=(b 1 2 3) ityp=358 inner=27986.3061..28283.6279 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42467.7731 rows=762 nkeys=0 outer=(b 1 4 5) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=1
+add_path rel=(b 1 2 3 4 5) type=358 startup=42549.6696 total=42563.7546 rows=762 nkeys=1 outer=(b 1 4 5) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=1
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42467.7731 rows=762 nkeys=0 outer=(b 1 4 5) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42576.5038 total=42603.9413 rows=762 nkeys=1 outer=(b 1 4 5) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=0
+add_path rel=(b 1 2 3 4 5) type=359 startup=42108.1156 total=42635.8556 rows=762 nkeys=0 outer=(b 1 4 5) inner=(b 2) ityp=347 inner=8779.7359..8852.8701 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42470.0131 rows=762 nkeys=0 outer=(b 2) inner=(b 1 4 5) ityp=358 inner=33248.1205..33604.2455 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42549.6696 total=42563.7546 rows=762 nkeys=0 outer=(b 2) inner=(b 1 4 5) ityp=358 inner=33248.1205..33604.2455 accept=0
+add_path rel=(b 1 2 3 4 5) type=358 startup=42027.8563 total=42470.0131 rows=762 nkeys=0 outer=(b 2) inner=(b 1 4 5) ityp=358 inner=33248.1205..33604.2455 accept=0
+add_path rel=(b 1 2 3 4 5) type=359 startup=42404.5463 total=42642.9831 rows=762 nkeys=0 outer=(b 2) inner=(b 1 4 5) ityp=358 inner=33248.1205..33604.2455 accept=0
