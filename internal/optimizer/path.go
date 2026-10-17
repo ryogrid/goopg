@@ -574,6 +574,10 @@ type RelOptInfo struct {
 	// (searchedBoundaryRebuild) prints its clauses as the committed tree
 	// does (M0146-0042a). nil elsewhere.
 	ecWant ecOrientation
+	// pricedPushedDown: this joinrel's clause list carried the problem's
+	// pushed-down WHERE restrictions, so its rows and every path's cost
+	// already include them (M0146-0224).
+	pricedPushedDown bool
 	Relids RelSet
 	Rows   float64
 	Width  int

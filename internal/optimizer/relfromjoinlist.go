@@ -94,6 +94,13 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
+	// pushedDownQuals are WHERE conjuncts, in binding coordinates, that
+	// reach the nullable sides of outer joins and can only be evaluated once
+	// every FROM item has been joined (M0146-0224). The root problem's full
+	// joinrel carries them as pushed-down restrictions; the plan still
+	// applies them in the Filter above the searched tree.
+	pushedDownQuals []Expr
+
 	// orClauseSelDivisor is PG's consider_new_or_clause compensation: for a
 	// join OR clause from which extractRestrictionOrClauses derived redundant
 	// base restrictions, the product of their selectivities, by which the
@@ -657,6 +664,25 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// outerjoin-delayed in PG's distribute_qual_to_rels), so its RHS's
 	// clauses stay out of the equivalence classes.
 	s.clauses = buildRestrictInfosExcluding(prob.conjuncts, 0, itemSpans, antiRighthands(sjis))
+	// M0146-0224: the delayed WHERE conjuncts, on the root problem only —
+	// the joinrel of every FROM item is where check_outerjoin_delay places
+	// them. One that does not resolve to this problem's items is left to
+	// the Filter above, unpriced, as before.
+	if lo == 0 && hi == len(prob.bindings) && len(prob.pushedDownQuals) > 0 {
+		full := RelSet(1)<<uint(len(items)) - 1
+		var pushed []*restrictInfo
+		for _, q := range prob.pushedDownQuals {
+			relids, ok := relidsOfExpr(q, itemSpans)
+			if !ok || !relsSubset(relids, full) {
+				pushed = nil
+				break
+			}
+			pushed = append(pushed, &restrictInfo{clause: q, relids: full, ecID: noEquivClass, pushedDown: true})
+		}
+		if len(pushed) > 0 {
+			s.pushedDown, s.pushedDownRelids = pushed, full
+		}
+	}
 	// M0146-0022: one clause per equivalence class at an inner join, only
 	// where no special join can null-extend a class member. M0146-0128: a
 	// SEMI join null-extends nothing (PG's distribute_qual_to_rels makes its

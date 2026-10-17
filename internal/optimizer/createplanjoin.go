@@ -548,6 +548,10 @@ func (in joinInputs) joinPredicate(kind string, pairs []JoinKeyPair, residual []
 	// join's joininfo clauses first and generate_join_implied_equalities'
 	// equivalence-class equalities after them; the stable cost sort keeps
 	// that order among equal-cost quals.
+	// M0146-0224: a pushed-down restriction is priced at this join but is
+	// not one of its join quals — the Filter above the searched tree applies
+	// it after the outer join's null-extension, as PG's otherquals.
+	residual = joinQualsOnly(residual)
 	if ecLast {
 		residual = ecJoinClausesLast(residual)
 	}

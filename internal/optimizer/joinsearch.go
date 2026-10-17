@@ -134,6 +134,13 @@ type searchCtx struct {
 	// and means "no join qual anywhere", which phase 1's clauseless branch
 	// handles; every predicate on it is nil-safe. Set by `joinSearch`.
 	clauses *restrictInfoList
+	// pushedDown / pushedDownRelids are the WHERE conjuncts delayed above
+	// the outer joins they read and the joinrel that completes those joins:
+	// the whole problem (M0146-0224, tryJoinSearch). Set on the root problem
+	// only; that joinrel's clause list carries them as pushed-down
+	// restrictions.
+	pushedDown       []*restrictInfo
+	pushedDownRelids RelSet
 
 	// builder is the sizing-and-costing collaborator `makeJoinRel` calls —
 	// P5.6's calcJoinrelSize and P5.4's add_paths_to_joinrel

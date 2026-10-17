@@ -608,6 +608,14 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// nullable side. 03 §3's coverage rule, which is a different predicate
 	// from the connectivity gate above.
 	clauses := s.clauses.buildJoinRelRestrictList(rel1.Relids, rel2.Relids, sjinfo)
+	// M0146-0224: the joinrel that completes every outer join a delayed
+	// WHERE conjunct reads carries it as a pushed-down restriction
+	// (build_joinrel_restrictlist keeps such a clause in the joinrel's
+	// restrictlist; RINFO_IS_PUSHED_DOWN marks it).
+	pushed := len(s.pushedDown) > 0 && joinrelids == s.pushedDownRelids
+	if pushed {
+		clauses = append(append(make([]*restrictInfo, 0, len(clauses)+len(s.pushedDown)), clauses...), s.pushedDown...)
+	}
 
 	joinrel := s.findRel(joinrelids)
 	// Recorded BEFORE the find-or-create branch, so the `created` bit says
@@ -627,6 +635,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			rows = 1
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
+		joinrel.pricedPushedDown = pushed
 		joinrel.usefulKeys = s.pathkeyUsefulnessFor(joinrelids)
 		// M0146-0185: canonical pathkeys, only where no special join can
 		// null-extend a class member (the same gate as ecReduce).

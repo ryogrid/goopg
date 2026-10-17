@@ -1,7 +1,7 @@
 # M0146-0224 — TPC-DS Q78: outer-join commutation over derived leaves
 
-Status: slice 1 (legality) and slice 2 (derived-leaf subpath cost) landed 2026-10-17. Q78 still diverges: the WHERE
-clause is not costed at the top joinrel (§6). Evidence: `analysis/m0146/m0146-0224/`.
+Status: slices 1-3 landed 2026-10-17. Q78 has PG's plan structure at both scales; it still diverges on EXPLAIN qual
+text through a removed SubqueryScan (§8). Evidence: `analysis/m0146/m0146-0224/`.
 
 ## 1. Record
 
@@ -151,7 +151,69 @@ The resume point is the ledgered `C-05 pselec-held-above` (`joinrelsize.go` `pus
 3. Charge it as `qp_qual` in the join producers, and apply it as the outer join's Filter (otherquals) rather than as a
    join qual.
 
-## 7. Not ported (ledger)
+## 7. Slice 3 (landed): delayed WHERE conjuncts are pushed-down restrictions of the top joinrel
+
+**Placement.** `topDelayedConjuncts` (`joinsearchseam.go`) selects the held WHERE conjuncts that
+`check_outerjoin_delay` would place at the join of every leaf:
+- close the conjunct's relids over every outer link whose nullable side they reach, adding that link's hands;
+- keep the conjunct when the closure covers the whole search.
+
+They reach the root problem as `joinlistProblem.pushedDownQuals`. `searchOneProblem` turns them into restrictInfos
+with the new `pushedDown` bit, PG's `RINFO_IS_PUSHED_DOWN`, required at the full item set.
+
+**The joinrel.** `makeJoinRel` appends them to the clause list of the joinrel that covers that set, as
+`build_joinrel_restrictlist` keeps them in its restrictlist. Then:
+- **Sizing:** `calcJoinrelSize` sizes the join quals without them and applies them through `pselec` after the outer
+  join's floor (`calc_joinrel_size_estimate`). Q78's rows are 1371 → 762, as PG.
+- **Costing:** every join method charges them as `qp_qual` beside the residual, per merge tuple, hash tuple or nested
+  loop pair. They also count against `skip_mark_restore` and Memoize's `inner_unique` gate, as
+  `joinrestrictinfo` does in PG.
+- **Exclusions:** they are never a hash or merge clause (`splitJoinClauses`), never a join qual at lowering
+  (`joinPredicate` drops them via `joinQualsOnly`), and never part of the unique-inner or semi/anti factor tests
+  (`innerrel_is_unique` and `compute_semi_anti_join_factors` skip them).
+
+**The plan.** The Filter above the searched tree still applies them, after the outer join's null-extension.
+`pricedPushedDownFilter` stamps that Filter with the winning path's cost and rows, the first stamp at or below the
+search root. EXPLAIN therefore prints PG's single join line with its Filter. Conjuncts the search did not price stay
+in the residual as before.
+
+**OR-arm selectivity.** `orRangeSelectivity` priced an unmeasured inequality arm at the unhandled-clause 0.5. PG's
+`scalarineqsel` returns DEFAULT_INEQ_SEL when no statistics exist (an expression, a derived column, an unanalyzed
+one), so that case is now 1/3. Statistics without a histogram keep 0.5, which is scalarineqsel's half of the non-null,
+non-MCV fraction. Q78's `coalesce(ws_qty,0) > 0 or coalesce(cs_qty,0) > 0` is 0.5556, as PG.
+
+**Measured** (`census3/`):
+- With PG statistics, Q78's top joinrel picks `(ss ⟕ cs) ⟕ ws` at 42027.89..42467.89, rows 762. PG's path is
+  42027.86..42467.77.
+- Shipped corpora: Q78 has PG's structure at both scales and is the only plan that changed (TPC-H unchanged). The
+  verdict is still SHAPE-DIFF, because the remaining signatures are qual text (§8). Match counts are unchanged:
+  TPC-H 22, SF0.25 90, SF1 77.
+- The fired Q78 results are byte-identical at both scales, and the acceptance arm is value-identical.
+
+**Pins** (mutation-checked):
+- `TestTopDelayedConjunctsClosesOverOuterJoins`;
+- `TestPushedDownRestrictionIsNeverAJoinKey`;
+- `TestOrRangeArmDefaultsToIneqSel`.
+
+The seam tests that read the held qual as the residual unwrap the priced Filter (`unwrapPricedPushedDown`). The qual
+is still above every outer join.
+
+## 8. What still separates Q78 from PG (slice 4)
+
+The differ's remaining signatures on Q78 are the Merge Conds and the Filter (`census3/m24c-tpcds-sf025-diff.txt`):
+
+| node | PG | goopg |
+|---|---|---|
+| Merge Cond | `store_sales.ss_item_sk = web_sales.ws_item_sk` | `store_sales.ss_item_sk = ws_item_sk` |
+| Merge Cond | `… = web_sales.ws_bill_customer_sk` | `… = ws_customer_sk` |
+| Filter | `COALESCE((sum(web_sales.ws_quantity)), '0'::bigint) > 0` | `COALESCE(ws_qty, 0) > 0` |
+
+PG's setrefs removes the trivial SubqueryScan over each CTE leg and replaces the upper Vars by the subplan's target
+list expressions (`set_subqueryscan_references` → `trivial_subqueryscan`). EXPLAIN then deparses those expressions:
+the base column, the `sum(...)` aggregate, the bigint constant's cast. goopg strips the node
+(`stripTrivialSubqueryScans`) but keeps rendering the subquery's output names.
+
+## 9. Not ported (ledger)
 
 - Strictness for derived leaves:
   - `sjiClauseRelids`'s strict relids come from `collectNonNullableTableNames`, which maps only catalog tables.
@@ -159,3 +221,8 @@ The resume point is the ledgered `C-05 pselec-held-above` (`joinrelsize.go` `pus
   - That is the safe direction, but it withholds the RHS association and the identity-3 arm PG would allow when a
     clause references the lower join's righthand side.
 - FigureColname for expression targets (casts, CASE, operators): such a leaf stays opaque to unqualified resolution.
+- Delayed WHERE conjuncts placed below the top: a conjunct whose `check_outerjoin_delay` placement is a lower joinrel
+  (its outer joins complete before every leaf is joined) is still held above the whole searched tree and unpriced.
+  PG evaluates it at that lower joinrel.
+- The placement closure uses the outer links' syntactic sides rather than their min sets, so it can only widen
+  PG's placement.

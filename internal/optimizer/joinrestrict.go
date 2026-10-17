@@ -154,6 +154,38 @@ type restrictInfo struct {
 	// clause applies only at a join one of whose inputs is exactly this
 	// relation (M0146-0127, semiecderive.go).
 	onlyBesideRel RelSet
+
+	// pushedDown is RINFO_IS_PUSHED_DOWN for a WHERE conjunct delayed above
+	// the outer joins whose nullable sides it reads (M0146-0224): it is a
+	// restriction of the joinrel that completes them, applied AFTER the
+	// outer join's null-extension. It sizes that joinrel through pselec and
+	// is charged as qp_qual by every join method, but it is never a hash,
+	// merge or index clause, never a join qual, and never part of the
+	// unique-inner or semi/anti factor tests (innerrel_is_unique,
+	// compute_semi_anti_join_factors skip it).
+	pushedDown bool
+}
+
+// joinQualsOnly drops the pushed-down restrictions from a joinrel's clause
+// list: the join quals PG's helpers read (they skip RINFO_IS_PUSHED_DOWN).
+// The input is returned as is when it holds none.
+func joinQualsOnly(clauses []*restrictInfo) []*restrictInfo {
+	n := 0
+	for _, ri := range clauses {
+		if ri != nil && ri.pushedDown {
+			n++
+		}
+	}
+	if n == 0 {
+		return clauses
+	}
+	out := make([]*restrictInfo, 0, len(clauses)-n)
+	for _, ri := range clauses {
+		if ri == nil || !ri.pushedDown {
+			out = append(out, ri)
+		}
+	}
+	return out
 }
 
 // restrictInfoList is every join clause in one join problem, in a stable order

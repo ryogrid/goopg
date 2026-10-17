@@ -334,7 +334,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		noteNLIPathGate(jt, "outer-unusable")
 		return
 	}
-	innerUnique := s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)
+	innerUnique := s.extraInnerUnique(outer, inner, jt, joinQualsOnly(clauses), uniq, sjinfo)
 	// M0145-0007's reframed question: count whether a parameterised inner
 	// exists at all before counting what happens to it.
 	filed := false

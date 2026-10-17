@@ -162,7 +162,7 @@ func joinPublishesInner(sjinfo *SpecialJoinInfo) bool {
 func (s *searchCtx) pushedDownSelectivity(clauses []*restrictInfo, joinrelids RelSet) float64 {
 	sel := 1.0
 	for _, ri := range clauses {
-		if ri == nil || relsSubset(ri.relids, joinrelids) {
+		if ri == nil || (!ri.pushedDown && relsSubset(ri.relids, joinrelids)) {
 			continue
 		}
 		// Unreachable today (see above); priced as PG would if it were not.
@@ -224,7 +224,9 @@ func (s *searchCtx) calcJoinrelSize(cat catalog.Catalog, outer, inner *RelOptInf
 	// function — but it has to be applied HERE too, because `makeJoinRel`
 	// hands the sizer the joinrel's full restriction list (what the path
 	// generators must evaluate), not the selectivity subset.
-	est := s.superkeyJoinSelectivity(cat, outer, inner, oneClausePerEquivClass(clauses), jt)
+	// M0146-0224: the pushed-down restrictions enter through pselec alone.
+	joinQuals := joinQualsOnly(clauses)
+	est := s.superkeyJoinSelectivity(cat, outer, inner, oneClausePerEquivClass(joinQuals), jt)
 	fkselec := est.sel
 	jselec := 1.0
 	for _, ri := range est.residual {

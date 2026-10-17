@@ -1199,11 +1199,20 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 			searchJl = append(searchJl, leafItem(i))
 		}
 	}
+	// M0146-0224: check_outerjoin_delay places a held WHERE conjunct at the
+	// lowest join that completes every outer join whose nullable side it
+	// reads. When that is the join of all the search's leaves, the conjunct
+	// is a pushed-down restriction of the search's top joinrel: PG sizes the
+	// joinrel with it and charges it per join tuple, which decides between
+	// orders that tie without it (TPC-DS Q78's commuted LEFT JOINs).
+	pushedQuals := topDelayedConjuncts(heldAbovePrefix, outerLinks, spans, leafRangeRelSet(0, nleaves))
 	searched, _, err := planJoinlistSearch(searchJl, &joinlistProblem{
 		bindings:  bindings,
 		scans:     leaves,
 		relInfos:  relInfos,
 		conjuncts: searchConjuncts,
+		// M0146-0224: priced at the root problem's full joinrel.
+		pushedDownQuals: pushedQuals,
 		// M0146-0127: the semijoin-derived equalities and their RHS operands.
 		semiRHSOperand: semiDerived,
 		// M0146-0005 slice 4: PG's norm_selec compensation for the join OR
@@ -1290,7 +1299,29 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// The held-back `WHERE` conjuncts lead, so a statement whose whole `WHERE`
 	// is held comes back with `residual == pred` by identity (`combineAnd` of
 	// one element is that element) rather than a re-associated copy.
-	left := append([]Expr(nil), heldAbovePrefix...)
+	//
+	// M0146-0224: when the search priced the pushed-down conjuncts into its
+	// top joinrel, they are applied by a Filter that carries the searched
+	// root's cost and rows — PG's one join node with its otherquals — and
+	// only the rest stays in the residual.
+	var priced []Expr
+	if rel := searchedRelOf(searched); rel != nil && rel.pricedPushedDown && len(pushedQuals) > 0 {
+		priced = pushedQuals
+	}
+	isPriced := func(c Expr) bool {
+		for _, q := range priced {
+			if q == c {
+				return true
+			}
+		}
+		return false
+	}
+	var left []Expr
+	for _, c := range heldAbovePrefix {
+		if !isPriced(c) {
+			left = append(left, c)
+		}
+	}
 	for _, c := range searchConjuncts {
 		if !searchConsumes(c, spans) {
 			left = append(left, c)
@@ -1312,6 +1343,10 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		traceSeamDecline("residual-hits-pad", nrels, nprefix)
 		return node, pred, false
 	}
+	if len(priced) > 0 && searchedResidualHitsPad(combineAnd(priced), searched, ctx.neededCols) {
+		traceSeamDecline("residual-hits-pad", nrels, nprefix)
+		return node, pred, false
+	}
 	// Applied to both: the searched tree's own clause copies, and the
 	// conjuncts themselves, which the restrict infos hold by pointer and
 	// later lowering re-reads (TPC-DS Q91's Join Filter). Only now, after
@@ -1326,7 +1361,76 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	if rel := searchedRelOf(searched); rel != nil {
 		rel.ecWant = ecWant
 	}
+	if len(priced) > 0 {
+		searched = pricedPushedDownFilter(searched, priced)
+	}
 	return searched, residual, true
+}
+
+// topDelayedConjuncts returns the held WHERE conjuncts whose
+// check_outerjoin_delay placement is the join of every leaf in `all`: closing
+// a conjunct's relids over every outer link whose nullable side they reach
+// (that join must be complete before the conjunct can be evaluated) covers
+// the whole search. The closure uses the links' syntactic sides, which is
+// exact for a chain whose ON clauses each name one preserved relation and
+// otherwise can only widen the placement.
+func topDelayedConjuncts(held []Expr, links []outerChainLink, spans []leafSpan, all RelSet) []Expr {
+	if len(held) == 0 || len(links) == 0 {
+		return nil
+	}
+	var out []Expr
+	for _, c := range held {
+		req, ok := relidsOfExpr(c, spans)
+		if !ok || req == 0 {
+			continue
+		}
+		for changed := true; changed; {
+			changed = false
+			for _, lk := range links {
+				hands := lk.preserved | lk.nullable
+				if relsOverlap(req, lk.nullable) && !relsSubset(hands, req) {
+					req |= hands
+					changed = true
+				}
+			}
+		}
+		if req == all {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// pricedPushedDownFilter applies the conjuncts the search priced into its
+// top joinrel above the searched root. The Filter carries the root's cost
+// and rows, which already include them: PG's join node with its otherquals
+// prints one cost and the post-qual rows.
+func pricedPushedDownFilter(searched Node, priced []Expr) Node {
+	f := &Filter{pos: searched.Pos(), Child: searched, Predicate: combineAnd(priced)}
+	// The searched root sits beneath the boundary's pass-through wrappers
+	// (searchedRelOf walks the same chain), and is itself a Project over the
+	// node the winning path stamped: take the first stamp at or below it.
+	n := searched
+	root := false
+	for depth := 0; n != nil && depth < 32; depth++ {
+		if s, ok := n.(searchRootNode); ok && s.isFromJoinSearch() {
+			root = true
+		}
+		if root {
+			if c, ok := n.(PlanCostCarrier); ok {
+				if pc, set := c.PlanCostInfo(); set {
+					f.setPlanCost(pc)
+					break
+				}
+			}
+		}
+		kids := boundaryWalkChildren(n)
+		if len(kids) != 1 {
+			break
+		}
+		n = kids[0]
+	}
+	return f
 }
 
 // outerLinksHaveSJInfos reports whether every admitted outer link is described

@@ -816,12 +816,17 @@ func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
 // `relInfos[].sourceIdx` translation the equality arm uses; the
 // measurement itself is `rangeOpSelectivityStats`, the stats-first
 // core of the restriction path's inequality estimator, so the two
-// paths price one shape with one arithmetic. Shapes with no
-// measurement keep the whole-OR default contribution as a guess.
+// paths price one shape with one arithmetic. A shape with no
+// measurement is DEFAULT_INEQ_SEL when no statistics exist — scalarineqsel
+// with no stats tuple (an expression, a derived column, an unanalyzed one),
+// and scalarltjoinsel for a join inequality (M0146-0224: TPC-DS Q78's
+// `coalesce(ws_qty, 0) > 0` arm was priced at the unhandled-clause 0.5).
+// Statistics without a histogram keep 0.5: scalarineqsel's "assume half of
+// them will match" over the non-null, non-MCV fraction.
 func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 	col, val, swapped, ok := normalizeColumnConstRange(bo.Left, bo.Right)
 	if !ok || col.Name == "" {
-		return defaultUnhandledClauseSel, true
+		return defaultIneqJoinSel, true
 	}
 	op := bo.Op
 	if swapped {
@@ -829,13 +834,18 @@ func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 	}
 	i, ok := s.relPosForSource(col.SourceTableIdx)
 	if !ok || s.relInfos[i].table == nil {
-		return defaultUnhandledClauseSel, true
+		return defaultIneqJoinSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
 	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows)); measured {
 		return sel, false
 	}
-	return defaultUnhandledClauseSel, true
+	// Statistics without a histogram: scalarineqsel assumes half of the
+	// non-null, non-MCV values match.
+	if stats != nil {
+		return defaultUnhandledClauseSel, true
+	}
+	return defaultIneqJoinSel, true
 }
 
 // orInListSelectivity prices one single-side `col IN (consts)` OR-arm

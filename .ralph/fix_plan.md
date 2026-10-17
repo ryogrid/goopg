@@ -4635,7 +4635,20 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       scale and TPC\-H Q18 changed cost only\.
     - Pin: TestSubplanLeafPricesCostSubqueryscanOnce, mutation\-checked\. Gates: units, spotcheck, acceptance arm,
       sf025 PASS=99, fireset PASS \(26 fired results byte\-identical\), TestPort\_RegressSuite\.
-  - Slice 3 \(next\): the WHERE OR clause at the top joinrel\. PG keeps \(ss ⟕ cs\) ⟕ ws by 0\.06: qp\_qual 0\.005 per
-    mergejointuples \(28 against 16\), path rows 762\. goopg holds the clause above the searched tree
-    \(heldAbovePrefix\) and never prices it\. Resume at the ledgered C\-05 pselec\-held\-above: distribute it with an
-    is\_pushed\_down bit, size it through pselec, charge it as qp\_qual, apply it as the outer join's Filter\.
+  - **Slice 3 LANDED 2026\-10\-17 \(loop \#77\): delayed WHERE conjuncts are pushed\-down restrictions of the top
+    joinrel\.** Design §7; `analysis/m0146/m0146\-0224/census3/`, `fireset3/`\.
+    - topDelayedConjuncts picks the held conjuncts whose check\_outerjoin\_delay placement is the join of every leaf\.
+      The root problem carries them as restrictInfos with a pushedDown bit \(RINFO\_IS\_PUSHED\_DOWN\)\.
+    - The full joinrel sizes them through pselec \(rows 762, as PG\) and charges them as qp\_qual in every join method\.
+      They are never keys, join quals or part of the unique/semi tests\.
+    - The Filter above the tree applies them, stamped with the winning path's cost\.
+    - orRangeSelectivity: an unmeasured inequality arm with no statistics is DEFAULT\_INEQ\_SEL, not 0\.5\.
+    - Q78 now has PG's structure at both scales and is the only plan that changed\. It is still SHAPE\-DIFF on qual
+      text\. Pins: TestTopDelayedConjunctsClosesOverOuterJoins, TestPushedDownRestrictionIsNeverAJoinKey,
+      TestOrRangeArmDefaultsToIneqSel\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(Q78 changed\), fireset PASS \(Q78 byte\-identical at
+      both scales\), TestPort\_RegressSuite\.
+  - Slice 4 \(next\): EXPLAIN qual text through a removed SubqueryScan\. PG's setrefs replaces the upper Vars with the
+    subplan's tlist expressions, so it prints web\_sales\.ws\_item\_sk, web\_sales\.ws\_bill\_customer\_sk and
+    sum\(web\_sales\.ws\_quantity\)\. goopg prints the CTE output names ws\_item\_sk, ws\_customer\_sk and ws\_qty\. These
+    are the differ's remaining Merge Cond and JoinQual signatures \(design §8\)\.
