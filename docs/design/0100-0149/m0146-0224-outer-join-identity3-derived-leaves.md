@@ -1,6 +1,7 @@
 # M0146-0224 — TPC-DS Q78: outer-join commutation over derived leaves
 
-Status: slice 1 (legality) landed 2026-10-17. Q78 still diverges on cost (§4). Evidence: `analysis/m0146/m0146-0224/`.
+Status: slice 1 (legality) and slice 2 (derived-leaf subpath cost) landed 2026-10-17. Q78 still diverges: the WHERE
+clause is not costed at the top joinrel (§6). Evidence: `analysis/m0146/m0146-0224/`.
 
 ## 1. Record
 
@@ -98,7 +99,59 @@ PG's residual join clause `ws_sold_year = ss_sold_year` is replaced by a constan
 `reconsider_outer_join_clauses`, once `ws_sold_year = 1998` is derived. goopg shows no Join Filter either, so it is
 not a difference in the plan text. Whether goopg still costs the clause is part of item 2.
 
-## 5. Not ported (ledger)
+## 5. Slice 2 (landed): a derived leaf pays cost_subqueryscan once
+
+`final_cost_mergejoin`'s terms on the replica (`probe2/pg-exact-replica-q78-final-cost-mergejoin.txt`) and in goopg
+agree on every factor: `mergejointuples` (16 and 28), `rescanratio` 1, merge qual 0.005, and the forced Material over
+an unsorted GroupAggregate. What differed were the inputs.
+
+PG's subquery-scan paths are the aggregate plus `cpu_tuple_cost` per row: ss 19406.47 + 13.71 = 19420.18. goopg's
+search leaves were the aggregate plus three times that: ss 19447.58, ws +14.25, cs +24.92
+(`probe2/goopg-q78-derived-leaf-chain-before.txt`).
+- A derived leaf arrives as SubqueryScan → Project → Aggregate.
+- The legacy display cost charges `cpu_tuple_cost` per row at the SubqueryScan and again at the Project.
+- `costSubplanLeaf` then adds `cost_subqueryscan`'s own charge.
+
+In PG:
+- the SubqueryScan is the scan `cost_subqueryscan` prices, so its subpath is the node beneath it;
+- a projection over a projection-capable path costs only its target list's evaluation (`create_projection_path`'s
+  dummypp arm).
+
+**Change:**
+- `subplanLeafSubpathCost` peels a SubqueryScan, then a Project whose child is projection-capable.
+  `projectionCapableNode` mirrors `is_projection_capable_path` on a positive list: scans, joins, Aggregate,
+  WindowAgg, Gather, GatherMerge and Result.
+- A wrapper is peeled only when it carries no path cost of its own, and its initPlan charge is kept.
+
+**Measured:**
+- Q78's 2-rel merges now match PG: `ss ⟕ ws` 28283.61 against 28283.63; the ws Materialize displays 8854.06, as PG.
+- Census verdicts and categories are unchanged (TPC-H 22, SF0.25 90, SF1 77).
+- 13 TPC-DS plans per scale and TPC-H Q18 changed cost only, with no shape change. Q78 SF0.25 is 42519.72 against
+  PG's 42510.48, from 42573.54. TPC-H Q18 is 404975.77 against 404713.55, from 406128.37.
+- All 26 fired results are byte-identical, and the acceptance arm is value-identical.
+
+**Pin:** `TestSubplanLeafPricesCostSubqueryscanOnce`. A projection over Material keeps its charge. Mutation-checked.
+
+## 6. What still separates Q78 from PG (slice 3)
+
+With the inputs equal, the two orders still tie in goopg. PG's 0.06 is the WHERE clause
+`(coalesce(ws_qty,0)>0 or coalesce(cs_qty,0)>0)` evaluated as a restriction of the top joinrel:
+- `qp_qual_cost` is 0.005;
+- it is charged per `mergejointuples`, which is 28 for `(ss⟕ws)⟕cs` and 16 for `(ss⟕cs)⟕ws`;
+- its selectivity sets the path rows to 762.
+
+goopg holds a WHERE conjunct that reaches a nullable side above the whole searched tree (`tryJoinSearch`'s
+`heldAbovePrefix`) and evaluates it as a Filter after the search. The placement is the same here, since the clause
+needs both outer joins. What differs is that the search never prices it.
+
+The resume point is the ledgered `C-05 pselec-held-above` (`joinrelsize.go` `pushedDownSelectivity`):
+1. Distribute such a conjunct into the clause list with an `is_pushed_down` bit, required at the join that completes
+   its outer joins.
+2. Size it through `pselec`.
+3. Charge it as `qp_qual` in the join producers, and apply it as the outer join's Filter (otherquals) rather than as a
+   join qual.
+
+## 7. Not ported (ledger)
 
 - Strictness for derived leaves:
   - `sjiClauseRelids`'s strict relids come from `collectNonNullableTableNames`, which maps only catalog tables.

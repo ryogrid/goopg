@@ -712,7 +712,7 @@ func costKeptCTEScanLeaf(cp costParams, ri baseRelInfo, leaf Node) (Cost, bool) 
 // which is what the seq-scan fabrication amounted to.
 func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
 	chargeDerivedLeafLevel(leaf)
-	sub := legacyDisplayCostOf(leaf)
+	sub := subplanLeafSubpathCost(leaf)
 	if rows < 0 {
 		rows = 0
 	}
@@ -720,6 +720,66 @@ func costSubplanLeaf(cp costParams, leaf Node, rows float64) Cost {
 		Startup: sub.StartupCost,
 		Total:   sub.TotalCost + cp.cpuTupleCost*rows,
 	}
+}
+
+// subplanLeafSubpathCost is the subpath cost cost_subqueryscan starts from
+// (M0146-0224). A derived leaf arrives as SubqueryScan → Project → body, and
+// the legacy display cost charges cpu_tuple_cost per row at both wrappers —
+// on top of the one costSubplanLeaf adds as cost_subqueryscan's own. PG
+// charges neither:
+//
+//   - the SubqueryScan IS the scan cost_subqueryscan prices, so its subpath is
+//     the node beneath it;
+//   - a projection over a projection-capable path adds only its target
+//     list's eval cost, with no cpu_tuple_cost (create_projection_path's
+//     dummypp arm, pathnode.c), and goopg prices target-list evaluation at
+//     zero everywhere.
+//
+// TPC-DS Q78's three grouped CTE legs entered the search at 0.03 per row above
+// their aggregates where PG has 0.01, which tied PG's outer-join order with
+// the written one. A wrapper is peeled only when it carries no path cost of
+// its own; its initPlan charge stays.
+func subplanLeafSubpathCost(leaf Node) PlanCost {
+	n := leaf
+	var initPlans float64
+	peel := func(w, child Node) bool {
+		if child == nil {
+			return false
+		}
+		if c, ok := w.(PlanCostCarrier); ok {
+			if _, set := c.PlanCostInfo(); set {
+				return false
+			}
+		}
+		initPlans += InitPlanChargeOf(w)
+		n = child
+		return true
+	}
+	if sq, ok := n.(*SubqueryScan); ok {
+		peel(sq, sq.Child)
+	}
+	if p, ok := n.(*Project); ok && projectionCapableNode(p.Child) {
+		peel(p, p.Child)
+	}
+	sub := legacyDisplayCostOf(n)
+	sub.StartupCost += initPlans
+	sub.TotalCost += initPlans
+	return sub
+}
+
+// projectionCapableNode is is_projection_capable_path (createplan.c) over
+// the node kinds it names capable: scans, joins, aggregation, window
+// aggregation, Gather and Result. The kinds PG lists as incapable (Sort,
+// Material, Memoize, Limit, LockRows, SetOp, Unique, Append, RecursiveUnion,
+// ProjectSet) and any goopg kind whose PG counterpart is ambiguous report
+// false, so their projection keeps its cpu_tuple_cost.
+func projectionCapableNode(n Node) bool {
+	switch n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan, *Join, *NestedLoopIndexJoin,
+		*Aggregate, *WindowAgg, *Gather, *GatherMerge, *Result:
+		return true
+	}
+	return false
 }
 
 // stampNeededColsOnRels copies the statement's needed-column set onto every rel

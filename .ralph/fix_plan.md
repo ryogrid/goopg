@@ -4624,9 +4624,18 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestScopedUnqualifiedResolvesDerivedLeaves, mutation\-checked\.
     - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(no plan changed\), fireset PASS \(SF1 Q78
       byte\-identical\), TestPort\_RegressSuite, internal/postmaster\.
-  - Slice 2 \(next\): cost\. On the replica PG keeps \(ss ⟕ cs\) ⟕ ws because it is 0\.06 cheaper \(42467\.7731 against
-    42467\.8331\); goopg's two orders tie to 1e\-11 at 42521\.2259\.
-    - PG costs the WHERE OR clause at the top joinrel \(path rows 762; qp\_qual per mergejointuples, which differs by
-      order\)\. goopg's top path rows are 1371 and the qual is applied above\.
-    - goopg's 2\-rel merges are dearer on run cost: ss ⟕ ws \+37, ss ⟕ cs \+44; the ws Materialize is 8862\.37 against
-      8852\.87\. Compare final\_cost\_mergejoin's terms one by one\.
+  - **Slice 2 LANDED 2026\-10\-17 \(loop \#76\): a derived leaf pays cost\_subqueryscan once\.** Design §5;
+    `analysis/m0146/m0146\-0224/probe2/`, `census2/`, `fireset2/`\.
+    - final\_cost\_mergejoin's terms agreed on both sides \(mergejointuples 16/28, rescanratio 1, forced Material\)\.
+      The inputs differed: goopg's CTE leaves entered at 0\.03 per row over their aggregates where PG has 0\.01\. The
+      SubqueryScan and the Project each added cpu\_tuple\_cost before costSubplanLeaf added cost\_subqueryscan's own\.
+    - Fix: subplanLeafSubpathCost peels the SubqueryScan and a Project over a projection\-capable node
+      \(is\_projection\_capable\_path, create\_projection\_path's dummypp arm\)\.
+    - Q78's 2\-rel merges now equal PG's \(28283\.61 against 28283\.63\)\. Verdicts unchanged; 13 TPC\-DS plans per
+      scale and TPC\-H Q18 changed cost only\.
+    - Pin: TestSubplanLeafPricesCostSubqueryscanOnce, mutation\-checked\. Gates: units, spotcheck, acceptance arm,
+      sf025 PASS=99, fireset PASS \(26 fired results byte\-identical\), TestPort\_RegressSuite\.
+  - Slice 3 \(next\): the WHERE OR clause at the top joinrel\. PG keeps \(ss ⟕ cs\) ⟕ ws by 0\.06: qp\_qual 0\.005 per
+    mergejointuples \(28 against 16\), path rows 762\. goopg holds the clause above the searched tree
+    \(heldAbovePrefix\) and never prices it\. Resume at the ledgered C\-05 pselec\-held\-above: distribute it with an
+    is\_pushed\_down bit, size it through pselec, charge it as qp\_qual, apply it as the outer join's Filter\.

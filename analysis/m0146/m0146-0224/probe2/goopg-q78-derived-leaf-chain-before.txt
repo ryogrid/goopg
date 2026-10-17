@@ -1,0 +1,7 @@
+goopg costSubplanLeaf probe (before slice 2), TPC-DS SF0.25 Q78 under PG statistics: the derived leaf's node chain
+with legacyDisplayCostOf at each level, then the cost the leaf entered the search at.
+rows=1371 chain: SubqueryScan(19206.5517..19433.8717) Project(19206.5517..19420.1617) Aggregate(19206.5517..19406.4517) GatherMerge(19206.5517..19368.7492) Sort(18206.5117..18207.6167)
+rows=475  chain: SubqueryScan(8779.7359..8857.6201)   Project(8779.7359..8852.8701)   Aggregate(8779.7359..8848.1201)   GatherMerge(8779.7359..8835.0576)   Sort(7779.7121..7780.2071)
+rows=829  chain: SubqueryScan(14041.6016..14179.0541) Project(14041.6016..14170.7641) Aggregate(14041.6016..14162.4741) GatherMerge(14041.6016..14139.6766) Sort(13041.5616..13042.2291)
+search leaf costs (mergeJoinCost inputs): ss 19206.5517..19447.5817, ws 8779.7359..8862.3701, cs 14041.6016..14187.3441
+PG's subquery-scan paths (add_path inner side): ss 19206.5702..19420.1802, ws 8779.7359..8852.8701, cs 14041.5502..14170.7127
