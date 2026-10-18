@@ -572,7 +572,9 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// all indent at the CURRENT es->indent, same column for every property
 	// of a node).
 	detailIndent := strings.Repeat(" ", childIndent*2)
-	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
+	reg.withFilterSrc(attachedFilterNode, func() {
+		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
+	})
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -1049,6 +1051,14 @@ func resolveKeySource(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg)
 // aggregate argument chased into the aggregate's own input needs that: it is
 // printed inside a call rendered far above the node it names.
 func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg, pinned bool) (optimizer.Expr, bool) {
+	return resolveKeySourceDepth(expr, node, reg, pinned, 4)
+}
+
+// resolveKeySourceDepth is resolveKeySourceAt with the republishing-layer
+// bound as a parameter. A join's attached Filter starts above the search
+// boundary's own Projects (a narrowing one and the binding-order one), so its
+// chase needs more levels before it reaches a leaf's body (M0146-0224).
+func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPlanReg, pinned bool, maxDepth int) (optimizer.Expr, bool) {
 	if expr == nil || node == nil || exprHasSubplanOrOuterRef(expr) {
 		return nil, false
 	}
@@ -1091,7 +1101,7 @@ func resolveKeySourceAt(expr optimizer.Expr, node optimizer.Node, reg *subPlanRe
 	relMismatch := func(name string, rel int16) bool {
 		return wantRel != 0 && rel != 0 && name == wantName && rel != wantRel
 	}
-	for depth := 0; depth < 4; depth++ {
+	for depth := 0; depth < maxDepth; depth++ {
 		if steps++; steps > 64 {
 			return nil, false
 		}
@@ -2968,7 +2978,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 		})
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprQual(attachedFilter, reg, qualify)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatAttachedJoinFilter(attachedFilter, reg, qualify)))})
 		}
 	case *optimizer.NestedLoopIndexJoin:
 		// The NLI's residual predicate (conjuncts the index probe does not
@@ -3899,6 +3909,20 @@ type subPlanReg struct {
 	// bare is resolved positionally through the child that produced it
 	// (explainNames.joinResidualColumn, M0146-0005as).
 	joinRow optimizer.Node
+	// filterSrc is the collapsed Filter wrapper whose predicate this node's
+	// line prints (walkPlanFiltered's attachedFilterNode), set around the
+	// node's detail lines. filterRow is that Filter's child while a join's
+	// attached `Filter:` is being rendered: its columns index the child's
+	// output, so a column no scope can name is chased through it to the node
+	// that computes it, as a join residual is (M0146-0224: TPC-DS Q78's
+	// `COALESCE((sum(web_sales.ws_quantity)), ...)` over stripped CTE
+	// subquery scans).
+	filterSrc optimizer.Node
+	filterRow optimizer.Node
+	// inChase is set while an expression a chase returned is rendered: its
+	// columns belong to the node the chase landed on and are never chased
+	// again from the line's own row.
+	inChase bool
 	// paramRow is the parameterised nested loop whose inner side prints with
 	// its param qual rendered (walkPlanFiltered's renderedParamQual arm). A
 	// sublink in that inner's Filter evaluates its PARAM_EXEC Args against
@@ -4201,8 +4225,67 @@ func formatExecParamRef(x *optimizer.ExecParamRef, reg *subPlanReg) string {
 	return fallback
 }
 
-// currentNode returns the plan node whose own lines are being rendered, or
-// nil.
+// withFilterRow renders fn with filterRow set to n (nil-receiver safe).
+func (r *subPlanReg) withFilterRow(n optimizer.Node, fn func()) {
+	if r == nil {
+		fn()
+		return
+	}
+	prev := r.filterRow
+	r.filterRow = n
+	defer func() { r.filterRow = prev }()
+	fn()
+}
+
+// withFilterSrc renders fn with filterSrc set to n (nil-receiver safe).
+func (r *subPlanReg) withFilterSrc(n optimizer.Node, fn func()) {
+	if r == nil {
+		fn()
+		return
+	}
+	prev := r.filterSrc
+	r.filterSrc = n
+	defer func() { r.filterSrc = prev }()
+	fn()
+}
+
+// formatChased renders an expression a chase returned with inChase set.
+func (r *subPlanReg) formatChased(e optimizer.Expr, qualify bool) string {
+	prev := r.inChase
+	r.inChase = true
+	defer func() { r.inChase = prev }()
+	return formatExprQual(e, r, qualify)
+}
+
+// namesRowColumn reports whether x is a reference into row's output: the
+// column at x's position carries x's name. A column inside an aggregate's
+// argument indexes the aggregate's input, not the row the enclosing line
+// reads (TPC-DS Q71's `sum(ext_price)`), and must not be chased from it.
+func namesRowColumn(row optimizer.Node, x *optimizer.ColumnRef) bool {
+	if row == nil || x == nil || x.Index < 0 {
+		return false
+	}
+	out := row.Output()
+	return x.Index < len(out) && out[x.Index].Name == x.Name
+}
+
+// formatAttachedJoinFilter renders a join's attached Filter with filterRow set
+// to the collapsed Filter's child, the row its columns index.
+func formatAttachedJoinFilter(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
+	var row optimizer.Node
+	if reg != nil {
+		if f, ok := reg.filterSrc.(*optimizer.Filter); ok {
+			row = f.Child
+		}
+	}
+	if row == nil {
+		return formatExprQual(e, reg, qualify)
+	}
+	var out string
+	reg.withFilterRow(row, func() { out = formatExprQual(e, reg, qualify) })
+	return out
+}
+
 // withJoinRow renders fn with joinRow set to n (nil-receiver safe).
 func (r *subPlanReg) withJoinRow(n optimizer.Node, fn func()) {
 	if r == nil {
@@ -4215,6 +4298,8 @@ func (r *subPlanReg) withJoinRow(n optimizer.Node, fn func()) {
 	fn()
 }
 
+// currentNode returns the plan node whose own lines are being rendered, or
+// nil.
 func (r *subPlanReg) currentNode() optimizer.Node {
 	if r == nil {
 		return nil
@@ -4621,6 +4706,22 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if q := reg.names().columnInScope(reg.currentNode(), x.SourceTableIdx, x.Name); q != "" {
 			return q
 		}
+		// M0146-0224: a join's attached Filter indexes the Filter's child
+		// output. A column no scope names — a stripped subquery scan's
+		// output — deparses through that child to the node computing it, as
+		// get_variable does for an upper Var (resolve_special_varno); a
+		// computed target is parenthesised.
+		if reg.joinRow == nil && reg.filterRow != nil && !reg.inChase && namesRowColumn(reg.filterRow, x) {
+			row := reg.filterRow
+			if chased, hit := resolveKeySourceDepth(x, row, reg, false, 8); hit {
+				var out string
+				reg.withFilterRow(nil, func() { out = reg.formatChased(chased, qualify) })
+				if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
+					out = "(" + out + ")"
+				}
+				return out
+			}
+		}
 		// M0146-0042: a sort key or an aggregate's expression indexes the
 		// node's input row, and PG deparses an OUTER_VAR there through the
 		// child's target list down to the scan (resolve_special_varno). A
@@ -4644,6 +4745,26 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		if input != nil {
 			if s := reg.names().resolvedColumn(input, x.Index, false); strings.HasSuffix(s, "."+x.Name) {
 				return s
+			}
+			// M0146-0224: a key or argument the scopes cannot name, over a
+			// search boundary whose subquery scans setrefs removed, deparses
+			// through the input to the node computing it — a grouped
+			// subquery's aggregate `(sum(store_sales.ss_quantity))`, or the
+			// base column an output alias renames (`s.cust` for `ss_cust`).
+			// A chase that lands on a column it cannot qualify keeps today's
+			// text.
+			if reg.inChase || !namesRowColumn(input, x) {
+				return reg.names().column(x.SourceTableIdx, x.Name, qualify)
+			}
+			if chased, hit := resolveKeySourceDepth(x, input, reg, false, 8); hit {
+				var out string
+				reg.withFilterRow(nil, func() { out = reg.formatChased(chased, qualify) })
+				if _, isCol := chased.(*optimizer.ColumnRef); !isCol {
+					return "(" + out + ")"
+				}
+				if strings.Contains(out, ".") {
+					return out
+				}
 			}
 		}
 		return reg.names().column(x.SourceTableIdx, x.Name, qualify)
@@ -6104,7 +6225,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	detailIndent := strings.Repeat(" ", childIndent*2)
-	emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
+	reg.withFilterSrc(attachedFilterNode, func() {
+		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
+	})
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
 		// matching upstream's text format (design 0118-0102).

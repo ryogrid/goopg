@@ -213,6 +213,37 @@ list expressions (`set_subqueryscan_references` → `trivial_subqueryscan`). EXP
 the base column, the `sum(...)` aggregate, the bigint constant's cast. goopg strips the node
 (`stripTrivialSubqueryScans`) but keeps rendering the subquery's output names.
 
+### 8.1 Slice 4: deparse through the stripped leg (landed 2026-10-19)
+
+PG reaches the subplan's target through `resolve_special_varno` and `get_variable` (ruleutils.c), and wraps any
+target that is not a plain Var in parentheses ("Force parentheses because our caller probably assumed a Var is a
+simple expression"). goopg's EXPLAIN now does the same at three points:
+
+- **Keys over a semi/anti join** (`explainNames.resolvedColumn` → `joinOutputSide`): a semi or anti join publishes
+  its left input position for position, so an output column maps to that input. The old walk stopped there, and
+  `web_sales.ws_item_sk` over the `ws LEFT JOIN web_returns … IS NULL` anti join printed bare.
+- **A join's attached Filter** (`formatAttachedJoinFilter`, `subPlanReg.filterSrc`/`filterRow`): the collapsed
+  Filter's columns index the Filter's child. A column no scope names is chased through that child with
+  `resolveKeySourceDepth` (8 levels: the search boundary adds a narrowing and a binding-order Project) to the node
+  that computes it. That turns `COALESCE(ws_qty, 0)` into `COALESCE((sum(web_sales.ws_quantity)), 0)`.
+- **Sort/aggregate keys over the boundary** (the M0146-0042 input-row arm of `formatExprQual`): the same chase,
+  kept only when it lands on an aggregate/expression or on a column it can qualify. That turns Q78's top
+  `ss_qty DESC` into `(sum(store_sales.ss_quantity)) DESC`, and TPC-H Q18's `o_totalprice DESC` into
+  `orders.o_totalprice DESC`.
+
+Guards: `namesRowColumn` chases a column only when it really indexes the row being read. A column inside an
+aggregate's argument indexes the aggregate's input instead (TPC-DS Q71's `sum(ext_price)`). `inChase` stops a
+chased expression from being chased again from the line's own row.
+
+Census with slice 4 (`census4/`, m24d): TPC-H 22/22 (Q18 Sort Key now text-identical), SF0.25 90→91, SF1 77→78.
+Q78 MATCHes at both scales; no other plan text changed. Still open: PG prints the coerced constant
+`'0'::bigint` where goopg prints `0`. That is ledger row M0146-0005ci (CASE/COALESCE result constants). Pin:
+`TestStrippedCTELeafQualsDeparseSubplanTargets`, mutation-checked against each of the three arms.
+
+Gates (staged code tree e6d93c0b): sf025 sweep PASS (99 compared; only Q78's plan text changed),
+TestPort_RegressSuite PASS, tpch-spotcheck PASS (Q12=2, Q13=35), acceptance arm m24e PASS (24/24 on values,
+`accept4`). Fireset not required: the change is internal/executor only.
+
 ## 9. Not ported (ledger)
 
 - Strictness for derived leaves:

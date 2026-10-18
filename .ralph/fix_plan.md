@@ -388,6 +388,28 @@ heuristic stays live.)
 - [x] testport/TestPort\_CreateSchemaSurvivesRestart — server start timeout after 20 s \(AI\-20261017\-005127\-002; repro: `go test \-v \-run '^TestPort\_CreateSchemaSurvivesRestart$' \./internal/testport/`\)\.
   - Stale, passes at HEAD 1390b3901 \(3\.8 s\)\. The same nightly\-plus\-loop load overlap; the next sibling restart tests
     in the same run passed\.
+- [x] units/internal/executor — TestSharedSpillingBuildLoadsOncePerBatch: loadCount=10 with 7 inner files and 4 participants, want exactly 7 \(AI\-20261019\-001758\-001; repro: `go test \-timeout 10m \./internal/executor/`\)\.
+  - Nightly ran from a detached worktree at HEAD ab7ff371b, which passed the 2026\-10\-18 nightly; not caused by the staged M0146\-0224 slice\-4 WIP\.
+  - Fixed in a9b03992b \(test\-only\)\. The test's barrier held participants BEFORE acquireLoad, so under host load the claimant
+    could load, probe and release a batch before a descheduled peer arrived; that peer reloaded it \(the documented straggler
+    path\)\. The loader now parks in testHookSharedBatchLoading until the other n\-1 peers wait on done\. Mutation check: an
+    injected post\-barrier sleep fails 10/10 without the park \(loadCount=12\) and passes 10/10 with it\.
+- [x] race/internal/access/nbtree — TestIncompleteSplitsFinishedConcurrently: finish\_split\_test\.go:390 Search\(865\) = false \(AI\-20261019\-001758\-002; repro: `go test \-race \-timeout 45m \./internal/access/nbtree/`\)\.
+  - 2026\-10\-19 01:32: the single test passed 5/5 under \-race on an idle host; not yet stressed or diagnosed\.
+  - Fixed in 8fbfdf20f \(test\-only\)\. Not a lost key: all 14 missing keys came from Inserts that returned errSplitAbandoned
+    while finishing another writer's half split on contact \(insertIntoBlock \-> finishSplit\), before their own key was placed\.
+    The test now retries failed inserts\. Latent since d7c05acde \(14/200 under 8x load\); fixed: 0/400\.
+- [x] testport/TestPort\_IsolationEvalPlanQual — output 1470 lines against 1468 expected \(AI\-20261019\-001758\-003; repro: `go test \-v \-run '^TestPort\_IsolationEvalPlanQual$' \./internal/testport/`\)\.
+  - Earlier fix: the 2026\-09\-22 alias fix in resolveRowMarkCtidResnos \(deferral ledger row 2408\) made it byte\-identical; if the repro fails at HEAD, that fix did not hold\.
+  - Stale, load\-induced; no code change\. Passes 3/3 at HEAD 8fbfdf20f on an idle host \(24 s\), and the same sha passed
+    the 2026\-10\-18 nightly\. The nightly diff starts at `step c1: COMMIT; <waiting ...>`: the harness labels any step still
+    running at blockProbeCap \(1\.5 s\) as waiting, and `mergevalues` then missed the 5 s drainWindow, so the harness cancelled
+    it and the balances stayed 700/1400\. A cancelled merge is not a wrong answer\. Testport ran beside the units and race lanes
+    in a MemoryHigh=6G cgroup, so multi\-second stalls are plausible\.
+  - Under synthetic CPU load \(10 stress binaries\) 1 of 6 runs failed, on a different permutation, with only the
+    timing\-label line differing and every value correct\. Root cause is the harness's timing fallback, already
+    ledgered: deferral\_ledger row 2963 \(pg\_isolation\_test\_session\_is\_blocked not implemented\)\. Hardening
+    lead, not done: treat a probe that reports no lock wait as still running past blockProbeCap, as isolationtester does\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
@@ -4594,9 +4616,10 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
     - Gates: units, spotcheck, acceptance arm, sf025 PASS \(Q39 plan text changed\), fireset PASS \(Q39 results
       byte\-identical at both scales\), TestPort\_RegressSuite\.
 Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
-- [ ] **M0146\-0224 — qual\-placement: TPC\-DS Q78 — PG commutes the two outer joins to \(ss ⟕ cs\) ⟕ ws; goopg keeps
+- [x] **M0146\-0224 — qual\-placement: TPC\-DS Q78 — PG commutes the two outer joins to \(ss ⟕ cs\) ⟕ ws; goopg keeps
   \(ss ⟕ ws\) ⟕ cs** \(filed 2026\-10\-17 by the S9 pass at 1a8760b93\)\.
   Kind: impl
+  Movement: yes — SF0\.25 match 90→91, SF1 77→78 \(PLAN\-PARITY census4, Q78 MATCH at both scales\)\.
   Parent: M0146-0014
   - Record: TPC\-DS SF0\.25 Q78, category qual\-placement, verdict SHAPE\-DIFF at depth 2 \(under Sort: PG Merge Left
     Join \| goopg Merge Left Join\)\. The same swap is the SF1 join\-order record at depth 2\. Both persist under PG
@@ -4652,3 +4675,21 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     subplan's tlist expressions, so it prints web\_sales\.ws\_item\_sk, web\_sales\.ws\_bill\_customer\_sk and
     sum\(web\_sales\.ws\_quantity\)\. goopg prints the CTE output names ws\_item\_sk, ws\_customer\_sk and ws\_qty\. These
     are the differ's remaining Merge Cond and JoinQual signatures \(design §8\)\.
+    - 2026\-10\-19: implemented in tree and staged, NOT committed \(design §8\.1; backup
+      `tmp/m0224\-slice4\-wip\.patch`\)\. Semi/anti join keys map to the left input \(joinOutputSide\), a join's
+      attached Filter and the Sort keys over the search boundary chase to the subplan target, and a non\-Var target
+      is parenthesised as get\_variable does\.
+    - Census with it \(`census4/`\): SF0\.25 90→91, SF1 77→78 \(Q78 MATCH at both scales\), TPC\-H 22/22 with Q18's
+      Sort Key text\-identical\. No other plan text changed\.
+    - Pin: TestStrippedCTELeafQualsDeparseSubplanTargets, mutation\-checked against all three arms\. Units PASS\.
+    - Blocked on gates: tpch\-spotcheck and the acceptance arm are SKIP\-BLOCKED because `:65433`'s data dir is
+      under HOLD \(unclean shutdown 2026\-10\-17 18:17, owner\-only\); `:65432` and `:65438` hold too\. The sf025
+      sweep refused while the 2026\-10\-19 nightly batch ran\. Still to run: sf025, fireset, TestPort\_RegressSuite\.
+    - 2026\-10\-19 02:12: sf025 sweep PASS on the staged index \(99 compared, no verdict change, only Q78's plan text
+      changed; stamp tmp/gate\-stamps/tpcds\-sf025\.json, code\_tree e6d93c0b\)\. TestPort\_RegressSuite PASS \(459 s\)\.
+      Fireset is not required: the staged set is internal/executor only, outside the fire\-set scope\. Only
+      tpch\-spotcheck and the acceptance arm remain, both HOLD\-blocked\. Re\-run sf025 if the staged internal/ index changes\.
+    - 2026\-10\-19 06:41: the owner released the HOLDs \(`*.HOLD.released-20261019`; ensure fix 8ea3190a7\)\.
+      tpch\-spotcheck PASS \(Q12=2, Q13=35\) and acceptance arm m24e PASS \(24/24 MATCH on values,
+      `analysis/m0146/m0146\-0224/accept4`\), both on code\_tree e6d93c0b, the same tree as the sf025 stamp\.
+  - **Slice 4 LANDED 2026\-10\-19: EXPLAIN qual text through the stripped CTE SubqueryScan\.** Task closed\.
