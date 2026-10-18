@@ -4722,3 +4722,19 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestWindowFunctionKeepsNeededSet, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS \(10 plans
       changed\), tpcds\-fireset PASS \(20 fired results byte\-identical\)\.
+- [ ] **M0146\-0226 — sort\-strategy: TPC\-DS SF0\.25 Q4 — PG finishes with an Incremental Sort over a merge\-joined
+  pair of sorted CTE scans; goopg nested\-loops unsorted CTE scans under a full Sort** \(filed 2026\-10\-19 by the S9
+  pass at fe64139d5\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q4, category sort\-strategy, verdict SHAPE\-DIFF at depth 1 \(under Limit: PG Incremental
+    Sort \| goopg Sort\)\. Persists under PG statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261019b/`\.
+  - S9 ranking: a five\-way tie at 1 \(SF0\.25 Q4, SF0\.25 Q69, SF1 Q23, SF1 Q72, SF1 Q77\); SF0\.25 preferred, then the
+    lower query id and shallower divergence\.
+  - Already different under identical statistics: CTE scan estimates \(goopg 9 / 29 rows, PG 10 / 30\) and the
+    year\_total HashAggregate cost \(goopg 46822\.64\.\.55046\.66, PG 53401\.85\.\.61625\.87, same input\)\.
+  - First step: on the SF0\.25 PG\-statistics clone \(`tmp/s9\-imp/run\.sh` recipe\), attribute the CTE\-scan row gap
+    \(the year\_total filter's selectivity over the CTE's column statistics, PG's set\_cte\_size\_estimates /
+    clauselist\_selectivity\) and the HashAggregate cost gap \(cost\_agg AGG\_HASHED\); then check whether the merge
+    join \+ Incremental Sort arm is generated \(instrument addPath\) and at what cost\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q4\), 91→92 on the shipped corpus\.
