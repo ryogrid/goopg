@@ -1409,6 +1409,31 @@ func TestSharedSpillingBuildLoadsOncePerBatch(t *testing.T) {
 	bar := newBatchBarrier(t, n)
 	testHookSharedBatchAcquire = bar.arrive
 	defer func() { testHookSharedBatchAcquire = nil }()
+	// The barrier alone does not make the load count exact. It holds every
+	// participant BEFORE it claims the load, so on a loaded host the claimant
+	// can load, probe its slice and release the table before a descheduled
+	// peer even reaches acquireLoad; that peer then reloads the batch from its
+	// file (the documented straggler path) and loadCount overshoots by one per
+	// late peer (nightly AI-20261019-001758-001: 10 for 7 files). Parking the
+	// loader until every peer is waiting on `done` takes the scheduler out of
+	// the figure.
+	testHookSharedBatchLoading = func(d *sharedBatchDesc, b int) {
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			d.mu.Lock()
+			w := d.waiting
+			d.mu.Unlock()
+			if w >= n-1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("loader of batch %d saw %d of %d peers waiting", b, w, n-1)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	defer func() { testHookSharedBatchLoading = nil }()
 
 	counter := &innerOpenCounter{}
 	got, sb := spillParticipants(t, plan, probeRows, buildRows, lw, rw, 128<<10, n, counter)
