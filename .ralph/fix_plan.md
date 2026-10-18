@@ -4693,9 +4693,10 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       tpch\-spotcheck PASS \(Q12=2, Q13=35\) and acceptance arm m24e PASS \(24/24 MATCH on values,
       `analysis/m0146/m0146\-0224/accept4`\), both on code\_tree e6d93c0b, the same tree as the sf025 stamp\.
   - **Slice 4 LANDED 2026\-10\-19: EXPLAIN qual text through the stripped CTE SubqueryScan\.** Task closed\.
-- [ ] **M0146\-0225 — scan\-type: TPC\-DS SF1 Q53/Q63 — PG probes `store` with an Index Only Scan under Memoize,
+- [x] **M0146\-0225 — scan\-type: TPC\-DS SF1 Q53/Q63 — PG probes `store` with an Index Only Scan under Memoize,
   goopg with a full\-width Index Scan** \(filed 2026\-10\-19 by the S9 pass at 0d94a7133\)\.
   Kind: impl
+  Movement: yes — SF1 match 78→80 \(Q53, Q63\); CATEGORIES\-EXCL\-MATCH scan\-type SF1 12→10
   Parent: M0146-0014
   - Record: TPC\-DS SF1 Q53 \(and Q63, same node\), category scan\-type, verdict SHAPE\-DIFF at depth 9 under Memoize\.
     PG `Index Only Scan using store_pkey on store \(cost=0\.14\.\.0\.15 rows=1 width=4\)`; goopg `Index Scan using
@@ -4709,3 +4710,15 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     addPath first \(memory planner\_verify\_both\_candidates\_generated\), then use the SF1 PG\-statistics clone recipe
     `tmp/s9\-imp/run\.sh`\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q53, Q63\), 78→80 on the shipped corpus\.
+  - **LANDED 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0225\-window\-needed\-columns\.md`; evidence
+    `analysis/m0146/m0146\-0225/`\.
+    - Bisected on an SF1 clone: the join block alone gets the index\-only probe; adding the window function loses it\.
+      `neededColumnNames` declined any OVER or WINDOW clause, so the needed set was unknown and pathparamindex\.go
+      never marked the probe index\-only\.
+    - Fix: collectWindowDefColumnNames walks PARTITION BY / ORDER BY \(PG build\_base\_rel\_tlists\), plus frame offsets
+      for safety; the WINDOW clause is walked in the needed set and its output\-set sibling\.
+    - Ten window queries change plan text at each scale; apart from Q53/Q63 only widths shrink \(narrowing now reaches
+      them\), costs unchanged\. SF0\.25 stays 91/99\.
+    - Pin: TestWindowFunctionKeepsNeededSet, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS \(10 plans
+      changed\), tpcds\-fireset PASS \(20 fired results byte\-identical\)\.

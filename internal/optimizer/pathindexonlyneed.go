@@ -253,8 +253,11 @@ func collectOutputColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// reference is a dropped column, so they decline as a group. Mirrors
 	// collectStmtColumnNames.
 	if s.SetOp != nil || s.SetOpOperand != nil ||
-		len(s.ValuesRows) != 0 ||
-		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		len(s.ValuesRows) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	// A WINDOW clause is evaluated above the tree, like the targets.
+	if !collectNamedWindowColumnNames(s.WindowClause, dst) {
 		return false
 	}
 	if !collectWithBodyColumnNames(s.With, dst) {
@@ -358,6 +361,9 @@ func collectSublinkOuterNames(e parser.Expr, dst map[string]bool) bool {
 		}
 		return true
 	case *parser.FuncCall:
+		// A window function cannot appear in WHERE or JOIN ON (PG's
+		// transformWindowFuncCall rejects it), so this arm never meets one;
+		// declining stays the safe answer.
 		if x.Over != nil {
 			return false
 		}
@@ -436,8 +442,10 @@ func collectStmtColumnNames(s *parser.SelectStmt, dst map[string]bool) bool {
 	// Shapes whose column usage this walker does not model; an unaccounted
 	// reference is a dropped column, so they decline as a group.
 	if s.SetOp != nil || s.SetOpOperand != nil ||
-		len(s.ValuesRows) != 0 ||
-		len(s.WindowClause) != 0 || len(s.Locking) != 0 {
+		len(s.ValuesRows) != 0 || len(s.Locking) != 0 {
+		return false
+	}
+	if !collectNamedWindowColumnNames(s.WindowClause, dst) {
 		return false
 	}
 	if !collectWithBodyColumnNames(s.With, dst) {
@@ -564,9 +572,9 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		}
 		return true
 	case *parser.FuncCall:
-		// A window function's frame can name columns; decline rather than
-		// model the WindowDef shape here. `count(*)` reads no column.
-		if x.Over != nil {
+		// M0146-0225: a window function also reads its window's PARTITION BY
+		// and ORDER BY expressions. `count(*)` reads no column.
+		if !collectWindowDefColumnNames(x.Over, dst) {
 			return false
 		}
 		for _, a := range x.Args {
@@ -621,6 +629,48 @@ func collectExprColumnNames(e parser.Expr, dst map[string]bool) bool {
 		// and is now handled above — it was declining TPC-H Q7/Q8/Q9.)
 		return false
 	}
+}
+
+// collectWindowDefColumnNames adds the columns a window definition reads
+// (M0146-0225). PG's build_base_rel_tlists sees a window's PARTITION BY and
+// ORDER BY as targetlist entries, so check_index_only counts them like any
+// other read. Frame offsets cannot name a column (transformFrameOffset's
+// checkExprIsVarFree) but are walked anyway: over-stating is the safe
+// direction. A reference to a named window (RefName) adds nothing here; the
+// statement's WINDOW clause is walked by collectNamedWindowColumnNames.
+func collectWindowDefColumnNames(w *parser.WindowDef, dst map[string]bool) bool {
+	if w == nil {
+		return true
+	}
+	for _, e := range w.PartitionBy {
+		if !collectExprColumnNames(e, dst) {
+			return false
+		}
+	}
+	for _, sb := range w.OrderBy {
+		if !collectExprColumnNames(sb.Expr, dst) {
+			return false
+		}
+	}
+	if w.Frame != nil {
+		if !collectExprColumnNames(w.Frame.StartOffset, dst) ||
+			!collectExprColumnNames(w.Frame.EndOffset, dst) {
+			return false
+		}
+	}
+	return true
+}
+
+// collectNamedWindowColumnNames adds the columns of every `WINDOW name AS
+// (...)` entry of one SELECT. Window names are scoped to their SELECT, so a
+// function's RefName always resolves to an entry walked here.
+func collectNamedWindowColumnNames(defs []parser.NamedWindowDef, dst map[string]bool) bool {
+	for _, d := range defs {
+		if !collectWindowDefColumnNames(d.Def, dst) {
+			return false
+		}
+	}
+	return true
 }
 
 // collectGroupingSetColumnNames adds every column the grouping sets name.
