@@ -18,9 +18,21 @@
 #   <datadir>.HOLD exists              -> HOLD, refused (reason logged from the file)
 #   <datadir>/PG_VERSION missing       -> REFUSE (would need init — never done here)
 #   goopg binary missing               -> REFUSE (never built here)
+#   postmaster.pid predates host boot  -> REBOOT: the server died with the host
+#                                         (WSL restart), not on its own. The pid
+#                                         is meaningless after a reboot (dead or
+#                                         reused), so the pidfile is renamed to
+#                                         postmaster.pid.stale-<boot-ts> and the
+#                                         cluster is started; the engine's own
+#                                         crash recovery replays WAL. No HOLD: a
+#                                         HOLD here parked the loop for ~36 h
+#                                         after the 2026-10-17 host restart.
+#                                         REF_ENSURE_REBOOT_POLICY=hold restores
+#                                         the HOLD-and-refuse behaviour.
 #   postmaster.pid names a LIVE pid    -> REFUSE (process exists but not listening:
 #                                         starting up / wedged — not ours to touch)
-#   postmaster.pid names a dead pid    -> REFUSE: an unclean shutdown. Writes
+#   postmaster.pid names a dead pid    -> REFUSE: a crash since boot (OOM kill,
+#   (pidfile written after boot)          panic). Writes
 #                                         <datadir>.HOLD ("unclean shutdown detected
 #                                         by ref-clusters-ensure <time>; owner must
 #                                         inspect") so nothing restarts it before the
@@ -54,7 +66,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1 ;;
     --strict)  STRICT=1 ;;
     --only)    shift; ONLY="${1:-}" ;;
-    -h|--help) sed -n '2,43p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "ref-clusters-ensure: unknown argument '$1'" >&2; exit 2 ;;
     esac
     shift
@@ -64,6 +76,16 @@ LOG="${REF_ENSURE_LOG:-${REPO_ROOT}/ci/logs/ref-clusters-ensure.log}"
 LOCK="${REF_ENSURE_LOCK:-${REPO_ROOT}/tmp/ref-clusters-ensure.lock}"
 FAIL_DIR="${REF_ENSURE_FAIL_DIR:-${REPO_ROOT}/tmp/ref-clusters-ensure}"
 BACKOFF_SEC="${REF_ENSURE_BACKOFF_SEC:-1800}"
+# start | hold — what a pidfile older than the host boot gets (header table).
+REBOOT_POLICY="${REF_ENSURE_REBOOT_POLICY:-start}"
+# Host boot time (epoch s) from /proc/stat btime; REF_ENSURE_BOOT_EPOCH
+# overrides it for tests. Empty/0 disables the reboot classification.
+BOOT_EPOCH="${REF_ENSURE_BOOT_EPOCH:-$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)}"
+# btime is derived (now - uptime) and drifts with WSL clock corrections — it
+# read 4 min after `uptime -s` on 2026-10-19. Only a pidfile older than
+# boot - slack counts as a reboot leftover; one written just before (or after)
+# the boot stays on the conservative HOLD path.
+BOOT_SLACK_SEC="${REF_ENSURE_BOOT_SLACK_SEC:-900}"
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${LOCK}")" "${FAIL_DIR}"
 
 log() {
@@ -129,6 +151,23 @@ for port in "${ports[@]}"; do
         fi ;;
     esac
     pid="$(ref_pidfile_pid "${RC_DATA}")"
+    if [[ -n "${pid}" && "${REBOOT_POLICY}" == "start" && "${BOOT_EPOCH:-0}" -gt 0 ]]; then
+        # Checked before kill -0: after a reboot the old pid may have been
+        # reused by an unrelated process, which must not read as "LIVE".
+        pid_mtime="$(stat -c %Y "${RC_DATA}/postmaster.pid" 2>/dev/null || echo 0)"
+        if (( pid_mtime > 0 && pid_mtime < BOOT_EPOCH - BOOT_SLACK_SEC )); then
+            stale="${RC_DATA}/postmaster.pid.stale-$(date -d "@${BOOT_EPOCH}" +%Y%m%dT%H%M%S)"
+            if [[ ${DRY_RUN} -eq 1 ]]; then
+                log "${tag} REBOOT — postmaster.pid (pid ${pid}) predates host boot $(date -d "@${BOOT_EPOCH}" -Iseconds): WOULD MOVE it to ${stale} and start (crash recovery)"
+            elif mv -n "${RC_DATA}/postmaster.pid" "${stale}" 2>/dev/null && [[ ! -e "${RC_DATA}/postmaster.pid" ]]; then
+                log "${tag} REBOOT — postmaster.pid (pid ${pid}) predates host boot $(date -d "@${BOOT_EPOCH}" -Iseconds); moved to ${stale}; starting (crash recovery)"
+            else
+                log "${tag} REFUSE — postmaster.pid predates host boot but could not be moved to ${stale}"
+                not_ok=1; continue
+            fi
+            pid=""
+        fi
+    fi
     if [[ -n "${pid}" ]]; then
         if kill -0 "${pid}" 2>/dev/null; then
             log "${tag} REFUSE — postmaster.pid names LIVE pid ${pid} but port is not listening (starting up or wedged; not touched)"
