@@ -257,5 +257,5 @@ for corpus in ${CORPORA}; do
     if [[ "${FIRESET_KEEP_CLONES}" != 1 ]]; then
         for dir in "${corpus_clones[@]}"; do remove_clone "${dir}"; done
     fi
-    python3 "${STATUS}" --fires "${fires}" --baseline "${baseline_status}" --candidate "${candidate_status}"
+    python3 "${STATUS}" --corpus "${corpus}" --fires "${fires}" --baseline "${baseline_status}" --candidate "${candidate_status}"
 done

@@ -213,6 +213,9 @@ it to hold the lineage.)
      the TPC-H actionable pool; Q5's >900s divergent-plan timeout is a
      recorded finding.
    - M0146-0005dp stays re-opened (its 0049/0049e gate landed).
+   - **Owner placement 2026-10-19 (b):** M0146-0229 (land the parked
+     slice 1), then M0146-0229a (Q74 executor recon) and its filed
+     sub-tasks — ahead of the next S9 pass.
    - Held: M0146-0010a, M0146-0035 `[!]`.
    - History — the M0145 chain narrative, M0146-internal ordering
      decisions through 2026-10-14 (0005/0006 sequencing, 0049 re-open,
@@ -345,6 +348,21 @@ OWNER DECISIONS 2026-10-19 — TPC-DS corpus reload + PG statistics import:
   `tpcds-sf025-regression.sh load-goopg` now imports the same way.
 - P0-E8 (concurrent CTE resolution race) placed at item 0 — found while
   verifying the reload; pre-existing (fails at e91816974 too).
+
+OWNER DECISIONS 2026-10-19 (b) — M0146-0229 slice 1 un-parked:
+- The f1695a907 escalation is resolved by landing slice 1 (Merge Append /
+  Incremental Sort, a port of PG's generate_orderedappend_paths /
+  create_ordered_paths). Rationale: without it goopg would have to reach
+  PG's plans by different logic. Q74's plan is PG-identical and its
+  runtime is unchanged by the slice (543 s vs 522 s); host timings are
+  unreliable at present (owner-side load outside WSL2).
+- Gate amendment: `scripts/tpcds-fireset-status.py` reads an
+  owner-maintained allowlist, `scripts/tpcds-fireset-timeout-allow.tsv`
+  (harness-protected). Row: tpcds-sf1 Q74, expires 2026-11-30. An
+  allowed introduced timeout is reported, not failed. Provisional.
+- Placement: M0146-0229 (resume slice 1), then **M0146-0229a** — the
+  executor-layer recon of Q74's runtime, and whatever impl sub-tasks it
+  files — rank inside item 3 ahead of the next S9 pass.
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -4319,6 +4337,23 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - 2026\-10\-19: the blocked\-on M0146\-0216 gate is CLEARED by the owner reload \(index geometry ±2 pages, PG
     statistics imported\)\. Q64 still diverges at BOTH scales on the reloaded corpora — resume slice 3 \(GEQO tour
     worths\) against them\.
+  - **Slice 3 LANDED 2026\-10\-19: tour\-by\-tour worths against PG\.** Design §7; evidence
+    `analysis/m0146/m0146\-0214/slice3/`\.
+    - Probes: `GOOPG_GEQO_TRACE` / `GOOPG_GEQO_TRACE_EVAL` in geqo\.go and the matching geqo\_eval\.c / geqo\_main\.c
+      probe in the tmp/pgdbg build \(patch in the evidence dir\)\. Both engines evaluate 500 tours; the first 252
+      are identical tours in identical order\.
+    - No tour's worth matched PG \(commonest \+0\.1\): Q64's cs\_ui, an inlined CTE over a grouped HAVING query,
+      paid cpu\_tuple\_cost at the CTEScan, Project and Filter, and its HAVING was unpriced\. Fixed:
+      HAVING priced inside the Aggregate \(cost\_agg's quals arm\), inlined CTEScan peeled like a SubqueryScan, Filter
+      projection\-capable over a capable child\. 45 of 252 tours now match PG exactly\.
+    - Routed: the \+0\.0103 class is customer\_demographics\_pkey's one extra index page \(M0146\-0216\); the large
+      classes start at a `<>` join estimate \(1536640 vs 1536621\), eqjoinsel's missing MCV arm → **M0146\-0230**\.
+    - Q64 unchanged at depth 5 \(13889\.69 vs PG 13874\.27\)\. Pins: TestHavingIsPricedInsideTheAggregate,
+      TestInlinedCTELeafPricesCostSubqueryscanOnce \(mutation\-checked\); TestExplainLimitClampsToInputRows now pins
+      PG's own Limit lines\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99
+      \(14 plans changed text\), tpcds\-fireset PASS \(29 fired results byte\-identical; parity 97/94 held\)\.
+    - Next: M0146\-0230, then re\-run the tour comparison \(`analysis/m0146/m0146\-0214/slice3/trace/joincmp\.sh`\)\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -4929,7 +4964,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - Slice 3 plan \(done — see the slice 3 bullet above\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
     customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
     \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.
-- [!] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
+- [ ] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
   UNION ALL's ordered GroupAggregates; goopg fully Sorts a plain Append** \(filed 2026\-10\-19 by the S9 pass at
   4906691d7\)\.
   Kind: impl
@@ -4969,3 +5004,52 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Dropped from the slice and ledgered: pricing set\-op members through their Projects flips the PG\-oracle pin
       TestParameterisedAppendOverUnionAll\.
     - Next slice after the unblock: the branch row estimate \(design §5\)\.
+  - **UN\-PARKED 2026\-10\-19 by the owner \(OWNER DECISIONS 2026\-10\-19 \(b\)\): land slice 1\.** It ports PG's
+    generate\_orderedappend\_paths / create\_ordered\_paths logic; withholding it would leave goopg reaching PG's
+    plans by different logic\. Q74's runtime is not a rejection reason \(S9 \(5\)\(a\)\), and host timings are
+    unreliable at present \(owner\-side load outside WSL2\)\. The tpcds\-fireset gate now tolerates an
+    introduced SF1 Q74 timeout through the owner allowlist `scripts/tpcds\-fireset\-timeout\-allow\.tsv`
+    \(expires 2026\-11\-30\)\. Resume: `git apply analysis/m0146/m0146\-0229/slice1\-ordered\-mergeappend\.patch`,
+    re\-run the gates, commit\. Then M0146\-0229a\.
+- [ ] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
+  optimisation for its shape, or a goopg executor slowdown?** \(filed 2026\-10\-19 by the owner; placed in banner
+  item 3 directly after M0146\-0229 slice 1\)\.
+  Kind: recon
+  Parent: M0146\-0229
+  - Why: Q74's plan MATCHes PG \(text\-identical, costs stripped\), so the runtime gap is executor\-side\. It sits
+    on the 600 s FIRESET\_TIMEOUT and is provisionally allowlisted there; the allowlist row expires 2026\-11\-30\.
+  - Shape: the `year\_total` CTE \(UNION ALL of store\_sales and web\_sales grouped by customer and year\), scanned
+    four times in a self\-join, then ORDER BY \+ LIMIT 100\.
+  - Owner evidence 2026\-10\-19: **PG 18\.3 itself runs SF1 Q74 in 897 s** under EXPLAIN \(ANALYZE, BUFFERS\) on :65438
+    \(`analysis/m0146/m0146\-0229/q74\-timing/pg\-sf1\-q74\-explain\-analyze\.txt`; ANALYZE adds per\-node timing
+    overhead\)\. The time is in PG's own plan: the CTE Scans are estimated at rows=1 \(actual 37708 / 38252 / 11256 /
+    11153\), so three nested loops rescan the CTE tuplestore 37708 × 38252 times; the CTE build itself is ~3\.4 s\.
+    goopg's 520\-560 s for the same plan is not slower than PG, so check first whether the recon reduces to "PG is
+    equally slow" \(compare plain\-execution runtimes on an idle host, and node by node\) before looking for a
+    mechanism\. PG's CTE Scan rescan reads its tuplestore in memory per loop \(nodeCtescan\.c CteScanRecheck /
+    tuplestore\_rescan\); compare goopg's per\-rescan cost there\.
+  - Method: EXPLAIN \(ANALYZE, BUFFERS\) on both engines on the reloaded SF1 corpus \(goopg on a private clone under
+    the cgroup cap, PG read\-only on :65438\); per\-node actual time and rows side by side\. Find the dominant
+    nodes, then attribute each gap: \(a\) a PG executor mechanism goopg lacks for this shape \(e\.g\. CTE Scan
+    tuplestore reading, HashAggregate / hash join batching and spilling, JIT is off on both, parallel workers in
+    the CTE, Memoize, tuple deform\); or \(b\) a goopg\-side cost \(per\-row allocation, datum copying,
+    numeric arithmetic, CTE re\-materialisation, GC under GOMEMLIMIT\)\. Profile goopg with pprof / perf on the clone\.
+    Host timings are unreliable at present: compare node ratios and CPU profiles, not wall clock alone\.
+  - Deliverable: findings in the design doc\. For EACH mechanism found, file an impl sub\-task
+    \(M0146\-0229b, \-0229c, …; `Parent: M0146\-0229`\) citing the PG executor code it ports or the goopg hot path it
+    removes, with expected instrument = SF1 Q74 runtime \(and the fire\-set allowlist row retired when Q74 clears
+    600 s with margin\)\. If nothing is found, close with `Movement: none — recon` and the evidence\.
+- [ ] **M0146\-0230 — join estimates: port eqjoinsel\_inner's MCV arm \(and neqjoinsel over it\); goopg estimates every
+  equality / `<>` join from ndistinct alone** \(filed 2026\-10\-19 by M0146\-0214 slice 3\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF0\.25 Q64, join\-order, SHAPE\-DIFF at depth 5\. Tour\-by\-tour against PG, the first large worth
+    gap is the cd2 join under `cd1.cd_marital_status <> cd2.cd_marital_status`: goopg 1536640 rows \(1 − 1/5\), PG
+    1536621 \(1 − eqjoinsel over the MCV lists\)\. Evidence `analysis/m0146/m0146\-0214/slice3/trace/`\.
+  - PG: `eqjoinsel_inner` \(selfuncs\.c\) with both MCV lists: matchprodfreq over matched pairs; otherfreq and
+    unmatchfreq spread over the ndistinct beyond each list; selectivity = min\(totalsel1, totalsel2\)\. goopg's
+    `eqJoinSelectivityExt` \(joinselectivity\.go\) is the no\-MCV branch only \(ledger 2026\-08\-04 M0127\-P5\.6\-a\)\.
+    `catalog.ColumnStats.MCV` carries the imported lists\.
+  - First step: port the MCV branch \(value equality by column type\) behind both\-sides\-have\-MCV, keep the no\-MCV
+    branch otherwise; pin with PG's numbers for a hand\-built pair of MCV lists; then census both corpora\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match counts at both scales \(and the Q64 tour worths\)\.
