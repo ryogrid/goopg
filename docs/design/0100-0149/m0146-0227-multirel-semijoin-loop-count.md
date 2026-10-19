@@ -1,6 +1,6 @@
 # M0146-0227 — TPC-DS SF0.25 Q69: semijoin loop count over a multi-relation RHS
 
-Status: slice 1 landed 2026-10-19; the task stays open for the anti-join order (§4). Filed by the S9 pass at
+Status: landed 2026-10-19 (slice 1, the semijoin loop count; slice 2, join_collapse_limit over pulled sublinks). Filed by the S9 pass at
 18d2c73b0 (`analysis/m0146/m0146-0014/routing-20261019c/`). Evidence: `analysis/m0146/m0146-0227/`.
 
 ## 1. Record
@@ -53,7 +53,7 @@ Census `analysis/m0146/m0146-0227/census/` (m27):
   probes in those queries now carry PG's loop count.
 - Fire set: 5 fired results, all byte-identical.
 
-## 4. Slice 2 diagnosis: join_collapse_limit over the pulled sublinks (in progress)
+## 4. Slice 2: join_collapse_limit over the pulled sublinks
 
 With the EXISTS leg at PG's cost, goopg's Q69 costs 43444.91 against PG's 43130.36 and keeps a Nested Loop Anti Join
 on web_sales at the top.
@@ -82,12 +82,38 @@ The cause is `join_collapse_limit`, not join legality:
 - goopg appends every pulled body's leaves to one flat joinlist (`jointreepullup.go`, the `ctx.joinlist` append) and
   searches a nine-relation problem.
 
-Attempted fix: fold each top-level pulled body with `combineJoinlists(jointype, false, joinlist, bodyLeaves,
-join_collapse_limit)`. The patch is saved at `tmp/m0227/slice2-collapse-fold-wip.patch`; it is not committed.
+The fix has three parts.
 
-- It splits Q69 exactly as PG does.
-- It panics in createPlan: "search root does not publish binding coordinate(s) [153 160 187 193 195]".
-- A sub-problem leaf that holds pulled (non-emitting) semi/anti leaves does not publish the binding coordinates the
-  enclosing tree reads.
-- Next: make the sub-problem leaf publication account for pulled leaves (createplanroot.go boundaryMap, the
-  sub-problem leaf's output layout), then re-apply the fold.
+- **Fold.** `foldPulledBodyLeaves` (jointreepullup.go) appends each top-level pulled body's leaves through
+  `combineJoinlists(jointype, false, joinlist, bodyLeaves, join_collapse_limit)`, in conjunct order.
+  `deconstruct_recurse` does the same over the nested JoinExprs. Nested pull-ups (a body's own sublinks) keep the
+  flat append.
+- **Publication.** Item 1 (catalog_sales + date_dim) is wholly the RHS of the anti join, but its inner quals read
+  five of its coordinates, so the root hole-filler refused them. The fold had panicked with "search root does not
+  publish binding coordinate(s) [153 160 187 193 195]". `searchOneProblem` (relfromjoinlist.go) now treats an item
+  lying wholly inside a SEMI/ANTI join's syntactic RHS like c11's synthetic semi/anti leaf: the join never
+  projects RHS columns, so nothing above reads them.
+- **Join-var statistics.** Once catalog_sales sat inside a sub-problem leaf, the top anti join's clause
+  `c_customer_sk = cs_ship_customer_sk` lost the column's statistics: the leaf is table-less. Its rows halved to 46
+  against PG's 91. PG's `examine_variable` reaches the base rel through `find_base_rel(varno)` whatever joinrel the
+  Var is read from. A sub-problem leaf now carries `subproblemBaseVars` (table, tuples, rows per base relation,
+  nested entries merged, beside `subproblemBaseRows`), and `examineJoinVar` resolves such a Var to its base
+  relation.
+
+On the SF0.25 PG-statistics clone, Q69 now prints PG's tree (`q69-pgstats-clone.txt`). The top Hash Right Anti Join
+costs 32212.04..43146.66 against PG's 32200.20..43130.36, both at 91 rows, and the differ reports MATCH.
+
+Pins: `TestPulledSublinksFoldUnderJoinCollapseLimit` and `TestSubproblemLeafVarKeepsBaseRelStats`, both
+mutation-checked. The publication change is exercised end to end: without it Q69 panics in createPlan.
+
+## 5. Measured (slice 2)
+
+Census `analysis/m0146/m0146-0227/census2/` (m27b):
+
+- Shipped SF1 PLAN-PARITY 81→82 (Q69 MATCH); CATEGORIES-EXCL-MATCH qual-placement 4→3, join-order 15→14.
+- PG-statistics SF0.25 96→97 (Q69 MATCH).
+- Shipped SF0.25 stays at 92/99. Q69's first divergence moves from depth 3 to depth 4 (PG Nested Loop Inner |
+  goopg Nested Loop Left Anti). It matches under PG statistics, so the residual is statistics-driven and routes to
+  the owner's stats import (M0146-0215).
+- TPC-H 22/22.
+- Q69 is the only plan whose text changed, at both scales. Fire set: both fired results byte-identical.

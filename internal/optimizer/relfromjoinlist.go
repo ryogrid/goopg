@@ -641,12 +641,17 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// M0146-0222: the base relations' rows, for the enclosing problem's
 	// get_loop_count (baseRelInfo.subproblemBaseRows).
 	baseRows := map[int16]float64{}
+	baseVars := map[int16]subproblemBaseVar{}
 	for i, info := range infos {
 		if rel := s.findRel(RelSet(1) << uint(i)); rel != nil && info.sourceIdx >= 0 && info.table != nil {
 			baseRows[info.sourceIdx] = rel.Rows
+			baseVars[info.sourceIdx] = subproblemBaseVar{table: info.table, tuples: float64(info.baseRows), rows: rel.Rows}
 		}
 		for k, v := range info.subproblemBaseRows {
 			baseRows[k] = v
+		}
+		for k, v := range info.subproblemBaseVars {
+			baseVars[k] = v
 		}
 	}
 	s.rootCheapestTotal = prob.rootCheapestTotal
@@ -795,6 +800,22 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	// M0146-0227: an item that lies wholly inside a SEMI/ANTI join's syntactic
+	// RHS — a join_collapse_limit sub-problem made of pulled sublink leaves, the
+	// third NOT EXISTS of TPC-DS Q69 — is the same case as c11's synthetic leaf
+	// below: the join never projects its RHS columns, so nothing above the root
+	// reads that item's coordinates, even the ones its own inner quals read.
+	semiAntiRHSItem := make([]bool, len(items))
+	for i := range items {
+		bit := RelSet(1) << uint(i)
+		for _, sj := range sjis {
+			if sj != nil && (sj.Jointype == parser.JoinSemi || sj.Jointype == parser.JoinAnti) &&
+				sj.SynRighthand&bit != 0 {
+				semiAntiRHSItem[i] = true
+				break
+			}
+		}
+	}
 	fill := func(coord int) (SchemaColumn, bool) {
 		for i := range items {
 			sp := itemSpans[i]
@@ -818,7 +839,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 			// even be unknown here). Checked before neededColsKnown
 			// because that gate exists for the OTHER leaf kinds, where
 			// "unknown" must fail closed.
-			if infos[i].isSemiAntiSyntheticLeaf {
+			if infos[i].isSemiAntiSyntheticLeaf || semiAntiRHSItem[i] {
 				return col, true
 			}
 			if !prob.neededColsKnown {
@@ -871,7 +892,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// the built node by `initialRelRows` — the pathlist-and-rows collapse
 		// this boundary performs (file header; ledgered).
 		binding: rangeBinding{offset: base},
-		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows},
+		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows, subproblemBaseVars: baseVars},
 		lo:      lo,
 		hi:      hi,
 		// R21 slice 1: the chosen path's parent rel — the search's own

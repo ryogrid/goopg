@@ -171,6 +171,22 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 			j := bits.TrailingZeros32(uint32(relids))
 			if j < len(s.relInfos) {
 				info := &s.relInfos[j]
+				// M0146-0227: a Var of a base relation inside a searched
+				// sub-problem leaf is still that relation's Var to
+				// examine_variable (find_base_rel), with its statistics,
+				// tuples and rows — not the sub-problem's.
+				if bv, found := info.subproblemBaseVars[cr.SourceTableIdx]; found && bv.table != nil {
+					for _, c := range bv.table.Columns {
+						if c.Name == cr.Name {
+							v.typeName = c.Type.Name
+							break
+						}
+					}
+					v.tuples = bv.tuples
+					v.rows = bv.rows
+					v.stats = columnStatsByName(bv.table, cr.Name)
+					return v
+				}
 				// M0146-0009e: vardata->rel = find_base_rel(varno) is
 				// unconditional for a Var operand, so the leaf's own row
 				// estimates stand in even when no column statistics

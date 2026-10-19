@@ -4752,10 +4752,11 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestFilterRowsRoundLikeClampRowEst, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS=99 \(11 plans
       changed\), tpcds\-fireset PASS \(25 fired results byte\-identical\)\.
-- [ ] **M0146\-0227 — join\-method: TPC\-DS SF0\.25 Q69 — PG anti\-joins catalog\_sales on top with a Hash Right Anti
+- [x] **M0146\-0227 — join\-method: TPC\-DS SF0\.25 Q69 — PG anti\-joins catalog\_sales on top with a Hash Right Anti
   Join; goopg puts a Nested Loop Anti Join with a Join Filter on web\_sales there** \(filed 2026\-10\-19 by the S9 pass
   at 18d2c73b0\)\.
   Kind: impl
+  Movement: yes — SF1 match 81→82 \(Q69\), PG\-statistics SF0\.25 match 96→97 \(Q69\); CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 4→3
   Parent: M0146-0014
   - Record: TPC\-DS SF0\.25 Q69, category join\-method, verdict SHAPE\-DIFF at depth 3 \(under Sort: PG Hash Right Anti
     Join \| goopg Nested Loop Anti Join\)\. Persists under PG statistics\. Census
@@ -4788,3 +4789,13 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Fold patch `tmp/m0227/slice2\-collapse\-fold\-wip\.patch` splits Q69 like PG but panics: a sub\-problem
       holding pulled leaves does not publish the binding coordinates the enclosing tree reads \(createplanroot\.go
       boundaryMap\)\. Next: fix that publication, then re\-apply the fold\.
+  - **Slice 2 LANDED 2026\-10\-19\.** Design §4/§5; evidence `analysis/m0146/m0146\-0227/census2/`\.
+    - foldPulledBodyLeaves folds pulled sublink bodies under join\_collapse\_limit \(deconstruct\_recurse\)\.
+    - The root filler licenses an item wholly inside a SEMI/ANTI RHS \(c11's rule for synthetic leaves\)\.
+    - A sub\-problem leaf carries subproblemBaseVars, so a join Var inside it keeps its base relation's statistics
+      \(examine\_variable / find\_base\_rel\); Q69's top anti join is back at PG's 91 rows\.
+    - Q69 MATCHes PG under PG statistics at SF0\.25 and on the shipped SF1 corpus\. The shipped SF0\.25 residual
+      \(depth 4\) is statistics\-driven and routes to the M0146\-0215 import\.
+    - Pins: TestPulledSublinksFoldUnderJoinCollapseLimit, TestSubproblemLeafVarKeepsBaseRelStats, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(Q69 changed\),
+      tpcds\-fireset PASS \(2 fired results byte\-identical\)\.

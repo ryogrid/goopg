@@ -1020,6 +1020,13 @@ type baseRelInfo struct {
 	// base relation's own rows for a probe parameterized by one of its
 	// columns (M0146-0222). Nil for any other leaf.
 	subproblemBaseRows map[int16]float64
+	// subproblemBaseVars is the rest of examine_variable's vardata for a Var
+	// of a base relation inside a searched sub-problem leaf (M0146-0227):
+	// find_base_rel(varno) still reaches the base rel through the joinrel,
+	// so the Var keeps its relation's statistics, tuples and rows. Keyed like
+	// subproblemBaseRows; nested sub-problems' entries are merged in. Nil for
+	// any other leaf.
+	subproblemBaseVars map[int16]subproblemBaseVar
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
@@ -2578,6 +2585,15 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 // group estimator works in: at least one row, otherwise rounded to an integer.
 // (Upstream's `rint` breaks ties to even and Go's `math.Round` away from zero;
 // that differs only on an exact .5 and never by more than one row.)
+// subproblemBaseVar is one base relation inside a sub-problem leaf, as
+// examine_variable sees it: the relation's table (for its pg_statistic), its
+// tuples and its restricted rows.
+type subproblemBaseVar struct {
+	table  *catalog.Table
+	tuples float64
+	rows   float64
+}
+
 func clampRowEstF(rows float64) float64 {
 	if math.IsNaN(rows) || rows <= 1 {
 		return 1

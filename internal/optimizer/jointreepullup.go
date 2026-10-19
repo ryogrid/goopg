@@ -278,12 +278,17 @@ func pullUpSublinksIntoJointree(pred Expr, ctx *resolveContext, cat catalog.Cata
 	}
 	pu.base = ctx.joinlist.nrels()
 	pos := pu.base
-	for _, pb := range pu.bodies {
-		for range pb.leafScans {
-			ctx.joinlist = append(ctx.joinlist, leafItem(pos))
-			pos++
-		}
-	}
+	// M0146-0227 slice 2: pull_up_sublinks nests each converted sublink's
+	// JoinExpr over the previous one (j->larg = *jtlink; *jtlink = j), and
+	// deconstruct_recurse folds every such (larg, rarg) pair the way it folds an
+	// explicit JOIN: concatenated while both sides fit join_collapse_limit,
+	// otherwise two members of the enclosing problem. TPC-DS Q69's third sublink
+	// meets 7 + 2 relations, over the limit of 8, so PG plans the first seven as
+	// a sub-problem and joins catalog_sales last; goopg searched all nine flat
+	// and anti-joined catalog_sales before web_sales. Nested pull-ups (a body's
+	// own sublinks) keep the flat append: their JoinExprs sit inside the parent
+	// body's rarg, which this fold does not model.
+	ctx.joinlist, pos = foldPulledBodyLeaves(ctx.joinlist, pos, pu.bodies, defaultCollapseLimits().joinCollapseLimit)
 	pu.nLeaves = pos - pu.base
 	return pu
 }
@@ -1715,4 +1720,32 @@ func outerOperandAsLevel1(operand Expr) (Expr, bool) {
 		return nil, false
 	}
 	return out, true
+}
+
+// foldPulledBodyLeaves appends each pulled body's leaves, numbered from pos,
+// to jl the way deconstruct_recurse folds the JoinExpr pull_up_sublinks built
+// for it (see the call site): combineJoinlists under join_collapse_limit, in
+// conjunct order. A nested pull-up keeps the flat append. Returns the new
+// joinlist and the next leaf position.
+func foldPulledBodyLeaves(jl joinlist, pos int, bodies []*jtPulledBody, joinLimit int) (joinlist, int) {
+	nested := false
+	for _, pb := range bodies {
+		if pb.parent != nil || len(pb.largChildren) > 0 {
+			nested = true
+			break
+		}
+	}
+	for _, pb := range bodies {
+		right := make(joinlist, 0, len(pb.leafScans))
+		for range pb.leafScans {
+			right = append(right, leafItem(pos))
+			pos++
+		}
+		if nested {
+			jl = append(jl, right...)
+			continue
+		}
+		jl = combineJoinlists(pb.jointype, false, jl, right, joinLimit)
+	}
+	return jl, pos
 }
