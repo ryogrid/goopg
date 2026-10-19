@@ -4910,7 +4910,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - Slice 3 plan \(done — see the slice 3 bullet above\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
     customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
     \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.
-- [ ] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
+- [!] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
   UNION ALL's ordered GroupAggregates; goopg fully Sorts a plain Append** \(filed 2026\-10\-19 by the S9 pass at
   4906691d7\)\.
   Kind: impl
@@ -4930,3 +4930,23 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     exist, compare costs with PG's\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus and 94→95 under PG
     statistics\.
+  - Note 2026\-10\-19: the owner's corpus reload \(95c0d0474\) made the shipped SF1 corpus carry PG statistics; the
+    record stands there \(SF1 94/99; Q23 still depth 1 sort\-strategy\)\. Expected instrument now SF1 match 94→95\.
+  - **Slice 1 PARKED 2026\-10\-19 — ESCALATED `[!]` on the tpcds\-fireset gate \(S9 \(5\)\(a\)\)\.** Design
+    `docs/design/0100\-0149/m0146\-0229\-ordered\-append\-incremental\-sort\.md` §3/§4; patch
+    `analysis/m0146/m0146\-0229/slice1\-ordered\-mergeappend\.patch` \(applies clean on a6636f6fc\+95c0d0474\)\.
+    - The slice: addOrderedAppendPaths offers generate\_orderedappend\_paths' Merge Append to the ordered stage, as\-is
+      or under an Incremental Sort; costSetOp's streaming arm adds cost\_append's per\-row overhead\. Three pins,
+      mutation\-checked\.
+    - Q23 does not flip yet: PG's arm is generated \(72528\.97\.\.72546\.65\) but the bounded full Sort costs 72545\.45,
+      because goopg's branches estimate 226 rows against PG's 299 \(semi join against the best\_ss\_customer CTE\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24 MATCH\), sf025 PASS=99 all PASS\.
+      tpcds\-fireset FAILs twice on an introduced SF1 Q74 TIMEOUT\. Q74's plan is text\-identical \(costs stripped\)
+      and MATCHes PG; all other fired results are byte\-identical; direct timing on fresh clones is 543 s \(baseline\)
+      vs 522 s \(candidate\), outputs identical \(`analysis/m0146/m0146\-0229/q74\-timing/`\)\. Q74 straddles the
+      600 s FIRESET\_TIMEOUT\.
+    - Owner ask: a Q74 timeout pin, a raised FIRESET\_TIMEOUT, or a gate\-exceptions row\. Resume: `git apply` the
+      patch, re\-run the gates, commit\.
+    - Dropped from the slice and ledgered: pricing set\-op members through their Projects flips the PG\-oracle pin
+      TestParameterisedAppendOverUnionAll\.
+    - Next slice after the unblock: the branch row estimate \(design §5\)\.
