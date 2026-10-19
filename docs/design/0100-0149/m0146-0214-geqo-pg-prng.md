@@ -1,10 +1,19 @@
 # M0146-0214 — GEQO runs on PG's pg_prng and pg_qsort
 
-Status: slices 1 (2026-10-16) and 3 (2026-10-19) landed; open. GEQO's random walk reproduces PG 18.3's draw for
-draw. TPC-DS Q64, the GEQO-RNG record, still diverges: from `sort_pool` on, the walk follows tour fitness (path
-cost). Slice 2 (§6) attributed that to physical inputs; the owner's 2026-10-19 reload cleared them to within an
-index page or two. Slice 3 (§7) compared all 500 tours against PG, fixed the subquery-leaf cost class, and routed
-the rest: the join-estimate class to M0146-0230 (eqjoinsel's MCV arm) and the last index pages to M0146-0216.
+Status: slices 1 (2026-10-16), 3 and 4 (2026-10-19) landed; open. GEQO's random walk reproduces PG 18.3's draw for
+draw.
+
+- **SF1 Q64 MATCHes PG since slice 4.** SF0.25 Q64 still diverges: from `sort_pool` on, the walk follows tour fitness
+  (path cost).
+- **Slice 2 (§6)** attributed that to physical inputs. The owner's 2026-10-19 reload cleared them to within an index
+  page or two.
+- **Slices 3 (§7) and 4 (§8)** compared tours against PG and fixed four costing and estimating classes:
+  - the subquery-leaf cost;
+  - the eqjoinsel MCV arm (M0146-0230);
+  - merge clauses matched to outer pathkeys through equivalence classes;
+  - hash\_inner\_and\_outer's cheapest-startup outer.
+- **Remaining classes:** Gather Merge over partial paths on GEQO joinrels for cartesian tours, and the last index
+  pages (M0146-0216).
 
 ## 1. The record
 
@@ -153,3 +162,47 @@ Findings:
 - Gates: units, TestPort\_RegressSuite, tpch-spotcheck, the acceptance arm (values identical), and the sf025 sweep
   (PASS=99, 14 plans changed text) all pass. tpcds-fireset passes: SF0.25 97/99 and SF1 94/99 unchanged, and all 29
   fired results are byte-identical.
+
+## 8. Slice 4 (2026-10-19): merge clauses by equivalence class, and the cheapest-startup outer for hash joins
+
+Tour-by-tour against PG again, after M0146-0230 put the join estimates on eqjoinsel's MCV branch. The tooling is §7's;
+the PG probe now also prints each join's input paths and MergePath's sort and materialize flags. Evidence:
+`analysis/m0146/m0146-0214/slice4/`.
+
+- **Merge clauses match outer pathkeys by class.** In tour 2 the first gap was a merge join with `item` at equal
+  rows. PG's inner is the presorted index scan on item\_pkey: 18896.82..106969.50, no sort.
+  - goopg never built that candidate, so it sorted a seq scan instead (20675.72..106647.34). Its
+    findMergeClausesForOuterPathkeys matched the outer's pathkeys to the clauses by expression.
+  - The outer nested loop is ordered on `cs_ui.cs_item_sk`, while the clause reads `ss_item_sk = i_item_sk`. PG
+    compares EquivalenceClasses (`pk_eclass` against the clause's EC), and both columns are members of one class that
+    the outer rel enforces.
+  - Fix: after the exact expression match, indexOfEquivalentOuterKey asks the outer path's rel (`equivalentWithin`).
+    Both callers change: the serial arm and the partial twin.
+  - Tour 2 now matches PG at every join, to within the one-page index residual (6 × 10⁻⁶).
+- **hash\_inner\_and\_outer tries the cheapest-startup outer.** In tour 12, PG's hash join (19412.99..109340.49) is
+  over the outer rel's cheapest-STARTUP path, a fast-start nested loop.
+  - PG tries `cheapest_startup_outer × cheapest_total_inner` first, then the cheapest-total pairs (joinpath.c). When
+    the totals tie within add\_path's fuzz, the fast-start join survives.
+  - goopg built the total-total pair only. addHashJoinPath now files PG's candidate set in PG's order:
+    - a unique-ified outer gets its cheapest-total only;
+    - a unique-ified inner gets the cheapest-total outer, then the cheapest-startup outer;
+    - otherwise the cheapest-startup outer goes first, then the cheapest-total pair unless it is the same.
+  - Tour 12 now matches at every join.
+- **Pins:** TestFindMergeClausesForOuterPathkeys\_MatchesThroughTheOuterClass and
+  TestAddHashJoinPath\_TriesTheCheapestStartupOuter, both mutation-checked.
+- **Result:**
+  - The first 252 tours: 155 within 10⁻⁶ relative of PG's worth, 26 beyond 10⁻⁴.
+  - SF1 Q64 MATCHes PG: SF1 PLAN-PARITY 94 → 95. CATEGORIES-EXCL-MATCH SF1 join-order 4 → 3, scan-type 4 → 3,
+    qual-placement 2 → 1.
+  - SF0.25 Q64 still diverges at depth 5.
+- **Remaining classes in the SF0.25 tours:**
+  - Gather Merge over a partial path on an intermediate GEQO joinrel. In tour 14's 397M-row cartesian join, PG's
+    cheapest path is a Gather Merge (1003.38..6.42 × 10⁹) where goopg has a serial nested loop (1.98 × 10¹⁰). It
+    comes from merge\_clump's generate\_useful\_gather\_paths. These tours have worths around 10¹⁰, but the pool's
+    ordering among them still steers selection.
+  - customer\_demographics\_pkey's one extra index page (5269 against PG's 5268), amplified by parameterised probes
+    (tour 21: +0.31 over 540607 loops). That is M0146-0216.
+- **Gates:**
+  - units, TestPort\_RegressSuite, tpch-spotcheck and the acceptance arm (values identical) pass.
+  - The sf025 sweep is PASS=99, with one plan changed.
+  - tpcds-fireset passes: Q64 fired at both scales and its results are byte-identical.

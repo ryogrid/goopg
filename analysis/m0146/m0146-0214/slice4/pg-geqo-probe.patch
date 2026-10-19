@@ -1,0 +1,125 @@
+--- postgres/src/backend/optimizer/geqo/geqo_eval.c	2026-07-16 19:03:45.149196531 +0900
++++ tmp/pgdbg/src/src/backend/optimizer/geqo/geqo_eval.c	2026-10-19 21:10:25.244145103 +0900
+@@ -21,6 +21,8 @@
+ 
+ #include "postgres.h"
+ 
++#include "lib/stringinfo.h"
++
+ #include <float.h>
+ #include <limits.h>
+ #include <math.h>
+@@ -53,9 +55,57 @@
+  * If no legal join order can be extracted from the proposed tour,
+  * returns DBL_MAX.
+  */
++/* M0146-0214 slice 3 probe: trace the join rels of one evaluation. */
++int			geqo_probe_seq = 0;
++static bool geqo_probe_this = false;
++
++static void
++geqo_probe_join(RelOptInfo *joinrel)
++{
++	Path	   *p = joinrel->cheapest_total_path;
++	const char *outer = "-", *inner = "-";
++
++	if (!geqo_probe_this || p == NULL)
++		return;
++	if (IsA(p, NestPath) || IsA(p, MergePath) || IsA(p, HashPath))
++	{
++		JoinPath   *jp = (JoinPath *) p;
++
++		outer = bmsToString(jp->outerjoinpath->parent->relids);
++		inner = bmsToString(jp->innerjoinpath->parent->relids);
++	}
++	elog(LOG, "GEQOJOIN relids=%s rows=%.0f type=%d startup=%.6f total=%.6f outer=%s inner=%s",
++		 bmsToString(joinrel->relids), joinrel->rows, (int) p->pathtype,
++		 p->startup_cost, p->total_cost, outer, inner);
++	if (IsA(p, NestPath) || IsA(p, MergePath) || IsA(p, HashPath))
++	{
++		JoinPath   *jp = (JoinPath *) p;
++		Path	   *op = jp->outerjoinpath,
++				   *ip = jp->innerjoinpath;
++
++		elog(LOG, "GEQOJOINKIDS outer=%d:%.6f..%.6f:r%.0f:pk%d inner=%d:%.6f..%.6f:r%.0f:pk%d",
++			 (int) op->pathtype, op->startup_cost, op->total_cost, op->rows, list_length(op->pathkeys),
++			 (int) ip->pathtype, ip->startup_cost, ip->total_cost, ip->rows, list_length(ip->pathkeys));
++		if (IsA(p, MergePath))
++		{
++			MergePath  *mp = (MergePath *) p;
++
++			elog(LOG, "GEQOMERGE clauses=%d outersort=%d innersort=%d materialize=%d skipmark=%d presorted_outer=%d",
++				 list_length(mp->path_mergeclauses), list_length(mp->outersortkeys), list_length(mp->innersortkeys),
++				 (int) mp->materialize_inner, (int) mp->skip_mark_restore, mp->outer_presorted_keys);
++		}
++	}
++}
++
+ Cost
+ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
+ {
++	{
++		const char *want = getenv("GEQO_TRACE_EVAL");
++
++		geqo_probe_this = (want != NULL && atoi(want) == geqo_probe_seq);
++		geqo_probe_seq++;
++	}
+ 	MemoryContext mycontext;
+ 	MemoryContext oldcxt;
+ 	RelOptInfo *joinrel;
+@@ -117,6 +167,17 @@
+ 	else
+ 		fitness = DBL_MAX;
+ 
++	/* M0146-0214 slice 3 probe: every evaluated tour and its worth. */
++	{
++		StringInfoData buf;
++
++		initStringInfo(&buf);
++		for (int gi = 0; gi < num_gene; gi++)
++			appendStringInfo(&buf, "%d ", (int) tour[gi]);
++		elog(LOG, "GEQOEVAL tour=%s worth=%.6f", buf.data, fitness);
++		pfree(buf.data);
++	}
++
+ 	/*
+ 	 * Restore join_rel_list to its former state, and put back original
+ 	 * hashtable if any.
+@@ -278,6 +339,7 @@
+ 
+ 				/* Find and save the cheapest paths for this joinrel */
+ 				set_cheapest(joinrel);
++				geqo_probe_join(joinrel);
+ 
+ 				/* Absorb new clump into old */
+ 				old_clump->joinrel = joinrel;
+--- postgres/src/backend/optimizer/geqo/geqo_main.c	2026-07-16 19:03:45.149196531 +0900
++++ tmp/pgdbg/src/src/backend/optimizer/geqo/geqo_main.c	2026-10-19 17:54:16.870559137 +0900
+@@ -105,6 +105,27 @@
+ /* initialize private number generator */
+ 	geqo_set_seed(root, Geqo_seed);
+ 
++	/* M0146-0214 slice 3 probe: the initial rels, in gene order. */
++	{
++		int			gi = 0;
++		ListCell   *lc;
++
++		extern int	geqo_probe_seq;
++
++		geqo_probe_seq = 0;
++		elog(LOG, "GEQOSTART nrels=%d", number_of_rels);
++		foreach(lc, initial_rels)
++		{
++			RelOptInfo *r = (RelOptInfo *) lfirst(lc);
++
++			elog(LOG, "GEQOREL gene=%d relids=%s rows=%.0f type=%d startup=%.6f total=%.6f width=%d", ++gi, bmsToString(r->relids), r->rows,
++				 r->cheapest_total_path ? (int) r->cheapest_total_path->pathtype : -1,
++				 r->cheapest_total_path ? r->cheapest_total_path->startup_cost : -1,
++				 r->cheapest_total_path ? r->cheapest_total_path->total_cost : -1,
++				 r->reltarget->width);
++		}
++	}
++
+ /* set GA parameters */
+ 	pool_size = gimme_pool_size(number_of_rels);
+ 	number_generations = gimme_number_generations(pool_size);

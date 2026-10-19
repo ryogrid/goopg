@@ -4357,6 +4357,22 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - 2026\-10\-19: M0146\-0230 landed \(MCV join estimates\)\. Tour 2's first gap is now a merge\-join COST at equal rows
     \(Q64 join with item, 939 rows: goopg 20675\.72\.\.106647\.34 vs PG 18896\.82\.\.106969\.50\) — next slice: compare
     cost\_mergejoin's terms \(outer sort over 1\.5M rows, inner sort, mergejoin rescan\) with PG on that join\.
+  - **Slice 4 LANDED 2026\-10\-19 — SF1 Q64 MATCHes PG \(SF1 PLAN\-PARITY 94→95\)\.** Design §8; evidence
+    `analysis/m0146/m0146\-0214/slice4/`\.
+    - Tour 2's merge gap was not cost_mergejoin: goopg never built PG's presorted\-index\-inner merge, because
+      findMergeClausesForOuterPathkeys matched outer pathkeys to clauses by expression\. PG compares
+      EquivalenceClasses; the outer \(ordered on cs\_ui\.cs\_item\_sk\) serves the clause on ss\_item\_sk via the
+      class the outer enforces\. Fixed \(indexOfEquivalentOuterKey, serial and partial callers\)\.
+    - Tour 12: hash\_inner\_and\_outer tries the cheapest\-STARTUP outer first; goopg built total\-total only\. Fixed
+      \(addHashJoinPath files PG's candidate set in PG's order\)\.
+    - 155/252 tours within 1e\-6 of PG; SF0\.25 Q64 still depth 5\. Remaining: Gather Merge over partial paths on
+      intermediate GEQO joinrels \(tour 14 cartesian\), and customer\_demographics\_pkey's \+1 page \(M0146\-0216\)\.
+    - Pins: TestFindMergeClausesForOuterPathkeys\_MatchesThroughTheOuterClass, TestAddHashJoinPath\_
+      TriesTheCheapestStartupOuter \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS
+      \(Q64 fired at both scales, byte\-identical\)\.
+    - Next slice: compare the GEQO\-joinrel partial / Gather Merge paths with PG on tour 14's join 6
+      \(\(b 1 3 7 9 10 11 12 16\): PG Gather Merge 1003\.38\.\.6\.42e9, goopg serial NL 1\.98e10\)\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.

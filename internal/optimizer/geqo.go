@@ -425,6 +425,23 @@ func geqoProbeJoin(joinrel *RelOptInfo) {
 	}
 	fmt.Fprintf(os.Stderr, "GEQOJOIN relids=%s rows=%.0f kind=%d startup=%.6f total=%.6f outer=%s inner=%s\n",
 		bms(joinrel.Relids), joinrel.Rows, p.Kind, p.Cost.Startup, p.Cost.Total, outer, inner)
+	// The input paths, one level down and their own inputs: an explicit Sort or
+	// Material shows as a child path here, where PG's MergePath records it as
+	// outersortkeys / innersortkeys / materialize_inner.
+	var kid func(c *Path, depth int) string
+	kid = func(c *Path, depth int) string {
+		if c == nil {
+			return "-"
+		}
+		out := fmt.Sprintf("%d:%.6f..%.6f:r%.0f:pk%d", c.Kind, c.Cost.Startup, c.Cost.Total, c.Rows, len(c.Pathkeys))
+		if depth < 1 && (c.Kind == PathSort || c.Kind == PathMaterial || c.Kind == PathIncrementalSort) && len(c.Children) == 1 {
+			out += "[" + kid(c.Children[0], depth+1) + "]"
+		}
+		return out
+	}
+	if len(p.Children) == 2 {
+		fmt.Fprintf(os.Stderr, "GEQOJOINKIDS outer=%s inner=%s\n", kid(p.Children[0], 0), kid(p.Children[1], 0))
+	}
 }
 
 func geqoEvalTour(s *searchCtx, tour []Gene, numGene int, probe bool) float64 {
