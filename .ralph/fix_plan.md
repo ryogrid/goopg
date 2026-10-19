@@ -4246,6 +4246,8 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Control: PG 18\.3 restored with `pg\_dump \-\-statistics` \(the reference's exact stats\) but freshly built
       indexes picks a THIRD Q64 plan \(14022\.76 vs 13874\.27\)\. plancat\.c reads index pages, tree height and
       heap blocks physically\. So Q64 needs physical parity first; resume this task after M0146\-0216\.
+  - 2026\-10\-19 \(M0146\-0226, c65fb3855\): shipped SF1 Q64 now MATCHes PG; the Filter row rounding moved it\.
+    SF0\.25 Q64 still diverges at depth 5 \(join\-order\), so this task's gate is unchanged\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
