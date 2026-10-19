@@ -148,7 +148,12 @@ func EstimateRows(n Node) int64 {
 		if child <= 0 {
 			return 0
 		}
-		return scaleByFloat(child, filterSelectivity(x))
+		// M0146-0226: set_baserel_size_estimates sizes a restricted rel as
+		// clamp_row_est(tuples * selectivity), which ROUNDS (rint). Truncating
+		// here sized TPC-DS Q4's year_total scans at 29 / 9 rows where PG says
+		// 30 / 10 (1194684 x 0.005^2 = 29.87). applyLocalFilterSelectivity, the
+		// search seam's sibling sizing, already rounds.
+		return saturateRowEst(clampRowEst(float64(child) * filterSelectivity(x)))
 	case *Limit:
 		child := limitInputRows(x.Child)
 		if child <= 0 {

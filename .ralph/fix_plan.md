@@ -4722,10 +4722,11 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestWindowFunctionKeepsNeededSet, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS \(10 plans
       changed\), tpcds\-fireset PASS \(20 fired results byte\-identical\)\.
-- [ ] **M0146\-0226 — sort\-strategy: TPC\-DS SF0\.25 Q4 — PG finishes with an Incremental Sort over a merge\-joined
+- [x] **M0146\-0226 — sort\-strategy: TPC\-DS SF0\.25 Q4 — PG finishes with an Incremental Sort over a merge\-joined
   pair of sorted CTE scans; goopg nested\-loops unsorted CTE scans under a full Sort** \(filed 2026\-10\-19 by the S9
   pass at fe64139d5\)\.
   Kind: impl
+  Movement: yes — SF0\.25 match 91→92 \(Q4\), SF1 match 80→81 \(Q64\); CATEGORIES\-EXCL\-MATCH SF0\.25 sort\-strategy 4→3
   Parent: M0146-0014
   - Record: TPC\-DS SF0\.25 Q4, category sort\-strategy, verdict SHAPE\-DIFF at depth 1 \(under Limit: PG Incremental
     Sort \| goopg Sort\)\. Persists under PG statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261019b/`\.
@@ -4738,3 +4739,14 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     clauselist\_selectivity\) and the HashAggregate cost gap \(cost\_agg AGG\_HASHED\); then check whether the merge
     join \+ Incremental Sort arm is generated \(instrument addPath\) and at what cost\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q4\), 91→92 on the shipped corpus\.
+  - **LANDED 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0226\-filter\-rows\-clamp\-row\-est\.md`; evidence
+    `analysis/m0146/m0146\-0226/`\.
+    - The CTE scans already cost PG's numbers; only their rows differed\. A trace showed PG's exact selectivities
+      \(2\.5e\-5, 8\.33e\-6\); EstimateRows\(\*Filter\) truncated 29\.87→29 and 9\.96→9 where clamp\_row\_est rounds\.
+    - Fix: the Filter arm uses clampRowEst \(rint\), like its sibling applyLocalFilterSelectivity\. The legacy
+      join\-fallback scaleByFloat callers are untouched \(ledger\)\.
+    - Eleven SF0\.25 plans change text through rows rounded up; SF1 Q64 also matches now \(M0146\-0214's record\)\.
+    - Open \(ledger\): the year\_total HashAggregate cost gap; the display\-path CTE scan qual cost\.
+    - Pin: TestFilterRowsRoundLikeClampRowEst, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS=99 \(11 plans
+      changed\), tpcds\-fireset PASS \(25 fired results byte\-identical\)\.
