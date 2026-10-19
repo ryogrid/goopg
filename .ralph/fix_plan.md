@@ -5024,6 +5024,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     \(`analysis/m0146/m0146\-0229/q74\-timing/pg\-sf1\-q74\-explain\-analyze\.txt`; ANALYZE adds per\-node timing
     overhead\)\. The time is in PG's own plan: the CTE Scans are estimated at rows=1 \(actual 37708 / 38252 / 11256 /
     11153\), so three nested loops rescan the CTE tuplestore 37708 × 38252 times; the CTE build itself is ~3\.4 s\.
+    Plain execution \(no EXPLAIN\) on PG: **896 s**, 100 rows \(owner, 2026\-10\-19\)\.
     goopg's 520\-560 s for the same plan is not slower than PG, so check first whether the recon reduces to "PG is
     equally slow" \(compare plain\-execution runtimes on an idle host, and node by node\) before looking for a
     mechanism\. PG's CTE Scan rescan reads its tuplestore in memory per loop \(nodeCtescan\.c CteScanRecheck /
