@@ -534,15 +534,26 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	if !ok {
 		return 0, false
 	}
+	return scalarIneqSelStats(op, stats, literal, col.Type.Name, tuples)
+}
+
+// scalarIneqSelStats is rangeOpSelectivityStats' arithmetic over a bound
+// already in histogram-string form — `scalarineqsel` (selfuncs.c) given a
+// Datum, which is how mergejoinscansel calls it with the other side's range
+// endpoints (M0146-0214). ok=false when the statistics carry no measurement.
+func scalarIneqSelStats(op parser.OpCode, stats *catalog.ColumnStats, literal, typeName string, tuples float64) (float64, bool) {
+	if stats == nil || (len(stats.Histogram) < 2 && len(stats.MCV) == 0) {
+		return 0, false
+	}
 
 	// Histogram covers the non-MCV mass.
 	mcvMass := 0.0
 	mcvHits := 0.0
 	for _, mcv := range stats.MCV {
 		mcvMass += mcv.Frequency
-		if histCmp(mcv.Value, literal, col.Type.Name) >= 0 {
+		if histCmp(mcv.Value, literal, typeName) >= 0 {
 			// Need to know if this MCV value satisfies op.
-			c := histCmp(mcv.Value, literal, col.Type.Name)
+			c := histCmp(mcv.Value, literal, typeName)
 			if rangeOpMatches(op, c) {
 				mcvHits += mcv.Frequency
 			}
@@ -557,7 +568,7 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	if nonMCVMass < 0 {
 		nonMCVMass = 0
 	}
-	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name, histogramEqSel(stats, tuples))
+	histSel := histogramOpSelectivity(op, stats.Histogram, literal, typeName, histogramEqSel(stats, tuples))
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
 		return 0, true

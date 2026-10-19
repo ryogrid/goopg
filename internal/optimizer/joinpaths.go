@@ -543,7 +543,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				mergeTuplesFor := func(mc []*restrictInfo) float64 {
 					return s.mergeJoinTuples(mc, outer.Rows, inner.Rows)
 				}
-				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+				scanSelFor := func(mc []*restrictInfo) mergeScanSel {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
 				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)

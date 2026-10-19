@@ -1021,20 +1021,13 @@ func hashJoinBatchCost(cp costParams, in hashJoinInputs) (startup, run float64) 
 	return startup, run
 }
 
-// mergeJoinInitialCost is initial_cost_mergejoin (costsize.c) over inputs
-// that already carry any explicit sort: both inputs' startup, then the scanned
-// fraction of each input's run — the lower bound before
-// final_cost_mergejoin's rescan, materialisation and per-tuple CPU.
-func mergeJoinInitialCost(outer, inner Cost, outerEndSel, innerEndSel float64) Cost {
-	if outerEndSel <= 0 || outerEndSel > 1 {
-		outerEndSel = 1
-	}
-	if innerEndSel <= 0 || innerEndSel > 1 {
-		innerEndSel = 1
-	}
-	startup := outer.Startup + inner.Startup
-	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel
-	return Cost{Startup: startup, Total: startup + run}
+// mergeJoinInitialCost is initial_cost_mergejoin's workspace->total_cost
+// (costsize.c): mergeJoinWorkspace's startup and runs, with the inner's
+// scanned window as "the minimum possible inner input cost" — the lower bound
+// before final_cost_mergejoin's rescan, materialisation and per-tuple CPU.
+func mergeJoinInitialCost(outer, inner Cost, outerRows, innerRows float64, sel mergeScanSel) Cost {
+	w := mergeJoinWorkspace(outer, inner, outerRows, innerRows, sel)
+	return Cost{Startup: w.startup, Total: w.startup + w.run + w.innerRun}
 }
 
 // spillPages is `page_size` (costsize.c:6464) in goopg's width model: how many
@@ -1161,30 +1154,18 @@ type mergeInner struct {
 //   - The merge clauses cost their operators on every tuple read from
 //     either side (cost_qual_eval, not one comparison per row), and each
 //     merged tuple pays cpu_tuple_cost; the caller adds the residual quals.
-func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows, outerEndSel, innerEndSel float64, mi mergeInner) (Cost, bool) {
-	startup := outer.Startup + inner.Startup
-	if outerEndSel <= 0 || outerEndSel > 1 {
-		outerEndSel = 1
-	}
-	if innerEndSel <= 0 || innerEndSel > 1 {
-		innerEndSel = 1
-	}
-	innerPathRows := innerRows
-	if innerPathRows <= 0 {
-		innerPathRows = 1
-	}
-	outerScanRows := clampRowEst(outerRows * outerEndSel)
-	innerScanRows := clampRowEst(innerRows * innerEndSel)
-	innerRun := (inner.Total - inner.Startup) * innerEndSel
-	run := (outer.Total - outer.Startup) * outerEndSel
+func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outputRows float64, sel mergeScanSel, mi mergeInner) (Cost, bool) {
+	w := mergeJoinWorkspace(outer, inner, outerRows, innerRows, sel)
+	startup, run, innerRun := w.startup, w.run, w.innerRun
+	innerPathRows := w.innerPathRows
 
 	rescanned := 0.0
 	if !mi.skipMarkRestore {
 		rescanned = math.Max(outputRows-innerPathRows, 0)
 	}
-	rescanRatio := 1.0 + rescanned/innerScanRows
+	rescanRatio := 1.0 + rescanned/w.innerRows
 	bare := innerRun * rescanRatio
-	mat := innerRun + cp.cpuOperatorCost*innerScanRows*rescanRatio
+	mat := innerRun + cp.cpuOperatorCost*w.innerRows*rescanRatio
 	materialize := false
 	switch {
 	case mi.skipMarkRestore:
@@ -1200,9 +1181,68 @@ func mergeJoinCost(cp costParams, outer, inner Cost, outerRows, innerRows, outpu
 	} else {
 		run += bare
 	}
-	run += cp.cpuOperatorCost * mi.qualOps * (outerScanRows + innerScanRows*rescanRatio)
+	// final_cost_mergejoin: the merge quals are evaluated on every tuple
+	// compared — the skipped prefixes at startup, the scanned windows over
+	// the run.
+	startup += cp.cpuOperatorCost * mi.qualOps * (w.outerSkip + w.innerSkip*rescanRatio)
+	run += cp.cpuOperatorCost * mi.qualOps * ((w.outerRows - w.outerSkip) + (w.innerRows-w.innerSkip)*rescanRatio)
 	run += cp.cpuTupleCost * outputRows
 	return Cost{Startup: startup, Total: startup + run}, materialize
+}
+
+// mergeJoinWS is initial_cost_mergejoin's JoinCostWorkspace for goopg's
+// already-sorted inputs.
+type mergeJoinWS struct {
+	startup, run, innerRun                     float64
+	outerPathRows, innerPathRows               float64
+	outerRows, innerRows, outerSkip, innerSkip float64
+}
+
+// mergeJoinWorkspace is initial_cost_mergejoin (costsize.c) over inputs that
+// already carry any explicit sort (M0146-0214 adds the start selectivities):
+// the scan fractions become row counts — skip rows rounded with rint, scanned
+// rows clamped — and are re-derived from them ("readjust scan selectivities
+// to account for above rounding"); then each input pays its startup plus the
+// skipped prefix of its run at the join's startup, and the scanned window of
+// its run after. The inner's window is kept apart (innerRun) for the
+// rescan and materialisation decision.
+func mergeJoinWorkspace(outer, inner Cost, outerPathRows, innerPathRows float64, sel mergeScanSel) mergeJoinWS {
+	clampSel := func(v, def float64) float64 {
+		if v < 0 || v > 1 || math.IsNaN(v) {
+			return def
+		}
+		return v
+	}
+	outerStart, innerStart := clampSel(sel.outerStart, 0), clampSel(sel.innerStart, 0)
+	outerEnd, innerEnd := clampSel(sel.outerEnd, 1), clampSel(sel.innerEnd, 1)
+	if outerEnd <= 0 {
+		outerEnd = 1
+	}
+	if innerEnd <= 0 {
+		innerEnd = 1
+	}
+	// "Protect some assumptions below that rowcounts aren't zero."
+	if outerPathRows <= 0 {
+		outerPathRows = 1
+	}
+	if innerPathRows <= 0 {
+		innerPathRows = 1
+	}
+
+	w := mergeJoinWS{outerPathRows: outerPathRows, innerPathRows: innerPathRows}
+	w.outerSkip = math.RoundToEven(outerPathRows * outerStart)
+	w.innerSkip = math.RoundToEven(innerPathRows * innerStart)
+	w.outerRows = clampRowEst(outerPathRows * outerEnd)
+	w.innerRows = clampRowEst(innerPathRows * innerEnd)
+	outerStart, innerStart = w.outerSkip/outerPathRows, w.innerSkip/innerPathRows
+	outerEnd, innerEnd = w.outerRows/outerPathRows, w.innerRows/innerPathRows
+
+	outerRun := outer.Total - outer.Startup
+	innerRunAll := inner.Total - inner.Startup
+	w.startup = outer.Startup + outerRun*outerStart + inner.Startup + innerRunAll*innerStart
+	w.run = outerRun * (outerEnd - outerStart)
+	w.innerRun = innerRunAll * (innerEnd - innerStart)
+	return w
 }
 
 // mergeInnerFor assembles mergeInner for a merge candidate whose (possibly

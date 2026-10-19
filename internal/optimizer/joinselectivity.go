@@ -1349,105 +1349,164 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 	return best
 }
 
-// mergeJoinScanSel is `mergejoinscansel` (selfuncs.c) reduced to its END
-// selectivities: what FRACTION of each input a merge join actually consumes
-// before the other side's key range is exhausted. take2 P2-12.
+// mergeScanSel is what a merge join reads of each input, in the join's own
+// outer/inner orientation: the fraction scanned before the first join pair
+// (start) and the fraction scanned before the other side's range is exhausted
+// (end) — initial_cost_mergejoin's outerstartsel / outerendsel /
+// innerstartsel / innerendsel.
+type mergeScanSel struct {
+	outerStart, outerEnd, innerStart, innerEnd float64
+}
+
+// fullMergeScan is mergejoinscansel's default: read every row of both inputs.
+var fullMergeScan = mergeScanSel{outerStart: 0, outerEnd: 1, innerStart: 0, innerEnd: 1}
+
+// clauseScanSel is mergejoinscansel's result in the clause's own left/right
+// orientation.
+type clauseScanSel struct {
+	leftStart, leftEnd, rightStart, rightEnd float64
+}
+
+// mergeJoinScanSel is `cached_scansel` + `mergejoinscansel` (costsize.c,
+// selfuncs.c) for a merge join's FIRST merge clause — the leading sort column,
+// which alone decides where each scan can start and stop (take2 P2-12; start
+// fractions M0146-0214).
 //
-// A merge join over `a.k = b.k` stops as soon as one side passes the other's
-// maximum key. When the two ranges overlap only partly — a fact-table scan
-// joined to a filtered dimension, say — a large share of the bigger input is
-// never read, and goopg charged a FULL pass over both.
+// A merge join over `a.k = b.k` skips each input's rows below the other
+// side's minimum before the first pair is found, and stops as soon as one
+// side passes the other's maximum. initial_cost_mergejoin charges the skipped
+// prefix to startup and the scanned window to the run; the unread suffix is
+// never charged.
 //
-// PG's start selectivities (the "skip to the first match" half) are NOT
-// implemented here and both are reported as 0. They are the smaller term, and
-// they model a seek goopg's merge does not perform: it consumes from the
-// beginning of each sorted input. Reporting 0 makes the omission a no-op rather
-// than an approximation.
-//
-// Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
-// side's range cannot be established. That is the safe direction: this term can
-// only ever REDUCE a merge join's cost, so an unknown must not.
-//
-// P6-08 (take3 08 §9): the two end selectivities are memoised on the clause,
-// which is upstream's own arrangement — `mergejoinscansel`'s callers go through
-// `cached_scansel` (costsize.c:3798), whose `MergeScanSelCache` list hangs off
-// the `RestrictInfo`. The reason is the same in both planners: the estimate is
-// re-asked once per merge path considered, the histogram walk behind it is the
-// single most expensive thing in the join search on a statistics-bearing
-// catalog (measured: `histCmp` 43.7% of planning CPU over TPC-H before this
-// cache), and its answer moves with none of what varies between those calls.
-//
-// The memo is stored in the clause's OWN left/right orientation and rotated at
-// return, so both directions of a commuted join share one computation. That is
-// sound because the underlying question is symmetric: the pair
-// (fraction of left at or below right's max, fraction of right at or below
-// left's max) is a property of the clause, and which member is the "outer" end
-// is decided entirely by `outerRelids` here at the return.
-func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
+// P6-08 (take3 08 §9): the estimate is memoised on the clause, which is
+// upstream's own arrangement — `cached_scansel`'s `MergeScanSelCache` list
+// hangs off the `RestrictInfo` — because it is re-asked once per merge path
+// considered and the histogram walk behind it dominated planning CPU
+// (`histCmp` 43.7% over TPC-H before the cache). The memo is stored in the
+// clause's own orientation and rotated here: the question is symmetric, and
+// which member is the outer is decided by `outerRelids` at the return.
+func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) mergeScanSel {
 	if len(clauses) == 0 {
-		return 1, 1
+		return fullMergeScan
 	}
-	// PG keys the estimate on the FIRST merge clause: it is the leading sort
-	// column, and it alone determines when the scan can stop.
 	ri := clauses[0]
 	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
-		return 1, 1
+		return fullMergeScan
 	}
-	// Which operand is on the outer side of THIS join. The left operand wins
-	// when it qualifies, exactly as the pre-cache swap did.
 	leftIsOuter := relsSubset(ri.leftRelids, outerRelids)
 	if !leftIsOuter && !relsSubset(ri.rightRelids, outerRelids) {
-		return 1, 1
+		return fullMergeScan
 	}
-	leftEnd, rightEnd := s.mergeScanSelForClause(ri)
+	c := s.mergeScanSelForClause(ri)
 	if leftIsOuter {
-		return leftEnd, rightEnd
+		return mergeScanSel{outerStart: c.leftStart, outerEnd: c.leftEnd, innerStart: c.rightStart, innerEnd: c.rightEnd}
 	}
-	return rightEnd, leftEnd
+	return mergeScanSel{outerStart: c.rightStart, outerEnd: c.rightEnd, innerStart: c.leftStart, innerEnd: c.leftEnd}
 }
 
-// mergeScanSelForClause is `mergeJoinScanSel`'s body in the clause's own
-// orientation: (fraction of the LEFT operand at or below the right operand's
-// maximum, fraction of the RIGHT operand at or below the left's). Memoised on
-// the `restrictInfo` — PG's `MergeScanSelCache` — under the cache contract
-// documented on that struct.
-func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) (leftEnd, rightEnd float64) {
+// mergeScanSelForClause is `mergejoinscansel` (selfuncs.c) in the clause's own
+// orientation, for goopg's one merge ordering (ascending, nulls last):
+//
+//   - each side's range comes from get_variable_range (histogram endpoints,
+//     widened by the MCV extremes);
+//   - leftend = scalarineqsel(left <= right max), rightend likewise; only the
+//     smaller end is believed and the other reset to 1 (both, when equal);
+//   - leftstart = scalarineqsel(left < right min), rightstart likewise; only
+//     the larger start is believed and the other reset to 0 (both, when equal);
+//   - a DEFAULT_INEQ_SEL answer is not believed, and start >= end is
+//     disbelieved as (0, 1).
+//
+// The nulls-first adjustment does not arise: goopg's merge sorts nulls last.
+// Any side without a range keeps the defaults (0, 1) for both.
+func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) clauseScanSel {
 	if ri.scanSelValid {
-		return ri.scanSelLeftEnd, ri.scanSelRightEnd
+		return ri.scanSel
 	}
-	leftEnd, rightEnd = 1, 1
+	out := clauseScanSel{leftStart: 0, leftEnd: 1, rightStart: 0, rightEnd: 1}
 	lv := s.examineJoinVar(ri.leftKey, ri.leftRelids)
 	rv := s.examineJoinVar(ri.rightKey, ri.rightRelids)
-	lMax, lOK := histogramMax(lv.stats)
-	rMax, rOK := histogramMax(rv.stats)
+	lMin, lMax, lOK := variableRange(lv.stats, lv.typeName)
+	rMin, rMax, rOK := variableRange(rv.stats, rv.typeName)
 	if lOK && rOK {
-		// The outer is scanned until it passes the INNER's maximum, and vice
-		// versa: `leftend = scalarineqsel(left <= right_max)`.
-		leftEnd = clampSelectivity(fractionAtMost(lv.stats, rMax, lv.typeName))
-		rightEnd = clampSelectivity(fractionAtMost(rv.stats, lMax, rv.typeName))
+		believe := func(op parser.OpCode, v joinVarStats, bound string, def float64) float64 {
+			if sel, ok := scalarIneqSelStats(op, v.stats, bound, v.typeName, v.tuples); ok && sel != defaultIneqSelectivity {
+				return sel
+			}
+			return def
+		}
+		out.leftEnd = believe(parser.OpLe, lv, rMax, 1)
+		out.rightEnd = believe(parser.OpLe, rv, lMax, 1)
+		switch {
+		case out.leftEnd > out.rightEnd:
+			out.leftEnd = 1
+		case out.leftEnd < out.rightEnd:
+			out.rightEnd = 1
+		default:
+			out.leftEnd, out.rightEnd = 1, 1
+		}
+		out.leftStart = believe(parser.OpLt, lv, rMin, 0)
+		out.rightStart = believe(parser.OpLt, rv, lMin, 0)
+		switch {
+		case out.leftStart < out.rightStart:
+			out.leftStart = 0
+		case out.leftStart > out.rightStart:
+			out.rightStart = 0
+		default:
+			out.leftStart, out.rightStart = 0, 0
+		}
+		if out.leftStart >= out.leftEnd {
+			out.leftStart, out.leftEnd = 0, 1
+		}
+		if out.rightStart >= out.rightEnd {
+			out.rightStart, out.rightEnd = 0, 1
+		}
 	}
 	if s != nil {
-		ri.scanSelLeftEnd, ri.scanSelRightEnd, ri.scanSelValid = leftEnd, rightEnd, true
+		ri.scanSel, ri.scanSelValid = out, true
 	}
-	return leftEnd, rightEnd
+	return out
 }
 
-// histogramMax is `get_variable_range`'s upper bound: the last histogram
-// boundary, which ANALYZE stores in ascending order.
-func histogramMax(cs *catalog.ColumnStats) (string, bool) {
-	if cs == nil || len(cs.Histogram) == 0 {
-		return "", false
+// variableRange is `get_variable_range` (selfuncs.c): the histogram's first
+// and last bounds, widened by the most common values — "needed even if we
+// also have a histogram, since the histogram excludes the MCVs". With no
+// histogram the MCVs are trusted only when they (with the nulls) cover the
+// whole table to within roundoff.
+func variableRange(cs *catalog.ColumnStats, typeName string) (min, max string, ok bool) {
+	if cs == nil || typeName == "" {
+		// No type means histCmp would compare byte-wise, which misorders
+		// every numeric column. Refuse rather than guess.
+		return "", "", false
 	}
-	return cs.Histogram[len(cs.Histogram)-1], true
+	if len(cs.Histogram) > 0 {
+		min, max, ok = cs.Histogram[0], cs.Histogram[len(cs.Histogram)-1], true
+	}
+	if len(cs.MCV) == 0 {
+		return min, max, ok
+	}
+	useMCVs := ok
+	if !ok {
+		sum := cs.NullFrac
+		for _, m := range cs.MCV {
+			sum += m.Frequency
+		}
+		useMCVs = sum > 0.99999
+	}
+	if !useMCVs {
+		return min, max, ok
+	}
+	for _, m := range cs.MCV {
+		if !ok {
+			min, max, ok = m.Value, m.Value, true
+			continue
+		}
+		if histCmp(m.Value, min, typeName) < 0 {
+			min = m.Value
+		}
+		if histCmp(m.Value, max, typeName) > 0 {
+			max = m.Value
+		}
+	}
+	return min, max, ok
 }
 
-// fractionAtMost is `scalarineqsel(<=)` over the column's histogram: the share
-// of the column at or below `bound`.
-func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
-	if cs == nil || len(cs.Histogram) < 2 || typeName == "" {
-		// No type means histCmp would compare byte-wise, which misorders every
-		// numeric column. Refuse rather than guess.
-		return 1
-	}
-	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName, histogramEqSel(cs, 0))
-}

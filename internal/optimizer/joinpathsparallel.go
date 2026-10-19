@@ -315,7 +315,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey,
 	mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
-	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, innerOverride *Path) {
+	scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, innerOverride *Path) {
 
 	// Same mode gate as the hash twin: the only reader of a partial path
 	// is `generateUsefulGatherPaths`, and under `off` producing buys
@@ -417,7 +417,7 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool,
 	site string,
 	resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo,
-	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64),
+	mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel,
 	paramSrc RelSet) {
 
 	if o == nil || i == nil {
@@ -494,11 +494,11 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)
 	mergeTuples := mergeTuplesFor(mergeClauses) / divisor
-	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	scanSel := scanSelFor(mergeClauses)
 	// try_partial_mergejoin_path's add_partial_path_precheck on the initial
 	// cost (M0146-0231).
 	if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableMergeJoin, o, i),
-		mergeJoinInitialCost(o.Cost, i.Cost, outerEndSel, innerEndSel).Total, buildJoinPathkeysFor(joinrel, jt, resultKeys)) {
+		mergeJoinInitialCost(o.Cost, i.Cost, o.Rows, i.Rows, scanSel).Total, buildJoinPathkeysFor(joinrel, jt, resultKeys)) {
 		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M11b", "precheck jt="+traceJoinTypeName(jt))
 		return
 	}
@@ -506,7 +506,7 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// (costParallelSeqscan divides it); the inner's are the WHOLE inner,
 	// read complete by every worker — the same asymmetry the hash twin
 	// implements and `final_cost_mergejoin` prices.
-	cost, matInner := mergeJoinCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, mergeTuples, outerEndSel, innerEndSel,
+	cost, matInner := mergeJoinCost(cp, o.Cost, i.Cost, o.Rows, i.Rows, mergeTuples, scanSel,
 		mergeInnerFor(i, i.Kind == PathSort, jt, innerUnique, mergeClauses, residual))
 	if matInner && i.Kind != PathSort {
 		i = mergeMaterialInner(i, cp)

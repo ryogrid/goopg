@@ -237,7 +237,7 @@ func mergeInnerSortKeys(groups []mergeKeyGroup, outerKeys []PathKey, outer RelSe
 // subtree). The base order is therefore the clause order, which is stable and
 // deterministic; the heuristic is a ranking of paths that all get generated
 // anyway, so its absence costs a tie-break, not a path. Ledgered.
-func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, mu mergeUnique) {
 	// "If unique-ification is requested, do it and then handle as a plain
 	// inner join" (joinpath.c:1402-1418).
 	o, i := outer.CheapestTotal, inner.CheapestTotal
@@ -336,7 +336,7 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func addMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
@@ -399,7 +399,7 @@ func buildJoinPathkeysRule(jt parser.JoinType, outerKeys []PathKey) []PathKey {
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
@@ -448,17 +448,17 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 	// goopg's inflated default, which is what made that default load-bearing.
 	// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
 	mergeTuples := mergeTuplesFor(mergeClauses)
-	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	scanSel := scanSelFor(mergeClauses)
 	// try_mergejoin_path's add_path_precheck on the initial cost
 	// (M0146-0231): a path a complete path already dominates on pathkeys and
 	// both costs is never built — parallel safety is not consulted, so a
 	// parallel-safe loser does not survive to add_path's parallel_safe rule.
-	init := mergeJoinInitialCost(op.Cost, ip.Cost, outerEndSel, innerEndSel)
+	init := mergeJoinInitialCost(op.Cost, ip.Cost, op.Rows, ip.Rows, scanSel)
 	if !addPathPrecheck(joinrel, disabledNodesFor(!cp.enableMergeJoin, op, ip), init.Startup, init.Total,
 		buildJoinPathkeysFor(joinrel, jt, resultKeys), req) {
 		return
 	}
-	cost, matInner := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, outerEndSel, innerEndSel,
+	cost, matInner := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, scanSel,
 		mergeInnerFor(ip, ip != i, jt, innerUnique, mergeClauses, residual))
 	if matInner && ip == i {
 		// create_mergejoin_plan's Material above the inner (createplan.c:4659).

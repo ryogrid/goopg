@@ -142,12 +142,13 @@ type restrictInfo struct {
 	keyPairLeftOK, keyPairRightOK   bool
 
 	// scanSel is PG's `MergeScanSelCache` (costsize.c: `cached_scansel`): the
-	// merge join's two END selectivities, held in the clause's OWN left/right
-	// orientation and rotated by `mergeJoinScanSel` for the join being costed.
-	// One entry rather than upstream's per-(opfamily, collation, strategy,
-	// nulls_first) list, because goopg's estimate reads none of those four.
-	scanSelValid                    bool
-	scanSelLeftEnd, scanSelRightEnd float64
+	// merge join's start and end selectivities, held in the clause's OWN
+	// left/right orientation and rotated by `mergeJoinScanSel` for the join
+	// being costed. One entry rather than upstream's per-(opfamily, collation,
+	// strategy, nulls_first) list: goopg's merge sorts ascending, nulls last,
+	// with the default collation, so only one key ever occurs.
+	scanSelValid bool
+	scanSel      clauseScanSel
 
 	// onlyBesideRel, when set, is the relation (a SEMI join's RHS) this
 	// clause reads columns of that no semi/anti join above it emits: the

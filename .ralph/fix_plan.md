@@ -4382,6 +4382,23 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - **M0146\-0231 landed 2026\-10\-19:** SF0\.25 Q64 MATCH; SF1 Q64 lost its match to a GEQO worth tie after tour 262
     \(design §10\)\. Next: the sub\-1% worth residuals before SF1 tour 262 \(evals 41, 90 at 0\.6–0\.75%; eval 160 at
     2\.6e\-4 is the one eval 0231 made worse\) — `analysis/m0146/m0146\-0231/evalcmp\.py` lists them\.
+  - **Slice 6 2026\-10\-20: mergejoinscansel ported in full\.** Design §11; evidence `analysis/m0146/m0146\-0214/slice6/`\.
+    - SF1 eval 41's first differing joinrel is \(b 1 9 10\): PG's merge startup carries
+      merge\_qual\_cost × inner\_skip\_rows × rescanratio \(275 × 1\.54e6 × 0\.0025 = 1056504\); goopg reported start
+      fractions as 0\.
+    - Landed: the four start/end fractions with PG's believe\-one rules, get\_variable\_range \(histogram widened by MCV
+      extremes\), and initial\_cost\_mergejoin's skip rows \(rint\) / clamped scan rows / readjusted selectivities;
+      final\_cost\_mergejoin charges the skipped prefix's merge quals at startup\. scalarineqsel's literal form is now
+      one core \(scalarIneqSelStats\) shared with the restriction path\.
+    - Measured: customer\_demographics ⋈ store\_sales merge 389569\.59\.\.485522\.14 vs PG 389569\.93\.\.485517\.46 \(was
+      389568\.55\.\.486177\.77; 4\.0 of the total gap is M0146\-0216's index page\); SF0\.25 Q77's Merge Join 3518\.29 =
+      PG \(was 3518\.30\)\. Match counts unchanged \(fire\-set SF0\.25 98, SF1 94\); SF1 Q64 tours equal to PG's stay 262\.
+    - Pins: TestMergeJoinChargesSkippedPrefixAtStartup \(mutation\-checked\), TestVariableRangeWidensByMCVExtremes\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(Q77
+      plan text changed\), tpcds\-fireset PASS \(fired Q77 byte\-identical\)\.
+    - Movement: none — parity held; merge\-join costs converge on PG numerically, no match count moved\.
+    - Remaining eval\-41 residuals → M0146\-0233 \(the cutoff clamp: 207 vs PG's 275 skipped rows\) and M0146\-0234
+      \(sort byte currency and joinrel sort width: join 2's Sort, join 9's partial merge 6\.32e10 vs PG 6\.20e10\)\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -5144,6 +5161,36 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       sf025 PASS=99 \(only Q64's plan changed; 21 s→32 s on PG's plan, same ck\), tpcds\-fireset PASS \(fired Q64/Q77
       byte\-identical\)\.
     - Residual → M0146\-0232\.
+- [ ] **M0146\-0233 — ineq\_histogram\_selectivity's cutoff clamp and get\_actual\_variable\_range** \(filed 2026\-10\-20 by
+  M0146\-0214 slice 6\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF1 Q64 GEQO eval 41, joinrel \(b 1 9 10\): store\_sales' merge start fraction is PG 9\.545e\-5 \(275
+    rows skipped\), goopg 7\.2e\-5 \(207\); startup 1446072\.92 vs 1184789\.15 with the PG sort currency\.
+  - PG \(selfuncs\.c ineq\_histogram\_selectivity\): unless the binary search touched an endpoint AND
+    get\_actual\_variable\_range found a usable btree index leading on the column \(have\_end\), the histogram
+    selectivity is clamped to \[0\.01/\(nvalues\-1\), 1 − that\]; with have\_end the endpoint is replaced by the index's
+    actual min/max\. goopg's histogramOpSelectivity applies neither \("Not ported" in its doc comment\)\.
+  - Scope: the clamp needs the column's index facts on every caller of histogramOpSelectivity \(restriction path
+    via resolveBaseColumn, OR arms, mergejoinscansel\) — sibling paths change together; the actual\-endpoint probe needs a
+    planner\-time btree first/last\-visible\-entry read\.
+  - Expected instrument: SF1 Q64 eval\-41 joinrel \(b 1 9 10\) startup = PG's; GEQO tours equal to PG's beyond 262\.
+- [ ] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
+  2026\-10\-20 by M0146\-0214 slice 6\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF1 Q64 GEQO eval 41\.
+    - Join 2 \(b 1 9 10\): goopg sorts store\_sales as a disk sort \(1190592\) where PG's is in memory \(389568\)\.
+    - Join 9: goopg's partial merge costs 6\.32e10 \(PG 6\.20e10\); the outer Sort's backed\-out width is about 664 \(PG
+      about 96\), so goopg's partial hash survives add\_partial\_path where PG's fuzz\-equal merge with better pathkeys
+      drops it\.
+  - PG \(costsize\.c cost\_tuplesort\): input\_bytes = relation\_byte\_size\(tuples, pathtarget\->width\)\. goopg prices with
+    hashsize\.EntryBytes unless GOOPG\_PG\_SORT\_RELATION\_BYTES\_COST=1 \(R113, held default\-off by M0139\-0007a on
+    2026\-09\-15 for zero measured movement\)\. With the flag, the store\_sales Sort is PG's exactly \(389568\.13\.\.396768\.01\),
+    but a joinrel's width is still unnarrowed\.
+  - First step: re\-measure R113 default\-on on the fire\-set and the SF1 Q64 eval list; then the joinrel reltarget width
+    feeding pathWidth for sort inputs\.
+  - Expected instrument: fire\-set match counts; SF1 Q64 GEQO tours equal to PG's beyond 262\.
 - [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl

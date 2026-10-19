@@ -242,3 +242,40 @@ GroupAggregate path. It also ports add\_path\_precheck and add\_partial\_path\_p
 - **What remains here** is the sub-1% worth residuals (SF1 evals 41 and 90 at about 0.6–0.75%) and
   M0146-0216's index-page residual.
 
+## 11. Slice 6 (2026-10-20): mergejoinscansel in full
+
+The first SF1 joinrel that differs on GEQO eval 41 is `(b 1 9 10)`, a merge of the `customer_demographics` cartesian
+with a sorted `store_sales`.
+
+- **What PG charges.** PG's startup includes `merge_qual_cost × inner_skip_rows × rescanratio`, which is
+  275 × 1.54 × 10⁶ × 0.0025 = 1056504. It skips the store\_sales rows below customer\_demographics' minimum, and the
+  rescan ratio is large because the outer repeats each key 1920800 times.
+- **What goopg reported.** goopg's `mergeJoinScanSel` returned only the end fractions, from the histogram's last
+  bound, so every start fraction was 0.
+- **The port** (joinselectivity.go `mergeScanSelForClause`):
+  - `get_variable_range`: the histogram endpoints, widened by the MCV extremes. MCV-only statistics are trusted only
+    when they cover the table.
+  - The end fractions are `scalarineqsel(x <= other max)`, and only the smaller one is believed. The start fractions
+    are `scalarineqsel(x < other min)`, and only the larger one is believed.
+  - Ties and default answers are disbelieved, and so is start ≥ end.
+- **The scalarineqsel core.** Its literal form is now one function (`scalarIneqSelStats`), shared with the
+  restriction path.
+- **The costing** (`mergeJoinWorkspace`):
+  - It ports initial\_cost\_mergejoin: skip rows rounded with rint, scanned rows clamped, and the selectivities
+    readjusted from those counts.
+  - Each input pays its skipped prefix at startup.
+  - final\_cost\_mergejoin's merge-qual CPU is split the same way. `mergeJoinInitialCost`, the precheck bound, reads
+    the same workspace.
+
+**Measured:**
+- customer\_demographics ⋈ store\_sales: goopg now costs 389569.59..485522.14 against PG's 389569.93..485517.46. It
+  was 389568.55..486177.77, and 4.0 of the remaining total gap is M0146-0216's index page.
+- SF0.25 Q77's Merge Join now costs 3518.29, exactly PG's.
+- No match count moved.
+
+**Remaining on eval 41:**
+- **The cutoff clamp** (M0146-0233). PG skips 275 rows where goopg skips 207, because `ineq_histogram_selectivity`
+  clamps to 0.01/(nvalues−1) whenever no index gives the actual endpoint.
+- **The sort byte currency and joinrel width** (M0146-0234). Join 2's Sort is a disk sort in goopg's EntryBytes
+  currency where PG's fits in memory. Join 9's partial-merge outer sort is priced at width ≈664 against PG's ≈96.
+
