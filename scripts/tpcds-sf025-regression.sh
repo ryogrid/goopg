@@ -29,8 +29,9 @@
 # additionally any query that errors on PG during oracle capture is excluded.
 #
 # Determinism: the goopg gate always runs S-cold (fresh server, no same-session
-# ANALYZE). goopg loses TableStats.RowCount on restart regardless (design doc
-# tpcds-round2-fixes §7.1), so S-cold is the reproducible state.
+# ANALYZE). Statistics persist across restarts (pg_statistic + size sidecar,
+# M0125-0029); since 2026-10-19 the corpus carries the PG reference's imported
+# statistics (see cmd_load_goopg), so S-cold plans from PG's exact stats.
 #
 # Known hazards this script codifies (all bitten on 2026-07-27):
 #   * sweep-tail collapse: GOGC=off + a 600 s timeout query leaves the heap at
@@ -448,14 +449,35 @@ cmd_load_goopg() {
             echo "COPY FAILED"
         fi
     done
-    # M0125-0028/-0029: ANALYZE now resolves per-DB and the per-column stats +
-    # relation size (reltuples/relpages via the goopg-private sidecar) survive
-    # a restart — the S-cold premise this gate was designed under no longer
-    # applies to a freshly loaded-and-ANALYZEd cluster.
-    log "ANALYZE + CHECKPOINT"
+    # Owner decision 2026-10-19 (M0146-0215/-0216): the shipped corpus carries
+    # the PG reference's own statistics, imported with PG 18's
+    # pg_restore_*_stats into never-analyzed tables (as pg_restore does), so
+    # the census measures planner logic rather than ANALYZE sample variance
+    # (PG seeds its sampler per process; no port reproduces its sample).
+    # VACUUM first truncates COPY's bulk-extension heap tail, as the
+    # reference's autovacuum did. Importing over a goopg ANALYZE would MERGE
+    # and leave goopg slots PG lacks, so there is no ANALYZE here. The
+    # reference unreachable -> fall back to goopg's own ANALYZE, loudly.
+    log "VACUUM + PG statistics import + CHECKPOINT"
     local t ok=0
     for t in ${TABLES}; do
-        ${GOOPG_PSQL} -c "ANALYZE ${t}" >/dev/null 2>&1 || true
+        ${GOOPG_PSQL} -c "VACUUM ${t}" >/dev/null 2>&1 || true
+    done
+    mkdir -p "${SF025_RESULTS_DIR}"
+    local stats="${SF025_RESULTS_DIR}/.pg-stats-import.sql"
+    if pg_dump --statistics-only -h "${TPCDS_HOST}" -p "${TPCDS_PG_PORT}" -U "${TPCDS_PG_USER}" \
+            -d "${SF025_PG_DB}" -f "${stats}" 2>/dev/null; then
+        local res
+        res=$(${GOOPG_PSQL} -X -q -At -f "${stats}" 2>&1)
+        log "  stats import: $(grep -c '^t$' <<<"${res}") true, $(grep -c '^f$' <<<"${res}") false, $(grep -c 'ERROR' <<<"${res}") ERROR"
+        rm -f "${stats}"
+    else
+        log "  WARNING: cannot pg_dump --statistics-only from :${TPCDS_PG_PORT}/${SF025_PG_DB} — falling back to goopg ANALYZE (NOT the shipped-corpus convention)"
+        for t in ${TABLES}; do
+            ${GOOPG_PSQL} -c "ANALYZE ${t}" >/dev/null 2>&1 || true
+        done
+    fi
+    for t in ${TABLES}; do
         if ${GOOPG_PSQL} -t -A -c "SELECT reltuples FROM pg_class WHERE relname = '${t}' AND reltuples > 0" 2>/dev/null | grep -q .; then
             ok=$((ok + 1))
         fi

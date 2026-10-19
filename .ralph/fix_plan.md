@@ -174,8 +174,13 @@ it to hold the lineage.)
   tail); **selecting** one ahead of the order above is allowed only when
   it breaks the build or a gate this banner's work needs.
 
-0. **P0 — incident recovery: DISCHARGED.** P0-E4..E7 all `[x]`
+0. **P0 — incident recovery.** P0-E4..E7 DISCHARGED `[x]`
    (2026-09-18; archive `completed_fix_plan_013.md`).
+   **P0-E8 OPEN — owner placement 2026-10-19 (S2): select FIRST.**
+   Concurrent sessions intermittently fail to resolve a CTE name
+   (`relation "x" does not exist` on a valid `WITH x AS (...) SELECT ...
+   FROM x`), wrong-error class; entry under M-NIGHTLY "Manually
+   discovered".
    `.ralph/gate-exceptions.md` stays empty — a blocked TPC-H gate is a
    failed gate (AGENT.md G1).
 1. **Regressions found by P0-E7: DISCHARGED** (drained; archive 013).
@@ -313,6 +318,34 @@ OWNER DECISIONS 2026-10-15 (c) — acceptance-arm unblock:
 - M0146-0178 de-escalated `[!]`→`[ ]`; resume = apply the parked
   slice2.patch, re-run the arm, commit.
 
+OWNER DECISIONS 2026-10-19 — TPC-DS corpus reload + PG statistics import:
+- Both shipped TPC-DS corpora (`:65436` data, `:65437` data-sf025) were
+  REBUILT on the ee18b4649 engine (insert-built indexes with the M0146-0216
+  split port) and carry the `:65438` reference's own statistics: COPY →
+  per-table VACUUM → `pg_dump --statistics-only` import into
+  never-analyzed tables (PG's import merges, so no ANALYZE first). Clears
+  the owner gates of M0146-0215 (owner-import stats), M0146-0216
+  (owner-index-refresh) and therefore M0146-0218 and M0146-0214's
+  blocked-on. Old corpora kept as `*.pre-reload-20261019`.
+- Measured (`analysis/m0146/owner-ops-20261019/`): heap relpages /
+  reltuples / relallvisible identical to the reference on every table
+  at both scales; index pages ±2; pg_stats identical except 4 wide text
+  columns (in-row thinning, ledger) and one correlation-0 rendering
+  (ledger). PLAN-PARITY on the HEAD binary: SF0.25 92 → **97/99**
+  (Q64, Q77 left), SF1 82 → **94/99** (Q13, Q23, Q64, Q72, Q77 left) —
+  identical to the loop's routing-20261019d PG-statistics clones. sf025
+  sweep PASS=99 (values); all 64 SF1 row anchors hold; EA ratchet PASS
+  (its stale clone `tmp/c20a/data-sf025` was moved aside, re-cloned).
+- This is a recorded CORPUS RELOAD for S9(1): routing artifacts before
+  2026-10-19 14:00 are stale; the next S9 pass captures fresh. The sf025
+  plan-shape channel will show large NON-BLOCKING movement on its first
+  run — expected.
+- Never ANALYZE the shipped TPC-DS corpora (it replaces the imported
+  statistics). Rebuild only via owner-only `scripts/tpcds-corpus-rebuild.sh`;
+  `tpcds-sf025-regression.sh load-goopg` now imports the same way.
+- P0-E8 (concurrent CTE resolution race) placed at item 0 — found while
+  verifying the reload; pre-existing (fails at e91816974 too).
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -412,6 +445,22 @@ heuristic stays live.)
     lead, not done: treat a probe that reports no lock wait as still running past blockProbeCap, as isolationtester does\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
+
+- [ ] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
+  \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.
+  Kind: impl
+  Parent: none
+  - Repro: `with x as (select 1 as a) select a from x;` as a pgbench script, 8 concurrent `pgbench \-c 1 \-t 50`
+    clients: some abort at `command 0 query 0` with `ERROR:  relation "x" does not exist`\. TPC\-DS query2\.sql run 4\-way
+    concurrently: 0\-6 errors per 20 runs; serial runs never fail\. Evidence:
+    `analysis/m0146/owner\-ops\-20261019/cte\-first\-statement\-race\.md`\.
+  - Pre\-existing: every tested rev of e91816974\.\.ee18b4649 fails, including e91816974\. Every observed failure is the
+    first statement of a connection\. Suspects: session\-startup / first\-plan initialisation shared across sessions;
+    package\-level planner state \(ledger 2026\-07\-29 M0125\-0003 row: no lock around planning\)\.
+  - First step: reproduce under `go test \-race` with N concurrent sessions each issuing one CTE query as its first
+    statement; find the shared state \(CTE registry / name\-resolution scope\) and make it per\-query, as PG's
+    `ParseState\.p\_ctenamespace` is\.
+  - Expected instrument: the repro at 0 errors over 20 rounds; `Movement: none — correctness fix — no plan instrument`\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4248,6 +4297,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       heap blocks physically\. So Q64 needs physical parity first; resume this task after M0146\-0216\.
   - 2026\-10\-19 \(M0146\-0226, c65fb3855\): shipped SF1 Q64 now MATCHes PG; the Filter row rounding moved it\.
     SF0\.25 Q64 still diverges at depth 5 \(join\-order\), so this task's gate is unchanged\.
+  - 2026\-10\-19: the blocked\-on M0146\-0216 gate is CLEARED by the owner reload \(index geometry ±2 pages, PG
+    statistics imported\)\. Q64 still diverges at BOTH scales on the reloaded corpora — resume slice 3 \(GEQO tour
+    worths\) against them\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -4300,6 +4352,8 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       statistics: run the `pg\_restore\_\*\_stats` section of `pg\_dump \-\-statistics \-d tpcds025` \(and
       `\-d tpcds` for SF1\) on the goopg clusters\. That replaces their ANALYZE statistics, so it is the owner's call
       \(see the escalation in the baton\)\.
+  - **2026\-10\-19: owner gate CLEARED** — both shipped corpora now carry the reference's statistics \(OWNER DECISIONS
+    2026\-10\-19\)\. SF0\.25 Q76 and Q99 MATCH on the shipped corpus; re\-measure and close with the census\.
 - [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
@@ -4354,6 +4408,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: nbtree \-race, units, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99, TestPort\_RegressSuite,
       TestPort\_Isolation\*\.
     - Shipped corpora are unchanged until they are reloaded on this engine \(owner\-index\-refresh\)\.
+  - **2026\-10\-19: owner reload DONE** \(OWNER DECISIONS 2026\-10\-19\): index pages now within ±2 of PG on every
+    table at both scales \(store\_sales\_pkey SF0\.25 2567 vs 2569; SF1 11042 vs 11041\); heap pages and relallvisible
+    identical\. Remaining: the FSM\-reuse heap\-TID residual \(ledger\)\. Re\-measure and close\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
@@ -4390,7 +4447,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: units, tpch\-spotcheck, acceptance arm \(24 MATCH on values\), sf025 PASS=99 same=99, tpcds\-fireset
       \(Q38/Q87 SF1 results byte\-identical\), TestPort\_RegressSuite\.
 Movement: none — instrument artefact — the shipped census plans from goopg's own ANALYZE sample \(SF0\.25 86/99 held; SF1 74→73, Q87 filed M0146\-0218\); the PG\-statistics clones move Q38 \(SF0\.25\) and Q87 \(SF1\) to MATCH
-- [!] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
+- [x] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
   \(filed 2026\-10\-16 by M0146\-0217 under R3\)\.
   Kind: regression
   Parent: M0146-0014
@@ -4403,6 +4460,9 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     engine\-side fix would have to make goopg's ANALYZE sample PG's rows, which M0146\-0215 slice 1 showed is not
     reproducible\.
   - Expected instrument: SF1 PLAN\-PARITY match 73→74 \(Q87\) after the import\.
+  - **Closed 2026\-10\-19 by the owner's import** \(OWNER DECISIONS 2026\-10\-19\): the reloaded SF1 corpus carries
+    the reference's statistics; Q87 MATCHes PG \(`analysis/m0146/owner\-ops\-20261019/census\-reload\-pgstats\-sf1\-diff\.txt`\)\.
+Movement: yes — SF1 PLAN\-PARITY 82→94 \(owner corpus reload \+ PG statistics import; Q87 MATCH\)
 - [x] **M0146\-0219 — aggregation\-strategy: TPC\-DS Q61 — PG plans each scalar FROM\-subquery aggregate as `Finalize
   Aggregate → Gather → Partial Aggregate`, goopg as `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at
   c2a4421fc\)\.

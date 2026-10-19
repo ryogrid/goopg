@@ -69,6 +69,13 @@ Setup / start / stop procedures:
   ~5 min) checks goopg row counts against a **git-tracked PG oracle**
   (`bench/tpcds/runtime_goopg/tpcds-results-sf025/oracle.txt`) and needs no
   PG instance.
+  **Both goopg TPC-DS corpora (`:65436`, `:65437`) were reloaded on the
+  current engine 2026-10-19 and carry the `:65438` reference's own
+  statistics** (PG 18 `pg_restore_*_stats` import into never-analyzed
+  tables; owner decision, M0146-0215/-0216). Never `ANALYZE` them — it
+  replaces the imported statistics; rebuild only via the owner-only
+  `scripts/tpcds-corpus-rebuild.sh` (README "Rebuilding the shipped
+  corpora"). Previous corpora kept as `*.pre-reload-20261019`.
 
 Row-count anchors are **load-dependent**: `bench/tpch/spotcheck_expected.env`
 (Q12/Q13) and `ci/batch/tpch-row-anchors.csv` are pinned to a specific HammerDB

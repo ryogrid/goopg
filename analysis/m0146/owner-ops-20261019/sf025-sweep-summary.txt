@@ -1,0 +1,4 @@
+
+=== SUMMARY: PASS=99 (61 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=0 ===
+# ck=n/a queries are row-count-only: a saturated LIMIT window has no stable row set.
+=== SUMMARY: PASS=99 (61 ck-verified, 38 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0 SKIP=0 ===

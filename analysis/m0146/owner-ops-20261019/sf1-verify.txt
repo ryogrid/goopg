@@ -1,0 +1,15 @@
+== row counts
+  24 tables checked
+== pg_class (relpages/reltuples/relallvisible) + physical size, tables and pkeys
+  index pages catalog_sales_pkey: goopg 5624 pg 5625 (-1)
+  index pages customer_demographics_pkey: goopg 5269 pg 5268 (+1)
+  index pages store_returns_pkey: goopg 1081 pg 1082 (-1)
+  index pages store_sales_pkey: goopg 11042 pg 11041 (+1)
+== pg_stats
+  425 pg columns, 425 goopg columns, 5 differ
+  catalog_page.cp_description: hist: g='{"A bit asleep rooms cannot feel short dry secondary leads. Ab","Achie' p='{"A bit asleep rooms cannot feel short dry secondary leads. Ab","Achie'
+  item.i_brand: hist: g='{"amalgamalgamalg #1                                ","amalgcorp #7   ' p='{"amalgamalgamalg #1                                ","amalgamalgamalg'
+  item.i_item_desc: mcv: g='{O,R,S,N,Co,In,Pr,A,Ag,C,P,T,"All ",F,Gre,H,I,Ju,Maj,Possib,The,Ver,Wo' p='{O,R,S,N,Co,In,Pr,A,Ag,C,P,T,"All ",F,Gre,H,I,Ju,Maj,Possib,The,Ver,Wo' | hist: g='{"A l","Always clear operations maintain quite economic teeth. Visitor' p='{"A l","Active effect","Again judicial colours may blame fully british'
+  item.i_manufact: hist: g='{"able                                              ","ablebarpri     ' p='{"able                                              ","ableableese    '
+  warehouse.w_suite_number: corr: g='' p='0'
+RESULT OK hard-mismatches=0 stats-diff-columns=5

@@ -79,6 +79,33 @@ scripts/tpcds-load.sh
 
 **Expect:** 25 tables loaded with row counts shown. Server can be restarted without WAL replay error.
 
+> **The shipped corpora (`:65436` `data`, `:65437` `data-sf025`) are NOT built this way
+> any more.** Since 2026-10-19 (owner decision, M0146-0215 / M0146-0216) they are loaded on
+> the current engine and carry the **PG reference's own statistics** instead of goopg's
+> ANALYZE — see "Rebuilding the shipped corpora" below. Running `ANALYZE` on them (or
+> `tpcds-load.sh`, which ANALYZEs) replaces the imported statistics; don't.
+
+### Rebuilding the shipped corpora (owner-only)
+
+`scripts/tpcds-corpus-rebuild.sh <sf025|sf1> <staging-dir> <port> [goopg-bin]` builds a
+staging data dir: `goopg init` + the shipped confs, `tpcds.sql` (keys inline, so indexes are
+insert-built like the reference's), server-side COPY from the same TSVs, per-table `VACUUM`
+(truncates COPY's bulk-extension heap tail, as the reference's autovacuum did), then — with
+no ANALYZE — the `pg_dump --statistics-only` calls of `:65438` (`tpcds025` / `tpcds`, minus the
+stray `bt` table) through `pg_restore_relation_stats` / `pg_restore_attribute_stats`. PG's
+import merges into existing statistics, so it must land on never-analyzed tables (as
+pg_restore does). `scripts/tpcds-sf025-regression.sh load-goopg` follows the same procedure.
+
+Before swapping a staging dir in, verify it against the reference: row counts, heap
+`relpages`/`reltuples`/`relallvisible` (identical), index pages (±2), and `pg_stats`
+(identical except wide text columns, which goopg's in-row `pg_statistic` thins — ledger).
+Swap only with both servers stopped, the nightly lock held
+(`~/.ralph/locks/goopg-nightly-run.lock`), and no sf025 gate / fire-set / capture /
+estimate-parity process running; keep the old dir as `<dir>.pre-reload-<date>`. Then remove
+`tmp/c20a/data-sf025` (the EA ratchet's private clone) so it re-clones.
+2026-10-19 result: SF0.25 PLAN-PARITY 92 → 97/99, SF1 82 → 94/99; sf025 sweep PASS=99;
+all 64 SF1 row anchors hold (`analysis/m0146/owner-ops-20261019/`).
+
 ### State 3 → Results: Run Queries
 
 ```bash
@@ -105,7 +132,8 @@ scripts/tpcds-run.sh 1,3,5-10
 | Script | Purpose |
 | --- | --- |
 | `tpcds-setup.sh` | Compile + generate + convert + fix (State 1→2) |
-| `tpcds-load.sh` | Schema + COPY + ANALYZE (State 2→3) |
+| `tpcds-load.sh` | Schema + COPY + ANALYZE (State 2→3) — scratch clusters only, not the shipped corpora |
+| `tpcds-corpus-rebuild.sh` | Owner-only: rebuild a shipped corpus into staging with the PG reference's statistics |
 | `tpcds-run.sh` | Execute queries + record results (State 3→results) |
 | `tpcds-bench-compare.sh` | SF=1 goopg + PG side-by-side sweep with EXPLAIN capture, per-timeout goopg restarts |
 | `tpcds-sf025-regression.sh` | **SF 0.25 fast regression gate** — see the dedicated section below |
@@ -331,8 +359,8 @@ same plan line carries the planner's *estimated* `rows=` first.
 - **Contamination guard**: refuses to run while the SF=1 sweep harness is
   active (`FORCE=1` to override).
 - **Determinism**: the gate always runs goopg **S-cold** (fresh server, no
-  same-session ANALYZE). goopg loses `TableStats.RowCount` on restart anyway
-  (design doc `tpcds-round2-fixes` §7.1), so S-cold is the reproducible state.
+  same-session ANALYZE). Statistics persist across restarts (M0125-0029), and
+  since 2026-10-19 the corpus carries the PG reference's imported statistics.
 
 ## Known limitations
 

@@ -1,0 +1,12 @@
+queries:   99   nodes scored: 259   unmatched-in-PG: 3
+bar:       qerr > max(10.0, PG_qerr * 2.0)
+FINDINGS:  0
+
+    Q       qerr    goopg est     ACTUAL     pg est    pg qerr  node                   relset
+---------------------------------------------------------------------------------------------
+
+RATCHET vs /home/ryo/work/goopg/goopg/analysis/planner-refactor-take3/c20a-estimator-census-20260922/ea-baseline.txt
+  baseline findings: 1   current: 0
+  FIXED    Q78:date_dim+store_returns+store_sales+web_returns+web_sales
+
+EA-RATCHET: PASS (1 fixed — re-pin the baseline)
