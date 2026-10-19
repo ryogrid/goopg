@@ -1,0 +1,75 @@
+=== Q76
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=39026.66..39070.79 rows=100 width=163)
+   ->  Finalize GroupAggregate  (cost=39026.66..40456.31 rows=3240 width=163)
+         Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+         ->  Gather Merge  (cost=39026.66..40214.93 rows=10044 width=163)
+               Workers Planned: 3
+               ->  Sort  (cost=38026.62..38034.72 rows=3240 width=163)
+                     Sort Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                     ->  Partial HashAggregate  (cost=37797.20..37837.70 rows=3240 width=163)
+                           Group Key: ('store'::text), ('ss_customer_sk'::text), date_dim.d_year, date_dim.d_qoy, item.i_category
+                           ->  Parallel Append  (cost=0.58..37614.25 rows=10454 width=129)
+                                 ->  Parallel Hash Join  (cost=1522.53..17999.50 rows=9931 width=129)
+                                       Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+                                       ->  Nested Loop  (cost=0.30..16451.19 rows=9931 width=18)
+                                             ->  Parallel Seq Scan on store_sales  (cost=0.00..15258.18 rows=10380 width=14)
+                                                   Filter: (ss_customer_sk IS NULL)
+                                             ->  Memoize  (cost=0.30..0.52 rows=1 width=12)
+                                                   Cache Key: store_sales.ss_sold_date_sk
+                                                   Cache Mode: logical
+                                                   ->  Index Scan using date_dim_pkey on date_dim  (cost=0.29..0.51 rows=1 width=12)
+                                                         Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                       ->  Parallel Hash  (cost=1389.88..1389.88 rows=10588 width=55)
+                                             ->  Parallel Seq Scan on item  (cost=0.00..1389.88 rows=10588 width=55)
+                                 ->  Nested Loop  (cost=0.58..13795.31 rows=509 width=129)
+                                       ->  Nested Loop  (cost=0.29..12313.97 rows=509 width=18)
+                                             ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10578.57 rows=512 width=14)
+                                                   Filter: (cs_bill_customer_sk IS NULL)
+                                             ->  Index Scan using date_dim_pkey on date_dim date_dim_1  (cost=0.29..3.39 rows=1 width=12)
+                                                   Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                       ->  Index Scan using item_pkey on item item_1  (cost=0.29..2.91 rows=1 width=55)
+                                             Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                                 ->  Nested Loop  (cost=0.58..5767.17 rows=18 width=129)
+                                       ->  Nested Loop  (cost=0.29..5622.74 rows=18 width=61)
+                                             ->  Parallel Seq Scan on web_sales  (cost=0.00..5493.82 rows=18 width=14)
+                                                   Filter: (ws_promo_sk IS NULL)
+                                             ->  Index Scan using item_pkey on item item_2  (cost=0.29..7.16 rows=1 width=55)
+                                                   Index Cond: (i_item_sk = web_sales.ws_item_sk)
+                                       ->  Index Scan using date_dim_pkey on date_dim date_dim_2  (cost=0.29..8.02 rows=1 width=12)
+                                             Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+(38 rows)
+
+=== Q99
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=13993.07..14060.85 rows=72 width=115)
+   ->  Finalize GroupAggregate  (cost=13993.07..14060.85 rows=72 width=115)
+         Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+         ->  Gather Merge  (cost=13993.07..14055.49 rows=223 width=115)
+               Workers Planned: 3
+               ->  Partial GroupAggregate  (cost=12993.03..13029.25 rows=72 width=115)
+                     Group Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+                     ->  Sort  (cost=12993.03..12994.45 rows=565 width=83)
+                           Sort Key: (substr((warehouse.w_warehouse_name)::text, 1, 20)), ship_mode.sm_type, call_center.cc_name
+                           ->  Hash Join  (cost=2074.91..12967.21 rows=565 width=83)
+                                 Hash Cond: (catalog_sales.cs_call_center_sk = call_center.cc_call_center_sk)
+                                 ->  Hash Join  (cost=2073.78..12962.13 rows=567 width=61)
+                                       Hash Cond: (catalog_sales.cs_warehouse_sk = warehouse.w_warehouse_sk)
+                                       ->  Hash Join  (cost=2072.66..12958.26 rows=570 width=47)
+                                             Hash Cond: (catalog_sales.cs_ship_mode_sk = ship_mode.sm_ship_mode_sk)
+                                             ->  Parallel Hash Join  (cost=2071.21..12954.98 rows=574 width=20)
+                                                   Hash Cond: (catalog_sales.cs_ship_date_sk = date_dim.d_date_sk)
+                                                   ->  Parallel Seq Scan on catalog_sales  (cost=0.00..10578.57 rows=116257 width=20)
+                                                   ->  Parallel Hash  (cost=2068.55..2068.55 rows=213 width=4)
+                                                         ->  Parallel Seq Scan on date_dim  (cost=0.00..2068.55 rows=213 width=4)
+                                                               Filter: ((d_month_seq >= 1194) AND (d_month_seq <= 1205))
+                                             ->  Hash  (cost=1.20..1.20 rows=20 width=35)
+                                                   ->  Seq Scan on ship_mode  (cost=0.00..1.20 rows=20 width=35)
+                                       ->  Hash  (cost=1.05..1.05 rows=5 width=22)
+                                             ->  Seq Scan on warehouse  (cost=0.00..1.05 rows=5 width=22)
+                                 ->  Hash  (cost=1.06..1.06 rows=6 width=16)
+                                       ->  Seq Scan on call_center  (cost=0.00..1.06 rows=6 width=16)
+(27 rows)
+

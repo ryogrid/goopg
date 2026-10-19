@@ -4451,7 +4451,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       TPC\-H parity 22/22, sf025 PASS=99 \(no plan\-shape change\), tpcds\-fireset PASS \(fired SF1 Q64 byte\-identical\)\.
     - Children stay open as their own tasks: M0146\-0216 \(index page\), M0146\-0232, M0146\-0233, M0146\-0234\.
   Movement: yes — SF1 match 94→95 \(Q64\)
-- [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
+- [x] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
   Kind: impl
@@ -4505,6 +4505,14 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       \(see the escalation in the baton\)\.
   - **2026\-10\-19: owner gate CLEARED** — both shipped corpora now carry the reference's statistics \(OWNER DECISIONS
     2026\-10\-19\)\. SF0\.25 Q76 and Q99 MATCH on the shipped corpus; re\-measure and close with the census\.
+  - **Closed 2026\-10\-20 \(re\-measured\)\.** Evidence `analysis/m0146/m0146\-0215/closure/` — Q76 and Q99 from the
+    d1446d972 fire\-set candidate captures \(`analysis/m0146/m0146\-0214/slice8/fireset/`\), shipped corpora with the
+    reference's imported statistics\.
+    - Q76 and Q99 MATCH at SF0\.25 and at SF1 \(first\-divergence: no structural divergence\)\.
+    - Not plan\-shape: Q76's top Limit still renders width=298 against PG's 163, and its cost is 0\.15% high
+      \(SF0\.25 39087\.41\.\.39131\.53 vs 39026\.66\.\.39070\.79\)\. EXPLAIN widths are the rendering burn\-down's
+      \(M0146\-0042\); the cost\-width currency is M0146\-0234's\.
+  Movement: yes — SF0\.25 match 86→88 \(Q76, Q99\)
 - [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
