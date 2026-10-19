@@ -4769,3 +4769,16 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     what cost\. Attribute the 251 gap on the EXISTS Nested Loop \(inner index probe into customer at 858 loops\)
     against PG's cost\_nestloop / cost\_index terms\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q69\), 92→93 on the shipped corpus\.
+  - **Slice 1 LANDED 2026\-10\-19: semijoin loop count over a multi\-relation RHS\.** Design
+    `docs/design/0100\-0149/m0146\-0227\-multirel\-semijoin\-loop\-count\.md`; evidence `analysis/m0146/m0146\-0227/`\.
+    - The EXISTS leg's customer\_pkey probe cost 0\.29\.\.0\.33 against PG's 0\.63 with identical statistics: goopg's
+      adjustRowcountForSemijoins sized only a one\-relation RHS, so the loop count stayed at store\_sales' 719876 rows
+      where PG's approximate\_joinrel\_size \+ estimate\_num\_groups give ss\_customer\_sk's 39023\.
+    - multiRelSemiRhsUniqueRows ports the multi\-relation arm; the probe now costs PG's 0\.63\.
+    - No verdict moved \(SF0\.25 92, SF1 81, TPC\-H 22\); Q10/Q35/Q69 cost\-only\.
+    - Pin: TestLoopCountClampsMultiRelSemijoinRHS, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(3 plans
+      changed\), tpcds\-fireset PASS \(5 fired results byte\-identical\)\.
+  - Next \(slice 2\): Q69 now costs 43444\.91, 314 above PG's 43130\.36, and keeps the web\_sales Nested Loop Anti Join
+    on top\. Instrument addPath on the top joinrel: is PG's catalog\_sales Hash Right Anti Join over \(… ⟕anti
+    web\_sales\) generated, and at what cost\?

@@ -40,3 +40,43 @@ func TestLoopCountClampsSemijoinRHSToUniqueRows(t *testing.T) {
 		t.Fatalf("reverse direction: loop count %v, want %v", got, probed.Rows)
 	}
 }
+
+// TestLoopCountClampsMultiRelSemijoinRHS pins M0146-0227 slice 1: a semijoin
+// RHS of SEVERAL relations is sized as adjust_rowcount_for_semijoins does —
+// nraw = approximate_joinrel_size (the plain product of the RHS rels' rows) and
+// nunique = estimate_num_groups(semi_rhs_exprs, nraw), each uniq expr sized on
+// the relation that owns it. TPC-DS Q69's EXISTS (store_sales ⋈ date_dim)
+// drives the customer probe: PG's loop count is ss_customer_sk's distinct
+// count, where goopg kept store_sales' raw rows and priced the probe at half
+// PG's cost.
+func TestLoopCountClampsMultiRelSemijoinRHS(t *testing.T) {
+	s := jslCtx(t, 3)
+	probed, ss, dd := s.findRel(rA), s.findRel(rB), s.findRel(rC)
+	ss.Rows, dd.Rows = 719876, 90
+	ss.baseLeaf = numGroupsScan("store_sales", 719876, 39023)
+	dd.baseLeaf = numGroupsScan("date_dim", 90, 90)
+	ss.baseOffset, dd.baseOffset = 10, 20
+	if got := s.loopCountFor(probed, rB); got != 719876 {
+		t.Fatalf("no semijoin: loop count %v, want store_sales' 719876 rows", got)
+	}
+	key := &ColumnRef{Index: 10, Name: "a"} // store_sales' first column, problem space
+	s.joinInfoList = []*SpecialJoinInfo{{
+		Jointype:            parser.JoinSemi,
+		SynLefthand:         rA,
+		SynRighthand:        rB | rC,
+		SemiRhsExprs:        []Expr{key},
+		SemiRhsProblemSpace: true,
+	}}
+	want := float64(estimateNumGroups([]Expr{&ColumnRef{Index: 0, Name: "a"}}, ss.baseLeaf, 719876))
+	if want != 39023 {
+		t.Fatalf("fixture: estimate_num_groups gave %v, want ss_customer_sk's 39023", want)
+	}
+	if got := s.loopCountFor(probed, rB); got != want {
+		t.Fatalf("multi-relation semijoin RHS: loop count %v, want its unique rows %v", got, want)
+	}
+	// A uniq expr outside every RHS relation's range cannot be sized: unadjusted.
+	s.joinInfoList[0].SemiRhsExprs = []Expr{&ColumnRef{Index: 99, Name: "a"}}
+	if got := s.loopCountFor(probed, rB); got != 719876 {
+		t.Fatalf("unresolvable uniq expr: loop count %v, want the raw 719876", got)
+	}
+}

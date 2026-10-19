@@ -1023,10 +1023,9 @@ func (s *searchCtx) subproblemSupplierRows(rel *RelOptInfo, outerKeys []Expr) (f
 // (indxpath.c): when outer is on the inside (syn_righthand) of a JOIN_SEMI
 // whose syn_lefthand holds cur, a parameterised path on cur can only be
 // driven by outer's unique-ified rows, so the loop count is clamped to
-// estimate_num_groups(semi_rhs_exprs) over the RHS. PG sizes a multi-rel RHS
-// with approximate_joinrel_size; goopg estimates only a single-relation RHS
-// (the RHS leaf's own node resolves the uniq exprs) and leaves the others
-// unadjusted.
+// estimate_num_groups(semi_rhs_exprs) over the RHS. A one-relation RHS
+// resolves the uniq exprs against its own leaf; a multi-relation RHS is sized
+// as approximate_joinrel_size does (M0146-0226b, below).
 func (s *searchCtx) adjustRowcountForSemijoins(cur, outer *RelOptInfo, rowcount float64) float64 {
 	if cur == nil || outer == nil {
 		return rowcount
@@ -1036,14 +1035,88 @@ func (s *searchCtx) adjustRowcountForSemijoins(cur, outer *RelOptInfo, rowcount 
 			cur.Relids&sj.SynLefthand == 0 || outer.Relids&sj.SynRighthand == 0 {
 			continue
 		}
-		if sj.SynRighthand != outer.Relids {
-			continue
+		var nunique float64
+		var ok bool
+		if sj.SynRighthand == outer.Relids {
+			nunique, ok = semiRhsUniqueRows(sj, outer)
+		} else {
+			nunique, ok = s.multiRelSemiRhsUniqueRows(sj)
 		}
-		if nunique, ok := semiRhsUniqueRows(sj, outer); ok && rowcount > nunique {
+		if ok && rowcount > nunique {
 			rowcount = nunique
 		}
 	}
 	return rowcount
+}
+
+// multiRelSemiRhsUniqueRows is adjust_rowcount_for_semijoins' estimate for a
+// semijoin RHS of several base relations (M0146-0227). PG takes
+// nraw = approximate_joinrel_size(syn_righthand), the plain PRODUCT of the
+// RHS relations' rows with no join selectivity, and
+// nunique = estimate_num_groups(semi_rhs_exprs, nraw). estimate_num_groups
+// sizes each relation's grouping vars on that relation and multiplies the
+// per-relation counts before clamping to the input rows, so each uniq expr is
+// resolved against the base relation that owns it. TPC-DS Q69's EXISTS
+// (store_sales ⋈ date_dim) drives the customer probe: PG's loop count is
+// ss_customer_sk's 39023 distinct values; goopg left it at store_sales'
+// 719876 rows and priced the probe at half PG's cost.
+//
+// The uniq exprs must be problem-space column refs, each inside one RHS
+// relation's coordinate range; anything else declines and the count stays
+// unadjusted, as before.
+func (s *searchCtx) multiRelSemiRhsUniqueRows(sj *SpecialJoinInfo) (float64, bool) {
+	if !sj.SemiRhsProblemSpace || len(sj.SemiRhsExprs) == 0 {
+		return 0, false
+	}
+	var rhs []*RelOptInfo
+	nraw := 1.0
+	for _, rel := range s.levelRels(1) {
+		if rel == nil || rel.Relids&sj.SynRighthand == 0 {
+			continue
+		}
+		if rel.baseLeaf == nil || rel.Rows <= 0 {
+			return 0, false
+		}
+		rhs = append(rhs, rel)
+		nraw *= rel.Rows
+	}
+	if len(rhs) == 0 {
+		return 0, false
+	}
+	perRel := make(map[*RelOptInfo][]Expr, len(rhs))
+	for _, e := range sj.SemiRhsExprs {
+		cr, ok := e.(*ColumnRef)
+		if !ok {
+			return 0, false
+		}
+		var owner *RelOptInfo
+		for _, rel := range rhs {
+			out := rel.baseLeaf.Output()
+			if i := cr.Index - rel.baseOffset; i >= 0 && i < len(out) && out[i].Name == cr.Name {
+				owner = rel
+				lc := *cr
+				lc.Index = i
+				perRel[rel] = append(perRel[rel], &lc)
+				break
+			}
+		}
+		if owner == nil {
+			return 0, false
+		}
+	}
+	nunique := 1.0
+	for _, rel := range rhs {
+		if exprs := perRel[rel]; len(exprs) > 0 {
+			nunique *= float64(estimateNumGroups(exprs, rel.baseLeaf, int64(rel.Rows)))
+		}
+	}
+	if nunique > nraw {
+		nunique = nraw
+	}
+	if nunique < 1 {
+		return 0, false
+	}
+	return nunique, true
 }
 
 // semiRhsUniqueRows is the estimate_num_groups(semi_rhs_exprs, nraw) half of
