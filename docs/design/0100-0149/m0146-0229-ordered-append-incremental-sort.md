@@ -1,8 +1,8 @@
 # M0146-0229 — TPC-DS SF1 Q23 statement 2: Incremental Sort over a Merge Append
 
-Status: open, escalated `[!]` on the tpcds-fireset gate (§4). Slice 1 is parked as
-`analysis/m0146/m0146-0229/slice1-ordered-mergeappend.patch`. Filed by the S9 pass at 4906691d7
-(`analysis/m0146/m0146-0014/routing-20261019e/`).
+Status: open. Slice 1 landed 2026-10-19, after the owner un-parked it (OWNER DECISIONS 2026-10-19 (b)). Q23 still
+diverges: the row estimate is the next slice (§5). M0146-0229a, the Q74 executor recon, follows. Filed by the S9 pass
+at 4906691d7 (`analysis/m0146/m0146-0014/routing-20261019e/`).
 
 ## 1. Record
 
@@ -34,7 +34,7 @@ The candidate is close on cost. On the SF1 PG-statistics clone it costs 72528.97
 The streaming UNION ALL's cost (costSetOp) also left out cost\_append's per-row overhead, cpu\_tuple\_cost *
 APPEND\_CPU\_COST\_MULTIPLIER (costsize.c:2400-2403).
 
-## 3. Slice 1 (parked): the ordered-stage Merge Append arm
+## 3. Slice 1 (landed 2026-10-19): the ordered-stage Merge Append arm
 
 `analysis/m0146/m0146-0229/slice1-ordered-mergeappend.patch`:
 
@@ -70,6 +70,22 @@ Why the Q74 timeout is not a regression:
 Per the banner's S9 (5)(a), the task does not revert or game the gate: it escalates `[!]` naming tpcds-fireset. The
 owner's options are a Q74 timeout pin, a raised FIRESET\_TIMEOUT, or a gate-exceptions row. Resume: apply the patch,
 re-run the gates, commit.
+
+### 4.1 Resolution (2026-10-19)
+
+The owner un-parked the slice. It ports PG's generate\_orderedappend\_paths / create\_ordered\_paths logic, and
+withholding it would leave goopg reaching PG's plans by other means. Q74's runtime is not a rejection reason (S9
+(5)(a)). tpcds-fireset reads an owner allow-list, `scripts/tpcds-fireset-timeout-allow.tsv`; its SF1 Q74 row expires
+2026-11-30.
+
+The patch was applied unchanged on 80fc64342 and re-gated:
+
+- units, TestPort\_RegressSuite, tpch-spotcheck and the acceptance arm pass.
+- The sf025 sweep is PASS=99.
+- tpcds-fireset passes. Q74 finished inside the timeout this run, so the allow-list was not needed. All 19 fired
+  results are byte-identical. Parity is held at SF0.25 97/99 and SF1 94/99.
+
+Evidence: `analysis/m0146/m0146-0229/fireset3/` and `accept2`.
 
 ## 5. Next slices
 

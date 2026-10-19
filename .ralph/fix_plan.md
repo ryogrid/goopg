@@ -5011,6 +5011,12 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     introduced SF1 Q74 timeout through the owner allowlist `scripts/tpcds\-fireset\-timeout\-allow\.tsv`
     \(expires 2026\-11\-30\)\. Resume: `git apply analysis/m0146/m0146\-0229/slice1\-ordered\-mergeappend\.patch`,
     re\-run the gates, commit\. Then M0146\-0229a\.
+  - **Slice 1 LANDED 2026\-10\-19** \(the parked patch applied unchanged on 80fc64342\)\. Design §3/§4\.1; evidence
+    `analysis/m0146/m0146\-0229/fireset3/`, `accept2`\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS \(Q74
+      finished inside the timeout this run, allowlist unused; 19 fired results byte\-identical; parity 97/94 held\)\.
+    - Q23 still SHAPE\-DIFF at depth 1: the Incremental Sort arm is generated but loses on goopg's 226\-row branch
+      estimate against PG's 299\. Next slice: that estimate \(design §5\)\. Then M0146\-0229a\.
 - [ ] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
   optimisation for its shape, or a goopg executor slowdown?** \(filed 2026\-10\-19 by the owner; placed in banner
   item 3 directly after M0146\-0229 slice 1\)\.

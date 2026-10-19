@@ -381,8 +381,8 @@ func TestCostSetOpIsCostAppendAndCreateSetopPath(t *testing.T) {
 	if stream.Startup != lStart {
 		t.Fatalf("streaming startup = %v, want the left branch's %v (cost_append)", stream.Startup, lStart)
 	}
-	if stream.Total != lTotal+rTotal {
-		t.Fatalf("streaming total = %v, want %v (sum of subpath totals, no per-row term)", stream.Total, lTotal+rTotal)
+	if want := lTotal + rTotal + cp.cpuTupleCost*appendCPUCostMultiplier*outRows; math.Abs(stream.Total-want) > 1e-9 {
+		t.Fatalf("streaming total = %v, want %v (sum of subpath totals plus cost_append's per-row overhead)", stream.Total, want)
 	}
 
 	buffered := costSetOp(cp, false, lStart, lTotal, lRows, rStart, rTotal, rRows, outRows, ncols)

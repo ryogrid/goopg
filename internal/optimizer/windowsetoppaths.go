@@ -649,9 +649,10 @@ func setOpStreams(n *SetOp) bool {
 // costSetOp prices one `*SetOp` node in the form its executor will run.
 //
 // STREAMING (UNION ALL) is `cost_append` (costsize.c:2250): the first
-// subpath's startup, the sum of the subpaths' totals, and no per-row term of
-// its own — an Append does no qual-checking or projection, and neither does
-// goopg's streaming arm, which forwards left then right.
+// subpath's startup, the sum of the subpaths' totals, plus cpu_tuple_cost *
+// APPEND_CPU_COST_MULTIPLIER per output row ("Although Append does not do any
+// selection or projection, it's not free", costsize.c:2400). M0146-0229 added
+// the per-row term, which this arm had left out.
 //
 // BUFFERED (everything else — UNION, INTERSECT [ALL], EXCEPT [ALL]) is
 // `create_setop_path`'s hashed arm (pathnode.c:3849): both inputs are read in
@@ -672,7 +673,7 @@ func costSetOp(cp costParams, streaming bool, leftStartup, leftTotal, leftRows,
 	rightStartup, rightTotal, rightRows, outputRows float64, numCols int) Cost {
 	_ = rightStartup
 	if streaming {
-		return Cost{Startup: leftStartup, Total: leftTotal + rightTotal}
+		return Cost{Startup: leftStartup, Total: leftTotal + rightTotal + cp.cpuTupleCost*appendCPUCostMultiplier*outputRows}
 	}
 	cmp := cp.cpuOperatorCost * (leftRows + rightRows) * float64(numCols)
 	startup := leftTotal + rightTotal + cmp
