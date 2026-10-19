@@ -1,7 +1,8 @@
 # M0146-0216 — physical-parity census and stored `pg_class.relallvisible`
 
 Status: slice 1 (census + attribution), slice 2 (stored relallvisible) and slice 3 (`_bt_findsplitloc` interval
-and penalty) landed 2026-10-16. Evidence: `analysis/m0146/m0146-0216/`.
+and penalty) landed 2026-10-16. Slice 4 (internal-page splits, §7) landed 2026-10-20. Evidence:
+`analysis/m0146/m0146-0216/`.
 
 ## 1. Census (slice 1)
 
@@ -122,3 +123,82 @@ free-space accounting discards the right page's first key; ledger row.
 
 The shipped corpora are unchanged until they are reloaded on this engine (owner action). A reload would now give
 index geometry within 2 pages of PG on every SF0.25 fact table.
+
+## 7. Slice 4 (2026-10-20): internal-page splits
+
+**Record.** After the owner's 2026-10-19 reload, customer\_demographics\_pkey is 5269 pages on both corpora against
+PG's 5268. That one page adds +4.0 to every probe of the index: the +4.0 / +4.57 offsets on SF1 Q64's joins and the
+index-only outer of the cd ⋈ store\_sales merge (M0146-0214). The table's 1920800 keys arrive in key order, so every
+split is a rightmost one. The leaf levels are identical: 5247 leaves of 367 items, plus a rightmost leaf of 398. The
+gap is the internal level. PG has 18 pages: 17 of 285 downlinks plus a high key, and a rightmost page of 403. goopg
+had 19 pages of 284.
+
+**Cause.** goopg priced an internal split with the leaf's arithmetic (`compactSplitLocFill`). `nbtsplitloc.c` and
+`nbtinsert.c` treat a non-leaf page differently in two ways:
+
+- `_bt_recsplitloc` charges the left half's new high key at the firstright tuple's size. It adds no heap-TID
+  allowance, because that is the leaf's worst case under suffix truncation. It also credits the right half with
+  the firstright tuple's key data: `rightfree += firstrightitemsz - (MAXALIGN(sizeof(IndexTupleData)) +
+  sizeof(ItemIdData))`.
+- `_bt_split` stores that credit. On an internal page the right half's first item is written key-less, as a
+  minus-infinity pivot (`newfirstdataitem`, `_bt_pgaddtup`), so it takes 8 bytes where goopg kept a 16-byte keyed
+  tuple.
+
+The interval is `INTERNAL_SPLIT_DISTANCE` (7.5%). The fill factor is `BTREE_NONLEAF_FILLFACTOR` on a rightmost page
+and an even balance elsewhere. Within the interval `_bt_bestsplitloc` takes the split with the smallest firstright
+tuple, because that tuple becomes the parent's separator (`_bt_split_penalty`). It stops at the page-wide minimum
+(`_bt_strategy`'s perfect penalty for internal pages).
+
+**Port.** `pgFindSplitLocInternal` (splitloc.go) is `_bt_findsplitloc` for a non-leaf page. It reuses `deltaSort`,
+and `defaultInterval` becomes `splitInterval` with the distance as a parameter. `insertIntoBlock` routes
+descriptor-format internal pages through it and truncates the right half's first item to `downlinkItem(nil,
+child)`. That is the same form every root's first downlink already has.
+
+**Measured.** The pkeys were replayed on clones: the same inline-key DDL, then server-side COPY from the TSVs the
+corpus loaded. On the HEAD binary the replay reproduces every shipped size exactly. INSERT … SELECT in heap order
+does not reproduce them: store\_sales gives 2578 against COPY's 2567, so a replay must use COPY.
+`slice4/replay-results.txt`:
+
+| scale | index | corpus (HEAD) | slice 4 | PG |
+|---|---|---|---|---|
+| SF0.25 | customer\_demographics\_pkey | 5269 | **5268** | 5268 |
+| SF0.25 | store\_sales\_pkey | 2567 | 2567 | 2569 |
+| SF0.25 | store\_returns / catalog\_sales | 280 / 1250 | 280 / 1250 | 280 / 1250 |
+| SF1 | customer\_demographics\_pkey | 5269 | **5268** | 5268 |
+| SF1 | store\_sales\_pkey | 11042 | 11042 | 11041 |
+| SF1 | store\_returns\_pkey | 1081 | 1081 | 1082 |
+| SF1 | catalog\_sales\_pkey | 5624 | 5624 | 5625 |
+
+**The remaining four are heap placement.** At SF1 the per-block heap row counts differ from PG's replica:
+
+- catalog\_sales: 7361 blocks differ (block 1 holds 39 rows in PG, 38 in goopg);
+- store\_returns: 689 blocks differ;
+- store\_sales: 17539 blocks differ.
+
+This is §6's mechanism at scale. PG's COPY records a page's free space in the FSM when it moves on, and later
+short tuples refill that page (`RecordAndGetPageWithFreeSpace`, hio.c). goopg fills forward. The heap TIDs differ,
+so `_bt_afternewitemoff`'s adjacency test and the leaf splits differ with them. The ledger row of 2026-10-16 owns
+this. It is the last engine mechanism between the corpora and PG's index geometry.
+
+**Pins** (`internal_split_test.go`):
+
+- `TestInsertBuiltSerialIndexMatchesPGInternalLevel` builds the 1920800-key ascending index. It checks PG's 5268
+  pages, the 17 × 285 + 403 internal level, and an 8-byte first downlink on every internal page.
+- `TestFindSplitLocInternalTakesSmallestFirstRight` has three cases. The smallest-firstright pick: 93 against the
+  balanced 89. The balanced pick once the short item leaves the interval. The 70/30 rightmost split: 127, which the
+  leaf's 8-byte allowance would move to 126.
+- Mutations fail them:
+  - Keeping the right half's first key fails the first pin (16-byte first downlinks).
+  - Ignoring the penalty, or charging the heap-TID allowance, fails the second.
+  - Reverting both halves fails the page count (5269).
+  - The 1.92M-key layout alone cannot tell the two halves apart: either saving yields the 285th downlink.
+
+**Plans.** The shipped corpora are unchanged until an owner rebuild (`scripts/tpcds-corpus-rebuild.sh`). Gates on
+them confirm no regression: sf025 sweep same=99, and the fire set fired nothing (SF1 95 / 99). A rebuild would
+remove the +4.0 customer\_demographics\_pkey offset from SF1 Q64 and SF0.25 Q77's merge.
+
+**Not changed.** The bulk loader (`bulkload.go`, CREATE INDEX on a filled table) still fills internal pages with
+its own reserve arithmetic. Upstream `_bt_buildadd` fills them to `BTREE_NONLEAF_FILLFACTOR` and truncates each new
+page's first item. No measured index here is bulk-built: both corpora and the TPC-H bench declare keys before
+loading. Ledger row.
+

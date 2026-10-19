@@ -3037,6 +3037,11 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		mid, splitOK = bt.format().pgFindSplitLoc(allItems, indexOfItem(allItems, it), pageDataBudget(), rightBudget,
 			hikey, rightmost, mult, useMult)
+	} else if !op.IsLeaf() && bt.format().tupleKeys() {
+		// _bt_findsplitloc's internal-page pricing (M0146-0216): no heap-TID
+		// allowance on the new high key, and the right half's first item
+		// shrinks to a minus-infinity pivot (below).
+		mid, splitOK = bt.format().pgFindSplitLocInternal(allItems, indexOfItem(allItems, it), pageDataBudget(), rightBudget, rightmost)
 	} else {
 		mid, splitOK = bt.format().compactSplitLocFill(allItems, pageDataBudget(), rightBudget, fillMult)
 	}
@@ -3062,6 +3067,15 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		lastLeft = leftItems[len(leftItems)-1]
 	}
 	sepKey := bt.format().truncateSeparator(lastLeft, rightItems[0])
+	if !op.IsLeaf() && bt.format().tupleKeys() {
+		// _bt_split's newfirstdataitem (_bt_pgaddtup): on an internal page
+		// the right half's first item keeps its downlink and loses its key —
+		// the separator above (the left page's new high key, which the
+		// parent downlink also carries) already says where the page starts,
+		// so the item is stored as a zero-attribute minus-infinity pivot,
+		// exactly as every root's first downlink is (M0146-0216).
+		rightItems = append([]item{downlinkItem(nil, rightItems[0].ptr.Block)}, rightItems[1:]...)
+	}
 	// _bt_check_third_page on the resulting PIVOT (3b-3d). The separator lands
 	// on this page at P_HIKEY and a copy of it lands on the parent, so it is
 	// charged the internal-level bound — the looser one, which exists exactly to

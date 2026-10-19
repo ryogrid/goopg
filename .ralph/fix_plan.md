@@ -4570,6 +4570,24 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - **2026\-10\-19: owner reload DONE** \(OWNER DECISIONS 2026\-10\-19\): index pages now within ±2 of PG on every
     table at both scales \(store\_sales\_pkey SF0\.25 2567 vs 2569; SF1 11042 vs 11041\); heap pages and relallvisible
     identical\. Remaining: the FSM\-reuse heap\-TID residual \(ledger\)\. Re\-measure and close\.
+  - **Slice 4 LANDED 2026\-10\-20 \(loop \#29\): internal\-page splits\.** Design §7; evidence
+    `analysis/m0146/m0146\-0216/slice4/`\.
+    - Record: customer\_demographics\_pkey 5269 vs PG 5268 on both corpora \(\+4\.0 per probe; SF1 Q64, SF0\.25 Q77\)\.
+      Leaves identical; the internal level is 19 pages of 284 against PG's 17 of 285 plus a rightmost 403\.
+    - Cause: internal splits used the leaf pricing\. \_bt\_recsplitloc's non\-leaf arm charges no heap\-TID allowance and
+      credits the right half with the firstright key, which \_bt\_split stores as a minus\-infinity first item\.
+      Ported as pgFindSplitLocInternal \(INTERNAL\_SPLIT\_DISTANCE, smallest\-firstright penalty\) plus the truncation\.
+    - Measured \(COPY replay on clones; HEAD reproduces every shipped size\): customer\_demographics\_pkey
+      5269→**5268** at both scales\. Unchanged: SF0\.25 store\_sales 2567 \(PG 2569\); SF1 store\_sales 11042
+      \(11041\), store\_returns 1081 \(1082\), catalog\_sales 5624 \(5625\)\. Those four ride heap placement: 7361 /
+      689 / 17539 SF1 heap blocks hold a different row count than PG's \(the FSM\-reuse ledger row\)\.
+    - Pins: TestInsertBuiltSerialIndexMatchesPGInternalLevel and TestFindSplitLocInternalTakesSmallestFirstRight,
+      mutation\-checked \(truncation, penalty, heap\-TID allowance, both halves\)\.
+    - Gates: nbtree and amcheck \-race, units, TestPort\_RegressSuite, TestPort\_Isolation\* \(the first run hung
+      once, ledger; the re\-run passed in 596 s\), tpch\-spotcheck, acceptance arm, sf025 sweep, tpcds\-fireset
+      \(SF1 95/99, fired none\)\.
+    - Next: COPY heap placement through the FSM \(hio\.c RecordAndGetPageWithFreeSpace; ledger 2026\-10\-16\), which
+      is the last engine mechanism here\. Then an owner corpus rebuild, re\-measure and close\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
