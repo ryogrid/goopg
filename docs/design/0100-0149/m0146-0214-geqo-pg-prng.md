@@ -229,3 +229,16 @@ partial\_pathlist and pathlist; PG's also prints the inputs of partial join path
   set\_subquery\_pathlist path set, at least the cheapest parallel-safe path and the cheapest path per useful
   ordering. Until then, SF0.25 Q64's tours over cs\_ui keep a costlier serial cheapest path. Those tours have worths
   around 10¹⁰, but the GEQO pool's ordering among them still steers selection.
+
+## 10. M0146-0231 slice 1 (2026-10-19): the alternative paths, and the prechecks
+
+M0146-0231 ([design](m0146-0231-subquery-leaf-alt-paths.md)) gives the cs\_ui leaf its parallel-safe
+GroupAggregate path. It also ports add\_path\_precheck and add\_partial\_path\_precheck.
+
+- **SF0.25 Q64 now MATCHes.** 326 tours are equal to PG's, in order (was 252), and tour 14's join 6 is PG's
+  Gather Merge.
+- **SF1 Q64 regressed.** It agrees through tour 262 (was 258) but then loses a worth tie at eval 363, so the
+  fire-set SF1 count went 95→94.
+- **What remains here** is the sub-1% worth residuals (SF1 evals 41 and 90 at about 0.6–0.75%) and
+  M0146-0216's index-page residual.
+

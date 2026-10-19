@@ -41,6 +41,41 @@ type planState struct {
 	// (analyzer.OuterScopeCarrier) — formerly the analyzer's package-level
 	// outerScope.
 	analyzerOuterScope any
+	// groupedRels keeps each scope's GROUP_AGG rel past its own planning,
+	// keyed by the Aggregate createGroupingPaths wrote the winner onto
+	// (M0146-0231). PG's set_subquery_pathlist reads the subquery's final
+	// rel's whole pathlist; an enclosing join search reads this record to
+	// offer a derived leaf the same surviving paths.
+	groupedRels map[*Aggregate]groupedRelRecord
+}
+
+// groupedRelRecord is one scope's GROUP_AGG rel and the path that won it.
+type groupedRelRecord struct {
+	rel  *RelOptInfo
+	best *Path
+}
+
+// recordGroupedRel files agg's GROUP_AGG rel on cat's statement; a no-op
+// when cat carries no planState.
+func recordGroupedRel(cat catalog.Catalog, agg *Aggregate, rel *RelOptInfo, best *Path) {
+	st := planStateOf(cat)
+	if st == nil || agg == nil || rel == nil {
+		return
+	}
+	if st.groupedRels == nil {
+		st.groupedRels = make(map[*Aggregate]groupedRelRecord)
+	}
+	st.groupedRels[agg] = groupedRelRecord{rel: rel, best: best}
+}
+
+// groupedRelOf is the record recordGroupedRel filed for agg, if any.
+func groupedRelOf(cat catalog.Catalog, agg *Aggregate) (groupedRelRecord, bool) {
+	st := planStateOf(cat)
+	if st == nil || agg == nil {
+		return groupedRelRecord{}, false
+	}
+	rec, ok := st.groupedRels[agg]
+	return rec, ok
 }
 
 // stmtCatalog is the per-statement catalog wrapper that carries planState.

@@ -739,6 +739,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// Both steps are AFTER stampNeededColsOnRels because the partial path's
 	// Target is computed from NeededCols, like the serial scans' (P4-01).
 	s.setBaseRelConsiderParallel(prob.cat)
+	// M0146-0231: set_subquery_pathlist's further paths for derived and
+	// inlined-CTE leaves, now that their rels' consider_parallel holds.
+	s.addSubqueryLeafAltPaths()
 	s.addBaseRelPartialPaths()
 	// M0145-0004: `add_paths_to_append_rel`'s partial arm — hoist the
 	// Parallel Append candidate a marked UNION ALL leaf's nested scope

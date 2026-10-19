@@ -449,6 +449,15 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 	// impl/FINDING-mergejoin-costed-on-postfilter-rows.md.
 	mergeTuples := mergeTuplesFor(mergeClauses)
 	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	// try_mergejoin_path's add_path_precheck on the initial cost
+	// (M0146-0231): a path a complete path already dominates on pathkeys and
+	// both costs is never built — parallel safety is not consulted, so a
+	// parallel-safe loser does not survive to add_path's parallel_safe rule.
+	init := mergeJoinInitialCost(op.Cost, ip.Cost, outerEndSel, innerEndSel)
+	if !addPathPrecheck(joinrel, disabledNodesFor(!cp.enableMergeJoin, op, ip), init.Startup, init.Total,
+		buildJoinPathkeysFor(joinrel, jt, resultKeys), req) {
+		return
+	}
 	cost, matInner := mergeJoinCost(cp, op.Cost, ip.Cost, op.Rows, ip.Rows, mergeTuples, outerEndSel, innerEndSel,
 		mergeInnerFor(ip, ip != i, jt, innerUnique, mergeClauses, residual))
 	if matInner && ip == i {

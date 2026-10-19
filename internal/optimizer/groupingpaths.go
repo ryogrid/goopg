@@ -47,7 +47,7 @@ const (
 // `getCheapestFractionalPath`); with one candidate per shape both are
 // identity today. `cat` serves the index-ordered input variant; nil cat
 // simply never matches one.
-func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, ps PlannerSettings, tupleFraction float64) (Node, error) {
+func createGroupingPaths(u *upperRels, aggNode *Aggregate, having Expr, cat catalog.Catalog, ps PlannerSettings, tupleFraction float64) (Node, error) {
 	if aggNode == nil {
 		return nil, &PlanError{Code: "XX000", Message: "createGroupingPaths: nil aggregate node"}
 	}
@@ -70,6 +70,11 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	sizeGroupingRelFromAgg(grouped, aggNode)
 
 	child := aggNode.Child
+	// M0146-0231: make_grouping_rel's consider_parallel, so that every
+	// candidate below carries create_agg_path's parallel_safe and add_path
+	// keeps a parallel-safe grouping beside a cheaper one over a Gather — the
+	// path an enclosing query's partial join takes as its inner.
+	grouped.ConsiderParallel = groupedRelConsiderParallel(aggNode, child, having, cat, cp)
 	inputRows := float64(EstimateRows(child))
 	if inputRows < 0 {
 		inputRows = 0
@@ -78,6 +83,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// rows are grouped rows, the input paths price input rows). Rows and
 	// cost are the child's own, by the C-12 monotonicity argument.
 	seed := newPrebuiltPath(grouped, child)
+	seed.ParallelSafe = inputPathParallelSafe(grouped, child)
 	seed.Rows = inputRows
 	// M0146-0211: the input path's own cost, through goopg's Project
 	// wrappers (upperInputPathCost), as create_grouping_paths prices
@@ -112,6 +118,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	splitSeed, splitChild := seed, child
 	if c2, p := searchedCheapestTotalInput(child); c2 != nil {
 		ct := newPrebuiltPath(grouped, c2)
+		ct.ParallelSafe = grouped.ParallelSafeForPath() && p.ParallelSafe
 		ct.Rows = p.Rows
 		ct.Cost = p.Cost
 		seed = ct
@@ -160,6 +167,10 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, cat catalog.Catalog, 
 	// copy loses no stamp; the B-01c keep is recomputed afterwards by the
 	// caller, ordered after any index-narrowing remap as today.
 	*aggNode = *built
+	// M0146-0231: the rel stays readable for an enclosing query's join
+	// search, which offers a derived leaf over this aggregate the rel's other
+	// surviving paths (set_subquery_pathlist).
+	recordGroupedRel(cat, aggNode, grouped, best)
 	return aggNode, nil
 }
 
@@ -493,6 +504,40 @@ func aggInputPGWidth(child Node, agg *Aggregate) int {
 // (Sort- or index-driven), and one plain candidate. Single candidate per
 // shape by construction — a pathlist holding more means the producer
 // over-generates (§5 negative).
+// addAggPath files one grouping candidate with create_agg_path's (and
+// create_groupingsets_path's) parallel_safe — `rel->consider_parallel &&
+// subpath->parallel_safe` (pathnode.c) — so that add_path keeps a
+// parallel-safe aggregate beside a cheaper one over a Gather (M0146-0231).
+func addAggPath(grouped *RelOptInfo, p *Path, producer string) {
+	p.ParallelSafe = parallelSafeWith(grouped, p.Children...)
+	addPath(grouped, p, producer)
+}
+
+// groupedRelConsiderParallel is make_grouping_rel's consider_parallel
+// (planner.c): the input rel considers parallelism and the grouping target
+// and HAVING quals are parallel-safe. The input rel is the search's own when
+// the input is a searched tree; any other finished input is judged by the
+// same subtree walk relConsiderParallel gives a planned subtree.
+func groupedRelConsiderParallel(aggNode *Aggregate, child Node, having Expr, cat catalog.Catalog, cp costParams) bool {
+	if !parallelModeOK(cp) {
+		return false
+	}
+	if sr := searchedRelOf(child); sr != nil && !sr.ConsiderParallel {
+		return false
+	}
+	if !subtreeHasNoParallelHazard(aggNode, cat) {
+		return false
+	}
+	return having == nil || isParallelSafeExpr(having, cat)
+}
+
+// inputPathParallelSafe is an input path's parallel_safe for a finished
+// input node on the GROUP_AGG rel: no Gather or Gather Merge inside it (a
+// gather path is never parallel-safe, nor is anything above one).
+func inputPathParallelSafe(grouped *RelOptInfo, n Node) bool {
+	return grouped.ParallelSafeForPath() && !planHasGatherNode(n)
+}
+
 func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cat catalog.Catalog, cp costParams, ps PlannerSettings) {
 	inputRows := seed.Rows
 	inputStartup, inputTotal := seed.Cost.Startup, seed.Cost.Total
@@ -581,7 +626,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			plainStartup, plainTotal = input.Cost.Startup, input.Cost.Total
 		}
 		plainSpec := *aggNode
-		addPath(grouped, &Path{
+		addAggPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &plainSpec,
 			Rel: grouped, Rows: 1,
 			Cost: costAggClause(cp, AggStrategyHashed, inputRows, plainStartup, plainTotal,
@@ -668,7 +713,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				sorted := *seed
 				sorted.Pathkeys = seedKeys
 				presortedSpec := *aggNode
-				addPath(grouped, &Path{
+				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAggClause(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
@@ -708,7 +753,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				}
 				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 				sortSpec := *aggNode
-				addPath(grouped, &Path{
+				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAggClause(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
@@ -741,6 +786,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						continue
 					}
 					cs := newPrebuiltPath(grouped, cNode)
+					cs.ParallelSafe = grouped.ParallelSafeForPath() && cand.ParallelSafe
 					cs.Rows = inputRows
 					cs.Cost = cand.Cost
 					cs.Pathkeys = candKeys[i]
@@ -749,7 +795,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
 					}
 					candSpec := *aggNode
-					addPath(grouped, &Path{
+					addAggPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,
 						Cost: costAggClause(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
@@ -764,7 +810,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// which add_paths_to_grouping_rel then takes as presorted input.
 			if _, ma := orderedAppendInput(seed.Rel, child, keys, cp); ma != nil {
 				maSpec := *aggNode
-				addPath(grouped, &Path{
+				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &maSpec,
 					Rel: grouped, Rows: numGroups,
 					DisabledNodes: ma.DisabledNodes,
@@ -778,6 +824,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				// is the builder's clone (remapped to narrowed positions);
 				// the input price is the index child's own.
 				idxSeed := newPrebuiltPath(grouped, idxChild)
+				idxSeed.ParallelSafe = inputPathParallelSafe(grouped, idxChild)
 				idxSeed.Rows = inputRows
 				if pc := legacyDisplayCostOf(idxChild); pc.PlanRows > 0 || pc.TotalCost > 0 {
 					idxSeed.Cost = Cost{Startup: pc.StartupCost, Total: pc.TotalCost}
@@ -792,7 +839,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					idxSeed.Cost = c
 				}
 				idxWidth := aggInputPGWidth(idxChild, idxSpec)
-				addPath(grouped, &Path{
+				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: idxSpec,
 					Rel: grouped, Rows: numGroups,
 					Cost: costAggClause(cp, AggStrategySorted, inputRows, idxSeed.Cost.Startup, idxSeed.Cost.Total,
@@ -850,7 +897,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				if !ok {
 					return
 				}
-				addPath(grouped, &Path{
+				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &mSpec,
 					Rel: grouped, Rows: numGroups,
 					DisabledNodes: inDisabled + dis,
@@ -861,7 +908,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			sortedInput := sortPathForBounded(sortSeed, rollupPathkeys, cp, -1)
 			addMixed(sortedInput, sortedInput.DisabledNodes, groupAggSortedProducer)
 			rSpec := *aggNode
-			addPath(grouped, &Path{
+			addAggPath(grouped, &Path{
 				Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &rSpec,
 				Rel: grouped, Rows: numGroups,
 				DisabledNodes: sortedInput.DisabledNodes + rollupSortsDisabled,
@@ -881,12 +928,13 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						continue
 					}
 					cs := newPrebuiltPath(grouped, cNode)
+					cs.ParallelSafe = grouped.ParallelSafeForPath() && cand.ParallelSafe
 					cs.Rows = inputRows
 					cs.Cost = cand.Cost
 					cs.Pathkeys = candKeys[i]
 					addMixed(cs, cand.DisabledNodes, groupAggSearchProducer)
 					cSpec := *aggNode
-					addPath(grouped, &Path{
+					addAggPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &cSpec,
 						Rel: grouped, Rows: numGroups,
 						DisabledNodes: cand.DisabledNodes + rollupSortsDisabled,
@@ -915,7 +963,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				hashCost = c
 			}
 		}
-		addPath(grouped, &Path{
+		addAggPath(grouped, &Path{
 			Kind: PathAgg, AggStrategy: AggStrategyHashed, Agg: &hashSpec,
 			Rel: grouped, Rows: numGroups,
 			DisabledNodes: disabledNodesFor(!ps.EnableHashAgg, seed),

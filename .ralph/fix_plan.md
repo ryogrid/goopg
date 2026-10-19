@@ -4379,6 +4379,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       set\_subquery\_pathlist keeps every path of the subquery's final rel\. goopg's subquery leaf is one prebuilt
       path \(the cheapest, with a Gather Merge inside, not parallel\-safe\), so no partial merge is possible\.
     - Next: M0146\-0231, then re\-run the 500\-tour comparison\.
+  - **M0146\-0231 landed 2026\-10\-19:** SF0\.25 Q64 MATCH; SF1 Q64 lost its match to a GEQO worth tie after tour 262
+    \(design §10\)\. Next: the sub\-1% worth residuals before SF1 tour 262 \(evals 41, 90 at 0\.6–0\.75%; eval 160 at
+    2\.6e\-4 is the one eval 0231 made worse\) — `analysis/m0146/m0146\-0231/evalcmp\.py` lists them\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -5107,7 +5110,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestSearchEqJoinUsesBothSidesMCVLists \(mutation\-checked\)\.
     - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
       sf025 PASS=99 \(8 plans changed text\), tpcds\-fireset PASS \(14 fired results byte\-identical\)\.
-- [ ] **M0146\-0231 — subquery / inlined\-CTE leaves offer the join search one prebuilt path; PG's
+- [x] **M0146\-0231 — subquery / inlined\-CTE leaves offer the join search one prebuilt path; PG's
   set\_subquery\_pathlist offers every surviving path of the subquery's final rel** \(filed 2026\-10\-19 by M0146\-0214
   slice 5\)\.
   Kind: impl
@@ -5125,3 +5128,32 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     per pathkeys\); offer them as additional leaf paths, each planned to a Node only when chosen\.
   - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q64\) once the GEQO pool order converges; tour 14's join
     6 cheapest = PG's Gather Merge\.
+  - **Done 2026\-10\-19 \(slice 1\)\.** Design `docs/design/0100\-0149/m0146\-0231\-subquery\-leaf\-alt\-paths\.md`;
+    evidence `analysis/m0146/m0146\-0231/`\.
+    - Grouping paths carry create\_agg\_path's parallel\_safe \(make\_grouping\_rel's consider\_parallel\); the GROUP\_AGG
+      rel is recorded on planState; derived and inlined\-CTE leaves offer its surviving paths \(set\_subquery\_pathlist\);
+      a Gather\-holding leaf path is parallel\-unsafe and an inlined CTE takes the RTE\_SUBQUERY consider\_parallel arm\.
+    - add\_path\_precheck / add\_partial\_path\_precheck ported \(path\.go\) into all five serial and four partial join
+      producers, on initial costs \(hashJoinInitialCost, mergeJoinInitialCost, nliNestLoopInitialCost\)\. Without them
+      the new parallel\-safe leaf path let several tours go 68% cheaper than PG\.
+    - Instrument: SF0\.25 Q64 MATCH \(fire\-set SF0\.25 97→98\); Q64 GEQO tours equal to PG's 252→326 \(SF0\.25\),
+      258→262 \(SF1\)\. SF1 Q64 now diverges \(fire\-set SF1 95→94\): both builds reach PG's best tour \(eval 114\), but
+      after tour 262 goopg evaluates a second tour of equal worth \(eval 363\) PG never reaches → M0146\-0214\.
+    - Pins: m0146\_0231\_test\.go \(precheck and agg\-safety pins mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      sf025 PASS=99 \(only Q64's plan changed; 21 s→32 s on PG's plan, same ck\), tpcds\-fireset PASS \(fired Q64/Q77
+      byte\-identical\)\.
+    - Residual → M0146\-0232\.
+- [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
+  2026\-10\-19 by M0146\-0231\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - PG: set\_subquery\_pathlist also files the final rel's partial paths \(when the rel considers parallel\), and offers
+    the final rel's paths for EVERY subquery — join\-only bodies and bodies with ORDER BY / DISTINCT / window above
+    the grouping included\. goopg offers alternatives only for a grouped body reached through
+    Filter/Project/SubqueryScan/inlined CTEScan wrappers \(subqueryLeafAggregate\)\.
+  - Also: the precheck reads the pathlist in goopg's producer order; PG's add\_paths\_to\_joinrel order is
+    sort\_inner\_and\_outer, match\_unsorted\_outer, hash\_inner\_and\_outer — audit where goopg's order differs\.
+  - First step: a census of fired TPC\-DS queries whose divergence sits under a SubqueryScan / inlined CTE leaf
+    with no grouped body \(first\-divergence parent chain\)\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match count on the queries that census names\.

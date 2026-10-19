@@ -1294,6 +1294,77 @@ func pathlistVerdict(list []*Path, newPath *Path, _ int) pathVerdict {
 // parallel-safe, or offered on a rel that does not consider parallel, is not
 // a candidate at all, and refusing fails closed (a path not offered cannot
 // be chosen), where a panic inside the planner would fail the statement.
+// addPathPrecheck is add_path_precheck (pathnode.c): could a proposed path
+// with these costs, pathkeys and parameterization survive add_path on rel?
+// false when an existing path of the same parameterization already dominates
+// it on pathkeys and on both cost metrics (startup only when the rel considers
+// it). PG stops at the first path it cannot be dominated by, relying on the
+// pathlist's (disabled_nodes, total_cost) order; skipping those paths instead
+// is the same answer on a sorted list and stays correct on any other.
+func addPathPrecheck(rel *RelOptInfo, disabledNodes int, startup, total float64, pathkeys []PathKey, requiredOuter RelSet) bool {
+	newKeys := pathkeys
+	considerStartup := rel.ConsiderStartup
+	if requiredOuter != 0 {
+		newKeys = nil
+		considerStartup = rel.ConsiderParamStartup
+	}
+	for _, old := range rel.Pathlist {
+		if old == nil {
+			continue
+		}
+		if old.DisabledNodes != disabledNodes {
+			if disabledNodes < old.DisabledNodes {
+				continue
+			}
+		} else if total <= old.Cost.Total*stdFuzzFactor {
+			continue
+		}
+		if startup > old.Cost.Startup*stdFuzzFactor || !considerStartup {
+			var oldKeys []PathKey
+			if old.RequiredOuter == 0 {
+				oldKeys = old.Pathkeys
+			}
+			switch comparePathkeysDimRel(rel, newKeys, oldKeys) {
+			case dimEqual, dimBetter2:
+				if requiredOuter == old.RequiredOuter {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// addPartialPathPrecheck is add_partial_path_precheck (pathnode.c), which
+// try_partial_nestloop_path, try_partial_mergejoin_path and
+// try_partial_hashjoin_path (joinpath.c) call with the initial-cost total
+// before building a partial join path (M0146-0231). Against the partial list
+// it decides outright when a path of comparable pathkeys is clearly worse or
+// clearly better; otherwise the path must also survive add_path_precheck
+// against the COMPLETE paths, with its total as the startup too: "If it loses
+// even before accounting for the cost of the Gather node, we should
+// definitely reject it." addPartialPath alone compares only partial paths,
+// so without this a partial join whose input is a costly parallel-safe
+// alternative was filed where PG rejects it.
+func addPartialPathPrecheck(rel *RelOptInfo, disabledNodes int, total float64, pathkeys []PathKey) bool {
+	for _, old := range rel.PartialPathlist {
+		if old == nil {
+			continue
+		}
+		keyscmp := comparePathkeysDimRel(rel, pathkeys, old.Pathkeys)
+		if keyscmp == dimIncomparable {
+			continue
+		}
+		if total > old.Cost.Total*stdFuzzFactor && keyscmp != dimBetter1 {
+			return false
+		}
+		if old.Cost.Total > total*stdFuzzFactor && keyscmp != dimBetter2 {
+			return true
+		}
+	}
+	return addPathPrecheck(rel, disabledNodes, total, total, pathkeys, 0)
+}
+
 func addPartialPath(rel *RelOptInfo, newPath *Path, producer string) {
 	if newPath == nil || !newPath.ParallelSafe || !rel.ConsiderParallel {
 		return

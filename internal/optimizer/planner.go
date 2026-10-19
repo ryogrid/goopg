@@ -2313,7 +2313,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// aggregate joins the Passthrough list BEFORE the election, so no
 		// candidate that narrows the aggregate's input can omit it.
 		prefetchFuncDepPassthroughs(s, agg)
-		if _, gerr := createGroupingPaths(upper, agg.node, cat, plannerSet, orderTupleFraction); gerr != nil {
+		if _, gerr := createGroupingPaths(upper, agg.node, having, cat, plannerSet, orderTupleFraction); gerr != nil {
 			return nil, gerr
 		}
 		// B-01c second cut: the producer above may replace the

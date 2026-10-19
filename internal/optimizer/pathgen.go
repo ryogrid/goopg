@@ -134,7 +134,7 @@ func addHashJoinPathPair(joinRel, probe, build *RelOptInfo, p, b *Path, cp costP
 	// per-parameterisation one (PG's ppi_rows; cost_hashjoin reads
 	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
 	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
-	cost := hashJoinCost(cp, hashJoinInputs{
+	hin := hashJoinInputs{
 		qualPerTuple: joinQualPerTuple(cp, residual),
 		outer:        p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
@@ -154,7 +154,14 @@ func addHashJoinPathPair(joinRel, probe, build *RelOptInfo, p, b *Path, cp costP
 		// while the executor measured the narrowed node's schema at runtime.
 		outerCols: pathNCols(p), innerCols: pathNCols(b),
 		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
-	})
+	}
+	// try_hashjoin_path's add_path_precheck on the initial cost (M0146-0231).
+	init := hashJoinInitialCost(cp, hin)
+	if !addPathPrecheck(joinRel, disabledNodesFor(!cp.enableHashJoin, p, b), init.Startup, init.Total,
+		nil, calcNonNestloopRequiredOuter(p, b)) {
+		return
+	}
+	cost := hashJoinCost(cp, hin)
 	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
 	// keys: hashJoinCost charges it (qualPerTuple) on `hashjointuples`, the
@@ -288,6 +295,14 @@ func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costPa
 	// (cost_material, materialize.go), so nothing is added here — this is the
 	// separation PG draws between inner_path->total_cost (one scan + fill)
 	// and rescan cost (replays 2..N).
+	// try_nestloop_path's add_path_precheck on the initial cost
+	// (M0146-0231).
+	init := nliNestLoopInitialCost(cp, o, i, semi)
+	if !addPathPrecheck(joinRel, disabledNodesFor(!cp.enableNestLoop, o, i), init.Startup, init.Total,
+		buildJoinPathkeysFor(joinRel, jt, o.Pathkeys),
+		calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)) {
+		return
+	}
 	rsStart, rsTotal := pathRescanCost(i, cp)
 	var cost Cost
 	if semi.apply {

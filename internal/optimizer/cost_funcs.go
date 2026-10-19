@@ -973,16 +973,41 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 		run += (cp.cpuTupleCost + in.qualPerTuple) * tuples
 	}
 
+	batchStartup, batchRun := hashJoinBatchCost(cp, in)
+	startup += batchStartup
+	run += batchRun
+	return Cost{Startup: startup, Total: startup + run}
+}
+
+// hashJoinInitialCost is initial_cost_hashjoin (costsize.c): the build, the
+// probe's hashing and the batch I/O — everything hashJoinCost charges before
+// final_cost_hashjoin's bucket walk and per-tuple CPU. It is the lower bound
+// the join-path prechecks compare (add_partial_path_precheck, M0146-0231).
+func hashJoinInitialCost(cp costParams, in hashJoinInputs) Cost {
+	startup := in.outer.Startup + in.inner.Total +
+		(cp.cpuOperatorCost*float64(in.numHashClauses)+cp.cpuTupleCost)*in.innerRows
+	run := (in.outer.Total - in.outer.Startup) +
+		cp.cpuOperatorCost*float64(in.numHashClauses)*in.outerRows
+	batchStartup, batchRun := hashJoinBatchCost(cp, in)
+	startup += batchStartup
+	run += batchRun
+	return Cost{Startup: startup, Total: startup + run}
+}
+
+// hashJoinBatchCost is initial_cost_hashjoin's batch I/O: nothing for a
+// single-batch build, else the inner written once at startup and both sides'
+// pages over the run.
+func hashJoinBatchCost(cp costParams, in hashJoinInputs) (startup, run float64) {
 	// R108 is deliberately opt-in. PG decides hash-table batches using packed
 	// HashJoinTuple geometry, then prices its batch I/O through the distinct
 	// heap-tuple page_size formula. It must not become an executor claim: map
 	// capacity and actual spills remain hashsize.Choose below.
 	if geometry := pgHashTupleSpillGeometryFor(in, cp); geometry.usePG {
 		if geometry.hash.numBatches > 1 {
-			startup += cp.seqPageCost * geometry.innerPages
-			run += cp.seqPageCost * (geometry.innerPages + 2*geometry.outerPages)
+			startup = cp.seqPageCost * geometry.innerPages
+			run = cp.seqPageCost * (geometry.innerPages + 2*geometry.outerPages)
 		}
-		return Cost{Startup: startup, Total: startup + run}
+		return startup, run
 	}
 
 	// M0128-P3.1: avgVarBytes from column stats replaces the hardcoded zero.
@@ -990,10 +1015,25 @@ func hashJoinCost(cp costParams, in hashJoinInputs) Cost {
 	if sizing.NBatch > 1 {
 		innerPages := spillPages(in.innerRows, in.innerCols, in.innerAvgVarBytes)
 		outerPages := spillPages(in.outerRows, in.outerCols, in.outerAvgVarBytes)
-		startup += cp.seqPageCost * innerPages
-		run += cp.seqPageCost * (innerPages + 2*outerPages)
+		startup = cp.seqPageCost * innerPages
+		run = cp.seqPageCost * (innerPages + 2*outerPages)
 	}
+	return startup, run
+}
 
+// mergeJoinInitialCost is initial_cost_mergejoin (costsize.c) over inputs
+// that already carry any explicit sort: both inputs' startup, then the scanned
+// fraction of each input's run — the lower bound before
+// final_cost_mergejoin's rescan, materialisation and per-tuple CPU.
+func mergeJoinInitialCost(outer, inner Cost, outerEndSel, innerEndSel float64) Cost {
+	if outerEndSel <= 0 || outerEndSel > 1 {
+		outerEndSel = 1
+	}
+	if innerEndSel <= 0 || innerEndSel > 1 {
+		innerEndSel = 1
+	}
+	startup := outer.Startup + inner.Startup
+	run := (outer.Total-outer.Startup)*outerEndSel + (inner.Total-inner.Startup)*innerEndSel
 	return Cost{Startup: startup, Total: startup + run}
 }
 

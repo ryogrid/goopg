@@ -235,7 +235,7 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)
 
-	cost := hashJoinCost(cp, hashJoinInputs{
+	hin := hashJoinInputs{
 		qualPerTuple: joinQualPerTuple(cp, residual),
 		// The partial outer's Rows is ALREADY the per-worker count
 		// (costParallelSeqscan divides it), so the probe terms come out
@@ -257,7 +257,14 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		innerWidth:      pathWidth(i),
 		outerCols:       pathNCols(o), innerCols: pathNCols(i),
 		outerAvgVarBytes: pathAvgVarBytes(o), innerAvgVarBytes: pathAvgVarBytes(i),
-	})
+	}
+	// try_partial_hashjoin_path's add_partial_path_precheck on the initial
+	// cost (M0146-0231).
+	if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableHashJoin, o, i), hashJoinInitialCost(cp, hin).Total, nil) {
+		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V8c", "precheck jt="+traceJoinTypeName(jt))
+		return
+	}
+	cost := hashJoinCost(cp, hin)
 	tracePGHashTupleGeometry(o, i, cp)
 	// The residual is priced inside hashJoinCost (qualPerTuple, charged on
 	// hashjointuples), as for the serial figure.
@@ -488,6 +495,13 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	rows := clampRowEst(joinrel.Rows / divisor)
 	mergeTuples := mergeTuplesFor(mergeClauses) / divisor
 	outerEndSel, innerEndSel := scanSelFor(mergeClauses)
+	// try_partial_mergejoin_path's add_partial_path_precheck on the initial
+	// cost (M0146-0231).
+	if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableMergeJoin, o, i),
+		mergeJoinInitialCost(o.Cost, i.Cost, outerEndSel, innerEndSel).Total, buildJoinPathkeysFor(joinrel, jt, resultKeys)) {
+		tracePVetoCtx(s, site, traceRelids(joinrel), outerRelids, innerRelids, "M11b", "precheck jt="+traceJoinTypeName(jt))
+		return
+	}
 	// The partial outer's Rows is ALREADY the per-worker count
 	// (costParallelSeqscan divides it); the inner's are the WHOLE inner,
 	// read complete by every worker — the same asymmetry the hash twin
@@ -610,7 +624,7 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 
 	divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 	rows := clampRowEst(joinrel.Rows / divisor)
-	cost := hashJoinCost(cp, hashJoinInputs{
+	hin := hashJoinInputs{
 		qualPerTuple: joinQualPerTuple(cp, residual),
 		outer:        o.Cost, inner: i.Cost,
 		outerRows: o.Rows, innerRows: i.Rows,
@@ -626,7 +640,13 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 		parallelHash:     true,
 		innerRowsTotal:   innerTotal,
 		parallelWorkers:  o.ParallelWorkers,
-	})
+	}
+	// try_partial_hashjoin_path's add_partial_path_precheck (M0146-0231).
+	if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableHashJoin, o, i), hashJoinInitialCost(cp, hin).Total, nil) {
+		veto("PH-precheck")
+		return
+	}
+	cost := hashJoinCost(cp, hin)
 
 	addPartialPath(joinrel, &Path{
 		Kind:          PathHashJoin,
