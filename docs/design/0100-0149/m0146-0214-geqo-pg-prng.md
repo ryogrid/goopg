@@ -1,9 +1,10 @@
 # M0146-0214 — GEQO runs on PG's pg_prng and pg_qsort
 
-Status: slice 1 landed 2026-10-16. GEQO's random walk now reproduces PG 18.3's draw for draw. TPC-DS Q64, the
-GEQO-RNG record, still diverges: from `sort_pool` on, the walk follows tour fitness (path cost). Slice 2 (§6)
-attributed the remaining divergence to physical inputs, the visibility map and index page counts, which
-M0146-0216 owns. The task is gated `blocked-on M0146-0216`.
+Status: slices 1 (2026-10-16) and 3 (2026-10-19) landed; open. GEQO's random walk reproduces PG 18.3's draw for
+draw. TPC-DS Q64, the GEQO-RNG record, still diverges: from `sort_pool` on, the walk follows tour fitness (path
+cost). Slice 2 (§6) attributed that to physical inputs; the owner's 2026-10-19 reload cleared them to within an
+index page or two. Slice 3 (§7) compared all 500 tours against PG, fixed the subquery-leaf cost class, and routed
+the rest: the join-estimate class to M0146-0230 (eqjoinsel's MCV arm) and the last index pages to M0146-0216.
 
 ## 1. The record
 
@@ -107,3 +108,48 @@ different tour, in PG itself.
 precision. That is M0146-0216's scope (S9(5)(c)). After that, the tour-by-tour worth comparison of §5 becomes
 meaningful; before it, every tour's worth differs for a known reason. M0146-0214 is gated
 `blocked-on M0146-0216`.
+
+## 7. Slice 3 (2026-10-19): tour-by-tour worths against PG
+
+On the reloaded corpora (PG's statistics, index pages within ±2), both engines were traced over SF0.25 Q64.
+
+- **PG oracle:** the `tmp/pgdbg` build on the exact replica `tmp/m21-refclone`, with a probe in geqo\_eval.c and
+  geqo\_main.c. It logs every evaluated tour and its worth, the initial rels in gene order with their cheapest paths,
+  and, for one chosen evaluation (`GEQO_TRACE_EVAL=<n>`), every join rel merge\_clump builds. The patch is
+  `analysis/m0146/m0146-0214/slice3/trace/pg-geqo-probe.patch`.
+- **goopg:** `GOOPG_GEQO_TRACE=1` (and `GOOPG_GEQO_TRACE_EVAL=<n>`) prints the same lines in the same format
+  (geqo.go; registered as diagnostic-only in flagProvenanceExempt). The comparison scripts are
+  `analysis/m0146/m0146-0214/slice3/trace/joincmp.{sh,py}`.
+
+Findings:
+
+- **The walk is PG's.** Both engines evaluate 500 tours, and the first 252 are the same tours in the same order. The
+  initial rels' gene order, rows and cheapest-path costs are identical except gene 3.
+- **No tour's worth matched PG before this slice.** The commonest difference was +0.1. Gene 3 is `cs_ui`, an inlined
+  CTE over a grouped query with a HAVING, which reaches the search as CTEScan → Project → Filter → Aggregate.
+  - PG prices it with cost\_subqueryscan over the Agg path, its HAVING priced inside cost\_agg ("If there are quals
+    (HAVING quals), account for their cost", costsize.c:2845): 13815.025975 + 7 × cpu\_tuple\_cost.
+  - goopg priced the Aggregate without the HAVING, then charged a cpu\_tuple\_cost per row at the Filter, the Project
+    and the CTEScan as well as the leaf's own: 0.1 high at SF0.25.
+- **Fixed:**
+  - DeriveLegacyDisplayCost prices a Filter over an Aggregate as cost\_agg's HAVING: the quals' startup plus their
+    per-tuple cost over the groups the Agg emits, and no cpu\_tuple\_cost.
+  - subplanLeafSubpathCost peels an inlined CTEScan, the subquery PG plans in its place.
+  - projectionCapableNode treats a Filter as capable when its child is, since PG keeps those quals on the node.
+  - Pins: TestHavingIsPricedInsideTheAggregate and TestInlinedCTELeafPricesCostSubqueryscanOnce, mutation-checked.
+    TestExplainLimitClampsToInputRows now pins PG's own Limit lines (43.90..46.90; 44.58..45.95), where it had pinned
+    goopg's HAVING-less 46.12.
+- **After the fix,** 45 of the first 252 tours match PG to the last printed digit. The remaining differences route
+  as follows:
+  - +0.0103 class (tour 5) and the tiny ones: a nested loop probing customer\_demographics\_pkey, which has 5269
+    pages in goopg against PG's 5268. store\_sales\_pkey is 2567 against 2569. This is the physical residual of
+    M0146-0216.
+  - The large classes (tour 2, −322): the first large gap is a row estimate. Joining customer\_demographics cd2
+    under `cd1.cd_marital_status <> cd2.cd_marital_status` gives 1536640 rows (1 − 1/5) against PG's 1536621.
+    PG's neqjoinsel is 1 − eqjoinsel, and eqjoinsel\_inner matches the two columns' MCV lists (selfuncs.c). goopg
+    ports only its no-MCV branch (ledger row 2026-08-04, M0127-P5.6-a). The imported statistics carry the MCV
+    lists, so this is now the dominant worth gap; it is filed as M0146-0230.
+- Q64 still diverges at depth 5 (join-order) at SF0.25. Its total moved 13889.79 → 13889.69; PG's is 13874.27.
+- Gates: units, TestPort\_RegressSuite, tpch-spotcheck, the acceptance arm (values identical), and the sf025 sweep
+  (PASS=99, 14 plans changed text) all pass. tpcds-fireset passes: SF0.25 97/99 and SF1 94/99 unchanged, and all 29
+  fired results are byte-identical.

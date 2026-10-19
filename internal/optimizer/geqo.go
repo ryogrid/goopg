@@ -3,6 +3,9 @@ package optimizer
 import (
 	"fmt"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/utils/pgprng"
@@ -159,6 +162,22 @@ func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error)
 	// the same geqo_seed (default 0) every draw below is PG's draw
 	// (M0146-0214).
 	rng := newGeqoRNG(s.cp.geqoSeed)
+	if geqoTraceOn {
+		// M0146-0214 slice 3: the initial rels in gene order, for a
+		// tour-by-tour comparison with PG's geqo_eval (GEQO_DEBUG-style).
+		fmt.Fprintf(os.Stderr, "GEQOSTART nrels=%d\n", nrels)
+		for i, r := range s.levelRels(1) {
+			var rows, st, tot float64
+			kind := -1
+			if r != nil {
+				rows = r.Rows
+				if r.CheapestTotal != nil {
+					kind, st, tot = int(r.CheapestTotal.Kind), r.CheapestTotal.Cost.Startup, r.CheapestTotal.Cost.Total
+				}
+			}
+			fmt.Fprintf(os.Stderr, "GEQOREL gene=%d relids=%v rows=%.0f kind=%d startup=%.6f total=%.6f\n", i+1, traceRelids(r), rows, kind, st, tot)
+		}
+	}
 
 	pool := allocPool(ps, nrels)
 	defer freePool(pool)
@@ -346,7 +365,71 @@ func linearRand(poolSize int, bias float64, rng *geqoRNG) int {
 // must not see joinrels built by a previous tour's gimmeTree, or the second
 // evaluation would price the first's stale paths.
 func geqoEval(s *searchCtx, tour []Gene, numGene int) float64 {
+	probe := false
+	if geqoTraceOn {
+		probe = geqoTraceEval >= 0 && s.geqoEvalSeq == geqoTraceEval
+		s.geqoEvalSeq++
+	}
+	worth := geqoEvalTour(s, tour, numGene, probe)
+	if geqoTraceOn {
+		var b strings.Builder
+		for _, g := range tour[:numGene] {
+			fmt.Fprintf(&b, "%d ", g)
+		}
+		w := worth
+		if w == math.MaxFloat64 {
+			w = math.Inf(1)
+		}
+		fmt.Fprintf(os.Stderr, "GEQOEVAL tour=%s worth=%.6f\n", b.String(), w)
+	}
+	return worth
+}
+
+// geqoTraceOn gates the GEQO tour trace (GOOPG_GEQO_TRACE=1): every evaluated
+// tour with its worth, and the initial rels in gene order, in the same line
+// format as the M0146-0214 PG oracle probe in geqo_eval.c, so the first
+// differing worth names the costing gap.
+var geqoTraceOn = os.Getenv("GOOPG_GEQO_TRACE") != ""
+
+// geqoTraceEval selects one evaluation (0-based, in draw order) whose join
+// rels mergeClump traces as GEQOJOIN lines (GOOPG_GEQO_TRACE_EVAL); -1 = none.
+var geqoTraceEval = func() int {
+	if v, err := strconv.Atoi(os.Getenv("GOOPG_GEQO_TRACE_EVAL")); err == nil {
+		return v
+	}
+	return -1
+}()
+
+// geqoProbeJoin prints one join rel of a traced evaluation in the PG probe's
+// GEQOJOIN format; gene k is relid bit k-1, printed as PG's RT index k.
+func geqoProbeJoin(joinrel *RelOptInfo) {
+	p := joinrel.CheapestTotal
+	if p == nil {
+		return
+	}
+	bms := func(r RelSet) string {
+		var b strings.Builder
+		b.WriteString("(b")
+		for i := 0; i < 64; i++ {
+			if r&(RelSet(1)<<uint(i)) != 0 {
+				fmt.Fprintf(&b, " %d", i+1)
+			}
+		}
+		b.WriteString(")")
+		return b.String()
+	}
+	outer, inner := "-", "-"
+	if len(p.Children) == 2 && p.Children[0] != nil && p.Children[1] != nil &&
+		p.Children[0].Rel != nil && p.Children[1].Rel != nil {
+		outer, inner = bms(p.Children[0].Rel.Relids), bms(p.Children[1].Rel.Relids)
+	}
+	fmt.Fprintf(os.Stderr, "GEQOJOIN relids=%s rows=%.0f kind=%d startup=%.6f total=%.6f outer=%s inner=%s\n",
+		bms(joinrel.Relids), joinrel.Rows, p.Kind, p.Cost.Startup, p.Cost.Total, outer, inner)
+}
+
+func geqoEvalTour(s *searchCtx, tour []Gene, numGene int, probe bool) float64 {
 	eval := s.freshEvalCtx()
+	eval.geqoProbe = probe
 	joinrel := gimmeTree(eval, tour, numGene)
 	if joinrel == nil {
 		return math.MaxFloat64
@@ -463,6 +546,9 @@ func mergeClump(s *searchCtx, clumps []*clump, newClump *clump, numGene int, for
 				// offered after set_cheapest could never be CheapestTotal.
 				s.generateUsefulGatherPaths(joinrel, false)
 				setCheapest(joinrel)
+				if s.geqoProbe {
+					geqoProbeJoin(joinrel)
+				}
 				// Absorb new clump into old.
 				oldClump.joinrel = joinrel
 				oldClump.size += newClump.size

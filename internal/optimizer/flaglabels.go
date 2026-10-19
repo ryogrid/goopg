@@ -376,6 +376,8 @@ var flagProvenanceExempt = map[string]string{
 	"GOOPG_PGSHAPED_DP_TRACE":  "diagnostic only: emits the enumeration trace, never changes a chosen plan",
 	"GOOPG_NLI_COSTGATE_DEBUG": "diagnostic only: logs the NLI cost-gate decision, never changes it",
 	"GOOPG_NLI_CENSUS":         "diagnostic only: counts which route built each NestedLoopIndexJoin, never changes which one is built",
+	"GOOPG_GEQO_TRACE":         "diagnostic only: prints each GEQO tour and its worth (M0146-0214), never changes a draw or a worth",
+	"GOOPG_GEQO_TRACE_EVAL":    "diagnostic only: selects which GEQO evaluation's join rels GOOPG_GEQO_TRACE prints, never changes a plan",
 }
 
 // shellSingleQuote quotes s for POSIX sh. The labels are ASCII today, but a
