@@ -48,8 +48,12 @@ func legacyAggCosts(cp costParams, nAggs int) aggCosts {
 // A call the table cannot resolve keeps the legacy one-unit-each pricing:
 // user-defined aggregates, and argument types it cannot name.
 //
-// Not ported: the arguments' and FILTER's evaluation cost (cost_qual_eval),
-// since goopg has no per-operator expression costing; see the ledger.
+// M0146-0228: per transition state, outside the combine step, the arguments'
+// and the FILTER's evaluation cost (cost_qual_eval_node, qualEvalOps) is added
+// to the per-input-row cost, as get_agg_clause_costs does ("these costs are
+// incurred only by the initial aggregate node"). TPC-DS Q23's
+// sum(ss_quantity*ss_sales_price) priced its serial HashAggregate at half PG's
+// per-row cost, so the serial arm undercut PG's Partial/Finalize split.
 func aggClauseCosts(cp costParams, agg *Aggregate, split aggSplit) aggCosts {
 	if agg == nil {
 		return aggCosts{}
@@ -77,6 +81,9 @@ func aggClauseCosts(cp costParams, agg *Aggregate, split aggSplit) aggCosts {
 		if !ok {
 			trans++
 			final++
+			if split != aggSplitFinalDeserial {
+				trans += aggInputEvalOps(c)
+			}
 			continue
 		}
 		shared := false
@@ -92,10 +99,10 @@ func aggClauseCosts(cp costParams, agg *Aggregate, split aggSplit) aggCosts {
 			case aggSplitFinalDeserial:
 				trans += cost.Combine + cost.Deserial
 			case aggSplitInitialSerial:
-				trans += cost.Trans
+				trans += cost.Trans + aggInputEvalOps(c)
 				final += cost.Serial
 			default:
-				trans += cost.Trans
+				trans += cost.Trans + aggInputEvalOps(c)
 			}
 		}
 		if split != aggSplitInitialSerial {
@@ -103,6 +110,22 @@ func aggClauseCosts(cp costParams, agg *Aggregate, split aggSplit) aggCosts {
 		}
 	}
 	return aggCosts{transPerTuple: trans * cp.cpuOperatorCost, finalPerGroup: final * cp.cpuOperatorCost}
+}
+
+// aggInputEvalOps is get_agg_clause_costs' input-expression charge for one
+// transition state, in cpu_operator_cost units: cost_qual_eval_node over the
+// arguments plus the FILTER, paid per input row. Startup costs are not
+// separated out here; aggregate arguments carry none in practice.
+func aggInputEvalOps(c AggregateCall) float64 {
+	var ops float64
+	for _, e := range append([]Expr{c.Arg, c.Arg2, c.Filter}, c.ExtraArgs...) {
+		if e == nil {
+			continue
+		}
+		_, per := qualEvalOps(e)
+		ops += per
+	}
+	return ops
 }
 
 // aggCallCost resolves one call to its built-in aggregate's support costs.

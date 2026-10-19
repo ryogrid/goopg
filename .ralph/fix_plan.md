@@ -4815,3 +4815,16 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     HAVING's InitPlan Param is parallel\-safe in PG: is\_parallel\_safe allows a PARAM\_EXEC from an initplan\)\. If it
     is generated, compare its cost with PG's and the serial arm's against PG's serial cost\.
   - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus\.
+  - **Slice 1 LANDED 2026\-10\-19: the aggregate input\-expression cost\.** Design
+    `docs/design/0100\-0149/m0146\-0228\-agg\-input\-expression\-cost\.md`; evidence `analysis/m0146/m0146\-0228/`\.
+    - The CTE body alone on the exact replica: PG's serial HashAggregate costs 0\.01 per input row over the shared
+      Hash Join, goopg's 0\.005\. get\_agg\_clause\_costs adds cost\_qual\_eval over the aggregate arguments, which
+      aggClauseCosts had left out\.
+    - aggInputEvalOps adds the arguments' and FILTER's qualEvalOps per transition state, never in the combine step\.
+    - No verdict moved; 17 TPC\-DS plans per scale changed cost, converging on PG \(Q2, Q43, Q59, Q66, Q99\)\.
+    - Pin: TestAggClauseCostsChargesInputExpressions, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(17 plans
+      changed\), tpcds\-fireset PASS \(34 fired results byte\-identical\)\.
+  - Next \(slice 2\): the implicit int4\_numeric cast \(the other 0\.0025 per row\)\. qualEvalOps prices every cast
+    at 0; port pg\_cast\.dat castmethod/castfunc plus the cast function's procost so cost\_qual\_eval prices
+    coercions\. Q23's serial arm is now 112644\.10\.\.114227\.43, still below its split arm \(design §4\)\.

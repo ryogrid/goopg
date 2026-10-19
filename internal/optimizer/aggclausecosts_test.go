@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestAggClauseCostsPortsGetAggClauseCosts pins M0146-0221 slice 2 against
@@ -82,5 +83,43 @@ func TestLookupBuiltinAggCostResolvesOverloads(t *testing.T) {
 	}
 	if _, ok := catalog.LookupBuiltinAggCost("count", []string{"text"}); !ok {
 		t.Errorf("count(text) must resolve through count(any)")
+	}
+}
+
+// TestAggClauseCostsChargesInputExpressions pins M0146-0228: get_agg_clause_costs
+// adds the arguments' and the FILTER's cost_qual_eval to each transition
+// state's per-input-row cost, except in the combine step, which only sees
+// already-aggregated states. TPC-DS Q23's sum(ss_quantity*ss_sales_price)
+// priced its serial HashAggregate without the multiply, half PG's per-row cost.
+func TestAggClauseCostsChargesInputExpressions(t *testing.T) {
+	cp := defaultCostParams()
+	op := cp.cpuOperatorCost
+	numeric := catalog.Type{Name: "numeric"}
+	col := func(i int) Expr { return &ColumnRef{Index: i, Name: "c", Type: numeric} }
+	product := &BinaryOp{Op: parser.OpMul, Left: col(0), Right: col(1)}
+	sumOf := func(arg Expr, filter Expr) AggregateCall {
+		return AggregateCall{Name: "sum", Arg: arg, Filter: filter, InputType: numeric, Type: numeric}
+	}
+	// sum(a*b): transfn 1 + multiply 1 per row, outside combine.
+	agg := &Aggregate{Aggs: []AggregateCall{sumOf(product, nil)}}
+	for _, c := range []struct {
+		split aggSplit
+		trans float64
+	}{{aggSplitSimple, 2}, {aggSplitInitialSerial, 2}, {aggSplitFinalDeserial, 2}} {
+		got := aggClauseCosts(cp, agg, c.split)
+		want := c.trans * op
+		if c.split == aggSplitFinalDeserial {
+			// combinefn + deserialfn; the input expression is not re-evaluated.
+			want = aggClauseCosts(cp, &Aggregate{Aggs: []AggregateCall{sumOf(col(0), nil)}}, c.split).transPerTuple
+		}
+		if got.transPerTuple != want {
+			t.Errorf("split %d: trans %v, want %v", c.split, got.transPerTuple, want)
+		}
+	}
+	// A FILTER is charged per input row too.
+	filter := &BinaryOp{Op: parser.OpGt, Left: col(2), Right: &IntegerConst{Value: 0}}
+	filtered := &Aggregate{Aggs: []AggregateCall{sumOf(col(0), filter)}}
+	if got := aggClauseCosts(cp, filtered, aggSplitSimple).transPerTuple; got != 2*op {
+		t.Errorf("sum(c) FILTER (WHERE c > 0): trans %v, want transfn + one comparison = %v", got, 2*op)
 	}
 }
