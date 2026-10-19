@@ -5191,6 +5191,22 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - First step: re\-measure R113 default\-on on the fire\-set and the SF1 Q64 eval list; then the joinrel reltarget width
     feeding pathWidth for sort inputs\.
   - Expected instrument: fire\-set match counts; SF1 Q64 GEQO tours equal to PG's beyond 262\.
+  - **Slice 1 2026\-10\-20\.** Design `docs/design/0100\-0149/m0146\-0234\-sort\-byte\-currency\-and\-stats\-widths\.md`;
+    evidence `analysis/m0146/m0146\-0234/`\.
+    - R113 default\-on \(cost\_tuplesort's relation\_byte\_size; "0" opts out\); the grouping sort seed carries the
+      narrowed PG width \(aggInputPGWidth\); relNarrowedWidths sums each kept column's ANALYZE AvgWidth
+      \(set\_rel\_width's get\_attavgwidth\) instead of the type width\. Join 9's Sort width 664→155 \(PG ≈96\)\.
+    - SF1 Q64 GEQO evals before the first differing tour with worth off >1e\-3: 14→6 \(>1e\-4: 33→29; eval 41
+      0\.0075→0\.00098, eval 90 0\.0061→6\.6e\-7\)\. Fire\-set 98/94 and TPC\-H parity 22/22 unchanged; only SF1 Q64's plan
+      changed \(still divergent, depth 4→5; fired result byte\-identical\)\.
+    - Pins: TestRelNarrowedWidthsNarrowsToNeededColumns asserts the stawidth sum \(mutation\-checked\);
+      TestSortSeedNarrowsWithTheAggregate / TestCostWindowPresortedCreditIsInertAtZero updated for the PG currency\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity capture 22/22, sf025 PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(off >1e\-3: 14→6\), no match count moved\.
+    - Next: build\_joinrel\_tlist's attr\_needed narrowing — a joinrel keeps an attribute only while a relation outside
+      it needs it; goopg's NeededCols is one statement\-wide name set \(join 9: 155 vs PG 96\)\. Then non\-table leaves'
+      widths from the subquery target list \(set\_subquery\_size\_estimates\)\.
 - [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl

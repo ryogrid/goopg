@@ -129,7 +129,7 @@ func TestCostWindowSortTermUsesRowWidthNotKeyCount(t *testing.T) {
 func TestCostWindowPresortedCreditIsInertAtZero(t *testing.T) {
 	cp := defaultCostParams()
 	got := costWindow(cp, 100, 5e6, 2, 3, 2, 4, 32, 64, 0, 0)
-	sortRun := costSortRun(cp, 5e6, 4, 32, -1)
+	sortRun := costSortRunWithWidth(cp, 5e6, 4, 32, -1, 64, "window")
 	wantStartup := 100 + sortRun.Startup
 	wantTotal := wantStartup + (sortRun.Total - sortRun.Startup) +
 		cp.cpuOperatorCost*2*5e6 + cp.cpuOperatorCost*5*5e6 + cp.cpuTupleCost*5e6

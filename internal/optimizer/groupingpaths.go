@@ -573,6 +573,11 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	if seed != nil && inNcols > 0 {
 		narrowed := *seed
 		narrowed.NCols, narrowed.AvgVarBytes = inNcols, inAvgVar
+		// M0146-0234: cost_sort's relation_byte_size reads the same narrowed
+		// target's width (set_pathtarget_cost_width), not the input rel's.
+		if inWidth > 0 {
+			narrowed.OutputWidth = inWidth
+		}
 		sortSeed = &narrowed
 	}
 

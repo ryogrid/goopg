@@ -153,8 +153,14 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 		return narrowedWidths{}
 	}
 
-	kept := make([]SchemaColumn, 0, len(keep))
 	var avg float64
+	// width is set_rel_width (costsize.c) over the kept columns: each
+	// attribute's get_attavgwidth — pg_statistic.stawidth, ANALYZE's average
+	// width — and get_typavgwidth only for a column without one (M0146-0234).
+	// The type-only sum priced char(n)/varchar columns at their declared
+	// sliding-scale width: TPC-DS SF1 Q64's partial-merge outer Sort at width
+	// 664 where PG's is 96.
+	width := 0
 	for _, i := range keep {
 		if i < 0 || i >= len(out) {
 			return narrowedWidths{}
@@ -172,7 +178,14 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 			}
 			avg += w
 		}
-		kept = append(kept, SchemaColumn{Name: col.Name, Type: col.Type})
+		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
+			width += int(aw)
+		} else {
+			width += typeWidth(col.Type)
+		}
+	}
+	if width < 1 {
+		width = 1
 	}
 	if noColMap {
 		avg = 0 // literal, not defaulted — see the block comment above.
@@ -180,7 +193,7 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 	return narrowedWidths{
 		ncols:       len(keep),
 		avgVarBytes: avg,
-		outputWidth: TupleWidth(kept),
+		outputWidth: width,
 		ok:          true,
 	}
 }

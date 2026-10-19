@@ -64,8 +64,10 @@ func TestRelNarrowedWidthsNarrowsToNeededColumns(t *testing.T) {
 	if math.Abs(got.avgVarBytes-30) > 1e-9 {
 		t.Errorf("avgVarBytes = %v, want 30 (a=10 + c=20)", got.avgVarBytes)
 	}
-	if got.outputWidth <= 0 {
-		t.Errorf("outputWidth = %d, want > 0", got.outputWidth)
+	// M0146-0234: set_rel_width's get_attavgwidth — the ANALYZE average
+	// width of each kept column (10 + 20), not its type's declared width.
+	if got.outputWidth != 30 {
+		t.Errorf("outputWidth = %d, want 30 (stawidth a=10 + c=20)", got.outputWidth)
 	}
 }
 
