@@ -4799,3 +4799,19 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pins: TestPulledSublinksFoldUnderJoinCollapseLimit, TestSubproblemLeafVarKeepsBaseRelStats, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(Q69 changed\),
       tpcds\-fireset PASS \(2 fired results byte\-identical\)\.
+- [ ] **M0146\-0228 — aggregation\-strategy: TPC\-DS SF1 Q23 — PG partially aggregates the best\_ss\_customer CTE under a
+  Gather \(Finalize HashAggregate\); goopg aggregates it serially** \(filed 2026\-10\-19 by the S9 pass at 8465f5e72\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q23, category aggregation\-strategy, verdict SHAPE\-DIFF at depth 2 \(under CTE: PG Finalize
+    HashAggregate \| goopg HashAggregate\)\. Persists under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261019d/`\.
+  - S9 ranking: a three\-way tie at 1, all SF1 \(Q23, Q72, Q77\); Q23 has the lowest id and the shallowest divergence\.
+  - PG 189437\.85\.\.191187\.85: Finalize HashAggregate → Gather \(4\) → Partial HashAggregate → Parallel Hash Join\.
+    goopg 179918\.25\.\.181501\.58: HashAggregate → serial Hash Join \(Seq Scan store\_sales ⋈ Index Only Scan
+    customer\_pkey\)\. The CTE's HAVING reads `\(InitPlan 2\)\.col1`\.
+  - First step: on an SF1 PG\-statistics clone, check whether the partial\-aggregation arm is generated for the CTE
+    body \(instrument addPath on its upper rel; PG create\_partial\_grouping\_paths\)\. If it is declined, find why \(the
+    HAVING's InitPlan Param is parallel\-safe in PG: is\_parallel\_safe allows a PARAM\_EXEC from an initplan\)\. If it
+    is generated, compare its cost with PG's and the serial arm's against PG's serial cost\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus\.
