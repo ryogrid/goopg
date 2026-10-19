@@ -85,12 +85,12 @@ func countCTEReferences(s *parser.SelectStmt, name string) int {
 
 // stampCTEReferenceCounts records astRefs on every entry the statement's own
 // WITH list declared (a recursive WITH is never inlined and is skipped).
-func stampCTEReferenceCounts(s *parser.SelectStmt) {
+func stampCTEReferenceCounts(s *parser.SelectStmt, cat catalog.Catalog) {
 	if s == nil || s.With == nil || s.With.Recursive {
 		return
 	}
 	for _, cte := range s.With.CTEs {
-		if e := planCTEs[strings.ToLower(cte.Name)]; e != nil {
+		if e := plannedCTEsOf(cat)[strings.ToLower(cte.Name)]; e != nil {
 			e.astRefs = countCTEReferences(s, cte.Name)
 		}
 	}
@@ -102,17 +102,17 @@ func stampCTEReferenceCounts(s *parser.SelectStmt) {
 // planning-time one) or a multiply-referenced NOT MATERIALIZED CTE
 // (inlinesEachReference), and its body could be pulled up at all. The
 // returned entry is the CTE whose preplanned body the pull-up replaces.
-func cteAsDerivedItem(it parser.FromExpr) (parser.FromExpr, *plannedCTE, bool) {
+func cteAsDerivedItem(it parser.FromExpr, cat catalog.Catalog) (parser.FromExpr, *plannedCTE, bool) {
 	rv := it.Base
 	if rv.Subquery != nil || rv.Schema != "" || rv.Name == "" || rv.Lateral ||
 		rv.TableFunc != nil || rv.TableSample != nil || len(rv.Columns) > 0 || len(it.Joins) > 0 {
 		return it, nil, false
 	}
-	e := planCTEs[strings.ToLower(rv.Name)]
+	e := plannedCTEsOf(cat)[strings.ToLower(rv.Name)]
 	singleRef := e != nil && e.astRefs == 1 && e.inlineEligible && e.selectOwned &&
 		e.materialized != "materialized" && !e.volatile && !e.isDML
 	if e == nil || !(singleRef || e.inlinesEachReference()) || e.query == nil ||
-		len(e.aliasColumns) > 0 || !cteBodyNamesResolveAsDeclared(e) {
+		len(e.aliasColumns) > 0 || !cteBodyNamesResolveAsDeclared(e, cat) {
 		return it, nil, false
 	}
 	alias := rv.Alias
@@ -149,7 +149,8 @@ func takeBackPulledBodyRefs(e *plannedCTE) {
 // (planCTEReferenceAsSubquery then plans the body under declScope). Entries
 // without a recorded scope (built outside preplanWithClause) decline only
 // when the body reads the CTE's own name.
-func cteBodyNamesResolveAsDeclared(e *plannedCTE) bool {
+func cteBodyNamesResolveAsDeclared(e *plannedCTE, cat catalog.Catalog) bool {
+	inScope := plannedCTEsOf(cat)
 	ok := true
 	complete := walkParserRangeVarNames(e.query, func(name string) {
 		key := strings.ToLower(name)
@@ -160,9 +161,9 @@ func cteBodyNamesResolveAsDeclared(e *plannedCTE) bool {
 			ok = false
 			return
 		} else {
-			declared = planCTEs[key]
+			declared = inScope[key]
 		}
-		if planCTEs[key] != declared {
+		if inScope[key] != declared {
 			ok = false
 		}
 	})
@@ -245,10 +246,11 @@ func planCTEReferenceAsSubquery(rv parser.RangeVar, e *plannedCTE, alias string,
 		}
 		copy(sub.Columns, rv.Columns)
 	}
-	saved := planCTEs
-	planCTEs = e.declScope
+	st := mustPlanState(cat)
+	saved := st.ctes
+	st.ctes = e.declScope
 	node, b, err := planSubqueryRangeVar(sub, cat, sourceIdx, lateralCtx, ps, scope)
-	planCTEs = saved
+	st.ctes = saved
 	if err != nil {
 		return nil, rangeBinding{}, err
 	}

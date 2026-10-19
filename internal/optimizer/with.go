@@ -13,6 +13,7 @@ package optimizer
 // See docs/design/0016-0002-nonrecursive-cte-planner-executor.md.
 
 import (
+	"sync/atomic"
 	"fmt"
 	"strings"
 
@@ -213,43 +214,41 @@ func planHasVolatileExpr(n Node, cat catalog.Catalog) bool {
 
 // markSelectOwnedCTEs flags the entries `with` declared as owned by a
 // SELECT, after preplanWithClause registered them.
-func markSelectOwnedCTEs(with *parser.WithClause) {
+func markSelectOwnedCTEs(with *parser.WithClause, cat catalog.Catalog) {
 	if with == nil || with.Recursive {
 		return
 	}
 	for _, cte := range with.CTEs {
-		if e := planCTEs[strings.ToLower(cte.Name)]; e != nil && e.declPos == cte.Pos() {
+		if e := plannedCTEsOf(cat)[strings.ToLower(cte.Name)]; e != nil && e.declPos == cte.Pos() {
 			e.selectOwned = true
 		}
 	}
 }
 
-// cteDeclSeq stamps plannedCTE.declSeq. Package-global and unsynchronised,
-// exactly like planCTEs above (planning is single-goroutine per statement);
-// only the relative order within one plan tree is ever read, so the counter
-// never needs resetting.
-var cteDeclSeq int
+// cteDeclSeq stamps plannedCTE.declSeq. Package-global but atomic: sessions
+// plan concurrently (P0-E8), and only the relative order within one plan
+// tree is ever read, so a counter shared across statements still orders each
+// statement's declarations and never needs resetting.
+var cteDeclSeq atomic.Int64
 
 func nextCTEDeclSeq() int {
-	cteDeclSeq++
-	return cteDeclSeq
+	return int(cteDeclSeq.Add(1))
 }
 
-// planCTEs is the goroutine-thread-unsafe "current WITH-list"
-// scope visible to nested Plan calls. Mirrors the existing
-// `planParent` pattern. nil when no WITH clause is in scope.
+// The "current WITH-list" scope visible to nested Plan calls lives on the
+// statement's planState (planstate.go, P0-E8), read through
+// plannedCTEsOf(cat); nil when no WITH clause is in scope. It was the
+// package-level planCTEs, which concurrent sessions swapped under each other.
 //
-// A CTE body's recursive Plan call inherits planCTEs from its
-// surrounding statement so a sibling CTE can reference an earlier
-// declaration (left-to-right visibility). When a nested statement
-// (subquery, CTE body) declares its own WITH, savePlanCTEs makes
-// the existing entries available too — name shadowing then mirrors
-// PostgreSQL.
-var planCTEs map[string]*plannedCTE
+// A CTE body's recursive Plan call inherits the scope from its surrounding
+// statement so a sibling CTE can reference an earlier declaration
+// (left-to-right visibility). When a nested statement (subquery, CTE body)
+// declares its own WITH, preplanWithClause copies the existing entries in
+// too — name shadowing then mirrors PostgreSQL.
 
 // preplanWithClause planens every CTE in `with` (left-to-right,
 // each visible to subsequent siblings) and stamps the resulting
-// plannedCTE entries into the package-local planCTEs map. The
+// plannedCTE entries into the statement's WITH-list scope (planState). The
 // caller MUST defer the returned restorer to release the scope
 // once the WITH-prefixed statement has finished planning.
 //
@@ -266,17 +265,18 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 	if with == nil {
 		return func() {}, nil, nil
 	}
+	st := mustPlanState(cat)
 	if with.Recursive {
 		// WITH RECURSIVE: each CTE body must be a UNION ALL.
 		// Second line of defence — the analyzer already rejects
 		// non-UNION-ALL forms.
-		prev := planCTEs
+		prev := st.ctes
 		cur := make(map[string]*plannedCTE, len(with.CTEs))
 		for k, v := range prev {
 			cur[k] = v
 		}
-		planCTEs = cur
-		restore = func() { planCTEs = prev }
+		st.ctes = cur
+		restore = func() { st.ctes = prev }
 
 		for _, cte := range with.CTEs {
 			body, err := planRecursiveCTE(cte, cat, ps, scope)
@@ -322,15 +322,15 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 		}
 		return restore, nil, nil
 	}
-	prev := planCTEs
+	prev := st.ctes
 	cur := make(map[string]*plannedCTE, len(with.CTEs))
 	// Outer-scope CTEs stay visible — a nested WITH inherits but
 	// its own names shadow on conflict. Mirrors PG.
 	for k, v := range prev {
 		cur[k] = v
 	}
-	planCTEs = cur
-	restore = func() { planCTEs = prev }
+	st.ctes = cur
+	restore = func() { st.ctes = prev }
 
 	for _, cte := range with.CTEs {
 		// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE body).
@@ -375,7 +375,7 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 		// references like `WITH a AS (SELECT 1), b AS (SELECT *
 		// FROM a) ...`. Planning the body directly (rather than via
 		// the Plan entry) skips Analyze while still seeing the
-		// in-progress planCTEs map so an earlier sibling is visible
+		// in-progress WITH-list map so an earlier sibling is visible
 		// to a later one.
 		// A-01(ii) cut 2: the body shares the statement scope.
 		// EX3-03 cut 1: under ps — the CTE body holds the join tree.
@@ -472,6 +472,7 @@ func preplanWithClause(with *parser.WithClause, owner *parser.SelectStmt, cat ca
 // EX3-03 cut 1: ps is the enclosing statement's settings — anchor and
 // recursive member both price under it.
 func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	st := mustPlanState(cat)
 	key := strings.ToLower(cte.Name)
 
 	// PostgreSQL allows WITH RECURSIVE CTEs whose bodies don't actually
@@ -507,7 +508,7 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 		for i, c := range schema {
 			cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
 		}
-		planCTEs[key] = &plannedCTE{
+		st.ctes[key] = &plannedCTE{
 			name:   cte.Name,
 			body:   body,
 			schema: schema,
@@ -542,9 +543,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	// Save and clear SetOp so planSelect for the anchor does NOT
 	// enter the UNION ALL handler (which would try to plan the
 	// recursive member before the WorkTableScan is registered).
-	savedEntry, hadEntry := planCTEs[key]
+	savedEntry, hadEntry := st.ctes[key]
 	if hadEntry {
-		delete(planCTEs, key)
+		delete(st.ctes, key)
 	}
 	savedSetOp := cte.Query.SetOp
 	cte.Query.SetOp = nil
@@ -554,7 +555,7 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	cte.Query.SetOp = savedSetOp
 	if err != nil {
 		if hadEntry {
-			planCTEs[key] = savedEntry
+			st.ctes[key] = savedEntry
 		}
 		return nil, err
 	}
@@ -571,7 +572,7 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 		// 42P10 error. Trailing columns keep their query-derived names.
 		if len(cte.Columns) > len(anchorSchema) {
 			if hadEntry {
-				planCTEs[key] = savedEntry
+				st.ctes[key] = savedEntry
 			}
 			return nil, &PlanError{
 				Pos:     cte.Pos(),
@@ -594,7 +595,7 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	for i, c := range anchorSchema {
 		wtCols[i] = catalog.Column{Name: c.Name, Type: c.Type}
 	}
-	planCTEs[key] = &plannedCTE{
+	st.ctes[key] = &plannedCTE{
 		name:   cte.Name,
 		body:   wts,
 		schema: anchorSchema,
@@ -604,9 +605,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	// Validate the recursive member for structural constraints before planning.
 	if err := validateRecursiveMember(key, cte.Name, cte.Pos(), cte.Query.SetOp.Right); err != nil {
 		if hadEntry {
-			planCTEs[key] = savedEntry
+			st.ctes[key] = savedEntry
 		} else {
-			delete(planCTEs, key)
+			delete(st.ctes, key)
 		}
 		return nil, err
 	}
@@ -615,9 +616,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	rec, err := planSelectWithSettings(cte.Query.SetOp.Right, cat, ps, scope)
 	if err != nil {
 		if hadEntry {
-			planCTEs[key] = savedEntry
+			st.ctes[key] = savedEntry
 		} else {
-			delete(planCTEs, key)
+			delete(st.ctes, key)
 		}
 		return nil, err
 	}
@@ -631,15 +632,16 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog, ps Plann
 	}, nil
 }
 
-// lookupPlannedCTE consults planCTEs for an unschemed name. CTE
+// lookupPlannedCTE consults the WITH list in scope for an unschemed name. CTE
 // names are unschemed in upstream so a `pg_catalog.foo` reference
 // always falls through to the catalog. Returns nil when no CTE
 // matches.
-func lookupPlannedCTE(name string) *plannedCTE {
-	if planCTEs == nil || name == "" {
+func lookupPlannedCTE(cat catalog.Catalog, name string) *plannedCTE {
+	ctes := plannedCTEsOf(cat)
+	if ctes == nil || name == "" {
 		return nil
 	}
-	return planCTEs[strings.ToLower(name)]
+	return ctes[strings.ToLower(name)]
 }
 
 // validateRecursiveMember checks that the recursive member of a WITH RECURSIVE

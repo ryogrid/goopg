@@ -397,7 +397,7 @@ func newSjiScope(from []parser.FromExpr, cat catalog.Catalog) *sjiScope {
 func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int) {
 	lf := sjiLeaf{alias: rv.Alias, name: rv.Name, schema: rv.Schema, leafIdx: leafIdx}
 	if rv.Subquery == nil && rv.TableFunc == nil && cat != nil {
-		if rv.Schema == "" && lookupPlannedCTE(rv.Name) != nil {
+		if rv.Schema == "" && lookupPlannedCTE(cat, rv.Name) != nil {
 			// CTE-owned name: structural (alias) matching only.
 		} else if tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}); ok {
 			lf.table = tbl
@@ -405,7 +405,7 @@ func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int
 		}
 	}
 	if lf.table == nil {
-		lf.cols, lf.colsKnown = derivedLeafColumns(rv)
+		lf.cols, lf.colsKnown = derivedLeafColumns(rv, cat)
 	}
 	if lf.table != nil {
 		key := lf.alias
@@ -424,7 +424,7 @@ func (sc *sjiScope) addLeaf(rv parser.RangeVar, cat catalog.Catalog, leafIdx int
 // reports false whenever a name is not certain — a star, a set operation,
 // a target whose FigureColname this walker does not model, a table
 // function — so an unqualified ref in scope still bails to syn.
-func derivedLeafColumns(rv parser.RangeVar) ([]string, bool) {
+func derivedLeafColumns(rv parser.RangeVar, cat catalog.Catalog) ([]string, bool) {
 	var names []string
 	switch {
 	case rv.TableFunc != nil:
@@ -442,7 +442,7 @@ func derivedLeafColumns(rv parser.RangeVar) ([]string, bool) {
 			names = append(names, n)
 		}
 	case rv.Schema == "":
-		cte := lookupPlannedCTE(rv.Name)
+		cte := lookupPlannedCTE(cat, rv.Name)
 		if cte == nil {
 			return nil, false
 		}

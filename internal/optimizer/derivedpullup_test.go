@@ -361,9 +361,8 @@ func TestDerivedPullupLateral(t *testing.T) {
 // inside a recursive term as `Subquery Scan on z` over the WorkTable Scan,
 // where PG pulls z up and filters the WorkTable Scan itself.
 func TestExpandPullupBodyStarsOverASharedCTE(t *testing.T) {
-	saved := planCTEs
-	defer func() { planCTEs = saved }()
-	planCTEs = map[string]*plannedCTE{
+	cat := withPlanState(catalog.NewInMemory())
+	planStateOf(cat).ctes = map[string]*plannedCTE{
 		"x": {name: "x", table: &catalog.Table{Name: "x", Columns: []catalog.Column{
 			{Name: "a", Type: catalog.Type{Name: "text"}},
 			{Name: "b", Type: catalog.Type{Name: "int4"}},
@@ -386,7 +385,7 @@ func TestExpandPullupBodyStarsOverASharedCTE(t *testing.T) {
 		// carried by this pass, so it declines.
 		{"select * from x xx(p, q)", nil},
 	} {
-		got, ok := expandPullupBodyStars(parse(tc.sql), catalog.NewInMemory())
+		got, ok := expandPullupBodyStars(parse(tc.sql), cat)
 		if tc.want == nil {
 			if ok {
 				t.Errorf("%s: expanded %v, want a decline", tc.sql, got)

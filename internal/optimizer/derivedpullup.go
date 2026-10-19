@@ -274,9 +274,9 @@ func expandPullupBodyStars(sub *parser.SelectStmt, cat catalog.Catalog) ([]parse
 	var items []fromItem
 	add := func(rv parser.RangeVar) bool {
 		item := parser.FromExpr{Base: rv}
-		if conv, _, ok := cteAsDerivedItem(item); ok {
+		if conv, _, ok := cteAsDerivedItem(item, cat); ok {
 			item = conv
-		} else if e := planCTEs[strings.ToLower(rv.Name)]; rv.Subquery == nil && rv.Schema == "" && e != nil {
+		} else if e := plannedCTEsOf(cat)[strings.ToLower(rv.Name)]; rv.Subquery == nil && rv.Schema == "" && e != nil {
 			// A CTE that is not inlined here — a shared or MATERIALIZED one,
 			// or the worktable of an enclosing recursive CTE — reads as a
 			// CTE scan, whose `*` expands to the CTE's planned columns
@@ -551,7 +551,7 @@ func expandDerivedPullups(s *parser.SelectStmt, mode derivedPullupMode, cat cata
 		for _, it := range items {
 			src := it
 			var cteEntry *plannedCTE
-			if conv, e, ok := cteAsDerivedItem(it); ok {
+			if conv, e, ok := cteAsDerivedItem(it, cat); ok {
 				src, cteEntry = conv, e
 			}
 			lateral := depth == 0 && src.Base.Lateral && cteEntry == nil
@@ -634,7 +634,7 @@ func splitInnerJoinChainForPullup(it parser.FromExpr, cat catalog.Catalog) ([]pa
 		// M0146-0007f: a reference to an inlinable CTE is the derived table
 		// inline_cte makes of it (cteAsDerivedItem); the pieces loop below
 		// converts it the same way.
-		if conv, _, ok := cteAsDerivedItem(item); ok {
+		if conv, _, ok := cteAsDerivedItem(item, cat); ok {
 			item = conv
 		}
 		if _, ok := simpleDerivedPullupBody(item, cat); ok {
@@ -691,7 +691,7 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 		bodyCtx := newResolveContext(bodyBindings, schema, ps)
 		bodyCtx.cat = cat
 		bodyCtx.rtScope = scope
-		bodyCtx.parent = planParent
+		bodyCtx.parent = planParentOf(cat)
 		if c.lateral {
 			// The items to the left are the LATERAL body's enclosing scope,
 			// searched after its own (PG's namespace order); they share the
@@ -701,7 +701,7 @@ func resolvePulledDerived(cands []*derivedPullupCandidate, bindings []rangeBindi
 			left := make([]rangeBinding, c.bindLo)
 			copy(left, bindings[:c.bindLo])
 			leftCtx := newResolveContext(left, schema, ps)
-			leftCtx.cat, leftCtx.rtScope, leftCtx.parent = cat, scope, planParent
+			leftCtx.cat, leftCtx.rtScope, leftCtx.parent = cat, scope, planParentOf(cat)
 			for _, prev := range cands {
 				if prev.parent == nil && prev.bindHi <= c.bindLo && relOf[prev] != nil {
 					leftCtx.pulledDerived = append(leftCtx.pulledDerived, relOf[prev])

@@ -1,6 +1,9 @@
 package optimizer
 
-import "os"
+import (
+	"os"
+	"sync/atomic"
+)
 
 // M0139-S1 — the missing attachment point (docs/milestones/0139-*.md
 // "The structural blocker, already located").
@@ -55,8 +58,8 @@ func narrowLegHookFromEnv(v string) bool { return v != "0" }
 // narrowable scan). It is the corpus measurement M0139-S1's design doc
 // reports as "the pass fires N > 0 times" — a literal read of this counter
 // over a real corpus plan run, not an argument. Test/measurement-only;
-// production code never reads it.
-var legHookFireCount int64
+// production code never reads it. Atomic: sessions plan concurrently (P0-E8).
+var legHookFireCount atomic.Int64
 
 // narrowJoinLeg is the hook. Call it on both the outer and inner leg of
 // every join AFTER any existing narrowing (narrowBuildInput,
@@ -83,7 +86,7 @@ func narrowJoinLeg(n Node, lay outputLayout, p *Path, nliInner bool) (Node, outp
 		// not this one.
 		return n, lay
 	}
-	legHookFireCount++
+	legHookFireCount.Add(1)
 	if nliInner {
 		// Structural, not a keep-set question: `createNestLoopIndexJoinPlan`
 		// / `createNestLoopIndexJoinPlanFused` (createplannl.go) peel this
@@ -175,7 +178,5 @@ func isNarrowableLeaf(n Node) bool {
 // legHookFireCountAndReset returns and resets the M0139-S1 hook's fire
 // counter. Test/measurement only.
 func legHookFireCountAndReset() int64 {
-	n := legHookFireCount
-	legHookFireCount = 0
-	return n
+	return legHookFireCount.Swap(0)
 }

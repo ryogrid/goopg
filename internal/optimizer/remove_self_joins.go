@@ -141,7 +141,7 @@ func selfJoinPlainTable(it *selfJoinItem, cat catalog.Catalog) bool {
 	if rv.Subquery != nil || rv.TableFunc != nil || rv.Lateral || rv.TableSample != nil || len(rv.Columns) > 0 {
 		return false
 	}
-	if rv.Schema == "" && lookupPlannedCTE(rv.Name) != nil {
+	if rv.Schema == "" && lookupPlannedCTE(cat, rv.Name) != nil {
 		return false
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})

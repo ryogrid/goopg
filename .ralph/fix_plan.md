@@ -446,9 +446,10 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
-- [ ] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
+- [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
   \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.
   Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro 0 aborts over 22 rounds vs HEAD 6; plans byte\-identical, fire set empty\)
   Parent: none
   - Repro: `with x as (select 1 as a) select a from x;` as a pgbench script, 8 concurrent `pgbench \-c 1 \-t 50`
     clients: some abort at `command 0 query 0` with `ERROR:  relation "x" does not exist`\. TPC\-DS query2\.sql run 4\-way
@@ -461,6 +462,24 @@ heuristic stays live.)
     statement; find the shared state \(CTE registry / name\-resolution scope\) and make it per\-query, as PG's
     `ParseState\.p\_ctenamespace` is\.
   - Expected instrument: the repro at 0 errors over 20 rounds; `Movement: none — correctness fix — no plan instrument`\.
+  - **DONE 2026\-10\-19\.** Design `docs/design/0100\-0149/p0\-e8\-per\-statement\-planner\-scope\.md`; evidence
+    `analysis/p0e8/`\.
+    - Cause: the planner's per\-statement dynamic scope lived in package globals swapped on nested\-scope entry and
+      restored on exit — planCTEs \(the WITH list\), planParent, and the analyzer's outerScope\. Concurrent sessions
+      swapped each other's scope; B's restore of planCTEs to nil let A's `FROM x` fall through to the catalog\. Only
+      a cold plan cache plans concurrently, hence "first statement"\.
+    - Fix: a per\-statement planState carried on a catalog wrapper \(stmtCatalog, Unwrap\-transparent\), created
+      idempotently at every planning entry; re\-entrant plans share it; the analyzer reads its outer scope through
+      an OuterScopeCarrier slot; cteDeclSeq and legHookFireCount atomic; sublinkRouteCounts mutex\-guarded \(an
+      unsynchronised map write was a latent process\-fatal "concurrent map writes"\)\.
+    - A global planning mutex was tried first and rejected: pgbench \-S 58\.7k → 16\.2k tps\. The per\-statement state is
+      throughput\-neutral \(59\.0k/59\.6k vs HEAD 58\.8k/59\.4k\)\.
+    - Pin: TestConcurrentPlansKeepTheirOwnCTEScope \(\-race clean; mutation\-checked: no sync, or one shared state, fails
+      with the production 42P01\)\.
+    - Repro: HEAD 6 aborts over 6 cold starts; the fix 0 over 22 rounds \(16 cold\-start\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99,
+      tpcds\-fireset PASS with no fires \(plans byte\-identical on both corpora\)\.
+    - Left: viewPlanDepth is a process\-wide atomic view\-nesting guard \(ledger 2026\-10\-19\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
