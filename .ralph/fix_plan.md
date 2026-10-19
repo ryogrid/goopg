@@ -4847,6 +4847,26 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild \(mutation\-checked\)\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99, tpcds\-fireset
       PASS \(Q23 fired, results byte\-identical\); TPC\-H 22/22 text\-identical; only Q23 changed\.
-  - Next \(slice 3\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
+  - Slice 3 plan \(done — see the slice 3 bullet above\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
     customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
     \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.
+- [ ] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
+  UNION ALL's ordered GroupAggregates; goopg fully Sorts a plain Append** \(filed 2026\-10\-19 by the S9 pass at
+  4906691d7\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q23, category sort\-strategy, verdict SHAPE\-DIFF at depth 1 \(under Limit: PG Incremental Sort
+    \| goopg Sort\)\. Persists under PG statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261019e/`\.
+  - S9 ranking: a three\-way tie at 1, all SF1 \(Q23 sort\-strategy, Q72 qual\-placement, Q77 join\-order\); Q23 has
+    the lowest id and the shallowest divergence\.
+  - PG: Limit → Incremental Sort \(Sort Key c\_last\_name, c\_first\_name, sum; Presorted Key c\_last\_name,
+    c\_first\_name\) → Merge Append \(Sort Key c\_last\_name, c\_first\_name\) → the two GroupAggregates, each over a
+    Sort on its group key\. goopg: Limit → Sort → Append over the same two GroupAggregates\.
+  - Branch estimates differ too: PG 173 \+ 126 = 299 rows, goopg 150 \+ 76 = 226 under PG statistics\.
+  - First step: on an SF1 PG\-statistics clone, check whether goopg's set\-operation rel offers an ordered
+    \(Merge Append\) path for a UNION ALL whose branches deliver the query's leading ORDER BY keys
+    \(generate\_orderedappend\_paths in allpaths\.c, over the branches' pathkeys\) and whether the upper sort stage
+    considers an incremental sort over a partially sorted input \(create\_ordered\_paths in planner\.c\)\. If both
+    exist, compare costs with PG's\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus and 94→95 under PG
+    statistics\.
