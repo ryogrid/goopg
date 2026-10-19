@@ -4297,7 +4297,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       25/25, SF0\.25 25/25; relallvisible <= relpages everywhere\)\. Index density landed \(fillfactor
       rightmost split; item\_pkey 52 = PG 52\) and slice 2 \(catalog\-resolved IndexRealPages\) landed\.
       No parity lever remains in the record\.
-- [ ] **M0146\-0214 — GEQO\-RNG: goopg's GEQO uses a bespoke Knuth LCG where PG uses pg\_prng \(splitmix64
+- [x] **M0146\-0214 — GEQO\-RNG: goopg's GEQO uses a bespoke Knuth LCG where PG uses pg\_prng \(splitmix64
   fseed + xoroshiro128\*\* + bitmask\-reject range\)** \(filed 2026\-10\-16 by owner directive;
   un\-waives GEQO\-RNG under S9\(2\)\)\.
   Kind: impl
@@ -4426,6 +4426,31 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(off >1e\-3: 6→1\)\.
     - Next: eval 173 \(0\.46%\) is M0146\-0234's joinrel attr\_needed width \(PG's partial merge fuzz\-equal to the partial hash
       with better pathkeys drops it; goopg's merge 2\.6933e10 vs PG 2\.5004e10\)\.
+  - **Slice 8 2026\-10\-20 \(done\): SF1 Q64 MATCH \(SF1 94→95\)\.** Design §13; evidence `analysis/m0146/m0146\-0214/slice8/`\.
+    - After M0146\-0234 slice 2 only two worth\-order inversions remained before tour 262 \(evals 96/138, 159/248\)\. Eval
+      159, two mechanisms:
+      - generate\_useful\_gather\_paths' incremental\-sort arm was skipped \("deferred to M0146\-0006"\)\. PG files a Gather
+        Merge over an Incremental Sort of the partial merge \(presorted on the leading query pathkey\); without it, a
+        Nested Loop with the same 7 pathkeys dominated goopg's pk1 Gather Merge\. Ported, with
+        `create_incremental_sort_path`'s parallel\_workers and an equivalence\-class\-aware presorted count; the group count
+        is estimate\_num\_groups over the presorted keys \(searchRelNumGroups\)\. The Incremental Sort is a per\-worker
+        pass\-through in every parallel walk: partialPathDrivingKind, drivingScan, stamp/unstampParallelScan,
+        drivingScanCrossesSort, replaceSingleChild, parallelChildren, and the executor's attachParallelScan /
+        attachParallelIndexScan / attachParallelBitmapScan / hash\-build claim / unwrapToSetOp / collectBitmapScans /
+        collectShareableJoins\.
+      - merge\_clump gathered the topmost scan/join rel inside each GEQO tour; PG skips it \("Except for the topmost
+        scan/join rel"\) and gathers it in apply\_scanjoin\_target\_to\_paths\. goopg's top\-level Gather Merge \(pk14\)
+        dominated the fuzz\-equal Nested Loop and raised the tour's worth\. Now mergeClump skips queryTopRelids
+        \(root\->all\_query\_rels\) and geqoSearch gathers the best tour's rebuilt top rel\. DP is unchanged: its top rel
+        feeds nothing above, so gathering it in the level loop is equivalent\.
+    - SF1 Q64: all 500 GEQO tours equal to PG's \(was 262\); no worth\-order inversion; evals 159/96 now agree to 2\.7e\-9;
+      plan MATCH\. Fire\-set SF1 94→95 \(Q64\), SF0\.25 98 \(Q64 still MATCH\); TPC\-H 22/22\.
+    - Pin: TestGatherMergeOverIncrementalSortIdentity \(executor; removing attachParallelScan's arm returns 800 rows for
+      400 — mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity 22/22, sf025 PASS=99 \(no plan\-shape change\), tpcds\-fireset PASS \(fired SF1 Q64 byte\-identical\)\.
+    - Children stay open as their own tasks: M0146\-0216 \(index page\), M0146\-0232, M0146\-0233, M0146\-0234\.
+  Movement: yes — SF1 match 94→95 \(Q64\)
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.

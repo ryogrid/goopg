@@ -302,3 +302,39 @@ Nested Loop. Its outer is a Gather Merge over `(b 1..17)`, sorted on all 14 quer
 - The remaining large one, eval 173 (0.46%), is M0146-0234's joinrel width: PG's partial merge is fuzzily equal to
   the partial hash and has better pathkeys, so PG drops the hash.
 
+## 13. Slice 8 (2026-10-20): SF1 Q64 MATCH
+
+After M0146-0234 slice 2, two worth-order inversions against PG remained before tour 262. Eval 159 explained both,
+through two mechanisms.
+
+1. **The incremental-sort arm of `generate_useful_gather_paths`.** On `(b 1 2 7 8 9 10 13 14)`, PG files a Gather
+   Merge over an Incremental Sort of the partial merge join (presorted on the leading query pathkey,
+   1676160451.57..1676166863.37). goopg skipped that arm. Its pk1 Gather Merge was then dominated: a Nested Loop
+   with all 7 pathkeys tied it on cost and had better pathkeys.
+   - **The port.** The Incremental Sort's group count is estimate\_num\_groups over the presorted keys
+     (`searchRelNumGroups`): per member base relation, as `createPulledJoinUniquePath` does. The presorted count is
+     taken through the rel's equivalence classes. `create_incremental_sort_path` now carries
+     `subpath->parallel_workers`.
+   - **Parallel walks.** An Incremental Sort is now a per-worker pass-through in every walk that knows Sort. On the
+     planner side: `partialPathDrivingKind`, `drivingScan`, `stampParallelScan`, `unstampParallelScan`,
+     `drivingScanCrossesSort`, `replaceSingleChild` and `parallelChildren`. In the executor: the five attach walks in
+     parallel\_scan.go, `collectBitmapScans` and `collectShareableJoins`.
+   - **Pin.** `TestGatherMergeOverIncrementalSortIdentity`. Without the attach arm, workers read the whole table, and
+     the test sees 800 rows where it expects 400.
+2. **The topmost scan/join rel.** `merge_clump` gathers every joinrel "except for the topmost scan/join rel", which
+   `apply_scanjoin_target_to_paths` gathers once the target list is known. goopg gathered it inside every tour.
+   There its pk14 Gather Merge dominated a fuzz-equal Nested Loop and raised the tour's fitness.
+   - `mergeClump` now skips `queryTopRelids` (root->all\_query\_rels: the problem spans the whole FROM list with no
+     pinned spine above), and `geqoSearch` gathers the best tour's rebuilt top rel.
+   - DP is unchanged, because its top rel feeds nothing above.
+
+**Result.**
+- All 500 SF1 Q64 GEQO tours equal PG's (was 262), with no worth-order inversion. Evals 159 and 96 agree with PG
+  to 2.7 × 10⁻⁹. The Q64 plan matches.
+- Fire-set SF1 94→95; SF0.25 98 (Q64 still matches); TPC-H 22/22.
+
+**Residuals.**
+- M0146-0216's extra index page: a +4.57 total offset on the affected joins.
+- `searchRelNumGroups` declines a non-column key.
+- The presorted expressions are the subpath's own. PG's `cost_incremental_sort` takes each class's first member.
+

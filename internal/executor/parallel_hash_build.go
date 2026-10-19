@@ -309,6 +309,8 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 		collectShareableJoins(x.child, out)
 	case *sortOp:
 		collectShareableJoins(x.child, out)
+	case *incrementalSortOp:
+		collectShareableJoins(x.child, out)
 	case *aggregateOp:
 		collectShareableJoins(x.child, out)
 	case *instrumentedOp:

@@ -231,12 +231,18 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 	// survives to feed whatever wants it above (an ordered input to an upper
 	// rel, or an outer pathkey chain through the NLs over it).
 	cheapestPartial := rel.PartialPathlist[0]
-	incOn := incrementalSortPathsMode == incrementalSortOn
+	incOn := incrementalSortPathsMode == incrementalSortOn && s.cp.enableIncrementalSort
+	u := rel.usefulKeys
+	if u == nil {
+		u = s.pathkeyUsefulnessFor(rel.Relids)
+	}
 	for _, useful := range s.usefulPathkeysForRelation(rel) {
 		for _, sub := range rel.PartialPathlist {
 			// `pathkeys_count_contained_in(useful_pathkeys,
-			// subpath->pathkeys, &presorted_keys)` (allpaths.c:3271).
-			contained, presorted := pathkeysCountContainedIn(sub.Pathkeys, useful)
+			// subpath->pathkeys, &presorted_keys)` (allpaths.c:3271), over
+			// canonical pathkeys: the rel's equivalence classes decide
+			// whether a subpath key and a useful key are one pathkey.
+			contained, presorted := u.countContainedIn(sub.Pathkeys, useful)
 			if contained {
 				// Already sorted: the loop above filed the bare
 				// Gather Merge over it.
@@ -246,10 +252,21 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 				continue
 			}
 			if presorted > 0 && incOn {
-				// Upstream's `create_incremental_sort_path` arm — deferred
-				// to M0146-0006 (see the function header); nothing is
-				// offered here rather than a regular Sort upstream would
-				// not price.
+				// `create_incremental_sort_path(root, rel, subpath,
+				// useful_pathkeys, presorted_keys, -1)` (allpaths.c), the
+				// arm PG prefers whenever a prefix is presorted: each
+				// worker sorts only within its presorted groups (M0146-0214;
+				// TPC-DS SF1 Q64's Gather Merge over a partial merge join
+				// ordered on the leading query pathkey). The group count is
+				// estimate_num_groups over the presorted keys.
+				groups, ok := s.searchRelNumGroups(rel, sub.Pathkeys[:presorted], sub.Rows)
+				if !ok {
+					continue
+				}
+				inc := incrementalSortPathWithGroups(rel, sub, useful, presorted, groups, s.cp, -1)
+				if gm := makeGatherMergePath(rel, inc, s.cp, overrideRows); gm != nil {
+					addPath(rel, gm, "gather.merge.incrementalsort")
+				}
 				continue
 			}
 			// `create_sort_path(root, rel, subpath, useful_pathkeys, -1)`
@@ -263,6 +280,63 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 			}
 		}
 	}
+}
+
+// searchRelNumGroups is estimate_num_groups (selfuncs.c) for expressions in
+// the search's coordinates over rel: each column resolves to the member base
+// relation that produces it (by binding offset and name), each member's group
+// count is estimateNumGroups over its own leaf, and the product is clamped to
+// inputRows — the per-relation product createPulledJoinUniquePath uses. ok is
+// false when a key is not a plain column of a member; the caller declines
+// rather than price a sort on an invented count.
+func (s *searchCtx) searchRelNumGroups(rel *RelOptInfo, keys []PathKey, inputRows float64) (float64, bool) {
+	members := rel.baseMembers()
+	if len(members) == 0 || len(keys) == 0 {
+		return 0, false
+	}
+	if inputRows < 2 {
+		inputRows = 2
+	}
+	locals := map[*RelOptInfo][]Expr{}
+	var order []*RelOptInfo
+	for _, pk := range keys {
+		cr, ok := pk.Expr.(*ColumnRef)
+		if !ok {
+			return 0, false
+		}
+		var owner *RelOptInfo
+		local := -1
+		for _, m := range members {
+			if m == nil || m.baseLeaf == nil {
+				return 0, false
+			}
+			out := m.baseLeaf.Output()
+			if i := cr.Index - m.baseOffset; i >= 0 && i < len(out) && out[i].Name == cr.Name {
+				owner, local = m, i
+				break
+			}
+		}
+		if owner == nil {
+			return 0, false
+		}
+		lc := *cr
+		lc.Index = local
+		if _, ok := locals[owner]; !ok {
+			order = append(order, owner)
+		}
+		locals[owner] = append(locals[owner], &lc)
+	}
+	groups := 1.0
+	for _, m := range order {
+		groups *= float64(estimateNumGroups(locals[m], m.baseLeaf, int64(inputRows)))
+	}
+	if groups > inputRows {
+		groups = inputRows
+	}
+	if groups < 1 {
+		groups = 1
+	}
+	return groups, true
 }
 
 // usefulPathkeysForRelation is `get_useful_pathkeys_for_relation`
@@ -937,6 +1011,15 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(o)
+	case PathIncrementalSort:
+		// M0146-0214: the incremental-sort arm of the same producer
+		// (allpaths.c create_incremental_sort_path) — a per-worker pass-through
+		// exactly like the PathSort arm below; drivingScan, stampParallelScan
+		// and the executor's attach walks carry matching arms.
+		if len(p.Children) != 1 || p.Children[0] == nil || p.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	case PathSort:
 		// M0146-0027: `generate_useful_gather_paths`' sorted-partial arm
 		// (allpaths.c:3304-3328) wraps the cheapest partial path in a Sort

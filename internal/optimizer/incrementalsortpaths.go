@@ -207,6 +207,18 @@ func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sor
 		groupTuples = 2
 	}
 	groups := estimateNumGroups(groupExprs, statsNode, int64(groupTuples))
+	return incrementalSortPathWithGroups(ordered, sub, sortPathkeys, nCommon, float64(groups), cp, limitTuples)
+}
+
+// incrementalSortPathWithGroups is create_incremental_sort_path given the
+// presorted prefix's group count (cost_incremental_sort's input_groups) — for
+// callers that estimate it from something other than a materialized node, as
+// the join search does for a partial path (generateUsefulGatherPaths).
+func incrementalSortPathWithGroups(ordered *RelOptInfo, sub *Path, sortPathkeys []PathKey, nCommon int, groups float64, cp costParams, limitTuples float64) *Path {
+	groupTuples := sub.Rows
+	if groupTuples < 2 {
+		groupTuples = 2
+	}
 	sp := &Path{
 		Kind: PathIncrementalSort,
 		// `cost_incremental_sort` folds enable_sort's flag in via
@@ -219,7 +231,7 @@ func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sor
 		// 2 rows in PG and is hashed in a semi join for it. The node's
 		// EstimateRows arm (cardinality.go) agrees.
 		Rows: groupTuples,
-		Cost: costIncrementalSort(cp, sub.Cost, sub.Rows, float64(groups),
+		Cost: costIncrementalSort(cp, sub.Cost, sub.Rows, groups,
 			pathNCols(sub), pathAvgVarBytes(sub), limitTuples, pathWidth(sub)),
 		Pathkeys: sortPathkeys,
 		// M0141-S7-exec-b: stashed for `createIncrementalSortPlan` — see
@@ -228,6 +240,10 @@ func incrementalSortPathOver(ordered *RelOptInfo, sub *Path, statsNode Node, sor
 		Children:       []*Path{sub},
 		RequiredOuter:  sub.RequiredOuter,
 		ParallelSafe:   parallelSafeWith(sub.Rel, sub),
+		// create_incremental_sort_path: parallel_workers =
+		// subpath->parallel_workers (pathnode.c), so a per-worker sort of a
+		// partial path stays partial under its Gather Merge.
+		ParallelWorkers: sub.ParallelWorkers,
 	}
 	inheritNarrowedWidths(sp, sub)
 	return sp

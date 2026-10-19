@@ -726,6 +726,12 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// the zero value on its rels, and the derivation declines there by
 	// construction.
 	s.outputEligible = lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && !prob.corrAbove
+	// M0146-0214: root->all_query_rels — the problem's final rel is the
+	// query's topmost scan/join rel exactly when it spans the whole FROM list
+	// with no pinned spine above it. Read by mergeClump / geqoSearch.
+	if lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && s.nrels > 0 {
+		s.queryTopRelids = RelSet(1)<<uint(s.nrels) - 1
+	}
 	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
 	// assignment above. buildInitialRels ran eight lines earlier and could not
 	// have seen it — that ordering is what made P4-01b's first version silently

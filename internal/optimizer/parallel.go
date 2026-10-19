@@ -852,6 +852,16 @@ func stampParallelScan(n Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *IncrementalSort:
+		// M0146-0214: the Sort arm's twin — generate_useful_gather_paths
+		// files a Gather Merge over a per-worker Incremental Sort.
+		child := stampParallelScan(x.Child)
+		if child == x.Child {
+			return x
+		}
+		c := *x
+		c.Child = child
+		return &c
 	case *Aggregate:
 		// M0146-0025: mirror of the drivingScan arm — descend only the
 		// producer-marked per-worker dedup; anything else is returned
@@ -1045,6 +1055,11 @@ func drivingScan(n Node) Node {
 		// children to the upper-rel producer; the four walks (drivingScan,
 		// stampParallelScan, unstampParallelScan, attachParallelScan) agree.
 		return drivingScan(x.Child)
+	case *IncrementalSort:
+		// M0146-0214: a per-worker Incremental Sort under a Gather Merge is
+		// the same pass-through as a Sort; the executor's
+		// attachParallelScan has the matching incrementalSortOp arm.
+		return drivingScan(x.Child)
 	case *Aggregate:
 		// M0146-0025. Only a node the partial-Group producer BUILT for this
 		// descent is transparent: `PartialGroup` marks the per-worker dedup
@@ -1202,7 +1217,7 @@ func drivingScans(n Node) []Node {
 // and read false here, which is what keeps the old verdict for them.
 func drivingScanCrossesSort(n Node) bool {
 	switch x := n.(type) {
-	case *Sort:
+	case *Sort, *IncrementalSort:
 		return true
 	case *Aggregate:
 		// M0146-0025: same gate as the three siblings — the marked
@@ -2339,6 +2354,10 @@ func replaceSingleChild(n Node, child Node) Node {
 		c := *x
 		c.Child = child
 		return &c
+	case *IncrementalSort:
+		c := *x
+		c.Child = child
+		return &c
 	case *Aggregate:
 		c := *x
 		c.Child = child
@@ -2386,6 +2405,8 @@ func parallelChildren(n Node) []Node {
 	case *Limit:
 		return []Node{x.Child}
 	case *Sort:
+		return []Node{x.Child}
+	case *IncrementalSort:
 		return []Node{x.Child}
 	case *Aggregate:
 		return []Node{x.Child}
@@ -2602,6 +2623,15 @@ func unstampParallelScan(n Node) Node {
 		// sibling warning). A scan left labelled parallel with no Gather
 		// above it makes EXPLAIN claim a parallelism the executor will
 		// not run.
+		child := unstampParallelScan(x.Child)
+		if child == x.Child {
+			return n
+		}
+		c := *x
+		c.Child = child
+		return &c
+	case *IncrementalSort:
+		// M0146-0214: the inverse of the stampParallelScan arm.
 		child := unstampParallelScan(x.Child)
 		if child == x.Child {
 			return n

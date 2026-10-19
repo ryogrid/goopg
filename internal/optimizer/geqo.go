@@ -233,6 +233,11 @@ func geqoSearch(s *searchCtx, builder joinRelBuilder, effort int) (*Path, error)
 	if joinrel == nil {
 		return nil, fmt.Errorf("geqo: failed to build a valid join tree from the best tour")
 	}
+	// apply_scanjoin_target_to_paths' generate_useful_gather_paths for the
+	// topmost scan/join rel, which merge_clump skipped.
+	if s.queryTopRelids != 0 && joinrel.Relids == s.queryTopRelids {
+		s.generateUsefulGatherPaths(joinrel, false)
+	}
 	setCheapest(joinrel)
 	p := getCheapestFractionalPath(joinrel, s.tupleFraction)
 	if s.rootCheapestTotal && joinrel.CheapestTotal != nil {
@@ -481,6 +486,7 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 		outputCols:      s.outputCols,
 		outputColsKnown: s.outputColsKnown,
 		outputEligible:  s.outputEligible,
+		queryTopRelids:  s.queryTopRelids,
 		// M0146-0134: every other query-level fact the DP search reads
 		// rides along too — PG's GEQO tours share the one PlannerInfo.
 		// Without queryPathkeys a tour truncated every ordering as useless
@@ -561,7 +567,16 @@ func mergeClump(s *searchCtx, clumps []*clump, newClump *clump, numGene int, for
 				// GEQO arm's counterpart of the DP arm's per-level call
 				// (joinsearchlevel.go). Same ordering reason: a Gather path
 				// offered after set_cheapest could never be CheapestTotal.
-				s.generateUsefulGatherPaths(joinrel, false)
+				//
+				// M0146-0214: "Except for the topmost scan/join rel"
+				// (geqo_eval.c merge_clump) — the query's final rel is
+				// gathered after the search, so a tour's fitness is its
+				// cheapest UNGATHERED path, as in PG. A top-level Gather
+				// Merge filed here dominated a fuzz-equal Nested Loop and
+				// raised TPC-DS SF1 Q64's eval 159 worth by 6e-5.
+				if s.queryTopRelids == 0 || joinrel.Relids != s.queryTopRelids {
+					s.generateUsefulGatherPaths(joinrel, false)
+				}
 				setCheapest(joinrel)
 				if s.geqoProbe {
 					geqoProbeJoin(joinrel)

@@ -221,6 +221,12 @@ type searchCtx struct {
 	outputCols      map[string]bool
 	outputColsKnown bool
 	outputEligible  bool
+	// queryTopRelids is root->all_query_rels when this problem's final rel
+	// is the query's topmost scan/join rel, else 0. PG gathers partial paths
+	// on every joinrel EXCEPT that one inside the join search (merge_clump,
+	// standard_join_search) and gathers it later, in
+	// apply_scanjoin_target_to_paths.
+	queryTopRelids RelSet
 
 	// parallelModeOK is `root->glob->parallelModeOK` for this search
 	// (considerparallel.go); cat is the catalog the qual-safety walk resolves
