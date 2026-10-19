@@ -1,6 +1,6 @@
 # M0146-0228 — TPC-DS SF1 Q23: aggregate input-expression cost
 
-Status: slice 1 landed 2026-10-19. The task stays open for the cast cost (§4). Filed by the S9 pass at 8465f5e72
+Status: slices 1 (aggregate input-expression cost) and 2 (numeric-family coercion cost) landed 2026-10-19. The task stays open for the Parallel Hash Join under Q23's partial aggregate (§5). Filed by the S9 pass at 8465f5e72
 (`analysis/m0146/m0146-0014/routing-20261019d/`). Evidence: `analysis/m0146/m0146-0228/`.
 
 ## 1. Record
@@ -56,12 +56,44 @@ Measured (census `analysis/m0146/m0146-0228/census/`, m28):
 
 Pin: `TestAggClauseCostsChargesInputExpressions`, mutation-checked.
 
-## 4. Open: the cast (slice 2)
+## 4. Slice 2: numeric-family coercion cost
 
-Q23's serial arm is now 112644.10..114227.43, still below its split arm, and PG's is 119518.79. The other half of
-PG's 0.005 per row is the implicit `int4_numeric` cast. goopg's `qualEvalOps` prices every cast at 0, because its
-CastExpr does not say whether PG would build a free RelabelType, a cast function (procost 1) or a CoerceViaIO (2).
+`cost_qual_eval` prices a coercion by the function that performs it. Every pg_cast entry inside the numeric family
+(int2, int4, int8, float4, float8, numeric) is a function cast (castmethod 'f') whose function has procost 1:
+`int4_numeric`, `i4tod`, `numeric_float8`, `int48`, and so on. goopg's `qualEvalOps` priced every cast at 0.
 
-Porting `pg_cast.dat`'s castmethod/castfunc table, and pg_proc's procost for the cast function, would let
-`cost_qual_eval` price coercions as PG does. The int4 operand of `int4 * numeric` must also be seen as coerced.
-That change reaches every qual with a cast, so it is its own slice.
+`qualevalcost.go` now prices two things:
+
+- **Implicit coercion of a binary operator's operand.**
+  - Integer against numeric: the integer side is coerced (`int4_numeric`).
+  - Integer against float: the integer side is coerced (`i4tod`).
+  - Numeric against float: the numeric side is coerced (`numeric_float8`, the implicit direction).
+  - Integer against integer and float against float coerce nothing: cross-type operators such as `int48mul` and
+    `float84mul` exist.
+- **A CastExpr between two numeric-family types.**
+
+Either way, a coerced operand that folds to a constant at plan time costs nothing: `eval_const_expressions`
+pre-coerces it. `isPlanTimeConst` is a `walkExprRefs` classifier (no Var, Param, function call or sublink); an
+unenumerated node reads as not constant. Other casts keep the free reading (ledger).
+
+On the exact replica, the CTE body's serial HashAggregate is 119518.79..121018.79. goopg now prices it at
+119518.79..121102.12: the startup matches to the cent, and the total differs only in the per-group final term.
+Q23's `best_ss_customer` now plans PG's Finalize HashAggregate → Gather → Partial HashAggregate.
+
+Measured (census `analysis/m0146/m0146-0228/census2/`, m28b):
+
+- No verdict moves: SF0.25 92/99, SF1 82/99, TPC-H 22/22.
+- Q23's first divergence moves at SF1, both shipped and under PG statistics: from depth 2 (aggregation-strategy)
+  to depth 5 (parallelism, §5).
+- Six TPC-DS plans per scale and twelve TPC-H plans change cost, mostly toward PG. TPC-H Q1 goes 178517 → 200684
+  against PG's 200862, and Q3, Q6, Q9 and Q14 also get closer. TPC-H Q12 moves away by 72.
+- Fire set: 12 fired results, all byte-identical.
+
+Pin: `TestQualEvalPricesNumericCoercions`, mutation-checked.
+
+## 5. Open: the Parallel Hash Join under the partial aggregate
+
+Under PG statistics, Q23's partial aggregate now reads its input from a non-parallel-aware Hash Join: a Parallel Seq
+Scan on store_sales probes a private Hash of an Index Only Scan on customer (3876.33..64750.26). PG builds a
+Parallel Hash Join with a Parallel Index Only Scan on customer_pkey and a Parallel Hash (2563.84..63437.77). Next:
+trace the partial paths of (store_sales_2, customer_1) and price PG's parallel-hash arm.

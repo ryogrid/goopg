@@ -4825,6 +4825,14 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestAggClauseCostsChargesInputExpressions, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(17 plans
       changed\), tpcds\-fireset PASS \(34 fired results byte\-identical\)\.
-  - Next \(slice 2\): the implicit int4\_numeric cast \(the other 0\.0025 per row\)\. qualEvalOps prices every cast
-    at 0; port pg\_cast\.dat castmethod/castfunc plus the cast function's procost so cost\_qual\_eval prices
-    coercions\. Q23's serial arm is now 112644\.10\.\.114227\.43, still below its split arm \(design §4\)\.
+  - **Slice 2 LANDED 2026\-10\-19: numeric\-family coercion cost\.** Design §4\.
+    - qualEvalOps prices an implicit operand coercion \(int vs numeric/float, numeric vs float\) and a numeric\-family
+      CastExpr as a function cast \(procost 1\), free when the operand folds to a constant\.
+    - The CTE body's serial HashAggregate startup now equals PG's 119518\.79; Q23's CTE plans PG's Finalize
+      HashAggregate → Gather → Partial HashAggregate\. No verdict moved; Q23's first divergence moved to depth 5\.
+    - Pin: TestQualEvalPricesNumericCoercions, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(6 plans
+      changed\), tpcds\-fireset PASS \(12 fired results byte\-identical\)\.
+  - Next \(slice 3\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
+    customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
+    \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.

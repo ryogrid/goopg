@@ -50,7 +50,10 @@ func qualEvalOpsPriced(e Expr, priceSublinks bool) (startup, perTuple float64) {
 		case *BinaryOp:
 			if n.Op != parser.OpAnd && n.Op != parser.OpOr {
 				perTuple++
+				perTuple += implicitNumericCoercionOps(n.Left, n.Right)
 			}
+		case *CastExpr:
+			perTuple += numericFamilyCastOps(n)
 		case *UnaryOp:
 			if n.Op != parser.OpNot {
 				perTuple++
@@ -125,6 +128,107 @@ func conjunctsEvalOps(conjuncts []Expr) (startup, perTuple float64) {
 		perTuple += p
 	}
 	return startup, perTuple
+}
+
+// M0146-0228 slice 2: cost_qual_eval prices a coercion by the function
+// that performs it. Among the numeric family (int2, int4, int8, float4,
+// float8, numeric) every pg_cast entry is a function cast (castmethod 'f')
+// whose function has procost 1: int4_numeric, i4tod, numeric_float8, int48,
+// ... Constant operands are pre-coerced by eval_const_expressions and cost
+// nothing at run time.
+
+// numericFamily classifies a type for operator resolution: 1 integer,
+// 2 float, 3 numeric, 0 anything else.
+func numericFamily(t string) int {
+	switch t {
+	case "int2", "int4", "int8", "smallint", "integer", "bigint":
+		return 1
+	case "float4", "float8", "real", "double precision":
+		return 2
+	case "numeric", "decimal":
+		return 3
+	}
+	return 0
+}
+
+// implicitNumericCoercionOps is the implicit cast PG's operator resolution
+// inserts for a binary operator over two numeric-family operands of
+// different classes. Cross-type operators exist within the integers
+// (int48mul, int24eq) and within the floats (float84mul), so those need no
+// cast. Integer against numeric resolves to the numeric operator over
+// int4_numeric(x); integer against float to the float8 operator over i4tod(x);
+// numeric against float to the float8 operator over numeric_float8(x), since
+// numeric→float8 is the implicit direction. One function call, procost 1, for
+// a non-constant coerced operand.
+func implicitNumericCoercionOps(l, r Expr) float64 {
+	lt, lok := ExprResultType(l)
+	rt, rok := ExprResultType(r)
+	if !lok || !rok || lt.IsArray || rt.IsArray {
+		return 0
+	}
+	lf, rf := numericFamily(lt.Name), numericFamily(rt.Name)
+	if lf == 0 || rf == 0 || lf == rf {
+		return 0
+	}
+	// The operand converted: the integer side against numeric or float, the
+	// numeric side against float.
+	coerced := l
+	switch {
+	case lf == 1:
+		coerced = l
+	case rf == 1:
+		coerced = r
+	case lf == 3:
+		coerced = l
+	default:
+		coerced = r
+	}
+	if isPlanTimeConst(coerced) {
+		return 0
+	}
+	return 1
+}
+
+// numericFamilyCastOps prices a CastExpr between two numeric-family types:
+// a function cast (procost 1) unless its operand folds to a constant. Other
+// casts keep the free reading (see qualEvalOps).
+func numericFamilyCastOps(c *CastExpr) float64 {
+	if c == nil || c.Operand == nil {
+		return 0
+	}
+	src := c.SourceType
+	if src == "" {
+		if t, ok := ExprResultType(c.Operand); ok && !t.IsArray {
+			src = t.Name
+		}
+	}
+	if numericFamily(src) == 0 || numericFamily(c.TargetType) == 0 || src == c.TargetType {
+		return 0
+	}
+	if isPlanTimeConst(c.Operand) {
+		return 0
+	}
+	return 1
+}
+
+// isPlanTimeConst reports whether eval_const_expressions folds e to a
+// constant: no column, parameter or function call anywhere in it, and no
+// sublink (scopeVeto). An expression the walker cannot enumerate aborts the
+// walk and reads as not constant, so it is still priced.
+func isPlanTimeConst(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	constant := true
+	walked := walkExprRefs(e, scopeVeto, exprVisitor{Visit: func(x Expr) bool {
+		switch x.(type) {
+		case *ColumnRef, *OuterColumnRef, *ParamRef, *FuncCall:
+			constant = false
+			return false
+		}
+		return true
+	}})
+	return walked && constant
 }
 
 func allConstExprs(es []Expr) bool {
