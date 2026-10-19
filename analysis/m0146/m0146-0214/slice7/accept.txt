@@ -1,0 +1,31 @@
+# arm=m0214s7
+# started 2026-10-20T03:17:39+09:00
+# engine-id: 6e58afac3fb64684f166e5c472a42af8e1ea2d78 31cd91aed89cb81ff0f8c082ef19e21039b73c9b  diff=dd016a32a99d
+# engine-binary: on-disk=d186b9591fb3c540 (tmp/goopg-acceptance-bin)
+# per-query cap 600s, serial, digest=1, queries=all
+# host: load1.69 1.62 1.72
+Q1: OK elapsed=3.85s colsig=767ce848ef814ee2 ordered=8ae7b8554c036cc9 unordered=d521408c80a7b1dc rows=4
+Q2: OK elapsed=0.66s colsig=98559dc0378d935e ordered=68119d021ea76fe1 unordered=68acf0784df2e99b rows=469
+Q3: OK elapsed=1.25s colsig=83ee73dd50fba86d ordered=2c100154bf30b2f7 unordered=ae8c1176187ba37a rows=11356
+Q4: OK elapsed=0.31s colsig=ab046cf17754992f ordered=125424f8158de417 unordered=85f1831061d8e6c7 rows=5
+Q5: OK elapsed=0.99s colsig=23ed6d41a314eb4e ordered=428617a013365ffd unordered=216c2b662edee6b5 rows=5
+Q6: OK elapsed=0.46s colsig=2e0a9e7c16d79cc6 ordered=c552d666a2a257c5 unordered=c552d666a2a257c5 rows=1
+Q7: OK elapsed=1.15s colsig=effb45ed4c5e2661 ordered=48e82c59c9a74c00 unordered=b525190f1a0e6989 rows=4
+Q8: OK elapsed=0.53s colsig=8acb7c80bbac36a7 ordered=2945f1d24f72127c unordered=9469eb9d7a66357b rows=2
+Q9: OK elapsed=1.76s colsig=d0a60022db317dc9 ordered=5c47cfebfd0d4155 unordered=983714af934573d5 rows=175
+Q10: OK elapsed=3.21s colsig=82959e9b048aa541 ordered=85d09d886cb389ae unordered=f89624b7be1f4683 rows=20486
+Q11: OK elapsed=0.46s colsig=a94b0078c4bc16ef ordered=63ba1d822b7cb22b unordered=1b36ccefc479c12f rows=517
+Q12: OK elapsed=2.70s colsig=8c6c14235b8e3d44 ordered=10d92d9bf7a4f3fc unordered=693668b5e953da0f rows=2
+Q13: OK elapsed=3.98s colsig=9694103490f49d86 ordered=4b05cc0d1230221c unordered=58bc604ea17d0516 rows=35
+Q14: OK elapsed=0.38s colsig=ab278eb7d8e03030 ordered=83eeb44c59fd0003 unordered=83eeb44c59fd0003 rows=1
+Q15-CREATEVIEW: OK elapsed=0.01s colsig=cbf29ce484222325 ordered=cbf29ce484222325 unordered=0000000000000000 rows=0
+Q15a-VIEWBODY: OK elapsed=1.45s colsig=7a934e0bc02f9878 ordered=56ed2368ccbdaad6 unordered=946be2b266fb7975 rows=10000
+Q15b-MAIN: OK elapsed=2.88s colsig=25d4fdb3731a5fa2 ordered=681fe69f4787b1e6 unordered=681fe69f4787b1e6 rows=1
+Q16: OK elapsed=0.63s colsig=95a4c8de6e558c15 ordered=c0c2a3f5786ff5fd unordered=06490406eb2a3904 rows=18166
+Q17: OK elapsed=3.93s colsig=d54de0dda81daf86 ordered=2a963ee5f19a29d5 unordered=2a963ee5f19a29d5 rows=1
+Q18: OK elapsed=4.26s colsig=1c632e3bcd2ea332 ordered=f7be792d4ad1d224 unordered=589854a6d9c67289 rows=12
+Q19: OK elapsed=0.11s colsig=2e0a9e7c16d79cc6 ordered=3b0c5cba91516eaf unordered=3b0c5cba91516eaf rows=1
+Q20: OK elapsed=0.26s colsig=5cd9dcbdb8104bbb ordered=2ed300534461e198 unordered=92483d987d1ec347 rows=92
+Q21: OK elapsed=1.33s colsig=8877f45c5e0db592 ordered=bd4028a404e88a40 unordered=195896c93d346c50 rows=421
+Q22: OK elapsed=0.18s colsig=6d31a4f5ee00a4d0 ordered=8d606c7fca82e9ed unordered=e1b00cd48f09d289 rows=7
+# finished 2026-10-20T03:18:17+09:00 runner-rc=0

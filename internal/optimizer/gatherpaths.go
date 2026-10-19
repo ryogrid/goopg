@@ -273,7 +273,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 // element" — so the list-of-lists shape is kept but populated from
 // `s.queryPathkeys` alone.
 //
-// `relation_can_be_sorted_early`'s EC-member search is syntactic here: a
+// `relation_can_be_sorted_early`'s EC-member search (sortableEarlyMember): a
 // pathkey is sortable early when every ColumnRef it reads resolves inside
 // `rel.Relids` (computable from the reltarget — `relidsOfExpr` over
 // `s.itemSpans`, the same item-coordinate windows `buildRestrictInfos`
@@ -290,17 +290,59 @@ func (s *searchCtx) usefulPathkeysForRelation(rel *RelOptInfo) [][]PathKey {
 	if s == nil || rel == nil || len(s.queryPathkeys) == 0 || len(s.itemSpans) == 0 {
 		return nil
 	}
-	n := 0
+	u := rel.usefulKeys
+	if u == nil {
+		u = s.pathkeyUsefulnessFor(rel.Relids)
+	}
+	var keys []PathKey
 	for _, pk := range s.queryPathkeys {
-		if pk.Expr == nil || !s.pathkeySortableEarly(rel, pk.Expr) {
+		if pk.Expr == nil {
 			break
 		}
-		n++
+		e, ok := s.sortableEarlyMember(rel, u, pk.Expr)
+		if !ok {
+			break
+		}
+		keys = append(keys, PathKey{Expr: e, SortAsc: pk.SortAsc, NullsFirst: pk.NullsFirst})
 	}
-	if n == 0 {
+	if len(keys) == 0 {
 		return nil
 	}
-	return [][]PathKey{s.queryPathkeys[:n:n]}
+	return [][]PathKey{keys}
+}
+
+// sortableEarlyMember is relation_can_be_sorted_early's
+// find_computable_ec_member (equivclass.c): the pathkey's own expression when
+// the rel computes it, else another member of its equivalence class that the
+// rel computes — PG's pathkey names the class, and the Sort below a Gather
+// Merge sorts on whichever member the rel's target holds
+// (prepare_sort_from_pathkeys). TPC-DS Q64's cross_sales groups by
+// i_item_sk; a joinrel without item is sorted early on its ss_item_sk, which
+// the join to item equates with it (M0146-0214). The member must also be
+// parallel-safe (require_parallel_safe at this call site).
+func (s *searchCtx) sortableEarlyMember(rel *RelOptInfo, u *pathkeyUsefulness, e Expr) (Expr, bool) {
+	if s.pathkeySortableEarly(rel, e) {
+		return e, true
+	}
+	if u == nil {
+		return nil, false
+	}
+	id := -1
+	for _, m := range u.ecMembers {
+		if exprEqual(m.expr, e) {
+			id = m.id
+			break
+		}
+	}
+	if id < 0 {
+		return nil, false
+	}
+	for _, m := range u.ecMembers {
+		if m.id == id && m.relids != 0 && relsSubset(m.relids, rel.Relids) && isParallelSafeExpr(m.expr, s.cat) {
+			return m.expr, true
+		}
+	}
+	return nil, false
 }
 
 // pathkeySortableEarly is the per-key half of the derivation above —

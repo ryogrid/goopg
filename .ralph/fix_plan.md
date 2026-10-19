@@ -462,6 +462,18 @@ heuristic stays live.)
     ledgered: deferral\_ledger row 2963 \(pg\_isolation\_test\_session\_is\_blocked not implemented\)\. Hardening
     lead, not done: treat a probe that reports no lock wait as still running past blockProbeCap, as isolationtester does\.
 
+- [ ] units/internal/access/nbtree — panic `storage: unsupported line pointer state: slot=2 flags=0` in insertItemSorted, from vacuumSplitRound's concurrent Insert \(btree\_vacuum\_split\_race\_test\.go:105\) \(AI\-20261020\-013101\-001; repro: `go test \-timeout 10m \./internal/access/nbtree/`\)\.
+  - Nightly sha cb9d2c011 from a detached worktree; that change set touched internal/optimizer only\. A slot read as
+    LP\_UNUSED during a sorted insert under a concurrent vacuum is a possible index\-page race, not a timing bound — S2
+    candidate \(possible corruption\); escalated in the baton\.
+  - 2026\-10\-20 03:15: TestStructuralLockVacuumWithSplits passed 5/5 on an idle host at HEAD cb9d2c011 \(0\.38 s each\);
+    intermittent, not yet stressed or diagnosed\.
+- [ ] testport/TestPort\_IsolationAlterTable1 — FAIL \(60\.04 s\) \(AI\-20261020\-013101\-002; repro: `go test \-v \-run '^TestPort\_IsolationAlterTable1$' \./internal/testport/`\)\.
+  - The nightly testport lane overlapped this loop's own regress/isolation gates \(load average 9\.5\); check stale first\.
+- [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
+- [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
+- [ ] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
 - [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
@@ -4399,6 +4411,21 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Movement: none — parity held; merge\-join costs converge on PG numerically, no match count moved\.
     - Remaining eval\-41 residuals → M0146\-0233 \(the cutoff clamp: 207 vs PG's 275 skipped rows\) and M0146\-0234
       \(sort byte currency and joinrel sort width: join 2's Sort, join 9's partial merge 6\.32e10 vs PG 6\.20e10\)\.
+  - **Slice 7 2026\-10\-20: Gather Merge useful pathkeys through the equivalence class\.** Design §12; evidence
+    `analysis/m0146/m0146\-0214/slice7/`\.
+    - SF1 eval 141 \(worst after M0146\-0234 slice 1, goopg 0\.57% dearer\): PG's final NL takes a Gather Merge over
+      \(b 1\.\.17\) sorted on all 14 query pathkeys; goopg's usefulPathkeysForRelation tested computability
+      syntactically and stopped at i\_item\_sk \(item, outside the rel\)\. Now relation\_can\_be\_sorted\_early's
+      find\_computable\_ec\_member: the pathkey carries a parallel\-safe class member the rel computes \(ss\_item\_sk\)\.
+    - SF1 Q64 evals off >1e\-3: 6→1 \(>1e\-4: 29→19; eval 141 0\.0057→7\.1e\-6\)\. Fire\-set 98/94, TPC\-H 22/22 unchanged;
+      SF1 Q77's plan text changed \(fired result byte\-identical, same first divergence\)\.
+    - Pin: TestSortableEarlyMemberUsesTheEquivalenceClass\.
+    - Gates: units \(the first run timed out in internal/initdb under the overlapping nightly; re\-run on an idle host
+      PASS\), TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), TPC\-H parity 22/22, sf025
+      PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(off >1e\-3: 6→1\)\.
+    - Next: eval 173 \(0\.46%\) is M0146\-0234's joinrel attr\_needed width \(PG's partial merge fuzz\-equal to the partial hash
+      with better pathkeys drops it; goopg's merge 2\.6933e10 vs PG 2\.5004e10\)\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.

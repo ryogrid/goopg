@@ -279,3 +279,26 @@ with a sorted `store_sales`.
 - **The sort byte currency and joinrel width** (M0146-0234). Join 2's Sort is a disk sort in goopg's EntryBytes
   currency where PG's fits in memory. Join 9's partial-merge outer sort is priced at width ≈664 against PG's ≈96.
 
+## 12. Slice 7 (2026-10-20): Gather Merge orderings use the equivalence class
+
+SF1 eval 141 was goopg's largest remaining worth gap: 0.57%, with goopg dearer. PG's cheapest final path is a
+Nested Loop. Its outer is a Gather Merge over `(b 1..17)`, sorted on all 14 query pathkeys
+(310476.10..310476.22), and item is the inner.
+
+- **Why PG has this path.** `merge_clump` runs `generate_useful_gather_paths` on every intermediate GEQO joinrel.
+  `get_useful_pathkeys_for_relation` admits a query pathkey when `relation_can_be_sorted_early` finds an
+  equivalence-class member the rel can compute (`find_computable_ec_member`). The Sort beneath the Gather Merge
+  then sorts on that member (`prepare_sort_from_pathkeys`).
+- **Why goopg lacked it.** goopg's test was syntactic. `i_item_sk` belongs to item, which `(b 1..17)` does not
+  hold, so the useful-pathkeys prefix stopped at that key and the Gather Merge was never built. In PG,
+  `ss_item_sk` stands in for it.
+- **The fix.** `usefulPathkeysForRelation` takes each pathkey's own expression when the rel computes it. Otherwise
+  it takes another member of the pathkey's class that the rel computes and that is parallel-safe
+  (`sortableEarlyMember`, over the search's `ecMembers`). The returned pathkey carries that member.
+
+**Measured on SF1 Q64**, before the first tour that differs from PG's:
+- Eval 141's error falls from 0.0057 to 7.1 × 10⁻⁶.
+- Evals off by more than 10⁻³ fall from 6 to 1; evals off by more than 10⁻⁴ fall from 29 to 19.
+- The remaining large one, eval 173 (0.46%), is M0146-0234's joinrel width: PG's partial merge is fuzzily equal to
+  the partial hash and has better pathkeys, so PG drops the hash.
+
