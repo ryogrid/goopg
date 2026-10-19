@@ -1,7 +1,7 @@
 # M0146-0229 — TPC-DS SF1 Q23 statement 2: Incremental Sort over a Merge Append
 
 Status: open. Slice 1 landed 2026-10-19, after the owner un-parked it (OWNER DECISIONS 2026-10-19 (b)). Q23 still
-diverges: the row estimate is the next slice (§5). M0146-0229a, the Q74 executor recon, follows. Filed by the S9 pass
+diverges: the row estimate is the next slice (§5). M0146-0229a, the Q74 executor recon, closed with no mechanism to port (§6). Filed by the S9 pass
 at 4906691d7 (`analysis/m0146/m0146-0014/routing-20261019e/`).
 
 ## 1. Record
@@ -93,3 +93,29 @@ Evidence: `analysis/m0146/m0146-0229/fireset3/` and `accept2`.
   (150 vs PG 173; the web branch 76 vs 126).
 - The member projection charge (§3, tried-and-dropped), once the partial and mixed Append costs are aligned with
   PG's numbers for TestParameterisedAppendOverUnionAll's fixture.
+
+## 6. M0146-0229a (2026-10-19): SF1 Q74's runtime is the plan's, in PG as in goopg
+
+The owner filed this recon to establish whether Q74's 520–560 s, which straddles the fire-set's 600 s
+FIRESET\_TIMEOUT, is a goopg slowdown or a PG executor mechanism goopg lacks. Evidence:
+`analysis/m0146/m0146-0229/q74-recon/` (goopg) and `analysis/m0146/m0146-0229/q74-timing/` (PG, owner-captured).
+
+- **Same plan.** Q74's plan is PG's (text-identical with costs stripped). The `year_total` CTE (UNION ALL of two
+  grouped legs, about 3 s to build in both engines) is read by four CTE Scans. Each scan's quals (sale\_type, year,
+  year\_total > 0) leave PG and goopg alike estimating 1 row; actually 37708 / 38252 / 11256 / 11153 rows come out.
+  So the planner nests them: about 1.44 × 10⁹ pairs on `t_s_secyear`, then 14505 and 1585 passes over the web legs.
+- **PG is slower.** PG 18.3 takes 896 s plain (owner, 78c59cd5d) and 897 s under EXPLAIN (ANALYZE, BUFFERS).
+  542 s of that is the `t_s_secyear` CTE Scan (14.4 ms × 37708 loops) and 250 s is `t_w_firstyear`. goopg takes
+  452 s under EXPLAIN (ANALYZE) on a fresh clone of the reloaded corpus, and 520–560 s in the earlier plain runs.
+  goopg's inner CTE Scans report `loops=1` because its nested loop replays a materialized inner, where PG rescans the
+  tuplestore. That is an instrumentation-counting difference, not a plan difference.
+- **Profile (goopg, 90 s during the nested-loop phase).** 98% of CPU is under `nlJoinStream.stepInner` →
+  `joinPredicateMatch`, the `customer_id` (bpchar) equality.
+  - 37 s of 101 s lands on `textShapeAmbiguous`'s first byte read (`as[0]`). That is the first touch of each
+    compared string, a cache miss on heap-scattered string data. The comparison itself would take the same miss, so
+    the shape check is not the cost.
+  - The rest is the evaluator (`evalExprSlot`, `compareDatum`, bpchar padding helpers).
+- **Verdict.** There is no PG executor mechanism that makes this shape fast — PG is about 2× slower on it — and no
+  goopg-side slowdown relative to PG. Nothing is filed. Q74's runtime is inherent to the PG-identical plan. Leaving it
+  under 600 s would need a plan PG does not choose. So the fire-set's SF1 Q74 timeout is structural, not transient:
+  owner's call whether to keep the allow-list row past 2026-11-30 or to raise FIRESET\_TIMEOUT for SF1.

@@ -5017,10 +5017,11 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       finished inside the timeout this run, allowlist unused; 19 fired results byte\-identical; parity 97/94 held\)\.
     - Q23 still SHAPE\-DIFF at depth 1: the Incremental Sort arm is generated but loses on goopg's 226\-row branch
       estimate against PG's 299\. Next slice: that estimate \(design §5\)\. Then M0146\-0229a\.
-- [ ] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
+- [x] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
   optimisation for its shape, or a goopg executor slowdown?** \(filed 2026\-10\-19 by the owner; placed in banner
   item 3 directly after M0146\-0229 slice 1\)\.
   Kind: recon
+  Movement: none — recon \(PG 18\.3 runs Q74 in 896 s on the identical plan; goopg 452 s; no mechanism to port\)
   Parent: M0146\-0229
   - Why: Q74's plan MATCHes PG \(text\-identical, costs stripped\), so the runtime gap is executor\-side\. It sits
     on the 600 s FIRESET\_TIMEOUT and is provisionally allowlisted there; the allowlist row expires 2026\-11\-30\.
@@ -5046,6 +5047,16 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     \(M0146\-0229b, \-0229c, …; `Parent: M0146\-0229`\) citing the PG executor code it ports or the goopg hot path it
     removes, with expected instrument = SF1 Q74 runtime \(and the fire\-set allowlist row retired when Q74 clears
     600 s with margin\)\. If nothing is found, close with `Movement: none — recon` and the evidence\.
+  - **CLOSED 2026\-10\-19: nothing found — PG is slower on the same plan\.** Design
+    `docs/design/0100\-0149/m0146\-0229\-ordered\-append\-incremental\-sort\.md` §6; evidence
+    `analysis/m0146/m0146\-0229/q74\-recon/`\.
+    - goopg EXPLAIN \(ANALYZE\) on a fresh SF1 clone: 452 s, PG's plan node for node; PG 896 s plain / 897 s under
+      ANALYZE\. Both estimate the four filtered CTE Scans at rows=1 \(actual 37708/38252/11256/11153\), so both nest
+      ≈1\.44×10⁹ bpchar comparisons\.
+    - CPU profile: 98% under the nested loop's join predicate; the 37 s on `textShapeAmbiguous` is the first touch
+      \(cache miss\) of each compared string, which the comparison itself would take — not a removable cost\.
+    - No impl sub\-task filed\. The SF1 Q74 fire\-set timeout is structural \(inherent to the PG\-identical plan\);
+      owner's call: keep the allowlist row past 2026\-11\-30 or raise FIRESET\_TIMEOUT for SF1\.
 - [ ] **M0146\-0230 — join estimates: port eqjoinsel\_inner's MCV arm \(and neqjoinsel over it\); goopg estimates every
   equality / `<>` join from ndistinct alone** \(filed 2026\-10\-19 by M0146\-0214 slice 3\)\.
   Kind: impl

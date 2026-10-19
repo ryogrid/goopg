@@ -1,0 +1,20 @@
+Total: 101.05s
+ROUTINE ======================== github.com/goopg/goopg/internal/executor.textShapeAmbiguous in /home/ryo/work/goopg/goopg/internal/executor/text_compare.go
+    37.78s     39.21s (flat, cum) 38.80% of Total
+      20ms       20ms     59:func textShapeAmbiguous(a, b Datum) bool {
+     270ms      270ms     60:	if a.Kind != KindString || b.Kind != KindString {
+         .          .     61:		return false
+         .          .     62:	}
+     290ms      980ms     63:	as, bs := a.StringValue(), b.StringValue()
+    37.05s     37.05s     64:	if len(as) > 0 && len(bs) > 0 && as[0] == bs[0] && (as[0] == '(' || as[0] == '{') {
+         .          .     65:		return true
+         .          .     66:	}
+      90ms      620ms     67:	if looksLikePgLSN(as) && looksLikePgLSN(bs) {
+         .          .     68:		return true
+         .          .     69:	}
+      60ms      270ms     70:	return isValidUUIDStr(as) || isValidUUIDStr(bs)
+         .          .     71:}
+         .          .     72:
+         .          .     73:// compareText compares two string Datums as plain strings (bttextcmp under
+         .          .     74:// the C collation).
+         .          .     75:func compareText(a, b Datum) int {
