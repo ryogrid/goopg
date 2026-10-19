@@ -1704,9 +1704,11 @@ func TestSetOpBranchPickSkipsUnrunnablePartial(t *testing.T) {
 // partialPathDrivingKind answers the build's TERMINAL driving kind, so a
 // merge-join build over a seqscan outer is admitted (each participant
 // merge-joins its claimed outer partition against the whole inner) while
-// a bitmap- or index-driven build finds no claim state in the leaf set
-// and would feed the whole relation into the shared table once per
-// participant.
+// a bitmap-driven build finds no claim state in the leaf set and would feed
+// the whole relation into the shared table once per participant. M0146-0228
+// admitted an index-driven build (parallelHashBuildIsClaimable): the leaf set
+// carries its own pidx, which attachAll wires to the index or index-only scan;
+// a parameterised index build is still no partial path at all.
 func TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild(t *testing.T) {
 	scan := func() *Path {
 		return &Path{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2}
@@ -1724,7 +1726,8 @@ func TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild(t *testing.T) {
 		{"parallel-hash-merge-over-seq-build", phj(&Path{Kind: PathMergeJoin,
 			Children: []*Path{scan(), scan()}}), false},
 		{"parallel-hash-bitmap-build", phj(&Path{Kind: PathBitmapHeapScan}), true},
-		{"parallel-hash-index-build", phj(&Path{Kind: PathIndexScan}), true},
+		{"parallel-hash-index-build", phj(&Path{Kind: PathIndexScan}), false},
+		{"parallel-hash-param-index-build", phj(&Path{Kind: PathIndexScan, RequiredOuter: 1}), true},
 		{"parallel-hash-merge-over-bitmap-build", phj(&Path{Kind: PathMergeJoin,
 			Children: []*Path{{Kind: PathBitmapHeapScan}, scan()}}), true},
 		{"plain-hash-any-build", &Path{Kind: PathHashJoin, ParallelSafe: true,

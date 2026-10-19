@@ -607,6 +607,29 @@ func paramProbePathIsPartialProbe(c *Path) bool {
 	return false
 }
 
+// parallelHashBuildIsClaimable reports whether a Parallel Hash join's partial
+// build side is driven by a scan the join's own claim set wires: the executor's
+// attachParallelHashBuildSides hands the build to attachAll over a leaf claim
+// set (hashBuildBranch) holding a block claim (pscan) and a leaf-block claim
+// (pidx), so a seq scan and an index or index-only scan are claimed. A bitmap
+// build is not — the leaf set has no prebuilt bitmap — and an unclaimed build
+// means every participant inserts the whole relation into the shared table,
+// N copies of every inner row. The producer gate (addParallelHashJoinPath's
+// PH2) and partialPathDrivingKind's two Parallel Hash arms share this one
+// predicate so they cannot drift.
+//
+// M0146-0228 admitted the index arm: TPC-DS Q23's best_ss_customer builds its
+// Parallel Hash from a Parallel Index Only Scan on customer_pkey in PG.
+// TestParallelHashIndexOnlyBuildIdentityWithSerial (internal/executor) pins the
+// claim by parallel-vs-serial identity and the published build-row count.
+func parallelHashBuildIsClaimable(build *Path) bool {
+	switch partialPathDrivingKind(build) {
+	case PathSeqScan, PathIndexScan:
+		return true
+	}
+	return false
+}
+
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
 		return PathPrebuilt
@@ -698,12 +721,8 @@ func partialPathDrivingKind(p *Path) PathKind {
 		}
 		// M0146-0002: a Parallel Hash join's BUILD side is partial too, and
 		// the executor claims it through the join's own claim set
-		// (attachParallelHashBuildSides). Only a partial seq scan is admitted
-		// there: a bitmap build would find no prebuilt bitmap in that set,
-		// and any other shape is one this slice never proved — an unclaimed
-		// build side means every participant builds the whole relation into
-		// the shared table, N copies of every inner row.
-		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+		// (attachParallelHashBuildSides) — parallelHashBuildIsClaimable.
+		if p.ParallelHash && !parallelHashBuildIsClaimable(p.Children[1]) {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
@@ -964,10 +983,8 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// parallelChildren's *SetOp arm (ParallelHashJoinsIn), and
 		// stampParallelScan labels the build side through the *SetOp
 		// branch descent. The same build-side restriction the top-level
-		// PathHashJoin arm carries applies: only a seq-scan-driven build
-		// — a bitmap build would find no prebuilt bitmap in the leaf
-		// claim set, and an unclaimed build is the N-copies defect.
-		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+		// PathHashJoin arm carries applies (parallelHashBuildIsClaimable).
+		if p.ParallelHash && !parallelHashBuildIsClaimable(p.Children[1]) {
 			return false
 		}
 		return setOpBranchDrivingKindIsSupported(p.Children[0])

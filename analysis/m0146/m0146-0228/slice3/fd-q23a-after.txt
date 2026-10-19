@@ -1,0 +1,4 @@
+Q23 MATCH (no structural divergence)
+FIRST-DIVERGENCE: queries=1 divergent=0 match=1
+CATEGORY-ROLLUP: 
+FIRST-DIVERGENCE TABLE (category | parent | PG child | goopg child | depth -> count):

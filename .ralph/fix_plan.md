@@ -4799,9 +4799,10 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pins: TestPulledSublinksFoldUnderJoinCollapseLimit, TestSubproblemLeafVarKeepsBaseRelStats, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(Q69 changed\),
       tpcds\-fireset PASS \(2 fired results byte\-identical\)\.
-- [ ] **M0146\-0228 — aggregation\-strategy: TPC\-DS SF1 Q23 — PG partially aggregates the best\_ss\_customer CTE under a
+- [x] **M0146\-0228 — aggregation\-strategy: TPC\-DS SF1 Q23 — PG partially aggregates the best\_ss\_customer CTE under a
   Gather \(Finalize HashAggregate\); goopg aggregates it serially** \(filed 2026\-10\-19 by the S9 pass at 8465f5e72\)\.
   Kind: impl
+  Movement: none — S3 instruments unchanged \(SF1 match 82, PG\-statistics 94, CATEGORIES\-EXCL\-MATCH identical\): Q23 statement 1 now MATCHes PG and the query's first divergence moved depth 5→1 onto statement 2 \(sort\-strategy\)
   Parent: M0146-0014
   - Record: TPC\-DS SF1 Q23, category aggregation\-strategy, verdict SHAPE\-DIFF at depth 2 \(under CTE: PG Finalize
     HashAggregate \| goopg HashAggregate\)\. Persists under PG statistics\. Census
@@ -4833,6 +4834,19 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestQualEvalPricesNumericCoercions, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(6 plans
       changed\), tpcds\-fireset PASS \(12 fired results byte\-identical\)\.
+  - **Slice 3 LANDED 2026\-10\-19: a Parallel Hash build over a partial index scan\.** Design §5/§6; evidence
+    `analysis/m0146/m0146\-0228/slice3/`, `census3/`, `fireset3/`\.
+    - PH2 vetoed PG's arm \(the build had to be a partial seq scan\); partialPathDrivingKind's hash arm carried the
+      same rule, so lifting PH2 alone made makeGatherPath refuse the split's partial input\.
+    - parallelHashBuildIsClaimable is now the one predicate for all three gates and admits a plain index or
+      index\-only build; the executor already claims it through the join's leaf pidx\.
+    - Q23's CTE plans PG's Partial HashAggregate 70312\.46\.\.71562\.46 over the Parallel Hash Join with a Parallel
+      Index Only Scan build; statement 1 MATCHes PG\. The rest is a separate sort\-strategy record \(statement 2's
+      Incremental Sort\) for the next S9 pass, plus a cost\-only ledger row \(subquery boundary cpu\_tuple\_cost\)\.
+    - Pins: TestParallelHashIndexOnlyBuildIdentityWithSerial \(executor values\),
+      TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99, tpcds\-fireset
+      PASS \(Q23 fired, results byte\-identical\); TPC\-H 22/22 text\-identical; only Q23 changed\.
   - Next \(slice 3\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
     customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
     \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.

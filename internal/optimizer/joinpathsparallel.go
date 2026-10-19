@@ -577,10 +577,10 @@ func cheapestParallelSafeTotalInner(paths []*Path) *Path {
 // sees the total under the combined budget (hashJoinInputs.parallelHash).
 //
 // One refusal PG does not have, executor capacity (M0145-0010 scope (d):
-// never admit a shape the executor cannot run): the inner must be a partial
-// SEQ SCAN — the one build shape whose claims the executor wires
-// (attachParallelHashBuildSides; partialPathDrivingKind refuses the rest the
-// same way). The former second refusal, "the build must fit one batch"
+// never admit a shape the executor cannot run): the inner must be a build
+// shape whose claims the executor wires — parallelHashBuildIsClaimable, shared
+// with partialPathDrivingKind's two Parallel Hash arms. The former second
+// refusal, "the build must fit one batch"
 // (PH4), is gone (M0146-0096): the executor batches a spilled share for
 // every join type (M0146-0090, M0146-0095).
 func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o, i *Path, cp costParams,
@@ -592,7 +592,7 @@ func addParallelHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, o,
 		veto("PH1")
 		return
 	}
-	if partialPathDrivingKind(i) != PathSeqScan {
+	if !parallelHashBuildIsClaimable(i) {
 		veto("PH2")
 		return
 	}

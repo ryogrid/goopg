@@ -1,6 +1,6 @@
 # M0146-0228 — TPC-DS SF1 Q23: aggregate input-expression cost
 
-Status: slices 1 (aggregate input-expression cost) and 2 (numeric-family coercion cost) landed 2026-10-19. The task stays open for the Parallel Hash Join under Q23's partial aggregate (§5). Filed by the S9 pass at 8465f5e72
+Status: closed 2026-10-19. Slices 1 (aggregate input-expression cost), 2 (numeric-family coercion cost) and 3 (a Parallel Hash build over a partial index-only scan) landed; Q23's first statement matches PG. Filed by the S9 pass at 8465f5e72
 (`analysis/m0146/m0146-0014/routing-20261019d/`). Evidence: `analysis/m0146/m0146-0228/`.
 
 ## 1. Record
@@ -91,9 +91,54 @@ Measured (census `analysis/m0146/m0146-0228/census2/`, m28b):
 
 Pin: `TestQualEvalPricesNumericCoercions`, mutation-checked.
 
-## 5. Open: the Parallel Hash Join under the partial aggregate
+## 5. Slice 3: a Parallel Hash build over a partial index scan
 
-Under PG statistics, Q23's partial aggregate now reads its input from a non-parallel-aware Hash Join: a Parallel Seq
-Scan on store_sales probes a private Hash of an Index Only Scan on customer (3876.33..64750.26). PG builds a
-Parallel Hash Join with a Parallel Index Only Scan on customer_pkey and a Parallel Hash (2563.84..63437.77). Next:
-trace the partial paths of (store_sales_2, customer_1) and price PG's parallel-hash arm.
+After slice 2, Q23's partial aggregate read a non-parallel-aware Hash Join: a Parallel Seq Scan on store\_sales probed
+a private Hash of an Index Only Scan on customer (3876.33..64750.26). PG builds a Parallel Hash Join whose Parallel
+Hash reads a Parallel Index Only Scan on customer\_pkey (2563.84..63437.77).
+
+Diagnosis, on the SF1 PG-statistics clone with `GOOPG_PGSHAPED_DP_TRACE=1`
+(`analysis/m0146/m0146-0228/slice3/`):
+
+- goopg never generated the arm. addParallelHashJoinPath vetoed it with PH2: the build side had to be a partial seq
+  scan.
+- Lifting PH2 alone generated the path at PG's exact cost, but nothing consumed it. searchedCheapestPartialInput's
+  makeGatherPath returned nil, because partialPathDrivingKind's PathHashJoin arm carries the same seq-scan-only
+  build rule. The split then fell back to parallelSeedCost over the serial child (a wrong 32786.95..34036.95 partial
+  aggregate over a serial-cost Hash Join).
+
+The executor already claims an index build. attachParallelHashBuildSides hands the build side to attachAll over the
+join's own leaf claim set (hashBuildBranch). That set holds a leaf-block claim (pidx), and attachParallelIndexScan
+wires it to an indexScanOp or indexOnlyScanOp. The restriction only recorded that this path was never proved.
+
+The change:
+
+- parallelHashBuildIsClaimable (gatherpaths.go) is one predicate for the three build-side gates: PH2 in
+  addParallelHashJoinPath, partialPathDrivingKind's PathHashJoin arm, and the SetOp-branch arm. It admits a seq scan
+  and a plain (unparameterised) index or index-only scan. A bitmap build stays refused: the leaf set has no
+  prebuilt bitmap.
+- TestParallelHashIndexOnlyBuildIdentityWithSerial (internal/executor) is the executor proof. It runs a Parallel
+  Hash join whose build is a partial index-only scan, for an inner join and an anti join, over a range covering
+  every leaf block and over a partial range. It checks that the rows equal the serial plan's and that the
+  participants published every build row exactly once (5 builders).
+- TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild now admits an index build and still refuses a
+  parameterised one. Mutation-checked: a seq-only predicate fails it.
+
+Result:
+
+- Q23's CTE plans PG's Partial HashAggregate (70312.46..71562.46) over the Parallel Hash Join (2563.84..63437.77) with
+  a Parallel Index Only Scan build.
+- Q23's first statement MATCHes PG under PG statistics. The query's first divergence moved from depth 5
+  (parallelism) to depth 1 (sort-strategy) on query23's second statement, under both PG and shipped statistics.
+- Only Q23 changed text: TPC-H 22/22 text-identical, SF0.25 sweep PASS, SF1 PG statistics 94/99.
+- The fire set fired Q23 only, and its baseline and candidate results are byte-identical.
+
+## 6. Open residuals
+
+- Query23's second statement: PG sorts under its Limit with an Incremental Sort, goopg with a Sort. This is a
+  separate sort-strategy record, left for the next S9 pass.
+- Cost only: the InitPlan's plain Aggregate (max over the grouped derived table) costs 74422.22 in goopg against PG's
+  73875.38, with the same HashAggregate input. PG charges 0.0125 per input row: cost\_subqueryscan's cpu\_tuple\_cost,
+  which stays in the input after setrefs drops the trivial SubqueryScan, plus numeric\_larger's procost. goopg
+  charges 0.0225, so the subquery boundary is charged one cpu\_tuple\_cost too many. `max`'s argument is a
+  ColumnRef (0 ops), so this is not slice 1's input charge. Ledger row 2026-10-19.
