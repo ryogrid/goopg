@@ -4373,6 +4373,12 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       \(Q64 fired at both scales, byte\-identical\)\.
     - Next slice: compare the GEQO\-joinrel partial / Gather Merge paths with PG on tour 14's join 6
       \(\(b 1 3 7 9 10 11 12 16\): PG Gather Merge 1003\.38\.\.6\.42e9, goopg serial NL 1\.98e10\)\.
+  - **Slice 5 \(diagnosis\) 2026\-10\-19 → filed M0146\-0231\.** Design §9; evidence `analysis/m0146/m0146\-0214/slice5/`\.
+    - Partial paths match PG up to \(b 1 7 9 10 11 12 16\); adding cs\_ui, PG files a partial Merge Join whose inner
+      is a DIFFERENT, parallel\-safe SubqueryScan path of cs\_ui \(0\.7225\.\.42006\.29, ordered on cs\_item\_sk\) —
+      set\_subquery\_pathlist keeps every path of the subquery's final rel\. goopg's subquery leaf is one prebuilt
+      path \(the cheapest, with a Gather Merge inside, not parallel\-safe\), so no partial merge is possible\.
+    - Next: M0146\-0231, then re\-run the 500\-tour comparison\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -5101,3 +5107,21 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestSearchEqJoinUsesBothSidesMCVLists \(mutation\-checked\)\.
     - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
       sf025 PASS=99 \(8 plans changed text\), tpcds\-fireset PASS \(14 fired results byte\-identical\)\.
+- [ ] **M0146\-0231 — subquery / inlined\-CTE leaves offer the join search one prebuilt path; PG's
+  set\_subquery\_pathlist offers every surviving path of the subquery's final rel** \(filed 2026\-10\-19 by M0146\-0214
+  slice 5\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF0\.25 Q64, join\-order, SHAPE\-DIFF at depth 5\. GEQO tour 14: PG files a partial Merge Join over
+    \(b 1 7 9 10 11 12 16\) ⋈ cs\_ui whose inner is cs\_ui's parallel\-safe, cs\_item\_sk\-ordered SubqueryScan path
+    \(0\.7225\.\.42006\.29\); its Gather Merge \(1003\.38\.\.6\.42e9\) is the joinrel's cheapest\. goopg's cs\_ui leaf has
+    only its cheapest plan \(13811\.71\.\.13815\.10, a Gather Merge inside, not parallel\-safe\) → serial 1\.98e10\.
+    Evidence `analysis/m0146/m0146\-0214/slice5/`\.
+  - PG: set\_subquery\_pathlist \(allpaths\.c\) builds a SubqueryScan path for each path of the subquery's
+    final\_rel \(pathkeys converted by convert\_subquery\_pathkeys; parallel\_safe carried\)\. goopg: the derived leaf
+    is one PathPrebuilt \(ctescanpathkeys\.go converts its pathkeys only\)\.
+  - First step: find where a derived / inlined\-CTE leaf's PathPrebuilt is built \(joinsearch\.go costSubplanLeaf
+    callers\) and whether the subquery's planning keeps its final rel's other paths \(cheapest parallel\-safe; cheapest
+    per pathkeys\); offer them as additional leaf paths, each planned to a Node only when chosen\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q64\) once the GEQO pool order converges; tour 14's join
+    6 cheapest = PG's Gather Merge\.

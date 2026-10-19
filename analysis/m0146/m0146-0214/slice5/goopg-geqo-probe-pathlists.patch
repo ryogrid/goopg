@@ -1,0 +1,23 @@
+diff --git a/internal/optimizer/geqo.go b/internal/optimizer/geqo.go
+index 23f96ee64..797b8ccdc 100644
+--- a/internal/optimizer/geqo.go
++++ b/internal/optimizer/geqo.go
+@@ -442,6 +442,18 @@ func geqoProbeJoin(joinrel *RelOptInfo) {
+ 	if len(p.Children) == 2 {
+ 		fmt.Fprintf(os.Stderr, "GEQOJOINKIDS outer=%s inner=%s\n", kid(p.Children[0], 0), kid(p.Children[1], 0))
+ 	}
++	for _, pp := range joinrel.PartialPathlist {
++		if pp != nil {
++			fmt.Fprintf(os.Stderr, "GEQOPARTIAL relids=%s kind=%d startup=%.6f total=%.6f rows=%.0f pk=%d workers=%d\n",
++				bms(joinrel.Relids), pp.Kind, pp.Cost.Startup, pp.Cost.Total, pp.Rows, len(pp.Pathkeys), pp.ParallelWorkers)
++		}
++	}
++	for _, pp := range joinrel.Pathlist {
++		if pp != nil {
++			fmt.Fprintf(os.Stderr, "GEQOPATH relids=%s kind=%d startup=%.6f total=%.6f rows=%.0f pk=%d\n",
++				bms(joinrel.Relids), pp.Kind, pp.Cost.Startup, pp.Cost.Total, pp.Rows, len(pp.Pathkeys))
++		}
++	}
+ }
+ 
+ func geqoEvalTour(s *searchCtx, tour []Gene, numGene int, probe bool) float64 {

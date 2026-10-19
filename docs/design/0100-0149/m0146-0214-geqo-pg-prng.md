@@ -206,3 +206,26 @@ the PG probe now also prints each join's input paths and MergePath's sort and ma
   - units, TestPort\_RegressSuite, tpch-spotcheck and the acceptance arm (values identical) pass.
   - The sf025 sweep is PASS=99, with one plan changed.
   - tpcds-fireset passes: Q64 fired at both scales and its results are byte-identical.
+
+## 9. Slice 5 (2026-10-19, diagnosis): a subquery leaf offers PG only one path
+
+The Gather Merge class from §8 was traced on SF0.25 Q64 tour 14. Both probes now also print each traced joinrel's
+partial\_pathlist and pathlist; PG's also prints the inputs of partial join paths. Evidence:
+`analysis/m0146/m0146-0214/slice5/`. The goopg probe extension is parked there as a patch.
+
+- **The partial paths match until gene 3.** Every partial path matches PG's, cost for cost, up to
+  `(b 1 7 9 10 11 12 16)`, a partial nested loop with pathkeys 2 (2.615..5.62 × 10⁹, 3 workers).
+- **At the next join, adding gene 3 (`cs_ui`), PG files a partial Merge Join** (3.34..6.37 × 10⁹, 128M rows,
+  3 workers, pathkeys 2), and its Gather Merge is the joinrel's cheapest path (1003.38..6.42 × 10⁹). goopg files no
+  partial path, so its cheapest is a serial Merge Join (13814.18..1.98 × 10¹⁰).
+- **The inner of PG's partial merge is not cs\_ui's cheapest path.** PG's cheapest cs\_ui path (13811.71..13815.10)
+  holds a Gather Merge and is not parallel-safe. The partial merge's inner is a different SubqueryScan path of the same
+  rel: 0.7225..42006.29, 7 rows, ordered on cs\_item\_sk, `parallel_safe`, with no sort or materialize.
+  set\_subquery\_pathlist (allpaths.c) turns every surviving path of the subquery's final rel into a SubqueryScan
+  path. consider\_parallel\_mergejoin then finds this one as the parallel-safe presorted inner.
+- **goopg's subquery leaf is one prebuilt path:** the cheapest plan, holding the Gather Merge, so not parallel-safe.
+  There is no parallel-safe alternative for the partial arms to use, and so no partial merge.
+- **Filed M0146-0230's sibling, M0146-0231:** subquery and inlined-CTE leaves should offer the search the
+  set\_subquery\_pathlist path set, at least the cheapest parallel-safe path and the cheapest path per useful
+  ordering. Until then, SF0.25 Q64's tours over cs\_ui keep a costlier serial cheapest path. Those tours have worths
+  around 10¹⁰, but the GEQO pool's ordering among them still steers selection.
