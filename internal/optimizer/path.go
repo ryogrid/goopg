@@ -887,6 +887,24 @@ type rangeTblEntry struct {
 	// create_unique_path's estimate_num_groups over a multi-relation semijoin
 	// RHS). Set by makeJoinRel; nil on base rels.
 	memberRels []*RelOptInfo
+	// publishedMembers are the base relations whose columns the joinrel's
+	// row carries: memberRels less any SEMI/ANTI join's RHS
+	// (joinPublishesInner). joinNarrow is the joinrel's build_joinrel_tlist
+	// cost triple over them (joinrelNarrowedWidths, M0146-0234).
+	publishedMembers []*RelOptInfo
+	joinNarrow       narrowedWidths
+}
+
+// publishedBaseMembers is the base relations rel's row carries: itself for a
+// base relation, publishedMembers for a joinrel.
+func (r *RelOptInfo) publishedBaseMembers() []*RelOptInfo {
+	if r == nil {
+		return nil
+	}
+	if r.baseLeaf != nil {
+		return []*RelOptInfo{r}
+	}
+	return r.publishedMembers
 }
 
 // baseMembers returns the base relations rel is made of: itself for a base

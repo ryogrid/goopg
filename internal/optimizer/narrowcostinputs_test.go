@@ -746,3 +746,45 @@ func TestR124AcceptedAvgVarDivergenceOnNonTableChild(t *testing.T) {
 			j.AvgVarBytes, executorCharge)
 	}
 }
+
+// M0146-0234: build_joinrel_tlist for the cost triple. A joinrel keeps a
+// column only while the output above the tree or a join clause reaching past
+// the joinrel reads it; a join key consumed inside the joinrel drops out.
+func TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	a := ncRel([]string{"a_key", "a_out"}, ncNeeded("a_key", "a_out", "b_key", "b_c", "c_key"), true,
+		map[string]float64{"a_key": 4, "a_out": 30})
+	a.Relids = RelSet(1)
+	b := ncRel([]string{"b_key", "b_c"}, ncNeeded("a_key", "a_out", "b_key", "b_c", "c_key"), true,
+		map[string]float64{"b_key": 4, "b_c": 8})
+	b.Relids = RelSet(2)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded("a_out"),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(3), "a_key", "b_key"), // inside the joinrel: both keys drop
+			clause(RelSet(6), "b_c", "c_key"),   // reaches c: b_c stays
+		}},
+	}
+	j := newRelOptInfo(RelSet(3), 10, 64)
+	j.publishedMembers = []*RelOptInfo{a, b}
+	got := s.joinrelNarrowedWidths(j)
+	if !got.ok || got.ncols != 2 || got.outputWidth != 38 {
+		t.Fatalf("joinrel triple = %+v, want a_out + b_c (2 cols, width 30+8)", got)
+	}
+	// A SEMI join publishes its LHS alone: only a's kept column counts.
+	j.publishedMembers = []*RelOptInfo{a}
+	if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 1 || got.outputWidth != 30 {
+		t.Fatalf("semi joinrel triple = %+v, want a_out only", got)
+	}
+	// Not output-eligible: decline, so the children's sum stays.
+	s.outputEligible = false
+	if got := s.joinrelNarrowedWidths(j); got.ok {
+		t.Fatalf("ineligible problem narrowed the joinrel: %+v", got)
+	}
+}

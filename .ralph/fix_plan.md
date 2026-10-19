@@ -5234,6 +5234,21 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Next: build\_joinrel\_tlist's attr\_needed narrowing — a joinrel keeps an attribute only while a relation outside
       it needs it; goopg's NeededCols is one statement\-wide name set \(join 9: 155 vs PG 96\)\. Then non\-table leaves'
       widths from the subquery target list \(set\_subquery\_size\_estimates\)\.
+  - **Slice 2 2026\-10\-20: joinrel target after build\_joinrel\_tlist\.** Design §8; evidence
+    `analysis/m0146/m0146\-0234/slice2/`\.
+    - joinrelNarrowedWidths \(computed at joinrel creation\): keep = outputCols ∪ names read by clauses reaching past the
+      joinrel; the triple sums the published base members' kept columns \(SEMI/ANTI RHS excluded\);
+      narrowJoinWidths stamps it on every path of the rel\. Declines to the children's sum when ineligible\.
+    - SF1 Q64: join 9's outer Sort width 155→99–103 \(PG 96\); evals before the first differing tour off >1e\-3:
+      1→0, max error 0\.0046→0\.00067 \(eval 173 0\.0046→0\.00022, eval 41 0\.00098→0\.00012\)\. Two worth\-order
+      inversions remain \(evals 96/138, 159/248, ~1e\-5 errors\)\. Fire\-set 98/94 and TPC\-H 22/22 unchanged; no fired
+      plan change\.
+    - Pin: TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity 22/22, sf025 PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(max error 0\.0046→0\.00067\)\.
+    - Remaining \(task stays open\): base rels narrow to the statement\-wide set \(PG's base reltarget drops columns read
+      only by the rel's own restriction quals\); non\-table leaves use type widths\.
 - [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl

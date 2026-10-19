@@ -102,13 +102,13 @@ type narrowedWidths struct {
 //     column with no statistics rather than mapping it to zero, precisely so
 //     this case is distinguishable — declining here fails HIGH, which is the
 //     direction that cannot under-size a build.
-func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 	if !narrowCostInputsEnabled() || rel == nil || rel.baseLeaf == nil {
-		return narrowedWidths{}
+		return nil, false
 	}
 	keep, ok := scanPathTarget(rel)
 	if !ok || len(keep) == 0 {
-		return narrowedWidths{}
+		return nil, false
 	}
 	out := rel.baseLeaf.Output()
 
@@ -150,22 +150,22 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 	// `plan.AvgVarBytes` over REL fields (createplanjoin.go).
 	noColMap := len(rel.ColVarBytes) == 0
 	if noColMap && rel.AvgVarBytes != 0 {
-		return narrowedWidths{}
+		return nil, false
 	}
 
-	var avg float64
+	cols := make([]keptColumn, 0, len(keep))
 	// width is set_rel_width (costsize.c) over the kept columns: each
 	// attribute's get_attavgwidth — pg_statistic.stawidth, ANALYZE's average
 	// width — and get_typavgwidth only for a column without one (M0146-0234).
 	// The type-only sum priced char(n)/varchar columns at their declared
 	// sliding-scale width: TPC-DS SF1 Q64's partial-merge outer Sort at width
 	// 664 where PG's is 96.
-	width := 0
 	for _, i := range keep {
 		if i < 0 || i >= len(out) {
-			return narrowedWidths{}
+			return nil, false
 		}
 		col := out[i]
+		kc := keptColumn{name: col.Name}
 		if !noColMap {
 			// Coordinate conversion, not an aside: neededKeepSet matches column
 			// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
@@ -174,28 +174,109 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 			if !found {
 				// Unattributed column — decline the whole rel rather than
 				// contribute a silent zero.
-				return narrowedWidths{}
+				return nil, false
 			}
-			avg += w
+			// noColMap leaves varBytes at a literal 0 — see the block
+			// comment above.
+			kc.varBytes = w
 		}
 		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
-			width += int(aw)
+			kc.width = int(aw)
 		} else {
-			width += typeWidth(col.Type)
+			kc.width = typeWidth(col.Type)
+		}
+		cols = append(cols, kc)
+	}
+	return cols, true
+}
+
+// keptColumn is one column a base rel's narrowed target keeps: its name, its
+// set_rel_width width and its variable-width payload.
+type keptColumn struct {
+	name     string
+	width    int
+	varBytes float64
+}
+
+// relNarrowedWidths computes the triple once per base rel: the sums over
+// relNarrowedColumns.
+func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+	cols, ok := relNarrowedColumns(rel)
+	if !ok {
+		return narrowedWidths{}
+	}
+	return sumKeptColumns(cols, nil)
+}
+
+// sumKeptColumns is a narrowed triple over cols, restricted to the names in
+// keep when keep is non-nil. A sum over no column declines: "narrowed to zero
+// columns" is unrepresentable (see relNarrowedColumns).
+func sumKeptColumns(cols []keptColumn, keep map[string]bool) narrowedWidths {
+	var n narrowedWidths
+	for _, c := range cols {
+		if keep != nil && !keep[c.name] {
+			continue
+		}
+		n.ncols++
+		n.avgVarBytes += c.varBytes
+		n.outputWidth += c.width
+	}
+	if n.ncols == 0 {
+		return narrowedWidths{}
+	}
+	if n.outputWidth < 1 {
+		n.outputWidth = 1
+	}
+	n.ok = true
+	return n
+}
+
+// joinrelNarrowedWidths is build_joinrel_tlist (relnode.c) for the cost
+// triple (M0146-0234): a joinrel's target holds a base relation's attribute
+// only while attr_needed names a relation outside the joinrel — the query's
+// output above the tree, or a join clause that reaches past it. goopg's base
+// rels narrow to a statement-wide needed set, and a join used to sum its
+// children's triples, so a column read only by a join clause inside the
+// joinrel stayed in its width (TPC-DS SF1 Q64: a partial-merge outer Sort at
+// width 155 where PG's is 96).
+//
+// The keep set is a NAME set, as every narrowing input is: the above-tree
+// names (outputCols) plus every column name read by a search clause whose
+// relids touch both the joinrel and a relation outside it. A name kept for
+// one alias keeps every same-named column — the over-keep direction. It
+// declines (the caller keeps the children's sum) when the problem is not
+// output-eligible, a clause cannot be inventoried, or any published member
+// does not narrow. Only published members count: a SEMI/ANTI join emits its
+// LHS alone (joinPublishesInner).
+func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
+	if s == nil || joinrel == nil || !narrowCostInputsEnabled() || !s.outputEligible ||
+		!s.outputColsKnown || s.outputCols == nil || s.clauses == nil || len(joinrel.publishedMembers) == 0 {
+		return narrowedWidths{}
+	}
+	keep := make(map[string]bool, len(s.outputCols)+16)
+	for name := range s.outputCols {
+		keep[name] = true
+	}
+	for _, ri := range s.clauses.all {
+		if ri == nil || ri.clause == nil {
+			continue
+		}
+		if ri.relids&joinrel.Relids == 0 || relsSubset(ri.relids, joinrel.Relids) {
+			continue
+		}
+		if !visitColumnRefsByName(ri.clause, func(name string) { keep[name] = true }) {
+			return narrowedWidths{}
 		}
 	}
-	if width < 1 {
-		width = 1
+	var cols []keptColumn
+	for _, m := range joinrel.publishedMembers {
+		mc, ok := relNarrowedColumns(m)
+		if !ok {
+			return narrowedWidths{}
+		}
+		cols = append(cols, mc...)
 	}
-	if noColMap {
-		avg = 0 // literal, not defaulted — see the block comment above.
-	}
-	return narrowedWidths{
-		ncols:       len(keep),
-		avgVarBytes: avg,
-		outputWidth: width,
-		ok:          true,
-	}
+	return sumKeptColumns(cols, keep)
 }
 
 // applyTo stamps the triple onto a path. It is a no-op on a decline, so every
@@ -301,6 +382,12 @@ func narrowJoinWidths(p *Path) {
 		return
 	}
 	if len(p.Children) != 2 {
+		return
+	}
+	// M0146-0234: the joinrel's own build_joinrel_tlist triple, the same for
+	// every path of the rel (rule 3), when it could be derived.
+	if p.Rel != nil && p.Rel.joinNarrow.ok {
+		p.Rel.joinNarrow.applyTo(p)
 		return
 	}
 	outer, inner := p.Children[0], p.Children[1]

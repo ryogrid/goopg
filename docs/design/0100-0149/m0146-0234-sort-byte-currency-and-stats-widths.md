@@ -1,6 +1,6 @@
 # M0146-0234 — sorts are priced in PG's byte currency, and narrowed widths come from ANALYZE
 
-Status: slice 1 landed 2026-10-20; the task stays open for the joinrel `attr_needed` narrowing. Parent: M0146-0214.
+Status: slices 1 and 2 landed 2026-10-20. Slice 2 is the joinrel `attr_needed` narrowing (§8). Parent: M0146-0214.
 Evidence: `analysis/m0146/m0146-0234/`.
 
 ## 1. Record
@@ -73,3 +73,39 @@ Its fired result is byte-identical. The SF0.25 sweep shows no plan-shape changes
 - Pins: TestRelNarrowedWidthsNarrowsToNeededColumns now asserts the stawidth sum (mutation-checked).
   TestSortSeedNarrowsWithTheAggregate and TestCostWindowPresortedCreditIsInertAtZero were updated for the PG
   currency.
+
+## 8. Slice 2 (2026-10-20): the joinrel target, after build\_joinrel\_tlist
+
+PG keeps a base relation's attribute in a joinrel's target only while `attr_needed` names a relation outside the
+joinrel (relnode.c `build_joinrel_tlist`). That means the query's output above the tree, or a join clause that
+reaches past the joinrel. A join key consumed inside the joinrel drops out.
+
+**What goopg did.** Its base rels narrow to one statement-wide name set, and a join path summed its two children's
+triples. A key used only by a join inside the joinrel therefore stayed in the joinrel's width.
+
+**The change** (`joinrelNarrowedWidths`, computed once when the joinrel is created):
+- **The keep set** is the above-tree names (`outputCols`), plus every column name read by a search clause whose
+  relids touch both the joinrel and a relation outside it.
+- **The width** is a sum over the joinrel's published base members (`publishedMembers`: a SEMI/ANTI join's RHS is
+  not published, per `joinPublishesInner`). Each member contributes its kept columns' `set_rel_width` widths,
+  restricted to that keep set.
+- **Application.** `narrowJoinWidths` stamps that triple on every path of the joinrel, in place of the children's
+  sum (rule 3).
+- **Declines.** It falls back to the children's sum when the problem is not output-eligible, a clause cannot be
+  inventoried, or a published member does not narrow.
+- **Name sets.** Like every narrowing input, the keep set is a set of names, so a name kept for one alias keeps
+  every same-named column. That errs toward over-keeping.
+
+**Measured on SF1 Q64:**
+- Join 9's outer Sort width goes from 155 to 99–103 (PG 96).
+- Before the first tour that differs from PG's, no eval is now off by more than 10⁻³ (was 1). The largest error is
+  0.00067 (was 0.0046); eval 173 is 0.00022 (was 0.0046), and eval 41 is 0.00012 (was 0.00098).
+- Only two worth-order inversions against PG remain before tour 262: eval 96 against 138, and eval 159 against 248.
+  Both come from errors around 10⁻⁵.
+- Fire-set 98/94 and TPC-H 22/22 are unchanged, and no fired query's plan changed at either scale.
+
+**Residuals.**
+- Base rels still narrow to the statement-wide set, which includes columns read only by their own restriction
+  quals. PG's base `reltarget` excludes those.
+- Non-table leaves still use type widths.
+

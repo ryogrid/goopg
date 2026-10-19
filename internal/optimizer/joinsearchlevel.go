@@ -643,6 +643,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			joinrel.pathkeyClass = joinrel.usefulKeys.equivalentWithin
 		}
 		joinrel.memberRels = append(append([]*RelOptInfo(nil), rel1.baseMembers()...), rel2.baseMembers()...)
+		joinrel.publishedMembers = append([]*RelOptInfo(nil), rel1.publishedBaseMembers()...)
+		if joinPublishesInner(sjinfo) {
+			joinrel.publishedMembers = append(joinrel.publishedMembers, rel2.publishedBaseMembers()...)
+		}
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.
 		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown
@@ -652,6 +656,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		if s.outputEligible {
 			joinrel.OutputCols, joinrel.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
+		joinrel.joinNarrow = s.joinrelNarrowedWidths(joinrel)
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a)... except for a SEMI or ANTI join, which emits its
