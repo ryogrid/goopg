@@ -53,9 +53,41 @@ Census `analysis/m0146/m0146-0227/census/` (m27):
   probes in those queries now carry PG's loop count.
 - Fire set: 5 fired results, all byte-identical.
 
-## 4. Open: the anti-join order (slice 2)
+## 4. Slice 2 diagnosis: join_collapse_limit over the pulled sublinks (in progress)
 
-With the EXISTS leg at PG's cost, goopg's Q69 plan costs 43444.91, 314 above PG's 43130.36, and keeps the Nested Loop
-Anti Join on web_sales at the top. Either PG's order is not generated or goopg prices it higher:
-`catalog_sales` Hash Right Anti Join over `(customer ⋈ ca ⋈ cd ⋈ EXISTS) ⟕anti web_sales`, with the web_sales anti
-join itself a Hash Right Anti Join. Next step: instrument addPath on the top joinrel on the PG-statistics clone.
+With the EXISTS leg at PG's cost, goopg's Q69 costs 43444.91 against PG's 43130.36 and keeps a Nested Loop Anti Join
+on web_sales at the top.
+
+goopg's side, from the DPTRACE/DPPATH trace on the SF0.25 PG-statistics clone (`q69-trace-plan.txt`):
+
+- PG's top IS generated: the `right_anti` hash join with catalog_sales probing and the other seven rels hashed costs
+  32211.13..43141.28, against PG's 32200.20..43130.36.
+- It is dominated. goopg's Nested Loop Anti Join with web_sales inner (26056.65..43444.91) is fuzzily equal on total
+  (within STD_FUZZ_FACTOR 1.01) and better on startup.
+- That NL anti's outer is the rel {c, ca, cd, EXISTS, catalog_sales anti}, built at 22880.00..34248.88.
+
+PG's side, from the exact replica (`tmp/m21-refclone` under the tmp/pgdbg debug build, with an add_path probe;
+`q69-pgprobe7.txt`):
+
+- PG never builds that rel. Across all seven-member join rels, it builds only (c, ca, cd, EXISTS, web_sales anti).
+- At the top it offers only catalog_sales-last splits. Its NL anti there costs 43738.81, more than 1% above the hash
+  join, so the hash join wins.
+
+The cause is `join_collapse_limit`, not join legality:
+
+- `pull_up_sublinks` nests each converted sublink's JoinExpr over the previous one (`j->larg = *jtlink`).
+- `deconstruct_recurse` folds each (larg, rarg) pair under `join_collapse_limit` (initsplan.c). EXISTS gives 3 + 2 =
+  5, then NOT EXISTS(web_sales) gives 5 + 2 = 7, and NOT EXISTS(catalog_sales) gives 7 + 2 = 9 > 8.
+- So PG plans the first seven relations as a sub-problem and joins catalog_sales last.
+- goopg appends every pulled body's leaves to one flat joinlist (`jointreepullup.go`, the `ctx.joinlist` append) and
+  searches a nine-relation problem.
+
+Attempted fix: fold each top-level pulled body with `combineJoinlists(jointype, false, joinlist, bodyLeaves,
+join_collapse_limit)`. The patch is saved at `tmp/m0227/slice2-collapse-fold-wip.patch`; it is not committed.
+
+- It splits Q69 exactly as PG does.
+- It panics in createPlan: "search root does not publish binding coordinate(s) [153 160 187 193 195]".
+- A sub-problem leaf that holds pulled (non-emitting) semi/anti leaves does not publish the binding coordinates the
+  enclosing tree reads.
+- Next: make the sub-problem leaf publication account for pulled leaves (createplanroot.go boundaryMap, the
+  sub-problem leaf's output layout), then re-apply the fold.

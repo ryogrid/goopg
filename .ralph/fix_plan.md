@@ -4779,6 +4779,12 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestLoopCountClampsMultiRelSemijoinRHS, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(3 plans
       changed\), tpcds\-fireset PASS \(5 fired results byte\-identical\)\.
-  - Next \(slice 2\): Q69 now costs 43444\.91, 314 above PG's 43130\.36, and keeps the web\_sales Nested Loop Anti Join
-    on top\. Instrument addPath on the top joinrel: is PG's catalog\_sales Hash Right Anti Join over \(… ⟕anti
-    web\_sales\) generated, and at what cost\?
+  - Slice 2 \(in progress, 2026\-10\-19\): diagnosed; design §4\.
+    - PG's top is generated \(right\_anti hash 32211\.13\.\.43141\.28 vs PG 32200\.20\.\.43130\.36\), but goopg's web\_sales
+      NL anti \(43444\.91\) dominates it inside the 1% fuzz with a lower startup\.
+    - PG never builds that NL anti's outer rel: the exact\-replica add\_path probe shows only \(c, ca, cd, EXISTS,
+      web anti\) at seven members\. The cause is join\_collapse\_limit: the third pulled sublink meets 7 \+ 2 > 8, so
+      PG plans the first seven as a sub\-problem\. goopg appends pulled leaves flat \(jointreepullup\.go\)\.
+    - Fold patch `tmp/m0227/slice2\-collapse\-fold\-wip\.patch` splits Q69 like PG but panics: a sub\-problem
+      holding pulled leaves does not publish the binding coordinates the enclosing tree reads \(createplanroot\.go
+      boundaryMap\)\. Next: fix that publication, then re\-apply the fold\.
