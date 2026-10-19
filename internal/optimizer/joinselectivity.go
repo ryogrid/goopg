@@ -4,7 +4,7 @@ package optimizer
 // `get_variable_numdistinct` and `eqjoinsel`'s no-MCV arm, expressed over the
 // join search's own `restrictInfo` operands.
 //
-// PG oracle: `eqjoinsel_inner`'s else-branch and `neqjoinsel`
+// PG oracle: `eqjoinsel_inner` (both branches since M0146-0230) and `neqjoinsel`
 // (utils/adt/selfuncs.c), `get_variable_numdistinct` (same file),
 // `clause_selectivity_ext`'s `s1 = 0.5` fall-through
 // (optimizer/path/clausesel.c:691), and the DEFAULT_* constants in
@@ -596,6 +596,17 @@ func eqJoinSelectivity(v1, v2 joinVarStats) float64 {
 func eqJoinSelectivityExt(v1, v2 joinVarStats) (float64, bool) {
 	nd1, isdefault1 := getVariableNumDistinct(v1)
 	nd2, isdefault2 := getVariableNumDistinct(v2)
+	// M0146-0230: eqjoinsel_inner's MCV branch, taken first whenever BOTH
+	// operands carry an MCV list (selfuncs.c: "We have most-common-value lists
+	// for both relations"). It is the plan-node estimator's own implementation
+	// (eqjoinselInnerMCVCore), so the search and the node price a join alike.
+	// A matched-MCV estimate is a measurement, not a guess.
+	if v1.stats != nil && v2.stats != nil && len(v1.stats.MCV) > 0 && len(v2.stats.MCV) > 0 {
+		bp := isBpcharTypeName(v1.typeName) && isBpcharTypeName(v2.typeName)
+		if sel, ok := eqjoinselInnerMCVCore(v1.stats, v2.stats, nd1, nd2, bp); ok {
+			return clampSelectivity(sel), false
+		}
+	}
 	nullfrac1, nullfrac2 := 0.0, 0.0
 	if v1.stats != nil {
 		nullfrac1 = v1.stats.NullFrac

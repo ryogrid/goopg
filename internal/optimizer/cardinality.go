@@ -2702,15 +2702,25 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 	if nd1 <= 0 || nd2 <= 0 {
 		return 0, false
 	}
+	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
+	// char(N) list joined to a char(M) list still matches (M0146-0009b).
+	bp := isBpcharTypeName(joinKeyTypeName(p.Left, j.Left)) && isBpcharTypeName(joinKeyTypeName(p.Right, j.Left))
+	return eqjoinselInnerMCVCore(st1, st2, nd1, nd2, bp)
+}
 
+// eqjoinselInnerMCVCore is eqjoinsel_inner's MCV branch over two resolved
+// statistics and their ndistincts. It is the one implementation both
+// estimators run: the plan-node estimator (eqjoinselInnerMCV) and the join
+// search's per-clause estimator (eqJoinSelectivityExt, M0146-0230) — sibling
+// paths that must agree, or the search elects plans the node estimate then
+// prices differently. bp pairs bpchar values on their trimmed (truelen) form.
+func eqjoinselInnerMCVCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, bp bool) (float64, bool) {
+	if st1 == nil || st2 == nil || len(st1.MCV) == 0 || len(st2.MCV) == 0 || nd1 <= 0 || nd2 <= 0 {
+		return 0, false
+	}
 	// Pair the two lists, each entry consumed at most once. Indexed rather
 	// than nested-loop for the reason recorded on the semi arm (review/260831
 	// OP1-2): a nested loop is statistics_target^2 comparisons per estimate.
-	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
-	// char(N) list joined to a char(M) list still matches (M0146-0009b).
-	type1 := joinKeyTypeName(p.Left, j.Left)
-	type2 := joinKeyTypeName(p.Right, j.Left)
-	bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
 	mcvKey := func(v string) string {
 		if bp {
 			return strings.TrimRight(v, " ")

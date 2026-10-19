@@ -4354,6 +4354,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99
       \(14 plans changed text\), tpcds\-fireset PASS \(29 fired results byte\-identical; parity 97/94 held\)\.
     - Next: M0146\-0230, then re\-run the tour comparison \(`analysis/m0146/m0146\-0214/slice3/trace/joincmp\.sh`\)\.
+  - 2026\-10\-19: M0146\-0230 landed \(MCV join estimates\)\. Tour 2's first gap is now a merge\-join COST at equal rows
+    \(Q64 join with item, 939 rows: goopg 20675\.72\.\.106647\.34 vs PG 18896\.82\.\.106969\.50\) — next slice: compare
+    cost\_mergejoin's terms \(outer sort over 1\.5M rows, inner sort, mergejoin rescan\) with PG on that join\.
 - [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
@@ -5057,9 +5060,10 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       \(cache miss\) of each compared string, which the comparison itself would take — not a removable cost\.
     - No impl sub\-task filed\. The SF1 Q74 fire\-set timeout is structural \(inherent to the PG\-identical plan\);
       owner's call: keep the allowlist row past 2026\-11\-30 or raise FIRESET\_TIMEOUT for SF1\.
-- [ ] **M0146\-0230 — join estimates: port eqjoinsel\_inner's MCV arm \(and neqjoinsel over it\); goopg estimates every
+- [x] **M0146\-0230 — join estimates: port eqjoinsel\_inner's MCV arm \(and neqjoinsel over it\); goopg estimates every
   equality / `<>` join from ndistinct alone** \(filed 2026\-10\-19 by M0146\-0214 slice 3\)\.
   Kind: impl
+  Movement: none — parity counts held \(SF0\.25 97/99, SF1 94/99\); fired\-query row estimates identical to PG 220→247/250 \(SF0\.25\), 170→195/203 \(SF1\)
   Parent: M0146-0214
   - Record: TPC\-DS SF0\.25 Q64, join\-order, SHAPE\-DIFF at depth 5\. Tour\-by\-tour against PG, the first large worth
     gap is the cd2 join under `cd1.cd_marital_status <> cd2.cd_marital_status`: goopg 1536640 rows \(1 − 1/5\), PG
@@ -5071,3 +5075,13 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - First step: port the MCV branch \(value equality by column type\) behind both\-sides\-have\-MCV, keep the no\-MCV
     branch otherwise; pin with PG's numbers for a hand\-built pair of MCV lists; then census both corpora\.
   - Expected instrument: TPC\-DS PLAN\-PARITY match counts at both scales \(and the Q64 tour worths\)\.
+  - **DONE 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0230\-search\-eqjoinsel\-mcv\.md`; evidence
+    `analysis/m0146/m0146\-0230/`\.
+    - The plan\-node estimator already had the MCV branch \(eqjoinselInnerMCV, take2 P1\-15\); its arithmetic is now
+      `eqjoinselInnerMCVCore`, shared by the search's `eqJoinSelectivityExt` \(taken first when both sides carry MCV
+      lists\)\. `<>` and the SEMI/ANTI clamp read it, as in PG\.
+    - Q64 tour 2: the cd2 join is now PG's 1536621 rows\. The next gap in that tour is merge\-join COST at equal rows
+      \(join with item: goopg startup 20675\.72 vs 18896\.82, total 106647\.34 vs 106969\.50\) → M0146\-0214\.
+    - Pin: TestSearchEqJoinUsesBothSidesMCVLists \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      sf025 PASS=99 \(8 plans changed text\), tpcds\-fireset PASS \(14 fired results byte\-identical\)\.
