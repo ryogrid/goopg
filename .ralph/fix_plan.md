@@ -4752,3 +4752,20 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Pin: TestFilterRowsRoundLikeClampRowEst, mutation\-checked\.
     - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS=99 \(11 plans
       changed\), tpcds\-fireset PASS \(25 fired results byte\-identical\)\.
+- [ ] **M0146\-0227 — join\-method: TPC\-DS SF0\.25 Q69 — PG anti\-joins catalog\_sales on top with a Hash Right Anti
+  Join; goopg puts a Nested Loop Anti Join with a Join Filter on web\_sales there** \(filed 2026\-10\-19 by the S9 pass
+  at 18d2c73b0\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q69, category join\-method, verdict SHAPE\-DIFF at depth 3 \(under Sort: PG Hash Right Anti
+    Join \| goopg Nested Loop Anti Join\)\. Persists under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261019c/`\.
+  - S9 ranking: a four\-way tie at 1 \(SF0\.25 Q69, SF1 Q23, SF1 Q72, SF1 Q77\); SF0\.25 preferred\.
+  - goopg's plan costs 43183\.05 against PG's 43130\.36, so either PG's order is not generated or goopg prices it
+    higher\. The EXISTS leg differs already: Nested Loop over the store\_sales HashAggregate 19132\.67\.\.19430\.53
+    \(goopg\) against 19132\.67\.\.19681\.46 \(PG\)\.
+  - First step: on the SF0\.25 PG\-statistics clone, instrument addPath for the top joinrel to check whether PG's
+    arm \(the catalog\_sales Hash Right Anti Join over \(customer ⋈ EXISTS\) ⟕anti web\_sales\) is generated and at
+    what cost\. Attribute the 251 gap on the EXISTS Nested Loop \(inner index probe into customer at 858 loops\)
+    against PG's cost\_nestloop / cost\_index terms\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q69\), 92→93 on the shipped corpus\.
