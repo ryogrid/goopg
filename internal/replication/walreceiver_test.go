@@ -83,6 +83,73 @@ func TestWalReceiverTrimsOverlappingRawWALData(t *testing.T) {
 	}
 }
 
+// TestWalReceiverAppendsFramesWhoseWalEndIsAhead pins the XLogData header's
+// meaning (M-NIGHTLY AI-20261021-010544-001): its second field is the
+// sender's end of WAL, which a PG primary catching a standby up sets past the
+// frame's own data (XLogSendPhysical caps each frame at MAX_SEND_SIZE but
+// reports SendRqstPtr). Such frames must still land verbatim at StartLSN.
+// The receiver used to wrap them in a new goopg record instead, so the
+// standby's WAL diverged from the primary's and later frames were trimmed as
+// already present.
+func TestWalReceiverAppendsFramesWhoseWalEndIsAhead(t *testing.T) {
+	srcDir := filepath.Join(t.TempDir(), "src_pg_wal")
+	srcWAL, err := xlog.NewWriter(xlog.Config{
+		WALDir: srcDir, SegmentSize: xlog.DefaultSegmentSize, PageHeaders: true,
+		SystemID: 1, TimelineID: 1, SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter src: %v", err)
+	}
+	defer func() { _ = srcWAL.Close() }()
+	for _, p := range []string{"alpha", "beta", "gamma", "delta"} {
+		if _, _, err := srcWAL.Append([]byte(p)); err != nil {
+			t.Fatalf("src Append %s: %v", p, err)
+		}
+	}
+	if err := srcWAL.FlushUpTo(srcWAL.WrittenLSN()); err != nil {
+		t.Fatalf("src FlushUpTo: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(srcDir, xlog.XLogFileName(1, 0, xlog.DefaultSegmentSize)))
+	if err != nil {
+		t.Fatalf("ReadFile raw WAL: %v", err)
+	}
+	raw = raw[:srcWAL.WrittenLSN()]
+	walEnd := uint64(len(raw))
+
+	dstDir := filepath.Join(t.TempDir(), "dst_pg_wal")
+	dstWAL, err := xlog.NewWriter(xlog.Config{
+		WALDir: dstDir, SegmentSize: xlog.DefaultSegmentSize, PageHeaders: true,
+		SystemID: 1, TimelineID: 1, WALBuffers: 256, SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter dst: %v", err)
+	}
+	defer func() { _ = dstWAL.Close() }()
+
+	rec := &WalReceiver{cfg: WalReceiverConfig{WAL: dstWAL}}
+	third := len(raw) / 3
+	for _, part := range [][2]int{{0, third}, {third, 2 * third}, {2 * third, len(raw)}} {
+		// Every frame reports the whole stream's end, as a PG primary does.
+		frame := libpq.EncodeWALData(uint64(part[0]), walEnd, time.Now(), raw[part[0]:part[1]])
+		if err := rec.handleCopyData(frame); err != nil {
+			t.Fatalf("handleCopyData [%d,%d): %v", part[0], part[1], err)
+		}
+		if got := dstWAL.WrittenLSN(); got != uint64(part[1]) {
+			t.Fatalf("after frame [%d,%d) dst WrittenLSN = %d, want %d (the frame's own end)", part[0], part[1], got, part[1])
+		}
+	}
+	if err := dstWAL.FlushUpTo(dstWAL.WrittenLSN()); err != nil {
+		t.Fatalf("dst FlushUpTo: %v", err)
+	}
+	gotRaw, err := os.ReadFile(filepath.Join(dstDir, xlog.XLogFileName(1, 0, xlog.DefaultSegmentSize)))
+	if err != nil {
+		t.Fatalf("ReadFile dst WAL: %v", err)
+	}
+	if string(gotRaw[:len(raw)]) != string(raw) {
+		t.Fatalf("dst WAL differs from the primary's")
+	}
+}
+
 func TestCheckSSLMode(t *testing.T) {
 	for _, mode := range []string{"", "disable", "allow", "prefer", "DISABLE", "  prefer  "} {
 		if err := checkSSLMode(mode); err != nil {

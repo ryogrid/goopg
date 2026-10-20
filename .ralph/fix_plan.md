@@ -578,7 +578,7 @@ heuristic stays live.)
       output; it fails with a 5 s guard\.
     - Gates: testport/framework, TestPort\_Isolation\* 122/122 \(561\.7 s\), units, tpch\-spotcheck, sf025\.
   Movement: none — test\-harness fidelity — no plan instrument \(isolation runner timing only\)
-- [ ] testport/TestE2E\_FailoverPGtoGoopg — FAIL \(80\.49 s, async arm 50\.55 s\) \(AI\-20261021\-010544\-001; repro: `go test \-v \-run '^TestE2E\_FailoverPGtoGoopg$' \./internal/testport/`\)\.
+- [x] testport/TestE2E\_FailoverPGtoGoopg — FAIL \(80\.49 s, async arm 50\.55 s\) \(AI\-20261021\-010544\-001; repro: `go test \-v \-run '^TestE2E\_FailoverPGtoGoopg$' \./internal/testport/`\)\.
   - 2026\-10\-21 nightly at e64b1bfe9: the async subtest's probe `SELECT count\(\*\) FROM public\.bench\_log WHERE client = \-999`
     stayed 0 for 30 s with the WAL receiver streaming; sync\_remote\_apply and sync\_on passed\. Not yet re\-run alone\.
   - First step: re\-run the async arm alone and under load; read the subtest's replay/apply position against the
@@ -601,6 +601,18 @@ heuristic stays live.)
     - Next: find what put the local writer at 0x30201C8 before the primary\'s segment\-3 data \(a timeline\-switch
       re\-send from the switch point, or a goopg\-local append at standby start\) — PG\'s walreceiver restarts at the
       switch point and overwrites; trimming is only right when the overlapping bytes are identical\.
+  - **Done 2026\-10\-21\.** Design §6 of `docs/design/0100\-0149/m\-nightly\-failover\-bootstrap\-replay\-diagnostics\.md`\.
+    - A temporary Writer\.Append stack probe on the standby showed every local append coming from the walreceiver\.
+    - Cause 1: XLogData\'s second field is the sender\'s end of WAL \(SendRqstPtr\), not the frame\'s data end\. A PG
+      primary catching up sends 128 kB frames with walEnd past them; handleCopyData appended those through
+      Writer\.Append as NEW goopg records, so the local WAL diverged and later frames were trimmed as already present\.
+    - Cause 2 \(masked by 1\): START\_REPLICATION was requested at WrittenLSN\+1, one byte past the end for a PG walsender\.
+    - Fix: every non\-empty frame is raw bytes at StartLSN; the request is the start of the local end\'s segment
+      \(RequestXLogStreaming\); goopg\'s walsender sends max\(chunk end, FlushedLSN\) as walEnd\.
+    - Replication E2E family \(16 tests\) 4/4 green; the full cycle failed 1/4 before\. Pin:
+      TestWalReceiverAppendsFramesWhoseWalEndIsAhead \(fails on the old receiver: 56\-byte frame grew local WAL to 128\)\.
+    - Ledgered: the re\-sent overlap is trimmed, not overwritten as XLogWalRcvWrite does; no divergence detection\.
+  Movement: none — replication correctness — no plan instrument \(walreceiver/walsender only\)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 

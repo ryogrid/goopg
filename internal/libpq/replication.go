@@ -59,8 +59,10 @@ func PgTimestampToTime(micros int64) time.Time {
 //	'w' | startLSN(8) | endLSN(8) | sendTime(8) | walBytes...
 //
 // startLSN is the LSN of the first byte in walBytes; endLSN is the
-// (exclusive) LSN of the byte one past the last in walBytes; sendTime
-// is when this frame was emitted.
+// sender's current end of WAL ("The current end of WAL on the server",
+// protocol-replication: XLogSendPhysical's SendRqstPtr), which can lie past
+// the frame's data — the data always ends at startLSN+len(walBytes);
+// sendTime is when this frame was emitted.
 func EncodeWALData(startLSN, endLSN uint64, sendTime time.Time, walBytes []byte) []byte {
 	out := make([]byte, 0, 1+8+8+8+len(walBytes))
 	out = append(out, ReplMsgWALData)
@@ -118,7 +120,7 @@ func EncodeStandbyStatusUpdate(writeLSN, flushLSN, applyLSN uint64, sendTime tim
 // before holding past the next FrameReader call.
 type WALDataMessage struct {
 	StartLSN uint64
-	EndLSN   uint64
+	EndLSN   uint64 // the sender's end of WAL (walEnd), not the data's end: that is StartLSN+len(WALBytes)
 	SendTime time.Time
 	WALBytes []byte
 }

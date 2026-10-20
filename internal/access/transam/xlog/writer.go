@@ -663,6 +663,9 @@ func (w *Writer) WalWriterFlushAfter() int64 { return w.walWriterFlushAfter.Load
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 
+// SegmentSize returns the WAL segment size the writer was constructed with.
+func (w *Writer) SegmentSize() int64 { return w.segmentSize }
+
 // TimelineID returns the WAL writer's current timeline ID (M0130-S8).
 // This is the TLI stamped into new segment filenames and WAL page headers.
 // The TLI is set at construction from Config.TimelineID and is immutable
