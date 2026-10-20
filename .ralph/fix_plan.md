@@ -516,7 +516,7 @@ heuristic stays live.)
     - Gates: nbtree \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck,
       acceptance arm \(values identical\), sf025 PASS=99 same=99\.
   Movement: none — correctness fix — no plan instrument \(TPC\-H and TPC\-DS plans and values unchanged\)
-- [ ] testport/TestPort\_IsolationAlterTable1 — FAIL \(60\.04 s\) \(AI\-20261020\-013101\-002; repro: `go test \-v \-run '^TestPort\_IsolationAlterTable1$' \./internal/testport/`\)\.
+- [x] testport/TestPort\_IsolationAlterTable1 — FAIL \(60\.04 s\) \(AI\-20261020\-013101\-002; repro: `go test \-v \-run '^TestPort\_IsolationAlterTable1$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - The nightly testport lane overlapped this loop's own regress/isolation gates \(load average 9\.5\); check stale first\.
@@ -531,6 +531,20 @@ heuristic stays live.)
     - Next: find each spec's unreported wait \(start with vacuum\-skip\-locked\), report PG's wait event there, then
       remove blockProbeCap from awaitStepOrBlock\.
     - Gates: transam \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck\.
+  - **Slice 2 LANDED 2026\-10\-20 — Done\.** Design §"slice 2" of `docs/design/0100\-0149/m\-nightly\-isolation\-lock\-wait\-probe\.md`\.
+    - Goroutine dumps at cap\-fire time \(test server pprof\) located each unreported wait; each now reports PG's
+      event: waitPgClassRowMarkReleased Lock:transactionid, acquireTupleLock Lock:tuple and acquireReindexLocks
+      Lock:relation \(on a real wait only, TryAcquire first\), WaitForSpecToken Lock:spectoken, waitForSafeSnapshot
+      IPC:SafeSnapshot\.
+    - The probe counts Lock waits and IPC:SafeSnapshot as blocked \(sessionWaitIsBlocking, isolationtester's
+      pg\_isolation\_test\_session\_is\_blocked test\)\.
+    - The six cap fallbacks left after the reporting were all slow\-but\-unblocked COMMIT/ROLLBACK/CREATE steps, the
+      false positive behind this failure\. blockProbeCap is now a 60 s hang guard, not a blocking rule \(isolationtester:
+      max\_step\_wait\)\. Isolation family: PASS in 563 s against 606 s, no test slower by more than 5 s\.
+    - Pins: TestSessionWaitIsBlockingMatchesIsolationTester, TestAwaitStepOrBlockAsksTheProbe \(shortened guard\)\.
+    - Gates: race \(transam, activity, testport/framework\), units, internal/postmaster, TestPort\_RegressSuite,
+      TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99\.
+  Movement: none — correctness fix — no plan instrument \(isolation harness and pg\_stat\_activity wait\-event fidelity\)
 - [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.

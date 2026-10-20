@@ -54,11 +54,6 @@ const (
 	// blockProbePoll is how often a still-running step that is NOT in a lock
 	// wait is re-probed.
 	blockProbePoll = 50 * time.Millisecond
-	// blockProbeCap bounds how long a running step that never reports a lock
-	// wait is waited for before it is treated as blocked anyway — the
-	// pre-probe timing rule, kept as a fallback for any goopg wait path that
-	// does not report wait_event_type 'Lock'.
-	blockProbeCap = 1500 * time.Millisecond
 	// postStepDrainWait is how long we wait after a regular step completes for
 	// recently unblocked pending steps to either finish or emit follow-up
 	// notices before advancing to the next regular step.
@@ -392,14 +387,33 @@ func (sc *sessionConns) blockedProbe(ctx context.Context, session string) func()
 		return func() (bool, bool) { return false, false }
 	}
 	return func() (bool, bool) {
-		var waitType sql.NullString
+		var waitType, waitEvent sql.NullString
 		err := sc.sharedDB.QueryRowContext(ctx,
-			"SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE pid = $1", pid).Scan(&waitType)
+			"SELECT wait_event_type, wait_event FROM pg_catalog.pg_stat_activity WHERE pid = $1", pid).Scan(&waitType, &waitEvent)
 		if err != nil {
 			return false, false
 		}
-		return waitType.Valid && waitType.String == "Lock", true
+		return sessionWaitIsBlocking(waitType.String, waitEvent.String), true
 	}
+}
+
+// blockProbeCap bounds how long a running step that the probe never reports
+// as blocked is waited for before it is treated as blocked anyway. It is a
+// hang guard, not a blocking rule: isolationtester decides "waiting" from
+// pg_isolation_test_session_is_blocked alone and bounds a stuck step only by
+// max_step_wait (360 s, isolationtester.c). It was 1.5 s while goopg waits
+// reported no wait event, which labelled a merely slow step — a COMMIT on a
+// loaded host — <waiting ...> (M-NIGHTLY AI-20261020-013101-002); every wait
+// the isolation family parks in now reports PG's event. A var so the unit
+// test need not wait it out.
+var blockProbeCap = 60 * time.Second
+
+// sessionWaitIsBlocking is pg_isolation_test_session_is_blocked's test
+// (lockfuncs.c) over a backend's pg_stat_activity wait event: a heavyweight
+// lock wait, or a READ ONLY DEFERRABLE transaction waiting in GetSafeSnapshot
+// (GetSafeSnapshotBlockingPids), which waits as IPC:SafeSnapshot.
+func sessionWaitIsBlocking(waitType, waitEvent string) bool {
+	return waitType == "Lock" || (waitType == "IPC" && waitEvent == "SafeSnapshot")
 }
 
 // awaitStepOrBlock waits for a running step — just launched, or already
@@ -416,10 +430,10 @@ func (sc *sessionConns) blockedProbe(ctx context.Context, session string) func()
 // (run_permutation's STEP_NONBLOCK|STEP_RETRY pass): a step the later step
 // unblocked is waited for until it completes, rather than for a fixed window.
 // This mirrors that: after firstWait the probe decides, and a step that
-// is still running without a lock wait is re-probed every blockProbePoll. Past
-// blockProbeCap, or when the probe cannot run, the step is treated as blocked
-// (the timing rule this replaced), so a goopg wait path that reports no wait
-// event still surfaces, only later.
+// is still running without a lock wait is re-probed every blockProbePoll. When
+// the probe cannot run the step is treated as blocked at once (the timing rule
+// this replaced); past blockProbeCap, a hang guard, it is treated as blocked
+// too, so a wait path that reports no event cannot hang the run.
 func awaitStepOrBlock(outCh <-chan stepOutcome, firstWait time.Duration, probe func() (blocked, known bool)) (stepOutcome, bool) {
 	start := time.Now()
 	select {

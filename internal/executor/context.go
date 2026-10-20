@@ -1430,7 +1430,21 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 		lockCtx = c.Ctx
 	}
 	tag := tupleLockTag(rel, ptr)
+	// LockTuple's ProcSleep shows as Lock:tuple in pg_stat_activity; report
+	// it only for an actual wait, so an uncontended row lock (the common case
+	// on this hot path) touches no wait-event state. TryAcquire keeps
+	// Acquire's FIFO rule, so trying first changes no grant order
+	// (M-NIGHTLY AI-20261020-013101-002, tuplelock-upgrade-no-deadlock).
+	if lm.TryAcquire(backend, tag, mode) == nil {
+		return nil
+	}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitTupleLock)
+	}
 	err := lm.AcquireWithTimeout(lockCtx, backend, tag, mode, timeout)
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
 	if err == nil {
 		return nil
 	}

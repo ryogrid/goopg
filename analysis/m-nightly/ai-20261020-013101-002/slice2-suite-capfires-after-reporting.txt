@@ -1,0 +1,6 @@
+horizons.spec pruner_create_perm
+lock-committed-update.spec s2c
+detach-partition-concurrently-3.spec s2commit
+intra-grant-inplace-db.spec snap3
+tuplelock-upgrade-no-deadlock.spec s1_rollback
+intra-grant-inplace-db.spec c1

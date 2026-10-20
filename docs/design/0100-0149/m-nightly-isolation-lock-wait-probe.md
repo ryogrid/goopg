@@ -160,3 +160,49 @@ full `TestPort_Isolation*` run
 | reindex-schema | 2 |
 | read-only-anomaly-3 | 2 |
 | insert-conflict-specconflict | 2 |
+
+## Follow-up (2026-10-20, slice 2): the remaining waits report, and the cap becomes a hang guard
+
+Goroutine dumps were taken at the moment the cap fired, from the test
+server's pprof endpoint (`GOOPG_PPROF_ADDR`). Each remaining wait gained PG's
+event:
+
+| spec | goopg wait site | PG wait | event |
+|---|---|---|---|
+| intra-grant-inplace | `waitPgClassRowMarkReleased` (5 ms poll) | heap_inplace_lock → XactLockTableWait | Lock:transactionid |
+| tuplelock-upgrade-no-deadlock | `acquireTupleLock` (lock manager) | LockTuple → ProcSleep | Lock:tuple |
+| reindex-schema | `acquireReindexLocks` (lock manager) | LockRelationOid | Lock:relation |
+| insert-conflict-specconflict | `WaitForSpecToken` | SpeculativeInsertionWait | Lock:spectoken |
+| read-only-anomaly-3 | `waitForSafeSnapshot` | GetSafeSnapshot → ProcWaitForSignal | IPC:SafeSnapshot |
+
+Notes on the table:
+
+- **Tuple and REINDEX locks:** `TryAcquire` goes first and the event is
+  reported only on a real wait. TryAcquire keeps Acquire's FIFO rule, so the
+  grant order is unchanged.
+- **The probe:** `sessionWaitIsBlocking` now counts a step as blocked on a Lock
+  wait *or* IPC:SafeSnapshot. That is pg_isolation_test_session_is_blocked's
+  test (lockfuncs.c: the heavyweight lock graph plus
+  GetSafeSnapshotBlockingPids).
+
+**Cap fallbacks over the isolation family:** 31 → 6 after the reporting.
+Instrumenting with the spec path showed that the earlier per-test attribution
+had misassigned suite subtests: the "vacuum-skip-locked 14" belonged to
+interleaved specs. None of the remaining six steps waits in PG's expected
+output: they are COMMIT, ROLLBACK and CREATE steps that were merely slow, the
+false positive behind the nightly AlterTable1 failure.
+
+**The cap.** `blockProbeCap` is now a 60 s hang guard, a var so the unit test
+can shorten it, not a blocking rule. isolationtester bounds a stuck step only
+by max_step_wait (360 s). With the guard:
+
+- the first full-family run exposed the spectoken wait (two 60 s hits), which
+  was then reported;
+- the family passes in 563 s, against 606 s with the 1.5 s cap, with no test
+  slower by more than 5 s.
+
+Pins:
+
+- `TestSessionWaitIsBlockingMatchesIsolationTester` (the probe's verdict);
+- `TestAwaitStepOrBlockAsksTheProbe` (the guard, at a shortened cap);
+- `TestSnapshotWaitsReportVirtualXIDLock` (slice 1).

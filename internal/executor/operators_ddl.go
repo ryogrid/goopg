@@ -19,6 +19,7 @@ import (
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/storage/lmgr"
 	"github.com/goopg/goopg/internal/utils/mmgr"
@@ -12973,6 +12974,16 @@ func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, r
 		defer deregisterWFG(ctx.Tx.XID)
 	}
 	const pollInterval = 5 * time.Millisecond
+	// heap_inplace_lock waits out the rowmark holder's xmax in
+	// XactLockTableWait, which pg_stat_activity shows as Lock:transactionid;
+	// report the same while parked, so a waiting session reads as blocked on a
+	// lock (M-NIGHTLY AI-20261020-013101-002, intra-grant-inplace).
+	waiting := false
+	defer func() {
+		if waiting && ctx.Activity != nil {
+			ctx.Activity.WaitEventEnd(ctx.ProcNum)
+		}
+	}()
 	for {
 		held := false
 		for _, m := range im.PgClassRowMarks(relOID) {
@@ -12983,6 +12994,12 @@ func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, r
 		}
 		if !held || !ctx.TxnMgr.IsXIDActive(holderXID) {
 			return false, nil
+		}
+		if !waiting {
+			waiting = true
+			if ctx.Activity != nil {
+				ctx.Activity.WaitEventStart(ctx.ProcNum, activity.WaitTypeLock, activity.WaitTransactionID)
+			}
 		}
 		select {
 		case <-ctx.Ctx.Done():

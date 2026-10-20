@@ -774,6 +774,7 @@ var waitEventStringCode = map[string]uint32{
 	WaitCheckpointStart:    42,
 	WaitBufferIO:           43,
 	WaitBackendTermination: 44,
+	WaitSafeSnapshot:       45,
 	// Activity events
 	WaitCheckpointerMain:    50,
 	WaitWalWriterMain:       51,

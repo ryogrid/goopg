@@ -26,6 +26,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 type reindexOp struct {
@@ -507,10 +508,23 @@ func (o *reindexOp) acquireReindexLocks(idxRel, tblRel storage.RelFileNode) (fun
 	}
 	tblTag := lmgr.LockTag{DB: tblRel.DBOid, Rel: tblRel.RelOid}
 	idxTag := lmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
-	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, tblTag, lmgr.ShareLock, c.deadlockTimeout()); err != nil {
+	// A blocked relation-lock acquisition shows as Lock:relation (LockRelationOid
+	// → ProcSleep); report only a real wait (M-NIGHTLY AI-20261020-013101-002,
+	// reindex-schema).
+	acquire := func(tag lmgr.LockTag, mode lmgr.Mode) error {
+		if tableLockMgr.TryAcquire(backend, tag, mode) == nil {
+			return nil
+		}
+		if c.Activity != nil {
+			c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+			defer c.Activity.WaitEventEnd(c.ProcNum)
+		}
+		return tableLockMgr.AcquireWithTimeout(lockCtx, backend, tag, mode, c.deadlockTimeout())
+	}
+	if err := acquire(tblTag, lmgr.ShareLock); err != nil {
 		return nil, reindexLockWaitError(err)
 	}
-	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, idxTag, lmgr.AccessExclusiveLock, c.deadlockTimeout()); err != nil {
+	if err := acquire(idxTag, lmgr.AccessExclusiveLock); err != nil {
 		tableLockMgr.Release(backend, tblTag, lmgr.ShareLock)
 		return nil, reindexLockWaitError(err)
 	}

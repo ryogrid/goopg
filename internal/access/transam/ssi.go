@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // CommitSeqNo is a monotonically increasing identifier for the
@@ -473,6 +474,15 @@ func (m *Manager) waitForSafeSnapshot(handle TxnHandle) {
 		waitOn = append(waitOn, sx)
 	}
 	cond := m.ssiCondLocked()
+	// GetSafeSnapshot waits in ProcWaitForSignal(WAIT_EVENT_SAFE_SNAPSHOT),
+	// shown as IPC:SafeSnapshot; report it while parked (M-NIGHTLY
+	// AI-20261020-013101-002, read-only-anomaly-3).
+	var endWait func()
+	defer func() {
+		if endWait != nil {
+			endWait()
+		}
+	}()
 	for {
 		pending := false
 		for _, sx := range waitOn {
@@ -483,6 +493,12 @@ func (m *Manager) waitForSafeSnapshot(handle TxnHandle) {
 		}
 		if !pending {
 			return
+		}
+		if endWait == nil {
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIPC, activity.WaitSafeSnapshot)
+				endWait = func() { reg.WaitEventEnd(procNum) }
+			}
 		}
 		cond.Wait()
 	}
