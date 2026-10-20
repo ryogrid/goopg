@@ -625,3 +625,63 @@ reads (`pageChecksumBlock` ~5 %).
 **Gates:** units, tpch-spotcheck, acceptance arm (values identical), sf025 PASS=99 PLAN-SHAPE same=99,
 `TestPort_RegressSuite`, and the `TestPort_Isolation*` family (narrowing now reaches many more scans, including
 under EPQ-rechecking row locks).
+
+## Slice 18 (2026-10-21): the scan borrow reaches through Projects and hash-join probes — TPC-H Q17
+
+After slice 17, the warm Q17 profile on a private clone was led by `cloneRowOwnedPrefix`: 22.6 % cumulative, all
+under the lineitem probe's `seqScanOp.Next`. That splits into the per-row full-width `acquireRow` (44 %) and
+`MaterializeArena` (15 %).
+
+The M0145-0008u borrow, where a scan hands up its reused row instead of a clone, applied only to a scan directly
+under a borrowing aggregate. Q17's probe chain is Aggregate → Project → Hash Join → Project → Seq Scan, so all 6M
+lineitem rows were cloned.
+
+**Rule (`markScanBorrowChain`, scan\_borrow.go).** It replaces the direct-child test under a borrowing aggregate.
+The borrow descends through operators that pass each row up before pulling the next and keep nothing of it. That is
+PG's slot discipline: a scan slot is valid until the next fetch, and a node that keeps a tuple copies it
+(`ExecMaterializeSlot`). Two kinds of operator qualify:
+
+- **A Project.** `projectOp.Next` evaluates its targets into its own reused row.
+- **The probe side of a non-lateral hash join** of type inner, left, semi or anti. The probe child is the right
+  one only for an inner join that builds on the left. The join holds two probe rows, each only while the probe
+  child is not advanced:
+  - the prefetched first row, while it builds;
+  - the current row, while it emits that row's matches.
+
+  A row that a spilling batch defers is deep-copied (spill.go). SubPlan cache keys are formatted strings, and
+  `SetParamExec` values are rebound before each use. The build side is kept in the hash table and never borrows.
+
+Everything else stops the descent: merge and nested-loop joins, lateral, right/full joins, and Filter (its batch
+path reads ahead).
+
+**Pin.** `TestScanBorrowThroughHashJoinProbe` runs four queries over a multi-page probe table whose text and big
+numerics live in the per-page arena: an inner join, a grouped join, a join with a filter reading both sides, and
+an EXISTS semi join. For each, with tail poison armed:
+
+- exactly the probe-side scan borrows;
+- group keys and min/max survive every arena reset;
+- every result equals the cloning path's (`scanBorrowDisabled`).
+
+**Measured.** Q17 on a private TPC-H clone, HEAD `b5832b221` against the candidate, a fresh server per arm, three
+interleaved rounds of five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 8.60 / 7.04 / 4.29 / 4.29 / 4.25 | 3.56 / 3.39 / 3.44 / 3.43 / 3.41 |
+| 2 | 8.55 / 7.03 / 4.22 / 4.30 / 4.36 | 3.59 / 3.44 / 3.42 / 3.48 / 3.42 |
+| 3 | 8.32 / 7.15 / 4.23 / 4.31 / 4.29 | 3.54 / 3.46 / 3.40 / 3.40 / 3.40 |
+
+- The warm median went from ~4.29 s to ~3.42 s (−20 %), with no overlap.
+- HEAD's first two runs per server (8.6 / 7.0 s) disappear: with `GOGC=off`, its per-row clones filled the heap
+  until the memory limit forced collection.
+- PG is ~1.53 s.
+- The acceptance sweep's single cold Q17 went 4.03 → 2.68 s. Its 22-query total went 30.2 → 26.7 s against the
+  slice-17 arm; that comparison is indicative only, as five days of other commits lie between the two arms.
+
+**Next lever.** Deform is now the largest cost on Q17's probe: `decodeRowRangeInfo` at 27 % cumulative, and
+`NumericInt64FromStoredPayload` at 9.6 %.
+
+**Not done (ledgered):**
+
+- The `BuildFast` builder (`buildRec`, the opnode tree) sets no borrow at all; only `buildNode` does.
+- Merge and nested-loop probe sides, and chains with a Filter between, still clone.

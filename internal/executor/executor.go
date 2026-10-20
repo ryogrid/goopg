@@ -326,9 +326,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// the row it reads (aggregateBorrowsScanRows), a seq scan child
 		// hands up its own reused row instead of a per-tuple clone.
 		if aggregateBorrowsScanRows(p) {
-			if so := unwrapSeqScanOp(child); so != nil {
-				so.borrowRows = true
-			}
+			markScanBorrowChain(child)
 		}
 		return maybeInstrument(p, newAggregateOp(p, child), scope), nil
 	case *optimizer.WindowAgg:

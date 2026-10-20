@@ -1633,6 +1633,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestScanDeformProjectThrough` and `TestScanDeformLoweredSublinkArgs`, both mutation\-checked.
     - Q17 warm median went from ~6400 ms to ~4400 ms \(−31%\); PG is ~1.53 s. Remaining Q17 cost: projectOp.Next
       and cloneRowOwnedPrefix \(~8% each\) on the probe side, plus page reads.
+  - **Slice 18 — the scan borrow reaches through Projects and hash\-join probes LANDED 2026\-10\-21.** Movement: none —
+    perf only. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE
+    same=99, TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS. Recon doc "Slice 18".
+    - cloneRowOwnedPrefix was 22.6% of warm Q17, all under the lineitem probe: the M0145\-0008u borrow reached only a
+      scan directly under a borrowing aggregate, and Q17 is Aggregate → Project → Hash Join → Project → Seq Scan.
+    - markScanBorrowChain descends through Projects and the probe side of non\-lateral inner/left/semi/anti hash joins
+      \(PG's slot discipline: valid until the next fetch\); anything else stops it\. Pin:
+      TestScanBorrowThroughHashJoinProbe \(probe borrows, build never; poison armed; equals the cloning path\)\.
+    - Q17 warm median ~4.29 s → ~3.42 s \(−20%, no overlap, 3 interleaved rounds\); PG ~1.53 s. Next lever: deform
+      \(decodeRowRangeInfo 27% cum\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3477,6 +3487,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/
     0205/0238/0239\(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for
     this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `b5832b221`** \(M0119 VM WAL slice 2 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

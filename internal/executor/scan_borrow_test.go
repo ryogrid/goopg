@@ -113,3 +113,79 @@ func TestScanBorrowMatchesClonedResults(t *testing.T) {
 		t.Log(fmt.Sprintf("%s -> %d rows", q, len(got)))
 	}
 }
+
+// borrowedScanTables walks a built tree through the operators that carry
+// rows and returns the tables whose seq scan borrows.
+func borrowedScanTables(op Operator) []string {
+	var out []string
+	var walk func(Operator)
+	walk = func(cur Operator) {
+		switch o := cur.(type) {
+		case nil:
+		case *instrumentedOp:
+			walk(o.inner)
+		case *seqScanOp:
+			if o.borrowRows && o.tbl != nil {
+				out = append(out, o.tbl.Name)
+			}
+		case *aggregateOp:
+			walk(o.child)
+		case *projectOp:
+			walk(o.child)
+		case *sortOp:
+			walk(o.child)
+		case *joinOp:
+			walk(o.left)
+			walk(o.right)
+		}
+	}
+	walk(op)
+	sort.Strings(out)
+	return out
+}
+
+// TestScanBorrowThroughHashJoinProbe extends the borrow to TPC-H Q17's shape,
+// Aggregate → Hash Join → Project → Seq Scan (markScanBorrowChain): the probe
+// side's scan hands up its reused row through the join and the Projects; the
+// build side's scan, kept in the hash table, never borrows. With tail poison
+// armed, group keys and min/max taken from probe rows must survive every
+// page's arena reset, the join filter must read the right row, and every
+// result must equal the cloning path's.
+func TestScanBorrowThroughHashJoinProbe(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text, lim int)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, 'dim-' || x, x * 100 FROM generate_series(0, 49) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	queries := []string{
+		"SELECT sum(bp.n), count(*), max(bp.s) FROM bp JOIN bd ON bp.k = bd.k",
+		"SELECT bd.label, min(bp.s), max(bp.s), sum(bp.i) FROM bp JOIN bd ON bp.k = bd.k GROUP BY bd.label",
+		"SELECT bp.k, count(*), min(bp.s) FROM bp JOIN bd ON bp.k = bd.k WHERE bp.i < bd.lim GROUP BY bp.k",
+		"SELECT count(*), max(bp.s) FROM bp WHERE EXISTS (SELECT 1 FROM bd WHERE bd.k = bp.k AND bd.lim > 2000)",
+	}
+	for _, q := range queries {
+		plan, err := testPlanDeform(t, ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if got := borrowedScanTables(op); strings.Join(got, ",") != "bp" {
+			t.Fatalf("%s: borrowing scans %v, want only the probe side bp\n%#v", q, got, plan)
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := sortedRowValues(t, ctx, q)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := sortedRowValues(t, ctx, q)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s:\nborrowed %v\ncloned   %v", q, got, want)
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", q)
+		}
+	}
+}

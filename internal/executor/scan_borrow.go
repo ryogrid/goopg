@@ -47,3 +47,60 @@ func aggregateBorrowsScanRows(agg *optimizer.Aggregate) bool {
 	}
 	return true
 }
+
+// markScanBorrowChain hands the seq scan at the bottom of op the borrow
+// (M0145-0008u) when every operator between it and a borrowing aggregate
+// passes each row up before pulling the next and keeps nothing of it — PG's
+// slot discipline, where a scan slot's values stay valid until the next fetch
+// and a node that keeps a tuple copies it (ExecMaterializeSlot).
+//
+// Two operators pass rows through that way:
+//   - a Project evaluates its targets into its own reused row (projectOp.Next)
+//     and returns before pulling again;
+//   - a non-lateral inner, left, semi or anti hash join reads its probe side
+//     one row at a time. It holds only the prefetched first row (while it
+//     builds, with the probe child not advanced) and the current row (while it
+//     emits that row's matches); a row a spilling batch defers is deep-copied
+//     (spill.go). Its build side is kept in the hash table and never borrows.
+//
+// Anything else stops the descent, a Filter included (its batch path reads
+// ahead). TPC-H Q17's lineitem probe, Aggregate → Hash Join → Project → Seq
+// Scan, cloned all 6M rows because the borrow reached only a scan directly
+// under the aggregate.
+func markScanBorrowChain(op Operator) {
+	for op != nil {
+		if io, ok := op.(*instrumentedOp); ok {
+			op = io.inner
+			continue
+		}
+		switch o := op.(type) {
+		case *seqScanOp:
+			o.borrowRows = true
+			return
+		case *projectOp:
+			op = o.child
+		case *joinOp:
+			op = joinBorrowProbeChild(o)
+		default:
+			return
+		}
+	}
+}
+
+// joinBorrowProbeChild is the probe-side child of a hash join that passes its
+// probe rows through without keeping them (markScanBorrowChain), or nil.
+func joinBorrowProbeChild(o *joinOp) Operator {
+	if o.plan == nil || o.plan.Algo != optimizer.JoinAlgoHash || o.plan.Lateral {
+		return nil
+	}
+	switch o.plan.Type {
+	case optimizer.JoinTypeInner:
+		if o.plan.BuildLeft {
+			return o.right
+		}
+		return o.left
+	case optimizer.JoinTypeLeft, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
+		return o.left
+	}
+	return nil
+}
