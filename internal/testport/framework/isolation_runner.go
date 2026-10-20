@@ -58,10 +58,20 @@ const (
 	// recently unblocked pending steps to either finish or emit follow-up
 	// notices before advancing to the next regular step.
 	postStepDrainWait = 200 * time.Millisecond
-	// drainWindow is how long we wait for a pending (blocked) step to
-	// unblock after all steps in a permutation have been submitted.
-	drainWindow = 5 * time.Second
 )
+
+// pendingStepGuard bounds how long the runner waits for a pending (reported
+// <waiting ...>) step to complete: before its session's next step, at the end
+// of the permutation, and for its notice blockers. It is a hang guard, not a
+// schedule: isolationtester waits on a waiting step until it completes and
+// only cancels it after max_step_wait (360 s, isolationtester.c
+// try_complete_step and run_permutation). It was a 5 s window, which reported
+// two CREATE INDEX CONCURRENTLY steps slowed by a loaded nightly host as
+// "<... timed out waiting>" and cancelled them (TestPort_IsolationMultipleCic,
+// M-NIGHTLY AI-20261020-013101-005); the dedicated isolation tests never
+// reach it. Same bound as blockProbeCap. A var so a unit test need not wait
+// it out.
+var pendingStepGuard = 60 * time.Second
 
 // oneResult holds the output of one SELECT-like statement within a step.
 type oneResult struct {
@@ -679,7 +689,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 		// process one query at a time; running a second query on a busy
 		// connection would block indefinitely.
 		//
-		// When the drainWindow expires, we cancel the pending goroutine's
+		// When pendingStepGuard expires, we cancel the pending goroutine's
 		// context (causing conn.QueryContext to return) and drain the
 		// goroutine result before reusing the connection. Without this,
 		// sending the next step while the previous goroutine still holds
@@ -694,7 +704,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 					}
 					writeCompletedStep(&sb, p.name, p.sql, o)
 					pending = append(pending[:i], pending[i+1:]...)
-				case <-time.After(drainWindow):
+				case <-time.After(pendingStepGuard):
 					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 					// Cancel the goroutine's context so conn.QueryContext
 					// returns promptly (lib/pq sends a CancelRequest),
@@ -834,7 +844,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 				outcome.notices = p.queue.drain()
 			}
 			writeCompletedStep(&sb, p.name, p.sql, outcome)
-		case <-time.After(drainWindow):
+		case <-time.After(pendingStepGuard):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 			if p.cancelFn != nil {
 				p.cancelFn()
@@ -908,13 +918,13 @@ func blockersSatisfied(spec IsolationSpec, queues map[string]*sessionNoticeQueue
 }
 
 // waitForStepBlockers blocks until a step's completion blockers are satisfied
-// or drainWindow elapses, then returns. A no-op when the step has no blockers,
+// or pendingStepGuard elapses, then returns. A no-op when the step has no blockers,
 // so steps in the 21 already-passing specs are unaffected.
 func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQueue, blockers []StepBlocker, baselines map[string]int) {
 	if len(blockers) == 0 {
 		return
 	}
-	deadline := time.After(drainWindow)
+	deadline := time.After(pendingStepGuard)
 	for {
 		if blockersSatisfied(spec, queues, blockers, baselines) {
 			return
@@ -988,7 +998,7 @@ func reportStepGatedOnBlockers(sb *strings.Builder, spec IsolationSpec, queues m
 					o.notices = p.queue.drain()
 				}
 				writeCompletedStep(sb, p.name, p.sql, o)
-			case <-time.After(drainWindow):
+			case <-time.After(pendingStepGuard):
 				fmt.Fprintf(sb, "step %s: <... timed out waiting>\n", p.name)
 				if p.cancelFn != nil {
 					p.cancelFn()

@@ -703,6 +703,21 @@ func TestPort_IsolationMultipleCic(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-cic.spec")
 }
 
+// TestIsolationRunnerWaitsForSlowPendingStep pins the runner's pending-step
+// wait to isolationtester's (M-NIGHTLY AI-20261020-013101-005): a step still
+// waiting when the permutation's steps run out is waited for until it
+// completes, here 6 s later at its lock_timeout. The runner used to give it a
+// 5 s window, print "<... timed out waiting>" and cancel it, which failed
+// multiple-cic on a loaded nightly host. The spec is goopg-local; its expected
+// output was captured from PG 18.3's isolationtester.
+func TestIsolationRunnerWaitsForSlowPendingStep(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_slow_pending")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "internal/testport/testdata/isolation/specs/slow-pending-step.spec")
+}
+
 // TestPort_IsolationAlterTable3 exercises the alter-table-3 spec (M0118-0008):
 // ALTER TABLE ... ENABLE/DISABLE TRIGGER mixed with concurrent writes and
 // SELECT ... FOR UPDATE.

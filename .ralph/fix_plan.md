@@ -561,9 +561,22 @@ heuristic stays live.)
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\): same start timeout inside initdb\.Open as \-003; see that item\.
-- [ ] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
+- [x] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
+  - **Done 2026\-10\-21\.** Design §"Follow\-up \(2026\-10\-21, AI\-20261020\-013101\-005\)" of
+    `docs/design/0100\-0149/m\-nightly\-isolation\-lock\-wait\-probe\.md`\.
+    - Cause: the runner gave a pending step a 5 s drainWindow, then printed `<\.\.\. timed out waiting>` and cancelled it;
+      the teardown's `bad connection` followed from the cancel\. isolationtester waits until the step completes and
+      cancels only after max\_step\_wait \(360 s\)\.
+    - Alone the spec takes 2\.0 s, and 2\.6\-3\.6 s at 2× CPU oversubscription; the nightly failure fell in the same
+      01:45\-01:53 window as the \-003/\-004 start timeouts\.
+    - drainWindow became pendingStepGuard, a 60 s hang guard like blockProbeCap\. A trace over the family found one
+      5 s hit, in the shared\-cluster suite \(drop\-index\-concurrently\-1\), which now PASSes there; suite SKIPs 84 → 79\.
+    - Pin: TestIsolationRunnerWaitsForSlowPendingStep, a goopg\-local spec with PG 18\.3 isolationtester expected
+      output; it fails with a 5 s guard\.
+    - Gates: testport/framework, TestPort\_Isolation\* 122/122 \(561\.7 s\), units, tpch\-spotcheck, sf025\.
+  Movement: none — test\-harness fidelity — no plan instrument \(isolation runner timing only\)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
