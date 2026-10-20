@@ -418,7 +418,7 @@ func castTargetIsColumnType(c *CastExpr, col catalog.Column) bool {
 func restrictionIndexSelectivity(tbl *catalog.Table, idx *catalog.Index, clauses []indexPathClause, relTuples float64) (float64, bool) {
 	rawRows := 0.0
 	if tbl.Stats != nil {
-		rawRows = float64(tbl.Stats.RowCount)
+		rawRows = float64(tableRows(tbl))
 	}
 	sel := 1.0
 	for _, c := range clauses {

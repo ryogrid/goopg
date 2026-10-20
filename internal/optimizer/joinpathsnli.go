@@ -185,18 +185,23 @@ func joinClauseIsMovableInto(ri *restrictInfo, currentRelids, currentAndOuter Re
 // the probe demonstrably enforces, and movability survives as the frame it is
 // checked inside rather than as the whole test.
 //
-// Matching is by `restrictInfo` IDENTITY. PG's redundancy test also matches a
-// clause DERIVED from the same equivalence class, and that half is deliberately
-// not reproduced: `selectivityClauses` (joinrestrict.go:319-348) has already
-// reduced each equivalence class to one member before this list is built, so
-// there is no same-EC sibling left to match — and were one to appear, keeping it
-// costs a redundant qual evaluation while dropping it would lose a restriction.
-// The asymmetry decides it. Ledgered.
+// Matching is by `restrictInfo` IDENTITY, over the join's restrictlist as PG
+// builds it (M0146-0242): generate_join_implied_equalities_normal emits ONE
+// equality per equivalence class between the two sides, so the list is first
+// reduced with oneClausePerEquivClass, the rule calcJoinrelSize already sizes
+// the join with. A probe that enforces that equality makes the join filterless;
+// a probe keyed on another member of the class leaves it as a Join Filter,
+// exactly as create_nestloop_path keeps a non-movable clause. goopg's full
+// clause list kept every member pair, so each probe left a sibling behind and
+// both paid the filter — TPC-DS Q72's item probe then elected the
+// inventory-parameterised scan (cheaper per probe) with
+// `cs_item_sk = i_item_sk` as its filter, where PG's catalog_sales probe
+// enforces the class's equality and carries none.
 func nestloopResidualClauses(clauses []*restrictInfo, innerPath *Path, innerRelids, innerParam RelSet) []*restrictInfo {
 	innerAndOuter := innerRelids | innerParam
 	enforced := probeEnforcedClauses(innerPath)
 	var residual []*restrictInfo
-	for _, ri := range clauses {
+	for _, ri := range oneClausePerEquivClass(clauses) {
 		if ri == nil {
 			continue
 		}
@@ -334,7 +339,7 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 		noteNLIPathGate(jt, "outer-unusable")
 		return
 	}
-	innerUnique := s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)
+	innerUnique := s.extraInnerUnique(outer, inner, jt, joinQualsOnly(clauses), uniq, sjinfo)
 	// M0145-0007's reframed question: count whether a parameterised inner
 	// exists at all before counting what happens to it.
 	filed := false
@@ -402,6 +407,13 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 				// parameterised index probe, so its "cache" is per-probe and the
 				// Memoize arm of nestLoopInnerRescanCost is the one that fires
 				// when a Memoize sits between.
+				// try_nestloop_path's add_path_precheck (M0146-0231).
+				init := nliNestLoopInitialCost(cp, o, in, semi)
+				if !addPathPrecheck(joinrel, disabledNodesFor(!cp.enableNestLoop, o, in), init.Startup, init.Total,
+					buildJoinPathkeysFor(joinrel, jt, o.Pathkeys), req) {
+					filed = true
+					continue
+				}
 				cost := nliNestLoopCost(cp, o, in, residual, semi)
 				filed = true
 				addPath(joinrel, &Path{
@@ -609,15 +621,18 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				// per-worker-divided (cost AND rows), so the four lines are
 				// the NLI arm's verbatim — the partial-ness lives in the
 				// inputs, exactly as the partial-hash producer documents.
-				// (`add_partial_path_precheck` is CPU-only — bail before
-				// creating the path — and the post-costing domination
-				// decides identically, so it is not mirrored.)
 				// M0146-0005: the same arithmetic as the serial NLI arm, through
 				// the same helper. This arm used to repeat it inline with the
 				// rescan STARTUP passed as a literal 0, so a parameterised inner
 				// re-paid only its run half and never its index descent —
 				// TPC-H Q9's partial nested loop into orders_pk cost 0.066 per
 				// probe instead of ~0.43.
+				// try_partial_nestloop_path's add_partial_path_precheck on
+				// the initial cost (M0146-0231).
+				if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableNestLoop, o, in),
+					nliNestLoopInitialCost(cp, o, in, semi).Total, buildJoinPathkeysFor(joinrel, jt, o.Pathkeys)) {
+					continue
+				}
 				cost := nliNestLoopCost(cp, o, in, residual, semi)
 				// `final_cost_nestloop` (costsize.c:4307-4314-twin): "For
 				// partial paths, scale row estimate." One divisor, applied
@@ -672,6 +687,10 @@ func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 				continue
 			}
 			residual := nestloopResidualClauses(clauses, in, inner.Relids, in.RequiredOuter)
+			if !addPartialPathPrecheck(joinrel, disabledNodesFor(!cp.enableNestLoop, o, in),
+				nliNestLoopInitialCost(cp, o, in, semi).Total, buildJoinPathkeysFor(joinrel, jt, o.Pathkeys)) {
+				continue
+			}
 			cost := nliNestLoopCost(cp, o, in, residual, semi)
 			divisor := getParallelDivisor(o.ParallelWorkers, cp.parallelLeaderParticipation)
 			addPartialPath(joinrel, &Path{
@@ -728,6 +747,27 @@ func nliNestLoopCost(cp costParams, o, in *Path, residual []*restrictInfo, semi 
 		cost.Total += joinQualEvalCost(cp, residual, o.Rows*in.Rows)
 	}
 	return cost
+}
+
+// nliNestLoopInitialCost is initial_cost_nestloop (costsize.c) for the
+// pairs nliNestLoopCost prices: both startups, the outer's run, every inner
+// rescan's startup, and — unless the SEMI/ANTI/inner-unique branch defers
+// them to final_cost_nestloop — the inner's first run and its rescans' runs.
+// It is the lower bound try_partial_nestloop_path prechecks (M0146-0231).
+func nliNestLoopInitialCost(cp costParams, o, in *Path, semi semiAntiJoinFactors) Cost {
+	rsStart, rsTot := pathRescanCost(in, cp)
+	startup := o.Cost.Startup + in.Cost.Startup
+	run := o.Cost.Total - o.Cost.Startup
+	if o.Rows > 1 {
+		run += (o.Rows - 1) * rsStart
+	}
+	if !semi.apply {
+		run += in.Cost.Total - in.Cost.Startup
+		if o.Rows > 1 {
+			run += (o.Rows - 1) * (rsTot - rsStart)
+		}
+	}
+	return Cost{Startup: startup, Total: startup + run}
 }
 
 // nestLoopOuterPaths is the outer-path loop of match_unsorted_outer

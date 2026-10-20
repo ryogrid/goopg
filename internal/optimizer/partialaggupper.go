@@ -570,6 +570,17 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	}
 	pseed.ParallelSafe = true
 	pseed.ParallelWorkers = workers
+	// M0146-0240: the cheapest partial path keeps its ordering. PG's
+	// create_partial_grouping_paths runs make_ordered_path over it, which
+	// sorts only when the path's pathkeys do not already contain the group
+	// pathkeys — a partial merge join on sr_store_sk = s_store_sk feeds the
+	// Partial GroupAggregate on s_store_sk as is (TPC-DS Q77's sr and ws).
+	if partial != nil {
+		if sr := searchedJoinInputRelOf(scanJoinChild); sr != nil {
+			pseed.Pathkeys = canonicalPartialInputKeys(
+				validatedSearchPathkeys(partial.Pathkeys, child.Output()), sr.usefulKeys, aggNode)
+		}
+	}
 
 	nAggs := len(aggNode.Aggs)
 	nGroupCols := len(aggNode.GroupExprs)
@@ -946,7 +957,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 	// The worker's own sort on the group keys — `make_ordered_path`
 	// (planner.c:7644) over the partial input, through the same
 	// sortPathForBounded the R56 arm below uses.
-	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+	workerSort := orderedPartialInput(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp)
 	// `sortPathForBounded` prices ParallelSafe but never plans workers;
 	// without this the GatherMerge build refuses the subpath
 	// (gatherChildPlan panics on 0 workers). R56's rule, verbatim.
@@ -1034,7 +1045,7 @@ func addPartialGroupArm(grouped, partialRel *RelOptInfo, pseed *Path, aggNode *A
 // itself — C-19e's `createPartialSortPaths` pattern (partialsortpaths.go),
 // whose worker-side construction this mirrors field for field.
 func workerSortGatherMergePath(grouped *RelOptInfo, pseed *Path, keys []SortKey, cp costParams, workers int, crossRows float64) (*Path, float64) {
-	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(keys), cp, -1)
+	workerSort := orderedPartialInput(pseed, pathkeysForSortKeys(keys), cp)
 	// `sortPathForBounded` prices ParallelSafe but never plans workers;
 	// without this the GatherMerge build below refuses the subpath
 	// (`gatherChildPlan` panics on 0 workers).
@@ -1445,7 +1456,7 @@ func addPartialAggSortedInputArm(grouped, partialRel *RelOptInfo, pseed *Path, a
 // as cost_agg adds its input's.
 func sortedInputPartialAgg(partialRel *RelOptInfo, pseed *Path, aggNode *Aggregate, cp costParams, workers int,
 	perWorkerRows, partialGroups float64, nGroupCols, nAggs, inWidth int, mergeKeys []PathKey) *Path {
-	workerSort := sortPathForBounded(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp, -1)
+	workerSort := orderedPartialInput(pseed, pathkeysForSortKeys(groupKeysSortKeys(aggNode)), cp)
 	workerSort.ParallelWorkers = workers
 	partialCost := costAggClause(cp, AggStrategySorted, perWorkerRows,
 		workerSort.Cost.Startup, workerSort.Cost.Total,
@@ -1495,6 +1506,45 @@ func hashedPartialAggSurvives(pseed *Path, aggNode *Aggregate, cp costParams, ps
 		}
 	}
 	return false
+}
+
+// canonicalPartialInputKeys states the cheapest partial path's ordering in the
+// grouping's own terms. PG compares canonical pathkeys, so a merge join on
+// sr_store_sk = s_store_sk is ordered by the one pathkey of that equivalence
+// class, which is also the group key s_store_sk's. goopg's pathkeys name
+// expressions, so each key equivalent within the searched rel to a group key
+// is renamed to that group key; the arms' containment test is then
+// pathkeys_contained_in's. keys are already validated against the partial
+// input's schema (validatedSearchPathkeys); nil means no ordering.
+func canonicalPartialInputKeys(keys []PathKey, u *pathkeyUsefulness, agg *Aggregate) []PathKey {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]PathKey, len(keys))
+	for i, k := range keys {
+		out[i] = k
+		for _, g := range agg.GroupExprs {
+			if !exprEqual(k.Expr, g) && u.equivalentWithin(k.Expr, g) {
+				out[i].Expr = g
+				break
+			}
+		}
+	}
+	return out
+}
+
+// orderedPartialInput is make_ordered_path (planner.c) for the cheapest
+// partial path: the path itself when its pathkeys already contain the
+// required ones, else a Sort over it. The returned path may be pseed itself,
+// so callers stamp it only with what pseed already carries (ParallelWorkers).
+// PG would sort a path presorted on a leading prefix incrementally when
+// enable_incremental_sort is on; goopg's partial arms still sort it fully
+// (deferral ledger, M0146-0240).
+func orderedPartialInput(pseed *Path, keys []PathKey, cp costParams) *Path {
+	if len(keys) > 0 && pathkeysContainedIn(pseed.Pathkeys, keys) {
+		return pseed
+	}
+	return sortPathForBounded(pseed, keys, cp, -1)
 }
 
 // parallelSeedCost is the partial input's price: startup unchanged, RUN cost

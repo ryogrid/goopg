@@ -296,7 +296,7 @@ func TestGroupingPathsC10cReassert(t *testing.T) {
 	u := newUpperRels()
 	// Force the sorted candidate to win (hashed disabled): the Sort arm
 	// below is what this test re-asserts.
-	got, err := createGroupingPaths(u, agg, nil, hashAggSettings(false), 0)
+	got, err := createGroupingPaths(u, agg, nil, nil, hashAggSettings(false), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func hashedProducerTotal(t *testing.T, agg *Aggregate) float64 {
 	var total float64
 	found := false
 	lines := captureTrace(t, func() {
-		if _, err := createGroupingPaths(nil, agg, nil, DefaultPlannerSettings(), 0); err != nil {
+		if _, err := createGroupingPaths(nil, agg, nil, nil, DefaultPlannerSettings(), 0); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -387,7 +387,7 @@ func TestCreateGroupingPathsSizesSeedFromSearchRel(t *testing.T) {
 // TestCreateGroupingPathsNilAgg pins the defensive error: nil spec errors,
 // never a nil node.
 func TestCreateGroupingPathsNilAgg(t *testing.T) {
-	if _, err := createGroupingPaths(nil, nil, nil, DefaultPlannerSettings(), 0); err == nil {
+	if _, err := createGroupingPaths(nil, nil, nil, nil, DefaultPlannerSettings(), 0); err == nil {
 		t.Fatalf("nil aggregate: want an error, got nil")
 	}
 }

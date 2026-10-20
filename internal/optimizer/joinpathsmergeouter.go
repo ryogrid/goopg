@@ -110,7 +110,7 @@ type mergeOuterMatch struct {
 // outer before reaching this arm, so only the per-outer-path test is made below —
 // the pathlist can hold parameterised paths that the cheapest-total test did not
 // cover.
-func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, mu mergeUnique) {
 	// "Can't do anything else if outer path needs to be unique'd"
 	// (joinpath.c:2001-2003): a unique-ified outer gets nested loops only.
 	if mu.side == uniqueSideOuter {
@@ -150,8 +150,8 @@ func matchUnsortedOuterMerge(joinrel, outer, inner *RelOptInfo, cp costParams, j
 
 // generateMergeJoinPaths is `generate_mergejoin_paths` (joinpath.c:1564) for one
 // already-ordered outer path.
-func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, uniqueInner bool) {
-	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups)
+func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapestTotal *Path, cp costParams, jt parser.JoinType, innerUnique bool, groups []mergeKeyGroup, outerRelids RelSet, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, uniqueInner bool) {
+	matched := findMergeClausesForOuterPathkeys(outerPath.Pathkeys, groups, relUsefulKeys(outerPath.Rel))
 	if len(matched) == 0 {
 		return
 	}
@@ -282,7 +282,7 @@ func generateMergeJoinPaths(joinrel, inner *RelOptInfo, outerPath, innerCheapest
 // the full sort-key list exactly as the serial first candidate does.
 func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 	jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
-	scanSelFor func([]*restrictInfo) (float64, float64), paramSrc RelSet, mu mergeUnique) {
+	scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, mu mergeUnique) {
 
 	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
 		sub := "mode"
@@ -340,7 +340,7 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M9", cand+" param")
 			continue
 		}
-		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups)
+		matched := findMergeClausesForOuterPathkeys(op.Pathkeys, groups, relUsefulKeys(op.Rel))
 		if len(matched) == 0 {
 			tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M2", cand+" matched=0")
 			continue
@@ -439,11 +439,22 @@ func demoteDroppedMergeClauses(residual, all, kept []*restrictInfo) []*restrictI
 // ordering, so a descending outer is perfectly usable and the direction is
 // propagated to the inner (`mergeInnerSortKeys`) rather than required of the
 // clause.
-func findMergeClausesForOuterPathkeys(outerPathkeys []PathKey, groups []mergeKeyGroup) []mergeOuterMatch {
+func findMergeClausesForOuterPathkeys(outerPathkeys []PathKey, groups []mergeKeyGroup, u *pathkeyUsefulness) []mergeOuterMatch {
 	var out []mergeOuterMatch
 	used := make(map[int]bool, len(groups))
 	for _, pk := range outerPathkeys {
 		g := indexOfOuterKey(groups, pk.Expr)
+		if g < 0 {
+			// M0146-0214 slice 4: PG matches a pathkey to a mergeclause by
+			// EquivalenceClass (pathkey->pk_eclass == rinfo->left_ec / right_ec,
+			// pathkeys.c find_mergeclauses_for_outer_pathkeys), not by
+			// expression. An outer ordered on one member of a class the outer
+			// rel enforces — TPC-DS Q64's nested loop ordered on
+			// cs_ui.cs_item_sk — serves a clause written on another member
+			// (ss_item_sk = i_item_sk). goopg's pathkeys carry an expression, so
+			// the class is asked of the outer rel (equivalentWithin).
+			g = indexOfEquivalentOuterKey(groups, pk.Expr, u)
+		}
 		if g < 0 || used[g] {
 			// `matched_restrictinfos == NIL` → break (:1642-1648). The
 			// already-used case cannot arise from a canonical pathkey list (PG
@@ -456,6 +467,30 @@ func findMergeClausesForOuterPathkeys(outerPathkeys []PathKey, groups []mergeKey
 		out = append(out, mergeOuterMatch{group: groups[g], outerKey: pk})
 	}
 	return out
+}
+
+// indexOfEquivalentOuterKey is indexOfOuterKey through the outer rel's
+// equivalence classes: the group whose outer operand is a different member of
+// a class the outer rel enforces together with expr. -1 when none is.
+func indexOfEquivalentOuterKey(groups []mergeKeyGroup, expr Expr, u *pathkeyUsefulness) int {
+	if u == nil {
+		return -1
+	}
+	for i := range groups {
+		if u.equivalentWithin(groups[i].outerKey.Expr, expr) {
+			return i
+		}
+	}
+	return -1
+}
+
+// relUsefulKeys is rel's pathkey usefulness (its equivalence classes), nil for
+// a nil rel.
+func relUsefulKeys(rel *RelOptInfo) *pathkeyUsefulness {
+	if rel == nil {
+		return nil
+	}
+	return rel.usefulKeys
 }
 
 // trimMergeClausesForInnerPathkeys is `trim_mergeclauses_for_inner_pathkeys`

@@ -148,7 +148,12 @@ func EstimateRows(n Node) int64 {
 		if child <= 0 {
 			return 0
 		}
-		return scaleByFloat(child, filterSelectivity(x))
+		// M0146-0226: set_baserel_size_estimates sizes a restricted rel as
+		// clamp_row_est(tuples * selectivity), which ROUNDS (rint). Truncating
+		// here sized TPC-DS Q4's year_total scans at 29 / 9 rows where PG says
+		// 30 / 10 (1194684 x 0.005^2 = 29.87). applyLocalFilterSelectivity, the
+		// search seam's sibling sizing, already rounds.
+		return saturateRowEst(clampRowEst(float64(child) * filterSelectivity(x)))
 	case *Limit:
 		child := limitInputRows(x.Child)
 		if child <= 0 {
@@ -961,11 +966,16 @@ func indexRangeBoundSelectivity(tbl *catalog.Table, idx *catalog.Index, nEq int,
 // for a scalar inequality whose statistics do not settle it.
 const defaultIneqSel = 0.3333333333333333
 
-// tableRows returns the catalog's reltuples-equivalent for a
-// table, or 0 when ANALYZE hasn't run yet.
+// tableRows returns rel->tuples for an analysed table — estimate_rel_size's
+// stored density scaled to the relation's current size (liveRelSize) — or the
+// stored reltuples-equivalent when the current size is unknown, or 0 when
+// ANALYZE hasn't run yet.
 func tableRows(tbl *catalog.Table) int64 {
 	if tbl == nil || tbl.Stats == nil {
 		return 0
+	}
+	if _, tuples, ok := liveRelSize(tbl); ok {
+		return int64(tuples)
 	}
 	return tbl.Stats.RowCount
 }
@@ -1015,6 +1025,13 @@ type baseRelInfo struct {
 	// base relation's own rows for a probe parameterized by one of its
 	// columns (M0146-0222). Nil for any other leaf.
 	subproblemBaseRows map[int16]float64
+	// subproblemBaseVars is the rest of examine_variable's vardata for a Var
+	// of a base relation inside a searched sub-problem leaf (M0146-0227):
+	// find_base_rel(varno) still reaches the base rel through the joinrel,
+	// so the Var keeps its relation's statistics, tuples and rows. Keyed like
+	// subproblemBaseRows; nested sub-problems' entries are merged in. Nil for
+	// any other leaf.
+	subproblemBaseVars map[int16]subproblemBaseVar
 	// appendrel mirrors `rangeBinding.appendrel` (M0145-0004): this leaf
 	// is a UNION ALL subquery the jointree pipeline marked at
 	// planSubqueryRangeVar. `addAppendRelPartialPaths` reads it to hoist
@@ -2573,6 +2590,15 @@ func columnNDistinctForChild(idx int, child Node) int64 {
 // group estimator works in: at least one row, otherwise rounded to an integer.
 // (Upstream's `rint` breaks ties to even and Go's `math.Round` away from zero;
 // that differs only on an exact .5 and never by more than one row.)
+// subproblemBaseVar is one base relation inside a sub-problem leaf, as
+// examine_variable sees it: the relation's table (for its pg_statistic), its
+// tuples and its restricted rows.
+type subproblemBaseVar struct {
+	table  *catalog.Table
+	tuples float64
+	rows   float64
+}
+
 func clampRowEstF(rows float64) float64 {
 	if math.IsNaN(rows) || rows <= 1 {
 		return 1
@@ -2681,15 +2707,25 @@ func eqjoinselInnerMCV(j *Join, p JoinKeyPair) (float64, bool) {
 	if nd1 <= 0 || nd2 <= 0 {
 		return 0, false
 	}
+	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
+	// char(N) list joined to a char(M) list still matches (M0146-0009b).
+	bp := isBpcharTypeName(joinKeyTypeName(p.Left, j.Left)) && isBpcharTypeName(joinKeyTypeName(p.Right, j.Left))
+	return eqjoinselInnerMCVCore(st1, st2, nd1, nd2, bp)
+}
 
+// eqjoinselInnerMCVCore is eqjoinsel_inner's MCV branch over two resolved
+// statistics and their ndistincts. It is the one implementation both
+// estimators run: the plan-node estimator (eqjoinselInnerMCV) and the join
+// search's per-clause estimator (eqJoinSelectivityExt, M0146-0230) — sibling
+// paths that must agree, or the search elects plans the node estimate then
+// prices differently. bp pairs bpchar values on their trimmed (truelen) form.
+func eqjoinselInnerMCVCore(st1, st2 *catalog.ColumnStats, nd1, nd2 float64, bp bool) (float64, bool) {
+	if st1 == nil || st2 == nil || len(st1.MCV) == 0 || len(st2.MCV) == 0 || nd1 <= 0 || nd2 <= 0 {
+		return 0, false
+	}
 	// Pair the two lists, each entry consumed at most once. Indexed rather
 	// than nested-loop for the reason recorded on the semi arm (review/260831
 	// OP1-2): a nested loop is statistics_target^2 comparisons per estimate.
-	// bpchar keys pair on truelen values — bpchareq (varchar.c:743) — so a
-	// char(N) list joined to a char(M) list still matches (M0146-0009b).
-	type1 := joinKeyTypeName(p.Left, j.Left)
-	type2 := joinKeyTypeName(p.Right, j.Left)
-	bp := isBpcharTypeName(type1) && isBpcharTypeName(type2)
 	mcvKey := func(v string) string {
 		if bp {
 			return strings.TrimRight(v, " ")

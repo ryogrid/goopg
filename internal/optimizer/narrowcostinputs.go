@@ -102,13 +102,13 @@ type narrowedWidths struct {
 //     column with no statistics rather than mapping it to zero, precisely so
 //     this case is distinguishable — declining here fails HIGH, which is the
 //     direction that cannot under-size a build.
-func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 	if !narrowCostInputsEnabled() || rel == nil || rel.baseLeaf == nil {
-		return narrowedWidths{}
+		return nil, false
 	}
 	keep, ok := scanPathTarget(rel)
 	if !ok || len(keep) == 0 {
-		return narrowedWidths{}
+		return nil, false
 	}
 	out := rel.baseLeaf.Output()
 
@@ -150,16 +150,22 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 	// `plan.AvgVarBytes` over REL fields (createplanjoin.go).
 	noColMap := len(rel.ColVarBytes) == 0
 	if noColMap && rel.AvgVarBytes != 0 {
-		return narrowedWidths{}
+		return nil, false
 	}
 
-	kept := make([]SchemaColumn, 0, len(keep))
-	var avg float64
+	cols := make([]keptColumn, 0, len(keep))
+	// width is set_rel_width (costsize.c) over the kept columns: each
+	// attribute's get_attavgwidth — pg_statistic.stawidth, ANALYZE's average
+	// width — and get_typavgwidth only for a column without one (M0146-0234).
+	// The type-only sum priced char(n)/varchar columns at their declared
+	// sliding-scale width: TPC-DS SF1 Q64's partial-merge outer Sort at width
+	// 664 where PG's is 96.
 	for _, i := range keep {
 		if i < 0 || i >= len(out) {
-			return narrowedWidths{}
+			return nil, false
 		}
 		col := out[i]
+		kc := keptColumn{name: col.Name}
 		if !noColMap {
 			// Coordinate conversion, not an aside: neededKeepSet matches column
 			// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
@@ -168,21 +174,151 @@ func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
 			if !found {
 				// Unattributed column — decline the whole rel rather than
 				// contribute a silent zero.
-				return narrowedWidths{}
+				return nil, false
 			}
-			avg += w
+			// noColMap leaves varBytes at a literal 0 — see the block
+			// comment above.
+			kc.varBytes = w
 		}
-		kept = append(kept, SchemaColumn{Name: col.Name, Type: col.Type})
+		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
+			kc.width = int(aw)
+		} else if w, ok := derivedLeafColumnWidth(rel.baseLeaf, i); ok {
+			kc.width = w
+		} else {
+			kc.width = typeWidth(col.Type)
+		}
+		cols = append(cols, kc)
 	}
-	if noColMap {
-		avg = 0 // literal, not defaulted — see the block comment above.
+	return cols, true
+}
+
+// keptColumn is one column a base rel's narrowed target keeps: its name, its
+// set_rel_width width and its variable-width payload.
+type keptColumn struct {
+	name     string
+	width    int
+	varBytes float64
+}
+
+// relNarrowedWidths computes the triple once per base rel: the sums over
+// relNarrowedColumns.
+func relNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+	cols, ok := relNarrowedColumns(rel)
+	if !ok {
+		return narrowedWidths{}
 	}
-	return narrowedWidths{
-		ncols:       len(keep),
-		avgVarBytes: avg,
-		outputWidth: TupleWidth(kept),
-		ok:          true,
+	return sumKeptColumns(cols, nil)
+}
+
+// sumKeptColumns is a narrowed triple over cols, restricted to the names in
+// keep when keep is non-nil. A sum over no column declines: "narrowed to zero
+// columns" is unrepresentable (see relNarrowedColumns).
+func sumKeptColumns(cols []keptColumn, keep map[string]bool) narrowedWidths {
+	var n narrowedWidths
+	for _, c := range cols {
+		if keep != nil && !keep[c.name] {
+			continue
+		}
+		n.ncols++
+		n.avgVarBytes += c.varBytes
+		n.outputWidth += c.width
 	}
+	if n.ncols == 0 {
+		return narrowedWidths{}
+	}
+	if n.outputWidth < 1 {
+		n.outputWidth = 1
+	}
+	n.ok = true
+	return n
+}
+
+// joinrelNarrowedWidths is build_joinrel_tlist (relnode.c) for the cost
+// triple (M0146-0234): a joinrel's target holds a base relation's attribute
+// only while attr_needed names a relation outside the joinrel — the query's
+// output above the tree, or a join clause that reaches past it. goopg's base
+// rels narrow to a statement-wide needed set, and a join used to sum its
+// children's triples, so a column read only by a join clause inside the
+// joinrel stayed in its width (TPC-DS SF1 Q64: a partial-merge outer Sort at
+// width 155 where PG's is 96).
+//
+// The keep set is a NAME set, as every narrowing input is: the above-tree
+// names (outputCols) plus every column name read by a search clause whose
+// relids touch both the joinrel and a relation outside it. A name kept for
+// one alias keeps every same-named column — the over-keep direction. It
+// declines (the caller keeps the children's sum) when the problem is not
+// output-eligible, a clause cannot be inventoried, or any published member
+// does not narrow. Only published members count: a SEMI/ANTI join emits its
+// LHS alone (joinPublishesInner).
+func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
+	if s == nil || joinrel == nil || !narrowCostInputsEnabled() || !s.outputEligible ||
+		!s.outputColsKnown || s.outputCols == nil || s.clauses == nil || len(joinrel.publishedMembers) == 0 {
+		return narrowedWidths{}
+	}
+	keep, ok := s.attrNeededAbove(joinrel.Relids)
+	if !ok {
+		return narrowedWidths{}
+	}
+	var cols []keptColumn
+	for _, m := range joinrel.publishedMembers {
+		mc, ok := relNarrowedColumns(m)
+		if !ok {
+			return narrowedWidths{}
+		}
+		cols = append(cols, mc...)
+	}
+	return sumKeptColumns(cols, keep)
+}
+
+// attrNeededAbove is the NAME set of attributes a rel over relids must emit —
+// attr_needed restricted to relations outside it (build_base_rel_tlists and
+// build_joinrel_tlist, relnode.c): the query's output above the tree plus every
+// column read by a search clause whose relids touch both relids and a relation
+// outside them. A clause wholly inside relids — a base rel's own restriction,
+// or a join clause already applied below — needs nothing emitted. ok=false
+// when the problem is not output-eligible or a clause cannot be inventoried.
+func (s *searchCtx) attrNeededAbove(relids RelSet) (map[string]bool, bool) {
+	if s == nil || !s.outputEligible || !s.outputColsKnown || s.outputCols == nil || s.clauses == nil {
+		return nil, false
+	}
+	keep := make(map[string]bool, len(s.outputCols)+16)
+	for name := range s.outputCols {
+		keep[name] = true
+	}
+	for _, ri := range s.clauses.all {
+		if ri == nil || ri.clause == nil {
+			continue
+		}
+		if ri.relids&relids == 0 || relsSubset(ri.relids, relids) {
+			continue
+		}
+		if !visitColumnRefsByName(ri.clause, func(name string) { keep[name] = true }) {
+			return nil, false
+		}
+	}
+	return keep, true
+}
+
+// baseRelNarrowedWidths is a base rel's cost triple over its reltarget
+// (M0146-0234): build_base_rel_tlists adds only the Vars a relation outside the
+// rel needs, so a column read solely by the rel's own restriction quals is
+// evaluated at the scan and never emitted — `date_dim` filtered on d_year and
+// d_moy is priced at d_date_sk's width. goopg narrowed a base rel to the
+// statement-wide needed set, WHERE included. A reltarget that keeps no
+// column (`count(*)` over restrictions) is unrepresentable in the triple (see
+// relNarrowedColumns), so it keeps the statement-wide narrowing, as does any
+// rel the clause inventory cannot attribute.
+func (s *searchCtx) baseRelNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+	cols, ok := relNarrowedColumns(rel)
+	if !ok {
+		return narrowedWidths{}
+	}
+	if keep, known := s.attrNeededAbove(rel.Relids); known {
+		if n := sumKeptColumns(cols, keep); n.ok {
+			return n
+		}
+	}
+	return sumKeptColumns(cols, nil)
 }
 
 // applyTo stamps the triple onto a path. It is a no-op on a decline, so every
@@ -236,7 +372,7 @@ func (s *searchCtx) narrowBaseRelCostWidths() {
 		if r == nil || r.baseLeaf == nil {
 			continue
 		}
-		narrowed := relNarrowedWidths(r)
+		narrowed := s.baseRelNarrowedWidths(r)
 		if !narrowed.ok {
 			continue
 		}
@@ -288,6 +424,12 @@ func narrowJoinWidths(p *Path) {
 		return
 	}
 	if len(p.Children) != 2 {
+		return
+	}
+	// M0146-0234: the joinrel's own build_joinrel_tlist triple, the same for
+	// every path of the rel (rule 3), when it could be derived.
+	if p.Rel != nil && p.Rel.joinNarrow.ok {
+		p.Rel.joinNarrow.applyTo(p)
 		return
 	}
 	outer, inner := p.Children[0], p.Children[1]
@@ -379,3 +521,108 @@ func inheritNarrowedWidths(parent, child *Path) {
 	parent.AvgVarBytes = child.AvgVarBytes
 	parent.OutputWidth = child.OutputWidth
 }
+
+// derivedLeafColumnWidth is set_subquery_size_estimates' attr_widths
+// (costsize.c) for output column idx of a derived leaf (M0146-0234): a
+// subquery output that is a plain Var takes the width its own rel computed for
+// that attribute — set_rel_width's get_attavgwidth, pg_statistic.stawidth —
+// rather than its type's default. ok=false leaves the type default, as PG does
+// for an expression target, a set operation, a materialized CTE (RTE_CTE,
+// set_cte_size_estimates computes no widths) or a column without statistics.
+// An inlined CTE is an RTE_SUBQUERY and answers like one.
+func derivedLeafColumnWidth(leaf Node, idx int) (int, bool) {
+	n := leaf
+	for {
+		if f, ok := n.(*Filter); ok && f.Child != nil {
+			n = f.Child
+			continue
+		}
+		break
+	}
+	switch x := n.(type) {
+	case *SubqueryScan:
+		n = x.Child
+	case *CTEScan:
+		if !x.Inlined() {
+			return 0, false
+		}
+		n = x.Child
+	case *Project:
+		// A trivial Subquery Scan stripped to the sub-select's own Project.
+	default:
+		return 0, false
+	}
+	return subqueryVarWidth(idx, n, 0)
+}
+
+// subqueryVarWidth follows output column idx of a planned subquery body down
+// to the base relation attribute it is a plain Var of, and returns that
+// attribute's stawidth. It crosses only what keeps a column a plain Var:
+// pass-through nodes, a Project's bare column, a join's side, a group key of
+// an Aggregate, and a nested subquery (whose own attr_widths were set the same
+// way).
+func subqueryVarWidth(idx int, n Node, depth int) (int, bool) {
+	if n == nil || idx < 0 || depth > 64 {
+		return 0, false
+	}
+	switch x := n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		tbl := scanTable(x)
+		out := x.Output()
+		if tbl == nil || idx >= len(out) {
+			return 0, false
+		}
+		if st := columnStatsByName(tbl, out[idx].Name); st != nil && st.AvgWidth > 0 {
+			return int(st.AvgWidth), true
+		}
+		return 0, false
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return subqueryVarWidth(cr.Index, x.Child, depth+1)
+			}
+		}
+		return 0, false
+	case *Aggregate:
+		if len(x.GroupingSets) > 0 || idx >= len(x.GroupExprs) {
+			return 0, false
+		}
+		if cr, ok := x.GroupExprs[idx].(*ColumnRef); ok {
+			return subqueryVarWidth(cr.Index, x.Child, depth+1)
+		}
+		return 0, false
+	case *Filter:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Sort:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Limit:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Gather:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Materialize:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Memoize:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *SubqueryScan:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *CTEScan:
+		if !x.Inlined() {
+			return 0, false
+		}
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return 0, false
+		}
+		if lw := len(x.Left.Output()); idx >= lw {
+			return subqueryVarWidth(idx-lw, x.Right, depth+1)
+		}
+		return subqueryVarWidth(idx, x.Left, depth+1)
+	}
+	return 0, false
+}
+

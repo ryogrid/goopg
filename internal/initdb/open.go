@@ -2868,6 +2868,36 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	}
 
+	// M0146-0237: estimate_rel_size's RelationGetNumberOfBlocks for the
+	// planner. An open fork answers from its block counter; otherwise the
+	// stat-only Exists guards against recreating a removed fork, as above.
+	sizeCat := rt.Catalog
+	catalog.RelationBlocksFunc = func(tbl *catalog.Table) (int64, bool) {
+		if tbl == nil || tbl.Virtual {
+			return 0, false
+		}
+		rel := sizeCat.RelFileNode(tbl)
+		if n, ok := pool.CachedNBlocks(rel); ok {
+			return int64(n), true
+		}
+		if !pool.Exists(rel) {
+			return 0, false
+		}
+		n, err := pool.NBlocks(rel)
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	}
+
+	// M0146-0233: get_actual_variable_range for the planner's histogram
+	// endpoints, reading btree indexes through this runtime's pool and catalog.
+	endpointProbe := executor.ActualVariableEndpointProbe(pool, rt.TxnMgr, rt.VM)
+	runtimeCat := rt.Catalog
+	catalog.ActualVariableRangeFunc = func(tbl *catalog.Table, column string, wantMax bool) (string, bool) {
+		return executor.ActualVariableRange(endpointProbe, runtimeCat, tbl, column, wantMax)
+	}
+
 	// M0130-S1: load persistent FSM state from per-relation. Same shape /
 	// nil-safety as the VM load above. A missing file is the
 	// fresh-cluster case; a corrupt one is a hard startup

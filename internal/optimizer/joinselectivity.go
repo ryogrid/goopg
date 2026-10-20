@@ -4,7 +4,7 @@ package optimizer
 // `get_variable_numdistinct` and `eqjoinsel`'s no-MCV arm, expressed over the
 // join search's own `restrictInfo` operands.
 //
-// PG oracle: `eqjoinsel_inner`'s else-branch and `neqjoinsel`
+// PG oracle: `eqjoinsel_inner` (both branches since M0146-0230) and `neqjoinsel`
 // (utils/adt/selfuncs.c), `get_variable_numdistinct` (same file),
 // `clause_selectivity_ext`'s `s1 = 0.5` fall-through
 // (optimizer/path/clausesel.c:691), and the DEFAULT_* constants in
@@ -117,6 +117,12 @@ type joinVarStats struct {
 	// subqueryUniqueOutput). `getVariableNumDistinct` then treats the column
 	// as unique over the relation's rows, as upstream does.
 	isUnique bool
+
+	// probe is get_actual_variable_range for a Var of a base relation (nil
+	// for a derived leaf, whose rel has no indexes) — what
+	// ineq_histogram_selectivity consults at the histogram's ends when
+	// mergejoinscansel calls scalarineqsel (M0146-0233).
+	probe endpointProbe
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -171,6 +177,23 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 			j := bits.TrailingZeros32(uint32(relids))
 			if j < len(s.relInfos) {
 				info := &s.relInfos[j]
+				// M0146-0227: a Var of a base relation inside a searched
+				// sub-problem leaf is still that relation's Var to
+				// examine_variable (find_base_rel), with its statistics,
+				// tuples and rows — not the sub-problem's.
+				if bv, found := info.subproblemBaseVars[cr.SourceTableIdx]; found && bv.table != nil {
+					for _, c := range bv.table.Columns {
+						if c.Name == cr.Name {
+							v.typeName = c.Type.Name
+							break
+						}
+					}
+					v.tuples = bv.tuples
+					v.rows = bv.rows
+					v.stats = columnStatsByName(bv.table, cr.Name)
+					v.probe = actualRangeProbe(bv.table, cr.Name)
+					return v
+				}
 				// M0146-0009e: vardata->rel = find_base_rel(varno) is
 				// unconditional for a Var operand, so the leaf's own row
 				// estimates stand in even when no column statistics
@@ -196,6 +219,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	v.tuples = float64(info.baseRows)
 	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
+	v.probe = s.relProbe(i, cr.Name)
 	// M0146-0009e: a derived leaf resolves `ok` through its binding's
 	// synthetic catalog.Table, but that table carries no statistics —
 	// columnStatsByName already returns nil for it. What the catalog path
@@ -580,6 +604,17 @@ func eqJoinSelectivity(v1, v2 joinVarStats) float64 {
 func eqJoinSelectivityExt(v1, v2 joinVarStats) (float64, bool) {
 	nd1, isdefault1 := getVariableNumDistinct(v1)
 	nd2, isdefault2 := getVariableNumDistinct(v2)
+	// M0146-0230: eqjoinsel_inner's MCV branch, taken first whenever BOTH
+	// operands carry an MCV list (selfuncs.c: "We have most-common-value lists
+	// for both relations"). It is the plan-node estimator's own implementation
+	// (eqjoinselInnerMCVCore), so the search and the node price a join alike.
+	// A matched-MCV estimate is a measurement, not a guess.
+	if v1.stats != nil && v2.stats != nil && len(v1.stats.MCV) > 0 && len(v2.stats.MCV) > 0 {
+		bp := isBpcharTypeName(v1.typeName) && isBpcharTypeName(v2.typeName)
+		if sel, ok := eqjoinselInnerMCVCore(v1.stats, v2.stats, nd1, nd2, bp); ok {
+			return clampSelectivity(sel), false
+		}
+	}
 	nullfrac1, nullfrac2 := 0.0, 0.0
 	if v1.stats != nil {
 		nullfrac1 = v1.stats.NullFrac
@@ -724,20 +759,114 @@ func (s *searchCtx) orJoinSelectivity(bo *BinaryOp) (float64, bool) {
 	return clampSelectivity(sel), isdefault
 }
 
-// orArmSelectivity prices one OR arm — an AND of conjuncts — as the
-// independent product, the same rule `conjunctionSelectivity` falls back to
-// for unrelated conjuncts. (The range-band pairing it adds on top is a
-// same-variable refinement; OR arms join FILTERs across relations, where PG
-// likewise multiplies.)
+// orArmSelectivity prices one OR arm — an AND of conjuncts — as PG's
+// clause_selectivity_ext does: through clauselist_selectivity_ext, which
+// multiplies unrelated conjuncts but pairs the bounds of one variable into a
+// range (addRangeClause, clausesel.c). Each bound is a single-relation
+// restriction even when the OR is a join clause, so `ss_net_profit >= 100 AND
+// ss_net_profit <= 200` inside an arm is the band `hibound + lobound - 1`,
+// not the product of the two halves (M0146-0241:
+// TPC-DS Q13's three-arm OR was 2.85x PG's estimate).
 func (s *searchCtx) orArmSelectivity(arm Expr) (float64, bool) {
 	sel := 1.0
 	isdefault := false
+	var groups []*orArmRange
 	for _, c := range splitAnd(arm) {
+		if g, isLo, bsel, bdef, ok := s.orArmRangeBound(c, &groups); ok {
+			// Keep the more restrictive of two similar bounds, as
+			// clausesel.c's addRangeClause does (conjunctionSelectivity).
+			if isLo {
+				if !g.haveLo || g.lo > bsel {
+					g.haveLo, g.lo = true, bsel
+				}
+			} else if !g.haveHi || g.hi > bsel {
+				g.haveHi, g.hi = true, bsel
+			}
+			isdefault = isdefault || bdef
+			continue
+		}
 		csel, cdef := s.orConjunctSelectivity(c)
 		sel *= csel
 		isdefault = isdefault || cdef
 	}
+	for _, g := range groups {
+		sel *= s.orArmRangeSelectivity(g)
+	}
 	return clampSelectivity(sel), isdefault
+}
+
+// orArmRange is clausesel.c's RangeQueryClause for one variable of an OR arm.
+type orArmRange struct {
+	col            *ColumnRef
+	haveLo, haveHi bool
+	lo, hi         float64
+}
+
+// orArmRangeBound reports whether c is a single-side inequality bound
+// `col <op> const` on an attributable column, and files it under its
+// variable's group. The bound's own selectivity is orRangeSelectivity's, the
+// estimate the unpaired conjunct would have had.
+func (s *searchCtx) orArmRangeBound(c Expr, groups *[]*orArmRange) (g *orArmRange, isLo bool, sel float64, isdefault, ok bool) {
+	bo, isBin := c.(*BinaryOp)
+	if !isBin {
+		return nil, false, 0, false, false
+	}
+	switch bo.Op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+	default:
+		return nil, false, 0, false, false
+	}
+	col, _, swapped, isRange := normalizeColumnConstRange(bo.Left, bo.Right)
+	if !isRange || col.Name == "" || col.SourceTableIdx == 0 {
+		return nil, false, 0, false, false
+	}
+	op := bo.Op
+	if swapped {
+		op = swapInequalityOp(op)
+	}
+	sel, isdefault = s.orRangeSelectivity(bo)
+	for _, x := range *groups {
+		if x.col.SourceTableIdx == col.SourceTableIdx && x.col.Name == col.Name {
+			g = x
+			break
+		}
+	}
+	if g == nil {
+		g = &orArmRange{col: col}
+		*groups = append(*groups, g)
+	}
+	return g, op == parser.OpGt || op == parser.OpGe, sel, isdefault, true
+}
+
+// orArmRangeSelectivity completes one variable's bounds as clausesel.c does
+// after its pairing loop: a lone bound is its own selectivity; a pair is
+// `hibound + lobound - 1` plus the column's null fraction (both bounds
+// exclude NULLs, so the subtraction removes them twice), DEFAULT_RANGE_INEQ_SEL
+// when either bound is the DEFAULT_INEQ_SEL guess, and the roundoff clamps.
+// conjunctionSelectivity (rangequery.go) is the restriction path's twin.
+func (s *searchCtx) orArmRangeSelectivity(g *orArmRange) float64 {
+	if !g.haveLo || !g.haveHi {
+		if g.haveLo {
+			return g.lo
+		}
+		return g.hi
+	}
+	if g.hi == defaultIneqSelectivity || g.lo == defaultIneqSelectivity {
+		return defaultRangeIneqSel
+	}
+	s2 := g.hi + g.lo - 1.0
+	if i, ok := s.relPosForSource(g.col.SourceTableIdx); ok && s.relInfos[i].table != nil {
+		if stats := columnStatsByName(s.relInfos[i].table, g.col.Name); stats != nil {
+			s2 += stats.NullFrac
+		}
+	}
+	switch {
+	case s2 < -0.01:
+		return defaultRangeIneqSel
+	case s2 <= 0.0:
+		return 1.0e-10
+	}
+	return s2
 }
 
 // orConjunctSelectivity prices one conjunct of an OR arm as a RESTRICTION, as
@@ -816,12 +945,17 @@ func (s *searchCtx) orEqualitySelectivity(bo *BinaryOp) (float64, bool) {
 // `relInfos[].sourceIdx` translation the equality arm uses; the
 // measurement itself is `rangeOpSelectivityStats`, the stats-first
 // core of the restriction path's inequality estimator, so the two
-// paths price one shape with one arithmetic. Shapes with no
-// measurement keep the whole-OR default contribution as a guess.
+// paths price one shape with one arithmetic. A shape with no
+// measurement is DEFAULT_INEQ_SEL when no statistics exist — scalarineqsel
+// with no stats tuple (an expression, a derived column, an unanalyzed one),
+// and scalarltjoinsel for a join inequality (M0146-0224: TPC-DS Q78's
+// `coalesce(ws_qty, 0) > 0` arm was priced at the unhandled-clause 0.5).
+// Statistics without a histogram keep 0.5: scalarineqsel's "assume half of
+// them will match" over the non-null, non-MCV fraction.
 func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 	col, val, swapped, ok := normalizeColumnConstRange(bo.Left, bo.Right)
 	if !ok || col.Name == "" {
-		return defaultUnhandledClauseSel, true
+		return defaultIneqJoinSel, true
 	}
 	op := bo.Op
 	if swapped {
@@ -829,13 +963,18 @@ func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 	}
 	i, ok := s.relPosForSource(col.SourceTableIdx)
 	if !ok || s.relInfos[i].table == nil {
-		return defaultUnhandledClauseSel, true
+		return defaultIneqJoinSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows)); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows), s.relProbe(i, col.Name)); measured {
 		return sel, false
 	}
-	return defaultUnhandledClauseSel, true
+	// Statistics without a histogram: scalarineqsel assumes half of the
+	// non-null, non-MCV values match.
+	if stats != nil {
+		return defaultUnhandledClauseSel, true
+	}
+	return defaultIneqJoinSel, true
 }
 
 // orInListSelectivity prices one single-side `col IN (consts)` OR-arm
@@ -891,7 +1030,7 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 			s2 = eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 		} else {
 			var measured bool
-			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples); !measured {
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples, s.relProbe(i, cr.Name)); !measured {
 				return decline()
 			}
 		}
@@ -1312,105 +1451,177 @@ func (s *searchCtx) estimateHashBucketSize(clauses []*restrictInfo, innerRelids 
 	return best
 }
 
-// mergeJoinScanSel is `mergejoinscansel` (selfuncs.c) reduced to its END
-// selectivities: what FRACTION of each input a merge join actually consumes
-// before the other side's key range is exhausted. take2 P2-12.
+// mergeScanSel is what a merge join reads of each input, in the join's own
+// outer/inner orientation: the fraction scanned before the first join pair
+// (start) and the fraction scanned before the other side's range is exhausted
+// (end) — initial_cost_mergejoin's outerstartsel / outerendsel /
+// innerstartsel / innerendsel.
+type mergeScanSel struct {
+	outerStart, outerEnd, innerStart, innerEnd float64
+}
+
+// fullMergeScan is mergejoinscansel's default: read every row of both inputs.
+var fullMergeScan = mergeScanSel{outerStart: 0, outerEnd: 1, innerStart: 0, innerEnd: 1}
+
+// clauseScanSel is mergejoinscansel's result in the clause's own left/right
+// orientation.
+type clauseScanSel struct {
+	leftStart, leftEnd, rightStart, rightEnd float64
+}
+
+// mergeJoinScanSel is `cached_scansel` + `mergejoinscansel` (costsize.c,
+// selfuncs.c) for a merge join's FIRST merge clause — the leading sort column,
+// which alone decides where each scan can start and stop (take2 P2-12; start
+// fractions M0146-0214).
 //
-// A merge join over `a.k = b.k` stops as soon as one side passes the other's
-// maximum key. When the two ranges overlap only partly — a fact-table scan
-// joined to a filtered dimension, say — a large share of the bigger input is
-// never read, and goopg charged a FULL pass over both.
+// A merge join over `a.k = b.k` skips each input's rows below the other
+// side's minimum before the first pair is found, and stops as soon as one
+// side passes the other's maximum. initial_cost_mergejoin charges the skipped
+// prefix to startup and the scanned window to the run; the unread suffix is
+// never charged.
 //
-// PG's start selectivities (the "skip to the first match" half) are NOT
-// implemented here and both are reported as 0. They are the smaller term, and
-// they model a seek goopg's merge does not perform: it consumes from the
-// beginning of each sorted input. Reporting 0 makes the omission a no-op rather
-// than an approximation.
-//
-// Returns (1, 1) — charge everything, i.e. today's behaviour — whenever either
-// side's range cannot be established. That is the safe direction: this term can
-// only ever REDUCE a merge join's cost, so an unknown must not.
-//
-// P6-08 (take3 08 §9): the two end selectivities are memoised on the clause,
-// which is upstream's own arrangement — `mergejoinscansel`'s callers go through
-// `cached_scansel` (costsize.c:3798), whose `MergeScanSelCache` list hangs off
-// the `RestrictInfo`. The reason is the same in both planners: the estimate is
-// re-asked once per merge path considered, the histogram walk behind it is the
-// single most expensive thing in the join search on a statistics-bearing
-// catalog (measured: `histCmp` 43.7% of planning CPU over TPC-H before this
-// cache), and its answer moves with none of what varies between those calls.
-//
-// The memo is stored in the clause's OWN left/right orientation and rotated at
-// return, so both directions of a commuted join share one computation. That is
-// sound because the underlying question is symmetric: the pair
-// (fraction of left at or below right's max, fraction of right at or below
-// left's max) is a property of the clause, and which member is the "outer" end
-// is decided entirely by `outerRelids` here at the return.
-func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) (outerEnd, innerEnd float64) {
+// P6-08 (take3 08 §9): the estimate is memoised on the clause, which is
+// upstream's own arrangement — `cached_scansel`'s `MergeScanSelCache` list
+// hangs off the `RestrictInfo` — because it is re-asked once per merge path
+// considered and the histogram walk behind it dominated planning CPU
+// (`histCmp` 43.7% over TPC-H before the cache). The memo is stored in the
+// clause's own orientation and rotated here: the question is symmetric, and
+// which member is the outer is decided by `outerRelids` at the return.
+func (s *searchCtx) mergeJoinScanSel(clauses []*restrictInfo, outerRelids RelSet) mergeScanSel {
 	if len(clauses) == 0 {
-		return 1, 1
+		return fullMergeScan
 	}
-	// PG keys the estimate on the FIRST merge clause: it is the leading sort
-	// column, and it alone determines when the scan can stop.
 	ri := clauses[0]
 	if ri == nil || ri.leftKey == nil || ri.rightKey == nil {
-		return 1, 1
+		return fullMergeScan
 	}
-	// Which operand is on the outer side of THIS join. The left operand wins
-	// when it qualifies, exactly as the pre-cache swap did.
 	leftIsOuter := relsSubset(ri.leftRelids, outerRelids)
 	if !leftIsOuter && !relsSubset(ri.rightRelids, outerRelids) {
-		return 1, 1
+		return fullMergeScan
 	}
-	leftEnd, rightEnd := s.mergeScanSelForClause(ri)
+	c := s.mergeScanSelForClause(ri)
 	if leftIsOuter {
-		return leftEnd, rightEnd
+		return mergeScanSel{outerStart: c.leftStart, outerEnd: c.leftEnd, innerStart: c.rightStart, innerEnd: c.rightEnd}
 	}
-	return rightEnd, leftEnd
+	return mergeScanSel{outerStart: c.rightStart, outerEnd: c.rightEnd, innerStart: c.leftStart, innerEnd: c.leftEnd}
 }
 
-// mergeScanSelForClause is `mergeJoinScanSel`'s body in the clause's own
-// orientation: (fraction of the LEFT operand at or below the right operand's
-// maximum, fraction of the RIGHT operand at or below the left's). Memoised on
-// the `restrictInfo` — PG's `MergeScanSelCache` — under the cache contract
-// documented on that struct.
-func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) (leftEnd, rightEnd float64) {
+// mergeScanSelForClause is `mergejoinscansel` (selfuncs.c) in the clause's own
+// orientation, for goopg's one merge ordering (ascending, nulls last):
+//
+//   - each side's range comes from get_variable_range (histogram endpoints,
+//     widened by the MCV extremes);
+//   - leftend = scalarineqsel(left <= right max), rightend likewise; only the
+//     smaller end is believed and the other reset to 1 (both, when equal);
+//   - leftstart = scalarineqsel(left < right min), rightstart likewise; only
+//     the larger start is believed and the other reset to 0 (both, when equal);
+//   - a DEFAULT_INEQ_SEL answer is not believed, and start >= end is
+//     disbelieved as (0, 1).
+//
+// The nulls-first adjustment does not arise: goopg's merge sorts nulls last.
+// Any side without a range keeps the defaults (0, 1) for both.
+func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) clauseScanSel {
 	if ri.scanSelValid {
-		return ri.scanSelLeftEnd, ri.scanSelRightEnd
+		return ri.scanSel
 	}
-	leftEnd, rightEnd = 1, 1
+	out := clauseScanSel{leftStart: 0, leftEnd: 1, rightStart: 0, rightEnd: 1}
 	lv := s.examineJoinVar(ri.leftKey, ri.leftRelids)
 	rv := s.examineJoinVar(ri.rightKey, ri.rightRelids)
-	lMax, lOK := histogramMax(lv.stats)
-	rMax, rOK := histogramMax(rv.stats)
+	lMin, lMax, lOK := variableRange(lv.stats, lv.typeName)
+	rMin, rMax, rOK := variableRange(rv.stats, rv.typeName)
 	if lOK && rOK {
-		// The outer is scanned until it passes the INNER's maximum, and vice
-		// versa: `leftend = scalarineqsel(left <= right_max)`.
-		leftEnd = clampSelectivity(fractionAtMost(lv.stats, rMax, lv.typeName))
-		rightEnd = clampSelectivity(fractionAtMost(rv.stats, lMax, rv.typeName))
+		believe := func(op parser.OpCode, v joinVarStats, bound string, def float64) float64 {
+			if sel, ok := scalarIneqSelStats(op, v.stats, bound, v.typeName, v.tuples, v.probe); ok && sel != defaultIneqSelectivity {
+				return sel
+			}
+			return def
+		}
+		out.leftEnd = believe(parser.OpLe, lv, rMax, 1)
+		out.rightEnd = believe(parser.OpLe, rv, lMax, 1)
+		switch {
+		case out.leftEnd > out.rightEnd:
+			out.leftEnd = 1
+		case out.leftEnd < out.rightEnd:
+			out.rightEnd = 1
+		default:
+			out.leftEnd, out.rightEnd = 1, 1
+		}
+		out.leftStart = believe(parser.OpLt, lv, rMin, 0)
+		out.rightStart = believe(parser.OpLt, rv, lMin, 0)
+		switch {
+		case out.leftStart < out.rightStart:
+			out.leftStart = 0
+		case out.leftStart > out.rightStart:
+			out.rightStart = 0
+		default:
+			out.leftStart, out.rightStart = 0, 0
+		}
+		if out.leftStart >= out.leftEnd {
+			out.leftStart, out.leftEnd = 0, 1
+		}
+		if out.rightStart >= out.rightEnd {
+			out.rightStart, out.rightEnd = 0, 1
+		}
 	}
 	if s != nil {
-		ri.scanSelLeftEnd, ri.scanSelRightEnd, ri.scanSelValid = leftEnd, rightEnd, true
+		ri.scanSel, ri.scanSelValid = out, true
 	}
-	return leftEnd, rightEnd
+	return out
 }
 
-// histogramMax is `get_variable_range`'s upper bound: the last histogram
-// boundary, which ANALYZE stores in ascending order.
-func histogramMax(cs *catalog.ColumnStats) (string, bool) {
-	if cs == nil || len(cs.Histogram) == 0 {
-		return "", false
+// variableRange is `get_variable_range` (selfuncs.c): the histogram's first
+// and last bounds, widened by the most common values — "needed even if we
+// also have a histogram, since the histogram excludes the MCVs". With no
+// histogram the MCVs are trusted only when they (with the nulls) cover the
+// whole table to within roundoff.
+func variableRange(cs *catalog.ColumnStats, typeName string) (min, max string, ok bool) {
+	if cs == nil || typeName == "" {
+		// No type means histCmp would compare byte-wise, which misorders
+		// every numeric column. Refuse rather than guess.
+		return "", "", false
 	}
-	return cs.Histogram[len(cs.Histogram)-1], true
+	if len(cs.Histogram) > 0 {
+		min, max, ok = cs.Histogram[0], cs.Histogram[len(cs.Histogram)-1], true
+	}
+	if len(cs.MCV) == 0 {
+		return min, max, ok
+	}
+	useMCVs := ok
+	if !ok {
+		sum := cs.NullFrac
+		for _, m := range cs.MCV {
+			sum += m.Frequency
+		}
+		useMCVs = sum > 0.99999
+	}
+	if !useMCVs {
+		return min, max, ok
+	}
+	for _, m := range cs.MCV {
+		if !ok {
+			min, max, ok = m.Value, m.Value, true
+			continue
+		}
+		if histCmp(m.Value, min, typeName) < 0 {
+			min = m.Value
+		}
+		if histCmp(m.Value, max, typeName) > 0 {
+			max = m.Value
+		}
+	}
+	return min, max, ok
 }
 
-// fractionAtMost is `scalarineqsel(<=)` over the column's histogram: the share
-// of the column at or below `bound`.
-func fractionAtMost(cs *catalog.ColumnStats, bound, typeName string) float64 {
-	if cs == nil || len(cs.Histogram) < 2 || typeName == "" {
-		// No type means histCmp would compare byte-wise, which misorders every
-		// numeric column. Refuse rather than guess.
-		return 1
+// relProbe is actualRangeProbe for column col of search rel i when that rel is
+// a base relation; a derived leaf (its own row estimate in leafTuples, or no
+// catalog table) has no indexes in PG's sense, so it gets none.
+func (s *searchCtx) relProbe(i int, col string) endpointProbe {
+	if i < 0 || i >= len(s.relInfos) {
+		return nil
 	}
-	return histogramOpSelectivity(parser.OpLe, cs.Histogram, bound, typeName, histogramEqSel(cs, 0))
+	info := &s.relInfos[i]
+	if info.table == nil || info.leafTuples > 0 {
+		return nil
+	}
+	return actualRangeProbe(info.table, col)
 }

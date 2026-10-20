@@ -283,13 +283,13 @@ func TestFindMergeClausesForOuterPathkeys_TakesThePrefixOnly(t *testing.T) {
 		equiClauseOn(a, b, 30, 31),
 	}, a)
 
-	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 30), groups); len(got) != 2 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 30), groups, nil); len(got) != 2 {
 		t.Fatalf("both ordering positions have clauses, want 2 matches, got %d", len(got))
 	}
-	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 99, 30), groups); len(got) != 1 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 99, 30), groups, nil); len(got) != 1 {
 		t.Fatalf("the run must stop at the unserved position, got %d matches", len(got))
 	}
-	if got := findMergeClausesForOuterPathkeys(ascKeys(99, 10), groups); len(got) != 0 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(99, 10), groups, nil); len(got) != 0 {
 		t.Fatalf("an ordering whose FIRST key has no clause is unusable, got %d matches", len(got))
 	}
 }
@@ -350,5 +350,32 @@ func TestGenerateMergejoinPaths_StrictlyCheaperRuleSuppressesAPointlessTruncatio
 		if len(p.HashKeys) < 2 {
 			t.Fatalf("emitted a %d-key merge where a 2-key one over the same inner exists — the strictly-cheaper rule must suppress it", len(p.HashKeys))
 		}
+	}
+}
+
+// TestFindMergeClausesForOuterPathkeys_MatchesThroughTheOuterClass pins
+// M0146-0214 slice 4: PG matches an outer pathkey to a mergeclause by
+// EquivalenceClass (find_mergeclauses_for_outer_pathkeys compares
+// pk_eclass with the clause's EC), so an outer ordered on one member of a
+// class the outer rel enforces serves a clause written on another member.
+// TPC-DS Q64's GEQO tours ordered a nested loop on cs_ui.cs_item_sk and
+// merge-joined item on ss_item_sk = i_item_sk; matching by expression alone
+// lost PG's presorted-index-inner merge path.
+func TestFindMergeClausesForOuterPathkeys_MatchesThroughTheOuterClass(t *testing.T) {
+	a, b := relsetOf(0), relsetOf(1)
+	groups := mergeKeyGroups([]*restrictInfo{equiClauseOn(a, b, 10, 11)}, a)
+	// The outer is ordered on column 12, a different member of column 10's class.
+	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, nil); len(got) != 0 {
+		t.Fatalf("without the outer's classes, column 12 serves no clause; got %d matches", len(got))
+	}
+	u := &pathkeyUsefulness{classMembers: []classMember{{expr: col(10), id: 1}, {expr: col(12), id: 1}}}
+	got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u)
+	if len(got) != 1 || !exprEqual(got[0].outerKey.Expr, col(12)) {
+		t.Fatalf("an outer ordered on a class member must serve the clause, keeping its own pathkey; got %+v", got)
+	}
+	// A member of a DIFFERENT class does not.
+	u2 := &pathkeyUsefulness{classMembers: []classMember{{expr: col(10), id: 1}, {expr: col(12), id: 2}}}
+	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u2); len(got) != 0 {
+		t.Fatalf("a member of another class serves nothing; got %d matches", len(got))
 	}
 }

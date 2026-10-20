@@ -192,7 +192,7 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 			for _, c := range pf {
 				quals = append(quals[:len(quals):len(quals)], c.ri)
 			}
-			cost := hashJoinCost(cp, hashJoinInputs{
+			hin := hashJoinInputs{
 				qualPerTuple: joinQualPerTuple(cp, quals),
 				outer:        o.Cost, inner: i.Cost,
 				outerRows: o.Rows, innerRows: i.Rows,
@@ -207,7 +207,13 @@ func addParameterizedHashJoinPaths(s *searchCtx, joinrel, outer, inner *RelOptIn
 				innerCols:        pathNCols(i),
 				outerAvgVarBytes: pathAvgVarBytes(o),
 				innerAvgVarBytes: pathAvgVarBytes(i),
-			})
+			}
+			// try_hashjoin_path's add_path_precheck (M0146-0231).
+			init := hashJoinInitialCost(cp, hin)
+			if !addPathPrecheck(joinrel, disabledNodesFor(!cp.enableHashJoin, o, i), init.Startup, init.Total, nil, req) {
+				continue
+			}
+			cost := hashJoinCost(cp, hin)
 			addPath(joinrel, &Path{
 				Kind:          PathHashJoin,
 				Jointype:      jt,

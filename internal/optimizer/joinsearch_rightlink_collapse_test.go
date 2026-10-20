@@ -29,6 +29,7 @@ func TestRightLinkSurvivesCollapseSplit(t *testing.T) {
 		node, ctx := seamChainFromSQL(t, names, rows, from)
 		pred := seamLocal(names, 0) // on the nullable prefix
 		out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
+		out, residual = unwrapPricedPushedDown(out, residual)
 		if !used {
 			t.Errorf("n=%d: seam declined the RIGHT-topped chain", n)
 			continue

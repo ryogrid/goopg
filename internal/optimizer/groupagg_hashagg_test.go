@@ -136,7 +136,7 @@ func TestEnableHashAggSkipsNonSimpleMode(t *testing.T) {
 		Mode:       AggModePartial,
 		Strategy:   AggStrategyHashed,
 	}
-	got, err := createGroupingPaths(nil, aggNode, nil, hashAggSettings(false), 0)
+	got, err := createGroupingPaths(nil, aggNode, nil, nil, hashAggSettings(false), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

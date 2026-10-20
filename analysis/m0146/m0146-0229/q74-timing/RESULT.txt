@@ -1,0 +1,8 @@
+TPC-DS SF1 Q74, one fresh clone of the shipped (2026-10-19 reloaded) corpus per binary, statement_timeout 1200s,
+run sequentially on an otherwise idle host (tmp/m0229/time-q74.sh):
+  m29b-baseline  (HEAD a6636f6fc + owner 95c0d0474, no slice 1)  rc=0  543.13 s  104 output lines
+  m29b-candidate (slice 1 staged)                                  rc=0  522.28 s  104 output lines
+Outputs byte-identical (cmp). The fire-set gate's FIRESET_TIMEOUT is 600 s; Q74's plan text (costs stripped) is
+identical between the two binaries and MATCHes PG.
+Fire-set runs: m29a (baseline PASS ~557 s, candidate TIMEOUT) and m29b (baseline PASS ~624 s wall incl. connect,
+candidate TIMEOUT); the candidate lane always runs second.

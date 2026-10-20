@@ -1,0 +1,17 @@
+GEQOJOIN relids=(b 1 11) rows=687674 startup=14.750000 total=22064.683000 outer=(b 1) inner=(b 11)
+GEQOJOIN relids=(b 1 8 11) rows=656935 startup=5136.750000 total=28991.905125 outer=(b 1 11) inner=(b 8)
+GEQOJOIN relids=(b 1 6 8 11) rows=634315 startup=8204.352500 total=33784.062125 outer=(b 1 8 11) inner=(b 6)
+GEQOJOIN relids=(b 1 5 6 8 11) rows=611184 startup=11271.955000 total=38516.830500 outer=(b 1 6 8 11) inner=(b 5)
+GEQOJOIN relids=(b 1 5 6 8 11 13) rows=590465 startup=11486.955000 total=40337.100750 outer=(b 1 5 6 8 11) inner=(b 13)
+GEQOJOIN relids=(b 1 5 6 8 11 12 13) rows=565075 startup=11701.955000 total=42102.939125 outer=(b 1 5 6 8 11 13) inner=(b 12)
+GEQOJOIN relids=(b 1 5 6 8 11 12 13 16) rows=565075 startup=11703.405000 total=43902.036750 outer=(b 1 5 6 8 11 12 13) inner=(b 16)
+GEQOJOIN relids=(b 1 4 5 6 8 11 12 13 16) rows=540607 startup=14771.007500 total=48453.039000 outer=(b 1 5 6 8 11 12 13 16) inner=(b 4)
+GEQOJOIN relids=(b 1 4 5 6 8 9 11 12 13 16) rows=517469 startup=14771.445000 total=95110.147401 outer=(b 1 4 5 6 8 11 12 13 16) inner=(b 9)
+GEQOJOIN relids=(b 1 3 4 5 6 8 9 11 12 13 16) rows=222 startup=109532.432125 total=109558.697125 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 11 12 13 16) rows=212 startup=109533.806440 total=109558.886440 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 11 12 13 15 16) rows=212 startup=109558.184442 total=109583.264442 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 11 12 13 15 16 17) rows=212 startup=109559.846317 total=109584.926317 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 11 12 13 14 15 16 17) rows=202 startup=109581.125600 total=109605.023100 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17) rows=156 startup=109680.839195 total=109699.294195 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18) rows=1 startup=76632.716295 total=109695.991476 outer=- inner=-
+GEQOJOIN relids=(b 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18) rows=1 startup=76633.008795 total=109696.305738 outer=(b 1 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18) inner=(b 2)

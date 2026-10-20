@@ -1,0 +1,12 @@
+P0-E8 repro on a fresh goopg cluster at 127.0.0.1:5533 (scripts in this dir; restart.sh honours GOOPG_BIN).
+Protocol: restart the server, then two rounds of round.sh (8 concurrent pgbench -c 1 -t 50 -f mini.sql);
+"aborts" = clients that hit `relation "x" does not exist` (always 0/50 transactions processed).
+
+HEAD f1695a907 binary            restart 1..6, (round1 round2): (3 0) (0 0) (0 0) (2 0) (0 0) (1 0)  -> 6 aborts
+per-statement planState binary   restart 1..6, (round1 round2): (0 0) x6                          -> 0 aborts
+
+Throughput, pgbench -S -c 32 -j 8 -T 20 on scale 10, fresh restart per run, 16 cores:
+  HEAD                       58825.9, 59427.2 tps
+  per-statement planState    59045.2, 59637.7 tps
+  (rejected) global planMu   16180.3, 16286.4, 16186.8 tps  vs HEAD 57125.9, 59811.4, 59098.6
+Extra 10 cold-start rounds (restart before each), per-statement planState binary: aborts total=0

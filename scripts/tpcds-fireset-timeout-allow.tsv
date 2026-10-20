@@ -1,0 +1,8 @@
+# OWNER-MAINTAINED timeout allowlist for scripts/tpcds-fireset-status.py.
+# The loop must not edit this file (harness-protected, scripts/ralph_protected_regions.py).
+# An INTRODUCED fire-set timeout of a listed (corpus, query) with an unexpired date is
+# reported as `allowed` and does not fail tpcds-fireset. Values are still compared
+# wherever both arms finish; an allowed query's result simply goes unchecked when the
+# candidate times out.
+# Format (TAB-separated): corpus  Q<n>  expires(YYYY-MM-DD)  reason
+tpcds-sf1	Q74	2026-11-30	owner 2026-10-19: Q74 straddles FIRESET_TIMEOUT=600 on both arms (543 s baseline vs 522 s candidate, identical output; analysis/m0146/m0146-0229/q74-timing/). Provisional until M0146-0229a's executor recon lands.

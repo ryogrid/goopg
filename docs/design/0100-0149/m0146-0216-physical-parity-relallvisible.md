@@ -1,7 +1,9 @@
 # M0146-0216 — physical-parity census and stored `pg_class.relallvisible`
 
 Status: slice 1 (census + attribution), slice 2 (stored relallvisible) and slice 3 (`_bt_findsplitloc` interval
-and penalty) landed 2026-10-16. Evidence: `analysis/m0146/m0146-0216/`.
+and penalty) landed 2026-10-16. Slice 4 (internal-page splits, §7) and slice 5 (COPY heap placement through the FSM, §8)
+landed 2026-10-20. **Closed 2026-10-20** after the owner rebuild and the closure census (§9). Evidence:
+`analysis/m0146/m0146-0216/`.
 
 ## 1. Census (slice 1)
 
@@ -122,3 +124,194 @@ free-space accounting discards the right page's first key; ledger row.
 
 The shipped corpora are unchanged until they are reloaded on this engine (owner action). A reload would now give
 index geometry within 2 pages of PG on every SF0.25 fact table.
+
+## 7. Slice 4 (2026-10-20): internal-page splits
+
+**Record.** After the owner's 2026-10-19 reload, customer\_demographics\_pkey is 5269 pages on both corpora against
+PG's 5268. That one page adds +4.0 to every probe of the index: the +4.0 / +4.57 offsets on SF1 Q64's joins and the
+index-only outer of the cd ⋈ store\_sales merge (M0146-0214). The table's 1920800 keys arrive in key order, so every
+split is a rightmost one. The leaf levels are identical: 5247 leaves of 367 items, plus a rightmost leaf of 398. The
+gap is the internal level. PG has 18 pages: 17 of 285 downlinks plus a high key, and a rightmost page of 403. goopg
+had 19 pages of 284.
+
+**Cause.** goopg priced an internal split with the leaf's arithmetic (`compactSplitLocFill`). `nbtsplitloc.c` and
+`nbtinsert.c` treat a non-leaf page differently in two ways:
+
+- `_bt_recsplitloc` charges the left half's new high key at the firstright tuple's size. It adds no heap-TID
+  allowance, because that is the leaf's worst case under suffix truncation. It also credits the right half with
+  the firstright tuple's key data: `rightfree += firstrightitemsz - (MAXALIGN(sizeof(IndexTupleData)) +
+  sizeof(ItemIdData))`.
+- `_bt_split` stores that credit. On an internal page the right half's first item is written key-less, as a
+  minus-infinity pivot (`newfirstdataitem`, `_bt_pgaddtup`), so it takes 8 bytes where goopg kept a 16-byte keyed
+  tuple.
+
+The interval is `INTERNAL_SPLIT_DISTANCE` (7.5%). The fill factor is `BTREE_NONLEAF_FILLFACTOR` on a rightmost page
+and an even balance elsewhere. Within the interval `_bt_bestsplitloc` takes the split with the smallest firstright
+tuple, because that tuple becomes the parent's separator (`_bt_split_penalty`). It stops at the page-wide minimum
+(`_bt_strategy`'s perfect penalty for internal pages).
+
+**Port.** `pgFindSplitLocInternal` (splitloc.go) is `_bt_findsplitloc` for a non-leaf page. It reuses `deltaSort`,
+and `defaultInterval` becomes `splitInterval` with the distance as a parameter. `insertIntoBlock` routes
+descriptor-format internal pages through it and truncates the right half's first item to `downlinkItem(nil,
+child)`. That is the same form every root's first downlink already has.
+
+**Measured.** The pkeys were replayed on clones: the same inline-key DDL, then server-side COPY from the TSVs the
+corpus loaded. On the HEAD binary the replay reproduces every shipped size exactly. INSERT … SELECT in heap order
+does not reproduce them: store\_sales gives 2578 against COPY's 2567, so a replay must use COPY.
+`slice4/replay-results.txt`:
+
+| scale | index | corpus (HEAD) | slice 4 | PG |
+|---|---|---|---|---|
+| SF0.25 | customer\_demographics\_pkey | 5269 | **5268** | 5268 |
+| SF0.25 | store\_sales\_pkey | 2567 | 2567 | 2569 |
+| SF0.25 | store\_returns / catalog\_sales | 280 / 1250 | 280 / 1250 | 280 / 1250 |
+| SF1 | customer\_demographics\_pkey | 5269 | **5268** | 5268 |
+| SF1 | store\_sales\_pkey | 11042 | 11042 | 11041 |
+| SF1 | store\_returns\_pkey | 1081 | 1081 | 1082 |
+| SF1 | catalog\_sales\_pkey | 5624 | 5624 | 5625 |
+
+**The remaining four are heap placement.** At SF1 the per-block heap row counts differ from PG's replica:
+
+- catalog\_sales: 7361 blocks differ (block 1 holds 39 rows in PG, 38 in goopg);
+- store\_returns: 689 blocks differ;
+- store\_sales: 17539 blocks differ.
+
+This is §6's mechanism at scale. PG's COPY records a page's free space in the FSM when it moves on, and later
+short tuples refill that page (`RecordAndGetPageWithFreeSpace`, hio.c). goopg fills forward. The heap TIDs differ,
+so `_bt_afternewitemoff`'s adjacency test and the leaf splits differ with them. The ledger row of 2026-10-16 owns
+this. It is the last engine mechanism between the corpora and PG's index geometry.
+
+**Pins** (`internal_split_test.go`):
+
+- `TestInsertBuiltSerialIndexMatchesPGInternalLevel` builds the 1920800-key ascending index. It checks PG's 5268
+  pages, the 17 × 285 + 403 internal level, and an 8-byte first downlink on every internal page.
+- `TestFindSplitLocInternalTakesSmallestFirstRight` has three cases. The smallest-firstright pick: 93 against the
+  balanced 89. The balanced pick once the short item leaves the interval. The 70/30 rightmost split: 127, which the
+  leaf's 8-byte allowance would move to 126.
+- Mutations fail them:
+  - Keeping the right half's first key fails the first pin (16-byte first downlinks).
+  - Ignoring the penalty, or charging the heap-TID allowance, fails the second.
+  - Reverting both halves fails the page count (5269).
+  - The 1.92M-key layout alone cannot tell the two halves apart: either saving yields the 285th downlink.
+
+**Plans.** The shipped corpora are unchanged until an owner rebuild (`scripts/tpcds-corpus-rebuild.sh`). Gates on
+them confirm no regression: sf025 sweep same=99, and the fire set fired nothing (SF1 95 / 99). A rebuild would
+remove the +4.0 customer\_demographics\_pkey offset from SF1 Q64 and SF0.25 Q77's merge.
+
+**Not changed.** The bulk loader (`bulkload.go`, CREATE INDEX on a filled table) still fills internal pages with
+its own reserve arithmetic. Upstream `_bt_buildadd` fills them to `BTREE_NONLEAF_FILLFACTOR` and truncates each new
+page's first item. No measured index here is bulk-built: both corpora and the TPC-H bench declare keys before
+loading. Ledger row.
+
+## 8. Slice 5 (2026-10-20): COPY heap placement through PG's free space map
+
+**Record.** After slice 4, four indexes were still 1-2 pages off PG: SF0.25 store\_sales\_pkey 2567 against 2569,
+and SF1 store\_sales 11042 / 11041, store\_returns 1081 / 1082, catalog\_sales 5624 / 5625. Each followed heap
+TIDs. PG's block 6 of SF0.25 store\_sales holds 56 rows, goopg's 55. The extra row is a 77-byte tuple that PG put
+back on block 6 and goopg put at block 520.
+
+**What PG does.** RelationGetBufferForTuple (hio.c) with COPY's BulkInsertState:
+
+1. keeps filling the current page;
+2. then takes the bulk extension's next free page, recording the page it leaves (`RecordPageWithFreeSpace`);
+3. once those are used up, calls `RecordAndGetPageWithFreeSpace`;
+4. only then calls RelationAddBlocks.
+
+RelationAddBlocks enters the pages beyond the caller's need into the FSM and calls
+`FreeSpaceMapVacuumRange(first_fsm_block, last_block)`. That range's end is exclusive, so the last page stays out.
+The search itself is freespace.c / fsmpage.c:
+
+- A leaf FSM page covers 4069 heap blocks and is a binary max-tree of one-byte categories. Space rounds down;
+  requests round up.
+- `fsm_search_avail` starts at the page's `fp_next_slot` and moves right with wraparound. It leaves the hint one
+  past the slot it returns.
+- `RecordAndGetPageWithFreeSpace` searches the old page's own leaf first, then the tree from the root
+  (`fsm_search`).
+- Upper levels change only through `FreeSpaceMapVacuumRange` (each upper slot gets its leaf's maximum, and every
+  visited page's hint resets to 0), or when `fsm_search` corrects a stale slot it descended into.
+
+**What goopg did.** The bulk path (`bulk_insert.go`, M0146-0009h) already followed hio.c step for step, over
+goopg's flat first-fit FSM. But server-side COPY built its executor context by hand (`postmaster/copy.go`) without
+`FSM` or `VM`. With `ctx.FSM == nil`:
+
+- `tryAppendToBlock` recorded nothing;
+- every lookup returned "no page", so the heap filled strictly forward;
+- the VM bit of an all-visible page COPY appended to was left set.
+
+A trace of the SF0.25 load showed every RecordAndGet search failing, block 519's included, while block 6 had 104
+bytes free.
+
+**Port.**
+
+- `storage/fsm_pgtree.go` holds PG's FSM tree per relation. It implements:
+  - addressing: `fsm_logical_to_physical`, `fsm_get_location`, parent and child;
+  - `fsm_set_avail` and `fsm_search_avail` with the hint, `fsm_rebuild_page` and `fsm_truncate_avail`;
+  - `fsm_set_and_search`, and `fsm_search` with its stale-slot correction and its restart bound;
+  - `fsm_vacuum_page` / `FreeSpaceMapVacuumRange`;
+  - the page-existence rule of `fsm_readbuf`, where a page exists below the fork's size;
+  - truncation.
+- The FSM keeps the tree beside its flat array:
+  - every record sets the leaf, with `PageGetHeapFreeSpace` when the page is at hand;
+  - load rebuilds the tree from the fork's categories, as a vacuumed FSM;
+  - truncate and drop follow the flat array.
+  - `PGGetPageWithFreeSpace`, `PGRecordAndGetPageWithFreeSpace` and `PGVacuumRange` read and maintain the tree;
+    goopg's other insert paths still use the flat first-fit lookups (ledger).
+- The bulk path's lookups are PG's:
+  - the fresh state calls GetPageWithFreeSpace;
+  - leaving a page calls RecordAndGetPageWithFreeSpace with the page's `PageGetHeapFreeSpace`;
+  - each extension calls the vacuum range.
+- COPY's context gets `FSM` and `VM`, as dispatch wires them.
+- VACUUM ends with `PGVacuumRange(0, nblocks)`, lazy\_scan\_heap's last `FreeSpaceMapVacuumRange`.
+- `MaxFSMRequestSize` is corrected to PG's `MaxHeapTupleSize`, 8160 (it was 8164).
+
+**Measured** (`slice5/`): the full COPY replay of all 24 tables at both scales.
+
+- Every pkey equals PG's page count. That includes the four above: 2569, 11041, 1082 and 5625.
+- Heap pages equal PG's, except the bulk-extension tails COPY leaves before VACUUM. VACUUM of the replayed copies
+  truncates them to PG's 242 / 721 / 53 / 332.
+- Per-block heap row counts against the PG replica: 0 differing blocks on store\_sales, store\_returns and
+  catalog\_sales at both scales. Before, 4303 / 387 / 58 blocks differed at SF0.25 and 17539 / 689 / 7361 at SF1.
+- Together with slice 4, a corpus reload on this engine now reproduces the reference's physical layout heap for
+  heap and index for index.
+
+**Pins.**
+
+- `TestCopyFromRefillsEarlierPagesThroughTheFSM` (postmaster) COPYs 3000 rows of 800-1200 bytes. It checks PG
+  18.3's measured layout: 411 blocks and their row counts, plus the 8 rows PG placed back on earlier pages. It
+  fails when the context's FSM is removed, when the bulk path goes back to first-fit, and when the extension's
+  vacuum range is dropped.
+- `fsm_pgtree_test.go` covers four behaviours:
+  - fsmpage.c's worked example: search right from the hint, wrap, and leave the hint;
+  - upper levels move only on a vacuum range, whose end is exclusive at a leaf boundary;
+  - RecordAndGet prefers the old page's leaf;
+  - the category edges.
+
+**Found on the way** (M0146-0236, S2): above a WindowAgg, `ctid` reads NULL and `xmin` does not resolve. The pin
+finds its back-jumps without `lag(ctid)` for that reason.
+
+**Plans.** The shipped corpora are unchanged: sf025 same=99, and the fire set fired nothing (SF0.25 98 / 99, SF1
+95 / 99). An owner rebuild on this engine gives PG-exact index geometry. Its first effect is the +4.0
+customer\_demographics\_pkey offset on SF1 Q64 and SF0.25 Q77.
+
+## 9. Closure (2026-10-20)
+
+The owner rebuilt both shipped corpora on the slice-4/5 engine (bb7b36ceb). M0146-0236, the open child that OWNER
+DECISIONS 2026-10-20 named, was then resolved (b0c982657). The closure census (`closure/census.sh`) clones each
+shipped corpus and compares pg\_class relpages, relallvisible, reltuples and `pg_relation_size` for every public
+table and index against `:65438`:
+
+| scale | relations compared | differing |
+|---|---|---|
+| SF0.25 | 49 | 0 |
+| SF1 | 49 | 1: `dbgen_version`, physical 0 against 1 |
+
+- **`dbgen_version`.** `scripts/tpcds-corpus-rebuild.sh` leaves the table out of its `TABLES` list, so the goopg
+  SF1 corpus holds no row where PG's holds one. Its relpages and reltuples match only because they are PG's
+  imported statistics. This is a load-script gap, not an engine one, and no TPC-DS query reads the table (ledger,
+  owner).
+- **Plan instruments.** The rebuild held parity at 98 / 99 (SF0.25) and 96 / 99 (SF1) with identical plan shapes.
+  The task's original record (the RELPAGES class: SF1 Q52, Q76) is gone: both match. The remaining first
+  divergences, Q13, Q72 and Q77, are planner ones.
+- **Probe note.** In goopg `pg_relation_size(c.oid::regclass)` returns NULL, while `pg_relation_size(c.oid)` works.
+  It is ledgered with the `pg_relation_size('name')` oddity.
+

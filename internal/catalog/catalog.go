@@ -77,6 +77,22 @@ var RelAllVisibleFunc func(dbOid, relOid uint32) int32
 // because those columns are declared NUMERIC (M0134-0183).
 var RelNBlocksFunc func(rel storage.RelFileNode) (int64, bool)
 
+// RelationBlocksFunc reports tbl's current main-fork size in blocks —
+// RelationGetNumberOfBlocks, which estimate_rel_size (plancat.c) reads on
+// every plan to set rel->pages and to scale a stale reltuples (M0146-0237).
+// Set by initdb with the server's catalog captured; nil (unit tests, tools)
+// leaves the planner on the stored statistics.
+var RelationBlocksFunc func(tbl *Table) (int64, bool)
+
+// ActualVariableRangeFunc is the planner's get_actual_variable_range
+// (selfuncs.c; M0146-0233): the actual current minimum (wantMax=false) or
+// maximum of tbl's column, read from a btree index leading on it, rendered as
+// ANALYZE renders histogram bounds. ok=false when no usable index exists or
+// the probe found no usable entry. Set by initdb at startup with the server's
+// catalog captured; nil (unit tests, tools) means no index can be probed, as
+// for a relation with no indexes.
+var ActualVariableRangeFunc func(tbl *Table, column string, wantMax bool) (string, bool)
+
 // IndexRealPages reports idx's real main-fork size in blocks, when the
 // storage hook is wired and the fork exists. The dbOid/tablespace resolution
 // mirrors (*InMemory).IndexRelFileNode less the receiver's default-db state:
@@ -2171,15 +2187,22 @@ func (cs ColumnStats) StaDistinct() float64 {
 //
 // Returns 0 when neither form is populated, which callers must treat as "no
 // information" rather than as zero distinct values.
+//
+// The form resolved is the one StaDistinct reports — the single stadistinct
+// PG stores — so a column ANALYZE recorded in both forms scales with the
+// relation exactly when PG's would: compute_scalar_stats stores the negated
+// fraction once the distinct count exceeds a tenth of the rows, and
+// get_variable_numdistinct resolves it against the relation's CURRENT tuple
+// estimate, which estimate_rel_size scales with the relation's size
+// (M0146-0237). Without a tuple count the absolute count still answers.
 func (cs ColumnStats) ResolvedNDistinct(tuples float64) float64 {
+	sd := cs.StaDistinct()
 	switch {
+	case sd < 0 && tuples > 0:
+		// ndistinct = -stadistinct * ntuples (selfuncs.c).
+		return -sd * tuples
 	case cs.NDistinct > 0:
 		return float64(cs.NDistinct)
-	case cs.NDistinctFrac > 0 && tuples > 0:
-		// The relative form is a FRACTION of the relation, exactly as
-		// `get_variable_numdistinct` resolves a negative stadistinct
-		// (selfuncs.c): ndistinct = -stadistinct * ntuples.
-		return cs.NDistinctFrac * tuples
 	default:
 		return 0
 	}

@@ -1,0 +1,8 @@
+# SF0.25 Q64 EXPLAIN wall time on one fresh clone of the shipped corpus, two runs per binary, taken while the owner's
+# SF1 corpus rebuild was running on the host (2026-10-20 ~11:55). The fire-set baseline (4eea30455) capture had
+# "(explain failed)" for Q64: capture-tpcds.sh runs each EXPLAIN under `timeout 120`.
+pre0233 (252e5b851)  run1 186.6 s  run2 89.0 s
+0233    (4eea30455)  run1 195.7 s  run2 75.1 s
+current (M0146-0237) run1 235.0 s  run2 42.3 s
+# Planning Q64 takes minutes on every binary, so the capture timeout is borderline under load; the endpoint probe
+# did not cause it.

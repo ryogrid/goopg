@@ -1,0 +1,1 @@
+# amcheck + per-block heap (check-extra.sh) — both corpora: 24/24 pkeys bt_index_parent_check clean; store_sales/store_returns/catalog_sales per-block differing lines = 0

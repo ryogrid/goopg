@@ -47,8 +47,10 @@ const (
 
 	// MaxFSMRequestSize is the maximum heap tuple size — the largest free-space
 	// request the FSM can satisfy. Category 255 represents >= this value.
-	// PG: MaxHeapTupleSize = BLCKSZ - SizeOfPageHeaderData - sizeof(ItemIdData).
-	MaxFSMRequestSize = BlockSize - SizeOfPageHeaderData - 4 // 8164 for 8k pages
+	// PG: MaxHeapTupleSize = BLCKSZ - MAXALIGN(SizeOfPageHeaderData +
+	// sizeof(ItemIdData)) (htup_details.h) — 8160, not 8164: the header and
+	// line pointer are MAXALIGNed together (M0146-0216).
+	MaxFSMRequestSize = pgMaxFSMRequestSize
 )
 
 // fsmSpaceAvailToCat converts available free bytes to an FSM category (0–255).
@@ -494,6 +496,7 @@ func (f *FSM) FSMLoadForks(dataDir string) error {
 			f.chunkMax[key] = buildChunkMax(pages)
 		}
 	}
+	f.buildTreesLocked()
 	f.mu.Unlock()
 	return nil
 }

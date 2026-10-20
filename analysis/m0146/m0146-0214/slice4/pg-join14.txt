@@ -1,0 +1,17 @@
+GEQOJOIN relids=(b 12 16) rows=7200 startup=1.450000 total=149.355000 outer=(b 12) inner=(b 16)
+GEQOJOIN relids=(b 1 12 16) rows=688921 startup=239.355000 total=29962.860000 outer=(b 1) inner=(b 12 16)
+GEQOJOIN relids=(b 1 7 12 16) rows=658861 startup=240.625000 total=32383.365750 outer=(b 1 12 16) inner=(b 7)
+GEQOJOIN relids=(b 1 7 9 12 16) rows=630662 startup=241.062500 total=81996.835154 outer=(b 1 7 12 16) inner=(b 9)
+GEQOJOIN relids=(b 1 7 9 11 12 16) rows=602450 startup=255.812500 total=83689.411904 outer=(b 1 7 9 12 16) inner=(b 11)
+GEQOJOIN relids=(b 1 7 9 10 11 12 16) rows=925737064895 startup=256.240000 total=17357946338.964405 outer=(b 10) inner=(b 1 7 9 11 12 16)
+GEQOJOIN relids=(b 1 3 7 9 10 11 12 16) rows=397555795 startup=1003.377500 total=6419138099.775522 outer=- inner=-
+GEQOJOIN relids=(b 1 3 7 9 10 11 12 14 16) rows=379639281 startup=1003.677500 total=6420248278.826638 outer=- inner=-
+GEQOJOIN relids=(b 1 3 7 9 10 11 12 14 16 18) rows=232002 startup=393945.284432 total=6375978696.201148 outer=- inner=-
+GEQOJOIN relids=(b 1 3 4 7 9 10 11 12 14 16 18) rows=221956 startup=393945.733789 total=6375979869.362577 outer=- inner=-
+GEQOJOIN relids=(b 1 2 3 4 7 9 10 11 12 14 16 18) rows=17 startup=393946.026289 total=6375999911.699629 outer=(b 1 3 4 7 9 10 11 12 14 16 18) inner=(b 2)
+GEQOJOIN relids=(b 13 17) rows=7200 startup=1.450000 total=149.355000 outer=(b 13) inner=(b 17)
+GEQOJOIN relids=(b 1 2 3 4 7 8 9 10 11 12 14 16 18) rows=1 startup=393946.318789 total=6375999917.479491 outer=(b 1 2 3 4 7 9 10 11 12 14 16 18) inner=(b 8)
+GEQOJOIN relids=(b 1 2 3 4 7 8 9 10 11 12 13 14 16 17 18) rows=1 startup=393947.768789 total=6376000156.834491 outer=(b 1 2 3 4 7 8 9 10 11 12 14 16 18) inner=(b 13 17)
+GEQOJOIN relids=(b 1 2 3 4 7 8 9 10 11 12 13 14 15 16 17 18) rows=1 startup=3187978945.498690 total=6375955105.689612 outer=- inner=-
+GEQOJOIN relids=(b 1 2 3 4 6 7 8 9 10 11 12 13 14 15 16 17 18) rows=1 startup=3187978945.791190 total=6375955106.064655 outer=(b 1 2 3 4 7 8 9 10 11 12 13 14 15 16 17 18) inner=(b 6)
+GEQOJOIN relids=(b 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18) rows=1 startup=3187978946.083690 total=6375955106.439697 outer=(b 1 2 3 4 6 7 8 9 10 11 12 13 14 15 16 17 18) inner=(b 5)

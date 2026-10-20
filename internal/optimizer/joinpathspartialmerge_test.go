@@ -63,11 +63,11 @@ func pmjFixture(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo
 	return s, joinrel, outer, inner, keys
 }
 
-func pmjClosures(s *searchCtx, joinrel, outer, inner *RelOptInfo) (func([]*restrictInfo) float64, func([]*restrictInfo) (float64, float64)) {
+func pmjClosures(s *searchCtx, joinrel, outer, inner *RelOptInfo) (func([]*restrictInfo) float64, func([]*restrictInfo) mergeScanSel) {
 	mergeTuplesFor := func(res []*restrictInfo) float64 {
 		return s.mergeJoinTuples(res, outer.Rows, inner.Rows)
 	}
-	scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+	scanSelFor := func(mc []*restrictInfo) mergeScanSel {
 		return s.mergeJoinScanSel(mc, outer.Relids)
 	}
 	return mergeTuplesFor, scanSelFor

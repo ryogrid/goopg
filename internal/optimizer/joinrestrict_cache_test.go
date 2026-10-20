@@ -93,25 +93,26 @@ func TestMergeScanSelCacheIsSpeedOnly(t *testing.T) {
 	outerLeft := relsetOf(0)
 	outerRight := relsetOf(1)
 
-	lo, li := s.mergeJoinScanSel([]*restrictInfo{warm}, outerLeft)
+	l := s.mergeJoinScanSel([]*restrictInfo{warm}, outerLeft)
 	if !warm.scanSelValid {
 		t.Fatal("merge scan-sel cache not populated")
 	}
-	if lo2, li2 := s.mergeJoinScanSel([]*restrictInfo{warm}, outerLeft); lo2 != lo || li2 != li {
-		t.Fatalf("warm (%v,%v) != cold (%v,%v)", lo2, li2, lo, li)
+	if l2 := s.mergeJoinScanSel([]*restrictInfo{warm}, outerLeft); l2 != l {
+		t.Fatalf("warm %+v != cold %+v", l2, l)
 	}
-	if fo, fi := s.mergeJoinScanSel([]*restrictInfo{cold}, outerLeft); fo != lo || fi != li {
-		t.Fatalf("other-cold (%v,%v) != cold (%v,%v)", fo, fi, lo, li)
+	if f := s.mergeJoinScanSel([]*restrictInfo{cold}, outerLeft); f != l {
+		t.Fatalf("other-cold %+v != cold %+v", f, l)
 	}
 	// The estimate must actually have been computed, or the swap assertion
-	// below is satisfied by (1, 1) meaning "declined".
-	if lo == 1 && li == 1 {
-		t.Fatalf("both ends are 1 — the fixture did not reach the histogram arm")
+	// below is satisfied by the full-scan default meaning "declined".
+	if l == fullMergeScan {
+		t.Fatalf("full-scan default — the fixture did not reach the histogram arm")
 	}
 	// Commuting the join swaps the pair and nothing else.
-	ro, ri := s.mergeJoinScanSel([]*restrictInfo{jsEqui(parser.OpEq)}, outerRight)
-	if ro != li || ri != lo {
-		t.Fatalf("commuted (%v,%v); want the swap of (%v,%v)", ro, ri, lo, li)
+	r := s.mergeJoinScanSel([]*restrictInfo{jsEqui(parser.OpEq)}, outerRight)
+	want := mergeScanSel{outerStart: l.innerStart, outerEnd: l.innerEnd, innerStart: l.outerStart, innerEnd: l.outerEnd}
+	if r != want {
+		t.Fatalf("commuted %+v; want the swap %+v", r, want)
 	}
 }
 

@@ -64,8 +64,10 @@ func TestRelNarrowedWidthsNarrowsToNeededColumns(t *testing.T) {
 	if math.Abs(got.avgVarBytes-30) > 1e-9 {
 		t.Errorf("avgVarBytes = %v, want 30 (a=10 + c=20)", got.avgVarBytes)
 	}
-	if got.outputWidth <= 0 {
-		t.Errorf("outputWidth = %d, want > 0", got.outputWidth)
+	// M0146-0234: set_rel_width's get_attavgwidth — the ANALYZE average
+	// width of each kept column (10 + 20), not its type's declared width.
+	if got.outputWidth != 30 {
+		t.Errorf("outputWidth = %d, want 30 (stawidth a=10 + c=20)", got.outputWidth)
 	}
 }
 
@@ -742,5 +744,122 @@ func TestR124AcceptedAvgVarDivergenceOnNonTableChild(t *testing.T) {
 		t.Fatalf("expected the ACCEPTED divergence (planner %v < executor %v); "+
 			"if this now holds, the divergence closed and the report must be updated",
 			j.AvgVarBytes, executorCharge)
+	}
+}
+
+// M0146-0234: build_joinrel_tlist for the cost triple. A joinrel keeps a
+// column only while the output above the tree or a join clause reaching past
+// the joinrel reads it; a join key consumed inside the joinrel drops out.
+func TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	a := ncRel([]string{"a_key", "a_out"}, ncNeeded("a_key", "a_out", "b_key", "b_c", "c_key"), true,
+		map[string]float64{"a_key": 4, "a_out": 30})
+	a.Relids = RelSet(1)
+	b := ncRel([]string{"b_key", "b_c"}, ncNeeded("a_key", "a_out", "b_key", "b_c", "c_key"), true,
+		map[string]float64{"b_key": 4, "b_c": 8})
+	b.Relids = RelSet(2)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded("a_out"),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(3), "a_key", "b_key"), // inside the joinrel: both keys drop
+			clause(RelSet(6), "b_c", "c_key"),   // reaches c: b_c stays
+		}},
+	}
+	j := newRelOptInfo(RelSet(3), 10, 64)
+	j.publishedMembers = []*RelOptInfo{a, b}
+	got := s.joinrelNarrowedWidths(j)
+	if !got.ok || got.ncols != 2 || got.outputWidth != 38 {
+		t.Fatalf("joinrel triple = %+v, want a_out + b_c (2 cols, width 30+8)", got)
+	}
+	// A SEMI join publishes its LHS alone: only a's kept column counts.
+	j.publishedMembers = []*RelOptInfo{a}
+	if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 1 || got.outputWidth != 30 {
+		t.Fatalf("semi joinrel triple = %+v, want a_out only", got)
+	}
+	// Not output-eligible: decline, so the children's sum stays.
+	s.outputEligible = false
+	if got := s.joinrelNarrowedWidths(j); got.ok {
+		t.Fatalf("ineligible problem narrowed the joinrel: %+v", got)
+	}
+}
+
+// M0146-0234: build_base_rel_tlists for a base rel's cost triple. A column read
+// only by the rel's own restriction quals is evaluated at the scan and never
+// emitted, so it leaves the width; a join key reaching another rel and the
+// query's output stay. A reltarget that keeps nothing (count(*) over
+// restrictions) keeps the statement-wide narrowing.
+func TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	d := ncRel([]string{"d_date_sk", "d_year", "d_moy"}, ncNeeded("d_date_sk", "d_year", "d_moy", "s_date_sk"), true,
+		map[string]float64{"d_date_sk": 4, "d_year": 4, "d_moy": 4})
+	d.Relids = RelSet(1)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded(),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(1), "d_year", "d_moy"),       // the rel's own restriction
+			clause(RelSet(3), "d_date_sk", "s_date_sk"), // reaches rel 2
+		}},
+	}
+	if got := s.baseRelNarrowedWidths(d); !got.ok || got.ncols != 1 || got.outputWidth != 4 {
+		t.Fatalf("base triple = %+v, want d_date_sk alone (1 col, width 4)", got)
+	}
+	// Nothing needed above: the statement-wide set stands (3 columns).
+	s.clauses.all = s.clauses.all[:1]
+	if got := s.baseRelNarrowedWidths(d); !got.ok || got.ncols != 3 {
+		t.Fatalf("empty reltarget triple = %+v, want the statement-wide 3 columns", got)
+	}
+}
+
+// M0146-0234: set_subquery_size_estimates — a derived leaf's plain-Var output
+// takes the width its subquery rel computed for the attribute (stawidth),
+// not the type default; an expression output, and a materialized CTE
+// (RTE_CTE), keep the type default; an inlined CTE answers as a subquery.
+func TestDerivedLeafColumnWidthFollowsSubqueryVars(t *testing.T) {
+	tbl := &catalog.Table{Name: "item", Columns: []catalog.Column{
+		{Name: "i_item_id", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "i_price", Type: catalog.Type{Name: "numeric"}},
+	}, Stats: &catalog.TableStats{RowCount: 100, Analyzed: true, Columns: []catalog.ColumnStats{
+		{AvgWidth: 17}, {AvgWidth: 6},
+	}}}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "i_item_id"}, {Name: "i_price"}}}
+	body := &Project{Child: scan, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "i_item_id"},
+		&BinaryOp{Op: parser.OpAdd, Left: &ColumnRef{Index: 1, Name: "i_price"}, Right: &IntegerConst{Value: 1}},
+	}, schema: Schema{{Name: "i_item_id"}, {Name: "p"}}}
+	sub := &SubqueryScan{Child: body, schema: body.schema}
+	if w, ok := derivedLeafColumnWidth(sub, 0); !ok || w != 17 {
+		t.Fatalf("plain-Var output width = %d, %v; want the column's stawidth 17", w, ok)
+	}
+	if _, ok := derivedLeafColumnWidth(sub, 1); ok {
+		t.Fatalf("expression output took a statistics width; PG uses the type default")
+	}
+	// A GROUP BY key is still a plain Var of the scan.
+	agg := &Aggregate{Child: scan, GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "i_item_id"}},
+		schema: Schema{{Name: "i_item_id"}, {Name: "n"}}}
+	if w, ok := derivedLeafColumnWidth(&SubqueryScan{Child: agg, schema: agg.schema}, 0); !ok || w != 17 {
+		t.Fatalf("group-key output width = %d, %v; want 17", w, ok)
+	}
+	// A materialized CTE computes no widths (set_cte_size_estimates).
+	mat := &CTEScan{Name: "c", Child: body, schema: body.schema,
+		cte: &plannedCTE{name: "c", body: body, schema: body.schema, materialized: "materialized"}}
+	if _, ok := derivedLeafColumnWidth(mat, 0); ok {
+		t.Fatalf("a materialized CTE took a statistics width; PG uses the type default")
+	}
+	inl := &CTEScan{Name: "c", Child: body, schema: body.schema,
+		cte: &plannedCTE{name: "c", body: body, schema: body.schema, inlineEligible: true, selectOwned: true, refs: 1}}
+	if w, ok := derivedLeafColumnWidth(inl, 0); !ok || w != 17 {
+		t.Fatalf("inlined CTE output width = %d, %v; want 17 (an RTE_SUBQUERY)", w, ok)
 	}
 }

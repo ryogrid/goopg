@@ -142,11 +142,45 @@ type scopeRel struct {
 	usingHidden []string
 }
 
-// outerScope is the goroutine-thread-unsafe lexical-scope
-// channel set by the planner before invoking Analyze on a
-// subquery's inner SELECT. Mirrors planner.planParent. nil
-// for top-level statements.
-var outerScope *scope
+// OuterScopeCarrier is implemented by the planner's per-statement catalog
+// wrapper (optimizer.stmtCatalog). Its slot holds the lexical-scope channel
+// the planner sets before invoking Analyze on a subquery's inner SELECT; nil
+// for top-level statements. It was a package-level variable, which sessions
+// planning concurrently swapped under each other (P0-E8) — PostgreSQL keeps
+// the equivalent per query, as ParseState.parentParseState.
+type OuterScopeCarrier interface {
+	AnalyzerOuterScopeSlot() *any
+}
+
+// outerScopeSlot finds cat's OuterScopeCarrier slot, peeling wrapper
+// catalogs; nil when cat carries none (a top-level Analyze from DDL).
+func outerScopeSlot(cat catalog.Catalog) *any {
+	type unwrapper interface {
+		Unwrap() catalog.Catalog
+	}
+	for i := 0; cat != nil && i < 16; i++ {
+		if c, ok := cat.(OuterScopeCarrier); ok {
+			return c.AnalyzerOuterScopeSlot()
+		}
+		u, ok := cat.(unwrapper)
+		if !ok {
+			return nil
+		}
+		cat = u.Unwrap()
+	}
+	return nil
+}
+
+// outerScopeOf is the lexical-scope parent cat's statement set for the next
+// Analyze call, or nil.
+func outerScopeOf(cat catalog.Catalog) *scope {
+	if slot := outerScopeSlot(cat); slot != nil {
+		if sc, ok := (*slot).(*scope); ok {
+			return sc
+		}
+	}
+	return nil
+}
 
 // OuterRelation describes one FROM-clause range variable in
 // an outer scope. The planner constructs these from its
@@ -179,17 +213,22 @@ func NewOuterScope(cat catalog.Catalog, rels []OuterRelation, parent *OuterScope
 	return &OuterScope{inner: s}
 }
 
-// SetOuterScope wires the lexical-scope parent for the next
-// Analyze call. Returns a restorer; defer it to guarantee
-// cleanup. Mirrors planner.planParent's design.
-func SetOuterScope(parent *OuterScope) func() {
-	prev := outerScope
-	if parent != nil {
-		outerScope = parent.inner
-	} else {
-		outerScope = nil
+// SetOuterScope wires the lexical-scope parent for the next Analyze call
+// over cat, on cat's per-statement OuterScopeCarrier slot. Returns a
+// restorer; defer it to guarantee cleanup. A cat without a carrier has no
+// statement scope to set it on, and the call is a no-op.
+func SetOuterScope(cat catalog.Catalog, parent *OuterScope) func() {
+	slot := outerScopeSlot(cat)
+	if slot == nil {
+		return func() {}
 	}
-	return func() { outerScope = prev }
+	prev := *slot
+	if parent != nil {
+		*slot = parent.inner
+	} else {
+		*slot = nil
+	}
+	return func() { *slot = prev }
 }
 
 // Analyze validates one parsed statement semantically.
@@ -221,7 +260,8 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 	// gate on a data-modifying WITH (analyzeWith / M0125-0051), goopg's
 	// analogue of upstream's `pstate->parentParseState == NULL` test in
 	// analyzeCTE (postgres/src/backend/parser/parse_cte.c:333).
-	return analyzeSelectStmt(s, cat, outerScope, outerScope == nil)
+	outer := outerScopeOf(cat)
+	return analyzeSelectStmt(s, cat, outer, outer == nil)
 }
 
 // lockingClauseName returns the SQL name of a locking strength (FOR UPDATE, etc.)
@@ -583,7 +623,7 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 		cteCtx = &scope{cat: cat}
 		// A WITH on the INSERT being analyzed is a root WITH exactly when
 		// no planner-supplied outer scope is in force. M0125-0051.
-		if err := analyzeWith(s.With, cteCtx, outerScope == nil); err != nil {
+		if err := analyzeWith(s.With, cteCtx, outerScopeOf(cat) == nil); err != nil {
 			return err
 		}
 	}
@@ -795,7 +835,7 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	// Register CTEs first so FROM-clause tables can reference them. M0100-0010.
 	if s.With != nil {
-		if err := analyzeWith(s.With, ctx, outerScope == nil); err != nil {
+		if err := analyzeWith(s.With, ctx, outerScopeOf(cat) == nil); err != nil {
 			return err
 		}
 	}
@@ -853,7 +893,7 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	// Register CTEs first so USING-clause tables can reference them. M0100-0010.
 	if s.With != nil {
-		if err := analyzeWith(s.With, ctx, outerScope == nil); err != nil {
+		if err := analyzeWith(s.With, ctx, outerScopeOf(cat) == nil); err != nil {
 			return err
 		}
 	}

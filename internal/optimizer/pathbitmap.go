@@ -362,7 +362,7 @@ func matchBitmapIndexQuals(
 			// relative ndistinct form; the table's own stats carry it here.
 			rawRows := 0.0
 			if tbl.Stats != nil {
-				rawRows = float64(tbl.Stats.RowCount)
+				rawRows = float64(tableRows(tbl))
 			}
 			colSel := indexKeyEqSelectivity(stats, val, rawRows, columnTypeByName(tbl, colName))
 			selectivity *= colSel

@@ -287,6 +287,7 @@ func TestPGShapedSeamKeepsANullableSideQualAboveTheOuterJoin(t *testing.T) {
 	nullableQual := seamLocal(names, 3) // `d1 > 5`, on the null-extended side
 
 	out, residual, used := tryPGShapedJoinSearch(node, nullableQual, ctx, nil)
+	out, residual = unwrapPricedPushedDown(out, residual)
 	if !used {
 		t.Fatal("the seam declined the C-04a shape")
 	}
@@ -318,6 +319,7 @@ func TestPGShapedSeamHoldsAMultiRelationNullableSideQual(t *testing.T) {
 	spanning := rfjEq(names, 0, 3)
 
 	out, residual, used := tryPGShapedJoinSearch(node, spanning, ctx, nil)
+	out, residual = unwrapPricedPushedDown(out, residual)
 	if !used {
 		t.Fatal("the seam declined the C-04a shape")
 	}
@@ -376,6 +378,7 @@ func TestSeamPlansARightLinkInsideOneSearchProblem(t *testing.T) {
 	pred := seamLocal(names, 0) // `a1 > 5`, on the null-extended prefix
 
 	out, residual, used := tryPGShapedJoinSearch(node, pred, ctx, nil)
+	out, residual = unwrapPricedPushedDown(out, residual)
 	if !used {
 		t.Fatal("the seam declined a 4-relation chain topped by a RIGHT JOIN — the C-04b shape")
 	}
@@ -616,4 +619,19 @@ func TestPGShapedSeamPeelsATwoLinkSpine(t *testing.T) {
 		}
 	}
 	rfjAssertBindingOrder(t, out, names)
+}
+
+// unwrapPricedPushedDown undoes M0146-0224's placement for a test that reads
+// the held WHERE conjuncts as the residual: a conjunct the search priced into
+// its top joinrel comes back in a Filter directly above the searched root —
+// still above every outer join — rather than in the residual.
+func unwrapPricedPushedDown(out Node, residual Expr) (Node, Expr) {
+	f, ok := out.(*Filter)
+	if !ok || !isSearchedTree(f.Child) {
+		return out, residual
+	}
+	if residual == nil {
+		return f.Child, f.Predicate
+	}
+	return f.Child, combineAnd([]Expr{f.Predicate, residual})
 }

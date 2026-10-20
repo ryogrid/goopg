@@ -206,10 +206,15 @@ func pathLeafNode(p *Path) Node {
 }
 
 // isTuplestoreScanNode reports PG's T_CteScan / T_WorkTableScan class —
-// scans whose output a rescan re-reads from a tuplestore.
+// scans whose output a rescan re-reads from a tuplestore. A CTE reference PG
+// inlines is not one: inline_cte turns it into an RTE_SUBQUERY, planned as a
+// T_SubqueryScan whose rescan re-executes the body (cost_rescan's default
+// arm), and goopg's executor streams that body too (CTEScan.Inlined).
 func isTuplestoreScanNode(n Node) bool {
-	switch n.(type) {
-	case *CTEScan, *MaterializedCTEScan, *WorkTableScan:
+	switch x := n.(type) {
+	case *CTEScan:
+		return !x.Inlined()
+	case *MaterializedCTEScan, *WorkTableScan:
 		return true
 	}
 	return false
@@ -230,16 +235,18 @@ func isFunctionScanNode(n Node) bool {
 // leaf scan kinds (which hide it one level deeper, in Rel.baseLeaf behind
 // the filter/labelling wrappers leafBaseScan strips).
 func nodeMaterializesOutput(n Node) bool {
-	switch n.(type) {
+	switch x := n.(type) {
 	case *Materialize, *Sort, *MaterializedCTEScan, *WorkTableScan,
 		*ScalarFuncScan, *RowsFrom, *GenerateSeries:
 		return true
 	case *CTEScan:
-		// CTEScan's labelling wrapper aside (plan.go:1816), its executor arm
-		// always builds cteScanOp, which "materializes all rows on first
-		// Open() and replays them on subsequent Open() calls"
-		// (executor.go:108-112) — T_CteScan's tuplestore, verbatim.
-		return true
+		// A kept CTE's executor arm builds cteScanOp, which "materializes all
+		// rows on first Open() and replays them on subsequent Open() calls"
+		// (executor.go:108-112) — T_CteScan's tuplestore, verbatim. An
+		// inlined reference is PG's T_SubqueryScan (inline_cte), which
+		// ExecMaterializesOutput does not list, so match_unsorted_outer
+		// offers a Material over it (M0146-0232: TPC-DS Q77's `cr`).
+		return !x.Inlined()
 	}
 	return false
 }
@@ -257,5 +264,5 @@ func createMaterialPlan(p *Path) (Node, outputLayout) {
 	if child == nil {
 		panic("createPlan: PathMaterial over a child path that built no node")
 	}
-	return &Materialize{pos: child.Pos(), Child: child}, childLayout
+	return &Materialize{pos: child.Pos(), Child: child, mergeJoinInner: p.mergeJoinMaterial}, childLayout
 }

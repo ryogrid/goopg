@@ -20,7 +20,7 @@ func TestMergeJoinCostMaterializeElection(t *testing.T) {
 	cp := defaultCostParams()
 	scan := Cost{Startup: 0, Total: 4}
 	cte := mergeInner{qualOps: 1}
-	cost, mat := mergeJoinCost(cp, scan, scan, 200, 200, 200, 1, 1, cte)
+	cost, mat := mergeJoinCost(cp, scan, scan, 200, 200, 200, fullMergeScan, cte)
 	if !mat {
 		t.Fatalf("a presorted CTE Scan inner must be materialized")
 	}
@@ -28,17 +28,17 @@ func TestMergeJoinCostMaterializeElection(t *testing.T) {
 		t.Errorf("merge cost %.4f, want PG's 11.50", cost.Total)
 	}
 	idx := mergeInner{qualOps: 1, markRestore: true}
-	if _, mat := mergeJoinCost(cp, scan, scan, 200, 200, 200, 1, 1, idx); mat {
+	if _, mat := mergeJoinCost(cp, scan, scan, 200, 200, 200, fullMergeScan, idx); mat {
 		t.Errorf("an index scan inner can mark/restore and must not be materialized")
 	}
 	uniq := mergeInner{qualOps: 1, skipMarkRestore: true}
-	if _, mat := mergeJoinCost(cp, scan, scan, 200, 200, 2000, 1, 1, uniq); mat {
+	if _, mat := mergeJoinCost(cp, scan, scan, 200, 200, 2000, fullMergeScan, uniq); mat {
 		t.Errorf("skip_mark_restore must never materialize")
 	}
 	// 2000 merged tuples over a 200-row inner: 1800 rescanned tuples make
 	// re-running a 40.00 inner (x10) dearer than buffering it.
 	dear := Cost{Startup: 0, Total: 40}
-	if _, mat := mergeJoinCost(cp, scan, dear, 200, 200, 2000, 1, 1, idx); !mat {
+	if _, mat := mergeJoinCost(cp, scan, dear, 200, 200, 2000, fullMergeScan, idx); !mat {
 		t.Errorf("heavy rescans of an expensive inner must elect the Material")
 	}
 }

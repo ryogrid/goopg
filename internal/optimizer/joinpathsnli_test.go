@@ -452,3 +452,28 @@ func TestParameterizedIndexPathsBindCompositeIndexFromTwoOuterRels(t *testing.T)
 			"{supplier} the skip probe, {part,supplier} the full one", params, want)
 	}
 }
+
+// TestNLIResidualKeepsOneClausePerEquivClass pins M0146-0242: the join's
+// restrictlist holds ONE equality per equivalence class between its sides
+// (generate_join_implied_equalities_normal), so a probe that enforces it
+// leaves no residual, and a probe keyed on another member leaves exactly that
+// equality as the Join Filter. TPC-DS Q72's class {cs, inv, item}: the written
+// `item = cs` is the class's equality; `item = inv` is inferred.
+func TestNLIResidualKeepsOneClausePerEquivClass(t *testing.T) {
+	cs, inv, item := relsetOf(0), relsetOf(1), relsetOf(2)
+	written := equiClause(item, cs)
+	written.ecID = 7
+	inferred := equiClause(item, inv)
+	inferred.ecID, inferred.inferred = 7, true
+	clauses := []*restrictInfo{written, inferred}
+
+	csProbe := &Path{IndexClauses: []indexPathClause{{ri: written, key: &ColumnRef{}}}}
+	if got := nestloopResidualClauses(clauses, csProbe, item, cs); len(got) != 0 {
+		t.Fatalf("cs-keyed probe left %d residual clauses, want 0: it enforces the class's equality", len(got))
+	}
+	invProbe := &Path{IndexClauses: []indexPathClause{{ri: inferred, key: &ColumnRef{}}}}
+	got := nestloopResidualClauses(clauses, invProbe, item, inv)
+	if len(got) != 1 || got[0] != written {
+		t.Fatalf("inv-keyed probe left %d residual clauses, want only the class's equality item = cs", len(got))
+	}
+}

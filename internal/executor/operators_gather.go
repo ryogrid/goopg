@@ -192,6 +192,8 @@ func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
 		collectBitmapScans(x.child, dst)
 	case *sortOp:
 		collectBitmapScans(x.child, dst)
+	case *incrementalSortOp:
+		collectBitmapScans(x.child, dst)
 	case *aggregateOp:
 		collectBitmapScans(x.child, dst)
 	case *instrumentedOp:

@@ -182,6 +182,22 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		// blocking reading — the conservative one for a startup column.
 		out.StartupCost = childTotal + cp.cpuOperatorCost*float64(len(x.Aggs))*childRowsOf(n)
 		out.TotalCost = out.StartupCost + perRow
+	case *Filter:
+		if agg, ok := x.Child.(*Aggregate); ok {
+			// M0146-0214: a Filter over an Aggregate is its HAVING. cost_agg
+			// prices the quals inside the aggregate (costsize.c, "If there
+			// are quals (HAVING quals), charge for them"): their startup,
+			// plus their per-tuple cost over the groups the Agg emits before
+			// filtering — and no cpu_tuple_cost, which cost_agg already
+			// charged per group.
+			in := legacyDisplayCostOf(agg)
+			qs, qp := qualEvalOps(x.Predicate)
+			out.StartupCost = in.StartupCost + qs*cp.cpuOperatorCost
+			out.TotalCost = in.TotalCost + (qs+qp*in.PlanRows)*cp.cpuOperatorCost
+			break
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
 	case *Limit:
 		// create_limit_path (M0146-0005bm): the input's costs and rows put
 		// through adjust_limit_rows_costs; a Limit charges no CPU of its own.

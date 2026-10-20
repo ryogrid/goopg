@@ -134,14 +134,19 @@ func TestSortSeedNarrowsWithTheAggregate(t *testing.T) {
 	// costs the same at any width, correctly. So the fixture must be large
 	// enough that the FULL row spills, which is exactly the case the
 	// narrowing is supposed to change.
+	// M0146-0234: the Sort spills on relation_byte_size(rows, width), so the
+	// rel's full width must be wide enough to spill work_mem.
 	const rows = 5_000_000
-	rel := newRelOptInfo(relsetOf(0), rows, 64)
+	rel := newRelOptInfo(relsetOf(0), rows, 256)
 	rel.NCols = len(child.Output())
 	rel.AvgVarBytes = nodeAvgVarBytes(child.Output())
 	seed := &Path{Kind: PathPrebuilt, Rel: rel, Rows: rows, Cost: Cost{Total: 1000}}
 
 	narrowed := *seed
 	narrowed.NCols, narrowed.AvgVarBytes = inNcols, inAvgVar
+	if w := aggInputPGWidth(child, agg); w > 0 {
+		narrowed.OutputWidth = w
+	}
 
 	keys := []PathKey{{Expr: &ColumnRef{Index: 0, Name: "g"}, SortAsc: true}}
 	full := sortPathForBounded(seed, keys, cp, -1)
@@ -157,7 +162,7 @@ func TestSortSeedNarrowsWithTheAggregate(t *testing.T) {
 	}
 	if !(narrow.Cost.Total < full.Cost.Total) {
 		t.Fatalf("narrowed sort priced %v, not below the full-width %v — the "+
-			"per-path NCols override is not reaching sortPathForBounded",
+			"per-path width override is not reaching sortPathForBounded",
 			narrow.Cost.Total, full.Cost.Total)
 	}
 }

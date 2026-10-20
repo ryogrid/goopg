@@ -231,12 +231,18 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 	// survives to feed whatever wants it above (an ordered input to an upper
 	// rel, or an outer pathkey chain through the NLs over it).
 	cheapestPartial := rel.PartialPathlist[0]
-	incOn := incrementalSortPathsMode == incrementalSortOn
+	incOn := incrementalSortPathsMode == incrementalSortOn && s.cp.enableIncrementalSort
+	u := rel.usefulKeys
+	if u == nil {
+		u = s.pathkeyUsefulnessFor(rel.Relids)
+	}
 	for _, useful := range s.usefulPathkeysForRelation(rel) {
 		for _, sub := range rel.PartialPathlist {
 			// `pathkeys_count_contained_in(useful_pathkeys,
-			// subpath->pathkeys, &presorted_keys)` (allpaths.c:3271).
-			contained, presorted := pathkeysCountContainedIn(sub.Pathkeys, useful)
+			// subpath->pathkeys, &presorted_keys)` (allpaths.c:3271), over
+			// canonical pathkeys: the rel's equivalence classes decide
+			// whether a subpath key and a useful key are one pathkey.
+			contained, presorted := u.countContainedIn(sub.Pathkeys, useful)
 			if contained {
 				// Already sorted: the loop above filed the bare
 				// Gather Merge over it.
@@ -246,10 +252,21 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 				continue
 			}
 			if presorted > 0 && incOn {
-				// Upstream's `create_incremental_sort_path` arm — deferred
-				// to M0146-0006 (see the function header); nothing is
-				// offered here rather than a regular Sort upstream would
-				// not price.
+				// `create_incremental_sort_path(root, rel, subpath,
+				// useful_pathkeys, presorted_keys, -1)` (allpaths.c), the
+				// arm PG prefers whenever a prefix is presorted: each
+				// worker sorts only within its presorted groups (M0146-0214;
+				// TPC-DS SF1 Q64's Gather Merge over a partial merge join
+				// ordered on the leading query pathkey). The group count is
+				// estimate_num_groups over the presorted keys.
+				groups, ok := s.searchRelNumGroups(rel, sub.Pathkeys[:presorted], sub.Rows)
+				if !ok {
+					continue
+				}
+				inc := incrementalSortPathWithGroups(rel, sub, useful, presorted, groups, s.cp, -1)
+				if gm := makeGatherMergePath(rel, inc, s.cp, overrideRows); gm != nil {
+					addPath(rel, gm, "gather.merge.incrementalsort")
+				}
 				continue
 			}
 			// `create_sort_path(root, rel, subpath, useful_pathkeys, -1)`
@@ -265,6 +282,63 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 	}
 }
 
+// searchRelNumGroups is estimate_num_groups (selfuncs.c) for expressions in
+// the search's coordinates over rel: each column resolves to the member base
+// relation that produces it (by binding offset and name), each member's group
+// count is estimateNumGroups over its own leaf, and the product is clamped to
+// inputRows — the per-relation product createPulledJoinUniquePath uses. ok is
+// false when a key is not a plain column of a member; the caller declines
+// rather than price a sort on an invented count.
+func (s *searchCtx) searchRelNumGroups(rel *RelOptInfo, keys []PathKey, inputRows float64) (float64, bool) {
+	members := rel.baseMembers()
+	if len(members) == 0 || len(keys) == 0 {
+		return 0, false
+	}
+	if inputRows < 2 {
+		inputRows = 2
+	}
+	locals := map[*RelOptInfo][]Expr{}
+	var order []*RelOptInfo
+	for _, pk := range keys {
+		cr, ok := pk.Expr.(*ColumnRef)
+		if !ok {
+			return 0, false
+		}
+		var owner *RelOptInfo
+		local := -1
+		for _, m := range members {
+			if m == nil || m.baseLeaf == nil {
+				return 0, false
+			}
+			out := m.baseLeaf.Output()
+			if i := cr.Index - m.baseOffset; i >= 0 && i < len(out) && out[i].Name == cr.Name {
+				owner, local = m, i
+				break
+			}
+		}
+		if owner == nil {
+			return 0, false
+		}
+		lc := *cr
+		lc.Index = local
+		if _, ok := locals[owner]; !ok {
+			order = append(order, owner)
+		}
+		locals[owner] = append(locals[owner], &lc)
+	}
+	groups := 1.0
+	for _, m := range order {
+		groups *= float64(estimateNumGroups(locals[m], m.baseLeaf, int64(inputRows)))
+	}
+	if groups > inputRows {
+		groups = inputRows
+	}
+	if groups < 1 {
+		groups = 1
+	}
+	return groups, true
+}
+
 // usefulPathkeysForRelation is `get_useful_pathkeys_for_relation`
 // (allpaths.c:3147) at its one populated arm: the longest prefix of
 // `root->query_pathkeys` whose every key `relation_can_be_sorted_early`
@@ -273,7 +347,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 // element" — so the list-of-lists shape is kept but populated from
 // `s.queryPathkeys` alone.
 //
-// `relation_can_be_sorted_early`'s EC-member search is syntactic here: a
+// `relation_can_be_sorted_early`'s EC-member search (sortableEarlyMember): a
 // pathkey is sortable early when every ColumnRef it reads resolves inside
 // `rel.Relids` (computable from the reltarget — `relidsOfExpr` over
 // `s.itemSpans`, the same item-coordinate windows `buildRestrictInfos`
@@ -290,17 +364,59 @@ func (s *searchCtx) usefulPathkeysForRelation(rel *RelOptInfo) [][]PathKey {
 	if s == nil || rel == nil || len(s.queryPathkeys) == 0 || len(s.itemSpans) == 0 {
 		return nil
 	}
-	n := 0
+	u := rel.usefulKeys
+	if u == nil {
+		u = s.pathkeyUsefulnessFor(rel.Relids)
+	}
+	var keys []PathKey
 	for _, pk := range s.queryPathkeys {
-		if pk.Expr == nil || !s.pathkeySortableEarly(rel, pk.Expr) {
+		if pk.Expr == nil {
 			break
 		}
-		n++
+		e, ok := s.sortableEarlyMember(rel, u, pk.Expr)
+		if !ok {
+			break
+		}
+		keys = append(keys, PathKey{Expr: e, SortAsc: pk.SortAsc, NullsFirst: pk.NullsFirst})
 	}
-	if n == 0 {
+	if len(keys) == 0 {
 		return nil
 	}
-	return [][]PathKey{s.queryPathkeys[:n:n]}
+	return [][]PathKey{keys}
+}
+
+// sortableEarlyMember is relation_can_be_sorted_early's
+// find_computable_ec_member (equivclass.c): the pathkey's own expression when
+// the rel computes it, else another member of its equivalence class that the
+// rel computes — PG's pathkey names the class, and the Sort below a Gather
+// Merge sorts on whichever member the rel's target holds
+// (prepare_sort_from_pathkeys). TPC-DS Q64's cross_sales groups by
+// i_item_sk; a joinrel without item is sorted early on its ss_item_sk, which
+// the join to item equates with it (M0146-0214). The member must also be
+// parallel-safe (require_parallel_safe at this call site).
+func (s *searchCtx) sortableEarlyMember(rel *RelOptInfo, u *pathkeyUsefulness, e Expr) (Expr, bool) {
+	if s.pathkeySortableEarly(rel, e) {
+		return e, true
+	}
+	if u == nil {
+		return nil, false
+	}
+	id := -1
+	for _, m := range u.ecMembers {
+		if exprEqual(m.expr, e) {
+			id = m.id
+			break
+		}
+	}
+	if id < 0 {
+		return nil, false
+	}
+	for _, m := range u.ecMembers {
+		if m.id == id && m.relids != 0 && relsSubset(m.relids, rel.Relids) && isParallelSafeExpr(m.expr, s.cat) {
+			return m.expr, true
+		}
+	}
+	return nil, false
 }
 
 // pathkeySortableEarly is the per-key half of the derivation above —
@@ -607,6 +723,29 @@ func paramProbePathIsPartialProbe(c *Path) bool {
 	return false
 }
 
+// parallelHashBuildIsClaimable reports whether a Parallel Hash join's partial
+// build side is driven by a scan the join's own claim set wires: the executor's
+// attachParallelHashBuildSides hands the build to attachAll over a leaf claim
+// set (hashBuildBranch) holding a block claim (pscan) and a leaf-block claim
+// (pidx), so a seq scan and an index or index-only scan are claimed. A bitmap
+// build is not — the leaf set has no prebuilt bitmap — and an unclaimed build
+// means every participant inserts the whole relation into the shared table,
+// N copies of every inner row. The producer gate (addParallelHashJoinPath's
+// PH2) and partialPathDrivingKind's two Parallel Hash arms share this one
+// predicate so they cannot drift.
+//
+// M0146-0228 admitted the index arm: TPC-DS Q23's best_ss_customer builds its
+// Parallel Hash from a Parallel Index Only Scan on customer_pkey in PG.
+// TestParallelHashIndexOnlyBuildIdentityWithSerial (internal/executor) pins the
+// claim by parallel-vs-serial identity and the published build-row count.
+func parallelHashBuildIsClaimable(build *Path) bool {
+	switch partialPathDrivingKind(build) {
+	case PathSeqScan, PathIndexScan:
+		return true
+	}
+	return false
+}
+
 func partialPathDrivingKind(p *Path) PathKind {
 	if p == nil {
 		return PathPrebuilt
@@ -698,12 +837,8 @@ func partialPathDrivingKind(p *Path) PathKind {
 		}
 		// M0146-0002: a Parallel Hash join's BUILD side is partial too, and
 		// the executor claims it through the join's own claim set
-		// (attachParallelHashBuildSides). Only a partial seq scan is admitted
-		// there: a bitmap build would find no prebuilt bitmap in that set,
-		// and any other shape is one this slice never proved — an unclaimed
-		// build side means every participant builds the whole relation into
-		// the shared table, N copies of every inner row.
-		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+		// (attachParallelHashBuildSides) — parallelHashBuildIsClaimable.
+		if p.ParallelHash && !parallelHashBuildIsClaimable(p.Children[1]) {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(p.Children[0])
@@ -876,6 +1011,15 @@ func partialPathDrivingKind(p *Path) PathKind {
 			return PathPrebuilt
 		}
 		return partialPathDrivingKind(o)
+	case PathIncrementalSort:
+		// M0146-0214: the incremental-sort arm of the same producer
+		// (allpaths.c create_incremental_sort_path) — a per-worker pass-through
+		// exactly like the PathSort arm below; drivingScan, stampParallelScan
+		// and the executor's attach walks carry matching arms.
+		if len(p.Children) != 1 || p.Children[0] == nil || p.RequiredOuter != 0 {
+			return PathPrebuilt
+		}
+		return partialPathDrivingKind(p.Children[0])
 	case PathSort:
 		// M0146-0027: `generate_useful_gather_paths`' sorted-partial arm
 		// (allpaths.c:3304-3328) wraps the cheapest partial path in a Sort
@@ -964,10 +1108,8 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 		// parallelChildren's *SetOp arm (ParallelHashJoinsIn), and
 		// stampParallelScan labels the build side through the *SetOp
 		// branch descent. The same build-side restriction the top-level
-		// PathHashJoin arm carries applies: only a seq-scan-driven build
-		// — a bitmap build would find no prebuilt bitmap in the leaf
-		// claim set, and an unclaimed build is the N-copies defect.
-		if p.ParallelHash && partialPathDrivingKind(p.Children[1]) != PathSeqScan {
+		// PathHashJoin arm carries applies (parallelHashBuildIsClaimable).
+		if p.ParallelHash && !parallelHashBuildIsClaimable(p.Children[1]) {
 			return false
 		}
 		return setOpBranchDrivingKindIsSupported(p.Children[0])

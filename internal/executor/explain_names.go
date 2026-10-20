@@ -927,9 +927,9 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			}
 			n = p.Child
 		case *optimizer.Join:
-			n, idx = concatJoinSide(p, p.Left, p.Right, idx)
+			n, idx = joinOutputSide(p, p.Type, p.Left, p.Right, idx)
 		case *optimizer.NestedLoopIndexJoin:
-			n, idx = concatJoinSide(p, p.Outer, p.Inner, idx)
+			n, idx = joinOutputSide(p, p.Type, p.Outer, p.Inner, idx)
 		case *optimizer.Memoize:
 			if requireSetOp {
 				return ""
@@ -970,6 +970,22 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 		}
 	}
 	return ""
+}
+
+// joinOutputSide is concatJoinSide extended to the joins that publish one
+// side: a semi or anti join emits its left input position for position, so
+// its output column idx is that input's (M0146-0224: TPC-DS Q78's
+// `web_sales.ws_item_sk` key over the `ws LEFT JOIN web_returns ... IS NULL`
+// anti join, which printed bare).
+func joinOutputSide(j optimizer.Node, jt optimizer.JoinType, left, right optimizer.Node, idx int) (optimizer.Node, int) {
+	switch jt {
+	case optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
+		if left != nil && len(j.Output()) == len(left.Output()) && idx < len(left.Output()) {
+			return left, idx
+		}
+		return nil, -1
+	}
+	return concatJoinSide(j, left, right, idx)
 }
 
 // concatJoinSide maps output column idx of a join whose output is exactly

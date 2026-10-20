@@ -51,6 +51,8 @@ func (e *PlanError) Error() string {
 // folding. Used by CREATE MATERIALIZED VIEW WITH NO DATA where the query is
 // planned only for schema inference and will never be executed.
 func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	// P0-E8: one planState per top-level statement (planstate.go).
+	cat = withPlanState(cat)
 	if err := rewriteIndirectionStarTargets(s); err != nil {
 		return nil, err
 	}
@@ -105,6 +107,10 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 // on P2-04 because the plan cache is cross-session and carries no GUC
 // fingerprint.
 func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+	// P0-E8: one planState per top-level statement (planstate.go); a
+	// re-entrant call (a view body, EXPLAIN's inner statement, COPY
+	// (query)) already carries its statement's and shares it.
+	cat = withPlanState(cat)
 	// C-19g's remainder: the STATEMENT-shape half of `statementIsParallelSafe`
 	// (parallel.go). A bare SELECT is the one shape the post-pass has ever
 	// parallelised; every other top-level statement — DML, DDL, utility — is
@@ -243,6 +249,7 @@ func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
+	cat = withPlanState(cat) // P0-E8: idempotent; a direct caller still gets one scope below
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into
@@ -856,7 +863,8 @@ func ResolveAlterColumnTypeUsing(table *catalog.Table, e parser.Expr) (Expr, err
 // evaluates it per row. The resolve context is the one planInsert uses for
 // its appended defaults, so both paths compute the same value (M0146-0054).
 func ResolveColumnDefault(e parser.Expr, cat catalog.Catalog) (Expr, error) {
-	return resolveExpr(e, &resolveContext{cat: cat, settings: DefaultPlannerSettings()})
+	// P0-E8: a sublink in the expression plans under its own planState.
+	return resolveExpr(e, &resolveContext{cat: withPlanState(cat), settings: DefaultPlannerSettings()})
 }
 
 func appendSchema(left, right Schema) Schema {
@@ -1273,6 +1281,7 @@ func setOpBindsTighter(inner, outer parser.SetOpType) bool {
 // its GOOPG_JOINTREE_PIPELINE selection knob were deleted by M0145-0008's
 // legacy-deletion slices.
 func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSet PlannerSettings, scope *rtableScope) (Node, error) {
+	cat = withPlanState(cat) // P0-E8: idempotent; a direct caller still gets one scope below
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
 	// UNION branches) reach planSelectWithSettings directly without
@@ -1313,10 +1322,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		return nil, err
 	}
 	defer restore()
-	markSelectOwnedCTEs(s.With)
+	markSelectOwnedCTEs(s.With, cat)
 	// M0146-0007e: parse analysis' cterefcount, for the reference-site
 	// pull-up that must decide before planning finishes counting.
-	stampCTEReferenceCounts(s)
+	stampCTEReferenceCounts(s, cat)
 
 	if s.SetOp != nil {
 		// Flatten the right-associative parse tree into a flat list of
@@ -1809,12 +1818,12 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// SELECT so resolveColumnRef can walk up.
 	if ctx != nil {
 		ctx.cat = cat
-		ctx.parent = planParent
+		ctx.parent = planParentOf(cat)
 		// take2 P2-01: the per-statement planner context. Stamped DIRECTLY
 		// here, in the same place `cat` and `parent` are, and resolved by the
 		// cost sites from this field alone — never by walking `parent`, which
-		// is assigned from the goroutine-unsafe package global `planParent`
-		// and could therefore yield a concurrently-planning session's GUCs.
+		// once came from the goroutine-unsafe package global `planParent`
+		// (now the per-statement planState.parent, P0-E8).
 		ctx.settings = plannerSet
 		// A-01(ii) cut 2: the statement's rtableScope, stamped DIRECTLY
 		// like the fields above. Sublink planners without the pointer
@@ -2304,7 +2313,7 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 		// aggregate joins the Passthrough list BEFORE the election, so no
 		// candidate that narrows the aggregate's input can omit it.
 		prefetchFuncDepPassthroughs(s, agg)
-		if _, gerr := createGroupingPaths(upper, agg.node, cat, plannerSet, orderTupleFraction); gerr != nil {
+		if _, gerr := createGroupingPaths(upper, agg.node, having, cat, plannerSet, orderTupleFraction); gerr != nil {
 			return nil, gerr
 		}
 		// B-01c second cut: the producer above may replace the
@@ -4137,6 +4146,7 @@ func rtableScopeFrom(ctx *resolveContext) *rtableScope {
 }
 
 func planFromClause(s *parser.SelectStmt, cat catalog.Catalog, ps PlannerSettings, scope *rtableScope) (Node, *resolveContext, error) {
+	cat = withPlanState(cat) // P0-E8: idempotent; a direct caller still gets one scope below
 	if len(s.FromExprs) == 0 {
 		return planFromRangeVars(s.From, cat, ps, scope)
 	}
@@ -4280,7 +4290,7 @@ func planFromClauseItems(s *parser.SelectStmt, items []parser.FromExpr, cands []
 		// at the statement's level, where every operand (and a pulled
 		// derived operand's alias) is in scope.
 		if len(onQuals) > 0 {
-			rctx.cat, rctx.parent = cat, planParent
+			rctx.cat, rctx.parent = cat, planParentOf(cat)
 			for _, on := range onQuals {
 				q, err := resolveExpr(canonicalizeQual(on), rctx)
 				if err != nil {
@@ -4622,7 +4632,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			// correlated ref counts the extra level openLateral's
 			// left-row push adds at runtime (the Join flips Lateral on
 			// the resolved OuterColumnRef). M0146-0015h.
-			joinLateralCtx = &resolveContext{parent: planParent}
+			joinLateralCtx = &resolveContext{parent: planParentOf(cat)}
 		}
 		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx, ps, scope)
 		if err != nil {
@@ -4660,7 +4670,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// A-01(ii) cut 2: carry the statement scope (see leftCtx above).
 		mergedCtx.rtScope = scope
 
-		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx)
+		pred, err := planJoinPredicate(j, leftCtx, rightCtx, mergedCtx, cat)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -4999,7 +5009,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// (Stage A inlining). The body is wrapped in a CTEScan so
 	// EXPLAIN can label the inlined subtree (M0016-0004).
 	if rv.Schema == "" {
-		if ce := lookupPlannedCTE(rv.Name); ce != nil {
+		if ce := lookupPlannedCTE(cat, rv.Name); ce != nil {
 			alias := rv.Alias
 			if alias == "" {
 				alias = ce.name
@@ -6071,7 +6081,7 @@ func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16
 	} else {
 		// M0146-0015h: same wiring as planSubqueryRangeVar's nil arm —
 		// non-LATERAL closes same-level siblings, not outer levels.
-		ctx.parent = planParent
+		ctx.parent = planParentOf(cat)
 	}
 	// A-01(ii) cut 2: VALUES cells may hang scalar subqueries (F6 records
 	// the RTE consumption at the planScanRangeVar level); they allocate
@@ -6201,7 +6211,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		stripped.lateralSibling = false
 		stripped.joinlist = nil
 		if stripped.parent == nil {
-			stripped.parent = planParent
+			stripped.parent = planParentOf(cat)
 		}
 		lateralCtx = &stripped
 	}
@@ -6244,7 +6254,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// one. This keeps OuterColumnRef.Level consistent with the
 		// executor's OuterRows stack depth. M0097-0065.
 		if latCtxWithCat.parent == nil {
-			latCtxWithCat.parent = planParent
+			latCtxWithCat.parent = planParentOf(cat)
 			// Do NOT set lateralSibling=true: openLateral() pushes the left-side
 			// row onto ctx.OuterRows per right-side re-evaluation, so the lateral
 			// boundary introduces a new OuterRows depth level at runtime. Leaving
@@ -6296,7 +6306,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// sibling visibility stays closed while level-1 outer refs land
 		// on the pushed subplan-boundary row (no openLateral hop exists
 		// on this arm).
-		inner, err = planSelectWithParent(rv.Subquery, cat, planParent, ps, scope)
+		inner, err = planSelectWithParent(rv.Subquery, cat, planParentOf(cat), ps, scope)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
@@ -7179,13 +7189,13 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planPgOptionsToTable(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "unnest") {
-		return planFromUnnest(rv, sourceIdx, lateralCtx)
+		return planFromUnnest(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "regexp_matches") {
-		return planFromRegexpMatches(rv, sourceIdx, lateralCtx)
+		return planFromRegexpMatches(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "regexp_split_to_table") {
-		return planFromRegexpSplitToTable(rv, sourceIdx, lateralCtx)
+		return planFromRegexpSplitToTable(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
@@ -7204,11 +7214,11 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 				// EX3-03 cut 1 (F5 audit): no session in scope on this
 				// fallback — stamp the defaults, never the zero value
 				// (a subquery in an SRF arg prices at defaults, as today).
-				ctx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+				ctx := &resolveContext{cat: cat, parent: planParentOf(cat), settings: DefaultPlannerSettings()}
 				if lateralCtx != nil {
 					if lateralCtx.parent == nil {
 						cp := *lateralCtx
-						cp.parent = planParent
+						cp.parent = planParentOf(cat)
 						ctx = &cp
 					} else {
 						ctx = lateralCtx
@@ -7271,11 +7281,11 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	// Build arg context: lateral siblings + outer-scope parent chain so
 	// correlated references like pr.prattrs in generate_series args resolve.
 	// EX3-03 cut 1 (F5 audit): fallback stamps the defaults, never zero.
-	argCtx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+	argCtx := &resolveContext{cat: cat, parent: planParentOf(cat), settings: DefaultPlannerSettings()}
 	if lateralCtx != nil {
 		if lateralCtx.parent == nil {
 			cp := *lateralCtx
-			cp.parent = planParent
+			cp.parent = planParentOf(cat)
 			argCtx = &cp
 		} else {
 			argCtx = lateralCtx
@@ -7536,11 +7546,11 @@ func planPgOptionsToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	// fdwoptions references the outer pg_foreign_data_wrapper row — resolves
 	// up the lexical scope. Mirrors generate_series. DU-002 slice 18.
 	// EX3-03 cut 1 (F5 audit): fallback stamps the defaults, never zero.
-	argCtx := &resolveContext{cat: cat, parent: planParent, settings: DefaultPlannerSettings()}
+	argCtx := &resolveContext{cat: cat, parent: planParentOf(cat), settings: DefaultPlannerSettings()}
 	if lateralCtx != nil {
 		if lateralCtx.parent == nil {
 			cp := *lateralCtx
-			cp.parent = planParent
+			cp.parent = planParentOf(cat)
 			argCtx = &cp
 		} else {
 			argCtx = lateralCtx
@@ -7579,7 +7589,7 @@ func planPgOptionsToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 // planFromUnnest plans FROM unnest(array_expr [, ...]) alias(col [, ...]).
 // Single-arg: expands one array into one row per element. M0097-0035.
 // Multi-arg: zips multiple arrays, NULL-padding shorter ones. M0097-0xxx.
-func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+func planFromUnnest(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
@@ -7590,11 +7600,11 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 	// `array(select quote_literal(x) from unnest(evttags) as t(x))` where
 	// evttags references the outer pg_event_trigger row — resolves up the
 	// lexical scope. Mirrors generate_series / pg_options_to_table. DU-002 slice 23.
-	ctx := &resolveContext{parent: planParent}
+	ctx := &resolveContext{parent: planParentOf(cat)}
 	if lateralCtx != nil {
 		if lateralCtx.parent == nil {
 			cp := *lateralCtx
-			cp.parent = planParent
+			cp.parent = planParentOf(cat)
 			ctx = &cp
 		} else {
 			ctx = lateralCtx
@@ -7694,7 +7704,7 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 // match when flags contains 'g', at most one row otherwise, zero rows on no
 // match — mirrors the SELECT-list RegexpMatchesCol SRF semantics. M0122-0002
 // follow-up (the FROM-clause form deferred by that earlier loop).
-func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+func planFromRegexpMatches(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) < 2 || len(tf.Args) > 3 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
@@ -7703,11 +7713,11 @@ func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	// Build arg context: lateral siblings + outer-scope parent chain, mirrors
 	// planFromUnnest/planPgOptionsToTable so a correlated pattern/string
 	// argument resolves up the lexical scope.
-	ctx := &resolveContext{parent: planParent}
+	ctx := &resolveContext{parent: planParentOf(cat)}
 	if lateralCtx != nil {
 		if lateralCtx.parent == nil {
 			cp := *lateralCtx
-			cp.parent = planParent
+			cp.parent = planParentOf(cat)
 			ctx = &cp
 		} else {
 			ctx = lateralCtx
@@ -7758,7 +7768,7 @@ func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 // default PG uses); N matches always produce N+1 rows (the 'g' flag is
 // rejected, then glob=true is forced internally — split always finds ALL
 // matches). Mirrors planFromRegexpMatches. M0134-0070 Round D.
-func planFromRegexpSplitToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+func planFromRegexpSplitToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) < 2 || len(tf.Args) > 3 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
@@ -7767,11 +7777,11 @@ func planFromRegexpSplitToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx 
 	// Build arg context: lateral siblings + outer-scope parent chain, mirrors
 	// planFromRegexpMatches so a correlated pattern/string argument resolves
 	// up the lexical scope.
-	ctx := &resolveContext{parent: planParent}
+	ctx := &resolveContext{parent: planParentOf(cat)}
 	if lateralCtx != nil {
 		if lateralCtx.parent == nil {
 			cp := *lateralCtx
-			cp.parent = planParent
+			cp.parent = planParentOf(cat)
 			ctx = &cp
 		} else {
 			ctx = lateralCtx
@@ -8272,7 +8282,7 @@ func deriveSubqueryTargetName(e parser.Expr) string {
 	return ""
 }
 
-func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resolveContext) (Expr, error) {
+func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resolveContext, cat catalog.Catalog) (Expr, error) {
 	if join.Type == parser.JoinCross {
 		return nil, nil
 	}
@@ -8295,7 +8305,7 @@ func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resol
 		// USING/NATURAL name lookups below and the next iteration's
 		// `leftCtx = mergedCtx` keep their local-only behaviour.
 		onCtx := *mergedCtx
-		onCtx.parent = planParent
+		onCtx.parent = planParentOf(cat)
 		onPred, onErr := resolveExpr(join.On, &onCtx)
 		if onErr != nil {
 			return nil, onErr
@@ -12218,7 +12228,7 @@ func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.
 		return false
 	}
 	cp := ps.costParams()
-	relTuples := float64(tbl.Stats.RowCount)
+	relTuples := float64(tableRows(tbl))
 	relPages := baseRelPages(tbl, relTuples)
 	// The equality qual against a synthetic scan: the same
 	// selectivity the search would price this probe at
@@ -12640,7 +12650,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	}
 	rv := s.From[0]
 	if rv.Schema == "" {
-		if ce := lookupPlannedCTE(rv.Name); ce != nil {
+		if ce := lookupPlannedCTE(cat, rv.Name); ce != nil {
 			return nil, false, nil
 		}
 	}
@@ -17583,6 +17593,7 @@ func outerRefReachesPast(o *OuterColumnRef, depth int) bool { return o.Level >= 
 // those hosts, never a zero-priced search. Same unstamped-means-default
 // rule as newResolveContext and the PlannerSettings zero-value rule.
 func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext, ps PlannerSettings, scope *rtableScope) (Node, error) {
+	cat = withPlanState(cat) // P0-E8: idempotent; a direct caller still gets one scope below
 	if ps == (PlannerSettings{}) {
 		ps = DefaultPlannerSettings()
 	}
@@ -17595,14 +17606,17 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 	// into a subquery to place one either, so nothing is lost that the engine
 	// could otherwise have had.
 	ps.ParallelStatementOK = false
-	prevParent := planParent
-	planParent = parent
-	defer func() { planParent = prevParent }()
+	// P0-E8: the outer context lives on the statement's planState, not a
+	// package-level variable a concurrent session could swap.
+	st := mustPlanState(cat)
+	prevParent := st.parent
+	st.parent = parent
+	defer func() { st.parent = prevParent }()
 
 	// Build the analyzer-side OuterScope chain mirroring the
 	// resolveContext chain.
 	if outerScope := buildAnalyzerOuterScope(parent); outerScope != nil {
-		restore := analyzer.SetOuterScope(outerScope)
+		restore := analyzer.SetOuterScope(cat, outerScope)
 		defer restore()
 	}
 
@@ -17611,7 +17625,7 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 	// (including this sub-SELECT) under the correct scope (with
 	// CTE names, outer relations, etc.). Re-running the analyzer
 	// here would fail for CTE references (e.g. DO UPDATE SET
-	// (b,a)=(SELECT ... FROM cte) where cte lives in planCTEs
+	// (b,a)=(SELECT ... FROM cte) where cte lives in the WITH-list scope
 	// but not in the catalog). Mirrors preplanWithClause's CTE-body
 	// planning pattern.
 	if scope == nil {
@@ -17645,18 +17659,10 @@ func buildAnalyzerOuterScope(ctx *resolveContext) *analyzer.OuterScope {
 	return analyzer.NewOuterScope(ctx.cat, rels, parent)
 }
 
-// planParent is the goroutine-thread-unsafe "current outer
-// resolveContext" used by planSelect to seed its top-level
-// resolveContext's parent field. This is a v0 simplification
-// — Plan() / planSelect / planFromClause take cat as a
-// parameter, and re-threading a parent argument through every
-// helper would be more invasive than the package-level
-// channel. Each public Plan() call is sequential at the
-// boundary, so the outer goroutine is the only writer.
-//
-// Future cleanup: add explicit parent params to Plan() / the
-// internal helpers.
-var planParent *resolveContext
+// The "current outer resolveContext" planSelect seeds its top-level
+// resolveContext's parent field with is the statement's planState.parent
+// (planstate.go), read through planParentOf(cat). It was the package-level
+// planParent, which concurrent sessions swapped under each other (P0-E8).
 
 // resolveCaseExpr translates a parser CaseExpr into a planner
 // CaseExpr, recursively resolving each Operand / When / Then /

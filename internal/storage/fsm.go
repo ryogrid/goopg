@@ -31,6 +31,10 @@ type FSM struct {
 	// This is the same idea as PG's FSM tree, flattened to one level because
 	// the reader only ever asks "is there anything here at all".
 	chunkMax map[fsmKey][]uint16
+	// trees is PG's FSM tree per relation (fsm_pgtree.go, M0146-0216): the
+	// structure PG's own page searches walk. Every record below sets its
+	// leaf; only the PG* lookups read it.
+	trees map[fsmKey]*fsmTree
 }
 
 // fsmChunkBlocks is how many heap blocks one chunkMax entry summarises. 512
@@ -41,7 +45,74 @@ const fsmChunkBlocks = 512
 
 // NewFSM allocates an empty FSM.
 func NewFSM() *FSM {
-	return &FSM{pages: make(map[fsmKey][]uint16), chunkMax: make(map[fsmKey][]uint16)}
+	return &FSM{pages: make(map[fsmKey][]uint16), chunkMax: make(map[fsmKey][]uint16), trees: make(map[fsmKey]*fsmTree)}
+}
+
+// treeLocked returns key's PG FSM tree, creating it empty. The write lock
+// must be held.
+func (f *FSM) treeLocked(key fsmKey) *fsmTree {
+	t := f.trees[key]
+	if t == nil {
+		if f.trees == nil {
+			f.trees = make(map[fsmKey]*fsmTree)
+		}
+		t = newFSMTree()
+		f.trees[key] = t
+	}
+	return t
+}
+
+// buildTreesLocked rebuilds every relation's tree from a loaded flat array,
+// as the fully vacuumed FSM that FSMSaveForks wrote. Loaded values are
+// category lower bounds (fsm_space_cat_to_avail), so each slot keeps its
+// stored category.
+func (f *FSM) buildTreesLocked() {
+	f.trees = make(map[fsmKey]*fsmTree, len(f.pages))
+	for key, pages := range f.pages {
+		t := newFSMTree()
+		for blk, free := range pages {
+			if free > 0 {
+				t.record(BlockNumber(blk), int(free))
+			}
+		}
+		t.vacuumRange(0, BlockNumber(len(pages)))
+		f.trees[key] = t
+	}
+}
+
+// PGGetPageWithFreeSpace is PG's GetPageWithFreeSpace (freespace.c): the
+// block fsm_search finds for spaceNeeded heap-free bytes, among the
+// relation's relBlocks blocks.
+func (f *FSM) PGGetPageWithFreeSpace(rel RelFileNode, spaceNeeded int, relBlocks BlockNumber) (BlockNumber, bool) {
+	if f == nil {
+		return 0, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.treeLocked(fsmKeyFor(rel)).get(spaceNeeded, relBlocks)
+}
+
+// PGRecordAndGetPageWithFreeSpace is PG's RecordAndGetPageWithFreeSpace:
+// record oldPage's heap free space (PageGetHeapFreeSpace), then search its own
+// FSM leaf from the leaf's hint, then the whole tree.
+func (f *FSM) PGRecordAndGetPageWithFreeSpace(rel RelFileNode, oldPage BlockNumber, oldSpaceAvail, spaceNeeded int, relBlocks BlockNumber) (BlockNumber, bool) {
+	if f == nil {
+		return 0, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.treeLocked(fsmKeyFor(rel)).recordAndGet(oldPage, oldSpaceAvail, spaceNeeded, relBlocks)
+}
+
+// PGVacuumRange is PG's FreeSpaceMapVacuumRange: bring the upper levels
+// covering heap blocks [start, end) up to date with the leaves.
+func (f *FSM) PGVacuumRange(rel RelFileNode, start, end BlockNumber) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.treeLocked(fsmKeyFor(rel)).vacuumRange(start, end)
 }
 
 // chunkMaxLocked returns the chunk summary for key, building it if this is the
@@ -199,12 +270,20 @@ func (f *FSM) GetCandidates(rel RelFileNode, minFreeBytes uint16, n int) []Block
 // A value of 0 marks the page as full; subsequent GetPageWithFreeSpace
 // calls won't return it until a positive value is recorded again.
 func (f *FSM) RecordFreeSpace(rel RelFileNode, blk BlockNumber, freeBytes uint16) {
+	f.recordFreeSpace(rel, blk, freeBytes, int(freeBytes)-itemIDSize)
+}
+
+// recordFreeSpace records freeBytes (pd_upper - pd_lower) in the flat array
+// and heapFree (PageGetHeapFreeSpace) in the PG tree's leaf
+// (RecordPageWithFreeSpace).
+func (f *FSM) recordFreeSpace(rel RelFileNode, blk BlockNumber, freeBytes uint16, heapFree int) {
 	if f == nil {
 		return
 	}
 	key := fsmKeyFor(rel)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.treeLocked(key).record(blk, heapFree)
 	pages := f.pages[key]
 	if need := int(blk) + 1; need > len(pages) {
 		// review/260831 ST-5: one growth step, not one append per block. A
@@ -262,7 +341,7 @@ func (f *FSM) RecordFreeSpaceForPage(rel RelFileNode, blk BlockNumber, p Page) {
 	if free < 0 {
 		free = 0
 	}
-	f.RecordFreeSpace(rel, blk, uint16(free))
+	f.recordFreeSpace(rel, blk, uint16(free), PageGetHeapFreeSpace(p))
 }
 
 // TruncateRel forgets the entries for blocks at or beyond nblocks, as
@@ -275,6 +354,9 @@ func (f *FSM) TruncateRel(rel RelFileNode, nblocks BlockNumber) {
 	key := fsmKeyFor(rel)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if t := f.trees[key]; t != nil {
+		t.truncate(nblocks)
+	}
 	pages := f.pages[key]
 	if int(nblocks) >= len(pages) {
 		return
@@ -299,4 +381,5 @@ func (f *FSM) DropRelation(rel RelFileNode) {
 	defer f.mu.Unlock()
 	delete(f.pages, key)
 	delete(f.chunkMax, key)
+	delete(f.trees, key)
 }

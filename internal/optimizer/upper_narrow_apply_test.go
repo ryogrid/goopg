@@ -551,7 +551,7 @@ func TestNarrowingProjectOverRefusesAWidthMismatch(t *testing.T) {
 func TestUpperNarrowApplyNodeFieldInventory(t *testing.T) {
 	want := map[string][]string{
 		// Rewritten by rewriteAggregateInputExprs / installAggregateInputExprs.
-		"Aggregate": {"GroupExprs", "Passthrough"},
+		"Aggregate": {"GroupExprs", "GroupInputKeys", "Passthrough"},
 		"AggregateCall": {
 			"Arg", "Arg2", "ExtraArgs", "Filter", "OrderBy", "WithinGroupOrderBy",
 		},

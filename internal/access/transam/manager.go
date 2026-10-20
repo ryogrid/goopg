@@ -978,6 +978,12 @@ func (m *Manager) WaitForPinnedSnapshotsReleased(ctx context.Context, active []i
 
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
+	var endWait func()
+	defer func() {
+		if endWait != nil {
+			endWait()
+		}
+	}()
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -992,6 +998,9 @@ func (m *Manager) WaitForPinnedSnapshotsReleased(ctx context.Context, active []i
 		}
 		if allDone {
 			return nil
+		}
+		if endWait == nil {
+			endWait = reportVirtualXIDWait()
 		}
 		m.commitCond.Wait()
 	}
@@ -1105,6 +1114,12 @@ func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error 
 
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
+	var endWait func()
+	defer func() {
+		if endWait != nil {
+			endWait()
+		}
+	}()
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1124,8 +1139,28 @@ func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error 
 		if allDone {
 			return nil
 		}
+		if endWait == nil {
+			endWait = reportVirtualXIDWait()
+		}
 		m.commitCond.Wait()
 	}
+}
+
+// reportVirtualXIDWait marks the calling backend as waiting on Lock:virtualxid
+// for the rest of the enclosing wait, the first time it is called; it returns
+// the end hook (nil when there is nothing to end). PG's WaitForOlderSnapshots
+// (indexcmds.c) and the DETACH PARTITION CONCURRENTLY snapshot wait park in
+// VirtualXactLock, whose ProcSleep pg_stat_activity shows as Lock:virtualxid,
+// so an isolation step waiting here reads as blocked on a lock, as it does in
+// PG (M-NIGHTLY AI-20261020-013101-002). Unregistered goroutines skip it, as
+// WaitForXID does.
+func reportVirtualXIDWait() func() {
+	reg, procNum, ok := activity.LookupCurrentGoroutine()
+	if !ok {
+		return nil
+	}
+	reg.WaitEventStart(procNum, activity.WaitTypeLock, activity.WaitVirtualXID)
+	return func() { reg.WaitEventEnd(procNum) }
 }
 
 // xidInProgress reports whether xid is assigned to any currently active

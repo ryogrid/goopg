@@ -53,8 +53,17 @@ What the loop will NOT fix by itself (each escalates instead):
 - Missing data directories → fresh bootstrap is owner-run (see below).
 - A `*.HOLD` file next to a data dir → evidence marker; owner must inspect
   and recover (`tpch-ref-recover.sh`).
-- A `postmaster.pid` naming a dead PID → ensure writes a HOLD and stops;
-  owner recovery as above.
+- A `postmaster.pid` written **since boot** naming a dead PID (a real
+  crash: OOM kill, panic) → ensure writes a HOLD and stops; owner recovery
+  as above.
+- A `postmaster.pid` **older than the host boot** (minus a 15 min btime
+  slack, `REF_ENSURE_BOOT_SLACK_SEC`) is a reboot leftover, not a crash:
+  ensure renames it to `postmaster.pid.stale-<boot-ts>` and starts the
+  cluster, letting the engine's crash recovery replay WAL. Added
+  2026-10-19 after the 2026-10-17 WSL restart HOLD-parked all three
+  reference clusters and idled the loop ~36 h.
+  `REF_ENSURE_REBOOT_POLICY=hold` restores the old HOLD-and-refuse
+  behaviour. Gates (`tpch-spotcheck.sh`) remain the data-sanity check.
 - A `postmaster.pid` naming a LIVE but non-listening PID → refused; the
   process is starting up or wedged, inspect manually.
 
@@ -71,8 +80,9 @@ inits or rebuilds anything. Per cluster it checks: already listening → OK;
 `*.HOLD` → refused; `PG_VERSION` missing → refused; goopg binary missing →
 refused (never built here); a peer owner running (`tpch-ref-recover.sh` for
 `:65433`, `tpcds-sf025-regression.sh` for `:65437`) → skipped;
-`postmaster.pid` live → refused; `postmaster.pid` dead → writes HOLD and
-refuses; start-failure backoff (30 min marker under
+`postmaster.pid` older than host boot → renamed aside and started (reboot
+leftover); `postmaster.pid` live → refused; `postmaster.pid` dead → writes
+HOLD and refuses; start-failure backoff (30 min marker under
 `tmp/ref-clusters-ensure/`). Otherwise it starts the cluster. Every action
 is appended to `ci/logs/ref-clusters-ensure.log`. Concurrent invocations
 are flock-deduped. `--strict` exits 1 when anything is not OK at the end.

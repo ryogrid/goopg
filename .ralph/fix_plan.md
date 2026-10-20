@@ -174,8 +174,13 @@ it to hold the lineage.)
   tail); **selecting** one ahead of the order above is allowed only when
   it breaks the build or a gate this banner's work needs.
 
-0. **P0 — incident recovery: DISCHARGED.** P0-E4..E7 all `[x]`
+0. **P0 — incident recovery.** P0-E4..E7 DISCHARGED `[x]`
    (2026-09-18; archive `completed_fix_plan_013.md`).
+   **P0-E8 OPEN — owner placement 2026-10-19 (S2): select FIRST.**
+   Concurrent sessions intermittently fail to resolve a CTE name
+   (`relation "x" does not exist` on a valid `WITH x AS (...) SELECT ...
+   FROM x`), wrong-error class; entry under M-NIGHTLY "Manually
+   discovered".
    `.ralph/gate-exceptions.md` stays empty — a blocked TPC-H gate is a
    failed gate (AGENT.md G1).
 1. **Regressions found by P0-E7: DISCHARGED** (drained; archive 013).
@@ -208,6 +213,9 @@ it to hold the lineage.)
      the TPC-H actionable pool; Q5's >900s divergent-plan timeout is a
      recorded finding.
    - M0146-0005dp stays re-opened (its 0049/0049e gate landed).
+   - **Owner placement 2026-10-19 (b):** M0146-0229 (land the parked
+     slice 1), then M0146-0229a (Q74 executor recon) and its filed
+     sub-tasks — ahead of the next S9 pass.
    - Held: M0146-0010a, M0146-0035 `[!]`.
    - History — the M0145 chain narrative, M0146-internal ordering
      decisions through 2026-10-14 (0005/0006 sequencing, 0049 re-open,
@@ -313,6 +321,81 @@ OWNER DECISIONS 2026-10-15 (c) — acceptance-arm unblock:
 - M0146-0178 de-escalated `[!]`→`[ ]`; resume = apply the parked
   slice2.patch, re-run the arm, commit.
 
+OWNER DECISIONS 2026-10-19 — TPC-DS corpus reload + PG statistics import:
+- Both shipped TPC-DS corpora (`:65436` data, `:65437` data-sf025) were
+  REBUILT on the ee18b4649 engine (insert-built indexes with the M0146-0216
+  split port) and carry the `:65438` reference's own statistics: COPY →
+  per-table VACUUM → `pg_dump --statistics-only` import into
+  never-analyzed tables (PG's import merges, so no ANALYZE first). Clears
+  the owner gates of M0146-0215 (owner-import stats), M0146-0216
+  (owner-index-refresh) and therefore M0146-0218 and M0146-0214's
+  blocked-on. Old corpora kept as `*.pre-reload-20261019`.
+- Measured (`analysis/m0146/owner-ops-20261019/`): heap relpages /
+  reltuples / relallvisible identical to the reference on every table
+  at both scales; index pages ±2; pg_stats identical except 4 wide text
+  columns (in-row thinning, ledger) and one correlation-0 rendering
+  (ledger). PLAN-PARITY on the HEAD binary: SF0.25 92 → **97/99**
+  (Q64, Q77 left), SF1 82 → **94/99** (Q13, Q23, Q64, Q72, Q77 left) —
+  identical to the loop's routing-20261019d PG-statistics clones. sf025
+  sweep PASS=99 (values); all 64 SF1 row anchors hold; EA ratchet PASS
+  (its stale clone `tmp/c20a/data-sf025` was moved aside, re-cloned).
+- This is a recorded CORPUS RELOAD for S9(1): routing artifacts before
+  2026-10-19 14:00 are stale; the next S9 pass captures fresh. The sf025
+  plan-shape channel will show large NON-BLOCKING movement on its first
+  run — expected.
+- Never ANALYZE the shipped TPC-DS corpora (it replaces the imported
+  statistics). Rebuild only via owner-only `scripts/tpcds-corpus-rebuild.sh`;
+  `tpcds-sf025-regression.sh load-goopg` now imports the same way.
+- P0-E8 (concurrent CTE resolution race) placed at item 0 — found while
+  verifying the reload; pre-existing (fails at e91816974 too).
+
+OWNER DECISIONS 2026-10-19 (b) — M0146-0229 slice 1 un-parked:
+- The f1695a907 escalation is resolved by landing slice 1 (Merge Append /
+  Incremental Sort, a port of PG's generate_orderedappend_paths /
+  create_ordered_paths). Rationale: without it goopg would have to reach
+  PG's plans by different logic. Q74's plan is PG-identical and its
+  runtime is unchanged by the slice (543 s vs 522 s); host timings are
+  unreliable at present (owner-side load outside WSL2).
+- Gate amendment: `scripts/tpcds-fireset-status.py` reads an
+  owner-maintained allowlist, `scripts/tpcds-fireset-timeout-allow.tsv`
+  (harness-protected). Row: tpcds-sf1 Q74, expires 2026-11-30. An
+  allowed introduced timeout is reported, not failed. Provisional.
+- Placement: M0146-0229 (resume slice 1), then **M0146-0229a** — the
+  executor-layer recon of Q74's runtime, and whatever impl sub-tasks it
+  files — rank inside item 3 ahead of the next S9 pass.
+
+OWNER DECISIONS 2026-10-20 — TPC-DS corpora REBUILT for M0146-0216 slices 4+5:
+- c74f0c278 (internal-page splits) and 0619c0ac9 (COPY heap placement
+  through PG's FSM) closed "shipped corpora unchanged until an owner
+  rebuild". Both shipped TPC-DS corpora were rebuilt at 4eea30455 with
+  `scripts/tpcds-corpus-rebuild.sh` (COPY → per-table VACUUM → :65438
+  statistics imported into never-analyzed tables; reference stats
+  unchanged since 2026-10-19). Previous corpora kept as
+  `*.pre-rebuild-20261020`. Evidence: `analysis/m0146/owner-ops-20261020/`.
+- Physical parity is now EXACT: all 24 pkeys equal PG's page counts at both
+  scales (was ±2; customer_demographics_pkey 5269 → 5268), heap per-block
+  row counts identical to PG for store_sales / store_returns /
+  catalog_sales, heap relpages/reltuples/relallvisible identical,
+  `bt_index_parent_check` clean on all 24 pkeys, pg_stats unchanged (the
+  5 ledgered diffs).
+- Same-binary A/B census (HEAD 4eea30455; old corpus vs rebuilt): SF0.25
+  98/99 → 98/99 (Q77), SF1 96/99 → 96/99 (Q13, Q72, Q77); plan shapes
+  identical, costs moved on 15 queries per scale (the +4.0-per-probe
+  customer_demographics_pkey offset is gone). SF1 Q64 keeps its match.
+- Values: sf025 sweep PASS=99 on the HEAD binary; all 64 SF1 row anchors.
+  (A sweep built from the dirty tree at 11:54 — the staged M0146-0237 WIP —
+  ERRORed Q34/Q64/Q75 on the rebuilt corpus; the HEAD binary does not.)
+- EA ratchet: on the rebuilt corpus the seeded goopg ANALYZE samples
+  different rows, and Q23's Hash (catalog_sales+cte:frequent_ss_items+
+  customer+date_dim, est 42 / actual 0, no PG counterpart) became a
+  finding; the same binary on the old corpus passes. Owner RE-PIN of
+  `ea-baseline.txt` (Q78 fixed → Q23). Not a code regression.
+- Recorded CORPUS REBUILD for S9(1): routing artifacts before 2026-10-20
+  12:00 are stale. tpcds-sf025 / tpcds-fireset gate stamps taken on the old
+  corpus were removed (re-run the gates).
+- M0146-0216: the owner gate is cleared; the loop re-censuses and closes it
+  once its open child M0146-0236 is resolved.
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -388,8 +471,112 @@ heuristic stays live.)
 - [x] testport/TestPort\_CreateSchemaSurvivesRestart — server start timeout after 20 s \(AI\-20261017\-005127\-002; repro: `go test \-v \-run '^TestPort\_CreateSchemaSurvivesRestart$' \./internal/testport/`\)\.
   - Stale, passes at HEAD 1390b3901 \(3\.8 s\)\. The same nightly\-plus\-loop load overlap; the next sibling restart tests
     in the same run passed\.
+- [x] units/internal/executor — TestSharedSpillingBuildLoadsOncePerBatch: loadCount=10 with 7 inner files and 4 participants, want exactly 7 \(AI\-20261019\-001758\-001; repro: `go test \-timeout 10m \./internal/executor/`\)\.
+  - Nightly ran from a detached worktree at HEAD ab7ff371b, which passed the 2026\-10\-18 nightly; not caused by the staged M0146\-0224 slice\-4 WIP\.
+  - Fixed in a9b03992b \(test\-only\)\. The test's barrier held participants BEFORE acquireLoad, so under host load the claimant
+    could load, probe and release a batch before a descheduled peer arrived; that peer reloaded it \(the documented straggler
+    path\)\. The loader now parks in testHookSharedBatchLoading until the other n\-1 peers wait on done\. Mutation check: an
+    injected post\-barrier sleep fails 10/10 without the park \(loadCount=12\) and passes 10/10 with it\.
+- [x] race/internal/access/nbtree — TestIncompleteSplitsFinishedConcurrently: finish\_split\_test\.go:390 Search\(865\) = false \(AI\-20261019\-001758\-002; repro: `go test \-race \-timeout 45m \./internal/access/nbtree/`\)\.
+  - 2026\-10\-19 01:32: the single test passed 5/5 under \-race on an idle host; not yet stressed or diagnosed\.
+  - Fixed in 8fbfdf20f \(test\-only\)\. Not a lost key: all 14 missing keys came from Inserts that returned errSplitAbandoned
+    while finishing another writer's half split on contact \(insertIntoBlock \-> finishSplit\), before their own key was placed\.
+    The test now retries failed inserts\. Latent since d7c05acde \(14/200 under 8x load\); fixed: 0/400\.
+- [x] testport/TestPort\_IsolationEvalPlanQual — output 1470 lines against 1468 expected \(AI\-20261019\-001758\-003; repro: `go test \-v \-run '^TestPort\_IsolationEvalPlanQual$' \./internal/testport/`\)\.
+  - Earlier fix: the 2026\-09\-22 alias fix in resolveRowMarkCtidResnos \(deferral ledger row 2408\) made it byte\-identical; if the repro fails at HEAD, that fix did not hold\.
+  - Stale, load\-induced; no code change\. Passes 3/3 at HEAD 8fbfdf20f on an idle host \(24 s\), and the same sha passed
+    the 2026\-10\-18 nightly\. The nightly diff starts at `step c1: COMMIT; <waiting ...>`: the harness labels any step still
+    running at blockProbeCap \(1\.5 s\) as waiting, and `mergevalues` then missed the 5 s drainWindow, so the harness cancelled
+    it and the balances stayed 700/1400\. A cancelled merge is not a wrong answer\. Testport ran beside the units and race lanes
+    in a MemoryHigh=6G cgroup, so multi\-second stalls are plausible\.
+  - Under synthetic CPU load \(10 stress binaries\) 1 of 6 runs failed, on a different permutation, with only the
+    timing\-label line differing and every value correct\. Root cause is the harness's timing fallback, already
+    ledgered: deferral\_ledger row 2963 \(pg\_isolation\_test\_session\_is\_blocked not implemented\)\. Hardening
+    lead, not done: treat a probe that reports no lock wait as still running past blockProbeCap, as isolationtester does\.
+
+- [x] units/internal/access/nbtree — panic `storage: unsupported line pointer state: slot=2 flags=0` in insertItemSorted, from vacuumSplitRound's concurrent Insert \(btree\_vacuum\_split\_race\_test\.go:105\) \(AI\-20261020\-013101\-001; repro: `go test \-timeout 10m \./internal/access/nbtree/`\)\.
+  - Nightly sha cb9d2c011 from a detached worktree; that change set touched internal/optimizer only\. A slot read as
+    LP\_UNUSED during a sorted insert under a concurrent vacuum is a possible index\-page race, not a timing bound — S2
+    candidate \(possible corruption\); escalated in the baton\.
+  - 2026\-10\-20 03:15: TestStructuralLockVacuumWithSplits passed 5/5 on an idle host at HEAD cb9d2c011 \(0\.38 s each\);
+    intermittent, not yet stressed or diagnosed\.
+  - **Done 2026\-10\-20\.** Design `docs/design/0100\-0149/m\-nightly\-nbtree\-unlinked\-page\-moveright\.md`; evidence
+    `analysis/m\-nightly/ai\-20261020\-013101\-001/`\.
+    - Reproduced at GOMAXPROCS=2 \(about 1 in 40\-100 runs\)\. Two defects, both excluded by PG's deletion protocol:
+      a descent that latched a page unlinked under it read the BTDeletedPageData tombstone as line pointers \(the panic\),
+      and unlinkEmptyLeaf released its emptiness check's latch before deleting, so an insert in between was destroyed\.
+    - Fix 1: isUnlinked \(BTDeleted without BTHalfDead\); descend, tryInsertNoSplit, insertIntoBlock, Search,
+      rangeScanPosLeaf and ScanCursor\.Next step right, as \_bt\_moveright does for P\_IGNORE\. Phase\-1 pages stay writable\.
+    - Fix 2: unlinkEmptyLeaf re\-tests emptiness after latching the target \(\_bt\_pagedel\) and abandons a repopulated one\.
+    - The stress test now gates recycling for the round: a bare pool recycled a deleted block at once, which let a split
+      reuse a block a stale inserter still held \(PG gates on safexid; production wires the horizon\)\. Gated: 0/600 runs
+      fail\.
+    - Pins: TestStructuralLockVacuumWithSplits \(panics without fix 1\); TestUnlinkRechecksEmptinessUnderTheTargetLatch
+      \(deterministic hook; loses the key without fix 2\)\.
+    - Gates: nbtree \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck,
+      acceptance arm \(values identical\), sf025 PASS=99 same=99\.
+  Movement: none — correctness fix — no plan instrument \(TPC\-H and TPC\-DS plans and values unchanged\)
+- [ ] testport/TestPort\_IsolationAlterTable1 — FAIL \(60\.04 s\) \(AI\-20261020\-013101\-002; repro: `go test \-v \-run '^TestPort\_IsolationAlterTable1$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
+  - The nightly testport lane overlapped this loop's own regress/isolation gates \(load average 9\.5\); check stale first\.
+  - Diagnosis 2026\-10\-20: the nightly diff starts at `step sc1: COMMIT; <waiting ...>`\. A COMMIT slowed by load ran past
+    the runner's blockProbeCap \(1\.5 s\), which labels a step waiting without a lock wait\. The cap exists only for goopg
+    waits that report no wait event; the fix is to make them report PG's, then retire the cap\.
+  - **Slice 1 LANDED 2026\-10\-20:** WaitForSlotsToCommit and WaitForPinnedSnapshotsReleased report Lock:virtualxid, as
+    PG's WaitForOlderSnapshots does in VirtualXactLock\. Cap fires over the isolation family: 61 → 31 \(evidence
+    `analysis/m\-nightly/ai\-20261020\-013101\-002/`\)\. Pin: TestSnapshotWaitsReportVirtualXIDLock\.
+    - Still unreported: vacuum\-skip\-locked 14, intra\-grant\-inplace 8, tuplelock\-upgrade\-no\-deadlock 3, reindex\-schema
+      2, read\-only\-anomaly\-3 2, insert\-conflict\-specconflict 2\.
+    - Next: find each spec's unreported wait \(start with vacuum\-skip\-locked\), report PG's wait event there, then
+      remove blockProbeCap from awaitStepOrBlock\.
+    - Gates: transam \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck\.
+- [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
+- [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
+- [ ] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
+
+- [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
+  \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro 0 aborts over 22 rounds vs HEAD 6; plans byte\-identical, fire set empty\)
+  Parent: none
+  - Repro: `with x as (select 1 as a) select a from x;` as a pgbench script, 8 concurrent `pgbench \-c 1 \-t 50`
+    clients: some abort at `command 0 query 0` with `ERROR:  relation "x" does not exist`\. TPC\-DS query2\.sql run 4\-way
+    concurrently: 0\-6 errors per 20 runs; serial runs never fail\. Evidence:
+    `analysis/m0146/owner\-ops\-20261019/cte\-first\-statement\-race\.md`\.
+  - Pre\-existing: every tested rev of e91816974\.\.ee18b4649 fails, including e91816974\. Every observed failure is the
+    first statement of a connection\. Suspects: session\-startup / first\-plan initialisation shared across sessions;
+    package\-level planner state \(ledger 2026\-07\-29 M0125\-0003 row: no lock around planning\)\.
+  - First step: reproduce under `go test \-race` with N concurrent sessions each issuing one CTE query as its first
+    statement; find the shared state \(CTE registry / name\-resolution scope\) and make it per\-query, as PG's
+    `ParseState\.p\_ctenamespace` is\.
+  - Expected instrument: the repro at 0 errors over 20 rounds; `Movement: none — correctness fix — no plan instrument`\.
+  - **DONE 2026\-10\-19\.** Design `docs/design/0100\-0149/p0\-e8\-per\-statement\-planner\-scope\.md`; evidence
+    `analysis/p0e8/`\.
+    - Cause: the planner's per\-statement dynamic scope lived in package globals swapped on nested\-scope entry and
+      restored on exit — planCTEs \(the WITH list\), planParent, and the analyzer's outerScope\. Concurrent sessions
+      swapped each other's scope; B's restore of planCTEs to nil let A's `FROM x` fall through to the catalog\. Only
+      a cold plan cache plans concurrently, hence "first statement"\.
+    - Fix: a per\-statement planState carried on a catalog wrapper \(stmtCatalog, Unwrap\-transparent\), created
+      idempotently at every planning entry; re\-entrant plans share it; the analyzer reads its outer scope through
+      an OuterScopeCarrier slot; cteDeclSeq and legHookFireCount atomic; sublinkRouteCounts mutex\-guarded \(an
+      unsynchronised map write was a latent process\-fatal "concurrent map writes"\)\.
+    - A global planning mutex was tried first and rejected: pgbench \-S 58\.7k → 16\.2k tps\. The per\-statement state is
+      throughput\-neutral \(59\.0k/59\.6k vs HEAD 58\.8k/59\.4k\)\.
+    - Pin: TestConcurrentPlansKeepTheirOwnCTEScope \(\-race clean; mutation\-checked: no sync, or one shared state, fails
+      with the production 42P01\)\.
+    - Repro: HEAD 6 aborts over 6 cold starts; the fix 0 over 22 rounds \(16 cold\-start\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99,
+      tpcds\-fireset PASS with no fires \(plans byte\-identical on both corpora\)\.
+    - Left: viewPlanDepth is a process\-wide atomic view\-nesting guard \(ledger 2026\-10\-19\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -3137,6 +3324,12 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-16 — **exhausted at `3e6a14e3a`** \(M0122\-0012 slice 16 changed internal/executor\)\. Census
     `routing\-20261016x` is a fresh capture of all three corpora; its records are byte\-identical to `routing\-20261016w`
     \(22/22, 86/99, 74/99\)\. No task is filed; the gates are unchanged\.
+  - S9 pass 2026\-10\-20 — **exhausted at `04839ab7f`**\. Census: the M0146\-0242 fire\-set and TPC\-H captures on HEAD's
+    code tree \(`analysis/m0146/m0146\-0242/fireset/`, `analysis/m0146/m0146\-0242/tpch/`\): TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every CATEGORIES\-EXCL\-MATCH category 0\. No record is non\-MATCH, so nothing is filed\. Open
+    items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175,
+    M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239\(below\-item\-10\);
+    M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -4177,7 +4370,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       25/25, SF0\.25 25/25; relallvisible <= relpages everywhere\)\. Index density landed \(fillfactor
       rightmost split; item\_pkey 52 = PG 52\) and slice 2 \(catalog\-resolved IndexRealPages\) landed\.
       No parity lever remains in the record\.
-- [ ] **M0146\-0214 — GEQO\-RNG: goopg's GEQO uses a bespoke Knuth LCG where PG uses pg\_prng \(splitmix64
+- [x] **M0146\-0214 — GEQO\-RNG: goopg's GEQO uses a bespoke Knuth LCG where PG uses pg\_prng \(splitmix64
   fseed + xoroshiro128\*\* + bitmask\-reject range\)** \(filed 2026\-10\-16 by owner directive;
   un\-waives GEQO\-RNG under S9\(2\)\)\.
   Kind: impl
@@ -4224,7 +4417,114 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Control: PG 18\.3 restored with `pg\_dump \-\-statistics` \(the reference's exact stats\) but freshly built
       indexes picks a THIRD Q64 plan \(14022\.76 vs 13874\.27\)\. plancat\.c reads index pages, tree height and
       heap blocks physically\. So Q64 needs physical parity first; resume this task after M0146\-0216\.
-- [ ] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
+  - 2026\-10\-19 \(M0146\-0226, c65fb3855\): shipped SF1 Q64 now MATCHes PG; the Filter row rounding moved it\.
+    SF0\.25 Q64 still diverges at depth 5 \(join\-order\), so this task's gate is unchanged\.
+  - 2026\-10\-19: the blocked\-on M0146\-0216 gate is CLEARED by the owner reload \(index geometry ±2 pages, PG
+    statistics imported\)\. Q64 still diverges at BOTH scales on the reloaded corpora — resume slice 3 \(GEQO tour
+    worths\) against them\.
+  - **Slice 3 LANDED 2026\-10\-19: tour\-by\-tour worths against PG\.** Design §7; evidence
+    `analysis/m0146/m0146\-0214/slice3/`\.
+    - Probes: `GOOPG_GEQO_TRACE` / `GOOPG_GEQO_TRACE_EVAL` in geqo\.go and the matching geqo\_eval\.c / geqo\_main\.c
+      probe in the tmp/pgdbg build \(patch in the evidence dir\)\. Both engines evaluate 500 tours; the first 252
+      are identical tours in identical order\.
+    - No tour's worth matched PG \(commonest \+0\.1\): Q64's cs\_ui, an inlined CTE over a grouped HAVING query,
+      paid cpu\_tuple\_cost at the CTEScan, Project and Filter, and its HAVING was unpriced\. Fixed:
+      HAVING priced inside the Aggregate \(cost\_agg's quals arm\), inlined CTEScan peeled like a SubqueryScan, Filter
+      projection\-capable over a capable child\. 45 of 252 tours now match PG exactly\.
+    - Routed: the \+0\.0103 class is customer\_demographics\_pkey's one extra index page \(M0146\-0216\); the large
+      classes start at a `<>` join estimate \(1536640 vs 1536621\), eqjoinsel's missing MCV arm → **M0146\-0230**\.
+    - Q64 unchanged at depth 5 \(13889\.69 vs PG 13874\.27\)\. Pins: TestHavingIsPricedInsideTheAggregate,
+      TestInlinedCTELeafPricesCostSubqueryscanOnce \(mutation\-checked\); TestExplainLimitClampsToInputRows now pins
+      PG's own Limit lines\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99
+      \(14 plans changed text\), tpcds\-fireset PASS \(29 fired results byte\-identical; parity 97/94 held\)\.
+    - Next: M0146\-0230, then re\-run the tour comparison \(`analysis/m0146/m0146\-0214/slice3/trace/joincmp\.sh`\)\.
+  - 2026\-10\-19: M0146\-0230 landed \(MCV join estimates\)\. Tour 2's first gap is now a merge\-join COST at equal rows
+    \(Q64 join with item, 939 rows: goopg 20675\.72\.\.106647\.34 vs PG 18896\.82\.\.106969\.50\) — next slice: compare
+    cost\_mergejoin's terms \(outer sort over 1\.5M rows, inner sort, mergejoin rescan\) with PG on that join\.
+  - **Slice 4 LANDED 2026\-10\-19 — SF1 Q64 MATCHes PG \(SF1 PLAN\-PARITY 94→95\)\.** Design §8; evidence
+    `analysis/m0146/m0146\-0214/slice4/`\.
+    - Tour 2's merge gap was not cost_mergejoin: goopg never built PG's presorted\-index\-inner merge, because
+      findMergeClausesForOuterPathkeys matched outer pathkeys to clauses by expression\. PG compares
+      EquivalenceClasses; the outer \(ordered on cs\_ui\.cs\_item\_sk\) serves the clause on ss\_item\_sk via the
+      class the outer enforces\. Fixed \(indexOfEquivalentOuterKey, serial and partial callers\)\.
+    - Tour 12: hash\_inner\_and\_outer tries the cheapest\-STARTUP outer first; goopg built total\-total only\. Fixed
+      \(addHashJoinPath files PG's candidate set in PG's order\)\.
+    - 155/252 tours within 1e\-6 of PG; SF0\.25 Q64 still depth 5\. Remaining: Gather Merge over partial paths on
+      intermediate GEQO joinrels \(tour 14 cartesian\), and customer\_demographics\_pkey's \+1 page \(M0146\-0216\)\.
+    - Pins: TestFindMergeClausesForOuterPathkeys\_MatchesThroughTheOuterClass, TestAddHashJoinPath\_
+      TriesTheCheapestStartupOuter \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS
+      \(Q64 fired at both scales, byte\-identical\)\.
+    - Next slice: compare the GEQO\-joinrel partial / Gather Merge paths with PG on tour 14's join 6
+      \(\(b 1 3 7 9 10 11 12 16\): PG Gather Merge 1003\.38\.\.6\.42e9, goopg serial NL 1\.98e10\)\.
+  - **Slice 5 \(diagnosis\) 2026\-10\-19 → filed M0146\-0231\.** Design §9; evidence `analysis/m0146/m0146\-0214/slice5/`\.
+    - Partial paths match PG up to \(b 1 7 9 10 11 12 16\); adding cs\_ui, PG files a partial Merge Join whose inner
+      is a DIFFERENT, parallel\-safe SubqueryScan path of cs\_ui \(0\.7225\.\.42006\.29, ordered on cs\_item\_sk\) —
+      set\_subquery\_pathlist keeps every path of the subquery's final rel\. goopg's subquery leaf is one prebuilt
+      path \(the cheapest, with a Gather Merge inside, not parallel\-safe\), so no partial merge is possible\.
+    - Next: M0146\-0231, then re\-run the 500\-tour comparison\.
+  - **M0146\-0231 landed 2026\-10\-19:** SF0\.25 Q64 MATCH; SF1 Q64 lost its match to a GEQO worth tie after tour 262
+    \(design §10\)\. Next: the sub\-1% worth residuals before SF1 tour 262 \(evals 41, 90 at 0\.6–0\.75%; eval 160 at
+    2\.6e\-4 is the one eval 0231 made worse\) — `analysis/m0146/m0146\-0231/evalcmp\.py` lists them\.
+  - **Slice 6 2026\-10\-20: mergejoinscansel ported in full\.** Design §11; evidence `analysis/m0146/m0146\-0214/slice6/`\.
+    - SF1 eval 41's first differing joinrel is \(b 1 9 10\): PG's merge startup carries
+      merge\_qual\_cost × inner\_skip\_rows × rescanratio \(275 × 1\.54e6 × 0\.0025 = 1056504\); goopg reported start
+      fractions as 0\.
+    - Landed: the four start/end fractions with PG's believe\-one rules, get\_variable\_range \(histogram widened by MCV
+      extremes\), and initial\_cost\_mergejoin's skip rows \(rint\) / clamped scan rows / readjusted selectivities;
+      final\_cost\_mergejoin charges the skipped prefix's merge quals at startup\. scalarineqsel's literal form is now
+      one core \(scalarIneqSelStats\) shared with the restriction path\.
+    - Measured: customer\_demographics ⋈ store\_sales merge 389569\.59\.\.485522\.14 vs PG 389569\.93\.\.485517\.46 \(was
+      389568\.55\.\.486177\.77; 4\.0 of the total gap is M0146\-0216's index page\); SF0\.25 Q77's Merge Join 3518\.29 =
+      PG \(was 3518\.30\)\. Match counts unchanged \(fire\-set SF0\.25 98, SF1 94\); SF1 Q64 tours equal to PG's stay 262\.
+    - Pins: TestMergeJoinChargesSkippedPrefixAtStartup \(mutation\-checked\), TestVariableRangeWidensByMCVExtremes\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), sf025 PASS=99 \(Q77
+      plan text changed\), tpcds\-fireset PASS \(fired Q77 byte\-identical\)\.
+    - Movement: none — parity held; merge\-join costs converge on PG numerically, no match count moved\.
+    - Remaining eval\-41 residuals → M0146\-0233 \(the cutoff clamp: 207 vs PG's 275 skipped rows\) and M0146\-0234
+      \(sort byte currency and joinrel sort width: join 2's Sort, join 9's partial merge 6\.32e10 vs PG 6\.20e10\)\.
+  - **Slice 7 2026\-10\-20: Gather Merge useful pathkeys through the equivalence class\.** Design §12; evidence
+    `analysis/m0146/m0146\-0214/slice7/`\.
+    - SF1 eval 141 \(worst after M0146\-0234 slice 1, goopg 0\.57% dearer\): PG's final NL takes a Gather Merge over
+      \(b 1\.\.17\) sorted on all 14 query pathkeys; goopg's usefulPathkeysForRelation tested computability
+      syntactically and stopped at i\_item\_sk \(item, outside the rel\)\. Now relation\_can\_be\_sorted\_early's
+      find\_computable\_ec\_member: the pathkey carries a parallel\-safe class member the rel computes \(ss\_item\_sk\)\.
+    - SF1 Q64 evals off >1e\-3: 6→1 \(>1e\-4: 29→19; eval 141 0\.0057→7\.1e\-6\)\. Fire\-set 98/94, TPC\-H 22/22 unchanged;
+      SF1 Q77's plan text changed \(fired result byte\-identical, same first divergence\)\.
+    - Pin: TestSortableEarlyMemberUsesTheEquivalenceClass\.
+    - Gates: units \(the first run timed out in internal/initdb under the overlapping nightly; re\-run on an idle host
+      PASS\), TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(values identical\), TPC\-H parity 22/22, sf025
+      PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(off >1e\-3: 6→1\)\.
+    - Next: eval 173 \(0\.46%\) is M0146\-0234's joinrel attr\_needed width \(PG's partial merge fuzz\-equal to the partial hash
+      with better pathkeys drops it; goopg's merge 2\.6933e10 vs PG 2\.5004e10\)\.
+  - **Slice 8 2026\-10\-20 \(done\): SF1 Q64 MATCH \(SF1 94→95\)\.** Design §13; evidence `analysis/m0146/m0146\-0214/slice8/`\.
+    - After M0146\-0234 slice 2 only two worth\-order inversions remained before tour 262 \(evals 96/138, 159/248\)\. Eval
+      159, two mechanisms:
+      - generate\_useful\_gather\_paths' incremental\-sort arm was skipped \("deferred to M0146\-0006"\)\. PG files a Gather
+        Merge over an Incremental Sort of the partial merge \(presorted on the leading query pathkey\); without it, a
+        Nested Loop with the same 7 pathkeys dominated goopg's pk1 Gather Merge\. Ported, with
+        `create_incremental_sort_path`'s parallel\_workers and an equivalence\-class\-aware presorted count; the group count
+        is estimate\_num\_groups over the presorted keys \(searchRelNumGroups\)\. The Incremental Sort is a per\-worker
+        pass\-through in every parallel walk: partialPathDrivingKind, drivingScan, stamp/unstampParallelScan,
+        drivingScanCrossesSort, replaceSingleChild, parallelChildren, and the executor's attachParallelScan /
+        attachParallelIndexScan / attachParallelBitmapScan / hash\-build claim / unwrapToSetOp / collectBitmapScans /
+        collectShareableJoins\.
+      - merge\_clump gathered the topmost scan/join rel inside each GEQO tour; PG skips it \("Except for the topmost
+        scan/join rel"\) and gathers it in apply\_scanjoin\_target\_to\_paths\. goopg's top\-level Gather Merge \(pk14\)
+        dominated the fuzz\-equal Nested Loop and raised the tour's worth\. Now mergeClump skips queryTopRelids
+        \(root\->all\_query\_rels\) and geqoSearch gathers the best tour's rebuilt top rel\. DP is unchanged: its top rel
+        feeds nothing above, so gathering it in the level loop is equivalent\.
+    - SF1 Q64: all 500 GEQO tours equal to PG's \(was 262\); no worth\-order inversion; evals 159/96 now agree to 2\.7e\-9;
+      plan MATCH\. Fire\-set SF1 94→95 \(Q64\), SF0\.25 98 \(Q64 still MATCH\); TPC\-H 22/22\.
+    - Pin: TestGatherMergeOverIncrementalSortIdentity \(executor; removing attachParallelScan's arm returns 800 rows for
+      400 — mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity 22/22, sf025 PASS=99 \(no plan\-shape change\), tpcds\-fireset PASS \(fired SF1 Q64 byte\-identical\)\.
+    - Children stay open as their own tasks: M0146\-0216 \(index page\), M0146\-0232, M0146\-0233, M0146\-0234\.
+  Movement: yes — SF1 match 94→95 \(Q64\)
+- [x] **M0146\-0215 — ESTIMATE\+RELPAGES: TPC\-DS Q76's width and join estimates diverge \(goopg
   width=298 vs PG 163\), flipping join\-method/scan\-type and parameterisation** \(filed 2026\-10\-16 by
   owner directive; un\-waives ESTIMATE\+RELPAGES under S9\(2\)\)\.
   Kind: impl
@@ -4276,7 +4576,17 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       statistics: run the `pg\_restore\_\*\_stats` section of `pg\_dump \-\-statistics \-d tpcds025` \(and
       `\-d tpcds` for SF1\) on the goopg clusters\. That replaces their ANALYZE statistics, so it is the owner's call
       \(see the escalation in the baton\)\.
-- [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
+  - **2026\-10\-19: owner gate CLEARED** — both shipped corpora now carry the reference's statistics \(OWNER DECISIONS
+    2026\-10\-19\)\. SF0\.25 Q76 and Q99 MATCH on the shipped corpus; re\-measure and close with the census\.
+  - **Closed 2026\-10\-20 \(re\-measured\)\.** Evidence `analysis/m0146/m0146\-0215/closure/` — Q76 and Q99 from the
+    d1446d972 fire\-set candidate captures \(`analysis/m0146/m0146\-0214/slice8/fireset/`\), shipped corpora with the
+    reference's imported statistics\.
+    - Q76 and Q99 MATCH at SF0\.25 and at SF1 \(first\-divergence: no structural divergence\)\.
+    - Not plan\-shape: Q76's top Limit still renders width=298 against PG's 163, and its cost is 0\.15% high
+      \(SF0\.25 39087\.41\.\.39131\.53 vs 39026\.66\.\.39070\.79\)\. EXPLAIN widths are the rendering burn\-down's
+      \(M0146\-0042\); the cost\-width currency is M0146\-0234's\.
+  Movement: yes — SF0\.25 match 86→88 \(Q76, Q99\)
+- [x] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
   Kind: impl
@@ -4330,12 +4640,122 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: nbtree \-race, units, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99, TestPort\_RegressSuite,
       TestPort\_Isolation\*\.
     - Shipped corpora are unchanged until they are reloaded on this engine \(owner\-index\-refresh\)\.
+  - **2026\-10\-19: owner reload DONE** \(OWNER DECISIONS 2026\-10\-19\): index pages now within ±2 of PG on every
+    table at both scales \(store\_sales\_pkey SF0\.25 2567 vs 2569; SF1 11042 vs 11041\); heap pages and relallvisible
+    identical\. Remaining: the FSM\-reuse heap\-TID residual \(ledger\)\. Re\-measure and close\.
+  - **Slice 4 LANDED 2026\-10\-20 \(loop \#29\): internal\-page splits\.** Design §7; evidence
+    `analysis/m0146/m0146\-0216/slice4/`\.
+    - Record: customer\_demographics\_pkey 5269 vs PG 5268 on both corpora \(\+4\.0 per probe; SF1 Q64, SF0\.25 Q77\)\.
+      Leaves identical; the internal level is 19 pages of 284 against PG's 17 of 285 plus a rightmost 403\.
+    - Cause: internal splits used the leaf pricing\. \_bt\_recsplitloc's non\-leaf arm charges no heap\-TID allowance and
+      credits the right half with the firstright key, which \_bt\_split stores as a minus\-infinity first item\.
+      Ported as pgFindSplitLocInternal \(INTERNAL\_SPLIT\_DISTANCE, smallest\-firstright penalty\) plus the truncation\.
+    - Measured \(COPY replay on clones; HEAD reproduces every shipped size\): customer\_demographics\_pkey
+      5269→**5268** at both scales\. Unchanged: SF0\.25 store\_sales 2567 \(PG 2569\); SF1 store\_sales 11042
+      \(11041\), store\_returns 1081 \(1082\), catalog\_sales 5624 \(5625\)\. Those four ride heap placement: 7361 /
+      689 / 17539 SF1 heap blocks hold a different row count than PG's \(the FSM\-reuse ledger row\)\.
+    - Pins: TestInsertBuiltSerialIndexMatchesPGInternalLevel and TestFindSplitLocInternalTakesSmallestFirstRight,
+      mutation\-checked \(truncation, penalty, heap\-TID allowance, both halves\)\.
+    - Gates: nbtree and amcheck \-race, units, TestPort\_RegressSuite, TestPort\_Isolation\* \(the first run hung
+      once, ledger; the re\-run passed in 596 s\), tpch\-spotcheck, acceptance arm, sf025 sweep, tpcds\-fireset
+      \(SF1 95/99, fired none\)\.
+    - Next: COPY heap placement through the FSM \(hio\.c RecordAndGetPageWithFreeSpace; ledger 2026\-10\-16\), which
+      is the last engine mechanism here\. Then an owner corpus rebuild, re\-measure and close\.
+  - **Slice 5 LANDED 2026\-10\-20 \(loop \#30\): COPY heap placement through PG's FSM\.** Design §8; evidence
+    `analysis/m0146/m0146\-0216/slice5/`\.
+    - Root cause: server\-side COPY's hand\-built executor context \(postmaster/copy\.go\) had no FSM \(and no VM\)\.
+      The bulk path recorded nothing and found nothing, so the heap filled strictly forward\. A trace showed every
+      RecordAndGet search failing\.
+    - Port: storage/fsm\_pgtree\.go, PG's FSM tree \(fsm\_search\_avail with fp\_next\_slot, own\-leaf\-first
+      RecordAndGet, upper levels moved only by FreeSpaceMapVacuumRange with its exclusive end, fsm\_search's stale
+      correction\)\. It is used by the bulk path; COPY gets FSM/VM; VACUUM ends with the vacuum range;
+      MaxFSMRequestSize 8164→8160\.
+    - Measured, full COPY replay at both scales: every pkey = PG \(store\_sales 2567→**2569** SF0\.25,
+      11042→**11041** SF1; store\_returns 1081→**1082**; catalog\_sales 5624→**5625**\)\. Heap block counts are
+      identical to the PG replica \(0 differing blocks, from 4303/387/58 SF0\.25 and 17539/689/7361 SF1\)\. Heap
+      pages = PG after VACUUM truncates COPY's tails\.
+    - Pins: TestCopyFromRefillsEarlierPagesThroughTheFSM \(PG\-measured layout plus 8 back\-jumps; fails without the
+      ctx FSM, with first\-fit, or without the vacuum range\) and fsm\_pgtree\_test\.go\.
+    - Filed M0146\-0236 \(S2\): ctid NULL / xmin unresolved above a WindowAgg\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, sf025 PASS=99 same=99, tpcds\-fireset \(98/99, 95/99, fired none\)\.
+    - Engine work for this task is complete\. Remaining: an owner corpus rebuild on this engine
+      \(scripts/tpcds\-corpus\-rebuild\.sh\), then re\-census and close\. The shipped corpora still carry the old
+      geometry \(customer\_demographics\_pkey 5269\)\.
+  - **2026\-10\-20: owner corpus rebuild DONE** \(OWNER DECISIONS 2026\-10\-20\): all 24 pkeys = PG at both
+    scales, heap per\-block identical, amcheck clean; same\-binary census unchanged \(98/99, 96/99\)\. Remaining:
+    re\-census and close after the open child M0146\-0236\.
+  - **CLOSED 2026\-10\-20 \(loop \#35\)** after M0146\-0236 resolved \(b0c982657\)\. Design §9; evidence
+    `analysis/m0146/m0146\-0216/closure/`\.
+    - Closure census \(fresh clones of both rebuilt corpora vs :65438; relpages, relallvisible, reltuples,
+      pg\_relation\_size for every public table and index\): SF0\.25 0 of 49 differ; SF1 1 of 49 \(dbgen\_version physical
+      0 vs 1\)\.
+    - dbgen\_version: `scripts/tpcds\-corpus\-rebuild\.sh`'s TABLES list omits it, so the goopg SF1 corpus has no row
+      where PG's has one; the matching relpages/reltuples are PG's imported statistics\. A load\-script gap for the owner,
+      not an engine one; no TPC\-DS query reads it \(ledger\)\.
+    - Original record cleared: the RELPAGES class \(SF1 Q52, Q76\) matches; the owner's same\-binary census held
+      98/99 and 96/99 with identical shapes\.
+    - Children: M0146\-0236 closed; its filings M0146\-0238/0239 are correctness\-only and stay below item 10
+      \(S7\) unless placed\.
+  Movement: none — physical census only: plan instruments were measured unchanged by the owner's same\-binary A/B \(98/99, 96/99\)
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
     `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
     `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
     `tmp/g14\-tpcds025\-stats\.sql`\.
+- [x] **M0146\-0236 — WRONG RESULTS: system columns lost above a WindowAgg — `ctid` reads NULL, `xmin` does not
+  resolve** \(filed 2026\-10\-20 by M0146\-0216 slice 5; S2 escalation, owner to place\)\.
+  Kind: impl
+  Parent: M0146-0216
+  - Repro \(any table\): `CREATE TABLE zt\(id int, x int\); INSERT INTO zt VALUES \(1,1\),\(2,2\);`
+    - `SELECT ctid, row\_number\(\) OVER \(\) FROM zt` returns NULL for ctid; PG returns \(0,1\) and \(0,2\)\.
+    - `SELECT ctid, sum\(x\) OVER \(ORDER BY id\) FROM zt` and `lag\(ctid\) OVER \(...\)` give NULL as well\.
+    - `SELECT xmin::text, row\_number\(\) OVER \(\) FROM zt` errors `column "xmin" does not exist`\.
+    - Plain `SELECT ctid FROM zt` and `ctid` in a subquery or GROUP BY are correct\.
+  - First step: find where the WindowAgg path builds its input target list. The system attribute is probably
+    dropped there \(ctid\), or never offered to name resolution \(xmin\)\. Compare with the Agg path, which keeps
+    `ctid` correctly\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
+  - **LANDED 2026\-10\-20 \(loop \#34\), the window case; selected as the child OWNER DECISIONS 2026\-10\-20 names
+    for closing M0146\-0216\.** Design `docs/design/0100-0149/m0146-0236-window-ctid.md`\.
+    - Cause: goopg's `ctid` is a CTIDExpr reading the slot's TID side\-channel\. windowOp buffered and re\-sorted its
+      input and emitted fresh slots, so the channel was lost\. markSortWantCTIDs passed through the window without
+      asking it to keep anything\.
+    - Change: windowOp keeps a per\-row TID array \(captured with slot\.TID\(\) while buffering, permuted with the
+      partition sort, re\-attached on emit\); markSortWantCTIDs sets its wantCTIDs\.
+    - Result: ctid beside window functions equals each row's TID, including over a Sort on 200000 rows\. Pin:
+      TestCtidSurvivesWindowAgg, mutation\-checked\.
+    - Not window\-specific, so filed separately: `xmin` and the other system columns do not resolve anywhere
+      \(M0146\-0239\); `ctid` is NULL in every join and binds to non\-relation range entries \(M0146\-0238\)\. `ctid`
+      inside the window's own expressions stays NULL \(ledger, same root as 0238\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+  Movement: none — correctness fix — no plan instrument
+- [ ] **M0146\-0238 — WRONG RESULTS: `ctid` reads NULL in every join and binds to non\-relation range entries** \(filed
+  2026\-10\-20 by M0146\-0236; S2 escalation, owner to place\)\.
+  Kind: impl
+  Parent: M0146-0236
+  - Repro: `CREATE TABLE a\(id int\); CREATE TABLE b\(id int\); INSERT ...;`
+    - `SELECT a\.ctid, b\.ctid FROM a JOIN b USING \(id\)` returns NULL for both; PG returns each row's TID\.
+    - `SELECT ctid FROM \(SELECT \* FROM a LIMIT 5\) s` returns values; PG errors 42703 \(a subquery has no ctid\)\.
+    - `SELECT ctid FROM a, LATERAL \(SELECT 1\) l` errors "ambiguous"; PG resolves it to a\.
+    - `lag\(ctid\)`, `PARTITION BY ctid` and a run condition over ctid read NULL inside a WindowAgg\.
+  - Cause: ctid is a CTIDExpr reading one TID side\-channel per slot; a join row has two sources, and
+    resolveColumnRefAt binds `ctid` to any range binding, not only to relations\.
+  - PG: ctid is a Var with attno \-1 of its relation, projected by the scan and carried up like any column\.
+    Resume: give CTIDExpr \(or a system\-column Var\) its source binding, have the scan emit it as a column, and
+    resolve only against RTE\_RELATION bindings\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
+- [ ] **M0146\-0239 — `xmin`, `xmax`, `cmin` and `cmax` system columns do not resolve** \(filed 2026\-10\-20 by
+  M0146\-0236\)\.
+  Kind: impl
+  Parent: M0146-0236
+  - Repro: `SELECT xmin, xmax, cmin, cmax FROM t` errors 42703 `column "xmin" does not exist`; PG returns the heap
+    tuple header's values \(heap\_getsysattr\)\.
+  - Resume: resolve them as system\-column Vars of their relation \(the same design as M0146\-0238\) and read
+    t\_xmin, t\_xmax \(HeapTupleHeaderGetRawXmax\) and the combo\-cid–aware cmin/cmax from the scanned tuple\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
 - [x] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
   Gather Merge\), goopg sorts only** \(filed 2026\-10\-16 by the S9 pass at 4334a3714\)\.
   Kind: impl
@@ -4366,7 +4786,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Gates: units, tpch\-spotcheck, acceptance arm \(24 MATCH on values\), sf025 PASS=99 same=99, tpcds\-fireset
       \(Q38/Q87 SF1 results byte\-identical\), TestPort\_RegressSuite\.
 Movement: none — instrument artefact — the shipped census plans from goopg's own ANALYZE sample \(SF0\.25 86/99 held; SF1 74→73, Q87 filed M0146\-0218\); the PG\-statistics clones move Q38 \(SF0\.25\) and Q87 \(SF1\) to MATCH
-- [!] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
+- [x] **M0146\-0218 — TPC\-DS SF1 Q87 MATCH→SHAPE\-DIFF after M0146\-0217's PG\-faithful split\-arm rows: estimate\-driven**
   \(filed 2026\-10\-16 by M0146\-0217 under R3\)\.
   Kind: regression
   Parent: M0146-0014
@@ -4379,6 +4799,9 @@ Movement: none — instrument artefact — the shipped census plans from goopg's
     engine\-side fix would have to make goopg's ANALYZE sample PG's rows, which M0146\-0215 slice 1 showed is not
     reproducible\.
   - Expected instrument: SF1 PLAN\-PARITY match 73→74 \(Q87\) after the import\.
+  - **Closed 2026\-10\-19 by the owner's import** \(OWNER DECISIONS 2026\-10\-19\): the reloaded SF1 corpus carries
+    the reference's statistics; Q87 MATCHes PG \(`analysis/m0146/owner\-ops\-20261019/census\-reload\-pgstats\-sf1\-diff\.txt`\)\.
+Movement: yes — SF1 PLAN\-PARITY 82→94 \(owner corpus reload \+ PG statistics import; Q87 MATCH\)
 - [x] **M0146\-0219 — aggregation\-strategy: TPC\-DS Q61 — PG plans each scalar FROM\-subquery aggregate as `Finalize
   Aggregate → Gather → Partial Aggregate`, goopg as `Aggregate → Gather`** \(filed 2026\-10\-16 by the S9 pass at
   c2a4421fc\)\.
@@ -4594,9 +5017,10 @@ Movement: yes — TPC\-DS SF0\.25 match 88→89 \(Q72\)
     - Gates: units, spotcheck, acceptance arm, sf025 PASS \(Q39 plan text changed\), fireset PASS \(Q39 results
       byte\-identical at both scales\), TestPort\_RegressSuite\.
 Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
-- [ ] **M0146\-0224 — qual\-placement: TPC\-DS Q78 — PG commutes the two outer joins to \(ss ⟕ cs\) ⟕ ws; goopg keeps
+- [x] **M0146\-0224 — qual\-placement: TPC\-DS Q78 — PG commutes the two outer joins to \(ss ⟕ cs\) ⟕ ws; goopg keeps
   \(ss ⟕ ws\) ⟕ cs** \(filed 2026\-10\-17 by the S9 pass at 1a8760b93\)\.
   Kind: impl
+  Movement: yes — SF0\.25 match 90→91, SF1 77→78 \(PLAN\-PARITY census4, Q78 MATCH at both scales\)\.
   Parent: M0146-0014
   - Record: TPC\-DS SF0\.25 Q78, category qual\-placement, verdict SHAPE\-DIFF at depth 2 \(under Sort: PG Merge Left
     Join \| goopg Merge Left Join\)\. The same swap is the SF1 join\-order record at depth 2\. Both persist under PG
@@ -4635,7 +5059,647 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       scale and TPC\-H Q18 changed cost only\.
     - Pin: TestSubplanLeafPricesCostSubqueryscanOnce, mutation\-checked\. Gates: units, spotcheck, acceptance arm,
       sf025 PASS=99, fireset PASS \(26 fired results byte\-identical\), TestPort\_RegressSuite\.
-  - Slice 3 \(next\): the WHERE OR clause at the top joinrel\. PG keeps \(ss ⟕ cs\) ⟕ ws by 0\.06: qp\_qual 0\.005 per
-    mergejointuples \(28 against 16\), path rows 762\. goopg holds the clause above the searched tree
-    \(heldAbovePrefix\) and never prices it\. Resume at the ledgered C\-05 pselec\-held\-above: distribute it with an
-    is\_pushed\_down bit, size it through pselec, charge it as qp\_qual, apply it as the outer join's Filter\.
+  - **Slice 3 LANDED 2026\-10\-17 \(loop \#77\): delayed WHERE conjuncts are pushed\-down restrictions of the top
+    joinrel\.** Design §7; `analysis/m0146/m0146\-0224/census3/`, `fireset3/`\.
+    - topDelayedConjuncts picks the held conjuncts whose check\_outerjoin\_delay placement is the join of every leaf\.
+      The root problem carries them as restrictInfos with a pushedDown bit \(RINFO\_IS\_PUSHED\_DOWN\)\.
+    - The full joinrel sizes them through pselec \(rows 762, as PG\) and charges them as qp\_qual in every join method\.
+      They are never keys, join quals or part of the unique/semi tests\.
+    - The Filter above the tree applies them, stamped with the winning path's cost\.
+    - orRangeSelectivity: an unmeasured inequality arm with no statistics is DEFAULT\_INEQ\_SEL, not 0\.5\.
+    - Q78 now has PG's structure at both scales and is the only plan that changed\. It is still SHAPE\-DIFF on qual
+      text\. Pins: TestTopDelayedConjunctsClosesOverOuterJoins, TestPushedDownRestrictionIsNeverAJoinKey,
+      TestOrRangeArmDefaultsToIneqSel\.
+    - Gates: units, spotcheck, acceptance arm, sf025 PASS=99 \(Q78 changed\), fireset PASS \(Q78 byte\-identical at
+      both scales\), TestPort\_RegressSuite\.
+  - Slice 4 \(next\): EXPLAIN qual text through a removed SubqueryScan\. PG's setrefs replaces the upper Vars with the
+    subplan's tlist expressions, so it prints web\_sales\.ws\_item\_sk, web\_sales\.ws\_bill\_customer\_sk and
+    sum\(web\_sales\.ws\_quantity\)\. goopg prints the CTE output names ws\_item\_sk, ws\_customer\_sk and ws\_qty\. These
+    are the differ's remaining Merge Cond and JoinQual signatures \(design §8\)\.
+    - 2026\-10\-19: implemented in tree and staged, NOT committed \(design §8\.1; backup
+      `tmp/m0224\-slice4\-wip\.patch`\)\. Semi/anti join keys map to the left input \(joinOutputSide\), a join's
+      attached Filter and the Sort keys over the search boundary chase to the subplan target, and a non\-Var target
+      is parenthesised as get\_variable does\.
+    - Census with it \(`census4/`\): SF0\.25 90→91, SF1 77→78 \(Q78 MATCH at both scales\), TPC\-H 22/22 with Q18's
+      Sort Key text\-identical\. No other plan text changed\.
+    - Pin: TestStrippedCTELeafQualsDeparseSubplanTargets, mutation\-checked against all three arms\. Units PASS\.
+    - Blocked on gates: tpch\-spotcheck and the acceptance arm are SKIP\-BLOCKED because `:65433`'s data dir is
+      under HOLD \(unclean shutdown 2026\-10\-17 18:17, owner\-only\); `:65432` and `:65438` hold too\. The sf025
+      sweep refused while the 2026\-10\-19 nightly batch ran\. Still to run: sf025, fireset, TestPort\_RegressSuite\.
+    - 2026\-10\-19 02:12: sf025 sweep PASS on the staged index \(99 compared, no verdict change, only Q78's plan text
+      changed; stamp tmp/gate\-stamps/tpcds\-sf025\.json, code\_tree e6d93c0b\)\. TestPort\_RegressSuite PASS \(459 s\)\.
+      Fireset is not required: the staged set is internal/executor only, outside the fire\-set scope\. Only
+      tpch\-spotcheck and the acceptance arm remain, both HOLD\-blocked\. Re\-run sf025 if the staged internal/ index changes\.
+    - 2026\-10\-19 06:41: the owner released the HOLDs \(`*.HOLD.released-20261019`; ensure fix 8ea3190a7\)\.
+      tpch\-spotcheck PASS \(Q12=2, Q13=35\) and acceptance arm m24e PASS \(24/24 MATCH on values,
+      `analysis/m0146/m0146\-0224/accept4`\), both on code\_tree e6d93c0b, the same tree as the sf025 stamp\.
+  - **Slice 4 LANDED 2026\-10\-19: EXPLAIN qual text through the stripped CTE SubqueryScan\.** Task closed\.
+- [x] **M0146\-0225 — scan\-type: TPC\-DS SF1 Q53/Q63 — PG probes `store` with an Index Only Scan under Memoize,
+  goopg with a full\-width Index Scan** \(filed 2026\-10\-19 by the S9 pass at 0d94a7133\)\.
+  Kind: impl
+  Movement: yes — SF1 match 78→80 \(Q53, Q63\); CATEGORIES\-EXCL\-MATCH scan\-type SF1 12→10
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q53 \(and Q63, same node\), category scan\-type, verdict SHAPE\-DIFF at depth 9 under Memoize\.
+    PG `Index Only Scan using store_pkey on store \(cost=0\.14\.\.0\.15 rows=1 width=4\)`; goopg `Index Scan using
+    store_pkey on store \(cost=0\.14\.\.0\.15 rows=1 width=1812\)`\. Both persist under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261019a/`\.
+  - S9 ranking \(persisting records, live\-task and import\-routed records excluded\): scan\-type 2, every other
+    category 1\.
+  - First step: the costs are identical and goopg's width is the whole row\. Find out whether goopg builds the
+    index\-only path for the Memoize's inner rel \(check\_index\_only over the rel's attr\_needed: only `s_store_sk` is
+    referenced\), and if it does, how the cost tie is resolved\. PG's add\_path keeps the index\-only path\. Instrument
+    addPath first \(memory planner\_verify\_both\_candidates\_generated\), then use the SF1 PG\-statistics clone recipe
+    `tmp/s9\-imp/run\.sh`\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q53, Q63\), 78→80 on the shipped corpus\.
+  - **LANDED 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0225\-window\-needed\-columns\.md`; evidence
+    `analysis/m0146/m0146\-0225/`\.
+    - Bisected on an SF1 clone: the join block alone gets the index\-only probe; adding the window function loses it\.
+      `neededColumnNames` declined any OVER or WINDOW clause, so the needed set was unknown and pathparamindex\.go
+      never marked the probe index\-only\.
+    - Fix: collectWindowDefColumnNames walks PARTITION BY / ORDER BY \(PG build\_base\_rel\_tlists\), plus frame offsets
+      for safety; the WINDOW clause is walked in the needed set and its output\-set sibling\.
+    - Ten window queries change plan text at each scale; apart from Q53/Q63 only widths shrink \(narrowing now reaches
+      them\), costs unchanged\. SF0\.25 stays 91/99\.
+    - Pin: TestWindowFunctionKeepsNeededSet, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS \(10 plans
+      changed\), tpcds\-fireset PASS \(20 fired results byte\-identical\)\.
+- [x] **M0146\-0226 — sort\-strategy: TPC\-DS SF0\.25 Q4 — PG finishes with an Incremental Sort over a merge\-joined
+  pair of sorted CTE scans; goopg nested\-loops unsorted CTE scans under a full Sort** \(filed 2026\-10\-19 by the S9
+  pass at fe64139d5\)\.
+  Kind: impl
+  Movement: yes — SF0\.25 match 91→92 \(Q4\), SF1 match 80→81 \(Q64\); CATEGORIES\-EXCL\-MATCH SF0\.25 sort\-strategy 4→3
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q4, category sort\-strategy, verdict SHAPE\-DIFF at depth 1 \(under Limit: PG Incremental
+    Sort \| goopg Sort\)\. Persists under PG statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261019b/`\.
+  - S9 ranking: a five\-way tie at 1 \(SF0\.25 Q4, SF0\.25 Q69, SF1 Q23, SF1 Q72, SF1 Q77\); SF0\.25 preferred, then the
+    lower query id and shallower divergence\.
+  - Already different under identical statistics: CTE scan estimates \(goopg 9 / 29 rows, PG 10 / 30\) and the
+    year\_total HashAggregate cost \(goopg 46822\.64\.\.55046\.66, PG 53401\.85\.\.61625\.87, same input\)\.
+  - First step: on the SF0\.25 PG\-statistics clone \(`tmp/s9\-imp/run\.sh` recipe\), attribute the CTE\-scan row gap
+    \(the year\_total filter's selectivity over the CTE's column statistics, PG's set\_cte\_size\_estimates /
+    clauselist\_selectivity\) and the HashAggregate cost gap \(cost\_agg AGG\_HASHED\); then check whether the merge
+    join \+ Incremental Sort arm is generated \(instrument addPath\) and at what cost\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q4\), 91→92 on the shipped corpus\.
+  - **LANDED 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0226\-filter\-rows\-clamp\-row\-est\.md`; evidence
+    `analysis/m0146/m0146\-0226/`\.
+    - The CTE scans already cost PG's numbers; only their rows differed\. A trace showed PG's exact selectivities
+      \(2\.5e\-5, 8\.33e\-6\); EstimateRows\(\*Filter\) truncated 29\.87→29 and 9\.96→9 where clamp\_row\_est rounds\.
+    - Fix: the Filter arm uses clampRowEst \(rint\), like its sibling applyLocalFilterSelectivity\. The legacy
+      join\-fallback scaleByFloat callers are untouched \(ledger\)\.
+    - Eleven SF0\.25 plans change text through rows rounded up; SF1 Q64 also matches now \(M0146\-0214's record\)\.
+    - Open \(ledger\): the year\_total HashAggregate cost gap; the display\-path CTE scan qual cost\.
+    - Pin: TestFilterRowsRoundLikeClampRowEst, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24 values\), sf025 PASS=99 \(11 plans
+      changed\), tpcds\-fireset PASS \(25 fired results byte\-identical\)\.
+- [x] **M0146\-0227 — join\-method: TPC\-DS SF0\.25 Q69 — PG anti\-joins catalog\_sales on top with a Hash Right Anti
+  Join; goopg puts a Nested Loop Anti Join with a Join Filter on web\_sales there** \(filed 2026\-10\-19 by the S9 pass
+  at 18d2c73b0\)\.
+  Kind: impl
+  Movement: yes — SF1 match 81→82 \(Q69\), PG\-statistics SF0\.25 match 96→97 \(Q69\); CATEGORIES\-EXCL\-MATCH SF1 qual\-placement 4→3
+  Parent: M0146-0014
+  - Record: TPC\-DS SF0\.25 Q69, category join\-method, verdict SHAPE\-DIFF at depth 3 \(under Sort: PG Hash Right Anti
+    Join \| goopg Nested Loop Anti Join\)\. Persists under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261019c/`\.
+  - S9 ranking: a four\-way tie at 1 \(SF0\.25 Q69, SF1 Q23, SF1 Q72, SF1 Q77\); SF0\.25 preferred\.
+  - goopg's plan costs 43183\.05 against PG's 43130\.36, so either PG's order is not generated or goopg prices it
+    higher\. The EXISTS leg differs already: Nested Loop over the store\_sales HashAggregate 19132\.67\.\.19430\.53
+    \(goopg\) against 19132\.67\.\.19681\.46 \(PG\)\.
+  - First step: on the SF0\.25 PG\-statistics clone, instrument addPath for the top joinrel to check whether PG's
+    arm \(the catalog\_sales Hash Right Anti Join over \(customer ⋈ EXISTS\) ⟕anti web\_sales\) is generated and at
+    what cost\. Attribute the 251 gap on the EXISTS Nested Loop \(inner index probe into customer at 858 loops\)
+    against PG's cost\_nestloop / cost\_index terms\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q69\), 92→93 on the shipped corpus\.
+  - **Slice 1 LANDED 2026\-10\-19: semijoin loop count over a multi\-relation RHS\.** Design
+    `docs/design/0100\-0149/m0146\-0227\-multirel\-semijoin\-loop\-count\.md`; evidence `analysis/m0146/m0146\-0227/`\.
+    - The EXISTS leg's customer\_pkey probe cost 0\.29\.\.0\.33 against PG's 0\.63 with identical statistics: goopg's
+      adjustRowcountForSemijoins sized only a one\-relation RHS, so the loop count stayed at store\_sales' 719876 rows
+      where PG's approximate\_joinrel\_size \+ estimate\_num\_groups give ss\_customer\_sk's 39023\.
+    - multiRelSemiRhsUniqueRows ports the multi\-relation arm; the probe now costs PG's 0\.63\.
+    - No verdict moved \(SF0\.25 92, SF1 81, TPC\-H 22\); Q10/Q35/Q69 cost\-only\.
+    - Pin: TestLoopCountClampsMultiRelSemijoinRHS, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(3 plans
+      changed\), tpcds\-fireset PASS \(5 fired results byte\-identical\)\.
+  - Slice 2 \(in progress, 2026\-10\-19\): diagnosed; design §4\.
+    - PG's top is generated \(right\_anti hash 32211\.13\.\.43141\.28 vs PG 32200\.20\.\.43130\.36\), but goopg's web\_sales
+      NL anti \(43444\.91\) dominates it inside the 1% fuzz with a lower startup\.
+    - PG never builds that NL anti's outer rel: the exact\-replica add\_path probe shows only \(c, ca, cd, EXISTS,
+      web anti\) at seven members\. The cause is join\_collapse\_limit: the third pulled sublink meets 7 \+ 2 > 8, so
+      PG plans the first seven as a sub\-problem\. goopg appends pulled leaves flat \(jointreepullup\.go\)\.
+    - Fold patch `tmp/m0227/slice2\-collapse\-fold\-wip\.patch` splits Q69 like PG but panics: a sub\-problem
+      holding pulled leaves does not publish the binding coordinates the enclosing tree reads \(createplanroot\.go
+      boundaryMap\)\. Next: fix that publication, then re\-apply the fold\.
+  - **Slice 2 LANDED 2026\-10\-19\.** Design §4/§5; evidence `analysis/m0146/m0146\-0227/census2/`\.
+    - foldPulledBodyLeaves folds pulled sublink bodies under join\_collapse\_limit \(deconstruct\_recurse\)\.
+    - The root filler licenses an item wholly inside a SEMI/ANTI RHS \(c11's rule for synthetic leaves\)\.
+    - A sub\-problem leaf carries subproblemBaseVars, so a join Var inside it keeps its base relation's statistics
+      \(examine\_variable / find\_base\_rel\); Q69's top anti join is back at PG's 91 rows\.
+    - Q69 MATCHes PG under PG statistics at SF0\.25 and on the shipped SF1 corpus\. The shipped SF0\.25 residual
+      \(depth 4\) is statistics\-driven and routes to the M0146\-0215 import\.
+    - Pins: TestPulledSublinksFoldUnderJoinCollapseLimit, TestSubproblemLeafVarKeepsBaseRelStats, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(Q69 changed\),
+      tpcds\-fireset PASS \(2 fired results byte\-identical\)\.
+- [x] **M0146\-0228 — aggregation\-strategy: TPC\-DS SF1 Q23 — PG partially aggregates the best\_ss\_customer CTE under a
+  Gather \(Finalize HashAggregate\); goopg aggregates it serially** \(filed 2026\-10\-19 by the S9 pass at 8465f5e72\)\.
+  Kind: impl
+  Movement: none — S3 instruments unchanged \(SF1 match 82, PG\-statistics 94, CATEGORIES\-EXCL\-MATCH identical\): Q23 statement 1 now MATCHes PG and the query's first divergence moved depth 5→1 onto statement 2 \(sort\-strategy\)
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q23, category aggregation\-strategy, verdict SHAPE\-DIFF at depth 2 \(under CTE: PG Finalize
+    HashAggregate \| goopg HashAggregate\)\. Persists under PG statistics\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261019d/`\.
+  - S9 ranking: a three\-way tie at 1, all SF1 \(Q23, Q72, Q77\); Q23 has the lowest id and the shallowest divergence\.
+  - PG 189437\.85\.\.191187\.85: Finalize HashAggregate → Gather \(4\) → Partial HashAggregate → Parallel Hash Join\.
+    goopg 179918\.25\.\.181501\.58: HashAggregate → serial Hash Join \(Seq Scan store\_sales ⋈ Index Only Scan
+    customer\_pkey\)\. The CTE's HAVING reads `\(InitPlan 2\)\.col1`\.
+  - First step: on an SF1 PG\-statistics clone, check whether the partial\-aggregation arm is generated for the CTE
+    body \(instrument addPath on its upper rel; PG create\_partial\_grouping\_paths\)\. If it is declined, find why \(the
+    HAVING's InitPlan Param is parallel\-safe in PG: is\_parallel\_safe allows a PARAM\_EXEC from an initplan\)\. If it
+    is generated, compare its cost with PG's and the serial arm's against PG's serial cost\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus\.
+  - **Slice 1 LANDED 2026\-10\-19: the aggregate input\-expression cost\.** Design
+    `docs/design/0100\-0149/m0146\-0228\-agg\-input\-expression\-cost\.md`; evidence `analysis/m0146/m0146\-0228/`\.
+    - The CTE body alone on the exact replica: PG's serial HashAggregate costs 0\.01 per input row over the shared
+      Hash Join, goopg's 0\.005\. get\_agg\_clause\_costs adds cost\_qual\_eval over the aggregate arguments, which
+      aggClauseCosts had left out\.
+    - aggInputEvalOps adds the arguments' and FILTER's qualEvalOps per transition state, never in the combine step\.
+    - No verdict moved; 17 TPC\-DS plans per scale changed cost, converging on PG \(Q2, Q43, Q59, Q66, Q99\)\.
+    - Pin: TestAggClauseCostsChargesInputExpressions, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(17 plans
+      changed\), tpcds\-fireset PASS \(34 fired results byte\-identical\)\.
+  - **Slice 2 LANDED 2026\-10\-19: numeric\-family coercion cost\.** Design §4\.
+    - qualEvalOps prices an implicit operand coercion \(int vs numeric/float, numeric vs float\) and a numeric\-family
+      CastExpr as a function cast \(procost 1\), free when the operand folds to a constant\.
+    - The CTE body's serial HashAggregate startup now equals PG's 119518\.79; Q23's CTE plans PG's Finalize
+      HashAggregate → Gather → Partial HashAggregate\. No verdict moved; Q23's first divergence moved to depth 5\.
+    - Pin: TestQualEvalPricesNumericCoercions, mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99 \(6 plans
+      changed\), tpcds\-fireset PASS \(12 fired results byte\-identical\)\.
+  - **Slice 3 LANDED 2026\-10\-19: a Parallel Hash build over a partial index scan\.** Design §5/§6; evidence
+    `analysis/m0146/m0146\-0228/slice3/`, `census3/`, `fireset3/`\.
+    - PH2 vetoed PG's arm \(the build had to be a partial seq scan\); partialPathDrivingKind's hash arm carried the
+      same rule, so lifting PH2 alone made makeGatherPath refuse the split's partial input\.
+    - parallelHashBuildIsClaimable is now the one predicate for all three gates and admits a plain index or
+      index\-only build; the executor already claims it through the join's leaf pidx\.
+    - Q23's CTE plans PG's Partial HashAggregate 70312\.46\.\.71562\.46 over the Parallel Hash Join with a Parallel
+      Index Only Scan build; statement 1 MATCHes PG\. The rest is a separate sort\-strategy record \(statement 2's
+      Incremental Sort\) for the next S9 pass, plus a cost\-only ledger row \(subquery boundary cpu\_tuple\_cost\)\.
+    - Pins: TestParallelHashIndexOnlyBuildIdentityWithSerial \(executor values\),
+      TestSetOpBranchDrivingKindAdmitsParallelHashSeqBuild \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24/24\), sf025 PASS=99, tpcds\-fireset
+      PASS \(Q23 fired, results byte\-identical\); TPC\-H 22/22 text\-identical; only Q23 changed\.
+  - Slice 3 plan \(done — see the slice 3 bullet above\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
+    customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
+    \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.
+- [x] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
+  UNION ALL's ordered GroupAggregates; goopg fully Sorts a plain Append** \(filed 2026\-10\-19 by the S9 pass at
+  4906691d7\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q23, category sort\-strategy, verdict SHAPE\-DIFF at depth 1 \(under Limit: PG Incremental Sort
+    \| goopg Sort\)\. Persists under PG statistics\. Census `analysis/m0146/m0146\-0014/routing\-20261019e/`\.
+  - S9 ranking: a three\-way tie at 1, all SF1 \(Q23 sort\-strategy, Q72 qual\-placement, Q77 join\-order\); Q23 has
+    the lowest id and the shallowest divergence\.
+  - PG: Limit → Incremental Sort \(Sort Key c\_last\_name, c\_first\_name, sum; Presorted Key c\_last\_name,
+    c\_first\_name\) → Merge Append \(Sort Key c\_last\_name, c\_first\_name\) → the two GroupAggregates, each over a
+    Sort on its group key\. goopg: Limit → Sort → Append over the same two GroupAggregates\.
+  - Branch estimates differ too: PG 173 \+ 126 = 299 rows, goopg 150 \+ 76 = 226 under PG statistics\.
+  - First step: on an SF1 PG\-statistics clone, check whether goopg's set\-operation rel offers an ordered
+    \(Merge Append\) path for a UNION ALL whose branches deliver the query's leading ORDER BY keys
+    \(generate\_orderedappend\_paths in allpaths\.c, over the branches' pathkeys\) and whether the upper sort stage
+    considers an incremental sort over a partially sorted input \(create\_ordered\_paths in planner\.c\)\. If both
+    exist, compare costs with PG's\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q23\), 82→83 on the shipped corpus and 94→95 under PG
+    statistics\.
+  - Note 2026\-10\-19: the owner's corpus reload \(95c0d0474\) made the shipped SF1 corpus carry PG statistics; the
+    record stands there \(SF1 94/99; Q23 still depth 1 sort\-strategy\)\. Expected instrument now SF1 match 94→95\.
+  - **Slice 1 PARKED 2026\-10\-19 — ESCALATED `[!]` on the tpcds\-fireset gate \(S9 \(5\)\(a\)\)\.** Design
+    `docs/design/0100\-0149/m0146\-0229\-ordered\-append\-incremental\-sort\.md` §3/§4; patch
+    `analysis/m0146/m0146\-0229/slice1\-ordered\-mergeappend\.patch` \(applies clean on a6636f6fc\+95c0d0474\)\.
+    - The slice: addOrderedAppendPaths offers generate\_orderedappend\_paths' Merge Append to the ordered stage, as\-is
+      or under an Incremental Sort; costSetOp's streaming arm adds cost\_append's per\-row overhead\. Three pins,
+      mutation\-checked\.
+    - Q23 does not flip yet: PG's arm is generated \(72528\.97\.\.72546\.65\) but the bounded full Sort costs 72545\.45,
+      because goopg's branches estimate 226 rows against PG's 299 \(semi join against the best\_ss\_customer CTE\)\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm \(24 MATCH\), sf025 PASS=99 all PASS\.
+      tpcds\-fireset FAILs twice on an introduced SF1 Q74 TIMEOUT\. Q74's plan is text\-identical \(costs stripped\)
+      and MATCHes PG; all other fired results are byte\-identical; direct timing on fresh clones is 543 s \(baseline\)
+      vs 522 s \(candidate\), outputs identical \(`analysis/m0146/m0146\-0229/q74\-timing/`\)\. Q74 straddles the
+      600 s FIRESET\_TIMEOUT\.
+    - Owner ask: a Q74 timeout pin, a raised FIRESET\_TIMEOUT, or a gate\-exceptions row\. Resume: `git apply` the
+      patch, re\-run the gates, commit\.
+    - Dropped from the slice and ledgered: pricing set\-op members through their Projects flips the PG\-oracle pin
+      TestParameterisedAppendOverUnionAll\.
+    - Next slice after the unblock: the branch row estimate \(design §5\)\.
+  - **UN\-PARKED 2026\-10\-19 by the owner \(OWNER DECISIONS 2026\-10\-19 \(b\)\): land slice 1\.** It ports PG's
+    generate\_orderedappend\_paths / create\_ordered\_paths logic; withholding it would leave goopg reaching PG's
+    plans by different logic\. Q74's runtime is not a rejection reason \(S9 \(5\)\(a\)\), and host timings are
+    unreliable at present \(owner\-side load outside WSL2\)\. The tpcds\-fireset gate now tolerates an
+    introduced SF1 Q74 timeout through the owner allowlist `scripts/tpcds\-fireset\-timeout\-allow\.tsv`
+    \(expires 2026\-11\-30\)\. Resume: `git apply analysis/m0146/m0146\-0229/slice1\-ordered\-mergeappend\.patch`,
+    re\-run the gates, commit\. Then M0146\-0229a\.
+  - **Slice 1 LANDED 2026\-10\-19** \(the parked patch applied unchanged on 80fc64342\)\. Design §3/§4\.1; evidence
+    `analysis/m0146/m0146\-0229/fireset3/`, `accept2`\.
+    - Gates: units, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025 PASS=99, tpcds\-fireset PASS \(Q74
+      finished inside the timeout this run, allowlist unused; 19 fired results byte\-identical; parity 97/94 held\)\.
+    - Q23 still SHAPE\-DIFF at depth 1: the Incremental Sort arm is generated but loses on goopg's 226\-row branch
+      estimate against PG's 299\. Next slice: that estimate \(design §5\)\. Then M0146\-0229a\.
+  - **Slice 2 LANDED 2026\-10\-20 \(loop \#31\): the semi join against a grouped CTE is examined as the CTE\.**
+    Design §7; evidence `analysis/m0146/m0146\-0229/slice2/`\.
+    - Cause: both branches' semi join against `best\_ss\_customer` \(GROUP BY c\_customer\_sk\)\. PG's
+      examine\_simple\_variable RTE\_CTE arm marks the lone group key isunique, so nd2 = 33333 and eqjoinsel\_semi
+      gives 0\.5732 \(173 of 302\)\. goopg's pulled sublink leaf never got derivedLeafUniqueCols, so nd2 = 200
+      \(default\) and the 0\.5 arm gave 150\.
+    - Change: tryPGShapedJoinSearch classifies a pulled derived leaf with derivedLeafUniqueCols, as it already
+      did for FROM\-clause derived leaves \(M0146\-0009e\)\.
+    - Result: SF1 Q23 branch rows 150/76→173/126 = PG; plan **MATCH** \(Incremental Sort over Merge Append\)\.
+      Every row estimate equals PG's; the remaining text difference is a Group Key parenthesisation
+      \(M0146\-0042 rendering\)\. SF0\.25 Q23 is still MATCH with a changed plan; fired Q23 results are
+      byte\-identical at both scales\.
+    - Pin: TestSemiJoinAgainstGroupedCTEUsesIsUnique \(600000 vs the default arm's 500000\), mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H
+      parity 22/22, sf025 PASS=99 \(changed=1, Q23\), tpcds\-fireset PASS \(SF0\.25 98/99, SF1 95→96\)\.
+    - Residual \(ledger\): the member projection charge \(design §5\)\.
+  Movement: yes — TPC\-DS SF1 match 95→96 \(Q23\)
+- [x] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
+  optimisation for its shape, or a goopg executor slowdown?** \(filed 2026\-10\-19 by the owner; placed in banner
+  item 3 directly after M0146\-0229 slice 1\)\.
+  Kind: recon
+  Movement: none — recon \(PG 18\.3 runs Q74 in 896 s on the identical plan; goopg 452 s; no mechanism to port\)
+  Parent: M0146\-0229
+  - Why: Q74's plan MATCHes PG \(text\-identical, costs stripped\), so the runtime gap is executor\-side\. It sits
+    on the 600 s FIRESET\_TIMEOUT and is provisionally allowlisted there; the allowlist row expires 2026\-11\-30\.
+  - Shape: the `year\_total` CTE \(UNION ALL of store\_sales and web\_sales grouped by customer and year\), scanned
+    four times in a self\-join, then ORDER BY \+ LIMIT 100\.
+  - Owner evidence 2026\-10\-19: **PG 18\.3 itself runs SF1 Q74 in 897 s** under EXPLAIN \(ANALYZE, BUFFERS\) on :65438
+    \(`analysis/m0146/m0146\-0229/q74\-timing/pg\-sf1\-q74\-explain\-analyze\.txt`; ANALYZE adds per\-node timing
+    overhead\)\. The time is in PG's own plan: the CTE Scans are estimated at rows=1 \(actual 37708 / 38252 / 11256 /
+    11153\), so three nested loops rescan the CTE tuplestore 37708 × 38252 times; the CTE build itself is ~3\.4 s\.
+    Plain execution \(no EXPLAIN\) on PG: **896 s**, 100 rows \(owner, 2026\-10\-19\)\.
+    goopg's 520\-560 s for the same plan is not slower than PG, so check first whether the recon reduces to "PG is
+    equally slow" \(compare plain\-execution runtimes on an idle host, and node by node\) before looking for a
+    mechanism\. PG's CTE Scan rescan reads its tuplestore in memory per loop \(nodeCtescan\.c CteScanRecheck /
+    tuplestore\_rescan\); compare goopg's per\-rescan cost there\.
+  - Method: EXPLAIN \(ANALYZE, BUFFERS\) on both engines on the reloaded SF1 corpus \(goopg on a private clone under
+    the cgroup cap, PG read\-only on :65438\); per\-node actual time and rows side by side\. Find the dominant
+    nodes, then attribute each gap: \(a\) a PG executor mechanism goopg lacks for this shape \(e\.g\. CTE Scan
+    tuplestore reading, HashAggregate / hash join batching and spilling, JIT is off on both, parallel workers in
+    the CTE, Memoize, tuple deform\); or \(b\) a goopg\-side cost \(per\-row allocation, datum copying,
+    numeric arithmetic, CTE re\-materialisation, GC under GOMEMLIMIT\)\. Profile goopg with pprof / perf on the clone\.
+    Host timings are unreliable at present: compare node ratios and CPU profiles, not wall clock alone\.
+  - Deliverable: findings in the design doc\. For EACH mechanism found, file an impl sub\-task
+    \(M0146\-0229b, \-0229c, …; `Parent: M0146\-0229`\) citing the PG executor code it ports or the goopg hot path it
+    removes, with expected instrument = SF1 Q74 runtime \(and the fire\-set allowlist row retired when Q74 clears
+    600 s with margin\)\. If nothing is found, close with `Movement: none — recon` and the evidence\.
+  - **CLOSED 2026\-10\-19: nothing found — PG is slower on the same plan\.** Design
+    `docs/design/0100\-0149/m0146\-0229\-ordered\-append\-incremental\-sort\.md` §6; evidence
+    `analysis/m0146/m0146\-0229/q74\-recon/`\.
+    - goopg EXPLAIN \(ANALYZE\) on a fresh SF1 clone: 452 s, PG's plan node for node; PG 896 s plain / 897 s under
+      ANALYZE\. Both estimate the four filtered CTE Scans at rows=1 \(actual 37708/38252/11256/11153\), so both nest
+      ≈1\.44×10⁹ bpchar comparisons\.
+    - CPU profile: 98% under the nested loop's join predicate; the 37 s on `textShapeAmbiguous` is the first touch
+      \(cache miss\) of each compared string, which the comparison itself would take — not a removable cost\.
+    - No impl sub\-task filed\. The SF1 Q74 fire\-set timeout is structural \(inherent to the PG\-identical plan\);
+      owner's call: keep the allowlist row past 2026\-11\-30 or raise FIRESET\_TIMEOUT for SF1\.
+- [x] **M0146\-0230 — join estimates: port eqjoinsel\_inner's MCV arm \(and neqjoinsel over it\); goopg estimates every
+  equality / `<>` join from ndistinct alone** \(filed 2026\-10\-19 by M0146\-0214 slice 3\)\.
+  Kind: impl
+  Movement: none — parity counts held \(SF0\.25 97/99, SF1 94/99\); fired\-query row estimates identical to PG 220→247/250 \(SF0\.25\), 170→195/203 \(SF1\)
+  Parent: M0146-0214
+  - Record: TPC\-DS SF0\.25 Q64, join\-order, SHAPE\-DIFF at depth 5\. Tour\-by\-tour against PG, the first large worth
+    gap is the cd2 join under `cd1.cd_marital_status <> cd2.cd_marital_status`: goopg 1536640 rows \(1 − 1/5\), PG
+    1536621 \(1 − eqjoinsel over the MCV lists\)\. Evidence `analysis/m0146/m0146\-0214/slice3/trace/`\.
+  - PG: `eqjoinsel_inner` \(selfuncs\.c\) with both MCV lists: matchprodfreq over matched pairs; otherfreq and
+    unmatchfreq spread over the ndistinct beyond each list; selectivity = min\(totalsel1, totalsel2\)\. goopg's
+    `eqJoinSelectivityExt` \(joinselectivity\.go\) is the no\-MCV branch only \(ledger 2026\-08\-04 M0127\-P5\.6\-a\)\.
+    `catalog.ColumnStats.MCV` carries the imported lists\.
+  - First step: port the MCV branch \(value equality by column type\) behind both\-sides\-have\-MCV, keep the no\-MCV
+    branch otherwise; pin with PG's numbers for a hand\-built pair of MCV lists; then census both corpora\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match counts at both scales \(and the Q64 tour worths\)\.
+  - **DONE 2026\-10\-19\.** Design `docs/design/0100\-0149/m0146\-0230\-search\-eqjoinsel\-mcv\.md`; evidence
+    `analysis/m0146/m0146\-0230/`\.
+    - The plan\-node estimator already had the MCV branch \(eqjoinselInnerMCV, take2 P1\-15\); its arithmetic is now
+      `eqjoinselInnerMCVCore`, shared by the search's `eqJoinSelectivityExt` \(taken first when both sides carry MCV
+      lists\)\. `<>` and the SEMI/ANTI clamp read it, as in PG\.
+    - Q64 tour 2: the cd2 join is now PG's 1536621 rows\. The next gap in that tour is merge\-join COST at equal rows
+      \(join with item: goopg startup 20675\.72 vs 18896\.82, total 106647\.34 vs 106969\.50\) → M0146\-0214\.
+    - Pin: TestSearchEqJoinUsesBothSidesMCVLists \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      sf025 PASS=99 \(8 plans changed text\), tpcds\-fireset PASS \(14 fired results byte\-identical\)\.
+- [x] **M0146\-0231 — subquery / inlined\-CTE leaves offer the join search one prebuilt path; PG's
+  set\_subquery\_pathlist offers every surviving path of the subquery's final rel** \(filed 2026\-10\-19 by M0146\-0214
+  slice 5\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF0\.25 Q64, join\-order, SHAPE\-DIFF at depth 5\. GEQO tour 14: PG files a partial Merge Join over
+    \(b 1 7 9 10 11 12 16\) ⋈ cs\_ui whose inner is cs\_ui's parallel\-safe, cs\_item\_sk\-ordered SubqueryScan path
+    \(0\.7225\.\.42006\.29\); its Gather Merge \(1003\.38\.\.6\.42e9\) is the joinrel's cheapest\. goopg's cs\_ui leaf has
+    only its cheapest plan \(13811\.71\.\.13815\.10, a Gather Merge inside, not parallel\-safe\) → serial 1\.98e10\.
+    Evidence `analysis/m0146/m0146\-0214/slice5/`\.
+  - PG: set\_subquery\_pathlist \(allpaths\.c\) builds a SubqueryScan path for each path of the subquery's
+    final\_rel \(pathkeys converted by convert\_subquery\_pathkeys; parallel\_safe carried\)\. goopg: the derived leaf
+    is one PathPrebuilt \(ctescanpathkeys\.go converts its pathkeys only\)\.
+  - First step: find where a derived / inlined\-CTE leaf's PathPrebuilt is built \(joinsearch\.go costSubplanLeaf
+    callers\) and whether the subquery's planning keeps its final rel's other paths \(cheapest parallel\-safe; cheapest
+    per pathkeys\); offer them as additional leaf paths, each planned to a Node only when chosen\.
+  - Expected instrument: TPC\-DS SF0\.25 PLAN\-PARITY match \(Q64\) once the GEQO pool order converges; tour 14's join
+    6 cheapest = PG's Gather Merge\.
+  - **Done 2026\-10\-19 \(slice 1\)\.** Design `docs/design/0100\-0149/m0146\-0231\-subquery\-leaf\-alt\-paths\.md`;
+    evidence `analysis/m0146/m0146\-0231/`\.
+    - Grouping paths carry create\_agg\_path's parallel\_safe \(make\_grouping\_rel's consider\_parallel\); the GROUP\_AGG
+      rel is recorded on planState; derived and inlined\-CTE leaves offer its surviving paths \(set\_subquery\_pathlist\);
+      a Gather\-holding leaf path is parallel\-unsafe and an inlined CTE takes the RTE\_SUBQUERY consider\_parallel arm\.
+    - add\_path\_precheck / add\_partial\_path\_precheck ported \(path\.go\) into all five serial and four partial join
+      producers, on initial costs \(hashJoinInitialCost, mergeJoinInitialCost, nliNestLoopInitialCost\)\. Without them
+      the new parallel\-safe leaf path let several tours go 68% cheaper than PG\.
+    - Instrument: SF0\.25 Q64 MATCH \(fire\-set SF0\.25 97→98\); Q64 GEQO tours equal to PG's 252→326 \(SF0\.25\),
+      258→262 \(SF1\)\. SF1 Q64 now diverges \(fire\-set SF1 95→94\): both builds reach PG's best tour \(eval 114\), but
+      after tour 262 goopg evaluates a second tour of equal worth \(eval 363\) PG never reaches → M0146\-0214\.
+    - Pins: m0146\_0231\_test\.go \(precheck and agg\-safety pins mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      sf025 PASS=99 \(only Q64's plan changed; 21 s→32 s on PG's plan, same ck\), tpcds\-fireset PASS \(fired Q64/Q77
+      byte\-identical\)\.
+    - Residual → M0146\-0232\.
+- [x] **M0146\-0233 — ineq\_histogram\_selectivity's cutoff clamp and get\_actual\_variable\_range** \(filed 2026\-10\-20 by
+  M0146\-0214 slice 6\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF1 Q64 GEQO eval 41, joinrel \(b 1 9 10\): store\_sales' merge start fraction is PG 9\.545e\-5 \(275
+    rows skipped\), goopg 7\.2e\-5 \(207\); startup 1446072\.92 vs 1184789\.15 with the PG sort currency\.
+  - PG \(selfuncs\.c ineq\_histogram\_selectivity\): unless the binary search touched an endpoint AND
+    get\_actual\_variable\_range found a usable btree index leading on the column \(have\_end\), the histogram
+    selectivity is clamped to \[0\.01/\(nvalues\-1\), 1 − that\]; with have\_end the endpoint is replaced by the index's
+    actual min/max\. goopg's histogramOpSelectivity applies neither \("Not ported" in its doc comment\)\.
+  - Scope: the clamp needs the column's index facts on every caller of histogramOpSelectivity \(restriction path
+    via resolveBaseColumn, OR arms, mergejoinscansel\) — sibling paths change together; the actual\-endpoint probe needs a
+    planner\-time btree first/last\-visible\-entry read\.
+  - Expected instrument: SF1 Q64 eval\-41 joinrel \(b 1 9 10\) startup = PG's; GEQO tours equal to PG's beyond 262\.
+  - **LANDED 2026\-10\-20 \(loop \#32\)\.** Design `docs/design/0100-0149/m0146-0233-actual-variable-range.md`; evidence
+    `analysis/m0146/m0146\-0233/`\.
+    - nbtree ScanFromEnd \(\_bt\_endpoint backward\); executor ActualVariableEndpointProbe / ActualVariableRange
+      \(non\-null leading key, all\-visible or not dead\-to\-all heap tuple, VISITED\_PAGES\_LIMIT; btree, non\-partial,
+      plain leading column, own collation, default opclass, DESC answers from the other end\); catalog
+      ActualVariableRangeFunc wired by initdb\.
+    - histogramOpSelectivity is PG's binary search with endpoint refresh, have\_end and the 0\.01/\(n−1\) cutoff;
+      no histogram gives scalarineqsel's 0\.5\. Probes reach the restriction path \(own base table only\), the OR and
+      range arms, and mergejoinscansel \(joinVarStats\.probe\)\.
+    - End to end vs PG on a stale histogram: id \> 15000 selectivity 0\.005 = PG's 0\.00495 \(was clamped to 1
+      row\)\. Row counts still differ by estimate\_rel\_size's page scaling → M0146\-0237\.
+    - Fire set: parity 98/99 and 96/99 held; Q13 and Q48 changed plans with results identical\. Row\-estimate census:
+      queries with every estimate equal to PG's SF0\.25 86→87, SF1 85→86 \(Q48\); nodes 2536→2539 / 2603→2606\.
+    - Pins: TestInequalityEstimateReadsActualIndexEndpoints \(postmaster\), TestHistogramOpSelectivityActualEndpoints,
+      TestScanFromEndVisitsEntriesInReverseKeyOrder, and the updated TestHistogramOpSelectivityEqSel\.
+      Mutation\-checked \(hook unwired, have\_end ignored\)\.
+    - Gates: units, internal/postmaster, nbtree \-race, TestPort\_RegressSuite, TestPort\_Isolation\*,
+      tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22, sf025 PASS=99 \(changed Q13 Q48\), tpcds\-fireset PASS\.
+    - Residuals \(ledger\): aborted\-inserter visibility in the probe, a per\-call btree open, no indisvalid check\.
+  Movement: none — parity held; estimate\-identical queries SF0\.25 86→87, SF1 85→86 \(Q48\)
+- [x] **M0146\-0237 — estimate\_rel\_size: scale a stale reltuples by the relation's current page count** \(filed
+  2026\-10\-20 by M0146\-0233\)\.
+  Kind: impl
+  Parent: M0146-0233
+  - Record: after ANALYZE of 10000 rows and 10000 more inserted \(autovacuum off\), PG estimates a scan of the
+    table at 19778 rows; goopg keeps reltuples, 10000\. Every estimate on the table is halved
+    \(`analysis/m0146/m0146\-0233/endpoint\-probe\-pg\-vs\-goopg\.txt`\)\.
+  - PG \(plancat\.c estimate\_rel\_size → table\_block\_relation\_estimate\_size\): curpages =
+    RelationGetNumberOfBlocks; with relpages \> 0 the density is reltuples / relpages, and tuples = rint\(density ×
+    curpages\)\. goopg applies its page\-based fallback only to never\-analysed relations \(relsize\.go
+    applyRelSizeFallback\)\.
+  - Scope: every reader of a base rel's tuples \(baseRelInfo\.baseRows, EstimateRows of a scan, the cost
+    functions\); sibling paths change together\.
+  - Expected instrument: shipped corpora are unaffected \(relpages = actual pages\); the plan instruments move only
+    on tables changed since ANALYZE\. Pin against PG on the same stale\-statistics workload\.
+  - **LANDED 2026\-10\-20 \(loop \#33\)\.** Design `docs/design/0100-0149/m0146-0237-estimate-rel-size-scaling.md`;
+    evidence `analysis/m0146/m0146\-0237/`\.
+    - liveRelSize \(relsize\.go\) is estimate\_rel\_size for an analysed table with a stored page count: pages =
+      curpages, tuples = rint\(reltuples / relpages × curpages\)\. It is fed by catalog\.RelationBlocksFunc \(initdb;
+      storage CachedNBlocks, no syscall for an open fork\)\. tableRows, baseRelPages and the direct RowCount readers go
+      through it\.
+    - Sibling fix: ResolvedNDistinct resolves the form StaDistinct reports \(relative once the fraction exceeds
+      0\.1\), so a key column's distinct count scales with rel\-\>tuples as PG's does\.
+    - Result: the stale\-statistics workload matches PG's EXPLAIN line for line, costs included \(19778 rows /
+      286\.78; id \< 9500 18788\)\. Shipped corpora unchanged \(sf025 same=99, SF1 fired none, TPC\-H 22/22, acceptance
+      identical\)\.
+    - Pin: TestInequalityEstimateReadsActualIndexEndpoints now asserts PG's exact lines; mutation\-checked
+      \(liveRelSize off → 50 rows; old ResolvedNDistinct order → 18787\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, TPC\-H parity 22/22 \(audit arm moved to 5586: the owner's SF1 corpus rebuild held 5582\)\. On the corpora
+      the owner rebuilt and swapped in at 11:44/11:49: sf025 PASS=99, 61 ck\-verified \(15 shapes changed against
+      the pre\-rebuild sweep, the corpus's doing\); tpcds\-fireset A/B PASS, no query changed, 98/99 and 96/99\.
+    - Re the owner's note on bb7b36ceb \(a dirty\-tree sweep at 11:54 ERRORed Q34/Q64/Q75 after 102/209/172 s\): the same
+      staged code swept the rebuilt corpus at 12:12 with Q34 PASS 0\.23 s, Q64 PASS 37 s and Q75 PASS 0\.9 s, all
+      ck\-matched \(`bench/tpcds/runtime_goopg/tpcds\-results\-sf025/sweep\-20261020\-121227\.txt`\)\. At 11:54 this
+      loop's three Q64 EXPLAIN timing servers were running in the same goopg\-workloads memory slice, so the
+      errors are attributed to that contention, not the code\.
+    - Note: the first fire\-set baseline failed SF0\.25 Q64's EXPLAIN on the capture's 120 s timeout\. Q64 plans in
+      40\-235 s on every binary, pre\-0233 included \(ledger\)\.
+  Movement: none — instrument artefact: the shipped corpora have relpages = actual pages, so no plan instrument can see the scaling; a stale\-statistics workload now matches PG line for line
+- [x] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
+  2026\-10\-20 by M0146\-0214 slice 6\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - Record: TPC\-DS SF1 Q64 GEQO eval 41\.
+    - Join 2 \(b 1 9 10\): goopg sorts store\_sales as a disk sort \(1190592\) where PG's is in memory \(389568\)\.
+    - Join 9: goopg's partial merge costs 6\.32e10 \(PG 6\.20e10\); the outer Sort's backed\-out width is about 664 \(PG
+      about 96\), so goopg's partial hash survives add\_partial\_path where PG's fuzz\-equal merge with better pathkeys
+      drops it\.
+  - PG \(costsize\.c cost\_tuplesort\): input\_bytes = relation\_byte\_size\(tuples, pathtarget\->width\)\. goopg prices with
+    hashsize\.EntryBytes unless GOOPG\_PG\_SORT\_RELATION\_BYTES\_COST=1 \(R113, held default\-off by M0139\-0007a on
+    2026\-09\-15 for zero measured movement\)\. With the flag, the store\_sales Sort is PG's exactly \(389568\.13\.\.396768\.01\),
+    but a joinrel's width is still unnarrowed\.
+  - First step: re\-measure R113 default\-on on the fire\-set and the SF1 Q64 eval list; then the joinrel reltarget width
+    feeding pathWidth for sort inputs\.
+  - Expected instrument: fire\-set match counts; SF1 Q64 GEQO tours equal to PG's beyond 262\.
+  - **Slice 1 2026\-10\-20\.** Design `docs/design/0100\-0149/m0146\-0234\-sort\-byte\-currency\-and\-stats\-widths\.md`;
+    evidence `analysis/m0146/m0146\-0234/`\.
+    - R113 default\-on \(cost\_tuplesort's relation\_byte\_size; "0" opts out\); the grouping sort seed carries the
+      narrowed PG width \(aggInputPGWidth\); relNarrowedWidths sums each kept column's ANALYZE AvgWidth
+      \(set\_rel\_width's get\_attavgwidth\) instead of the type width\. Join 9's Sort width 664→155 \(PG ≈96\)\.
+    - SF1 Q64 GEQO evals before the first differing tour with worth off >1e\-3: 14→6 \(>1e\-4: 33→29; eval 41
+      0\.0075→0\.00098, eval 90 0\.0061→6\.6e\-7\)\. Fire\-set 98/94 and TPC\-H parity 22/22 unchanged; only SF1 Q64's plan
+      changed \(still divergent, depth 4→5; fired result byte\-identical\)\.
+    - Pins: TestRelNarrowedWidthsNarrowsToNeededColumns asserts the stawidth sum \(mutation\-checked\);
+      TestSortSeedNarrowsWithTheAggregate / TestCostWindowPresortedCreditIsInertAtZero updated for the PG currency\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity capture 22/22, sf025 PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(off >1e\-3: 14→6\), no match count moved\.
+    - Next: build\_joinrel\_tlist's attr\_needed narrowing — a joinrel keeps an attribute only while a relation outside
+      it needs it; goopg's NeededCols is one statement\-wide name set \(join 9: 155 vs PG 96\)\. Then non\-table leaves'
+      widths from the subquery target list \(set\_subquery\_size\_estimates\)\.
+  - **Slice 2 2026\-10\-20: joinrel target after build\_joinrel\_tlist\.** Design §8; evidence
+    `analysis/m0146/m0146\-0234/slice2/`\.
+    - joinrelNarrowedWidths \(computed at joinrel creation\): keep = outputCols ∪ names read by clauses reaching past the
+      joinrel; the triple sums the published base members' kept columns \(SEMI/ANTI RHS excluded\);
+      narrowJoinWidths stamps it on every path of the rel\. Declines to the children's sum when ineligible\.
+    - SF1 Q64: join 9's outer Sort width 155→99–103 \(PG 96\); evals before the first differing tour off >1e\-3:
+      1→0, max error 0\.0046→0\.00067 \(eval 173 0\.0046→0\.00022, eval 41 0\.00098→0\.00012\)\. Two worth\-order
+      inversions remain \(evals 96/138, 159/248, ~1e\-5 errors\)\. Fire\-set 98/94 and TPC\-H 22/22 unchanged; no fired
+      plan change\.
+    - Pin: TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove \(mutation\-checked\)\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm \(values identical\),
+      TPC\-H parity 22/22, sf025 PASS=99, tpcds\-fireset PASS\.
+    - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(max error 0\.0046→0\.00067\)\.
+    - Remaining \(task stays open\): base rels narrow to the statement\-wide set \(PG's base reltarget drops columns read
+      only by the rel's own restriction quals\); non\-table leaves use type widths\.
+  - **Slice 3 2026\-10\-20 \(loop \#36\): the base rel target, after build\_base\_rel\_tlists\.** Design §9; evidence
+    `analysis/m0146/m0146\-0234/slice3/`\.
+    - attrNeededAbove \(factored from joinrelNarrowedWidths\) gives a base rel's keep set: above\-tree names plus columns
+      of clauses reaching another rel; baseRelNarrowedWidths stamps it \(an empty reltarget keeps the statement\-wide
+      set\)\. Restriction\-only columns no longer count in a base rel's cost width\.
+    - Measured inert: fire\-set SF0\.25/SF1 plans text\-identical with costs; TPC\-H 22/22; sf025 same=99\. The joins above
+      already price with the slice\-2 target, small hash builds are one batch, EXPLAIN widths are unnarrowed\.
+    - Pin: TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22,
+      sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+    - Movement: none — instrument artefact: no captured plan or cost reads a base rel's width on these corpora\.
+    - Remaining \(task stays open\): non\-table leaves' widths from the subquery target list
+      \(set\_subquery\_size\_estimates / set\_cte\_size\_estimates\)\.
+  - **Slice 4 2026\-10\-20 \(loop \#37\): derived leaves' widths, and closure\.** Design §10; evidence
+    `analysis/m0146/m0146\-0234/slice4/`\.
+    - derivedLeafColumnWidth / subqueryVarWidth: a subquery output that is a plain Var takes its base attribute's
+      stawidth \(set\_subquery\_size\_estimates\); expressions, set operations, materialized CTEs and stat\-less columns
+      keep the type default; an inlined CTE answers as a subquery\.
+    - Measured inert: fire\-set plans text\-identical with costs \(SF0\.25 1882/2572, SF1 1951/2611 cost\-equal nodes,
+      unchanged\); TPC\-H 22/22; sf025 same=99\.
+    - Pin: TestDerivedLeafColumnWidthFollowsSubqueryVars\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22,
+      sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+    - Closure: the record \(SF1 Q64 GEQO eval 41\) is stale, since SF1 Q64 has matched PG since M0146\-0214 closed
+      \(d1446d972\); every item named here has landed\.
+  Movement: none — record stale: SF1 Q64 has matched since M0146\-0214; slices 3–4 are fidelity ports no capture reads
+- [x] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
+  2026\-10\-19 by M0146\-0231\)\.
+  Kind: impl
+  Parent: M0146-0214
+  - PG: set\_subquery\_pathlist also files the final rel's partial paths \(when the rel considers parallel\), and offers
+    the final rel's paths for EVERY subquery — join\-only bodies and bodies with ORDER BY / DISTINCT / window above
+    the grouping included\. goopg offers alternatives only for a grouped body reached through
+    Filter/Project/SubqueryScan/inlined CTEScan wrappers \(subqueryLeafAggregate\)\.
+  - Also: the precheck reads the pathlist in goopg's producer order; PG's add\_paths\_to\_joinrel order is
+    sort\_inner\_and\_outer, match\_unsorted\_outer, hash\_inner\_and\_outer — audit where goopg's order differs\.
+  - First step: a census of fired TPC\-DS queries whose divergence sits under a SubqueryScan / inlined CTE leaf
+    with no grouped body \(first\-divergence parent chain\)\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match count on the queries that census names\.
+  - **Done 2026\-10\-20 \(slice 1\) — CLOSED\.** Design
+    `docs/design/0100\-0149/m0146\-0232\-inlined\-cte\-rescan\-and\-material\.md`; evidence `analysis/m0146/m0146\-0232/`\.
+    - Census: SF1 Q13 \(join order\), SF1 Q72 \(qual placement\) and SF0\.25 Q77 c0 diverge outside any subquery leaf\.
+      The only divergence under one is Q77's c1 branch \(grouped inlined CTE `cr`\)\. No record needs a subquery
+      partial path or an ungrouped\-subquery alternative\.
+    - Q77 c1: an inlined CTE reference is PG's T\_SubqueryScan \(inline\_cte\)\. isTuplestoreScanNode and
+      nodeMaterializesOutput now answer `!Inlined\(\)` for a CTEScan, so rescans re\-execute the body and
+      match\_unsorted\_outer's Material wins, as in PG\.
+    - A MaterialPath's child keeps the CP\_SMALL\_TLIST regime \(subqueryStripTlistReset gains a Materialize arm\), so
+      `Subquery Scan on cr` renders\. A merge join's make\_material \(Path\.mergeJoinMaterial →
+      Materialize\.mergeJoinInner\) does not reset it: Q58's ws\_items and Q78's cs still strip\.
+    - Instrument: SF0\.25 Q77 CATEGORIES\-EXCL\-MATCH scan\-type 1 → 0 \(within ±3\); match 98 → 98\. SF1 Q77's c1 now
+      matches, and its first divergence moves to the pre\-existing c2 web branch \(Merge vs Hash Left Join\); SF1
+      96 → 96\. TPC\-H 22/22\.
+    - Pin: TestInlinedCTEInnerIsMaterialized \(both halves mutation\-checked\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 same=98 \(Q77 changed\), tpcds\-fireset PASS\.
+    - Not done \(ledgered\): subquery partial paths, ungrouped\-subquery alternatives and the producer\-order audit, none
+      of which a fired record needs\.
+  Movement: none — SF0\.25 Q77 scan\-type 1 → 0 is inside ±3; match counts 98/99 and 96/99 unchanged
+- [x] **M0146\-0240 — join\-method: TPC\-DS SF1 Q77 web branch — PG Merge Left Joins the ws and wr CTEs; goopg Hash
+  Left Joins them, and sorts a merge join's output that already carries the group key's order** \(filed 2026\-10\-20
+  by the S9 pass at cdb6a4513\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q77, category join\-method, verdict SHAPE\-DIFF at depth 5 \(Append c2: PG Merge Left Join \|
+    goopg Hash Left Join\)\. Census: the M0146\-0232 fire\-set captures on HEAD's code tree,
+    `analysis/m0146/m0146\-0232/fireset/`\.
+  - S9 ranking \(SF0\.25 98/99, SF1 96/99, TPC\-H 22/22\): join\-method 2 \(SF1 Q13, SF1 Q77\), sort\-strategy 1
+    \(SF0\.25 Q77\), qual\-placement 1 \(SF1 Q72\)\. Q77 is chosen over Q13 because it has the shallower divergence and
+    shares its probable cause with SF0\.25 Q77; Q13's ca/store order follows row\-estimate differences under the
+    customer\_address filter\.
+  - Inside ws, goopg plans Partial GroupAggregate → Sort \(wp\_web\_page\_sk\) → Merge Join \(ws\_web\_page\_sk =
+    wp\_web\_page\_sk\); PG feeds the Partial GroupAggregate straight from the Merge Join, whose output order already
+    satisfies the group key through the equivalence class\. The extra Sort makes ws 24863\.27 against PG's 24859\.35\.
+  - SF0\.25 Q77 c0 \(sort\-strategy\) has the same shape: Sort \(store\_1\.s\_store\_sk\) above Merge Join
+    \(sr\_store\_sk = store\_1\.s\_store\_sk\)\. goopg's inner Sort also reports 31 rows over an 18\-row partial input
+    \(PG 18\)\.
+  - First step: on a private SF0\.25 clone, EXPLAIN the sr CTE alone and check the partial merge join's pathkeys as
+    the partial grouping stage sees them \(create\_partial\_grouping\_paths: pathkeys\_contained\_in\(group\_pathkeys,
+    path\->pathkeys\) over the canonical EC pathkey\)\. Then check the inner Sort's row count\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match, SF0\.25 98→99 and SF1 96→97, if the web branch then elects
+    PG's Merge Left Join\.
+  - **Slice 1 LANDED 2026\-10\-20: the partial aggregate reads a presorted partial path\.** Design
+    `docs/design/0100\-0149/m0146\-0240\-partial\-agg\-presorted\-input\.md`; evidence `analysis/m0146/m0146\-0240/`\.
+    - make\_ordered\_path's first test for the cheapest partial path: pseed keeps the partial path's validated pathkeys,
+      renamed through the searched rel's equivalence classes to the group keys \(canonicalPartialInputKeys\)\.
+      orderedPartialInput skips the worker Sort in the sorted\-input split, the partial Group arm and the R56 Gather
+      Merge arm\. createFinalizeAggSortedPlan and splitAggregateTransportSortedInput accept the Sort\-less input\.
+    - Instrument: TPC\-DS SF0\.25 match 98 → 99/99 \(Q77; all categories 0\)\. SF1 96 → 96: ws and wr now cost exactly
+      PG's, but the web branch still elects Hash Left Join 29549\.08 over PG's Merge Left Join 29548\.61\. TPC\-H 22/22,
+      plans unchanged\.
+    - Pin: TestPartialAggOverPresortedPartialJoin \(PG\-anchored shape plus values; two mutations fail it\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 same=98 \(Q77\), tpcds\-fireset PASS\.
+    - Next \(slice 2\): does goopg file the Merge Left Join of the ws and wr leaves at all? Instrument addPath on that
+      joinrel on an SF1 clone, then compare its cost with PG's 29514\.15\.\.29548\.61\.
+  - **Slice 2 LANDED 2026\-10\-20 — CLOSED: a sorted aggregate over an EC\-ordered input keeps its order\.** Design §5;
+    evidence `analysis/m0146/m0146\-0240/slice2/`\.
+    - The Merge Left Join was filed but sorted both inputs: wr's GroupAggregate \(group key wp\_web\_page\_sk\) reads a
+      Gather Merge ordered by wr\_web\_page\_sk, the same EC, and the emission twins compared the keys syntactically\.
+    - Aggregate\.GroupInputKeys records the EC member the presorted\-seed and searched\-candidate arms proved;
+      groupKeyOrderedBy is the shared test of aggregateEmissionPathkeys and groupingEmissionPathkeys\. The upper
+      narrowing pass remaps the field \(or drops it\), and the field\-inventory pin lists it\.
+    - Repro: Merge Left Join 29514\.15\.\.29549\.06 \(PG \.\.29548\.61\)\. The 0\.45 left is cost\_subqueryscan's
+      trivial\_pathtarget exemption, measured on :65438 by reordering the select list \(ledgered\)\.
+    - Pin: TestGroupAggOverECOrderedInputKeepsItsOrder \(mutation\-checked\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 96→97 and SF0\.25 match 98→99 \(Q77\)
+- [x] **M0146\-0241 — join\-method: TPC\-DS SF1 Q13 — a range pair inside an OR join clause's arm is multiplied, not paired**
+  \(filed 2026\-10\-20 by the S9 pass at 4e0c4e8c1\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q13, category join\-method, verdict SHAPE\-DIFF at depth 6 \(PG Nested Loop over the
+    customer\_address probe \| goopg Hash Join with store first\)\. Census: the M0146\-0240 slice\-2 fire\-set captures on
+    HEAD's code tree, `analysis/m0146/m0146\-0240/slice2/fireset/`\.
+  - S9 ranking \(SF0\.25 99/99, SF1 97/99, TPC\-H 22/22\): join\-method 1 \(SF1 Q13\), qual\-placement 1 \(SF1 Q72\); Q13
+    has the lower id and the shallower divergence\.
+  - Diagnosis \(SF1 clone vs :65438\): restriction estimates on customer\_address are identical, and so is each single
+    `ca\_state IN … AND ss\_net\_profit BETWEEN …` arm \(11520 rows over store\_sales ⋈ customer\_address\)\. The OR of two
+    such arms, a JOIN clause, estimates 31665 against PG's 16054, and the three\-arm OR 80704 against 28320\.
+  - PG: clause\_selectivity\_ext prices an OR arm \(an AND\) through clauselist\_selectivity\_ext, which pairs the
+    same\-variable bounds of `ss\_net\_profit >= a AND ss\_net\_profit <= b` into one range \(addRangeClause:
+    hibound \+ lobound − 1 \+ null fraction\)\. goopg's orArmSelectivity multiplies the two bounds independently\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q13\), 97 → 98\.
+  - **Done 2026\-10\-20 — CLOSED\.** Design `docs/design/0100\-0149/m0146\-0241\-or\-arm\-range\-pairing\.md`; evidence
+    `analysis/m0146/m0146\-0241/`\.
+    - orArmSelectivity groups single\-side inequality bounds by variable \(orArmRangeBound\) and completes each as
+      clausesel\.c does \(orArmRangeSelectivity: hi \+ lo − 1 \+ null fraction, DEFAULT\_RANGE\_INEQ\_SEL for a guessed
+      bound, the roundoff clamps\)\.
+    - The two\- and three\-arm ORs now estimate PG's 16054 and 28320; SF1 Q13 MATCHes \(82716\.26 both\)\. TPC\-H Q19's OR
+      join estimates PG's 47 rows \(was 71\), plan still MATCH\.
+    - Pin: TestORJoinClauseArmPairsRangeBounds \(PG row estimates 743 and 1940; mutation\-checked\)\. The file avoids an
+      `\_arm\_test\.go` name, which Go reads as a GOARCH constraint\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 \(Q13 changed, still MATCH\), tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 97→98 \(Q13\)
+- [x] **M0146\-0242 — qual\-placement: TPC\-DS SF1 Q72 — a nested loop over a parameterised inner keeps an equivalence
+  clause the inner already enforces** \(filed 2026\-10\-20 by the S9 pass at 1bb99c7a1\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q72, category qual\-placement, verdict SHAPE\-DIFF \(the item probe's Nested Loop: goopg
+    `Join Filter: \(catalog\_sales\.cs\_item\_sk = item\.i\_item\_sk\)` over `Index Cond: \(i\_item\_sk = inventory\.inv\_item\_sk\)`;
+    PG no Join Filter over `Index Cond: \(i\_item\_sk = catalog\_sales\.cs\_item\_sk\)`\)\. Census: the M0146\-0241 fire\-set
+    captures on HEAD's code tree, `analysis/m0146/m0146\-0241/fireset/`\.
+  - S9 ranking \(SF0\.25 99/99, SF1 98/99, TPC\-H 22/22\): qual\-placement 1 \(SF1 Q72\) is the only open record\.
+    M0146\-0194 closed SF0\.25 Q72 as a PG\-internal near\-tie; SF0\.25 Q72 now matches\.
+  - PG: the EC \{cs\_item\_sk, inv\_item\_sk, i\_item\_sk\} is enforced once\. create\_nestloop\_path drops every
+    restrict clause join\_clause\_is\_movable\_into the parameterised inner, and generate\_join\_implied\_equalities\_normal
+    takes the first best\-scoring outer member in EC order \(cs\_item\_sk\)\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q72\), 98 → 99\.
+  - **Done 2026\-10\-20 — CLOSED\.** Design
+    `docs/design/0100\-0149/m0146\-0242\-nestloop\-one\-clause\-per\-equivclass\.md`; evidence `analysis/m0146/m0146\-0242/`\.
+    - The joinrel's clause list held every member pair of the class, so each item probe left the sibling it did not
+      enforce as a Join Filter; the inventory probe \(cheaper per scan by loop\_count\) won with
+      `cs\_item\_sk = i\_item\_sk` as its filter\.
+    - nestloopResidualClauses reduces its input with oneClausePerEquivClass before the identity drop: the cs\-keyed
+      probe is filterless, the inventory\-keyed one keeps `i = cs`, and PG's probe wins\. A first attempt that dropped
+      every sibling made both filterless and was replaced\.
+    - Pins: TestNLIResidualKeepsOneClausePerEquivClass \(unit, mutation\-checked\);
+      TestNestLoopKeepsOneEquivClassClausePerJoin \(PG\-anchored shape guard, both directions\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 98→99 \(Q72\)

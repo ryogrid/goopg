@@ -1,0 +1,6 @@
+Index Scan using ep_pkey on ep  (rows=1978 width=8)   ||   Index Scan using ep_pkey on ep  (rows=1978 width=8)
+Index Scan using ep_pkey on ep  (rows=98 width=8)   ||   Index Scan using ep_pkey on ep  (rows=98 width=8)
+Index Scan using ep_pkey on ep  (rows=1 width=8)   ||   Index Scan using ep_pkey on ep  (rows=1 width=8)
+Seq Scan on ep  (rows=8475 width=8)   ||   Seq Scan on ep  (rows=8475 width=8)
+Index Scan using ep_pkey on ep  (rows=988 width=8)   ||   Index Scan using ep_pkey on ep  (rows=987 width=8)
+Seq Scan on ep  (rows=19778 width=8)   ||   Seq Scan on ep  (rows=19778 width=8)

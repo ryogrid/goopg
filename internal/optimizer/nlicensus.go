@@ -35,6 +35,7 @@ package optimizer
 // needs.
 
 import (
+	"sync"
 	"fmt"
 	"os"
 	"strings"
@@ -91,13 +92,19 @@ const (
 
 // sublinkRouteCounts is noteSublinkRoute's test-visible twin: bumped on
 // every call, env gate or not, so a unit test can pin which route planned a
-// statement without scraping stderr. This package's tests do not run
-// parallel, so a plain map suffices.
-var sublinkRouteCounts = map[string]int{}
+// statement without scraping stderr. Sessions plan concurrently, and two
+// unsynchronised writers to one map are a fatal runtime error, so the bump
+// takes sublinkRouteMu (P0-E8); tests read the map single-threaded.
+var (
+	sublinkRouteMu     sync.Mutex
+	sublinkRouteCounts = map[string]int{}
+)
 
 // noteSublinkRoute records which route planned one statement's WHERE sublinks.
 func noteSublinkRoute(route string) {
+	sublinkRouteMu.Lock()
 	sublinkRouteCounts[route]++
+	sublinkRouteMu.Unlock()
 	if !nliCensusEnabled {
 		return
 	}

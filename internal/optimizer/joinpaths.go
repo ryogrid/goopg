@@ -101,7 +101,10 @@ func splitJoinClauses(outer, inner RelSet, clauses []*restrictInfo) (keys, resid
 		if ri == nil {
 			continue
 		}
-		if isKeyableFor(ri, outer, inner) {
+		// M0146-0224: a pushed-down restriction is never a hash or merge
+		// clause (hash_inner_and_outer / select_mergejoin_clauses skip
+		// RINFO_IS_PUSHED_DOWN at an outer join).
+		if !ri.pushedDown && isKeyableFor(ri, outer, inner) {
 			keys = append(keys, ri)
 			continue
 		}
@@ -414,11 +417,15 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// PG-specific refinement, never wrong). See jointypeForDirection's
 	// contract note above.
 	mergeDeclined := jt == parser.JoinSemi || jt == parser.JoinAnti
+	// M0146-0224: the unique-inner and semi/anti factor tests read the join
+	// quals only; the pushed-down restrictions stay in `clauses` for the
+	// producers to price.
+	joinQuals := joinQualsOnly(clauses)
 	// M0145-0008l: PG computes the semi/anti factors once per pair
 	// (add_paths_to_joinrel → compute_semi_anti_join_factors) and every
 	// nested-loop candidate for the pair reads them. `jt` is already
 	// demoted to INNER when a side is unique-ified, as in PG.
-	semi := s.semiAntiJoinFactorsFor(outer, inner, jt, clauses)
+	semi := s.semiAntiJoinFactorsFor(outer, inner, jt, joinQuals)
 	// M0146-0005dk: add_paths_to_joinrel's JOIN_UNIQUE_INNER arm —
 	// `extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
 	// outerrel->relids)`: the unique-ified RHS is unique relative to an LHS
@@ -428,7 +435,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	uniqInnerUnique := uniq == uniqueSideInner && sjinfo != nil &&
 		relsSubset(sjinfo.MinLefthand, outer.Relids)
 	if uniqInnerUnique {
-		semi = s.semiAntiJoinFactorsFor(outer, inner, parser.JoinSemi, clauses)
+		semi = s.semiAntiJoinFactorsFor(outer, inner, parser.JoinSemi, joinQuals)
 	}
 	// M0146-0005dy: the unique-ified side's path, for the arms that take
 	// their inputs from the rels' path lists rather than through
@@ -437,7 +444,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// path (sort_inner_and_outer :1406-1418, match_unsorted_outer
 	// :1881-1890, consider_parallel_nestloop :2171-2178). Reading the raw
 	// side instead joins every duplicate of the semi join's RHS.
-	mu := mergeUnique{side: uniq, innerUnique: s.extraInnerUnique(outer, inner, jt, clauses, uniq, sjinfo)}
+	mu := mergeUnique{side: uniq, innerUnique: s.extraInnerUnique(outer, inner, jt, joinQuals, uniq, sjinfo)}
 	switch uniq {
 	case uniqueSideOuter:
 		mu.path = createUniquePath(outer, outer.CheapestTotal, sjinfo, cp)
@@ -451,8 +458,8 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 	// match_count = the inner's rows). A unique-ified pair is left alone: PG
 	// computes its factors with the SEMI SpecialJoinInfo.
 	if !semi.apply && innerUniqueJoinType(jt) && uniq == uniqueSideNone &&
-		s.innerRelProvenUnique(outer, inner, clauses, true) {
-		frac, matchCount := s.innerUniqueMatchFactors(inner, clauses)
+		s.innerRelProvenUnique(outer, inner, joinQuals, true) {
+		frac, matchCount := s.innerUniqueMatchFactors(inner, joinQuals)
 		semi = semiAntiJoinFactors{apply: true, outerMatchFrac: frac, matchCount: matchCount}
 	}
 
@@ -536,7 +543,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 				mergeTuplesFor := func(mc []*restrictInfo) float64 {
 					return s.mergeJoinTuples(mc, outer.Rows, inner.Rows)
 				}
-				scanSelFor := func(mc []*restrictInfo) (float64, float64) {
+				scanSelFor := func(mc []*restrictInfo) mergeScanSel {
 					return s.mergeJoinScanSel(mc, outer.Relids)
 				}
 				sortInnerAndOuter(s, joinrel, outer, inner, cp, jt, innerUnique, mkeys, mres, mergeTuplesFor, scanSelFor, paramSrc, mu)

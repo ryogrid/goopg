@@ -608,6 +608,14 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 	// nullable side. 03 §3's coverage rule, which is a different predicate
 	// from the connectivity gate above.
 	clauses := s.clauses.buildJoinRelRestrictList(rel1.Relids, rel2.Relids, sjinfo)
+	// M0146-0224: the joinrel that completes every outer join a delayed
+	// WHERE conjunct reads carries it as a pushed-down restriction
+	// (build_joinrel_restrictlist keeps such a clause in the joinrel's
+	// restrictlist; RINFO_IS_PUSHED_DOWN marks it).
+	pushed := len(s.pushedDown) > 0 && joinrelids == s.pushedDownRelids
+	if pushed {
+		clauses = append(append(make([]*restrictInfo, 0, len(clauses)+len(s.pushedDown)), clauses...), s.pushedDown...)
+	}
 
 	joinrel := s.findRel(joinrelids)
 	// Recorded BEFORE the find-or-create branch, so the `created` bit says
@@ -627,6 +635,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			rows = 1
 		}
 		joinrel = newRelOptInfo(joinrelids, rows, width)
+		joinrel.pricedPushedDown = pushed
 		joinrel.usefulKeys = s.pathkeyUsefulnessFor(joinrelids)
 		// M0146-0185: canonical pathkeys, only where no special join can
 		// null-extend a class member (the same gate as ecReduce).
@@ -634,6 +643,10 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			joinrel.pathkeyClass = joinrel.usefulKeys.equivalentWithin
 		}
 		joinrel.memberRels = append(append([]*RelOptInfo(nil), rel1.baseMembers()...), rel2.baseMembers()...)
+		joinrel.publishedMembers = append([]*RelOptInfo(nil), rel1.publishedBaseMembers()...)
+		if joinPublishesInner(sjinfo) {
+			joinrel.publishedMembers = append(joinrel.publishedMembers, rel2.publishedBaseMembers()...)
+		}
 		// take2 P4-01 rev 10 step 1: a join rel is built during the search,
 		// after s.neededCols is published, so it takes the set directly.
 		joinrel.NeededCols, joinrel.NeededColsKnown = s.neededCols, s.neededColsKnown
@@ -643,6 +656,7 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		if s.outputEligible {
 			joinrel.OutputCols, joinrel.OutputColsKnown = s.outputCols, s.outputColsKnown
 		}
+		joinrel.joinNarrow = s.joinrelNarrowedWidths(joinrel)
 		// A join row is the concatenation of its two inputs' rows — the
 		// executor's Join emits left++right — so the column count adds
 		// (M0127-P5.7-a)... except for a SEMI or ANTI join, which emits its

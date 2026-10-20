@@ -24,6 +24,9 @@ const (
 	// leafSplitDistance is LEAF_SPLIT_DISTANCE: the free-space tolerance
 	// (as a share of the page's data) that bounds the split interval.
 	leafSplitDistance = 0.050
+	// internalSplitDistance is INTERNAL_SPLIT_DISTANCE: "a bit more
+	// aggressive when splitting internal pages".
+	internalSplitDistance = 0.075
 	// bTreeSingleValFillFactor is BTREE_SINGLEVAL_FILLFACTOR (nbtree.h).
 	bTreeSingleValFillFactor = 96
 )
@@ -153,11 +156,85 @@ func deltaSort(cands []splitCand, fillFactorMult float64, useMult bool) {
 	})
 }
 
+// pgFindSplitLocInternal is _bt_findsplitloc for an INTERNAL page
+// (nbtsplitloc.c, M0146-0216). items is the page's data items (pivots) with the
+// new downlink merged in at newIdx; budgets are leftspace and rightspace. Each
+// candidate is priced as _bt_recsplitloc prices a non-leaf split: the left half
+// pays for its new high key with the firstright tuple as it stands (no heap-TID
+// allowance — that is the leaf's worst case), and the right half gets back the
+// firstright tuple's key data, because its first item becomes a key-less
+// minus-infinity pivot. The fillfactor is BTREE_NONLEAF_FILLFACTOR on a
+// rightmost page and an unweighted balance elsewhere; the interval uses
+// INTERNAL_SPLIT_DISTANCE; and within it _bt_bestsplitloc takes the split with
+// the smallest firstright tuple (_bt_split_penalty's internal arm), stopping at
+// the page-wide minimum (_bt_strategy's perfect penalty for internal pages).
+func (f indexFormat) pgFindSplitLocInternal(items []item, newIdx, leftBudget, rightBudget int, rightmost bool) (int, bool) {
+	n := len(items)
+	if n < 2 {
+		return 0, false
+	}
+	const itemIDSize = 4 // matches storage.itemIDSize
+	// minusInfSize is MAXALIGN(sizeof(IndexTupleData)) + sizeof(ItemIdData):
+	// what the right page's first item shrinks to.
+	const minusInfSize = SizeOfIndexTupleData + itemIDSize
+	sz := make([]int, n)
+	total := 0
+	for i := range items {
+		sz[i] = itemIDSize + MaxAlign(f.bodySize(items[i].key))
+		total += sz[i]
+	}
+	oldTotal := total
+	if newIdx >= 0 && newIdx < n {
+		oldTotal -= sz[newIdx]
+	}
+	var cands []splitCand
+	minFirstRight := int(^uint(0) >> 1)
+	left := 0
+	for m := 1; m < n; m++ {
+		left += sz[m-1]
+		fr := sz[m]
+		leftfree := int(int16(leftBudget - left - fr))
+		rightfree := int(int16(rightBudget - (total - left) + fr - minusInfSize))
+		if leftfree < 0 || rightfree < 0 {
+			continue
+		}
+		minFirstRight = min(minFirstRight, fr)
+		cands = append(cands, splitCand{m: m, left: left, right: total - left, leftfree: leftfree, rightfree: rightfree})
+	}
+	if len(cands) == 0 {
+		return 0, false
+	}
+	if rightmost {
+		deltaSort(cands, BTreeNonLeafFillFactor/100.0, true)
+	} else {
+		deltaSort(cands, 0.50, false)
+	}
+	interval := splitInterval(cands, oldTotal, internalSplitDistance)
+	high := min(interval, len(cands))
+	best, bestPenalty := 0, int(^uint(0)>>1)
+	for i := 0; i < high; i++ {
+		p := sz[cands[i].m]
+		if p < bestPenalty {
+			best, bestPenalty = i, p
+		}
+		if p <= minFirstRight {
+			break
+		}
+	}
+	return cands[best].m, true
+}
+
 // defaultInterval is _bt_defaultinterval for a leaf: the count of leading
 // (delta-sorted) splits whose free space stays within LEAF_SPLIT_DISTANCE of
 // the space-optimal split's on both sides.
 func defaultInterval(cands []splitCand, oldTotal int) int {
-	tolerance := int(int16(float64(oldTotal) * leafSplitDistance))
+	return splitInterval(cands, oldTotal, leafSplitDistance)
+}
+
+// splitInterval is _bt_defaultinterval at a given split distance
+// (LEAF_SPLIT_DISTANCE or INTERNAL_SPLIT_DISTANCE).
+func splitInterval(cands []splitCand, oldTotal int, distance float64) int {
+	tolerance := int(int16(float64(oldTotal) * distance))
 	opt := cands[0]
 	lowLeft, lowRight := opt.leftfree-tolerance, opt.rightfree-tolerance
 	highLeft, highRight := opt.leftfree+tolerance, opt.rightfree+tolerance

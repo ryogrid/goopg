@@ -1,0 +1,9 @@
+psql:tmp/g18-sf1-stats-only.sql:9: ERROR:  relation "public.bt" does not exist
+LINE 1: SELECT * FROM pg_catalog.pg_restore_relation_stats(
+                      ^
+psql:tmp/g18-sf1-stats-only.sql:22: ERROR:  relation "public.bt" does not exist
+LINE 1: SELECT * FROM pg_catalog.pg_restore_attribute_stats(
+                      ^
+psql:tmp/g18-sf1-stats-only.sql:35: ERROR:  relation "public.bt" does not exist
+LINE 1: SELECT * FROM pg_catalog.pg_restore_attribute_stats(
+                      ^

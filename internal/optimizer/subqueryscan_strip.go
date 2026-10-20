@@ -433,10 +433,16 @@ func hashJoinBuildChild(j *Join) Node {
 // add CP_SMALL_TLIST; create_gather_plan/create_gather_merge_plan and
 // create_recursiveunion_plan request CP_EXACT_TLIST outright.
 func subqueryStripTlistReset(n Node) bool {
-	switch n.(type) {
+	switch x := n.(type) {
 	case *Sort, *IncrementalSort, *Memoize, *WindowAgg,
 		*Gather, *GatherMerge, *RecursiveUnion:
 		return true
+	case *Materialize:
+		// Only a MaterialPath's: a merge join's materialize_inner is
+		// make_material over an inner create_mergejoin_plan already planned
+		// with the join's flags (createplan.c:4659), so the join's regime
+		// passes through it (TPC-DS Q58's ws_items, Q78's cs strip there).
+		return !x.mergeJoinInner
 	}
 	return false
 }

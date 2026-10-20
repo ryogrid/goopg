@@ -45,6 +45,16 @@ type windowOp struct {
 	// of one value share a partition and a peer group. M0146.
 	pTrims  []bool
 	obTrims []bool
+
+	// wantCTIDs is the TID side-channel's request flag (markSortWantCTIDs):
+	// a consumer above evaluates `ctid` against this operator's slots. The
+	// window buffers its input, so each row's TID is kept in ctids, in step
+	// with rows through the partition sort, and re-attached on output — as
+	// sortOp does. PG computes the Var below the WindowAgg and passes it up as
+	// a column (make_window_input_target); goopg's ctid rides the slot
+	// (M0146-0236).
+	wantCTIDs bool
+	ctids     []sortCTID
 }
 
 func newWindowOp(plan *optimizer.WindowAgg, child Operator) *windowOp {
@@ -83,6 +93,10 @@ func (o *windowOp) Open(ctx *Context) error {
 		}
 		// Materialize at retention boundary: windowOp holds rows
 		// across many Next() calls. (M0071-0010 Stage B.)
+		if o.wantCTIDs {
+			b, off, ok := slot.TID()
+			o.ctids = append(o.ctids, sortCTID{block: b, off: off, has: ok})
+		}
 		row := slot.Materialize().Row()
 		dup := make(Row, len(row))
 		copy(dup, row)
@@ -175,6 +189,13 @@ func (o *windowOp) Open(ctx *Context) error {
 			sorted[i] = o.rows[p]
 		}
 		o.rows = sorted
+		if len(o.ctids) == len(perm) {
+			ctids := make([]sortCTID, len(perm))
+			for i, p := range perm {
+				ctids[i] = o.ctids[p]
+			}
+			o.ctids = ctids
+		}
 	}
 
 	if n := len(o.plan.Funcs); n > 0 {
@@ -1276,7 +1297,7 @@ func (o *windowOp) Next() (TupleSlot, error) {
 		row := o.rows[o.idx]
 		o.idx++
 		if o.plan.RunCondition == nil {
-			return asSlot(o.schema, row), nil
+			return o.emit(row, o.idx-1), nil
 		}
 		// M0146-0005dn: nodeWindowAgg.c's run condition on the top-level
 		// WindowAgg. A false or NULL result stays so for the rest of the
@@ -1288,7 +1309,7 @@ func (o *windowOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		if !v.IsNull() && v.BoolValue() {
-			return asSlot(o.schema, row), nil
+			return o.emit(row, o.idx-1), nil
 		}
 		if len(o.plan.PartitionBy) == 0 {
 			o.idx = len(o.rows)
@@ -1311,8 +1332,21 @@ func (o *windowOp) Next() (TupleSlot, error) {
 	}
 }
 
+// emit is the output slot for row i, with its input row's TID re-attached
+// when a consumer asked for the side-channel.
+func (o *windowOp) emit(row Row, i int) TupleSlot {
+	slot := SlotFromRow(o.schema, row)
+	if o.wantCTIDs && i < len(o.ctids) && o.ctids[i].has {
+		slot.hasCTID = true
+		slot.ctidBlock = o.ctids[i].block
+		slot.ctidOff = o.ctids[i].off
+	}
+	return slot
+}
+
 func (o *windowOp) Close() error {
 	o.rows = nil
+	o.ctids = nil
 	o.ctx = nil
 	o.idx = 0
 	return o.child.Close()

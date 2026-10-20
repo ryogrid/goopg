@@ -505,6 +505,20 @@ func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // empty one. A pure stat of the on-disk path is the faithful test — every open
 // relation always has an on-disk file (relFile creates it eagerly), so a
 // stat-only check never reports a live relation as absent.
+// CachedNBlocks is NBlocks for a fork this manager already has open, without
+// touching the file system; ok=false when the fork is not open. The planner
+// reads relation sizes on every plan (estimate_rel_size's
+// RelationGetNumberOfBlocks), and an open fork's block counter is exact.
+func (m *Manager) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
+	m.mu.Lock()
+	f, ok := m.files[rel]
+	m.mu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return f.nBlocks(), true
+}
+
 func (m *Manager) Exists(rel RelFileNode) bool {
 	_, err := os.Stat(m.relPath(rel))
 	return err == nil

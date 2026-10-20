@@ -670,7 +670,8 @@ func TestOutputColumnNamesDeclinesLikeNeeded(t *testing.T) {
 		// cannot model (a recursive UNION) or a data-modifying CTE.
 		"with recursive x(n) as (select 1 union all select n + 1 from x) select a.a_v from pt_a a",
 		"with x as (delete from pt_b returning b_k) select a.a_v from pt_a a",
-		"select rank() over (order by a.a_v) from pt_a a",
+		// M0146-0225: a window function no longer declines — its PARTITION
+		// BY / ORDER BY are walked (TestWindowFunctionKeepsNeededSet).
 	} {
 		stmts, err := parser.Parse(sql)
 		if err != nil {

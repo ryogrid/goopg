@@ -343,13 +343,29 @@ func TestIncompleteSplitsFinishedConcurrently(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	errCh := make(chan error, handles)
+	// failed[h] lists the keys whose Insert on handle h returned
+	// errSplitAbandoned. That error does not mean the key went in. A writer
+	// that meets a half split on its way down finishes it first
+	// (insertIntoBlock -> finishSplit, as _bt_moveright calls
+	// _bt_finish_split), and when the hook abandons the parent split that
+	// finish cascades into, the error returns before the writer's own key is
+	// placed, just as an ERROR there aborts the insert in PostgreSQL. Only the
+	// writer whose OWN split was abandoned has its key on the page. Nightly
+	// AI-20261019-001758-002 was this test treating every failed insert as
+	// landed: about 8% of runs under host load, never on an idle host.
+	failed := make([][]int, handles)
 	for h := range hs {
 		wg.Add(1)
 		go func(h int) {
 			defer wg.Done()
 			for _, i := range rand.New(rand.NewSource(int64(h) + 1)).Perm(perHandle) {
 				n := i*handles + h
-				if err := hs[h].Insert(finishKey(n), finishTID(n)); err != nil && !errors.Is(err, errSplitAbandoned) {
+				err := hs[h].Insert(finishKey(n), finishTID(n))
+				if errors.Is(err, errSplitAbandoned) {
+					failed[h] = append(failed[h], n)
+					continue
+				}
+				if err != nil {
 					errCh <- fmt.Errorf("handle %d insert %d: %w", h, n, err)
 					return
 				}
@@ -380,6 +396,18 @@ func TestIncompleteSplitsFinishedConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A failed insert is retried, as the client would, and must then succeed.
+	// The retry uses the sweep's TID, which checkKeys accepts, so a key that
+	// did land the first time is not re-inserted as an exact duplicate.
+	retried := 0
+	for _, keys := range failed {
+		for _, n := range keys {
+			if err := bt.Insert(finishKey(n), storage.ItemPointer{Block: 9999, Offset: 1}); err != nil {
+				t.Fatalf("retry of failed insert %d: %v", n, err)
+			}
+			retried++
+		}
+	}
 	swept, err := bt.CompleteDeferredSplits()
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +416,6 @@ func TestIncompleteSplitsFinishedConcurrently(t *testing.T) {
 		t.Fatalf("pages still flagged: %v", f)
 	}
 	checkKeys(t, bt, inserted)
-	t.Logf("splits %d, left incomplete %d, finished by the final sweep %d (the rest by writers on contact)",
-		splits.Load(), abandoned.Load(), swept)
+	t.Logf("splits %d, left incomplete %d, finished by the final sweep %d (the rest by writers on contact), failed inserts retried %d",
+		splits.Load(), abandoned.Load(), swept, retried)
 }

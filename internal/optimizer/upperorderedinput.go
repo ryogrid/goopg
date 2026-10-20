@@ -566,7 +566,7 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		// `Index` equality (names are not part of its key) is the match —
 		// for a bare column and for an expression key alike.
 		keyExpr, _, _ := childKeyAt(j)
-		if !exprEqual(keyExpr, g) {
+		if !groupKeyOrderedBy(agg, j, g, keyExpr) {
 			return nil
 		}
 		if _, ok := g.(*ColumnRef); !ok {
@@ -595,6 +595,44 @@ func aggregateEmissionPathkeys(agg *Aggregate) []PathKey {
 		}
 	}
 	return emitted
+}
+
+// groupKeyOrderedBy reports whether an input ordered by key, at processed
+// group-clause position j, is ordered by group key g: the same expression,
+// or the equivalence-class member the grouping step recorded for that
+// position (Aggregate.GroupInputKeys). PG's AggPath carries its subpath's
+// canonical pathkeys, which are the group keys' own when the input was
+// presorted through an equivalence class, so the aggregate's output order is
+// the group keys' either way. Both emission twins (aggregateEmissionPathkeys,
+// groupingEmissionPathkeys) ask this one question.
+func groupKeyOrderedBy(agg *Aggregate, j int, g, key Expr) bool {
+	if exprEqual(key, g) {
+		return true
+	}
+	return agg != nil && j < len(agg.GroupInputKeys) && agg.GroupInputKeys[j] != nil &&
+		exprEqual(key, agg.GroupInputKeys[j])
+}
+
+// equivalentGroupInputKeys builds Aggregate.GroupInputKeys for an input whose
+// pathkeys inputKeys contain the group pathkeys groupKeys through the
+// searched rel's equivalence classes: position j records the input's key
+// where it is not the group key itself. nil when every position matches
+// syntactically, or when inputKeys does not reach every group key.
+func equivalentGroupInputKeys(inputKeys, groupKeys []PathKey, nGroups int) []Expr {
+	if nGroups == 0 || len(groupKeys) < nGroups || len(inputKeys) < nGroups {
+		return nil
+	}
+	var out []Expr
+	for j := 0; j < nGroups; j++ {
+		if exprEqual(inputKeys[j].Expr, groupKeys[j].Expr) {
+			continue
+		}
+		if out == nil {
+			out = make([]Expr, nGroups)
+		}
+		out[j] = inputKeys[j].Expr
+	}
+	return out
 }
 
 // projectIsPositionalIdentity reports whether `p` re-assigns no output

@@ -103,11 +103,15 @@ func (s *searchCtx) setBaseRelConsiderParallel(cat catalog.Catalog) {
 		// trace (relfromjoinlist.go), so the line lands in the problem's
 		// own block; nil-safe when the gate is off.
 		s.trace.baseCP(rel.Relids, rel.baseLeaf, rel.ConsiderParallel)
-		// The prebuilt path predates the flag (see above). Every path on the
-		// rel at this point is a base-rel scan with no children, so the stamp
-		// is exact for all of them.
+		// The prebuilt paths predate the flag (see above). Every path on the
+		// rel at this point is a prebuilt leaf with no children, so the stamp
+		// is the rel's, except that a leaf holding a Gather is not
+		// parallel-safe: create_subqueryscan_path's parallel_safe is
+		// `rel->consider_parallel && subpath->parallel_safe`, and a gather
+		// path never is (M0146-0231).
 		for _, p := range rel.Pathlist {
-			p.ParallelSafe = rel.ParallelSafeForPath()
+			p.ParallelSafe = rel.ParallelSafeForPath() &&
+				!(p.Kind == PathPrebuilt && planHasGatherNode(p.node))
 		}
 	}
 }
@@ -234,9 +238,16 @@ func relConsiderParallel(leaf Node, tbl *catalog.Table, cat catalog.Catalog) boo
 		if x.Outer != nil && !subtreeHasNoParallelHazard(x.Outer, cat) {
 			return false
 		}
-	case *CTEScan, *MaterializedCTEScan:
+	case *CTEScan:
 		// RTE_CTE: "CTE tuplestores aren't shared among parallel workers, so
-		// we force all CTE scans to happen in the leader" (:706-718).
+		// we force all CTE scans to happen in the leader" (:706-718). An
+		// inlined CTE is no CTE scan upstream: inline_cte turns the reference
+		// into an RTE_SUBQUERY, whose arm is the planned-subtree one below
+		// (M0146-0231).
+		if !x.Inlined() || x.Child == nil || !subtreeHasNoParallelHazard(x.Child, cat) {
+			return false
+		}
+	case *MaterializedCTEScan:
 		return false
 	case *Values:
 		// RTE_VALUES: the lists must be parallel-safe (:697-702).
@@ -377,6 +388,18 @@ func subtreeHasNoParallelHazard(n Node, cat catalog.Catalog) bool {
 			// (create_subqueryscan_path), so the walk descends. Refusing
 			// it marked TPC-H Q18's ANY_subquery rel unsafe and left the
 			// whole join tree without partial paths.
+		case *GatherMerge, *IncrementalSort, *Memoize:
+			// M0146-0231: pass-throughs parallelChildren does not enumerate.
+			// None has an expression channel a worker could not evaluate (a
+			// Memoize's cache keys are the inner's parameter values); what
+			// decides a subquery rel is what lies beneath. RTE_SUBQUERY's
+			// consider_parallel does not read the subquery's paths at all
+			// (allpaths.c) — a Gather Merge among them makes that path
+			// parallel-unsafe, not the rel (planHasGatherNode).
+			for _, c := range legacyDisplayChildren(cur) {
+				walk(c)
+			}
+			return
 		case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *GenerateSeries,
 			*GenerateSubscripts, *FromUnnest, *UserSrfScan, *CTEScan,
 			*MaterializedCTEScan, *ScalarFuncScan:
@@ -903,4 +926,33 @@ func InitPlanEvaluatedByLeader(sq *SubqueryExpr) bool {
 		}
 	})
 	return !readsParam
+}
+
+// planHasGatherNode reports whether a Gather or Gather Merge sits anywhere in
+// n's own plan level — the question PG answers with the path's parallel_safe
+// flag, which create_gather_path and create_gather_merge_path set false and
+// every path above one inherits (M0146-0231). A kept CTE's body is another
+// level (an initPlan) and is not entered; an inlined CTE's body is this
+// level's subquery and is.
+func planHasGatherNode(n Node) bool {
+	switch x := n.(type) {
+	case nil:
+		return false
+	case *Gather, *GatherMerge:
+		return true
+	case *CTEScan:
+		return x.Inlined() && planHasGatherNode(x.Child)
+	case *MaterializedCTEScan:
+		return false
+	}
+	kids, ok := planChildNodes(n)
+	if !ok {
+		return false
+	}
+	for _, k := range kids {
+		if planHasGatherNode(k) {
+			return true
+		}
+	}
+	return false
 }

@@ -141,6 +141,69 @@ func orderedAppendInput(rel *RelOptInfo, child Node, keys []SortKey, cp costPara
 	return chain, merge
 }
 
+// addOrderedAppendPaths is the ordered stage's half of
+// generate_orderedappend_paths (allpaths.c): a UNION ALL appendrel offers, for
+// every ordering one of its members delivers (all_child_pathkeys), a Merge
+// Append in that ordering, and create_ordered_paths (planner.c) takes each
+// such input path as-is when its pathkeys contain the ORDER BY, or under an
+// Incremental Sort when they deliver a leading prefix of it. TPC-DS Q23's
+// second statement orders a UNION ALL of two GroupAggregates, each grouped by
+// (c_last_name, c_first_name), by those two columns and the sum: PG merges the
+// branches and incrementally sorts on the sum, where goopg sorted the plain
+// Append whole (M0146-0229). The full-Sort arm stays the seed's
+// (addOrderedPaths): create_ordered_paths gives the cheapest input path a
+// full Sort and every presorted one an Incremental Sort.
+func addOrderedAppendPaths(ordered *RelOptInfo, input Node, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
+	members := unionAllMembers(input)
+	if len(members) < 2 || len(sortPathkeys) == 0 {
+		return
+	}
+	var seen [][]PathKey
+	for _, m := range members {
+		ordering := memberOrdering(m, 0)
+		if len(ordering) == 0 {
+			continue
+		}
+		dup := false
+		for _, o := range seen {
+			if len(o) != len(ordering) {
+				continue
+			}
+			same := true
+			for i := range o {
+				if !pathKeyEqual(o[i], ordering[i]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		seen = append(seen, ordering)
+		keys := make([]SortKey, len(ordering))
+		for i, pk := range ordering {
+			keys[i] = SortKey{Expr: pk.Expr, Desc: !pk.SortAsc, NullsFirst: pk.NullsFirst}
+		}
+		chain, ma := orderedAppendInput(ordered, input, keys, cp)
+		if ma == nil {
+			continue
+		}
+		contained, nCommon := ordered.SearchCandidateClasses.countContainedIn(ma.Pathkeys, sortPathkeys)
+		switch {
+		case contained:
+			addPath(ordered, ma, upperOrderedMergeAppendProducer)
+		case nCommon > 0 && cp.enableIncrementalSort:
+			addPath(ordered, incrementalSortPathOver(ordered, ma, chain, sortPathkeys, nCommon, cp, limitTuples),
+				upperOrderedMergeAppendProducer)
+		}
+	}
+}
+
 // memberDeliversOrdering reports whether member m already emits its rows in
 // the order keys name by output position (pathkeys_contained_in over the
 // member's own ordering, memberOrdering).

@@ -364,6 +364,13 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		// stats.Live / stats.Dead are accumulated in the reclamation pass above.
 	}
 
+	// lazy_scan_heap's last FreeSpaceMapVacuumRange (vacuumlazy.c): the
+	// space recorded above becomes visible to searches from the FSM root,
+	// which RecordPageWithFreeSpace alone does not do (M0146-0216).
+	if opts.FSM != nil && nBlocks > 0 {
+		opts.FSM.PGVacuumRange(rel, 0, nBlocks)
+	}
+
 	// Tail truncation (vacuum_truncate): drop trailing never-populated /
 	// fully-empty blocks. WAL-first emission + invalidation + smgr shrink are
 	// encapsulated in the pool helper; a missing hook (test harnesses) makes

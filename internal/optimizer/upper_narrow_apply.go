@@ -303,7 +303,12 @@ func narrowAggregateInput(agg *Aggregate, refs map[Node]int) bool {
 type aggregateInputExprs struct {
 	groupExprs  []Expr
 	passthrough []Expr
-	aggs        []aggregateCallInputExprs
+	// groupInputKeys is Aggregate.GroupInputKeys remapped, or nil when a key
+	// does not survive the cut: the stamp only lets the aggregate claim its
+	// input's ordering (groupKeyOrderedBy), so dropping it claims less and
+	// never refuses the site.
+	groupInputKeys []Expr
+	aggs           []aggregateCallInputExprs
 }
 
 // aggregateCallInputExprs is one AggregateCall's rewritten input-row reads.
@@ -335,6 +340,18 @@ func rewriteAggregateInputExprs(agg *Aggregate, km keepMap) (aggregateInputExprs
 	}
 	if out.passthrough, ok = keepPreservesExprList(agg.Passthrough, km); !ok {
 		return aggregateInputExprs{}, false
+	}
+	if len(agg.GroupInputKeys) > 0 {
+		keys := make([]Expr, len(agg.GroupInputKeys))
+		for i, e := range agg.GroupInputKeys {
+			ne, kept := keepPreservesExpr(e, km)
+			if !kept {
+				keys = nil
+				break
+			}
+			keys[i] = ne
+		}
+		out.groupInputKeys = keys
 	}
 	out.aggs = make([]aggregateCallInputExprs, len(agg.Aggs))
 	for i := range agg.Aggs {
@@ -371,6 +388,7 @@ func rewriteAggregateInputExprs(agg *Aggregate, km keepMap) (aggregateInputExprs
 func installAggregateInputExprs(agg *Aggregate, r aggregateInputExprs) {
 	agg.GroupExprs = r.groupExprs
 	agg.Passthrough = r.passthrough
+	agg.GroupInputKeys = r.groupInputKeys
 	for i := range agg.Aggs {
 		a := &agg.Aggs[i]
 		c := r.aggs[i]

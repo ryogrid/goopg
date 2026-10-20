@@ -17,26 +17,22 @@ import (
 // goopg printed `rows=<count>` with the input's total plus a per-row charge
 // (TPC-DS Q84: rows=100 over a Gather Merge of 11).
 //
-// The HashAggregate's own cost (and the scan's unnarrowed width) differ from
-// PG's for reasons outside this fix, so the aggregate cases pin the Limit
-// relative to its input: LIMIT 100 over 22 rows is the input's own cost line;
-// LIMIT 10 OFFSET 5 over (43.90..46.12, 22 rows) is
-// 43.90 + 2.22*5/22 = 44.40 .. 44.40 + 2.22*10/22 = 45.41.
-//
 // PG's aggregate total is 43.90 + 200 groups x (cpu_tuple_cost 0.01 + the
-// HAVING quals' 2 x cpu_operator_cost) = 46.90; count(*) has no finalfn.
-// goopg's is 46.12: the finalfn charge is right since M0146-0221's
-// get_agg_clause_costs port (46.62 before, a spurious 0.5), and the
-// remaining 0.78 is the HAVING qual cost (cost_qual_eval), a ledger row.
+// HAVING quals' 2 x cpu_operator_cost) = 46.90; count(*) has no finalfn. goopg
+// reaches it exactly since M0146-0214 slice 3 priced the HAVING inside the
+// aggregate (cost_agg's quals arm; 46.12 before, with the 0.78 of HAVING quals
+// missing), so all three cases pin PG's own Limit lines. LIMIT 10 OFFSET 5 over
+// (43.90..46.90, 22 rows) is 43.90 + 3.00*5/22 = 44.58 .. 44.58 + 3.00*10/22 =
+// 45.95.
 func TestExplainLimitClampsToInputRows(t *testing.T) {
 	cases := []struct {
 		sql  string
 		want string
 	}{
 		{`SELECT a, count(*) FROM t GROUP BY a HAVING count(*) >= 15 AND count(*) <= 20 LIMIT 100`,
-			"Limit  (cost=43.90..46.12 rows=22 "},
+			"Limit  (cost=43.90..46.90 rows=22 "},
 		{`SELECT a, count(*) FROM t GROUP BY a HAVING count(*) >= 15 AND count(*) <= 20 LIMIT 10 OFFSET 5`,
-			"Limit  (cost=44.40..45.41 rows=10 "},
+			"Limit  (cost=44.58..45.95 rows=10 "},
 		{`SELECT a FROM t LIMIT 5 OFFSET 7`,
 			"Limit  (cost=0.10..0.17 rows=5 "},
 	}

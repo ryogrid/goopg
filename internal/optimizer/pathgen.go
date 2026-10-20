@@ -79,8 +79,8 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	p, b := probe.CheapestTotal, build.CheapestTotal
 	// M0142-0008c-3c: `hash_inner_and_outer`'s own unique-ify substitution
 	// (joinpath.c:2301-2341) — JOIN_UNIQUE_OUTER replaces the probe with its
-	// unique-ified cheapest-total (one try, no cheap-startup variant, since
-	// goopg has no cheapest-startup-outer arm for hash to begin with);
+	// unique-ified cheapest-total (one try, no cheap-startup variant — PG
+	// makes none for a unique-ified outer);
 	// JOIN_UNIQUE_INNER replaces the build side the same way. `jt` has
 	// already been demoted to JoinInner by `addPathsToJoinrel` before this
 	// call (M0142-0008c-3a), exactly mirroring PG's own `jointype = JOIN_INNER`
@@ -94,12 +94,47 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 	if p == nil || b == nil {
 		return
 	}
+	// M0146-0214 slice 4: hash_inner_and_outer's outer candidates
+	// (joinpath.c), in its order — add_path keeps the incumbent on a fuzzy
+	// tie, so the order is part of the answer.
+	//   - JOIN_UNIQUE_OUTER: the unique-ified cheapest-total outer only.
+	//   - JOIN_UNIQUE_INNER: the cheapest-total outer, then the cheapest-
+	//     startup outer when it is a different path.
+	//   - otherwise: the cheapest-startup outer against the cheapest-total
+	//     inner FIRST, then the cheapest-total pair (cheapest_parameterized_
+	//     paths' unparameterised member), skipped when it is the pair already
+	//     tried. TPC-DS Q64's GEQO tours price a hash join over a fast-start
+	//     nested loop that the total-only pairing never built.
+	// cheapest_startup_path is chosen among unparameterised paths only
+	// (setCheapest), so it is never parameterised by the build side.
+	startupOuter := probe.CheapestStartup
+	switch uniq {
+	case uniqueSideOuter:
+		addHashJoinPathPair(joinRel, probe, build, p, b, cp, jt, keys, residual, innerBucketSize, final, sjinfo)
+	case uniqueSideInner:
+		addHashJoinPathPair(joinRel, probe, build, p, b, cp, jt, keys, residual, innerBucketSize, final, sjinfo)
+		if startupOuter != nil && startupOuter != p {
+			addHashJoinPathPair(joinRel, probe, build, startupOuter, b, cp, jt, keys, residual, innerBucketSize, final, sjinfo)
+		}
+	default:
+		if startupOuter != nil {
+			addHashJoinPathPair(joinRel, probe, build, startupOuter, b, cp, jt, keys, residual, innerBucketSize, final, sjinfo)
+		}
+		if startupOuter != p {
+			addHashJoinPathPair(joinRel, probe, build, p, b, cp, jt, keys, residual, innerBucketSize, final, sjinfo)
+		}
+	}
+}
+
+// addHashJoinPathPair prices and files one hash join over the probe path p and
+// the build path b — try_hashjoin_path's body.
+func addHashJoinPathPair(joinRel, probe, build *RelOptInfo, p, b *Path, cp costParams, jt parser.JoinType, keys, residual []*restrictInfo, innerBucketSize float64, final hashJoinFinalCostInput, sjinfo *SpecialJoinInfo) {
 	// Row counts come from the CHILD PATHS, not their RelOptInfos: for a
 	// parameterised path the two differ, and the path's own count is the
 	// per-parameterisation one (PG's ppi_rows; cost_hashjoin reads
 	// outer_path->rows / inner_path->rows, costsize.c:3563-3564). See
 	// leftdeep-joins 03 §9 rule 3 and Path.Rows.
-	cost := hashJoinCost(cp, hashJoinInputs{
+	hin := hashJoinInputs{
 		qualPerTuple: joinQualPerTuple(cp, residual),
 		outer:        p.Cost, inner: b.Cost,
 		outerRows: p.Rows, innerRows: b.Rows,
@@ -119,7 +154,14 @@ func addHashJoinPath(joinRel, probe, build *RelOptInfo, cp costParams, jt parser
 		// while the executor measured the narrowed node's schema at runtime.
 		outerCols: pathNCols(p), innerCols: pathNCols(b),
 		outerAvgVarBytes: pathAvgVarBytes(p), innerAvgVarBytes: pathAvgVarBytes(b),
-	})
+	}
+	// try_hashjoin_path's add_path_precheck on the initial cost (M0146-0231).
+	init := hashJoinInitialCost(cp, hin)
+	if !addPathPrecheck(joinRel, disabledNodesFor(!cp.enableHashJoin, p, b), init.Startup, init.Total,
+		nil, calcNonNestloopRequiredOuter(p, b)) {
+		return
+	}
+	cost := hashJoinCost(cp, hin)
 	tracePGHashTupleGeometry(p, b, cp)
 	// The residual is evaluated only on tuples that already matched on the
 	// keys: hashJoinCost charges it (qualPerTuple) on `hashjointuples`, the
@@ -253,6 +295,14 @@ func addNestLoopPathFor(joinRel, outer, inner *RelOptInfo, o, i *Path, cp costPa
 	// (cost_material, materialize.go), so nothing is added here — this is the
 	// separation PG draws between inner_path->total_cost (one scan + fill)
 	// and rescan cost (replays 2..N).
+	// try_nestloop_path's add_path_precheck on the initial cost
+	// (M0146-0231).
+	init := nliNestLoopInitialCost(cp, o, i, semi)
+	if !addPathPrecheck(joinRel, disabledNodesFor(!cp.enableNestLoop, o, i), init.Startup, init.Total,
+		buildJoinPathkeysFor(joinRel, jt, o.Pathkeys),
+		calcNestloopRequiredOuter(outer.Relids, o.RequiredOuter, inner.Relids, i.RequiredOuter)) {
+		return
+	}
 	rsStart, rsTotal := pathRescanCost(i, cp)
 	var cost Cost
 	if semi.apply {

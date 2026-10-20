@@ -1,0 +1,3 @@
+DPTRACE pveto site=hash rel={customer+store_sales} dir={store_sales}+{customer} veto=PH2 detail=phash jt=INNER
+DPTRACE pveto site=hash rel={customer+date_dim+store_sales} dir={date_dim+store_sales}+{customer} veto=PH2 detail=phash jt=INNER
+DPTRACE pveto site=hash rel={customer+store_sales} dir={store_sales}+{customer} veto=PH2 detail=phash jt=INNER

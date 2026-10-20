@@ -366,6 +366,12 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// that shape — see findPartialSubtree, which returns a Sort as the
 		// partial root only together with the GatherMerge it requires.
 		return attachParallelScan(x.child, st)
+	case *incrementalSortOp:
+		// M0146-0214: the same per-worker pass-through as a Sort —
+		// generate_useful_gather_paths' incremental-sort arm puts an
+		// Incremental Sort under a Gather Merge, each worker sorting its own
+		// partition's presorted groups.
+		return attachParallelScan(x.child, st)
 	case *nestedLoopIndexJoinOp:
 		// M0142-0005a: the fused NLI is partial through its OUTER only —
 		// each worker joins its outer partition and re-opens the inner
@@ -465,6 +471,8 @@ func attachParallelBitmapScan(op Operator, st *parallelBitmapState) bool {
 		return attachParallelBitmapScan(x.child, st)
 	case *sortOp:
 		// P7: per-worker Sort under Gather Merge.
+		return attachParallelBitmapScan(x.child, st)
+	case *incrementalSortOp:
 		return attachParallelBitmapScan(x.child, st)
 	case *nestedLoopIndexJoinOp:
 		// M0142-0005a: mirror of the sequential arm above — the fused
@@ -643,6 +651,8 @@ func attachParallelIndexScan(op Operator, st *parallelIndexScanState) bool {
 		return attachParallelIndexScan(x.child, st)
 	case *sortOp:
 		return attachParallelIndexScan(x.child, st)
+	case *incrementalSortOp:
+		return attachParallelIndexScan(x.child, st)
 	case *nestedLoopIndexJoinOp:
 		// M0142-0005a: same literal-outer rule as the two siblings
 		// above; the probe inner never takes index claim state.
@@ -773,6 +783,8 @@ func (cs *parallelClaimSet) attachParallelHashBuildSides(op Operator) bool {
 		return cs.attachParallelHashBuildSides(x.child)
 	case *sortOp:
 		return cs.attachParallelHashBuildSides(x.child)
+	case *incrementalSortOp:
+		return cs.attachParallelHashBuildSides(x.child)
 	case *nestedLoopIndexJoinOp:
 		if !optimizer.NestedLoopIndexJoinIsPartialCapable(x.plan) {
 			return false
@@ -889,6 +901,8 @@ func unwrapToSetOp(op Operator) (*setOp, bool) {
 	case *instrumentedOp:
 		return unwrapToSetOp(x.inner)
 	case *sortOp:
+		return unwrapToSetOp(x.child)
+	case *incrementalSortOp:
 		return unwrapToSetOp(x.child)
 	case *aggregateOp:
 		return unwrapToSetOp(x.child)

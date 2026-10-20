@@ -1,0 +1,49 @@
+File: goopg
+Build ID: 12bb18c3eacb6cb99041bdfbf670789ffce0a571
+Type: cpu
+Time: 2026-10-19 20:08:17 JST
+Duration: 90s, Total samples = 101.05s (112.28%)
+Showing nodes accounting for 95.26s, 94.27% of 101.05s total
+Dropped 206 nodes (cum <= 0.51s)
+Showing top 40 nodes out of 57
+      flat  flat%   sum%        cum   cum%
+    37.78s 37.39% 37.39%     39.21s 38.80%  github.com/goopg/goopg/internal/executor.textShapeAmbiguous
+    17.97s 17.78% 55.17%     78.06s 77.25%  github.com/goopg/goopg/internal/executor.evalExprSlot
+     5.73s  5.67% 60.84%      5.73s  5.67%  runtime.memmove
+     3.79s  3.75% 64.59%      7.27s  7.19%  github.com/goopg/goopg/internal/executor.compareDatum
+     3.14s  3.11% 67.70%      3.14s  3.11%  github.com/goopg/goopg/internal/executor.Datum.StringValue
+     2.91s  2.88% 70.58%     91.23s 90.28%  github.com/goopg/goopg/internal/executor.(*joinOp).joinPredicateMatch
+     2.75s  2.72% 73.30%      5.11s  5.06%  github.com/goopg/goopg/internal/executor.declaredBpcharTypmod
+     2.48s  2.45% 75.75%      2.48s  2.45%  strings.ToLower
+     2.05s  2.03% 77.78%     87.97s 87.06%  github.com/goopg/goopg/internal/executor.evalExpr
+     1.64s  1.62% 79.41%      1.64s  1.62%  indexbytebody
+     1.60s  1.58% 80.99%      1.60s  1.58%  runtime.nextFreeFast (inline)
+     1.54s  1.52% 82.51%      1.54s  1.52%  runtime.memclrNoHeapPointers
+     1.28s  1.27% 83.78%      7.22s  7.14%  runtime.mallocgcSmallScanNoHeader
+     1.24s  1.23% 85.01%      3.49s  3.45%  github.com/goopg/goopg/internal/executor.comparisonOperandsAsBpchar
+     0.97s  0.96% 85.97%      8.98s  8.89%  github.com/goopg/goopg/internal/executor.evalBinary
+     0.96s  0.95% 86.92%      0.96s  0.95%  github.com/goopg/goopg/internal/executor.promoteCrossKind
+     0.87s  0.86% 87.78%      0.87s  0.86%  github.com/goopg/goopg/internal/executor.concatOperandsAsText
+     0.69s  0.68% 88.46%      0.69s  0.68%  github.com/goopg/goopg/internal/executor.isValidUUIDStr
+     0.63s  0.62% 89.08%     98.01s 96.99%  github.com/goopg/goopg/internal/executor.(*nlJoinStream).pairMatches
+     0.58s  0.57% 89.66%      0.58s  0.57%  github.com/goopg/goopg/internal/executor.Datum.IsNull (inline)
+     0.54s  0.53% 90.19%     99.44s 98.41%  github.com/goopg/goopg/internal/executor.(*nlJoinStream).stepInner
+     0.54s  0.53% 90.73%      2.64s  2.61%  github.com/goopg/goopg/internal/executor.looksLikePgLSN
+     0.51s   0.5% 91.23%      0.58s  0.57%  runtime.(*mspan).writeHeapBitsSmall
+     0.51s   0.5% 91.74%      0.51s   0.5%  strings.trimRightByte (inline)
+     0.49s  0.48% 92.22%      7.75s  7.67%  runtime.mallocgc
+     0.43s  0.43% 92.65%      6.15s  6.09%  runtime.typedslicecopy
+     0.36s  0.36% 93.00%     99.82s 98.78%  github.com/goopg/goopg/internal/executor.(*nlJoinStream).next
+     0.35s  0.35% 93.35%      0.86s  0.85%  strings.TrimRight
+     0.34s  0.34% 93.69%      7.96s  7.88%  runtime.convTslice
+     0.22s  0.22% 93.90%      0.78s  0.77%  github.com/goopg/goopg/internal/executor.(*materializeOp).Next
+     0.09s 0.089% 93.99%      1.22s  1.21%  runtime.(*mcache).refill
+     0.09s 0.089% 94.08%      0.67s  0.66%  runtime.heapSetTypeNoHeader (inline)
+     0.06s 0.059% 94.14%      2.05s  2.03%  internal/stringslite.IndexByte (inline)
+     0.05s 0.049% 94.19%      2.10s  2.08%  strings.IndexByte (inline)
+     0.04s  0.04% 94.23%      1.32s  1.31%  runtime.(*mcache).nextFree
+     0.03s  0.03% 94.26%      0.75s  0.74%  runtime.systemstack
+     0.01s 0.0099% 94.27%     99.86s 98.82%  github.com/goopg/goopg/internal/executor.(*projectOp).Next
+         0     0% 94.27%     99.91s 98.87%  github.com/goopg/goopg/internal/executor.(*OpIterator).Open
+         0     0% 94.27%     99.91s 98.87%  github.com/goopg/goopg/internal/executor.(*explainOp).Open
+         0     0% 94.27%     99.82s 98.78%  github.com/goopg/goopg/internal/executor.(*instrumentedOp).Next

@@ -1,0 +1,25 @@
+# M0146-0216 slice 4 — insert-built pkey replay (tmp/m0216/replay.sh: clone the shipped corpus, CREATE TABLE r_<t>
+# with tpcds.sql's inline primary key, server-side COPY from the same TSV the corpus loaded, pkey pages)
+# old = HEAD 3d8b7737e nbtree (internal splits through compactSplitLocFill, first right item keeps its key)
+# new = this slice. PG = :65438 census (tmp/m0231/census-pg{025,1}.txt).
+# The old replay reproduces every shipped corpus size exactly, so the replay is faithful.
+# (INSERT ... SELECT in heap order is NOT: store_sales 2578 vs COPY 2567 on the same binary.)
+scale  index                        corpus  old    new    PG
+sf025  customer_demographics_pkey   5269    5269   5268   5268
+sf025  store_sales_pkey             2567    2567   2567   2569
+sf025  store_returns_pkey           280     280    280    280
+sf025  catalog_sales_pkey           1250    1250   1250   1250
+sf1    customer_demographics_pkey   5269    -      5268   5268
+sf1    store_sales_pkey             11042   -      11042  11041
+sf1    store_returns_pkey           1081    -      1081   1082
+sf1    catalog_sales_pkey           5624    -      5624   5625
+# customer_demographics internal level (1920800 ascending keys): PG 18 pages, 17 x 285 downlinks + high key,
+# rightmost 403, every first downlink an 8-byte minus-infinity pivot. old: 19 pages, 284 downlinks each (the
+# leftmost 285, rightmost 135); every first downlink but the leftmost page's kept its 16-byte key.
+#
+# Remaining SF1 diffs ride heap placement: per-block heap row counts, SF1, goopg corpus vs PG replica
+# (select (ctid::text::point)[0]::int, count(*) ... group by 1):
+#   catalog_sales  7361 blocks differ (block 1: PG 39 rows, goopg 38)
+#   store_returns   689 blocks differ (block 12: PG 60, goopg 59)
+#   store_sales   17539 blocks differ (block 2: PG 57, goopg 56)
+# PG refills an earlier page through the FSM (hio.c RecordAndGetPageWithFreeSpace); goopg fills forward.

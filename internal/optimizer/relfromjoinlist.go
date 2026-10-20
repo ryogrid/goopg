@@ -94,6 +94,13 @@ type joinlistProblem struct {
 	// coordinates. Every problem filters it for itself; see the file header.
 	conjuncts []Expr
 
+	// pushedDownQuals are WHERE conjuncts, in binding coordinates, that
+	// reach the nullable sides of outer joins and can only be evaluated once
+	// every FROM item has been joined (M0146-0224). The root problem's full
+	// joinrel carries them as pushed-down restrictions; the plan still
+	// applies them in the Filter above the searched tree.
+	pushedDownQuals []Expr
+
 	// orClauseSelDivisor is PG's consider_new_or_clause compensation: for a
 	// join OR clause from which extractRestrictionOrClauses derived redundant
 	// base restrictions, the product of their selectivities, by which the
@@ -634,12 +641,17 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// M0146-0222: the base relations' rows, for the enclosing problem's
 	// get_loop_count (baseRelInfo.subproblemBaseRows).
 	baseRows := map[int16]float64{}
+	baseVars := map[int16]subproblemBaseVar{}
 	for i, info := range infos {
 		if rel := s.findRel(RelSet(1) << uint(i)); rel != nil && info.sourceIdx >= 0 && info.table != nil {
 			baseRows[info.sourceIdx] = rel.Rows
+			baseVars[info.sourceIdx] = subproblemBaseVar{table: info.table, tuples: float64(info.baseRows), rows: rel.Rows}
 		}
 		for k, v := range info.subproblemBaseRows {
 			baseRows[k] = v
+		}
+		for k, v := range info.subproblemBaseVars {
+			baseVars[k] = v
 		}
 	}
 	s.rootCheapestTotal = prob.rootCheapestTotal
@@ -657,6 +669,25 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// outerjoin-delayed in PG's distribute_qual_to_rels), so its RHS's
 	// clauses stay out of the equivalence classes.
 	s.clauses = buildRestrictInfosExcluding(prob.conjuncts, 0, itemSpans, antiRighthands(sjis))
+	// M0146-0224: the delayed WHERE conjuncts, on the root problem only —
+	// the joinrel of every FROM item is where check_outerjoin_delay places
+	// them. One that does not resolve to this problem's items is left to
+	// the Filter above, unpriced, as before.
+	if lo == 0 && hi == len(prob.bindings) && len(prob.pushedDownQuals) > 0 {
+		full := RelSet(1)<<uint(len(items)) - 1
+		var pushed []*restrictInfo
+		for _, q := range prob.pushedDownQuals {
+			relids, ok := relidsOfExpr(q, itemSpans)
+			if !ok || !relsSubset(relids, full) {
+				pushed = nil
+				break
+			}
+			pushed = append(pushed, &restrictInfo{clause: q, relids: full, ecID: noEquivClass, pushedDown: true})
+		}
+		if len(pushed) > 0 {
+			s.pushedDown, s.pushedDownRelids = pushed, full
+		}
+	}
 	// M0146-0022: one clause per equivalence class at an inner join, only
 	// where no special join can null-extend a class member. M0146-0128: a
 	// SEMI join null-extends nothing (PG's distribute_qual_to_rels makes its
@@ -695,6 +726,12 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// the zero value on its rels, and the derivation declines there by
 	// construction.
 	s.outputEligible = lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && !prob.corrAbove
+	// M0146-0214: root->all_query_rels — the problem's final rel is the
+	// query's topmost scan/join rel exactly when it spans the whole FROM list
+	// with no pinned spine above it. Read by mergeClump / geqoSearch.
+	if lo == 0 && hi == len(prob.bindings) && !prob.spineAbove && !prob.pinAbove && s.nrels > 0 {
+		s.queryTopRelids = RelSet(1)<<uint(s.nrels) - 1
+	}
 	// take2 P4-01 rev 10 step 1: publish the set onto the base rels, AFTER the
 	// assignment above. buildInitialRels ran eight lines earlier and could not
 	// have seen it — that ordering is what made P4-01b's first version silently
@@ -708,6 +745,9 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// Both steps are AFTER stampNeededColsOnRels because the partial path's
 	// Target is computed from NeededCols, like the serial scans' (P4-01).
 	s.setBaseRelConsiderParallel(prob.cat)
+	// M0146-0231: set_subquery_pathlist's further paths for derived and
+	// inlined-CTE leaves, now that their rels' consider_parallel holds.
+	s.addSubqueryLeafAltPaths()
 	s.addBaseRelPartialPaths()
 	// M0145-0004: `add_paths_to_append_rel`'s partial arm — hoist the
 	// Parallel Append candidate a marked UNION ALL leaf's nested scope
@@ -769,6 +809,22 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	if err != nil {
 		return joinlistRel{}, err
 	}
+	// M0146-0227: an item that lies wholly inside a SEMI/ANTI join's syntactic
+	// RHS — a join_collapse_limit sub-problem made of pulled sublink leaves, the
+	// third NOT EXISTS of TPC-DS Q69 — is the same case as c11's synthetic leaf
+	// below: the join never projects its RHS columns, so nothing above the root
+	// reads that item's coordinates, even the ones its own inner quals read.
+	semiAntiRHSItem := make([]bool, len(items))
+	for i := range items {
+		bit := RelSet(1) << uint(i)
+		for _, sj := range sjis {
+			if sj != nil && (sj.Jointype == parser.JoinSemi || sj.Jointype == parser.JoinAnti) &&
+				sj.SynRighthand&bit != 0 {
+				semiAntiRHSItem[i] = true
+				break
+			}
+		}
+	}
 	fill := func(coord int) (SchemaColumn, bool) {
 		for i := range items {
 			sp := itemSpans[i]
@@ -792,7 +848,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 			// even be unknown here). Checked before neededColsKnown
 			// because that gate exists for the OTHER leaf kinds, where
 			// "unknown" must fail closed.
-			if infos[i].isSemiAntiSyntheticLeaf {
+			if infos[i].isSemiAntiSyntheticLeaf || semiAntiRHSItem[i] {
 				return col, true
 			}
 			if !prob.neededColsKnown {
@@ -845,7 +901,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 		// the built node by `initialRelRows` — the pathlist-and-rows collapse
 		// this boundary performs (file header; ledgered).
 		binding: rangeBinding{offset: base},
-		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows},
+		info:    baseRelInfo{bindingIdx: -1, sourceIdx: -1, subproblemAlts: alts, subproblemBaseRows: baseRows, subproblemBaseVars: baseVars},
 		lo:      lo,
 		hi:      hi,
 		// R21 slice 1: the chosen path's parent rel — the search's own

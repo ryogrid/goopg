@@ -68,6 +68,11 @@ const maxSearchRels = 32
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.
 type searchCtx struct {
+	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
+	// search's evaluation counter, and whether this evaluation context's join
+	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.
+	geqoEvalSeq int
+	geqoProbe   bool
 	// orClauseSelDivisor: see joinlistProblem.orClauseSelDivisor.
 	orClauseSelDivisor map[Expr]float64
 	// semiDerivedRHS is the union of the SEMI join RHS relations (item
@@ -134,6 +139,13 @@ type searchCtx struct {
 	// and means "no join qual anywhere", which phase 1's clauseless branch
 	// handles; every predicate on it is nil-safe. Set by `joinSearch`.
 	clauses *restrictInfoList
+	// pushedDown / pushedDownRelids are the WHERE conjuncts delayed above
+	// the outer joins they read and the joinrel that completes those joins:
+	// the whole problem (M0146-0224, tryJoinSearch). Set on the root problem
+	// only; that joinrel's clause list carries them as pushed-down
+	// restrictions.
+	pushedDown       []*restrictInfo
+	pushedDownRelids RelSet
 
 	// builder is the sizing-and-costing collaborator `makeJoinRel` calls —
 	// P5.6's calcJoinrelSize and P5.4's add_paths_to_joinrel
@@ -209,6 +221,12 @@ type searchCtx struct {
 	outputCols      map[string]bool
 	outputColsKnown bool
 	outputEligible  bool
+	// queryTopRelids is root->all_query_rels when this problem's final rel
+	// is the query's topmost scan/join rel, else 0. PG gathers partial paths
+	// on every joinrel EXCEPT that one inside the join search (merge_clump,
+	// standard_join_search) and gathers it later, in
+	// apply_scanjoin_target_to_paths.
+	queryTopRelids RelSet
 
 	// parallelModeOK is `root->glob->parallelModeOK` for this search
 	// (considerparallel.go); cat is the catalog the qual-safety walk resolves
@@ -758,6 +776,12 @@ func subplanLeafSubpathCost(leaf Node) PlanCost {
 	if sq, ok := n.(*SubqueryScan); ok {
 		peel(sq, sq.Child)
 	}
+	// M0146-0214: an inlined CTE reference is the subquery PG plans in its
+	// place (inline_cte), priced by the same cost_subqueryscan; peel it like
+	// the SubqueryScan above. A kept CTE is cost_ctescan's, not this.
+	if cs, ok := n.(*CTEScan); ok && cs.Inlined() && cs.Child != nil {
+		peel(cs, cs.Child)
+	}
 	if p, ok := n.(*Project); ok && projectionCapableNode(p.Child) {
 		peel(p, p.Child)
 	}
@@ -774,10 +798,15 @@ func subplanLeafSubpathCost(leaf Node) PlanCost {
 // ProjectSet) and any goopg kind whose PG counterpart is ambiguous report
 // false, so their projection keeps its cpu_tuple_cost.
 func projectionCapableNode(n Node) bool {
-	switch n.(type) {
+	switch x := n.(type) {
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan, *Join, *NestedLoopIndexJoin,
 		*Aggregate, *WindowAgg, *Gather, *GatherMerge, *Result:
 		return true
+	case *Filter:
+		// M0146-0214: goopg's Filter is a qual PG keeps on the node beneath
+		// it (a scan's or join's qpqual, an Agg's HAVING), so it projects
+		// exactly when that node does.
+		return projectionCapableNode(x.Child)
 	}
 	return false
 }

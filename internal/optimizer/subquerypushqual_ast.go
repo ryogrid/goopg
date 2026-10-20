@@ -351,7 +351,7 @@ func newPushQualItem(rv parser.RangeVar, chain, pos int, nullable bool, cat cata
 	case rv.TableFunc != nil || rv.Name == "":
 	default:
 		if rv.Schema == "" {
-			if e := planCTEs[strings.ToLower(rv.Name)]; e != nil {
+			if e := plannedCTEsOf(cat)[strings.ToLower(rv.Name)]; e != nil {
 				x.names = map[string]int{}
 				for _, c := range e.schema {
 					x.names[strings.ToLower(c.Name)]++
@@ -363,7 +363,7 @@ func newPushQualItem(rv parser.RangeVar, chain, pos int, nullable bool, cat cata
 					e.materialized != "materialized" && !e.volatile && !e.isDML
 				if (singleRef || e.inlinesEachReference()) &&
 					e.query != nil && len(e.aliasColumns) == 0 && len(rv.Columns) == 0 &&
-					cteBodyNamesResolveAsDeclared(e) {
+					cteBodyNamesResolveAsDeclared(e, cat) {
 					x.body, x.cte = e.query, e
 				}
 				break

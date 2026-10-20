@@ -483,8 +483,8 @@ func baseColumnOfTable(scan Node, tbl *catalog.Table, uniq [][]string, idx int) 
 	}
 	ref := baseColumnRef{scan: scan, table: tbl, col: tbl.Columns[idx].Name, uniqueKeys: uniq}
 	if tbl.Stats != nil {
-		if tbl.Stats.RowCount > 0 {
-			ref.rawRows = float64(tbl.Stats.RowCount)
+		if rows := tableRows(tbl); rows > 0 {
+			ref.rawRows = float64(rows)
 		}
 		if idx < len(tbl.Stats.Columns) {
 			// take2 P2-09: resolve BOTH ndistinct forms. Reading

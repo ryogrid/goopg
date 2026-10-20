@@ -465,6 +465,9 @@ func (s *searchCtx) totalTablePages() float64 {
 // `buildInitialRels` prices its sequential scan with, so the two rivals in one
 // `addPath` comparison at least share a page model when neither has statistics.
 func baseRelPages(tbl *catalog.Table, relTuples float64) int64 {
+	if pages, _, ok := liveRelSize(tbl); ok {
+		return pages
+	}
 	if tbl != nil && tbl.Stats != nil && tbl.Stats.Pages > 0 {
 		return int64(tbl.Stats.Pages)
 	}
