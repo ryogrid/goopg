@@ -1643,6 +1643,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       TestScanBorrowThroughHashJoinProbe \(probe borrows, build never; poison armed; equals the cloning path\)\.
     - Q17 warm median ~4.29 s → ~3.42 s \(−20%, no overlap, 3 interleaved rounds\); PG ~1.53 s. Next lever: deform
       \(decodeRowRangeInfo 27% cum\)\.
+  - **Slice 19 — a scan under a Project walks past the columns nobody reads LANDED 2026\-10\-21.** Movement: none —
+    perf only. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE
+    same=99, TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS. Recon doc "Slice 19".
+    - Q17's probe Project reads 3 of the 8 deformed lineitem columns; 5 were fully decoded \(numerics to int64, a date,
+      a char\) for nothing\. PG walks those attributes too but leaves by\-reference values as pointers\.
+    - markProjectScanReads \(both builders\) records the targets\' read set on a seq scan directly under a non\-identity
+      Project; Open marks the rest colTypeInfo\.skip \(no absorbed qual, no SSI hook\); skipAttrLen steps a varlena by
+      its header and a by\-value fixed type by its width, else decodes\.
+    - Pins: TestScanSkipMatchesFullDecode \(18 types, poison armed; fails with varlena sizes off by one\),
+      TestPhysicalPGVarlenaSize\.
+    - Q17 warm median ~3.5 s → ~2.95 s \(−16%, no overlap\); slices 17\-19 ~6.4 s → ~2.95 s; PG ~1.53 s\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3489,6 +3500,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `b5832b221`** \(M0119 VM WAL slice 2 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `a9a9b1f55`** \(M0122\-0012 slice 18 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.

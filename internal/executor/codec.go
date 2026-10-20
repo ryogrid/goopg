@@ -1480,6 +1480,18 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 			dst[i] = NullDatum
 			continue
 		}
+		// A column no consumer reads is walked past, not decoded
+		// (colTypeInfo.skip, M0122-0012 slice 19).
+		if info != nil && info[i].skip {
+			if n, ok := skipAttrLen(&info[i], data[off:]); ok {
+				dst[i] = NullDatum
+				if seqScanDeformPoison {
+					dst[i] = deformPoisonDatum()
+				}
+				off += n
+				continue
+			}
+		}
 		// M0122-0012: a by-value integer is read straight into the slot, as
 		// PG's fetch_att does. Through the generic decoder the 48-byte Datum
 		// comes back in a stack slot written with mixed-width stores and is

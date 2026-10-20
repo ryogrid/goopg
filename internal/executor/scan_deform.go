@@ -118,6 +118,17 @@ const (
 // caller declines to full deform. A missed arm costs performance, never
 // correctness.
 func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
+	return deformScanVisit(e, func(idx int) {
+		if idx > *maxRef {
+			*maxRef = idx
+		}
+	})
+}
+
+// deformScanVisit is deformScanRefs' walk: it calls visit for every
+// ColumnRef.Index e reads and reports whether e is in the understood set
+// (deformScanRefs' whitelist). A false return means the reads are unknown.
+func deformScanVisit(e optimizer.Expr, visit func(idx int)) bool {
 	switch x := e.(type) {
 	case nil:
 		return false
@@ -127,9 +138,7 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 		if x.Index < 0 {
 			return false
 		}
-		if x.Index > *maxRef {
-			*maxRef = x.Index
-		}
+		visit(x.Index)
 		return true
 	case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
 		*optimizer.TypedStringLit, *optimizer.IntervalLit, *optimizer.NullConst,
@@ -139,24 +148,24 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 		// LIKE...ESCAPE carries a LikeEscapePattern operand, which the
 		// whitelist rejects, so those predicates decline — same as the
 		// prefilter.
-		return deformScanRefs(x.Left, maxRef) && deformScanRefs(x.Right, maxRef)
+		return deformScanVisit(x.Left, visit) && deformScanVisit(x.Right, visit)
 	case *optimizer.UnaryOp:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.CastExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsNullExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsBoolExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsDistinctFromExpr:
-		return deformScanRefs(x.Left, maxRef) && deformScanRefs(x.Right, maxRef)
+		return deformScanVisit(x.Left, visit) && deformScanVisit(x.Right, visit)
 	case *optimizer.SubqueryExpr:
 		args, ok := deformSublinkArgs(x)
 		if !ok {
 			return false
 		}
 		for _, a := range args {
-			if !deformScanRefs(a, maxRef) {
+			if !deformScanVisit(a, visit) {
 				return false
 			}
 		}
@@ -164,6 +173,27 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 	default:
 		return false
 	}
+}
+
+// deformScanReadSet reports which of a scan's width columns exprs read, or
+// nil when any expression falls outside deformScanVisit's understood set (the
+// reads are then unknown and every column must be decoded).
+func deformScanReadSet(width int, exprs ...optimizer.Expr) []bool {
+	read := make([]bool, width)
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		ok := deformScanVisit(e, func(idx int) {
+			if idx < width {
+				read[idx] = true
+			}
+		})
+		if !ok {
+			return nil
+		}
+	}
+	return read
 }
 
 // deformSublinkArgs reports the outer-row expressions a scalar sublink reads

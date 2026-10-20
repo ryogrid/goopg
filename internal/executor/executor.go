@@ -142,6 +142,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// targets into o.out and clones for the consumer; child
 		// slot lifetime is bounded by projectOp's per-Next read
 		// — no borrow contract needed.
+		markProjectScanReads(p, child)
 		return maybeInstrument(p, newProjectOp(p, child), scope), nil
 	case *optimizer.Filter:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
@@ -622,6 +623,32 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 // *planner.SeqScan, transparently peeling the maybeInstrument wrapper. Returns
 // nil for anything else. Used to hand a leaf Filter's spatial predicate to the
 // scan for GiST spatial-SSI locking (design 0118-0137).
+// scanSkipDisabled turns markProjectScanReads off. Tests set it to compare a
+// skipping scan's results with the full decode.
+var scanSkipDisabled = false
+
+// markProjectScanReads records, on a seq scan directly under a non-identity
+// Project, the columns the Project's targets read (M0122-0012 slice 19). The
+// Project evaluates only its targets against the scan's row, and the row
+// leaves the scan through nothing else, so the remaining columns of the
+// deform window need not be decoded — PG's projection likewise fetches only
+// the attributes its expressions reference (ExecBuildProjectionInfo,
+// EEOP_SCAN_FETCHSOME up to last_scan, with by-reference values left as
+// pointers). Unknown target shapes leave readCols nil: everything decodes.
+func markProjectScanReads(p *optimizer.Project, child Operator) {
+	if scanSkipDisabled || isIdentityProject(p) {
+		return
+	}
+	if _, ok := p.Child.(*optimizer.SeqScan); !ok {
+		return
+	}
+	so := unwrapSeqScanOp(child)
+	if so == nil {
+		return
+	}
+	so.readCols = deformScanReadSet(len(so.cols), p.Targets...)
+}
+
 func unwrapSeqScanOp(op Operator) *seqScanOp {
 	switch o := op.(type) {
 	case *seqScanOp:
@@ -690,6 +717,9 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		// Phase C.3: target expressions compiled into exprTreeSlab; projectState
 		// holds only compiled indices — no GC-traced *planner.Project or schema slice.
 		// Schema is pooled in opTreeSlab.schemas; projectState stores an int32 index.
+		if so, ok := tree.ops[childIdx].state.(*seqScanOp); ok {
+			markProjectScanReads(p, so)
+		}
 		targExprs := make([]int32, len(p.Targets))
 		for i, t := range p.Targets {
 			targExprs[i] = tree.exprs.buildExpr(t)

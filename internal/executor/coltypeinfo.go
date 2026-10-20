@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -85,6 +86,55 @@ type colTypeInfo struct {
 	// decodeRowRangeInfo decodes in place when its payload fits the int64
 	// mantissa fast path. See numericFastForLoweredName.
 	isNumeric bool
+	// skip marks a column no consumer of this scan reads (seqScanOp.readCols):
+	// decodeRowRangeInfo walks past its bytes without decoding it, as PG's
+	// slot_deform_heap_tuple walks every attribute before the last one it is
+	// asked for but leaves a by-reference value as a pointer. Set per scan in
+	// Open, only for a column skipAttrLen can measure.
+	skip bool
+}
+
+// skipAttrLen is the byte length of a column's stored value at data, measured
+// without decoding it, for decodeRowRangeInfo's skip arm. It follows goopg's
+// physical encoding, not attLen alone: a varlena (catalog.PhysicalTypeIsVarlena)
+// is sized from its header (VARSIZE_ANY), a by-value fixed type by its width.
+// ok is false whenever the value cannot be measured that way — an external
+// TOAST pointer, a truncated value, a fixed type passed by reference — and the
+// caller then decodes it as usual.
+func skipAttrLen(ci *colTypeInfo, data []byte) (int, bool) {
+	if ci.isVarlena {
+		return physicalPGVarlenaSize(data)
+	}
+	n := int(ci.intWidth)
+	if n == 0 {
+		if !ci.attByVal || ci.attLen <= 0 {
+			return 0, false
+		}
+		n = int(ci.attLen)
+	}
+	if len(data) < n {
+		return 0, false
+	}
+	return n, true
+}
+
+// physicalPGVarlenaSize is VARSIZE_ANY over a stored varlena header: the short
+// 1-byte form, or the 4-byte form compressed or not (its size field counts the
+// compressed bytes, which is what the tuple holds). An external TOAST pointer
+// (header 0x01) is not measured.
+func physicalPGVarlenaSize(data []byte) (int, bool) {
+	if len(data) == 0 || data[0] == 0x01 {
+		return 0, false
+	}
+	if data[0]&0x01 == 0x01 {
+		total := int(data[0] >> 1)
+		return total, total >= 1 && total <= len(data)
+	}
+	if len(data) < 4 {
+		return 0, false
+	}
+	total := int((binary.LittleEndian.Uint32(data[:4]) >> 2) & 0x3FFFFFFF)
+	return total, total >= 4 && total <= len(data)
 }
 
 // resolveColTypeInfo resolves one colTypeInfo per column. Call it once, from

@@ -1062,6 +1062,11 @@ type seqScanOp struct {
 	// stay full-width — only the deform window narrows, so bound ==
 	// len(cols) takes the exact pre-EX1-01 path. See scan_deform.go.
 	deformBound int
+	// readCols, when non-nil, is the set of columns any consumer of this scan's
+	// rows reads (M0122-0012 slice 19): Build sets it for a scan whose only
+	// reader is the non-identity Project above it. Open marks every other
+	// column in colInfo as skip, so the deform walks past it undecoded.
+	readCols []bool
 	// borrowRows is set at Build when the parent consumes every row before
 	// the next Next() and retains nothing of it (aggregateBorrowsScanRows):
 	// Next then yields scanRow itself instead of a per-tuple clone
@@ -1482,6 +1487,13 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// Context — the only way the GUCs can differ mid-operator — re-reads them.
 	o.arrayStyleLive = colsHaveArray(o.cols)
 	o.colInfo = resolveColTypeInfo(o.cols)
+	if o.readCols != nil && !o.qualSet && o.ssiGistPred == nil && o.ssiGinPred == nil {
+		for i := range o.colInfo {
+			if i < len(o.readCols) && !o.readCols[i] {
+				o.colInfo[i].skip = true
+			}
+		}
+	}
 	if o.arrayStyleLive {
 		o.arrayStyle = arrayOutputStyle(ctx)
 	}

@@ -685,3 +685,62 @@ interleaved rounds of five runs:
 
 - The `BuildFast` builder (`buildRec`, the opnode tree) sets no borrow at all; only `buildNode` does.
 - Merge and nested-loop probe sides, and chains with a Filter between, still clone.
+
+## Slice 19 (2026-10-21): a scan under a Project walks past the columns nobody reads — TPC-H Q17
+
+After slice 18, deform led Q17's probe: `decodeRowRangeInfo` at 27 % cumulative. The lineitem probe's Project
+reads `l_extendedprice`, `l_quantity` and `l_partkey`. Under HammerDB's column order those are the 4th, 6th and
+8th columns, so the deform window is 8 columns and 5 of them were fully decoded for nothing: numerics converted to
+int64, a date, a `char`.
+
+PG's `slot_deform_heap_tuple` also walks every attribute before the last one it is asked for, because a heap tuple
+has no offset array. A by-reference value costs it only a pointer store, so an unread numeric costs PG nothing.
+
+**Rule.** For a non-identity Project directly over a seq scan (`markProjectScanReads`, in both the `buildNode` and
+`buildRec` arms), the scan records the set of columns its targets read (`deformScanReadSet`). It is built over
+`deformScanVisit`, the whitelist walker `deformScanRefs` now uses; an unknown target shape leaves the set nil.
+
+The Project evaluates only its targets against the scan's row, and the row leaves the scan through nothing else:
+no code outside `seqScanOp` reads `scanRow`. So every other column in the deform window is walked past undecoded.
+`colTypeInfo.skip` is set in Open, and only when the scan has no absorbed qual and no GiST/GIN SSI hook, the
+scan's own readers of the row.
+
+`skipAttrLen` measures a skipped value by goopg's physical encoding:
+
+- a varlena by its header (`physicalPGVarlenaSize`, which is VARSIZE\_ANY): the short form, or the 4-byte form,
+  compressed or not;
+- a by-value fixed type by its width.
+
+Anything else is decoded as before: an external TOAST pointer, a truncated value, or a fixed by-reference type
+such as uuid or interval.
+
+**Pins:**
+
+- `TestScanSkipMatchesFullDecode` builds an 18-column table spanning int2/4/8, numeric, text with NULLs, varchar,
+  char, date, timestamp, timestamptz, float4/8, bool, uuid, interval, bytea, and text stored compressed inline,
+  with a read column after every type. With tail poison armed, five projections must equal the full decode
+  (`scanSkipDisabled`). Making varlena sizes off by one fails it.
+- `TestPhysicalPGVarlenaSize` covers the header forms and the refusals.
+
+**Measured.** Q17, HEAD `a9a9b1f55` against the candidate, a fresh server per arm, three interleaved rounds of
+five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 4.34 / 3.49 / 3.53 / 3.64 / 3.68 | 3.37 / 3.03 / 2.89 / 3.00 / 3.13 |
+| 2 | 3.36 / 3.38 / 3.36 / 3.42 / 3.85 | 3.09 / 2.86 / 2.92 / 2.92 / 3.21 |
+| 3 | 3.47 / 3.42 / 3.54 / 3.66 / 3.66 | 3.00 / 2.90 / 2.94 / 2.93 / 3.18 |
+
+- The warm median went from ~3.5 s to ~2.95 s (−16 %), with no overlap.
+- Across slices 17–19 Q17 went from ~6.4 s to ~2.95 s. PG is ~1.53 s.
+- `decodeRowRangeInfo` fell from 27 % to 20 % cumulative, and the generic decoder left the top of the profile.
+
+**Next levers** on Q17: `projectOp.Next` flat (12 %), `pageChecksumBlock` (9 %), and
+`NumericInt64FromStoredPayload` for the three columns actually read (6.7 %).
+
+**Not done (ledgered).** The walk-past applies only to a Project directly over a qual-less seq scan. It does not
+cover:
+
+- scans with a qual, where the qual's columns join the read set;
+- consumers further up, through joins: a read set threaded like the deform bound;
+- index and bitmap scans.
