@@ -12,11 +12,12 @@ import (
 )
 
 // TestPgWaldumpHeapRecordsCarryVMCleared reads goopg's own WAL with PG 18.3's
-// pg_waldump after a change to an all-visible page. Each heap record must
-// carry PG's *_ALL_VISIBLE_CLEARED flag bit (heap_insert, heap_delete and
+// pg_waldump around VACUUM. Each visibility-map set must be PG's
+// XLOG_HEAP2_VISIBLE, and each heap change to an all-visible page must carry
+// PG's *_ALL_VISIBLE_CLEARED flag bit (heap_insert, heap_delete and
 // heap_update set it when PageIsAllVisible held), which PG's redo uses to
-// clear the page's visibility-map bits. goopg logged only its own native
-// rmgr-128 clear record, which a PG standby cannot replay.
+// clear the page's map bits. goopg logged both as its own native rmgr-128
+// record, which a PG standby cannot replay.
 func TestPgWaldumpHeapRecordsCarryVMCleared(t *testing.T) {
 	waldump := clientToolBin(t, "pg_waldump")
 	psqlBin := clientToolBin(t, "psql")
@@ -112,6 +113,27 @@ func TestPgWaldumpHeapRecordsCarryVMCleared(t *testing.T) {
 	for _, r := range got[:len(got)-len(want)] {
 		if r.flags&0x01 != 0 {
 			t.Errorf("seed %s carries ALL_VISIBLE_CLEARED; the page was not all-visible yet", r.op)
+		}
+	}
+
+	// Each VACUUM's set is PG's XLOG_HEAP2_VISIBLE — block 0 the vm page,
+	// block 1 the heap page — not goopg's native rmgr-128 record, which a PG
+	// standby cannot replay. Nothing in the whole stream is a custom rmgr.
+	visRE := regexp.MustCompile(`desc: VISIBLE snapshotConflictHorizon: \d+, flags: 0x0([1-3]), blkref #0: rel 1663/` +
+		regexp.QuoteMeta(dbOID+"/"+relnode) + ` fork vm blk 0, blkref #1: rel 1663/` + regexp.QuoteMeta(dbOID+"/"+relnode) + ` blk 0`)
+	visible := 0
+	for _, ln := range waldumpLines(t, waldump, libDir, c.DataDir(), startLSN, endLSN,
+		"--relation", fmt.Sprintf("1663/%s/%s", dbOID, relnode), "--rmgr", "Heap2") {
+		if visRE.MatchString(ln) {
+			visible++
+		}
+	}
+	if visible != 3 {
+		t.Errorf("XLOG_HEAP2_VISIBLE records for vmc = %d, want 3 (one per VACUUM)", visible)
+	}
+	for _, ln := range waldumpLines(t, waldump, libDir, c.DataDir(), startLSN, endLSN) {
+		if strings.Contains(ln, "rmgr: custom") {
+			t.Errorf("goopg-native record in the stream: %s", ln)
 		}
 	}
 }

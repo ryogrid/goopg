@@ -328,7 +328,7 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 			case storage.PageAllVisible(page, horizon):
 				opts.VM.SetAllVisible(rel, blk)
 			default:
-				opts.VM.ClearBlock(rel, blk)
+				opts.VM.ClearBlockNoWAL(rel, blk)
 			}
 		}
 		// Cost-based throttling (vacuum.c:2472–2490): accumulate per-page

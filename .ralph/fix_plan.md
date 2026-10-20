@@ -1371,7 +1371,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Gates: xlog \-race, cmd/goopg, E2E physical/failover/standby family, recovery/pg\_ctl/pg\_waldump ports, units,
       internal/postmaster, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025\.
   Movement: none — WAL/promotion correctness — no plan instrument \(no planner change\)
-- [ ] **Visibility\-map changes as XLOG\_HEAP2\_VISIBLE** \(filed 2026\-10\-14 at the M0122\-0009 close\)\.
+- [x] **Visibility\-map changes as XLOG\_HEAP2\_VISIBLE** \(filed 2026\-10\-14 at the M0122\-0009 close\)\.
   Kind: impl
   Parent: none
   - goopg logs every VM change as a native rmgr\-128 `RecordKindHeapVisible` record with no block reference and no
@@ -1393,6 +1393,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       TestPgWaldumpHeapRecordsCarryVMCleared\.
     - Next \(slice 2\): emit sets as XLOG\_HEAP2\_VISIBLE \(block 0 VM page, block 1 heap page\) and retire the native
       set/clear records; ledgered gaps in the design §6\.
+  - **Slice 2 LANDED 2026\-10\-21 — Done\.** Design §7\.
+    - Sets are PG\'s XLOG\_HEAP2\_VISIBLE \(EncodeHeapVisiblePG: block 0 the vm page, block 1 the heap page\); goopg\'s
+      redo applies them through the decoded arm written for PG WAL\.
+    - Plain clears are unlogged \(VisibilityMap\.ClearBlockNoWAL\) at every site whose heap record carries the flag and
+      at VACUUM\'s corrective clear, as in PG\.
+    - pg\_waldump: three `Heap2 VISIBLE … fork vm blk 0` records, no custom\-rmgr record in the stream\.
+    - Crash test TestVisibilityMapSurvivesCrashFromPGRecords: VACUUM → kill → bit restored; INSERT → kill → bit
+      cleared \(fails with redoClearAllVisible disabled\)\.
+    - Ledgered: native records remain for the row\-lock frozen clear, a dropped relation\'s map and the catalog
+      resync clear; no conflict horizon; no CATALOG\_REL flag\.
+    - Gates: units, postmaster, replication E2E family, RegressSuite, vacuum isolation specs, pg\_waldump ports,
+      tpch\-spotcheck, acceptance arm, sf025\.
+  Movement: none — WAL/redo correctness — no plan instrument \(no planner change\)
 - [ ] **XLogInsert / XLogFlush rename** \(backlog entry, M0042\-0003; filed 2026\-10\-14 at the M0122\-0009 close\)\.
   Kind: impl
   Parent: none

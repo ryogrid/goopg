@@ -1427,6 +1427,26 @@ func EncodeCheckpointRedoPG() ([]byte, error) {
 	return framedAssemble(RmgrXLog, xlogCheckpointRedo, 0, mainData, nil)
 }
 
+// EncodeHeapVisiblePG builds PG's RM_HEAP2 XLOG_HEAP2_VISIBLE record for a
+// visibility-map set (log_heap_visible, heapam.c): main data
+// xl_heap_visible{snapshotConflictHorizon, flags}, block 0 the vm page that
+// holds heapBlk's bits, block 1 the heap page. flags are the vm bits being set
+// (VISIBILITYMAP_ALL_VISIBLE, | ALL_FROZEN). Redo sets them and the heap
+// page's PD_ALL_VISIBLE (replayDecodedXLogHeap2Visible, heap_xlog_visible).
+func EncodeHeapVisiblePG(rel storage.RelFileNode, heapBlk storage.BlockNumber, snapshotConflictHorizon storage.TransactionID, flags uint8) ([]byte, error) {
+	heapRel := rel
+	heapRel.Fork = storage.MainFork
+	vmRel := heapRel
+	vmRel.Fork = storage.VisibilityMapFork
+	mainData := make([]byte, sizeOfXLogHeapVisibleData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(snapshotConflictHorizon))
+	mainData[4] = flags
+	return framedAssemble(RmgrHeap2, xlogHeap2Visible, 0, mainData, []BlockRef{
+		{ID: 0, Rel: vmRel, Block: storage.VMBlockForHeapBlock(heapBlk)},
+		{ID: 1, Rel: heapRel, Block: heapBlk},
+	})
+}
+
 // sizeOfXlEndOfRecovery is sizeof(xl_end_of_recovery) (access/xlog_internal.h):
 // end_time TimestampTz(8) + ThisTimeLineID(4) + PrevTimeLineID(4) +
 // wal_level int(4), padded to the struct's 8-byte alignment. PG registers

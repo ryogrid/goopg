@@ -4607,7 +4607,7 @@ func tryApplyHOTUpdate(
 	// was all-visible, HOT or not — the new version's xmin is not yet visible
 	// to all, and an all-frozen bit would let VACUUM skip freezing it.
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
@@ -9730,7 +9730,7 @@ func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple)
 			}
 			// Clear VM: page was modified, no longer ALL_VISIBLE (M0046-0004).
 			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+				ctx.VM.ClearBlockNoWAL(rel, blk)
 			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -9886,7 +9886,7 @@ func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple)
 	}
 	// New page starts dirty — not ALL_VISIBLE (M0046-0004).
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
@@ -9942,7 +9942,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 			}
 			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+				ctx.VM.ClearBlockNoWAL(rel, blk)
 			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -10053,7 +10053,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 	}
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
@@ -10189,7 +10189,7 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			ctx.FSM.RecordFreeSpaceForPage(rel, oldTID.Block, oldSlotBuf.Page())
 		}
 		if ctx.VM != nil {
-			ctx.VM.ClearBlock(rel, oldTID.Block)
+			ctx.VM.ClearBlockNoWAL(rel, oldTID.Block)
 		}
 		oldSlotBuf.Unlock()
 		ctx.Pool.Unpin(oldSlotBuf)
@@ -10312,8 +10312,8 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			ctx.FSM.RecordFreeSpaceForPage(rel, newBlk, newBuf.Page())
 		}
 		if ctx.VM != nil {
-			ctx.VM.ClearBlock(rel, newBlk)
-			ctx.VM.ClearBlock(rel, oldTID.Block)
+			ctx.VM.ClearBlockNoWAL(rel, newBlk)
+			ctx.VM.ClearBlockNoWAL(rel, oldTID.Block)
 		}
 		unlockBoth()
 		if derr != nil {
@@ -10418,7 +10418,7 @@ func markHeapDeleteDirtyAndClearVM(
 		return err
 	}
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	return nil
 }

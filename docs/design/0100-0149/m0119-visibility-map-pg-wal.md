@@ -1,8 +1,8 @@
 # M0119 — visibility-map changes in PG's WAL form
 
 Status: slice 1 landed 2026-10-21 (clears ride heap records, and redo honours
-them). Slice 2 (sets as XLOG\_HEAP2\_VISIBLE, native records retired) is
-open.
+them); slice 2 landed 2026-10-21 (sets as XLOG\_HEAP2\_VISIBLE, plain clears
+unlogged). The task is closed; three native records remain (§7).
 
 ## 1. Gap
 
@@ -114,3 +114,59 @@ VACUUM; HOT UPDATE
 - **Conflict horizon.** The native set record carries no
   snapshotConflictHorizon. Slice 2 needs one for a PG standby's query
   conflicts.
+
+## 7. Slice 2 (landed)
+
+**Sets.** The VM WAL hook (`initdb.Open`) now emits every set as PG's
+record. `EncodeHeapVisiblePG` writes:
+
+- block 0: the vm fork page holding the heap block's bits;
+- block 1: the heap page;
+- main data: `xl_heap_visible{snapshotConflictHorizon, flags}`, with flags
+  `VISIBILITYMAP_ALL_VISIBLE`, plus `ALL_FROZEN` for a freeze.
+
+goopg's own redo applies it through the existing decoded arm,
+`replayDecodedXLogHeap2Visible`, which was written for a PG primary's WAL.
+The walsummarizer counts its block references like any other PG record.
+
+**Plain clears are no longer logged on their own.**
+`VisibilityMap.ClearBlockNoWAL` is used at:
+
+- every executor site whose heap record carries the
+  `XLH_*_ALL_VISIBLE_CLEARED` flag (slice 1): inserts, TOAST inserts, HOT,
+  catalog updates and delete;
+- VACUUM's corrective clear, which PG leaves unlogged.
+
+The hook still writes the native record only for what PG logs elsewhere and
+goopg does not yet:
+
+- a row lock's frozen-only clear: `XLH_LOCK_ALL_FROZEN_CLEARED` on a lock
+  record that is still native;
+- a dropped relation's map: smgr truncate/unlink;
+- the catalog resync clear (operators\_ddl), which is logged as a full-page
+  image.
+
+**Verified:**
+
+- `TestPgWaldumpHeapRecordsCarryVMCleared` runs PG 18.3's `pg_waldump`. It
+  now also asserts:
+  - each VACUUM's set is `Heap2 VISIBLE ... flags: 0x03, blkref #0: … fork
+    vm blk 0, blkref #1: … blk 0`, three in all;
+  - the whole stream holds no custom-rmgr (native) record.
+- `TestVisibilityMapSurvivesCrashFromPGRecords` SIGKILLs a real server
+  twice:
+  - after VACUUM, recovery restores the bit from `XLOG_HEAP2_VISIBLE`;
+  - after an INSERT, recovery clears it from `XLH_INSERT_ALL_VISIBLE_CLEARED`,
+    the clear's only record now.
+
+  Making `redoClearAllVisible` a no-op fails the second check with bits
+  0x3.
+
+**Still not done (ledgered):**
+
+- the three native records above;
+- snapshotConflictHorizon is always InvalidTransactionId, so a PG hot
+  standby resolves no query conflicts on a set;
+- `VISIBILITYMAP_XLOG_CATALOG_REL` is never set (catalog relations under
+  wal\_level logical);
+- `PD_ALL_VISIBLE` is set only by redo, never at runtime.

@@ -2850,12 +2850,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// RecordKindHeapVisible (replayHeapVisible applies it to the fork). The
 	// next checkpoint saves the forks and records the capability (FlushCLOGFn
 	// above), after which a crash start may trust them.
+	// A set goes out as PG's XLOG_HEAP2_VISIBLE, which a PG standby replays.
+	// Plain clears are not logged here at all: the heap record that caused
+	// them carries XLH_*_ALL_VISIBLE_CLEARED (VisibilityMap.ClearBlockNoWAL).
+	// The native record remains for what PG logs elsewhere and goopg does not
+	// yet: a row lock's frozen-only clear (XLH_LOCK_ALL_FROZEN_CLEARED on a
+	// still-native lock record), a dropped relation's map, and the catalog
+	// resync clear that is logged as a full-page image.
 	rt.VM.SetWALHook(func(rel storage.RelFileNode, blk storage.BlockNumber, flags uint8) error {
-		_, _, err := walWriter.Append(xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{
-			Rel:     rel,
-			HeapBlk: blk,
-			Flags:   flags,
-		}))
+		var payload []byte
+		if flags&storage.VMWALSetAllVisible != 0 {
+			bits := uint8(storage.VMAllVisible)
+			if flags&storage.VMWALSetAllFrozen != 0 {
+				bits |= storage.VMAllFrozen
+			}
+			var err error
+			if payload, err = xlog.EncodeHeapVisiblePG(rel, blk, storage.InvalidTransactionID, bits); err != nil {
+				return err
+			}
+		} else {
+			payload = xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: rel, HeapBlk: blk, Flags: flags})
+		}
+		_, _, err := walWriter.Append(payload)
 		return err
 	})
 	vmLogging.Store(true)
