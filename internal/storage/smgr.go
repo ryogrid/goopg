@@ -742,6 +742,14 @@ func relDir(rel RelFileNode) string {
 		misc.TablespaceVersionDirectory + "/" + fmt.Sprint(rel.DBOid)
 }
 
+// RelMainPath is the data-directory-relative path of rel's main fork — the
+// string pg_relation_filepath returns (relpathbackend for MAIN_FORKNUM,
+// common/relpath.c): global/<n>, base/<db>/<n>, or
+// pg_tblspc/<spc>/<version dir>/<db>/<n>. It names the file relPath opens.
+func RelMainPath(rel RelFileNode) string {
+	return relDir(rel) + "/" + strconv.FormatUint(uint64(rel.RelOid), 10)
+}
+
 func (m *Manager) relPath(rel RelFileNode) string {
 	base := filepath.Join(m.cfg.DataDir, relDir(rel))
 	switch rel.Fork {

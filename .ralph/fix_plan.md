@@ -557,6 +557,7 @@ heuristic stays live.)
       TestStartupGoroutinesSelectsMainAndInitdb\.
     - Next: read the two notes on the next nightly start timeout; high\-events and PSI stalls → resize the lanes,
       a quiet group plus a parked initdb\.Open frame → fix that wait\.
+    - 2026\-10\-21 nightly \(e64b1bfe9, diagnostic armed\): no start timeout in testport; still waiting for one\.
 - [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
@@ -577,6 +578,11 @@ heuristic stays live.)
       output; it fails with a 5 s guard\.
     - Gates: testport/framework, TestPort\_Isolation\* 122/122 \(561\.7 s\), units, tpch\-spotcheck, sf025\.
   Movement: none — test\-harness fidelity — no plan instrument \(isolation runner timing only\)
+- [ ] testport/TestE2E\_FailoverPGtoGoopg — FAIL \(80\.49 s, async arm 50\.55 s\) \(AI\-20261021\-010544\-001; repro: `go test \-v \-run '^TestE2E\_FailoverPGtoGoopg$' \./internal/testport/`\)\.
+  - 2026\-10\-21 nightly at e64b1bfe9: the async subtest's probe `SELECT count\(\*\) FROM public\.bench\_log WHERE client = \-999`
+    stayed 0 for 30 s with the WAL receiver streaming; sync\_remote\_apply and sync\_on passed\. Not yet re\-run alone\.
+  - First step: re\-run the async arm alone and under load; read the subtest's replay/apply position against the
+    probe's insert LSN\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
@@ -1220,11 +1226,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     \(`endPendingRelDeletes` currently forgets it\)\.
   - Expected instrument: a testport case of the repro; regress `transactions` savepoint DDL cases\.
 
-- [ ] **`pg\_relation\_filepath\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6b\)\.
+- [x] **`pg\_relation\_filepath\(\)` does not exist** \(found 2026\-10\-14 during M0122\-0009 S6b\)\.
   Kind: bug
   Parent: none
   - `SELECT pg\_relation\_filepath\(\'t\'\)` → 42883\. PG returns `base/<db>/<relfilenode>` \(dbsize\.c\)\.
   - First step: an executor builtin from the catalog\'s RelFileNode \(tablespace, database, relfilenode\)\.
+  - **Done 2026\-10\-21\.** Design `docs/design/0100\-0149/0119\-0010\-pg\-relation\-filepath\.md`\.
+    - pg\_relation\_filepath returns the main fork's data\-directory path \(relpathbackend\), the file the storage
+      manager opens; NULL for InvalidOid, an unknown OID or a relkind without storage \(dbsize\.c\)\.
+    - Sibling fixed with it: pg\_relation\_filenode returned NULL for every index and a view\'s OID for a view; both
+      now share relationStorageForOID over catalog\.TableRelkind / IndexRelkind, the relkind pg\_class shows\.
+    - The dbsize functions took no name literal \(`pg\_relation\_size\(\'t\'\)` was NULL\); resolveRegclassOID now goes
+      through regclassin \(regIdentifierInput\) and raises 42P01 for a missing name, as PG does\.
+    - PG 18\.3 scratch comparison identical except the path\'s database directory \(pg\_database shows 16384, files
+      live in base/5: the known 0119\-0006bv split\)\.
+    - Ledgered: no t<procnumber>\_ temp prefix; nailed system\-index stubs and shared catalogs return NULL;
+      pg\_class\.relfilenode ignores RelFileNodeOID\.
+    - Pin: TestPgRelationFilepathAndFilenode \(fails without the relkind check\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, tpch\-spotcheck, sf025\.
+  Movement: none — catalog/executor correctness — no plan instrument \(dbsize builtins only\)
 
 - [ ] **Boolean predicate columns are advertised as `text`** \(found 2026\-10\-14 during M0122\-0009 S7\)\.
   Kind: bug
@@ -3364,6 +3384,12 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 pass 2026\-10\-20 — **exhausted at `04839ab7f`**\. Census: the M0146\-0242 fire\-set and TPC\-H captures on HEAD's
     code tree \(`analysis/m0146/m0146\-0242/fireset/`, `analysis/m0146/m0146\-0242/tpch/`\): TPC\-H 22/22, TPC\-DS SF0\.25
     99/99, SF1 99/99, every CATEGORIES\-EXCL\-MATCH category 0\. No record is non\-MATCH, so nothing is filed\. Open
+    items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175,
+    M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239\(below\-item\-10\);
+    M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `b084797b2`** \(`44cf7d275` changed internal/executor: wait\-event
+    reporting only\)\. Census `analysis/m0146/m0146\-0014/routing\-20261021a/` is a fresh capture of all three corpora:
+    TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every CATEGORIES\-EXCL\-MATCH category 0\. No task is filed\. Open
     items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175,
     M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239\(below\-item\-10\);
     M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.

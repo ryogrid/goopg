@@ -6992,19 +6992,32 @@ func parsePgSnapshotValid(s string) bool {
 // A regclass value already carries its OID once evaluated (or, less
 // commonly, arrives as the textual OID from an explicit ::regclass cast) —
 // same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
-func resolveRegclassOID(argExpr optimizer.Expr, slot SlotView, ctx *Context) (uint32, bool) {
+func resolveRegclassOID(argExpr optimizer.Expr, slot SlotView, ctx *Context) (uint32, bool, error) {
 	arg, err := evalExprSlot(argExpr, slot, ctx)
-	if err != nil || arg.IsNull() {
-		return 0, false
+	if err != nil {
+		return 0, false, err
+	}
+	if arg.IsNull() {
+		return 0, false, nil
+	}
+	if arg.Kind == KindString {
+		// An unknown literal reaches a regclass parameter through regclassin
+		// (`pg_relation_size('t')`): a name resolves on the search path and a
+		// missing one raises 42P01, as the parameter's input function does in
+		// PG. An OID string stays an OID (parseRegDashOrOid).
+		arg, err = regIdentifierInput(arg, "regclass", ctx, argExpr.Pos())
+		if err != nil {
+			return 0, false, err
+		}
 	}
 	if arg.Kind == KindInt {
-		return uint32(arg.Int), true
+		return uint32(arg.Int), true, nil
 	}
 	v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
 	if perr != nil {
-		return 0, false
+		return 0, false, nil
 	}
-	return uint32(v), true
+	return uint32(v), true, nil
 }
 
 // parseForkName maps a pg_relation_size fork-name argument to storage's
@@ -7054,6 +7067,9 @@ func relationAllForksSize(pool *storage.Pool, rel storage.RelFileNode) int64 {
 // relationFileNodeForOID resolves a regclass OID to its RelFileNode, for
 // either an ordinary table or an index — pg_relation_size accepts both.
 func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if oid == 0 { // InvalidOid names no relation (try_relation_open)
+		return storage.RelFileNode{}, false
+	}
 	if tbl, ok := cat.LookupTableByOID(oid); ok {
 		return cat.RelFileNode(tbl), true
 	}
@@ -7071,6 +7087,89 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 	return storage.RelFileNode{}, false
 }
 
+// relationStorageForOID is the storage pg_relation_filenode and
+// pg_relation_filepath report (dbsize.c): a relation of a kind with storage
+// (RELKIND_HAS_STORAGE — table, index, sequence, TOAST table, materialized
+// view) has one; a view, partitioned table or index, or foreign table has
+// none, and neither has an unknown OID — both functions return NULL then. The
+// relkind is the one pg_class shows, so the functions agree with
+// pg_class.relfilenode. A temporary relation is no exception: PG reports its
+// filenode too.
+func relationStorageForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if oid == 0 { // InvalidOid has no pg_class row
+		return storage.RelFileNode{}, false
+	}
+	if tbl, ok := cat.LookupTableByOID(oid); ok {
+		if !catalog.RelkindHasStorage(catalog.TableRelkind(tbl)) {
+			return storage.RelFileNode{}, false
+		}
+		return cat.RelFileNode(tbl), true
+	}
+	if idx, ok := cat.LookupIndexByOID(oid); ok {
+		if !catalog.RelkindHasStorage(cat.IndexRelkind(idx)) {
+			return storage.RelFileNode{}, false
+		}
+		return cat.IndexRelFileNode(idx), true
+	}
+	if toastRel, ok := cat.ToastRelFileNodeByOID(oid); ok {
+		return toastRel, true
+	}
+	return storage.RelFileNode{}, false
+}
+
+// evalPgRelationFilenode implements pg_relation_filenode(regclass) → oid
+// (dbsize.c): the relation's file number, NULL for a relation without
+// storage or an unknown OID.
+func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationStorageForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	return Datum{Kind: KindInt, Int: int64(rel.RelOid)}, nil
+}
+
+// evalPgRelationFilepath implements pg_relation_filepath(regclass) → text
+// (dbsize.c): the main fork's path relative to the data directory, NULL when
+// pg_relation_filenode is NULL. It names the file goopg actually stores the
+// relation in. One divergence: PG puts a temporary relation's file under a
+// per-backend name (base/<db>/t<procnumber>_<n>, relpathbackend); goopg
+// stores temporary relations like permanent ones, so the path has no t prefix.
+func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationStorageForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	return NewStringDatum(storage.RelMainPath(rel)), nil
+}
+
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
 // mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
 // named fork (default "main") of the relation's own storage. M0122-0002.
@@ -7078,7 +7177,10 @@ func evalPgRelationSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Dat
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -7116,7 +7218,10 @@ func evalPgTableSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum,
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -7141,7 +7246,10 @@ func evalPgIndexesSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datu
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -14329,33 +14437,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return NullDatum, nil
 
 	case "pg_relation_filenode":
-		// pg_relation_filenode(relation regclass) → oid
-		// Returns the filenode for a relation. For temporary tables returns NULL.
-		if len(x.Args) >= 1 {
-			relDatum, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err != nil {
-				return Datum{}, err
-			}
-			var relOID uint32
-			switch relDatum.Kind {
-			case KindInt:
-				relOID = uint32(relDatum.Int)
-			case KindString:
-				n, _ := strconv.ParseUint(relDatum.StringValue(), 10, 32)
-				relOID = uint32(n)
-			}
-			if relOID != 0 {
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, exists := im.LookupTableByOID(relOID); exists {
-						if tbl.Temp {
-							return NullDatum, nil
-						}
-						return Datum{Kind: KindInt, Int: int64(relOID)}, nil
-					}
-				}
-			}
-		}
-		return NullDatum, nil
+		return evalPgRelationFilenode(x, slot, ctx)
+
+	case "pg_relation_filepath":
+		return evalPgRelationFilepath(x, slot, ctx)
 
 	case "pg_filenode_relation":
 		// pg_filenode_relation(tablespace oid, filenode oid) → regclass
