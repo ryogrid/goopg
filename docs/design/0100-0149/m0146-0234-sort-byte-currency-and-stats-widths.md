@@ -109,3 +109,37 @@ triples. A key used only by a join inside the joinrel therefore stayed in the jo
   quals. PG's base `reltarget` excludes those.
 - Non-table leaves still use type widths.
 
+## 9. Slice 3 (2026-10-20): the base rel target, after build\_base\_rel\_tlists
+
+**PG.** `build_base_rel_tlists` and `distribute_qual_to_rels` add to a base rel's reltarget only the Vars a relation
+outside it needs: the final target list, and every Var of a clause whose relids span more than one rel. A column
+read only by the rel's own restriction quals is evaluated at the scan and never emitted. `date_dim` filtered on
+`d_year` and `d_moy` and joined on `d_date_sk` has a reltarget of `d_date_sk` alone.
+
+**goopg.** Slice 2 applied this rule to joinrels. Base rels still narrowed to the statement-wide needed set, WHERE
+included, so their cost triple counted restriction-only columns.
+
+**Change.** `attrNeededAbove(relids)` factors slice 2's keep set out of `joinrelNarrowedWidths`: the above-tree
+names plus every column of a search clause that touches both the rel and a relation outside it.
+`baseRelNarrowedWidths` applies it to a base rel's kept columns, and `narrowBaseRelCostWidths` stamps that triple.
+A reltarget that keeps nothing (`count(*)` over restrictions) cannot be represented in the triple, so it keeps the
+statement-wide narrowing.
+
+**Result.** The keep set is computed and applied. On TPC-DS Q3 all three base rels are eligible. No captured plan
+moves:
+
+- TPC-DS fire set: SF0.25 and SF1 plans are text-identical, costs included, between baseline and candidate.
+- TPC-H parity stays 22 / 22, and the sf025 plan shapes stay the same.
+
+No instrument consumes a base rel's width visibly on these corpora:
+
+- The joins above already price with the slice-2 joinrel target, which never held restriction-only columns.
+- A hash build over a small dimension is one batch, so its width does not change cost.
+- EXPLAIN renders widths from the unnarrowed schema (M0146-0042).
+
+**Pin.** `TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns`: a rel whose only outside need is its join key
+keeps that key alone (width 4 of 12). With nothing needed above, it keeps the statement-wide set.
+
+**Remaining (task open).** A non-table leaf (subquery, CTE) still takes its column widths from type widths. PG uses
+the subquery's target-list widths (`set_subquery_size_estimates`, `set_cte_size_estimates`).
+

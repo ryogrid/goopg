@@ -5498,6 +5498,19 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Movement: none — parity held; SF1 Q64 eval worths converge on PG \(max error 0\.0046→0\.00067\)\.
     - Remaining \(task stays open\): base rels narrow to the statement\-wide set \(PG's base reltarget drops columns read
       only by the rel's own restriction quals\); non\-table leaves use type widths\.
+  - **Slice 3 2026\-10\-20 \(loop \#36\): the base rel target, after build\_base\_rel\_tlists\.** Design §9; evidence
+    `analysis/m0146/m0146\-0234/slice3/`\.
+    - attrNeededAbove \(factored from joinrelNarrowedWidths\) gives a base rel's keep set: above\-tree names plus columns
+      of clauses reaching another rel; baseRelNarrowedWidths stamps it \(an empty reltarget keeps the statement\-wide
+      set\)\. Restriction\-only columns no longer count in a base rel's cost width\.
+    - Measured inert: fire\-set SF0\.25/SF1 plans text\-identical with costs; TPC\-H 22/22; sf025 same=99\. The joins above
+      already price with the slice\-2 target, small hash builds are one batch, EXPLAIN widths are unnarrowed\.
+    - Pin: TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22,
+      sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+    - Movement: none — instrument artefact: no captured plan or cost reads a base rel's width on these corpora\.
+    - Remaining \(task stays open\): non\-table leaves' widths from the subquery target list
+      \(set\_subquery\_size\_estimates / set\_cte\_size\_estimates\)\.
 - [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl

@@ -253,20 +253,9 @@ func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
 		!s.outputColsKnown || s.outputCols == nil || s.clauses == nil || len(joinrel.publishedMembers) == 0 {
 		return narrowedWidths{}
 	}
-	keep := make(map[string]bool, len(s.outputCols)+16)
-	for name := range s.outputCols {
-		keep[name] = true
-	}
-	for _, ri := range s.clauses.all {
-		if ri == nil || ri.clause == nil {
-			continue
-		}
-		if ri.relids&joinrel.Relids == 0 || relsSubset(ri.relids, joinrel.Relids) {
-			continue
-		}
-		if !visitColumnRefsByName(ri.clause, func(name string) { keep[name] = true }) {
-			return narrowedWidths{}
-		}
+	keep, ok := s.attrNeededAbove(joinrel.Relids)
+	if !ok {
+		return narrowedWidths{}
 	}
 	var cols []keptColumn
 	for _, m := range joinrel.publishedMembers {
@@ -277,6 +266,57 @@ func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
 		cols = append(cols, mc...)
 	}
 	return sumKeptColumns(cols, keep)
+}
+
+// attrNeededAbove is the NAME set of attributes a rel over relids must emit —
+// attr_needed restricted to relations outside it (build_base_rel_tlists and
+// build_joinrel_tlist, relnode.c): the query's output above the tree plus every
+// column read by a search clause whose relids touch both relids and a relation
+// outside them. A clause wholly inside relids — a base rel's own restriction,
+// or a join clause already applied below — needs nothing emitted. ok=false
+// when the problem is not output-eligible or a clause cannot be inventoried.
+func (s *searchCtx) attrNeededAbove(relids RelSet) (map[string]bool, bool) {
+	if s == nil || !s.outputEligible || !s.outputColsKnown || s.outputCols == nil || s.clauses == nil {
+		return nil, false
+	}
+	keep := make(map[string]bool, len(s.outputCols)+16)
+	for name := range s.outputCols {
+		keep[name] = true
+	}
+	for _, ri := range s.clauses.all {
+		if ri == nil || ri.clause == nil {
+			continue
+		}
+		if ri.relids&relids == 0 || relsSubset(ri.relids, relids) {
+			continue
+		}
+		if !visitColumnRefsByName(ri.clause, func(name string) { keep[name] = true }) {
+			return nil, false
+		}
+	}
+	return keep, true
+}
+
+// baseRelNarrowedWidths is a base rel's cost triple over its reltarget
+// (M0146-0234): build_base_rel_tlists adds only the Vars a relation outside the
+// rel needs, so a column read solely by the rel's own restriction quals is
+// evaluated at the scan and never emitted — `date_dim` filtered on d_year and
+// d_moy is priced at d_date_sk's width. goopg narrowed a base rel to the
+// statement-wide needed set, WHERE included. A reltarget that keeps no
+// column (`count(*)` over restrictions) is unrepresentable in the triple (see
+// relNarrowedColumns), so it keeps the statement-wide narrowing, as does any
+// rel the clause inventory cannot attribute.
+func (s *searchCtx) baseRelNarrowedWidths(rel *RelOptInfo) narrowedWidths {
+	cols, ok := relNarrowedColumns(rel)
+	if !ok {
+		return narrowedWidths{}
+	}
+	if keep, known := s.attrNeededAbove(rel.Relids); known {
+		if n := sumKeptColumns(cols, keep); n.ok {
+			return n
+		}
+	}
+	return sumKeptColumns(cols, nil)
 }
 
 // applyTo stamps the triple onto a path. It is a no-op on a decline, so every
@@ -330,7 +370,7 @@ func (s *searchCtx) narrowBaseRelCostWidths() {
 		if r == nil || r.baseLeaf == nil {
 			continue
 		}
-		narrowed := relNarrowedWidths(r)
+		narrowed := s.baseRelNarrowedWidths(r)
 		if !narrowed.ok {
 			continue
 		}

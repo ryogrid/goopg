@@ -788,3 +788,36 @@ func TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove(t *testing.T) {
 		t.Fatalf("ineligible problem narrowed the joinrel: %+v", got)
 	}
 }
+
+// M0146-0234: build_base_rel_tlists for a base rel's cost triple. A column read
+// only by the rel's own restriction quals is evaluated at the scan and never
+// emitted, so it leaves the width; a join key reaching another rel and the
+// query's output stay. A reltarget that keeps nothing (count(*) over
+// restrictions) keeps the statement-wide narrowing.
+func TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns(t *testing.T) {
+	defer setNarrowCostInputsForTest(true)()
+	d := ncRel([]string{"d_date_sk", "d_year", "d_moy"}, ncNeeded("d_date_sk", "d_year", "d_moy", "s_date_sk"), true,
+		map[string]float64{"d_date_sk": 4, "d_year": 4, "d_moy": 4})
+	d.Relids = RelSet(1)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded(),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(1), "d_year", "d_moy"),       // the rel's own restriction
+			clause(RelSet(3), "d_date_sk", "s_date_sk"), // reaches rel 2
+		}},
+	}
+	if got := s.baseRelNarrowedWidths(d); !got.ok || got.ncols != 1 || got.outputWidth != 4 {
+		t.Fatalf("base triple = %+v, want d_date_sk alone (1 col, width 4)", got)
+	}
+	// Nothing needed above: the statement-wide set stands (3 columns).
+	s.clauses.all = s.clauses.all[:1]
+	if got := s.baseRelNarrowedWidths(d); !got.ok || got.ncols != 3 {
+		t.Fatalf("empty reltarget triple = %+v, want the statement-wide 3 columns", got)
+	}
+}
