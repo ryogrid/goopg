@@ -143,7 +143,7 @@ func groupingEmissionPathkeys(aggNode *Aggregate, cand *Path) []PathKey {
 		// excluded, exprwalk.go:555+) — for a bare column and, since
 		// M0146-0005ae, for an expression key alike (the Node twin,
 		// aggregateEmissionPathkeys, admits the same shapes).
-		if j >= len(childPK) || !exprEqual(childPK[j].Expr, g) {
+		if j >= len(childPK) || !groupKeyOrderedBy(spec, j, g, childPK[j].Expr) {
 			traceGroupDecline(fmt.Sprintf("group-expr[%d]-not-leading-child-sortkey", k.Pos), cand)
 			return nil
 		}

@@ -718,6 +718,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 				sorted := *seed
 				sorted.Pathkeys = seedKeys
 				presortedSpec := *aggNode
+				presortedSpec.GroupInputKeys = equivalentGroupInputKeys(seedKeys, pathkeysForSortKeys(keys), len(presortedSpec.GroupExprs))
 				addAggPath(grouped, &Path{
 					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
 					Rel: grouped, Rows: numGroups,
@@ -800,6 +801,9 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 						in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
 					}
 					candSpec := *aggNode
+					if contained {
+						candSpec.GroupInputKeys = equivalentGroupInputKeys(candKeys[i], groupPathkeys, len(candSpec.GroupExprs))
+					}
 					addAggPath(grouped, &Path{
 						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
 						Rel: grouped, Rows: numGroups,

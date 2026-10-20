@@ -5557,7 +5557,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Not done \(ledgered\): subquery partial paths, ungrouped\-subquery alternatives and the producer\-order audit, none
       of which a fired record needs\.
   Movement: none — SF0\.25 Q77 scan\-type 1 → 0 is inside ±3; match counts 98/99 and 96/99 unchanged
-- [ ] **M0146\-0240 — join\-method: TPC\-DS SF1 Q77 web branch — PG Merge Left Joins the ws and wr CTEs; goopg Hash
+- [x] **M0146\-0240 — join\-method: TPC\-DS SF1 Q77 web branch — PG Merge Left Joins the ws and wr CTEs; goopg Hash
   Left Joins them, and sorts a merge join's output that already carries the group key's order** \(filed 2026\-10\-20
   by the S9 pass at cdb6a4513\)\.
   Kind: impl
@@ -5594,3 +5594,16 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 same=98 \(Q77\), tpcds\-fireset PASS\.
     - Next \(slice 2\): does goopg file the Merge Left Join of the ws and wr leaves at all? Instrument addPath on that
       joinrel on an SF1 clone, then compare its cost with PG's 29514\.15\.\.29548\.61\.
+  - **Slice 2 LANDED 2026\-10\-20 — CLOSED: a sorted aggregate over an EC\-ordered input keeps its order\.** Design §5;
+    evidence `analysis/m0146/m0146\-0240/slice2/`\.
+    - The Merge Left Join was filed but sorted both inputs: wr's GroupAggregate \(group key wp\_web\_page\_sk\) reads a
+      Gather Merge ordered by wr\_web\_page\_sk, the same EC, and the emission twins compared the keys syntactically\.
+    - Aggregate\.GroupInputKeys records the EC member the presorted\-seed and searched\-candidate arms proved;
+      groupKeyOrderedBy is the shared test of aggregateEmissionPathkeys and groupingEmissionPathkeys\. The upper
+      narrowing pass remaps the field \(or drops it\), and the field\-inventory pin lists it\.
+    - Repro: Merge Left Join 29514\.15\.\.29549\.06 \(PG \.\.29548\.61\)\. The 0\.45 left is cost\_subqueryscan's
+      trivial\_pathtarget exemption, measured on :65438 by reordering the select list \(ledgered\)\.
+    - Pin: TestGroupAggOverECOrderedInputKeepsItsOrder \(mutation\-checked\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 96→97 and SF0\.25 match 98→99 \(Q77\)

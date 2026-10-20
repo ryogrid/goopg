@@ -1651,6 +1651,16 @@ type Aggregate struct {
 	// the alternative design (see docs/design/0134-0001-p2-explain-format.md
 	// §"S8 Slice 2c").
 	GroupKeyOrder []int
+	// GroupInputKeys records, per processed group-clause position j, the
+	// input expression the grouping step proved the input ordered by in
+	// place of group key j: a member of the key's equivalence class, which
+	// PG's canonical pathkeys make the same pathkey (make_ordered_path's
+	// is_sorted test, M0146-0134). nil, or a nil entry, means the input is
+	// ordered by the key itself. Read only by groupKeyOrderedBy, so the
+	// aggregate's emitted ordering survives an EC-equivalent input
+	// (M0146-0240: TPC-DS Q77's wr groups wp_web_page_sk over a merge join
+	// ordered by wr_web_page_sk).
+	GroupInputKeys []Expr
 
 	// GroupClause is PG's processed_groupClause for a plain GROUP BY
 	// (M0145-0008d): the order and direction sort-based grouping consumes
