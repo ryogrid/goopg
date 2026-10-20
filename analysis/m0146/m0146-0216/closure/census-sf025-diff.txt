@@ -1,0 +1,3 @@
+== sf025: goopg 55 rels, PG 49 rels
+  only in goopg: pg_class_oid_index pg_class_relname_nsp_index pg_database_oid_index pg_index_indexrelid_index pg_index_indrelid_index pg_shdescription_o_c_index
+  -> 0 of 49 common relations differ

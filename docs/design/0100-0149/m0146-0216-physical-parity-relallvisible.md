@@ -2,7 +2,7 @@
 
 Status: slice 1 (census + attribution), slice 2 (stored relallvisible) and slice 3 (`_bt_findsplitloc` interval
 and penalty) landed 2026-10-16. Slice 4 (internal-page splits, §7) and slice 5 (COPY heap placement through the FSM, §8)
-landed 2026-10-20. Evidence:
+landed 2026-10-20. **Closed 2026-10-20** after the owner rebuild and the closure census (§9). Evidence:
 `analysis/m0146/m0146-0216/`.
 
 ## 1. Census (slice 1)
@@ -292,4 +292,26 @@ finds its back-jumps without `lag(ctid)` for that reason.
 **Plans.** The shipped corpora are unchanged: sf025 same=99, and the fire set fired nothing (SF0.25 98 / 99, SF1
 95 / 99). An owner rebuild on this engine gives PG-exact index geometry. Its first effect is the +4.0
 customer\_demographics\_pkey offset on SF1 Q64 and SF0.25 Q77.
+
+## 9. Closure (2026-10-20)
+
+The owner rebuilt both shipped corpora on the slice-4/5 engine (bb7b36ceb). M0146-0236, the open child that OWNER
+DECISIONS 2026-10-20 named, was then resolved (b0c982657). The closure census (`closure/census.sh`) clones each
+shipped corpus and compares pg\_class relpages, relallvisible, reltuples and `pg_relation_size` for every public
+table and index against `:65438`:
+
+| scale | relations compared | differing |
+|---|---|---|
+| SF0.25 | 49 | 0 |
+| SF1 | 49 | 1: `dbgen_version`, physical 0 against 1 |
+
+- **`dbgen_version`.** `scripts/tpcds-corpus-rebuild.sh` leaves the table out of its `TABLES` list, so the goopg
+  SF1 corpus holds no row where PG's holds one. Its relpages and reltuples match only because they are PG's
+  imported statistics. This is a load-script gap, not an engine one, and no TPC-DS query reads the table (ledger,
+  owner).
+- **Plan instruments.** The rebuild held parity at 98 / 99 (SF0.25) and 96 / 99 (SF1) with identical plan shapes.
+  The task's original record (the RELPAGES class: SF1 Q52, Q76) is gone: both match. The remaining first
+  divergences, Q13, Q72 and Q77, are planner ones.
+- **Probe note.** In goopg `pg_relation_size(c.oid::regclass)` returns NULL, while `pg_relation_size(c.oid)` works.
+  It is ledgered with the `pg_relation_size('name')` oddity.
 

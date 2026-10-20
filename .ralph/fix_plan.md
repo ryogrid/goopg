@@ -4545,7 +4545,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       \(SF0\.25 39087\.41\.\.39131\.53 vs 39026\.66\.\.39070\.79\)\. EXPLAIN widths are the rendering burn\-down's
       \(M0146\-0042\); the cost\-width currency is M0146\-0234's\.
   Movement: yes — SF0\.25 match 86→88 \(Q76, Q99\)
-- [ ] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
+- [x] **M0146\-0216 — physical\-parity census: per\-table relpages / relallvisible / pg\_relation\_size
   vs PG :65438 across both TPC\-DS corpora, and the COPY/VM all\-visible marking question**
   \(filed 2026\-10\-16 by owner directive; un\-waives RELPAGES under S9\(2\)\)\.
   Kind: impl
@@ -4644,6 +4644,19 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - **2026\-10\-20: owner corpus rebuild DONE** \(OWNER DECISIONS 2026\-10\-20\): all 24 pkeys = PG at both
     scales, heap per\-block identical, amcheck clean; same\-binary census unchanged \(98/99, 96/99\)\. Remaining:
     re\-census and close after the open child M0146\-0236\.
+  - **CLOSED 2026\-10\-20 \(loop \#35\)** after M0146\-0236 resolved \(b0c982657\)\. Design §9; evidence
+    `analysis/m0146/m0146\-0216/closure/`\.
+    - Closure census \(fresh clones of both rebuilt corpora vs :65438; relpages, relallvisible, reltuples,
+      pg\_relation\_size for every public table and index\): SF0\.25 0 of 49 differ; SF1 1 of 49 \(dbgen\_version physical
+      0 vs 1\)\.
+    - dbgen\_version: `scripts/tpcds\-corpus\-rebuild\.sh`'s TABLES list omits it, so the goopg SF1 corpus has no row
+      where PG's has one; the matching relpages/reltuples are PG's imported statistics\. A load\-script gap for the owner,
+      not an engine one; no TPC\-DS query reads it \(ledger\)\.
+    - Original record cleared: the RELPAGES class \(SF1 Q52, Q76\) matches; the owner's same\-binary census held
+      98/99 and 96/99 with identical shapes\.
+    - Children: M0146\-0236 closed; its filings M0146\-0238/0239 are correctness\-only and stay below item 10
+      \(S7\) unless placed\.
+  Movement: none — physical census only: plan instruments were measured unchanged by the owner's same\-binary A/B \(98/99, 96/99\)
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
