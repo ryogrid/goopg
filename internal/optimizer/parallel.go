@@ -2312,13 +2312,18 @@ func splitAggregateTransportSorted(a *Aggregate, workers int, keys []SortKey) *A
 // derived against. The Partial keeps the stamp: it reads the same input
 // row, sorted.
 func splitAggregateTransportSortedInput(a *Aggregate, workers int, mergeKeys, inputKeys []SortKey) *Aggregate {
-	sorter := &Sort{pos: a.Pos(), Child: stampParallelScan(a.Child), Keys: inputKeys}
+	// No inputKeys: the input is already ordered by the group keys
+	// (make_ordered_path, M0146-0240), so the partial reads it directly.
+	var in Node = stampParallelScan(a.Child)
+	if len(inputKeys) > 0 {
+		in = &Sort{pos: a.Pos(), Child: in, Keys: inputKeys}
+	}
 
 	partial := *a
 	partial.Mode = AggModePartial
 	partial.Strategy = AggStrategySorted
 	partial.PartialEmit = true
-	partial.Child = sorter
+	partial.Child = in
 
 	merge := NewGatherMerge(a.Pos(), &partial, workers, mergeKeys)
 

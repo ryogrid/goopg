@@ -287,6 +287,9 @@ func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
 
 	var input *Path
 	sortedInput := sub.Kind == PathAgg
+	// M0146-0240: a sorted partial over an input already ordered by the
+	// group keys (make_ordered_path) has no worker Sort of its own.
+	presortedInput := false
 	switch {
 	case sub.Kind == PathSort:
 		// Presorted arm: Finalize -> GatherMerge -> Sort -> Partial -> input.
@@ -300,12 +303,17 @@ func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
 		}
 		input = partial.Children[0]
 	case sortedInput:
-		// Sorted-input arm: Finalize -> GatherMerge -> Partial -> Sort -> input.
+		// Sorted-input arm: Finalize -> GatherMerge -> Partial -> Sort -> input,
+		// or Partial -> input when the input is presorted (orderedPartialInput).
 		partial := sub
-		if len(partial.Children) != 1 || partial.Children[0] == nil || partial.Children[0].Kind != PathSort {
-			panic("createPlan: PathFinalizeAgg's sorted partial without a PathSort input")
+		if len(partial.Children) != 1 || partial.Children[0] == nil {
+			panic("createPlan: PathFinalizeAgg's sorted partial without an input")
 		}
 		srt := partial.Children[0]
+		if srt.Kind != PathSort {
+			input, presortedInput = srt, true
+			break
+		}
 		if len(srt.Children) != 1 || srt.Children[0] == nil {
 			panic("createPlan: PathFinalizeAgg's sorted-partial Sort without an input")
 		}
@@ -326,7 +334,11 @@ func createFinalizeAggSortedPlan(p *Path) (Node, outputLayout) {
 	}
 	var built *Aggregate
 	if sortedInput {
-		built = splitAggregateTransportSortedInput(&simple, p.ParallelWorkers, keys, groupKeysSortKeys(&simple))
+		var inputKeys []SortKey
+		if !presortedInput {
+			inputKeys = groupKeysSortKeys(&simple)
+		}
+		built = splitAggregateTransportSortedInput(&simple, p.ParallelWorkers, keys, inputKeys)
 	} else {
 		built = splitAggregateTransportSorted(&simple, p.ParallelWorkers, keys)
 	}

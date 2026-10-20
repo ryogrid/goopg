@@ -5557,3 +5557,40 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Not done \(ledgered\): subquery partial paths, ungrouped\-subquery alternatives and the producer\-order audit, none
       of which a fired record needs\.
   Movement: none — SF0\.25 Q77 scan\-type 1 → 0 is inside ±3; match counts 98/99 and 96/99 unchanged
+- [ ] **M0146\-0240 — join\-method: TPC\-DS SF1 Q77 web branch — PG Merge Left Joins the ws and wr CTEs; goopg Hash
+  Left Joins them, and sorts a merge join's output that already carries the group key's order** \(filed 2026\-10\-20
+  by the S9 pass at cdb6a4513\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q77, category join\-method, verdict SHAPE\-DIFF at depth 5 \(Append c2: PG Merge Left Join \|
+    goopg Hash Left Join\)\. Census: the M0146\-0232 fire\-set captures on HEAD's code tree,
+    `analysis/m0146/m0146\-0232/fireset/`\.
+  - S9 ranking \(SF0\.25 98/99, SF1 96/99, TPC\-H 22/22\): join\-method 2 \(SF1 Q13, SF1 Q77\), sort\-strategy 1
+    \(SF0\.25 Q77\), qual\-placement 1 \(SF1 Q72\)\. Q77 is chosen over Q13 because it has the shallower divergence and
+    shares its probable cause with SF0\.25 Q77; Q13's ca/store order follows row\-estimate differences under the
+    customer\_address filter\.
+  - Inside ws, goopg plans Partial GroupAggregate → Sort \(wp\_web\_page\_sk\) → Merge Join \(ws\_web\_page\_sk =
+    wp\_web\_page\_sk\); PG feeds the Partial GroupAggregate straight from the Merge Join, whose output order already
+    satisfies the group key through the equivalence class\. The extra Sort makes ws 24863\.27 against PG's 24859\.35\.
+  - SF0\.25 Q77 c0 \(sort\-strategy\) has the same shape: Sort \(store\_1\.s\_store\_sk\) above Merge Join
+    \(sr\_store\_sk = store\_1\.s\_store\_sk\)\. goopg's inner Sort also reports 31 rows over an 18\-row partial input
+    \(PG 18\)\.
+  - First step: on a private SF0\.25 clone, EXPLAIN the sr CTE alone and check the partial merge join's pathkeys as
+    the partial grouping stage sees them \(create\_partial\_grouping\_paths: pathkeys\_contained\_in\(group\_pathkeys,
+    path\->pathkeys\) over the canonical EC pathkey\)\. Then check the inner Sort's row count\.
+  - Expected instrument: TPC\-DS PLAN\-PARITY match, SF0\.25 98→99 and SF1 96→97, if the web branch then elects
+    PG's Merge Left Join\.
+  - **Slice 1 LANDED 2026\-10\-20: the partial aggregate reads a presorted partial path\.** Design
+    `docs/design/0100\-0149/m0146\-0240\-partial\-agg\-presorted\-input\.md`; evidence `analysis/m0146/m0146\-0240/`\.
+    - make\_ordered\_path's first test for the cheapest partial path: pseed keeps the partial path's validated pathkeys,
+      renamed through the searched rel's equivalence classes to the group keys \(canonicalPartialInputKeys\)\.
+      orderedPartialInput skips the worker Sort in the sorted\-input split, the partial Group arm and the R56 Gather
+      Merge arm\. createFinalizeAggSortedPlan and splitAggregateTransportSortedInput accept the Sort\-less input\.
+    - Instrument: TPC\-DS SF0\.25 match 98 → 99/99 \(Q77; all categories 0\)\. SF1 96 → 96: ws and wr now cost exactly
+      PG's, but the web branch still elects Hash Left Join 29549\.08 over PG's Merge Left Join 29548\.61\. TPC\-H 22/22,
+      plans unchanged\.
+    - Pin: TestPartialAggOverPresortedPartialJoin \(PG\-anchored shape plus values; two mutations fail it\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 same=98 \(Q77\), tpcds\-fireset PASS\.
+    - Next \(slice 2\): does goopg file the Merge Left Join of the ws and wr leaves at all? Instrument addPath on that
+      joinrel on an SF1 clone, then compare its cost with PG's 29514\.15\.\.29548\.61\.
