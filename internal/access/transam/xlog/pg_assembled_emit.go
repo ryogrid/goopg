@@ -130,6 +130,14 @@ const xlhInsertContainsNewTuple uint8 = 0x08
 // trailing first-touch XLOG_FPI (still emitted by MarkDirtyLogicalChange) then
 // harmlessly restores the same post-insert page image.
 func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, initPage bool) ([]byte, error) {
+	return EncodeHeapInsertPGVis(rel, blk, lineSlot, tuple, initPage, false)
+}
+
+// EncodeHeapInsertPGVis is EncodeHeapInsertPG for an insert that cleared the
+// page's visibility-map bits: visCleared sets XLH_INSERT_ALL_VISIBLE_CLEARED,
+// as heap_insert does when PageIsAllVisible held (heapam.c), and redo clears
+// the bits too.
+func EncodeHeapInsertPGVis(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, initPage, visCleared bool) ([]byte, error) {
 	if len(tuple) < storage.SizeOfHeapTupleHeaderData {
 		return nil, fmt.Errorf("wal: heap-insert tuple %d bytes < fixed header %d", len(tuple), storage.SizeOfHeapTupleHeaderData)
 	}
@@ -146,6 +154,9 @@ func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSl
 	mainData := make([]byte, sizeOfXLogHeapInsertData)
 	binary.LittleEndian.PutUint16(mainData[0:2], lineSlot) // offnum
 	mainData[2] = xlhInsertContainsNewTuple                // flags
+	if visCleared {
+		mainData[2] |= xlogHeapInsertAllVisibleCleared
+	}
 
 	body, err := assembleXLogRecord(mainData, []BlockRef{{
 		ID: 0, Rel: rel, Block: blk, Data: blockData, WillInit: initPage,
@@ -191,12 +202,21 @@ const (
 // lock bits), and replay reproduces it with PageSetHeapTupleXmax, matching the
 // native replay. xl_xid = xmax (the deleting xact).
 func EncodeHeapDeletePG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) ([]byte, error) {
+	return EncodeHeapDeletePGVis(rel, blk, lineSlot, xmax, oldTuple, false)
+}
+
+// EncodeHeapDeletePGVis is EncodeHeapDeletePG for a delete that cleared the
+// page's visibility-map bits (XLH_DELETE_ALL_VISIBLE_CLEARED, heap_delete).
+func EncodeHeapDeletePGVis(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte, visCleared bool) ([]byte, error) {
 	mainData := make([]byte, sizeOfXLogHeapDeleteData)
 	binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax))
 	binary.LittleEndian.PutUint16(mainData[4:6], lineSlot)
 	mainData[6] = 0 // infobits_set
 
 	var flags uint8
+	if visCleared {
+		flags |= xlhDeleteAllVisibleCleared
+	}
 	if len(oldTuple) >= storage.SizeOfHeapTupleHeaderData {
 		flags |= xlhDeleteContainsOldTuple
 		mainData = append(mainData, oldTuple[18:22]...) // t_infomask2 + t_infomask
@@ -252,6 +272,14 @@ const (
 // new tuple at new_offnum on block 0 and stamps the old tuple (old_offnum) with
 // old_xmax + t_ctid->new + HEAP_HOT_UPDATED (replayDecodedXLogHeapUpdate).
 func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, newTuple []byte) ([]byte, error) {
+	return EncodeHeapHotUpdatePGVis(rel, blk, oldSlot, newSlot, xmax, newTuple, false)
+}
+
+// EncodeHeapHotUpdatePGVis is EncodeHeapHotUpdatePG for an update that
+// cleared the (shared) page's visibility-map bits: heap_update sets
+// XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED for the old page, and a HOT update has
+// no other page.
+func EncodeHeapHotUpdatePGVis(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, newTuple []byte, visCleared bool) ([]byte, error) {
 	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
 		return nil, fmt.Errorf("wal: heap-hot-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
 	}
@@ -260,6 +288,9 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 	binary.LittleEndian.PutUint16(mainData[4:6], oldSlot)      // old_offnum
 	mainData[6] = 0                                            // old_infobits_set
 	mainData[7] = xlhUpdateContainsNewTuple                    // flags
+	if visCleared {
+		mainData[7] |= xlhUpdateOldAllVisibleCleared
+	}
 	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
 	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
 
@@ -280,6 +311,16 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 // reached via indexes) and places the new version at new_offnum.
 func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16,
 	newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, newTuple []byte) ([]byte, error) {
+	return EncodeHeapUpdatePGVis(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, newTuple, false, false)
+}
+
+// EncodeHeapUpdatePGVis is EncodeHeapUpdatePG for an update that cleared
+// visibility-map bits: oldCleared sets XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED
+// (the old version's page), newCleared XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED
+// (the new version's page, only when it is another page), as heap_update
+// does.
+func EncodeHeapUpdatePGVis(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16,
+	newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, newTuple []byte, oldCleared, newCleared bool) ([]byte, error) {
 	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
 		return nil, fmt.Errorf("wal: heap-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
 	}
@@ -288,6 +329,12 @@ func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, old
 	binary.LittleEndian.PutUint16(mainData[4:6], oldSlot)      // old_offnum
 	mainData[6] = 0                                            // old_infobits_set
 	mainData[7] = xlhUpdateContainsNewTuple                    // flags
+	if oldCleared {
+		mainData[7] |= xlhUpdateOldAllVisibleCleared
+	}
+	if newCleared && newBlk != oldBlk {
+		mainData[7] |= xlhUpdateNewAllVisibleCleared
+	}
 	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
 	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
 

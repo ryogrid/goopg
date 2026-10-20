@@ -3409,12 +3409,18 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.Rel.Fork != storage.MainFork {
 		return fmt.Errorf("wal: xlog heap-insert fork=%d, want main fork", block.Rel.Fork)
 	}
-	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
-	}
 	offnum, err := decodeXLogHeapInsertMainData(xlog.MainData)
 	if err != nil {
 		return err
+	}
+	visCleared := xlog.MainData[2]&xlogHeapInsertAllVisibleCleared != 0
+	if visCleared {
+		if err := redoClearAllVisible(mgr, block.Rel, block.Block); err != nil {
+			return fmt.Errorf("wal: xlog heap-insert clear vm: %w", err)
+		}
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
 	tupleRaw, err := decodeXLogHeapInsertTuple(block, storage.TransactionID(xlog.Header.XID), offnum)
 	if err != nil {
@@ -3434,6 +3440,9 @@ func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecod
 	// the array — the same bug the multi-insert path refused loudly.
 	if err := redoHeapPageAddItemOverwrite(page, offnum, tupleRaw); err != nil {
 		return fmt.Errorf("wal: xlog heap-insert apply (block %d): %w", block.Block, err)
+	}
+	if visCleared {
+		clearPageAllVisible(page)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
@@ -3593,13 +3602,18 @@ func replayDecodedXLogHeapMultiInsert(mgr *storage.Manager, r Record, xlog *XLog
 	if block.Rel.Fork != storage.MainFork {
 		return fmt.Errorf("wal: xlog heap-multi-insert fork=%d, want main fork", block.Rel.Fork)
 	}
-	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
-	}
 	isInit := xlog.Header.Info&xlogHeapInit != 0
 	flags, offsets, err := decodeXLogHeapMultiInsertMainData(xlog.MainData, isInit)
 	if err != nil {
 		return err
+	}
+	if flags&xlogHeapInsertAllVisibleCleared != 0 {
+		if err := redoClearAllVisible(mgr, block.Rel, block.Block); err != nil {
+			return fmt.Errorf("wal: xlog heap-multi-insert clear vm: %w", err)
+		}
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
 	tuples, err := decodeXLogMultiInsertTuples(block.Data, len(offsets))
 	if err != nil {
@@ -3619,9 +3633,9 @@ func replayDecodedXLogHeapMultiInsert(mgr *storage.Manager, r Record, xlog *XLog
 			return fmt.Errorf("wal: xlog heap-multi-insert apply entry %d (block %d): %w", i, block.Block, err)
 		}
 	}
-	// The visibility-map bits upstream mirrors onto the heap page itself. The
-	// VM fork update is XLOG_HEAP2_VISIBLE's job (still S21a-2); these two are
-	// the page-header half heap_xlog_multi_insert does inline.
+	// The visibility-map bits upstream mirrors onto the heap page itself; the
+	// vm fork's clear ran above (redoClearAllVisible), and an ALL_FROZEN_SET
+	// insert's vm set is the XLOG_HEAP2_VISIBLE record that follows it.
 	hdr := storage.MustHeader(page)
 	if flags&xlogHeapInsertAllVisibleCleared != 0 {
 		hdr.SetFlags(hdr.Flags() &^ storage.PDAllVisible)
@@ -3833,12 +3847,17 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if !ok {
 		return fmt.Errorf("wal: xlog heap-delete missing block 0")
 	}
-	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
-	}
 	xmax, offnum, infobits, flags, err := decodeXLogHeapDeleteMainData(xlog.MainData)
 	if err != nil {
 		return err
+	}
+	if flags&xlhDeleteAllVisibleCleared != 0 {
+		if err := redoClearAllVisible(mgr, block.Rel, block.Block); err != nil {
+			return fmt.Errorf("wal: xlog heap-delete clear vm: %w", err)
+		}
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
 	// M0131-S21f: RBM_NORMAL, like upstream's heap_xlog_delete. An absent or
 	// all-zero page is BLK_NOTFOUND and the record does nothing; it used to be
@@ -3863,6 +3882,9 @@ func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecod
 		block.Block, storage.TransactionID(xlog.Header.XID),
 		flags&xlhDeleteIsSuper != 0, flags&xlhDeleteIsPartitionMove != 0); err != nil {
 		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
+	}
+	if flags&xlhDeleteAllVisibleCleared != 0 {
+		clearPageAllVisible(page)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
@@ -4376,6 +4398,32 @@ func redoVMPageForBlock(mgr *storage.Manager, block XLogBlockRef, endLSN storage
 // are already zero, so the sole difference is whether an all-zero vm page
 // materialises on disk — and materialising one for a *clear* would invent map
 // content that the primary may never have had.
+// redoClearAllVisible is heap redo's visibilitymap_clear(VISIBILITYMAP_VALID_BITS)
+// for a record whose flags say the change cleared the heap page's all-visible
+// state (XLH_INSERT/DELETE_ALL_VISIBLE_CLEARED, XLH_UPDATE_OLD/NEW_...). It
+// runs before the heap page is redone and whatever that redo decides: "The
+// visibility map may need to be fixed even if the heap page is already
+// up-to-date" (heap_xlog_insert, heap_xlog_delete, heap_xlog_update,
+// heap_xlog_multi_insert). A relation with no vm fork has no bit to clear,
+// and the fork is not created for it.
+func redoClearAllVisible(mgr *storage.Manager, rel storage.RelFileNode, heapBlk storage.BlockNumber) error {
+	heapRel := rel
+	heapRel.Fork = storage.MainFork
+	vmRel := heapRel
+	vmRel.Fork = storage.VisibilityMapFork
+	if !mgr.Exists(vmRel) {
+		return nil
+	}
+	return redoClearVMBitsForHeapBlock(mgr, heapRel, heapBlk, storage.VMAllVisible|storage.VMAllFrozen)
+}
+
+// clearPageAllVisible is PageClearAllVisible: the page-header half of a
+// redone ALL_VISIBLE_CLEARED change.
+func clearPageAllVisible(page storage.Page) {
+	hdr := storage.MustHeader(page)
+	hdr.SetFlags(hdr.Flags() &^ storage.PDAllVisible)
+}
+
 func redoClearVMBitsForHeapBlock(mgr *storage.Manager, heapRel storage.RelFileNode, heapBlk storage.BlockNumber, bits uint8) error {
 	vmRel := heapRel
 	vmRel.Fork = storage.VisibilityMapFork
@@ -4529,9 +4577,6 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if !ok {
 		return fmt.Errorf("wal: xlog heap-update missing block 0")
 	}
-	if block.HasImage && block.ImageApply {
-		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
-	}
 	oldXmax, oldOffnum, oldInfobits, flags, _, newOffnum, err := decodeXLogHeapUpdateMainData(xlog.MainData)
 	if err != nil {
 		return err
@@ -4544,6 +4589,24 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 			return fmt.Errorf("wal: xlog heap-hot-update with cross-page block 1")
 		}
 		oldBlock = ob
+	}
+	// heap_xlog_update clears each page's vm bits before redoing it: the old
+	// page's for OLD_ALL_VISIBLE_CLEARED, the new page's for NEW_... (set only
+	// when the new version went to another page).
+	oldVisCleared := flags&xlhUpdateOldAllVisibleCleared != 0
+	newVisCleared := flags&xlhUpdateNewAllVisibleCleared != 0
+	if oldVisCleared {
+		if err := redoClearAllVisible(mgr, oldBlock.Rel, oldBlock.Block); err != nil {
+			return fmt.Errorf("wal: xlog heap-update clear old vm: %w", err)
+		}
+	}
+	if newVisCleared {
+		if err := redoClearAllVisible(mgr, block.Rel, block.Block); err != nil {
+			return fmt.Errorf("wal: xlog heap-update clear new vm: %w", err)
+		}
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
 	}
 	// M0131-S21d: acquire block 0 the way every other heap redo routine does.
 	// Upstream draws no distinction here — heap_xlog_update takes
@@ -4613,6 +4676,9 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 				return fmt.Errorf("wal: xlog heap-update stamp old tuple: %w", err)
 			}
 		}
+		if newVisCleared || (samePage && oldVisCleared) {
+			clearPageAllVisible(page)
+		}
 		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 		if err := mgr.WriteBlock(block.Rel, block.Block, page); err != nil {
 			return err
@@ -4640,6 +4706,9 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	if err := stampOld(oldPage); err != nil {
 		return fmt.Errorf("wal: xlog heap-update stamp old tuple: %w", err)
+	}
+	if oldVisCleared {
+		clearPageAllVisible(oldPage)
 	}
 	storage.MustHeader(oldPage).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, oldBlock.Block, oldPage)

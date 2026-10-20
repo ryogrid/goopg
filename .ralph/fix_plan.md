@@ -592,6 +592,15 @@ heuristic stays live.)
     - pg\_last\_wal\_receive\_lsn / pg\_last\_wal\_replay\_lsn implemented \(were 42883\); the bootstrap wait now reports
       want/primary/sent/receive/replay LSNs \(walProgressDiagnostics\)\. Pin: TestPgLastWALLSN\.
     - Next: on the next occurrence read the notes — replay < want → replay stalled; replay ≥ want → visibility\.
+  - **Root\-cause lead 2026\-10\-21:** TestE2E\_PGStandbyFullCycle failed 1 of 4 local runs with the same symptom, and its
+    log shows `walreceiver WALData start mismatch start\_lsn=50331648 expected\_start\_lsn=50463176` — expected =
+    0x030201C8, the exact LSN the failed nightly standby\'s wal\_receiver row reported\.
+    - handleCopyData \(internal/replication/walreceiver\.go\) treats primary bytes that start below the local
+      WrittenLSN as already present and trims them; when the local WAL has run AHEAD of what the primary\'s stream
+      holds there \(here 0x201C8 bytes into segment 3\), every later frame is dropped and the row never arrives\.
+    - Next: find what put the local writer at 0x30201C8 before the primary\'s segment\-3 data \(a timeline\-switch
+      re\-send from the switch point, or a goopg\-local append at standby start\) — PG\'s walreceiver restarts at the
+      switch point and overwrites; trimming is only right when the overlapping bytes are identical\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
@@ -1360,6 +1369,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - First step: emit sets as `XLOG\_HEAP2\_VISIBLE` through the assembler and route goopg replay to the existing decoded
     arm; keep a length\-versioned decode of the native record for old WAL\.
   - Expected instrument: `pg\_waldump` decoding goopg\'s VACUUM WAL; the walsummarizer VM checks stay green\.
+  - **Slice 1 LANDED 2026\-10\-21** \(clears\)\. Design `docs/design/0100\-0149/m0119\-visibility\-map\-pg\-wal\.md`\.
+    - Order matters: PG\-form sets alone would let a PG standby set all\-visible bits goopg then clears only in rmgr 128,
+      so its scans would trust stale pages\. Clears first\.
+    - Heap insert/delete/update records now carry XLH\_\*\_ALL\_VISIBLE\_CLEARED, read from the runtime VM at log time
+      \(initdb\.Open hooks; every executor site logs, then VM\.ClearBlock, under one page lock\)\.
+    - PG\-format heap redo honours the flags \(redoClearAllVisible before the page redo, clearPageAllVisible after\):
+      insert/delete/update ignored them, so a goopg standby of PG kept stale all\-visible bits\.
+    - pg\_waldump on goopg WAL: INSERT 0x09, DELETE 0x03, HOT\_UPDATE 0x11 after each VACUUM; seeds carry no bit\.
+    - Pins: TestPGHeapRecordsClearVMBits \(fails without the insert arm\'s clear\), TestHeapEncodersSetVMClearedFlags,
+      TestPgWaldumpHeapRecordsCarryVMCleared\.
+    - Next \(slice 2\): emit sets as XLOG\_HEAP2\_VISIBLE \(block 0 VM page, block 1 heap page\) and retire the native
+      set/clear records; ledgered gaps in the design §6\.
 - [ ] **XLogInsert / XLogFlush rename** \(backlog entry, M0042\-0003; filed 2026\-10\-14 at the M0122\-0009 close\)\.
   Kind: impl
   Parent: none

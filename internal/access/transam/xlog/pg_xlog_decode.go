@@ -140,6 +140,13 @@ const (
 	// the block's visibility-map ALL_FROZEN bit.
 	xlhLockAllFrozenCleared uint8 = 0x01
 
+	// XLH_DELETE_ALL_VISIBLE_CLEARED, XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED and
+	// XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED (heapam_xlog.h): the change cleared
+	// the page's visibility-map bits, which redo clears too.
+	xlhDeleteAllVisibleCleared    uint8 = 1 << 0
+	xlhUpdateOldAllVisibleCleared uint8 = 1 << 0
+	xlhUpdateNewAllVisibleCleared uint8 = 1 << 1
+
 	// RM_BTREE_ID (rmid 11) opcodes (nbtxlog.h:27-39). Used by
 	// recordKindToRmgrInfo (doc 04 §3.1) to map
 	// BtreeInsert/BtreeSplit/BtreeVacuum/BtreeUnlinkPage/BtreeNewRoot/
