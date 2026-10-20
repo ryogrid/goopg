@@ -22,8 +22,11 @@ import (
 // and a full scan returns exactly the odd keys, in order.
 //
 // No structural lock exists since 2026-10-15 (M0122-0010 gap 8). Odd rounds
-// run every goroutine, vacuum included, through one shared handle, so pages
-// vacuum frees go to the same free list the splits allocate from.
+// run every goroutine, vacuum included, through one shared handle. Writers and
+// readers that reach a page unlinked under them step right, as _bt_moveright
+// does for P_IGNORE, and vacuum re-tests emptiness under the target's latch
+// before deleting it (M-NIGHTLY AI-20261020-013101-001); on failure the
+// verification dumps every leaf still holding the missing key.
 func TestStructuralLockVacuumWithSplits(t *testing.T) {
 	if testing.Short() {
 		t.Skip("inserts and vacuums thousands of wide keys from several goroutines")
@@ -46,6 +49,13 @@ func TestStructuralLockVacuumWithSplits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
+	// Every inserter here stands for a running transaction, so no deleted
+	// page may be recycled while the round runs: PG gates reuse on the
+	// deletion's safexid preceding every running xmin (BTPageIsRecyclable),
+	// and production wires that horizon (initdb). A bare pool recycles at
+	// once, which lets a split reuse a block a stale inserter still holds —
+	// a hazard PG's protocol excludes, not one the tree is meant to absorb.
+	pool.SetBtreeRecycleHorizon(func() (uint64, uint64) { return 1000, 0 })
 	for round := 0; round < 10; round++ {
 		rel := storage.RelFileNode{DBOid: 1, RelOid: uint32(9400 + round), Fork: storage.MainFork}
 		if err := vacuumSplitRound(pool, rel, int64(round), round%2 == 1); err != nil {
@@ -149,7 +159,30 @@ func vacuumSplitRound(pool *storage.Pool, rel storage.RelFileNode, seed int64, o
 			return fmt.Errorf("vacuumed key %d still found", n)
 		}
 		if !victim(n) && (!ok || got != tid(n)) {
-			return fmt.Errorf("Search(%d) = %+v, %v; want %+v", n, got, ok, tid(n))
+			nb, _ := pool.NBlocks(rel)
+			var dump []string
+			for blk := storage.BlockNumber(1); blk < nb; blk++ {
+				sl, perr := first.pinR(blk)
+				if perr != nil {
+					continue
+				}
+				op := readOpaque(sl.Page())
+				items, ierr := first.format().pageItems(sl.Page())
+				hit := false
+				if ierr == nil {
+					for _, it := range items {
+						if bytes.Equal(it.key, key(n)) || it.ptr == tid(n) {
+							hit = true
+						}
+					}
+				}
+				if hit && op.IsLeaf() {
+					dump = append(dump, fmt.Sprintf("blk=%d flags=%#x lvl=%d prev=%d next=%d items=%d", blk, op.Flags, op.Level, op.Prev, op.Next, len(items)))
+				}
+				first.unpinR(sl)
+			}
+			lb, _, _ := first.descendToLeaf(key(n))
+			return fmt.Errorf("Search(%d) = %+v, %v; want %+v; descend->%d; nblocks=%d; leaf holders=%v", n, got, ok, tid(n), lb, nb, dump)
 		}
 	}
 	var prev []byte

@@ -153,6 +153,23 @@ func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
 // fields such as the level, so structural validators must exempt them.
 func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
 
+// isUnlinked reports a page whose deletion finished: unlinkEmptyLeaf removed
+// its downlink, handed its key range to its right sibling, and rewrote it as a
+// BTDeletedPageData tombstone (ReplayUnlinkTargetPage: BTP_DELETED without
+// BTP_HALF_DEAD). No descent takes latches hand over hand, so a reader or
+// writer that picked the block before the unlink still lands on it, and must
+// step right as _bt_moveright does for P_IGNORE (nbtsearch.c): reading it as
+// an ordinary page parses the safexid bytes as line pointers. goopg's phase-1
+// marking (BTDeleted|BTHalfDead, parent untouched) is NOT this: that page
+// still owns its range, and unlinkEmptyLeaf reverts the mark when an insert
+// repopulates it, so writers keep inserting into it (M-NIGHTLY
+// AI-20261020-013101-001).
+func (o BTPageOpaque) isUnlinked() bool { return o.IsDeleted() && !o.IsHalfDead() }
+
+// errFellOffEnd is _bt_moveright's "fell off the end of index" (nbtsearch.c):
+// a deleted page with no right sibling, which the deletion rules never leave.
+var errFellOffEnd = errors.New("btree: fell off the end of index at a deleted page")
+
 // HasHighKey reports whether this page advertises a high-key boundary. It is
 // upstream's !P_RIGHTMOST, not a stored bit: a page has a high key exactly
 // when it has a right sibling. Pages without one are rightmost on their level
@@ -956,6 +973,10 @@ type BTree struct {
 	// insertIntoBlock's leaf-write window, where insertItemSorted really
 	// panicked. See latch_release.go.
 	panicBeforeLeafWrite func(storage.BlockNumber) // test-only fault injection
+	// beforeUnlinkPins is test-only: it runs in unlinkEmptyLeaf after the
+	// unlatched emptiness recheck and before the deletion latches its pages,
+	// the window an insert into the phase-1 page can fall into.
+	beforeUnlinkPins func(storage.BlockNumber)
 
 	// DebugTraceInserts (M-NIGHTLY AI-20260708-064334-001 investigation
 	// aid, 5th loop): when true, every insertItemSorted call anywhere in
@@ -2532,6 +2553,18 @@ func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumbe
 			continue
 		}
 
+		// _bt_moveright's P_IGNORE arm: the page was unlinked after the
+		// level above pointed here; its key range now lives to the right.
+		if op.isUnlinked() {
+			next := op.Next
+			bt.unpinR(slot)
+			if next == storage.InvalidBlockNumber {
+				return 0, nil, errFellOffEnd
+			}
+			cur = next
+			continue
+		}
+
 		// Right-link recovery: a concurrent split may have moved
 		// our target keys to the right sibling. Follow op.Next
 		// until we land on a page that covers the search key.
@@ -2647,8 +2680,10 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 	}
 	defer bt.unpinW(slot)
 
-	// The slow path finishes a split left incomplete since the descent.
-	if keyExceedsHighKey(bt.format(), slot.Page(), it.key) || readOpaque(slot.Page()).HasIncompleteSplit() {
+	// The slow path finishes a split left incomplete since the descent, and
+	// steps right from a page unlinked since it (insertIntoBlock).
+	if op := readOpaque(slot.Page()); op.isUnlinked() || op.HasIncompleteSplit() ||
+		keyExceedsHighKey(bt.format(), slot.Page(), it.key) {
 		return errNeedsSplit
 	}
 	if !bt.format().pageHasSpaceFor(slot.Page(), it) {
@@ -2726,6 +2761,16 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		held.hold(slot)
 		op = readOpaque(slot.Page())
+		if op.isUnlinked() {
+			// _bt_moveright's P_IGNORE arm (see isUnlinked).
+			next := op.Next
+			held.release()
+			if next == storage.InvalidBlockNumber {
+				return errFellOffEnd
+			}
+			blk = next
+			continue
+		}
 		if op.HasIncompleteSplit() {
 			// _bt_insertonpg never inserts into half of a split: finish it
 			// first (_bt_stepright / _bt_moveright), then re-read the page.
@@ -4387,6 +4432,16 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 			return storage.ItemPointer{}, false, err
 		}
 		op := readOpaque(slot.Page())
+		if op.isUnlinked() {
+			// Unlinked since the descent: its range is to the right.
+			next := op.Next
+			bt.unpinR(slot)
+			if next == storage.InvalidBlockNumber {
+				return storage.ItemPointer{}, false, nil
+			}
+			cur = next
+			continue
+		}
 		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
 			next := op.Next
 			bt.unpinR(slot)
@@ -4528,6 +4583,14 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 			return err
 		}
 		op := readOpaque(slot.Page())
+		// _bt_readnextpage skips P_IGNORE pages: a leaf unlinked after the
+		// descent or after its left sibling's link was read.
+		if op.isUnlinked() {
+			next := op.Next
+			bt.unpinR(slot)
+			cur = next
+			continue
+		}
 		// Recovery on the first iteration: descendToLeaf may
 		// have returned a leaf that has since been split. Skip
 		// rightward until we land on a page whose key range
@@ -4816,6 +4879,12 @@ func (c *ScanCursor) Next(fn func(key []byte, ptr storage.ItemPointer, pos ScanP
 			return false, err
 		}
 		op := readOpaque(slot.Page())
+		// Same P_IGNORE skip as the eager walk (isUnlinked).
+		if op.isUnlinked() {
+			c.next = op.Next
+			c.bt.unpinR(slot)
+			continue
+		}
 		// Same high-key recovery skip as the eager walk (applies
 		// meaningfully to the first leaf descendToLeaf returned; harmless
 		// on later leaves, whose key ranges all exceed lo).

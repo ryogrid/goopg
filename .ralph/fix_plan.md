@@ -494,17 +494,41 @@ heuristic stays live.)
     ledgered: deferral\_ledger row 2963 \(pg\_isolation\_test\_session\_is\_blocked not implemented\)\. Hardening
     lead, not done: treat a probe that reports no lock wait as still running past blockProbeCap, as isolationtester does\.
 
-- [ ] units/internal/access/nbtree — panic `storage: unsupported line pointer state: slot=2 flags=0` in insertItemSorted, from vacuumSplitRound's concurrent Insert \(btree\_vacuum\_split\_race\_test\.go:105\) \(AI\-20261020\-013101\-001; repro: `go test \-timeout 10m \./internal/access/nbtree/`\)\.
+- [x] units/internal/access/nbtree — panic `storage: unsupported line pointer state: slot=2 flags=0` in insertItemSorted, from vacuumSplitRound's concurrent Insert \(btree\_vacuum\_split\_race\_test\.go:105\) \(AI\-20261020\-013101\-001; repro: `go test \-timeout 10m \./internal/access/nbtree/`\)\.
   - Nightly sha cb9d2c011 from a detached worktree; that change set touched internal/optimizer only\. A slot read as
     LP\_UNUSED during a sorted insert under a concurrent vacuum is a possible index\-page race, not a timing bound — S2
     candidate \(possible corruption\); escalated in the baton\.
   - 2026\-10\-20 03:15: TestStructuralLockVacuumWithSplits passed 5/5 on an idle host at HEAD cb9d2c011 \(0\.38 s each\);
     intermittent, not yet stressed or diagnosed\.
+  - **Done 2026\-10\-20\.** Design `docs/design/0100\-0149/m\-nightly\-nbtree\-unlinked\-page\-moveright\.md`; evidence
+    `analysis/m\-nightly/ai\-20261020\-013101\-001/`\.
+    - Reproduced at GOMAXPROCS=2 \(about 1 in 40\-100 runs\)\. Two defects, both excluded by PG's deletion protocol:
+      a descent that latched a page unlinked under it read the BTDeletedPageData tombstone as line pointers \(the panic\),
+      and unlinkEmptyLeaf released its emptiness check's latch before deleting, so an insert in between was destroyed\.
+    - Fix 1: isUnlinked \(BTDeleted without BTHalfDead\); descend, tryInsertNoSplit, insertIntoBlock, Search,
+      rangeScanPosLeaf and ScanCursor\.Next step right, as \_bt\_moveright does for P\_IGNORE\. Phase\-1 pages stay writable\.
+    - Fix 2: unlinkEmptyLeaf re\-tests emptiness after latching the target \(\_bt\_pagedel\) and abandons a repopulated one\.
+    - The stress test now gates recycling for the round: a bare pool recycled a deleted block at once, which let a split
+      reuse a block a stale inserter still held \(PG gates on safexid; production wires the horizon\)\. Gated: 0/600 runs
+      fail\.
+    - Pins: TestStructuralLockVacuumWithSplits \(panics without fix 1\); TestUnlinkRechecksEmptinessUnderTheTargetLatch
+      \(deterministic hook; loses the key without fix 2\)\.
+    - Gates: nbtree \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck,
+      acceptance arm \(values identical\), sf025 PASS=99 same=99\.
+  Movement: none — correctness fix — no plan instrument \(TPC\-H and TPC\-DS plans and values unchanged\)
 - [ ] testport/TestPort\_IsolationAlterTable1 — FAIL \(60\.04 s\) \(AI\-20261020\-013101\-002; repro: `go test \-v \-run '^TestPort\_IsolationAlterTable1$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
   - The nightly testport lane overlapped this loop's own regress/isolation gates \(load average 9\.5\); check stale first\.
 - [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
 - [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
 - [ ] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
+  - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
+    re\-run on its own\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
@@ -3289,6 +3313,12 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-16 — **exhausted at `3e6a14e3a`** \(M0122\-0012 slice 16 changed internal/executor\)\. Census
     `routing\-20261016x` is a fresh capture of all three corpora; its records are byte\-identical to `routing\-20261016w`
     \(22/22, 86/99, 74/99\)\. No task is filed; the gates are unchanged\.
+  - S9 pass 2026\-10\-20 — **exhausted at `04839ab7f`**\. Census: the M0146\-0242 fire\-set and TPC\-H captures on HEAD's
+    code tree \(`analysis/m0146/m0146\-0242/fireset/`, `analysis/m0146/m0146\-0242/tpch/`\): TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every CATEGORIES\-EXCL\-MATCH category 0\. No record is non\-MATCH, so nothing is filed\. Open
+    items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175,
+    M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239\(below\-item\-10\);
+    M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

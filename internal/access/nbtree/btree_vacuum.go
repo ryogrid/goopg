@@ -583,6 +583,9 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		return nil
 	}
 	bt.unpinW(recheckSlot)
+	if bt.beforeUnlinkPins != nil {
+		bt.beforeUnlinkPins(leaf.blk)
+	}
 
 	// Resolve the parent block (and the ancestor path the cascade needs)
 	// BEFORE any mutation. The slot index it also returns is used only by the
@@ -654,6 +657,23 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 			return bt.abandonHalfDeadLeaf(leaf.blk)
 		}
 		return err
+	}
+
+	// _bt_pagedel re-tests emptiness under the target's exclusive lock
+	// (`P_FIRSTDATAKEY(opaque) <= PageGetMaxOffsetNumber(page)` refuses).
+	// The recheck at the top of this function released its latch, and a
+	// writer may have inserted into the phase-1 page since — writers still
+	// insert there, because the page keeps its key range until the parent is
+	// retargeted below. Rewriting it as a tombstone now would destroy that
+	// tuple (M-NIGHTLY AI-20261020-013101-001: a key inserted under a
+	// concurrent vacuum went missing); this latch is held through both
+	// records, so no insert can follow the test.
+	if n, cerr := PGDataItemCount(pins.target.Page()); cerr != nil || n > 0 {
+		pins.release(bt)
+		if cerr != nil {
+			return cerr
+		}
+		return bt.abandonHalfDeadLeaf(leaf.blk)
 	}
 
 	// M0130-S11.5d-3a: upstream cannot delete a page whose downlink is
