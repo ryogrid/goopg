@@ -106,7 +106,7 @@ func matchSetByColumnName(tbl *catalog.Table, col string) int64 {
 	if tbl == nil || tbl.Stats == nil || col == "" {
 		return 0
 	}
-	rows := tbl.Stats.RowCount
+	rows := tableRows(tbl)
 	if rows <= 0 {
 		return 0
 	}

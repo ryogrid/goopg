@@ -110,8 +110,8 @@ func priceSemiProbe(x *NestedLoopIndexJoin, cat catalog.Catalog, cp costParams) 
 		return
 	}
 	relTuples := outerRows
-	if tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0 {
-		relTuples = float64(tbl.Stats.RowCount)
+	if rows := tableRows(tbl); rows > 0 {
+		relTuples = float64(rows)
 	}
 	var bound []paramIndexClause
 	for i, col := range boundCols {

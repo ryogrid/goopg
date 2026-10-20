@@ -5359,7 +5359,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22, sf025 PASS=99 \(changed Q13 Q48\), tpcds\-fireset PASS\.
     - Residuals \(ledger\): aborted\-inserter visibility in the probe, a per\-call btree open, no indisvalid check\.
   Movement: none — parity held; estimate\-identical queries SF0\.25 86→87, SF1 85→86 \(Q48\)
-- [ ] **M0146\-0237 — estimate\_rel\_size: scale a stale reltuples by the relation's current page count** \(filed
+- [x] **M0146\-0237 — estimate\_rel\_size: scale a stale reltuples by the relation's current page count** \(filed
   2026\-10\-20 by M0146\-0233\)\.
   Kind: impl
   Parent: M0146-0233
@@ -5374,6 +5374,31 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     functions\); sibling paths change together\.
   - Expected instrument: shipped corpora are unaffected \(relpages = actual pages\); the plan instruments move only
     on tables changed since ANALYZE\. Pin against PG on the same stale\-statistics workload\.
+  - **LANDED 2026\-10\-20 \(loop \#33\)\.** Design `docs/design/0100-0149/m0146-0237-estimate-rel-size-scaling.md`;
+    evidence `analysis/m0146/m0146\-0237/`\.
+    - liveRelSize \(relsize\.go\) is estimate\_rel\_size for an analysed table with a stored page count: pages =
+      curpages, tuples = rint\(reltuples / relpages × curpages\)\. It is fed by catalog\.RelationBlocksFunc \(initdb;
+      storage CachedNBlocks, no syscall for an open fork\)\. tableRows, baseRelPages and the direct RowCount readers go
+      through it\.
+    - Sibling fix: ResolvedNDistinct resolves the form StaDistinct reports \(relative once the fraction exceeds
+      0\.1\), so a key column's distinct count scales with rel\-\>tuples as PG's does\.
+    - Result: the stale\-statistics workload matches PG's EXPLAIN line for line, costs included \(19778 rows /
+      286\.78; id \< 9500 18788\)\. Shipped corpora unchanged \(sf025 same=99, SF1 fired none, TPC\-H 22/22, acceptance
+      identical\)\.
+    - Pin: TestInequalityEstimateReadsActualIndexEndpoints now asserts PG's exact lines; mutation\-checked
+      \(liveRelSize off → 50 rows; old ResolvedNDistinct order → 18787\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, TPC\-H parity 22/22 \(audit arm moved to 5586: the owner's SF1 corpus rebuild held 5582\)\. On the corpora
+      the owner rebuilt and swapped in at 11:44/11:49: sf025 PASS=99, 61 ck\-verified \(15 shapes changed against
+      the pre\-rebuild sweep, the corpus's doing\); tpcds\-fireset A/B PASS, no query changed, 98/99 and 96/99\.
+    - Re the owner's note on bb7b36ceb \(a dirty\-tree sweep at 11:54 ERRORed Q34/Q64/Q75 after 102/209/172 s\): the same
+      staged code swept the rebuilt corpus at 12:12 with Q34 PASS 0\.23 s, Q64 PASS 37 s and Q75 PASS 0\.9 s, all
+      ck\-matched \(`bench/tpcds/runtime_goopg/tpcds\-results\-sf025/sweep\-20261020\-121227\.txt`\)\. At 11:54 this
+      loop's three Q64 EXPLAIN timing servers were running in the same goopg\-workloads memory slice, so the
+      errors are attributed to that contention, not the code\.
+    - Note: the first fire\-set baseline failed SF0\.25 Q64's EXPLAIN on the capture's 120 s timeout\. Q64 plans in
+      40\-235 s on every binary, pre\-0233 included \(ledger\)\.
+  Movement: none — instrument artefact: the shipped corpora have relpages = actual pages, so no plan instrument can see the scaling; a stale\-statistics workload now matches PG line for line
 - [ ] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
   2026\-10\-20 by M0146\-0214 slice 6\)\.
   Kind: impl

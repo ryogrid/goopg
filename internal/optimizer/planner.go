@@ -12228,7 +12228,7 @@ func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.
 		return false
 	}
 	cp := ps.costParams()
-	relTuples := float64(tbl.Stats.RowCount)
+	relTuples := float64(tableRows(tbl))
 	relPages := baseRelPages(tbl, relTuples)
 	// The equality qual against a synthetic scan: the same
 	// selectivity the search would price this probe at

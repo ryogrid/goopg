@@ -652,3 +652,39 @@ func baseRelRows(rowCount, blocks int64, width int) float64 {
 	}
 	return estimateRelSizeRows(blocks, width) // cold: block-derived, no persistence
 }
+
+// liveRelSize is estimate_rel_size (plancat.c → table_block_relation_estimate_size)
+// for an ANALYZEd base table whose current size is known (M0146-0237):
+// rel->pages is the relation's current block count, not pg_class.relpages, and
+// rel->tuples scales the stored density to it, rint(reltuples / relpages ×
+// curpages) — a table that grew since its last ANALYZE is estimated in
+// proportion. ok=false when the size hook is unset (unit tests), the table is
+// virtual or has no file, or the statistics carry no page count to take the
+// density from; callers then keep the stored statistics. An empty current
+// relation (0 blocks) is also declined, because goopg's callers read 0 tuples
+// as "unknown" (ledger).
+func liveRelSize(tbl *catalog.Table) (pages int64, tuples float64, ok bool) {
+	if tbl == nil || tbl.Virtual || tbl.Stats == nil || catalog.RelationBlocksFunc == nil {
+		return 0, 0, false
+	}
+	if tbl.Stats.Pages <= 0 || (tbl.Stats.RowCount <= 0 && !tbl.Stats.Analyzed) {
+		return 0, 0, false
+	}
+	blocks, known := catalog.RelationBlocksFunc(tbl)
+	if !known || blocks <= 0 {
+		return 0, 0, false
+	}
+	pages, tuples = estimateRelSize(relSizeInputs{
+		curpages:    blocks,
+		relpages:    int64(tbl.Stats.Pages),
+		reltuples:   tbl.Stats.RowCount,
+		analyzed:    true,
+		hasSubclass: len(tbl.PartitionKey) > 0,
+		fillfactor:  tbl.Fillfactor,
+		dataWidth:   tableDataWidth(tbl),
+	})
+	if tuples <= 0 {
+		return 0, 0, false
+	}
+	return pages, tuples, true
+}

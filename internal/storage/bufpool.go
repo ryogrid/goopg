@@ -1151,6 +1151,12 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 
 // Exists reports whether rel's backing fork file is present on disk without
 // creating it (mirrors smgrexists). See Manager.Exists.
+// CachedNBlocks reports an already-open fork's size without a file-system
+// call (see Manager.CachedNBlocks).
+func (p *Pool) CachedNBlocks(rel RelFileNode) (BlockNumber, bool) {
+	return p.mgr.CachedNBlocks(rel)
+}
+
 func (p *Pool) Exists(rel RelFileNode) bool {
 	return p.mgr.Exists(rel)
 }

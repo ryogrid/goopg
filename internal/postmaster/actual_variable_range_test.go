@@ -19,9 +19,15 @@ import (
 // the stale histogram says nothing qualifies, so without the probe the
 // estimate is clamped to a hundredth of a bin (0.0001 of the rows: 1 row).
 // With the probe the last bin runs to the actual maximum 20000, and 15000 is
-// half-way into it: PG 18.3 estimates a selectivity of 0.00495 (98 of the
-// 19778 rows it scales reltuples to). goopg keeps reltuples at 10000 (no
-// current-pages scaling, M0146-0237), so the same selectivity is 50 rows.
+// half-way into it: PG 18.3 estimates 98 of the 19778 rows it scales
+// reltuples to.
+//
+// The same workload pins M0146-0237's estimate_rel_size: reltuples (10000) and
+// relpages (45) are stale, the heap has 89 pages, and PG scales the stored
+// density to them — rel->tuples 19778, rel->pages 89 — so a plain scan costs
+// 0.00..286.78, and a relative ndistinct resolves against 19778 (`id < 9500`
+// is 18788 rows, not the 18787 an eq_selec over 10000 gives). Every line below
+// is PG 18.3's EXPLAIN on the same statements.
 func TestInequalityEstimateReadsActualIndexEndpoints(t *testing.T) {
 	dir := t.TempDir()
 	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
@@ -54,11 +60,24 @@ func TestInequalityEstimateReadsActualIndexEndpoints(t *testing.T) {
 		}
 		return m[1] + " (" + strings.TrimSpace(line) + ")"
 	}
-	if got := estimate("SELECT * FROM ep WHERE id > 15000"); !strings.HasPrefix(got, "50 ") {
-		t.Fatalf("id > 15000 estimated %s; want 50 — the probed maximum 20000 puts 15000 half-way into the last bin (1 = the stale histogram's clamp)", got)
+	if got := estimate("SELECT * FROM ep WHERE id > 15000"); !strings.HasPrefix(got, "98 ") {
+		t.Fatalf("id > 15000 estimated %s; want 98 — the probed maximum 20000 puts 15000 half-way into the last bin (1 = the stale histogram's clamp)", got)
 	}
 	// Inside the histogram the probe is not consulted.
-	if got := estimate("SELECT * FROM ep WHERE id > 9000"); !strings.HasPrefix(got, "1000 ") {
-		t.Fatalf("id > 9000 estimated %s; want 1000", got)
+	if got := estimate("SELECT * FROM ep WHERE id > 9000"); !strings.HasPrefix(got, "1978 ") {
+		t.Fatalf("id > 9000 estimated %s; want 1978", got)
+	}
+	for q, want := range map[string]string{
+		"SELECT * FROM ep":                 "Seq Scan on ep  (cost=0.00..286.78 rows=19778 width=8)",
+		"SELECT * FROM ep WHERE id < 9500": "Seq Scan on ep  (cost=0.00..336.23 rows=18788 width=8)",
+		"SELECT * FROM ep WHERE v > 3":     "Seq Scan on ep  (cost=0.00..336.23 rows=8475 width=8)",
+	} {
+		var line string
+		if err := db.QueryRowContext(ctx, "EXPLAIN "+q).Scan(&line); err != nil {
+			t.Fatalf("EXPLAIN %s: %v", q, err)
+		}
+		if line != want {
+			t.Errorf("EXPLAIN %s:\n got %s\nwant %s (PG 18.3: estimate_rel_size scales the stale reltuples to the current 89 pages)", q, line, want)
+		}
 	}
 }

@@ -966,11 +966,16 @@ func indexRangeBoundSelectivity(tbl *catalog.Table, idx *catalog.Index, nEq int,
 // for a scalar inequality whose statistics do not settle it.
 const defaultIneqSel = 0.3333333333333333
 
-// tableRows returns the catalog's reltuples-equivalent for a
-// table, or 0 when ANALYZE hasn't run yet.
+// tableRows returns rel->tuples for an analysed table — estimate_rel_size's
+// stored density scaled to the relation's current size (liveRelSize) — or the
+// stored reltuples-equivalent when the current size is unknown, or 0 when
+// ANALYZE hasn't run yet.
 func tableRows(tbl *catalog.Table) int64 {
 	if tbl == nil || tbl.Stats == nil {
 		return 0
+	}
+	if _, tuples, ok := liveRelSize(tbl); ok {
+		return int64(tuples)
 	}
 	return tbl.Stats.RowCount
 }
