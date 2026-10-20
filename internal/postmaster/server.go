@@ -206,6 +206,11 @@ type Config struct {
 	// M0106-0010 batched-34.
 	IsStandby func() bool
 
+	// RecoveryLSNs, when non-nil, reports the standby's received and
+	// replayed WAL positions for pg_last_wal_receive_lsn /
+	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
+	RecoveryLSNs func() (receive, replay uint64)
+
 	// OnStopImmediate, when set, is invoked by the control-plane
 	// STOPIMMEDIATE command (`goopg stop -mode immediate`) BEFORE the
 	// run context is cancelled. It must mark the runtime so the final

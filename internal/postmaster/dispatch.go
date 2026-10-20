@@ -683,6 +683,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
+	ectx.RecoveryLSNs = s.cfg.RecoveryLSNs
 	// Wire inline-NOTICE delivery so RAISE NOTICE emitted before a row-level
 	// lock wait (e.g. from noisy_oper() in eval-plan-qual) reaches the client
 	// before blockDetectWait fires in the isolation runner.  Without this,

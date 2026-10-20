@@ -18103,6 +18103,8 @@ case "pg_char_to_encoding":
 		return NewBoolDatum(ctx.IsStandby), nil
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
+	case "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn":
+		return evalPgLastWALLSN(name, ctx), nil
 	case "pg_promote":
 		// pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
 		// Returns true if this server is a standby and promotion was triggered.

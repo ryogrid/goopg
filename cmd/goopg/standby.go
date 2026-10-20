@@ -82,6 +82,30 @@ type standbyController struct {
 	promoting  atomic.Bool
 	promoteErr atomic.Pointer[error]
 	promoted   atomic.Bool
+
+	// lastReceived is the highest WAL position a walreceiver reported. PG's
+	// pg_last_wal_receive_lsn keeps answering WalRcv->flushedUpto after the
+	// walreceiver exits (promotion, a reconnect); goopg's receiver registry
+	// forgets a stopped receiver, so recoveryLSNs remembers it here.
+	lastReceived atomic.Uint64
+}
+
+// recoveryLSNs reports pg_last_wal_receive_lsn's and pg_last_wal_replay_lsn's
+// positions: the WAL received from the primary, and the end of the last
+// record replayed (StreamReplayer.ApplyLSN, PG's lastReplayedEndRecPtr).
+func (sc *standbyController) recoveryLSNs() (receive, replay uint64) {
+	if st, ok := sc.rt.WalReceivers.Snapshot(); ok {
+		for {
+			prev := sc.lastReceived.Load()
+			if st.ReceivedLSN <= prev || sc.lastReceived.CompareAndSwap(prev, st.ReceivedLSN) {
+				break
+			}
+		}
+	}
+	if sc.replayer != nil {
+		replay = sc.replayer.ApplyLSN()
+	}
+	return sc.lastReceived.Load(), replay
 }
 
 // startStandby launches the receiver + replayer goroutines and

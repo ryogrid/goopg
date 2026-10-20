@@ -583,6 +583,15 @@ heuristic stays live.)
     stayed 0 for 30 s with the WAL receiver streaming; sync\_remote\_apply and sync\_on passed\. Not yet re\-run alone\.
   - First step: re\-run the async arm alone and under load; read the subtest's replay/apply position against the
     probe's insert LSN\.
+  - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\)\. Design
+    `docs/design/0100\-0149/m\-nightly\-failover\-bootstrap\-replay\-diagnostics\.md`\.
+    - Passes alone 5/5 and 6/6 at 2× CPU oversubscription \(~9\.5 s\)\.
+    - The bootstrap row's commit ends at 0/3003100 on every passing run \(deterministic setup\); the failed standby had
+      received and flushed 0/30201C8\. The row was shipped: the defect is goopg replay or visibility \(StreamReplayer,
+      ReplayXactCommit, snapshot\), not the walsender\. The 0\-byte heap file proves nothing \(unflushed pool pages\)\.
+    - pg\_last\_wal\_receive\_lsn / pg\_last\_wal\_replay\_lsn implemented \(were 42883\); the bootstrap wait now reports
+      want/primary/sent/receive/replay LSNs \(walProgressDiagnostics\)\. Pin: TestPgLastWALLSN\.
+    - Next: on the next occurrence read the notes — replay < want → replay stalled; replay ≥ want → visibility\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
@@ -3393,6 +3402,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175,
     M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239\(below\-item\-10\);
     M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `250e20249`** \(M0119 pg\_relation\_filepath changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

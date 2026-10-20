@@ -720,6 +720,12 @@ type Context struct {
 	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
 	IsStandby bool
 
+	// RecoveryLSNs, when non-nil, reports the standby's WAL positions for
+	// pg_last_wal_receive_lsn (received from the primary) and
+	// pg_last_wal_replay_lsn (end of the last replayed record); 0 means none,
+	// which the functions return as NULL (xlogfuncs.c).
+	RecoveryLSNs func() (receive, replay uint64)
+
 	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
 	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
 	// Key is the lowercase CTE name; value is the materialized RETURNING rows.

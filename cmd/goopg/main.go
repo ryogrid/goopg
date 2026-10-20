@@ -994,6 +994,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		sc = startStandby(ctx, rt, registry, logger)
 		cfg.Promote = boundPromoteToServer(sc)
 		cfg.IsStandby = func() bool { return sc.rt.Standby }
+		cfg.RecoveryLSNs = sc.recoveryLSNs
 	}
 
 	srv := postmaster.New(cfg)

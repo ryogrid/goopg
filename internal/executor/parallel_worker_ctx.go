@@ -90,6 +90,7 @@ func NewWorkerContext(leader *Context, workerMctx *mmgr.Context, workerCtx conte
 	w.CurrentDatabase = leader.CurrentDatabase
 	w.CurrentDatabaseOid = leader.CurrentDatabaseOid
 	w.IsStandby = leader.IsStandby
+	w.RecoveryLSNs = leader.RecoveryLSNs
 	w.EnableOpportunisticPrune = leader.EnableOpportunisticPrune
 	w.FreezeMinAge = leader.FreezeMinAge
 	w.SyncCommitMode = leader.SyncCommitMode
