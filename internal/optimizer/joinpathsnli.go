@@ -185,18 +185,23 @@ func joinClauseIsMovableInto(ri *restrictInfo, currentRelids, currentAndOuter Re
 // the probe demonstrably enforces, and movability survives as the frame it is
 // checked inside rather than as the whole test.
 //
-// Matching is by `restrictInfo` IDENTITY. PG's redundancy test also matches a
-// clause DERIVED from the same equivalence class, and that half is deliberately
-// not reproduced: `selectivityClauses` (joinrestrict.go:319-348) has already
-// reduced each equivalence class to one member before this list is built, so
-// there is no same-EC sibling left to match — and were one to appear, keeping it
-// costs a redundant qual evaluation while dropping it would lose a restriction.
-// The asymmetry decides it. Ledgered.
+// Matching is by `restrictInfo` IDENTITY, over the join's restrictlist as PG
+// builds it (M0146-0242): generate_join_implied_equalities_normal emits ONE
+// equality per equivalence class between the two sides, so the list is first
+// reduced with oneClausePerEquivClass, the rule calcJoinrelSize already sizes
+// the join with. A probe that enforces that equality makes the join filterless;
+// a probe keyed on another member of the class leaves it as a Join Filter,
+// exactly as create_nestloop_path keeps a non-movable clause. goopg's full
+// clause list kept every member pair, so each probe left a sibling behind and
+// both paid the filter — TPC-DS Q72's item probe then elected the
+// inventory-parameterised scan (cheaper per probe) with
+// `cs_item_sk = i_item_sk` as its filter, where PG's catalog_sales probe
+// enforces the class's equality and carries none.
 func nestloopResidualClauses(clauses []*restrictInfo, innerPath *Path, innerRelids, innerParam RelSet) []*restrictInfo {
 	innerAndOuter := innerRelids | innerParam
 	enforced := probeEnforcedClauses(innerPath)
 	var residual []*restrictInfo
-	for _, ri := range clauses {
+	for _, ri := range oneClausePerEquivClass(clauses) {
 		if ri == nil {
 			continue
 		}

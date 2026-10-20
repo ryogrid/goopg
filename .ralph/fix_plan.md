@@ -5635,3 +5635,30 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
       arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 \(Q13 changed, still MATCH\), tpcds\-fireset PASS\.
   Movement: yes — TPC\-DS SF1 match 97→98 \(Q13\)
+- [x] **M0146\-0242 — qual\-placement: TPC\-DS SF1 Q72 — a nested loop over a parameterised inner keeps an equivalence
+  clause the inner already enforces** \(filed 2026\-10\-20 by the S9 pass at 1bb99c7a1\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q72, category qual\-placement, verdict SHAPE\-DIFF \(the item probe's Nested Loop: goopg
+    `Join Filter: \(catalog\_sales\.cs\_item\_sk = item\.i\_item\_sk\)` over `Index Cond: \(i\_item\_sk = inventory\.inv\_item\_sk\)`;
+    PG no Join Filter over `Index Cond: \(i\_item\_sk = catalog\_sales\.cs\_item\_sk\)`\)\. Census: the M0146\-0241 fire\-set
+    captures on HEAD's code tree, `analysis/m0146/m0146\-0241/fireset/`\.
+  - S9 ranking \(SF0\.25 99/99, SF1 98/99, TPC\-H 22/22\): qual\-placement 1 \(SF1 Q72\) is the only open record\.
+    M0146\-0194 closed SF0\.25 Q72 as a PG\-internal near\-tie; SF0\.25 Q72 now matches\.
+  - PG: the EC \{cs\_item\_sk, inv\_item\_sk, i\_item\_sk\} is enforced once\. create\_nestloop\_path drops every
+    restrict clause join\_clause\_is\_movable\_into the parameterised inner, and generate\_join\_implied\_equalities\_normal
+    takes the first best\-scoring outer member in EC order \(cs\_item\_sk\)\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q72\), 98 → 99\.
+  - **Done 2026\-10\-20 — CLOSED\.** Design
+    `docs/design/0100\-0149/m0146\-0242\-nestloop\-one\-clause\-per\-equivclass\.md`; evidence `analysis/m0146/m0146\-0242/`\.
+    - The joinrel's clause list held every member pair of the class, so each item probe left the sibling it did not
+      enforce as a Join Filter; the inventory probe \(cheaper per scan by loop\_count\) won with
+      `cs\_item\_sk = i\_item\_sk` as its filter\.
+    - nestloopResidualClauses reduces its input with oneClausePerEquivClass before the identity drop: the cs\-keyed
+      probe is filterless, the inventory\-keyed one keeps `i = cs`, and PG's probe wins\. A first attempt that dropped
+      every sibling made both filterless and was replaced\.
+    - Pins: TestNLIResidualKeepsOneClausePerEquivClass \(unit, mutation\-checked\);
+      TestNestLoopKeepsOneEquivClassClausePerJoin \(PG\-anchored shape guard, both directions\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 98→99 \(Q72\)
