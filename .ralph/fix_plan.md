@@ -520,6 +520,17 @@ heuristic stays live.)
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - The nightly testport lane overlapped this loop's own regress/isolation gates \(load average 9\.5\); check stale first\.
+  - Diagnosis 2026\-10\-20: the nightly diff starts at `step sc1: COMMIT; <waiting ...>`\. A COMMIT slowed by load ran past
+    the runner's blockProbeCap \(1\.5 s\), which labels a step waiting without a lock wait\. The cap exists only for goopg
+    waits that report no wait event; the fix is to make them report PG's, then retire the cap\.
+  - **Slice 1 LANDED 2026\-10\-20:** WaitForSlotsToCommit and WaitForPinnedSnapshotsReleased report Lock:virtualxid, as
+    PG's WaitForOlderSnapshots does in VirtualXactLock\. Cap fires over the isolation family: 61 → 31 \(evidence
+    `analysis/m\-nightly/ai\-20261020\-013101\-002/`\)\. Pin: TestSnapshotWaitsReportVirtualXIDLock\.
+    - Still unreported: vacuum\-skip\-locked 14, intra\-grant\-inplace 8, tuplelock\-upgrade\-no\-deadlock 3, reindex\-schema
+      2, read\-only\-anomaly\-3 2, insert\-conflict\-specconflict 2\.
+    - Next: find each spec's unreported wait \(start with vacuum\-skip\-locked\), report PG's wait event there, then
+      remove blockProbeCap from awaitStepOrBlock\.
+    - Gates: transam \-race, units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck\.
 - [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.

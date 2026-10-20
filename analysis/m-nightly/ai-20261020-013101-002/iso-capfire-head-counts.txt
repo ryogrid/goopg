@@ -1,0 +1,9 @@
+27 TestPort_IsolationSuite/specs/vacuum-skip-locked
+9 TestPort_IsolationDetachPartitionConcurrently1
+8 TestPort_IsolationIntraGrantInplace
+5 TestPort_IsolationDropIndexConcurrently1
+3 TestPort_IsolationTuplelockUpgradeNoDeadlock
+3 TestPort_IsolationDetachPartitionConcurrently4
+2 TestPort_IsolationReindexSchema
+2 TestPort_IsolationReadOnlyAnomaly3
+2 TestPort_IsolationInsertConflictSpecconflict

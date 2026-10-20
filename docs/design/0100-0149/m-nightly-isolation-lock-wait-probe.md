@@ -122,3 +122,41 @@ COMMIT slows down on a loaded host (WAL flush) but never takes a lock wait.
   `pg_blocking_pids`, OID 2561) is still unimplemented.
 - **PreparedTransactions is still non-strict.** Re-promoting it to strict
   and updating the inventory are left for the nightly to confirm.
+
+## Follow-up (2026-10-20): snapshot waits report Lock:virtualxid
+
+Trigger: `TestPort_IsolationAlterTable1` failed in the 2026-10-20 nightly with
+`step sc1: COMMIT; <waiting ...>`. It passed alone on an idle host. A COMMIT
+slowed by load ran past `blockProbeCap`, and past the cap the runner labels a
+step waiting without the probe's agreement. The cap exists only for goopg
+waits that report no wait event, so the fix is to make those waits report what
+PG reports, then retire the cap.
+
+**Slice 1.** PG's `WaitForOlderSnapshots` (indexcmds.c) sleeps in
+`VirtualXactLock`, shown as Lock:virtualxid. goopg's counterparts now report
+the same while they actually wait (`reportVirtualXIDWait`):
+
+- `WaitForSlotsToCommit`: CREATE / DROP / REINDEX INDEX CONCURRENTLY;
+- `WaitForPinnedSnapshotsReleased`: DETACH PARTITION CONCURRENTLY.
+
+Pin: `TestSnapshotWaitsReportVirtualXIDLock`, which fails without the change.
+
+**Measured.** I counted steps where the cap fired without a lock wait over a
+full `TestPort_Isolation*` run
+(`analysis/m-nightly/ai-20261020-013101-002/`). They fell from 61 to 31:
+
+- detach-partition-concurrently-1 (9) went to 0;
+- drop-index-concurrently-1 (5) went to 0;
+- detach-partition-concurrently-4 (3) went to 0;
+- vacuum-skip-locked went from 27 to 14.
+
+**Still unreported** (the cap stays until these report):
+
+| spec | cap fires |
+|---|---|
+| vacuum-skip-locked | 14 |
+| intra-grant-inplace | 8 |
+| tuplelock-upgrade-no-deadlock | 3 |
+| reindex-schema | 2 |
+| read-only-anomaly-3 | 2 |
+| insert-conflict-specconflict | 2 |
