@@ -105,6 +105,10 @@ estimate-parity process running; keep the old dir as `<dir>.pre-reload-<date>`. 
 `tmp/c20a/data-sf025` (the EA ratchet's private clone) so it re-clones.
 2026-10-19 result: SF0.25 PLAN-PARITY 92 → 97/99, SF1 82 → 94/99; sf025 sweep PASS=99;
 all 64 SF1 row anchors hold (`analysis/m0146/owner-ops-20261019/`).
+2026-10-20 rebuild (after the M0146-0216 internal-split and COPY-FSM ports): all 24 pkeys and
+the fact tables' per-block heap row counts equal PG's at both scales; same-binary census unchanged
+(98/99, 96/99); also run `bt_index_parent_check(<pkey>, true, false, true)` on every pkey and remove
+the stale `tmp/gate-stamps/tpcds-{sf025,fireset}.json` after a swap (`analysis/m0146/owner-ops-20261020/`).
 
 ### State 3 → Results: Run Queries
 

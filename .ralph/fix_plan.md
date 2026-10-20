@@ -364,6 +364,38 @@ OWNER DECISIONS 2026-10-19 (b) — M0146-0229 slice 1 un-parked:
   executor-layer recon of Q74's runtime, and whatever impl sub-tasks it
   files — rank inside item 3 ahead of the next S9 pass.
 
+OWNER DECISIONS 2026-10-20 — TPC-DS corpora REBUILT for M0146-0216 slices 4+5:
+- c74f0c278 (internal-page splits) and 0619c0ac9 (COPY heap placement
+  through PG's FSM) closed "shipped corpora unchanged until an owner
+  rebuild". Both shipped TPC-DS corpora were rebuilt at 4eea30455 with
+  `scripts/tpcds-corpus-rebuild.sh` (COPY → per-table VACUUM → :65438
+  statistics imported into never-analyzed tables; reference stats
+  unchanged since 2026-10-19). Previous corpora kept as
+  `*.pre-rebuild-20261020`. Evidence: `analysis/m0146/owner-ops-20261020/`.
+- Physical parity is now EXACT: all 24 pkeys equal PG's page counts at both
+  scales (was ±2; customer_demographics_pkey 5269 → 5268), heap per-block
+  row counts identical to PG for store_sales / store_returns /
+  catalog_sales, heap relpages/reltuples/relallvisible identical,
+  `bt_index_parent_check` clean on all 24 pkeys, pg_stats unchanged (the
+  5 ledgered diffs).
+- Same-binary A/B census (HEAD 4eea30455; old corpus vs rebuilt): SF0.25
+  98/99 → 98/99 (Q77), SF1 96/99 → 96/99 (Q13, Q72, Q77); plan shapes
+  identical, costs moved on 15 queries per scale (the +4.0-per-probe
+  customer_demographics_pkey offset is gone). SF1 Q64 keeps its match.
+- Values: sf025 sweep PASS=99 on the HEAD binary; all 64 SF1 row anchors.
+  (A sweep built from the dirty tree at 11:54 — the staged M0146-0237 WIP —
+  ERRORed Q34/Q64/Q75 on the rebuilt corpus; the HEAD binary does not.)
+- EA ratchet: on the rebuilt corpus the seeded goopg ANALYZE samples
+  different rows, and Q23's Hash (catalog_sales+cte:frequent_ss_items+
+  customer+date_dim, est 42 / actual 0, no PG counterpart) became a
+  finding; the same binary on the old corpus passes. Owner RE-PIN of
+  `ea-baseline.txt` (Q78 fixed → Q23). Not a code regression.
+- Recorded CORPUS REBUILD for S9(1): routing artifacts before 2026-10-20
+  12:00 are stale. tpcds-sf025 / tpcds-fireset gate stamps taken on the old
+  corpus were removed (re-run the gates).
+- M0146-0216: the owner gate is cleared; the loop re-censuses and closes it
+  once its open child M0146-0236 is resolved.
+
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
 Its selection condition lives in this section's **Selection rules**
@@ -4609,6 +4641,9 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     - Engine work for this task is complete\. Remaining: an owner corpus rebuild on this engine
       \(scripts/tpcds\-corpus\-rebuild\.sh\), then re\-census and close\. The shipped corpora still carry the old
       geometry \(customer\_demographics\_pkey 5269\)\.
+  - **2026\-10\-20: owner corpus rebuild DONE** \(OWNER DECISIONS 2026\-10\-20\): all 24 pkeys = PG at both
+    scales, heap per\-block identical, amcheck clean; same\-binary census unchanged \(98/99, 96/99\)\. Remaining:
+    re\-census and close after the open child M0146\-0236\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.

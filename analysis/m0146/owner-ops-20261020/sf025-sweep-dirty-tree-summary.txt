@@ -1,0 +1,5 @@
+[11:54:14] building goopg -> /home/ryo/work/goopg/goopg/tmp/ownerops-20261020/goopg-sf025-gate (tree 4eea30455, dirty)
+=== SUMMARY: PASS=96 (59 ck-verified, 37 ck=n/a) MISMATCH=0 CKMISMATCH=0 ERROR=3 TIMEOUT=0 SKIP=0 ===
+Q34  ERROR     102s (102514ms) psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query34.sql:2
+Q64  ERROR     209s (208945ms) psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query64.sql:1
+Q75  ERROR     172s (172011ms) psql:/home/ryo/work/goopg/goopg/bench/tpcds/runtime_goopg/tpcds-data/queries/query75.sql:6

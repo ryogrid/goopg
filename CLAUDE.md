@@ -75,7 +75,9 @@ Setup / start / stop procedures:
   tables; owner decision, M0146-0215/-0216). Never `ANALYZE` them — it
   replaces the imported statistics; rebuild only via the owner-only
   `scripts/tpcds-corpus-rebuild.sh` (README "Rebuilding the shipped
-  corpora"). Previous corpora kept as `*.pre-reload-20261019`.
+  corpora"). Rebuilt again 2026-10-20 (internal-split + COPY-FSM ports:
+  every pkey and heap block now equals PG's). Previous corpora kept as
+  `*.pre-rebuild-20261020` (and `*.pre-reload-20261019`).
 
 Row-count anchors are **load-dependent**: `bench/tpch/spotcheck_expected.env`
 (Q12/Q13) and `ci/batch/tpch-row-anchors.csv` are pinned to a specific HammerDB

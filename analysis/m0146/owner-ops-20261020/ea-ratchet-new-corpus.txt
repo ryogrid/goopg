@@ -1,0 +1,5 @@
+FINDINGS:  1
+  Q23       42.0           42          0          -          -  Hash                   catalog_sales+cte:frequent_ss_items+customer+date_dim
+  FIXED    Q78:date_dim+store_returns+store_sales+web_returns+web_sales
+  NEW      Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim
+EA-RATCHET: FAIL (1 new estimate finding(s))

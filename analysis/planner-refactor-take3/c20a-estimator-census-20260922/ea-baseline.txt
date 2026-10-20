@@ -1,3 +1,3 @@
 # EA parity ratchet baseline — one line per finding.
 # tol=2.0 floor=10.0
-Q78:date_dim+store_returns+store_sales+web_returns+web_sales
+Q23:catalog_sales+cte:frequent_ss_items+customer+date_dim
