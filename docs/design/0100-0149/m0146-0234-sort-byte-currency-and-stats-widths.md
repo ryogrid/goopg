@@ -143,3 +143,34 @@ keeps that key alone (width 4 of 12). With nothing needed above, it keeps the st
 **Remaining (task open).** A non-table leaf (subquery, CTE) still takes its column widths from type widths. PG uses
 the subquery's target-list widths (`set_subquery_size_estimates`, `set_cte_size_estimates`).
 
+## 10. Slice 4 (2026-10-20): derived leaves' column widths, and closure
+
+**PG.** `set_subquery_size_estimates` copies into a subquery rel's `attr_widths` the width its own rel computed for
+every subquery target that is a plain Var: `set_rel_width`'s get\_attavgwidth, which is stawidth. An expression
+target, any target under set operations, and every column of a materialized CTE (`set_cte_size_estimates` sets no
+widths) fall to the type default in `set_rel_width`.
+
+**goopg.** A non-table leaf priced every kept column at its type width.
+
+**Change.** `derivedLeafColumnWidth` / `subqueryVarWidth` (narrowcostinputs.go) follow a derived leaf's output to
+the base attribute it is a plain Var of, and `relNarrowedColumns` uses that attribute's stawidth. The walk crosses:
+
+- pass-through nodes;
+- a Project's bare column;
+- a join's side;
+- an Aggregate's group key;
+- a nested subquery or inlined CTE.
+
+It stops, keeping the type default, at a materialized CTE, a set operation, an expression or a column without
+statistics.
+
+**Result.** Inert like slice 3. Fire-set plans are text-identical with costs at both scales: SF0.25 1882 of 2572
+nodes and SF1 1951 of 2611 nodes are cost-equal before and after. TPC-H parity stays 22 / 22, and sf025 shapes are
+the same.
+
+**Pin.** `TestDerivedLeafColumnWidthFollowsSubqueryVars`: a plain Var and a group key take stawidth 17, while an
+expression and a materialized CTE keep the type default. An inlined CTE answers like a subquery.
+
+**Closure.** The task's record, SF1 Q64's GEQO evaluation 41, is gone: SF1 Q64 has matched PG since M0146-0214
+closed (d1446d972), and every item this task named has landed. Slice 1 (sort byte currency, stawidth sums) and
+slice 2 (the joinrel target) moved the Q64 worths. Slices 3 and 4 are fidelity ports that no current capture reads.

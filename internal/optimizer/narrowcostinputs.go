@@ -182,6 +182,8 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 		}
 		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
 			kc.width = int(aw)
+		} else if w, ok := derivedLeafColumnWidth(rel.baseLeaf, i); ok {
+			kc.width = w
 		} else {
 			kc.width = typeWidth(col.Type)
 		}
@@ -519,3 +521,108 @@ func inheritNarrowedWidths(parent, child *Path) {
 	parent.AvgVarBytes = child.AvgVarBytes
 	parent.OutputWidth = child.OutputWidth
 }
+
+// derivedLeafColumnWidth is set_subquery_size_estimates' attr_widths
+// (costsize.c) for output column idx of a derived leaf (M0146-0234): a
+// subquery output that is a plain Var takes the width its own rel computed for
+// that attribute — set_rel_width's get_attavgwidth, pg_statistic.stawidth —
+// rather than its type's default. ok=false leaves the type default, as PG does
+// for an expression target, a set operation, a materialized CTE (RTE_CTE,
+// set_cte_size_estimates computes no widths) or a column without statistics.
+// An inlined CTE is an RTE_SUBQUERY and answers like one.
+func derivedLeafColumnWidth(leaf Node, idx int) (int, bool) {
+	n := leaf
+	for {
+		if f, ok := n.(*Filter); ok && f.Child != nil {
+			n = f.Child
+			continue
+		}
+		break
+	}
+	switch x := n.(type) {
+	case *SubqueryScan:
+		n = x.Child
+	case *CTEScan:
+		if !x.Inlined() {
+			return 0, false
+		}
+		n = x.Child
+	case *Project:
+		// A trivial Subquery Scan stripped to the sub-select's own Project.
+	default:
+		return 0, false
+	}
+	return subqueryVarWidth(idx, n, 0)
+}
+
+// subqueryVarWidth follows output column idx of a planned subquery body down
+// to the base relation attribute it is a plain Var of, and returns that
+// attribute's stawidth. It crosses only what keeps a column a plain Var:
+// pass-through nodes, a Project's bare column, a join's side, a group key of
+// an Aggregate, and a nested subquery (whose own attr_widths were set the same
+// way).
+func subqueryVarWidth(idx int, n Node, depth int) (int, bool) {
+	if n == nil || idx < 0 || depth > 64 {
+		return 0, false
+	}
+	switch x := n.(type) {
+	case *SeqScan, *IndexScan, *IndexOnlyScan, *BitmapHeapScan:
+		tbl := scanTable(x)
+		out := x.Output()
+		if tbl == nil || idx >= len(out) {
+			return 0, false
+		}
+		if st := columnStatsByName(tbl, out[idx].Name); st != nil && st.AvgWidth > 0 {
+			return int(st.AvgWidth), true
+		}
+		return 0, false
+	case *Project:
+		if idx < len(x.Targets) {
+			if cr, ok := x.Targets[idx].(*ColumnRef); ok {
+				return subqueryVarWidth(cr.Index, x.Child, depth+1)
+			}
+		}
+		return 0, false
+	case *Aggregate:
+		if len(x.GroupingSets) > 0 || idx >= len(x.GroupExprs) {
+			return 0, false
+		}
+		if cr, ok := x.GroupExprs[idx].(*ColumnRef); ok {
+			return subqueryVarWidth(cr.Index, x.Child, depth+1)
+		}
+		return 0, false
+	case *Filter:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Sort:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *IncrementalSort:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Limit:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Gather:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *GatherMerge:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Materialize:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Memoize:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *SubqueryScan:
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *CTEScan:
+		if !x.Inlined() {
+			return 0, false
+		}
+		return subqueryVarWidth(idx, x.Child, depth+1)
+	case *Join:
+		if x.Left == nil || x.Right == nil {
+			return 0, false
+		}
+		if lw := len(x.Left.Output()); idx >= lw {
+			return subqueryVarWidth(idx-lw, x.Right, depth+1)
+		}
+		return subqueryVarWidth(idx, x.Left, depth+1)
+	}
+	return 0, false
+}
+

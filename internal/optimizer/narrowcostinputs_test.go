@@ -821,3 +821,45 @@ func TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns(t *testing.T) {
 		t.Fatalf("empty reltarget triple = %+v, want the statement-wide 3 columns", got)
 	}
 }
+
+// M0146-0234: set_subquery_size_estimates — a derived leaf's plain-Var output
+// takes the width its subquery rel computed for the attribute (stawidth),
+// not the type default; an expression output, and a materialized CTE
+// (RTE_CTE), keep the type default; an inlined CTE answers as a subquery.
+func TestDerivedLeafColumnWidthFollowsSubqueryVars(t *testing.T) {
+	tbl := &catalog.Table{Name: "item", Columns: []catalog.Column{
+		{Name: "i_item_id", Type: catalog.Type{Name: "bpchar"}},
+		{Name: "i_price", Type: catalog.Type{Name: "numeric"}},
+	}, Stats: &catalog.TableStats{RowCount: 100, Analyzed: true, Columns: []catalog.ColumnStats{
+		{AvgWidth: 17}, {AvgWidth: 6},
+	}}}
+	scan := &SeqScan{Table: tbl, schema: Schema{{Name: "i_item_id"}, {Name: "i_price"}}}
+	body := &Project{Child: scan, Targets: []Expr{
+		&ColumnRef{Index: 0, Name: "i_item_id"},
+		&BinaryOp{Op: parser.OpAdd, Left: &ColumnRef{Index: 1, Name: "i_price"}, Right: &IntegerConst{Value: 1}},
+	}, schema: Schema{{Name: "i_item_id"}, {Name: "p"}}}
+	sub := &SubqueryScan{Child: body, schema: body.schema}
+	if w, ok := derivedLeafColumnWidth(sub, 0); !ok || w != 17 {
+		t.Fatalf("plain-Var output width = %d, %v; want the column's stawidth 17", w, ok)
+	}
+	if _, ok := derivedLeafColumnWidth(sub, 1); ok {
+		t.Fatalf("expression output took a statistics width; PG uses the type default")
+	}
+	// A GROUP BY key is still a plain Var of the scan.
+	agg := &Aggregate{Child: scan, GroupExprs: []Expr{&ColumnRef{Index: 0, Name: "i_item_id"}},
+		schema: Schema{{Name: "i_item_id"}, {Name: "n"}}}
+	if w, ok := derivedLeafColumnWidth(&SubqueryScan{Child: agg, schema: agg.schema}, 0); !ok || w != 17 {
+		t.Fatalf("group-key output width = %d, %v; want 17", w, ok)
+	}
+	// A materialized CTE computes no widths (set_cte_size_estimates).
+	mat := &CTEScan{Name: "c", Child: body, schema: body.schema,
+		cte: &plannedCTE{name: "c", body: body, schema: body.schema, materialized: "materialized"}}
+	if _, ok := derivedLeafColumnWidth(mat, 0); ok {
+		t.Fatalf("a materialized CTE took a statistics width; PG uses the type default")
+	}
+	inl := &CTEScan{Name: "c", Child: body, schema: body.schema,
+		cte: &plannedCTE{name: "c", body: body, schema: body.schema, inlineEligible: true, selectOwned: true, refs: 1}}
+	if w, ok := derivedLeafColumnWidth(inl, 0); !ok || w != 17 {
+		t.Fatalf("inlined CTE output width = %d, %v; want 17 (an RTE_SUBQUERY)", w, ok)
+	}
+}

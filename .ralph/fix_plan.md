@@ -5451,7 +5451,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Note: the first fire\-set baseline failed SF0\.25 Q64's EXPLAIN on the capture's 120 s timeout\. Q64 plans in
       40\-235 s on every binary, pre\-0233 included \(ledger\)\.
   Movement: none — instrument artefact: the shipped corpora have relpages = actual pages, so no plan instrument can see the scaling; a stale\-statistics workload now matches PG line for line
-- [ ] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
+- [x] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
   2026\-10\-20 by M0146\-0214 slice 6\)\.
   Kind: impl
   Parent: M0146-0214
@@ -5511,6 +5511,19 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Movement: none — instrument artefact: no captured plan or cost reads a base rel's width on these corpora\.
     - Remaining \(task stays open\): non\-table leaves' widths from the subquery target list
       \(set\_subquery\_size\_estimates / set\_cte\_size\_estimates\)\.
+  - **Slice 4 2026\-10\-20 \(loop \#37\): derived leaves' widths, and closure\.** Design §10; evidence
+    `analysis/m0146/m0146\-0234/slice4/`\.
+    - derivedLeafColumnWidth / subqueryVarWidth: a subquery output that is a plain Var takes its base attribute's
+      stawidth \(set\_subquery\_size\_estimates\); expressions, set operations, materialized CTEs and stat\-less columns
+      keep the type default; an inlined CTE answers as a subquery\.
+    - Measured inert: fire\-set plans text\-identical with costs \(SF0\.25 1882/2572, SF1 1951/2611 cost\-equal nodes,
+      unchanged\); TPC\-H 22/22; sf025 same=99\.
+    - Pin: TestDerivedLeafColumnWidthFollowsSubqueryVars\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22,
+      sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+    - Closure: the record \(SF1 Q64 GEQO eval 41\) is stale, since SF1 Q64 has matched PG since M0146\-0214 closed
+      \(d1446d972\); every item named here has landed\.
+  Movement: none — record stale: SF1 Q64 has matched since M0146\-0214; slices 3–4 are fidelity ports no capture reads
 - [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl
