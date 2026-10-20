@@ -1484,6 +1484,9 @@ func markSortWantCTIDs(op Operator) {
 		case *ordinalityOp:
 			op = v.child
 		case *windowOp:
+			// The window buffers rows, so it keeps their TIDs itself
+			// (M0146-0236) and the sorts below must deliver them.
+			v.wantCTIDs = true
 			op = v.child
 		case *projectSetOp:
 			op = v.child

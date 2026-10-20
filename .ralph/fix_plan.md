@@ -4650,7 +4650,7 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
     `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
     `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
     `tmp/g14\-tpcds025\-stats\.sql`\.
-- [ ] **M0146\-0236 — WRONG RESULTS: system columns lost above a WindowAgg — `ctid` reads NULL, `xmin` does not
+- [x] **M0146\-0236 — WRONG RESULTS: system columns lost above a WindowAgg — `ctid` reads NULL, `xmin` does not
   resolve** \(filed 2026\-10\-20 by M0146\-0216 slice 5; S2 escalation, owner to place\)\.
   Kind: impl
   Parent: M0146-0216
@@ -4662,6 +4662,45 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
   - First step: find where the WindowAgg path builds its input target list. The system attribute is probably
     dropped there \(ctid\), or never offered to name resolution \(xmin\)\. Compare with the Agg path, which keeps
     `ctid` correctly\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
+  - **LANDED 2026\-10\-20 \(loop \#34\), the window case; selected as the child OWNER DECISIONS 2026\-10\-20 names
+    for closing M0146\-0216\.** Design `docs/design/0100-0149/m0146-0236-window-ctid.md`\.
+    - Cause: goopg's `ctid` is a CTIDExpr reading the slot's TID side\-channel\. windowOp buffered and re\-sorted its
+      input and emitted fresh slots, so the channel was lost\. markSortWantCTIDs passed through the window without
+      asking it to keep anything\.
+    - Change: windowOp keeps a per\-row TID array \(captured with slot\.TID\(\) while buffering, permuted with the
+      partition sort, re\-attached on emit\); markSortWantCTIDs sets its wantCTIDs\.
+    - Result: ctid beside window functions equals each row's TID, including over a Sort on 200000 rows\. Pin:
+      TestCtidSurvivesWindowAgg, mutation\-checked\.
+    - Not window\-specific, so filed separately: `xmin` and the other system columns do not resolve anywhere
+      \(M0146\-0239\); `ctid` is NULL in every join and binds to non\-relation range entries \(M0146\-0238\)\. `ctid`
+      inside the window's own expressions stays NULL \(ledger, same root as 0238\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, sf025 PASS=99 same=99, tpcds\-fireset PASS \(no change; 98/99, 96/99\)\.
+  Movement: none — correctness fix — no plan instrument
+- [ ] **M0146\-0238 — WRONG RESULTS: `ctid` reads NULL in every join and binds to non\-relation range entries** \(filed
+  2026\-10\-20 by M0146\-0236; S2 escalation, owner to place\)\.
+  Kind: impl
+  Parent: M0146-0236
+  - Repro: `CREATE TABLE a\(id int\); CREATE TABLE b\(id int\); INSERT ...;`
+    - `SELECT a\.ctid, b\.ctid FROM a JOIN b USING \(id\)` returns NULL for both; PG returns each row's TID\.
+    - `SELECT ctid FROM \(SELECT \* FROM a LIMIT 5\) s` returns values; PG errors 42703 \(a subquery has no ctid\)\.
+    - `SELECT ctid FROM a, LATERAL \(SELECT 1\) l` errors "ambiguous"; PG resolves it to a\.
+    - `lag\(ctid\)`, `PARTITION BY ctid` and a run condition over ctid read NULL inside a WindowAgg\.
+  - Cause: ctid is a CTIDExpr reading one TID side\-channel per slot; a join row has two sources, and
+    resolveColumnRefAt binds `ctid` to any range binding, not only to relations\.
+  - PG: ctid is a Var with attno \-1 of its relation, projected by the scan and carried up like any column\.
+    Resume: give CTIDExpr \(or a system\-column Var\) its source binding, have the scan emit it as a column, and
+    resolve only against RTE\_RELATION bindings\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
+- [ ] **M0146\-0239 — `xmin`, `xmax`, `cmin` and `cmax` system columns do not resolve** \(filed 2026\-10\-20 by
+  M0146\-0236\)\.
+  Kind: impl
+  Parent: M0146-0236
+  - Repro: `SELECT xmin, xmax, cmin, cmax FROM t` errors 42703 `column "xmin" does not exist`; PG returns the heap
+    tuple header's values \(heap\_getsysattr\)\.
+  - Resume: resolve them as system\-column Vars of their relation \(the same design as M0146\-0238\) and read
+    t\_xmin, t\_xmax \(HeapTupleHeaderGetRawXmax\) and the combo\-cid–aware cmin/cmax from the scanned tuple\.
   - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
 - [x] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
   Gather Merge\), goopg sorts only** \(filed 2026\-10\-16 by the S9 pass at 4334a3714\)\.
