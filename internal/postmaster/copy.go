@@ -195,6 +195,14 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 	ectx.Catalog = s.cfg.Catalog
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.MultiXact = s.cfg.MultiXact
+	// The free space map and visibility map, as dispatch wires them for
+	// every other statement (M0146-0216). Without the FSM, COPY's
+	// RelationGetBufferForTuple could neither record a page it left nor find
+	// one with room, so it filled the heap strictly forward where PG's COPY
+	// returns to earlier pages; without the VM, a COPY into an all-visible
+	// page left the page's visibility bit set.
+	ectx.FSM = s.cfg.FSM
+	ectx.VM = s.cfg.VM
 	ectx.Tx = tx
 	ectx.Snap = snap
 	asyncCommit := sessionAsyncCommit(sess)

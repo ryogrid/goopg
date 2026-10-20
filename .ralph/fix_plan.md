@@ -4588,12 +4588,46 @@ Movement: none — plans byte-identical on TPC-H and SF0.25 (inert on today's co
       \(SF1 95/99, fired none\)\.
     - Next: COPY heap placement through the FSM \(hio\.c RecordAndGetPageWithFreeSpace; ledger 2026\-10\-16\), which
       is the last engine mechanism here\. Then an owner corpus rebuild, re\-measure and close\.
+  - **Slice 5 LANDED 2026\-10\-20 \(loop \#30\): COPY heap placement through PG's FSM\.** Design §8; evidence
+    `analysis/m0146/m0146\-0216/slice5/`\.
+    - Root cause: server\-side COPY's hand\-built executor context \(postmaster/copy\.go\) had no FSM \(and no VM\)\.
+      The bulk path recorded nothing and found nothing, so the heap filled strictly forward\. A trace showed every
+      RecordAndGet search failing\.
+    - Port: storage/fsm\_pgtree\.go, PG's FSM tree \(fsm\_search\_avail with fp\_next\_slot, own\-leaf\-first
+      RecordAndGet, upper levels moved only by FreeSpaceMapVacuumRange with its exclusive end, fsm\_search's stale
+      correction\)\. It is used by the bulk path; COPY gets FSM/VM; VACUUM ends with the vacuum range;
+      MaxFSMRequestSize 8164→8160\.
+    - Measured, full COPY replay at both scales: every pkey = PG \(store\_sales 2567→**2569** SF0\.25,
+      11042→**11041** SF1; store\_returns 1081→**1082**; catalog\_sales 5624→**5625**\)\. Heap block counts are
+      identical to the PG replica \(0 differing blocks, from 4303/387/58 SF0\.25 and 17539/689/7361 SF1\)\. Heap
+      pages = PG after VACUUM truncates COPY's tails\.
+    - Pins: TestCopyFromRefillsEarlierPagesThroughTheFSM \(PG\-measured layout plus 8 back\-jumps; fails without the
+      ctx FSM, with first\-fit, or without the vacuum range\) and fsm\_pgtree\_test\.go\.
+    - Filed M0146\-0236 \(S2\): ctid NULL / xmin unresolved above a WindowAgg\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm, sf025 PASS=99 same=99, tpcds\-fireset \(98/99, 95/99, fired none\)\.
+    - Engine work for this task is complete\. Remaining: an owner corpus rebuild on this engine
+      \(scripts/tpcds\-corpus\-rebuild\.sh\), then re\-census and close\. The shipped corpora still carry the old
+      geometry \(customer\_demographics\_pkey 5269\)\.
   - Re\-attributed record \(M0146\-0214 slice 2, 2026\-10\-16\): TPC\-DS **Q64**. Its GEQO walk is now PG's draw for
     draw, but the tours' worth follows the physical inputs: relallvisible on every Q64 table, plus
     store\_returns\_pkey 277 vs 280 and store\_sales\_pkey 2481 vs 2569 index pages at SF0\.25\.
     `analysis/m0146/m0146\-0214/physical/` has the pg\_class pairs. A `pg\_dump \-\-statistics` restore into the
     `tmp/pgdbg` scratch PG reproduces the reference's stats exactly and is a ready control rig; dump at
     `tmp/g14\-tpcds025\-stats\.sql`\.
+- [ ] **M0146\-0236 — WRONG RESULTS: system columns lost above a WindowAgg — `ctid` reads NULL, `xmin` does not
+  resolve** \(filed 2026\-10\-20 by M0146\-0216 slice 5; S2 escalation, owner to place\)\.
+  Kind: impl
+  Parent: M0146-0216
+  - Repro \(any table\): `CREATE TABLE zt\(id int, x int\); INSERT INTO zt VALUES \(1,1\),\(2,2\);`
+    - `SELECT ctid, row\_number\(\) OVER \(\) FROM zt` returns NULL for ctid; PG returns \(0,1\) and \(0,2\)\.
+    - `SELECT ctid, sum\(x\) OVER \(ORDER BY id\) FROM zt` and `lag\(ctid\) OVER \(...\)` give NULL as well\.
+    - `SELECT xmin::text, row\_number\(\) OVER \(\) FROM zt` errors `column "xmin" does not exist`\.
+    - Plain `SELECT ctid FROM zt` and `ctid` in a subquery or GROUP BY are correct\.
+  - First step: find where the WindowAgg path builds its input target list. The system attribute is probably
+    dropped there \(ctid\), or never offered to name resolution \(xmin\)\. Compare with the Agg path, which keeps
+    `ctid` correctly\.
+  - Gate: correctness\-only under the S7 carve\-out; no plan instrument\.
 - [x] **M0146\-0217 — sort\-strategy: TPC\-DS Q38/Q87 — PG dedups each DISTINCT set\-operation leg per worker \(Unique under
   Gather Merge\), goopg sorts only** \(filed 2026\-10\-16 by the S9 pass at 4334a3714\)\.
   Kind: impl

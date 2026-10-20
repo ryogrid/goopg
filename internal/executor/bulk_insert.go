@@ -31,10 +31,6 @@ const maxBuffersToExtendBy = 64
 // itemIDSize is sizeof(ItemIdData), one line pointer.
 const itemIDSize = 4
 
-// fsmCategoryStep is freespace.c's FSM_CAT_STEP: the FSM keeps free space in
-// 32-byte categories, rounding a page's space down and a request up.
-const fsmCategoryStep = 32
-
 type bulkInsertState struct {
 	rel storage.RelFileNode
 
@@ -87,13 +83,19 @@ func heapMultiInsertPages(lens []int, saveFree int) int {
 	return npages
 }
 
-// fsmRequest is the goopg FSM threshold that asks what PG's FSM search asks:
-// a page whose heap free space, rounded down to a category, covers the
-// request rounded up to one. goopg's FSM keeps exact pd_upper - pd_lower, one
-// line pointer more than PageGetHeapFreeSpace.
-func fsmRequest(targetFreeSpace int) uint16 {
-	need := (targetFreeSpace + fsmCategoryStep - 1) / fsmCategoryStep * fsmCategoryStep
-	return uint16(need + itemIDSize)
+// heapFreeSpaceOf is PageGetHeapFreeSpace of blk, read under its content
+// lock: the pageFreeSpace RelationGetBufferForTuple hands the FSM when it
+// leaves a page.
+func heapFreeSpaceOf(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber) (int, error) {
+	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return 0, err
+	}
+	slot.Lock()
+	free := storage.PageGetHeapFreeSpace(slot.Page())
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+	return free, nil
 }
 
 // place puts the prepared tuple whose targetFreeSpace is given on a page,
@@ -154,16 +156,14 @@ func (bs *bulkInsertState) getBuffer(ctx *Context, targetFreeSpace, numPages int
 		// RelationGetTargetBlock: goopg caches no smgr_targblock, so a
 		// fresh state starts from the FSM, then the last page (hio.c:576-597).
 		skipCur = false
-		if blk, ok := ctx.FSM.GetPageWithFreeSpace(rel, fsmRequest(targetFreeSpace)); ok {
+		n, err := ctx.Pool.NBlocks(rel)
+		if err != nil {
+			return 0, err
+		}
+		if blk, ok := ctx.FSM.PGGetPageWithFreeSpace(rel, targetFreeSpace, n); ok {
 			target, have = blk, true
-		} else {
-			n, err := ctx.Pool.NBlocks(rel)
-			if err != nil {
-				return 0, err
-			}
-			if n > 0 {
-				target, have = n-1, true
-			}
+		} else if n > 0 {
+			target, have = n-1, true
 		}
 	}
 	for have {
@@ -177,7 +177,8 @@ func (bs *bulkInsertState) getBuffer(ctx *Context, targetFreeSpace, numPages int
 			}
 		}
 		skipCur = false
-		// try has recorded the page's remaining space in the FSM.
+		// try has recorded the page's remaining space in the FSM
+		// (RecordPageWithFreeSpace on the next_free arm).
 		if bs.haveFree {
 			target = bs.nextFree
 			if bs.nextFree >= bs.lastFree {
@@ -187,7 +188,17 @@ func (bs *bulkInsertState) getBuffer(ctx *Context, targetFreeSpace, numPages int
 			}
 			continue
 		}
-		target, have = ctx.FSM.GetPageWithFreeSpace(rel, fsmRequest(targetFreeSpace))
+		// RecordAndGetPageWithFreeSpace: the old page's FSM leaf first,
+		// searched from its hint, then the whole tree (M0146-0216).
+		pageFree, err := heapFreeSpaceOf(ctx, rel, target)
+		if err != nil {
+			return 0, err
+		}
+		n, err := ctx.Pool.NBlocks(rel)
+		if err != nil {
+			return 0, err
+		}
+		target, have = ctx.FSM.PGRecordAndGetPageWithFreeSpace(rel, target, pageFree, targetFreeSpace, n)
 	}
 	return bs.extend(ctx, numPages, try)
 }
@@ -214,6 +225,13 @@ func (bs *bulkInsertState) extend(ctx *Context, numPages int,
 		emptyFree := uint16(storage.BlockSize - storage.SizeOfPageHeaderData)
 		for i := notInFSM; i < extendBy; i++ {
 			ctx.FSM.RecordFreeSpace(rel, first+storage.BlockNumber(i), emptyFree)
+		}
+		// FreeSpaceMapVacuumRange(relation, first_fsm_block, last_block):
+		// the range end is exclusive, so the extension's last page stays out
+		// of the upper levels — and every FSM page visited restarts its
+		// search hint at slot 0.
+		if notInFSM < extendBy {
+			ctx.FSM.PGVacuumRange(rel, first+storage.BlockNumber(notInFSM), first+storage.BlockNumber(extendBy-1))
 		}
 	}
 	if extendBy > 1 {
