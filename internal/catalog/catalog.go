@@ -77,6 +77,15 @@ var RelAllVisibleFunc func(dbOid, relOid uint32) int32
 // because those columns are declared NUMERIC (M0134-0183).
 var RelNBlocksFunc func(rel storage.RelFileNode) (int64, bool)
 
+// ActualVariableRangeFunc is the planner's get_actual_variable_range
+// (selfuncs.c; M0146-0233): the actual current minimum (wantMax=false) or
+// maximum of tbl's column, read from a btree index leading on it, rendered as
+// ANALYZE renders histogram bounds. ok=false when no usable index exists or
+// the probe found no usable entry. Set by initdb at startup with the server's
+// catalog captured; nil (unit tests, tools) means no index can be probed, as
+// for a relation with no indexes.
+var ActualVariableRangeFunc func(tbl *Table, column string, wantMax bool) (string, bool)
+
 // IndexRealPages reports idx's real main-fork size in blocks, when the
 // storage hook is wired and the fork exists. The dbOid/tablespace resolution
 // mirrors (*InMemory).IndexRelFileNode less the receiver's default-db state:

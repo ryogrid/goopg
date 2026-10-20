@@ -2868,6 +2868,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return int64(n), true
 	}
 
+	// M0146-0233: get_actual_variable_range for the planner's histogram
+	// endpoints, reading btree indexes through this runtime's pool and catalog.
+	endpointProbe := executor.ActualVariableEndpointProbe(pool, rt.TxnMgr, rt.VM)
+	runtimeCat := rt.Catalog
+	catalog.ActualVariableRangeFunc = func(tbl *catalog.Table, column string, wantMax bool) (string, bool) {
+		return executor.ActualVariableRange(endpointProbe, runtimeCat, tbl, column, wantMax)
+	}
+
 	// M0130-S1: load persistent FSM state from per-relation. Same shape /
 	// nil-safety as the VM load above. A missing file is the
 	// fresh-cluster case; a corrupt one is a hard startup

@@ -498,7 +498,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 		op = swapInequalityOp(op)
 	}
 	stats := columnStatsForChild(col.Index, child)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, columnRawRowsForChild(col.Index, child)); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, columnRawRowsForChild(col.Index, child), childBaseColumnProbe(col.Index, child)); measured {
 		return sel
 	}
 	return defaultIneqSelectivity
@@ -515,7 +515,7 @@ func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 
 // ok=false when the shape carries no measurement (no statistics, a
 // short histogram, or a non-constant) and the caller keeps its own
 // default.
-func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats, tuples float64) (float64, bool) {
+func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *catalog.ColumnStats, tuples float64, probe endpointProbe) (float64, bool) {
 	// M0142-0009: a column whose distinct values all fit the MCV list
 	// (analyze.c's `nmultiple == ndistinct` case, `computeColumnStats`
 	// mirrors it at operators_analyze.go:1441) legitimately stores NO
@@ -534,14 +534,16 @@ func rangeOpSelectivityStats(op parser.OpCode, col *ColumnRef, val Expr, stats *
 	if !ok {
 		return 0, false
 	}
-	return scalarIneqSelStats(op, stats, literal, col.Type.Name, tuples)
+	return scalarIneqSelStats(op, stats, literal, col.Type.Name, tuples, probe)
 }
 
 // scalarIneqSelStats is rangeOpSelectivityStats' arithmetic over a bound
 // already in histogram-string form — `scalarineqsel` (selfuncs.c) given a
 // Datum, which is how mergejoinscansel calls it with the other side's range
 // endpoints (M0146-0214). ok=false when the statistics carry no measurement.
-func scalarIneqSelStats(op parser.OpCode, stats *catalog.ColumnStats, literal, typeName string, tuples float64) (float64, bool) {
+// probe is get_actual_variable_range for the variable (nil when its relation
+// has no usable index), consulted when the histogram search reaches an end.
+func scalarIneqSelStats(op parser.OpCode, stats *catalog.ColumnStats, literal, typeName string, tuples float64, probe endpointProbe) (float64, bool) {
 	if stats == nil || (len(stats.Histogram) < 2 && len(stats.MCV) == 0) {
 		return 0, false
 	}
@@ -568,7 +570,12 @@ func scalarIneqSelStats(op parser.OpCode, stats *catalog.ColumnStats, literal, t
 	if nonMCVMass < 0 {
 		nonMCVMass = 0
 	}
-	histSel := histogramOpSelectivity(op, stats.Histogram, literal, typeName, histogramEqSel(stats, tuples))
+	// scalarineqsel: the histogram's share of the non-MCV mass, or half of it
+	// when ineq_histogram_selectivity has no usable histogram (-1).
+	histSel := histogramOpSelectivity(op, stats.Histogram, literal, typeName, histogramEqSel(stats, tuples), probe)
+	if histSel < 0 {
+		histSel = 0.5
+	}
 	sel := mcvHits + histSel*nonMCVMass
 	if sel < 0 {
 		return 0, true
@@ -579,28 +586,77 @@ func scalarIneqSelStats(op parser.OpCode, stats *catalog.ColumnStats, literal, t
 	return sel, true
 }
 
+// endpointProbe is get_actual_variable_range for one variable: the actual
+// current minimum (wantMax=false) or maximum, in histogram-bound form, read
+// from a btree index leading on the column. nil when the variable's relation
+// has no usable index — PG's "rel->indexlist == NIL" — so the probe is never
+// attempted.
+type endpointProbe func(wantMax bool) (string, bool)
+
+// actualRangeProbe is the endpointProbe for column col of base table tbl,
+// through the startup-wired catalog.ActualVariableRangeFunc (M0146-0233).
+func actualRangeProbe(tbl *catalog.Table, col string) endpointProbe {
+	if catalog.ActualVariableRangeFunc == nil || tbl == nil || col == "" {
+		return nil
+	}
+	return func(wantMax bool) (string, bool) {
+		return catalog.ActualVariableRangeFunc(tbl, col, wantMax)
+	}
+}
+
+// childBaseColumnProbe is actualRangeProbe for a restriction's column when
+// child is the base relation's own scan (a leaf-local Filter peeled). PG's
+// vardata->rel for a Var of a subquery or CTE is the derived rel, which has no
+// indexes, so a column resolved THROUGH a derived boundary is never probed.
+func childBaseColumnProbe(idx int, child Node) endpointProbe {
+	ref, ok := resolveBaseColumn(idx, child)
+	if !ok || ref.table == nil {
+		return nil
+	}
+	n := child
+	for {
+		if f, isF := n.(*Filter); isF && f.Child != nil {
+			n = f.Child
+			continue
+		}
+		break
+	}
+	if scanTable(n) != ref.table {
+		return nil
+	}
+	return actualRangeProbe(ref.table, ref.col)
+}
+
 // histogramOpSelectivity is PG's ineq_histogram_selectivity
 // (postgres/src/backend/utils/adt/selfuncs.c) over a sorted histogram: the
-// fraction of the histogram's mass satisfying `x <op> literal`. eqSel is the
-// function's eq_selec, the selectivity of `x = literal` among the non-MCV
-// values (histogramEqSel).
+// fraction of the histogram's mass satisfying `x <op> literal`, or -1 when
+// there is no usable histogram (the caller, scalarineqsel, then takes half of
+// the non-MCV mass). eqSel is the function's eq_selec, the selectivity of
+// `x = literal` among the non-MCV values (histogramEqSel).
 //
-// PG first estimates `x <= literal` (histfrac): the bin holding the literal
-// is found by counting the bounds that satisfy the probe (`bound < literal`
-// for `<`/`>=`, `bound <= literal` for `<=`/`>`), and the literal's place
-// inside it is interpolated. The first bin is narrower than the rest by
-// eq_selec, so it is rescaled to make `x <= first bound` come out as eq_selec;
-// `<` and `>=` then subtract eq_selec, and `>`/`>=` flip the result. Without
-// the eq_selec step goopg scored `>=` like `>` and `<=` like `<`: TPC-DS's
-// `d_year BETWEEN 1999 AND 2001` lost two eq_selec (705 rows where PG
-// estimates 1049; M0146-0005s).
+// The bin holding the literal is found by PG's binary search: the leftmost
+// bound for which the probe `bound < literal` (`<`, `>=`) or `bound <=
+// literal` (`<=`, `>`) fails. When the search is about to compare against the
+// first or last bound, the bound is first replaced by the column's actual
+// current minimum or maximum (get_actual_variable_range, through probe); with
+// exactly two bounds both are refreshed up front. have_end records whether
+// the last such refresh succeeded.
 //
-// Not ported: the cutoff clamp to a hundredth of the histogram resolution
-// and get_actual_variable_range's endpoint refresh.
-func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string, eqSel float64) float64 {
-	k := len(bounds) - 1 // bucket count
-	if k < 1 {
-		return defaultIneqSelectivity
+// PG then estimates `x <= literal` (histfrac) by interpolating inside the
+// bin. The first bin is narrower than the rest by eq_selec, so it is rescaled
+// to make `x <= first bound` come out as eq_selec; `<` and `>=` then subtract
+// eq_selec, and `>`/`>=` flip the result. Without the eq_selec step goopg
+// scored `>=` like `>` and `<=` like `<`: TPC-DS's `d_year BETWEEN 1999 AND
+// 2001` lost two eq_selec (705 rows where PG estimates 1049; M0146-0005s).
+//
+// Finally the estimate is clamped: to [0, 1] when have_end, else to a
+// hundredth of the histogram resolution from either end, because "the
+// histogram boundaries are only approximate to begin with, and may well be
+// out of date anyway" (M0146-0233).
+func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string, eqSel float64, probe endpointProbe) float64 {
+	nvalues := len(bounds)
+	if nvalues < 2 {
+		return -1
 	}
 	var isgt, iseq bool
 	switch op {
@@ -615,37 +671,86 @@ func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName
 		return defaultIneqSelectivity
 	}
 	strict := isgt == iseq // `<` and `>=` probe with `bound < literal`
-	lobound := 0
-	for _, b := range bounds {
-		c := histCmp(b, literal, typeName)
-		if c < 0 || (c == 0 && !strict) {
-			lobound++
-			continue
+	values := bounds
+	copied := false
+	setValue := func(i int, v string) {
+		if !copied {
+			values = append([]string(nil), bounds...)
+			copied = true
 		}
-		break
+		values[i] = v
+	}
+	haveEnd := false
+	if nvalues == 2 && probe != nil {
+		lo, okLo := probe(false)
+		hi, okHi := probe(true)
+		// get_actual_variable_range fills both ends from one index or neither.
+		if okLo && okHi {
+			setValue(0, lo)
+			setValue(1, hi)
+			haveEnd = true
+		}
+	}
+	lobound, hibound := 0, nvalues
+	for lobound < hibound {
+		p := (lobound + hibound) / 2
+		if p == 0 && nvalues > 2 {
+			haveEnd = false
+			if probe != nil {
+				if v, ok := probe(false); ok {
+					setValue(0, v)
+					haveEnd = true
+				}
+			}
+		} else if p == nvalues-1 && nvalues > 2 {
+			haveEnd = false
+			if probe != nil {
+				if v, ok := probe(true); ok {
+					setValue(p, v)
+					haveEnd = true
+				}
+			}
+		}
+		c := histCmp(values[p], literal, typeName)
+		ltcmp := c < 0 || (c == 0 && !strict)
+		if ltcmp {
+			lobound = p + 1
+		} else {
+			hibound = p
+		}
 	}
 	var histfrac float64
 	switch {
-	case lobound == 0:
+	case lobound <= 0:
 		histfrac = 0
-	case lobound > k:
+	case lobound >= nvalues:
 		histfrac = 1
 	default:
 		i := lobound
-		binfrac := bucketFraction(bounds[i-1], bounds[i], literal, typeName)
-		histfrac = (float64(i-1) + binfrac) / float64(k)
+		binfrac := bucketFraction(values[i-1], values[i], literal, typeName)
+		histfrac = (float64(i-1) + binfrac) / float64(nvalues-1)
 		if i == 1 {
 			histfrac += eqSel * (1.0 - binfrac)
 		}
 		if strict {
 			histfrac -= eqSel
 		}
-		histfrac = clampSelectivity(histfrac)
 	}
+	sel := histfrac
 	if isgt {
-		return 1.0 - histfrac
+		sel = 1.0 - histfrac
 	}
-	return histfrac
+	if haveEnd {
+		return clampSelectivity(sel)
+	}
+	cutoff := 0.01 / float64(nvalues-1)
+	if sel < cutoff {
+		return cutoff
+	}
+	if sel > 1.0-cutoff {
+		return 1.0 - cutoff
+	}
+	return sel
 }
 
 // histogramEqSel is ineq_histogram_selectivity's eq_selec: every non-MCV

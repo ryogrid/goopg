@@ -5290,7 +5290,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       sf025 PASS=99 \(only Q64's plan changed; 21 s→32 s on PG's plan, same ck\), tpcds\-fireset PASS \(fired Q64/Q77
       byte\-identical\)\.
     - Residual → M0146\-0232\.
-- [ ] **M0146\-0233 — ineq\_histogram\_selectivity's cutoff clamp and get\_actual\_variable\_range** \(filed 2026\-10\-20 by
+- [x] **M0146\-0233 — ineq\_histogram\_selectivity's cutoff clamp and get\_actual\_variable\_range** \(filed 2026\-10\-20 by
   M0146\-0214 slice 6\)\.
   Kind: impl
   Parent: M0146-0214
@@ -5304,6 +5304,41 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     via resolveBaseColumn, OR arms, mergejoinscansel\) — sibling paths change together; the actual\-endpoint probe needs a
     planner\-time btree first/last\-visible\-entry read\.
   - Expected instrument: SF1 Q64 eval\-41 joinrel \(b 1 9 10\) startup = PG's; GEQO tours equal to PG's beyond 262\.
+  - **LANDED 2026\-10\-20 \(loop \#32\)\.** Design `docs/design/0100-0149/m0146-0233-actual-variable-range.md`; evidence
+    `analysis/m0146/m0146\-0233/`\.
+    - nbtree ScanFromEnd \(\_bt\_endpoint backward\); executor ActualVariableEndpointProbe / ActualVariableRange
+      \(non\-null leading key, all\-visible or not dead\-to\-all heap tuple, VISITED\_PAGES\_LIMIT; btree, non\-partial,
+      plain leading column, own collation, default opclass, DESC answers from the other end\); catalog
+      ActualVariableRangeFunc wired by initdb\.
+    - histogramOpSelectivity is PG's binary search with endpoint refresh, have\_end and the 0\.01/\(n−1\) cutoff;
+      no histogram gives scalarineqsel's 0\.5\. Probes reach the restriction path \(own base table only\), the OR and
+      range arms, and mergejoinscansel \(joinVarStats\.probe\)\.
+    - End to end vs PG on a stale histogram: id \> 15000 selectivity 0\.005 = PG's 0\.00495 \(was clamped to 1
+      row\)\. Row counts still differ by estimate\_rel\_size's page scaling → M0146\-0237\.
+    - Fire set: parity 98/99 and 96/99 held; Q13 and Q48 changed plans with results identical\. Row\-estimate census:
+      queries with every estimate equal to PG's SF0\.25 86→87, SF1 85→86 \(Q48\); nodes 2536→2539 / 2603→2606\.
+    - Pins: TestInequalityEstimateReadsActualIndexEndpoints \(postmaster\), TestHistogramOpSelectivityActualEndpoints,
+      TestScanFromEndVisitsEntriesInReverseKeyOrder, and the updated TestHistogramOpSelectivityEqSel\.
+      Mutation\-checked \(hook unwired, have\_end ignored\)\.
+    - Gates: units, internal/postmaster, nbtree \-race, TestPort\_RegressSuite, TestPort\_Isolation\*,
+      tpch\-spotcheck, acceptance arm, TPC\-H parity 22/22, sf025 PASS=99 \(changed Q13 Q48\), tpcds\-fireset PASS\.
+    - Residuals \(ledger\): aborted\-inserter visibility in the probe, a per\-call btree open, no indisvalid check\.
+  Movement: none — parity held; estimate\-identical queries SF0\.25 86→87, SF1 85→86 \(Q48\)
+- [ ] **M0146\-0237 — estimate\_rel\_size: scale a stale reltuples by the relation's current page count** \(filed
+  2026\-10\-20 by M0146\-0233\)\.
+  Kind: impl
+  Parent: M0146-0233
+  - Record: after ANALYZE of 10000 rows and 10000 more inserted \(autovacuum off\), PG estimates a scan of the
+    table at 19778 rows; goopg keeps reltuples, 10000\. Every estimate on the table is halved
+    \(`analysis/m0146/m0146\-0233/endpoint\-probe\-pg\-vs\-goopg\.txt`\)\.
+  - PG \(plancat\.c estimate\_rel\_size → table\_block\_relation\_estimate\_size\): curpages =
+    RelationGetNumberOfBlocks; with relpages \> 0 the density is reltuples / relpages, and tuples = rint\(density ×
+    curpages\)\. goopg applies its page\-based fallback only to never\-analysed relations \(relsize\.go
+    applyRelSizeFallback\)\.
+  - Scope: every reader of a base rel's tuples \(baseRelInfo\.baseRows, EstimateRows of a scan, the cost
+    functions\); sibling paths change together\.
+  - Expected instrument: shipped corpora are unaffected \(relpages = actual pages\); the plan instruments move only
+    on tables changed since ANALYZE\. Pin against PG on the same stale\-statistics workload\.
 - [ ] **M0146\-0234 — sort cost byte currency: PG relation\_byte\_size and the joinrel's reltarget width** \(filed
   2026\-10\-20 by M0146\-0214 slice 6\)\.
   Kind: impl

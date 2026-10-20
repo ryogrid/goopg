@@ -679,7 +679,7 @@ func TestOrRangeSelectivityMeasured(t *testing.T) {
 	s := jsQtyCtx(t)
 	stats := columnStatsByName(s.relInfos[0].table, "q")
 	col := jsQtyGe(1, 15).Left.(*ColumnRef)
-	want, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 15}, stats, float64(s.relInfos[0].baseRows))
+	want, measured := rangeOpSelectivityStats(parser.OpGe, col, &IntegerConst{Value: 15}, stats, float64(s.relInfos[0].baseRows), nil)
 	if !measured {
 		t.Fatal("fixture carries no measurement; the test would pass vacuously")
 	}

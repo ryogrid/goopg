@@ -117,6 +117,12 @@ type joinVarStats struct {
 	// subqueryUniqueOutput). `getVariableNumDistinct` then treats the column
 	// as unique over the relation's rows, as upstream does.
 	isUnique bool
+
+	// probe is get_actual_variable_range for a Var of a base relation (nil
+	// for a derived leaf, whose rel has no indexes) — what
+	// ineq_histogram_selectivity consults at the histogram's ends when
+	// mergejoinscansel calls scalarineqsel (M0146-0233).
+	probe endpointProbe
 }
 
 // examineJoinVar resolves ONE operand of a join clause to its base relation's
@@ -185,6 +191,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 					v.tuples = bv.tuples
 					v.rows = bv.rows
 					v.stats = columnStatsByName(bv.table, cr.Name)
+					v.probe = actualRangeProbe(bv.table, cr.Name)
 					return v
 				}
 				// M0146-0009e: vardata->rel = find_base_rel(varno) is
@@ -212,6 +219,7 @@ func (s *searchCtx) examineJoinVar(key Expr, relids RelSet) joinVarStats {
 	v.tuples = float64(info.baseRows)
 	v.rows = float64(info.filteredRows)
 	v.stats = columnStatsByName(info.table, cr.Name)
+	v.probe = s.relProbe(i, cr.Name)
 	// M0146-0009e: a derived leaf resolves `ok` through its binding's
 	// synthetic catalog.Table, but that table carries no statistics —
 	// columnStatsByName already returns nil for it. What the catalog path
@@ -864,7 +872,7 @@ func (s *searchCtx) orRangeSelectivity(bo *BinaryOp) (float64, bool) {
 		return defaultIneqJoinSel, true
 	}
 	stats := columnStatsByName(s.relInfos[i].table, col.Name)
-	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows)); measured {
+	if sel, measured := rangeOpSelectivityStats(op, col, val, stats, float64(s.relInfos[i].baseRows), s.relProbe(i, col.Name)); measured {
 		return sel, false
 	}
 	// Statistics without a histogram: scalarineqsel assumes half of the
@@ -928,7 +936,7 @@ func (s *searchCtx) orInListSelectivity(e *InExpr) (float64, bool) {
 			s2 = eqSelectivityForColumn(stats, elem, tuples, cr.Type.Name)
 		} else {
 			var measured bool
-			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples); !measured {
+			if s2, measured = rangeOpSelectivityStats(e.AnyOp, cr, elem, stats, tuples, s.relProbe(i, cr.Name)); !measured {
 				return decline()
 			}
 		}
@@ -1429,7 +1437,7 @@ func (s *searchCtx) mergeScanSelForClause(ri *restrictInfo) clauseScanSel {
 	rMin, rMax, rOK := variableRange(rv.stats, rv.typeName)
 	if lOK && rOK {
 		believe := func(op parser.OpCode, v joinVarStats, bound string, def float64) float64 {
-			if sel, ok := scalarIneqSelStats(op, v.stats, bound, v.typeName, v.tuples); ok && sel != defaultIneqSelectivity {
+			if sel, ok := scalarIneqSelStats(op, v.stats, bound, v.typeName, v.tuples, v.probe); ok && sel != defaultIneqSelectivity {
 				return sel
 			}
 			return def
@@ -1510,3 +1518,16 @@ func variableRange(cs *catalog.ColumnStats, typeName string) (min, max string, o
 	return min, max, ok
 }
 
+// relProbe is actualRangeProbe for column col of search rel i when that rel is
+// a base relation; a derived leaf (its own row estimate in leafTuples, or no
+// catalog table) has no indexes in PG's sense, so it gets none.
+func (s *searchCtx) relProbe(i int, col string) endpointProbe {
+	if i < 0 || i >= len(s.relInfos) {
+		return nil
+	}
+	info := &s.relInfos[i]
+	if info.table == nil || info.leafTuples > 0 {
+		return nil
+	}
+	return actualRangeProbe(info.table, col)
+}

@@ -1,0 +1,10 @@
+drop table if exists ep;
+create table ep (id int primary key, v int) with (autovacuum_enabled = false);
+insert into ep select g, g % 7 from generate_series(1, 10000) g;
+analyze ep;
+insert into ep select g, g % 7 from generate_series(10001, 20000) g;
+explain select * from ep where id > 9000;
+explain select * from ep where id > 15000;
+explain select * from ep where id < 0;
+explain select * from ep where v > 3;
+explain select * from ep where id > 9000 and id < 9500;
