@@ -5121,7 +5121,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - Slice 3 plan \(done — see the slice 3 bullet above\): under the partial aggregate, PG uses a Parallel Hash Join \(Parallel Index Only Scan
     customer\_pkey \+ Parallel Hash, 2563\.84\.\.63437\.77\); goopg a non\-parallel\-aware Hash Join over a private Hash
     \(3876\.33\.\.64750\.26\)\. Trace the partial paths of \(store\_sales\_2, customer\_1\) \(design §5\)\.
-- [ ] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
+- [x] **M0146\-0229 — sort\-strategy: TPC\-DS SF1 Q23 statement 2 — PG Incremental Sorts a Merge Append of the
   UNION ALL's ordered GroupAggregates; goopg fully Sorts a plain Append** \(filed 2026\-10\-19 by the S9 pass at
   4906691d7\)\.
   Kind: impl
@@ -5174,6 +5174,23 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
       finished inside the timeout this run, allowlist unused; 19 fired results byte\-identical; parity 97/94 held\)\.
     - Q23 still SHAPE\-DIFF at depth 1: the Incremental Sort arm is generated but loses on goopg's 226\-row branch
       estimate against PG's 299\. Next slice: that estimate \(design §5\)\. Then M0146\-0229a\.
+  - **Slice 2 LANDED 2026\-10\-20 \(loop \#31\): the semi join against a grouped CTE is examined as the CTE\.**
+    Design §7; evidence `analysis/m0146/m0146\-0229/slice2/`\.
+    - Cause: both branches' semi join against `best\_ss\_customer` \(GROUP BY c\_customer\_sk\)\. PG's
+      examine\_simple\_variable RTE\_CTE arm marks the lone group key isunique, so nd2 = 33333 and eqjoinsel\_semi
+      gives 0\.5732 \(173 of 302\)\. goopg's pulled sublink leaf never got derivedLeafUniqueCols, so nd2 = 200
+      \(default\) and the 0\.5 arm gave 150\.
+    - Change: tryPGShapedJoinSearch classifies a pulled derived leaf with derivedLeafUniqueCols, as it already
+      did for FROM\-clause derived leaves \(M0146\-0009e\)\.
+    - Result: SF1 Q23 branch rows 150/76→173/126 = PG; plan **MATCH** \(Incremental Sort over Merge Append\)\.
+      Every row estimate equals PG's; the remaining text difference is a Group Key parenthesisation
+      \(M0146\-0042 rendering\)\. SF0\.25 Q23 is still MATCH with a changed plan; fired Q23 results are
+      byte\-identical at both scales\.
+    - Pin: TestSemiJoinAgainstGroupedCTEUsesIsUnique \(600000 vs the default arm's 500000\), mutation\-checked\.
+    - Gates: units, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, TPC\-H
+      parity 22/22, sf025 PASS=99 \(changed=1, Q23\), tpcds\-fireset PASS \(SF0\.25 98/99, SF1 95→96\)\.
+    - Residual \(ledger\): the member projection charge \(design §5\)\.
+  Movement: yes — TPC\-DS SF1 match 95→96 \(Q23\)
 - [x] **M0146\-0229a — recon: why SF1 Q74 runs ~520\-560 s on goopg — is there a PG 18\.3 executor\-layer
   optimisation for its shape, or a goopg executor slowdown?** \(filed 2026\-10\-19 by the owner; placed in banner
   item 3 directly after M0146\-0229 slice 1\)\.

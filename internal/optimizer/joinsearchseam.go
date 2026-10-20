@@ -1074,6 +1074,16 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		}
 		relInfos[i] = seamLeafRelInfo(i, b, scan, local, cat)
 		relInfos[i].subqueryUniqueOutput = pulledLeafUniqueOutput(ctx, i-pulledBase)
+		// M0146-0229: a pulled sublink body's FROM item that is itself a
+		// derived rel — `x IN (SELECT k FROM cte)`, where pull_up_subqueries
+		// flattens the simple sub-select and leaves the CTE's own RTE in the
+		// semi join — is examined as that rel: examine_simple_variable's
+		// RTE_CTE / RTE_SUBQUERY arm marks the CTE body's lone GROUP BY or
+		// DISTINCT key isunique (selfuncs.c), exactly as for a FROM-clause
+		// derived leaf above (TPC-DS Q23's best_ss_customer).
+		if isSubplanLeaf(scan) {
+			relInfos[i].uniqueOutCols = derivedLeafUniqueCols(scan)
+		}
 		// The leaf's own coordinates are non-emitting (a SEMI/ANTI join
 		// never projects its RHS), so the boundary filler must mark them
 		// fillable exactly like the extracted leaves' — which is what the

@@ -1,7 +1,7 @@
 # M0146-0229 — TPC-DS SF1 Q23 statement 2: Incremental Sort over a Merge Append
 
-Status: open. Slice 1 landed 2026-10-19, after the owner un-parked it (OWNER DECISIONS 2026-10-19 (b)). Q23 still
-diverges: the row estimate is the next slice (§5). M0146-0229a, the Q74 executor recon, closed with no mechanism to port (§6). Filed by the S9 pass
+Status: closed 2026-10-20. Slice 1 landed 2026-10-19, after the owner un-parked it (OWNER DECISIONS 2026-10-19 (b)).
+Slice 2 (§7) fixed the branch row estimate, and SF1 Q23 now MATCHes PG. M0146-0229a, the Q74 executor recon, closed with no mechanism to port (§6). Filed by the S9 pass
 at 4906691d7 (`analysis/m0146/m0146-0014/routing-20261019e/`).
 
 ## 1. Record
@@ -119,3 +119,52 @@ FIRESET\_TIMEOUT, is a goopg slowdown or a PG executor mechanism goopg lacks. Ev
   goopg-side slowdown relative to PG. Nothing is filed. Q74's runtime is inherent to the PG-identical plan. Leaving it
   under 600 s would need a plan PG does not choose. So the fire-set's SF1 Q74 timeout is structural, not transient:
   owner's call whether to keep the allow-list row past 2026-11-30 or to raise FIRESET\_TIMEOUT for SF1.
+
+## 7. Slice 2 (2026-10-20): the semi join against a grouped CTE is examined as the CTE
+
+**Record.** After slice 1, PG's Incremental Sort over a Merge Append was generated but lost to a full Sort. goopg's
+UNION ALL branches estimated 150 + 76 = 226 rows against PG's 173 + 126 = 299. In both branches the first
+difference is the semi join against the `best_ss_customer` CTE, whose body is `GROUP BY c_customer_sk HAVING ...`.
+The catalog branch's input is 302 rows in both engines. PG keeps 173 of them (selectivity 0.5732) and goopg kept
+150 (0.4971).
+
+**What PG does.**
+
+- `cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)` becomes a semi join (pull\_up\_sublinks).
+  pull\_up\_subqueries then flattens the simple sub-select, so the semi join's inner Var is the CTE's own
+  (RTE\_CTE).
+- `examine_simple_variable`'s RTE\_SUBQUERY / RTE\_CTE arm finds the CTE's planned subroot. Its lone GROUP BY
+  key marks the column `isunique` (selfuncs.c).
+- `get_variable_numdistinct` therefore returns nd2 = the CTE rel's 33333 tuples, not DEFAULT\_NUM\_DISTINCT.
+- `eqjoinsel_semi` takes the nd arm: nd2 / nd1 × (1 − nullfrac1) = 33333 / 57821 × 0.9943 = 0.5732.
+
+**What goopg did.** A FROM-clause derived leaf already gets this through `derivedLeafUniqueCols` (M0146-0009e).
+A leaf pulled up from a sublink body got only `pulledLeafUniqueOutput`, which marks the output unique when the
+sub-select itself is grouped. Here the sub-select is a plain `SELECT c_customer_sk FROM cte`, and the grouping is in
+the CTE beneath it. A trace of `eqJoinSelectivitySemi` showed the CTE operand with `isUnique=false`, so
+nd2 = 200 (default) and the 0.5 × (1 − nullfrac1) arm applied.
+
+**Change.** `tryPGShapedJoinSearch` (joinsearchseam.go) gives a pulled leaf that is itself a derived rel (`isSubplanLeaf`) the same
+`derivedLeafUniqueCols` classification as a FROM-clause derived leaf. `examineJoinVar` then sets `isUnique` and
+`getVariableNumDistinct` returns the CTE's rows.
+
+**Result.**
+
+| instrument | before | slice 2 | PG |
+|---|---|---|---|
+| SF1 Q23 catalog / web branch rows | 150 / 76 | 173 / 126 | 173 / 126 |
+| SF1 Q23 plan | Sort over Append (depth-1 sort-strategy) | **MATCH** | Incremental Sort over Merge Append |
+| TPC-DS fire-set PLAN-PARITY match, SF0.25 / SF1 | 98 / 95 | 98 / 96 | |
+
+- Every row estimate in SF1 Q23 statement 2 now equals PG's. The one remaining text difference is the Group Key
+  parenthesisation of `substr(...)`, which is M0146-0042's rendering class.
+- SF0.25 Q23 stays MATCH. Its plan changed (the sf025 sweep reports one changed shape, Q23), and both captures
+  match PG.
+- Fired Q23 results are byte-identical at both scales.
+
+**Pin.** `TestSemiJoinAgainstGroupedCTEUsesIsUnique` plans `fk IN (SELECT gk FROM b)` over a materialized
+`GROUP BY gk` CTE of 30000 rows. It checks that the semi joinrel has 1000000 × 30000 / 50000 = 600000 rows, against
+the default arm's 500000. Removing the classification fails it with 500000.
+
+**Residual (ledger).** The member projection charge (§5, tried and dropped in slice 1) stays deferred.
+
