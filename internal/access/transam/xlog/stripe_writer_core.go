@@ -318,6 +318,17 @@ func (c *stripeWriterCore) resetPosition(curr, prev uint64) {
 	c.posTracker.resetPosition(curr, prev)
 }
 
+// resetPublished sets the published watermark to pos, which may be below
+// it: SwitchTimeline moves insertion back to the end of the last replayed
+// record. Like resetPosition it must not run while any insertion is in
+// flight. nil receiver is a no-op.
+func (c *stripeWriterCore) resetPublished(pos int64) {
+	if c == nil || c.publisher == nil {
+		return
+	}
+	c.publisher.published.Store(pos)
+}
+
 // PublishedTail returns the publisher's current watermark without
 // re-computing it. Useful for diagnostics and assertions
 // (`PublishUpTo`'s return value is the published-then-capped

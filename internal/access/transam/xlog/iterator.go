@@ -612,6 +612,15 @@ func (it *RecordIterator) readSegmentSliceCached(segNo uint64, off int64, n int,
 		it.closeSegFile()
 		path := filepath.Join(it.walDir, FormatSegmentNameTLI(segNo, tli))
 		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			// A segment from before a timeline switch exists only under
+			// an older timeline's name (SwitchTimeline): read the newest
+			// one at or below the writer's.
+			if older, ok, serr := newestSegmentPath(it.walDir, segNo, tli); serr == nil && ok {
+				path = older
+				f, err = os.Open(path)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("wal: iterator open %s: %w", path, err)
 		}

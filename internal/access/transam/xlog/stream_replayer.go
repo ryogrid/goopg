@@ -49,8 +49,11 @@ type StreamReplayer struct {
 
 	mu       sync.Mutex
 	applyLSN uint64
-	records  uint64
-	applied  uint64
+	// lastStart is the StartLSN of the record that set applyLSN (0 before
+	// any): promotion resumes WAL after it with xl_prev naming it.
+	lastStart uint64
+	records   uint64
+	applied   uint64
 	// iter is the iterator the current Run call is draining. Held so
 	// observers outside the replay goroutine (the promotion drain)
 	// can ask whether replay has reached end-of-WAL. nil before the
@@ -87,6 +90,16 @@ func (sr *StreamReplayer) ApplyLSN() uint64 {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.applyLSN
+}
+
+// LastApplied returns the StartLSN and EndLSN of the last record applied;
+// ok is false before the first. The end is PG's lastReplayedEndRecPtr, where
+// a promotion's new timeline begins, and the start (0-based: start-1) is
+// what the first record on it names as xl_prev.
+func (sr *StreamReplayer) LastApplied() (start, end uint64, ok bool) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.lastStart, sr.applyLSN, sr.lastStart != 0
 }
 
 // AtEndOfWAL reports that replay has applied every complete record
@@ -167,6 +180,7 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		}
 		if rec.EndLSN > sr.applyLSN {
 			sr.applyLSN = rec.EndLSN
+			sr.lastStart = rec.StartLSN
 		}
 		sr.mu.Unlock()
 	}

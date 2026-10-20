@@ -1319,7 +1319,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     on a replica are past the relation\'s end\.
   - First step: wire `LogSmgrTruncateTo` in the production pool setup \(`internal/initdb/open\.go`\) and pin it with
     a recovery test\.
-- [ ] **In\-process WAL writer timeline switch at promotion, then XLOG\_END\_OF\_RECOVERY** \(filed 2026\-10\-14 at the
+- [x] **In\-process WAL writer timeline switch at promotion, then XLOG\_END\_OF\_RECOVERY** \(filed 2026\-10\-14 at the
   M0122\-0009 close\)\.
   Kind: impl
   Parent: none
@@ -1332,6 +1332,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - First step: a `Writer` timeline switch \(close the current segment, copy it to the new TLI\'s name up to the switch
     LSN, continue there\), then emit the record\.
   - Expected instrument: a promotion test reading the new TLI\'s segment with `pg\_waldump`\.
+  - **Done 2026\-10\-21\.** Design `docs/design/0100\-0149/m0119\-promotion\-timeline\-switch\.md`\.
+    - Writer\.SwitchTimeline resumes WAL at the end of the last replayed record with its xl\_prev, copies the switch
+      segment to the new TLI \(XLogInitNewTimeline\), removes later old\-TLI segments \(RemoveNonParentXlogFiles\), and
+      makes the writer\'s TLI live \(atomic; pads read it through padLayout\.tliRef\)\.
+    - Readers open a segment\'s newest timeline \(openSegmentFile, RecordIterator fallback\)\.
+    - finalizePromotion switches, then writes XLOG\_END\_OF\_RECOVERY \(EncodeEndOfRecoveryPG\) and minRecoveryPoint\.
+    - Defects fixed on the way: post\-promotion WAL on the old TLI; the first checkpoint stamping TLI 1 back into
+      pg\_control; a stale first xl\_prev after walreceiver appends; post\-promotion records unreadable after a
+      partial received tail\.
+    - pg\_waldump on the promoted standby: `END\_OF\_RECOVERY tli 2; prev tli 1` at the history switch LSN, prev\-link
+      accepted, the post\-promotion insert decodes after it \(all three failover modes\)\.
+    - Pins: TestSwitchTimelineResumesAtEndOfLog \(fails without the tracker reset or with oldest\-TLI reads\),
+      TestEndOfRecoveryRecordRoundTrips, checkPromotedTimelineWAL\.
+    - Ledgered: archive\-recovery promotion path; \.partial rename under archiving; segment recycling; the promotion
+      checkpoint request\.
+    - Gates: xlog \-race, cmd/goopg, E2E physical/failover/standby family, recovery/pg\_ctl/pg\_waldump ports, units,
+      internal/postmaster, TestPort\_RegressSuite, tpch\-spotcheck, acceptance arm, sf025\.
+  Movement: none — WAL/promotion correctness — no plan instrument \(no planner change\)
 - [ ] **Visibility\-map changes as XLOG\_HEAP2\_VISIBLE** \(filed 2026\-10\-14 at the M0122\-0009 close\)\.
   Kind: impl
   Parent: none
@@ -3407,6 +3425,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `943cbd7b1`** \(AI\-20261021\-010544\-001 recovery\-LSN builtins changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261021c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1
+    99/99, every category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\),
+    M0146\-0042\(channel\); M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/
+    0205/0238/0239\(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for
+    this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

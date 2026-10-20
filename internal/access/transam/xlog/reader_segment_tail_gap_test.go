@@ -233,7 +233,7 @@ func writeWALWithStraddlingRecord(t *testing.T, lead int64) (walDir string, payl
 	if err != nil {
 		t.Fatal(err)
 	}
-	sysID, tli := w.stateRef.sysID, w.stateRef.tli
+	sysID, tli := w.stateRef.sysID, w.stateRef.tli.Load()
 
 	target := uint64(tailGapSegSize) - uint64(lead)
 	var cur, lastStart, lastEnd uint64

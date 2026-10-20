@@ -506,7 +506,11 @@ type state struct {
 	// 0 means "no previous record" (first record on the chain).
 	prevRecPtr uint64
 	sysID      uint64
-	tli        uint32
+	// tli is the timeline new segment names and page headers carry. It is
+	// fixed except at promotion, where SwitchTimeline moves it forward
+	// (XLogInitNewTimeline); atomic so the append paths read it without a
+	// lock.
+	tli atomic.Uint32
 
 
 	// core is the slice B stripe writer core, mounted by NewWriter and
@@ -615,7 +619,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 			pageHeaders: st.pageHeaders,
 			segSize:     cfg.SegmentSize,
 			sysID:       st.sysID,
-			tli:         st.tli,
+			tliRef:      &st.tli,
 		},
 	)
 	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
@@ -667,7 +671,7 @@ func (w *Writer) TimelineID() uint32 {
 	if w.stateRef == nil {
 		return 1
 	}
-	return w.stateRef.tli
+	return w.stateRef.tli.Load()
 }
 
 // Format returns the active on-disk WAL format the writer is
@@ -1339,8 +1343,8 @@ func loadState(cfg Config) (*state, error) {
 		pageHeaders: cfg.PageHeaders,
 		prevRecPtr:  prevRecPtr,
 		sysID:       cfg.SystemID,
-		tli:         cfg.TimelineID,
 	}
+	st.tli.Store(cfg.TimelineID)
 	if st.walBuf != nil {
 		st.walBuf.reset(writePos)
 	}
@@ -1800,7 +1804,7 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 					if perr != nil {
 						return 0, 0, perr
 					}
-					padStream, _ = emitWithPageHeaders(pad, recLen, writePos, segSize, s.sysID, s.tli)
+					padStream, _ = emitWithPageHeaders(pad, recLen, writePos, segSize, s.sysID, s.tli.Load())
 					if int64(len(padStream)) != gapLen {
 						return 0, 0, fmt.Errorf("wal: appendPGCompat: pad emitted %d bytes for gap [%d,%d) of %d",
 							len(padStream), writePos, boundary, gapLen)
@@ -1818,7 +1822,7 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		if err != nil {
 			return 0, 0, err
 		}
-		stream, leading := emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+		stream, leading := emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli.Load())
 		start := uint64(writePos) + uint64(leading) + 1
 		end := uint64(writePos) + uint64(len(stream))
 
@@ -1905,7 +1909,7 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 			runtime.Gosched()
 			continue
 		}
-		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
+		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli.Load())
 		if errors.Is(err, walBufferCapacityExceeded) {
 			// The posMu-level ring-window check refused the reservation
 			// before curr committed — nothing was burned, but the physical
@@ -2100,7 +2104,7 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		procNum := s.stripeNum()
 		var start0 uint64
 		var total, leading int
-		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
+		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli.Load())
 		if errors.Is(err, walBufferCapacityExceeded) {
 			// The posMu-level ring-window check refused the reservation
 			// before curr committed — nothing was burned. Release the claim
@@ -2501,7 +2505,7 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 			for existing[nextTarget] {
 				nextTarget++
 			}
-			newPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(nextTarget, s.tli))
+			newPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(nextTarget, s.tli.Load()))
 			if rerr := recycleSegmentFile(oldPath, newPath, s.cfg.SegmentSize); rerr != nil {
 				if errors.Is(rerr, os.ErrNotExist) {
 					continue
@@ -2663,7 +2667,7 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	if f, ok := s.files[segNo]; ok {
 		return f, nil
 	}
-	path := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
+	path := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli.Load()))
 
 	// Detect first-time creation so the preallocator only zero-fills
 	// new segments. Existing files (legacy lazy mode, or a re-open
@@ -2723,7 +2727,7 @@ func (s *state) eagerPreallocSegment(segNo uint64) {
 	if !s.cfg.Preallocate {
 		return
 	}
-	finalPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli))
+	finalPath := filepath.Join(s.cfg.WALDir, FormatSegmentNameTLI(segNo, s.tli.Load()))
 	if _, err := os.Stat(finalPath); err == nil {
 		return
 	}

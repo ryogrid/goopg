@@ -88,6 +88,44 @@ type standbyController struct {
 	// walreceiver exits (promotion, a reconnect); goopg's receiver registry
 	// forgets a stopped receiver, so recoveryLSNs remembers it here.
 	lastReceived atomic.Uint64
+
+	// walLevel is the wal_level enum (minimal 0, replica 1, logical 2)
+	// XLOG_END_OF_RECOVERY records.
+	walLevel int32
+}
+
+// walLevelEnum maps a wal_level setting to its enum value (WalLevel,
+// access/xlog.h).
+func walLevelEnum(s string) int32 {
+	switch s {
+	case "minimal":
+		return 0
+	case "logical":
+		return 2
+	}
+	return 1
+}
+
+// endOfLog is where the promoted timeline begins — PG's EndOfLog — and
+// the 0-based start of the record before it, the first new record's
+// xl_prev. It is the end of the last record replay applied. With none
+// applied it is the replayer's baseline, the end of the WAL the writer
+// opened with, whose prev the writer's tracker still holds (walreceiver
+// appends never move it).
+func (sc *standbyController) endOfLog() (end, prev uint64) {
+	if sc.replayer != nil {
+		if start, e, ok := sc.replayer.LastApplied(); ok {
+			return e, start - 1
+		}
+	}
+	if sc.rt.WAL == nil {
+		return 0, 0
+	}
+	_, prev = sc.rt.WAL.InsertPosition()
+	if sc.replayer != nil {
+		return sc.replayer.ApplyLSN(), prev
+	}
+	return sc.rt.WAL.WrittenLSN(), prev
 }
 
 // recoveryLSNs reports pg_last_wal_receive_lsn's and pg_last_wal_replay_lsn's
@@ -141,6 +179,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		replayer:       replayer,
 		signalCancel:   sigCancel,
 		signalDone:     sigDone,
+		walLevel:       walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
 	// Clear any stale promote.signal left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
@@ -294,12 +333,11 @@ func (sc *standbyController) runPromote(ctx context.Context) error {
 //  1. Compute the new TLI (oldTLI + 1) from the persisted value.
 //  2. Append a history entry for oldTLI + EndOfLog to any pre-existing
 //     history chain and atomically write `pg_wal/<newTLI>.history`.
-//  3. Persist newTLI to `global/timeline_id` so a future restart picks
-//     it up (the running WAL writer keeps emitting on oldTLI for the
-//     remainder of this process — an in-place writer.SetTLI() is left
-//     to a follow-up because mid-stream segment renaming is risky and
-//     not required by M0102-0003's verification gate).
-//  3. Remove `standby.signal` so a future restart still comes up as
+//  3. Persist newTLI to `global/timeline_id` and pg_control.
+//  4. Switch the running WAL writer to newTLI at the end of the last
+//     replayed record and write XLOG_END_OF_RECOVERY there
+//     (Writer.SwitchTimeline; design m0119-promotion-timeline-switch.md).
+//  5. Remove `standby.signal` so a future restart still comes up as
 //     primary even if the operator forgets to clear it.
 //
 // Errors at any step are returned to the caller — leaving the
@@ -314,17 +352,10 @@ func (sc *standbyController) finalizePromotion() error {
 		newTLI := oldTLI + 1
 		walDir := walDirFor(sc.rt)
 
-		// Anchor the switch at the last bytes the standby actually
-		// applied. Falling back to WrittenLSN ensures a non-zero
-		// position when the standby promoted before any replay
-		// happened (e.g. hot-spare with empty WAL).
-		var endLSN uint64
-		if sc.replayer != nil {
-			endLSN = sc.replayer.ApplyLSN()
-		}
-		if endLSN == 0 && sc.rt.WAL != nil {
-			endLSN = sc.rt.WAL.WrittenLSN()
-		}
+		// The switch point is the end of the last record replay
+		// applied: received bytes past it are a partial record, which
+		// the new timeline overwrites (endOfLog).
+		endLSN, prevRecPtr := sc.endOfLog()
 
 		prev, err := xlog.ReadHistory(walDir, oldTLI)
 		if err != nil {
@@ -353,6 +384,35 @@ func (sc *standbyController) finalizePromotion() error {
 			cd.CheckPointCopyPrevTLI = oldTLI
 		}); err != nil {
 			return fmt.Errorf("promote: update pg_control TLI: %w", err)
+		}
+		// Move the running writer onto the new timeline at once, and
+		// make XLOG_END_OF_RECOVERY its first record, as StartupXLOG does
+		// at the end of archive recovery (XLogInitNewTimeline,
+		// CreateEndOfRecoveryRecord). The writer used to stay on the old
+		// timeline until restart, so post-promotion WAL carried the old
+		// TLI and the first checkpoint stamped it back into pg_control.
+		if sc.rt.WAL != nil && endLSN > 0 {
+			if err := sc.rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
+				return fmt.Errorf("promote: switch WAL timeline: %w", err)
+			}
+			rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, sc.walLevel)
+			if err != nil {
+				return fmt.Errorf("promote: encode end-of-recovery record: %w", err)
+			}
+			_, recEnd, err := sc.rt.WAL.Append(rec)
+			if err != nil {
+				return fmt.Errorf("promote: write end-of-recovery record: %w", err)
+			}
+			if err := sc.rt.WAL.FlushUpTo(recEnd); err != nil {
+				return fmt.Errorf("promote: flush end-of-recovery record: %w", err)
+			}
+			// So crash recovery follows the timeline change to here.
+			if err := control.UpdateControlFile(sc.rt.DataDir, func(cd *control.ControlFileData) {
+				cd.MinRecoveryPoint = recEnd
+				cd.MinRecoveryPointTLI = newTLI
+			}); err != nil {
+				return fmt.Errorf("promote: update pg_control min recovery point: %w", err)
+			}
 		}
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,

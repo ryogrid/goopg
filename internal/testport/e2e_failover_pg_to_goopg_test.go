@@ -259,6 +259,7 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"INSERT INTO public.bench_log (client, src) VALUES (-1, 'post')"); err != nil {
 		t.Fatalf("post-failover insert: %v", err)
 	}
+	checkPromotedTimelineWAL(t, standby.DataDir())
 
 	preCount := goopgCount(t, standby,
 		"SELECT count(*) FROM public.bench_log WHERE src = 'pre'")
@@ -283,6 +284,40 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := goopgScalar(t, standby,
 		"SELECT src FROM public.bench_log WHERE client = -1"); got != "post" {
 		t.Fatalf("post-failover row src=%q want post", got)
+	}
+}
+
+// checkPromotedTimelineWAL reads the promoted standby's new timeline with
+// PG 18.3's pg_waldump from the switch point its history file records. The
+// first record must be XLOG_END_OF_RECOVERY naming both timelines, as
+// CreateEndOfRecoveryRecord writes it, and the records after it (the
+// post-promotion insert) must decode: the writer switched timelines at once
+// (Writer.SwitchTimeline) instead of writing TLI-1 WAL until a restart.
+func checkPromotedTimelineWAL(t *testing.T, dataDir string) {
+	t.Helper()
+	waldump := clientToolBin(t, "pg_waldump")
+	if waldump == "" {
+		t.Log("pg_waldump not found; skipping the new-timeline WAL check")
+		return
+	}
+	walDir := filepath.Join(dataDir, "pg_wal")
+	hist, err := xlog.ReadHistory(walDir, 2)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("read 00000002.history: %v (entries %v)", err, hist)
+	}
+	sw := hist[len(hist)-1].SwitchLSN
+	start := fmt.Sprintf("%X/%X", sw>>32, uint32(sw))
+	out, err := exec.Command(waldump, "--path", walDir, "--timeline", "2", "--start", start, "--limit", "3").CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_waldump --timeline 2 --start %s: %v\n%s", start, err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 3 || !strings.Contains(lines[0], "desc: END_OF_RECOVERY tli 2; prev tli 1;") {
+		t.Fatalf("new timeline's WAL from %s, want END_OF_RECOVERY first and two more records:\n%s", start, out)
+	}
+	// pg_waldump prints LSNs as %X/%08X (PG 18 LSN_FORMAT_ARGS).
+	if !strings.Contains(lines[0], fmt.Sprintf("lsn: %X/%08X,", sw>>32, uint32(sw))) {
+		t.Errorf("END_OF_RECOVERY is not at the switch point %s:\n%s", start, lines[0])
 	}
 }
 

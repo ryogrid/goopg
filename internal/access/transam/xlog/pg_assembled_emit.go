@@ -3,6 +3,7 @@ package xlog
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/storage"
@@ -1377,6 +1378,45 @@ func EncodeCheckpointPGFields(shutdown bool, f CheckPointFields) ([]byte, error)
 func EncodeCheckpointRedoPG() ([]byte, error) {
 	mainData := binary.LittleEndian.AppendUint32(make([]byte, 0, 4), 1) // wal_level=replica
 	return framedAssemble(RmgrXLog, xlogCheckpointRedo, 0, mainData, nil)
+}
+
+// sizeOfXlEndOfRecovery is sizeof(xl_end_of_recovery) (access/xlog_internal.h):
+// end_time TimestampTz(8) + ThisTimeLineID(4) + PrevTimeLineID(4) +
+// wal_level int(4), padded to the struct's 8-byte alignment. PG registers
+// the whole struct, padding included.
+const sizeOfXlEndOfRecovery = 24
+
+// EncodeEndOfRecoveryPG builds the RM_XLOG XLOG_END_OF_RECOVERY record a
+// promotion writes as the first record of its new timeline
+// (CreateEndOfRecoveryRecord, xlog.c). endTime is a PG TimestampTz
+// (microseconds since 2000-01-01 UTC); walLevel is the wal_level enum
+// (minimal 0, replica 1, logical 2). Replay checks thisTLI against the
+// timeline it is replaying (xlog_redo).
+func EncodeEndOfRecoveryPG(endTime int64, thisTLI, prevTLI uint32, walLevel int32) ([]byte, error) {
+	mainData := make([]byte, sizeOfXlEndOfRecovery)
+	le := binary.LittleEndian
+	le.PutUint64(mainData[0:8], uint64(endTime))
+	le.PutUint32(mainData[8:12], thisTLI)
+	le.PutUint32(mainData[12:16], prevTLI)
+	le.PutUint32(mainData[16:20], uint32(walLevel))
+	return framedAssemble(RmgrXLog, xlogXLogEndOfRecovery, 0, mainData, nil)
+}
+
+// DecodeEndOfRecovery parses an XLOG_END_OF_RECOVERY main-data body — the
+// decode sibling of EncodeEndOfRecoveryPG.
+func DecodeEndOfRecovery(mainData []byte) (endTime int64, thisTLI, prevTLI uint32, walLevel int32, err error) {
+	if len(mainData) < 20 {
+		err = fmt.Errorf("wal: xl_end_of_recovery main-data len %d (want %d)", len(mainData), sizeOfXlEndOfRecovery)
+		return
+	}
+	le := binary.LittleEndian
+	return int64(le.Uint64(mainData[0:8])), le.Uint32(mainData[8:12]), le.Uint32(mainData[12:16]), int32(le.Uint32(mainData[16:20])), nil
+}
+
+// PGTimestampTz returns t as a PG TimestampTz: microseconds since
+// 2000-01-01 UTC.
+func PGTimestampTz(t time.Time) int64 {
+	return t.Sub(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)).Microseconds()
 }
 
 // minSizeOfXlRunningXacts is offsetof(xl_running_xacts, xids) in PG18
