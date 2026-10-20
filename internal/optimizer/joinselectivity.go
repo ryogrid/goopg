@@ -759,20 +759,114 @@ func (s *searchCtx) orJoinSelectivity(bo *BinaryOp) (float64, bool) {
 	return clampSelectivity(sel), isdefault
 }
 
-// orArmSelectivity prices one OR arm — an AND of conjuncts — as the
-// independent product, the same rule `conjunctionSelectivity` falls back to
-// for unrelated conjuncts. (The range-band pairing it adds on top is a
-// same-variable refinement; OR arms join FILTERs across relations, where PG
-// likewise multiplies.)
+// orArmSelectivity prices one OR arm — an AND of conjuncts — as PG's
+// clause_selectivity_ext does: through clauselist_selectivity_ext, which
+// multiplies unrelated conjuncts but pairs the bounds of one variable into a
+// range (addRangeClause, clausesel.c). Each bound is a single-relation
+// restriction even when the OR is a join clause, so `ss_net_profit >= 100 AND
+// ss_net_profit <= 200` inside an arm is the band `hibound + lobound - 1`,
+// not the product of the two halves (M0146-0241:
+// TPC-DS Q13's three-arm OR was 2.85x PG's estimate).
 func (s *searchCtx) orArmSelectivity(arm Expr) (float64, bool) {
 	sel := 1.0
 	isdefault := false
+	var groups []*orArmRange
 	for _, c := range splitAnd(arm) {
+		if g, isLo, bsel, bdef, ok := s.orArmRangeBound(c, &groups); ok {
+			// Keep the more restrictive of two similar bounds, as
+			// clausesel.c's addRangeClause does (conjunctionSelectivity).
+			if isLo {
+				if !g.haveLo || g.lo > bsel {
+					g.haveLo, g.lo = true, bsel
+				}
+			} else if !g.haveHi || g.hi > bsel {
+				g.haveHi, g.hi = true, bsel
+			}
+			isdefault = isdefault || bdef
+			continue
+		}
 		csel, cdef := s.orConjunctSelectivity(c)
 		sel *= csel
 		isdefault = isdefault || cdef
 	}
+	for _, g := range groups {
+		sel *= s.orArmRangeSelectivity(g)
+	}
 	return clampSelectivity(sel), isdefault
+}
+
+// orArmRange is clausesel.c's RangeQueryClause for one variable of an OR arm.
+type orArmRange struct {
+	col            *ColumnRef
+	haveLo, haveHi bool
+	lo, hi         float64
+}
+
+// orArmRangeBound reports whether c is a single-side inequality bound
+// `col <op> const` on an attributable column, and files it under its
+// variable's group. The bound's own selectivity is orRangeSelectivity's, the
+// estimate the unpaired conjunct would have had.
+func (s *searchCtx) orArmRangeBound(c Expr, groups *[]*orArmRange) (g *orArmRange, isLo bool, sel float64, isdefault, ok bool) {
+	bo, isBin := c.(*BinaryOp)
+	if !isBin {
+		return nil, false, 0, false, false
+	}
+	switch bo.Op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+	default:
+		return nil, false, 0, false, false
+	}
+	col, _, swapped, isRange := normalizeColumnConstRange(bo.Left, bo.Right)
+	if !isRange || col.Name == "" || col.SourceTableIdx == 0 {
+		return nil, false, 0, false, false
+	}
+	op := bo.Op
+	if swapped {
+		op = swapInequalityOp(op)
+	}
+	sel, isdefault = s.orRangeSelectivity(bo)
+	for _, x := range *groups {
+		if x.col.SourceTableIdx == col.SourceTableIdx && x.col.Name == col.Name {
+			g = x
+			break
+		}
+	}
+	if g == nil {
+		g = &orArmRange{col: col}
+		*groups = append(*groups, g)
+	}
+	return g, op == parser.OpGt || op == parser.OpGe, sel, isdefault, true
+}
+
+// orArmRangeSelectivity completes one variable's bounds as clausesel.c does
+// after its pairing loop: a lone bound is its own selectivity; a pair is
+// `hibound + lobound - 1` plus the column's null fraction (both bounds
+// exclude NULLs, so the subtraction removes them twice), DEFAULT_RANGE_INEQ_SEL
+// when either bound is the DEFAULT_INEQ_SEL guess, and the roundoff clamps.
+// conjunctionSelectivity (rangequery.go) is the restriction path's twin.
+func (s *searchCtx) orArmRangeSelectivity(g *orArmRange) float64 {
+	if !g.haveLo || !g.haveHi {
+		if g.haveLo {
+			return g.lo
+		}
+		return g.hi
+	}
+	if g.hi == defaultIneqSelectivity || g.lo == defaultIneqSelectivity {
+		return defaultRangeIneqSel
+	}
+	s2 := g.hi + g.lo - 1.0
+	if i, ok := s.relPosForSource(g.col.SourceTableIdx); ok && s.relInfos[i].table != nil {
+		if stats := columnStatsByName(s.relInfos[i].table, g.col.Name); stats != nil {
+			s2 += stats.NullFrac
+		}
+	}
+	switch {
+	case s2 < -0.01:
+		return defaultRangeIneqSel
+	case s2 <= 0.0:
+		return 1.0e-10
+	}
+	return s2
 }
 
 // orConjunctSelectivity prices one conjunct of an OR arm as a RESTRICTION, as

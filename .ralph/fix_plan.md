@@ -5607,3 +5607,31 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
       arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
   Movement: yes — TPC\-DS SF1 match 96→97 and SF0\.25 match 98→99 \(Q77\)
+- [x] **M0146\-0241 — join\-method: TPC\-DS SF1 Q13 — a range pair inside an OR join clause's arm is multiplied, not paired**
+  \(filed 2026\-10\-20 by the S9 pass at 4e0c4e8c1\)\.
+  Kind: impl
+  Parent: M0146-0014
+  - Record: TPC\-DS SF1 Q13, category join\-method, verdict SHAPE\-DIFF at depth 6 \(PG Nested Loop over the
+    customer\_address probe \| goopg Hash Join with store first\)\. Census: the M0146\-0240 slice\-2 fire\-set captures on
+    HEAD's code tree, `analysis/m0146/m0146\-0240/slice2/fireset/`\.
+  - S9 ranking \(SF0\.25 99/99, SF1 97/99, TPC\-H 22/22\): join\-method 1 \(SF1 Q13\), qual\-placement 1 \(SF1 Q72\); Q13
+    has the lower id and the shallower divergence\.
+  - Diagnosis \(SF1 clone vs :65438\): restriction estimates on customer\_address are identical, and so is each single
+    `ca\_state IN … AND ss\_net\_profit BETWEEN …` arm \(11520 rows over store\_sales ⋈ customer\_address\)\. The OR of two
+    such arms, a JOIN clause, estimates 31665 against PG's 16054, and the three\-arm OR 80704 against 28320\.
+  - PG: clause\_selectivity\_ext prices an OR arm \(an AND\) through clauselist\_selectivity\_ext, which pairs the
+    same\-variable bounds of `ss\_net\_profit >= a AND ss\_net\_profit <= b` into one range \(addRangeClause:
+    hibound \+ lobound − 1 \+ null fraction\)\. goopg's orArmSelectivity multiplies the two bounds independently\.
+  - Expected instrument: TPC\-DS SF1 PLAN\-PARITY match \(Q13\), 97 → 98\.
+  - **Done 2026\-10\-20 — CLOSED\.** Design `docs/design/0100\-0149/m0146\-0241\-or\-arm\-range\-pairing\.md`; evidence
+    `analysis/m0146/m0146\-0241/`\.
+    - orArmSelectivity groups single\-side inequality bounds by variable \(orArmRangeBound\) and completes each as
+      clausesel\.c does \(orArmRangeSelectivity: hi \+ lo − 1 \+ null fraction, DEFAULT\_RANGE\_INEQ\_SEL for a guessed
+      bound, the roundoff clamps\)\.
+    - The two\- and three\-arm ORs now estimate PG's 16054 and 28320; SF1 Q13 MATCHes \(82716\.26 both\)\. TPC\-H Q19's OR
+      join estimates PG's 47 rows \(was 71\), plan still MATCH\.
+    - Pin: TestORJoinClauseArmPairsRangeBounds \(PG row estimates 743 and 1940; mutation\-checked\)\. The file avoids an
+      `\_arm\_test\.go` name, which Go reads as a GOARCH constraint\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 \(Q13 changed, still MATCH\), tpcds\-fireset PASS\.
+  Movement: yes — TPC\-DS SF1 match 97→98 \(Q13\)
