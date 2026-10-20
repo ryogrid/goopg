@@ -179,6 +179,11 @@ type Path struct {
 	// parameterised index probe it builds there so the loop can bind its
 	// keys — PG's create_plan-time curOuterRels.
 	paramSink *[]paramProbeNode
+	// mergeJoinMaterial marks a PathMaterial that is create_mergejoin_plan's
+	// make_material over an elected materialize_inner (mergeMaterialInner),
+	// not a MaterialPath: PG plans that inner under the join's own flags, so
+	// it gets no CP_SMALL_TLIST (Materialize.mergeJoinInner).
+	mergeJoinMaterial bool
 	// ParamFilter is a parameterised hash join's ppi clauses that no input
 	// enforces — get_joinrel_parampathinfo's equivalence-class clause between
 	// the required-outer rel and the probe side (M0146-0135). Applied as a

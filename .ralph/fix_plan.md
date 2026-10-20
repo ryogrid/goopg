@@ -5524,7 +5524,7 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Closure: the record \(SF1 Q64 GEQO eval 41\) is stale, since SF1 Q64 has matched PG since M0146\-0214 closed
       \(d1446d972\); every item named here has landed\.
   Movement: none — record stale: SF1 Q64 has matched since M0146\-0214; slices 3–4 are fidelity ports no capture reads
-- [ ] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
+- [x] **M0146\-0232 — set\_subquery\_pathlist coverage: subquery partial paths and ungrouped subqueries** \(filed
   2026\-10\-19 by M0146\-0231\)\.
   Kind: impl
   Parent: M0146-0214
@@ -5537,3 +5537,23 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
   - First step: a census of fired TPC\-DS queries whose divergence sits under a SubqueryScan / inlined CTE leaf
     with no grouped body \(first\-divergence parent chain\)\.
   - Expected instrument: TPC\-DS PLAN\-PARITY match count on the queries that census names\.
+  - **Done 2026\-10\-20 \(slice 1\) — CLOSED\.** Design
+    `docs/design/0100\-0149/m0146\-0232\-inlined\-cte\-rescan\-and\-material\.md`; evidence `analysis/m0146/m0146\-0232/`\.
+    - Census: SF1 Q13 \(join order\), SF1 Q72 \(qual placement\) and SF0\.25 Q77 c0 diverge outside any subquery leaf\.
+      The only divergence under one is Q77's c1 branch \(grouped inlined CTE `cr`\)\. No record needs a subquery
+      partial path or an ungrouped\-subquery alternative\.
+    - Q77 c1: an inlined CTE reference is PG's T\_SubqueryScan \(inline\_cte\)\. isTuplestoreScanNode and
+      nodeMaterializesOutput now answer `!Inlined\(\)` for a CTEScan, so rescans re\-execute the body and
+      match\_unsorted\_outer's Material wins, as in PG\.
+    - A MaterialPath's child keeps the CP\_SMALL\_TLIST regime \(subqueryStripTlistReset gains a Materialize arm\), so
+      `Subquery Scan on cr` renders\. A merge join's make\_material \(Path\.mergeJoinMaterial →
+      Materialize\.mergeJoinInner\) does not reset it: Q58's ws\_items and Q78's cs still strip\.
+    - Instrument: SF0\.25 Q77 CATEGORIES\-EXCL\-MATCH scan\-type 1 → 0 \(within ±3\); match 98 → 98\. SF1 Q77's c1 now
+      matches, and its first divergence moves to the pre\-existing c2 web branch \(Merge vs Hash Left Join\); SF1
+      96 → 96\. TPC\-H 22/22\.
+    - Pin: TestInlinedCTEInnerIsMaterialized \(both halves mutation\-checked\)\.
+    - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
+      arm \(values identical\), TPC\-H parity 22/22, sf025 PASS=99 same=98 \(Q77 changed\), tpcds\-fireset PASS\.
+    - Not done \(ledgered\): subquery partial paths, ungrouped\-subquery alternatives and the producer\-order audit, none
+      of which a fired record needs\.
+  Movement: none — SF0\.25 Q77 scan\-type 1 → 0 is inside ±3; match counts 98/99 and 96/99 unchanged

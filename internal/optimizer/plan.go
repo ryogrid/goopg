@@ -1145,6 +1145,12 @@ type Materialize struct {
 	PlanCost
 	pos   int
 	Child Node
+	// mergeJoinInner marks create_mergejoin_plan's make_material (planned
+	// from a mergeJoinMaterial path): its child was planned under the join's
+	// flags, so stripTrivialSubqueryScans keeps the join's physical-tlist
+	// regime below it. A MaterialPath's create_material_plan adds
+	// CP_SMALL_TLIST instead (createplan.c:1650).
+	mergeJoinInner bool
 }
 
 func (n *Materialize) Pos() int       { return n.pos }

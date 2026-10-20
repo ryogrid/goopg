@@ -1310,6 +1310,8 @@ func mergeMaterialInner(sub *Path, cp costParams) *Path {
 		RequiredOuter: sub.RequiredOuter,
 		Children:      []*Path{sub},
 		DisabledNodes: sub.DisabledNodes,
+
+		mergeJoinMaterial: true,
 	}
 }
 
