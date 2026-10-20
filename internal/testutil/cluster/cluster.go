@@ -273,8 +273,121 @@ func (c *Cluster) Start() error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("start timeout after %s (see %s)%s",
-		c.startupWait, c.logPath, c.startFailureLogTail())
+	tail := c.startFailureLogTail()
+	mem := cgroupMemoryNote(cmd.Process.Pid)
+	return fmt.Errorf("start timeout after %s (see %s)%s%s%s",
+		c.startupWait, c.logPath, tail, mem, c.stuckStartStacks(cmd, exited))
+}
+
+// cgroupMemoryNote reports the memory state of the server's cgroup v2 at a
+// start timeout: usage against memory.high/max, how often the group crossed
+// memory.high (each crossing throttles its allocations), and the PSI stall
+// lines. A unit held at memory.high stalls every allocation of a starting
+// server (the nightly lanes run under high=6G, servers under GOMEMLIMIT 5GiB).
+// Best-effort: no cgroup v2 degrades to "".
+func cgroupMemoryNote(pid int) string {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return ""
+	}
+	var rel string
+	for line := range strings.SplitSeq(string(raw), "\n") {
+		if r, ok := strings.CutPrefix(line, "0::"); ok {
+			rel = r
+		}
+	}
+	if rel == "" {
+		return ""
+	}
+	dir := filepath.Join("/sys/fs/cgroup", rel)
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return "?"
+		}
+		return strings.TrimSpace(string(b))
+	}
+	highEvents := "?"
+	for line := range strings.SplitSeq(read("memory.events"), "\n") {
+		if v, ok := strings.CutPrefix(line, "high "); ok {
+			highEvents = v
+		}
+	}
+	return fmt.Sprintf("\n--- cgroup %s: memory.current=%s memory.high=%s memory.max=%s high-events=%s ---\n%s",
+		rel, read("memory.current"), read("memory.high"), read("memory.max"), highEvents, read("memory.pressure"))
+}
+
+// stuckStartWait bounds how long a timed-out start waits for the server to
+// write its SIGQUIT goroutine dump and exit.
+const stuckStartWait = 5 * time.Second
+
+// stuckStartStacksBytes caps the stacks inlined into a start timeout.
+const stuckStartStacksBytes = 12 << 10
+
+// stuckStartStacks makes a timed-out server say where it is stuck. goopg
+// leaves SIGQUIT to the Go runtime, which writes every goroutine's stack to
+// stderr — cluster.log — and exits. The stacks that locate a stuck start are
+// goroutine 1, which runs runStart and initdb.Open, and the goroutines
+// initdb.Open spawned; they are inlined, because the log is deleted with the
+// run (startFailureLogTail).
+//
+// WHY: TestPort_IsolationClusterConflict and InsertConflictDoUpdate3 timed
+// out on the 2026-10-20 nightly with cluster.log ending at "loaded
+// postgresql.conf" — inside initdb.Open, which finishes in ~0.1 s on a quiet
+// host — and neither reproduces alone (AI-20261020-013101-003/-004).
+//
+// Best-effort: a missing or empty dump degrades to a note, never to an error
+// that replaces the timeout.
+func (c *Cluster) stuckStartStacks(cmd *exec.Cmd, exited <-chan struct{}) string {
+	if cmd == nil || cmd.Process == nil || c.logPath == "" {
+		return ""
+	}
+	before := int64(0)
+	if fi, err := os.Stat(c.logPath); err == nil {
+		before = fi.Size()
+	}
+	// The whole group, as Kill does, so a `go run` wrapper's child dumps too.
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		pgid = cmd.Process.Pid
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGQUIT); err != nil {
+		return fmt.Sprintf("\n--- no goroutine dump: SIGQUIT: %v ---", err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(stuckStartWait):
+	}
+	data, err := os.ReadFile(c.logPath)
+	if err != nil || int64(len(data)) <= before {
+		return "\n--- no goroutine dump in cluster.log after SIGQUIT ---"
+	}
+	stacks := startupGoroutines(string(data[before:]))
+	if stacks == "" {
+		return "\n--- SIGQUIT output holds no goroutine 1 or initdb stack ---"
+	}
+	if len(stacks) > stuckStartStacksBytes {
+		stacks = stacks[:stuckStartStacksBytes] + "\n…(truncated)"
+	}
+	return "\n--- stuck-start goroutines (SIGQUIT) ---\n" + stacks + "\n--- end goroutines ---"
+}
+
+// startupGoroutines selects, from a Go runtime goroutine dump, goroutine 1
+// and every goroutine with an internal/initdb frame. Blocks are separated by
+// blank lines and open with "goroutine N [state]:" ("goroutine N gp=… [state]:"
+// under GOTRACEBACK's crash detail).
+func startupGoroutines(dump string) string {
+	var keep []string
+	for block := range strings.SplitSeq(dump, "\n\n") {
+		block = strings.TrimSpace(block)
+		if !strings.HasPrefix(block, "goroutine ") {
+			continue
+		}
+		if strings.HasPrefix(block, "goroutine 1 ") || strings.Contains(block, "/internal/initdb.") {
+			keep = append(keep, block)
+		}
+	}
+	return strings.Join(keep, "\n\n")
 }
 
 // startFailureLogTailBytes is how much of cluster.log to inline into a start

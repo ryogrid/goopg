@@ -548,9 +548,19 @@ heuristic stays live.)
 - [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
+  - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\)\. Design `docs/design/0100\-0149/m\-nightly\-cluster\-start\-timeout\-diagnostics\.md`\.
+    - Both start timeouts \(\-003, \-004\) stalled inside initdb\.Open: cluster\.log ends at "loaded postgresql\.conf"\. Open takes
+      ~0\.1 s warm; neither spec fails alone \(2\.3 s each\), and 24 concurrent cold starts all attached by 1\.76 s\.
+    - Hypothesis: the testport unit \(memory\.high=6G\) throttled at memory\.high, with servers at GOMEMLIMIT 5GiB\.
+    - cluster\.Start now inlines the cgroup's memory state \(current/high/max, high\-event count, PSI\) and, via SIGQUIT,
+      goroutine 1's and every initdb goroutine's stack\. Pins: TestStartTimeoutCarriesStuckGoroutines,
+      TestStartupGoroutinesSelectsMainAndInitdb\.
+    - Next: read the two notes on the next nightly start timeout; high\-events and PSI stalls → resize the lanes,
+      a quiet group plus a parked initdb\.Open frame → fix that wait\.
 - [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
+  - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\): same start timeout inside initdb\.Open as \-003; see that item\.
 - [ ] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
