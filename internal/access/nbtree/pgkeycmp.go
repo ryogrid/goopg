@@ -1,7 +1,5 @@
 package nbtree
 
-import "fmt"
-
 // ---------------------------------------------------------------------------
 // M0130-S11.4 slice 3b-2c-i — the comparison SEAM, behaviour-preserving.
 //
@@ -189,63 +187,30 @@ func (c indexFormat) compareHigh(entry, hi []byte) int {
 	// The low end keeps `compare` (with its tiebreak) and needs no such change:
 	// there a zero-TID bound is minus infinity among its own duplicates, which is
 	// exactly "start at the first of them".
-	res, err := ComparePGIndexTupleKeyAttrs(c.desc, entry, hi)
+	res, nEntry, nHi, err := comparePGIndexTupleAttrs(c.desc, entry, hi)
 	if err != nil {
 		return CompareKeys(entry, hi)
 	}
-	if res <= 0 {
-		// Already within the bound; the truncation rule only ever makes the
-		// SHORTER operand smaller, so it cannot have produced this.
+	if res != 0 || nEntry == nHi {
+		// A shared attribute decided it, or the operands store the same
+		// attributes and agree on all of them (equal on the key: inside).
 		return res
 	}
-	// res > 0. Was it produced solely by hi being the shorter operand? That is
-	// true iff hi stores fewer attributes AND the operands agree on the ones it
-	// does store — which is what re-comparing entry TRUNCATED to hi's attribute
-	// count answers, without duplicating the deform loop.
-	nkey := uint16(c.desc.NKeyAtts())
-	if len(entry) < SizeOfIndexTupleData || len(hi) < SizeOfIndexTupleData {
-		return res
+	if nEntry < nHi {
+		// entry is the shorter operand: minus infinity beyond its attributes.
+		return -1
 	}
-	nHi := BTreeTupleGetNAtts(hi, nkey)
-	if nHi >= BTreeTupleGetNAtts(entry, nkey) {
-		return res
+	if nHi == 0 {
+		// A bound storing no attribute is minus infinity, not a prefix.
+		return 1
 	}
-	prefix, err := truncatedPGIndexTuple(entry, nHi, nkey)
-	if err != nil {
-		return res
-	}
-	if eq, err := ComparePGIndexTupleKeyAttrs(c.desc, prefix, hi); err == nil && eq == 0 {
-		// Equal on every attribute the bound names: inside a plus-infinity
-		// upper bound.
-		return 0
-	}
-	return res
-}
-
-// truncatedPGIndexTuple returns a copy of raw restamped to claim only its first
-// natts key attributes, so it can be compared against a bound that stores that
-// many. The data area is left alone: `ComparePGIndexTuples` deforms exactly
-// `min(nattsA, nattsB)` attributes, so the extra bytes are never read, and
-// re-forming the tuple would mean re-encoding datums inside a comparison.
-//
-// The copy is unavoidable — the source aliases a pinned leaf page (rangeScanPos'
-// M0091-0002 no-copy contract) and restamping in place would corrupt the index.
-// It costs one allocation per entry that reaches the bound test with a truncated
-// bound, i.e. once per scan at the boundary, not per row: an entry strictly
-// inside the range exits at `res <= 0` above, before any of this.
-func truncatedPGIndexTuple(raw []byte, natts, nkey uint16) ([]byte, error) {
-	if natts == 0 || natts >= nkey {
-		return nil, fmt.Errorf("btree: truncatedPGIndexTuple: %d attributes is not a proper prefix of %d", natts, nkey)
-	}
-	out := make([]byte, len(raw))
-	copy(out, raw)
-	// heapTID=false: a prefix bound has no tiebreaker TID, and neither may the
-	// operand being compared to it, or the TID tiebreak below the attribute loop
-	// would order an entry above a bound it is equal to.
-	if err := BTreeTupleSetNAtts(out, natts, false); err != nil {
-		return nil, err
-	}
-	return out, nil
+	// hi stores fewer attributes than entry and the two agree on all of them:
+	// equal on every attribute the bound names, i.e. inside a plus-infinity
+	// upper bound. One pass answers it — before M0122-0012 slice 33 this
+	// re-compared a heap copy of entry restamped to hi's attribute count, an
+	// allocation and a second deform for every entry of a prefix group (TPC-DS
+	// Q72's inventory skip scan: ~11 % of its CPU in that copy alone).
+	return 0
 }
 
 // KeyDesc reports the descriptor this tree orders by, or nil for the bytewise

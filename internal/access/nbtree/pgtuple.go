@@ -697,52 +697,77 @@ func (a PGIndexAttr) phys() PGIndexAttr { return a }
 //
 // values[i] ALIASES raw (as DeformPGIndexTuple's contract has always said), so
 // a caller reusing scratch across tuples must finish with the previous tuple's
-// datums before deforming the next one. comparePGIndexTuples does: it deforms
-// both operands, then compares, then drops both.
+// datums before deforming the next one. The attribute loop is
+// pgIndexTupleWalk.next, which comparePGIndexTuples drives directly.
 //
 // values and isnull must each have room for natts entries; the caller is
-// trusted on that, since the two in-tree callers pass a fixed-size array.
+// trusted on that.
 func deformPGIndexTupleInto[T physAttr](raw []byte, attrs []T, natts int, values [][]byte, isnull []bool) error {
 	if natts > len(attrs) {
 		return fmt.Errorf("btree: natts %d exceeds %d described attributes", natts, len(attrs))
 	}
+	w, err := newPGIndexTupleWalk(raw)
+	if err != nil {
+		return err
+	}
+	for i := range natts {
+		if values[i], isnull[i], err = w.next(i, attrs[i].phys()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pgIndexTupleWalk reads an index tuple's attributes one at a time, in
+// attribute order: deformPGIndexTupleInto's loop, for a caller that may stop
+// at the first attribute that decides its answer. comparePGIndexTuples is that
+// caller — upstream's _bt_compare likewise fetches each attribute with
+// index_getattr only when it reaches it, and returns on the first non-equal
+// one (nbtsearch.c), so a corrupt attribute past the deciding one goes unread
+// there too (M0122-0012 slice 33).
+type pgIndexTupleWalk struct {
+	raw      []byte
+	size     int
+	off      int
+	hasNulls bool
+}
+
+func newPGIndexTupleWalk(raw []byte) (pgIndexTupleWalk, error) {
 	if len(raw) < SizeOfIndexTupleData {
-		return fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
+		return pgIndexTupleWalk{}, fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
 	}
 	tInfo := pgTInfo(raw)
 	size := int(tInfo & IndexSizeMask)
 	if size > len(raw) {
-		return fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
+		return pgIndexTupleWalk{}, fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
 	}
-	hasNulls := tInfo&IndexNullMask != 0
-	off := PGIndexInfoFindDataOffset(tInfo)
+	return pgIndexTupleWalk{raw: raw, size: size, off: PGIndexInfoFindDataOffset(tInfo), hasNulls: tInfo&IndexNullMask != 0}, nil
+}
 
-	for i := range natts {
-		att := attrs[i].phys()
-		values[i] = nil
-		isnull[i] = false
-		if hasNulls {
-			// A CLEAR bit means null (fill_val sets the bit for present values).
-			if raw[SizeOfIndexTupleData+i/8]&(1<<uint(i%8)) == 0 {
-				isnull[i] = true
-				continue
-			}
+// next returns attribute i, which must be the attribute after the one the
+// previous call returned (the first call reads attribute 0). The value
+// ALIASES the tuple, as deformPGIndexTupleInto's values do.
+func (w *pgIndexTupleWalk) next(i int, att PGIndexAttr) ([]byte, bool, error) {
+	raw, size, off := w.raw, w.size, w.off
+	if w.hasNulls {
+		// A CLEAR bit means null (fill_val sets the bit for present values).
+		if raw[SizeOfIndexTupleData+i/8]&(1<<uint(i%8)) == 0 {
+			return nil, true, nil
 		}
-		if !(att.Len == -1 && off < size && pgVarattIs1B(raw[off:])) {
-			off = alignTo(off, att.AlignBy)
-		}
-		if off >= size {
-			return fmt.Errorf("btree: attribute %d starts at %d, past the %d-byte tuple", i, off, size)
-		}
-		n, err := pgAttLength(att, raw[off:size])
-		if err != nil {
-			return fmt.Errorf("btree: attribute %d: %w", i, err)
-		}
-		if off+n > size {
-			return fmt.Errorf("btree: attribute %d of %d bytes overruns the %d-byte tuple", i, n, size)
-		}
-		values[i] = raw[off : off+n]
-		off += n
 	}
-	return nil
+	if !(att.Len == -1 && off < size && pgVarattIs1B(raw[off:])) {
+		off = alignTo(off, att.AlignBy)
+	}
+	if off >= size {
+		return nil, false, fmt.Errorf("btree: attribute %d starts at %d, past the %d-byte tuple", i, off, size)
+	}
+	n, err := pgAttLength(att, raw[off:size])
+	if err != nil {
+		return nil, false, fmt.Errorf("btree: attribute %d: %w", i, err)
+	}
+	if off+n > size {
+		return nil, false, fmt.Errorf("btree: attribute %d of %d bytes overruns the %d-byte tuple", i, n, size)
+	}
+	w.off = off + n
+	return raw[off : off+n], false, nil
 }

@@ -4835,6 +4835,37 @@ type ScanCursor struct {
 	loExclusive, hiExclusive bool
 	leafFilter               func(storage.BlockNumber) bool
 	next                     storage.BlockNumber // InvalidBlockNumber once exhausted
+	// page is the leaf Next is walking, set only while fn runs (LeafLastKey).
+	page storage.Page
+}
+
+// LeafLastKey returns the key of the last data item on the leaf the current
+// Next call is walking — PG's finaltup, the tuple _bt_advance_array_keys
+// tests to decide that no tuple left on the page can satisfy the advanced
+// array keys and that a new primitive index scan should start
+// (nbtutils.c, "Proactively check finaltup"). Upstream uses the page's high
+// key; every data item orders at or below it, so the last item is the
+// tighter test. Valid only inside Next's fn: the key aliases the pinned page.
+// An LP_DEAD item keeps its place in key order, so it counts. ok is false on
+// an empty or unreadable leaf, or outside fn.
+func (c *ScanCursor) LeafLastKey() (key []byte, ok bool) {
+	if c.page == nil {
+		return nil, false
+	}
+	count, err := PGDataItemCount(c.page)
+	if err != nil || count == 0 {
+		return nil, false
+	}
+	r, err := pgGetItemRawAllowDeadNoCopy(c.page, uint16(count))
+	if err != nil {
+		return nil, false
+	}
+	if isPostingRaw(r) {
+		k, _, perr := c.bt.format().parsePostingRaw(r)
+		return k, perr == nil
+	}
+	it, perr := c.bt.format().parseNoCopy(r)
+	return it.key, perr == nil
 }
 
 // NewScanCursor descends once to the leaf that could contain lo — the
@@ -4899,7 +4930,9 @@ func (c *ScanCursor) Next(fn func(key []byte, ptr storage.ItemPointer, pos ScanP
 			continue
 		}
 		nextBlk := op.Next
+		c.page = slot.Page()
 		stop, ferr := c.bt.scanLeafItems(slot, cur, c.lo, c.hi, c.loExclusive, c.hiExclusive, fn)
+		c.page = nil
 		c.bt.unpinR(slot)
 		if ferr != nil {
 			c.next = storage.InvalidBlockNumber

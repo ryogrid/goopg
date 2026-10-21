@@ -235,7 +235,13 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 	}
 	entries, newGroups := 0, 0
 	stopped := false
-	ok, nerr := e.walkCur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
+	cur := e.walkCur
+	// jump is the finaltup test's verdict (below): a re-descent target the
+	// rest of this leaf cannot reach. checkedBefore/checkedPassed make it one
+	// test per group state per leaf.
+	var jump []byte
+	jumpExcl, checkedBefore, checkedPassed := false, false, false
+	ok, nerr := cur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
 		entries++
 		if e.gPivot == nil || tree.CompareHighBound(key, e.gPivot) > 0 {
 			probe, pivot, gerr := e.groupBounds(ctx, idx, s, key, pos, op)
@@ -244,13 +250,37 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			}
 			e.gProbe, e.gPivot = probe, pivot
 			e.gReached, e.gPassed = false, false
+			checkedBefore, checkedPassed = false, false
 			newGroups++
 		}
-		if e.gPassed || tree.CompareLowBound(key, e.gProbe) < 0 {
+		if !e.gPassed && tree.CompareLowBound(key, e.gProbe) < 0 {
+			// Before the group's probe. If even the leaf's final entry is,
+			// no entry left here reaches it: descend to the probe now, as
+			// _bt_advance_array_keys starts a new primitive scan when the
+			// page's finaltup is still before the advanced array keys.
+			if !checkedBefore {
+				checkedBefore = true
+				if last, lok := cur.LeafLastKey(); lok && tree.CompareLowBound(last, e.gProbe) < 0 {
+					jump, jumpExcl = e.gProbe, false
+					return false, nil
+				}
+			}
 			return true, nil
 		}
-		if tree.CompareHighBound(key, e.gProbe) > 0 {
+		if !e.gPassed && tree.CompareHighBound(key, e.gProbe) > 0 {
 			e.gPassed = true
+		}
+		if e.gPassed {
+			// Past the probe, still inside its group. If the leaf's final
+			// entry is too, the rest of the leaf is this group's tail:
+			// descend past the group now instead of reading it.
+			if !checkedPassed {
+				checkedPassed = true
+				if last, lok := cur.LeafLastKey(); lok && tree.CompareHighBound(last, e.gPivot) <= 0 {
+					jump, jumpExcl = e.gPivot, true
+					return false, nil
+				}
+			}
 			return true, nil
 		}
 		e.gReached = true
@@ -269,6 +299,14 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			return false, ee
 		}
 		return false, &ExecError{Code: "XX000", Pos: pos, Message: nerr.Error()}
+	}
+	if jump != nil {
+		jc, cerr := tree.NewScanCursor(jump, nil, jumpExcl, false, leafFilter)
+		if cerr != nil {
+			return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
+		}
+		e.walkCur = jc
+		return true, nil
 	}
 	if stopped || !ok {
 		e.done = true

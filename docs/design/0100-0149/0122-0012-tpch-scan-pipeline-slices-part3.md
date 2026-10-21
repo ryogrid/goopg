@@ -390,3 +390,69 @@ and the same build swung 3× from run to run. It is left for re-measurement.
 **Left.** The other `exprEqual` callers still format both keys per comparison: `pathKeyEqual` in
 `joinpathsmerge.go`/`orderedappend.go`, plus 29 call sites in the package. Q64's remaining ~1 s over PG has not
 been profiled yet.
+
+## Slice 33 (2026-10-21): index key comparison walks attributes; the skip-scan walk re-descends on finaltup — TPC-DS Q72
+
+**Cause.** After slice 32, TPC-DS Q72 was the largest SF0.25 gap: ~29 s warm, against PG's 3.4 s. The plan
+matches PG's. Its inner `inventory_pkey` (inv\_date\_sk, inv\_item\_sk, inv\_warehouse\_sk) index scan is a
+skip scan probed on `inv_item_sk` (PG: 2185 loops, 898 676 index searches). 88 % of the CPU was in
+`scanLeafItems`, which had two costs:
+
+- **Every key comparison deformed both tuples.** `comparePGIndexTuples` deformed all shared attributes of both
+  operands into a zeroed 384-byte scratch frame before comparing the first one.
+- **`compareHigh` compared twice for a prefix bound.** When the bound named only a prefix, it re-compared a heap
+  copy of the entry restamped to the bound's attribute count: an allocation and a second deform for every
+  entry of a prefix group.
+- **The skip-scan leaf walk read whole leaves it could not use.** `btreeSkipEnum.walkLeaf` compared every
+  remaining entry of a leaf. This happened both before the group's probe and after passing it, and it only
+  re-descended after a leaf turned out to hold a single group. PG re-descends earlier.
+  `_bt_advance_array_keys` checks the page's finaltup and starts a new primitive scan as soon as no tuple left
+  on the page can satisfy the advanced array keys (nbtutils.c, "Proactively check finaltup").
+
+**Rule.**
+
+- **`pgIndexTupleWalk` reads one attribute at a time.** `comparePGIndexTupleAttrs` walks both tuples together
+  and returns at the first attribute that differs, as `_bt_compare` does with `index_getattr`.
+  `deformPGIndexTupleInto` is now the same walker run to `natts`, so the two cannot drift apart.
+- **`compareHigh` answers the prefix-bound case in the same pass.** Equal on every attribute the shorter bound
+  stores means inside the bound (0). A bound that stores no attribute is still minus infinity (1). The truncated
+  copy (`truncatedPGIndexTuple`) is gone.
+- **`ScanCursor.LeafLastKey` returns the walked leaf's last data item.** This is the finaltup test, using the
+  tighter last item instead of the high key. `walkLeaf` checks it once per group state per leaf:
+  - when the entry is still before the probe and so is the last item, it descends to the probe;
+  - when the probe is passed and the last item is still inside the group, it descends past the group
+    (exclusive pivot).
+
+  Neither jump skips a row the walk would have emitted: the walk would skip every entry between the jump point
+  and the target too.
+
+**Pins.**
+
+- `TestComparePGIndexTuplesWalkMatchesDeformFirst` reproduces the deform-everything-first algorithm and the
+  two-pass `compareHigh`. It checks them against the new code over 26 000 pairs: three attributes (int4,
+  NULLS FIRST text, DESC int4), random NULLs, and pivots storing 0–3 attributes. It fails each of three
+  mutations:
+  - the 0-attribute bound read as a prefix;
+  - the prefix case answered as `compare`;
+  - a walk that does not advance its offset.
+- `TestSkipScanLeafWalk` (seq-scan oracle over the dense, sparse and long-run shapes) exercised both new jumps:
+  46 past-group and 40 to-probe jumps, counted with a temporary counter.
+
+**Measured.** Private SF0.25 copy, warm:
+
+| query | HEAD (s) | candidate (s) | PG (s) |
+|---|---|---|---|
+| Q72 | 28.1–31.3 | 8.2–10.7 | 3.4 |
+
+- The comparison change alone took Q72 to 17–20 s; the finaltup re-descent took it the rest of the way.
+- In the sf025 sweep, Q72 went from 29.7 s to 10.8 s, Q81 from 11.1 s to 7.8 s, and the sum of the 99 query
+  times from 203 s to 182 s.
+- Q35 and Q1 rose in that sweep but A/B as noise. Both builds drift from ~3.4 s to 5–8 s on Q35 as the server
+  ages, and Q1 swings 21–32 s on HEAD.
+- TPC-H warm totals sit within run-to-run noise (15.4–16.1 s, two interleaved rounds); TPC-H has no skip scan.
+- Q72, Q94, Q95 and Q16 output is byte-identical to `:65438`.
+
+**Left.** Q72 is still ~2.4× PG. What remains is mostly the leaf binary search (`leafScanStart`) on cold
+leaves. goopg descends twice per prefix group (past the group, then to the next group's probe), where PG with
+skip support often descends once. The cursor also binary-searches every later leaf against its lower bound.
+Both are recorded in the deferral ledger.
