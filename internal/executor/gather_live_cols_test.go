@@ -65,6 +65,10 @@ func TestGatherUnderAggregateShipsLiveColumns(t *testing.T) {
 }
 
 func TestCloneRowOwnedLive(t *testing.T) {
+	// Dead cells are NULL with the deform poison off (poison when armed).
+	old := seqScanDeformPoison
+	seqScanDeformPoison = false
+	t.Cleanup(func() { seqScanDeformPoison = old })
 	src := Row{NewIntDatum(1), NewStringDatum("keep"), NewStringDatum("drop"), NewIntDatum(4)}
 	got := cloneRowOwnedLive(src, []bool{false, true})
 	if len(got) != len(src) {

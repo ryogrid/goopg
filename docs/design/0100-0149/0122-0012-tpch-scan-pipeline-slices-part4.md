@@ -317,3 +317,64 @@ Gather).
 - **The workers still evaluate and deform columns nobody reads.** The mask only stops them from being copied.
   PG's workers project before sending; goopg's plans put the projection above the Gather. This is recorded in
   the deferral ledger.
+
+## Slice 40 (2026-10-22): the legacy Filter evaluates a compiled predicate — TPC-DS Q81, Q1
+
+**Target, named up front:** TPC-DS Q81, ~7.4 s warm at HEAD against PG's 3.8 s.
+
+**Cause.** 97 % of Q81's CPU sat in `filterOp.nextPerRow` → `evalExprSlot`. It is the correlated SubPlan's
+`ctr1.ctr_state = ctr2.ctr_state` over the CTE scan, evaluated about 47 M times. The interpreted evaluator
+re-derives every static fact of the comparison on each call:
+
+- both operands' declared bpchar widths (`declaredBpcharTypmod`, which lowercases the type name with
+  `strings.ToLower` each time);
+- whether both are character strings (`exprIsCharacterString`).
+
+A SubPlan's inner tree is built by the legacy `buildNode`, whose `filterOp` always interpreted. Only the slab
+path's OpFilter ran the compiled evaluator, whose node carries those facts in its payload.
+
+**Rule.** `newFilterOp` compiles the predicate once into an `exprTreeSlab`. `nextPerRow` evaluates it with
+`evalFastExpr`, exactly as the slab path's `filterOpNext` does. Kinds the compiler does not know fall back to
+`evalExprSlot` inside the slab, so results stay the interpreter's. A hand-built `filterOp` with no compiled
+slab keeps the interpreted path.
+
+**Found and fixed: the batch filter disagreed with both per-row twins.** The pin below drives `filterOp` with
+its batch path on and off. With batching on, `evalFilterBatch` computed `evalBinaryBatch` over the raw values
+and skipped two rules both per-row twins apply first:
+
+- **bpchar semantics:** a `char(n)` operand, or a bare literal opposite one, compares with trailing blanks
+  stripped (`comparisonOperandsAsBpchar`). So text `'ab'` = `'ab  '::char(4)` came out false.
+- **the pg_lsn-shape comparison.**
+
+`evalFilterBatch` now re-evaluates through the interpreter exactly the rows those rules could touch:
+
+- either operand is declared bpchar;
+- a bare literal faces a string;
+- a value has the pg\_lsn shape;
+- two character strings have a sniffed shape.
+
+Non-string rows keep the batch result. Plain SQL did not reach the bug in this pin's probes: a filter directly
+over a scan is absorbed into the scan, and `t = b` returned PG's {1}. The batch path serves only a
+batch-eligible Filter above a non-scan child.
+
+**Pin.** `TestFilterOpCompiledPredicateMatchesInterpreted` runs every case with the batch path on and off and
+requires exactly the rows `evalExprSlot` keeps. It covers:
+
+- `=` `<` `>` `<>` over int, text and `char(4)` columns and bare literals;
+- padded and unpadded values;
+- the sniffed shapes: row, array, pg\_lsn and uuid;
+- NULLs.
+
+Restoring the old `evalFilterBatch` fails it on `t = b (batch=true)`.
+
+**Measured.**
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q81, warm, two interleaved rounds | 7.27–8.95 | 5.38–5.47, one 7.12 |
+
+In the sf025 sweep, the 99-query sum went from 155.0 s to 147.2 s. Q1, another correlated subquery over a CTE,
+went from 17.8 to 11.2 s (PG 13.3 s). TPC-H is flat (14.81 vs 14.65 s, `GOGC=100`).
+
+**Left.** `textShapeAmbiguous` still sniffs the values on every call, in the compiled arm too. That is the
+slice 30 ledger row: the operand types are not carried everywhere.

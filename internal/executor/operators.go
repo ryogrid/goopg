@@ -599,10 +599,26 @@ type filterOp struct {
 	// filterBatchSize child rows before emitting the first, which moves that
 	// position past the row being emitted.
 	noReadAhead bool
+	// predExprs / predIdx are pred compiled once into an exprTreeSlab, the
+	// form the slab path's OpFilter evaluates (filterOpNext). nextPerRow
+	// runs it through evalFastExpr instead of re-walking pred with the
+	// interpreted evaluator, which re-derives every static decision per row
+	// (the operands' declared bpchar widths and character-string types).
+	// Kinds the compiler does not know fall back to evalExprSlot inside the
+	// slab, so the result is the interpreter's. A correlated SubPlan's inner
+	// Filter is built here, not on the slab path: TPC-DS Q81 evaluated its
+	// `ctr1.ctr_state = ctr2.ctr_state` 47M times interpreted (M0122-0012
+	// slice 40).
+	predExprs exprTreeSlab
+	predIdx   int32
 }
 
 func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
-	return &filterOp{child: child, pred: plan.Predicate}
+	o := &filterOp{child: child, pred: plan.Predicate, predIdx: noExpr}
+	if plan.Predicate != nil {
+		o.predIdx = o.predExprs.buildExpr(plan.Predicate)
+	}
+	return o
 }
 
 func (o *filterOp) Open(ctx *Context) error {
@@ -663,7 +679,12 @@ func (o *filterOp) nextPerRow() (TupleSlot, error) {
 			// done, no row to surface" — propagate without eval.
 			return nil, nil
 		}
-		v, err := evalExprSlot(o.pred, slot, o.ctx)
+		var v Datum
+		if len(o.predExprs) > 0 && o.predIdx != noExpr {
+			v, err = evalFastExpr(o.predExprs, o.predIdx, slot, o.ctx)
+		} else {
+			v, err = evalExprSlot(o.pred, slot, o.ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
