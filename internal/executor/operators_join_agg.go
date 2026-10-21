@@ -50,6 +50,13 @@ type joinOp struct {
 
 	ctx *Context
 
+	// nlOuterBorrowed is set by markScanBorrowChain when this nested loop's
+	// outer chain hands up reused rows (M0122-0012 slice 28). The streaming
+	// loops then keep the current outer row by a shallow copy: they pull the
+	// next outer row only after the inner side is done with this one, so its
+	// values stay valid without the deep clone.
+	nlOuterBorrowed bool
+
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
 	// int64 fast-path (cost-model ch.14): when the build-side keys are

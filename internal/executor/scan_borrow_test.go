@@ -142,6 +142,8 @@ func borrowedScanTables(op Operator) []string {
 		case *joinOp:
 			walk(o.left)
 			walk(o.right)
+		case *nestedLoopIndexJoinOp:
+			walk(o.outer)
 		}
 	}
 	walk(op)
@@ -367,4 +369,129 @@ func TestScanBorrowBuildSideAndGatherWorkers(t *testing.T) {
 			t.Fatalf("gathered=%v: no rows", gathered)
 		}
 	}
+}
+
+// TestScanBorrowThroughNestedLoopOuter extends the borrow to TPC-H Q3's
+// shape: a nested loop whose outer is a filtered scan, under a borrowing
+// aggregate — the parameterised NestedLoopIndexJoin and the streaming
+// nested-loop joinOp (plain and LATERAL), whose stepOuter then keeps the
+// outer row by a shallow copy (nlOuterBorrowed). The loop keeps the outer row
+// while it drains the inner probe for it, so the outer scan hands up its
+// reused row; the outer table spans many pages with text and big numerics in
+// the per-page arena and every outer row has several inner matches, so a value
+// read after its page's reset would show. With tail poison armed every result
+// must equal the cloning path's.
+func TestScanBorrowThroughNestedLoopOuter(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE no (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO no SELECT x % 997, repeat(chr(65 + x % 26), 30 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE ni (k int, v int, label text)")
+	runSQL(t, ctx, "INSERT INTO ni SELECT x % 997, x, 'lbl-' || x FROM generate_series(1, 40000) x")
+	runSQL(t, ctx, "CREATE INDEX ni_k ON ni (k)")
+	runSQL(t, ctx, "ANALYZE no")
+	runSQL(t, ctx, "ANALYZE ni")
+	for _, q := range []string{
+		"SELECT max(no.s), sum(no.n), count(*), sum(ni.v) FROM no JOIN ni ON ni.k = no.k WHERE no.i % 200 = 7",
+		"SELECT no.k, max(no.s), count(*) FROM no JOIN ni ON ni.k = no.k WHERE no.i % 200 = 7 GROUP BY no.k",
+		"SELECT max(no.s), count(*) FROM no LEFT JOIN ni ON ni.k = no.k AND ni.v < 3000 WHERE no.i % 200 = 7",
+		// Streaming nested loops (joinOp, slice 28): a non-equi join cannot
+		// hash, and a LATERAL subquery re-opens its inner per outer row.
+		"SELECT max(no.s), sum(no.n), count(*) FROM no JOIN ni ON ni.v BETWEEN no.i AND no.i + 2 WHERE no.i % 200 = 7",
+		"SELECT max(no.s), count(*), sum(l.v) FROM no, LATERAL (SELECT ni.v FROM ni WHERE ni.k = no.k ORDER BY ni.v LIMIT 2) l WHERE no.i % 200 = 7",
+	} {
+		plan, err := testPlanDeform(t, ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if !hasNestedLoop(op) {
+			t.Fatalf("%s: no nested loop in the plan; nothing is exercised", q)
+		}
+		outer := nestedLoopOuterScan(op)
+		if outer == nil || !outer.borrowRows {
+			t.Fatalf("%s: the nested loop's outer scan does not borrow (borrowing: %v)", q, borrowedScanTables(op))
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := sortedRowValues(t, ctx, q)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := sortedRowValues(t, ctx, q)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s:\nborrowed %v\ncloned   %v", q, got, want)
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", q)
+		}
+	}
+}
+
+// hasNestedLoop reports whether a built tree holds a nested loop — a
+// parameterised NestedLoopIndexJoin or a streaming nested-loop joinOp — on its
+// row-carrying path.
+func hasNestedLoop(op Operator) bool {
+	switch o := op.(type) {
+	case *instrumentedOp:
+		return hasNestedLoop(o.inner)
+	case *nestedLoopIndexJoinOp:
+		return true
+	case *aggregateOp:
+		return hasNestedLoop(o.child)
+	case *projectOp:
+		return hasNestedLoop(o.child)
+	case *sortOp:
+		return hasNestedLoop(o.child)
+	case *joinOp:
+		if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			return true
+		}
+		return hasNestedLoop(o.left) || hasNestedLoop(o.right)
+	}
+	return false
+}
+
+// nestedLoopOuterScan returns the seq scan feeding the first nested loop's
+// outer side through Projects, or nil.
+func nestedLoopOuterScan(op Operator) *seqScanOp {
+	var outer Operator
+	var find func(Operator) bool
+	find = func(cur Operator) bool {
+		switch o := cur.(type) {
+		case *instrumentedOp:
+			return find(o.inner)
+		case *nestedLoopIndexJoinOp:
+			outer = o.outer
+			return true
+		case *aggregateOp:
+			return find(o.child)
+		case *projectOp:
+			return find(o.child)
+		case *sortOp:
+			return find(o.child)
+		case *joinOp:
+			if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+				outer = o.left
+				return true
+			}
+			return find(o.left) || find(o.right)
+		}
+		return false
+	}
+	if !find(op) {
+		return nil
+	}
+	for outer != nil {
+		switch o := outer.(type) {
+		case *instrumentedOp:
+			outer = o.inner
+		case *projectOp:
+			outer = o.child
+		case *seqScanOp:
+			return o
+		default:
+			return nil
+		}
+	}
+	return nil
 }

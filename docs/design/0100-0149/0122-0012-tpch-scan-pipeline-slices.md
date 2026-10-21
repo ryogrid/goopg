@@ -606,3 +606,58 @@ Comparing numerics by raw `Int` fails it.
 **Not done (ledgered):** the recursive evaluation of column and constant leaves (`evalFastExpr` line 434 still
 carried the most flat time) remains. PG's `ExecInterpExpr` reads a scan Var and a Const through opcode steps, with
 no recursion.
+
+## Slice 28 (2026-10-21): the scan borrow reaches through nested loops — TPC-H Q3
+
+**Cause.** Q3 (0.64 s against PG's 0.21 s) still spent 12 % in `cloneRowOwnedPrefix`. A debug pass on a private
+server (temporary print, not committed) showed the orders scan opening without the borrow in all 25 participant
+opens.
+
+Its chain is Gather worker → Nested Loop → Parallel Hash Join → orders. The descent stopped at the Nested Loop, a
+`joinOp` with `JoinAlgoNestedLoop`. Because its inner side is a parameterised index probe, it runs in
+`join_lateral_stream.go`.
+
+**Rule.** A nested loop pulls its next outer row only once the inner side is done with the current one, and keeps
+nothing of it afterwards. PG's NestLoop holds the outer slot across the inner rescans the same way. So the descent
+continues into its outer side:
+
+- **A streaming nested-loop `joinOp`**, plain (`join_nl_stream.go`) or LATERAL (`join_lateral_stream.go`). The
+  descent sets `nlOuterBorrowed`, and `stepOuter` then keeps the current outer row by a shallow copy instead of
+  `cloneRowOwned`. Otherwise the clone would only move from the scan into the loop.
+- **A `nestedLoopIndexJoinOp`.** It already copies only the outer row's slice.
+
+The inner side keeps nothing of the outer row across outer rows:
+
+- the index probe reads the bound slot at Rescan;
+- Memoize keys its cache by a formatted string;
+- the lateral CTE cache resets per outer row;
+- the sublink result caches key by formatted strings.
+
+A sublink could return an outer column as its cached value. A real-server probe of that case — 30,000 rows
+repeating three values across pages, `(SELECT so.s FROM one)` — returned correct groups. The sublink cache stores
+values undetached, which is ledgered.
+
+**Pin.** `TestScanBorrowThroughNestedLoopOuter` runs five aggregate queries over a multi-page outer table, each
+under a borrowing aggregate and with tail poison armed:
+
+- two over a parameterised nested loop (NLI), one of them a LEFT join;
+- one non-equi join, which cannot hash;
+- one LATERAL subquery.
+
+For each, the nested loop's outer scan must borrow, and the result must equal the cloning path's. Removing the
+nested-loop `joinOp` case fails it.
+
+The unit fixture's scans do not use the per-page arena, so a value read after an arena reset cannot show in a unit
+test. Arena lifetime is covered only by the server gates (spotcheck, acceptance, sf025, regress, isolation), and
+that is ledgered.
+
+**Measured.** HEAD `169a92964` against the candidate, four interleaved rounds of five runs:
+
+- Q3's warm median went from ~0.56 s to ~0.45 s (−20 %);
+- HEAD drifted upward within each server (0.51 → 0.73 s), while the candidate stayed flat.
+
+**Not done (ledgered):**
+
+- merge joins, Sort, Filter and GatherMerge still stop the descent;
+- the sublink caches store result Datums undetached;
+- there is no arena-backed unit fixture.

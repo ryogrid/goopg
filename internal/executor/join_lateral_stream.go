@@ -217,7 +217,7 @@ func (m *lateralJoinStream) stepOuter() (Row, bool, error) {
 	row := slotRow(slot)
 	// The outer tuple stays in scope for the whole right-side re-execution, so
 	// it must survive the left child's next step.
-	if rowHasArena(row) {
+	if rowHasArena(row) && !m.o.nlOuterBorrowed {
 		m.outerRow = cloneRowOwned(row)
 	} else {
 		m.outerRow = append(m.outerRow[:0], row...)

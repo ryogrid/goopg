@@ -1753,6 +1753,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       runs inside the fastBinarySimple gate after the NULL check; every other pair takes evalBinary\.
     - Pin: TestFastCompareDatumMatchesCompareDatum \(18 values pairwise vs compareDatum; raw\-Int numeric compare
       fails it\)\. Q6 ~0\.45 → ~0\.31 s \(PG 0\.24\)\.
+  - **Slice 28 — the scan borrow reaches through nested loops LANDED 2026\-10\-21.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS\. Doc "Slice 28"\.
+    - Q3's orders scan \(Gather worker → Nested Loop → Parallel Hash Join → orders\) never borrowed: the descent
+      stopped at the nested\-loop joinOp \(lateral stream, parameterised index inner\)\.
+    - markScanBorrowChain now enters the outer side of a streaming nested\-loop joinOp \(sets nlOuterBorrowed so
+      stepOuter keeps the row by shallow copy\) and of nestedLoopIndexJoinOp\. Pin:
+      TestScanBorrowThroughNestedLoopOuter \(5 shapes incl\. NLI, LEFT, non\-equi, LATERAL\)\.
+    - Q3 ~0\.56 → ~0\.45 s \(−20%\)\. Found: executor unit fixtures do not use the per\-page arena, so arena\-reset
+      hazards are only witnessed by the server gates \(ledgered\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3644,6 +3654,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `7909e3796`** \(census reused: 7909e3796 touched only internal/utils/mmgr, not an S9 trigger path\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `169a92964`** \(M0122\-0012 slice 27 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
