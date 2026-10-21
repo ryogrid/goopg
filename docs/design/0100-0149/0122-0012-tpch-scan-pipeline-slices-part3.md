@@ -353,3 +353,40 @@ for small digit values a big-endian read stays order-preserving.
 | Q3 | ~0.46 | ~0.44 | ~4 %; the first round was ~0.52 against ~0.44 |
 | Q21 | — | — | ~2 % |
 | Q18 | — | — | within its run-to-run swing |
+
+## Slice 32 (2026-10-21): pathkey usefulness compares identity keys once — TPC-DS Q64
+
+**Cause.** Away from TPC-H, a per-query gap census of the TPC-DS SF0.25 corpus against `:65438` put Q64 at
+36–44 s against PG's 2.0 s. Nearly all of it was planning, not execution. In the CPU profile, 94 % of samples
+sat under `exprEqual` → `exprIdentityKey` → `fmt.Sprintf`, called from `pathkeyUsefulness.sameClass`.
+`sameClass` scans every equivalence-class member against two expressions per call, and `exprEqual` formats
+both identity keys from scratch on every comparison. Q64's 18-relation join search asks the question for
+every candidate path's pathkeys.
+
+**Rule.** `pathkeyUsefulness` compares identity keys it has already computed:
+
+- `classMember` carries its `exprIdentityKey`, computed once when `newClassMember` collects it.
+- `keyOf` memoises the key of any other compared expression (pathkey, merge and query keys) by node identity,
+  for the rel's lifetime.
+- `exprEqualKeyed` is `exprEqual`'s own decision from precomputed keys. Nil equals only nil, a node equals
+  itself, and otherwise both keys must exist and match.
+
+`sameClass`, `equivalentWithin`, `rightMergeDirection`, `usefulForMerging` and `sortableEarlyMember` use it.
+Which paths are useful does not change; only the repeated formatting is gone.
+
+**Pin.** `TestPathkeyUsefulnessKeyedMatchesExprEqual` checks every keyed answer against plain `exprEqual` over
+equal, distinct, nil and literal (unkeyed) members. Comparing by pointer only, without keys, fails 8 of its
+checks.
+
+**Measured.** Q64 went from 36–44 s to ~3.0 s warm on a private SF0.25 copy (PG 2.0 s). Plans did not move:
+
+- the sf025 sweep reported plan shapes identical, 99/99;
+- the TPC-DS fire-set gate found no changed query;
+- the TPC-H acceptance arm matched all 24 labels on values.
+
+An A/B of Q72 (30 s against PG 3.4 s) was attempted but was unreadable: host load was 13–23 with 69 % iowait,
+and the same build swung 3× from run to run. It is left for re-measurement.
+
+**Left.** The other `exprEqual` callers still format both keys per comparison: `pathKeyEqual` in
+`joinpathsmerge.go`/`orderedappend.go`, plus 29 call sites in the package. Q64's remaining ~1 s over PG has not
+been profiled yet.

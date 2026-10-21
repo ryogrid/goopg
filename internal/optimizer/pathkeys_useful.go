@@ -47,6 +47,44 @@ type pathkeyUsefulness struct {
 	// class itself, so list_member_ptr matches an ordering on any member
 	// (classOf).
 	ecMembers []classMember
+	// keys memoises exprIdentityKey for the expressions the methods below
+	// compare (pathkey expressions, merge and query keys), keyed by node
+	// identity, for this rel's lifetime (M0122-0012 slice 32).
+	keys map[Expr]cachedKey
+}
+
+type cachedKey struct {
+	key string
+	ok  bool
+}
+
+// keyOf is the identity key exprEqual would compute for e, memoised.
+func (u *pathkeyUsefulness) keyOf(e Expr) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	if c, hit := u.keys[e]; hit {
+		return c.key, c.ok
+	}
+	k, ok := exprIdentityKey(e, scopeVeto)
+	if u.keys == nil {
+		u.keys = make(map[Expr]cachedKey)
+	}
+	u.keys[e] = cachedKey{k, ok}
+	return k, ok
+}
+
+// equalKeyed is exprEqual(a, b) through the memo.
+func (u *pathkeyUsefulness) equalKeyed(a, b Expr) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a == b {
+		return true
+	}
+	ka, oka := u.keyOf(a)
+	kb, okb := u.keyOf(b)
+	return oka && okb && ka == kb
 }
 
 // classMember is one expression of an equivalence class, with the relations
@@ -55,6 +93,43 @@ type classMember struct {
 	expr   Expr
 	relids RelSet
 	id     int
+	// key / keyOK are exprIdentityKey(expr, scopeVeto), computed once when
+	// the member is collected (newClassMember). sameClass compares every
+	// member against two expressions per call, and exprEqual formats both
+	// keys on every comparison: TPC-DS Q64 spent ~36 s planning in it
+	// (M0122-0012 slice 32).
+	key   string
+	keyOK bool
+	keyed bool // key/keyOK were computed; a literal member falls back to the memo
+}
+
+func newClassMember(e Expr, relids RelSet, id int) classMember {
+	m := classMember{expr: e, relids: relids, id: id, keyed: true}
+	if e != nil {
+		m.key, m.keyOK = exprIdentityKey(e, scopeVeto)
+	}
+	return m
+}
+
+// memberKey is m's identity key, precomputed or through the memo.
+func (u *pathkeyUsefulness) memberKey(m *classMember) (string, bool) {
+	if m.keyed {
+		return m.key, m.keyOK
+	}
+	return u.keyOf(m.expr)
+}
+
+// exprEqualKeyed is exprEqual(a, b) given each side's precomputed identity key
+// (keyOf): nil only equals nil, the same expression equals itself, and
+// otherwise both keys must exist and match.
+func exprEqualKeyed(a Expr, ka string, oka bool, b Expr, kb string, okb bool) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a == b {
+		return true
+	}
+	return oka && okb && ka == kb
 }
 
 // pathkeyUsefulnessFor collects the merge-useful expressions for joinrelids
@@ -88,13 +163,13 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 		} else {
 			if relsSubset(ri.leftRelids, joinrelids) && relsSubset(ri.rightRelids, joinrelids) {
 				u.classMembers = append(u.classMembers,
-					classMember{ri.leftKey, ri.leftRelids, id}, classMember{ri.rightKey, ri.rightRelids, id})
+					newClassMember(ri.leftKey, ri.leftRelids, id), newClassMember(ri.rightKey, ri.rightRelids, id))
 			}
 		}
 		classes[id] = append(classes[id], member{ri.leftKey, ri.leftRelids}, member{ri.rightKey, ri.rightRelids})
 		if ri.ecID != noEquivClass {
 			u.ecMembers = append(u.ecMembers,
-				classMember{ri.leftKey, ri.leftRelids, id}, classMember{ri.rightKey, ri.rightRelids, id})
+				newClassMember(ri.leftKey, ri.leftRelids, id), newClassMember(ri.rightKey, ri.rightRelids, id))
 		}
 	}
 	for _, ms := range classes {
@@ -178,12 +253,16 @@ func (u *pathkeyUsefulness) leadingMembersOf(keys, list []PathKey) int {
 // PG's canonical pathkeys; equivalentWithin is the narrower question of
 // whether this rel's rows are ordered alike by both.
 func (u *pathkeyUsefulness) sameClass(a, b Expr) bool {
+	ka, oka := u.keyOf(a)
+	kb, okb := u.keyOf(b)
 	ida, idb := -1, -1
-	for _, m := range u.ecMembers {
-		if ida < 0 && exprEqual(m.expr, a) {
+	for i := range u.ecMembers {
+		m := &u.ecMembers[i]
+		mk, mok := u.memberKey(m)
+		if ida < 0 && exprEqualKeyed(m.expr, mk, mok, a, ka, oka) {
 			ida = m.id
 		}
-		if idb < 0 && exprEqual(m.expr, b) {
+		if idb < 0 && exprEqualKeyed(m.expr, mk, mok, b, kb, okb) {
 			idb = m.id
 		}
 	}
@@ -201,7 +280,7 @@ func (u *pathkeyUsefulness) usefulForMerging(keys []PathKey) int {
 		}
 		matched := false
 		for _, e := range u.mergeExprs {
-			if exprEqual(e, pk.Expr) {
+			if u.equalKeyed(e, pk.Expr) {
 				matched = true
 				break
 			}
@@ -218,7 +297,7 @@ func (u *pathkeyUsefulness) usefulForMerging(keys []PathKey) int {
 // is useful only in the query's direction; any other is useful ascending.
 func (u *pathkeyUsefulness) rightMergeDirection(pk PathKey) bool {
 	for _, q := range u.queryPathkeys {
-		if exprEqual(q.Expr, pk.Expr) {
+		if u.equalKeyed(q.Expr, pk.Expr) {
 			return q.SortAsc == pk.SortAsc
 		}
 	}
@@ -236,12 +315,16 @@ func (u *pathkeyUsefulness) equivalentWithin(a, b Expr) bool {
 	if u == nil || len(u.classMembers) == 0 {
 		return false
 	}
+	ka, oka := u.keyOf(a)
+	kb, okb := u.keyOf(b)
 	ida, idb := -1, -1
-	for _, m := range u.classMembers {
-		if ida < 0 && exprEqual(m.expr, a) {
+	for i := range u.classMembers {
+		m := &u.classMembers[i]
+		mk, mok := u.memberKey(m)
+		if ida < 0 && exprEqualKeyed(m.expr, mk, mok, a, ka, oka) {
 			ida = m.id
 		}
-		if idb < 0 && exprEqual(m.expr, b) {
+		if idb < 0 && exprEqualKeyed(m.expr, mk, mok, b, kb, okb) {
 			idb = m.id
 		}
 	}
