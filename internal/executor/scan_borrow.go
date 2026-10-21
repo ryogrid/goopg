@@ -66,11 +66,19 @@ func aggregateBorrowsScanRows(agg *optimizer.Aggregate) bool {
 //     probe row emits build rows only (PG's HJ_FILL_INNER_TUPLES).
 //
 // Anything else stops the descent, a Filter included (its batch path reads
-// ahead). TPC-H Q17's lineitem probe, Aggregate → Hash Join → Project → Seq
+// ahead). A Gather ends it too, after marking its leader tree (see
+// gatherOp.borrowLeader).
+//
+// Besides a borrowing aggregate, two roots start a descent: a hash join's
+// build side (joinBorrowBuildChild) and a Gather worker's tree
+// (gatherOp.runWorker), each of which copies every row it keeps. TPC-H Q17's lineitem probe, Aggregate → Hash Join → Project → Seq
 // Scan, cloned all 6M rows because the borrow reached only a scan directly
 // under the aggregate; TPC-H Q13's orders probe under a Hash Right Join
 // cloned its 1.5M rows because the descent stopped at the RIGHT join.
 func markScanBorrowChain(op Operator) {
+	if scanBorrowDisabled {
+		return
+	}
 	for op != nil {
 		if io, ok := op.(*instrumentedOp); ok {
 			op = io.inner
@@ -84,10 +92,34 @@ func markScanBorrowChain(op Operator) {
 			op = o.child
 		case *joinOp:
 			op = joinBorrowProbeChild(o)
+		case *gatherOp:
+			// The leader's own rows pass straight up (gatherOp.Next); worker
+			// rows are copied before they are queued either way.
+			o.borrowLeader = true
+			return
 		default:
 			return
 		}
 	}
+}
+
+// joinBorrowBuildChild is the build-side child of a non-lateral hash join,
+// or nil. Every build loop copies each row it keeps before pulling the next
+// one: retainBuildRow re-homes arena payloads into the join's build arena
+// (buildLoopLeft / buildLoopRight, which Parallel Hash participants also run),
+// and the FOR UPDATE build clones in drainRowsCtxCTID. So the build side is a
+// borrow root of its own, whatever sits above the join — PG's
+// ExecHashTableInsert likewise copies the slot into the hash table
+// (ExecFetchSlotMinimalTuple + memcpy). TPC-H Q10 and Q21 cloned every
+// lineitem row that fed a Parallel Hash this way.
+func joinBorrowBuildChild(o *joinOp) Operator {
+	if joinBorrowProbeChild(o) == nil {
+		return nil
+	}
+	if o.hashBuildIsLeft() {
+		return o.left
+	}
+	return o.right
 }
 
 // joinBorrowProbeChild is the probe-side child of a hash join that passes its

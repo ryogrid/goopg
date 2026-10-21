@@ -357,3 +357,64 @@ integer or a `numeric`. Neither direction can lose a match:
 - Q13's remaining string-map cost is the aggregate's group key (`mapaccess2_faststr` ~5 %), which still keys a
   numeric group column by string.
 - The packed multi-key lane (`execKeyPackInt`) still admits machine integers only.
+
+## Slice 23 (2026-10-21): two more borrow roots — a hash join's build side and a Gather worker's tree — TPC-H Q10, Q21
+
+**Cause.** Q21 and Q10 were the largest unprofiled gaps (1.20 / 0.53 s and 1.20 / 0.62 s after slice 22). Both
+were led by the seq scan's per-row clone:
+
+- Q21: `cloneRowOwnedPrefix` was 37 %, plus the span clearing it caused (`memclrNoHeapPointers`, 21 %);
+- Q10: `cloneRowOwnedPrefix` was 26 %.
+
+Their big lineitem scans sit under hash joins whose output feeds a (Parallel) Hash, or under a Gather. The borrow
+descent started only below a borrowing aggregate, so it never reached them.
+
+**Rule.** Two operators copy every row they keep before pulling the next one, so each is a borrow root of its own,
+whatever sits above it:
+
+- **A hash join's build side** (`joinBorrowBuildChild`, marked in `buildNode`'s Join arm). Every build path copies:
+  - `buildLoopLeft` / `buildLoopRight` keep rows through `retainBuildRow`, which re-homes arena payloads into the
+    join's build arena; Parallel Hash participants run these same loops;
+  - the FOR UPDATE build clones in `drainRowsCtxCTID`.
+
+  This is PG's `ExecHashTableInsert`, which copies the slot into the table.
+- **A Gather worker's tree** (`gatherOp.runWorker`). Each row goes through `transferRowForQueue` before the next is
+  pulled. That is a fresh row for a virtual slot (cloned when it holds arena data) and a clone for every other
+  slot kind.
+
+  The leader's own rows pass straight through `gatherOp.Next` uncopied, so the leader tree borrows only when the
+  Gather itself is reached by a borrowing descent (`gatherOp.borrowLeader`). That is defensive: a Sort above a
+  Gather materialises the rows it keeps anyway.
+
+`scanBorrowDisabled` now gates every root in `markScanBorrowChain`.
+
+**Pins:**
+
+- `TestScanBorrowBuildSideAndGatherWorkers`:
+  - a join under a Sort, where only the build-side scan borrows;
+  - the same join gathered over three workers.
+
+  Both tables span many pages with text in the per-page arena, tail poison is armed, and every result must equal
+  the cloning path's. Making `retainBuildRow` keep its input uncopied fails it. The test raises
+  `MinParallelTableScanBlocks`: the cooperative parallel build would otherwise rebuild the build subtree in its
+  own producers, and the borrowing scan would never run. A first version passed that mutation for exactly that
+  reason.
+- `TestScanBorrowThroughHashJoinProbe` and `TestScanBorrowThroughOuterHashJoinProbe` now expect the build side to
+  borrow too.
+
+**Measured.** HEAD `f24bff055` against the candidate, a fresh server per arm, interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q10 | ~1.70 | ~1.18 | −30 % |
+| Q21 | ~1.18 | ~1.03 | −13 % |
+
+- HEAD's 1.8–2.0 s second run of Q21 disappears; with `GOGC=off` the clones filled the heap.
+- Q13 and Q7 are unchanged across three interleaved rounds. A single full pass had suggested otherwise; that was
+  drift between passes.
+
+**Not done (ledgered):**
+
+- the cooperative parallel build's producer trees and GatherMerge workers do not borrow, though both copy each row
+  into their queue;
+- the `BuildFast` builder's join children are `opNodeOperator` wrappers, which the descent does not enter.

@@ -152,7 +152,8 @@ func borrowedScanTables(op Operator) []string {
 // TestScanBorrowThroughHashJoinProbe extends the borrow to TPC-H Q17's shape,
 // Aggregate → Hash Join → Project → Seq Scan (markScanBorrowChain): the probe
 // side's scan hands up its reused row through the join and the Projects; the
-// build side's scan, kept in the hash table, never borrows. With tail poison
+// build side's scan borrows too, as a root of its own: the build loop copies
+// every row it keeps (joinBorrowBuildChild, slice 23). With tail poison
 // armed, group keys and min/max taken from probe rows must survive every
 // page's arena reset, the join filter must read the right row, and every
 // result must equal the cloning path's.
@@ -176,8 +177,8 @@ func TestScanBorrowThroughHashJoinProbe(t *testing.T) {
 			t.Fatalf("%s: %v", q, err)
 		}
 		op := mustBuildDeform(t, plan)
-		if got := borrowedScanTables(op); strings.Join(got, ",") != "bp" {
-			t.Fatalf("%s: borrowing scans %v, want only the probe side bp\n%#v", q, got, plan)
+		if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+			t.Fatalf("%s: borrowing scans %v, want the probe side bp and the build side bd\n%#v", q, got, plan)
 		}
 		old := seqScanDeformPoison
 		seqScanDeformPoison = true
@@ -227,7 +228,7 @@ func hashJoins(op Operator) []*joinOp {
 // last probe row emits build rows (null-extended on the probe side) only. bd
 // has keys bp lacks, so the sweep emits rows; bp has keys bd lacks, so the
 // FULL join null-extends probe rows too. (RIGHT SEMI / RIGHT ANTI never emit
-// a probe row at all.) goopg never plans a FULL hash join
+// a probe row at all.) The build side bd borrows as its own root. goopg never plans a FULL hash join
 // (deferral ledger M0134-0037), so the FULL case retypes the planned RIGHT
 // join; both orientations are the same runtime (join_outer_fill.go). With
 // tail poison armed every result must equal the cloning path's.
@@ -271,8 +272,8 @@ func TestScanBorrowThroughOuterHashJoinProbe(t *testing.T) {
 				t.Fatalf("%s: %d hash joins, want one %v", c.sql, len(joins), c.planned)
 			}
 			joins[0].plan.Type = c.runAs // shared with plan: later builds see it
-			if got := borrowedScanTables(op); strings.Join(got, ",") != "bp" {
-				t.Fatalf("%s: borrowing scans %v, want only the probe side bp", c.sql, got)
+			if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+				t.Fatalf("%s: borrowing scans %v, want the probe side bp and the build side bd", c.sql, got)
 			}
 			old := seqScanDeformPoison
 			seqScanDeformPoison = true
@@ -291,5 +292,79 @@ func TestScanBorrowThroughOuterHashJoinProbe(t *testing.T) {
 				t.Fatalf("%s as FULL: no null-extended probe row in %v", c.sql, got)
 			}
 		})
+	}
+}
+
+// TestScanBorrowBuildSideAndGatherWorkers pins the two borrow roots that do
+// not need a borrowing aggregate above them (slice 23):
+//   - a hash join's build side (joinBorrowBuildChild): the build loop copies
+//     every row it keeps, so its scan borrows even under a Sort, which keeps
+//     rows and stops every other descent;
+//   - a Gather worker's tree (gatherOp.runWorker): each row is copied by
+//     transferRowForQueue before the next is pulled.
+//
+// Both tables span many pages with text in the per-page arena, so a row kept
+// past its page's reset would read stale bytes; tail poison is armed. Every
+// result must equal the cloning path's. Making retainBuildRow keep its input
+// uncopied fails the serial case. The leader-tree rule (gatherOp.borrowLeader:
+// the leader's rows pass through Gather uncopied, so its tree borrows only
+// under a borrowing chain) is defensive and not witnessed here: the Sort above
+// this Gather materialises every row it keeps.
+func TestScanBorrowBuildSideAndGatherWorkers(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 700, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, repeat(chr(97 + x % 26), 30 + x % 50) || '-' || x FROM generate_series(0, 1999) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	const q = "SELECT bd.label, bp.s, bp.n FROM bp JOIN bd ON bp.k = bd.k ORDER BY 1, 2"
+	// Keep the serial build loop: the cooperative parallel build rebuilds the
+	// build subtree in its own producers (parallelBuildEligible), so the
+	// borrowing scan of this tree would never run.
+	ctx.MinParallelTableScanBlocks = 1 << 40
+
+	plan, err := testPlanDeform(t, ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := mustBuildDeform(t, plan)
+	joins := hashJoins(op)
+	if len(joins) != 1 {
+		t.Fatalf("want one hash join, got %d", len(joins))
+	}
+	build := "bd"
+	if joins[0].hashBuildIsLeft() {
+		build = "bp"
+	}
+	if got := borrowedScanTables(op); strings.Join(got, ",") != build {
+		t.Fatalf("borrowing scans %v, want only the build side %s under the Sort", got, build)
+	}
+
+	run := func(gathered bool) []string {
+		t.Helper()
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		defer func() { seqScanDeformPoison = old }()
+		if gathered {
+			rows, ok := runJoinGathered(t, ctx, q, 3)
+			if !ok {
+				t.Fatal("no Gather in the plan")
+			}
+			return rows
+		}
+		return renderRows(runSQL(t, ctx, q))
+	}
+	for _, gathered := range []bool{false, true} {
+		got := run(gathered)
+		scanBorrowDisabled = true
+		want := run(gathered)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("gathered=%v: borrowed and cloned results differ (%d vs %d rows)", gathered, len(got), len(want))
+		}
+		if len(got) == 0 {
+			t.Fatalf("gathered=%v: no rows", gathered)
+		}
 	}
 }

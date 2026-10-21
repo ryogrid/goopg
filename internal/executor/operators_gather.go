@@ -78,6 +78,11 @@ type gatherOp struct {
 	// one worker. Injected so tests can drive the operator without a planner.
 	buildChild func(scope *instrumenter) (Operator, error)
 
+	// borrowLeader is set when Gather sits under a borrowing chain
+	// (markScanBorrowChain): the leader's own rows pass straight up, so its
+	// tree may borrow only then. Worker trees always may (markWorkerBorrow).
+	borrowLeader bool
+
 	group   *ParallelGroup
 	ch      chan rowBatch
 	workers []*Context
@@ -360,6 +365,9 @@ func (o *gatherOp) Open(ctx *Context) error {
 		if o.wantCTIDs {
 			markSortWantCTIDs(child)
 		}
+		if o.borrowLeader {
+			markScanBorrowChain(child)
+		}
 		// The leader takes blocks from the same allocator as the workers —
 		// it is a peer, not an extra full scan.
 		o.attachAll(child)
@@ -404,6 +412,10 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	if o.wantCTIDs {
 		markSortWantCTIDs(child)
 	}
+	// A worker hands each row to transferRowForQueue before pulling the next
+	// one, and that copies the row and its arena payloads (the queue is an
+	// ownership boundary), so the worker's tree may borrow.
+	markScanBorrowChain(child)
 	o.attachAll(child)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {

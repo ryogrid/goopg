@@ -1708,6 +1708,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       old big\-lane answer\)\. Q13 ~3\.24 → ~2\.93 s; TPC\-H warm pass total 18\.65 → 17\.29 s\.
     - Found while probing NaN keys: P0\-E9 \(seq scan drops numeric NaN/±Infinity rows\), filed with an S2
       escalation under "Manually discovered"\.
+  - **Slice 23 — a hash join's build side and a Gather worker's tree are borrow roots LANDED 2026\-10\-21.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025
+    PASS=99 PLAN\-SHAPE same=99, TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS\. Doc "Slice 23"\.
+    - Q21 cloneRowOwnedPrefix 37% \+ memclr 21%, Q10 26%: lineitem scans feeding a \(Parallel\) Hash or under a Gather
+      never got a borrow — the descent started only below a borrowing aggregate\.
+    - joinBorrowBuildChild: every build loop copies what it keeps \(retainBuildRow; drainRowsCtxCTID clones\)\.
+      gatherOp\.runWorker marks the worker tree \(transferRowForQueue copies\); the leader tree only under a
+      borrowing chain \(gatherOp\.borrowLeader\)\.
+    - Pin: TestScanBorrowBuildSideAndGatherWorkers \(fails with retainBuildRow uncopied; needs
+      MinParallelTableScanBlocks raised, else the cooperative build bypasses the borrowing scan\)\.
+    - Q10 ~1\.70 → ~1\.18 s \(−30%\), Q21 ~1\.18 → ~1\.03 s \(−13%\); Q13/Q7 unchanged \(interleaved A/B\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3577,6 +3588,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `f24bff055`** \(M0122\-0012 slice 22 changed internal/optimizer and internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

@@ -237,6 +237,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// impossible (it depends on `bound`, i.e. on everything above this
 		// join). See joinOp.deformLeftBound.
 		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+		markScanBorrowChain(joinBorrowBuildChild(jop))
 		return maybeInstrument(p, jop, scope), nil
 	case *optimizer.NestedLoopIndexJoin:
 		// EX1-02: the outer follows the left-side rule; inner rescans
