@@ -517,3 +517,43 @@ Resuming survivors from `MaxCols` instead of column 0 fails it: the poison fires
 - the last-column prefilter;
 - the double decode of a survivor's qual columns;
 - Q18's swing.
+
+## Slice 26 (2026-10-21): a memory context reuses the chunks its Reset emptied — TPC-H Q13
+
+**Cause.** In Q13's flat profile after slice 25, two costs stood out:
+
+- `mmgr.(*Context).Reset` cost 4 % flat, called once per page by the orders scan;
+- `growChunk` → `typedslicecopy` cost another 4.5 %.
+
+`growChunk` always inserted a new chunk after the head. It never reused the chunks a `Reset` had emptied. So the
+seq scan's per-page arena (`sctx`, reset at every block boundary) gained a chunk on every page whose decoded text
+overflowed one. Three things followed:
+
+- the chunk list grew for the whole scan, holding its memory until Close;
+- each `Reset` walked every chunk;
+- each insertion shifted the chunks after the head.
+
+PG's `AllocSetReset` keeps its keeper block and reuses its free lists for the next cycle.
+
+**Rule.**
+
+- Every chunk after the head is empty, because growth always moves the head to the chunk it adds and only `Reset`
+  moves it back. So `growChunk` takes the first empty standard-size chunk after the head and swaps it into the
+  next slot. The swap moves no live offset.
+- An oversized chunk (`n > cs`) is never reused for a small allocation. A second allocation in it could start past
+  `cs`, which the `chunkIdx*cs + start` offset encoding cannot express. An oversized allocation still gets a chunk
+  of its own.
+
+**Pin.** `TestResetReusesChunks` runs 50 reset cycles. Each cycle overflows three chunks, and every tenth cycle also
+makes an oversized allocation. Every offset must resolve to its own bytes, and the chunk list must stay bounded.
+Without the reuse it grows from 8 to 156 chunks.
+
+**Measured.** HEAD `493de93b5` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q13 | ~2.93 | ~2.70 | −8 % |
+| Q17 | ~2.55 | ~2.49 | −2 % |
+
+**Not done (ledgered):** oversized chunks are kept until Release. PG's `AllocSetReset` frees every block but the
+keeper.
