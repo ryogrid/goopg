@@ -573,3 +573,52 @@ The sf025 sweep's 99-query sum went from 173.9 s to 169.5 s.
   Project disappears, as in PG. Both are recorded in the deferral ledger.
 - **Parallel is slower than serial here.** The probe micro runs ~0.75 s with 3 workers against ~0.59 s serially.
   PG's Gather overhead is smaller (0.23 s parallel, 0.18 s serial).
+
+## Slice 36 (2026-10-22): a re-opened index probe keeps its decode buffer — TPC-H Q5/Q7/Q3, TPC-DS Q14
+
+**Cause.** The probe shape under Q14 is a parallel nested loop driving `item_pkey` probes; a standalone copy
+is `tmp/q14-micro.sql`. On that shape goopg spent ~2.5 core-seconds per run against PG's ~0.9. 22 % of the CPU
+was `runtime.mallocgc`, and 60 % of that came from `acquireRow` inside `indexScanOp.Next`.
+
+`lateralJoinStream` closes and re-opens the inner probe for every outer row. `indexScanOp.Close` dropped
+`scanRow`, so every probe allocated a fresh full-width row: 22 Datums, ~1 kB of pointerful memory. That cost
+4.1 s of a 30 s profile.
+
+Comparing against the serial run was misleading. With no parallel workers, both goopg and PG choose a hash join
+with item, so "parallel slower than serial" was a plan difference, not Gather overhead.
+
+**Rule.** `indexScanOp.Close` scrubs the deform poison but keeps the buffer, and so does its sibling
+`bitmapHeapScanOp.Close`. The returned slot already aliases `scanRow` until the next `Next`. A re-Open followed
+by `Next` is no different, so reuse across Close adds no aliasing the scan did not already have across rows. PG
+likewise keeps a scan node's slot for the node's lifetime: `ExecReScanIndexScan` does not free
+`ss_ScanTupleSlot`. Memoize copies the rows it caches (`operators_memoize.go`), so its cache is unaffected.
+
+**Pin.** `TestIndexScanKeepsScanRowAcrossReopen` checks two things:
+
+- after Close, the same buffer is still held;
+- re-opening the probe decodes into that buffer and returns the probe's own values.
+
+Restoring the old `o.scanRow = nil` fails it.
+
+**Measured.** Warm. TPC-H ran under `GOGC=100`, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| probe micro (parallel) | 0.71–0.90 | 0.50–0.56 |
+| TPC-DS Q14 | 16.82–17.09 | 15.84–16.15 |
+| TPC-H Q5 | 0.53–0.66 | 0.40 |
+| TPC-H Q7 | 0.70–0.85 | 0.59–0.61 |
+| TPC-H Q3 | 0.41–0.42 | 0.36–0.37 |
+| TPC-H total | 16.16–16.37 | 15.79–15.95 |
+
+The sf025 sweep's 99-query sum went from 169.5 s (slice 35) to 168.6 s.
+
+The usual `tmp/tpch-gap.sh` harness runs with `GOGC=off`, so its collections fire at GOMEMLIMIT. Under it, Q2
+showed 0.40 → 0.72 s on the candidate in both rounds. Under `GOGC=100` and in isolation, Q2 is unchanged
+(0.33–0.38 s and ~0.48 s): the collection was simply landing in Q2 instead of elsewhere.
+
+**Left.**
+
+- **`indexOnlyScanOp` still allocates a fresh output row per row** (`projectKeyVals` / `projectHeapRow`).
+- **`lateralJoinStream` clones every emitted pair.** That is `cloneRow(m.pair)`, 2.2 s on the micro.
+- **The probe shape is still ~2× PG's CPU.** Both items above are recorded in the deferral ledger.

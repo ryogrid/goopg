@@ -1353,11 +1353,19 @@ func (o *indexScanOp) Close() error {
 	o.skip = btreeSkipEnum{done: true}
 	o.hasLast = false
 	if o.scanRow != nil {
-		// EX1-02b: scrub tail poison before the pooled row is released so
-		// a poisoned buffer never leaks into a later flag-off scan.
+		// EX1-02b: scrub tail poison so a poisoned buffer never leaks into
+		// a later flag-off scan.
+		//
+		// The buffer itself is KEPT (M0122-0012 slice 36): a nested loop's
+		// inner probe is closed and re-opened for every outer row, and
+		// dropping it here made every probe allocate a fresh full-width row
+		// (4.1 s of 30 s CPU on TPC-DS Q14's item_pkey probe shape). The
+		// slot Next returns aliases scanRow until the next Next under the
+		// standard contract; a re-Open followed by Next is no different, so
+		// reuse across Close is the same aliasing the scan already has
+		// across rows. PG keeps a scan's slot for the node's life the same
+		// way (ExecReScanIndexScan does not free ss_ScanTupleSlot).
 		scrubDeformPoison(o.scanRow)
-		releaseRow(o.scanRow)
-		o.scanRow = nil
 	}
 	return nil
 }
