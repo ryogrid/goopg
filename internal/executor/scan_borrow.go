@@ -57,16 +57,19 @@ func aggregateBorrowsScanRows(agg *optimizer.Aggregate) bool {
 // Two operators pass rows through that way:
 //   - a Project evaluates its targets into its own reused row (projectOp.Next)
 //     and returns before pulling again;
-//   - a non-lateral inner, left, semi or anti hash join reads its probe side
-//     one row at a time. It holds only the prefetched first row (while it
-//     builds, with the probe child not advanced) and the current row (while it
-//     emits that row's matches); a row a spilling batch defers is deep-copied
-//     (spill.go). Its build side is kept in the hash table and never borrows.
+//   - a non-lateral hash join of any type reads its probe side one row at a
+//     time. It holds only the prefetched first row (while it builds, with the
+//     probe child not advanced) and the current row (while it emits that row's
+//     matches or its null-extended self); a row a spilling batch defers is
+//     deep-copied (spill.go). Its build side is kept in the hash table and
+//     never borrows, and the RIGHT / FULL / RIGHT ANTI sweep after the last
+//     probe row emits build rows only (PG's HJ_FILL_INNER_TUPLES).
 //
 // Anything else stops the descent, a Filter included (its batch path reads
 // ahead). TPC-H Q17's lineitem probe, Aggregate → Hash Join → Project → Seq
 // Scan, cloned all 6M rows because the borrow reached only a scan directly
-// under the aggregate.
+// under the aggregate; TPC-H Q13's orders probe under a Hash Right Join
+// cloned its 1.5M rows because the descent stopped at the RIGHT join.
 func markScanBorrowChain(op Operator) {
 	for op != nil {
 		if io, ok := op.(*instrumentedOp); ok {
@@ -88,18 +91,20 @@ func markScanBorrowChain(op Operator) {
 }
 
 // joinBorrowProbeChild is the probe-side child of a hash join that passes its
-// probe rows through without keeping them (markScanBorrowChain), or nil.
+// probe rows through without keeping them (markScanBorrowChain), or nil. The
+// probe is the side the lazy-hash runtime does not build (hashBuildIsLeft,
+// which forces semi/anti builds onto the right), not plan.BuildLeft's raw
+// value.
 func joinBorrowProbeChild(o *joinOp) Operator {
 	if o.plan == nil || o.plan.Algo != optimizer.JoinAlgoHash || o.plan.Lateral {
 		return nil
 	}
 	switch o.plan.Type {
-	case optimizer.JoinTypeInner:
-		if o.plan.BuildLeft {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull,
+		optimizer.JoinTypeSemi, optimizer.JoinTypeAnti, optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+		if o.hashBuildIsLeft() {
 			return o.right
 		}
-		return o.left
-	case optimizer.JoinTypeLeft, optimizer.JoinTypeSemi, optimizer.JoinTypeAnti:
 		return o.left
 	}
 	return nil

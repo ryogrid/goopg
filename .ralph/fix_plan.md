@@ -1654,6 +1654,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Pins: TestScanSkipMatchesFullDecode \(18 types, poison armed; fails with varlena sizes off by one\),
       TestPhysicalPGVarlenaSize\.
     - Q17 warm median ~3.5 s → ~2.95 s \(−16%, no overlap\); slices 17\-19 ~6.4 s → ~2.95 s; PG ~1.53 s\.
+  - **Slice 20 — the scan borrow reaches through right and full hash joins LANDED 2026\-10\-21.** Movement: none —
+    perf only. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE
+    same=99, TestPort\_RegressSuite PASS. Recon doc "Slice 20".
+    - Warm per\-query census after slice 19 \(goopg / PG, s\): Q13 3\.73/1\.50, Q12 1\.62/0\.47, Q18 4\.37/3\.39,
+      Q21 1\.35/0\.53, Q17 2\.49/1\.73, Q10 1\.29/0\.62; every other query within 0\.3 s\. Q13 was the largest gap\.
+    - Q13's orders probe under its Hash Right Join cloned all 1\.5M rows \(cloneRowOwned 27\.6% cum, span clearing 9%\):
+      joinBorrowProbeChild stopped at RIGHT/FULL\. It now admits every non\-lateral hash join type, probing the side
+      hashBuildIsLeft does not build\. Pin: TestScanBorrowThroughOuterHashJoinProbe \(RIGHT as planned, FULL retyped —
+      goopg never plans a FULL hash join, ledger M0134\-0037\)\.
+    - Q13 median ~4\.71 s → ~3\.43 s \(−27%, no overlap, 3 interleaved rounds\)\. Next lever: the numeric join key is
+      hashed as a canonical string \(mapaccess\*\_faststr ~21%\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3505,6 +3516,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `a9a9b1f55`** \(M0122\-0012 slice 18 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `2181e6060`** \(M0122\-0012 slice 19 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.

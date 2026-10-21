@@ -1,0 +1,237 @@
+# M0122-0012 — TPC-H scan pipeline slices (part 2 of the vector filter pipeline recon)
+
+Continues [0122-0012-vector-filter-pipeline-recon.md](0122-0012-vector-filter-pipeline-recon.md), which holds
+the decision record and slices 2–16. Split out on 2026-10-21 under the 800-line design-doc limit; the slice
+numbering is unchanged.
+
+## Slice 17 (2026-10-16): Projects fold their targets, lowered sublinks fold their Args — TPC-H Q17
+
+With Q1 at parity, the slice timed every TPC-H query on PG `:65432` (SELECT only) and warm on a private goopg clone.
+Q17 was furthest behind: 6.19 s against 1.53 s. Q13 (4.05 / 1.44), Q12 (1.64 / 0.44) and Q10 (1.57 / 0.63)
+followed. Q17's plan is PG's, node for node. In PG the lineitem seq scan under the Hash Join probe takes ~350 ms.
+In goopg, `decodeRowRangeInfo` (13.6 %) and `cloneRowOwned` (11 %) dominated, both under the probe's `projectOp`.
+
+A deform-bound trace (`deformBoundBelow` per node) showed the bound reset to full twice:
+
+- **At the Project between the Aggregate and the join, and at the probe Project over lineitem.** The EX1-02 rule
+  narrowed a non-identity Project only when its targets were bare and in column order, and only under a non-full
+  bound from above. HammerDB's lineitem column order (`l_shipdate, l_orderkey, l_discount, l_extendedprice, …`) makes
+  Q17's probe projection `(l_partkey, l_quantity, l_extendedprice)` reordered. So all 16 columns, including
+  `l_comment`, were deformed and cloned for 6M rows.
+- **At the join filter.** `l_quantity < (SubPlan 1)` contains a `SubqueryExpr`, which neither walker understood, so
+  both join sides went full.
+
+Fixes:
+
+- **Projects.** `projectOp.Next` and the op-tree `OpProject` evaluate only `Targets` against the child slot. So every
+  non-identity Project folds its targets alone, `deformFoldRefs(deformBoundNone, Targets...)`, whatever the parent
+  reads. That is PG's projection rule: `ExecCreateExprSetupSteps` (`execExpr.c`) sets `last_scan` to the highest
+  attnum in the target list and emits one `EEOP_SCAN_FETCHSOME`. Unknown target shapes still decline. The
+  identity arm is unchanged. `isOrderedBareProject` and `deformProjectThrough` were folded into the rule and
+  removed.
+- **Sublinks.** A param-lowered `SubqueryExpr` (`ParParam` set, D4.1) reads the outer row only through `Args`,
+  bound by `bindSubPlanParams`: the inner plan reads ParamExec slots, nothing is pushed on `OuterRows`, and the
+  cache key is the bound values. PG's `expr_setup_walker` likewise visits a SubPlan's `args`. Both walkers now fold
+  `Args` (`deformSublinkArgs`). An unlowered sublink still declines: it pushes the whole row and keys its cache by
+  every column (`subqueryCacheKey`).
+
+Pins: `TestScanDeformProjectThrough` (reordered, expression, const and full-parent shapes; unknown targets decline)
+and `TestScanDeformLoweredSublinkArgs` (both walkers, lowered and unlowered). Each fails under the mutation that
+restores the old behaviour.
+
+**Measured:** Q17 on a private TPC-H clone, three rounds, fresh server per arm, last four of five runs. The first
+of the four is still reading pages in:
+
+| round | HEAD `fccdebfc7` (ms) | candidate (ms) |
+|---|---|---|
+| 1 | 7861 / 6287 / 6581 / 6373 | 6678 / 4376 / 4376 / 4431 |
+| 2 | 8067 / 6300 / 6331 / 6425 | 5811 / 4390 / 4428 / 4459 |
+| 3 | 7867 / 6587 / 7278 / 6845 | 6322 / 4369 / 4438 / 4411 |
+
+That is a warm median of ~6400 → ~4400 ms, about −31 %, with no overlap among the warm runs. PG is ~1.53 s. What remains on Q17 is
+`projectOp.Next` and `cloneRowOwnedPrefix` on the probe side (~8 % each, now over the narrowed prefix) and page
+reads (`pageChecksumBlock` ~5 %).
+
+**Gates:** units, tpch-spotcheck, acceptance arm (values identical), sf025 PASS=99 PLAN-SHAPE same=99,
+`TestPort_RegressSuite`, and the `TestPort_Isolation*` family (narrowing now reaches many more scans, including
+under EPQ-rechecking row locks).
+
+## Slice 18 (2026-10-21): the scan borrow reaches through Projects and hash-join probes — TPC-H Q17
+
+After slice 17, the warm Q17 profile on a private clone was led by `cloneRowOwnedPrefix`: 22.6 % cumulative, all
+under the lineitem probe's `seqScanOp.Next`. That splits into the per-row full-width `acquireRow` (44 %) and
+`MaterializeArena` (15 %).
+
+The M0145-0008u borrow, where a scan hands up its reused row instead of a clone, applied only to a scan directly
+under a borrowing aggregate. Q17's probe chain is Aggregate → Project → Hash Join → Project → Seq Scan, so all 6M
+lineitem rows were cloned.
+
+**Rule (`markScanBorrowChain`, scan\_borrow.go).** It replaces the direct-child test under a borrowing aggregate.
+The borrow descends through operators that pass each row up before pulling the next and keep nothing of it. That is
+PG's slot discipline: a scan slot is valid until the next fetch, and a node that keeps a tuple copies it
+(`ExecMaterializeSlot`). Two kinds of operator qualify:
+
+- **A Project.** `projectOp.Next` evaluates its targets into its own reused row.
+- **The probe side of a non-lateral hash join** of type inner, left, semi or anti. The probe child is the right
+  one only for an inner join that builds on the left. The join holds two probe rows, each only while the probe
+  child is not advanced:
+  - the prefetched first row, while it builds;
+  - the current row, while it emits that row's matches.
+
+  A row that a spilling batch defers is deep-copied (spill.go). SubPlan cache keys are formatted strings, and
+  `SetParamExec` values are rebound before each use. The build side is kept in the hash table and never borrows.
+
+Everything else stops the descent: merge and nested-loop joins, lateral, right/full joins, and Filter (its batch
+path reads ahead).
+
+**Pin.** `TestScanBorrowThroughHashJoinProbe` runs four queries over a multi-page probe table whose text and big
+numerics live in the per-page arena: an inner join, a grouped join, a join with a filter reading both sides, and
+an EXISTS semi join. For each, with tail poison armed:
+
+- exactly the probe-side scan borrows;
+- group keys and min/max survive every arena reset;
+- every result equals the cloning path's (`scanBorrowDisabled`).
+
+**Measured.** Q17 on a private TPC-H clone, HEAD `b5832b221` against the candidate, a fresh server per arm, three
+interleaved rounds of five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 8.60 / 7.04 / 4.29 / 4.29 / 4.25 | 3.56 / 3.39 / 3.44 / 3.43 / 3.41 |
+| 2 | 8.55 / 7.03 / 4.22 / 4.30 / 4.36 | 3.59 / 3.44 / 3.42 / 3.48 / 3.42 |
+| 3 | 8.32 / 7.15 / 4.23 / 4.31 / 4.29 | 3.54 / 3.46 / 3.40 / 3.40 / 3.40 |
+
+- The warm median went from ~4.29 s to ~3.42 s (−20 %), with no overlap.
+- HEAD's first two runs per server (8.6 / 7.0 s) disappear: with `GOGC=off`, its per-row clones filled the heap
+  until the memory limit forced collection.
+- PG is ~1.53 s.
+- The acceptance sweep's single cold Q17 went 4.03 → 2.68 s. Its 22-query total went 30.2 → 26.7 s against the
+  slice-17 arm; that comparison is indicative only, as five days of other commits lie between the two arms.
+
+**Next lever.** Deform is now the largest cost on Q17's probe: `decodeRowRangeInfo` at 27 % cumulative, and
+`NumericInt64FromStoredPayload` at 9.6 %.
+
+**Not done (ledgered):**
+
+- The `BuildFast` builder (`buildRec`, the opnode tree) sets no borrow at all; only `buildNode` does.
+- Merge and nested-loop probe sides, and chains with a Filter between, still clone.
+
+## Slice 19 (2026-10-21): a scan under a Project walks past the columns nobody reads — TPC-H Q17
+
+After slice 18, deform led Q17's probe: `decodeRowRangeInfo` at 27 % cumulative. The lineitem probe's Project
+reads `l_extendedprice`, `l_quantity` and `l_partkey`. Under HammerDB's column order those are the 4th, 6th and
+8th columns, so the deform window is 8 columns and 5 of them were fully decoded for nothing: numerics converted to
+int64, a date, a `char`.
+
+PG's `slot_deform_heap_tuple` also walks every attribute before the last one it is asked for, because a heap tuple
+has no offset array. A by-reference value costs it only a pointer store, so an unread numeric costs PG nothing.
+
+**Rule.** For a non-identity Project directly over a seq scan (`markProjectScanReads`, in both the `buildNode` and
+`buildRec` arms), the scan records the set of columns its targets read (`deformScanReadSet`). It is built over
+`deformScanVisit`, the whitelist walker `deformScanRefs` now uses; an unknown target shape leaves the set nil.
+
+The Project evaluates only its targets against the scan's row, and the row leaves the scan through nothing else:
+no code outside `seqScanOp` reads `scanRow`. So every other column in the deform window is walked past undecoded.
+`colTypeInfo.skip` is set in Open, and only when the scan has no absorbed qual and no GiST/GIN SSI hook, the
+scan's own readers of the row.
+
+`skipAttrLen` measures a skipped value by goopg's physical encoding:
+
+- a varlena by its header (`physicalPGVarlenaSize`, which is VARSIZE\_ANY): the short form, or the 4-byte form,
+  compressed or not;
+- a by-value fixed type by its width.
+
+Anything else is decoded as before: an external TOAST pointer, a truncated value, or a fixed by-reference type
+such as uuid or interval.
+
+**Pins:**
+
+- `TestScanSkipMatchesFullDecode` builds an 18-column table spanning int2/4/8, numeric, text with NULLs, varchar,
+  char, date, timestamp, timestamptz, float4/8, bool, uuid, interval, bytea, and text stored compressed inline,
+  with a read column after every type. With tail poison armed, five projections must equal the full decode
+  (`scanSkipDisabled`). Making varlena sizes off by one fails it.
+- `TestPhysicalPGVarlenaSize` covers the header forms and the refusals.
+
+**Measured.** Q17, HEAD `a9a9b1f55` against the candidate, a fresh server per arm, three interleaved rounds of
+five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 4.34 / 3.49 / 3.53 / 3.64 / 3.68 | 3.37 / 3.03 / 2.89 / 3.00 / 3.13 |
+| 2 | 3.36 / 3.38 / 3.36 / 3.42 / 3.85 | 3.09 / 2.86 / 2.92 / 2.92 / 3.21 |
+| 3 | 3.47 / 3.42 / 3.54 / 3.66 / 3.66 | 3.00 / 2.90 / 2.94 / 2.93 / 3.18 |
+
+- The warm median went from ~3.5 s to ~2.95 s (−16 %), with no overlap.
+- Across slices 17–19 Q17 went from ~6.4 s to ~2.95 s. PG is ~1.53 s.
+- `decodeRowRangeInfo` fell from 27 % to 20 % cumulative, and the generic decoder left the top of the profile.
+
+**Next levers** on Q17: `projectOp.Next` flat (12 %), `pageChecksumBlock` (9 %), and
+`NumericInt64FromStoredPayload` for the three columns actually read (6.7 %).
+
+**Not done (ledgered).** The walk-past applies only to a Project directly over a qual-less seq scan. It does not
+cover:
+
+- scans with a qual, where the qual's columns join the read set;
+- consumers further up, through joins: a read set threaded like the deform bound;
+- index and bitmap scans.
+
+## Slice 20 (2026-10-21): the scan borrow reaches through right and full hash joins — TPC-H Q13
+
+**Choosing the target.** A warm per-query census after slice 19 (tpch-runner, second pass on a private clone,
+against the `:65432` reference; Q15 skipped) ranks the gap to PG by absolute seconds:
+
+| query | goopg (s) | PG (s) | gap (s) |
+|---|---|---|---|
+| Q13 | 3.73 | 1.50 | 2.23 |
+| Q12 | 1.62 | 0.47 | 1.15 |
+| Q18 | 4.37 | 3.39 | 0.98 |
+| Q21 | 1.35 | 0.53 | 0.82 |
+| Q17 | 2.49 | 1.73 | 0.76 |
+| Q10 | 1.29 | 0.62 | 0.67 |
+
+Every other query is within 0.3 s of PG.
+
+**Cause.** Q13's plan matches PG's: HashAggregate → Hash Right Join, with orders probing a hash of customer. Its
+profile was led by `cloneRowOwned` at 27.6 % cumulative, all under the orders scan's `seqScanOp.Next`. The span
+clearing that the per-row clones caused (`memclrNoHeapPointers` via `initHeapBits`) added 9 %.
+
+Slice 18's descent (`joinBorrowProbeChild`) stopped at the RIGHT join, so all 1.5M orders rows were cloned.
+
+**Rule.** The descent now admits a non-lateral hash join of any type. The probe child is the side the lazy-hash
+runtime does not build (`hashBuildIsLeft`, which forces semi and anti builds onto the right), not the raw
+`plan.BuildLeft`. A RIGHT or FULL join reads its probe side through the same loop as an inner join (`nextLazy`).
+It holds only the prefetched first row and the current row, and a null-extended unmatched probe row is emitted
+from the still-bound current row. The sweep after the last probe row emits build rows only: PG's
+`HJ_FILL_INNER_TUPLES`, null-extended on the probe side. RIGHT SEMI and RIGHT ANTI never emit a probe row.
+
+**Pin.** `TestScanBorrowThroughOuterHashJoinProbe` (scan\_borrow\_test.go):
+
+- it plans `bd LEFT JOIN bp`, which comes out as a Hash Right Join probing the multi-page `bp`, with keys
+  missing on both sides;
+- it runs that plan as planned, and again retyped as FULL, because goopg never plans a FULL hash join
+  (ledger M0134-0037 — PG 18.3 plans Hash Full Join for the same query; checked on a scratch PG);
+- for each, exactly the probe-side scan borrows, and with tail poison armed the results equal the cloning
+  path's.
+
+Restoring the old join-type list fails it.
+
+**Measured.** Q13, HEAD `2181e6060` against the candidate, a fresh server per arm, three interleaved rounds of
+five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 4.48 / 4.58 / 4.71 / 5.03 / 4.79 | 3.69 / 3.30 / 3.22 / 3.59 / 3.41 |
+| 2 | 4.57 / 4.82 / 4.52 / 4.50 / 4.72 | 3.82 / 3.41 / 3.48 / 3.35 / 3.37 |
+| 3 | 4.58 / 4.80 / 4.71 / 4.62 / 4.89 | 3.85 / 3.40 / 3.44 / 3.51 / 3.43 |
+
+- The median went from ~4.71 s to ~3.43 s (−27 %), with no overlap.
+- Five back-to-back runs on one server are slower than the census's second pass (3.73 s at HEAD); both arms ran
+  under the same conditions.
+- `cloneRowOwned` left the profile.
+
+**Next lever on Q13.** The hash probe keys a numeric `o_custkey` by its canonical string: `mapaccess1_faststr`
+(16 %) plus `mapaccess2_faststr` (4.7 %), split between the probe and `matchedStrBucket`'s RIGHT-join match
+bitmap. HammerDB declares the TPC-H keys `numeric`, so they never take the int64 bucket map.
+
+**Not done (ledgered):** the descent still stops at merge and nested-loop joins, Filter, and Sort, and the
+`BuildFast` builder sets no borrow (slice 18's row).

@@ -40,8 +40,13 @@ func TestAggregateBorrowsScanRowsWhitelist(t *testing.T) {
 // Datum.Int, which is meaningless for text and numeric cells).
 func sortedRowValues(t *testing.T, ctx *Context, sql string) []string {
 	t.Helper()
+	return sortedCells(runSQL(t, ctx, sql))
+}
+
+// sortedCells renders rows as comma-joined text cells, sorted.
+func sortedCells(rows []Row) []string {
 	var out []string
-	for _, r := range runSQL(t, ctx, sql) {
+	for _, r := range rows {
 		cells := make([]string, len(r))
 		for i, d := range r {
 			if d.IsNull() {
@@ -187,5 +192,104 @@ func TestScanBorrowThroughHashJoinProbe(t *testing.T) {
 		if len(got) == 0 {
 			t.Fatalf("%s: no rows", q)
 		}
+	}
+}
+
+// hashJoins lists the hash joins in a built tree.
+func hashJoins(op Operator) []*joinOp {
+	var out []*joinOp
+	var walk func(Operator)
+	walk = func(cur Operator) {
+		switch o := cur.(type) {
+		case *instrumentedOp:
+			walk(o.inner)
+		case *aggregateOp:
+			walk(o.child)
+		case *projectOp:
+			walk(o.child)
+		case *sortOp:
+			walk(o.child)
+		case *joinOp:
+			if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoHash {
+				out = append(out, o)
+			}
+			walk(o.left)
+			walk(o.right)
+		}
+	}
+	walk(op)
+	return out
+}
+
+// TestScanBorrowThroughOuterHashJoinProbe extends the borrow to TPC-H Q13's
+// shape, Aggregate → Hash Right Join → Seq Scan: a RIGHT or FULL hash join
+// streams its probe rows like an inner one, and the sweep after the
+// last probe row emits build rows (null-extended on the probe side) only. bd
+// has keys bp lacks, so the sweep emits rows; bp has keys bd lacks, so the
+// FULL join null-extends probe rows too. (RIGHT SEMI / RIGHT ANTI never emit
+// a probe row at all.) goopg never plans a FULL hash join
+// (deferral ledger M0134-0037), so the FULL case retypes the planned RIGHT
+// join; both orientations are the same runtime (join_outer_fill.go). With
+// tail poison armed every result must equal the cloning path's.
+func TestScanBorrowThroughOuterHashJoinProbe(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, 'dim-' || x FROM generate_series(10, 69) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	const rightSQL = "SELECT bd.label, bp.k, count(bp.i), max(bp.s), sum(bp.n) FROM bd LEFT JOIN bp ON bp.k = bd.k AND bp.s NOT LIKE '%B%' GROUP BY bd.label, bp.k"
+	run := func(plan optimizer.Node) []string {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := Run(op, ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sortedCells(rows)
+	}
+	for _, c := range []struct {
+		name, sql string
+		planned   optimizer.JoinType
+		runAs     optimizer.JoinType
+	}{
+		{"right", rightSQL, optimizer.JoinTypeRight, optimizer.JoinTypeRight},
+		{"full", rightSQL, optimizer.JoinTypeRight, optimizer.JoinTypeFull},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			plan, err := testPlanDeform(t, ctx, c.sql)
+			if err != nil {
+				t.Fatalf("%s: %v", c.sql, err)
+			}
+			op := mustBuildDeform(t, plan)
+			joins := hashJoins(op)
+			if len(joins) != 1 || joins[0].plan.Type != c.planned {
+				t.Fatalf("%s: %d hash joins, want one %v", c.sql, len(joins), c.planned)
+			}
+			joins[0].plan.Type = c.runAs // shared with plan: later builds see it
+			if got := borrowedScanTables(op); strings.Join(got, ",") != "bp" {
+				t.Fatalf("%s: borrowing scans %v, want only the probe side bp", c.sql, got)
+			}
+			old := seqScanDeformPoison
+			seqScanDeformPoison = true
+			got := run(plan)
+			seqScanDeformPoison = old
+			scanBorrowDisabled = true
+			want := run(plan)
+			scanBorrowDisabled = false
+			if strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("%s:\nborrowed %v\ncloned   %v", c.sql, got, want)
+			}
+			if len(got) == 0 {
+				t.Fatalf("%s: no rows", c.sql)
+			}
+			if c.runAs == optimizer.JoinTypeFull && !strings.Contains(strings.Join(got, "|"), "NULL,") {
+				t.Fatalf("%s as FULL: no null-extended probe row in %v", c.sql, got)
+			}
+		})
 	}
 }
