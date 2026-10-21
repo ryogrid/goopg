@@ -109,6 +109,93 @@ type pendingStep struct {
 // IsolationRunner executes an IsolationSpec against a live database.
 type IsolationRunner struct {
 	DSN string
+	// SetupTeardownGuard bounds one global setup or teardown block; zero
+	// means defaultSetupTeardownGuard. See setupTeardownGuard.
+	SetupTeardownGuard time.Duration
+}
+
+// defaultSetupTeardownGuard is the hang guard for a global setup or teardown
+// block (M-NIGHTLY AI-20261022-011400-001). isolationtester runs those with a
+// plain PQexec and no timeout, but it runs one spec at a time; the suite here
+// runs every spec in parallel on one shared cluster, so a setup or teardown
+// that waits forever (on a lock another spec's session holds) used to hang
+// the whole testport package until go test's 2 h timeout, with nothing to
+// say what it waited on. Past the guard the block is cancelled and the spec
+// fails with the server's pg_stat_activity and pg_locks at that moment. The
+// bound is far above any real setup: upstream's die limit for a step is
+// 2 * max_step_wait (720 s), and the slowest setup in the suite takes seconds.
+const defaultSetupTeardownGuard = 5 * time.Minute
+
+func (r *IsolationRunner) setupTeardownGuard() time.Duration {
+	if r.SetupTeardownGuard > 0 {
+		return r.SetupTeardownGuard
+	}
+	return defaultSetupTeardownGuard
+}
+
+// runGuarded runs fn under the setup/teardown guard. When the guard expires
+// it snapshots the server state FIRST — while the block is still waiting, so
+// the snapshot shows it and whatever it waits on — and only then cancels fn's
+// context. snapshot is empty when fn finished in time.
+func (r *IsolationRunner) runGuarded(ctx context.Context, db *sql.DB, fn func(context.Context)) (snapshot string, expired bool) {
+	gctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fired := make(chan struct{})
+	timer := time.AfterFunc(r.setupTeardownGuard(), func() {
+		snapshot = serverStateSnapshot(db)
+		cancel()
+		close(fired)
+	})
+	fn(gctx)
+	if timer.Stop() {
+		return "", false
+	}
+	<-fired
+	return snapshot, true
+}
+
+// serverStateSnapshot reports what the server's backends are doing and which
+// locks they hold or wait for, over a fresh connection — the evidence a
+// guard-expired setup or teardown needs. Errors are reported inline: the
+// snapshot is best effort and must not hide the guard failure itself.
+func serverStateSnapshot(db *sql.DB) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var b strings.Builder
+	for _, q := range []string{
+		"SELECT pid, state, wait_event_type, wait_event, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' ORDER BY pid",
+		"SELECT locktype, database, relation, mode, granted, pid FROM pg_locks ORDER BY granted, pid",
+	} {
+		fmt.Fprintf(&b, "-- %s\n", q)
+		rows, err := db.QueryContext(ctx, q)
+		if err != nil {
+			fmt.Fprintf(&b, "(%v)\n", err)
+			continue
+		}
+		cols, _ := rows.Columns()
+		vals := make([]sql.NullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				fmt.Fprintf(&b, "(%v)\n", err)
+				break
+			}
+			parts := make([]string, len(vals))
+			for i, v := range vals {
+				parts[i] = v.String
+				if !v.Valid {
+					parts[i] = "NULL"
+				}
+			}
+			b.WriteString(strings.Join(parts, " | "))
+			b.WriteByte('\n')
+		}
+		_ = rows.Close()
+	}
+	return b.String()
 }
 
 // RunSpec runs all permutations and returns output formatted like isolationtester.
@@ -198,7 +285,15 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 				if strings.TrimSpace(blk) == "" {
 					continue
 				}
-				out, errText := execConnSetupCapture(ctx, monitor, blk)
+				var out, errText string
+				snap, expired := r.runGuarded(ctx, db, func(gctx context.Context) {
+					out, errText = execConnSetupCapture(gctx, monitor, blk)
+				})
+				if expired {
+					_ = monitor.Close()
+					return "", fmt.Errorf("global setup (permutation %d) still running after the %s setup/teardown guard; server state:\n%s",
+						i, r.setupTeardownGuard(), snap)
+				}
 				if errText != "" {
 					_ = monitor.Close()
 					return "", fmt.Errorf("global setup (permutation %d): %s", i, errText)
@@ -219,11 +314,23 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		out, err := r.runPermutation(ctx, sc, spec, perm, permBlockers, setupResult)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
+		// A teardown error is ignored, as isolationtester ignores it ("don't
+		// exit on teardown failure"); a teardown still running past the guard
+		// fails the spec instead of hanging the suite.
 		if spec.TeardownSQL != "" {
 			monitor, _ := db.Conn(ctx)
 			if monitor != nil {
-				_ = execConn(ctx, monitor, spec.TeardownSQL)
+				snap, expired := r.runGuarded(ctx, db, func(tctx context.Context) {
+					_ = execConn(tctx, monitor, spec.TeardownSQL)
+				})
 				_ = monitor.Close()
+				if expired {
+					// This spec's sessions are still open (the deferred
+					// sc.close() runs after the return), so one holding the
+					// blocking lock shows in the snapshot.
+					return "", fmt.Errorf("global teardown (permutation %d) still running after the %s setup/teardown guard; server state:\n%s",
+						i, r.setupTeardownGuard(), snap)
+				}
 			}
 		}
 

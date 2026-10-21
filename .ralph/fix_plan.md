@@ -621,7 +621,7 @@ heuristic stays live.)
       output; it fails with a 5 s guard\.
     - Gates: testport/framework, TestPort\_Isolation\* 122/122 \(561\.7 s\), units, tpch\-spotcheck, sf025\.
   Movement: none — test\-harness fidelity — no plan instrument \(isolation runner timing only\)
-- [ ] testport/stage — stage testport FAILED: `go test` timed out after 2h0m0s in TestPort\_IsolationSuite \(AI\-20261022\-011400\-001; repro: `go test \-v \-timeout 120m \-run '^TestPort\_IsolationSuite$' \./internal/testport/`\)\.
+- [x] testport/stage — stage testport FAILED: `go test` timed out after 2h0m0s in TestPort\_IsolationSuite \(AI\-20261022\-011400\-001; repro: `go test \-v \-timeout 120m \-run '^TestPort\_IsolationSuite$' \./internal/testport/`\)\.
   - 2026\-10\-22 nightly at f39f376e9: specs alter\-table\-1 and partial\-index were each blocked 1h49m in a server query
     \(alter\-table\-1 in RunSpec→execConn, isolation\_runner\.go:225; partial\-index in its setup, execConnSetupCapture
     :201\)\. Host load was ~0\.2 while they waited, so the server was idle: a lock wait or lost wakeup, not a spinning query\.
@@ -630,6 +630,20 @@ heuristic stays live.)
   - Not reproduced: the two specs pass alone at HEAD b6e96eb84 \(17 s\), and the full TestPort\_Isolation\* family passed
     in this loop's gates at f39f376e9 and b6e96eb84 \(577 s, 770 s\)\. Next: rerun the full suite under the nightly's cgroup
     \(high=6G max=8G\) and, on a hang, capture the server's goroutine dump \(SIGQUIT\) and pg\_locks before the timeout\.
+  - **Done 2026\-10\-22 \(harness hang fixed; the underlying wait is not yet diagnosed\)\.** Design §"Follow\-up \(2026\-10\-22,
+    AI\-20261022\-011400\-001\)" of `docs/design/0100\-0149/m\-nightly\-isolation\-lock\-wait\-probe\.md`\.
+    - Re\-run at HEAD 043bddd4c under the nightly cgroup \(high=6G max=8G GOMEMLIMIT=5GiB\) with a stall watchdog:
+      TestPort\_IsolationSuite PASS in 127 s; no stall to capture\.
+    - Global setup/teardown now run under IsolationRunner\.SetupTeardownGuard \(5 min\): on expiry the runner snapshots
+      pg\_stat\_activity \+ pg\_locks, then cancels, and fails the spec with the snapshot\. A recurrence becomes one failed
+      spec with its blocker named, not a 2 h package timeout; the next nightly files it as a new AI item\.
+    - Pin: TestIsolationRunnerGuardsBlockedTeardown \(row\-lock\-blocked teardown, 3 s guard → error after 3\.2 s naming the
+      waiting teardown and its idle\-in\-transaction holder; ignoring the expiry fails it\)\.
+    - Found: goopg's pg\_locks shows no transactionid rows \(ledger\); LOCK TABLE \.\.\. ACCESS EXCLUSIVE in an open
+      transaction did not block another session's DROP TABLE in the pin's first draft\.
+    - Gates: testport/framework, TestPort\_Isolation\* \+ TestIsolationRunner\* \(612 s\), units, tpch\-spotcheck, acceptance arm,
+      sf025\.
+  Movement: none — test\-harness robustness — no plan instrument \(isolation runner hang guard\)
 - [x] testport/TestE2E\_FailoverPGtoGoopg — FAIL \(80\.49 s, async arm 50\.55 s\) \(AI\-20261021\-010544\-001; repro: `go test \-v \-run '^TestE2E\_FailoverPGtoGoopg$' \./internal/testport/`\)\.
   - 2026\-10\-21 nightly at e64b1bfe9: the async subtest's probe `SELECT count\(\*\) FROM public\.bench\_log WHERE client = \-999`
     stayed 0 for 30 s with the WAL receiver streaming; sync\_remote\_apply and sync\_on passed\. Not yet re\-run alone\.
@@ -3854,6 +3868,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `b6e96eb84`** \(M0122\-0012 slice 37 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `043bddd4c`** \(M0122\-0012 slice 38 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.

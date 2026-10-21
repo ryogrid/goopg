@@ -252,3 +252,46 @@ reached the 5 s window. With the guard:
 expected output was captured from PG 18.3's isolationtester. In the spec, s2u
 waits on s1's row lock and completes 6 s later with a lock\_timeout error.
 With a 5 s guard the test fails exactly as the nightly did.
+
+## Follow-up (2026-10-22, AI-20261022-011400-001): global setup and teardown get a hang guard
+
+**Symptom.** The 2026-10-22 nightly (sha f39f376e9) timed out the whole testport package after go test's 2 h
+limit. Two specs had been blocked for 1h49m on the shared suite cluster:
+
+- `alter-table-1` in its global teardown (`RunSpec` → `execConn`);
+- `partial-index` in its global setup (`execConnSetupCapture`).
+
+The host was idle the whole time, so this was a wait, not a spin. Nothing recorded what either block was
+waiting on. Neither reproduces on demand:
+
+- both specs pass alone in 17 s;
+- `TestPort_IsolationSuite` passes in 127 s under the nightly's own cgroup (high=6G, max=8G, GOMEMLIMIT=5GiB);
+- the whole `TestPort_Isolation*` family passed in the gates of three successive commits.
+
+**Why the runner hung with it.** isolationtester runs global setup and teardown with a plain `PQexec` and no
+timeout. Its only bounds are on steps: `max_step_wait` cancels a step, and twice that exits. Upstream runs one
+spec at a time, so a stuck block hangs one spec. This suite runs every spec in parallel on one shared cluster,
+so a setup or teardown waiting on a lock held by another spec's session stalls the whole package.
+
+**Rule.**
+
+- **Each global setup and teardown block runs under `IsolationRunner.SetupTeardownGuard`.** The default is
+  `defaultSetupTeardownGuard`, 5 min. That is far above any real setup; upstream's die limit for a step is
+  720 s.
+- **On expiry, `runGuarded` snapshots the server first, then cancels the block.** `serverStateSnapshot` reads
+  `pg_stat_activity` (non-idle backends) and `pg_locks` over a fresh connection. Taking it before the cancel
+  means it shows the waiting block, and the spec's own sessions are still open, so a session holding the
+  blocking lock shows too.
+- **The spec fails with that snapshot in its error.** A teardown that merely errors is still ignored, as
+  isolationtester ignores it; only a teardown still running at the guard fails the spec.
+
+**Pin.** `TestIsolationRunnerGuardsBlockedTeardown`. The test's own connection holds an uncommitted UPDATE of
+the row that `guard-blocked-teardown.spec`'s teardown updates. With a 3 s guard, `RunSpec` returns after
+~3.2 s, and its error names the guarded teardown. The snapshot shows the teardown as `active | Lock |
+transactionid`, and the holder as `idle in transaction`. Ignoring the guard's expiry fails the test.
+
+**Found while pinning.** goopg's `pg_locks` lists no `transactionid` rows. PG would show the holder's
+ExclusiveLock on its own xid, granted, and the waiter's ShareLock on it, not granted (`XactLockTableWait`);
+goopg exposes the wait only through `pg_stat_activity.wait_event`. This is recorded in the deferral ledger. A
+`LOCK TABLE … IN ACCESS EXCLUSIVE MODE` held in an open transaction did not block another session's `DROP
+TABLE` in this test either, so the pin uses a row-lock wait.
