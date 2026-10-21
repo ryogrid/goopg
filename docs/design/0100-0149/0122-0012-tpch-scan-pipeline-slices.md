@@ -709,3 +709,47 @@ must equal the full decode. Leaving the qual's columns out of the read set trips
 
 **Not done (ledgered):** the read set still comes only from a Project directly over the scan. A scan feeding a join
 decodes its whole deform window: the set-valued twin of the deform bound through joins.
+
+## Slice 30 (2026-10-21): a plain-string comparison compares in place — TPC-H Q10
+
+**Cause.** Q10's `l_returnflag = 'R'::bpchar` qual is a string comparison, so it misses `fastBinarySimple` and takes
+`evalFastBinaryApply` on every row (21 % of the profile):
+
+1. the ambiguous-text-shape check;
+2. a pg\_lsn sniff on both operands (`looksLikePgLSN`);
+3. the bpchar normalisation;
+4. `evalBinary` → `compareDatum`, whose string arm sniffs again for pg\_lsn shapes, UUID spellings and row/array
+   literals before it reaches `strings.Compare`.
+
+**Rule.** After the ambiguous-shape branch, a comparison of two `KindString` operands that are both
+`plainCompareString` compares in place: bpchar normalisation, then `strings.Compare`. A plain string is one no sniff
+can match:
+
+| sniff | needs | plain string excludes it by |
+|---|---|---|
+| `looksLikePgLSN` | a `/` | containing no `/` |
+| `isValidUUIDStr` | exactly 32, 36 or 38 bytes | being shorter than 32 bytes |
+| row / array comparison | a leading `(` or `{` | not starting with either |
+
+Trimming trailing blanks cannot make a plain string unplain. Every branch the old path took is therefore skipped,
+and the result equals `evalBinary`'s.
+
+**Pin.** `TestExprSiblingParityStringCompare` compares the compiled and interpreted twins:
+
+- 16 values, among them blank-padded, pg\_lsn-, UUID-, row- and array-shaped strings;
+- text, bpchar(3) and untyped operands, plus literals opposite a bpchar;
+- all six comparison operators.
+
+Two mutations fail it: skipping the bpchar normalisation (140 divergences), and dropping the guard (120 untyped
+divergences). Typed operands never reach the guard: the ambiguous-text-shape branch takes those shapes first.
+
+**Measured.** HEAD `c53226b14` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q10 | ~1.04 | ~0.95 | −9 % |
+| Q12 | — | — | unchanged; its strings go through the IN-list arm |
+
+**Not done (ledgered).** For untyped operands goopg decides by sniffing the value, where PG decides by the
+operand's type (`texteq`, `bpchareq`). Two equal UUIDs spelled differently compare equal as untyped strings in
+goopg.

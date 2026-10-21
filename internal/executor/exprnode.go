@@ -527,6 +527,26 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
 		return nil
 	}
+	// M0122-0012 slice 30: a comparison of two plain strings compares them
+	// in place. compareDatum's string arm sniffs values — pg_lsn shapes,
+	// UUIDs, row and array literals — before falling back to
+	// strings.Compare, and the pg_lsn check below runs first too; when
+	// neither string can match any sniff (plainCompareString) every one of
+	// those branches is skipped, so the result is strings.Compare of the
+	// bpchar-normalised operands, exactly what evalBinary would return.
+	// TPC-H Q10's `l_returnflag = 'R'` took the whole path per row.
+	if op.IsComparison() && left.Kind == KindString && right.Kind == KindString {
+		if ls, rs := left.StringValue(), right.StringValue(); plainCompareString(ls) && plainCompareString(rs) {
+			l, r := left, right
+			if lbp, rbp := int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])); lbp > 0 || rbp > 0 {
+				l, r = comparisonOperandsAsBpchar(op, l, r, lbp, rbp, n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+			}
+			if l.Kind == KindString && r.Kind == KindString {
+				*out = NewBoolDatum(cmpResult(op, strings.Compare(l.StringValue(), r.StringValue())))
+				return nil
+			}
+		}
+	}
 	// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 	if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
 		(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
@@ -602,6 +622,19 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 func fastBinarySimple(n *ExprNode, op parser.OpCode, left, right *Datum) bool {
 	return n.payload[16]&4 == 0 && left.Kind != KindString && right.Kind != KindString &&
 		op != parser.OpConcat && binary.LittleEndian.Uint64(n.payload[8:16]) == 0
+}
+
+// plainCompareString reports that s can match none of the value sniffs a
+// string comparison makes (compareDatum's KindString arm and
+// evalFastBinaryApply's pg_lsn check): looksLikePgLSN needs a '/',
+// isValidUUIDStr accepts only 32, 36 or 38 bytes, and the row / array
+// comparisons need a leading '(' or '{'. Trimming trailing blanks (the bpchar
+// normalisation) cannot make a plain string unplain.
+func plainCompareString(s string) bool {
+	if len(s) >= 32 || strings.IndexByte(s, '/') >= 0 {
+		return false
+	}
+	return len(s) == 0 || (s[0] != '(' && s[0] != '{')
 }
 
 // fastCompareDatum is compareDatum for the kind pairs whose ordering is a

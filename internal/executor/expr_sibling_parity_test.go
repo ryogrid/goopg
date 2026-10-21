@@ -676,3 +676,48 @@ func TestExprSiblingParityNilAndDegenerateNodes(t *testing.T) {
 		}
 	}
 }
+
+// TestExprSiblingParityStringCompare pins slice 30's in-place string compare
+// (evalFastBinaryApply → plainCompareString) against the interpreter. Plain
+// strings take the fast path; strings a value sniff can match — pg_lsn shapes
+// ('/'), UUID spellings (32/36/38 bytes), row and array literals — must
+// decline it and still agree. bpchar-typed sides (trailing blanks ignored),
+// text-typed sides (blanks significant) and untyped literals opposite a
+// bpchar all take part, as in TPC-H Q10's `l_returnflag = 'R'`.
+func TestExprSiblingParityStringCompare(t *testing.T) {
+	vals := []string{
+		"R", "R  ", "A", "", "  ", "abc", "abd",
+		"0/16B3748", "0/16B3700",
+		"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "A0EEBC999C0B4EF8BB6D6BB9BD380A11",
+		"(1,2)", "(01,2)", "{1,2}", "{01,2}",
+		"this string is longer than thirty-two bytes",
+	}
+	row := make(Row, len(vals))
+	for i, v := range vals {
+		row[i] = NewStringDatum(v)
+	}
+	bp := func(idx int) *optimizer.ColumnRef {
+		return &optimizer.ColumnRef{Index: idx, Name: fmt.Sprintf("c%d", idx), Type: catalog.Type{Name: "bpchar", Args: []int64{3}}}
+	}
+	lit := func(s string) optimizer.Expr { return &optimizer.StringConst{Value: s} }
+	var corpus []parityCase
+	for _, op := range []parser.OpCode{parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe} {
+		for i := range vals {
+			for j := range vals {
+				corpus = append(corpus,
+					parityCase{fmt.Sprintf("text %d op=%d %d", i, op, j), pbin(op, pcol(i, "text"), pcol(j, "text"))},
+					parityCase{fmt.Sprintf("bpchar %d op=%d %d", i, op, j), pbin(op, bp(i), bp(j))},
+					// Untyped operands skip the typed-text shape branch, so
+					// the value sniffs (and plainCompareString's guard) decide.
+					parityCase{fmt.Sprintf("untyped %d op=%d %d", i, op, j), pbin(op, pcol(i, ""), pcol(j, ""))},
+				)
+			}
+			corpus = append(corpus,
+				parityCase{fmt.Sprintf("bpchar %d op=%d lit R", i, op), pbin(op, bp(i), lit("R"))},
+				parityCase{fmt.Sprintf("bpchar %d op=%d lit 'R '", i, op), pbin(op, bp(i), lit("R "))},
+				parityCase{fmt.Sprintf("text %d op=%d lit R", i, op), pbin(op, pcol(i, "text"), lit("R"))},
+			)
+		}
+	}
+	checkParityCorpus(t, corpus, row)
+}
