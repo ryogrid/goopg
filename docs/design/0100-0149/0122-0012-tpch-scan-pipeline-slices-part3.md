@@ -456,3 +456,42 @@ skip scan probed on `inv_item_sk` (PG: 2185 loops, 898 676 index searches). 88 %
 leaves. goopg descends twice per prefix group (past the group, then to the next group's probe), where PG with
 skip support often descends once. The cursor also binary-searches every later leaf against its lower bound.
 Both are recorded in the deferral ledger.
+
+## Slice 34 (2026-10-21): a plain hash aggregate does not sort its output — TPC-DS Q23, TPC-H Q18/Q13
+
+**Cause.** After slice 33, TPC-DS Q23 was the largest SF0.25 ratio: ~8.7 s warm against PG's 2.0 s. Its
+`frequent_ss_items` CTE alone took ~3.5 s against PG's 0.40 s. It hash-aggregates 414 575 rows into 403 882
+groups. `aggregateOp.Open` then sorted the finished groups by their GROUP BY columns with `sort.SliceStable`
+over `compareDatumTyped`, which cost ~2.1 s.
+
+M0097-0117 added that sort when goopg had only hash aggregation and the regress expected output came from PG's
+sort-based GroupAggregate. Today the planner chooses Hashed or Sorted as PG does, and the plans match PG's. A
+HashAggregate therefore sits only where PG has one, and PG's `agg_retrieve_hash_table` (nodeAgg.c) returns
+groups in hash-table order. PG promises no order there; wherever one is needed, the planner puts a Sort above
+the aggregate.
+
+**Rule.** The output pre-sort is skipped for `AggStrategyHashed` without grouping sets. Groups come out in the
+order they were first seen. Sorted aggregates and every grouping-sets shape keep the per-set/rollup ordering
+code unchanged.
+
+**Pin.** No new unit test: what changed is the absence of an order nobody may rely on. The evidence is that
+every order-sensitive consumer still passes:
+
+- `TestPort_RegressSuite` and `TestPort_Isolation`;
+- the sf025 sweep, whose `ck` is an ORDERED sha256 over result rows: 61 ck-verified, CKMISMATCH=0;
+- the TPC-H acceptance arm: 24 labels match on values;
+- the `internal/executor` package, including `TestAggSortedHashParity`.
+
+**Measured.** Warm, interleaved HEAD/candidate:
+
+| query | HEAD (s) | candidate (s) | PG (s) |
+|---|---|---|---|
+| TPC-DS Q23 | 7.96–9.30 | 4.47–6.46 | 2.0 |
+| TPC-H Q18 | 4.16–4.18 | 3.58–3.60 | — |
+| TPC-H Q13 | 2.40–2.43 | 2.16–2.19 | — |
+| TPC-H total (21 queries) | 16.64–16.87 | 15.82–15.99 | — |
+
+**Left.** goopg's hash aggregate emits first-seen order, not PG's hash-table order. The two agree only on the
+set of rows. Where the input arrives through a Gather, the first-seen order also varies from run to run. PG's
+order is fixed by its hash values. Both are recorded in the deferral ledger. The Sorted-strategy final and
+partial modes still re-sort input that already arrives in group order.

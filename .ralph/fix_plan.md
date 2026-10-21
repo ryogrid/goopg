@@ -1856,6 +1856,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       finaltup re\-descent in walkLeaf \(PG \_bt\_advance\_array\_keys\)\. Q72 ~29 → ~8\.2 s \(PG 3\.4\); sweep 203 → 182 s\.
     - Pins: TestComparePGIndexTuplesWalkMatchesDeformFirst \(26 000 pairs vs the old algorithm; 3 mutations fail\);
       TestSkipScanLeafWalk exercised both jumps \(46 \+ 40\)\. Remaining Q72 gap ledgered \(two descents per group\)\.
+  - **Slice 34 — a plain hash aggregate does not sort its output LANDED 2026\-10\-21\.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\-verified, ordered
+    ck\) PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 3 "Slice 34"\.
+    - Q23's frequent\_ss\_items CTE \(404K groups\) spent ~2\.1 s in aggregateOp\.Open's M0097\-0117 output pre\-sort;
+      PG's agg\_retrieve\_hash\_table emits hash\-table order\. Skipped for AggStrategyHashed without grouping sets\.
+    - Q23 ~8\.7 → ~5\.5 s \(PG 2\.0\); TPC\-H Q18 4\.17 → 3\.59 s, Q13 2\.4 → 2\.17 s, total 16\.7 → 15\.9 s\.
+    - Next levers: Q23 remaining \(best\_ss\_customer ~1\.4 s vs PG 0\.78\), Q14 \(19\.5 vs PG 8\.5 s\), Q81 \(7\.8 vs 3\.8\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3782,6 +3789,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `59a326fc7`** \(M0122\-0012 slice 32 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `b24046088`** \(M0122\-0012 slice 33 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.

@@ -2954,7 +2954,12 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			sorted[pos] = o.rows[i]
 		}
 		o.rows = sorted
-	} else if nGroupCols > 0 {
+	} else if nGroupCols > 0 && !(o.plan.Strategy == optimizer.AggStrategyHashed && o.plan.GroupingSets == nil) {
+		// A plain hash aggregate emits its groups in hash-table order and
+		// promises no other (nodeAgg.c agg_retrieve_hash_table): the planner
+		// puts a Sort above it whenever an order is needed, so the pre-sort
+		// here is skipped for it. It cost TPC-DS Q23's 404 000-group
+		// frequent_ss_items CTE ~2.1 s of a ~3.5 s scan (M0122-0012 slice 34).
 		rowSets := emitted
 		idxOf := make([]int, len(o.rows))
 		for i := range idxOf {
