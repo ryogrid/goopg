@@ -467,6 +467,16 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// fastBinarySimple holds, every preamble branch of
 		// evalFastBinaryApply is a no-op, and what is left is exactly this.
 		if fastBinarySimple(n, op, &left, &right) {
+			// M0122-0012 slice 27: a comparison of two non-NULL values of
+			// one kind compares them in place (fastCompareDatum), skipping
+			// evalBinary's dispatch and compareDatum's cross-kind
+			// promotion — and, for date/timestamp, the time.Time each side
+			// was built into. Anything else takes evalBinary below.
+			if op.IsComparison() && !left.IsNull() && !right.IsNull() {
+				if c, ok := fastCompareDatum(&left, &right); ok {
+					return NewBoolDatum(cmpResult(op, c)), nil
+				}
+			}
 			result, err := evalBinary(op, left, right, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))), ctx)
 			if err != nil {
 				return Datum{}, err
@@ -592,6 +602,44 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 func fastBinarySimple(n *ExprNode, op parser.OpCode, left, right *Datum) bool {
 	return n.payload[16]&4 == 0 && left.Kind != KindString && right.Kind != KindString &&
 		op != parser.OpConcat && binary.LittleEndian.Uint64(n.payload[8:16]) == 0
+}
+
+// fastCompareDatum is compareDatum for the kind pairs whose ordering is a
+// plain integer compare, or ok=false. Each arm is exactly the arm compareDatum
+// reaches for that pair:
+//   - int / int: promoteCrossKind leaves equal kinds alone, and the KindInt
+//     arm compares Int;
+//   - time / time, neither a timetz (Scale == 0): the KindTime arm compares
+//     the instants, and Int is the instant's UnixNano — the ±infinity
+//     sentinels sit at the int64 extremes, so they order the same way;
+//   - numeric / numeric, both on the int64 lane: numericCmp, as compareDatum
+//     calls it.
+func fastCompareDatum(a, b *Datum) (int, bool) {
+	if a.Kind != b.Kind {
+		return 0, false
+	}
+	switch a.Kind {
+	case KindInt:
+	case KindTime:
+		if a.Scale != 0 || b.Scale != 0 {
+			return 0, false
+		}
+	case KindNumeric:
+		if isBigNumeric(*a) || isBigNumeric(*b) {
+			return 0, false
+		}
+		c, err := numericCmp(*a, *b)
+		return c, err == nil
+	default:
+		return 0, false
+	}
+	switch {
+	case a.Int < b.Int:
+		return -1, true
+	case a.Int > b.Int:
+		return 1, true
+	}
+	return 0, true
 }
 
 // fastIntOverflow is the int2/int4 overflow check shared by the per-row

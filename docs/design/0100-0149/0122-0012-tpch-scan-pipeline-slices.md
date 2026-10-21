@@ -557,3 +557,52 @@ Without the reuse it grows from 8 to 156 chunks.
 
 **Not done (ledgered):** oversized chunks are kept until Release. PG's `AllocSetReset` frees every block but the
 keeper.
+
+## Slice 27 (2026-10-21): a same-kind comparison compares in place — TPC-H Q6
+
+**Cause.** Q6 (0.48 s against PG's 0.24 s) is a filtered lineitem scan whose five-comparison qual dominated its
+profile:
+
+| function | flat | cumulative |
+|---|---|---|
+| `evalFastExpr` | 33 % | 56 % |
+| `evalBinary` | — | 22 % |
+| `compareDatum` | — | 16 % |
+
+`time.Unix` and `promoteCrossKind` showed up as well. Every comparison went `evalBinary` → `compareDatum` →
+`promoteCrossKind`, then a per-kind switch. For `date`/`timestamp`, that switch built a `time.Time` from each side
+before comparing two instants that are already UnixNano integers.
+
+**Rule.** Inside the compiled BinaryOp arm's existing simple-path gate (`fastBinarySimple`), a comparison of two
+non-NULL values of one kind goes through `fastCompareDatum`. Each of its arms is the arm `compareDatum` reaches
+for that pair:
+
+| pair | how it compares | why it matches `compareDatum` |
+|---|---|---|
+| int / int | `Int` | `promoteCrossKind` leaves equal kinds alone |
+| time / time, neither a timetz (`Scale == 0`) | `Int` | `Int` is UnixNano; the ±infinity sentinels sit at the int64 extremes and order the same way |
+| numeric / numeric on the int64 lane | `numericCmp` | the same call `compareDatum` makes |
+
+Every other pair, and any NULL, takes `evalBinary` as before.
+
+**Pin.** `TestFastCompareDatumMatchesCompareDatum` compares 18 values pairwise. They cover:
+
+- a date against a timestamp at the same instant and one nanosecond later;
+- the infinities;
+- timetz values whose UTC order differs from their local order;
+- numerics at mixed scales;
+- the big lane.
+
+Every decided pair must equal `compareDatum`, and every timetz, big-lane or mixed-kind pair must be declined.
+Comparing numerics by raw `Int` fails it.
+
+**Measured.** HEAD `7909e3796` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q6 | ~0.45 | ~0.31 | −30 %; PG 0.24 |
+| Q1 | — | — | within noise; its qual is a single date compare |
+
+**Not done (ledgered):** the recursive evaluation of column and constant leaves (`evalFastExpr` line 434 still
+carried the most flat time) remains. PG's `ExecInterpExpr` reads a scan Var and a Const through opcode steps, with
+no recursion.

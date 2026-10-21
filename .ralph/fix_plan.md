@@ -1745,6 +1745,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - growChunk now swaps the first empty standard\-size chunk after the head into place \(chunks after the head are
       always empty\); oversized chunks are never reused for small allocations \(offset encoding\)\. Pin:
       TestResetReusesChunks \(8 → 156 chunks without the reuse\)\. Q13 ~2\.93 → ~2\.70 s, Q17 ~2\.55 → ~2\.49 s\.
+  - **Slice 27 — a same\-kind comparison compares in place LANDED 2026\-10\-21.** Movement: none — perf only\. The S3
+    instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS\. Doc "Slice 27"\.
+    - Q6's qual: evalFastExpr 33% flat, evalBinary 22% and compareDatum 16% cum; date/timestamp compares built a
+      time\.Time per side\. fastCompareDatum \(int/int, time/time with Scale 0, int64\-lane numeric/numeric\)
+      runs inside the fastBinarySimple gate after the NULL check; every other pair takes evalBinary\.
+    - Pin: TestFastCompareDatumMatchesCompareDatum \(18 values pairwise vs compareDatum; raw\-Int numeric compare
+      fails it\)\. Q6 ~0\.45 → ~0\.31 s \(PG 0\.24\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3630,6 +3638,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `493de93b5`** \(M0122\-0012 slice 25 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `7909e3796`** \(census reused: 7909e3796 touched only internal/utils/mmgr, not an S9 trigger path\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
