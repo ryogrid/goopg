@@ -495,3 +495,81 @@ every order-sensitive consumer still passes:
 set of rows. Where the input arrives through a Gather, the first-seen order also varies from run to run. PG's
 order is fixed by its hash values. Both are recorded in the deferral ledger. The Sorted-strategy final and
 partial modes still re-sort input that already arrives in group order.
+
+## Slice 35 (2026-10-21): a projection under an aggregate evaluates only what the aggregate reads — TPC-H Q3/Q5/Q13, TPC-DS Q14
+
+**Cause.** TPC-DS Q14 runs ~17.5 s warm against PG's 8.5 s. Its time sits in index probes: `store_sales_pkey`
+took 4.2 s for 16 173 loops returning 688 034 rows, where PG takes ~0.63 s. The probe deformed every heap
+column, with no narrowing at all.
+
+Above each probe the planner puts a **re-expansion Project**. It maps the join's narrowed output back to the
+coordinates of the aggregate's arms, so it names every join column: 74 or 85 targets. Two things followed:
+
+- **The deform walk counted every target as read.** It folds every Project target, so all join columns counted
+  as consumers and every probe below deformed in full.
+- **`projectOp` evaluated all of them.** It did so on every row, and the GroupAggregate's Sort then stored
+  ~4 kB per row (83 MB for 21 135 rows).
+
+PG never builds dead targets: a node's targetlist holds only what its parent needs.
+
+**Rule.**
+
+- **A consumer-complete parent builds the projection itself.** A plain or partial Aggregate qualifies, because
+  its arms (`aggConsumerExprs`) are the only readers of its child's rows. Down a chain of Sorts and
+  IncrementalSorts that stays true once their keys join the consumers. `buildCompleteChild` walks that chain and
+  builds the Project through `buildProjectNode` with a live set (`projectLiveSet`).
+- **`projectOp` evaluates only the live targets.** A dead target's cell is set once at Open, to NULL (or to the
+  deform poison when that is armed). Only live targets fold into the child's bound (`deformProjectBelow`).
+- **A dead target is skipped only when that is safe.** It must be a column reference or a plain constant.
+  Anything else (a cast, a call, an operator) stays live. A consumer the visitor cannot enumerate, or a
+  reference outside the list, keeps every target.
+- **Every other parent keeps every target live.** That includes a Finalize aggregate, which reads its child's
+  state columns without an arm. It also includes the root: the walk's root bound (None) is not a consumer
+  inventory, since a root Sort folds only its keys while the client reads every column. The slab twin
+  (`buildRec`/OpProject) has no consumer-complete parent, so it is unchanged.
+- **Lateral probe keys now fold into the outer's bound.** Narrowing exposed a gap in `deformJoinBounds`: a
+  LATERAL join's inner probe reads its keys from the outer row (`OuterColumnRef{Level: 1}`). When the probe has
+  absorbed the clause, no join Predicate repeats it, and nothing folded those keys into the outer's bound.
+  `deformLateralOuterRefs` folds them, plus any level-1 reference in the probe's Cond, through
+  `WalkExprHostScope`; it fails closed to full on a sublink or an expression kind it cannot enumerate. A
+  full-width projection above the outer had always masked this gap.
+
+**Pins.**
+
+- `TestProjectLiveSetUnderAggregate` covers six things:
+  - Aggregate → Sort → re-expansion Project evaluates exactly the arm and key targets, and the scan bound is
+    their fold (14 of 16);
+  - a partial aggregate behaves the same;
+  - a Final aggregate keeps every target;
+  - a root Sort keeps every target and the scan stays full;
+  - an operator target stays live even though it is dead.
+
+  Removing Sort from the chain fails it, and so does treating a Final aggregate as complete.
+- `TestDeformJoinBoundsFoldsLateralProbeKeys`: dropping the lateral fold gives left bound 0 instead of 2, and a
+  sublink in the Cond goes full.
+- `TestLateralProbeKeepsOuterKeyDeformed` is an SQL value check, run with poison armed.
+- The whole `internal/executor` package also passes with the deform poison armed globally.
+
+**Measured.** Warm, interleaved HEAD/candidate:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-H Q3 | 0.42–0.44 | 0.37–0.38 |
+| TPC-H Q5 | 0.44–0.45 | 0.39–0.41 |
+| TPC-H Q13 | 2.21–2.24 | 2.02–2.03 |
+| TPC-H total | 16.03–16.27 | 15.47–16.10 |
+| TPC-DS Q14 | 17.47–17.65 | 16.87–17.21 |
+| probe micro (serial) | ~0.592 | ~0.525 |
+
+The sf025 sweep's 99-query sum went from 173.9 s to 169.5 s.
+
+**Left.**
+
+- **Q14 moves only ~2.5 %.** The deform bound is a prefix. The arm coordinates interleave the tables, so the
+  live targets' refs still reach column 20 of 34 on catalog\_sales and web\_sales, and column 12 of 23 on one
+  store\_sales probe. Two store\_sales probes in statement 2 stay full.
+- **A real fix needs one of two designs:** a set-valued read set for index-scan heap fetches threaded through
+  joins, or a planner that remaps the aggregate's arms onto the narrowed join output so the re-expansion
+  Project disappears, as in PG. Both are recorded in the deferral ledger.
+- **Parallel is slower than serial here.** The probe micro runs ~0.75 s with 3 workers against ~0.59 s serially.
+  PG's Gather overhead is smaller (0.23 s parallel, 0.18 s serial).

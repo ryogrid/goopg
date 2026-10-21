@@ -1863,6 +1863,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       PG's agg\_retrieve\_hash\_table emits hash\-table order\. Skipped for AggStrategyHashed without grouping sets\.
     - Q23 ~8\.7 → ~5\.5 s \(PG 2\.0\); TPC\-H Q18 4\.17 → 3\.59 s, Q13 2\.4 → 2\.17 s, total 16\.7 → 15\.9 s\.
     - Next levers: Q23 remaining \(best\_ss\_customer ~1\.4 s vs PG 0\.78\), Q14 \(19\.5 vs PG 8\.5 s\), Q81 \(7\.8 vs 3\.8\)\.
+  - **Slice 35 — a projection under an aggregate evaluates only what the aggregate reads LANDED 2026\-10\-21\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025
+    PASS=99 \(61 ck\) PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS
+    with the deform poison armed globally\. Doc part 3 "Slice 35"\.
+    - The planner's re\-expansion Project \(74/85 targets mapping a narrowed join back to the aggregate's arm
+      coordinates\) made every join column a consumer: Q14's store\_sales\_pkey probes deformed all 23 columns\.
+    - Fix: buildCompleteChild \(plain/partial Aggregate → sorts → Project\) with projectLiveSet; projectOp skips dead
+      ColumnRef/constant targets; deformLateralOuterRefs folds lateral probe keys \(OuterColumnRef level 1\)\.
+    - TPC\-H Q3 −12 %, Q5 −10 %, Q13 −9 %; Q14 only −2\.5 % \(prefix bound still wide; ledgered\)\.
+    - Yield watch \(banner rule b\): slice 35's own target Q14 moved < 3 %; if slice 36 also moves its target < 3 %,
+      M0122\-0012 yields to M0147\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3794,6 +3805,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `b24046088`** \(M0122\-0012 slice 33 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `434b23349`** \(M0122\-0012 slice 34 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.

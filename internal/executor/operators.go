@@ -344,6 +344,10 @@ type projectOp struct {
 	// M0092-0007: stack-aliased slot reused across every Next()
 	// call so we don't allocate a fresh MaterializedSlot per row.
 	slot MaterializedSlot
+	// live marks the targets Next evaluates (projectLiveSet; nil = all of
+	// them). A dead target's cell is set once at Open — NULL, or the deform
+	// poison when armed — and never written again. M0122-0012 slice 35.
+	live []bool
 }
 
 func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
@@ -363,10 +367,22 @@ func (o *projectOp) Open(ctx *Context) error {
 	} else {
 		o.out = o.out[:len(o.targets)]
 	}
+	if len(o.live) != len(o.targets) {
+		o.live = nil
+	}
+	for i := range o.out {
+		if o.live != nil && !o.live[i] {
+			o.out[i] = NullDatum
+			if seqScanDeformPoison {
+				o.out[i] = deformPoisonDatum()
+			}
+		}
+	}
 	return o.child.Open(ctx)
 }
 func (o *projectOp) Schema() optimizer.Schema { return o.schema }
 func (o *projectOp) Close() error {
+	scrubDeformPoison(o.out)
 	releaseRow(o.out)
 	o.out = nil
 	return o.child.Close()
@@ -378,6 +394,9 @@ func (o *projectOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	for i, t := range o.targets {
+		if o.live != nil && !o.live[i] {
+			continue
+		}
 		v, err := evalExprSlot(t, inSlot, o.ctx)
 		if err != nil {
 			return nil, err
