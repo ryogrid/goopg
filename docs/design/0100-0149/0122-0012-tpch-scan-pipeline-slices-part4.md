@@ -214,3 +214,44 @@ Treat any single-query TPC-H delta below ~0.2 s as noise unless it repeats acros
 **Left.** `indexOnlyScanOp` still allocates its output row per row. The Q14 statement-level gap (16.0 s against
 PG's 8.5 s) now sits in the wide prefix deform of the fact-table probes (slice 35, ledgered) and in the descent
 itself.
+
+## Slice 38 (2026-10-22): a CTE scan returns one slot — TPC-DS Q81
+
+**Target, named up front:** TPC-DS Q81, ~7.8 s on an idle host (10–12 s under the nightly's load) against
+PG's 3.8 s.
+
+**Cause.** PG spends almost all of Q81 (4.6 s) in a correlated SubPlan over the `customer_total_return` CTE.
+It makes 6 893 calls, each scanning the 6 893-row CTE for `ctr1.ctr_state = ctr2.ctr_state` at ~0.58 ms per
+call. goopg runs the same plan, single-threaded. Its profile has 21 % in `SlotFromRow` called from
+`cteScanOp.Next`: a fresh `MaterializedSlot` was heap-allocated for every row of every rescan. PG's CteScan
+stores every tuple into its single `ss_ScanTupleSlot` (nodeCtescan.c `CteScanNext`).
+
+**Rule.** `cteScanOp` and its sibling `materializedCTEScanOp` keep one `MaterializedSlot` and re-point it at
+each cached row. The rows are the CTE cache's own and outlive the call. Only the slot is reused, under the same
+per-Next contract that the stack-aliased slots of `projectOp` and `indexScanOp` follow.
+
+**Pin.** `TestCTEScanReusesOneSlot` covers both CTE scan kinds:
+
+- the same slot comes back for every row;
+- it carries the cached row itself;
+- the values come back in order, followed by EOF.
+
+Restoring `SlotFromRow` fails it.
+
+**Measured.** Warm, two interleaved rounds of three:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q81 | 9.87–11.84 | 7.48–8.17 |
+
+The gain is ~30 %, more than the 21 % profile share, because GC pressure falls with the allocations. The sf025
+sweep's 99-query sum went from 168.2 s to 159.3 s, with Q81 at 7.5 s in the sweep. Plans are unchanged and the
+values match (61 checksum-verified).
+
+**Left.** The SubPlan's comparison still runs through the interpreted evaluator, because the compiled path does
+not take the `OuterColumnRef` operand. Each call:
+
+- lowercases both type names (`declaredBpcharTypmod`, `strings.ToLower`);
+- sniffs the string values for pg\_lsn / UUID / row shapes (`textShapeAmbiguous`).
+
+The sniffing is ledgered since slice 30, and the per-call lowercasing now has a row of its own.

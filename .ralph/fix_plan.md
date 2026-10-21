@@ -621,6 +621,15 @@ heuristic stays live.)
       output; it fails with a 5 s guard\.
     - Gates: testport/framework, TestPort\_Isolation\* 122/122 \(561\.7 s\), units, tpch\-spotcheck, sf025\.
   Movement: none — test\-harness fidelity — no plan instrument \(isolation runner timing only\)
+- [ ] testport/stage — stage testport FAILED: `go test` timed out after 2h0m0s in TestPort\_IsolationSuite \(AI\-20261022\-011400\-001; repro: `go test \-v \-timeout 120m \-run '^TestPort\_IsolationSuite$' \./internal/testport/`\)\.
+  - 2026\-10\-22 nightly at f39f376e9: specs alter\-table\-1 and partial\-index were each blocked 1h49m in a server query
+    \(alter\-table\-1 in RunSpec→execConn, isolation\_runner\.go:225; partial\-index in its setup, execConnSetupCapture
+    :201\)\. Host load was ~0\.2 while they waited, so the server was idle: a lock wait or lost wakeup, not a spinning query\.
+  - Nearby in the same run, deferred specs logged `DDL catalog sync: mirror catalogs to postgres db: mirror catalog 1259:
+    dst extend produced blk 69, expected 68` on the shared cluster — a candidate for the concurrent\-DDL interaction\.
+  - Not reproduced: the two specs pass alone at HEAD b6e96eb84 \(17 s\), and the full TestPort\_Isolation\* family passed
+    in this loop's gates at f39f376e9 and b6e96eb84 \(577 s, 770 s\)\. Next: rerun the full suite under the nightly's cgroup
+    \(high=6G max=8G\) and, on a hang, capture the server's goroutine dump \(SIGQUIT\) and pg\_locks before the timeout\.
 - [x] testport/TestE2E\_FailoverPGtoGoopg — FAIL \(80\.49 s, async arm 50\.55 s\) \(AI\-20261021\-010544\-001; repro: `go test \-v \-run '^TestE2E\_FailoverPGtoGoopg$' \./internal/testport/`\)\.
   - 2026\-10\-21 nightly at e64b1bfe9: the async subtest's probe `SELECT count\(\*\) FROM public\.bench\_log WHERE client = \-999`
     stayed 0 for 30 s with the WAL receiver streaming; sync\_remote\_apply and sync\_on passed\. Not yet re\-run alone\.
@@ -1888,6 +1897,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - markScanBorrowChain sets nlEmitBorrowed beside nlOuterBorrowed; both streaming nested loops then emit m\.pair
       instead of cloneRow\(m\.pair\)\. Named target probe micro 0\.50–0\.63 → 0\.40–0\.41 s \(−20 %\); Q14, TPC\-H flat\.
     - Erratum: slice 36's TPC\-H Q5/Q7 deltas are bimodal noise \(fresh HEAD Q5 0\.63 / 0\.39 s across two rounds\)\.
+  - **Slice 38 — a CTE scan returns one slot LANDED 2026\-10\-22\.** Movement: none — perf only\. The S3 instrument is
+    value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, TestPort\_RegressSuite
+    PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 4 "Slice 38"\.
+    - Named target TPC\-DS Q81: cteScanOp\.Next allocated a slot per row \(21 % of the correlated SubPlan's CTE rescans\);
+      both CTE scan ops now re\-point one slot \(PG CteScanNext / ss\_ScanTupleSlot\)\. Q81 9\.9–11\.8 → 7\.5–8\.2 s \(~−30 %\)\.
+    - sf025 sweep sum 168\.2 → 159\.3 s\. Remaining: interpreted OuterColumnRef comparison \(ledger row\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3834,6 +3849,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `f39f376e9`** \(M0122\-0012 slice 36 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `b6e96eb84`** \(M0122\-0012 slice 37 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.

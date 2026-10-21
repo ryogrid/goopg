@@ -289,6 +289,9 @@ type materializedCTEScanOp struct {
 	plan *optimizer.MaterializedCTEScan
 	rows [][]Datum
 	idx  int
+	// slot is the one slot Next returns, re-pointed at each row (the
+	// cteScanOp twin; M0122-0012 slice 38).
+	slot MaterializedSlot
 }
 
 func newMaterializedCTEScanOp(p *optimizer.MaterializedCTEScan) *materializedCTEScanOp {
@@ -315,6 +318,15 @@ type cteScanOp struct {
 	stable bool
 	rows   []Row
 	idx    int
+	// slot is the one slot Next returns, re-pointed at each cached row —
+	// PG's CteScan stores every tuple into its single ss_ScanTupleSlot
+	// (nodeCtescan.c CteScanNext). The rows themselves live in the CTE
+	// cache and outlive the call; only the slot is reused, under the
+	// standard per-Next contract the stack-aliased slots of projectOp and
+	// indexScanOp already follow. A fresh slot per row was 21 % of TPC-DS
+	// Q81's correlated SubPlan, which rescans its CTE once per outer row
+	// (M0122-0012 slice 38).
+	slot MaterializedSlot
 }
 
 func newCteScanOp(p *optimizer.CTEScan) (*cteScanOp, error) {
@@ -464,7 +476,8 @@ func (o *cteScanOp) Next() (TupleSlot, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return SlotFromRow(o.plan.Output(), row), nil
+	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
+	return &o.slot, nil
 }
 
 func (o *materializedCTEScanOp) Schema() optimizer.Schema { return o.plan.Output() }
@@ -496,5 +509,6 @@ func (o *materializedCTEScanOp) Next() (TupleSlot, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return SlotFromRow(o.plan.Output(), row), nil
+	o.slot = MaterializedSlot{schema: o.plan.Output(), row: row}
+	return &o.slot, nil
 }
