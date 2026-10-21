@@ -20,7 +20,7 @@ when the candidate:
       parity-closure sweep's purpose IS filing findings, and a `none`-
       streak of its routing sweeps must not freeze the supply. A listed
       root may not be flipped `[ ]` -> `[!]`; the owner de-lists it.
-  Rule B (lineage required): adds a task whose id matches M0137..M0146 or P0-
+  Rule B (lineage required): adds a task whose id matches M0137..M0147 or P0-
       without a `Parent:` line.
   Rule D (field hygiene — audit hole D): a NEWLY ADDED line may not
       (1) be a task's ONLY `Parent:` / `Movement: yes` declaration while
@@ -35,7 +35,7 @@ when the candidate:
           reshaping an existing entry is not the loop gaming it).
       (2) claim `Movement: yes` without citing one of S3's instruments on
           the SAME line — a `match` count, `CATEGORIES-EXCL-MATCH`,
-          `ea-ratchet`, or a `regress` suite diff count — together with a
+          `ea-ratchet`, a `regress` suite diff count, or (M0147) `lever-count` — together with a
           number. A non-conforming
           `Movement: yes` is additionally TREATED AS `none` for Rule A, so it
           cannot reset the lineage budget (three such lines in HEAD did).
@@ -113,15 +113,16 @@ PARENT_RE = re.compile(r"^\s*Parent:\s*`?([^\s`]+)`?")
 MOVE_RE = re.compile(r"^\s*Movement:\s*(\S+)")
 PARENT_INLINE_RE = re.compile(r"(?:^|\s)Parent:\s*`?([^\s`]+)`?")
 MOVE_INLINE_RE = re.compile(r"(?:^|\s)Movement:\s*(\S+)")
-NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-6])|P0-)")
+NEWID_RE = re.compile(r"^(M01(3[7-9]|4[0-7])|P0-)")
 # Rule D: `Movement: yes` must cite an instrument with a number on the SAME
 # line — a `match` count (this also covers CATEGORIES-EXCL-MATCH),
 # `ea-ratchet`, or a `regress` diff count (owner decision 2026-10-12:
 # regress-suite diff lines are a real measured instrument — correctness
 # families whose work moves only regress diffs were tripping Rule A as
-# structural `none`s).
+# structural `none`s). `lever-count` (scripts/lever-count.sh) is the M0147
+# lever-retirement instrument (owner decision 2026-10-21).
 MOVE_YES_RE = re.compile(r"(?:^|\s)Movement:\s*yes", re.I)
-INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b", re.I)
+INSTRUMENT_RE = re.compile(r"\bmatch\b|CATEGORIES-EXCL-MATCH|\bea-ratchet\b|\bregress\b|\blever-count\b", re.I)
 NUMBER_RE = re.compile(r"[0-9]")
 
 
@@ -319,7 +320,7 @@ def check(baseline, candidate):
         if NEWID_RE.match(t.id) and not t.has_parent:
             errs.append(
                 f"[B] new task {t.id} (line {t.line}) has no `Parent:` line. Every new "
-                f"M0137-M0146 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
+                f"M0137-M0147 / P0- task names the task that filed it (`Parent: <TASK-ID>`, "
                 f"or `Parent: none` for owner-filed tasks).")
 
     # Rule A
@@ -413,7 +414,7 @@ def check(baseline, candidate):
                 f"[D] task {t.id} (line {n}) claims `Movement: yes` without citing an "
                 f"instrument on the same line. `Movement: yes` must name one of S3's "
                 f"instruments WITH a number: a `match` count change, `CATEGORIES-EXCL-MATCH`, "
-                f"`ea-ratchet`, or a `regress` suite diff count "
+                f"`ea-ratchet`, a `regress` suite diff count, or `lever-count` "
                 f"(e.g. `Movement: yes — match 539 -> 530`). Until then it "
                 f"counts as `Movement: none` and does NOT reset the lineage budget. Line: "
                 f"{ln.strip()[:120]}")

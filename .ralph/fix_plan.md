@@ -236,8 +236,23 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (M0119 → M0122 → M0131 → M0134 → M0135/M0136 → M0095/M0110).
+    (M0119 → M0122-0012 → **M0147** → the rest of M0122 → M0131 → M0134 →
+    M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
+    **M0122-0012 outranks every M0147 task** (owner decision 2026-10-21) —
+    "M0122-0012" means its inline slices and any task with
+    `Parent: M0122-0012`. It is a living perf task, so it yields to M0147
+    only when (a) its entry and the baton name no runnable next slice (or
+    the named slice is blocked), or (b) its last TWO landed slices each
+    moved their own measured target (the target named in the slice's own
+    task entry before it landed) by less than 3% (diminishing returns).
+    Record the yield as the Skip-rationale token
+    `M0122-0012(yield: <a|b + evidence>)`; do not invent an M0122-0012 slice
+    to keep the priority, and re-check M0122-0012 first after each M0147
+    task closes. M0147 descendants inherit this rank — the S7
+    correctness-only carve-out does not demote them. **M0147-0000 is a
+    channel, not stock** (like M0146-0014): never select it; take its first
+    open child in file order (`M0147-0000(channel)`).
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
 the start of its own line: `Kind: recon|impl`, `Parent: <task-id|none>`, and on
@@ -254,7 +269,10 @@ that moved, e.g. `TPCH match 10→11`, `SF0.25 text-identical 25→26`,
 `test-only`, `instrument artefact — <why invisible>`, `parity held`,
 `correctness fix — no plan instrument`). Instrument-artefact `none`s name
 why the instruments cannot see the change (the LINEAGE-BASELINE pins show
-why this matters for S4's budget).
+why this matters for S4's budget). For M0147 lever-retirement tasks only,
+`lever-count` (`scripts/lever-count.sh`) is an instrument:
+`Movement: yes — lever-count 34→30 (census 22/22·99/99·99/99 held)`
+(owner decision 2026-10-21).
 
 FROZEN-PREFIXES:
 (empty — the M0142-0008 chain was UNFROZEN by owner decision 2026-09-20;
@@ -395,6 +413,31 @@ OWNER DECISIONS 2026-10-20 — TPC-DS corpora REBUILT for M0146-0216 slices 4+5:
   corpus were removed (re-run the gates).
 - M0146-0216: the owner gate is cleared; the loop re-censuses and closes it
   once its open child M0146-0236 is resolved.
+
+OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
+- Plan parity is complete on all three corpora (routing-20261021p: 22/22,
+  99/99, 99/99). The default-OFF and legacy `GOOPG_*` lever arms are now
+  retired by **M0147** (`docs/milestones/0147-lever-retirement.md`; section
+  `## M0147` at the end of this file), per AGENT.md C5 (promote or delete —
+  HOLD is not an outcome). Analysis and review:
+  `/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`.
+- Rank: item 10 — M0122-0012 first (with the yield rule there), then M0147,
+  then the rest of M0122.
+- Order inside M0147: phase 1 goopg-private retirements (0010–0017), then
+  phase 0 PG-port promotions (0020–0023; R3 — never discard a PG arm
+  without an owner `[!]`), then phase 2 (0030 recon files the default-ON
+  levers' OFF-arm slices).
+- Harness: AGENT.md's plan-parity range is now M0137–M0147 (also PROMPT.md
+  and the lineage guard's Rule B); `lever-count` added as an M0147
+  instrument (AGENT.md S3, lineage guard Rule D; `scripts/lever-count.sh`
+  is harness-protected). AGENT.md R6/B1 amended: deleting
+  `GOOPG_SORT_PACKED` is in scope; C4 amended: GATHER_PATHS `off`/`top` may
+  be retired.
+- M0146-0010a (Held) and M0147-0023 are the same flip; M0147-0023 is `[!]`
+  blocked-on M0146-0010a. Its release condition (Q4/Q11 `year_total` CTE
+  nested-loop estimates) may already hold now that SF0.25/SF1 are 99/99 —
+  the loop may re-measure it and, if PG's plans match at both scales, flip
+  M0146-0010a `[!]`→`[ ]` (owner authorisation recorded here).
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -6086,3 +6129,131 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
     - Gates: units, internal/postmaster, TestPort\_RegressSuite, TestPort\_Isolation\*, tpch\-spotcheck, acceptance
       arm \(values identical\), TPC\-H parity 22/22 \(plans unchanged\), sf025 PASS=99 same=99, tpcds\-fireset PASS\.
   Movement: yes — TPC\-DS SF1 match 98→99 \(Q72\)
+
+## M0147 — Lever retirement (filed 2026-10-21, owner decision)
+
+**Milestone doc:** `docs/milestones/0147-lever-retirement.md`. **Rank:** banner item 10 — M0122-0012 →
+**M0147** → the rest of M0122; **M0122-0012 (its inline slices and any task with `Parent: M0122-0012`)
+outranks every M0147 task** until it yields under the banner's item-10 rule (OWNER DECISIONS 2026-10-21).
+Basis: the 2026-10-21 lever census and its review
+(`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`).
+
+**Slice protocol (binding for every M0147 task — owner decision):**
+- One task per commit (M0147-0010's four probe switches share their files and retire together). Delete the
+  lever's read, the arm it selects that is being retired, the tests that only exercise that arm, and — if the
+  lever has a row in `internal/optimizer/flaglabels.go` — keep the row as `retired(<task id>)` and regenerate
+  `scripts/planner-flags.env` in the same commit (`TestFlagProvenanceEnvIsGenerated`).
+- Keep shared helpers: build first, then delete what the COMPILER reports unused (grep oversizes scope).
+- Inert proof (AGENT.md C6): the retired arm is unreachable on the shipped default — no gate, script or
+  env file sets the lever (ON-only arm), or the OFF arm is never reached with the lever unset.
+- Gates: units, `go test ./internal/postmaster/` when touched, TestPort_RegressSuite, TestPort_Isolation*,
+  tpch-spotcheck, acceptance arm (values identical), sf025 sweep PASS=99 **same=99**, tpcds-fireset
+  **fires=none**, and the S9 census unchanged (TPC-H 22/22, TPC-DS 99/99, 99/99). A retirement that moves
+  ANY plan or value broke a default path: stop and fix it, never re-pin.
+- M0147 is inside the plan-parity harness range (AGENT.md, now M0137–M0147): R, C3, C5 (promote or delete —
+  HOLD is not an outcome), C6, S3/S4, D and G rules bind it. R3: an arm whose ON side ports PG 18.3 logic is
+  promoted, never discarded, without an owner `[!]` decision.
+- Ledger: every ledger row / fix_plan task that names a retired lever gets a NEW resolution row (R7,
+  append-only) and a note on the task.
+- Movement: `Movement: yes — lever-count N→N-k (census 22/22·99/99·99/99 held)` from `scripts/lever-count.sh`
+  (34 at filing). A slice that retires no lever literal (stale comments only) closes `Movement: none`.
+- Keep list (never retired by M0147; excluded from lever-count): `GOOPG_ANALYZE_SEED`/`_SEED_CHILD`, the traces
+  (`PGSHAPED_DP_TRACE`, `NLI_CENSUS`, `GEQO_TRACE[_EVAL]`), `GOOPG_NLI_COSTGATE` (C-20f owner decision,
+  `docs/design/not_ralph/minimize_datum/TODO_ALL.md:2565`; the `legacy` arm stays), `GOOPG_WAL_ALLOW_EARLY_END`,
+  test-harness / profiling / assertion switches (milestone doc §Keep).
+- Order: file order below — phase 1 (0010–0017), then phase 0 (0020–0023), then phase 2 (0030 and the
+  children it files).
+
+- [ ] **M0147-0000 — Lever retirement root (tracking channel — NEVER selected)**
+  Kind: recon
+  Parent: none
+  - A channel, not stock (like M0146-0014): never select it; take its first open child in file order. Close it
+    only in the commit that closes its last child. Skip-rationale token: `M0147-0000(channel)`. Commit subjects
+    cite the child id, never M0147-0000.
+- [ ] **M0147-0010 — retire the S30.3 / S32.x probes: `GOOPG_PAGEIDENT_PROBE`, `GOOPG_S321_PROBE`, `GOOPG_S321_NOWAIT`, `GOOPG_S322_NOWAIT`**
+  Kind: impl
+  Parent: M0147-0000
+  - `internal/storage/pageident_probe.go`, `internal/executor/s321_probe.go` and their hooks (bufpool.go,
+    operators_storage.go), plus `analysis/pageident_probe.sh`. **Keep the pending-writer waits**: delete only the
+    `!s321NoWait &&` / `!s322NoWait &&` conjuncts at operators_storage.go ~5388/5413/6052/6070/6338/6361 —
+    NOWAIT=1 disabled a correctness fix. Resolves ledger row 1194 (new row). lever-count 34→30.
+- [ ] **M0147-0011 — retire `GOOPG_SORT_PACKED` (packed sort retention)**
+  Kind: impl
+  Parent: M0147-0000
+  - AGENT.md R6/B1 (amended 2026-10-21): no new packed retention; deleting this leftover arm is in scope.
+    `packUse` branches in operators.go; packedslot_test.go:657. Supersedes the packed part of M0141-S7-exec-d and
+    ledger row 2259 (new rows; note on M0141-S7-exec-d).
+- [ ] **M0147-0012 — retire `GOOPG_HEAP_PREFETCH_DEPTH`**
+  Kind: impl
+  Parent: M0147-0000
+  - Remove the prefetch window (`o.pf`) and its construction at operators_bitmap.go:554
+    (`newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())`) with `internal/executor/bitmap_prefetch.go`;
+    keep the storage-layer `Pool.StartRead` (reusable per `docs/design/not_ralph/minimize_datum/TODO_ALL.md:4144-4190`,
+    which records the measured NO-GO).
+- [ ] **M0147-0013 — retire `GOOPG_SCALAR_UNNEST` (correlated scalar-subquery decorrelation; PG never does it)**
+  Kind: impl
+  Parent: M0147-0000
+  - unnest.go `unnestSubquery` / `unnestScalarWithResiduals` and the inverse gates at sublinkjoinclause.go:155 and
+    local_filters.go:631; keep `collectUnnestParamsAndResiduals` (EXISTS path). Tests:
+    scalar_unnest_switch_test.go, executor/nl_semi_anti_join_test.go:119, cte_scalar_sublink_unnest_test.go:80 —
+    rebase any that pin the default arm onto PG's SubPlan expectation. Ledger row 2819 (new row).
+- [ ] **M0147-0014 — retire `GOOPG_HASH_OUTER_JOIN`**
+  Kind: impl
+  Parent: M0147-0000
+  - joincost.go:52; keep `costInnerHash`/`costInnerMerge` (default `chooseInnerJoinAlgo`). Neither arm is PG: the
+    post-search `chooseInner/OuterFillJoinAlgo` assignment (planner.go:4873-4887) is goopg-private — list it in
+    M0147-0030's phase-2 inventory.
+- [ ] **M0147-0015 — retire `GOOPG_FORCED_GC`**
+  Kind: impl
+  Parent: M0147-0000
+  - postmaster/dispatch.go `maybeForceGCAfterCommit` and forced_gc_flag_test.go; run `go test ./internal/postmaster/`
+    yourself (the units gate excludes it).
+- [ ] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
+  Kind: impl
+  Parent: M0147-0000
+  - relsize.go:69 (read, stored, never loaded; retired take2-P1-05), its setter and ~10 test call sites
+    (relsize_fallback_test.go, small_dimension_test.go, relsize_baserel_placement_test.go), the
+    `scripts/tpch-relsize-arm.sh:186` arm that still drives it, the uncalled `envFloatDefault` (cost_funcs.go:14);
+    stale comments relsize.go:55-61/:166, flaglabels.go:142/:162 (PG_SORT_RELATION_BYTES_COST and
+    INCREMENTAL_SORT are default ON), and the stale "default-OFF" GATHER_PATHS text in the M0140 section.
+- [ ] **M0147-0017 — retire `GOOPG_DISABLE_NLI` (the M0054-0006 nested-loop-index rollback switch)**
+  Kind: impl
+  Parent: M0147-0000
+  - cmd/goopg/main.go:299 and the `SetNLIEnabled` plumbing the switch reaches; keep the setter only if tests use it
+    to isolate a path and no PG-equivalent switch exists (`goopg.enable_nestloop_index` is the GUC route).
+- [ ] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
+  Kind: impl
+  Parent: M0147-0000
+  - First: trace whether the post-pass is still reached now that Gather comes from the search (C6 trace over the
+    full corpus). Unreachable: delete both arms. Reached: flip ON, run the gates, then delete the OFF arm. Never
+    delete the ON arm without an owner `[!]` (R3). Runtime is not a rejection reason (S9(5)(a)).
+- [ ] **M0147-0021 — promote `GOOPG_PG_HASH_TUPLE_SPILL_COST` (costsize.c initial_cost_hashjoin / nodeHash.c ExecChooseHashTableSize)**
+  Kind: impl
+  Parent: M0147-0000
+  - **C3 first**: ledger row 2188 warns the planner may charge less memory than the executor allocates — the
+    acceptance arm and the SF1 fire set must pass with the arm ON; a memory regression is NOT waived by
+    S9(5)(a). Keep `pgHashGeometry`/`pgHashSpillPages`. Retiring the lever changes `tracePGHashTupleGeometry`'s
+    PGSHAPED_DP_TRACE output — check the estimate-audit readers. On success delete the OFF arm; ledger 2188 new row.
+- [ ] **M0147-0022 — complete and promote `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`**
+  Kind: impl
+  Parent: M0147-0000
+  - The port is incomplete: add PG's per-key `get_expr_width` term (cost_memoize_rescan /
+    ExecEstimateCacheEntryOverheadBytes; ledger row 2189), then flip ON, run the gates, delete the OFF arm. Keep
+    `pgRelationByteSize`.
+- [!] **M0147-0023 — promote `GOOPG_NL_BARE_REEXEC` (PG ExecReScan semantics for a bare nested-loop inner)**
+  Kind: impl
+  Parent: M0147-0000
+  - blocked-on M0146-0010a (the same flip; Held, live blocker = the Q4/Q11 `year_total` CTE nested-loop estimates;
+    M0142-0008c-2 already landed). Closes as a pointer when M0146-0010a lands (then delete the attach-time compat
+    cache arm and the lever).
+- [ ] **M0147-0030 — phase 2 recon: default-ON levers' OFF arms (goopg-private legacy)**
+  Kind: recon
+  Parent: M0147-0000
+  - Inventory every default-ON lever left in `scripts/lever-count.sh --list` (MEMOIZE, PARALLEL, EXISTS_TO_ANY,
+    INDEXKEY_HARVEST, NARROW_*, PARTIAL_AGG_PATHS, PG_SORT_RELATION_BYTES_COST, INCREMENTAL_SORT,
+    COOP_JOIN_BUILD, HASHED_SUBPLAN, JOIN_SLOT_CHAIN, NL_MATERIALIZE_WORK_MEM, SCAN_PREFILTER, SUBPLAN_RESCAN,
+    GATHER_PATHS off/top) plus the goopg-private post-search join-algorithm assignment (M0147-0014 note).
+  - For each: what the OFF arm is, which tests flip it (e.g. `setPartialAggPathsModeForTest` ×36) and how those
+    tests rebase onto a PG oracle expectation or PG's own switch (e.g. `max_parallel_workers_per_gather=0`
+    instead of `GATHER_PATHS=off`; AGENT.md C4 amended 2026-10-21) before the arm goes.
+  - Files one impl child per lever (M0147-0031…, `Parent: M0147-0000`), lowest risk first; done when they exist.

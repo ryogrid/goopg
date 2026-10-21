@@ -448,7 +448,7 @@ If Go symbol operations fail:
   condition). Both always outrank `.ralph/working_set.md`'s "NEXT LOOP"
   note, which carries state, not priority — and any other document's rank
   statement is non-authoritative.
-- For M0137–M0146 and `P0-` tasks, §"Plan-parity harness" below is binding —
+- For M0137–M0147 and `P0-` tasks, §"Plan-parity harness" below is binding —
   read it before selecting one. **M-NIGHTLY filing is unconditional:** every
   loop reads `ci/logs/action-items.md` and files each new `## AI-` subject;
   its selection condition lives in the banner's Selection rules.
@@ -456,16 +456,16 @@ If Go symbol operations fail:
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
   is a hard requirement, not optional documentation. **Overridden for
-  M0137–M0146 only** — see §"Plan-parity harness" below, where the design doc is
+  M0137–M0147 only** — see §"Plan-parity harness" below, where the design doc is
   written when the task is *selected*.
 - For any non-trivial subsystem item, create/update the corresponding
   `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
   `docs/design/README.md`
   in the same loop and commit. (This same-loop indexing requirement is **not**
-  relaxed for M0137–M0146.)
+  relaxed for M0137–M0147.)
 - Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
   concrete `<id>-NNNN-*` filenames before implementation begins. **Overridden
-  for M0137–M0146 only**: the filename is reserved at task selection, not at
+  for M0137–M0147 only**: the filename is reserved at task selection, not at
   milestone filing.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
@@ -490,10 +490,10 @@ If Go symbol operations fail:
   done.
 
 <!-- PLAN-PARITY-HARNESS:BEGIN -->
-## Plan-parity harness (M0137–M0146) — binding
+## Plan-parity harness (M0137–M0147) — binding
 
 Sections R and G7 apply to **every** Ralph loop task. The rest applies to
-tasks in M0137–M0146 and `P0-` tasks. Where this section disagrees with other
+tasks in M0137–M0147 and `P0-` tasks. Where this section disagrees with other
 sections of this file, it wins for those tasks (including over
 `docs/milestones/README.md` step 2 and "reserve a design-doc filename before
 coding"). Rationale and history: `docs/design/0100-0149/plan-parity-harness-background.md`
@@ -573,7 +573,9 @@ overriding the ambient convention inside a canonical measurement.
 - **R8 Hygiene.** No directories at the repository root, no committed build
   artefacts, no `rNNN-*` directories.
 - **R6 Tuning is forbidden.** A constant chosen so an estimate or plan matches
-  PG is rejected. B1 (`minimize_datum`/packed retention) is NO-GO and out of scope.
+  PG is rejected. B1 (`minimize_datum`/packed retention) is NO-GO: no new
+  packed-retention work. Deleting its leftover arm (`GOOPG_SORT_PACKED`,
+  M0147-0011) is in scope (owner decision 2026-10-21).
 
 `RALPH_LOOP=1` hooks enforce R1, R2, R5 (`scripts/ralph-bash-guard.sh`,
 `.githooks/pre-commit`, `.githooks/commit-msg`). A hook denial is a rule, not an
@@ -593,8 +595,10 @@ remains below is filing/completion discipline, not rank.
   buried mid-sentence does not count and the guard rejects it.
   *Movement* = PG match count changed, or a `CATEGORIES-EXCL-MATCH:` category
   moved beyond ±3, or `make ea-ratchet` findings decreased, or a `regress`
-  suite's diff count moved (e.g. `regress join 14868 -> 14730`). `Movement: yes`
-  must cite one of those four instruments **with a number** on the same line;
+  suite's diff count moved (e.g. `regress join 14868 -> 14730`), or — for M0147
+  lever-retirement tasks only — `lever-count` decreased (`scripts/lever-count.sh`,
+  e.g. `lever-count 34 -> 33`). `Movement: yes`
+  must cite one of those instruments **with a number** on the same line;
   anything else (a unit test now passing, a feature now working) is
   `Movement: none` — real work, but not movement toward this goal.
 - **S4 Lineage budget.** After **5 consecutive** completed descendants of one
@@ -639,7 +643,9 @@ remains below is filing/completion discipline, not rank.
   absorption that lets the planner charge less than the executor needs must
   pass `scripts/tpch-acceptance-arm.sh` before landing. Not for C3/K63 display
   defects (repay those).
-- **C4** `GOOPG_GATHER_PATHS=all` stays default (B3).
+- **C4** `GOOPG_GATHER_PATHS=all` stays default (B3); its goopg-private `off`/`top`
+  arms may be retired by M0147 once their tests use `max_parallel_workers_per_gather=0`
+  (owner decision 2026-10-21).
 - **C5 Default-off arms.** A new default-off arm names, in the same commit, the
   task and measurement that decide it. It resolves to *promote* or *delete*;
   HOLD is not an outcome. At most ~4 at once.
@@ -668,7 +674,7 @@ Run on the change, in the task that changes production code:
   and never generalises one task's exception into a standing one; without a row,
   a blocked gate means: mark the task `[!]`, escalate, select elsewhere.
 - **G2** Gate scripts write `tmp/gate-stamps/<gate>.json` (tree hash, binary
-  sha256, result). `.githooks/commit-msg` rejects an M0137–M0146 planner/executor
+  sha256, result). `.githooks/commit-msg` rejects an M0137–M0147 planner/executor
   commit without matching PASS stamps and a `CATEGORIES-EXCL-MATCH:` line (or
   `PARITY: N/A — <reason>`).
 - **G3 Captures**: private clone + binary built from HEAD, never a shared
