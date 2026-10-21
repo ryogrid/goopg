@@ -1858,7 +1858,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       TestSkipScanLeafWalk exercised both jumps \(46 \+ 40\)\. Remaining Q72 gap ledgered \(two descents per group\)\.
   - **Slice 34 — a plain hash aggregate does not sort its output LANDED 2026\-10\-21\.** Movement: none — perf only\.
     The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\-verified, ordered
-    ck\) PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 3 "Slice 34"\.
+    ck\) PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 4 "Slice 34"\.
     - Q23's frequent\_ss\_items CTE \(404K groups\) spent ~2\.1 s in aggregateOp\.Open's M0097\-0117 output pre\-sort;
       PG's agg\_retrieve\_hash\_table emits hash\-table order\. Skipped for AggStrategyHashed without grouping sets\.
     - Q23 ~8\.7 → ~5\.5 s \(PG 2\.0\); TPC\-H Q18 4\.17 → 3\.59 s, Q13 2\.4 → 2\.17 s, total 16\.7 → 15\.9 s\.
@@ -1866,7 +1866,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - **Slice 35 — a projection under an aggregate evaluates only what the aggregate reads LANDED 2026\-10\-21\.**
     Movement: none — perf only\. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025
     PASS=99 \(61 ck\) PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS
-    with the deform poison armed globally\. Doc part 3 "Slice 35"\.
+    with the deform poison armed globally\. Doc part 4 "Slice 35"\.
     - The planner's re\-expansion Project \(74/85 targets mapping a narrowed join back to the aggregate's arm
       coordinates\) made every join column a consumer: Q14's store\_sales\_pkey probes deformed all 23 columns\.
     - Fix: buildCompleteChild \(plain/partial Aggregate → sorts → Project\) with projectLiveSet; projectOp skips dead
@@ -1876,7 +1876,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       M0122\-0012 yields to M0147\.
   - **Slice 36 — a re\-opened index probe keeps its decode buffer LANDED 2026\-10\-22\.** Movement: none — perf only\.
     The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
-    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 3 "Slice 36"\.
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 4 "Slice 36"\.
     - lateralJoinStream closes/re\-opens the inner per outer row; indexScanOp\.Close dropped scanRow, so every probe
       allocated a full\-width row \(4\.1 s of 30 s CPU\)\. Close now keeps it \(bitmapHeapScanOp too\)\.
     - Named target Q14: 16\.9 → 16\.0 s \(−5\.5 %, ≥ 3 %: no yield\)\. Probe micro −35 %, TPC\-H Q5 −30 %, Q7 −20 %\.
@@ -1884,7 +1884,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Next levers: lateral emit cloneRow \(2\.2 s on the micro\), IOS per\-row output allocation \(ledger row\)\.
   - **Slice 37 — a borrowed nested loop emits its pair buffer LANDED 2026\-10\-22\.** Movement: none — perf only\.
     The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
-    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 3 "Slice 37"\.
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 4 "Slice 37"\.
     - markScanBorrowChain sets nlEmitBorrowed beside nlOuterBorrowed; both streaming nested loops then emit m\.pair
       instead of cloneRow\(m\.pair\)\. Named target probe micro 0\.50–0\.63 → 0\.40–0\.41 s \(−20 %\); Q14, TPC\-H flat\.
     - Erratum: slice 36's TPC\-H Q5/Q7 deltas are bimodal noise \(fresh HEAD Q5 0\.63 / 0\.39 s across two rounds\)\.
