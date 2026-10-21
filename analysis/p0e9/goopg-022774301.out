@@ -1,0 +1,23 @@
+CREATE TABLE
+INSERT 0 6
+ count 
+-------
+     6
+(1 row)
+
+   t    |            n             
+--------+--------------------------
+ one    |                        1
+ onebig | 1.0000000000000000000000
+ two    |                        2
+(3 rows)
+
+CREATE TABLE
+INSERT 0 4
+   t    |   v   
+--------+-------
+ one    | m-one
+ onebig | m-one
+ two    | m-two
+(3 rows)
+

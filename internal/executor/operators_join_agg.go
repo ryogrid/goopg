@@ -865,7 +865,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// fixed-width int64 lane lives in join_composite_key.go), so a
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
-	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysTakeInt64Lane()
 
 	// EX3-02 Cut 1: stratum-B arena for this build, parented to the
 	// statement context. Covers the serial loops below and the cooperative
@@ -5552,7 +5552,13 @@ func datumToInt64Key(d Datum) (int64, bool) {
 		return d.Int, true
 	case KindNumeric:
 		if isBigNumeric(d) {
-			return 0, false // overflow lane: not representable as int64
+			// The big lane holds any mantissa past int64, which includes an
+			// integral value written with a long scale: 1.0000000000000000000000
+			// is mantissa 10^22, scale 22. Such a value must map to its int64,
+			// because an int64-lane probe treats "not representable" as "equals
+			// no build key" (nextLazy) — a numeric join key now starts in the
+			// int lane (HashKeysTakeInt64Lane).
+			return bigNumericInt64Key(numericMant(d), int(d.Scale))
 		}
 		m, s := d.NumericMantissaValue(), int(d.Scale)
 		for s > 0 && m%10 == 0 {
@@ -5565,6 +5571,27 @@ func datumToInt64Key(d Datum) (int64, bool) {
 		return 0, false // fractional numeric
 	}
 	return 0, false
+}
+
+// bigNumericInt64Key is datumToInt64Key for a big-lane mantissa: the value
+// m·10^-scale as an int64 when it is integral and in range.
+func bigNumericInt64Key(m *big.Int, scale int) (int64, bool) {
+	if scale > 0 {
+		ten := big.NewInt(10)
+		q, r := new(big.Int), new(big.Int)
+		for scale > 0 {
+			q.QuoRem(m, ten, r)
+			if r.Sign() != 0 {
+				return 0, false // fractional
+			}
+			m, q = q, m
+			scale--
+		}
+	}
+	if scale != 0 || !m.IsInt64() {
+		return 0, false
+	}
+	return m.Int64(), true
 }
 
 func datumKey(d Datum) string {

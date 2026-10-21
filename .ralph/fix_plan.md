@@ -651,6 +651,27 @@ heuristic stays live.)
       tpcds\-fireset PASS with no fires \(plans byte\-identical on both corpora\)\.
     - Left: viewPlanDepth is a process\-wide atomic view\-nesting guard \(ledger 2026\-10\-19\)\.
 
+- [ ] **P0\-E9 — a seq scan silently drops every row whose `numeric` column holds NaN or ±Infinity**
+  \(filed 2026\-10\-21 by the loop, M0122\-0012 slice 22 investigation; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro rows 3 → 6, PG 18\.3 returns 6\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-21 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e9/numeric\-special\-repro\.sql`; PG 18\.3 output
+    > `analysis/p0e9/pg18\.out`, goopg `022774301` output `analysis/p0e9/goopg\-022774301\.out`\.
+  - Symptom: `INSERT` of `'NaN'`, `'Infinity'`, `'\-Infinity'` into a `numeric` column succeeds and `count\(\*\)` counts
+    them \(6\), but `SELECT t, n FROM zn` returns 3 rows and an equi\-join on the column loses the NaN and Infinity
+    matches \(3 rows vs PG's 5\)\.
+  - Cause \(read, not yet proven by instrument\): the heap decode's numeric arm \(internal/executor/codec\.go, after
+    `nodes\.NumericInt64FromStoredPayload` declines a NUMERIC\_SPECIAL header\) falls through to `parseNumeric\(text\)`,
+    which cannot parse `NaN`/`Infinity`; the error makes `seqScanOp\.Next` `continue` past the tuple, the same
+    silent skip a decode error always takes there\. `count\(\*\)` deforms nothing, so it still counts the row\.
+  - First step: decode NUMERIC\_SPECIAL to the datum the executor uses for a numeric NaN/±Infinity literal \(check
+    what `'NaN'::numeric` evaluates to in evalCast\), then audit the silent `continue` on a decode error — PG raises
+    instead\. Then check numeric comparison, sort, hash keys \(datumToInt64Key must reject a special\) and
+    aggregates against PG\.
+  - Expected instrument: the repro identical to `analysis/p0e9/pg18\.out`; TPC\-H/TPC\-DS values unchanged\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -1676,6 +1697,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       items \+ bpchar metadata per statement in Context\.inListConsts \(PG folds it to a Const array\)\.
     - Pin: TestScanQualValueListIN \(7 IN quals vs their OR spelling, early on/off; fails caching a column\-item list
       and with the blanket decline\)\. Q12 warm median ~1\.61 s → ~0\.84 s \(−48%\); PG ~0\.47 s\.
+  - **Slice 22 — a numeric hash\-join key starts in the int64 lane LANDED 2026\-10\-21.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS, tpcds\-fireset PASS \(no changed plans\)\. Doc "Slice 22"\.
+    - HammerDB's TPC\-H keys are numeric; HashKeysAreInt64 admitted machine ints only, so every TPC\-H hash join keyed
+      a string map \(Q13 mapaccess\*\_faststr ~21%\)\. HashKeysTakeInt64Lane admits numeric; a non\-integral build key
+      demotes once \(demoteIntHash\); a probe miss means no match only because datumToInt64Key is now exact for the
+      big lane \(bigNumericInt64Key: 1\.0000000000000000000000 = 1\)\.
+    - Pins: TestBigNumericInt64KeyIsExact, TestNumericHashJoinIntLane \(8 joins vs hash off; fails 363/364 with the
+      old big\-lane answer\)\. Q13 ~3\.24 → ~2\.93 s; TPC\-H warm pass total 18\.65 → 17\.29 s\.
+    - Found while probing NaN keys: P0\-E9 \(seq scan drops numeric NaN/±Infinity rows\), filed with an S2
+      escalation under "Manually discovered"\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3537,6 +3569,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `54a37edcd`** \(M0122\-0012 slice 20 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `022774301`** \(M0122\-0012 slice 21 changed internal/optimizer and internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.

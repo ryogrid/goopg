@@ -295,3 +295,65 @@ five runs:
   `ExecEvalHashedScalarArrayOp`). goopg walks a long literal list linearly; it is now evaluated once, but still
   compared item by item.
 - A list of params or stable functions is still evaluated per row. PG folds params into a custom plan's Const.
+
+## Slice 22 (2026-10-21): a numeric hash-join key starts in the int64 lane — TPC-H Q13, Q17, Q18
+
+**Census.** After slice 21, a warm per-query pass (goopg / PG, s) ranks:
+
+| query | goopg (s) | PG (s) |
+|---|---|---|
+| Q13 | 2.96 | 1.50 |
+| Q18 | 4.26 | 3.39 |
+| Q21 | 1.30 | 0.53 |
+| Q10 | 1.27 | 0.62 |
+| Q17 | 2.27 | 1.73 |
+
+Q12 is down to 0.80 s against PG's 0.47 s.
+
+**Cause.** The lazy hash join has an int64 bucket lane (`lazyIntHash`, M0127-P0.3), chosen before the build from the
+plan's key types (`Join.HashKeysAreInt64`). It admitted only machine integers. Its comment excluded `numeric` on
+cost grounds: for numeric it is the values, not the type, that decide whether a key fits an int64.
+
+HammerDB declares every TPC-H key `numeric`, so every TPC-H hash join keyed a string map by the canonical numeric
+string. On Q13 that was `mapaccess1_faststr` plus `mapaccess2_faststr` at ~21 %, across the probe and the RIGHT
+join's match bitmap.
+
+**Rule.** `Join.HashKeysTakeInt64Lane` starts a single-key build in the int64 lane when each key is a machine
+integer or a `numeric`. Neither direction can lose a match:
+
+- **Build.** A build key that is not int64-representable (a fraction, a value past int64) demotes the table to the
+  string lane once (`demoteIntHash`), re-keying the rows filed so far under the identical canonical string. The
+  Parallel Hash merge already reconciles a participant that demoted (`parallel_hash_shared.go`).
+- **Probe.** A probe key that is not representable is treated as equal to no build key. That holds only if
+  `datumToInt64Key` maps every integral, in-range value of every numeric representation.
+
+  The small lane already did that. The big lane did not: `1.0000000000000000000000` (mantissa 10^22, scale 22)
+  answered "not representable" even though it equals 1. `bigNumericInt64Key` now strips the trailing zeros of the
+  big mantissa and maps the value. The batch router (`joinBatchHash`) and the packed composite lane key on the
+  same canonical bytes, so they stay consistent.
+
+**Pins:**
+
+- `TestBigNumericInt64KeyIsExact` covers `bigNumericInt64Key`.
+- `TestNumericHashJoinIntLane` runs eight numeric-keyed hash joins against the same queries with hash joins
+  disabled:
+  - the join types are inner, both left orientations, semi, anti, and `numeric = int4`;
+  - the keys are integral values at several scales (one past int64's mantissa), a fraction that demotes the
+    build, negatives, zero and NULL.
+
+  Restoring the big lane's old "not representable" answer drops the `1.0000000000000000000000` probe's match
+  (363 rows against 364).
+
+**Measured:**
+
+- Q13, HEAD `022774301` against the candidate, a fresh server per arm, three interleaved rounds of five runs: the
+  median went from ~3.24 s to ~2.93 s (−9 %), with no overlap in the warm runs.
+- The profile shows the int lane engaged: `mapaccess1_fast64` and `matchedIntBucket`.
+- A single warm pass over all queries went from 18.65 s to 17.29 s in total (−7 %): Q17 −0.39 s, Q18 −0.36 s, Q13
+  −0.20 s, Q21 −0.10 s.
+
+**Not done (ledgered):**
+
+- Q13's remaining string-map cost is the aggregate's group key (`mapaccess2_faststr` ~5 %), which still keys a
+  numeric group column by string.
+- The packed multi-key lane (`execKeyPackInt`) still admits machine integers only.
