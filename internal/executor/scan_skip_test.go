@@ -98,3 +98,67 @@ func TestPhysicalPGVarlenaSize(t *testing.T) {
 		t.Error("a truncated varlena was measured")
 	}
 }
+
+// TestScanPrefilterSkipMatchesFullDecode pins the prefilter's skipping first
+// pass (M0122-0012 slice 25): a qual judged early decodes only its own
+// columns of the prefix, stepping over the others by stored length
+// (prefilterSkipInfo), and a survivor is decoded again from column 0 so its
+// skipped cells never reach the Project. The quals read late columns after
+// every type in the table, the select lists read the skipped columns, and
+// tail poison is armed; each result must equal the result with the skip off
+// and with the early path off.
+func TestScanPrefilterSkipMatchesFullDecode(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, `CREATE TABLE skq (
+		i2 int2, i4 int4, i8 int8, n numeric, tx text, vc varchar(10), ch char(4),
+		d date, ts timestamp, tz timestamptz, f4 float4, f8 float8, b bool,
+		u uuid, iv interval, by bytea, big text, last int, flag char(1))`)
+	runSQL(t, ctx, `INSERT INTO skq SELECT
+		x::int2, x * 7, x::int8 * 100000000000, x::numeric * 123456789012345678901234567890,
+		CASE WHEN x % 5 = 0 THEN NULL ELSE 'text-' || x END, 'v' || (x % 100), 'c' || (x % 10),
+		('2020-01-' || (1 + x % 28))::date, ('2020-01-01 ' || (x % 24) || ':00:00')::timestamp,
+		('2020-01-01 ' || (x % 24) || ':30:00+00')::timestamptz, x / 3.0, x / 7.0, x % 2 = 0,
+		md5(x::text)::uuid, (x || ' days')::interval, decode(md5(x::text), 'hex'),
+		CASE WHEN x % 3 = 0 THEN repeat('compressible-', 400) ELSE 'short' || x END, x,
+		chr(65 + x % 4)
+		FROM generate_series(1, 2000) x`)
+	for _, q := range []string{
+		"SELECT i4, n, tx, d FROM skq WHERE last % 7 = 3",
+		"SELECT big, ch, iv FROM skq WHERE last < 300 AND i2 > 10",
+		"SELECT u, by, f8, last FROM skq WHERE ch = 'c3'",
+		"SELECT tz, vc FROM skq WHERE b AND last > 1500",
+		"SELECT n, tx, by FROM skq WHERE ch = ANY ('{c1,c4}'::bpchar[]) AND last > 100",
+	} {
+		plan, err := testPlanDeform(t, ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if err := op.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		scans := seqScans(op)
+		armed := len(scans) == 1 && scans[0].pfInfo != nil
+		_ = op.Close()
+		if !armed {
+			t.Fatalf("%s: the prefilter has no skipping first pass; nothing is exercised", q)
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := sortedRowValues(t, ctx, q)
+		seqScanDeformPoison = old
+		scanSkipDisabled = true
+		want := sortedRowValues(t, ctx, q)
+		scanSkipDisabled = false
+		scanPrefilterOn.Store(false)
+		late := sortedRowValues(t, ctx, q)
+		scanPrefilterOn.Store(true)
+		if strings.Join(got, "|") != strings.Join(want, "|") || strings.Join(got, "|") != strings.Join(late, "|") {
+			t.Fatalf("%s: skipping %d rows, full %d, late %d\nskipping %v\nfull     %v", q, len(got), len(want), len(late),
+				got[:min(3, len(got))], want[:min(3, len(want))])
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", q)
+		}
+	}
+}

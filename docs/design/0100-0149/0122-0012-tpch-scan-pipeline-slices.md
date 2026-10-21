@@ -463,3 +463,57 @@ experiments:
 - multi-key and grouping-set aggregates still hash a string;
 - a single NULL key demotes the whole lane;
 - Q18's early-run cost is not yet attributed.
+
+## Slice 25 (2026-10-21): the early qual decodes only its own columns — TPC-H Q12, Q10
+
+**Q18 attribution, from slice 24.** Run without the bench's `GOGC=off GOMEMLIMIT=12GiB` override, so the server
+applies its own `GOGC=200`, Q18 swings just as much (4.5–6.3 s across a server's five runs). So the swing is not
+the `GOGC=off` heap growth slice 24 suspected. Both clusters run 2 GB `shared_buffers`, and a large parallel scan
+reads through a ring in both engines, re-reading lineitem from the OS page cache each run. The swing stays
+unattributed (ledgered).
+
+**Cause.** Q10's lineitem qual is `l_returnflag = 'R'`, and about 25 % of rows survive. The early qual (slice 21;
+`seqScanOp.Next`'s prefilter) deformed every column up to `l_returnflag`: four numerics, two keys and a date
+the qual never reads, for every row. Decode was 32 % of the query. Q12's prefix is the same, ahead of its IN list
+and three date compares.
+
+PG's `slot_getsomeattrs` also deforms that prefix. A by-reference value costs it only a pointer store, though,
+and goopg converts every value.
+
+**Rule:**
+
+- **The first pass skips.** `prefilterSkipInfo` copies `colInfo` and marks skip on every column in
+  `[0, prefilter.MaxCols)` that the qual does not read (`deformScanReadSet`). The prefilter's first pass decodes
+  with that copy (`pfInfo`), stepping over the other columns by stored length (`skipAttrLen`, slice 19).
+- **Survivors decode again from column 0** with `colInfo`, so a skipped cell never reaches a consumer. The qual's
+  own columns are decoded twice for survivors only.
+- `pfInfo` is nil when the qual's reads cannot be bounded or nothing would be skipped. `scanSkipDisabled` turns it
+  off.
+- **`deformScanVisit` admits a value-list `InExpr`**: its operand and items, nothing else, which is slice 21's
+  `PlanScanQual` rule. The same walker bounds deform windows elsewhere, so value-list IN quals and targets now
+  narrow those too.
+- A qual that reads the last column still gets no prefilter: `PlanScanQual` declines it as saving nothing. With
+  skipping it would now save a lot (ledgered).
+
+**Pin.** `TestScanPrefilterSkipMatchesFullDecode` runs five quals over a 19-column table that has every type
+ahead of the columns read, including a value-list `= ANY`. For each it:
+
+- asserts that `pfInfo` is armed;
+- reads the skipped columns in the select list, with tail poison armed;
+- requires the result to equal the result with the skip off and with the early path off.
+
+Resuming survivors from `MaxCols` instead of column 0 fails it: the poison fires on a skipped cell.
+
+**Measured.** HEAD `19610b0a5` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q12 | ~0.82 | ~0.66 | −20 %; PG 0.47 |
+| Q10 | ~1.19 | ~1.11 | −7 % |
+| Q6 | — | — | unchanged; its qual columns sit early in the row |
+
+**Not done (ledgered):**
+
+- the last-column prefilter;
+- the double decode of a survivor's qual columns;
+- Q18's swing.

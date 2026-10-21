@@ -1084,6 +1084,12 @@ type seqScanOp struct {
 	// TupleDesc equivalent. Re-resolved on every Open so an ALTER TABLE that
 	// re-resolves o.cols re-resolves this with it.
 	colInfo []colTypeInfo
+	// pfInfo is colInfo for the prefilter's first pass (M0122-0012 slice 25):
+	// every column in [0, prefilter.MaxCols) the qual does not read is marked
+	// skip, so a tuple the qual rejects is never decoded past its own columns.
+	// nil when nothing would be skipped. A survivor is then decoded from
+	// column 0 with colInfo, so a skipped cell never reaches a consumer.
+	pfInfo []colTypeInfo
 	// pfSlab / pfIdx are the COMPILED form of the prefilter predicate, built
 	// once in Open (where a *Context exists, which constant folding needs) and
 	// immutable after. Per-operator rather than shared: each parallel worker
@@ -1407,13 +1413,19 @@ func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
 // offset reached so the caller can resume. Used by the prefilter path in Next
 // to deform only the predicate's columns first; see scan_prefilter.go.
 func (o *seqScanOp) decodeScanRowRange(data, bitmap []byte, storedNatts, from, to, off int) (int, error) {
+	return o.decodeScanRowRangeInfo(o.colInfo, data, bitmap, storedNatts, from, to, off)
+}
+
+// decodeScanRowRangeInfo is decodeScanRowRange with an explicit column info
+// (the prefilter's skipping pfInfo, or colInfo).
+func (o *seqScanOp) decodeScanRowRangeInfo(info []colTypeInfo, data, bitmap []byte, storedNatts, from, to, off int) (int, error) {
 	// Mirror decodeScanRow's two arms exactly: the unstyled entry point is
 	// DefaultOutputStyle(), not a zero OutputStyle.
 	st := o.arrayStyle
 	if !o.arrayStyleLive {
 		st = array.DefaultOutputStyle()
 	}
-	return decodeRowRangeInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.sctx, st, from, to, off)
+	return decodeRowRangeInfo(o.scanRow, o.cols, info, data, bitmap, storedNatts, o.sctx, st, from, to, off)
 }
 
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
@@ -1634,6 +1646,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 {
 			o.prefilterSet = false
 		}
+	}
+	o.pfInfo = nil
+	if o.prefilterSet && !scanSkipDisabled {
+		o.pfInfo = prefilterSkipInfo(o.colInfo, o.prefilter.MaxCols, o.qual)
 	}
 	// Compile the prefilter predicate into the existing ExprNode slab, with
 	// constant folding enabled by passing ctx. Rebuilt on every Open so a
@@ -2134,7 +2150,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// The partial row is handed to NOTHING but the predicate —
 				// entries at/past MaxCols still hold the previous tuple's
 				// values — so it must not escape this block.
-				off, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, 0, o.prefilter.MaxCols, 0)
+				info := o.colInfo
+				if o.pfInfo != nil {
+					info = o.pfInfo
+				}
+				off, derr := o.decodeScanRowRangeInfo(info, tuple.Data, tuple.Bitmap, storedNatts, 0, o.prefilter.MaxCols, 0)
 				if derr != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
@@ -2179,7 +2199,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					// excludes FuncCall, subqueries and params), so the
 					// discarded attempt cannot have had a side effect.
 				}
-				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, survivorBound, off); derr != nil {
+				// A survivor of a skipping first pass is decoded again from
+				// column 0: its skipped cells must not reach a consumer.
+				from := o.prefilter.MaxCols
+				if o.pfInfo != nil {
+					from, off = 0, 0
+				}
+				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, from, survivorBound, off); derr != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
 					}

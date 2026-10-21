@@ -112,7 +112,8 @@ const (
 // reporting whether e is positively understood as reading only indexed
 // columns. This is deliberately a whitelist mirroring prefilterSafeExpr's
 // understood set (plain column reads, constants, and the transparent
-// comparison/arithmetic/boolean/cast/is-null wrappers): anything else —
+// comparison/arithmetic/boolean/cast/is-null wrappers, value-list IN):
+// anything else —
 // FuncCall, RowExpr, CTIDExpr, TableOidExpr, MergeWholeRowRef, subquery and
 // outer-ref shapes, and every future expression kind — returns false and the
 // caller declines to full deform. A missed arm costs performance, never
@@ -159,6 +160,23 @@ func deformScanVisit(e optimizer.Expr, visit func(idx int)) bool {
 		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsDistinctFromExpr:
 		return deformScanVisit(x.Left, visit) && deformScanVisit(x.Right, visit)
+	case *optimizer.InExpr:
+		// A value list (`x IN (a, b)`, `x = ANY('{…}'::t[])`) reads its
+		// operand and items and nothing else: evalInExprScalarRow evaluates
+		// exactly those against the row (slice 25; PlanScanQual admits the
+		// same shape, slice 21). The sublink form declines.
+		if x.Plan != nil || x.Subquery != nil || len(x.Args) > 0 || len(x.ParParam) > 0 {
+			return false
+		}
+		if !deformScanVisit(x.Operand, visit) {
+			return false
+		}
+		for _, it := range x.List {
+			if !deformScanVisit(it, visit) {
+				return false
+			}
+		}
+		return true
 	case *optimizer.SubqueryExpr:
 		args, ok := deformSublinkArgs(x)
 		if !ok {
@@ -882,4 +900,33 @@ func scrubDeformPoison(row Row) {
 			row[i] = NullDatum
 		}
 	}
+}
+
+// prefilterSkipInfo returns a copy of info whose columns in [0, maxCols) that
+// qual does not read are marked skip (M0122-0012 slice 25), or nil when the
+// qual's reads cannot be bounded or no column would be skipped. PG's
+// slot_getsomeattrs deforms the qual's prefix too, but a by-reference value
+// costs it a pointer store; goopg's decode converts every value, so on TPC-H
+// Q10's `l_returnflag = 'R'` the 75 % of lineitem rows the qual rejects paid
+// for four numerics and two dates nobody read.
+func prefilterSkipInfo(info []colTypeInfo, maxCols int, qual optimizer.Expr) []colTypeInfo {
+	if maxCols > len(info) {
+		return nil
+	}
+	read := deformScanReadSet(len(info), qual)
+	if read == nil {
+		return nil
+	}
+	out := append([]colTypeInfo(nil), info...)
+	skipped := false
+	for i := 0; i < maxCols; i++ {
+		if !read[i] {
+			out[i].skip = true
+			skipped = true
+		}
+	}
+	if !skipped {
+		return nil
+	}
+	return out
 }

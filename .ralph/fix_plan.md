@@ -1729,6 +1729,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q13 ~3\.1–3\.2 → ~2\.9–3\.0 s \(~5%, two experiments\)\. Q18 neutral; slab allocation of groups measured no
       gain and was reverted\. Q18's first three runs per server \(~6\.3 s vs ~4\.5 s\) look like heap growth under
       the bench's GOGC=off — not yet attributed\.
+  - **Slice 25 — the early qual decodes only its own columns LANDED 2026\-10\-21.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS, TestPort\_Isolation\* PASS\. Doc "Slice 25"\.
+    - Q18's swing is NOT GOGC=off: it persists under the server's own GOGC=200 \(4\.5–6\.3 s\); unattributed\.
+    - prefilterSkipInfo marks skip on prefix columns the qual does not read; the first pass decodes with that
+      pfInfo; survivors decode again from column 0 with colInfo\. deformScanVisit admits value\-list InExpr\.
+    - Pin: TestScanPrefilterSkipMatchesFullDecode \(5 quals, poison armed, vs skip off and early off; resuming
+      survivors at MaxCols trips the poison\)\. Q12 ~0\.82 → ~0\.66 s \(−20%\), Q10 ~1\.19 → ~1\.11 s, Q6 unchanged\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3605,6 +3613,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `4dba3357b`** \(M0122\-0012 slice 23 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `19610b0a5`** \(M0122\-0012 slice 24 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
