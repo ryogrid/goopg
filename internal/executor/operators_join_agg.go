@@ -2607,6 +2607,68 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		order = append(order, key)
 	}
 
+	// newGroup founds a group from its first input row.
+	newGroup := func(si int, set []int, allVals Row, slot TupleSlot) *groupRuntime {
+		// Evaluate passthrough (functionally-determined) columns from the first row.
+		var ptVals Row
+		if len(o.plan.Passthrough) > 0 {
+			ptVals = make(Row, len(o.plan.Passthrough))
+			for i, expr := range o.plan.Passthrough {
+				v, err := evalExprSlot(expr, slot, ctx)
+				if err != nil {
+					ptVals[i] = NullDatum
+				} else {
+					ptVals[i] = v
+				}
+			}
+		}
+		var gv Row
+		if nGroupCols > 0 {
+			gv = make(Row, nGroupCols)
+			for i := range gv {
+				// A column rolled up away at this level is NULL —
+				// the SQL standard's value for it, and what makes
+				// GROUPING(...) necessary to tell it from a real one.
+				gv[i] = NullDatum
+			}
+			for _, ci := range set {
+				// M0073-0004 retention boundary, moved here from
+				// evalGroupExprs (M0145-0008f): only a group-founding
+				// row's key values are retained, so only they are
+				// detached from the input arena.
+				gv[ci] = allVals[ci].MaterializeArena()
+			}
+		}
+		return &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+	}
+
+	// M0122-0012 slice 24: the int64 group lane. A single grouping set over a
+	// single key files each group under datumToInt64Key(value) in igroups
+	// instead of hashing the key's canonical string — HammerDB declares every
+	// TPC-H key numeric, so TPC-H Q13's GROUP BY c_custkey hashed a string per
+	// input row (about 5 % of the query). datumToInt64Key is exact — every integral in-range value of
+	// every numeric representation maps, and appendGroupKey's canonical key for
+	// such a value is canonicalNumericKey(v, 0) — so a group's identity does
+	// not depend on the lane. The first key the lane cannot represent (NULL, a
+	// fraction, any other kind) demotes it: every int group moves to the string
+	// map under that canonical key, in founding order, so groups and order end
+	// up exactly as the string path alone would have built them.
+	intLane := !aggIntLaneDisabled && !multiSet && len(sets) == 1 && len(sets[0]) == 1 &&
+		!(o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit)
+	var igroups map[int64]*groupRuntime
+	var iorder []int64
+	if intLane {
+		igroups = make(map[int64]*groupRuntime)
+	}
+	demoteIntGroups := func() {
+		for _, ik := range iorder {
+			key := canonicalNumericKey(ik, 0)
+			groups[key] = igroups[ik]
+			order = append(order, key)
+		}
+		igroups, iorder = nil, nil
+	}
+
 	for {
 		slot, err := o.child.Next()
 		if err == EOF {
@@ -2638,46 +2700,34 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			return err
 		}
 		for si, set := range sets {
-			// M0122-0012: the key is built into gkBuf and looked up as
-			// string(gkBuf), which Go does not allocate for; the key string
-			// is materialised only when this row founds a group.
-			o.gkBuf = o.appendGroupKey(o.gkBuf[:0], si, set, allVals, multiSet)
-			gr, ok := groups[string(o.gkBuf)]
-			if !ok {
-				key := string(o.gkBuf)
-				// Evaluate passthrough (functionally-determined) columns from the first row.
-				var ptVals Row
-				if len(o.plan.Passthrough) > 0 {
-					ptVals = make(Row, len(o.plan.Passthrough))
-					for i, expr := range o.plan.Passthrough {
-						v, err := evalExprSlot(expr, slot, ctx)
-						if err != nil {
-							ptVals[i] = NullDatum
-						} else {
-							ptVals[i] = v
-						}
+			var gr *groupRuntime
+			// M0122-0012 slice 24: the int64 group lane (see intLane above).
+			if intLane {
+				if ik, ok := datumToInt64Key(allVals[set[0]]); ok {
+					gr = igroups[ik]
+					if gr == nil {
+						gr = newGroup(si, set, allVals, slot)
+						igroups[ik] = gr
+						iorder = append(iorder, ik)
 					}
+				} else {
+					intLane = false
+					demoteIntGroups()
 				}
-				var gv Row
-				if nGroupCols > 0 {
-					gv = make(Row, nGroupCols)
-					for i := range gv {
-						// A column rolled up away at this level is NULL —
-						// the SQL standard's value for it, and what makes
-						// GROUPING(...) necessary to tell it from a real one.
-						gv[i] = NullDatum
-					}
-					for _, ci := range set {
-						// M0073-0004 retention boundary, moved here from
-						// evalGroupExprs (M0145-0008f): only a group-founding
-						// row's key values are retained, so only they are
-						// detached from the input arena.
-						gv[ci] = allVals[ci].MaterializeArena()
-					}
+			}
+			if gr == nil {
+				// M0122-0012: the key is built into gkBuf and looked up as
+				// string(gkBuf), which Go does not allocate for; the key string
+				// is materialised only when this row founds a group.
+				o.gkBuf = o.appendGroupKey(o.gkBuf[:0], si, set, allVals, multiSet)
+				var ok bool
+				gr, ok = groups[string(o.gkBuf)]
+				if !ok {
+					key := string(o.gkBuf)
+					gr = newGroup(si, set, allVals, slot)
+					groups[key] = gr
+					order = append(order, key)
 				}
-				gr = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-				groups[key] = gr
-				order = append(order, key)
 			}
 
 			o.currentRowVersion++
@@ -2704,6 +2754,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				}
 			}
 		}
+	}
+
+	if intLane {
+		demoteIntGroups()
 	}
 
 	switch o.plan.Mode {
@@ -3031,6 +3085,10 @@ func (o *aggregateOp) appendGroupKey(buf []byte, si int, set []int, vals Row, mu
 	}
 	return buf
 }
+
+// aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
+// set it to compare the lane's output, order included, with the string path.
+var aggIntLaneDisabled = false
 
 // appendDatumKey appends datumKey(d)'s bytes to buf (M0122-0012). The common
 // kinds are encoded in place; any other kind defers to datumKey itself, so

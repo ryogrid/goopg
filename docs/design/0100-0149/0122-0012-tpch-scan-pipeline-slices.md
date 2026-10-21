@@ -418,3 +418,48 @@ whatever sits above it:
 - the cooperative parallel build's producer trees and GatherMerge workers do not borrow, though both copy each row
   into their queue;
 - the `BuildFast` builder's join children are `opNodeOperator` wrappers, which the descent does not enter.
+
+## Slice 24 (2026-10-21): the hashed aggregate's int64 group lane — TPC-H Q13; Q18 examined
+
+**Q18 first.** Q18 has the largest absolute time (~4.0 s against PG's 3.39 s). Its inner HashAggregate folds 6M
+lineitem rows into ~1.5M `l_orderkey` groups. Two hypotheses were measured:
+
+| hypothesis | profile evidence | result |
+|---|---|---|
+| hashing the key's string per row | `mapaccess2_faststr` + `aeshashbody` ~13 % | neutral on Q18 |
+| per-group allocation | `heapSetTypeSmallHeader` 18 % in an early run; the group-founding closure 23 % cum | slab chunks for the group, key row and states: **no gain**, rounds overlapped and leaned worse; reverted |
+
+The first three runs per server take ~6.3 s and later ones ~4.5 s. That pattern points at heap growth under the
+bench's `GOGC=off`, not at either hypothesis. It is left for a dedicated look; the bench does not run with the
+server's own GC settings.
+
+**Q13.** Q13's `GROUP BY c_custkey` keys the same way and does move.
+
+**Rule.** For a single grouping set over a single key, `aggregateOp.Open`'s drain files each group under
+`datumToInt64Key(value)` in an int64 map. The lane cannot change a group's identity or the output order:
+
+- `datumToInt64Key` is exact since slice 22. For every value it maps, `appendGroupKey`'s canonical key is
+  `canonicalNumericKey(v, 0)`.
+- The first key the lane cannot represent (NULL, a fraction, any other kind) demotes it. Every int group moves to
+  the string map under that canonical key, in founding order.
+- After the drain the lane always demotes. The partial/finalize publication and the emit loops therefore see
+  exactly the groups and order the string path builds.
+- The row-transport finalize (`AggModeFinal` with `PartialEmit`) and grouping sets keep the string path.
+
+**Pin.** `TestAggregateIntGroupLaneMatchesStringPath` runs five aggregates and compares their output, order
+included, with the lane disabled (`aggIntLaneDisabled`). The keys mix spellings of one value (2, 2.000,
+1.0000000000000000000000), negatives and zero. One query sees a NULL key mid-stream and one a fraction, so the
+lane demotes after many int groups exist. Two mutations fail it: deferring the demotion (106–111 rows against 61),
+and a wrong canonical key on demotion.
+
+**Measured.** Q13, HEAD `4dba3357b` against the candidate, three interleaved rounds of five runs, in two separate
+experiments:
+
+- the warm runs went from ~3.1–3.2 s to ~2.9–3.0 s (~5 %) both times;
+- Q18 is unchanged.
+
+**Not done (ledgered):**
+
+- multi-key and grouping-set aggregates still hash a string;
+- a single NULL key demotes the whole lane;
+- Q18's early-run cost is not yet attributed.

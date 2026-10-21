@@ -1719,6 +1719,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Pin: TestScanBorrowBuildSideAndGatherWorkers \(fails with retainBuildRow uncopied; needs
       MinParallelTableScanBlocks raised, else the cooperative build bypasses the borrowing scan\)\.
     - Q10 ~1\.70 → ~1\.18 s \(−30%\), Q21 ~1\.18 → ~1\.03 s \(−13%\); Q13/Q7 unchanged \(interleaved A/B\)\.
+  - **Slice 24 — the hashed aggregate's int64 group lane LANDED 2026\-10\-21.** Movement: none — perf only\. The S3
+    instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 PLAN\-SHAPE same=99,
+    TestPort\_RegressSuite PASS\. Doc "Slice 24"\.
+    - A single\-set single\-key hashed aggregate files groups under datumToInt64Key\(value\); the first
+      unrepresentable key \(NULL, fraction, other kind\) demotes every int group to the string map in founding
+      order under canonicalNumericKey\(v, 0\), and the lane always demotes after the drain — groups and order are
+      exactly the string path's\. Pin: TestAggregateIntGroupLaneMatchesStringPath \(order included\)\.
+    - Q13 ~3\.1–3\.2 → ~2\.9–3\.0 s \(~5%, two experiments\)\. Q18 neutral; slab allocation of groups measured no
+      gain and was reverted\. Q18's first three runs per server \(~6\.3 s vs ~4\.5 s\) look like heap growth under
+      the bench's GOGC=off — not yet attributed\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3590,6 +3600,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `f24bff055`** \(M0122\-0012 slice 22 changed internal/optimizer and internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `4dba3357b`** \(M0122\-0012 slice 23 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
