@@ -10447,48 +10447,12 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// is bounded by the sublink result caches and, later, the S2 handles.
 	operandNull := operand.IsNull()
 
-	row := slotToRow(slot)
-	values, err := collectInValues(x, row, ctx)
+	values, itemBP, itemLit, err := inListItems(x, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	// bpchar comparison semantics for `operand = item` (M0146): each
-	// element comparison resolves under the same rules
-	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
-	// side compares blank-insensitively (bcTruelen), an untyped literal
-	// opposite a bpchar is coerced to bpchar, and an explicitly
-	// text-typed side keeps its padding byte-exact. The DECLARED types
-	// decide, never the datum, so the item metadata is captured here
-	// while the expressions/plan are still visible:
-	//   - a literal list (x.List) exposes each item's expression;
-	//   - a subquery list's items all share the inner plan's first
-	//     output column type;
-	//   - a single-element array-literal expansion gives every element
-	//     the source expression's classification.
 	opBP := declaredBpcharTypmod(x.Operand)
 	opLit := isBareStringLit(x.Operand)
-	itemBP := make([]int64, len(values))
-	itemLit := make([]bool, len(values))
-	switch {
-	case x.Plan != nil:
-		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
-			for i := range itemBP {
-				itemBP[i] = 1
-			}
-		}
-	case len(values) == len(x.List):
-		for i, e := range x.List {
-			itemBP[i] = declaredBpcharTypmod(e)
-			itemLit[i] = isBareStringLit(e)
-		}
-	case len(x.List) == 1:
-		bp := declaredBpcharTypmod(x.List[0])
-		lit := isBareStringLit(x.List[0])
-		for i := range itemBP {
-			itemBP[i] = bp
-			itemLit[i] = lit
-		}
-	}
 	if operandNull {
 		if len(values) == 0 {
 			// Vacuous quantification over an empty list.
@@ -10813,6 +10777,130 @@ func bindSubPlanParams(exprPtr any, parParam []int, args []optimizer.Expr, row R
 		sb.WriteString(datumKey(v))
 	}
 	return sb.String(), nil
+}
+
+// inListConst is a literal value list's evaluated items, kept per statement
+// (Context.inListConsts). literal is false for a list that must be evaluated
+// per row; the entry then only remembers that verdict.
+type inListConst struct {
+	literal bool
+	values  []Datum
+	itemBP  []int64
+	itemLit []bool
+}
+
+// inListItems returns an IN's items with the per-item bpchar metadata
+// comparisonOperandsAsBpchar needs. A value list whose items are all literals
+// (TPC-H Q12's `l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])`) is evaluated once
+// per statement: PG's planner folds such a list to a Const array
+// (eval_const_expressions), and ExecEvalScalarArrayOp then only walks it per
+// row. goopg evaluated every item, re-parsed the array text and allocated the
+// metadata slices on every row. The cache lives on the Context, which is per
+// statement and private to each parallel worker (NewWorkerContext starts
+// from NewContext), and its values are detached from any arena.
+func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []int64, []bool, error) {
+	if x.Plan != nil || ctx == nil {
+		return inListItemsEval(x, slotToRow(slot), ctx)
+	}
+	c := ctx.inListConsts[x]
+	if c == nil {
+		c = &inListConst{literal: inListIsLiteral(x)}
+		if !c.literal {
+			if ctx.inListConsts == nil {
+				ctx.inListConsts = make(map[*optimizer.InExpr]*inListConst)
+			}
+			ctx.inListConsts[x] = c
+		}
+	}
+	if !c.literal {
+		return inListItemsEval(x, slotToRow(slot), ctx)
+	}
+	if c.values == nil {
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		if err != nil {
+			return nil, nil, nil, err // not cached: the next row raises it again
+		}
+		owned := make([]Datum, len(values))
+		for i, v := range values {
+			owned[i] = v.MaterializeArena()
+		}
+		c.values, c.itemBP, c.itemLit = owned, itemBP, itemLit
+		if ctx.inListConsts == nil {
+			ctx.inListConsts = make(map[*optimizer.InExpr]*inListConst)
+		}
+		ctx.inListConsts[x] = c
+	}
+	return c.values, c.itemBP, c.itemLit, nil
+}
+
+// inListIsLiteral reports whether every item of a value-list IN is a literal,
+// optionally cast: its value cannot depend on the row, a parameter, or a
+// function call.
+func inListIsLiteral(x *optimizer.InExpr) bool {
+	if x.Plan != nil || x.Subquery != nil || len(x.Args) > 0 || len(x.List) == 0 {
+		return false
+	}
+	var lit func(e optimizer.Expr) bool
+	lit = func(e optimizer.Expr) bool {
+		switch v := e.(type) {
+		case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
+			*optimizer.BooleanConst, *optimizer.NullConst, *optimizer.TypedStringLit:
+			return true
+		case *optimizer.CastExpr:
+			return lit(v.Operand)
+		}
+		return false
+	}
+	for _, e := range x.List {
+		if !lit(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// inListItemsEval evaluates an IN's items against row.
+func inListItemsEval(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, []int64, []bool, error) {
+	values, err := collectInValues(x, row, ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// bpchar comparison semantics for `operand = item` (M0146): each
+	// element comparison resolves under the same rules
+	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
+	// side compares blank-insensitively (bcTruelen), an untyped literal
+	// opposite a bpchar is coerced to bpchar, and an explicitly
+	// text-typed side keeps its padding byte-exact. The DECLARED types
+	// decide, never the datum, so the item metadata is captured here
+	// while the expressions/plan are still visible:
+	//   - a literal list (x.List) exposes each item's expression;
+	//   - a subquery list's items all share the inner plan's first
+	//     output column type;
+	//   - a single-element array-literal expansion gives every element
+	//     the source expression's classification.
+	itemBP := make([]int64, len(values))
+	itemLit := make([]bool, len(values))
+	switch {
+	case x.Plan != nil:
+		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
+			for i := range itemBP {
+				itemBP[i] = 1
+			}
+		}
+	case len(values) == len(x.List):
+		for i, e := range x.List {
+			itemBP[i] = declaredBpcharTypmod(e)
+			itemLit[i] = isBareStringLit(e)
+		}
+	case len(x.List) == 1:
+		bp := declaredBpcharTypmod(x.List[0])
+		lit := isBareStringLit(x.List[0])
+		for i := range itemBP {
+			itemBP[i] = bp
+			itemLit[i] = lit
+		}
+	}
+	return values, itemBP, itemLit, nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When

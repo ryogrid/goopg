@@ -86,7 +86,17 @@ func PlanScanQual(qual Expr, ncols int) ScanQualPlan {
 				// scan stamps hasCTID/ctidBlock/ctidOff BELOW the row
 				// clone, so the prefix slot has no ctid to read.
 				early = false
-			case *SubqueryExpr, *ExistsExpr, *InExpr, *ArraySubqueryExpr,
+			case *InExpr:
+				// A value list — `x IN (a, b)`, `x = ANY('{…}'::t[])`,
+				// PG's ScalarArrayOpExpr — is a plain expression over its
+				// operand and items, both walked as same-scope children
+				// above, so its column bound is exact. Only the sublink
+				// form opens a plan of its own (see the next arm's note on
+				// why a nil Plan alone does not prove the list form).
+				if x.Plan != nil || x.Subquery != nil || len(x.Args) > 0 || len(x.ParParam) > 0 {
+					early = false
+				}
+			case *SubqueryExpr, *ExistsExpr, *ArraySubqueryExpr,
 				*MultiAssignSubqRow, *MultiAssignSubqElem:
 				// Named explicitly as well as caught by OnScope, because
 				// OnScope is NOT sufficient: exprChildSlots reports the

@@ -57,6 +57,17 @@ func TestPlanScanPrefilterWhitelist(t *testing.T) {
 			bin(parser.OpLt, col(1), &optimizer.SubqueryExpr{}), 16, false, 0},
 		{"outer column ref — declined",
 			bin(parser.OpLt, col(1), &optimizer.OuterColumnRef{Level: 1, Index: 0}), 16, false, 0},
+		// TPC-H Q12's `l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])`.
+		{"value-list IN over a column", &optimizer.InExpr{Operand: col(3), List: []optimizer.Expr{lit("1"), lit("2")}}, 16, true, 4},
+		{"value-list IN with a column item — the item counts", &optimizer.InExpr{Operand: col(1), List: []optimizer.Expr{lit("1"), col(6)}}, 16, true, 7},
+		{"value-list IN with a function item — declined",
+			&optimizer.InExpr{Operand: col(1), List: []optimizer.Expr{&optimizer.FuncCall{Name: "random"}}}, 16, false, 0},
+		{"IN subquery with a nil plan — declined",
+			&optimizer.InExpr{Operand: col(1), Subquery: &parser.SelectStmt{}}, 16, false, 0},
+		{"IN subquery planned — declined",
+			&optimizer.InExpr{Operand: col(1), Plan: &optimizer.SeqScan{}}, 16, false, 0},
+		{"lowered IN subquery args — declined",
+			&optimizer.InExpr{Operand: col(1), Args: []optimizer.Expr{col(2)}, ParParam: []int{0}}, 16, false, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

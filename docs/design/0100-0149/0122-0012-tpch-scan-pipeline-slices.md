@@ -235,3 +235,63 @@ bitmap. HammerDB declares the TPC-H keys `numeric`, so they never take the int64
 
 **Not done (ledgered):** the descent still stops at merge and nested-loop joins, Filter, and Sort, and the
 `BuildFast` builder sets no borrow (slice 18's row).
+
+## Slice 21 (2026-10-21): a value-list IN is judged early, and a literal list is evaluated once — TPC-H Q12
+
+**Cause.** Q12 is the second-largest gap to PG in slice 20's census (1.62 s vs 0.47 s). Its plan matches PG's: a
+Parallel Seq Scan on lineitem whose qual starts with `l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])`, then a nested
+loop into orders. Two costs led its profile:
+
+- `cloneRowOwned` was 23 % and `decodeRowRangeInfo` 25 %. The qual is absorbed into the scan, and the scan can
+  judge it early, on the deformed prefix (PG's `slot_getsomeattrs` discipline), so that only survivors are fully
+  decoded and cloned. But `PlanScanQual` declined every `InExpr`, the sublink form and the value-list form alike.
+  So all 6M rows were fully decoded and cloned before the qual rejected about 99 % of them.
+- `collectInValues` was 10 %, and the IN arm 20 % in all. A value list was evaluated item by item on every row. The
+  `'{MAIL,SHIP}'` array text was re-parsed each time, and the per-item bpchar metadata slices were reallocated.
+  PG's planner folds that list to a Const array (`eval_const_expressions`), and `ExecEvalScalarArrayOp` only walks
+  it per row.
+
+**Rule:**
+
+- **`PlanScanQual` admits a value-list `InExpr`.** That is one with no Plan, no Subquery and no PARAM\_EXEC Args.
+  Its operand and items are walked as same-scope children (`exprChildSlots`), so the column bound is exact, and an
+  item that is itself ineligible (a function call, a param) still declines. The sublink form stays declined, even
+  when its Plan is nil, for the reason the existing arm records.
+- **`inListItems` evaluates a literal list once per statement.** A literal list is one whose every item is a
+  literal or a cast of one (`inListIsLiteral`). The items and their bpchar metadata are kept in
+  `Context.inListConsts`, keyed by the `InExpr`, with the values detached from any arena (`MaterializeArena`).
+  - The Context is per statement, the same lifetime as the existing non-correlated sublink cache.
+  - Each parallel worker starts from `NewContext`, so the map is never shared.
+  - A list that errors is not cached, so the next row raises the error again.
+  - Any other list is evaluated per row, as before.
+
+**Pin.** `TestScanQualValueListIN` (scan\_inlist\_test.go) runs seven IN quals over a multi-page table. They cover:
+
+- bpchar blank-insensitivity;
+- typed date literals;
+- `< ANY` over an int array;
+- `NOT IN`, plus `NOT IN` with a NULL item;
+- a column item.
+
+Each must arm the early path and equal its OR/AND spelling, a different evaluator, with the early path on and off.
+Two mutations fail it: caching every list (the column-item case returns 353 rows against 636), and restoring the
+blanket `InExpr` decline. `TestPlanScanPrefilterWhitelist` gains six eligibility cases.
+
+**Measured.** Q12, HEAD `54a37edcd` against the candidate, a fresh server per arm, three interleaved rounds of
+five runs:
+
+| round | HEAD (s) | candidate (s) |
+|---|---|---|
+| 1 | 5.29 / 1.92 / 1.61 / 1.59 / 1.57 | 3.09 / 0.84 / 0.86 / 0.85 / 0.85 |
+| 2 | 3.95 / 1.99 / 1.63 / 1.63 / 1.63 | 3.04 / 0.84 / 0.81 / 0.80 / 0.81 |
+| 3 | 4.00 / 1.98 / 1.63 / 1.61 / 1.59 | 3.11 / 0.82 / 0.85 / 0.84 / 0.82 |
+
+- The warm median went from ~1.61 s to ~0.84 s (−48 %). The first run per server is cold on both arms.
+- The early-path change alone measured ~1.09 s. PG is ~0.47 s.
+
+**Not done (ledgered):**
+
+- PG hashes a constant array of 9 or more elements (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`,
+  `ExecEvalHashedScalarArrayOp`). goopg walks a long literal list linearly; it is now evaluated once, but still
+  compared item by item.
+- A list of params or stable functions is still evaluated per row. PG folds params into a custom plan's Const.

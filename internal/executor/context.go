@@ -147,6 +147,10 @@ type Context struct {
 	subqCacheScoped *kvcache.Cache
 	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
 
+	// inListConsts holds each literal value-list IN's evaluated items for
+	// the statement (inListItems, expr.go).
+	inListConsts map[*optimizer.InExpr]*inListConst
+
 	// TriggerDepth is pg_trigger_depth(): the number of trigger invocations
 	// on the stack. executePLpgSQLTriggerBody gives its child context one
 	// more than its caller's (M0146-0080).
