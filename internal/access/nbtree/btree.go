@@ -262,6 +262,30 @@ func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
 	return f.compare(key, hk) > 0
 }
 
+// keyAtOrPastHighKey is keyExceedsHighKey for an EXCLUSIVE lower bound
+// (_bt_moveright with nextkey, nbtsearch.c): every entry of the page orders at
+// or below its high key, so when the high key is itself at or below the bound
+// — with a bound naming a key prefix read as plus infinity beyond it, the
+// compareHigh rule — no entry of the page can be past the bound, and the scan
+// belongs on a page further right.
+func keyAtOrPastHighKey(f indexFormat, p storage.Page, key []byte) bool {
+	hk, ok, err := f.pageHighKey(p)
+	if err != nil || !ok {
+		return false
+	}
+	return f.compareHigh(hk, key) <= 0
+}
+
+// lowerBoundPastPage is the scan's "this leaf holds nothing at or past lo"
+// test: keyExceedsHighKey for an inclusive bound, keyAtOrPastHighKey for an
+// exclusive one (M0122-0012 slice 41).
+func lowerBoundPastPage(f indexFormat, p storage.Page, lo []byte, loExclusive bool) bool {
+	if loExclusive {
+		return keyAtOrPastHighKey(f, p, lo)
+	}
+	return keyExceedsHighKey(f, p, lo)
+}
+
 // itemOvershootsHighKey reports whether a new item keyed `key` belongs
 // strictly to the right of the page described by `op` rather than on it —
 // the Lehman-Yao "move right" test applied to a structural INSERT rather
@@ -2458,7 +2482,7 @@ func findChildBlock(f indexFormat, items []item, key []byte) storage.BlockNumber
 // child block to descend into for `key`, without decoding all items
 // first.  Replaces the pageItems + findChildBlock pair (which allocated
 // a slice of all items on every descent).  M0027-0001.
-func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.BlockNumber, error) {
+func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey bool) (storage.BlockNumber, error) {
 	count, err := PGDataItemCount(p)
 	if err != nil {
 		return 0, err
@@ -2478,6 +2502,12 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte) (storage.Bl
 		it, err := f.parseNoCopy(raw)
 		if err != nil {
 			return true
+		}
+		if nextKey {
+			// _bt_binsrch with nextkey: the first item past every key the
+			// bound names (compareHigh), so an exclusive bound descends to
+			// the END of its equal-prefix group, not its start.
+			return f.compareHigh(it.key, key) > 0
 		}
 		return f.compare(it.key, key) > 0
 	})
@@ -2530,6 +2560,23 @@ func (bt *BTree) descendForInsert(key []byte) (leafBlk storage.BlockNumber, path
 }
 
 func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
+	return bt.descendMode(key, forUpdate, false)
+}
+
+// descendToLowerBound descends to the leaf where a scan with lower bound lo
+// starts: descendToLeaf for an inclusive bound, and for an exclusive one the
+// nextkey descent _bt_first uses for a `>` scan key (nbtsearch.c: nextkey =
+// true), which lands after the bound's equal-prefix group. Descending to the
+// group's start instead made an exclusive cursor walk — and binary-search —
+// every leaf of the group only to skip all of its entries: on TPC-DS Q72 the
+// skip scan's past-the-group jumps read ~30 leaves per cursor, 28M leaf
+// searches for 0.93M cursors (M0122-0012 slice 41).
+func (bt *BTree) descendToLowerBound(lo []byte, loExclusive bool) (storage.BlockNumber, error) {
+	leaf, _, err := bt.descendMode(lo, false, loExclusive && lo != nil)
+	return leaf, err
+}
+
+func (bt *BTree) descendMode(key []byte, forUpdate, nextKey bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
 	meta, err := bt.readMeta()
 	if err != nil {
 		return 0, nil, err
@@ -2568,7 +2615,7 @@ func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumbe
 		// Right-link recovery: a concurrent split may have moved
 		// our target keys to the right sibling. Follow op.Next
 		// until we land on a page that covers the search key.
-		if keyExceedsHighKey(bt.format(), slot.Page(), key) {
+		if lowerBoundPastPage(bt.format(), slot.Page(), key, nextKey) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -2593,7 +2640,7 @@ func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumbe
 
 		// Binary-search the internal page directly, without decoding
 		// all items (avoids allocation & linear decode — M0027-0001).
-		child, err := findChildBlockDirect(bt.format(), slot.Page(), key)
+		child, err := findChildBlockDirect(bt.format(), slot.Page(), key, nextKey)
 		bt.unpinR(slot)
 		if err != nil {
 			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
@@ -4573,7 +4620,7 @@ func (bt *BTree) RangeScanWithPosLeafFilter(lo, hi []byte, loExclusive, hiExclus
 }
 
 func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
-	cur, _, err := bt.descendToLeaf(lo)
+	cur, err := bt.descendToLowerBound(lo, loExclusive)
 	if err != nil {
 		return err
 	}
@@ -4597,7 +4644,7 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 		// covers `lo` (or we run out of pages).
 		// When lo is nil, keyExceedsHighKey(page, nil) is always false
 		// (nil compares less than any real key), so we never skip — correct.
-		if lo != nil && keyExceedsHighKey(bt.format(), slot.Page(), lo) {
+		if lo != nil && lowerBoundPastPage(bt.format(), slot.Page(), lo, loExclusive) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -4873,7 +4920,7 @@ func (c *ScanCursor) LeafLastKey() (key []byte, ok bool) {
 // walk rightward from it. A nil lo means "scan from the leftmost leaf",
 // matching the eager scans.
 func (bt *BTree) NewScanCursor(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool) (*ScanCursor, error) {
-	cur, _, err := bt.descendToLeaf(lo)
+	cur, err := bt.descendToLowerBound(lo, loExclusive)
 	if err != nil {
 		return nil, err
 	}
@@ -4919,7 +4966,7 @@ func (c *ScanCursor) Next(fn func(key []byte, ptr storage.ItemPointer, pos ScanP
 		// Same high-key recovery skip as the eager walk (applies
 		// meaningfully to the first leaf descendToLeaf returned; harmless
 		// on later leaves, whose key ranges all exceed lo).
-		if c.lo != nil && keyExceedsHighKey(c.bt.format(), slot.Page(), c.lo) {
+		if c.lo != nil && lowerBoundPastPage(c.bt.format(), slot.Page(), c.lo, c.loExclusive) {
 			c.next = op.Next
 			c.bt.unpinR(slot)
 			continue

@@ -378,3 +378,60 @@ went from 17.8 to 11.2 s (PG 13.3 s). TPC-H is flat (14.81 vs 14.65 s, `GOGC=100
 
 **Left.** `textShapeAmbiguous` still sniffs the values on every call, in the compiled arm too. That is the
 slice 30 ledger row: the operand types are not carried everywhere.
+
+## Slice 41 (2026-10-22): an exclusive lower bound descends past its group — TPC-DS Q72
+
+**Target, named up front:** TPC-DS Q72, ~8.5 s warm at HEAD against PG's 3.4 s.
+
+**Cause.** 55 % of Q72's CPU was `leafScanStart`, the binary search inside a leaf. Counting showed 28 M leaf
+searches for 0.93 M cursors, about 30 leaves per cursor; PG reads about 4 pages per index search.
+
+The source was the skip-scan walk's past-the-group jump (slice 33): `NewScanCursor(gPivot, nil, excl)`.
+`descendToLeaf` searches with `compare`, which reads a bound naming only a prefix as minus infinity beyond it.
+So an exclusive bound landed at the FIRST leaf of its equal-prefix group. The cursor then binary-searched every
+leaf of that group (about 70 for one inventory date) only to skip all of their entries.
+
+PG's `_bt_first` handles a `>` bound with `nextkey = true` (nbtsearch.c):
+
+- `_bt_binsrch` picks the first item past every key the bound names;
+- `_bt_moveright` moves right while the high key is at or below the bound.
+
+The descent therefore lands after the group.
+
+**Rule.**
+
+- **`descendToLowerBound(lo, loExclusive)` is the entry point.** It is `descendToLeaf` for an inclusive bound,
+  and `descendMode(..., nextKey=true)` for an exclusive one.
+- **The nextkey descent uses `compareHigh` on both tests.** `findChildBlockDirect` takes the first item with
+  `compareHigh(item, lo) > 0`, and the right-link check moves right on `keyAtOrPastHighKey`, i.e. while
+  `compareHigh(highkey, lo) <= 0`.
+- **The scans use it.** `NewScanCursor` and the eager `rangeScanPosLeaf` descend through it. Their per-leaf
+  "nothing here reaches lo" skip is `lowerBoundPastPage`, the same test, so a leaf the descent could not avoid
+  costs one high-key comparison instead of a binary search.
+- **No result changes.** `scanLeafItems` already treats an exclusive lower bound as "skip the whole equal-key
+  group" (`compareHigh(key, lo) <= 0`), so the descent only reaches the same first entry sooner. For the blob
+  format `compareHigh` is `compare`, so its descent is unchanged.
+
+**Pin.** `TestExclusivePrefixBoundDescendsPastTheGroup` builds a 2-column tree whose a=2 group spans many
+leaves. It checks four things:
+
+- the nextkey descent lands on the leaf of the first a=3 entry, or its left neighbour;
+- the inclusive descent lands elsewhere;
+- the cursor and the eager scan return exactly the entries past the group;
+- the cursor reads at most one leaf before the first of them.
+
+Disabling the nextkey descent fails it. The nbtree package passes under `-race` (98 s).
+
+**Measured.** Warm, two interleaved rounds of three:
+
+| query | HEAD (s) | candidate (s) | PG (s) |
+|---|---|---|---|
+| TPC-DS Q72 | 8.38–10.42 | 2.31–2.60 | 3.4 |
+
+That is −71 %, and goopg is now ahead of PG on Q72. Q72, Q94, Q95 and Q16 output is byte-identical to
+`:65438`. In the sf025 sweep, the 99-query sum went from 147.2 s to 142.0 s, with Q72 at 3.1 s. TPC-H is flat
+(15.11 vs 15.21 s, `GOGC=100`).
+
+**Left.** A later leaf that the walk does read is still binary-searched against the bound, where `_bt_readpage`
+starts at the first item on any page after the first. goopg also still descends twice per prefix group in the
+weekly-dates case, as PG does without skip-support hits. Both are recorded in the deferral ledger.
