@@ -1940,6 +1940,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Named target TPC\-DS Q72: 28M leaf binary searches for 0\.93M cursors — the skip walk's past\-the\-group jump descended
       to the group's FIRST leaf; NewScanCursor / rangeScanPosLeaf now use the nextkey descent \(\_bt\_first `>`\) and skip a
       leaf below the bound on its high key\. Q72 8\.4–10\.4 → 2\.3–2\.6 s \(PG 3\.4\); sweep 147\.2 → 142\.0 s; TPC\-H flat\.
+  - **Slice 42 — one identity\-key memo per search, indexed sameClass LANDED 2026\-10\-22\.** Movement: none — planning time
+    only\. The S3 instrument is plan/value identity: tpcds\-fireset PASS \(99/99, no changed query\), sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 4
+    "Slice 42"\.
+    - Named target TPC\-DS Q64 \(fresh gap census: 4\.4 s vs PG 0\.36, ratio 12\): leadingMembersOf 50 % — sameClass linear
+      scans \(30 %\) and per\-rel key re\-formatting \(26 %\)\. searchCtx\.exprKeys is now shared; ecClassOf indexes members\.
+    - Q64 EXPLAIN 2\.9 → 1\.7 s, run 3\.5 → 2\.4 s \(−32 %\); sweep Q64 4\.36 → 1\.85 s; TPC\-H identical\.
+    - Gap census \(warm, :65438\) for next targets: Q35 3\.4 vs 0\.35, Q83 1\.3 vs 0\.10, Q5 1\.6 vs 0\.31, Q39 2\.6 vs 0\.59,
+      Q21 2\.3 vs 0\.70, Q14 16\.8 vs 7\.7\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3910,6 +3919,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `8bbcba80e`** \(M0122\-0012 slice 40 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `a0a569de7`** \(census reused: a0a569de7 touched only internal/access/nbtree, not an S9 trigger path\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239

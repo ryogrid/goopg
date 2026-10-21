@@ -51,6 +51,13 @@ type pathkeyUsefulness struct {
 	// compare (pathkey expressions, merge and query keys), keyed by node
 	// identity, for this rel's lifetime (M0122-0012 slice 32).
 	keys map[Expr]cachedKey
+	// ecByKey / ecByPtr index ecMembers for sameClass: the class id of the
+	// FIRST member, in ecMembers order, with each identity key (keyed
+	// members) or each expression node (members without a key). Built
+	// lazily on first use; ecMembers is complete by then. M0122-0012 slice 42.
+	ecIndexed bool
+	ecByKey   map[string]int
+	ecByPtr   map[Expr]int
 }
 
 type cachedKey struct {
@@ -103,6 +110,15 @@ type classMember struct {
 	keyed bool // key/keyOK were computed; a literal member falls back to the memo
 }
 
+// newClassMember is newClassMember with the key taken from u's memo.
+func (u *pathkeyUsefulness) newClassMember(e Expr, relids RelSet, id int) classMember {
+	m := classMember{expr: e, relids: relids, id: id, keyed: true}
+	if e != nil {
+		m.key, m.keyOK = u.keyOf(e)
+	}
+	return m
+}
+
 func newClassMember(e Expr, relids RelSet, id int) classMember {
 	m := classMember{expr: e, relids: relids, id: id, keyed: true}
 	if e != nil {
@@ -138,8 +154,15 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	if s == nil {
 		return nil
 	}
+	if s.exprKeys == nil {
+		s.exprKeys = make(map[Expr]cachedKey)
+	}
+	// The identity-key memo is the search's, not this rel's: TPC-DS Q64
+	// builds hundreds of join rels over the same clause and pathkey
+	// expressions, and re-formatting their keys per rel was 26 % of its
+	// planning (M0122-0012 slice 42).
 	u := &pathkeyUsefulness{queryPathkeys: s.queryPathkeys, groupPathkeys: s.groupPathkeys,
-		distinctPathkeys: s.distinctPathkeys, relids: joinrelids}
+		distinctPathkeys: s.distinctPathkeys, relids: joinrelids, keys: s.exprKeys}
 	if s.clauses == nil {
 		return u
 	}
@@ -163,13 +186,13 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 		} else {
 			if relsSubset(ri.leftRelids, joinrelids) && relsSubset(ri.rightRelids, joinrelids) {
 				u.classMembers = append(u.classMembers,
-					newClassMember(ri.leftKey, ri.leftRelids, id), newClassMember(ri.rightKey, ri.rightRelids, id))
+					u.newClassMember(ri.leftKey, ri.leftRelids, id), u.newClassMember(ri.rightKey, ri.rightRelids, id))
 			}
 		}
 		classes[id] = append(classes[id], member{ri.leftKey, ri.leftRelids}, member{ri.rightKey, ri.rightRelids})
 		if ri.ecID != noEquivClass {
 			u.ecMembers = append(u.ecMembers,
-				newClassMember(ri.leftKey, ri.leftRelids, id), newClassMember(ri.rightKey, ri.rightRelids, id))
+				u.newClassMember(ri.leftKey, ri.leftRelids, id), u.newClassMember(ri.rightKey, ri.rightRelids, id))
 		}
 	}
 	for _, ms := range classes {
@@ -253,20 +276,47 @@ func (u *pathkeyUsefulness) leadingMembersOf(keys, list []PathKey) int {
 // PG's canonical pathkeys; equivalentWithin is the narrower question of
 // whether this rel's rows are ordered alike by both.
 func (u *pathkeyUsefulness) sameClass(a, b Expr) bool {
-	ka, oka := u.keyOf(a)
-	kb, okb := u.keyOf(b)
-	ida, idb := -1, -1
-	for i := range u.ecMembers {
-		m := &u.ecMembers[i]
-		mk, mok := u.memberKey(m)
-		if ida < 0 && exprEqualKeyed(m.expr, mk, mok, a, ka, oka) {
-			ida = m.id
-		}
-		if idb < 0 && exprEqualKeyed(m.expr, mk, mok, b, kb, okb) {
-			idb = m.id
+	ida := u.ecClassOf(a)
+	return ida >= 0 && ida == u.ecClassOf(b)
+}
+
+// ecClassOf is the class id of the first member of ecMembers that e equals
+// (exprEqualKeyed), or -1. That first match is found by lookup instead of a
+// scan of every member (M0122-0012 slice 42: the scan was 30 % of TPC-DS
+// Q64's planning). An expression with an identity key equals exactly the
+// members carrying the same key — a member that is the same node carries the
+// same key — so the first keyed match is ecByKey[key]. An expression without
+// a key equals only itself, so its first match is ecByPtr[e]. A nil e equals
+// only a nil member, which ecByPtr also records.
+func (u *pathkeyUsefulness) ecClassOf(e Expr) int {
+	if !u.ecIndexed {
+		u.ecIndexed = true
+		u.ecByKey = make(map[string]int, len(u.ecMembers))
+		u.ecByPtr = make(map[Expr]int, len(u.ecMembers))
+		for i := range u.ecMembers {
+			m := &u.ecMembers[i]
+			if mk, mok := u.memberKey(m); mok {
+				if _, seen := u.ecByKey[mk]; !seen {
+					u.ecByKey[mk] = m.id
+				}
+			}
+			if _, seen := u.ecByPtr[m.expr]; !seen {
+				u.ecByPtr[m.expr] = m.id
+			}
 		}
 	}
-	return ida >= 0 && ida == idb
+	if e != nil {
+		if k, ok := u.keyOf(e); ok {
+			if id, hit := u.ecByKey[k]; hit {
+				return id
+			}
+			return -1
+		}
+	}
+	if id, hit := u.ecByPtr[e]; hit {
+		return id
+	}
+	return -1
 }
 
 // usefulForMerging is pathkeys_useful_for_merging: the leading pathkeys, in

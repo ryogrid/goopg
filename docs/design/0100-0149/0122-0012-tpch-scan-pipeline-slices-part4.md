@@ -435,3 +435,55 @@ That is −71 %, and goopg is now ahead of PG on Q72. Q72, Q94, Q95 and Q16 outp
 **Left.** A later leaf that the walk does read is still binary-searched against the bound, where `_bt_readpage`
 starts at the first item on any page after the first. goopg also still descends twice per prefix group in the
 weekly-dates case, as PG does without skip-support hits. Both are recorded in the deferral ledger.
+
+## Slice 42 (2026-10-22): one identity-key memo per search, and an indexed sameClass — TPC-DS Q64
+
+**Target, named up front:** TPC-DS Q64. A fresh warm gap census against `:65438` put it at 4.4 s against PG's
+0.36 s, a ratio of 12, the largest left. A plain EXPLAIN took 2.9–4.6 s, so it is still planning.
+
+**Cause.** In the planning profile, `pathkeyUsefulness.leadingMembersOf` took 50 %. Within it:
+
+- **`sameClass` scanned the members.** It walked every equivalence-class member twice per call (30 %), once for
+  each operand.
+- **Identity keys were built again for every join rel.** `appendExprIdentityKey`, building keys, took 26 %.
+  Slice 32's memo lived on each rel's `pathkeyUsefulness`, so each of Q64's hundreds of join rels re-formatted
+  the keys of the same clause and pathkey expressions.
+
+**Rule.**
+
+- **One memo for the whole search.** `searchCtx.exprKeys` is created once, and every rel's `pathkeyUsefulness`
+  shares it as its `keys`. Members are built with `u.newClassMember`, so their keys come from that memo too. The
+  search runs in one goroutine. The in-place `ColumnRef` rewrites in the optimizer act on fresh clones or in
+  plan creation, not on the nodes the search keys.
+- **`sameClass` is two lookups.** It is `ecClassOf(a) == ecClassOf(b)`. `ecClassOf` reads two lazily built
+  indexes:
+  - `ecByKey`: the class of the first member in `ecMembers` order with each identity key;
+  - `ecByPtr`: the class of the first member that is each node.
+
+  An expression with a key equals exactly the members carrying that key, since a member that is the same node
+  carries the same key. So its first match is `ecByKey[key]`. A keyless expression equals only itself, so its
+  first match is `ecByPtr[e]`. This preserves the scan's "first match wins" answer.
+
+**Pin.** `TestSameClassIndexMatchesScan` compares `ecClassOf` and `sameClass` against the old scan over:
+
+- keyed and literal members;
+- a key duplicated across two classes;
+- a keyless sublink, which matches by node only;
+- a nil member and nil probes.
+
+Making the index keep the LAST duplicate fails it.
+
+**Measured.** Warm, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q64, plain EXPLAIN | 2.5–4.2 | 1.7–1.8 |
+| TPC-DS Q64, full run | 3.2–3.8 | 2.3–2.5 |
+
+The full run is ~−32 %. In the sf025 sweep, Q64 went from 4.36 to 1.85 s. Plans did not move: the sweep's plan
+shapes are identical, and the fire-set gate found no changed query on SF1. TPC-H is identical (14.84 s, the
+same on both builds).
+
+**Left.** PG's pathkeys are canonical and compare by EquivalenceClass pointer. goopg still keys expressions by
+identity strings, through map lookups on interface keys (`runtime.ifaceeq` was ~10 %). That is the slice 32
+ledger row, with a progress row added for this slice.
