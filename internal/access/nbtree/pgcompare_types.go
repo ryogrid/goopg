@@ -342,8 +342,19 @@ type numericParts struct {
 	special  uint16 // 0 when finite, else numNaN/numPInf/numNInf
 	negative bool
 	weight   int
-	digits   []int16
+	// raw is the NBASE digit array as stored: little-endian int16 pairs,
+	// read in place by dig rather than copied out. Decoding it into a fresh
+	// []int16 cost two allocations per key comparison — mallocgc was 17 % of
+	// TPC-H Q3, whose lineitem index probes compare numeric l_orderkey keys
+	// (M0122-0012 slice 31).
+	raw []byte
 }
+
+// ndig is the number of NBASE digits.
+func (n numericParts) ndig() int { return len(n.raw) / 2 }
+
+// dig is digit i.
+func (n numericParts) dig(i int) int16 { return int16(binary.LittleEndian.Uint16(n.raw[2*i:])) }
 
 // PGCompareNumeric is numeric_cmp over the on-disk NumericData varlena.
 //
@@ -390,16 +401,16 @@ func numericSpecialRank(n numericParts) int {
 // cmpNumericVar is cmp_var_common: sign first (with zero — an empty digit
 // array — treated as neither positive nor negative), then magnitude.
 func cmpNumericVar(a, b numericParts) int {
-	if len(a.digits) == 0 {
+	if a.ndig() == 0 {
 		switch {
-		case len(b.digits) == 0:
+		case b.ndig() == 0:
 			return 0
 		case b.negative:
 			return 1
 		}
 		return -1
 	}
-	if len(b.digits) == 0 {
+	if b.ndig() == 0 {
 		if a.negative {
 			return -1
 		}
@@ -425,23 +436,23 @@ func cmpNumericVar(a, b numericParts) int {
 func cmpNumericAbs(a, b numericParts) int {
 	i1, i2 := 0, 0
 	w1, w2 := a.weight, b.weight
-	for w1 > w2 && i1 < len(a.digits) {
-		if a.digits[i1] != 0 {
+	for w1 > w2 && i1 < a.ndig() {
+		if a.dig(i1) != 0 {
 			return 1
 		}
 		i1++
 		w1--
 	}
-	for w2 > w1 && i2 < len(b.digits) {
-		if b.digits[i2] != 0 {
+	for w2 > w1 && i2 < b.ndig() {
+		if b.dig(i2) != 0 {
 			return -1
 		}
 		i2++
 		w2--
 	}
 	if w1 == w2 {
-		for i1 < len(a.digits) && i2 < len(b.digits) {
-			if d := int(a.digits[i1]) - int(b.digits[i2]); d != 0 {
+		for i1 < a.ndig() && i2 < b.ndig() {
+			if d := int(a.dig(i1)) - int(b.dig(i2)); d != 0 {
 				if d > 0 {
 					return 1
 				}
@@ -453,13 +464,13 @@ func cmpNumericAbs(a, b numericParts) int {
 	}
 	// One side has digits the other does not: the extra digits decide, but only
 	// if any of them is non-zero (trailing zeros are still equal).
-	for ; i1 < len(a.digits); i1++ {
-		if a.digits[i1] != 0 {
+	for ; i1 < a.ndig(); i1++ {
+		if a.dig(i1) != 0 {
 			return 1
 		}
 	}
-	for ; i2 < len(b.digits); i2++ {
-		if b.digits[i2] != 0 {
+	for ; i2 < b.ndig(); i2++ {
+		if b.dig(i2) != 0 {
 			return -1
 		}
 	}
@@ -520,11 +531,7 @@ func decodeNumericParts(raw []byte) (numericParts, bool) {
 	if len(rest)%2 != 0 {
 		return numericParts{}, false
 	}
-	digits := make([]int16, len(rest)/2)
-	for i := range digits {
-		digits[i] = int16(binary.LittleEndian.Uint16(rest[2*i:]))
-	}
-	return numericParts{negative: negative, weight: weight, digits: digits}, true
+	return numericParts{negative: negative, weight: weight, raw: rest}, true
 }
 
 // ---------------------------------------------------------------------------

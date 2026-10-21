@@ -325,3 +325,31 @@ a call layer. It was reverted.
 
 Removing the recursion needs PG's shape: a flat step program over a result register, not a helper on the same
 recursive interface (ledger slice 27 row).
+
+## Slice 31 (2026-10-21): numeric B-tree keys compare in place — TPC-H Q3
+
+**Cause.** Q3's per-orders-row probe of lineitem's `l_orderkey` index (HammerDB declares the key `numeric`) spent
+15 % in `comparePGIndexTuples` and 10.5 % in `PGCompareNumeric`, with `mallocgc` at 16.8 % of the query.
+`decodeNumericParts` copied the NBASE digit array of both keys into a fresh `[]int16`, so every key comparison of
+every descent made two heap allocations.
+
+**Rule.** `numericParts` keeps `raw`, a view of the stored little-endian digit pairs, and `dig(i)` reads digit i in
+place. `cmpNumericVar` and `cmpNumericAbs` use `ndig()`/`dig()`. The comparison is still upstream's `cmp_numerics` /
+`cmp_var_common`, digit for digit; only the copy is gone.
+
+**Pin.** `TestPGCompareNumericMatchesExactOrder` compares 407 values pairwise against exact `big.Rat` comparison:
+
+- random signs;
+- up to 12 integer digits and scales 0–12;
+- NBASE boundary values such as 9999, 10000 and 0.9999.
+
+Reading the digits big-endian fails it. The existing hand-picked total-order test did not catch that mutation:
+for small digit values a big-endian read stays order-preserving.
+
+**Measured.** HEAD `836273d83` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q3 | ~0.46 | ~0.44 | ~4 %; the first round was ~0.52 against ~0.44 |
+| Q21 | — | — | ~2 % |
+| Q18 | — | — | within its run-to-run swing |
