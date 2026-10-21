@@ -1409,6 +1409,30 @@ func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
 	return err
 }
 
+// skipReadSet is the set of columns this scan's row must carry decoded, or
+// nil when every column must be (slice 19's walk-past declines). It is the
+// consumer's read set (readCols) plus, for a scan with an absorbed qual, the
+// qual's own columns (slice 29): the late qual reads the finished row. A
+// resolved GiST/GIN SSI hook (Open, before this is consulted) reads the row
+// too, and declines.
+func (o *seqScanOp) skipReadSet() []bool {
+	if o.readCols == nil || o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 {
+		return nil
+	}
+	if !o.qualSet {
+		return o.readCols
+	}
+	qr := deformScanReadSet(len(o.cols), o.qual)
+	if qr == nil {
+		return nil
+	}
+	read := make([]bool, len(o.cols))
+	for i := range read {
+		read[i] = qr[i] || (i < len(o.readCols) && o.readCols[i])
+	}
+	return read
+}
+
 // decodeScanRowRange is decodeScanRow over a column window, returning the byte
 // offset reached so the caller can resume. Used by the prefilter path in Next
 // to deform only the predicate's columns first; see scan_prefilter.go.
@@ -1499,13 +1523,6 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// Context — the only way the GUCs can differ mid-operator — re-reads them.
 	o.arrayStyleLive = colsHaveArray(o.cols)
 	o.colInfo = resolveColTypeInfo(o.cols)
-	if o.readCols != nil && !o.qualSet && o.ssiGistPred == nil && o.ssiGinPred == nil {
-		for i := range o.colInfo {
-			if i < len(o.readCols) && !o.readCols[i] {
-				o.colInfo[i].skip = true
-			}
-		}
-	}
 	if o.arrayStyleLive {
 		o.arrayStyle = arrayOutputStyle(ctx)
 	}
@@ -1609,6 +1626,17 @@ func (o *seqScanOp) Open(ctx *Context) error {
 				o.ginSSIFastUpdate = fu
 				o.ginSearchKeys = keys
 				ssiRecordGinKeyRead(ctx, o.rel.DBOid, oid, keys, fu)
+			}
+		}
+	}
+	// Slice 19/29: walk past the columns nothing reads. Applied here, after
+	// the GiST/GIN SSI hooks are resolved: an absorbed Filter always sets
+	// ssiGistPred/ssiGinPred, but a hook reads the row only once its index
+	// OID resolved.
+	if read := o.skipReadSet(); read != nil {
+		for i := range o.colInfo {
+			if i < len(read) && !read[i] {
+				o.colInfo[i].skip = true
 			}
 		}
 	}

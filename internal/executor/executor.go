@@ -640,7 +640,16 @@ func markProjectScanReads(p *optimizer.Project, child Operator) {
 	if scanSkipDisabled || isIdentityProject(p) {
 		return
 	}
-	if _, ok := p.Child.(*optimizer.SeqScan); !ok {
+	switch c := p.Child.(type) {
+	case *optimizer.SeqScan:
+	case *optimizer.Filter:
+		// M0122-0012 slice 29: a Filter directly over the scan is absorbed
+		// into it (the child operator IS the seqScanOp), and Open adds the
+		// qual's own columns to the read set.
+		if _, ok := c.Child.(*optimizer.SeqScan); !ok {
+			return
+		}
+	default:
 		return
 	}
 	so := unwrapSeqScanOp(child)

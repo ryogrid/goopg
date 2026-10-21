@@ -661,3 +661,51 @@ that is ledgered.
 - merge joins, Sort, Filter and GatherMerge still stop the descent;
 - the sublink caches store result Datums undetached;
 - there is no arena-backed unit fixture.
+
+## Slice 29 (2026-10-21): filtered scans walk past unread columns — TPC-H Q21
+
+**Census.** A per-query pass after slice 28 ranks the largest gaps as Q13 (2.81 / 1.50 s), Q18 (4.00 / 3.39), Q10
+(1.09 / 0.62) and Q21 (0.96 / 0.53).
+
+Q11 read 0.34 s in that pass. Interleaved runs of the slice 26, 27 and 28 builds all measure it at ~0.19 s warm,
+so the 0.34 s is a whole-suite artifact, not a regression.
+
+**Cause.** Q21 is decode-bound: `decodeRowRangeInfo` is 37 % cumulative. Its lineitem scan carries a filter
+(`l_receiptdate > l_commitdate`) and sits directly under a narrowing Project. Slice 19's walk-past did not apply,
+for two reasons:
+
+- `markProjectScanReads` required the Project's plan child to be a `SeqScan`, but a filtered scan's plan child is
+  `Filter{SeqScan}`. The Filter is absorbed into the scan operator.
+- Open declined every scan that had a qual or the SSI predicates. An absorbed Filter always sets `ssiGistPred` and
+  `ssiGinPred` to its predicate, but those hooks read the row only once Open resolves an index OID for them, and
+  that resolution happens after the skip flags were computed. So no filtered scan ever skipped.
+
+**Rule:**
+
+- `markProjectScanReads` also accepts a `Filter` directly over the `SeqScan`.
+- `seqScanOp.skipReadSet` is the consumer read set, plus the qual's own columns (`deformScanReadSet`) for a scan
+  with an absorbed qual. The late qual reads the finished row, so its columns must stay decoded. An unbounded qual
+  declines.
+- The skip flags are applied after the GiST/GIN SSI hooks resolve, and decline only when a hook's index OID
+  resolved (`gistSSIIdxOID`, `ginSSIIdxOID`).
+- The prefilter's `pfInfo` copies `colInfo` afterwards, so it inherits the skips.
+
+**Pin.** `TestScanSkipMatchesFullDecode` gains three filtered queries:
+
+- an early qual;
+- a qual on the last column, which gets no prefilter, so the late path;
+- a two-column date and float qual.
+
+Every query must now arm at least one skip after Open. That assertion exists because the first version of this
+slice passed vacuously, with no skip armed, before the SSI ordering was found. With tail poison armed, the results
+must equal the full decode. Leaving the qual's columns out of the read set trips the poison.
+
+**Measured.** HEAD `d857ea0b9` against the candidate, three interleaved rounds of five runs:
+
+| query | HEAD warm (s) | candidate warm (s) | change |
+|---|---|---|---|
+| Q21 | ~0.95 | ~0.86 | −9 % |
+| Q10 | — | — | unchanged; its filtered scans are not directly under a Project |
+
+**Not done (ledgered):** the read set still comes only from a Project directly over the scan. A scan feeding a join
+decodes its whole deform window: the set-valued twin of the deform bound through joins.

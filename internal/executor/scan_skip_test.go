@@ -7,7 +7,8 @@ import (
 )
 
 // TestScanSkipMatchesFullDecode pins the walk-past of unread columns
-// (M0122-0012 slice 19): a seq scan under a non-identity Project decodes only
+// (M0122-0012 slice 19; filtered scans since slice 29, whose qual columns join
+// the read set): a seq scan under a non-identity Project decodes only
 // the columns the Project's targets read and steps over the others by their
 // stored length (skipAttrLen). Every type below sits before a column that is
 // read, so a wrong step for any of them would misplace every later column.
@@ -32,6 +33,12 @@ func TestScanSkipMatchesFullDecode(t *testing.T) {
 		"SELECT tx, last FROM sk",
 		"SELECT big, last FROM sk",
 		"SELECT b, d, last FROM sk",
+		// Slice 29: a Filter absorbed into the scan; the qual's columns join
+		// the read set, early (prefilter) and late (a qual on the last
+		// column gets no prefilter) alike.
+		"SELECT last, i4 FROM sk WHERE i2 % 3 = 1",
+		"SELECT tx, n FROM sk WHERE last > 1500",
+		"SELECT big FROM sk WHERE d > DATE '2020-01-14' AND f8 < 200",
 	}
 	for _, q := range queries {
 		plan, err := testPlanDeform(t, ctx, q)
@@ -57,6 +64,20 @@ func TestScanSkipMatchesFullDecode(t *testing.T) {
 		if scan == nil || scan.readCols == nil {
 			t.Fatalf("%s: the scan records no read set; nothing is exercised", q)
 		}
+		// The skip flags are set in Open (after the SSI hooks resolve); a
+		// read set that never arms one exercises nothing (slice 29: an
+		// absorbed Filter's ssiGistPred once disarmed every filtered scan).
+		if err := op.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		armed := false
+		for _, ci := range scan.colInfo {
+			armed = armed || ci.skip
+		}
+		_ = op.Close()
+		if !armed {
+			t.Fatalf("%s: no column is skipped after Open; nothing is exercised", q)
+		}
 		old := seqScanDeformPoison
 		seqScanDeformPoison = true
 		got := sortedRowValues(t, ctx, q)
@@ -67,8 +88,8 @@ func TestScanSkipMatchesFullDecode(t *testing.T) {
 		if strings.Join(got, "|") != strings.Join(want, "|") {
 			t.Fatalf("%s:\nskipping %v\nfull     %v", q, got[:min(5, len(got))], want[:min(5, len(want))])
 		}
-		if len(got) != 2000 {
-			t.Fatalf("%s: %d rows, want 2000", q, len(got))
+		if len(got) == 0 || (!strings.Contains(q, "WHERE") && len(got) != 2000) {
+			t.Fatalf("%s: %d rows", q, len(got))
 		}
 	}
 }
