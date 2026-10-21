@@ -1781,6 +1781,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       such pairs compare by strings\.Compare after the bpchar normalisation\.
     - Pin: TestExprSiblingParityStringCompare \(compiled vs interpreted; text/bpchar/untyped; caught both mutations\)\.
       Q10 ~1\.04 → ~0\.95 s; Q12 unchanged\.
+  - **Measured, not landed 2026\-10\-21 \(after slice 30\)\.** Doc split: slices 25–30 moved to
+    0122\-0012\-tpch\-scan\-pipeline\-slices\-part3\.md \(indexed\)\.
+    - Read set through joins: a debug build showed Q13/Q10's scans already carry read sets except Q10's orders
+      \(early qual rejects ~96%\) — little payoff for a ~30\-site refactor; stays ledgered\.
+    - Inline leaf fetch \(evalFastLeaf\) in the compiled BinaryOp arm: Q6 ~0\.32 → ~0\.35 s \(slower\), Q10/Q1 neutral;
+      reverted\. Removing the recursion needs a flat step program \(ledger row\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3687,6 +3693,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-21 — **exhausted at `c53226b14`** \(M0122\-0012 slice 29 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261021o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-21 — **exhausted at `5fcdbb6e0`** \(M0122\-0012 slice 30 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261021p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
