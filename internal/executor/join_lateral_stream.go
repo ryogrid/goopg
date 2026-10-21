@@ -291,6 +291,11 @@ func (m *lateralJoinStream) stepInner() (Row, bool, error) {
 		}
 		return cloneRow(m.outerRow), true, nil
 	}
+	if m.o.nlEmitBorrowed {
+		// The consumer is done with this row before the next stepInner
+		// rewrites m.pair (markScanBorrowChain).
+		return m.pair, true, nil
+	}
 	return cloneRow(m.pair), true, nil
 }
 

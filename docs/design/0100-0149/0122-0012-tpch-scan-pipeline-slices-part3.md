@@ -622,3 +622,47 @@ showed 0.40 → 0.72 s on the candidate in both rounds. Under `GOGC=100` and in 
 - **`indexOnlyScanOp` still allocates a fresh output row per row** (`projectKeyVals` / `projectHeapRow`).
 - **`lateralJoinStream` clones every emitted pair.** That is `cloneRow(m.pair)`, 2.2 s on the micro.
 - **The probe shape is still ~2× PG's CPU.** Both items above are recorded in the deferral ledger.
+
+## Slice 37 (2026-10-22): a borrowed nested loop emits its pair buffer — the Q14 probe shape
+
+**Cause.** After slice 36, the nested loop's emit was the next allocation on the probe micro
+(`tmp/q14-micro.sql`). Both streaming loops, `lateralJoinStream.stepInner` and `nlJoinStream`'s inner step,
+built every joined pair in a reused buffer and then emitted `cloneRow(m.pair)`, a fresh row per output tuple.
+That clone cost 2.2 s of a 30 s profile.
+
+PG's NestLoop returns its projected result slot, which is valid until the next call; it makes no copy.
+
+**Rule.** `markScanBorrowChain` already descends through a nested-loop `joinOp` from a borrowing root:
+
+- a borrowing aggregate;
+- a hash join's build side;
+- a Gather worker tree.
+
+Each such root copies whatever it keeps before pulling again. On that descent it now also sets
+`nlEmitBorrowed`, so both streams emit `m.pair` itself. The consumer is done with the row before the next call
+rewrites the buffer, which is the same contract `nlOuterBorrowed` relies on for the outer row since slice 28.
+Off the borrow chain both streams still clone.
+
+**Pin.** `TestScanBorrowThroughNestedLoopOuter` now also asserts that every streaming nested loop on the
+borrowed chain has `nlEmitBorrowed` set. Leaving the flag unset fails it. Its existing comparison still checks
+the results against the cloning path (`scanBorrowDisabled`) with the deform poison armed, over five plain,
+non-equi and LATERAL shapes.
+
+**Measured.** Warm, interleaved:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| probe micro (parallel) | 0.50–0.63 | 0.40–0.41 |
+| TPC-DS Q14 | 15.83–16.42 | 15.82–16.40 |
+| TPC-H total (`GOGC=100`, fresh HEAD build) | 15.37–15.82 | 15.36–15.38 |
+
+The sf025 sweep's 99-query sum is 168.2 s.
+
+**Erratum for slice 36.** TPC-H Q5 and Q7 are bimodal from run to run on the same binary. Across two rounds,
+a freshly built HEAD gave Q5 0.63 and 0.39 s, and Q7 0.62 and 0.58 s. So slice 36's Q5 "−30 %" and Q7 "−20 %"
+rows overstate it. Its robust results are the probe micro (−35 %) and Q14 (−5.5 %, consistent over two rounds).
+Treat any single-query TPC-H delta below ~0.2 s as noise unless it repeats across ≥ 3 interleaved rounds.
+
+**Left.** `indexOnlyScanOp` still allocates its output row per row. The Q14 statement-level gap (16.0 s against
+PG's 8.5 s) now sits in the wide prefix deform of the fact-table probes (slice 35, ledgered) and in the descent
+itself.

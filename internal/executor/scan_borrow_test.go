@@ -411,6 +411,13 @@ func TestScanBorrowThroughNestedLoopOuter(t *testing.T) {
 		if outer == nil || !outer.borrowRows {
 			t.Fatalf("%s: the nested loop's outer scan does not borrow (borrowing: %v)", q, borrowedScanTables(op))
 		}
+		// M0122-0012 slice 37: a streaming nested loop on the borrowed
+		// chain emits its reused pair buffer instead of a clone per row.
+		for _, j := range streamingNestedLoops(op) {
+			if !j.nlEmitBorrowed {
+				t.Fatalf("%s: a streaming nested loop on the borrow chain still clones every emitted row", q)
+			}
+		}
 		old := seqScanDeformPoison
 		seqScanDeformPoison = true
 		got := sortedRowValues(t, ctx, q)
@@ -425,6 +432,24 @@ func TestScanBorrowThroughNestedLoopOuter(t *testing.T) {
 			t.Fatalf("%s: no rows", q)
 		}
 	}
+}
+
+// streamingNestedLoops returns the nested-loop joinOps on a built tree's
+// row-carrying path (the shapes markScanBorrowChain descends through).
+func streamingNestedLoops(op Operator) []*joinOp {
+	switch o := op.(type) {
+	case *instrumentedOp:
+		return streamingNestedLoops(o.inner)
+	case *aggregateOp:
+		return streamingNestedLoops(o.child)
+	case *projectOp:
+		return streamingNestedLoops(o.child)
+	case *joinOp:
+		if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			return append([]*joinOp{o}, streamingNestedLoops(o.left)...)
+		}
+	}
+	return nil
 }
 
 // hasNestedLoop reports whether a built tree holds a nested loop — a

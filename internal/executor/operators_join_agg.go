@@ -56,6 +56,12 @@ type joinOp struct {
 	// next outer row only after the inner side is done with this one, so its
 	// values stay valid without the deep clone.
 	nlOuterBorrowed bool
+	// nlEmitBorrowed is set by markScanBorrowChain on the same descent: the
+	// consumer above this nested loop passes each row up (or copies what it
+	// keeps) before pulling the next one, so the streaming loops emit their
+	// reused joined-pair buffer instead of a clone per row — PG's NestLoop
+	// returns its projected result slot the same way (M0122-0012 slice 37).
+	nlEmitBorrowed bool
 
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table

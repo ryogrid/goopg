@@ -395,6 +395,11 @@ func (m *nlJoinStream) stepInner() (Row, bool, error) {
 	if m.fillInner {
 		m.markInner(j)
 	}
+	if m.o.nlEmitBorrowed {
+		// The lateral stream's sibling (stepInner): the consumer is done
+		// with this row before the next call rewrites m.pair.
+		return m.pair, true, nil
+	}
 	return cloneRow(m.pair), true, nil
 }
 

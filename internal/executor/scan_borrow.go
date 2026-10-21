@@ -103,7 +103,12 @@ func markScanBorrowChain(op Operator) {
 				// lateral CTE cache). PG's NestLoop holds the outer slot
 				// across the inner rescans the same way. TPC-H Q3's orders
 				// probe sits under one.
+				//
+				// The loop's own output passes up the same chain, so it is
+				// borrowed too: the joined pair is emitted from the reused
+				// buffer, not cloned per row (M0122-0012 slice 37).
 				o.nlOuterBorrowed = true
+				o.nlEmitBorrowed = true
 				op = o.left
 				continue
 			}
