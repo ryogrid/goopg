@@ -405,10 +405,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// so every worker's private tree narrows the same leaves. A worker
 		// built through the public BuildWorker entry (no bound in scope)
 		// declines to full deform.
-		workerBound := deformBoundBelow(p, bound)
-		return maybeInstrument(p, newGatherOp(p, func(scope *instrumenter) (Operator, error) {
-			return buildNode(p.Child, workerBound, scope)
-		}), scope), nil
+		return maybeInstrument(p, newGatherNode(p, bound), scope), nil
 	case *optimizer.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams. The GatherMerge keys (folded
@@ -658,6 +655,12 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 			return nil, err
 		}
 		return finishSortNode(p, child, scope), nil
+	case *optimizer.Gather:
+		// The workers' rows go only to these consumers, so a worker ships
+		// just the columns they read (M0122-0012 slice 39).
+		g := newGatherNode(p, bound)
+		g.liveCols = consumerLiveColumns(consumers)
+		return maybeInstrument(p, g, scope), nil
 	case *optimizer.IncrementalSort:
 		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
 		child, err := buildCompleteChild(p.Child, deformBoundBelow(p, bound), keys, scope)
@@ -667,6 +670,20 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		return finishIncrementalSortNode(p, child, scope), nil
 	}
 	return buildNode(n, bound, scope)
+}
+
+// newGatherNode builds a Gather whose workers each construct their own tree
+// over the partial plan, narrowed by the bound captured here — shared by
+// buildNode's Gather arm and buildCompleteChild so the two cannot drift.
+func newGatherNode(p *optimizer.Gather, bound int) *gatherOp {
+	// EX1-01: the bound is captured into the worker buildChild closure
+	// so every worker's private tree narrows the same leaves. A worker
+	// built through the public BuildWorker entry (no bound in scope)
+	// declines to full deform.
+	workerBound := deformBoundBelow(p, bound)
+	return newGatherOp(p, func(scope *instrumenter) (Operator, error) {
+		return buildNode(p.Child, workerBound, scope)
+	})
 }
 
 // finishSortNode and finishIncrementalSortNode wrap a built child in the sort

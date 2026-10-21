@@ -1917,6 +1917,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Named target TPC\-DS Q81: cteScanOp\.Next allocated a slot per row \(21 % of the correlated SubPlan's CTE rescans\);
       both CTE scan ops now re\-point one slot \(PG CteScanNext / ss\_ScanTupleSlot\)\. Q81 9\.9–11\.8 → 7\.5–8\.2 s \(~−30 %\)\.
     - sf025 sweep sum 168\.2 → 159\.3 s\. Remaining: interpreted OuterColumnRef comparison \(ledger row\)\.
+  - **Slice 39 — a Gather under an aggregate ships only the columns the aggregate reads LANDED 2026\-10\-22\.** Movement:
+    none — perf only\. The S3 instrument is value/plan identity: acceptance arm PASS \(24 MATCH\), sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS poison\-armed\. Doc part 4
+    "Slice 39"\.
+    - Named target TPC\-DS Q23: Gather workers deep\-copied ~50\-column join rows \(cloneRowOwned 11\.6 %\) for
+      HashAggregates reading three; buildCompleteChild now stamps gatherOp\.liveCols \(consumerLiveColumns\)\.
+    - Q23 mean 5\.10 → 4\.49 s \(−12 %, 4 rounds\); sweep sum 159\.3 → 155\.0 s; TPC\-H flat\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3872,6 +3879,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `043bddd4c`** \(M0122\-0012 slice 38 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `c3c0e3b2d`** \(census reused: c3c0e3b2d touched only internal/testport, not an S9 trigger path\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239

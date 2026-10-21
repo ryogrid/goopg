@@ -454,6 +454,45 @@ func projectLiveSet(p *optimizer.Project, consumers []optimizer.Expr) []bool {
 	return live
 }
 
+// consumerLiveColumns marks the row columns consumers read, or returns nil
+// (every column) when it cannot be sure. It answers only "which cells may a
+// consumer read", not "may this expression be narrowed past", so unlike
+// deformScanVisit it walks through function calls and operators of any kind
+// (optimizer.WalkExprHostScope, fail-closed on an expression kind it does not
+// enumerate) and collects their column references. It gives up on anything
+// that can read the row as a whole or outside its cells: a whole-row or
+// negative ColumnRef, a merge whole-row reference, a ctid / tableoid read, or
+// a sublink (an unlowered one pushes the entire outer row). Columns past the
+// highest reference are left out of the mask, which reads them as dead.
+func consumerLiveColumns(consumers []optimizer.Expr) []bool {
+	live := []bool{}
+	for _, e := range consumers {
+		if e == nil {
+			continue
+		}
+		known := true
+		ok := optimizer.WalkExprHostScope(e, func(x optimizer.Expr) {
+			switch r := x.(type) {
+			case *optimizer.ColumnRef:
+				if r.Index < 0 {
+					known = false
+					return
+				}
+				for len(live) <= r.Index {
+					live = append(live, false)
+				}
+				live[r.Index] = true
+			case *optimizer.SubqueryExpr, *optimizer.MergeWholeRowRef, *optimizer.CTIDExpr, *optimizer.TableOidExpr:
+				known = false
+			}
+		})
+		if !ok || !known {
+			return nil
+		}
+	}
+	return live
+}
+
 // aggConsumerExprs is every expression a plain or partial Aggregate evaluates
 // against its child's rows — the arms deformBoundBelow folds.
 func aggConsumerExprs(p *optimizer.Aggregate) []optimizer.Expr {

@@ -83,6 +83,13 @@ type gatherOp struct {
 	// tree may borrow only then. Worker trees always may (markWorkerBorrow).
 	borrowLeader bool
 
+	// liveCols, when set, marks the only columns of the worker rows any
+	// consumer reads (a consumer-complete aggregate's arms directly above;
+	// buildCompleteChild). Workers then ship just those as owned copies
+	// (transferRowForQueueLive) instead of deep-copying the whole row. nil =
+	// every column. M0122-0012 slice 39.
+	liveCols []bool
+
 	group   *ParallelGroup
 	ch      chan rowBatch
 	workers []*Context
@@ -463,7 +470,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		if o.wantCTIDs {
 			tids = append(tids, slotQueueTID(slot))
 		}
-		batch = append(batch, transferRowForQueue(slot))
+		batch = append(batch, transferRowForQueueLive(slot, o.liveCols))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}

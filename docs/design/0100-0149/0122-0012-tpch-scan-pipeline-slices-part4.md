@@ -255,3 +255,65 @@ not take the `OuterColumnRef` operand. Each call:
 - sniffs the string values for pg\_lsn / UUID / row shapes (`textShapeAmbiguous`).
 
 The sniffing is ledgered since slice 30, and the per-call lowercasing now has a row of its own.
+
+## Slice 39 (2026-10-22): a Gather under an aggregate ships only the columns the aggregate reads — TPC-DS Q23
+
+**Target, named up front:** TPC-DS Q23, ~5.2 s warm at HEAD against PG's 2.0 s. It had the largest
+goopg/PG ratio of the remaining SF0.25 gaps.
+
+**Cause.** 11.6 % of Q23's profile was `cloneRowOwned`, called from `MaterializeForTransfer` in the Gather
+workers' send path. Every worker row is deep-copied before it crosses the queue, so the leader never reads
+memory that a worker's arena recycles. Q23's Gathers sit under simple HashAggregates:
+
+- `frequent_ss_items` groups by `substr(i_item_desc, 1, 30)`, `i_item_sk` and `d_date`;
+- `best_ss_customer`'s InitPlan sums `ss_quantity * ss_sales_price` per `c_customer_sk`.
+
+Their worker rows are whole store\_sales ⋈ date\_dim ⋈ item / customer join rows, around 50 columns, of which
+the aggregate reads three. PG's workers send the projected tuple, which holds only the targetlist the parent
+needs. goopg's Gather sits below that projection, so it shipped everything.
+
+**Rule.**
+
+- **`buildCompleteChild` builds the Gather itself.** This is slice 35's consumer-complete chain: a plain or
+  partial Aggregate, whose arms are the only readers of its child's rows. It builds the Gather through the
+  shared `newGatherNode` and stamps `gatherOp.liveCols` from `consumerLiveColumns(consumers)`.
+- **Workers send masked rows.** They call `transferRowForQueueLive`, which goes through `cloneRowOwnedLive`:
+  only live cells are detached from the producer arena; dead cells are NULL, or the deform poison when that is
+  armed.
+- **`consumerLiveColumns` only asks which cells a consumer may read.** So unlike `deformScanVisit` it walks
+  through function calls and operators of any kind. It uses `optimizer.WalkExprHostScope`, which fails closed on
+  unknown kinds, and returns nil (every column) on anything that can read the row as a whole or outside its
+  cells:
+  - a whole-row or negative `ColumnRef`;
+  - `MergeWholeRowRef`;
+  - a ctid or tableoid read;
+  - a sublink.
+- **Every other Gather keeps every column.** A Finalize aggregate reads its child's state columns without an
+  arm, so it is not consumer-complete. The leader's own rows pass up unmasked.
+
+**Pins.**
+
+- `TestConsumerLiveColumns`: a function call's arguments are live; no consumer gives an empty, non-nil mask; a
+  sublink, a whole-row reference or a ctid read gives nil.
+- `TestGatherUnderAggregateShipsLiveColumns`: a simple aggregate over a Gather gives exactly the arm columns,
+  and a Finalize aggregate gives nil. Dropping the stamp fails it.
+- `TestCloneRowOwnedLive`: live cells are copied and dead cells are NULL.
+- The executor package also passes with the deform poison armed, which poisons every dead cell.
+
+**Measured.** Warm, four interleaved rounds of three, two of them in reversed order:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q23, mean | 5.10 (range 3.98–6.49) | 4.49 (range 3.88–4.86) |
+
+That is ~−12 %. The `frequent_ss_items` CTE alone moved only from ~1.25 to ~1.2 s, so most of the gain is in
+`best_ss_customer`'s Gather, whose join rows are wider. The sf025 sweep's 99-query sum went from 159.3 s to
+155.0 s, with Q23 at 3.66 s in the sweep. TPC-H is flat (15.05 / 15.06 s; it has no simple aggregate over a
+Gather).
+
+**Left.**
+
+- **GatherMerge and the leader's own rows are unmasked.**
+- **The workers still evaluate and deform columns nobody reads.** The mask only stops them from being copied.
+  PG's workers project before sending; goopg's plans put the projection above the Gather. This is recorded in
+  the deferral ledger.
