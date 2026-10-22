@@ -691,3 +691,46 @@ and frees it at reset.
 - The finalisation's big-integer variance and square root.
 - The string-keyed group map.
 - The leader's per-row item probe and projection.
+
+## M0122-0016 (2026-10-23): a big-mantissa numeric owns its payload instead of writing it to the permanent arena
+
+**Problem (found in slice 68).** `newNumeric`, `NewNumericBigDatum`, unary minus and `MaterializeArena` stored the
+sign byte and big-endian magnitude of every numeric whose mantissa passes int64 in `mmgr.Perm()`, the
+process-global context documented as never reset or released. 100 000 big-lane divisions grew its usage by
+1.18 MB (about 12 B per result), and every write took the process-wide `permMu` write lock. PG pallocs a numeric
+result in the current memory context (`make_result`, `numeric.c`), which frees it at reset.
+
+**Change.**
+
+- **Owned payload.** `NewNumericBigDatum` builds the payload into the Datum's own `Buf`: `ArenaID` 0,
+  `flagBigNumeric` set, and `Int` holding the payload length. It is owned and garbage-collected like an owned
+  string. Keeping the length in `Int`'s low word means the readers that size a big numeric from it (ANALYZE's
+  width, the spill estimate) need no change.
+- **Readers.** `bigNumericPayload` serves both representations: an owned `Buf`, or an arena payload when
+  `ArenaID != 0` (a dense hash build still re-homes payloads into its build arena). `NumericBigValue` and
+  slice 68's `numericMagUint64` read through it.
+- **Writers.** `newNumeric`, unary minus and `MaterializeArena` produce owned values. `MaterializeArena`
+  detaches an arena payload by copying its bytes. `newBigNumericInCtx` stays as the arena-backed constructor.
+- **Contracts.** `AssertTransferable`'s comment no longer leans on the "big numerics live in Perm" invariant.
+  `TestCloneRowOwnedStillAssertTransferable`, which pinned that contract on purpose, now pins the owned one:
+  the clone has `ArenaID` 0 and its own `Buf`, and it survives the producer arena's reset.
+
+**Pins.**
+
+- `TestBigNumericArithmeticLeavesPermUntouched`: 20 000 big-lane divisions and additions leave `Perm().Usage()`
+  unchanged, and the quotient is an owned big numeric.
+- `TestOwnedBigNumericRoundTrip`: zero, ±1, 2^64 and a 29-digit negative value. Each round-trips through
+  `NumericBigValue` with `Int` equal to the payload length. `MaterializeArena` leaves an owned value as is and
+  detaches an arena copy that survives the arena's reset.
+- Restoring the Perm write fails both tests.
+
+**Measured.** This is a resource fix, not a speed slice. Q39 21.74 → 21.64 Ginstr, Q4 −1.4 %; Q11, Q74 and Q78
+are flat. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite, including numeric.sql
+and aggregates.sql), and plan shapes are identical. The executor package passes with the deform poison armed.
+
+**Also measured: the "bimodal" Q39 wall time.** It is the server's heap growing toward its memory limit. The
+first seven runs of a fresh server each page-fault about 300 K fresh pages (RSS +1.1 GB per run, about 1 s of
+system time per run). Once RSS reaches about 9.2 GB, the pages are recycled and a run takes 1.09–1.11 s
+(user CPU ≈ 2.0 s, sys ≈ 0.1 s). The `tmp/ds-*` instruments restart the server for every sample, so they land
+in either phase. Wall A/Bs on this host must hold server age constant (CLAUDE.md "sweep-tail collapse"), or use
+instruction and user-CPU counts.

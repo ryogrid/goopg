@@ -337,7 +337,9 @@ func TestDenseBuildFullSweepRehomedStrings(t *testing.T) {
 
 // TestCloneRowOwnedStillAssertTransferable pins the F3 boundary from the
 // other side: the legacy primitive Cut 1 leaves untouched still produces
-// worker-transferable rows — including the big-numeric Perm lane.
+// worker-transferable rows — including the big-numeric lane, whose payload
+// a clone now owns (M0122-0016: it used to be re-stored in the never-reset
+// Perm arena).
 func TestCloneRowOwnedStillAssertTransferable(t *testing.T) {
 	prod := mmgr.Acquire(nil, mmgr.KindStmt)
 	defer prod.Release()
@@ -351,8 +353,8 @@ func TestCloneRowOwnedStillAssertTransferable(t *testing.T) {
 	if err := AssertTransferable(owned); err != nil {
 		t.Fatalf("cloneRowOwned output not transferable: %v", err)
 	}
-	if got := owned[2].ArenaID; got != mmgr.PermContextID {
-		t.Fatalf("legacy big-numeric lane left Perm (arena %d) — non-build Perm contract moved", got)
+	if got := owned[2]; got.ArenaID != 0 || len(got.Buf) == 0 {
+		t.Fatalf("cloned big numeric is arena %d with a %d-byte Buf, want an owned payload (arena 0)", got.ArenaID, len(got.Buf))
 	}
 	prod.Reset()
 	cut1AssertRowsEqual(t, owned, src)

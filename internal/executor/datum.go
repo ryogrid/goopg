@@ -351,11 +351,7 @@ func (d Datum) NumericBigValue() *big.Int {
 	if d.Flags&flagBigNumeric == 0 {
 		return nil
 	}
-	ctx := mmgr.Lookup(d.ArenaID)
-	if ctx == nil {
-		return new(big.Int)
-	}
-	buf := ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
+	buf := d.bigNumericPayload()
 	if len(buf) == 0 {
 		return new(big.Int)
 	}
@@ -454,9 +450,13 @@ func (d Datum) MaterializeArena() Datum {
 	// retention boundary or a producer arena reset corrupts its
 	// sign+BE-magnitude bytes at scale (the sibling-path gap that only
 	// String/Bytes were covering; see rowHasArena/cloneRowOwned). Re-store
-	// it in the permanent arena, which never resets.
+	// it as an owned payload (M0122-0016: no longer the never-reset
+	// permanent arena).
 	if d.Kind == KindNumeric && d.Flags&flagBigNumeric != 0 {
-		return newBigNumericInCtx(mmgr.Perm(), d.NumericBigValue(), d.Scale)
+		src := d.bigNumericPayload()
+		buf := make([]byte, len(src))
+		copy(buf, src)
+		return Datum{Kind: KindNumeric, Flags: flagBigNumeric, Scale: d.Scale, Int: int64(len(buf)), Buf: buf}
 	}
 	if d.Kind != KindString && d.Kind != KindBytes {
 		return d
@@ -678,12 +678,41 @@ func NewNumericInt64Datum(mant int64, scale int16) Datum {
 // NewNumericBigDatum constructs a KindNumeric Datum on the big.Int
 // overflow lane (used when the result of arithmetic exceeds int64
 // range, e.g. TPC-H Q8's `1.00000000000000000000`).
+//
+// The sign byte and big-endian magnitude live in the Datum's own Buf, owned
+// and garbage-collected like an owned string (ArenaID 0, Int = payload
+// length). They used to be written into mmgr.Perm(), which is never reset:
+// every big-mantissa result stayed for the process lifetime (~12 B each,
+// ~25 MB per TPC-DS Q39 run) behind a process-wide lock (M0122-0016). PG
+// pallocs a numeric in the current memory context, which frees it.
 func NewNumericBigDatum(bi *big.Int, scale int16) Datum {
-	return newBigNumericInCtx(mmgr.Perm(), bi, scale)
+	buf := make([]byte, 1+(bi.BitLen()+7)/8)
+	if bi.Sign() < 0 {
+		buf[0] = 0x80
+	}
+	bi.FillBytes(buf[1:])
+	return Datum{Kind: KindNumeric, Flags: flagBigNumeric, Scale: scale, Int: int64(len(buf)), Buf: buf}
+}
+
+// bigNumericPayload returns a big-numeric Datum's sign byte + big-endian
+// magnitude, from its own Buf (owned) or its arena (ArenaID != 0), or nil
+// when an arena reference no longer resolves.
+func (d Datum) bigNumericPayload() []byte {
+	if d.ArenaID == 0 {
+		return d.Buf
+	}
+	ctx := mmgr.Lookup(d.ArenaID)
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
 }
 
 // newBigNumericInCtx stores bi's sign+BE-magnitude in ctx and returns
 // a KindNumeric Datum with flagBigNumeric set. ctx must outlive the Datum.
+// It builds the arena-backed big-numeric representation (dense hash builds
+// re-home payloads into their build arena the same way); value-producing
+// code uses NewNumericBigDatum, whose payload is owned (M0122-0016).
 func newBigNumericInCtx(ctx *mmgr.Context, bi *big.Int, scale int16) Datum {
 	mag := bi.Bytes() // big-endian magnitude; one alloc inside big.Int
 	sign := byte(0)

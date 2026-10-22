@@ -33,7 +33,6 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -1505,7 +1504,7 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			// Negate a numeric/float value. M0097-0003.
 			if d.Flags&flagBigNumeric != 0 {
 				neg := new(big.Int).Neg(d.NumericBigValue())
-				return newBigNumericInCtx(mmgr.Perm(), neg, d.Scale), nil
+				return NewNumericBigDatum(neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
 		case KindInterval:

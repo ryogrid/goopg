@@ -2255,7 +2255,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q39 22\.48 → 21\.67 Ginstr \(−3\.6 %\), CPU −7 %; Q4 −4\.1 %, Q67 −0\.8 %; Q22/Q11/Q87/Q17 flat\.
     - Q39 wall is bimodal on BOTH binaries \(~1\.45 s or ~2\.2–2\.7 s per 3\-run sample\) — compare instructions/CPU\.
     - Discovery filed: M0122\-0016 \(big numeric results accumulate in the never\-reset permanent arena\)\.
-- [ ] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
+- [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
   - Filed 2026\-10\-23 from M0122\-0012 slice 68 \(found while trimming numericDiv's big\.Int path for TPC\-DS Q39\)\.
@@ -2273,6 +2273,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     "big numerics live in Perm" assumption that `AssertTransferable`'s comment records\.
   - Gate: an allocation probe over repeated statements \(Perm usage flat\), the executor package with the deform
     poison, sf025 \(numeric values, 61 ck\), RegressSuite \(numeric\.sql, aggregates\.sql\)\.
+  - **LANDED 2026\-10\-23\.** Movement: none — resource fix\. Doc part 6 "M0122\-0016"\.
+    - NewNumericBigDatum builds an owned payload \(Datum\.Buf, ArenaID 0, Int = payload length\); bigNumericPayload
+      reads owned or arena payloads for NumericBigValue / numericMagUint64; newNumeric, unary minus and
+      MaterializeArena produce owned values; newBigNumericInCtx stays as the arena\-backed constructor \(dense builds\)\.
+    - TestCloneRowOwnedStillAssertTransferable re\-pinned to the owned contract \(it pinned the Perm one on purpose\)\.
+    - Pins: Perm usage flat over 20 000 big\-lane divisions \+ additions; owned round trip incl\. arena detach after
+      reset; restoring the Perm write fails both\.
+    - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, RegressSuite, Isolation,
+      executor package with the deform poison — all PASS\. Q39 −0\.4 %, Q4 −1\.4 % instructions\.
+    - Q39's "bimodal" wall = a fresh server's heap growing to its memory limit \(~300 K page faults/run for 7 runs\);
+      steady state 1\.09–1\.11 s\.
+    - Left: `internal/utils/mmgr/mctx.go`'s permanentContext comment still says big numerics allocate there —
+      fix in the next executor slice \(a comment\-only change after the gates would have invalidated their stamps\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4400,6 +4413,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `b3f708aee`** \(M0122\-0012 slice 67 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `97086429c`** \(M0122\-0012 slice 68 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

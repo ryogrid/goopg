@@ -10,7 +10,6 @@ import (
 
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 var (
@@ -200,9 +199,9 @@ func newNumeric(b *big.Int, scale int) Datum {
 	if b.Cmp(bigNumericMinInt64) >= 0 && b.Cmp(bigNumericMaxInt64) <= 0 {
 		return Datum{Kind: KindNumeric, Int: b.Int64(), Scale: int16(scale)}
 	}
-	// newBigNumericInCtx copies b's bytes into the arena and keeps no
-	// reference to b, so b is passed as is (M0122-0012 slice 68).
-	return newBigNumericInCtx(mmgr.Perm(), b, int16(scale))
+	// NewNumericBigDatum copies b's bytes and keeps no reference to b, so b
+	// is passed as is (M0122-0012 slice 68).
+	return NewNumericBigDatum(b, int16(scale))
 }
 
 // parseNumericFast attempts an int64-only fast path for the
@@ -923,7 +922,7 @@ func numericDivUint128(a, b Datum) (Datum, bool) {
 
 // numericMagUint64 returns the magnitude and sign of a numeric's mantissa
 // when the magnitude fits a uint64, in either lane. A big-lane payload is
-// read in place — the sign byte and big-endian magnitude newBigNumericInCtx
+// read in place — the sign byte and big-endian magnitude NewNumericBigDatum
 // writes, the encoding NumericBigValue decodes — without building a big.Int.
 func numericMagUint64(d Datum) (mag uint64, neg bool, ok bool) {
 	if !isBigNumeric(d) {
@@ -933,11 +932,7 @@ func numericMagUint64(d Datum) (mag uint64, neg bool, ok bool) {
 		}
 		return uint64(m), false, true
 	}
-	ctx := mmgr.Lookup(d.ArenaID)
-	if ctx == nil {
-		return 0, false, false
-	}
-	buf := ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
+	buf := d.bigNumericPayload()
 	if len(buf) == 0 || len(buf) > 9 {
 		return 0, false, false
 	}
