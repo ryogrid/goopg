@@ -1976,6 +1976,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       inListConst\.coercedItems coerces a literal IN list once per operand kind; both apply only on a runtime kind match\.
     - Q83 1\.6 → 0\.24 s, Q58 1\.3 → 0\.6 s, Q16 1\.2 → 0\.92 s, Q32 0\.11 → 0\.04 s; sweep 142\.4 → 139\.6 s; TPC\-H values identical\.
     - Next candidates: Q58 rest is join row cloning \(cloneRowOwnedPrefix\); Q35 3\.4 vs 0\.35, Q39 2\.4 vs 0\.59, Q87, Q51\.
+  - **Slice 44 — the sorted aggregate and the incremental sort stream LANDED 2026\-10\-22\.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 4 "Slice 44"\.
+    - Named target TPC\-DS Q35 \(3\.4–3\.7 s vs PG 0\.35\): `Limit 100 → GroupAggregate → Incremental Sort → Nested Loop`
+      read all 50 000 outer rows \(16\.4 M filter pairs\) where PG stops at 20 300 — both operators drained in Open\.
+    - incrementalSortOp reads one prefix group per Next \(one\-row lookahead\); aggregateOp\.nextSorted returns each group
+      as the next one's first row closes it — the drained loop's exact call sequence\.
+    - Q35 3\.35–3\.96 → 1\.49–1\.65 s; sweep 139\.6 → 136\.5 s; TPC\-H values identical\.
+    - Next candidates: Q35 rest = 5\.7 M join\-filter pairs at ~270 ns vs PG ~90 ns \(NL over Materialize\); Q58 join row
+      cloning; Q39 2\.4 vs 0\.59, Q87, Q51\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3960,6 +3970,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `a410e5cf8`** \(M0122\-0012 slice 43 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

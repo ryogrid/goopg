@@ -27,8 +27,20 @@ type incrementalSortOp struct {
 	presortedCount int
 	ctx            *Context
 
-	groups [][]Row
-	gi, ri int
+	// group is the presorted-prefix group being emitted, sorted by every key;
+	// ri is the next row of it to return. groupKeys holds its key values while
+	// it is collected.
+	group     []Row
+	groupKeys [][]Datum
+	ri        int
+	// next / nextKV is the first row of the following group, read to find
+	// where the current group ends and held until that group is collected.
+	next    Row
+	nextKV  []Datum
+	hasNext bool
+	// eof records that the child returned EOF.
+	eof    bool
+	pulled int
 }
 
 func newIncrementalSortOp(child Operator, plan *optimizer.IncrementalSort, keys []optimizer.SortKey, presortedCount int) *incrementalSortOp {
@@ -37,75 +49,85 @@ func newIncrementalSortOp(child Operator, plan *optimizer.IncrementalSort, keys 
 
 func (o *incrementalSortOp) Schema() optimizer.Schema { return o.child.Schema() }
 
-// Open drains the child fully, splitting it into presorted-prefix groups as
-// they arrive (a group closes the moment a row's prefix no longer matches
-// the previous row's — sortPrefixEqual's "groups are contiguous" contract),
-// sorting each group as it closes. Peak memory is bounded by the largest
-// group, not the input (E-15's EXECUTOR GUARANTEE).
+// Open opens the child and reads nothing from it. Groups are read on demand
+// by Next, one at a time, as PG's ExecIncrementalSort does: a group is
+// collected, sorted and emitted before the next one is read, so a LIMIT above
+// stops the child after the group that completes it (M0122-0012 slice 44 —
+// TPC-DS Q35's LIMIT 100 read 50 000 outer rows of a nested loop where PG read
+// 20 300). Draining the child in Open, as this operator first did, returned
+// the same rows in the same order but always paid for the whole input.
 func (o *incrementalSortOp) Open(ctx *Context) error {
 	o.ctx = ctx
-	o.groups = nil
-	o.gi, o.ri = 0, 0
+	o.group, o.groupKeys = o.group[:0], o.groupKeys[:0]
+	o.ri = 0
+	o.next, o.nextKV, o.hasNext = nil, nil, false
+	o.eof = false
+	o.pulled = 0
 	// A `ctid` key reads the child's carried tid (M0146-0052).
 	if sortKeysUseCTID(o.keys) {
 		markSortWantCTIDs(o.child)
 	}
-	if err := o.child.Open(ctx); err != nil {
-		return err
+	return o.child.Open(ctx)
+}
+
+// readGroup collects the next presorted-prefix group into o.group and sorts
+// it. A group closes the moment a row's prefix no longer matches the
+// previous row's (sortPrefixEqual's "groups are contiguous" contract); that
+// row is held as the first of the following group. Peak memory is bounded by
+// the largest group, not the input (E-15's EXECUTOR GUARANTEE). It reports
+// false when the child is exhausted and nothing remains.
+func (o *incrementalSortOp) readGroup() (bool, error) {
+	for i := range o.group {
+		o.group[i] = nil
 	}
-
-	var curRows []Row
-	var curKeys [][]Datum
-	var prevKV []Datum
-	haveGroup := false
-
-	flush := func() error {
-		if len(curRows) == 0 {
-			return nil
-		}
-		if err := o.sortGroup(curRows, curKeys); err != nil {
-			return err
-		}
-		o.groups = append(o.groups, curRows)
-		curRows, curKeys = nil, nil
-		return nil
+	o.group, o.groupKeys = o.group[:0], o.groupKeys[:0]
+	o.ri = 0
+	prevKV := []Datum(nil)
+	if o.hasNext {
+		o.group = append(o.group, o.next)
+		o.groupKeys = append(o.groupKeys, o.nextKV)
+		prevKV = o.nextKV
+		o.next, o.nextKV, o.hasNext = nil, nil, false
 	}
-
-	pulled := 0
-	for {
+	for !o.eof {
 		// M0062-followup precedent (sortOp.Open): give a cancel opportunity
-		// every 4096 rows rather than only draining fully unattended.
-		if pulled&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
-			if err := ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		// every 4096 rows.
+		if o.pulled&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
 		slot, err := o.child.Next()
 		if err == EOF {
+			o.eof = true
 			break
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
+		o.pulled++
 		ms := slot.Materialize()
 		row := ms.Row()
 		// On the slot, so a `ctid` key sees the carried tid (M0146-0052).
 		kv, kerr := o.sortKeyVals(ms)
 		if kerr != nil {
-			return kerr
+			return false, kerr
 		}
-		if haveGroup && !sortPrefixEqual(prevKV, kv, o.keys, o.presortedCount) {
-			if err := flush(); err != nil {
-				return err
-			}
+		if prevKV != nil && !sortPrefixEqual(prevKV, kv, o.keys, o.presortedCount) {
+			o.next, o.nextKV, o.hasNext = row, kv, true
+			break
 		}
-		curRows = append(curRows, row)
-		curKeys = append(curKeys, kv)
+		o.group = append(o.group, row)
+		o.groupKeys = append(o.groupKeys, kv)
 		prevKV = kv
-		haveGroup = true
-		pulled++
 	}
-	return flush()
+	if len(o.group) == 0 {
+		return false, nil
+	}
+	if err := o.sortGroup(o.group, o.groupKeys); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // sortKeyVals evaluates every ORDER BY key for one row, once — same shape as
@@ -193,23 +215,24 @@ func (o *incrementalSortOp) sortGroup(rows []Row, keyvals [][]Datum) error {
 }
 
 func (o *incrementalSortOp) Next() (TupleSlot, error) {
-	for o.gi < len(o.groups) {
-		g := o.groups[o.gi]
-		if o.ri >= len(g) {
-			o.gi++
-			o.ri = 0
-			continue
+	if o.ri >= len(o.group) {
+		ok, err := o.readGroup()
+		if err != nil {
+			return nil, err
 		}
-		row := g[o.ri]
-		o.ri++
-		return SlotFromRow(o.Schema(), row), nil
+		if !ok {
+			return nil, EOF
+		}
 	}
-	return nil, EOF
+	row := o.group[o.ri]
+	o.ri++
+	return SlotFromRow(o.Schema(), row), nil
 }
 
 func (o *incrementalSortOp) Close() error {
-	o.groups = nil
-	o.gi, o.ri = 0, 0
+	o.group, o.groupKeys = nil, nil
+	o.ri = 0
+	o.next, o.nextKV, o.hasNext = nil, nil, false
 	o.ctx = nil
 	return o.child.Close()
 }

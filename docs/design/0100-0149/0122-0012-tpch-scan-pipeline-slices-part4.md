@@ -576,3 +576,71 @@ bimodal on both. TPC-H values are identical (acceptance 24 MATCH).
 - **P0-E10, filed (S2):** `compareEq`, used by IN lists, compares an integer to an unknown literal as text, so
   `d_year IN ('02000', ' 2001')` matches nothing where PG matches 731 rows. The `=` form is correct. The defect
   is pre-existing at `62b168220`. Repro: `analysis/p0e10/`.
+
+## Slice 44 (2026-10-22): the sorted aggregate and the incremental sort stream — TPC-DS Q35
+
+**Target, named up front:** TPC-DS Q35, 3.4–3.7 s warm against PG's 0.35 s, the largest ratio left after
+slice 43. A plain EXPLAIN takes ~10 ms, so the time is execution.
+
+**Cause.** The plan is `Limit 100 → GroupAggregate → Incremental Sort (presorted ca_state) → Nested Loop`. The
+nested loop's outer side is a Gather Merge over `customer_address` sorted by state; its inner side is a
+Materialize of 328 rows. PG's EXPLAIN ANALYZE reads 20 300 outer rows and stops once the Limit has its 100
+groups (6.66 M join-filter pairs). goopg read all 50 000 outer rows (16.4 M pairs, ~4.4 s). Two operators drained
+their whole input before returning a row:
+
+- **`incrementalSortOp.Open`** collected and sorted every presorted-prefix group of the child before `Next`
+  returned the first. PG's `ExecIncrementalSort` collects one group, sorts it, emits it, and reads on only when
+  it is exhausted.
+- **The AGG_SORTED path** (`aggregateOp.openSorted`, M0134-0001 S8) finalised every group into `o.rows` in
+  `Open`. PG's `agg_retrieve_direct` returns each group as the first row of the next one closes it. Making
+  only the sort stream moved nothing: the aggregate above it still read to EOF (its first row came at 4.39 s).
+
+**Rule.**
+
+- **Incremental sort.** `Open` opens the child and reads nothing. `Next` calls `readGroup` when the current group
+  is exhausted:
+  - it collects rows while `sortPrefixEqual` holds;
+  - it keeps the first row of the following group (`next`/`nextKV`) as a one-row lookahead;
+  - it sorts the group with the unchanged `sortGroup` (stable, every key).
+
+  Group boundaries and per-group order are the drained version's, so the output is identical.
+- **Sorted aggregate.** `Open` sets `o.sorted`, and `Next` calls `nextSorted`. It reads the child until a row's
+  key parts differ from the current group's, finalises the current group, starts the new group from that row and
+  absorbs it, then returns the finalised group. EOF finalises the last group. That is the drained loop's exact
+  sequence of `evalGroupExprs` / `applyAgg` / `finalizeGroup` calls, so shared user-aggregate state, passthrough
+  columns and finalisation are unchanged. Only when the consumer sees each group differs.
+
+Both operators re-open cleanly (a rescan resets the cursor and lookahead). An error raised by a group past the
+Limit no longer reaches the client, as in PG.
+
+**Pins.** `TestSortedAggregateStreamsGroups` and `TestIncrementalSortStreamsGroups` count the child's pulls after
+each output row:
+
+- `Open` pulls nothing;
+- each group costs its own rows plus the one row that closes it;
+- the last group ends at EOF;
+- the aggregate test runs twice to cover a re-open.
+
+Restoring either operator's draining version fails its test.
+
+**Measured.** Warm, two interleaved rounds of three runs:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q35 | 3.35–3.96 (one 5.6) | 1.49–1.65 (one 3.6) |
+
+EXPLAIN ANALYZE now shows the Incremental Sort returning 101 rows, as in PG, over 17 444 outer rows (PG:
+20 300; the parallel split differs) and 5.7 M filtered pairs. In the sf025 sweep, Q35 went from 3.50 to 1.66 s
+and the sweep sum from 139.6 to 136.5 s. The sweep's Q88/Q42 +2 s rows did not repeat in an A/B (equal on both
+builds), the same outlier pattern slice 43 recorded for Q22/Q66. TPC-H values are identical (acceptance 24
+MATCH), and the sweep's plan shapes are identical.
+
+**Left.**
+
+- Q35's remaining gap: the 5.7 M join-filter pairs cost ~270 ns each against PG's ~90 ns. That is the nested
+  loop over a Materialize, a next target.
+- PG's incremental sort also has a full-sort mode, which batches at least 32 tuples (`DEFAULT_MIN_GROUP_SIZE`)
+  before looking for a boundary, and a prefix mode for large groups. It also passes a LIMIT bound into its
+  tuplesorts and reports `Full-sort Groups` / `Pre-sorted Groups` in EXPLAIN ANALYZE. goopg sorts each prefix
+  group as one batch and prints neither line. The output order is the same; the ANALYZE text is not. Recorded
+  in the deferral ledger.

@@ -2288,6 +2288,15 @@ type aggregateOp struct {
 	rows []Row
 	idx  int
 
+	// Sorted aggregation streams (M0122-0012 slice 44): sorted is set by Open
+	// when the AGG_SORTED path applies, and Next then reads the child only up
+	// to the end of the next group (nextSorted). sCur / sCurParts are the
+	// group being accumulated and its key parts; sEOF records the child's EOF.
+	sorted    bool
+	sCur      *groupRuntime
+	sCurParts []string
+	sEOF      bool
+
 	// sharedUserStates supports PG aggregate state sharing: when multiple user-defined
 	// aggregates have the same sfunc/stype and the same input, sfunc is called only
 	// once per row and the state is shared. SharedStateSlot=-1 means no sharing. M0097-0035.
@@ -2541,8 +2550,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
 	// of building the groups hash map. Grouping sets, ungrouped
 	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
+	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
 	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == optimizer.AggModeSimple {
-		return o.openSorted(ctx)
+		o.sorted = true
+		o.rows = nil
+		return nil
 	}
 
 	// M0146-0003 S5: a sorted-armed row-transport finalize consumes a
@@ -3708,14 +3720,17 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 	return out, nil
 }
 
-// openSorted implements the sorted (AGG_SORTED) grouping strategy: the child
+// nextSorted implements the sorted (AGG_SORTED) grouping strategy: the child
 // is assumed to deliver rows in GROUP BY key order, so groups are collapsed by
 // comparing each incoming key run against the current group's key rather than
 // hashing (nodeAgg.c agg_retrieve_direct, postgres/src/backend/executor/
-// nodeAgg.c:2280-2619). Like the hash path it is materialized — the child is
-// drained to EOF first — but unlike the hash path it emits one row per key
-// RUN in input order and never runs the emit-time key sort (the child is
-// already sorted, so input order IS key order). The finalize/emit step is
+// nodeAgg.c:2280-2619). Like agg_retrieve_direct it streams: each call reads
+// the child up to the first row of the next group and returns the group that
+// row closed, so a LIMIT above stops the child after the group that completes
+// it (M0122-0012 slice 44 — the path first drained the child in Open, which
+// returned the same rows but always read all of the input). It emits one row
+// per key RUN in input order and never runs the emit-time key sort (the child
+// is already sorted, so input order IS key order). The finalize/emit step is
 // shared with the hash path via finalizeGroup, so the two strategies can never
 // diverge on shared-state sync, finishAgg, GROUPING mask or passthrough
 // semantics. M0134-0001 S8.
@@ -3723,50 +3738,38 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 // Invariant: the caller (Open) only routes here when GroupingSets == nil,
 // len(GroupExprs) > 0 and Mode == AggModeSimple, so there is exactly one
 // implicit grouping set holding every group column and setIdx is always 0.
-func (o *aggregateOp) openSorted(ctx *Context) error {
+func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 	nGroupCols := len(o.plan.GroupExprs)
-
-	// The current group is always the group of the previous row: the input is
-	// sorted, so a key change is a group boundary. aggs is a fresh slice per
-	// group, mirroring the hash path's per-group make([]aggRuntime, nAggs).
-	var curParts []string
-	var cur *groupRuntime
-
-	flush := func() error {
-		if cur == nil {
-			return nil
-		}
-		out, err := o.finalizeGroup(cur)
-		if err != nil {
-			return err
-		}
-		o.rows = append(o.rows, out)
-		cur = nil
-		return nil
-	}
-
-	for {
+	for !o.sEOF {
 		slot, err := o.child.Next()
 		if err == EOF {
+			o.sEOF = true
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if ctx.Ctx != nil {
-			if cerr := ctx.Ctx.Err(); cerr != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		if o.ctx != nil && o.ctx.Ctx != nil {
+			if cerr := o.ctx.Ctx.Err(); cerr != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
 		allVals, parts, err := o.evalGroupExprs(slot)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if cur == nil || !sameGroupKey(curParts, parts) {
-			// Group boundary: finalize and emit the previous group, then start
-			// a fresh one from this row.
-			if err := flush(); err != nil {
-				return err
+		var out Row
+		emit := false
+		if o.sCur == nil || !sameGroupKey(o.sCurParts, parts) {
+			// Group boundary: finalize the previous group, then start a fresh
+			// one from this row. The previous group is returned once this
+			// row has been absorbed, so the calls run in the order the
+			// drained loop ran them.
+			if o.sCur != nil {
+				if out, err = o.finalizeGroup(o.sCur); err != nil {
+					return nil, err
+				}
+				emit = true
 			}
 			// Evaluate passthrough (functionally-determined) columns from the
 			// first row of the group — identical to the hash path's group
@@ -3788,8 +3791,8 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 				gv = make(Row, nGroupCols)
 				copy(gv, allVals)
 			}
-			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-			curParts = parts
+			o.sCur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			o.sCurParts = parts
 		}
 		o.currentRowVersion++
 		for i := range o.plan.Aggs {
@@ -3810,12 +3813,31 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 					continue
 				}
 			}
-			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
-				return err
+			if err := o.applyAgg(&o.sCur.aggs[i], call, slot, i); err != nil {
+				return nil, err
 			}
 		}
+		if emit {
+			return o.emitSorted(out), nil
+		}
 	}
-	return flush()
+	if o.sCur == nil {
+		return nil, EOF
+	}
+	out, err := o.finalizeGroup(o.sCur)
+	o.sCur = nil
+	if err != nil {
+		return nil, err
+	}
+	return o.emitSorted(out), nil
+}
+
+// emitSorted returns one finalized group through the operator's reused slot,
+// as Next does for the materialised paths.
+func (o *aggregateOp) emitSorted(row Row) TupleSlot {
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot
 }
 
 // sameGroupKey reports whether two per-column key vectors denote the same
@@ -5489,6 +5511,9 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 }
 
 func (o *aggregateOp) Next() (TupleSlot, error) {
+	if o.sorted {
+		return o.nextSorted()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -5502,6 +5527,7 @@ func (o *aggregateOp) Next() (TupleSlot, error) {
 
 func (o *aggregateOp) Close() error {
 	o.rows = nil
+	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
 	o.ctx = nil
 	o.idx = 0
 	return o.child.Close()
