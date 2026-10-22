@@ -277,3 +277,57 @@ re-pins and re-checks it. PG keeps the leaf pinned from `_bt_search` into `_bt_r
 latch across the executor boundary is unsafe here. Beyond that the probe cost is the comparison chain itself:
 `compare` → `ComparePGIndexTuples` → `comparePGIndexTupleAttrsAt` → `compareFixedPrefix` on a tuple-vs-tuple key,
 where PG compares a pre-deformed scan key against the index tuple.
+
+## Slice 62 (2026-10-23): an explicit-frame window aggregate keeps its running state while the frame head stays put — TPC-DS Q51
+
+**Target.** TPC-DS Q51, 1.4 s against PG's 0.31 s, at 15.8 G instructions. Its CTEs compute
+`sum(...) OVER (PARTITION BY item ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`, and its outer
+query a `max(...) OVER` with the same frame. Split by stack, the leader held 70 % of the samples, and
+`windowOp`'s frame evaluation (`evalExplicitFrameAggFuncs` → `applyAgg` / `aggEvalList` / `evalExprSlot`) was its
+largest window-specific cost. The cause is in that function's own comment: every row's frame was re-aggregated from
+its head, O(partition × frame), "a deliberate v0 tradeoff". For an UNBOUNDED PRECEDING frame that is quadratic in
+the partition size. PG's `eval_windowaggregates` (nodeWindowAgg.c) works differently. While the frame head has not
+moved, it keeps the transition state and feeds only the rows between `aggregatedupto` and the new frame tail. When
+the head moves, it restarts, unless the aggregate has an inverse transition function. It also restarts for an
+EXCLUDE clause.
+
+**Change.** `evalExplicitFrameAggFuncs` tracks `[aggStart, aggEnd)`, the rows already in the running state:
+
+- When the next row's frame has the same head and a tail no shorter, only rows `[aggEnd, end)` are applied.
+- Otherwise the state is reset and the frame is aggregated from its head.
+- Rows are applied in the same ascending order as the from-scratch loop, so float sums are bit-identical.
+- This applies only without EXCLUDE, and only to `sum`, `count`, `avg`, `min` and `max`
+  (`frameAggReusesState`). Their state is plain values: `finishAgg` gets it by value, and numeric sums are
+  replaced, never updated in place. A finalized value therefore never aliases state that a later row changes.
+- Aggregates holding slices or maps (string\_agg, array\_agg, ordered-set, DISTINCT) still recompute every frame.
+- `frameAggIncremental` switches the path off, for the equivalence test.
+
+**Pins.**
+
+- `TestWindowFrameIncrementalMatchesRecompute` runs 100 rows in 4 partitions, with duplicate order keys (peer
+  groups), NULLs, numerics beyond 64 bits and float8.
+  - Ten aggregates (sum, count, count(\*), avg, min, max, and a FILTERed sum) run over ten frames: ROWS and
+    GROUPS with an UNBOUNDED PRECEDING head and CURRENT ROW, k FOLLOWING or UNBOUNDED FOLLOWING tails; sliding
+    ROWS; RANGE frames; and an EXCLUDE CURRENT ROW frame.
+  - Every value must equal the from-scratch path.
+  - Mutation check: ignoring head movement fails it on the sliding frame.
+- The sf025 sweep records Q51 by row count only (`ck=n/a`), so this test is its value pin.
+
+**Measured** against `edc87a31a`:
+
+| query | HEAD Ginstr | candidate Ginstr | HEAD wall / CPU (s) | candidate wall / CPU (s) |
+|---|---|---|---|---|
+| Q51 | 15.79 | 12.17 (−22.9 %) | 1.42–1.60 / 2.01–2.27 | 1.14–1.16 / 1.74–1.77 |
+| Q47, Q57, Q12, Q98 | — | identical (no explicit frame) | | |
+
+The sf025 sweep sum went from 107.1 to 105.5 s, with Q51 at 1.11 → 0.84 s. Values are identical (sf025 PASS=99,
+61 ck; acceptance 24 MATCH), plan shapes are identical, and the regress suite, whose window cases cover frames,
+passes.
+
+**Deferred (ledger row).** PG's moving-aggregate mode is not implemented. When the head advances, PG subtracts the
+leaving rows through the aggregate's inverse transition function (`invtransfn`, with NaN and overflow fallbacks);
+goopg recomputes a sliding frame from its new head. Sliding frames are rare in the corpora.
+
+**Left.** Q51 is still ~2.7× PG. The leader's sorted Groups and Sorts over CTE scans clone every row
+(`cloneRowOwned` via `sortOp.Open` ← `cteScanOp`), and the workers' Gather queue clones every row
+(`transferRowForQueue`).

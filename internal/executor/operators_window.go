@@ -702,6 +702,15 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 		}
 		colIdx := colBase + j
 		call := windowFuncToAggregateCall(fn)
+		// eval_windowaggregates (nodeWindowAgg.c): while the frame head
+		// stays where it was and the tail does not move back, the running
+		// transition state is kept and only the rows the tail newly covers
+		// are fed to it — rows [aggStart, aggEnd) are already aggregated.
+		// An EXCLUDE clause restarts every row, as upstream's does.
+		incremental := frameAggIncremental && o.plan.Frame.Exclusion == parser.FrameExcludeNone &&
+			frameAggReusesState(call.Name)
+		aggStart, aggEnd := -1, -1
+		var running aggRuntime
 		for i := pStart; i < pEnd; i++ {
 			start, end, err := o.frameBounds(pStart, pEnd, i, groupBounds)
 			if err != nil {
@@ -711,14 +720,22 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 			if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
 				peerStart, peerEnd = peerBoundsOf(groupBounds, i)
 			}
-			var running aggRuntime
-			for k := start; k < end; k++ {
+			from := start
+			if incremental && start == aggStart && end >= aggEnd {
+				from = aggEnd
+			} else {
+				running = aggRuntime{}
+			}
+			for k := from; k < end; k++ {
 				if frameRowExcluded(o.plan.Frame.Exclusion, k, i, peerStart, peerEnd) {
 					continue
 				}
 				if err := aggHelper.applyAgg(&running, &call, asSlot(o.schema, o.rows[k]), -1); err != nil {
 					return err
 				}
+			}
+			if incremental {
+				aggStart, aggEnd = start, max(end, start)
 			}
 			val, ferr := aggHelper.finishAgg(running, call)
 			if ferr != nil {
@@ -728,6 +745,25 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 		}
 	}
 	return nil
+}
+
+// frameAggIncremental gates evalExplicitFrameAggFuncs' reuse of the running
+// aggregate state across rows whose frame head stays put (M0122-0012 slice
+// 62); the equivalence test turns it off to compute every frame from scratch.
+var frameAggIncremental = true
+
+// frameAggReusesState reports the aggregates whose running state may be
+// finalized and then fed further rows: sum, count, avg, min and max keep only
+// value fields (finishAgg receives the state by value and the numeric sums are
+// replaced, never updated in place), so a finalized value never aliases state
+// a later row changes. Aggregates holding slices or maps (string_agg,
+// array_agg, ordered-set and DISTINCT accumulators) recompute each frame.
+func frameAggReusesState(name string) bool {
+	switch strings.ToLower(name) {
+	case "sum", "count", "avg", "min", "max":
+		return true
+	}
+	return false
 }
 
 // windowFuncToAggregateCall adapts a planner.WindowFunc (sum/count/avg/

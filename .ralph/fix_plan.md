@@ -2145,6 +2145,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q87 −1\.4 %, Q38 −1\.3 %, Q72 −2\.1 %, Q14 −1\.6 % instructions — **below the 3 % bar** \(counts toward rule b\)\.
     - Discovery filed: M0131\-S33 \(split\-created internal page keeps its first item's key\) \+ ledger row\.
     - Next: if slice 62 also moves its target < 3 %, M0122\-0012 yields to M0147 \(banner item 10 rule b\)\.
+  - **Slice 62 — an explicit\-frame window aggregate keeps its running state while the frame head stays put LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS \(643 s with
+    \-timeout 30m\)\. Doc part 6 "Slice 62"\.
+    - Named target TPC\-DS Q51: evalExplicitFrameAggFuncs re\-aggregated every row's frame from its head — O\(n²\) for
+      ROWS UNBOUNDED PRECEDING; PG eval\_windowaggregates continues from aggregatedupto while the head is fixed\.
+    - Incremental \[aggStart, aggEnd\) state for sum/count/avg/min/max without EXCLUDE \(pinned against the
+      from\-scratch path over ten frames × ten aggregates, mutation\-checked\)\.
+    - Q51 15\.79 → 12\.17 Ginstr \(−22\.9 %\), wall ~1\.5 → ~1\.15 s; other window queries identical; sweep 107\.1 → 105\.5 s\.
+    - Rule b: slice 62 moved its target ≥ 3 % → no yield\.
+    - Deferred \(ledger\): PG's inverse\-transition moving aggregate for sliding frames\.
+    - Next: Q51 still ~2\.7× PG — leader row clones via sortOp over CTE scans; Gather queue clones\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
