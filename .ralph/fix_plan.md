@@ -2074,6 +2074,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q72 1\.10 → 0\.98 s, Q16 0\.47 → 0\.42 s, Q14b 6\.4 → 5\.9 s, Q14a flat; sweep 113\.4 → 112\.3 s; values identical\.
     - Tried and dropped: a per\-Context pgIndexKeyColumns cache in indexProbeKey — flat \(≈2 % of samples\)\.
     - Next: Q14 descent still the largest share; Gather\-queue cloneRowOwned; unread prefix text decode\.
+  - **Slice 55 — index\-tuple comparison takes the cached\-offset path LANDED 2026\-10\-22\.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, nbtree \-race PASS\. Doc part 5 "Slice 55"\.
+    - Named target TPC\-DS Q16 \(0\.42 s vs PG 0\.06, same plan and loops\): 82 % in scanLeafItems, the skip walk's up to
+      three whole\-tuple compares per entry; comparePGIndexTupleAttrs 42 %\.
+    - compareFixedPrefix: no null bitmap → leading fixed\-width attributes sliced at their cached offsets
+      \(index\_getattr's attcacheoff\); declines to the walk otherwise \(answers and errors unchanged, pinned\)\.
+    - Q16 0\.42–0\.45 → 0\.36 s, Q72 1\.02 → 0\.90 s, Q14 down; sweep 112\.3 → 109\.5 s; values identical\.
+    - Next: Q16 still ~6× PG — skip walk's 3 compares/entry vs \_bt\_checkkeys' per\-attribute check; \_bt\_readpage precheck\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

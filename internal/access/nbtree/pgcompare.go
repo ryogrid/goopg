@@ -248,6 +248,9 @@ func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, n
 	if ncmp == 0 {
 		return 0, nattsA, nattsB, nil
 	}
+	if res, done := compareFixedPrefix(desc, a, b, ncmp); done {
+		return res, nattsA, nattsB, nil
+	}
 	var wa, wb pgIndexTupleWalk
 	if err := wa.init(a); err != nil {
 		return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
@@ -270,6 +273,46 @@ func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, n
 		}
 	}
 	return 0, nattsA, nattsB, nil
+}
+
+// compareFixedPrefix is comparePGIndexTupleAttrs' cached-offset fast path,
+// index_getattr's attcacheoff branch (itup.h, M0122-0012 slice 55): when
+// neither tuple has a null bitmap, the data starts at MAXALIGN(sizeof
+// IndexTupleData) in both, and each fixed-width attribute sits at the same
+// aligned offset in both — so both values are sliced directly instead of
+// walked. It decides the comparison (done=true) when an attribute differs or
+// all ncmp attributes are fixed-width and equal. It declines (done=false) at
+// a null bitmap, an untrustworthy t_info size, a varlena/cstring attribute,
+// or an attribute that would overrun either tuple; the walk then runs from
+// the start and returns exactly what it always did — re-comparing the equal
+// prefix, and reporting the same overrun error.
+func compareFixedPrefix(desc *PGIndexKeyDesc, a, b []byte, ncmp int) (res int, done bool) {
+	tiA, tiB := pgTInfo(a), pgTInfo(b)
+	if (tiA|tiB)&IndexNullMask != 0 {
+		return 0, false
+	}
+	sizeA, sizeB := int(tiA&IndexSizeMask), int(tiB&IndexSizeMask)
+	if sizeA > len(a) || sizeB > len(b) {
+		return 0, false
+	}
+	off := MaxAlign(SizeOfIndexTupleData)
+	for i := range ncmp {
+		att := &desc.Attrs[i]
+		n := int(att.Len)
+		if n <= 0 {
+			return 0, false
+		}
+		off = alignTo(off, att.AlignBy)
+		end := off + n
+		if end > sizeA || end > sizeB {
+			return 0, false
+		}
+		if res := att.compareAttr(a[off:end], false, b[off:end], false); res != 0 {
+			return res, true
+		}
+		off = end
+	}
+	return 0, true
 }
 
 func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {

@@ -567,3 +567,59 @@ resolution repeated on every probe: Q14a/Q14b flat within noise (≈2 % of sampl
 
 **Left.** Q14's per-probe descent remains the largest share, followed by `cloneRowOwned` of Gather-queue rows
 and the string decode of unread prefix text columns.
+
+## Slice 55 (2026-10-22): index-tuple comparison takes the cached-offset path — TPC-DS Q16, Q72
+
+**Target.** Q16 is the largest equal-buffers ratio (0.42 s against PG's 0.06 s). Its plan and loop counts
+match PG: the anti and semi joins probe `catalog_returns_pkey` and `catalog_sales_pkey` on their second key
+column, as skip scans. A profile at `54b1d5f35` put 82 % of its CPU in `scanLeafItems`. Almost all of that is
+the skip walk's per-entry checks (`btreeSkipEnum.walkLeaf`), which run up to three whole-tuple comparisons
+per entry against the group's probe and pivot. `comparePGIndexTupleAttrs` alone took 42 %.
+
+Each comparison walked both tuples attribute by attribute. That meant an `init`, then per attribute a null
+check, a varlena test, an alignment step, a `pgAttLength` call and bounds checks, all before the comparator
+ran. PG reads index attributes with `index_getattr` (itup.h). When the tuple has no null bitmap and every
+preceding attribute is fixed-width, that is `fetchatt` at the cached `attcacheoff`, a constant offset.
+
+**Change.** `compareFixedPrefix` is that fast path for a comparison:
+
+- It applies only when neither tuple has a null bitmap. The data then starts at MAXALIGN(sizeof
+  IndexTupleData) in both tuples, and every leading fixed-width attribute sits at the same aligned offset in
+  both.
+- It slices the two values directly and runs `compareAttr`.
+- It answers when an attribute differs, or when all compared attributes are fixed-width and equal.
+- It declines at a null bitmap, an untrustworthy `t_info` size, a varlena or cstring attribute, or an attribute
+  that would overrun either tuple. The walk then runs from the start, so its answers and its overrun error are
+  unchanged.
+
+**Pins.**
+
+- `TestCompareFixedPrefixMatchesWalk` checks `comparePGIndexTuples` (with and without the heap TID) and
+  `compareHigh` against the deform-first reference.
+  - It uses two descriptors: bool, int2, int8 and a DESC int4, mixing every width and alignment; and int2,
+    int8 then text, where the path declines at the varlena.
+  - The tuples are random: NULLs, truncated pivots and plain tuples.
+  - It requires the fast path to have decided a non-trivial share of the pairs.
+  - Mutation check: removing the alignment step fails it.
+- `TestCompareFixedPrefixOverrunKeepsWalkError`: a tuple whose `t_info` size cuts a fixed-width attribute short
+  makes the path decline, and the comparison still errors. The existing `TestComparePGIndexTuplesWalkMatchesDeformFirst`
+  covers the int4–text–int4 descriptor. The nbtree package passes under `-race`.
+
+**Measured.** Warm, 2GB clone, two interleaved rounds against `54b1d5f35`:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| Q16 | 0.42–0.45 | 0.36 |
+| Q72 | 1.02 | 0.89–0.90 |
+| Q14b | 5.8–6.0 | 5.3–5.5 (one 6.5) |
+| Q14a | 6.5–8.4 | 5.9–7.3 |
+
+The sf025 sweep sum went from 112.3 to 109.5 s. Values are identical (sf025 PASS=99, 61 ck; acceptance
+24 MATCH), and plan shapes are identical.
+
+**Left.**
+
+- Q16 still runs about 6× PG. The skip walk makes up to three comparisons per entry; PG's `_bt_checkkeys`
+  compares the skip attribute, then the next one.
+- PG also skips required-key checks on a page whose final tuple already satisfies them (the `_bt_readpage`
+  precheck).
