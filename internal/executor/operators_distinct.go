@@ -5,6 +5,7 @@ package executor
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -161,6 +162,33 @@ type distinctOnOp struct {
 	// unsorted, so a key is a duplicate when it was ever seen, not only
 	// when it equals the previous row's.
 	seen map[string]struct{}
+	// keyBuf is Next's reused key buffer (appendDistinctOnKey).
+	keyBuf []byte
+}
+
+// appendDistinctOnKey appends row's DISTINCT ON key to buf: for each key
+// column, datumKey of its value — bpchar padding stripped where keyTrims says
+// so, as trimStringDatum does — then a NUL. These are the bytes Next built by
+// concatenating one datumKey string per column for every input row; the
+// buffer is reused and compared or looked up without allocating, so only a
+// row that starts a new key allocates its string (M0122-0012 slice 60,
+// TPC-DS Q87's three DISTINCTs).
+func (o *distinctOnOp) appendDistinctOnKey(buf []byte, row Row) []byte {
+	for ki, idx := range o.plan.KeyCols {
+		if idx < 0 || idx >= len(row) {
+			continue
+		}
+		v := row[idx]
+		if ki < len(o.keyTrims) && o.keyTrims[ki] && v.Kind == KindString {
+			// trimStringDatum's result (it acts on KindString only).
+			buf = append(buf, 's', ':')
+			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
+		} else {
+			buf = appendDatumKey(buf, v)
+		}
+		buf = append(buf, 0)
+	}
+	return buf
 }
 
 func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
@@ -191,7 +219,6 @@ func (o *distinctOnOp) Open(ctx *Context) error {
 }
 
 func (o *distinctOnOp) Next() (TupleSlot, error) {
-	keyCols := o.plan.KeyCols
 	for {
 		slot, err := o.child.Next()
 		if err != nil {
@@ -201,27 +228,18 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 			continue
 		}
 		row := slot.Row()
-		// Build a key from the DISTINCT ON columns.
-		var key string
-		for ki, idx := range keyCols {
-			if idx >= 0 && idx < len(row) {
-				v := row[idx]
-				if ki < len(o.keyTrims) && o.keyTrims[ki] {
-					v = trimStringDatum(v)
-				}
-				key += datumKey(v) + "\x00"
-			}
-		}
+		// The key of the DISTINCT ON columns, in the reused buffer.
+		o.keyBuf = o.appendDistinctOnKey(o.keyBuf[:0], row)
 		if o.seen != nil {
-			if _, dup := o.seen[key]; dup {
+			if _, dup := o.seen[string(o.keyBuf)]; dup {
 				continue
 			}
-			o.seen[key] = struct{}{}
+			o.seen[string(o.keyBuf)] = struct{}{}
 			return SlotFromRow(o.schema, cloneRow(row)), nil
 		}
-		if !o.started || key != o.prevKey {
+		if !o.started || string(o.keyBuf) != o.prevKey {
 			o.started = true
-			o.prevKey = key
+			o.prevKey = string(o.keyBuf)
 			return SlotFromRow(o.schema, cloneRow(row)), nil
 		}
 		// Duplicate key: skip this row.

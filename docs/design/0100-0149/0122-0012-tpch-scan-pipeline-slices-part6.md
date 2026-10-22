@@ -151,3 +151,68 @@ host load. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and
 - The `sortOp` stable sort still uses the reflected swapper. It is ~3 % of Q97's instructions; slice 58's
   `SortStableFunc` attempt was flat on wall time, but this instrument could now resolve it.
 - `exprnode.go`'s header comment still lists only the original six compiled kinds.
+
+## Slice 60 (2026-10-22): string sort keys compare plainly, and DISTINCT ON keys stop allocating per row — TPC-DS Q87, Q38
+
+**Target.** TPC-DS Q87, 0.95 s against PG's 0.31 s. Its three branches each take the DISTINCT
+`(c_last_name, c_first_name, d_date)` of a sales ⋈ date_dim ⋈ customer join, through a Sort and a Unique
+(`distinctOnOp`), and two EXCEPTs combine them. Q38 is the same shape with INTERSECT. An instruction-sampled
+profile at `5d6e91613` showed two costs:
+
+- **String sort keys.** Every comparison of two strings ran `compareDatumTyped`, whose `textShapeAmbiguous`
+  check tests both values for row, array, pg_lsn and uuid shapes (1.6 %, plus `StringValue` 1.5 %). The values
+  then went through `compareDatum`'s generic path.
+- **DISTINCT ON's key.** `distinctOnOp.Next` built each input row's key as a fresh string, `key +=
+  datumKey(v) + "\x00"` per column, with `trimStringDatum` for bpchar columns (`TrimRight` 2 %,
+  `trimStringDatum` 1.4 %, plus the allocations). It then compared that string with the previous key.
+
+**Change.**
+
+- **String key fast path.** `sortOp` keeps `keyText[i]`, set by `newSortOp` through `sortKeyTextFlags`, which
+  records whether the key's static type is a character string. When `fastCompareDatum` declines a pair and
+  both values are `KindString` for such a key, `lessKeyVals` uses `strings.Compare`. That is
+  `compareDatumTyped`'s answer whatever the values' shape:
+  - an ambiguous pair takes `compareText`;
+  - otherwise `compareDatum`'s KindString arm reaches the same `strings.Compare`. Its shape rules are exactly
+    the ones `textShapeAmbiguous` tests, and `promoteCrossKind` leaves same-kind pairs alone.
+
+  `compareMergeKeys` takes the same shortcut from its existing `text` flags. A key that is not a character
+  string keeps the shape rules. Arena strings are `KindString` since M0107-0002, so they are covered. The int
+  fast path runs first, so integer keys pay nothing extra.
+- **DISTINCT ON key buffer.** `appendDistinctOnKey` appends the same bytes into a reused buffer. It uses
+  `appendDatumKey`, whose equality to `datumKey` is already pinned, and an inline `"s:"` + `TrimRight` for a
+  trimmed `KindString`, which is `trimStringDatum`'s result. `Next` compares `string(buf)` with the previous key,
+  or looks it up in the hashed set, without allocating; only a row that starts a new key allocates.
+- **Housekeeping.** `exprnode.go`'s header now lists every compiled kind (left over from slice 59).
+
+**Pins.**
+
+- `TestSortStringKeyFastPathMatchesCompareDatumTyped` runs every pair of 16 strings: plain, padded, row-,
+  array-, pg_lsn- and uuid-shaped. For a text key and a record key, ASC and DESC, `lessKeyVals` must match
+  `compareDatumTyped` and `compareMergeKeys` must match `compareDatumPlain`. Mutation check: taking the
+  shortcut for every key fails it on the record key's uuid normalisation.
+- `TestDistinctOnKeyMatchesConcatenatedDatumKeys`: over 3000 random rows of nine value kinds, with and without
+  trims, and with an out-of-range key column, the buffer's bytes equal the old concatenation. Mutation check:
+  dropping the trim fails it.
+
+**Measured.** Instructions per query against `5d6e91613`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q87 | 27.06 | 24.01–24.12 (−11 %) |
+| Q38 | 26.90 | 23.86 (−11 %) |
+| Q35 | 12.81 | 12.48 (−2.6 %) |
+| Q97 | 7.73 | 7.755 (+0.3 %) |
+| Q51 | 15.75 | 15.77 (+0.1 %) |
+
+The +0.3 % on Q97 and +0.1 % on Q51 persisted after the integer fast path was moved first; they are integer-key
+queries, so this is layout cost. The sf025 sweep sum went from 109.9 to 105.8 s (Q87 1.01 → 0.84 s, Q38 0.87 →
+0.83 s). Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.**
+
+- Q87 is still ~3× PG.
+- `mergeKeysLess` (Gather Merge) still takes `compareDatumTyped` for strings, because it has no per-key text
+  flag.
+- `distinctOp` (plain DISTINCT) still hashes a `rowKeyTrimmed` string per row and sorts through
+  `compareDatumPlain`.

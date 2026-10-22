@@ -1034,6 +1034,11 @@ type sortOp struct {
 	plan *optimizer.Sort
 	keys []optimizer.SortKey
 	ctx  *Context
+	// keyText[i] reports key i's static type is a character string
+	// (sortKeyTextFlags, set by newSortOp): two string values of such a key
+	// compare as plain strings (lessKeyVals, M0122-0012 slice 60). A sortOp
+	// built without it compares through compareDatumTyped as before.
+	keyText []bool
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -1123,7 +1128,7 @@ type sortCTID struct {
 }
 
 func newSortOp(plan *optimizer.Sort, child Operator) *sortOp {
-	return &sortOp{plan: plan, child: child, keys: plan.Keys}
+	return &sortOp{plan: plan, child: child, keys: plan.Keys, keyText: sortKeyTextFlags(plan.Keys)}
 }
 
 // SortStat is the per-plan-node sort instrumentation EXPLAIN (ANALYZE)
@@ -1344,6 +1349,16 @@ func (o *sortOp) sortKeyValsView(view SlotView) ([]Datum, error) {
 	return kv, nil
 }
 
+// sortKeyTextFlags marks the sort keys whose static type is a character
+// string (exprIsCharacterString), for sortOp.keyText.
+func sortKeyTextFlags(keys []optimizer.SortKey) []bool {
+	flags := make([]bool, len(keys))
+	for i, k := range keys {
+		flags[i] = exprIsCharacterString(k.Expr)
+	}
+	return flags
+}
+
 // lessKeyVals is the comparator, over PRECOMPUTED key values. It is the same
 // rule lessRows applied — NULL placement by NullsFirst, then compareDatum,
 // then Desc — with the evaluation lifted out.
@@ -1362,8 +1377,14 @@ func (o *sortOp) lessKeyVals(a, b []Datum) bool {
 		// fastCompareDatum decides same-kind int / time / numeric pairs
 		// exactly as compareDatum does (TestFastCompareDatumMatchesCompareDatum),
 		// and compareDatumTyped is compareDatum for every non-string pair
-		// (M0122-0012 slice 59).
+		// (M0122-0012 slice 59). Two strings of a character-string key are
+		// compareText whatever their shape: compareDatumTyped takes it when
+		// the shape is ambiguous, and otherwise compareDatum's KindString
+		// arm is the same strings.Compare (slice 60).
 		cmp, ok := fastCompareDatum(&av, &bv)
+		if !ok && i < len(o.keyText) && o.keyText[i] && av.Kind == KindString && bv.Kind == KindString {
+			cmp, ok = strings.Compare(av.StringValue(), bv.StringValue()), true
+		}
 		if !ok {
 			var err error
 			if cmp, err = compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr); err != nil {

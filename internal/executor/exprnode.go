@@ -6,7 +6,8 @@
 // itab overhead on the hot expression-evaluation path.
 //
 // Recognised kinds (ExprColumnRef, ExprIntConst, ExprBoolConst,
-// ExprNullConst, ExprBinaryOp, ExprUnaryOp) are evaluated natively.
+// ExprNullConst, ExprBinaryOp, ExprUnaryOp, ExprConstVal, ExprCase,
+// ExprNullTest) are evaluated natively.
 // All other expression kinds fall through to ExprAdapter, which
 // delegates to the existing evalExprSlot path. This means correctness
 // is never compromised by the migration: complex expressions (CastExpr,

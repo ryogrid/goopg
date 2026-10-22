@@ -34,7 +34,11 @@ package executor
 // Both routes null-extend the row for an outer join and drop it for an inner
 // one, which is why this is a cost change and not a semantic one.
 
-import "github.com/goopg/goopg/internal/optimizer"
+import (
+	"strings"
+
+	"github.com/goopg/goopg/internal/optimizer"
+)
 
 // initMergeKeys resolves this merge join's key list and residual. Called once
 // at the top of runMergeJoin, before either side is keyed, since the two sides
@@ -143,9 +147,15 @@ func compareMergeKeys(a, b []Datum, pos int, text []bool) (int, error) {
 		// The sort comparator's fast path (sortOp.lessKeyVals):
 		// compareDatumPlain is compareDatum for every non-string pair.
 		cmp, ok := fastCompareDatum(&a[i], &b[i])
+		plain := i < len(text) && text[i]
+		if !ok && plain && a[i].Kind == KindString && b[i].Kind == KindString {
+			// compareDatumPlain's answer for two strings of a character-
+			// string key, whatever their shape (sortOp.lessKeyVals).
+			cmp, ok = strings.Compare(a[i].StringValue(), b[i].StringValue()), true
+		}
 		if !ok {
 			var err error
-			if cmp, err = compareDatumPlain(a[i], b[i], pos, i < len(text) && text[i]); err != nil {
+			if cmp, err = compareDatumPlain(a[i], b[i], pos, plain); err != nil {
 				return 0, err
 			}
 		}
