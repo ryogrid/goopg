@@ -216,3 +216,64 @@ queries, so this is layout cost. The sf025 sweep sum went from 109.9 to 105.8 s 
   flag.
 - `distinctOp` (plain DISTINCT) still hashes a `rowKeyTrimmed` string per row and sorts through
   `compareDatumPlain`.
+
+## Slice 61 (2026-10-22): descents start from a cached root, and scans stop building the descent path — TPC-DS Q87 (below the 3 % bar)
+
+**Target.** After slice 60, index probes were 28 % of Q87's instructions: the nested-loop probes into
+`customer_pkey`. Per probe, `descendMode` did two things PG does not:
+
+- **A metapage read every time.** `readMeta` pinned the metapage, validated it and decoded it on every descent,
+  about 1.5 %. PG's `_bt_getroot` descends from `rd_amcache`, a cached copy of the metapage, and re-reads it only
+  when the cached root proves stale.
+- **A descent path nobody read.** Every internal block was appended to `path`, so the slice grew and allocated
+  on each probe (`growslice` about 1.3 %). Only writers (split propagation) and vacuum read that path, never a
+  scan.
+
+**Change.**
+
+- **Cached root.** `BTree.rootCache` packs (level, block) atomically, with 0 meaning uncached. `readRoot` fills
+  it whenever the metapage is read. A descent starting from the cache pins the page and requires
+  `rootCacheValid`: `BTRoot` set, not deleted or half-dead, at the cached level, and with no left or right
+  sibling. Otherwise it drops the cache and re-reads the metapage, as is an unreadable cached block.
+  - A root that has split gets a right sibling and loses `BTRoot`.
+  - Requiring the true root, rather than PG's fast root, keeps a writer's path complete up to the top for
+    `getStackBuf`.
+- **No path for scans.** `descendMode` takes `needPath`. `descendToLowerBound`, the scan entry, passes false;
+  `descend` (inserts, `descendToLeaf`, vacuum) passes true.
+
+**Pins.** `TestRootCacheTracksTheRoot` runs three stages, and in each, lookups (`Search`) and a cursor scan must
+stay exact, while the cache must equal the metapage's root and level afterwards:
+
+1. A fresh 3000-key tree, whose root is internal.
+2. The cache poisoned with the rightmost leaf, from which right links can never reach key 0.
+3. The pre-split root held in the cache across inserts that grow the tree a level, then 500 more inserts made
+   through the stale cache.
+
+A full scan must then return every key in order. Mutation check: a `rootCacheValid` that accepts anything
+makes `Search(0)` miss. The nbtree package passes under `-race`.
+
+**Discovery (filed, not fixed).** Growing that tree past three levels trips the existing `walkPivotInvariants`
+check, "internal item 0 natts = 1, want 0", with the cache disabled too. `_bt_split` makes the first data item of
+a split-created right internal page a zero-attribute (minus infinity) pivot; goopg keeps its key. Searches are
+unaffected, because keys stay ordered, but the page differs from PG's on disk. The existing pivot tests only build
+two-level trees. Filed as fix_plan M0131-S33 with a deferral-ledger row.
+
+**Measured.** Instructions per query against `fdb607c10`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q87 | 24.12 | 23.79 (−1.4 %) |
+| Q38 | 23.96 | 23.65 (−1.3 %) |
+| Q72 | 29.23 | 28.62 (−2.1 %) |
+| Q14 | 162.5 | 159.8 (−1.6 %) |
+| Q16 | 13.90 | 13.87 (−0.2 %) |
+
+The named target moved less than 3 %, which counts toward the banner's item-10 yield rule (b). The sf025 sweep
+sum went from 105.8 to 107.1 s; the instruction counts show this is load. Values are identical (sf025 PASS=99,
+61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.** Each probe still pins its leaf twice: the descent checks the high key and unpins, then the cursor
+re-pins and re-checks it. PG keeps the leaf pinned from `_bt_search` into `_bt_readpage`, but holding the
+latch across the executor boundary is unsafe here. Beyond that the probe cost is the comparison chain itself:
+`compare` → `ComparePGIndexTuples` → `comparePGIndexTupleAttrsAt` → `compareFixedPrefix` on a tuple-vs-tuple key,
+where PG compares a pre-deformed scan key against the index tuple.

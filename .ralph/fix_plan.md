@@ -2134,6 +2134,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       compareMergeKeys; appendDistinctOnKey into a reused buffer \(both pinned, mutation\-checked\)\.
     - Q87 27\.06 → 24\.0 Ginstr \(−11 %\), Q38 −11 %, Q35 −2\.6 %; Q97 \+0\.3 % layout; sweep 109\.9 → 105\.8 s\.
     - Next: mergeKeysLess string path \(no text flags\); distinctOp rowKeyTrimmed per row; Q87 still ~3× PG\.
+  - **Slice 61 — descents start from a cached root; scans stop building the descent path LANDED 2026\-10\-22\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS \(a first run hit the 10 m
+    package timeout under load at 600 s; re\-run with \-timeout 30m passed in 540 s\), nbtree \-race PASS\. Doc part 6
+    "Slice 61"\.
+    - Named target TPC\-DS Q87: index probes 28 % of instructions; readMeta per descent ~1\.5 %, path growslice ~1\.3 %\.
+    - BTree\.rootCache \(PG rd\_amcache\) validated per descent by rootCacheValid; descendMode needPath=false for scans
+      \(pinned incl\. stale\-root and poisoned\-leaf cases, mutation\-checked\)\.
+    - Q87 −1\.4 %, Q38 −1\.3 %, Q72 −2\.1 %, Q14 −1\.6 % instructions — **below the 3 % bar** \(counts toward rule b\)\.
+    - Discovery filed: M0131\-S33 \(split\-created internal page keeps its first item's key\) \+ ledger row\.
+    - Next: if slice 62 also moves its target < 3 %, M0122\-0012 yields to M0147 \(banner item 10 rule b\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -2478,6 +2489,21 @@ Theme F — Crash-state cluster-directory interchange (added 2026-08-11, user di
 
 - [ ] **M0131-S24 — MultiXact: durable `pg_multixact` SLRU + `multixact_redo`** — DEFERRED.
 
+- [ ] **M0131-S33 — nbtree: the first item of a split\-created internal page keeps its key \(PG truncates it to minus infinity\)**\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-10\-22 from M0122\-0012 slice 61 \(discovery while testing the root cache\)\.
+  - Repro: an int4 test tree grown past three levels by incremental inserts \(`TestInsertSplitProducesPivotTuples` shape,
+    ~60 000 keys\) fails `walkPivotInvariants` with "block N \(internal\) item 0 natts = 1, want 0" — the cache disabled,
+    so it predates slice 61; the existing pivot tests only build two\-level trees and never reach it\.
+  - PG: `\_bt\_split` \(nbtinsert\.c\) makes the right internal page's first data item a zero\-attribute pivot \(its
+    key is minus infinity; only its downlink matters\), so every internal page's first item has natts 0\.
+  - Impact: searches still route correctly \(keys stay ordered and goopg's binary search treats the item as a key\),
+    but the on\-disk page differs from PG's and PG's amcheck checks this invariant\.
+  - Resume: internal\-page split in internal/access/nbtree/btree\.go \(the right half's first item\) — truncate it with
+    `BTreeTupleSetNAtts\(raw, 0, false\)` as the leftmost root item already is; then grow
+    `TestInsertSplitProducesPivotTuples` past three levels\.
+  - S7: correctness/format only, no plan\-instrument rationale → queues below item 10\.
 ## Archived — complete (see `completed_milestones/completed_fix_plan_012.md`)
 
 _(completed entries archived → `completed_milestones/completed_fix_plan_015.md`)_
@@ -4204,6 +4230,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `5d6e91613`** \(M0122\-0012 slice 59 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022u/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `fdb607c10`** \(M0122\-0012 slice 60 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
