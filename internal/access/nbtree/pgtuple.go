@@ -185,6 +185,24 @@ func pgVarattIs1B(b []byte) bool { return len(b) > 0 && b[0]&0x01 == 0x01 }
 // pgVarattIs1BE is VARATT_IS_1B_E — a TOAST pointer (0x01 header byte).
 func pgVarattIs1BE(b []byte) bool { return len(b) > 0 && b[0] == 0x01 }
 
+// PGIndexImageInline reports that img, one attribute image deformed from an
+// index tuple (DeformPGIndexTuple), is stored inline and uncompressed: a
+// fixed-width value, a short-header varlena that is not a TOAST pointer, or
+// a 4-byte-header uncompressed varlena. FormPGIndexTuple re-forms such an
+// image into exactly the bytes it forms from the same value encoded afresh
+// (a 4-byte header is re-headered short, a short one is copied), so a caller
+// may build a new key from it without decoding the value (M0122-0012 slice
+// 52, the skip scan's group bounds).
+func PGIndexImageInline(att PGIndexAttr, img []byte) bool {
+	if att.Len != -1 {
+		return true
+	}
+	if pgVarattIs1B(img) {
+		return !pgVarattIs1BE(img)
+	}
+	return pgVarattIs4BU(img)
+}
+
 // pgVarSizeAny is VARSIZE_ANY: the total on-disk length of a varlena in any
 // header form.
 func pgVarSizeAny(b []byte) (int, error) {

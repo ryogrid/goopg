@@ -42,6 +42,13 @@ type btreeSkipEnum struct {
 	// vals is groupBounds' reused value buffer (prefix datums, then the
 	// bound columns' values).
 	vals []Datum
+	// restImgs are the bound columns' attribute images, encoded once per
+	// Rescan for groupBoundsRaw (nil when one cannot be, e.g. a TOAST
+	// pointer); rawImgs / rawNulls are its reused per-group buffers.
+	restImgs     [][]byte
+	restImgsDone bool
+	rawImgs      [][]byte
+	rawNulls     []bool
 }
 
 // init evaluates the bound columns ONCE per Rescan — the same eval timing
@@ -180,6 +187,11 @@ func (e *btreeSkipEnum) next(ctx *Context, tree *nbtree.BTree, idx *catalog.Inde
 // its pivot, the prefix alone: an entry is still in the group exactly while
 // CompareHighBound(entry, pivot) <= 0, and the next group starts strictly past it.
 func (e *btreeSkipEnum) groupBounds(ctx *Context, idx *catalog.Index, s int, key []byte, pos int, op string) (probe, pivot []byte, err error) {
+	if probe, pivot, ok, rerr := e.groupBoundsRaw(idx, s, key, pos); rerr != nil {
+		return nil, nil, rerr
+	} else if ok {
+		return probe, pivot, nil
+	}
 	datums, derr := pgIndexTupleKeyDatums(e.desc, e.keyCols, key)
 	if derr != nil {
 		return nil, nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
@@ -203,6 +215,85 @@ func (e *btreeSkipEnum) groupBounds(ctx *Context, idx *catalog.Index, s int, key
 		return nil, nil, err
 	}
 	return probe, pivot, nil
+}
+
+// groupBoundsRaw forms the group's probe and pivot from the entry's own
+// attribute images (M0122-0012 slice 52), as PG's skip array takes the
+// skipped attribute's datum straight from the index tuple
+// (_bt_advance_array_keys, nbtutils.c) instead of decoding and re-encoding
+// it. The prefix images are deformed once and handed to FormPGIndexTuple with
+// the bound columns' images (encoded once per Rescan); FormPGIndexTuple
+// re-forms an inline image into the bytes it forms from the decoded value
+// encoded afresh (nbtree.PGIndexImageInline), so the keys are groupBounds'.
+// ok is false — the caller takes the decoding path, which also reports the
+// errors — for an entry that is not a full-arity leaf tuple, a prefix value
+// stored compressed or out of line, or a bound value that is a TOAST pointer.
+func (e *btreeSkipEnum) groupBoundsRaw(idx *catalog.Index, s int, key []byte, pos int) (probe, pivot []byte, ok bool, err error) {
+	nkey := e.desc.NKeyAtts()
+	phys := e.desc.Physical()
+	n := s + len(e.rest)
+	if n > nkey || len(key) < nbtree.SizeOfIndexTupleData || int(nbtree.BTreeTupleGetNAtts(key, uint16(nkey))) != nkey {
+		return nil, nil, false, nil
+	}
+	if !e.restImgsDone {
+		e.restImgsDone = true
+		e.restImgs = make([][]byte, 0, len(e.rest))
+		for i, r := range e.rest {
+			if r.val.Kind == KindToastPointer {
+				e.restImgs = nil
+				break
+			}
+			img, encErr := encodeValuePG(e.keyCols[s+i].Type, r.val)
+			if encErr != nil {
+				e.restImgs = nil
+				break
+			}
+			e.restImgs = append(e.restImgs, img)
+		}
+	}
+	if len(e.restImgs) != len(e.rest) {
+		return nil, nil, false, nil
+	}
+	imgs, nulls, derr := nbtree.DeformPGIndexTuple(key, phys, s)
+	if derr != nil {
+		return nil, nil, false, nil
+	}
+	for i := 0; i < s; i++ {
+		if !nulls[i] && !nbtree.PGIndexImageInline(phys[i], imgs[i]) {
+			return nil, nil, false, nil
+		}
+	}
+	e.rawImgs = append(append(e.rawImgs[:0], imgs...), e.restImgs...)
+	e.rawNulls = append(e.rawNulls[:0], nulls...)
+	for range e.rest {
+		e.rawNulls = append(e.rawNulls, false)
+	}
+	if probe, err = e.formKey(idx, phys[:n], e.rawImgs[:n], e.rawNulls[:n], nkey, pos); err != nil {
+		return nil, nil, false, err
+	}
+	if pivot, err = e.formKey(idx, phys[:s], e.rawImgs[:s], e.rawNulls[:s], nkey, pos); err != nil {
+		return nil, nil, false, err
+	}
+	return probe, pivot, true, nil
+}
+
+// formKey is pgIndexTupleKey's tail over ready attribute images: one
+// FormPGIndexTuple with the zero heap TID, stamped as a pivot of its own
+// attribute count when it names fewer than every key attribute, and checked
+// against the leaf item-size limit — with indexProbeKey's error text.
+func (e *btreeSkipEnum) formKey(idx *catalog.Index, phys []nbtree.PGIndexAttr, imgs [][]byte, nulls []bool, nkey, pos int) ([]byte, error) {
+	raw, err := nbtree.FormPGIndexTuple(phys, imgs, nulls, storage.ItemPointer{})
+	if err == nil && len(phys) < nkey {
+		err = nbtree.BTreeTupleSetNAtts(raw, uint16(len(phys)), false)
+	}
+	if err == nil {
+		err = nbtree.CheckPGBTItemSize(len(raw), true)
+	}
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: index %q: %v", idx.Name, err)}
+	}
+	return raw, nil
 }
 
 // probeKey is ctx.indexProbeKey's tuple-format arm for a part list naming

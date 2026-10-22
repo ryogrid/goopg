@@ -2044,6 +2044,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - markScanBorrowChain descends both branches of a streaming, merge\-key\-free setOp \(nextStreaming keeps nothing\)\.
     - Q71 → 0\.40–0\.42 s, Q5 0\.87–1\.70 → 0\.68–1\.25 s, Q14 20\.4–20\.9 → 17\.5–19\.3 s; TPC\-H values identical\.
     - Next: Q71 rest = NL index probes \+ Gather queue copies; Q78, Q80, Q59 bpchar compare\.
+  - **Slice 52 — a skip\-scan group key is formed from the entry's own images LANDED 2026\-10\-22\.** Movement: none —
+    perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, nbtree \-race PASS\. Doc part 5 "Slice 52"\.
+    - Measurement: goopg clones/corpora run at 128MB shared\_buffers vs PG's 2GB \(DB 761MB\) — warm runs re\-read pages
+      and verify checksums; the private clone now runs at 2GB\. At equal buffers Q72 is at parity; Q16 is the top ratio\.
+    - Named target TPC\-DS Q16 \(0\.67 s vs PG 0\.06\): groupBounds decode \+ re\-encode 40 %; groupBoundsRaw forms
+      probe/pivot from the entry's prefix images \(PGIndexImageInline gate\), byte\-identical \(pinned\)\.
+    - Q16 0\.65–0\.74 → 0\.48–0\.51 s, Q95 −8 %; sweep 119\.0 → 115\.7 s; TPC\-H values identical\.
+    - Next: Q16 per\-entry whole\-tuple compares \(38 %\); Q97 5×, Q80 3×, Q78 2\.9×, Q59 2\.6× at equal buffers\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4072,6 +4081,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `0928e85b3`** \(M0122\-0012 slice 50 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `b535f1ec5`** \(M0122\-0012 slice 51 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

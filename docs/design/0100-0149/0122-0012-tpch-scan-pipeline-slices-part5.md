@@ -368,3 +368,74 @@ TPC-H values are identical (acceptance 24 MATCH), and the sweep's plan shapes ar
 
 **Left.** Q71 is still ~5× PG. Its nested loops probe `item_pkey` and `time_dim_pkey` per outer row, and the
 Gather queue copies every surviving row (`transferRowForQueue`).
+
+## Slice 52 (2026-10-22): a skip-scan group key is formed from the entry's own images — TPC-DS Q16
+
+**Measurement note first.** Profiling Q80 and Q58 this loop put 6–8 % in `storage.pageChecksumBlock` under
+`relFile.readBlock`: warm runs were still reading pages from disk. The private bench clone (`tmp/q64-clone`), like
+the shipped goopg corpora, runs at the default 128MB `shared_buffers`. The `:65438` PG reference runs at 2GB, and
+the SF0.25 database is 761MB. Both clusters verify checksums on read (`data_checksums = on`), so goopg paid a
+re-read and a checksum per page that PG, with everything cached, never pays.
+
+The clone now runs at 2GB to match PG. It is a private `tmp/` copy, so this changes no shipped corpus or gate.
+Re-timed at equal buffers:
+
+| query | goopg (s) | PG (s) |
+|---|---|---|
+| Q72 | 1.1 | 0.6–1.4 |
+| Q16 | 0.67 | 0.06 |
+| Q97 | 0.63 | 0.12 |
+| Q80 | 0.23 | 0.08 |
+| Q78 | 1.33 | 0.46 |
+| Q59 | ~1.9 | 0.74 |
+| Q71 | 0.17 | 0.08 |
+
+Q72 is at parity. Earlier slices' A/B ratios stand: both builds ran at the same 128MB.
+
+**Target, named up front:** TPC-DS Q16, the largest ratio at equal buffers.
+
+**Cause.** After slice 49, `groupBounds` was still 40 % of the query. Per prefix group it decoded the group's first
+entry to Datums (`pgIndexTupleKeyDatums`, 22 %) and re-encoded them into the probe and pivot (`pgIndexTupleKey`,
+15 %). PG's skip array never round-trips the value: `_bt_advance_array_keys` copies the skipped attribute's datum
+straight from the index tuple into its scankey.
+
+**Rule.** `groupBoundsRaw` forms both keys from images:
+
+- it deforms only the entry's `s` prefix attributes (`nbtree.DeformPGIndexTuple`), and passes those images to
+  `FormPGIndexTuple`;
+- the bound columns' images (`encodeValuePG`) are formed once per Rescan;
+- the tail is `pgIndexTupleKey`'s: zero heap TID, the pivot stamped with its own attribute count, and the leaf
+  item-size check, all with `indexProbeKey`'s error text.
+
+A new `nbtree.PGIndexImageInline` admits only images `FormPGIndexTuple` re-forms into exactly the bytes of the
+value encoded afresh: fixed width, a short varlena that is not a TOAST pointer, or a 4-byte uncompressed varlena
+(re-headered short). Anything else takes the decoding path, which also reports the errors:
+
+- an entry that is not a full-arity leaf tuple;
+- a prefix value stored compressed or out of line;
+- a bound value that is a TOAST pointer.
+
+**Pins.**
+
+- `TestSkipGroupBoundsMatchesIndexProbeKey` now asserts the raw path takes every entry.
+- `TestSkipGroupBoundsRawImagesMatchDecodedTypes` checks that the raw probe and pivot are byte-equal to the
+  decode-and-encode keys for an index on `(numeric, date, char(4), text, int)`. It skips four columns, with a NULL
+  prefix, padded and blank `char` values, an empty text and a long text value.
+
+Dropping the pivot's attribute-count stamp fails both. The nbtree package passes under `-race`.
+
+**Measured.** Warm, 2GB clone, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q16 | 0.65–0.74 | 0.48–0.51 |
+| TPC-DS Q95 | 3.48–3.87 | 3.20–3.53 |
+| TPC-DS Q94 | 0.10–0.13 | 0.09–0.10 |
+
+In the sf025 sweep (128MB), Q16 went from 0.62 to 0.50 s and the sum from 119.0 to 115.7 s. Its Q9/Q97/Q31 rises
+did not repeat in an A/B (equal on both builds). TPC-H values are identical (acceptance 24 MATCH), and the sweep's
+plan shapes are identical.
+
+**Left.** Q16 is still ~8× PG. What remains is the walk's per-entry tuple comparisons
+(`comparePGIndexTupleAttrs`, ~38 %): PG compares scankeys with each attribute's comparator, while goopg compares
+two whole tuple images.
