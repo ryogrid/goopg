@@ -10447,7 +10447,7 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// is bounded by the sublink result caches and, later, the S2 handles.
 	operandNull := operand.IsNull()
 
-	values, itemBP, itemLit, err := inListItems(x, slot, ctx)
+	values, itemBP, itemLit, litList, err := inListItems(x, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -10538,10 +10538,21 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	if res, served := evalInHashProbe(x, operand, values, ctx); served {
 		return res, nil
 	}
+	// A literal list's string items coerced once to the operand's kind
+	// (M0122-0012 slice 43): for these kinds compareEq(operand, item) is
+	// compareDatum(operand, item), which coerces the item itself — see
+	// unknown_literal.go.
+	coerced := litList.coercedItems(operand.Kind, opBP, opLit)
 	sawNull := false
 	for i, v := range values {
 		if v.IsNull() {
 			sawNull = true
+			continue
+		}
+		if coerced != nil && coerced[i].Kind == operand.Kind {
+			if cmp, err := compareDatum(operand, coerced[i], 0); err == nil && cmp == 0 {
+				return NewBoolDatum(!x.Negated), nil
+			}
 			continue
 		}
 		o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
@@ -10787,6 +10798,10 @@ type inListConst struct {
 	values  []Datum
 	itemBP  []int64
 	itemLit []bool
+	// coerced is values coerced to coercedKind for the plain-equality loop
+	// (coercedItems, unknown_literal.go).
+	coerced     []Datum
+	coercedKind DatumKind
 }
 
 // inListItems returns an IN's items with the per-item bpchar metadata
@@ -10798,9 +10813,10 @@ type inListConst struct {
 // metadata slices on every row. The cache lives on the Context, which is per
 // statement and private to each parallel worker (NewWorkerContext starts
 // from NewContext), and its values are detached from any arena.
-func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []int64, []bool, error) {
+func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []int64, []bool, *inListConst, error) {
 	if x.Plan != nil || ctx == nil {
-		return inListItemsEval(x, slotToRow(slot), ctx)
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		return values, itemBP, itemLit, nil, err
 	}
 	c := ctx.inListConsts[x]
 	if c == nil {
@@ -10813,12 +10829,13 @@ func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []i
 		}
 	}
 	if !c.literal {
-		return inListItemsEval(x, slotToRow(slot), ctx)
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		return values, itemBP, itemLit, nil, err
 	}
 	if c.values == nil {
 		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
 		if err != nil {
-			return nil, nil, nil, err // not cached: the next row raises it again
+			return nil, nil, nil, nil, err // not cached: the next row raises it again
 		}
 		owned := make([]Datum, len(values))
 		for i, v := range values {
@@ -10830,7 +10847,7 @@ func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []i
 		}
 		ctx.inListConsts[x] = c
 	}
-	return c.values, c.itemBP, c.itemLit, nil
+	return c.values, c.itemBP, c.itemLit, c, nil
 }
 
 // inListIsLiteral reports whether every item of a value-list IN is a literal,

@@ -487,3 +487,92 @@ same on both builds).
 **Left.** PG's pathkeys are canonical and compare by EquivalenceClass pointer. goopg still keys expressions by
 identity strings, through map lookups on interface keys (`runtime.ifaceeq` was ~10 %). That is the slice 32
 ledger row, with a progress row added for this slice.
+
+## Slice 43 (2026-10-22): an unknown literal is coerced once, not per row — TPC-DS Q83, Q58
+
+**Target, named up front:** TPC-DS Q83 (1.34 s in the sf025 sweep against PG's 0.10 s, a ratio of 13) and Q58
+(0.92 s against 0.087 s). A plain EXPLAIN of each takes ~10 ms, so the time is execution.
+
+**Cause.** EXPLAIN ANALYZE put Q83's time in three scans of `date_dim` (73 049 rows) filtered by
+`d_date IN ('2001-07-13', '2001-09-10', '2001-11-16')`: ~300–600 ms each, where PG takes 6.5 ms. Alone,
+`count(*) … WHERE d_date IN (…)` took 590 ms and `d_date = '2001-07-13'` 204 ms; an integer IN list over the
+same table took 17 ms. 92 % of the profile was `compareEq → compareDatum → promoteCrossKind →
+tryParseStringAs → parseCopyTimestamp → time.Parse`, half of it in `time.newParseError` from the layouts that
+fail before the one that fits.
+
+goopg types a bare literal `unknown` and coerces it at comparison time (root-0019), so every row re-parsed the
+literal text. PG coerces it once, while the query is parsed: `oper()` resolves the unknown operand to the other
+operand's type and `coerce_type` runs that type's input function on the literal (`parse_oper.c`,
+`parse_coerce.c`; `transformAExprIn` does the same for an IN list).
+
+**Rule.** Both memos rest on one identity. `compareDatum(a, lit)` begins with `promoteCrossKind(a, lit)`, which
+for a non-string `a` and a string `lit` is `(a, tryParseStringAs(a.Kind, lit))`, and leaves a pair of equal
+kinds alone. So `compareDatum(a, tryParseStringAs(a.Kind, lit))` equals `compareDatum(a, lit)` for every `a`.
+Each memo is used only when the opposite operand's runtime kind is the kind the literal was coerced to; every
+other row takes the old path. A literal that does not parse is not memoised, so its row still fails or falls
+back exactly as before.
+
+- **A compiled comparison** (`unknownLitCoercion`, at build time). The memo is built when the operator is a
+  comparison and exactly one side is a bare literal. It also needs:
+  - no character-string pair;
+  - no bpchar-typed side;
+  - a literal that does not look like a pg_lsn.
+
+  These are the preamble branches of `evalFastBinaryApply` that could see the literal as a string. The other
+  side's declared type (`optimizer.ExprResultType`) picks the kind (`unknownLitTargetKind`: int, numeric,
+  date/timestamp, interval). The coerced literal rides in `ExprNode.constVal`, with its kind in `payload[17]`.
+  `coerceUnknownLit` substitutes it in the per-row arm before the `fastBinarySimple` test, so the pair then
+  takes slice 27's in-place `fastCompareDatum`. It also substitutes at the top of `evalFastBinaryApply`, for the
+  batch evaluator. The slab is per operator instance and the memo is immutable after the build, so workers
+  share nothing mutable.
+- **A literal IN list** (`inListConst.coercedItems`). The statement already caches a literal list's items per
+  Context. They are now also coerced, once per operand kind, after the same bpchar normalisation the loop
+  applies. The plain-equality loop then compares a coerced item with `compareDatum`, which is what `compareEq`
+  calls for those kinds:
+  - numeric, through its own arm;
+  - date/timestamp/interval, through the cross-kind fallback.
+
+  An integer operand is not served, because `compareEq` compares an integer to a string as text. That is a
+  separate wrong-result defect, P0-E10 below; serving it here would have made the cached and uncached lists
+  disagree.
+
+The interpreted twin (`evalExprSlot`'s BinaryOp arm) still coerces per row. It returns the same values, only
+slower.
+
+**Pins.**
+
+- `TestUnknownLiteralComparisonMatchesPerRowCoercion` compares the compiled per-row and batch evaluators with
+  the interpreted twin. It covers:
+  - five typed columns, 17 literals, six operators and both operand orders, on every row;
+  - rows whose runtime kind is not the declared one: a string `'2001-07-13 00:00:00'` in a date column, which
+    equals the date but sorts after the text `'2001-07-13'`.
+
+  Dropping the runtime kind test fails it.
+- `TestUnknownLiteralInListMatchesPerRowCoercion` compares a cached list (with a Context) against per-row
+  evaluation (without one), for IN and NOT IN with NULL, unparseable and typed items mixed in. Admitting
+  `KindInt` to `coercedItems` fails it on `5 IN ('05')`.
+
+**Measured.**
+
+| query | before | after |
+|---|---|---|
+| `count(*) FROM date_dim WHERE d_date IN (3 literals)` | 590 ms | 18.6 ms |
+| `… WHERE d_date = '2001-07-13'` | 204 ms | 11 ms |
+| TPC-DS Q83, warm, two interleaved rounds | 1.59–1.64 s | 0.23–0.25 s |
+| TPC-DS Q58 | 1.22–1.39 s | 0.60–0.61 s |
+| TPC-DS Q16 | 1.09–1.31 s | 0.92–0.93 s |
+| TPC-DS Q32 | 0.11 s | 0.04 s |
+
+In the sf025 sweep, Q83 went from 1.34 to 0.21 s, Q58 from 0.92 to 0.45 s, and the sweep sum from 142.4 to
+139.6 s. The sweep's larger Q22/Q66/Q7/Q56 moves did not repeat in an A/B (equal on both builds), and Q4 is
+bimodal on both. TPC-H values are identical (acceptance 24 MATCH).
+
+**Left.**
+
+- Q58's remaining 0.45 s is join row cloning (`cloneRowOwnedPrefix`), a separate target.
+- PG coerces in the analyzer, and goopg still carries the literal as a string through the plan. Moving the
+  coercion into the analyzer would also serve the interpreted twin, index-probe keys and every other consumer.
+  Recorded in the deferral ledger.
+- **P0-E10, filed (S2):** `compareEq`, used by IN lists, compares an integer to an unknown literal as text, so
+  `d_year IN ('02000', ' 2001')` matches nothing where PG matches 731 rows. The `=` form is correct. The defect
+  is pre-existing at `62b168220`. Repro: `analysis/p0e10/`.

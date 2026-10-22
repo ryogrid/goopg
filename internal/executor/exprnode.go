@@ -97,8 +97,9 @@ type ExprNode struct {
 	childB  int32        // right child index; noExpr if none
 	payload [40]byte     // per-Kind inline data (see constants above)
 	orig    optimizer.Expr // non-nil only for ExprAdapter
-	// constVal is the folded value for ExprConstVal, and nil for every other
-	// kind. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
+	// constVal is the folded value for ExprConstVal; for an ExprBinaryOp
+	// comparison it is the bare literal operand coerced once to the kind in
+	// payload[17] (unknownLitCoercion, unknown_literal.go); nil otherwise. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
 	// a pointer costs 8 bytes on every node instead of growing payload by 48.
 	constVal *Datum
 }
@@ -264,6 +265,14 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		// sibling of the interpreted twin's exprIsCharacterString test).
 		if isComparisonOpCode(t.Op) && exprIsCharacterString(t.Left) && exprIsCharacterString(t.Right) {
 			(*s)[idx].payload[16] |= 4
+		}
+		// constVal / payload[17]: a bare literal compared with a typed
+		// operand, coerced once here rather than per row by compareDatum
+		// (M0122-0012 slice 43; PG coerces the unknown literal at parse
+		// time). Applied by coerceUnknownLit in both evaluators.
+		if lit, kind, ok := unknownLitCoercion(t, (*s)[idx].payload[16]); ok {
+			(*s)[idx].constVal = &lit
+			(*s)[idx].payload[17] = uint8(kind)
 		}
 		// Bits 8 / 16: `||` resolved to textcat / jsonb_concat from the
 		// static operand types (M0146-0074; the interpreted twin calls
@@ -462,6 +471,9 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		if n.constVal != nil {
+			coerceUnknownLit(n, &left, &right)
+		}
 		// The common shape is evaluated inline: the shared function's call
 		// cost was 14-26% of a per-row qual (M0122-0012 slice 7). When
 		// fastBinarySimple holds, every preamble branch of
@@ -517,6 +529,15 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Context, out *Datum) error {
 	var err error
 	left, right := *lp, *rp
+	// The batch evaluator reaches here without the per-row arm's
+	// coercion; once the literal is coerced, the comparison is the per-row
+	// arm's inline fastCompareDatum case.
+	if n.constVal != nil && coerceUnknownLit(n, &left, &right) && !left.IsNull() && !right.IsNull() {
+		if c, ok := fastCompareDatum(&left, &right); ok {
+			*out = NewBoolDatum(cmpResult(op, c))
+			return nil
+		}
+	}
 	// The compiled position (payload[4:8]), not a literal 0: every error
 	// these three helpers raise is stamped with it on the interpreted twin.
 	// M0127-PS6.2.

@@ -738,6 +738,24 @@ heuristic stays live.)
     aggregates against PG\.
   - Expected instrument: the repro identical to `analysis/p0e9/pg18\.out`; TPC\-H/TPC\-DS values unchanged\.
 
+- [ ] **P0\-E10 — an integer operand IN a list of unknown literals compares as text**
+  \(filed 2026\-10\-22 by the loop, M0122\-0012 slice 43 investigation; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro counts 0/3/0 → PG's 2/1/731\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-22 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e10/int\-in\-literal\-repro\.sql`; PG 18\.3 output
+    > `analysis/p0e10/pg18\.out`, goopg `62b168220` output `analysis/p0e10/goopg\-62b168220\.out`\.
+  - Symptom: `d\_year IN \('02000', ' 2001'\)` matches no row \(PG: 731 on tpcds025\); `y NOT IN \('02000', '\+2001'\)` keeps
+    rows PG drops\. `y = '02000'` is correct\.
+  - Cause \(read\): compareEq \(internal/executor/expr\.go\), which every IN / NOT IN / `<> ANY` loop uses, has an arm
+    comparing KindInt to KindString by `fmt\.Sprintf\("%d"\)` text equality; `=` goes through compareDatum →
+    promoteCrossKind, which parses the literal\. PG coerces each literal with int4in at parse time \(transformAExprIn\)\.
+  - First step: route compareEq's int/string arms through compareDatum like its numeric arm \(an incompatible pair stays
+    not\-equal\), then check evalInHashProbe and the row\-IN paths for the same arm; admit KindInt to
+    inListConst\.coercedItems once both paths agree\.
+  - Expected instrument: the repro identical to `analysis/p0e10/pg18\.out`; TPC\-H/TPC\-DS values unchanged\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -1949,6 +1967,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q64 EXPLAIN 2\.9 → 1\.7 s, run 3\.5 → 2\.4 s \(−32 %\); sweep Q64 4\.36 → 1\.85 s; TPC\-H identical\.
     - Gap census \(warm, :65438\) for next targets: Q35 3\.4 vs 0\.35, Q83 1\.3 vs 0\.10, Q5 1\.6 vs 0\.31, Q39 2\.6 vs 0\.59,
       Q21 2\.3 vs 0\.70, Q14 16\.8 vs 7\.7\.
+  - **Slice 43 — an unknown literal is coerced once, not per row LANDED 2026\-10\-22\.** Movement: none — perf only\. The
+    S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS\. Doc part 4 "Slice 43"\.
+    - Named targets TPC\-DS Q83 \(1\.34 s vs PG 0\.10\) and Q58 \(0\.92 vs 0\.087\): 92 % of a `date\_dim` scan under
+      `d\_date IN \('2001\-07\-13', …\)` was tryParseStringAs re\-parsing the literal per row \(590 ms vs PG 6\.5 ms\)\.
+    - unknownLitCoercion pre\-coerces a compiled comparison's bare literal to the other side's declared kind;
+      inListConst\.coercedItems coerces a literal IN list once per operand kind; both apply only on a runtime kind match\.
+    - Q83 1\.6 → 0\.24 s, Q58 1\.3 → 0\.6 s, Q16 1\.2 → 0\.92 s, Q32 0\.11 → 0\.04 s; sweep 142\.4 → 139\.6 s; TPC\-H values identical\.
+    - Next candidates: Q58 rest is join row cloning \(cloneRowOwnedPrefix\); Q35 3\.4 vs 0\.35, Q39 2\.4 vs 0\.59, Q87, Q51\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3925,6 +3952,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `a0a569de7`** \(census reused: a0a569de7 touched only internal/access/nbtree, not an S9 trigger path\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `62b168220`** \(M0122\-0012 slice 42 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\)\. Item 10 is live for this loop\.
