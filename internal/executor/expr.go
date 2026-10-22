@@ -6992,19 +6992,32 @@ func parsePgSnapshotValid(s string) bool {
 // A regclass value already carries its OID once evaluated (or, less
 // commonly, arrives as the textual OID from an explicit ::regclass cast) —
 // same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
-func resolveRegclassOID(argExpr optimizer.Expr, slot SlotView, ctx *Context) (uint32, bool) {
+func resolveRegclassOID(argExpr optimizer.Expr, slot SlotView, ctx *Context) (uint32, bool, error) {
 	arg, err := evalExprSlot(argExpr, slot, ctx)
-	if err != nil || arg.IsNull() {
-		return 0, false
+	if err != nil {
+		return 0, false, err
+	}
+	if arg.IsNull() {
+		return 0, false, nil
+	}
+	if arg.Kind == KindString {
+		// An unknown literal reaches a regclass parameter through regclassin
+		// (`pg_relation_size('t')`): a name resolves on the search path and a
+		// missing one raises 42P01, as the parameter's input function does in
+		// PG. An OID string stays an OID (parseRegDashOrOid).
+		arg, err = regIdentifierInput(arg, "regclass", ctx, argExpr.Pos())
+		if err != nil {
+			return 0, false, err
+		}
 	}
 	if arg.Kind == KindInt {
-		return uint32(arg.Int), true
+		return uint32(arg.Int), true, nil
 	}
 	v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
 	if perr != nil {
-		return 0, false
+		return 0, false, nil
 	}
-	return uint32(v), true
+	return uint32(v), true, nil
 }
 
 // parseForkName maps a pg_relation_size fork-name argument to storage's
@@ -7054,6 +7067,9 @@ func relationAllForksSize(pool *storage.Pool, rel storage.RelFileNode) int64 {
 // relationFileNodeForOID resolves a regclass OID to its RelFileNode, for
 // either an ordinary table or an index — pg_relation_size accepts both.
 func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if oid == 0 { // InvalidOid names no relation (try_relation_open)
+		return storage.RelFileNode{}, false
+	}
 	if tbl, ok := cat.LookupTableByOID(oid); ok {
 		return cat.RelFileNode(tbl), true
 	}
@@ -7071,6 +7087,89 @@ func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileN
 	return storage.RelFileNode{}, false
 }
 
+// relationStorageForOID is the storage pg_relation_filenode and
+// pg_relation_filepath report (dbsize.c): a relation of a kind with storage
+// (RELKIND_HAS_STORAGE — table, index, sequence, TOAST table, materialized
+// view) has one; a view, partitioned table or index, or foreign table has
+// none, and neither has an unknown OID — both functions return NULL then. The
+// relkind is the one pg_class shows, so the functions agree with
+// pg_class.relfilenode. A temporary relation is no exception: PG reports its
+// filenode too.
+func relationStorageForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if oid == 0 { // InvalidOid has no pg_class row
+		return storage.RelFileNode{}, false
+	}
+	if tbl, ok := cat.LookupTableByOID(oid); ok {
+		if !catalog.RelkindHasStorage(catalog.TableRelkind(tbl)) {
+			return storage.RelFileNode{}, false
+		}
+		return cat.RelFileNode(tbl), true
+	}
+	if idx, ok := cat.LookupIndexByOID(oid); ok {
+		if !catalog.RelkindHasStorage(cat.IndexRelkind(idx)) {
+			return storage.RelFileNode{}, false
+		}
+		return cat.IndexRelFileNode(idx), true
+	}
+	if toastRel, ok := cat.ToastRelFileNodeByOID(oid); ok {
+		return toastRel, true
+	}
+	return storage.RelFileNode{}, false
+}
+
+// evalPgRelationFilenode implements pg_relation_filenode(regclass) → oid
+// (dbsize.c): the relation's file number, NULL for a relation without
+// storage or an unknown OID.
+func evalPgRelationFilenode(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationStorageForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	return Datum{Kind: KindInt, Int: int64(rel.RelOid)}, nil
+}
+
+// evalPgRelationFilepath implements pg_relation_filepath(regclass) → text
+// (dbsize.c): the main fork's path relative to the data directory, NULL when
+// pg_relation_filenode is NULL. It names the file goopg actually stores the
+// relation in. One divergence: PG puts a temporary relation's file under a
+// per-backend name (base/<db>/t<procnumber>_<n>, relpathbackend); goopg
+// stores temporary relations like permanent ones, so the path has no t prefix.
+func evalPgRelationFilepath(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationStorageForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	return NewStringDatum(storage.RelMainPath(rel)), nil
+}
+
 // evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
 // mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
 // named fork (default "main") of the relation's own storage. M0122-0002.
@@ -7078,7 +7177,10 @@ func evalPgRelationSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Dat
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -7116,7 +7218,10 @@ func evalPgTableSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum,
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -7141,7 +7246,10 @@ func evalPgIndexesSize(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datu
 	if len(x.Args) < 1 {
 		return NullDatum, nil
 	}
-	oid, ok := resolveRegclassOID(x.Args[0], slot, ctx)
+	oid, ok, err := resolveRegclassOID(x.Args[0], slot, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
 	if !ok {
 		return NullDatum, nil
 	}
@@ -10339,48 +10447,12 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// is bounded by the sublink result caches and, later, the S2 handles.
 	operandNull := operand.IsNull()
 
-	row := slotToRow(slot)
-	values, err := collectInValues(x, row, ctx)
+	values, itemBP, itemLit, litList, err := inListItems(x, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
-	// bpchar comparison semantics for `operand = item` (M0146): each
-	// element comparison resolves under the same rules
-	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
-	// side compares blank-insensitively (bcTruelen), an untyped literal
-	// opposite a bpchar is coerced to bpchar, and an explicitly
-	// text-typed side keeps its padding byte-exact. The DECLARED types
-	// decide, never the datum, so the item metadata is captured here
-	// while the expressions/plan are still visible:
-	//   - a literal list (x.List) exposes each item's expression;
-	//   - a subquery list's items all share the inner plan's first
-	//     output column type;
-	//   - a single-element array-literal expansion gives every element
-	//     the source expression's classification.
 	opBP := declaredBpcharTypmod(x.Operand)
 	opLit := isBareStringLit(x.Operand)
-	itemBP := make([]int64, len(values))
-	itemLit := make([]bool, len(values))
-	switch {
-	case x.Plan != nil:
-		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
-			for i := range itemBP {
-				itemBP[i] = 1
-			}
-		}
-	case len(values) == len(x.List):
-		for i, e := range x.List {
-			itemBP[i] = declaredBpcharTypmod(e)
-			itemLit[i] = isBareStringLit(e)
-		}
-	case len(x.List) == 1:
-		bp := declaredBpcharTypmod(x.List[0])
-		lit := isBareStringLit(x.List[0])
-		for i := range itemBP {
-			itemBP[i] = bp
-			itemLit[i] = lit
-		}
-	}
 	if operandNull {
 		if len(values) == 0 {
 			// Vacuous quantification over an empty list.
@@ -10466,10 +10538,21 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	if res, served := evalInHashProbe(x, operand, values, ctx); served {
 		return res, nil
 	}
+	// A literal list's string items coerced once to the operand's kind
+	// (M0122-0012 slice 43): for these kinds compareEq(operand, item) is
+	// compareDatum(operand, item), which coerces the item itself — see
+	// unknown_literal.go.
+	coerced := litList.coercedItems(operand.Kind, opBP, opLit)
 	sawNull := false
 	for i, v := range values {
 		if v.IsNull() {
 			sawNull = true
+			continue
+		}
+		if coerced != nil && coerced[i].Kind == operand.Kind {
+			if cmp, err := compareDatum(operand, coerced[i], 0); err == nil && cmp == 0 {
+				return NewBoolDatum(!x.Negated), nil
+			}
 			continue
 		}
 		o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, v,
@@ -10705,6 +10788,136 @@ func bindSubPlanParams(exprPtr any, parParam []int, args []optimizer.Expr, row R
 		sb.WriteString(datumKey(v))
 	}
 	return sb.String(), nil
+}
+
+// inListConst is a literal value list's evaluated items, kept per statement
+// (Context.inListConsts). literal is false for a list that must be evaluated
+// per row; the entry then only remembers that verdict.
+type inListConst struct {
+	literal bool
+	values  []Datum
+	itemBP  []int64
+	itemLit []bool
+	// coerced is values coerced to coercedKind for the plain-equality loop
+	// (coercedItems, unknown_literal.go).
+	coerced     []Datum
+	coercedKind DatumKind
+}
+
+// inListItems returns an IN's items with the per-item bpchar metadata
+// comparisonOperandsAsBpchar needs. A value list whose items are all literals
+// (TPC-H Q12's `l_shipmode = ANY ('{MAIL,SHIP}'::bpchar[])`) is evaluated once
+// per statement: PG's planner folds such a list to a Const array
+// (eval_const_expressions), and ExecEvalScalarArrayOp then only walks it per
+// row. goopg evaluated every item, re-parsed the array text and allocated the
+// metadata slices on every row. The cache lives on the Context, which is per
+// statement and private to each parallel worker (NewWorkerContext starts
+// from NewContext), and its values are detached from any arena.
+func inListItems(x *optimizer.InExpr, slot SlotView, ctx *Context) ([]Datum, []int64, []bool, *inListConst, error) {
+	if x.Plan != nil || ctx == nil {
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		return values, itemBP, itemLit, nil, err
+	}
+	c := ctx.inListConsts[x]
+	if c == nil {
+		c = &inListConst{literal: inListIsLiteral(x)}
+		if !c.literal {
+			if ctx.inListConsts == nil {
+				ctx.inListConsts = make(map[*optimizer.InExpr]*inListConst)
+			}
+			ctx.inListConsts[x] = c
+		}
+	}
+	if !c.literal {
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		return values, itemBP, itemLit, nil, err
+	}
+	if c.values == nil {
+		values, itemBP, itemLit, err := inListItemsEval(x, slotToRow(slot), ctx)
+		if err != nil {
+			return nil, nil, nil, nil, err // not cached: the next row raises it again
+		}
+		owned := make([]Datum, len(values))
+		for i, v := range values {
+			owned[i] = v.MaterializeArena()
+		}
+		c.values, c.itemBP, c.itemLit = owned, itemBP, itemLit
+		if ctx.inListConsts == nil {
+			ctx.inListConsts = make(map[*optimizer.InExpr]*inListConst)
+		}
+		ctx.inListConsts[x] = c
+	}
+	return c.values, c.itemBP, c.itemLit, c, nil
+}
+
+// inListIsLiteral reports whether every item of a value-list IN is a literal,
+// optionally cast: its value cannot depend on the row, a parameter, or a
+// function call.
+func inListIsLiteral(x *optimizer.InExpr) bool {
+	if x.Plan != nil || x.Subquery != nil || len(x.Args) > 0 || len(x.List) == 0 {
+		return false
+	}
+	var lit func(e optimizer.Expr) bool
+	lit = func(e optimizer.Expr) bool {
+		switch v := e.(type) {
+		case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
+			*optimizer.BooleanConst, *optimizer.NullConst, *optimizer.TypedStringLit:
+			return true
+		case *optimizer.CastExpr:
+			return lit(v.Operand)
+		}
+		return false
+	}
+	for _, e := range x.List {
+		if !lit(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// inListItemsEval evaluates an IN's items against row.
+func inListItemsEval(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, []int64, []bool, error) {
+	values, err := collectInValues(x, row, ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// bpchar comparison semantics for `operand = item` (M0146): each
+	// element comparison resolves under the same rules
+	// comparisonOperandsAsBpchar applies to a BinaryOp — a bpchar-typed
+	// side compares blank-insensitively (bcTruelen), an untyped literal
+	// opposite a bpchar is coerced to bpchar, and an explicitly
+	// text-typed side keeps its padding byte-exact. The DECLARED types
+	// decide, never the datum, so the item metadata is captured here
+	// while the expressions/plan are still visible:
+	//   - a literal list (x.List) exposes each item's expression;
+	//   - a subquery list's items all share the inner plan's first
+	//     output column type;
+	//   - a single-element array-literal expansion gives every element
+	//     the source expression's classification.
+	itemBP := make([]int64, len(values))
+	itemLit := make([]bool, len(values))
+	switch {
+	case x.Plan != nil:
+		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
+			for i := range itemBP {
+				itemBP[i] = 1
+			}
+		}
+	case len(values) == len(x.List):
+		for i, e := range x.List {
+			itemBP[i] = declaredBpcharTypmod(e)
+			itemLit[i] = isBareStringLit(e)
+		}
+	case len(x.List) == 1:
+		bp := declaredBpcharTypmod(x.List[0])
+		lit := isBareStringLit(x.List[0])
+		for i := range itemBP {
+			itemBP[i] = bp
+			itemLit[i] = lit
+		}
+	}
+	return values, itemBP, itemLit, nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When
@@ -14329,33 +14542,10 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		return NullDatum, nil
 
 	case "pg_relation_filenode":
-		// pg_relation_filenode(relation regclass) → oid
-		// Returns the filenode for a relation. For temporary tables returns NULL.
-		if len(x.Args) >= 1 {
-			relDatum, err := evalExprSlot(x.Args[0], slot, ctx)
-			if err != nil {
-				return Datum{}, err
-			}
-			var relOID uint32
-			switch relDatum.Kind {
-			case KindInt:
-				relOID = uint32(relDatum.Int)
-			case KindString:
-				n, _ := strconv.ParseUint(relDatum.StringValue(), 10, 32)
-				relOID = uint32(n)
-			}
-			if relOID != 0 {
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, exists := im.LookupTableByOID(relOID); exists {
-						if tbl.Temp {
-							return NullDatum, nil
-						}
-						return Datum{Kind: KindInt, Int: int64(relOID)}, nil
-					}
-				}
-			}
-		}
-		return NullDatum, nil
+		return evalPgRelationFilenode(x, slot, ctx)
+
+	case "pg_relation_filepath":
+		return evalPgRelationFilepath(x, slot, ctx)
 
 	case "pg_filenode_relation":
 		// pg_filenode_relation(tablespace oid, filenode oid) → regclass
@@ -18018,6 +18208,8 @@ case "pg_char_to_encoding":
 		return NewBoolDatum(ctx.IsStandby), nil
 	case "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn":
 		return evalPgCurrentWALLSN(name, ctx)
+	case "pg_last_wal_receive_lsn", "pg_last_wal_replay_lsn":
+		return evalPgLastWALLSN(name, ctx), nil
 	case "pg_promote":
 		// pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
 		// Returns true if this server is a standby and promotion was triggered.

@@ -112,12 +112,24 @@ const (
 // reporting whether e is positively understood as reading only indexed
 // columns. This is deliberately a whitelist mirroring prefilterSafeExpr's
 // understood set (plain column reads, constants, and the transparent
-// comparison/arithmetic/boolean/cast/is-null wrappers): anything else —
+// comparison/arithmetic/boolean/cast/is-null wrappers, value-list IN):
+// anything else —
 // FuncCall, RowExpr, CTIDExpr, TableOidExpr, MergeWholeRowRef, subquery and
 // outer-ref shapes, and every future expression kind — returns false and the
 // caller declines to full deform. A missed arm costs performance, never
 // correctness.
 func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
+	return deformScanVisit(e, func(idx int) {
+		if idx > *maxRef {
+			*maxRef = idx
+		}
+	})
+}
+
+// deformScanVisit is deformScanRefs' walk: it calls visit for every
+// ColumnRef.Index e reads and reports whether e is in the understood set
+// (deformScanRefs' whitelist). A false return means the reads are unknown.
+func deformScanVisit(e optimizer.Expr, visit func(idx int)) bool {
 	switch x := e.(type) {
 	case nil:
 		return false
@@ -127,9 +139,7 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 		if x.Index < 0 {
 			return false
 		}
-		if x.Index > *maxRef {
-			*maxRef = x.Index
-		}
+		visit(x.Index)
 		return true
 	case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NumericConst,
 		*optimizer.TypedStringLit, *optimizer.IntervalLit, *optimizer.NullConst,
@@ -139,24 +149,41 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 		// LIKE...ESCAPE carries a LikeEscapePattern operand, which the
 		// whitelist rejects, so those predicates decline — same as the
 		// prefilter.
-		return deformScanRefs(x.Left, maxRef) && deformScanRefs(x.Right, maxRef)
+		return deformScanVisit(x.Left, visit) && deformScanVisit(x.Right, visit)
 	case *optimizer.UnaryOp:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.CastExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsNullExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsBoolExpr:
-		return deformScanRefs(x.Operand, maxRef)
+		return deformScanVisit(x.Operand, visit)
 	case *optimizer.IsDistinctFromExpr:
-		return deformScanRefs(x.Left, maxRef) && deformScanRefs(x.Right, maxRef)
+		return deformScanVisit(x.Left, visit) && deformScanVisit(x.Right, visit)
+	case *optimizer.InExpr:
+		// A value list (`x IN (a, b)`, `x = ANY('{…}'::t[])`) reads its
+		// operand and items and nothing else: evalInExprScalarRow evaluates
+		// exactly those against the row (slice 25; PlanScanQual admits the
+		// same shape, slice 21). The sublink form declines.
+		if x.Plan != nil || x.Subquery != nil || len(x.Args) > 0 || len(x.ParParam) > 0 {
+			return false
+		}
+		if !deformScanVisit(x.Operand, visit) {
+			return false
+		}
+		for _, it := range x.List {
+			if !deformScanVisit(it, visit) {
+				return false
+			}
+		}
+		return true
 	case *optimizer.SubqueryExpr:
 		args, ok := deformSublinkArgs(x)
 		if !ok {
 			return false
 		}
 		for _, a := range args {
-			if !deformScanRefs(a, maxRef) {
+			if !deformScanVisit(a, visit) {
 				return false
 			}
 		}
@@ -164,6 +191,27 @@ func deformScanRefs(e optimizer.Expr, maxRef *int) bool {
 	default:
 		return false
 	}
+}
+
+// deformScanReadSet reports which of a scan's width columns exprs read, or
+// nil when any expression falls outside deformScanVisit's understood set (the
+// reads are then unknown and every column must be decoded).
+func deformScanReadSet(width int, exprs ...optimizer.Expr) []bool {
+	read := make([]bool, width)
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		ok := deformScanVisit(e, func(idx int) {
+			if idx < width {
+				read[idx] = true
+			}
+		})
+		if !ok {
+			return nil
+		}
+	}
+	return read
 }
 
 // deformSublinkArgs reports the outer-row expressions a scalar sublink reads
@@ -271,28 +319,11 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 		// identity special case of the map-through rule. Folding can only
 		// widen to len(Targets)-1; a full-width identity re-widens to
 		// full, as it must. Every other projection folds its targets
-		// alone (below).
-		if isIdentityProject(p) {
-			// Identity targets are genuine consumers in child-output
-			// space (a root SELECT a,b reads columns 0..1 of the leaf
-			// row), so they fold like any other consumer. Folding can
-			// only widen to len(Targets)-1; a full-width identity
-			// re-widens to full, as it must.
-			return deformFoldRefs(incoming, p.Targets...)
-		}
-		// Any other projection (M0122-0012 slice 17): projectOp and the
-		// op-tree OpProject evaluate p.Targets against the child slot and
-		// read nothing else of it. So the targets are the child's only
-		// consumers, whatever the parent reads of the projection's output,
-		// and the bound is their fold. This is PG's rule:
-		// ExecBuildProjectionInfo → ExecCreateExprSetupSteps
-		// (execExpr.c) sets last_scan to the highest attnum the target
-		// list references and emits one EEOP_SCAN_FETCHSOME for it. A
-		// target the whitelist does not understand still declines to
-		// full. Reordered bare targets used to reset to full here: HammerDB's
-		// lineitem column order makes TPC-H Q17's probe projection
-		// reordered, so all 16 columns were deformed and cloned per row.
-		return deformFoldRefs(deformBoundNone, p.Targets...)
+		// alone (deformProjectBelow). Every target is live here: whether
+		// the incoming bound covers every reader of the projection's
+		// output is known only to a consumer-complete parent, which builds
+		// the projection itself (buildProjectNode, M0122-0012 slice 35).
+		return deformProjectBelow(p, incoming, nil)
 	case *optimizer.Aggregate:
 		// Reshape boundary: the incoming bound is in aggregate-output
 		// space and cannot map through it, so it is dropped. The arms
@@ -337,6 +368,154 @@ func deformBoundBelow(parent optimizer.Node, incoming int) int {
 	default:
 		return deformBoundFull
 	}
+}
+
+// deformProjectBelow is the bound a projection threads to its child when it
+// evaluates only the targets live marks (nil = every target).
+func deformProjectBelow(p *optimizer.Project, incoming int, live []bool) int {
+	targets := p.Targets
+	if live != nil {
+		targets = make([]optimizer.Expr, 0, len(p.Targets))
+		for i, t := range p.Targets {
+			if live[i] {
+				targets = append(targets, t)
+			}
+		}
+	}
+	if isIdentityProject(p) {
+		// Identity targets are genuine consumers in child-output
+		// space (a root SELECT a,b reads columns 0..1 of the leaf
+		// row), so they fold like any other consumer. Folding can
+		// only widen to len(Targets)-1; a full-width identity
+		// re-widens to full, as it must.
+		return deformFoldRefs(incoming, targets...)
+	}
+	// Any other projection (M0122-0012 slice 17): projectOp and the
+	// op-tree OpProject evaluate p.Targets against the child slot and
+	// read nothing else of it. So the targets are the child's only
+	// consumers, whatever the parent reads of the projection's output,
+	// and the bound is their fold. This is PG's rule:
+	// ExecBuildProjectionInfo → ExecCreateExprSetupSteps
+	// (execExpr.c) sets last_scan to the highest attnum the target
+	// list references and emits one EEOP_SCAN_FETCHSOME for it. A
+	// target the whitelist does not understand still declines to
+	// full. Reordered bare targets used to reset to full here: HammerDB's
+	// lineitem column order makes TPC-H Q17's probe projection
+	// reordered, so all 16 columns were deformed and cloned per row.
+	return deformFoldRefs(deformBoundNone, targets...)
+}
+
+// projectLiveSet marks the targets of p that its consumers read, or returns
+// nil when every target must be evaluated (M0122-0012 slice 35). consumers
+// are every expression that reads p's output, in p's output coordinates —
+// which only a consumer-complete parent can supply (buildCompleteChild): a
+// plain or partial Aggregate's arms, plus the keys of any sort between them.
+//
+// It exists for the re-expansion Project the planner puts between an
+// aggregate and a narrowed join: it maps the join's narrowed row back to the
+// aggregate's arm coordinates, so it lists every join column, and evaluating
+// (and folding) all of them deformed the whole heap tuple of every inner
+// probe. PG never builds the dead targets — a node's targetlist holds only
+// what its parent needs — so skipping them is the PG-shaped behaviour.
+//
+// A dead target is skipped only when evaluating it can neither fail nor have
+// an effect (projectTargetSkippable); any other is kept live. A consumer the
+// visitor does not understand, or a reference outside the target list,
+// keeps every target.
+func projectLiveSet(p *optimizer.Project, consumers []optimizer.Expr) []bool {
+	n := len(p.Targets)
+	live := make([]bool, n)
+	for _, e := range consumers {
+		if e == nil {
+			continue
+		}
+		inRange := true
+		ok := deformScanVisit(e, func(idx int) {
+			if idx < 0 || idx >= n {
+				inRange = false
+				return
+			}
+			live[idx] = true
+		})
+		if !ok || !inRange {
+			return nil
+		}
+	}
+	all := true
+	for i, t := range p.Targets {
+		if !live[i] && !projectTargetSkippable(t) {
+			live[i] = true
+		}
+		all = all && live[i]
+	}
+	if all {
+		return nil
+	}
+	return live
+}
+
+// consumerLiveColumns marks the row columns consumers read, or returns nil
+// (every column) when it cannot be sure. It answers only "which cells may a
+// consumer read", not "may this expression be narrowed past", so unlike
+// deformScanVisit it walks through function calls and operators of any kind
+// (optimizer.WalkExprHostScope, fail-closed on an expression kind it does not
+// enumerate) and collects their column references. It gives up on anything
+// that can read the row as a whole or outside its cells: a whole-row or
+// negative ColumnRef, a merge whole-row reference, a ctid / tableoid read, or
+// a sublink (an unlowered one pushes the entire outer row). Columns past the
+// highest reference are left out of the mask, which reads them as dead.
+func consumerLiveColumns(consumers []optimizer.Expr) []bool {
+	live := []bool{}
+	for _, e := range consumers {
+		if e == nil {
+			continue
+		}
+		known := true
+		ok := optimizer.WalkExprHostScope(e, func(x optimizer.Expr) {
+			switch r := x.(type) {
+			case *optimizer.ColumnRef:
+				if r.Index < 0 {
+					known = false
+					return
+				}
+				for len(live) <= r.Index {
+					live = append(live, false)
+				}
+				live[r.Index] = true
+			case *optimizer.SubqueryExpr, *optimizer.MergeWholeRowRef, *optimizer.CTIDExpr, *optimizer.TableOidExpr:
+				known = false
+			}
+		})
+		if !ok || !known {
+			return nil
+		}
+	}
+	return live
+}
+
+// aggConsumerExprs is every expression a plain or partial Aggregate evaluates
+// against its child's rows — the arms deformBoundBelow folds.
+func aggConsumerExprs(p *optimizer.Aggregate) []optimizer.Expr {
+	out := append([]optimizer.Expr(nil), p.GroupExprs...)
+	for i := range p.Aggs {
+		a := &p.Aggs[i]
+		out = append(out, a.Arg, a.Arg2, a.Filter)
+		out = append(out, a.ExtraArgs...)
+		out = append(out, deformSortKeyExprs(a.OrderBy)...)
+		out = append(out, deformSortKeyExprs(a.WithinGroupOrderBy)...)
+	}
+	return append(out, p.Passthrough...)
+}
+
+// projectTargetSkippable reports whether a target may be left unevaluated:
+// its evaluation cannot raise an error or have a side effect.
+func projectTargetSkippable(e optimizer.Expr) bool {
+	switch e.(type) {
+	case *optimizer.ColumnRef, *optimizer.NullConst, *optimizer.IntegerConst,
+		*optimizer.BooleanConst, *optimizer.StringConst, *optimizer.NumericConst:
+		return true
+	}
+	return false
 }
 
 // deformSideWidth reports the output width of a join side (or NLI arm).
@@ -546,8 +725,82 @@ func deformJoinBounds(p *optimizer.Join, incoming int) (left, right int) {
 	}
 	leftKeys, rightKeys := deformPositionalKeys(p, leftW, rightW)
 	leftSplit, rightSplit := deformSplitPredicate(p.Predicate, leftW, rightW)
-	return deformUnionBound(leftAbove, deformUnionBound(leftKeys, leftSplit)),
-		deformUnionBound(rightAbove, deformUnionBound(rightKeys, rightSplit))
+	left = deformUnionBound(leftAbove, deformUnionBound(leftKeys, leftSplit))
+	if p.Lateral {
+		left = deformUnionBound(left, deformLateralOuterRefs(p.Right))
+	}
+	return left, deformUnionBound(rightAbove, deformUnionBound(rightKeys, rightSplit))
+}
+
+// deformLateralOuterRefs is the left-side bound a LATERAL join's inner reads
+// of the outer row: lateralJoinStream binds every outer row into the inner's
+// outer slot, and the probe evaluates its key expressions — and any outer
+// reference in its Cond — against it. Those reads are OuterColumnRef{Level:
+// 1} (Index = the outer row's column); a ColumnRef among the keys is taken at
+// face value, which can only widen. It is the generic-Join twin of
+// NestedLoopIndexJoin's deformNLIOuterKeyExprs fold. An inner the walk does
+// not positively understand, or an expression it cannot enumerate (a
+// sublink, an unknown kind), reads the outer row in ways it cannot
+// inventory, so the outer deforms in full (M0122-0012 slice 35 — before it,
+// the omission was masked by the full-width projection that always sat
+// above such a join's outer side).
+func deformLateralOuterRefs(right optimizer.Node) int {
+	var keys []optimizer.Expr
+	var cond optimizer.Expr
+	switch in := right.(type) {
+	case *optimizer.Memoize:
+		return deformLateralOuterRefs(in.Child)
+	case *optimizer.IndexScan:
+		keys = append(deformNLIOuterKeyExprs(in), in.SAOPKeys...)
+		keys = append(keys, in.RangePrefix...)
+		cond = in.Cond
+	case *optimizer.IndexOnlyScan:
+		keys, cond = deformNLIOuterKeyExprs(in), in.Cond
+	default:
+		return deformBoundFull
+	}
+	bound := deformBoundNone
+	visit := func(e optimizer.Expr, isKey bool) bool {
+		if e == nil {
+			return true
+		}
+		known := true
+		ok := optimizer.WalkExprHostScope(e, func(x optimizer.Expr) {
+			switch r := x.(type) {
+			case *optimizer.OuterColumnRef:
+				if r.Level == 1 {
+					if r.Index < 0 {
+						known = false
+					} else if r.Index > bound {
+						bound = r.Index
+					}
+				}
+			case *optimizer.ColumnRef:
+				// A key's ColumnRef indexes the outer row (as on an NLI
+				// inner); a Cond's indexes the inner row and reads nothing
+				// of the outer one.
+				if isKey {
+					if r.Index < 0 {
+						known = false
+					} else if r.Index > bound {
+						bound = r.Index
+					}
+				}
+			case *optimizer.SubqueryExpr:
+				known = false
+			}
+		})
+		return ok && known
+	}
+	for _, k := range keys {
+		if !visit(k, true) {
+			return deformBoundFull
+		}
+	}
+	if !visit(cond, false) {
+		return deformBoundFull
+	}
+	return bound
 }
 
 // deformPositionalKeys folds a join's equi-key pairs at face value per
@@ -852,4 +1105,33 @@ func scrubDeformPoison(row Row) {
 			row[i] = NullDatum
 		}
 	}
+}
+
+// prefilterSkipInfo returns a copy of info whose columns in [0, maxCols) that
+// qual does not read are marked skip (M0122-0012 slice 25), or nil when the
+// qual's reads cannot be bounded or no column would be skipped. PG's
+// slot_getsomeattrs deforms the qual's prefix too, but a by-reference value
+// costs it a pointer store; goopg's decode converts every value, so on TPC-H
+// Q10's `l_returnflag = 'R'` the 75 % of lineitem rows the qual rejects paid
+// for four numerics and two dates nobody read.
+func prefilterSkipInfo(info []colTypeInfo, maxCols int, qual optimizer.Expr) []colTypeInfo {
+	if maxCols > len(info) {
+		return nil
+	}
+	read := deformScanReadSet(len(info), qual)
+	if read == nil {
+		return nil
+	}
+	out := append([]colTypeInfo(nil), info...)
+	skipped := false
+	for i := 0; i < maxCols; i++ {
+		if !read[i] {
+			out[i].skip = true
+			skipped = true
+		}
+	}
+	if !skipped {
+		return nil
+	}
+	return out
 }

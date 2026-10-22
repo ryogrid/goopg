@@ -35,3 +35,24 @@ func evalPgCurrentWALLSN(name string, ctx *Context) (Datum, error) {
 		return NewStringDatum(formatPgLSN(write)), nil
 	}
 }
+
+// evalPgLastWALLSN implements pg_last_wal_receive_lsn and
+// pg_last_wal_replay_lsn (xlogfuncs.c). The first is the WAL the standby's
+// walreceiver has received (GetWalRcvFlushRecPtr); the second the end of the
+// last record replayed (GetXLogReplayRecPtr, lastReplayedEndRecPtr). Each is
+// NULL when its position is 0: no streaming yet, or a server that never ran
+// recovery. Unlike pg_current_wal_*, both may run during recovery.
+func evalPgLastWALLSN(name string, ctx *Context) Datum {
+	if ctx.RecoveryLSNs == nil {
+		return NullDatum
+	}
+	receive, replay := ctx.RecoveryLSNs()
+	lsn := receive
+	if name == "pg_last_wal_replay_lsn" {
+		lsn = replay
+	}
+	if lsn == 0 {
+		return NullDatum
+	}
+	return NewStringDatum(formatPgLSN(lsn))
+}

@@ -402,7 +402,7 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 			// M0146-0063b: an insert leaves the page no longer all-visible
 			// (heap_insert's visibilitymap_clear).
 			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+				ctx.VM.ClearBlockNoWAL(rel, blk)
 			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -445,7 +445,7 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, raw)
 	// M0146-0063b: as above.
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)

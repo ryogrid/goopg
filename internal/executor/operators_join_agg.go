@@ -50,6 +50,19 @@ type joinOp struct {
 
 	ctx *Context
 
+	// nlOuterBorrowed is set by markScanBorrowChain when this nested loop's
+	// outer chain hands up reused rows (M0122-0012 slice 28). The streaming
+	// loops then keep the current outer row by a shallow copy: they pull the
+	// next outer row only after the inner side is done with this one, so its
+	// values stay valid without the deep clone.
+	nlOuterBorrowed bool
+	// nlEmitBorrowed is set by markScanBorrowChain on the same descent: the
+	// consumer above this nested loop passes each row up (or copies what it
+	// keeps) before pulling the next one, so the streaming loops emit their
+	// reused joined-pair buffer instead of a clone per row — PG's NestLoop
+	// returns its projected result slot the same way (M0122-0012 slice 37).
+	nlEmitBorrowed bool
+
 	// M0036 lazy-output state (hash join only)
 	lazyHash     map[string][]Row // build-side hash table
 	// int64 fast-path (cost-model ch.14): when the build-side keys are
@@ -111,6 +124,16 @@ type joinOp struct {
 	probeKeyExprs  []optimizer.Expr
 	execKeyPackInt bool
 	execKeyBuf     []byte
+
+	// predExprs / predIdx are plan.Predicate compiled for joinPredicateMatch,
+	// the per-pair check of the nested-loop and lateral streams (M0122-0012
+	// slice 45); predSlot is the reused view over the pair buffer it reads.
+	// Built once, without constant folding, on the first pair: the plan is
+	// fixed for the joinOp's life and the slab holds no Context state.
+	predExprs    exprTreeSlab
+	predIdx      int32
+	predCompiled bool
+	predSlot     MaterializedSlot
 
 	// M0127-PS6.1 (05 §6, stage E5): the COMPILED twin of the three
 	// expression slots above. Join keys and residuals were the last
@@ -865,7 +888,7 @@ func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	// fixed-width int64 lane lives in join_composite_key.go), so a
 	// map[int64] table can never be built for a join that probes with a
 	// composite key.
-	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysAreInt64()
+	o.lazyHashIsInt = !o.multiKey() && o.plan.HashKeysTakeInt64Lane()
 
 	// EX3-02 Cut 1: stratum-B arena for this build, parented to the
 	// statement context. Covers the serial loops below and the cooperative
@@ -1570,7 +1593,18 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if o.plan.Predicate == nil {
 		return true, nil
 	}
-	v, err := evalExpr(o.plan.Predicate, row, o.ctx)
+	// Compiled, as joinPredicateMatchSlot evaluates the hash residual
+	// (M0127-PS6.1): the interpreted evalExpr boxed the row into a fresh
+	// interface and walked the tree for every candidate pair — a third of
+	// TPC-DS Q35, whose nested loop filters 5.7 M pairs (slice 45).
+	if !o.predCompiled {
+		o.predExprs = o.predExprs[:0]
+		o.predIdx = o.predExprs.buildExpr(o.plan.Predicate)
+		o.predCompiled = true
+	}
+	o.predSlot.row = row
+	v, err := evalFastExpr(o.predExprs, o.predIdx, &o.predSlot, o.ctx)
+	o.predSlot.row = nil
 	if err != nil {
 		return false, err
 	}
@@ -2275,6 +2309,15 @@ type aggregateOp struct {
 	rows []Row
 	idx  int
 
+	// Sorted aggregation streams (M0122-0012 slice 44): sorted is set by Open
+	// when the AGG_SORTED path applies, and Next then reads the child only up
+	// to the end of the next group (nextSorted). sCur / sCurParts are the
+	// group being accumulated and its key parts; sEOF records the child's EOF.
+	sorted    bool
+	sCur      *groupRuntime
+	sCurParts []string
+	sEOF      bool
+
 	// sharedUserStates supports PG aggregate state sharing: when multiple user-defined
 	// aggregates have the same sfunc/stype and the same input, sfunc is called only
 	// once per row and the state is shared. SharedStateSlot=-1 means no sharing. M0097-0035.
@@ -2528,8 +2571,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
 	// of building the groups hash map. Grouping sets, ungrouped
 	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
+	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
 	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == optimizer.AggModeSimple {
-		return o.openSorted(ctx)
+		o.sorted = true
+		o.rows = nil
+		return nil
 	}
 
 	// M0146-0003 S5: a sorted-armed row-transport finalize consumes a
@@ -2607,6 +2653,68 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		order = append(order, key)
 	}
 
+	// newGroup founds a group from its first input row.
+	newGroup := func(si int, set []int, allVals Row, slot TupleSlot) *groupRuntime {
+		// Evaluate passthrough (functionally-determined) columns from the first row.
+		var ptVals Row
+		if len(o.plan.Passthrough) > 0 {
+			ptVals = make(Row, len(o.plan.Passthrough))
+			for i, expr := range o.plan.Passthrough {
+				v, err := evalExprSlot(expr, slot, ctx)
+				if err != nil {
+					ptVals[i] = NullDatum
+				} else {
+					ptVals[i] = v
+				}
+			}
+		}
+		var gv Row
+		if nGroupCols > 0 {
+			gv = make(Row, nGroupCols)
+			for i := range gv {
+				// A column rolled up away at this level is NULL —
+				// the SQL standard's value for it, and what makes
+				// GROUPING(...) necessary to tell it from a real one.
+				gv[i] = NullDatum
+			}
+			for _, ci := range set {
+				// M0073-0004 retention boundary, moved here from
+				// evalGroupExprs (M0145-0008f): only a group-founding
+				// row's key values are retained, so only they are
+				// detached from the input arena.
+				gv[ci] = allVals[ci].MaterializeArena()
+			}
+		}
+		return &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+	}
+
+	// M0122-0012 slice 24: the int64 group lane. A single grouping set over a
+	// single key files each group under datumToInt64Key(value) in igroups
+	// instead of hashing the key's canonical string — HammerDB declares every
+	// TPC-H key numeric, so TPC-H Q13's GROUP BY c_custkey hashed a string per
+	// input row (about 5 % of the query). datumToInt64Key is exact — every integral in-range value of
+	// every numeric representation maps, and appendGroupKey's canonical key for
+	// such a value is canonicalNumericKey(v, 0) — so a group's identity does
+	// not depend on the lane. The first key the lane cannot represent (NULL, a
+	// fraction, any other kind) demotes it: every int group moves to the string
+	// map under that canonical key, in founding order, so groups and order end
+	// up exactly as the string path alone would have built them.
+	intLane := !aggIntLaneDisabled && !multiSet && len(sets) == 1 && len(sets[0]) == 1 &&
+		!(o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit)
+	var igroups map[int64]*groupRuntime
+	var iorder []int64
+	if intLane {
+		igroups = make(map[int64]*groupRuntime)
+	}
+	demoteIntGroups := func() {
+		for _, ik := range iorder {
+			key := canonicalNumericKey(ik, 0)
+			groups[key] = igroups[ik]
+			order = append(order, key)
+		}
+		igroups, iorder = nil, nil
+	}
+
 	for {
 		slot, err := o.child.Next()
 		if err == EOF {
@@ -2638,46 +2746,34 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			return err
 		}
 		for si, set := range sets {
-			// M0122-0012: the key is built into gkBuf and looked up as
-			// string(gkBuf), which Go does not allocate for; the key string
-			// is materialised only when this row founds a group.
-			o.gkBuf = o.appendGroupKey(o.gkBuf[:0], si, set, allVals, multiSet)
-			gr, ok := groups[string(o.gkBuf)]
-			if !ok {
-				key := string(o.gkBuf)
-				// Evaluate passthrough (functionally-determined) columns from the first row.
-				var ptVals Row
-				if len(o.plan.Passthrough) > 0 {
-					ptVals = make(Row, len(o.plan.Passthrough))
-					for i, expr := range o.plan.Passthrough {
-						v, err := evalExprSlot(expr, slot, ctx)
-						if err != nil {
-							ptVals[i] = NullDatum
-						} else {
-							ptVals[i] = v
-						}
+			var gr *groupRuntime
+			// M0122-0012 slice 24: the int64 group lane (see intLane above).
+			if intLane {
+				if ik, ok := datumToInt64Key(allVals[set[0]]); ok {
+					gr = igroups[ik]
+					if gr == nil {
+						gr = newGroup(si, set, allVals, slot)
+						igroups[ik] = gr
+						iorder = append(iorder, ik)
 					}
+				} else {
+					intLane = false
+					demoteIntGroups()
 				}
-				var gv Row
-				if nGroupCols > 0 {
-					gv = make(Row, nGroupCols)
-					for i := range gv {
-						// A column rolled up away at this level is NULL —
-						// the SQL standard's value for it, and what makes
-						// GROUPING(...) necessary to tell it from a real one.
-						gv[i] = NullDatum
-					}
-					for _, ci := range set {
-						// M0073-0004 retention boundary, moved here from
-						// evalGroupExprs (M0145-0008f): only a group-founding
-						// row's key values are retained, so only they are
-						// detached from the input arena.
-						gv[ci] = allVals[ci].MaterializeArena()
-					}
+			}
+			if gr == nil {
+				// M0122-0012: the key is built into gkBuf and looked up as
+				// string(gkBuf), which Go does not allocate for; the key string
+				// is materialised only when this row founds a group.
+				o.gkBuf = o.appendGroupKey(o.gkBuf[:0], si, set, allVals, multiSet)
+				var ok bool
+				gr, ok = groups[string(o.gkBuf)]
+				if !ok {
+					key := string(o.gkBuf)
+					gr = newGroup(si, set, allVals, slot)
+					groups[key] = gr
+					order = append(order, key)
 				}
-				gr = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-				groups[key] = gr
-				order = append(order, key)
 			}
 
 			o.currentRowVersion++
@@ -2704,6 +2800,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				}
 			}
 		}
+	}
+
+	if intLane {
+		demoteIntGroups()
 	}
 
 	switch o.plan.Mode {
@@ -2893,7 +2993,12 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			sorted[pos] = o.rows[i]
 		}
 		o.rows = sorted
-	} else if nGroupCols > 0 {
+	} else if nGroupCols > 0 && !(o.plan.Strategy == optimizer.AggStrategyHashed && o.plan.GroupingSets == nil) {
+		// A plain hash aggregate emits its groups in hash-table order and
+		// promises no other (nodeAgg.c agg_retrieve_hash_table): the planner
+		// puts a Sort above it whenever an order is needed, so the pre-sort
+		// here is skipped for it. It cost TPC-DS Q23's 404 000-group
+		// frequent_ss_items CTE ~2.1 s of a ~3.5 s scan (M0122-0012 slice 34).
 		rowSets := emitted
 		idxOf := make([]int, len(o.rows))
 		for i := range idxOf {
@@ -3031,6 +3136,10 @@ func (o *aggregateOp) appendGroupKey(buf []byte, si int, set []int, vals Row, mu
 	}
 	return buf
 }
+
+// aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
+// set it to compare the lane's output, order included, with the string path.
+var aggIntLaneDisabled = false
 
 // appendDatumKey appends datumKey(d)'s bytes to buf (M0122-0012). The common
 // kinds are encoded in place; any other kind defers to datumKey itself, so
@@ -3632,14 +3741,17 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 	return out, nil
 }
 
-// openSorted implements the sorted (AGG_SORTED) grouping strategy: the child
+// nextSorted implements the sorted (AGG_SORTED) grouping strategy: the child
 // is assumed to deliver rows in GROUP BY key order, so groups are collapsed by
 // comparing each incoming key run against the current group's key rather than
 // hashing (nodeAgg.c agg_retrieve_direct, postgres/src/backend/executor/
-// nodeAgg.c:2280-2619). Like the hash path it is materialized — the child is
-// drained to EOF first — but unlike the hash path it emits one row per key
-// RUN in input order and never runs the emit-time key sort (the child is
-// already sorted, so input order IS key order). The finalize/emit step is
+// nodeAgg.c:2280-2619). Like agg_retrieve_direct it streams: each call reads
+// the child up to the first row of the next group and returns the group that
+// row closed, so a LIMIT above stops the child after the group that completes
+// it (M0122-0012 slice 44 — the path first drained the child in Open, which
+// returned the same rows but always read all of the input). It emits one row
+// per key RUN in input order and never runs the emit-time key sort (the child
+// is already sorted, so input order IS key order). The finalize/emit step is
 // shared with the hash path via finalizeGroup, so the two strategies can never
 // diverge on shared-state sync, finishAgg, GROUPING mask or passthrough
 // semantics. M0134-0001 S8.
@@ -3647,50 +3759,38 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 // Invariant: the caller (Open) only routes here when GroupingSets == nil,
 // len(GroupExprs) > 0 and Mode == AggModeSimple, so there is exactly one
 // implicit grouping set holding every group column and setIdx is always 0.
-func (o *aggregateOp) openSorted(ctx *Context) error {
+func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 	nGroupCols := len(o.plan.GroupExprs)
-
-	// The current group is always the group of the previous row: the input is
-	// sorted, so a key change is a group boundary. aggs is a fresh slice per
-	// group, mirroring the hash path's per-group make([]aggRuntime, nAggs).
-	var curParts []string
-	var cur *groupRuntime
-
-	flush := func() error {
-		if cur == nil {
-			return nil
-		}
-		out, err := o.finalizeGroup(cur)
-		if err != nil {
-			return err
-		}
-		o.rows = append(o.rows, out)
-		cur = nil
-		return nil
-	}
-
-	for {
+	for !o.sEOF {
 		slot, err := o.child.Next()
 		if err == EOF {
+			o.sEOF = true
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if ctx.Ctx != nil {
-			if cerr := ctx.Ctx.Err(); cerr != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		if o.ctx != nil && o.ctx.Ctx != nil {
+			if cerr := o.ctx.Ctx.Err(); cerr != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
 		allVals, parts, err := o.evalGroupExprs(slot)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if cur == nil || !sameGroupKey(curParts, parts) {
-			// Group boundary: finalize and emit the previous group, then start
-			// a fresh one from this row.
-			if err := flush(); err != nil {
-				return err
+		var out Row
+		emit := false
+		if o.sCur == nil || !sameGroupKey(o.sCurParts, parts) {
+			// Group boundary: finalize the previous group, then start a fresh
+			// one from this row. The previous group is returned once this
+			// row has been absorbed, so the calls run in the order the
+			// drained loop ran them.
+			if o.sCur != nil {
+				if out, err = o.finalizeGroup(o.sCur); err != nil {
+					return nil, err
+				}
+				emit = true
 			}
 			// Evaluate passthrough (functionally-determined) columns from the
 			// first row of the group — identical to the hash path's group
@@ -3712,8 +3812,8 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 				gv = make(Row, nGroupCols)
 				copy(gv, allVals)
 			}
-			cur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-			curParts = parts
+			o.sCur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			o.sCurParts = parts
 		}
 		o.currentRowVersion++
 		for i := range o.plan.Aggs {
@@ -3734,12 +3834,31 @@ func (o *aggregateOp) openSorted(ctx *Context) error {
 					continue
 				}
 			}
-			if err := o.applyAgg(&cur.aggs[i], call, slot, i); err != nil {
-				return err
+			if err := o.applyAgg(&o.sCur.aggs[i], call, slot, i); err != nil {
+				return nil, err
 			}
 		}
+		if emit {
+			return o.emitSorted(out), nil
+		}
 	}
-	return flush()
+	if o.sCur == nil {
+		return nil, EOF
+	}
+	out, err := o.finalizeGroup(o.sCur)
+	o.sCur = nil
+	if err != nil {
+		return nil, err
+	}
+	return o.emitSorted(out), nil
+}
+
+// emitSorted returns one finalized group through the operator's reused slot,
+// as Next does for the materialised paths.
+func (o *aggregateOp) emitSorted(row Row) TupleSlot {
+	o.slot.schema = o.schema
+	o.slot.row = row
+	return &o.slot
 }
 
 // sameGroupKey reports whether two per-column key vectors denote the same
@@ -4722,10 +4841,31 @@ func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datu
 }
 
 func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
+	// PG's numeric_stddev_internal (numeric.c) for integer inputs, which
+	// int2/int4/int8_accum feed with sumX and sumX2 at display scale 0
+	// (M0122-0012 slice 46). Everything is exact integer arithmetic, so the
+	// digits are PG's: the variance is N*sumX2 - sumX^2 over N*(N-1) (or N^2),
+	// divided at select_div_scale's rscale and rounded half away from zero
+	// (div_var round=true, exact=true); the stddev is sqrt_var of that
+	// rounded variance at the same rscale. The result is numeric, printed
+	// with rscale decimals. This replaced a big.Rat quotient printed to 12
+	// decimals and a 15-step big.Float Newton sqrt printed to 18 significant
+	// digits — neither PG's digits (var_samp(1,2,4) printed 2.333333333333,
+	// PG 2.3333333333333333) — and the Newton loop was a quarter of TPC-DS
+	// Q39, which finalises ~90 000 stddev_samp groups.
+	// Sample statistics are undefined for N <= 1 and population ones for
+	// N == 0: NULL, checked before the numerator as PG does.
+	if n == 0 || (isSample && n <= 1) {
+		return NullDatum
+	}
 	bigN := big.NewInt(n)
-	// numerator = N * Sxx - Sx²
-	num := new(big.Int).Sub(new(big.Int).Mul(bigN, sxx), new(big.Int).Mul(sx, sx))
-	// denominator = N² (pop) or N*(N-1) (samp)
+	num := new(big.Int).Mul(bigN, sxx)
+	num.Sub(num, new(big.Int).Mul(sx, sx))
+	if num.Sign() <= 0 {
+		// "Watch out for roundoff error producing a negative numerator":
+		// make_result(&const_zero), display scale 0.
+		return Datum{Kind: KindNumeric}
+	}
 	var den *big.Int
 	if isSample {
 		den = new(big.Int).Mul(bigN, big.NewInt(n-1))
@@ -4735,52 +4875,84 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	if den.Sign() == 0 {
 		return NullDatum
 	}
-	// Use exact big.Rat arithmetic, then format as a decimal string.
-	// Matching PostgreSQL numeric display: up to 18 decimal places, trailing zeros stripped.
-	rat := new(big.Rat).SetFrac(num, den)
-	if isSqrt {
-		// For stddev, compute sqrt via high-precision float.
-		f64, _ := rat.Float64()
-		if f64 <= 0 {
-			// Variance is exactly 0 (all inputs equal) or negative due to
-			// floating-point artifacts: stddev = 0, matching PostgreSQL.
-			//
-			// Without this guard the Newton seed below is sqrt(0) = 0 and the
-			// first iteration computes big.Float Quo(0, 0), which PANICS
-			// ("division of zero by zero"). The panic escaped to serveConn and
-			// dropped the connection — TPC-DS Q39's stddev_samp over a
-			// (warehouse, item, month) inventory group whose quantity never
-			// changes hit it on every run (the long-unexplained RC-4
-			// "connection lost"). The numeric sibling exactNumericVariance
-			// already had exactly this guard; the int path had lost it —
-			// sibling paths must agree.
-			return NewStringDatum("0")
-		}
-		// Newton-Raphson sqrt with 128-bit precision.
-		prec := uint(128)
-		ratFloat := new(big.Float).SetPrec(prec).SetRat(rat)
-		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
-		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
-		for i := 0; i < 15; i++ {
-			if seed.Sign() == 0 {
-				break
-			}
-			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
-			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
-		}
-		// Format with 18 significant digits matching PostgreSQL stddev output.
-		s := seed.Text('g', 18)
-		if strings.Contains(s, ".") && !strings.Contains(s, "e") {
-			s = strings.TrimRight(s, "0")
-			s = strings.TrimRight(s, ".")
-		}
-		return NewStringDatum(s)
+	rscale := pgSelectDivScaleInt(num, den)
+	// div_var(num, den, rscale, round): round half away from zero.
+	q := new(big.Int).Mul(num, pow10Big(rscale))
+	q.Lsh(q, 1).Add(q, den)
+	q.Quo(q, new(big.Int).Lsh(den, 1))
+	if !isSqrt {
+		return newNumeric(q, rscale)
 	}
-	// Format rational as decimal with up to 12 decimal places with round-half-up, then
-	// strip trailing zeros. Matches PostgreSQL's numeric_poly_var_samp output scale
-	// for integer inputs (consistently 12 decimal places across test cases).
-	s := formatBigRatDecimal(rat, 12)
-	return NewStringDatum(s)
+	return pgSqrtScaled(q, rscale)
+}
+
+// pgSqrtScaled is sqrt_var (numeric.c) applied to q / 10^rscale at result
+// scale rscale. sqrt_var computes res_ndigits NBASE (10^4) digits of the
+// square root, truncated — the Karatsuba square root is an exact integer
+// square root of the input extended to 2*F fractional NBASE digits — and
+// rounds that to rscale with round_var. F, the number of fractional NBASE
+// digits, is res_ndigits - res_weight - 1: ceil((rscale+1)/4) digits, or
+// more when the result needs at least one NBASE digit below its weight.
+func pgSqrtScaled(q *big.Int, rscale int) Datum {
+	if q.Sign() == 0 {
+		// zero_var with dscale = rscale.
+		return Datum{Kind: KindNumeric, Scale: int16(min(rscale, numericMaxDisplayScale))}
+	}
+	weight, _ := pgNBaseWeightFirst(q, rscale)
+	resWeight := weight / 2
+	if weight < 0 {
+		resWeight = -((-weight-1)/2 + 1)
+	}
+	resNdigits := resWeight + 1 + (rscale+4)/4
+	if resNdigits < 1 {
+		resNdigits = 1
+	}
+	f := resNdigits - resWeight - 1
+	// floor(sqrt(q / 10^rscale * 10^(8f))) — 8f > rscale, so the scaled
+	// argument is an integer.
+	arg := new(big.Int).Mul(q, pow10Big(8*f-rscale))
+	root := new(big.Int).Sqrt(arg)
+	// round_var(root / 10^(4f), rscale): half away from zero.
+	drop := pow10Big(4*f - rscale)
+	root.Lsh(root, 1).Add(root, drop)
+	root.Quo(root, new(big.Int).Lsh(drop, 1))
+	return newNumeric(root, rscale)
+}
+
+// pgSelectDivScaleInt is select_div_scale (numeric.c) for two positive
+// integers (display scale 0): enough decimals for NUMERIC_MIN_SIG_DIGITS (16)
+// significant digits of the quotient, estimated from the operands' NBASE
+// weights and leading NBASE digits, clamped to [0, NUMERIC_MAX_DISPLAY_SCALE].
+func pgSelectDivScaleInt(num, den *big.Int) int {
+	w1, f1 := pgNBaseWeightFirst(num, 0)
+	w2, f2 := pgNBaseWeightFirst(den, 0)
+	qweight := w1 - w2
+	if f1 <= f2 {
+		qweight--
+	}
+	rscale := 16 - qweight*4
+	if rscale < 0 {
+		rscale = 0
+	}
+	return min(rscale, 1000)
+}
+
+// pgNBaseWeightFirst returns the NumericVar weight (index of the leading
+// base-10^4 digit relative to the decimal point) and the leading base-10^4
+// digit of the positive value d / 10^scale, as PG stores it: digit groups
+// are aligned on the decimal point.
+func pgNBaseWeightFirst(d *big.Int, scale int) (int, int64) {
+	s4 := (scale + 3) / 4 * 4
+	v := new(big.Int).Mul(d, pow10Big(s4-scale))
+	digits := len(v.String())
+	nd := (digits + 3) / 4
+	lead := new(big.Int).Quo(v, pow10Big(4*(nd-1)))
+	return nd - 1 - s4/4, lead.Int64()
+}
+
+// pow10Big returns 10^k as a new big.Int (k >= 0).
+func pow10Big(k int) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(k)), nil)
 }
 
 // formatBigRatDecimal formats a big.Rat as a decimal string with up to maxDecimals decimal
@@ -5413,6 +5585,9 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 }
 
 func (o *aggregateOp) Next() (TupleSlot, error) {
+	if o.sorted {
+		return o.nextSorted()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -5426,6 +5601,7 @@ func (o *aggregateOp) Next() (TupleSlot, error) {
 
 func (o *aggregateOp) Close() error {
 	o.rows = nil
+	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
 	o.ctx = nil
 	o.idx = 0
 	return o.child.Close()
@@ -5552,7 +5728,13 @@ func datumToInt64Key(d Datum) (int64, bool) {
 		return d.Int, true
 	case KindNumeric:
 		if isBigNumeric(d) {
-			return 0, false // overflow lane: not representable as int64
+			// The big lane holds any mantissa past int64, which includes an
+			// integral value written with a long scale: 1.0000000000000000000000
+			// is mantissa 10^22, scale 22. Such a value must map to its int64,
+			// because an int64-lane probe treats "not representable" as "equals
+			// no build key" (nextLazy) — a numeric join key now starts in the
+			// int lane (HashKeysTakeInt64Lane).
+			return bigNumericInt64Key(numericMant(d), int(d.Scale))
 		}
 		m, s := d.NumericMantissaValue(), int(d.Scale)
 		for s > 0 && m%10 == 0 {
@@ -5565,6 +5747,27 @@ func datumToInt64Key(d Datum) (int64, bool) {
 		return 0, false // fractional numeric
 	}
 	return 0, false
+}
+
+// bigNumericInt64Key is datumToInt64Key for a big-lane mantissa: the value
+// m·10^-scale as an int64 when it is integral and in range.
+func bigNumericInt64Key(m *big.Int, scale int) (int64, bool) {
+	if scale > 0 {
+		ten := big.NewInt(10)
+		q, r := new(big.Int), new(big.Int)
+		for scale > 0 {
+			q.QuoRem(m, ten, r)
+			if r.Sign() != 0 {
+				return 0, false // fractional
+			}
+			m, q = q, m
+			scale--
+		}
+	}
+	if scale != 0 || !m.IsInt64() {
+		return 0, false
+	}
+	return m.Int64(), true
 }
 
 func datumKey(d Datum) string {

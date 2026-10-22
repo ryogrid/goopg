@@ -39,6 +39,8 @@ func TestAwaitStepOrBlockAsksTheProbe(t *testing.T) {
 
 	// A step that never finishes and never reports a lock wait is treated
 	// as blocked once blockProbeCap passes.
+	defer func(prev time.Duration) { blockProbeCap = prev }(blockProbeCap)
+	blockProbeCap = 400 * time.Millisecond
 	start = time.Now()
 	if _, completed := awaitStepOrBlock(make(chan stepOutcome), blockDetectWait, never); completed {
 		t.Errorf("a hung step was reported completed")
@@ -53,5 +55,30 @@ func TestAwaitStepOrBlockAsksTheProbe(t *testing.T) {
 	called := false
 	if _, completed := awaitStepOrBlock(fast, blockDetectWait, func() (bool, bool) { called = true; return true, true }); !completed || called {
 		t.Errorf("a fast step: completed=%v, probe called=%v", completed, called)
+	}
+}
+
+// TestSessionWaitIsBlockingMatchesIsolationTester pins the probe's verdict to
+// pg_isolation_test_session_is_blocked (lockfuncs.c): a heavyweight lock wait
+// or a READ ONLY DEFERRABLE transaction in GetSafeSnapshot (IPC:SafeSnapshot)
+// blocks; I/O, LWLock and other IPC waits — a slow COMMIT's WAL flush — and no
+// wait at all do not (M-NIGHTLY AI-20261020-013101-002).
+func TestSessionWaitIsBlockingMatchesIsolationTester(t *testing.T) {
+	for _, c := range []struct {
+		typ, event string
+		want       bool
+	}{
+		{"Lock", "transactionid", true},
+		{"Lock", "virtualxid", true},
+		{"Lock", "tuple", true},
+		{"IPC", "SafeSnapshot", true},
+		{"IPC", "SyncRep", false},
+		{"IO", "WALSync", false},
+		{"LWLock", "WALWrite", false},
+		{"", "", false},
+	} {
+		if got := sessionWaitIsBlocking(c.typ, c.event); got != c.want {
+			t.Errorf("sessionWaitIsBlocking(%q, %q) = %v, want %v", c.typ, c.event, got, c.want)
+		}
 	}
 }

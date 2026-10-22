@@ -47,3 +47,128 @@ func aggregateBorrowsScanRows(agg *optimizer.Aggregate) bool {
 	}
 	return true
 }
+
+// markScanBorrowChain hands the seq scan at the bottom of op the borrow
+// (M0145-0008u) when every operator between it and a borrowing aggregate
+// passes each row up before pulling the next and keeps nothing of it — PG's
+// slot discipline, where a scan slot's values stay valid until the next fetch
+// and a node that keeps a tuple copies it (ExecMaterializeSlot).
+//
+// Two operators pass rows through that way:
+//   - a Project evaluates its targets into its own reused row (projectOp.Next)
+//     and returns before pulling again;
+//   - a non-lateral hash join of any type reads its probe side one row at a
+//     time. It holds only the prefetched first row (while it builds, with the
+//     probe child not advanced) and the current row (while it emits that row's
+//     matches or its null-extended self); a row a spilling batch defers is
+//     deep-copied (spill.go). Its build side is kept in the hash table and
+//     never borrows, and the RIGHT / FULL / RIGHT ANTI sweep after the last
+//     probe row emits build rows only (PG's HJ_FILL_INNER_TUPLES).
+//
+// A parameterised nested loop (NestedLoopIndexJoin) passes its outer rows
+// through the same way. Anything else stops the descent, a Filter included
+// (its batch path reads ahead). A Gather ends it too, after marking its leader tree (see
+// gatherOp.borrowLeader).
+//
+// Besides a borrowing aggregate, two roots start a descent: a hash join's
+// build side (joinBorrowBuildChild) and a Gather worker's tree
+// (gatherOp.runWorker), each of which copies every row it keeps. TPC-H Q17's lineitem probe, Aggregate → Hash Join → Project → Seq
+// Scan, cloned all 6M rows because the borrow reached only a scan directly
+// under the aggregate; TPC-H Q13's orders probe under a Hash Right Join
+// cloned its 1.5M rows because the descent stopped at the RIGHT join.
+func markScanBorrowChain(op Operator) {
+	if scanBorrowDisabled {
+		return
+	}
+	for op != nil {
+		if io, ok := op.(*instrumentedOp); ok {
+			op = io.inner
+			continue
+		}
+		switch o := op.(type) {
+		case *seqScanOp:
+			o.borrowRows = true
+			return
+		case *projectOp:
+			op = o.child
+		case *joinOp:
+			if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+				// The streaming nested loops (join_nl_stream.go, and
+				// join_lateral_stream.go for a parameterised inner) pull
+				// the next outer row only once the inner side is done with
+				// the current one, and keep nothing of it afterwards. The
+				// inner side is re-scanned (or, for LATERAL, re-opened) per
+				// outer row; what it caches is keyed by formatted strings
+				// (Memoize, the sublink caches) or reset per outer row (the
+				// lateral CTE cache). PG's NestLoop holds the outer slot
+				// across the inner rescans the same way. TPC-H Q3's orders
+				// probe sits under one.
+				//
+				// The loop's own output passes up the same chain, so it is
+				// borrowed too: the joined pair is emitted from the reused
+				// buffer, not cloned per row (M0122-0012 slice 37).
+				o.nlOuterBorrowed = true
+				o.nlEmitBorrowed = true
+				op = o.left
+				continue
+			}
+			op = joinBorrowProbeChild(o)
+		case *nestedLoopIndexJoinOp:
+			// The parameterised nested loop copies only the outer row's
+			// slice (currentOuter) and pulls the next outer row only after
+			// the inner probe is exhausted, so the outer scan's values stay
+			// valid for every match it emits — PG's NestLoop holds the outer
+			// slot across the inner rescans the same way. Its inner keeps
+			// nothing of the outer row: the index probe reads the bound
+			// slot at Rescan, and Memoize keys its cache by a formatted
+			// string. TPC-H Q3's orders probe sits under one.
+			op = o.outer
+		case *gatherOp:
+			// The leader's own rows pass straight up (gatherOp.Next); worker
+			// rows are copied before they are queued either way.
+			o.borrowLeader = true
+			return
+		default:
+			return
+		}
+	}
+}
+
+// joinBorrowBuildChild is the build-side child of a non-lateral hash join,
+// or nil. Every build loop copies each row it keeps before pulling the next
+// one: retainBuildRow re-homes arena payloads into the join's build arena
+// (buildLoopLeft / buildLoopRight, which Parallel Hash participants also run),
+// and the FOR UPDATE build clones in drainRowsCtxCTID. So the build side is a
+// borrow root of its own, whatever sits above the join — PG's
+// ExecHashTableInsert likewise copies the slot into the hash table
+// (ExecFetchSlotMinimalTuple + memcpy). TPC-H Q10 and Q21 cloned every
+// lineitem row that fed a Parallel Hash this way.
+func joinBorrowBuildChild(o *joinOp) Operator {
+	if joinBorrowProbeChild(o) == nil {
+		return nil
+	}
+	if o.hashBuildIsLeft() {
+		return o.left
+	}
+	return o.right
+}
+
+// joinBorrowProbeChild is the probe-side child of a hash join that passes its
+// probe rows through without keeping them (markScanBorrowChain), or nil. The
+// probe is the side the lazy-hash runtime does not build (hashBuildIsLeft,
+// which forces semi/anti builds onto the right), not plan.BuildLeft's raw
+// value.
+func joinBorrowProbeChild(o *joinOp) Operator {
+	if o.plan == nil || o.plan.Algo != optimizer.JoinAlgoHash || o.plan.Lateral {
+		return nil
+	}
+	switch o.plan.Type {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeRight, optimizer.JoinTypeFull,
+		optimizer.JoinTypeSemi, optimizer.JoinTypeAnti, optimizer.JoinTypeRightSemi, optimizer.JoinTypeRightAnti:
+		if o.hashBuildIsLeft() {
+			return o.right
+		}
+		return o.left
+	}
+	return nil
+}

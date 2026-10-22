@@ -54,7 +54,7 @@ func TestCountContainedInThroughEquivalenceClass(t *testing.T) {
 	cs := &ColumnRef{Index: 0, Name: "cs_item_sk", Type: catalog.Type{Name: "int4"}}
 	it := &ColumnRef{Index: 5, Name: "i_item_sk", Type: catalog.Type{Name: "int4"}}
 	other := &ColumnRef{Index: 6, Name: "s_store_name", Type: catalog.Type{Name: "text"}}
-	u := &pathkeyUsefulness{classMembers: []classMember{{cs, 0b01, 3}, {it, 0b10, 3}}}
+	u := &pathkeyUsefulness{classMembers: []classMember{{expr: cs, relids: 0b01, id: 3}, {expr: it, relids: 0b10, id: 3}}}
 	keys := []PathKey{{Expr: cs, SortAsc: true}}
 	required := []PathKey{{Expr: it, SortAsc: true}, {Expr: other, SortAsc: true}}
 	if contained, n := u.countContainedIn(keys, required); contained || n != 1 {

@@ -1362,6 +1362,39 @@ func RelkindHasStorage(relkind string) bool {
 	}
 }
 
+// TableRelkind is the pg_class.relkind of a table-registry relation: 'S'
+// sequence, 'v' view, 'm' materialized view, 'p' partitioned table, 'f'
+// foreign table, else 'r'. The virtual pg_class builder and the dbsize
+// functions (pg_relation_filenode / pg_relation_filepath) share it, so a
+// relation's storage answer always follows the relkind pg_class shows.
+func TableRelkind(t *Table) string {
+	switch {
+	case t.IsSequence:
+		return "S"
+	case t.View != nil && !t.IsMatView:
+		return "v"
+	case t.IsMatView:
+		return "m"
+	case t.PartitionMethod != "" && t.PartitionParentOID == 0:
+		return "p"
+	case t.ForeignServerName != "":
+		return "f"
+	}
+	return "r"
+}
+
+// IndexRelkind is the pg_class.relkind of an index: 'I' for a partitioned
+// index (one with partition children, which has no storage of its own), else
+// 'i' — the virtual pg_class builder's rule.
+func (c *InMemory) IndexRelkind(idx *Index) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.indexPartitionChildren[idx.OID]) > 0 {
+		return "I"
+	}
+	return "i"
+}
+
 // RelfilenodeForRelkind renders the pg_class.relfilenode cell for a relation of
 // the given kind: its own OID when the kind has storage, "0" otherwise. See
 // RelkindHasStorage. M0134-0164.
@@ -8023,7 +8056,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			// slice 116).
 			continue
 		}
-		relkind := "r"
+		relkind := TableRelkind(t)
 		// relam: heap (2) for ordinary relations; 0 for sequences. PG sets
 		// pg_class.relam=0 for sequences (RELKIND_HAS_TABLE_AM excludes
 		// RELKIND_SEQUENCE — see pg_class.h: sequences use the heap AM only at
@@ -8034,16 +8067,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		// M0110-0001 (DU-002 slice 116).
 		relam := "2"
 		if t.IsSequence {
-			relkind = "S"
 			relam = "0"
-		} else if t.View != nil && !t.IsMatView {
-			relkind = "v"
-		} else if t.IsMatView {
-			relkind = "m"
-		} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
-			relkind = "p"
-		} else if t.ForeignServerName != "" {
-			relkind = "f"
 		}
 		populated := "t"
 		if t.IsMatView && !t.IsPopulated {

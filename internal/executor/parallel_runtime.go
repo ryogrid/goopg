@@ -89,6 +89,19 @@ func transferRowForQueue(slot TupleSlot) Row {
 	return MaterializeForTransfer(slot.Row())
 }
 
+// transferRowForQueueLive is transferRowForQueue for a worker whose rows are
+// read only in the columns live marks (gatherOp.liveCols): only those cross
+// the queue as owned copies, every other cell arrives NULL. PG's workers send
+// the projected tuple, not the whole join row; goopg's Gather sits below the
+// projection, so the mask is how the copy is kept to what the leader reads.
+// A nil live is transferRowForQueue.
+func transferRowForQueueLive(slot TupleSlot, live []bool) Row {
+	if live == nil {
+		return transferRowForQueue(slot)
+	}
+	return cloneRowOwnedLive(slot.Row(), live)
+}
+
 // AssertTransferable reports whether every datum in row is safe to read from
 // another goroutine, returning a descriptive error when one is not.
 //

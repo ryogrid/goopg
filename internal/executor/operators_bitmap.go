@@ -584,11 +584,11 @@ func (o *bitmapHeapScanOp) Close() error {
 		o.mctx = nil
 	}
 	if o.scanRow != nil {
-		// EX1-02b: scrub tail poison before the pooled row is released so
-		// a poisoned buffer never leaks into a later flag-off scan.
+		// EX1-02b: scrub tail poison so a poisoned buffer never leaks into
+		// a later flag-off scan. The buffer is kept for the next Open, as
+		// indexScanOp.Close keeps its own (M0122-0012 slice 36): a nested
+		// loop's inner re-opens it for every outer row.
 		scrubDeformPoison(o.scanRow)
-		releaseRow(o.scanRow)
-		o.scanRow = nil
 	}
 	o.outerBitmap = nil
 	o.tbm = nil

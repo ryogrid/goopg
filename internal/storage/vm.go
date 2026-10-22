@@ -189,6 +189,25 @@ func (v *VisibilityMap) ClearBlock(rel RelFileNode, blk BlockNumber) {
 	v.logChange(rel, blk, 0)
 }
 
+// ClearBlockNoWAL is ClearBlock without a change record, for the two clears PG
+// logs no separate record for: a heap change whose own WAL record carries
+// XLH_*_ALL_VISIBLE_CLEARED (heap_insert, heap_delete, heap_update — the
+// caller logged it while the bits were still set), and VACUUM's corrective
+// clear of a page found not all-visible (lazy_scan_heap's visibilitymap_clear,
+// which is unlogged).
+func (v *VisibilityMap) ClearBlockNoWAL(rel RelFileNode, blk BlockNumber) {
+	if v == nil {
+		return
+	}
+	key := vmKeyFor(rel)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.bitsFor(key, blk) == 0 {
+		return
+	}
+	v.clearBits(key, blk, VMAllVisible|VMAllFrozen)
+}
+
 // ClearAllFrozen clears only the ALL_FROZEN bit for rel/blk, keeping
 // ALL_VISIBLE. A row lock stamps a locker xmax that VACUUM must later freeze
 // away, so the page is no longer all-frozen, yet every tuple stays visible to

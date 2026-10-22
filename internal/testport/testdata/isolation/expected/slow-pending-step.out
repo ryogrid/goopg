@@ -1,0 +1,8 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1u s2u
+step s1b: BEGIN;
+step s1u: UPDATE slow_pending SET v = 1 WHERE id = 1;
+step s2u: UPDATE slow_pending SET v = 2 WHERE id = 1; <waiting ...>
+step s2u: <... completed>
+ERROR:  canceling statement due to lock timeout

@@ -30,22 +30,13 @@ import (
 // ordinary aggregates (var_pop/var_samp/variance/stddev family, bool_and/
 // bool_or, array_agg) driven through OVER(), each with an explicit frame.
 //
-// The var_pop/var_samp/variance/stddev*/stddev cases below pin goopg's
-// ACTUAL output, not PostgreSQL's — the routing fix this brief owns (three
-// serial gates: analyzer/planner/executor) makes these values COMPUTE at
-// all for the first time, but their numeric display scale/precision still
-// diverges from PG's `window.out` oracle by a PRE-EXISTING, orthogonal bug
-// this brief explicitly excludes from scope: goopg's variance/stddev
-// finishers (internal/executor/operators_join_agg.go: exactIntVariance)
-// (a) drop trailing zeros PG's NUMERIC division keeps (21704 vs PG's
-// 21704.000000000000 — a numeric-scale gap), and (b) compute sqrt via
-// 128-bit Newton-Raphson formatted at 18 significant digits vs PG's
-// numeric sqrt_var rounding (147.322774885623167 vs PG's
-// 147.322774885623 — a precision gap, already ledgered 2026-07-27
-// "tpcds-round2 stddev-precision"). Reproduced with IDENTICAL divergence
-// on the plain (non-window) aggregate call, confirming it is unrelated to
-// this brief's window-function gate fix. See the brief's own escalation
-// clause ("numeric display scale ... cause is outside the three gates").
+// Every case below is asserted byte-identical to PostgreSQL 18.3's
+// window.out. The var_pop/var_samp/variance/stddev cases first pinned
+// goopg's own output: its integer variance finisher printed the quotient to
+// 12 decimals with trailing zeros dropped and the square root to 18
+// significant digits. M0122-0012 slice 46 ported numeric_stddev_internal
+// (select_div_scale, rounded div_var, sqrt_var) into exactIntVariance, and
+// the wants are now PG's text.
 // bool_and/bool_or and array_agg below ARE asserted byte-identical to the
 // PG oracle — they hit no numeric formatting path.
 func TestWindowAggregateFunctions(t *testing.T) {
@@ -66,10 +57,10 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT VAR_POP(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,600),(2,470),(3,170),(4,430),(5,300)) r(i,n)",
 			want: []string{
-				"21704",
-				"13868.75",
+				"21704.000000000000",
+				"13868.750000000000",
 				"11266.666666666667",
-				"4225",
+				"4225.0000000000000000",
 				"0",
 			},
 		},
@@ -80,10 +71,10 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT VAR_SAMP(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,600),(2,470),(3,170),(4,430),(5,300)) r(i,n)",
 			want: []string{
-				"27130",
+				"27130.000000000000",
 				"18491.666666666667",
-				"16900",
-				"8450",
+				"16900.000000000000",
+				"8450.0000000000000000",
 				"",
 			},
 		},
@@ -94,10 +85,10 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT VARIANCE(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,600),(2,470),(3,170),(4,430),(5,300)) r(i,n)",
 			want: []string{
-				"27130",
+				"27130.000000000000",
 				"18491.666666666667",
-				"16900",
-				"8450",
+				"16900.000000000000",
+				"8450.0000000000000000",
 				"",
 			},
 		},
@@ -109,11 +100,11 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT STDDEV_POP(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,NULL),(2,600),(3,470),(4,170),(5,430),(6,300)) r(i,n)",
 			want: []string{
-				"147.322774885623167",
-				"147.322774885623167",
-				"117.765657133138777",
-				"106.144555520604384",
-				"65",
+				"147.322774885623",
+				"147.322774885623",
+				"117.765657133139",
+				"106.144555520604",
+				"65.0000000000000000",
 				"0",
 			},
 		},
@@ -125,10 +116,10 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT STDDEV_SAMP(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,NULL),(2,600),(3,470),(4,170),(5,430),(6,300)) r(i,n)",
 			want: []string{
-				"164.711869639076103",
-				"164.711869639076103",
-				"135.984067694221688",
-				"130",
+				"164.711869639076",
+				"164.711869639076",
+				"135.984067694222",
+				"130.000000000000",
 				"91.9238815542511782",
 				"",
 			},
@@ -140,10 +131,10 @@ func TestWindowAggregateFunctions(t *testing.T) {
 			sql: "SELECT STDDEV(n::bigint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) " +
 				"FROM (VALUES(1,NULL),(2,600),(3,470),(4,170),(5,430),(6,300)) r(i,n)",
 			want: []string{
-				"164.711869639076103",
-				"164.711869639076103",
-				"135.984067694221688",
-				"130",
+				"164.711869639076",
+				"164.711869639076",
+				"135.984067694222",
+				"130.000000000000",
 				"91.9238815542511782",
 				"",
 			},

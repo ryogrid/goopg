@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // specInsertRegistry tracks in-progress speculative insertions and their
@@ -108,6 +109,14 @@ func (r *specInsertRegistry) WaitForSpecToken(ctx context.Context, targetXID sto
 		return false, nil
 	}
 	r.specWaiters = append(r.specWaiters, specWaiter{pid: ownPID, ownXID: ownXID, targetXID: targetXID})
+	// SpeculativeInsertionWait sleeps on the inserter's speculative-token
+	// lock, which pg_stat_activity shows as Lock:spectoken; report the same
+	// while parked (M-NIGHTLY AI-20261020-013101-002,
+	// insert-conflict-specconflict).
+	if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		reg.WaitEventStart(procNum, activity.WaitTypeLock, activity.WaitSpecToken)
+		defer reg.WaitEventEnd(procNum)
+	}
 	for {
 		e = r.active[targetXID]
 		if e == nil || e.settled {

@@ -574,54 +574,8 @@ arm returned identical values.
 
 **Gates:** units, tpch-spotcheck, sf025 PASS=99 PLAN-SHAPE same=99, and `TestPort_RegressSuite`.
 
-## Slice 17 (2026-10-16): Projects fold their targets, lowered sublinks fold their Args — TPC-H Q17
+## Slices 17 onward
 
-With Q1 at parity, the slice timed every TPC-H query on PG `:65432` (SELECT only) and warm on a private goopg clone.
-Q17 was furthest behind: 6.19 s against 1.53 s. Q13 (4.05 / 1.44), Q12 (1.64 / 0.44) and Q10 (1.57 / 0.63)
-followed. Q17's plan is PG's, node for node. In PG the lineitem seq scan under the Hash Join probe takes ~350 ms.
-In goopg, `decodeRowRangeInfo` (13.6 %) and `cloneRowOwned` (11 %) dominated, both under the probe's `projectOp`.
-
-A deform-bound trace (`deformBoundBelow` per node) showed the bound reset to full twice:
-
-- **At the Project between the Aggregate and the join, and at the probe Project over lineitem.** The EX1-02 rule
-  narrowed a non-identity Project only when its targets were bare and in column order, and only under a non-full
-  bound from above. HammerDB's lineitem column order (`l_shipdate, l_orderkey, l_discount, l_extendedprice, …`) makes
-  Q17's probe projection `(l_partkey, l_quantity, l_extendedprice)` reordered. So all 16 columns, including
-  `l_comment`, were deformed and cloned for 6M rows.
-- **At the join filter.** `l_quantity < (SubPlan 1)` contains a `SubqueryExpr`, which neither walker understood, so
-  both join sides went full.
-
-Fixes:
-
-- **Projects.** `projectOp.Next` and the op-tree `OpProject` evaluate only `Targets` against the child slot. So every
-  non-identity Project folds its targets alone, `deformFoldRefs(deformBoundNone, Targets...)`, whatever the parent
-  reads. That is PG's projection rule: `ExecCreateExprSetupSteps` (`execExpr.c`) sets `last_scan` to the highest
-  attnum in the target list and emits one `EEOP_SCAN_FETCHSOME`. Unknown target shapes still decline. The
-  identity arm is unchanged. `isOrderedBareProject` and `deformProjectThrough` were folded into the rule and
-  removed.
-- **Sublinks.** A param-lowered `SubqueryExpr` (`ParParam` set, D4.1) reads the outer row only through `Args`,
-  bound by `bindSubPlanParams`: the inner plan reads ParamExec slots, nothing is pushed on `OuterRows`, and the
-  cache key is the bound values. PG's `expr_setup_walker` likewise visits a SubPlan's `args`. Both walkers now fold
-  `Args` (`deformSublinkArgs`). An unlowered sublink still declines: it pushes the whole row and keys its cache by
-  every column (`subqueryCacheKey`).
-
-Pins: `TestScanDeformProjectThrough` (reordered, expression, const and full-parent shapes; unknown targets decline)
-and `TestScanDeformLoweredSublinkArgs` (both walkers, lowered and unlowered). Each fails under the mutation that
-restores the old behaviour.
-
-**Measured:** Q17 on a private TPC-H clone, three rounds, fresh server per arm, last four of five runs. The first
-of the four is still reading pages in:
-
-| round | HEAD `fccdebfc7` (ms) | candidate (ms) |
-|---|---|---|
-| 1 | 7861 / 6287 / 6581 / 6373 | 6678 / 4376 / 4376 / 4431 |
-| 2 | 8067 / 6300 / 6331 / 6425 | 5811 / 4390 / 4428 / 4459 |
-| 3 | 7867 / 6587 / 7278 / 6845 | 6322 / 4369 / 4438 / 4411 |
-
-That is a warm median of ~6400 → ~4400 ms, about −31 %, with no overlap among the warm runs. PG is ~1.53 s. What remains on Q17 is
-`projectOp.Next` and `cloneRowOwnedPrefix` on the probe side (~8 % each, now over the narrowed prefix) and page
-reads (`pageChecksumBlock` ~5 %).
-
-**Gates:** units, tpch-spotcheck, acceptance arm (values identical), sf025 PASS=99 PLAN-SHAPE same=99,
-`TestPort_RegressSuite`, and the `TestPort_Isolation*` family (narrowing now reaches many more scans, including
-under EPQ-rechecking row locks).
+Slices 17 onward (the TPC-H Q17 and Q13 scan pipeline: Project folding, the scan row borrow, walking past
+unread columns) continue in [0122-0012-tpch-scan-pipeline-slices.md](0122-0012-tpch-scan-pipeline-slices.md),
+split out on 2026-10-21 under the 800-line design-doc limit.

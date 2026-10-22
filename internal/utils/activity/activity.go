@@ -97,6 +97,12 @@ const (
 	WaitCheckpointStart    = "CheckpointStart"
 	WaitBufferIO           = "BufferIo"
 	WaitBackendTermination = "BackendTermination"
+
+	// WaitSafeSnapshot is GetSafeSnapshot's ProcWaitForSignal
+	// (WAIT_EVENT_SAFE_SNAPSHOT, predicate.c): a READ ONLY DEFERRABLE
+	// transaction waiting for a snapshot no concurrent serializable writer
+	// can make unsafe.
+	WaitSafeSnapshot = "SafeSnapshot"
 )
 
 // Activity-type events  (PG_WAIT_ACTIVITY).

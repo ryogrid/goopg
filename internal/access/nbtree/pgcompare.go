@@ -202,15 +202,22 @@ func ComparePGIndexTupleKeyAttrs(desc *PGIndexKeyDesc, a, b []byte) (int, error)
 	return comparePGIndexTuples(desc, a, b, false)
 }
 
-// deformScratchAtts caps the on-stack deform scratch in comparePGIndexTuples.
-// PG's INDEX_MAX_KEYS is 32, but real indexes are narrow; 8 covers every index
-// in the TPC-H/TPC-DS/pgbench schemas with a 384-byte frame.
-const deformScratchAtts = 8
-
-func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {
+// comparePGIndexTupleAttrs compares the key attributes a and b both store, in
+// attribute order, and stops at the first that differs: res is that
+// attribute's comparison, or 0 when every shared attribute is equal. nattsA and
+// nattsB are the operands' stored attribute counts, for the caller's
+// truncation and heap-TID rules.
+//
+// It walks both tuples together (pgIndexTupleWalk) rather than deforming each
+// into scratch first. That was the btree descent's and range scan's inner
+// loop: TPC-DS Q72's inventory skip scan spent ~55 % of its CPU comparing,
+// most of it deforming attributes past the one that decided the answer and
+// zeroing a 384-byte scratch frame per call (M0122-0012 slice 33). Upstream's
+// _bt_compare reads each attribute only when it reaches it (nbtsearch.c).
+func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, nattsB int, err error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
-		return 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
+		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
 	}
 	if len(a) < SizeOfIndexTupleData || len(b) < SizeOfIndexTupleData {
 		// An operand too short to hold an IndexTupleData header is not a tuple
@@ -222,60 +229,54 @@ func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (
 		// indexFormat.compare fall back to the bytewise order, where an empty
 		// key sorts before every tuple — which IS minus infinity, so the
 		// descent lands on the leftmost leaf exactly as intended.
-		return 0, fmt.Errorf("btree: ComparePGIndexTuples operand of %d/%d bytes is shorter than an index tuple header", len(a), len(b))
+		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples operand of %d/%d bytes is shorter than an index tuple header", len(a), len(b))
 	}
 	if BTreeTupleIsPosting(a) || BTreeTupleIsPosting(b) {
 		// A posting list's key is a single value shared by many heap TIDs;
 		// comparing one is meaningful, but the heap-TID tiebreak below would
 		// have to pick which of its TIDs to use, and every caller that has a
 		// posting tuple in hand knows which. Refuse rather than guess.
-		return 0, fmt.Errorf("btree: ComparePGIndexTuples does not accept posting-list tuples")
+		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples does not accept posting-list tuples")
 	}
 
-	nattsA := int(BTreeTupleGetNAtts(a, uint16(nkey)))
-	nattsB := int(BTreeTupleGetNAtts(b, uint16(nkey)))
+	nattsA = int(BTreeTupleGetNAtts(a, uint16(nkey)))
+	nattsB = int(BTreeTupleGetNAtts(b, uint16(nkey)))
 	if nattsA > nkey || nattsB > nkey {
-		return 0, fmt.Errorf("btree: tuple has %d/%d attributes, more than the descriptor's %d", nattsA, nattsB, nkey)
+		return 0, 0, 0, fmt.Errorf("btree: tuple has %d/%d attributes, more than the descriptor's %d", nattsA, nattsB, nkey)
 	}
 	ncmp := min(nattsA, nattsB)
+	if ncmp == 0 {
+		return 0, nattsA, nattsB, nil
+	}
+	wa, err := newPGIndexTupleWalk(a)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
+	}
+	wb, err := newPGIndexTupleWalk(b)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
+	}
+	for i := range ncmp {
+		att := &desc.Attrs[i]
+		av, anull, err := wa.next(i, att.PGIndexAttr)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
+		}
+		bv, bnull, err := wb.next(i, att.PGIndexAttr)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
+		}
+		if res := att.compareAttr(av, anull, bv, bnull); res != 0 {
+			return res, nattsA, nattsB, nil
+		}
+	}
+	return 0, nattsA, nattsB, nil
+}
 
-	if ncmp > 0 {
-		// perf-optimize-take3/05 candidate B. This is the btree descent's
-		// inner loop: at c=50 it ran ~276 heap allocations per single-row
-		// index lookup (55.9% of ALL allocated objects in the server, 11.5%
-		// of read CPU) because each comparison allocated desc.Physical()
-		// plus a [][]byte and a []bool per operand — five allocations, none
-		// of which outlive the loop below.
-		//
-		// The scratch arrays are stack-allocated for the overwhelmingly
-		// common narrow-index case; deformPGIndexTupleInto only writes
-		// through them, so escape analysis keeps them off the heap. Indexes
-		// wider than deformScratchAtts fall back to the allocating path
-		// rather than growing the stack frame for every comparison.
-		var (
-			avArr, bvArr       [deformScratchAtts][]byte
-			anullArr, bnullArr [deformScratchAtts]bool
-			av, bv             [][]byte
-			anull, bnull       []bool
-		)
-		if ncmp <= deformScratchAtts {
-			av, bv = avArr[:ncmp], bvArr[:ncmp]
-			anull, bnull = anullArr[:ncmp], bnullArr[:ncmp]
-		} else {
-			av, bv = make([][]byte, ncmp), make([][]byte, ncmp)
-			anull, bnull = make([]bool, ncmp), make([]bool, ncmp)
-		}
-		if err := deformPGIndexTupleInto(a, desc.Attrs, ncmp, av, anull); err != nil {
-			return 0, fmt.Errorf("btree: left tuple: %w", err)
-		}
-		if err := deformPGIndexTupleInto(b, desc.Attrs, ncmp, bv, bnull); err != nil {
-			return 0, fmt.Errorf("btree: right tuple: %w", err)
-		}
-		for i := range ncmp {
-			if res := desc.Attrs[i].compareAttr(av[i], anull[i], bv[i], bnull[i]); res != 0 {
-				return res, nil
-			}
-		}
+func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {
+	res, nattsA, nattsB, err := comparePGIndexTupleAttrs(desc, a, b)
+	if err != nil || res != 0 {
+		return res, err
 	}
 
 	// Equal on every attribute both tuples physically store: the one with

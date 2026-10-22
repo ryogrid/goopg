@@ -569,6 +569,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// The visibility map. The heap WAL hooks below read it: a heap change on
+	// an all-visible page clears the page's map bits right after logging, so
+	// at log time the bits still say whether the change clears them, which
+	// the record states with XLH_*_ALL_VISIBLE_CLEARED (heap_insert,
+	// heap_delete, heap_update test PageIsAllVisible under the same buffer
+	// lock). Redo then clears them too.
+	vm := storage.NewVisibilityMap()
+	visibleCleared := func(rel storage.RelFileNode, blk storage.BlockNumber) bool {
+		return vm.AllVisible(rel, blk)
+	}
+
 	// Logical heap-insert change record (M0002 redo-records —
 	// see docs/design/0002-0003-redo-records.md).
 	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, initPage bool) (storage.LSN, error) {
@@ -576,7 +587,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// + tuple, xl_xid = t_xmin) instead of the goopg-native body. Recovery
 		// routes it to replayDecodedXLogHeapInsert (the decoded path) since it
 		// carries a block ref. See docs/design/wal-pg-identical-stream/01.
-		payload, err := xlog.EncodeHeapInsertPG(rel, blk, lineSlot, tuple, initPage)
+		payload, err := xlog.EncodeHeapInsertPGVis(rel, blk, lineSlot, tuple, initPage, visibleCleared(rel, blk))
 		if err != nil {
 			return 0, err
 		}
@@ -630,7 +641,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) (storage.LSN, error) {
 		// A3: emit a PostgreSQL xl_heap_delete record (block ref + xmax/offnum
 		// main-data, old tuple for logical) instead of the goopg-native body.
-		payload, err := xlog.EncodeHeapDeletePG(rel, blk, lineSlot, xmax, oldTuple)
+		payload, err := xlog.EncodeHeapDeletePGVis(rel, blk, lineSlot, xmax, oldTuple, visibleCleared(rel, blk))
 		if err != nil {
 			return 0, err
 		}
@@ -802,7 +813,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
 		// A4: emit a PostgreSQL xl_heap_update (HOT opcode) record instead of the
 		// goopg-native body. Recovery routes it to replayDecodedXLogHeapUpdate.
-		payload, err := xlog.EncodeHeapHotUpdatePG(rel, blk, oldSlot, newSlot, xmax, tupleBytes)
+		payload, err := xlog.EncodeHeapHotUpdatePGVis(rel, blk, oldSlot, newSlot, xmax, tupleBytes, visibleCleared(rel, blk))
 		if err != nil {
 			return 0, err
 		}
@@ -818,7 +829,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// forward ctid + new version, one xl_heap_update record. Replay routes
 	// to replayDecodedXLogHeapUpdate(hot=false).
 	logHeapUpdate := func(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16, newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
-		payload, err := xlog.EncodeHeapUpdatePG(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes)
+		payload, err := xlog.EncodeHeapUpdatePGVis(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes,
+			visibleCleared(rel, oldBlk), visibleCleared(rel, newBlk))
 		if err != nil {
 			return 0, err
 		}
@@ -2056,10 +2068,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		State:       "active",
 	})
 	act.UpdateTrackIOTiming(checkpointerProcNum, opts.TrackIOTiming)
-	// M0146-0063: the visibility map exists before the checkpointer, whose
-	// flush phase saves its forks (FlushCLOGFn below). It stays empty, and a
-	// save writes nothing, until the forks are loaded after replay.
-	vm := storage.NewVisibilityMap()
+	// M0146-0063: the visibility map (vm, constructed before the heap WAL
+	// hooks) exists before the checkpointer, whose flush phase saves its
+	// forks (FlushCLOGFn below). It stays empty, and a save writes nothing,
+	// until the forks are loaded after replay.
 	// vmLogging is set once the map's WAL hook is installed; vmCapability
 	// once global/pg_goopg_features says the map is WAL-logged. The
 	// capability is recorded by the first checkpoint that saves the forks
@@ -2838,12 +2850,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// RecordKindHeapVisible (replayHeapVisible applies it to the fork). The
 	// next checkpoint saves the forks and records the capability (FlushCLOGFn
 	// above), after which a crash start may trust them.
+	// A set goes out as PG's XLOG_HEAP2_VISIBLE, which a PG standby replays.
+	// Plain clears are not logged here at all: the heap record that caused
+	// them carries XLH_*_ALL_VISIBLE_CLEARED (VisibilityMap.ClearBlockNoWAL).
+	// The native record remains for what PG logs elsewhere and goopg does not
+	// yet: a row lock's frozen-only clear (XLH_LOCK_ALL_FROZEN_CLEARED on a
+	// still-native lock record), a dropped relation's map, and the catalog
+	// resync clear that is logged as a full-page image.
 	rt.VM.SetWALHook(func(rel storage.RelFileNode, blk storage.BlockNumber, flags uint8) error {
-		_, _, err := walWriter.Append(xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{
-			Rel:     rel,
-			HeapBlk: blk,
-			Flags:   flags,
-		}))
+		var payload []byte
+		if flags&storage.VMWALSetAllVisible != 0 {
+			bits := uint8(storage.VMAllVisible)
+			if flags&storage.VMWALSetAllFrozen != 0 {
+				bits |= storage.VMAllFrozen
+			}
+			var err error
+			if payload, err = xlog.EncodeHeapVisiblePG(rel, blk, storage.InvalidTransactionID, bits); err != nil {
+				return err
+			}
+		} else {
+			payload = xlog.EncodeHeapVisible(xlog.HeapVisiblePayload{Rel: rel, HeapBlk: blk, Flags: flags})
+		}
+		_, _, err := walWriter.Append(payload)
 		return err
 	})
 	vmLogging.Store(true)

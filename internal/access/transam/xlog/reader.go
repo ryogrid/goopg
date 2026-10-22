@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 // Record is one decoded WAL record from the stream.
@@ -550,32 +549,42 @@ func detectSegmentSizeAt(walDir string, segNo uint64) int64 {
 	return size
 }
 
-// openSegmentFile tries to open the WAL segment for segNo, first with TLI=1
-// (the bootstrap timeline, which covers most goopg clusters) and then with
-// any other TLI found in the pg_wal directory. Returns the open file handle
-// or the error from the last attempt.
+// openSegmentFile opens the WAL segment for segNo on its newest timeline.
+// After a promotion the segment holding the switch point exists on both
+// timelines: the old copy ends at the switch point, the new one continues
+// past it (XLogInitNewTimeline), so the newest is the one to read — as
+// XLogFileReadAnyTLI walks the history newest timeline first. Segments
+// before the switch exist only on the old timeline.
 func openSegmentFile(walDir string, segNo uint64) (*os.File, error) {
-	// Fast path: TLI=1.
-	path := filepath.Join(walDir, FormatSegmentName(segNo))
-	if f, err := os.Open(path); err == nil {
-		return f, nil
+	path, ok, err := newestSegmentPath(walDir, segNo, ^uint32(0))
+	if err != nil {
+		return nil, err
 	}
-	// Slow path: scan for any segment file with the matching log+seg suffix.
-	// The segment name format is TLI(8)+LOG(8)+SEG(8) = 24 hex chars.
+	if !ok {
+		return nil, fmt.Errorf("wal: segment %s not found in %s", FormatSegmentName(segNo), walDir)
+	}
+	return os.Open(path)
+}
+
+// newestSegmentPath returns the path of segment segNo on the newest timeline
+// at or below maxTLI that has it.
+func newestSegmentPath(walDir string, segNo uint64, maxTLI uint32) (string, bool, error) {
 	entries, err := os.ReadDir(walDir)
 	if err != nil {
-		return nil, fmt.Errorf("wal: readdir %s: %w", walDir, err)
+		return "", false, fmt.Errorf("wal: readdir %s: %w", walDir, err)
 	}
-	suffix := FormatSegmentName(segNo)[8:] // log+seg portion (last 16 hex digits)
+	best, found := uint32(0), false
 	for _, e := range entries {
-		name := e.Name()
-		if len(name) == 24 && strings.HasSuffix(name, suffix) {
-			if f, err := os.Open(filepath.Join(walDir, name)); err == nil {
-				return f, nil
-			}
+		tli, n, ok := ParseXLogFileName(e.Name(), 0)
+		if !ok || n != segNo || tli > maxTLI || (found && tli <= best) {
+			continue
 		}
+		best, found = tli, true
 	}
-	return nil, fmt.Errorf("wal: segment %s not found in %s", FormatSegmentName(segNo), walDir)
+	if !found {
+		return "", false, nil
+	}
+	return filepath.Join(walDir, FormatSegmentNameTLI(segNo, best)), true, nil
 }
 
 // lastLiveSegment returns the highest segment at or after firstSegNo whose

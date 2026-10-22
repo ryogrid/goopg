@@ -37,6 +37,36 @@ func (n *Join) HashKeysAreInt64() bool {
 	return n.hashKeyIsInt64(n.LeftKey) && n.hashKeyIsInt64(n.RightKey)
 }
 
+// HashKeysTakeInt64Lane reports whether the executor should START this hash
+// join's build in the int64 key lane: each key is a machine integer or a
+// `numeric`, and the join has a single key pair.
+//
+// This is the question HashKeysAreInt64's first exclusion leaves open. A
+// numeric key is int64-representable whenever its value is integral and in
+// range, and HammerDB's TPC-H declares every join key `numeric` (TPC-H Q13's
+// `o_custkey = c_custkey` probed a string map, ~21 % of the query). The lane
+// is a starting guess, not a promise: a build key that is not representable
+// (a fraction, a value past int64) demotes the table to the string lane once
+// (demoteIntHash), and a probe key that is not representable cannot equal any
+// int64 build key, because datumToInt64Key maps every integral in-range value
+// of every numeric representation.
+func (n *Join) HashKeysTakeInt64Lane() bool {
+	if n == nil || n.Algo != JoinAlgoHash || n.LeftKey == nil || n.RightKey == nil {
+		return false
+	}
+	return n.hashKeyMayBeInt64(n.LeftKey) && n.hashKeyMayBeInt64(n.RightKey)
+}
+
+// hashKeyMayBeInt64 is hashKeyIsInt64 widened to `numeric`.
+func (n *Join) hashKeyMayBeInt64(key Expr) bool {
+	t, ok := n.keyExprType(key)
+	if !ok || t.IsArray {
+		return false
+	}
+	name := strings.ToLower(t.Name)
+	return isMachineIntTypeName(name) || name == "numeric" || name == "decimal"
+}
+
 // hashKeyIsInt64 types one side's key expression.
 //
 // `exprType` is the primary source, but several ColumnRef construction sites

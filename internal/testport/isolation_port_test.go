@@ -703,6 +703,21 @@ func TestPort_IsolationMultipleCic(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-cic.spec")
 }
 
+// TestIsolationRunnerWaitsForSlowPendingStep pins the runner's pending-step
+// wait to isolationtester's (M-NIGHTLY AI-20261020-013101-005): a step still
+// waiting when the permutation's steps run out is waited for until it
+// completes, here 6 s later at its lock_timeout. The runner used to give it a
+// 5 s window, print "<... timed out waiting>" and cancel it, which failed
+// multiple-cic on a loaded nightly host. The spec is goopg-local; its expected
+// output was captured from PG 18.3's isolationtester.
+func TestIsolationRunnerWaitsForSlowPendingStep(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_slow_pending")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "internal/testport/testdata/isolation/specs/slow-pending-step.spec")
+}
+
 // TestPort_IsolationAlterTable3 exercises the alter-table-3 spec (M0118-0008):
 // ALTER TABLE ... ENABLE/DISABLE TRIGGER mixed with concurrent writes and
 // SELECT ... FOR UPDATE.
@@ -2163,4 +2178,68 @@ func buildDSNForDB(t *testing.T, c *cluster.Cluster, dbname string) string {
 		t.Fatalf("split host port %q: %v", addr, err)
 	}
 	return fmt.Sprintf("host=%s port=%s user=postgres dbname=%s sslmode=disable", host, port, dbname)
+}
+
+// TestIsolationRunnerGuardsBlockedTeardown pins the setup/teardown hang guard
+// (M-NIGHTLY AI-20261022-011400-001). The nightly's testport stage timed out
+// after 2 h with two specs blocked for 1h49m in global setup / teardown on the
+// shared cluster, and nothing recorded what they waited on. Here the test's
+// own connection holds an uncommitted UPDATE of the row the spec's teardown
+// updates: the runner must give up at its guard, well before the outer
+// deadline, and report the server state — including the waiting teardown —
+// in the error.
+func TestIsolationRunnerGuardsBlockedTeardown(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_guard_teardown")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	db, err := sql.Open("postgres", buildDSN(t, c))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	holder, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer holder.Close()
+	for _, q := range []string{
+		"CREATE TABLE guard_blocked (i int)",
+		"INSERT INTO guard_blocked VALUES (1)",
+		"BEGIN",
+		"UPDATE guard_blocked SET i = 1 WHERE i = 1",
+	} {
+		if _, err := holder.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+
+	spec, err := framework.ParseIsolationSpec(filepath.Join(root, "internal/testport/testdata/isolation/specs/guard-blocked-teardown.spec"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	runner := &framework.IsolationRunner{DSN: buildDSN(t, c), SetupTeardownGuard: 3 * time.Second}
+	start := time.Now()
+	_, runErr := runner.RunSpec(ctx, spec)
+	elapsed := time.Since(start)
+	if _, err := holder.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Logf("rollback holder: %v", err)
+	}
+	if runErr == nil {
+		t.Fatal("RunSpec returned no error although its teardown could never finish")
+	}
+	msg := runErr.Error()
+	if !strings.Contains(msg, "global teardown") || !strings.Contains(msg, "setup/teardown guard") {
+		t.Fatalf("error does not name the guarded teardown: %v", runErr)
+	}
+	if !strings.Contains(msg, "pg_locks") || !strings.Contains(msg, "UPDATE guard_blocked SET i = 3") {
+		t.Fatalf("error does not carry the server-state snapshot with the waiting teardown: %v", runErr)
+	}
+	if elapsed > time.Minute {
+		t.Fatalf("RunSpec took %s; the 3 s guard did not bound the teardown", elapsed)
+	}
+	t.Logf("guarded after %s:\n%s", elapsed.Round(time.Millisecond), msg)
 }

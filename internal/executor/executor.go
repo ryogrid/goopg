@@ -134,15 +134,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		}
 		return maybeInstrument(p, newMaterializeOp(child), scope), nil
 	case *optimizer.Project:
-		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
-		if err != nil {
-			return nil, err
-		}
-		// M0071-0015 Stage E: projectOp materialises evaluated
-		// targets into o.out and clones for the consumer; child
-		// slot lifetime is bounded by projectOp's per-Next read
-		// — no borrow contract needed.
-		return maybeInstrument(p, newProjectOp(p, child), scope), nil
+		return buildProjectNode(p, bound, nil, scope)
 	case *optimizer.Filter:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
 		if err != nil {
@@ -206,7 +198,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if err != nil {
 			return nil, err
 		}
-		return maybeInstrument(p, newSortOp(p, child), scope), nil
+		return finishSortNode(p, child, scope), nil
 	case *optimizer.IncrementalSort:
 		// M0141-S7-exec-b: PathIncrementalSort's translated node, wired like
 		// *optimizer.Sort just above — same child bound, same instrumentation
@@ -215,7 +207,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if err != nil {
 			return nil, err
 		}
-		return maybeInstrument(p, newIncrementalSortOp(child, p, p.Keys, p.PresortedCount), scope), nil
+		return finishIncrementalSortNode(p, child, scope), nil
 	case *optimizer.Join:
 		// EX1-02: per-side bounds from the merged-space remap
 		// (deformJoinBounds): above-join refs mapped through the output
@@ -236,6 +228,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// impossible (it depends on `bound`, i.e. on everything above this
 		// join). See joinOp.deformLeftBound.
 		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+		markScanBorrowChain(joinBorrowBuildChild(jop))
 		return maybeInstrument(p, jop, scope), nil
 	case *optimizer.NestedLoopIndexJoin:
 		// EX1-02: the outer follows the left-side rule; inner rescans
@@ -312,7 +305,17 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan), scope), nil
 	case *optimizer.Aggregate:
-		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
+		var child Operator
+		var err error
+		childBound := deformBoundBelow(p, bound)
+		if p.Mode != optimizer.AggModeFinal {
+			// A plain or partial aggregate is consumer-complete: its arms
+			// (folded into childBound) are the only readers of its child's
+			// rows (M0122-0012 slice 35, buildCompleteChild).
+			child, err = buildCompleteChild(p.Child, childBound, aggConsumerExprs(p), scope)
+		} else {
+			child, err = buildNode(p.Child, childBound, scope)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -326,9 +329,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// the row it reads (aggregateBorrowsScanRows), a seq scan child
 		// hands up its own reused row instead of a per-tuple clone.
 		if aggregateBorrowsScanRows(p) {
-			if so := unwrapSeqScanOp(child); so != nil {
-				so.borrowRows = true
-			}
+			markScanBorrowChain(child)
 		}
 		return maybeInstrument(p, newAggregateOp(p, child), scope), nil
 	case *optimizer.WindowAgg:
@@ -404,10 +405,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// so every worker's private tree narrows the same leaves. A worker
 		// built through the public BuildWorker entry (no bound in scope)
 		// declines to full deform.
-		workerBound := deformBoundBelow(p, bound)
-		return maybeInstrument(p, newGatherOp(p, func(scope *instrumenter) (Operator, error) {
-			return buildNode(p.Child, workerBound, scope)
-		}), scope), nil
+		return maybeInstrument(p, newGatherNode(p, bound), scope), nil
 	case *optimizer.GatherMerge:
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams. The GatherMerge keys (folded
@@ -624,6 +622,146 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 // *planner.SeqScan, transparently peeling the maybeInstrument wrapper. Returns
 // nil for anything else. Used to hand a leaf Filter's spatial predicate to the
 // scan for GiST spatial-SSI locking (design 0118-0137).
+// scanSkipDisabled turns markProjectScanReads off. Tests set it to compare a
+// skipping scan's results with the full decode.
+var scanSkipDisabled = false
+
+// markProjectScanReads records, on a seq scan directly under a non-identity
+// Project, the columns the Project's targets read (M0122-0012 slice 19). The
+// Project evaluates only its targets against the scan's row, and the row
+// leaves the scan through nothing else, so the remaining columns of the
+// deform window need not be decoded — PG's projection likewise fetches only
+// the attributes its expressions reference (ExecBuildProjectionInfo,
+// EEOP_SCAN_FETCHSOME up to last_scan, with by-reference values left as
+// pointers). Unknown target shapes leave readCols nil: everything decodes.
+// buildCompleteChild builds the child of a consumer-complete parent — a plain
+// or partial Aggregate, whose arms (consumers, folded into bound) are the
+// only readers of the rows the child returns. Down a chain of sorts, which
+// read only their keys and return every row unchanged, that stays true once
+// the keys join the consumers, so a Project at the bottom of the chain may
+// evaluate just the targets they read (projectLiveSet). TPC-DS Q14's
+// GroupAggregate → Sort → Project → nested-loop chains are the shape: the
+// re-expansion Project otherwise evaluates every join column, the sort
+// stores ~4 kB per row, and each store_sales_pkey probe deforms all 23 heap
+// columns. Any other node builds normally (every target live).
+func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr, scope *instrumenter) (Operator, error) {
+	switch p := n.(type) {
+	case *optimizer.Project:
+		return buildProjectNode(p, bound, projectLiveSet(p, consumers), scope)
+	case *optimizer.Sort:
+		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
+		child, err := buildCompleteChild(p.Child, deformBoundBelow(p, bound), keys, scope)
+		if err != nil {
+			return nil, err
+		}
+		return finishSortNode(p, child, scope), nil
+	case *optimizer.Gather:
+		// The workers' rows go only to these consumers, so a worker ships
+		// just the columns they read (M0122-0012 slice 39).
+		g := newGatherNode(p, bound)
+		g.liveCols = consumerLiveColumns(consumers)
+		return maybeInstrument(p, g, scope), nil
+	case *optimizer.IncrementalSort:
+		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
+		child, err := buildCompleteChild(p.Child, deformBoundBelow(p, bound), keys, scope)
+		if err != nil {
+			return nil, err
+		}
+		return finishIncrementalSortNode(p, child, scope), nil
+	}
+	return buildNode(n, bound, scope)
+}
+
+// newGatherNode builds a Gather whose workers each construct their own tree
+// over the partial plan, narrowed by the bound captured here — shared by
+// buildNode's Gather arm and buildCompleteChild so the two cannot drift.
+func newGatherNode(p *optimizer.Gather, bound int) *gatherOp {
+	// EX1-01: the bound is captured into the worker buildChild closure
+	// so every worker's private tree narrows the same leaves. A worker
+	// built through the public BuildWorker entry (no bound in scope)
+	// declines to full deform.
+	workerBound := deformBoundBelow(p, bound)
+	return newGatherOp(p, func(scope *instrumenter) (Operator, error) {
+		return buildNode(p.Child, workerBound, scope)
+	})
+}
+
+// finishSortNode and finishIncrementalSortNode wrap a built child in the sort
+// operator — shared by buildNode's arms and buildCompleteChild so the two
+// cannot drift.
+// finishSortNode builds the Sort operator over its child. A sort is a borrow
+// root (M0122-0012 slice 48): sortOp.Open materialises every child slot —
+// cloneRowOwned copies the row slice and promotes arena payloads — before it
+// pulls the next one, the retention boundary the seq scan's per-page arena
+// reset already relies on. So a seq scan under it, through the pass-through
+// operators markScanBorrowChain walks, may hand up its own reused row instead
+// of a per-tuple clone, as it already does under an aggregate or a Gather.
+// PG's Sort likewise copies each input slot into its tuplesort
+// (tuplesort_puttupleslot). TPC-DS Q97 cloned every store_sales and
+// catalog_sales probe row of the Parallel Hash Joins under its two sorts.
+func finishSortNode(p *optimizer.Sort, child Operator, scope *instrumenter) Operator {
+	markScanBorrowChain(child)
+	return maybeInstrument(p, newSortOp(p, child), scope)
+}
+
+// finishIncrementalSortNode builds the IncrementalSort operator; a borrow root
+// for the same reason as a Sort (readGroup materialises each slot before the
+// next pull).
+func finishIncrementalSortNode(p *optimizer.IncrementalSort, child Operator, scope *instrumenter) Operator {
+	markScanBorrowChain(child)
+	return maybeInstrument(p, newIncrementalSortOp(child, p, p.Keys, p.PresortedCount), scope)
+}
+
+// buildProjectNode builds a Project that evaluates only the targets live
+// marks (nil = all of them), threading the bound those targets need to its
+// child.
+func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instrumenter) (Operator, error) {
+	child, err := buildNode(p.Child, deformProjectBelow(p, bound, live), scope)
+	if err != nil {
+		return nil, err
+	}
+	// M0071-0015 Stage E: projectOp materialises evaluated
+	// targets into o.out and clones for the consumer; child
+	// slot lifetime is bounded by projectOp's per-Next read
+	// — no borrow contract needed.
+	markProjectScanReads(p, child, live)
+	pop := newProjectOp(p, child)
+	pop.live = live
+	return maybeInstrument(p, pop, scope), nil
+}
+
+func markProjectScanReads(p *optimizer.Project, child Operator, live []bool) {
+	if scanSkipDisabled || isIdentityProject(p) {
+		return
+	}
+	switch c := p.Child.(type) {
+	case *optimizer.SeqScan:
+	case *optimizer.Filter:
+		// M0122-0012 slice 29: a Filter directly over the scan is absorbed
+		// into it (the child operator IS the seqScanOp), and Open adds the
+		// qual's own columns to the read set.
+		if _, ok := c.Child.(*optimizer.SeqScan); !ok {
+			return
+		}
+	default:
+		return
+	}
+	so := unwrapSeqScanOp(child)
+	if so == nil {
+		return
+	}
+	targets := p.Targets
+	if live != nil {
+		targets = nil
+		for i, t := range p.Targets {
+			if live[i] {
+				targets = append(targets, t)
+			}
+		}
+	}
+	so.readCols = deformScanReadSet(len(so.cols), targets...)
+}
+
 func unwrapSeqScanOp(op Operator) *seqScanOp {
 	switch o := op.(type) {
 	case *seqScanOp:
@@ -692,6 +830,11 @@ func (tree *opTreeSlab) buildRec(plan optimizer.Node, bound int) (int32, error) 
 		// Phase C.3: target expressions compiled into exprTreeSlab; projectState
 		// holds only compiled indices — no GC-traced *planner.Project or schema slice.
 		// Schema is pooled in opTreeSlab.schemas; projectState stores an int32 index.
+		// Every target is live: a slab parent is never a consumer-complete
+		// Aggregate (buildProjectNode is the only narrowing builder).
+		if so, ok := tree.ops[childIdx].state.(*seqScanOp); ok {
+			markProjectScanReads(p, so, nil)
+		}
 		targExprs := make([]int32, len(p.Targets))
 		for i, t := range p.Targets {
 			targExprs[i] = tree.exprs.buildExpr(t)

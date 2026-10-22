@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"math/big"
+	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/nodes"
@@ -405,5 +409,48 @@ func TestPGCompareDescInvertsTypedComparator(t *testing.T) {
 	}
 	if got := sign(attr.compareAttr(i4(1), false, i4(256), false)); got != 1 {
 		t.Errorf("DESC int4: 1 vs 256 = %d, want 1", got)
+	}
+}
+
+// TestPGCompareNumericMatchesExactOrder checks PGCompareNumeric against exact
+// rational comparison over random values: mixed signs, magnitudes across many
+// NBASE digits (digit values up to 9999, whose little-endian byte pairs a
+// wrong-endian read would misorder), and scales 0-12. Slice 31 reads the
+// digit array in place instead of copying it out, so the digit read is pinned
+// here, not only by the hand-picked total-order list above.
+func TestPGCompareNumericMatchesExactOrder(t *testing.T) {
+	r := rand.New(rand.NewSource(20261021))
+	vals := make([]string, 0, 400)
+	for i := 0; i < 400; i++ {
+		var b strings.Builder
+		if r.Intn(2) == 0 {
+			b.WriteByte('-')
+		}
+		b.WriteString(strconv.FormatInt(r.Int63n(1_000_000_000_000), 10))
+		if s := r.Intn(13); s > 0 {
+			b.WriteByte('.')
+			for j := 0; j < s; j++ {
+				b.WriteByte(byte('0' + r.Intn(10)))
+			}
+		}
+		vals = append(vals, b.String())
+	}
+	vals = append(vals, "9999", "10000", "9998.9999", "99999999", "0.0001", "0.9999", "-9999.9999")
+	enc := make([][]byte, len(vals))
+	exact := make([]*big.Rat, len(vals))
+	for i, v := range vals {
+		enc[i] = numeric(t, v)
+		q, ok := new(big.Rat).SetString(v)
+		if !ok {
+			t.Fatalf("big.Rat(%q)", v)
+		}
+		exact[i] = q
+	}
+	for i := range vals {
+		for j := range vals {
+			if got, want := sign(PGCompareNumeric(enc[i], enc[j])), exact[i].Cmp(exact[j]); got != want {
+				t.Fatalf("%s vs %s = %d, want %d", vals[i], vals[j], got, want)
+			}
+		}
 	}
 }

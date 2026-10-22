@@ -1,6 +1,9 @@
 package xlog
 
-import "fmt"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
 // emitSegmentPad is the cross-segment composer for M0107-0007 slice B
 // (Phase D4 — 8-stripe WAL insert locks per
@@ -147,7 +150,7 @@ func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gap
 		}
 		out = pad
 		if lay.pageHeaders && lay.segSize > 0 {
-			out, leading = emitWithPageHeaders(pad, recLen, int64(gapStart), lay.segSize, lay.sysID, lay.tli)
+			out, leading = emitWithPageHeaders(pad, recLen, int64(gapStart), lay.segSize, lay.sysID, lay.timeline())
 			if len(out) != gapLen {
 				return 0, false, fmt.Errorf("wal: emitSegmentPad: emitted %d bytes for gap [%d,%d) of %d",
 					len(out), gapStart, boundary, gapLen)
@@ -184,6 +187,17 @@ type padLayout struct {
 	segSize     int64
 	sysID       uint64
 	tli         uint32
+	// tliRef, when set, is the writer's live timeline (state.tli), which
+	// SwitchTimeline advances at promotion; it overrides tli.
+	tliRef *atomic.Uint32
+}
+
+// timeline is the TLI a pad's page headers carry.
+func (l padLayout) timeline() uint32 {
+	if l.tliRef != nil {
+		return l.tliRef.Load()
+	}
+	return l.tli
 }
 
 // pageHeaderBytesIn returns the number of page-header bytes emitWithPageHeaders

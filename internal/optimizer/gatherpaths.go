@@ -402,8 +402,11 @@ func (s *searchCtx) sortableEarlyMember(rel *RelOptInfo, u *pathkeyUsefulness, e
 		return nil, false
 	}
 	id := -1
-	for _, m := range u.ecMembers {
-		if exprEqual(m.expr, e) {
+	ke, oke := u.keyOf(e)
+	for i := range u.ecMembers {
+		m := &u.ecMembers[i]
+		mk, mok := u.memberKey(m)
+		if exprEqualKeyed(m.expr, mk, mok, e, ke, oke) {
 			id = m.id
 			break
 		}

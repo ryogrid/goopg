@@ -160,3 +160,138 @@ full `TestPort_Isolation*` run
 | reindex-schema | 2 |
 | read-only-anomaly-3 | 2 |
 | insert-conflict-specconflict | 2 |
+
+## Follow-up (2026-10-20, slice 2): the remaining waits report, and the cap becomes a hang guard
+
+Goroutine dumps were taken at the moment the cap fired, from the test
+server's pprof endpoint (`GOOPG_PPROF_ADDR`). Each remaining wait gained PG's
+event:
+
+| spec | goopg wait site | PG wait | event |
+|---|---|---|---|
+| intra-grant-inplace | `waitPgClassRowMarkReleased` (5 ms poll) | heap_inplace_lock → XactLockTableWait | Lock:transactionid |
+| tuplelock-upgrade-no-deadlock | `acquireTupleLock` (lock manager) | LockTuple → ProcSleep | Lock:tuple |
+| reindex-schema | `acquireReindexLocks` (lock manager) | LockRelationOid | Lock:relation |
+| insert-conflict-specconflict | `WaitForSpecToken` | SpeculativeInsertionWait | Lock:spectoken |
+| read-only-anomaly-3 | `waitForSafeSnapshot` | GetSafeSnapshot → ProcWaitForSignal | IPC:SafeSnapshot |
+
+Notes on the table:
+
+- **Tuple and REINDEX locks:** `TryAcquire` goes first and the event is
+  reported only on a real wait. TryAcquire keeps Acquire's FIFO rule, so the
+  grant order is unchanged.
+- **The probe:** `sessionWaitIsBlocking` now counts a step as blocked on a Lock
+  wait *or* IPC:SafeSnapshot. That is pg_isolation_test_session_is_blocked's
+  test (lockfuncs.c: the heavyweight lock graph plus
+  GetSafeSnapshotBlockingPids).
+
+**Cap fallbacks over the isolation family:** 31 → 6 after the reporting.
+Instrumenting with the spec path showed that the earlier per-test attribution
+had misassigned suite subtests: the "vacuum-skip-locked 14" belonged to
+interleaved specs. None of the remaining six steps waits in PG's expected
+output: they are COMMIT, ROLLBACK and CREATE steps that were merely slow, the
+false positive behind the nightly AlterTable1 failure.
+
+**The cap.** `blockProbeCap` is now a 60 s hang guard, a var so the unit test
+can shorten it, not a blocking rule. isolationtester bounds a stuck step only
+by max_step_wait (360 s). With the guard:
+
+- the first full-family run exposed the spectoken wait (two 60 s hits), which
+  was then reported;
+- the family passes in 563 s, against 606 s with the 1.5 s cap, with no test
+  slower by more than 5 s.
+
+Pins:
+
+- `TestSessionWaitIsBlockingMatchesIsolationTester` (the probe's verdict);
+- `TestAwaitStepOrBlockAsksTheProbe` (the guard, at a shortened cap);
+- `TestSnapshotWaitsReportVirtualXIDLock` (slice 1).
+
+## Follow-up (2026-10-21, AI-20261020-013101-005): a pending step is waited for, not given 5 s
+
+**Failure.** On the 2026-10-20 nightly, `TestPort_IsolationMultipleCic`
+printed `step s1i: <... timed out waiting>` and the same for `s2i`. Its
+teardown then failed with `driver: bad connection`, because the runner had
+cancelled both CREATE INDEX CONCURRENTLY steps and reused their connections.
+The spec passes alone in 2.0 s, and five runs at 2× CPU oversubscription took
+2.6–3.6 s. The failure fell in the same 01:45–01:53 window as the two
+cluster-start timeouts (`m-nightly-cluster-start-timeout-diagnostics.md`), so
+the host or the testport unit was slowed then.
+
+**Cause.** The runner gave each pending (reported `<waiting ...>`) step a 5 s
+window, `drainWindow`, then printed a goopg-only `<... timed out waiting>`
+line and cancelled the step. The window applied:
+
+- before its session's next step;
+- at the end of the permutation;
+- to its notice blockers;
+- to steps gated behind a blocker step.
+
+**PG.** isolationtester sets no such window. In run_permutation and
+try_complete_step, a waiting step is polled until it completes. Only after
+max_step_wait (360 s, or 2 × PG\_TEST\_TIMEOUT\_DEFAULT) does it cancel the
+step, and after twice that it exits.
+
+**Change.** `drainWindow` became `pendingStepGuard`, a 60 s hang guard, the
+same bound as `blockProbeCap`. It is a var so a test can shorten it. The
+cancel-and-reuse path behind the guard is unchanged.
+
+**Measured.** A temporary trace at every guard site over the full isolation
+family at HEAD found one hit: step `drop` of drop-index-concurrently-1, inside
+the shared-cluster `TestPort_IsolationSuite`. There, DROP INDEX CONCURRENTLY
+waits for other specs' transactions. The dedicated pass-required tests never
+reached the 5 s window. With the guard:
+
+- the family passes, 122/122, in 561.7 s (557.7 s before);
+- the suite subtest drop-index-concurrently-1 turns from a timed-out SKIP into
+  a PASS;
+- suite SKIPs fall from 84 to 79.
+
+**Pin.** `TestIsolationRunnerWaitsForSlowPendingStep` runs a goopg-local spec,
+`internal/testport/testdata/isolation/specs/slow-pending-step.spec`. Its
+expected output was captured from PG 18.3's isolationtester. In the spec, s2u
+waits on s1's row lock and completes 6 s later with a lock\_timeout error.
+With a 5 s guard the test fails exactly as the nightly did.
+
+## Follow-up (2026-10-22, AI-20261022-011400-001): global setup and teardown get a hang guard
+
+**Symptom.** The 2026-10-22 nightly (sha f39f376e9) timed out the whole testport package after go test's 2 h
+limit. Two specs had been blocked for 1h49m on the shared suite cluster:
+
+- `alter-table-1` in its global teardown (`RunSpec` → `execConn`);
+- `partial-index` in its global setup (`execConnSetupCapture`).
+
+The host was idle the whole time, so this was a wait, not a spin. Nothing recorded what either block was
+waiting on. Neither reproduces on demand:
+
+- both specs pass alone in 17 s;
+- `TestPort_IsolationSuite` passes in 127 s under the nightly's own cgroup (high=6G, max=8G, GOMEMLIMIT=5GiB);
+- the whole `TestPort_Isolation*` family passed in the gates of three successive commits.
+
+**Why the runner hung with it.** isolationtester runs global setup and teardown with a plain `PQexec` and no
+timeout. Its only bounds are on steps: `max_step_wait` cancels a step, and twice that exits. Upstream runs one
+spec at a time, so a stuck block hangs one spec. This suite runs every spec in parallel on one shared cluster,
+so a setup or teardown waiting on a lock held by another spec's session stalls the whole package.
+
+**Rule.**
+
+- **Each global setup and teardown block runs under `IsolationRunner.SetupTeardownGuard`.** The default is
+  `defaultSetupTeardownGuard`, 5 min. That is far above any real setup; upstream's die limit for a step is
+  720 s.
+- **On expiry, `runGuarded` snapshots the server first, then cancels the block.** `serverStateSnapshot` reads
+  `pg_stat_activity` (non-idle backends) and `pg_locks` over a fresh connection. Taking it before the cancel
+  means it shows the waiting block, and the spec's own sessions are still open, so a session holding the
+  blocking lock shows too.
+- **The spec fails with that snapshot in its error.** A teardown that merely errors is still ignored, as
+  isolationtester ignores it; only a teardown still running at the guard fails the spec.
+
+**Pin.** `TestIsolationRunnerGuardsBlockedTeardown`. The test's own connection holds an uncommitted UPDATE of
+the row that `guard-blocked-teardown.spec`'s teardown updates. With a 3 s guard, `RunSpec` returns after
+~3.2 s, and its error names the guarded teardown. The snapshot shows the teardown as `active | Lock |
+transactionid`, and the holder as `idle in transaction`. Ignoring the guard's expiry fails the test.
+
+**Found while pinning.** goopg's `pg_locks` lists no `transactionid` rows. PG would show the holder's
+ExclusiveLock on its own xid, granted, and the waiter's ShareLock on it, not granted (`XactLockTableWait`);
+goopg exposes the wait only through `pg_stat_activity.wait_event`. This is recorded in the deferral ledger. A
+`LOCK TABLE … IN ACCESS EXCLUSIVE MODE` held in an open transaction did not block another session's `DROP
+TABLE` in this test either, so the pin uses a row-lock wait.

@@ -517,6 +517,28 @@ func cloneRowOwned(src Row) Row {
 	return dst
 }
 
+// cloneRowOwnedLive is cloneRowOwned for a row only some of whose cells any
+// consumer will read: live marks them (a cell past len(live) is dead). Only
+// live cells are detached from the producer arena; dead ones are written as
+// NULL, or poisoned when the EX1-01 debug flag is armed. A Gather under a
+// consumer-complete aggregate ships its worker rows this way (M0122-0012
+// slice 39).
+func cloneRowOwnedLive(src Row, live []bool) Row {
+	dst := acquireRow(len(src))
+	dead := NullDatum
+	if seqScanDeformPoison {
+		dead = deformPoisonDatum()
+	}
+	for i, d := range src {
+		if i < len(live) && live[i] {
+			dst[i] = d.MaterializeArena()
+		} else {
+			dst[i] = dead
+		}
+	}
+	return dst
+}
+
 // cloneRowOwnedPrefix is cloneRowOwned for a row whose cells at and past
 // bound were never deformed (the seq scan's EX1-03a survivor window). Only
 // [0, bound) is detached from the producer arena. The tail holds the

@@ -719,7 +719,11 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			}
 			return nil
 		case chunk := <-chunkCh:
-			frame := libpq.EncodeWALData(chunk.StartLSN, chunk.EndLSN, time.Now().UTC(), chunk.Payload)
+			// The header's second field is this server's end of WAL
+			// (XLogSendPhysical sends SendRqstPtr, the flush position), not
+			// the chunk's end; the data's end is StartLSN+len.
+			walEnd := max(chunk.EndLSN, s.cfg.WAL.FlushedLSN())
+			frame := libpq.EncodeWALData(chunk.StartLSN, walEnd, time.Now().UTC(), chunk.Payload)
 			if err := w.WriteCopyData(frame); err != nil {
 				streamCancel()
 				return err

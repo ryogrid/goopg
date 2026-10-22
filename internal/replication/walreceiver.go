@@ -365,7 +365,7 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 	case libpq.ReplMsgWALData:
 		m := parsed.(*libpq.WALDataMessage)
 		if len(m.WALBytes) == 0 {
-			// Empty advance: just track endLSN.
+			// Empty advance: just track the sender's end of WAL.
 			r.mu.Lock()
 			if m.EndLSN > r.applyLSN {
 				r.applyLSN = m.EndLSN
@@ -374,36 +374,42 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 			r.publishProgress(m.EndLSN)
 			return nil
 		}
-		appendVerbatim := m.EndLSN > m.StartLSN && uint64(len(m.WALBytes)) == m.EndLSN-m.StartLSN
+		// Every XLogData message carries raw WAL stream bytes starting at
+		// StartLSN and ending at StartLSN+len(WALBytes). The second header
+		// field is the sender's current end of WAL ("The current end of WAL
+		// on the server", protocol-replication; XLogSendPhysical's
+		// SendRqstPtr), not the end of this message: a primary with more than
+		// MAX_SEND_SIZE (128 kB) to send ships frames whose walEnd lies past
+		// their data. This used to append only frames whose walEnd equalled
+		// start+len verbatim and Append the others as a NEW goopg record
+		// wrapping the primary's bytes — so during a PG primary's catch-up the
+		// local WAL diverged from the primary's, those bytes never replayed,
+		// and every later frame below the drifted position was trimmed as
+		// already present (M-NIGHTLY AI-20261021-010544-001: the standby never
+		// saw a committed row).
 		var end uint64
-		if appendVerbatim {
-			expectedStart := r.cfg.WAL.WrittenLSN()
-			payload := m.WALBytes
-			if m.StartLSN != 0 && m.StartLSN != expectedStart {
-				slog.Info("walreceiver WALData start mismatch",
-					"start_lsn", m.StartLSN,
-					"end_lsn", m.EndLSN,
-					"expected_start_lsn", expectedStart,
-					"bytes", len(m.WALBytes))
-				switch {
-				case m.StartLSN < expectedStart:
-					trim := expectedStart - m.StartLSN
-					if trim >= uint64(len(payload)) {
-						end = r.cfg.WAL.WrittenLSN()
-						break
-					}
-					payload = payload[int(trim):]
-				case m.StartLSN > expectedStart:
-					return fmt.Errorf("walreceiver: raw WAL gap: start_lsn=%d expected_start_lsn=%d end_lsn=%d", m.StartLSN, expectedStart, m.EndLSN)
+		expectedStart := r.cfg.WAL.WrittenLSN()
+		data := m.WALBytes
+		if m.StartLSN != 0 && m.StartLSN != expectedStart {
+			slog.Info("walreceiver WALData start mismatch",
+				"start_lsn", m.StartLSN,
+				"wal_end", m.EndLSN,
+				"expected_start_lsn", expectedStart,
+				"bytes", len(m.WALBytes))
+			switch {
+			case m.StartLSN < expectedStart:
+				trim := expectedStart - m.StartLSN
+				if trim >= uint64(len(data)) {
+					end = expectedStart
+					break
 				}
+				data = data[int(trim):]
+			case m.StartLSN > expectedStart:
+				return fmt.Errorf("walreceiver: raw WAL gap: start_lsn=%d expected_start_lsn=%d wal_end=%d", m.StartLSN, expectedStart, m.EndLSN)
 			}
-			if end == 0 && len(payload) > 0 {
-				_, end, err = r.cfg.WAL.AppendRaw(payload)
-			} else if end == 0 {
-				end = r.cfg.WAL.WrittenLSN()
-			}
-		} else {
-			_, end, err = r.cfg.WAL.Append(m.WALBytes)
+		}
+		if end == 0 {
+			_, end, err = r.cfg.WAL.AppendRaw(data)
 		}
 		if err != nil {
 			return fmt.Errorf("walreceiver: append local WAL: %w", err)
@@ -491,6 +497,23 @@ func (r *WalReceiver) Close() error {
 // buildStartReplicationCommand renders the wire-level command
 // string. Mirrors upstream's libpq walreceiver shape so a goopg
 // primary or upstream PostgreSQL primary parse it identically.
+// streamingStartLSN is the START_REPLICATION point for a local WAL whose next
+// byte is written: the start of that byte's segment, as PG's
+// RequestXLogStreaming rounds it ("We always start at the beginning of the
+// segment"). The request used to be written+1, goopg's record-start
+// convention; a PG walsender reads the LSN as a byte position and started
+// one byte past the local end, so every frame was a gap (and before the
+// XLogData walEnd fix the first frame hid it by being wrapped as a record).
+// A segment boundary is the same byte to both walsenders — goopg's
+// NewRecordIterator reads a boundary as itself — and the primary's re-sent
+// prefix up to written is trimmed on receipt (handleCopyData).
+func streamingStartLSN(written uint64, segSize int64) uint64 {
+	if segSize <= 0 {
+		segSize = xlog.DefaultSegmentSize
+	}
+	return written - written%uint64(segSize)
+}
+
 func buildStartReplicationCommand(slotName string, startLSN uint64) string {
 	if slotName != "" {
 		return fmt.Sprintf("START_REPLICATION SLOT %s PHYSICAL %s",
@@ -581,16 +604,12 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			if ctx.Err() != nil {
 				return
 			}
-			// StartLSN is the LSN of the next record's first byte —
-			// i.e., WrittenLSN+1 (one past the last byte already in
-			// our local WAL). Sending WrittenLSN itself would make the
-			// primary's iterator anchor inside the last-applied record
-			// and stream garbage.
+			startLSN := streamingStartLSN(cfg.WAL.WrittenLSN(), cfg.WAL.SegmentSize())
 			rec, err := DialWalReceiver(ctx, WalReceiverConfig{
 				PrimaryAddr:     addr,
 				User:            user,
 				SlotName:        slotName,
-				StartLSN:        cfg.WAL.WrittenLSN() + 1,
+				StartLSN:        startLSN,
 				WAL:             cfg.WAL,
 				StatusInterval:  statusInterval,
 				DialTimeout:     10 * time.Second,
@@ -621,7 +640,7 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			logger.Info("walreceiver connected",
 				"event", xlog.EventWalreceiverConnected,
 				"primary", addr, "slot", slotName,
-				"start_lsn", cfg.WAL.WrittenLSN()+1)
+				"start_lsn", startLSN, "written_lsn", cfg.WAL.WrittenLSN())
 			runErr := rec.Run(ctx)
 			lastApplied := rec.ApplyLSN()
 			_ = rec.Close()

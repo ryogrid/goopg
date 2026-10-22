@@ -54,19 +54,24 @@ const (
 	// blockProbePoll is how often a still-running step that is NOT in a lock
 	// wait is re-probed.
 	blockProbePoll = 50 * time.Millisecond
-	// blockProbeCap bounds how long a running step that never reports a lock
-	// wait is waited for before it is treated as blocked anyway — the
-	// pre-probe timing rule, kept as a fallback for any goopg wait path that
-	// does not report wait_event_type 'Lock'.
-	blockProbeCap = 1500 * time.Millisecond
 	// postStepDrainWait is how long we wait after a regular step completes for
 	// recently unblocked pending steps to either finish or emit follow-up
 	// notices before advancing to the next regular step.
 	postStepDrainWait = 200 * time.Millisecond
-	// drainWindow is how long we wait for a pending (blocked) step to
-	// unblock after all steps in a permutation have been submitted.
-	drainWindow = 5 * time.Second
 )
+
+// pendingStepGuard bounds how long the runner waits for a pending (reported
+// <waiting ...>) step to complete: before its session's next step, at the end
+// of the permutation, and for its notice blockers. It is a hang guard, not a
+// schedule: isolationtester waits on a waiting step until it completes and
+// only cancels it after max_step_wait (360 s, isolationtester.c
+// try_complete_step and run_permutation). It was a 5 s window, which reported
+// two CREATE INDEX CONCURRENTLY steps slowed by a loaded nightly host as
+// "<... timed out waiting>" and cancelled them (TestPort_IsolationMultipleCic,
+// M-NIGHTLY AI-20261020-013101-005); the dedicated isolation tests never
+// reach it. Same bound as blockProbeCap. A var so a unit test need not wait
+// it out.
+var pendingStepGuard = 60 * time.Second
 
 // oneResult holds the output of one SELECT-like statement within a step.
 type oneResult struct {
@@ -104,6 +109,93 @@ type pendingStep struct {
 // IsolationRunner executes an IsolationSpec against a live database.
 type IsolationRunner struct {
 	DSN string
+	// SetupTeardownGuard bounds one global setup or teardown block; zero
+	// means defaultSetupTeardownGuard. See setupTeardownGuard.
+	SetupTeardownGuard time.Duration
+}
+
+// defaultSetupTeardownGuard is the hang guard for a global setup or teardown
+// block (M-NIGHTLY AI-20261022-011400-001). isolationtester runs those with a
+// plain PQexec and no timeout, but it runs one spec at a time; the suite here
+// runs every spec in parallel on one shared cluster, so a setup or teardown
+// that waits forever (on a lock another spec's session holds) used to hang
+// the whole testport package until go test's 2 h timeout, with nothing to
+// say what it waited on. Past the guard the block is cancelled and the spec
+// fails with the server's pg_stat_activity and pg_locks at that moment. The
+// bound is far above any real setup: upstream's die limit for a step is
+// 2 * max_step_wait (720 s), and the slowest setup in the suite takes seconds.
+const defaultSetupTeardownGuard = 5 * time.Minute
+
+func (r *IsolationRunner) setupTeardownGuard() time.Duration {
+	if r.SetupTeardownGuard > 0 {
+		return r.SetupTeardownGuard
+	}
+	return defaultSetupTeardownGuard
+}
+
+// runGuarded runs fn under the setup/teardown guard. When the guard expires
+// it snapshots the server state FIRST — while the block is still waiting, so
+// the snapshot shows it and whatever it waits on — and only then cancels fn's
+// context. snapshot is empty when fn finished in time.
+func (r *IsolationRunner) runGuarded(ctx context.Context, db *sql.DB, fn func(context.Context)) (snapshot string, expired bool) {
+	gctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fired := make(chan struct{})
+	timer := time.AfterFunc(r.setupTeardownGuard(), func() {
+		snapshot = serverStateSnapshot(db)
+		cancel()
+		close(fired)
+	})
+	fn(gctx)
+	if timer.Stop() {
+		return "", false
+	}
+	<-fired
+	return snapshot, true
+}
+
+// serverStateSnapshot reports what the server's backends are doing and which
+// locks they hold or wait for, over a fresh connection — the evidence a
+// guard-expired setup or teardown needs. Errors are reported inline: the
+// snapshot is best effort and must not hide the guard failure itself.
+func serverStateSnapshot(db *sql.DB) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var b strings.Builder
+	for _, q := range []string{
+		"SELECT pid, state, wait_event_type, wait_event, left(query, 160) FROM pg_stat_activity WHERE state <> 'idle' ORDER BY pid",
+		"SELECT locktype, database, relation, mode, granted, pid FROM pg_locks ORDER BY granted, pid",
+	} {
+		fmt.Fprintf(&b, "-- %s\n", q)
+		rows, err := db.QueryContext(ctx, q)
+		if err != nil {
+			fmt.Fprintf(&b, "(%v)\n", err)
+			continue
+		}
+		cols, _ := rows.Columns()
+		vals := make([]sql.NullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				fmt.Fprintf(&b, "(%v)\n", err)
+				break
+			}
+			parts := make([]string, len(vals))
+			for i, v := range vals {
+				parts[i] = v.String
+				if !v.Valid {
+					parts[i] = "NULL"
+				}
+			}
+			b.WriteString(strings.Join(parts, " | "))
+			b.WriteByte('\n')
+		}
+		_ = rows.Close()
+	}
+	return b.String()
 }
 
 // RunSpec runs all permutations and returns output formatted like isolationtester.
@@ -193,7 +285,15 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 				if strings.TrimSpace(blk) == "" {
 					continue
 				}
-				out, errText := execConnSetupCapture(ctx, monitor, blk)
+				var out, errText string
+				snap, expired := r.runGuarded(ctx, db, func(gctx context.Context) {
+					out, errText = execConnSetupCapture(gctx, monitor, blk)
+				})
+				if expired {
+					_ = monitor.Close()
+					return "", fmt.Errorf("global setup (permutation %d) still running after the %s setup/teardown guard; server state:\n%s",
+						i, r.setupTeardownGuard(), snap)
+				}
 				if errText != "" {
 					_ = monitor.Close()
 					return "", fmt.Errorf("global setup (permutation %d): %s", i, errText)
@@ -214,11 +314,23 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		out, err := r.runPermutation(ctx, sc, spec, perm, permBlockers, setupResult)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
+		// A teardown error is ignored, as isolationtester ignores it ("don't
+		// exit on teardown failure"); a teardown still running past the guard
+		// fails the spec instead of hanging the suite.
 		if spec.TeardownSQL != "" {
 			monitor, _ := db.Conn(ctx)
 			if monitor != nil {
-				_ = execConn(ctx, monitor, spec.TeardownSQL)
+				snap, expired := r.runGuarded(ctx, db, func(tctx context.Context) {
+					_ = execConn(tctx, monitor, spec.TeardownSQL)
+				})
 				_ = monitor.Close()
+				if expired {
+					// This spec's sessions are still open (the deferred
+					// sc.close() runs after the return), so one holding the
+					// blocking lock shows in the snapshot.
+					return "", fmt.Errorf("global teardown (permutation %d) still running after the %s setup/teardown guard; server state:\n%s",
+						i, r.setupTeardownGuard(), snap)
+				}
 			}
 		}
 
@@ -392,14 +504,33 @@ func (sc *sessionConns) blockedProbe(ctx context.Context, session string) func()
 		return func() (bool, bool) { return false, false }
 	}
 	return func() (bool, bool) {
-		var waitType sql.NullString
+		var waitType, waitEvent sql.NullString
 		err := sc.sharedDB.QueryRowContext(ctx,
-			"SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE pid = $1", pid).Scan(&waitType)
+			"SELECT wait_event_type, wait_event FROM pg_catalog.pg_stat_activity WHERE pid = $1", pid).Scan(&waitType, &waitEvent)
 		if err != nil {
 			return false, false
 		}
-		return waitType.Valid && waitType.String == "Lock", true
+		return sessionWaitIsBlocking(waitType.String, waitEvent.String), true
 	}
+}
+
+// blockProbeCap bounds how long a running step that the probe never reports
+// as blocked is waited for before it is treated as blocked anyway. It is a
+// hang guard, not a blocking rule: isolationtester decides "waiting" from
+// pg_isolation_test_session_is_blocked alone and bounds a stuck step only by
+// max_step_wait (360 s, isolationtester.c). It was 1.5 s while goopg waits
+// reported no wait event, which labelled a merely slow step — a COMMIT on a
+// loaded host — <waiting ...> (M-NIGHTLY AI-20261020-013101-002); every wait
+// the isolation family parks in now reports PG's event. A var so the unit
+// test need not wait it out.
+var blockProbeCap = 60 * time.Second
+
+// sessionWaitIsBlocking is pg_isolation_test_session_is_blocked's test
+// (lockfuncs.c) over a backend's pg_stat_activity wait event: a heavyweight
+// lock wait, or a READ ONLY DEFERRABLE transaction waiting in GetSafeSnapshot
+// (GetSafeSnapshotBlockingPids), which waits as IPC:SafeSnapshot.
+func sessionWaitIsBlocking(waitType, waitEvent string) bool {
+	return waitType == "Lock" || (waitType == "IPC" && waitEvent == "SafeSnapshot")
 }
 
 // awaitStepOrBlock waits for a running step — just launched, or already
@@ -416,10 +547,10 @@ func (sc *sessionConns) blockedProbe(ctx context.Context, session string) func()
 // (run_permutation's STEP_NONBLOCK|STEP_RETRY pass): a step the later step
 // unblocked is waited for until it completes, rather than for a fixed window.
 // This mirrors that: after firstWait the probe decides, and a step that
-// is still running without a lock wait is re-probed every blockProbePoll. Past
-// blockProbeCap, or when the probe cannot run, the step is treated as blocked
-// (the timing rule this replaced), so a goopg wait path that reports no wait
-// event still surfaces, only later.
+// is still running without a lock wait is re-probed every blockProbePoll. When
+// the probe cannot run the step is treated as blocked at once (the timing rule
+// this replaced); past blockProbeCap, a hang guard, it is treated as blocked
+// too, so a wait path that reports no event cannot hang the run.
 func awaitStepOrBlock(outCh <-chan stepOutcome, firstWait time.Duration, probe func() (blocked, known bool)) (stepOutcome, bool) {
 	start := time.Now()
 	select {
@@ -665,7 +796,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 		// process one query at a time; running a second query on a busy
 		// connection would block indefinitely.
 		//
-		// When the drainWindow expires, we cancel the pending goroutine's
+		// When pendingStepGuard expires, we cancel the pending goroutine's
 		// context (causing conn.QueryContext to return) and drain the
 		// goroutine result before reusing the connection. Without this,
 		// sending the next step while the previous goroutine still holds
@@ -680,7 +811,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 					}
 					writeCompletedStep(&sb, p.name, p.sql, o)
 					pending = append(pending[:i], pending[i+1:]...)
-				case <-time.After(drainWindow):
+				case <-time.After(pendingStepGuard):
 					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 					// Cancel the goroutine's context so conn.QueryContext
 					// returns promptly (lib/pq sends a CancelRequest),
@@ -820,7 +951,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, 
 				outcome.notices = p.queue.drain()
 			}
 			writeCompletedStep(&sb, p.name, p.sql, outcome)
-		case <-time.After(drainWindow):
+		case <-time.After(pendingStepGuard):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 			if p.cancelFn != nil {
 				p.cancelFn()
@@ -894,13 +1025,13 @@ func blockersSatisfied(spec IsolationSpec, queues map[string]*sessionNoticeQueue
 }
 
 // waitForStepBlockers blocks until a step's completion blockers are satisfied
-// or drainWindow elapses, then returns. A no-op when the step has no blockers,
+// or pendingStepGuard elapses, then returns. A no-op when the step has no blockers,
 // so steps in the 21 already-passing specs are unaffected.
 func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQueue, blockers []StepBlocker, baselines map[string]int) {
 	if len(blockers) == 0 {
 		return
 	}
-	deadline := time.After(drainWindow)
+	deadline := time.After(pendingStepGuard)
 	for {
 		if blockersSatisfied(spec, queues, blockers, baselines) {
 			return
@@ -974,7 +1105,7 @@ func reportStepGatedOnBlockers(sb *strings.Builder, spec IsolationSpec, queues m
 					o.notices = p.queue.drain()
 				}
 				writeCompletedStep(sb, p.name, p.sql, o)
-			case <-time.After(drainWindow):
+			case <-time.After(pendingStepGuard):
 				fmt.Fprintf(sb, "step %s: <... timed out waiting>\n", p.name)
 				if p.cancelFn != nil {
 					p.cancelFn()

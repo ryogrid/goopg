@@ -73,6 +73,7 @@ const (
 	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
 	ExprConstVal           // constVal = a subtree folded to a value at build time
+	ExprCase               // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -97,10 +98,14 @@ type ExprNode struct {
 	childB  int32        // right child index; noExpr if none
 	payload [40]byte     // per-Kind inline data (see constants above)
 	orig    optimizer.Expr // non-nil only for ExprAdapter
-	// constVal is the folded value for ExprConstVal, and nil for every other
-	// kind. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
+	// constVal is the folded value for ExprConstVal; for an ExprBinaryOp
+	// comparison it is the bare literal operand coerced once to the kind in
+	// payload[17] (unknownLitCoercion, unknown_literal.go); nil otherwise. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
 	// a pointer costs 8 bytes on every node instead of growing payload by 48.
 	constVal *Datum
+	// caseInfo is the ExprCase node's arms (evalFastCase), nil for every
+	// other kind.
+	caseInfo *exprCaseInfo
 }
 
 // exprTreeSlab is the flat slice of ExprNode for a single statement.
@@ -265,6 +270,14 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		if isComparisonOpCode(t.Op) && exprIsCharacterString(t.Left) && exprIsCharacterString(t.Right) {
 			(*s)[idx].payload[16] |= 4
 		}
+		// constVal / payload[17]: a bare literal compared with a typed
+		// operand, coerced once here rather than per row by compareDatum
+		// (M0122-0012 slice 43; PG coerces the unknown literal at parse
+		// time). Applied by coerceUnknownLit in both evaluators.
+		if lit, kind, ok := unknownLitCoercion(t, (*s)[idx].payload[16]); ok {
+			(*s)[idx].constVal = &lit
+			(*s)[idx].payload[17] = uint8(kind)
+		}
 		// Bits 8 / 16: `||` resolved to textcat / jsonb_concat from the
 		// static operand types (M0146-0074; the interpreted twin calls
 		// concatModeOf directly).
@@ -282,6 +295,38 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 				(*s)[idx].payload[16] |= 128
 			}
 		}
+		return idx
+
+	case *optimizer.CaseExpr:
+		// M0122-0012 slice 47: CASE compiles, so a CASE inside an aggregate
+		// argument, a projection or a qual no longer flattens the slot into a
+		// Row and re-boxes it for every branch it evaluates (evalCaseExpr's
+		// path through evalExprSlot). A malformed arm keeps the adapter.
+		for _, w := range t.Whens {
+			if w.When == nil || w.Then == nil {
+				idx := int32(len(*s))
+				*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+				return idx
+			}
+		}
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprCase})
+		ci := &exprCaseInfo{operand: noExpr, els: noExpr}
+		if t.Operand != nil {
+			ci.operand = s.buildExprCtx(t.Operand, ctx)
+			ci.opBP = declaredBpcharTypmod(t.Operand)
+			ci.opLit = isBareStringLit(t.Operand)
+		}
+		for _, w := range t.Whens {
+			ci.whens = append(ci.whens, s.buildExprCtx(w.When, ctx))
+			ci.thens = append(ci.thens, s.buildExprCtx(w.Then, ctx))
+			ci.whenBP = append(ci.whenBP, declaredBpcharTypmod(w.When))
+			ci.whenLit = append(ci.whenLit, isBareStringLit(w.When))
+		}
+		if t.Else != nil {
+			ci.els = s.buildExprCtx(t.Else, ctx)
+		}
+		(*s)[idx].caseInfo = ci
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -462,11 +507,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		if n.constVal != nil {
+			coerceUnknownLit(n, &left, &right)
+		}
 		// The common shape is evaluated inline: the shared function's call
 		// cost was 14-26% of a per-row qual (M0122-0012 slice 7). When
 		// fastBinarySimple holds, every preamble branch of
 		// evalFastBinaryApply is a no-op, and what is left is exactly this.
 		if fastBinarySimple(n, op, &left, &right) {
+			// M0122-0012 slice 27: a comparison of two non-NULL values of
+			// one kind compares them in place (fastCompareDatum), skipping
+			// evalBinary's dispatch and compareDatum's cross-kind
+			// promotion — and, for date/timestamp, the time.Time each side
+			// was built into. Anything else takes evalBinary below.
+			if op.IsComparison() && !left.IsNull() && !right.IsNull() {
+				if c, ok := fastCompareDatum(&left, &right); ok {
+					return NewBoolDatum(cmpResult(op, c)), nil
+				}
+			}
 			result, err := evalBinary(op, left, right, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))), ctx)
 			if err != nil {
 				return Datum{}, err
@@ -494,6 +552,9 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 	case ExprAdapter:
 		return evalExprSlot(n.orig, slot, ctx)
 
+	case ExprCase:
+		return evalFastCase(exprs, n.caseInfo, slot, ctx)
+
 	default:
 		return Datum{}, fmt.Errorf("executor: evalFastExpr: unknown ExprKind %d at idx %d", n.Kind, idx)
 	}
@@ -507,6 +568,15 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Context, out *Datum) error {
 	var err error
 	left, right := *lp, *rp
+	// The batch evaluator reaches here without the per-row arm's
+	// coercion; once the literal is coerced, the comparison is the per-row
+	// arm's inline fastCompareDatum case.
+	if n.constVal != nil && coerceUnknownLit(n, &left, &right) && !left.IsNull() && !right.IsNull() {
+		if c, ok := fastCompareDatum(&left, &right); ok {
+			*out = NewBoolDatum(cmpResult(op, c))
+			return nil
+		}
+	}
 	// The compiled position (payload[4:8]), not a literal 0: every error
 	// these three helpers raise is stamped with it on the interpreted twin.
 	// M0127-PS6.2.
@@ -516,6 +586,26 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 			int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
 			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
 		return nil
+	}
+	// M0122-0012 slice 30: a comparison of two plain strings compares them
+	// in place. compareDatum's string arm sniffs values — pg_lsn shapes,
+	// UUIDs, row and array literals — before falling back to
+	// strings.Compare, and the pg_lsn check below runs first too; when
+	// neither string can match any sniff (plainCompareString) every one of
+	// those branches is skipped, so the result is strings.Compare of the
+	// bpchar-normalised operands, exactly what evalBinary would return.
+	// TPC-H Q10's `l_returnflag = 'R'` took the whole path per row.
+	if op.IsComparison() && left.Kind == KindString && right.Kind == KindString {
+		if ls, rs := left.StringValue(), right.StringValue(); plainCompareString(ls) && plainCompareString(rs) {
+			l, r := left, right
+			if lbp, rbp := int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])); lbp > 0 || rbp > 0 {
+				l, r = comparisonOperandsAsBpchar(op, l, r, lbp, rbp, n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+			}
+			if l.Kind == KindString && r.Kind == KindString {
+				*out = NewBoolDatum(cmpResult(op, strings.Compare(l.StringValue(), r.StringValue())))
+				return nil
+			}
+		}
 	}
 	// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 	if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
@@ -592,6 +682,57 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 func fastBinarySimple(n *ExprNode, op parser.OpCode, left, right *Datum) bool {
 	return n.payload[16]&4 == 0 && left.Kind != KindString && right.Kind != KindString &&
 		op != parser.OpConcat && binary.LittleEndian.Uint64(n.payload[8:16]) == 0
+}
+
+// plainCompareString reports that s can match none of the value sniffs a
+// string comparison makes (compareDatum's KindString arm and
+// evalFastBinaryApply's pg_lsn check): looksLikePgLSN needs a '/',
+// isValidUUIDStr accepts only 32, 36 or 38 bytes, and the row / array
+// comparisons need a leading '(' or '{'. Trimming trailing blanks (the bpchar
+// normalisation) cannot make a plain string unplain.
+func plainCompareString(s string) bool {
+	if len(s) >= 32 || strings.IndexByte(s, '/') >= 0 {
+		return false
+	}
+	return len(s) == 0 || (s[0] != '(' && s[0] != '{')
+}
+
+// fastCompareDatum is compareDatum for the kind pairs whose ordering is a
+// plain integer compare, or ok=false. Each arm is exactly the arm compareDatum
+// reaches for that pair:
+//   - int / int: promoteCrossKind leaves equal kinds alone, and the KindInt
+//     arm compares Int;
+//   - time / time, neither a timetz (Scale == 0): the KindTime arm compares
+//     the instants, and Int is the instant's UnixNano — the ±infinity
+//     sentinels sit at the int64 extremes, so they order the same way;
+//   - numeric / numeric, both on the int64 lane: numericCmp, as compareDatum
+//     calls it.
+func fastCompareDatum(a, b *Datum) (int, bool) {
+	if a.Kind != b.Kind {
+		return 0, false
+	}
+	switch a.Kind {
+	case KindInt:
+	case KindTime:
+		if a.Scale != 0 || b.Scale != 0 {
+			return 0, false
+		}
+	case KindNumeric:
+		if isBigNumeric(*a) || isBigNumeric(*b) {
+			return 0, false
+		}
+		c, err := numericCmp(*a, *b)
+		return c, err == nil
+	default:
+		return 0, false
+	}
+	switch {
+	case a.Int < b.Int:
+		return -1, true
+	case a.Int > b.Int:
+		return 1, true
+	}
+	return 0, true
 }
 
 // fastIntOverflow is the int2/int4 overflow check shared by the per-row
@@ -750,4 +891,62 @@ func foldedValuesIdentical(a, b Datum) bool {
 		return a.StringValue() == b.StringValue()
 	}
 	return true
+}
+
+// exprCaseInfo is a compiled CASE: the slab indices of its operand (noExpr
+// for the searched form), its WHEN/THEN pairs and its ELSE (noExpr when
+// absent), plus the declared-type facts the simple form's implicit `=` needs
+// — compiled here because evaluation only sees Datums (the same facts
+// evalCaseExpr reads from the expressions).
+type exprCaseInfo struct {
+	operand      int32
+	whens, thens []int32
+	els          int32
+	opBP         int64
+	opLit        bool
+	whenBP       []int64
+	whenLit      []bool
+}
+
+// evalFastCase is evalCaseExpr's compiled twin and must agree with it arm
+// for arm: the operand is evaluated once; each WHEN in order is a boolean
+// predicate (searched form) or `operand = WHEN` resolved through
+// comparisonOperandsAsBpchar and compareEq (simple form), a NULL or non-bool
+// result counting as no match; the first match's THEN is the result, else the
+// ELSE, else NULL. Only the matched THEN (or the ELSE) is evaluated.
+func evalFastCase(exprs exprTreeSlab, ci *exprCaseInfo, slot SlotView, ctx *Context) (Datum, error) {
+	var operand Datum
+	hasOperand := ci.operand != noExpr
+	if hasOperand {
+		v, err := evalFastExpr(exprs, ci.operand, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		operand = v
+	}
+	for i, w := range ci.whens {
+		whenVal, err := evalFastExpr(exprs, w, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		var matched bool
+		if hasOperand {
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, whenVal,
+				ci.opBP, ci.whenBP[i], ci.opLit, ci.whenLit[i])
+			eq, err := compareEq(o, vv)
+			if err != nil {
+				return Datum{}, err
+			}
+			matched = eq.Kind == KindBool && eq.BoolValue()
+		} else {
+			matched = whenVal.Kind == KindBool && whenVal.BoolValue()
+		}
+		if matched {
+			return evalFastExpr(exprs, ci.thens[i], slot, ctx)
+		}
+	}
+	if ci.els != noExpr {
+		return evalFastExpr(exprs, ci.els, slot, ctx)
+	}
+	return NullDatum, nil
 }

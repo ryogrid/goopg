@@ -1062,6 +1062,11 @@ type seqScanOp struct {
 	// stay full-width — only the deform window narrows, so bound ==
 	// len(cols) takes the exact pre-EX1-01 path. See scan_deform.go.
 	deformBound int
+	// readCols, when non-nil, is the set of columns any consumer of this scan's
+	// rows reads (M0122-0012 slice 19): Build sets it for a scan whose only
+	// reader is the non-identity Project above it. Open marks every other
+	// column in colInfo as skip, so the deform walks past it undecoded.
+	readCols []bool
 	// borrowRows is set at Build when the parent consumes every row before
 	// the next Next() and retains nothing of it (aggregateBorrowsScanRows):
 	// Next then yields scanRow itself instead of a per-tuple clone
@@ -1079,6 +1084,12 @@ type seqScanOp struct {
 	// TupleDesc equivalent. Re-resolved on every Open so an ALTER TABLE that
 	// re-resolves o.cols re-resolves this with it.
 	colInfo []colTypeInfo
+	// pfInfo is colInfo for the prefilter's first pass (M0122-0012 slice 25):
+	// every column in [0, prefilter.MaxCols) the qual does not read is marked
+	// skip, so a tuple the qual rejects is never decoded past its own columns.
+	// nil when nothing would be skipped. A survivor is then decoded from
+	// column 0 with colInfo, so a skipped cell never reaches a consumer.
+	pfInfo []colTypeInfo
 	// pfSlab / pfIdx are the COMPILED form of the prefilter predicate, built
 	// once in Open (where a *Context exists, which constant folding needs) and
 	// immutable after. Per-operator rather than shared: each parallel worker
@@ -1398,17 +1409,47 @@ func (o *seqScanOp) decodeScanRow(data, bitmap []byte, storedNatts int) error {
 	return err
 }
 
+// skipReadSet is the set of columns this scan's row must carry decoded, or
+// nil when every column must be (slice 19's walk-past declines). It is the
+// consumer's read set (readCols) plus, for a scan with an absorbed qual, the
+// qual's own columns (slice 29): the late qual reads the finished row. A
+// resolved GiST/GIN SSI hook (Open, before this is consulted) reads the row
+// too, and declines.
+func (o *seqScanOp) skipReadSet() []bool {
+	if o.readCols == nil || o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 {
+		return nil
+	}
+	if !o.qualSet {
+		return o.readCols
+	}
+	qr := deformScanReadSet(len(o.cols), o.qual)
+	if qr == nil {
+		return nil
+	}
+	read := make([]bool, len(o.cols))
+	for i := range read {
+		read[i] = qr[i] || (i < len(o.readCols) && o.readCols[i])
+	}
+	return read
+}
+
 // decodeScanRowRange is decodeScanRow over a column window, returning the byte
 // offset reached so the caller can resume. Used by the prefilter path in Next
 // to deform only the predicate's columns first; see scan_prefilter.go.
 func (o *seqScanOp) decodeScanRowRange(data, bitmap []byte, storedNatts, from, to, off int) (int, error) {
+	return o.decodeScanRowRangeInfo(o.colInfo, data, bitmap, storedNatts, from, to, off)
+}
+
+// decodeScanRowRangeInfo is decodeScanRowRange with an explicit column info
+// (the prefilter's skipping pfInfo, or colInfo).
+func (o *seqScanOp) decodeScanRowRangeInfo(info []colTypeInfo, data, bitmap []byte, storedNatts, from, to, off int) (int, error) {
 	// Mirror decodeScanRow's two arms exactly: the unstyled entry point is
 	// DefaultOutputStyle(), not a zero OutputStyle.
 	st := o.arrayStyle
 	if !o.arrayStyleLive {
 		st = array.DefaultOutputStyle()
 	}
-	return decodeRowRangeInfo(o.scanRow, o.cols, o.colInfo, data, bitmap, storedNatts, o.sctx, st, from, to, off)
+	return decodeRowRangeInfo(o.scanRow, o.cols, info, data, bitmap, storedNatts, o.sctx, st, from, to, off)
 }
 
 func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
@@ -1588,6 +1629,17 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			}
 		}
 	}
+	// Slice 19/29: walk past the columns nothing reads. Applied here, after
+	// the GiST/GIN SSI hooks are resolved: an absorbed Filter always sets
+	// ssiGistPred/ssiGinPred, but a hook reads the row only once its index
+	// OID resolved.
+	if read := o.skipReadSet(); read != nil {
+		for i := range o.colInfo {
+			if i < len(read) && !read[i] {
+				o.colInfo[i].skip = true
+			}
+		}
+	}
 	// Move the qual to the LATE position whenever a post-decode rewrite is
 	// live. Each of these mutates the row AFTER cloneRowOwned, so an EARLY
 	// evaluation would judge a tuple on values that differ from the ones the
@@ -1622,6 +1674,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 {
 			o.prefilterSet = false
 		}
+	}
+	o.pfInfo = nil
+	if o.prefilterSet && !scanSkipDisabled {
+		o.pfInfo = prefilterSkipInfo(o.colInfo, o.prefilter.MaxCols, o.qual)
 	}
 	// Compile the prefilter predicate into the existing ExprNode slab, with
 	// constant folding enabled by passing ctx. Rebuilt on every Open so a
@@ -2122,7 +2178,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// The partial row is handed to NOTHING but the predicate —
 				// entries at/past MaxCols still hold the previous tuple's
 				// values — so it must not escape this block.
-				off, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, 0, o.prefilter.MaxCols, 0)
+				info := o.colInfo
+				if o.pfInfo != nil {
+					info = o.pfInfo
+				}
+				off, derr := o.decodeScanRowRangeInfo(info, tuple.Data, tuple.Bitmap, storedNatts, 0, o.prefilter.MaxCols, 0)
 				if derr != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
@@ -2167,7 +2227,13 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					// excludes FuncCall, subqueries and params), so the
 					// discarded attempt cannot have had a side effect.
 				}
-				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, o.prefilter.MaxCols, survivorBound, off); derr != nil {
+				// A survivor of a skipping first pass is decoded again from
+				// column 0: its skipped cells must not reach a consumer.
+				from := o.prefilter.MaxCols
+				if o.pfInfo != nil {
+					from, off = 0, 0
+				}
+				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, from, survivorBound, off); derr != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
 					}
@@ -4607,7 +4673,7 @@ func tryApplyHOTUpdate(
 	// was all-visible, HOT or not — the new version's xmin is not yet visible
 	// to all, and an all-frozen bit would let VACUUM skip freezing it.
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
@@ -9730,7 +9796,7 @@ func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple)
 			}
 			// Clear VM: page was modified, no longer ALL_VISIBLE (M0046-0004).
 			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+				ctx.VM.ClearBlockNoWAL(rel, blk)
 			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -9886,7 +9952,7 @@ func placeHeapTuple(ctx *Context, rel storage.RelFileNode, pt preparedHeapTuple)
 	}
 	// New page starts dirty — not ALL_VISIBLE (M0046-0004).
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
@@ -9942,7 +10008,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 			}
 			if ctx.VM != nil {
-				ctx.VM.ClearBlock(rel, blk)
+				ctx.VM.ClearBlockNoWAL(rel, blk)
 			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -10053,7 +10119,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 	}
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
@@ -10189,7 +10255,7 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			ctx.FSM.RecordFreeSpaceForPage(rel, oldTID.Block, oldSlotBuf.Page())
 		}
 		if ctx.VM != nil {
-			ctx.VM.ClearBlock(rel, oldTID.Block)
+			ctx.VM.ClearBlockNoWAL(rel, oldTID.Block)
 		}
 		oldSlotBuf.Unlock()
 		ctx.Pool.Unpin(oldSlotBuf)
@@ -10312,8 +10378,8 @@ func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []cata
 			ctx.FSM.RecordFreeSpaceForPage(rel, newBlk, newBuf.Page())
 		}
 		if ctx.VM != nil {
-			ctx.VM.ClearBlock(rel, newBlk)
-			ctx.VM.ClearBlock(rel, oldTID.Block)
+			ctx.VM.ClearBlockNoWAL(rel, newBlk)
+			ctx.VM.ClearBlockNoWAL(rel, oldTID.Block)
 		}
 		unlockBoth()
 		if derr != nil {
@@ -10418,7 +10484,7 @@ func markHeapDeleteDirtyAndClearVM(
 		return err
 	}
 	if ctx.VM != nil {
-		ctx.VM.ClearBlock(rel, blk)
+		ctx.VM.ClearBlockNoWAL(rel, blk)
 	}
 	return nil
 }

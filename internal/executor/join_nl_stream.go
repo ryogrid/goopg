@@ -336,7 +336,7 @@ func (m *nlJoinStream) stepOuter() (Row, bool, error) {
 	row := slotRow(slot)
 	// The outer tuple is read once and revisited for every inner tuple, so it
 	// must survive the child's next step.
-	if rowHasArena(row) {
+	if rowHasArena(row) && !m.o.nlOuterBorrowed {
 		m.outerRow = cloneRowOwned(row)
 	} else {
 		m.outerRow = append(m.outerRow[:0], row...)
@@ -394,6 +394,11 @@ func (m *nlJoinStream) stepInner() (Row, bool, error) {
 	}
 	if m.fillInner {
 		m.markInner(j)
+	}
+	if m.o.nlEmitBorrowed {
+		// The lateral stream's sibling (stepInner): the consumer is done
+		// with this row before the next call rewrites m.pair.
+		return m.pair, true, nil
 	}
 	return cloneRow(m.pair), true, nil
 }

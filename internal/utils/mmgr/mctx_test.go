@@ -276,3 +276,49 @@ func TestZeroLengthAlloc(t *testing.T) {
 		t.Fatal("Bytes(0,0) should return nil")
 	}
 }
+
+// TestResetReusesChunks pins growChunk's reuse of chunks a Reset emptied. A
+// per-page scan arena that overflows one chunk on every page must keep a
+// bounded chunk list; before the fix it gained a chunk per cycle, so Reset
+// and every insertion walked an ever-longer list. Offsets handed out after the
+// reuse must still resolve to their bytes, including across an oversized
+// allocation, which takes a chunk of its own.
+func TestResetReusesChunks(t *testing.T) {
+	c := Acquire(nil, KindStmt)
+	defer c.Release()
+	payload := make([]byte, 700)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	var peak int
+	for cycle := 0; cycle < 50; cycle++ {
+		c.Reset()
+		type alloc struct{ off, n uint32 }
+		var got []alloc
+		for i := 0; i < 3*int(c.cs)/len(payload); i++ {
+			payload[0] = byte(cycle + i)
+			off, n := c.AllocBytes(payload)
+			got = append(got, alloc{off, n})
+		}
+		if cycle%10 == 0 {
+			big := make([]byte, int(c.cs)+100)
+			big[len(big)-1] = 0x5a
+			off, n := c.AllocBytes(big)
+			if b := c.Bytes(off, n); len(b) != len(big) || b[len(b)-1] != 0x5a {
+				t.Fatalf("cycle %d: oversized allocation does not resolve", cycle)
+			}
+		}
+		for i, a := range got {
+			b := c.Bytes(a.off, a.n)
+			if len(b) != len(payload) || b[0] != byte(cycle+i) || b[1] != 1 {
+				t.Fatalf("cycle %d alloc %d: offset %d does not resolve to its bytes", cycle, i, a.off)
+			}
+		}
+		if cycle == 1 {
+			peak = len(c.chunks)
+		}
+	}
+	if len(c.chunks) > peak+6 {
+		t.Fatalf("chunk list grew from %d to %d over 50 reset cycles", peak, len(c.chunks))
+	}
+}

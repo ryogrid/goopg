@@ -147,6 +147,10 @@ type Context struct {
 	subqCacheScoped *kvcache.Cache
 	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
 
+	// inListConsts holds each literal value-list IN's evaluated items for
+	// the statement (inListItems, expr.go).
+	inListConsts map[*optimizer.InExpr]*inListConst
+
 	// TriggerDepth is pg_trigger_depth(): the number of trigger invocations
 	// on the stack. executePLpgSQLTriggerBody gives its child context one
 	// more than its caller's (M0146-0080).
@@ -719,6 +723,12 @@ type Context struct {
 	// IsStandby reflects whether the server is currently acting as a hot
 	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
 	IsStandby bool
+
+	// RecoveryLSNs, when non-nil, reports the standby's WAL positions for
+	// pg_last_wal_receive_lsn (received from the primary) and
+	// pg_last_wal_replay_lsn (end of the last replayed record); 0 means none,
+	// which the functions return as NULL (xlogfuncs.c).
+	RecoveryLSNs func() (receive, replay uint64)
 
 	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
 	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
@@ -1430,7 +1440,21 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 		lockCtx = c.Ctx
 	}
 	tag := tupleLockTag(rel, ptr)
+	// LockTuple's ProcSleep shows as Lock:tuple in pg_stat_activity; report
+	// it only for an actual wait, so an uncontended row lock (the common case
+	// on this hot path) touches no wait-event state. TryAcquire keeps
+	// Acquire's FIFO rule, so trying first changes no grant order
+	// (M-NIGHTLY AI-20261020-013101-002, tuplelock-upgrade-no-deadlock).
+	if lm.TryAcquire(backend, tag, mode) == nil {
+		return nil
+	}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitTupleLock)
+	}
 	err := lm.AcquireWithTimeout(lockCtx, backend, tag, mode, timeout)
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
 	if err == nil {
 		return nil
 	}

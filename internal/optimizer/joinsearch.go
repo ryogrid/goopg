@@ -68,6 +68,11 @@ const maxSearchRels = 32
 // searchCtx is the join search's working state — the subset of PG's
 // PlannerInfo the search itself reads. One per join problem.
 type searchCtx struct {
+	// exprKeys memoises exprIdentityKey by expression node for the whole
+	// search; every rel's pathkeyUsefulness shares it (M0122-0012 slice 42).
+	// The search is single-goroutine and the clause and pathkey expressions
+	// it keys are not mutated in place during it.
+	exprKeys map[Expr]cachedKey
 	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
 	// search's evaluation counter, and whether this evaluation context's join
 	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.

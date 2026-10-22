@@ -158,16 +158,40 @@ func evalFilterBatch(pred optimizer.Expr, slots []*MaterializedSlot, ctx *Contex
 	if err := evalBinaryBatch(b.Op, left, right, out[:len(slots)]); err != nil {
 		return err
 	}
-	// Two character-string operands compare as text whatever the values
-	// look like — the same decision both BinaryOp twins make (M0146-0053).
-	if exprIsCharacterString(b.Left) && exprIsCharacterString(b.Right) {
-		lbp, rbp := declaredBpcharTypmod(b.Left), declaredBpcharTypmod(b.Right)
-		lLit, rLit := isBareStringLit(b.Left), isBareStringLit(b.Right)
-		for i := range slots {
-			if textShapeAmbiguous(left[i], right[i]) {
-				out[i] = binaryTextComparison(b.Op, left[i], right[i], lbp, rbp, lLit, rLit)
-			}
+	// A row whose string operands the per-row twins treat specially is
+	// re-evaluated by the interpreter, so the batch keeps exactly the rows
+	// evalExprSlot (and the compiled evaluator) keep. evalBinaryBatch alone
+	// compares the raw values, which misses three rules both twins apply
+	// first (M0122-0012 slice 40, found by
+	// TestFilterOpCompiledPredicateMatchesInterpreted):
+	//   - bpchar semantics: an operand declared char(n) — or a bare literal
+	//     opposite one — compares with trailing blanks stripped
+	//     (comparisonOperandsAsBpchar); 'ab' = 'ab  '::char(4) is true;
+	//   - two character-string operands of a sniffed shape compare as text
+	//     (binaryTextComparison, M0146-0053);
+	//   - a pg_lsn-shaped value takes the pg_lsn comparison.
+	// Rows with no string operand keep the batch result.
+	lbp, rbp := declaredBpcharTypmod(b.Left), declaredBpcharTypmod(b.Right)
+	lLit, rLit := isBareStringLit(b.Left), isBareStringLit(b.Right)
+	bpchar := lbp > 0 || rbp > 0
+	bothChar := exprIsCharacterString(b.Left) && exprIsCharacterString(b.Right)
+	for i, slot := range slots {
+		l, r := left[i], right[i]
+		if l.Kind != KindString && r.Kind != KindString {
+			continue
 		}
+		special := bpchar || ((lLit || rLit) && l.Kind == KindString && r.Kind == KindString) ||
+			(l.Kind == KindString && looksLikePgLSN(l.StringValue())) ||
+			(r.Kind == KindString && looksLikePgLSN(r.StringValue())) ||
+			(bothChar && textShapeAmbiguous(l, r))
+		if !special {
+			continue
+		}
+		v, err := evalExprSlot(pred, slot, ctx)
+		if err != nil {
+			return err
+		}
+		out[i] = v
 	}
 	return nil
 }

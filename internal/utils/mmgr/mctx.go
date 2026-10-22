@@ -329,8 +329,31 @@ func (c *Context) Release() {
 
 // growChunk adds a new chunk of size cs (or n if oversized) AFTER the
 // current head, preserving the small-chunk tail (mirrors Arena.Allocate).
+//
+// Every chunk after the head was emptied by a Reset (growth always moves the
+// head to the chunk it adds), so the next one is reused when it is a
+// standard-size chunk and n fits — as PG's AllocSetReset keeps its blocks
+// for the next cycle. Without this a per-page scan arena gained a chunk on
+// every page that overflowed one: its chunk list grew for the whole scan,
+// each Reset walked all of it, and each insertion shifted it (TPC-H Q13 spent
+// ~8 % there). An empty standard chunk further on is swapped into place, so an
+// oversized chunk left after the head does not block reuse. An oversized
+// chunk is never reused for a small allocation: a
+// second allocation in it could start past cs, which the chunkIdx*cs+start
+// offset encoding cannot express.
 func (c *Context) growChunk(n int) {
 	c.ensureLC()
+	if next := int(c.head) + 1; n <= int(c.cs) {
+		for j := next; j < len(c.chunks); j++ {
+			if b := c.chunks[j].buf; len(b) == 0 && cap(b) == int(c.cs) {
+				// Every chunk after the head is empty, so moving one
+				// changes no live offset.
+				c.chunks[next], c.chunks[j] = c.chunks[j], c.chunks[next]
+				c.head = int32(next)
+				return
+			}
+		}
+	}
 	var buf []byte
 	if n > int(c.cs) {
 		buf = make([]byte, 0, n)

@@ -75,6 +75,7 @@ HARNESS_SUFFIXES = (
     "scripts/tpch-ref-recover.sh",
     "scripts/lib/gate-stamp.sh",
     "scripts/tpcds-fireset-timeout-allow.tsv",
+    "scripts/lever-count.sh",
     "scripts/ralph-prev-loop-check.sh",
     ".git/config",
 )

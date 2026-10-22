@@ -148,9 +148,10 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	waitForPhysicalStreaming(t, primary, standby, slotName, mode.exact, 45*time.Second)
 
 	primary.Exec(t, "INSERT INTO public.bench_log (client, src) VALUES (-999, 'bootstrap')")
+	bootLSN := primary.QueryScalar(t, "SELECT pg_current_wal_lsn()")
 	waitForGoopgCount(t, standby,
 		"SELECT count(*) FROM public.bench_log WHERE client = -999",
-		1, 30*time.Second)
+		1, 30*time.Second, func() string { return walProgressDiagnostics(primary, standby, bootLSN) })
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable",
 		primary.Host(), primary.Port(), primary.User(), primary.Database())
@@ -258,6 +259,7 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"INSERT INTO public.bench_log (client, src) VALUES (-1, 'post')"); err != nil {
 		t.Fatalf("post-failover insert: %v", err)
 	}
+	checkPromotedTimelineWAL(t, standby.DataDir())
 
 	preCount := goopgCount(t, standby,
 		"SELECT count(*) FROM public.bench_log WHERE src = 'pre'")
@@ -282,6 +284,40 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := goopgScalar(t, standby,
 		"SELECT src FROM public.bench_log WHERE client = -1"); got != "post" {
 		t.Fatalf("post-failover row src=%q want post", got)
+	}
+}
+
+// checkPromotedTimelineWAL reads the promoted standby's new timeline with
+// PG 18.3's pg_waldump from the switch point its history file records. The
+// first record must be XLOG_END_OF_RECOVERY naming both timelines, as
+// CreateEndOfRecoveryRecord writes it, and the records after it (the
+// post-promotion insert) must decode: the writer switched timelines at once
+// (Writer.SwitchTimeline) instead of writing TLI-1 WAL until a restart.
+func checkPromotedTimelineWAL(t *testing.T, dataDir string) {
+	t.Helper()
+	waldump := clientToolBin(t, "pg_waldump")
+	if waldump == "" {
+		t.Log("pg_waldump not found; skipping the new-timeline WAL check")
+		return
+	}
+	walDir := filepath.Join(dataDir, "pg_wal")
+	hist, err := xlog.ReadHistory(walDir, 2)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("read 00000002.history: %v (entries %v)", err, hist)
+	}
+	sw := hist[len(hist)-1].SwitchLSN
+	start := fmt.Sprintf("%X/%X", sw>>32, uint32(sw))
+	out, err := exec.Command(waldump, "--path", walDir, "--timeline", "2", "--start", start, "--limit", "3").CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_waldump --timeline 2 --start %s: %v\n%s", start, err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 3 || !strings.Contains(lines[0], "desc: END_OF_RECOVERY tli 2; prev tli 1;") {
+		t.Fatalf("new timeline's WAL from %s, want END_OF_RECOVERY first and two more records:\n%s", start, out)
+	}
+	// pg_waldump prints LSNs as %X/%08X (PG 18 LSN_FORMAT_ARGS).
+	if !strings.Contains(lines[0], fmt.Sprintf("lsn: %X/%08X,", sw>>32, uint32(sw))) {
+		t.Errorf("END_OF_RECOVERY is not at the switch point %s:\n%s", start, lines[0])
 	}
 }
 
@@ -384,7 +420,7 @@ func waitForPhysicalStreaming(t *testing.T, primary *pgcluster.Cluster, standby 
 	t.Fatalf("physical replication did not reach streaming state within %s (requireSync=%v)", timeout, requireSync)
 }
 
-func waitForGoopgCount(t *testing.T, c *cluster.Cluster, query string, wantAtLeast int64, timeout time.Duration) {
+func waitForGoopgCount(t *testing.T, c *cluster.Cluster, query string, wantAtLeast int64, timeout time.Duration, extra ...func() string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var (
@@ -404,8 +440,59 @@ func waitForGoopgCount(t *testing.T, c *cluster.Cluster, query string, wantAtLea
 		t.Fatalf("query did not reach count >= %d within %s: %s (last count=%d last err=%v)",
 			wantAtLeast, timeout, query, lastCount, lastErr)
 	}
-	t.Fatalf("query did not reach count >= %d within %s: %s (last count=%d%s)",
-		wantAtLeast, timeout, query, lastCount, benchLogDiagnostics(c, query))
+	more := ""
+	for _, f := range extra {
+		more += f()
+	}
+	t.Fatalf("query did not reach count >= %d within %s: %s (last count=%d%s%s)",
+		wantAtLeast, timeout, query, lastCount, benchLogDiagnostics(c, query), more)
+}
+
+// walProgressDiagnostics places a row the standby never showed on the WAL
+// stream: the primary's WAL position right after the row's commit
+// (wantLSN), what the primary's walsender reports sending and the standby
+// confirming (pg_stat_replication), and what the standby received and
+// replayed. sent < wantLSN means the row was never shipped; receive >=
+// wantLSN > replay means it arrived but was not replayed; replay >= wantLSN
+// means it was replayed but is not visible. Added for
+// AI-20261021-010544-001, whose failure carried only "streaming" and an
+// empty heap file (which pages still in the buffer pool also show).
+// Best-effort: every failed probe degrades to its error text.
+func walProgressDiagnostics(primary *pgcluster.Cluster, standby *cluster.Cluster, wantLSN string) string {
+	ctx := context.Background()
+	out := fmt.Sprintf(" want_lsn=%s", wantLSN)
+	if db, err := primary.OpenDB(); err != nil {
+		out += fmt.Sprintf(" primary_err=%v", err)
+	} else {
+		var cur string
+		if err := db.QueryRowContext(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&cur); err != nil {
+			out += fmt.Sprintf(" primary_lsn_err=%v", err)
+		} else {
+			out += " primary_lsn=" + cur
+		}
+		rows, err := db.QueryContext(ctx, `SELECT application_name, state, coalesce(sent_lsn::text, ''),
+			coalesce(write_lsn::text, ''), coalesce(flush_lsn::text, ''), coalesce(replay_lsn::text, '')
+			FROM pg_stat_replication`)
+		if err != nil {
+			out += fmt.Sprintf(" pg_stat_replication_err=%v", err)
+		} else {
+			for rows.Next() {
+				var app, state, sent, write, flush, replay string
+				if err := rows.Scan(&app, &state, &sent, &write, &flush, &replay); err == nil {
+					out += fmt.Sprintf(" walsender[%s %s sent=%s write=%s flush=%s replay=%s]", app, state, sent, write, flush, replay)
+				}
+			}
+			rows.Close()
+		}
+		_ = db.Close()
+	}
+	if rows, err := standby.Query(ctx,
+		"SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), pg_is_in_recovery()"); err != nil {
+		out += fmt.Sprintf(" standby_lsn_err=%v", err)
+	} else if len(rows) > 0 {
+		out += fmt.Sprintf(" standby_receive_replay_recovery=%v", rows[0])
+	}
+	return out
 }
 
 func goopgCount(t *testing.T, c *cluster.Cluster, query string) int64 {

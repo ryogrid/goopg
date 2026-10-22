@@ -77,6 +77,8 @@ base = plan(ROOT)
 case("B: new M0142 task without Parent -> violation", base, base + task("M0142-0020"), "B")
 case("B: new P0- task without Parent -> violation", base, base + task("P0-E4"), "B")
 case("B: new M0143 task with Parent: none -> ok", base, base + task("M0143-0009", parent="none"), None)
+case("B: new M0147 task without Parent -> violation", base, base + task("M0147-0010"), "B")
+case("B: new M0148 task without Parent -> ok (outside the range)", base, base + task("M0148-0001"), None)
 case("B: new M0136 (out of range) without Parent -> ok", base, base + task("M0136-0100"), None)
 case("B: new M0145 task without Parent -> violation", base, base + task("M0145-0009"), "B")
 case("B: new M0146 task without Parent -> violation", base, base + task("M0146-0001"), "B")
@@ -183,6 +185,10 @@ case("D: Movement: yes citing ea-ratchet -> ok", base,
      base + "- [x] **M0142-0053 — t**\n  Parent: M0142-0008\n  Movement: yes — ea-ratchet 140 -> 131 nodes\n", None)
 case("D: Movement: yes citing a regress diff count -> ok", base,
      base + "- [x] **M0142-0054 — t**\n  Parent: M0142-0008\n  Movement: yes — regress join 14931 -> 14876\n", None)
+case("D: Movement: yes citing lever-count with a number -> ok", base,
+     base + "- [x] **M0142-0056 — t**\n  Parent: M0142-0008\n  Movement: yes — lever-count 34→33 (census 22/22·99/99·99/99 held)\n", None)
+case("D: Movement: yes citing lever-count without a number -> violation", base,
+     base + "- [x] **M0142-0057 — t**\n  Parent: M0142-0008\n  Movement: yes — lever-count went down\n", "D")
 case("D: Movement: yes citing regress without a number -> violation", base,
      base + "- [x] **M0142-0055 — t**\n  Parent: M0142-0008\n  Movement: yes — regress subselect A/B clean\n", "D")
 case("D: Movement: yes naming an instrument but no number -> violation", base,

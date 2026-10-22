@@ -40,8 +40,13 @@ func TestAggregateBorrowsScanRowsWhitelist(t *testing.T) {
 // Datum.Int, which is meaningless for text and numeric cells).
 func sortedRowValues(t *testing.T, ctx *Context, sql string) []string {
 	t.Helper()
+	return sortedCells(runSQL(t, ctx, sql))
+}
+
+// sortedCells renders rows as comma-joined text cells, sorted.
+func sortedCells(rows []Row) []string {
 	var out []string
-	for _, r := range runSQL(t, ctx, sql) {
+	for _, r := range rows {
 		cells := make([]string, len(r))
 		for i, d := range r {
 			if d.IsNull() {
@@ -111,5 +116,475 @@ func TestScanBorrowMatchesClonedResults(t *testing.T) {
 			t.Fatalf("%s:\nborrowed %v\ncloned   %v", q, got, want)
 		}
 		t.Log(fmt.Sprintf("%s -> %d rows", q, len(got)))
+	}
+}
+
+// borrowedScanTables walks a built tree through the operators that carry
+// rows and returns the tables whose seq scan borrows.
+func borrowedScanTables(op Operator) []string {
+	var out []string
+	var walk func(Operator)
+	walk = func(cur Operator) {
+		switch o := cur.(type) {
+		case nil:
+		case *instrumentedOp:
+			walk(o.inner)
+		case *seqScanOp:
+			if o.borrowRows && o.tbl != nil {
+				out = append(out, o.tbl.Name)
+			}
+		case *aggregateOp:
+			walk(o.child)
+		case *projectOp:
+			walk(o.child)
+		case *sortOp:
+			walk(o.child)
+		case *joinOp:
+			walk(o.left)
+			walk(o.right)
+		case *nestedLoopIndexJoinOp:
+			walk(o.outer)
+		}
+	}
+	walk(op)
+	sort.Strings(out)
+	return out
+}
+
+// TestScanBorrowThroughHashJoinProbe extends the borrow to TPC-H Q17's shape,
+// Aggregate → Hash Join → Project → Seq Scan (markScanBorrowChain): the probe
+// side's scan hands up its reused row through the join and the Projects; the
+// build side's scan borrows too, as a root of its own: the build loop copies
+// every row it keeps (joinBorrowBuildChild, slice 23). With tail poison
+// armed, group keys and min/max taken from probe rows must survive every
+// page's arena reset, the join filter must read the right row, and every
+// result must equal the cloning path's.
+func TestScanBorrowThroughHashJoinProbe(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text, lim int)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, 'dim-' || x, x * 100 FROM generate_series(0, 49) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	queries := []string{
+		"SELECT sum(bp.n), count(*), max(bp.s) FROM bp JOIN bd ON bp.k = bd.k",
+		"SELECT bd.label, min(bp.s), max(bp.s), sum(bp.i) FROM bp JOIN bd ON bp.k = bd.k GROUP BY bd.label",
+		"SELECT bp.k, count(*), min(bp.s) FROM bp JOIN bd ON bp.k = bd.k WHERE bp.i < bd.lim GROUP BY bp.k",
+		"SELECT count(*), max(bp.s) FROM bp WHERE EXISTS (SELECT 1 FROM bd WHERE bd.k = bp.k AND bd.lim > 2000)",
+	}
+	for _, q := range queries {
+		plan, err := testPlanDeform(t, ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+			t.Fatalf("%s: borrowing scans %v, want the probe side bp and the build side bd\n%#v", q, got, plan)
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := sortedRowValues(t, ctx, q)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := sortedRowValues(t, ctx, q)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s:\nborrowed %v\ncloned   %v", q, got, want)
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", q)
+		}
+	}
+}
+
+// hashJoins lists the hash joins in a built tree.
+func hashJoins(op Operator) []*joinOp {
+	var out []*joinOp
+	var walk func(Operator)
+	walk = func(cur Operator) {
+		switch o := cur.(type) {
+		case *instrumentedOp:
+			walk(o.inner)
+		case *aggregateOp:
+			walk(o.child)
+		case *projectOp:
+			walk(o.child)
+		case *sortOp:
+			walk(o.child)
+		case *joinOp:
+			if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoHash {
+				out = append(out, o)
+			}
+			walk(o.left)
+			walk(o.right)
+		}
+	}
+	walk(op)
+	return out
+}
+
+// TestScanBorrowThroughOuterHashJoinProbe extends the borrow to TPC-H Q13's
+// shape, Aggregate → Hash Right Join → Seq Scan: a RIGHT or FULL hash join
+// streams its probe rows like an inner one, and the sweep after the
+// last probe row emits build rows (null-extended on the probe side) only. bd
+// has keys bp lacks, so the sweep emits rows; bp has keys bd lacks, so the
+// FULL join null-extends probe rows too. (RIGHT SEMI / RIGHT ANTI never emit
+// a probe row at all.) The build side bd borrows as its own root. goopg never plans a FULL hash join
+// (deferral ledger M0134-0037), so the FULL case retypes the planned RIGHT
+// join; both orientations are the same runtime (join_outer_fill.go). With
+// tail poison armed every result must equal the cloning path's.
+func TestScanBorrowThroughOuterHashJoinProbe(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, 'dim-' || x FROM generate_series(10, 69) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	const rightSQL = "SELECT bd.label, bp.k, count(bp.i), max(bp.s), sum(bp.n) FROM bd LEFT JOIN bp ON bp.k = bd.k AND bp.s NOT LIKE '%B%' GROUP BY bd.label, bp.k"
+	run := func(plan optimizer.Node) []string {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := Run(op, ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sortedCells(rows)
+	}
+	for _, c := range []struct {
+		name, sql string
+		planned   optimizer.JoinType
+		runAs     optimizer.JoinType
+	}{
+		{"right", rightSQL, optimizer.JoinTypeRight, optimizer.JoinTypeRight},
+		{"full", rightSQL, optimizer.JoinTypeRight, optimizer.JoinTypeFull},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			plan, err := testPlanDeform(t, ctx, c.sql)
+			if err != nil {
+				t.Fatalf("%s: %v", c.sql, err)
+			}
+			op := mustBuildDeform(t, plan)
+			joins := hashJoins(op)
+			if len(joins) != 1 || joins[0].plan.Type != c.planned {
+				t.Fatalf("%s: %d hash joins, want one %v", c.sql, len(joins), c.planned)
+			}
+			joins[0].plan.Type = c.runAs // shared with plan: later builds see it
+			if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+				t.Fatalf("%s: borrowing scans %v, want the probe side bp and the build side bd", c.sql, got)
+			}
+			old := seqScanDeformPoison
+			seqScanDeformPoison = true
+			got := run(plan)
+			seqScanDeformPoison = old
+			scanBorrowDisabled = true
+			want := run(plan)
+			scanBorrowDisabled = false
+			if strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("%s:\nborrowed %v\ncloned   %v", c.sql, got, want)
+			}
+			if len(got) == 0 {
+				t.Fatalf("%s: no rows", c.sql)
+			}
+			if c.runAs == optimizer.JoinTypeFull && !strings.Contains(strings.Join(got, "|"), "NULL,") {
+				t.Fatalf("%s as FULL: no null-extended probe row in %v", c.sql, got)
+			}
+		})
+	}
+}
+
+// TestScanBorrowBuildSideAndGatherWorkers pins the two borrow roots that do
+// not need a borrowing aggregate above them (slice 23):
+//   - a hash join's build side (joinBorrowBuildChild): the build loop copies
+//     every row it keeps, so its scan borrows whatever sits above the join
+//     (and, since slice 48, a Sort is a borrow root of its own — it
+//     materialises each row it keeps — so the probe side borrows here too);
+//   - a Gather worker's tree (gatherOp.runWorker): each row is copied by
+//     transferRowForQueue before the next is pulled.
+//
+// Both tables span many pages with text in the per-page arena, so a row kept
+// past its page's reset would read stale bytes; tail poison is armed. Every
+// result must equal the cloning path's. Making retainBuildRow keep its input
+// uncopied fails the serial case. The leader-tree rule (gatherOp.borrowLeader:
+// the leader's rows pass through Gather uncopied, so its tree borrows only
+// under a borrowing chain) is defensive and not witnessed here: the Sort above
+// this Gather materialises every row it keeps.
+func TestScanBorrowBuildSideAndGatherWorkers(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bp (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bp SELECT x % 700, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bd SELECT x, repeat(chr(97 + x % 26), 30 + x % 50) || '-' || x FROM generate_series(0, 1999) x")
+	runSQL(t, ctx, "ANALYZE bp")
+	runSQL(t, ctx, "ANALYZE bd")
+	const q = "SELECT bd.label, bp.s, bp.n FROM bp JOIN bd ON bp.k = bd.k ORDER BY 1, 2"
+	// Keep the serial build loop: the cooperative parallel build rebuilds the
+	// build subtree in its own producers (parallelBuildEligible), so the
+	// borrowing scan of this tree would never run.
+	ctx.MinParallelTableScanBlocks = 1 << 40
+
+	plan, err := testPlanDeform(t, ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := mustBuildDeform(t, plan)
+	joins := hashJoins(op)
+	if len(joins) != 1 {
+		t.Fatalf("want one hash join, got %d", len(joins))
+	}
+	// The build side borrows as a root of its own; since M0122-0012 slice 48
+	// the Sort is a borrow root too, so the probe side borrows through the
+	// join as well.
+	if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+		t.Fatalf("borrowing scans %v, want the build side and, under the Sort, the probe side", got)
+	}
+
+	run := func(gathered bool) []string {
+		t.Helper()
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		defer func() { seqScanDeformPoison = old }()
+		if gathered {
+			rows, ok := runJoinGathered(t, ctx, q, 3)
+			if !ok {
+				t.Fatal("no Gather in the plan")
+			}
+			return rows
+		}
+		return renderRows(runSQL(t, ctx, q))
+	}
+	for _, gathered := range []bool{false, true} {
+		got := run(gathered)
+		scanBorrowDisabled = true
+		want := run(gathered)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("gathered=%v: borrowed and cloned results differ (%d vs %d rows)", gathered, len(got), len(want))
+		}
+		if len(got) == 0 {
+			t.Fatalf("gathered=%v: no rows", gathered)
+		}
+	}
+}
+
+// TestScanBorrowThroughNestedLoopOuter extends the borrow to TPC-H Q3's
+// shape: a nested loop whose outer is a filtered scan, under a borrowing
+// aggregate — the parameterised NestedLoopIndexJoin and the streaming
+// nested-loop joinOp (plain and LATERAL), whose stepOuter then keeps the
+// outer row by a shallow copy (nlOuterBorrowed). The loop keeps the outer row
+// while it drains the inner probe for it, so the outer scan hands up its
+// reused row; the outer table spans many pages with text and big numerics in
+// the per-page arena and every outer row has several inner matches, so a value
+// read after its page's reset would show. With tail poison armed every result
+// must equal the cloning path's.
+func TestScanBorrowThroughNestedLoopOuter(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE no (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO no SELECT x % 997, repeat(chr(65 + x % 26), 30 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE ni (k int, v int, label text)")
+	runSQL(t, ctx, "INSERT INTO ni SELECT x % 997, x, 'lbl-' || x FROM generate_series(1, 40000) x")
+	runSQL(t, ctx, "CREATE INDEX ni_k ON ni (k)")
+	runSQL(t, ctx, "ANALYZE no")
+	runSQL(t, ctx, "ANALYZE ni")
+	for _, q := range []string{
+		"SELECT max(no.s), sum(no.n), count(*), sum(ni.v) FROM no JOIN ni ON ni.k = no.k WHERE no.i % 200 = 7",
+		"SELECT no.k, max(no.s), count(*) FROM no JOIN ni ON ni.k = no.k WHERE no.i % 200 = 7 GROUP BY no.k",
+		"SELECT max(no.s), count(*) FROM no LEFT JOIN ni ON ni.k = no.k AND ni.v < 3000 WHERE no.i % 200 = 7",
+		// Streaming nested loops (joinOp, slice 28): a non-equi join cannot
+		// hash, and a LATERAL subquery re-opens its inner per outer row.
+		"SELECT max(no.s), sum(no.n), count(*) FROM no JOIN ni ON ni.v BETWEEN no.i AND no.i + 2 WHERE no.i % 200 = 7",
+		"SELECT max(no.s), count(*), sum(l.v) FROM no, LATERAL (SELECT ni.v FROM ni WHERE ni.k = no.k ORDER BY ni.v LIMIT 2) l WHERE no.i % 200 = 7",
+	} {
+		plan, err := testPlanDeform(t, ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if !hasNestedLoop(op) {
+			t.Fatalf("%s: no nested loop in the plan; nothing is exercised", q)
+		}
+		outer := nestedLoopOuterScan(op)
+		if outer == nil || !outer.borrowRows {
+			t.Fatalf("%s: the nested loop's outer scan does not borrow (borrowing: %v)", q, borrowedScanTables(op))
+		}
+		// M0122-0012 slice 37: a streaming nested loop on the borrowed
+		// chain emits its reused pair buffer instead of a clone per row.
+		for _, j := range streamingNestedLoops(op) {
+			if !j.nlEmitBorrowed {
+				t.Fatalf("%s: a streaming nested loop on the borrow chain still clones every emitted row", q)
+			}
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := sortedRowValues(t, ctx, q)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := sortedRowValues(t, ctx, q)
+		scanBorrowDisabled = false
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s:\nborrowed %v\ncloned   %v", q, got, want)
+		}
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", q)
+		}
+	}
+}
+
+// streamingNestedLoops returns the nested-loop joinOps on a built tree's
+// row-carrying path (the shapes markScanBorrowChain descends through).
+func streamingNestedLoops(op Operator) []*joinOp {
+	switch o := op.(type) {
+	case *instrumentedOp:
+		return streamingNestedLoops(o.inner)
+	case *aggregateOp:
+		return streamingNestedLoops(o.child)
+	case *projectOp:
+		return streamingNestedLoops(o.child)
+	case *joinOp:
+		if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			return append([]*joinOp{o}, streamingNestedLoops(o.left)...)
+		}
+	}
+	return nil
+}
+
+// hasNestedLoop reports whether a built tree holds a nested loop — a
+// parameterised NestedLoopIndexJoin or a streaming nested-loop joinOp — on its
+// row-carrying path.
+func hasNestedLoop(op Operator) bool {
+	switch o := op.(type) {
+	case *instrumentedOp:
+		return hasNestedLoop(o.inner)
+	case *nestedLoopIndexJoinOp:
+		return true
+	case *aggregateOp:
+		return hasNestedLoop(o.child)
+	case *projectOp:
+		return hasNestedLoop(o.child)
+	case *sortOp:
+		return hasNestedLoop(o.child)
+	case *joinOp:
+		if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+			return true
+		}
+		return hasNestedLoop(o.left) || hasNestedLoop(o.right)
+	}
+	return false
+}
+
+// nestedLoopOuterScan returns the seq scan feeding the first nested loop's
+// outer side through Projects, or nil.
+func nestedLoopOuterScan(op Operator) *seqScanOp {
+	var outer Operator
+	var find func(Operator) bool
+	find = func(cur Operator) bool {
+		switch o := cur.(type) {
+		case *instrumentedOp:
+			return find(o.inner)
+		case *nestedLoopIndexJoinOp:
+			outer = o.outer
+			return true
+		case *aggregateOp:
+			return find(o.child)
+		case *projectOp:
+			return find(o.child)
+		case *sortOp:
+			return find(o.child)
+		case *joinOp:
+			if o.plan != nil && o.plan.Algo == optimizer.JoinAlgoNestedLoop {
+				outer = o.left
+				return true
+			}
+			return find(o.left) || find(o.right)
+		}
+		return false
+	}
+	if !find(op) {
+		return nil
+	}
+	for outer != nil {
+		switch o := outer.(type) {
+		case *instrumentedOp:
+			outer = o.inner
+		case *projectOp:
+			outer = o.child
+		case *seqScanOp:
+			return o
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// orderedRowValues runs sql and renders every cell as text in result order.
+func orderedRowValues(t *testing.T, ctx *Context, sql string) []string {
+	t.Helper()
+	var out []string
+	for _, r := range runSQL(t, ctx, sql) {
+		cells := make([]string, len(r))
+		for i, d := range r {
+			if d.IsNull() {
+				cells[i] = "NULL"
+			} else {
+				cells[i] = string(d.AppendValueText(nil))
+			}
+		}
+		out = append(out, strings.Join(cells, ","))
+	}
+	return out
+}
+
+// TestScanBorrowUnderSort pins M0122-0012 slice 48: a Sort is a borrow root
+// (finishSortNode). sortOp.Open materialises each child slot before the next
+// pull, so a seq scan under it — directly, through a Project, or as a hash
+// join's probe side — hands up its reused row. (A Filter stops the chain: its
+// batch mode reads child rows ahead.) The table spans many pages and
+// its text and big-numeric values live in the scan's per-page arena, so a
+// sort that kept a borrowed row would read reset arena bytes. With tail poison
+// armed, every result must equal the cloning path's in order.
+func TestScanBorrowUnderSort(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bs (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bs SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bsd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bsd SELECT x, 'dim-' || x FROM generate_series(0, 49) x")
+	runSQL(t, ctx, "ANALYZE bs")
+	runSQL(t, ctx, "ANALYZE bsd")
+	cases := []struct {
+		sql  string
+		want string // tables whose scans must borrow
+	}{
+		{"SELECT * FROM bs ORDER BY s, i", "bs"},
+		{"SELECT s, n, i FROM bs ORDER BY s, i", "bs"},
+		{"SELECT i, upper(s), n * 2 FROM bs ORDER BY n DESC", "bs"},
+		{"SELECT bsd.label, bs.s, bs.n FROM bs JOIN bsd ON bs.k = bsd.k ORDER BY bs.s, bsd.label", "bs,bsd"},
+	}
+	for _, c := range cases {
+		plan, err := testPlanDeform(t, ctx, c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if got := strings.Join(borrowedScanTables(op), ","); got != c.want {
+			t.Fatalf("%s: borrowing scans %q, want %q", c.sql, got, c.want)
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := orderedRowValues(t, ctx, c.sql)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := orderedRowValues(t, ctx, c.sql)
+		scanBorrowDisabled = false
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", c.sql)
+		}
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s: borrowed and cloned results differ (%d vs %d rows)", c.sql, len(got), len(want))
+		}
 	}
 }

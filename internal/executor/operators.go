@@ -344,6 +344,10 @@ type projectOp struct {
 	// M0092-0007: stack-aliased slot reused across every Next()
 	// call so we don't allocate a fresh MaterializedSlot per row.
 	slot MaterializedSlot
+	// live marks the targets Next evaluates (projectLiveSet; nil = all of
+	// them). A dead target's cell is set once at Open — NULL, or the deform
+	// poison when armed — and never written again. M0122-0012 slice 35.
+	live []bool
 }
 
 func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
@@ -363,10 +367,22 @@ func (o *projectOp) Open(ctx *Context) error {
 	} else {
 		o.out = o.out[:len(o.targets)]
 	}
+	if len(o.live) != len(o.targets) {
+		o.live = nil
+	}
+	for i := range o.out {
+		if o.live != nil && !o.live[i] {
+			o.out[i] = NullDatum
+			if seqScanDeformPoison {
+				o.out[i] = deformPoisonDatum()
+			}
+		}
+	}
 	return o.child.Open(ctx)
 }
 func (o *projectOp) Schema() optimizer.Schema { return o.schema }
 func (o *projectOp) Close() error {
+	scrubDeformPoison(o.out)
 	releaseRow(o.out)
 	o.out = nil
 	return o.child.Close()
@@ -378,6 +394,9 @@ func (o *projectOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	for i, t := range o.targets {
+		if o.live != nil && !o.live[i] {
+			continue
+		}
 		v, err := evalExprSlot(t, inSlot, o.ctx)
 		if err != nil {
 			return nil, err
@@ -580,10 +599,26 @@ type filterOp struct {
 	// filterBatchSize child rows before emitting the first, which moves that
 	// position past the row being emitted.
 	noReadAhead bool
+	// predExprs / predIdx are pred compiled once into an exprTreeSlab, the
+	// form the slab path's OpFilter evaluates (filterOpNext). nextPerRow
+	// runs it through evalFastExpr instead of re-walking pred with the
+	// interpreted evaluator, which re-derives every static decision per row
+	// (the operands' declared bpchar widths and character-string types).
+	// Kinds the compiler does not know fall back to evalExprSlot inside the
+	// slab, so the result is the interpreter's. A correlated SubPlan's inner
+	// Filter is built here, not on the slab path: TPC-DS Q81 evaluated its
+	// `ctr1.ctr_state = ctr2.ctr_state` 47M times interpreted (M0122-0012
+	// slice 40).
+	predExprs exprTreeSlab
+	predIdx   int32
 }
 
 func newFilterOp(plan *optimizer.Filter, child Operator) *filterOp {
-	return &filterOp{child: child, pred: plan.Predicate}
+	o := &filterOp{child: child, pred: plan.Predicate, predIdx: noExpr}
+	if plan.Predicate != nil {
+		o.predIdx = o.predExprs.buildExpr(plan.Predicate)
+	}
+	return o
 }
 
 func (o *filterOp) Open(ctx *Context) error {
@@ -644,7 +679,12 @@ func (o *filterOp) nextPerRow() (TupleSlot, error) {
 			// done, no row to surface" — propagate without eval.
 			return nil, nil
 		}
-		v, err := evalExprSlot(o.pred, slot, o.ctx)
+		var v Datum
+		if len(o.predExprs) > 0 && o.predIdx != noExpr {
+			v, err = evalFastExpr(o.predExprs, o.predIdx, slot, o.ctx)
+		} else {
+			v, err = evalExprSlot(o.pred, slot, o.ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
