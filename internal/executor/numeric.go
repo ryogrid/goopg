@@ -885,11 +885,9 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 	shift := rscale + db - da
 	num := new(big.Int).Set(am)
 	if shift > 0 {
-		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(shift)), nil)
-		num.Mul(num, scl)
+		num.Mul(num, pow10Big(shift))
 	} else if shift < 0 {
-		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(-shift)), nil)
-		num.Quo(num, scl)
+		num.Quo(num, pow10Big(-shift))
 	}
 
 	q, rem := new(big.Int).QuoRem(num, bm, new(big.Int))
@@ -940,10 +938,8 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 // pure decimal model the weights differ by 1 and rscale would land
 // at 15.
 func numericDivScale(am, bm *big.Int, da, db int) int {
-	absA := new(big.Int).Abs(am).Text(10)
-	absB := new(big.Int).Abs(bm).Text(10)
-	w1, fd1 := nbaseWeightAndFirstDigit(absA, da)
-	w2, fd2 := nbaseWeightAndFirstDigit(absB, db)
+	w1, fd1 := nbaseWeightAndFirstDigit(am, da)
+	w2, fd2 := nbaseWeightAndFirstDigit(bm, db)
 	qweight := w1 - w2
 	if fd1 <= fd2 {
 		qweight--
@@ -964,22 +960,36 @@ func numericDivScale(am, bm *big.Int, da, db int) int {
 	return rscale
 }
 
-// nbaseWeightAndFirstDigit converts a value `|mantissa| * 10^-dscale`
-// (with mantissa given as the decimal digit string of its absolute
-// value) into upstream's NumericVar weight + first NBASE digit. NBASE
-// is 10000 — each NBASE digit packs 4 consecutive decimal digits.
+// nbaseWeightAndFirstDigit converts a value `|mantissa| * 10^-dscale` into
+// upstream's NumericVar weight + first NBASE digit. NBASE is 10000 — each
+// NBASE digit packs 4 consecutive decimal digits.
 //
-// The MSB of the value sits at decimal position `nd - 1 - dscale`
-// (where nd = number of decimal digits). That MSB falls into NBASE
-// digit at position floor(MSBPos / 4). The first NBASE digit's value
-// is the 4-decimal-digit chunk aligned to that NBASE position,
-// padded on the right with zeros if the mantissa has fewer trailing
-// digits.
-func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int) {
-	if len(absStr) == 1 && absStr[0] == '0' {
+// The MSB of the value sits at decimal position `nd - 1 - dscale` (where nd =
+// number of decimal digits). That MSB falls into NBASE digit at position
+// floor(MSBPos / 4). The first NBASE digit's value is the 4-decimal-digit
+// chunk aligned to that NBASE position, i.e. the value's leading
+// MSBPos - 4*weight + 1 decimal digits.
+//
+// It works from the digit count and one division instead of the mantissa's
+// decimal string (M0122-0012 slice 67: two Text(10) conversions per numeric
+// division were TPC-DS Q39's HAVING filter's largest cost).
+func nbaseWeightAndFirstDigit(mant *big.Int, dscale int) (weight, firstdigit int) {
+	if mant.Sign() == 0 {
 		return 0, 0
 	}
-	nd := len(absStr)
+	abs := mant
+	if mant.Sign() < 0 {
+		abs = new(big.Int).Neg(mant)
+	}
+	var nd int
+	var u uint64
+	small := abs.IsUint64()
+	if small {
+		u = abs.Uint64()
+		nd = decimalDigitsUint64(u)
+	} else {
+		nd = decimalDigitsBig(abs)
+	}
 	msbDecPos := nd - 1 - dscale
 	weight = msbDecPos / 4
 	if msbDecPos < 0 && msbDecPos%4 != 0 {
@@ -987,16 +997,19 @@ func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int
 		// but upstream's weight uses floor for negative exponents.
 		weight--
 	}
-	posInNBASE := msbDecPos - 4*weight // 0..3
-	firstdigit = 0
-	for i := 0; i <= posInNBASE; i++ {
-		d := byte(0)
-		if i < nd {
-			d = absStr[i] - '0'
+	lead := msbDecPos - 4*weight + 1 // 1..4 leading decimal digits
+	if lead >= nd {
+		// Fewer digits than the chunk: the chunk is the whole value,
+		// padded with zeros on the right.
+		if small {
+			return weight, int(u * pow10Uint64[lead-nd])
 		}
-		firstdigit = firstdigit*10 + int(d)
+		return weight, int(new(big.Int).Mul(abs, pow10Big(lead-nd)).Int64())
 	}
-	return weight, firstdigit
+	if small {
+		return weight, int(u / pow10Uint64[nd-lead])
+	}
+	return weight, int(new(big.Int).Quo(abs, pow10Big(nd-lead)).Int64())
 }
 
 // numericCmp compares two numeric values, returning -1/0/+1.

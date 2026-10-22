@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"os"
 	"sort"
 	"strconv"
@@ -2436,6 +2437,14 @@ type aggRuntime struct {
 	intExact bool
 	intSx    *big.Int // Σx
 	intSxx   *big.Int // Σx²
+	// int2 / int4 input accumulates in 128-bit integers first, as PG's
+	// int2_accum / int4_accum do (do_int128_accum, Int128AggState): x² < 2^62,
+	// so neither sum can overflow. intSums folds them into intSx / intSxx for
+	// every reader (M0122-0012 slice 67: two big.Int per group and a big.Int
+	// multiply per row were most of TPC-DS Q39's stddev_samp accumulation).
+	int128On bool
+	sx128    int128
+	sxx128   int128
 	// Exact rational accumulators for var_pop/var_samp/stddev on numeric inputs.
 	// When numericExact is true, these hold exact rational values matching PG's
 	// numeric_accum path (which uses exact arithmetic, not floating point). M0097-0125.
@@ -4569,6 +4578,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 					}
 					return false
 				}
+				if arg.Kind == KindInt && arg.Int >= math.MinInt32 && arg.Int <= math.MaxInt32 && inputIsInt32(call.InputType.Name) {
+					st.intExact, st.int128On = true, true
+					st.sx128.addInt64(arg.Int)
+					st.sxx128.addUint64(uint64(arg.Int * arg.Int))
+					st.count++
+					break
+				}
 				if arg.Kind == KindInt && inputIsInt() {
 					if !st.intExact {
 						st.intExact = true
@@ -4879,6 +4895,63 @@ func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datu
 	return NewStringDatum(formatBigRatDecimal(result, 12))
 }
 
+// int128 is a two's-complement 128-bit integer, value hi*2^64 + lo — the
+// int128 of PG's Int128AggState, for int2 / int4 variance sums.
+type int128 struct {
+	hi int64
+	lo uint64
+}
+
+func (a *int128) addInt64(v int64) {
+	var c uint64
+	a.lo, c = bits.Add64(a.lo, uint64(v), 0)
+	a.hi += v>>63 + int64(c)
+}
+
+func (a *int128) addUint64(v uint64) {
+	var c uint64
+	a.lo, c = bits.Add64(a.lo, v, 0)
+	a.hi += int64(c)
+}
+
+func (a int128) big() *big.Int {
+	b := new(big.Int).SetInt64(a.hi)
+	b.Lsh(b, 64)
+	return b.Add(b, new(big.Int).SetUint64(a.lo))
+}
+
+// inputIsInt32 reports whether a variance aggregate's declared input type is
+// int2 or int4, whose PG transition functions accumulate in int128.
+func inputIsInt32(name string) bool {
+	switch name {
+	case "int2", "int4", "int", "integer", "smallint", "serial", "smallserial":
+		return true
+	}
+	switch strings.ToLower(name) {
+	case "int2", "int4", "int", "integer", "smallint", "serial", "smallserial":
+		return true
+	}
+	return false
+}
+
+// intSums returns the exact Σx and Σx² of an integer variance state, the
+// 128-bit lane folded into the big.Int one, or nils when the state saw no
+// integer input. It never modifies the state: a copied state may share the
+// big.Int pointers.
+func (st *aggRuntime) intSums() (sx, sxx *big.Int) {
+	if !st.int128On {
+		return st.intSx, st.intSxx
+	}
+	sx, sxx = st.sx128.big(), st.sxx128.big()
+	if st.intSx != nil {
+		sx.Add(sx, st.intSx)
+	}
+	if st.intSxx != nil {
+		sxx.Add(sxx, st.intSxx)
+	}
+	return sx, sxx
+}
+
 func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	// PG's numeric_stddev_internal (numeric.c) for integer inputs, which
 	// int2/int4/int8_accum feed with sumX and sumX2 at display scale 0
@@ -4983,14 +5056,72 @@ func pgSelectDivScaleInt(num, den *big.Int) int {
 func pgNBaseWeightFirst(d *big.Int, scale int) (int, int64) {
 	s4 := (scale + 3) / 4 * 4
 	v := new(big.Int).Mul(d, pow10Big(s4-scale))
-	digits := len(v.String())
-	nd := (digits + 3) / 4
+	if v.IsUint64() {
+		u := v.Uint64()
+		digits := decimalDigitsUint64(u)
+		nd := (digits + 3) / 4
+		return nd - 1 - s4/4, int64(u / pow10Uint64[4*(nd-1)])
+	}
+	nd := (decimalDigitsBig(v) + 3) / 4
 	lead := new(big.Int).Quo(v, pow10Big(4*(nd-1)))
 	return nd - 1 - s4/4, lead.Int64()
 }
 
-// pow10Big returns 10^k as a new big.Int (k >= 0).
+// pow10Uint64[k] is 10^k for every k whose power fits a uint64.
+var pow10Uint64 = func() [20]uint64 {
+	var t [20]uint64
+	t[0] = 1
+	for k := 1; k < len(t); k++ {
+		t[k] = t[k-1] * 10
+	}
+	return t
+}()
+
+// decimalDigitsUint64 is the number of decimal digits of u (1 for 0).
+func decimalDigitsUint64(u uint64) int {
+	n := 1
+	for n < len(pow10Uint64) && u >= pow10Uint64[n] {
+		n++
+	}
+	return n
+}
+
+// decimalDigitsBig is the number of decimal digits of the positive v —
+// len(v.String()) without formatting it (M0122-0012 slice 67: the string
+// conversion was most of pgNBaseWeightFirst on TPC-DS Q39's stddev groups).
+// The bit length gives an estimate within one digit; comparisons with exact
+// powers of ten settle it.
+func decimalDigitsBig(v *big.Int) int {
+	n := int(float64(v.BitLen()-1)*math.Log10(2)) + 1
+	for n > 1 && v.Cmp(pow10Big(n-1)) < 0 {
+		n--
+	}
+	for v.Cmp(pow10Big(n)) >= 0 {
+		n++
+	}
+	return n
+}
+
+// pow10BigTable[k] is 10^k, built once; pow10Big serves exponents in its
+// range from it.
+var pow10BigTable = func() [160]*big.Int {
+	var t [160]*big.Int
+	t[0] = big.NewInt(1)
+	ten := big.NewInt(10)
+	for k := 1; k < len(t); k++ {
+		t[k] = new(big.Int).Mul(t[k-1], ten)
+	}
+	return t
+}()
+
+// pow10Big returns 10^k (k >= 0). The result may be shared: callers read it
+// and never modify it. Exponents below 160 — every rscale-sized power the
+// variance and square-root paths ask for at PG's default scales — come from
+// a table instead of a big.Int.Exp per call (M0122-0012 slice 67).
 func pow10Big(k int) *big.Int {
+	if k >= 0 && k < len(pow10BigTable) {
+		return pow10BigTable[k]
+	}
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(k)), nil)
 }
 
@@ -5478,7 +5609,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, false, false)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, false, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
@@ -5491,7 +5623,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, true, false)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, true, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
@@ -5503,7 +5636,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, false, true)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, false, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
@@ -5518,7 +5652,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, true, true)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, true, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)

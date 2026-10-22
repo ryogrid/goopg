@@ -228,18 +228,23 @@ func combineVariance(dst, src *aggRuntime) {
 	srcNaN := math.IsNaN(src.floatM2)
 
 	// Exact lanes: plain sums, and nil means "this worker saw nothing".
-	if src.intSx != nil {
-		if dst.intSx == nil {
-			dst.intSx, dst.intSxx = new(big.Int), new(big.Int)
+	// intSums folds each side's 128-bit lane (int2 / int4 input) into its
+	// big.Int sums; the combined state keeps the big.Int lane only.
+	if srcSx, srcSxx := src.intSums(); srcSx != nil {
+		dstSx, dstSxx := dst.intSums()
+		if dstSx == nil {
+			dstSx, dstSxx = new(big.Int), new(big.Int)
 			dst.intExact = true
 		}
-		dst.intSx.Add(dst.intSx, src.intSx)
-		if src.intSxx != nil {
-			if dst.intSxx == nil {
-				dst.intSxx = new(big.Int)
-			}
-			dst.intSxx.Add(dst.intSxx, src.intSxx)
+		dst.intSx = new(big.Int).Add(dstSx, srcSx)
+		if dstSxx == nil {
+			dstSxx = new(big.Int)
 		}
+		if srcSxx != nil {
+			dstSxx = new(big.Int).Add(dstSxx, srcSxx)
+		}
+		dst.intSxx = dstSxx
+		dst.int128On, dst.sx128, dst.sxx128 = false, int128{}, int128{}
 	}
 	if src.numericSx != nil {
 		if dst.numericSx == nil {

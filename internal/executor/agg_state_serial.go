@@ -86,8 +86,9 @@ func serializeAggRuntime(name string, st *aggRuntime) (Datum, error) {
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(st.count))
 		buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(st.floatSx))
 		buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(st.floatM2))
-		buf = appendBigInt(buf, st.intSx)
-		buf = appendBigInt(buf, st.intSxx)
+		sx, sxx := st.intSums()
+		buf = appendBigInt(buf, sx)
+		buf = appendBigInt(buf, sxx)
 		buf = appendBigRat(buf, st.numericSx)
 		buf = appendBigRat(buf, st.numericSxx)
 

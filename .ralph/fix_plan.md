@@ -2232,6 +2232,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Q48/Q13 flat; sweep 95\.5 s unchanged\.
     - Next: Q39's serial leader — per\-group allocation, string\-keyed group map, numeric finalisation of 540 K groups
       \(PG accumulates int4 in int128, int4\_accum\); or the hashed SubPlan for Q35\.
+  - **Slice 67 — numeric division and variance stop formatting and exponentiating; int4 variance input accumulates in 128
+    bits LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck;
+    Q39 ck identical\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation
+    PASS\. Doc part 6 "Slice 67"\.
+    - Q39 leader: finalizeGroup 31 %, HAVING numericDiv 15 %; pow10Big ran big\.Int\.Exp per call, the NBASE weight helpers
+      formatted values \(String / Text\(10\)\) to count digits, stddev\_samp\(int4\) kept two big\.Int sums per group\.
+    - pow10 tables; decimalDigitsBig / decimalDigitsUint64; nbaseWeightAndFirstDigit takes the mantissa; int128 lane
+      \(sx128/sxx128, PG do\_int128\_accum\) folded by intSums for finalise, serialise and combine \(pinned against the
+      string\-based oracles and big\.Int sums; mutation\-checked\)\.
+    - Q39 26\.86 → 22\.42 Ginstr \(−16\.5 %\), wall 2\.2 → 1\.56 s \(−30 %\); Q17/Q7/Q22/Q21/Q26 flat; sweep Q39 1\.75 → 1\.37 s\.
+    - Next: Q39 per\-group state \(664\-byte aggRuntime per aggregate, string\-keyed group map\); or the hashed SubPlan for Q35\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4347,6 +4358,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `d4a855738`** \(M0122\-0012 slice 65 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `3a50b12ed`** \(M0122\-0012 slice 66 changed internal/executor and internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

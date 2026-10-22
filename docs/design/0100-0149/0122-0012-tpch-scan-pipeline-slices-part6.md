@@ -558,3 +558,67 @@ identical.
   group lookups, and the numeric finalisation of 540 K groups (`exactIntVariance`, `numericDiv`,
   `pgSqrtScaled`). PG accumulates `int4` input in 128-bit integers (`int4_accum`, `Int128AggState`) and converts
   to numeric only in the final function.
+
+## Slice 67 (2026-10-23): numeric division and variance stop formatting and exponentiating, and int4 variance input accumulates in 128 bits — TPC-DS Q39
+
+**Target.** After slice 66, Q39's wall time is its serial leader. Per statement the leader aggregates 2.34 M rows
+into 540 K groups, finalises `stddev_samp` and `avg` for each group, and evaluates the HAVING filter
+`CASE avg(...) WHEN 0 THEN 0 ELSE stddev_samp(...) / avg(...) END > 1` on each. An instruction profile split by
+leader stack put 31 % of the leader in `finalizeGroup` and 15 % in the filter's `numericDiv`. Three costs ran
+per call or per row, and none of them was arithmetic PG performs:
+
+- **Powers of ten** were recomputed with `big.Int.Exp`: in `pow10Big` (variance, square root, weight helpers) and
+  in `numericDiv`'s rescaling.
+- **Digit counting formatted the number.** `pgNBaseWeightFirst` took `len(v.String())`, and `numericDivScale`
+  converted both operands with `Text(10)`, only to read the digit count and the leading NBASE digit.
+- **Big-integer accumulation for int4 input.** Every `stddev_samp(int4)` group allocated two `big.Int` sums, and
+  every row added to them with a `big.Int` square. PG's `int4_accum` accumulates in `int128`
+  (`do_int128_accum`, `Int128AggState`), and so does `int2_accum`; x² < 2^62 there, so neither sum can overflow.
+
+**Change.**
+
+- **Powers of ten from tables.** `pow10Big` serves exponents below 160 from a table built once (callers only read
+  the result) and falls back to `Exp` above that. `numericDiv` rescales with it. `pow10Uint64` covers powers
+  that fit a uint64.
+- **Digit counts without formatting.** `decimalDigitsUint64` is a table comparison. `decimalDigitsBig` estimates
+  from the bit length, which is within one digit, and settles with exact power comparisons.
+  `pgNBaseWeightFirst` and `nbaseWeightAndFirstDigit` read the leading NBASE digit with one division, through
+  uint64 when the value fits. `nbaseWeightAndFirstDigit` now takes the mantissa (any sign), not its decimal
+  string. Its negative-scale floor and the zero-padding of a short leading chunk are unchanged.
+- **The 128-bit lane.** A variance aggregate whose declared input is int2 or int4 (`inputIsInt32`), with an
+  in-range value, accumulates Σx and Σx² in `int128` fields (`sx128`, `sxx128`; `bits.Add64`). `intSums` folds
+  the lane into the existing `intSx` and `intSxx` big.Int sums for every reader: the four finalisers, the
+  partial-state serialiser and the parallel combine. It allocates fresh results and never modifies the state,
+  because a copied state may share the big.Int pointers. int8 input keeps the big.Int lane, as PG's
+  `int8_accum` keeps numeric.
+
+**Pins.**
+
+- `TestDecimalDigitsMatchesString` and `TestNBaseWeightHelpersMatchStringOracle` check the new helpers against
+  the string-based versions they replace, kept in the test as oracles. The values cover every power-of-ten
+  boundary to 10^60, the uint64 seam, and 2000 random values up to 200 bits; scales run −9..40 and both signs
+  are tested. Removing the downward adjustment in `decimalDigitsBig` fails them.
+- `TestPow10BigTableAndFallback` covers the table, its boundary and the `Exp` fallback, including `Exp`'s answer
+  for a negative exponent.
+- `TestInt128LaneMatchesBigInt`: lane sums and all four variance / stddev results equal the big.Int path's. The
+  inputs include 70 000 repeated `MinInt32`/`MaxInt32` values that carry the low word and drive Σx negative.
+  Dropping the sign extension fails it.
+- `TestIntSumsFoldsWithoutMutating` and `TestInt128LaneSerialisesAndCombines` cover the fold into an existing
+  big.Int lane, shared pointers left untouched, a serialise round trip, and combines from a lane state, a
+  deserialised state and into an empty destination. Each of the serialiser, combine and fold arms was
+  mutation-checked.
+
+**Measured** against `3a50b12ed` (slice 66):
+
+| query | HEAD Ginstr | candidate Ginstr | HEAD wall / CPU (s) | candidate wall / CPU (s) |
+|---|---|---|---|---|
+| Q39 | 26.86 | 22.42 (−16.5 %; powers + digits −9.6 %, division −5.5 %, int128 −1.4 %) | 2.16–2.25 / 3.48–3.57 | 1.56–1.59 / 2.76–2.80 |
+| Q17 (stddev\_samp), Q7, Q22, Q21, Q26 | — | within ±0.1 % | | |
+
+Q39's wall time fell about 30 % because this work was on the serial leader. In the sf025 sweep Q39 went from
+1.75 to 1.37 s with an identical checksum, and the sum went from 95.5 to 95.1 s. Values are identical (sf025
+PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.** Q39 still takes 1.56 s against PG's 0.59 s. Each group allocates a 664-byte `aggRuntime` per aggregate
+(PG's per-group state is a transition value and two flags), plus its group key string in a string-keyed map.
+The leader also probes the item hash and projects every row before aggregating.
