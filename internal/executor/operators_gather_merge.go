@@ -461,12 +461,16 @@ func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatumTyped(av, bv, 0, k.Expr)
-		if err != nil {
-			if *errp == nil {
-				*errp = err
+		// The sort comparator's fast path (sortOp.lessKeyVals).
+		cmp, ok := fastCompareDatum(&av, &bv)
+		if !ok {
+			var err error
+			if cmp, err = compareDatumTyped(av, bv, 0, k.Expr); err != nil {
+				if *errp == nil {
+					*errp = err
+				}
+				return false
 			}
-			return false
 		}
 		if cmp == 0 {
 			continue

@@ -88,3 +88,66 @@ identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are ident
   rows the Group already ordered); and the final aggregate's CASE, whose `IS NULL` / `AND` arms fall back from
   `evalFastExpr` to the interpreted `evalExprSlot`.
 - PG's leader runs this chain in under 0.12 s.
+
+## Slice 59 (2026-10-22): IS NULL compiles, and the sort and merge comparators take the same-kind fast path — TPC-DS Q97
+
+**Instrument.** Host load (other agents' builds, load average 7–10) moved Q97's per-query CPU by ±10 % between
+identical rounds, which hides a few-percent change. From this slice the A/B also counts **user-mode
+instructions retired per query**: `perf stat -e instructions:u -p <pid>` across a fixed number of runs
+(`tmp/ds-instr.sh`). Repeat rounds agree to ±0.005 G, and builds that differ only off a query's path give the
+same count, so unrelated sweep swings can be checked directly.
+
+**Target.** TPC-DS Q97, the leader-serial chain of slice 58. An instruction-sampled profile of Q97 run serially
+split as follows:
+
+- About 20 % sat in the sort comparator: `sortOp.lessKeyVals` → `compareDatumTyped` → `compareDatum` →
+  `promoteCrossKind`. Every integer key pair went through the generic cross-kind path.
+- The Gather Merge heap (`mergeKeysLess`) and the merge join's key comparison (`compareMergeKeys`) take the
+  same route.
+- The final aggregate's `CASE WHEN a IS NOT NULL AND b IS NULL` arms ran `IsNullExpr` through an `ExprAdapter`,
+  i.e. the interpreted `evalExprSlot`, for every row. The compiled slab has no NullTest kind.
+
+**Change.**
+
+- **Comparator fast path.** `sortOp.lessKeyVals`, `mergeKeysLess` and `compareMergeKeys` first try
+  `fastCompareDatum`, the compiled comparison's existing same-kind int / time / non-big numeric shortcut.
+  `TestFastCompareDatumMatchesCompareDatum` pins it equal to `compareDatum` whenever it answers. Both
+  `compareDatumTyped` and `compareDatumPlain` reduce to `compareDatum` for every non-string pair, and
+  `fastCompareDatum` declines strings. Everything else takes the old call, so NULL placement, DESC and errors are
+  untouched. `sortOp.lessRows`, the defensive fallback, is left alone.
+- **ExprNullTest.** `IsNullExpr` compiles to `ExprNullTest`: the compiled operand, then
+  `isNull != negated`, which is exactly the interpreted scalar arm. It never yields NULL, and an operand error
+  propagates. A `RowExpr` operand keeps the adapter, because its field-wise rule (`evalRowNullTest`) is not the
+  scalar test. The batch evaluator reaches it through its per-row fallback.
+
+**Pins.**
+
+- `TestNullTestCompiledMatchesInterpreted` compares IS NULL / IS NOT NULL over int, text and computed operands,
+  alone, under AND, and inside a Q97-shaped CASE, on the per-row and batch evaluators, with the interpreted
+  `evalExpr`. It also checks that a row-valued IS NULL stays on the adapter and still matches. Mutation check:
+  flipping the negation fails it.
+- The comparator fast path rests on `TestFastCompareDatumMatchesCompareDatum`. The executor's
+  sort / merge / gather tests pass.
+
+**Measured.** Instructions per query (load-insensitive), interleaved against `0f365344a`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q97 serial | 7.882–7.887 | 7.068–7.071 (the IS NULL compile alone: 7.788) |
+| Q97 parallel | 8.587 | 7.724–7.729 |
+| Q51 | 17.28 | 16.18 |
+| Q87 | 27.23 | 27.06 |
+| Q16, Q72, Q23, Q95, Q1 | — | identical |
+
+That is −10 % on Q97 and −6.4 % on Q51. `/proc` CPU agrees: Q97 went from 1.09–1.19 to 0.94–1.02 CPU-s and Q51
+from 2.20–2.25 to 2.08–2.10. The sf025 sweep sum went from 108.6 to 109.9 s. That came from Q1, Q72, Q23 and Q95
+rising and Q74, Q39 and Q9 falling, all by seconds, and the risers' instruction counts are unchanged, so it is
+host load. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.**
+
+- Q97's leader still runs the merge join's `mergeSortedSource` re-keying of rows the Group already ordered.
+- Gather Merge still re-evaluates sort keys per row through `evalExprSlot`.
+- The `sortOp` stable sort still uses the reflected swapper. It is ~3 % of Q97's instructions; slice 58's
+  `SortStableFunc` attempt was flat on wall time, but this instrument could now resolve it.
+- `exprnode.go`'s header comment still lists only the original six compiled kinds.

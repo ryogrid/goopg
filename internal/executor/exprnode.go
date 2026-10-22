@@ -74,6 +74,7 @@ const (
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
 	ExprConstVal           // constVal = a subtree folded to a value at build time
 	ExprCase               // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
+	ExprNullTest           // payload[0] = 1 for IS NOT NULL; childA = operand
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -329,6 +330,26 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		(*s)[idx].caseInfo = ci
 		return idx
 
+	case *optimizer.IsNullExpr:
+		// M0122-0012 slice 59: IS [NOT] NULL compiles, so a CASE arm or a qual
+		// testing a column no longer drops to evalExprSlot for every row
+		// (TPC-DS Q97's `ssci.customer_sk IS NOT NULL AND csci.customer_sk IS
+		// NULL`). A row-valued operand keeps the adapter: its field-wise rule
+		// (evalRowNullTest) is not the scalar test.
+		if _, isRow := t.Operand.(*optimizer.RowExpr); isRow || t.Operand == nil {
+			idx := int32(len(*s))
+			*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+			return idx
+		}
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprNullTest})
+		childA := s.buildExprCtx(t.Operand, ctx)
+		(*s)[idx].childA = childA
+		if t.Negated {
+			(*s)[idx].payload[0] = 1
+		}
+		return idx
+
 	case *optimizer.UnaryOp:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprUnaryOp})
@@ -551,6 +572,14 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 
 	case ExprAdapter:
 		return evalExprSlot(n.orig, slot, ctx)
+
+	case ExprNullTest:
+		// evalExprSlot's scalar IsNullExpr arm: the test never yields NULL.
+		operand, err := evalFastExpr(exprs, n.childA, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewBoolDatum(operand.IsNull() != (n.payload[0] == 1)), nil
 
 	case ExprCase:
 		return evalFastCase(exprs, n.caseInfo, slot, ctx)

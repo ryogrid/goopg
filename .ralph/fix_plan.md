@@ -2114,6 +2114,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q97 CPU 1\.10 → 1\.06 CPU\-s parallel, 0\.91–0\.94 → 0\.83–0\.89 serial; wall noise ±10 % hides it\.
     - Tried and dropped: pdqsort with index tiebreak for sortOp \(Q87 \+8 %\); slices\.SortStableFunc \(flat\)\.
     - Next: leader's Gather Merge key re\-eval, merge join input re\-keying, CASE IS NULL/AND interpreted fallback\.
+  - **Slice 59 — IS NULL compiles; sort and merge comparators take the same\-kind fast path LANDED 2026\-10\-22\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 6 "Slice 59"\.
+    - Instrument: user\-mode instructions per query \(perf stat \-e instructions:u \-p PID; tmp/ds\-instr\.sh\) — ±0\.005 G
+      between rounds, unaffected by host load \(load average 7–10 swung CPU ±10 %\)\.
+    - Named target TPC\-DS Q97: ~20 % of serial instructions in lessKeyVals → compareDatum → promoteCrossKind for int
+      keys; IsNullExpr ran through ExprAdapter \(interpreted\) per row\.
+    - lessKeyVals / mergeKeysLess / compareMergeKeys try fastCompareDatum first; IsNullExpr → ExprNullTest \(pinned,
+      mutation\-checked; RowExpr keeps the adapter\)\.
+    - Q97 7\.88 → 7\.07 Ginstr \(−10 %\), CPU 1\.09–1\.19 → 0\.94–1\.02; Q51 −6\.4 %; Q16/Q72/Q23/Q95/Q1 identical\.
+    - Next: mergeSortedSource re\-keying, Gather Merge key re\-eval, reflected swapper in sortOp \(~3 %\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4172,6 +4183,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `49da13013`** \(M0122\-0012 slice 57 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `0f365344a`** \(M0122\-0012 slice 58 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

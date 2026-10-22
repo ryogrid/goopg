@@ -140,9 +140,14 @@ func (o *joinOp) mergeSideKeyExprs(isLeft bool) []optimizer.Expr {
 // text flags the key pairs that compare as plain text (joinOp.mergeKeyText).
 func compareMergeKeys(a, b []Datum, pos int, text []bool) (int, error) {
 	for i := range a {
-		cmp, err := compareDatumPlain(a[i], b[i], pos, i < len(text) && text[i])
-		if err != nil {
-			return 0, err
+		// The sort comparator's fast path (sortOp.lessKeyVals):
+		// compareDatumPlain is compareDatum for every non-string pair.
+		cmp, ok := fastCompareDatum(&a[i], &b[i])
+		if !ok {
+			var err error
+			if cmp, err = compareDatumPlain(a[i], b[i], pos, i < len(text) && text[i]); err != nil {
+				return 0, err
+			}
 		}
 		if cmp != 0 {
 			return cmp, nil

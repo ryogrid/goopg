@@ -1359,12 +1359,19 @@ func (o *sortOp) lessKeyVals(a, b []Datum) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr)
-		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
+		// fastCompareDatum decides same-kind int / time / numeric pairs
+		// exactly as compareDatum does (TestFastCompareDatumMatchesCompareDatum),
+		// and compareDatumTyped is compareDatum for every non-string pair
+		// (M0122-0012 slice 59).
+		cmp, ok := fastCompareDatum(&av, &bv)
+		if !ok {
+			var err error
+			if cmp, err = compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr); err != nil {
+				if o.sortErr == nil {
+					o.sortErr = err
+				}
+				return false
 			}
-			return false
 		}
 		if cmp == 0 {
 			continue
