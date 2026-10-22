@@ -734,3 +734,5 @@ system time per run). Once RSS reaches about 9.2 GB, the pages are recycled and 
 (user CPU ≈ 2.0 s, sys ≈ 0.1 s). The `tmp/ds-*` instruments restart the server for every sample, so they land
 in either phase. Wall A/Bs on this host must hold server age constant (CLAUDE.md "sweep-tail collapse"), or use
 instruction and user-CPU counts.
+
+Continued in [0122-0012-tpch-scan-pipeline-slices-part7.md](0122-0012-tpch-scan-pipeline-slices-part7.md) (slices 69–).

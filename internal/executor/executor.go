@@ -323,6 +323,9 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if aggregateBorrowsScanRows(p) {
 			markScanBorrowChain(child)
 		}
+		if aggregateIgnoresInputOrder(p) {
+			markDistinctUnordered(child)
+		}
 		return maybeInstrument(p, newAggregateOp(p, child), scope), nil
 	case *optimizer.WindowAgg:
 		child, err := buildNode(p.Child, deformBoundFull, scope)

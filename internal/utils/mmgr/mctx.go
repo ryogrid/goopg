@@ -129,10 +129,11 @@ func (c *Context) isShared() bool { return c.id == PermContextID }
 
 // permanentContext is the process-global literal-payload context (slot 1).
 //
-// It is the ONE Context that is legitimately shared across goroutines: every
-// backend's big-mantissa numerics allocate from it (newBigNumericInCtx), and
-// it is never Reset or Released, which is precisely why arena-backed numerics
-// are safe to pass between goroutines at all.
+// It is the ONE Context that is legitimately shared across goroutines: its
+// payloads are never Reset or Released, so they are safe to pass between
+// goroutines. Until M0122-0016 every backend's big-mantissa numeric was
+// written here too, so they accumulated for the process lifetime; numerics
+// now own their payload (executor NewNumericBigDatum) and none are added.
 //
 // That sharing was previously unsynchronised. Because allocation is a bump
 // pointer that appends to c.chunks, and Bytes reads that same slice, two

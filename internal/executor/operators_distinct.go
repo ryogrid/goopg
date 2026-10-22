@@ -31,6 +31,9 @@ type distinctOp struct {
 	// colText flags character-string columns, whose output-order
 	// comparison is plain text whatever the values look like (M0146-0053).
 	colText []bool
+	// unordered skips the output sort: the consumer is a hashed aggregate
+	// whose result does not depend on input order (markDistinctUnordered).
+	unordered bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
@@ -97,6 +100,9 @@ func (o *distinctOp) Open(ctx *Context) error {
 		}
 		seen[k] = struct{}{}
 		o.rows = append(o.rows, ownedRow)
+	}
+	if o.unordered {
+		return nil
 	}
 	// Sort rows for deterministic output matching PostgreSQL's sort-based
 	// DISTINCT: NULL values sort last, non-null values by datum order.
@@ -251,4 +257,55 @@ func (o *distinctOnOp) Close() error {
 	return o.child.Close()
 }
 
+// aggregateIgnoresInputOrder reports whether p's result is the same for every
+// order of its input rows: a hashed (or ungrouped) aggregate whose every
+// aggregate is count, min, max, or sum / avg over a non-float input. Float
+// sums and averages round differently in different orders, and the
+// collecting aggregates (array_agg, string_agg, ...) and user-defined ones
+// keep their input order, so any of those keeps the input as it is.
+func aggregateIgnoresInputOrder(p *optimizer.Aggregate) bool {
+	if p.Strategy != optimizer.AggStrategyHashed || p.Mode == optimizer.AggModeFinal || p.GroupingSets != nil {
+		return false
+	}
+	for i := range p.Aggs {
+		a := &p.Aggs[i]
+		if len(a.OrderBy) > 0 || a.WithinGroup {
+			return false
+		}
+		switch strings.ToLower(a.Name) {
+		case "count", "min", "max":
+		case "sum", "avg":
+			switch strings.ToLower(a.InputType.Name) {
+			case "float4", "float8", "real", "double precision", "":
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
 
+// markDistinctUnordered tells a hashed DISTINCT feeding op — directly or
+// through projections — that its consumer ignores row order, so it may emit
+// its rows in first-seen order instead of sorting them (M0122-0012 slice 69).
+// PostgreSQL's HashAggregate DISTINCT emits hash-table order and never sorts;
+// goopg's sort exists only to make an unordered DISTINCT's own output
+// deterministic, which no order-insensitive consumer can observe. TPC-DS
+// Q75's UNION de-duplication sorted ~485 K rows that a sum() HashAggregate
+// then regrouped.
+func markDistinctUnordered(op Operator) {
+	for op != nil {
+		switch o := op.(type) {
+		case *distinctOp:
+			o.unordered = true
+			return
+		case *projectOp:
+			op = o.child
+		case *instrumentedOp:
+			op = o.inner
+		default:
+			return
+		}
+	}
+}

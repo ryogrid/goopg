@@ -2255,6 +2255,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q39 22\.48 → 21\.67 Ginstr \(−3\.6 %\), CPU −7 %; Q4 −4\.1 %, Q67 −0\.8 %; Q22/Q11/Q87/Q17 flat\.
     - Q39 wall is bimodal on BOTH binaries \(~1\.45 s or ~2\.2–2\.7 s per 3\-run sample\) — compare instructions/CPU\.
     - Discovery filed: M0122\-0016 \(big numeric results accumulate in the never\-reset permanent arena\)\.
+  - **Slice 69 — a hashed DISTINCT feeding an order\-insensitive hashed aggregate stops sorting its output LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7
+    "Slice 69" \(part 7 split from part 6 at the 800\-line limit\)\.
+    - Named target TPC\-DS Q75 \(warm 0\.56 s vs PG 0\.24 s\): the UNION's hashed DISTINCT \(distinctOp\) sorted ~485 K rows
+      for "deterministic output" — a third of the leader — before a sum\(\) HashAggregate regrouped them; PG's hashed
+      DISTINCT never sorts\.
+    - distinctOp\.unordered; markDistinctUnordered from the Aggregate arm through Projects; aggregateIgnoresInputOrder
+      \(count/min/max, sum/avg over non\-float input; no ORDER BY / grouping sets / Finalize\) \(pinned; mutation\-checked\)\.
+    - Q75 14\.45 → 12\.29–12\.39 Ginstr \(−14 to −15 %\); output byte\-identical to before and to :65438 tpcds025; Q87/Q38/
+      Q16/Q94 flat\.
+    - Finding: tmp/q64\-clone is the SF0\.25 corpus \(not SF1\) — compare against :65438 tpcds025\.
+    - Folded in M0122\-0016's leftover mctx\.go comment fix\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4419,6 +4432,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `97086429c`** \(M0122\-0012 slice 68 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `32a6ac752`** \(M0122\-0016 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
