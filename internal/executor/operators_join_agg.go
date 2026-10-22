@@ -2317,6 +2317,9 @@ type aggregateOp struct {
 	sCur      *groupRuntime
 	sCurParts []string
 	sEOF      bool
+	// sKeyBuf is nextSorted's reused per-column key buffer (M0122-0012
+	// slice 58): a row's group key is compared without allocating.
+	sKeyBuf []byte
 
 	// sharedUserStates supports PG aggregate state sharing: when multiple user-defined
 	// aggregates have the same sfunc/stype and the same input, sfunc is called only
@@ -3125,16 +3128,22 @@ func (o *aggregateOp) appendGroupKey(buf []byte, si int, set []int, vals Row, mu
 		if i > 0 {
 			buf = append(buf, '|')
 		}
-		v := vals[ci]
-		if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
-			// trimStringDatum's result, without forming a new Datum.
-			buf = append(buf, 's', ':')
-			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
-			continue
-		}
-		buf = appendDatumKey(buf, v)
+		buf = o.appendGroupColKey(buf, ci, vals[ci])
 	}
 	return buf
+}
+
+// appendGroupColKey appends grouping column ci's key for value v — datumKey,
+// with the bpchar padding stripped where gkTrims says so — to buf. It is the
+// per-column part both appendGroupKey and the sorted path's sameSortedGroup
+// build.
+func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
+	if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
+		// trimStringDatum's result, without forming a new Datum.
+		buf = append(buf, 's', ':')
+		return append(buf, strings.TrimRight(v.StringValue(), " ")...)
+	}
+	return appendDatumKey(buf, v)
 }
 
 // aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
@@ -3775,13 +3784,13 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		allVals, parts, err := o.evalGroupExprs(slot)
+		allVals, err := o.evalGroupValsScratch(slot)
 		if err != nil {
 			return nil, err
 		}
 		var out Row
 		emit := false
-		if o.sCur == nil || !sameGroupKey(o.sCurParts, parts) {
+		if o.sCur == nil || !o.sameSortedGroup(allVals) {
 			// Group boundary: finalize the previous group, then start a fresh
 			// one from this row. The previous group is returned once this
 			// row has been absorbed, so the calls run in the order the
@@ -3807,10 +3816,19 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 					}
 				}
 			}
+			// The group's values leave the scratch vector here, detached
+			// from the input arena (the M0073-0004 retention boundary), and
+			// its per-column key strings are kept for sameSortedGroup.
 			var gv Row
+			var parts []string
 			if nGroupCols > 0 {
 				gv = make(Row, nGroupCols)
-				copy(gv, allVals)
+				parts = make([]string, nGroupCols)
+				for i, v := range allVals {
+					gv[i] = v.MaterializeArena()
+					o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, gv[i])
+					parts[i] = string(o.sKeyBuf)
+				}
 			}
 			o.sCur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 			o.sCurParts = parts
@@ -3859,6 +3877,27 @@ func (o *aggregateOp) emitSorted(row Row) TupleSlot {
 	o.slot.schema = o.schema
 	o.slot.row = row
 	return &o.slot
+}
+
+// sameSortedGroup reports whether a row's grouping values (the scratch vector
+// evalGroupValsScratch fills) belong to the current sorted group: each
+// column's key — datumKey of the value, bpchar padding stripped where gkTrims
+// says so, exactly the part evalGroupExprs built — equals the group's stored
+// part. It is sameGroupKey(o.sCurParts, parts) without building parts: one
+// reused buffer and an allocation-free string comparison per column, where
+// the per-row values row, parts slice and key strings were allocated for
+// every input row of a sorted Group (M0122-0012 slice 58, TPC-DS Q97).
+func (o *aggregateOp) sameSortedGroup(vals Row) bool {
+	if len(vals) != len(o.sCurParts) {
+		return false
+	}
+	for i, v := range vals {
+		o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, v)
+		if string(o.sKeyBuf) != o.sCurParts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sameGroupKey reports whether two per-column key vectors denote the same

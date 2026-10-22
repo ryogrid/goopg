@@ -733,3 +733,5 @@ PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
 **Left.** Q16 is still ~4× PG in CPU (0.98 vs ~0.24 CPU-s). Per entry the walk still parses the item and
 makes its comparison through two layers of calls. PG's `_bt_readpage` applies `_bt_checkkeys` with the
 `_bt_set_startikey` and look-ahead shortcuts, which skip tuples the array keys cannot match.
+
+Continued in [0122-0012-tpch-scan-pipeline-slices-part6.md](0122-0012-tpch-scan-pipeline-slices-part6.md) (slices 58–).

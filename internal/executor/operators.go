@@ -348,6 +348,28 @@ type projectOp struct {
 	// them). A dead target's cell is set once at Open — NULL, or the deform
 	// poison when armed — and never written again. M0122-0012 slice 35.
 	live []bool
+	// colRef[i] is target i's input column when the target is a bare
+	// ColumnRef, else -1 (projectColRefs; filled on first Next).
+	colRef []int
+}
+
+// projectColRefs maps each projection target that is a bare ColumnRef to its
+// input column, -1 otherwise. Next copies such a column straight from a
+// materialised input row into its output cell (M0122-0012 slice 58): the
+// value evalExprSlot's ColumnRef arm returns — slot.Get, a bare row index
+// for a *MaterializedSlot — without the 48-byte Datum it returns by value
+// being stored to the stack and reloaded (the datum-return store-forwarding
+// stall), which perf showed as projectOp's own hot instructions between a
+// Gather Merge and a sorted Group (TPC-DS Q97).
+func projectColRefs(targets []optimizer.Expr) []int {
+	refs := make([]int, len(targets))
+	for i, t := range targets {
+		refs[i] = -1
+		if cr, ok := t.(*optimizer.ColumnRef); ok {
+			refs[i] = cr.Index
+		}
+	}
+	return refs
 }
 
 func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
@@ -393,8 +415,24 @@ func (o *projectOp) Next() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(o.colRef) != len(o.targets) {
+		o.colRef = projectColRefs(o.targets)
+	}
+	var inRow Row
+	if ms, ok := inSlot.(*MaterializedSlot); ok {
+		inRow = ms.row
+	}
 	for i, t := range o.targets {
 		if o.live != nil && !o.live[i] {
+			continue
+		}
+		if c := o.colRef[i]; c >= 0 && c < len(inRow) {
+			// evalExprSlot's ColumnRef arm for a *MaterializedSlot, copied
+			// in place; an out-of-range index takes that arm for its error.
+			o.out[i] = inRow[c]
+			if seqScanDeformPoison {
+				checkDeformPoison(o.out[i])
+			}
 			continue
 		}
 		v, err := evalExprSlot(t, inSlot, o.ctx)

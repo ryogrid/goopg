@@ -2103,6 +2103,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       scanLeafItems drops `lo` once one entry passed it \(leaf order\)\.
     - Q16 0\.268 → 0\.237 s wall, 1\.11 → 0\.975 CPU\-s; Q72 −4 %; sweep sum noise \(Q1/Q81/Q14 rises did not repeat in A/B\)\.
     - Next: Q16 still ~4× PG CPU — per\-entry parse \+ call layers; PG's \_bt\_set\_startikey / look\-ahead\.
+  - **Slice 58 — the serial leader path of a sorted Group stops copying and allocating per row LANDED 2026\-10\-22\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, executor package PASS
+    poison\-armed\. Doc part 6 "Slice 58" \(new part; part 5 reached 737 lines\)\.
+    - Named target TPC\-DS Q97 \(0\.56 s vs PG 0\.12\): perf split by stack — the leader is busy the whole query
+      \(~530 ms/run\) vs ~150 ms per worker; its serial chain is the bottleneck\.
+    - projectOp copies bare ColumnRef targets from a MaterializedSlot row in place \(projectColRefs\); nextSorted
+      compares group keys via sameSortedGroup / appendGroupColKey without per\-row allocations \(both pinned\)\.
+    - Q97 CPU 1\.10 → 1\.06 CPU\-s parallel, 0\.91–0\.94 → 0\.83–0\.89 serial; wall noise ±10 % hides it\.
+    - Tried and dropped: pdqsort with index tiebreak for sortOp \(Q87 \+8 %\); slices\.SortStableFunc \(flat\)\.
+    - Next: leader's Gather Merge key re\-eval, merge join input re\-keying, CASE IS NULL/AND interpreted fallback\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4155,6 +4166,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `de41f8c20`** \(M0122\-0012 slice 56 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `49da13013`** \(M0122\-0012 slice 57 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
