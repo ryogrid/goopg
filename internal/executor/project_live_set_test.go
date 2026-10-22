@@ -117,3 +117,48 @@ func TestProjectLiveSetUnderAggregate(t *testing.T) {
 		}
 	})
 }
+
+// TestNestedProjectLiveSet pins M0122-0012 slice 53: a Project whose child is
+// another Project builds that child with a live set — the child's only reader
+// is the parent, which evaluates just its own live targets. TPC-DS Q14 stacks
+// a re-expansion Project on another that lists every joined column; with
+// every inner target live the fold reached the last column and the probes
+// under it deformed whole rows.
+func TestNestedProjectLiveSet(t *testing.T) {
+	scan16 := &optimizer.SeqScan{Table: deformTable(16)}
+	inner := reexpandProject(scan16)
+	outer := reexpandProject(inner)
+	agg := &optimizer.Aggregate{
+		Child: outer,
+		Mode:  optimizer.AggModeSimple,
+		Aggs: []optimizer.AggregateCall{
+			// Output 2 of the outer projection is inner output 13, which
+			// is scan column 2.
+			{Name: "sum", Arg: deformCol(2), Type: catalog.Type{Name: "int8"}},
+		},
+	}
+	op := mustBuildDeform(t, agg)
+	outerOp := projectUnder(t, op)
+	if got := liveIndexes(outerOp.live); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("outer live targets %v, want [2]", got)
+	}
+	innerOp := projectUnder(t, outerOp.child)
+	if got := liveIndexes(innerOp.live); len(got) != 1 || got[0] != 13 {
+		t.Fatalf("inner live targets %v, want [13] (the one the outer's live target reads)", got)
+	}
+	if b, n := seqLeafBound(t, op); b != 3 || n != 16 {
+		t.Fatalf("bound=%d ncols=%d, want 3/16 (scan column 2 alone)", b, n)
+	}
+
+	// Under a root (not consumer-complete) parent, the outer evaluates every
+	// target, so the inner's consumers are all of them: every inner target
+	// the outer reads (0..15; the trailing constant fill is read by nobody)
+	// stays live, and the scan deforms in full.
+	op = mustBuildDeform(t, reexpandProject(reexpandProject(&optimizer.SeqScan{Table: deformTable(16)})))
+	if got := liveIndexes(projectUnder(t, projectUnder(t, op).child).live); len(got) != 16 || got[15] != 15 {
+		t.Fatalf("inner live = %v under a full outer, want [0..15]", got)
+	}
+	if b, n := seqLeafBound(t, op); b != 16 || n != 16 {
+		t.Fatalf("bound=%d ncols=%d under a full outer, want 16/16", b, n)
+	}
+}

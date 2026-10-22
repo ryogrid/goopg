@@ -439,3 +439,79 @@ plan shapes are identical.
 **Left.** Q16 is still ~8× PG. What remains is the walk's per-entry tuple comparisons
 (`comparePGIndexTupleAttrs`, ~38 %): PG compares scankeys with each attribute's comparator, while goopg compares
 two whole tuple images.
+
+## Slice 53 (2026-10-22): nested Projects and non-correlated sublinks keep the deform bound — TPC-DS Q14
+
+**Target, named up front:** TPC-DS Q14 at equal buffers, 13.7–16.3 s against PG's ~8 s: the largest absolute gap
+left.
+
+**First attempt, discarded (measured non-improvement).** Q78 and Q97 profiles showed two row copies in a row.
+A Gather Merge worker's Sort keeps a materialised copy of each row, and the queue transfer copies it again.
+Marking a Sort's emitted rows and a Gather's queue rows as already owned (`MaterializedSlot.owned`) removed the
+copy. A/B showed Q78 inside its 1.5–3.1 s noise and Q97 slightly *slower* (0.42 → 0.46 s), so the change was
+dropped uncommitted.
+
+**Cause.** In Q14's profile, `indexScanOp.Next` took 43 %, and 26 % of that was full-width heap decoding
+(`decodeRowIntoInfo`). A debug build counting decoded rows per index scan showed:
+
+| probe | rows decoded | deform width |
+|---|---|---|
+| `store_sales` (Q14b) | 1.38 M | all 23 columns |
+| `date_dim` | 1.31 M | all 28 columns |
+| `item` | 1.55 M | all 22 columns |
+
+The queries read a 9–13-column prefix of each. Two rules widened the bound to full:
+
+- **A Project under a Project kept every target live.** Slice 35 gives a consumer-complete Project (under a plain
+  aggregate, through sorts) a live set. Q14 stacks that re-expansion Project on a second one listing every column
+  of its lateral joins. The inner Project was built with `live = nil`, so it folded the joins' last column and
+  every probe below deformed in full.
+- **A non-correlated sublink declined the deform walk.** Q14b's `date_dim` probe filters on
+  `d_week_seq = (SELECT d_week_seq FROM date_dim WHERE …)`. `deformSublinkArgs` declined every unlowered sublink,
+  so:
+  - the probe deformed every `date_dim` column;
+  - the lateral outer-ref fold (`deformLateralOuterRefs`) failed the outer side, `store_sales` and `item`, to
+    full.
+
+**Rule.**
+
+- **Nested Projects.** `buildProjectNode` builds a child Project with
+  `projectLiveSet(child, liveProjectTargets(p, live))`. A projection's only reader of its child's rows is itself,
+  and it evaluates exactly its live targets (every target when `live` is nil), so the child is consumer-complete.
+  This is `buildCompleteChild`'s rule under an aggregate, applied one level down. Unskippable dead targets stay
+  live (`projectTargetSkippable`).
+- **Non-correlated sublinks.** A sublink with `IsNonCorrelated` (`!planHasOuterRef(inner)`) and no lowered params
+  reads nothing of the row: `evalSubquery` keys it by the sublink alone (`nonCorrelatedCacheKey`, InitPlan
+  semantics), and the row it pushes on `OuterRows` is never read. `deformSublinkArgs` now reports it as reading no
+  columns, and the lateral fold accepts it. A correlated or unlowered sublink still declines.
+
+**Pins.**
+
+- `TestNestedProjectLiveSet` builds Aggregate → re-expansion Project → re-expansion Project → scan. It checks that
+  the inner Project's live set is exactly the target the outer's live target reads, and that the scan deforms one
+  column. Under a root (full) outer, the inner keeps every read target and the scan deforms in full. HEAD's build
+  leaves the inner live set empty and fails.
+- `TestDeformNonCorrelatedSublinkReadsNothing`: `col = (non-correlated sublink)` folds to that column alone and the
+  lateral fold keeps the key column, while the correlated forms stay full. HEAD's `scan_deform.go` fails.
+- `TestLateralProbeWithInitPlanFilterValues` runs a nested-loop index probe filtered by a non-correlated sublink,
+  with the deform poison armed, and requires the hash join's result.
+- The executor package passes poison-armed.
+
+**Measured.** Warm, 2GB clone, each Q14 statement separately, two interleaved rounds:
+
+| statement | HEAD (s) | candidate (s) |
+|---|---|---|
+| Q14a | 7.10–7.81 | 6.69–6.76 |
+| Q14b | 8.01–8.84 | 6.82–7.36 |
+
+The sf025 sweep sum went from 115.7 to 113.4 s. Its Q60/Q7/Q1 rises did not repeat in an A/B (equal on both
+builds), and TPC-H's warm total is flat (15.1 vs 15.5 s, Q2 bimodal). TPC-H values are identical (acceptance
+24 MATCH), and the sweep's plan shapes are identical.
+
+**Left.**
+
+- The slab builder's Project arm (`buildRec`) still evaluates every target; only `buildNode`'s path applies live
+  sets.
+- A CTE body is built with an unbounded `Build(p.Child)` (`newCteScanOp`), so its scans deform from a full
+  incoming bound.
+- Both are bound-threading gaps for the next slices.

@@ -716,7 +716,23 @@ func finishIncrementalSortNode(p *optimizer.IncrementalSort, child Operator, sco
 // marks (nil = all of them), threading the bound those targets need to its
 // child.
 func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instrumenter) (Operator, error) {
-	child, err := buildNode(p.Child, deformProjectBelow(p, bound, live), scope)
+	childBound := deformProjectBelow(p, bound, live)
+	var child Operator
+	var err error
+	if inner, ok := p.Child.(*optimizer.Project); ok {
+		// A projection's only reader of its child's rows is itself, and it
+		// evaluates just its live targets: a child projection is therefore
+		// consumer-complete, its consumers being those targets — the rule
+		// buildCompleteChild applies under an aggregate, one level down
+		// (M0122-0012 slice 53). TPC-DS Q14 stacks a re-expansion Project
+		// on another that lists every column of its lateral joins; built
+		// with every target live, that inner Project folded the joins'
+		// last column, and the store_sales, item and date_dim probes beneath
+		// deformed every column of every probed row.
+		child, err = buildProjectNode(inner, childBound, projectLiveSet(inner, liveProjectTargets(p, live)), scope)
+	} else {
+		child, err = buildNode(p.Child, childBound, scope)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -728,6 +744,21 @@ func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instr
 	pop := newProjectOp(p, child)
 	pop.live = live
 	return maybeInstrument(p, pop, scope), nil
+}
+
+// liveProjectTargets is p's targets that live marks (every target when live
+// is nil) — the expressions p evaluates against its child's rows.
+func liveProjectTargets(p *optimizer.Project, live []bool) []optimizer.Expr {
+	if live == nil {
+		return p.Targets
+	}
+	out := make([]optimizer.Expr, 0, len(p.Targets))
+	for i, t := range p.Targets {
+		if live[i] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func markProjectScanReads(p *optimizer.Project, child Operator, live []bool) {

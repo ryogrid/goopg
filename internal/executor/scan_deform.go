@@ -222,9 +222,20 @@ func deformScanReadSet(width int, exprs ...optimizer.Expr) []bool {
 // row, as a PG SubPlan's parParam/args are. An unlowered sublink pushes the
 // whole row and keys its cache by every column (subqueryCacheKey), so it
 // cannot be bounded and declines.
+//
+// A non-correlated sublink (IsNonCorrelated: its plan reads no outer value at
+// all, planHasOuterRef) reads nothing of the row either: evalSubquery keys its
+// result by the sublink alone (nonCorrelatedCacheKey, InitPlan semantics) and
+// the row it pushes on OuterRows is never read — PG plans it as an InitPlan,
+// whose param references no column of the scan (M0122-0012 slice 53; TPC-DS
+// Q14's `d_week_seq = (SELECT d_week_seq FROM date_dim …)` probe filter
+// otherwise deformed every date_dim, store_sales and item column).
 func deformSublinkArgs(x *optimizer.SubqueryExpr) ([]optimizer.Expr, bool) {
-	if x == nil || len(x.ParParam) == 0 {
+	if x == nil {
 		return nil, false
+	}
+	if len(x.ParParam) == 0 {
+		return nil, x.IsNonCorrelated
 	}
 	return x.Args, true
 }
@@ -787,7 +798,11 @@ func deformLateralOuterRefs(right optimizer.Node) int {
 					}
 				}
 			case *optimizer.SubqueryExpr:
-				known = false
+				// A non-correlated sublink reads no outer value
+				// (deformSublinkArgs); any other may read the outer row.
+				if !r.IsNonCorrelated || len(r.ParParam) > 0 {
+					known = false
+				}
 			}
 		})
 		return ok && known
