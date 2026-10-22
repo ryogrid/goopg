@@ -125,6 +125,16 @@ type joinOp struct {
 	execKeyPackInt bool
 	execKeyBuf     []byte
 
+	// predExprs / predIdx are plan.Predicate compiled for joinPredicateMatch,
+	// the per-pair check of the nested-loop and lateral streams (M0122-0012
+	// slice 45); predSlot is the reused view over the pair buffer it reads.
+	// Built once, without constant folding, on the first pair: the plan is
+	// fixed for the joinOp's life and the slab holds no Context state.
+	predExprs    exprTreeSlab
+	predIdx      int32
+	predCompiled bool
+	predSlot     MaterializedSlot
+
 	// M0127-PS6.1 (05 §6, stage E5): the COMPILED twin of the three
 	// expression slots above. Join keys and residuals were the last
 	// 100%-interpreted hot expressions in the executor — the compiled
@@ -1583,7 +1593,18 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if o.plan.Predicate == nil {
 		return true, nil
 	}
-	v, err := evalExpr(o.plan.Predicate, row, o.ctx)
+	// Compiled, as joinPredicateMatchSlot evaluates the hash residual
+	// (M0127-PS6.1): the interpreted evalExpr boxed the row into a fresh
+	// interface and walked the tree for every candidate pair — a third of
+	// TPC-DS Q35, whose nested loop filters 5.7 M pairs (slice 45).
+	if !o.predCompiled {
+		o.predExprs = o.predExprs[:0]
+		o.predIdx = o.predExprs.buildExpr(o.plan.Predicate)
+		o.predCompiled = true
+	}
+	o.predSlot.row = row
+	v, err := evalFastExpr(o.predExprs, o.predIdx, &o.predSlot, o.ctx)
+	o.predSlot.row = nil
 	if err != nil {
 		return false, err
 	}

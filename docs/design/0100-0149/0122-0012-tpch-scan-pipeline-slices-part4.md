@@ -644,3 +644,60 @@ MATCH), and the sweep's plan shapes are identical.
   tuplesorts and reports `Full-sort Groups` / `Pre-sorted Groups` in EXPLAIN ANALYZE. goopg sorts each prefix
   group as one batch and prints neither line. The output order is the same; the ANALYZE text is not. Recorded
   in the deferral ledger.
+
+## Slice 45 (2026-10-22): the nested-loop join filter is compiled — TPC-DS Q35, Q74
+
+**Target, named up front:** TPC-DS Q35's remaining 1.55 s against PG's 0.35 s. After slice 44 its nested loop
+still filtered 5.7 M pairs at ~270 ns each, where PG takes ~90 ns.
+
+**Cause.** In the profile, `nlJoinStream.pairMatches → joinOp.joinPredicateMatch` took 32 %. It evaluated
+`plan.Predicate` through `evalExpr`, the interpreted evaluator. That cost twice for every candidate pair:
+
+- **A fresh interface.** It boxed the pair buffer into a new `rowSlotView` interface (`runtime.convTslice`,
+  8 %).
+- **The interpreted tree walk** (`evalExprSlot`).
+
+The hash join's residual has been compiled since M0127-PS6.1 (`joinPredicateMatchSlot`). The two per-pair
+streams that use `joinPredicateMatch`, the nested loop and the lateral join, were the last join paths still
+interpreted.
+
+**Rule.** On its first pair, `joinPredicateMatch` compiles `plan.Predicate` into its own slab
+(`predExprs`/`predIdx`). It uses `buildExpr`, with no constant folding and no Context state, so the slab is
+built once per joinOp. It then evaluates with `evalFastExpr` against a reused `MaterializedSlot`
+(`predSlot`) re-pointed at the pair buffer. Nothing changes in what is evaluated:
+
+- the counters for rows removed by the join filter;
+- the probe-qual attribution for rejected pairs;
+- the NULL-is-no-match rule.
+
+The compiled and interpreted evaluators are siblings: an expression kind the compiler does not know runs
+through `evalExprSlot` as an ExprAdapter node.
+
+**Pins.**
+
+- `TestJoinPredicateMatchCompiledMatchesInterpreted` compares the compiled match against `evalExpr` over every
+  pair of a mixed-kind fixture with NULLs. It covers eight predicates: equality and inequalities across date,
+  timestamptz, int, numeric and interval; AND / OR; an unknown literal; an IN list; NOT. The matrix holds both
+  matches and rejects.
+- `TestJoinPredicateMatchAllocatesNothingPerPair` asserts zero allocations per pair. HEAD's interpreted version
+  allocates one per pair and fails it.
+
+**Measured.** Warm, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q35 | 1.49–1.83 | 0.97–1.09 |
+| TPC-DS Q74 | 32.7–32.9 | 17.3–19.7 |
+
+In the sf025 sweep, the sum went from 136.5 to 125.2 s (Q74 31.7 → 19.2 s, Q35 1.66 → 1.14 s). The sweep's
+Q76/Q62/Q7/Q1 rises did not repeat in an A/B: Q76 was 0.33–0.46 s on both builds over six runs. This is the
+same single-query ~+2 s outlier pattern slices 43 and 44 recorded. TPC-H values are identical (acceptance 24
+MATCH), and the sweep's plan shapes are identical.
+
+**Left.**
+
+- `pairMatches` still copies the outer and inner rows into the pair buffer for every pair (`memmove`, ~8 % of
+  Q35). PG's join quals read the outer and inner tuple slots in place (`ExecQual` over `ecxt_outertuple` /
+  `ecxt_innertuple`). A two-source view would remove the copy.
+- `indexScanOp`'s Filter is still interpreted (`evalExpr`, ~14 % of Q35 through its hashed-SubPlan ANY).
+- Both are recorded in the deferral ledger.
