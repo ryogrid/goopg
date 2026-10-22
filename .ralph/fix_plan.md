@@ -588,7 +588,7 @@ heuristic stays live.)
     - Gates: race \(transam, activity, testport/framework\), units, internal/postmaster, TestPort\_RegressSuite,
       TestPort\_Isolation\*, tpch\-spotcheck, acceptance arm, sf025 PASS=99 same=99\.
   Movement: none — correctness fix — no plan instrument \(isolation harness and pg\_stat\_activity wait\-event fidelity\)
-- [ ] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
+- [x] testport/TestPort\_IsolationClusterConflict — FAIL \(22\.88 s\) \(AI\-20261020\-013101\-003; repro: `go test \-v \-run '^TestPort\_IsolationClusterConflict$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\)\. Design `docs/design/0100\-0149/m\-nightly\-cluster\-start\-timeout\-diagnostics\.md`\.
@@ -603,11 +603,23 @@ heuristic stays live.)
     - 2026\-10\-21 nightly \(e64b1bfe9, diagnostic armed\): no start timeout in testport; still waiting for one\.
     - 2026\-10\-23 nightly \(c6a780f7e\): recurrence captured as AI\-20261023\-005128\-001 — quiet cgroup, goroutine 1
       runnable in the catalog\-heap reload \(not parked in initdb\.Open's wait\); see that task\.
-- [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
+  - **Resolved 2026\-10\-23** \(harness/CI only, no engine change\)\. The recurrence \(AI\-20261023\-005128\-001\) showed
+    a quiet cgroup and goroutine 1 runnable in the catalog\-heap reload: CPU contention under the nightly co\-load
+    stretched a ~1 s start past the test's 20 s budget; the repro passes 3/3 in ~2 s on an idle host\.
+    internal/testutil/cluster honours PGCTLTIMEOUT \(pg\_ctl's DEFAULT\_WAIT override; raises normal budgets only,
+    pinned\) and stage\-testport exports PGCTLTIMEOUT=60\. Design m\-nightly\-cluster\-start\-timeout\-diagnostics §7\.
+  Movement: none — CI harness \(test start budget\)\.
+- [x] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\): same start timeout inside initdb\.Open as \-003; see that item\.
-- [ ] testport/TestPort\_ExtendedStatisticsSurvivesRestart — start timeout after 20 s \(AI\-20261023\-005128\-001; repro: `go test \-v \-run '^TestPort\_ExtendedStatisticsSurvivesRestart$' \./internal/testport/`\)\.
+  - **Resolved 2026\-10\-23** \(harness/CI only, no engine change\)\. The recurrence \(AI\-20261023\-005128\-001\) showed
+    a quiet cgroup and goroutine 1 runnable in the catalog\-heap reload: CPU contention under the nightly co\-load
+    stretched a ~1 s start past the test's 20 s budget; the repro passes 3/3 in ~2 s on an idle host\.
+    internal/testutil/cluster honours PGCTLTIMEOUT \(pg\_ctl's DEFAULT\_WAIT override; raises normal budgets only,
+    pinned\) and stage\-testport exports PGCTLTIMEOUT=60\. Design m\-nightly\-cluster\-start\-timeout\-diagnostics §7\.
+  Movement: none — CI harness \(test start budget\)\.
+- [x] testport/TestPort\_ExtendedStatisticsSurvivesRestart — start timeout after 20 s \(AI\-20261023\-005128\-001; repro: `go test \-v \-run '^TestPort\_ExtendedStatisticsSurvivesRestart$' \./internal/testport/`\)\.
   - Filed 2026\-10\-23\. The \-003/\-004 start\-timeout class, with the 2026\-10\-21 diagnostic armed:
     - cgroup quiet: memory\.current 0\.6 GB of high 6 GB, PSI some/full avg 0\.00 — not a memory throttle\.
     - goroutine 1 **runnable** \(not parked\) in initdb catalog\-heap reload \(reloadUserAggregatesFromHeap →
@@ -616,6 +628,12 @@ heuristic stays live.)
       lane — CPU starvation of a slow\-but\-moving start, not a wait bug\.
   - Next: re\-run the repro on an idle host; if it passes, the lever is either the 20 s start budget under nightly
     load or the cost of the per\-start catalog heap reload \(it decodes every catalog row on each start\)\.
+  - **Resolved 2026\-10\-23** \(harness/CI only, no engine change\)\. The recurrence \(AI\-20261023\-005128\-001\) showed
+    a quiet cgroup and goroutine 1 runnable in the catalog\-heap reload: CPU contention under the nightly co\-load
+    stretched a ~1 s start past the test's 20 s budget; the repro passes 3/3 in ~2 s on an idle host\.
+    internal/testutil/cluster honours PGCTLTIMEOUT \(pg\_ctl's DEFAULT\_WAIT override; raises normal budgets only,
+    pinned\) and stage\-testport exports PGCTLTIMEOUT=60\. Design m\-nightly\-cluster\-start\-timeout\-diagnostics §7\.
+  Movement: none — CI harness \(test start budget\)\.
 - [x] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
@@ -4291,6 +4309,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `ecbfe6696`** \(M0122\-0012 slice 63 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `d164c7319`** \(M0122\-0012 slice 64 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

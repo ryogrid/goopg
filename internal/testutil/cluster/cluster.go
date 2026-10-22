@@ -133,8 +133,9 @@ func New(name string, opts Options) (*Cluster, error) {
 	}
 	startup := opts.StartupWait
 	if startup <= 0 {
-		startup = 20 * time.Second
+		startup = defaultStartupWait
 	}
+	startup = startupWaitFromEnv(startup, os.Getenv("PGCTLTIMEOUT"))
 	shutdown := opts.ShutdownWait
 	if shutdown <= 0 {
 		shutdown = 20 * time.Second
@@ -277,6 +278,33 @@ func (c *Cluster) Start() error {
 	mem := cgroupMemoryNote(cmd.Process.Pid)
 	return fmt.Errorf("start timeout after %s (see %s)%s%s%s",
 		c.startupWait, c.logPath, tail, mem, c.stuckStartStacks(cmd, exited))
+}
+
+// defaultStartupWait is the start budget when Options.StartupWait is unset.
+const defaultStartupWait = 20 * time.Second
+
+// startupWaitFromEnv raises a start budget to PGCTLTIMEOUT seconds when that
+// is set and longer — pg_ctl's own override of its 60 s DEFAULT_WAIT
+// (src/bin/pg_ctl/pg_ctl.c), which PG's TAP suites rely on when a host runs
+// slow. Only a normal start budget (at least the default) is raised: a test
+// that sets a deliberately short one to provoke a timeout keeps it.
+//
+// The nightly testport lane exports PGCTLTIMEOUT=60 (M-NIGHTLY
+// AI-20261023-005128-001): under that lane's co-load a server's start, still
+// progressing through the catalog-heap reload, overran the 20 s budget its
+// test had set — ~2 s on an idle host — and was reported as a regression.
+func startupWaitFromEnv(budget time.Duration, env string) time.Duration {
+	if env == "" || budget < defaultStartupWait {
+		return budget
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(env))
+	if err != nil || secs <= 0 {
+		return budget
+	}
+	if d := time.Duration(secs) * time.Second; d > budget {
+		return d
+	}
+	return budget
 }
 
 // cgroupMemoryNote reports the memory state of the server's cgroup v2 at a

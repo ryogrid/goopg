@@ -23,7 +23,13 @@ if [[ "${TEST_ROOT}" != "${REPO_ROOT}" && ! -e "${TEST_ROOT}/postgres/local_inst
 fi
 
 rc=0
+# PGCTLTIMEOUT=60 is pg_ctl's own default start wait (DEFAULT_WAIT,
+# src/bin/pg_ctl/pg_ctl.c). internal/testutil/cluster honours it, raising a
+# test's normal start budget (20 s in most suites): under this lane's co-load a
+# server still working through its catalog-heap reload overran 20 s
+# (AI-20261023-005128-001; ~2 s on an idle host) and was filed as a regression.
 ( cd "${TEST_ROOT}" && \
+  PGCTLTIMEOUT=60 \
   GOOPG_REGRESS_DIFF_DIR="${REGRESS_DIFF_DIR}" \
   GOOPG_CG_UNIT=goopg-nightly-testport GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
   GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \
