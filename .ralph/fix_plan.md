@@ -2157,6 +2157,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Rule b: slice 62 moved its target ≥ 3 % → no yield\.
     - Deferred \(ledger\): PG's inverse\-transition moving aggregate for sliding frames\.
     - Next: Q51 still ~2\.7× PG — leader row clones via sortOp over CTE scans; Gather queue clones\.
+  - **Slice 63 — a Gather Merge under an aggregate ships only live columns; live / prefix clones leave dead cells
+    unwritten LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99
+    \(61 ck; Q78 ck identical\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS \(632 s, \-timeout 30m\), executor package PASS poison\-armed\. Doc part 6 "Slice 63"\.
+    - Named target TPC\-DS Q78: transferRowForQueue in gatherMergeOp deep\-copied ~50\-column join rows \(clone 9\.3 % \+
+      memclr 3\.6 % of instructions\); slice 39's live mask covered plain Gather only\.
+    - buildCompleteChild GatherMerge arm \(consumers \+ merge keys\); cloneRowOwnedLive / cloneRowOwnedPrefix skip dead\-cell
+      writes \(NullDatum is the zero Datum — pinned\)\.
+    - Q78 27\.87 → 26\.71 Ginstr \(−4\.2 %\); other queries ±0\.1 %; wall/CPU unresolvable at load 7–9\.
+    - Next: worker Sort below Gather Merge stores whole join rows \(worker trees built with buildNode\); full\-width transfer rows\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4248,6 +4258,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `fdb607c10`** \(M0122\-0012 slice 60 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `c6a780f7e`** \(M0122\-0012 slice 62 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

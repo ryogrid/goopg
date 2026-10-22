@@ -525,15 +525,24 @@ func cloneRowOwned(src Row) Row {
 // slice 39).
 func cloneRowOwnedLive(src Row, live []bool) Row {
 	dst := acquireRow(len(src))
-	dead := NullDatum
 	if seqScanDeformPoison {
-		dead = deformPoisonDatum()
+		dead := deformPoisonDatum()
+		for i, d := range src {
+			if i < len(live) && live[i] {
+				dst[i] = d.MaterializeArena()
+			} else {
+				dst[i] = dead
+			}
+		}
+		return dst
 	}
-	for i, d := range src {
-		if i < len(live) && live[i] {
-			dst[i] = d.MaterializeArena()
-		} else {
-			dst[i] = dead
+	// acquireRow's cells are already the zero Datum, which is NullDatum
+	// (KindNull is 0), so a dead cell needs no write: only the live ones
+	// — within the mask's length — are touched (M0122-0012 slice 63; a
+	// 50-column join row with six live columns wrote all fifty).
+	for i := range min(len(live), len(src)) {
+		if live[i] {
+			dst[i] = src[i].MaterializeArena()
 		}
 	}
 	return dst
@@ -558,12 +567,13 @@ func cloneRowOwnedPrefix(src Row, bound int) Row {
 	for i := 0; i < bound; i++ {
 		dst[i] = src[i].MaterializeArena()
 	}
-	tail := NullDatum
+	// The tail is already NullDatum (the zero Datum) in a fresh row; only
+	// the armed poison is written.
 	if seqScanDeformPoison {
-		tail = deformPoisonDatum()
-	}
-	for i := bound; i < len(src); i++ {
-		dst[i] = tail
+		tail := deformPoisonDatum()
+		for i := bound; i < len(src); i++ {
+			dst[i] = tail
+		}
 	}
 	return dst
 }

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -81,5 +82,72 @@ func TestCloneRowOwnedLive(t *testing.T) {
 		if !got[i].IsNull() {
 			t.Fatalf("dead cell %d = %v, want NULL", i, got[i])
 		}
+	}
+}
+
+// TestGatherMergeUnderAggregateShipsLiveColumns pins M0122-0012 slice 63: a
+// Gather Merge under a plain or partial aggregate ships only the columns the
+// aggregate's arms read AND its own merge keys, which the leader evaluates on
+// every transferred row (a dead key column would arrive NULL and mis-order
+// the merge). TPC-DS Q78's GroupAggregate → Gather Merge branches deep-copied
+// whole join rows. A Finalize aggregate, or a key the live walk cannot resolve
+// (ctid), keeps every column.
+func TestGatherMergeUnderAggregateShipsLiveColumns(t *testing.T) {
+	agg := func(mode optimizer.AggMode, key optimizer.Expr) *optimizer.Aggregate {
+		return &optimizer.Aggregate{
+			Mode: mode,
+			Child: &optimizer.GatherMerge{
+				Keys:  []optimizer.SortKey{{Expr: key}},
+				Child: &optimizer.Sort{Keys: []optimizer.SortKey{{Expr: key}}, Child: &optimizer.SeqScan{Table: deformTable(16)}},
+			},
+			GroupExprs: []optimizer.Expr{deformCol(3)},
+			Aggs: []optimizer.AggregateCall{
+				{Name: "sum", Arg: deformCol(11), Type: catalog.Type{Name: "int8"}},
+			},
+		}
+	}
+	gatherMergeUnder := func(t *testing.T, op Operator) *gatherMergeOp {
+		t.Helper()
+		a, ok := op.(*aggregateOp)
+		if !ok {
+			t.Fatalf("root is %T", op)
+		}
+		g, ok := a.child.(*gatherMergeOp)
+		if !ok {
+			t.Fatalf("aggregate child is %T", a.child)
+		}
+		return g
+	}
+	got := liveIndexes(gatherMergeUnder(t, mustBuildDeform(t, agg(optimizer.AggModeSimple, deformCol(5)))).liveCols)
+	if len(got) != 3 || got[0] != 3 || got[1] != 5 || got[2] != 11 {
+		t.Fatalf("Gather Merge live columns %v, want [3 5 11] (group column, merge key, aggregate argument)", got)
+	}
+	if live := gatherMergeUnder(t, mustBuildDeform(t, agg(optimizer.AggModeFinal, deformCol(5)))).liveCols; live != nil {
+		t.Fatalf("Finalize aggregate's Gather Merge live columns %v, want nil", liveIndexes(live))
+	}
+	if live := gatherMergeUnder(t, mustBuildDeform(t, agg(optimizer.AggModeSimple, &optimizer.CTIDExpr{}))).liveCols; live != nil {
+		t.Fatalf("ctid merge key: live columns %v, want nil (every column)", liveIndexes(live))
+	}
+}
+
+// TestNullDatumIsTheZeroDatum pins the premise cloneRowOwnedLive and
+// cloneRowOwnedPrefix rest on since slice 63: a fresh row's cells are already
+// NullDatum, so a dead cell is left unwritten. Reordering DatumKind so that
+// KindNull is not 0 would turn every dead cell into a non-NULL value.
+func TestNullDatumIsTheZeroDatum(t *testing.T) {
+	// Dead cells are NULL with the deform poison off (poison when armed).
+	old := seqScanDeformPoison
+	seqScanDeformPoison = false
+	defer func() { seqScanDeformPoison = old }()
+	if !reflect.DeepEqual(NullDatum, Datum{}) || !(Datum{}).IsNull() {
+		t.Fatalf("NullDatum %+v is not the zero Datum", NullDatum)
+	}
+	row := cloneRowOwnedPrefix(Row{NewIntDatum(1), NewIntDatum(2), NewStringDatum("x")}, 1)
+	if row[0].Int != 1 || !row[1].IsNull() || !row[2].IsNull() {
+		t.Fatalf("cloneRowOwnedPrefix(.., 1) = %v, want [1 NULL NULL]", row)
+	}
+	live := cloneRowOwnedLive(Row{NewIntDatum(1), NewIntDatum(2), NewIntDatum(3)}, []bool{false, true})
+	if !live[0].IsNull() || live[1].Int != 2 || !live[2].IsNull() {
+		t.Fatalf("cloneRowOwnedLive(.., [f t]) = %v, want [NULL 2 NULL]", live)
 	}
 }

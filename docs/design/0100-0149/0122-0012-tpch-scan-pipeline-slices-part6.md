@@ -331,3 +331,49 @@ goopg recomputes a sliding frame from its new head. Sliding frames are rare in t
 **Left.** Q51 is still ~2.7× PG. The leader's sorted Groups and Sorts over CTE scans clone every row
 (`cloneRowOwned` via `sortOp.Open` ← `cteScanOp`), and the workers' Gather queue clones every row
 (`transferRowForQueue`).
+
+## Slice 63 (2026-10-23): a Gather Merge under an aggregate ships only live columns, and live / prefix clones leave dead cells unwritten — TPC-DS Q78
+
+**Target.** TPC-DS Q78, 1.6–2.0 s against PG's 0.46 s, at 27.9 G instructions. Each of its three CTE branches is
+a GroupAggregate → Gather Merge → Sort → (Parallel Hash Join + anti join). An instruction profile put
+`cloneRowOwned` at 12.5 % and `memclrNoHeapPointers` at 5.3 %. Most of that (9.3 % + 3.6 %) was
+`transferRowForQueue` in `gatherMergeOp.runWorker`: every ~50-column join row was deep-copied across the worker
+queue for an aggregate that reads six columns. Slice 39 had given plain Gather a live-column mask
+(`gatherOp.liveCols` via `buildCompleteChild`), but Gather Merge had no such arm.
+
+**Change.**
+
+- **Live mask on Gather Merge.** `buildCompleteChild` gets a GatherMerge arm. `newGatherMergeNode`, shared with
+  `buildNode` as `newGatherNode` is, sets `liveCols` to `consumerLiveColumns` of the consumers plus the
+  GatherMerge's own merge keys, because the leader evaluates those keys on every transferred row. Both transfer
+  sites take `transferRowForQueueLive`: the worker queue, and the leader's own participating tree. An
+  unresolvable shape, such as a ctid key or a sublink, yields nil, which means every column.
+- **No writes for dead cells.** `cloneRowOwnedLive` no longer walks every column writing `NullDatum` into dead
+  cells: a fresh row's cells are already the zero Datum, which is `NullDatum` (`KindNull` = 0). It copies only
+  the live cells within the mask; the armed deform poison still writes every dead cell.
+  `cloneRowOwnedPrefix`, the seq scan's survivor-window clone, skips its tail the same way.
+
+**Pins.**
+
+- `TestGatherMergeUnderAggregateShipsLiveColumns`: the live set is exactly the group column, the merge key and
+  the aggregate argument. A Finalize aggregate or a ctid merge key gets nil. Mutation check: omitting the merge
+  keys fails it.
+- `TestNullDatumIsTheZeroDatum` pins the zero-value premise and both clones' NULL tails with the poison off.
+  `TestCloneRowOwnedLive` and the existing Gather Merge order / null-ordering / identity tests pass.
+- The executor package passes with the poison armed.
+
+**Measured.** Instructions per query against `c6a780f7e`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q78 | 27.86–27.87 | 26.71 (−4.2 %; the live mask alone gave −2.4 %) |
+| Q51, Q97, Q14, Q87, Q23, Q1 | — | within ±0.1 % |
+
+Wall time and CPU could not resolve the change at load average 7–9. The sweep's Q78 checksum is identical
+(`ck=c06cf981a7819a37`). Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are
+identical.
+
+**Left.** The transferred row is still allocated, and therefore zeroed, at full width: the leader expects the
+child schema's column positions. The worker's Sort below the Gather Merge stores whole join rows
+(`sortOp.Open` → `MaterializedSlot.Materialize`), because a worker tree is built with `buildNode`, not
+`buildCompleteChild`, so nothing narrows it to the consumers' columns.

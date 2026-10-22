@@ -410,10 +410,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams. The GatherMerge keys (folded
 		// by deformBoundBelow) are leader-side consumers of the worker rows.
-		workerMergeBound := deformBoundBelow(p, bound)
-		return maybeInstrument(p, newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
-			return buildNode(p.Child, workerMergeBound, scope)
-		}), scope), nil
+		return maybeInstrument(p, newGatherMergeNode(p, bound), scope), nil
 	case *optimizer.Distinct:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
 		if err != nil {
@@ -661,6 +658,15 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		g := newGatherNode(p, bound)
 		g.liveCols = consumerLiveColumns(consumers)
 		return maybeInstrument(p, g, scope), nil
+	case *optimizer.GatherMerge:
+		// As Gather (M0122-0012 slice 63): the rows reach only these
+		// consumers and the leader's merge, which reads the GatherMerge keys,
+		// so a worker — and the leader's own participating tree — ships just
+		// those columns. TPC-DS Q78's three GroupAggregate → Gather Merge
+		// branches deep-copied every 50-column join row across the queue.
+		g := newGatherMergeNode(p, bound)
+		g.liveCols = consumerLiveColumns(append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...))
+		return maybeInstrument(p, g, scope), nil
 	case *optimizer.IncrementalSort:
 		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
 		child, err := buildCompleteChild(p.Child, deformBoundBelow(p, bound), keys, scope)
@@ -670,6 +676,16 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		return finishIncrementalSortNode(p, child, scope), nil
 	}
 	return buildNode(n, bound, scope)
+}
+
+// newGatherMergeNode builds a GatherMerge whose workers each construct their
+// own tree over the partial plan, narrowed by the bound captured here —
+// newGatherNode's twin, shared by buildNode's arm and buildCompleteChild.
+func newGatherMergeNode(p *optimizer.GatherMerge, bound int) *gatherMergeOp {
+	workerMergeBound := deformBoundBelow(p, bound)
+	return newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
+		return buildNode(p.Child, workerMergeBound, scope)
+	})
 }
 
 // newGatherNode builds a Gather whose workers each construct their own tree
