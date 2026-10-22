@@ -206,3 +206,54 @@ plan shapes are identical.
 **Left.** Q97 remains ~7× PG. The probe rows are now borrowed, but the Gather Merge workers still ship every
 joined row through the queue (`transferRowForQueue`), and Group / Merge Full Join run in the leader. A next
 profile should split the time between the workers' sort and the leader's merge.
+
+## Slice 49 (2026-10-22): a skip-scan group key is built without re-resolving the index — TPC-DS Q16
+
+**Target, named up front:** TPC-DS Q16, 0.97–1.20 s warm against PG's 0.08 s.
+
+**Cause.** EXPLAIN ANALYZE put Q16's time in its anti-join and semi-join probes. They are an Index Only Scan on
+`catalog_returns_pkey (cr_item_sk, cr_order_number)` and an Index Scan on `catalog_sales_pkey`, each keyed only on
+the second column: skip scans. Each probe took ~18 ms against PG's ~1.5 ms.
+
+In the profile, `btreeSkipEnum.walkLeaf → groupBounds` took 58 %. For every prefix group (every distinct
+`cr_item_sk`), `groupBounds` decoded the group's first entry and called `ctx.indexProbeKey` twice, once for the
+group's probe and once for its pivot. Each `indexProbeKey` call re-resolved:
+
+- the index descriptor (`pgIndexKeyDesc`);
+- the key columns (`pgIndexKeyColumns`), by a case-insensitive by-name lookup (`findColumnByName`,
+  `strings.EqualFold`) that also allocates.
+
+Those two alone were 37 % of the query.
+
+**Rule.** The enumeration already holds both, resolved once per Rescan in `init` (`e.desc`, `e.keyCols`).
+`groupBounds` now forms both images directly, through `btreeSkipEnum.probeKey`: one `pgIndexTupleKey` over
+`e.keyCols[:n]` with the zero heap TID, wrapped with `indexProbeKey`'s own error text. The values go in a reused
+buffer (`e.vals`): the prefix datums, then the bound columns' values.
+
+This is exactly `indexProbeKey`'s tuple-format arm. A part list built from `keyCols` in order always passes its
+"leading prefix of the key" check, so the bytes are the same.
+
+**Pin.** `TestSkipGroupBoundsMatchesIndexProbeKey` checks that `groupBounds`' probe and pivot are byte-equal to
+the `indexProbeKey` composition it replaced, for entries of two indexes:
+
+- `(a, b)`, skipping one int column;
+- `(a, c, b)`, skipping an int and a varchar, which brings in alignment and a varlena header.
+
+The entries include an empty string and a negative key. Dropping the last bound value from the probe fails it.
+
+**Measured.** Warm, two interleaved rounds of three runs:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q16 | 0.97–1.20 | 0.66–0.90 |
+| TPC-DS Q95 | 3.69–4.21 | 3.37–3.96 |
+
+In the sf025 sweep, Q16 went from 0.94 to 0.67 s and the sum from 116.7 to 115.6 s. Q26's sweep rise was the
+first-run warm-up; it is equal on both builds after that. TPC-H values are identical (acceptance 24 MATCH), and
+the sweep's plan shapes are identical.
+
+**Left.** In what remains of the skip walk, each group still decodes its first entry's prefix to datums and
+re-encodes the probe and pivot (`pgIndexTupleKeyDatums` + `pgIndexTupleKey`, ~37 %), and the per-entry comparisons
+are another 37 %. PG's skip arrays never form tuples: `_bt_advance_array_keys` copies the entry's prefix
+attribute into the array's scankey and compares scankeys against index tuples. Building the pivot by truncating
+the entry (`_bt_truncate`'s shape), and comparing on scankeys, is the next step for Q16, Q94 and Q95.

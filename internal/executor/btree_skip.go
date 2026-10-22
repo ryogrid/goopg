@@ -38,6 +38,10 @@ type btreeSkipEnum struct {
 	gPivot   []byte
 	gReached bool
 	gPassed  bool
+
+	// vals is groupBounds' reused value buffer (prefix datums, then the
+	// bound columns' values).
+	vals []Datum
 }
 
 // init evaluates the bound columns ONCE per Rescan — the same eval timing
@@ -181,19 +185,36 @@ func (e *btreeSkipEnum) groupBounds(ctx *Context, idx *catalog.Index, s int, key
 		return nil, nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
 			"%s: skip scan on index %q could not decode a prefix entry: %v", op, idx.Name, derr)}
 	}
-	parts := make([]indexProbeKeyPart, 0, s+len(e.rest))
-	for i := 0; i < s; i++ {
-		parts = append(parts, indexProbeKeyPart{col: e.keyCols[i], val: datums[i], pos: pos})
+	// The key images are formed straight from the enumeration's own
+	// descriptor and key columns (M0122-0012 slice 49): they are what
+	// ctx.indexProbeKey resolves on every call — pgIndexKeyDesc(idx) and
+	// pgIndexKeyColumns(idx), the latter a by-name column lookup that
+	// allocates — and a part list built from keyCols in order always passes
+	// its prefix check. The bytes and the error text are indexProbeKey's.
+	n := s + len(e.rest)
+	e.vals = append(e.vals[:0], datums[:s]...)
+	for _, r := range e.rest {
+		e.vals = append(e.vals, r.val)
 	}
-	probe, encErr := ctx.indexProbeKey(idx, append(parts, e.rest...))
-	if encErr != nil {
-		return nil, nil, encErr
+	if probe, err = e.probeKey(idx, e.vals[:n], pos); err != nil {
+		return nil, nil, err
 	}
-	pivot, encErr = ctx.indexProbeKey(idx, parts)
-	if encErr != nil {
-		return nil, nil, encErr
+	if pivot, err = e.probeKey(idx, e.vals[:s], pos); err != nil {
+		return nil, nil, err
 	}
 	return probe, pivot, nil
+}
+
+// probeKey is ctx.indexProbeKey's tuple-format arm for a part list naming
+// the first len(vals) key columns: one pgIndexTupleKey image with the zero
+// heap TID.
+func (e *btreeSkipEnum) probeKey(idx *catalog.Index, vals []Datum, pos int) ([]byte, error) {
+	key, _, err := pgIndexTupleKey(e.desc, e.keyCols[:len(vals)], vals, storage.ItemPointer{})
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: index %q: %v", idx.Name, err)}
+	}
+	return key, nil
 }
 
 // canWalk reports whether the leaf walk applies: the tuple format, whose
