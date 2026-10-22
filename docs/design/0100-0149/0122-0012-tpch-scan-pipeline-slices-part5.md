@@ -143,3 +143,66 @@ sweep's Q7/Q57/Q14 rises did not repeat in an A/B (equal or better on the candid
 **Left.** In Q59's profile, the CASE WHENs' `d_day_name = 'Sunday'` comparisons are now the largest term:
 `evalFastBinaryApply` takes 23 % on the bpchar arm, which normalises the operands' padding before comparing.
 They are a next candidate.
+
+## Slice 48 (2026-10-22): a Sort is a borrow root — TPC-DS Q97, Q87
+
+**Target, named up front:** TPC-DS Q97, 0.93–1.11 s warm against PG's 0.11 s. EXPLAIN ANALYZE showed its Merge
+Full Join returning its first row only at 1 225 ms. Both inputs are
+`Group → Gather Merge → Sort → Parallel Hash Join (store_sales or catalog_sales probe) → Parallel Seq Scan`.
+
+**Cause.** `cloneRowOwnedPrefix` under `seqScanOp.Next` took 40 % of the profile, with its allocator
+(`heapSetTypeSmallHeader`) another 13 %. Every probe row of both Parallel Hash Joins was cloned by the scan,
+because nothing above the scan made it a borrower.
+
+A seq scan hands up its own reused row (`borrowRows`, M0145-0008u) only when `markScanBorrowChain` reaches it from
+a root. A root is an operator that copies every row it keeps before pulling the next one:
+
+- a borrowing aggregate;
+- a hash join's build loop;
+- a Gather worker's queue.
+
+The walk descends through operators that keep nothing (Project, a hash join's probe side, the nested loops, a
+Gather leader) and stops at anything else. In a Gather Merge worker the tree's top is a Sort, which stopped the
+walk.
+
+A Sort is a retention boundary, though. `sortOp.Open` calls `slot.Materialize()` on every child slot before it
+pulls the next one: `cloneRowOwned` copies the row slice and promotes arena payloads. The scan's per-page arena
+reset already names `sortOp.Open` as one of the boundaries it relies on. PG's Sort likewise copies each input slot
+into its tuplesort (`tuplesort_puttupleslot`). The in-place `MaterializedSlot.Materialize` is also safe on a
+borrowing scan: the scan decodes into its own `scanRow` and only re-points `o.slot.row` at it on each Next.
+
+**Rule.** `finishSortNode` calls `markScanBorrowChain(child)`, and so does `finishIncrementalSortNode`, whose
+`readGroup` materialises each slot the same way. A Filter between the Sort and the scan still stops the walk: its
+batch mode reads child rows ahead, the known read-ahead hazard.
+
+**Pins.**
+
+- `TestScanBorrowUnderSort` runs four ORDER BY queries over a multi-page table whose text and big numerics live
+  in the per-page arena:
+  - Sort directly on the scan (`SELECT *`);
+  - Sort over a column Project;
+  - Sort over an expression Project;
+  - Sort over a hash join probe.
+
+  It asserts which scans borrow, and that the results equal the cloning path's in order, with tail poison armed.
+  A Sort that keeps the child's row without copying fails the `SELECT *` case.
+- `TestScanBorrowBuildSideAndGatherWorkers` had pinned "only the build side borrows under the Sort". It now
+  expects the probe side too; its serial and gathered value checks are unchanged.
+- The executor package passes with deform poison armed globally.
+
+**Measured.** Warm, two interleaved rounds of three runs:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q97 | 0.93–1.11 | 0.77–1.02 |
+| TPC-DS Q87 | 1.31–2.27 | 1.27–1.36 |
+
+Q51 first looked slower, but repeated interleaved runs showed it bimodal on both builds (HEAD 1.35–2.68 s,
+candidate 1.72–2.32 s), with a lower median on the candidate. In the sf025 sweep the sum went from 121.9 to
+116.7 s. TPC-H's warm total is flat (15.50 → 15.77 s); its Q2/Q3 rows were re-run four times interleaved and
+overlap fully (Q2 0.33–0.70 s on both builds). TPC-H values are identical (acceptance 24 MATCH), and the sweep's
+plan shapes are identical.
+
+**Left.** Q97 remains ~7× PG. The probe rows are now borrowed, but the Gather Merge workers still ship every
+joined row through the queue (`transferRowForQueue`), and Group / Merge Full Join run in the leader. A next
+profile should split the time between the workers' sort and the leader's merge.

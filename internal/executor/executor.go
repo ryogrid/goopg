@@ -689,11 +689,26 @@ func newGatherNode(p *optimizer.Gather, bound int) *gatherOp {
 // finishSortNode and finishIncrementalSortNode wrap a built child in the sort
 // operator — shared by buildNode's arms and buildCompleteChild so the two
 // cannot drift.
+// finishSortNode builds the Sort operator over its child. A sort is a borrow
+// root (M0122-0012 slice 48): sortOp.Open materialises every child slot —
+// cloneRowOwned copies the row slice and promotes arena payloads — before it
+// pulls the next one, the retention boundary the seq scan's per-page arena
+// reset already relies on. So a seq scan under it, through the pass-through
+// operators markScanBorrowChain walks, may hand up its own reused row instead
+// of a per-tuple clone, as it already does under an aggregate or a Gather.
+// PG's Sort likewise copies each input slot into its tuplesort
+// (tuplesort_puttupleslot). TPC-DS Q97 cloned every store_sales and
+// catalog_sales probe row of the Parallel Hash Joins under its two sorts.
 func finishSortNode(p *optimizer.Sort, child Operator, scope *instrumenter) Operator {
+	markScanBorrowChain(child)
 	return maybeInstrument(p, newSortOp(p, child), scope)
 }
 
+// finishIncrementalSortNode builds the IncrementalSort operator; a borrow root
+// for the same reason as a Sort (readGroup materialises each slot before the
+// next pull).
 func finishIncrementalSortNode(p *optimizer.IncrementalSort, child Operator, scope *instrumenter) Operator {
+	markScanBorrowChain(child)
 	return maybeInstrument(p, newIncrementalSortOp(child, p, p.Keys, p.PresortedCount), scope)
 }
 

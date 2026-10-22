@@ -300,8 +300,9 @@ func TestScanBorrowThroughOuterHashJoinProbe(t *testing.T) {
 // TestScanBorrowBuildSideAndGatherWorkers pins the two borrow roots that do
 // not need a borrowing aggregate above them (slice 23):
 //   - a hash join's build side (joinBorrowBuildChild): the build loop copies
-//     every row it keeps, so its scan borrows even under a Sort, which keeps
-//     rows and stops every other descent;
+//     every row it keeps, so its scan borrows whatever sits above the join
+//     (and, since slice 48, a Sort is a borrow root of its own — it
+//     materialises each row it keeps — so the probe side borrows here too);
 //   - a Gather worker's tree (gatherOp.runWorker): each row is copied by
 //     transferRowForQueue before the next is pulled.
 //
@@ -335,12 +336,11 @@ func TestScanBorrowBuildSideAndGatherWorkers(t *testing.T) {
 	if len(joins) != 1 {
 		t.Fatalf("want one hash join, got %d", len(joins))
 	}
-	build := "bd"
-	if joins[0].hashBuildIsLeft() {
-		build = "bp"
-	}
-	if got := borrowedScanTables(op); strings.Join(got, ",") != build {
-		t.Fatalf("borrowing scans %v, want only the build side %s under the Sort", got, build)
+	// The build side borrows as a root of its own; since M0122-0012 slice 48
+	// the Sort is a borrow root too, so the probe side borrows through the
+	// join as well.
+	if got := borrowedScanTables(op); strings.Join(got, ",") != "bd,bp" {
+		t.Fatalf("borrowing scans %v, want the build side and, under the Sort, the probe side", got)
 	}
 
 	run := func(gathered bool) []string {
@@ -519,4 +519,72 @@ func nestedLoopOuterScan(op Operator) *seqScanOp {
 		}
 	}
 	return nil
+}
+
+// orderedRowValues runs sql and renders every cell as text in result order.
+func orderedRowValues(t *testing.T, ctx *Context, sql string) []string {
+	t.Helper()
+	var out []string
+	for _, r := range runSQL(t, ctx, sql) {
+		cells := make([]string, len(r))
+		for i, d := range r {
+			if d.IsNull() {
+				cells[i] = "NULL"
+			} else {
+				cells[i] = string(d.AppendValueText(nil))
+			}
+		}
+		out = append(out, strings.Join(cells, ","))
+	}
+	return out
+}
+
+// TestScanBorrowUnderSort pins M0122-0012 slice 48: a Sort is a borrow root
+// (finishSortNode). sortOp.Open materialises each child slot before the next
+// pull, so a seq scan under it — directly, through a Project, or as a hash
+// join's probe side — hands up its reused row. (A Filter stops the chain: its
+// batch mode reads child rows ahead.) The table spans many pages and
+// its text and big-numeric values live in the scan's per-page arena, so a
+// sort that kept a borrowed row would read reset arena bytes. With tail poison
+// armed, every result must equal the cloning path's in order.
+func TestScanBorrowUnderSort(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	runSQL(t, ctx, "CREATE TABLE bs (k int, s text, n numeric, i int)")
+	runSQL(t, ctx, "INSERT INTO bs SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 6000) x")
+	runSQL(t, ctx, "CREATE TABLE bsd (k int, label text)")
+	runSQL(t, ctx, "INSERT INTO bsd SELECT x, 'dim-' || x FROM generate_series(0, 49) x")
+	runSQL(t, ctx, "ANALYZE bs")
+	runSQL(t, ctx, "ANALYZE bsd")
+	cases := []struct {
+		sql  string
+		want string // tables whose scans must borrow
+	}{
+		{"SELECT * FROM bs ORDER BY s, i", "bs"},
+		{"SELECT s, n, i FROM bs ORDER BY s, i", "bs"},
+		{"SELECT i, upper(s), n * 2 FROM bs ORDER BY n DESC", "bs"},
+		{"SELECT bsd.label, bs.s, bs.n FROM bs JOIN bsd ON bs.k = bsd.k ORDER BY bs.s, bsd.label", "bs,bsd"},
+	}
+	for _, c := range cases {
+		plan, err := testPlanDeform(t, ctx, c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if got := strings.Join(borrowedScanTables(op), ","); got != c.want {
+			t.Fatalf("%s: borrowing scans %q, want %q", c.sql, got, c.want)
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := orderedRowValues(t, ctx, c.sql)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := orderedRowValues(t, ctx, c.sql)
+		scanBorrowDisabled = false
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", c.sql)
+		}
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s: borrowed and cloned results differ (%d vs %d rows)", c.sql, len(got), len(want))
+		}
+	}
 }
