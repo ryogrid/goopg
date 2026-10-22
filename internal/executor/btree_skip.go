@@ -49,6 +49,14 @@ type btreeSkipEnum struct {
 	restImgsDone bool
 	rawImgs      [][]byte
 	rawNulls     []bool
+	// probeTmpl / pivotTmpl are groupBoundsFixed's per-Rescan templates for
+	// a skip prefix of tmplS attributes (nil when the probe is not all
+	// fixed-width), and tmplOffs the prefix attributes' offsets in them.
+	tmplDone  bool
+	tmplS     int
+	probeTmpl []byte
+	pivotTmpl []byte
+	tmplOffs  []int
 }
 
 // init evaluates the bound columns ONCE per Rescan — the same eval timing
@@ -254,6 +262,9 @@ func (e *btreeSkipEnum) groupBoundsRaw(idx *catalog.Index, s int, key []byte, po
 	if len(e.restImgs) != len(e.rest) {
 		return nil, nil, false, nil
 	}
+	if probe, pivot, fixed := e.groupBoundsFixed(idx, s, key, nkey, phys, pos); fixed {
+		return probe, pivot, true, nil
+	}
 	imgs, nulls, derr := nbtree.DeformPGIndexTuple(key, phys, s)
 	if derr != nil {
 		return nil, nil, false, nil
@@ -275,6 +286,67 @@ func (e *btreeSkipEnum) groupBoundsRaw(idx *catalog.Index, s int, key []byte, po
 		return nil, nil, false, err
 	}
 	return probe, pivot, true, nil
+}
+
+// groupBoundsFixed is groupBoundsRaw for a probe whose attributes are all
+// fixed-width (M0122-0012 slice 56). FormPGIndexTuple lays such a key out
+// with no null bitmap, every attribute at its fixed offset
+// (nbtree.PGIndexFixedAttrOffsets) and nothing else value-dependent, so the
+// probe and pivot are formed once per Rescan as templates — the bound
+// columns' images in place, the prefix attributes zero — and each group
+// copies the entry's prefix attribute bytes into a fresh copy of both. An
+// entry with no null bitmap stores those attributes at the same offsets.
+// The bytes are therefore groupBoundsRaw's (pinned), without its per-group
+// deform and two generic tuple formations; PG's skip array likewise just
+// takes the datum (_bt_advance_array_keys). ok is false — groupBoundsRaw's
+// general path runs — for a variable-width probe attribute, an entry with a
+// null bitmap or a t_info size short of the prefix, or a template that cannot
+// be formed (whose error the general path reports).
+func (e *btreeSkipEnum) groupBoundsFixed(idx *catalog.Index, s int, key []byte, nkey int, phys []nbtree.PGIndexAttr, pos int) (probe, pivot []byte, ok bool) {
+	if s == 0 {
+		return nil, nil, false
+	}
+	if !e.tmplDone || e.tmplS != s {
+		e.tmplDone, e.tmplS = true, s
+		e.probeTmpl, e.pivotTmpl, e.tmplOffs = nil, nil, nil
+		n := s + len(e.rest)
+		offs, fixed := nbtree.PGIndexFixedAttrOffsets(phys[:n])
+		if !fixed {
+			return nil, nil, false
+		}
+		imgs, nulls := make([][]byte, n), make([]bool, n)
+		for i := 0; i < s; i++ {
+			imgs[i] = make([]byte, phys[i].Len)
+		}
+		copy(imgs[s:], e.restImgs)
+		pr, err := e.formKey(idx, phys[:n], imgs, nulls, nkey, pos)
+		if err != nil {
+			return nil, nil, false
+		}
+		pv, err := e.formKey(idx, phys[:s], imgs[:s], nulls[:s], nkey, pos)
+		if err != nil {
+			return nil, nil, false
+		}
+		e.probeTmpl, e.pivotTmpl, e.tmplOffs = pr, pv, offs[:s]
+	}
+	if e.probeTmpl == nil || nbtree.PGIndexTupleHasNulls(key) {
+		return nil, nil, false
+	}
+	size := nbtree.PGIndexTupleSize(key)
+	if size > len(key) || e.tmplOffs[s-1]+int(phys[s-1].Len) > size {
+		return nil, nil, false
+	}
+	np := len(e.probeTmpl)
+	buf := make([]byte, np+len(e.pivotTmpl))
+	probe, pivot = buf[:np:np], buf[np:]
+	copy(probe, e.probeTmpl)
+	copy(pivot, e.pivotTmpl)
+	for i, o := range e.tmplOffs {
+		end := o + int(phys[i].Len)
+		copy(probe[o:end], key[o:end])
+		copy(pivot[o:end], key[o:end])
+	}
+	return probe, pivot, true
 }
 
 // formKey is pgIndexTupleKey's tail over ready attribute images: one

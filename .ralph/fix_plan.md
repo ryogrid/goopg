@@ -2083,6 +2083,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(index\_getattr's attcacheoff\); declines to the walk otherwise \(answers and errors unchanged, pinned\)\.
     - Q16 0\.42–0\.45 → 0\.36 s, Q72 1\.02 → 0\.90 s, Q14 down; sweep 112\.3 → 109\.5 s; values identical\.
     - Next: Q16 still ~6× PG — skip walk's 3 compares/entry vs \_bt\_checkkeys' per\-attribute check; \_bt\_readpage precheck\.
+  - **Slice 56 — a fixed\-width skip group's keys are copied into templates LANDED 2026\-10\-22\.** Movement: none — perf
+    only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 5 "Slice 56"\.
+    - Named target TPC\-DS Q16: groupBoundsRaw 34 % of CPU — per group a deform \(two slice allocs\) plus two generic
+      FormPGIndexTuple calls\.
+    - groupBoundsFixed: all\-fixed\-width probe → per\-Rescan probe/pivot templates \(formed by formKey\), per group one
+      alloc \+ prefix bytes copied at nbtree\.PGIndexFixedAttrOffsets; declines on null bitmap / varlena \(pinned\)\.
+    - Q16 0\.34–0\.38 → 0\.26–0\.29 s, Q95 2\.6–2\.9 → 2\.4 s; sweep 109\.5 → 109\.3 s; values identical\.
+    - Next: Q16 ~4\.5× PG — walkLeaf's up to 3 tuple compares per entry\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

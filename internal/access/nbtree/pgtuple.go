@@ -185,6 +185,28 @@ func pgVarattIs1B(b []byte) bool { return len(b) > 0 && b[0]&0x01 == 0x01 }
 // pgVarattIs1BE is VARATT_IS_1B_E — a TOAST pointer (0x01 header byte).
 func pgVarattIs1BE(b []byte) bool { return len(b) > 0 && b[0] == 0x01 }
 
+// PGIndexFixedAttrOffsets returns where each of attrs starts in an index
+// tuple that has no null bitmap, when every one is fixed-width: the data
+// begins at MAXALIGN(sizeof(IndexTupleData)) and each attribute at its
+// alignment past the previous one — index_getattr's attcacheoff
+// (itup.h). ok is false when any attribute is a varlena or cstring, whose
+// successors have no fixed offset. The offsets hold in every such tuple
+// whose leading attributes are attrs, whatever follows them (M0122-0012
+// slice 56, the skip scan's group bounds).
+func PGIndexFixedAttrOffsets(attrs []PGIndexAttr) (offs []int, ok bool) {
+	off := MaxAlign(SizeOfIndexTupleData)
+	offs = make([]int, len(attrs))
+	for i, a := range attrs {
+		if a.Len <= 0 {
+			return nil, false
+		}
+		off = alignTo(off, a.AlignBy)
+		offs[i] = off
+		off += int(a.Len)
+	}
+	return offs, true
+}
+
 // PGIndexImageInline reports that img, one attribute image deformed from an
 // index tuple (DeformPGIndexTuple), is stored inline and uncompressed: a
 // fixed-width value, a short-header varlena that is not a TOAST pointer, or

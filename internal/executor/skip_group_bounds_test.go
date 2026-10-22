@@ -144,3 +144,86 @@ func TestSkipGroupBoundsRawImagesMatchDecodedTypes(t *testing.T) {
 		}
 	}
 }
+
+// TestSkipGroupBoundsFixedTemplate pins M0122-0012 slice 56: when every probe
+// attribute is fixed-width, groupBoundsFixed copies the entry's prefix bytes
+// into per-Rescan templates instead of deforming the entry and forming two
+// tuples. The prefix (smallint, bigint, date) puts alignment padding between
+// attributes, so a wrong offset moves bytes. For every entry the bytes must
+// be indexProbeKey's; an entry with a NULL prefix attribute (a null bitmap)
+// must decline to the general path, which still forms the right bytes; and
+// two groups' keys must not share memory.
+func TestSkipGroupBoundsFixedTemplate(t *testing.T) {
+	ctx, cleanup := setupSkipFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE fixed (s smallint, b bigint, d date, k int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX fixed_sbdk ON fixed (s, b, d, k)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "fixed_sbdk"})
+	if !ok {
+		t.Fatal("lookup fixed_sbdk")
+	}
+	day := func(y int) Datum { return NewDateDatum(time.Date(y, 3, 1, 0, 0, 0, 0, time.UTC)) }
+	entries := []Row{
+		{NewIntDatum(1), NewIntDatum(1 << 40), day(2001), NewIntDatum(1)},
+		{NewIntDatum(-2), NewIntDatum(-5), day(1970), NewIntDatum(2)},
+		{NewIntDatum(32767), NewIntDatum(0), day(2038), NewIntDatum(3)},
+		{NullDatum, NewIntDatum(7), day(2000), NewIntDatum(4)},
+		{NewIntDatum(3), NullDatum, NullDatum, NewIntDatum(5)},
+	}
+	var e btreeSkipEnum
+	if empty, err := e.init(ctx, idx, 3, []optimizer.Expr{&optimizer.IntegerConst{Value: 20}}, nil, 0, "test"); err != nil || empty {
+		t.Fatalf("init empty=%v err=%v", empty, err)
+	}
+	if e.desc == nil {
+		t.Fatal("not a tuple-format index; nothing is exercised")
+	}
+	nkey, phys := e.desc.NKeyAtts(), e.desc.Physical()
+	var prev []byte
+	for ei, vals := range entries {
+		entry, _, err := pgIndexTupleKey(e.desc, e.keyCols, vals, storage.ItemPointer{Block: 1, Offset: uint16(ei + 1)})
+		if err != nil {
+			t.Fatalf("entry %d: %v", ei, err)
+		}
+		// groupBoundsRaw first: it encodes the bound images the templates
+		// are formed from, as walkLeaf's calls always do.
+		probe, pivot, ok, rerr := e.groupBoundsRaw(idx, 3, entry, 0)
+		if rerr != nil || !ok {
+			t.Fatalf("entry %d: raw path declined (ok=%v err=%v)", ei, ok, rerr)
+		}
+		_, _, fixed := e.groupBoundsFixed(idx, 3, entry, nkey, phys, 0)
+		hasNull := vals[0].IsNull() || vals[1].IsNull() || vals[2].IsNull()
+		if fixed == hasNull {
+			t.Fatalf("entry %d: fixed path taken=%v, want %v (NULL prefix declines)", ei, fixed, !hasNull)
+		}
+		parts := make([]indexProbeKeyPart, 0, 4)
+		for i := 0; i < 3; i++ {
+			parts = append(parts, indexProbeKeyPart{col: e.keyCols[i], val: vals[i]})
+		}
+		wantProbe, perr := ctx.indexProbeKey(idx, append(parts, e.rest...))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		wantPivot, perr := ctx.indexProbeKey(idx, parts)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if !bytes.Equal(probe, wantProbe) || !bytes.Equal(pivot, wantPivot) {
+			t.Fatalf("entry %d: probe %x pivot %x, indexProbeKey %x / %x", ei, probe, pivot, wantProbe, wantPivot)
+		}
+		if prev != nil {
+			saved := append([]byte(nil), prev...)
+			clear(probe)
+			clear(pivot)
+			if !bytes.Equal(prev, saved) {
+				t.Fatalf("entry %d: clearing this group's keys changed the previous group's probe", ei)
+			}
+		}
+		if prev, _, _, rerr = e.groupBoundsRaw(idx, 3, entry, 0); rerr != nil {
+			t.Fatal(rerr)
+		}
+	}
+}

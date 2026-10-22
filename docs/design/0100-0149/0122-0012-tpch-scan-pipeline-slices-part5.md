@@ -623,3 +623,50 @@ The sf025 sweep sum went from 112.3 to 109.5 s. Values are identical (sf025 PASS
   compares the skip attribute, then the next one.
 - PG also skips required-key checks on a page whose final tuple already satisfies them (the `_bt_readpage`
   precheck).
+
+## Slice 56 (2026-10-22): a fixed-width skip group's keys are copied into templates — TPC-DS Q16
+
+**Target.** After slice 55, a profile of Q16 at `3703798f0` put 34 % of its CPU in
+`btreeSkipEnum.groupBoundsRaw`, which forms each new prefix group's probe and pivot. Per group it ran
+`DeformPGIndexTuple`, which allocates both image slices (180 ms), then two generic `FormPGIndexTuple` calls
+(240 ms), each sizing, allocating and filling a tuple. In Q16's `catalog_returns_pkey` / `catalog_sales_pkey`
+probes a group is a handful of entries, so this ran every few entries. PG's skip array takes the
+tuple's datum when it advances (`_bt_advance_array_keys`) and forms no key.
+
+**Change.** `groupBoundsFixed` runs ahead of the general path when every probe attribute is fixed-width
+(`nbtree.PGIndexFixedAttrOffsets`, index\_getattr's attcacheoff layout):
+
+- **Once per Rescan.** It forms the probe and pivot as templates through `formKey` itself: the bound columns'
+  images in place, the prefix attributes zero. Templates are byte-exact by construction, and the size check
+  runs once.
+- **Per group.** It copies both templates into one allocation, then copies the entry's prefix attribute
+  bytes into them at the fixed offsets. An entry with no null bitmap stores those attributes at the same
+  offsets, and `FormPGIndexTuple` writes nothing value-dependent for fixed-width non-null attributes.
+- **Declines.** A variable-width probe attribute, an entry with a null bitmap or a `t_info` size short of the
+  prefix, or a template that cannot be formed all fall to the general path. That path still forms, or
+  reports, exactly what it did.
+
+**Pins.** `TestSkipGroupBoundsFixedTemplate` runs a (smallint, bigint, date | int) index, where alignment
+padding separates the prefix attributes:
+
+- Every entry's probe and pivot equal `indexProbeKey`'s bytes.
+- NULL-prefix entries decline and still match.
+- Clearing one group's keys leaves the previous group's intact.
+- Mutation check: dropping the alignment step in `PGIndexFixedAttrOffsets` fails it.
+- Slice 52's `TestSkipGroupBoundsMatchesIndexProbeKey` (int, int) now runs through the template path and still
+  passes.
+
+**Measured.** Warm, 2GB clone, two interleaved rounds against `3703798f0`:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| Q16 | 0.34–0.38 | 0.26–0.29 |
+| Q95 | 2.59–2.91 | 2.36–2.40 (one 4.02 outlier) |
+| Q94 | 0.08–0.10 | 0.07–0.08 |
+| Q72 | 0.89–0.93 | 0.86 |
+
+The sf025 sweep sum went from 109.5 to 109.3 s. Values are identical (sf025 PASS=99, 61 ck; acceptance
+24 MATCH), and plan shapes are identical.
+
+**Left.** Q16 is still about 4.5× PG. The skip walk still makes up to three tuple comparisons per entry
+(`walkLeaf`), where PG's `_bt_checkkeys` compares the skip attribute and then the next one.
