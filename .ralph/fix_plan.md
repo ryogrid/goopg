@@ -2206,6 +2206,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - S3 instrument value/plan identity: sf025 PASS=99 \(61 ck; Q2/Q43 ck identical\) PLAN\-SHAPE same, acceptance arm
       PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS — run after the nightly \(fired 00:51,
       ended 02:09\), which the acceptance arm refuses to overlap\. Sweep Q59 1\.60 → 1\.30 s, Q2 0\.46 → 0\.42 s\.
+  - **Slice 65 — a subquery IN stops allocating per row; a nested loop copies its outer tuple once per outer row
+    LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 6
+    "Slice 65"\.
+    - Target choice: Q25's 22× sweep gap is a 128MB shared\_buffers artifact \(0\.20 s vs PG 0\.14 at 2GB\); Q35 is real
+      \(2\.3–3\.1 s vs PG 0\.354 at 2GB\)\.
+    - Q35: inListItemsEval allocated itemBP/itemLit at the subquery's result size per row \(EXISTS→ANY\), and the heap
+      profiler's stack walks on those allocations cost ~13 %; nlJoinStream\.pairMatches re\-copied the outer tuple per pair\.
+    - subqueryInListMeta caches the uniform metadata per InExpr; pairOuterValid copies the outer half once \(pinned;
+      the reset is mutation\-checked by existing NL suites\)\.
+    - Q35 12\.43 → 10\.39 Ginstr \(−16\.4 %\), wall 2\.3–3\.1 → 0\.62 s; sweep 98\.9 → 95\.5 s\.
+    - Next: hashed SubPlan for EXISTS … OR EXISTS … \(PG\) instead of per\-row cached list \+ probe; Q39 \(2\.2 vs 0\.59 s\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.

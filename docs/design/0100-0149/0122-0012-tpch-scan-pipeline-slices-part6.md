@@ -435,3 +435,54 @@ nightly batch (fired 00:51, ended 02:09), because the acceptance arm refuses to 
 
 **Left.** PG compiles `bpchareq` against a constant without re-deriving the constant's blank-stripped length per row.
 goopg still trims the literal per call, a short `TrimRight`, and the column value too.
+
+## Slice 65 (2026-10-23): a subquery IN stops allocating per row, and a nested loop copies its outer tuple once per outer row — TPC-DS Q35
+
+**Target.** Ranking the sweep's gaps by absolute seconds put Q25 (3.1 s against PG's 0.14 s) first, but on the
+2GB clone Q25 runs in 0.20 s: its sweep time is the corpus's 128MB shared\_buffers. Q35 is a real gap: 2.3–3.1 s
+against PG's 0.354 s on the 2GB clone. An instruction profile put about 13 % in Go stack unwinding (`runtime.step`,
+`pcvalue`, `findfunc`). That was the heap profiler's sampling stack walks (`mallocgc` → `profilealloc` →
+`mProf_Malloc` → `callers`), triggered by large per-row allocations, plus 7–10 % in `memmove`. Two sources:
+
+- **Subquery IN metadata.** Q35's EXISTS clauses become IN subqueries (EXISTS→ANY). For every outer row,
+  `inListItemsEval` allocated its two per-item metadata slices, `itemBP` and `itemLit`, at the subquery's
+  result size: thousands of customer keys. The uncorrelated subquery's values come from the cache and are then
+  probed through the hash (`evalInHashProbe`), so the allocations were all that scaled with the result.
+- **Nested-loop pairs.** `nlJoinStream.pairMatches` copied the whole outer tuple into the pair buffer for every
+  inner tuple, although it is the same for the entire inner loop.
+
+**Change.**
+
+- **Metadata built once.** For a subquery IN the metadata is uniform: every item shares the inner plan's first
+  output column type, so `itemBP` is that column's bpchar flag and `itemLit` is false throughout.
+  `subqueryInListMeta` builds it once per InExpr on the Context (`inListPlanMeta`), grows it when a longer
+  result arrives, and returns a capped prefix for each row. Without a Context it builds per call as before.
+  Callers only read it.
+- **Outer half copied once.** `pairMatches` copies the outer half only when `pairOuterValid` is unset. The flag is
+  cleared when `stepOuter` reads a new outer tuple, when the buffer is reallocated, and, defensively, when the
+  pair is emitted borrowed (`nlEmitBorrowed`), since the consumer then holds it until the next call.
+
+**Pins.**
+
+- `TestSubqueryInListMetaIsUniformAndReused`: for bpchar and text inner columns, the prefix carries the uniform
+  flag at lengths 3, 3, 10, 2 and 0. A same-length call reuses the slice, and the no-Context path builds it.
+- `TestInSubqueryBpcharSemantics`: `c IN (SELECT c ...)` over char(5) is blank-insensitive and over text
+  byte-exact, with a NULL operand, across rows.
+- The pair-copy flag is pinned by the existing nested-loop suites. With the new-outer reset removed,
+  `TestExecJoinVariants`, `TestNestedLoopKeylessSemiAntiEarlyOut` and `TestNumericHashJoinIntLane` fail.
+
+**Measured** against `302e0463d`:
+
+| query | HEAD Ginstr | candidate Ginstr | HEAD wall / CPU (s) | candidate wall / CPU (s) |
+|---|---|---|---|---|
+| Q35 | 12.43 | 10.39 (−16.4 %; the metadata alone −9.6 %) | 2.32–3.10 / 2.85–3.16 | 0.62 / 1.14 |
+| Q10 | 10.44 | 10.31 (−1.3 %) | | |
+| Q16, Q72, Q94, Q64 | — | within ±0.2 % | | |
+
+Q35's wall time fell about 75 %, far more than its instruction count. The per-row allocations cost mostly outside
+user-mode instructions: zeroed pages, page faults and collector work, which `instructions:u` does not count. The
+sf025 sweep sum went from 98.9 to 95.5 s, with Q35 at 1.37 → 0.81 s and Q10 at 1.07 → 0.83 s. Values are
+identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.** PG evaluates `EXISTS … OR EXISTS …` as a hashed SubPlan, with no per-row list at all. goopg still
+materialises the cached value slice and probes its hash per row.

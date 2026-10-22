@@ -108,6 +108,11 @@ type nlJoinStream struct {
 	outerRow     Row
 	outerCTID    joinRowCTID
 	outerMatched bool
+	// pairOuterValid reports pair[:len(outerRow)] already holds the current
+	// outer tuple, so pairMatches copies only the inner tuple (M0122-0012
+	// slice 65). Cleared when a new outer tuple is read, when pair is
+	// reallocated, and when pair is handed to the consumer borrowed.
+	pairOuterValid bool
 
 	// innerMatched is one bit per inner tuple ORDINAL. The Materialize replays
 	// in insertion order, so the ordinal is just the count of tuples returned
@@ -341,6 +346,7 @@ func (m *nlJoinStream) stepOuter() (Row, bool, error) {
 	} else {
 		m.outerRow = append(m.outerRow[:0], row...)
 	}
+	m.pairOuterValid = false
 	if m.lw == 0 && len(m.outerRow) > 0 {
 		// A child with an empty Schema() (a Values node, a subplan built
 		// without one) only reveals its width when its first row arrives —
@@ -397,7 +403,9 @@ func (m *nlJoinStream) stepInner() (Row, bool, error) {
 	}
 	if m.o.nlEmitBorrowed {
 		// The lateral stream's sibling (stepInner): the consumer is done
-		// with this row before the next call rewrites m.pair.
+		// with this row before the next call rewrites m.pair. It holds the
+		// buffer until then, so the next pair re-copies the outer tuple.
+		m.pairOuterValid = false
 		return m.pair, true, nil
 	}
 	return cloneRow(m.pair), true, nil
@@ -477,14 +485,24 @@ func (m *nlJoinStream) drainInner() error {
 // pairMatches composes the current outer tuple with `inner` into the reusable
 // buffer and evaluates the join predicate against it. The buffer is what makes
 // a rejected candidate pair cost zero allocations.
+//
+// The outer half is copied once per outer tuple, not once per pair: it is the
+// same for every inner tuple of the loop (pairOuterValid). TPC-DS Q35's
+// nested loops re-copied a wide outer row for each of thousands of inner
+// tuples — 10 % of its instructions in memmove (M0122-0012 slice 65).
 func (m *nlJoinStream) pairMatches(inner Row) (bool, error) {
-	n := len(m.outerRow) + len(inner)
+	ow := len(m.outerRow)
+	n := ow + len(inner)
 	if cap(m.pair) < n {
 		m.pair = make(Row, n)
+		m.pairOuterValid = false
 	}
 	m.pair = m.pair[:n]
-	copy(m.pair, m.outerRow)
-	copy(m.pair[len(m.outerRow):], inner)
+	if !m.pairOuterValid {
+		copy(m.pair, m.outerRow)
+		m.pairOuterValid = true
+	}
+	copy(m.pair[ow:], inner)
 	return m.o.joinPredicateMatch(m.pair)
 }
 
