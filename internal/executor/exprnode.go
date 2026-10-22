@@ -184,6 +184,20 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		*s = append(*s, ExprNode{Kind: ExprNullConst})
 		return idx
 
+	case *optimizer.StringConst:
+		// A bare string literal is evalExprSlot's NewStringDatum(Value) — a
+		// constant — so it compiles to ExprConstVal even without a Context
+		// (buildExpr; the fold above needs one). It was an ExprAdapter, an
+		// interpreted call per row: TPC-DS Q59's seven `d_day_name =
+		// 'Sunday'`-style CASE arms inside aggregate arguments made seven of
+		// them per row (M0122-0012 slice 64). A BinaryOp still reads the
+		// literal-ness of its operands from the planner expression (flags),
+		// not from this node.
+		idx := int32(len(*s))
+		v := NewStringDatum(t.Value)
+		*s = append(*s, ExprNode{Kind: ExprConstVal, constVal: &v})
+		return idx
+
 	case *optimizer.BinaryOp:
 		// Float-typed arithmetic must use evalExprSlot's float64 path; the
 		// fast path's exact arithmetic diverges from PostgreSQL float8 output.
@@ -611,12 +625,6 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 	// these three helpers raise is stamped with it on the interpreted twin.
 	// M0127-PS6.2.
 	pos := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
-	if n.payload[16]&4 != 0 && textShapeAmbiguous(left, right) {
-		*out = binaryTextComparison(op, left, right,
-			int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
-			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
-		return nil
-	}
 	// M0122-0012 slice 30: a comparison of two plain strings compares them
 	// in place. compareDatum's string arm sniffs values — pg_lsn shapes,
 	// UUIDs, row and array literals — before falling back to
@@ -625,17 +633,34 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 	// those branches is skipped, so the result is strings.Compare of the
 	// bpchar-normalised operands, exactly what evalBinary would return.
 	// TPC-H Q10's `l_returnflag = 'R'` took the whole path per row.
+	// M0122-0012 slice 64: the plain pair is decided before the
+	// character-string ambiguity test below — two plain strings are never
+	// textShapeAmbiguous (a uuid needs 32+ bytes, a pg_lsn a '/', a row or
+	// array a leading '(' / '{'), so for them that test, two isValidUUIDStr
+	// scans and a pg_lsn sniff per row, could only answer false. TPC-DS
+	// Q59's seven char(9) `d_day_name = 'Sunday'` arms paid it per row.
 	if op.IsComparison() && left.Kind == KindString && right.Kind == KindString {
 		if ls, rs := left.StringValue(), right.StringValue(); plainCompareString(ls) && plainCompareString(rs) {
-			l, r := left, right
+			// comparisonOperandsAsBpchar's rule on the strings themselves:
+			// with either side bpchar-typed, a bpchar side or a bare
+			// literal drops its trailing blanks.
 			if lbp, rbp := int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])); lbp > 0 || rbp > 0 {
-				l, r = comparisonOperandsAsBpchar(op, l, r, lbp, rbp, n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+				if lbp > 0 || n.payload[16]&1 != 0 {
+					ls = strings.TrimRight(ls, " ")
+				}
+				if rbp > 0 || n.payload[16]&2 != 0 {
+					rs = strings.TrimRight(rs, " ")
+				}
 			}
-			if l.Kind == KindString && r.Kind == KindString {
-				*out = NewBoolDatum(cmpResult(op, strings.Compare(l.StringValue(), r.StringValue())))
-				return nil
-			}
+			*out = NewBoolDatum(cmpResult(op, strings.Compare(ls, rs)))
+			return nil
 		}
+	}
+	if n.payload[16]&4 != 0 && textShapeAmbiguous(left, right) {
+		*out = binaryTextComparison(op, left, right,
+			int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])),
+			n.payload[16]&1 != 0, n.payload[16]&2 != 0)
+		return nil
 	}
 	// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
 	if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||

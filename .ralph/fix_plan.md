@@ -601,10 +601,21 @@ heuristic stays live.)
     - Next: read the two notes on the next nightly start timeout; high\-events and PSI stalls → resize the lanes,
       a quiet group plus a parked initdb\.Open frame → fix that wait\.
     - 2026\-10\-21 nightly \(e64b1bfe9, diagnostic armed\): no start timeout in testport; still waiting for one\.
+    - 2026\-10\-23 nightly \(c6a780f7e\): recurrence captured as AI\-20261023\-005128\-001 — quiet cgroup, goroutine 1
+      runnable in the catalog\-heap reload \(not parked in initdb\.Open's wait\); see that task\.
 - [ ] testport/TestPort\_IsolationInsertConflictDoUpdate3 — FAIL \(20\.17 s\) \(AI\-20261020\-013101\-004; repro: `go test \-v \-run '^TestPort\_IsolationInsertConflictDoUpdate3$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
   - **Diagnostic LANDED 2026\-10\-21** \(root cause pending\): same start timeout inside initdb\.Open as \-003; see that item\.
+- [ ] testport/TestPort\_ExtendedStatisticsSurvivesRestart — start timeout after 20 s \(AI\-20261023\-005128\-001; repro: `go test \-v \-run '^TestPort\_ExtendedStatisticsSurvivesRestart$' \./internal/testport/`\)\.
+  - Filed 2026\-10\-23\. The \-003/\-004 start\-timeout class, with the 2026\-10\-21 diagnostic armed:
+    - cgroup quiet: memory\.current 0\.6 GB of high 6 GB, PSI some/full avg 0\.00 — not a memory throttle\.
+    - goroutine 1 **runnable** \(not parked\) in initdb catalog\-heap reload \(reloadUserAggregatesFromHeap →
+      scanCatalogHeapRows → DecodeRowIntoMctxPGTuple\) at the 20 s mark: startup was progressing, slowly\.
+    - It fired at 01:01:56, while this loop's S9 census \(clone copy \+ 221 EXPLAINs\) ran beside the nightly testport
+      lane — CPU starvation of a slow\-but\-moving start, not a wait bug\.
+  - Next: re\-run the repro on an idle host; if it passes, the lever is either the 20 s start budget under nightly
+    load or the cost of the per\-start catalog heap reload \(it decodes every catalog row on each start\)\.
 - [x] testport/TestPort\_IsolationMultipleCic — FAIL \(23\.23 s\) \(AI\-20261020\-013101\-005; repro: `go test \-v \-run '^TestPort\_IsolationMultipleCic$' \./internal/testport/`\)\.
   - 2026\-10\-20: passed inside a full `TestPort\_Isolation` gate at HEAD on an idle host; likely load\-induced, not yet
     re\-run on its own\.
@@ -2167,6 +2178,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       writes \(NullDatum is the zero Datum — pinned\)\.
     - Q78 27\.87 → 26\.71 Ginstr \(−4\.2 %\); other queries ±0\.1 %; wall/CPU unresolvable at load 7–9\.
     - Next: worker Sort below Gather Merge stores whole join rows \(worker trees built with buildNode\); full\-width transfer rows\.
+  - **Slice 64 — string literals compile to constants; a plain string pair skips the character\-string ambiguity test
+    LANDED 2026\-10\-23\.** Movement: none — perf only\. Doc part 6 "Slice 64"\.
+    - Named target TPC\-DS Q59: seven char\(9\) `d\_day\_name = 'Sunday'` CASE arms per row; literals ran as ExprAdapter
+      \(buildExpr has no fold\); textShapeAmbiguous ran before slice 30's plain\-string shortcut\.
+    - StringConst → ExprConstVal; plain pair decided first with the bpchar blank rule inline \(pinned compiled/batch vs
+      interpreted over >10 000 pairs incl\. uuid/pg\_lsn/row/array shapes; mutation\-checked\)\.
+    - Q59 20\.14 → 17\.19 Ginstr \(−14\.7 %\), Q2 −21\.3 %, Q43 −6\.7 %; Q19/Q3/Q10 identical\.
+    - S3 instrument value/plan identity: sf025 PASS=99 \(61 ck; Q2/Q43 ck identical\) PLAN\-SHAPE same, acceptance arm
+      PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS — run after the nightly \(fired 00:51,
+      ended 02:09\), which the acceptance arm refuses to overlap\. Sweep Q59 1\.60 → 1\.30 s, Q2 0\.46 → 0\.42 s\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4264,6 +4285,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `c6a780f7e`** \(M0122\-0012 slice 62 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `ecbfe6696`** \(M0122\-0012 slice 63 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

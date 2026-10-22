@@ -377,3 +377,61 @@ identical.
 child schema's column positions. The worker's Sort below the Gather Merge stores whole join rows
 (`sortOp.Open` → `MaterializedSlot.Materialize`), because a worker tree is built with `buildNode`, not
 `buildCompleteChild`, so nothing narrows it to the consumers' columns.
+
+## Slice 64 (2026-10-23): string literals compile to constants, and a plain string pair skips the character-string ambiguity test — TPC-DS Q59, Q2
+
+**Target.** TPC-DS Q59, 1.9 s against PG's 0.74 s, at 20.1 G instructions. It runs serially (no Gather). Its
+`wss` CTE is seven `sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END)`-style aggregates, and
+`d_day_name` is char(9). Every input row therefore made up to seven bpchar comparisons against string literals. An
+instruction profile split as follows:
+
+- `evalFastExpr` 13 %, `projectOp` 10.5 % and `evalExprSlot` 5.9 %.
+- `comparisonOperandsAsBpchar` 5.1 %, `evalFastBinaryApply` 4.7 %, `StringValue` 1.9 %, `indexbytebody` 1.3 %
+  and `textShapeAmbiguous` 1.0 %.
+
+Two causes sat in the compiled expression path:
+
+- **The literals were interpreted.** The compiled slab had no StringConst kind. Aggregate arguments compile through
+  `buildExpr`, without a Context and so without the constant fold, so every `'Sunday'` was an `ExprAdapter`: an
+  `evalExprSlot` call per row per arm.
+- **The plain-string shortcut ran after the expensive test.** For a comparison of two character-string operands
+  (payload bit 4), `evalFastBinaryApply` ran `textShapeAmbiguous` first: two `isValidUUIDStr` scans, a pg\_lsn
+  sniff and the row/array test. Only then did it reach slice 30's plain-string shortcut, which re-normalised both
+  operands through `comparisonOperandsAsBpchar`'s Datum round trip.
+
+**Change.**
+
+- **StringConst compiles to ExprConstVal.** The value is `NewStringDatum(Value)`, the interpreted arm's own
+  result, a constant. A BinaryOp still reads the literal-ness of its operands from the planner expression
+  (payload bits 0/1), not from the child node, so literal handling is unchanged.
+- **The plain pair goes first.** The plain-string shortcut now runs before the ambiguity test. Two
+  `plainCompareString` strings are never `textShapeAmbiguous`: a uuid needs 32 or more bytes, a pg\_lsn a '/', and a
+  row or array a leading '(' or '{'. That test could therefore only answer false for them. The bpchar blank rule
+  is applied directly to the strings: with either side bpchar-typed, a bpchar side or a bare literal drops its
+  trailing blanks.
+
+**Pins.**
+
+- `TestCompiledStringComparisonMatchesInterpreted` runs all six comparison operators over a char(9) column, a text
+  column and bare literals (plain, padded and row-shaped), in both operand orders. Values are plain, padded,
+  blank-only, uuid-, pg\_lsn-, row- and array-shaped. The compiled per-row and batch evaluators must equal the
+  interpreted `evalExpr` on every pair (over 10 000 checks). Mutation check: dropping the bare-literal trim fails
+  it.
+- `TestBuildExprSlabCommonKinds`' "unknown kind falls back to the adapter" case used StringConst as its example.
+  It now uses a function call, since StringConst no longer falls back.
+
+**Measured.** Instructions per query against `ecbfe6696`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q59 | 20.14 | 17.19 (−14.7 %; the StringConst compile alone −1.9 %) |
+| Q2 | 14.65 | 11.53 (−21.3 %) |
+| Q43 | 8.68 | 8.10 (−6.7 %) |
+| Q19, Q3, Q10 | — | identical |
+
+The sf025 sweep put Q59 at 1.60 → 1.30 s and Q2 at 0.46 → 0.42 s, with Q2 and Q43 checksums identical. Values are
+identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical. The gates ran after the
+nightly batch (fired 00:51, ended 02:09), because the acceptance arm refuses to overlap it.
+
+**Left.** PG compiles `bpchareq` against a constant without re-deriving the constant's blank-stripped length per row.
+goopg still trims the literal per call, a short `TrimRight`, and the column value too.
