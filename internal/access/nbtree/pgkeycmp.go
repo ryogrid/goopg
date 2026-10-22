@@ -237,3 +237,24 @@ func (bt *BTree) CompareLowBound(key, lo []byte) int { return bt.format().compar
 
 // CompareHighBound — see CompareLowBound.
 func (bt *BTree) CompareHighBound(key, hi []byte) int { return bt.format().compareHigh(key, hi) }
+
+// CompareBoundAttrs compares key with a bound on the attributes both store,
+// reporting the first differing attribute's comparison (res, 0 when all are
+// equal), its index (at; the shared count when all are equal) and the two
+// stored attribute counts (M0122-0012 slice 57). The skip walk derives its
+// group, before-probe and past-probe answers — CompareHighBound against the
+// pivot, CompareLowBound and CompareHighBound against the probe — from this
+// one pass, as _bt_checkkeys reads the skip attribute and then the next.
+// ok is false for the blob format or a comparison error, whose answers
+// (CompareKeys' bytewise fallback) only the per-bound calls give.
+func (bt *BTree) CompareBoundAttrs(key, bound []byte) (res, at, nKey, nBound int, ok bool) {
+	desc := bt.format().desc
+	if desc == nil {
+		return 0, 0, 0, 0, false
+	}
+	res, at, nKey, nBound, err := comparePGIndexTupleAttrsAt(desc, key, bound)
+	if err != nil {
+		return 0, 0, 0, 0, false
+	}
+	return res, at, nKey, nBound, true
+}

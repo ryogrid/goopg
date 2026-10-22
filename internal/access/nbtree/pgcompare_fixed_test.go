@@ -86,7 +86,7 @@ func TestCompareFixedPrefixMatchesWalk(t *testing.T) {
 				for _, y := range all {
 					nkey := uint16(desc.NKeyAtts())
 					ncmp := min(int(BTreeTupleGetNAtts(x, nkey)), int(BTreeTupleGetNAtts(y, nkey)))
-					if _, done := compareFixedPrefix(desc, x, y, ncmp); done {
+					if _, _, done := compareFixedPrefix(desc, x, y, ncmp); done {
 						decided++
 					}
 					for _, withTID := range []bool{false, true} {
@@ -125,7 +125,7 @@ func TestCompareFixedPrefixOverrunKeepsWalkError(t *testing.T) {
 	good := tup(t, desc.Attrs, [][]byte{int4Val(1), int4Val(2)}, storage.ItemPointer{Block: 1, Offset: 1})
 	short := append([]byte(nil), good...)
 	pgPutIndexTupleSize(short, len(short)-4) // second attribute now overruns
-	if _, done := compareFixedPrefix(desc, good, short, 2); done {
+	if _, _, done := compareFixedPrefix(desc, good, short, 2); done {
 		t.Fatal("compareFixedPrefix answered for a tuple whose attribute overruns its t_info size")
 	}
 	if _, err := ComparePGIndexTuples(desc, good, short); err == nil {

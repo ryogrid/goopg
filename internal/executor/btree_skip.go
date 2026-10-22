@@ -385,6 +385,62 @@ func (e *btreeSkipEnum) probeKey(idx *catalog.Index, vals []Datum, pos int) ([]b
 // the per-group descents of next.
 func (e *btreeSkipEnum) canWalk() bool { return e.desc != nil }
 
+// skipPos is one leaf entry's comparison with its group's probe
+// (nbtree.BTree.CompareBoundAttrs, M0122-0012 slice 57). The probe is the
+// pivot's attributes followed by the bound columns, so the one pass answers
+// all three of walkLeaf's per-entry questions, each exactly as the bound
+// comparison it replaces would: pastGroup is CompareHighBound(key, pivot) > 0,
+// beforeProbe CompareLowBound(key, probe) < 0, pastProbe
+// CompareHighBound(key, probe) > 0. Without a usable pass (ok false: no probe
+// yet, a comparison error, an entry storing fewer attributes than the probe)
+// and in the one case the attributes leave open — an entry equal to a
+// full-arity probe, which only the heap-TID tiebreak orders — the
+// per-bound call answers.
+type skipPos struct {
+	res, at, nKey, nProbe int
+	ok                    bool
+}
+
+func probePos(tree *nbtree.BTree, key, probe []byte) skipPos {
+	if probe == nil {
+		return skipPos{}
+	}
+	res, at, nKey, nProbe, ok := tree.CompareBoundAttrs(key, probe)
+	return skipPos{res: res, at: at, nKey: nKey, nProbe: nProbe, ok: ok && nProbe > 0 && nKey >= nProbe}
+}
+
+// pastGroup: the entry's first s attributes order after the pivot's — the
+// probe's first s. Equal on them, compareHigh calls the entry inside the
+// pivot (a bound naming a prefix is plus infinity beyond it).
+func (p skipPos) pastGroup(tree *nbtree.BTree, key, pivot []byte, s int) bool {
+	if p.ok && s <= p.nProbe {
+		return p.at < s && p.res > 0
+	}
+	return tree.CompareHighBound(key, pivot) > 0
+}
+
+// beforeProbe: a differing attribute decides; equal on every probe attribute,
+// a longer entry orders after the truncated probe (minus infinity beyond it).
+func (p skipPos) beforeProbe(tree *nbtree.BTree, key, probe []byte) bool {
+	if p.ok {
+		if p.res != 0 {
+			return p.res < 0
+		}
+		if p.nKey > p.nProbe {
+			return false
+		}
+	}
+	return tree.CompareLowBound(key, probe) < 0
+}
+
+// pastProbe: compareHigh is heap-TID blind, so equal attributes are inside.
+func (p skipPos) pastProbe(tree *nbtree.BTree, key, probe []byte) bool {
+	if p.ok {
+		return p.res > 0
+	}
+	return tree.CompareHighBound(key, probe) > 0
+}
+
 // walkLeaf is the skip scan as PG 18 runs it (M0145-0008af): one leaf page
 // per call, every entry checked against the current prefix group's probe,
 // as `_bt_checkkeys` checks a skip array advanced to the entry's prefix
@@ -427,7 +483,8 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 	jumpExcl, checkedBefore, checkedPassed := false, false, false
 	ok, nerr := cur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
 		entries++
-		if e.gPivot == nil || tree.CompareHighBound(key, e.gPivot) > 0 {
+		at := probePos(tree, key, e.gProbe)
+		if e.gPivot == nil || at.pastGroup(tree, key, e.gPivot, s) {
 			probe, pivot, gerr := e.groupBounds(ctx, idx, s, key, pos, op)
 			if gerr != nil {
 				return false, gerr
@@ -436,8 +493,9 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			e.gReached, e.gPassed = false, false
 			checkedBefore, checkedPassed = false, false
 			newGroups++
+			at = probePos(tree, key, e.gProbe)
 		}
-		if !e.gPassed && tree.CompareLowBound(key, e.gProbe) < 0 {
+		if !e.gPassed && at.beforeProbe(tree, key, e.gProbe) {
 			// Before the group's probe. If even the leaf's final entry is,
 			// no entry left here reaches it: descend to the probe now, as
 			// _bt_advance_array_keys starts a new primitive scan when the
@@ -451,7 +509,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			}
 			return true, nil
 		}
-		if !e.gPassed && tree.CompareHighBound(key, e.gProbe) > 0 {
+		if !e.gPassed && at.pastProbe(tree, key, e.gProbe) {
 			e.gPassed = true
 		}
 		if e.gPassed {

@@ -2092,6 +2092,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       alloc \+ prefix bytes copied at nbtree\.PGIndexFixedAttrOffsets; declines on null bitmap / varlena \(pinned\)\.
     - Q16 0\.34–0\.38 → 0\.26–0\.29 s, Q95 2\.6–2\.9 → 2\.4 s; sweep 109\.5 → 109\.3 s; values identical\.
     - Next: Q16 ~4\.5× PG — walkLeaf's up to 3 tuple compares per entry\.
+  - **Slice 57 — the skip walk reads its group position off one comparison LANDED 2026\-10\-22\.** Movement: none — perf
+    only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS \(2 of 3 runs; the first failure's output was not captured\),
+    nbtree \-race PASS\. Doc part 5 "Slice 57"\.
+    - Instrument: the Go CPU profiler under\-samples parallel queries here \(~66 ms vs 1\.1 CPU\-s per Q16 run\); per\-query
+      CPU from /proc utime\+stime and `perf record \-p` are the instruments\.
+    - Named target TPC\-DS Q16: per entry 3 bound compares in walkLeaf plus a per\-entry `lo` compare in scanLeafItems\.
+    - BTree\.CompareBoundAttrs \(deciding attribute\) → skipPos predicates equal the replaced calls \(pinned, mutation\-checked\);
+      scanLeafItems drops `lo` once one entry passed it \(leaf order\)\.
+    - Q16 0\.268 → 0\.237 s wall, 1\.11 → 0\.975 CPU\-s; Q72 −4 %; sweep sum noise \(Q1/Q81/Q14 rises did not repeat in A/B\)\.
+    - Next: Q16 still ~4× PG CPU — per\-entry parse \+ call layers; PG's \_bt\_set\_startikey / look\-ahead\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4138,6 +4149,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `7e6b592d1`** \(M0122\-0012 slice 53 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `de41f8c20`** \(M0122\-0012 slice 56 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

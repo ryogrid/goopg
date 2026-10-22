@@ -4750,6 +4750,11 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 				} else if bt.format().compare(key, lo) < 0 {
 					continue
 				}
+				// Leaf order: every later entry passes too (the
+				// monotone predicate leafScanStart binary-searches), so
+				// the rest of the leaf skips the test (M0122-0012
+				// slice 57).
+				lo = nil
 			}
 			// compareHigh, not compare: a bound naming only a prefix of
 			// the key attributes is PLUS infinity beyond them (see
@@ -4790,6 +4795,7 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 				} else if bt.format().compare(it.key, lo) < 0 {
 					continue
 				}
+				lo = nil // see the posting branch above
 			}
 			// compareHigh: see the posting branch above. An EXCLUSIVE
 			// upper bound stops at the boundary key itself.

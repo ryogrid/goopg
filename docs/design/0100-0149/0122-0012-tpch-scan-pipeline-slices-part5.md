@@ -670,3 +670,66 @@ The sf025 sweep sum went from 109.5 to 109.3 s. Values are identical (sf025 PASS
 
 **Left.** Q16 is still about 4.5× PG. The skip walk still makes up to three tuple comparisons per entry
 (`walkLeaf`), where PG's `_bt_checkkeys` compares the skip attribute and then the next one.
+
+## Slice 57 (2026-10-22): the skip walk reads its group position off one comparison — TPC-DS Q16
+
+**Measuring.** On this host the Go CPU profile under-samples parallel queries badly. For Q16 it recorded
+~66 ms per run, but `/proc/<pid>/stat` showed 1.1 CPU-s per run: the query is CPU-bound across its four
+processes, and PG takes ~0.24 CPU-s. `perf record -F 997 -p <pid>` gives the true distribution. Per-query CPU
+from `/proc` (utime+stime deltas over N runs) is the A/B instrument from here on.
+
+**Target.** `perf` at `de41f8c20` put the skip walk (`btreeSkipEnum.walkLeaf` over `scanLeafItems`) at
+roughly two thirds of Q16's CPU. Per leaf entry it ran:
+
+- `CompareHighBound(entry, pivot)` (has a new group started?);
+- `CompareLowBound(entry, probe)` (is the entry before the probe?);
+- `CompareHighBound(entry, probe)` (is it past the probe?);
+- inside `scanLeafItems`, a fourth full comparison against the cursor's lower bound `lo`, on every entry of
+  every leaf.
+
+**Change.**
+
+- **One comparison per entry.** `BTree.CompareBoundAttrs` compares the entry with the probe once and also
+  reports which attribute decided (`comparePGIndexTupleAttrsAt`; `compareFixedPrefix` reports it too).
+  The probe is the pivot's attributes followed by the bound columns, so `skipPos` answers all three
+  questions exactly as the replaced calls would:
+  - new group: the deciding attribute lies inside the prefix and the result is positive. With an equal
+    prefix, `compareHigh` calls the entry inside the pivot.
+  - before the probe: the result is negative. With all probe attributes equal, a longer entry orders after
+    the truncated probe.
+  - past the probe: the result is positive (`compareHigh` ignores the heap TID).
+  - Fallbacks: no probe yet, a comparison error (whose bytewise fallback only the per-bound calls give), an
+    entry storing fewer attributes than the probe, and an entry equal to a full-arity probe (ordered only by
+    the heap-TID tiebreak) all make the original call.
+- **`lo` tested once per leaf.** `scanLeafItems` stops testing `lo` once one entry has passed it. Leaf
+  entries are sorted, so the test is true for a prefix of the page and false afterwards — the monotone
+  predicate `leafScanStart` already binary-searches. This applies to every range scan, not only skip scans.
+
+**Pins.**
+
+- `TestSkipPosMatchesBoundCalls` covers a (DESC int4, int4 NULLS FIRST, int4) tree with random entries,
+  including NULLs and duplicate keys. It uses groups of one and two prefix attributes, with truncated and
+  full-arity probes, and each predicate must equal the call it replaced. Mutation check: `at <= s` for
+  `at < s` fails it.
+- For the `lo` change, `TestLeafScanStartMatchesLinearWalk` and `TestScanCursorExclusiveBounds` fail when the
+  lower-bound test is dropped altogether, so they guard the bound semantics. They pass with the
+  test-once-per-leaf rule.
+- The nbtree package passes under `-race`.
+
+**Measured.** Per-query wall and CPU (`/proc`), 2GB clone, two interleaved rounds of 8–20 runs against
+`de41f8c20`:
+
+| query | HEAD wall / CPU (s) | candidate wall / CPU (s) |
+|---|---|---|
+| Q16 | 0.268 / 1.105–1.113 | 0.237–0.238 / 0.975 |
+| Q72 | 0.753 / 3.05–3.07 | 0.725 / 2.92–2.93 |
+| Q95 | 2.30–2.44 / 2.63–2.92 | 2.25–2.27 / 2.57–2.60 |
+
+The fused comparison alone was worth −4.5 % of Q16's CPU; the `lo` change added the rest. The sf025 sweep
+sum went from 109.3 to 110.7 s. That rise came from Q1 (+2.3 s), Q81 (+1.5 s) and Q14 (+1.1 s), none of which
+repeated in an interleaved A/B (Q1 is bimodal at 10–11.8 s on both builds). Values are identical (sf025
+PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Left.** Q16 is still ~4× PG in CPU (0.98 vs ~0.24 CPU-s). Per entry the walk still parses the item and
+makes its comparison through two layers of calls. PG's `_bt_readpage` applies `_bt_checkkeys` with the
+`_bt_set_startikey` and look-ahead shortcuts, which skip tuples the array keys cannot match.
