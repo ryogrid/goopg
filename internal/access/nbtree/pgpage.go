@@ -177,6 +177,16 @@ func pgAddItemRaw(p storage.Page, raw []byte) (uint16, error) {
 // exported for the same reason ParseOpaque is: out-of-package structural
 // validators must read the high key through this package's single decoder.
 func PGHighKeyRaw(p storage.Page) ([]byte, bool, error) {
+	raw, ok, err := pgHighKeyRawNoCopy(p)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return append([]byte(nil), raw...), true, nil
+}
+
+// pgHighKeyRawNoCopy is PGHighKeyRaw without the copy: the bytes ALIAS the
+// page, valid only while the caller holds it pinned and unmodified.
+func pgHighKeyRawNoCopy(p storage.Page) ([]byte, bool, error) {
 	if ReadPGOpaque(p).IsRightmost() {
 		return nil, false, nil
 	}
@@ -187,7 +197,7 @@ func PGHighKeyRaw(p storage.Page) ([]byte, bool, error) {
 	if count < int(PHiKey) {
 		return nil, false, fmt.Errorf("btree: non-rightmost page has no high key line pointer (maxoff=%d)", count)
 	}
-	raw, err := storage.PageGetItemRawAllowDead(p, PHiKey)
+	raw, err := storage.PageGetItemRawAllowDeadNoCopy(p, PHiKey)
 	if err != nil {
 		return nil, false, err
 	}

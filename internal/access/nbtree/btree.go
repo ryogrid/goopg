@@ -219,11 +219,29 @@ func writeOpaque(p storage.Page, o BTPageOpaque) {
 // bytes are the separator; its pointer half is unused (S11.4 turns it into a
 // real pivot tuple whose t_tid carries the downlink).
 func (f indexFormat) pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
-	raw, ok, err := PGHighKeyRaw(p)
+	raw, ok, err := pgHighKeyRawNoCopy(p)
 	if err != nil || !ok {
 		return nil, false, err
 	}
 	it, perr := f.parse(raw)
+	if perr != nil {
+		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
+		return nil, false, perr
+	}
+	return it.key, true, nil
+}
+
+// pageHighKeyNoCopy is pageHighKey without the copy: the key ALIASES the
+// page, so it is valid only while the caller holds p pinned and unmodified.
+// The move-right tests below compare it and drop it; copying it twice there
+// (the raw item, then the key) was two allocations per tree level on every
+// descent — every probe of a nested-loop index join (M0122-0012 slice 54).
+func (f indexFormat) pageHighKeyNoCopy(p storage.Page) (key []byte, ok bool, err error) {
+	raw, ok, err := pgHighKeyRawNoCopy(p)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	it, perr := f.parseNoCopy(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
 		return nil, false, perr
@@ -255,7 +273,7 @@ func highKeyItem(key []byte) item {
 // under right-link recovery. A rightmost page (or an unreadable high key, which
 // the structural validators report separately) never overshoots.
 func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}
@@ -269,7 +287,7 @@ func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
 // compareHigh rule — no entry of the page can be past the bound, and the scan
 // belongs on a page further right.
 func keyAtOrPastHighKey(f indexFormat, p storage.Page, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}
@@ -298,7 +316,7 @@ func lowerBoundPastPage(f indexFormat, p storage.Page, lo []byte, loExclusive bo
 // HighKey is itself the separator that was pushed up when this page last
 // split, so a downlink equal to it belongs to the right sibling.
 func itemOvershootsHighKey(f indexFormat, p storage.Page, op BTPageOpaque, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}

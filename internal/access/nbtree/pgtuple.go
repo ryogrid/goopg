@@ -724,7 +724,8 @@ func deformPGIndexTupleInto[T physAttr](raw []byte, attrs []T, natts int, values
 	if natts > len(attrs) {
 		return fmt.Errorf("btree: natts %d exceeds %d described attributes", natts, len(attrs))
 	}
-	w, err := newPGIndexTupleWalk(raw)
+	var w pgIndexTupleWalk
+	err := w.init(raw)
 	if err != nil {
 		return err
 	}
@@ -750,16 +751,22 @@ type pgIndexTupleWalk struct {
 	hasNulls bool
 }
 
-func newPGIndexTupleWalk(raw []byte) (pgIndexTupleWalk, error) {
+// init points w at raw's first attribute. It fills w in place rather than
+// returning a walk: comparePGIndexTupleAttrs runs it twice per comparison on
+// every descent step, and a returned 48-byte struct is stored to the stack
+// and reloaded field by field — a store-forwarding stall that profiled at
+// ~1 s of TPC-DS Q14's 21 s of CPU (M0122-0012 slice 54).
+func (w *pgIndexTupleWalk) init(raw []byte) error {
 	if len(raw) < SizeOfIndexTupleData {
-		return pgIndexTupleWalk{}, fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
+		return fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
 	}
 	tInfo := pgTInfo(raw)
 	size := int(tInfo & IndexSizeMask)
 	if size > len(raw) {
-		return pgIndexTupleWalk{}, fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
+		return fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
 	}
-	return pgIndexTupleWalk{raw: raw, size: size, off: PGIndexInfoFindDataOffset(tInfo), hasNulls: tInfo&IndexNullMask != 0}, nil
+	w.raw, w.size, w.off, w.hasNulls = raw, size, PGIndexInfoFindDataOffset(tInfo), tInfo&IndexNullMask != 0
+	return nil
 }
 
 // next returns attribute i, which must be the attribute after the one the

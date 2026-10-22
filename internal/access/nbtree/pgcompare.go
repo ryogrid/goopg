@@ -248,12 +248,11 @@ func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, n
 	if ncmp == 0 {
 		return 0, nattsA, nattsB, nil
 	}
-	wa, err := newPGIndexTupleWalk(a)
-	if err != nil {
+	var wa, wb pgIndexTupleWalk
+	if err := wa.init(a); err != nil {
 		return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
 	}
-	wb, err := newPGIndexTupleWalk(b)
-	if err != nil {
+	if err := wb.init(b); err != nil {
 		return 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
 	}
 	for i := range ncmp {

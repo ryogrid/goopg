@@ -515,3 +515,55 @@ builds), and TPC-H's warm total is flat (15.1 vs 15.5 s, Q2 bimodal). TPC-H valu
 - A CTE body is built with an unbounded `Build(p.Child)` (`newCteScanOp`), so its scans deform from a full
   incoming bound.
 - Both are bound-threading gaps for the next slices.
+
+## Slice 54 (2026-10-22): the descent compares without copying or returning walks — TPC-DS Q72, Q16, Q14b
+
+**Target.** At HEAD `7e6b592d1` a CPU profile of TPC-DS Q14 on the 2GB clone put 30 % of samples in B-tree
+descents: the per-probe descents of the nested-loop index joins. Line-level, two costs had nothing to do with
+comparing keys:
+
+- `comparePGIndexTupleAttrs` took 1.80 s flat out of 21 s. Of that, 1.06 s sat on its two `newPGIndexTupleWalk`
+  call lines, while the constructor's own body took 0.30 s. The constructor returns a 48-byte walk plus an error
+  by value, twice per comparison. This is the stack-returned-struct pattern that cost the Datum-returning
+  deform path a store-forwarding stall.
+- `keyExceedsHighKey`, the move-right test run at every tree level, took 1.33 s. 1.05 s of that went to
+  `pageHighKey`, which copied the high key twice per call: `PGHighKeyRaw` copied the raw item
+  (`PageGetItemRawAllowDead`), then `parse` copied its key. The test then compared the key and dropped it.
+
+**Change.**
+
+- `pgIndexTupleWalk.init` fills a caller-declared walk in place. `comparePGIndexTupleAttrs` and
+  `deformPGIndexTupleInto` declare theirs, and `newPGIndexTupleWalk` is gone.
+- `pgHighKeyRawNoCopy` and `indexFormat.pageHighKeyNoCopy` alias the page. The three compare-and-drop tests use
+  them: `keyExceedsHighKey`, `keyAtOrPastHighKey` and `itemOvershootsHighKey`. Each runs on a page its caller holds
+  pinned, the same contract the leaf and inner binary searches already rely on (`parseNoCopy`).
+- `PGHighKeyRaw` and `pageHighKey` still return copies; `pageHighKey` now makes one copy instead of two.
+
+After the change, the walk-init lines take 0.33 s and `keyExceedsHighKey` 0.60 s. `comparePGIndexTupleAttrs`
+went from 3.04 s to 2.35 s cumulative.
+
+**Pins.**
+
+- `TestPageHighKeyNoCopyMatchesCopy` covers every page of a blob-format and a tuple-format tree. Both readers
+  must return the same key and presence. After the page is cleared, `pageHighKey`'s key must be unchanged (a copy)
+  and `pageHighKeyNoCopy`'s must not (an alias).
+- The walk's comparison and deform semantics are pinned unchanged by the existing comparator and walk tests
+  (`pgcompare_walk_test.go`, `pgcompare_test.go`). The nbtree package passes under `-race`.
+
+**Measured.** Warm (second run of each), 2GB clone, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| Q72 | 1.10–1.12 | 0.98 |
+| Q16 | 0.47 | 0.41–0.43 |
+| Q14b | 6.32–6.44 | 5.83–5.94 |
+| Q14a | 6.07–6.39 | 6.15–6.34 |
+
+The sf025 sweep sum (128MB) went from 113.4 to 112.3 s. Values are identical (sf025 PASS=99, 61 ck; acceptance
+24 MATCH) and plan shapes are identical.
+
+**Tried and dropped.** A per-Context cache of `pgIndexKeyColumns` in `indexProbeKey`, the by-name key-column
+resolution repeated on every probe: Q14a/Q14b flat within noise (≈2 % of samples, under the 3 % bar).
+
+**Left.** Q14's per-probe descent remains the largest share, followed by `cloneRowOwned` of Gather-queue rows
+and the string decode of unread prefix text columns.

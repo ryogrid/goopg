@@ -2064,6 +2064,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q14a 7\.1–7\.8 → 6\.7–6\.8 s, Q14b 8\.0–8\.8 → 6\.8–7\.4 s; sweep 115\.7 → 113\.4 s; TPC\-H flat, values identical\.
     - Tried and dropped: MaterializedSlot\.owned copy elision \(Sort / Gather rows\) — Q97 slightly slower\.
     - Next: slab buildRec Project arm has no live set; CTE bodies built with unbounded Build\(\)\.
+  - **Slice 54 — the B\-tree descent compares without copying or returning walks LANDED 2026\-10\-22\.** Movement: none
+    — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, nbtree \-race PASS\. Doc part 5 "Slice 54"\.
+    - Named target TPC\-DS Q72 \(per\-probe descents\): newPGIndexTupleWalk's 48\-byte struct return took 1\.06 s of 21 s
+      CPU in Q14, and pageHighKey copied the high key twice per tree level for a compare\-and\-drop move\-right test\.
+    - pgIndexTupleWalk\.init fills in place; keyExceedsHighKey / keyAtOrPastHighKey / itemOvershootsHighKey read an
+      aliasing key \(pageHighKeyNoCopy\); pageHighKey still copies \(once\)\.
+    - Q72 1\.10 → 0\.98 s, Q16 0\.47 → 0\.42 s, Q14b 6\.4 → 5\.9 s, Q14a flat; sweep 113\.4 → 112\.3 s; values identical\.
+    - Tried and dropped: a per\-Context pgIndexKeyColumns cache in indexProbeKey — flat \(≈2 % of samples\)\.
+    - Next: Q14 descent still the largest share; Gather\-queue cloneRowOwned; unread prefix text decode\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4104,6 +4114,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `48af8abcc`** \(M0122\-0012 slice 52 changed internal/executor and nbtree\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `7e6b592d1`** \(M0122\-0012 slice 53 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
