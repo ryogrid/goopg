@@ -221,15 +221,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if err != nil {
 			return nil, err
 		}
-		jop := newJoinOp(p, left, right)
-		// Record the bounds the children were actually built with. The
-		// cooperative parallel hash build rebuilds the build-side subtree
-		// from the plan and must use the SAME bound; deriving it there is
-		// impossible (it depends on `bound`, i.e. on everything above this
-		// join). See joinOp.deformLeftBound.
-		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
-		markScanBorrowChain(joinBorrowBuildChild(jop))
-		return maybeInstrument(p, jop, scope), nil
+		return finishJoinNode(p, left, right, leftBound, rightBound, scope), nil
 	case *optimizer.NestedLoopIndexJoin:
 		// EX1-02: the outer follows the left-side rule; inner rescans
 		// stay out (EX1-02b).
@@ -674,8 +666,42 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 			return nil, err
 		}
 		return finishIncrementalSortNode(p, child, scope), nil
+	case *optimizer.Join:
+		// The join's left rows reach only the consumers (through the merged
+		// output) and the join's own predicate and left keys, so the left
+		// subtree is consumer-complete too (M0122-0012 slice 66). TPC-DS
+		// Q39's HashAggregate → Hash Join → Gather shipped every column of
+		// its inventory × date_dim × warehouse rows across the queue.
+		leftConsumers, ok := joinLeftConsumers(p, consumers)
+		if !ok {
+			break
+		}
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		left, err := buildCompleteChild(p.Left, leftBound, leftConsumers, scope)
+		if err != nil {
+			return nil, err
+		}
+		right, err := buildNode(p.Right, rightBound, scope)
+		if err != nil {
+			return nil, err
+		}
+		return finishJoinNode(p, left, right, leftBound, rightBound, scope), nil
 	}
 	return buildNode(n, bound, scope)
+}
+
+// finishJoinNode wires a Join over its built children — shared by buildNode's
+// Join arm and buildCompleteChild so the two cannot drift.
+func finishJoinNode(p *optimizer.Join, left, right Operator, leftBound, rightBound int, scope *instrumenter) Operator {
+	jop := newJoinOp(p, left, right)
+	// Record the bounds the children were actually built with. The
+	// cooperative parallel hash build rebuilds the build-side subtree
+	// from the plan and must use the SAME bound; deriving it there is
+	// impossible (it depends on `bound`, i.e. on everything above this
+	// join). See joinOp.deformLeftBound.
+	jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+	markScanBorrowChain(joinBorrowBuildChild(jop))
+	return maybeInstrument(p, jop, scope)
 }
 
 // newGatherMergeNode builds a GatherMerge whose workers each construct their
@@ -735,20 +761,18 @@ func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instr
 	childBound := deformProjectBelow(p, bound, live)
 	var child Operator
 	var err error
-	if inner, ok := p.Child.(*optimizer.Project); ok {
-		// A projection's only reader of its child's rows is itself, and it
-		// evaluates just its live targets: a child projection is therefore
-		// consumer-complete, its consumers being those targets — the rule
-		// buildCompleteChild applies under an aggregate, one level down
-		// (M0122-0012 slice 53). TPC-DS Q14 stacks a re-expansion Project
-		// on another that lists every column of its lateral joins; built
-		// with every target live, that inner Project folded the joins'
-		// last column, and the store_sales, item and date_dim probes beneath
-		// deformed every column of every probed row.
-		child, err = buildProjectNode(inner, childBound, projectLiveSet(inner, liveProjectTargets(p, live)), scope)
-	} else {
-		child, err = buildNode(p.Child, childBound, scope)
-	}
+	// A projection's only reader of its child's rows is itself, and it
+	// evaluates just its live targets: its child is therefore
+	// consumer-complete, its consumers being those targets — the rule
+	// buildCompleteChild applies under an aggregate, one level down
+	// (M0122-0012 slice 53). TPC-DS Q14 stacks a re-expansion Project on
+	// another that lists every column of its lateral joins; built with every
+	// target live, that inner Project folded the joins' last column, and the
+	// store_sales, item and date_dim probes beneath deformed every column of
+	// every probed row. Slice 66 extends it past a child projection: TPC-DS
+	// Q39's aggregate reads a Project over a Hash Join over a Gather, whose
+	// workers shipped whole join rows.
+	child, err = buildCompleteChild(p.Child, childBound, liveProjectTargets(p, live), scope)
 	if err != nil {
 		return nil, err
 	}

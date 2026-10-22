@@ -743,6 +743,48 @@ func deformJoinBounds(p *optimizer.Join, incoming int) (left, right int) {
 	return left, deformUnionBound(rightAbove, deformUnionBound(rightKeys, rightSplit))
 }
 
+// joinLeftConsumers translates the consumers of a join's merged (left++right)
+// output into the expressions that read its LEFT rows, for buildCompleteChild:
+// one ColumnRef per live left column, plus the join's own readers of the left
+// row — the merged-space predicate (folded into the live set) and the left
+// halves of its equi-key pairs, which evaluate positionally against left rows
+// (deformPositionalKeys). ok is false — build the join normally — for a join
+// type whose output is not that layout, a LATERAL or null-aware join, a
+// layout the side widths do not account for, or consumers whose reads
+// consumerLiveColumns cannot enumerate.
+func joinLeftConsumers(p *optimizer.Join, consumers []optimizer.Expr) ([]optimizer.Expr, bool) {
+	switch p.Type {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeCross:
+	default:
+		return nil, false
+	}
+	if p.Lateral || p.NullAware || len(p.UsingLeftCols) > 0 {
+		return nil, false
+	}
+	leftW, rightW := deformSideWidth(p.Left), deformSideWidth(p.Right)
+	if leftW <= 0 || rightW <= 0 || len(p.Output()) != leftW+rightW {
+		return nil, false
+	}
+	live := consumerLiveColumns(append(append([]optimizer.Expr(nil), consumers...), p.Predicate))
+	if live == nil {
+		return nil, false
+	}
+	var out []optimizer.Expr
+	for i := range min(len(live), leftW) {
+		if live[i] {
+			out = append(out, &optimizer.ColumnRef{Index: i})
+		}
+	}
+	if len(p.HashKeys) > 0 {
+		for _, k := range p.HashKeys {
+			out = append(out, k.Left)
+		}
+	} else {
+		out = append(out, p.LeftKey)
+	}
+	return out, true
+}
+
 // deformLateralOuterRefs is the left-side bound a LATERAL join's inner reads
 // of the outer row: lateralJoinStream binds every outer row into the inner's
 // outer slot, and the probe evaluates its key expressions — and any outer

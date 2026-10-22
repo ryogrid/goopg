@@ -314,6 +314,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	}
 
 	batch := make([]Row, 0, gatherBatchRows)
+	var chunk rowChunk
 	var tids []queueTID
 	if o.wantCTIDs {
 		tids = make([]queueTID, 0, gatherBatchRows)
@@ -351,7 +352,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		if o.wantCTIDs {
 			tids = append(tids, slotQueueTID(slot))
 		}
-		batch = append(batch, transferRowForQueueLive(slot, o.liveCols))
+		batch = append(batch, transferRowForQueueLive(slot, o.liveCols, &chunk))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -407,7 +408,7 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		if o.wantCTIDs {
 			src.curTID = slotQueueTID(slot)
 		}
-		src.cur = transferRowForQueueLive(slot, o.liveCols)
+		src.cur = transferRowForQueueLive(slot, o.liveCols, nil)
 		return true, nil
 	}
 	for len(src.pending) == 0 {

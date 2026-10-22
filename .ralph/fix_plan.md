@@ -2218,6 +2218,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       the reset is mutation\-checked by existing NL suites\)\.
     - Q35 12\.43 → 10\.39 Ginstr \(−16\.4 %\), wall 2\.3–3\.1 → 0\.62 s; sweep 98\.9 → 95\.5 s\.
     - Next: hashed SubPlan for EXISTS … OR EXISTS … \(PG\) instead of per\-row cached list \+ probe; Q39 \(2\.2 vs 0\.59 s\)\.
+  - **Slice 66 — liveness crosses a Project and a join's probe side; a Gather worker carves shipped rows from chunks
+    LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same \(also PASS=99 on a poison\-armed binary\), acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite
+    PASS, TestPort\_Isolation PASS\. Doc part 6 "Slice 66"\.
+    - Q39 \(HashAggregate → Project → Hash Join → Gather, 2\.34 M rows per statement\): workers spent 30 % of all
+      instructions in transferRowForQueue — VirtualSlot\.Row\(\) of all 9 cells, then a deep copy; liveCols was nil because
+      a Project and a join stood between the aggregate and the Gather\.
+    - buildProjectNode builds its child through buildCompleteChild; new Join arm \(joinLeftConsumers: INNER/LEFT/CROSS,
+      not LATERAL/null\-aware, layout\-checked\); transferRowForQueueLive reads VirtualSlot live cells in place; rowChunk
+      \(32 rows per allocation\) for worker rows \(pinned; mutation\-checked\)\.
+    - Q39 29\.06 → 26\.86 Ginstr \(−7\.6 %\), CPU −11 %, wall unchanged \(~2\.0 s; leader\-bound\); Q22 −0\.7 %; Q21/Q7/Q26/
+      Q48/Q13 flat; sweep 95\.5 s unchanged\.
+    - Next: Q39's serial leader — per\-group allocation, string\-keyed group map, numeric finalisation of 540 K groups
+      \(PG accumulates int4 in int128, int4\_accum\); or the hashed SubPlan for Q35\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4327,6 +4341,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `d164c7319`** \(M0122\-0012 slice 64 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `d4a855738`** \(M0122\-0012 slice 65 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

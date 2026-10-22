@@ -486,3 +486,75 @@ identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are ident
 
 **Left.** PG evaluates `EXISTS … OR EXISTS …` as a hashed SubPlan, with no per-row list at all. goopg still
 materialises the cached value slice and probes its hash per row.
+
+## Slice 66 (2026-10-23): liveness crosses a Project and a join's probe side, and a Gather worker carves its shipped rows from chunks — TPC-DS Q39
+
+**Target.** Q39 is the largest remaining gap on the 2GB clone: 1.94 s for its two statements against PG's 0.59 s.
+Each statement is `HashAggregate → Project → Hash Join (item) → Gather → Hash Join (warehouse) → Parallel Hash
+Join (date_dim) → Parallel Seq Scan on inventory`, and the Gather carries 2.34 M rows per statement (PG's own
+EXPLAIN ANALYZE count). An instruction profile put 30 % of all instructions in the workers' `transferRowForQueue`:
+it gathered every cell of the 9-column join row through `VirtualSlot.Row()` into a scratch row, then deep-copied
+that row again for the queue. Slices 39 and 63 ship only live columns when a Gather sits directly under a
+consumer-complete parent (an aggregate or a sort), but here a Project and a join stand in between, so
+`liveCols` stayed nil.
+
+**Change.**
+
+- **A Project's child is consumer-complete.** A projection reads its child's rows only through its live
+  targets, so `buildProjectNode` builds its child through `buildCompleteChild` with those targets as the
+  consumers. Slice 53 did this only for a child that is itself a Project; every arm of `buildCompleteChild`
+  (Sort, IncrementalSort, Gather, GatherMerge, now Join) is correct under that rule, and any other child kind
+  still builds through `buildNode`.
+- **A join's left side is consumer-complete.** A new `*optimizer.Join` arm of `buildCompleteChild` builds the
+  left subtree with the consumers `joinLeftConsumers` derives: one ColumnRef per live left column of the merged
+  output, where liveness covers the parent's consumers and the join's merged-space predicate, plus the left
+  halves of the equi-key pairs, which evaluate positionally against left rows. The right subtree and the join
+  itself are built as in `buildNode`, through the shared `finishJoinNode`. The arm declines, and the join builds
+  normally, for a join type whose output is not the left++right layout (only INNER, LEFT and CROSS qualify), a
+  LATERAL or null-aware join, a layout the side widths do not account for, or consumers whose reads
+  `consumerLiveColumns` cannot enumerate (a sublink, a whole-row or ctid reference).
+- **Live cells read in place.** `transferRowForQueueLive` reads a VirtualSlot cell by cell, live cells only,
+  instead of materialising the whole row first. Any other slot is copied from its `Row()` view as before.
+- **Shipped rows come from chunks.** A Gather or Gather Merge worker carves its shipped rows from a `rowChunk`,
+  one allocation per 32 rows of a width. It is not a pool: every row is fresh and zeroed, owned by its
+  consumer, and capacity-capped so an append cannot reach a neighbour. A consumer that keeps one row keeps its
+  chunk alive, and the 32-row size bounds that. The leader's own Gather Merge rows still allocate one by one.
+
+**Pins.**
+
+- `TestGatherUnderJoinShipsLiveColumns`: Aggregate → Project → Join → Gather ships exactly the join key, the
+  residual's left column and the aggregate's column, for INNER and LEFT. Dropping the predicate from the live
+  set, or bypassing the arm, fails it.
+- `TestGatherUnderJoinKeepsEveryColumnWhenUnsure`: a semi join, a LATERAL join, a mismatched layout and a
+  sublink predicate each leave `liveCols` nil.
+- `TestRowChunkRowsAreIndependent`: rows are zeroed and length-capped, refill past the chunk works, and an
+  append on one row leaves its neighbour intact. Removing the capacity cap fails it.
+- `TestTransferRowForQueueLiveReadsLiveCellsOnly`: for a VirtualSlot and a materialised slot, live cells carry
+  the source values and dead cells are NULL.
+- The executor package passes with the deform poison armed, and so does an SF0.25 sweep run on a poison-armed
+  binary (PASS=99, 61 ck), so no consumer reads a cell this slice leaves dead.
+
+**Measured** against `d4a855738`:
+
+| query | HEAD Ginstr | candidate Ginstr | HEAD wall / CPU (s) | candidate wall / CPU (s) |
+|---|---|---|---|---|
+| Q39 | 29.06 | 26.86 (−7.6 %; the liveness alone −6.5 %) | 1.99 / 3.80 | 2.10 / 3.38 |
+| Q22 | 22.64 | 22.48 (−0.7 %) | | |
+| Q21, Q7, Q26, Q48, Q13 | — | within ±0.05 % | | |
+
+Q39's CPU fell about 11 %, but its wall time did not move: wall stays within run-to-run noise (1.94–2.10 s on
+either binary). The query is bound by its serial leader, which probes the item hash, projects, and aggregates
+2.34 M rows into 540 K groups per statement, then finalises `stddev_samp` and `avg` through big-integer numeric
+arithmetic. The workers' savings only shorten the time they spend waiting on the leader. The sf025 sweep sum is
+unchanged at 95.5 s, values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are
+identical.
+
+**Left.**
+
+- PG's workers send the projected tuple, its targetlist narrowed by the planner at every level. goopg still
+  ships full-width rows with NULL dead cells, and narrows only along the consumer-complete chains above: a
+  join's right side, semi and anti joins, and RIGHT and FULL joins are not narrowed.
+- Q39's wall time is the leader's serial work. Its leader profile is flat: per-group allocation, string-keyed
+  group lookups, and the numeric finalisation of 540 K groups (`exactIntVariance`, `numericDiv`,
+  `pgSqrtScaled`). PG accumulates `int4` input in 128-bit integers (`int4_accum`, `Int128AggState`) and converts
+  to numeric only in the final function.

@@ -430,6 +430,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	}
 
 	batch := make([]Row, 0, gatherBatchRows)
+	var chunk rowChunk
 	var tids []queueTID
 	if o.wantCTIDs {
 		tids = make([]queueTID, 0, gatherBatchRows)
@@ -470,7 +471,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 		if o.wantCTIDs {
 			tids = append(tids, slotQueueTID(slot))
 		}
-		batch = append(batch, transferRowForQueueLive(slot, o.liveCols))
+		batch = append(batch, transferRowForQueueLive(slot, o.liveCols, &chunk))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}

@@ -1469,6 +1469,13 @@ type Join struct {
 
 func (n *Join) Pos() int { return n.pos }
 
+// WithSchemaForTest stamps n's merged output schema, for executor-package
+// tests that need a join of known layout (M0122-0012 slice 66).
+func (n *Join) WithSchemaForTest(schema Schema) *Join {
+	n.schema = schema
+	return n
+}
+
 // Output publishes the join's column layout.
 //
 // M0125-0008: Semi / Anti joins emit the OUTER (Left) row only, so

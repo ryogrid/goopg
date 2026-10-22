@@ -95,11 +95,35 @@ func transferRowForQueue(slot TupleSlot) Row {
 // the projected tuple, not the whole join row; goopg's Gather sits below the
 // projection, so the mask is how the copy is kept to what the leader reads.
 // A nil live is transferRowForQueue.
-func transferRowForQueueLive(slot TupleSlot, live []bool) Row {
+//
+// The shipped rows are carved from chunk (nil: one allocation per row), and
+// the slot is read cell by cell, live cells only: a join's VirtualSlot.Row()
+// would first gather every column of the join row into a scratch row that the
+// copy then read again (M0122-0012 slice 66).
+func transferRowForQueueLive(slot TupleSlot, live []bool, chunk *rowChunk) Row {
 	if live == nil {
 		return transferRowForQueue(slot)
 	}
-	return cloneRowOwnedLive(slot.Row(), live)
+	if seqScanDeformPoison {
+		return cloneRowOwnedLive(slot.Row(), live)
+	}
+	if vs, ok := slot.(*VirtualSlot); ok {
+		dst := chunk.take(vs.Width())
+		for i := range min(len(live), len(dst)) {
+			if live[i] {
+				dst[i] = vs.Get(i).MaterializeArena()
+			}
+		}
+		return dst
+	}
+	src := slot.Row()
+	dst := chunk.take(len(src))
+	for i := range min(len(live), len(src)) {
+		if live[i] {
+			dst[i] = src[i].MaterializeArena()
+		}
+	}
+	return dst
 }
 
 // AssertTransferable reports whether every datum in row is safe to read from
