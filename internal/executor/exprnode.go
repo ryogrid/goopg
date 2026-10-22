@@ -73,6 +73,7 @@ const (
 	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
 	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
 	ExprConstVal           // constVal = a subtree folded to a value at build time
+	ExprCase               // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -102,6 +103,9 @@ type ExprNode struct {
 	// payload[17] (unknownLitCoercion, unknown_literal.go); nil otherwise. A Datum is 48 bytes against payload's 40, so it cannot ride inline;
 	// a pointer costs 8 bytes on every node instead of growing payload by 48.
 	constVal *Datum
+	// caseInfo is the ExprCase node's arms (evalFastCase), nil for every
+	// other kind.
+	caseInfo *exprCaseInfo
 }
 
 // exprTreeSlab is the flat slice of ExprNode for a single statement.
@@ -291,6 +295,38 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 				(*s)[idx].payload[16] |= 128
 			}
 		}
+		return idx
+
+	case *optimizer.CaseExpr:
+		// M0122-0012 slice 47: CASE compiles, so a CASE inside an aggregate
+		// argument, a projection or a qual no longer flattens the slot into a
+		// Row and re-boxes it for every branch it evaluates (evalCaseExpr's
+		// path through evalExprSlot). A malformed arm keeps the adapter.
+		for _, w := range t.Whens {
+			if w.When == nil || w.Then == nil {
+				idx := int32(len(*s))
+				*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+				return idx
+			}
+		}
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprCase})
+		ci := &exprCaseInfo{operand: noExpr, els: noExpr}
+		if t.Operand != nil {
+			ci.operand = s.buildExprCtx(t.Operand, ctx)
+			ci.opBP = declaredBpcharTypmod(t.Operand)
+			ci.opLit = isBareStringLit(t.Operand)
+		}
+		for _, w := range t.Whens {
+			ci.whens = append(ci.whens, s.buildExprCtx(w.When, ctx))
+			ci.thens = append(ci.thens, s.buildExprCtx(w.Then, ctx))
+			ci.whenBP = append(ci.whenBP, declaredBpcharTypmod(w.When))
+			ci.whenLit = append(ci.whenLit, isBareStringLit(w.When))
+		}
+		if t.Else != nil {
+			ci.els = s.buildExprCtx(t.Else, ctx)
+		}
+		(*s)[idx].caseInfo = ci
 		return idx
 
 	case *optimizer.UnaryOp:
@@ -515,6 +551,9 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 
 	case ExprAdapter:
 		return evalExprSlot(n.orig, slot, ctx)
+
+	case ExprCase:
+		return evalFastCase(exprs, n.caseInfo, slot, ctx)
 
 	default:
 		return Datum{}, fmt.Errorf("executor: evalFastExpr: unknown ExprKind %d at idx %d", n.Kind, idx)
@@ -852,4 +891,62 @@ func foldedValuesIdentical(a, b Datum) bool {
 		return a.StringValue() == b.StringValue()
 	}
 	return true
+}
+
+// exprCaseInfo is a compiled CASE: the slab indices of its operand (noExpr
+// for the searched form), its WHEN/THEN pairs and its ELSE (noExpr when
+// absent), plus the declared-type facts the simple form's implicit `=` needs
+// — compiled here because evaluation only sees Datums (the same facts
+// evalCaseExpr reads from the expressions).
+type exprCaseInfo struct {
+	operand      int32
+	whens, thens []int32
+	els          int32
+	opBP         int64
+	opLit        bool
+	whenBP       []int64
+	whenLit      []bool
+}
+
+// evalFastCase is evalCaseExpr's compiled twin and must agree with it arm
+// for arm: the operand is evaluated once; each WHEN in order is a boolean
+// predicate (searched form) or `operand = WHEN` resolved through
+// comparisonOperandsAsBpchar and compareEq (simple form), a NULL or non-bool
+// result counting as no match; the first match's THEN is the result, else the
+// ELSE, else NULL. Only the matched THEN (or the ELSE) is evaluated.
+func evalFastCase(exprs exprTreeSlab, ci *exprCaseInfo, slot SlotView, ctx *Context) (Datum, error) {
+	var operand Datum
+	hasOperand := ci.operand != noExpr
+	if hasOperand {
+		v, err := evalFastExpr(exprs, ci.operand, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		operand = v
+	}
+	for i, w := range ci.whens {
+		whenVal, err := evalFastExpr(exprs, w, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		var matched bool
+		if hasOperand {
+			o, vv := comparisonOperandsAsBpchar(parser.OpEq, operand, whenVal,
+				ci.opBP, ci.whenBP[i], ci.opLit, ci.whenLit[i])
+			eq, err := compareEq(o, vv)
+			if err != nil {
+				return Datum{}, err
+			}
+			matched = eq.Kind == KindBool && eq.BoolValue()
+		} else {
+			matched = whenVal.Kind == KindBool && whenVal.BoolValue()
+		}
+		if matched {
+			return evalFastExpr(exprs, ci.thens[i], slot, ctx)
+		}
+	}
+	if ci.els != noExpr {
+		return evalFastExpr(exprs, ci.els, slot, ctx)
+	}
+	return NullDatum, nil
 }

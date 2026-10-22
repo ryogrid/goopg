@@ -82,3 +82,64 @@ checksum normalises numeric text, which is why the old digits never tripped it).
   12 decimals / 15 significant digits.
 - **Float input.** The float path prints with `strconv 'g' 15`, not `float8out`.
 - Both are recorded in the deferral ledger.
+
+## Slice 47 (2026-10-22): CASE compiles — TPC-DS Q59, Q2
+
+**Target, named up front:** TPC-DS Q59, 2.2–2.4 s warm against PG's 0.72 s, the largest absolute gap in a fresh
+warm re-time of the ratio candidates. The others re-timed were Q78 1.65 vs 0.49 s, Q97 1.05 vs 0.11, Q16 0.97
+vs 0.08, and Q8 1.0 vs 0.14.
+
+**Cause.** EXPLAIN ANALYZE put 2.27 s of Q59 in its CTE `wss`, against PG's 0.55 s. The CTE is a hash aggregate
+of 687 k `store_sales ⋈ date_dim` rows computing seven
+`sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END)` columns.
+
+`evalCaseExpr` took 46 % of the profile, and `runtime.convTslice` 11 %. CASE was not in the compiled evaluator:
+`buildExpr` made it an ExprAdapter, so each of the 4.8 M CASE evaluations ran through
+`evalExprSlot → evalCaseExpr(x, slotToRow(slot), ctx)`. That flattened the slot into a Row, then boxed the Row
+into a fresh `rowSlotView` interface for every WHEN and THEN it evaluated.
+
+**Rule.** A new compiled kind, `ExprCase`, carries an `exprCaseInfo` built at slab-build time:
+
+- the slab indices of the operand (noExpr for the searched form), each WHEN/THEN pair and the ELSE;
+- the declared-type facts the simple form's implicit `=` needs: the operand's and each WHEN's bpchar width
+  (`declaredBpcharTypmod`) and bare-literal flag (`isBareStringLit`).
+
+These are the facts `evalCaseExpr` reads from the expressions. `evalFastCase` is its twin, arm for arm:
+
+- the operand is evaluated once;
+- each WHEN, in order, is a boolean predicate (searched form), or `operand = WHEN` resolved through the same
+  `comparisonOperandsAsBpchar` and `compareEq` (simple form);
+- a NULL or non-bool result is no match;
+- the first match's THEN is evaluated and returned, otherwise the ELSE, otherwise NULL.
+
+Only the chosen arm is evaluated. A CASE with a nil arm keeps the adapter. Every compiled call site gains the
+node: aggregate arguments, projections, quals and join filters. The batch evaluator reaches it through its
+per-row fallback.
+
+**Pin.** `TestCaseCompiledMatchesInterpreted` compares `evalFastCase` with `evalCaseExpr` on every row of a
+fixture. The fixture covers:
+
+- the searched form, Q59's shape;
+- several arms with no ELSE;
+- a simple CASE over a `char(9)` operand, where padded values meet bare literals and a WHEN is NULL;
+- simple CASEs over int and numeric operands with mixed-kind WHENs;
+- a non-bool WHEN in the searched form;
+- a CASE nested in a THEN.
+
+It asserts at least eight distinct results. Passing a zero bpchar width in place of the compiled one fails it on
+the padded `char(9)` rows.
+
+**Measured.** Warm, two interleaved rounds of three runs:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q59 | 2.32–2.37 | 1.80–1.89 |
+| TPC-DS Q43 | 0.48–0.72 | 0.44–0.55 |
+
+In the sf025 sweep, Q59 went from 2.30 to 1.82 s and Q2 (also day-name CASE sums) from 0.93 to 0.68 s. The
+sweep's Q7/Q57/Q14 rises did not repeat in an A/B (equal or better on the candidate). TPC-H values are identical
+(acceptance 24 MATCH), and the sweep's plan shapes are identical.
+
+**Left.** In Q59's profile, the CASE WHENs' `d_day_name = 'Sunday'` comparisons are now the largest term:
+`evalFastBinaryApply` takes 23 % on the bpchar arm, which normalises the operands' padding before comparing.
+They are a next candidate.
