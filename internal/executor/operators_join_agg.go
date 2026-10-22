@@ -4841,10 +4841,31 @@ func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datu
 }
 
 func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
+	// PG's numeric_stddev_internal (numeric.c) for integer inputs, which
+	// int2/int4/int8_accum feed with sumX and sumX2 at display scale 0
+	// (M0122-0012 slice 46). Everything is exact integer arithmetic, so the
+	// digits are PG's: the variance is N*sumX2 - sumX^2 over N*(N-1) (or N^2),
+	// divided at select_div_scale's rscale and rounded half away from zero
+	// (div_var round=true, exact=true); the stddev is sqrt_var of that
+	// rounded variance at the same rscale. The result is numeric, printed
+	// with rscale decimals. This replaced a big.Rat quotient printed to 12
+	// decimals and a 15-step big.Float Newton sqrt printed to 18 significant
+	// digits — neither PG's digits (var_samp(1,2,4) printed 2.333333333333,
+	// PG 2.3333333333333333) — and the Newton loop was a quarter of TPC-DS
+	// Q39, which finalises ~90 000 stddev_samp groups.
+	// Sample statistics are undefined for N <= 1 and population ones for
+	// N == 0: NULL, checked before the numerator as PG does.
+	if n == 0 || (isSample && n <= 1) {
+		return NullDatum
+	}
 	bigN := big.NewInt(n)
-	// numerator = N * Sxx - Sx²
-	num := new(big.Int).Sub(new(big.Int).Mul(bigN, sxx), new(big.Int).Mul(sx, sx))
-	// denominator = N² (pop) or N*(N-1) (samp)
+	num := new(big.Int).Mul(bigN, sxx)
+	num.Sub(num, new(big.Int).Mul(sx, sx))
+	if num.Sign() <= 0 {
+		// "Watch out for roundoff error producing a negative numerator":
+		// make_result(&const_zero), display scale 0.
+		return Datum{Kind: KindNumeric}
+	}
 	var den *big.Int
 	if isSample {
 		den = new(big.Int).Mul(bigN, big.NewInt(n-1))
@@ -4854,52 +4875,84 @@ func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	if den.Sign() == 0 {
 		return NullDatum
 	}
-	// Use exact big.Rat arithmetic, then format as a decimal string.
-	// Matching PostgreSQL numeric display: up to 18 decimal places, trailing zeros stripped.
-	rat := new(big.Rat).SetFrac(num, den)
-	if isSqrt {
-		// For stddev, compute sqrt via high-precision float.
-		f64, _ := rat.Float64()
-		if f64 <= 0 {
-			// Variance is exactly 0 (all inputs equal) or negative due to
-			// floating-point artifacts: stddev = 0, matching PostgreSQL.
-			//
-			// Without this guard the Newton seed below is sqrt(0) = 0 and the
-			// first iteration computes big.Float Quo(0, 0), which PANICS
-			// ("division of zero by zero"). The panic escaped to serveConn and
-			// dropped the connection — TPC-DS Q39's stddev_samp over a
-			// (warehouse, item, month) inventory group whose quantity never
-			// changes hit it on every run (the long-unexplained RC-4
-			// "connection lost"). The numeric sibling exactNumericVariance
-			// already had exactly this guard; the int path had lost it —
-			// sibling paths must agree.
-			return NewStringDatum("0")
-		}
-		// Newton-Raphson sqrt with 128-bit precision.
-		prec := uint(128)
-		ratFloat := new(big.Float).SetPrec(prec).SetRat(rat)
-		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
-		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
-		for i := 0; i < 15; i++ {
-			if seed.Sign() == 0 {
-				break
-			}
-			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
-			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
-		}
-		// Format with 18 significant digits matching PostgreSQL stddev output.
-		s := seed.Text('g', 18)
-		if strings.Contains(s, ".") && !strings.Contains(s, "e") {
-			s = strings.TrimRight(s, "0")
-			s = strings.TrimRight(s, ".")
-		}
-		return NewStringDatum(s)
+	rscale := pgSelectDivScaleInt(num, den)
+	// div_var(num, den, rscale, round): round half away from zero.
+	q := new(big.Int).Mul(num, pow10Big(rscale))
+	q.Lsh(q, 1).Add(q, den)
+	q.Quo(q, new(big.Int).Lsh(den, 1))
+	if !isSqrt {
+		return newNumeric(q, rscale)
 	}
-	// Format rational as decimal with up to 12 decimal places with round-half-up, then
-	// strip trailing zeros. Matches PostgreSQL's numeric_poly_var_samp output scale
-	// for integer inputs (consistently 12 decimal places across test cases).
-	s := formatBigRatDecimal(rat, 12)
-	return NewStringDatum(s)
+	return pgSqrtScaled(q, rscale)
+}
+
+// pgSqrtScaled is sqrt_var (numeric.c) applied to q / 10^rscale at result
+// scale rscale. sqrt_var computes res_ndigits NBASE (10^4) digits of the
+// square root, truncated — the Karatsuba square root is an exact integer
+// square root of the input extended to 2*F fractional NBASE digits — and
+// rounds that to rscale with round_var. F, the number of fractional NBASE
+// digits, is res_ndigits - res_weight - 1: ceil((rscale+1)/4) digits, or
+// more when the result needs at least one NBASE digit below its weight.
+func pgSqrtScaled(q *big.Int, rscale int) Datum {
+	if q.Sign() == 0 {
+		// zero_var with dscale = rscale.
+		return Datum{Kind: KindNumeric, Scale: int16(min(rscale, numericMaxDisplayScale))}
+	}
+	weight, _ := pgNBaseWeightFirst(q, rscale)
+	resWeight := weight / 2
+	if weight < 0 {
+		resWeight = -((-weight-1)/2 + 1)
+	}
+	resNdigits := resWeight + 1 + (rscale+4)/4
+	if resNdigits < 1 {
+		resNdigits = 1
+	}
+	f := resNdigits - resWeight - 1
+	// floor(sqrt(q / 10^rscale * 10^(8f))) — 8f > rscale, so the scaled
+	// argument is an integer.
+	arg := new(big.Int).Mul(q, pow10Big(8*f-rscale))
+	root := new(big.Int).Sqrt(arg)
+	// round_var(root / 10^(4f), rscale): half away from zero.
+	drop := pow10Big(4*f - rscale)
+	root.Lsh(root, 1).Add(root, drop)
+	root.Quo(root, new(big.Int).Lsh(drop, 1))
+	return newNumeric(root, rscale)
+}
+
+// pgSelectDivScaleInt is select_div_scale (numeric.c) for two positive
+// integers (display scale 0): enough decimals for NUMERIC_MIN_SIG_DIGITS (16)
+// significant digits of the quotient, estimated from the operands' NBASE
+// weights and leading NBASE digits, clamped to [0, NUMERIC_MAX_DISPLAY_SCALE].
+func pgSelectDivScaleInt(num, den *big.Int) int {
+	w1, f1 := pgNBaseWeightFirst(num, 0)
+	w2, f2 := pgNBaseWeightFirst(den, 0)
+	qweight := w1 - w2
+	if f1 <= f2 {
+		qweight--
+	}
+	rscale := 16 - qweight*4
+	if rscale < 0 {
+		rscale = 0
+	}
+	return min(rscale, 1000)
+}
+
+// pgNBaseWeightFirst returns the NumericVar weight (index of the leading
+// base-10^4 digit relative to the decimal point) and the leading base-10^4
+// digit of the positive value d / 10^scale, as PG stores it: digit groups
+// are aligned on the decimal point.
+func pgNBaseWeightFirst(d *big.Int, scale int) (int, int64) {
+	s4 := (scale + 3) / 4 * 4
+	v := new(big.Int).Mul(d, pow10Big(s4-scale))
+	digits := len(v.String())
+	nd := (digits + 3) / 4
+	lead := new(big.Int).Quo(v, pow10Big(4*(nd-1)))
+	return nd - 1 - s4/4, lead.Int64()
+}
+
+// pow10Big returns 10^k as a new big.Int (k >= 0).
+func pow10Big(k int) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(k)), nil)
 }
 
 // formatBigRatDecimal formats a big.Rat as a decimal string with up to maxDecimals decimal

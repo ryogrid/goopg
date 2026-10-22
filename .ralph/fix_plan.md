@@ -1995,6 +1995,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q35 1\.49–1\.83 → 0\.97–1\.09 s, Q74 32\.8 → 17\.3–19\.7 s; sweep 136\.5 → 125\.2 s; TPC\-H values identical\.
     - Next candidates: pair\-buffer copy per pair \(memmove ~8 %\); indexScanOp Filter interpreted \(~14 % of Q35\); Q58
       join row cloning; Q74 still 18 s vs PG \(check its plan\)\.
+  - **Slice 46 — integer variance/stddev are PG's numeric\_stddev\_internal LANDED 2026\-10\-22\.** Movement: none — perf
+    and output fidelity; plans/row counts identical\. S3 instrument: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance
+    arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 5 "Slice 46" \(new file\)\.
+    - Named target TPC\-DS Q39 \(2\.5 s vs PG 0\.59\): exactIntVariance's 15\-step big\.Float Newton sqrt was 28 % of the
+      query, and its text was not PG's \(12 decimals / 18 significant digits vs select\_div\_scale's rscale\)\.
+    - Ported select\_div\_scale, rounded div\_var and sqrt\_var \(exact big\.Int isqrt at F NBASE digits \+ round\_var\);
+      numeric Datum result\. 696/696 probe lines byte\-identical to PG; window test now asserts window\.out\.
+    - Q39 3\.0–3\.9 → 2\.1–2\.4 s; sweep 125\.2 → 120\.8 s; TPC\-H values identical\.
+    - Left: numeric\-input sibling \(no dscale in state\), float path \('g' 15\); ledgered\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3987,6 +3996,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `8711a1938`** \(M0122\-0012 slice 44 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `984b3cb89`** \(M0122\-0012 slice 45 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
