@@ -2243,6 +2243,36 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       string\-based oracles and big\.Int sums; mutation\-checked\)\.
     - Q39 26\.86 → 22\.42 Ginstr \(−16\.5 %\), wall 2\.2 → 1\.56 s \(−30 %\); Q17/Q7/Q22/Q21/Q26 flat; sweep Q39 1\.75 → 1\.37 s\.
     - Next: Q39 per\-group state \(664\-byte aggRuntime per aggregate, string\-keyed group map\); or the hashed SubPlan for Q35\.
+  - **Slice 68 — numeric division takes a 128\-bit path and drops redundant big\.Int copies; hash\-aggregate groups come
+    from chunks LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025
+    PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS\. Doc part 6 "Slice 68"\.
+    - Q39 leader after slice 67: newGroup allocation 9 %, HAVING numericDiv 10\.6 % \(numericMant 20 % of it,
+      newNumeric 15 %, the int64 fast path tried and failed\)\.
+    - numericDivUint128 \(either lane, uint64 magnitudes, bits\.Mul64/Div64\); numericDivBig without the redundant
+      numericMant / newNumeric / numerator copies and rounding temporaries; groupRuntime / aggRuntime / key rows from
+      32\-group chunks \(pinned: 200 000\-case fuzz vs numericDivBig, rounding \+ declines; mutation\-checked\)\.
+    - Q39 22\.48 → 21\.67 Ginstr \(−3\.6 %\), CPU −7 %; Q4 −4\.1 %, Q67 −0\.8 %; Q22/Q11/Q87/Q17 flat\.
+    - Q39 wall is bimodal on BOTH binaries \(~1\.45 s or ~2\.2–2\.7 s per 3\-run sample\) — compare instructions/CPU\.
+    - Discovery filed: M0122\-0016 \(big numeric results accumulate in the never\-reset permanent arena\)\.
+- [ ] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
+  Kind: impl
+  Parent: M0122-0012
+  - Filed 2026\-10\-23 from M0122\-0012 slice 68 \(found while trimming numericDiv's big\.Int path for TPC\-DS Q39\)\.
+  - `newNumeric` → `newBigNumericInCtx\(mmgr\.Perm\(\), …\)` stores the sign byte \+ magnitude of every numeric whose
+    mantissa passes int64 in the process\-global permanent context, which `mmgr\.Perm` documents as "never reset or
+    released"\. Measured: 100 000 big\-lane divisions grew `Perm\(\)\.Usage\(\)` by 1 179 648 bytes \(~12 B per result\)\.
+    Q39 alone produces on the order of a million such results per run \(16\-decimal avg / stddev / their quotient\)\.
+  - Every such write also takes `permMu` \(a package\-level RWMutex, write\-locked per allocation\), so parallel
+    workers producing big numerics serialise on one lock\.
+  - PG: a numeric result is palloc'd in the current memory context \(per\-tuple / per\-aggregate\), freed when that
+    context resets \(`make\_result`, `numeric.c`\); nothing accumulates across statements\.
+  - Resume point: `internal/executor/numeric.go` newNumeric / `datum.go` newBigNumericInCtx — allocate the payload in
+    the statement's or expression's context and detach it at the retention boundaries that already exist for
+    arena\-backed strings \(`Datum.MaterializeArena`, `cloneRowOwned`, `transferRowForQueue*`\), then drop the
+    "big numerics live in Perm" assumption that `AssertTransferable`'s comment records\.
+  - Gate: an allocation probe over repeated statements \(Perm usage flat\), the executor package with the deform
+    poison, sf025 \(numeric values, 61 ck\), RegressSuite \(numeric\.sql, aggregates\.sql\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4364,6 +4394,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `3a50b12ed`** \(M0122\-0012 slice 66 changed internal/executor and internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `b3f708aee`** \(M0122\-0012 slice 67 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

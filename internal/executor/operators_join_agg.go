@@ -2372,6 +2372,10 @@ const (
 	floatSpecialNegInf   floatSpecialKind = 3 // -Infinity
 )
 
+// groupChunkGroups is how many groups a hash aggregate carves from one
+// allocation of runtimes, states and key rows.
+const groupChunkGroups = 32
+
 type aggRuntime struct {
 	hasValue bool
 	value    Datum
@@ -2665,6 +2669,35 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		order = append(order, key)
 	}
 
+	// A group lives until the aggregate finishes, so its runtime, its
+	// aggregate states and its key row are carved from chunks: one
+	// allocation per groupChunkGroups groups instead of three per group
+	// (M0122-0012 slice 68; TPC-DS Q39 founds 540 K groups per statement,
+	// each with two 664-byte aggregate states). Every piece is fresh and
+	// zeroed, and the states' capacity is capped so no append reaches a
+	// neighbour.
+	var grChunk []groupRuntime
+	var aggChunk []aggRuntime
+	var gvChunk rowChunk
+	nAggs := len(o.plan.Aggs)
+	newGroupRuntime := func() *groupRuntime {
+		if len(grChunk) == 0 {
+			grChunk = make([]groupRuntime, groupChunkGroups)
+		}
+		g := &grChunk[0]
+		grChunk = grChunk[1:]
+		if nAggs == 0 {
+			g.aggs = make([]aggRuntime, 0)
+			return g
+		}
+		if len(aggChunk) < nAggs {
+			aggChunk = make([]aggRuntime, nAggs*groupChunkGroups)
+		}
+		g.aggs = aggChunk[:nAggs:nAggs]
+		aggChunk = aggChunk[nAggs:]
+		return g
+	}
+
 	// newGroup founds a group from its first input row.
 	newGroup := func(si int, set []int, allVals Row, slot TupleSlot) *groupRuntime {
 		// Evaluate passthrough (functionally-determined) columns from the first row.
@@ -2682,13 +2715,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		var gv Row
 		if nGroupCols > 0 {
-			gv = make(Row, nGroupCols)
-			for i := range gv {
-				// A column rolled up away at this level is NULL —
-				// the SQL standard's value for it, and what makes
-				// GROUPING(...) necessary to tell it from a real one.
-				gv[i] = NullDatum
-			}
+			// A column rolled up away at this level is NULL — the SQL
+			// standard's value for it, and what makes GROUPING(...)
+			// necessary to tell it from a real one. A fresh chunk row
+			// is already NULL throughout (NullDatum is the zero Datum).
+			gv = gvChunk.take(nGroupCols)
 			for _, ci := range set {
 				// M0073-0004 retention boundary, moved here from
 				// evalGroupExprs (M0145-0008f): only a group-founding
@@ -2697,7 +2728,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				gv[ci] = allVals[ci].MaterializeArena()
 			}
 		}
-		return &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+		g := newGroupRuntime()
+		g.setIdx, g.groupValues, g.passthroughVals = si, gv, ptVals
+		return g
 	}
 
 	// M0122-0012 slice 24: the int64 group lane. A single grouping set over a

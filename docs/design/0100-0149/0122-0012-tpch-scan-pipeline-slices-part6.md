@@ -622,3 +622,72 @@ PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
 **Left.** Q39 still takes 1.56 s against PG's 0.59 s. Each group allocates a 664-byte `aggRuntime` per aggregate
 (PG's per-group state is a transition value and two flags), plus its group key string in a string-keyed map.
 The leader also probes the item hash and projects every row before aggregating.
+
+## Slice 68 (2026-10-23): numeric division takes a 128-bit path and drops redundant big.Int copies, and hash-aggregate groups come from chunks — TPC-DS Q39, Q4
+
+**Target.** After slice 67, a leader-only profile of Q39 put 9 % of the leader in founding groups (`newGroup`:
+a `groupRuntime`, a key row and two 664-byte `aggRuntime` states per group, three allocations) and 10.6 % in
+the HAVING filter's `numericDiv`. Within `numericDiv`, 20 % was `numericMant` building `big.Int` operands, 15 %
+`newNumeric` and 11 % the int64 fast path being tried and failing. The mean is a 16-decimal numeric whose
+mantissa passes int64, so it lives in the big-mantissa lane, which skips the int64 fast path entirely.
+
+**Change.**
+
+- **`numericDivUint128`.** It runs after the int64 fast path, for operands of either lane whose mantissa
+  magnitudes fit a uint64. A big-lane payload is read in place (`numericMagUint64`: sign byte plus big-endian
+  magnitude, the encoding `newBigNumericInCtx` writes). The rscale is `select_div_scale`'s, through
+  `nbaseWeightAndFirstDigitUint64`. The shifted numerator is one `bits.Mul64` and the quotient one `bits.Div64`,
+  rounded half away from zero, with the result in the int64 lane. It declines a zero operand, a shift past
+  10^19, a quotient past 64 bits or past int64, and a magnitude past uint64; all of these go to the big path.
+  For Q39 it covers the groups whose coefficient of variation is at least 1 (rscale 16). Below 1, rscale 20
+  needs a 20-digit quotient, and the big path keeps those.
+- **The big path without redundant copies** (`numericDivBig`, the former body):
+  - `numericMant` returns `NumericBigValue()`'s already-fresh `big.Int` instead of copying it again.
+  - The numerator is scaled in place.
+  - The rounding test runs in the remainder's own storage, and the ±1 bump uses a constant.
+  - `newNumeric` passes its argument straight to `newBigNumericInCtx`, which only copies the bytes out.
+  
+  `numericMant` and `newNumeric` are shared by every numeric operator, so those two help all of them.
+- **Groups from chunks.** The hash aggregate's drain carves `groupRuntime`s, `aggRuntime` state slices
+  (capacity-capped) and key rows (`rowChunk`) from 32-group chunks. Groups live until the aggregate finishes,
+  so a chunk pins nothing that would otherwise be freed. A fresh key row is already NULL throughout, so the
+  NULL-fill loop for rolled-up columns is gone.
+
+**Pins.**
+
+- `TestNumericDivUint128MatchesBigPath`: 200 000 random pairs over both lanes, both signs, scales 0..20 and
+  magnitudes just past int64. Every answered case equals `numericDivBig` in digits and scale, and the test
+  fails if fewer than 50 000 cases take the new path.
+- `TestNumericDivUint128RoundingAndDeclines`: round-half-away-from-zero for both signs, an exact quotient, the
+  five declines, and division by zero still raising. Dropping the tie rounding, the sign, or the big-lane sign
+  byte fails these tests.
+- The existing int64 fast-path fuzz tests now compare against `numericDivBig` directly. They had forced the
+  slow path through big-lane operands, which the new path would otherwise answer.
+- The chunked groups are covered by the aggregate suites: the executor package (also with the deform poison),
+  RegressSuite (aggregates, groupingsets) and sf025's 61 value checks.
+
+**Measured** against `b3f708aee` (slice 67):
+
+| query | HEAD Ginstr | candidate Ginstr | HEAD CPU (s) | candidate CPU (s) |
+|---|---|---|---|---|
+| Q39 | 22.48 | 21.67 (−3.6 %; division −2.9 %, chunks −0.7 %) | 2.88–2.94 | 2.66–2.68 |
+| Q4 | 48.38 | 46.38 (−4.1 %) | | |
+| Q67 | 29.68 | 29.43 (−0.8 %) | | |
+| Q22, Q11, Q87, Q17 | — | within ±0.3 % | | |
+
+Q39's wall time is bimodal on both binaries: each 3-run sample averages either about 1.45 s or 2.2–2.7 s, with
+the same CPU, so wall A/Bs on it need several samples or the CPU column. The sf025 sweep's per-query times move
+by seconds on unrelated queries (Q74, Q25, Q1) between runs, so its sum is not a usable instrument at this
+scale. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH), and plan shapes are identical.
+
+**Discovery (filed M0122-0016, ledger row).** Every big-mantissa numeric result goes to `mmgr.Perm()`, the
+process-global context documented as never reset: 100 000 big-lane divisions grew its usage by 1.18 MB. Each
+write also takes the process-wide `permMu` write lock. PG pallocs a numeric in the current memory context
+and frees it at reset.
+
+**Left.** Q39 still takes about 1.45 s against PG's 0.59 s. Remaining costs:
+
+- The rscale-20 divisions in the big path.
+- The finalisation's big-integer variance and square root.
+- The string-keyed group map.
+- The leader's per-row item probe and projection.
