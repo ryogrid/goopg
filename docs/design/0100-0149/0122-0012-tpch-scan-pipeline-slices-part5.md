@@ -321,3 +321,50 @@ sweep's plan shapes are identical.
 **Left.** PG hashes any element type with a hash opclass, and also hashes `<> ALL` (NOT IN through the
 negator). goopg's hash serves only string and int keys through the IN-list path. A numeric, date or interval
 operand, and the explicit `op ANY(array)` / `<> ANY` loops, stay linear. Recorded in the deferral ledger.
+
+## Slice 51 (2026-10-22): a streaming UNION ALL passes the borrow on — TPC-DS Q71, Q5
+
+**Target, named up front:** TPC-DS Q71, 0.64–0.66 s warm against PG's 0.08 s (re-timed warm this loop; PG's
+EXPLAIN ANALYZE inflates its own Q71 to 0.45 s with timing overhead, so plain runs were compared).
+
+**Cause.** In the profile, `cloneRowOwnedPrefix` under `seqScanOp.Next` took 40 % and its allocator another 9 %.
+Q71's worker tree is `Nested Loop → Nested Loop → Parallel Append → three Parallel Hash Joins`, each probing a
+sales-table scan. The Gather worker root (slice 23) starts `markScanBorrowChain` at the top. The walk passes
+through both nested loops, then stops at the Append — a `setOp`, which it did not know. So every web/catalog/store
+sales probe row was cloned.
+
+**Rule.** A streaming UNION ALL (`setOp.nextStreaming`) returns each child slot as it is. It keeps nothing
+between calls: it drains one branch, then the other, closing each at EOF. So `markScanBorrowChain` now continues
+into both branches of a `setOp` that is streaming and has no merge keys.
+
+Two other `setOp` kinds keep rows, so the walk stops at them as before:
+
+- a Merge Append (`nextMerge`) holds each side's front row across calls;
+- the buffering set operations (INTERSECT / EXCEPT / the non-streaming variants) keep their input.
+
+**Pin.** `TestScanBorrowThroughUnionAll` checks that both UNION ALL branches borrow under a borrowing
+grouped aggregate and under a Sort, and that an `INTERSECT ALL` (HashSetOp) under an aggregate borrows nothing.
+Every result must equal the cloning path's with tail poison armed (in order for the Sort). Admitting every
+`setOp` to the walk fails the INTERSECT case. The executor package passes with deform poison armed globally.
+
+**Measured.** Warm, two interleaved rounds:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q71 | 0.64–0.66 | 0.40–0.42 |
+| TPC-DS Q5 | 0.87–1.70 | 0.68–1.25 |
+| TPC-DS Q2 | 0.40–0.44 | 0.36–0.37 |
+| TPC-DS Q14 (UNION ALL `cross_items`) | 20.4–20.9 | 17.5–19.3 |
+
+In the sf025 sweep, Q5 went from 1.53 to 0.73 s and Q71 from 0.41 to 0.30 s. The sweep sum rose (116.7 →
+119.0 s) on its noisy rows; none of them repeated in an A/B:
+
+- Q14 is faster on the candidate;
+- Q64 and Q23 are equal;
+- Q78, which has no UNION, spans 1.5–3.1 s on both builds;
+- Q77 is equal over ten runs.
+
+TPC-H values are identical (acceptance 24 MATCH), and the sweep's plan shapes are identical.
+
+**Left.** Q71 is still ~5× PG. Its nested loops probe `item_pkey` and `time_dim_pkey` per outer row, and the
+Gather queue copies every surviving row (`transferRowForQueue`).

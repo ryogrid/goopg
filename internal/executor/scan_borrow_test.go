@@ -144,6 +144,9 @@ func borrowedScanTables(op Operator) []string {
 			walk(o.right)
 		case *nestedLoopIndexJoinOp:
 			walk(o.outer)
+		case *setOp:
+			walk(o.left)
+			walk(o.right)
 		}
 	}
 	walk(op)
@@ -579,6 +582,57 @@ func TestScanBorrowUnderSort(t *testing.T) {
 		seqScanDeformPoison = old
 		scanBorrowDisabled = true
 		want := orderedRowValues(t, ctx, c.sql)
+		scanBorrowDisabled = false
+		if len(got) == 0 {
+			t.Fatalf("%s: no rows", c.sql)
+		}
+		if strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s: borrowed and cloned results differ (%d vs %d rows)", c.sql, len(got), len(want))
+		}
+	}
+}
+
+// TestScanBorrowThroughUnionAll pins M0122-0012 slice 51: a streaming UNION
+// ALL (Append) passes each child slot through and keeps nothing, so both of
+// its branches carry the borrow — under a borrowing aggregate and under a
+// Sort. An INTERSECT (HashSetOp) buffers its input and must stop the walk.
+// Both tables span many pages with text and big numerics in the per-page
+// arena; with tail poison armed every result must equal the cloning path's.
+func TestScanBorrowThroughUnionAll(t *testing.T) {
+	ctx := deformW8Fixture(t)
+	for _, tbl := range []string{"ua", "ub"} {
+		runSQL(t, ctx, "CREATE TABLE "+tbl+" (k int, s text, n numeric, i int)")
+		runSQL(t, ctx, "INSERT INTO "+tbl+" SELECT x % 50, repeat(chr(65 + x % 26), 20 + x % 40) || x, (x::numeric * 123456789012345678901234567890), x FROM generate_series(1, 4000) x")
+		runSQL(t, ctx, "ANALYZE "+tbl)
+	}
+	cases := []struct {
+		sql     string
+		want    string // tables whose scans must borrow
+		ordered bool
+	}{
+		{"SELECT k, count(*), max(s), sum(n) FROM (SELECT k, s, n FROM ua UNION ALL SELECT k, s, n FROM ub) u GROUP BY k", "ua,ub", false},
+		{"SELECT s, n FROM (SELECT s, n FROM ua UNION ALL SELECT s, n FROM ub) u ORDER BY s, n", "ua,ub", true},
+		{"SELECT count(*), max(s), min(s) FROM (SELECT s FROM ua INTERSECT ALL SELECT s FROM ub) u", "", false},
+	}
+	for _, c := range cases {
+		plan, err := testPlanDeform(t, ctx, c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		op := mustBuildDeform(t, plan)
+		if got := strings.Join(borrowedScanTables(op), ","); got != c.want {
+			t.Fatalf("%s: borrowing scans %q, want %q", c.sql, got, c.want)
+		}
+		render := sortedRowValues
+		if c.ordered {
+			render = orderedRowValues
+		}
+		old := seqScanDeformPoison
+		seqScanDeformPoison = true
+		got := render(t, ctx, c.sql)
+		seqScanDeformPoison = old
+		scanBorrowDisabled = true
+		want := render(t, ctx, c.sql)
 		scanBorrowDisabled = false
 		if len(got) == 0 {
 			t.Fatalf("%s: no rows", c.sql)
