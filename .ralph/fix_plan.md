@@ -2028,6 +2028,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - groupBounds now uses e\.desc / e\.keyCols via btreeSkipEnum\.probeKey \(byte\-identical, pinned\)\.
     - Q16 → 0\.66–0\.90 s, Q95 3\.69–4\.21 → 3\.37–3\.96 s; sweep 116\.7 → 115\.6 s; TPC\-H values identical\.
     - Next: per\-group decode/re\-encode \+ per\-entry compares \(PG compares scankeys, \_bt\_advance\_array\_keys\)\.
+  - **Slice 50 — a literal IN list of nine or more items is hashed LANDED 2026\-10\-22\.** Movement: none — perf only\.
+    The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 5 "Slice 50"\.
+    - Named target TPC\-DS Q8 \(0\.90–1\.04 s vs PG 0\.14\): `substr\(ca\_zip,1,5\) IN \(400 literals\)` compared linearly
+      per row \(591 ms vs PG 20 ms; PG hashes a ≥9\-element constant SAOP\)\.
+    - inListConst\.hashed / inListHash\.probe: string/string \(bpchar rule kept exact\) and int/int only\.
+    - Q8 → 0\.34–0\.45 s; TPC\-H values identical\.
+    - Left \(ledgered\): numeric/date/interval operands and explicit op ANY / <> ANY stay linear\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4044,6 +4052,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-22 — **exhausted at `18b8ea331`** \(M0122\-0012 slice 48 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261022l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-22 — **exhausted at `5bb2a9977`** \(M0122\-0012 slice 49 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261022m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

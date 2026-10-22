@@ -257,3 +257,67 @@ re-encodes the probe and pivot (`pgIndexTupleKeyDatums` + `pgIndexTupleKey`, ~37
 are another 37 %. PG's skip arrays never form tuples: `_bt_advance_array_keys` copies the entry's prefix
 attribute into the array's scankey and compares scankeys against index tuples. Building the pivot by truncating
 the entry (`_bt_truncate`'s shape), and comparing on scankeys, is the next step for Q16, Q94 and Q95.
+
+## Slice 50 (2026-10-22): a literal IN list of nine or more items is hashed — TPC-DS Q8
+
+**Target, named up front:** TPC-DS Q8, 0.90–1.04 s warm against PG's 0.14 s.
+
+**Cause.** EXPLAIN ANALYZE put 591 ms of Q8 in one scan, against PG's 20 ms: `customer_address` filtered by
+`substr(ca_zip, 1, 5) = ANY ('{…400 zip codes…}')`. In the profile, `evalInExprScalarRow` + `compareEq` were 44 %.
+goopg compared each of the 50 000 rows with each of the 400 cached items in turn.
+
+PG never does. `convert_saop_to_hashed_saop` (`optimizer/util/clauses.c`) turns a constant `= ANY` array of at
+least `MIN_ARRAY_SIZE_FOR_HASHED_SAOP` (9) elements into a hashed ScalarArrayOp, and `ExecEvalHashedScalarArrayOp`
+probes a hash table built from the array once.
+
+**Rule.** A literal IN list is already cached per statement (`inListConst`). With nine or more items it also
+builds an `inListHash` once (`inListConst.hashed`), and the plain-equality loop of `evalInExprScalarRow` first
+asks `inListHash.probe`. The probe returns:
+
+- true on a hit;
+- else NULL if the list holds a NULL;
+- else false (IN) or true (NOT IN);
+
+which is exactly what the loop returns. It serves only the pairings where the loop decides a match by exact key
+equality — `compareEq` compares two strings with `==` and two ints with `==`, with no error path:
+
+- **string operand / string items.** Both sides get the per-pair bpchar normalisation the loop applies
+  (`comparisonOperandsAsBpchar`):
+  - with a bpchar operand, the operand is always trimmed, and each item by its own declared type or
+    bare-literal flag;
+  - with no bpchar on either side, nothing is trimmed.
+
+  A list mixing bpchar items under a non-bpchar operand trims the operand per item, which one probe key cannot
+  model, so it keeps the loop.
+- **int operand / int items.**
+
+Every other pairing keeps the loop:
+
+- a numeric, date or interval operand (slice 43's coerced items);
+- a string operand against int items, or the reverse — `compareEq` compares those as text;
+- a list mixing kinds;
+- a list shorter than nine.
+
+**Pin.** `TestInListHashMatchesLinear` checks that a cached, hashed list (with a Context) and per-row linear
+evaluation (without one) agree on every row, for IN and NOT IN. It covers:
+
+- text, `bpchar(5)` and int operands, with operand values that are NULL, padded, of the other kind, or absent
+  from the list;
+- string, int, padded, bpchar-cast, NULL-holding, mixed-kind and eight-item lists.
+
+It asserts at least ten lists actually hash. Each of three mutations fails it: never trimming the operand,
+ignoring the list's NULL, and admitting a mixed-kind list.
+
+**Measured.** Warm, two interleaved rounds of three runs:
+
+| query | HEAD (s) | candidate (s) |
+|---|---|---|
+| TPC-DS Q8 | 0.90–1.04 | 0.34–0.45 |
+
+In the sf025 sweep, Q8 went from 0.96 to 0.36 s. The sweep's Q74/Q7/Q14 rises did not repeat in an A/B: Q7 0.43
+s on both builds, Q74 within its 18.9–20.3 s spread. TPC-H values are identical (acceptance 24 MATCH), and the
+sweep's plan shapes are identical.
+
+**Left.** PG hashes any element type with a hash opclass, and also hashes `<> ALL` (NOT IN through the
+negator). goopg's hash serves only string and int keys through the IN-list path. A numeric, date or interval
+operand, and the explicit `op ANY(array)` / `<> ANY` loops, stay linear. Recorded in the deferral ledger.
