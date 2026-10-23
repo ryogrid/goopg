@@ -292,3 +292,59 @@ Values are identical:
 
 - **Other sorts.** A sort under any other reader still stores full-width rows.
 - **The queue.** The Gather Merge queue rows are still full width.
+
+## Slice 84 — the compiled evaluator applies AND / OR itself and compares a numeric with an int in place
+
+**Target.** Q28 runs 2.9× slower than release PG. It is six parallel `store_sales` scans under
+`ss_quantity BETWEEN … AND (ss_list_price BETWEEN … OR ss_coupon_amt BETWEEN … OR ss_wholesale_cost BETWEEN …)`.
+
+- **Where the time goes.** `evalFastExpr` is 26.5 % of the profile and the scan decode 24 %.
+- **A generic step per row.** Inside `evalFastExpr`, about 13 % went to `evalBinary` → `evalAnd` / `evalOr` and to
+  `evalBinary` → `compareDatum`.
+- **What a debug build showed.** The comparisons falling through to `compareDatum` were `numeric` columns against
+  `int` constants (`KindNumeric` vs `KindInt`). `fastCompareDatum` declines mixed kinds.
+
+**PG.** `ExecInitExprRec` compiles a BoolExpr into `EEOP_BOOL_AND_STEP*` / `EEOP_BOOL_OR_STEP*` steps, and a
+numeric/int comparison is a single resolved comparison function.
+
+**Change** (`internal/executor/exprnode.go`):
+
+- **AND / OR.** The BinaryOp arm applies Kleene AND / OR (`evalAnd` / `evalOr`) directly when there is no literal
+  coercion and both operands are bool or NULL. `evalBinary` sends `OpAnd` / `OpOr` straight there, and nothing else
+  on the general path (bpchar, pg_lsn, coercion) applies to bool operands.
+- **numeric / int.** `fastCompareDatum` decides a numeric/int pair on the int64 lane in either order, as
+  `compareDatum`'s NUMERIC ↔ INT arm does: `promoteCrossKind` leaves the pair alone, the int becomes
+  `numericFromInt`, and `numericCmp` compares. A big-mantissa numeric still declines.
+
+**Pins.**
+
+- `TestCompiledBoolAndNumericIntMatchInterpreter`: compiled against interpreted over every comparison operator in
+  both orders, scales 0–4, a big numeric, NULLs, and AND / OR over all true/false/NULL pairings. Two mutations fail
+  it: swapped compare operands, and AND evaluated as OR.
+- `TestFastCompareDatumMatchesCompareDatum` (slice 27's pin) is amended: numeric/int pairs on the int64 lane are now
+  decided, and checked against `compareDatum` like every decided pair.
+
+**Measured** (instructions:u per query, against `a05a55628`):
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q13 | 6.82 G | 6.18 G (−9.5 %) |
+| Q48 | 7.12 G | 6.65 G (−6.6 %) |
+| Q28 | 25.67 G | 25.02 G (−2.5 %) |
+| Q85 | — | −1.1 % |
+| Q7, Q26 | — | flat |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left.**
+
+- **Scan decode.** Q28's remaining time is the scan decode: `decodeRowRangeInfo` with the numeric payload checks
+  (`NumericInt64FromStoredPayload`, the legacy-spelling probes) is about 30 %.
+- **The batch evaluator.** It still reaches AND / OR and numeric/int comparisons through `evalFastBinaryApply` →
+  `evalBinary`. The results are the same, but the path is slower.

@@ -629,6 +629,21 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		// AND / OR of two boolean (or NULL) operands is Kleene logic
+		// applied here, as PG's EEOP_BOOL_AND_STEP / EEOP_BOOL_OR_STEP
+		// steps do, instead of through evalBinary's dispatch: TPC-DS Q28's
+		// six `ss_quantity BETWEEN … AND (… OR … OR …)` scan quals called
+		// evalAnd / evalOr per row through it (M0122-0012 slice 84).
+		// evalBinary sends OpAnd / OpOr straight to evalAnd / evalOr, and
+		// for bool / NULL operands nothing on the general path (literal
+		// coercion, bpchar, pg_lsn) applies, so the result is the same.
+		if (op == parser.OpAnd || op == parser.OpOr) && n.constVal == nil &&
+			(left.Kind == KindBool || left.IsNull()) && (right.Kind == KindBool || right.IsNull()) {
+			if op == parser.OpAnd {
+				return evalAnd(left, right), nil
+			}
+			return evalOr(left, right), nil
+		}
 		if n.constVal != nil {
 			coerceUnknownLit(n, &left, &right)
 		}
@@ -912,6 +927,19 @@ func plainCompareString(s string) bool {
 //     calls it.
 func fastCompareDatum(a, b *Datum) (int, bool) {
 	if a.Kind != b.Kind {
+		// numeric / int on the int64 lane: compareDatum's NUMERIC ↔ INT arm
+		// (promoteCrossKind leaves the pair alone, the int becomes
+		// numericFromInt, numericCmp compares) — TPC-DS Q28's
+		// `ss_list_price BETWEEN 107 AND 117` compared through evalBinary
+		// per row (M0122-0012 slice 84).
+		switch {
+		case a.Kind == KindNumeric && b.Kind == KindInt && !isBigNumeric(*a):
+			c, err := numericCmp(*a, numericFromInt(b.Int))
+			return c, err == nil
+		case a.Kind == KindInt && b.Kind == KindNumeric && !isBigNumeric(*b):
+			c, err := numericCmp(numericFromInt(a.Int), *b)
+			return c, err == nil
+		}
 		return 0, false
 	}
 	switch a.Kind {

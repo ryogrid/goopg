@@ -32,9 +32,13 @@ func TestFastCompareDatumMatchesCompareDatum(t *testing.T) {
 		for j := range vals {
 			a, b := vals[i], vals[j]
 			got, ok := fastCompareDatum(&a, &b)
-			mustDecline := a.Kind != b.Kind ||
+			// A numeric against an int on the int64 lane is decided too
+			// (M0122-0012 slice 84): compareDatum's NUMERIC ↔ INT arm.
+			numInt := (a.Kind == KindNumeric && b.Kind == KindInt && !isBigNumeric(a)) ||
+				(a.Kind == KindInt && b.Kind == KindNumeric && !isBigNumeric(b))
+			mustDecline := (a.Kind != b.Kind && !numInt) ||
 				(a.Kind == KindTime && (a.Scale != 0 || b.Scale != 0)) ||
-				(a.Kind == KindNumeric && (isBigNumeric(a) || isBigNumeric(b)))
+				(a.Kind == KindNumeric && b.Kind == KindNumeric && (isBigNumeric(a) || isBigNumeric(b)))
 			if mustDecline {
 				if ok {
 					t.Errorf("pair %d,%d (%v vs %v): decided %d, must decline", i, j, a, b, got)
