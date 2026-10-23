@@ -22,6 +22,9 @@ import (
 // For pages not yet marked ALL_VISIBLE it falls back to a full heap fetch
 // so MVCC visibility is always respected.
 type indexOnlyScanOp struct {
+	// probeForm resolves the probe key's columns once and forms fixed-width
+	// probes from a template (M0122-0012 slice 80).
+	probeForm indexProbeForm
 	// rangeLoExcl / rangeHiExcl: index-order bound exclusivity, as on
 	// indexScanOp (DESC swap, NULL pivots). Set by every lookupRangeBounds;
 	// the plan's operators otherwise.
@@ -1107,7 +1110,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 			return nil, false, nil
 		}
 		colName := o.plan.Index.Columns[i]
-		col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		col, found := o.probeForm.colAt(o.ctx, o.plan.Table, colName, i)
 		if !found {
 			return nil, false, &ExecError{
 				Code: "XX000", Pos: o.plan.Pos(),
@@ -1116,7 +1119,7 @@ func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
 		}
 		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
 	}
-	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	probe, encErr := o.probeForm.form(o.ctx, o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -1135,13 +1138,13 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 	if v.IsNull() {
 		return nil, false, nil
 	}
-	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	col, ok := o.probeForm.colAt(o.ctx, o.plan.Table, o.plan.Index.Columns[0], 0)
 	if !ok {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: fmt.Sprintf("indexed column %q not found", o.plan.Index.Columns[0])}
 	}
 	parts := []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}}
-	k, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	k, encErr := o.probeForm.form(o.ctx, o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}

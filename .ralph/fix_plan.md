@@ -2408,6 +2408,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q43 −19\.3 %, Q59 −24\.9 %, Q2 −16\.9 %, Q75 −15\.2 % instructions; warm wall Q43 0\.25 → 0\.20 s, Q59 1\.30 → 0\.99 s\.
     - Correction to slice 78: Q14's "77\.7 G planning" was its second statement's execution \(two\-statement file;
       the explain prefix covers the first only\) — Q14/Q23/Q24/Q39 need per\-statement plan measurement\.
+  - **Slice 80 — an index scan forms its probe key from resolved columns and re\-aims one cursor per rescan LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 \(new\) "Slice 80"\.
+    - Target: Q14, the largest gap vs release PG 18\.3 \(8\.9 vs 4\.8 s\)\. Same plans and rows; parameterised
+      \*\_sales\_pkey rescans \(16 173 each\): lookupKey re\-resolved columns by name and formed the probe generically,
+      and every rescan allocated a cursor\.
+    - indexProbeForm \(colAt once; fixed\-width template fill\) in indexScanOp and indexOnlyScanOp alike; curSpare \+
+      ResetScanCursor\. Byte\-identity pinned vs indexProbeKey; mutation\-checked\.
+    - Q14 −4\.9 % instructions, −13 % bytes / −21 % objects allocated; Q17 −4\.5 %, Q25 −2\.9 %\.
+    - Left: leafScanStart's generic comparator \(~12 % of Q14\); Q14 still allocates 4\.5 GB / 46 M objects per run\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4674,6 +4685,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `a53a0c466`** \(M0122\-0012 slice 78 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `71a749a8e`** \(M0122\-0012 slice 79 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

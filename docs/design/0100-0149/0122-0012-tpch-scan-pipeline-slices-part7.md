@@ -672,3 +672,5 @@ Values are identical:
 
 **Left.** Q43's Sort still stores full-width rows with the dead cells NULL (the slice-71 ledger row). Its live
 columns are now the four the aggregate reads, but every row is still allocated at the 80-column schema width.
+
+*Continued in [part 8](0122-0012-tpch-scan-pipeline-slices-part8.md) (slice 80 on).*
