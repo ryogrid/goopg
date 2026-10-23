@@ -611,3 +611,64 @@ PASS=99 (61 ck) with identical plan shapes, acceptance 24 MATCH, RegressSuite PA
 - Q64 still plans in about 0.8 s against PG's 64 ms. The remaining profile is the memo's map lookups, now one per
   key, in `keyOf` and `equivalentWithin`. Canonical pathkeys (PG `make_canonical_pathkey`) would remove them.
 - Q14 spends about 5 s and 77.7 G instructions planning, which is untouched here and the next lead.
+
+## Slice 79 — a re-expansion Project's live set reads its consumers through any expression
+
+**Target selection.** I ranked the warm SF0.25 gap census (all 99 queries on one server against `:65438`
+`tpcds025`; slice 78) by ratio among single-statement queries whose planning is small. Q43 runs 208 ms against PG's
+75 ms (2.75×).
+
+Two-statement files need care: Q14, Q23, Q24 and Q39 hold two statements, so an `explain` prefix covers only the
+first and the second still runs. The "77.7 G per plan" recorded for Q14 in slice 78 was its second statement's
+execution, not planning.
+
+**Diagnosis.**
+
+- **The sort.** Q43's worker Sort reported 121–131 MB of quicksort memory per participant, against PG's 3.5 MB for
+  the same ~34 k rows.
+- **The profile.** 72 % of Q43's instructions sat under a `projectOp` between the Sort and the hash join: the
+  planner's 80-target re-expansion Project, which never appears in EXPLAIN.
+- **The cause.** A debug build showed that Project with `live == nil`, so all 80 targets were evaluated per row.
+  `projectLiveSet` walked the consumers with the narrowing whitelist `deformScanVisit`, which declines a `CaseExpr`.
+  Q43's aggregates are `sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END)`, so every consumer
+  "could not be enumerated" and every target stayed live.
+- **The same shape elsewhere.** Q59 has seven such arms, and Q2 and Q75 aggregate CASE / COALESCE expressions.
+
+**PG.** A node's targetlist holds only what its parent needs; the dead targets are never built.
+
+**Change** (`internal/executor/scan_deform.go`): `projectLiveSet` asks `consumerLiveColumns` which targets the
+consumers read.
+
+- `consumerLiveColumns` is the walk the Gather, Gather Merge and Sort live sets already use. It goes through any
+  expression kind (`optimizer.WalkExprHostScope`), fail-closed on an unknown kind, and gives up on a whole-row,
+  ctid or tableoid read and on a sublink.
+- A reference past the target list still keeps every target live.
+- A dead target is still evaluated unless `projectTargetSkippable` says it can neither fail nor have an effect.
+
+**Pins** (`TestProjectLiveSetUnderAggregate`, new subtests).
+
+- A CASE argument reading outputs 5 and 2 leaves exactly [2 5] live.
+- A sublink inside the argument keeps every target.
+- A reference past the target list keeps every target.
+- Dropping the out-of-range guard fails the last subtest.
+
+**Measured** against `a53a0c466` (SF0.25 clone):
+
+| query | instructions | warm wall |
+|---|---|---|
+| Q43 | 7.40 → 5.97 G (−19.3 %) | 0.25 → 0.20 s |
+| Q59 | 17.13 → 12.86 G (−24.9 %) | 1.30 → 0.99 s |
+| Q2 | 11.48 → 9.54 G (−16.9 %) | 0.26 → 0.22 s |
+| Q75 | 11.69 → 9.91 G (−15.2 %) | 0.44 → 0.39 s |
+| Q14, Q36, Q53, Q63, Q70, Q89, Q98 | within noise | — |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left.** Q43's Sort still stores full-width rows with the dead cells NULL (the slice-71 ledger row). Its live
+columns are now the four the aggregate reads, but every row is still allocated at the 80-column schema width.

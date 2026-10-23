@@ -430,28 +430,29 @@ func deformProjectBelow(p *optimizer.Project, incoming int, live []bool) int {
 // what its parent needs — so skipping them is the PG-shaped behaviour.
 //
 // A dead target is skipped only when evaluating it can neither fail nor have
-// an effect (projectTargetSkippable); any other is kept live. A consumer the
-// visitor does not understand, or a reference outside the target list,
-// keeps every target.
+// an effect (projectTargetSkippable); any other is kept live. A consumer that
+// may read the row beyond its cells (consumerLiveColumns), or a reference
+// outside the target list, keeps every target.
+//
+// The question is only which targets a consumer reads, so the consumers are
+// walked by consumerLiveColumns, through any expression kind. The narrowing
+// whitelist (deformScanVisit) it used before declined every CASE, so the
+// aggregates of TPC-DS Q43 / Q59 (`sum(CASE WHEN d_day_name = 'Sunday' THEN
+// ss_sales_price ...)`) kept all 80 targets of their re-expansion Project
+// live — every join column evaluated per row (M0122-0012 slice 79).
 func projectLiveSet(p *optimizer.Project, consumers []optimizer.Expr) []bool {
 	n := len(p.Targets)
-	live := make([]bool, n)
-	for _, e := range consumers {
-		if e == nil {
-			continue
-		}
-		inRange := true
-		ok := deformScanVisit(e, func(idx int) {
-			if idx < 0 || idx >= n {
-				inRange = false
-				return
-			}
-			live[idx] = true
-		})
-		if !ok || !inRange {
+	read := consumerLiveColumns(consumers)
+	if read == nil {
+		return nil
+	}
+	for i := n; i < len(read); i++ {
+		if read[i] {
 			return nil
 		}
 	}
+	live := make([]bool, n)
+	copy(live, read)
 	all := true
 	for i, t := range p.Targets {
 		if !live[i] && !projectTargetSkippable(t) {
