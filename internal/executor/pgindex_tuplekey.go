@@ -211,6 +211,17 @@ func pgIndexKeyColumns(idx *catalog.Index) []*catalog.Column {
 // the descriptor and stores no heap TID, so it is a separator inside the tree,
 // never an entry an index-only scan may answer a row from.
 func pgIndexTupleKeyDatums(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, key []byte) ([]Datum, error) {
+	n := desc.NKeyAtts()
+	return pgIndexTupleKeyDatumsInto(desc, cols, key, make([][]byte, n), make([]bool, n), make([]Datum, n))
+}
+
+// pgIndexTupleKeyDatumsInto is pgIndexTupleKeyDatums into caller-owned
+// scratch (images, isnull) and output (out), each with room for every key
+// attribute; it returns out. An index-only scan decodes every matched entry,
+// and the allocating form cost it a Physical() copy and three slices per entry
+// (M0122-0012 slice 82). The checks, the deform and the per-attribute decode
+// are pgIndexTupleKeyDatums' own, which is this function over fresh slices.
+func pgIndexTupleKeyDatumsInto(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, key []byte, images [][]byte, isnull []bool, out []Datum) ([]Datum, error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: nil or empty key descriptor")
@@ -224,11 +235,10 @@ func pgIndexTupleKeyDatums(desc *nbtree.PGIndexKeyDesc, cols []*catalog.Column, 
 	if natts := int(nbtree.BTreeTupleGetNAtts(key, uint16(nkey))); natts != nkey {
 		return nil, fmt.Errorf("pgIndexTupleKeyDatums: key names %d of %d key attributes (a pivot, not an entry)", natts, nkey)
 	}
-	images, isnull, err := nbtree.DeformPGIndexTuple(key, desc.Physical(), nkey)
-	if err != nil {
+	if err := nbtree.DeformPGIndexKeyInto(key, desc, nkey, images, isnull); err != nil {
 		return nil, err
 	}
-	out := make([]Datum, nkey)
+	out = out[:nkey]
 	for i := range out {
 		if isnull[i] {
 			out[i] = NullDatum

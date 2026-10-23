@@ -717,6 +717,15 @@ func DeformPGIndexTuple(raw []byte, attrs []PGIndexAttr, natts int) ([][]byte, [
 	return values, isnull, nil
 }
 
+// DeformPGIndexKeyInto is DeformPGIndexTuple(raw, desc.Physical(), natts)
+// into caller-owned slices, walking desc's attributes directly — no
+// Physical() copy and no per-call value / null slices (M0122-0012 slice 82:
+// an index-only scan deformed every matched entry). values[i] aliases raw;
+// values and isnull must have room for natts entries.
+func DeformPGIndexKeyInto(raw []byte, desc *PGIndexKeyDesc, natts int, values [][]byte, isnull []bool) error {
+	return deformPGIndexTupleInto(raw, desc.Attrs, natts, values, isnull)
+}
+
 // physAttr lets deformPGIndexTupleInto walk either the layout-only
 // []PGIndexAttr or the richer []PGKeyAttr without materialising the former
 // from the latter. It is a generic constraint, not an interface value: each

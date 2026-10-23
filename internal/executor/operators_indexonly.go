@@ -25,6 +25,14 @@ type indexOnlyScanOp struct {
 	// probeForm resolves the probe key's columns once and forms fixed-width
 	// probes from a template (M0122-0012 slice 80).
 	probeForm indexProbeForm
+	// keyDesc … keyVals are decodeRowFromKey's per-descriptor key columns,
+	// names and deform scratch (M0122-0012 slice 82).
+	keyDesc  *nbtree.PGIndexKeyDesc
+	keyCols  []*catalog.Column
+	keyNames []string
+	keyImgs  [][]byte
+	keyNulls []bool
+	keyVals  []Datum
 	// rangeLoExcl / rangeHiExcl: index-order bound exclusivity, as on
 	// indexScanOp (DESC swap, NULL pivots). Set by every lookupRangeBounds;
 	// the plan's operators otherwise.
@@ -653,16 +661,26 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 	// only the DECODE differs between the two formats, never which columns the
 	// scan is answering from.
 	if desc := o.ctx.pgIndexKeyDesc(o.plan.Index); desc != nil {
-		keyCols := pgIndexKeyColumns(o.plan.Index)
-		vals, err := pgIndexTupleKeyDatums(desc, keyCols, key)
+		// The key columns, their names and the deform scratch are resolved
+		// once per descriptor, not per matched entry (M0122-0012 slice 82):
+		// PG's index_deform_tuple writes into the scan's slot. The decoded
+		// values go through a reused buffer; projectKeyVals copies them into
+		// the entry's own row.
+		if o.keyDesc != desc {
+			o.keyDesc = desc
+			o.keyCols = pgIndexKeyColumns(o.plan.Index)
+			o.keyNames = make([]string, len(o.keyCols))
+			for i, kc := range o.keyCols {
+				o.keyNames[i] = kc.Name
+			}
+			n := desc.NKeyAtts()
+			o.keyImgs, o.keyNulls, o.keyVals = make([][]byte, n), make([]bool, n), make([]Datum, n)
+		}
+		vals, err := pgIndexTupleKeyDatumsInto(desc, o.keyCols, key, o.keyImgs, o.keyNulls, o.keyVals)
 		if err != nil {
 			return nil, err
 		}
-		names := make([]string, len(keyCols))
-		for i, kc := range keyCols {
-			names[i] = kc.Name
-		}
-		return o.projectKeyVals(names, vals)
+		return o.projectKeyVals(o.keyNames, vals)
 	}
 	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
 		d, err := decodeBTreeKeyToDatumStyled(key, o.plan.Covered[0], o.arrayStyle)

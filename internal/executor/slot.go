@@ -228,6 +228,19 @@ func slotRow(slot TupleSlot) Row {
 	return slot.Row()
 }
 
+// appendSlotCells appends slot's cells to dst: slotRow(slot)'s values,
+// without the fresh row a VirtualSlot's Row materialises (M0122-0012 slice
+// 82). A nil slot appends nothing.
+func appendSlotCells(dst Row, slot TupleSlot) Row {
+	if vs, ok := slot.(*VirtualSlot); ok {
+		for i := range vs.cols {
+			dst = append(dst, vs.Get(i))
+		}
+		return dst
+	}
+	return append(dst, slotRow(slot)...)
+}
+
 // slotToRow extracts a Row from a SlotView for legacy helpers
 // (evalSubquery / evalInExpr / evalExistsExpr / evalExtract /
 // evalFuncCall / evalCaseExpr) that still take Row. Type-asserts

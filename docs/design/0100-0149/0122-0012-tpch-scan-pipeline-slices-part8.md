@@ -150,3 +150,74 @@ Values are identical:
   directly under a Project. An index scan on a nested loop's inner side has no such parent; it needs a join-aware
   read set.
 - **Bytes per run.** The 4.2 GB per run is dominated by these decoded rows and the sort and set-op row copies.
+
+## Slice 82 — the lateral stream copies the outer row's cells, and an index-only scan decodes into reused scratch
+
+**Target selection.** A fresh warm census at `e9c61e18b` (all 99 SF0.25 queries, second pass, on one server)
+against release PG 18.3 put the total at 67.6 s against 85.8 s.
+
+- **Q47 was an artefact.** It read 4.8 s in that pass, against 1.2 s before. Run alone it is 2.5 s while the
+  server warms and 1.2 s once warm, and its instructions did not change (19.6 → 19.3 G).
+- **Allocation drives the wall times.** Q23 allocates 3.9 GB and 21.5 M objects per run, Q78 3.1 GB, Q47 2.0 GB.
+- **The target.** Q23 runs 2.6 s against release PG's 1.3 s. Its statements take 1.7 s and 1.3 s, against 0.93 s
+  and 0.89 s on cassert PG. Both are dominated by parallel nested loops probing `item_pkey` (index scan) and
+  `customer_pkey` (index-only scan), 414 k times each.
+
+**Allocation attribution** (first non-runtime frame above the allocator, 15 s profile of statement 1):
+
+- **Dead string columns.** The index scan's string decode is the slice-81 ledger row.
+- **A throwaway outer row.** `VirtualSlot.Row` in `lateralJoinStream.stepOuter`: `slotRow` materialised the
+  join's VirtualSlot into a fresh row for every outer row, only to copy it again into the stream's reused
+  `outerRow`.
+- **Index-only scan decode.** `pgIndexTupleKeyDatums` in `indexOnlyScanOp.decodeRowFromKey` (about 1 470
+  samples) allocated, per matched entry:
+  - `pgIndexKeyColumns` and a `names` slice;
+  - `desc.Physical()`'s copy;
+  - `DeformPGIndexTuple`'s value and null slices;
+  - the `[]Datum` result.
+
+  PG's `index_deform_tuple` writes into the scan's slot.
+
+**Change.**
+
+- **The outer row.** `lateralJoinStream.stepOuter` fills `outerRow` straight from the slot's cells
+  (`appendSlotCells`) and detaches arena-backed cells in place. The stream already reused that buffer when
+  nothing was arena-backed.
+- **The deform** (`nbtree.DeformPGIndexKeyInto`): `DeformPGIndexTuple` over `desc.Attrs`, into caller-owned
+  slices.
+- **The decode** (`pgIndexTupleKeyDatumsInto`): `pgIndexTupleKeyDatums` with caller-owned scratch and output.
+  The allocating form is now that function over fresh slices, so the checks and the per-attribute decode cannot
+  drift apart.
+- **The index-only scan** resolves its key columns, names and scratch once per descriptor (`keyDesc` … `keyVals`)
+  and decodes every entry through them. `projectKeyVals` still copies each entry into its own row, because the
+  eager rescan keeps every row.
+
+**Pins.**
+
+- `TestKeyDatumsIntoMatchesAllocatingDecode`: entries with int and varchar attributes and NULLs, decoded through
+  reused scratch, must equal the allocating decode. Leaving a NULL attribute unwritten fails it, because the
+  previous entry's value survives.
+- `TestAppendSlotCellsMatchesSlotRow`: for a VirtualSlot, a materialised slot and nil, onto a dirty reused buffer.
+
+**Measured** against `e9c61e18b`:
+
+| query | instructions | bytes per run | objects per run |
+|---|---|---|---|
+| Q23 | 67.31 → 65.67 G (−2.4 %) | 3.91 → 3.43 GB (−12 %) | 21.5 M → 15.8 M (−26.5 %) |
+| Q14 | 139.82 → 136.81 G (−2.1 %) | 4.19 → 3.91 GB (−7 %) | — |
+| Q72 | flat | 97 → 77 MB (−21 %) | — |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left.**
+
+- **Dead string columns** in index scans: the slice-81 ledger row.
+- **Lateral re-open.** The lateral stream still re-opens the whole right subtree per outer row, where PG uses
+  `ExecReScan`.
+- **Remaining volume.** Q23 still allocates 3.4 GB per run.

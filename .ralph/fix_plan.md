@@ -2430,6 +2430,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Pinned \(counts vs rowKeyTrimmed incl\. int/numeric, bpchar, NULL canonicalisation\); mutation\-checked\.
     - Q14 objects 45\.96 M → 32\.57 M per run \(−29 %\), bytes −6 %, instructions −2\.9 %; Q38/Q87 −1\.1 %\.
     - Ledger row: index scans decode dead string columns \(needs a join\-aware read set for inner\-side scans\)\.
+  - **Slice 82 — the lateral stream copies the outer row's cells; an index\-only scan decodes into reused scratch
+    LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99
+    \(61 ck\) PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm
+    PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 82"\.
+    - Target: Q23 \(2\.6 s vs release PG 1\.3 s; 3\.9 GB / 21\.5 M objects per run\)\. Fresh census: goopg 67\.6 s vs
+      release PG 85\.8 s total; Q47's 4\.8 s was a warm\-up artefact \(1\.2 s warm, instructions unchanged\)\.
+    - stepOuter materialised the VirtualSlot then copied it \(appendSlotCells now\); IOS decodeRowFromKey allocated
+      keyCols/names/Physical/values/nulls/vals per entry \(pgIndexTupleKeyDatumsInto \+ DeformPGIndexKeyInto with
+      per\-descriptor scratch\)\. Pinned; mutation\-checked\.
+    - Q23 objects −26\.5 %, bytes −12 %, instructions −2\.4 %; Q14 −2\.1 % instructions; Q72 bytes −21 %\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4708,6 +4718,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `afdfe9869`** \(M0122\-0012 slice 80 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `e9c61e18b`** \(M0122\-0012 slice 81 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
