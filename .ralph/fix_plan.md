@@ -2533,6 +2533,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Next lever, needs design: cooperative hash build producers clone every build row \(Q95 ~13 %\) that the
       consumer copies again; recycling requires a borrow\-safe transfer\.
     - Ledger: EXPLAIN ANALYZE actual time prints loop totals, PG prints per\-loop averages\.
+  - **Slice 92 — cooperative hash build producers borrow their scan and fill recycled batch blocks LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, \-race on the coop tests PASS\. Doc part 9 "Slice 92"\.
+    - Target: Q95 \(1534 MB/run\)\. Producers cloned every build row \(their tree never borrowed\) and the consumer
+      copied it again \(retainBuildRow\)\.
+    - coopBorrowScan admits the bare scan or a column\-only Project over it; rows are copied into coopBatch blocks the
+      channelSource hands back on a free list once past the batch\.
+    - Q95 −21\.5 % bytes, −8 % objects, ws\_wh build −27 to −48 %; end\-to\-end within noise; Q4 −2\.0 %, Q59
+      −1\.2 % instructions\. Rule \(b\): ≥ 3 % on its target \(bytes\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4890,6 +4900,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **census reused at `a5ba2cb39`** \(docs\-only commit; routing\-20261024d's capture sha
+    `8532a71e3` is an ancestor and no planner/executor/cost path changed since\)\. Same items\-0\-9 tokens as the
+    `8532a71e3` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

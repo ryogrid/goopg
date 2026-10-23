@@ -357,10 +357,27 @@ func collectShareableJoins(op Operator, out *[]*joinOp) {
 // EXACT same buildLoopRight/buildLoopLeft code the serial build uses — the
 // only difference is the row source (channel vs. child operator tree).
 type channelSource struct {
-	ch     <-chan []Row
+	ch     <-chan coopBatch
 	schema optimizer.Schema
 	batch  []Row
 	idx    int
+	// free takes back a batch's cells once the source moves past it
+	// (coopBatch); cells is the current batch's.
+	free  chan<- []Datum
+	cells []Datum
+}
+
+// coopBatch is one producer batch of a cooperative build (M0122-0012
+// slice 92). rows are carved from cells, a block the producer takes from the
+// free list (or allocates) and the consumer's channelSource hands back once
+// it has moved past the batch: the build loop copies every row it keeps
+// before it pulls the next one (retainBuildRow — the invariant the serial
+// build's scan borrow already rests on, joinBorrowBuildChild), so by then
+// nothing reads the batch. A row the producer could not carve (a width
+// change) is its own allocation and cells stays as is.
+type coopBatch struct {
+	rows  []Row
+	cells []Datum
 }
 
 func (s *channelSource) Open(_ *Context) error { return nil }
@@ -374,11 +391,18 @@ func (s *channelSource) Schema() optimizer.Schema { return s.schema }
 
 func (s *channelSource) Next() (TupleSlot, error) {
 	for s.idx >= len(s.batch) {
+		if s.cells != nil && s.free != nil {
+			select {
+			case s.free <- s.cells:
+			default:
+			}
+		}
+		s.cells = nil
 		b, ok := <-s.ch
 		if !ok {
 			return nil, EOF
 		}
-		s.batch = b
+		s.batch, s.cells = b.rows, b.cells
 		s.idx = 0
 	}
 	row := s.batch[s.idx]
@@ -605,6 +629,11 @@ func (o *joinOp) parallelBuildEligible(ctx *Context, buildLeft bool) bool {
 // path is counted, and TestCoopParallelHashBuildSpills asserts the count moves.
 var coopSpillingBuilds atomic.Int64
 
+// coopRecycledBatches counts producer batches carved from a block the
+// consumer handed back (coopBatchCells), and coopBorrowedProducers the
+// producers whose tree is a bare scan that borrows. Test observability.
+var coopRecycledBatches, coopBorrowedProducers atomic.Int64
+
 // CoopSpillingBuildCount reports the process-wide number of cooperative
 // parallel hash builds that spilled to batch files. Test/diagnostic use.
 func CoopSpillingBuildCount() int64 { return coopSpillingBuilds.Load() }
@@ -667,7 +696,8 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 
 	group := NewParallelGroup(ctx.Ctx)
 	pscan := newParallelScanState(0)
-	ch := make(chan []Row, gatherChanDepth*(maxProducers+1))
+	ch := make(chan coopBatch, gatherChanDepth*(maxProducers+1))
+	free := make(chan []Datum, gatherChanDepth*(maxProducers+1)+maxProducers)
 
 	// E-18 slice 2: when the build side is a JOIN TREE, every producer would
 	// otherwise redo each nested build — the cost objection recorded on
@@ -743,12 +773,29 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 			if !attachParallelScan(tree, pscan) {
 				return fmt.Errorf("parallel build: no scan in built tree")
 			}
+			// The producer copies each row into its batch before it pulls
+			// the next one, so its scan may borrow — hand up its reused row
+			// instead of a per-tuple clone (M0122-0012 slice 92) — when what
+			// the producer copies are the scan's own cells
+			// (coopBorrowScan). A computed value over a borrowed scan can
+			// alias the scan's page arena without being marked arena-backed
+			// (substr over an arena cell), which the copy cannot detach, so
+			// any other tree keeps its scan's clone. For the bare scan the
+			// copy takes the scan's own deform prefix — the cells past it are
+			// the borrowed row's stale tail, which no consumer reads and the
+			// clone left NULL; behind a Project it takes every output column.
+			scanRoot, bareScan := coopBorrowScan(tree)
+			if scanRoot != nil {
+				markScanBorrowChain(tree)
+				coopBorrowedProducers.Add(1)
+			}
 			if err := tree.Open(wctx); err != nil {
 				return err
 			}
 			defer tree.Close()
 
-			var batch []Row
+			var b coopBatch
+			w, cb := -1, 0
 			for {
 				slot, err := tree.Next()
 				if err == EOF {
@@ -757,19 +804,39 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 				if err != nil {
 					return err
 				}
-				batch = append(batch, transferRowForQueue(slot))
-				if len(batch) >= gatherBatchRows {
+				if w < 0 {
+					w = slot.Width()
+					cb = w
+					if bareScan {
+						cb = seqScanSurvivorWidth(scanRoot.deformBound, w)
+					}
+				}
+				if b.rows == nil {
+					b.rows = make([]Row, 0, gatherBatchRows)
+					b.cells = coopBatchCells(free, gatherBatchRows*w, w, cb)
+				}
+				if slot.Width() != w {
+					b.rows = append(b.rows, cloneRowOwnedPrefix(slot.Row(), min(cb, slot.Width())))
+				} else {
+					k := len(b.rows) * w
+					dst := b.cells[k : k+w : k+w]
+					for i := 0; i < cb; i++ {
+						dst[i] = slot.Get(i).MaterializeArena()
+					}
+					b.rows = append(b.rows, dst)
+				}
+				if len(b.rows) >= gatherBatchRows {
 					select {
-					case ch <- batch:
+					case ch <- b:
 					case <-workerCtx.Done():
 						return workerCtx.Err()
 					}
-					batch = nil
+					b = coopBatch{}
 				}
 			}
-			if len(batch) > 0 {
+			if len(b.rows) > 0 {
 				select {
-				case ch <- batch:
+				case ch <- b:
 				case <-workerCtx.Done():
 					return workerCtx.Err()
 				}
@@ -787,7 +854,7 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 
 	// Replace the build child with a synthetic operator that reads from the
 	// channel. The old operator was never opened — it is harmless to drop.
-	source := &channelSource{ch: ch, schema: buildSchema}
+	source := &channelSource{ch: ch, schema: buildSchema, free: free}
 
 	// Run the SAME build loop as the serial path, but from the channel.
 	buildStart := time.Now()
@@ -861,4 +928,56 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	}
 	o.recordBuildTime(ctx, buildStart)
 	return probeIsLeft, nil
+}
+
+// coopBatchCells returns a block of n cells for a producer batch of rows of
+// width w whose first cb cells are written per row: one handed back on free
+// when there is one of that size, otherwise a new block whose tail cells
+// (cb..w of every row) are set once — NULL, or the deform poison when armed,
+// as cloneRowOwnedPrefix leaves them. A producer only ever writes the first
+// cb cells of a row, so a recycled block's tails are still that.
+func coopBatchCells(free <-chan []Datum, n, w, cb int) []Datum {
+	select {
+	case c := <-free:
+		if len(c) == n {
+			coopRecycledBatches.Add(1)
+			return c
+		}
+	default:
+	}
+	c := make([]Datum, n)
+	if seqScanDeformPoison && cb < w {
+		dead := deformPoisonDatum()
+		for r := 0; r+w <= n; r += w {
+			for i := r + cb; i < r+w; i++ {
+				c[i] = dead
+			}
+		}
+	}
+	return c
+}
+
+// coopBorrowScan returns the scan a cooperative build producer may let
+// borrow, and whether that scan is the whole tree: the tree's own scan, or
+// the scan under a Project whose every target is a plain column of it — the
+// Project then passes the scan's cells through, arena marks and all, so the
+// producer's MaterializeArena copy detaches each one. nil for any other tree.
+func coopBorrowScan(tree Operator) (*seqScanOp, bool) {
+	if so := unwrapSeqScanOp(tree); so != nil {
+		return so, true
+	}
+	op := tree
+	if io, ok := op.(*instrumentedOp); ok {
+		op = io.inner
+	}
+	p, ok := op.(*projectOp)
+	if !ok {
+		return nil, false
+	}
+	for _, t := range p.targets {
+		if c, ok := t.(*optimizer.ColumnRef); !ok || c.Index < 0 {
+			return nil, false
+		}
+	}
+	return unwrapSeqScanOp(p.child), false
 }

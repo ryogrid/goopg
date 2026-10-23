@@ -213,3 +213,83 @@ needs a design pass of its own.
 **A rendering difference** found along the way: goopg's EXPLAIN ANALYZE prints `actual time` totals over all loops
 (Q14's `store_sales_pkey` scan shows `0.003..1857.725` with loops=16173), where PG prints per-loop averages. Plain
 EXPLAIN parity is unaffected. It is recorded here and in the ledger, not fixed.
+
+## Slice 92 — cooperative hash build producers borrow their scan and fill recycled batch blocks
+
+**Target.** Q95 allocated 1534 MB in 4.63 M objects per run. About 13 % of its instructions
+(`cloneRowOwnedPrefix` plus `memclr` and `malloc`) went to the cooperative parallel hash build's producers
+(`parallelBuildLazyHashTable`, M0129-S4.1).
+
+- Each producer's tree was built without the scan borrow, so its seq scan cloned every row, a full-width allocation
+  of `web_sales`'s 34 columns for the `ws_wh` build.
+- The rows then crossed the channel, and the consumer's build loop copied each one again (`retainBuildRow`).
+- The producer's clone was therefore a transient full-width allocation per build row.
+
+**Change** (`parallel_hash_build.go`).
+
+- **Borrowing.** A producer whose tree is the bare scan, or the scan under a Project whose every target is a plain
+  column (`coopBorrowScan`), marks the borrow chain. The scan then hands up its reused row instead of a clone.
+- **The copy.** The producer copies each row into its batch before pulling the next:
+  - for the bare scan, the scan's own deform prefix;
+  - behind a column-only Project, every output column, since the Project passes the scan's cells through with their
+    arena marks;
+  - each cell through `MaterializeArena`.
+- **Refused trees.** Any other tree keeps its scan's clone. A computed target over a borrowed scan can alias the
+  scan's page arena without being marked arena-backed (substr over an arena cell, the slice-83 invariant), and the
+  copy cannot detach that.
+- **Recycled blocks.** Rows are carved from one block per batch (`coopBatch{rows, cells}`). `channelSource` hands a
+  block back on a free channel when it moves past the batch, and a producer takes one from there before allocating
+  (`coopBatchCells`). Tail cells, from the deform prefix to the row width, are set once at allocation: NULL, or the
+  poison when armed, as `cloneRowOwnedPrefix` left them. Producers never write them again. Neither side blocks on the
+  free list.
+- **Why recycling is safe.** The build loop copies every row it keeps before it pulls the next one (`retainBuildRow`
+  in `buildLoopLeft` / `buildLoopRight`: `retainBuildRowHeap`, `packDenseBuildRow`, `ownedBuildRow`). The serial
+  build's scan borrow already rests on that invariant (`joinBorrowBuildChild`), so by the time a block goes back
+  nothing reads its batch.
+
+**The first cut was wrong twice** before the version above:
+
+- **Wrong bound.** It bounded the copy by the build subtree's `buildBound`. That is the scan's input bound, not the
+  tree's output: a Project emitting 3 columns over a scan bounded at 2. The poison test caught it: a consumer read an
+  undeformed cell.
+- **Too narrow.** Restricting the borrow to the bare scan was safe but missed Q95, whose producer is a column-only
+  Project (−1.4 % bytes instead of −21 %).
+
+**Pins** (`coop_build_recycle_test.go`).
+
+- `TestCoopBuildRecycledBatchesMatchSerialBuild` runs three queries over a 3000-row build side with arena-backed text
+  and columns past the deform bound: a column-only Project, `d.*` from the bare scan, and substr computed above the
+  join. Each must equal the serial build's rows (cooperative build off), with poison off and armed, five times each.
+  It also asserts that the recycling and borrowing paths ran.
+- A consumer that hands a block back on receipt, before reading it, fails the test in 4 runs out of 4.
+- `TestCoopBorrowScanShapes` checks which trees may borrow. Admitting a computed target fails it.
+- `-race` passes on the cooperative tests.
+
+**Measured** against `a5ba2cb39`:
+
+| query | measure | before | after | change |
+|---|---|---|---|---|
+| Q95 | bytes per run | 1534 MB | 1205 MB | −21.5 % |
+| Q95 | objects per run | 4.63 M | 4.26 M | −8 % |
+| Q95 | instructions | — | — | −1.6 % |
+| Q95 | `ws_wh` build time | 65.1 / 89.7 ms | 47.4 / 46.9 ms | −27 to −48 % (two runs) |
+| Q4 | instructions | — | — | −2.0 % |
+| Q59 | instructions | — | — | −1.2 % |
+| Q2 | instructions | — | — | flat |
+
+End-to-end time moved within noise on the final binary, in both directions:
+
+- cycles 8.62 → 8.59 G and 9.13 → 7.88 G over two runs;
+- EXPLAIN ANALYZE execution 2538 → 2603 ms on one pair and 3080 → 2636 ms on another;
+- warm wall time in one long sweep under `GOGC=off` was noisy too.
+
+The measured gains are allocation and the build itself.
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH (TPC-H's cooperative builds);
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
