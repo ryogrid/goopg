@@ -110,3 +110,88 @@ func TestScanDescentOnLeafRoot(t *testing.T) {
 		t.Fatalf("leaf-root cursor delivered %v, want 4..9", keys)
 	}
 }
+
+// TestResetScanCursorMatchesNewCursor pins M0122-0012 slice 77: re-aiming one
+// cursor (ResetScanCursor) — mid-walk, after a drain, inclusive and exclusive,
+// with and without an upper bound — delivers exactly the keys inside the new
+// bounds, nothing left over from its previous aim. The skip scan re-aims one
+// cursor per descent.
+func TestResetScanCursorMatchesNewCursor(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+	const N = 3000
+	for i := 0; i < N; i++ {
+		if err := bt.Insert(EncodeInt4(int32(i)), storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reused := &ScanCursor{}
+	for step, b := range []struct {
+		lo, hi           int32
+		loExcl, hasUpper bool
+	}{{100, 0, false, false}, {2500, 2700, true, true}, {7, 9, false, true}, {2999, 0, true, false}, {0, 1500, false, true}} {
+		var hi []byte
+		if b.hasUpper {
+			hi = EncodeInt4(b.hi)
+		}
+		// The keys past the bounds, computed independently: NewScanCursor
+		// is itself ResetScanCursor on a new cursor, so it is no oracle.
+		var want []int32
+		for k := int32(0); k < N; k++ {
+			if k < b.lo || (b.loExcl && k == b.lo) || (b.hasUpper && k > b.hi) {
+				continue
+			}
+			want = append(want, k)
+		}
+		if err := bt.ResetScanCursor(reused, EncodeInt4(b.lo), hi, b.loExcl, false, nil); err != nil {
+			t.Fatal(err)
+		}
+		if step%2 == 0 {
+			// Re-aim mid-walk too: read one leaf, then re-aim again.
+			if _, err := reused.Next(func([]byte, storage.ItemPointer, ScanPos) (bool, error) { return true, nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := bt.ResetScanCursor(reused, EncodeInt4(b.lo), hi, b.loExcl, false, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, _, _, _ := drainCursor(t, reused)
+		if len(got) != len(want) || (len(want) > 0 && (got[0] != want[0] || got[len(got)-1] != want[len(want)-1])) {
+			t.Fatalf("step %d: re-aimed cursor delivered %d keys, want %d", step, len(got), len(want))
+		}
+	}
+}
+
+// TestEmptyBoundDescendsLeftmost pins slice 77's minus-infinity shortcut: an
+// empty or nil lower bound takes every page's first downlink and is past no
+// page, so the descent lands on the leftmost leaf and the scan reads every key.
+func TestEmptyBoundDescendsLeftmost(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+	const N = 3000
+	for i := 0; i < N; i++ {
+		if err := bt.Insert(EncodeInt4(int32(i)), storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _, err := bt.descendMode(EncodeInt4(-1), false, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lo := range [][]byte{nil, {}} {
+		leaf, err := bt.descendToLowerBound(lo, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if leaf != first {
+			t.Fatalf("lo=%v: descent landed on leaf %d, the leftmost is %d", lo, leaf, first)
+		}
+		cur, err := bt.NewScanCursor(lo, nil, false, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if keys, _, _, _ := drainCursor(t, cur); len(keys) != N || keys[0] != 0 {
+			t.Fatalf("lo=%v: cursor delivered %d keys from %v, want all %d", lo, len(keys), keys[:min(1, len(keys))], N)
+		}
+	}
+}

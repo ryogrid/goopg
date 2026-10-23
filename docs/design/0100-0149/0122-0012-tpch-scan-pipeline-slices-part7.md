@@ -478,3 +478,66 @@ server at `7050dc003`:
   buffer-pool arena is 2 GB, that garbage reaches about 11 GB before the first collection. This is the next lead.
 - **Measurement note.** `/debug/pprof/allocs` diffs between two `?gc=1` fetches showed almost none of those
   allocations. Read the MemStats lines of `/debug/pprof/heap?debug=1` instead.
+
+## Slice 77 — one cursor per skip scan, re-aimed per descent
+
+**Lead.** Q72 allocated about 193 MB and 2.39 M objects per run on the Go heap. Measured with `tmp/ds-alloc.sh`, a
+MemStats TotalAlloc/Mallocs delta over 5 runs. Attributing the `mallocgc` samples of an instruction profile to
+their first non-runtime caller gave:
+
+- `nbtree.(*BTree).NewScanCursor`: 49 %. Each of the skip scan's 862 k descents allocated a fresh `ScanCursor` of
+  about 112 bytes (a 128-byte size class), about 110 MB per run.
+- `groupBoundsFixed`: 14 %, one probe/pivot buffer per prefix group.
+- `fmt.Errorf` inside `comparePGIndexTupleAttrsAt`: the walk's first descent of each rescan has no lower bound,
+  and every comparison against that empty key built an "operand shorter than an index tuple header" error before
+  falling back to byte order.
+
+**PG.** `btbeginscan` allocates one `BTScanOpaque` per scan, and `_bt_first` re-runs in it for every primitive
+index scan the skip array starts. A scan with no lower bound descends with `_bt_endpoint` to the leftmost leaf,
+comparing nothing.
+
+**Change.**
+
+- **Reusable cursor** (`internal/access/nbtree/btree.go`): `BTree.ResetScanCursor(c, …)` performs
+  `NewScanCursor`'s descent into an existing cursor; `NewScanCursor` is now that call on a new one.
+- **Empty bound** (same file): an empty bound takes `findChildBlockDirect`'s first downlink without the binary
+  search, which picks exactly that item, since every item orders above the empty key. An empty inclusive bound
+  is past no page in `lowerBoundPastPage`. The exclusive empty case keeps the general path: in the blob format
+  an empty high key compares equal.
+- **Skip enumeration** (`internal/executor/btree_skip.go`):
+  - `btreeSkipEnum` keeps two spare cursors, `walkSpare` for `walkLeaf`'s descents and jumps and `enumSpare`
+    for `next`.
+  - `cursorAt` re-aims them.
+  - `reset`, used by `init` and by the index scan's three rescan and close sites, keeps them while clearing
+    everything else. A cursor is re-aimed only after its `Next` has returned.
+
+**Pins.**
+
+- `TestResetScanCursorMatchesNewCursor`: one cursor re-aimed through five bound sets delivers exactly the keys
+  inside each set. Those are computed independently, because `NewScanCursor` is itself `ResetScanCursor` and so
+  is no oracle. The bound sets include inclusive, exclusive and upper bounds, and re-aiming mid-walk.
+- `TestEmptyBoundDescendsLeftmost`: a nil or empty bound lands on the leftmost leaf and reads every key.
+- `TestSkipEnumKeepsSpareCursors`: `reset` keeps the spares and clears everything else.
+- Two mutations fail these tests: dropping the upper bound in the reset, and taking the last downlink for an
+  empty key.
+- `go test -race ./internal/access/nbtree/` passes.
+
+**Measured** against `7050dc003` (SF0.25 clone):
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q72 allocation | 192.9 MB, 2.39 M objects per run | 92.7 MB (−52 %), 1.41 M (−41 %) |
+| Q72 instructions | 27.39 G | 27.09 G (−1.1 %) |
+| Q72 warm wall | 0.57–0.64 s | 0.55–0.56 s |
+| Q17, Q25, Q29, Q54 | — | within ±0.3 % |
+
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and
+plan shapes are identical.
+
+**Left.**
+
+- `groupBoundsFixed` still allocates one probe/pivot buffer per prefix group, about 28 MB per run. Reusing it
+  requires the cursor to own a copy of its lower bound, because the walk's jump cursors retain `gProbe` / `gPivot`
+  as `lo` across later groups. PG copies scan keys into `so->keyData`.
+- About 1.4 M other allocations per run remain, spread across row materialisation (`VirtualSlot.Row`), the index
+  scan's batch append and datum keys.

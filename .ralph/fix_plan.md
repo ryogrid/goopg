@@ -2371,6 +2371,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       hands \_bt\_first one leaf buffer\. Pinned: same leaf as the full descent for every bound; leaf\-root tree\.
     - Q72 28\.53 → 27\.39 Ginstr \(−4\.0 %\), wall 0\.69 → 0\.59 s; Q17 −1\.2 %, Q25 −0\.8 %, Q54 −0\.4 %\.
     - Discovery filed: M0122\-0018 \(EXPLAIN ANALYZE TIMING OFF runs Q72 4\.4× slower than the bare query\)\.
+  - **Slice 77 — one cursor per skip scan, re\-aimed per descent LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), nbtree race PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\.
+    Doc part 7 "Slice 77"\.
+    - Target: Q72's per\-run Go\-heap allocation \(tmp/ds\-alloc\.sh, MemStats delta\)\. A fresh ScanCursor per descent
+      was 49 % of allocation samples \(862k × 128 B\); an empty lower bound built an error per comparison\.
+    - BTree\.ResetScanCursor re\-aims a cursor; btreeSkipEnum keeps walkSpare/enumSpare across reset \(PG's one
+      BTScanOpaque per scan\); an empty bound takes the first downlink directly \(PG \_bt\_endpoint\)\. Pinned with an
+      independent key oracle; mutation\-checked\.
+    - Q72 192\.9 → 92\.7 MB/run \(−52 %\), 2\.39 M → 1\.41 M allocations; instructions −1\.1 %; warm wall ~0\.58 → 0\.55 s\.
+    - Left: groupBoundsFixed's per\-group buffer \(~28 MB/run; needs the cursor to own a copy of lo\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012

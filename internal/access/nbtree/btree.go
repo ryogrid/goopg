@@ -298,6 +298,11 @@ func keyAtOrPastHighKey(f indexFormat, p storage.Page, key []byte) bool {
 // test: keyExceedsHighKey for an inclusive bound, keyAtOrPastHighKey for an
 // exclusive one (M0122-0012 slice 41).
 func lowerBoundPastPage(f indexFormat, p storage.Page, lo []byte, loExclusive bool) bool {
+	if len(lo) == 0 && !loExclusive {
+		// Minus infinity is past no page (keyExceedsHighKey's compare would
+		// say so after building an error; see findChildBlockDirect).
+		return false
+	}
 	if loExclusive {
 		return keyAtOrPastHighKey(f, p, lo)
 	}
@@ -2517,9 +2522,13 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey boo
 	if count == 0 {
 		return 0, fmt.Errorf("btree: empty internal page")
 	}
-	// Binary search across line pointers.
+	// Binary search across line pointers (none for an empty key; below).
 	n := count
-	idx := sort.Search(n, func(i int) bool {
+	searchN := n
+	if len(key) == 0 {
+		searchN = 0
+	}
+	idx := sort.Search(searchN, func(i int) bool {
 		// C3-S1: dead items keep ordering bytes. NoCopy (M0146-0088): the
 		// page is latched for the whole call and the probe only compares.
 		raw, err := pgGetItemRawAllowDeadNoCopy(p, uint16(i+1))
@@ -2538,8 +2547,15 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey boo
 		}
 		return f.compare(it.key, key) > 0
 	})
-	// sort.Search returns [0, n]; idx==n means all items ≤ key.
-	if idx >= n {
+	// An empty key is minus infinity — the descent of a scan with no lower
+	// bound, as PG's _bt_endpoint descends to the leftmost leaf. Every item
+	// orders above it, so the search picks the first downlink — after
+	// compare built and dropped an error per probe for a key too short to be
+	// a tuple (M0122-0012 slice 77). Take it directly.
+	if len(key) == 0 {
+		idx = 0
+	} else if idx >= n {
+		// sort.Search returns [0, n]; idx==n means all items ≤ key.
 		idx = n - 1
 	} else if idx > 0 {
 		// idx is the first item with key > search_key;
@@ -5029,11 +5045,27 @@ func (c *ScanCursor) LeafLastKey() (key []byte, ok bool) {
 // walk rightward from it. A nil lo means "scan from the leftmost leaf",
 // matching the eager scans.
 func (bt *BTree) NewScanCursor(lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool) (*ScanCursor, error) {
-	cur, err := bt.descendToLowerBound(lo, loExclusive)
-	if err != nil {
+	c := &ScanCursor{}
+	if err := bt.ResetScanCursor(c, lo, hi, loExclusive, hiExclusive, leafFilter); err != nil {
 		return nil, err
 	}
-	return &ScanCursor{
+	return c, nil
+}
+
+// ResetScanCursor re-aims an existing cursor: the descent NewScanCursor
+// performs, into c instead of a new cursor. A skip scan starts a new
+// primitive index scan per prefix group — TPC-DS Q72 starts ~0.86M of them —
+// and PG reuses its one BTScanOpaque across them (btbeginscan allocates it
+// once; _bt_first re-runs per primitive scan), where a fresh ScanCursor per
+// descent was over half of Q72's per-run allocation (M0122-0012 slice 77).
+// c must not be in use: a Next call on it has returned. On an error c is left
+// unchanged.
+func (bt *BTree) ResetScanCursor(c *ScanCursor, lo, hi []byte, loExclusive, hiExclusive bool, leafFilter func(storage.BlockNumber) bool) error {
+	cur, err := bt.descendToLowerBound(lo, loExclusive)
+	if err != nil {
+		return err
+	}
+	*c = ScanCursor{
 		bt:          bt,
 		lo:          lo,
 		hi:          hi,
@@ -5041,7 +5073,8 @@ func (bt *BTree) NewScanCursor(lo, hi []byte, loExclusive, hiExclusive bool, lea
 		hiExclusive: hiExclusive,
 		leafFilter:  leafFilter,
 		next:        cur,
-	}, nil
+	}
+	return nil
 }
 
 // Next reads exactly one admitted leaf page: every in-range entry on it

@@ -475,7 +475,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{done: true}
+	o.skip.reset(true)
 	o.outerSlot = nil
 	o.outerWidth = 0
 
@@ -552,7 +552,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{}
+	o.skip.reset(false)
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
 
@@ -1350,7 +1350,7 @@ func (o *indexScanOp) Close() error {
 	o.cur = nil
 	o.saopBounds = nil
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{done: true}
+	o.skip.reset(true)
 	o.hasLast = false
 	if o.scanRow != nil {
 		// EX1-02b: scrub tail poison so a poisoned buffer never leaks into
