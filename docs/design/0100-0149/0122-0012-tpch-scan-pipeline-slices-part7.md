@@ -399,3 +399,63 @@ identical.
 - Columns of a `VirtualSlot` or `PackedSlot` still take the copying path.
 - Q1's remaining time is the SubPlan rescan itself: a CTE scan plus a filter for each of 166 M rows. PG pays the
   same, since it builds no hashed SubPlan for a correlated scalar aggregate.
+
+## Slice 76 — a scan's descent stops above the leaf: one leaf visit per descent
+
+**Census lead, re-read.** The rows census flagged Q72's `Index Scan using inventory_pkey` at 20× PG's rows. That is
+the pre-Filter count of M0122-0017: goopg reports 195 rows per loop, while PG reports 9.88 returned plus 191
+removed by the Filter. Every other node's rows match PG's. The scan is a skip scan: `inventory_pkey` is
+(`inv_date_sk`, `inv_item_sk`, `inv_warehouse_sk`), probed on `inv_item_sk` alone. Counters in a scratch build
+showed 862 k cursors for 436 k date groups, about two entries walked per leaf. PG reports 898 676 Index Searches,
+so the descent counts agree and each descent's cost is the gap. In the instruction profile `descendMode` is 42 %
+inclusive and `ScanCursor.Next` 39 %.
+
+**The redundancy.**
+
+- `descendToLowerBound` ran `descendMode` down to the leaf: pin it, check `P_IGNORE`, run the high-key move-right
+  test for the bound, then unpin it.
+- Both of its callers, `rangeScanPosLeaf` and `ScanCursor.Next`, then pinned the same block again and ran the same
+  two steps before reading it.
+- PG reads the leaf once: `_bt_search` moves right on the leaf and returns its buffer, and `_bt_first` /
+  `_bt_readpage` read that buffer.
+
+**Change** (`internal/access/nbtree/btree.go`):
+
+- `descendMode` gains `stopAboveLeaf`. On a level-1 page it returns the downlink it chose without visiting the
+  leaf. A root that is itself a leaf is still visited and returned.
+- `descendToLowerBound` sets the flag, and its callers' own leaf-level steps do the visit.
+- Writers' descents (`descendForInsert`, which must hold the leaf, and which refresh the rightmost-leaf cache) are
+  unchanged.
+- No pinned state is carried between calls: a cursor created now and read later pins its first leaf when it reads
+  it, as it already did.
+
+**Pins.**
+
+- `TestScanDescentStopsAboveLeaf` tries every bound in and around a 3 000-key two-level tree, inclusive and
+  exclusive. For each:
+  - the returned block is a leaf;
+  - it equals the full descent's leaf directly (no move-right in a quiescent tree), and still does after the
+    callers' move-right step;
+  - every 97th bound's cursor delivers exactly the keys past it.
+- `TestScanDescentOnLeafRoot` covers a single-page tree.
+- Returning the level-1 page instead of its child fails the first test.
+- `go test -race ./internal/access/nbtree/` passes.
+
+**Measured** against `88998a861` (instructions:u per query; SF0.25 clone):
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q72 | 28.53 | 27.39 (−4.0 %); wall 0.69 → 0.59 s |
+| Q17 | 2.837 | 2.802 (−1.2 %) |
+| Q25 | 2.814 | 2.792 (−0.8 %) |
+| Q54 | 5.683 | 5.659 (−0.4 %) |
+
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and
+plan shapes are identical.
+
+**Discovery.** On this binary Q72 runs 0.69 s bare but 3.04 s under `EXPLAIN (ANALYZE, TIMING OFF)`, while PG's
+EXPLAIN ANALYZE of it takes 0.87 s. Filed as M0122-0018. Until it is understood, per-node timings read off EXPLAIN
+ANALYZE on rescan-heavy plans are distorted.
+
+**Left.** The remaining per-descent cost is constant factors that PG also pays at each level: an internal page's
+binary search (`findChildBlockDirect`), the high-key test, and buffer pins.

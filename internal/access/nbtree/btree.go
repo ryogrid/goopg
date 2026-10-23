@@ -2587,7 +2587,7 @@ func (bt *BTree) descendForInsert(key []byte) (leafBlk storage.BlockNumber, path
 }
 
 func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
-	return bt.descendMode(key, forUpdate, false, true)
+	return bt.descendMode(key, forUpdate, false, true, false)
 }
 
 // descendToLowerBound descends to the leaf where a scan with lower bound lo
@@ -2598,13 +2598,26 @@ func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumbe
 // every leaf of the group only to skip all of its entries: on TPC-DS Q72 the
 // skip scan's past-the-group jumps read ~30 leaves per cursor, 28M leaf
 // searches for 0.93M cursors (M0122-0012 slice 41).
+//
+// The descent stops at the level-1 page and returns its downlink without
+// visiting the leaf (stopAboveLeaf). Both callers — rangeScanPosLeaf and the
+// ScanCursor — pin the returned block themselves and apply the leaf-level
+// steps descendMode would: the P_IGNORE skip and the high-key move-right
+// test for lo. Visiting the leaf here as well pinned it twice and ran the
+// high-key test twice per descent, where PG's _bt_search hands _bt_first the
+// leaf it moved right to and _bt_readpage reads that same buffer: one leaf
+// visit per descent. TPC-DS Q72's skip scan pays ~0.86M descents (M0122-0012
+// slice 76).
 func (bt *BTree) descendToLowerBound(lo []byte, loExclusive bool) (storage.BlockNumber, error) {
 	// A scan never walks the path back up, so it is not built.
-	leaf, _, err := bt.descendMode(lo, false, loExclusive && lo != nil, false)
+	leaf, _, err := bt.descendMode(lo, false, loExclusive && lo != nil, false, true)
 	return leaf, err
 }
 
-func (bt *BTree) descendMode(key []byte, forUpdate, nextKey, needPath bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
+// stopAboveLeaf returns the leaf a level-1 page's downlink names without
+// pinning it; the caller owns the leaf-level steps (see descendToLowerBound).
+// A root that is itself a leaf is still visited and returned.
+func (bt *BTree) descendMode(key []byte, forUpdate, nextKey, needPath, stopAboveLeaf bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
 	cur, rootLevel, fromCache := bt.cachedRoot()
 	if !fromCache {
 		if cur, err = bt.readRoot(); err != nil {
@@ -2697,6 +2710,9 @@ func (bt *BTree) descendMode(key []byte, forUpdate, nextKey, needPath bool) (lea
 		}
 		if needPath {
 			path = append(path, cur)
+		}
+		if stopAboveLeaf && op.Level == 1 {
+			return child, path, nil
 		}
 		cur = child
 	}

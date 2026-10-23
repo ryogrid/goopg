@@ -2360,6 +2360,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(fastOperandPtr\), gated on fastBinarySimple's static half \(without it, Q81 \+9 %\)\. Pinned vs evalExprSlot
       on 25 expressions incl\. every error path; mutation\-checked\.
     - Q1 122\.81 → 98\.99 Ginstr \(−19\.4 %\), wall 9\.63 → 6\.75 s \(PG 12\.4 s\); Q81 −4\.6 %; Q30 −4\.4 %; Q6 flat\.
+  - **Slice 76 — a scan's descent stops above the leaf: one leaf visit per descent LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), nbtree race PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\.
+    Doc part 7 "Slice 76"\.
+    - Q72's "20× inventory\_pkey rows" census lead was the pre\-Filter count \(M0122\-0017\): 195 ≈ PG's 9\.88 returned
+      \+ 191 removed\. Its skip scan makes 862k cursors for 436k date groups, matching PG's 898 676 Index Searches\.
+    - descendToLowerBound pinned the leaf, ran its high\-key test and unpinned it; both callers then re\-pinned it
+      and re\-ran that test\. The descent now returns the level\-1 downlink \(stopAboveLeaf\), as PG's \_bt\_search
+      hands \_bt\_first one leaf buffer\. Pinned: same leaf as the full descent for every bound; leaf\-root tree\.
+    - Q72 28\.53 → 27\.39 Ginstr \(−4\.0 %\), wall 0\.69 → 0\.59 s; Q17 −1\.2 %, Q25 −0\.8 %, Q54 −0\.4 %\.
+    - Discovery filed: M0122\-0018 \(EXPLAIN ANALYZE TIMING OFF runs Q72 4\.4× slower than the bare query\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -2401,6 +2412,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     node returns \(InstrStopNode after ExecScan's qual\), goopg counts them before the Filter\.
   - Resume point: the instrumentation wrapper around an index scan with a pushed\-down Filter \(maybeInstrument
     placement vs the filterOp the builder adds\) — count emitted rows, keep Rows Removed by Filter as is\.
+- [ ] **M0122-0018 — EXPLAIN \(ANALYZE, TIMING OFF\) runs TPC\-DS Q72 4\.4× slower than the bare query**\.
+  Kind: impl
+  Parent: M0122-0012
+  - Filed 2026\-10\-23 from M0122\-0012 slice 76\. On the SF0\.25 clone \(binary `88998a861`\) Q72 takes 0\.69 s bare
+    and 3\.04 s under `EXPLAIN \(ANALYZE, COSTS OFF, TIMING OFF\)`; PG's InstrStartNode/InstrStopNode without
+    timing only bump counters \(instrument\.c\), and PG's own EXPLAIN ANALYZE of Q72 takes 0\.87 s\.
+  - Q72 is a 9\-deep parameterised nested loop in 4 parallel participants: ~1M inner rescans of index scans, so a
+    per\-rescan or per\-node\-start instrumentation cost multiplies\. Every per\-node timing a slice reads off EXPLAIN
+    ANALYZE on such a plan is distorted until this is understood\.
+  - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
+    timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4576,6 +4598,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `f7dc0cc55`** \(M0122\-0012 slice 74 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `88998a861`** \(M0122\-0012 slice 75 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
