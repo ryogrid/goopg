@@ -221,3 +221,74 @@ Values are identical:
 - **Lateral re-open.** The lateral stream still re-opens the whole right subtree per outer row, where PG uses
   `ExecReScan`.
 - **Remaining volume.** Q23 still allocates 3.4 GB per run.
+
+## Slice 83 — a sort read only by a Gather Merge stores compact rows
+
+**Target.** Q78 allocates 3.0 GB per run in 5.7 M objects, about 500 bytes each. The allocation-sample
+attribution put the top sources at:
+
+- `materializeLiveRow` in the worker and leader sorts: slice 71's live rows, still full width with the dead cells
+  NULL;
+- `transferRowForQueueLive` in the Gather Merge (also 8.3 % of all instructions);
+- the aggregate above.
+
+Q78's join rows are about 50 columns wide, and its readers need about half a dozen. PG's tuplesort stores a
+MinimalTuple of the sort's narrow targetlist.
+
+**Change** (`internal/executor/operators.go`, `executor.go`):
+
+- **Marking.** `newGatherMergeNodeFor` marks a Sort at the root of its partial plan `compactOut`. That sort's only
+  reader is the Gather Merge, which copies every row it pulls (`transferRowForQueueLive` in `runWorker` and
+  `advanceRow` alike).
+- **Compact storage.** A live sort so marked stores each row as its live cells alone (`liveIdx` order, detached,
+  `rowChunk`-allocated), and `Next` expands it into one reused full-width row (`expandInto`; dead cells NULL, or
+  the deform poison when armed).
+- **Spills.** Before the first spill the stored rows are expanded back and compact mode ends for that Open
+  (`expandCompactRows`), so the spill files and the merge only ever hold full-width rows.
+- **Keys on detached cells.** Each row's keys are evaluated on its detached cells, laid out in the reused scratch
+  row (not on the incoming slot).
+
+**The bug the first cut had, and the invariant it exposed.**
+
+- **The failure.** Evaluating the keys on the incoming slot made TPC-H Q22 return 1 510 groups instead of 7: every
+  key was `"  "`.
+- **The cause.** `Datum.StringValue()` of an arena-backed cell is an `unsafe.String` over the producer's arena. A
+  value computed from it, such as `substr(c_phone, 1, 2)`, is a plain string with ArenaID 0 that still aliases the
+  arena, so `MaterializeArena` cannot detach it. The seq scan's next page reset rewrote it.
+- **The invariant.** Any value an operator keeps past its child's next row must be computed from detached cells.
+  The old path held to it only because it evaluated keys on a materialised row.
+- **What caught it.** The TPC-DS SF0.25 sweep (99/99, 61 ck) and the unit tests did not; the TPC-H acceptance
+  arm's digests did.
+
+**Pins.**
+
+- `TestCompactSortMatchesLiveSort`: a 600-row sort, in memory (compact) and spilling (expanded first), returns
+  the plain live sort's rows with every dead cell NULL. Two mutations fail it: no expansion before the spill, and
+  cells written at the wrong columns.
+- `TestCompactSortKeysSurviveTheArena`: an arena-page source resets its arena per row, under a `substr` key. The
+  compact sort must order exactly as the plain live sort; evaluating the keys on the incoming slot fails it,
+  reproducing Q22.
+- `TestSortForConsumerCompleteReadersStoresLiveColumns` asserts that the Gather Merge marks its root sort.
+
+**Measured** against `233658626`:
+
+| query | instructions | bytes per run |
+|---|---|---|
+| Q78 | 21.74 → 20.68 G (−4.9 %) | 3.02 → 2.22 GB (−26 %) |
+| Q47 | 19.06 → 18.32 G (−3.9 %) | — |
+| Q43, Q51, Q57, Q67, Q97 | within ±0.6 % | — |
+
+Q43's sort sits under a Partial GroupAggregate, not at the partial plan's root.
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH (it read 23 MATCH and 1 ROWS-DIFF on Q22 before the key fix);
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left** (ledger row).
+
+- **Other sorts.** A sort under any other reader still stores full-width rows.
+- **The queue.** The Gather Merge queue rows are still full width.

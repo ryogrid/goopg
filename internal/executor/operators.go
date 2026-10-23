@@ -1063,6 +1063,20 @@ type sortOp struct {
 	// liveSlot is the scratch slot the keys of a live-ingested row are
 	// evaluated on.
 	liveSlot MaterializedSlot
+	// compactOut is set by the Gather Merge that is this sort's only reader
+	// (newGatherMergeNodeFor), which copies every row it pulls. A live sort
+	// then stores compact rows — the live cells alone, in liveIdx order — as
+	// PG's tuplesort stores a MinimalTuple of the sort's narrow targetlist,
+	// and Next expands each into one reused full-width row (outRow). Before
+	// the first spill the stored rows are expanded back (compact is cleared),
+	// so the spill and merge paths only ever see full-width rows.
+	// M0122-0012 slice 83.
+	compactOut bool
+	compact    bool
+	liveIdx    []int
+	width      int // the input rows' width, from the first compact row
+	outRow     Row
+	rowChunk   rowChunk
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -1249,6 +1263,16 @@ func (o *sortOp) Open(ctx *Context) error {
 	limit := o.chunkLimit()
 	var chunkBytes int64
 	pulled := 0
+	o.compact = o.compactOut && o.live != nil && !o.packUse && !o.trackCTIDs
+	o.width = 0
+	if o.compact {
+		o.liveIdx = o.liveIdx[:0]
+		for i, l := range o.live {
+			if l {
+				o.liveIdx = append(o.liveIdx, i)
+			}
+		}
+	}
 	for {
 		// M0062-followup: a sort over millions of rows can otherwise
 		// drain the child without a cancel opportunity. ctx check
@@ -1269,6 +1293,44 @@ func (o *sortOp) Open(ctx *Context) error {
 		// across many Next() calls, so the slot's lifetime
 		// contract requires us to take ownership of an
 		// independent row. (M0071-0010 Stage B.)
+		if o.compact {
+			// The row keeps its live cells only, detached from any producer
+			// arena. The keys are evaluated on those detached cells, laid out
+			// at their columns in the reused full-width scratch row — never
+			// on the incoming slot: a key computed from an arena-backed cell
+			// (substr(c_phone, 1, 2) over a scan's page arena) can alias the
+			// arena without being marked arena-backed, and the arena is reused
+			// by the next page (TPC-H Q22 sorted every row on "  ").
+			if pulled == 0 || o.width == 0 {
+				o.width = slot.Width()
+			}
+			row := o.rowChunk.take(len(o.liveIdx))
+			for j, c := range o.liveIdx {
+				row[j] = slot.Get(c).MaterializeArena()
+			}
+			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), o.expandInto(row)
+			kv, kerr := o.sortKeyValsView(&o.liveSlot)
+			if kerr != nil {
+				return kerr
+			}
+			o.rows = append(o.rows, row)
+			o.keyvals = append(o.keyvals, kv)
+			chunkBytes += estimatedRowBytes(row)
+			pulled++
+			if chunkBytes > o.peakBytes {
+				o.peakBytes = chunkBytes
+			}
+			if chunkBytes >= limit {
+				o.expandCompactRows()
+				if err := o.flushChunk(); err != nil {
+					return err
+				}
+				o.rows = o.rows[:0]
+				o.keyvals = o.keyvals[:0]
+				chunkBytes = 0
+			}
+			continue
+		}
 		var ms *MaterializedSlot
 		if o.live != nil && !o.packUse && !o.trackCTIDs {
 			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), materializeLiveRow(slot, o.live)
@@ -1808,6 +1870,39 @@ func (o *sortOp) lessRows(a, b Row) bool {
 
 // flushChunk sorts the current in-memory chunk and writes it to a
 // new spill file. The caller must reset o.rows after the call.
+// expandInto writes a compact row's cells into the reused full-width output
+// row and returns it: the live cells at their columns, every other cell NULL —
+// or the deform poison when armed, as materializeLiveRow leaves it.
+func (o *sortOp) expandInto(compact Row) Row {
+	w := o.width
+	if len(o.outRow) != w {
+		o.outRow = make(Row, w)
+		if seqScanDeformPoison {
+			dead := deformPoisonDatum()
+			for i := range o.outRow {
+				o.outRow[i] = dead
+			}
+		}
+	}
+	for j, c := range o.liveIdx {
+		o.outRow[c] = compact[j]
+	}
+	return o.outRow
+}
+
+// expandCompactRows turns the stored compact rows back into full-width ones
+// and leaves compact mode for the rest of this Open: a spilled chunk and the
+// merge that reads it back key on full-width rows.
+func (o *sortOp) expandCompactRows() {
+	if !o.compact {
+		return
+	}
+	for i, r := range o.rows {
+		o.rows[i] = append(Row(nil), o.expandInto(r)...)
+	}
+	o.compact = false
+}
+
 func (o *sortOp) flushChunk() error {
 	if o.packUse {
 		return o.flushPackedChunk()
@@ -1959,6 +2054,9 @@ func (o *sortOp) Next() (TupleSlot, error) {
 			return nil, EOF
 		}
 		row := o.rows[o.idx]
+		if o.compact {
+			row = o.expandInto(row)
+		}
 		slot := SlotFromRow(o.Schema(), row)
 		// Re-attach the per-row TID side-channel so a parent LockRows can stamp
 		// row locks (ORDER BY ... FOR UPDATE). M0118-0003. Maintained only

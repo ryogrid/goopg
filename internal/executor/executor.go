@@ -728,11 +728,35 @@ func newGatherMergeNode(p *optimizer.GatherMerge, bound int) *gatherMergeOp {
 func newGatherMergeNodeFor(p *optimizer.GatherMerge, bound int, readers []optimizer.Expr) *gatherMergeOp {
 	workerMergeBound := deformBoundBelow(p, bound)
 	return newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
+		var op Operator
+		var err error
 		if readers != nil {
-			return buildCompleteChild(p.Child, workerMergeBound, readers, scope)
+			op, err = buildCompleteChild(p.Child, workerMergeBound, readers, scope)
+		} else {
+			op, err = buildNode(p.Child, workerMergeBound, scope)
 		}
-		return buildNode(p.Child, workerMergeBound, scope)
+		// A Sort at the root of the partial plan is read only by the Gather
+		// Merge, which copies every row it pulls (transferRowForQueueLive, in
+		// runWorker and advanceRow alike): the sort may keep compact rows and
+		// emit through one reused row (sortOp.compactOut, M0122-0012 slice 83).
+		if so := unwrapSortOp(op); so != nil {
+			so.compactOut = true
+		}
+		return op, err
 	})
+}
+
+// unwrapSortOp is unwrapSeqScanOp for a *sortOp.
+func unwrapSortOp(op Operator) *sortOp {
+	switch o := op.(type) {
+	case *sortOp:
+		return o
+	case *instrumentedOp:
+		if so, ok := o.inner.(*sortOp); ok {
+			return so
+		}
+	}
+	return nil
 }
 
 // newGatherNode builds a Gather whose workers each construct their own tree
