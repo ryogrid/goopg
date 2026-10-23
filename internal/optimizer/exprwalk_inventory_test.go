@@ -370,6 +370,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
 	"subplan_lower.go:rewriteSublinkPlan":        walkerPending, // 6 of 32 arms
+	"subplan_lower.go:selfContainedPlan":       walkerPending, // 7 of 32 arms — M0122-0012 slice 91, excludedRefsWithin's sibling
 	// R33 (K44): the sublink-graft classifiers — decide-and-return over
 	// the five/six sublink shapes, no descent (descent rides
 	// exprChildSlots via spliceField). Classifier role needs no

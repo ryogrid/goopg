@@ -74,3 +74,82 @@ Values are identical:
 - spotcheck PASS;
 - RegressSuite PASS;
 - TestPort\_Isolation PASS.
+
+## Slice 91 — a correlated sublink over a CTE scan is lowered, so its result cache keys on the parameters
+
+**Target.** TPC-DS Q1, Q30 and Q81 filter a CTE scan inside a correlated scalar sublink:
+`ctr1.ctr_total_return > (SELECT avg(ctr_total_return) * 1.2 FROM ctr ctr2 WHERE ctr1.k = ctr2.k)`. After slice 90,
+Q81 still ran 31 G instructions.
+
+EXPLAIN ANALYZE showed why: `SubPlan 2 (calls=6893 rebuilds=6893 hits=0 misses=6893)`. The sublink was not lowered to
+PARAM\_EXEC slots (D4.1, `subplan_lower.go`), so its result cache was keyed by the whole outer row (`subqueryCacheKey`)
+and missed on every call. Each call rescanned the whole CTE.
+
+**Root cause.** The lowering walk (`lowerTraverseNodeHooked`) had no CTEScan arm, and it bails on every node kind it
+does not model, as its soundness contract requires. A sublink over a CTE scan therefore always stayed on the
+OuterRows stack path.
+
+The CTE body (`CTEScan.Child`) cannot simply be walked, for two reasons:
+
+- it is shared by every reference to the CTE (the executor fills its row cache once per CTE), so a rewrite inside it
+  would rewrite every reference;
+- Q81's body holds a parameterised nested loop whose inner index probe reads the join's left row as a Level-1
+  `OuterColumnRef`. That reference is local to the body, but a flat "no outer refs" test (`excludedRefsWithin(body,
+  0)`, the first attempt) rejects it.
+
+**Change** (`internal/optimizer`).
+
+- **`selfContainedPlan(plan, frames)`** (subplan\_lower.go) is a non-mutating check on the lowering walk itself, so an
+  unmodelled kind still refuses:
+  - an `OuterColumnRef` must have `Level <= frames`;
+  - a lateral Join's right child is walked one frame deeper, as `keptRebase.rebaseNode` walks it, because the join
+    pushes its left row there;
+  - a nested sublink's plan is walked one frame deeper, and an IN's operand and list in the current frame;
+  - an `ExecParamRef` refuses, because its slot's binder cannot be told from here.
+- **The CTEScan arm** of `lowerTraverseNodeHooked` (subplan\_lower\_walk.go) returns `selfContainedPlan(x.Child, 0)`
+  and never enters the body. The analysis and rewrite phases, and the keptRebase pass, all treat a self-contained CTE
+  scan as a leaf.
+
+PG's `SS_replace_correlation_vars` turns every correlated Var into a PARAM\_EXEC regardless of what lies below. This
+brings goopg's lowering closer to it, and executor caching is unchanged.
+
+**Plans are unchanged.** Census on this tree: TPC-H 22/22, SF0.25 99/99 and SF1 99/99 MATCH, and the captured plan
+text is byte-identical to the previous capture's (only headers differ). The fire-set gate saw no changed query.
+`EA-RATCHET: PASS`.
+
+**Pins.**
+
+- `TestLowerScalarSublinkOverCTEScan` (optimizer): a sublink over a MATERIALIZED CTE scan is lowered to one param
+  whose Arg is the host's column, and the CTE body carries no ExecParamRef or OuterColumnRef afterwards.
+- `TestSublinkOverCorrelatedCTEStaysOnStack`: a CTE defined inside the sublink over the outer row keeps the sublink
+  correlated and unlowered. Lowered, it would have no params and would be marked non-correlated, so one cached result
+  would serve every outer row. A CTEScan arm that accepts without the check fails this test.
+- `TestSelfContainedPlan` covers ten plan shapes: local and escaping refs, lateral and plain joins, nested sublinks,
+  ExecParamRef, and an unmodelled node.
+- `TestCorrelatedSublinkOverCTEValues` (executor) checks Q81's shape over 60 rows, including NULL keys and bpchar
+  padding, against values computed in Go, for both the lowered query and the stack-path query. The accept-always
+  mutation makes the stack-path query return wrong rows there too.
+- `selfContainedPlan` is pinned `walkerPending` in `exprSwitchInventory`, with a ledger row.
+
+**Measured** against `4cf358ae6`:
+
+| query | instructions before | instructions after | warm wall time | release PG |
+|---|---|---|---|---|
+| Q1 | 99.2 G | 1.00 G | 0.108 s | 7.20 s |
+| Q81 | 31.4 G | 0.99 G | 0.102 s | 2.29 s |
+| Q30 | 7.25 G | 0.49 G | 0.054 s | 0.52 s |
+
+Q81's SubPlan now shows `hits=6841 misses=52`, one miss per distinct state.
+
+Values are identical:
+
+- sorted full output of Q1, Q30 and Q81 equals the `:65438` reference (SELECT only);
+- sf025 PASS=99 (61 ck), and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Still bailing** (ledger row). A sublink whose plan, or whose CTE body, holds another unmodelled kind still stays on
+the stack path: WindowAgg, SetOp, RecursiveUnion and ProjectSet.

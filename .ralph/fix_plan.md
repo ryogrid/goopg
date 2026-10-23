@@ -2516,6 +2516,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Target: Q81 \(indexbytebody 26 % from plainCompareString's IndexByte on two\-letter state codes; StringValue
       not inlinable\)\. Byte\-loop plainCompareString \+ inlinable stringValueInline\.
     - Q81 −15\.1 %, Q30 −14\.3 %, Q59 −1\.9 %, Q2 −0\.6 % instructions\. Rule \(b\): ≥ 3 %\.
+  - **Slice 91 — a correlated sublink over a CTE scan is lowered, so its result cache keys on the parameters LANDED
+    2026\-10\-24\.**
+    Movement: none — plan text byte\-identical \(census 22/22, 99/99, 99/99 MATCH; fire\-set no changed query;
+    EA\-RATCHET PASS\)\. Values: Q1/Q30/Q81 sorted output == :65438; sf025 PASS=99 \(61 ck\), poison sf025 PASS;
+    executor pkg with poison PASS; acceptance 24 MATCH; spotcheck PASS; RegressSuite PASS; Isolation PASS\. Doc part 9
+    "Slice 91"; ledger row \(remaining unmodelled kinds; selfContainedPlan hand\-written switch\)\.
+    - Target: Q81 SubPlan `calls=6893 hits=0`: the D4\.1 lowering walk had no CTEScan arm, so the sublink stayed on
+      the OuterRows stack and its cache was keyed by the whole outer row\.
+    - selfContainedPlan: non\-mutating body check \(lateral right / nested sublink one frame deeper, ExecParamRef
+      refused\); CTEScan arm never enters the shared body\.
+    - Q1 99\.2 → 1\.0 G instructions \(0\.108 s vs release PG 7\.2 s\), Q81 31\.4 → 0\.99 G, Q30 7\.25 → 0\.49 G\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4848,6 +4859,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-24 — **exhausted at `e8bf90456`** \(M0122\-0012 slice 89 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261024b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `4cf358ae6`** \(M0122\-0012 slice 90 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
