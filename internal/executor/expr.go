@@ -33,7 +33,6 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
-	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/utils/adt/datetime"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -1505,7 +1504,7 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			// Negate a numeric/float value. M0097-0003.
 			if d.Flags&flagBigNumeric != 0 {
 				neg := new(big.Int).Neg(d.NumericBigValue())
-				return newBigNumericInCtx(mmgr.Perm(), neg, d.Scale), nil
+				return NewNumericBigDatum(neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
 		case KindInterval:
@@ -10542,6 +10541,16 @@ func evalInExprScalarRow(x *optimizer.InExpr, slot SlotView, ctx *Context) (Datu
 	// (M0122-0012 slice 43): for these kinds compareEq(operand, item) is
 	// compareDatum(operand, item), which coerces the item itself — see
 	// unknown_literal.go.
+	// A literal list of nine or more items is probed through a hash set,
+	// as PG hashes such a ScalarArrayOp (M0122-0012 slice 50; TPC-DS Q8's
+	// 400 zip codes): exact for the pairings it serves, the loop otherwise.
+	if litList != nil && len(values) >= minHashedInListItems {
+		if h := litList.hashed(opBP, opLit); h.ok {
+			if res, served := h.probe(operand, x.Negated); served {
+				return res, nil
+			}
+		}
+	}
 	coerced := litList.coercedItems(operand.Kind, opBP, opLit)
 	sawNull := false
 	for i, v := range values {
@@ -10802,6 +10811,9 @@ type inListConst struct {
 	// (coercedItems, unknown_literal.go).
 	coerced     []Datum
 	coercedKind DatumKind
+	// hash is the list as a hash set for the plain-equality loop
+	// (inListConst.hashed, in_list_hash.go).
+	hash inListHash
 }
 
 // inListItems returns an IN's items with the per-item bpchar metadata
@@ -10895,15 +10907,13 @@ func inListItemsEval(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, []int
 	//     output column type;
 	//   - a single-element array-literal expansion gives every element
 	//     the source expression's classification.
+	if x.Plan != nil {
+		itemBP, itemLit := subqueryInListMeta(x, len(values), ctx)
+		return values, itemBP, itemLit, nil
+	}
 	itemBP := make([]int64, len(values))
 	itemLit := make([]bool, len(values))
 	switch {
-	case x.Plan != nil:
-		if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
-			for i := range itemBP {
-				itemBP[i] = 1
-			}
-		}
 	case len(values) == len(x.List):
 		for i, e := range x.List {
 			itemBP[i] = declaredBpcharTypmod(e)
@@ -10923,6 +10933,55 @@ func inListItemsEval(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, []int
 // collectInValues returns the inner set for `IN (...)`. When
 // the source is a subquery, drains it; the subquery must have
 // exactly one column. Otherwise evaluates the value list.
+// inListMeta is a subquery IN's per-item comparison metadata: every item
+// shares the inner plan's first output column type, so itemBP is that
+// column's bpchar flag throughout and itemLit is false throughout.
+type inListMeta struct {
+	itemBP  []int64
+	itemLit []bool
+}
+
+// subqueryInListMeta returns n items of a subquery IN's metadata — what
+// inListItemsEval built for every evaluated row by allocating two slices at
+// the subquery's result size (TPC-DS Q35's EXISTS→ANY conversions over
+// thousands of customer keys spent ~13 % of their instructions in those
+// allocations and the heap profiler's stack walks they triggered). The
+// values are uniform, so one slice per InExpr — kept on the Context, grown
+// when a longer result arrives — serves every row through a prefix. Callers
+// only read the metadata.
+func subqueryInListMeta(x *optimizer.InExpr, n int, ctx *Context) ([]int64, []bool) {
+	var bp int64
+	if out := x.Plan.Output(); len(out) > 0 && bpcharCatalogType(out[0].Type) {
+		bp = 1
+	}
+	build := func(size int) *inListMeta {
+		m := &inListMeta{itemBP: make([]int64, size), itemLit: make([]bool, size)}
+		if bp != 0 {
+			for i := range m.itemBP {
+				m.itemBP[i] = bp
+			}
+		}
+		return m
+	}
+	if ctx == nil {
+		m := build(n)
+		return m.itemBP, m.itemLit
+	}
+	m := ctx.inListPlanMeta[x]
+	if m == nil || len(m.itemBP) < n {
+		old := 0
+		if m != nil {
+			old = len(m.itemBP)
+		}
+		m = build(max(n, 2*old))
+		if ctx.inListPlanMeta == nil {
+			ctx.inListPlanMeta = make(map[*optimizer.InExpr]*inListMeta)
+		}
+		ctx.inListPlanMeta[x] = m
+	}
+	return m.itemBP[:n:n], m.itemLit[:n:n]
+}
+
 func collectInValues(x *optimizer.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
 		// Check for query cancellation before each SubPlan evaluation.

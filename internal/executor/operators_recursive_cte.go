@@ -1,7 +1,8 @@
 package executor
 
 import (
-	"strings"
+	"bytes"
+	"strconv"
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -249,7 +250,19 @@ func rowKeyExcluding(row Row, skip map[int]bool) string {
 // trims == nil keeps the historical byte-exact key. M0146 bpchar hash
 // parity.
 func rowKeyTrimmed(row Row, skip map[int]bool, trims []bool) string {
-	var sb strings.Builder
+	return string(appendRowKeyTrimmed(nil, row, skip, trims))
+}
+
+// appendRowKeyTrimmed appends rowKeyTrimmed's key to buf: per kept column
+// its Format() text — trailing decimal zeros stripped when it holds a '.' —
+// or "<NULL>", '|'-separated. An int, string or byte column appends its text
+// directly, and an int64-lane numeric appends formatNumeric's text
+// (appendFormatNumeric) — exactly Format's result for those kinds — instead of building and
+// copying a string; every other kind appends Format(). A caller that reuses
+// buf and looks the key up as map[string(buf)] allocates only for a key it
+// keeps (M0122-0012 slice 70: TPC-DS Q75's UNION DISTINCT keyed ~485 K rows).
+func appendRowKeyTrimmed(buf []byte, row Row, skip map[int]bool, trims []bool) []byte {
+	start := len(buf)
 	for i, d := range row {
 		if skip[i] {
 			continue
@@ -257,28 +270,49 @@ func rowKeyTrimmed(row Row, skip map[int]bool, trims []bool) string {
 		if i < len(trims) && trims[i] {
 			d = trimStringDatum(d)
 		}
-		if sb.Len() > 0 {
-			sb.WriteByte('|')
+		if len(buf) > start {
+			buf = append(buf, '|')
 		}
 		if d.IsNull() {
-			sb.WriteString("<NULL>")
-		} else {
-			s := d.Format()
-			// Strip trailing zeros after the decimal point so that "0.0",
-			// "0.00", "0.000" and "0" all canonicalise to "0". This is
-			// necessary when the two sides of a UNION have different Go
-			// kinds (KindNumeric vs KindInt) for the same logical value.
-			if strings.Contains(s, ".") {
-				s = strings.TrimRight(s, "0")
-				s = strings.TrimRight(s, ".")
-				if s == "" || s == "-" {
-					s = "0" // edge-case: "-0." → "-0" → "-" → "0"
-				}
+			buf = append(buf, "<NULL>"...)
+			continue
+		}
+		seg := len(buf)
+		switch d.Kind {
+		case KindInt:
+			buf = strconv.AppendInt(buf, d.Int, 10)
+		case KindString:
+			buf = append(buf, d.StringValue()...)
+		case KindBytes:
+			buf = append(buf, d.BytesValue()...)
+		case KindNumeric:
+			if isBigNumeric(d) {
+				buf = append(buf, d.Format()...)
+			} else {
+				buf = appendFormatNumeric(buf, d.Int, d.Scale)
 			}
-			sb.WriteString(s)
+		default:
+			buf = append(buf, d.Format()...)
+		}
+		// Strip trailing zeros after the decimal point so that "0.0",
+		// "0.00", "0.000" and "0" all canonicalise to "0". This is
+		// necessary when the two sides of a UNION have different Go
+		// kinds (KindNumeric vs KindInt) for the same logical value.
+		if bytes.IndexByte(buf[seg:], '.') >= 0 {
+			end := len(buf)
+			for end > seg && buf[end-1] == '0' {
+				end--
+			}
+			for end > seg && buf[end-1] == '.' {
+				end--
+			}
+			buf = buf[:end]
+			if end == seg || (end == seg+1 && buf[seg] == '-') {
+				buf = append(buf[:seg], '0') // edge-case: "-0." → "-0" → "-" → "0"
+			}
 		}
 	}
-	return sb.String()
+	return buf
 }
 
 // itoa converts an int to its decimal string representation.

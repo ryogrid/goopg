@@ -96,6 +96,12 @@ type gatherMergeOp struct {
 	// when no instrumentation scope was stored.
 	scope        *instrumenter
 	workerTables []nodeStatsTable
+
+	// liveCols, when set, marks the only columns of the worker (and the
+	// leader's own) rows that the merge keys and the consumers above read;
+	// only those are transferred, the rest arrive NULL (gatherOp.liveCols,
+	// transferRowForQueueLive). nil = every column. M0122-0012 slice 63.
+	liveCols []bool
 }
 
 // EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
@@ -308,6 +314,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	}
 
 	batch := make([]Row, 0, gatherBatchRows)
+	var chunk rowChunk
 	var tids []queueTID
 	if o.wantCTIDs {
 		tids = make([]queueTID, 0, gatherBatchRows)
@@ -345,7 +352,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		if o.wantCTIDs {
 			tids = append(tids, slotQueueTID(slot))
 		}
-		batch = append(batch, transferRowForQueue(slot))
+		batch = append(batch, transferRowForQueueLive(slot, o.liveCols, &chunk))
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -401,7 +408,7 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		if o.wantCTIDs {
 			src.curTID = slotQueueTID(slot)
 		}
-		src.cur = transferRowForQueue(slot)
+		src.cur = transferRowForQueueLive(slot, o.liveCols, nil)
 		return true, nil
 	}
 	for len(src.pending) == 0 {
@@ -461,12 +468,16 @@ func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatumTyped(av, bv, 0, k.Expr)
-		if err != nil {
-			if *errp == nil {
-				*errp = err
+		// The sort comparator's fast path (sortOp.lessKeyVals).
+		cmp, ok := fastCompareDatum(&av, &bv)
+		if !ok {
+			var err error
+			if cmp, err = compareDatumTyped(av, bv, 0, k.Expr); err != nil {
+				if *errp == nil {
+					*errp = err
+				}
+				return false
 			}
-			return false
 		}
 		if cmp == 0 {
 			continue

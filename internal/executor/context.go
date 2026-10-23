@@ -150,6 +150,11 @@ type Context struct {
 	// inListConsts holds each literal value-list IN's evaluated items for
 	// the statement (inListItems, expr.go).
 	inListConsts map[*optimizer.InExpr]*inListConst
+	// inListPlanMeta holds each subquery IN's per-item comparison metadata
+	// (inListItemsEval): uniform across the items, so it is built once and
+	// resliced per row instead of allocated at the subquery's result size
+	// for every row (M0122-0012 slice 65).
+	inListPlanMeta map[*optimizer.InExpr]*inListMeta
 
 	// TriggerDepth is pg_trigger_depth(): the number of trigger invocations
 	// on the stack. executePLpgSQLTriggerBody gives its child context one

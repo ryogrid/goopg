@@ -38,6 +38,25 @@ type btreeSkipEnum struct {
 	gPivot   []byte
 	gReached bool
 	gPassed  bool
+
+	// vals is groupBounds' reused value buffer (prefix datums, then the
+	// bound columns' values).
+	vals []Datum
+	// restImgs are the bound columns' attribute images, encoded once per
+	// Rescan for groupBoundsRaw (nil when one cannot be, e.g. a TOAST
+	// pointer); rawImgs / rawNulls are its reused per-group buffers.
+	restImgs     [][]byte
+	restImgsDone bool
+	rawImgs      [][]byte
+	rawNulls     []bool
+	// probeTmpl / pivotTmpl are groupBoundsFixed's per-Rescan templates for
+	// a skip prefix of tmplS attributes (nil when the probe is not all
+	// fixed-width), and tmplOffs the prefix attributes' offsets in them.
+	tmplDone  bool
+	tmplS     int
+	probeTmpl []byte
+	pivotTmpl []byte
+	tmplOffs  []int
 }
 
 // init evaluates the bound columns ONCE per Rescan — the same eval timing
@@ -176,30 +195,251 @@ func (e *btreeSkipEnum) next(ctx *Context, tree *nbtree.BTree, idx *catalog.Inde
 // its pivot, the prefix alone: an entry is still in the group exactly while
 // CompareHighBound(entry, pivot) <= 0, and the next group starts strictly past it.
 func (e *btreeSkipEnum) groupBounds(ctx *Context, idx *catalog.Index, s int, key []byte, pos int, op string) (probe, pivot []byte, err error) {
+	if probe, pivot, ok, rerr := e.groupBoundsRaw(idx, s, key, pos); rerr != nil {
+		return nil, nil, rerr
+	} else if ok {
+		return probe, pivot, nil
+	}
 	datums, derr := pgIndexTupleKeyDatums(e.desc, e.keyCols, key)
 	if derr != nil {
 		return nil, nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
 			"%s: skip scan on index %q could not decode a prefix entry: %v", op, idx.Name, derr)}
 	}
-	parts := make([]indexProbeKeyPart, 0, s+len(e.rest))
-	for i := 0; i < s; i++ {
-		parts = append(parts, indexProbeKeyPart{col: e.keyCols[i], val: datums[i], pos: pos})
+	// The key images are formed straight from the enumeration's own
+	// descriptor and key columns (M0122-0012 slice 49): they are what
+	// ctx.indexProbeKey resolves on every call — pgIndexKeyDesc(idx) and
+	// pgIndexKeyColumns(idx), the latter a by-name column lookup that
+	// allocates — and a part list built from keyCols in order always passes
+	// its prefix check. The bytes and the error text are indexProbeKey's.
+	n := s + len(e.rest)
+	e.vals = append(e.vals[:0], datums[:s]...)
+	for _, r := range e.rest {
+		e.vals = append(e.vals, r.val)
 	}
-	probe, encErr := ctx.indexProbeKey(idx, append(parts, e.rest...))
-	if encErr != nil {
-		return nil, nil, encErr
+	if probe, err = e.probeKey(idx, e.vals[:n], pos); err != nil {
+		return nil, nil, err
 	}
-	pivot, encErr = ctx.indexProbeKey(idx, parts)
-	if encErr != nil {
-		return nil, nil, encErr
+	if pivot, err = e.probeKey(idx, e.vals[:s], pos); err != nil {
+		return nil, nil, err
 	}
 	return probe, pivot, nil
+}
+
+// groupBoundsRaw forms the group's probe and pivot from the entry's own
+// attribute images (M0122-0012 slice 52), as PG's skip array takes the
+// skipped attribute's datum straight from the index tuple
+// (_bt_advance_array_keys, nbtutils.c) instead of decoding and re-encoding
+// it. The prefix images are deformed once and handed to FormPGIndexTuple with
+// the bound columns' images (encoded once per Rescan); FormPGIndexTuple
+// re-forms an inline image into the bytes it forms from the decoded value
+// encoded afresh (nbtree.PGIndexImageInline), so the keys are groupBounds'.
+// ok is false — the caller takes the decoding path, which also reports the
+// errors — for an entry that is not a full-arity leaf tuple, a prefix value
+// stored compressed or out of line, or a bound value that is a TOAST pointer.
+func (e *btreeSkipEnum) groupBoundsRaw(idx *catalog.Index, s int, key []byte, pos int) (probe, pivot []byte, ok bool, err error) {
+	nkey := e.desc.NKeyAtts()
+	phys := e.desc.Physical()
+	n := s + len(e.rest)
+	if n > nkey || len(key) < nbtree.SizeOfIndexTupleData || int(nbtree.BTreeTupleGetNAtts(key, uint16(nkey))) != nkey {
+		return nil, nil, false, nil
+	}
+	if !e.restImgsDone {
+		e.restImgsDone = true
+		e.restImgs = make([][]byte, 0, len(e.rest))
+		for i, r := range e.rest {
+			if r.val.Kind == KindToastPointer {
+				e.restImgs = nil
+				break
+			}
+			img, encErr := encodeValuePG(e.keyCols[s+i].Type, r.val)
+			if encErr != nil {
+				e.restImgs = nil
+				break
+			}
+			e.restImgs = append(e.restImgs, img)
+		}
+	}
+	if len(e.restImgs) != len(e.rest) {
+		return nil, nil, false, nil
+	}
+	if probe, pivot, fixed := e.groupBoundsFixed(idx, s, key, nkey, phys, pos); fixed {
+		return probe, pivot, true, nil
+	}
+	imgs, nulls, derr := nbtree.DeformPGIndexTuple(key, phys, s)
+	if derr != nil {
+		return nil, nil, false, nil
+	}
+	for i := 0; i < s; i++ {
+		if !nulls[i] && !nbtree.PGIndexImageInline(phys[i], imgs[i]) {
+			return nil, nil, false, nil
+		}
+	}
+	e.rawImgs = append(append(e.rawImgs[:0], imgs...), e.restImgs...)
+	e.rawNulls = append(e.rawNulls[:0], nulls...)
+	for range e.rest {
+		e.rawNulls = append(e.rawNulls, false)
+	}
+	if probe, err = e.formKey(idx, phys[:n], e.rawImgs[:n], e.rawNulls[:n], nkey, pos); err != nil {
+		return nil, nil, false, err
+	}
+	if pivot, err = e.formKey(idx, phys[:s], e.rawImgs[:s], e.rawNulls[:s], nkey, pos); err != nil {
+		return nil, nil, false, err
+	}
+	return probe, pivot, true, nil
+}
+
+// groupBoundsFixed is groupBoundsRaw for a probe whose attributes are all
+// fixed-width (M0122-0012 slice 56). FormPGIndexTuple lays such a key out
+// with no null bitmap, every attribute at its fixed offset
+// (nbtree.PGIndexFixedAttrOffsets) and nothing else value-dependent, so the
+// probe and pivot are formed once per Rescan as templates — the bound
+// columns' images in place, the prefix attributes zero — and each group
+// copies the entry's prefix attribute bytes into a fresh copy of both. An
+// entry with no null bitmap stores those attributes at the same offsets.
+// The bytes are therefore groupBoundsRaw's (pinned), without its per-group
+// deform and two generic tuple formations; PG's skip array likewise just
+// takes the datum (_bt_advance_array_keys). ok is false — groupBoundsRaw's
+// general path runs — for a variable-width probe attribute, an entry with a
+// null bitmap or a t_info size short of the prefix, or a template that cannot
+// be formed (whose error the general path reports).
+func (e *btreeSkipEnum) groupBoundsFixed(idx *catalog.Index, s int, key []byte, nkey int, phys []nbtree.PGIndexAttr, pos int) (probe, pivot []byte, ok bool) {
+	if s == 0 {
+		return nil, nil, false
+	}
+	if !e.tmplDone || e.tmplS != s {
+		e.tmplDone, e.tmplS = true, s
+		e.probeTmpl, e.pivotTmpl, e.tmplOffs = nil, nil, nil
+		n := s + len(e.rest)
+		offs, fixed := nbtree.PGIndexFixedAttrOffsets(phys[:n])
+		if !fixed {
+			return nil, nil, false
+		}
+		imgs, nulls := make([][]byte, n), make([]bool, n)
+		for i := 0; i < s; i++ {
+			imgs[i] = make([]byte, phys[i].Len)
+		}
+		copy(imgs[s:], e.restImgs)
+		pr, err := e.formKey(idx, phys[:n], imgs, nulls, nkey, pos)
+		if err != nil {
+			return nil, nil, false
+		}
+		pv, err := e.formKey(idx, phys[:s], imgs[:s], nulls[:s], nkey, pos)
+		if err != nil {
+			return nil, nil, false
+		}
+		e.probeTmpl, e.pivotTmpl, e.tmplOffs = pr, pv, offs[:s]
+	}
+	if e.probeTmpl == nil || nbtree.PGIndexTupleHasNulls(key) {
+		return nil, nil, false
+	}
+	size := nbtree.PGIndexTupleSize(key)
+	if size > len(key) || e.tmplOffs[s-1]+int(phys[s-1].Len) > size {
+		return nil, nil, false
+	}
+	np := len(e.probeTmpl)
+	buf := make([]byte, np+len(e.pivotTmpl))
+	probe, pivot = buf[:np:np], buf[np:]
+	copy(probe, e.probeTmpl)
+	copy(pivot, e.pivotTmpl)
+	for i, o := range e.tmplOffs {
+		end := o + int(phys[i].Len)
+		copy(probe[o:end], key[o:end])
+		copy(pivot[o:end], key[o:end])
+	}
+	return probe, pivot, true
+}
+
+// formKey is pgIndexTupleKey's tail over ready attribute images: one
+// FormPGIndexTuple with the zero heap TID, stamped as a pivot of its own
+// attribute count when it names fewer than every key attribute, and checked
+// against the leaf item-size limit — with indexProbeKey's error text.
+func (e *btreeSkipEnum) formKey(idx *catalog.Index, phys []nbtree.PGIndexAttr, imgs [][]byte, nulls []bool, nkey, pos int) ([]byte, error) {
+	raw, err := nbtree.FormPGIndexTuple(phys, imgs, nulls, storage.ItemPointer{})
+	if err == nil && len(phys) < nkey {
+		err = nbtree.BTreeTupleSetNAtts(raw, uint16(len(phys)), false)
+	}
+	if err == nil {
+		err = nbtree.CheckPGBTItemSize(len(raw), true)
+	}
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: index %q: %v", idx.Name, err)}
+	}
+	return raw, nil
+}
+
+// probeKey is ctx.indexProbeKey's tuple-format arm for a part list naming
+// the first len(vals) key columns: one pgIndexTupleKey image with the zero
+// heap TID.
+func (e *btreeSkipEnum) probeKey(idx *catalog.Index, vals []Datum, pos int) ([]byte, error) {
+	key, _, err := pgIndexTupleKey(e.desc, e.keyCols[:len(vals)], vals, storage.ItemPointer{})
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf(
+			"indexProbeKey: index %q: %v", idx.Name, err)}
+	}
+	return key, nil
 }
 
 // canWalk reports whether the leaf walk applies: the tuple format, whose
 // entries the walk can compare against a group probe. The blob format keeps
 // the per-group descents of next.
 func (e *btreeSkipEnum) canWalk() bool { return e.desc != nil }
+
+// skipPos is one leaf entry's comparison with its group's probe
+// (nbtree.BTree.CompareBoundAttrs, M0122-0012 slice 57). The probe is the
+// pivot's attributes followed by the bound columns, so the one pass answers
+// all three of walkLeaf's per-entry questions, each exactly as the bound
+// comparison it replaces would: pastGroup is CompareHighBound(key, pivot) > 0,
+// beforeProbe CompareLowBound(key, probe) < 0, pastProbe
+// CompareHighBound(key, probe) > 0. Without a usable pass (ok false: no probe
+// yet, a comparison error, an entry storing fewer attributes than the probe)
+// and in the one case the attributes leave open — an entry equal to a
+// full-arity probe, which only the heap-TID tiebreak orders — the
+// per-bound call answers.
+type skipPos struct {
+	res, at, nKey, nProbe int
+	ok                    bool
+}
+
+func probePos(tree *nbtree.BTree, key, probe []byte) skipPos {
+	if probe == nil {
+		return skipPos{}
+	}
+	res, at, nKey, nProbe, ok := tree.CompareBoundAttrs(key, probe)
+	return skipPos{res: res, at: at, nKey: nKey, nProbe: nProbe, ok: ok && nProbe > 0 && nKey >= nProbe}
+}
+
+// pastGroup: the entry's first s attributes order after the pivot's — the
+// probe's first s. Equal on them, compareHigh calls the entry inside the
+// pivot (a bound naming a prefix is plus infinity beyond it).
+func (p skipPos) pastGroup(tree *nbtree.BTree, key, pivot []byte, s int) bool {
+	if p.ok && s <= p.nProbe {
+		return p.at < s && p.res > 0
+	}
+	return tree.CompareHighBound(key, pivot) > 0
+}
+
+// beforeProbe: a differing attribute decides; equal on every probe attribute,
+// a longer entry orders after the truncated probe (minus infinity beyond it).
+func (p skipPos) beforeProbe(tree *nbtree.BTree, key, probe []byte) bool {
+	if p.ok {
+		if p.res != 0 {
+			return p.res < 0
+		}
+		if p.nKey > p.nProbe {
+			return false
+		}
+	}
+	return tree.CompareLowBound(key, probe) < 0
+}
+
+// pastProbe: compareHigh is heap-TID blind, so equal attributes are inside.
+func (p skipPos) pastProbe(tree *nbtree.BTree, key, probe []byte) bool {
+	if p.ok {
+		return p.res > 0
+	}
+	return tree.CompareHighBound(key, probe) > 0
+}
 
 // walkLeaf is the skip scan as PG 18 runs it (M0145-0008af): one leaf page
 // per call, every entry checked against the current prefix group's probe,
@@ -243,7 +483,8 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 	jumpExcl, checkedBefore, checkedPassed := false, false, false
 	ok, nerr := cur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
 		entries++
-		if e.gPivot == nil || tree.CompareHighBound(key, e.gPivot) > 0 {
+		at := probePos(tree, key, e.gProbe)
+		if e.gPivot == nil || at.pastGroup(tree, key, e.gPivot, s) {
 			probe, pivot, gerr := e.groupBounds(ctx, idx, s, key, pos, op)
 			if gerr != nil {
 				return false, gerr
@@ -252,8 +493,9 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			e.gReached, e.gPassed = false, false
 			checkedBefore, checkedPassed = false, false
 			newGroups++
+			at = probePos(tree, key, e.gProbe)
 		}
-		if !e.gPassed && tree.CompareLowBound(key, e.gProbe) < 0 {
+		if !e.gPassed && at.beforeProbe(tree, key, e.gProbe) {
 			// Before the group's probe. If even the leaf's final entry is,
 			// no entry left here reaches it: descend to the probe now, as
 			// _bt_advance_array_keys starts a new primitive scan when the
@@ -267,7 +509,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			}
 			return true, nil
 		}
-		if !e.gPassed && tree.CompareHighBound(key, e.gProbe) > 0 {
+		if !e.gPassed && at.pastProbe(tree, key, e.gProbe) {
 			e.gPassed = true
 		}
 		if e.gPassed {

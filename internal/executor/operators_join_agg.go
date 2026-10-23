@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"os"
 	"sort"
 	"strconv"
@@ -659,6 +660,16 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	}
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(ctx, sb)
+		// PG's workers each build the table privately and take the
+		// empty-inner exit on it; the shared table is that same table,
+		// so a participant leaves its share of the outer side unscanned
+		// too (M0122-0012 slice 72: TPC-DS Q61's store join is empty at
+		// SF0.25, and every worker still scanned all of store_sales).
+		if o.emptyBuildEndsJoin() {
+			o.firstProbe = nil
+			o.lazyProbe = nil
+			return nil
+		}
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
 	o.firstProbe = nil
@@ -2317,6 +2328,9 @@ type aggregateOp struct {
 	sCur      *groupRuntime
 	sCurParts []string
 	sEOF      bool
+	// sKeyBuf is nextSorted's reused per-column key buffer (M0122-0012
+	// slice 58): a row's group key is compared without allocating.
+	sKeyBuf []byte
 
 	// sharedUserStates supports PG aggregate state sharing: when multiple user-defined
 	// aggregates have the same sfunc/stype and the same input, sfunc is called only
@@ -2367,6 +2381,10 @@ const (
 	floatSpecialPosInf   floatSpecialKind = 2 // +Infinity
 	floatSpecialNegInf   floatSpecialKind = 3 // -Infinity
 )
+
+// groupChunkGroups is how many groups a hash aggregate carves from one
+// allocation of runtimes, states and key rows.
+const groupChunkGroups = 32
 
 type aggRuntime struct {
 	hasValue bool
@@ -2433,6 +2451,14 @@ type aggRuntime struct {
 	intExact bool
 	intSx    *big.Int // Σx
 	intSxx   *big.Int // Σx²
+	// int2 / int4 input accumulates in 128-bit integers first, as PG's
+	// int2_accum / int4_accum do (do_int128_accum, Int128AggState): x² < 2^62,
+	// so neither sum can overflow. intSums folds them into intSx / intSxx for
+	// every reader (M0122-0012 slice 67: two big.Int per group and a big.Int
+	// multiply per row were most of TPC-DS Q39's stddev_samp accumulation).
+	int128On bool
+	sx128    int128
+	sxx128   int128
 	// Exact rational accumulators for var_pop/var_samp/stddev on numeric inputs.
 	// When numericExact is true, these hold exact rational values matching PG's
 	// numeric_accum path (which uses exact arithmetic, not floating point). M0097-0125.
@@ -2653,6 +2679,35 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		order = append(order, key)
 	}
 
+	// A group lives until the aggregate finishes, so its runtime, its
+	// aggregate states and its key row are carved from chunks: one
+	// allocation per groupChunkGroups groups instead of three per group
+	// (M0122-0012 slice 68; TPC-DS Q39 founds 540 K groups per statement,
+	// each with two 664-byte aggregate states). Every piece is fresh and
+	// zeroed, and the states' capacity is capped so no append reaches a
+	// neighbour.
+	var grChunk []groupRuntime
+	var aggChunk []aggRuntime
+	var gvChunk rowChunk
+	nAggs := len(o.plan.Aggs)
+	newGroupRuntime := func() *groupRuntime {
+		if len(grChunk) == 0 {
+			grChunk = make([]groupRuntime, groupChunkGroups)
+		}
+		g := &grChunk[0]
+		grChunk = grChunk[1:]
+		if nAggs == 0 {
+			g.aggs = make([]aggRuntime, 0)
+			return g
+		}
+		if len(aggChunk) < nAggs {
+			aggChunk = make([]aggRuntime, nAggs*groupChunkGroups)
+		}
+		g.aggs = aggChunk[:nAggs:nAggs]
+		aggChunk = aggChunk[nAggs:]
+		return g
+	}
+
 	// newGroup founds a group from its first input row.
 	newGroup := func(si int, set []int, allVals Row, slot TupleSlot) *groupRuntime {
 		// Evaluate passthrough (functionally-determined) columns from the first row.
@@ -2670,13 +2725,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		var gv Row
 		if nGroupCols > 0 {
-			gv = make(Row, nGroupCols)
-			for i := range gv {
-				// A column rolled up away at this level is NULL —
-				// the SQL standard's value for it, and what makes
-				// GROUPING(...) necessary to tell it from a real one.
-				gv[i] = NullDatum
-			}
+			// A column rolled up away at this level is NULL — the SQL
+			// standard's value for it, and what makes GROUPING(...)
+			// necessary to tell it from a real one. A fresh chunk row
+			// is already NULL throughout (NullDatum is the zero Datum).
+			gv = gvChunk.take(nGroupCols)
 			for _, ci := range set {
 				// M0073-0004 retention boundary, moved here from
 				// evalGroupExprs (M0145-0008f): only a group-founding
@@ -2685,7 +2738,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				gv[ci] = allVals[ci].MaterializeArena()
 			}
 		}
-		return &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+		g := newGroupRuntime()
+		g.setIdx, g.groupValues, g.passthroughVals = si, gv, ptVals
+		return g
 	}
 
 	// M0122-0012 slice 24: the int64 group lane. A single grouping set over a
@@ -3125,16 +3180,22 @@ func (o *aggregateOp) appendGroupKey(buf []byte, si int, set []int, vals Row, mu
 		if i > 0 {
 			buf = append(buf, '|')
 		}
-		v := vals[ci]
-		if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
-			// trimStringDatum's result, without forming a new Datum.
-			buf = append(buf, 's', ':')
-			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
-			continue
-		}
-		buf = appendDatumKey(buf, v)
+		buf = o.appendGroupColKey(buf, ci, vals[ci])
 	}
 	return buf
+}
+
+// appendGroupColKey appends grouping column ci's key for value v — datumKey,
+// with the bpchar padding stripped where gkTrims says so — to buf. It is the
+// per-column part both appendGroupKey and the sorted path's sameSortedGroup
+// build.
+func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
+	if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
+		// trimStringDatum's result, without forming a new Datum.
+		buf = append(buf, 's', ':')
+		return append(buf, strings.TrimRight(v.StringValue(), " ")...)
+	}
+	return appendDatumKey(buf, v)
 }
 
 // aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
@@ -3775,13 +3836,13 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		allVals, parts, err := o.evalGroupExprs(slot)
+		allVals, err := o.evalGroupValsScratch(slot)
 		if err != nil {
 			return nil, err
 		}
 		var out Row
 		emit := false
-		if o.sCur == nil || !sameGroupKey(o.sCurParts, parts) {
+		if o.sCur == nil || !o.sameSortedGroup(allVals) {
 			// Group boundary: finalize the previous group, then start a fresh
 			// one from this row. The previous group is returned once this
 			// row has been absorbed, so the calls run in the order the
@@ -3807,10 +3868,19 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 					}
 				}
 			}
+			// The group's values leave the scratch vector here, detached
+			// from the input arena (the M0073-0004 retention boundary), and
+			// its per-column key strings are kept for sameSortedGroup.
 			var gv Row
+			var parts []string
 			if nGroupCols > 0 {
 				gv = make(Row, nGroupCols)
-				copy(gv, allVals)
+				parts = make([]string, nGroupCols)
+				for i, v := range allVals {
+					gv[i] = v.MaterializeArena()
+					o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, gv[i])
+					parts[i] = string(o.sKeyBuf)
+				}
 			}
 			o.sCur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 			o.sCurParts = parts
@@ -3859,6 +3929,27 @@ func (o *aggregateOp) emitSorted(row Row) TupleSlot {
 	o.slot.schema = o.schema
 	o.slot.row = row
 	return &o.slot
+}
+
+// sameSortedGroup reports whether a row's grouping values (the scratch vector
+// evalGroupValsScratch fills) belong to the current sorted group: each
+// column's key — datumKey of the value, bpchar padding stripped where gkTrims
+// says so, exactly the part evalGroupExprs built — equals the group's stored
+// part. It is sameGroupKey(o.sCurParts, parts) without building parts: one
+// reused buffer and an allocation-free string comparison per column, where
+// the per-row values row, parts slice and key strings were allocated for
+// every input row of a sorted Group (M0122-0012 slice 58, TPC-DS Q97).
+func (o *aggregateOp) sameSortedGroup(vals Row) bool {
+	if len(vals) != len(o.sCurParts) {
+		return false
+	}
+	for i, v := range vals {
+		o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, v)
+		if string(o.sKeyBuf) != o.sCurParts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sameGroupKey reports whether two per-column key vectors denote the same
@@ -4530,6 +4621,13 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 					}
 					return false
 				}
+				if arg.Kind == KindInt && arg.Int >= math.MinInt32 && arg.Int <= math.MaxInt32 && inputIsInt32(call.InputType.Name) {
+					st.intExact, st.int128On = true, true
+					st.sx128.addInt64(arg.Int)
+					st.sxx128.addUint64(uint64(arg.Int * arg.Int))
+					st.count++
+					break
+				}
 				if arg.Kind == KindInt && inputIsInt() {
 					if !st.intExact {
 						st.intExact = true
@@ -4840,6 +4938,63 @@ func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datu
 	return NewStringDatum(formatBigRatDecimal(result, 12))
 }
 
+// int128 is a two's-complement 128-bit integer, value hi*2^64 + lo — the
+// int128 of PG's Int128AggState, for int2 / int4 variance sums.
+type int128 struct {
+	hi int64
+	lo uint64
+}
+
+func (a *int128) addInt64(v int64) {
+	var c uint64
+	a.lo, c = bits.Add64(a.lo, uint64(v), 0)
+	a.hi += v>>63 + int64(c)
+}
+
+func (a *int128) addUint64(v uint64) {
+	var c uint64
+	a.lo, c = bits.Add64(a.lo, v, 0)
+	a.hi += int64(c)
+}
+
+func (a int128) big() *big.Int {
+	b := new(big.Int).SetInt64(a.hi)
+	b.Lsh(b, 64)
+	return b.Add(b, new(big.Int).SetUint64(a.lo))
+}
+
+// inputIsInt32 reports whether a variance aggregate's declared input type is
+// int2 or int4, whose PG transition functions accumulate in int128.
+func inputIsInt32(name string) bool {
+	switch name {
+	case "int2", "int4", "int", "integer", "smallint", "serial", "smallserial":
+		return true
+	}
+	switch strings.ToLower(name) {
+	case "int2", "int4", "int", "integer", "smallint", "serial", "smallserial":
+		return true
+	}
+	return false
+}
+
+// intSums returns the exact Σx and Σx² of an integer variance state, the
+// 128-bit lane folded into the big.Int one, or nils when the state saw no
+// integer input. It never modifies the state: a copied state may share the
+// big.Int pointers.
+func (st *aggRuntime) intSums() (sx, sxx *big.Int) {
+	if !st.int128On {
+		return st.intSx, st.intSxx
+	}
+	sx, sxx = st.sx128.big(), st.sxx128.big()
+	if st.intSx != nil {
+		sx.Add(sx, st.intSx)
+	}
+	if st.intSxx != nil {
+		sxx.Add(sxx, st.intSxx)
+	}
+	return sx, sxx
+}
+
 func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	// PG's numeric_stddev_internal (numeric.c) for integer inputs, which
 	// int2/int4/int8_accum feed with sumX and sumX2 at display scale 0
@@ -4944,14 +5099,72 @@ func pgSelectDivScaleInt(num, den *big.Int) int {
 func pgNBaseWeightFirst(d *big.Int, scale int) (int, int64) {
 	s4 := (scale + 3) / 4 * 4
 	v := new(big.Int).Mul(d, pow10Big(s4-scale))
-	digits := len(v.String())
-	nd := (digits + 3) / 4
+	if v.IsUint64() {
+		u := v.Uint64()
+		digits := decimalDigitsUint64(u)
+		nd := (digits + 3) / 4
+		return nd - 1 - s4/4, int64(u / pow10Uint64[4*(nd-1)])
+	}
+	nd := (decimalDigitsBig(v) + 3) / 4
 	lead := new(big.Int).Quo(v, pow10Big(4*(nd-1)))
 	return nd - 1 - s4/4, lead.Int64()
 }
 
-// pow10Big returns 10^k as a new big.Int (k >= 0).
+// pow10Uint64[k] is 10^k for every k whose power fits a uint64.
+var pow10Uint64 = func() [20]uint64 {
+	var t [20]uint64
+	t[0] = 1
+	for k := 1; k < len(t); k++ {
+		t[k] = t[k-1] * 10
+	}
+	return t
+}()
+
+// decimalDigitsUint64 is the number of decimal digits of u (1 for 0).
+func decimalDigitsUint64(u uint64) int {
+	n := 1
+	for n < len(pow10Uint64) && u >= pow10Uint64[n] {
+		n++
+	}
+	return n
+}
+
+// decimalDigitsBig is the number of decimal digits of the positive v —
+// len(v.String()) without formatting it (M0122-0012 slice 67: the string
+// conversion was most of pgNBaseWeightFirst on TPC-DS Q39's stddev groups).
+// The bit length gives an estimate within one digit; comparisons with exact
+// powers of ten settle it.
+func decimalDigitsBig(v *big.Int) int {
+	n := int(float64(v.BitLen()-1)*math.Log10(2)) + 1
+	for n > 1 && v.Cmp(pow10Big(n-1)) < 0 {
+		n--
+	}
+	for v.Cmp(pow10Big(n)) >= 0 {
+		n++
+	}
+	return n
+}
+
+// pow10BigTable[k] is 10^k, built once; pow10Big serves exponents in its
+// range from it.
+var pow10BigTable = func() [160]*big.Int {
+	var t [160]*big.Int
+	t[0] = big.NewInt(1)
+	ten := big.NewInt(10)
+	for k := 1; k < len(t); k++ {
+		t[k] = new(big.Int).Mul(t[k-1], ten)
+	}
+	return t
+}()
+
+// pow10Big returns 10^k (k >= 0). The result may be shared: callers read it
+// and never modify it. Exponents below 160 — every rscale-sized power the
+// variance and square-root paths ask for at PG's default scales — come from
+// a table instead of a big.Int.Exp per call (M0122-0012 slice 67).
 func pow10Big(k int) *big.Int {
+	if k >= 0 && k < len(pow10BigTable) {
+		return pow10BigTable[k]
+	}
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(k)), nil)
 }
 
@@ -5439,7 +5652,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, false, false)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, false, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
@@ -5452,7 +5666,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, true, false)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, true, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
@@ -5464,7 +5679,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, false, true)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, false, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
@@ -5479,7 +5695,8 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			return exactIntVariance(st.intSx, st.intSxx, st.count, true, true)
+			sx, sxx := st.intSums()
+			return exactIntVariance(sx, sxx, st.count, true, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)

@@ -128,6 +128,20 @@ func markScanBorrowChain(op Operator) {
 			// rows are copied before they are queued either way.
 			o.borrowLeader = true
 			return
+		case *setOp:
+			// A streaming UNION ALL (Append / Parallel Append, nextStreaming)
+			// returns each child slot as it is and keeps nothing between
+			// calls — it drains one branch, then the other — so both branches
+			// pass the borrow on (M0122-0012 slice 51; TPC-DS Q71's Parallel
+			// Append over three Parallel Hash Joins cloned every probe row).
+			// A Merge Append (nextMerge) holds each side's front row across
+			// calls, and the other set operations buffer, so they stop the
+			// walk.
+			if o.streaming && len(o.plan.MergeKeys) == 0 {
+				markScanBorrowChain(o.left)
+				markScanBorrowChain(o.right)
+			}
+			return
 		default:
 			return
 		}

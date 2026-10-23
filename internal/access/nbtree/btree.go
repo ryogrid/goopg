@@ -219,11 +219,29 @@ func writeOpaque(p storage.Page, o BTPageOpaque) {
 // bytes are the separator; its pointer half is unused (S11.4 turns it into a
 // real pivot tuple whose t_tid carries the downlink).
 func (f indexFormat) pageHighKey(p storage.Page) (key []byte, ok bool, err error) {
-	raw, ok, err := PGHighKeyRaw(p)
+	raw, ok, err := pgHighKeyRawNoCopy(p)
 	if err != nil || !ok {
 		return nil, false, err
 	}
 	it, perr := f.parse(raw)
+	if perr != nil {
+		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
+		return nil, false, perr
+	}
+	return it.key, true, nil
+}
+
+// pageHighKeyNoCopy is pageHighKey without the copy: the key ALIASES the
+// page, so it is valid only while the caller holds p pinned and unmodified.
+// The move-right tests below compare it and drop it; copying it twice there
+// (the raw item, then the key) was two allocations per tree level on every
+// descent — every probe of a nested-loop index join (M0122-0012 slice 54).
+func (f indexFormat) pageHighKeyNoCopy(p storage.Page) (key []byte, ok bool, err error) {
+	raw, ok, err := pgHighKeyRawNoCopy(p)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	it, perr := f.parseNoCopy(raw)
 	if perr != nil {
 		maybeDumpPageOnParseErr(p, "pageHighKey: parseItem")
 		return nil, false, perr
@@ -255,7 +273,7 @@ func highKeyItem(key []byte) item {
 // under right-link recovery. A rightmost page (or an unreadable high key, which
 // the structural validators report separately) never overshoots.
 func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}
@@ -269,7 +287,7 @@ func keyExceedsHighKey(f indexFormat, p storage.Page, key []byte) bool {
 // compareHigh rule — no entry of the page can be past the bound, and the scan
 // belongs on a page further right.
 func keyAtOrPastHighKey(f indexFormat, p storage.Page, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}
@@ -298,7 +316,7 @@ func lowerBoundPastPage(f indexFormat, p storage.Page, lo []byte, loExclusive bo
 // HighKey is itself the separator that was pushed up when this page last
 // split, so a downlink equal to it belongs to the right sibling.
 func itemOvershootsHighKey(f indexFormat, p storage.Page, op BTPageOpaque, key []byte) bool {
-	hk, ok, err := f.pageHighKey(p)
+	hk, ok, err := f.pageHighKeyNoCopy(p)
 	if err != nil || !ok {
 		return false
 	}
@@ -984,6 +1002,15 @@ type BTree struct {
 	// don't tear the value. Zero (BlockNumber 0) means "uncached"
 	// — block 0 is the metapage so no real leaf has block 0.
 	rightmostLeafBlk atomic.Uint64
+
+	// rootCache is the metapage's root as of the last read, packed as
+	// level<<32 | block (0 = uncached: block 0 is the metapage) — PG's
+	// rd_amcache copy of the metapage that _bt_getroot descends from
+	// instead of reading the metapage (M0122-0012 slice 61). A descent
+	// trusts it only after pinning the page and finding it still the
+	// live root at that level (rootCacheValid); otherwise it re-reads the
+	// metapage, as _bt_getroot does when its cached root went stale.
+	rootCache atomic.Uint64
 
 	// M0055-0005 Phase D: recycled-page free list. Pages that
 	// were unlinked by vacuum get pushed here; future
@@ -2560,7 +2587,7 @@ func (bt *BTree) descendForInsert(key []byte) (leafBlk storage.BlockNumber, path
 }
 
 func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
-	return bt.descendMode(key, forUpdate, false)
+	return bt.descendMode(key, forUpdate, false, true)
 }
 
 // descendToLowerBound descends to the leaf where a scan with lower bound lo
@@ -2572,22 +2599,45 @@ func (bt *BTree) descend(key []byte, forUpdate bool) (leafBlk storage.BlockNumbe
 // skip scan's past-the-group jumps read ~30 leaves per cursor, 28M leaf
 // searches for 0.93M cursors (M0122-0012 slice 41).
 func (bt *BTree) descendToLowerBound(lo []byte, loExclusive bool) (storage.BlockNumber, error) {
-	leaf, _, err := bt.descendMode(lo, false, loExclusive && lo != nil)
+	// A scan never walks the path back up, so it is not built.
+	leaf, _, err := bt.descendMode(lo, false, loExclusive && lo != nil, false)
 	return leaf, err
 }
 
-func (bt *BTree) descendMode(key []byte, forUpdate, nextKey bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
-	meta, err := bt.readMeta()
-	if err != nil {
-		return 0, nil, err
+func (bt *BTree) descendMode(key []byte, forUpdate, nextKey, needPath bool) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
+	cur, rootLevel, fromCache := bt.cachedRoot()
+	if !fromCache {
+		if cur, err = bt.readRoot(); err != nil {
+			return 0, nil, err
+		}
 	}
-	cur := meta.Root
 	for {
 		slot, err := bt.pinR(cur)
 		if err != nil {
+			if fromCache {
+				// The cached block is unreadable: forget it and start over
+				// from the metapage.
+				fromCache = false
+				bt.rootCache.Store(0)
+				if cur, err = bt.readRoot(); err != nil {
+					return 0, nil, err
+				}
+				continue
+			}
 			return 0, nil, err
 		}
 		op := readOpaque(slot.Page())
+		if fromCache {
+			fromCache = false
+			if !rootCacheValid(op, rootLevel) {
+				bt.unpinR(slot)
+				bt.rootCache.Store(0)
+				if cur, err = bt.readRoot(); err != nil {
+					return 0, nil, err
+				}
+				continue
+			}
+		}
 
 		// A split whose parent step never ran (an error in between, or a
 		// crash: redo restores the half split) is finished by the next
@@ -2645,9 +2695,46 @@ func (bt *BTree) descendMode(key []byte, forUpdate, nextKey bool) (leafBlk stora
 		if err != nil {
 			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
 		}
-		path = append(path, cur)
+		if needPath {
+			path = append(path, cur)
+		}
 		cur = child
 	}
+}
+
+// cachedRoot returns the cached root block and level (rootCache), ok=false
+// when nothing is cached.
+func (bt *BTree) cachedRoot() (storage.BlockNumber, uint32, bool) {
+	v := bt.rootCache.Load()
+	if v == 0 {
+		return 0, 0, false
+	}
+	return storage.BlockNumber(uint32(v)), uint32(v >> 32), true
+}
+
+// readRoot reads the metapage's root and caches it (with its level) for
+// later descents.
+func (bt *BTree) readRoot() (storage.BlockNumber, error) {
+	meta, err := bt.readMeta()
+	if err != nil {
+		return 0, err
+	}
+	if meta.Root != MetaBlock {
+		bt.rootCache.Store(uint64(meta.Level)<<32 | uint64(uint32(meta.Root)))
+	}
+	return meta.Root, nil
+}
+
+// rootCacheValid is _bt_getroot's check of a cached root: the pinned page is
+// live (neither deleted nor half-dead), at the cached level, the only page on
+// its level (no left or right sibling) and flagged the root. A root that has
+// since split has a right sibling and has dropped BTRoot; a page recycled
+// after the root moved fails one of the tests. Requiring the TRUE root, not
+// merely PG's fast root, keeps a writer's descent path complete to the top
+// (getStackBuf walks it upward after a split).
+func rootCacheValid(op BTPageOpaque, level uint32) bool {
+	return op.IsRoot() && !op.IsDeleted() && !op.IsHalfDead() && op.Level == level &&
+		op.Prev == storage.InvalidBlockNumber && op.Next == storage.InvalidBlockNumber
 }
 
 // Insert places (key, ptr) into the leaf where it belongs, splitting
@@ -4732,6 +4819,11 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 				} else if bt.format().compare(key, lo) < 0 {
 					continue
 				}
+				// Leaf order: every later entry passes too (the
+				// monotone predicate leafScanStart binary-searches), so
+				// the rest of the leaf skips the test (M0122-0012
+				// slice 57).
+				lo = nil
 			}
 			// compareHigh, not compare: a bound naming only a prefix of
 			// the key attributes is PLUS infinity beyond them (see
@@ -4772,6 +4864,7 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 				} else if bt.format().compare(it.key, lo) < 0 {
 					continue
 				}
+				lo = nil // see the posting branch above
 			}
 			// compareHigh: see the posting branch above. An EXCLUSIVE
 			// upper bound stops at the boundary key itself.

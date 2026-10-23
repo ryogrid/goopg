@@ -185,6 +185,46 @@ func pgVarattIs1B(b []byte) bool { return len(b) > 0 && b[0]&0x01 == 0x01 }
 // pgVarattIs1BE is VARATT_IS_1B_E — a TOAST pointer (0x01 header byte).
 func pgVarattIs1BE(b []byte) bool { return len(b) > 0 && b[0] == 0x01 }
 
+// PGIndexFixedAttrOffsets returns where each of attrs starts in an index
+// tuple that has no null bitmap, when every one is fixed-width: the data
+// begins at MAXALIGN(sizeof(IndexTupleData)) and each attribute at its
+// alignment past the previous one — index_getattr's attcacheoff
+// (itup.h). ok is false when any attribute is a varlena or cstring, whose
+// successors have no fixed offset. The offsets hold in every such tuple
+// whose leading attributes are attrs, whatever follows them (M0122-0012
+// slice 56, the skip scan's group bounds).
+func PGIndexFixedAttrOffsets(attrs []PGIndexAttr) (offs []int, ok bool) {
+	off := MaxAlign(SizeOfIndexTupleData)
+	offs = make([]int, len(attrs))
+	for i, a := range attrs {
+		if a.Len <= 0 {
+			return nil, false
+		}
+		off = alignTo(off, a.AlignBy)
+		offs[i] = off
+		off += int(a.Len)
+	}
+	return offs, true
+}
+
+// PGIndexImageInline reports that img, one attribute image deformed from an
+// index tuple (DeformPGIndexTuple), is stored inline and uncompressed: a
+// fixed-width value, a short-header varlena that is not a TOAST pointer, or
+// a 4-byte-header uncompressed varlena. FormPGIndexTuple re-forms such an
+// image into exactly the bytes it forms from the same value encoded afresh
+// (a 4-byte header is re-headered short, a short one is copied), so a caller
+// may build a new key from it without decoding the value (M0122-0012 slice
+// 52, the skip scan's group bounds).
+func PGIndexImageInline(att PGIndexAttr, img []byte) bool {
+	if att.Len != -1 {
+		return true
+	}
+	if pgVarattIs1B(img) {
+		return !pgVarattIs1BE(img)
+	}
+	return pgVarattIs4BU(img)
+}
+
 // pgVarSizeAny is VARSIZE_ANY: the total on-disk length of a varlena in any
 // header form.
 func pgVarSizeAny(b []byte) (int, error) {
@@ -706,7 +746,8 @@ func deformPGIndexTupleInto[T physAttr](raw []byte, attrs []T, natts int, values
 	if natts > len(attrs) {
 		return fmt.Errorf("btree: natts %d exceeds %d described attributes", natts, len(attrs))
 	}
-	w, err := newPGIndexTupleWalk(raw)
+	var w pgIndexTupleWalk
+	err := w.init(raw)
 	if err != nil {
 		return err
 	}
@@ -732,16 +773,22 @@ type pgIndexTupleWalk struct {
 	hasNulls bool
 }
 
-func newPGIndexTupleWalk(raw []byte) (pgIndexTupleWalk, error) {
+// init points w at raw's first attribute. It fills w in place rather than
+// returning a walk: comparePGIndexTupleAttrs runs it twice per comparison on
+// every descent step, and a returned 48-byte struct is stored to the stack
+// and reloaded field by field — a store-forwarding stall that profiled at
+// ~1 s of TPC-DS Q14's 21 s of CPU (M0122-0012 slice 54).
+func (w *pgIndexTupleWalk) init(raw []byte) error {
 	if len(raw) < SizeOfIndexTupleData {
-		return pgIndexTupleWalk{}, fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
+		return fmt.Errorf("btree: index tuple too short (%d bytes)", len(raw))
 	}
 	tInfo := pgTInfo(raw)
 	size := int(tInfo & IndexSizeMask)
 	if size > len(raw) {
-		return pgIndexTupleWalk{}, fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
+		return fmt.Errorf("btree: t_info size %d exceeds the %d supplied bytes", size, len(raw))
 	}
-	return pgIndexTupleWalk{raw: raw, size: size, off: PGIndexInfoFindDataOffset(tInfo), hasNulls: tInfo&IndexNullMask != 0}, nil
+	w.raw, w.size, w.off, w.hasNulls = raw, size, PGIndexInfoFindDataOffset(tInfo), tInfo&IndexNullMask != 0
+	return nil
 }
 
 // next returns attribute i, which must be the attribute after the one the

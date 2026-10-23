@@ -5,6 +5,7 @@ package executor
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/optimizer"
 )
@@ -30,6 +31,9 @@ type distinctOp struct {
 	// colText flags character-string columns, whose output-order
 	// comparison is plain text whatever the values look like (M0146-0053).
 	colText []bool
+	// unordered skips the output sort: the consumer is a hashed aggregate
+	// whose result does not depend on input order (markDistinctUnordered).
+	unordered bool
 }
 
 func newDistinctOp(p *optimizer.Distinct, child Operator) *distinctOp {
@@ -63,6 +67,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 	}
 	// Drain all rows and deduplicate.
 	seen := make(map[string]struct{})
+	var keyBuf []byte
 	rowN := 0
 	for {
 		// Cancellation: check ctx.Err() every 1024 rows so a
@@ -88,14 +93,18 @@ func (o *distinctOp) Open(ctx *Context) error {
 			continue
 		}
 		row := slot.Row()
-		// Clone the row so we own the data (child slot is reused).
-		ownedRow := cloneRow(row)
-		k := rowKeyTrimmed(ownedRow, o.junkPos, o.colTrims)
-		if _, dup := seen[k]; dup {
+		// The key is built in a reused buffer and looked up without
+		// allocating; only a row that starts a new key is cloned (the child
+		// slot is reused) and keeps a key string (M0122-0012 slice 70).
+		keyBuf = appendRowKeyTrimmed(keyBuf[:0], row, o.junkPos, o.colTrims)
+		if _, dup := seen[string(keyBuf)]; dup {
 			continue
 		}
-		seen[k] = struct{}{}
-		o.rows = append(o.rows, ownedRow)
+		seen[string(keyBuf)] = struct{}{}
+		o.rows = append(o.rows, cloneRow(row))
+	}
+	if o.unordered {
+		return nil
 	}
 	// Sort rows for deterministic output matching PostgreSQL's sort-based
 	// DISTINCT: NULL values sort last, non-null values by datum order.
@@ -161,6 +170,33 @@ type distinctOnOp struct {
 	// unsorted, so a key is a duplicate when it was ever seen, not only
 	// when it equals the previous row's.
 	seen map[string]struct{}
+	// keyBuf is Next's reused key buffer (appendDistinctOnKey).
+	keyBuf []byte
+}
+
+// appendDistinctOnKey appends row's DISTINCT ON key to buf: for each key
+// column, datumKey of its value — bpchar padding stripped where keyTrims says
+// so, as trimStringDatum does — then a NUL. These are the bytes Next built by
+// concatenating one datumKey string per column for every input row; the
+// buffer is reused and compared or looked up without allocating, so only a
+// row that starts a new key allocates its string (M0122-0012 slice 60,
+// TPC-DS Q87's three DISTINCTs).
+func (o *distinctOnOp) appendDistinctOnKey(buf []byte, row Row) []byte {
+	for ki, idx := range o.plan.KeyCols {
+		if idx < 0 || idx >= len(row) {
+			continue
+		}
+		v := row[idx]
+		if ki < len(o.keyTrims) && o.keyTrims[ki] && v.Kind == KindString {
+			// trimStringDatum's result (it acts on KindString only).
+			buf = append(buf, 's', ':')
+			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
+		} else {
+			buf = appendDatumKey(buf, v)
+		}
+		buf = append(buf, 0)
+	}
+	return buf
 }
 
 func newDistinctOnOp(p *optimizer.DistinctOn, child Operator) *distinctOnOp {
@@ -191,7 +227,6 @@ func (o *distinctOnOp) Open(ctx *Context) error {
 }
 
 func (o *distinctOnOp) Next() (TupleSlot, error) {
-	keyCols := o.plan.KeyCols
 	for {
 		slot, err := o.child.Next()
 		if err != nil {
@@ -201,27 +236,18 @@ func (o *distinctOnOp) Next() (TupleSlot, error) {
 			continue
 		}
 		row := slot.Row()
-		// Build a key from the DISTINCT ON columns.
-		var key string
-		for ki, idx := range keyCols {
-			if idx >= 0 && idx < len(row) {
-				v := row[idx]
-				if ki < len(o.keyTrims) && o.keyTrims[ki] {
-					v = trimStringDatum(v)
-				}
-				key += datumKey(v) + "\x00"
-			}
-		}
+		// The key of the DISTINCT ON columns, in the reused buffer.
+		o.keyBuf = o.appendDistinctOnKey(o.keyBuf[:0], row)
 		if o.seen != nil {
-			if _, dup := o.seen[key]; dup {
+			if _, dup := o.seen[string(o.keyBuf)]; dup {
 				continue
 			}
-			o.seen[key] = struct{}{}
+			o.seen[string(o.keyBuf)] = struct{}{}
 			return SlotFromRow(o.schema, cloneRow(row)), nil
 		}
-		if !o.started || key != o.prevKey {
+		if !o.started || string(o.keyBuf) != o.prevKey {
 			o.started = true
-			o.prevKey = key
+			o.prevKey = string(o.keyBuf)
 			return SlotFromRow(o.schema, cloneRow(row)), nil
 		}
 		// Duplicate key: skip this row.
@@ -233,4 +259,55 @@ func (o *distinctOnOp) Close() error {
 	return o.child.Close()
 }
 
+// aggregateIgnoresInputOrder reports whether p's result is the same for every
+// order of its input rows: a hashed (or ungrouped) aggregate whose every
+// aggregate is count, min, max, or sum / avg over a non-float input. Float
+// sums and averages round differently in different orders, and the
+// collecting aggregates (array_agg, string_agg, ...) and user-defined ones
+// keep their input order, so any of those keeps the input as it is.
+func aggregateIgnoresInputOrder(p *optimizer.Aggregate) bool {
+	if p.Strategy != optimizer.AggStrategyHashed || p.Mode == optimizer.AggModeFinal || p.GroupingSets != nil {
+		return false
+	}
+	for i := range p.Aggs {
+		a := &p.Aggs[i]
+		if len(a.OrderBy) > 0 || a.WithinGroup {
+			return false
+		}
+		switch strings.ToLower(a.Name) {
+		case "count", "min", "max":
+		case "sum", "avg":
+			switch strings.ToLower(a.InputType.Name) {
+			case "float4", "float8", "real", "double precision", "":
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
 
+// markDistinctUnordered tells a hashed DISTINCT feeding op — directly or
+// through projections — that its consumer ignores row order, so it may emit
+// its rows in first-seen order instead of sorting them (M0122-0012 slice 69).
+// PostgreSQL's HashAggregate DISTINCT emits hash-table order and never sorts;
+// goopg's sort exists only to make an unordered DISTINCT's own output
+// deterministic, which no order-insensitive consumer can observe. TPC-DS
+// Q75's UNION de-duplication sorted ~485 K rows that a sum() HashAggregate
+// then regrouped.
+func markDistinctUnordered(op Operator) {
+	for op != nil {
+		switch o := op.(type) {
+		case *distinctOp:
+			o.unordered = true
+			return
+		case *projectOp:
+			op = o.child
+		case *instrumentedOp:
+			op = o.inner
+		default:
+			return
+		}
+	}
+}

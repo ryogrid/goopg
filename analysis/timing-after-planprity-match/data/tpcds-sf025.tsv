@@ -1,0 +1,100 @@
+query	pg_ms	goopg_ms	ratio_goopg_over_pg	notes
+Q1	14867	10992	0.74	goopg 3 sweeps 12740/10403/10992 ms; PG 10-21 runs 16.77/13.33 s
+Q2	558	448	0.80	goopg 3 sweeps 448/440/452 ms; PG 2026-09-11 oracle single run 176 ms
+Q3	142	34	0.24	goopg 3 sweeps 85/33/34 ms; PG 2026-09-11 oracle single run 19 ms
+Q4	29902	4440	0.15	goopg 3 sweeps 4440/4737/4204 ms; PG 10-21 runs 29.42/28.99 s
+Q5	306	602	1.97	goopg 3 sweeps 602/656/595 ms; PG same-day re-runs 0.39/0.26/0.26 s; ratio vs warm PG 2.32
+Q6	35955	341	0.01	goopg 3 sweeps 341/352/340 ms
+Q7	1832	1025	0.56	goopg 3 sweeps 1227/574/1025 ms; PG 2026-09-11 oracle single run 116 ms
+Q8	138	344	2.49	goopg 3 sweeps 344/339/361 ms
+Q9	449	487	1.08	goopg 3 sweeps 487/488/477 ms
+Q10	1432	859	0.60	goopg 3 sweeps 859/870/856 ms; PG 2026-09-11 oracle single run 140 ms
+Q11	6769	2050	0.30	goopg 3 sweeps 2050/2030/2057 ms
+Q12	26	74	2.85	goopg 3 sweeps 74/71/77 ms
+Q13	127	225	1.77	goopg 3 sweeps 227/220/225 ms
+Q14	7656	14031	1.83	goopg 3 sweeps 11934/14563/14031 ms; PG re-runs 10-22 8.33/8.44/7.83 s, 10-21 8.73/8.51 s; PG split 14a 3.3-3.9 s + 14b 4.7-5.5 s; ratio vs warm PG 1.68; a+b variants in one file, timed together (both engines)
+Q15	38	131	3.45	goopg 3 sweeps 131/126/151 ms
+Q16	81	236	2.91	goopg 3 sweeps 236/236/238 ms; PG re-runs 0.06/0.07/0.06, 0.100/0.073/0.064/0.069 s; ratio vs warm PG 3.58
+Q17	171	497	2.91	goopg 3 sweeps 532/480/497 ms
+Q18	96	232	2.42	goopg 3 sweeps 232/226/261 ms
+Q19	46	208	4.52	goopg 3 sweeps 208/198/213 ms
+Q20	31	129	4.16	goopg 3 sweeps 136/129/128 ms
+Q21	701	346	0.49	goopg 3 sweeps 346/349/334 ms; PG 2026-09-11 oracle single run 109 ms
+Q22	516	595	1.15	goopg 3 sweeps 584/611/595 ms
+Q23	3550	3343	0.94	goopg 3 sweeps 3474/3263/3343 ms; PG 10-21 runs 1.77/1.97 s (vs 3.55 s here); a+b variants in one file, timed together (both engines)
+Q24	19	60	3.16	goopg 3 sweeps 67/60/56 ms; a+b variants in one file, timed together (both engines)
+Q25	139	396	2.85	goopg 3 sweeps 3024/396/339 ms
+Q26	115	361	3.14	goopg 3 sweeps 361/304/482 ms
+Q27	135	390	2.89	goopg 3 sweeps 350/390/419 ms
+Q28	435	562	1.29	goopg 3 sweeps 577/562/560 ms
+Q29	75	237	3.16	goopg 3 sweeps 243/237/231 ms
+Q30	796	806	1.01	goopg 3 sweeps 848/806/798 ms
+Q31	1712	878	0.51	goopg 3 sweeps 901/878/861 ms
+Q32	34	50	1.47	goopg 3 sweeps 60/49/50 ms
+Q33	90	327	3.63	goopg 3 sweeps 333/327/326 ms
+Q34	50	177	3.54	goopg 3 sweeps 177/181/174 ms
+Q35	354	796	2.25	goopg 3 sweeps 815/796/786 ms
+Q36	141	364	2.58	goopg 3 sweeps 315/389/364 ms
+Q37	16	12	0.75	goopg 3 sweeps 12/12/12 ms
+Q38	311	770	2.48	goopg 3 sweeps 777/770/769 ms
+Q39	593	1243	2.10	goopg 3 sweeps 1374/1243/1196 ms; a+b variants in one file, timed together (both engines)
+Q40	32	134	4.19	goopg 3 sweeps 135/134/128 ms
+Q41	1481	884	0.60	goopg 3 sweeps 909/884/872 ms
+Q42	42	162	3.86	goopg 3 sweeps 162/171/158 ms
+Q43	71	226	3.18	goopg 3 sweeps 195/226/230 ms
+Q44	413	399	0.97	goopg 3 sweeps 422/399/389 ms
+Q45	36	75	2.08	goopg 3 sweeps 72/77/75 ms
+Q46	105	248	2.36	goopg 3 sweeps 248/248/253 ms
+Q47	895	1217	1.36	goopg 3 sweeps 1217/1208/1228 ms
+Q48	131	220	1.68	goopg 3 sweeps 221/220/219 ms
+Q49	48	54	1.12	goopg 3 sweeps 52/58/54 ms
+Q50	27	36	1.33	goopg 3 sweeps 36/37/36 ms
+Q51	304	825	2.71	goopg 3 sweeps 825/840/806 ms; PG re-runs 0.367/0.316/0.300/0.306 s; ratio vs warm PG 2.70
+Q52	44	111	2.52	goopg 3 sweeps 111/112/109 ms
+Q53	64	96	1.50	goopg 3 sweeps 99/96/94 ms
+Q54	2336	342	0.15	goopg 3 sweeps 379/342/338 ms
+Q55	29	24	0.83	goopg 3 sweeps 24/23/24 ms
+Q56	123	262	2.13	goopg 3 sweeps 264/262/256 ms
+Q57	416	537	1.29	goopg 3 sweeps 537/549/518 ms
+Q58	87	286	3.29	goopg 3 sweeps 293/286/285 ms; PG re-runs 0.09 x3; ratio vs warm PG 3.18
+Q59	722	1209	1.67	goopg 3 sweeps 1240/1185/1209 ms; PG re-runs 0.75/0.74/0.74 s; ratio vs warm PG 1.63
+Q60	179	370	2.07	goopg 3 sweeps 369/370/376 ms
+Q61	22	283	12.86	goopg 3 sweeps 289/281/283 ms
+Q62	58	134	2.31	goopg 3 sweeps 134/136/133 ms
+Q63	62	124	2.00	goopg 3 sweeps 124/124/126 ms
+Q64	357	1808	5.06	goopg 3 sweeps 1814/1808/1801 ms; PG 10-21 run 1.97 s (vs 0.36 s here)
+Q65	225	497	2.21	goopg 3 sweeps 497/544/496 ms
+Q66	328	355	1.08	goopg 3 sweeps 355/3078/316 ms; PG 2026-09-11 oracle single run 90 ms
+Q67	1923	2333	1.21	goopg 3 sweeps 2341/2332/2333 ms
+Q68	74	113	1.53	goopg 3 sweeps 113/111/116 ms
+Q69	76	320	4.21	goopg 3 sweeps 320/315/364 ms
+Q70	115	422	3.67	goopg 3 sweeps 410/422/3801 ms
+Q71	76	250	3.29	goopg 3 sweeps 250/250/274 ms; PG re-runs 0.08 x3; ratio vs warm PG 3.12
+Q72	1117	2469	2.21	goopg 3 sweeps 2688/2201/2469 ms; PG re-runs 1.37/0.61/0.60 s (single-shot includes first-touch); 10-21 single run 3.38 s; ratio vs warm PG 4.12
+Q73	46	173	3.76	goopg 3 sweeps 173/170/184 ms
+Q74	59299	11477	0.19	goopg 3 sweeps 13825/10926/11477 ms; PG 10-21 runs 60.89/59.22 s
+Q75	236	754	3.19	goopg 3 sweeps 754/750/756 ms; PG 2026-09-11 oracle single run 476 ms
+Q76	76	296	3.89	goopg 3 sweeps 296/307/281 ms
+Q77	112	431	3.85	goopg 3 sweeps 437/431/425 ms
+Q78	489	1236	2.53	goopg 3 sweeps 1268/1236/1213 ms; PG re-runs 0.46 x3; ratio vs warm PG 2.69
+Q79	91	251	2.76	goopg 3 sweeps 254/251/244 ms
+Q80	84	376	4.48	goopg 3 sweeps 386/376/373 ms; PG re-runs 0.11/0.08/0.08 s; ratio vs warm PG 4.70
+Q81	3506	3600	1.03	goopg 3 sweeps 3638/3600/3404 ms; PG 10-21 runs 3.61/3.79 s
+Q82	20	21	1.05	goopg 3 sweeps 22/21/20 ms
+Q83	101	159	1.57	goopg 3 sweeps 170/159/157 ms
+Q84	31	42	1.35	goopg 3 sweeps 45/42/42 ms
+Q85	55	95	1.73	goopg 3 sweeps 100/94/95 ms
+Q86	55	91	1.65	goopg 3 sweeps 92/91/88 ms
+Q87	298	784	2.63	goopg 3 sweeps 823/784/773 ms; PG re-runs 0.713/0.313/0.316/0.375 s; ratio vs warm PG 2.48
+Q88	330	616	1.87	goopg 3 sweeps 619/616/587 ms
+Q89	85	122	1.44	goopg 3 sweeps 123/122/121 ms
+Q90	51	88	1.73	goopg 3 sweeps 88/91/88 ms
+Q91	24	43	1.79	goopg 3 sweeps 44/43/42 ms
+Q92	40	62	1.55	goopg 3 sweeps 64/62/62 ms
+Q93	11	18	1.64	goopg 3 sweeps 16/18/18 ms
+Q94	39	66	1.69	goopg 3 sweeps 66/61/69 ms
+Q95	1773	1631	0.92	goopg 3 sweeps 1631/1653/1630 ms
+Q96	51	130	2.55	goopg 3 sweeps 133/130/130 ms
+Q97	114	546	4.79	goopg 3 sweeps 542/554/546 ms; PG re-runs 0.12 x3, 0.122-0.126 s; ratio vs warm PG 4.44
+Q98	57	174	3.05	goopg 3 sweeps 174/176/165 ms
+Q99	79	218	2.76	goopg 3 sweeps 218/231/218 ms

@@ -114,3 +114,41 @@ The next nightly that times out a start carries both notes:
 AI-005 (`TestPort_IsolationMultipleCic`) is a separate failure: steps timed out
 in the runner's 5 s drain window, then `driver: bad connection`. It stays open
 on its own.
+
+## 7. The recurrence, and the fix (2026-10-23)
+
+The 2026-10-23 nightly (run 20261023-005128, `c6a780f7e`) timed out a start in
+`TestPort_ExtendedStatisticsSurvivesRestart` (AI-20261023-005128-001). The notes
+gave a third answer, neither of the two §6 expected:
+
+- the cgroup was quiet: memory.current 0.6 GB against memory.high 6 GB, PSI
+  some/full avg10/60/300 all 0.00, so this was not a memory throttle;
+- goroutine 1 was **runnable**, not parked, inside the catalog-heap reload
+  (`initdb.reloadUserAggregatesFromHeap` → `scanCatalogHeapRows` →
+  `DecodeRowIntoMctxPGTuple`), so this was not a stuck wait either.
+
+The start was progressing, slowly. It fired at 01:01:56, while a Ralph loop's
+S9 census (a clone copy plus 221 EXPLAINs) ran beside the nightly testport lane.
+On an idle host the same test passes in 2.1–2.2 s (3 of 3), so CPU contention
+stretched a ~1 s start past the test's 20 s budget. The earlier -003/-004
+timeouts stalled in the same initdb phase, under the same nightly co-load.
+
+**Fix.** PG's own start wait is `pg_ctl`'s 60 s `DEFAULT_WAIT`, which the
+`PGCTLTIMEOUT` environment variable overrides (src/bin/pg_ctl/pg_ctl.c). PG's TAP
+suites rely on that override when a host runs slow. The harness now honours it:
+
+- `cluster.New` passes the start budget through `startupWaitFromEnv`, which
+  raises a normal budget, at least the 20 s `defaultStartupWait`, to
+  PGCTLTIMEOUT seconds when that is longer. It never lowers one, ignores a
+  malformed or non-positive value, and leaves a deliberately short budget alone
+  (the 1 s budget of `TestStartTimeoutCarriesStuckGoroutines`).
+- The nightly testport stage (`ci/batch/stages/stage-testport.sh`) exports
+  `PGCTLTIMEOUT=60`. Interactive and loop runs keep their budgets. A real
+  `pg_ctl` sees its own default.
+
+Pins: `TestStartupWaitFromEnv` (raise, never lower, malformed, short budget) and
+`TestNewHonoursPGCTLTIMEOUT` (default and explicit 20 s budgets both reach 60 s).
+
+The per-start catalog-heap reload, which decodes every catalog row on each
+start, is what makes a start slow under contention. It remains a possible
+start-time lever, but it is not a correctness issue.

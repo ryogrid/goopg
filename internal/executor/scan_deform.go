@@ -222,9 +222,20 @@ func deformScanReadSet(width int, exprs ...optimizer.Expr) []bool {
 // row, as a PG SubPlan's parParam/args are. An unlowered sublink pushes the
 // whole row and keys its cache by every column (subqueryCacheKey), so it
 // cannot be bounded and declines.
+//
+// A non-correlated sublink (IsNonCorrelated: its plan reads no outer value at
+// all, planHasOuterRef) reads nothing of the row either: evalSubquery keys its
+// result by the sublink alone (nonCorrelatedCacheKey, InitPlan semantics) and
+// the row it pushes on OuterRows is never read — PG plans it as an InitPlan,
+// whose param references no column of the scan (M0122-0012 slice 53; TPC-DS
+// Q14's `d_week_seq = (SELECT d_week_seq FROM date_dim …)` probe filter
+// otherwise deformed every date_dim, store_sales and item column).
 func deformSublinkArgs(x *optimizer.SubqueryExpr) ([]optimizer.Expr, bool) {
-	if x == nil || len(x.ParParam) == 0 {
+	if x == nil {
 		return nil, false
+	}
+	if len(x.ParParam) == 0 {
+		return nil, x.IsNonCorrelated
 	}
 	return x.Args, true
 }
@@ -732,6 +743,48 @@ func deformJoinBounds(p *optimizer.Join, incoming int) (left, right int) {
 	return left, deformUnionBound(rightAbove, deformUnionBound(rightKeys, rightSplit))
 }
 
+// joinLeftConsumers translates the consumers of a join's merged (left++right)
+// output into the expressions that read its LEFT rows, for buildCompleteChild:
+// one ColumnRef per live left column, plus the join's own readers of the left
+// row — the merged-space predicate (folded into the live set) and the left
+// halves of its equi-key pairs, which evaluate positionally against left rows
+// (deformPositionalKeys). ok is false — build the join normally — for a join
+// type whose output is not that layout, a LATERAL or null-aware join, a
+// layout the side widths do not account for, or consumers whose reads
+// consumerLiveColumns cannot enumerate.
+func joinLeftConsumers(p *optimizer.Join, consumers []optimizer.Expr) ([]optimizer.Expr, bool) {
+	switch p.Type {
+	case optimizer.JoinTypeInner, optimizer.JoinTypeLeft, optimizer.JoinTypeCross:
+	default:
+		return nil, false
+	}
+	if p.Lateral || p.NullAware || len(p.UsingLeftCols) > 0 {
+		return nil, false
+	}
+	leftW, rightW := deformSideWidth(p.Left), deformSideWidth(p.Right)
+	if leftW <= 0 || rightW <= 0 || len(p.Output()) != leftW+rightW {
+		return nil, false
+	}
+	live := consumerLiveColumns(append(append([]optimizer.Expr(nil), consumers...), p.Predicate))
+	if live == nil {
+		return nil, false
+	}
+	var out []optimizer.Expr
+	for i := range min(len(live), leftW) {
+		if live[i] {
+			out = append(out, &optimizer.ColumnRef{Index: i})
+		}
+	}
+	if len(p.HashKeys) > 0 {
+		for _, k := range p.HashKeys {
+			out = append(out, k.Left)
+		}
+	} else {
+		out = append(out, p.LeftKey)
+	}
+	return out, true
+}
+
 // deformLateralOuterRefs is the left-side bound a LATERAL join's inner reads
 // of the outer row: lateralJoinStream binds every outer row into the inner's
 // outer slot, and the probe evaluates its key expressions — and any outer
@@ -787,7 +840,11 @@ func deformLateralOuterRefs(right optimizer.Node) int {
 					}
 				}
 			case *optimizer.SubqueryExpr:
-				known = false
+				// A non-correlated sublink reads no outer value
+				// (deformSublinkArgs); any other may read the outer row.
+				if !r.IsNonCorrelated || len(r.ParParam) > 0 {
+					known = false
+				}
 			}
 		})
 		return ok && known

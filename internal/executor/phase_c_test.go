@@ -779,11 +779,12 @@ func TestBuildExprSlabCommonKinds(t *testing.T) {
 
 	t.Run("UnknownKind_falls_back_to_adapter", func(t *testing.T) {
 		var slab exprTreeSlab
-		// StringConst is not handled natively → ExprAdapter.
-		e := &optimizer.StringConst{Value: "hello"}
+		// FuncCall is not handled natively → ExprAdapter. (StringConst was the
+		// example here until it compiled to ExprConstVal, M0122-0012 slice 64.)
+		e := &optimizer.FuncCall{Name: "upper", Args: []optimizer.Expr{&optimizer.ColumnRef{Index: 0, Name: "c"}}}
 		idx := slab.buildExpr(e)
 		if slab[idx].Kind != ExprAdapter {
-			t.Fatalf("expected ExprAdapter for StringConst, got %d", slab[idx].Kind)
+			t.Fatalf("expected ExprAdapter for FuncCall, got %d", slab[idx].Kind)
 		}
 		if slab[idx].orig == nil {
 			t.Error("ExprAdapter.orig must be non-nil")

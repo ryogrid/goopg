@@ -10,7 +10,6 @@ import (
 
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 var (
@@ -173,7 +172,9 @@ const numericMaxDisplayScale = 16383
 // fresh *big.Int so callers can mutate without aliasing the Datum.
 func numericMant(d Datum) *big.Int {
 	if isBigNumeric(d) {
-		return new(big.Int).Set(d.NumericBigValue())
+		// NumericBigValue decodes into a fresh big.Int already; copying it
+		// again was a second allocation per big operand (M0122-0012 slice 68).
+		return d.NumericBigValue()
 	}
 	return big.NewInt(d.NumericMantissaValue())
 }
@@ -198,8 +199,9 @@ func newNumeric(b *big.Int, scale int) Datum {
 	if b.Cmp(bigNumericMinInt64) >= 0 && b.Cmp(bigNumericMaxInt64) <= 0 {
 		return Datum{Kind: KindNumeric, Int: b.Int64(), Scale: int16(scale)}
 	}
-	bb := new(big.Int).Set(b)
-	return newBigNumericInCtx(mmgr.Perm(), bb, int16(scale))
+	// NewNumericBigDatum copies b's bytes and keeps no reference to b, so b
+	// is passed as is (M0122-0012 slice 68).
+	return NewNumericBigDatum(b, int16(scale))
 }
 
 // parseNumericFast attempts an int64-only fast path for the
@@ -859,6 +861,92 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 			return d, nil
 		}
 	}
+	if d, ok := numericDivUint128(a, b); ok {
+		return d, nil
+	}
+	return numericDivBig(a, b, pos)
+}
+
+// numericDivUint128 is numericDiv for operands whose mantissa magnitudes fit
+// a uint64 — either lane — when the shifted numerator fits 128 bits and the
+// rounded quotient fits the int64 lane: one 128-by-64-bit division, no
+// big.Int, and no big-numeric result payload (M0122-0012 slice 68: TPC-DS
+// Q39's HAVING divides a 16-decimal stddev by a 16-decimal mean whose
+// mantissa passes int64, so every group took the big.Int path). ok=false
+// leaves the case to numericDivBig, including a zero divisor (which raises
+// there) and a zero numerator. The result is numericDivBig's, digit and
+// scale alike: the same select_div_scale rscale and half-away-from-zero
+// rounding.
+func numericDivUint128(a, b Datum) (Datum, bool) {
+	ma, negA, ok := numericMagUint64(a)
+	if !ok || ma == 0 {
+		return Datum{}, false
+	}
+	mb, negB, ok := numericMagUint64(b)
+	if !ok || mb == 0 {
+		return Datum{}, false
+	}
+	da, db := int(a.Scale), int(b.Scale)
+	w1, fd1 := nbaseWeightAndFirstDigitUint64(ma, da)
+	w2, fd2 := nbaseWeightAndFirstDigitUint64(mb, db)
+	qweight := w1 - w2
+	if fd1 <= fd2 {
+		qweight--
+	}
+	rscale := max(numericMinSigDigits-qweight*4, da, db, 0)
+	rscale = min(rscale, numericMaxDisplayScale)
+	shift := rscale + db - da
+	if shift < 0 || shift >= len(pow10Uint64) {
+		return Datum{}, false
+	}
+	hi, lo := bits.Mul64(ma, pow10Uint64[shift])
+	if hi >= mb {
+		return Datum{}, false // the quotient needs more than 64 bits
+	}
+	q, r := bits.Div64(hi, lo, mb)
+	if r >= mb-r { // 2r >= mb: round half away from zero
+		q++
+		if q == 0 {
+			return Datum{}, false
+		}
+	}
+	if q > math.MaxInt64 {
+		return Datum{}, false
+	}
+	v := int64(q)
+	if negA != negB {
+		v = -v
+	}
+	return Datum{Kind: KindNumeric, Int: v, Scale: int16(rscale)}, true
+}
+
+// numericMagUint64 returns the magnitude and sign of a numeric's mantissa
+// when the magnitude fits a uint64, in either lane. A big-lane payload is
+// read in place — the sign byte and big-endian magnitude NewNumericBigDatum
+// writes, the encoding NumericBigValue decodes — without building a big.Int.
+func numericMagUint64(d Datum) (mag uint64, neg bool, ok bool) {
+	if !isBigNumeric(d) {
+		m := d.NumericMantissaValue()
+		if m < 0 {
+			return uint64(-(m + 1)) + 1, true, true
+		}
+		return uint64(m), false, true
+	}
+	buf := d.bigNumericPayload()
+	if len(buf) == 0 || len(buf) > 9 {
+		return 0, false, false
+	}
+	for _, c := range buf[1:] {
+		mag = mag<<8 | uint64(c)
+	}
+	return mag, buf[0]&0x80 != 0, true
+}
+
+// numericDivBig is numericDiv's big.Int path, for any operands.
+// bigNumericOne is the constant 1, read only.
+var bigNumericOne = big.NewInt(1)
+
+func numericDivBig(a, b Datum, pos int) (Datum, error) {
 	bm := numericMant(b)
 	if bm.Sign() == 0 {
 		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
@@ -883,40 +971,31 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 	// integer division produces a quotient with `rscale` fractional
 	// digits.
 	shift := rscale + db - da
-	num := new(big.Int).Set(am)
+	num := am // numericMant's result is this call's own: scale it in place
 	if shift > 0 {
-		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(shift)), nil)
-		num.Mul(num, scl)
+		num.Mul(num, pow10Big(shift))
 	} else if shift < 0 {
-		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(-shift)), nil)
-		num.Quo(num, scl)
+		num.Quo(num, pow10Big(-shift))
 	}
 
 	q, rem := new(big.Int).QuoRem(num, bm, new(big.Int))
 	// Round half-away-from-zero. With Go's Quo/QuoRem semantics
 	// (truncated division), the sign of `rem` matches the sign of
-	// `num`. We compare 2*|rem| against |bm|.
-	twoAbsRem := new(big.Int).Abs(rem)
-	twoAbsRem.Lsh(twoAbsRem, 1)
-	absB := new(big.Int).Abs(bm)
-	if twoAbsRem.Cmp(absB) >= 0 {
+	// `num`. We compare 2*|rem| against |bm|, in rem's own storage.
+	rem.Abs(rem)
+	rem.Lsh(rem, 1)
+	if rem.CmpAbs(bm) >= 0 {
 		// Increment magnitude by 1, preserving sign of q. When q
 		// is zero, the resulting sign comes from num*bm.
-		var bump *big.Int
+		neg := q.Sign() < 0
 		if q.Sign() == 0 {
-			// q is zero — sign comes from the numerator times
-			// the denominator's sign.
-			if (num.Sign() < 0) != (bm.Sign() < 0) {
-				bump = big.NewInt(-1)
-			} else {
-				bump = big.NewInt(1)
-			}
-		} else if q.Sign() > 0 {
-			bump = big.NewInt(1)
-		} else {
-			bump = big.NewInt(-1)
+			neg = (num.Sign() < 0) != (bm.Sign() < 0)
 		}
-		q.Add(q, bump)
+		if neg {
+			q.Sub(q, bigNumericOne)
+		} else {
+			q.Add(q, bigNumericOne)
+		}
 	}
 
 	return newNumeric(q, rscale), nil
@@ -940,10 +1019,8 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 // pure decimal model the weights differ by 1 and rscale would land
 // at 15.
 func numericDivScale(am, bm *big.Int, da, db int) int {
-	absA := new(big.Int).Abs(am).Text(10)
-	absB := new(big.Int).Abs(bm).Text(10)
-	w1, fd1 := nbaseWeightAndFirstDigit(absA, da)
-	w2, fd2 := nbaseWeightAndFirstDigit(absB, db)
+	w1, fd1 := nbaseWeightAndFirstDigit(am, da)
+	w2, fd2 := nbaseWeightAndFirstDigit(bm, db)
 	qweight := w1 - w2
 	if fd1 <= fd2 {
 		qweight--
@@ -964,22 +1041,31 @@ func numericDivScale(am, bm *big.Int, da, db int) int {
 	return rscale
 }
 
-// nbaseWeightAndFirstDigit converts a value `|mantissa| * 10^-dscale`
-// (with mantissa given as the decimal digit string of its absolute
-// value) into upstream's NumericVar weight + first NBASE digit. NBASE
-// is 10000 — each NBASE digit packs 4 consecutive decimal digits.
+// nbaseWeightAndFirstDigit converts a value `|mantissa| * 10^-dscale` into
+// upstream's NumericVar weight + first NBASE digit. NBASE is 10000 — each
+// NBASE digit packs 4 consecutive decimal digits.
 //
-// The MSB of the value sits at decimal position `nd - 1 - dscale`
-// (where nd = number of decimal digits). That MSB falls into NBASE
-// digit at position floor(MSBPos / 4). The first NBASE digit's value
-// is the 4-decimal-digit chunk aligned to that NBASE position,
-// padded on the right with zeros if the mantissa has fewer trailing
-// digits.
-func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int) {
-	if len(absStr) == 1 && absStr[0] == '0' {
+// The MSB of the value sits at decimal position `nd - 1 - dscale` (where nd =
+// number of decimal digits). That MSB falls into NBASE digit at position
+// floor(MSBPos / 4). The first NBASE digit's value is the 4-decimal-digit
+// chunk aligned to that NBASE position, i.e. the value's leading
+// MSBPos - 4*weight + 1 decimal digits.
+//
+// It works from the digit count and one division instead of the mantissa's
+// decimal string (M0122-0012 slice 67: two Text(10) conversions per numeric
+// division were TPC-DS Q39's HAVING filter's largest cost).
+func nbaseWeightAndFirstDigit(mant *big.Int, dscale int) (weight, firstdigit int) {
+	if mant.Sign() == 0 {
 		return 0, 0
 	}
-	nd := len(absStr)
+	abs := mant
+	if mant.Sign() < 0 {
+		abs = new(big.Int).Neg(mant)
+	}
+	if abs.IsUint64() {
+		return nbaseWeightAndFirstDigitUint64(abs.Uint64(), dscale)
+	}
+	nd := decimalDigitsBig(abs)
 	msbDecPos := nd - 1 - dscale
 	weight = msbDecPos / 4
 	if msbDecPos < 0 && msbDecPos%4 != 0 {
@@ -987,16 +1073,29 @@ func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int
 		// but upstream's weight uses floor for negative exponents.
 		weight--
 	}
-	posInNBASE := msbDecPos - 4*weight // 0..3
-	firstdigit = 0
-	for i := 0; i <= posInNBASE; i++ {
-		d := byte(0)
-		if i < nd {
-			d = absStr[i] - '0'
-		}
-		firstdigit = firstdigit*10 + int(d)
+	lead := msbDecPos - 4*weight + 1 // 1..4 leading decimal digits
+	if lead >= nd {
+		// Fewer digits than the chunk: the chunk is the whole value,
+		// padded with zeros on the right.
+		return weight, int(new(big.Int).Mul(abs, pow10Big(lead-nd)).Int64())
 	}
-	return weight, firstdigit
+	return weight, int(new(big.Int).Quo(abs, pow10Big(nd-lead)).Int64())
+}
+
+// nbaseWeightAndFirstDigitUint64 is nbaseWeightAndFirstDigit for a nonzero
+// magnitude that fits a uint64.
+func nbaseWeightAndFirstDigitUint64(u uint64, dscale int) (weight, firstdigit int) {
+	nd := decimalDigitsUint64(u)
+	msbDecPos := nd - 1 - dscale
+	weight = msbDecPos / 4
+	if msbDecPos < 0 && msbDecPos%4 != 0 {
+		weight--
+	}
+	lead := msbDecPos - 4*weight + 1
+	if lead >= nd {
+		return weight, int(u * pow10Uint64[lead-nd])
+	}
+	return weight, int(u / pow10Uint64[nd-lead])
 }
 
 // numericCmp compares two numeric values, returning -1/0/+1.

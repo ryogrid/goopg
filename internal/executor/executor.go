@@ -221,15 +221,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if err != nil {
 			return nil, err
 		}
-		jop := newJoinOp(p, left, right)
-		// Record the bounds the children were actually built with. The
-		// cooperative parallel hash build rebuilds the build-side subtree
-		// from the plan and must use the SAME bound; deriving it there is
-		// impossible (it depends on `bound`, i.e. on everything above this
-		// join). See joinOp.deformLeftBound.
-		jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
-		markScanBorrowChain(joinBorrowBuildChild(jop))
-		return maybeInstrument(p, jop, scope), nil
+		return finishJoinNode(p, left, right, leftBound, rightBound, scope), nil
 	case *optimizer.NestedLoopIndexJoin:
 		// EX1-02: the outer follows the left-side rule; inner rescans
 		// stay out (EX1-02b).
@@ -331,6 +323,9 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if aggregateBorrowsScanRows(p) {
 			markScanBorrowChain(child)
 		}
+		if aggregateIgnoresInputOrder(p) {
+			markDistinctUnordered(child)
+		}
 		return maybeInstrument(p, newAggregateOp(p, child), scope), nil
 	case *optimizer.WindowAgg:
 		child, err := buildNode(p.Child, deformBoundFull, scope)
@@ -410,10 +405,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// Same per-worker construction as Gather; the difference is entirely in
 		// how the leader consumes the streams. The GatherMerge keys (folded
 		// by deformBoundBelow) are leader-side consumers of the worker rows.
-		workerMergeBound := deformBoundBelow(p, bound)
-		return maybeInstrument(p, newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
-			return buildNode(p.Child, workerMergeBound, scope)
-		}), scope), nil
+		return maybeInstrument(p, newGatherMergeNode(p, bound), scope), nil
 	case *optimizer.Distinct:
 		child, err := buildNode(p.Child, deformBoundBelow(p, bound), scope)
 		if err != nil {
@@ -654,12 +646,26 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		if err != nil {
 			return nil, err
 		}
-		return finishSortNode(p, child, scope), nil
+		// The sorted rows reach only the consumers, and the sort itself
+		// reads its keys: it stores just those columns (M0122-0012 slice
+		// 71). TPC-DS Q97's worker sorts held whole 51-column join rows,
+		// built twice per row, to ship two of them.
+		return finishSortNodeLive(p, child, consumerLiveColumns(keys), scope), nil
 	case *optimizer.Gather:
 		// The workers' rows go only to these consumers, so a worker ships
 		// just the columns they read (M0122-0012 slice 39).
 		g := newGatherNode(p, bound)
 		g.liveCols = consumerLiveColumns(consumers)
+		return maybeInstrument(p, g, scope), nil
+	case *optimizer.GatherMerge:
+		// As Gather (M0122-0012 slice 63): the rows reach only these
+		// consumers and the leader's merge, which reads the GatherMerge keys,
+		// so a worker — and the leader's own participating tree — ships just
+		// those columns. TPC-DS Q78's three GroupAggregate → Gather Merge
+		// branches deep-copied every 50-column join row across the queue.
+		readers := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
+		g := newGatherMergeNodeFor(p, bound, readers)
+		g.liveCols = consumerLiveColumns(readers)
 		return maybeInstrument(p, g, scope), nil
 	case *optimizer.IncrementalSort:
 		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
@@ -668,8 +674,65 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 			return nil, err
 		}
 		return finishIncrementalSortNode(p, child, scope), nil
+	case *optimizer.Join:
+		// The join's left rows reach only the consumers (through the merged
+		// output) and the join's own predicate and left keys, so the left
+		// subtree is consumer-complete too (M0122-0012 slice 66). TPC-DS
+		// Q39's HashAggregate → Hash Join → Gather shipped every column of
+		// its inventory × date_dim × warehouse rows across the queue.
+		leftConsumers, ok := joinLeftConsumers(p, consumers)
+		if !ok {
+			break
+		}
+		leftBound, rightBound := deformJoinBounds(p, bound)
+		left, err := buildCompleteChild(p.Left, leftBound, leftConsumers, scope)
+		if err != nil {
+			return nil, err
+		}
+		right, err := buildNode(p.Right, rightBound, scope)
+		if err != nil {
+			return nil, err
+		}
+		return finishJoinNode(p, left, right, leftBound, rightBound, scope), nil
 	}
 	return buildNode(n, bound, scope)
+}
+
+// finishJoinNode wires a Join over its built children — shared by buildNode's
+// Join arm and buildCompleteChild so the two cannot drift.
+func finishJoinNode(p *optimizer.Join, left, right Operator, leftBound, rightBound int, scope *instrumenter) Operator {
+	jop := newJoinOp(p, left, right)
+	// Record the bounds the children were actually built with. The
+	// cooperative parallel hash build rebuilds the build-side subtree
+	// from the plan and must use the SAME bound; deriving it there is
+	// impossible (it depends on `bound`, i.e. on everything above this
+	// join). See joinOp.deformLeftBound.
+	jop.deformLeftBound, jop.deformRightBound = leftBound, rightBound
+	markScanBorrowChain(joinBorrowBuildChild(jop))
+	return maybeInstrument(p, jop, scope)
+}
+
+// newGatherMergeNode builds a GatherMerge whose workers each construct their
+// own tree over the partial plan, narrowed by the bound captured here —
+// newGatherNode's twin, shared by buildNode's arm and buildCompleteChild.
+func newGatherMergeNode(p *optimizer.GatherMerge, bound int) *gatherMergeOp {
+	return newGatherMergeNodeFor(p, bound, nil)
+}
+
+// newGatherMergeNodeFor is newGatherMergeNode for a Gather Merge whose rows
+// are read only by readers (the consumers of a consumer-complete parent plus
+// the merge keys): each participant's partial plan is then consumer-complete
+// too, so it is built through buildCompleteChild with those readers — the
+// worker Sort below stores only their columns (M0122-0012 slice 71). nil
+// readers build the partial plan normally.
+func newGatherMergeNodeFor(p *optimizer.GatherMerge, bound int, readers []optimizer.Expr) *gatherMergeOp {
+	workerMergeBound := deformBoundBelow(p, bound)
+	return newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
+		if readers != nil {
+			return buildCompleteChild(p.Child, workerMergeBound, readers, scope)
+		}
+		return buildNode(p.Child, workerMergeBound, scope)
+	})
 }
 
 // newGatherNode builds a Gather whose workers each construct their own tree
@@ -700,8 +763,16 @@ func newGatherNode(p *optimizer.Gather, bound int) *gatherOp {
 // (tuplesort_puttupleslot). TPC-DS Q97 cloned every store_sales and
 // catalog_sales probe row of the Parallel Hash Joins under its two sorts.
 func finishSortNode(p *optimizer.Sort, child Operator, scope *instrumenter) Operator {
+	return finishSortNodeLive(p, child, nil, scope)
+}
+
+// finishSortNodeLive is finishSortNode for a sort whose output is read only in
+// the columns live marks (nil = every column; sortOp.live).
+func finishSortNodeLive(p *optimizer.Sort, child Operator, live []bool, scope *instrumenter) Operator {
 	markScanBorrowChain(child)
-	return maybeInstrument(p, newSortOp(p, child), scope)
+	op := newSortOp(p, child)
+	op.live = live
+	return maybeInstrument(p, op, scope)
 }
 
 // finishIncrementalSortNode builds the IncrementalSort operator; a borrow root
@@ -716,7 +787,21 @@ func finishIncrementalSortNode(p *optimizer.IncrementalSort, child Operator, sco
 // marks (nil = all of them), threading the bound those targets need to its
 // child.
 func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instrumenter) (Operator, error) {
-	child, err := buildNode(p.Child, deformProjectBelow(p, bound, live), scope)
+	childBound := deformProjectBelow(p, bound, live)
+	var child Operator
+	var err error
+	// A projection's only reader of its child's rows is itself, and it
+	// evaluates just its live targets: its child is therefore
+	// consumer-complete, its consumers being those targets — the rule
+	// buildCompleteChild applies under an aggregate, one level down
+	// (M0122-0012 slice 53). TPC-DS Q14 stacks a re-expansion Project on
+	// another that lists every column of its lateral joins; built with every
+	// target live, that inner Project folded the joins' last column, and the
+	// store_sales, item and date_dim probes beneath deformed every column of
+	// every probed row. Slice 66 extends it past a child projection: TPC-DS
+	// Q39's aggregate reads a Project over a Hash Join over a Gather, whose
+	// workers shipped whole join rows.
+	child, err = buildCompleteChild(p.Child, childBound, liveProjectTargets(p, live), scope)
 	if err != nil {
 		return nil, err
 	}
@@ -728,6 +813,21 @@ func buildProjectNode(p *optimizer.Project, bound int, live []bool, scope *instr
 	pop := newProjectOp(p, child)
 	pop.live = live
 	return maybeInstrument(p, pop, scope), nil
+}
+
+// liveProjectTargets is p's targets that live marks (every target when live
+// is nil) — the expressions p evaluates against its child's rows.
+func liveProjectTargets(p *optimizer.Project, live []bool) []optimizer.Expr {
+	if live == nil {
+		return p.Targets
+	}
+	out := make([]optimizer.Expr, 0, len(p.Targets))
+	for i, t := range p.Targets {
+		if live[i] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func markProjectScanReads(p *optimizer.Project, child Operator, live []bool) {

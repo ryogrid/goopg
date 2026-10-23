@@ -58,3 +58,32 @@ func acquireRow(width int) Row {
 func releaseRow(r Row) {
 	_ = r
 }
+
+// rowChunkRows is how many rows of one width a rowChunk carves from a single
+// allocation.
+const rowChunkRows = 32
+
+// rowChunk hands out fresh rows carved from one shared backing array, so a
+// producer that emits many rows of one width pays one allocation per
+// rowChunkRows rows instead of one per row (M0122-0012 slice 66: a Gather
+// worker shipping TPC-DS Q39's 2.3 M join rows). It is not a pool: nothing
+// is reused, each row is still zeroed, owned by its consumer and collected
+// with the rest of its chunk. A consumer that retains one row keeps its
+// whole chunk alive, which rowChunkRows bounds. Every row's capacity is its
+// length, so an append on one row cannot write into its neighbour. A nil
+// *rowChunk falls back to acquireRow.
+type rowChunk struct {
+	buf []Datum
+}
+
+func (c *rowChunk) take(width int) Row {
+	if c == nil || width <= 0 {
+		return acquireRow(width)
+	}
+	if len(c.buf) < width {
+		c.buf = make([]Datum, width*rowChunkRows)
+	}
+	r := c.buf[:width:width]
+	c.buf = c.buf[width:]
+	return r
+}

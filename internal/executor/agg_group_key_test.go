@@ -68,3 +68,79 @@ func TestAppendGroupKeyMatchesSetGroupKey(t *testing.T) {
 		}
 	}
 }
+
+// TestSameSortedGroupMatchesSameGroupKey pins M0122-0012 slice 58: the sorted
+// Group compares a row's grouping values with the current group's stored
+// parts through appendGroupColKey and a reused buffer (sameSortedGroup),
+// instead of building evalGroupExprs' per-column datumKey strings for every
+// row. Each column's key must be exactly the part evalGroupExprs built
+// (datumKey, after trimStringDatum where gkTrims is set), and the group
+// decision must be sameGroupKey's, over the value kinds a group key takes —
+// NULL, bool, int, numeric, big numeric, padded and empty strings, bytes,
+// time, interval — with close pairs (equal after trimming, different kinds)
+// so both answers occur.
+func TestSameSortedGroupMatchesSameGroupKey(t *testing.T) {
+	rng := rand.New(rand.NewSource(58))
+	bigM, _ := new(big.Int).SetString("123456789012345678901234567890", 10)
+	pick := func() Datum {
+		switch rng.Intn(10) {
+		case 0:
+			return NullDatum
+		case 1:
+			return NewBoolDatum(rng.Intn(2) == 0)
+		case 2:
+			return NewIntDatum(int64(rng.Intn(3)))
+		case 3:
+			return Datum{Kind: KindNumeric, Int: int64(rng.Intn(3)), Scale: int16(rng.Intn(2))}
+		case 4:
+			return newNumeric(bigM, rng.Intn(2))
+		case 5:
+			return NewStringDatum([]string{"ab", "ab  ", "", " "}[rng.Intn(4)])
+		case 6:
+			return NewBytesDatum([]byte{byte(rng.Intn(2))})
+		case 7:
+			return NewTimeDatum(time.Unix(int64(rng.Intn(2)), 0).UTC())
+		case 8:
+			return NewIntervalDatumFull(int32(rng.Intn(2)), 0, 0)
+		default:
+			return NewStringDatum("2")
+		}
+	}
+	parts := func(o *aggregateOp, vals Row) []string {
+		keys := make([]string, len(vals))
+		for i, v := range vals {
+			if o.gkTrims[i] {
+				v = trimStringDatum(v)
+			}
+			keys[i] = datumKey(v)
+		}
+		return keys
+	}
+	same, differ := 0, 0
+	for trial := 0; trial < 5000; trial++ {
+		o := &aggregateOp{gkTrims: []bool{rng.Intn(2) == 0, rng.Intn(2) == 0, true}}
+		cur, row := Row{pick(), pick(), pick()}, Row{pick(), pick(), pick()}
+		if rng.Intn(3) == 0 {
+			copy(row, cur)
+		}
+		curParts, rowParts := parts(o, cur), parts(o, row)
+		for i, v := range row {
+			if got := string(o.appendGroupColKey(nil, i, v)); got != rowParts[i] {
+				t.Fatalf("column %d value %v trim=%v: appendGroupColKey %q, evalGroupExprs part %q", i, v, o.gkTrims[i], got, rowParts[i])
+			}
+		}
+		o.sCurParts = curParts
+		want := sameGroupKey(curParts, rowParts)
+		if got := o.sameSortedGroup(row); got != want {
+			t.Fatalf("cur %v row %v trims %v: sameSortedGroup %v, sameGroupKey %v", cur, row, o.gkTrims, got, want)
+		}
+		if want {
+			same++
+		} else {
+			differ++
+		}
+	}
+	if same < 500 || differ < 500 {
+		t.Fatalf("fixture too one-sided: %d same, %d different", same, differ)
+	}
+}

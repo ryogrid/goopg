@@ -348,6 +348,37 @@ type projectOp struct {
 	// them). A dead target's cell is set once at Open — NULL, or the deform
 	// poison when armed — and never written again. M0122-0012 slice 35.
 	live []bool
+	// colRef[i] is target i's input column when the target is a bare
+	// ColumnRef, else -1 (projectColRefs; filled on first Next).
+	colRef []int
+	// fast holds the targets compiled for evalFastExpr, target i rooted at
+	// fastIdx[i] (filled on first Next, kept across re-Opens). Before
+	// M0122-0012 slice 70 every non-column target ran evalExprSlot per
+	// row — TPC-DS Q75's `cs_quantity - COALESCE(cr_return_quantity, 0)`
+	// projections were a fifth of its leader; filters and aggregate
+	// arguments already ran compiled. Kinds the compiler does not know stay
+	// ExprAdapter nodes, which call evalExprSlot exactly as before.
+	fast    exprTreeSlab
+	fastIdx []int32
+}
+
+// projectColRefs maps each projection target that is a bare ColumnRef to its
+// input column, -1 otherwise. Next copies such a column straight from a
+// materialised input row into its output cell (M0122-0012 slice 58): the
+// value evalExprSlot's ColumnRef arm returns — slot.Get, a bare row index
+// for a *MaterializedSlot — without the 48-byte Datum it returns by value
+// being stored to the stack and reloaded (the datum-return store-forwarding
+// stall), which perf showed as projectOp's own hot instructions between a
+// Gather Merge and a sorted Group (TPC-DS Q97).
+func projectColRefs(targets []optimizer.Expr) []int {
+	refs := make([]int, len(targets))
+	for i, t := range targets {
+		refs[i] = -1
+		if cr, ok := t.(*optimizer.ColumnRef); ok {
+			refs[i] = cr.Index
+		}
+	}
+	return refs
 }
 
 func newProjectOp(plan *optimizer.Project, child Operator) *projectOp {
@@ -393,11 +424,33 @@ func (o *projectOp) Next() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i, t := range o.targets {
+	if len(o.colRef) != len(o.targets) {
+		o.colRef = projectColRefs(o.targets)
+	}
+	if len(o.fastIdx) != len(o.targets) {
+		o.fastIdx = make([]int32, len(o.targets))
+		for i, t := range o.targets {
+			o.fastIdx[i] = o.fast.buildExprCtx(t, o.ctx)
+		}
+	}
+	var inRow Row
+	if ms, ok := inSlot.(*MaterializedSlot); ok {
+		inRow = ms.row
+	}
+	for i := range o.targets {
 		if o.live != nil && !o.live[i] {
 			continue
 		}
-		v, err := evalExprSlot(t, inSlot, o.ctx)
+		if c := o.colRef[i]; c >= 0 && c < len(inRow) {
+			// evalExprSlot's ColumnRef arm for a *MaterializedSlot, copied
+			// in place; an out-of-range index takes that arm for its error.
+			o.out[i] = inRow[c]
+			if seqScanDeformPoison {
+				checkDeformPoison(o.out[i])
+			}
+			continue
+		}
+		v, err := evalFastExpr(o.fast, o.fastIdx[i], inSlot, o.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -996,6 +1049,20 @@ type sortOp struct {
 	plan *optimizer.Sort
 	keys []optimizer.SortKey
 	ctx  *Context
+	// keyText[i] reports key i's static type is a character string
+	// (sortKeyTextFlags, set by newSortOp): two string values of such a key
+	// compare as plain strings (lessKeyVals, M0122-0012 slice 60). A sortOp
+	// built without it compares through compareDatumTyped as before.
+	keyText []bool
+	// live, when set, marks the only columns of the input rows any reader
+	// of this sort's output reads (buildCompleteChild: its consumers and its
+	// keys). Only those cells are read and detached into the stored row; the
+	// rest stay NULL (the deform poison when armed). nil = every column.
+	// M0122-0012 slice 71.
+	live []bool
+	// liveSlot is the scratch slot the keys of a live-ingested row are
+	// evaluated on.
+	liveSlot MaterializedSlot
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -1084,8 +1151,28 @@ type sortCTID struct {
 	has   bool
 }
 
+// materializeLiveRow is slot.Materialize for a reader that reads only the
+// columns live marks: a fresh full-width row whose live cells are detached
+// from any producer arena and whose other cells are NULL — or poisoned when
+// the EX1-01 debug flag is armed, so a read of one panics.
+func materializeLiveRow(slot TupleSlot, live []bool) Row {
+	row := acquireRow(slot.Width())
+	if seqScanDeformPoison {
+		dead := deformPoisonDatum()
+		for i := range row {
+			row[i] = dead
+		}
+	}
+	for i := range min(len(live), len(row)) {
+		if live[i] {
+			row[i] = slot.Get(i).MaterializeArena()
+		}
+	}
+	return row
+}
+
 func newSortOp(plan *optimizer.Sort, child Operator) *sortOp {
-	return &sortOp{plan: plan, child: child, keys: plan.Keys}
+	return &sortOp{plan: plan, child: child, keys: plan.Keys, keyText: sortKeyTextFlags(plan.Keys)}
 }
 
 // SortStat is the per-plan-node sort instrumentation EXPLAIN (ANALYZE)
@@ -1182,7 +1269,13 @@ func (o *sortOp) Open(ctx *Context) error {
 		// across many Next() calls, so the slot's lifetime
 		// contract requires us to take ownership of an
 		// independent row. (M0071-0010 Stage B.)
-		ms := slot.Materialize()
+		var ms *MaterializedSlot
+		if o.live != nil && !o.packUse && !o.trackCTIDs {
+			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), materializeLiveRow(slot, o.live)
+			ms = &o.liveSlot
+		} else {
+			ms = slot.Materialize()
+		}
 		row := ms.Row()
 		// Keys are evaluated on the slot, not the bare Row: a `ctid` key
 		// reads the slot's carried tid and would read NULL from the Row,
@@ -1306,6 +1399,16 @@ func (o *sortOp) sortKeyValsView(view SlotView) ([]Datum, error) {
 	return kv, nil
 }
 
+// sortKeyTextFlags marks the sort keys whose static type is a character
+// string (exprIsCharacterString), for sortOp.keyText.
+func sortKeyTextFlags(keys []optimizer.SortKey) []bool {
+	flags := make([]bool, len(keys))
+	for i, k := range keys {
+		flags[i] = exprIsCharacterString(k.Expr)
+	}
+	return flags
+}
+
 // lessKeyVals is the comparator, over PRECOMPUTED key values. It is the same
 // rule lessRows applied — NULL placement by NullsFirst, then compareDatum,
 // then Desc — with the evaluation lifted out.
@@ -1321,12 +1424,25 @@ func (o *sortOp) lessKeyVals(a, b []Datum) bool {
 		if av.IsNull() && bv.IsNull() {
 			continue
 		}
-		cmp, err := compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr)
-		if err != nil {
-			if o.sortErr == nil {
-				o.sortErr = err
+		// fastCompareDatum decides same-kind int / time / numeric pairs
+		// exactly as compareDatum does (TestFastCompareDatumMatchesCompareDatum),
+		// and compareDatumTyped is compareDatum for every non-string pair
+		// (M0122-0012 slice 59). Two strings of a character-string key are
+		// compareText whatever their shape: compareDatumTyped takes it when
+		// the shape is ambiguous, and otherwise compareDatum's KindString
+		// arm is the same strings.Compare (slice 60).
+		cmp, ok := fastCompareDatum(&av, &bv)
+		if !ok && i < len(o.keyText) && o.keyText[i] && av.Kind == KindString && bv.Kind == KindString {
+			cmp, ok = strings.Compare(av.StringValue(), bv.StringValue()), true
+		}
+		if !ok {
+			var err error
+			if cmp, err = compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr); err != nil {
+				if o.sortErr == nil {
+					o.sortErr = err
+				}
+				return false
 			}
-			return false
 		}
 		if cmp == 0 {
 			continue

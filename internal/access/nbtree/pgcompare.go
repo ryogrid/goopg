@@ -215,9 +215,18 @@ func ComparePGIndexTupleKeyAttrs(desc *PGIndexKeyDesc, a, b []byte) (int, error)
 // zeroing a 384-byte scratch frame per call (M0122-0012 slice 33). Upstream's
 // _bt_compare reads each attribute only when it reaches it (nbtsearch.c).
 func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, nattsB int, err error) {
+	res, _, nattsA, nattsB, err = comparePGIndexTupleAttrsAt(desc, a, b)
+	return res, nattsA, nattsB, err
+}
+
+// comparePGIndexTupleAttrsAt is comparePGIndexTupleAttrs also reporting at,
+// the index of the attribute that decided res — min(nattsA, nattsB) when every
+// shared attribute is equal. The skip walk reads a group's position off one
+// comparison with it (BTree.CompareBoundAttrs, M0122-0012 slice 57).
+func comparePGIndexTupleAttrsAt(desc *PGIndexKeyDesc, a, b []byte) (res, at, nattsA, nattsB int, err error) {
 	nkey := desc.NKeyAtts()
 	if nkey == 0 {
-		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
+		return 0, 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples needs a key descriptor with at least one attribute")
 	}
 	if len(a) < SizeOfIndexTupleData || len(b) < SizeOfIndexTupleData {
 		// An operand too short to hold an IndexTupleData header is not a tuple
@@ -229,48 +238,90 @@ func comparePGIndexTupleAttrs(desc *PGIndexKeyDesc, a, b []byte) (res, nattsA, n
 		// indexFormat.compare fall back to the bytewise order, where an empty
 		// key sorts before every tuple — which IS minus infinity, so the
 		// descent lands on the leftmost leaf exactly as intended.
-		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples operand of %d/%d bytes is shorter than an index tuple header", len(a), len(b))
+		return 0, 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples operand of %d/%d bytes is shorter than an index tuple header", len(a), len(b))
 	}
 	if BTreeTupleIsPosting(a) || BTreeTupleIsPosting(b) {
 		// A posting list's key is a single value shared by many heap TIDs;
 		// comparing one is meaningful, but the heap-TID tiebreak below would
 		// have to pick which of its TIDs to use, and every caller that has a
 		// posting tuple in hand knows which. Refuse rather than guess.
-		return 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples does not accept posting-list tuples")
+		return 0, 0, 0, 0, fmt.Errorf("btree: ComparePGIndexTuples does not accept posting-list tuples")
 	}
 
 	nattsA = int(BTreeTupleGetNAtts(a, uint16(nkey)))
 	nattsB = int(BTreeTupleGetNAtts(b, uint16(nkey)))
 	if nattsA > nkey || nattsB > nkey {
-		return 0, 0, 0, fmt.Errorf("btree: tuple has %d/%d attributes, more than the descriptor's %d", nattsA, nattsB, nkey)
+		return 0, 0, 0, 0, fmt.Errorf("btree: tuple has %d/%d attributes, more than the descriptor's %d", nattsA, nattsB, nkey)
 	}
 	ncmp := min(nattsA, nattsB)
 	if ncmp == 0 {
-		return 0, nattsA, nattsB, nil
+		return 0, 0, nattsA, nattsB, nil
 	}
-	wa, err := newPGIndexTupleWalk(a)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
+	if res, at, done := compareFixedPrefix(desc, a, b, ncmp); done {
+		return res, at, nattsA, nattsB, nil
 	}
-	wb, err := newPGIndexTupleWalk(b)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
+	var wa, wb pgIndexTupleWalk
+	if err := wa.init(a); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
+	}
+	if err := wb.init(b); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
 	}
 	for i := range ncmp {
 		att := &desc.Attrs[i]
 		av, anull, err := wa.next(i, att.PGIndexAttr)
 		if err != nil {
-			return 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
+			return 0, 0, 0, 0, fmt.Errorf("btree: left tuple: %w", err)
 		}
 		bv, bnull, err := wb.next(i, att.PGIndexAttr)
 		if err != nil {
-			return 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
+			return 0, 0, 0, 0, fmt.Errorf("btree: right tuple: %w", err)
 		}
 		if res := att.compareAttr(av, anull, bv, bnull); res != 0 {
-			return res, nattsA, nattsB, nil
+			return res, i, nattsA, nattsB, nil
 		}
 	}
-	return 0, nattsA, nattsB, nil
+	return 0, ncmp, nattsA, nattsB, nil
+}
+
+// compareFixedPrefix is comparePGIndexTupleAttrs' cached-offset fast path,
+// index_getattr's attcacheoff branch (itup.h, M0122-0012 slice 55): when
+// neither tuple has a null bitmap, the data starts at MAXALIGN(sizeof
+// IndexTupleData) in both, and each fixed-width attribute sits at the same
+// aligned offset in both — so both values are sliced directly instead of
+// walked. It decides the comparison (done=true) when an attribute differs or
+// all ncmp attributes are fixed-width and equal. It declines (done=false) at
+// a null bitmap, an untrustworthy t_info size, a varlena/cstring attribute,
+// or an attribute that would overrun either tuple; the walk then runs from
+// the start and returns exactly what it always did — re-comparing the equal
+// prefix, and reporting the same overrun error.
+func compareFixedPrefix(desc *PGIndexKeyDesc, a, b []byte, ncmp int) (res, at int, done bool) {
+	tiA, tiB := pgTInfo(a), pgTInfo(b)
+	if (tiA|tiB)&IndexNullMask != 0 {
+		return 0, 0, false
+	}
+	sizeA, sizeB := int(tiA&IndexSizeMask), int(tiB&IndexSizeMask)
+	if sizeA > len(a) || sizeB > len(b) {
+		return 0, 0, false
+	}
+	off := MaxAlign(SizeOfIndexTupleData)
+	for i := range ncmp {
+		att := &desc.Attrs[i]
+		n := int(att.Len)
+		if n <= 0 {
+			return 0, 0, false
+		}
+		off = alignTo(off, att.AlignBy)
+		end := off + n
+		if end > sizeA || end > sizeB {
+			return 0, 0, false
+		}
+		if res := att.compareAttr(a[off:end], false, b[off:end], false); res != 0 {
+			return res, i, true
+		}
+		off = end
+	}
+	return 0, ncmp, true
 }
 
 func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {

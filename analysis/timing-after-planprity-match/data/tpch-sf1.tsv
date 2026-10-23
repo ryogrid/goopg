@@ -1,0 +1,24 @@
+query	pg_ms	goopg_ms	ratio_goopg_over_pg	notes
+Q1	1020	1310	1.28	PG p1=1.09s, PG 10-16 p2=1.09s; goopg p1=2.39s, slice-52 p2=1.25s
+Q2	210	670	3.19	PG p1=1.48s, PG 10-16 p2=0.23s; goopg p1=0.59s, slice-52 p2=0.55s; goopg Q2 bimodal (0.33-0.70s per slice-48/53 notes)
+Q3	210	430	2.05	PG p1=1.39s, PG 10-16 p2=0.24s; goopg p1=0.71s, slice-52 p2=0.39s
+Q4	110	190	1.73	PG p1=0.26s, PG 10-16 p2=0.12s; goopg p1=0.18s, slice-52 p2=0.17s
+Q5	300	400	1.33	PG p1=0.43s, PG 10-16 p2=0.28s; goopg p1=0.39s, slice-52 p2=0.35s; goopg bimodal run-to-run (slice-36 erratum)
+Q6	240	360	1.50	PG p1=0.36s, PG 10-16 p2=0.25s; goopg p1=0.34s, slice-52 p2=0.34s
+Q7	400	560	1.40	PG p1=0.47s, PG 10-16 p2=0.42s; goopg p1=0.55s, slice-52 p2=0.55s; goopg bimodal run-to-run (slice-36 erratum)
+Q8	170	160	0.94	PG p1=0.47s, PG 10-16 p2=0.18s; goopg p1=0.24s, slice-52 p2=0.17s
+Q9	440	520	1.18	PG p1=0.55s, PG 10-16 p2=0.42s; goopg p1=0.60s, slice-52 p2=0.50s
+Q10	620	960	1.55	PG p1=0.55s, PG 10-16 p2=0.63s; goopg p1=0.97s, slice-52 p2=0.94s
+Q11	110	90	0.82	PG p1=0.09s, PG 10-16 p2=0.10s; goopg p1=0.09s, slice-52 p2=0.09s; <0.1s, ratio dominated by 10ms runner resolution
+Q12	470	650	1.38	PG p1=0.43s, PG 10-16 p2=0.44s; goopg p1=0.69s, slice-52 p2=0.65s
+Q13	1500	1850	1.23	PG p1=1.32s, PG 10-16 p2=1.44s; goopg p1=2.31s, slice-52 p2=1.96s
+Q14	200	270	1.35	PG p1=0.18s, PG 10-16 p2=0.21s; goopg p1=0.28s, slice-52 p2=0.29s
+Q15				NO WARM PAIR: PG ref :65432 never times Q15 (runner's Q15 = CREATE VIEW, DDL forbidden on a reference cluster); warm goopg harness also skips 15. goopg-only single-shot acceptance arm (tmp/accept-s65, 2026-10-23, fresh server, partly cold): view body 1.36s + main 2.79s
+Q16	290	420	1.45	PG p1=0.35s, PG 10-16 p2=0.28s; goopg p1=0.60s, slice-52 p2=0.44s
+Q17	1730	1910	1.10	PG p1=1.51s, PG 10-16 p2=1.53s; goopg p1=2.19s, slice-52 p2=1.93s
+Q18	3390	3520	1.04	PG p1=3.57s, PG 10-16 p2=3.63s; goopg p1=3.77s, slice-52 p2=3.40s
+Q19	50	70	1.40	PG p1=0.05s, PG 10-16 p2=0.05s; goopg p1=0.07s, slice-52 p2=0.06s; <0.1s, ratio dominated by 10ms runner resolution
+Q20	210	200	0.95	PG p1=0.25s, PG 10-16 p2=0.21s; goopg p1=0.21s, slice-52 p2=0.19s
+Q21	530	810	1.53	PG p1=0.56s, PG 10-16 p2=0.57s; goopg p1=0.84s, slice-52 p2=0.81s
+Q22	60	110	1.83	PG p1=0.06s, PG 10-16 p2=0.06s; goopg p1=0.13s, slice-52 p2=0.11s; <0.1s, ratio dominated by 10ms runner resolution
+TOTAL(21, excl Q15)	12260	15460	1.26	sum of the rows above

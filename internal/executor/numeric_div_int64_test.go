@@ -99,7 +99,7 @@ func TestNumericDivInt64FastBasic(t *testing.T) {
 		// Force big.Int path
 		aBig := NewNumericBigDatum(big.NewInt(tc.am), tc.ascale)
 		bBig := NewNumericBigDatum(big.NewInt(tc.bm), tc.bscale)
-		slow, err := numericDiv(aBig, bBig, 0)
+		slow, err := numericDivBig(aBig, bBig, 0)
 		if err != nil {
 			t.Errorf("slow(%d/%d, %d/%d) error: %v", tc.am, tc.ascale, tc.bm, tc.bscale, err)
 			continue
@@ -138,7 +138,7 @@ func TestNumericDivInt64FastVsBigPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fast %d/%d ÷ %d/%d error: %v", am, ascale, bm, bscale, err)
 		}
-		slow, err := numericDiv(aBig, bBig, 0)
+		slow, err := numericDivBig(aBig, bBig, 0)
 		if err != nil {
 			t.Fatalf("slow %d/%d ÷ %d/%d error: %v", am, ascale, bm, bscale, err)
 		}
@@ -245,7 +245,7 @@ func TestNumericDivInt64FastQEqualsZeroSignHandling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fast %d/%d ÷ %d/%d error: %v", tc.am, tc.ascale, tc.bm, tc.bscale, err)
 		}
-		slow, err := numericDiv(aBig, bBig, 0)
+		slow, err := numericDivBig(aBig, bBig, 0)
 		if err != nil {
 			t.Fatalf("slow %d/%d ÷ %d/%d error: %v", tc.am, tc.ascale, tc.bm, tc.bscale, err)
 		}
