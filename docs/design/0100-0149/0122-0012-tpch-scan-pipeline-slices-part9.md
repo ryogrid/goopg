@@ -153,3 +153,63 @@ Values are identical:
 
 **Still bailing** (ledger row). A sublink whose plan, or whose CTE body, holds another unmodelled kind still stays on
 the stack path: WindowAgg, SetOp, RecursiveUnion and ProjectSet.
+
+## After slice 91 — measured, not landed (2026-10-24)
+
+**SubPlan cache census.** All 99 SF0.25 queries ran under EXPLAIN (ANALYZE) on the clone (`tmp/s92-subplan-census.sh`).
+Every SubPlan now hits its result cache, and the misses equal the distinct parameter values:
+
+| query | calls | hits | misses |
+|---|---|---|---|
+| Q1 | 12 881 | 12 874 | 7 |
+| Q6 | 6 514 | 6 503 | 11 |
+| Q10 | 2 278 | 2 277 | 1 |
+| Q30 | 3 210 | 3 158 | 52 |
+| Q35 | 6 427 | 6 426 | 1 |
+| Q41 | 245 | 173 | 72 |
+| Q45 | 1 616 | 1 615 | 1 |
+| Q81 | 6 893 | 6 841 | 52 |
+| Q92 | 38 | 34 | 4 |
+
+No SubPlan with `hits=0` is left, so slice 91 closed this lever.
+
+**A buffered stable merge sort for the sort operators** (sortChunk, sortPackedChunk, the window and incremental-sort
+permutations), replacing `sort.SliceStable`'s in-place SymMerge, which was 19 % of Q67. The output is identical by
+construction: a stable sort's result is unique, and a test against `sort.SliceStable` on lengths 0 to 4099 with ties
+passed.
+
+| measurement | change |
+|---|---|
+| Q67 instructions | −3.0 % |
+| Q47 instructions | −3.1 % |
+| Q51 instructions | −4.0 % |
+| Q67 serial cycles | +2.6 % (12.48 against 12.16 G, three runs each) |
+
+Dropped. Its full-array merge passes touch the scattered key values (48-byte Datums, string bytes behind them) more
+than SymMerge's localised work. The comparator's cost is memory access, not instruction count.
+
+**The cooperative parallel hash build's producer clone.** In Q95's `ws_wh` CTE, about 13 % of instructions is
+`cloneRowOwnedPrefix`, plus `memclr` and `malloc`, inside the producers of `parallelBuildLazyHashTable`. Q95 allocates
+1.5 GB and 4.6 M objects per run.
+
+- Each producer's seq scan clones every row up to its deform bound (about 18 of `web_sales`'s 34 columns) to hand it
+  across the channel.
+- The consumer's build loop then copies each row again (`retainBuildRow`), so the producer's copy is transient.
+- Recycling it needs the producer's scan to borrow, and a borrowed scan row keeps a stale, possibly arena-backed
+  tail past the deform bound. The generic `transferRowForQueue` also returns a row with no arena cell as-is, which
+  would hand the scan's reused row across the channel.
+
+A safe version copies only the build side's live columns into recycled batch storage that the consumer returns. That
+needs a design pass of its own.
+
+**Remaining gaps against release PG**, by absolute excess:
+
+- **Q14** (+3.6 s): 16 173 parameterised `store_sales_pkey` probes and 688 k heap fetches, and the `cross_items`
+  intersect build. This is the per-probe constant factor.
+- **Q23** (+1.4 s): the same index-probe class.
+- **Q67** (+1.1 s): sort comparisons over eight `char(n)` keys.
+- **Q95** (+1.0 s): the build clone above, plus 10 M CTE rows through two semi joins.
+
+**A rendering difference** found along the way: goopg's EXPLAIN ANALYZE prints `actual time` totals over all loops
+(Q14's `store_sales_pkey` scan shows `0.003..1857.725` with loops=16173), where PG prints per-loop averages. Plain
+EXPLAIN parity is unaffected. It is recorded here and in the ledger, not fixed.

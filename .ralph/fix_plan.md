@@ -2527,6 +2527,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - selfContainedPlan: non\-mutating body check \(lateral right / nested sublink one frame deeper, ExecParamRef
       refused\); CTEScan arm never enters the shared body\.
     - Q1 99\.2 → 1\.0 G instructions \(0\.108 s vs release PG 7\.2 s\), Q81 31\.4 → 0\.99 G, Q30 7\.25 → 0\.49 G\.
+  - Post\-slice\-91 recon 2026\-10\-24 \(no code landed; doc part 9 "After slice 91"\):
+    - SubPlan cache census over all 99 SF0\.25 queries: no `hits=0` SubPlan remains\.
+    - Dropped: buffered stable merge sort \(Q67 −3 % instructions but \+2\.6 % serial cycles\)\.
+    - Next lever, needs design: cooperative hash build producers clone every build row \(Q95 ~13 %\) that the
+      consumer copies again; recycling requires a borrow\-safe transfer\.
+    - Ledger: EXPLAIN ANALYZE actual time prints loop totals, PG prints per\-loop averages\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -2589,6 +2595,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     ANALYZE on such a plan is distorted until this is understood\.
   - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
     timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
+- [ ] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
+  Kind: impl
+  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Parent: none
+  - Filed 2026\-10\-24 from M0122\-0012 post\-slice\-91 recon\. TPC\-DS Q14 on the SF0\.25 clone:
+    `Index Scan using store\_sales\_pkey … \(actual time=0\.003\.\.1857\.725 rows=42\.54 loops=16173\)` — rows is the
+    per\-loop average but time is the total; PG's ExplainNode \(explain\.c\) divides startup and total time by nloops\.
+  - Resume point: internal/executor/operators\_explain\.go, the actual\-time renderer: divide by loops as explain\.c
+    does; ledger row 2026\-10\-24 \(post slice 91 recon\)\.
 - [ ] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
   Kind: impl
   Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
@@ -4865,6 +4880,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-24 — **exhausted at `4cf358ae6`** \(M0122\-0012 slice 90 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261024c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `8532a71e3`** \(M0122\-0012 slice 91 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
