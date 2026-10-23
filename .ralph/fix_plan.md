@@ -785,6 +785,27 @@ heuristic stays live.)
     inListConst\.coercedItems once both paths agree\.
   - Expected instrument: the repro identical to `analysis/p0e10/pg18\.out`; TPC\-H/TPC\-DS values unchanged\.
 
+- [ ] **P0\-E11 — numeric division of a zero dividend prints the wrong display scale**
+  \(filed 2026\-10\-23 by the loop, M0122\-0012 slice 74 output comparison; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro text differs from PG on every column\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-23 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e11/zero\-dividend\-scale\-repro\.sql`; PG 18\.3 output
+    > `analysis/p0e11/pg18\.out`, goopg output `analysis/p0e11/goopg\-cb3e7e6b6\.out`\.
+  - Symptom: `0::numeric / 3` → goopg `0`, PG `0\.00000000000000000000`; `0::numeric / 12345\.67` → goopg `0\.00`, PG
+    `0\.000000000000000000000000`\. Visible in TPC\-DS Q12 / Q20 / Q98 output \(revenueratio of a zero\-revenue item\);
+    the sf025 checksum normalises trailing zeros, so the gate does not see it\.
+  - Cause \(read\): numericDiv's zero\-numerator short\-circuits — numericDivInt64Fast, numericDivBig, and
+    numericDivScaleInt64's "defensive" zero return — use max\(dscale\_a, dscale\_b\)\. PG's select\_div\_scale
+    \(numeric\.c\) treats a zero dividend as weight 0 / first digit 0 and still derives rscale from the divisor, then
+    div\_var returns zero at that scale\.
+  - First step: drop the zero short\-circuits in favour of numericDivScale\(am, bm, da, db\) \(nbaseWeightAndFirstDigit
+    already answers \(0, 0\) for a zero mantissa, PG's rule\) in both the int64 and big paths; keep the 22012 check
+    first\.
+  - Expected instrument: the repro identical to `analysis/p0e11/pg18\.out`; Q12/Q20/Q98 outputs identical to
+    :65438 tpcds025\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -2314,6 +2335,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Q87 23\.73 → 13\.11 Ginstr \(−44\.8 %\), warm 0\.633 → 0\.371 s \(PG 0\.30\); Q38 −45\.4 %; outputs identical to PG\.
     - Census leads for next slices: Q72 inventory\_pkey index scan 20×, Q67/Q51 Sorts 10×/330×, Q17/Q25/Q29
       catalog\_sales\_pkey index scan where PG reads 0 rows\.
+  - **Slice 74 — a presorted, partitioned window consumes its input one partition at a time LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7 "Slice 74"\.
+    - Rows census: Q51's Sort emitted 169 297 rows into the WindowAgg where PG's emitted 506 — windowOp drained its
+      whole input at Open; PG spools one partition at a time \(spool\_tuples / begin\_partition\), so LIMIT stops it\.
+    - streamsPartitions \(Presorted \+ PARTITION BY\) → spoolPartition per partition with a one\-row lookahead; run
+      condition skips the buffer; empty input still evaluates the frame offsets \(ExecWindowAgg all\_first\); offsets
+      and the aggregate helper cached per scan \(pinned vs whole\-input over 7 window queries; early\-stop pinned;
+      mutation\-checked\)\.
+    - Q51 11\.91 → 9\.94 Ginstr \(−16\.5 %\), Sort now 514 rows; Q67 −4\.6 %; Q47 \+0\.8 %, Q57 \+0\.7 % \(per\-partition
+      overhead\); 9 window queries' outputs identical to PG\.
+    - Census triage: Q17/Q25/Q29 = EXPLAIN ANALYZE pre\-Filter row count \(filed M0122\-0017\); Q44 = WindowAgg
+      run\-condition early stop still reads the sorted input to the end \(cheap\)\.
+    - Discovery filed: P0\-E11 \(S2, zero\-dividend numeric scale\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -2345,6 +2380,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       steady state 1\.09–1\.11 s\.
     - Left: `internal/utils/mmgr/mctx.go`'s permanentContext comment still says big numerics allocate there —
       fix in the next executor slice \(a comment\-only change after the gates would have invalidated their stamps\)\.
+- [ ] **M0122-0017 — EXPLAIN ANALYZE counts an index scan's rows before its own Filter**\.
+  Kind: impl
+  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Parent: none
+  - Filed 2026\-10\-23 from the M0122\-0012 slice\-73/74 per\-node rows census \(tmp/rows\-census\.sh\)\.
+  - TPC\-DS Q17 / Q25 / Q29: `Index Scan using catalog\_sales\_pkey … Filter: \(cs\_bill\_customer\_sk = …\)` reports
+    `actual rows=25\.63 loops=7511` with `Rows Removed by Filter: 26`; PG reports `rows=0\.00` — PG counts the tuples the
+    node returns \(InstrStopNode after ExecScan's qual\), goopg counts them before the Filter\.
+  - Resume point: the instrumentation wrapper around an index scan with a pushed\-down Filter \(maybeInstrument
+    placement vs the filterOp the builder adds\) — count emitted rows, keep Rows Removed by Filter as is\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4508,6 +4553,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `d92a36e6f`** \(M0122\-0012 slice 72 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `cb3e7e6b6`** \(M0122\-0012 slice 73 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

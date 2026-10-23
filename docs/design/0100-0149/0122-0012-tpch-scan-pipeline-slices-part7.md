@@ -281,3 +281,60 @@ Q87's and Q38's outputs are byte-identical to the `tpcds025` reference's. Values
 61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and plan shapes are identical.
 
 **Left.** The census's other leads (Q72, Q67, Q51, Q17/Q25/Q29) are the next slices' targets.
+
+## Slice 74 (2026-10-23): a presorted, partitioned window consumes its input one partition at a time — TPC-DS Q51, Q67
+
+**Target (from the rows census).** Q51's WindowAgg sits under `Limit 100` / `Subquery Scan … Filter`. PG's Sort
+under it emitted 506 rows; goopg's emitted all 169 297. `windowOp.Open` drained its whole input, then evaluated every
+window function for every row before returning one. PG's WindowAgg spools one partition at a time (`spool_tuples` /
+`begin_partition`, `nodeWindowAgg.c`), so a LIMIT above stops it after the partitions it needed. Q67 (255 K
+against 25 K) has the same shape.
+
+**Change.**
+
+- **When it streams.** `streamsPartitions` holds when the plan delivers the input already sorted (`Presorted`; the
+  in-operator sort needs every row first) and there is a PARTITION BY.
+- **How.** `Open` spools only the first partition. `Next` spools the next one when the buffer runs out
+  (`spoolPartition`), keeping the row that ended a partition as the next one's first (`pending`). `evalWindowFuncs`
+  is unchanged: given one partition's rows it evaluates exactly that partition, and it skips re-detecting partition
+  boundaries on a streaming buffer.
+- **Run Condition.** A failed Run Condition in a partitioned window now skips the rest of the buffer, which is the
+  rest of the partition (WINDOWAGG\_PASSTHROUGH\_STRICT).
+- **Frame offsets.** An empty input still evaluates the frame offsets once, as `ExecWindowAgg` does on its first call
+  (`calculate_frame_offsets` under `all_first`). They and the frame-aggregate helper are resolved once per scan.
+
+**Pins.**
+
+- `TestWindowStreamingMatchesWholeInput`: seven window queries over seven random partitions, run streaming and
+  with `windowStreamPartitions` off, return identical rows. They cover row\_number/rank/dense\_rank;
+  sum/count/avg; lag/lead/first\_value/last\_value; ntile/percent\_rank/cume\_dist; a whole-partition aggregate;
+  a rank filter; and a LIMIT.
+- `TestWindowStreamingStopsAtThePartitionItNeeds`: emitting the first partition reads exactly its rows plus one,
+  and the whole scan reads every row once.
+- Losing the lookahead row fails both tests.
+
+**Measured** against `cb3e7e6b6`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q51 | 11.91 | 9.94 (−16.5 %); its Sort now emits 514 rows |
+| Q67 | 28.26 | 26.95 (−4.6 %) |
+| Q47, Q57 | 18.88, 9.22 | 19.03 (+0.8 %), 9.28 (+0.7 %): per-partition spool overhead over many small partitions |
+| Q44, Q89, Q70, Q86, Q36, Q12 | — | within ±0.3 % |
+
+The outputs of Q51, Q67, Q44, Q47, Q57, Q89, Q70, Q86 and Q36 are byte-identical to the `:65438` `tpcds025`
+reference's. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS;
+TestPort\_Isolation PASS), and plan shapes are identical.
+
+**Census triage and discoveries.**
+
+- **Q17/Q25/Q29** were not executor waste. goopg's EXPLAIN ANALYZE counts an index scan's rows before its own
+  Filter (`rows=25.63` beside `Rows Removed by Filter: 26`), where PG counts the rows the node returns. Filed as
+  M0122-0017.
+- **Q12/Q20/Q98** outputs differ from PG, as they already did at HEAD. A zero dividend's numeric division prints
+  scale max(dscale) (`0`, `0.00`) where PG's `select_div_scale` derives it from the divisor
+  (`0.00000000000000000000`). Filed as P0-E11, an S2 escalation awaiting owner placement.
+- **Left.** Within a partition goopg still evaluates every window function for every row at spool time; PG
+  evaluates them as rows are returned (`eval_windowfunction` per output row, with pass-through after a failed Run
+  Condition). Q44's top-N window therefore still reads its sorted input to the end. A non-presorted window still
+  drains its input.

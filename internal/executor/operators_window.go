@@ -55,6 +55,22 @@ type windowOp struct {
 	// (M0146-0236).
 	wantCTIDs bool
 	ctids     []sortCTID
+
+	// streaming is set for a presorted, partitioned window (streamsPartitions):
+	// rows holds ONE partition at a time and Next spools the next one when it
+	// runs out, as nodeWindowAgg.c's spool_tuples / begin_partition do, so a
+	// LIMIT above stops the input after the partitions it needed (M0122-0012
+	// slice 74: TPC-DS Q51's Sort emitted all 169 297 rows into the window
+	// where PG's emitted 506). pending is the next partition's first row,
+	// read while finding this one's end; childDone marks the input's end.
+	streaming  bool
+	pending    Row
+	pendingTID sortCTID
+	childDone  bool
+	// offsetsResolved marks the frame offsets evaluated for this scan, and
+	// aggHelper is the frame-aggregate accumulator reused across partitions.
+	offsetsResolved bool
+	aggHelper       *aggregateOp
 }
 
 func newWindowOp(plan *optimizer.WindowAgg, child Operator) *windowOp {
@@ -82,6 +98,16 @@ func (o *windowOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	if err := o.child.Open(ctx); err != nil {
 		return err
+	}
+	if o.streamsPartitions() {
+		o.streaming = true
+		o.rows, o.ctids, o.idx = nil, nil, 0
+		o.pending, o.childDone, o.offsetsResolved = nil, false, false
+		// The first partition is spooled here, so an empty input still runs
+		// evalWindowFuncs once: ExecWindowAgg evaluates the frame offsets on
+		// its first call (calculate_frame_offsets) before it looks for a
+		// partition, and raises their errors over empty input too.
+		return o.spoolPartition(true)
 	}
 	for {
 		slot, err := o.child.Next()
@@ -215,6 +241,88 @@ func (o *windowOp) Open(ctx *Context) error {
 	return nil
 }
 
+// streamsPartitions reports whether the window can consume its input one
+// partition at a time: the plan delivers it sorted by PARTITION BY ++ ORDER BY
+// (Presorted — no in-operator sort, which needs every row first) and there is
+// a PARTITION BY to split it on.
+func (o *windowOp) streamsPartitions() bool {
+	return windowStreamPartitions && o.plan.Presorted && len(o.plan.PartitionBy) > 0
+}
+
+// windowStreamPartitions turns partition streaming off for tests comparing it
+// with the whole-input evaluation.
+var windowStreamPartitions = true
+
+// spoolPartition replaces rows with the next partition of the sorted input —
+// the pending row and every following row with its partition key — appends
+// the window-function columns and evaluates them over it (evalWindowFuncs
+// splits whatever rows hold into partitions, here exactly one). first runs the
+// evaluation even when the input is empty (see Open).
+func (o *windowOp) spoolPartition(first bool) error {
+	rows := make([]Row, 0, 64)
+	var ctids []sortCTID
+	var key string
+	if o.pending != nil {
+		k, err := o.partitionKey(o.pending)
+		if err != nil {
+			return err
+		}
+		key = k
+		rows = append(rows, o.pending)
+		if o.wantCTIDs {
+			ctids = append(ctids, o.pendingTID)
+		}
+		o.pending = nil
+	}
+	for !o.childDone {
+		slot, err := o.child.Next()
+		if err == EOF {
+			o.childDone = true
+			break
+		}
+		if err != nil {
+			return err
+		}
+		var tid sortCTID
+		if o.wantCTIDs {
+			b, off, ok := slot.TID()
+			tid = sortCTID{block: b, off: off, has: ok}
+		}
+		row := slot.Materialize().Row()
+		dup := make(Row, len(row))
+		copy(dup, row)
+		k, err := o.partitionKey(dup)
+		if err != nil {
+			return err
+		}
+		if len(rows) > 0 && k != key {
+			o.pending, o.pendingTID = dup, tid
+			break
+		}
+		key = k
+		rows = append(rows, dup)
+		if o.wantCTIDs {
+			ctids = append(ctids, tid)
+		}
+	}
+	o.rows, o.ctids, o.idx = rows, ctids, 0
+	if len(rows) == 0 && !first {
+		return nil
+	}
+	if n := len(o.plan.Funcs); n > 0 {
+		for i := range o.rows {
+			out := make(Row, 0, len(o.rows[i])+n)
+			out = append(out, o.rows[i]...)
+			for j := 0; j < n; j++ {
+				out = append(out, NullDatum)
+			}
+			o.rows[i] = out
+		}
+		return o.evalWindowFuncs()
+	}
+	return nil
+}
+
 func (o *windowOp) evalWindowFuncs() error {
 	if len(o.plan.Funcs) == 0 {
 		return nil
@@ -225,8 +333,10 @@ func (o *windowOp) evalWindowFuncs() error {
 	}
 
 	// Find partition start indices (rows are already sorted by partition key).
+	// A streaming window's buffer is exactly one partition: spoolPartition
+	// already compared every row's key, so they are not compared again.
 	pStarts := []int{0}
-	if len(o.rows) > 0 {
+	if len(o.rows) > 0 && !o.streaming {
 		prevKey, err := o.partitionKey(o.rows[0])
 		if err != nil {
 			return err
@@ -248,13 +358,19 @@ func (o *windowOp) evalWindowFuncs() error {
 	// (numeric-exact sums, float4/float8 formatting, NULL-skipping,
 	// FILTER support) for frame-consuming window aggregates. Its
 	// methods only touch o.ctx, so a bare instance is safe to share.
-	aggHelper := &aggregateOp{ctx: o.ctx}
+	if o.aggHelper == nil || o.aggHelper.ctx != o.ctx {
+		o.aggHelper = &aggregateOp{ctx: o.ctx}
+	}
+	aggHelper := o.aggHelper
 
 	// A frame's offset expressions are evaluated once per query, not
 	// per row or per partition (PG forbids column/aggregate/window
 	// references in them for exactly this reason) — mirrors
 	// limitOp.Open's once-per-query LIMIT/OFFSET evaluation.
-	if fr := o.plan.Frame; fr != nil {
+	// A streaming window calls this once per partition; the offsets are
+	// resolved on the first call only (ExecWindowAgg's all_first).
+	if fr := o.plan.Frame; fr != nil && !o.offsetsResolved {
+		o.offsetsResolved = o.streaming
 		if fr.Mode == parser.FrameModeRange {
 			// RANGE value offsets are compared against the ORDER BY column
 			// value (value±offset), so the offset keeps its native type
@@ -1328,7 +1444,13 @@ func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool, e optimi
 func (o *windowOp) Next() (TupleSlot, error) {
 	for {
 		if o.idx >= len(o.rows) {
-			return nil, EOF
+			if !o.streaming || (o.childDone && o.pending == nil) {
+				return nil, EOF
+			}
+			if err := o.spoolPartition(false); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		row := o.rows[o.idx]
 		o.idx++
@@ -1350,6 +1472,12 @@ func (o *windowOp) Next() (TupleSlot, error) {
 		if len(o.plan.PartitionBy) == 0 {
 			o.idx = len(o.rows)
 			return nil, EOF
+		}
+		if o.streaming {
+			// The buffer is this partition: its remaining rows are skipped
+			// (WINDOWAGG_PASSTHROUGH_STRICT) and the next one is spooled.
+			o.idx = len(o.rows)
+			continue
 		}
 		key, err := o.partitionKey(row)
 		if err != nil {
@@ -1383,6 +1511,8 @@ func (o *windowOp) emit(row Row, i int) TupleSlot {
 func (o *windowOp) Close() error {
 	o.rows = nil
 	o.ctids = nil
+	o.pending = nil
+	o.childDone = false
 	o.ctx = nil
 	o.idx = 0
 	return o.child.Close()
