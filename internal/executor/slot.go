@@ -185,7 +185,16 @@ func (s *VirtualSlot) Materialize() *MaterializedSlot {
 	// skipped the MaterializeArena step that MaterializedSlot's
 	// own Materialize and drainRowsBounded both perform
 	// (datum.go:425-434 cloneRowOwned; spill.go:395).
-	return &MaterializedSlot{schema: s.schema, row: cloneRowOwned(s.Row())}
+	//
+	// One pass: each cell is read once and detached into the owned row,
+	// which is cloneRowOwned(s.Row()) without the intermediate full row
+	// Row() built and the copy dropped (M0122-0012 slice 71: a sort over a
+	// join's VirtualSlot allocated and copied every row twice).
+	row := acquireRow(len(s.cols))
+	for i := range row {
+		row[i] = s.Get(i).MaterializeArena()
+	}
+	return &MaterializedSlot{schema: s.schema, row: row}
 }
 
 // Release on a VirtualSlot is a no-op — backing storage lives in

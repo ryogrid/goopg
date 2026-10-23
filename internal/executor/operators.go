@@ -1054,6 +1054,15 @@ type sortOp struct {
 	// compare as plain strings (lessKeyVals, M0122-0012 slice 60). A sortOp
 	// built without it compares through compareDatumTyped as before.
 	keyText []bool
+	// live, when set, marks the only columns of the input rows any reader
+	// of this sort's output reads (buildCompleteChild: its consumers and its
+	// keys). Only those cells are read and detached into the stored row; the
+	// rest stay NULL (the deform poison when armed). nil = every column.
+	// M0122-0012 slice 71.
+	live []bool
+	// liveSlot is the scratch slot the keys of a live-ingested row are
+	// evaluated on.
+	liveSlot MaterializedSlot
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -1140,6 +1149,26 @@ type sortCTID struct {
 	block uint32
 	off   uint16
 	has   bool
+}
+
+// materializeLiveRow is slot.Materialize for a reader that reads only the
+// columns live marks: a fresh full-width row whose live cells are detached
+// from any producer arena and whose other cells are NULL — or poisoned when
+// the EX1-01 debug flag is armed, so a read of one panics.
+func materializeLiveRow(slot TupleSlot, live []bool) Row {
+	row := acquireRow(slot.Width())
+	if seqScanDeformPoison {
+		dead := deformPoisonDatum()
+		for i := range row {
+			row[i] = dead
+		}
+	}
+	for i := range min(len(live), len(row)) {
+		if live[i] {
+			row[i] = slot.Get(i).MaterializeArena()
+		}
+	}
+	return row
 }
 
 func newSortOp(plan *optimizer.Sort, child Operator) *sortOp {
@@ -1240,7 +1269,13 @@ func (o *sortOp) Open(ctx *Context) error {
 		// across many Next() calls, so the slot's lifetime
 		// contract requires us to take ownership of an
 		// independent row. (M0071-0010 Stage B.)
-		ms := slot.Materialize()
+		var ms *MaterializedSlot
+		if o.live != nil && !o.packUse && !o.trackCTIDs {
+			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), materializeLiveRow(slot, o.live)
+			ms = &o.liveSlot
+		} else {
+			ms = slot.Materialize()
+		}
 		row := ms.Row()
 		// Keys are evaluated on the slot, not the bare Row: a `ctid` key
 		// reads the slot's carried tid and would read NULL from the Row,

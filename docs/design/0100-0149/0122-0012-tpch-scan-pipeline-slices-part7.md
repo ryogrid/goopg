@@ -125,3 +125,56 @@ identical. The executor package passes with the deform poison armed.
 
 **Left.** The scan deform (`decodeRowRangeInfo`, 15 % of Q75) walks every column up to the last one read. PG's
 `attcacheoff` jumps straight to fixed-offset attributes in tuples without NULLs.
+
+## Slice 71 (2026-10-23): a sort read only by consumer-complete readers stores just their columns, a Gather Merge's partial plan is built for its readers, and a VirtualSlot materialises in one pass — TPC-DS Q97, Q78
+
+**Target.** Q97 is the largest warm gap on the SF0.25 clone: 0.36 s against PG's 0.11 s. Each side runs
+`Group → Gather Merge → Sort → Parallel Hash Join (sales × date_dim)`. A split profile put 20 % of the worker
+samples in `transferRowForQueueLive`, sitting on the load of a sorted row's cell. Those are cache misses: each
+worker Sort stored whole join rows (store\_sales × date\_dim, about 51 cells, roughly 2.4 KB each), and the
+Gather Merge ships 3 of them. Each row was also built twice on the way in: `slot.Materialize()` on the join's
+VirtualSlot was `cloneRowOwned(s.Row())`, so it allocated and copied a full row, then copied it again.
+
+**Change.**
+
+- **One-pass `Materialize`.** `VirtualSlot.Materialize` detaches each cell once into the owned row
+  (`MaterializeArena` of `Get(i)`). That is `cloneRowOwned(Row())` without the intermediate row and copy, and it
+  benefits every caller.
+- **`sortOp.live`.** It is set by `buildCompleteChild`'s Sort arm to the columns the consumers and the sort keys
+  read (`finishSortNodeLive`). Ingestion then reads and detaches only those cells (`materializeLiveRow`: a fresh
+  full-width row, other cells NULL, or the deform poison when armed). Rows keep the schema width, so no reader
+  sees a short row. It is skipped when the sort tracks ctids, or uses the packed representation (off by default).
+- **`newGatherMergeNodeFor`.** A Gather Merge built under a consumer-complete parent passes its readers (the
+  consumers plus its merge keys, the same set as its `liveCols`) to each participant's partial plan. That plan is
+  then built through `buildCompleteChild`, so the worker Sort learns its live columns. A Gather Merge built
+  anywhere else keeps the plain build.
+
+**Pins.**
+
+- `TestVirtualSlotMaterializeOwnsEveryCell`: one-pass `Materialize` equals `cloneRowOwned(Row())` and survives
+  the producer arena's reset. Dropping the detach fails it.
+- `TestSortForConsumerCompleteReadersStoresLiveColumns`: under a sum aggregate, the Gather Merge's worker Sort
+  stores columns [3 5 11] (group column, merge key, aggregate argument). A top-level Gather Merge's sort stores
+  every column. Not passing the readers fails it.
+- `TestSortWithLiveIngestionSortsLiveCells`: sorting with a live mask orders by the key, keeps the live cells,
+  and leaves the dead one NULL. Ignoring the mask fails it.
+- The executor package passes with the deform poison armed. So does an SF0.25 sweep on a poison-armed binary
+  (PASS=99, 61 ck), so no reader touches a cell a sort leaves dead.
+
+**Measured** against `cabdb6039`:
+
+| query | HEAD Ginstr | candidate Ginstr | warm wall / user CPU (s), HEAD → candidate |
+|---|---|---|---|
+| Q97 | 7.65 | 7.42 (−3.0 %) | 0.350–0.357 / 0.70 → 0.341–0.344 / 0.66 |
+| Q78 | 27.57 | 24.50 (−11.1 %) | |
+| Q35, Q51 | 10.45, 12.12 | 10.25 (−1.9 %), 11.90 (−1.8 %) | |
+| Q87, Q38, Q75 | — | within ±0.1 % | |
+
+The warm timings come from `tmp/ds-warm.sh` after 8 Q39 runs, so both servers are past the heap plateau.
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS), and plan shapes are
+identical.
+
+**Left.** The stored rows still have the schema's full width (about 2.4 KB for Q97), so a sorted scan still
+misses cache once per row. PG's tuplesort stores MinimalTuples of the sort's own narrow targetlist. Narrow
+storage would need the sort to emit full-width rows from compact ones without breaking readers that keep a row
+across `Next`.

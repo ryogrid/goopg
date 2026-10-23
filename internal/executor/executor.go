@@ -646,7 +646,11 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		if err != nil {
 			return nil, err
 		}
-		return finishSortNode(p, child, scope), nil
+		// The sorted rows reach only the consumers, and the sort itself
+		// reads its keys: it stores just those columns (M0122-0012 slice
+		// 71). TPC-DS Q97's worker sorts held whole 51-column join rows,
+		// built twice per row, to ship two of them.
+		return finishSortNodeLive(p, child, consumerLiveColumns(keys), scope), nil
 	case *optimizer.Gather:
 		// The workers' rows go only to these consumers, so a worker ships
 		// just the columns they read (M0122-0012 slice 39).
@@ -659,8 +663,9 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 		// so a worker — and the leader's own participating tree — ships just
 		// those columns. TPC-DS Q78's three GroupAggregate → Gather Merge
 		// branches deep-copied every 50-column join row across the queue.
-		g := newGatherMergeNode(p, bound)
-		g.liveCols = consumerLiveColumns(append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...))
+		readers := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
+		g := newGatherMergeNodeFor(p, bound, readers)
+		g.liveCols = consumerLiveColumns(readers)
 		return maybeInstrument(p, g, scope), nil
 	case *optimizer.IncrementalSort:
 		keys := append(append([]optimizer.Expr(nil), consumers...), deformSortKeyExprs(p.Keys)...)
@@ -711,8 +716,21 @@ func finishJoinNode(p *optimizer.Join, left, right Operator, leftBound, rightBou
 // own tree over the partial plan, narrowed by the bound captured here —
 // newGatherNode's twin, shared by buildNode's arm and buildCompleteChild.
 func newGatherMergeNode(p *optimizer.GatherMerge, bound int) *gatherMergeOp {
+	return newGatherMergeNodeFor(p, bound, nil)
+}
+
+// newGatherMergeNodeFor is newGatherMergeNode for a Gather Merge whose rows
+// are read only by readers (the consumers of a consumer-complete parent plus
+// the merge keys): each participant's partial plan is then consumer-complete
+// too, so it is built through buildCompleteChild with those readers — the
+// worker Sort below stores only their columns (M0122-0012 slice 71). nil
+// readers build the partial plan normally.
+func newGatherMergeNodeFor(p *optimizer.GatherMerge, bound int, readers []optimizer.Expr) *gatherMergeOp {
 	workerMergeBound := deformBoundBelow(p, bound)
 	return newGatherMergeOp(p, func(scope *instrumenter) (Operator, error) {
+		if readers != nil {
+			return buildCompleteChild(p.Child, workerMergeBound, readers, scope)
+		}
 		return buildNode(p.Child, workerMergeBound, scope)
 	})
 }
@@ -745,8 +763,16 @@ func newGatherNode(p *optimizer.Gather, bound int) *gatherOp {
 // (tuplesort_puttupleslot). TPC-DS Q97 cloned every store_sales and
 // catalog_sales probe row of the Parallel Hash Joins under its two sorts.
 func finishSortNode(p *optimizer.Sort, child Operator, scope *instrumenter) Operator {
+	return finishSortNodeLive(p, child, nil, scope)
+}
+
+// finishSortNodeLive is finishSortNode for a sort whose output is read only in
+// the columns live marks (nil = every column; sortOp.live).
+func finishSortNodeLive(p *optimizer.Sort, child Operator, live []bool, scope *instrumenter) Operator {
 	markScanBorrowChain(child)
-	return maybeInstrument(p, newSortOp(p, child), scope)
+	op := newSortOp(p, child)
+	op.live = live
+	return maybeInstrument(p, op, scope)
 }
 
 // finishIncrementalSortNode builds the IncrementalSort operator; a borrow root

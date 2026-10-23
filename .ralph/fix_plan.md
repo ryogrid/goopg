@@ -2278,6 +2278,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       mutation\-checked\)\.
     - Q75 12\.27 → 11\.71 Ginstr \(−4\.6 %\); Q11 −1\.4 %, Q4 −0\.9 %, Q39 −0\.8 %; seven others within ±0\.3 %\.
     - Next: scan deform \(decodeRowRangeInfo 15 % of Q75\) — PG attcacheoff for null\-free tuples; or Q97 / Q87\.
+  - **Slice 71 — a sort read only by consumer\-complete readers stores just their columns; Gather Merge partial plans
+    built for their readers; one\-pass VirtualSlot\.Materialize LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3
+    instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same \(also PASS=99 on a poison\-armed binary\),
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7 "Slice 71"\.
+    - Named target TPC\-DS Q97 \(warm 0\.36 vs PG 0\.11\): worker Sorts stored ~51\-cell join rows built twice per row;
+      transferRowForQueueLive stalled on cache misses reading them \(20 % of worker samples\)\.
+    - sortOp\.live / materializeLiveRow / finishSortNodeLive; newGatherMergeNodeFor; VirtualSlot\.Materialize one pass
+      \(pinned; mutation\-checked\)\.
+    - Q97 7\.65 → 7\.42 Ginstr \(−3\.0 %\), warm user CPU −5 %; Q78 −11\.1 %, Q35 −1\.9 %, Q51 −1\.8 %; Q87/Q38/Q75 flat\.
+    - Rule b: slices 70 \(Q75 −4\.6 %\) and 71 \(Q97 −3\.0 %\) both ≥ 3 % → no yield\.
+    - Next: narrow sort storage \(PG tuplesort MinimalTuple of the sort targetlist\) — the remaining Q97 cache misses;
+      or the attcacheoff deform\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4454,6 +4466,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `606717ffc`** \(M0122\-0012 slice 69 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `cabdb6039`** \(M0122\-0012 slice 70 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
