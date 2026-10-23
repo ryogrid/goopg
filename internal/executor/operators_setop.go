@@ -316,11 +316,11 @@ func (o *setOp) computeBuffered() error {
 		o.lTrims = merge(o.lTrims)
 		o.rTrims = merge(o.rTrims)
 	}
-	leftRows, _, err := drainSetOpInput(o.left, o.lTrims)
+	leftRows, _, err := drainSetOpInput(o.left, o.lTrims, false)
 	if err != nil {
 		return err
 	}
-	rightRows, rightCount, err := drainSetOpInput(o.right, o.rTrims)
+	rightRows, rightCount, err := drainSetOpInput(o.right, o.rTrims, true)
 	if err != nil {
 		return err
 	}
@@ -411,9 +411,22 @@ func (o *setOp) computeExcept(leftRows []Row, rightCount map[string]int) {
 
 // drainSetOpInput fully consumes an operator, returning the cloned rows in
 // order plus a multiset count keyed by rowKey.
-func drainSetOpInput(op Operator, trims []bool) ([]Row, map[string]int, error) {
+func drainSetOpInput(op Operator, trims []bool, wantCounts bool) ([]Row, map[string]int, error) {
 	var rows []Row
-	counts := make(map[string]int)
+	// The duplicate counts are keyed by the row key, formed in one reused
+	// buffer and looked up without a conversion (M0122-0012 slice 81): a key
+	// string is allocated once per distinct key, not once per row. TPC-DS
+	// Q14's INTERSECT of three ~190 k-row inputs has 3.8 k distinct keys.
+	// The left input's counts are never read (computeBuffered), so it forms
+	// no keys at all.
+	var (
+		keyBuf []byte
+		slots  map[string]int
+		counts []int
+	)
+	if wantCounts {
+		slots = make(map[string]int)
+	}
 	for {
 		slot, err := op.Next()
 		if err == EOF {
@@ -427,9 +440,25 @@ func drainSetOpInput(op Operator, trims []bool) ([]Row, map[string]int, error) {
 		}
 		owned := cloneRow(slot.Row())
 		rows = append(rows, owned)
-		counts[rowKeyTrimmed(owned, nil, trims)]++
+		if !wantCounts {
+			continue
+		}
+		keyBuf = appendRowKeyTrimmed(keyBuf[:0], owned, nil, trims)
+		if i, ok := slots[string(keyBuf)]; ok {
+			counts[i]++
+			continue
+		}
+		slots[string(keyBuf)] = len(counts)
+		counts = append(counts, 1)
 	}
-	return rows, counts, nil
+	if !wantCounts {
+		return rows, nil, nil
+	}
+	out := make(map[string]int, len(slots))
+	for k, i := range slots {
+		out[k] = counts[i]
+	}
+	return rows, out, nil
 }
 
 // currentTID implements currentTIDProvider for partition UNION ALL scans

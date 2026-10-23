@@ -464,8 +464,13 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		o.enumTypes = nil
 		o.colInfo = nil
 	}
-	o.tids = nil
-	o.poss = nil
+	// The TID batch keeps its capacity across Open/Close (M0122-0012 slice
+	// 81): a parameterised inner scan under a lateral join is closed and
+	// re-opened per outer row — PG's ExecReScan keeps the scan's state — and
+	// nil slices made every probe regrow both batches from zero (80 % of the
+	// index scan's batch append was growslice on TPC-DS Q14).
+	o.tids = o.tids[:0]
+	o.poss = o.poss[:0]
 	o.killList = nil
 	o.idx = 0
 	o.hasLast = false
@@ -1354,8 +1359,9 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 func (o *indexScanOp) Close() error {
 	o.finalizeIndexScanSSI() // M0142-0005b: record the deferred gap-lock decision
 	o.flushKills()           // C3-S3: mark pending kills before releasing state
-	o.tids = nil
-	o.poss = nil
+	// Capacity kept for a re-Open (see openPrep).
+	o.tids = o.tids[:0]
+	o.poss = o.poss[:0]
 	o.killList = nil
 	o.cur = nil
 	o.saopBounds = nil

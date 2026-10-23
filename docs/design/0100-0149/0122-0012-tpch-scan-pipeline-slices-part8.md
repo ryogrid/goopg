@@ -87,3 +87,66 @@ Values are identical:
   `comparePGIndexTuples`) is about 12 % of Q14.
 - **The descent.** It is per rescan, as in PG, but costs more per level.
 - **Allocation.** Q14 still allocates 4.5 GB and 46 M objects per run.
+
+## Slice 81 — a re-opened inner index scan keeps its batch, and a set-op drain forms one key per distinct row
+
+**Target.** Q14's allocation: 4.46 GB and 46.0 M objects per run after slice 80. I attributed allocation samples
+(the first non-runtime frame above `mallocgc` / `growslice`) in a 20 s profile. The top sources:
+
+1. `indexScanOp.scanAppendEntry`, 80 % of it `growslice`.
+2. `decodePhysicalPGValueLowered`: string columns decoded with no arena, one Go string each.
+3. `drainSetOpInput`: `appendRowKeyTrimmed`'s `strconv` growth, one key string per row.
+
+**Diagnosis.**
+
+- **Batch regrowth.** The lateral join stream re-opens its right subtree for every outer row (`stepOuter` →
+  `right.Open`, `finishOuter` → `Close`). `indexScanOp.Open` and `Close` both set the TID batches `tids` / `poss` to
+  nil, so every probe regrew both from zero, about 7 doublings for Q14's 42-row probes. PG's `ExecReScan` keeps the
+  scan state.
+- **Wasted keys.** `computeBuffered` drains both set-op inputs with `drainSetOpInput`, which builds a key string for
+  every row. The left input's counts are discarded (`leftRows, _, err`). The right input's 190 k rows have 3.8 k
+  distinct keys.
+
+**Change** (`internal/executor`):
+
+- **Keep the batch.** `indexScanOp.Open` / `Close` truncate `tids` / `poss` to length 0 instead of setting them to
+  nil.
+- **One key per distinct row.** `drainSetOpInput` takes `wantCounts`, so the left input forms no keys. The right
+  input forms each key in one reused buffer, looks it up without a conversion in a key → slot index, and increments
+  the slot. A key string is allocated once per distinct key, and the map it returns is the same.
+- **Key format unchanged.** The integer key stays decimal text: `appendRowKeyTrimmed` canonicalises an int and a
+  numeric spelling of one value to one key (`1` ≡ `1.00`).
+
+**Pins.**
+
+- `TestDrainSetOpInputCountsMatchRowKeys`: the counts equal the per-row `rowKeyTrimmed` counts on a fixture whose
+  7 rows collapse to 4 keys through int/numeric, bpchar-trim and NULL canonicalisation. A drain without counts
+  returns every row and no map.
+- Not incrementing a duplicate fails it.
+
+**Measured** against `afdfe9869`:
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q14 objects allocated per run | 45.96 M | 32.57 M (−29 %) |
+| Q14 bytes allocated per run | 4.46 GB | 4.20 GB (−6 %) |
+| Q14 instructions | 143.99 G | 139.86 G (−2.9 %) |
+| Q38, Q87 | 12.23, 12.46 G | 12.10, 12.33 G (−1.1 %) |
+| Q8 | — | flat |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left** (ledger row).
+
+- **Index scans decode dead string columns.** An index scan decodes every column up to its deform bound with no
+  arena, so `item_pkey`'s probes copy `i_item_id`, `i_item_desc`, `i_brand` and `i_class` into new strings per row.
+  The seq scan walks past dead columns (`colTypeInfo.skip`, `readCols`), but the read set reaches only a scan
+  directly under a Project. An index scan on a nested loop's inner side has no such parent; it needs a join-aware
+  read set.
+- **Bytes per run.** The 4.2 GB per run is dominated by these decoded rows and the sort and set-op row copies.

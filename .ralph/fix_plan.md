@@ -2419,6 +2419,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       ResetScanCursor\. Byte\-identity pinned vs indexProbeKey; mutation\-checked\.
     - Q14 −4\.9 % instructions, −13 % bytes / −21 % objects allocated; Q17 −4\.5 %, Q25 −2\.9 %\.
     - Left: leafScanStart's generic comparator \(~12 % of Q14\); Q14 still allocates 4\.5 GB / 46 M objects per run\.
+  - **Slice 81 — a re\-opened inner index scan keeps its batch; a set\-op drain forms one key per distinct row LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 81"\.
+    - Target: Q14's per\-run allocation \(tmp/ds\-alloc\.sh\)\. Allocation\-sample attribution: scanAppendEntry growslice
+      \(the lateral stream re\-opens the inner per outer row; Open/Close nil'd the TID batches\), string decode, and
+      drainSetOpInput's per\-row key strings \(the left input's counts are discarded\)\.
+    - Open/Close keep tids/poss capacity; drainSetOpInput\(wantCounts\) with a reused key buffer \+ key→slot index\.
+      Pinned \(counts vs rowKeyTrimmed incl\. int/numeric, bpchar, NULL canonicalisation\); mutation\-checked\.
+    - Q14 objects 45\.96 M → 32\.57 M per run \(−29 %\), bytes −6 %, instructions −2\.9 %; Q38/Q87 −1\.1 %\.
+    - Ledger row: index scans decode dead string columns \(needs a join\-aware read set for inner\-side scans\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4691,6 +4702,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `71a749a8e`** \(M0122\-0012 slice 79 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `afdfe9869`** \(M0122\-0012 slice 80 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
