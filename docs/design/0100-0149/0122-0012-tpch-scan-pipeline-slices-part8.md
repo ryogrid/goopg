@@ -592,3 +592,78 @@ Values are identical:
 - spotcheck PASS;
 - RegressSuite PASS;
 - TestPort\_Isolation PASS.
+
+## Slice 89 — a character-string comparison of in-place operands compares them where they lie
+
+**Target.** Q2 and Q59 run seven `sum(CASE WHEN d_day_name = '<day>' THEN … END)` arms per joined row, and
+`d_day_name` is `char(9)`. In Q2, `evalFastExpr`, `evalFastCase` and `evalFastBinaryApply` made up about 30 % of
+instructions.
+
+Each comparison took a long path:
+
+- two operand calls through `evalFastExpr`, each returning a 48-byte Datum;
+- the literal-coercion probe;
+- `fastBinarySimple`, which refuses strings;
+- `evalFastBinaryApply`, which copies the operands again before its plain-string branch (slice 30) decides the
+  comparison with `strings.Compare`.
+
+Slice 75's in-place comparison excludes character strings on purpose. Testing per row whether a string comparison
+could go in place cost Q81 9 % more instructions there.
+
+**Change** (`exprnode.go`, the BinaryOp arm of `evalFastExpr`).
+
+- **The lane.** A comparison compiled as a character-string comparison (payload bit 4), where no literal is coerced to
+  KindString, reads both operands in place with `fastOperandPtr`: a row's column, an outer row's column, a parameter
+  or a constant.
+- **Deciding it there.** When both are strings and both are `plainCompareString`, the lane trims trailing blanks by the
+  same bpchar rule and returns `strings.Compare`. That is exactly the plain-string branch the general path reaches: two
+  strings fail `fastBinarySimple`, and `coerceUnknownLit` replaces a literal only opposite an operand of the coerced
+  kind, which a string is not.
+- **Fallback.** Anything else falls through unchanged.
+- **The plain test is conservative here.** For a pair compiled with bit 4, the shape-ambiguous strings also compare as
+  text (`binaryTextComparison`), but the lane stays inside the domain slice 30 established.
+
+**Pins.**
+
+- `TestStringCompareInPlaceMatchesInterpreted` compares compiled and interpreted results for every comparison
+  operator, across 11 operand pairs and 9 rows × 3 outer rows. The pairs cover:
+  - bpchar against a literal, both ways;
+  - text against a padded and an unpadded literal;
+  - bpchar against text;
+  - an outer bpchar column;
+  - the empty string, '1/2', '(a', a uuid-length value, and NULLs.
+- Dropping the bpchar trim fails it.
+
+**Measured** against `8c2d59d66` (instructions:u per run):
+
+| query | before | after | change |
+|---|---|---|---|
+| Q81 | 44.49 G | 36.90 G | −17 % |
+| Q30 | 10.10 G | 8.45 G | −16 % |
+| Q2 | 9.57 G | 8.93 G | −6.7 % |
+| Q59 | 12.91 G | 12.09 G | −6.4 % |
+| Q43 | — | — | −2.7 % |
+| Q7, Q26, Q85 | — | — | flat |
+| Q13, Q48 | — | — | +0.3 to +0.4 % |
+
+The Q13 and Q48 increase is the failed in-place attempt on their bpchar quals.
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Measured and not landed this loop.**
+
+- **Reading a compact sort's stored rows straight into the queue.** The idea was to skip the sort's `expandInto` and
+  the `transferRowCompact` re-pick for a compact Gather Merge (Q78's top flat cost, `sortOp.Next`). It cut 0.8 % of
+  Q78's instructions and left cycles flat (7.44 vs 7.44 G). The cost is the cache-missing load of the sorted rows,
+  which moves with the read rather than going away.
+
+**A warning about wall-clock ratios.** A warm 99-query sweep (`tmp/ds-warm.sh`) ranks wall time against release PG
+unreliably for queries that follow a heavy one. Q2 measured 673 ms right after Q1, but 250 ms in steady state.
+Instruction counts stay the instrument.

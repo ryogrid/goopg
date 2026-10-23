@@ -598,6 +598,33 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				}
 			}
 		}
+		// A character-string comparison of two operands that live somewhere
+		// already compares them in place when both are plain strings: that
+		// is evalFastBinaryApply's plain-string branch (slice 30), reached
+		// without copying four Datums through the two operand calls and the
+		// apply. The general path gets there the same way — two strings fail
+		// fastBinarySimple, and coerceUnknownLit replaces a literal only
+		// opposite an operand of the coerced kind, which a string is not
+		// when that kind is not KindString. TPC-DS Q2's and Q59's seven
+		// `CASE WHEN d_day_name = '<day>'` arms per row went the long way
+		// (M0122-0012 slice 89).
+		if op.IsComparison() && n.payload[16]&4 != 0 && (n.constVal == nil || DatumKind(n.payload[17]) != KindString) {
+			if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && lp.Kind == KindString {
+				if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && rp.Kind == KindString {
+					if ls, rs := lp.StringValue(), rp.StringValue(); plainCompareString(ls) && plainCompareString(rs) {
+						if lbp, rbp := binary.LittleEndian.Uint32(n.payload[8:]), binary.LittleEndian.Uint32(n.payload[12:]); lbp > 0 || rbp > 0 {
+							if lbp > 0 || n.payload[16]&1 != 0 {
+								ls = strings.TrimRight(ls, " ")
+							}
+							if rbp > 0 || n.payload[16]&2 != 0 {
+								rs = strings.TrimRight(rs, " ")
+							}
+						}
+						return NewBoolDatum(cmpResult(op, strings.Compare(ls, rs))), nil
+					}
+				}
+			}
+		}
 		left, err := evalFastExpr(exprs, n.childA, slot, ctx)
 		if err != nil {
 			return Datum{}, err
