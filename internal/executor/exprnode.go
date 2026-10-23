@@ -76,6 +76,7 @@ const (
 	ExprConstVal           // constVal = a subtree folded to a value at build time
 	ExprCase               // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
 	ExprNullTest           // payload[0] = 1 for IS NOT NULL; childA = operand
+	ExprCoalesce           // childA = first argument, childB = the rest (another ExprCoalesce, or the last argument)
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -365,6 +366,21 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		}
 		return idx
 
+	case *optimizer.FuncCall:
+		// M0122-0012 slice 70: COALESCE compiles, so a projection such as
+		// TPC-DS Q75's `cs_quantity - COALESCE(cr_return_quantity, 0)` no
+		// longer drops the whole target to evalExprSlot per row. evalFuncCall's
+		// "coalesce" arm is the reference: the first non-NULL argument as is,
+		// arguments evaluated in order and an argument's error raised. That is
+		// coalesce(a, coalesce(b, ...)), so the arguments chain through childB.
+		// Every other function keeps the adapter.
+		if strings.EqualFold(t.Name, "coalesce") && len(t.Args) > 0 {
+			return s.buildCoalesce(t.Args, ctx)
+		}
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+		return idx
+
 	case *optimizer.UnaryOp:
 		idx := int32(len(*s))
 		*s = append(*s, ExprNode{Kind: ExprUnaryOp})
@@ -382,6 +398,21 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 		return idx
 	}
+}
+
+// buildCoalesce compiles COALESCE(args...) as an ExprCoalesce chain: the
+// first argument and the COALESCE of the rest; a single argument is itself.
+func (s *exprTreeSlab) buildCoalesce(args []optimizer.Expr, ctx *Context) int32 {
+	if len(args) == 1 {
+		return s.buildExprCtx(args[0], ctx)
+	}
+	idx := int32(len(*s))
+	*s = append(*s, ExprNode{Kind: ExprCoalesce})
+	childA := s.buildExprCtx(args[0], ctx)
+	childB := s.buildCoalesce(args[1:], ctx)
+	(*s)[idx].childA = childA
+	(*s)[idx].childB = childB
+	return idx
 }
 
 // evalFastColumnRefErr raises the out-of-range (or nil-slot) ColumnRef error
@@ -598,6 +629,15 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 
 	case ExprCase:
 		return evalFastCase(exprs, n.caseInfo, slot, ctx)
+
+	case ExprCoalesce:
+		// evalFuncCall's "coalesce" arm: the first non-NULL argument, an
+		// argument's error raised, the rest left unevaluated.
+		v, err := evalFastExpr(exprs, n.childA, slot, ctx)
+		if err != nil || !v.IsNull() {
+			return v, err
+		}
+		return evalFastExpr(exprs, n.childB, slot, ctx)
 
 	default:
 		return Datum{}, fmt.Errorf("executor: evalFastExpr: unknown ExprKind %d at idx %d", n.Kind, idx)

@@ -351,6 +351,15 @@ type projectOp struct {
 	// colRef[i] is target i's input column when the target is a bare
 	// ColumnRef, else -1 (projectColRefs; filled on first Next).
 	colRef []int
+	// fast holds the targets compiled for evalFastExpr, target i rooted at
+	// fastIdx[i] (filled on first Next, kept across re-Opens). Before
+	// M0122-0012 slice 70 every non-column target ran evalExprSlot per
+	// row — TPC-DS Q75's `cs_quantity - COALESCE(cr_return_quantity, 0)`
+	// projections were a fifth of its leader; filters and aggregate
+	// arguments already ran compiled. Kinds the compiler does not know stay
+	// ExprAdapter nodes, which call evalExprSlot exactly as before.
+	fast    exprTreeSlab
+	fastIdx []int32
 }
 
 // projectColRefs maps each projection target that is a bare ColumnRef to its
@@ -418,11 +427,17 @@ func (o *projectOp) Next() (TupleSlot, error) {
 	if len(o.colRef) != len(o.targets) {
 		o.colRef = projectColRefs(o.targets)
 	}
+	if len(o.fastIdx) != len(o.targets) {
+		o.fastIdx = make([]int32, len(o.targets))
+		for i, t := range o.targets {
+			o.fastIdx[i] = o.fast.buildExprCtx(t, o.ctx)
+		}
+	}
 	var inRow Row
 	if ms, ok := inSlot.(*MaterializedSlot); ok {
 		inRow = ms.row
 	}
-	for i, t := range o.targets {
+	for i := range o.targets {
 		if o.live != nil && !o.live[i] {
 			continue
 		}
@@ -435,7 +450,7 @@ func (o *projectOp) Next() (TupleSlot, error) {
 			}
 			continue
 		}
-		v, err := evalExprSlot(t, inSlot, o.ctx)
+		v, err := evalFastExpr(o.fast, o.fastIdx[i], inSlot, o.ctx)
 		if err != nil {
 			return nil, err
 		}

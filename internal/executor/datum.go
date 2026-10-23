@@ -925,6 +925,37 @@ func formatNumeric(mantissa int64, scale int16) string {
 	return out
 }
 
+// appendFormatNumeric appends formatNumeric(mantissa, scale) to buf without
+// building the intermediate strings (M0122-0012 slice 70: dedup keys format
+// every numeric column of every row). A non-positive scale and MinInt64 keep
+// formatNumeric itself, whose output is the definition.
+func appendFormatNumeric(buf []byte, mantissa int64, scale int16) []byte {
+	if scale <= 0 || mantissa == math.MinInt64 {
+		if scale == 0 {
+			return strconv.AppendInt(buf, mantissa, 10)
+		}
+		return append(buf, formatNumeric(mantissa, scale)...)
+	}
+	abs := mantissa
+	if mantissa < 0 {
+		buf = append(buf, '-')
+		abs = -mantissa
+	}
+	var tmp [20]byte
+	digits := strconv.AppendInt(tmp[:0], abs, 10)
+	sc := int(scale)
+	if sc >= len(digits) {
+		buf = append(buf, '0', '.')
+		for range sc - len(digits) {
+			buf = append(buf, '0')
+		}
+		return append(buf, digits...)
+	}
+	buf = append(buf, digits[:len(digits)-sc]...)
+	buf = append(buf, '.')
+	return append(buf, digits[len(digits)-sc:]...)
+}
+
 // numericText returns d formatted as the canonical NUMERIC text,
 // transparently dispatching to formatNumericBig for the *big.Int
 // lane and formatNumeric for the int64 fast path.

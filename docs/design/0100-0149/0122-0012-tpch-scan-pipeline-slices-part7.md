@@ -69,3 +69,59 @@ allocate there (M0122-0016's leftover). `mmgr.Perm()` now has no production call
 **Left.** goopg's other hashed DISTINCT consumers (a hash join's build side, a hashed SetOp, a semi-join's
 unique-ified inner) are also order-insensitive but keep the sort. Each needs its own proof that nothing above it
 depends on the order, as the aggregate's does here.
+
+## Slice 70 (2026-10-23): projections run compiled, COALESCE compiles, and dedup keys are built in a reused buffer — TPC-DS Q75
+
+**Target.** After slice 69, Q75's whole-query instruction profile, workers included, showed two per-row costs:
+
+- **Projections.** `projectOp.Next` ran `evalExprSlot` for every non-column target, about a fifth of the query,
+  with per-row `strings.ToLower`, bpchar-typmod lookups and a numeric literal re-parsed each row. Q75's
+  `cs_quantity - COALESCE(cr_return_quantity, 0)` targets went through the interpreter on every row. Filters
+  and aggregate arguments already ran compiled; the legacy projection never did. The compiler also left
+  `COALESCE` (a `FuncCall`) as an `ExprAdapter`.
+- **Dedup keys.** The UNION's hashed DISTINCT built each row's key with `rowKeyTrimmed`: a `strings.Builder` over
+  every column's `Format()` string (`strconv.FormatInt`, `formatNumeric`), plus a clone of every input row,
+  duplicates included.
+
+**Change.**
+
+- **`projectOp` runs compiled.** It compiles its targets once, on the first `Next`, into `fast` / `fastIdx`
+  (`buildExprCtx`, so literal-only subtrees fold) and keeps them across re-Opens. Non-column targets evaluate
+  through `evalFastExpr`. Kinds the compiler does not know stay `ExprAdapter` nodes, which call `evalExprSlot`
+  as before. Bare column targets keep slice 58's in-place copy.
+- **`ExprCoalesce`.** `COALESCE(a, b, …)` compiles to a chain: the first argument and the COALESCE of the rest.
+  `evalFastExpr` returns the first non-NULL argument as is, raises an argument's error, and leaves the remaining
+  arguments unevaluated. That is evalFuncCall's `"coalesce"` arm, which stays the interpreted reference.
+- **Keys in a reused buffer.** `appendRowKeyTrimmed` appends `rowKeyTrimmed`'s key: the same `|`-separated
+  `Format()` text with trailing decimal zeros stripped, and `<NULL>`. An int, string, byte or int64-lane numeric
+  column appends directly (`appendFormatNumeric` is `formatNumeric` without its intermediate strings).
+  `rowKeyTrimmed` is now a wrapper over it, so its five callers cannot drift. `distinctOp` looks keys up as
+  `seen[string(buf)]` without allocating, and clones and keeps a key string only for a row that starts a new key.
+
+**Pins.**
+
+- `TestCoalesceCompiledMatchesInterpreted`: one, two and three arguments, COALESCE inside arithmetic, and an
+  argument that divides by zero ahead of or behind a non-NULL one. The per-row and batch evaluators match the
+  interpreter on every row, and no adapter is left. Swallowing the argument's error, or dropping a middle
+  argument, fails it.
+- `TestProjectTargetsRunCompiled`: COALESCE arithmetic compiles, `upper()` stays an adapter, and values equal
+  `evalExprSlot`'s across two Opens. Recompiling on every `Next` fails it. Evaluating through the interpreter
+  instead gives the same values, which is the point: the change is speed-only.
+- `TestAppendRowKeyTrimmedMatchesOracle`: 20 000 random rows over every kind, including `-0.`-style and dotted
+  strings, bpchar trims and skipped columns, give exactly the old string builder's key, also after a prefix.
+  Removing the `-` edge case, the dot pass, or the prefix-aware separator fails it.
+- `TestAppendFormatNumericMatchesFormatNumeric`: 50 000 mantissas, including `MinInt64`, at scales 0..25.
+
+**Measured** against `606717ffc`:
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q75 | 12.27–12.33 | 11.71 (−4.6 %; keys −2.0 %, compiled projections −2.6 %) |
+| Q11, Q4, Q39 | 20.77, 45.73, 21.66 | 20.48 (−1.4 %), 45.30 (−0.9 %), 21.49 (−0.8 %) |
+| Q7, Q22, Q35, Q59, Q87, Q97, Q2 | — | within ±0.3 % |
+
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS), and plan shapes are
+identical. The executor package passes with the deform poison armed.
+
+**Left.** The scan deform (`decodeRowRangeInfo`, 15 % of Q75) walks every column up to the last one read. PG's
+`attcacheoff` jumps straight to fixed-offset attributes in tuples without NULLs.

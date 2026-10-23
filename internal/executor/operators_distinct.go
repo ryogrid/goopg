@@ -67,6 +67,7 @@ func (o *distinctOp) Open(ctx *Context) error {
 	}
 	// Drain all rows and deduplicate.
 	seen := make(map[string]struct{})
+	var keyBuf []byte
 	rowN := 0
 	for {
 		// Cancellation: check ctx.Err() every 1024 rows so a
@@ -92,14 +93,15 @@ func (o *distinctOp) Open(ctx *Context) error {
 			continue
 		}
 		row := slot.Row()
-		// Clone the row so we own the data (child slot is reused).
-		ownedRow := cloneRow(row)
-		k := rowKeyTrimmed(ownedRow, o.junkPos, o.colTrims)
-		if _, dup := seen[k]; dup {
+		// The key is built in a reused buffer and looked up without
+		// allocating; only a row that starts a new key is cloned (the child
+		// slot is reused) and keeps a key string (M0122-0012 slice 70).
+		keyBuf = appendRowKeyTrimmed(keyBuf[:0], row, o.junkPos, o.colTrims)
+		if _, dup := seen[string(keyBuf)]; dup {
 			continue
 		}
-		seen[k] = struct{}{}
-		o.rows = append(o.rows, ownedRow)
+		seen[string(keyBuf)] = struct{}{}
+		o.rows = append(o.rows, cloneRow(row))
 	}
 	if o.unordered {
 		return nil
