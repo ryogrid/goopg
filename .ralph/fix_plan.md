@@ -2382,6 +2382,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       independent key oracle; mutation\-checked\.
     - Q72 192\.9 → 92\.7 MB/run \(−52 %\), 2\.39 M → 1\.41 M allocations; instructions −1\.1 %; warm wall ~0\.58 → 0\.55 s\.
     - Left: groupBoundsFixed's per\-group buffer \(~28 MB/run; needs the cursor to own a copy of lo\)\.
+  - **Slice 78 — pathkey usefulness looks each key up once: TPC\-DS Q64 planning −65 % LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: fire\-set fires=none \(99/99 MATCH\), sf025
+    PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS\. Doc part 7 "Slice 78"\.
+    - Target: Q64, the largest SF0\.25 gap vs PG \(1719 vs 260 ms\), is planning — plan\-only EXPLAIN 1\.6–2\.0 s vs PG
+      Planning Time 64 ms\. Instrument: tmp/ds\-planinstr\.sh \(instructions:u per plan, plan cache busted via work\_mem\)\.
+    - 70 % of planning was truncateUselessPathkeys: exprEqual formatted both keys per pair; then memo map lookups
+      per pair; the class index was rebuilt per rel; every GEQO tour started an empty key memo\.
+    - Each key is looked up once \(pathkeyUsefulness\.pathKeyEqual, groupMeta/distinctMeta/mergeMeta/queryMeta\);
+      classIndex is the search's; freshEvalCtx shares exprKeys/ecIdx\. Oracle\-pinned; three mutations caught\.
+    - Q64 18\.62 → 6\.48 Ginstr/plan \(−65 %\); Q72 −44 %, Q25 −51 %, Q18 −42 %; Q14 flat at 77\.7 G \(~5 s planning —
+      next lead\)\. Plans byte\-identical\.
+    - Discovery: goopg's EXPLAIN ANALYZE "Planning Time" reports 0\.17 ms for Q64's ~1\.6 s planning — filed
+      M0122\-0019\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -2444,6 +2458,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     ANALYZE on such a plan is distorted until this is understood\.
   - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
     timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
+- [ ] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
+  Kind: impl
+  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Parent: none
+  - Filed 2026\-10\-23 from M0122\-0012 slice 78\. On the SF0\.25 clone `EXPLAIN \(ANALYZE\)` of Q64 prints
+    `Planning Time: 0\.169 ms` while a plan\-only EXPLAIN of the same text takes 1\.6–2\.0 s wall \(profile: 96 % under
+    optimizer\.PlanWithSettings → geqoSearch\); PG prints its whole planner time \(ExplainOnePlan's planduration,
+    measured around pg\_plan\_query\)\.
+  - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
+    CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
+    cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -4625,6 +4650,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `88998a861`** \(M0122\-0012 slice 75 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `a5693f85c`** \(M0122\-0012 slice 77 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

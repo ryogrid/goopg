@@ -468,7 +468,19 @@ func geqoEvalTour(s *searchCtx, tour []Gene, numGene int, probe bool) float64 {
 // an empty relMap and empty higher levels, so one GEQO tour evaluation cannot
 // see another's joinrels.
 func (s *searchCtx) freshEvalCtx() *searchCtx {
+	// The identity-key memo and the class index are by expression node and
+	// by clause list, both shared by every tour: PG's GEQO tours share one
+	// PlannerInfo, and a fresh memo per tour re-formatted every pathkey and
+	// clause key of TPC-DS Q64 once per evaluation (M0122-0012 slice 78).
+	if s.exprKeys == nil {
+		s.exprKeys = make(map[Expr]cachedKey)
+	}
+	if s.ecIdx == nil || s.ecIdx.clauses != s.clauses {
+		s.ecIdx = &classIndex{clauses: s.clauses}
+	}
 	n := &searchCtx{
+		exprKeys:       s.exprKeys,
+		ecIdx:          s.ecIdx,
 		joinrels:       make([][]*RelOptInfo, s.nrels+1),
 		relMap:         make(map[RelSet]*RelOptInfo),
 		nrels:          s.nrels,

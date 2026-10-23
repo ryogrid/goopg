@@ -73,6 +73,10 @@ type searchCtx struct {
 	// The search is single-goroutine and the clause and pathkey expressions
 	// it keys are not mutated in place during it.
 	exprKeys map[Expr]cachedKey
+	// ecIdx is the search's equivalence-class index for pathkeyUsefulness
+	// (classIndex): built once per clause list and shared by every rel and
+	// every GEQO tour, like exprKeys (M0122-0012 slice 78).
+	ecIdx *classIndex
 	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
 	// search's evaluation counter, and whether this evaluation context's join
 	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.

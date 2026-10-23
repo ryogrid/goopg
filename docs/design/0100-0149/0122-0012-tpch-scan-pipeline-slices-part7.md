@@ -541,3 +541,73 @@ plan shapes are identical.
   as `lo` across later groups. PG copies scan keys into `so->keyData`.
 - About 1.4 M other allocations per run remain, spread across row materialisation (`VirtualSlot.Row`), the index
   scan's batch append and datum keys.
+
+## Slice 78 — pathkey usefulness looks each key up once: TPC-DS Q64 planning −65 %
+
+**Target selection.** I timed all 99 SF0.25 queries warm on one server against `:65438` `tpcds025` (PG cassert).
+goopg's total is 70.8 s against PG's 187.1 s. The largest per-query gap is Q64, 1719 ms against 260 ms, and it is
+planning:
+
+- **Planning is the gap.** A plan-only `EXPLAIN` takes 1.6–2.0 s; PG reports a 64 ms Planning Time.
+- **EXPLAIN ANALYZE reports the wrong figure.** goopg's EXPLAIN ANALYZE prints a Planning Time of 0.17 ms for the
+  same query. That is a fidelity defect, filed separately.
+- **Measurement method.** The cross-session plan cache admits a statement on its second sighting, and its key
+  ignores comments. Plan-only runs are therefore measured with `work_mem` varied by 1 kB per run, which is part of
+  the cache fingerprint (`tmp/ds-planinstr.sh`, instructions:u per plan; `tmp/ds-planprof.sh` for the profile).
+
+**Profile.** 70 % of Q64's planning (GEQO) sat under `truncateUselessPathkeys`:
+
+- `leadingMembersOf` called the package `pathKeyEqual` → `exprEqual`, which formats both expressions' identity
+  keys with `fmt` on every pair.
+- Once those calls went through the memo, the remaining time was the memo's interface-keyed map lookups, one per
+  side per pair.
+- The equivalence-class index (`ecByKey` / `ecByPtr`) was rebuilt for every join rel.
+- Every GEQO tour (`freshEvalCtx`) started an empty identity-key memo.
+
+**PG.** Pathkeys are canonical objects, so `pathkeys_useful_for_grouping` / `_for_ordering` / `_for_merging`
+compare pointers (`list_member_ptr`), and all GEQO tours share one PlannerInfo. goopg's pathkeys carry an
+expression and must compare identity keys. The slice makes each key's lookup happen once instead of once per
+pair. Canonical pathkeys themselves remain a design item.
+
+**Change** (`internal/optimizer`):
+
+- **Memoised equality.** `pathkeyUsefulness.pathKeyEqual` compares through the memo (`equalKeyed`) and is
+  nil-safe. `leadingMembersOf`, `countContainedIn` and `pathkeysContainedInRel` use it.
+- **List entries once per rel.** `leadingMembersOf` takes each list entry's identity key and class from
+  `groupMeta` / `distinctMeta`, formed once per rel, and each candidate key's once per key.
+  `usefulForMerging` / `rightMergeDirection` do the same with `mergeMeta` / `queryMeta` (`ensureMergeMeta`).
+- **Shared class index.** `classIndex` is the search's: built once per clause list from `ecMembers`, which are
+  the same for every rel because they are the search's whole equivalence-class membership. It carries a
+  per-expression class memo and is shared by every rel through `searchCtx.ecIdx`.
+- **Shared across GEQO tours.** `freshEvalCtx` shares `exprKeys` and `ecIdx` with every tour, as PG's tours share
+  one PlannerInfo.
+
+**Pins.**
+
+- `TestTruncateUselessPathkeysMatchesOracle`: 9 candidate lists through `truncateUselessPathkeys`, with the shared
+  index and per rel, twice to cover the cached second call. Each result must equal a count computed from the plain
+  definitions (`exprEqual` / `pathKeyEqual` per pair, a class found by scanning `ecMembers`). The oracle's counts
+  span at least three values.
+- `TestGeqoToursShareKeyMemoAndClassIndex`: tours share the memo and the index, and a new clause list gets a new
+  index.
+- Three mutations fail the first test: the wrong list entry's class, the query direction ignored, and a corrupted
+  class memo.
+
+**Measured** (planning instructions:u per plan-only EXPLAIN, against `a5693f85c`):
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q64 | 18.62 G, 2014 ms | 6.48 G (−65 %), ~0.8–1.0 s |
+| Q72 | 1.478 G | 0.823 G (−44 %) |
+| Q25 | 1.482 G | 0.727 G (−51 %) |
+| Q18 | 0.182 G | 0.105 G (−42 %) |
+| Q14 | 77.75 G | 77.74 G (flat) |
+
+Q64's plan text is byte-identical. The fire-set gate reports fires=none (99/99 MATCH, no changed plan), sf025
+PASS=99 (61 ck) with identical plan shapes, acceptance 24 MATCH, RegressSuite PASS and TestPort\_Isolation PASS.
+
+**Left.**
+
+- Q64 still plans in about 0.8 s against PG's 64 ms. The remaining profile is the memo's map lookups, now one per
+  key, in `keyOf` and `equivalentWithin`. Canonical pathkeys (PG `make_canonical_pathkey`) would remove them.
+- Q14 spends about 5 s and 77.7 G instructions planning, which is untouched here and the next lead.
