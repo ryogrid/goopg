@@ -1,11 +1,13 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // TestStringCompareInPlaceMatchesInterpreted pins M0122-0012 slice 89: a
@@ -71,5 +73,48 @@ func TestStringCompareInPlaceMatchesInterpreted(t *testing.T) {
 	}
 	if !fired {
 		t.Fatal("no comparison compiled as a character-string comparison; the in-place lane is never reached")
+	}
+}
+
+// TestPlainCompareStringMatchesIndexByteForm pins slice 90's byte-loop
+// plainCompareString to the strings.IndexByte form it replaced, on every
+// edge the test has: a '/' at each position, a leading '(' or '{' (and one
+// that is not leading), lengths around the 32-byte uuid cut, and the empty
+// string.
+func TestPlainCompareStringMatchesIndexByteForm(t *testing.T) {
+	ref := func(s string) bool {
+		if len(s) >= 32 || strings.IndexByte(s, '/') >= 0 {
+			return false
+		}
+		return len(s) == 0 || (s[0] != '(' && s[0] != '{')
+	}
+	cases := []string{"", "GA", "Sunday   ", "(a", "{b}", "a(", "a{", "/", " /", "( /", strings.Repeat("x", 31),
+		strings.Repeat("x", 32), strings.Repeat("x", 33), strings.Repeat("x", 30) + "/"}
+	base := "abcdefghij"
+	for i := 0; i <= len(base); i++ {
+		cases = append(cases, base[:i]+"/"+base[i:])
+	}
+	for _, s := range cases {
+		if got, want := plainCompareString(s), ref(s); got != want {
+			t.Fatalf("plainCompareString(%q) = %v, the IndexByte form says %v", s, got, want)
+		}
+	}
+}
+
+// TestStringValueInlineMatchesStringValue pins slice 90's inlinable string
+// read: an owned string, an empty and a nil buffer, and an arena-backed
+// string all read as StringValue reads them.
+func TestStringValueInlineMatchesStringValue(t *testing.T) {
+	arena := mmgr.Acquire(nil, mmgr.KindStmt)
+	defer arena.Release()
+	for name, d := range map[string]Datum{
+		"owned": NewStringDatum("Sunday   "),
+		"empty": NewStringDatum(""),
+		"nil":   {Kind: KindString},
+		"arena": cut1ArenaString(t, arena, "GA"),
+	} {
+		if got, want := stringValueInline(&d), d.StringValue(); got != want {
+			t.Fatalf("%s: stringValueInline = %q, StringValue = %q", name, got, want)
+		}
 	}
 }

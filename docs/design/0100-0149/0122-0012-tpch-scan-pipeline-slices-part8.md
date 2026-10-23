@@ -667,3 +667,5 @@ Values are identical:
 **A warning about wall-clock ratios.** A warm 99-query sweep (`tmp/ds-warm.sh`) ranks wall time against release PG
 unreliably for queries that follow a heavy one. Q2 measured 673 ms right after Q1, but 250 ms in steady state.
 Instruction counts stay the instrument.
+
+*Continued in [part 9](0122-0012-tpch-scan-pipeline-slices-part9.md) (slice 90 on).*
