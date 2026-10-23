@@ -2349,6 +2349,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Census triage: Q17/Q25/Q29 = EXPLAIN ANALYZE pre\-Filter row count \(filed M0122\-0017\); Q44 = WindowAgg
       run\-condition early stop still reads the sorted input to the end \(cheap\)\.
     - Discovery filed: P0\-E11 \(S2, zero\-dividend numeric scale\)\.
+  - **Slice 75 — correlated references compile, and a comparison reads its operands in place LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS\. Doc part 7 "Slice 75"\.
+    - Q1's SubPlan filter `ctr1\.ctr\_store\_sk = ctr\_store\_sk` runs 166 M times \(12 881 calls × 12 881 CTE rows\);
+      the outer reference was an ExprAdapter and both operands were copied as 48\-byte Datums per row\.
+    - OuterColumnRef / ExecParamRef → ExprOuterColumnRef / ExprExecParamRef \(PG EEOP\_PARAM\_EXEC\); a comparison
+      whose operands lie in a materialized row, outer row, parameter slot or folded constant compares them in place
+      \(fastOperandPtr\), gated on fastBinarySimple's static half \(without it, Q81 \+9 %\)\. Pinned vs evalExprSlot
+      on 25 expressions incl\. every error path; mutation\-checked\.
+    - Q1 122\.81 → 98\.99 Ginstr \(−19\.4 %\), wall 9\.63 → 6\.75 s \(PG 12\.4 s\); Q81 −4\.6 %; Q30 −4\.4 %; Q6 flat\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4563,6 +4574,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `f7dc0cc55`** \(M0122\-0012 slice 74 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

@@ -65,18 +65,20 @@ func isFloatResultType(resultType string) bool {
 type ExprKind uint8
 
 const (
-	ExprInvalid   ExprKind = iota
-	ExprColumnRef          // payload[0:4] = int32 column index
-	ExprIntConst           // payload[0:8] = int64 value
-	ExprBoolConst          // payload[0] = 0 (false) or 1 (true)
-	ExprNullConst          // no payload
-	ExprBinaryOp           // payload[0] = op, [1] = overflow code, [4:8] = int32 pos; childA/childB = operands
-	ExprUnaryOp            // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
-	ExprAdapter            // orig = original planner.Expr; delegates to evalExprSlot
-	ExprConstVal           // constVal = a subtree folded to a value at build time
-	ExprCase               // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
-	ExprNullTest           // payload[0] = 1 for IS NOT NULL; childA = operand
-	ExprCoalesce           // childA = first argument, childB = the rest (another ExprCoalesce, or the last argument)
+	ExprInvalid        ExprKind = iota
+	ExprColumnRef               // payload[0:4] = int32 column index
+	ExprIntConst                // payload[0:8] = int64 value
+	ExprBoolConst               // payload[0] = 0 (false) or 1 (true)
+	ExprNullConst               // no payload
+	ExprBinaryOp                // payload[0] = op, [1] = overflow code, [4:8] = int32 pos; childA/childB = operands
+	ExprUnaryOp                 // payload[0] = uint8(parser.OpCode), [4:8] = int32 pos; childA = operand index
+	ExprAdapter                 // orig = original planner.Expr; delegates to evalExprSlot
+	ExprConstVal                // constVal = a subtree folded to a value at build time
+	ExprCase                    // caseInfo = the CASE's operand / WHEN / THEN / ELSE nodes
+	ExprNullTest                // payload[0] = 1 for IS NOT NULL; childA = operand
+	ExprCoalesce                // childA = first argument, childB = the rest (another ExprCoalesce, or the last argument)
+	ExprOuterColumnRef          // payload[0:4] = int32 level, [4:8] = int32 column index; orig kept for the error path
+	ExprExecParamRef            // payload[0:4] = int32 PARAM_EXEC slot; orig kept for the error path
 )
 
 // noExpr is the sentinel "no expression child" index, analogous to noChild.
@@ -163,6 +165,25 @@ func (s *exprTreeSlab) buildExprCtx(e optimizer.Expr, ctx *Context) int32 {
 		// interpreted twin's exact error rather than a second, diverging one.
 		*s = append(*s, ExprNode{Kind: ExprColumnRef, orig: e})
 		binary.LittleEndian.PutUint32((*s)[idx].payload[:], uint32(t.Index))
+		return idx
+
+	case *optimizer.OuterColumnRef:
+		// A correlated sublink's reference to its parent's row (PG: a Var of
+		// varlevelsup > 0 turned into a PARAM_EXEC, read by EEOP_PARAM_EXEC).
+		// It was an ExprAdapter, so TPC-DS Q1's `ctr1.ctr_store_sk =
+		// ctr_store_sk` paid an interpreted call per inner row — 12 881
+		// SubPlan executions × 12 881 CTE rows (M0122-0012 slice 75). orig
+		// is kept so an out-of-range read raises the interpreted twin's error.
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprOuterColumnRef, orig: e})
+		binary.LittleEndian.PutUint32((*s)[idx].payload[0:], uint32(int32(t.Level)))
+		binary.LittleEndian.PutUint32((*s)[idx].payload[4:], uint32(int32(t.Index)))
+		return idx
+
+	case *optimizer.ExecParamRef:
+		idx := int32(len(*s))
+		*s = append(*s, ExprNode{Kind: ExprExecParamRef, orig: e})
+		binary.LittleEndian.PutUint32((*s)[idx].payload[0:], uint32(int32(t.ID)))
 		return idx
 
 	case *optimizer.IntegerConst:
@@ -528,6 +549,13 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		checkDeformPoison(d)
 		return d, nil
 
+	case ExprOuterColumnRef, ExprExecParamRef:
+		if p := fastRefOperand(n, ctx); p != nil {
+			checkDeformPoison(*p)
+			return *p, nil
+		}
+		return evalExprSlot(n.orig, slot, ctx)
+
 	case ExprIntConst:
 		v := int64(binary.LittleEndian.Uint64(n.payload[:]))
 		return Datum{Kind: KindInt, Int: v}, nil
@@ -543,6 +571,33 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 			return Datum{}, fmt.Errorf("executor: evalFastExpr: BinaryOp node %d missing child", idx)
 		}
 		op := parser.OpCode(n.payload[0])
+		// A comparison of two operands that live somewhere already — a
+		// column of a materialized row, an outer row's column, a SubPlan
+		// parameter, a folded constant — compares them where they lie, as
+		// PG's EEOP_SCAN_VAR / EEOP_PARAM_EXEC steps hand int4eq the 8-byte
+		// Datums in place. Here each operand is a 48-byte Datum, and the two
+		// recursive calls below copied both out and back per row: in TPC-DS
+		// Q1's SubPlan filter those copies were most of evalFastExpr's
+		// samples (M0122-0012 slice 75). The conditions are exactly the ones
+		// the general path reaches fastCompareDatum under (no literal
+		// coercion, fastBinarySimple, two non-NULL values); anything else
+		// falls through to it, and re-reading a pure operand there is free.
+		// fastBinarySimple's static half is tested before any operand is
+		// read: a character-string comparison never qualifies, and finding
+		// that out per row cost TPC-DS Q81's `ctr1.ctr_state = ctr_state`
+		// 9 % more instructions.
+		if n.constVal == nil && op.IsComparison() && n.payload[16]&4 == 0 &&
+			binary.LittleEndian.Uint64(n.payload[8:16]) == 0 {
+			if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && !lp.IsNull() && lp.Kind != KindString {
+				if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && !rp.IsNull() && fastBinarySimple(n, op, lp, rp) {
+					checkDeformPoison(*lp)
+					checkDeformPoison(*rp)
+					if c, ok := fastCompareDatum(lp, rp); ok {
+						return NewBoolDatum(cmpResult(op, c)), nil
+					}
+				}
+			}
+		}
 		left, err := evalFastExpr(exprs, n.childA, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -767,6 +822,59 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 	}
 	*out = result
 	return nil
+}
+
+// fastOperandPtr returns where the value of node idx already lies, or nil when
+// it must be evaluated: an in-range column of a *MaterializedSlot, an in-range
+// outer-row column or a set SubPlan parameter (fastRefOperand), or a folded
+// constant. Every value it returns is the one evalFastExpr would return for
+// the node; a nil leaves the node to evalFastExpr, errors included.
+func fastOperandPtr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) *Datum {
+	if idx == noExpr {
+		return nil
+	}
+	n := &exprs[idx]
+	switch n.Kind {
+	case ExprColumnRef:
+		if s, ok := slot.(*MaterializedSlot); ok {
+			colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+			if colIdx >= 0 && colIdx < len(s.row) {
+				return &s.row[colIdx]
+			}
+		}
+	case ExprOuterColumnRef, ExprExecParamRef:
+		return fastRefOperand(n, ctx)
+	case ExprConstVal:
+		return n.constVal
+	}
+	return nil
+}
+
+// fastRefOperand is the in-range read of evalExprSlot's OuterColumnRef and
+// ExecParamRef arms (expr.go), or nil wherever those arms raise an error —
+// the caller then delegates to them so the error text is theirs.
+func fastRefOperand(n *ExprNode, ctx *Context) *Datum {
+	if ctx == nil {
+		return nil
+	}
+	if n.Kind == ExprExecParamRef {
+		id := int(int32(binary.LittleEndian.Uint32(n.payload[0:])))
+		if id < 0 || id >= len(ctx.ParamExec) || !ctx.ParamSet[id] {
+			return nil
+		}
+		return &ctx.ParamExec[id]
+	}
+	level := int(int32(binary.LittleEndian.Uint32(n.payload[0:])))
+	i := len(ctx.OuterRows) - level
+	if i < 0 || i >= len(ctx.OuterRows) {
+		return nil
+	}
+	outer := ctx.OuterRows[i]
+	col := int(int32(binary.LittleEndian.Uint32(n.payload[4:])))
+	if col < 0 || col >= len(outer) {
+		return nil
+	}
+	return &outer[col]
 }
 
 // fastBinarySimple reports that every preamble branch of evalFastBinaryApply

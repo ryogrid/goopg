@@ -338,3 +338,64 @@ TestPort\_Isolation PASS), and plan shapes are identical.
   evaluates them as rows are returned (`eval_windowfunction` per output row, with pass-through after a failed Run
   Condition). Q44's top-N window therefore still reads its sorted input to the end. A non-presorted window still
   drains its input.
+
+## Slice 75 — correlated references compile, and a comparison reads its operands in place
+
+**Census lead.** The rows census at 1.5× flagged no row waste in TPC-DS Q1, but Q1 is a pure per-row cost case.
+Its SubPlan runs once for each of the CTE's 12 881 rows, and each run scans all 12 881 CTE rows through
+`Filter: (ctr1.ctr_store_sk = ctr_store_sk)`: 166 M evaluations of one integer comparison. PG runs the same plan
+in 12.4 s (cassert build); goopg ran it in 9.6 s. In the instruction profile:
+
+- 54 % of Q1 was `evalFastExpr` and another 7 % was `evalExprSlot`.
+- The hottest instructions were 48-byte `Datum` stores. The comparison's two operand evaluations copy each Datum out
+  of its row and back into the caller's frame.
+- `ctr1.ctr_store_sk` (an `OuterColumnRef`) was an `ExprAdapter`, so every evaluation took an interpreted call.
+
+**PG.** `ExecInitExprRec` compiles a Var of an outer query level to `EEOP_PARAM_EXEC`, and a scan column to
+`EEOP_SCAN_VAR`. Both steps hand `int4eq` the 8-byte Datums where they lie.
+
+**Change** (`internal/executor/exprnode.go`):
+
+- **New nodes.** `OuterColumnRef` compiles to `ExprOuterColumnRef` (level and index in the payload) and `ExecParamRef`
+  to `ExprExecParamRef` (slot id). `fastRefOperand` is the in-range read of the interpreted arms. Wherever those
+  arms raise (level or index out of range, parameter unset, no Context), it returns nil and the node delegates to
+  `evalExprSlot`, so the error text stays theirs.
+- **In-place comparison.** A comparison takes this path when it has no literal coercion
+  (`constVal == nil`) and passes `fastBinarySimple`'s static half (no character-string operands, no bpchar
+  widths). `fastOperandPtr` then locates each operand where it lies: an in-range column of a `*MaterializedSlot`,
+  an outer row's column, a set parameter, or a folded constant. When both operands are non-NULL and
+  `fastBinarySimple` holds, `fastCompareDatum` compares them through pointers. Anything else falls through to the
+  unchanged general path.
+- **Same results.** These are exactly the conditions under which the general path reaches `fastCompareDatum`.
+- **The static gate is necessary.** Without it, Q30/Q81's `ctr1.ctr_state = ctr_state` paid the operand lookups
+  per row only to fail on strings: +9 % instructions. An out-of-line helper (`//go:noinline`) cost Q1 another
+  11 points, so the check stays inline.
+
+**Pins.**
+
+- `TestOuterRefCompiledMatchesInterpreted` runs 25 expressions over 4 inner rows and 3 outer rows. They cover
+  out-of-range levels and columns, an unset parameter, NULLs, int64-lane and big numerics, strings, coerced
+  literals, AND and arithmetic. Each compiled value and error must equal `evalExprSlot`'s, on a
+  `*MaterializedSlot` (in-place path) and on a `rowSlotView` (general path).
+- `TestOperandPtrReadsInPlace` checks that the operand pointer aliases the row, outer row or parameter slot, and
+  that every unsafe case returns nil.
+- Two mutations fail the first test: swapped compare operands, and an off-by-one outer level.
+
+**Measured** against `f7dc0cc55` (instructions:u per query; SF0.25 clone):
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q1 | 122.81 | 98.99 (−19.4 %); wall 9.63 → 6.75 s (PG 12.4 s) |
+| Q81 | 46.15 | 44.03 (−4.6 %); wall 3.98 → 3.86 s |
+| Q30 | 10.46 | 10.00 (−4.4 %) |
+| Q6 | 4.578 | 4.586 (+0.2 %) |
+
+Values are identical: sf025 PASS=99 with 61 checksums, also PASS with the deform poison armed; acceptance
+24 MATCH; executor package PASS with the poison armed; RegressSuite PASS; TestPort\_Isolation PASS. Plan shapes are
+identical.
+
+**Left.**
+
+- Columns of a `VirtualSlot` or `PackedSlot` still take the copying path.
+- Q1's remaining time is the SubPlan rescan itself: a CTE scan plus a filter for each of 166 M rows. PG pays the
+  same, since it builds no hashed SubPlan for a correlated scalar aggregate.
