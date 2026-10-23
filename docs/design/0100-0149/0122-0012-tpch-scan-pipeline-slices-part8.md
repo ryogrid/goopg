@@ -398,3 +398,73 @@ target by at least 3 %, or M0122-0012 yields to M0147.
   within noise.
 - **The nested-loop stream's outer-row copy** (`nlJoinStream.stepOuter`, the sibling of slice 82). It does not
   fire in Q10, whose outer rows are not VirtualSlots with arena-backed cells, so it is left as it is.
+
+## Slice 86 — a seq scan judges the qual's leading conjunct on its own columns
+
+**Target.** Q28 runs 2.9× slower than release PG. Its plan matches PG's: six `store_sales` scans, each with a qual of
+the form `ss_quantity >= x AND ss_quantity <= y AND (list_price … OR coupon_amt … OR wholesale_cost …)`.
+
+**Attribution** (25.0 G instructions per run). `evalFastExpr` is 27 %, `decodeRowRangeInfo` 25 %,
+`NumericInt64FromStoredPayload` 6.7 % and `skipAttrLen` 3 %.
+
+- The prefilter (slice 25) decodes all four qual columns before judging the row: `ss_quantity` is column 10, and the
+  three numerics run up to column 19.
+- About 95 % of rows then fail the quantity bounds.
+- PG pays one deform up to the last attribute (EEOP\_SCAN\_FETCHSOME) and then runs the AND-list step by step. goopg's
+  numeric and varlena decode costs more than PG's, so the deform of columns the first clause never reads dominates.
+
+**Change** (`scan_prefilter.go`: `scanQualLead`, `planScanQualLead`, `leadRejects`; wired in `seqScanOp.Open` and
+`Next`).
+
+- **Choosing the lead.** In Open, the qual's AND spine and its compiled slab are walked together: an AND node's left
+  operand is its `childA`. The lead is the first left operand that reads fewer columns than the whole qual.
+- **Judging it.** Per row, the scan decodes only the lead's columns, using a skip info built like `pfInfo`, and
+  evaluates the lead's slab node.
+- **Rejecting.** A FALSE lead rejects the row, with the same `statReturned` / `filterRemoved` accounting as the
+  prefilter's reject. That is the whole qual's verdict: the compiled AND evaluates its left operand first and returns
+  a FALSE one (`evalFastExpr`'s OpAnd short-circuit), and the lead is what that evaluation computes first.
+- **Every other outcome** (TRUE, NULL, an error, a decode error, a toasted cell in the prefix) decides nothing. The row
+  takes the unchanged prefilter path, which re-decodes the prefix from column 0 and evaluates the qual whole, so
+  errors surface where they did before.
+- **The probe.** A lead that rejects fewer than a quarter of its first 4096 rows is switched off for the rest of the
+  scan, because the rows it passes decode its columns twice.
+
+**Pins.**
+
+- `TestScanQualLeadMatchesWholeQual` compares rows and errors with the lead off (`scanSkipDisabled`) and with the early
+  path off (the late position), with tail poison armed. It covers:
+  - a selective lead ahead of numeric, float and text columns;
+  - a lead that is NULL for some rows;
+  - a lead that errors;
+  - a later conjunct that errors on exactly the rows the lead rejects.
+- `TestScanQualLeadProbeSwitchesOff` pins the probe in both directions.
+- Two mutations fail the tests: aiming the lead at the AND's right operand (`b.Right`, `childB`), and pairing the left
+  operand's expression with the right operand's node.
+
+**Measured** against `44017260b` (instructions:u per run):
+
+| query | before | after | change |
+|---|---|---|---|
+| Q28 | 25.02 G | 17.99 G | −28 % |
+| Q13, Q48, Q88, Q96, Q7 | — | — | flat |
+| Q9 | — | — | +0.2 % (noise) |
+
+Q9's single-column `BETWEEN` has no narrower lead.
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck, Q28 ck verified), plan shapes identical, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+This moves its own target by at least 3 %, so the rule (b) yield watch resets.
+
+**Not covered.**
+
+- **A qual that reads the scan's last column** gets no prefilter (two-phase deform saves nothing there), so it gets no
+  lead stage either. Extending the lead to the late position is a possible later slice.
+- **An out-of-line cell in the lead's prefix,** even in a column the lead does not read, sends the row down the
+  prefilter path uncounted. This is the same rule `needsDetoastPrefix` applies to the prefilter.

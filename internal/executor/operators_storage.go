@@ -1098,6 +1098,9 @@ type seqScanOp struct {
 	// the non-fast Build path and any compile failure fall back to.
 	pfSlab exprTreeSlab
 	pfIdx  int32
+	// lead is the qual's leading-conjunct stage (scanQualLead), planned in
+	// Open after pfSlab.
+	lead scanQualLead
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1692,6 +1695,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			o.pfSlab, o.pfIdx = slab, idx
 		}
 	}
+	o.lead = scanQualLead{idx: noExpr}
+	if o.prefilterSet && o.pfIdx != noExpr && !scanSkipDisabled {
+		o.lead = planScanQualLead(o.pfSlab, o.pfIdx, o.qual, o.colInfo)
+	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
 	// predicate lock so a concurrent writer's INSERT of a matching row forms
 	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
@@ -2178,6 +2185,18 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// The partial row is handed to NOTHING but the predicate —
 				// entries at/past MaxCols still hold the previous tuple's
 				// values — so it must not escape this block.
+				// The lead conjunct first, on its own columns
+				// (scanQualLead): a FALSE lead is the qual's verdict.
+				if o.lead.idx != noExpr && o.leadRejects(tuple.Data, tuple.Bitmap, storedNatts) {
+					o.statReturned++
+					if o.filterRemoved != nil {
+						*o.filterRemoved++
+					}
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
 				info := o.colInfo
 				if o.pfInfo != nil {
 					info = o.pfInfo
