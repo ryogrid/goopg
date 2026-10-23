@@ -660,6 +660,16 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	}
 	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
 		o.applySharedBuild(ctx, sb)
+		// PG's workers each build the table privately and take the
+		// empty-inner exit on it; the shared table is that same table,
+		// so a participant leaves its share of the outer side unscanned
+		// too (M0122-0012 slice 72: TPC-DS Q61's store join is empty at
+		// SF0.25, and every worker still scanned all of store_sales).
+		if o.emptyBuildEndsJoin() {
+			o.firstProbe = nil
+			o.lazyProbe = nil
+			return nil
+		}
 		return o.openProbeSide(ctx, sb.probeIsLeft)
 	}
 	o.firstProbe = nil

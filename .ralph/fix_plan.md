@@ -2290,6 +2290,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Rule b: slices 70 \(Q75 −4\.6 %\) and 71 \(Q97 −3\.0 %\) both ≥ 3 % → no yield\.
     - Next: narrow sort storage \(PG tuplesort MinimalTuple of the sort targetlist\) — the remaining Q97 cache misses;
       or the attcacheoff deform\.
+  - **Slice 72 — a participant probing a leader\-prebuilt shared hash table takes the empty\-inner exit LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7 "Slice 72"\.
+    - Named target TPC\-DS Q61 \(warm 91 ms vs PG 16 ms\): PG's store\_sales scans return 1 row per process — the
+      filtered store join is empty at SF0\.25 and ExecHashJoin quits \(totalTuples == 0 && \!HJ\_FILL\_OUTER\); goopg's
+      shared\-build participant branch never checked emptyBuildEndsJoin, so workers scanned all of store\_sales\.
+    - sharedHashBuild\.buildRows/buildRowsCounted \(captureSharedBuild → applySharedBuild\); shared branch takes the exit
+      \(pinned with a real captured shared build; mutation\-checked\)\.
+    - Q61 5\.645 → 0\.012 Ginstr, warm 91 → 3–7 ms \(below PG\); sweep 288 → 13 ms; output identical\.
+    - Dropped \(flat on Q61\): conditional NULL write for skipped cells; attcacheoff cached offsets \(~40 % of SF0\.25
+      store\_sales tuples are NULL\-free\)\.
+    - Rule b: slices 71 \(Q97 −3\.0 %\) and 72 \(Q61 −99 %\) ≥ 3 % → no yield\.
+    - Next: lazy deform before a selective hash probe \(PG slot\_getsomeattrs\), or the Parallel Hash empty exit\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4472,6 +4485,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `cabdb6039`** \(M0122\-0012 slice 70 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `2efa8fe12`** \(M0122\-0012 slice 71 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

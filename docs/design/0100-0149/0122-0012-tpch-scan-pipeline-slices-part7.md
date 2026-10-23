@@ -178,3 +178,53 @@ identical.
 misses cache once per row. PG's tuplesort stores MinimalTuples of the sort's own narrow targetlist. Narrow
 storage would need the sort to emit full-width rows from compact ones without breaking readers that keep a row
 across `Next`.
+
+## Slice 72 (2026-10-23): a participant probing a leader-prebuilt shared hash table takes the empty-inner exit — TPC-DS Q61
+
+**Target.** Ranked by warm time against the `:65438` `tpcds025` reference, the largest ratios were small
+queries. Q61 took 91 ms against PG's 16 ms, and burned about 0.37 CPU-s per run. Its profile was scan deform
+(`decodeRowRangeInfo` 29 %, `seqScanOp.Next` 14 %) over both store\_sales branches.
+
+Two deform micro-changes measured flat on Q61 and were dropped:
+
+- leaving an already-NULL skipped cell unwritten;
+- PG's `attcacheoff` cached offsets for NULL-free tuples. At SF0.25 only about 40 % of store\_sales tuples are
+  NULL-free, so the extra branch cost what it saved.
+
+PG's own EXPLAIN ANALYZE showed the real difference. Its `Parallel Seq Scan on store_sales` returns **1 row per
+process**. The filtered `store` (`s_gmt_offset = -7`) is empty at SF0.25, and ExecHashJoin's HJ\_BUILD\_HASHTABLE
+state ends the join without scanning the outer relation (`hashtable->totalTuples == 0 && !HJ_FILL_OUTER`,
+`nodeHashjoin.c`). The one row is the outer-first prefetch. goopg already had that exit (`emptyBuildEndsJoin`,
+M0146-0049d1) for private builds. But under a Gather, goopg's leader pre-builds one shared table
+(`prebuildSharedHashJoins` / `captureSharedBuild`), and the participant branch of `openLazyHashJoin`
+(`applySharedBuild` → `openProbeSide`) never checked it. Every worker scanned its whole store\_sales share
+against an empty table. PG's workers each build the table privately and quit on it.
+
+**Change.**
+
+- `sharedHashBuild` carries the builder's `buildRows` / `buildRowsCounted`, set by `captureSharedBuild` and
+  copied by `applySharedBuild`.
+- The shared branch of `openLazyHashJoin` takes `emptyBuildEndsJoin()`. When the table is empty and the join
+  does not emit unmatched probe rows (`probeFillsUnmatched`: not LEFT, ANTI or FULL), it returns without opening
+  the probe side, and `Next` answers EOF.
+- A Parallel Hash participant's share (`openParallelHashJoin`) does not set the count, since an empty share says
+  nothing of the whole table, so that path is unchanged. PG takes the exit there too after its build barrier;
+  that remains a ledger row.
+
+**Pins.**
+
+- `TestSharedHashBuildEmptyBuildSkipsProbe` builds a real shared table with the builder's own
+  `buildLazyHashTable` / `captureSharedBuild`, registers it in `Context.SharedHashBuilds`, and opens a
+  participant. With an empty build, INNER and SEMI never open the probe side and return nothing, while LEFT and
+  ANTI still emit all 3 probe rows. A non-empty INNER probes as before. Removing the exit, or not carrying the
+  count, fails it.
+- The serial path's `TestHashJoinEmptyBuildSkipsProbe` is unchanged and passes.
+
+**Measured** against `2efa8fe12`. Q61 went from 5.645 to 0.012 Ginstr per run, and from 87–92 ms warm wall to
+3–7 ms, below PG's 16 ms. In the sf025 sweep it went from 288 to 13 ms. Its output (a single NULL row at SF0.25)
+is byte-identical. Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS;
+TestPort\_Isolation PASS), and plan shapes are identical.
+
+**Left.** Q61's 23× per-row CPU gap would also show where the join is not empty. goopg deforms every scanned
+row up to its last referenced column before the first hash probe, while PG's `slot_getsomeattrs` deforms
+lazily, only as far as each consumer reads.

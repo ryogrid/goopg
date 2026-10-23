@@ -97,3 +97,63 @@ func TestHashJoinEmptyBuildSkipsProbe(t *testing.T) {
 		})
 	}
 }
+
+// TestSharedHashBuildEmptyBuildSkipsProbe pins M0122-0012 slice 72: a
+// participant probing a table the Gather's leader pre-built (sharedHashBuild)
+// takes the same empty-inner exit as a private build. PG's workers each build
+// the table privately and quit on an empty one, so a worker scanned TPC-DS
+// Q61's whole store_sales share against an empty store join only here.
+func TestSharedHashBuildEmptyBuildSkipsProbe(t *testing.T) {
+	const lw, rw = 2, 2
+	for _, tc := range []struct {
+		name      string
+		jt        optimizer.JoinType
+		build     []Row
+		wantRows  int
+		wantOpens int
+	}{
+		{"inner/empty", optimizer.JoinTypeInner, nil, 0, 0},
+		{"semi/empty", optimizer.JoinTypeSemi, nil, 0, 0},
+		{"left/empty", optimizer.JoinTypeLeft, nil, 3, 1},
+		{"anti/empty", optimizer.JoinTypeAnti, nil, 3, 1},
+		{"inner/nonempty", optimizer.JoinTypeInner, keyedRows("r", 2, 9), 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := keyedRows("l", 1, 2, 3)
+			plan := outerFillPlan(tc.jt, optimizer.JoinAlgoHash, lw, len(probe), len(tc.build))
+			ctx := &Context{}
+			builder := newJoinOp(plan, &rowsOp{rows: probe, schema: batchSchema("l", lw)}, &rowsOp{rows: tc.build, schema: batchSchema("r", rw)})
+			probeIsLeft, err := builder.buildLazyHashTable(ctx)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			sb, err := builder.captureSharedBuild(probeIsLeft)
+			if err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+			ctx.SharedHashBuilds = map[*optimizer.Join]*sharedHashBuild{plan: sb}
+			left := &openCountOp{Operator: &rowsOp{rows: probe, schema: batchSchema("l", lw)}}
+			o := newJoinOp(plan, left, &rowsOp{rows: tc.build, schema: batchSchema("r", rw)})
+			if err := o.Open(ctx); err != nil {
+				t.Fatalf("open participant: %v", err)
+			}
+			rows := 0
+			for {
+				_, err := o.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("join Next: %v", err)
+				}
+				rows++
+			}
+			if err := o.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			if rows != tc.wantRows || left.opens != tc.wantOpens {
+				t.Fatalf("rows %d, probe opens %d; want %d rows, %d opens", rows, left.opens, tc.wantRows, tc.wantOpens)
+			}
+		})
+	}
+}

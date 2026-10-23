@@ -69,6 +69,15 @@ type sharedHashBuild struct {
 	leftWidth         int
 	rightWidth        int
 
+	// buildRows / buildRowsCounted carry the builder's row count
+	// (joinOp.buildRows), so a participant takes the empty-inner exit on a
+	// shared table exactly as on a private one (emptyBuildEndsJoin;
+	// M0122-0012 slice 72). Only a complete table sets them — a Parallel
+	// Hash participant's share does not, as an empty share says nothing of
+	// the whole.
+	buildRows        int64
+	buildRowsCounted bool
+
 	// E-09a (docs/design/executor-e09a-shared-spilling-build/DESIGN.md §4):
 	// the batch descriptor of a build that batched. The maps above hold
 	// BATCH 0 ONLY; every other batch is an inner file the leader wrote and
@@ -95,6 +104,8 @@ func (o *joinOp) captureSharedBuild(probeIsLeft bool) (*sharedHashBuild, error) 
 		leftWidth:         o.lazyLW,
 		rightWidth:        o.lazyRW,
 		buildBytes:        o.buildBytes,
+		buildRows:         o.buildRows,
+		buildRowsCounted:  o.buildRowsCounted,
 	}
 	if o.batches != nil {
 		d, err := o.batches.freezeForSharing()
@@ -150,6 +161,7 @@ func (o *joinOp) applySharedBuild(ctx *Context, sb *sharedHashBuild) {
 	o.antiBuildHasNull = sb.antiBuildHasNull
 	o.lazyLW = sb.leftWidth
 	o.lazyRW = sb.rightWidth
+	o.buildRows, o.buildRowsCounted = sb.buildRows, sb.buildRowsCounted
 	// EX3-02 Cut 1: adopt the shared stratum-B arena. Marked shared so
 	// Close only dereferences it — the builder (never Closed on this path)
 	// and the statement-end Release own its lifetime.
