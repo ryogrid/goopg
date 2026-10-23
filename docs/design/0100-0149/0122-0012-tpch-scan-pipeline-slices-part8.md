@@ -348,3 +348,53 @@ Values are identical:
   (`NumericInt64FromStoredPayload`, the legacy-spelling probes) is about 30 %.
 - **The batch evaluator.** It still reaches AND / OR and numeric/int comparisons through `evalFastBinaryApply` →
   `evalBinary`. The results are the same, but the path is slower.
+
+## Slice 85 — a Gather worker shipping every column reads a join's VirtualSlot once
+
+**Target.** Q10 runs 2.5× slower than release PG. Its plan matches PG's, a nested loop over a 1.92 M-row
+`customer_demographics` scan whose materialised inner side is empty. PG also reads every outer row, because
+`ExecNestLoop` has no empty-inner exit, so the gap is per-row cost.
+
+**Attribution.**
+
+- **The double copy.** The worker's `cloneRowOwned` and `VirtualSlot.Row` samples all come from
+  `transferRowForQueue`. For a Gather that reads every column (no live mask), a join's VirtualSlot was gathered
+  into a scratch row by `Row()` and then cloned by `cloneRowOwned`: two row allocations per shipped row.
+- **The live path already avoided it.** `transferRowForQueueLive`'s live path has read cells straight into a
+  chunk row since slice 66.
+
+**Change** (`internal/executor/parallel_runtime.go`): with no live mask, a VirtualSlot is read cell by cell into a
+chunk row, each cell detached (`MaterializeArena`). The values are `transferRowForQueue`'s: that function returns
+`Row()` as-is when no cell is arena-backed, and `cloneRowOwned` (`MaterializeArena` per cell) otherwise. Other slot
+kinds keep `transferRowForQueue`.
+
+**Pins.** `TestTransferRowForQueueFullReadsCellsOnce`: a VirtualSlot with an arena-backed cell ships
+`transferRowForQueue`'s values and survives the producer arena's reset. Dropping the detach fails it.
+
+**Measured** against `e9ba4cf5f`:
+
+| query | bytes per run | objects per run | instructions |
+|---|---|---|---|
+| Q10 | 186.5 → 151.2 MB (−19 %) | 369.8 k → 342.3 k (−7 %) | −0.4 % |
+| Q35 | — | — | −1.4 % |
+| Q16, Q69, Q94, Q95 | — | — | flat |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+This slice moves its target by less than 3 %. Under banner rule (b), the next M0122-0012 slice must move its own
+target by at least 3 %, or M0122-0012 yields to M0147.
+
+**Measured and not landed this loop.**
+
+- **Skipping the NULL store for skipped scan columns.** A store happens only when the reused cell is not exactly
+  NullDatum. The skip arm's 48-byte stores are the largest lines of a filtered `store_sales` deform (about a third
+  of `decodeRowRangeInfo` in Q28), but the load and compare cost more instructions (+4.7 %) for −1 to −3 % cycles,
+  within noise.
+- **The nested-loop stream's outer-row copy** (`nlJoinStream.stepOuter`, the sibling of slice 82). It does not
+  fire in Q10, whose outer rows are not VirtualSlots with arena-backed cells, so it is left as it is.
