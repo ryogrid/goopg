@@ -1551,3 +1551,46 @@ func TestGatherOverSetOpBranchParallelHashIdentity(t *testing.T) {
 		})
 	}
 }
+
+// TestAttachAllWiresHashBuildUnderPartialUnique pins M0122-0012 slice 73: a
+// partial Unique (PG's per-worker `Gather Merge → Unique → Sort`) above a
+// Parallel Hash join passes the build-side walk through, as it passes the
+// three scan attachers. Without the arm every participant scanned the whole
+// build relation into the shared table (TPC-DS Q87 / Q38's catalog branch:
+// each worker's join returned ~4x PG's rows, hidden by the Unique).
+func TestAttachAllWiresHashBuildUnderPartialUnique(t *testing.T) {
+	probeScan := &seqScanOp{}
+	buildScan := &seqScanOp{}
+	j := &optimizer.Join{Algo: optimizer.JoinAlgoHash, Type: optimizer.JoinTypeInner, ParallelHash: true}
+	partial := &optimizer.DistinctOn{PartialUnique: true}
+	tree := &distinctOnOp{plan: partial, child: &sortOp{child: &joinOp{plan: j, left: probeScan, right: buildScan}}}
+	cs := newParallelClaimSet()
+	if !cs.attachAll(tree) {
+		t.Fatal("attachAll reported nothing attached")
+	}
+	if probeScan.pscan != cs.pscan {
+		t.Error("probe scan not wired to the flat claim set")
+	}
+	if buildScan.pscan == nil || buildScan.pscan != cs.hashBuildBranch(j).pscan {
+		t.Error("build scan under a partial Unique not wired to the join's hashBuildBranch claim set")
+	}
+	// An unmarked Unique is not a per-worker dedup: neither walk descends it.
+	unmarked := &seqScanOp{}
+	plain := &distinctOnOp{plan: &optimizer.DistinctOn{}, child: &sortOp{child: &joinOp{plan: j, left: &seqScanOp{}, right: unmarked}}}
+	if newParallelClaimSet().attachAll(plain); unmarked.pscan != nil {
+		t.Error("build scan under an unmarked Unique was claimed")
+	}
+}
+
+// TestUnwrapToSetOpThroughPartialUnique: the SetOp walk passes a partial
+// Unique too, so the branches of a partial SetOp below one are claimed.
+func TestUnwrapToSetOpThroughPartialUnique(t *testing.T) {
+	so := &setOp{plan: &optimizer.SetOp{Op: parser.SetOpUnion, All: true}, left: &seqScanOp{}, right: &seqScanOp{}}
+	partial := &optimizer.DistinctOn{PartialUnique: true}
+	if got, ok := unwrapToSetOp(&distinctOnOp{plan: partial, child: &sortOp{child: so}}); !ok || got != so {
+		t.Fatal("unwrapToSetOp did not reach the SetOp through a partial Unique")
+	}
+	if _, ok := unwrapToSetOp(&distinctOnOp{plan: &optimizer.DistinctOn{}, child: so}); ok {
+		t.Fatal("unwrapToSetOp descended an unmarked Unique")
+	}
+}

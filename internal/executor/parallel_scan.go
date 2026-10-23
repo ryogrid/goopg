@@ -773,6 +773,20 @@ func (cs *parallelClaimSet) hashBuildBranch(j *optimizer.Join) *parallelClaimSet
 // Hash build is partial and must be claimed.
 func (cs *parallelClaimSet) attachParallelHashBuildSides(op Operator) bool {
 	switch x := op.(type) {
+	case *distinctOnOp:
+		// A partial Unique (PG's per-worker `Gather Merge → Unique`) passes
+		// its rows through, as it does for the three scan attachers. Without
+		// this arm the walk stopped above it and a Parallel Hash join below
+		// went unclaimed: every participant fed the whole build relation into
+		// the shared table and the join returned (participants) copies of
+		// every match — TPC-DS Q87's and Q38's catalog branch (M0122-0012
+		// slice 73; the per-worker Unique hid the copies from the result).
+		// Only the producer-marked node is descended, as attachParallelScan
+		// requires.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return false
+		}
+		return cs.attachParallelHashBuildSides(x.child)
 	case *filterOp:
 		return cs.attachParallelHashBuildSides(x.child)
 	case *projectOp:
@@ -900,6 +914,14 @@ func unwrapToSetOp(op Operator) (*setOp, bool) {
 		return unwrapToSetOp(x.child)
 	case *instrumentedOp:
 		return unwrapToSetOp(x.inner)
+	case *distinctOnOp:
+		// The scan attachers' pass-through set (M0122-0012 slice 73): a
+		// partial Unique over a partial SetOp leaves the branches to claim.
+		// Only the producer-marked node, as attachParallelScan requires.
+		if x.plan == nil || !x.plan.PartialUnique {
+			return nil, false
+		}
+		return unwrapToSetOp(x.child)
 	case *sortOp:
 		return unwrapToSetOp(x.child)
 	case *incrementalSortOp:

@@ -228,3 +228,56 @@ TestPort\_Isolation PASS), and plan shapes are identical.
 **Left.** Q61's 23× per-row CPU gap would also show where the join is not empty. goopg deforms every scanned
 row up to its last referenced column before the first hash probe, while PG's `slot_getsomeattrs` deforms
 lazily, only as far as each consumer reads.
+
+## Slice 73 (2026-10-23): the Parallel Hash build-side claim walk passes a partial Unique — TPC-DS Q87, Q38
+
+**Instrument: the per-node actual-rows census.** Slice 72 showed that a timing gap can hide an algorithmic
+difference that only PG's actual row counts reveal. `tmp/rows-census.sh <port>` captures
+`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)` of every TPC-DS query's first statement on the SF0.25 clone and on
+the `:65438` `tpcds025` reference. `tmp/rows-census.py` aligns the two plans node by node (the shapes are
+identical, 99/99) and lists every node whose total goopg rows exceed 3 × PG's.
+
+- **Totals.** goopg prints per-worker lines for parallel nodes; they are summed. PG prints the average per loop;
+  it is multiplied by the loop count.
+- **Leads it surfaced:**
+  - Q87 and Q38's catalog branch: about 4 × PG on the Parallel Hash Join and everything above it.
+  - Q72: the `inventory_pkey` index scan at 20 ×.
+  - Q67 and Q51: their Sorts at 10 × and 330 ×.
+  - Q17, Q25 and Q29: a `catalog_sales_pkey` index scan that PG runs for 0 rows.
+
+**Finding (Q87, Q38).** In the catalog branch every goopg participant's `Parallel Seq Scan on date_dim` returned
+all 365 rows, where PG's split them (91.25 × 4). Each participant therefore inserted the whole build relation
+into the one shared Parallel Hash table, and every probe row matched four times. The branch's plan is
+`Gather Merge → Unique (partial, per worker) → Sort → Nested Loop → Parallel Hash Join`. The Parallel Hash
+build-side walk (`attachParallelHashBuildSides`) had no `distinctOnOp` arm, so it stopped at the per-worker Unique
+and the build scan never received its claim state (`hashBuildBranch`). The three scan attachers
+(`attachParallelScan`, `attachParallelIndexScan`, `attachParallelBitmapScan`) all had that arm: a sibling-walk
+drift. The results stayed correct only because the per-worker Unique and the leader's Unique removed the
+identical copies. The store branch, whose Unique sits above the Gather Merge, was unaffected.
+
+**Change.**
+
+- `attachParallelHashBuildSides` gains the `distinctOnOp` arm.
+- So does `unwrapToSetOp`, the SetOp claim walk, which lacked it too.
+- Both descend only a producer-marked partial Unique (`DistinctOn.PartialUnique`), exactly as
+  `attachParallelScan` does: an unmarked Unique under a Gather is not a per-worker dedup.
+
+**Pins.**
+
+- `TestAttachAllWiresHashBuildUnderPartialUnique`: Unique → Sort → Parallel Hash. The probe scan takes the flat
+  claim set, the build scan takes the join's `hashBuildBranch` set, and an unmarked Unique wires nothing. Dropping
+  the arm, or its gate, fails it.
+- `TestUnwrapToSetOpThroughPartialUnique`: a marked Unique is passed and an unmarked one is not.
+
+**Measured** against `d92a36e6f`:
+
+| query | HEAD Ginstr | candidate Ginstr | warm wall (s), HEAD → candidate (PG) |
+|---|---|---|---|
+| Q87 | 23.73 | 13.11 (−44.8 %) | 0.633 → 0.371 (0.30) |
+| Q38 | 23.57 | 12.86 (−45.4 %) | 0.620 → 0.357 |
+
+Each participant's catalog-branch join now returns about 17.5 K rows, 71 906 in total, which is PG's figure.
+Q87's and Q38's outputs are byte-identical to the `tpcds025` reference's. Values are identical (sf025 PASS=99,
+61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and plan shapes are identical.
+
+**Left.** The census's other leads (Q72, Q67, Q51, Q17/Q25/Q29) are the next slices' targets.

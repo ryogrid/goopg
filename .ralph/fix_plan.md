@@ -2303,6 +2303,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       store\_sales tuples are NULL\-free\)\.
     - Rule b: slices 71 \(Q97 −3\.0 %\) and 72 \(Q61 −99 %\) ≥ 3 % → no yield\.
     - Next: lazy deform before a selective hash probe \(PG slot\_getsomeattrs\), or the Parallel Hash empty exit\.
+  - **Slice 73 — the Parallel Hash build\-side claim walk passes a partial Unique LANDED 2026\-10\-23\.** Movement: none —
+    perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7 "Slice 73"\.
+    - New instrument: per\-node actual\-rows census goopg vs :65438 tpcds025 \(tmp/rows\-census\.sh / \.py\) — flags
+      nodes doing > 3× PG's rows\.
+    - Q87/Q38 catalog branch: attachParallelHashBuildSides \(and unwrapToSetOp\) lacked the distinctOnOp arm the three
+      scan attachers had — every participant fed the whole date\_dim into the shared table \(4× join rows, hidden by
+      the Unique\)\. Added, PartialUnique\-gated \(pinned; mutation\-checked\)\.
+    - Q87 23\.73 → 13\.11 Ginstr \(−44\.8 %\), warm 0\.633 → 0\.371 s \(PG 0\.30\); Q38 −45\.4 %; outputs identical to PG\.
+    - Census leads for next slices: Q72 inventory\_pkey index scan 20×, Q67/Q51 Sorts 10×/330×, Q17/Q25/Q29
+      catalog\_sales\_pkey index scan where PG reads 0 rows\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4491,6 +4502,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `2efa8fe12`** \(M0122\-0012 slice 71 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `d92a36e6f`** \(M0122\-0012 slice 72 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
