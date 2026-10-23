@@ -2481,6 +2481,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       lead rejecting < 25 % of its first 4096 rows switches off\.
     - Q28 25\.02 → 17\.99 G instructions \(−28 %\); Q13/Q48/Q88/Q96/Q7 flat, Q9 \+0\.2 % noise\. Rule \(b\) watch resets\.
     - Open: a qual reading the last column has no prefilter, hence no lead \(possible later slice\)\.
+  - **Slice 87 — a sorted aggregate carries the next group in the finalized group's runtime LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 87"\.
+    - Target: Q78 \(6\.2x warm vs release PG at cd37060e5; 2224 MB / 5\.50 M objects per run\)\. nextSorted allocated
+      a groupRuntime, one 704\-byte aggRuntime per aggregate, a key row and key strings for every group; Q78's groups
+      are mostly one row\.
+    - Q78 −24 % bytes, −28 % objects, −3\.2 % instructions, warm wall 1\.74 → 1\.45 s; Q97 −3\.7 %, Q51 −3\.1 %
+      instructions; Q67 flat\. Rule \(b\): ≥ 3 % on its target\.
+    - Open: Q78 sys time ~1\.0 s/run; remaining 1\.7 GB/run \(Gather Merge transfer, sort rows, merge\-join output\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -4789,6 +4799,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-23 — **exhausted at `44017260b`** \(M0122\-0012 slice 85 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261023x/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `cd37060e5`** \(M0122\-0012 slice 86 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023y/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);

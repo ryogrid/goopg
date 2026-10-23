@@ -129,7 +129,13 @@ func TestSameSortedGroupMatchesSameGroupKey(t *testing.T) {
 				t.Fatalf("column %d value %v trim=%v: appendGroupColKey %q, evalGroupExprs part %q", i, v, o.gkTrims[i], got, rowParts[i])
 			}
 		}
-		o.sCurParts = curParts
+		// The group's parts as nextSorted keeps them: one buffer, per-column
+		// end offsets (slice 87).
+		o.sCurKey, o.sCurEnds = nil, nil
+		for _, p := range curParts {
+			o.sCurKey = append(o.sCurKey, p...)
+			o.sCurEnds = append(o.sCurEnds, len(o.sCurKey))
+		}
 		want := sameGroupKey(curParts, rowParts)
 		if got := o.sameSortedGroup(row); got != want {
 			t.Fatalf("cur %v row %v trims %v: sameSortedGroup %v, sameGroupKey %v", cur, row, o.gkTrims, got, want)

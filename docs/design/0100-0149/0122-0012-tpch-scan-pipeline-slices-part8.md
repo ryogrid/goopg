@@ -468,3 +468,65 @@ This moves its own target by at least 3 %, so the rule (b) yield watch resets.
   lead stage either. Extending the lead to the late position is a possible later slice.
 - **An out-of-line cell in the lead's prefix,** even in a column the lead does not read, sends the row down the
   prefilter path uncounted. This is the same rule `needsDetoastPrefix` applies to the prefilter.
+
+## Slice 87 — a sorted aggregate carries the next group in the finalized group's runtime
+
+**Target.** Q78 was the largest warm gap against release PG at `cd37060e5`: 1.74 s against 0.28 s (6.2×). It
+allocated 2224 MB in 5.50 M objects per run.
+
+**Attribution** (perf samples inside `mallocgc`, each attributed to its first non-runtime frame). The largest site was
+`aggregateOp.nextSorted` building a new group, about 5 % of all samples. Each group allocated:
+
+- a `groupRuntime`;
+- one `aggRuntime` per aggregate, at 704 bytes each;
+- the key-values row;
+- a `[]string` of key parts, plus one string per column.
+
+Q78's three GroupAggregates group by (item, customer), and most groups hold one row, so this ran for nearly every
+input row. PG resets its per-group state in place (`initialize_aggregates` over the AggStatePerGroup array) and
+allocates nothing per group.
+
+**Change** (`operators_join_agg.go`, `nextSorted` / `sameSortedGroup`).
+
+- **Reusing the runtime.** Once `finalizeGroup` has formed the finished group's row, that group's runtime carries the
+  next group:
+  - its `aggs` are cleared, which is the zero state `make` gave;
+  - its key-values and passthrough rows are reused (`reuseRowLen`).
+- **Why that is safe.** `finalizeGroup` copies everything into a fresh output row, and nothing else refers to the
+  runtime. Clearing drops the old values' references without touching what they point to, which the emitted row may
+  share. No aggregate state is keyed by a runtime's address (`sharedUserStates` is per slot).
+- **The group key.** It is kept in one reused byte buffer with per-column end offsets (`sCurKey` / `sCurEnds`) instead
+  of a string slice.
+- **After the stream.** The last group's runtime is kept as `sFree`, so a rescan reuses it too.
+
+**Pins.**
+
+- `TestAggSortedReusedRuntimeKeepsEmittedRows` retains every emitted row as returned, without a copy, across two
+  scans of one operator, and renders the rows only at the end. They must equal the hash strategy's rows. The aggregates
+  cover a numeric sum, text max, `count(DISTINCT)`, `array_agg` and numeric avg.
+- `TestSameSortedGroupMatchesSameGroupKey` now builds the offset-encoded key.
+- Two mutations fail the tests: dropping the `clear`, and not advancing the key offset.
+
+**Measured** against `cd37060e5`:
+
+| query | measure | before | after | change |
+|---|---|---|---|---|
+| Q78 | bytes per run | 2224 MB | 1683 MB | −24 % |
+| Q78 | objects per run | 5.50 M | 3.97 M | −28 % |
+| Q78 | instructions | 20.50 G | 19.85 G | −3.2 % |
+| Q78 | warm wall time | 1.74 s | 1.45 s | −17 % |
+| Q97 | instructions | — | — | −3.7 % |
+| Q51 | instructions | — | — | −3.1 % |
+| Q67 | instructions | — | — | flat |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Open.** Q78 still spends about 1.0 s of system time per run against 1.8 s of user time. Its remaining 1.7 GB per
+run is the next lever: Gather Merge transfer rows, sort rows, and merge-join output.
