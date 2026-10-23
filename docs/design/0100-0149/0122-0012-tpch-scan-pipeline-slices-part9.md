@@ -293,3 +293,26 @@ Values are identical:
 - spotcheck PASS;
 - RegressSuite PASS;
 - TestPort\_Isolation PASS.
+
+## After slice 92 — probe: computed values over a borrowed scan (filed P0-E12)
+
+Slice 92 refused to borrow behind a Project with computed targets. The probe asked whether the existing borrow gates
+have the same hazard.
+
+**Gather workers.** A hand-built Gather over Project(`substr(t, 2, 6)`) over a parallel scan of a multi-page text
+table returns about 16 000 of 20 000 strings with another column's bytes. From SQL, the planner places such
+projections above the Gather, so workers ship raw scan cells and the probed queries (projection, filter) match the
+serial run.
+
+**Hash aggregate over a borrowed scan, serial.** `SELECT substr(t, 2, 6), count(*) FROM gq GROUP BY 1` returns
+60 000 rows with only 36 distinct keys.
+
+- `aggregateBorrowsScanRows` lets the scan hand up its reused row because "group keys are MaterializeArena'd at group
+  creation".
+- But `evalSubstr` slices the arena-backed string, and `NewStringDatum` wraps the bytes uncopied. The key has
+  `ArenaID` 0 and its `Buf` inside the page arena, so `MaterializeArena` keeps it as is, and a later page overwrites
+  it.
+- It reproduces at `a05a55628`, before this part's slices.
+
+It is filed as **P0-E12** (S2, owner placement). The repro is `analysis/p0e12/`, with the expected output computed
+from the generator. The probe tests were not kept; the P0-E12 task names the regression test its fix needs.

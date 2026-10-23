@@ -806,6 +806,34 @@ heuristic stays live.)
   - Expected instrument: the repro identical to `analysis/p0e11/pg18\.out`; Q12/Q20/Q98 outputs identical to
     :65438 tpcds025\.
 
+- [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
+  \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(the repro's values differ from the generator's\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-24 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e12/substr\-group\-key\-repro\.sql`; expected output
+    > `analysis/p0e12/expected\.out` \(computed from the generator: 60 000 distinct keys, count 1 each\); goopg output
+    > `analysis/p0e12/goopg\-a05a55628\-serial\.out` — 60 000 rows but only **36 distinct keys**\.
+  - Symptom: on a throwaway cluster, `SELECT substr\(t, 2, 6\), count\(\*\) FROM gq GROUP BY 1` \(serial, a HashAggregate
+    over a Seq Scan of a 60 000\-row table with a 200\-byte pad column\) returns most rows as `59972\-\|1` — the stored
+    keys show a later page's bytes\. With parallelism forced, 44 keys show the pad column's bytes\. Reproduces at
+    `a05a55628` and at `2e8519eff` \(pre\-dates M0122\-0012 slices 84\-92\)\.
+  - Cause \(read\): evalSubstr slices `src\.StringValue\(\)` — an `unsafe\.String` over the scan's per\-page arena for
+    an arena\-backed cell — and `NewStringDatum` wraps those bytes without copying, so the result has `ArenaID` 0
+    while its `Buf` points into the arena\. `MaterializeArena` treats it as owned and does not detach it\. The scan
+    borrow \(M0145\-0008u `aggregateBorrowsScanRows`: "group keys MaterializeArena'd at group creation"\) hands the
+    aggregate the scan's reused row, so the retained key is overwritten when the arena is reused for a later page\.
+    The same class hit TPC\-H Q22 in slice 83 \(memory note "computed values alias the scan arena"\); a hand\-built
+    Gather over Project\(substr\) over a parallel scan returns pad bytes the same way\.
+  - First step: make a value computed from an arena\-backed string own its bytes or carry the arena mark — at the
+    source \(evalSubstr and the other slicing builtins: left/right/split\_part/trim family, lower/upper when
+    unchanged\) or by having NewStringDatum's callers on arena inputs copy; then re\-check every borrow gate that
+    trusts MaterializeArena on computed values \(aggregateBorrowsScanRows group keys and min/max, gatherOp workers
+    through projectOp, slice 92's coopBorrowScan already refuses computed targets\)\.
+  - Expected instrument: the repro identical to `analysis/p0e12/expected\.out`, serial and parallel; a regression
+    test with a substr group key over a multi\-page text scan; TPC\-H/TPC\-DS values unchanged\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -4903,6 +4931,12 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-24 — **census reused at `a5ba2cb39`** \(docs\-only commit; routing\-20261024d's capture sha
     `8532a71e3` is an ancestor and no planner/executor/cost path changed since\)\. Same items\-0\-9 tokens as the
     `8532a71e3` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `2e8519eff`** \(M0122\-0012 slice 92 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
