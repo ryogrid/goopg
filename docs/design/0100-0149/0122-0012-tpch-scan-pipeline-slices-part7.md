@@ -456,6 +456,25 @@ plan shapes are identical.
 **Discovery.** On this binary Q72 runs 0.69 s bare but 3.04 s under `EXPLAIN (ANALYZE, TIMING OFF)`, while PG's
 EXPLAIN ANALYZE of it takes 0.87 s. Filed as M0122-0018. Until it is understood, per-node timings read off EXPLAIN
 ANALYZE on rescan-heavy plans are distorted.
+*Corrected below (M0122-0018 closed): the 3.04 s was a once-per-server stall, not EXPLAIN overhead.*
 
 **Left.** The remaining per-descent cost is constant factors that PG also pays at each level: an internal page's
 binary search (`findChildBlockDirect`), the high-key test, and buffer pins.
+
+## M0122-0018 closed — the "EXPLAIN ANALYZE 4.4× slower" reading was a once-per-server stall
+
+Slice 76 recorded Q72 at 3.04 s under `EXPLAIN (ANALYZE, TIMING OFF)` against 0.69 s bare. Re-measured on one warm
+server at `7050dc003`:
+
+- **No real overhead.** Bare runs take 0.58–0.62 s and EXPLAIN runs 0.60–0.67 s, about +7 %. Instructions:u are
+  27.39 vs 27.64 G per query. The filed figure was the server's first EXPLAIN run.
+- **The stall is not EXPLAIN's.** One run of about 3.4 s occurs once per server lifetime, bare or EXPLAIN alike,
+  when the server's RSS first crosses about 5 GB (4 948 and 5 058 MB in two series).
+- **It is not GC either.** `GODEBUG=gctrace=1` shows the first collection only at 11.4 GB, ten seconds after the
+  stall. The likely cause is the WSL2 VM committing fresh host memory on first touch, an environment stall that
+  benchmark timing should exclude by warming a server past it.
+- **The memory growth is real.** Q72 allocates about 202 MB and 2.4 M objects per run (MemStats TotalAlloc and
+  Mallocs over 5 runs; PG allocates almost nothing per row). Under GOGC=200 over a 2.8 GB live heap, of which the
+  buffer-pool arena is 2 GB, that garbage reaches about 11 GB before the first collection. This is the next lead.
+- **Measurement note.** `/debug/pprof/allocs` diffs between two `?gc=1` fetches showed almost none of those
+  allocations. Read the MemStats lines of `/debug/pprof/heap?debug=1` instead.

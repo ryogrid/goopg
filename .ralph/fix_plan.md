@@ -2412,9 +2412,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     node returns \(InstrStopNode after ExecScan's qual\), goopg counts them before the Filter\.
   - Resume point: the instrumentation wrapper around an index scan with a pushed\-down Filter \(maybeInstrument
     placement vs the filterOp the builder adds\) — count emitted rows, keep Rows Removed by Filter as is\.
-- [ ] **M0122-0018 — EXPLAIN \(ANALYZE, TIMING OFF\) runs TPC\-DS Q72 4\.4× slower than the bare query**\.
+- [x] **M0122-0018 — EXPLAIN \(ANALYZE, TIMING OFF\) runs TPC\-DS Q72 4\.4× slower than the bare query**\.
   Kind: impl
   Parent: M0122-0012
+  Movement: none — premise stale: the 3\.04 s was a once\-per\-server stall, not EXPLAIN overhead\.
+  - **Closed 2026\-10\-23 \(loop \#118\)\.** Warm, on one server \(`7050dc003`\): bare 0\.58–0\.62 s, `EXPLAIN \(ANALYZE,
+    TIMING OFF\)` 0\.60–0\.67 s \(\+7 %; instructions 27\.39 vs 27\.64 G\)\. The filed 3\.04 s was the server's first
+    EXPLAIN run\.
+  - A ~3\.4 s run recurs ONCE per server lifetime, bare or EXPLAIN alike, when RSS first crosses ~5 GB \(4 948 /
+    5 058 MB in two series\)\. gctrace shows the first GC only at 11\.4 GB, 10 s later — not GC\. Reading: the
+    WSL2 VM committing fresh host memory on first touch \(an environment stall\)\.
+  - What drives RSS there is real: Q72 allocates ~202 MB and 2\.4 M objects per run \(MemStats TotalAlloc /
+    Mallocs over 5 runs\), and GOGC=200 over a 2\.8 GB live heap \(2 GB buffer\-pool arena\) lets it pile to ~11 GB
+    before the first GC\. Lead for the next M0122\-0012 slice\.
   - Filed 2026\-10\-23 from M0122\-0012 slice 76\. On the SF0\.25 clone \(binary `88998a861`\) Q72 takes 0\.69 s bare
     and 3\.04 s under `EXPLAIN \(ANALYZE, COSTS OFF, TIMING OFF\)`; PG's InstrStartNode/InstrStopNode without
     timing only bump counters \(instrument\.c\), and PG's own EXPLAIN ANALYZE of Q72 takes 0\.87 s\.
