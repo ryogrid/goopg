@@ -323,6 +323,9 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		if aggregateBorrowsScanRows(p) {
 			markScanBorrowChain(child)
 		}
+		if aggregateBorrowsGatherRows(p) {
+			markGatherMergeBorrow(child)
+		}
 		if aggregateIgnoresInputOrder(p) {
 			markDistinctUnordered(child)
 		}

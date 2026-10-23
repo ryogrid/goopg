@@ -530,3 +530,65 @@ Values are identical:
 
 **Open.** Q78 still spends about 1.0 s of system time per run against 1.8 s of user time. Its remaining 1.7 GB per
 run is the next lever: Gather Merge transfer rows, sort rows, and merge-join output.
+
+## Slice 88 — a Gather Merge read by a borrowing aggregate ships compact rows
+
+**Target.** After slice 87, Q78 allocated 1683 MB per run and spent about 1.0–1.45 s of system time per run.
+
+The system time is page faults. Under the cgroup wrapper the server runs `GOGC=off` with `GOMEMLIMIT=12GiB`, so the
+heap is not collected during a run and every allocated byte lands on a fresh page. One run of Q78 took 369 k minor
+faults. Allocation volume is therefore also the system-time lever.
+
+**Attribution.** The largest allocation site was the worker's queue row: `rowChunk.take` inside
+`transferRowForQueueLive`.
+
+- A worker shipped full-width rows: 51 store\_sales × date\_dim columns, about 2.4 KB.
+- Only the live cells were written, 4 to 5 of them (slice 63).
+- The leader then handed that row to the GroupAggregate, which reads it once.
+- The merge also allocated a fresh sort-key slice per row (`advance`).
+
+**Change** (`operators_gather_merge.go`, `scan_borrow.go`, `executor.go`).
+
+- **When it applies.** The aggregate build marks a Gather Merge directly below it as `borrowOut` when the aggregate
+  passes `aggregateBorrowsGatherRows`. That predicate is `aggregateBorrowsScanRows` without its two arena exclusions,
+  the sorted strategy and passthrough columns: a Gather Merge row's values are already detached, so keeping one as is
+  keeps an owned value. DISTINCT, ordered, ordered-set, user and Finalize aggregates are still refused.
+- **Compact transfer.** In Open, a `borrowOut` merge whose `liveCols` mark fewer columns than the row has sets
+  `liveIdx`. Every participant then ships compact rows holding just the live cells, each detached
+  (`transferRowCompact`). The leader's own share reuses one compact row.
+- **Expansion on the leader.** The leader expands each compact row into the next of its source's two scratch rows
+  (`expandLive`). The row Next returned last is the other scratch row, so it stays intact until the parent's next
+  call, which is the borrow contract. Dead cells are never written: they stay NULL, or the deform poison when that is
+  armed.
+- **Key slices.** Every merge source now reuses its sort-key slice. The heap compares only the fronts' keys, and Next
+  takes the popped row before advancing that source.
+
+**Pins.**
+
+- `TestGatherMergeCompactTransferMatchesFullRows` hand-builds a sorted GroupAggregate over Gather Merge → Sort →
+  Seq Scan of an 8-column table with 6000 rows. Its aggregates are count, sum, numeric max, avg with NULLs, and text
+  min. The rows must equal the full-width transfer's (borrow off) with 0, 1 and 3 workers, and the compact path must be
+  armed. It also passes under `-race`.
+- `TestAggregateBorrowsGatherRows` pins the predicate.
+- Two mutations fail the test: a single scratch row instead of two, and dropping the expansion.
+
+**Measured** against `127b21ea8`:
+
+| query | measure | before | after | change |
+|---|---|---|---|---|
+| Q78 | bytes per run | 1683 MB | 876 MB | −48 % |
+| Q78 | objects per run | 3.97 M | 3.69 M | −7 % |
+| Q78 | instructions | 19.85 G | 19.29 G | −2.9 % |
+| Q78 | warm wall time | 1.67 s | 1.41 s | −15 % |
+| Q78 | warm sys time | 1.45 s | 0.40 s | −72 % |
+| Q47, Q51, Q57, Q64, Q65, Q67 | instructions | — | — | −0.2 to −0.8 % |
+| Q5, Q74, Q98 | instructions | — | — | flat |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- spotcheck PASS;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.

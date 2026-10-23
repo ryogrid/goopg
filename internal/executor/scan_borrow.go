@@ -48,6 +48,45 @@ func aggregateBorrowsScanRows(agg *optimizer.Aggregate) bool {
 	return true
 }
 
+// aggregateBorrowsGatherRows reports whether agg reads each input row before
+// pulling the next and keeps nothing of the row slice, so a Gather Merge
+// directly below it may hand up a reused scratch row (gatherMergeOp.borrowOut,
+// M0122-0012 slice 88). It is aggregateBorrowsScanRows without the two
+// exclusions that exist for the seq scan's per-page arena: a Gather Merge
+// row's values are detached already (every participant MaterializeArenas
+// each cell it ships), so a passthrough column or the sorted strategy's
+// group key keeping an input value as is keeps an owned value. What it still
+// refuses keeps rows (ordered and ordered-set aggregates, DISTINCT) or may
+// keep an argument in a state it later mutates (user aggregates), and a
+// Finalize node combines partial states.
+func aggregateBorrowsGatherRows(agg *optimizer.Aggregate) bool {
+	if scanBorrowDisabled || agg == nil || agg.Mode == optimizer.AggModeFinal {
+		return false
+	}
+	for i := range agg.Aggs {
+		a := &agg.Aggs[i]
+		if a.UserAgg != nil || a.Distinct || a.WithinGroup || len(a.OrderBy) > 0 || len(a.WithinGroupOrderBy) > 0 {
+			return false
+		}
+		switch strings.ToLower(a.Name) {
+		case "count", "sum", "avg", "min", "max":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// markGatherMergeBorrow sets borrowOut on a Gather Merge that is op itself.
+func markGatherMergeBorrow(op Operator) {
+	if io, ok := op.(*instrumentedOp); ok {
+		op = io.inner
+	}
+	if gm, ok := op.(*gatherMergeOp); ok {
+		gm.borrowOut = true
+	}
+}
+
 // markScanBorrowChain hands the seq scan at the bottom of op the borrow
 // (M0145-0008u) when every operator between it and a borrowing aggregate
 // passes each row up before pulling the next and keeps nothing of it — PG's
