@@ -4949,6 +4949,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9/E10/E11/E12
     \(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `b63f03791`** \(M0147\-0011 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261024g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7388,9 +7391,16 @@ Basis: the 2026-10-21 lever census and its review
   - AGENT.md R6/B1 (amended 2026-10-21): no new packed retention; deleting this leftover arm is in scope.
     `packUse` branches in operators.go; packedslot_test.go:657. Supersedes the packed part of M0141-S7-exec-d and
     ledger row 2259 (new rows; note on M0141-S7-exec-d).
-- [ ] **M0147-0012 — retire `GOOPG_HEAP_PREFETCH_DEPTH`**
+- [x] **M0147-0012 — retire `GOOPG_HEAP_PREFETCH_DEPTH`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 29→28 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. bitmap\_prefetch\.go and its tests deleted; the
+    `pf` field, its construction, four drain points and the refill/take branch removed from operators\_bitmap\.go;
+    `tbmIterator\.peekBlocks` deleted\. Pool\.StartRead kept\. Design doc
+    `docs/design/0100\-0149/m0147\-0012\-retire\-heap\-prefetch\-depth\.md` \(C6\)\. Gates: units, spotcheck,
+    acceptance 24 MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans standalone same=99\), census on tree held,
+    RegressSuite, Isolation\.
   - Remove the prefetch window (`o.pf`) and its construction at operators_bitmap.go:554
     (`newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())`) with `internal/executor/bitmap_prefetch.go`;
     keep the storage-layer `Pool.StartRead` (reusable per `docs/design/not_ralph/minimize_datum/TODO_ALL.md:4144-4190`,
