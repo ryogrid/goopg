@@ -4937,6 +4937,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **census reused at `652989a37`** \(docs\-only filing commit; routing\-20261024e's capture
+    `2e8519eff` is an ancestor\)\. Same items\-0\-9 tokens plus P0\-E12\(owner\-placement\)\. Item 10 is live; M0122\-0012
+    yielded under rule \(a\) \(no runnable slice after profiling Q14/Q23/Q67\) → M0147\-0010\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7351,9 +7354,15 @@ Basis: the 2026-10-21 lever census and its review
   - A channel, not stock (like M0146-0014): never select it; take its first open child in file order. Close it
     only in the commit that closes its last child. Skip-rationale token: `M0147-0000(channel)`. Commit subjects
     cite the child id, never M0147-0000.
-- [ ] **M0147-0010 — retire the S30.3 / S32.x probes: `GOOPG_PAGEIDENT_PROBE`, `GOOPG_S321_PROBE`, `GOOPG_S321_NOWAIT`, `GOOPG_S322_NOWAIT`**
+- [x] **M0147-0010 — retire the S30.3 / S32.x probes: `GOOPG_PAGEIDENT_PROBE`, `GOOPG_S321_PROBE`, `GOOPG_S321_NOWAIT`, `GOOPG_S322_NOWAIT`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 34→30 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under banner rule \(a\)\)\. Files deleted: s321\_probe\.go,
+    pageident\_probe\.go, analysis/pageident\_probe\.sh; call sites removed in operators\_storage\.go, bufpool\.go,
+    smgr\.go, prefetch\.go; the six NOWAIT conjuncts deleted, the waits kept\. Design doc
+    `docs/design/0100\-0149/m0147\-0010\-retire\-s30\-s32\-probes\.md` \(C6 inert proof\)\. Gates: units, spotcheck,
+    acceptance 24 MATCH, sf025 PASS=99, census on tree held, RegressSuite, Isolation; fire\-set out of scope\.
   - `internal/storage/pageident_probe.go`, `internal/executor/s321_probe.go` and their hooks (bufpool.go,
     operators_storage.go), plus `analysis/pageident_probe.sh`. **Keep the pending-writer waits**: delete only the
     `!s321NoWait &&` / `!s322NoWait &&` conjuncts at operators_storage.go ~5388/5413/6052/6070/6338/6361 —
