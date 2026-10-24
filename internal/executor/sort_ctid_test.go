@@ -55,8 +55,6 @@ func TestSortByCTID(t *testing.T) {
 	parallel.MaxParallelWorkersPerGather = 2
 	ctx.MaxParallelWorkers = 8
 	ctx.ParallelLeaderParticipation = true
-	prevPacked := sortPackedEnabled()
-	t.Cleanup(func() { SetSortPackedEnabled(prevPacked) })
 
 	for _, c := range cases {
 		stmts, err := parser.Parse(c.sql)
@@ -80,8 +78,7 @@ func TestSortByCTID(t *testing.T) {
 				t.Fatalf("%s: no Gather in the %s plan:\n%s", c.sql, mode, text)
 			}
 			for _, workMem := range []int64{0, 64 << 10} {
-				for _, packed := range []bool{false, true} {
-					SetSortPackedEnabled(packed)
+				{
 					ctx.WorkMem = workMem
 					for _, slab := range []bool{false, true} {
 						advanceStmtCounter(ctx)
@@ -107,8 +104,8 @@ func TestSortByCTID(t *testing.T) {
 							for first < len(got) && first < len(c.want) && got[first] == c.want[first] {
 								first++
 							}
-							t.Errorf("%s [%s workmem=%d packed=%v slab=%v]: %d rows, want %d; first difference at row %d: got %q want %q",
-								c.sql, mode, workMem, packed, slab, len(got), len(c.want), first, at(got, first), at(c.want, first))
+							t.Errorf("%s [%s workmem=%d slab=%v]: %d rows, want %d; first difference at row %d: got %q want %q",
+								c.sql, mode, workMem, slab, len(got), len(c.want), first, at(got, first), at(c.want, first))
 						}
 					}
 				}

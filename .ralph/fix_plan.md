@@ -3685,6 +3685,9 @@ spill route is net-negative.
   (completed sub-entries archived → `completed_milestones/completed_fix_plan_015.md`)
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
     Kind: impl
+    **Note 2026\-10\-24 \(M0147\-0011\):** packed\-tuple retention \(`GOOPG\_SORT\_PACKED`\) is retired and no
+    longer part of this task's scope \(AGENT\.md R6/B1\); the remaining items are spill, ctid passthrough and
+    per\-group SortStat\.
     `sortOp` feature parity once exec-a/b/c land and the corpus is
     measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),
     ctid passthrough (`ORDER BY ... FOR UPDATE` over an Incremental Sort),
@@ -4940,6 +4943,12 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-24 — **census reused at `652989a37`** \(docs\-only filing commit; routing\-20261024e's capture
     `2e8519eff` is an ancestor\)\. Same items\-0\-9 tokens plus P0\-E12\(owner\-placement\)\. Item 10 is live; M0122\-0012
     yielded under rule \(a\) \(no runnable slice after profiling Q14/Q23/Q67\) → M0147\-0010\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `1f05de2c5`** \(M0147\-0010 changed internal/executor \+ storage\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9/E10/E11/E12
+    \(owner\-placement\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7367,9 +7376,15 @@ Basis: the 2026-10-21 lever census and its review
     operators_storage.go), plus `analysis/pageident_probe.sh`. **Keep the pending-writer waits**: delete only the
     `!s321NoWait &&` / `!s322NoWait &&` conjuncts at operators_storage.go ~5388/5413/6052/6070/6338/6361 —
     NOWAIT=1 disabled a correctness fix. Resolves ledger row 1194 (new row). lever-count 34→30.
-- [ ] **M0147-0011 — retire `GOOPG_SORT_PACKED` (packed sort retention)**
+- [x] **M0147-0011 — retire `GOOPG_SORT_PACKED` (packed sort retention)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 30→29 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. The sortOp packed arm deleted; packed\-only
+    tests deleted; TestPackedSlotHasNoProducer strict\. Design doc
+    `docs/design/0100\-0149/m0147\-0011\-retire\-sort\-packed\.md` \(C6\)\. Gates: units, spotcheck, acceptance 24
+    MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans captured separately, same=99\), census on tree held,
+    RegressSuite, Isolation\.
   - AGENT.md R6/B1 (amended 2026-10-21): no new packed retention; deleting this leftover arm is in scope.
     `packUse` branches in operators.go; packedslot_test.go:657. Supersedes the packed part of M0141-S7-exec-d and
     ledger row 2259 (new rows; note on M0141-S7-exec-d).
