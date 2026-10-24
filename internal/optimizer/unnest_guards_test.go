@@ -118,19 +118,6 @@ func TestGuardScalarUnderORStaysSubPlan(t *testing.T) {
 	}
 }
 
-func TestGuardTopLevelScalarStillUnnests(t *testing.T) {
-	enableScalarUnnestForTest(t)
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x > (SELECT sum(z) FROM t2 WHERE y = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if findSubqueryExpr(node) != nil {
-		t.Errorf("a top-level correlated sum() sublink should still decorrelate:\n%s", planString(node))
-	}
-}
-
 // --- Guard 3: only NULL-on-empty aggregates may decorrelate ------------
 
 // TestGuardCountScalarStaysSubPlan is the count-bug guard. count() returns 0
@@ -161,23 +148,6 @@ func TestGuardCoalescedAggregateStaysSubPlan(t *testing.T) {
 	}
 	if findSubqueryExpr(node) == nil {
 		t.Errorf("COALESCE-wrapped aggregate was decorrelated; it is not NULL on an empty group:\n%s",
-			planString(node))
-	}
-}
-
-// TestGuardArithmeticOverAggregateStillUnnests pins the shape TPC-H Q20
-// depends on: `0.5 * sum(...)` stays NULL when sum is NULL, so the Project
-// wrapper must not block the rewrite.
-func TestGuardArithmeticOverAggregateStillUnnests(t *testing.T) {
-	enableScalarUnnestForTest(t)
-	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x > (SELECT 2 * sum(z) FROM t2 WHERE y = t1.x)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if findSubqueryExpr(node) != nil {
-		t.Errorf("arithmetic over a whitelisted aggregate is still NULL-preserving and must decorrelate:\n%s",
 			planString(node))
 	}
 }

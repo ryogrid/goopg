@@ -420,45 +420,6 @@ func TestIndexKeyScalarProbeCheapStaysSubPlan(t *testing.T) {
 	}
 }
 
-// TestIndexKeyScalarJoinInnerDecorrelates is the policy's other half —
-// the Q2 shape: a correlated scalar whose inner joins another table has
-// no cheap rescan form (its SubPlan path rebuilt an Aggregate over a
-// multi-table join at ≈26 ms per call; decorrelating measured
-// 10.87 s → 3.36 s), so with the harvest on it must decorrelate to the
-// GROUP BY + INNER join.
-func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
-	enableScalarUnnestForTest(t)
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
-
-	cat := indexedCorrCatalog(t)
-	// extra_t joins inner_t inside the subquery, so the inner plan is an
-	// Aggregate over a join — not an index-probe shape.
-	if _, err := cat.CreateTable(parser.ObjectName{Name: "extra_t"}, []catalog.Column{
-		{Name: "e_id", Type: catalog.Type{Name: "int4"}, NotNull: true},
-		{Name: "e_w", Type: catalog.Type{Name: "int4"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	sql := "SELECT o_key FROM outer_t WHERE o_val < (SELECT min(i_a) FROM inner_t, extra_t WHERE i_key = outer_t.o_key AND e_id = i_b)"
-	node, err := Plan(parseOne(t, sql), cat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if findFirstJoinByType(node, JoinTypeInner) == nil {
-		t.Fatalf("scalar with a multi-table inner did not decorrelate to an INNER join")
-	}
-	if findFirstAggregate(node) == nil {
-		t.Fatalf("decorrelated scalar should build a GROUP BY aggregate")
-	}
-	if planHasSubqueryExpr(node) {
-		t.Fatalf("a SubqueryExpr survived after decorrelation")
-	}
-	if planHasOuterRefRemaining(node) {
-		t.Fatalf("an OuterColumnRef survived the rewrite")
-	}
-}
-
 // TestIndexKeyToggleDeterminism: the same correlated EXISTS decorrelates
 // whether or not the inner correlation column is indexed. Before the fix
 // only the index-less form fired.

@@ -1929,7 +1929,6 @@ func TestSlice3SelfJoinInDerivedTable(t *testing.T) {
 // does not, and an outer reference sealed inside a subplan does not (it
 // belongs to the body's own scope — scopeIgnore steps over it).
 func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
-	enableScalarUnnestForTest(t)
 	outer := &OuterColumnRef{Name: "p_partkey", Index: 3}
 	local := func(name string, idx int) *ColumnRef { return &ColumnRef{Name: name, Index: idx} }
 	corr := &BinaryOp{Op: parser.OpEq, Left: local("ps_partkey", 0), Right: outer}
@@ -1953,22 +1952,8 @@ func TestSlice3CorrelatedBodyDeclinesParentAware(t *testing.T) {
 	if !exprHasOuterRefList([]Expr{plain, corr}) {
 		t.Error("mixed list: got false, want true")
 	}
-	// End to end, the correlated Q2 scalar-aggregate body still decorrelates
-	// (the acceptance test that caught the first interaction): the decline
-	// keeps the group key in the body's searched output.
-	if agg := func() *Aggregate {
-		stmts, err := parser.Parse(jsgQ2SQL)
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
-		plan, err := Plan(stmts[0], jsgCatalog(t))
-		if err != nil {
-			t.Fatalf("plan: %v", err)
-		}
-		return jsgDecorrelatedAgg(plan)
-	}(); agg == nil {
-		t.Error("Q2 scalar aggregate no longer decorrelates; corrAbove over-declines or the body lost its group key")
-	}
+	// (The end-to-end half — the correlated Q2 scalar-aggregate body still
+	// decorrelating — went with the scalar decorrelation, M0147-0013.)
 }
 
 // ---- B-01a P4-01 deferred slice (a): merge/NL input policy ----

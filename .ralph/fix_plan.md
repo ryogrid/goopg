@@ -4952,6 +4952,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-24 — **exhausted at `b63f03791`** \(M0147\-0011 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261024g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `50ecb096b`** \(M0147\-0012 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261024h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7405,9 +7408,17 @@ Basis: the 2026-10-21 lever census and its review
     (`newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())`) with `internal/executor/bitmap_prefetch.go`;
     keep the storage-layer `Pool.StartRead` (reusable per `docs/design/not_ralph/minimize_datum/TODO_ALL.md:4144-4190`,
     which records the measured NO-GO).
-- [ ] **M0147-0013 — retire `GOOPG_SCALAR_UNNEST` (correlated scalar-subquery decorrelation; PG never does it)**
+- [x] **M0147-0013 — retire `GOOPG_SCALAR_UNNEST` (correlated scalar-subquery decorrelation; PG never does it)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 28→27 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. Switch, `canUnnestSubquery`, `unnestSubquery`,
+    `unnestScalarWithResiduals` and 13 helpers left unreachable \(`deadcode ./cmd/...` diff\) deleted; the three
+    gates in sublinkjoinclause\.go / local\_filters\.go simplified; flaglabels row → `retired\(M0147\-0013\)`,
+    planner\-flags\.env regenerated\. Decorrelation\-only tests deleted; the Q30 CTE test and the M17 duplicate\-outer
+    test rebased onto PG\'s SubPlan\. Design doc `docs/design/0100\-0149/m0147\-0013\-retire\-scalar\-unnest\.md` \(C6\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans standalone same=99\),
+    fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - unnest.go `unnestSubquery` / `unnestScalarWithResiduals` and the inverse gates at sublinkjoinclause.go:155 and
     local_filters.go:631; keep `collectUnnestParamsAndResiduals` (EXISTS path). Tests:
     scalar_unnest_switch_test.go, executor/nl_semi_anti_join_test.go:119, cte_scalar_sublink_unnest_test.go:80 —
