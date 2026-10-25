@@ -691,8 +691,8 @@ func projectIsPositionalIdentity(p *Project) bool {
 // path's `Pathkeys` are validated against the published schema and stamped on
 // the root by `stampSearchPathkeys`. The legacy join constructor has no path
 // and no stamp, and it reaches `JoinAlgoMerge` on its own — `chooseInnerJoinAlgo`
-// (joincost.go:33) elects merge on cost, and `chooseOuterFillJoinAlgo` leaves
-// RIGHT/FULL on merge by default. Every statement the seam declines on
+// (joincost.go:21) elects merge on cost, and RIGHT/FULL always take merge
+// there (M0147-0014). Every statement the seam declines on
 // (the census's 104 `leaf-count` fires are the bulk) takes that route, so
 // without this arm those trees lose an ordering PG keeps and the ORDERED step
 // stacks a Sort the rows do not need.

@@ -4955,6 +4955,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-24 — **exhausted at `50ecb096b`** \(M0147\-0012 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261024h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-25 — **exhausted at `1a41444e5`** \(M0147\-0013 `483b19112` changed internal/optimizer;
+    `1a41444e5` is analysis\-only\)\. Census `analysis/m0146/m0146\-0014/routing\-20261025a/`: TPC\-H 22/22, TPC\-DS
+    SF0\.25 99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\.
+    Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7423,9 +7427,19 @@ Basis: the 2026-10-21 lever census and its review
     local_filters.go:631; keep `collectUnnestParamsAndResiduals` (EXISTS path). Tests:
     scalar_unnest_switch_test.go, executor/nl_semi_anti_join_test.go:119, cte_scalar_sublink_unnest_test.go:80 —
     rebase any that pin the default arm onto PG's SubPlan expectation. Ledger row 2819 (new row).
-- [ ] **M0147-0014 — retire `GOOPG_HASH_OUTER_JOIN`**
+- [x] **M0147-0014 — retire `GOOPG_HASH_OUTER_JOIN`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 27→26 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-25 \(M0122\-0012 yielded under rule \(a\)\)\. `hashOuterJoinEnabled`, `hashOuterJoinFromEnv`,
+    `chooseOuterFillJoinAlgo` deleted; the planner\.go RIGHT/FULL arm is plain `JoinAlgoMerge` \(the shipped default\);
+    the hash\-RIGHT `BuildLeft` branch went with the hash arm\. `deadcode ./cmd/...` diff: no new orphan\. flaglabels row
+    → `retired\(M0147\-0014\)`, planner\-flags\.env regenerated\. Four hash\-arm\-only tests deleted \(3 in joincost\_test\.go,
+    `TestPlanJoinRightFullTakesHashOnceCostable`\)\. Design doc `docs/design/0100\-0149/m0147\-0014\-retire\-hash\-outer\-join\.md`
+    \(C6\); ledger resolution row for the 2026\-08\-04 M0127\-P4\.2 and 2026\-09\-03 take2\-P6\-06 rows\.
+  - Gates: units, spotcheck, acceptance 24 MATCH \(vs baseline\-digests\), sf025 PASS=99 \(61 ck; SF025\_NO\_PLANS=1;
+    plans standalone same=99\), fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on tree 22/22,
+    RegressSuite, Isolation\.
   - joincost.go:52; keep `costInnerHash`/`costInnerMerge` (default `chooseInnerJoinAlgo`). Neither arm is PG: the
     post-search `chooseInner/OuterFillJoinAlgo` assignment (planner.go:4873-4887) is goopg-private — list it in
     M0147-0030's phase-2 inventory.

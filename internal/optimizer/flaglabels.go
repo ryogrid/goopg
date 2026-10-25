@@ -76,11 +76,10 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
-	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
-	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
-	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
+	"GOOPG_MEMOIZE":          func(v string) string { return onOff(memoizeFromEnv(v)) },
+	"GOOPG_PARALLEL":         func(v string) string { return onOff(parallelFromEnv(v)) },
+	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
+	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
@@ -179,6 +178,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_UNNEST_PREDP",
 	"GOOPG_INDEXKEY_HARVEST",
 	"GOOPG_NLI_COSTGATE",
+	// Retired at M0147-0014 — see flagProvenanceRetired.
 	"GOOPG_HASH_OUTER_JOIN",
 	// Joined at planner-refactor-take2 P0-04c. It multiplies NL-index probe
 	// cost, so it moves the hash-vs-NL crossover on every join — and it had
@@ -346,6 +346,11 @@ var flagProvenanceRetired = map[string]string{
 	// it stays a SubPlan). M0147-0013 deleted the arm, so nothing reads the
 	// variable. `on` in an older artefact is the decorrelating arm.
 	"GOOPG_SCALAR_UNNEST": "M0147-0013",
+	// M0127-P4.2's hash-or-merge choice for a RIGHT/FULL join the post-search
+	// algorithm assignment reaches, default OFF (merge) since then. Neither arm
+	// is PG's add_paths_to_joinrel; M0147-0014 deleted the hash arm, so nothing
+	// reads the variable. `on` in an older artefact is the hash-choosing arm.
+	"GOOPG_HASH_OUTER_JOIN": "M0147-0014",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a
