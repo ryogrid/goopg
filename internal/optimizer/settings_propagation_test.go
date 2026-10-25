@@ -85,7 +85,9 @@ func TestPlannerSettingsReachSubqueryScan(t *testing.T) {
 //
 // The arms are EXACTLY the P2-02d settings family this fixture can observe:
 // seq_page_cost, cpu_tuple_cost, cpu_operator_cost (each ×1000) and work_mem
-// (16kB, whose hash budget spills at this fixture's build size — the same
+// (64kB, PG's minimum, on the unfiltered build where the test says so: PG's
+// packed HashJoinTuple geometry, promoted by M0147-0021, does not spill the
+// 100-row filtered build at any legal budget — the same
 // repricing the bench shows live as `SET work_mem='64kB'` 14835→23478).
 // Deliberately NOT covered here, same honesty rule as
 // TestCostGUCsReachTheCostingOnAHashJoin: random_page_cost,
@@ -100,6 +102,11 @@ func TestPlannerSettingsReachDerivedTableJoin(t *testing.T) {
 	// Q9's shape class: the join tree lives inside the derived table.
 	const sql = "SELECT s.a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) s"
 	const nestedSQL = "SELECT s.a FROM (SELECT q.a AS a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3) q) s"
+	// work_mem needs a build PG's packed HashJoinTuple geometry spills at a
+	// legal work_mem: the unfiltered 10000-row side batches at 64kB, while
+	// `pa.v = 3`'s 100 rows fit any budget PG accepts (M0147-0021 promoted
+	// that geometry; 16kB used to spill only goopg's wider map geometry).
+	const wideSQL = "SELECT s.a FROM (SELECT pa.v AS a, pb.v AS b FROM pa, pb WHERE pa.id = pb.id) s"
 
 	base, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
 	if !ok {
@@ -114,12 +121,16 @@ func TestPlannerSettingsReachDerivedTableJoin(t *testing.T) {
 		{"seq_page_cost", sql, func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
 		{"cpu_tuple_cost", sql, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
 		{"cpu_operator_cost", sql, func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
-		{"work_mem", sql, func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+		{"work_mem", wideSQL, func(p *PlannerSettings) { p.WorkMem = 64 << 10 }},
 		// The settings thread recursively: a derived table inside a derived
 		// table prices under the same statement settings.
 		{"cpu_tuple_cost/nested", nestedSQL, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			base, ok := topPlanCost(psPlan(t, cat, tc.sql, DefaultPlannerSettings()))
+			if !ok {
+				t.Fatalf("%s: baseline plan carries no cost", tc.name)
+			}
 			ps := DefaultPlannerSettings()
 			tc.apply(&ps)
 			got, ok := topPlanCost(psPlan(t, cat, tc.sql, ps))
@@ -199,7 +210,9 @@ func TestDerivedTablePropagationKeepsDefaultPlan(t *testing.T) {
 //
 // The arms are EXACTLY the P2-02d settings family this fixture can observe:
 // seq_page_cost, cpu_tuple_cost, cpu_operator_cost (each ×1000) and work_mem
-// (16kB, whose hash budget spills at this fixture's build size — the same
+// (64kB, PG's minimum, on the unfiltered build where the test says so: PG's
+// packed HashJoinTuple geometry, promoted by M0147-0021, does not spill the
+// 100-row filtered build at any legal budget — the same
 // repricing the bench shows live as `SET work_mem='64kB'` 14835→23478).
 // Deliberately NOT covered here, same honesty rule as
 // TestCostGUCsReachTheCostingOnAHashJoin and TestPlannerSettingsReachDerivedTableJoin:
@@ -218,6 +231,11 @@ func TestPlannerSettingsReachSetOpOperands(t *testing.T) {
 	// The parenthesised compound plans through the SetOpOperand grouping
 	// site (planSelectWithSettings' `s.SetOpOperand != nil` branch).
 	const groupedSQL = "(SELECT pa.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3 UNION SELECT pb.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v = 3)"
+	// work_mem needs operand builds that PG's packed HashJoinTuple geometry
+	// (promoted by M0147-0021) spills at a legal budget: `pa.v <> 3` keeps
+	// ~9900 rows, while `pa.v = 3`'s 100 rows fit any budget PG accepts.
+	const wideSQL = "SELECT pa.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v <> 3 UNION SELECT pb.v AS a FROM pa, pb WHERE pa.id = pb.id AND pa.v <> 3"
+	const wideGroupedSQL = "(" + wideSQL + ")"
 
 	base, ok := topPlanCost(psPlan(t, cat, sql, DefaultPlannerSettings()))
 	if !ok {
@@ -226,6 +244,14 @@ func TestPlannerSettingsReachSetOpOperands(t *testing.T) {
 	groupedBase, ok := topPlanCost(psPlan(t, cat, groupedSQL, DefaultPlannerSettings()))
 	if !ok {
 		t.Fatal("baseline parenthesised set-op plan carries no cost; the operand join did not reach the path search")
+	}
+	wideBase, ok := topPlanCost(psPlan(t, cat, wideSQL, DefaultPlannerSettings()))
+	if !ok {
+		t.Fatal("baseline wide set-op plan carries no cost")
+	}
+	wideGroupedBase, ok := topPlanCost(psPlan(t, cat, wideGroupedSQL, DefaultPlannerSettings()))
+	if !ok {
+		t.Fatal("baseline wide parenthesised set-op plan carries no cost")
 	}
 
 	for _, tc := range []struct {
@@ -237,14 +263,14 @@ func TestPlannerSettingsReachSetOpOperands(t *testing.T) {
 		{"seq_page_cost", sql, base, func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
 		{"cpu_tuple_cost", sql, base, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
 		{"cpu_operator_cost", sql, base, func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
-		{"work_mem", sql, base, func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+		{"work_mem", wideSQL, wideBase, func(p *PlannerSettings) { p.WorkMem = 64 << 10 }},
 		// The threading is per-operand, not just the leftmost branch: the
 		// right operand (planSegment site) reprices too.
 		{"cpu_tuple_cost/right_operand", sql, base, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
 		// The parenthesised grouping site threads the same value.
 		{"cpu_tuple_cost/grouped", groupedSQL, groupedBase, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
 		{"seq_page_cost/grouped", groupedSQL, groupedBase, func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
-		{"work_mem/grouped", groupedSQL, groupedBase, func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+		{"work_mem/grouped", wideGroupedSQL, wideGroupedBase, func(p *PlannerSettings) { p.WorkMem = 64 << 10 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ps := DefaultPlannerSettings()
@@ -396,7 +422,9 @@ func findSetOp(n Node) (*SetOp, bool) {
 //
 // The arms are EXACTLY the P2-02d settings family this fixture can observe:
 // seq_page_cost, cpu_tuple_cost, cpu_operator_cost (each ×1000) and work_mem
-// (16kB, whose hash budget spills at this fixture's build size — the same
+// (64kB, PG's minimum, on the unfiltered build where the test says so: PG's
+// packed HashJoinTuple geometry, promoted by M0147-0021, does not spill the
+// 100-row filtered build at any legal budget — the same
 // repricing the bench shows live as `SET work_mem='64kB'` 14835→23478).
 // Deliberately NOT covered here, same honesty rule as
 // TestCostGUCsReachTheCostingOnAHashJoin,
@@ -423,13 +451,27 @@ func TestPlannerSettingsReachScalarSubqueryJoin(t *testing.T) {
 	// one. All five sublinks are non-correlated, so the inner SELECT
 	// reaches the path search (a correlated/lateral inner would bypass it
 	// with no costed node, like B-12d's lateral variant).
-	const joinBody = "pa, pb WHERE pa.id = pb.id AND pa.v = 3"
-	shapes := []struct{ name, sql string }{
-		{"scalar", "SELECT (SELECT pa.v FROM " + joinBody + ") FROM pa"},
-		{"array", "SELECT ARRAY(SELECT pa.v FROM " + joinBody + ") FROM pa"},
-		{"in", "SELECT pa.v FROM pa WHERE pa.v IN (SELECT pb.v FROM " + joinBody + ")"},
-		{"exists", "SELECT pa.v FROM pa WHERE EXISTS (SELECT pa.v FROM " + joinBody + ")"},
-		{"multiassign", "UPDATE tgt SET (a, b) = (SELECT pa.v, pb.v FROM " + joinBody + ")"},
+	// work_mem's arm uses the unfiltered join body: PG's packed HashJoinTuple
+	// geometry (promoted by M0147-0021) spills its 10000-row build at 64kB,
+	// while the filtered body's 100 rows fit any budget PG accepts.
+	shapesFor := func(joinBody string) []struct{ name, sql string } {
+		return []struct{ name, sql string }{
+			{"scalar", "SELECT (SELECT pa.v FROM " + joinBody + ") FROM pa"},
+			{"array", "SELECT ARRAY(SELECT pa.v FROM " + joinBody + ") FROM pa"},
+			{"in", "SELECT pa.v FROM pa WHERE pa.v IN (SELECT pb.v FROM " + joinBody + ")"},
+			{"exists", "SELECT pa.v FROM pa WHERE EXISTS (SELECT pa.v FROM " + joinBody + ")"},
+			{"multiassign", "UPDATE tgt SET (a, b) = (SELECT pa.v, pb.v FROM " + joinBody + ")"},
+		}
+	}
+	shapes := shapesFor("pa, pb WHERE pa.id = pb.id AND pa.v = 3")
+	// The wide IN shape is pulled up into a semi-join (no costed inner plan
+	// is left to reprice), so work_mem covers the other four shapes; IN's
+	// settings propagation is pinned by the three cost arms.
+	var wideShapes []struct{ name, sql string }
+	for _, sh := range shapesFor("pa, pb WHERE pa.id = pb.id AND pa.v <> 3") {
+		if sh.name != "in" {
+			wideShapes = append(wideShapes, sh)
+		}
 	}
 	// The settings thread recursively: a scalar sublink inside a scalar
 	// sublink's plan prices under the same statement settings.
@@ -445,24 +487,29 @@ func TestPlannerSettingsReachScalarSubqueryJoin(t *testing.T) {
 	}
 
 	arms := []struct {
-		name  string
-		apply func(*PlannerSettings)
+		name   string
+		shapes []struct{ name, sql string }
+		apply  func(*PlannerSettings)
 	}{
-		{"seq_page_cost", func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
-		{"cpu_tuple_cost", func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
-		{"cpu_operator_cost", func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
-		{"work_mem", func(p *PlannerSettings) { p.WorkMem = 16 << 10 }},
+		{"seq_page_cost", shapes, func(p *PlannerSettings) { p.SeqPageCost *= 1000 }},
+		{"cpu_tuple_cost", shapes, func(p *PlannerSettings) { p.CPUTupleCost *= 1000 }},
+		{"cpu_operator_cost", shapes, func(p *PlannerSettings) { p.CPUOperatorCost *= 1000 }},
+		{"work_mem", wideShapes, func(p *PlannerSettings) { p.WorkMem = 64 << 10 }},
 	}
-	for _, sh := range shapes {
-		for _, arm := range arms {
+	for _, arm := range arms {
+		for _, sh := range arm.shapes {
 			t.Run(sh.name+"/"+arm.name, func(t *testing.T) {
+				baseCosts := costedScalarInners(t, cat, sh.sql, DefaultPlannerSettings())
+				if len(baseCosts) != 1 {
+					t.Fatalf("%s: baseline has %d costed inner plans, want 1 — the fixture is wrong", sh.name, len(baseCosts))
+				}
 				ps := DefaultPlannerSettings()
 				arm.apply(&ps)
 				costs := costedScalarInners(t, cat, sh.sql, ps)
 				if len(costs) != 1 {
 					t.Fatalf("%s: hot plan has %d costed inner plans, want 1", sh.name, len(costs))
 				}
-				if costs[0] == base[sh.name] {
+				if costs[0] == baseCosts[0] {
 					t.Errorf("%s/%s: inner join still costed at (%.4f..%.4f) — "+
 						"the settings did not reach the subquery's join search",
 						sh.name, arm.name, costs[0].StartupCost, costs[0].TotalCost)

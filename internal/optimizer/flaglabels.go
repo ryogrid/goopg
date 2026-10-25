@@ -122,12 +122,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
-	// R108's experiment is intentionally default-off. Its plan-changing arm
-	// must nevertheless be stamped so every A/B artefact names the geometry
-	// currency it used.
-	"GOOPG_PG_HASH_TUPLE_SPILL_COST": func(v string) string {
-		return onOff(pgHashTupleSpillCostFromEnv(v))
-	},
 	// R113's Sort planner byte price (PG cost_sort's relation-bytes input).
 	// It shipped as a default-off experiment and is default ON today;
 	// artefacts must name its currency for a reproducible A/B.
@@ -222,6 +216,7 @@ var flagProvenanceOrder = []string{
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
 	// Retired at M0147-0020 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PARTIAL_SORT_PATHS",
+	// Retired at M0147-0021 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
 	// Joined at M0139-0007b: gives cost_memoize_rescan's cache-entry byte
@@ -354,6 +349,11 @@ var flagProvenanceRetired = map[string]string{
 	// `off` in an older artefact is the type-switch arm; this binary always
 	// runs the tournament.
 	"GOOPG_PARTIAL_SORT_PATHS": "M0147-0020",
+	// R108's PG hash-join spill price (packed HashJoinTuple batch geometry +
+	// page_size batch I/O), default off since then. M0147-0021 promoted it —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is the executor-map pricing arm.
+	"GOOPG_PG_HASH_TUPLE_SPILL_COST": "M0147-0021",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

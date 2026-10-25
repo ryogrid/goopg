@@ -985,10 +985,12 @@ func hashJoinInitialCost(cp costParams, in hashJoinInputs) Cost {
 // single-batch build, else the inner written once at startup and both sides'
 // pages over the run.
 func hashJoinBatchCost(cp costParams, in hashJoinInputs) (startup, run float64) {
-	// R108 is deliberately opt-in. PG decides hash-table batches using packed
-	// HashJoinTuple geometry, then prices its batch I/O through the distinct
-	// heap-tuple page_size formula. It must not become an executor claim: map
-	// capacity and actual spills remain hashsize.Choose below.
+	// R108 (promoted by M0147-0021). PG decides hash-table batches using packed
+	// HashJoinTuple geometry (ExecChooseHashTableSize), then prices its batch
+	// I/O through the distinct heap-tuple page_size formula
+	// (initial_cost_hashjoin). It must not become an executor claim: map
+	// capacity and actual spills remain hashsize.Choose, which also prices the
+	// batches when a PG width is unknown.
 	if geometry := pgHashTupleSpillGeometryFor(in, cp); geometry.usePG {
 		if geometry.hash.numBatches > 1 {
 			startup = cp.seqPageCost * geometry.innerPages

@@ -4973,6 +4973,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `9c3e12d47`** \(M0147\-0017 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `a4c64c462`** \(M0147\-0020 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7536,9 +7539,24 @@ Basis: the 2026-10-21 lever census and its review
   - First: trace whether the post-pass is still reached now that Gather comes from the search (C6 trace over the
     full corpus). Unreachable: delete both arms. Reached: flip ON, run the gates, then delete the OFF arm. Never
     delete the ON arm without an owner `[!]` (R3). Runtime is not a rejection reason (S9(5)(a)).
-- [ ] **M0147-0021 — promote `GOOPG_PG_HASH_TUPLE_SPILL_COST` (costsize.c initial_cost_hashjoin / nodeHash.c ExecChooseHashTableSize)**
+- [x] **M0147-0021 — promote `GOOPG_PG_HASH_TUPLE_SPILL_COST` (costsize.c initial_cost_hashjoin / nodeHash.c ExecChooseHashTableSize)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 22→21 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. C3 first: ON captures on both TPC\-DS corpora
+    byte\-identical to the OFF census \(0 diff lines incl\. costs; 99/99 both\) although the arm engaged \(`DPPGHASH
+    currency=pg` on \~164k offered hash joins, batches up to 131072\) — no plan moved, so executor memory cannot move;
+    acceptance arm \(TPC\-H SF1 executed, 24 MATCH\) and SF1 fire\-set \(fires=none\) PASS on the promoted tree\.
+  - Deleted the switch/env/resolver/enabled/test setter; `pgHashGeometry`/`pgHashSpillPages` kept; invalid PG width
+    still falls back to map pricing\. No DPPGHASH reader outside the package \(estimate\-audit does not parse it\)\.
+  - Tests: trace \+ cost tests rebased \(map reference = unknown\-width fallback\); three settings\-propagation tests'
+    `work\_mem` arms rebased from 16kB on the 100\-row build \(spilled only goopg's map geometry; PG's packed geometry
+    never batches it at a legal budget\) to 64kB on \~10000\-row builds with per\-arm baselines; wide IN shape pulls up
+    to a semi\-join, so work\_mem covers the other four sublink shapes\.
+  - Design doc `docs/design/0100\-0149/m0147\-0021\-promote\-pg\-hash\-tuple\-spill\-cost\.md`; m0139\-0007a doc status line;
+    ledger row \(resolves 2188's hash half; residual: executor still sizes with map geometry\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - **C3 first**: ledger row 2188 warns the planner may charge less memory than the executor allocates — the
     acceptance arm and the SF1 fire set must pass with the arm ON; a memory regression is NOT waived by
     S9(5)(a). Keep `pgHashGeometry`/`pgHashSpillPages`. Retiring the lever changes `tracePGHashTupleGeometry`'s
