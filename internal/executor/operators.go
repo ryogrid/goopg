@@ -2,16 +2,13 @@ package executor
 
 import (
 	"container/heap"
-	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
-	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
-	"github.com/goopg/goopg/internal/utils/adt/array"
 )
 
 // valuesOp emits a fixed sequence of rows produced from literal
@@ -1008,31 +1005,9 @@ func (o *limitOp) tiesRowMatches(row Row) bool {
 }
 
 // sortOp buffers the child's output then sorts under the supplied
-// key list. Stable sort matches upstream's behaviour.
-//
-// sortPackedOn is D-06/MD-05's measurement switch. Default OFF;
-// GOOPG_SORT_PACKED=on at server start (or SetSortPackedEnabled from
-// tests) retains sort rows as PackedTuples instead of []Row. Read once
-// per sortOp.Open into o.packUse, so both arms are the same binary and
-// a negative measurement is a one-commit revert (D-04 stopping rule).
-var sortPackedOn atomic.Bool
-
-func init() {
-	sortPackedOn.Store(os.Getenv("GOOPG_SORT_PACKED") == "on")
-}
-
-// SetSortPackedEnabled toggles the packed sort retention. Test-only API;
-// the operational switch is the environment variable read at init.
-func SetSortPackedEnabled(on bool) { sortPackedOn.Store(on) }
-
-func sortPackedEnabled() bool { return sortPackedOn.Load() }
-
-// errSortKeyvalsMismatch latches the packed arm's structural invariant:
-// packed and keyvals are appended/truncated/permuted together, so a
-// length mismatch is an internal bug, never a second comparator —
-// degrading to lessRows there would be the exact wrong-answer class
-// operators.go:1010-1015 warns about (D-06 DESIGN §2.1(b)).
-var errSortKeyvalsMismatch = fmt.Errorf("sort: packed/keyvals length mismatch")
+// key list. Stable sort matches upstream's behaviour. (The D-06 packed
+// retention arm, GOOPG_SORT_PACKED, was retired by M0147-0011: AGENT.md
+// R6/B1 — no packed retention.)
 
 // M0068-0006: when the in-memory chunk exceeds sortChunkBytes the
 // chunk is sorted, written to a spill file, and freed. After the
@@ -1063,6 +1038,20 @@ type sortOp struct {
 	// liveSlot is the scratch slot the keys of a live-ingested row are
 	// evaluated on.
 	liveSlot MaterializedSlot
+	// compactOut is set by the Gather Merge that is this sort's only reader
+	// (newGatherMergeNodeFor), which copies every row it pulls. A live sort
+	// then stores compact rows — the live cells alone, in liveIdx order — as
+	// PG's tuplesort stores a MinimalTuple of the sort's narrow targetlist,
+	// and Next expands each into one reused full-width row (outRow). Before
+	// the first spill the stored rows are expanded back (compact is cleared),
+	// so the spill and merge paths only ever see full-width rows.
+	// M0122-0012 slice 83.
+	compactOut bool
+	compact    bool
+	liveIdx    []int
+	width      int // the input rows' width, from the first compact row
+	outRow     Row
+	rowChunk   rowChunk
 
 	// chunk size threshold for triggering a spill. Default 256 MiB.
 	chunkLimitBytes int64
@@ -1070,20 +1059,6 @@ type sortOp struct {
 	// In-memory chunk / tail.
 	rows []Row
 	idx  int
-	// D-06/MD-05: under packUse the chunk / tail is packed instead of
-	// rows. packed[i] is the PG MinimalTuple encoding of whatever row
-	// the sort was handed (width-agnostic: correct on both sides of the
-	// B-01c narrowing boundary by construction). keyvals/ctids keep
-	// their roles and move under the same permutation. outSlot serves
-	// the in-memory Next path (the lazy deform is the point);
-	// packScratch deforms at the flush boundary; mergeSlots are the
-	// §2.1(a) double buffer for the packed tail source.
-	packUse     bool
-	packed      []PackedTuple
-	desc        *TupleDesc
-	outSlot     *PackedSlot
-	packScratch *PackedSlot
-	mergeSlots  [2]*PackedSlot
 	// keyvals[i] holds the ORDER BY key values of rows[i], evaluated once when
 	// the row is pulled instead of re-derived inside every comparison
 	// (M0134-0191). goopg's per-key cost is an interpreted evalExpr dispatch,
@@ -1226,22 +1201,11 @@ func (o *sortOp) Open(ctx *Context) error {
 	// Rescan contract (see peakBytes' doc comment): a stale max from a
 	// previous Open must not survive into this one.
 	o.peakBytes = 0
-	// D-06: the retention representation is chosen once per Open.
-	o.packUse = sortPackedEnabled()
 	o.trackCTIDs = o.wantCTIDs || sortKeysUseCTID(o.keys)
 	// A `ctid` key reads the child's carried tid, so the child spine must
 	// keep it (a Gather below ships it only when marked) — M0146-0052.
 	if sortKeysUseCTID(o.keys) {
 		markSortWantCTIDs(o.child)
-	}
-	if o.packUse {
-		o.desc = NewTupleDesc(o.Schema())
-		o.outSlot = NewPackedSlotForSchema(o.Schema(), o.desc, nil, array.DefaultOutputStyle())
-		o.packScratch = NewPackedSlot(o.desc, nil, array.DefaultOutputStyle())
-		o.mergeSlots = [2]*PackedSlot{
-			NewPackedSlot(o.desc, nil, array.DefaultOutputStyle()),
-			NewPackedSlot(o.desc, nil, array.DefaultOutputStyle()),
-		}
 	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
@@ -1249,6 +1213,16 @@ func (o *sortOp) Open(ctx *Context) error {
 	limit := o.chunkLimit()
 	var chunkBytes int64
 	pulled := 0
+	o.compact = o.compactOut && o.live != nil && !o.trackCTIDs
+	o.width = 0
+	if o.compact {
+		o.liveIdx = o.liveIdx[:0]
+		for i, l := range o.live {
+			if l {
+				o.liveIdx = append(o.liveIdx, i)
+			}
+		}
+	}
 	for {
 		// M0062-followup: a sort over millions of rows can otherwise
 		// drain the child without a cancel opportunity. ctx check
@@ -1269,8 +1243,46 @@ func (o *sortOp) Open(ctx *Context) error {
 		// across many Next() calls, so the slot's lifetime
 		// contract requires us to take ownership of an
 		// independent row. (M0071-0010 Stage B.)
+		if o.compact {
+			// The row keeps its live cells only, detached from any producer
+			// arena. The keys are evaluated on those detached cells, laid out
+			// at their columns in the reused full-width scratch row — never
+			// on the incoming slot: a key computed from an arena-backed cell
+			// (substr(c_phone, 1, 2) over a scan's page arena) can alias the
+			// arena without being marked arena-backed, and the arena is reused
+			// by the next page (TPC-H Q22 sorted every row on "  ").
+			if pulled == 0 || o.width == 0 {
+				o.width = slot.Width()
+			}
+			row := o.rowChunk.take(len(o.liveIdx))
+			for j, c := range o.liveIdx {
+				row[j] = slot.Get(c).MaterializeArena()
+			}
+			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), o.expandInto(row)
+			kv, kerr := o.sortKeyValsView(&o.liveSlot)
+			if kerr != nil {
+				return kerr
+			}
+			o.rows = append(o.rows, row)
+			o.keyvals = append(o.keyvals, kv)
+			chunkBytes += estimatedRowBytes(row)
+			pulled++
+			if chunkBytes > o.peakBytes {
+				o.peakBytes = chunkBytes
+			}
+			if chunkBytes >= limit {
+				o.expandCompactRows()
+				if err := o.flushChunk(); err != nil {
+					return err
+				}
+				o.rows = o.rows[:0]
+				o.keyvals = o.keyvals[:0]
+				chunkBytes = 0
+			}
+			continue
+		}
 		var ms *MaterializedSlot
-		if o.live != nil && !o.packUse && !o.trackCTIDs {
+		if o.live != nil && !o.trackCTIDs {
 			o.liveSlot.schema, o.liveSlot.row = slot.Schema(), materializeLiveRow(slot, o.live)
 			ms = &o.liveSlot
 		} else {
@@ -1284,20 +1296,7 @@ func (o *sortOp) Open(ctx *Context) error {
 		if kerr != nil {
 			return kerr
 		}
-		// D-06: keys are evaluated from the row BEFORE packing, exactly
-		// as above, so key evaluation is bit-identical and the comparator
-		// cannot drift. A row the encoder cannot represent fails the
-		// query LOUDLY rather than falling back per row — a per-row
-		// fallback would put two formats in one sort (DESIGN §4).
-		if o.packUse {
-			pt, perr := FormPackedTuple(o.desc, row, o.ctx)
-			if perr != nil {
-				return perr
-			}
-			o.packed = append(o.packed, pt)
-		} else {
-			o.rows = append(o.rows, row)
-		}
+		o.rows = append(o.rows, row)
 		o.keyvals = append(o.keyvals, kv)
 		// EX3-05 Cut A: maintain the TID side-channel only when it is
 		// needed (trackCTIDs). Otherwise skip the per-row append entirely.
@@ -1318,9 +1317,6 @@ func (o *sortOp) Open(ctx *Context) error {
 			}
 			o.rows = o.rows[:0]
 			o.keyvals = o.keyvals[:0]
-			// D-06: packed and keyvals truncate in the same statement —
-			// a packed tail that outlived a flush would offset every key.
-			o.packed = o.packed[:0]
 			// The flushed chunk's tids went to its spill file with the rows.
 			o.ctids = o.ctids[:0]
 			chunkBytes = 0
@@ -1460,10 +1456,6 @@ func (o *sortOp) lessKeyVals(a, b []Datum) bool {
 // before M0134-0191 there was nothing to keep in step and it sorted rows
 // directly.
 func (o *sortOp) sortChunk(rows []Row) {
-	if o.packUse {
-		o.sortPackedChunk()
-		return
-	}
 	if len(o.keyvals) != len(rows) {
 		// Defensive: nothing should reach here with the two out of step, and
 		// comparing on stale keys would be a silent wrong answer.
@@ -1482,53 +1474,6 @@ func (o *sortOp) sortChunk(rows []Row) {
 		ctids = o.ctids
 	}
 	applySortPerm(perm, rows, o.keyvals, ctids)
-}
-
-// sortPackedChunk is sortChunk over the packed retention: the permutation
-// is computed from keyvals exactly as above and applied to packed (plus
-// ctids when the TID side-channel is live). The lessRows fallback is NOT
-// ported — under the switch a length mismatch latches errSortKeyvalsMismatch
-// instead of silently sorting by a second comparator (DESIGN §2.1(b)).
-func (o *sortOp) sortPackedChunk() {
-	if len(o.keyvals) != len(o.packed) {
-		if o.sortErr == nil {
-			o.sortErr = errSortKeyvalsMismatch
-		}
-		return
-	}
-	perm := make([]int, len(o.packed))
-	for i := range perm {
-		perm[i] = i
-	}
-	sort.SliceStable(perm, func(i, j int) bool {
-		return o.lessKeyVals(o.keyvals[perm[i]], o.keyvals[perm[j]])
-	})
-	applySortPermPacked(perm, o.packed, o.keyvals, o.ctids)
-}
-
-// applySortPermPacked is applySortPerm over the packed retention: packed,
-// keyvals and ctids move under the SAME permutation, which is what keeps a
-// tuple with its own keys and its own TID.
-func applySortPermPacked(perm []int, packed []PackedTuple, keyvals [][]Datum, ctids []sortCTID) {
-	newP := make([]PackedTuple, len(perm))
-	for i, p := range perm {
-		newP[i] = packed[p]
-	}
-	copy(packed, newP)
-	if keyvals != nil {
-		newKV := make([][]Datum, len(perm))
-		for i, p := range perm {
-			newKV[i] = keyvals[p]
-		}
-		copy(keyvals, newKV)
-	}
-	if ctids != nil {
-		newC := make([]sortCTID, len(perm))
-		for i, p := range perm {
-			newC[i] = ctids[p]
-		}
-		copy(ctids, newC)
-	}
 }
 
 // applySortPerm rewrites rows / keyvals / ctids in place under perm. Every
@@ -1556,14 +1501,10 @@ func applySortPerm(perm []int, rows []Row, keyvals [][]Datum, ctids []sortCTID) 
 	}
 }
 
-// sortTailWithCTIDs sorts the final in-memory tail. sortChunk and
-// sortPackedChunk reorder o.ctids in lockstep with the rows whenever the
-// side-channel is tracked, so each emitted row keeps its own ctid.
+// sortTailWithCTIDs sorts the final in-memory tail. sortChunk reorders
+// o.ctids in lockstep with the rows whenever the side-channel is tracked,
+// so each emitted row keeps its own ctid.
 func (o *sortOp) sortTailWithCTIDs() {
-	if o.packUse {
-		o.sortPackedChunk()
-		return
-	}
 	o.sortChunk(o.rows)
 }
 
@@ -1808,10 +1749,40 @@ func (o *sortOp) lessRows(a, b Row) bool {
 
 // flushChunk sorts the current in-memory chunk and writes it to a
 // new spill file. The caller must reset o.rows after the call.
-func (o *sortOp) flushChunk() error {
-	if o.packUse {
-		return o.flushPackedChunk()
+// expandInto writes a compact row's cells into the reused full-width output
+// row and returns it: the live cells at their columns, every other cell NULL —
+// or the deform poison when armed, as materializeLiveRow leaves it.
+func (o *sortOp) expandInto(compact Row) Row {
+	w := o.width
+	if len(o.outRow) != w {
+		o.outRow = make(Row, w)
+		if seqScanDeformPoison {
+			dead := deformPoisonDatum()
+			for i := range o.outRow {
+				o.outRow[i] = dead
+			}
+		}
 	}
+	for j, c := range o.liveIdx {
+		o.outRow[c] = compact[j]
+	}
+	return o.outRow
+}
+
+// expandCompactRows turns the stored compact rows back into full-width ones
+// and leaves compact mode for the rest of this Open: a spilled chunk and the
+// merge that reads it back key on full-width rows.
+func (o *sortOp) expandCompactRows() {
+	if !o.compact {
+		return
+	}
+	for i, r := range o.rows {
+		o.rows[i] = append(Row(nil), o.expandInto(r)...)
+	}
+	o.compact = false
+}
+
+func (o *sortOp) flushChunk() error {
 	o.sortChunk(o.rows)
 	if o.sortErr != nil {
 		return o.sortErr
@@ -1843,47 +1814,6 @@ func (o *sortOp) flushChunk() error {
 	return nil
 }
 
-// flushPackedChunk is flushChunk over the packed retention (D-06 DESIGN
-// §2.1(c)): sort the packed chunk, then deform each tuple back to a Row
-// at the flush boundary and write today's on-disk format unchanged.
-// One deform per spilled row, once, on a path already doing file I/O;
-// the read-back side is untouched and still yields owned Rows.
-func (o *sortOp) flushPackedChunk() error {
-	o.sortPackedChunk()
-	if o.sortErr != nil {
-		return o.sortErr
-	}
-	w, err := newSpillWriter(o.ctx)
-	if err != nil {
-		return err
-	}
-	var rec Row
-	for i, pt := range o.packed {
-		o.packScratch.Load(pt)
-		if serr := o.packScratch.Err(); serr != nil {
-			w.Close()
-			o.ctx.removeSpillFile(w.Path())
-			return serr
-		}
-		r := o.packScratch.Row()
-		if o.trackCTIDs {
-			rec = append(append(rec[:0], r...), sortCTIDDatum(o.ctids[i]))
-			r = rec
-		}
-		if werr := w.WriteRow(r); werr != nil {
-			w.Close()
-			o.ctx.removeSpillFile(w.Path())
-			return werr
-		}
-	}
-	if err := w.Close(); err != nil {
-		o.ctx.removeSpillFile(w.Path())
-		return err
-	}
-	o.spillFiles = append(o.spillFiles, w.Path())
-	return nil
-}
-
 func (o *sortOp) Schema() optimizer.Schema { return o.child.Schema() }
 func (o *sortOp) Close() error {
 	// Captured before o.ctx is cleared: the spill-file unlink below has to
@@ -1891,15 +1821,6 @@ func (o *sortOp) Close() error {
 	ctx := o.ctx
 	o.rows = nil
 	o.ctids = nil
-	// D-06: drop the packed retention and its slots. The slots carry no
-	// arena (nil parent), so there is nothing to release; dropping the
-	// references lets the GC reclaim the tuples. Fresh slots are built
-	// in Open, so a rescan never inherits a loaded tuple.
-	o.packed = nil
-	o.desc = nil
-	o.outSlot = nil
-	o.packScratch = nil
-	o.mergeSlots = [2]*PackedSlot{nil, nil}
 	// E-01 (§5): Close must leave no per-Open state. keyvals outliving
 	// rows silently mis-keys a second Open's tail merge (positional
 	// lookup) and trips the sortChunk lessRows fallback; a surviving
@@ -1937,28 +1858,13 @@ func (o *sortOp) Close() error {
 func (o *sortOp) Next() (TupleSlot, error) {
 	if len(o.spillFiles) == 0 {
 		// Fully in-memory path.
-		// D-06: the lazy deform is the point — a consumer reading 2 of
-		// 12 columns deforms a prefix, not the row. The returned slot is
-		// scratch (valid until the next Next, per the TupleSlot
-		// contract); retention past it must go through Materialize.
-		if o.packUse {
-			if o.idx >= len(o.packed) {
-				return nil, EOF
-			}
-			pt := o.packed[o.idx]
-			if o.wantCTIDs && o.idx < len(o.ctids) && o.ctids[o.idx].has {
-				c := o.ctids[o.idx]
-				o.outSlot.LoadWithTID(pt, c.block, c.off)
-			} else {
-				o.outSlot.Load(pt)
-			}
-			o.idx++
-			return o.outSlot, nil
-		}
 		if o.idx >= len(o.rows) {
 			return nil, EOF
 		}
 		row := o.rows[o.idx]
+		if o.compact {
+			row = o.expandInto(row)
+		}
 		slot := SlotFromRow(o.Schema(), row)
 		// Re-attach the per-row TID side-channel so a parent LockRows can stamp
 		// row locks (ORDER BY ... FOR UPDATE). M0118-0003. Maintained only
@@ -2021,19 +1927,6 @@ func (o *sortOp) initMerge() error {
 			heap.Push(o.heap, s)
 		}
 	}
-	// D-06: the packed tail rides the merge with its own keys handed
-	// over, and deforms through the §2.1(a) double buffer — two
-	// alternating scratch slots, exactly sufficient because at most one
-	// row per source is outstanding at any instant.
-	if len(o.packed) > 0 {
-		s := &sortSource{packed: o.packed, keyvals: o.keyvals, ctids: tailCTIDs, keysOf: o.sortKeyValsTID, pslots: o.mergeSlots, desc: o.desc}
-		if err := s.advance(); err != nil {
-			return err
-		}
-		if !s.eof {
-			heap.Push(o.heap, s)
-		}
-	}
 	o.mergeReady = true
 	return nil
 }
@@ -2085,16 +1978,6 @@ type sortSource struct {
 	curTID sortCTID
 	tidCol bool
 	ctids  []sortCTID
-
-	// D-06: the packed-tail variant. packed is the tail's tuples;
-	// pslots are the two alternating deform scratches (DESIGN §2.1(a));
-	// desc is kept for future width assertions. pidx is the next tuple
-	// to take; pcur selects the scratch the previous row did NOT use.
-	packed []PackedTuple
-	pslots [2]*PackedSlot
-	desc   *TupleDesc
-	pidx   int
-	pcur   int
 }
 
 func (s *sortSource) advance() error {
@@ -2118,33 +2001,6 @@ func (s *sortSource) advance() error {
 			s.cur = s.cur[:last]
 		}
 		return s.loadKeys(-1)
-	}
-	// D-06: deform the packed tail through alternating scratches, so the
-	// advance that follows a Pop cannot overwrite the row just returned
-	// (DESIGN §2.1(a)). A latched deform error fails the query LOUDLY —
-	// Row() would return nil there, and publishing a nil row as data is
-	// the silent corruption this row exists to avoid.
-	if s.packed != nil {
-		if s.pidx >= len(s.packed) {
-			s.eof = true
-			s.cur = nil
-			s.curKeys = nil
-			return nil
-		}
-		sl := s.pslots[s.pcur]
-		s.pcur ^= 1
-		sl.Load(s.packed[s.pidx])
-		if serr := sl.Err(); serr != nil {
-			return serr
-		}
-		s.cur = sl.Row()
-		i := s.pidx
-		s.pidx++
-		s.curTID = sortCTID{}
-		if i < len(s.ctids) {
-			s.curTID = s.ctids[i]
-		}
-		return s.loadKeys(i)
 	}
 	if s.idx >= len(s.rows) {
 		s.eof = true

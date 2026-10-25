@@ -6,6 +6,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/utils/mmgr"
 )
 
 // M0122-0012 slice 66 guards: a consumer-complete parent's liveness crosses a
@@ -148,5 +149,36 @@ func TestTransferRowForQueueLiveReadsLiveCellsOnly(t *testing.T) {
 		if got[0].Kind != KindNull || got[2].Kind != KindNull {
 			t.Fatalf("%s: row %v, want dead cells NULL", name, got)
 		}
+	}
+}
+
+// TestTransferRowForQueueFullReadsCellsOnce pins M0122-0012 slice 85: a
+// worker whose Gather reads every column ships a join's VirtualSlot read cell
+// by cell into a chunk row — not gathered by Row() and then cloned. The row
+// must hold transferRowForQueue's values and own every cell: it survives its
+// producer arena's reset.
+func TestTransferRowForQueueFullReadsCellsOnce(t *testing.T) {
+	prod := mmgr.Acquire(nil, mmgr.KindStmt)
+	defer prod.Release()
+	left := &MaterializedSlot{row: Row{NewIntDatum(1), cut1ArenaString(t, prod, "arena")}}
+	right := &MaterializedSlot{row: Row{NullDatum, NewStringDatum("owned")}}
+	vs := &VirtualSlot{sources: []TupleSlot{left, right}, cols: []virtualCol{{1, 1}, {0, 1}, {0, 0}, {1, 0}}}
+	want := transferRowForQueue(vs)
+	var c rowChunk
+	got := transferRowForQueueLive(vs, nil, &c)
+	prod.Reset()
+	if err := AssertTransferable(got); err != nil {
+		t.Fatalf("shipped row keeps an arena reference: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("width %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !sameResult(got[i], nil, want[i], nil) {
+			t.Fatalf("cell %d = %q, want %q", i, got[i].Format(), want[i].Format())
+		}
+	}
+	if got[1].StringValue() != "arena" {
+		t.Fatalf("arena cell after the arena's reset = %q", got[1].StringValue())
 	}
 }

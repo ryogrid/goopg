@@ -102,6 +102,19 @@ func transferRowForQueue(slot TupleSlot) Row {
 // copy then read again (M0122-0012 slice 66).
 func transferRowForQueueLive(slot TupleSlot, live []bool, chunk *rowChunk) Row {
 	if live == nil {
+		// Every column crosses: a join's VirtualSlot is read cell by cell
+		// into a chunk row, each cell detached, rather than gathered into a
+		// scratch row by Row() and then cloned again by cloneRowOwned — two
+		// row allocations per shipped row (M0122-0012 slice 85; TPC-DS Q10's
+		// workers shipped 1.92 M join rows that way). The values are
+		// transferRowForQueue's.
+		if vs, ok := slot.(*VirtualSlot); ok {
+			dst := chunk.take(vs.Width())
+			for i := range dst {
+				dst[i] = vs.Get(i).MaterializeArena()
+			}
+			return dst
+		}
 		return transferRowForQueue(slot)
 	}
 	if seqScanDeformPoison {

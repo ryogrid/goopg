@@ -234,6 +234,11 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
+	// probeForm resolves the probe key's columns once and forms fixed-width
+	// probes from a template (M0122-0012 slice 80).
+	probeForm indexProbeForm
+	// curSpare is the cursor the equality / range rescan re-aims.
+	curSpare *nbtree.ScanCursor
 	// rangeLoExcl / rangeHiExcl: the INDEX-ORDER exclusivity of the bounds
 	// lookupRangeBounds returned — the plan's operators, swapped for a DESC
 	// column, and forced exclusive where an open end became a NULL pivot
@@ -459,8 +464,13 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		o.enumTypes = nil
 		o.colInfo = nil
 	}
-	o.tids = nil
-	o.poss = nil
+	// The TID batch keeps its capacity across Open/Close (M0122-0012 slice
+	// 81): a parameterised inner scan under a lateral join is closed and
+	// re-opened per outer row — PG's ExecReScan keeps the scan's state — and
+	// nil slices made every probe regrow both batches from zero (80 % of the
+	// index scan's batch append was growslice on TPC-DS Q14).
+	o.tids = o.tids[:0]
+	o.poss = o.poss[:0]
 	o.killList = nil
 	o.idx = 0
 	o.hasLast = false
@@ -475,7 +485,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{done: true}
+	o.skip.reset(true)
 	o.outerSlot = nil
 	o.outerWidth = 0
 
@@ -552,7 +562,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.saopBounds = nil
 	o.saopIdx = 0
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{}
+	o.skip.reset(false)
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
 
@@ -699,11 +709,16 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.pidx != nil {
 		leafFilter = o.ownsLeaf
 	}
-	cur, err := o.tree.NewScanCursor(loBytes, hiBytes, loExcl, hiExcl, leafFilter)
-	if err != nil {
+	// The cursor is re-aimed, not reallocated, per rescan (M0122-0012 slice
+	// 80): PG's btrescan reuses the scan's one BTScanOpaque, and a
+	// parameterised inner index scan rescans once per outer row.
+	if o.curSpare == nil {
+		o.curSpare = new(nbtree.ScanCursor)
+	}
+	if err := o.tree.ResetScanCursor(o.curSpare, loBytes, hiBytes, loExcl, hiExcl, leafFilter); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	o.cur = cur
+	o.cur = o.curSpare
 	o.scanDone = false
 	if o.hashBucketScan {
 		if len(o.hashProbeFingerprint) > 0 {
@@ -1344,13 +1359,14 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 func (o *indexScanOp) Close() error {
 	o.finalizeIndexScanSSI() // M0142-0005b: record the deferred gap-lock decision
 	o.flushKills()           // C3-S3: mark pending kills before releasing state
-	o.tids = nil
-	o.poss = nil
+	// Capacity kept for a re-Open (see openPrep).
+	o.tids = o.tids[:0]
+	o.poss = o.poss[:0]
 	o.killList = nil
 	o.cur = nil
 	o.saopBounds = nil
 	o.saopSeen = nil
-	o.skip = btreeSkipEnum{done: true}
+	o.skip.reset(true)
 	o.hasLast = false
 	if o.scanRow != nil {
 		// EX1-02b: scrub tail poison so a poisoned buffer never leaks into
@@ -1420,7 +1436,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 			return nil, false, nil
 		}
 		colName := o.plan.Index.Columns[i]
-		col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		col, found := o.probeForm.colAt(o.ctx, o.plan.Table, colName, i)
 		if !found {
 			return nil, false, &ExecError{
 				Code: "XX000", Pos: o.plan.Pos(),
@@ -1429,7 +1445,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 		}
 		parts = append(parts, indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
 	}
-	probe, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	probe, encErr := o.probeForm.form(o.ctx, o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}
@@ -1449,12 +1465,12 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 	// probe encoding matches what backfill stored. The index is
 	// always single-column in v0 (createSingleColumnBTreeIndex
 	// enforces this).
-	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	col, ok := o.probeForm.colAt(o.ctx, o.plan.Table, o.plan.Index.Columns[0], 0)
 	if !ok {
 		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
 	parts := []indexProbeKeyPart{{col: col, val: v, pos: o.plan.Key.Pos()}}
-	key, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
+	key, encErr := o.probeForm.form(o.ctx, o.plan.Index, parts)
 	if encErr != nil {
 		return nil, false, encErr
 	}

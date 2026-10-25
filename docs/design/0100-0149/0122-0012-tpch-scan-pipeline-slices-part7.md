@@ -399,3 +399,278 @@ identical.
 - Columns of a `VirtualSlot` or `PackedSlot` still take the copying path.
 - Q1's remaining time is the SubPlan rescan itself: a CTE scan plus a filter for each of 166 M rows. PG pays the
   same, since it builds no hashed SubPlan for a correlated scalar aggregate.
+
+## Slice 76 — a scan's descent stops above the leaf: one leaf visit per descent
+
+**Census lead, re-read.** The rows census flagged Q72's `Index Scan using inventory_pkey` at 20× PG's rows. That is
+the pre-Filter count of M0122-0017: goopg reports 195 rows per loop, while PG reports 9.88 returned plus 191
+removed by the Filter. Every other node's rows match PG's. The scan is a skip scan: `inventory_pkey` is
+(`inv_date_sk`, `inv_item_sk`, `inv_warehouse_sk`), probed on `inv_item_sk` alone. Counters in a scratch build
+showed 862 k cursors for 436 k date groups, about two entries walked per leaf. PG reports 898 676 Index Searches,
+so the descent counts agree and each descent's cost is the gap. In the instruction profile `descendMode` is 42 %
+inclusive and `ScanCursor.Next` 39 %.
+
+**The redundancy.**
+
+- `descendToLowerBound` ran `descendMode` down to the leaf: pin it, check `P_IGNORE`, run the high-key move-right
+  test for the bound, then unpin it.
+- Both of its callers, `rangeScanPosLeaf` and `ScanCursor.Next`, then pinned the same block again and ran the same
+  two steps before reading it.
+- PG reads the leaf once: `_bt_search` moves right on the leaf and returns its buffer, and `_bt_first` /
+  `_bt_readpage` read that buffer.
+
+**Change** (`internal/access/nbtree/btree.go`):
+
+- `descendMode` gains `stopAboveLeaf`. On a level-1 page it returns the downlink it chose without visiting the
+  leaf. A root that is itself a leaf is still visited and returned.
+- `descendToLowerBound` sets the flag, and its callers' own leaf-level steps do the visit.
+- Writers' descents (`descendForInsert`, which must hold the leaf, and which refresh the rightmost-leaf cache) are
+  unchanged.
+- No pinned state is carried between calls: a cursor created now and read later pins its first leaf when it reads
+  it, as it already did.
+
+**Pins.**
+
+- `TestScanDescentStopsAboveLeaf` tries every bound in and around a 3 000-key two-level tree, inclusive and
+  exclusive. For each:
+  - the returned block is a leaf;
+  - it equals the full descent's leaf directly (no move-right in a quiescent tree), and still does after the
+    callers' move-right step;
+  - every 97th bound's cursor delivers exactly the keys past it.
+- `TestScanDescentOnLeafRoot` covers a single-page tree.
+- Returning the level-1 page instead of its child fails the first test.
+- `go test -race ./internal/access/nbtree/` passes.
+
+**Measured** against `88998a861` (instructions:u per query; SF0.25 clone):
+
+| query | HEAD Ginstr | candidate Ginstr |
+|---|---|---|
+| Q72 | 28.53 | 27.39 (−4.0 %); wall 0.69 → 0.59 s |
+| Q17 | 2.837 | 2.802 (−1.2 %) |
+| Q25 | 2.814 | 2.792 (−0.8 %) |
+| Q54 | 5.683 | 5.659 (−0.4 %) |
+
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and
+plan shapes are identical.
+
+**Discovery.** On this binary Q72 runs 0.69 s bare but 3.04 s under `EXPLAIN (ANALYZE, TIMING OFF)`, while PG's
+EXPLAIN ANALYZE of it takes 0.87 s. Filed as M0122-0018. Until it is understood, per-node timings read off EXPLAIN
+ANALYZE on rescan-heavy plans are distorted.
+*Corrected below (M0122-0018 closed): the 3.04 s was a once-per-server stall, not EXPLAIN overhead.*
+
+**Left.** The remaining per-descent cost is constant factors that PG also pays at each level: an internal page's
+binary search (`findChildBlockDirect`), the high-key test, and buffer pins.
+
+## M0122-0018 closed — the "EXPLAIN ANALYZE 4.4× slower" reading was a once-per-server stall
+
+Slice 76 recorded Q72 at 3.04 s under `EXPLAIN (ANALYZE, TIMING OFF)` against 0.69 s bare. Re-measured on one warm
+server at `7050dc003`:
+
+- **No real overhead.** Bare runs take 0.58–0.62 s and EXPLAIN runs 0.60–0.67 s, about +7 %. Instructions:u are
+  27.39 vs 27.64 G per query. The filed figure was the server's first EXPLAIN run.
+- **The stall is not EXPLAIN's.** One run of about 3.4 s occurs once per server lifetime, bare or EXPLAIN alike,
+  when the server's RSS first crosses about 5 GB (4 948 and 5 058 MB in two series).
+- **It is not GC either.** `GODEBUG=gctrace=1` shows the first collection only at 11.4 GB, ten seconds after the
+  stall. The likely cause is the WSL2 VM committing fresh host memory on first touch, an environment stall that
+  benchmark timing should exclude by warming a server past it.
+- **The memory growth is real.** Q72 allocates about 202 MB and 2.4 M objects per run (MemStats TotalAlloc and
+  Mallocs over 5 runs; PG allocates almost nothing per row). Under GOGC=200 over a 2.8 GB live heap, of which the
+  buffer-pool arena is 2 GB, that garbage reaches about 11 GB before the first collection. This is the next lead.
+- **Measurement note.** `/debug/pprof/allocs` diffs between two `?gc=1` fetches showed almost none of those
+  allocations. Read the MemStats lines of `/debug/pprof/heap?debug=1` instead.
+
+## Slice 77 — one cursor per skip scan, re-aimed per descent
+
+**Lead.** Q72 allocated about 193 MB and 2.39 M objects per run on the Go heap. Measured with `tmp/ds-alloc.sh`, a
+MemStats TotalAlloc/Mallocs delta over 5 runs. Attributing the `mallocgc` samples of an instruction profile to
+their first non-runtime caller gave:
+
+- `nbtree.(*BTree).NewScanCursor`: 49 %. Each of the skip scan's 862 k descents allocated a fresh `ScanCursor` of
+  about 112 bytes (a 128-byte size class), about 110 MB per run.
+- `groupBoundsFixed`: 14 %, one probe/pivot buffer per prefix group.
+- `fmt.Errorf` inside `comparePGIndexTupleAttrsAt`: the walk's first descent of each rescan has no lower bound,
+  and every comparison against that empty key built an "operand shorter than an index tuple header" error before
+  falling back to byte order.
+
+**PG.** `btbeginscan` allocates one `BTScanOpaque` per scan, and `_bt_first` re-runs in it for every primitive
+index scan the skip array starts. A scan with no lower bound descends with `_bt_endpoint` to the leftmost leaf,
+comparing nothing.
+
+**Change.**
+
+- **Reusable cursor** (`internal/access/nbtree/btree.go`): `BTree.ResetScanCursor(c, …)` performs
+  `NewScanCursor`'s descent into an existing cursor; `NewScanCursor` is now that call on a new one.
+- **Empty bound** (same file): an empty bound takes `findChildBlockDirect`'s first downlink without the binary
+  search, which picks exactly that item, since every item orders above the empty key. An empty inclusive bound
+  is past no page in `lowerBoundPastPage`. The exclusive empty case keeps the general path: in the blob format
+  an empty high key compares equal.
+- **Skip enumeration** (`internal/executor/btree_skip.go`):
+  - `btreeSkipEnum` keeps two spare cursors, `walkSpare` for `walkLeaf`'s descents and jumps and `enumSpare`
+    for `next`.
+  - `cursorAt` re-aims them.
+  - `reset`, used by `init` and by the index scan's three rescan and close sites, keeps them while clearing
+    everything else. A cursor is re-aimed only after its `Next` has returned.
+
+**Pins.**
+
+- `TestResetScanCursorMatchesNewCursor`: one cursor re-aimed through five bound sets delivers exactly the keys
+  inside each set. Those are computed independently, because `NewScanCursor` is itself `ResetScanCursor` and so
+  is no oracle. The bound sets include inclusive, exclusive and upper bounds, and re-aiming mid-walk.
+- `TestEmptyBoundDescendsLeftmost`: a nil or empty bound lands on the leftmost leaf and reads every key.
+- `TestSkipEnumKeepsSpareCursors`: `reset` keeps the spares and clears everything else.
+- Two mutations fail these tests: dropping the upper bound in the reset, and taking the last downlink for an
+  empty key.
+- `go test -race ./internal/access/nbtree/` passes.
+
+**Measured** against `7050dc003` (SF0.25 clone):
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q72 allocation | 192.9 MB, 2.39 M objects per run | 92.7 MB (−52 %), 1.41 M (−41 %) |
+| Q72 instructions | 27.39 G | 27.09 G (−1.1 %) |
+| Q72 warm wall | 0.57–0.64 s | 0.55–0.56 s |
+| Q17, Q25, Q29, Q54 | — | within ±0.3 % |
+
+Values are identical (sf025 PASS=99, 61 ck; acceptance 24 MATCH; RegressSuite PASS; TestPort\_Isolation PASS), and
+plan shapes are identical.
+
+**Left.**
+
+- `groupBoundsFixed` still allocates one probe/pivot buffer per prefix group, about 28 MB per run. Reusing it
+  requires the cursor to own a copy of its lower bound, because the walk's jump cursors retain `gProbe` / `gPivot`
+  as `lo` across later groups. PG copies scan keys into `so->keyData`.
+- About 1.4 M other allocations per run remain, spread across row materialisation (`VirtualSlot.Row`), the index
+  scan's batch append and datum keys.
+
+## Slice 78 — pathkey usefulness looks each key up once: TPC-DS Q64 planning −65 %
+
+**Target selection.** I timed all 99 SF0.25 queries warm on one server against `:65438` `tpcds025` (PG cassert).
+goopg's total is 70.8 s against PG's 187.1 s. The largest per-query gap is Q64, 1719 ms against 260 ms, and it is
+planning:
+
+- **Planning is the gap.** A plan-only `EXPLAIN` takes 1.6–2.0 s; PG reports a 64 ms Planning Time.
+- **EXPLAIN ANALYZE reports the wrong figure.** goopg's EXPLAIN ANALYZE prints a Planning Time of 0.17 ms for the
+  same query. That is a fidelity defect, filed separately.
+- **Measurement method.** The cross-session plan cache admits a statement on its second sighting, and its key
+  ignores comments. Plan-only runs are therefore measured with `work_mem` varied by 1 kB per run, which is part of
+  the cache fingerprint (`tmp/ds-planinstr.sh`, instructions:u per plan; `tmp/ds-planprof.sh` for the profile).
+
+**Profile.** 70 % of Q64's planning (GEQO) sat under `truncateUselessPathkeys`:
+
+- `leadingMembersOf` called the package `pathKeyEqual` → `exprEqual`, which formats both expressions' identity
+  keys with `fmt` on every pair.
+- Once those calls went through the memo, the remaining time was the memo's interface-keyed map lookups, one per
+  side per pair.
+- The equivalence-class index (`ecByKey` / `ecByPtr`) was rebuilt for every join rel.
+- Every GEQO tour (`freshEvalCtx`) started an empty identity-key memo.
+
+**PG.** Pathkeys are canonical objects, so `pathkeys_useful_for_grouping` / `_for_ordering` / `_for_merging`
+compare pointers (`list_member_ptr`), and all GEQO tours share one PlannerInfo. goopg's pathkeys carry an
+expression and must compare identity keys. The slice makes each key's lookup happen once instead of once per
+pair. Canonical pathkeys themselves remain a design item.
+
+**Change** (`internal/optimizer`):
+
+- **Memoised equality.** `pathkeyUsefulness.pathKeyEqual` compares through the memo (`equalKeyed`) and is
+  nil-safe. `leadingMembersOf`, `countContainedIn` and `pathkeysContainedInRel` use it.
+- **List entries once per rel.** `leadingMembersOf` takes each list entry's identity key and class from
+  `groupMeta` / `distinctMeta`, formed once per rel, and each candidate key's once per key.
+  `usefulForMerging` / `rightMergeDirection` do the same with `mergeMeta` / `queryMeta` (`ensureMergeMeta`).
+- **Shared class index.** `classIndex` is the search's: built once per clause list from `ecMembers`, which are
+  the same for every rel because they are the search's whole equivalence-class membership. It carries a
+  per-expression class memo and is shared by every rel through `searchCtx.ecIdx`.
+- **Shared across GEQO tours.** `freshEvalCtx` shares `exprKeys` and `ecIdx` with every tour, as PG's tours share
+  one PlannerInfo.
+
+**Pins.**
+
+- `TestTruncateUselessPathkeysMatchesOracle`: 9 candidate lists through `truncateUselessPathkeys`, with the shared
+  index and per rel, twice to cover the cached second call. Each result must equal a count computed from the plain
+  definitions (`exprEqual` / `pathKeyEqual` per pair, a class found by scanning `ecMembers`). The oracle's counts
+  span at least three values.
+- `TestGeqoToursShareKeyMemoAndClassIndex`: tours share the memo and the index, and a new clause list gets a new
+  index.
+- Three mutations fail the first test: the wrong list entry's class, the query direction ignored, and a corrupted
+  class memo.
+
+**Measured** (planning instructions:u per plan-only EXPLAIN, against `a5693f85c`):
+
+| query | HEAD | candidate |
+|---|---|---|
+| Q64 | 18.62 G, 2014 ms | 6.48 G (−65 %), ~0.8–1.0 s |
+| Q72 | 1.478 G | 0.823 G (−44 %) |
+| Q25 | 1.482 G | 0.727 G (−51 %) |
+| Q18 | 0.182 G | 0.105 G (−42 %) |
+| Q14 | 77.75 G | 77.74 G (flat) |
+
+Q64's plan text is byte-identical. The fire-set gate reports fires=none (99/99 MATCH, no changed plan), sf025
+PASS=99 (61 ck) with identical plan shapes, acceptance 24 MATCH, RegressSuite PASS and TestPort\_Isolation PASS.
+
+**Left.**
+
+- Q64 still plans in about 0.8 s against PG's 64 ms. The remaining profile is the memo's map lookups, now one per
+  key, in `keyOf` and `equivalentWithin`. Canonical pathkeys (PG `make_canonical_pathkey`) would remove them.
+- Q14 spends about 5 s and 77.7 G instructions planning, which is untouched here and the next lead.
+
+## Slice 79 — a re-expansion Project's live set reads its consumers through any expression
+
+**Target selection.** I ranked the warm SF0.25 gap census (all 99 queries on one server against `:65438`
+`tpcds025`; slice 78) by ratio among single-statement queries whose planning is small. Q43 runs 208 ms against PG's
+75 ms (2.75×).
+
+Two-statement files need care: Q14, Q23, Q24 and Q39 hold two statements, so an `explain` prefix covers only the
+first and the second still runs. The "77.7 G per plan" recorded for Q14 in slice 78 was its second statement's
+execution, not planning.
+
+**Diagnosis.**
+
+- **The sort.** Q43's worker Sort reported 121–131 MB of quicksort memory per participant, against PG's 3.5 MB for
+  the same ~34 k rows.
+- **The profile.** 72 % of Q43's instructions sat under a `projectOp` between the Sort and the hash join: the
+  planner's 80-target re-expansion Project, which never appears in EXPLAIN.
+- **The cause.** A debug build showed that Project with `live == nil`, so all 80 targets were evaluated per row.
+  `projectLiveSet` walked the consumers with the narrowing whitelist `deformScanVisit`, which declines a `CaseExpr`.
+  Q43's aggregates are `sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END)`, so every consumer
+  "could not be enumerated" and every target stayed live.
+- **The same shape elsewhere.** Q59 has seven such arms, and Q2 and Q75 aggregate CASE / COALESCE expressions.
+
+**PG.** A node's targetlist holds only what its parent needs; the dead targets are never built.
+
+**Change** (`internal/executor/scan_deform.go`): `projectLiveSet` asks `consumerLiveColumns` which targets the
+consumers read.
+
+- `consumerLiveColumns` is the walk the Gather, Gather Merge and Sort live sets already use. It goes through any
+  expression kind (`optimizer.WalkExprHostScope`), fail-closed on an unknown kind, and gives up on a whole-row,
+  ctid or tableoid read and on a sublink.
+- A reference past the target list still keeps every target live.
+- A dead target is still evaluated unless `projectTargetSkippable` says it can neither fail nor have an effect.
+
+**Pins** (`TestProjectLiveSetUnderAggregate`, new subtests).
+
+- A CASE argument reading outputs 5 and 2 leaves exactly [2 5] live.
+- A sublink inside the argument keeps every target.
+- A reference past the target list keeps every target.
+- Dropping the out-of-range guard fails the last subtest.
+
+**Measured** against `a53a0c466` (SF0.25 clone):
+
+| query | instructions | warm wall |
+|---|---|---|
+| Q43 | 7.40 → 5.97 G (−19.3 %) | 0.25 → 0.20 s |
+| Q59 | 17.13 → 12.86 G (−24.9 %) | 1.30 → 0.99 s |
+| Q2 | 11.48 → 9.54 G (−16.9 %) | 0.26 → 0.22 s |
+| Q75 | 11.69 → 9.91 G (−15.2 %) | 0.44 → 0.39 s |
+| Q14, Q36, Q53, Q63, Q70, Q89, Q98 | within noise | — |
+
+Values are identical:
+
+- sf025 PASS=99 (61 ck) with identical plan shapes, and PASS again with the deform poison armed;
+- the executor package passes with the poison armed;
+- acceptance 24 MATCH;
+- RegressSuite PASS;
+- TestPort\_Isolation PASS.
+
+**Left.** Q43's Sort still stores full-width rows with the dead cells NULL (the slice-71 ledger row). Its live
+columns are now the four the aggregate reads, but every row is still allocated at the 80-column schema width.
+
+*Continued in [part 8](0122-0012-tpch-scan-pipeline-slices-part8.md) (slice 80 on).*

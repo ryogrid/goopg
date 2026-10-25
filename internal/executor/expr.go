@@ -11485,12 +11485,12 @@ func planIsIndexScanBased(n optimizer.Node) bool {
 	case *optimizer.IndexScan:
 		return true
 	case *optimizer.BitmapHeapScan:
-		// The planner twin (innerPlanIsIndexProbeCheap) admits the keyed
-		// single-producer bitmap for the same reason it admits IndexScan:
-		// bitmapHeapScanOp.Open rebuilds the probe from its Key against the
-		// CURRENT outer binding, so the re-Open-per-key lifecycle is exactly
-		// as safe as the index scan's. Kept in lockstep per that function's
-		// contract. M0134-0185.
+		// The keyed single-producer bitmap is admitted for the same reason
+		// IndexScan is: bitmapHeapScanOp.Open rebuilds the probe from its Key
+		// against the CURRENT outer binding, so the re-Open-per-key lifecycle
+		// is exactly as safe as the index scan's. M0134-0185. (Its planner
+		// twin, innerPlanIsIndexProbeCheap, went with the scalar
+		// decorrelation, M0147-0013.)
 		_, ok := x.Outer.(*optimizer.BitmapIndexScan)
 		return ok
 	case *optimizer.Project:
@@ -11505,8 +11505,7 @@ func planIsIndexScanBased(n optimizer.Node) bool {
 		// the child. Admitting it lets Aggregate{Filter{IndexScan}} shapes
 		// (an index probe with extra local conjuncts, e.g. TPC-H Q20's
 		// date-windowed sum) ride the rescan path instead of rebuilding
-		// per call. Kept in lockstep with the planner's
-		// innerPlanIsIndexProbeCheap (S6 scalar policy).
+		// per call.
 		return planIsIndexScanBased(x.Child)
 	}
 	return false

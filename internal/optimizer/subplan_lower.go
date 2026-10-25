@@ -320,6 +320,69 @@ func excludedRefsWithin(plan Node, pushes int) bool {
 	})
 }
 
+// selfContainedPlan reports, without mutating anything, whether every outer
+// reference in plan resolves within the plan itself, given that `frames`
+// enclosing frames are its own (M0122-0012 slice 91). It is the CTEScan arm's
+// test of a CTE body, which the lowering walk never enters:
+//   - an OuterColumnRef must have Level <= frames;
+//   - a lateral Join drives its right child once per left row and pushes that
+//     row as a frame (joinOp.openLateral), so its right child is walked one
+//     frame deeper, as keptRebase.rebaseNode walks it — a parameterised
+//     nested loop's probe key is such a ref, local to the body;
+//   - a nested sublink's plan is walked one frame deeper (its eval site pushes
+//     or binds that frame), and an IN's operand and list in this frame;
+//   - an ExecParamRef refuses: a slot's binder cannot be told from here;
+//   - every node or expression kind the walk does not model refuses, as in
+//     the lowering walk itself.
+func selfContainedPlan(plan Node, frames int) bool {
+	var fx lowerExprFn
+	fx = func(e Expr) (Expr, bool, bool) {
+		switch x := e.(type) {
+		case *OuterColumnRef:
+			return e, true, x.Level <= frames
+		case *ExecParamRef:
+			return e, true, false
+		case *SubqueryExpr:
+			return e, true, x.Plan == nil || selfContainedPlan(x.Plan, frames+1)
+		case *ExistsExpr:
+			return e, true, x.Plan == nil || selfContainedPlan(x.Plan, frames+1)
+		case *ArraySubqueryExpr:
+			return e, true, x.Plan == nil || selfContainedPlan(x.Plan, frames+1)
+		case *MultiAssignSubqRow:
+			return e, true, x.Plan == nil || selfContainedPlan(x.Plan, frames+1)
+		case *InExpr:
+			if x.Plan == nil {
+				return e, false, true
+			}
+			if x.Operand != nil {
+				if _, ok := lowerTraverseExpr(x.Operand, fx); !ok {
+					return e, true, false
+				}
+			}
+			for _, le := range x.List {
+				if _, ok := lowerTraverseExpr(le, fx); !ok {
+					return e, true, false
+				}
+			}
+			return e, true, selfContainedPlan(x.Plan, frames+1)
+		}
+		return e, false, true
+	}
+	hook := func(n Node) (bool, bool) {
+		j, isJoin := n.(*Join)
+		if !isJoin || !j.Lateral {
+			return false, true
+		}
+		for _, p := range []Expr{j.Predicate, j.LeftKey, j.RightKey} {
+			if _, ok := lowerTraverseExpr(p, fx); !ok {
+				return true, false
+			}
+		}
+		return true, selfContainedPlan(j.Left, frames) && selfContainedPlan(j.Right, frames+1)
+	}
+	return lowerTraverseNodeHooked(plan, fx, hook)
+}
+
 // planContainsLateralJoin reports whether any Join in the subtree has
 // outer references in its RIGHT child — the shape the executor runs
 // with the general-LATERAL per-iteration OuterRows push

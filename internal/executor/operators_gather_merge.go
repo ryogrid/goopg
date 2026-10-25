@@ -44,6 +44,12 @@ type gmSource struct {
 	pendingTIDs []queueTID
 	// local is non-nil for the leader's own share.
 	local Operator
+	// Compact transfer (gatherMergeOp.liveIdx): full holds the two scratch
+	// rows cur alternates between, flip the one cur is; compact is the
+	// leader's own share's reused compact row.
+	full    [2]Row
+	flip    int
+	compact Row
 }
 
 // gatherMergeOp implements planner.GatherMerge.
@@ -102,6 +108,15 @@ type gatherMergeOp struct {
 	// only those are transferred, the rest arrive NULL (gatherOp.liveCols,
 	// transferRowForQueueLive). nil = every column. M0122-0012 slice 63.
 	liveCols []bool
+	// borrowOut is set at Build when the parent reads each row before its
+	// next Next and keeps nothing of the row slice (aggregateBorrowsGatherRows).
+	// Open then sets liveIdx — the live columns in order — when liveCols
+	// marks fewer columns than the row has: every participant ships compact
+	// rows holding just those cells (transferRowCompact), and the leader
+	// expands each into one of its source's two scratch rows (expandLive)
+	// instead of receiving a full-width row per tuple (M0122-0012 slice 88).
+	borrowOut bool
+	liveIdx   []int
 }
 
 // EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
@@ -144,6 +159,18 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.slot = MaterializedSlot{schema: o.schema}
 	o.keySlot = MaterializedSlot{schema: o.schema}
+	o.liveIdx = nil
+	if o.borrowOut && o.liveCols != nil && !o.wantCTIDs {
+		var idx []int
+		for i, l := range o.liveCols {
+			if l && i < len(o.schema) {
+				idx = append(idx, i)
+			}
+		}
+		if len(idx) < len(o.schema) {
+			o.liveIdx = idx
+		}
+	}
 
 	n := o.plan.WorkersPlanned
 	if n < 0 {
@@ -352,7 +379,11 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 		if o.wantCTIDs {
 			tids = append(tids, slotQueueTID(slot))
 		}
-		batch = append(batch, transferRowForQueueLive(slot, o.liveCols, &chunk))
+		if o.liveIdx != nil {
+			batch = append(batch, transferRowCompact(slot, o.liveIdx, chunk.take(len(o.liveIdx))))
+		} else {
+			batch = append(batch, transferRowForQueueLive(slot, o.liveCols, &chunk))
+		}
 		if len(batch) >= gatherBatchRows && !flush() {
 			return wctx.Ctx.Err()
 		}
@@ -371,7 +402,15 @@ func (o *gatherMergeOp) advance(src *gmSource) (bool, error) {
 	if err != nil || !ok {
 		return ok, err
 	}
-	kv := make([]Datum, len(o.keys))
+	if o.liveIdx != nil {
+		src.cur = o.expandLive(src, src.cur)
+	}
+	// The source's key slice is reused: the heap compares only the fronts'
+	// keys, and Next has taken the popped row before advancing its source.
+	kv := src.curKeys
+	if len(kv) != len(o.keys) {
+		kv = make([]Datum, len(o.keys))
+	}
 	var keyView SlotView = rowSlotView(src.cur)
 	if o.wantCTIDs {
 		o.keySlot.row = src.cur
@@ -407,6 +446,12 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 		// later — so they must be transferred like any retained row.
 		if o.wantCTIDs {
 			src.curTID = slotQueueTID(slot)
+		}
+		if o.liveIdx != nil {
+			// Expanded before the next pull, so one compact row serves.
+			src.compact = transferRowCompact(slot, o.liveIdx, reuseRowLen(src.compact, len(o.liveIdx)))
+			src.cur = src.compact
+			return true, nil
 		}
 		src.cur = transferRowForQueueLive(slot, o.liveCols, nil)
 		return true, nil
@@ -588,4 +633,44 @@ func (o *gatherMergeOp) Close() error {
 		return err
 	}
 	return nil
+}
+
+// transferRowCompact is transferRowForQueueLive for a compact queue row: dst
+// (len(liveIdx) cells) receives the slot's live columns in order, each
+// detached from its arena (M0122-0012 slice 88).
+func transferRowCompact(slot TupleSlot, liveIdx []int, dst Row) Row {
+	w := slot.Width()
+	for j, c := range liveIdx {
+		if c < w {
+			dst[j] = slot.Get(c).MaterializeArena()
+		} else {
+			dst[j] = NullDatum
+		}
+	}
+	return dst
+}
+
+// expandLive places a compact row's cells at their columns in the next of
+// src's two scratch rows. The row Next returned last is the other one, so it
+// stays intact until the parent's next call, which is all a borrowing parent
+// reads it for. A dead cell is never written: it keeps the zero Datum (NULL,
+// as transferRowForQueueLive leaves it), or the deform poison when that is
+// armed.
+func (o *gatherMergeOp) expandLive(src *gmSource, compact Row) Row {
+	src.flip ^= 1
+	full := src.full[src.flip]
+	if len(full) != len(o.schema) {
+		full = make(Row, len(o.schema))
+		if seqScanDeformPoison {
+			dead := deformPoisonDatum()
+			for i := range full {
+				full[i] = dead
+			}
+		}
+		src.full[src.flip] = full
+	}
+	for j, c := range o.liveIdx {
+		full[c] = compact[j]
+	}
+	return full
 }

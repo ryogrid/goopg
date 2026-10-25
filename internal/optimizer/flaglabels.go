@@ -81,9 +81,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
-	// M0145-0008y: scalar-sublink decorrelation, default OFF (PG keeps the
-	// SubPlan); `=on` restores the pre-M0145-0008y unnest.
-	"GOOPG_SCALAR_UNNEST": func(v string) string { return onOff(scalarUnnestFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
@@ -260,6 +257,7 @@ var flagProvenanceOrder = []string{
 	// flagProvenanceRetired below.
 	"GOOPG_JOINTREE_PIPELINE",
 	// Joined at M0145-0008y: scalar-sublink decorrelation, default OFF.
+	// Retired at M0147-0013 — see flagProvenanceRetired below.
 	"GOOPG_SCALAR_UNNEST",
 }
 
@@ -343,6 +341,11 @@ var flagProvenanceRetired = map[string]string{
 	// nothing reads the variable. `unset(2)` in an older artefact is the
 	// multiplied arm; `1` there reproduces this one.
 	"GOOPG_INDEX_PROBE_MULT": "M0146-0159",
+	// M0145-0008y's correlated scalar-sublink decorrelation into a grouped
+	// join, default OFF since then (PG never decorrelates an EXPR_SUBLINK;
+	// it stays a SubPlan). M0147-0013 deleted the arm, so nothing reads the
+	// variable. `on` in an older artefact is the decorrelating arm.
+	"GOOPG_SCALAR_UNNEST": "M0147-0013",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

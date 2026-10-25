@@ -624,11 +624,7 @@ func correlatedScalarSublinkBinding(c Expr, spans []leafSpan, b int) int {
 				// then reads parameters, not the host row. PG distributes the
 				// clause by the Vars of its testexpr and args (pull_varnos),
 				// so TPC-H Q20's `ps_availqty > (SubPlan 1)` filters partsupp.
-				// With the non-PG scalar decorrelation switched on
-				// (GOOPG_SCALAR_UNNEST) the clause stays above, where that
-				// pass reads it off the body's top qual holder.
 				if x.Plan == nil || len(x.Args) != len(x.ParParam) ||
-					(len(x.Args) > 0 && scalarUnnestOn.Load()) ||
 					planEscapesBy(x.Plan, 1, outside) {
 					ok = false
 				}

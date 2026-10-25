@@ -107,6 +107,44 @@ func TestProjectLiveSetUnderAggregate(t *testing.T) {
 		}
 	})
 
+	t.Run("case-argument", func(t *testing.T) {
+		// M0122-0012 slice 79: TPC-DS Q43 / Q59 aggregate a CASE —
+		// sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price END). The
+		// CASE reads outputs 5 and 2; every other target is dead. The
+		// narrowing whitelist the live set used to walk declined the CASE
+		// and kept all 17 targets live.
+		a := agg(optimizer.AggModePartial, reexpandProject(scan16()))
+		a.Aggs[0].Arg = &optimizer.CaseExpr{
+			Whens: []optimizer.CaseWhen{{When: deformLt(deformCol(5), deformInt(3)), Then: deformCol(2)}},
+		}
+		op := mustBuildDeform(t, a)
+		if got := liveIndexes(projectUnder(t, op).live); len(got) != 2 || got[0] != 2 || got[1] != 5 {
+			t.Fatalf("live targets %v, want [2 5]", got)
+		}
+	})
+
+	t.Run("sublink-argument-keeps-every-target", func(t *testing.T) {
+		// A sublink may push the whole row: no target may be left out.
+		a := agg(optimizer.AggModeSimple, reexpandProject(scan16()))
+		a.Aggs[0].Arg = &optimizer.CaseExpr{
+			Whens: []optimizer.CaseWhen{{When: &optimizer.SubqueryExpr{}, Then: deformCol(2)}},
+		}
+		op := mustBuildDeform(t, a)
+		if live := projectUnder(t, op).live; live != nil {
+			t.Fatalf("live = %v, want nil (every target)", liveIndexes(live))
+		}
+	})
+
+	t.Run("out-of-range-reference-keeps-every-target", func(t *testing.T) {
+		// A reference past the target list is not this projection's
+		// coordinates: the set cannot be trusted.
+		a := agg(optimizer.AggModeSimple, reexpandProject(scan16()))
+		a.Aggs[0].Arg = deformCol(40)
+		if live := projectLiveSet(reexpandProject(scan16()), aggConsumerExprs(a)); live != nil {
+			t.Fatalf("live = %v, want nil (every target)", liveIndexes(live))
+		}
+	})
+
 	t.Run("unskippable-dead-target-stays-live", func(t *testing.T) {
 		// A dead target that could fail when evaluated is still evaluated.
 		p := reexpandProject(scan16())

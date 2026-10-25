@@ -2322,12 +2322,17 @@ type aggregateOp struct {
 
 	// Sorted aggregation streams (M0122-0012 slice 44): sorted is set by Open
 	// when the AGG_SORTED path applies, and Next then reads the child only up
-	// to the end of the next group (nextSorted). sCur / sCurParts are the
-	// group being accumulated and its key parts; sEOF records the child's EOF.
-	sorted    bool
-	sCur      *groupRuntime
-	sCurParts []string
-	sEOF      bool
+	// to the end of the next group (nextSorted). sCur is the group being
+	// accumulated; its per-column key parts are sCurKey[sCurEnds[i-1]:
+	// sCurEnds[i]]. sEOF records the child's EOF.
+	sorted   bool
+	sCur     *groupRuntime
+	sCurKey  []byte
+	sCurEnds []int
+	sEOF     bool
+	// sFree is the last group's runtime, kept once it is finalized so the
+	// next stream (a rescan) reuses it (M0122-0012 slice 87).
+	sFree *groupRuntime
 	// sKeyBuf is nextSorted's reused per-column key buffer (M0122-0012
 	// slice 58): a row's group key is compared without allocating.
 	sKeyBuf []byte
@@ -2597,7 +2602,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// by the GROUP BY keys, so openSorted collapses runs of equal keys instead
 	// of building the groups hash map. Grouping sets, ungrouped
 	// (len(GroupExprs)==0) and parallel split nodes always keep the hash path.
-	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
+	o.sorted, o.sCur, o.sCurEnds, o.sEOF = false, nil, nil, false
 	if o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets == nil && len(o.plan.GroupExprs) > 0 && o.plan.Mode == optimizer.AggModeSimple {
 		o.sorted = true
 		o.rows = nil
@@ -3847,18 +3852,35 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 			// one from this row. The previous group is returned once this
 			// row has been absorbed, so the calls run in the order the
 			// drained loop ran them.
-			if o.sCur != nil {
-				if out, err = o.finalizeGroup(o.sCur); err != nil {
+			gr := o.sCur
+			if gr != nil {
+				if out, err = o.finalizeGroup(gr); err != nil {
 					return nil, err
 				}
 				emit = true
+			} else {
+				gr = o.sFree
+			}
+			// The finalized group's runtime carries the new group
+			// (M0122-0012 slice 87). finalizeGroup has copied everything the
+			// emitted row holds into a fresh row, and nothing else refers to
+			// the runtime, so clearing it is starting from the zero runtime
+			// the allocation gave: each aggRuntime is 704 bytes, and TPC-DS
+			// Q78's (item, customer) groups are mostly one row each, so the
+			// three per group were allocated and cleared for nearly every
+			// input row. Clearing drops the old values' references without
+			// touching what they point to, which the emitted row may share.
+			if gr == nil || len(gr.aggs) != len(o.plan.Aggs) {
+				gr = &groupRuntime{aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			} else {
+				clear(gr.aggs)
 			}
 			// Evaluate passthrough (functionally-determined) columns from the
 			// first row of the group — identical to the hash path's group
 			// creation.
 			var ptVals Row
 			if len(o.plan.Passthrough) > 0 {
-				ptVals = make(Row, len(o.plan.Passthrough))
+				ptVals = reuseRowLen(gr.passthroughVals, len(o.plan.Passthrough))
 				for i, expr := range o.plan.Passthrough {
 					v, err := evalExprSlot(expr, slot, o.ctx)
 					if err != nil {
@@ -3870,20 +3892,19 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 			}
 			// The group's values leave the scratch vector here, detached
 			// from the input arena (the M0073-0004 retention boundary), and
-			// its per-column key strings are kept for sameSortedGroup.
+			// its per-column keys are kept in sCurKey for sameSortedGroup.
 			var gv Row
-			var parts []string
+			o.sCurKey, o.sCurEnds = o.sCurKey[:0], o.sCurEnds[:0]
 			if nGroupCols > 0 {
-				gv = make(Row, nGroupCols)
-				parts = make([]string, nGroupCols)
+				gv = reuseRowLen(gr.groupValues, nGroupCols)
 				for i, v := range allVals {
 					gv[i] = v.MaterializeArena()
-					o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, gv[i])
-					parts[i] = string(o.sKeyBuf)
+					o.sCurKey = o.appendGroupColKey(o.sCurKey, i, gv[i])
+					o.sCurEnds = append(o.sCurEnds, len(o.sCurKey))
 				}
 			}
-			o.sCur = &groupRuntime{setIdx: 0, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
-			o.sCurParts = parts
+			gr.setIdx, gr.groupValues, gr.passthroughVals = 0, gv, ptVals
+			o.sCur = gr
 		}
 		o.currentRowVersion++
 		for i := range o.plan.Aggs {
@@ -3916,7 +3937,7 @@ func (o *aggregateOp) nextSorted() (TupleSlot, error) {
 		return nil, EOF
 	}
 	out, err := o.finalizeGroup(o.sCur)
-	o.sCur = nil
+	o.sFree, o.sCur = o.sCur, nil
 	if err != nil {
 		return nil, err
 	}
@@ -3935,19 +3956,22 @@ func (o *aggregateOp) emitSorted(row Row) TupleSlot {
 // evalGroupValsScratch fills) belong to the current sorted group: each
 // column's key — datumKey of the value, bpchar padding stripped where gkTrims
 // says so, exactly the part evalGroupExprs built — equals the group's stored
-// part. It is sameGroupKey(o.sCurParts, parts) without building parts: one
+// part. It is sameGroupKey(the group's parts, parts) without building parts: one
 // reused buffer and an allocation-free string comparison per column, where
 // the per-row values row, parts slice and key strings were allocated for
 // every input row of a sorted Group (M0122-0012 slice 58, TPC-DS Q97).
 func (o *aggregateOp) sameSortedGroup(vals Row) bool {
-	if len(vals) != len(o.sCurParts) {
+	if len(vals) != len(o.sCurEnds) {
 		return false
 	}
+	start := 0
 	for i, v := range vals {
 		o.sKeyBuf = o.appendGroupColKey(o.sKeyBuf[:0], i, v)
-		if string(o.sKeyBuf) != o.sCurParts[i] {
+		end := o.sCurEnds[i]
+		if string(o.sKeyBuf) != string(o.sCurKey[start:end]) {
 			return false
 		}
+		start = end
 	}
 	return true
 }
@@ -5818,7 +5842,7 @@ func (o *aggregateOp) Next() (TupleSlot, error) {
 
 func (o *aggregateOp) Close() error {
 	o.rows = nil
-	o.sorted, o.sCur, o.sCurParts, o.sEOF = false, nil, nil, false
+	o.sorted, o.sCur, o.sCurEnds, o.sEOF = false, nil, nil, false
 	o.ctx = nil
 	o.idx = 0
 	return o.child.Close()
@@ -6887,4 +6911,13 @@ func sameArrayShape(a, b []int) bool {
 		}
 	}
 	return true
+}
+
+// reuseRowLen is r resliced to n cells when it has the capacity, otherwise a
+// new row; every cell is the caller's to overwrite.
+func reuseRowLen(r Row, n int) Row {
+	if cap(r) >= n {
+		return r[:n]
+	}
+	return make(Row, n)
 }

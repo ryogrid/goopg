@@ -53,6 +53,10 @@ coverage.html
 /bench/tpch/runtime/
 /bench/tpch/logs/
 
+# Private non-cassert PG 18.3 build + its TPC-H / TPC-DS clusters
+# (analysis/timing-after-planprity-match/README.md §6).
+/bench/pg-release/
+
 # Local dev data directories
 /tmp-data/
 /var/

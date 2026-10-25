@@ -98,19 +98,16 @@ func sublinkArgsNameBaseRelations(e Expr, ctx *resolveContext) bool {
 }
 
 // conjunctHasOnlyCorrelatedScalarSublinks reports whether c carries at least
-// one correlated, not-yet-lowered scalar sublink, no other sublink kind, and
-// no scalar sublink the post-planning unnest pass would decorrelate: that pass
-// reads the correlation off the body's OuterColumnRefs, which pre-lowering
-// replaces. goopg still decorrelates a body that is not probe-cheap
-// (canUnnestSubquery) where PG keeps the SubPlan — ledgered; this slice
-// leaves that choice exactly as it was.
+// one correlated, not-yet-lowered scalar sublink and no other sublink kind.
+// Like PG, goopg never decorrelates a scalar sublink (the GOOPG_SCALAR_UNNEST
+// decorrelation was retired by M0147-0013), so every such sublink stays a
+// SubPlan.
 func conjunctHasOnlyCorrelatedScalarSublinks(c Expr) bool {
 	scalar, other := false, false
 	ok := walkExprRefs(c, scopeIgnore, exprVisitor{
 		Visit: func(n Expr) bool {
 			if x, isSub := n.(*SubqueryExpr); isSub {
-				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 || !planHasOuterRef(x.Plan) ||
-					(subqueryUnnestEnabled() && canUnnestSubquery(x)) {
+				if x.Plan == nil || len(x.Args) > 0 || len(x.ParParam) > 0 || !planHasOuterRef(x.Plan) {
 					other = true
 				} else {
 					scalar = true
@@ -148,13 +145,8 @@ func exprCarriesSublink(e Expr) bool {
 // so an equality over it can key a hash join on the side its Args come from,
 // as PG hashes on `(SubPlan 1) = ps_supplycost` in TPC-H Q2 (M0146-0207).
 // The executor evaluates a key against the merged row of its side, which is
-// where the Args point. Off under GOOPG_SCALAR_UNNEST, whose post-planning
-// pass reads such a clause off the join's predicate (as
-// correlatedScalarSublinkBinding).
+// where the Args point.
 func paramExecScalarSublinksOnly(e Expr) bool {
-	if scalarUnnestOn.Load() {
-		return false
-	}
 	found, ok := false, true
 	walked := walkExprRefs(e, scopeIgnore, exprVisitor{
 		Visit: func(n Expr) bool {

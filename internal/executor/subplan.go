@@ -244,9 +244,8 @@ func classifySubPlan(n optimizer.Node, ctx *Context) (kind int, cacheable bool) 
 		case *optimizer.BitmapHeapScan:
 			// M0146-0015a: a correlated body's outer reference can now be
 			// its bitmap probe key, so the keyed single-producer bitmap is a
-			// common SubPlan leaf. Same narrowness as the twins
-			// (planIsIndexScanBased here, innerPlanIsIndexProbeCheap in the
-			// planner): one BitmapIndexScan producer, whose probe is rebuilt
+			// common SubPlan leaf. Same narrowness as planIsIndexScanBased:
+			// one BitmapIndexScan producer, whose probe is rebuilt
 			// from the key against the current outer binding. Close+Open,
 			// not a bare re-Open: openPrep builds a fresh producer on every
 			// Open, so re-Opening without Close would leak the previous one.

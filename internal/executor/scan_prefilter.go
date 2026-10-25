@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // scanPrefilterOn is E-17/EX3-08's operational kill switch. Default ON;
@@ -142,4 +143,115 @@ func (o *seqScanOp) evalPrefilter() (bool, error) {
 		o.scanSlot = rowSlotView(o.scanRow)
 	}
 	return o.evalQual(o.scanSlot)
+}
+
+// scanQualLead is the absorbed qual's leading conjunct, judged on its own
+// columns before the prefilter's prefix is decoded (M0122-0012 slice 86).
+// PG decodes up to the qual's last attribute once (EEOP_SCAN_FETCHSOME) and
+// then runs the AND-list step by step, so a tuple its first clause rejects
+// costs PG a deform it never reads. goopg's deform of a numeric or varlena
+// column costs more than PG's, so the scan decodes only the lead's columns,
+// evaluates the lead, and stops there when it is FALSE: that is the verdict
+// the whole qual returns, because the compiled AND evaluates its left operand
+// first and returns a FALSE one as the result (evalFastExpr's OpAnd
+// short-circuit). The lead is a left operand on the qual's AND spine, so it is
+// what the full evaluation computes first. Every other outcome — TRUE, NULL,
+// an error, a decode error, a toasted cell — decides nothing, and the row
+// takes the prefilter path unchanged, which evaluates the qual whole.
+// TPC-DS Q28's six store_sales quals lead with `ss_quantity >= x AND
+// ss_quantity <= y`: one int4 column against four, three of them numerics up
+// to column 20, and about 95 % of rows fail it.
+type scanQualLead struct {
+	// idx is the lead's node in the prefilter's slab; noExpr means no lead
+	// stage (none was found, or the probe below switched it off).
+	idx int32
+	// max is the lead's MaxCols, and info is colInfo with every column in
+	// [0, max) the lead does not read marked skip (nil: colInfo itself).
+	max  int
+	info []colTypeInfo
+	// seen / rejected count the lead's evaluations and FALSE verdicts. A lead
+	// that rejects under a quarter of the first scanLeadProbeRows rows only
+	// adds work (the rows it passes decode its columns twice), so the stage
+	// is switched off for the rest of the scan.
+	seen, rejected int
+}
+
+const scanLeadProbeRows = 4096
+
+// planScanQualLead finds the lead stage for the prefilter qual compiled at
+// slab[idx]. It walks the qual's AND spine and the slab together — the AND
+// node's left child is its childA — and takes the first left operand that
+// reads fewer columns than the whole qual. No lead (idx noExpr) when the qual
+// is not an AND, a node was folded or adapted, or no left operand reads
+// fewer columns.
+func planScanQualLead(slab exprTreeSlab, idx int32, qual optimizer.Expr, info []colTypeInfo) scanQualLead {
+	none := scanQualLead{idx: noExpr}
+	full := deformScanReadSet(len(info), qual)
+	if full == nil {
+		return none
+	}
+	nFull := countRead(full)
+	e := qual
+	for idx != noExpr && int(idx) < len(slab) {
+		b, ok := e.(*optimizer.BinaryOp)
+		n := &slab[idx]
+		if !ok || b.Op != parser.OpAnd || n.Kind != ExprBinaryOp || parser.OpCode(n.payload[0]) != parser.OpAnd || n.constVal != nil {
+			return none
+		}
+		e, idx = b.Left, n.childA
+		read := deformScanReadSet(len(info), e)
+		if read == nil || idx == noExpr {
+			return none
+		}
+		if countRead(read) < nFull {
+			sq := optimizer.PlanScanQual(e, len(info))
+			if !sq.Early || sq.MaxCols > len(info) {
+				return none
+			}
+			return scanQualLead{idx: idx, max: sq.MaxCols, info: prefilterSkipInfo(info, sq.MaxCols, e)}
+		}
+	}
+	return none
+}
+
+func countRead(read []bool) int {
+	n := 0
+	for _, r := range read {
+		if r {
+			n++
+		}
+	}
+	return n
+}
+
+// leadRejects decodes the lead's columns of the tuple into o.scanRow and
+// reports whether the lead is FALSE for it — then, and only then, the whole
+// qual is FALSE and the row is rejected. The cells it decodes are handed to
+// nothing but the lead; the prefilter path re-decodes the prefix from column
+// 0 for every row it does not reject.
+func (o *seqScanOp) leadRejects(data, bitmap []byte, storedNatts int) bool {
+	l := &o.lead
+	info := l.info
+	if info == nil {
+		info = o.colInfo
+	}
+	if _, err := o.decodeScanRowRangeInfo(info, data, bitmap, storedNatts, 0, l.max, 0); err != nil {
+		return false
+	}
+	if needsDetoastPrefix(o.scanRow, l.max) {
+		return false
+	}
+	if o.scanSlot == nil {
+		o.scanSlot = rowSlotView(o.scanRow)
+	}
+	v, err := evalFastExpr(o.pfSlab, l.idx, o.scanSlot, o.ctx)
+	l.seen++
+	reject := err == nil && v.Kind == KindBool && !v.BoolValue()
+	if reject {
+		l.rejected++
+	}
+	if l.seen == scanLeadProbeRows && l.rejected*4 < l.seen {
+		l.idx = noExpr
+	}
+	return reject
 }

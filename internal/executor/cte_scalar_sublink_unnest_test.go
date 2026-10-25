@@ -1,26 +1,19 @@
 package executor
 
-// cte_scalar_sublink_unnest_test.go — M0125-0041.
+// cte_scalar_sublink_unnest_test.go — M0125-0041, rebased by M0147-0013.
 //
 // TPC-DS Q30 and Q81 put a correlated scalar-aggregate sublink over a WITH
 // item: `ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 from
-// customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)`. Every
-// pull-up gate accepts that shape, but the rewrite died inside
-// clonePlanReplacingOuter, which had no arm for *planner.CTEScan — so the
-// sublink silently stayed a per-outer-row SubPlan and the query timed out.
-//
-// The fix is only worth anything if the decorrelated plan answers exactly what
-// the SubPlan path answered, so the test is an equivalence test: the same query
-// over the same data, planned with the pull-up on and off, must return the same
-// rows. A plan-shape assertion alone would have passed for a rewrite that
-// dropped or duplicated rows.
+// customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)`.
+// M0125-0041 taught goopg's scalar decorrelation to rewrite that shape; the
+// decorrelation (GOOPG_SCALAR_UNNEST) was default off from M0145-0008y and
+// M0147-0013 deleted it. PG never decorrelates an EXPR_SUBLINK
+// (pull_up_sublinks converts only ANY/EXISTS), so the shape stays a SubPlan,
+// and the test now pins that plan and its answer.
 
 import (
-	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // q30ShapeSQL is Q30 reduced to its planning-relevant skeleton: a grouped WITH
@@ -62,65 +55,28 @@ func setupQ30Shape(t *testing.T, ctx *Context) {
 		(50,5,1000)`)
 }
 
-func rowsKey(rows []Row) string {
-	var b strings.Builder
-	for _, r := range rows {
-		for i, d := range r {
-			if i > 0 {
-				b.WriteByte('|')
-			}
-			fmt.Fprintf(&b, "%v", d)
-		}
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
+func TestCTEScalarSublinkStaysSubPlan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	setupQ30Shape(t, ctx)
 
-func TestCTEScalarSublinkDecorrelatesAndAgrees(t *testing.T) {
-	optimizer.SetScalarUnnestEnabled(true)
-	t.Cleanup(func() { optimizer.SetScalarUnnestEnabled(false) })
-	// Plan shape first: with the pull-up enabled the Q30 shape must no longer
-	// carry a SubPlan. This is what the timeout hinged on.
-	ctxOn, _, cleanupOn := newDDLFixture(t)
-	t.Cleanup(cleanupOn)
-	setupQ30Shape(t, ctxOn)
-
-	plan := runExplainRows(t, ctxOn, "EXPLAIN "+q30ShapeSQL)
-	for _, line := range plan {
-		if strings.Contains(line, "SubPlan") {
-			t.Fatalf("correlated scalar sublink over a CTE stayed a SubPlan:\n%s",
-				strings.Join(plan, "\n"))
-		}
-	}
-	got := runSQL(t, ctxOn, q30ShapeSQL)
-
-	// Same query, same data, pull-up disabled — the SubPlan path's answer is
-	// the oracle here (it is the shape that shipped before this change).
-	optimizer.SetSubqueryUnnestEnabled(false)
-	defer optimizer.SetSubqueryUnnestEnabled(true)
-
-	ctxOff, _, cleanupOff := newDDLFixture(t)
-	t.Cleanup(cleanupOff)
-	setupQ30Shape(t, ctxOff)
-
-	offPlan := runExplainRows(t, ctxOff, "EXPLAIN "+q30ShapeSQL)
+	plan := runExplainRows(t, ctx, "EXPLAIN "+q30ShapeSQL)
 	sawSubPlan := false
-	for _, line := range offPlan {
+	for _, line := range plan {
 		if strings.Contains(line, "SubPlan") {
 			sawSubPlan = true
 		}
 	}
 	if !sawSubPlan {
-		t.Fatalf("control arm did not take the SubPlan path, so it proves nothing:\n%s",
-			strings.Join(offPlan, "\n"))
+		t.Fatalf("correlated scalar sublink over a CTE was decorrelated; PG keeps it a SubPlan:\n%s",
+			strings.Join(plan, "\n"))
 	}
-	want := runSQL(t, ctxOff, q30ShapeSQL)
 
-	if rowsKey(got) != rowsKey(want) {
-		t.Errorf("decorrelated result differs from the SubPlan result:\n got:\n%s\nwant:\n%s\nplan:\n%s",
-			rowsKey(got), rowsKey(want), strings.Join(plan, "\n"))
-	}
-	if len(want) == 0 {
-		t.Fatalf("fixture produced no rows on either path — the comparison is vacuous")
+	// AR's average total is (100+900+400+50)/4 = 362.5, so only C20 (900)
+	// clears 435; TN's single member cannot clear 1.2 x its own average, and
+	// the NULL state's correlation group is empty, so avg() is NULL there.
+	got := renderRows(runSQL(t, ctx, q30ShapeSQL))
+	if want := []string{"C20|900"}; !equalStrings(got, want) {
+		t.Errorf("got %v, want %v\nplan:\n%s", got, want, strings.Join(plan, "\n"))
 	}
 }

@@ -806,6 +806,34 @@ heuristic stays live.)
   - Expected instrument: the repro identical to `analysis/p0e11/pg18\.out`; Q12/Q20/Q98 outputs identical to
     :65438 tpcds025\.
 
+- [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
+  \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(the repro's values differ from the generator's\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-24 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e12/substr\-group\-key\-repro\.sql`; expected output
+    > `analysis/p0e12/expected\.out` \(computed from the generator: 60 000 distinct keys, count 1 each\); goopg output
+    > `analysis/p0e12/goopg\-a05a55628\-serial\.out` — 60 000 rows but only **36 distinct keys**\.
+  - Symptom: on a throwaway cluster, `SELECT substr\(t, 2, 6\), count\(\*\) FROM gq GROUP BY 1` \(serial, a HashAggregate
+    over a Seq Scan of a 60 000\-row table with a 200\-byte pad column\) returns most rows as `59972\-\|1` — the stored
+    keys show a later page's bytes\. With parallelism forced, 44 keys show the pad column's bytes\. Reproduces at
+    `a05a55628` and at `2e8519eff` \(pre\-dates M0122\-0012 slices 84\-92\)\.
+  - Cause \(read\): evalSubstr slices `src\.StringValue\(\)` — an `unsafe\.String` over the scan's per\-page arena for
+    an arena\-backed cell — and `NewStringDatum` wraps those bytes without copying, so the result has `ArenaID` 0
+    while its `Buf` points into the arena\. `MaterializeArena` treats it as owned and does not detach it\. The scan
+    borrow \(M0145\-0008u `aggregateBorrowsScanRows`: "group keys MaterializeArena'd at group creation"\) hands the
+    aggregate the scan's reused row, so the retained key is overwritten when the arena is reused for a later page\.
+    The same class hit TPC\-H Q22 in slice 83 \(memory note "computed values alias the scan arena"\); a hand\-built
+    Gather over Project\(substr\) over a parallel scan returns pad bytes the same way\.
+  - First step: make a value computed from an arena\-backed string own its bytes or carry the arena mark — at the
+    source \(evalSubstr and the other slicing builtins: left/right/split\_part/trim family, lower/upper when
+    unchanged\) or by having NewStringDatum's callers on arena inputs copy; then re\-check every borrow gate that
+    trusts MaterializeArena on computed values \(aggregateBorrowsScanRows group keys and min/max, gatherOp workers
+    through projectOp, slice 92's coopBorrowScan already refuses computed targets\)\.
+  - Expected instrument: the repro identical to `analysis/p0e12/expected\.out`, serial and parallel; a regression
+    test with a substr group key over a multi\-page text scan; TPC\-H/TPC\-DS values unchanged\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -2360,6 +2388,189 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(fastOperandPtr\), gated on fastBinarySimple's static half \(without it, Q81 \+9 %\)\. Pinned vs evalExprSlot
       on 25 expressions incl\. every error path; mutation\-checked\.
     - Q1 122\.81 → 98\.99 Ginstr \(−19\.4 %\), wall 9\.63 → 6\.75 s \(PG 12\.4 s\); Q81 −4\.6 %; Q30 −4\.4 %; Q6 flat\.
+  - **Slice 76 — a scan's descent stops above the leaf: one leaf visit per descent LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), nbtree race PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\.
+    Doc part 7 "Slice 76"\.
+    - Q72's "20× inventory\_pkey rows" census lead was the pre\-Filter count \(M0122\-0017\): 195 ≈ PG's 9\.88 returned
+      \+ 191 removed\. Its skip scan makes 862k cursors for 436k date groups, matching PG's 898 676 Index Searches\.
+    - descendToLowerBound pinned the leaf, ran its high\-key test and unpinned it; both callers then re\-pinned it
+      and re\-ran that test\. The descent now returns the level\-1 downlink \(stopAboveLeaf\), as PG's \_bt\_search
+      hands \_bt\_first one leaf buffer\. Pinned: same leaf as the full descent for every bound; leaf\-root tree\.
+    - Q72 28\.53 → 27\.39 Ginstr \(−4\.0 %\), wall 0\.69 → 0\.59 s; Q17 −1\.2 %, Q25 −0\.8 %, Q54 −0\.4 %\.
+    - Discovery filed: M0122\-0018 \(EXPLAIN ANALYZE TIMING OFF runs Q72 4\.4× slower than the bare query\)\.
+  - **Slice 77 — one cursor per skip scan, re\-aimed per descent LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    acceptance arm PASS \(24 MATCH\), nbtree race PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\.
+    Doc part 7 "Slice 77"\.
+    - Target: Q72's per\-run Go\-heap allocation \(tmp/ds\-alloc\.sh, MemStats delta\)\. A fresh ScanCursor per descent
+      was 49 % of allocation samples \(862k × 128 B\); an empty lower bound built an error per comparison\.
+    - BTree\.ResetScanCursor re\-aims a cursor; btreeSkipEnum keeps walkSpare/enumSpare across reset \(PG's one
+      BTScanOpaque per scan\); an empty bound takes the first downlink directly \(PG \_bt\_endpoint\)\. Pinned with an
+      independent key oracle; mutation\-checked\.
+    - Q72 192\.9 → 92\.7 MB/run \(−52 %\), 2\.39 M → 1\.41 M allocations; instructions −1\.1 %; warm wall ~0\.58 → 0\.55 s\.
+    - Left: groupBoundsFixed's per\-group buffer \(~28 MB/run; needs the cursor to own a copy of lo\)\.
+  - **Slice 78 — pathkey usefulness looks each key up once: TPC\-DS Q64 planning −65 % LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: fire\-set fires=none \(99/99 MATCH\), sf025
+    PASS=99 \(61 ck\) PLAN\-SHAPE same, acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS\. Doc part 7 "Slice 78"\.
+    - Target: Q64, the largest SF0\.25 gap vs PG \(1719 vs 260 ms\), is planning — plan\-only EXPLAIN 1\.6–2\.0 s vs PG
+      Planning Time 64 ms\. Instrument: tmp/ds\-planinstr\.sh \(instructions:u per plan, plan cache busted via work\_mem\)\.
+    - 70 % of planning was truncateUselessPathkeys: exprEqual formatted both keys per pair; then memo map lookups
+      per pair; the class index was rebuilt per rel; every GEQO tour started an empty key memo\.
+    - Each key is looked up once \(pathkeyUsefulness\.pathKeyEqual, groupMeta/distinctMeta/mergeMeta/queryMeta\);
+      classIndex is the search's; freshEvalCtx shares exprKeys/ecIdx\. Oracle\-pinned; three mutations caught\.
+    - Q64 18\.62 → 6\.48 Ginstr/plan \(−65 %\); Q72 −44 %, Q25 −51 %, Q18 −42 %; Q14 flat at 77\.7 G \(~5 s planning —
+      next lead\)\. Plans byte\-identical\.
+    - Discovery: goopg's EXPLAIN ANALYZE "Planning Time" reports 0\.17 ms for Q64's ~1\.6 s planning — filed
+      M0122\-0019\.
+  - **Slice 79 — a re\-expansion Project's live set reads its consumers through any expression LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 7 "Slice 79"\.
+    - Target: Q43 \(208 vs PG 75 ms\)\. Its worker Sort held 121–131 MB vs PG 3\.5 MB; 72 % of instructions were the
+      80\-target re\-expansion Project, evaluated in full because projectLiveSet's whitelist declined the CASE in
+      sum\(CASE WHEN d\_day\_name = 'Sunday' …\)\.
+    - projectLiveSet now uses consumerLiveColumns \(any expression, fail\-closed\); out\-of\-range refs and sublinks
+      still keep every target\. Pinned \(CASE / sublink / out\-of\-range subtests\); mutation\-checked\.
+    - Q43 −19\.3 %, Q59 −24\.9 %, Q2 −16\.9 %, Q75 −15\.2 % instructions; warm wall Q43 0\.25 → 0\.20 s, Q59 1\.30 → 0\.99 s\.
+    - Correction to slice 78: Q14's "77\.7 G planning" was its second statement's execution \(two\-statement file;
+      the explain prefix covers the first only\) — Q14/Q23/Q24/Q39 need per\-statement plan measurement\.
+  - **Slice 80 — an index scan forms its probe key from resolved columns and re\-aims one cursor per rescan LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 \(new\) "Slice 80"\.
+    - Target: Q14, the largest gap vs release PG 18\.3 \(8\.9 vs 4\.8 s\)\. Same plans and rows; parameterised
+      \*\_sales\_pkey rescans \(16 173 each\): lookupKey re\-resolved columns by name and formed the probe generically,
+      and every rescan allocated a cursor\.
+    - indexProbeForm \(colAt once; fixed\-width template fill\) in indexScanOp and indexOnlyScanOp alike; curSpare \+
+      ResetScanCursor\. Byte\-identity pinned vs indexProbeKey; mutation\-checked\.
+    - Q14 −4\.9 % instructions, −13 % bytes / −21 % objects allocated; Q17 −4\.5 %, Q25 −2\.9 %\.
+    - Left: leafScanStart's generic comparator \(~12 % of Q14\); Q14 still allocates 4\.5 GB / 46 M objects per run\.
+  - **Slice 81 — a re\-opened inner index scan keeps its batch; a set\-op drain forms one key per distinct row LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 81"\.
+    - Target: Q14's per\-run allocation \(tmp/ds\-alloc\.sh\)\. Allocation\-sample attribution: scanAppendEntry growslice
+      \(the lateral stream re\-opens the inner per outer row; Open/Close nil'd the TID batches\), string decode, and
+      drainSetOpInput's per\-row key strings \(the left input's counts are discarded\)\.
+    - Open/Close keep tids/poss capacity; drainSetOpInput\(wantCounts\) with a reused key buffer \+ key→slot index\.
+      Pinned \(counts vs rowKeyTrimmed incl\. int/numeric, bpchar, NULL canonicalisation\); mutation\-checked\.
+    - Q14 objects 45\.96 M → 32\.57 M per run \(−29 %\), bytes −6 %, instructions −2\.9 %; Q38/Q87 −1\.1 %\.
+    - Ledger row: index scans decode dead string columns \(needs a join\-aware read set for inner\-side scans\)\.
+  - **Slice 82 — the lateral stream copies the outer row's cells; an index\-only scan decodes into reused scratch
+    LANDED 2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99
+    \(61 ck\) PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm
+    PASS \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 82"\.
+    - Target: Q23 \(2\.6 s vs release PG 1\.3 s; 3\.9 GB / 21\.5 M objects per run\)\. Fresh census: goopg 67\.6 s vs
+      release PG 85\.8 s total; Q47's 4\.8 s was a warm\-up artefact \(1\.2 s warm, instructions unchanged\)\.
+    - stepOuter materialised the VirtualSlot then copied it \(appendSlotCells now\); IOS decodeRowFromKey allocated
+      keyCols/names/Physical/values/nulls/vals per entry \(pgIndexTupleKeyDatumsInto \+ DeformPGIndexKeyInto with
+      per\-descriptor scratch\)\. Pinned; mutation\-checked\.
+    - Q23 objects −26\.5 %, bytes −12 %, instructions −2\.4 %; Q14 −2\.1 % instructions; Q72 bytes −21 %\.
+  - **Slice 83 — a sort read only by a Gather Merge stores compact rows LANDED 2026\-10\-23\.** Movement: none — perf
+    only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same, also PASS with the
+    deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), TestPort\_RegressSuite PASS,
+    TestPort\_Isolation PASS\. Doc part 8 "Slice 83"\.
+    - Target: Q78 \(3\.0 GB / 5\.7 M objects per run; materializeLiveRow \+ transferRowForQueueLive on ~50\-column rows\)\.
+    - compactOut \(set by newGatherMergeNodeFor\) → compact live rows, reused full\-width output row, expansion before
+      the first spill; keys evaluated on the detached cells\.
+    - The first cut evaluated keys on the incoming slot: TPC\-H Q22 1 510 groups instead of 7 \(acceptance ROWS\-DIFF;
+      sf025 99/99 missed it\)\. substr over an arena\-backed cell aliases the arena with ArenaID 0, which
+      MaterializeArena cannot detach\. Pinned with an arena\-page source; mutation\-checked\.
+    - Q78 −26 % bytes, −4\.9 % instructions; Q47 −3\.9 %\. Ledger row: other sorts and the GM queue stay full width\.
+  - **Slice 84 — the compiled evaluator applies AND / OR itself and compares a numeric with an int in place LANDED
+    2026\-10\-23\.** Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\)
+    PLAN\-SHAPE same, also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS
+    \(24 MATCH\), TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 84"\.
+    - Target: boolean\-heavy numeric scan quals \(Q28 2\.9x vs release PG; Q13, Q48\)\. evalFastExpr fell to evalBinary
+      for AND/OR and for numeric\-vs\-int comparisons \(fastCompareDatum declined mixed kinds\)\.
+    - Kleene AND/OR inline for bool/NULL operands; fastCompareDatum numeric/int arm \(compareDatum's NUMERIC ↔ INT\)\.
+      Pinned vs the interpreter; slice 27's pin amended; mutation\-checked\.
+    - Q13 −9\.5 %, Q48 −6\.6 %, Q28 −2\.5 % instructions\.
+  - **Slice 85 — a Gather worker shipping every column reads a join's VirtualSlot once LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\),
+    TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 85"\.
+    - Target: Q10 \(2\.5x vs release PG; same plan, 1\.92 M\-row outer scan\)\. transferRowForQueue built Row\(\) then
+      cloneRowOwned per shipped row for a Gather with no live mask; now one cell\-by\-cell pass into a chunk row\.
+    - Q10 −19 % bytes / −7 % objects, −0\.4 % instructions; Q35 −1\.4 %\. **Below 3 %: rule \(b\) — the next slice
+      must clear 3 % on its own target or M0122\-0012 yields to M0147\.**
+    - Measured and dropped: skip\-arm conditional NULL store \(\+4\.7 % instructions, cycles within noise\); NL stream
+      outer copy \(does not fire in Q10\)\.
+  - **Slice 86 — a seq scan judges the qual's leading conjunct on its own columns LANDED 2026\-10\-23\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 86"\.
+    - Target: Q28 \(2\.9x vs release PG; same plan\)\. The prefilter decoded all four qual columns \(three numerics up to
+      column 19\) before judging rows that 95 % fail on `ss\_quantity` alone\.
+    - scanQualLead: the first left operand on the qual's AND spine that reads fewer columns is decoded and evaluated
+      alone; FALSE rejects \(the AND short\-circuit's own verdict\), anything else takes the unchanged prefilter path; a
+      lead rejecting < 25 % of its first 4096 rows switches off\.
+    - Q28 25\.02 → 17\.99 G instructions \(−28 %\); Q13/Q48/Q88/Q96/Q7 flat, Q9 \+0\.2 % noise\. Rule \(b\) watch resets\.
+    - Open: a qual reading the last column has no prefilter, hence no lead \(possible later slice\)\.
+  - **Slice 87 — a sorted aggregate carries the next group in the finalized group's runtime LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 87"\.
+    - Target: Q78 \(6\.2x warm vs release PG at cd37060e5; 2224 MB / 5\.50 M objects per run\)\. nextSorted allocated
+      a groupRuntime, one 704\-byte aggRuntime per aggregate, a key row and key strings for every group; Q78's groups
+      are mostly one row\.
+    - Q78 −24 % bytes, −28 % objects, −3\.2 % instructions, warm wall 1\.74 → 1\.45 s; Q97 −3\.7 %, Q51 −3\.1 %
+      instructions; Q67 flat\. Rule \(b\): ≥ 3 % on its target\.
+    - Open: Q78 sys time ~1\.0 s/run; remaining 1\.7 GB/run \(Gather Merge transfer, sort rows, merge\-join output\)\.
+  - **Slice 88 — a Gather Merge read by a borrowing aggregate ships compact rows LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, new test under \-race PASS\. Doc part 8 "Slice 88"\.
+    - Target: Q78 bytes \(1683 MB/run\)\. Its sys time is page faults: under GOGC=off every allocated byte is a fresh
+      page \(369 k minor faults per run\)\. Workers shipped 2\.4 KB full\-width rows with 4\-5 live cells\.
+    - aggregateBorrowsGatherRows marks the Gather Merge borrowOut; liveIdx compact rows, expandLive into two scratch
+      rows per source; per\-source sort\-key slices reused\.
+    - Q78 −48 % bytes, sys 1\.45 → 0\.40 s, warm wall 1\.67 → 1\.41 s, −2\.9 % instructions\. Rule \(b\): ≥ 3 % on its
+      target\.
+  - **Slice 89 — a character\-string comparison of in\-place operands compares them where they lie LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 8 "Slice 89"\.
+    - Target: Q2/Q59 \(seven char\(9\) `d\_day\_name = '<day>'` CASE arms per row\)\. The comparison copied four Datums
+      through two operand calls and evalFastBinaryApply before its plain\-string branch\.
+    - Q81 −17 %, Q30 −16 %, Q2 −6\.7 %, Q59 −6\.4 %, Q43 −2\.7 % instructions; Q13/Q48 \+0\.3–0\.4 %\. Rule \(b\): ≥ 3 %\.
+    - Dropped: direct compact\-sort read into the Gather Merge queue \(Q78 −0\.8 % instructions, cycles flat\)\.
+  - **Slice 90 — the plain\-string test and the string read inline at the comparison LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS\. Doc part 9 \(new\) "Slice 90"\.
+    - Target: Q81 \(indexbytebody 26 % from plainCompareString's IndexByte on two\-letter state codes; StringValue
+      not inlinable\)\. Byte\-loop plainCompareString \+ inlinable stringValueInline\.
+    - Q81 −15\.1 %, Q30 −14\.3 %, Q59 −1\.9 %, Q2 −0\.6 % instructions\. Rule \(b\): ≥ 3 %\.
+  - **Slice 91 — a correlated sublink over a CTE scan is lowered, so its result cache keys on the parameters LANDED
+    2026\-10\-24\.**
+    Movement: none — plan text byte\-identical \(census 22/22, 99/99, 99/99 MATCH; fire\-set no changed query;
+    EA\-RATCHET PASS\)\. Values: Q1/Q30/Q81 sorted output == :65438; sf025 PASS=99 \(61 ck\), poison sf025 PASS;
+    executor pkg with poison PASS; acceptance 24 MATCH; spotcheck PASS; RegressSuite PASS; Isolation PASS\. Doc part 9
+    "Slice 91"; ledger row \(remaining unmodelled kinds; selfContainedPlan hand\-written switch\)\.
+    - Target: Q81 SubPlan `calls=6893 hits=0`: the D4\.1 lowering walk had no CTEScan arm, so the sublink stayed on
+      the OuterRows stack and its cache was keyed by the whole outer row\.
+    - selfContainedPlan: non\-mutating body check \(lateral right / nested sublink one frame deeper, ExecParamRef
+      refused\); CTEScan arm never enters the shared body\.
+    - Q1 99\.2 → 1\.0 G instructions \(0\.108 s vs release PG 7\.2 s\), Q81 31\.4 → 0\.99 G, Q30 7\.25 → 0\.49 G\.
+  - Post\-slice\-91 recon 2026\-10\-24 \(no code landed; doc part 9 "After slice 91"\):
+    - SubPlan cache census over all 99 SF0\.25 queries: no `hits=0` SubPlan remains\.
+    - Dropped: buffered stable merge sort \(Q67 −3 % instructions but \+2\.6 % serial cycles\)\.
+    - Next lever, needs design: cooperative hash build producers clone every build row \(Q95 ~13 %\) that the
+      consumer copies again; recycling requires a borrow\-safe transfer\.
+    - Ledger: EXPLAIN ANALYZE actual time prints loop totals, PG prints per\-loop averages\.
+  - **Slice 92 — cooperative hash build producers borrow their scan and fill recycled batch blocks LANDED 2026\-10\-24\.**
+    Movement: none — perf only\. The S3 instrument is value/plan identity: sf025 PASS=99 \(61 ck\) PLAN\-SHAPE same,
+    also PASS with the deform poison armed; executor pkg with poison PASS; acceptance arm PASS \(24 MATCH\), spotcheck
+    PASS, TestPort\_RegressSuite PASS, TestPort\_Isolation PASS, \-race on the coop tests PASS\. Doc part 9 "Slice 92"\.
+    - Target: Q95 \(1534 MB/run\)\. Producers cloned every build row \(their tree never borrowed\) and the consumer
+      copied it again \(retainBuildRow\)\.
+    - coopBorrowScan admits the bare scan or a column\-only Project over it; rows are copied into coopBatch blocks the
+      channelSource hands back on a free list once past the batch\.
+    - Q95 −21\.5 % bytes, −8 % objects, ws\_wh build −27 to −48 %; end\-to\-end within noise; Q4 −2\.0 %, Q59
+      −1\.2 % instructions\. Rule \(b\): ≥ 3 % on its target \(bytes\)\.
 - [x] **M0122-0016 — every big\-mantissa numeric result is written to the never\-reset permanent arena \(unbounded growth \+ a process\-wide lock\)**\.
   Kind: impl
   Parent: M0122-0012
@@ -2401,6 +2612,47 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     node returns \(InstrStopNode after ExecScan's qual\), goopg counts them before the Filter\.
   - Resume point: the instrumentation wrapper around an index scan with a pushed\-down Filter \(maybeInstrument
     placement vs the filterOp the builder adds\) — count emitted rows, keep Rows Removed by Filter as is\.
+- [x] **M0122-0018 — EXPLAIN \(ANALYZE, TIMING OFF\) runs TPC\-DS Q72 4\.4× slower than the bare query**\.
+  Kind: impl
+  Parent: M0122-0012
+  Movement: none — premise stale: the 3\.04 s was a once\-per\-server stall, not EXPLAIN overhead\.
+  - **Closed 2026\-10\-23 \(loop \#118\)\.** Warm, on one server \(`7050dc003`\): bare 0\.58–0\.62 s, `EXPLAIN \(ANALYZE,
+    TIMING OFF\)` 0\.60–0\.67 s \(\+7 %; instructions 27\.39 vs 27\.64 G\)\. The filed 3\.04 s was the server's first
+    EXPLAIN run\.
+  - A ~3\.4 s run recurs ONCE per server lifetime, bare or EXPLAIN alike, when RSS first crosses ~5 GB \(4 948 /
+    5 058 MB in two series\)\. gctrace shows the first GC only at 11\.4 GB, 10 s later — not GC\. Reading: the
+    WSL2 VM committing fresh host memory on first touch \(an environment stall\)\.
+  - What drives RSS there is real: Q72 allocates ~202 MB and 2\.4 M objects per run \(MemStats TotalAlloc /
+    Mallocs over 5 runs\), and GOGC=200 over a 2\.8 GB live heap \(2 GB buffer\-pool arena\) lets it pile to ~11 GB
+    before the first GC\. Lead for the next M0122\-0012 slice\.
+  - Filed 2026\-10\-23 from M0122\-0012 slice 76\. On the SF0\.25 clone \(binary `88998a861`\) Q72 takes 0\.69 s bare
+    and 3\.04 s under `EXPLAIN \(ANALYZE, COSTS OFF, TIMING OFF\)`; PG's InstrStartNode/InstrStopNode without
+    timing only bump counters \(instrument\.c\), and PG's own EXPLAIN ANALYZE of Q72 takes 0\.87 s\.
+  - Q72 is a 9\-deep parameterised nested loop in 4 parallel participants: ~1M inner rescans of index scans, so a
+    per\-rescan or per\-node\-start instrumentation cost multiplies\. Every per\-node timing a slice reads off EXPLAIN
+    ANALYZE on such a plan is distorted until this is understood\.
+  - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
+    timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
+- [ ] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
+  Kind: impl
+  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Parent: none
+  - Filed 2026\-10\-24 from M0122\-0012 post\-slice\-91 recon\. TPC\-DS Q14 on the SF0\.25 clone:
+    `Index Scan using store\_sales\_pkey … \(actual time=0\.003\.\.1857\.725 rows=42\.54 loops=16173\)` — rows is the
+    per\-loop average but time is the total; PG's ExplainNode \(explain\.c\) divides startup and total time by nloops\.
+  - Resume point: internal/executor/operators\_explain\.go, the actual\-time renderer: divide by loops as explain\.c
+    does; ledger row 2026\-10\-24 \(post slice 91 recon\)\.
+- [ ] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
+  Kind: impl
+  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Parent: none
+  - Filed 2026\-10\-23 from M0122\-0012 slice 78\. On the SF0\.25 clone `EXPLAIN \(ANALYZE\)` of Q64 prints
+    `Planning Time: 0\.169 ms` while a plan\-only EXPLAIN of the same text takes 1\.6–2\.0 s wall \(profile: 96 % under
+    optimizer\.PlanWithSettings → geqoSearch\); PG prints its whole planner time \(ExplainOnePlan's planduration,
+    measured around pg\_plan\_query\)\.
+  - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
+    CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
+    cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
@@ -3433,6 +3685,9 @@ spill route is net-negative.
   (completed sub-entries archived → `completed_milestones/completed_fix_plan_015.md`)
   - [ ] **M0141-S7-exec-d (deferred, ledger row filed 2026-09-17)** —
     Kind: impl
+    **Note 2026\-10\-24 \(M0147\-0011\):** packed\-tuple retention \(`GOOPG\_SORT\_PACKED`\) is retired and no
+    longer part of this task's scope \(AGENT\.md R6/B1\); the remaining items are spill, ctid passthrough and
+    per\-group SortStat\.
     `sortOp` feature parity once exec-a/b/c land and the corpus is
     measured: spill-to-disk, packed-tuple retention (`GOOPG_SORT_PACKED`),
     ctid passthrough (`ORDER BY ... FOR UPDATE` over an Incremental Sort),
@@ -4580,6 +4835,126 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
     \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
     P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `88998a861`** \(M0122\-0012 slice 75 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `a5693f85c`** \(M0122\-0012 slice 77 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `a53a0c466`** \(M0122\-0012 slice 78 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `71a749a8e`** \(M0122\-0012 slice 79 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `afdfe9869`** \(M0122\-0012 slice 80 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `e9c61e18b`** \(M0122\-0012 slice 81 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `233658626`** \(M0122\-0012 slice 82 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023u/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `a05a55628`** \(M0122\-0012 slice 83 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `e9ba4cf5f`** \(M0122\-0012 slice 84 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023w/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `44017260b`** \(M0122\-0012 slice 85 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023x/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-23 — **exhausted at `cd37060e5`** \(M0122\-0012 slice 86 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261023y/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `127b21ea8`** \(M0122\-0012 slice 87 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024z/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `8c2d59d66`** \(M0122\-0012 slice 88 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `e8bf90456`** \(M0122\-0012 slice 89 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `4cf358ae6`** \(M0122\-0012 slice 90 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `8532a71e3`** \(M0122\-0012 slice 91 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **census reused at `a5ba2cb39`** \(docs\-only commit; routing\-20261024d's capture sha
+    `8532a71e3` is an ancestor and no planner/executor/cost path changed since\)\. Same items\-0\-9 tokens as the
+    `8532a71e3` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `2e8519eff`** \(M0122\-0012 slice 92 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9\(owner\-placement\);
+    P0\-E10\(owner\-placement\); P0\-E11\(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **census reused at `652989a37`** \(docs\-only filing commit; routing\-20261024e's capture
+    `2e8519eff` is an ancestor\)\. Same items\-0\-9 tokens plus P0\-E12\(owner\-placement\)\. Item 10 is live; M0122\-0012
+    yielded under rule \(a\) \(no runnable slice after profiling Q14/Q23/Q67\) → M0147\-0010\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `1f05de2c5`** \(M0147\-0010 changed internal/executor \+ storage\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261024f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Open items\-0\-9 tasks and their gates: M0146\-0014\(channel\), M0146\-0042\(channel\);
+    M0146\-0007/0012b/0067/0175, M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239
+    \(below\-item\-10\); M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003/0010\); P0\-E9/E10/E11/E12
+    \(owner\-placement\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `b63f03791`** \(M0147\-0011 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261024g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-24 — **exhausted at `50ecb096b`** \(M0147\-0012 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261024h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -6994,29 +7369,56 @@ Basis: the 2026-10-21 lever census and its review
   - A channel, not stock (like M0146-0014): never select it; take its first open child in file order. Close it
     only in the commit that closes its last child. Skip-rationale token: `M0147-0000(channel)`. Commit subjects
     cite the child id, never M0147-0000.
-- [ ] **M0147-0010 — retire the S30.3 / S32.x probes: `GOOPG_PAGEIDENT_PROBE`, `GOOPG_S321_PROBE`, `GOOPG_S321_NOWAIT`, `GOOPG_S322_NOWAIT`**
+- [x] **M0147-0010 — retire the S30.3 / S32.x probes: `GOOPG_PAGEIDENT_PROBE`, `GOOPG_S321_PROBE`, `GOOPG_S321_NOWAIT`, `GOOPG_S322_NOWAIT`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 34→30 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under banner rule \(a\)\)\. Files deleted: s321\_probe\.go,
+    pageident\_probe\.go, analysis/pageident\_probe\.sh; call sites removed in operators\_storage\.go, bufpool\.go,
+    smgr\.go, prefetch\.go; the six NOWAIT conjuncts deleted, the waits kept\. Design doc
+    `docs/design/0100\-0149/m0147\-0010\-retire\-s30\-s32\-probes\.md` \(C6 inert proof\)\. Gates: units, spotcheck,
+    acceptance 24 MATCH, sf025 PASS=99, census on tree held, RegressSuite, Isolation; fire\-set out of scope\.
   - `internal/storage/pageident_probe.go`, `internal/executor/s321_probe.go` and their hooks (bufpool.go,
     operators_storage.go), plus `analysis/pageident_probe.sh`. **Keep the pending-writer waits**: delete only the
     `!s321NoWait &&` / `!s322NoWait &&` conjuncts at operators_storage.go ~5388/5413/6052/6070/6338/6361 —
     NOWAIT=1 disabled a correctness fix. Resolves ledger row 1194 (new row). lever-count 34→30.
-- [ ] **M0147-0011 — retire `GOOPG_SORT_PACKED` (packed sort retention)**
+- [x] **M0147-0011 — retire `GOOPG_SORT_PACKED` (packed sort retention)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 30→29 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. The sortOp packed arm deleted; packed\-only
+    tests deleted; TestPackedSlotHasNoProducer strict\. Design doc
+    `docs/design/0100\-0149/m0147\-0011\-retire\-sort\-packed\.md` \(C6\)\. Gates: units, spotcheck, acceptance 24
+    MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans captured separately, same=99\), census on tree held,
+    RegressSuite, Isolation\.
   - AGENT.md R6/B1 (amended 2026-10-21): no new packed retention; deleting this leftover arm is in scope.
     `packUse` branches in operators.go; packedslot_test.go:657. Supersedes the packed part of M0141-S7-exec-d and
     ledger row 2259 (new rows; note on M0141-S7-exec-d).
-- [ ] **M0147-0012 — retire `GOOPG_HEAP_PREFETCH_DEPTH`**
+- [x] **M0147-0012 — retire `GOOPG_HEAP_PREFETCH_DEPTH`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 29→28 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. bitmap\_prefetch\.go and its tests deleted; the
+    `pf` field, its construction, four drain points and the refill/take branch removed from operators\_bitmap\.go;
+    `tbmIterator\.peekBlocks` deleted\. Pool\.StartRead kept\. Design doc
+    `docs/design/0100\-0149/m0147\-0012\-retire\-heap\-prefetch\-depth\.md` \(C6\)\. Gates: units, spotcheck,
+    acceptance 24 MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans standalone same=99\), census on tree held,
+    RegressSuite, Isolation\.
   - Remove the prefetch window (`o.pf`) and its construction at operators_bitmap.go:554
     (`newHeapPrefetchWindow(ctx.Pool, o.rel, heapPrefetchDepth())`) with `internal/executor/bitmap_prefetch.go`;
     keep the storage-layer `Pool.StartRead` (reusable per `docs/design/not_ralph/minimize_datum/TODO_ALL.md:4144-4190`,
     which records the measured NO-GO).
-- [ ] **M0147-0013 — retire `GOOPG_SCALAR_UNNEST` (correlated scalar-subquery decorrelation; PG never does it)**
+- [x] **M0147-0013 — retire `GOOPG_SCALAR_UNNEST` (correlated scalar-subquery decorrelation; PG never does it)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 28→27 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-24 \(M0122\-0012 yielded under rule \(a\)\)\. Switch, `canUnnestSubquery`, `unnestSubquery`,
+    `unnestScalarWithResiduals` and 13 helpers left unreachable \(`deadcode ./cmd/...` diff\) deleted; the three
+    gates in sublinkjoinclause\.go / local\_filters\.go simplified; flaglabels row → `retired\(M0147\-0013\)`,
+    planner\-flags\.env regenerated\. Decorrelation\-only tests deleted; the Q30 CTE test and the M17 duplicate\-outer
+    test rebased onto PG\'s SubPlan\. Design doc `docs/design/0100\-0149/m0147\-0013\-retire\-scalar\-unnest\.md` \(C6\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(SF025\_NO\_PLANS=1; plans standalone same=99\),
+    fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - unnest.go `unnestSubquery` / `unnestScalarWithResiduals` and the inverse gates at sublinkjoinclause.go:155 and
     local_filters.go:631; keep `collectUnnestParamsAndResiduals` (EXISTS path). Tests:
     scalar_unnest_switch_test.go, executor/nl_semi_anti_join_test.go:119, cte_scalar_sublink_unnest_test.go:80 —

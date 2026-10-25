@@ -39,6 +39,13 @@ type btreeSkipEnum struct {
 	gReached bool
 	gPassed  bool
 
+	// walkSpare / enumSpare are the cursors walkLeaf and next re-aim
+	// (nbtree.BTree.ResetScanCursor) for every descent, kept across init and
+	// reset so one scan node allocates each once — PG's one BTScanOpaque
+	// per scan (M0122-0012 slice 77).
+	walkSpare *nbtree.ScanCursor
+	enumSpare *nbtree.ScanCursor
+
 	// vals is groupBounds' reused value buffer (prefix datums, then the
 	// bound columns' values).
 	vals []Datum
@@ -65,7 +72,7 @@ type btreeSkipEnum struct {
 // whole scan is empty.
 func (e *btreeSkipEnum) init(ctx *Context, idx *catalog.Index, skipPrefix int, keys []optimizer.Expr,
 	outerSlot SlotView, pos int, op string) (empty bool, err error) {
-	*e = btreeSkipEnum{}
+	e.reset(false)
 	ncols := len(idx.Columns)
 	e.keyCols = pgIndexKeyColumns(idx)
 	if len(e.keyCols) != ncols {
@@ -100,6 +107,25 @@ func (e *btreeSkipEnum) init(ctx *Context, idx *catalog.Index, skipPrefix int, k
 	return false, nil
 }
 
+// reset clears the enumeration (done marks it exhausted), keeping the spare
+// cursors.
+func (e *btreeSkipEnum) reset(done bool) {
+	ws, es := e.walkSpare, e.enumSpare
+	*e = btreeSkipEnum{done: done, walkSpare: ws, enumSpare: es}
+}
+
+// cursorAt re-aims *spare (allocating it on first use) at lo: the descent
+// NewScanCursor performs, without a cursor allocation per descent.
+func cursorAt(spare **nbtree.ScanCursor, tree *nbtree.BTree, lo []byte, loExcl bool, leafFilter func(storage.BlockNumber) bool) (*nbtree.ScanCursor, error) {
+	if *spare == nil {
+		*spare = new(nbtree.ScanCursor)
+	}
+	if err := tree.ResetScanCursor(*spare, lo, nil, loExcl, false, leafFilter); err != nil {
+		return nil, err
+	}
+	return *spare, nil
+}
+
 // next advances the enumeration to the next distinct value of the skipped
 // prefix and returns the bounded probe for that group as (lo, hi) — both
 // inclusive — or ok=false when no further group exists.
@@ -126,7 +152,7 @@ func (e *btreeSkipEnum) next(ctx *Context, tree *nbtree.BTree, idx *catalog.Inde
 	s := skipPrefix
 	for !e.done {
 		var first []byte
-		enum, cerr := tree.NewScanCursor(e.seek, nil, e.seekExcl, false, nil)
+		enum, cerr := cursorAt(&e.enumSpare, tree, e.seek, e.seekExcl, nil)
 		if cerr != nil {
 			return nil, nil, false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
 		}
@@ -467,7 +493,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 		return false, nil
 	}
 	if e.walkCur == nil {
-		cur, cerr := tree.NewScanCursor(e.seek, nil, e.seekExcl, false, leafFilter)
+		cur, cerr := cursorAt(&e.walkSpare, tree, e.seek, e.seekExcl, leafFilter)
 		if cerr != nil {
 			return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
 		}
@@ -543,7 +569,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 		return false, &ExecError{Code: "XX000", Pos: pos, Message: nerr.Error()}
 	}
 	if jump != nil {
-		jc, cerr := tree.NewScanCursor(jump, nil, jumpExcl, false, leafFilter)
+		jc, cerr := cursorAt(&e.walkSpare, tree, jump, jumpExcl, leafFilter)
 		if cerr != nil {
 			return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
 		}
@@ -565,7 +591,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			target = e.gProbe
 		}
 		if target != nil {
-			cur, cerr := tree.NewScanCursor(target, nil, excl, false, leafFilter)
+			cur, cerr := cursorAt(&e.walkSpare, tree, target, excl, leafFilter)
 			if cerr != nil {
 				return false, &ExecError{Code: "XX000", Pos: pos, Message: cerr.Error()}
 			}

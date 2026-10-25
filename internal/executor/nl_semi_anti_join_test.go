@@ -110,14 +110,12 @@ func TestNLAntiJoinNullPredicate(t *testing.T) {
 	}
 }
 
-// TestScalarResidualDuplicateOuterOrdinality is the base-table twin of
-// matrix row M17: two IDENTICAL outer rows must both survive the
-// aggregate-above-join rewrite, and the plan must show the Ordinality
-// tag actually fired (the rewrite, not the SubPlan path, produced the
-// result).
-func TestScalarResidualDuplicateOuterOrdinality(t *testing.T) {
-	optimizer.SetScalarUnnestEnabled(true)
-	t.Cleanup(func() { optimizer.SetScalarUnnestEnabled(false) })
+// TestScalarResidualDuplicateOuterMultiplicity is the base-table twin of
+// matrix row M17: two IDENTICAL outer rows must both survive. It once pinned
+// goopg's aggregate-above-join rewrite (an Ordinality tag kept the duplicates
+// apart); M0147-0013 deleted that scalar decorrelation, so the sublink stays a
+// SubPlan, as in PG, and the test pins that plan and the multiplicity.
+func TestScalarResidualDuplicateOuterMultiplicity(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 	for _, stmt := range []string{
@@ -138,8 +136,8 @@ func TestScalarResidualDuplicateOuterOrdinality(t *testing.T) {
 	const sql = "SELECT d1.a FROM d1 WHERE d1.b >= (" +
 		"SELECT min(y.b) FROM d2 y WHERE y.a = d1.a AND y.b <= d1.b) ORDER BY a"
 	plan := explainText(t, ctx, sql)
-	if !strings.Contains(plan, "Ordinality") {
-		t.Fatalf("aggregate-above-join rewrite did not fire (no Ordinality node):\n%s", plan)
+	if !strings.Contains(plan, "SubPlan") {
+		t.Fatalf("correlated scalar sublink was decorrelated; PG keeps it a SubPlan:\n%s", plan)
 	}
 	rows, err := runQueryWithErr(ctx, sql)
 	if err != nil {
@@ -148,6 +146,6 @@ func TestScalarResidualDuplicateOuterOrdinality(t *testing.T) {
 	got := renderRows(rows)
 	want := []string{"1", "1"}
 	if !equalStrings(got, want) {
-		t.Fatalf("duplicate-outer multiplicity: got %v want %v (single 1 = ordinal tag collapsed duplicates)", got, want)
+		t.Fatalf("duplicate-outer multiplicity: got %v want %v", got, want)
 	}
 }

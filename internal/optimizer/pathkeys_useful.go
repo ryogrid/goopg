@@ -58,6 +58,38 @@ type pathkeyUsefulness struct {
 	ecIndexed bool
 	ecByKey   map[string]int
 	ecByPtr   map[Expr]int
+	// ecIdx, when set, is the search's shared index (classIndex) in place of
+	// the three fields above.
+	ecIdx *classIndex
+	// groupMeta / distinctMeta are leadingMembersOf's per-entry identity keys
+	// and classes of groupPathkeys / distinctPathkeys, formed once per rel.
+	groupMeta, distinctMeta []listKeyMeta
+	// mergeMeta / queryMeta are the identity keys of mergeExprs and of
+	// queryPathkeys' expressions, formed once per rel for usefulForMerging
+	// (M0122-0012 slice 78).
+	mergeMeta, queryMeta []listKeyMeta
+}
+
+// classIndex is ecClassOf's index over ecMembers, which are the members of
+// every equivalence class in the search's clause list — the same list for
+// every rel of the search, so the index is built once per clause list and
+// shared (M0122-0012 slice 78; it was rebuilt per rel). memo caches the
+// answer per expression node: an expression's class does not depend on the
+// rel asking.
+type classIndex struct {
+	clauses *restrictInfoList
+	built   bool
+	byKey   map[string]int
+	byPtr   map[Expr]int
+	memo    map[Expr]int
+}
+
+// listKeyMeta is one entry of a pathkey list with its expression's identity
+// key and class, looked up once.
+type listKeyMeta struct {
+	key   string
+	keyOK bool
+	class int
 }
 
 type cachedKey struct {
@@ -92,6 +124,19 @@ func (u *pathkeyUsefulness) equalKeyed(a, b Expr) bool {
 	ka, oka := u.keyOf(a)
 	kb, okb := u.keyOf(b)
 	return oka && okb && ka == kb
+}
+
+// pathKeyEqual is the package pathKeyEqual(a, b) with exprEqual through the
+// memo. truncateUselessPathkeys asks it for every key of every candidate path
+// against the query's grouping and distinct keys, and exprEqual formats both
+// identity keys on every call: 70 % of TPC-DS Q64's planning
+// (M0122-0012 slice 78). A nil receiver answers with the unmemoised form.
+func (u *pathkeyUsefulness) pathKeyEqual(a, b PathKey) bool {
+	if u == nil {
+		return pathKeyEqual(a, b)
+	}
+	return a.SortAsc == b.SortAsc && a.NullsFirst == b.NullsFirst &&
+		a.GroupingNulled == b.GroupingNulled && u.equalKeyed(a.Expr, b.Expr)
 }
 
 // classMember is one expression of an equivalence class, with the relations
@@ -161,8 +206,11 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	// builds hundreds of join rels over the same clause and pathkey
 	// expressions, and re-formatting their keys per rel was 26 % of its
 	// planning (M0122-0012 slice 42).
+	if s.ecIdx == nil || s.ecIdx.clauses != s.clauses {
+		s.ecIdx = &classIndex{clauses: s.clauses}
+	}
 	u := &pathkeyUsefulness{queryPathkeys: s.queryPathkeys, groupPathkeys: s.groupPathkeys,
-		distinctPathkeys: s.distinctPathkeys, relids: joinrelids, keys: s.exprKeys}
+		distinctPathkeys: s.distinctPathkeys, relids: joinrelids, keys: s.exprKeys, ecIdx: s.ecIdx}
 	if s.clauses == nil {
 		return u
 	}
@@ -230,10 +278,10 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	if _, nOrd := u.countContainedIn(keys, u.queryPathkeys); nOrd > n {
 		n = nOrd
 	}
-	if nGrp := u.leadingMembersOf(keys, u.groupPathkeys); nGrp > n {
+	if nGrp := u.leadingMembersOf(keys, u.groupPathkeys, &u.groupMeta); nGrp > n {
 		n = nGrp
 	}
-	if nDist := u.leadingMembersOf(keys, u.distinctPathkeys); nDist > n {
+	if nDist := u.leadingMembersOf(keys, u.distinctPathkeys, &u.distinctMeta); nDist > n {
 		n = nDist
 	}
 	switch {
@@ -249,16 +297,41 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 // pathkeys_useful_for_distinct: the number of leading keys that are members
 // of list, in any order. Membership is list_member_ptr on canonical pathkeys:
 // the same direction, nulls order and equivalence class (classOf).
-func (u *pathkeyUsefulness) leadingMembersOf(keys, list []PathKey) int {
+func (u *pathkeyUsefulness) leadingMembersOf(keys, list []PathKey, meta *[]listKeyMeta) int {
 	if len(list) == 0 {
 		return 0
 	}
+	// Each list entry's identity key and class are looked up once per rel
+	// (*meta), each candidate key's once per key — not once per pair, which
+	// was most of TPC-DS Q64's planning after the memo (M0122-0012 slice 78).
+	// The test per pair is unchanged: pathKeyEqual (exprEqual by identity
+	// key) or, with the same direction and nulls order, sameClass.
+	if len(*meta) != len(list) {
+		m := make([]listKeyMeta, len(list))
+		for j, l := range list {
+			m[j].key, m[j].keyOK = u.keyOf(l.Expr)
+			m[j].class = u.ecClassOf(l.Expr)
+		}
+		*meta = m
+	}
+	lm := *meta
 	n := 0
 	for _, k := range keys {
+		kk, kok := u.keyOf(k.Expr)
+		kc, kcDone := 0, false
 		member := false
-		for _, l := range list {
-			if pathKeyEqual(k, l) || (k.SortAsc == l.SortAsc && k.NullsFirst == l.NullsFirst &&
-				k.GroupingNulled == l.GroupingNulled && u.sameClass(k.Expr, l.Expr)) {
+		for j, l := range list {
+			if k.SortAsc != l.SortAsc || k.NullsFirst != l.NullsFirst || k.GroupingNulled != l.GroupingNulled {
+				continue
+			}
+			if exprEqualKeyed(k.Expr, kk, kok, l.Expr, lm[j].key, lm[j].keyOK) {
+				member = true
+				break
+			}
+			if !kcDone {
+				kc, kcDone = u.ecClassOf(k.Expr), true
+			}
+			if kc >= 0 && kc == lm[j].class {
 				member = true
 				break
 			}
@@ -289,31 +362,55 @@ func (u *pathkeyUsefulness) sameClass(a, b Expr) bool {
 // a key equals only itself, so its first match is ecByPtr[e]. A nil e equals
 // only a nil member, which ecByPtr also records.
 func (u *pathkeyUsefulness) ecClassOf(e Expr) int {
+	if x := u.ecIdx; x != nil {
+		if id, hit := x.memo[e]; hit {
+			return id
+		}
+		if !x.built {
+			x.built = true
+			x.byKey, x.byPtr = u.indexMembers()
+			x.memo = make(map[Expr]int)
+		}
+		id := u.classIn(e, x.byKey, x.byPtr)
+		x.memo[e] = id
+		return id
+	}
 	if !u.ecIndexed {
 		u.ecIndexed = true
-		u.ecByKey = make(map[string]int, len(u.ecMembers))
-		u.ecByPtr = make(map[Expr]int, len(u.ecMembers))
-		for i := range u.ecMembers {
-			m := &u.ecMembers[i]
-			if mk, mok := u.memberKey(m); mok {
-				if _, seen := u.ecByKey[mk]; !seen {
-					u.ecByKey[mk] = m.id
-				}
-			}
-			if _, seen := u.ecByPtr[m.expr]; !seen {
-				u.ecByPtr[m.expr] = m.id
+		u.ecByKey, u.ecByPtr = u.indexMembers()
+	}
+	return u.classIn(e, u.ecByKey, u.ecByPtr)
+}
+
+// indexMembers builds ecClassOf's lookup maps over ecMembers.
+func (u *pathkeyUsefulness) indexMembers() (byKey map[string]int, byPtr map[Expr]int) {
+	byKey = make(map[string]int, len(u.ecMembers))
+	byPtr = make(map[Expr]int, len(u.ecMembers))
+	for i := range u.ecMembers {
+		m := &u.ecMembers[i]
+		if mk, mok := u.memberKey(m); mok {
+			if _, seen := byKey[mk]; !seen {
+				byKey[mk] = m.id
 			}
 		}
+		if _, seen := byPtr[m.expr]; !seen {
+			byPtr[m.expr] = m.id
+		}
 	}
+	return byKey, byPtr
+}
+
+// classIn is ecClassOf's lookup of e in one index.
+func (u *pathkeyUsefulness) classIn(e Expr, byKey map[string]int, byPtr map[Expr]int) int {
 	if e != nil {
 		if k, ok := u.keyOf(e); ok {
-			if id, hit := u.ecByKey[k]; hit {
+			if id, hit := byKey[k]; hit {
 				return id
 			}
 			return -1
 		}
 	}
-	if id, hit := u.ecByPtr[e]; hit {
+	if id, hit := byPtr[e]; hit {
 		return id
 	}
 	return -1
@@ -323,14 +420,19 @@ func (u *pathkeyUsefulness) ecClassOf(e Expr) int {
 // order, that a later merge join can use, stopping at the first that cannot
 // or that runs against the query's direction (right_merge_direction).
 func (u *pathkeyUsefulness) usefulForMerging(keys []PathKey) int {
+	// The merge and query expressions' keys are looked up once per rel,
+	// each pathkey's once per key (M0122-0012 slice 78); every comparison is
+	// still exprEqual by identity key.
+	u.ensureMergeMeta()
 	useful := 0
 	for _, pk := range keys {
-		if !u.rightMergeDirection(pk) {
+		pkk, pok := u.keyOf(pk.Expr)
+		if !u.rightMergeDirectionKeyed(pk, pkk, pok) {
 			break
 		}
 		matched := false
-		for _, e := range u.mergeExprs {
-			if u.equalKeyed(e, pk.Expr) {
+		for j, e := range u.mergeExprs {
+			if exprEqualKeyed(e, u.mergeMeta[j].key, u.mergeMeta[j].keyOK, pk.Expr, pkk, pok) {
 				matched = true
 				break
 			}
@@ -346,8 +448,32 @@ func (u *pathkeyUsefulness) usefulForMerging(keys []PathKey) int {
 // rightMergeDirection is right_merge_direction: a pathkey the query orders by
 // is useful only in the query's direction; any other is useful ascending.
 func (u *pathkeyUsefulness) rightMergeDirection(pk PathKey) bool {
-	for _, q := range u.queryPathkeys {
-		if u.equalKeyed(q.Expr, pk.Expr) {
+	u.ensureMergeMeta()
+	pkk, pok := u.keyOf(pk.Expr)
+	return u.rightMergeDirectionKeyed(pk, pkk, pok)
+}
+
+// ensureMergeMeta forms mergeMeta and queryMeta once per rel.
+func (u *pathkeyUsefulness) ensureMergeMeta() {
+	if len(u.mergeMeta) != len(u.mergeExprs) {
+		u.mergeMeta = make([]listKeyMeta, len(u.mergeExprs))
+		for j, e := range u.mergeExprs {
+			u.mergeMeta[j].key, u.mergeMeta[j].keyOK = u.keyOf(e)
+		}
+	}
+	if len(u.queryMeta) != len(u.queryPathkeys) {
+		u.queryMeta = make([]listKeyMeta, len(u.queryPathkeys))
+		for j, q := range u.queryPathkeys {
+			u.queryMeta[j].key, u.queryMeta[j].keyOK = u.keyOf(q.Expr)
+		}
+	}
+}
+
+// rightMergeDirectionKeyed is rightMergeDirection given pk's identity key;
+// queryMeta must be formed (ensureMergeMeta).
+func (u *pathkeyUsefulness) rightMergeDirectionKeyed(pk PathKey, pkk string, pok bool) bool {
+	for j, q := range u.queryPathkeys {
+		if exprEqualKeyed(q.Expr, u.queryMeta[j].key, u.queryMeta[j].keyOK, pk.Expr, pkk, pok) {
 			return q.SortAsc == pk.SortAsc
 		}
 	}
@@ -389,7 +515,7 @@ func (u *pathkeyUsefulness) countContainedIn(keys, required []PathKey) (containe
 	n := 0
 	for n < len(required) && n < len(keys) {
 		k, r := keys[n], required[n]
-		if !pathKeyEqual(k, r) && (k.SortAsc != r.SortAsc || k.NullsFirst != r.NullsFirst ||
+		if !u.pathKeyEqual(k, r) && (k.SortAsc != r.SortAsc || k.NullsFirst != r.NullsFirst ||
 			k.GroupingNulled != r.GroupingNulled || !u.equivalentWithin(k.Expr, r.Expr)) {
 			break
 		}
@@ -414,7 +540,7 @@ func pathkeysContainedInRel(rel *RelOptInfo, keys, required []PathKey) bool {
 	}
 	for i := range required {
 		k, r := keys[i], required[i]
-		if pathKeyEqual(k, r) {
+		if u.pathKeyEqual(k, r) {
 			continue
 		}
 		if k.SortAsc != r.SortAsc || k.NullsFirst != r.NullsFirst || !u.equivalentWithin(k.Expr, r.Expr) {

@@ -60,6 +60,11 @@ func TestSortForConsumerCompleteReadersStoresLiveColumns(t *testing.T) {
 	if got := liveIndexes(s.live); len(got) != 3 || got[0] != 3 || got[1] != 5 || got[2] != 11 {
 		t.Fatalf("worker sort live columns %v, want [3 5 11]", got)
 	}
+	// Its only reader is the Gather Merge, which copies every row it pulls:
+	// the sort keeps compact rows (M0122-0012 slice 83).
+	if !s.compactOut {
+		t.Fatal("worker sort under a Gather Merge is not marked compactOut")
+	}
 	// A Gather Merge built outside a consumer-complete parent keeps the
 	// partial plan as it was: the sort stores every column.
 	plain := mustBuildDeform(t, plan.Child).(*gatherMergeOp)

@@ -303,7 +303,6 @@ func (op *ReadOp) Finish() error {
 
 	s.contentMu.Lock()
 	recordIOTrace(op.tag, "postRead", s.page)
-	PageIdentityObserve(op.tag, s.page, "postRead")
 	if p.OnBlockReload != nil {
 		p.OnBlockReload(op.tag, s.page)
 	}

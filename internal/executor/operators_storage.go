@@ -1098,6 +1098,9 @@ type seqScanOp struct {
 	// the non-fast Build path and any compile failure fall back to.
 	pfSlab exprTreeSlab
 	pfIdx  int32
+	// lead is the qual's leading-conjunct stage (scanQualLead), planned in
+	// Open after pfSlab.
+	lead scanQualLead
 	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
 	// table's GiST index: the index OID used as the predicate-lock relation and
 	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
@@ -1692,6 +1695,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			o.pfSlab, o.pfIdx = slab, idx
 		}
 	}
+	o.lead = scanQualLead{idx: noExpr}
+	if o.prefilterSet && o.pfIdx != noExpr && !scanSkipDisabled {
+		o.lead = planScanQualLead(o.pfSlab, o.pfIdx, o.qual, o.colInfo)
+	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
 	// predicate lock so a concurrent writer's INSERT of a matching row forms
 	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
@@ -2178,6 +2185,18 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// The partial row is handed to NOTHING but the predicate —
 				// entries at/past MaxCols still hold the previous tuple's
 				// values — so it must not escape this block.
+				// The lead conjunct first, on its own columns
+				// (scanQualLead): a FALSE lead is the qual's verdict.
+				if o.lead.idx != noExpr && o.leadRejects(tuple.Data, tuple.Bitmap, storedNatts) {
+					o.statReturned++
+					if o.filterRemoved != nil {
+						*o.filterRemoved++
+					}
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
 				info := o.colInfo
 				if o.pfInfo != nil {
 					info = o.pfInfo
@@ -4509,7 +4528,6 @@ func tryApplyHOTUpdate(
 		oldItem.Flags != storage.ItemIDNormal {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		s321Note(s321HOTSkipItemID)
 		return false, nil
 	}
 
@@ -4544,22 +4562,7 @@ func tryApplyHOTUpdate(
 				Message: "could not serialize access due to concurrent update (deadlock)",
 			}
 		}
-		s321Note(s321HOTSkipConcurrent)
 		return false, nil // fall back to delete+insert; caller re-checks
-	}
-	// M0131-S30.3 probe (temporary, GOOPG_PAGEIDENT_PROBE=1): this is the exact
-	// site whose WAL record and on-disk page disagree. Under the content lock
-	// the line-pointer count is stable, so a count BELOW the high-water mark
-	// previously seen for {rel, blk} proves the slot's bytes belong to another
-	// block. See internal/storage/pageident_probe.go.
-	storage.PageIdentityObserve(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), "hotUpdate")
-	// Line-pointer count before the (unlogged) append, so the orphan-cleanup
-	// arm below can assert the add/remove pair left the page untouched.
-	lpBeforeAdd := -1
-	if storage.PageIdentityProbeEnabled() {
-		if n, cerr := storage.PageLinePointerCount(s.Page()); cerr == nil {
-			lpBeforeAdd = n
-		}
 	}
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
@@ -4584,7 +4587,6 @@ func tryApplyHOTUpdate(
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(addErr, storage.ErrNoSpaceInPage) {
-			s321Note(s321HOTNoSpace)
 			return false, nil // caller falls back to normal path
 		}
 		return false, addErr
@@ -4643,14 +4645,11 @@ func tryApplyHOTUpdate(
 		// replay rebuilds. PageAddHeapTuple always appends, so newSlot
 		// is the last line pointer and PageRemoveHeapTuple undoes it
 		// exactly, pd_lower AND pd_upper. M0131-S30.5 / heap.go.
-		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
-			// Non-fatal: page is still structurally valid; the
-			// orphan wastes space until the next VACUUM repacks
-			// the page. Do not surface this to the client.
-		} else if lpBeforeAdd >= 0 {
-			// M0131-S30.3 probe: prove the unlogged pair is a page no-op.
-			storage.PageIdentityAssertCount(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), lpBeforeAdd, "hotOrphanClean")
-		}
+		//
+		// A failure is non-fatal: the page is still structurally valid,
+		// and the orphan wastes space until the next VACUUM repacks the
+		// page. It is not surfaced to the client.
+		_ = storage.PageRemoveHeapTuple(s.Page(), newSlot)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(stampErr, storage.ErrUnsupportedItem) || errors.Is(stampErr, storage.ErrInvalidSlot) {
@@ -4663,11 +4662,6 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
-	// M0131-S30.3 probe step (a): the value about to be written into the record's
-	// new_off must describe THIS page — newSlot == line-pointer count, and never
-	// below the high-water count seen for {rel, blk}. Still under the content
-	// lock, so the counts are stable.
-	storage.PageIdentityAssertEmit(storage.BufferTag{Rel: rel, Block: blk}, s.Page(), newSlot, "hotUpdateEmit")
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	// M0146-0063b: heap_update clears the page's visibility-map bits when it
 	// was all-visible, HOT or not — the new version's xmin is not yet visible
@@ -4677,7 +4671,6 @@ func tryApplyHOTUpdate(
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	s321Note(s321HOTApplied)
 	return true, derr
 }
 
@@ -5147,7 +5140,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// (postgres/src/backend/access/heap/heapam.c), it does not re-apply.
 		for i := range pending {
 			if pending[i].blk == ptr.Block && pending[i].slot == actualSlot {
-				s321Note(s321ScanDedup)
 				return true, nil
 			}
 		}
@@ -5256,7 +5248,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					s321Note(s321EPQSelfModified)
 					epqSkip = true
 					break
 				}
@@ -5385,9 +5376,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						// statement's write while still reporting `UPDATE 1`.
 						// Wait for that writer and re-run the EPQ loop; the RC
 						// budget (maxEPQRetriesRC) bounds a pathological lap.
-						if pendXID, pending := epqChainPendingWriter(o.ctx, rel, pu.blk, pu.slot); pending && !s321NoWait &&
+						if pendXID, pending := epqChainPendingWriter(o.ctx, rel, pu.blk, pu.slot); pending &&
 							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
-							s321Note(s321EPQChainPendingWait)
 							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
 								terr.Pos = o.plan.Pos()
 								return nil, terr
@@ -5410,13 +5400,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						// last snapshot refresh, so the snapshot-driven
 						// chain-follow reports not-found while nobody is in
 						// flight for epqChainPendingWriter to wait on.
-						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+						if epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
 							epqChainTailLiveButUnseen(o.ctx, rel, pu.blk, pu.slot) {
-							s321Note(s321EPQChainStaleSnap)
 							epqRefreshSnapForRetry(o.ctx)
 							continue
 						}
-						s321Note(s321EPQChainNotFound)
 						epqSkip = true
 						break
 					}
@@ -5436,7 +5424,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						return nil, err
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
-					s321Note(s321EPQChainFollowed)
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -5451,7 +5438,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// invalidated it after scan-time). Skip.
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					s321Note(s321EPQOldGetFail)
 					epqSkip = true
 					break
 				}
@@ -6049,9 +6035,8 @@ func (o *updateOp) next() (TupleSlot, error) {
 						// epqWait already refreshes ctx.Snap on return, so the
 						// retry re-walks the chain under a snapshot that includes
 						// the writer we just waited for.
-						if pendXID, inflight := epqChainPendingWriter(o.ctx, captureRel, writeBlk, writeSlot); inflight && !s322NoWait &&
+						if pendXID, inflight := epqChainPendingWriter(o.ctx, captureRel, writeBlk, writeSlot); inflight &&
 							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
-							s321Note(s321ScanEPQPendingWait)
 							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
 								terr.Pos = o.plan.Pos()
 								return terr
@@ -6067,13 +6052,11 @@ func (o *updateOp) next() (TupleSlot, error) {
 						// snapshot visibility, so such a tail reads as not-found
 						// while epqChainPendingWriter (correctly) reports nobody
 						// in flight — and the row is dropped. Refresh and re-lap.
-						if !s322NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+						if epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
 							epqChainTailLiveButUnseen(o.ctx, captureRel, writeBlk, writeSlot) {
-							s321Note(s321ScanEPQStaleSnap)
 							epqRefreshSnapForRetry(o.ctx)
 							continue
 						}
-						s321Note(s321ScanEPQNotFound)
 						o.ctx.Snap = scanSnap
 						return nil // row genuinely deleted by concurrent tx
 					}
@@ -6132,7 +6115,6 @@ func (o *updateOp) next() (TupleSlot, error) {
 		}
 	}
 	if len(pending) == 0 {
-		s321Note(s321ScanNoRow)
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait
@@ -6237,7 +6219,6 @@ func (o *updateOp) next() (TupleSlot, error) {
 				if oldGerr == nil && isSelfModifiedWrite(oldTup.Header, o.ctx.Tx.XID) {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					s321Note(s321EPQSelfModified)
 					epqSkipSeq = true
 					break
 				}
@@ -6335,9 +6316,8 @@ func (o *updateOp) next() (TupleSlot, error) {
 						// statement's write while still reporting `UPDATE 1`.
 						// Wait for that writer and re-run the EPQ loop; the RC
 						// budget (maxEPQRetriesRC) bounds a pathological lap.
-						if pendXID, pending := epqChainPendingWriter(o.ctx, puRel, pu.blk, pu.slot); pending && !s321NoWait &&
+						if pendXID, pending := epqChainPendingWriter(o.ctx, puRel, pu.blk, pu.slot); pending &&
 							epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) {
-							s321Note(s321EPQChainPendingWait)
 							if dl, terr := epqWait(o.ctx, pendXID); terr != nil {
 								terr.Pos = o.plan.Pos()
 								return nil, terr
@@ -6358,13 +6338,11 @@ func (o *updateOp) next() (TupleSlot, error) {
 						// M0131-S32.3: see the index-arm site above — a tail that
 						// is live but committed after our last snapshot refresh
 						// must be re-lapped, not skipped.
-						if !s321NoWait && epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
+						if epqRetry < epqRetryLimit(o.ctx.Tx.Isolation) &&
 							epqChainTailLiveButUnseen(o.ctx, puRel, pu.blk, pu.slot) {
-							s321Note(s321EPQChainStaleSnap)
 							epqRefreshSnapForRetry(o.ctx)
 							continue
 						}
-						s321Note(s321EPQChainNotFound)
 						epqSkipSeq = true
 						break
 					}
@@ -6400,7 +6378,6 @@ func (o *updateOp) next() (TupleSlot, error) {
 					if pu.retRow != nil && pu.inheritColMap != nil {
 						pu.retRow = remapChildRowToParent(pu.newRow, pu.inheritColMap)
 					}
-					s321Note(s321EPQChainFollowed)
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -6450,7 +6427,6 @@ func (o *updateOp) next() (TupleSlot, error) {
 						// RETURN NULL — suppress the row.
 						s.Unlock()
 						o.ctx.Pool.Unpin(s)
-						s321Note(s321EPQOldGetFail)
 						epqSkipSeq = true
 						break
 					}

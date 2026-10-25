@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"unsafe"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -598,6 +599,33 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				}
 			}
 		}
+		// A character-string comparison of two operands that live somewhere
+		// already compares them in place when both are plain strings: that
+		// is evalFastBinaryApply's plain-string branch (slice 30), reached
+		// without copying four Datums through the two operand calls and the
+		// apply. The general path gets there the same way — two strings fail
+		// fastBinarySimple, and coerceUnknownLit replaces a literal only
+		// opposite an operand of the coerced kind, which a string is not
+		// when that kind is not KindString. TPC-DS Q2's and Q59's seven
+		// `CASE WHEN d_day_name = '<day>'` arms per row went the long way
+		// (M0122-0012 slice 89).
+		if op.IsComparison() && n.payload[16]&4 != 0 && (n.constVal == nil || DatumKind(n.payload[17]) != KindString) {
+			if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && lp.Kind == KindString {
+				if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && rp.Kind == KindString {
+					if ls, rs := stringValueInline(lp), stringValueInline(rp); plainCompareString(ls) && plainCompareString(rs) {
+						if lbp, rbp := binary.LittleEndian.Uint32(n.payload[8:]), binary.LittleEndian.Uint32(n.payload[12:]); lbp > 0 || rbp > 0 {
+							if lbp > 0 || n.payload[16]&1 != 0 {
+								ls = strings.TrimRight(ls, " ")
+							}
+							if rbp > 0 || n.payload[16]&2 != 0 {
+								rs = strings.TrimRight(rs, " ")
+							}
+						}
+						return NewBoolDatum(cmpResult(op, strings.Compare(ls, rs))), nil
+					}
+				}
+			}
+		}
 		left, err := evalFastExpr(exprs, n.childA, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -628,6 +656,21 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		right, err := evalFastExpr(exprs, n.childB, slot, ctx)
 		if err != nil {
 			return Datum{}, err
+		}
+		// AND / OR of two boolean (or NULL) operands is Kleene logic
+		// applied here, as PG's EEOP_BOOL_AND_STEP / EEOP_BOOL_OR_STEP
+		// steps do, instead of through evalBinary's dispatch: TPC-DS Q28's
+		// six `ss_quantity BETWEEN … AND (… OR … OR …)` scan quals called
+		// evalAnd / evalOr per row through it (M0122-0012 slice 84).
+		// evalBinary sends OpAnd / OpOr straight to evalAnd / evalOr, and
+		// for bool / NULL operands nothing on the general path (literal
+		// coercion, bpchar, pg_lsn) applies, so the result is the same.
+		if (op == parser.OpAnd || op == parser.OpOr) && n.constVal == nil &&
+			(left.Kind == KindBool || left.IsNull()) && (right.Kind == KindBool || right.IsNull()) {
+			if op == parser.OpAnd {
+				return evalAnd(left, right), nil
+			}
+			return evalOr(left, right), nil
 		}
 		if n.constVal != nil {
 			coerceUnknownLit(n, &left, &right)
@@ -735,7 +778,7 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 	// scans and a pg_lsn sniff per row, could only answer false. TPC-DS
 	// Q59's seven char(9) `d_day_name = 'Sunday'` arms paid it per row.
 	if op.IsComparison() && left.Kind == KindString && right.Kind == KindString {
-		if ls, rs := left.StringValue(), right.StringValue(); plainCompareString(ls) && plainCompareString(rs) {
+		if ls, rs := stringValueInline(&left), stringValueInline(&right); plainCompareString(ls) && plainCompareString(rs) {
 			// comparisonOperandsAsBpchar's rule on the strings themselves:
 			// with either side bpchar-typed, a bpchar side or a bare
 			// literal drops its trailing blanks.
@@ -893,11 +936,34 @@ func fastBinarySimple(n *ExprNode, op parser.OpCode, left, right *Datum) bool {
 // isValidUUIDStr accepts only 32, 36 or 38 bytes, and the row / array
 // comparisons need a leading '(' or '{'. Trimming trailing blanks (the bpchar
 // normalisation) cannot make a plain string unplain.
+//
+// The '/' test is a byte loop, not strings.IndexByte: the string is under 32
+// bytes here, and the call into IndexByte's vector routine cost more than the
+// scan — 26 % of TPC-DS Q81, whose correlated subplan compares two-letter
+// state codes per inner row (M0122-0012 slice 90). The loop lets the function
+// inline.
 func plainCompareString(s string) bool {
-	if len(s) >= 32 || strings.IndexByte(s, '/') >= 0 {
+	if len(s) >= 32 || (len(s) > 0 && (s[0] == '(' || s[0] == '{')) {
 		return false
 	}
-	return len(s) == 0 || (s[0] != '(' && s[0] != '{')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			return false
+		}
+	}
+	return true
+}
+
+// stringValueInline is d.StringValue() with the owned-buffer arm inlined
+// at the caller: StringValue's arena arm puts it over the inlining budget, and
+// the plain-string compares call it twice per comparison (M0122-0012
+// slice 90). An arena-backed string takes StringValue itself.
+func stringValueInline(d *Datum) string {
+	if d.ArenaID != 0 {
+		return d.StringValue()
+	}
+	// unsafe.String(nil, 0) is "", StringValue's answer for an empty Buf.
+	return unsafe.String(unsafe.SliceData(d.Buf), len(d.Buf))
 }
 
 // fastCompareDatum is compareDatum for the kind pairs whose ordering is a
@@ -912,6 +978,19 @@ func plainCompareString(s string) bool {
 //     calls it.
 func fastCompareDatum(a, b *Datum) (int, bool) {
 	if a.Kind != b.Kind {
+		// numeric / int on the int64 lane: compareDatum's NUMERIC ↔ INT arm
+		// (promoteCrossKind leaves the pair alone, the int becomes
+		// numericFromInt, numericCmp compares) — TPC-DS Q28's
+		// `ss_list_price BETWEEN 107 AND 117` compared through evalBinary
+		// per row (M0122-0012 slice 84).
+		switch {
+		case a.Kind == KindNumeric && b.Kind == KindInt && !isBigNumeric(*a):
+			c, err := numericCmp(*a, numericFromInt(b.Int))
+			return c, err == nil
+		case a.Kind == KindInt && b.Kind == KindNumeric && !isBigNumeric(*b):
+			c, err := numericCmp(numericFromInt(a.Int), *b)
+			return c, err == nil
+		}
 		return 0, false
 	}
 	switch a.Kind {

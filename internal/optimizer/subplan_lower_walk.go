@@ -186,6 +186,19 @@ func lowerTraverseNodeHooked(n Node, fx lowerExprFn, hook lowerNodeHook) bool {
 			return false
 		}
 		return lowerTraverseNodeHooked(x.Child, fx, hook)
+	case *CTEScan:
+		// A CTE scan reads the CTE's rows; its body (Child) is the plan
+		// every reference to the CTE shares — and the executor evaluates
+		// it once into the CTE row cache — so the walk never enters it: a
+		// rewrite there would rewrite every reference. The scan is a leaf
+		// when the body refers to nothing outside itself
+		// (selfContainedPlan from no enclosing frame), and no kind the
+		// walk does not model (which bails, as everywhere). TPC-DS Q1, Q30 and Q81
+		// filter a CTE scan by `ctr1.k = ctr2.k` inside a scalar sublink,
+		// and the CTE scan kept the sublink unlowered: its result cache was
+		// keyed by the whole outer row and missed on every call
+		// (M0122-0012 slice 91).
+		return selfContainedPlan(x.Child, 0)
 	}
 	// Unmodelled node kind (WindowAgg, SRFs, CTE machinery, SetOp, ...):
 	// bail — the sublink stays on the stack path.

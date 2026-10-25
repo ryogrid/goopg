@@ -370,6 +370,7 @@ var exprSwitchInventory = map[string]walkerRole{
 	"subplan_lower.go:excludedRefsWithin":        walkerPending, // 6 of 32 arms
 	"subplan_lower.go:handleFor":                 nonRecursiveClassifier,
 	"subplan_lower.go:rewriteSublinkPlan":        walkerPending, // 6 of 32 arms
+	"subplan_lower.go:selfContainedPlan":       walkerPending, // 7 of 32 arms — M0122-0012 slice 91, excludedRefsWithin's sibling
 	// R33 (K44): the sublink-graft classifiers — decide-and-return over
 	// the five/six sublink shapes, no descent (descent rides
 	// exprChildSlots via spliceField). Classifier role needs no
@@ -381,8 +382,6 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:canUnnestExistsExpr":              walkerPending, // 5 of 32 arms
 	"unnest.go:cloneExprLeaf":                    walkerPending, // 14 of 32 arms
 	"unnest.go:cloneExprReplacingOuter":          walkerPending, // 11 of 32 arms
-	"unnest.go:cloneExprSubstituteAggIdx0":       walkerPending, // 7 of 32 arms
-	"unnest.go:containsExpr":                     walkerPending, // 5 of 32 arms
 	"unnest.go:countSublinksInExpr":              nonRecursiveClassifier,
 	// deepVisitSublinkChildren descends through walkExprTreeDeep, which is a
 	// PLAN walker with no Expr switch of its own, so the census's mutual-
@@ -391,14 +390,9 @@ var exprSwitchInventory = map[string]walkerRole{
 	"unnest.go:findExistsExprInExpr":            walkerPending, // 5 of 32 arms
 	"unnest.go:findExprInExpr":                  walkerPending, // 3 of 32 arms
 	"unnest.go:findInExprInExpr":                walkerPending, // 5 of 32 arms
-	"unnest.go:findSubqueryInExpr":              walkerPending, // 5 of 32 arms
 	"unnest.go:liftResidualConjunctsWithOffset": walkerPending, // 5 of 32 arms
-	"unnest.go:nullPreservingScalarTarget":      walkerPending, // 9 of 32 arms
 	"unnest.go:planCloneSupported":              walkerPending, // 5 of 32 arms
-	"unnest.go:replaceExprInConjunct":           walkerPending, // 5 of 32 arms
 	"unnest.go:residualExprLiftable":            walkerPending, // 12 of 32 arms
-	"unnest.go:shiftExprColumnIdx":              walkerPending, // 5 of 32 arms
-	"unnest.go:subqueryANDReachable":            walkerPending, // 2 of 32 arms
 	"unnest.go:walkExprTree":                    walkerPending, // 8 of 32 arms
 	"unnest.go:walkSubqueryPlansInExpr":         walkerPending, // 9 of 32 arms
 	// Added by M0146-0005ax. A per-node whitelist evaluated inside

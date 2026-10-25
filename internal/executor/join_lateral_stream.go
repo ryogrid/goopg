@@ -214,13 +214,17 @@ func (m *lateralJoinStream) stepOuter() (Row, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	row := slotRow(slot)
 	// The outer tuple stays in scope for the whole right-side re-execution, so
-	// it must survive the left child's next step.
-	if rowHasArena(row) && !m.o.nlOuterBorrowed {
-		m.outerRow = cloneRowOwned(row)
-	} else {
-		m.outerRow = append(m.outerRow[:0], row...)
+	// it must survive the left child's next step: its cells are copied into
+	// the stream's own buffer, and arena-backed ones detached there. The
+	// cells are read straight from the slot — slotRow materialised a join's
+	// VirtualSlot into a fresh row only to copy it again, one allocation per
+	// outer row (M0122-0012 slice 82; TPC-DS Q23's 414 k item_pkey probes).
+	m.outerRow = appendSlotCells(m.outerRow[:0], slot)
+	if !m.o.nlOuterBorrowed && rowHasArena(m.outerRow) {
+		for i := range m.outerRow {
+			m.outerRow[i] = m.outerRow[i].MaterializeArena()
+		}
 	}
 	m.outerMatched = false
 	// Per-outer-tuple CTE cache: a LATERAL CTE whose body reads the outer row
