@@ -2180,8 +2180,8 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
 	// the equi-join predicate matches a single-column B-tree index
 	// on the inner side AND the cost gate accepts. The pass is a
-	// no-op when the package-level kill-switch is off
-	// (`SetNLIEnabled(false)`).
+	// no-op when the statement's goopg.enable_nestloop_index is off
+	// (`PlannerSettings.EnableNestLoopIndex`).
 	node = rewriteJoinsToNLI(node, cat, plannerSet)
 	// R77: price the rewrite-built SEMI/ANTI NLIs BEFORE the upper
 	// elections (aggregate stage, ORDER BY arm) read their seeds —

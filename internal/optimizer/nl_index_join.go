@@ -25,7 +25,7 @@ package optimizer
 // resolves the column reference against the row that the parent
 // `nestedLoopIndexJoinOp` binds before each `Rescan` (M0054-0006a).
 //
-// The rule has a kill-switch: when the GUC `enable_nestloop_index`
+// The rule has a kill-switch: when the GUC `goopg.enable_nestloop_index`
 // is `off`, the walk is a no-op. Per the M0054 no-deferral clause
 // this provides the rollback path.
 
@@ -38,17 +38,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// nliEnabled is the package-level kill-switch the M0054-0006
-// rollback path uses. Initialised to "on" (1). Tests toggle it via
-// `SetNLIEnabled(false)`. The corresponding `enable_nestloop_index`
-// GUC is registered in `internal/config/defaults.go`; runtime SET
-// to consult this flag is plumbed through the dispatch path in a
-// follow-up (M0054-0006e-followup) so the present land has a
-// programmatic kill-switch but not a SQL-driven one.
-var nliEnabled atomic.Bool
-
 func init() {
-	nliEnabled.Store(true)
 	// D6.3a escape hatch: GOOPG_NLI_COSTGATE=legacy restores the
 	// stats-blind semi/anti gate for one stage (deleted in R2-8 if
 	// unused).
@@ -60,17 +50,6 @@ func init() {
 // boolean kill switches this one is a MODE — the label spells `legacy` or
 // `current`, not on/off.
 func nliCostGateLegacyFromEnv(v string) bool { return v == "legacy" }
-
-// SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
-// only API; the production toggle path is the GUC mentioned above.
-// NLIEnabled reports the process-wide enable_nestloop_index SEED — the value a
-// planner call with no session defaults to (take2 P2-02c), not what a session's
-// SET reads.
-func NLIEnabled() bool { return nliEnabled.Load() }
-
-func SetNLIEnabled(on bool) {
-	nliEnabled.Store(on)
-}
 
 // nliMaxOuterRowsHeuristic is the row-count threshold above which
 // NLI is rejected unless cost-aware statistics say otherwise. The
@@ -84,8 +63,8 @@ const nliMaxOuterRowsHeuristic int64 = 100000
 // `*Join` nodes to `*NestedLoopIndexJoin`. Mutates in place; the
 // returned root is the same node (or a substitute when the root
 // itself is rewritten). Catalog is needed to look up indexes.
-// The package-level kill-switch `nliEnabled` short-circuits the
-// walk when off.
+// `PlannerSettings.EnableNestLoopIndex` (the per-statement
+// `goopg.enable_nestloop_index`) short-circuits the walk when off.
 func rewriteJoinsToNLI(n Node, cat catalog.Catalog, ps PlannerSettings) Node {
 	if n == nil || cat == nil {
 		return n
@@ -1396,7 +1375,7 @@ func otherChild(j *Join, innerScan *SeqScan) Node {
 var nliCostGateLegacy atomic.Bool
 
 // SetNLICostGateLegacy toggles the legacy (stats-blind) cost gate for
-// semi/anti NLI decisions. Test hook, mirroring SetNLIEnabled.
+// semi/anti NLI decisions. Test hook.
 func SetNLICostGateLegacy(on bool) { nliCostGateLegacy.Store(on) }
 
 // nliCostGateAccepts returns true when the cost model finds NLI

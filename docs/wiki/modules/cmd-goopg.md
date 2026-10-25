@@ -132,7 +132,6 @@ func (sc *standbyController) promoteSignalWatcher(ctx context.Context)
 flowchart TD
     A[runStart] --> B[Env tuning]
     B --> B1[GOOPG_MUTEX_PROFILE_RATE / GOOPG_BLOCK_PROFILE_RATE]
-    B --> B2[GOOPG_DISABLE_NLI → optimizer.SetNLIEnabled false]
     B --> B3["GOGC=200 default; GOMEMLIMIT passthrough"]
     B --> C[pprof on 127.0.0.1:6060 / GOOPG_PPROF_ADDR]
     C --> D[signal.NotifyContext SIGINT/SIGTERM]
@@ -444,7 +443,6 @@ with IMMEDIATE speed, writes the checkpoint record to WAL, and responds with
 |---|---|
 | `GOOPG_MUTEX_PROFILE_RATE` | Enable pprof mutex sampling (1 = every contention event) |
 | `GOOPG_BLOCK_PROFILE_RATE` | Enable pprof block sampling |
-| `GOOPG_DISABLE_NLI` | `1`/`true` disables the nestloop-index-join promotion |
 | `GOOPG_PPROF_ADDR` | Override pprof listen address (default `127.0.0.1:6060`) |
 | `GOOPG_LOG_STATEMENT` | Per-statement query logging (`none`/`ddl`/`mod`/`all`) |
 | `GOGC` | GC target (default 200 when unset) |

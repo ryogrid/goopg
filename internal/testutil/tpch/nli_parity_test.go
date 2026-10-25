@@ -2,20 +2,26 @@ package tpch_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
 
 // TestNLIResultParityVsHashJoin (M0054-0006d) spins up a real
 // goopg cluster, builds a small two-table fixture, and runs the
-// same equi-join twice — once with NLI enabled (planner default)
-// and once with the kill-switch off (HashJoin path). The result
-// rows must match exactly, both content and ordering after a
-// stable ORDER BY.
+// same equi-join twice — once on the planner default (a Hash Join
+// on fixtures this small) and once with hash and merge join and seq
+// scans switched off by PG's own planner GUCs, which forces a nested
+// loop over the index. The result rows must match exactly, both
+// content and ordering after a stable ORDER BY.
+//
+// M0147-0017 rebased the arms. They used to toggle
+// optimizer.SetNLIEnabled in the TEST process, which never reached
+// the cluster's separate server process, so both arms ran the same
+// plan. requireArmsPlanDifferently now guards that.
 func TestNLIResultParityVsHashJoin(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping cluster-backed NLI parity in short mode")
@@ -62,21 +68,18 @@ func TestNLIResultParityVsHashJoin(t *testing.T) {
 
 	const q = `SELECT k, payload FROM small, indexed WHERE k = id ORDER BY k, payload`
 
-	// First run with NLI on (default).
-	optimizer.SetNLIEnabled(true)
-	defer optimizer.SetNLIEnabled(true)
-	rowsNLI, err := c.Query(ctx, q)
-	if err != nil {
-		t.Fatalf("query (NLI on): %v", err)
-	}
-
-	// Then run with NLI off — Hash join path.
-	optimizer.SetNLIEnabled(false)
+	// Planner default: the Hash Join path.
 	rowsHash, err := c.Query(ctx, q)
 	if err != nil {
-		t.Fatalf("query (NLI off): %v", err)
+		t.Fatalf("query (default): %v", err)
 	}
-	optimizer.SetNLIEnabled(true)
+
+	// Forced nested loop over the index.
+	requireArmsPlanDifferently(ctx, t, c, q)
+	rowsNLI, err := c.QueryWithOptions(ctx, forceIndexNestLoop, q)
+	if err != nil {
+		t.Fatalf("query (forced nested loop): %v", err)
+	}
 
 	if len(rowsNLI) != len(rowsHash) {
 		t.Fatalf("row count differs: NLI=%d Hash=%d", len(rowsNLI), len(rowsHash))
@@ -101,8 +104,9 @@ func TestNLIResultParityVsHashJoin(t *testing.T) {
 
 // TestNLIResultParityCompositeKey (M0054-0006-followup-Q9-
 // composite) drives a Q9-shaped two-equi-conjunct join across a
-// composite-key B-tree index, asserting NLI-on and NLI-off
-// produce identical row sets. This is the cluster-backed
+// composite-key B-tree index, asserting the default plan and the
+// forced index nested loop (forceIndexNestLoop) produce identical
+// row sets. This is the cluster-backed
 // regression test for the run-012 attempt #1 failure
 // `column "ps_suppkey" is not numeric at runtime`.
 func TestNLIResultParityCompositeKey(t *testing.T) {
@@ -157,19 +161,16 @@ func TestNLIResultParityCompositeKey(t *testing.T) {
 		WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
 		ORDER BY l_partkey, l_suppkey`
 
-	optimizer.SetNLIEnabled(true)
-	defer optimizer.SetNLIEnabled(true)
-	rowsNLI, err := c.Query(ctx, q)
-	if err != nil {
-		t.Fatalf("query (NLI on, composite key): %v", err)
-	}
-
-	optimizer.SetNLIEnabled(false)
 	rowsHash, err := c.Query(ctx, q)
 	if err != nil {
-		t.Fatalf("query (NLI off, composite key): %v", err)
+		t.Fatalf("query (default, composite key): %v", err)
 	}
-	optimizer.SetNLIEnabled(true)
+
+	requireArmsPlanDifferently(ctx, t, c, q)
+	rowsNLI, err := c.QueryWithOptions(ctx, forceIndexNestLoop, q)
+	if err != nil {
+		t.Fatalf("query (forced nested loop, composite key): %v", err)
+	}
 
 	if len(rowsNLI) != len(rowsHash) {
 		t.Fatalf("row count differs: NLI=%d Hash=%d", len(rowsNLI), len(rowsHash))
@@ -190,5 +191,29 @@ func TestNLIResultParityCompositeKey(t *testing.T) {
 	// (1,1), (1,2), (2,1), (3,1), (3,3), (4,2), (5,5) → 7 rows.
 	if got := len(rowsNLI); got != 7 {
 		t.Errorf("expected 7 matched composite-key rows, got %d", got)
+	}
+}
+
+// forceIndexNestLoop takes hash join, merge join and seq scans off the table
+// with PG's own planner switches (guc_tables.c enable_*), so the join runs as a
+// nested loop that reads the indexed side through its index.
+const forceIndexNestLoop = "-c enable_hashjoin=off -c enable_mergejoin=off -c enable_seqscan=off"
+
+// requireArmsPlanDifferently proves the two arms ran different plans: the
+// EXPLAIN text must differ between the default and the forceIndexNestLoop
+// connection. Without it a parity test whose switch silently stopped reaching
+// the server would still pass.
+func requireArmsPlanDifferently(ctx context.Context, t *testing.T, c *cluster.Cluster, q string) {
+	t.Helper()
+	def, err := c.Query(ctx, "EXPLAIN "+q)
+	if err != nil {
+		t.Fatalf("EXPLAIN (default): %v", err)
+	}
+	forced, err := c.QueryWithOptions(ctx, forceIndexNestLoop, "EXPLAIN "+q)
+	if err != nil {
+		t.Fatalf("EXPLAIN (forced nested loop): %v", err)
+	}
+	if fmt.Sprint(def) == fmt.Sprint(forced) {
+		t.Fatalf("forcing the nested loop did not change the plan:\n%v", def)
 	}
 }

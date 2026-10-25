@@ -4967,6 +4967,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `51326adf2`** \(M0147\-0015 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `f5efcefdf`** \(M0147\-0016 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7488,9 +7491,25 @@ Basis: the 2026-10-21 lever census and its review
     `scripts/tpch-relsize-arm.sh:186` arm that still drives it, the uncalled `envFloatDefault` (cost_funcs.go:14);
     stale comments relsize.go:55-61/:166, flaglabels.go:142/:162 (PG_SORT_RELATION_BYTES_COST and
     INCREMENTAL_SORT are default ON), and the stale "default-OFF" GATHER_PATHS text in the M0140 section.
-- [ ] **M0147-0017 — retire `GOOPG_DISABLE_NLI` (the M0054-0006 nested-loop-index rollback switch)**
+- [x] **M0147-0017 — retire `GOOPG_DISABLE_NLI` (the M0054-0006 nested-loop-index rollback switch)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 24→23 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Env read in cmd/goopg/main\.go deleted; the setter went
+    too — no PG\-equivalent concern, because the GUC route `goopg.enable_nestloop_index` \(PlannerSettings\) already
+    exists: `nliEnabled`, `SetNLIEnabled`, `NLIEnabled` deleted and DefaultPlannerSettings seeds `true`\.
+  - Tests: TestNLIRuleRespectsKillSwitch now plans with `PlannerSettings\.EnableNestLoopIndex=false`\. The two
+    cluster\-backed parity tests in internal/testutil/tpch were VACUOUS — their off arm called SetNLIEnabled in the test
+    process, which the cluster's server subprocess never saw, and on 5\-row fixtures the default plan is a Hash Join
+    anyway\. They now compare the default plan with a nested loop forced by PG's `enable\_hashjoin/enable\_mergejoin/
+    enable\_seqscan=off` \(new `cluster\.QueryWithOptions`, startup `options`\) and assert the two EXPLAINs differ\.
+  - Finding \(ledger row; M0147\-0030 note\): with those switches off, `goopg\.enable\_nestloop\_index=off` still did not
+    change the plan — the legacy post\-search rewriteJoinsToNLI pass did not fire\.
+  - Wiki cmd\-goopg\.md env table / flow updated\. Design doc
+    `docs/design/0100\-0149/m0147\-0017\-retire\-disable\-nli\.md` \(C6\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    on SF0\.25 and SF1\), TPC\-H census on tree 22/22, RegressSuite, Isolation, the two rebased cluster parity tests
+    PASS \(go test \-run TestNLIResultParity ./internal/testutil/tpch/\)\.
   - cmd/goopg/main.go:299 and the `SetNLIEnabled` plumbing the switch reaches; keep the setter only if tests use it
     to isolate a path and no PG-equivalent switch exists (`goopg.enable_nestloop_index` is the GUC route).
 - [ ] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
@@ -7529,3 +7548,6 @@ Basis: the 2026-10-21 lever census and its review
     tests rebase onto a PG oracle expectation or PG's own switch (e.g. `max_parallel_workers_per_gather=0`
     instead of `GATHER_PATHS=off`; AGENT.md C4 amended 2026-10-21) before the arm goes.
   - Files one impl child per lever (M0147-0031…, `Parent: M0147-0000`), lowest risk first; done when they exist.
+  - Add to the inventory \(M0147\-0017 finding, 2026\-10\-26\): `goopg.enable_nestloop_index` and the post\-search
+    `rewriteJoinsToNLI` pass it gates — on a forced nested\-loop fixture the pass did not fire \(the search built the
+    join\); measure its reachability with a census under `PGOPTIONS='\-c goopg.enable_nestloop_index=off'` first\.

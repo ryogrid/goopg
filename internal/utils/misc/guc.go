@@ -590,7 +590,7 @@ func NewRegistry() *Registry {
 // session successfully `SET`s the named variable (case-insensitive).
 // The callback receives the canonicalised value AFTER the session
 // layer is updated. Use cases: bridging SQL-level toggles to
-// package-level atomic flags such as `planner.SetNLIEnabled`. Only
+// package-level atomic flags. Only
 // one callback per name is supported; a second registration replaces
 // the first. (M0054-0006e-followup.)
 func (r *Registry) OnChange(name string, fn func(value string)) {

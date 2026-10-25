@@ -33,9 +33,11 @@ func TestNLIRuleSkipsWhenInnerHasNoIndex(t *testing.T) {
 	}
 }
 
-// TestNLIRuleRespectsKillSwitch confirms `SetNLIEnabled(false)`
-// short-circuits the rewrite — the rollback path described in the
-// M0054-0006e design.
+// TestNLIRuleRespectsKillSwitch confirms that
+// `PlannerSettings.EnableNestLoopIndex = false` — the per-statement input
+// `goopg.enable_nestloop_index` feeds (take2 P2-02c) — short-circuits the
+// rewrite. Until M0147-0017 it flipped the process-wide SetNLIEnabled seed,
+// which only the retired GOOPG_DISABLE_NLI env switch set in production.
 func TestNLIRuleRespectsKillSwitch(t *testing.T) {
 	cat := catalog.NewInMemory()
 	parts, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
@@ -56,9 +58,9 @@ func TestNLIRuleRespectsKillSwitch(t *testing.T) {
 	}
 	stmt := parseOne(t, `SELECT * FROM lineitem, part WHERE l_partkey = p_partkey`)
 
-	SetNLIEnabled(false)
-	defer SetNLIEnabled(true)
-	node, err := Plan(stmt, cat)
+	ps := DefaultPlannerSettings()
+	ps.EnableNestLoopIndex = false
+	node, err := PlanWithSettings(stmt, cat, ps)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

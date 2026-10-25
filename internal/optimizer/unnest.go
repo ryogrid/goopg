@@ -45,7 +45,7 @@ func init() {
 func indexKeyHarvestFromEnv(v string) bool { return v != "off" }
 
 // SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
-// Test-only API, mirroring SetNLIEnabled: there is deliberately no
+// Test-only API: there is deliberately no
 // `enable_subquery_unnest` GUC, because unlike a plan-shape toggle this
 // switch also changes which correctness bugs are reachable, and a SQL
 // surface would invite it into production configs.

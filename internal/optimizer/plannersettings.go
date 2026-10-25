@@ -266,7 +266,7 @@ func DefaultPlannerSettings() PlannerSettings {
 
 		EnableHashAgg:            HashAggEnabled(),
 		EnablePresortedAggregate: PresortedAggEnabled(),
-		EnableNestLoopIndex:      NLIEnabled(),
+		EnableNestLoopIndex:      true,
 		Geqo:                     GeqoEnabled(),
 		GeqoEffort:               5,   // DEFAULT_GEQO_EFFORT
 		GeqoPoolSize:             0,   // 0 = derive from effort

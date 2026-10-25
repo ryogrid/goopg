@@ -692,11 +692,23 @@ func (s *BackgroundPSQL) Stop() error {
 // Query executes SQL using Go's lib/pq database/sql client and returns rows as
 // text values.
 func (c *Cluster) Query(ctx context.Context, sqlText string) ([][]string, error) {
+	return c.QueryWithOptions(ctx, "", sqlText)
+}
+
+// QueryWithOptions is Query on a connection whose startup packet carries
+// `options` (PGOPTIONS syntax, e.g. "-c goopg.enable_nestloop_index=off"), so a
+// session GUC applies to the statement even though every call opens a fresh
+// connection. The server runs in a separate process, so this — not a planner
+// package setter in the test process — is how a test reaches its settings.
+func (c *Cluster) QueryWithOptions(ctx context.Context, options, sqlText string) ([][]string, error) {
 	host, port, err := splitHostPort(c.listenAddr)
 	if err != nil {
 		return nil, err
 	}
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable", host, port, c.user, c.database)
+	if options != "" {
+		dsn += " options='" + strings.ReplaceAll(options, "'", `\'`) + "'"
+	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, err
