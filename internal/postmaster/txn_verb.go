@@ -502,7 +502,6 @@ func (s *Server) applyTransactionVerb(ctx *executor.Context, connTx *connTxState
 			// deliverNotifications. M0118-0009 (async-notify).
 			s.publishPendingNotify(connTx)
 			s.endExplicitBlock(ctx, connTx, false)
-			maybeForceGCAfterCommit()
 			// Leave *autoCommitPtr = false so the caller does NOT attempt
 			// a second TxnMgr.Commit on the already-committed transaction.
 			return txnVerbOutcome{Handled: true, Tag: transactionTag(txNode.Verb)}

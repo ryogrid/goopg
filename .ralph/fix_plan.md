@@ -4959,6 +4959,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     `1a41444e5` is analysis\-only\)\. Census `analysis/m0146/m0146\-0014/routing\-20261025a/`: TPC\-H 22/22, TPC\-DS
     SF0\.25 99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\.
     Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-25 — **exhausted at `033b6c14d`** \(M0147\-0014 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261025b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7443,9 +7446,20 @@ Basis: the 2026-10-21 lever census and its review
   - joincost.go:52; keep `costInnerHash`/`costInnerMerge` (default `chooseInnerJoinAlgo`). Neither arm is PG: the
     post-search `chooseInner/OuterFillJoinAlgo` assignment (planner.go:4873-4887) is goopg-private — list it in
     M0147-0030's phase-2 inventory.
-- [ ] **M0147-0015 — retire `GOOPG_FORCED_GC`**
+- [x] **M0147-0015 — retire `GOOPG_FORCED_GC`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 26→25 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. The switch, `maybeForceGCAfterCommit` and its counters
+    deleted from dispatch\.go; its 4 call sites \(dispatch\.go autocommit, copy\.go ×2, txn\_verb\.go\) gone;
+    `\(\*Context\)\.DidWrite` deleted \(its only caller was the GC guard; deadcode does not flag exported methods, so
+    `git grep` confirmed\)\. forced\_gc\_flag\_test\.go and didwrite\_test\.go deleted\. Not a planner flag \(no
+    flaglabels row\); fire\-set out of scope \(fireset\-scope\.sh rc=1\)\. postmaster wiki updated\. Design doc
+    `docs/design/0100\-0149/m0147\-0015\-retire\-forced\-gc\.md` \(C6\)\. No ledger row named the lever\.
+  - Gates: `go test ./internal/postmaster/` PASS \(first run: `TestExplainSplitAggregateChainCosts` i/o timeout on its
+    2 s frame deadline during a 600k\-row INSERT under package\-parallel load; passes alone and on the full rerun\),
+    units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck; plans standalone same=99\), TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - postmaster/dispatch.go `maybeForceGCAfterCommit` and forced_gc_flag_test.go; run `go test ./internal/postmaster/`
     yourself (the units gate excludes it).
 - [ ] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
