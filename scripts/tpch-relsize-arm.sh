@@ -3,20 +3,18 @@
 # tpch-relsize-arm.sh — one arm of M0125-0003's four-arm TPC-H measurement,
 # run through the per-query-isolated harness design §D7 mandates.
 #
-#   arm | ANALYZE | GOOPG_RELSIZE_FALLBACK | what it measures
-#   ----+---------+-----------------------+---------------------------------
-#   c1  | no      | 0                     | pre-M0125-0003 S-cold: RowCount=0, DP seed 1
-#   c2  | no      | 2                     | the change — the only interesting cell
-#   w1  | yes     | 0                     | control; the regime every published number is in
-#   w2  | yes     | 2                     | must equal w1 exactly — design §D3's invariant
+#   arm  | ANALYZE | what it measures
+#   -----+---------+-----------------------------------------------------------
+#   cold | no      | S-cold: RowCount=0, the block-count fallback sizes every rel
+#   warm | yes     | control; must not read the fallback (design §D3's invariant)
 #
-# The flag values are set EXPLICITLY, never left unset (M0125-0031, 2026-07-30).
-# Until M0125-0005 (`d4071df4`) an unset GOOPG_RELSIZE_FALLBACK meant stage 0, so
-# the 2026-07-30 c1 arm's "(unset)" and an explicit "0" are the same measurement;
-# after the flip an unset variable means stage 2, which would have silently turned
-# c1 into a second c2 and w1 into a second w2. Explicit values keep every arm
-# well-defined across future default changes — the arm is the independent variable, not
-# the default.
+# History. The four-arm design crossed ANALYZE with GOOPG_RELSIZE_FALLBACK
+# (c1/w1 = stage 0, c2/w2 = stage 2). take2 P1-05 made the fallback
+# unconditional, so the flag stopped changing anything: c1 measured c2 and w1
+# measured w2. M0147-0016 deleted the dead env read and this script's flag
+# column; `c2`/`w2` stay accepted as aliases of `cold`/`warm` so older artefact
+# recipes still run, and `c1`/`w1` are refused — the pre-fallback planner they
+# selected no longer exists.
 #
 # WHY NOT the ordinary power test (bench/tpch/run_power_test_goopg.sh):
 #
@@ -24,26 +22,21 @@
 #     against ONE long-lived server. Round-5 §6 measured a mis-ordered star
 #     query that did NOT honour cancellation, with the server pinned at ~10 GB
 #     RSS; in a shared session that wedges the host instead of reporting a
-#     regression. Arm c2 is exactly the arm expected to produce such plans, so
+#     regression. The cold arm is exactly the arm expected to produce such plans, so
 #     the isolation is not optional here.
 #  2. Server age is a confound of its own (CLAUDE.md "sweep-tail collapse"): a
 #     server that just ran a timeout query sits at GOMEMLIMIT with GOGC=off and
 #     thrashes GC, which mimics a regression in every later query. A restart per
 #     query holds server age constant across queries AND across arms.
-#  3. GOOPG_RELSIZE_FALLBACK is read once, in the planner package's init() from
-#     the SERVER's environment (internal/planner/relsize.go:40). The arm can
-#     therefore only be selected at server start — there is no GUC to flip
-#     mid-session, so per-query restart is what makes the arm well-defined.
-#
 # The ONE deliberate divergence from round-5 §8's protocol (design §D7): its
 # "full server restart + re-ANALYZE between queries" keeps the re-ANALYZE, and
-# for the c1/c2 arms we must DROP it. ANALYZE pushes TableStats.RowCount above
+# for the cold arm we must DROP it. ANALYZE pushes TableStats.RowCount above
 # zero, and by design §D3's invariant the fallback then cannot fire at all —
-# a re-ANALYZEd "c2" arm measures nothing and reports it as safe.
+# a re-ANALYZEd "cold" arm measures nothing and reports it as safe.
 #
 # Usage:
-#   scripts/tpch-relsize-arm.sh c1
-#   QUERIES=1,5,9 PER_Q=180 scripts/tpch-relsize-arm.sh c2
+#   scripts/tpch-relsize-arm.sh cold
+#   QUERIES=1,5,9 PER_Q=180 scripts/tpch-relsize-arm.sh warm
 #   scripts/tpch-relsize-arm.sh probe-analyze     # is ANALYZE even reachable?
 #
 # Environment:
@@ -71,7 +64,7 @@ source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
 # shellcheck source=lib/tpch-private-clone.sh
 source "${REPO_ROOT}/scripts/lib/tpch-private-clone.sh"
 
-ARM="${1:?usage: $0 <c1|c2|w1|w2|probe-analyze>}"
+ARM="${1:?usage: $0 <cold|warm|probe-analyze>}"
 
 PG_PREFIX="${REPO_ROOT}/postgres/local_install"
 export LD_LIBRARY_PATH="${PG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -97,15 +90,14 @@ PER_Q="${PER_Q:-300}"
 QUERIES="${QUERIES:-1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22}"
 OUTDIR="${OUTDIR:-${REPO_ROOT}/analysis/tpch-relsize-fallback-$(date +%Y%m%d)}"
 
-# Arm -> (flag, analyze). An unknown arm must not silently become c1.
-ARM_FLAG=""; ARM_ANALYZE=0
+# Arm -> analyze. An unknown arm is refused, never defaulted.
+ARM_ANALYZE=0
 case "${ARM}" in
-    c1)            ARM_FLAG="0"; ARM_ANALYZE=0 ;;
-    c2)            ARM_FLAG="2"; ARM_ANALYZE=0 ;;
-    w1)            ARM_FLAG="0"; ARM_ANALYZE=1 ;;
-    w2)            ARM_FLAG="2"; ARM_ANALYZE=1 ;;
+    cold|c2)       ARM_ANALYZE=0 ;;
+    warm|w2)       ARM_ANALYZE=1 ;;
+    c1|w1) echo "arm '${ARM}' selected GOOPG_RELSIZE_FALLBACK=0, which no longer exists (take2 P1-05, M0147-0016); use cold|warm" >&2; exit 2 ;;
     probe-analyze) ;;
-    *) echo "unknown arm '${ARM}' (want c1|c2|w1|w2|probe-analyze)" >&2; exit 2 ;;
+    *) echo "unknown arm '${ARM}' (want cold|warm|probe-analyze)" >&2; exit 2 ;;
 esac
 
 mkdir -p "${OUTDIR}" "${REPO_ROOT}/tmp"
@@ -183,7 +175,6 @@ start_server_once() {
     GOOPG_CG_UNIT="${CG_UNIT}" GOOPG_MEM_HIGH=13G GOOPG_MEM_MAX=15G \
     GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=12GiB GOGC=100 \
     GOOPG_PPROF_ADDR="${PPROF_ADDR}" \
-    GOOPG_RELSIZE_FALLBACK="${ARM_FLAG}" \
         "${REPO_ROOT}/scripts/goopg-test-run.sh" \
         "${GOOPG_BIN}" start -D "${PGDATA}" \
         --listen "${PG_HOST}:${PG_PORT}" \
@@ -307,7 +298,7 @@ fi
 
 # --- the arm ---------------------------------------------------------------
 {
-    echo "# arm: ${ARM}  (GOOPG_RELSIZE_FALLBACK='${ARM_FLAG:-unset}'  analyze=${ARM_ANALYZE})"
+    echo "# arm: ${ARM}  (analyze=${ARM_ANALYZE})"
     echo "# started: $(date -Is)"
     echo "# engine-id: $(bench_engine_id)"
     echo "# engine-binary: on-disk=$(bench_engine_bin_sha "${GOOPG_BIN}") (${GOOPG_BIN#"${REPO_ROOT}/"})"
@@ -316,7 +307,7 @@ fi
     printf 'query\tsecs\trows\tstatus\tpeak_rss_kb\trunning_engine\n'
 } > "${TSV}"
 
-say "arm ${ARM}: flag='${ARM_FLAG:-unset}' queries=${QUERIES} per_q=${PER_Q}s -> ${TSV}"
+say "arm ${ARM}: analyze=${ARM_ANALYZE} queries=${QUERIES} per_q=${PER_Q}s -> ${TSV}"
 IFS=',' read -r -a QLIST <<< "${QUERIES}"
 arm_t0=${SECONDS}
 

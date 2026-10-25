@@ -103,8 +103,8 @@ var goopgEnvName = regexp.MustCompile(`^GOOPG_[A-Z0-9_]+$`)
 //
 // It walks the AST rather than matching `os.Getenv("GOOPG_…")` in raw text,
 // because the regex form had a hole that was silently exploited for an entire
-// milestone: GOOPG_INDEX_PROBE_MULT is read through the envFloatDefault helper
-// (cost_funcs.go), not a literal os.Getenv call, so the detector never saw it
+// milestone: GOOPG_INDEX_PROBE_MULT was read through the envFloatDefault helper
+// (cost_funcs.go, since deleted), not a literal os.Getenv call, so the detector never saw it
 // and the flag that multiplies every NL-index probe cost was absent from every
 // benchmark artefact this table exists to stamp. Any read path — direct,
 // helper-wrapped, or one this package has not invented yet — puts the name in a

@@ -135,8 +135,9 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST": func(v string) string {
 		return onOff(pgHashTupleSpillCostFromEnv(v))
 	},
-	// R113's experiment is default-off and changes only Sort's planner byte
-	// price, but artefacts must name its currency for a reproducible A/B.
+	// R113's Sort planner byte price (PG cost_sort's relation-bytes input).
+	// It shipped as a default-off experiment and is default ON today;
+	// artefacts must name its currency for a reproducible A/B.
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
@@ -155,8 +156,9 @@ var flagResolvedState = map[string]func(string) string{
 		return "current"
 	},
 	// M0141-S2b-2c / S7: gates addOrderedPaths' third arm (Incremental Sort
-	// over a losing search candidate). Default off — createPlanNode has no
-	// arm for PathIncrementalSort until the executor operator lands.
+	// over a losing search candidate). It shipped default off while
+	// createPlanNode had no PathIncrementalSort arm; default ON since the
+	// executor operator landed.
 	"GOOPG_INCREMENTAL_SORT": func(v string) string {
 		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
 	},
@@ -183,7 +185,7 @@ var flagProvenanceOrder = []string{
 	// Joined at planner-refactor-take2 P0-04c. It multiplies NL-index probe
 	// cost, so it moves the hash-vs-NL crossover on every join — and it had
 	// been readable, and absent from every artefact, since M0126. It escaped
-	// the completeness guard because it is read through envFloatDefault rather
+	// the completeness guard because it was read through envFloatDefault rather
 	// than a literal os.Getenv, which the old regex detector could not see.
 	// Retired at M0146-0159 — see flagProvenanceRetired.
 	"GOOPG_INDEX_PROBE_MULT",

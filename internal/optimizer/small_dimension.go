@@ -79,13 +79,12 @@ func smallDimensionTag(cat catalog.Catalog, tbl *catalog.Table) bool {
 // ANALYZE-derived count when this session has one, and otherwise the
 // block-count fallback (estimate_rel_size).
 //
-// The fallback is read UNGATED — deliberately not through
-// `relSizeFallbackRows`. GOOPG_RELSIZE_FALLBACK stages which *cost* consumers
-// trust a block-derived cardinality; turning it off must restore
-// pre-M0125-0003 plans, and pre-M0125-0003 plans had the small-dimension
-// property populated (by name) at every stage. Gating it here would make
-// `GOOPG_RELSIZE_FALLBACK=0` silently drop the build-side pinning that
-// M0054-0010 added, which is a different change than the knob promises.
+// The fallback is read directly rather than through `relSizeFallbackRows`.
+// That was deliberate while GOOPG_RELSIZE_FALLBACK staged which *cost*
+// consumers trusted a block-derived cardinality: turning the knob off must not
+// drop the build-side pinning M0054-0010 added. The knob is retired (take2
+// P1-05; the dead read went with M0147-0016), and both paths now read the same
+// estimate.
 func smallDimensionRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
 	if rows := tableRows(tbl); rows > 0 {
 		return rows

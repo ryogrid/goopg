@@ -2,23 +2,10 @@ package optimizer
 
 import (
 	"math"
-	"os"
-	"strconv"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
-
-// envFloatDefault reads a float from the environment, returning def when unset
-// or unparseable. Used for measurement-time cost-calibration overrides.
-func envFloatDefault(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return def
-}
 
 // Per-node cost functions, reproduced from PostgreSQL's costsize.c in PG's units
 // (seq_page_cost = 1.0). See docs/design/cost-model/ chapter 02. Phase C3.1:

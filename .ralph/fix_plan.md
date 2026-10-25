@@ -3392,6 +3392,8 @@ arm is dead solely because `GOOPG_GATHER_PATHS` is default-OFF), **K82** (Q14 is
 byte-identical under the flip, so the tracks are independent), **K92**
 (relabelling goopg's leader-prebuild as `Parallel Hash` would be a
 misdescription, i.e. the forcing the goal forbids).
+*Note 2026\-10\-26 \(M0147\-0016\): the "default\-OFF" above was true at filing; `GOOPG_GATHER_PATHS` is default
+`all` today \(`scripts/planner\-flags.env`: `unset\(all\)`\)\. K80's arm is live\.*
 
 Carry, do not rediscover: **K20** — `GOOPG_GATHER_PATHS` gates *partial paths
 only, not parallelism*; the post-pass emits a Gather regardless, so there is no
@@ -4961,6 +4963,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-25 — **exhausted at `033b6c14d`** \(M0147\-0014 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261025b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `51326adf2`** \(M0147\-0015 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
@@ -7462,9 +7467,22 @@ Basis: the 2026-10-21 lever census and its review
     22/22, RegressSuite, Isolation\.
   - postmaster/dispatch.go `maybeForceGCAfterCommit` and forced_gc_flag_test.go; run `go test ./internal/postmaster/`
     yourself (the units gate excludes it).
-- [ ] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
+- [x] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 25→24 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. relsize\.go: the never\-loaded stage var \(only
+    Store/Swap at HEAD\), init read, parseRelSizeFallbackStage, SetRelSizeFallbackStage deleted; cost\_funcs\.go
+    `envFloatDefault` deleted; knob\-is\-live comments fixed in small\_dimension\.go, plan\.go, cardinality\.go;
+    flaglabels\.go PG\_SORT\_RELATION\_BYTES\_COST / INCREMENTAL\_SORT comments now say default ON;
+    tpch\-relsize\-arm\.sh reduced to cold/warm \(c2/w2 aliases, c1/w1 refused\); M0140 K80 "default\-OFF" text
+    annotated\. Tests: TestParseRelSizeFallbackStage and TestSmallDimensionTagIgnoresRelSizeFallbackStage deleted,
+    stage loops/setters dropped\. deadcode diff: only the two deleted funcs left the list\. planner\-flags\.env
+    unchanged \(row already retired\)\. Design doc
+    `docs/design/0100\-0149/m0147\-0016\-retire\-relsize\-fallback\-read\.md` \(C6\); ledger resolution row\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on
+    tree 22/22, RegressSuite, Isolation, sf025 PASS=99 \(61 ck\) \+ plans standalone same=99 \(first attempt refused
+    with FATAL while the nightly batch ran — re\-run after it exited, never FORCE=1\)\.
   - relsize.go:69 (read, stored, never loaded; retired take2-P1-05), its setter and ~10 test call sites
     (relsize_fallback_test.go, small_dimension_test.go, relsize_baserel_placement_test.go), the
     `scripts/tpch-relsize-arm.sh:186` arm that still drives it, the uncalled `envFloatDefault` (cost_funcs.go:14);

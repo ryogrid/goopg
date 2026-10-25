@@ -782,12 +782,11 @@ func lateralNLIMatchFraction(j *Join) float64 {
 // ANALYZEd state") and is asserted by
 // TestRelSizeFallbackDoesNotFireWhenAnalyzed.
 //
-// EstRelRows is 0 whenever the fallback did not apply, so with the flag off
-// this reduces to tableRows and no caller can observe a difference. The
-// consumers that make this move plan SHAPE — the bushy DP seed and
-// estimateBaseRelInfo.baseRows — are stages 2 and 3 and read the flag
-// separately. (Its one remaining shape consumer, the MultiHashJoin probe-side
-// choice, went away with the node in M0127-P6.2.)
+// EstRelRows is 0 whenever the fallback did not apply, so this then reduces to
+// tableRows. The fallback's former stage flag (GOOPG_RELSIZE_FALLBACK) is
+// retired; the search's base-relation cardinality reads it through
+// applyRelSizeFallback (relsize.go). (Its one other shape consumer, the
+// MultiHashJoin probe-side choice, went away with the node in M0127-P6.2.)
 func seqScanRows(x *SeqScan) int64 {
 	if x == nil {
 		return 0

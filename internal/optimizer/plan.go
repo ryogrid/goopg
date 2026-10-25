@@ -756,8 +756,8 @@ type SeqScan struct {
 	TableSample *TableSampleSpec
 	// EstRelRows is the relation-size fallback's row estimate for Table,
 	// stamped once at plan-build time and 0 when it did not apply (the
-	// GOOPG_RELSIZE_FALLBACK flag is off, the relation is ANALYZEd, or no
-	// live block count was available). EstimateRows reads it only when
+	// relation is ANALYZEd, or no live block count was available).
+	// EstimateRows reads it only when
 	// TableStats.RowCount is absent.
 	//
 	// Stamped rather than computed on demand for two reasons. It mirrors
