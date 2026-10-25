@@ -4970,6 +4970,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `f5efcefdf`** \(M0147\-0016 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `9c3e12d47`** \(M0147\-0017 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7512,9 +7515,24 @@ Basis: the 2026-10-21 lever census and its review
     PASS \(go test \-run TestNLIResultParity ./internal/testutil/tpch/\)\.
   - cmd/goopg/main.go:299 and the `SetNLIEnabled` plumbing the switch reaches; keep the setter only if tests use it
     to isolate a path and no PG-equivalent switch exists (`goopg.enable_nestloop_index` is the GUC route).
-- [ ] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
+- [x] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 23→22 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. C6 trace \(`GOOPG\_PGSHAPED\_DP\_TRACE=1`
+    captures, `upper gate=sort` records\): the post\-pass IS reached — OFF 3 `sort\-rule` verdicts at SF0\.25, 2 at SF1;
+    ON worker 1 / serial 1 / declined 1 at SF0\.25, worker 1 / serial 1 at SF1\. ON captures: goopg plans byte\-identical
+    to the OFF census \(0 diff lines\), PLAN\-PARITY 99/99 both\. TPC\-H census lane is serial \(post\-pass unreachable\);
+    TPC\-H parallel values via the acceptance arm\.
+  - Deleted: mode type/consts/env read/resolver/label, both test setters, the mode\-off branch;
+    `sortPartialRootPays` KEPT as the no\-tournament fallback\. flaglabels → `retired\(M0147\-0020\)`, planner\-flags\.env
+    regenerated\. Tests: the fail\-closed resolver test and the off\-inertness test deleted; two tests drop their mode pins\.
+    deadcode diff: only the two setters left\. Design doc
+    `docs/design/0100\-0149/m0147\-0020\-promote\-partial\-sort\-paths\.md` \(C\-19e DESIGN\.md status line added\); ledger row
+    \(residual: PG decides in generate\_useful\_gather\_paths/create\_ordered\_paths; goopg in a post\-pass with default
+    cost params\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - First: trace whether the post-pass is still reached now that Gather comes from the search (C6 trace over the
     full corpus). Unreachable: delete both arms. Reached: flip ON, run the gates, then delete the OFF arm. Never
     delete the ON arm without an owner `[!]` (R3). Runtime is not a rejection reason (S9(5)(a)).

@@ -47,71 +47,17 @@ package optimizer
 // its own decide honestly — the same argument partialaggpaths.go §3.1 makes,
 // and the reason a `legacyDisplayCostOf` seed is adequate here.
 //
-// Ships behind `GOOPG_PARTIAL_SORT_PATHS`, default `off`, which delegates to
-// the retired rule unchanged — so the serial control arm and the default arm
-// are bit-identical to C-19g's behaviour, and the measurement decides the flip.
+// PROMOTED (M0147-0020, 2026-10-26). It shipped behind
+// `GOOPG_PARTIAL_SORT_PATHS`, default `off` (the retired rule). The C6 trace
+// showed the post-pass still reached on both TPC-DS corpora (3 verdicts at
+// SF0.25, 2 at SF1), and flipping it on left every goopg plan byte-identical
+// with PLAN-PARITY 99/99 on both. The tournament now always decides;
+// `sortPartialRootPays` survives only as the answer when no tournament can be
+// run (no worker budget, or no usable input estimate).
 
 import (
-	"os"
 	"strconv"
-	"strings"
 )
-
-// partialSortMode is the admission rule for this file's verdict.
-//
-//   - off — the retired type switch (`sortPartialRootPays`) decides, unchanged.
-//   - on  — the priced path tournament decides.
-type partialSortMode int
-
-const (
-	partialSortPathsOff partialSortMode = iota
-	partialSortPathsOn
-)
-
-// partialSortPathsMode is read once at process start, like every other
-// plan-shaping knob in this package, so a plan cannot change shape
-// mid-statement.
-var partialSortPathsMode = partialSortModeFromEnv(os.Getenv("GOOPG_PARTIAL_SORT_PATHS"))
-
-// partialSortModeFromEnv resolves the knob. Anything unrecognised is `off`:
-// fail-closed, so a typo cannot silently enable a plan shape whose measurement
-// has not been run. Same shape as `partialAggModeFromEnv`.
-func partialSortModeFromEnv(v string) partialSortMode {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "on", "paths", "true", "1":
-		return partialSortPathsOn
-	default:
-		return partialSortPathsOff
-	}
-}
-
-// partialSortModeLabel spells the mode the way an operator would export it, so
-// the flag-provenance label round-trips (flaglabels.go's contract).
-func partialSortModeLabel(m partialSortMode) string {
-	if m == partialSortPathsOn {
-		return "on"
-	}
-	return "off"
-}
-
-// setPartialSortPathsModeForTest pins the mode for one test and returns the
-// restore func. The knob is process-global by design, so a test that flips it
-// must put it back.
-func setPartialSortPathsModeForTest(m partialSortMode) func() {
-	prev := partialSortPathsMode
-	partialSortPathsMode = m
-	return func() { partialSortPathsMode = prev }
-}
-
-// SetPartialSortPathsMode is the same hook across the package boundary, taking
-// the label an operator would export (`off` / `on`) and resolving it through
-// the SAME function production resolves the environment variable with — so a
-// caller cannot select a mode the env knob could not. Mirrors
-// `SetPartialAggPathsMode` / `SetGatherPathsMode`; process-global, so a caller
-// must run the returned restore.
-func SetPartialSortPathsMode(label string) (restore func()) {
-	return setPartialSortPathsModeForTest(partialSortModeFromEnv(label))
-}
 
 // Producer strings for the DPPATH trace (pathtrace.go), in the convention
 // C-12 fixed: `producer=upper.partialsort.*`.
@@ -164,13 +110,6 @@ func (t *partialSortTournament) workerSideWins() bool {
 // from `agg.Child`: the divisor that prices the candidates has to be the one
 // the built plan will actually run at.
 func partialSortRootPays(srt *Sort, workers int, leaderParticipates bool) bool {
-	if partialSortPathsMode == partialSortPathsOff {
-		// R54 Step-0: mode-off upper-gate record. Same reasoning as
-		// `partialAggSplitPays`' mode-off arm — the rule still answers but the
-		// tournament never runs.
-		traceUpperGate("sort", "sort-rule", "mode=off")
-		return sortPartialRootPays(srt)
-	}
 	// DefaultPlannerSettings, not the session's — identical reasoning to
 	// `partialAggSplitPays`: `MaybeAddGather` carries `ParallelSettings` and
 	// runs post-cache, so no `PlannerSettings` is in scope. PG's GUC DEFAULTS

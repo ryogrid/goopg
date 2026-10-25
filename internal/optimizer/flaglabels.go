@@ -122,13 +122,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
-	// C-19e: selects which authority decides `Gather Merge -> Sort -> partial`
-	// — the retired type switch or the priced two-candidate tournament. It
-	// moves the plan of every parallel ORDER BY / merge-input sort, so an
-	// artefact that does not name it cannot say which arm it measured.
-	"GOOPG_PARTIAL_SORT_PATHS": func(v string) string {
-		return partialSortModeLabel(partialSortModeFromEnv(v))
-	},
 	// R108's experiment is intentionally default-off. Its plan-changing arm
 	// must nevertheless be stamped so every A/B artefact names the geometry
 	// currency it used.
@@ -227,6 +220,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_ONEREL_SEARCH",
 	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
+	// Retired at M0147-0020 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PARTIAL_SORT_PATHS",
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
@@ -353,6 +347,13 @@ var flagProvenanceRetired = map[string]string{
 	// is PG's add_paths_to_joinrel; M0147-0014 deleted the hash arm, so nothing
 	// reads the variable. `on` in an older artefact is the hash-choosing arm.
 	"GOOPG_HASH_OUTER_JOIN": "M0147-0014",
+	// C-19e's authority switch for `Gather Merge -> Sort -> partial`: the
+	// retired type switch (`off`, the default) or the priced cost_sort /
+	// cost_gather_merge tournament (`on`). M0147-0020 promoted the tournament —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is the type-switch arm; this binary always
+	// runs the tournament.
+	"GOOPG_PARTIAL_SORT_PATHS": "M0147-0020",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

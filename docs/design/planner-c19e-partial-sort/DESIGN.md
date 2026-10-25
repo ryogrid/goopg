@@ -4,6 +4,9 @@
 `../planner-c19d-gather-paths/DESIGN.md`, `../planner-c19f-parallel-hashjoin/DESIGN.md`,
 `../planner-c19g-partial-agg/DESIGN.md`.*
 
+**Status 2026-10-26: PROMOTED by M0147-0020.** `GOOPG_PARTIAL_SORT_PATHS` is retired; the tournament always
+decides. See [`../0100-0149/m0147-0020-promote-partial-sort-paths.md`](../0100-0149/m0147-0020-promote-partial-sort-paths.md).
+
 ## 1. The rule this replaces
 
 `MaybeAddGather` has three predicates that decide plan shape by reading

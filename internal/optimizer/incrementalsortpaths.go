@@ -32,7 +32,8 @@ package optimizer
 // the `anyTranslated` gate. See the design doc's 2026-09-17h update for the
 // full writeup and the follow-up this filed. Matches the off-by-default
 // convention every other experimental path family in this package already
-// uses (`GOOPG_PARTIAL_SORT_PATHS`, `GOOPG_PARTIAL_AGG_PATHS`, …). With the
+// uses (`GOOPG_PARTIAL_AGG_PATHS`, …; `GOOPG_PARTIAL_SORT_PATHS` was promoted
+// by M0147-0020). With the
 // flag at its default the ORDERED tournament is byte-identical to before
 // this file existed: `addIncrementalSortPaths` returns immediately.
 //
@@ -120,7 +121,7 @@ func setIncrementalSortPathsModeForTest(m incrementalSortMode) func() {
 // taking the label an operator would export (`off` / `on`) and resolving it
 // through the SAME function production resolves the environment variable
 // with — so a caller cannot select a mode the env knob could not. Mirrors
-// `SetPartialSortPathsMode` / `SetPartialAggPathsMode`; process-global, so a
+// `SetPartialAggPathsMode`; process-global, so a
 // caller must run the returned restore.
 func SetIncrementalSortPathsMode(label string) (restore func()) {
 	return setIncrementalSortPathsModeForTest(incrementalSortModeFromEnv(label))

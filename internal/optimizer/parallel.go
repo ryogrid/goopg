@@ -630,9 +630,9 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 		// `Gather Merge -> Sort -> partial` against `Sort -> Gather -> partial`
 		// — priced by `costSortRun` + `cost_gather` / `cost_gather_merge` and
 		// adjudicated by `addPath` / `setCheapest` (partialsortpaths.go).
-		// `GOOPG_PARTIAL_SORT_PATHS=off`, the default until the measurement in
-		// docs/design/planner-c19e-partial-sort/DESIGN.md §5 says otherwise,
-		// delegates to the retired type switch unchanged. The worker count is
+		// M0147-0020 promoted it (it shipped behind `GOOPG_PARTIAL_SORT_PATHS`,
+		// default off); the retired type switch answers only when no
+		// tournament can be run. The worker count is
 		// sized from `srt.Child` for the same reason the aggregate arm sizes
 		// from `agg.Child`: the divisor that PRICES the candidates must be the
 		// one the built plan RUNS at, and `MaybeAddGather` does not compute it
@@ -708,9 +708,9 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // C-19e (P5-05) is the item that gives the post-pass the cost model this
 // comment says it lacks: `partialSortRootPays` (partialsortpaths.go) prices
 // both candidates with `costSortRun` + `cost_gather` / `cost_gather_merge` and
-// lets `addPath` adjudicate. This function is what that tournament DELEGATES TO
-// when `GOOPG_PARTIAL_SORT_PATHS` is `off` — the default — so it is still the
-// production verdict and its measurement still stands.
+// lets `addPath` adjudicate. Since M0147-0020 promoted that tournament, this
+// function answers only when no tournament can be run (no worker budget, or no
+// usable input estimate); until then it was the production verdict.
 //
 // It used to decline for a SECOND, harder reason as well — the Gather Merge
 // operator attached only the seq-scan block allocator to its workers, not the
@@ -720,9 +720,7 @@ func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 // `parallelClaimSet` covering all three claim kinds, with an anti-drift test.
 // The correctness hazard is gone; only the measured cost argument above
 // remains, and it is what still carries this decline (q16 1.5 -> 2.3 s,
-// q13 4.2 -> 6.8 s). Do not read the removal of the hazard as a reason to
-// flip this rule — that needs the cost comparison the rule's own text says
-// goopg's post-pass does not have.
+// q13 4.2 -> 6.8 s) in the fallback case.
 func sortPartialRootPays(srt *Sort) bool {
 	switch drivingScan(srt.Child).(type) {
 	case *IndexOnlyScan, *IndexScan:
