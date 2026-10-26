@@ -99,8 +99,6 @@ Feature gates (all wrap package atomics + env var kill-switches):
 | `SetIndexKeyHarvestEnabled` | `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
 | `SetNLIEnabled` | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `SetNLICostGateLegacy` | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
-| `SetParallelEnabled` | `GOOPG_PARALLEL` | on | Parallel query post-pass |
-| `ParallelEnabled` | — | — | Query-time check |
 
 ## Internal structure
 
@@ -383,7 +381,7 @@ sequenceDiagram
 
 - **Env-flag kill-switch culture** — every plan-shaping feature is gated by a process-start
   env var (`GOOPG_PGSHAPED_DP`, `GOOPG_UNNEST_PREDP`, `GOOPG_EXISTS_TO_ANY`,
-  `GOOPG_MEMOIZE`, `GOOPG_PARALLEL`, `GOOPG_COLLAPSE`, `GOOPG_NLI`, …). Benchmark gates
+  `GOOPG_COLLAPSE`, `GOOPG_NLI`, …; M0147 is retiring them — see `flagProvenanceRetired`). Benchmark gates
   stamp `planner-flags:` provenance lines via `FlagProvenanceTable`/`RenderFlagProvenanceEnv`.
   Flags are read once at process start (`init()`), so a plan cannot change shape mid-statement.
 
@@ -569,7 +567,6 @@ Every plan-shaping feature is gated by a process-start env var. The full list:
 | `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
 | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
-| `GOOPG_PARALLEL` | on | Parallel query post-pass |
 | `GOOPG_COLLAPSE` | on | Explicit JOIN tree collapsing |
 | `GOOPG_EXISTS_TO_ANY` | on | EXISTS-to-ANY rewrite |
 | `GOOPG_REDUCE_OUTER_JOINS` | on | reduce_outer_joins pass |

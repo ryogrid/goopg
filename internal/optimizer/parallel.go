@@ -28,32 +28,17 @@ package optimizer
 //     plan pointer.
 
 import (
-	"os"
 	"strings"
-	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// parallelOn is the process-global kill switch, in the established house
-// style (the NLI cost-gate legacy flag; memoizeOn until M0147-0044). Default on; killed by
-// GOOPG_PARALLEL=off at process start or by SetParallelEnabled from tests.
-var parallelOn atomic.Bool
-
-func init() {
-	parallelOn.Store(parallelFromEnv(os.Getenv("GOOPG_PARALLEL")))
-}
-
-// parallelFromEnv is the kill-switch's polarity, factored out of init for the
-// provenance table (flaglabels.go).
-func parallelFromEnv(v string) bool { return v != "off" }
-
-// SetParallelEnabled toggles Gather insertion process-wide.
-func SetParallelEnabled(on bool) { parallelOn.Store(on) }
-
-// ParallelEnabled reports whether Gather insertion is active.
-func ParallelEnabled() bool { return parallelOn.Load() }
+// Parallelism answers to PG's per-session switch alone:
+// `max_parallel_workers_per_gather = 0` (ParallelSettings.MaxWorkersPerGather
+// here, PlannerSettings.MaxParallelWorkersPerGather in the search). The
+// process-wide GOOPG_PARALLEL=off kill switch (parallelOn, SetParallelEnabled)
+// duplicated it and was retired at M0147-0045.
 
 // ParallelSettings carries the per-session GUCs the post-pass needs. They are
 // passed explicitly rather than read from a global because
@@ -115,13 +100,6 @@ func maybeAddGatherInner(root Node, s ParallelSettings, ancGathered bool) Node {
 	if root == nil {
 		return root
 	}
-	if !parallelOn.Load() {
-		// `GOOPG_PARALLEL=off` is an ENGINE-level refusal, and since C-19g's
-		// remainder the planner can have chosen a Gather before this pass
-		// runs, so the knob has to strip rather than merely not-add.
-		return StripGather(root)
-	}
-
 	// C-19d COEXISTENCE RULE — the path model wins.
 	//
 	// The search can now produce a `PathGather` / `PathGatherMerge` priced by

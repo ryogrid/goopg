@@ -130,9 +130,8 @@ func setGatherPathsModeForTest(m gatherPathMode) func() {
 // It exists for C-19f's executor consumer check: the item requires a fixture
 // where the parallel hash path WINS by cost to actually EXECUTE as a parallel
 // hash, and that test lives in internal/executor, which cannot reach an
-// unexported knob. `SetParallelEnabled` (parallel.go) is the same shape for the
-// post-pass's kill switch. Like it, this is process-global, so a caller must
-// run the returned restore.
+// unexported knob. It is process-global, so a caller must run the returned
+// restore.
 func SetGatherPathsMode(label string) (restore func()) {
 	return setGatherPathsModeForTest(gatherPathModeFromEnv(label))
 }

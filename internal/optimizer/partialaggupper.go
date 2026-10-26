@@ -411,7 +411,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// `ParallelStatementOK` is the top-level statement's shape (a bare SELECT,
 	// not a DML/DDL/utility statement and not a nested planning scope); the
 	// per-node refusals are `subtreeHasUnsafeNode`'s.
-	if !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+	if ps.MaxParallelWorkersPerGather <= 0 {
 		traceUpperGate("agg-upper", "refused", "gate=statement")
 		return nil
 	}

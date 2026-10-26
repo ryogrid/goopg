@@ -299,34 +299,32 @@ func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
 // so a refused head can never starve admittable siblings (the gather-path
 // reader takes PartialPathlist[0] only).
 func TestPartialNLFilingInnerOnly(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		cp := defaultCostParams()
-		a, b := relsetOf(0), relsetOf(1)
-		for _, jt := range []parser.JoinType{
-			parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti, parser.JoinRight, parser.JoinFull,
-		} {
-			outer := nlPartialOuter(a)
-			// ParallelSafe is stamped at path creation: the flag must be
-			// set BEFORE generateScanPaths runs.
-			inner := newRelOptInfo(b, 500, 32)
-			inner.ConsiderParallel = true
-			generateScanPaths(inner, defaultCostParams(), 5, 0, 0, true)
-			setCheapest(inner)
-			joinrel := newRelOptInfo(a|b, 5000, 64)
-			joinrel.ConsiderParallel = true
-			s := &searchCtx{parallelModeOK: true}
-			clauses := []*restrictInfo{equiClause(a, b)}
-			addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{}, mergeUnique{})
-			if jt != parser.JoinRight && jt != parser.JoinFull {
-				if len(joinrel.PartialPathlist) == 0 {
-					t.Errorf("%v partial NL must be filed", jt)
-				}
-				continue
+	defer setGatherPathsModeForTest(gatherPathsAll)()
+	cp := defaultCostParams()
+	a, b := relsetOf(0), relsetOf(1)
+	for _, jt := range []parser.JoinType{
+		parser.JoinInner, parser.JoinLeft, parser.JoinSemi, parser.JoinAnti, parser.JoinRight, parser.JoinFull,
+	} {
+		outer := nlPartialOuter(a)
+		// ParallelSafe is stamped at path creation: the flag must be
+		// set BEFORE generateScanPaths runs.
+		inner := newRelOptInfo(b, 500, 32)
+		inner.ConsiderParallel = true
+		generateScanPaths(inner, defaultCostParams(), 5, 0, 0, true)
+		setCheapest(inner)
+		joinrel := newRelOptInfo(a|b, 5000, 64)
+		joinrel.ConsiderParallel = true
+		s := &searchCtx{parallelModeOK: true}
+		clauses := []*restrictInfo{equiClause(a, b)}
+		addPartialNestLoopPaths(s, joinrel, outer, inner, cp, jt, clauses, semiAntiJoinFactors{}, mergeUnique{})
+		if jt != parser.JoinRight && jt != parser.JoinFull {
+			if len(joinrel.PartialPathlist) == 0 {
+				t.Errorf("%v partial NL must be filed", jt)
 			}
-			if len(joinrel.PartialPathlist) != 0 {
-				t.Errorf("%v: partial NL outside {INNER, LEFT, SEMI, ANTI} must not be filed", jt)
-			}
+			continue
 		}
-	})
+		if len(joinrel.PartialPathlist) != 0 {
+			t.Errorf("%v: partial NL outside {INNER, LEFT, SEMI, ANTI} must not be filed", jt)
+		}
+	}
 }

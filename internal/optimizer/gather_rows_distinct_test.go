@@ -43,9 +43,6 @@ func TestEstimateRowsGatherReadsItsPathRows(t *testing.T) {
 // (planner.c:5017). Unclamped, Q54's 1 × 1.7 priced the merge under PG's and
 // tipped the DISTINCT onto the partial arm.
 func TestPartialDistinctGatheredRowsAreClamped(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	// 400000 rows plan one worker, so the divisor is 1.7 and the gathered
 	// rows are fractional before the clamp (45.9).

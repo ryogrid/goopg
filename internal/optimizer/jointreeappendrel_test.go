@@ -46,33 +46,31 @@ func appendrelTestCat(t *testing.T) catalog.Catalog {
 }
 
 func TestAddAppendRelPartialPathsTraceVerdicts(t *testing.T) {
-	withParallelOn(t, func() {
-		enableDPTrace(t)
-		cp := defaultCostParams()
-		setOpRel := upperRelSetOpWithPartials(t, cp)
-		leaf := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
-		leaf.setSetOpBranchRel(setOpRel)
-		leafRel := &RelOptInfo{Relids: 0b001, ConsiderParallel: true, rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
-		otherRel := &RelOptInfo{Relids: 0b010, ConsiderParallel: true}
-		s := &searchCtx{
-			parallelModeOK: true,
-			cp:             cp,
-			joinrels:       [][]*RelOptInfo{nil, {leafRel, otherRel}},
-			relInfos:       []baseRelInfo{{appendrel: true}, {}},
-			nrels:          2,
-			trace:          newSearchTrace([]rangeBinding{{alias: "u"}, {alias: "d"}}),
+	enableDPTrace(t)
+	cp := defaultCostParams()
+	setOpRel := upperRelSetOpWithPartials(t, cp)
+	leaf := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(50))
+	leaf.setSetOpBranchRel(setOpRel)
+	leafRel := &RelOptInfo{Relids: 0b001, ConsiderParallel: true, rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
+	otherRel := &RelOptInfo{Relids: 0b010, ConsiderParallel: true}
+	s := &searchCtx{
+		parallelModeOK: true,
+		cp:             cp,
+		joinrels:       [][]*RelOptInfo{nil, {leafRel, otherRel}},
+		relInfos:       []baseRelInfo{{appendrel: true}, {}},
+		nrels:          2,
+		trace:          newSearchTrace([]rangeBinding{{alias: "u"}, {alias: "d"}}),
+	}
+	s.addAppendRelPartialPaths()
+	out := s.trace.render()
+	for _, want := range []string{
+		"DPTRACE appendrel rel={u} verdict=admitted",
+		"DPTRACE appendrel rel={d} verdict=unmarked",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered trace missing %q:\n%s", want, out)
 		}
-		s.addAppendRelPartialPaths()
-		out := s.trace.render()
-		for _, want := range []string{
-			"DPTRACE appendrel rel={u} verdict=admitted",
-			"DPTRACE appendrel rel={d} verdict=unmarked",
-		} {
-			if !strings.Contains(out, want) {
-				t.Errorf("rendered trace missing %q:\n%s", want, out)
-			}
-		}
-	})
+	}
 }
 
 // findSetOpLeaf returns the first *SetOp reachable through single-child
@@ -209,135 +207,131 @@ func TestAppendrelMarkSurvivesEarlierFromSibling(t *testing.T) {
 // lifts. On the legacy arm the mark is never set, the members keep the
 // isSimpleSingle bypass, and no partial is filed — the A/B boundary.
 func TestAppendrelMemberScopeEngagesSearch(t *testing.T) {
-	withParallelOn(t, func() {
-		cat := appendrelTestCat(t)
-		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u, zz_d d WHERE u.a = d.a`
+	cat := appendrelTestCat(t)
+	sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u, zz_d d WHERE u.a = d.a`
 
-		node := planOnPipeline(t, sql, cat)
-		leaf := findSetOpLeaf(node)
-		if leaf == nil {
-			t.Fatal("jointree arm: no *SetOp leaf in the plan")
+	node := planOnPipeline(t, sql, cat)
+	leaf := findSetOpLeaf(node)
+	if leaf == nil {
+		t.Fatal("jointree arm: no *SetOp leaf in the plan")
+	}
+	carrier, ok := Node(leaf).(setOpBranchRelNode)
+	if !ok {
+		t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
+	}
+	sr := carrier.setOpBranchRel()
+	if sr == nil && setOpLeafUnderGather(node, false) {
+		// The Parallel Append candidate won the election, which needs
+		// the member-scope forcing: legacy members file no partial.
+		return
+	}
+	if sr == nil {
+		t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
+	}
+	if len(sr.PartialPathlist) == 0 {
+		t.Fatal("jointree arm: SETOP rel has no partial path — the Parallel Append candidate was never filed")
+	}
+	for name, branch := range map[string]Node{"left": leaf.Left, "right": leaf.Right} {
+		br := setOpBranchRelOf(branch)
+		if br == nil {
+			t.Fatalf("jointree arm: %s member has no searched rel — member-scope forcing did not engage", name)
 		}
-		carrier, ok := Node(leaf).(setOpBranchRelNode)
-		if !ok {
-			t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
+		if !br.ConsiderParallel {
+			t.Errorf("jointree arm: %s member rel ConsiderParallel = false", name)
 		}
-		sr := carrier.setOpBranchRel()
-		if sr == nil && setOpLeafUnderGather(node, false) {
-			// The Parallel Append candidate won the election, which needs
-			// the member-scope forcing: legacy members file no partial.
-			return
+		if len(br.PartialPathlist) == 0 {
+			t.Errorf("jointree arm: %s member rel has no partial path", name)
 		}
-		if sr == nil {
-			t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
-		}
-		if len(sr.PartialPathlist) == 0 {
-			t.Fatal("jointree arm: SETOP rel has no partial path — the Parallel Append candidate was never filed")
-		}
-		for name, branch := range map[string]Node{"left": leaf.Left, "right": leaf.Right} {
-			br := setOpBranchRelOf(branch)
-			if br == nil {
-				t.Fatalf("jointree arm: %s member has no searched rel — member-scope forcing did not engage", name)
-			}
-			if !br.ConsiderParallel {
-				t.Errorf("jointree arm: %s member rel ConsiderParallel = false", name)
-			}
-			if len(br.PartialPathlist) == 0 {
-				t.Errorf("jointree arm: %s member rel has no partial path", name)
-			}
-		}
+	}
 
-	})
 }
 
 // TestAddAppendRelPartialPathsHoists pins the hoist's own contract: the
 // nested SETOP rel's partial paths are copied onto the leaf rel with
 // Rel re-targeted, and every gate fails closed.
 func TestAddAppendRelPartialPathsHoists(t *testing.T) {
-	withParallelOn(t, func() {
-		cp := defaultCostParams()
-		build := func(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo) {
-			setOpRel := upperRelSetOpWithPartials(t, cp)
-			leaf := setOpTestNode(parser.SetOpUnion, true,
-				upperOrderedInput(100), upperOrderedInput(50))
-			leaf.setSetOpBranchRel(setOpRel)
-			leafRel := &RelOptInfo{ConsiderParallel: true, rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
-			otherRel := &RelOptInfo{ConsiderParallel: true}
-			s := &searchCtx{
-				parallelModeOK: true,
-				cp:             cp,
-				joinrels:       [][]*RelOptInfo{nil, {leafRel, otherRel}},
-				relInfos:       []baseRelInfo{{appendrel: true}, {}},
-				nrels:          2,
-			}
-			return s, leafRel, otherRel, setOpRel
+	cp := defaultCostParams()
+	build := func(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo) {
+		setOpRel := upperRelSetOpWithPartials(t, cp)
+		leaf := setOpTestNode(parser.SetOpUnion, true,
+			upperOrderedInput(100), upperOrderedInput(50))
+		leaf.setSetOpBranchRel(setOpRel)
+		leafRel := &RelOptInfo{ConsiderParallel: true, rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
+		otherRel := &RelOptInfo{ConsiderParallel: true}
+		s := &searchCtx{
+			parallelModeOK: true,
+			cp:             cp,
+			joinrels:       [][]*RelOptInfo{nil, {leafRel, otherRel}},
+			relInfos:       []baseRelInfo{{appendrel: true}, {}},
+			nrels:          2,
 		}
+		return s, leafRel, otherRel, setOpRel
+	}
 
-		t.Run("files the retargeted path on the marked leaf only", func(t *testing.T) {
-			s, leafRel, otherRel, setOpRel := build(t)
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 1 {
-				t.Fatalf("leaf PartialPathlist = %d, want the hoisted 1", len(leafRel.PartialPathlist))
-			}
-			got := leafRel.PartialPathlist[0]
-			if got.Rel != leafRel {
-				t.Error("hoisted path was not re-targeted to the leaf rel")
-			}
-			if got == setOpRel.PartialPathlist[0] {
-				t.Error("hoisted path aliases the SETOP rel's entry — it must be a copy so the owner change cannot leak back")
-			}
-			if got.Kind != PathSetOp {
-				t.Errorf("hoisted path kind = %v, want PathSetOp", got.Kind)
-			}
-			if len(otherRel.PartialPathlist) != 0 {
-				t.Errorf("unmarked sibling got %d partial paths", len(otherRel.PartialPathlist))
-			}
-		})
+	t.Run("files the retargeted path on the marked leaf only", func(t *testing.T) {
+		s, leafRel, otherRel, setOpRel := build(t)
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 1 {
+			t.Fatalf("leaf PartialPathlist = %d, want the hoisted 1", len(leafRel.PartialPathlist))
+		}
+		got := leafRel.PartialPathlist[0]
+		if got.Rel != leafRel {
+			t.Error("hoisted path was not re-targeted to the leaf rel")
+		}
+		if got == setOpRel.PartialPathlist[0] {
+			t.Error("hoisted path aliases the SETOP rel's entry — it must be a copy so the owner change cannot leak back")
+		}
+		if got.Kind != PathSetOp {
+			t.Errorf("hoisted path kind = %v, want PathSetOp", got.Kind)
+		}
+		if len(otherRel.PartialPathlist) != 0 {
+			t.Errorf("unmarked sibling got %d partial paths", len(otherRel.PartialPathlist))
+		}
+	})
 
-		t.Run("refuses without the mark", func(t *testing.T) {
-			s, leafRel, _, _ := build(t)
-			s.relInfos[0].appendrel = false
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 0 {
-				t.Error("unmarked leaf got a hoisted path")
-			}
-		})
+	t.Run("refuses without the mark", func(t *testing.T) {
+		s, leafRel, _, _ := build(t)
+		s.relInfos[0].appendrel = false
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 0 {
+			t.Error("unmarked leaf got a hoisted path")
+		}
+	})
 
-		t.Run("refuses when the leaf is not parallel-considered", func(t *testing.T) {
-			s, leafRel, _, _ := build(t)
-			leafRel.ConsiderParallel = false
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 0 {
-				t.Error("non-parallel leaf got a hoisted path")
-			}
-		})
+	t.Run("refuses when the leaf is not parallel-considered", func(t *testing.T) {
+		s, leafRel, _, _ := build(t)
+		leafRel.ConsiderParallel = false
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 0 {
+			t.Error("non-parallel leaf got a hoisted path")
+		}
+	})
 
-		t.Run("refuses when the carrier is wrapped", func(t *testing.T) {
-			s, leafRel, _, _ := build(t)
-			leafRel.baseLeaf = &Project{Child: leafRel.baseLeaf}
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 0 {
-				t.Error("wrapped leaf got a hoisted path — wrappers change rows the hoisted emission cannot reproduce")
-			}
-		})
+	t.Run("refuses when the carrier is wrapped", func(t *testing.T) {
+		s, leafRel, _, _ := build(t)
+		leafRel.baseLeaf = &Project{Child: leafRel.baseLeaf}
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 0 {
+			t.Error("wrapped leaf got a hoisted path — wrappers change rows the hoisted emission cannot reproduce")
+		}
+	})
 
-		t.Run("refuses with no nested partials", func(t *testing.T) {
-			s, leafRel, _, setOpRel := build(t)
-			setOpRel.PartialPathlist = nil
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 0 {
-				t.Error("leaf got a hoisted path from an empty SETOP partial list")
-			}
-		})
+	t.Run("refuses with no nested partials", func(t *testing.T) {
+		s, leafRel, _, setOpRel := build(t)
+		setOpRel.PartialPathlist = nil
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 0 {
+			t.Error("leaf got a hoisted path from an empty SETOP partial list")
+		}
+	})
 
-		t.Run("refuses when parallel mode is off", func(t *testing.T) {
-			s, leafRel, _, _ := build(t)
-			s.parallelModeOK = false
-			s.addAppendRelPartialPaths()
-			if len(leafRel.PartialPathlist) != 0 {
-				t.Error("leaf got a hoisted path with parallelModeOK=false")
-			}
-		})
+	t.Run("refuses when parallel mode is off", func(t *testing.T) {
+		s, leafRel, _, _ := build(t)
+		s.parallelModeOK = false
+		s.addAppendRelPartialPaths()
+		if len(leafRel.PartialPathlist) != 0 {
+			t.Error("leaf got a hoisted path with parallelModeOK=false")
+		}
 	})
 }
 
@@ -386,34 +380,32 @@ func TestCreateSetOpPlanLeafLayout(t *testing.T) {
 // of the member rels' — not the opaque rtekind verdict, which reads a
 // *SetOp leaf as `other` and fails closed.
 func TestAppendrelConsiderParallelInheritsSetOp(t *testing.T) {
-	withParallelOn(t, func() {
-		cp := defaultCostParams()
-		setOpRel := upperRelSetOpWithPartials(t, cp)
-		leaf := setOpTestNode(parser.SetOpUnion, true,
-			upperOrderedInput(100), upperOrderedInput(50))
-		leaf.setSetOpBranchRel(setOpRel)
+	cp := defaultCostParams()
+	setOpRel := upperRelSetOpWithPartials(t, cp)
+	leaf := setOpTestNode(parser.SetOpUnion, true,
+		upperOrderedInput(100), upperOrderedInput(50))
+	leaf.setSetOpBranchRel(setOpRel)
 
-		leafRel := &RelOptInfo{rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
-		s := &searchCtx{
-			cp:       cp,
-			joinrels: [][]*RelOptInfo{nil, {leafRel}},
-			relInfos: []baseRelInfo{{appendrel: true}},
-		}
-		// relConsiderParallel would refuse the opaque *SetOp leaf; the
-		// appendrel arm must stamp the SETOP rel's verdict instead.
-		setOpRel.ConsiderParallel = true
-		s.setBaseRelConsiderParallel(nil)
-		if !leafRel.ConsiderParallel {
-			t.Error("marked leaf did not inherit the SETOP rel's parallel safety")
-		}
+	leafRel := &RelOptInfo{rangeTblEntry: rangeTblEntry{baseLeaf: leaf}}
+	s := &searchCtx{
+		cp:       cp,
+		joinrels: [][]*RelOptInfo{nil, {leafRel}},
+		relInfos: []baseRelInfo{{appendrel: true}},
+	}
+	// relConsiderParallel would refuse the opaque *SetOp leaf; the
+	// appendrel arm must stamp the SETOP rel's verdict instead.
+	setOpRel.ConsiderParallel = true
+	s.setBaseRelConsiderParallel(nil)
+	if !leafRel.ConsiderParallel {
+		t.Error("marked leaf did not inherit the SETOP rel's parallel safety")
+	}
 
-		setOpRel.ConsiderParallel = false
-		leafRel.ConsiderParallel = true
-		s.setBaseRelConsiderParallel(nil)
-		if leafRel.ConsiderParallel {
-			t.Error("marked leaf stayed parallel-considered when a member was unsafe")
-		}
-	})
+	setOpRel.ConsiderParallel = false
+	leafRel.ConsiderParallel = true
+	s.setBaseRelConsiderParallel(nil)
+	if leafRel.ConsiderParallel {
+		t.Error("marked leaf stayed parallel-considered when a member was unsafe")
+	}
 }
 
 // TestPartialAggOverUnionLeafGathers pins the observable consequence of
@@ -422,54 +414,52 @@ func TestAppendrelConsiderParallelInheritsSetOp(t *testing.T) {
 // computeParallelWorkers/upperSplitWorkers now see the member scans
 // through the SetOp driving node.
 func TestPartialAggOverUnionLeafGathers(t *testing.T) {
-	withParallelOn(t, func() {
-		cat := appendrelTestCat(t)
-		sql := `SELECT count(*) FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u`
-		// One arm since the M0145-0008 legacy deletion; `on` only labels
-		// the failure messages.
-		for _, on := range []bool{true} {
-			func() {
-				ps := DefaultPlannerSettings()
-				ps.ParallelStatementOK = true
-				node, err := PlanWithSettings(parseOne(t, sql), cat, ps)
-				if err != nil {
-					t.Fatal(err)
+	cat := appendrelTestCat(t)
+	sql := `SELECT count(*) FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2) u`
+	// One arm since the M0145-0008 legacy deletion; `on` only labels
+	// the failure messages.
+	for _, on := range []bool{true} {
+		func() {
+			ps := DefaultPlannerSettings()
+			ps.ParallelStatementOK = true
+			node, err := PlanWithSettings(parseOne(t, sql), cat, ps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Walk for Aggregate → … → Gather → … → SetOp.
+			agg, _ := node.(*Aggregate)
+			if agg == nil {
+				if p, ok := node.(*Project); ok {
+					agg, _ = p.Child.(*Aggregate)
 				}
-				// Walk for Aggregate → … → Gather → … → SetOp.
-				agg, _ := node.(*Aggregate)
-				if agg == nil {
-					if p, ok := node.(*Project); ok {
-						agg, _ = p.Child.(*Aggregate)
-					}
+			}
+			if agg == nil {
+				t.Fatalf("arm=%v: no top Aggregate (got %T)", on, node)
+			}
+			var gather *Gather
+			var setop *SetOp
+			var walk func(n Node)
+			walk = func(n Node) {
+				switch x := n.(type) {
+				case *Gather:
+					gather = x
+					walk(x.Child)
+				case *SetOp:
+					setop = x
+				case *Aggregate:
+					walk(x.Child)
+				case *Project:
+					walk(x.Child)
+				case *Filter:
+					walk(x.Child)
 				}
-				if agg == nil {
-					t.Fatalf("arm=%v: no top Aggregate (got %T)", on, node)
-				}
-				var gather *Gather
-				var setop *SetOp
-				var walk func(n Node)
-				walk = func(n Node) {
-					switch x := n.(type) {
-					case *Gather:
-						gather = x
-						walk(x.Child)
-					case *SetOp:
-						setop = x
-					case *Aggregate:
-						walk(x.Child)
-					case *Project:
-						walk(x.Child)
-					case *Filter:
-						walk(x.Child)
-					}
-				}
-				walk(agg.Child)
-				if gather == nil || setop == nil {
-					t.Fatalf("arm=%v: want Aggregate→Gather→…→SetOp, gather=%v setop=%v", on, gather != nil, setop != nil)
-				}
-			}()
-		}
-	})
+			}
+			walk(agg.Child)
+			if gather == nil || setop == nil {
+				t.Fatalf("arm=%v: want Aggregate→Gather→…→SetOp, gather=%v setop=%v", on, gather != nil, setop != nil)
+			}
+		}()
+	}
 }
 
 // flattenSetOpMembersTest collects the streaming members of a (possibly
@@ -567,62 +557,60 @@ func TestWholeChainPartialPathIsGatherable(t *testing.T) {
 // witness Q71 does on real stats). What must hold unconditionally is that
 // the candidate is FILED and RUNNABLE.
 func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
-	withParallelOn(t, func() {
-		cat := appendrelTestCat(t)
-		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2 UNION ALL SELECT a, v FROM zz_m3) u, zz_d d WHERE u.a = d.a`
+	cat := appendrelTestCat(t)
+	sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL SELECT a, v FROM zz_m2 UNION ALL SELECT a, v FROM zz_m3) u, zz_d d WHERE u.a = d.a`
 
-		node := planOnPipeline(t, sql, cat)
-		leaf := findSetOpLeaf(node)
-		if leaf == nil {
-			t.Fatal("jointree arm: no *SetOp leaf in the plan")
+	node := planOnPipeline(t, sql, cat)
+	leaf := findSetOpLeaf(node)
+	if leaf == nil {
+		t.Fatal("jointree arm: no *SetOp leaf in the plan")
+	}
+	carrier, ok := Node(leaf).(setOpBranchRelNode)
+	if !ok {
+		t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
+	}
+	sr := carrier.setOpBranchRel()
+	if sr == nil && setOpLeafUnderGather(node, false) {
+		// The whole-chain partial was elected and gathered, so it was
+		// filed and runnable; it must still be the stacked chain.
+		_, leftNested := leaf.Left.(*SetOp)
+		_, rightNested := leaf.Right.(*SetOp)
+		if !leftNested && !rightNested {
+			t.Fatalf("gathered chain leaf has no nested SetOp — children %T/%T", leaf.Left, leaf.Right)
 		}
-		carrier, ok := Node(leaf).(setOpBranchRelNode)
-		if !ok {
-			t.Fatalf("jointree arm: leaf %T is not a setOpBranchRelNode carrier", leaf)
+		return
+	}
+	if sr == nil {
+		t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
+	}
+	var whole *Path
+	for _, p := range sr.PartialPathlist {
+		if p.Kind == PathSetOp {
+			whole = p
+			break
 		}
-		sr := carrier.setOpBranchRel()
-		if sr == nil && setOpLeafUnderGather(node, false) {
-			// The whole-chain partial was elected and gathered, so it was
-			// filed and runnable; it must still be the stacked chain.
-			_, leftNested := leaf.Left.(*SetOp)
-			_, rightNested := leaf.Right.(*SetOp)
-			if !leftNested && !rightNested {
-				t.Fatalf("gathered chain leaf has no nested SetOp — children %T/%T", leaf.Left, leaf.Right)
-			}
-			return
+	}
+	if whole == nil {
+		t.Fatal("jointree arm: outer link's SETOP rel carries no partial PathSetOp")
+	}
+	// The whole-chain shape: one branch is the inner link's own partial
+	// PathSetOp, the other a member partial. Left-deep fold puts the
+	// chain on the left.
+	var nested *Path
+	for _, c := range whole.Children {
+		if c.Kind == PathSetOp {
+			nested = c
 		}
-		if sr == nil {
-			t.Fatal("jointree arm: leaf carrier answers a nil SETOP rel")
-		}
-		var whole *Path
-		for _, p := range sr.PartialPathlist {
-			if p.Kind == PathSetOp {
-				whole = p
-				break
-			}
-		}
-		if whole == nil {
-			t.Fatal("jointree arm: outer link's SETOP rel carries no partial PathSetOp")
-		}
-		// The whole-chain shape: one branch is the inner link's own partial
-		// PathSetOp, the other a member partial. Left-deep fold puts the
-		// chain on the left.
-		var nested *Path
-		for _, c := range whole.Children {
-			if c.Kind == PathSetOp {
-				nested = c
-			}
-		}
-		if nested == nil {
-			t.Fatalf("whole-chain partial has no nested PathSetOp child — "+
-				"children kinds are %v/%v; the chain did not stack",
-				whole.Children[0].Kind, whole.Children[1].Kind)
-		}
-		if !gatherSubpathIsRunnable(whole) {
-			t.Fatal("whole-chain partial PathSetOp is not gatherable — the " +
-				"nested-branch refusal is back")
-		}
-	})
+	}
+	if nested == nil {
+		t.Fatalf("whole-chain partial has no nested PathSetOp child — "+
+			"children kinds are %v/%v; the chain did not stack",
+			whole.Children[0].Kind, whole.Children[1].Kind)
+	}
+	if !gatherSubpathIsRunnable(whole) {
+		t.Fatal("whole-chain partial PathSetOp is not gatherable — the " +
+			"nested-branch refusal is back")
+	}
 }
 
 // TestSmallAppendrelMemberGetsPartialPath is M0146-0132:
@@ -635,35 +623,33 @@ func TestUnionAllChainLeafFilesGatherablePartial(t *testing.T) {
 // (is_safe_append_member: "no place to put them in an appendrel"): it is a
 // subquery whose relation is a base rel, and the cutoff still applies.
 func TestSmallAppendrelMemberGetsPartialPath(t *testing.T) {
-	withParallelOn(t, func() {
-		cat := appendrelTestCat(t)
-		tbl, err := cat.CreateTable(parser.ObjectName{Name: "zz_small"}, []catalog.Column{
-			{Name: "a", Type: catalog.Type{Name: "int4"}},
-			{Name: "v", Type: catalog.Type{Name: "int4"}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		// 700 pages: below the 1024-page (8 MB) min_parallel_table_scan_size.
-		tbl.Stats = &catalog.TableStats{RowCount: 70_000, Pages: 700, Analyzed: true,
-			Columns: []catalog.ColumnStats{{AvgWidth: 4, NDistinct: -1}, {AvgWidth: 4, NDistinct: -1}}}
-		smallMemberPartials := func(member string) int {
-			sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL ` + member + `) u, zz_d d WHERE u.a = d.a`
-			leaf := findSetOpLeaf(planOnPipeline(t, sql, cat))
-			if leaf == nil {
-				t.Fatalf("%s: no *SetOp leaf in the plan", member)
-			}
-			br := setOpBranchRelOf(leaf.Right)
-			if br == nil {
-				t.Fatalf("%s: the small member has no searched rel", member)
-			}
-			return len(br.PartialPathlist)
-		}
-		if n := smallMemberPartials(`SELECT a, v FROM zz_small`); n == 0 {
-			t.Error("pulled-up member below min_parallel_table_scan_size has no partial path")
-		}
-		if n := smallMemberPartials(`SELECT a, v FROM zz_small WHERE v > 0`); n != 0 {
-			t.Errorf("member with its own WHERE (not pulled up) has %d partial paths, want 0", n)
-		}
+	cat := appendrelTestCat(t)
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "zz_small"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "int4"}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 700 pages: below the 1024-page (8 MB) min_parallel_table_scan_size.
+	tbl.Stats = &catalog.TableStats{RowCount: 70_000, Pages: 700, Analyzed: true,
+		Columns: []catalog.ColumnStats{{AvgWidth: 4, NDistinct: -1}, {AvgWidth: 4, NDistinct: -1}}}
+	smallMemberPartials := func(member string) int {
+		sql := `SELECT * FROM (SELECT a, v FROM zz_m1 UNION ALL ` + member + `) u, zz_d d WHERE u.a = d.a`
+		leaf := findSetOpLeaf(planOnPipeline(t, sql, cat))
+		if leaf == nil {
+			t.Fatalf("%s: no *SetOp leaf in the plan", member)
+		}
+		br := setOpBranchRelOf(leaf.Right)
+		if br == nil {
+			t.Fatalf("%s: the small member has no searched rel", member)
+		}
+		return len(br.PartialPathlist)
+	}
+	if n := smallMemberPartials(`SELECT a, v FROM zz_small`); n == 0 {
+		t.Error("pulled-up member below min_parallel_table_scan_size has no partial path")
+	}
+	if n := smallMemberPartials(`SELECT a, v FROM zz_small WHERE v > 0`); n != 0 {
+		t.Errorf("member with its own WHERE (not pulled up) has %d partial paths, want 0", n)
+	}
 }

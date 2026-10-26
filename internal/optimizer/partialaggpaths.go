@@ -112,9 +112,8 @@ func setPartialAggPathsModeForTest(m partialAggMode) func() {
 // fixture where the split verdict is reached BY COST to actually execute as
 // Finalize -> Gather -> Partial and return the serial plan's values, and that
 // test lives in internal/executor, which cannot reach an unexported knob.
-// `SetGatherPathsMode` (gatherpaths.go) and `SetParallelEnabled` (parallel.go)
-// are the same shape. Like them, this is process-global, so a caller must run
-// the returned restore.
+// `SetGatherPathsMode` (gatherpaths.go) is the same shape. Like it, this is
+// process-global, so a caller must run the returned restore.
 func SetPartialAggPathsMode(label string) (restore func()) {
 	return setPartialAggPathsModeForTest(partialAggModeFromEnv(label))
 }

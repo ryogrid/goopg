@@ -76,7 +76,6 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_PARALLEL":         func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
@@ -118,6 +117,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_COST_DRIVEN_JOINORDER",
 	// Retired at M0147-0044 — see flagProvenanceRetired.
 	"GOOPG_MEMOIZE",
+	// Retired at M0147-0045 — see flagProvenanceRetired.
 	"GOOPG_PARALLEL",
 	// Retired at M0145-0008 — see flagProvenanceRetired.
 	"GOOPG_PGSHAPED_DP",
@@ -368,6 +368,11 @@ var flagProvenanceRetired = map[string]string{
 	// both arms answering only to the statement's enable_memoize, so nothing
 	// reads the variable. `off` in an older artefact is the no-Memoize arm.
 	"GOOPG_MEMOIZE": "M0147-0044",
+	// The process-wide parallel kill switch (default on, `off` refused every
+	// partial path and stripped Gathers). M0147-0045 left parallelism answering
+	// only to max_parallel_workers_per_gather, which already did both, so
+	// nothing reads the variable. `off` in an older artefact is the serial arm.
+	"GOOPG_PARALLEL": "M0147-0045",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

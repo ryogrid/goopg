@@ -74,26 +74,24 @@ const (
 // comparator honours a crossover when a subpath offers one. What changed is
 // that the producer can now offer one.
 func TestBaseRelGatherCrossesOverOnASelectiveScan(t *testing.T) {
-	withParallelOn(t, func() {
-		for _, tc := range []struct {
-			sel      float64
-			wantWins bool
-		}{
-			{1.0, false},  // everything crosses: serial, as in PG
-			{0.5, false},  //
-			{0.01, true},  // selective: the CPU share dwarfs the transfer
-			{0.001, true}, //
-		} {
-			serial, gather := crossoverArms(t, tc.sel)
-			wins := gather.Cost.Total < serial.Cost.Total
-			if wins != tc.wantWins {
-				t.Errorf("sel=%v: gather %v vs serial %v: wins = %v, want %v — "+
-					"the base-rel scan cost inputs moved; see ledger "+
-					"c19-baserel-scan-priced-on-output-rows",
-					tc.sel, gather.Cost.Total, serial.Cost.Total, wins, tc.wantWins)
-			}
+	for _, tc := range []struct {
+		sel      float64
+		wantWins bool
+	}{
+		{1.0, false},  // everything crosses: serial, as in PG
+		{0.5, false},  //
+		{0.01, true},  // selective: the CPU share dwarfs the transfer
+		{0.001, true}, //
+	} {
+		serial, gather := crossoverArms(t, tc.sel)
+		wins := gather.Cost.Total < serial.Cost.Total
+		if wins != tc.wantWins {
+			t.Errorf("sel=%v: gather %v vs serial %v: wins = %v, want %v — "+
+				"the base-rel scan cost inputs moved; see ledger "+
+				"c19-baserel-scan-priced-on-output-rows",
+				tc.sel, gather.Cost.Total, serial.Cost.Total, wins, tc.wantWins)
 		}
-	})
+	}
 }
 
 // crossoverArms runs the production producer chain over a single
