@@ -90,13 +90,6 @@ var flagResolvedState = map[string]func(string) string{
 	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
 	// Default ON, `=0` opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
-	// B-01c applying half, slice (c): narrows the input row of an upper `*Sort`
-	// site — the general ORDER BY sort — re-basing the whole ancestor chain up
-	// to the node that absorbs the change (upper_narrow_chain.go). A separate
-	// flag from GOOPG_NARROW_UPPER because the two sites move different plan
-	// shapes and an A/B that cannot separate them cannot attribute a
-	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
-	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
 	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
 	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
 	// above, so the in/out distinction no longer separates them -- but it is
@@ -180,6 +173,7 @@ var flagProvenanceOrder = []string{
 	// ORDER BY sort's input row and re-bases the ancestor chain above it, so an
 	// artefact that does not name it cannot say which sort payload it measured.
 	// Default ON.
+	// Retired at M0147-0038 — see flagProvenanceRetired.
 	"GOOPG_NARROW_UPPER_SORT",
 	// Joined at M0139-S1: the join-leg hook (joinleghook.go). A pure
 	// decline that only counts eligible legs; no artefact captured before
@@ -353,6 +347,11 @@ var flagProvenanceRetired = map[string]string{
 	// out). M0147-0031 made the hook unconditional, so nothing reads the
 	// variable. `off` in an older artefact is the un-narrowed-leg arm.
 	"GOOPG_NARROW_LEG_HOOK": "M0147-0031",
+	// B-01c slice (c)'s upper-Sort narrowing site switch (default on, `=0`
+	// opted out). M0147-0038 made the site unconditional under
+	// GOOPG_NARROW_UPPER, so nothing reads the variable. `off` in an older
+	// artefact is the un-narrowed-Sort arm.
+	"GOOPG_NARROW_UPPER_SORT": "M0147-0038",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

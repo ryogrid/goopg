@@ -403,19 +403,16 @@ func TestNarrowSortInputLeavesNoPartialRewrite(t *testing.T) {
 	}
 }
 
-// TestApplyUpperSortNarrowingFlagOff: `GOOPG_NARROW_UPPER_SORT=0` reproduces
-// the pre-slice-(c) tree bit-identically, and so does `GOOPG_NARROW_UPPER=0`.
-// The flag exists so a gate can measure the FLAG rather than the commit; a
-// flag that does not fully restore the old arm cannot do that.
+// TestApplyUpperSortNarrowingFlagOff: `GOOPG_NARROW_UPPER=0` reproduces the
+// pre-slice-(c) tree bit-identically. (Its own GOOPG_NARROW_UPPER_SORT=0 arm
+// was retired by M0147-0038.)
 func TestApplyUpperSortNarrowingFlagOff(t *testing.T) {
-	for _, tc := range []struct{ name, upper, upperSort string }{
-		{"GOOPG_NARROW_UPPER_SORT=0", "", "0"},
-		{"GOOPG_NARROW_UPPER=0", "0", ""},
+	for _, tc := range []struct{ name, upper string }{
+		{"GOOPG_NARROW_UPPER=0", "0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(u, us bool) { narrowUpper, narrowUpperSort = u, us }(narrowUpper, narrowUpperSort)
+			defer func(u bool) { narrowUpper = u }(narrowUpper)
 			narrowUpper = narrowUpperFromEnv(tc.upper)
-			narrowUpperSort = narrowUpperSortFromEnv(tc.upperSort)
 
 			proj, srt, _, _, _ := uncSortTree()
 			before := srt.Child

@@ -1,7 +1,5 @@
 package optimizer
 
-import "os"
-
 // upper_narrow_chain.go — B-01c APPLYING half, slice (c): the ANCESTOR-CHAIN
 // WALK, and the `*Sort` site it unblocks.
 //
@@ -112,20 +110,11 @@ import "os"
 //
 // A refusal at any point leaves the plan BIT-IDENTICAL to slice (b)'s.
 
-// narrowUpperSort resolves GOOPG_NARROW_UPPER_SORT at process start. Opt-out
-// polarity (`=0` disables), matching GOOPG_NARROW_UPPER and GOOPG_NARROW_BUILD.
-//
-// It is a SECOND flag rather than a widening of the first because the two
-// sites move different plans: slice (b) moves sorted-aggregate shapes, this one
-// moves every ORDER BY sort whose input is wider than what the chain above it
-// reads. An A/B that cannot separate them cannot attribute a regression to
-// either. `GOOPG_NARROW_UPPER=0` still disables both — this site is a strict
+// This site shipped behind its own opt-out flag, GOOPG_NARROW_UPPER_SORT
+// (`=0` disabled it), so an A/B could separate it from slice (b)'s Aggregate
+// site. M0147-0038 retired that flag: no gate, CI or bench script ever set
+// it. `GOOPG_NARROW_UPPER=0` still disables both sites — this one is a strict
 // extension of that pass, not a parallel one.
-var narrowUpperSort = narrowUpperSortFromEnv(os.Getenv("GOOPG_NARROW_UPPER_SORT"))
-
-// narrowUpperSortFromEnv is the flag's polarity, factored out so tests and
-// flaglabels.go resolve the same default the process starts with.
-func narrowUpperSortFromEnv(v string) bool { return v != "0" }
 
 // ---------------------------------------------------------------------
 // The driver
@@ -153,7 +142,7 @@ func narrowUpperSortFromEnv(v string) bool { return v != "0" }
 // afterwards sees that Project as an ABSORBER on its own chain — which is
 // correct, and is why the chain is re-derived at every site rather than cached.
 func applyUpperSortNarrowing(root Node, refs map[Node]int) {
-	if !narrowUpper || !narrowUpperSort || root == nil {
+	if !narrowUpper || root == nil {
 		return
 	}
 	applyUpperSortNarrowingAt(root, nil, map[Node]bool{}, refs)

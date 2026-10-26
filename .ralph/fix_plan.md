@@ -5015,6 +5015,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `eff6e2294`** \(M0147\-0036 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `f8a8392fd`** \(M0147\-0037 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7724,9 +7727,16 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
     22/22, RegressSuite, Isolation\.
   - executor subplan_hash.go:48; ON = PG hashed SubPlan; SetHashedSubPlanEnabled ×10; the linear path survives as the non-hashable fallback. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0038 — retire `GOOPG_NARROW_UPPER_SORT` OFF arm**
+- [x] **M0147-0038 — retire `GOOPG_NARROW_UPPER_SORT` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 13→12 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `narrowUpperSort` \+ resolver deleted; the upper\-Sort
+    narrowing site is unconditional under GOOPG\_NARROW\_UPPER \(0039 next\); flaglabels → `retired\(M0147\-0038\)`,
+    planner\-flags\.env regenerated; the flag\-off test keeps its NARROW\_UPPER=0 case\. Design doc
+    `docs/design/0100\-0149/m0147\-0038\-retire\-narrow\-upper\-sort\.md`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - optimizer upper_narrow_chain.go:124; 2 direct test refs; flaglabels row. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0039 — retire `GOOPG_NARROW_UPPER` OFF arm**
   Kind: impl
