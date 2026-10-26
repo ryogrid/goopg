@@ -70,7 +70,7 @@ func TestScanAbsorbsQualAndDropsFilterOp(t *testing.T) {
 
 // TestScanAbsorbedQualValuesMatchFilterOp is the values pin: for the same
 // query, the absorbed-qual path must return exactly what the pre-E-17
-// filterOp path returned. GOOPG_SCAN_PREFILTER=off restores the old seam
+// filterOp path returned. scanPrefilterForceLate restores the old seam
 // (scan deforms everything, qual evaluated at the LATE position only), so the
 // two positions are compared against each other on the same data.
 //
@@ -89,9 +89,9 @@ func TestScanAbsorbedQualValuesMatchFilterOp(t *testing.T) {
 		t.Run(q, func(t *testing.T) {
 			var got [2][]Row
 			for i, early := range []bool{true, false} {
-				SetScanPrefilterEnabled(early)
+				scanPrefilterForceLate.Store(!early)
 				func() {
-					defer SetScanPrefilterEnabled(true)
+					defer scanPrefilterForceLate.Store(false)
 					ctx, cat, cleanup := newStorageFixture(t)
 					defer cleanup()
 					tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
@@ -295,7 +295,7 @@ func findLockRowsOpInTree(op Operator) *lockRowsOp {
 func TestScanAbsorbedQualErrorPosition(t *testing.T) {
 	// Non-vacuity: the qual below must actually take the EARLY position
 	// when enabled, or the early arm proves nothing about promotion.
-	SetScanPrefilterEnabled(true)
+	scanPrefilterForceLate.Store(false)
 	func() {
 		ctx, cat, cleanup := newStorageFixture(t)
 		defer cleanup()
@@ -323,8 +323,8 @@ func TestScanAbsorbedQualErrorPosition(t *testing.T) {
 	}()
 	for _, early := range []bool{true, false} {
 		t.Run(map[bool]string{true: "early", false: "late"}[early], func(t *testing.T) {
-			SetScanPrefilterEnabled(early)
-			defer SetScanPrefilterEnabled(true)
+			scanPrefilterForceLate.Store(!early)
+			defer scanPrefilterForceLate.Store(false)
 			ctx, cat, cleanup := newStorageFixture(t)
 			defer cleanup()
 			tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
