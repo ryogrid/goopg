@@ -231,7 +231,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 	// survives to feed whatever wants it above (an ordered input to an upper
 	// rel, or an outer pathkey chain through the NLs over it).
 	cheapestPartial := rel.PartialPathlist[0]
-	incOn := incrementalSortPathsMode == incrementalSortOn && s.cp.enableIncrementalSort
+	incOn := s.cp.enableIncrementalSort
 	u := rel.usefulKeys
 	if u == nil {
 		u = s.pathkeyUsefulnessFor(rel.Relids)

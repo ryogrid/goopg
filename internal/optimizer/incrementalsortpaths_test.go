@@ -6,15 +6,6 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// withIncrementalSortMode flips the package knob for one test and restores
-// it, mirroring uniqueify_hash_builders_test.go's gatherPathsMode convention.
-func withIncrementalSortMode(t *testing.T, m incrementalSortMode) {
-	t.Helper()
-	prev := incrementalSortPathsMode
-	incrementalSortPathsMode = m
-	t.Cleanup(func() { incrementalSortPathsMode = prev })
-}
-
 // incrementalSortFixture builds the same shape
 // TestCreateOrderedPathsThreadsSearchCandidatesOntoOrderedRel /
 // TestCreateOrderedPathsValidatesSearchCandidatePathkeys use — a searched-tree
@@ -43,24 +34,21 @@ func incrementalSortFixture() (u *upperRels, in *searchedPricedNode, cand1, cand
 	return u, in, cand1, cand2
 }
 
-// TestAddIncrementalSortPathsOffIsInert pins the escape hatch: with
-// GOOPG_INCREMENTAL_SORT=off, createOrderedPaths' ordered.Pathlist is exactly
+// TestAddIncrementalSortPathsOffIsInert pins PG's switch for this arm: with
+// enable_incremental_sort off, createOrderedPaths' ordered.Pathlist is exactly
 // what it was before the third arm existed (seed's full Sort alone) even
 // though a genuinely partial-prefix-matching search candidate is present.
-// Default ON since M0146-0006.
+// (Rebased from the retired GOOPG_INCREMENTAL_SORT=off arm, M0147-0043.)
 func TestAddIncrementalSortPathsOffIsInert(t *testing.T) {
-	if incrementalSortPathsMode != incrementalSortOn {
-		t.Fatalf("incrementalSortPathsMode = %v, want the package default on (M0146-0006)", incrementalSortPathsMode)
-	}
-	withIncrementalSortMode(t, incrementalSortOff)
 	cp := defaultCostParams()
+	cp.enableIncrementalSort = false
 	u, in, _, _ := incrementalSortFixture()
 
 	createOrderedPaths(u, in, upperOrderedKeys(), 0, cp, 0, -1, nil)
 
 	ordered := fetchUpperRel(u, UpperOrdered, 0, 0)
 	if len(ordered.Pathlist) != 1 {
-		t.Fatalf("ordered.Pathlist = %d entries, want 1 (the seed's full Sort only) — the third arm must stay off under the escape hatch", len(ordered.Pathlist))
+		t.Fatalf("ordered.Pathlist = %d entries, want 1 (the seed's full Sort only) — the third arm must stay off with enable_incremental_sort off", len(ordered.Pathlist))
 	}
 	if ordered.Pathlist[0].Kind != PathSort {
 		t.Fatalf("ordered.Pathlist[0].Kind = %d, want PathSort", ordered.Pathlist[0].Kind)
@@ -103,7 +91,6 @@ func incrementalSortOrderedFixture() (ordered *RelOptInfo, seedNode *pricedNode,
 // full Sort. The positive case runs end to end in the executor's
 // TestGroupAggIncrementalSortOverPresortedInput / the fire set.
 func TestAddIncrementalSortPathsDeclinesACandidateTheBoundaryCannotRebuild(t *testing.T) {
-	withIncrementalSortMode(t, incrementalSortOn)
 	cp := defaultCostParams()
 	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
 	ordered, _, seed := incrementalSortOrderedFixture()
@@ -131,7 +118,6 @@ func TestAddIncrementalSortPathsDeclinesACandidateTheBoundaryCannotRebuild(t *te
 // M0141-S2b-2c's still-open "actual tournament" scope) — this arm must not
 // double-offer it as an Incremental Sort of its own child.
 func TestAddIncrementalSortPathsSkipsAFullyContainedCandidate(t *testing.T) {
-	withIncrementalSortMode(t, incrementalSortOn)
 	cp := defaultCostParams()
 	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
 	ordered, _, seed := incrementalSortOrderedFixture()
@@ -159,7 +145,6 @@ func TestAddIncrementalSortPathsSkipsAFullyContainedCandidate(t *testing.T) {
 // Incremental Sort with nCommon=0 would just be `costSortRun` under a
 // different name for a candidate this arm was never meant to touch.
 func TestAddIncrementalSortPathsSkipsAZeroPrefixCandidate(t *testing.T) {
-	withIncrementalSortMode(t, incrementalSortOn)
 	cp := defaultCostParams()
 	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
 	ordered, _, seed := incrementalSortOrderedFixture()
@@ -178,36 +163,12 @@ func TestAddIncrementalSortPathsSkipsAZeroPrefixCandidate(t *testing.T) {
 	}
 }
 
-// TestIncrementalSortModeFromEnv pins the env-string contract: default ON
-// since M0146-0006 (PG's enable_incremental_sort defaults on), with `off`
-// as the escape hatch.
-func TestIncrementalSortModeFromEnv(t *testing.T) {
-	cases := map[string]incrementalSortMode{
-		"":      incrementalSortOn,
-		"off":   incrementalSortOff,
-		"OFF":   incrementalSortOff,
-		"0":     incrementalSortOff,
-		"false": incrementalSortOff,
-		"bogus": incrementalSortOn,
-		"on":    incrementalSortOn,
-		"ON":    incrementalSortOn,
-		"1":     incrementalSortOn,
-		"true":  incrementalSortOn,
-		" on ":  incrementalSortOn,
-	}
-	for in, want := range cases {
-		if got := incrementalSortModeFromEnv(in); got != want {
-			t.Errorf("incrementalSortModeFromEnv(%q) = %v, want %v", in, got, want)
-		}
-	}
-}
-
 // TestAddOrderedPathsIncrementallySortsAPresortedSeed pins M0146-0005bp:
 // create_ordered_paths gives the cheapest input an Incremental Sort — and no
 // full Sort — when its pathkeys deliver a leading prefix of the ORDER BY and
 // enable_incremental_sort is on (planner.c), and a full Sort when the GUC is
-// off. Independent of the GOOPG_INCREMENTAL_SORT knob, which gates only the
-// other-candidates arm.
+// off. The other-candidates arm (addIncrementalSortPaths) answers to the same
+// GUC.
 func TestAddOrderedPathsIncrementallySortsAPresortedSeed(t *testing.T) {
 	sortPathkeys := pathkeysForSortKeys(upperOrderedKeys())
 	for _, on := range []bool{true, false} {

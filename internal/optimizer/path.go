@@ -132,10 +132,11 @@ const (
 	// sort, not the whole input). Produced only by `addIncrementalSortPaths`
 	// (incrementalsortpaths.go). `createPlanNode` HAS an arm for it
 	// (`createIncrementalSortPlan`, createplansimple.go, exec-b) and the
-	// executor operator exists (`incrementalSortOp`, exec-a) — the flag
-	// (`GOOPG_INCREMENTAL_SORT`) stays off by default not because either is
-	// missing but because the 2026-09-17h corpus measurement (design doc's
-	// own update) found the arm inert on the full TPC-DS corpus at HEAD:
+	// executor operator exists (`incrementalSortOp`, exec-a). The arm is
+	// gated only by PG's `enable_incremental_sort` (its GOOPG_INCREMENTAL_SORT
+	// switch was promoted at M0146-0006 and retired at M0147-0043). It was
+	// held off until then because the 2026-09-17h corpus measurement (design
+	// doc's own update) found the arm inert on the full TPC-DS corpus:
 	// `ordered.SearchCandidates`/`SearchCandidateKeys` are populated only
 	// inside `createOrderedPaths`, and `electOrderedGrouping` — the GROUP_AGG
 	// upper rel's own ORDER BY election loop — calls `addOrderedPaths`

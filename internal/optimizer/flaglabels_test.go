@@ -115,9 +115,15 @@ var goopgEnvName = regexp.MustCompile(`^GOOPG_[A-Z0-9_]+$`)
 // which a raw-text regex would report as reads.
 func plannerEnvNames(t *testing.T) map[string]string {
 	t.Helper()
+	return plannerEnvNamesExcept(t, "")
+}
+
+// plannerEnvNamesExcept is plannerEnvNames with one source file left out.
+func plannerEnvNamesExcept(t *testing.T, skip string) map[string]string {
+	t.Helper()
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
+		return !strings.HasSuffix(fi.Name(), "_test.go") && fi.Name() != skip
 	}, 0)
 	if err != nil {
 		t.Fatalf("parse package dir: %v", err)
@@ -174,13 +180,16 @@ func TestFlagProvenanceTableCoversPlannerEnv(t *testing.T) {
 // through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT was
 // the flag that slipped through (read via envFloatDefault, later via
 // os.Getenv into indexProbeMultFromEnv) until M0146-0159 retired it.
-// GOOPG_INCREMENTAL_SORT has the same shape — os.Getenv handed to
-// incrementalSortModeFromEnv at package init — so its presence in the
-// detector's output is the regression test for the detector.
+// GOOPG_NLI_COSTGATE has the same shape — os.Getenv handed to
+// nliCostGateLegacyFromEnv at package init — so its presence in the
+// detector's output is the regression test for the detector. flaglabels.go
+// is left out of the scan because it names every flag, live or retired, and
+// would satisfy the check on its own. (The fixture was GOOPG_INCREMENTAL_SORT
+// until M0147-0043 retired that read.)
 func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
-	names := plannerEnvNames(t)
-	if _, ok := names["GOOPG_INCREMENTAL_SORT"]; !ok {
-		t.Fatal("detector did not see GOOPG_INCREMENTAL_SORT; the helper-wrapped-read hole is back")
+	names := plannerEnvNamesExcept(t, "flaglabels.go")
+	if _, ok := names["GOOPG_NLI_COSTGATE"]; !ok {
+		t.Fatal("detector did not see GOOPG_NLI_COSTGATE; the helper-wrapped-read hole is back")
 	}
 }
 

@@ -108,13 +108,6 @@ var flagResolvedState = map[string]func(string) string{
 		}
 		return "current"
 	},
-	// M0141-S2b-2c / S7: gates addOrderedPaths' third arm (Incremental Sort
-	// over a losing search candidate). It shipped default off while
-	// createPlanNode had no PathIncrementalSort arm; default ON since the
-	// executor operator landed.
-	"GOOPG_INCREMENTAL_SORT": func(v string) string {
-		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
-	},
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -203,6 +196,7 @@ var flagProvenanceOrder = []string{
 	// Joined at M0141-S2b-2c / S7: gates addOrderedPaths' third arm
 	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
 	// for PathIncrementalSort until the executor operator lands.
+	// Retired at M0147-0043 — see flagProvenanceRetired.
 	"GOOPG_INCREMENTAL_SORT",
 	// Joined at M0145-0011: bypassed the `outer-over-derived` firewall
 	// (relfromjoinlist.go). Retired at M0145-0018 — see
@@ -363,6 +357,12 @@ var flagProvenanceRetired = map[string]string{
 	// planner width is valid, so nothing reads the variable. `off` in an
 	// older artefact is the goopg-currency Sort arm.
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": "M0147-0042",
+	// addOrderedPaths' third arm (Incremental Sort over a losing search
+	// candidate; default on since M0146-0006, `off` dropped the arm).
+	// M0147-0043 left the arm gated only by PG's enable_incremental_sort, so
+	// nothing reads the variable. `off` in an older artefact is the
+	// seed-only ORDERED tournament.
+	"GOOPG_INCREMENTAL_SORT": "M0147-0043",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

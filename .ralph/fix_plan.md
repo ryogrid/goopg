@@ -5030,6 +5030,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `6c45b63bd`** \(M0147\-0041 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261027b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `77d4c33b6`** \(M0147\-0042 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -5748,6 +5751,20 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > \#\# ESCALATION 2026\-10\-16 \(S2\) — M0146\-0205: COPY inside BEGIN … ROLLBACK keeps its rows
   > Wrong results and loss of atomicity: a client that rolls back a failed load keeps its partial rows\. Filed under
   > M0146\-0204\. Owner: place it, or confirm below item 10\.
+- [ ] **M0146-0243 — Incremental Sort path counts `enable_sort` in `DisabledNodes`; PG's does not** \(filed 2026\-10\-27
+  by M0147\-0043\)\. `incrementalSortPathWithGroups` \(`internal/optimizer/incrementalsortpaths.go`\) sets
+  `DisabledNodes: disabledNodesFor\(\!cp\.enableSort, sub\)` and its comment says cost\_incremental\_sort folds
+  enable\_sort in via cost\_sort\. It does not: PG 18\.3 `cost_incremental_sort` asserts `enable_incremental_sort`
+  and sets `path\->disabled_nodes = input_disabled_nodes` \(`postgres/src/backend/optimizer/path/costsize.c:2123\-2125`\);
+  only `cost_sort` adds `enable_sort ? 0 : 1` \(:2162\)\. With `enable_sort=off` goopg disables an Incremental Sort that
+  PG would keep, so the ORDERED tournament can pick a different arm\.
+  Kind: impl
+  Parent: none
+  - Rank: below item 10 — no TPC\-H/TPC\-DS query diverges at default GUCs \(the census runs with enable\_sort on\)
+    \(S7 carve\-out\)\.
+  - First step: set `DisabledNodes` to the input's own count \(`sub\.DisabledNodes`\), fix the comment, and pin it with
+    a unit test that plans the ORDERED rel under `enable_sort=off` and expects the Incremental Sort to keep zero
+    disabled nodes; cross\-check one `SET enable_sort = off` EXPLAIN against a scratch PG\.
 - [x] **M0146-0206 — VACUUM tail truncation leaves the visibility map untruncated, so relallvisible exceeds relpages; a tail emptied by DELETE is not truncated** \(filed 2026\-10\-16 by M0146\-0204\)\.
   DONE 2026\-10\-16 \(owner, a181f6bfd\): `VisibilityMap\.TruncateRel` beside `opts\.FSM\.TruncateRel`,
   `VMTruncateForkForHeap` as the smgr\_redo `SMGR\_TRUNCATE\_VM` arm \(visibilitymap\_prepare\_truncate —
@@ -7803,9 +7820,21 @@ Basis: the 2026-10-21 lever census and its review
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(321 s\), Isolation PASS \(559 s\)\. The first acceptance and
     sf025 attempts refused while the nightly ran \(01:05\-02:21\); both passed on rerun after it ended\.
   - optimizer sort_pgrelationbytes.go:17; ON = PG cost_sort relation bytes; setPGSortRelationBytesCostForTest ×8; keep the invalid-width fallback (M0147-0021 pattern). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0043 — retire `GOOPG_INCREMENTAL_SORT` OFF arm**
+- [x] **M0147-0043 — retire `GOOPG_INCREMENTAL_SORT` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 8→7 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `77d4c33b6`; M0122\-0012 yielded under rule \(a\)\)\. Mode type, env read
+    and both setters deleted; `addIncrementalSortPaths` and the `generateUsefulGatherPaths` sibling gate only on
+    `cp\.enableIncrementalSort` \(PG's enable\_incremental\_sort\); flaglabels → `retired\(M0147\-0043\)`,
+    planner\-flags\.env regenerated\. Design doc `docs/design/0100\-0149/m0147\-0043\-retire\-incremental\-sort\.md`\.
+  - Tests: the OFF\-is\-inert test rebased onto `cp\.enableIncrementalSort = false`; three ON pins and the env\-polarity
+    test deleted; the flag\-detector test's helper\-wrapped fixture moved to `GOOPG_NLI_COSTGATE`, scanning with
+    `flaglabels\.go` excluded \(it names every flag and made the check vacuous\)\.
+  - Finding: the Incremental Sort path charges `enable_sort` in `DisabledNodes`; PG's `cost_incremental_sort` does
+    not \(costsize\.c:2123\-2125\)\. Filed as M0146\-0243 \(below item 10\) with a ledger row\.
+  - Gates: units, spotcheck, acceptance PASS, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(647 s\)\.
   - optimizer incrementalsortpaths.go:86; 5 direct test refs; rebase onto PG enable_incremental_sort (PlannerSettings.EnableIncrementalSort). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0044 — retire `GOOPG_MEMOIZE` OFF arm**
   Kind: impl
