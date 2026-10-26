@@ -1,7 +1,5 @@
 package optimizer
 
-import "os"
-
 // upper_narrow_apply.go — B-01c APPLYING half, slice (b): the
 // NARROWING-AWARE UPPER REWRITER, and the first production site that
 // consumes it.
@@ -82,17 +80,10 @@ import "os"
 //
 // A refusal at any point leaves the plan BIT-IDENTICAL to today's.
 
-// narrowUpper resolves GOOPG_NARROW_UPPER at process start. Opt-out polarity
-// (`=0` disables), matching GOOPG_NARROW_BUILD and GOOPG_PGSHAPED_DP: the
-// flag exists so a gate can measure the FLAG rather than the commit, and so
-// the pre-flip behaviour is one export away. Read once, in the server —
-// putting it on a client command line sets it where nothing reads it.
-var narrowUpper = narrowUpperFromEnv(os.Getenv("GOOPG_NARROW_UPPER"))
-
-// narrowUpperFromEnv is the flag's polarity, factored out so tests resolve
-// the same default the process starts with (flaglabels.go's contract: no
-// literal restating a default elsewhere).
-func narrowUpperFromEnv(v string) bool { return v != "0" }
+// The pass shipped behind GOOPG_NARROW_UPPER (opt-out, `=0` disabled both
+// this Aggregate site and slice (c)'s Sort site) so a gate could measure the
+// flag rather than the commit. M0147-0039 retired it: no gate, CI or bench
+// script ever set it, and the pass is unconditional.
 
 // ---------------------------------------------------------------------
 // The driver
@@ -114,7 +105,7 @@ func narrowUpperFromEnv(v string) bool { return v != "0" }
 // kind simply ends the descent. Missing a site costs memory; walking into a
 // kind whose child coordinates are not what they look like costs correctness.
 func applyUpperNarrowing(n Node) Node {
-	if !narrowUpper || n == nil {
+	if n == nil {
 		return n
 	}
 	// One census of the tree's parent edges, shared by both passes: a node

@@ -84,12 +84,6 @@ var flagResolvedState = map[string]func(string) string{
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
 	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
-	// B-01c applying half, slice (b): narrows the input row of an upper
-	// Aggregate site whose stamped target the key-preservation gate passes,
-	// sinking the cut past order-preserving wrappers so the Sort beneath a
-	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
-	// Default ON, `=0` opts back out to the un-narrowed arm.
-	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
 	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
 	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
 	// above, so the in/out distinction no longer separates them -- but it is
@@ -168,6 +162,7 @@ var flagProvenanceOrder = []string{
 	// Aggregate site's input row and sinks the cut past the Sort beneath a
 	// sorted aggregation, so an artefact that does not name it cannot say
 	// which sort payload it measured. Default ON.
+	// Retired at M0147-0039 — see flagProvenanceRetired.
 	"GOOPG_NARROW_UPPER",
 	// Joined at take3 B-01c applying half, slice (c): narrows the general
 	// ORDER BY sort's input row and re-bases the ancestor chain above it, so an
@@ -352,6 +347,11 @@ var flagProvenanceRetired = map[string]string{
 	// GOOPG_NARROW_UPPER, so nothing reads the variable. `off` in an older
 	// artefact is the un-narrowed-Sort arm.
 	"GOOPG_NARROW_UPPER_SORT": "M0147-0038",
+	// B-01c slice (b)'s upper-narrowing pass switch (default on, `=0` opted
+	// out of both the Aggregate and the Sort site). M0147-0039 made the pass
+	// unconditional, so nothing reads the variable. `off` in an older artefact
+	// is the un-narrowed-upper arm.
+	"GOOPG_NARROW_UPPER": "M0147-0039",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

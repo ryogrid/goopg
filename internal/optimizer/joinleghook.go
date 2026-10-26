@@ -36,7 +36,7 @@ import (
 // joinKeepSet / neededKeepSet) rather than inventing a second one, and
 // calls narrowPlanOutput with the result — the same "wrap in a *Project
 // naming only the kept columns" mechanism GOOPG_NARROW_BUILD and
-// GOOPG_NARROW_UPPER/GOOPG_NARROW_UPPER_SORT already ship. It is now
+// upper-narrowing passes already ship. It is now
 // genuinely load-bearing: a leg this hook narrows changes the plan (the new
 // *Project node) and the row width flowing into whatever join sits above
 // it.

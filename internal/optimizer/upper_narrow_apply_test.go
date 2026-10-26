@@ -154,38 +154,6 @@ func TestApplyUpperNarrowingDeclinesHashAggregate(t *testing.T) {
 	}
 }
 
-// TestApplyUpperNarrowingFlagOff: `GOOPG_NARROW_UPPER=0` reproduces the
-// pre-flip tree exactly, so a gate can measure the FLAG rather than the
-// commit.
-func TestApplyUpperNarrowingFlagOff(t *testing.T) {
-	if !narrowUpperFromEnv("") {
-		t.Fatal("the flag's default is off; this test and the wiring assume on")
-	}
-	if narrowUpperFromEnv("0") {
-		t.Fatal("`=0` did not opt out")
-	}
-	saved := narrowUpper
-	narrowUpper = false
-	defer func() { narrowUpper = saved }()
-
-	node, err := Plan(parseOne(t, "SELECT a, count(DISTINCT b) FROM wide GROUP BY a"), unaWideCatalog(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	agg, ok := unaFind[*Aggregate](node)
-	if !ok {
-		t.Fatal("no Aggregate in the plan")
-	}
-	if !agg.InputTargetKnown {
-		t.Fatal("the pass ran with the flag off")
-	}
-	if srt, ok := agg.Child.(*Sort); ok {
-		if _, isProj := srt.Child.(*Project); isProj {
-			t.Fatal("a narrowing Project was inserted with the flag off")
-		}
-	}
-}
-
 func unaDump(n Node, d int) string {
 	if n == nil {
 		return ""

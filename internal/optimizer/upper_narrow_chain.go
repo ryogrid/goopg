@@ -112,9 +112,9 @@ package optimizer
 
 // This site shipped behind its own opt-out flag, GOOPG_NARROW_UPPER_SORT
 // (`=0` disabled it), so an A/B could separate it from slice (b)'s Aggregate
-// site. M0147-0038 retired that flag: no gate, CI or bench script ever set
-// it. `GOOPG_NARROW_UPPER=0` still disables both sites — this one is a strict
-// extension of that pass, not a parallel one.
+// site; GOOPG_NARROW_UPPER=0 disabled both. M0147-0038 and M0147-0039
+// retired the two flags: no gate, CI or bench script ever set either, and
+// both sites are unconditional.
 
 // ---------------------------------------------------------------------
 // The driver
@@ -142,7 +142,7 @@ package optimizer
 // afterwards sees that Project as an ABSORBER on its own chain — which is
 // correct, and is why the chain is re-derived at every site rather than cached.
 func applyUpperSortNarrowing(root Node, refs map[Node]int) {
-	if !narrowUpper || root == nil {
+	if root == nil {
 		return
 	}
 	applyUpperSortNarrowingAt(root, nil, map[Node]bool{}, refs)

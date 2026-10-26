@@ -403,30 +403,6 @@ func TestNarrowSortInputLeavesNoPartialRewrite(t *testing.T) {
 	}
 }
 
-// TestApplyUpperSortNarrowingFlagOff: `GOOPG_NARROW_UPPER=0` reproduces the
-// pre-slice-(c) tree bit-identically. (Its own GOOPG_NARROW_UPPER_SORT=0 arm
-// was retired by M0147-0038.)
-func TestApplyUpperSortNarrowingFlagOff(t *testing.T) {
-	for _, tc := range []struct{ name, upper string }{
-		{"GOOPG_NARROW_UPPER=0", "0"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			defer func(u bool) { narrowUpper = u }(narrowUpper)
-			narrowUpper = narrowUpperFromEnv(tc.upper)
-
-			proj, srt, _, _, _ := uncSortTree()
-			before := srt.Child
-			uncApply(proj)
-			if srt.Child != before {
-				t.Fatalf("the pass fired with the flag off (child is %T)", srt.Child)
-			}
-			if idx := uncColIndices(proj.Targets); idx["b"] != 1 {
-				t.Fatalf("the pass rewrote an ancestor with the flag off: %v", idx)
-			}
-		})
-	}
-}
-
 // ---------------------------------------------------------------------
 // The ancestor-class inventory — the fail-closed pin
 // ---------------------------------------------------------------------
