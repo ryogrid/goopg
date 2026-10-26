@@ -406,7 +406,7 @@ type Path struct {
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
 	// executor hash sizing.
 	//
-	// R121 widened that reading: with GOOPG_NARROW_COST_INPUTS on, a base-rel
+	// R121 widened that reading: with cost-input narrowing (narrowcostinputs.go), a base-rel
 	// scan path carries the columns the STATEMENT needs, which is not
 	// literally what the path emits — goopg's SeqScan does not project, and
 	// neither does its Sort. The figures are a COST currency, and the safe

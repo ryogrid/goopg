@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -53,27 +52,23 @@ import (
 // `parallelism` staying 0, artefacts in
 // docs/design/not_ralph/plan_parity_fix_take2/r128-parity-over-throughput/.
 //
-// It is now opt-OUT (`v != "0"`), matching the sibling `GOOPG_NARROW_*`
-// family. It remains the only one of them that gates a planner COST input
-// rather than executor plan shape — that distinction survives promotion even
-// though the opt-in/opt-out split no longer marks it.
+// It shipped as opt-OUT (`GOOPG_NARROW_COST_INPUTS=0`); M0147-0041 retired
+// that switch, so narrowing is unconditional in the server.
 //
 // The trade is recorded rather than hidden (R128 SCOPE §4): promotion
 // re-baselines every plan pin, changes 3 TPC-DS shapes (Q6/Q64/Q75) for no
 // TPC-DS gain, and makes R124's accepted planner-publishes-below-executor
 // divergence the shipped default rather than an opt-in arm. It is taken
 // because the goal counts PG-likeness and disclaims runtime.
-var narrowCostInputs = narrowCostInputsFromEnv(os.Getenv("GOOPG_NARROW_COST_INPUTS"))
+//
+// narrowCostInputsForceOff is a test seam, not a lever: no environment
+// variable or GUC reaches it. TestNarrowCostInputsReachesTheLiveSearch needs
+// an un-narrowed arm as its oracle — a searched join cost that moves between
+// the arms is the only proof the production call site in relfromjoinlist.go
+// still runs (the scanPrefilterForceLate precedent, M0147-0034).
+var narrowCostInputsForceOff bool
 
-func narrowCostInputsFromEnv(v string) bool { return v != "0" }
-
-func narrowCostInputsEnabled() bool { return narrowCostInputs }
-
-func setNarrowCostInputsForTest(on bool) func() {
-	old := narrowCostInputs
-	narrowCostInputs = on
-	return func() { narrowCostInputs = old }
-}
+func narrowCostInputsEnabled() bool { return !narrowCostInputsForceOff }
 
 // narrowedWidths is the width triple a base rel's paths may carry, or a
 // decline. `ok == false` means "this rel narrows nothing" and every path of it
@@ -90,7 +85,7 @@ type narrowedWidths struct {
 // It declines — rather than narrowing to something smaller than the truth — on
 // every input it cannot attribute:
 //
-//   - the flag is off, or the rel/leaf is missing;
+//   - the test seam forces narrowing off, or the rel/leaf is missing;
 //   - `NeededColsKnown == false` (the collector declined; NOT the same as an
 //     empty set);
 //   - an EMPTY keep-set. `SELECT count(*)` needs no column, but `Path.NCols`
@@ -439,7 +434,7 @@ func narrowJoinWidths(p *Path) {
 
 	// Rule 4: an index-only child's triple is NOT this round's narrowing.
 	// pathindexonly.go writes NCols/AvgVarBytes/OutputWidth unconditionally,
-	// independent of this flag, so treating `NCols > 0` as "we narrowed it"
+	// independent of this narrowing, so treating `NCols > 0` as "we narrowed it"
 	// would launder an IOS triple into a join sum on a rel that declined —
 	// while the NLI path for that same joinrel (inner from
 	// CheapestParameterized, NCols == 0) declined. Two paths of one joinrel in
@@ -502,7 +497,7 @@ func inheritNarrowedWidths(parent, child *Path) {
 	// Do NOT launder an index-only triple onto a wrapper (rule 3).
 	//
 	// Index-only paths carry `NCols` unconditionally — they are written by
-	// pathindexonly.go whether or not this flag is set, and they are the one
+	// pathindexonly.go whether or not this round narrows, and they are the one
 	// documented exemption from the all-or-none rule at the SCAN level. But a
 	// Gather is not exempt: it is a path this round writes. Without this
 	// guard, a rel that DECLINES to narrow (nil ColVarBytes — an un-ANALYZEd

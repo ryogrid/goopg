@@ -91,7 +91,6 @@ var flagResolvedState = map[string]func(string) string{
 	// basis. (The previous comment here asserted "this one is opt-IN"; that
 	// was true until the promotion and is corrected rather than dropped, so a
 	// reader of an older artefact can date it.)
-	"GOOPG_NARROW_COST_INPUTS": func(v string) string { return onOff(narrowCostInputsFromEnv(v)) },
 	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
 	// search may choose a Gather at all, and at which rels, so an artefact
 	// that does not name it cannot say whether the plans it holds were free
@@ -176,6 +175,7 @@ var flagProvenanceOrder = []string{
 	// Retired at M0147-0031 — see flagProvenanceRetired.
 	"GOOPG_NARROW_LEG_HOOK",
 	// Joined at R121 (r121-narrow-cost-inputs/SCOPE.md). Default `off`.
+	// Retired at M0147-0041 — see flagProvenanceRetired.
 	"GOOPG_NARROW_COST_INPUTS",
 	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
 	// into the search. Default `all` since M0140-0003 landed the TPC-H/
@@ -357,6 +357,11 @@ var flagProvenanceRetired = map[string]string{
 	// sites unconditional, so nothing reads the variable. `off` in an older
 	// artefact is the un-narrowed-build arm.
 	"GOOPG_NARROW_BUILD": "M0147-0040",
+	// R121's cost-input narrowing switch (default on since R128, `=0` opted
+	// out to full-relation widths in the planner's cost inputs). M0147-0041
+	// made the narrowing unconditional, so nothing reads the variable. `off`
+	// in an older artefact is the un-narrowed-cost arm.
+	"GOOPG_NARROW_COST_INPUTS": "M0147-0041",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

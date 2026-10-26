@@ -291,12 +291,11 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// also the contract Path.NCols' own doc states ("read them through
 		// pathNCols ..., never directly").
 		//
-		// UNCONDITIONAL. R128 note: GOOPG_NARROW_COST_INPUTS is now DEFAULT
-		// ON, so the interesting arm is no longer the one this paragraph was
-		// written for -- narrowing normally DOES reach pathNCols here. The
-		// invariant below is still worth stating, and still holds, but read it
-		// as covering the opted-OUT arm (`=0`) rather than the default:
-		// with narrowing off the ONLY writer of Path.NCols is
+		// UNCONDITIONAL. Cost-input narrowing has been unconditional since
+		// M0147-0041 (default ON since R128), so narrowing normally DOES reach
+		// pathNCols here. The invariant below covers a rel that declines to
+		// narrow (and the un-narrowed test seam):
+		// with no narrowing the ONLY writer of Path.NCols is
 		// pathindexonly.go, and getMemoizePath cannot reach here on an
 		// index-only inner -- memoizeCacheKeys returns (nil,false) when
 		// len(innerPath.IndexClauses)==0, and the index-only producer emits

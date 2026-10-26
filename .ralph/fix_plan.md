@@ -5024,6 +5024,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `61b3b0dbe`** \(M0147\-0039 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `16101a6a1`** \(M0147\-0040 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7768,9 +7771,19 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(363 s\), Isolation PASS \(543 s\)\.
   - optimizer narrowoutput.go:11; 34 direct test refs in 2 files. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0041 — retire `GOOPG_NARROW_COST_INPUTS` OFF arm**
+- [x] **M0147-0041 — retire `GOOPG_NARROW_COST_INPUTS` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 10→9 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `16101a6a1`; M0122\-0012 yielded under rule \(a\)\)\. Env read,
+    `narrowCostInputsFromEnv`, `setNarrowCostInputsForTest` and the resolver deleted; flaglabels →
+    `retired\(M0147\-0041\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0041\-retire\-narrow\-cost\-inputs\.md`\.
+  - Tests: the live\-search pin uses the OFF arm as a genuine oracle \(a searched join cost must move\), so it keeps an
+    env\-free seam `narrowCostInputsForceOff` \(scanPrefilterForceLate precedent\)\. 24 ON pins and four switch\-only
+    tests deleted; no cost pin needed re\-deriving, since ON was already the default every pin ran under\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(311 s\), Isolation PASS \(547 s\)\.
   - optimizer narrowcostinputs.go:66; setNarrowCostInputsForTest ×30; cost pins re-derived at narrowed widths. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0042 — retire `GOOPG_PG_SORT_RELATION_BYTES_COST` OFF arm (goopg Sort currency)**
   Kind: impl
