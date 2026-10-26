@@ -5021,6 +5021,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `529af8c85`** \(M0147\-0038 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `61b3b0dbe`** \(M0147\-0039 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7752,9 +7755,18 @@ Basis: the 2026-10-21 lever census and its review
     both\), TPC\-H census on tree 22/22, Isolation; RegressSuite PASS on rerun \(first run: no case diverged, only a
     `TempDir RemoveAll … directory not empty` teardown flake\)\.
   - optimizer upper_narrow_apply.go:90; 5 direct test refs in 2 files; it also gates NARROW_UPPER_SORT — land after 0038. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0040 — retire `GOOPG_NARROW_BUILD` OFF arm**
+- [x] **M0147-0040 — retire `GOOPG_NARROW_BUILD` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 11→10 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(M0122\-0012 yielded under rule \(a\)\)\. `narrowBuild` \+ `narrowBuildFromEnv` \+ resolver
+    deleted; `narrowBuildInput` and `narrowMergeInput` decline only on structural conditions; flaglabels →
+    `retired\(M0147\-0040\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0040\-retire\-narrow\-build\.md`\.
+  - Tests: none of the 34 refs was an OFF\-arm oracle — nine ON pins deleted, the wiring test's flag column and
+    flag\-off case dropped, the merge subtest kept its keyless half, the polarity test went with its function\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(363 s\), Isolation PASS \(543 s\)\.
   - optimizer narrowoutput.go:11; 34 direct test refs in 2 files. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0041 — retire `GOOPG_NARROW_COST_INPUTS` OFF arm**
   Kind: impl

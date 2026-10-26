@@ -83,7 +83,6 @@ var flagResolvedState = map[string]func(string) string{
 	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
 	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
 	// opts back out to the un-narrowed arm.
-	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
 	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
 	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
 	// above, so the in/out distinction no longer separates them -- but it is
@@ -157,6 +156,7 @@ var flagProvenanceOrder = []string{
 	// not name it cannot say which arm it measured.
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
 	// default ON since step 5 (P4-A §18 steps 3-5).
+	// Retired at M0147-0040 — see flagProvenanceRetired.
 	"GOOPG_NARROW_BUILD",
 	// Joined at take3 B-01c applying half, slice (b): narrows an upper
 	// Aggregate site's input row and sinks the cut past the Sort beneath a
@@ -352,6 +352,11 @@ var flagProvenanceRetired = map[string]string{
 	// unconditional, so nothing reads the variable. `off` in an older artefact
 	// is the un-narrowed-upper arm.
 	"GOOPG_NARROW_UPPER": "M0147-0039",
+	// P4-01 rev 10's build-side narrowing switch (default on, `=0` opted out
+	// of both the hash-build and the merge-input site). M0147-0040 made both
+	// sites unconditional, so nothing reads the variable. `off` in an older
+	// artefact is the un-narrowed-build arm.
+	"GOOPG_NARROW_BUILD": "M0147-0040",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

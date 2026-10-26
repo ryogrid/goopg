@@ -8,7 +8,7 @@ import (
 // "The structural blocker, already located").
 //
 // joinInputsFor (createplanjoin.go) already narrows a hash join's INNER
-// (build) side (narrowBuildInput, narrowoutput.go, GOOPG_NARROW_BUILD) and
+// (build) side (narrowBuildInput, narrowoutput.go) and
 // BOTH sides of a merge join (narrowMergeInput). Three legs it never
 // reaches, because nothing in the pipeline ever wraps them: a hash join's
 // OUTER (probe) side, and both sides of every nested-loop shape (plain NL
@@ -35,7 +35,7 @@ import (
 // narrowBuildInput's existing keep-set derivation (buildKeepSet /
 // joinKeepSet / neededKeepSet) rather than inventing a second one, and
 // calls narrowPlanOutput with the result — the same "wrap in a *Project
-// naming only the kept columns" mechanism GOOPG_NARROW_BUILD and
+// naming only the kept columns" mechanism the build-side and
 // upper-narrowing passes already ship. It is now
 // genuinely load-bearing: a leg this hook narrows changes the plan (the new
 // *Project node) and the row width flowing into whatever join sits above

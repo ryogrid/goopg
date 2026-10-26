@@ -609,8 +609,8 @@ type RelOptInfo struct {
 	// as DATA on the rel, the way NCols and AvgVarBytes already do.
 	//
 	// take2 P4-01 rev 10 step 1. Nothing reads these yet — the consumer is the
-	// build-side narrowing in `joinInputsFor`, which lands behind
-	// GOOPG_NARROW_BUILD in a later slice. Added first, and separately, so that
+	// build-side narrowing in `joinInputsFor`, which landed in a later slice
+	// (unconditional since M0147-0040). Added first, and separately, so that
 	// commit changes one thing.
 	//
 	// NeededColsKnown false means "no information": the collector declined the
