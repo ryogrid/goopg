@@ -145,11 +145,6 @@ func TestJoinSeamEngagesUnderBuildWorker(t *testing.T) {
 	if _, err := op.Next(); err != nil {
 		t.Fatalf("first row: %v", err)
 	}
-	if !j.lazyChainProbe {
-		t.Fatal("seam is OFF in a worker-built join: ensureLazyVirtual read " +
-			"joinSlotChainEnabled as false. Fusion declines in workers by " +
-			"design (C10/F4); the P1.1 seam must not")
-	}
 	if j.lazyProbeSrc == nil {
 		t.Fatal("no probe slot bound after the first emitted row")
 	}
@@ -167,8 +162,9 @@ func TestJoinSeamEngagesUnderBuildWorker(t *testing.T) {
 // the chained emit and retained across later pulls must still be correct and
 // still be arena-free.
 //
-// Both seam arms run, and both are compared against the SAME serial baseline,
-// so this is also the identity check for the seam at the transfer boundary.
+// The chained seam is compared against a serial baseline, so this is also the
+// identity check for the seam at the transfer boundary. (A pre-P1.1
+// "killswitch" arm ran here too until M0147-0035 retired GOOPG_JOIN_SLOT_CHAIN.)
 func TestJoinSeamWorkerTransferIndependence(t *testing.T) {
 	ctx, cleanup := pqJoinFixture(t)
 	defer cleanup()
@@ -183,23 +179,10 @@ func TestJoinSeamWorkerTransferIndependence(t *testing.T) {
 		t.Fatal("fixture produced no joined rows; the comparison is vacuous")
 	}
 
-	for _, chained := range []bool{true, false} {
-		name := "chained"
-		if !chained {
-			name = "killswitch"
-		}
-		t.Run(name, func(t *testing.T) {
-			SetJoinSlotChainEnabled(chained)
-			defer SetJoinSlotChainEnabled(true)
-
-			// The flag is read once per joinOp in ensureLazyVirtual, so the
-			// plan must be built AFTER it is set.
+	{
+		t.Run("chained", func(t *testing.T) {
 			node := planWorkerQuery(t, ctx, workerSeamSQL)
-			got, joins := drainWorkerTree(t, ctx, node)
-			if len(joins) == 1 && joins[0].lazyChainProbe != chained {
-				t.Fatalf("seam arm not honoured: lazyChainProbe=%v, want %v",
-					joins[0].lazyChainProbe, chained)
-			}
+			got, _ := drainWorkerTree(t, ctx, node)
 			rendered := renderRows(got)
 			sort.Strings(rendered)
 			if len(rendered) != len(want) {
@@ -290,15 +273,8 @@ func TestJoinSeamGatheredIdentity(t *testing.T) {
 	}
 
 	gathered := 0
-	for _, chained := range []bool{true, false} {
-		arm := "chained"
-		if !chained {
-			arm = "killswitch"
-		}
-		t.Run(arm, func(t *testing.T) {
-			SetJoinSlotChainEnabled(chained)
-			defer SetJoinSlotChainEnabled(true)
-
+	{
+		t.Run("chained", func(t *testing.T) {
 			for _, sql := range pqJoinCorpus() {
 				want := baseline[sql]
 				for _, leader := range []bool{true, false} {

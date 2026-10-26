@@ -6,11 +6,9 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -276,7 +274,6 @@ type joinOp struct {
 	lazyProbeSrcIdx  int          // its position inside lazyVirtualOut.sources
 	lazyProbeWidth   int          // columns lazyVirtualOut reads from it
 	lazyOuterOnlyOut *VirtualSlot // Semi/Anti emit slot, chained to the probe
-	lazyChainProbe   bool         // seam enabled (GOOPG_JOIN_SLOT_CHAIN=off disables)
 
 	// M0127-P0.1 (design leftdeep-joins/05 §3, stage E2): hoisted
 	// merged-key slots. mergedKeySlot allocated five objects per BUILD
@@ -1670,24 +1667,12 @@ func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
 	return ok, nil
 }
 
-// joinSlotChainOn is M0127-P1.1's operational kill switch. Default ON;
-// GOOPG_JOIN_SLOT_CHAIN=off at server start (or
-// SetJoinSlotChainEnabled(false) from tests) restores the pre-P1.1 seam
-// that flattened the probe child's slot into a Row on every pull. Same
-// pattern as GOOPG_HASHED_SUBPLAN (subplan_hash.go).
-var joinSlotChainOn atomic.Bool
-
-func init() {
-	joinSlotChainOn.Store(os.Getenv("GOOPG_JOIN_SLOT_CHAIN") != "off")
-}
-
-// SetJoinSlotChainEnabled toggles probe-side slot chaining. Test-only
-// API; the operational switch is the environment variable read at init.
-// It is read once per joinOp in ensureLazyVirtual, so a toggle takes
-// effect from the next Open, not mid-scan.
-func SetJoinSlotChainEnabled(on bool) { joinSlotChainOn.Store(on) }
-
-func joinSlotChainEnabled() bool { return joinSlotChainOn.Load() }
+// M0127-P1.1's probe-side slot chaining is unconditional. It shipped behind
+// GOOPG_JOIN_SLOT_CHAIN (default on; `=off` forced the pre-P1.1 seam that
+// flattened the probe child's slot into a Row on every pull). M0147-0035
+// retired the switch: no gate, CI or bench script ever set it, and the copy
+// path stays reachable as the fallback for probe children whose slot cannot
+// be chained (TestProbeChainOuterOnlyWidthFallback).
 
 // ensureLazyVirtual lazily builds the persistent VirtualSlot used
 // by nextLazy to emit joined rows without per-match concat. Source
@@ -1712,7 +1697,6 @@ func (o *joinOp) ensureLazyVirtual() {
 	}
 	o.lazyOuterOnlyOut = NewVirtualSlot(o.schema,
 		[]TupleSlot{o.lazyProbeSlot}, outerCols)
-	o.lazyChainProbe = joinSlotChainEnabled()
 	cols := make([]virtualCol, 0, o.lazyLW+o.lazyRW)
 	if o.plan.BuildLeft {
 		// Output is left ++ right; build side is left → sources
@@ -1748,10 +1732,11 @@ func (o *joinOp) ensureLazyVirtual() {
 // current slot (M0127-P1.1; design leftdeep-joins/05 §2, stage E1).
 //
 // Steady state writes one interface word into lazyVirtualOut.sources and
-// copies nothing. Two conditions fall back to the pre-P1.1 copy through
-// lazyProbeSlot, so the seam can never be the reason a row is wrong:
+// copies nothing. One condition falls back to the pre-P1.1 copy through
+// lazyProbeSlot, so the seam can never be the reason a row is wrong (the
+// other, the GOOPG_JOIN_SLOT_CHAIN=off kill switch, was retired by
+// M0147-0035):
 //
-//   - the kill switch is off (GOOPG_JOIN_SLOT_CHAIN=off), and
 //   - the child's slot is narrower than the columns lazyVirtualOut reads
 //     from it. That is the F7 type-change fallback in its observable
 //     form: what matters about "the child returned a different slot" is
@@ -1770,7 +1755,7 @@ func (o *joinOp) bindProbe(probeSlot TupleSlot) (bool, error) {
 	if o.lazyActive {
 		return false, &ExecError{Code: "XX000", Message: "join probe rebound while matches were still draining"}
 	}
-	if o.lazyChainProbe && probeSlot != nil && probeSlot.Width() >= o.lazyProbeWidth {
+	if probeSlot != nil && probeSlot.Width() >= o.lazyProbeWidth {
 		o.lazyVirtualOut.sources[o.lazyProbeSrcIdx] = probeSlot
 		o.lazyProbeSrc = probeSlot
 		return true, nil

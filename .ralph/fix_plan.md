@@ -5006,6 +5006,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `07d3ad3e9`** \(M0147\-0033 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `a16b71cdf`** \(M0147\-0034 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7679,9 +7682,17 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
     22/22, RegressSuite, Isolation\.
   - executor scan_prefilter.go:24; SetScanPrefilterEnabled ×5 — values-identity tests become single-arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0035 — retire `GOOPG_JOIN_SLOT_CHAIN` OFF arm**
+- [x] **M0147-0035 — retire `GOOPG_JOIN_SLOT_CHAIN` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 16→15 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Switch, exported test setter and the per\-join
+    `lazyChainProbe` field deleted; bindProbe chains whenever the child slot is wide enough; the copy path stays as the
+    narrow\-slot fallback\. OFF arm was NOT an oracle \(worker tests compare against a serial baseline\), so the
+    kill\-switch test and the benchmark/worker off arms were removed\. Design doc
+    `docs/design/0100\-0149/m0147\-0035\-retire\-join\-slot\-chain\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - executor operators_join_agg.go:1681; SetJoinSlotChainEnabled ×8. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0036 — retire `GOOPG_SUBPLAN_RESCAN` OFF arm (legacy per-call SubPlan + CorrSubqOps registry)**
   Kind: impl
