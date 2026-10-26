@@ -5012,6 +5012,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `7608c9ff0`** \(M0147\-0035 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `eff6e2294`** \(M0147\-0036 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7709,9 +7712,17 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
     22/22, RegressSuite, Isolation\.
   - executor subplan.go:36; SetSubPlanRescanEnabled ×5; delete the legacy registry with it if nothing else reads it (deadcode diff). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0037 — retire `GOOPG_HASHED_SUBPLAN` OFF arm (linear IN-slice scan)**
+- [x] **M0147-0037 — retire `GOOPG_HASHED_SUBPLAN` OFF arm (linear IN-slice scan)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 14→13 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Env lever \+ exported setter retired; the forced\-linear
+    arm is the hashed tests\' correctness ORACLE \(subplan\_hash\_test, big\-numeric, DML engine\-settings\), so it stays as
+    the unexported env\-free test seam `hashedSubPlanForceLinear` \(drives both the probe and the EXPLAIN label\);
+    the linear slice scan also stays as the production non\-hashable fallback\. Design doc
+    `docs/design/0100\-0149/m0147\-0037\-retire\-hashed\-subplan\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - executor subplan_hash.go:48; ON = PG hashed SubPlan; SetHashedSubPlanEnabled ×10; the linear path survives as the non-hashable fallback. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0038 — retire `GOOPG_NARROW_UPPER_SORT` OFF arm**
   Kind: impl

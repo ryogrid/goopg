@@ -143,13 +143,13 @@ func TestDMLSublinkRowEffects(t *testing.T) {
 func TestDMLSublinkEngineSettingsAgree(t *testing.T) {
 	for _, tc := range dmlCases {
 		t.Run(tc.name, func(t *testing.T) {
-			SetHashedSubPlanEnabled(true)
-			t.Cleanup(func() { SetHashedSubPlanEnabled(true) })
+			hashedSubPlanForceLinear.Store(false)
+			t.Cleanup(func() { hashedSubPlanForceLinear.Store(false) })
 			ctxA, cleanupA := newDMLSublinkFixture(t)
 			withEngines := runDMLAndSnapshot(t, ctxA, tc.dml)
 			cleanupA()
 
-			SetHashedSubPlanEnabled(false)
+			hashedSubPlanForceLinear.Store(true)
 			ctxB, cleanupB := newDMLSublinkFixture(t)
 			without := runDMLAndSnapshot(t, ctxB, tc.dml)
 			cleanupB()
