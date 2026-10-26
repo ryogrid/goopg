@@ -4219,6 +4219,18 @@ Sequencing: the S9 replenishment rule in the banner.)
   > filtered CTE scans \(their outer estimate and join method; Q4/Q11 routing:
   > SORT at SF0\.25, HASHSPILL M0141\-S2a\-fix2r\-a at SF1\), and Q14 statement
   > 2\'s inner is PG\'s probe chain\. Then re\-run the strict sweep\.
+  - **Re\-measured 2026\-10\-26 \(banner OWNER DECISIONS 2026\-10\-21 authorisation\), still held \[\!\]\.** Census
+    `routing\-20261026f` is PLAN\-PARITY 22/22, 99/99, 99/99 — and PG\'s own Q4 plan, matched exactly, ALSO nests loops
+    over filtered `CTE Scan on year\_total` inners \(rows=10/30 estimates\), so the escalation\'s "PG hash\-joins them"
+    premise is stale: the join half of the release test now holds by plan identity\.
+    - Strict arm \(`GOOPG\_NL\_BARE\_REEXEC=1`, SF0\.25 sweep, results `tmp/m0146\-0010a\-strict/`, log
+      `/tmp/strict\-sf025\.log`\): 54/99 ran before the sweep aborted on a server restart race after a forced shutdown;
+      **Q4, Q14 and Q54 TIMEOUT** \(300 s\); Q11 now PASS \(21 s\), Q5 9 s, Q7 3 s, Q31 5 s\.
+    - The live blocker is therefore EXECUTOR\-side: on the PG\-identical plan, goopg\'s strict re\-execution of the
+      bare `CTE Scan` inner is far costlier than PG\'s rescan of the CTE\'s already\-filled tuplestore
+      \(nodeCtescan\.c `ExecReScanCteScan` re\-reads the shared tuplestore; it never re\-runs the CTE\)\. Next step:
+      EXPLAIN ANALYZE Q4 under the strict arm on a private SF0\.25 clone and compare per\-node `loops`/rows with
+      :65438 tpcds025; check whether goopg\'s CTEScan rescan re\-runs or re\-copies the CTE producer\.
 - [x] **M0146-0012 — correlated restrictions as base-rel index quals**
   (full entry archived → `completed_milestones/completed_fix_plan_015.md`)
 - [ ] **M0146\-0012b — a multi\-relation EXISTS body\'s correlated
@@ -4978,6 +4990,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-26 — **exhausted at `aafabf804`** \(M0147\-0021 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `4f7b216cd`** \(M0147\-0022 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
@@ -7587,7 +7602,7 @@ Basis: the 2026-10-21 lever census and its review
   - blocked-on M0146-0010a (the same flip; Held, live blocker = the Q4/Q11 `year_total` CTE nested-loop estimates;
     M0142-0008c-2 already landed). Closes as a pointer when M0146-0010a lands (then delete the attach-time compat
     cache arm and the lever).
-- [ ] **M0147-0030 — phase 2 recon: default-ON levers' OFF arms (goopg-private legacy)**
+- [x] **M0147-0030 — phase 2 recon: default-ON levers' OFF arms (goopg-private legacy)**
   Kind: recon
   Parent: M0147-0000
   - Inventory every default-ON lever left in `scripts/lever-count.sh --list` (MEMOIZE, PARALLEL, EXISTS_TO_ANY,
@@ -7601,3 +7616,90 @@ Basis: the 2026-10-21 lever census and its review
   - Add to the inventory \(M0147\-0017 finding, 2026\-10\-26\): `goopg.enable_nestloop_index` and the post\-search
     `rewriteJoinsToNLI` pass it gates — on a forced nested\-loop fixture the pass did not fire \(the search built the
     join\); measure its reachability with a census under `PGOPTIONS='\-c goopg.enable_nestloop_index=off'` first\.
+  Movement: none — recon
+  - Done 2026\-10\-26: inventory `analysis/m0147/m0147\-0030/INVENTORY\.md` \(19 env levers \+ the two env\-less post\-search
+    passes\)\. No gate/CI/bench script sets any lever — every OFF arm is test/A\-B only\. Children M0147\-0031…0050 filed
+    below, lowest risk first \(executor kill\-switches → narrowing family → PG\-switch rebases → PG\-faithfulness\-in\-
+    question \(EXISTS\_TO\_ANY, INDEXKEY\_HARVEST\) → recon\)\.
+- [ ] **M0147-0031 — retire `GOOPG_NARROW_LEG_HOOK` (counting-only join-leg hook switch)**
+  Kind: impl
+  Parent: M0147-0000
+  - joinleghook.go:49; the OFF arm changes no node (it only disables leg counting), 8 direct test refs in 1 file. Inert proof by construction; keep the hook. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0032 — retire `GOOPG_COOP_JOIN_BUILD` OFF arm (pre-coop nested build rebuild)**
+  Kind: impl
+  Parent: M0147-0000
+  - executor parallel_hash_build.go:481; 4 direct test refs. Values gates + TPC-H parallel acceptance arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0033 — retire `GOOPG_NL_MATERIALIZE_WORK_MEM=0` (unbounded NL inner cache)**
+  Kind: impl
+  Parent: M0147-0000
+  - executor join_nl_stream.go:52; ON = PG tuplestore spill past work_mem (M0146-0010c); 3 direct test refs. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0034 — retire `GOOPG_SCAN_PREFILTER` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - executor scan_prefilter.go:24; SetScanPrefilterEnabled ×5 — values-identity tests become single-arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0035 — retire `GOOPG_JOIN_SLOT_CHAIN` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - executor operators_join_agg.go:1681; SetJoinSlotChainEnabled ×8. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0036 — retire `GOOPG_SUBPLAN_RESCAN` OFF arm (legacy per-call SubPlan + CorrSubqOps registry)**
+  Kind: impl
+  Parent: M0147-0000
+  - executor subplan.go:36; SetSubPlanRescanEnabled ×5; delete the legacy registry with it if nothing else reads it (deadcode diff). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0037 — retire `GOOPG_HASHED_SUBPLAN` OFF arm (linear IN-slice scan)**
+  Kind: impl
+  Parent: M0147-0000
+  - executor subplan_hash.go:48; ON = PG hashed SubPlan; SetHashedSubPlanEnabled ×10; the linear path survives as the non-hashable fallback. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0038 — retire `GOOPG_NARROW_UPPER_SORT` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer upper_narrow_chain.go:124; 2 direct test refs; flaglabels row. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0039 — retire `GOOPG_NARROW_UPPER` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer upper_narrow_apply.go:90; 5 direct test refs in 2 files; it also gates NARROW_UPPER_SORT — land after 0038. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0040 — retire `GOOPG_NARROW_BUILD` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer narrowoutput.go:11; 34 direct test refs in 2 files. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0041 — retire `GOOPG_NARROW_COST_INPUTS` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer narrowcostinputs.go:66; setNarrowCostInputsForTest ×30; cost pins re-derived at narrowed widths. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0042 — retire `GOOPG_PG_SORT_RELATION_BYTES_COST` OFF arm (goopg Sort currency)**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer sort_pgrelationbytes.go:17; ON = PG cost_sort relation bytes; setPGSortRelationBytesCostForTest ×8; keep the invalid-width fallback (M0147-0021 pattern). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0043 — retire `GOOPG_INCREMENTAL_SORT` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer incrementalsortpaths.go:86; 5 direct test refs; rebase onto PG enable_incremental_sort (PlannerSettings.EnableIncrementalSort). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0044 — retire `GOOPG_MEMOIZE` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer memoize.go:34; SetMemoizeEnabled ×13; rebase onto PG enable_memoize (PlannerSettings.EnableMemoize). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0045 — retire `GOOPG_PARALLEL` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer parallel.go:45; SetParallelEnabled ×8; rebase onto PG max_parallel_workers_per_gather = 0. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0046 — retire `GOOPG_GATHER_PATHS` `off`/`top` arms (AGENT.md C4)**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer gatherpaths.go:80; setGatherPathsModeForTest ×18 + SetGatherPathsMode ×5; rebase onto max_parallel_workers_per_gather = 0; `all` stays. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0047 — retire `GOOPG_PARTIAL_AGG_PATHS` OFF arm (retired size rule)**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer partialaggpaths.go:62; setPartialAggPathsModeForTest ×35; measure reachability + ON-vs-OFF plan diff first (M0147-0020 recipe). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0048 — decide and retire `GOOPG_EXISTS_TO_ANY` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer exists_to_any.go:79; SetExistsToAnyEnabled ×6. ON is goopg's unconditional analogue of convert_EXISTS_to_ANY (PG keeps an AlternativeSubPlan; ledger M0146-0012b) — if ON is not PG logic, R3 needs an owner [!] before the OFF (PG-closer per-row SubPlan) arm goes. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0049 — measure and retire `GOOPG_INDEXKEY_HARVEST` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - optimizer unnest.go:38; SetIndexKeyHarvestEnabled ×22; after M0147-0013 the harvest serves IN/EXISTS only — re-measure reachability and the 2026-09-05 not-plan-neutral note first. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [ ] **M0147-0050 — recon: `goopg.enable_nestloop_index` / `rewriteJoinsToNLI` and the post-search `jn.Algo` assignment reachability**
+  Kind: recon
+  Parent: M0147-0000
+  - Run the three-corpus census with `PGOPTIONS='-c goopg.enable_nestloop_index=off'` (M0147-0017 finding: the pass
+    did not fire on a forced fixture) and count the join trees the PG-shaped search did not build (the M0147-0014
+    post-search assignment's only customers); file promote-or-delete children.
