@@ -134,25 +134,21 @@ func TestDMLSublinkRowEffects(t *testing.T) {
 	}
 }
 
-// TestDMLSublinkEngineSettingsAgree re-runs every case with the rescan
-// engine and the hashed IN probe disabled. Lowering feeds both, so a
-// difference between settings would mean the param-slot path and the
-// legacy path disagree — exactly what "lowering is semantics-preserving"
-// forbids.
+// TestDMLSublinkEngineSettingsAgree re-runs every case with the hashed IN
+// probe disabled. Lowering feeds it, so a difference between settings would
+// mean the param-slot path and the linear path disagree — exactly what
+// "lowering is semantics-preserving" forbids. (The rescan-engine half of this
+// A/B went with GOOPG_SUBPLAN_RESCAN, M0147-0036: the legacy per-call path it
+// compared against no longer exists.)
 func TestDMLSublinkEngineSettingsAgree(t *testing.T) {
 	for _, tc := range dmlCases {
 		t.Run(tc.name, func(t *testing.T) {
-			SetSubPlanRescanEnabled(true)
 			SetHashedSubPlanEnabled(true)
-			t.Cleanup(func() {
-				SetSubPlanRescanEnabled(true)
-				SetHashedSubPlanEnabled(true)
-			})
+			t.Cleanup(func() { SetHashedSubPlanEnabled(true) })
 			ctxA, cleanupA := newDMLSublinkFixture(t)
 			withEngines := runDMLAndSnapshot(t, ctxA, tc.dml)
 			cleanupA()
 
-			SetSubPlanRescanEnabled(false)
 			SetHashedSubPlanEnabled(false)
 			ctxB, cleanupB := newDMLSublinkFixture(t)
 			without := runDMLAndSnapshot(t, ctxB, tc.dml)

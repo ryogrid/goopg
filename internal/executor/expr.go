@@ -11269,8 +11269,8 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 	var loweredKey string
 	if lowered {
 		// D4.1: bind the correlation params before any inner-plan
-		// path runs — both the CorrSubqOps rescan below and a full
-		// rebuild read the slots via ExecParamRef.
+		// path runs — both the handle rescan below and a full rebuild
+		// read the slots via ExecParamRef.
 		var bindErr error
 		loweredKey, bindErr = bindSubPlanParams(x, x.ParParam, x.Args, row, ctx)
 		if bindErr != nil {
@@ -11289,8 +11289,7 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 
 	// Fast path: correlated subquery whose inner plan is an index-probe
 	// chain. Skip the result caches entirely — the operator rescans correctly
-	// per outer row (Stage-9 handle, or the legacy CorrSubqOps registry
-	// when the engine is off), so the key-build + map overhead is
+	// per outer row (Stage-9 handle), so the key-build + map overhead is
 	// unnecessary. Rescanning caches nothing, so this path needs no
 	// volatility gate.
 	if !x.IsNonCorrelated && planIsIndexScanBased(x.Plan) {
@@ -11362,43 +11361,15 @@ func subqueryImpl(x *optimizer.SubqueryExpr, ctx *Context) (Datum, error) {
 	//    Scan the inner table ONCE (O(N)) to build key→value map, then do
 	//    O(1) lookups. Works even when no btree index exists.
 	if !x.IsNonCorrelated {
-		// Path 1: IndexScan-based (btree index exists). With the
-		// Stage-9 engine the generic handle serves this (classified
-		// rescanReOpen — identical lifecycle to the old CorrSubqOps
-		// registry, which remains only for the legacy kill-switch
-		// path).
+		// Path 1: IndexScan-based (btree index exists). The Stage-9
+		// handle serves this, classified rescanReOpen (the retired
+		// CorrSubqOps registry had the same lifecycle; M0147-0036).
 		if planIsIndexScanBased(x.Plan) {
-			if subPlanRescanEnabled() {
-				op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
-				if err != nil {
-					return Datum{}, err
-				}
-				defer done()
-				return subqueryReadOne(op, x)
-			}
-			if ctx.CorrSubqOps == nil {
-				ctx.CorrSubqOps = make(map[*optimizer.SubqueryExpr]Operator)
-			}
-			op, found := ctx.CorrSubqOps[x]
-			if found {
-				// Re-Open of an already-built operator: the one
-				// place goopg already does what upstream always
-				// does (ExecReScan rather than re-instantiate).
-				ctx.subPlanStat(x).Rescans++
-			} else {
-				ctx.subPlanStat(x).Rebuilds++
-				var buildErr error
-				op, buildErr = Build(x.Plan)
-				if buildErr != nil {
-					return Datum{}, buildErr
-				}
-				ctx.CorrSubqOps[x] = op
-			}
-			if err := op.Open(ctx); err != nil {
-				delete(ctx.CorrSubqOps, x)
-				_ = op.Close()
+			op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+			if err != nil {
 				return Datum{}, err
 			}
+			defer done()
 			return subqueryReadOne(op, x)
 		}
 

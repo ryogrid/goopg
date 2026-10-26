@@ -186,14 +186,6 @@ type Context struct {
 	// so workers read it without locking. Nil on a leader Context.
 	InitPlanValues map[*optimizer.SubqueryExpr]Datum
 
-	// CorrSubqOps caches pre-built, pre-opened operators for correlated
-	// scalar subqueries so the same plan can be rescanned for each outer
-	// row without repeated Build+openPrep (lock acquire + btree.Open)
-	// overhead. Populated by subqueryImpl; indexScanOp.Open detects the
-	// reuse and skips openPrep on subsequent calls. Operators are not
-	// explicitly closed (locks released at commit; GC handles memory).
-	CorrSubqOps map[*optimizer.SubqueryExpr]Operator
-
 	// CorrSubqHashMaps caches hash maps built for correlated scalar subqueries
 	// matching Project(Filter(SeqScan, inner_col = OuterColumnRef)). The hash
 	// map is built once by scanning the entire inner table (O(N)) and provides
@@ -1115,7 +1107,7 @@ type SubPlanSiteStats struct {
 	// (and later Close) the inner plan's operator tree.
 	Rebuilds int64
 	// Rescans is the number of Calls served by re-Opening an
-	// operator tree that was already built (the CorrSubqOps path).
+	// operator tree that was already built (the Stage-9 handle path).
 	Rescans int64
 	// CacheHits / CacheMisses count Calls answered from, or
 	// missing in, a result cache (the kvcache-backed sublink stores or the correlated

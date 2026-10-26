@@ -1,9 +1,7 @@
 package executor
 
 import (
-	"os"
 	"strings"
-	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -24,23 +22,11 @@ import (
 // (make_subplan's initPlan branch has no volatility check), so the
 // existing constant-key cache is exactly PG's semantics.
 
-// subPlanRescanOn is the operational kill switch for the whole handle
-// mechanism. Default ON; GOOPG_SUBPLAN_RESCAN=off at server start (or
-// SetSubPlanRescanEnabled(false) from tests) restores the legacy
-// Build/Open/Close-per-call paths, including the CorrSubqOps registry,
-// exactly as they were before Stage 9. Same pattern as the planner's
-// SetIndexKeyHarvestEnabled.
-var subPlanRescanOn atomic.Bool
-
-func init() {
-	subPlanRescanOn.Store(os.Getenv("GOOPG_SUBPLAN_RESCAN") != "off")
-}
-
-// SetSubPlanRescanEnabled toggles the SubPlan handle engine. Test-only
-// API; the operational switch is the environment variable read at init.
-func SetSubPlanRescanEnabled(on bool) { subPlanRescanOn.Store(on) }
-
-func subPlanRescanEnabled() bool { return subPlanRescanOn.Load() }
+// The handle engine is unconditional. It shipped behind GOOPG_SUBPLAN_RESCAN
+// (default on; `=off` restored the pre-Stage-9 Build/Open/Close-per-call
+// paths and the CorrSubqOps registry — a lifecycle PG never runs).
+// M0147-0036 retired the switch and the legacy paths: no gate, CI or bench
+// script ever set it.
 
 // How a handle re-runs its operator tree for a new outer row.
 const (
@@ -294,48 +280,22 @@ func getSubPlanHandle(ctx *Context, key optimizer.Expr, plan optimizer.Node, for
 // by key (with inner plan `plan`) may be served from a value cache.
 // Only meaningful for CORRELATED sublinks — non-correlated ones follow
 // InitPlan semantics and cache unconditionally (see the file comment).
-// On the legacy path (kill switch off) this always reports true, which
-// is exactly the pre-Stage-9 behavior.
 func subPlanResultCacheable(ctx *Context, key optimizer.Expr, plan optimizer.Node, forExists bool) bool {
-	if !subPlanRescanEnabled() {
-		return true
-	}
 	return getSubPlanHandle(ctx, key, plan, forExists).cacheable
 }
 
 // acquireSubPlanOp returns an OPEN operator for the sublink's inner
 // plan plus a done() the caller must invoke after draining.
 //
-// Handle path (kill switch on): the operator is built once per
+// The operator is built once per
 // statement and re-run per the handle's rescanKind; done() is a no-op —
 // the operator stays open, owned by the handle, until CloseSubPlans.
 // Counters: the first acquisition and every rescanRebuild count as
 // Rebuilds; a reOpen or Close+Open of the retained tree counts as
 // Rescans (no Build() ran — Close+Open reconstructs runtime state only,
 // which is what upstream's ExecReScan does for hash state too).
-//
-// Legacy path (kill switch off): Build+Open per call, done() Closes —
-// byte-for-byte the pre-Stage-9 lifecycle.
 func acquireSubPlanOp(ctx *Context, key optimizer.Expr, plan optimizer.Node, forExists bool) (Operator, func(), error) {
 	stat := ctx.subPlanStat(key)
-	if !subPlanRescanEnabled() {
-		stat.Rebuilds++
-		op, err := Build(plan)
-		if err != nil {
-			return nil, nil, err
-		}
-		if forExists {
-			if lop, ok := op.(*lockRowsOp); ok {
-				lop.maxDrain = 1
-			}
-		}
-		if err := op.Open(ctx); err != nil {
-			_ = op.Close()
-			return nil, nil, err
-		}
-		return op, func() { _ = op.Close() }, nil
-	}
-
 	h := getSubPlanHandle(ctx, key, plan, forExists)
 	noop := func() {}
 	if !h.built {
