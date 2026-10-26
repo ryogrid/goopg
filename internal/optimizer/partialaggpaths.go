@@ -74,8 +74,7 @@ var partialAggPathsMode = partialAggModeFromEnv(os.Getenv("GOOPG_PARTIAL_AGG_PAT
 // An unrecognised value still resolves to a MODE rather than to a panic, but
 // the fail-closed direction has moved with the default: `off` is now the
 // explicit opt-out (the serial control arm every C-19 measurement is taken
-// against), and anything unrecognised reads as the default `on`. Same shape as
-// `gatherPathModeFromEnv`, opposite polarity.
+// against), and anything unrecognised reads as the default `on`.
 func partialAggModeFromEnv(v string) partialAggMode {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "off", "false", "0", "size-rule":
@@ -112,8 +111,7 @@ func setPartialAggPathsModeForTest(m partialAggMode) func() {
 // fixture where the split verdict is reached BY COST to actually execute as
 // Finalize -> Gather -> Partial and return the serial plan's values, and that
 // test lives in internal/executor, which cannot reach an unexported knob.
-// `SetGatherPathsMode` (gatherpaths.go) is the same shape. Like it, this is
-// process-global, so a caller must run the returned restore.
+// It is process-global, so a caller must run the returned restore.
 func SetPartialAggPathsMode(label string) (restore func()) {
 	return setPartialAggPathsModeForTest(partialAggModeFromEnv(label))
 }

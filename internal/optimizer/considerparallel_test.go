@@ -395,26 +395,11 @@ func TestPartialPathIsNeverTheFinalPath(t *testing.T) {
 		}
 	}
 	walk(final)
-	// M0140-0003 re-baseline: this fixture's original assumption — "join
-	// rels have no partial paths yet, C-19d/e produce them" — held only
-	// because `GOOPG_GATHER_PATHS` defaulted `off`. `addPartialHashJoinPath`
-	// (C-19f, joinpathsparallel.go) is a SEPARATE producer that is not
-	// gated behind any later pass; it fires during the ordinary DP search
-	// the moment the flag admits partial paths at all, so a join rel
-	// legitimately carries them under `top`/`all` (M0140-0002's
-	// adjudication). The property that actually matters — no partial path
-	// ever reaches the CHOSEN tree — is `walk(final)` above and is
-	// unconditional; this second loop only pins the join-rel-population
-	// timing, which is mode-dependent, so it is scoped to the `off` arm.
-	if gatherPathsMode == gatherPathsOff {
-		for lev := 2; lev < len(s.joinrels); lev++ {
-			for _, rel := range s.joinrels[lev] {
-				if len(rel.PartialPathlist) != 0 {
-					t.Fatalf("join rel %#x has partial paths before C-19d", uint32(rel.Relids))
-				}
-			}
-		}
-	}
+	// The property that matters — no partial path ever reaches the CHOSEN
+	// tree — is `walk(final)` above. Join rels legitimately carry partial
+	// paths (C-19f's producers run in the ordinary DP search); the check that
+	// they had none before C-19d was scoped to the GOOPG_GATHER_PATHS `off`
+	// arm, retired at M0147-0046.
 
 	// The whole production seam, both arms: identical trees.
 	on, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))

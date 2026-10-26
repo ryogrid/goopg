@@ -5039,6 +5039,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `dd246d001`** \(M0147\-0044 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `637799d73`** \(M0147\-0045 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7872,9 +7875,19 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(323 s\), Isolation PASS \(543 s\)\.
   - optimizer parallel.go:45; SetParallelEnabled ×8; rebase onto PG max_parallel_workers_per_gather = 0. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0046 — retire `GOOPG_GATHER_PATHS` `off`/`top` arms (AGENT.md C4)**
+- [x] **M0147-0046 — retire `GOOPG_GATHER_PATHS` `off`/`top` arms (AGENT.md C4)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 5→4 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `637799d73`; M0122\-0012 yielded under rule \(a\)\)\. Mode type, env read,
+    label/polarity funcs and both setters deleted; the ten off/top gates \(three gather generators, four partial join
+    producers, partial SetOp\) removed, so Gather admission is PG's generate\_useful\_gather\_paths at every rel with
+    partial paths\. Design doc `docs/design/0100\-0149/m0147\-0046\-retire\-gather\-paths\-off\-top\.md`\.
+  - Tests: `gpSearch`/`phjJoinrel` lose their mode parameter; six mode\-only tests/subtests deleted; the upper\-rel
+    refusal test and both executor C\-19f consumer checks rebased onto max\_parallel\_workers\_per\_gather = 0
+    \(`c19fSerialPlan`\); flaglabels' orphaned resolver comments \(0040/0041/0046\) cleaned\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(316 s\), Isolation PASS \(553 s\)\.
   - optimizer gatherpaths.go:80; setGatherPathsModeForTest ×18 + SetGatherPathsMode ×5; rebase onto max_parallel_workers_per_gather = 0; `all` stays. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0047 — retire `GOOPG_PARTIAL_AGG_PATHS` OFF arm (retired size rule)**
   Kind: impl

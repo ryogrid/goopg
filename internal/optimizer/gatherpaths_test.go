@@ -27,10 +27,9 @@ import (
 )
 
 // gpSearch is cpSearch plus this slice's step: the production protocol of
-// searchOneProblem, including addBaseRelGatherPaths, under an explicit mode.
-func gpSearch(t *testing.T, prob *joinlistProblem, mode gatherPathMode) *searchCtx {
+// searchOneProblem, including addBaseRelGatherPaths.
+func gpSearch(t *testing.T, prob *joinlistProblem) *searchCtx {
 	t.Helper()
-	defer setGatherPathsModeForTest(mode)()
 	s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +185,7 @@ func TestGatherMergePathCountsEnableGathermerge(t *testing.T) {
 // change to either side breaks the pin.
 func TestComputeGatherRowsUndoesTheScansDivisorOnce(t *testing.T) {
 	prob := cpBigProblem([]string{"a", "b", "c"})
-	s := gpSearch(t, prob, gatherPathsOff)
+	s := gpSearch(t, prob)
 	found := 0
 	for _, rel := range s.joinrels[1] {
 		if len(rel.PartialPathlist) == 0 {
@@ -387,72 +386,6 @@ func gpCountGathers(rel *RelOptInfo) int {
 	return n
 }
 
-// (6) The admission mode. `off` — the default — offers nothing, which is this
-// slice's serial-control-arm argument; `all` offers at a base rel; `top` offers
-// at the search's FINAL rel only. The pins are not vacuous in either direction:
-// the same fixture and the same partial path produce a Gather under one mode
-// and none under another.
-func TestGatherPathsModeGovernsAdmission(t *testing.T) {
-	names := []string{"a", "b", "c"}
-
-	// Base rels: `off` vs `all`.
-	for _, tc := range []struct {
-		mode gatherPathMode
-		want int
-	}{
-		{gatherPathsOff, 0},
-		{gatherPathsTop, 0}, // a base rel is not the final rel of a 3-rel search
-		{gatherPathsAll, 1},
-	} {
-		s := gpSearch(t, cpBigProblem(names), gatherPathsOff)
-		rel := s.joinrels[1][0]
-		if len(rel.PartialPathlist) == 0 {
-			t.Fatal("fixture produced no partial path on rel 0; the pins would be vacuous")
-		}
-		makeGatherWorthwhile(rel, rel.PartialPathlist[0], s.cp)
-		restore := setGatherPathsModeForTest(tc.mode)
-		s.addBaseRelGatherPaths()
-		restore()
-		if got := gpCountGathers(rel); got != tc.want {
-			t.Errorf("mode %s: base rel has %d Gather paths, want %d", gatherPathModeLabel(tc.mode), got, tc.want)
-		}
-	}
-
-	// The final rel: `top` offers there, and a NON-final joinrel gets
-	// nothing under the same mode. Joinrels have no partial paths until
-	// C-19f, so one is installed by hand — the mode is what is under test,
-	// not the producer.
-	s := gpSearch(t, cpBigProblem(names), gatherPathsOff)
-	var mid, top *RelOptInfo
-	for lev := 2; lev < len(s.joinrels); lev++ {
-		for _, rel := range s.joinrels[lev] {
-			if relLevel(rel.Relids) == s.nrels {
-				top = rel
-			} else if mid == nil {
-				mid = rel
-			}
-		}
-	}
-	if mid == nil || top == nil {
-		t.Fatal("fixture has no intermediate and final joinrel pair")
-	}
-	for _, rel := range []*RelOptInfo{mid, top} {
-		rel.ConsiderParallel = true
-		sub := gpPartialSeqPath(rel, 0, 2)
-		rel.PartialPathlist = []*Path{sub}
-		makeGatherWorthwhile(rel, sub, s.cp)
-	}
-	defer setGatherPathsModeForTest(gatherPathsTop)()
-	s.generateUsefulGatherPaths(mid, false)
-	s.generateUsefulGatherPaths(top, false)
-	if got := gpCountGathers(mid); got != 0 {
-		t.Errorf("mode top offered %d Gather paths at a NON-final joinrel", got)
-	}
-	if got := gpCountGathers(top); got != 1 {
-		t.Errorf("mode top offered %d Gather paths at the final rel, want 1", got)
-	}
-}
-
 // (4) createPlanNode's arms: the executor node carries the SUBPATH's worker
 // count, its driving scan is stamped parallel (so EXPLAIN says "Parallel Seq
 // Scan" and the post-pass's label and this one agree), and the path's cost
@@ -462,7 +395,7 @@ func TestGatherPathsModeGovernsAdmission(t *testing.T) {
 // pathlist: whether a base-rel Gather SURVIVES add_path is the economics
 // question makeGatherWorthwhile documents, and it is not this pin's subject.
 func TestCreateGatherPlanCarriesWorkersAndStampsTheScan(t *testing.T) {
-	s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}), gatherPathsOff)
+	s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}))
 	rel := s.joinrels[1][0]
 	if len(rel.PartialPathlist) == 0 {
 		t.Fatal("fixture produced no partial path")
@@ -589,7 +522,6 @@ func TestGenerateUsefulGatherPathsSortedPartialArm(t *testing.T) {
 	// Happy path: the ordering is sortable early here, so the arm files
 	// Gather Merge -> Sort -> partial seq.
 	s, rel, sub := newCtx(useful)
-	defer setGatherPathsModeForTest(gatherPathsAll)()
 	s.generateUsefulGatherPaths(rel, false)
 	var gm *Path
 	for _, p := range rel.Pathlist {

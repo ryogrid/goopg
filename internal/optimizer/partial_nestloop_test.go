@@ -299,7 +299,6 @@ func TestPartialPathDrivingKindNestLoopProbe(t *testing.T) {
 // so a refused head can never starve admittable siblings (the gather-path
 // reader takes PartialPathlist[0] only).
 func TestPartialNLFilingInnerOnly(t *testing.T) {
-	defer setGatherPathsModeForTest(gatherPathsAll)()
 	cp := defaultCostParams()
 	a, b := relsetOf(0), relsetOf(1)
 	for _, jt := range []parser.JoinType{

@@ -780,9 +780,8 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// which is what keeps TPC-H Q1's `Finalize Agg -> Gather -> Partial Agg`
 	// (built by the post-pass) out of this slice's blast radius.
 	//
-	// It runs before the level-2 search reads `CheapestTotal`, and is a no-op
-	// unless GOOPG_GATHER_PATHS is `all` — see DESIGN.md §5 for why `top` is
-	// the arm to measure first.
+	// It runs before the level-2 search reads `CheapestTotal` (DESIGN.md §5;
+	// the GOOPG_GATHER_PATHS `off`/`top` arms were retired at M0147-0046).
 	s.addBaseRelGatherPaths()
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.

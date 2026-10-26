@@ -58,8 +58,7 @@ func pmjFixture(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo
 	}}
 
 	prob := phjProblem(2_000_000, 10)
-	s, _ := phjJoinrel(t, prob, gatherPathsAll)
-	t.Cleanup(setGatherPathsModeForTest(gatherPathsAll))
+	s, _ := phjJoinrel(t, prob)
 	return s, joinrel, outer, inner, keys
 }
 
@@ -233,15 +232,6 @@ func TestPartialMergeJoinRefusals(t *testing.T) {
 			ok, ok, ik, keys, nil, mergeTuplesFor, scanSelFor, 0, nil)
 	}
 
-	t.Run("mode off", func(t *testing.T) {
-		s, joinrel, outer, inner, keys := build(t)
-		restore := setGatherPathsModeForTest(gatherPathsOff)
-		t.Cleanup(restore)
-		offer(s, joinrel, outer, inner, keys)
-		if got := pmjPartials(joinrel.PartialPathlist); len(got) != 0 {
-			t.Fatalf("mode off filed %d paths", len(got))
-		}
-	})
 	t.Run("nil search", func(t *testing.T) {
 		_, joinrel, outer, inner, keys := build(t)
 		s, _, _, _, _ := build(t)
@@ -400,8 +390,7 @@ func TestPartialMergeJoinFilesEndToEnd(t *testing.T) {
 	setCheapest(outer)
 	setCheapest(inner)
 	prob := phjProblem(2_000_000, 10)
-	s, _ := phjJoinrel(t, prob, gatherPathsAll)
-	t.Cleanup(setGatherPathsModeForTest(gatherPathsAll))
+	s, _ := phjJoinrel(t, prob)
 	if err := addPathsToJoinrel(s, joinrel, outer, inner, append([]*restrictInfo{}, keys...), s.cp, nil); err != nil {
 		t.Fatalf("addPathsToJoinrel: %v", err)
 	}

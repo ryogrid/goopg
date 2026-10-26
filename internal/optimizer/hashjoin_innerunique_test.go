@@ -286,7 +286,6 @@ func TestHashJoinUniqueVirtualGeometryLeavesExecutorSpillCostUnchanged(t *testin
 }
 
 func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) {
-	defer setGatherPathsModeForTest(gatherPathsAll)()
 	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
 	s.parallelModeOK = true
 	joinrel.ConsiderParallel = true

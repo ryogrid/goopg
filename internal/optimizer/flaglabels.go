@@ -78,23 +78,6 @@ func onOff(on bool) string {
 var flagResolvedState = map[string]func(string) string{
 	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
-	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
-	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
-	// opts back out to the un-narrowed arm.
-	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
-	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
-	// above, so the in/out distinction no longer separates them -- but it is
-	// still the only one of the family that gates a planner COST input rather
-	// than executor plan SHAPE, and artefacts must keep them distinct on that
-	// basis. (The previous comment here asserted "this one is opt-IN"; that
-	// was true until the promotion and is corrected rather than dropped, so a
-	// reader of an older artefact can date it.)
-	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
-	// search may choose a Gather at all, and at which rels, so an artefact
-	// that does not name it cannot say whether the plans it holds were free
-	// to parallelise. Rendered through the same label function the resolver
-	// uses, so the token inside `unset(…)` re-exported reproduces the arm.
-	"GOOPG_GATHER_PATHS": func(v string) string { return gatherPathModeLabel(gatherPathModeFromEnv(v)) },
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
@@ -170,6 +153,7 @@ var flagProvenanceOrder = []string{
 	// DESIGN.md §5; docs/design/0100-0149/
 	// m0140-0003-gather-paths-flip-lands-default-on.md). `off` still
 	// reproduces the pre-M0140-0003 arm.
+	// Retired at M0147-0046 — see flagProvenanceRetired.
 	"GOOPG_GATHER_PATHS",
 	"GOOPG_PARTIAL_AGG_PATHS",
 	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path
@@ -373,6 +357,12 @@ var flagProvenanceRetired = map[string]string{
 	// only to max_parallel_workers_per_gather, which already did both, so
 	// nothing reads the variable. `off` in an older artefact is the serial arm.
 	"GOOPG_PARALLEL": "M0147-0045",
+	// C-19d's admission MODE (off / top / all; default all since M0140-0003).
+	// M0147-0046 kept only `all` — every rel with partial paths is offered its
+	// Gathers, as generate_useful_gather_paths does — so nothing reads the
+	// variable. `off` in an older artefact is the serial-search arm; `top`
+	// admitted only the search's final rel.
+	"GOOPG_GATHER_PATHS": "M0147-0046",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

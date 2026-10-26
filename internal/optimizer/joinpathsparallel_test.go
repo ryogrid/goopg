@@ -51,9 +51,9 @@ func phjProblem(aRows, bRows int64) *joinlistProblem {
 
 // phjJoinrel runs the production protocol under a mode and returns the single
 // level-2 joinrel.
-func phjJoinrel(t *testing.T, prob *joinlistProblem, mode gatherPathMode) (*searchCtx, *RelOptInfo) {
+func phjJoinrel(t *testing.T, prob *joinlistProblem) (*searchCtx, *RelOptInfo) {
 	t.Helper()
-	s := gpSearch(t, prob, mode)
+	s := gpSearch(t, prob)
 	if len(s.joinrels) < 3 || len(s.joinrels[2]) != 1 {
 		t.Fatalf("fixture produced %d level-2 joinrels, want exactly 1", len(s.joinrels[2]))
 	}
@@ -88,7 +88,7 @@ func phjClose(a, b float64) bool { return math.Abs(a-b) <= 1e-9*math.Max(1, math
 //     multiplier fails this test.
 func TestPartialHashJoinChargesTheBuildOnceUndivided(t *testing.T) {
 	prob := phjProblem(2_000_000, 10)
-	s, joinrel := phjJoinrel(t, prob, gatherPathsAll)
+	s, joinrel := phjJoinrel(t, prob)
 	cp := s.cp
 
 	pp := phjPathOfKind(joinrel.PartialPathlist, PathHashJoin)
@@ -153,7 +153,7 @@ func TestPartialHashJoinChargesTheBuildOnceUndivided(t *testing.T) {
 // back; if either side ever applied it twice the Gather would be charged
 // parallel_tuple_cost on a quarter of the rows that actually cross it.
 func TestPartialHashJoinRowsRoundTripThroughExactlyOneDivisor(t *testing.T) {
-	s, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10), gatherPathsAll)
+	s, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10))
 	pp := phjPathOfKind(joinrel.PartialPathlist, PathHashJoin)
 	if pp == nil {
 		t.Fatal("no partial hash join path")
@@ -170,7 +170,7 @@ func TestPartialHashJoinRowsRoundTripThroughExactlyOneDivisor(t *testing.T) {
 // parameterisation, so the costs were never the question. A crossover test that
 // does not first prove both producers fired proves nothing about costs.
 func TestPartialHashJoinAndItsSerialTwinAreBothOffered(t *testing.T) {
-	_, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10), gatherPathsAll)
+	_, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10))
 	if phjPathOfKind(joinrel.Pathlist, PathHashJoin) == nil {
 		t.Error("the SERIAL hash join path was not offered")
 	}
@@ -205,7 +205,7 @@ func TestPartialHashJoinGatherWinsExactlyAtTheCrossover(t *testing.T) {
 	// Calibrate the fixture from the model rather than from a guess: one
 	// probe run reports the workers the ladder sized and the join output
 	// per unit of `b`, so the two arms below are placed by the constants.
-	s, probe := phjJoinrel(t, phjProblem(aRows, 1), gatherPathsAll)
+	s, probe := phjJoinrel(t, phjProblem(aRows, 1))
 	cp := s.cp
 	if len(s.joinrels[1][0].PartialPathlist) == 0 {
 		t.Fatal("the large rel has no partial seq scan; the fixture cannot exercise this")
@@ -241,7 +241,7 @@ func TestPartialHashJoinGatherWinsExactlyAtTheCrossover(t *testing.T) {
 			if bRows < 1 {
 				bRows = 1
 			}
-			_, joinrel := phjJoinrel(t, phjProblem(aRows, bRows), gatherPathsAll)
+			_, joinrel := phjJoinrel(t, phjProblem(aRows, bRows))
 			// Not vacuous in either direction: BOTH rivals must exist, or
 			// the winner says nothing about the crossover.
 			if phjPathOfKind(joinrel.Pathlist, PathHashJoin) == nil ||
@@ -260,10 +260,9 @@ func TestPartialHashJoinGatherWinsExactlyAtTheCrossover(t *testing.T) {
 // have. A joinrel's partial path is the partial OUTER of the join above it, so
 // the paths climb the tree and one Gather can sit over the whole of it.
 func TestPartialHashJoinPropagatesUpTheJoinTree(t *testing.T) {
-	s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}), gatherPathsAll)
+	s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}))
 	// The producer reads the mode, and gpSearch restores it on return, so
 	// the direct calls below have to re-pin it.
-	defer setGatherPathsModeForTest(gatherPathsAll)()
 
 	var mid, top *RelOptInfo
 	for lev := 2; lev < len(s.joinrels); lev++ {
@@ -332,10 +331,8 @@ func TestPartialHashJoinRefusals(t *testing.T) {
 	build := func(t *testing.T) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo, []*restrictInfo) {
 		t.Helper()
 		prob := phjProblem(2_000_000, 10)
-		s, joinrel := phjJoinrel(t, prob, gatherPathsAll)
+		s, joinrel := phjJoinrel(t, prob)
 		outer, inner := s.joinrels[1][0], s.joinrels[1][1]
-		// gpSearch restores the mode on return, and the producer reads it.
-		t.Cleanup(setGatherPathsModeForTest(gatherPathsAll))
 		pp := phjPathOfKind(joinrel.PartialPathlist, PathHashJoin)
 		if pp == nil {
 			t.Fatal("the unbroken fixture files no partial path; the refusals would be vacuous")
@@ -473,7 +470,7 @@ func TestParallelAwareJoinGuardRefusesAJoinTheExecutorWillNotRun(t *testing.T) {
 // worker would hash a PARTITION of the build input and the join would quietly
 // drop matches — the failure mode parallel_hash_join_test.go's header names.
 func TestGatherOverPartialHashJoinStampsTheProbeScanOnly(t *testing.T) {
-	s, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10), gatherPathsAll)
+	s, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10))
 	pp := phjPathOfKind(joinrel.PartialPathlist, PathHashJoin)
 	if pp == nil {
 		t.Fatal("no partial hash join path")
@@ -507,22 +504,5 @@ func TestGatherOverPartialHashJoinStampsTheProbeScanOnly(t *testing.T) {
 	}
 	if bs, ok := buildSide.(*SeqScan); ok && bs.Parallel {
 		t.Error("the BUILD side's scan is stamped Parallel; each worker would hash only a partition and the join would drop matches")
-	}
-}
-
-// (8) Mode `off` — the default — produces no partial join path at all, so the
-// search is unchanged by construction. This is the slice's serial-control-arm
-// argument, and it is what makes "C-19f is inert at the default" a fact rather
-// than a claim.
-func TestPartialHashJoinIsInertUnderTheDefaultMode(t *testing.T) {
-	_, joinrel := phjJoinrel(t, phjProblem(2_000_000, 10), gatherPathsOff)
-	if n := len(joinrel.PartialPathlist); n != 0 {
-		t.Errorf("mode off filed %d partial join path(s); the only reader is behind the same mode, so producing them is pure planner time", n)
-	}
-	if gpCountGathers(joinrel) != 0 {
-		t.Error("mode off produced a Gather path")
-	}
-	if got := joinrel.CheapestTotal.Kind; got != PathHashJoin {
-		t.Errorf("mode off changed the chosen path to %v", got)
 	}
 }

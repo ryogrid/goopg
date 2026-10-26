@@ -753,29 +753,6 @@ func TestAddPartialSetOpPathRefusesNonStreaming(t *testing.T) {
 	}
 }
 
-// TestAddPartialSetOpPathRefusesUnderGatherPathsOff.
-func TestAddPartialSetOpPathRefusesUnderGatherPathsOff(t *testing.T) {
-	restore := setGatherPathsModeForTest(gatherPathsOff)
-	defer restore()
-	cp := defaultCostParams()
-	setOpRel := &RelOptInfo{}
-	mk := func() *RelOptInfo {
-		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
-			Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
-			ParallelSafe: true, ParallelWorkers: 2,
-		}}}
-	}
-	setOpRel.LeftBranchRel = mk()
-	setOpRel.RightBranchRel = mk()
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
-
-	addPartialSetOpPath(setOpRel, node, cp, false)
-
-	if len(setOpRel.PartialPathlist) != 0 {
-		t.Fatalf("PartialPathlist = %d entries, want 0 under GOOPG_GATHER_PATHS=off", len(setOpRel.PartialPathlist))
-	}
-}
-
 // TestAddPartialSetOpPathRefusesWhenABranchDoesNotConsiderParallel mirrors
 // the join-rel rule (build_join_rel, relnode.c:842): the conjunction of both
 // inputs, not just one.

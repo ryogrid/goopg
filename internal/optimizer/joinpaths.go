@@ -618,8 +618,7 @@ func addPathsForJointype(s *searchCtx, joinrel, outer, inner *RelOptInfo, clause
 			// can differ only in the parallel terms. It files into the
 			// joinrel's PartialPathlist, which nothing but
 			// generateUsefulGatherPaths and the next level's own partial
-			// producer reads; with GOOPG_GATHER_PATHS off it produces nothing
-			// at all (joinpathsparallel.go).
+			// producer reads (joinpathsparallel.go).
 			addPartialHashJoinPath(s, joinrel, outer, inner, cp, jt, keys, residual, bucket, final, uniq, sjinfo)
 		}
 	}

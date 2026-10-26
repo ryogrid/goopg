@@ -341,8 +341,7 @@ func (s *searchCtx) joinSearch(clauses *restrictInfoList, b joinRelBuilder) (*Re
 			// (allpaths.c:3503-3517), and the order matters — a Gather path
 			// offered after set_cheapest could never become CheapestTotal and
 			// would be invisible to the level above. It is a no-op until a
-			// joinrel has partial paths (C-19f) and while GOOPG_GATHER_PATHS
-			// is off.
+			// joinrel has partial paths (C-19f).
 			s.generateUsefulGatherPaths(rel, false)
 			setCheapest(rel)
 			// R53 Step-0: one L-number per relset, after the whole level's

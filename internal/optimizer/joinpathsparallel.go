@@ -95,16 +95,6 @@ func addPartialHashJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp 
 		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V-uniq-outer", "jt="+traceJoinTypeName(jt))
 		return
 	}
-	// The only reader of a partial path is `generateUsefulGatherPaths`, which
-	// is gated by the same mode — so producing under `off` buys nothing and
-	// costs one hashJoinCost per pair per direction per level on a search whose
-	// planner time the pre-commit pgbench smoke measures. Under `top` the
-	// producer must still run at EVERY level: the final rel's partial path
-	// exists only because the levels below propagated theirs upward.
-	if gatherPathsMode == gatherPathsOff {
-		tracePVetoCtx(s, "hash", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
-		return
-	}
 	// R9 (plan-parity-fix-take2, K17): the direction filter this producer
 	// never had. Without it a RIGHT hash join is filed as parallel-aware and
 	// `assertParallelAwareJoinIsRunnable` panics at plan build — the join's
@@ -317,14 +307,6 @@ func addPartialMergeJoinPath(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp
 	mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
 	scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, innerOverride *Path) {
 
-	// Same mode gate as the hash twin: the only reader of a partial path
-	// is `generateUsefulGatherPaths`, and under `off` producing buys
-	// nothing while costing a mergeJoinCost per pair per direction per
-	// level on a search whose planner time the pgbench smoke measures.
-	if gatherPathsMode == gatherPathsOff {
-		tracePVetoCtx(s, "merge", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M0", "jt="+traceJoinTypeName(jt))
-		return
-	}
 	// `joinrel->consider_parallel` (joinpath.c:2418, via the hash block's
 	// guard which the merge block shares), already propagated by
 	// joinrelConsiderParallel.

@@ -135,10 +135,6 @@ func TestAddHashJoinPath_UniqueSideDeclinesWhenUnUniqueIfiable(t *testing.T) {
 // Sort+Unique has no parallel-safe shape to substitute in its place, so the
 // whole arm must decline before even inspecting PartialPathlist.
 func TestAddPartialHashJoinPath_UniqueSideOuterAlwaysDeclines(t *testing.T) {
-	prevMode := gatherPathsMode
-	gatherPathsMode = gatherPathsTop
-	defer func() { gatherPathsMode = prevMode }()
-
 	cp := defaultCostParams()
 	s := &searchCtx{parallelModeOK: true}
 
@@ -170,10 +166,6 @@ func TestAddPartialHashJoinPath_UniqueSideOuterAlwaysDeclines(t *testing.T) {
 // today — a correct, conservative consequence of a real field, not a bug to
 // paper over with a false ParallelSafe.
 func TestAddPartialHashJoinPath_UniqueSideInnerDeclinesNonParallelSafe(t *testing.T) {
-	prevMode := gatherPathsMode
-	gatherPathsMode = gatherPathsTop
-	defer func() { gatherPathsMode = prevMode }()
-
 	cp := defaultCostParams()
 	s := &searchCtx{parallelModeOK: true}
 

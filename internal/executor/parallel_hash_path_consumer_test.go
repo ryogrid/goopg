@@ -116,6 +116,25 @@ func c19fPlan(t *testing.T, ctx *Context, sql string) optimizer.Node {
 	return node
 }
 
+// c19fSerialPlan is c19fPlan's serial control arm: the same settings with
+// max_parallel_workers_per_gather = 0, PG's own switch (it replaced the retired
+// GOOPG_GATHER_PATHS=off arm, M0147-0046).
+func c19fSerialPlan(t *testing.T, ctx *Context, sql string) optimizer.Node {
+	t.Helper()
+	advanceStmtCounter(ctx)
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse %q: %v", sql, err)
+	}
+	ps := c19fSettings()
+	ps.MaxParallelWorkersPerGather = 0
+	node, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+	if err != nil {
+		t.Fatalf("plan %q: %v", sql, err)
+	}
+	return node
+}
+
 // c19fFindGather returns the Gather the PATH MODEL placed, or nil.
 func c19fFindGather(n optimizer.Node) *optimizer.Gather {
 	var found *optimizer.Gather
@@ -208,19 +227,15 @@ func TestC19fPathModelGatherExecutesAsAParallelHashJoin(t *testing.T) {
 	chosen := 0
 	for _, sql := range c19fCorpus() {
 		t.Run(sql, func(t *testing.T) {
-			// The serial control arm: the SAME statement with the producer
-			// off, which is the shipped default. Any row difference is a
+			// The serial control arm: the SAME statement with
+			// max_parallel_workers_per_gather = 0. Any row difference is a
 			// wrong answer, not a slow plan.
-			restoreOff := optimizer.SetGatherPathsMode("off")
-			serialPlan := c19fPlan(t, ctx, sql)
-			restoreOff()
+			serialPlan := c19fSerialPlan(t, ctx, sql)
 			if g := c19fFindGather(serialPlan); g != nil {
-				t.Fatal("mode off produced a Gather; the control arm is not serial and proves nothing")
+				t.Fatal("max_parallel_workers_per_gather = 0 produced a Gather; the control arm is not serial and proves nothing")
 			}
 
-			restoreAll := optimizer.SetGatherPathsMode("all")
 			parPlan := c19fPlan(t, ctx, sql)
-			restoreAll()
 
 			gather := c19fFindGather(parPlan)
 			if gather == nil {
@@ -331,9 +346,7 @@ func TestC19fGatheredHashBuildRunsOnceAndIsShared(t *testing.T) {
 	defer cleanup()
 
 	sql := "SELECT f.fid, d.dname FROM pq_fact f JOIN pq_dim d ON f.fk = d.dk WHERE f.amt >= 0"
-	restore := optimizer.SetGatherPathsMode("all")
 	plan := c19fPlan(t, ctx, sql)
-	restore()
 
 	gather := c19fFindGather(plan)
 	if gather == nil {

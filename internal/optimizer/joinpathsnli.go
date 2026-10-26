@@ -476,13 +476,6 @@ func addNLIPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams,
 // cite it: by comment, with no field to test).
 func addPartialNestLoopPaths(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, clauses []*restrictInfo, semi semiAntiJoinFactors, mu mergeUnique) {
 	innerUnique := mu.innerUnique
-	// V0: the reader-only gate, shared with both landed partial producers
-	// (`joinpathsparallel.go:82-91`): nothing but `generateUsefulGatherPaths`
-	// and the next level's own partial producer reads a partial path.
-	if gatherPathsMode == gatherPathsOff {
-		tracePVetoCtx(s, "nestloop", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "V0", "jt="+traceJoinTypeName(jt))
-		return
-	}
 	// The dispatch gate (joinpath.c:2022-2031). JOIN_UNIQUE_OUTER reaches
 	// here as INNER with mu.side set (M0146-0005dy): a partial outer cannot
 	// be unique-ified, so it is refused as in PG.
