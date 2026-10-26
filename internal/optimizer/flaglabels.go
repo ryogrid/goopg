@@ -128,12 +128,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
 		return onOff(pgSortRelationBytesCostFromEnv(v))
 	},
-	// M0139-0007b's experiment is default-off and changes only Memoize's
-	// planner cache-entry byte price, but artefacts must name its currency for
-	// a reproducible A/B.
-	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": func(v string) string {
-		return onOff(pgMemoizeEntryBytesCostFromEnv(v))
-	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -223,6 +217,7 @@ var flagProvenanceOrder = []string{
 	// estimate PG's relation_byte_size/ExecEstimateCacheEntryOverheadBytes
 	// currency instead of goopg's kvcache entry size. Default `off`, R108/
 	// R113-shaped.
+	// Retired at M0147-0022 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST",
 	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md), default `off`.
 	// Retired at M0137-0009 — see flagProvenanceRetired below.
@@ -354,6 +349,12 @@ var flagProvenanceRetired = map[string]string{
 	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
 	// `off` in an older artefact is the executor-map pricing arm.
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST": "M0147-0021",
+	// M0139-0007b's PG cost_memoize_rescan tuple-byte currency
+	// (relation_byte_size + ExecEstimateCacheEntryOverheadBytes + the per-key
+	// get_expr_width term), default off since then. M0147-0022 promoted it —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is goopg's kvcache-entry currency.
+	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": "M0147-0022",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

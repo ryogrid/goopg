@@ -113,12 +113,11 @@ func memoizeEntryOverheadBytes(tuples float64) float64 {
 //     join's sizing goes through, so a cached row and a hashed row are measured
 //     by one ruler and not two.
 //   - `get_expr_width` per cache key (`keyWidth`, `memoizeKeyWidths` below) IS
-//     now ported when the PG-faithful currency is enabled and
-//     `pgRelationByteSize` itself succeeds: every cache key here is a bare
+//     now ported and used whenever `pgRelationByteSize` succeeds: every cache key here is a bare
 //     `*ColumnRef` (`memoizeCacheKeys`'s only admitted shape), so `get_expr_width`
 //     reduces to the same ANALYZEd-width-or-typeWidth lookup every other width
-//     consumer in this package already shares. When the currency is off, or the
-//     PG byte-size substitution itself declined, the per-key term stays
+//     consumer in this package already shares. When the PG byte-size
+//     substitution declines, the per-key term stays
 //     `hashsize.EntryBytes(nkeys, 0)` — the goopg-native ruler paired with the
 //     goopg-native tuple-bytes term it sits beside, so neither term switches
 //     currency without the other.
@@ -140,28 +139,22 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 		tuples = 0
 	}
 
-	// R108/R113-shaped absorption arm (M0139-0007b): PG prices the cached
-	// tuple bytes with `relation_byte_size(tuples, width)` +
-	// `ExecEstimateCacheEntryOverheadBytes(tuples)` (costsize.c:2565-2566),
-	// where `width` is the PG-equivalent pathtarget width, not goopg's
-	// Datum/kvcache entry size. Off by default like its two siblings.
+	// M0139-0007b's PG currency, promoted by M0147-0022:
+	// PG prices the cached tuple bytes with `relation_byte_size(tuples,
+	// width)` + `ExecEstimateCacheEntryOverheadBytes(tuples)`
+	// (costsize.c:2565-2566), where `width` is the PG-equivalent pathtarget
+	// width, not goopg's Datum/kvcache entry size.
 	//
-	// The per-key term (M0139-0007c) now tracks the SAME currency choice as
-	// the tuple-bytes term beside it: `keyWidth` (the caller's ported
-	// `get_expr_width` sum, `memoizeKeyWidths`) only when the PG currency is
-	// on AND `pgRelationByteSize` itself succeeded — if that substitution
-	// declined, both terms fall back to goopg's own `hashsize.EntryBytes`
-	// ruler together, never a PG per-key width paired with a goopg tuple
-	// width or vice versa.
+	// The per-key term (M0139-0007c) tracks the SAME currency choice as the
+	// tuple-bytes term beside it: `keyWidth` (the caller's ported
+	// `get_expr_width` sum, `memoizeKeyWidths`) whenever `pgRelationByteSize`
+	// succeeds — if that substitution declines (no usable width), both terms
+	// fall back to goopg's own `hashsize.EntryBytes` ruler together, never a
+	// PG per-key width paired with a goopg tuple width or vice versa.
 	var tupleBytes, perKeyBytes float64
-	if pgMemoizeEntryBytesCostEnabled() {
-		if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
-			tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
-			perKeyBytes = keyWidth
-		} else {
-			tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
-			perKeyBytes = hashsize.EntryBytes(nkeys, 0)
-		}
+	if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
+		tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
+		perKeyBytes = keyWidth
 	} else {
 		tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
 		perKeyBytes = hashsize.EntryBytes(nkeys, 0)

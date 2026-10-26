@@ -4976,6 +4976,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `a4c64c462`** \(M0147\-0020 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `aafabf804`** \(M0147\-0021 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7561,9 +7564,20 @@ Basis: the 2026-10-21 lever census and its review
     acceptance arm and the SF1 fire set must pass with the arm ON; a memory regression is NOT waived by
     S9(5)(a). Keep `pgHashGeometry`/`pgHashSpillPages`. Retiring the lever changes `tracePGHashTupleGeometry`'s
     PGSHAPED_DP_TRACE output — check the estimate-audit readers. On success delete the OFF arm; ledger 2188 new row.
-- [ ] **M0147-0022 — complete and promote `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`**
+- [x] **M0147-0022 — complete and promote `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 21→20 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. "Complete" was already done: the per\-key
+    `get\_expr\_width` term landed in M0139\-0007c \(`costMemoizeRescan` `keyWidth` / `memoizeKeyWidths`\); the task text
+    predates it\. ON captures: 0 changed plan lines on both TPC\-DS corpora \(41 / 26 Memoize nodes\), 99/99 both\.
+  - Deleted the switch/env/resolver/enabled/test setter; PG currency now whenever `pgRelationByteSize` succeeds,
+    unknown\-width fallback to goopg's ruler kept \(both terms together\); `pgRelationByteSize` kept\. Tests: the
+    switch\-off test replaced by an unknown\-width fallback test; two currency tests drop pins and OFF halves\.
+  - Design doc `docs/design/0100\-0149/m0147\-0022\-promote\-pg\-memoize\-entry\-bytes\-cost\.md`; m0139\-0007b doc status
+    line; ledger row \(resolves line 2189; residual: goopg min clamps \+ unknown\-width fallback\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - The port is incomplete: add PG's per-key `get_expr_width` term (cost_memoize_rescan /
     ExecEstimateCacheEntryOverheadBytes; ledger row 2189), then flip ON, run the gates, delete the OFF arm. Keep
     `pgRelationByteSize`.
