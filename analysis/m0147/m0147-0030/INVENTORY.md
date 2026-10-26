@@ -13,7 +13,7 @@ arm.
 
 | child | lever | layer | read site | OFF arm (what dies) | test hooks | rebase route | risk |
 |---|---|---|---|---|---|---|---|
-| 0031 | NARROW_LEG_HOOK | optimizer | joinleghook.go:49 | hook that only COUNTS legs (no node change) disabled | 8 direct refs, 1 file | none needed (OFF changes no plan) | lowest |
+| 0031 | NARROW_LEG_HOOK | optimizer | joinleghook.go:49 | un-narrowed join legs (the hook is load-bearing since M0139-S2: it wraps legs in a narrowing `*Project`; flaglabels' "counting-only" comment was stale — corrected by M0147-0031) | 8 direct refs, 1 file | single-arm | low |
 | 0032 | COOP_JOIN_BUILD | executor | parallel_hash_build.go:481 | producers rebuild nested shareable joins (pre-coop) | 4 direct refs, 1 file | unit tests call the coop path directly | low |
 | 0033 | NL_MATERIALIZE_WORK_MEM | executor | join_nl_stream.go:52 | unbounded NL inner cache (no spill) | 3 direct refs, 1 file | ON = PG tuplestore spill past work_mem; tests pin ON | low |
 | 0034 | SCAN_PREFILTER | executor | scan_prefilter.go:24 | scan deforms every column, filterOp only | SetScanPrefilterEnabled ×5 | values-identity tests become single-arm | low |

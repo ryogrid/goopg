@@ -4994,6 +4994,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `4f7b216cd`** \(M0147\-0022 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **census reused at `e5f10324e`** \(analysis/fix\_plan\-only recon commit;
+    routing\-20261026f\'s capture `4f7b216cd` is an ancestor, no planner/executor/cost path changed\)\. Same items\-0\-9
+    tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7621,9 +7624,16 @@ Basis: the 2026-10-21 lever census and its review
     passes\)\. No gate/CI/bench script sets any lever — every OFF arm is test/A\-B only\. Children M0147\-0031…0050 filed
     below, lowest risk first \(executor kill\-switches → narrowing family → PG\-switch rebases → PG\-faithfulness\-in\-
     question \(EXISTS\_TO\_ANY, INDEXKEY\_HARVEST\) → recon\)\.
-- [ ] **M0147-0031 — retire `GOOPG_NARROW_LEG_HOOK` (counting-only join-leg hook switch)**
+- [x] **M0147-0031 — retire `GOOPG_NARROW_LEG_HOOK` (counting-only join-leg hook switch)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 20→19 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Correction: the hook is NOT counting\-only — M0139\-S2 made
+    it load\-bearing \(narrowing `\*Project` on join legs\); the stale flaglabels comment and the 0030 inventory row are
+    corrected\. Switch \+ resolver deleted, hook unconditional; two tests rebased to the single arm; flaglabels →
+    `retired\(M0147\-0031\)`; deadcode diff empty\. Design doc `docs/design/0100\-0149/m0147\-0031\-retire\-narrow\-leg\-hook\.md`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - joinleghook.go:49; the OFF arm changes no node (it only disables leg counting), 8 direct test refs in 1 file. Inert proof by construction; keep the hook. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0032 — retire `GOOPG_COOP_JOIN_BUILD` OFF arm (pre-coop nested build rebuild)**
   Kind: impl

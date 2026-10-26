@@ -97,13 +97,6 @@ var flagResolvedState = map[string]func(string) string{
 	// shapes and an A/B that cannot separate them cannot attribute a
 	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
 	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
-	// M0139-S1: the join-leg hook (joinleghook.go). Default ON, `=0` opts
-	// back out — but unlike its three GOOPG_NARROW_* siblings above, S1's
-	// hook never changes a node; it only counts the legs a real narrowing
-	// pass would have something to say about. Flipping this flag off
-	// therefore does not change any plan captured today (M0139-S2 is what
-	// makes the flag load-bearing).
-	"GOOPG_NARROW_LEG_HOOK": func(v string) string { return onOff(narrowLegHookFromEnv(v)) },
 	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
 	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
 	// above, so the in/out distinction no longer separates them -- but it is
@@ -191,6 +184,7 @@ var flagProvenanceOrder = []string{
 	// Joined at M0139-S1: the join-leg hook (joinleghook.go). A pure
 	// decline that only counts eligible legs; no artefact captured before
 	// M0139-S2 lands can differ by this flag's value. Default ON.
+	// Retired at M0147-0031 — see flagProvenanceRetired.
 	"GOOPG_NARROW_LEG_HOOK",
 	// Joined at R121 (r121-narrow-cost-inputs/SCOPE.md). Default `off`.
 	"GOOPG_NARROW_COST_INPUTS",
@@ -355,6 +349,10 @@ var flagProvenanceRetired = map[string]string{
 	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
 	// `off` in an older artefact is goopg's kvcache-entry currency.
 	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": "M0147-0022",
+	// M0139-S1/S2's join-leg narrowing hook switch (default on, `=0` opted
+	// out). M0147-0031 made the hook unconditional, so nothing reads the
+	// variable. `off` in an older artefact is the un-narrowed-leg arm.
+	"GOOPG_NARROW_LEG_HOOK": "M0147-0031",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

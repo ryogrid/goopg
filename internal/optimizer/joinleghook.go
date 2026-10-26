@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"sync/atomic"
 )
 
@@ -42,16 +41,10 @@ import (
 // *Project node) and the row width flowing into whatever join sits above
 // it.
 //
-// narrowLegHook resolves GOOPG_NARROW_LEG_HOOK at process start. Opt-out
-// polarity (`=0` disables), matching every other narrowing flag in this
-// family (GOOPG_NARROW_BUILD, GOOPG_NARROW_UPPER, GOOPG_NARROW_UPPER_SORT):
-// the flag exists so a gate can measure the FLAG rather than the commit.
-var narrowLegHook = narrowLegHookFromEnv(os.Getenv("GOOPG_NARROW_LEG_HOOK"))
-
-// narrowLegHookFromEnv is the flag's polarity, factored out so tests
-// resolve the same default the process starts with (flaglabels.go's
-// contract: no literal restating a default elsewhere).
-func narrowLegHookFromEnv(v string) bool { return v != "0" }
+// The hook ran behind GOOPG_NARROW_LEG_HOOK (opt-out, `=0` disabled it) so a
+// gate could measure the flag rather than the commit. M0147-0031 retired the
+// switch: no gate, CI or bench script ever set it, and the hook is
+// unconditional.
 
 // legHookFireCount counts calls to narrowJoinLeg that found an
 // eligible-but-currently-unhooked leg (flag on, node still a bare
@@ -70,7 +63,7 @@ var legHookFireCount atomic.Int64
 // leg of an NLI join (`kind == "PathNestLoop(NLI)"` at the joinInputsFor
 // call site) — see the guard below for why.
 func narrowJoinLeg(n Node, lay outputLayout, p *Path, nliInner bool) (Node, outputLayout) {
-	if !narrowLegHook || n == nil {
+	if n == nil {
 		return n, lay
 	}
 	if _, already := n.(*Project); already {
