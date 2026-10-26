@@ -4,7 +4,8 @@ package optimizer
 // `create_partial_grouping_paths` (planner.c:7351) at the one site goopg can
 // legally take the decision — the post-cache parallel pass.
 //
-// WHAT THIS REPLACES. `splitAggregateIsProfitable` (parallel_agg.go) decides
+// WHAT THIS REPLACED. `splitAggregateIsProfitable` (parallel_agg.go, deleted at
+// M0147-0047) decided
 // split-vs-no-split with five constants — cXfer 2.0, cTrans 1.0, cHash 0.25,
 // cMerge 4.0, cOut 1.0 — that its own comment calls "calibrated against one
 // query". None is a PG cost constant and none is reachable from a GUC. Worse,
@@ -39,82 +40,15 @@ package optimizer
 // in `groupingpaths.go` this slice does not own).
 
 import (
-	"os"
 	"strconv"
-	"strings"
 )
 
-// partialAggMode is the admission rule for this file's verdict.
-//
-//   - off — the retired size rule decides, unchanged. This is the serial
-//     control arm: the search and the post-pass behave exactly as at C-19f.
-//   - on  — the priced path tournament decides.
-type partialAggMode int
-
-const (
-	partialAggPathsOff partialAggMode = iota
-	partialAggPathsOn
-)
-
-// partialAggPathsMode is read once at process start, like every other
-// plan-shaping knob in this package, so a plan cannot change shape
-// mid-statement.
-var partialAggPathsMode = partialAggModeFromEnv(os.Getenv("GOOPG_PARTIAL_AGG_PATHS"))
-
-// partialAggModeFromEnv resolves the knob. The DEFAULT IS NOW `on`
-// (2026-09-07): C-19g's own §9 recommended the flip on a measured positive
-// result, and the upper-rel-resident half (partialaggupper.go) is what made it
-// safe to take — with the split resident as a PATH, `MaybeAddGather` is no
-// longer the only producer of parallelism, and the C-19h census reads the same
-// 12/22 TPC-H queries carrying a Gather with the post-pass and with it stood
-// down. Measured for this flip: TPC-H 24/24 MATCH on VALUES, Q1 8.66 s ->
-// 4.87 s median, plan pin moved by 2 queries (Q5, Q9, each GAINING
-// `Finalize -> Gather -> Partial`), TPC-DS SF0.5 sweep clean.
-//
-// An unrecognised value still resolves to a MODE rather than to a panic, but
-// the fail-closed direction has moved with the default: `off` is now the
-// explicit opt-out (the serial control arm every C-19 measurement is taken
-// against), and anything unrecognised reads as the default `on`.
-func partialAggModeFromEnv(v string) partialAggMode {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "off", "false", "0", "size-rule":
-		return partialAggPathsOff
-	default:
-		return partialAggPathsOn
-	}
-}
-
-// partialAggModeLabel spells the mode the way an operator would export it, so
-// the flag-provenance label round-trips (flaglabels.go's contract).
-func partialAggModeLabel(m partialAggMode) string {
-	if m == partialAggPathsOn {
-		return "on"
-	}
-	return "off"
-}
-
-// setPartialAggPathsModeForTest pins the mode for one test and returns the
-// restore func. The knob is process-global by design, so a test that flips it
-// must put it back.
-func setPartialAggPathsModeForTest(m partialAggMode) func() {
-	prev := partialAggPathsMode
-	partialAggPathsMode = m
-	return func() { partialAggPathsMode = prev }
-}
-
-// SetPartialAggPathsMode is the same hook across the package boundary, taking
-// the label an operator would export (`off` / `on`) and resolving it through
-// the SAME function production resolves the environment variable with — so a
-// caller cannot select a mode the env knob could not.
-//
-// It exists for this item's EXECUTOR CONSUMER CHECK: the gate requires a
-// fixture where the split verdict is reached BY COST to actually execute as
-// Finalize -> Gather -> Partial and return the serial plan's values, and that
-// test lives in internal/executor, which cannot reach an unexported knob.
-// It is process-global, so a caller must run the returned restore.
-func SetPartialAggPathsMode(label string) (restore func()) {
-	return setPartialAggPathsModeForTest(partialAggModeFromEnv(label))
-}
+// The verdict below is unconditional since M0147-0047. It shipped behind
+// GOOPG_PARTIAL_AGG_PATHS (default `on` since 2026-09-07, when C-19g's §9
+// measurement flipped it; `off` kept the retired size rule as the serial
+// control arm). Measured at retirement, the `off` arm moved TPC-H to 10/22
+// match and TPC-DS to 78/99 (SF0.25) and 74/99 (SF1) against PG 18.3, so the
+// priced tournament is the PG-faithful arm; the size rule went with it.
 
 // Producer strings for the DPPATH trace (pathtrace.go). With `Relids = 0` the
 // lines read `producer=upper.partialgroupagg.* relids=-`, the convention C-12
@@ -434,11 +368,7 @@ func pathIsFiled(rel *RelOptInfo, p *Path) bool {
 }
 
 // partialAggSplitPays is the verdict `findPartialSubtree` consumes, and the
-// one-line replacement for `splitAggregateIsProfitable`.
-//
-// Mode `off` (the default until the measurement in DESIGN §6 says otherwise)
-// delegates to the retired size rule unchanged, so the serial control arm is
-// bit-identical to C-19f's behaviour.
+// one-line replacement for the retired size rule `splitAggregateIsProfitable`.
 //
 // It returns only a boolean and constructs no node. `splitAggregate`
 // (parallel.go) still BUILDS the Finalize -> Gather -> Partial shape, with the
@@ -447,13 +377,6 @@ func pathIsFiled(rel *RelOptInfo, p *Path) bool {
 // else builds a split, and C-19d's `subtreeHasGather` stand-down still stops the
 // post-pass on any tree that already carries a costed Gather.
 func partialAggSplitPays(agg *Aggregate, workers int, leaderParticipates bool) bool {
-	if partialAggPathsMode == partialAggPathsOff {
-		// R54 Step-0: mode-off upper-gate record. The post-pass still answers
-		// (the pre-tournament rule) but the tournament never runs — a Q5 that
-		// never reaches even `split` bookkeeping is downstream of this line.
-		traceUpperGate("agg", "split-rule", "mode=off")
-		return splitAggregateIsProfitable(agg, workers, leaderParticipates)
-	}
 	// DefaultPlannerSettings, not the session's: `MaybeAddGather` carries
 	// `ParallelSettings` and runs post-cache, so no PlannerSettings is in
 	// scope. This is strictly better than what it replaces — PG's GUC DEFAULTS

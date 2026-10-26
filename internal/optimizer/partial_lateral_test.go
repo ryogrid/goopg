@@ -288,8 +288,6 @@ func TestPartialPathDrivingKindLateralProbe(t *testing.T) {
 // no prebuilt copying is needed; this test would catch a regression to
 // refusal.
 func TestUpperSplitAdmitsLateralProbeChild(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	outer, ok := agg.Child.(*SeqScan)

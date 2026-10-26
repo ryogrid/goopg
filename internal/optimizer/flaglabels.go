@@ -78,9 +78,6 @@ func onOff(on bool) string {
 var flagResolvedState = map[string]func(string) string{
 	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
-	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
-		return partialAggModeLabel(partialAggModeFromEnv(v))
-	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -155,6 +152,7 @@ var flagProvenanceOrder = []string{
 	// reproduces the pre-M0140-0003 arm.
 	// Retired at M0147-0046 — see flagProvenanceRetired.
 	"GOOPG_GATHER_PATHS",
+	// Retired at M0147-0047 — see flagProvenanceRetired.
 	"GOOPG_PARTIAL_AGG_PATHS",
 	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path
 	// search, as PG's set_base_rel_pathlists does unconditionally
@@ -363,6 +361,12 @@ var flagProvenanceRetired = map[string]string{
 	// variable. `off` in an older artefact is the serial-search arm; `top`
 	// admitted only the search's final rel.
 	"GOOPG_GATHER_PATHS": "M0147-0046",
+	// C-19g's split verdict mode (default on since 2026-09-07; `off` kept the
+	// retired size rule, splitAggregateIsProfitable, as the serial control
+	// arm). M0147-0047 made the priced tournament unconditional and deleted
+	// the size rule, so nothing reads the variable. `off` in an older artefact
+	// is the size-rule arm (TPC-H 10/22 vs PG when measured at retirement).
+	"GOOPG_PARTIAL_AGG_PATHS": "M0147-0047",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

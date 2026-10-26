@@ -399,14 +399,6 @@ func addPartialGroupOnlyPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggN
 // path's own worker count, per-worker rows and per-worker cost, as
 // create_partial_grouping_paths does, instead of dividing the serial seed.
 func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child Node, cp costParams, ps PlannerSettings, partial *Path) *Path {
-	if partialAggPathsMode != partialAggPathsOn {
-		// R54 Step-0: upper-rel refusal record. Gate name "agg-upper" keeps
-		// this producer distinct from the post-pass "agg" consumer — the two
-		// are independent verdicts over the same aggregate, and conflating
-		// them would misattribute a refusal to the wrong round.
-		traceUpperGate("agg-upper", "refused", "gate=mode")
-		return nil
-	}
 	// The statement-level refusals `MaybeAddGather` makes at its own entry.
 	// `ParallelStatementOK` is the top-level statement's shape (a bare SELECT,
 	// not a DML/DDL/utility statement and not a nested planning scope); the

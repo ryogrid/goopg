@@ -5042,6 +5042,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `637799d73`** \(M0147\-0045 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `3a8bfaa96`** \(M0147\-0046 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7889,9 +7892,19 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(316 s\), Isolation PASS \(553 s\)\.
   - optimizer gatherpaths.go:80; setGatherPathsModeForTest ×18 + SetGatherPathsMode ×5; rebase onto max_parallel_workers_per_gather = 0; `all` stays. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0047 — retire `GOOPG_PARTIAL_AGG_PATHS` OFF arm (retired size rule)**
+- [x] **M0147-0047 — retire `GOOPG_PARTIAL_AGG_PATHS` OFF arm (retired size rule)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 4→3 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `3a8bfaa96`; M0122\-0012 yielded under rule \(a\)\)\. Measured first: the OFF
+    arm is live and far from PG — TPC\-H 10/22, SF0\.25 78/99, SF1 74/99 vs 22/99/99 ON
+    \(`analysis/m0147/m0147\-0047/`\)\. Mode plumbing, both OFF branches, the size rule `splitAggregateIsProfitable`
+    with its five non\-PG constants, and the duplicate `parallelDivisor` deleted; the priced tournament is
+    unconditional\. Design doc `docs/design/0100\-0149/m0147\-0047\-retire\-partial\-agg\-paths\.md`\.
+  - Tests: 32 ON pins deleted; FailsClosed keeps its two PG refusals; nine OFF/size\-rule\-only tests deleted
+    \(incl\. a duplicate of TestGetParallelDivisor\); executor `runAggSplitPriced` no longer flips the mode\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(338 s\), Isolation PASS \(520 s\)\.
   - optimizer partialaggpaths.go:62; setPartialAggPathsModeForTest ×35; measure reachability + ON-vs-OFF plan diff first (M0147-0020 recipe). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0048 — decide and retire `GOOPG_EXISTS_TO_ANY` OFF arm**
   Kind: impl

@@ -53,8 +53,6 @@ func addSplitFor(t *testing.T, agg *Aggregate, ps PlannerSettings) (*RelOptInfo,
 // TestUpperSplitPathIsGeneratedAndPriced is the "the candidate exists" pin —
 // the one that stops every verdict test below from passing vacuously.
 func TestUpperSplitPathIsGeneratedAndPriced(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2) // TPC-H Q1's shape
 	grouped, split := addSplitFor(t, agg, upperSplitSettings())
@@ -92,8 +90,6 @@ func TestUpperSplitPathIsGeneratedAndPriced(t *testing.T) {
 // TPC-H Q1's shape — 5.9 M rows into four groups. This is the win C-19g
 // measured (8.57 s -> 4.14 s) delivered as a PATH rather than by the post-pass.
 func TestUpperSplitWinsForLowCardinalityGrouping(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	ps := upperSplitSettings()
@@ -132,8 +128,6 @@ func TestUpperSplitWinsForLowCardinalityGrouping(t *testing.T) {
 // nothing is pre-aggregated and the group states that cross the boundary are
 // the input itself. DESIGN §3.4's second sanity reading.
 func TestUpperSplitLosesWhenGroupingReducesNothing(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	const rows = 6_000_000
 	agg := sizedAggFixture(t, rows, rows, 1, 1)
@@ -162,8 +156,6 @@ func TestUpperSplitLosesWhenGroupingReducesNothing(t *testing.T) {
 // which is what `terminatesPartial` makes the post-pass do. Gating the whole
 // producer on decomposability cost TPC-H Q16 its Gather in the C-19h census.
 func TestUpperSplitOffersTheGatheredArmForANonSplittableAggregate(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	for i := range agg.Aggs {
@@ -195,19 +187,15 @@ func TestUpperSplitFailsClosed(t *testing.T) {
 	base := upperSplitSettings()
 	cases := []struct {
 		name string
-		mode partialAggMode
 		mut  func(*PlannerSettings)
 	}{
-		{"knob off", partialAggPathsOff, nil},
-		{"not a top-level select", partialAggPathsOn,
+		{"not a top-level select",
 			func(ps *PlannerSettings) { ps.ParallelStatementOK = false }},
-		{"max_parallel_workers_per_gather = 0", partialAggPathsOn,
+		{"max_parallel_workers_per_gather = 0",
 			func(ps *PlannerSettings) { ps.MaxParallelWorkersPerGather = 0 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			restore := setPartialAggPathsModeForTest(tc.mode)
-			defer restore()
 			ps := base
 			if tc.mut != nil {
 				tc.mut(&ps)
@@ -225,8 +213,6 @@ func TestUpperSplitFailsClosed(t *testing.T) {
 // emit the same node shape, because they call the same constructor. A future
 // edit that re-implements the construction inside the arm breaks this.
 func TestUpperSplitBuildsTheSameShapeAsThePostPass(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	_, split := addSplitFor(t, agg, upperSplitSettings())
@@ -264,8 +250,6 @@ func TestUpperSplitBuildsTheSameShapeAsThePostPass(t *testing.T) {
 // Dropping the Gather alone would leave a Finalize over a node that emits NO
 // ROWS at all, so the fold-back to the simple aggregate is not tidiness.
 func TestStripGatherFoldsASplitAggregateBack(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	_, split := addSplitFor(t, agg, upperSplitSettings())
@@ -329,8 +313,6 @@ func captureUpperSplit(t *testing.T, agg *Aggregate, ps PlannerSettings) (*Path,
 // distinct from the post-pass "agg" consumer: independent verdicts over the
 // same aggregate that must never be conflated.
 func TestUpperSplitAdmitsWithTraceLine(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2) // TPC-H Q1's shape
 	split, line := captureUpperSplit(t, agg, upperSplitSettings())
@@ -341,23 +323,6 @@ func TestUpperSplitAdmitsWithTraceLine(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("upper line missing %q: %q", want, line)
 		}
-	}
-}
-
-// TestUpperSplitModeRefusalWithTraceLine: with the knob off the producer files
-// nothing and the line says which gate refused — a silent nil would leave
-// Step-0 unable to tell "mode off" from "subtree unusable".
-func TestUpperSplitModeRefusalWithTraceLine(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOff)
-	defer restore()
-
-	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
-	split, line := captureUpperSplit(t, agg, upperSplitSettings())
-	if split != nil {
-		t.Fatal("producer filed a candidate with the knob off")
-	}
-	if want := "DPTRACE upper gate=agg-upper verdict=refused gate=mode"; line != want {
-		t.Errorf("upper line = %q, want %q", line, want)
 	}
 }
 
@@ -468,8 +433,6 @@ func TestR56TracedDecompositionPins(t *testing.T) {
 // groups; the row count echoes the Q1 fixture its neighbours use so admission
 // (workers, divisor) is certain and only the sorted-arm contest is exercised.
 func TestR56GatherMergeArmFiledAndEvictsLeaderSort(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	if partialAggGatherMergeProducer != "upper.groupagg.gathermerge" {
 		t.Errorf("gathermerge producer = %q, want upper.groupagg.gathermerge",
@@ -571,8 +534,6 @@ func sortedInputArm(rel *RelOptInfo) *Path {
 // transport-final executor was built for —
 // Finalize-Agg(Sorted) -> GatherMerge -> Sort -> PathAgg(Hashed).
 func TestUpperSplitSortedTransportArmFilesThePGShape(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	if partialAggSortedSplitProducer != "upper.groupagg.sortsplit" {
 		t.Errorf("sortsplit producer = %q, want upper.groupagg.sortsplit",
@@ -630,8 +591,6 @@ func TestUpperSplitSortedTransportArmFilesThePGShape(t *testing.T) {
 // hashed split still competes (Q16's lesson: refusing to file is a
 // gate decision, refusing to plan is not).
 func TestUpperSplitSortedTransportArmRefusals(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	// Non-column group expr with no output schema to name the transport
 	// position: the merge key cannot be labelled honestly — the arm
@@ -671,8 +630,6 @@ func TestUpperSplitSortedTransportArmRefusals(t *testing.T) {
 // This test pins admission: a named literal key files the sorted arm and
 // its worker-Sort pathkey is the positional ref into the transport row.
 func TestUpperSplitSortedTransportArmExprKey(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	agg.GroupExprs[0] = &IntegerConst{Value: 7}
@@ -715,8 +672,6 @@ func TestUpperSplitSortedTransportArmExprKey(t *testing.T) {
 }
 
 func TestUpperSplitSortedTransportArmCompetes(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	ps := upperSplitSettings()
@@ -757,8 +712,6 @@ func TestUpperSplitSortedTransportArmCompetes(t *testing.T) {
 // PG's `Finalize GroupAggregate -> Gather Merge -> Sort -> Partial
 // HashAggregate`.
 func TestUpperSplitSortedTransportLowering(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
@@ -820,8 +773,6 @@ func TestUpperSplitSortedTransportLowering(t *testing.T) {
 // Simple+Sorted node would let openSorted trust input order the
 // stripped scan no longer provides.
 func TestStripGatherFoldsTheSortedSplitBack(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
@@ -859,8 +810,6 @@ func TestStripGatherFoldsTheSortedSplitBack(t *testing.T) {
 // below that Gather; without one, the statement-level refusal stands, since a
 // NEW Gather there could land under another parallel-aware node.
 func TestUpperSplitInNestedScopeNeedsExistingGather(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	ps := upperSplitSettings()
 	ps.ParallelStatementOK = false
@@ -917,8 +866,6 @@ func partialGroupChain(p *Path) (gm, partial, workerSort *Path) {
 }
 
 func TestPartialGroupArmFilesThePGShape(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
 	grouped, split := addSplitFor(t, agg, upperSplitSettings())
@@ -953,8 +900,6 @@ func TestPartialGroupArmFilesThePGShape(t *testing.T) {
 }
 
 func TestPartialGroupArmRefusals(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	t.Run("expression key", func(t *testing.T) {
 		agg := sizedAggFixture(t, 5_900_000, 4, 0, 1)
@@ -1032,8 +977,6 @@ func TestPartialGroupWalkAgreement(t *testing.T) {
 // pins the emitted node chain: leader Group -> Gather Merge -> per-worker
 // marked Group -> Sort -> Parallel SeqScan.
 func TestPartialGroupLowering(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 4, 0, 2)
 	_, split := addSplitFor(t, agg, upperSplitSettings())
@@ -1153,8 +1096,6 @@ func fileSortedInput(t *testing.T, agg *Aggregate, ps PlannerSettings) *Path {
 // PathAgg(Sorted) -> PathSort -> input, with the worker Sort priced and
 // keyed over INPUT rows and the merge over TRANSPORT positions.
 func TestUpperSplitSortedInputArmFilesThePGShape(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	if partialAggSortedInputProducer != "upper.groupagg.sortinput" {
 		t.Errorf("sortinput producer = %q, want upper.groupagg.sortinput",
@@ -1206,8 +1147,6 @@ func TestUpperSplitSortedInputArmFilesThePGShape(t *testing.T) {
 // stamped parallel scan — PG's `Finalize GroupAggregate -> Gather Merge
 // -> Partial GroupAggregate -> Sort`.
 func TestUpperSplitSortedInputArmLowers(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	sorted := fileSortedInput(t, agg, upperSplitSettings())
@@ -1263,8 +1202,6 @@ func TestUpperSplitSortedInputArmLowers(t *testing.T) {
 // nil without filing) and the producer's decomposable-aggregate gate
 // (a DISTINCT aggregate keeps ALL split arms off the rel).
 func TestUpperSplitSortedInputArmRefusals(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	// Non-column group expr with no output schema to name the transport
 	// position: transportGroupSortKeys refuses, and the arm must not
@@ -1313,8 +1250,6 @@ func TestUpperSplitSortedInputArmRefusals(t *testing.T) {
 // on this pathlist: which of THOSE wins a fixture's rel is a
 // cost-model verdict measured on the corpus, not this arm's contract.
 func TestUpperSplitSortedInputArmElection(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	contest := func(agg *Aggregate, wm int64) (*RelOptInfo, *Path, *Path) {
 		grouped, partialRel, pseed, cp, workers, d, pwr, pg, fg, ngc, na, inw :=
@@ -1367,8 +1302,6 @@ func TestUpperSplitSortedInputArmElection(t *testing.T) {
 // to Simple+Hashed (where the Sort sat above the partial and is
 // discarded with it).
 func TestStripGatherFoldsTheSortedInputBack(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
 	sorted := fileSortedInput(t, agg, upperSplitSettings())
@@ -1457,8 +1390,6 @@ func aggOver(rel *RelOptInfo, childKind PathKind) *Path {
 // with ordered aggregates), and both ordered gathered inputs are filed —
 // `Agg -> Sort -> Gather` and `Agg -> Gather Merge -> Sort`.
 func TestUpperSplitPlainOrderedAggFilesSortedArms(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
 	if len(agg.GroupExprs) != 0 || agg.GroupingSets != nil {
@@ -1514,8 +1445,6 @@ func TestUpperSplitPlainOrderedAggFilesSortedArms(t *testing.T) {
 // `make_ordered_path` returns the gather path unchanged — the unsorted arm
 // IS the upstream candidate then, so it must survive.
 func TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	ps := upperSplitSettings()
 	ps.EnablePresortedAggregate = false
@@ -1535,8 +1464,6 @@ func TestUpperSplitPlainOrderedAggGUCOffKeepsUnsortedArm(t *testing.T) {
 // lowering the R56 grouped arm already proves, exercised here for the PLAIN
 // (0-group) spec.
 func TestUpperSplitPlainOrderedAggLowers(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedPlainOrderedAggFixture(t, 5_900_000)
 	grouped, _ := addSplitFor(t, agg, upperSplitSettings())
@@ -1578,8 +1505,6 @@ func TestUpperSplitPlainOrderedAggLowers(t *testing.T) {
 // an expensive input (a nested loop) under a small group set, where the
 // worker sort is noise against the input's cost (PG: 69117.54 vs 68911.18).
 func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	ps := upperSplitSettings()
 	survives := func(agg *Aggregate, inputTotal float64, enableSort bool) bool {
@@ -1610,8 +1535,6 @@ func TestHashedPartialAggEvictedByFuzzyTiedSortedPartial(t *testing.T) {
 // sorted-input split and neither the presorted split nor a hashed split
 // built on the evicted partial.
 func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	file := func(inputTotal float64) *RelOptInfo {
 		ps := upperSplitSettings()
@@ -1660,8 +1583,6 @@ func TestUpperSplitSkipsArmsOverEvictedHashedPartial(t *testing.T) {
 // Q16's `GroupAggregate -> Gather Merge -> Sort (p_brand, p_type, p_size,
 // ps_suppkey)`.
 func TestGatheredArmFollowsTheSerialOrderedAggRules(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 5_900_000, 2_000, 1, 1)
 	agg.Aggs[0] = AggregateCall{Name: "count", Distinct: true, Arg: &ColumnRef{Index: 2, Name: "v"}}
@@ -1734,8 +1655,6 @@ func TestGatherSplicesKeepWorkerUnsafeWrappersAbove(t *testing.T) {
 // compute_gather_rows, the count of the override_rows=true upper-rel calls. That
 // let TPC-DS SF1 Q48's no-split Gather undercut PG's Finalize Aggregate.
 func TestGatheredArmBoundariesCarryScanJoinRelRows(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	// Every row its own group: nothing to pre-aggregate, so the no-split
 	// shapes are the ones the rel keeps.
@@ -1805,8 +1724,6 @@ func TestGatheredArmBoundariesCarryScanJoinRelRows(t *testing.T) {
 // unclamped 4.8 priced goopg's split arm 0.02 under PG's and helped it win a
 // near-tie that PG's no-split arm wins.
 func TestSplitArmBoundariesCarryComputeGatherRows(t *testing.T) {
-	restore := setPartialAggPathsModeForTest(partialAggPathsOn)
-	defer restore()
 
 	agg := sizedAggFixture(t, 1_000_000, 37, 2, 1)
 	ps := upperSplitSettings()
