@@ -5045,6 +5045,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `3a8bfaa96`** \(M0147\-0046 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b2665b45c`** \(M0147\-0047 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7906,9 +7909,22 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(338 s\), Isolation PASS \(520 s\)\.
   - optimizer partialaggpaths.go:62; setPartialAggPathsModeForTest ×35; measure reachability + ON-vs-OFF plan diff first (M0147-0020 recipe). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0048 — decide and retire `GOOPG_EXISTS_TO_ANY` OFF arm**
+- [!] **M0147-0048 — decide and retire `GOOPG_EXISTS_TO_ANY` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  - Measured 2026\-10\-27 at `b2665b45c` \(`analysis/m0147/m0147\-0048/`\): with `GOOPG_EXISTS_TO_ANY=off` the census
+    reads TPC\-H 22/22, TPC\-DS SF0\.25 97/99 and SF1 97/99 — Q10 and Q35 SHAPE\-DIFF \(join\-order,
+    parameterisation, qual\-placement\) at both scales; ON is 22/99/99\. Q10/Q35 are the OR\-of\-EXISTS witnesses
+    the pass exists for, and PG's own plans show the hashed ANY SubPlan there\.
+  - Decision per this entry's rule: ON is NOT PG logic\. PG plans both forms in `make\_subplan` and setrefs\.c keeps
+    the cheaper per expected calls \(AlternativeSubPlan\); goopg's ON always takes the hashed form\. Neither arm is
+    PG's choice, so the OFF arm is not deleted without the owner \(R3\)\. The PG\-faithful route is M0146\-0012b
+    \(port the cost choice\), after which both arms retire together\.
+  > \#\# ESCALATION 2026\-10\-27 \(R3\) — M0147\-0048: retire the EXISTS→ANY OFF arm now, or hold it behind M0146\-0012b?
+  > ON matches PG on every corpus query \(OFF loses TPC\-DS Q10/Q35\), but ON is an unconditional stand\-in for PG's
+  > AlternativeSubPlan cost choice, not a port of it\. Owner: either authorise retiring OFF now \(lever\-count 3→2;
+  > the corpus evidence says ON is the closer arm\), or keep 0048 held until M0146\-0012b lands and retire both
+  > env arms in favour of the cost choice\. The loop continues with M0147\-0049 meanwhile\.
   - optimizer exists_to_any.go:79; SetExistsToAnyEnabled ×6. ON is goopg's unconditional analogue of convert_EXISTS_to_ANY (PG keeps an AlternativeSubPlan; ledger M0146-0012b) — if ON is not PG logic, R3 needs an owner [!] before the OFF (PG-closer per-row SubPlan) arm goes. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0049 — measure and retire `GOOPG_INDEXKEY_HARVEST` OFF arm**
   Kind: impl
