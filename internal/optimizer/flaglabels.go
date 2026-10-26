@@ -76,7 +76,6 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_MEMOIZE":          func(v string) string { return onOff(memoizeFromEnv(v)) },
 	"GOOPG_PARALLEL":         func(v string) string { return onOff(parallelFromEnv(v)) },
 	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
@@ -117,6 +116,7 @@ var flagResolvedState = map[string]func(string) string{
 var flagProvenanceOrder = []string{
 	"GOOPG_RELSIZE_FALLBACK",
 	"GOOPG_COST_DRIVEN_JOINORDER",
+	// Retired at M0147-0044 — see flagProvenanceRetired.
 	"GOOPG_MEMOIZE",
 	"GOOPG_PARALLEL",
 	// Retired at M0145-0008 — see flagProvenanceRetired.
@@ -363,6 +363,11 @@ var flagProvenanceRetired = map[string]string{
 	// nothing reads the variable. `off` in an older artefact is the
 	// seed-only ORDERED tournament.
 	"GOOPG_INCREMENTAL_SORT": "M0147-0043",
+	// The process-wide Memoize kill switch (default on, `off` disabled both
+	// the legacy NLI insertion rule and get_memoize_path). M0147-0044 left
+	// both arms answering only to the statement's enable_memoize, so nothing
+	// reads the variable. `off` in an older artefact is the no-Memoize arm.
+	"GOOPG_MEMOIZE": "M0147-0044",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

@@ -207,8 +207,9 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 // shape named rather than dropped (a vacuous gate that is not written down is
 // indistinguishable from a forgotten one the day 03 §4.4's pin is relaxed):
 //
-//  1. `enable_memoize` — goopg's `memoizeOn`, the SAME switch the legacy
-//     insertion rule reads, so `SET enable_memoize = off` kills both arms.
+//  1. `enable_memoize` — the statement's `cp.enableMemoize`, the SAME setting
+//     the legacy insertion rule receives, so `SET enable_memoize = off` kills
+//     both arms.
 //  2. `outer_path->parent->rows < 2` (:696): with one outer row every probe is
 //     a first probe and a cache is pure overhead.
 //  3. LATERAL cache keys (`extract_lateral_vars_from_PHVs`, :704): goopg's
@@ -242,10 +243,9 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 // is unconditionally in the strict mode and never in the "logical" one. That is
 // a superset of what PG guarantees here, never a subset. Ledgered.
 func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path, cp costParams) *Path {
-	// take2 P2-02c: the per-STATEMENT setting, not the process global. The
-	// global remains as the env kill-switch (GOOPG_MEMOIZE) and as the legacy
-	// arm's gate; what it no longer carries is one session's SET.
-	if !cp.enableMemoize || !memoizeOn.Load() {
+	// take2 P2-02c: the per-STATEMENT setting, not a process global (the
+	// GOOPG_MEMOIZE global was retired at M0147-0044).
+	if !cp.enableMemoize {
 		return nil
 	}
 	if outerPath == nil || innerPath == nil || outer == nil {

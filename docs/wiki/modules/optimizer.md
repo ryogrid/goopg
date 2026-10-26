@@ -570,7 +570,6 @@ Every plan-shaping feature is gated by a process-start env var. The full list:
 | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
 | `GOOPG_PARALLEL` | on | Parallel query post-pass |
-| `GOOPG_MEMOIZE` | on | Memoize path generation |
 | `GOOPG_COLLAPSE` | on | Explicit JOIN tree collapsing |
 | `GOOPG_EXISTS_TO_ANY` | on | EXISTS-to-ANY rewrite |
 | `GOOPG_REDUCE_OUTER_JOINS` | on | reduce_outer_joins pass |

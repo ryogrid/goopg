@@ -17,34 +17,11 @@ package optimizer
 // Memoize insertions at all; that matches PostgreSQL, which memoizes
 // zero of the 22 TPC-H queries at SF1.
 
-import (
-	"os"
-	"sync/atomic"
-)
-
-// memoizeOn gates Memoize insertion. Default on; killed by the env
-// GOOPG_MEMOIZE=off at process start, by SetMemoizeEnabled from tests,
-// or by `SET enable_memoize = off` via the OnChange bridge in
-// cmd/goopg/main.go (the same bridge pattern as enable_nestloop_index:
-// the GUC stays registered in the planner-method no-op loop and the
-// most-recent SET wins process-wide).
-var memoizeOn atomic.Bool
-
-func init() {
-	memoizeOn.Store(memoizeFromEnv(os.Getenv("GOOPG_MEMOIZE")))
-}
-
-// memoizeFromEnv is the kill-switch's polarity, factored out of init so the
-// provenance table (flaglabels.go) can ask what an UNSET variable resolves to
-// without a subprocess — the same shape as pgShapedDPFromEnv.
-func memoizeFromEnv(v string) bool { return v != "off" }
-
-// SetMemoizeEnabled flips Memoize insertion on or off (test hook and
-// the enable_memoize GUC bridge target).
-func SetMemoizeEnabled(on bool) { memoizeOn.Store(on) }
-
-// MemoizeEnabled reports the current switch state.
-func MemoizeEnabled() bool { return memoizeOn.Load() }
+// Memoize insertion answers to PG's `enable_memoize` alone, per statement
+// (PlannerSettings.EnableMemoize): the legacy arm below receives it from
+// rewriteJoinsToNLI, the searched arm (getMemoizePath) from costParams. The
+// process-wide memoizeOn switch it replaced — GOOPG_MEMOIZE=off, and
+// SetMemoizeEnabled from tests — was retired at M0147-0044.
 
 const (
 	// memoizeMinHitFraction: insert only when at least this fraction of
@@ -63,7 +40,7 @@ const (
 // gate accepts. Mutates nli in place; always returns nli.
 //
 // Gate conditions (all must hold):
-//   - switch on (GUC/env);
+//   - `enable_memoize` on for this statement;
 //   - join type INNER or LEFT — NEVER Semi/Anti: their early-out probes
 //     cannot run the inner to completion, so a cache entry could never
 //     be marked complete (PG refuses SEMI/ANTI in get_memoize_path
@@ -77,8 +54,8 @@ const (
 //   - ANALYZE stats yield outerRows and ndistinct(outer key);
 //   - outerRows ≥ memoizeMinOuterRows and expected hit fraction
 //     ≥ memoizeMinHitFraction.
-func maybeAttachMemoize(nli *NestedLoopIndexJoin) *NestedLoopIndexJoin {
-	if nli == nil || !memoizeOn.Load() {
+func maybeAttachMemoize(nli *NestedLoopIndexJoin, enableMemoize bool) *NestedLoopIndexJoin {
+	if nli == nil || !enableMemoize {
 		return nli
 	}
 	if nli.Type != JoinTypeInner && nli.Type != JoinTypeLeft {

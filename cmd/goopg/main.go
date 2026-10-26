@@ -392,8 +392,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// Memoize for every other session on the server — the most-recent SET won
 	// process-wide. It is now a per-statement planner input carried on
 	// PlannerSettings, so a SET affects only the session that issued it.
-	// optimizer.SetMemoizeEnabled survives as the test hook and the
-	// GOOPG_MEMOIZE env kill-switch.
+	// (The process global it bridged to — optimizer.SetMemoizeEnabled and the
+	// GOOPG_MEMOIZE env kill-switch — was retired at M0147-0044.)
 	// take2 P2-02c: enable_presorted_aggregate, enable_hashagg, geqo and
 	// geqo_threshold NO LONGER bridge to process globals. Each did, and each
 	// therefore let one session's SET steer every other session's plans. All

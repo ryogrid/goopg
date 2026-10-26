@@ -5033,6 +5033,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `77d4c33b6`** \(M0147\-0042 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261027c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `abd93c55a`** \(M0147\-0043 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7836,9 +7839,20 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance PASS, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(647 s\)\.
   - optimizer incrementalsortpaths.go:86; 5 direct test refs; rebase onto PG enable_incremental_sort (PlannerSettings.EnableIncrementalSort). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0044 — retire `GOOPG_MEMOIZE` OFF arm**
+- [x] **M0147-0044 — retire `GOOPG_MEMOIZE` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 7→6 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `abd93c55a`; M0122\-0012 yielded under rule \(a\)\)\. `memoizeOn`, the env
+    read, `memoizeFromEnv`, `SetMemoizeEnabled` and `MemoizeEnabled` deleted; both Memoize arms answer only to the
+    statement's `enable_memoize`\. The legacy NLI insertion rule \(`maybeAttachMemoize`\) now receives
+    `ps\.EnableMemoize` via `walkRewriteNLI` — before this, a session's `SET enable_memoize = off` did not reach it\.
+    Design doc `docs/design/0100\-0149/m0147\-0044\-retire\-memoize\.md`\.
+  - Tests: attach/getMemoizePath kill\-switch tests rebased onto the per\-statement setting; executor
+    `TestMemoizeExplainAndResults` off arm plans through `runSQLWith` with EnableMemoize/HashJoin/MergeJoin off \(the
+    bare NLI\), and asserts it is still a Nested Loop\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(314 s\), Isolation PASS \(567 s\)\.
   - optimizer memoize.go:34; SetMemoizeEnabled ×13; rebase onto PG enable_memoize (PlannerSettings.EnableMemoize). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0045 — retire `GOOPG_PARALLEL` OFF arm**
   Kind: impl

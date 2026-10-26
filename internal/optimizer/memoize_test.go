@@ -75,7 +75,7 @@ func TestMemoizeAttachGateTable(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			nli := memoNLI(t, tc.joinType, tc.outerRows, tc.keyND, tc.unique)
-			maybeAttachMemoize(nli)
+			maybeAttachMemoize(nli, true)
 			if got := nli.InnerMemo != nil; got != tc.want {
 				t.Fatalf("InnerMemo attached=%v, want %v", got, tc.want)
 			}
@@ -98,13 +98,11 @@ func TestMemoizeAttachGateTable(t *testing.T) {
 	}
 }
 
-// TestMemoizeAttachKillSwitch — SetMemoizeEnabled(false) must suppress
-// the attach even on the accepting shape (the enable_memoize bridge).
+// TestMemoizeAttachKillSwitch — the statement's enable_memoize = off must
+// suppress the attach even on the accepting shape.
 func TestMemoizeAttachKillSwitch(t *testing.T) {
-	SetMemoizeEnabled(false)
-	defer SetMemoizeEnabled(true)
 	nli := memoNLI(t, JoinTypeInner, 4000, 10, true)
-	maybeAttachMemoize(nli)
+	maybeAttachMemoize(nli, false)
 	if nli.InnerMemo != nil {
 		t.Fatal("InnerMemo attached with the switch off")
 	}
@@ -116,7 +114,7 @@ func TestMemoizeAttachKillSwitch(t *testing.T) {
 func TestMemoizeAttachNonColumnKey(t *testing.T) {
 	nli := memoNLI(t, JoinTypeInner, 4000, 10, true)
 	nliIn(nli.Inner).Key = &ColumnRef{Index: 7, Name: "bogus"}
-	maybeAttachMemoize(nli)
+	maybeAttachMemoize(nli, true)
 	if nli.InnerMemo != nil {
 		t.Fatal("InnerMemo attached for an out-of-schema key")
 	}

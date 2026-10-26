@@ -116,8 +116,8 @@ func TestDisabledNodesAccumulatesFromChildren(t *testing.T) {
 // comment said. The GUC is a per-statement planner input and now travels on
 // PlannerSettings with the rest.
 //
-// The process global survives as the GOOPG_MEMOIZE env kill-switch and as the
-// legacy arm's gate; what it must no longer carry is a session's SET.
+// The process global itself (GOOPG_MEMOIZE / SetMemoizeEnabled) was retired at
+// M0147-0044; both Memoize arms now read only the per-statement setting.
 func TestEnableMemoizeIsPerStatementNotProcessGlobal(t *testing.T) {
 	if !DefaultPlannerSettings().EnableMemoize {
 		t.Fatal("enable_memoize must default to ENABLED")
@@ -139,10 +139,6 @@ func TestEnableMemoizeIsPerStatementNotProcessGlobal(t *testing.T) {
 	if !on.costParams().enableMemoize || off.costParams().enableMemoize {
 		t.Error("two PlannerSettings must resolve independently; one session's " +
 			"setting is leaking into another's")
-	}
-	// The global is untouched by any of the above.
-	if !MemoizeEnabled() {
-		t.Error("resolving per-statement settings must not mutate the process global")
 	}
 }
 

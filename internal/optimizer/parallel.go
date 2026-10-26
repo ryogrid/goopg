@@ -37,7 +37,7 @@ import (
 )
 
 // parallelOn is the process-global kill switch, in the established house
-// style (memoizeOn, the NLI cost-gate legacy flag). Default on; killed by
+// style (the NLI cost-gate legacy flag; memoizeOn until M0147-0044). Default on; killed by
 // GOOPG_PARALLEL=off at process start or by SetParallelEnabled from tests.
 var parallelOn atomic.Bool
 
@@ -46,7 +46,7 @@ func init() {
 }
 
 // parallelFromEnv is the kill-switch's polarity, factored out of init for the
-// provenance table (flaglabels.go); see memoizeFromEnv.
+// provenance table (flaglabels.go).
 func parallelFromEnv(v string) bool { return v != "off" }
 
 // SetParallelEnabled toggles Gather insertion process-wide.

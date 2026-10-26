@@ -40,7 +40,7 @@ func init() {
 
 // indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
 // so the provenance table (flaglabels.go) can render its unset default from
-// the same function production resolves it with; see memoizeFromEnv. (Its
+// the same function production resolves it with. (Its
 // sibling GOOPG_UNNEST_PREDP retired with the S5a pre-DP route, M0145-0008.)
 func indexKeyHarvestFromEnv(v string) bool { return v != "off" }
 

@@ -46,7 +46,7 @@ func init() {
 }
 
 // nliCostGateLegacyFromEnv is the escape hatch's polarity, factored out of init
-// for the provenance table (flaglabels.go); see memoizeFromEnv. Unlike the
+// for the provenance table (flaglabels.go). Unlike the
 // boolean kill switches this one is a MODE — the label spells `legacy` or
 // `current`, not on/off.
 func nliCostGateLegacyFromEnv(v string) bool { return v == "legacy" }
@@ -83,10 +83,12 @@ func rewriteJoinsToNLI(n Node, cat catalog.Catalog, ps PlannerSettings) Node {
 	// site are gone: the flag defaulted off from M0127-P5.9 and was
 	// deleted at M0127-P6.3, and the two in-place reorders the pass
 	// repaired (the integer DP, the MHJ packer) were deleted with it.
-	return walkRewriteNLI(n, cat)
+	return walkRewriteNLI(n, cat, ps.EnableMemoize)
 }
 
-func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
+// enableMemoize is the statement's `enable_memoize`, consulted by the Memoize
+// insertion rule on every NLI this walk builds.
+func walkRewriteNLI(n Node, cat catalog.Catalog, enableMemoize bool) Node {
 	if n == nil {
 		return nil
 	}
@@ -100,13 +102,13 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 	}
 	switch x := n.(type) {
 	case *Join:
-		x.Left = walkRewriteNLI(x.Left, cat)
-		x.Right = walkRewriteNLI(x.Right, cat)
+		x.Left = walkRewriteNLI(x.Left, cat, enableMemoize)
+		x.Right = walkRewriteNLI(x.Right, cat, enableMemoize)
 		if nli, ok := tryBuildNLI(x, cat); ok {
 			// S7 (D5.1): consider a Memoize cache on the inner probe.
 			// The Filter-promotion path above recurses through this
 			// case, so one insertion point covers every NLI build.
-			return maybeAttachMemoize(nli)
+			return maybeAttachMemoize(nli, enableMemoize)
 		}
 		return x
 	case *Filter:
@@ -132,7 +134,7 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 				if jc.Type == JoinTypeCross {
 					jc.Type = JoinTypeInner
 				}
-				newChild := walkRewriteNLI(jc, cat)
+				newChild := walkRewriteNLI(jc, cat, enableMemoize)
 				if _, isNLI := newChild.(*NestedLoopIndexJoin); isNLI {
 					if len(residuals) == 0 {
 						return newChild
@@ -157,25 +159,25 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 		// confirming the rebind picked the wrong runtime slot).
 		// Defer to M0068 once the underlying schema/layout
 		// reconciliation is solved.
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *Project:
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *Sort:
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *Limit:
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *Aggregate:
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *WindowAgg:
-		x.Child = walkRewriteNLI(x.Child, cat)
+		x.Child = walkRewriteNLI(x.Child, cat, enableMemoize)
 		return x
 	case *NestedLoopIndexJoin:
-		x.Outer = walkRewriteNLI(x.Outer, cat)
+		x.Outer = walkRewriteNLI(x.Outer, cat, enableMemoize)
 		// Inner is *IndexScan — leaf; nothing to recurse.
 		return x
 	}
