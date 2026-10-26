@@ -5000,6 +5000,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **exhausted at `63d2ab399`** \(M0147\-0031 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261026g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `8ab965464`** \(M0147\-0032 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7650,9 +7653,16 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
     22/22, RegressSuite, Isolation\.
   - executor parallel_hash_build.go:481; 4 direct test refs. Values gates + TPC-H parallel acceptance arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0033 — retire `GOOPG_NL_MATERIALIZE_WORK_MEM=0` (unbounded NL inner cache)**
+- [x] **M0147-0033 — retire `GOOPG_NL_MATERIALIZE_WORK_MEM=0` (unbounded NL inner cache)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 18→17 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `nlInnerWorkMemEnabled`, both `setUnbounded` branches and
+    `materializeOp\.setUnbounded` deleted — the NL inner cache is always work\_mem\-bounded \(PG tuplestore spill\);
+    `withNLInnerWorkMem` helper \+ 3 calls and the spill test\'s env skip removed\. Ledger resolution row \(M0127\-P4\.3
+    knob\)\. Design doc `docs/design/0100\-0149/m0147\-0033\-retire\-nl\-materialize\-work\-mem\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - executor join_nl_stream.go:52; ON = PG tuplestore spill past work_mem (M0146-0010c); 3 direct test refs. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0034 — retire `GOOPG_SCAN_PREFILTER` OFF arm**
   Kind: impl

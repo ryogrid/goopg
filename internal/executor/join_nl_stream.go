@@ -45,11 +45,10 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
-// nlInnerWorkMemEnabled gates the work_mem bound on the nested loop's inner
-// Materialize: PG's tuplestore spills past work_mem, and so does this cache
-// by default since M0146-0010c. GOOPG_NL_MATERIALIZE_WORK_MEM=0 restores the
-// old unbounded cache for an A/B. See openNestedLoop for the history.
-var nlInnerWorkMemEnabled = os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") != "0"
+// The nested loop's inner Materialize is bounded by work_mem and spills past
+// it, as PG's tuplestore does (M0146-0010c). GOOPG_NL_MATERIALIZE_WORK_MEM=0
+// restored the old unbounded cache for an A/B until M0147-0033 retired the
+// switch: no gate, CI or bench script ever set it.
 
 // nlBareReexec selects the STRICT bare-inner semantics (M0146-0010): when the
 // plan elects no `*optimizer.Materialize` over a nested-loop inner, the rescan
@@ -169,20 +168,16 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 			_ = o.right.Close()
 			return fmt.Errorf("nested loop: plan elected Materialize over the inner but no materializeOp was built")
 		}
-		if !nlInnerWorkMemEnabled {
-			// The bound was off by default until M0146-0010c. Measured on
-			// TPC-DS SF0.5 Q54, whose plan then nest-looped over a 1.44M-row
-			// `store_sales` seq scan (~1.6 GB as `[]Datum`), the spilled cache
-			// replayed the whole file per outer tuple — 144 s → >400 s. PG
-			// never meets that wall because `cost_rescan` prices the case and
-			// the planner picks another path, and goopg's planner now does too
-			// (costMaterial + materialRescanCost, optimizer/materialize.go):
-			// Q54's plan no longer materializes store_sales, and the SF0.25
-			// sweep is unchanged with the bound on (M0146-0010b, design doc
-			// m0146-0010-materialize-node.md §7).
-			// `GOOPG_NL_MATERIALIZE_WORK_MEM=0` turns it off for an A/B.
-			mat.setUnbounded()
-		}
+		// The cache is bounded by work_mem (M0146-0010c). It was unbounded by
+		// default before: measured on TPC-DS SF0.5 Q54, whose plan then
+		// nest-looped over a 1.44M-row `store_sales` seq scan (~1.6 GB as
+		// `[]Datum`), the spilled cache replayed the whole file per outer
+		// tuple — 144 s → >400 s. PG never meets that wall because
+		// `cost_rescan` prices the case and the planner picks another path,
+		// and goopg's planner now does too (costMaterial + materialRescanCost,
+		// optimizer/materialize.go): Q54's plan no longer materializes
+		// store_sales (M0146-0010b, design doc m0146-0010-materialize-node.md
+		// §7).
 		inner = rs
 	} else if nlBareReexec {
 		// The strict bare-inner arm: no Materialize node means PG's cost
@@ -199,9 +194,6 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 		// plan/executor disagreement is the documented debt.
 		m := newMaterializeOp(o.right)
 		m.openCached(ctx)
-		if !nlInnerWorkMemEnabled {
-			m.setUnbounded()
-		}
 		mat = m
 		inner = m
 	}

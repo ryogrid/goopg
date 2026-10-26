@@ -21,7 +21,6 @@ package executor
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -176,18 +175,6 @@ func TestMaterializePartialFirstPassResumesChild(t *testing.T) {
 	}
 }
 
-// withNLInnerWorkMem turns the nested loop's inner-cache work_mem bound ON for
-// the duration of a test. The bound is the default since M0146-0010c, but an
-// A/B run with GOOPG_NL_MATERIALIZE_WORK_MEM=0 turns it off for the process,
-// and the tests that assert the spill path is an identity must not then
-// silently assert nothing.
-func withNLInnerWorkMem(t *testing.T) {
-	t.Helper()
-	prev := nlInnerWorkMemEnabled
-	nlInnerWorkMemEnabled = true
-	t.Cleanup(func() { nlInnerWorkMemEnabled = prev })
-}
-
 // nlJoinPlan is a nested-loop join of the given type on (l0 = r0) over a
 // MATERIALISED inner — what every test in this file pins (read-once replay,
 // spill identity, resume rule). Since M0146-0010 the executor materialises
@@ -245,7 +232,6 @@ func TestNestedLoopStreamsOuterAndReadsInnerOnce(t *testing.T) {
 // hold the inner side forces the cache to disk and every outer tuple past the
 // first replays it from the file.
 func TestNestedLoopIdenticalWhenInnerCacheSpills(t *testing.T) {
-	withNLInnerWorkMem(t)
 	const outerN, innerN, lw, rw = 30, 80, 2, 2
 	left := seqRows(outerN, "l")
 	right := seqRows(innerN, "r")
@@ -265,7 +251,6 @@ func TestNestedLoopIdenticalWhenInnerCacheSpills(t *testing.T) {
 // the cache itself — the one path where the join drains the Materialize
 // directly.
 func TestNestedLoopRightJoinOverEmptyOuter(t *testing.T) {
-	withNLInnerWorkMem(t)
 	const innerN, lw, rw = 12, 2, 2
 	right := seqRows(innerN, "r")
 	for _, workMem := range []int64{0, 256} {
@@ -282,7 +267,6 @@ func TestNestedLoopRightJoinOverEmptyOuter(t *testing.T) {
 // The join must still be correct for the outer tuples that follow, which is
 // the Materialize resume rule exercised through the join rather than directly.
 func TestNestedLoopKeylessSemiAntiEarlyOut(t *testing.T) {
-	withNLInnerWorkMem(t)
 	const lw, rw = 2, 2
 	// Left keys 0..9; right keys 0..4 only, so half the outer tuples match.
 	left := seqRows(10, "l")
@@ -420,9 +404,6 @@ func TestNestedLoopMaterializedPlanWithoutCacheIsRefused(t *testing.T) {
 // GOOPG_NL_MATERIALIZE_WORK_MEM=1. The spilled join must equal the in-memory
 // one.
 func TestNestedLoopInnerCacheSpillsByDefault(t *testing.T) {
-	if os.Getenv("GOOPG_NL_MATERIALIZE_WORK_MEM") == "0" {
-		t.Skip("the bound is turned off for this process (A/B run)")
-	}
 	const outerN, innerN, lw, rw = 20, 80, 2, 2
 	run := func(workMem int64) ([]string, *materializeOp) {
 		left := &rowsOp{rows: seqRows(outerN, "l"), schema: batchSchema("l", lw)}

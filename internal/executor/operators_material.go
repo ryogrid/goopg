@@ -302,11 +302,6 @@ func (o *materializeOp) Close() error {
 	return o.child.Close()
 }
 
-// setUnbounded drops the work_mem budget for this cache, so it never spills.
-// Callers use it when the replay cost of a spilled cache is not yet priced by
-// the planner — see joinOp.openNestedLoop.
-func (o *materializeOp) setUnbounded() { o.buf.limit = 0 }
-
 // rescanByReexec is the bare-inner rescan strategy (M0146-0010): the nested
 // loop's inner when the plan carries NO `*optimizer.Materialize` node —
 // `cost_rescan`'s default arm, where re-running the path re-pays startup and
