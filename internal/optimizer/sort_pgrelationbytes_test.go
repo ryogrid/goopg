@@ -33,28 +33,7 @@ func TestPGRelationByteSizeAlignmentAndInvalidWidth(t *testing.T) {
 	}
 }
 
-func TestCostSortRunPGRelationBytesSwitchOffIsLegacy(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(false)
-	defer restore()
-	cp := defaultCostParams()
-	for _, tc := range []struct {
-		rows, avg, limit float64
-		ncols, width      int
-	}{
-		{0, 0, -1, 4, 8}, {1, 4, -1, 4, 9}, {1000, 32, -1, 8, 64},
-		{1e7, 500, 100, 24, 700},
-	} {
-		legacy := costSortRun(cp, tc.rows, tc.ncols, tc.avg, tc.limit)
-		got := costSortRunWithWidth(cp, tc.rows, tc.ncols, tc.avg, tc.limit, tc.width, "test")
-		if got != legacy {
-			t.Fatalf("switch-off %+v: got %+v, want legacy %+v", tc, got, legacy)
-		}
-	}
-}
-
 func TestCostSortRunPGRelationBytesUsesPGFloorOrdering(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	cp.workMem = 31 // one PG width-1 row is 32 bytes
 
@@ -86,8 +65,6 @@ func TestCostSortRunPGRelationBytesUsesPGFloorOrdering(t *testing.T) {
 }
 
 func TestSortPathUsesNarrowEmittedWidthOnlyForOptInPrice(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	cp.workMem = 64
 	rel := &RelOptInfo{Width: 700, NCols: 4, AvgVarBytes: 32}
@@ -110,8 +87,6 @@ func TestSortPathUsesNarrowEmittedWidthOnlyForOptInPrice(t *testing.T) {
 }
 
 func TestOrderedSortUsesItsActualInputWidth(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	in := upperOrderedInput(10)
 	sort := createOrderedPaths(newUpperRels(), in, upperOrderedKeys(), 0, cp, 0, -1, nil).(*Sort)
@@ -127,8 +102,6 @@ func TestOrderedSortUsesItsActualInputWidth(t *testing.T) {
 }
 
 func TestPGSortRelationBytesTraceNamesBothCurrencies(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	lines := captureTrace(t, func() {
 		costSortRunWithWidth(cp, 10, 2, 0, -1, 9, "test.sort")
@@ -139,14 +112,15 @@ func TestPGSortRelationBytesTraceNamesBothCurrencies(t *testing.T) {
 		!strings.Contains(lines[0], "goopgbranch=") || !strings.Contains(lines[0], "pgbranch=") {
 		t.Fatalf("trace = %q, want one PG Sort currency record", lines)
 	}
-	restore()
-	restore = setPGSortRelationBytesCostForTest(false)
+	// With no valid planner width the PG currency cannot be computed, so the
+	// goopg entry-byte currency is the fallback (the only arm left of the
+	// retired GOOPG_PG_SORT_RELATION_BYTES_COST switch, M0147-0042).
 	lines = captureTrace(t, func() {
-		costSortRunWithWidth(cp, 10, 2, 0, -1, 9, "test.sort")
+		costSortRunWithWidth(cp, 10, 2, 0, -1, 0, "test.sort")
 	})
 	if len(lines) != 1 || !strings.Contains(lines[0], "currency=goopg") ||
-		!strings.Contains(lines[0], "pginput=") || !strings.Contains(lines[0], "pgbranch=") {
-		t.Fatalf("switch-off trace = %q, want both currencies and Goopg election", lines)
+		!strings.Contains(lines[0], "pgbranch=unknown-width") {
+		t.Fatalf("invalid-width trace = %q, want the goopg fallback election", lines)
 	}
 }
 

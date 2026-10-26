@@ -73,8 +73,6 @@ func TestPartialSortTournamentPricesBothArms(t *testing.T) {
 }
 
 func TestPartialSortBothArmsUseTheEmittedInputWidth(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := DefaultPlannerSettings().costParams()
 	tbl := bigTable(t, "psp_pgwidth")
 	child := seqScanOver(tbl)

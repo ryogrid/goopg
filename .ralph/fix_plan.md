@@ -5027,6 +5027,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `16101a6a1`** \(M0147\-0040 changed internal/optimizer\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261027a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `6c45b63bd`** \(M0147\-0041 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7785,9 +7788,20 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(311 s\), Isolation PASS \(547 s\)\.
   - optimizer narrowcostinputs.go:66; setNarrowCostInputsForTest ×30; cost pins re-derived at narrowed widths. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0042 — retire `GOOPG_PG_SORT_RELATION_BYTES_COST` OFF arm (goopg Sort currency)**
+- [x] **M0147-0042 — retire `GOOPG_PG_SORT_RELATION_BYTES_COST` OFF arm (goopg Sort currency)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 9→8 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `6c45b63bd`; M0122\-0012 yielded under rule \(a\)\)\. Env read, polarity
+    func, `pgSortRelationBytesCostEnabled` and the test setter deleted; `costSortRunWithWidth` elects the PG
+    relation\_byte\_size currency whenever its width is valid, goopg entry bytes kept only as the unknown\-width
+    fallback; flaglabels → `retired\(M0147\-0042\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0042\-retire\-pg\-sort\-relation\-bytes\-cost\.md`\.
+  - Tests: six ON pins deleted, the switch\-off\-is\-legacy test deleted, the trace test's off half re\-pinned on the
+    width\-0 fallback \(`currency=goopg`, `pgbranch=unknown\-width`\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(321 s\), Isolation PASS \(559 s\)\. The first acceptance and
+    sf025 attempts refused while the nightly ran \(01:05\-02:21\); both passed on rerun after it ended\.
   - optimizer sort_pgrelationbytes.go:17; ON = PG cost_sort relation bytes; setPGSortRelationBytesCostForTest ×8; keep the invalid-width fallback (M0147-0021 pattern). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0043 — retire `GOOPG_INCREMENTAL_SORT` OFF arm**
   Kind: impl

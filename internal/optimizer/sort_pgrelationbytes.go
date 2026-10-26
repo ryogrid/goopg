@@ -6,25 +6,15 @@ import (
 	"os"
 )
 
-// pgSortRelationBytesCost elects cost_tuplesort's own byte currency —
-// relation_byte_size(tuples, pathtarget width) (costsize.c) — for the Sort
-// spill decision. R113 shipped it default-off; M0146-0234 turned it on: PG
-// prices every sort with this formula, and goopg's executor-entry-byte
-// currency (hashsize.EntryBytes) priced TPC-DS SF1 Q64's store_sales Sort as
-// a disk sort (1190592) where PG's fits in work_mem (389568.13, which the PG
-// currency reproduces exactly). Only the exact value "0" keeps the old
-// currency, as a measurement switch.
-var pgSortRelationBytesCost = pgSortRelationBytesCostFromEnv(os.Getenv("GOOPG_PG_SORT_RELATION_BYTES_COST"))
-
-func pgSortRelationBytesCostFromEnv(v string) bool { return v != "0" }
-
-func pgSortRelationBytesCostEnabled() bool { return pgSortRelationBytesCost }
-
-func setPGSortRelationBytesCostForTest(on bool) func() {
-	old := pgSortRelationBytesCost
-	pgSortRelationBytesCost = on
-	return func() { pgSortRelationBytesCost = old }
-}
+// The Sort spill decision prices cost_tuplesort's own byte currency —
+// relation_byte_size(tuples, pathtarget width) (costsize.c). R113 shipped it
+// default-off; M0146-0234 turned it on: PG prices every sort with this
+// formula, and goopg's executor-entry-byte currency (hashsize.EntryBytes)
+// priced TPC-DS SF1 Q64's store_sales Sort as a disk sort (1190592) where PG's
+// fits in work_mem (389568.13, which the PG currency reproduces exactly).
+// M0147-0042 retired the GOOPG_PG_SORT_RELATION_BYTES_COST=0 measurement
+// switch. The goopg currency survives only as the fallback for a Sort with no
+// valid planner width (costSortRunWithWidth).
 
 const pgMaxAlignBytes = 8
 

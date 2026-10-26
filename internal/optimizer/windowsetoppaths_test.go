@@ -196,8 +196,6 @@ func TestCostWindowPartialPresortedMatchIsCheaperThanFullSort(t *testing.T) {
 }
 
 func TestAddWindowPathsUsesPreWindowEmittedWidth(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	cp.workMem = 100
 	in := upperOrderedInput(1000000)

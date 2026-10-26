@@ -100,12 +100,6 @@ var flagResolvedState = map[string]func(string) string{
 	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
 		return partialAggModeLabel(partialAggModeFromEnv(v))
 	},
-	// R113's Sort planner byte price (PG cost_sort's relation-bytes input).
-	// It shipped as a default-off experiment and is default ON today;
-	// artefacts must name its currency for a reproducible A/B.
-	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
-		return onOff(pgSortRelationBytesCostFromEnv(v))
-	},
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -195,6 +189,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PARTIAL_SORT_PATHS",
 	// Retired at M0147-0021 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
+	// Retired at M0147-0042 — see flagProvenanceRetired.
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
 	// Joined at M0139-0007b: gives cost_memoize_rescan's cache-entry byte
 	// estimate PG's relation_byte_size/ExecEstimateCacheEntryOverheadBytes
@@ -362,6 +357,12 @@ var flagProvenanceRetired = map[string]string{
 	// made the narrowing unconditional, so nothing reads the variable. `off`
 	// in an older artefact is the un-narrowed-cost arm.
 	"GOOPG_NARROW_COST_INPUTS": "M0147-0041",
+	// R113's Sort planner byte price (PG cost_sort's relation_byte_size
+	// input; default on since M0146-0234, `=0` kept goopg's entry-byte
+	// currency). M0147-0042 made the PG currency unconditional whenever the
+	// planner width is valid, so nothing reads the variable. `off` in an
+	// older artefact is the goopg-currency Sort arm.
+	"GOOPG_PG_SORT_RELATION_BYTES_COST": "M0147-0042",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

@@ -37,9 +37,9 @@ package optimizer
 // are narrowed. Rows and Width (both the rel's own and the per-call
 // `inWidth` `costWindow` receives) are left exactly as
 // `sizeWindowRelFromNode`/`nodeTupleWidth(belowNode)` already compute them —
-// `pgSortRelationBytesCostEnabled()` (default off) is the only consumer of
-// either, the same disposition ordered_input_narrow.go recorded for the
-// ORDERED rel.
+// the PG Sort byte price (unconditional since M0147-0042) is the only
+// consumer of either, the same disposition ordered_input_narrow.go recorded
+// for the ORDERED rel.
 //
 // Safety direction, same as sweep-a/R121: "unknown" declines to today's
 // full-width sizing at every level, and a keep only ever narrows — never
