@@ -4997,6 +4997,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-26 — **census reused at `e5f10324e`** \(analysis/fix\_plan\-only recon commit;
     routing\-20261026f\'s capture `4f7b216cd` is an ancestor, no planner/executor/cost path changed\)\. Same items\-0\-9
     tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `63d2ab399`** \(M0147\-0031 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7635,9 +7638,17 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - joinleghook.go:49; the OFF arm changes no node (it only disables leg counting), 8 direct test refs in 1 file. Inert proof by construction; keep the hook. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0032 — retire `GOOPG_COOP_JOIN_BUILD` OFF arm (pre-coop nested build rebuild)**
+- [x] **M0147-0032 — retire `GOOPG_COOP_JOIN_BUILD` OFF arm (pre-coop nested build rebuild)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 19→18 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `coopJoinBuildOn` deleted; coopDrivingScan\'s Join arm
+    unconditional; the stale "OFF by default" comment corrected\. `TestCoopBuildRecycledBatchesMatchSerialBuild` took
+    its "serial" reference from the coop flag, which gates only the join\-tree widening — vacuous for its bare\-scan /
+    column\-only\-Project builds; rebased onto `ctx\.MaxParallelWorkers = 0`\. Design doc
+    `docs/design/0100\-0149/m0147\-0032\-retire\-coop\-join\-build\.md`\. Fire\-set out of scope \(executor only\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - executor parallel_hash_build.go:481; 4 direct test refs. Values gates + TPC-H parallel acceptance arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0033 — retire `GOOPG_NL_MATERIALIZE_WORK_MEM=0` (unbounded NL inner cache)**
   Kind: impl
