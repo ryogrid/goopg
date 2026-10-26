@@ -96,7 +96,6 @@ Feature gates (all wrap package atomics + env var kill-switches):
 |---|---|---|---:|---:|---:|
 | `SetUnnestPreDPEnabled` | `GOOPG_UNEST_PREDP` | on | Run pull-up before join search |
 | `SetSubqueryUnnestEnabled` | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
-| `SetIndexKeyHarvestEnabled` | `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
 | `SetNLIEnabled` | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `SetNLICostGateLegacy` | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
 
@@ -564,7 +563,6 @@ Every plan-shaping feature is gated by a process-start env var. The full list:
 | `GOOPG_PGSHAPED_DP` | on | PG-shaped join search (vs syntactic order) |
 | `GOOPG_UNEST_PREDP` | on | Unnest before join search |
 | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
-| `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
 | `GOOPG_NLI` | on | Rewrite joins to NLI |
 | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
 | `GOOPG_COLLAPSE` | on | Explicit JOIN tree collapsing |

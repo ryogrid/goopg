@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"strings"
 	"sync/atomic"
 
@@ -31,18 +30,9 @@ func init() {
 	// Default ON since phase S6 (D6.2 minimal) landed: with index-driven
 	// semi/anti NLI + the scalar probe-cheap policy, decorrelation no
 	// longer regresses the selective TPC-H shapes (measured — see
-	// IMPLEMENTATION-TODO.md Stage 6b). Rollback switches:
-	// SetIndexKeyHarvestEnabled(false) from Go, or the environment
-	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
-	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
-	indexKeyHarvestOn.Store(indexKeyHarvestFromEnv(os.Getenv("GOOPG_INDEXKEY_HARVEST")))
+	// IMPLEMENTATION-TODO.md Stage 6b). (The index-key harvest's own
+	// GOOPG_INDEXKEY_HARVEST rollback switch was retired at M0147-0049.)
 }
-
-// indexKeyHarvestFromEnv is the kill-switch's polarity, factored out of init
-// so the provenance table (flaglabels.go) can render its unset default from
-// the same function production resolves it with. (Its
-// sibling GOOPG_UNNEST_PREDP retired with the S5a pre-DP route, M0145-0008.)
-func indexKeyHarvestFromEnv(v string) bool { return v != "off" }
 
 // SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
 // Test-only API: there is deliberately no
@@ -551,51 +541,17 @@ func collectUnnestParams(node Node) []unnestParam {
 // present in the scan schema (should not happen for a base-table index)
 // is skipped, which makes the OuterColumnRef unaccounted and the whole
 // subquery bail — the safe direction.
-// **Default ON** (`indexKeyHarvestFromEnv` answers true for an unset
-// variable); `GOOPG_INDEXKEY_HARVEST=off` is the escape hatch. This
-// comment previously said "Gated OFF by default", which contradicted the
-// code — corrected 2026-09-05 while measuring C-20c.
-//
-// Measured at SF1 on 2026-07-21 with the harvest enabled: Q2 10.87 s →
-// 3.36 s and Q22 7.83 s → 1.66 s, but Q4 3.87 s → 276.08 s, Q17 58.27 s →
-// 86.65 s, Q20 12.29 s → 26.57 s.
-//
-// **Re-measured 2026-09-05** (pinned-statistics regime, SF=1, serial,
-// on/off arms back to back). The catastrophic Q4 case is gone — the
-// prerequisite execution work landed in the meantime — but the flag is
-// still live in BOTH directions, so the off path is not dead code:
-//
-//	        harvest ON (default)   harvest OFF
-//	Q2       0.97 s                 1.05 s
-//	Q4       2.27 s                 1.46 s
-//	Q17      0.65 s                 0.75 s
-//	Q20      1.70 s                 1.99 s
-//	Q22      1.17 s                 0.79 s
-//
-// Q4 and Q22 are materially faster with the harvest OFF; Q2, Q17 and Q20
-// are faster with it ON. That is why C-20c (retire this flag) cannot close
-// on its stated gate of byte-identical plans for the flip: the flip is not
-// plan-neutral, and deleting the off path would lock in the slower side of
-// two queries. The regressions are not a defect in this
-// harvest — the decorrelated plans are correct — but a consequence of
-// goopg executing every semi/anti join as a HASH join. A selective
-// correlated EXISTS (Q4 probes ~57 K date-filtered orders through
-// idx_lineitem_orderkey) becomes a hash semi join that scans and hashes
-// all 6 M lineitem rows. Upstream can decorrelate unconditionally because
-// it also has index-driven and parallel semi joins; goopg does not yet.
-//
-// Bundle phase S6 (D6.2, NLI semi/anti with a residual-bearing inner) is
-// the prerequisite; this flag flips on there, with a re-measure.
-var indexKeyHarvestOn atomic.Bool
-
-// SetIndexKeyHarvestEnabled toggles harvesting correlation equijoins out
-// of an inner IndexScan probe key. Test-only, like SetSubqueryUnnestEnabled.
-func SetIndexKeyHarvestEnabled(on bool) { indexKeyHarvestOn.Store(on) }
-
+// The harvest is unconditional since M0147-0049. It shipped behind
+// GOOPG_INDEXKEY_HARVEST (default on; `off` left an index-absorbed
+// correlation unaccounted, so the sublink stayed a per-row SubPlan). PG pulls
+// IN/EXISTS sublinks up on the parse tree, before any index choice, so the
+// harvest — which recovers the correlation goopg's earlier probe rewriting hid
+// — is the PG-shaped arm. Measured at retirement (after M0147-0013 confined
+// the harvest to IN/EXISTS), the `off` arm's TPC-H/TPC-DS EXPLAIN text was
+// byte-identical to `on`; the 2026-09-05 runtime A/B recorded here before
+// (Q4/Q22 faster off, Q2/Q17/Q20 faster on) is history in the M0147-0049
+// design doc.
 func harvestIndexKeyParams(node Node) []unnestParam {
-	if !indexKeyHarvestOn.Load() {
-		return nil
-	}
 	var out []unnestParam
 	var walk func(Node)
 	walk = func(n Node) {

@@ -7926,9 +7926,20 @@ Basis: the 2026-10-21 lever census and its review
   > the corpus evidence says ON is the closer arm\), or keep 0048 held until M0146\-0012b lands and retire both
   > env arms in favour of the cost choice\. The loop continues with M0147\-0049 meanwhile\.
   - optimizer exists_to_any.go:79; SetExistsToAnyEnabled ×6. ON is goopg's unconditional analogue of convert_EXISTS_to_ANY (PG keeps an AlternativeSubPlan; ledger M0146-0012b) — if ON is not PG logic, R3 needs an owner [!] before the OFF (PG-closer per-row SubPlan) arm goes. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0049 — measure and retire `GOOPG_INDEXKEY_HARVEST` OFF arm**
+- [x] **M0147-0049 — measure and retire `GOOPG_INDEXKEY_HARVEST` OFF arm**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 3→2 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `b2665b45c`, reused — `4ac79cdee` touched no planner path; M0122\-0012
+    yielded under rule \(a\); M0147\-0048 held \[\!\]\)\. Measured first: with the harvest off the corpus EXPLAIN text
+    is byte\-identical to on \(0 differing lines, all three corpora; `analysis/m0147/m0147\-0049/`\), so the
+    2026\-09\-05 not\-plan\-neutral note is superseded\. ON is the PG\-shaped arm \(PG pulls IN/EXISTS up before
+    any index choice\)\. Switch, env read and setter deleted; `harvestIndexKeyParams` unconditional\. Design doc
+    `docs/design/0100\-0149/m0147\-0049\-retire\-indexkey\-harvest\.md`\.
+  - Tests: 8 ON pins deleted; the two executor SubPlan\-path result tests now take that path from the test\-only
+    `SetSubqueryUnnestEnabled\(false\)` \(restored via t\.Cleanup\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(645 s\)\.
   - optimizer unnest.go:38; SetIndexKeyHarvestEnabled ×22; after M0147-0013 the harvest serves IN/EXISTS only — re-measure reachability and the 2026-09-05 not-plan-neutral note first. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
 - [ ] **M0147-0050 — recon: `goopg.enable_nestloop_index` / `rewriteJoinsToNLI` and the post-search `jn.Algo` assignment reachability**
   Kind: recon

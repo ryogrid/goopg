@@ -76,8 +76,7 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_EXISTS_TO_ANY":    func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	"GOOPG_INDEXKEY_HARVEST": func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
+	"GOOPG_EXISTS_TO_ANY": func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 	// A mode, not a boolean: the artefact carries the word an operator would
 	// export to reproduce the arm.
 	"GOOPG_NLI_COSTGATE": func(v string) string {
@@ -104,6 +103,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_PGSHAPED_COLLAPSE",
 	"GOOPG_EXISTS_TO_ANY",
 	"GOOPG_UNNEST_PREDP",
+	// Retired at M0147-0049 — see flagProvenanceRetired.
 	"GOOPG_INDEXKEY_HARVEST",
 	"GOOPG_NLI_COSTGATE",
 	// Retired at M0147-0014 — see flagProvenanceRetired.
@@ -367,6 +367,12 @@ var flagProvenanceRetired = map[string]string{
 	// the size rule, so nothing reads the variable. `off` in an older artefact
 	// is the size-rule arm (TPC-H 10/22 vs PG when measured at retirement).
 	"GOOPG_PARTIAL_AGG_PATHS": "M0147-0047",
+	// The unnest index-key harvest switch (default on; `off` kept an
+	// index-absorbed correlation unaccounted, so the IN/EXISTS sublink stayed
+	// a per-row SubPlan). M0147-0049 made the harvest unconditional — the
+	// `off` arm's TPC-H/TPC-DS plans were byte-identical at retirement — so
+	// nothing reads the variable.
+	"GOOPG_INDEXKEY_HARVEST": "M0147-0049",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a
