@@ -6213,7 +6213,25 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// per outer row (correlated subplan / NL inner side) would otherwise
 		// print a total inflated by up to `loops`x versus PG's own output
 		// for the identical physical operation. See M0142-0004a.
-		rowsAvg := rowsPerLoop(s.rowsOut, s.loops)
+		rowsOut := s.rowsOut
+		// M0122-0017: a parameterized nested loop's inner probe is walked
+		// with attachedFilterNode == n and filterRowsRemoved holding the
+		// probe's share of the residual's rejections (M0146-0005aj moves
+		// that part of the residual onto this scan's `Filter:` line). goopg
+		// evaluates it at the join, so rowsOut counts every candidate the
+		// probe returned; PG evaluates it in the scan (ExecScan's qual), and
+		// its `rows=` counts only the tuples that pass (InstrStopNode after
+		// the qual, execProcnode.c). Subtracting the attributed rejections
+		// gives PG's number — TPC-DS Q17/Q25/Q29's catalog_sales_pkey probe
+		// printed rows=25.63 beside `Rows Removed by Filter: 26` where PG
+		// prints rows=0.00.
+		if attachedFilterNode == n && filterRowsRemoved > 0 {
+			rowsOut -= filterRowsRemoved
+			if rowsOut < 0 {
+				rowsOut = 0
+			}
+		}
+		rowsAvg := rowsPerLoop(rowsOut, s.loops)
 		if s.timing {
 			// PG formats rows as float (e.g. "rows=5.00") for ANALYZE output.
 			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",

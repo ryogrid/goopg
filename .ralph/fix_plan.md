@@ -2602,10 +2602,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       steady state 1\.09–1\.11 s\.
     - Left: `internal/utils/mmgr/mctx.go`'s permanentContext comment still says big numerics allocate there —
       fix in the next executor slice \(a comment\-only change after the gates would have invalidated their stamps\)\.
-- [ ] **M0122-0017 — EXPLAIN ANALYZE counts an index scan's rows before its own Filter**\.
+- [x] **M0122-0017 — EXPLAIN ANALYZE counts an index scan's rows before its own Filter**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN ANALYZE text fidelity; census 22/22, regress outputs unchanged\)
   Parent: none
+  - Done 2026\-10\-27 \(selected as item 10's "rest of M0122": M0122\-0012 yields, every M0147 child is done or held\)\.
+    Cause: the witness is a parameterised NL's inner probe whose residual conjunct EXPLAIN moves onto the scan's
+    `Filter:` \(M0146\-0005aj\) while goopg still evaluates it at the join, so the scan's rowsOut is pre\-filter\.
+    `walkPlanAnalyzeFiltered` now subtracts the probe's attributed rejections on that branch\. Design doc
+    `docs/design/0100\-0149/m0122\-0017\-param\-probe\-actual\-rows\.md`\.
+  - Test `TestExplainAnalyzeParamProbeRowsAfterMovedFilter`: `Index Scan … \(actual rows=0\.09 loops=100\)` / `Rows
+    Removed by Filter: 0` — identical to scratch PG 18\.3 for the same NL shape\.
+  - JSON/YAML/XML sibling gap ledgered \(2026\-10\-27\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree 22/22,
+    RegressSuite PASS \(81 mismatches; plpgsql flapper only\), Isolation PASS; fire\-set out of scope \(executor only\)\.
   - Filed 2026\-10\-23 from the M0122\-0012 slice\-73/74 per\-node rows census \(tmp/rows\-census\.sh\)\.
   - TPC\-DS Q17 / Q25 / Q29: `Index Scan using catalog\_sales\_pkey … Filter: \(cs\_bill\_customer\_sk = …\)` reports
     `actual rows=25\.63 loops=7511` with `Rows Removed by Filter: 26`; PG reports `rows=0\.00` — PG counts the tuples the
@@ -5053,6 +5063,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `b7d73466c`** \(M0147\-0053 `54223610d` changed internal/optimizer \+
     executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
+    every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b7da10d8d`** \(M0147\-0051 changed internal/optimizer \+ executor \+
+    postmaster\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
     every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
