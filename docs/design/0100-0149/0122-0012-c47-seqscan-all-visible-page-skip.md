@@ -1,6 +1,6 @@
 # M0122-0012 C47 — the seq scan skips per-tuple visibility on an all-visible page
 
-Status: slice 1 landed (2026-10-28, loop #233); slice 2 (the scan skip) is next. Design written loop #232. Areas: `internal/commands/vacuum`
+Status: slice 1 landed (2026-10-28, loop #233); **slice 2 blocked on P0-E15** (loop #234). Design written loop #232. Areas: `internal/commands/vacuum`
 (sets the page bit), `internal/executor` (DML clears it, the seq scan reads it). Perf-only: plans, values and EXPLAIN
 output unchanged. Parent: M0122-0012 (banner item 10). The Target is written in the M0122-0012 entry.
 
@@ -127,3 +127,19 @@ In the executor fixture, a DELETE plus VACUUM leaves the VM all-visible with the
 The seq scan never returns an LP\_DEAD item, so slice 2 is unaffected. An index-only scan that trusts the VM while
 the dead item's index entry survives would be. The probe returned no row (the entry was gone or the plan was not
 index-only), so wrong results are not demonstrated.
+
+## Slice 2 — blocked on P0-E15 (loop #234)
+
+The safety review before the scan skip asked whether goopg's VACUUM ever marks a page all-visible over a tuple that
+some snapshot must not see. It does, for a rolled-back INSERT:
+
+- `storage.PageAllVisible` requires only xmin < horizon, not a committed xmin. The executor fixture shows an aborted
+  tuple left on a page that the VM (and now PD\_ALL\_VISIBLE) marks all-visible, and an Index Only Scan returns it.
+- On a real server it is worse. `PageFreezeOldTuples` freezes the aborted xmin, and the freeze cutoff collapses to
+  OldestXmin on a young cluster (uint32 wrap plus a non-circular clamp). After VACUUM even a plain Seq Scan counts the
+  rolled-back row: 2001 against PG's 2000 (`analysis/p0e15/`).
+
+A scan that trusts PD\_ALL\_VISIBLE would extend the Index Only Scan's wrong result to every seq scan, so slice 2
+waits for P0-E15. Filed under M-NIGHTLY with an S2 escalation. P0-E15's fix makes PageAllVisible demand a committed
+xmin, the prune remove aborted inserts and the freeze refuse uncommitted xmins. Slice 1 stays landed: nothing reads
+the page bit yet, and redo already set it on standbys.

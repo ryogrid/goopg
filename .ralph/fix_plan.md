@@ -898,6 +898,41 @@ heuristic stays live.)
     use the same matcher\.
   - Expected instrument: the repro identical to `analysis/p0e13/pg18\-expected\.out`\.
 
+- [ ] **P0\-E15 — VACUUM resurrects a rolled\-back INSERT: the aborted row becomes visible to every scan**
+  \(filed 2026\-10\-28 by the loop, M0122\-0012 C47 slice 2 safety review; S2 — wrong results / data integrity\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro counts differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-28 \(S2, wrong results — rolled\-back data reappears\) — OWNER PLACEMENT NEEDED\.**
+    > Filed, not selected: the loop continues with the banner\. `autovacuum` defaults to on, so any rolled\-back
+    > INSERT can reappear without a manual VACUUM\. Repro `analysis/p0e15/aborted\-insert\-ios\-repro\.sql`; PG 18\.3
+    > output `analysis/p0e15/pg18\.out` \(scratch PG on :5545\), goopg `analysis/p0e15/goopg\-102c74a5e\.out`;
+    > trigger probe `analysis/p0e15/trigger\-probe\.sql` / `trigger\-probe\-goopg\.out`\.
+  - Symptom: `INSERT 2000 rows; BEGIN; INSERT 99999; ROLLBACK; VACUUM;` — goopg `count\(\*\)` = 2001 \(PG 2000\),
+    `WHERE id = 99999` finds the row \(PG 0\), through a plain Seq Scan and through an Index Only Scan alike\.
+    Before the VACUUM goopg counts 2000\. Reproduced on a fresh `goopg init` server; the binary predates C47\.
+  - Cause 1 \(read, matches the symptom\): `storage\.PageFreezeOldTuples` \(internal/storage/freeze\.go\) rewrites
+    every xmin below the cutoff to FrozenTransactionID without checking that it committed\. PG never freezes an
+    aborted xmin: pruning removes aborted inserts as HEAPTUPLE\_DEAD \(heap\_prune\_satisfies\_vacuum, pruneheap\.c\)
+    and heap\_prepare\_freeze\_tuple \(heapam\.c\) errors on an xmin that did not commit\. goopg's
+    `PageVacuumPrune` takes only the horizon \(no clog\), so the aborted tuple survives the prune and is then frozen\.
+  - Cause 2: the freeze cutoff in `operators\_vacuum\.go` \(~l\.103\) is `nextXID \- freeze\_min\_age` in uint32 and is
+    clamped with a plain `fb > oldest`\. On a young cluster the subtraction wraps, the clamp makes the cutoff
+    OldestXmin, and every tuple below the horizon is frozen — vacuum\_freeze\_min\_age \(default 50 M\) is
+    ineffective\. PG's vacuum\_get\_cutoffs \(vacuum\.c\) uses circular TransactionIdPrecedes and
+    FirstNormalTransactionId\.
+  - Cause 3 \(same family\): `storage\.PageAllVisible` \(vm\.go\) requires only xmin < horizon, not a committed xmin,
+    so VACUUM sets the VM \(and since C47 slice 1, PD\_ALL\_VISIBLE\) on a page holding an aborted tuple\. In the
+    executor fixture \(no freeze\) the aborted tuple keeps xmin 4 while the VM says all\-visible, and an Index Only
+    Scan returns it\. PG's heap\_page\_is\_all\_visible / lazy\_scan\_prune need HEAPTUPLE\_LIVE \(xmin committed\)\. It
+    also admits LP\_DEAD items \(ledger 2026\-10\-28\)\.
+  - First step: give the prune and freeze passes a commit oracle \(vacuumCore already has the transam Manager\):
+    prune an aborted\-xmin tuple as dead, never freeze an xmin that did not commit, and make PageAllVisible demand a
+    committed xmin and no LP\_DEAD item; fix the cutoff arithmetic with circular XID comparisons\. Then the repro,
+    an aborted\-insert regression test per scan type, and the isolation/vacuum regress cases\.
+  - Expected instrument: the repro identical to `analysis/p0e15/pg18\.out`\.
+  - Blocks: M0122\-0012 C47 slice 2 \(a seq\-scan visibility skip on PD\_ALL\_VISIBLE would trust the same wrong
+    all\-visible decision\)\.
 - [ ] **P0\-E14 — SET ROLE survives ROLLBACK, and an INITIALLY DEFERRED constraint trigger fires at the statement, not at COMMIT**
   \(filed 2026\-10\-27 by the loop, M0122\-0012 C26 RegressSuite review of the `triggers` case; S2 — wrong results /
   privilege\)\.
@@ -2368,6 +2403,9 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         `TupleVisibleSubxact` \(not in recovery\); `seqScanAllVisibleDisabled` knob; equivalence test; then the Q39 A/B on
         a private clone copy whose pages carry the bit \(VACUUM skips VM\-all\-visible pages — check whether an
         aggressive / DISABLE\_PAGE\_SKIPPING pass exists\)\.
+    - **C47 slice 2 BLOCKED on P0\-E15 \(loop \#234\)**: the safety review found VACUUM marks pages all\-visible \(and
+      freezes\) over aborted inserts; a scan that trusts PD\_ALL\_VISIBLE would return them\. Slice 1 stays \(no reader\)\.
+      M0122\-0012 moves to another candidate until P0\-E15 is fixed; C47 does not count as a miss\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -6047,6 +6085,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#232\) — **exhausted at `102c74a5e`**, fresh census `routing\-20261028i/`
     \(`102c74a5e` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
     filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#234\) — **exhausted at `44fbe565b`**, census `routing\-20261028i/` reused:
+    `2ddabfd68` is docs\-only and `44fbe565b` touched internal/storage \+ commands/vacuum only\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
