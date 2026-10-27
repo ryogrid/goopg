@@ -2212,6 +2212,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Q23\) was host contention: equal instructions, and the next sweep came back −15\.0 %\. Test
       `TestNLOuterDeferMatchesEager` \(mutation\-checked\)\. **Misses 0\.** Design: part 11 §115\. Next on return:
       re\-census S9, then G3 on the census\-20261028 top 10 \(Q14, Q23, H Q13/Q17, Q78, Q39, Q59\)\.
+  - **G3 pass 2026\-10\-28 \(loop \#223, misses 0\)**: S9 re\-census `routing\-20261028f` exhausted\. Profiled DS
+    Q78, Q39, Q59, H Q17 and DS Q23 at `821d93323` \(`tmp/g3\-223/`, instructions:u\)\. **No candidate predicted ≥ 3 %**,
+    so nothing was attempted \(not a miss\)\. Findings:
+    - Q78 and Q39 are spread thin \(no symbol above 6 %; evalFastExpr, seqScanOp\.Next, the hash probe and the
+      Gather queue copy are each 3–10 %\)\.
+    - Q59: the seven `CASE WHEN d\_day\_name = '<day>'` arms are 17\.9 % of the query, but slice 89's in\-place string
+      path already serves them\. What remains per arm is two `plainCompareString` scans, two `bcTrimRight`s and a
+      three\-way `strings\.Compare` for `=`: ~4 % in total, about half of it saveable\.
+    - H Q17: `seqScanOp\.Next`'s hottest lines are the first touch of each tuple header \(stall skid on the
+      visibility call's argument setup\) and the `needsDetoastPrefix` re\-scan of decoded cells \(~2 % of Q17\)\.
+    - DS Q23: index probes are 44\.7 % \(item\_pkey ~1\.15 M probes, customer\_pkey IOS\), spread over PG\-equivalent
+      descent work; the aggregate's string\-serialised group keys \(`mapaccess2\_faststr`, memmove, aeshash,
+      `formatBase10`\) ~4\.5 %, mostly hash/stall work a typed key would still pay\.
+    - Added to the pool \(each predicted < 3 % on its query\):
+      - C39: the decoder reports toast pointers so the per\-row `needsDetoastPrefix` re\-scan disappears \(H Q17
+        ~2 %\);
+      - C40: `=`/`<>` on two plain strings as length\-then\-bytes equality, with the constant side's
+        plain/trimmed form precomputed at compile time \(Q59 ~2 %\);
+      - C41: typed composite hash\-aggregate keys instead of serialised strings, PG's TupleHashTable
+        \(execGrouping\.c\) \(Q23 ~2 %\)\.
+    - Next pass: DS Q14 after C34 \(its lateral probes\), H Q13 by cycles \(stall\-bound; instructions do not see
+      it\), DS Q72 descents\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5855,6 +5877,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-28 \(loop \#222\) — **exhausted at `f645129a8`**, fresh census `routing\-20261028e/`
     \(s9az\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#223\) — **exhausted at `821d93323`**, fresh census `routing\-20261028f/`
+    \(s9ba\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
