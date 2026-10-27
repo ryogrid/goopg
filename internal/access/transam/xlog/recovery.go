@@ -906,6 +906,35 @@ func encodeCheckPointStruct(f CheckPointFields) []byte {
 	return payload
 }
 
+// decodeCheckPointStruct is encodeCheckPointStruct's inverse over the PG18
+// CheckPoint layout (offsets documented there): the fields and the time
+// stamp. ok is false unless b is a whole 88-byte struct.
+func decodeCheckPointStruct(b []byte) (CheckPointFields, int64, bool) {
+	if len(b) != 88 {
+		return CheckPointFields{}, 0, false
+	}
+	le := binary.LittleEndian
+	f := CheckPointFields{
+		RedoLSN0:          le.Uint64(b[0:8]),
+		ThisTLI:           le.Uint32(b[8:12]),
+		PrevTLI:           le.Uint32(b[12:16]),
+		FullPageWrites:    b[16] != 0,
+		WalLevel:          le.Uint32(b[20:24]),
+		NextXid:           le.Uint64(b[24:32]),
+		NextOid:           le.Uint32(b[32:36]),
+		NextMulti:         le.Uint32(b[36:40]),
+		NextMultiOffset:   le.Uint32(b[40:44]),
+		OldestXid:         le.Uint32(b[44:48]),
+		OldestXidDB:       le.Uint32(b[48:52]),
+		OldestMulti:       le.Uint32(b[52:56]),
+		OldestMultiDB:     le.Uint32(b[56:60]),
+		OldestCommitTsXid: le.Uint32(b[72:76]),
+		NewestCommitTsXid: le.Uint32(b[76:80]),
+		OldestActiveXid:   le.Uint32(b[80:84]),
+	}
+	return f, int64(le.Uint64(b[64:72])), true
+}
+
 // EncodePageImage encodes one full-page image record payload.
 func EncodePageImage(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
 	if len(page) != storage.BlockSize {

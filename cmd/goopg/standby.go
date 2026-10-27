@@ -161,6 +161,12 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	sigDone := make(chan struct{})
 
 	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+	// Recovery flushes become restartpoints: the checkpointer adopts the
+	// last checkpoint record replay applied into pg_control
+	// (CreateRestartPoint), so a restarted standby replays from there.
+	if rt.Checkpointer != nil && replayer != nil {
+		rt.Checkpointer.SetRestartPointSource(replayer.LastCheckpoint)
+	}
 	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
 		WAL:          rt.WAL,
 		Receivers:    rt.WalReceivers,
@@ -428,6 +434,7 @@ func (sc *standbyController) finalizePromotion() error {
 	// normal checkpoint path before accepting primary writes.
 	if sc.rt.Checkpointer != nil {
 		sc.rt.Checkpointer.SetRecoveryMode(false)
+		sc.rt.Checkpointer.SetRestartPointSource(nil)
 	}
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil

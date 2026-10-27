@@ -1744,6 +1744,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       M0119\-0006, M0147 holds no selectable child, so the first is M0122\-0013 \(ledgered resume point: a standby's
       recovery checkpoint advancing pg\_control like PG's CreateRestartPoint\)\. Then return; the miss counter
       resets\.
+      - Worked: M0122\-0013 standby restartpoint, landed 2026\-10\-27 \(loop \#195\)\. Yield over — the next item\-10
+        selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -2860,6 +2862,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Standby restartpoint LANDED 2026\-10\-27 \(loop \#195, the M0122\-0012 one\-task yield\)**\. Movement: none —
+    recovery path\. `StreamReplayer` records the last replayed checkpoint \(PG RecoveryRestartPoint\);
+    `runRecoveryFlush` snapshots it before the flush and `adoptRestartPoint` then advances pg\_control's
+    checkPoint/checkPointCopy when its redo is older, minRecoveryPoint only in DB\_IN\_ARCHIVE\_RECOVERY
+    \(CreateRestartPoint\)\. A restarted standby now replays from its last restartpoint\.
+    - Pin: `TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl` \(standby pg\_control equals the primary's
+      checkpoint after a standby CHECKPOINT; restart keeps streaming\); FAILS with the wiring removed \(redo
+      unchanged 1016F80\)\. Units: `TestDecodeCheckPointStructRoundTrips`, `TestAdoptRestartPointAdvancesOnlyForward`,
+      `TestRecoveryFlushAdoptsReplayedCheckpoint`\.
+    - Residual \(ledgered\): no DB\_IN\_ARCHIVE\_RECOVERY stamp on a standby \(minRecoveryPoint arm dormant\), no
+      DB\_SHUTDOWNED\_IN\_RECOVERY on a shutdown restartpoint, no restartpoint\-driven WAL removal\.
+    - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"The restartpoint"\.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
     Design: `docs/design/0000-0049/0005-0001-streaming-replication-architecture.md`.
