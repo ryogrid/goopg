@@ -2090,6 +2090,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     \(`indexScanReadSets`\) that walks the plan top\-down with a column set \(unknown nodes/expressions = all\), consumed
     by the two IndexScan build arms as `colInfo\.skip`, leaving every existing bound path untouched\. Implementation is
     the next loop's slice; nothing attempted, misses 0\.
+  - **Loop \#216**: plumbing decided \(design §Plumbing\): `buildNode` has ~39 call sites, the slab builder
+    \(`buildRec`\) and the worker builds \(`BuildWorker` / Gather `buildChild`\) would all need a new parameter, package
+    state races between sessions, and stamping a cached plan from the executor races too — so the read set is stamped
+    at `Plan\(\)`'s tail as `IndexScan\.ReadCols` by `fillIndexScanReadCols` \(precedent `fillJoinHashKeys`\), with a
+    conservative optimizer expression walker checked against the executor's `deformScanReadSet`\. Nightly batch was
+    running \(load ~11\); implementation deferred to a fresh loop\. Nothing attempted, misses 0\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5713,6 +5719,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#215\) — **exhausted at `d1e6f0a79`**, census `routing\-20261028a/` reused:
     `d1e6f0a79` is analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
     this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#216\) — **exhausted at `bafc2e139`**, census `routing\-20261028a/` reused:
+    `bafc2e139` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

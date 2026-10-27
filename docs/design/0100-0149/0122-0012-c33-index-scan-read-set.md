@@ -1,6 +1,6 @@
 # M0122-0012 C33 — a read set for index-scan heap fetches
 
-Status: design (2026-10-28, loop #215). Area: `internal/executor` (Build-time deform analysis, `indexScanOp`).
+Status: design (2026-10-28, loop #215; plumbing decided in loop #216, see "Plumbing"). Area: `internal/executor` (Build-time deform analysis, `indexScanOp`).
 Perf-only: plans, values and EXPLAIN output unchanged. Parent: M0122-0012 (banner item 10). Target, written in the
 M0122-0012 entry in loop #214: TPC-DS SF0.25 Q14 instructions:u, bar −3 %, predicted ~4 %.
 
@@ -96,3 +96,29 @@ was wrongly omitted reads NULL. Under the debug poison flag that read panics, th
   and the TPC-H/TPC-DS value gates cover it. The pass must fall back to "all columns" on anything it does not
   understand.
 - **Build cost.** One extra walk per statement, small next to planning.
+
+## Plumbing (decided in loop #216)
+
+The read set cannot ride the existing Build recursion without changing its signature. `buildNode(plan, bound,
+scope)` has about 39 call sites, and the sibling slab builder (`BuildFast` / `buildRec`) would need the same change
+(hard-won rule 2). Worker trees are built later, in their own goroutines, through `BuildWorker` and the Gather
+`buildChild` closures. Package-level state is not an option, because concurrent sessions build concurrently.
+Writing the set onto a cached plan node from the executor at Build would race between sessions sharing the plan.
+
+**Decision.** Stamp the read set at the tail of `Plan()`, the way `fillJoinHashKeys` publishes `Join.HashKeys`:
+
+- `fillIndexScanReadCols(node)` runs after `fillJoinHashKeys`, once every rewriting pass (`lowerSubPlanParams`,
+  `applyUpperNarrowing`, the SubqueryScan clean-up) has finished.
+- It writes `IndexScan.ReadCols []bool` in table-column coordinates, or nil meaning every column.
+- The plan is read-only from then on, so cached plans share it without races.
+- Every executor build path reads the field: `buildNode`'s IndexScan arm and NLI inner arm, `buildRec`, and the
+  worker builds. Each sets `colInfo[i].skip` for columns `i < deformBound` outside it, in `indexScanOp.openPrep`.
+
+**The pass's expression walker** must be conservative: a `ColumnRef` contributes its index, and any expression kind
+it does not recognise returns "every column" for that node's coordinates. That includes `OuterColumnRef`, sublinks,
+`CTIDExpr`, row and whole-row references, and function calls whose arguments it cannot see. The executor's
+`deformScanReadSet` already behaves this way, so the optimizer walker should be checked against it in a unit test
+over the same expression corpus.
+
+Because `internal/optimizer` changes, the S9 census re-runs after the commit. The pass is plan-neutral: it only adds
+a field that EXPLAIN never prints.
