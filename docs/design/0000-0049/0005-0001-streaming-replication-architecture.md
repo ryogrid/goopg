@@ -245,12 +245,38 @@ With the wiring removed, the test fails on an unchanged redo.
 
 **Still missing** \(ledgered 2026\-10\-27\):
 
-- goopg never stamps `DB_IN_ARCHIVE_RECOVERY` on a standby, so the
-  `minRecoveryPoint` arm is dormant.
-- A shutdown restartpoint does not set `DB_SHUTDOWNED_IN_RECOVERY`.
 - Restartpoints do not drive WAL segment removal \(`KeepLogSeg` /
   `RemoveOldXlogFiles` in `CreateRestartPoint`\).
 - The skip arm's `UpdateMinRecoveryPoint` is not ported.
+
+### A standby's pg\_control state \(2026\-10\-27, M0122\-0013\)
+
+A goopg standby used to stamp `DB_IN_PRODUCTION` at startup, like a primary,
+and `DB_IN_CRASH_RECOVERY` while replaying. That made the restartpoint's
+`minRecoveryPoint` arm dormant and gave every tool reading `pg_control` the
+wrong picture.
+
+PG treats `standby.signal` as `ArchiveRecoveryRequested`
+\(`xlogrecovery.c:946-961`\). goopg now follows that through the whole lifecycle:
+
+| moment | state stamped | PG reference |
+|---|---|---|
+| replay begins \(`beginRecovery`\) | `DB_IN_ARCHIVE_RECOVERY`, not `DB_IN_CRASH_RECOVERY` | `xlogrecovery.c:946-961` |
+| end of Open | `DB_IN_ARCHIVE_RECOVERY` \(`stampInArchiveRecovery`\) | the standby serves in archive recovery |
+| shutdown restartpoint | `DB_SHUTDOWNED_IN_RECOVERY` | `CreateRestartPoint` |
+| promotion | `DB_IN_PRODUCTION` | end of `StartupXLOG`, `xlog.c:6204-6211` |
+
+The shutdown restartpoint stamps `DB_SHUTDOWNED_IN_RECOVERY` in two cases:
+
+- when it adopts a newer checkpoint while in archive recovery;
+- unconditionally when there is nothing newer to adopt, as the skip arm does
+  \(`xlog.c:7685-7692`\).
+
+A restarted standby replays from either state, since neither is
+`DB_SHUTDOWNED`.
+
+`TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl` now asserts each state
+in turn: running, stopped, restarted, promoted.
 
 The complementary primary-restart boundary is pinned separately: a running
 standby must survive a primary Stop plus Start, redial the same endpoint, and

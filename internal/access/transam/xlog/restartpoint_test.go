@@ -69,7 +69,7 @@ func TestAdoptRestartPointAdvancesOnlyForward(t *testing.T) {
 
 	dir := t.TempDir()
 	writeTestControl(t, dir, control.DBStateInProduction, 100)
-	if ok, err := adoptRestartPoint(dir, rp); err != nil || !ok {
+	if ok, err := adoptRestartPoint(dir, rp, true, false); err != nil || !ok {
 		t.Fatalf("adopt newer checkpoint: ok=%v err=%v", ok, err)
 	}
 	cd, err := control.ReadControlFile(dir)
@@ -85,18 +85,18 @@ func TestAdoptRestartPointAdvancesOnlyForward(t *testing.T) {
 		t.Fatalf("minRecoveryPoint moved outside archive recovery: %d", cd.MinRecoveryPoint)
 	}
 	// The same checkpoint again: not newer, nothing written.
-	if ok, err := adoptRestartPoint(dir, rp); err != nil || ok {
+	if ok, err := adoptRestartPoint(dir, rp, true, false); err != nil || ok {
 		t.Fatalf("re-adopt: ok=%v err=%v, want no update", ok, err)
 	}
 	older := rp
 	older.Fields.RedoLSN0 = 3000
-	if ok, _ := adoptRestartPoint(dir, older); ok {
+	if ok, _ := adoptRestartPoint(dir, older, true, false); ok {
 		t.Fatal("an older checkpoint moved pg_control back")
 	}
 
 	arch := t.TempDir()
 	writeTestControl(t, arch, control.DBStateInArchiveRecovery, 100)
-	if ok, err := adoptRestartPoint(arch, rp); err != nil || !ok {
+	if ok, err := adoptRestartPoint(arch, rp, true, false); err != nil || !ok {
 		t.Fatalf("adopt in archive recovery: ok=%v err=%v", ok, err)
 	}
 	if cd, _ := control.ReadControlFile(arch); cd.MinRecoveryPoint != 5121 || cd.MinRecoveryPointTLI != 1 {
@@ -189,5 +189,42 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	}
 	if cd, _ := control.ReadControlFile(dir); cd.CheckPointCopyRedo != 16 {
 		t.Fatalf("source-less recovery flush moved redo to %d", cd.CheckPointCopyRedo)
+	}
+}
+
+// TestShutdownRestartPointStampsShutdownedInRecovery pins CreateRestartPoint's
+// shutdown arms (xlog.c:7685-7692, 7786-7787): a shutdown restartpoint that
+// adopts a newer checkpoint in DB_IN_ARCHIVE_RECOVERY leaves
+// DB_SHUTDOWNED_IN_RECOVERY, and one with nothing newer to adopt stamps it
+// unconditionally; a non-shutdown flush with nothing to adopt writes nothing.
+func TestShutdownRestartPointStampsShutdownedInRecovery(t *testing.T) {
+	rp := ReplayedCheckpoint{StartLSN: 5001, EndLSN: 5121,
+		Fields: CheckPointFields{RedoLSN0: 4000, ThisTLI: 1, PrevTLI: 1}}
+
+	adopt := t.TempDir()
+	writeTestControl(t, adopt, control.DBStateInArchiveRecovery, 100)
+	if ok, err := adoptRestartPoint(adopt, rp, true, true); err != nil || !ok {
+		t.Fatalf("shutdown adopt: ok=%v err=%v", ok, err)
+	}
+	if cd, _ := control.ReadControlFile(adopt); cd.State != control.DBStateShutdownedInRecovery || cd.CheckPointCopyRedo != 4000 {
+		t.Fatalf("after shutdown adopt: state=%d redo=%d", cd.State, cd.CheckPointCopyRedo)
+	}
+
+	skip := t.TempDir()
+	writeTestControl(t, skip, control.DBStateInArchiveRecovery, 9000)
+	if ok, err := adoptRestartPoint(skip, rp, true, true); err != nil || ok {
+		t.Fatalf("shutdown skip: ok=%v err=%v", ok, err)
+	}
+	if cd, _ := control.ReadControlFile(skip); cd.State != control.DBStateShutdownedInRecovery || cd.CheckPointCopyRedo != 9000 {
+		t.Fatalf("after shutdown skip: state=%d redo=%d", cd.State, cd.CheckPointCopyRedo)
+	}
+
+	none := t.TempDir()
+	writeTestControl(t, none, control.DBStateInArchiveRecovery, 100)
+	if _, err := adoptRestartPoint(none, ReplayedCheckpoint{}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if cd, _ := control.ReadControlFile(none); cd.State != control.DBStateInArchiveRecovery {
+		t.Fatalf("non-shutdown flush with nothing to adopt changed state to %d", cd.State)
 	}
 }

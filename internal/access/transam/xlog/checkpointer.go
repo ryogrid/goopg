@@ -792,7 +792,7 @@ func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
 	if c.recoveryMode.Load() {
-		return c.runRecoveryFlush(ctx)
+		return c.runRecoveryFlush(ctx, shutdown)
 	}
 	start := time.Now()
 	checkpointType := "requested"
@@ -1130,7 +1130,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 // adopts the last replayed checkpoint into pg_control (adoptRestartPoint), so
 // a restarted standby begins replay at that checkpoint's redo rather than at
 // its base backup's.
-func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
+func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) error {
 	start := time.Now()
 	c.cfg.Logger.Info("recovery checkpoint start", "type", "standby")
 	// CreateRestartPoint takes its copy of the last replayed checkpoint
@@ -1155,8 +1155,8 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 			return fmt.Errorf("sync recovery data files: %w", err)
 		}
 	}
-	if haveRP && c.cfg.DataDir != "" {
-		adopted, err := adoptRestartPoint(c.cfg.DataDir, rp)
+	if c.cfg.DataDir != "" && (haveRP || shutdown) {
+		adopted, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, shutdown)
 		if err != nil {
 			return fmt.Errorf("restartpoint pg_control update: %w", err)
 		}
@@ -1174,15 +1174,24 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 // when pg_control still shows an older checkpoint (checkPointCopy.redo <
 // the replayed checkpoint's redo), checkPoint and checkPointCopy become the
 // replayed checkpoint's, and — only while the control file shows
-// DB_IN_ARCHIVE_RECOVERY — minRecoveryPoint is raised to the record's end.
-// Nothing is written otherwise. Reports whether it advanced pg_control.
-func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint) (bool, error) {
+// DB_IN_ARCHIVE_RECOVERY — minRecoveryPoint is raised to the record's end
+// and a shutdown restartpoint leaves DB_SHUTDOWNED_IN_RECOVERY. When there is
+// no newer checkpoint (haveRP false, or one already adopted) only a shutdown
+// writes, stamping DB_SHUTDOWNED_IN_RECOVERY whatever the state, as the
+// skip arm does (xlog.c:7685-7692). Reports whether it advanced the
+// checkpoint.
+func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown bool) (bool, error) {
 	cd, err := control.ReadControlFile(dataDir)
 	if err != nil || cd == nil {
 		return false, err
 	}
-	if !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
-		return false, nil
+	if !haveRP || !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
+		if !shutdown {
+			return false, nil
+		}
+		return false, control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateShutdownedInRecovery
+		})
 	}
 	f := rp.Fields
 	err = control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
@@ -1207,9 +1216,14 @@ func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint) (bool, error) {
 		cd.CheckPointCopyOldestCommitTsXid = f.OldestCommitTsXid
 		cd.CheckPointCopyNewestCommitTsXid = f.NewestCommitTsXid
 		cd.CheckPointCopyOldestActiveXid = f.OldestActiveXid
-		if cd.State == control.DBStateInArchiveRecovery && cd.MinRecoveryPoint < rp.EndLSN {
-			cd.MinRecoveryPoint = rp.EndLSN
-			cd.MinRecoveryPointTLI = f.ThisTLI
+		if cd.State == control.DBStateInArchiveRecovery {
+			if cd.MinRecoveryPoint < rp.EndLSN {
+				cd.MinRecoveryPoint = rp.EndLSN
+				cd.MinRecoveryPointTLI = f.ThisTLI
+			}
+			if shutdown {
+				cd.State = control.DBStateShutdownedInRecovery
+			}
 		}
 	})
 	return err == nil, err

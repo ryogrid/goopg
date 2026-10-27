@@ -436,6 +436,15 @@ func (sc *standbyController) finalizePromotion() error {
 		sc.rt.Checkpointer.SetRecoveryMode(false)
 		sc.rt.Checkpointer.SetRestartPointSource(nil)
 	}
+	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
+	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion
+	// (xlog.c:6204-6211) (M0122-0013).
+	if err := control.UpdateControlFile(sc.rt.DataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = time.Now().Unix()
+	}); err != nil {
+		return fmt.Errorf("promote: stamp pg_control DB_IN_PRODUCTION: %w", err)
+	}
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil
 }

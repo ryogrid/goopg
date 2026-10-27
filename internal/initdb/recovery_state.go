@@ -72,7 +72,12 @@ type startupRecoveryDecision struct {
 // supported shape (verifyInitialized checks only PG_VERSION) — and yields
 // the pre-M0131-S20 behaviour: replay everything the scan finds, stamp
 // nothing.
-func beginRecovery(dataDir string) (startupRecoveryDecision, error) {
+//
+// archiveRecovery (standby.signal present) is upstream's ArchiveRecoveryRequested:
+// the stamped state is then DB_IN_ARCHIVE_RECOVERY rather than
+// DB_IN_CRASH_RECOVERY (xlogrecovery.c:946-961), and stays so until promotion
+// (M0122-0013).
+func beginRecovery(dataDir string, archiveRecovery bool) (startupRecoveryDecision, error) {
 	cd, err := control.ReadControlFile(dataDir)
 	if err != nil || cd == nil {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -90,6 +95,15 @@ func beginRecovery(dataDir string) (startupRecoveryDecision, error) {
 	onlineCheckpoint := cd.CheckPointCopyRedo < cd.CheckPoint
 	d.crashRecovery = cd.State != control.DBStateShutdowned || onlineCheckpoint
 	if !d.crashRecovery {
+		return d, nil
+	}
+
+	if archiveRecovery {
+		if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateInArchiveRecovery
+		}); err != nil {
+			return d, err
+		}
 		return d, nil
 	}
 

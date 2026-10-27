@@ -1789,6 +1789,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       child, so M0122\-0013 \(ledgered residual 2026\-10\-27: a standby never stamps DB\_IN\_ARCHIVE\_RECOVERY, so
       the restartpoint's minRecoveryPoint arm is dormant and a shutdown restartpoint misses
       DB\_SHUTDOWNED\_IN\_RECOVERY\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 standby pg\_control state, landed 2026\-10\-27 \(loop \#201\)\. Yield over — the next
+        item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2969,6 +2971,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Residual \(ledgered\): no DB\_IN\_ARCHIVE\_RECOVERY stamp on a standby \(minRecoveryPoint arm dormant\), no
       DB\_SHUTDOWNED\_IN\_RECOVERY on a shutdown restartpoint, no restartpoint\-driven WAL removal\.
     - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"The restartpoint"\.
+  - **Standby pg\_control state LANDED 2026\-10\-27 \(loop \#201, the second M0122\-0012 yield\)**\. A standby now stamps
+    DB\_IN\_ARCHIVE\_RECOVERY before replay and at the end of Open \(it stamped DB\_IN\_CRASH\_RECOVERY then
+    DB\_IN\_PRODUCTION\), a shutdown restartpoint leaves DB\_SHUTDOWNED\_IN\_RECOVERY \(both CreateRestartPoint arms\),
+    and promotion stamps DB\_IN\_PRODUCTION\. The restartpoint's minRecoveryPoint arm is live\. Pin: the restartpoint
+    E2E asserts all four states; units `TestBeginRecoveryStandbyIsArchiveRecovery`,
+    `TestShutdownRestartPointStampsShutdownedInRecovery`\. Residual: restartpoint WAL removal, skip\-arm
+    UpdateMinRecoveryPoint \(ledgered\)\. Design: 0005\-0001 §"A standby's pg\_control state"\.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
     Design: `docs/design/0000-0049/0005-0001-streaming-replication-architecture.md`.
