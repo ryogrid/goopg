@@ -339,7 +339,7 @@ func TestMakeJoinRelPublishesLeftOnlyForSemiAnti(t *testing.T) {
 		cols         int
 	}
 	figuresOf := func(r *RelOptInfo) figures {
-		return figures{r.Width, r.NCols, r.AvgVarBytes, len(r.ColVarBytes)}
+		return figures{r.Width, r.NCols, r.AvgVarBytes, len(r.colVarBytes())}
 	}
 	build := func(t *testing.T, jt parser.JoinType) (*searchCtx, *RelOptInfo, *RelOptInfo, *RelOptInfo) {
 		t.Helper()
@@ -379,7 +379,7 @@ func TestMakeJoinRelPublishesLeftOnlyForSemiAnti(t *testing.T) {
 		return s, s.findRel(relsetOf(0)), s.findRel(relsetOf(1)), s.findRel(relsetOf(2))
 	}
 	concat := func(a, b *RelOptInfo) figures {
-		return figures{a.Width + b.Width, a.NCols + b.NCols, a.AvgVarBytes + b.AvgVarBytes, len(a.ColVarBytes) + len(b.ColVarBytes)}
+		return figures{a.Width + b.Width, a.NCols + b.NCols, a.AvgVarBytes + b.AvgVarBytes, len(a.colVarBytes()) + len(b.colVarBytes())}
 	}
 
 	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {

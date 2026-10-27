@@ -675,7 +675,8 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 		// the joinrel above it (C-05 DESIGN §4.6).
 		joinrel.NCols = relNCols(rel1)
 		joinrel.AvgVarBytes = rel1.AvgVarBytes
-		joinrel.ColVarBytes = rel1.ColVarBytes
+		joinrel.colVarFrom = [2]*RelOptInfo{rel1, nil}
+		joinrel.colVarPending = true
 		if joinPublishesInner(sjinfo) {
 			joinrel.NCols += relNCols(rel2)
 			// AvgVarBytes adds the same way: a concatenation of two
@@ -684,7 +685,8 @@ func (s *searchCtx) makeJoinRel(rel1, rel2 *RelOptInfo) (*RelOptInfo, error) {
 			// Its unsummed twin concatenates the same way; a name carried by
 			// both inputs (a self-join's aliases) keeps the WIDER width, so a
 			// collision over-states rather than under-states.
-			joinrel.ColVarBytes = unionColVarBytes(rel1.ColVarBytes, rel2.ColVarBytes)
+			// Formed on first read (colVarBytes, M0122-0012 C16d).
+			joinrel.colVarFrom[1] = rel2
 		}
 		// `joinrel->consider_startup = (root->tuple_fraction > 0)`
 		// (relnode.c:707) — the same query-wide fact every base rel copied in

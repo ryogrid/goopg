@@ -458,7 +458,7 @@ func TestNarrowJoinWidthsWritesNoRelField(t *testing.T) {
 	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
 	p.Rel = rel
 	narrowJoinWidths(p)
-	if rel.NCols != 37 || rel.AvgVarBytes != 2080 || len(rel.ColVarBytes) != 1 {
+	if rel.NCols != 37 || rel.AvgVarBytes != 2080 || len(rel.colVarBytes()) != 1 {
 		t.Fatalf("no RelOptInfo field may be written: %+v", rel)
 	}
 	if p.NCols != 5 {

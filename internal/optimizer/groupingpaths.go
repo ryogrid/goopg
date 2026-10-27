@@ -481,7 +481,7 @@ func aggInputPGWidth(child Node, agg *Aggregate) int {
 	}
 	var stawidths map[string]float64
 	if sr := searchedJoinInputRelOf(child); sr != nil {
-		stawidths = sr.ColVarBytes
+		stawidths = sr.colVarBytes()
 	}
 	w := 0
 	for _, c := range cols {

@@ -672,8 +672,18 @@ type RelOptInfo struct {
 	// under-states the entry.
 	//
 	// Set alongside AvgVarBytes by the same two constructors; a join rel's
-	// map is the union of its inputs'.
+	// map is the union of its inputs'. Read it through colVarBytes(): a join
+	// rel's union is formed on first read (colVarFrom), not when the search
+	// builds the rel.
 	ColVarBytes map[string]float64
+	// colVarFrom are the inputs a join rel's ColVarBytes unions — the first
+	// pair that built it, the inner left nil when the join publishes its
+	// outer alone — pending until colVarBytes() first reads it. GEQO builds
+	// every joinrel of ~500 tours and nothing reads the union until plan
+	// creation or the upper rels: TPC-DS Q64 spent 8.5 % of its planning
+	// in the eager map copies (M0122-0012 C16d).
+	colVarFrom    [2]*RelOptInfo
+	colVarPending bool
 
 	Pathlist        []*Path
 	PartialPathlist []*Path

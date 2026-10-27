@@ -482,3 +482,61 @@ clause-list change resets the memos.
 
 **Next.** Re-profile Q64. Before this slice, the per-path pathkey truncation (`truncateUselessPathkeys`: 14.8 %)
 and `addPathsForJointype`'s own allocation were the largest remaining shares.
+
+## Slice 96 — C16d: a join rel's column-width map is formed on first read (Q64 planning −6.8 %)
+
+Loop #190, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-profile after slice 95** (`tmp/q64plan-c16c2.pprof`):
+
+| share | site |
+|---|---|
+| 65 % | `addPathsForJointype` |
+| 23 % | `mallocgc` |
+| 16.2 % | `truncateUselessPathkeys` |
+| 8.5 % | `unionColVarBytes` (`makemap` + `mapassign_faststr` + map iteration) |
+| 7.3 % | `comparePathkeysDimRel` → unmemoised `pathKeyEqual` → `exprIdentityKey` |
+| 7.0 % | `buildPathkeyUsefulness` (about half of its calls now hit the memo) |
+
+`makeJoinRel` copied both inputs' `ColVarBytes` into a new map for every joinrel that publishes its inner side, on
+every tour.
+
+The map has two readers, and neither is in the search:
+
+- `buildAvgVarBytes`, at plan creation (createplanjoin.go);
+- the grouping-path width on the searched input rel (groupingpaths.go).
+
+**Change.** A join rel records the pair that built it in `colVarFrom` (the inner nil when the join publishes its
+outer alone) with `colVarPending` set. `(*RelOptInfo).colVarBytes()` forms the union on first read, recursively
+through pending inputs, then drops the references. Every reader goes through it: `buildAvgVarBytes`, the grouping
+width, and `relNarrowedColumns`.
+
+It is the same union over the same first pair, so the result is identical to the eager map. The union with
+wider-wins is order-independent in any case.
+
+**Measured.**
+
+| run | before (slice 95) | after |
+|---|---|---|
+| 1 | 5.214 G | 4.853 G |
+| 2 | 5.201 G | 4.858 G |
+
+That is **−6.8 %**, which meets the 3 % bar. Over slices 93–96, Q64 planning is −25.2 % in instructions (6.49 →
+4.86 G).
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+One sweep read total-delta +20 % under host load (load average 5–7: Q46 238 → 1016 ms, Q72, Q11, Q95). A rerun
+read −1.3 % (Q46 235 ms), so it was contention, not this planning-only change.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite per-case counts identical to the
+baseline; isolation PASS.
+
+Test: `TestJoinRelColVarBytesFormsOnFirstRead`. The lazy union matches the eager one through two levels, the
+inputs are released, and an outer-only join takes the outer's map.
+
+**Next candidates on the same Target.**
+
+- `truncateUselessPathkeys` per path (16 %).
+- `comparePathkeysDimRel`'s unmemoised `pathKeyEqual` (7 %). PG's `compare_pathkeys` is a pointer comparison over
+  canonical pathkeys.

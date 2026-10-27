@@ -143,7 +143,8 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 	// `buildAvgVarBytes` (which declines to the whole-relation sum).
 	// Cost-only: these Path fields never reach the executor, which sizes from
 	// `plan.AvgVarBytes` over REL fields (createplanjoin.go).
-	noColMap := len(rel.ColVarBytes) == 0
+	colVar := rel.colVarBytes()
+	noColMap := len(colVar) == 0
 	if noColMap && rel.AvgVarBytes != 0 {
 		return nil, false
 	}
@@ -165,7 +166,7 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 			// Coordinate conversion, not an aside: neededKeepSet matches column
 			// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
 			// (tableColVarBytes).
-			w, found := rel.ColVarBytes[strings.ToLower(col.Name)]
+			w, found := colVar[strings.ToLower(col.Name)]
 			if !found {
 				// Unattributed column — decline the whole rel rather than
 				// contribute a silent zero.
@@ -175,7 +176,7 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 			// comment above.
 			kc.varBytes = w
 		}
-		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
+		if aw := colVar[strings.ToLower(col.Name)]; aw > 0 {
 			kc.width = int(aw)
 		} else if w, ok := derivedLeafColumnWidth(rel.baseLeaf, i); ok {
 			kc.width = w
