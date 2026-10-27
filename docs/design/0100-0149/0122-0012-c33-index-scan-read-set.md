@@ -122,3 +122,35 @@ over the same expression corpus.
 
 Because `internal/optimizer` changes, the S9 census re-runs after the commit. The pass is plan-neutral: it only adds
 a field that EXPLAIN never prints.
+
+## Measured and dropped: the NestedLoopIndexJoin slice (loop #217)
+
+The executor's existing consumer threading (`buildCompleteChild`) carries consumer expressions down from
+consumer-complete roots, so the first slice was built on it rather than on the Plan()-tail pass:
+
+- `buildCompleteChild` got a `NestedLoopIndexJoin` case.
+- The consumers and the join predicate are split at the outer width. The inner read set is their inner columns
+  plus the probe's `Cond`.
+- The outer is built consumer-complete. Its consumers are the outer columns referenced by the consumers, the
+  predicate, the probe's key expressions and the Memoize keys.
+- Any expression the deform visitor cannot enumerate declines the case.
+- The read set became `indexScanOp.readCols`, applied as `colInfo.skip`.
+
+An on/off/poison equivalence test passed; 2 of its 7 queries armed.
+
+**Measured:** Q14 128.744 → 128.701 G (−0.03 %). Q72, Q17, Q25 and Q29 did not move.
+
+**Why it missed.** Q14's index probes are the inner IndexScans of lateral or parameterised `Join`s
+(`lateralJoinStream`), not `NestedLoopIndexJoin`s, and two-table index nested loops plan as `Join` too.
+`joinLeftConsumers` declines lateral joins, so no consumer chain reaches those probes. The code was correct but
+inert, and it was reverted.
+
+**What is left.** Thread consumers through lateral joins:
+
+- The right read set is the consumers' right-side columns, plus the predicate's, plus the inner `Cond`'s own
+  columns.
+- The left consumers additionally include every outer column the inner reads through `OuterColumnRef{Level: 1}`
+  (its keys and `Cond`).
+
+This needs a visitor that understands `OuterColumnRef`; `deformLateralOuterRefs` is today's integer-bound twin.
+That path, or the Plan()-tail pass above, is the next attempt. Both are design-sized.

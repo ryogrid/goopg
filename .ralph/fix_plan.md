@@ -1802,6 +1802,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
     - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
       `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
+    - Dropped: C33 NLI\-inner index\-scan read set through buildCompleteChild \(Q14 instructions −0\.03 %: Q14's
+      probes sit under lateral Joins the consumer threading does not cross\)\.
     - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -2096,6 +2098,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     at `Plan\(\)`'s tail as `IndexScan\.ReadCols` by `fillIndexScanReadCols` \(precedent `fillJoinHashKeys`\), with a
     conservative optimizer expression walker checked against the executor's `deformScanReadSet`\. Nightly batch was
     running \(load ~11\); implementation deferred to a fresh loop\. Nothing attempted, misses 0\.
+  - **C33 MEASURED AND DROPPED \(loop \#217\)**: implemented the slice the executor's existing consumer threading
+    allows — `buildCompleteChild` gained a NestedLoopIndexJoin case \(consumers split at the outer width; inner read
+    set = consumers' and predicate's inner columns ∪ Cond; outer consumers = their outer columns ∪ the probe's Key/
+    Keys/SAOPKeys/Low/HighKey/RangePrefix ∪ Memoize keys; any unenumerable expression declines\), applied as
+    indexScanOp `colInfo\.skip`; an on/off/poison equivalence test passed \(2 of 7 queries armed\)\. **Q14 128\.744 →
+    128\.701 G = −0\.03 %, misses the bar**; Q72, Q17, Q25, Q29 ±0\. Cause: Q14's probes are the inner IndexScans of
+    LATERAL / parameterised `Join`s \(lateralJoinStream\), not NestedLoopIndexJoins, and `joinLeftConsumers` declines
+    lateral joins, so no consumer chain reaches them; two\-table index nested loops plan as `Join` too\. Code reverted
+    \(correct but inert\)\. **Miss counter 1\.** The remaining lever is lateral\-join consumer threading: right read set
+    from the consumers' right columns ∪ predicate ∪ Cond, and left consumers ∪ the inner's OuterColumnRef\{Level 1\}
+    reads — needs an OuterColumnRef\-aware visitor \(deformLateralOuterRefs is the int\-bound twin\); design\-sized\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5721,6 +5734,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     this loop\.
   - S9 re\-check 2026\-10\-28 \(loop \#216\) — **exhausted at `bafc2e139`**, census `routing\-20261028a/` reused:
     `bafc2e139` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#217\) — **exhausted at `a3f833e78`**, census `routing\-20261028a/` reused:
+    `a3f833e78` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
     loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
