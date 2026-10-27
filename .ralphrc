@@ -78,6 +78,31 @@ export AGENT_BACKEND="claude"
 #export AGENT_BACKEND="codex"
 #export AGENT_BACKEND="opencode"
 #export AGENT_BACKEND="devin"
+
+# Claude API-token failover (owner, 2026-10-28) — ~/.ralph/ralph_loop.sh,
+# section "CLAUDE API-TOKEN FAILOVER". With AGENT_BACKEND=claude and the
+# variable NAMED below holding a Console API key (sk-ant-apiNN-…, exported
+# from ~/.bashrc before the shell that starts the loop), every loop runs on
+# that key. When the key is unusable the loop switches to the subscription
+# login at once and blocks the key:
+#   budget (credit balance / API usage or spend limit) or invalid (401):
+#     retried CLAUDE_API_RETRY_HOURS later;
+#   rate_limit (3 consecutive 429s) or api_error (3 consecutive other
+#     api-mode errors): retried CLAUDE_API_SHORT_RETRY_HOURS later;
+#   any block is lifted at once when the key's value changes.
+# Unset, empty or malformed token, ANTHROPIC_BASE_URL set, or a
+# CLAUDE_CODE_CMD that is not claude itself: subscription login only.
+# Each mode keeps its own resume id (.ralph/.claude_session_id,
+# .ralph/.claude_session_id.api); the block lives in
+# .ralph/.claude_auth_state.json (delete it to retry the key now). The token is
+# read once at loop start: a new value needs a restart. Environment variables
+# of the same names override these values.
+CLAUDE_API_FAILOVER=true
+CLAUDE_API_TOKEN_VAR="ANTHTOPIC_100D_API_TOKEN"
+CLAUDE_API_RETRY_HOURS=24
+CLAUDE_API_SHORT_RETRY_HOURS=1
+# Optional per-invocation spend cap in api mode (claude --max-budget-usd):
+#CLAUDE_API_MAX_BUDGET_USD=20
 # OpenCode backend settings (used only when AGENT_BACKEND=opencode).
 # Model in provider/model format; empty = CLI default.
 #OPENCODE_MODEL=""
