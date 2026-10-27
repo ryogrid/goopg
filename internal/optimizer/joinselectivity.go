@@ -705,6 +705,12 @@ func (s *searchCtx) joinClauseSelectivityExtUncached(ri *restrictInfo) (float64,
 	if ri == nil || ri.clause == nil {
 		return defaultUnhandledClauseSel, true
 	}
+	// M0147-0053: an outer join's held preserved-side conjunct references one
+	// relation, so PG's clause_selectivity prices it as a restriction
+	// (restriction_selectivity), not as a join clause.
+	if ri.ojHeld {
+		return s.orConjunctSelectivity(ri.clause)
+	}
 	bo, ok := ri.clause.(*BinaryOp)
 	if !ok {
 		return defaultUnhandledClauseSel, true

@@ -7986,9 +7986,22 @@ Basis: the 2026-10-21 lever census and its review
     class that PG plans through the search\.
   - Witness for the NLI\-dependent class \(from the M0147\-0051 trial\): `TestParallelNLIJointypeIdentity/left` —
     a LEFT JOIN whose ON clause carries an outer\-only conjunct \(`AND o\.id > 0`\)\. It unblocks M0147\-0051\.
-- [ ] **M0147-0053 — admit outer\-join ON conjuncts that test only the preserved side \(the `outer\-on\-qual` seam decline\)**
+- [x] **M0147-0053 — admit outer\-join ON conjuncts that test only the preserved side \(the `outer\-on\-qual` seam decline\)**
   Kind: impl
   Parent: M0147-0052
+  Movement: none — instrument artefact: the class has no corpus or regress\-EXPLAIN witness \(census 22/22·99/99·99/99, regress outputs identical\); the witness statement now plans PG 18\.3's exact shape \(scratch\-PG verified\)
+  - Done 2026\-10\-27\. `outerOnQualsOK` admits a preserved\-side\-only conjunct; the seam carries it as an
+    `ojHeldQual` \(scope = one column per leaf\); `appendOJHeld` gives it a restrict info with the outer join's scope
+    as `relids` in exactly the problem that splits the join, flagged `ojHeld` and priced as a restriction
+    \(PG `distribute\_qual\_to\_rels`, `clause\_selectivity`\)\. Design doc
+    `docs/design/0100\-0149/m0147\-0053\-outer\-join\-preserved\-side\-on\-qual\.md`\.
+  - Witness `o LEFT JOIN i ON i\.k = o\.k AND o\.id > 0` now plans `Nested Loop Left Join` / `Join Filter: \(o\.id >
+    0\)` / parameterised index probe — identical to scratch PG 18\.3\. The fused\-NLI pin
+    `TestParallelNLIJointypeIdentity` is retired \(its last case now builds the decomposed family, pinned by
+    `parallel\_lateral\_left\_probe\_identity\_test\.go`\); the old RIGHT\-link decline test asserts the new placement\.
+  - Constant ON conjuncts still decline — ledger row 2026\-10\-27\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(same 81 mismatches, outputs identical\), Isolation PASS\.
   - Filed by M0147\-0052: `outerOnQualsOK` \(`internal/optimizer/joinsearchseam\.go`\) declines a LEFT/RIGHT link whose
     ON clause carries a preserved\-side\-only conjunct or a constant \(45 regress decline events\), so the statement is
     planned outside the PG\-shaped search\. PG keeps such a conjunct as a join clause of that outer join
