@@ -292,6 +292,43 @@ its durable tail and replays the complete outage interval in order.
 standby, commits twelve rows on the live primary, then asserts every row after
 the standby recovers and reconnects.
 
+### Restartpoint WAL removal \(2026\-10\-28, M0122\-0013\)
+
+After `CreateRestartPoint` updates pg\_control it deletes the WAL that the restartpoint made redundant (xlog.c):
+
+1. `XLByteToSeg(RedoRecPtr)` takes the restartpoint's redo segment.
+2. `KeepLogSeg` lowers it for replication slots and `wal_keep_size`, measured against the later of the received and
+   replayed positions.
+3. `RemoveOldXlogFiles` removes or recycles every older segment.
+
+Only the arm that adopted a restartpoint gets there; the skip arm returns before it. Until now a goopg standby kept
+every segment it ever received.
+
+`runRecoveryFlush` now calls the checkpointer's retainer with the adopted redo, right after `adoptRestartPoint`
+reports an advance. That is the same `SlotAwareRetainer` the primary's checkpoint uses, with the same slot horizons,
+`max_slot_wal_keep_size` invalidation and recycle-by-rename sizing. On a standby the retainer's writer is the one the
+walreceiver appends into, so its `WrittenLSN`, the retainer's lag yardstick, is the end of the received WAL: PG's
+`endptr`. Replay has already passed the adopted checkpoint record, which follows its redo, so no segment the
+replayer or a restarted walreceiver still needs is removed.
+
+`TestE2E_PhysicalStandbyRestartPointRemovesOldWAL` writes about 40 MB on the primary, checkpoints, and waits for the
+standby to replay past the checkpoint. It then requires:
+
+- before the standby CHECKPOINT, segments older than the redo's segment exist;
+- after it, none remain;
+- the standby still restarts and keeps streaming.
+
+With the retention call removed it fails: two old segments survive.
+
+Still missing (ledgered):
+
+- restartpoints do not feed the checkpoint-distance estimate (`UpdateCheckPointDistanceEstimate`);
+- no `PreallocXlogFiles`;
+- no `TruncateSUBTRANS` at a restartpoint;
+- no `archive_cleanup_command`;
+- restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
+  `RequestCheckpoint`.
+
 ### Promotion restart invariant
 
 A caught-up standby promoted through `goopg promote -D <dir>` must become a

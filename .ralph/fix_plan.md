@@ -1833,6 +1833,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-27: CreateRestartPoint's WAL segment
       removal — KeepLogSeg \+ RemoveOldXlogFiles after the pg\_control update — in `runRecoveryFlush` after
       `adoptRestartPoint`\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 restartpoint WAL removal, landed 2026\-10\-28 \(loop \#226\)\. Yield over — the next item\-10
+        selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -3391,6 +3393,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint WAL removal LANDED 2026\-10\-28 \(loop \#226, the M0122\-0012 one\-task yield\)**\. Movement: none —
+    recovery path\. `runRecoveryFlush` calls the checkpointer's retainer \(`SlotAwareRetainer`, the primary's\) with the
+    adopted redo right after `adoptRestartPoint` advances pg\_control — PG CreateRestartPoint's XLByteToSeg\(RedoRecPtr\)
+    → KeepLogSeg → RemoveOldXlogFiles; the skip arm removes nothing\. A standby's pg\_wal no longer grows without bound\.
+    - Pin: `TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL` \(~40 MB of primary WAL; after the standby CHECKPOINT no
+      segment before the redo's survives; restart keeps streaming\); FAILS with the call removed \(2 old segments
+      survive\)\.
+    - Residual \(ledgered\): no restartpoint distance estimate, PreallocXlogFiles, TruncateSUBTRANS or
+      archive\_cleanup\_command; restartpoints still timer\-driven\.
+    - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"Restartpoint WAL removal"\.
   - **Standby restartpoint LANDED 2026\-10\-27 \(loop \#195, the M0122\-0012 one\-task yield\)**\. Movement: none —
     recovery path\. `StreamReplayer` records the last replayed checkpoint \(PG RecoveryRestartPoint\);
     `runRecoveryFlush` snapshots it before the flush and `adoptRestartPoint` then advances pg\_control's
@@ -5928,6 +5940,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#225\) — **exhausted at `07f9d5c6a`**, census `routing\-20261028f/` reused:
     `07f9d5c6a` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
     this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#226\) — **exhausted at `602669237`**, fresh census `routing\-20261028g/`
+    \(s9bb\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: the M0122\-0012 one\-task yield → M0122\-0013\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

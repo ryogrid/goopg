@@ -1162,6 +1162,21 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 		}
 		if adopted {
 			c.cfg.Logger.Info("recovery restart point", "redo", rp.Fields.RedoLSN0, "checkpoint", rp.StartLSN-1)
+			// CreateRestartPoint then deletes the WAL the restartpoint made
+			// redundant (xlog.c: XLByteToSeg(RedoRecPtr) → KeepLogSeg →
+			// RemoveOldXlogFiles), the same retention the primary's
+			// checkpoint runs — slot horizons, max_slot_wal_keep_size and
+			// recycle-by-rename included. Only the arm that adopted a
+			// restartpoint gets there; the skip arm returns first. The
+			// retainer's lag yardstick, the writer's WrittenLSN, is the end
+			// of the received WAL, KeepLogSeg's endptr (the later of the
+			// receive and replay positions). Without it a standby's pg_wal
+			// grew without bound (M0122-0013).
+			if c.retainer != nil {
+				if err := c.retainer.Retain(rp.Fields.RedoLSN0 + 1); err != nil {
+					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
+				}
+			}
 		}
 	}
 	c.numRequested.Add(1)
