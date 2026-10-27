@@ -300,6 +300,9 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 // ---------------------------------------------------------------------------
 
 type bitmapHeapScanOp struct {
+	// cond is plan.Cond compiled for the per-row filter (C43).
+	cond compiledCond
+
 	// borrowRows is set at Build when every operator up to a borrowing root
 	// consumes each row before the next Next() and keeps nothing of it
 	// (markScanBorrowChain): emitRow then yields scanRow instead of a clone
@@ -901,7 +904,7 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 	// list and fires only on a lossy entry. Set only on an NLI inner, where the
 	// quals cannot live in a *Filter above (plan.go, BitmapHeapScan.Cond).
 	if o.plan.Cond != nil {
-		d, cerr := evalExpr(o.plan.Cond, o.scanRow, o.ctx)
+		d, cerr := o.cond.eval(o.plan.Cond, o.scanRow, o.ctx)
 		if cerr != nil {
 			return nil, read, cerr
 		}

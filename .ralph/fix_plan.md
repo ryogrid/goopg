@@ -2252,6 +2252,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       misses the bar**\. The premise was wrong: the compares inside nextLeafBatch are mostly `leafScanStart`'s binary
       search for the range start \(2\.31 % of Q14\), not per\-item hi tests \(0\.62 %\) — the store\_sales\_pkey probes
       match far fewer items per page than the ~44 assumed\. Code reverted\. **Miss counter 1\.**
+  - **Loop \#225 \(misses 1\)**: S9 census reused \(`07f9d5c6a` ralph\-only\)\. Q14's heap\-fetch leads checked first:
+    pruning already runs once per new heap block \(`PagePruneXIDSet` 2\.0 % is each heap page's first touch, which PG
+    pays too\); same\-block pin reuse is rare for these probes\. The real lead: `indexScanOp\.Next` evaluates its `Cond`
+    per fetched row with the **interpreted** `evalExpr` — **7\.08 % of Q14** \(the date\_dim probes' `d\_year = 2001 AND
+    d\_moy = 11` and `d\_week\_seq = \(InitPlan\)`\) — where the seq scan's qual and the join residual already run
+    compiled \(`evalFastExpr`, slice 45\)\.
+    - C43: compile `IndexScan\.Cond` once per operator into an `exprTreeSlab` and evaluate it with `evalFastExpr`
+      over a reused slot, as `joinOp\.joinPredicateMatch` does\. PG evaluates the scan qual through ExecQual over a
+      compiled ExprState \(execExpr\.c\)\.
+    - **Target \(C43\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~5 %\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5902,6 +5913,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#224\) — **exhausted at `ed521153d`**, census `routing\-20261028f/` reused:
     `ed521153d` is ralph/analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#225\) — **exhausted at `07f9d5c6a`**, census `routing\-20261028f/` reused:
+    `07f9d5c6a` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
+    this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

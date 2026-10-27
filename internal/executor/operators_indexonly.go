@@ -22,6 +22,9 @@ import (
 // For pages not yet marked ALL_VISIBLE it falls back to a full heap fetch
 // so MVCC visibility is always respected.
 type indexOnlyScanOp struct {
+	// cond is plan.Cond compiled for the per-row filter (C43).
+	cond compiledCond
+
 	// probeForm resolves the probe key's columns once and forms fixed-width
 	// probes from a template (M0122-0012 slice 80).
 	probeForm indexProbeForm
@@ -592,7 +595,7 @@ func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 		r := o.rows[o.idx]
 		o.idx += step
 		if o.plan.Cond != nil {
-			d, err := evalExpr(o.plan.Cond, r, o.ctx)
+			d, err := o.cond.eval(o.plan.Cond, r, o.ctx)
 			if err != nil {
 				return nil, err
 			}
