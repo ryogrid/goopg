@@ -2151,6 +2151,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       and plans identical\. Test `TestSkipColumnRunMatchesPerColumnSkip` \(4 000 random tuples, run vs per\-column\)\.
       **Misses 0\.** Design: part 10 §112\. Next on return: re\-census S9 \(executor changed\), then G3 on H Q13
       \(mapaccess1\_fast64 is stall time — check instructions first\) or DS Q72/Q18\.
+  - **Return 2026\-10\-28 \(loop \#220, misses 0\)**: S9 re\-census `routing\-20261028c` exhausted\. G3 at
+    `b68540921` \(`tmp/g3\-220/`\):
+    - H Q18: map lookups 11 % \(stall skid\) and NUMERIC decode ~10 %; the legacy\-text / special\-spelling probes are
+      already early\-reject, their share is call overhead plus the payload's first touch \(C20's ≈1–2 % again\)\.
+    - H Q13: `MaterializedSlot\.Get` 9 % and `mapaccess1\_fast64` 25 % are the first touch of build rows after the
+      hash lookup — stall time, not instructions\. No instruction lever\.
+    - DS Q72: skip scan dominates — `btreeSkipEnum\.walkLeaf` ~43 % \(leaf entries\), `cursorAt` descents ~35 %\.
+    - C36: walkLeaf checks every leaf entry before the current group's probe\. PG 18 does that only three times
+      in a row, then `\_bt\_checkkeys\_look\_ahead` \(nbtutils\.c\) tests a tuple `targetdistance` ahead \(5, doubling
+      to MaxIndexTuplesPerPage/2; on a miss rechecks reset and the distance drops to /8\), and `\_bt\_readpage`
+      jumps there via `pstate\.skip`\. The state resets per page and on each array advance\. Port: a ScanCursor
+      skip slot \(`scanLeafItems` honours it\) and the look\-ahead in walkLeaf's before\-probe branch\.
+    - **Target \(C36\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~10 % \(walkLeaf ~43 %\)\.
+    - **C36 LANDED \(slice 113\)**: `skipLookAhead` in walkLeaf's before\-probe branch \+ `ScanCursor\.SkipTo` /
+      `LeafKeyAt` / `LeafItemCount` \(scanLeafItems honours the skip only without a hi bound\)\. Q72 23\.955/23\.954 →
+      23\.157/23\.154 Ginstr/q \(**−3\.3 %, meets the bar**; predicted ~10 % — most walked entries are matches or
+      group boundaries\); Q72 output identical; plans 99/99 same; sf025 total −3\.3 %\. Test
+      `TestSkipLookAheadMatchesEntryWalk` \(mutation\-checked\)\. **Misses 0\.** Design: part 10 §113\. Next on
+      return: re\-census S9, then Q72's descents \(`cursorAt` ~35 %: per\-descent page pin \+ bufmap lookup \+
+      readOpaque\) or a fresh G1 census \(census\-20261027b expires 2026\-10\-30\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5785,6 +5806,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     loop\. The C34 commit changes `internal/executor`, so the next loop re\-runs the census\.
   - S9 re\-check 2026\-10\-28 \(loop \#219\) — **exhausted at `39041efc5`**, fresh census `routing\-20261028b/`
     \(s9aw\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#220\) — **exhausted at `b68540921`**, fresh census `routing\-20261028c/`
+    \(s9ax\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

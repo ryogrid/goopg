@@ -467,6 +467,51 @@ func (p skipPos) pastProbe(tree *nbtree.BTree, key, probe []byte) bool {
 	return tree.CompareHighBound(key, probe) > 0
 }
 
+// The look-ahead constants are nbtutils.c's LOOK_AHEAD_REQUIRED_RECHECKS and
+// LOOK_AHEAD_DEFAULT_DISTANCE; the distance stops doubling at
+// MaxIndexTuplesPerPage / 2 (408 / 2 on an 8 kB page).
+const (
+	skipLookAheadRechecks        = 3
+	skipLookAheadDefaultDistance = 5
+	skipLookAheadMaxDistance     = 408 / 2
+)
+
+// skipLookAheadDisabled is the A/B and equivalence-test knob for C36.
+var skipLookAheadDisabled = false
+
+// skipLookAheadHit is a test hook counting successful look-aheads.
+var skipLookAheadHit = func() {}
+
+// skipLookAhead is PG 18's _bt_checkkeys_look_ahead (nbtutils.c) for
+// walkLeaf (M0122-0012 C36). The entry at slot is before the current group's
+// probe, and so were the rechecks-1 before it; rather than test every entry
+// on the way to the probe, test the one targetDistance slots ahead. If it is
+// still before the probe, so is every entry between (leaf order), and none of
+// them can start a new group (a later prefix orders after the probe), so the
+// walk jumps past it (ScanCursor.SkipTo, PG's pstate.skip). The distance
+// starts at 5 and doubles with each success; a miss resets rechecks and cuts
+// the distance to an eighth. No look-ahead near the page's end.
+func skipLookAhead(cur *nbtree.ScanCursor, tree *nbtree.BTree, probe []byte, slot uint16, rechecks, targetDistance *int) {
+	maxoff := cur.LeafItemCount()
+	off := int(slot)
+	if off >= maxoff-skipLookAheadDefaultDistance {
+		return
+	}
+	if *targetDistance == 0 {
+		*targetDistance = skipLookAheadDefaultDistance
+	} else if *targetDistance < skipLookAheadMaxDistance {
+		*targetDistance *= 2
+	}
+	ahead := min(maxoff, off+*targetDistance)
+	if key, ok := cur.LeafKeyAt(uint16(ahead)); ok && probePos(tree, key, probe).beforeProbe(tree, key, probe) {
+		cur.SkipTo(uint16(ahead + 1))
+		skipLookAheadHit()
+		return
+	}
+	*rechecks = 0
+	*targetDistance = max(*targetDistance/8, 1)
+}
+
 // walkLeaf is the skip scan as PG 18 runs it (M0145-0008af): one leaf page
 // per call, every entry checked against the current prefix group's probe,
 // as `_bt_checkkeys` checks a skip array advanced to the entry's prefix
@@ -507,6 +552,10 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 	// test per group state per leaf.
 	var jump []byte
 	jumpExcl, checkedBefore, checkedPassed := false, false, false
+	// rechecks / targetDistance are _bt_readpage's look-ahead state
+	// (BTReadPageState): per leaf page, and reset when the array keys advance
+	// to a new group (C36).
+	rechecks, targetDistance := 0, 0
 	ok, nerr := cur.Next(func(key []byte, ptr storage.ItemPointer, p nbtree.ScanPos) (bool, error) {
 		entries++
 		at := probePos(tree, key, e.gProbe)
@@ -518,6 +567,7 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 			e.gProbe, e.gPivot = probe, pivot
 			e.gReached, e.gPassed = false, false
 			checkedBefore, checkedPassed = false, false
+			rechecks, targetDistance = 0, 0
 			newGroups++
 			at = probePos(tree, key, e.gProbe)
 		}
@@ -532,6 +582,12 @@ func (e *btreeSkipEnum) walkLeaf(ctx *Context, tree *nbtree.BTree, idx *catalog.
 					jump, jumpExcl = e.gProbe, false
 					return false, nil
 				}
+			}
+			// A run of entries before the probe: after a few, look ahead
+			// on this page and jump over the ones that cannot match (C36).
+			rechecks++
+			if rechecks >= skipLookAheadRechecks && !skipLookAheadDisabled {
+				skipLookAhead(cur, tree, e.gProbe, p.Slot, &rechecks, &targetDistance)
 			}
 			return true, nil
 		}

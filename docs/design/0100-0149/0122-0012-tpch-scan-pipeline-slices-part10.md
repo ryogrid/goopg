@@ -593,3 +593,63 @@ Gates:
 It decodes each with a random skip mask over a random window, which may resume mid-row, once with the run and once
 without. It requires identical cells and resume offsets, and NULL in every skipped cell. A mutation that drops
 the fixed-width alignment fails it.
+
+## Slice 113 — C36: the skip scan looks ahead within a leaf (Q72 −3.3 % instructions)
+
+Loop #220. The S9 census `routing-20261028c` (at `b68540921`) is exhausted. G3 at HEAD:
+
+- H Q18 and H Q13: their remaining shares are stall time (first touches after hash lookups) or the NUMERIC
+  probes' call overhead, about 1–2 %. Neither has an instruction lever.
+- DS Q72: the skip scan over `inventory_pkey` dominates, with `btreeSkipEnum.walkLeaf` ~43 % (leaf entries) and
+  `cursorAt` descents ~35 %.
+
+**Symptom.** `walkLeaf` (M0145-0008af) tests every leaf entry that sorts before the current prefix group's probe
+until it reaches the probe. PG 18 does that only `LOOK_AHEAD_REQUIRED_RECHECKS` (3) times in a row. After that,
+`_bt_checkkeys_look_ahead` (nbtutils.c) tests the tuple `targetdistance` slots ahead:
+
+- if that tuple is still before the advanced array keys, `_bt_readpage` jumps to the slot after it
+  (`pstate.skip`, nbtsearch.c);
+- the distance starts at `LOOK_AHEAD_DEFAULT_DISTANCE` (5) and doubles up to `MaxIndexTuplesPerPage / 2`;
+- a miss resets `rechecks` and cuts the distance to an eighth;
+- there is no look-ahead within 5 slots of the page's end;
+- the state is per page and resets whenever the array keys advance (`_bt_advance_array_keys`).
+
+**Change:**
+
+- `nbtree.ScanCursor` gains `LeafItemCount`, `LeafKeyAt` (`LeafLastKey` now uses it) and `SkipTo`.
+- `scanLeafItems` takes the cursor's skip slot and resumes there after `fn` returns. It honours the skip only
+  without a `hi` bound, so a jump can never step over the entry that ends the scan. A posting tuple stops
+  delivering its TIDs once a skip is set.
+- `walkLeaf` keeps `rechecks` and `targetDistance` per call, which is one leaf, and resets them on each new group.
+  In the before-probe branch it calls `skipLookAhead` once three consecutive entries were before the probe.
+- A successful look-ahead is result-neutral. Every entry it passes over lies between the current entry and the
+  look-ahead entry, both before the probe, and so does not match. None of them can start a new group, because a
+  later prefix orders after the probe.
+- Test knob: `skipLookAheadDisabled`; test hook: `skipLookAheadHit`.
+
+**Measured** (`tools/ds-instr.sh`, 3 runs × 2, a fresh A/B against `b68540921`): Q72 23.955 / 23.954 →
+23.157 / 23.154 Ginstr/q, **−3.3 %**. That meets the 3 % bar against a ~10 % prediction: most of walkLeaf's entries
+are matches or group boundaries, not long before-probe runs. Q72's output is byte-identical, and the SF0.25
+sweep's total time moved −3.3 %.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- fire-set: PASS, no fires;
+- RegressSuite: counts equal to the C35 run except the `plpgsql` flapper;
+- isolation suite: PASS.
+
+**Test.** `TestSkipLookAheadMatchesEntryWalk` runs skip probes three ways and requires identical results:
+look-ahead on, look-ahead off, and a sequential scan. The probes cover:
+
+- 40 and 7 prefixes with 300 and 1 500 distinct bound values;
+- probes at a run's start, middle and end, and one past every group;
+- NULLs in the bound column;
+- the lazy index scan;
+- a parameterised join that restarts the walk per outer row;
+- an ordered probe.
+
+The look-ahead fires on mid-run probes. A mutation that jumps without the before-probe test fails it.

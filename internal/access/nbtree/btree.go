@@ -4821,7 +4821,7 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 		// callers are CAT-1 (see contract above); none retain
 		// key beyond fn, none re-enter the btree.
 		nextBlk := op.Next
-		stop, fnErr := bt.scanLeafItems(slot, cur, lo, hi, loExclusive, hiExclusive, fn)
+		stop, fnErr := bt.scanLeafItems(slot, cur, lo, hi, loExclusive, hiExclusive, nil, fn)
 		bt.unpinR(slot)
 		if fnErr != nil {
 			return fnErr
@@ -4845,7 +4845,15 @@ func (bt *BTree) rangeScanPosLeaf(lo, hi []byte, loExclusive, hiExclusive bool, 
 // Returns stop=true when the scan must not continue rightward: the hi
 // bound was reached, fn declined, or fn errored (the error is returned
 // alongside stop).
-func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, hi []byte, loExclusive, hiExclusive bool, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) (stop bool, err error) {
+//
+// skip, when non-nil, is the cursor's within-page jump (ScanCursor.SkipTo,
+// PG's pstate.skip): fn may set it to a later slot, and the walk resumes
+// there instead of at the next slot. It is honoured only without a hi bound,
+// so a jump can never step over the entry that would have ended the scan.
+func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, hi []byte, loExclusive, hiExclusive bool, skip *uint16, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) (stop bool, err error) {
+	if hi != nil {
+		skip = nil
+	}
 	count, countErr := PGDataItemCount(slot.Page())
 	if countErr != nil {
 		return false, nil
@@ -4913,6 +4921,9 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 				if !ok {
 					return true, nil
 				}
+				if skip != nil && *skip != 0 {
+					break
+				}
 			}
 		} else {
 			// M0091-0002: parseItemNoCopy aliases the
@@ -4950,6 +4961,12 @@ func (bt *BTree) scanLeafItems(slot *storage.Slot, cur storage.BlockNumber, lo, 
 			if !ok {
 				return true, nil
 			}
+		}
+		if skip != nil && *skip != 0 {
+			if *skip > s+1 {
+				s = *skip - 1
+			}
+			*skip = 0
 		}
 	}
 	return false, nil
@@ -5054,6 +5071,8 @@ type ScanCursor struct {
 	next                     storage.BlockNumber // InvalidBlockNumber once exhausted
 	// page is the leaf Next is walking, set only while fn runs (LeafLastKey).
 	page storage.Page
+	// skip is the within-page jump fn requested (SkipTo); 0 = none.
+	skip uint16
 }
 
 // LeafLastKey returns the key of the last data item on the leaf the current
@@ -5066,14 +5085,42 @@ type ScanCursor struct {
 // An LP_DEAD item keeps its place in key order, so it counts. ok is false on
 // an empty or unreadable leaf, or outside fn.
 func (c *ScanCursor) LeafLastKey() (key []byte, ok bool) {
-	if c.page == nil {
+	n := c.LeafItemCount()
+	if n == 0 {
 		return nil, false
+	}
+	return c.LeafKeyAt(uint16(n))
+}
+
+// LeafItemCount is the number of data items on the leaf the current Next call
+// is walking (0 outside fn or on an unreadable leaf); data slots run 1..n,
+// as ScanPos.Slot numbers them.
+func (c *ScanCursor) LeafItemCount() int {
+	if c.page == nil {
+		return 0
 	}
 	count, err := PGDataItemCount(c.page)
-	if err != nil || count == 0 {
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+// SkipTo asks the walk of the current leaf to continue at data slot slot,
+// passing over the slots between — PG's pstate.skip, which _bt_readpage
+// honours after _bt_checkkeys_look_ahead found a later tuple still before the
+// scan's array keys (nbtsearch.c / nbtutils.c). Only a forward jump on a
+// cursor without a hi bound takes effect; valid only inside Next's fn.
+func (c *ScanCursor) SkipTo(slot uint16) { c.skip = slot }
+
+// LeafKeyAt returns the key of data slot slot on the leaf the current Next
+// call is walking — LeafLastKey's read at any slot, with the same rules (an
+// LP_DEAD item keeps its place in key order; valid only inside fn).
+func (c *ScanCursor) LeafKeyAt(slot uint16) (key []byte, ok bool) {
+	if c.page == nil || slot == 0 {
 		return nil, false
 	}
-	r, err := pgGetItemRawAllowDeadNoCopy(c.page, uint16(count))
+	r, err := pgGetItemRawAllowDeadNoCopy(c.page, slot)
 	if err != nil {
 		return nil, false
 	}
@@ -5165,7 +5212,8 @@ func (c *ScanCursor) Next(fn func(key []byte, ptr storage.ItemPointer, pos ScanP
 		}
 		nextBlk := op.Next
 		c.page = slot.Page()
-		stop, ferr := c.bt.scanLeafItems(slot, cur, c.lo, c.hi, c.loExclusive, c.hiExclusive, fn)
+		c.skip = 0
+		stop, ferr := c.bt.scanLeafItems(slot, cur, c.lo, c.hi, c.loExclusive, c.hiExclusive, &c.skip, fn)
 		c.page = nil
 		c.bt.unpinR(slot)
 		if ferr != nil {
