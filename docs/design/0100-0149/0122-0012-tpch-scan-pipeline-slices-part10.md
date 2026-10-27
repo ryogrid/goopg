@@ -199,3 +199,52 @@ multi-byte UTF-8 and leading blanks next to the padding.
 need `allVals` pre-trimmed per column. The final Sort's comparator copies 48-byte Datums per key, and each row's key
 slice is a separate allocation reached through `perm`. PG keeps the first key inline in the SortTuple array
 (`datum1`, tuplesort.c), and that is the cycle-side lever.
+
+## Slice 106 — C26: the sort comparator reads key Datums in place (Q67 −7.6 % instructions)
+
+Loop #204 took an instructions:u profile of Q67 at `08a69974e`:
+
+- the final Sort (255 k rollup rows by `i_category, sumsales DESC`) is 17.9 %, the worker Sort 8.9 %;
+- `sortOp.lessKeyVals` alone is 11.4 % self, and `cmpbody` 7.6 %.
+
+**Symptom.** `lessKeyVals` copied both 48-byte Datums of every key into locals (`av, bv := a[i], b[i]`). It then
+tried `fastCompareDatum`, which declines every string pair. For a character-string key it then called the
+value-receiver `StringValue`, which copies each Datum again before `strings.Compare`. Each key comparison moved
+about 200 bytes before comparing anything.
+
+**PG.** tuplesort compares with `ApplySortComparator` over the SortTuple's datums, using the comparator that
+SortSupport resolved for the key once (sortsupport.h; `varstrfastcmp_c` for text in the C collation). Nothing is
+copied per comparison.
+
+**Change** (`operators.go`, `datum.go`):
+
+- `lessKeyVals` takes pointers into the two key slices and tests NULLs on the Kind byte.
+- A pair of strings under a character-string key goes straight to `strings.Compare` over `datumStringInPlace`. That
+  helper aliases Buf-backed bytes without copying the Datum; arena-backed values still go through `StringValue`.
+- Every other pair takes `fastCompareDatum`, then `compareDatumTyped`, as before.
+- The order of decisions is unchanged, because `fastCompareDatum` never decided a string pair.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `08a69974e`): Q67 20.647 / 20.616 →
+19.071 / 19.065 Ginstr/q, **−7.6 %**, which meets the 3 % bar (predicted ~5 %). Q67's output is byte-identical.
+Q38 (INTERSECT over sorts) drops from 11.648 to 11.333 Ginstr/q.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set PASS (no fires);
+RegressSuite per-case counts equal to the slice-105 run except the plpgsql flapper. Eleven actual files differ
+byte-wise between runs:
+
+- nine are temp-file names in psql error lines;
+- `foreign_key` reorders `\d` lines and differs between every pair of earlier runs too;
+- `triggers` flips between two states seen on unchanged code (c26 is byte-identical to c21).
+
+Reviewing that flap found P0-E14 (S2, filed with an escalation): SET ROLE is not undone by ROLLBACK, and an
+INITIALLY DEFERRED constraint trigger fires at the statement instead of at COMMIT.
+
+Test: `TestLessKeyValsInPlaceMatchesCopy` pins the in-place comparator to the copying one over random text, int
+and numeric keys with NULLs, under every Desc / NullsFirst combination.
+
+**Left on Q67.**
+
+- The sort still reaches each row's keys through `perm` → `keyvals[p]` → a per-row slice, so the comparator's
+  cycles are mostly cache misses. PG keeps the first key inline in the SortTuple array (`datum1`).
+- Sort-key evaluation (8 %) re-trims the rollup's untrimmed char(n) group values.
+- The aggregate drain's per-set hash lookups (C24).

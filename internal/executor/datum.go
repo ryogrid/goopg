@@ -224,6 +224,16 @@ func (d Datum) StringValue() string {
 	return unsafe.String(&d.Buf[0], len(d.Buf))
 }
 
+// datumStringInPlace is d.StringValue() read through a pointer, without
+// copying the 48-byte Datum: a Buf-backed string's bytes are aliased
+// directly, and an arena-backed one goes through StringValue.
+func datumStringInPlace(d *Datum) string {
+	if d.ArenaID != 0 {
+		return d.StringValue()
+	}
+	return unsafe.String(unsafe.SliceData(d.Buf), len(d.Buf))
+}
+
 // BytesValue returns the byte payload of KindBytes / KindBytesArena
 // / KindToastPointer. The slice aliases the underlying bytes (Buf
 // for non-arena variants, arena page for arena variants); callers

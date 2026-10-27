@@ -898,6 +898,35 @@ heuristic stays live.)
     use the same matcher\.
   - Expected instrument: the repro identical to `analysis/p0e13/pg18\-expected\.out`\.
 
+- [ ] **P0\-E14 — SET ROLE survives ROLLBACK, and an INITIALLY DEFERRED constraint trigger fires at the statement, not at COMMIT**
+  \(filed 2026\-10\-27 by the loop, M0122\-0012 C26 RegressSuite review of the `triggers` case; S2 — wrong results /
+  privilege\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro values differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-27 \(S2, wrong results \+ privilege\) — OWNER PLACEMENT NEEDED\.** Filed, not selected:
+    > the loop continues with the banner\. Repros `analysis/p0e14/repro\-role\.sql`, `repro\-deferred\.sql`; PG 18\.3
+    > output `\*\.pg\.out` \(scratch PG on :5545\), goopg output `\*\.goopg\.out` \(binary at `08a69974e` \+ C26\)\.
+  - Symptom 1 \(privilege\): `BEGIN; SET ROLE r; ROLLBACK;` leaves `current\_user` = r \(PG: the session user\);
+    likewise after an aborted transaction\. The session keeps the rolled\-back role's privileges — in the upstream
+    `triggers` block the next `SELECT` fails with `permission denied`\.
+  - Symptom 2 \(wrong result\): a `CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` fires at the INSERT
+    statement \(NOTICE before the next statement\); PG queues it and fires it at COMMIT\. A deferred trigger that
+    raises therefore fails the INSERT instead of the COMMIT\.
+  - The upstream `triggers` regress case flaps between two goopg states across runs on unchanged code \(c21 = c26 vs
+    c23 = c25 in tmp/\*\-regress\): with the trigger not firing at all \(row committed, no error, `t`\), or firing at
+    the INSERT with the role left set \(`f`\)\. Neither matches PG\.
+  - Cause \(read, not yet traced\): SET ROLE state lives on `connTxState` \(internal/postmaster/query\.go
+    `applySetRole`, dispatch\.go `ectx\.SetRole`\) with nothing undoing it at transaction end; PG's `role` is a GUC
+    rolled back by AtEOXact\_GUC \(src/backend/utils/misc/guc\.c\) on abort and on a non\-LOCAL SET inside a rolled\-back
+    transaction\. Constraint triggers \(`trig\.IsConstraint`, internal/executor/expr\.go ~9422\) do not consult
+    tgdeferrable/tginitdeferred; PG queues them in the after\-trigger event list and fires deferred ones at
+    AfterTriggerFireDeferred \(src/backend/commands/trigger\.c\)\.
+  - First step: snapshot the role state at transaction start and restore it on ROLLBACK/abort \(and for SET LOCAL at
+    commit\); then route `IsConstraint` triggers marked initially\-deferred into the deferred\-check queue that the
+    deferred FK/unique checks already use at COMMIT\.
+  - Expected instrument: both repros identical to their `\*\.pg\.out`; the `triggers` regress case stops flapping\.
+
 - [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
   \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
   Kind: impl
@@ -1876,6 +1905,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Next on return: Q67's final Sort — PG's SortTuple `datum1` \(first key inline in the sorted array, tuplesort\.c\)
       against goopg's per\-row key slices reached through `perm` \(cycle\-side; check its instruction share first\),
       or C24 \(drain hash vs current\-group compare\)\. Design: part 10 §105\.
+  - **Return 2026\-10\-27 \(loop \#204\)**: instructions:u profile of Q67 at `08a69974e` \(`tmp/g3\-204/q67i\.data`\):
+    final Sort 17\.9 %, worker Sort 8\.9 %, sort\-key evaluation 8\.2 %, applyAgg 7\.8 %, aggregate map 4\.1 %;
+    **lessKeyVals 11\.4 % self**, cmpbody 7\.6 %\.
+    - C26: `sortOp\.lessKeyVals` copies both 48\-byte Datums of every key \(`av, bv := a\[i\], b\[i\]`\), tries
+      `fastCompareDatum` \(which declines every string pair\), then copies them again through the value\-receiver
+      `StringValue` before `strings\.Compare`\. PG compares in place: ApplySortComparator over Datums with a comparator
+      resolved once per key \(SortSupport, tuplesort\.c / sortsupport\.h; varstrfastcmp\_c for text\)\. Mechanism: compare
+      through pointers into the key slices, with a direct string arm for character\-string keys \(Buf\-backed bytes read
+      in place\) and the existing fast/typed fallbacks otherwise\. Predicted ~5 %\.
+    - **Target \(C26\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `08a69974e`\)\. Bar: −3 %\.
+    - **C26 LANDED \(slice 106\)**: `lessKeyVals` compares through pointers; string keys go straight to
+      `strings\.Compare` over `datumStringInPlace`\. Q67 20\.647/20\.616 → 19\.071/19\.065 Ginstr/q \(**−7\.6 %, meets
+      the bar**\); Q38 −2\.7 %; Q67 output byte\-identical; plans 99/99 same\. Misses 0\. Discovery: P0\-E14 \(S2,
+      filed\)\. Next on return: SortTuple `datum1` \(cycles\) or C24; or rotate G2 to Q14/Q23 \(Q67's excess has fallen
+      from 1344 ms\)\. Design: part 10 §106\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5455,6 +5500,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 \(loop \#203\) — **exhausted at `8432307f1`** \(M0122\-0012 slice 104 changed
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027x/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
+    for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#204\) — **exhausted at `08a69974e`** \(M0122\-0012 slice 105 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027y/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
     SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
     for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner

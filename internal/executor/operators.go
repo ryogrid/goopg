@@ -1408,42 +1408,55 @@ func sortKeyTextFlags(keys []optimizer.SortKey) []bool {
 // lessKeyVals is the comparator, over PRECOMPUTED key values. It is the same
 // rule lessRows applied — NULL placement by NullsFirst, then compareDatum,
 // then Desc — with the evaluation lifted out.
+//
+// It compares the key Datums in place, through pointers into the two key
+// slices, as PG's ApplySortComparator compares the SortTuple's datums with
+// the comparator SortSupport resolved for the key (tuplesort.c,
+// sortsupport.h). It used to copy both 48-byte Datums of every key into
+// locals and copy them again through the value-receiver StringValue: 11 % of
+// TPC-DS Q67's instructions (M0122-0012 C26).
 func (o *sortOp) lessKeyVals(a, b []Datum) bool {
-	for i, k := range o.keys {
-		av, bv := a[i], b[i]
-		if av.IsNull() && !bv.IsNull() {
-			return k.NullsFirst
+	for i := range o.keys {
+		pa, pb := &a[i], &b[i]
+		an, bn := pa.Kind == KindNull, pb.Kind == KindNull
+		if an || bn {
+			if an && bn {
+				continue
+			}
+			if an {
+				return o.keys[i].NullsFirst
+			}
+			return !o.keys[i].NullsFirst
 		}
-		if !av.IsNull() && bv.IsNull() {
-			return !k.NullsFirst
-		}
-		if av.IsNull() && bv.IsNull() {
-			continue
-		}
+		// Two strings of a character-string key are compareText whatever
+		// their shape: compareDatumTyped takes it when the shape is
+		// ambiguous, and otherwise compareDatum's KindString arm is the same
+		// strings.Compare (slice 60). fastCompareDatum declines every
+		// string pair, so trying it first only cost time. Otherwise
 		// fastCompareDatum decides same-kind int / time / numeric pairs
 		// exactly as compareDatum does (TestFastCompareDatumMatchesCompareDatum),
 		// and compareDatumTyped is compareDatum for every non-string pair
-		// (M0122-0012 slice 59). Two strings of a character-string key are
-		// compareText whatever their shape: compareDatumTyped takes it when
-		// the shape is ambiguous, and otherwise compareDatum's KindString
-		// arm is the same strings.Compare (slice 60).
-		cmp, ok := fastCompareDatum(&av, &bv)
-		if !ok && i < len(o.keyText) && o.keyText[i] && av.Kind == KindString && bv.Kind == KindString {
-			cmp, ok = strings.Compare(av.StringValue(), bv.StringValue()), true
-		}
-		if !ok {
-			var err error
-			if cmp, err = compareDatumTyped(av, bv, k.Expr.Pos(), k.Expr); err != nil {
-				if o.sortErr == nil {
-					o.sortErr = err
+		// (M0122-0012 slice 59).
+		var cmp int
+		if pa.Kind == KindString && pb.Kind == KindString && i < len(o.keyText) && o.keyText[i] {
+			cmp = strings.Compare(datumStringInPlace(pa), datumStringInPlace(pb))
+		} else {
+			var ok bool
+			if cmp, ok = fastCompareDatum(pa, pb); !ok {
+				var err error
+				k := &o.keys[i]
+				if cmp, err = compareDatumTyped(*pa, *pb, k.Expr.Pos(), k.Expr); err != nil {
+					if o.sortErr == nil {
+						o.sortErr = err
+					}
+					return false
 				}
-				return false
 			}
 		}
 		if cmp == 0 {
 			continue
 		}
-		if k.Desc {
+		if o.keys[i].Desc {
 			return cmp > 0
 		}
 		return cmp < 0
