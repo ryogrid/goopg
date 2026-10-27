@@ -2058,6 +2058,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       miss counter stays 0\.
     - **Target \(C32, first slice\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
       runs × 2, fresh A/B against the then\-HEAD\)\. Bar: −3 %\.
+    - **C32 SLICE 1 LANDED \(loop \#213\)**: `probe\_defer\.go` — the first pass decodes up to the last probe key
+      \(skipping earlier non\-key read columns\), the join finishes matched/emitted rows \(resume at the saved offset, or
+      from column 0 when early columns were skipped\), through a narrowing Project; self\-disarm after 4096 deferred
+      rows when ≥ half were finished\. Q17 27\.28–27\.31 → 24\.96 Ginstr/q \(**−8\.6 %, meets the bar**\); TPC\-DS Q8
+      −32\.9 %, Q26 −21\.0 %, Q7 −17\.7 %, Q59 \+0\.3 %\. The first \(skip\-table, full re\-decode\) form regressed Q59
+      \+13\.9 % and was reworked before landing\. Misses 0\. Design: `0122\-0012\-c32\-lazy\-probe\-deform\.md` §Landed\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5672,6 +5678,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ad/`: TPC\-H 22/22, TPC\-DS SF0\.25
     99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#213\) — **exhausted at `2349ef9b0`**, census `routing\-20261027ad/` reused:
+    `2349ef9b0` is docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

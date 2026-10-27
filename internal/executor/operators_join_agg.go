@@ -362,6 +362,9 @@ type joinOp struct {
 	// arrived after the sweep was claimed (parallel_hash_shared.go,
 	// M0146-0005dj).
 	parallelFill      *parallelHashBuild
+	// probeFinish completes a probe row whose non-key columns the probe scan
+	// deferred (M0122-0012 C32, armProbeDefer); nil when not armed.
+	probeFinish func() error
 	parallelProbing   bool
 	parallelSkipProbe bool
 	parallelSweeps    bool
@@ -769,6 +772,7 @@ func (o *joinOp) adoptProbeSide(probeIsLeft bool) error {
 	if o.batches != nil {
 		o.batches.nbatchOutstart = o.batches.nbatch
 	}
+	o.armProbeDefer()
 	return nil
 }
 
@@ -821,6 +825,7 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 	if o.batches != nil {
 		o.batches.nbatchOutstart = o.batches.nbatch
 	}
+	o.armProbeDefer()
 	return nil
 }
 
@@ -1879,6 +1884,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := o.finishProbe(); err != nil {
+				return nil, err
+			}
 			o.lazyProbeSrc = nil
 			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
@@ -2098,6 +2106,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				// would be a wasted map probe on the majority of rows while
 				// batch 0 is being probed.
 				if bs := o.batches; bs != nil && bs.nbatch > 1 {
+					if err := o.finishProbe(); err != nil {
+						return nil, err
+					}
 					routed, rerr := bs.routeProbeRow(joinBatchHash(kd), slotRow(probeSlot))
 					if rerr != nil {
 						return nil, rerr
@@ -2122,6 +2133,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P3.2: `key` IS the canonical form joinBatchHash hashes,
 			// so the string lane routes without re-deriving anything.
 			if bs := o.batches; ok && bs != nil && bs.nbatch > 1 {
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				routed, rerr := bs.routeProbeRow(hashKeyString(key), slotRow(probeSlot))
 				if rerr != nil {
 					return nil, rerr
@@ -2170,6 +2184,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
+				// C32: the residual reads the probe row beyond its keys.
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				// Probe source already bound by bindProbe.
 				for _, m := range matches {
 					o.lazyBuildSlot.row = m
@@ -2194,6 +2212,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if anyMatch {
 				continue
 			}
+			// C32: the emitted row must be complete.
+			if err := o.finishProbe(); err != nil {
+				return nil, err
+			}
 			o.lazyProbeSrc = nil
 			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
@@ -2202,12 +2224,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				// The preserved side is the PROBE side: emit the row with
 				// the build side null-padded. The probe source is already
 				// bound; virtualOut composes the two in plan order.
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				o.lazyProbeSrc = nil
 				o.lazyBuildSlot.row = nullBuild
 				return o.lazyVirtualOut, nil
 			}
 			// No matches and nothing to preserve — skip this probe row.
+			// C32: the one exit that never finishes a deferred probe row —
+			// PG never fetches past the hash key for it either.
 			continue
+		}
+		// C32: the residual and the emitted row read the probe row beyond
+		// its keys (PG's HJ_SCAN_BUCKET).
+		if err := o.finishProbe(); err != nil {
+			return nil, err
 		}
 		o.lazyMatches = matches
 		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
