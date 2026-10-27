@@ -29,3 +29,53 @@ That is **−13.2 %**, which meets the bar.
 Gates: storage `-race` (checkptr on the unsafe view); units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with
 plans 99/99 same; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation PASS; checksum and
 amcheck port tests PASS.
+
+## Slice 103 — C21: the bitmap heap scan joins the scan borrow (Q17 −2.06 %, below the bar)
+
+Loop #199, 2026-10-27. Profile of TPC-H Q17 after slice 102:
+
+| share | site |
+|---|---|
+| 21.9 % | `decodeRowRangeInfo` |
+| 9.35 % | `NumericInt64FromStoredPayload` |
+| 8.1 % | `cloneRowOwned` |
+
+**C20, not attempted.** Its line profile puts the goopg-only legacy-text probe mostly in call overhead and in the
+payload's first touch, which the decode pays anyway. The prediction was about 1–2 %.
+
+**C21.** All of Q17's `cloneRowOwned` comes from `bitmapHeapScanOp.emitRow`. Q17's SubPlan is Aggregate(avg) over
+a Bitmap Heap Scan on lineitem, and the scan cloned every fetched row although `aggregateBorrowsScanRows` already
+proves the aggregate keeps nothing. `markScanBorrowChain` handed the borrow only to seq scans. PG's bitmap heap
+scan stores a buffer tuple in the slot (`ExecStoreBufferHeapTuple`).
+
+**Change.**
+
+- `markScanBorrowChain` sets `bitmapHeapScanOp.borrowRows`.
+- `emitRow` then yields `scanRow` itself unless the plan emits extra ctid columns.
+
+The contract is the seq scan's:
+
+- the reused row is consumed before the next `Next()`;
+- arena-backed values live until the per-page arena resets, which happens inside a later `Next()`.
+
+**Measured.**
+
+| run | before (slice 102) | after |
+|---|---|---|
+| 1 | 27.860 G | 27.299 G |
+| 2 | 27.877 G | 27.289 G |
+
+That is **−2.06 %**, which misses the 3 % bar. The profile share was mostly allocation and GC cycles, which
+instructions:u does not count.
+
+The change is landed as plan-neutral and recorded on the Below-bar list. The miss counter is 1.
+
+Gates: units; spotcheck; acceptance 24 MATCH (Q17 MATCH); sf025 PASS=99 with plans 99/99 same; TPC-H census
+22/22; RegressSuite = baseline (plpgsql flap); isolation PASS.
+
+Test: `TestBitmapHeapScanBorrowMatchesClone`. Over a 6000-row multi-page table, planned with seq and index scans
+off:
+
+- plain and grouped aggregates (count/sum/avg plus text min/max) give identical results with the borrow on and
+  off;
+- the borrow is asserted armed.

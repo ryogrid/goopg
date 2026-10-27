@@ -300,6 +300,11 @@ func (o *bitmapIndexScanOp) lookupKeys(firstCol *catalog.Column) (lo, hi []byte,
 // ---------------------------------------------------------------------------
 
 type bitmapHeapScanOp struct {
+	// borrowRows is set at Build when every operator up to a borrowing root
+	// consumes each row before the next Next() and keeps nothing of it
+	// (markScanBorrowChain): emitRow then yields scanRow instead of a clone
+	// (M0122-0012 C21).
+	borrowRows bool
 	// colInfo is the per-column decode memo; see Open.
 	colInfo []colTypeInfo
 	plan *optimizer.BitmapHeapScan
@@ -921,7 +926,18 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 //     drainAndStamp's ms.hasCTID fallback for shapes the column path
 //     cannot cover (self-joins skip injection).
 func (o *bitmapHeapScanOp) emitRow(block storage.BlockNumber, offset uint16) TupleSlot {
-	row := cloneRowOwned(o.scanRow)
+	// A parent that consumes each row before its next Next() and keeps
+	// nothing of it (borrowRows, markScanBorrowChain) takes scanRow itself —
+	// PG stores the buffer tuple in the scan slot (ExecStoreBufferHeapTuple).
+	// The row slice is reused and its arena-backed values live until the
+	// arena resets at the next page, both inside a later Next(). A scan that
+	// also emits ctid columns builds a longer row and keeps the clone.
+	var row Row
+	if o.borrowRows && len(o.plan.Output()) == len(o.scanRow) {
+		row = o.scanRow
+	} else {
+		row = cloneRowOwned(o.scanRow)
+	}
 	for i := len(o.cols); i < len(o.plan.Output()); i++ {
 		row = append(row, NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)))
 	}

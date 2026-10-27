@@ -128,6 +128,14 @@ func markScanBorrowChain(op Operator) {
 		case *seqScanOp:
 			o.borrowRows = true
 			return
+		case *bitmapHeapScanOp:
+			// Same contract as the seq scan: a reused scanRow whose
+			// arena-backed values live until the per-page arena resets in
+			// a later Next(). TPC-H Q17's SubPlan, Aggregate(avg) over a
+			// Bitmap Heap Scan on lineitem, cloned every fetched row
+			// (M0122-0012 C21).
+			o.borrowRows = true
+			return
 		case *projectOp:
 			op = o.child
 		case *joinOp:

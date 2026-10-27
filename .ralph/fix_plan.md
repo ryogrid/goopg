@@ -1771,6 +1771,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       instructions −2\.96 %, `pathkeys\_useful\.go` truncMemo vs PG build\_join\_pathkeys\)\.
     - Dropped: C16h merge candidates priced before their Sort paths are built \(`tryMergeJoinPath` vs PG
       try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
+    - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
+      `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
     - Yield 2026\-10\-27 \(loop \#194\): C16g −2\.96 % \(slice 99, landed\) and C16h −0\.5 % \(dropped\) both missed the
       bar on Q64 planning; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
@@ -1800,6 +1802,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       portable form kept as fallback \+ oracle\. Q17 32\.104/32\.082 → 27\.848/27\.862 Ginstr/q \(**−13\.2 %, meets
       the bar**\); micro 1058 vs 2473 ns/page; stored checksums unchanged\. Misses 0\. Next on return: re\-profile
       Q17 \(decodeRowRangeInfo 23 %, NumericInt64FromStoredPayload 9 %\) or Q18\. Design: part 10 §102\.
+    - C20 \(added 2026\-10\-27 loop \#199, G3 on Q17/Q18 after C19\): `NumericInt64FromStoredPayload` 9\.35 % of Q17,
+      7\.3 % of Q18 \(lineitem's NUMERIC columns, HammerDB\); a third of it is the goopg\-only legacy\-text probe
+      \(`numericPayloadIsLegacyText`\), the rest 128\-bit accumulation for 1–2 base\-10000 digits\.
+    - **Target \(C20, loop \#199\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Mechanism: a short\-form NumericData fast path — reject the legacy\-text probe from the header bytes
+      \(byte 1 carries NUMERIC\_SHORT's 0x80; byte 0 ASCII non\-space\), accumulate ≤ 4 digits in uint64\. Bar: −3 %\.
+      - Not attempted: the line profile puts most of the legacy\-text probe in call overhead \+ the payload's first
+        touch \(paid by the decode anyway\); predicted ≈1–2 %, below the bar\. Superseded by C21\.
+    - C21 \(added loop \#199\): Q17's SubPlan, Aggregate\(avg\) → Bitmap Heap Scan on lineitem, clones every fetched
+      row \(`bitmapHeapScanOp\.emitRow` → `cloneRowOwned`, 8\.1 % of Q17 \+ its GC\) though the aggregate
+      provably keeps nothing \(aggregateBorrowsScanRows\): `markScanBorrowChain` hands the borrow only to seq scans\.
+      PG's bitmap heap scan stores a buffer tuple in the slot \(ExecStoreBufferHeapTuple\)\.
+    - **Target \(C21, loop \#199\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Bar: −3 %\.
+    - **C21 LANDED BELOW THE BAR \(slice 103\)**: `markScanBorrowChain` hands the borrow to `bitmapHeapScanOp`;
+      `emitRow` yields scanRow when no ctid column is emitted\. Q17 27\.860/27\.877 → 27\.299/27\.289 Ginstr/q =
+      **−2\.06 %, misses the 3 % bar** \(the 8 % profile share was mostly allocation/GC cycles, which instructions do
+      not count\); values and plans identical; Below\-bar list updated\. **Miss counter 1\.** Design: part 10 §103\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
