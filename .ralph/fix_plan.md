@@ -1958,6 +1958,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       **Misses reset to 0\.** Next on return: Q67's remaining excess \(Sort datum1, the no\-hash rollup after the
       equality proof\) or a fresh G1 census \(census\-20261027 expires 2026\-10\-30; Q67 has fallen from 24\.77 to
       18\.22 Ginstr/q\)\. Design: part 10 §107\.
+  - **Return 2026\-10\-27 \(loop \#207\)**: S9 exhausted at `83bfa2945` \(census aa\)\. G3 by instructions:u at HEAD:
+    Q23 map work in aggregateOp\.Open 5\.2 % \(drain lookup 2\.3 %, emit re\-lookup `groups\[key\]` 1\.8 %; ≤ 3 % even with
+    PG\-style table pre\-sizing — the plan carries no numGroups\), allocation spread thin; Q72 ~70 % B\-tree probing
+    \(`tmp/g3\-207/q72i\.data`\)\. A release\-PG instruction baseline for Q72 was attempted and denied by the permission
+    classifier \(starting bench/pg\-release\) — not retried\.
+    - C28 \(G3 on Q72\): both binary\-search sites — `findChildBlockDirect` \(internal pages\) and `leafScanStart` \(leaf,
+      non\-posting\) — run every probed tuple through `parseNoCopy` → `parseItemBody`, which validates, extracts the
+      downlink/body and builds an `item`, though in the tuple format the compared key is `raw` itself\. PG's
+      \_bt\_binsrch → \_bt\_compare reads the tuple in place\. Mechanism: compare `raw` directly, keeping only
+      parseItemBody's rejection checks \(length, t\_info size, posting / short heap\-TID pivot\)\. Under
+      findChildBlockDirect the parse layer is ~3\.3 % of Q72 \(parseItemBody 2\.3 %, parseAliasing 1\.0 %\)\. Predicted
+      ~3 %\.
+      - Noted, not taken: the leaf probe of a POSTING tuple calls parsePostingRaw, which allocates the TID array and
+        a key copy per probe \(Q72's probed indexes are unique, so it does not show there\)\.
+    - **Target \(C28\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `83bfa2945`\)\. Bar: −3 %\.
+    - **C28 LANDED \(slice 108\)**: `probeTupleOK` \(parseItemBody's rejections only\); findChildBlockDirect and
+      leafScanStart compare `raw` in place in the tuple format\. Q72 26\.166/26\.168 → 24\.351/24\.352 Ginstr/q
+      \(**−6\.9 %, meets the bar**\); Q72/Q14/Q23 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return:
+      the posting\-tuple leaf probe \(parsePostingRaw allocates per probe\) where an index has duplicates, or a fresh
+      G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10 §108\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5550,6 +5571,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 \(loop \#206\) — **exhausted at `acd4ff2d7`**, census `routing\-20261027z/` reused:
     `acd4ff2d7` is ralph/docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live
     for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#207\) — **exhausted at `83bfa2945`** \(M0122\-0012 slice 107 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027aa/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

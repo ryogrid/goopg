@@ -326,3 +326,52 @@ A temporary probe counted 11 588 cache hits in it.
 
 - FILTER clauses are still evaluated once per set; PG evaluates them once per transition too.
 - Text and other non-inline arguments are still evaluated once per set.
+
+## Slice 108 — C28: B-tree binary-search probes compare the tuple in place (Q72 −6.9 % instructions)
+
+Loop #207. Census aa (`83bfa2945`) is exhausted. A G3 by instructions:u at HEAD found:
+
+- Q23's map work in `aggregateOp.Open` is 5.2 %: the drain lookup 2.3 % and the emit loop's `groups[key]`
+  re-lookup 1.8 %. That stays at or below 3 % even with PG-style table pre-sizing, because the plan carries no
+  numGroups estimate.
+- Q72 is ~70 % B-tree probing.
+
+A release-PG instruction baseline for Q72 needed the private `bench/pg-release` cluster started; the permission
+classifier denied that, and it was not retried.
+
+**Symptom.** Both binary-search sites send every probed tuple through `parseNoCopy` → `parseAliasing` →
+`parseItemBody`:
+
+- `findChildBlockDirect` (internal pages);
+- `leafScanStart` (leaf pages, non-posting tuples).
+
+`parseItemBody` validates the tuple, extracts the downlink TID and the body slice, and builds an `item`. In the
+tuple format, however, `parseAliasing` returns `key: raw`: the compared key is the probed bytes themselves.
+Under `findChildBlockDirect` that parse layer was ~3.3 % of Q72 (`parseItemBody` 2.3 %, `parseAliasing` 1.0 %),
+before counting its inlined part.
+
+**PG.** `_bt_binsrch` hands `_bt_compare` the line pointer's tuple in place (nbtsearch.c).
+
+**Change** (`btree.go`):
+
+- `probeTupleOK` holds exactly `parseItemBody`'s rejection conditions: too short, a `t_info` size that disagrees
+  with the length, a posting tuple, a heap-TID pivot too short for its TID.
+- In the tuple format both probes compare `raw` directly after that check.
+- The blob format keeps `parseNoCopy`, because its key is the body after the header.
+- The final downlink of `findChildBlockDirect` is still parsed and validated as before.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `83bfa2945`): Q72 26.166 / 26.168 →
+24.351 / 24.352 Ginstr/q, **−6.9 %**, which meets the 3 % bar (predicted ~3 %; the leaf site and the inlined
+parse were not in the estimate). The outputs of Q72, Q14 and Q23 are byte-identical.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 (total −3.0 %) with plans 99/99 same; fire-set PASS
+(no fires); RegressSuite counts equal to the slice-107 run except the plpgsql flapper, with `create_index` and
+`indexing` byte-identical.
+
+Test: `TestProbeTupleOKMatchesParseItemBody` runs 200 000 random tuples biased to reach every branch (short,
+size mismatch, plain, posting, pivot with and without room for its TID). `probeTupleOK` must accept exactly what
+`parseItemBody` accepts.
+
+**Left (ledgered).** The leaf probe of a POSTING tuple calls `parsePostingRaw`. That allocates the TID array and
+a restamped key copy on every probe, only to compare and discard them. PG's `_bt_compare` reads a posting tuple's
+key attributes in place, with the first heap TID as the tiebreak.

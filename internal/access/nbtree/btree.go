@@ -499,6 +499,26 @@ func downlinkItem(key []byte, child storage.BlockNumber) item {
 //
 // A POSTING tuple still errors out: it has its own decoder in posting.go, and
 // its t_tid halves mean a third thing again (TID count and array offset).
+// probeTupleOK reports whether parseItemBody would accept raw. A binary-search
+// probe in the tuple format compares raw itself — parseAliasing's key IS raw —
+// so it needs only parseItemBody's rejections, not the downlink, body slice and
+// item it builds (M0122-0012 C28): PG's _bt_binsrch hands the line pointer's
+// tuple to _bt_compare in place. Keep the conditions in step with
+// parseItemBody's error returns.
+func probeTupleOK(raw []byte) bool {
+	if len(raw) < SizeOfIndexTupleData || PGIndexTupleSize(raw) != len(raw) {
+		return false
+	}
+	if !PGIndexTupleIsAltTID(raw) {
+		return true
+	}
+	if BTreeTupleIsPosting(raw) {
+		return false
+	}
+	return PGIndexTupleTID(raw).Offset&BTPivotHeapTIDAttr == 0 ||
+		len(raw)-SizeOfIndexTupleData >= SizeOfItemPointerData
+}
+
 func parseItemBody(raw []byte) (storage.ItemPointer, []byte, bool, error) {
 	if len(raw) < SizeOfIndexTupleData {
 		return storage.ItemPointer{}, nil, false, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
@@ -2532,6 +2552,7 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey boo
 	if err != nil {
 		return 0, err
 	}
+	tuple := f.tupleKeys()
 	idx := sort.Search(searchN, func(i int) bool {
 		// C3-S1: dead items keep ordering bytes. NoCopy (M0146-0088): the
 		// page is latched for the whole call and the probe only compares.
@@ -2539,17 +2560,26 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey boo
 		if err != nil {
 			return true // will surface at the final error check
 		}
-		it, err := f.parseNoCopy(raw)
-		if err != nil {
-			return true
+		// C28: in the tuple format the probe compares raw in place.
+		k := raw
+		if tuple {
+			if !probeTupleOK(raw) {
+				return true
+			}
+		} else {
+			it, err := f.parseNoCopy(raw)
+			if err != nil {
+				return true
+			}
+			k = it.key
 		}
 		if nextKey {
 			// _bt_binsrch with nextkey: the first item past every key the
 			// bound names (compareHigh), so an exclusive bound descends to
 			// the END of its equal-prefix group, not its start.
-			return f.compareHigh(it.key, key) > 0
+			return f.compareHigh(k, key) > 0
 		}
-		return f.compare(it.key, key) > 0
+		return f.compare(k, key) > 0
 	})
 	// An empty key is minus infinity — the descent of a scan with no lower
 	// bound, as PG's _bt_endpoint descends to the leftmost leaf. Every item
@@ -4955,6 +4985,7 @@ func (bt *BTree) leafScanStart(p storage.Page, count int, lo []byte, loExclusive
 	if err != nil {
 		return 1
 	}
+	tuple := f.tupleKeys()
 	skip := func(s int) (skipped, ok bool) {
 		r, err := pp.rawAllowDead(uint16(s))
 		if err != nil {
@@ -4967,6 +4998,12 @@ func (bt *BTree) leafScanStart(p storage.Page, count int, lo []byte, loExclusive
 				return false, false
 			}
 			key = k
+		} else if tuple {
+			// C28: the tuple is its own key; compare it in place.
+			if !probeTupleOK(r) {
+				return false, false
+			}
+			key = r
 		} else {
 			it, perr := f.parseNoCopy(r)
 			if perr != nil {
