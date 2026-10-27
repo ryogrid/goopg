@@ -7956,7 +7956,7 @@ Basis: the 2026-10-21 lever census and its review
   - Run the three-corpus census with `PGOPTIONS='-c goopg.enable_nestloop_index=off'` (M0147-0017 finding: the pass
     did not fire on a forced fixture) and count the join trees the PG-shaped search did not build (the M0147-0014
     post-search assignment's only customers); file promote-or-delete children.
-- [!] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
+- [ ] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
   Kind: impl
   Parent: M0147-0050
   - Filed by M0147\-0050: the pass rewrites no corpus join and changes no regress verdict; PG has no such pass \(its
@@ -7971,6 +7971,9 @@ Basis: the 2026-10-21 lever census and its review
     pass is what turns it into the `Nested Loop Left Join` over an index probe that PG 18\.3 elects for this fixture
     \(M0145\-0030\)\. Deleting the pass first would move such unsearched shapes AWAY from PG; the search must build them
     first \(M0147\-0052\), after which the pass has no customers and goes\. No code changed by the trial\.
+  - **Unblocked 2026\-10\-27** by M0147\-0053 \(`54223610d`\): the witness now plans through the search, and its plan
+    is PG 18\.3's\. Re\-run the trial \(disable the call, units gate\) before deleting; any other test that still needs
+    the pass names the next unsearched class\.
 - [x] **M0147-0052 — recon: why regress joins bypass the PG\-shaped search \(the post\-search `jn\.Algo` population\)**
   Kind: recon
   Parent: M0147-0050
