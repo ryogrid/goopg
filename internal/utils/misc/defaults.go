@@ -1281,19 +1281,13 @@ func BuildDefaultRegistry() *Registry {
 		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
 		"enable_nestloop", "enable_sort", "enable_hashagg",
 		"enable_material", "enable_partition_pruning",
-		// M0054-0006: nested-loop index join rollback switch.
-		// `off` keeps the legacy Hash plan for joins that the
-		// rule would otherwise rewrite. goopg-only, so it is
-		// spelled in the "goopg." namespace (M0122-0008).
-		GoopgEnableNestLoopIndex,
 		// Additional planner method toggles present in catalog pg_settings
 		// but missing from the registry — needed so SET succeeds. M0097-0069.
 		"enable_partitionwise_join", "enable_partitionwise_aggregate",
 		"enable_parallel_hash", "enable_parallel_append",
 		"enable_gathermerge", "enable_incremental_sort",
-		// enable_memoize is no longer a no-op: like goopg.enable_nestloop_index
-		// above, cmd/goopg/main.go bridges its OnChange to the planner's
-		// process-global kill-switch (S7).
+		// enable_memoize reaches the planner per statement through
+		// PlannerSettings.EnableMemoize (take2 P2-02c).
 		"enable_async_append", "enable_memoize",
 		"enable_presorted_aggregate", "enable_distinct_reordering",
 		"enable_group_by_reordering", "enable_self_join_elimination",
@@ -1304,8 +1298,7 @@ func BuildDefaultRegistry() *Registry {
 			Context: ContextUserset,
 			Scope:   ScopeSession | ScopeTransaction,
 			// All upstream enable_* planner-method GUCs are GUC_EXPLAIN
-			// (guc_tables.c); goopg's own goopg.enable_nestloop_index
-			// follows the same convention since it too gates a plan shape.
+			// (guc_tables.c).
 			Flags: FlagExplain,
 		}))
 	}

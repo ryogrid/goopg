@@ -236,7 +236,6 @@
 #enable_group_by_reordering = on
 #enable_self_join_elimination = on
 #enable_tidscan = on
-#goopg.enable_nestloop_index = on       # goopg-specific: index nested-loop join
 #goopg.enable_opportunistic_prune = on  # goopg-specific: inline HOT page-prune
 #parallel_leader_participation = on
 

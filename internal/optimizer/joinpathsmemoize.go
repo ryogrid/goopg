@@ -12,13 +12,13 @@ package optimizer
 //
 // # Why this is a PATH and not an attachment
 //
-// goopg already had a Memoize insertion rule — `maybeAttachMemoize`
-// (memoize.go) — and it runs on a BUILT `*NestedLoopIndexJoin`, after
-// `rewriteJoinsToNLI` has chosen the method. That is exactly what it can be for
-// the legacy enumerator, whose join method is decided by rules rather than by a
-// cost comparison. It is exactly what it must NOT be for the searched arm:
-// `walkRewriteNLI` skips a searched subtree (nl_index_join.go:110), so a
-// searched NLI never reached it at all, and bolting it on at `createPlan` time
+// goopg had a Memoize insertion rule — `maybeAttachMemoize` — that ran on a
+// BUILT `*NestedLoopIndexJoin` after the legacy NLI post-pass had chosen the
+// method (both deleted at M0147-0051). That suited an enumerator whose join
+// method was decided by rules rather than by a cost comparison. It is exactly
+// what it must NOT be for the searched arm: the post-pass skipped a searched
+// subtree, so a searched NLI never reached it at all, and bolting it on at
+// `createPlan` time
 // would make the executed plan cheaper than the plan the search costed — the
 // costed-≠-executed class this architecture exists to kill (06 §2.1). A cache
 // that only ever makes an NLI faster still changes which METHOD wins: the whole
@@ -234,9 +234,8 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 //     (`addParameterizedIndexPaths` declines a wrapped leaf, P5.5-e-ii-b).
 //  8. `paraminfo_get_equal_hashops` (:802): every key must be hashable. goopg's
 //     memoize cache keys on `Datum` values through `kvcache`, and the shape it
-//     can key on is the bare outer column — which is the same test
-//     `maybeAttachMemoize` applies (memoize.go:106-110), deliberately, so the
-//     legacy and searched arms cannot disagree about what is cacheable.
+//     can key on is the bare outer column (the test the deleted legacy
+//     `maybeAttachMemoize` also applied, M0147-0051).
 //
 // PG's `binary_mode` has no goopg counterpart: `kvcache` compares Datums by
 // their encoded form, which is the binary comparison PG switches into, so goopg

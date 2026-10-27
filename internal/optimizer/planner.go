@@ -2176,13 +2176,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
 	node = rewriteScanInputsWithSingleTablePredicates(node, cat, plannerSet)
-	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
-	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
-	// the equi-join predicate matches a single-column B-tree index
-	// on the inner side AND the cost gate accepts. The pass is a
-	// no-op when the statement's goopg.enable_nestloop_index is off
-	// (`PlannerSettings.EnableNestLoopIndex`).
-	node = rewriteJoinsToNLI(node, cat, plannerSet)
+	// (M0054-0006's nested-loop-index post-pass, rewriteJoinsToNLI, ran
+	// here until M0147-0051 deleted it: PG has no such pass, and once
+	// M0147-0053 let the search build its last customer it rewrote no join.)
 	// R77: price the rewrite-built SEMI/ANTI NLIs BEFORE the upper
 	// elections (aggregate stage, ORDER BY arm) read their seeds —
 	// otherwise the elections stamp winners priced on the seam base

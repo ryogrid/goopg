@@ -382,11 +382,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// take2 P2-02c: goopg.enable_nestloop_index no longer bridges to a process
-	// global either. All six planner-method bridges are gone; each of them let
-	// the most-recent SET win process-wide, steering every other session's
-	// plans. (Its process-wide seed, optimizer.SetNLIEnabled, and the
-	// GOOPG_DISABLE_NLI env switch that set it were retired by M0147-0017.)
+	// take2 P2-02c: none of the six planner-method GUCs bridges to a process
+	// global; each of them used to let the most-recent SET win process-wide,
+	// steering every other session's plans. (goopg.enable_nestloop_index, the
+	// last of them, was retired with the legacy NLI post-pass at M0147-0051.)
 	// `enable_memoize` NO LONGER bridges to a process global (take2 P2-02c).
 	// It did, and that made `SET enable_memoize = off` in one session disable
 	// Memoize for every other session on the server — the most-recent SET won

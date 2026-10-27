@@ -136,7 +136,7 @@ flowchart TD
     B --> C[pprof on 127.0.0.1:6060 / GOOPG_PPROF_ADDR]
     C --> D[signal.NotifyContext SIGINT/SIGTERM]
     D --> E[BuildDefaultRegistry]
-    E --> F[OnChange bridges: enable_nestloop_index / enable_memoize / enable_presorted_aggregate / enable_hashagg]
+    E --> F[OnChange bridges: none for planner-method GUCs since take2 P2-02c]
     F --> G{"confPath != """}
     G -- yes --> H[ParseConfigFile + ApplyConfigEntries]
     G -- no --> I

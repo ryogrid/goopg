@@ -136,7 +136,6 @@ func TestPlannerCacheFingerprintCoversEveryField(t *testing.T) {
 		},
 		func(ps *optimizer.PlannerSettings) { ps.Geqo = !ps.Geqo },
 		func(ps *optimizer.PlannerSettings) { ps.GeqoThreshold++ },
-		func(ps *optimizer.PlannerSettings) { ps.EnableNestLoopIndex = !ps.EnableNestLoopIndex },
 		func(ps *optimizer.PlannerSettings) { ps.GeqoEffort++ },
 		func(ps *optimizer.PlannerSettings) { ps.GeqoPoolSize++ },
 		func(ps *optimizer.PlannerSettings) { ps.GeqoGenerations++ },

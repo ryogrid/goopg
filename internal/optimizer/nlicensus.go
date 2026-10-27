@@ -49,7 +49,7 @@ var nliCensusEnabled = os.Getenv("GOOPG_NLI_CENSUS") == "1"
 // NLI construction routes, as they appear in the census lines.
 const (
 	nliRouteSearch  = "search"  // elected as a path, built by createplannl.go
-	nliRouteRewrite = "rewrite" // built by rewriteJoinsToNLI's node walk
+	nliRouteRewrite = "rewrite" // built by the legacy post-pass, deleted at M0147-0051; no longer produced
 )
 
 // noteNLIBuilt records one built `*NestedLoopIndexJoin`. Call it at the

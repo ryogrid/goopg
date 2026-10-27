@@ -33,42 +33,6 @@ func TestNLIRuleSkipsWhenInnerHasNoIndex(t *testing.T) {
 	}
 }
 
-// TestNLIRuleRespectsKillSwitch confirms that
-// `PlannerSettings.EnableNestLoopIndex = false` — the per-statement input
-// `goopg.enable_nestloop_index` feeds (take2 P2-02c) — short-circuits the
-// rewrite. Until M0147-0017 it flipped the process-wide SetNLIEnabled seed,
-// which only the retired GOOPG_DISABLE_NLI env switch set in production.
-func TestNLIRuleRespectsKillSwitch(t *testing.T) {
-	cat := catalog.NewInMemory()
-	parts, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateIndex(parser.ObjectName{Name: "part_pk"}, parts,
-		[]string{"p_partkey"}, true, "btree", true); err != nil {
-		t.Fatal(err)
-	}
-	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
-		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stmt := parseOne(t, `SELECT * FROM lineitem, part WHERE l_partkey = p_partkey`)
-
-	ps := DefaultPlannerSettings()
-	ps.EnableNestLoopIndex = false
-	node, err := PlanWithSettings(stmt, cat, ps)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if findNLI(node) {
-		t.Fatalf("kill-switch off: did not expect NLI; tree: %s", describePlanTree(node))
-	}
-}
-
 // TestNLIRuleSkipsCompositeIndexWithPartialKey
 // (M0054-0006-followup-Q9-composite) asserts the regression
 // guard: when only the leading column of a composite index has

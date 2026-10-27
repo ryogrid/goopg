@@ -77,14 +77,6 @@ func onOff(on bool) string {
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
 	"GOOPG_EXISTS_TO_ANY": func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	// A mode, not a boolean: the artefact carries the word an operator would
-	// export to reproduce the arm.
-	"GOOPG_NLI_COSTGATE": func(v string) string {
-		if nliCostGateLegacyFromEnv(v) {
-			return "legacy"
-		}
-		return "current"
-	},
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -105,6 +97,7 @@ var flagProvenanceOrder = []string{
 	"GOOPG_UNNEST_PREDP",
 	// Retired at M0147-0049 — see flagProvenanceRetired.
 	"GOOPG_INDEXKEY_HARVEST",
+	// Retired at M0147-0051 — see flagProvenanceRetired.
 	"GOOPG_NLI_COSTGATE",
 	// Retired at M0147-0014 — see flagProvenanceRetired.
 	"GOOPG_HASH_OUTER_JOIN",
@@ -373,6 +366,11 @@ var flagProvenanceRetired = map[string]string{
 	// `off` arm's TPC-H/TPC-DS plans were byte-identical at retirement — so
 	// nothing reads the variable.
 	"GOOPG_INDEXKEY_HARVEST": "M0147-0049",
+	// D6.3a's escape hatch for the legacy NLI post-pass's semi/anti cost gate
+	// (`legacy` restored the stats-blind heuristic). M0147-0051 deleted the
+	// post-pass, so nothing reads the variable. `legacy` in an older artefact
+	// is that gate's old arm.
+	"GOOPG_NLI_COSTGATE": "M0147-0051",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

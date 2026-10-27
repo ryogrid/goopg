@@ -696,7 +696,7 @@ func (c *Cluster) Query(ctx context.Context, sqlText string) ([][]string, error)
 }
 
 // QueryWithOptions is Query on a connection whose startup packet carries
-// `options` (PGOPTIONS syntax, e.g. "-c goopg.enable_nestloop_index=off"), so a
+// `options` (PGOPTIONS syntax, e.g. "-c enable_hashjoin=off"), so a
 // session GUC applies to the statement even though every call opens a fresh
 // connection. The server runs in a separate process, so this — not a planner
 // package setter in the test process — is how a test reaches its settings.

@@ -21,8 +21,7 @@ import (
 //     count-bug and NULL rows are exactly where the transformed and
 //     untransformed plans can silently diverge.
 //
-// Unlike `enable_nestloop_index` this has no GUC yet; see
-// SetSubqueryUnnestEnabled.
+// It has no GUC; see SetSubqueryUnnestEnabled.
 var subqueryUnnestOn atomic.Bool
 
 func init() {

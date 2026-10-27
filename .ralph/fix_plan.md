@@ -5051,6 +5051,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `5a9b2fb84`** \(M0147\-0049 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b7d73466c`** \(M0147\-0053 `54223610d` changed internal/optimizer \+
+    executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
+    every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7956,9 +7959,21 @@ Basis: the 2026-10-21 lever census and its review
   - Run the three-corpus census with `PGOPTIONS='-c goopg.enable_nestloop_index=off'` (M0147-0017 finding: the pass
     did not fire on a forced fixture) and count the join trees the PG-shaped search did not build (the M0147-0014
     post-search assignment's only customers); file promote-or-delete children.
-- [ ] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
+- [x] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
   Kind: impl
   Parent: M0147-0050
+  Movement: none — parity held: the pass was corpus\-inert \(M0147\-0050\) and customer\-free after M0147\-0053 \(census 22/22·99/99·99/99, regress outputs unchanged bar the plpgsql flapper\)
+  - Done 2026\-10\-27\. Second trial \(call disabled\): units gate green\. Deleted the call, `rewriteJoinsToNLI`,
+    `walkRewriteNLI`, `tryBuildNLI` and the 22 helpers only it reached \(deadcode fixed point\), `memoize\.go`
+    \(`maybeAttachMemoize`\), the `GOOPG\_NLI\_COSTGATE` escape hatch, `PlannerSettings\.EnableNestLoopIndex` with its
+    readBool/fingerprint bit, and the `goopg\.enable\_nestloop\_index` GUC \(now an unrecognised parameter, as in
+    PG\)\. \~3400 lines removed\. Design doc `docs/design/0100\-0149/m0147\-0051\-delete\-legacy\-nli\-post\-pass\.md`\.
+  - Tests: six legacy\-only test files and the legacy tests in mixed files deleted; flag\-detector fixture →
+    `GOOPG\_EXISTS\_TO\_ANY`; misc GUC tests → `goopg\.enable\_opportunistic\_prune`\.
+  - Follow\-up noted in the design doc: `stampSemiProbePrices` and nlicensus's `rewrite` route are probably inert now\.
+  - Gates: units, postmaster package, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set
+    PASS \(fires=none both\), TPC\-H census on tree 22/22, RegressSuite PASS \(81 mismatches; only plpgsql moved,
+    1659→1655 diff lines\), Isolation PASS\.
   - Filed by M0147\-0050: the pass rewrites no corpus join and changes no regress verdict; PG has no such pass \(its
     parameterised index nested loop is an ordinary `match\_unsorted\_outer` path\)\.
   - First step: list the 20 regress rewrites \(probe recipe in `analysis/m0147/m0147\-0050/README\.md`\) and compare

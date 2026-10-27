@@ -1904,7 +1904,6 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
-	readBool(misc.GoopgEnableNestLoopIndex, &ps.EnableNestLoopIndex)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("geqo", &ps.Geqo)
@@ -2032,7 +2031,6 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(ps.EnablePresortedAggregate),
 		bit(ps.Geqo),
 		strconv.Itoa(ps.GeqoThreshold),
-		bit(ps.EnableNestLoopIndex),
 		strconv.Itoa(ps.GeqoEffort),
 		strconv.Itoa(ps.GeqoPoolSize),
 		strconv.Itoa(ps.GeqoGenerations),

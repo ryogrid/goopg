@@ -443,9 +443,8 @@ func createNestLoopIndexJoinPlanFused(p *Path, innerPath *Path, memoPath *Path, 
 // `SingleRow` is decided here and not on the path because it is a property of
 // the INDEX the probe ended up using (`Index.Unique` with every index column
 // bound), which is a fact about the built node; the path-level decision was only
-// ever whether a cache pays. It is the same test `maybeAttachMemoize` applies
-// (memoize.go:134-136), shared in intent so the legacy and searched arms cannot
-// mark the same probe differently.
+// ever whether a cache pays. (The deleted legacy `maybeAttachMemoize` applied
+// the same test; M0147-0051.)
 func memoizeNodeFor(memoPath *Path, is Node, keys []Expr) *Memoize {
 	idx, _, _, _ := nliInnerProbe(is)
 	singleRow := idx != nil && idx.Unique && len(keys) == len(idx.Columns)

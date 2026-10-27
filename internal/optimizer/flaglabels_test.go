@@ -180,16 +180,16 @@ func TestFlagProvenanceTableCoversPlannerEnv(t *testing.T) {
 // through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT was
 // the flag that slipped through (read via envFloatDefault, later via
 // os.Getenv into indexProbeMultFromEnv) until M0146-0159 retired it.
-// GOOPG_NLI_COSTGATE has the same shape — os.Getenv handed to
-// nliCostGateLegacyFromEnv at package init — so its presence in the
-// detector's output is the regression test for the detector. flaglabels.go
-// is left out of the scan because it names every flag, live or retired, and
-// would satisfy the check on its own. (The fixture was GOOPG_INCREMENTAL_SORT
-// until M0147-0043 retired that read.)
+// GOOPG_EXISTS_TO_ANY has the same shape — os.Getenv handed to
+// existsToAnyFromEnv at package init — so its presence in the detector's
+// output is the regression test for the detector. flaglabels.go is left out
+// of the scan because it names every flag, live or retired, and would satisfy
+// the check on its own. (The fixture was GOOPG_INCREMENTAL_SORT until
+// M0147-0043, then GOOPG_NLI_COSTGATE until M0147-0051 retired each read.)
 func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
 	names := plannerEnvNamesExcept(t, "flaglabels.go")
-	if _, ok := names["GOOPG_NLI_COSTGATE"]; !ok {
-		t.Fatal("detector did not see GOOPG_NLI_COSTGATE; the helper-wrapped-read hole is back")
+	if _, ok := names["GOOPG_EXISTS_TO_ANY"]; !ok {
+		t.Fatal("detector did not see GOOPG_EXISTS_TO_ANY; the helper-wrapped-read hole is back")
 	}
 }
 
