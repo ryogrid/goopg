@@ -1,0 +1,14 @@
+    889 join-unsearched type=4 algo=0
+    101 join-unsearched type=1 algo=0
+     58 join-unsearched type=1 algo=1
+     55 join-unsearched type=3 algo=2
+     48 join-unsearched type=3 algo=0
+     39 join-unsearched type=0 algo=0
+     37 join-unsearched type=5 algo=1
+     36 join-unsearched type=0 algo=1
+     18 join-unsearched type=2 algo=0
+     13 join-unsearched type=6 algo=1
+     12 nli-built type=1
+     10 join-unsearched type=2 algo=2
+      8 nli-built type=0
+      2 join-unsearched type=6 algo=0

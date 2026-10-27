@@ -5048,6 +5048,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `b2665b45c`** \(M0147\-0047 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `5a9b2fb84`** \(M0147\-0049 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7941,9 +7944,31 @@ Basis: the 2026-10-21 lever census and its review
   - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
     both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(645 s\)\.
   - optimizer unnest.go:38; SetIndexKeyHarvestEnabled ×22; after M0147-0013 the harvest serves IN/EXISTS only — re-measure reachability and the 2026-09-05 not-plan-neutral note first. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
-- [ ] **M0147-0050 — recon: `goopg.enable_nestloop_index` / `rewriteJoinsToNLI` and the post-search `jn.Algo` assignment reachability**
+- [x] **M0147-0050 — recon: `goopg.enable_nestloop_index` / `rewriteJoinsToNLI` and the post-search `jn.Algo` assignment reachability**
   Kind: recon
   Parent: M0147-0000
+  Movement: none — recon
+  - Done 2026\-10\-27 \(`analysis/m0147/m0147\-0050/`\)\. GUC off: corpus EXPLAIN byte\-identical \(22/99/99\)\.
+    Probe: the post\-pass rewrites 0 corpus joins and 20 regress joins \(12 LEFT, 8 INNER\); disabling it keeps the
+    regress suite PASS with the same 81 mismatches \(differences are temp\-file names, known flappers and an
+    unordered catalog listing\)\. The post\-search `jn\.Algo` assignment's customers: 2 FULL joins per TPC\-DS
+    corpus \(MATCH PG\) and 1306 regress joins \(889 CROSS\)\. Children filed below\.
   - Run the three-corpus census with `PGOPTIONS='-c goopg.enable_nestloop_index=off'` (M0147-0017 finding: the pass
     did not fire on a forced fixture) and count the join trees the PG-shaped search did not build (the M0147-0014
     post-search assignment's only customers); file promote-or-delete children.
+- [ ] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
+  Kind: impl
+  Parent: M0147-0050
+  - Filed by M0147\-0050: the pass rewrites no corpus join and changes no regress verdict; PG has no such pass \(its
+    parameterised index nested loop is an ordinary `match\_unsorted\_outer` path\)\.
+  - First step: list the 20 regress rewrites \(probe recipe in `analysis/m0147/m0147\-0050/README\.md`\) and compare
+    each statement's EXPLAIN with PG 18\.3; delete the pass, `tryBuildNLI`'s legacy callers, `maybeAttachMemoize` if
+    left unreachable, and the goopg\-private GUC \(keep accepting `SET goopg\.enable\_nestloop\_index` only if a
+    client depends on it\)\.
+- [ ] **M0147-0052 — recon: why regress joins bypass the PG\-shaped search \(the post\-search `jn\.Algo` population\)**
+  Kind: recon
+  Parent: M0147-0050
+  - Filed by M0147\-0050: 1306 regress joins and 2 TPC\-DS FULL joins per scale reach `walkRewriteNLI` unsearched, so
+    `planFromItem`'s post\-search `jn\.Algo` assignment, not add\_paths\_to\_joinrel, picks their method\.
+  - First step: classify the 1306 by the reason the search declined them \(CROSS 889 first\); file a parity task per
+    class that PG plans through the search\.
