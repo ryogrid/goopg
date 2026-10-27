@@ -540,3 +540,49 @@ inputs are released, and an outer-only join takes the outer's map.
 - `truncateUselessPathkeys` per path (16 %).
 - `comparePathkeysDimRel`'s unmemoised `pathKeyEqual` (7 %). PG's `compare_pathkeys` is a pointer comparison over
   canonical pathkeys.
+
+## Slice 97 — C16e: add_path's pathkey comparison goes through the identity-key memo (Q64 planning −4.8 %)
+
+Loop #191, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Where the time went.** `comparePathkeysDimRel` is add_path's pathkey dimension. It compared each key pair with
+the package `pathKeyEqual` → `exprEqual`, which formats both expressions' identity keys (`exprIdentityKey`) on
+every call. That was 7.3 % of Q64's planning after slice 95. Every new path is compared with every retained path
+of its rel.
+
+PG's `compare_pathkeys` compares canonical pathkey pointers.
+
+The joinrel already carries the search's identity-key memo: `usefulKeys.pathKeyEqual`, which
+`truncateUselessPathkeys` uses for the same keys. It is nil-safe and falls back to the unmemoised form.
+
+**Change.** Both arms of `comparePathkeysDimRel` compare through `rel.usefulKeys.pathKeyEqual`:
+
+- the equivalence-class arm (`pathkeyClass` set);
+- the syntactic arm, when the rel has a usefulness but no class.
+
+A rel with neither keeps `comparePathkeysDim`. The verdicts are unchanged, because the memo caches the same
+identity key `exprEqual` computes.
+
+**Measured.**
+
+| run | before (slice 96) | after |
+|---|---|---|
+| 1 | 4.852 G | 4.626 G |
+| 2 | 4.854 G | 4.618 G |
+
+That is **−4.8 %**, which meets the 3 % bar. Over slices 93–97, Q64 planning is −28.8 % in instructions (6.49 →
+4.62 G).
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestComparePathkeysDimRelMemoMatchesUnmemoised`. Over seven key lists it checks every pair against the
+unmemoised comparison, and that separately built equal keys and class-equal keys compare equal.
+
+**Remaining on Q64** (slice 95 profile, before 96/97):
+
+- `truncateUselessPathkeys` per path (16 %);
+- `buildPathkeyUsefulness` on memo misses (7 %);
+- `mallocgc` across `addPathsForJointype` (23 %).

@@ -1764,6 +1764,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       → 4\.853/4\.858 Ginstr/plan \(**−6\.8 %, meets the bar**; −25\.2 % over 93–96\); plans identical\. Misses 0\.
       Next on return: truncateUselessPathkeys per path \(16 %\) or comparePathkeysDimRel's unmemoised pathKeyEqual
       \(7 %; PG compare\_pathkeys is a pointer compare\)\. Design: part 9 §Slice 96\.
+    - **C16e LANDED \(slice 97, loop \#191\)**: comparePathkeysDimRel compares keys through the rel's identity\-key
+      memo \(usefulKeys\.pathKeyEqual\) instead of re\-formatting both keys per comparison\. Q64 4\.852/4\.854 →
+      4\.626/4\.618 Ginstr/plan \(**−4\.8 %, meets the bar**; −28\.8 % over 93–97\); plans identical\. Misses 0\.
+      Next on return: re\-profile; truncateUselessPathkeys per path \(16 %\), buildPathkeyUsefulness misses \(7 %\)\.
+      Design: part 9 §Slice 97\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5247,6 +5252,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `c0d1f97ed`** \(M0122\-0012 slice 95 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `660e20d86`** \(M0122\-0012 slice 96 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
