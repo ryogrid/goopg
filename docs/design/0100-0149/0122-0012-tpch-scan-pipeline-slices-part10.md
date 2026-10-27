@@ -248,3 +248,29 @@ and numeric keys with NULLs, under every Desc / NullsFirst combination.
   cycles are mostly cache misses. PG keeps the first key inline in the SortTuple array (`datum1`).
 - Sort-key evaluation (8 %) re-trims the rollup's untrimmed char(n) group values.
 - The aggregate drain's per-set hash lookups (C24).
+
+## After slice 106 — C24 measured and dropped (2026-10-27)
+
+Loop #205 first took instructions:u profiles of DS Q14 and Q23, the two largest absolute excesses:
+
+- B-tree descents (`leafScanStart`, `findChildBlockDirect`, key compares) are ~20 % of each, the ground C18
+  already covered;
+- the rest is heap decode and buffer lookups;
+- prune-on-access already runs once per heap block, as in `heapam_index_fetch_tuple`.
+
+No new mechanism reached 3 %.
+
+**C24.** Q67's aggregate drain is 30.6 % of its instructions. The per-row, per-set `groups[string(gkBuf)]` lookup
+(operators_join_agg.go:2876) is 4.0 %, and the emit loop's `groups[key]` re-lookup another 1.5 %. The attempt
+compared each row's key for a set with the current group's key and went to the map only on a change, after PG's
+`agg_retrieve_direct`, which compares the row with the current group's first tuple (`execTuplesMatch`).
+
+**Measured.** Q67 went from 19.066 / 19.055 to 18.990 / 18.978 Ginstr/q, **−0.4 %**. The detail sets have
+nearly one group per input row (255 275 groups from 133 k rows), so almost every row changes group in them and
+still reaches the map. The change was dropped and added to the Below-bar list. The miss counter is 1.
+
+**The structural lever (ledgered).** A sorted rollup could keep no hash table at all: every key change founds a
+group, as in PG, and the output is emitted from a group list. That would also remove the map insert and the emit
+re-lookup, about 7 % together. It would, however, drop the reopen check that is goopg's only guard against a sort
+key and a group key that disagree on equality (bpchar trimming, numeric scale, collation). That agreement has to
+be proven first.

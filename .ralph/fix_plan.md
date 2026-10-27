@@ -1802,6 +1802,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
     - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
       `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
+    - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
+      vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -1921,6 +1923,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       the bar**\); Q38 −2\.7 %; Q67 output byte\-identical; plans 99/99 same\. Misses 0\. Discovery: P0\-E14 \(S2,
       filed\)\. Next on return: SortTuple `datum1` \(cycles\) or C24; or rotate G2 to Q14/Q23 \(Q67's excess has fallen
       from 1344 ms\)\. Design: part 10 §106\.
+  - **Return 2026\-10\-27 \(loop \#205\)**: instructions:u profiles of DS Q14 and Q23 at `8d794539a`
+    \(`tmp/g3\-205/q14i\.data`, `q23i\.data`\): B\-tree descents ~20 % \(C18 territory\), heap decode, buffer lookups;
+    prune\-on\-access already once per block; no new mechanism ≥ 3 %\. Q67 re\-profiled \(`q67i\.data`\): aggregate
+    drain 30\.6 %, of which `groups\[string\(gkBuf\)\]` \(operators\_join\_agg\.go:2876\) 4\.0 % and the emit loop's
+    `groups\[key\]` re\-lookup 1\.5 %\.
+    - **Target \(C24\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `8d794539a`\)\. Mechanism: in a sorted rollup \(closeOrderOK\), compare the row's group key
+      with the current group's key for that set and consult the hash table only when the group changes \(PG
+      agg\_retrieve\_direct compares the row with the group's first tuple, execTuplesMatch\)\. Predicted ~3\.5 %\. Bar:
+      −3 %\.
+    - **C24 MEASURED AND DROPPED \(loop \#205\)**: Q67 19\.066/19\.055 → 18\.990/18\.978 Ginstr/q = **−0\.4 %, misses the
+      bar**\. The shortcut rarely fires where the lookups are: the detail sets have nearly one group per input row
+      \(255 275 groups from 133 k rows\), so almost every row changes group in them and still goes to the map\. The
+      remaining lever is structural — no hash table at all for a sorted rollup \(every key change founds a group, as
+      in PG\), which also removes the map insert and the emit loop's `groups\[key\]` re\-lookup \(~7 % together\) but
+      drops the reopen check that guards against a sort/group\-equality mismatch; ledgered, not attempted\. Below\-bar
+      list updated\. **Miss counter 1\.**
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5506,6 +5525,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027y/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
     SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
     for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#205\) — **exhausted at `8d794539a`** \(M0122\-0012 slice 106 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027z/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note \(plus
+    P0\-E14\(owner\-placement\)\)\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
