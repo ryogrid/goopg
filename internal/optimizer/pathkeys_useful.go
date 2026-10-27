@@ -73,15 +73,17 @@ type pathkeyUsefulness struct {
 	// queryPathkeys' expressions, formed once per rel for usefulForMerging
 	// (M0122-0012 slice 78).
 	mergeMeta, queryMeta []listKeyMeta
-	// truncMemo memoises truncateUselessPathkeys' kept length per key list,
-	// bucketed by the list's backing array and length and verified against
-	// a copy of the list on every hit (M0122-0012 C16f).
-	truncMemo map[truncMemoKey]truncMemoEntry
+	// truncMemo memoises truncateUselessPathkeys' kept length per key list
+	// CONTENTS, bucketed by the list's first key and length and verified
+	// against a copy of the list on every hit (M0122-0012 C16f; keyed by
+	// contents since C16g, so a freshly built list — sort_inner_and_outer
+	// forms one per call — finds the answer an equal list left).
+	truncMemo map[truncMemoKey][]truncMemoEntry
 }
 
 type truncMemoKey struct {
-	data *PathKey
-	n    int
+	first PathKey
+	n     int
 }
 
 type truncMemoEntry struct {
@@ -331,19 +333,20 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	// same outer ordering is offered to a joinrel with every inner path and
 	// join method, and u is shared by every GEQO tour (usefulMemo), so the
 	// answer repeats; PG's build_join_pathkeys is cheap because canonical
-	// pathkeys compare by pointer. A hit must match the stored copy key by
+	// pathkeys compare by pointer. A hit must match a stored list key by
 	// key — PathKey compares Expr by pointer (every Expr is a pointer type) —
-	// so a reused backing array can never return another list's length, and
-	// the result always slices the caller's own list.
-	mk := truncMemoKey{data: unsafe.SliceData(keys), n: len(keys)}
-	if e, hit := u.truncMemo[mk]; hit && slices.Equal(e.keys, keys) {
-		return keepPathkeys(keys, e.kept)
+	// and the result always slices the caller's own list.
+	mk := truncMemoKey{first: keys[0], n: len(keys)}
+	for _, e := range u.truncMemo[mk] {
+		if slices.Equal(e.keys, keys) {
+			return keepPathkeys(keys, e.kept)
+		}
 	}
 	n := u.truncateUselessLen(keys)
 	if u.truncMemo == nil {
-		u.truncMemo = make(map[truncMemoKey]truncMemoEntry)
+		u.truncMemo = make(map[truncMemoKey][]truncMemoEntry)
 	}
-	u.truncMemo[mk] = truncMemoEntry{keys: slices.Clone(keys), kept: n}
+	u.truncMemo[mk] = append(u.truncMemo[mk], truncMemoEntry{keys: slices.Clone(keys), kept: n})
 	return keepPathkeys(keys, n)
 }
 

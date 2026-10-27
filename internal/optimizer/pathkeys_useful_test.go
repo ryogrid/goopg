@@ -121,10 +121,14 @@ func TestTruncateUselessPathkeysMemo(t *testing.T) {
 	if len(u.truncMemo) != 1 {
 		t.Fatalf("memo holds %d lists, want 1", len(u.truncMemo))
 	}
-	// An equal list in another array is its own entry, with the same answer.
+	// An equal list in another array hits the same entry (C16g: keyed by
+	// contents) and is answered from the caller's array.
 	other := append([]PathKey(nil), keys...)
 	if got := truncateUselessPathkeys(u, other); len(got) != 1 || &got[0] != &other[0] {
 		t.Fatalf("equal list elsewhere: got %d keys from the wrong array", len(got))
+	}
+	if n := len(u.truncMemo[truncMemoKey{first: keys[0], n: 2}]); n != 1 {
+		t.Fatalf("an equal list added a second entry: %d", n)
 	}
 	// The same array rewritten: b leads, which no merge can use.
 	keys[0], keys[1] = keys[1], keys[0]

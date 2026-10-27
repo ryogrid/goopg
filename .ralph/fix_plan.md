@@ -1734,6 +1734,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       conditional NULL write and the skip-arm conditional NULL store (+4.7%); pdqsort (Q87 +8%) and
       `SortStableFunc`; buffered stable merge sort (Q67 −3% instructions, +2.6% cycles); compact sort-to-GM-queue
       (slice 89); NL stream outer copy (does not fire in Q10).
+    - Landed below the bar: C16g content\-keyed truncate\_useless\_pathkeys memo \(slice 99, Q64 planning
+      instructions −2\.96 %, `pathkeys\_useful\.go` truncMemo vs PG build\_join\_pathkeys\)\.
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
@@ -1775,6 +1777,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       EXPLAIN with costs byte\-identical on Q64/Q72/Q14/Q39/Q17/Q25/Q29\. Misses 0\. Next on return: re\-profile Q64;
       planning now ~3\.2 G vs PG's 52 ms plan — measure planning ms again \(g1\-split\.sh\) before the next step\.
       Design: part 9 §Slice 98\.
+    - **C16g LANDED BELOW THE BAR \(slice 99, loop \#193\)**: the truncation memo keyed by list CONTENTS \(first key
+      \+ length, verified with slices\.Equal\) so sort\_inner\_and\_outer's fresh lists hit\. Q64 3\.227/3\.228 →
+      3\.135/3\.129 Ginstr/plan = **−2\.96 %, misses the 3 % bar** \(spread ±0\.005 G, not noise\); plans identical,
+      all gates green; landed as plan\-neutral and added to the Below\-bar list\. **Miss counter 1\.** Q64 planning
+      488 ms by EXPLAIN SUMMARY at slice 98 \(PG 52\)\. Profile after slice 98: sortInnerAndOuter 16 %
+      \(tryMergeJoinPath 15\.7 %: buildJoinPathkeysFor 44 % of it, sortPathFor 18 %\), mallocgc 29 %,
+      addNestLoopPathFor 9\.4 %, buildPathkeyUsefulness 7\.9 %\. Design: part 9 §Slice 99\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5264,6 +5273,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `34ccf73db`** \(M0122\-0012 slice 97 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `d5e071c67`** \(M0122\-0012 slice 98 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

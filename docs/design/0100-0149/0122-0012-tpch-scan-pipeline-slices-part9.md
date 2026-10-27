@@ -638,3 +638,45 @@ corpus; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation PA
 
 Test: `TestTruncateUselessPathkeysMemo`. It covers a repeated hit slicing the caller's list, an equal list in
 another array, and a rewritten array recomputed.
+
+## Slice 99 — C16g: the truncation memo keyed by contents (Q64 planning −2.96 %, below the bar)
+
+Loop #193, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-measure after slice 98.** Q64 plans in 488 ms (`EXPLAIN (SUMMARY ON)`, min of two; it was 636 ms before
+C16, and release PG is 52 ms).
+
+Profile (`tmp/q64plan-c16f.pprof`):
+
+| share | site |
+|---|---|
+| 29 % | `mallocgc` |
+| 16.2 % | `sortInnerAndOuter` |
+| 15.7 % | `tryMergeJoinPath`, of which `buildJoinPathkeysFor` 44 % and `sortPathFor` 18 % |
+| 9.8 % | `truncateUselessPathkeys` (`truncateUselessLen` 6.1 %, i.e. memo misses) |
+| 9.4 % | `addNestLoopPathFor` |
+| 7.9 % | `buildPathkeyUsefulness` (misses of the per-relids memo) |
+
+The slice 98 memo was keyed by the key list's backing array. `sort_inner_and_outer` forms a fresh outer key list
+on every call, so equal lists missed.
+
+**Change.** `truncMemo` is keyed by the list's first `PathKey` and its length, with a bucket of entries each
+verified by `slices.Equal`. An equal list anywhere hits, and the result still slices the caller's list.
+
+**Measured.**
+
+| run | before (slice 98) | after |
+|---|---|---|
+| 1 | 3.227 G | 3.135 G |
+| 2 | 3.228 G | 3.129 G |
+
+That is **−2.96 %**, which misses the 3 % bar. The spread is ±0.005 G, so the shortfall is real.
+
+Plans are identical and every gate is green: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99
+same; fire-set no fires on either corpus; TPC-H census 22/22; RegressSuite per-case counts identical; isolation
+PASS.
+
+It is landed as a plan-neutral reduction and recorded on the Below-bar list. The return-first miss counter is 1.
+
+The remaining Q64 planning cost is spread: allocation, the merge-join arms' sort-path construction, and the
+nested-loop arms. Any one mechanism there is likely to fall near the bar.
