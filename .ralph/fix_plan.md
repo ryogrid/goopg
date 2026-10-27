@@ -1804,6 +1804,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
     - Dropped: C33 NLI\-inner index\-scan read set through buildCompleteChild \(Q14 instructions −0\.03 %: Q14's
       probes sit under lateral Joins the consumer threading does not cross\)\.
+    - Dropped: C42 galloping binary search for the end of a leaf's in\-range run \(`scanLeafItems` hi test vs PG
+      `\_bt\_checkkeys`, Q14 instructions −0\.12 %: per\-item hi tests were only 0\.62 % of Q14\)\.
     - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -2234,6 +2236,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         \(execGrouping\.c\) \(Q23 ~2 %\)\.
     - Next pass: DS Q14 after C34 \(its lateral probes\), H Q13 by cycles \(stall\-bound; instructions do not see
       it\), DS Q72 descents\.
+  - **G3 2026\-10\-28 \(loop \#224, misses 0\)**: DS Q14 at `ed521153d` \(`tmp/g3\-224/q14i\*`, attributed by innermost
+    operator\): index scans are 66 % — `indexScanOp\.Next` 28 %, `nextLeafBatch` 23 %, `Rescan` 12 %\. Inside
+    nextLeafBatch, each `store\_sales\_pkey` probe \(`ss\_item\_sk = X`, ~44 matching items\) tests every item against the
+    upper bound through compareHigh → comparePGIndexTuples → comparePGIndexTupleAttrsAt → compareFixedPrefix
+    \(~7–8 % of Q14 with BTreeTupleGetNAtts\)\.
+    - C42: `scanLeafItems` finds the end of the in\-range run by binary search, the twin of `leafScanStart`'s
+      search for its start \(`\_bt\_binsrch`\)\. It does so only after a run of in\-range items, galloping, so a
+      single\-match probe \(Q23's item\_pkey\) still tests one or two items\. Items before the found end skip the hi
+      test; the walk stops at the end as it would have\. PG tests each tuple through `\_bt\_checkkeys` with one opclass
+      call; goopg's per\-item chain is goopg\-only overhead\.
+    - **Target \(C42\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~5 %\.
+    - **C42 MEASURED AND DROPPED \(loop \#224\)**: Q14 117\.008/116\.968 → 116\.870/116\.825 Ginstr/q = **−0\.12 %,
+      misses the bar**\. The premise was wrong: the compares inside nextLeafBatch are mostly `leafScanStart`'s binary
+      search for the range start \(2\.31 % of Q14\), not per\-item hi tests \(0\.62 %\) — the store\_sales\_pkey probes
+      match far fewer items per page than the ~44 assumed\. Code reverted\. **Miss counter 1\.**
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5881,6 +5899,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#223\) — **exhausted at `821d93323`**, fresh census `routing\-20261028f/`
     \(s9ba\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#224\) — **exhausted at `ed521153d`**, census `routing\-20261028f/` reused:
+    `ed521153d` is ralph/analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
