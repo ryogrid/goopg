@@ -1,6 +1,6 @@
 # M0122-0012 C47 — the seq scan skips per-tuple visibility on an all-visible page
 
-Status: design (2026-10-28, loop #232); implementation is the next M0122-0012 slices. Areas: `internal/commands/vacuum`
+Status: slice 1 landed (2026-10-28, loop #233); slice 2 (the scan skip) is next. Design written loop #232. Areas: `internal/commands/vacuum`
 (sets the page bit), `internal/executor` (DML clears it, the seq scan reads it). Perf-only: plans, values and EXPLAIN
 output unchanged. Parent: M0122-0012 (banner item 10). The Target is written in the M0122-0012 entry.
 
@@ -88,3 +88,42 @@ too.
 - Redo already maintains the bit, so a standby's scans could use it. PG refuses for recovery snapshots
   (`takenDuringRecovery`) because a standby's VM and page bits can run ahead of its snapshot's horizon. Keep the
   skip off in recovery until that is reasoned through.
+
+## Slice 1 — landed (loop #233)
+
+The invalidation went into the storage layer rather than the ~13 executor sites, because every heap tuple add and
+xmax stamp lands in `internal/storage/heap.go`. An executor path that forgot its VM clear would then still clear
+the page bit.
+
+- `storage.PageIsAllVisible` / `PageSetAllVisible` / `PageClearAllVisible` (page.go) are bufpage.h's macros.
+- **Cleared:**
+  - `PageAddHeapTuple`, on both success paths (heap\_insert, heap\_update's new page);
+  - `PageSetHeapTupleXmax` (heap\_delete / heap\_update);
+  - `PageSetHeapTupleMovedPartition`;
+  - `PageStampHotOldTuple`, `PageStampUpdatedOldTuple`, `PageStampHotOldTupleMulti`;
+  - `PageSetHeapTupleXmaxMulti`, only when the multi has an updater.
+- **Kept:**
+  - `PageSetHeapTupleLockOnly` and a lock-only multi (heap\_lock\_tuple keeps the bit);
+  - the raw item writers, which serve index pages, redo and the two in-place catalog updates (heap\_inplace\_update
+    keeps it);
+  - the `PageApply*Redo` functions, where redo already applies ALL\_VISIBLE\_CLEARED.
+- Every clear runs before the caller's WAL emission, so a full-page image shows the bit cleared, as in PG. The
+  record's ALL\_VISIBLE\_CLEARED flag is still derived from the VM bit at log time (unchanged). VACUUM sets the page
+  bit together with the VM bit, so the two agree.
+- VACUUM: `setPageAllVisible` (vacuum.go) sets the bit and dirties the page in the ALL\_FROZEN and ALL\_VISIBLE
+  arms. The not-all-visible arm clears it with the map.
+- Tests:
+  - `TestPageAllVisibleClearedByHeapChanges` (storage, every stamper);
+  - `TestPageAllVisibleFollowsVM` (executor: VACUUM sets both bits; insert, HOT update, non-HOT update and delete
+    clear the page bit with the VM bit; FOR UPDATE keeps both; VACUUM re-sets).
+  - Mutation checks: dropping the delete-stamp clear fails both tests; dropping VACUUM's set fails the second.
+- Gates: units, TestE2E\_Physical\* family, the pg\_waldump VM-cleared / vacuum-prune / crash-start testport tests,
+  tpch-spotcheck, sf025 PASS=99 (plans 99/99 same).
+
+**Finding (pre-existing, recorded in the ledger).** `storage.PageAllVisible` skips every non-normal line pointer,
+LP\_DEAD included. PG's heap\_page\_prune\_and\_freeze refuses all-visible while any LP\_DEAD item remains
+(`pruneheap.c`: `all_visible && lpdead_items == 0`) and sets the VM only after the second heap pass makes them unused.
+In the executor fixture, a DELETE plus VACUUM leaves the VM all-visible with the LP\_DEAD item still on the page.
+The seq scan never returns an LP\_DEAD item, so slice 2 is unaffected. An index-only scan that trusts the VM while
+the dead item's index entry survives would be. The probe returned no row (the entry was gone or the plan was not
+index-only), so wrong results are not demonstrated.

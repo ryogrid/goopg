@@ -2356,6 +2356,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       alternating, fresh A/B, on a private vacuumed copy of the clone whose pages carry the bit; plans identical to
       the uncopied clone\)\. Bar: −3 %; predicted ~4 %\. Implementation is the next loops' slices; nothing attempted,
       misses 0\.
+    - **C47 slice 1 LANDED \(loop \#233\)**: PD\_ALL\_VISIBLE producer \+ invalidation, no scan change\. The clears live in
+      `internal/storage/heap\.go` where every heap add / xmax stamp lands \(PageAddHeapTuple, PageSetHeapTupleXmax,
+      MovedPartition, the three Stamp\*OldTuple, XmaxMulti with an updater\); row locks keep it\. VACUUM's
+      `setPageAllVisible` sets it with the VM bit, the not\-all\-visible arm clears it\. Tests
+      `TestPageAllVisibleClearedByHeapChanges`, `TestPageAllVisibleFollowsVM` \(mutation\-checked\)\. Gates: units,
+      TestE2E\_Physical\*, pg\_waldump VM/prune/crash\-start testport, spotcheck, sf025 99/99\. Design §"Slice 1"\.
+      - Finding: `storage\.PageAllVisible` admits LP\_DEAD items; PG refuses all\-visible while any remain
+        \(pruneheap\.c `all\_visible && lpdead\_items == 0`\)\. Ledger row; not a wrong result for the seq scan\.
+      - Next: slice 2 — `seqScanOp` reads PD\_ALL\_VISIBLE once per page under the read lock and skips
+        `TupleVisibleSubxact` \(not in recovery\); `seqScanAllVisibleDisabled` knob; equivalence test; then the Q39 A/B on
+        a private clone copy whose pages carry the bit \(VACUUM skips VM\-all\-visible pages — check whether an
+        aggressive / DISABLE\_PAGE\_SKIPPING pass exists\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**

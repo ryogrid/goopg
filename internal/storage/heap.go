@@ -757,6 +757,7 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 				return 0, err
 			}
 			h.SetUpper(uint16(newUpper))
+			PageClearAllVisible(p)
 			return uint16(idx + 1), nil
 		}
 		h.SetFlags(h.Flags() &^ PDHasFreeLines)
@@ -775,6 +776,12 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	}
 	h.SetLower(uint16(lower + itemIDSize))
 	h.SetUpper(uint16(newUpper))
+	// A new tuple's xmin is not yet visible to all: heap_insert and
+	// heap_update's new page clear PD_ALL_VISIBLE (heapam.c). Clearing it
+	// where every heap tuple add lands keeps a page the seq scan treats as
+	// all-visible from ever holding one (M0122-0012 C47). Redo of an
+	// ALL_FROZEN_SET multi-insert re-sets it after its adds.
+	PageClearAllVisible(p)
 	return uint16(count + 1), nil
 }
 
@@ -1400,6 +1407,10 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	// Advance pd_prune_xid so opportunistic pruning knows when
 	// this page first became prunable (M0046-0002).
 	pageSetPrunablePG(p, xmax)
+	// A deleting or updating xmax clears PD_ALL_VISIBLE, as heap_delete /
+	// heap_update do (M0122-0012 C47); a row lock stamps through
+	// PageSetHeapTupleLockOnly and keeps it, as heap_lock_tuple does.
+	PageClearAllVisible(p)
 	return nil
 }
 
@@ -1606,6 +1617,10 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	pageSetPrunablePG(p, xmax)
+	// A deleting or updating xmax clears PD_ALL_VISIBLE, as heap_delete /
+	// heap_update do (M0122-0012 C47); a row lock stamps through
+	// PageSetHeapTupleLockOnly and keeps it, as heap_lock_tuple does.
+	PageClearAllVisible(p)
 	return nil
 }
 
@@ -2064,6 +2079,12 @@ func PageSetHeapTupleXmaxMulti(p Page, slot uint16, multi TransactionID, infomas
 	infomask &^= HeapXmaxLockMask | HeapXmaxLockOnly | HeapXmaxInvalid | HeapXmaxCommitted | HeapXmaxIsMulti
 	infomask |= infomaskBits
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// A multi with an updater is heap_update / heap_delete's stamp and clears
+	// PD_ALL_VISIBLE; a lock-only multi is heap_lock_tuple's and keeps it
+	// (M0122-0012 C47).
+	if infomaskBits&HeapXmaxLockOnly == 0 {
+		PageClearAllVisible(p)
+	}
 	return nil
 }
 
@@ -2117,6 +2138,10 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
 	// once xmax is committed and xmax < OldestXmin.
 	pageSetPrunablePG(p, xmax)
+	// A deleting or updating xmax clears PD_ALL_VISIBLE, as heap_delete /
+	// heap_update do (M0122-0012 C47); a row lock stamps through
+	// PageSetHeapTupleLockOnly and keeps it, as heap_lock_tuple does.
+	PageClearAllVisible(p)
 	return nil
 }
 
@@ -2157,6 +2182,10 @@ func PageStampUpdatedOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk Bl
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	pageSetPrunablePG(p, xmax)
+	// A deleting or updating xmax clears PD_ALL_VISIBLE, as heap_delete /
+	// heap_update do (M0122-0012 C47); a row lock stamps through
+	// PageSetHeapTupleLockOnly and keeps it, as heap_lock_tuple does.
+	PageClearAllVisible(p)
 	return nil
 }
 
@@ -2228,6 +2257,10 @@ func PageStampHotOldTupleMulti(p Page, oldSlot uint16, multi TransactionID, info
 	// HOT tuple is dead once the updater commits and is < OldestXmin. The multi
 	// id itself is not a TransactionID, so prune tracking uses updaterXID.
 	pageSetPrunablePG(p, updaterXID)
+	// A deleting or updating xmax clears PD_ALL_VISIBLE, as heap_delete /
+	// heap_update do (M0122-0012 C47); a row lock stamps through
+	// PageSetHeapTupleLockOnly and keeps it, as heap_lock_tuple does.
+	PageClearAllVisible(p)
 	return nil
 }
 

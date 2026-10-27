@@ -182,3 +182,80 @@ func TestIndexOnlyScanFallbackWithoutVM(t *testing.T) {
 		t.Errorf("expected id=7, got %+v", rows[0][0])
 	}
 }
+
+// TestPageAllVisibleFollowsVM pins M0122-0012 C47's producer and invalidation
+// halves end to end. VACUUM sets the heap page's PD_ALL_VISIBLE together with
+// the visibility map's ALL_VISIBLE bit (lazy_scan_prune), and every DML kind
+// clears it again (heap_insert, heap_update on both a HOT and a non-HOT path,
+// heap_delete) while a row lock keeps it (heap_lock_tuple). The seq scan's
+// per-page visibility skip is only safe because the page bit is never left set
+// over a tuple some snapshot cannot see.
+func TestPageAllVisibleFollowsVM(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	for _, sql := range []string{
+		"CREATE TABLE pav (id int, v int)",
+		"CREATE INDEX pav_id ON pav (id)",
+		"INSERT INTO pav VALUES (1, 10)",
+		"INSERT INTO pav VALUES (2, 20)",
+		"INSERT INTO pav VALUES (3, 30)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitTx(t, ctx)
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "pav"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pageBit := func() bool {
+		t.Helper()
+		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ctx.Pool.Unpin(slot)
+		slot.RLock()
+		defer slot.RUnlock()
+		return storage.PageIsAllVisible(slot.Page())
+	}
+	vacuum := func(when string) {
+		t.Helper()
+		beginTx(t, ctx)
+		if err := runDDL(t, ctx, "VACUUM pav"); err != nil {
+			t.Fatal(err)
+		}
+		commitTx(t, ctx)
+		if !ctx.VM.AllVisible(rel, 0) || !pageBit() {
+			t.Fatalf("%s: VACUUM left VM all-visible=%v, PD_ALL_VISIBLE=%v; want both set",
+				when, ctx.VM.AllVisible(rel, 0), pageBit())
+		}
+	}
+	if pageBit() {
+		t.Fatal("PD_ALL_VISIBLE set before any VACUUM")
+	}
+	vacuum("first pass")
+	for _, tc := range []struct {
+		name    string
+		sql     string
+		cleared bool
+	}{
+		{"insert", "INSERT INTO pav VALUES (4, 40)", true},
+		{"hot update", "UPDATE pav SET v = 11 WHERE id = 1", true},
+		{"non-hot update", "UPDATE pav SET id = 22 WHERE id = 2", true},
+		{"delete", "DELETE FROM pav WHERE id = 3", true},
+		{"row lock", "SELECT id FROM pav WHERE id = 1 FOR UPDATE", false},
+	} {
+		beginTx(t, ctx)
+		if _, err := runQueryWithErr(ctx, tc.sql); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := !pageBit(); got != tc.cleared {
+			t.Fatalf("%s: PD_ALL_VISIBLE cleared = %v, want %v", tc.name, got, tc.cleared)
+		}
+		if tc.cleared && ctx.VM.AllVisible(rel, 0) {
+			t.Fatalf("%s: page bit cleared but the VM still says all-visible", tc.name)
+		}
+		commitTx(t, ctx)
+		vacuum("after " + tc.name)
+	}
+}
