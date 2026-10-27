@@ -680,3 +680,25 @@ It is landed as a plan-neutral reduction and recorded on the Below-bar list. The
 
 The remaining Q64 planning cost is spread: allocation, the merge-join arms' sort-path construction, and the
 nested-loop arms. Any one mechanism there is likely to fall near the bar.
+
+## After slice 99 — C16h measured and dropped; one-task yield (2026-10-27)
+
+**C16h.** PG's `try_mergejoin_path` prices the sorted inputs inside `initial_cost_mergejoin` and builds nothing
+before `add_path_precheck`; `create_mergejoin_plan` makes the Sorts later. goopg's `tryMergeJoinPath` built both
+Sort paths (`sortPathFor`) first and formed the join pathkeys twice.
+
+The attempt computed each input's `cost_sort` figure first (`sortRunCostFor`), ran the precheck on it, and built
+the Sort paths from the same figure only for survivors.
+
+**Measured.** Q64 3.126/3.132 → 3.114/3.111 G per plan, −0.5 %. Q64's merge candidates rarely lose the precheck,
+so the avoided construction is small. The change was dropped, not landed.
+
+**Yield.** Slice 99 (−2.96 %) and C16h (−0.5 %) are two consecutive attempts below the 3 % bar, so the return-first
+rule yields for one task. M0119 holds only `[!]` M0119-0006 and M0147 has no selectable child, so the yield takes
+M0122-0013. M0122-0012 resumes after that task, with the miss counter reset.
+
+**Where Q64's planning stands.** 6.49 → 3.13 G over slices 93–99; `EXPLAIN (SUMMARY ON)` reports 488 ms against
+release PG's 52 ms.
+
+The rest is spread thin across allocation, the nested-loop and merge-join arms, and memo misses on joinrels seen
+once per tour. A next pass should start from a fresh G1–G3 census rather than from this query.

@@ -1736,7 +1736,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       (slice 89); NL stream outer copy (does not fire in Q10).
     - Landed below the bar: C16g content\-keyed truncate\_useless\_pathkeys memo \(slice 99, Q64 planning
       instructions −2\.96 %, `pathkeys\_useful\.go` truncMemo vs PG build\_join\_pathkeys\)\.
+    - Dropped: C16h merge candidates priced before their Sort paths are built \(`tryMergeJoinPath` vs PG
+      try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
+    - Yield 2026\-10\-27 \(loop \#194\): C16g −2\.96 % \(slice 99, landed\) and C16h −0\.5 % \(dropped\) both missed the
+      bar on Q64 planning; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
+      M0119\-0006, M0147 holds no selectable child, so the first is M0122\-0013 \(ledgered resume point: a standby's
+      recovery checkpoint advancing pg\_control like PG's CreateRestartPoint\)\. Then return; the miss counter
+      resets\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -1784,6 +1791,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       488 ms by EXPLAIN SUMMARY at slice 98 \(PG 52\)\. Profile after slice 98: sortInnerAndOuter 16 %
       \(tryMergeJoinPath 15\.7 %: buildJoinPathkeysFor 44 % of it, sortPathFor 18 %\), mallocgc 29 %,
       addNestLoopPathFor 9\.4 %, buildPathkeyUsefulness 7\.9 %\. Design: part 9 §Slice 99\.
+    - **C16h MEASURED AND DROPPED \(loop \#194\)**: price a merge candidate's sorted inputs \(cost\_sort figure\)
+      for initial\_cost\_mergejoin \+ add\_path\_precheck and build the Sort paths only afterwards, join pathkeys
+      formed once\. Q64 3\.126/3\.132 → 3\.114/3\.111 Ginstr/plan = −0\.5 % \(precheck rarely rejects on Q64\)\.
+      **Second consecutive miss → one\-task yield** \(Yield record\)\. Profile at slice 99
+      \(`tmp/q64plan\-c16g\.pprof`\): truncateUselessLen still 4\.3 % \(misses follow per\-relids usefulness
+      misses\), addNestLoopPathFor 10\.3 %, tryMergeJoinPath 13\.9 %\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5276,6 +5289,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `d5e071c67`** \(M0122\-0012 slice 98 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `06d18e112`** \(M0122\-0012 slice 99 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027u/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
