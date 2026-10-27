@@ -124,6 +124,13 @@ type nlJoinStream struct {
 
 	scanLeaf currentTIDProvider
 	steps    int
+
+	// deferScan is the outer seq scan armed for C38's lazy outer deform
+	// (armOuterDefer), deferProj the bare-reference projection between them
+	// (nil when none) and deferRefs its column map.
+	deferScan *seqScanOp
+	deferProj *projectOp
+	deferRefs []int
 }
 
 // openNestedLoop opens both children and prepares the streaming join. When
@@ -221,7 +228,104 @@ func (o *joinOp) openNestedLoop(ctx *Context, captureCTID bool) error {
 			disableFilterReadAhead(o.left)
 		}
 	}
+	m.armOuterDefer()
 	o.nlStream = m
+	return nil
+}
+
+// nlOuterDeferArmed is a test hook counting C38 arms.
+var nlOuterDeferArmed = func() {}
+
+// armOuterDefer is C32's lazy probe deform for the nested loop's outer side
+// (M0122-0012 C38). PG's NestLoop evaluates the join qual with
+// EEOP_OUTER_FETCHSOME up to the highest outer attribute the qual reads, and
+// the projection fetches the rest only for a pair that passed
+// (ExecNestLoop, execExpr.c); TPC-DS Q10 filters 1.92 M customer_demographics
+// rows against three inner rows on cd_demo_sk, and goopg decoded (and cloned)
+// all nine columns of each. Armed, the outer seq scan — directly under the
+// join or under a projection of bare column references — decodes the columns
+// the predicate reads, and finishOuterRow completes the row before any use
+// beyond the predicate. Declined when the predicate's reads cannot be
+// enumerated or touch no outer column, and under EXPLAIN ANALYZE's filter
+// counters (they evaluate the probe qual on the pair).
+func (m *nlJoinStream) armOuterDefer() {
+	o := m.o
+	if probeDeferDisabled || o.plan == nil || o.plan.Predicate == nil || o.plan.Lateral ||
+		o.joinFilterRemoved != nil || o.probeQual != nil || m.lw <= 0 {
+		return
+	}
+	read := exprReadSet([]optimizer.Expr{o.plan.Predicate})
+	if read == nil {
+		return
+	}
+	var keyCols []int
+	for i := 0; i < m.lw && i < len(read); i++ {
+		if read[i] {
+			keyCols = append(keyCols, i)
+		}
+	}
+	if len(keyCols) == 0 {
+		return
+	}
+	op := unwrapInstrumented(o.left)
+	var proj *projectOp
+	var refs []int
+	if p, ok := op.(*projectOp); ok {
+		if p.live != nil {
+			return
+		}
+		refs = projectColRefs(p.targets)
+		for _, c := range refs {
+			if c < 0 {
+				return
+			}
+		}
+		for i, k := range keyCols {
+			if k >= len(refs) {
+				return
+			}
+			keyCols[i] = refs[k]
+		}
+		proj = p
+		op = unwrapInstrumented(p.child)
+	}
+	scan, ok := op.(*seqScanOp)
+	if !ok || !scan.armDefer(keyCols, false) {
+		return
+	}
+	m.deferScan, m.deferProj, m.deferRefs = scan, proj, refs
+	nlOuterDeferArmed()
+}
+
+// finishOuterRow completes the current outer row when C38 deferred it: the
+// scan decodes the rest of its row (it has not advanced — the stream pulls
+// the next outer row only after the inner side is done), and the row is
+// copied into outerRow again exactly as stepOuter copied it. A no-op when
+// nothing is pending.
+func (m *nlJoinStream) finishOuterRow() error {
+	s := m.deferScan
+	if s == nil || !s.deferPending {
+		return nil
+	}
+	if err := s.finishDeferred(); err != nil {
+		return err
+	}
+	row := s.scanRow
+	if m.deferProj != nil {
+		for i, c := range m.deferRefs {
+			if i < len(m.deferProj.out) && c < len(s.scanRow) {
+				m.deferProj.out[i] = s.scanRow[c]
+			}
+		}
+		row = m.deferProj.out
+	}
+	n := min(len(m.outerRow), len(row))
+	if rowHasArena(row[:n]) && !m.o.nlOuterBorrowed {
+		m.outerRow = cloneRowOwned(row[:n])
+	} else {
+		m.outerRow = append(m.outerRow[:0], row[:n]...)
+	}
+	m.pairOuterValid = false
 	return nil
 }
 
@@ -384,6 +488,16 @@ func (m *nlJoinStream) stepInner() (Row, bool, error) {
 		return nil, false, nil
 	}
 	m.outerMatched = true
+	if !m.semiAnti {
+		// C38: the pair is used beyond the predicate.
+		if err := m.finishOuterRow(); err != nil {
+			return nil, false, err
+		}
+		if !m.pairOuterValid {
+			copy(m.pair, m.outerRow)
+			m.pairOuterValid = true
+		}
+	}
 	if m.semiAnti {
 		// S4a (D3.2): one qualifying inner tuple decides this outer tuple.
 		// Never emit the joined row (the join's schema is outer-only) and
@@ -413,11 +527,17 @@ func (m *nlJoinStream) finishOuter() (Row, bool, error) {
 			hit = !m.outerMatched
 		}
 		if hit {
+			if err := m.finishOuterRow(); err != nil {
+				return nil, false, err
+			}
 			return append(Row(nil), m.outerRow...), true, nil
 		}
 		return nil, false, nil
 	}
 	if !m.outerMatched && m.fillOuter {
+		if err := m.finishOuterRow(); err != nil {
+			return nil, false, err
+		}
 		m.ensurePads()
 		return concatRows(m.outerRow, m.nullRight), true, nil
 	}

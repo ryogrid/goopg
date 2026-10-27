@@ -2190,6 +2190,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(mutation\-checked\), `TestPGIndexIntWidthMatchesComparator`\. **Misses 0\.** Design: part 10 §114\. Isolation
       suite needs `\-timeout 30m` \(533–587 s against the 10\-minute default\)\. Next on return: re\-census S9, then a
       fresh G1 refresh \(census\-20261027b expires 2026\-10\-30; release\-PG numbers are reusable, goopg's moved\)\.
+  - **Return 2026\-10\-28 \(loop \#222, misses 0\)**: S9 re\-census `routing\-20261028e` exhausted\. **G1 refresh**
+    committed as `analysis/m0122/m0122\-0012/census\-20261028/` \(HEAD `f645129a8`, release\-PG numbers reused\); new
+    top 10: DS Q14 3205, DS Q23 2631, H Q18 1050 \(host variance — instructions fell 41\.912 → 40\.760 G since
+    census\-b\), H Q13 950, H Q17 900, DS Q72 796, **DS Q10 543 \(ratio 4\.05\)**, DS Q78 539, DS Q39 502, DS Q59 462 ms\.
+    - G3 on DS Q10 \(`tmp/g3\-222/q10i\*`\): decodeRowRangeInfo 21\.6 % self \(32 % cum\), seqScanOp\.Next 13 %\. The
+      plan is Nested Loop \(Join Filter `cd\_demo\_sk = c\.c\_current\_cdemo\_sk`\) with outer Seq Scan on
+      customer\_demographics \(1\.92 M rows\) and a Materialize of ~3 inner rows\. goopg decodes \(and, the outer
+      scan not borrowing under Sort, clones\) all nine columns of every outer row; PG's join filter fetches only
+      attribute 1 \(EEOP\_OUTER\_FETCHSOME\) and the projection the rest for the few matching rows\.
+    - C38: C32's lazy probe deform for the streaming nested loop's outer side — arm the outer seq scan \(directly
+      or under a bare\-reference projection\) with the outer columns the join predicate reads; the stream finishes
+      the row \(and re\-copies its cells into `outerRow`\) before any use beyond the predicate: an emitted pair, a
+      semi/anti emit, a null\-extended outer row\. Works for non\-borrowing scans because the page stays pinned
+      until the scan advances and `finishDeferred` re\-takes the content lock\.
+    - **Target \(C38\)**: TPC\-DS SF0\.25 **Q10**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~20 %\.
+    - **C38 LANDED \(slice 115\)**: `nlJoinStream\.armOuterDefer` / `finishOuterRow` \+ `seqScanOp\.armDefer\(keyCols,
+      requireBorrow\)`\. Q10 10\.255/10\.277 → 6\.889/6\.899 Ginstr/q \(**−32\.9 %, meets the bar**\); Q35 ±0 \(disarm path
+      free\); outputs of Q10/Q35/Q69/Q13/Q48 identical; plans 99/99 same\. A first gate sweep's \+13\.2 % \(Q78, Q26,
+      Q23\) was host contention: equal instructions, and the next sweep came back −15\.0 %\. Test
+      `TestNLOuterDeferMatchesEager` \(mutation\-checked\)\. **Misses 0\.** Design: part 11 §115\. Next on return:
+      re\-census S9, then G3 on the census\-20261028 top 10 \(Q14, Q23, H Q13/Q17, Q78, Q39, Q59\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5830,6 +5852,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-28 \(loop \#221\) — **exhausted at `4321d5793`**, fresh census `routing\-20261028d/`
     \(s9ay\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#222\) — **exhausted at `f645129a8`**, fresh census `routing\-20261028e/`
+    \(s9az\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

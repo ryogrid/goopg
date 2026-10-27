@@ -40,7 +40,17 @@ const probeDeferDisarmRows = 4096
 // table's, and a scan that clones its rows (only a borrowed row is the one the
 // join holds).
 func (o *seqScanOp) armProbeDefer(keyCols []int) bool {
-	if probeDeferDisabled || seqScanDeformPoison || !o.borrowRows || o.qualSet || o.prefilterSet ||
+	return o.armDefer(keyCols, true)
+}
+
+// armDefer is armProbeDefer with the borrow requirement optional. A caller
+// that holds the scan's returned row needs the borrow (the row it holds must
+// be the one finishDeferred completes); the streaming nested loop (C38)
+// instead re-copies the finished cells from scanRow itself, so it arms a
+// cloning scan too: the page stays pinned until the scan advances, and
+// finishDeferred re-takes the content lock.
+func (o *seqScanOp) armDefer(keyCols []int, requireBorrow bool) bool {
+	if probeDeferDisabled || seqScanDeformPoison || (requireBorrow && !o.borrowRows) || o.qualSet || o.prefilterSet ||
 		o.gistSSIIdxOID != 0 || o.ginSSIIdxOID != 0 ||
 		o.typeACLColIdx >= 0 || o.attrACLColIdx >= 0 || o.dbACLColIdx >= 0 ||
 		len(o.schema) > len(o.cols) || len(o.colInfo) != len(o.cols) {
