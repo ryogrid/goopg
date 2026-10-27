@@ -79,3 +79,22 @@ off:
 - plain and grouped aggregates (count/sum/avg plus text min/max) give identical results with the borrow on and
   off;
 - the borrow is asserted armed.
+
+## After slice 103 — C22 measured and dropped; one-task yield (2026-10-27)
+
+**C22.** The aim was to give a seq scan at the bottom of a consumer-complete chain a read set, by adding a SeqScan
+case to `buildCompleteChild` and teaching `consumerLiveColumns` lowered sublinks (`deformSublinkArgs`, the rule
+`deformScanVisit` already applies). Q17's join filter `l_quantity < (SubPlan 1)` had made the consumer walk
+decline.
+
+**Measured.** Q17 instructions came out unchanged (27.30 G either way). A Build trace showed why: the chain is
+Join → Project → Seq Scan lineitem, and the Project already narrows the scan's `readCols` to the three columns read
+(l_extendedprice, l_quantity, l_partkey, slice 19). Q17's remaining decode cost is the three NEEDED NUMERICs. The
+change was dropped.
+
+**Yield.** C21 (−2.06 %, landed) and C22 (±0 %) are two consecutive misses, so the next loop works one item-10
+task: M0122-0013, the standby `DB_IN_ARCHIVE_RECOVERY` residual. It then returns here with the counter reset.
+
+**Q17 after slices 102–103.** What remains is the needed-column numeric decode, the checksum (now 6 %), reads
+(syscall 6 %) and the correlated SubPlan's per-row bitmap probe. The TID-bitmap entry sizing (goopg 2048 bits per
+page, PG `MaxHeapTuplesPerPage` = 291) is a ~2 % item for a later pass.

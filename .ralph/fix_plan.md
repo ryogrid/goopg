@@ -1773,6 +1773,9 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
     - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
       `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
+    - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
+      consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
+      \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
     - Yield 2026\-10\-27 \(loop \#194\): C16g −2\.96 % \(slice 99, landed\) and C16h −0\.5 % \(dropped\) both missed the
       bar on Q64 planning; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
@@ -1781,6 +1784,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       resets\.
       - Worked: M0122\-0013 standby restartpoint, landed 2026\-10\-27 \(loop \#195\)\. Yield over — the next item\-10
         selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-27 \(loop \#200\): C21 −2\.06 % \(slice 103, landed\) and C22 ±0 % \(dropped\) missed the bar;
+      worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no selectable
+      child, so M0122\-0013 \(ledgered residual 2026\-10\-27: a standby never stamps DB\_IN\_ARCHIVE\_RECOVERY, so
+      the restartpoint's minRecoveryPoint arm is dormant and a shutdown restartpoint misses
+      DB\_SHUTDOWNED\_IN\_RECOVERY\)\. Then return; misses reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -1820,6 +1828,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `emitRow` yields scanRow when no ctid column is emitted\. Q17 27\.860/27\.877 → 27\.299/27\.289 Ginstr/q =
       **−2\.06 %, misses the 3 % bar** \(the 8 % profile share was mostly allocation/GC cycles, which instructions do
       not count\); values and plans identical; Below\-bar list updated\. **Miss counter 1\.** Design: part 10 §103\.
+    - C22 \(added loop \#200, G3 on Q17 after C21\): the main lineitem probe scan decodes columns 0–5 \(six
+      NUMERICs; decodeScanRowRange 21 % of Q17\) though only l\_partkey / l\_quantity / l\_extendedprice are read:
+      `buildCompleteChild` carries consumer\-completeness through the hash join to its left side \(slice 66\) but has
+      no seq\-scan case, so the scan's read set \(`readCols`, slice 19\) stays nil\. PG fetches only referenced
+      attributes \(EEOP\_SCAN\_FETCHSOME\)\. TID\-bitmap entry sizing \(goopg 2048\-bit vs PG MaxHeapTuplesPerPage
+      291\) noted, ~2 %, not taken\.
+    - **Target \(C22, loop \#200\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Bar: −3 %\.
+    - **C22 MEASURED AND DROPPED \(loop \#200\)**: Q17 27\.304/27\.302 vs 27\.287/27\.322 Ginstr/q = ±0 %\. A
+      build trace showed the premise wrong: Join → Project → Seq Scan lineitem, and the Project already narrows the
+      scan's readCols to the three read columns \(slice 19\); even with consumerLiveColumns taught lowered sublinks
+      \(Q17's join filter made it decline\), nothing further is skipped\. Q17's remaining decode is the three NEEDED
+      NUMERICs\. **Second consecutive miss → one\-task yield** \(Yield record\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5383,6 +5404,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `64aa8f62f`** \(M0122\-0012 slice 101 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `986df5900`** \(M0122\-0012 slice 103 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027w/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
