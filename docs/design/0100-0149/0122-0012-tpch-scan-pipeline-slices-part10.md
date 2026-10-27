@@ -375,3 +375,51 @@ size mismatch, plain, posting, pivot with and without room for its TID). `probeT
 **Left (ledgered).** The leaf probe of a POSTING tuple calls `parsePostingRaw`. That allocates the TID array and
 a restamped key copy on every probe, only to compare and discard them. PG's `_bt_compare` reads a posting tuple's
 key attributes in place, with the first heap TID as the tiebreak.
+
+## Slice 109 — C29: a hash aggregate emits its groups directly, without re-keying (TPC-H Q18 −5.7 % instructions)
+
+Loop #208 reused census aa (`e35fff402` touched only nbtree). After C28, Q14 is flat: nbtree 34 % and index-scan
+heap fetch 31 %, spread over small symbols. TPC-H Q18 (G2 #6) was profiled by instructions:u for the first time.
+
+**Symptom.** Q18's hash aggregate on `l_orderkey` (~1.5 M groups) runs in three steps:
+
+- It files groups in the int64 lane (`igroups[ik]`, 10.3 %, the lookup PG pays too).
+- At the end of every drain, `demoteIntGroups` moves all of them into the string map: an `igroups` re-lookup
+  (2.9 %), a `canonicalNumericKey` string allocation per group, and string-map inserts and rehashing.
+- The emit loop then walks `order` (key strings) and looks every group up again with `groups[key]` (4.0 %).
+
+Both of the last two steps exist only to give the emit loop a key per group.
+
+**PG.** `agg_retrieve_hash_table` iterates the hash table's entries (`ScanTupleHashTable`). Nothing is re-keyed or
+looked up again.
+
+**Change** (`operators_join_agg.go`):
+
+- `founded` lists every group in founding order: the pre-founded empty-set groups, int-lane groups and
+  string-path groups. That is the order `order` lists their keys in, because int-lane groups are always founded
+  before any string-path group (demotion happens at the first non-int key, or at the end).
+- In Simple mode the emit loop walks `founded`, and the end-of-drain demotion is skipped.
+- Partial, Final and row-transport aggregates publish or rebuild by key and keep `order`.
+- `aggEmitFoundedDisabled` is a test knob.
+
+**Measured** (`tools/h-instr.sh`, 5 runs × 2, a fresh A/B against `e35fff402`): Q18 44.813 / 44.962 →
+42.328 / 42.304 Ginstr/q, **−5.7 %**, which meets the 3 % bar (predicted ~7 %). TPC-H acceptance: Q18 MATCH and
+24 MATCH overall.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 (total −3.1 %) with plans 99/99 same; fire-set PASS
+(no fires); RegressSuite counts equal to the slice-108 run except the plpgsql flapper, with `groupingsets`,
+`aggregates` and `join` byte-identical.
+
+Test: `TestAggEmitFoundedMatchesKeyedEmit` compares the founded emit with the keyed emit over:
+
+- the pure int64 lane;
+- a lane demoted mid-drain by a fraction and by a NULL;
+- string and multi-column keys;
+- grouping sets;
+- an ungrouped aggregate;
+- empty input.
+
+A temporary probe confirmed both the founded emit and an undemoted lane were reached.
+
+**Left (ledgered).** PG sizes the hash table from the planner's group estimate (`hash_choose_num_buckets`), but
+goopg's maps start empty and rehash as they grow (1.5 % of Q18). The plan node carries no numGroups.

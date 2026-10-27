@@ -1979,6 +1979,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(**−6\.9 %, meets the bar**\); Q72/Q14/Q23 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return:
       the posting\-tuple leaf probe \(parsePostingRaw allocates per probe\) where an index has duplicates, or a fresh
       G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10 §108\.
+  - **Return 2026\-10\-27 \(loop \#208\)**: S9 reused census aa \(`e35fff402` is nbtree\-only\)\. Q14 after C28 is flat
+    \(`tmp/g3\-208/q14i\.data`: nbtree 34 %, index\-scan heap fetch 31 %, no ≥ 3 % mechanism\)\. TPC\-H Q18
+    \(`tmp/g3\-208/h18i\.data`\): the hash aggregate on l\_orderkey \(~1\.5 M groups\) spends `igroups\[ik\]` 10\.3 % \(the
+    lookup PG also pays\), then `demoteIntGroups` at end of drain 2\.9 % \+ string\-map inserts/rehash \+
+    canonicalNumericKey allocations, and the emit loop's `groups\[key\]` re\-lookup 4\.0 %\.
+    - C29: the int64 lane is converted to string keys at the end of every drain only so the emit loop can walk
+      `order` \(key strings\) and look each group up again\. PG's agg\_retrieve\_hash\_table iterates the table's entries
+      \(ScanTupleHashTable\); nothing is re\-keyed or re\-looked\-up\. Mechanism: keep the founded groups in a
+      `\[\]\*groupRuntime` list in founding order, emit from it, and skip the end\-of\-drain demotion on the plain
+      \(Simple\-mode\) emit path\. Partial/Final/row\-transport paths keep key strings\. Predicted ~7 %\.
+    - **Target \(C29\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5 runs × 2, fresh
+      A/B against `e35fff402`\)\. Bar: −3 %\.
+    - **C29 LANDED \(slice 109\)**: `founded` \(founding\-order group list\); Simple\-mode emit walks it and skips the
+      end\-of\-drain int\-lane demotion\. Q18 44\.813/44\.962 → 42\.328/42\.304 Ginstr/q \(**−5\.7 %, meets the bar**\);
+      acceptance 24 MATCH; plans 99/99 same\. Misses 0\. Next on return: hash\-table pre\-sizing needs a plan\-node
+      numGroups \(planner change; ledgered\); or a fresh G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10
+      §109\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5575,6 +5592,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027aa/`: TPC\-H 22/22, TPC\-DS SF0\.25
     99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#208\) — **exhausted at `e35fff402`**, census `routing\-20261027aa/` reused:
+    `e35fff402` touched internal/access/nbtree only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\.
+    Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

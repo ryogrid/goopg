@@ -2679,6 +2679,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
+	// M0122-0012 C29: founded lists every group in founding order — the
+	// order `order` lists their keys in — so the Simple-mode emit walks the
+	// groups themselves, as PG's agg_retrieve_hash_table iterates the hash
+	// table's entries (ScanTupleHashTable), instead of looking every group up
+	// again by key. With it the int64 lane need not be re-keyed into the
+	// string map at the end of the drain. Partial / Final / row-transport
+	// aggregates publish or rebuild by key and keep `order`.
+	var founded []*groupRuntime
+	emitFounded := o.plan.Mode == optimizer.AggModeSimple && !aggEmitFoundedDisabled
 
 	nGroupCols := len(o.plan.GroupExprs)
 
@@ -2731,6 +2740,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		key := o.setGroupKey(si, nil, nil, multiSet)
 		groups[key] = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 		order = append(order, key)
+		founded = append(founded, groups[key])
 	}
 
 	// A group lives until the aggregate finishes, so its runtime, its
@@ -2881,6 +2891,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 						gr = newGroup(si, set, allVals, slot)
 						igroups[ik] = gr
 						iorder = append(iorder, ik)
+						founded = append(founded, gr)
 					}
 				} else {
 					intLane = false
@@ -2899,6 +2910,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 					gr = newGroup(si, set, allVals, slot)
 					groups[key] = gr
 					order = append(order, key)
+					founded = append(founded, gr)
 				}
 			}
 			if closeOrderOK {
@@ -2939,7 +2951,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 	}
 
-	if intLane {
+	if intLane && !emitFounded {
 		demoteIntGroups()
 	}
 
@@ -3011,16 +3023,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		accum.mu.Unlock()
 	}
 
-	o.rows = make([]Row, 0, len(order))
+	nEmit := len(order)
+	if emitFounded {
+		nEmit = len(founded)
+	}
+	o.rows = make([]Row, 0, nEmit)
 	// emitted[i] is the grouping set that produced o.rows[i]; consumed by the
 	// output sort below. M0125-0048.
-	emitted := make([]int, 0, len(order))
+	emitted := make([]int, 0, nEmit)
 	// closedAt[i] is o.rows[i]'s group closeSeq (M0122-0012 C23).
 	var closedAt []int
 	if closeOrderOK {
-		closedAt = make([]int, 0, len(order))
+		closedAt = make([]int, 0, nEmit)
 	}
-	for idx, key := range order {
+	for idx := 0; idx < nEmit; idx++ {
 		// M0062-followup: mirror the input-drain ctx check (line ~629)
 		// on the output-materialisation loop. A 1 M-group aggregate's
 		// rebuild can otherwise take seconds without a cancel
@@ -3030,7 +3046,12 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		gr := groups[key]
+		var gr *groupRuntime
+		if emitFounded {
+			gr = founded[idx]
+		} else {
+			gr = groups[order[idx]]
+		}
 		if gr == nil {
 			continue
 		}
@@ -3297,6 +3318,11 @@ var aggIntLaneDisabled = false
 // aggArgShareDisabled makes a multi-set aggregate evaluate each argument
 // once per grouping set again. Tests set it to compare the two.
 var aggArgShareDisabled = false
+
+// aggEmitFoundedDisabled makes a Simple-mode hash aggregate emit by
+// re-looking each group up by key (and re-key its int64 lane) again. Tests
+// set it to compare the two.
+var aggEmitFoundedDisabled = false
 
 // rollupCloseOrderDisabled sends a sorted rollup's output through the column
 // comparator instead of rollupCloseOrder. Tests set it to compare the two
