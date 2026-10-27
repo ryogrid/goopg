@@ -1806,6 +1806,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       probes sit under lateral Joins the consumer threading does not cross\)\.
     - Dropped: C42 galloping binary search for the end of a leaf's in\-range run \(`scanLeafItems` hi test vs PG
       `\_bt\_checkkeys`, Q14 instructions −0\.12 %: per\-item hi tests were only 0\.62 % of Q14\)\.
+    - Landed below the bar: C43 scan `Cond` compiled for evalFastExpr \(`compiledCond` vs PG ExecInitQual/ExecQual,
+      Q14 instructions −1\.94 %\)\.
     - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -1826,6 +1828,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       DB\_SHUTDOWNED\_IN\_RECOVERY\)\. Then return; misses reset\.
       - Worked: M0122\-0013 standby pg\_control state, landed 2026\-10\-27 \(loop \#201\)\. Yield over — the next
         item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#225\): C42 −0\.12 % \(dropped\) and C43 −1\.94 % \(slice 116, landed below the bar\)
+      missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006,
+      M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-27: CreateRestartPoint's WAL segment
+      removal — KeepLogSeg \+ RemoveOldXlogFiles after the pg\_control update — in `runRecoveryFlush` after
+      `adoptRestartPoint`\)\. Then return; misses reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2263,6 +2270,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       compiled ExprState \(execExpr\.c\)\.
     - **Target \(C43\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
       2, fresh A/B\)\. Bar: −3 %; predicted ~5 %\.
+    - **C43 LANDED BELOW THE BAR \(slice 116, `602669237`\)**: `compiledCond` \(compiled\_cond\.go\) for the index,
+      index\-only and bitmap heap scans' per\-row `Cond`\. Q14 116\.985/116\.965 → 114\.717/114\.720 Ginstr/q = **−1\.94 %,
+      misses the 3 % bar** \(the compiled filter still costs ~2/3 of the interpreted one on these short predicates\);
+      Q7 −6\.2 %, Q88 −1\.1 %; plans 99/99 same; values identical\. Test `TestCompiledCondMatchesInterpreter`\. Design:
+      part 11 §116\. **Second consecutive miss \(C42, C43\) → one\-task yield** \(Yield record\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
