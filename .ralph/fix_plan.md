@@ -1808,6 +1808,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `\_bt\_checkkeys`, Q14 instructions −0\.12 %: per\-item hi tests were only 0\.62 % of Q14\)\.
     - Landed below the bar: C43 scan `Cond` compiled for evalFastExpr \(`compiledCond` vs PG ExecInitQual/ExecQual,
       Q14 instructions −1\.94 %\)\.
+    - Dropped: C44 int\-lane hash table with the first build row inline \(`lazyIntHash` vs PG ExecScanHashBucket,
+      H Q13 wall −1\.1 %, instructions ±0\)\.
     - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -2289,6 +2291,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - **Target \(C44\)**: TPC\-H SF1 **Q13**, metric **wall time** \(median of 5 warm runs, idle host: 16 cores,
       load < 2; alternating A/B on tmp/q17\-clone\), with instructions:u no worse than \+1 %\. Bar: −3 %; predicted
       ~5 %\. Implementation is the next loop's slice; nothing attempted, misses 0\.
+    - **C44 MEASURED AND DROPPED \(loop \#228\)**: implemented as designed \(`intHashRows\{first, all, n\}` at all 45
+      sites incl\. the parallel shared build; equivalence and layout tests passed\)\. Q13 wall, 10 alternating
+      fresh\-server runs each \(load 0\.9–1\.4\): base median 1\.785 s, C44 1\.765 s = **−1\.1 %, misses the 3 % bar**
+      \(first 5\-run set −2\.2 %, second ±0\); instructions:u 11\.957 → 11\.960 G\. The extra hop was not the stall that
+      matters — the slot and the cells dominate\. Code reverted\. **Miss counter 1\.**
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5958,6 +5965,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#227\) — **exhausted at `4370e7f2c`**, census `routing\-20261028g/` reused:
     `4370e7f2c` touches only `internal/access/transam/xlog` and tests, outside the planner\-relevant paths\. No task is
     filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: M0122\-0012 \(returned from the yield\)\.
+  - S9 re\-check 2026\-10\-28 \(loop \#228\) — **exhausted at `d100bd483`**, census `routing\-20261028g/` reused:
+    `d100bd483` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

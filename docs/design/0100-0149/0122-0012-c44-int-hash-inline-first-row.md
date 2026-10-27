@@ -69,3 +69,27 @@ first candidate's key directly.
   duplicate-key and batched cases in the equivalence test cover it.
 - **Memory.** A map value grows from 24 to 48 bytes, while the per-key one-element array (8 + 24 bytes, plus
   allocator rounding) goes away. The net change is about neutral.
+
+## Measured and dropped (loop #228)
+
+The design was implemented in full:
+
+- `intHashRows{first, all, n}`, with `intHashAppend`, `rowsOf` (one-element scratch for the probe and the outer-fill
+  sweep), `each` and `intHashMerge`;
+- all 45 sites converted, including the batch spill, the save and restore, `demoteIntHash` and the parallel shared
+  build's insert, merge, demotion and `rowCount`;
+- the executor's join, spill and parallel-build tests passed, plus a layout test.
+
+**Measured** on TPC-H Q13: 10 alternating fresh-server runs per binary, pass 2 of `tools/tpch-gap.sh`, host load
+0.9–1.4.
+
+| | median wall time |
+|---|---|
+| base | 1.785 s |
+| C44 | 1.765 s (**−1.1 %**) |
+
+The first 5-run set showed −2.2 % and the second ±0. Instructions:u: 11.957 → 11.960 G.
+
+This misses the 3 % bar. Removing the one-element backing array did not shorten the stall that matters: the probe's
+time is in the map slot and in the first read of the build row's cells, and both remain. The code was reverted and
+C44 is on the Below-bar list.
