@@ -2009,6 +2009,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(decodeRowRangeInfo 12\.7 %, checksum 6 % after C19\)\. No candidate ≥ 3 % this pass; nothing attempted, miss
       counter stays 0\. Next on return: G3 on DS Q39 \(hash\-key evaluation per probe row, evalHashKeyDatumSlot\), DS Q78,
       DS Q47\.
+  - **Return 2026\-10\-27 \(loop \#210\)**: S9 reused census ab \(`2910f8451` is analysis\-only\)\. G3 by instructions:u
+    \(`tmp/g3\-210/q\{39,78,47\}i\.data`\): Q39 evalFastExpr 9\.7 % = filterOp\.nextPerRow 8\.4 % \+ hash\-probe keys
+    \(evalHashKeyDatumSlot 7\.7 %: a column ref through evalFastExpr plus the slot read's first touch — no lever\); Q78
+    flat \(decodeRowRangeInfo 7\.9 %\); Q47 is Q67's shape — string sort/merge comparisons\.
+    - C30 \(G3 on Q47\): the Gather Merge / ordered\-merge comparator `mergeKeysLess` — the sibling of
+      `sortOp\.lessKeyVals` it must agree with — still copies both Datums per key, tries fastCompareDatum \(which
+      declines strings\), then `compareDatumTyped` → `textShapeAmbiguous` / `compareDatum`: 4\.6 % of Q47 under it\.
+      C26 gave lessKeyVals in\-place access and a character\-string arm; the merge comparator never got them\. PG's
+      Gather Merge heap compares with the same SortSupport comparators \(heap\_compare\_slots → ApplySortComparator\)\.
+      Mechanism: mergeKeysLess reads through pointers and takes the character\-string arm, with key text flags computed
+      once per merge \(sortKeyTextFlags\)\. Predicted 2\.5–3 %\.
+    - **Target \(C30\)**: TPC\-DS SF0\.25 **Q47**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `2910f8451`\)\. Bar: −3 %\.
+    - **C30 LANDED \(slice 110\)**: `mergeKeysLess\(keys, keyText, …\)` in place with the character\-string arm;
+      gatherMergeOp\.keyText, setOp\.mergeTextFlags\(\)\. Q47 16\.993/16\.985 → 16\.130/16\.127 Ginstr/q \(**−5\.1 %, meets
+      the bar**\); Q47/Q67/Q14/Q57 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return: Q39's
+      `filterOp\.nextPerRow` \(8\.4 %\) or Q23 / Q14 again\. Design: part 10 §110\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5611,6 +5628,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 \(loop \#209\) — **exhausted at `a8367e529`** \(M0122\-0012 slice 109 changed
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ab/`: TPC\-H 22/22, TPC\-DS SF0\.25
     99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#210\) — **exhausted at `2910f8451`**, census `routing\-20261027ab/` reused:
+    `2910f8451` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

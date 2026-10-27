@@ -18,6 +18,7 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/goopg/goopg/internal/utils/mmgr"
 	"github.com/goopg/goopg/internal/optimizer"
@@ -75,6 +76,9 @@ type gatherMergeOp struct {
 	sources  []*gmSource
 	h        *gmHeap
 	keys     []optimizer.SortKey
+	// keyText marks the character-string keys (sortKeyTextFlags) for
+	// mergeKeysLess's string arm.
+	keyText []bool
 	sortErr  error
 	slot     MaterializedSlot
 	launched int
@@ -147,7 +151,7 @@ func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
 }
 
 func newGatherMergeOp(p *optimizer.GatherMerge, buildChild func(scope *instrumenter) (Operator, error)) *gatherMergeOp {
-	return &gatherMergeOp{plan: p, schema: p.Output(), buildChild: buildChild, keys: p.Keys}
+	return &gatherMergeOp{plan: p, schema: p.Output(), buildChild: buildChild, keys: p.Keys, keyText: sortKeyTextFlags(p.Keys)}
 }
 
 func (o *gatherMergeOp) Schema() optimizer.Schema { return o.schema }
@@ -477,22 +481,29 @@ func (o *gatherMergeOp) advanceRow(src *gmSource) (bool, error) {
 // advance). Comparison errors are captured rather than returned so the
 // comparator stays a strict weak ordering, matching sortOp's own discipline.
 func (o *gatherMergeOp) lessKeys(a, b []Datum) bool {
-	return mergeKeysLess(o.keys, a, b, &o.sortErr)
+	return mergeKeysLess(o.keys, o.keyText, a, b, &o.sortErr)
 }
 
 // mergeKeysLess orders two rows by their PRECOMPUTED sort-key values. It is
 // the one comparator every ordered merge shares — gatherMergeOp's heap and
 // the ordered-merge setOp (Merge Append, M0141-S2b-4c) — and it must agree
-// with sortOp.lessRows, because each merge orders streams those Sorts
+// with sortOp.lessKeyVals, because each merge orders streams those Sorts
 // produced. Comparison errors are recorded in *errp (first one wins) rather
 // than returned, so the comparator stays a strict weak ordering.
-func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
-	for i, k := range keys {
-		av, bv := a[i], b[i]
-		// NULL placement is `k.NullsFirst`, NOT `k.Desc`. The two coincide
+//
+// keyText marks the character-string keys (sortKeyTextFlags). Like
+// lessKeyVals (M0122-0012 C26) it reads the key Datums in place and sends a
+// pair of strings under such a key straight to strings.Compare — PG's Gather
+// Merge heap compares with the key's SortSupport comparator
+// (heap_compare_slots → ApplySortComparator). The merge comparator had kept
+// the copying, compareDatumTyped form (M0122-0012 C30).
+func mergeKeysLess(keys []optimizer.SortKey, keyText []bool, a, b []Datum, errp *error) bool {
+	for i := range keys {
+		pa, pb := &a[i], &b[i]
+		// NULL placement is `NullsFirst`, NOT `Desc`. The two coincide
 		// only for PG's DEFAULTS (NULLS LAST for ASC, NULLS FIRST for DESC,
 		// which is how `sortByNullsFirst` resolves an omitted clause), so the
-		// old `k.Desc` form agreed with `sortOp` by accident and disagreed the
+		// old `Desc` form agreed with `sortOp` by accident and disagreed the
 		// moment a query wrote NULLS FIRST/LAST explicitly.
 		//
 		// That is a WRONG-RESULTS bug, not a cosmetic one, and it was live:
@@ -504,30 +515,36 @@ func mergeKeysLess(keys []optimizer.SortKey, a, b []Datum, errp *error) bool {
 		//   select nullif(l_linenumber,1) from lineitem
 		//     order by 1 asc nulls first
 		//   -> a NULL surfaced at row 1183498, AFTER non-NULLs (PG: correct)
-		if av.IsNull() && !bv.IsNull() {
-			return k.NullsFirst
+		an, bn := pa.Kind == KindNull, pb.Kind == KindNull
+		if an || bn {
+			if an && bn {
+				continue
+			}
+			if an {
+				return keys[i].NullsFirst
+			}
+			return !keys[i].NullsFirst
 		}
-		if !av.IsNull() && bv.IsNull() {
-			return !k.NullsFirst
-		}
-		if av.IsNull() && bv.IsNull() {
-			continue
-		}
-		// The sort comparator's fast path (sortOp.lessKeyVals).
-		cmp, ok := fastCompareDatum(&av, &bv)
-		if !ok {
-			var err error
-			if cmp, err = compareDatumTyped(av, bv, 0, k.Expr); err != nil {
-				if *errp == nil {
-					*errp = err
+		// The sort comparator's arms (sortOp.lessKeyVals).
+		var cmp int
+		if pa.Kind == KindString && pb.Kind == KindString && i < len(keyText) && keyText[i] {
+			cmp = strings.Compare(datumStringInPlace(pa), datumStringInPlace(pb))
+		} else {
+			var ok bool
+			if cmp, ok = fastCompareDatum(pa, pb); !ok {
+				var err error
+				if cmp, err = compareDatumTyped(*pa, *pb, 0, keys[i].Expr); err != nil {
+					if *errp == nil {
+						*errp = err
+					}
+					return false
 				}
-				return false
 			}
 		}
 		if cmp == 0 {
 			continue
 		}
-		if k.Desc {
+		if keys[i].Desc {
 			return cmp > 0
 		}
 		return cmp < 0

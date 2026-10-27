@@ -423,3 +423,46 @@ A temporary probe confirmed both the founded emit and an undemoted lane were rea
 
 **Left (ledgered).** PG sizes the hash table from the planner's group estimate (`hash_choose_num_buckets`), but
 goopg's maps start empty and rehash as they grow (1.5 % of Q18). The plan node carries no numGroups.
+
+## Slice 110 — C30: the ordered-merge comparator gets the sort comparator's arms (Q47 −5.1 % instructions)
+
+Loop #210 reused census ab (`2910f8451` is analysis-only). G3 by instructions:u on the census-20261027b
+candidates:
+
+- Q39: `evalFastExpr` 9.7 %, split between `filterOp.nextPerRow` (8.4 %) and hash-probe key evaluation
+  (`evalHashKeyDatumSlot` 7.7 %). The latter is a column reference through `evalFastExpr` plus the first touch of
+  the probe row, with no lever.
+- Q78: flat.
+- Q47: Q67's shape, dominated by string sort and merge comparisons.
+
+**Symptom.** `mergeKeysLess` is the comparator that Gather Merge's heap and the ordered-merge setOp share. It must
+agree with `sortOp.lessKeyVals`, because the merges order streams that those Sorts produced. C26 (slice 106) gave
+`lessKeyVals` in-place access and a character-string arm; the merge comparator kept the old form. That form copies
+both Datums per key, tries `fastCompareDatum` (which declines every string pair), and then calls
+`compareDatumTyped` → `textShapeAmbiguous` / `compareDatum`. That was 4.6 % of Q47.
+
+**PG.** The Gather Merge heap compares with the key's SortSupport comparator (`heap_compare_slots` →
+`ApplySortComparator`), the same one the Sorts below use.
+
+**Change:**
+
+- `mergeKeysLess(keys, keyText, a, b, errp)` reads through pointers and sends a pair of strings under a
+  character-string key straight to `strings.Compare` (`datumStringInPlace`). Every other pair keeps
+  `fastCompareDatum`, then `compareDatumTyped`.
+- The flags come from `sortKeyTextFlags`, computed once per merge: `gatherMergeOp.keyText` at build time, and
+  `setOp.mergeTextFlags()` on first use.
+- The arm is exact for the same reason as in C26 (slice 60): under a character-string key, `compareDatumTyped`
+  of two strings is `compareText`, which is `strings.Compare`.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `2910f8451`): Q47 16.993 / 16.985 →
+16.130 / 16.127 Ginstr/q, **−5.1 %**, which meets the 3 % bar (predicted 2.5–3 %). The outputs of Q47, Q67, Q14
+and Q57 are byte-identical. The sweep's wall-time movers Q14 (+3 s) and Q74 (+2.5 s) run slightly fewer
+instructions with the change (Q14 129.279 → 128.860, Q74 134.579 → 134.488 G), so they were host noise.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set PASS (no fires);
+RegressSuite counts equal to the slice-109 run except the plpgsql flapper, with `window` and `join`
+byte-identical.
+
+Test: `TestMergeKeysLessInPlaceMatchesCopy` pins the merge comparator to its old copying form over text, bpchar,
+int and numeric keys with NULLs, under every Desc / NullsFirst combination. The text values include
+shape-ambiguous ones (array, row, pg_lsn and uuid look-alikes), where `compareDatumTyped` takes its shape rule.
