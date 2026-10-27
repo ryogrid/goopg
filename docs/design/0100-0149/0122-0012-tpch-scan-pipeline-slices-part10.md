@@ -466,3 +466,54 @@ byte-identical.
 Test: `TestMergeKeysLessInPlaceMatchesCopy` pins the merge comparator to its old copying form over text, bpchar,
 int and numeric keys with NULLs, under every Desc / NullsFirst combination. The text values include
 shape-ambiguous ones (array, row, pg_lsn and uuid look-alikes), where `compareDatumTyped` takes its shape rule.
+
+## Slice 111 — C31: integer variance and stddev finalised in fixed width (Q39 −11.2 % instructions)
+
+Loop #211. Census ac (`b996b60d9`) is exhausted. G3 on DS Q39 (G2 #7) found big-number numeric work at 13.3 %
+of its instructions:
+
+- `exactIntVariance` 8.2 %: the per-group `stddev_samp` finalisation, with `nat.sqrt` 3.7 %, the `big.Int`
+  allocations, and `intSums` 1.0 %;
+- the filter's `stdev/mean` division 4.8 % (`numericDiv` already has a uint128 path).
+
+**Symptom.** For int2/int4 inputs, goopg accumulates Σx and Σx² in int128 lanes, as PG's `Int128AggState` does.
+At finalisation it converted both to `big.Int` (`intSums`) and computed PG's `numeric_stddev_internal` entirely
+in `big.Int`: the numerator N·Σx² − (Σx)², `select_div_scale`, the rounded division, and `sqrt_var` through
+`big.Int.Sqrt` (Newton from a bit-length guess). That meant several fresh `big.Int`s per group, for ~90 000
+groups per statement. For Q39's quantities (0–1000, tens of rows per group) every intermediate fits fixed width:
+
+- the numerator and denominator fit 64 bits;
+- the variance mantissa at its rscale (≈ 12) fits below 2^63;
+- `sqrt_var`'s argument q·10^(8f−rscale) (≈ 10^37) fits below 2^128.
+
+**Change** (`variance_int128_fast.go`):
+
+- `aggRuntime.intVariance` serves all four integer-variance finalisers: var_pop, var_samp, stddev_pop and
+  stddev_samp.
+- When the state lives wholly in the int128 lane, `intVarianceFixed` runs `exactIntVariance` step for step in
+  fixed width:
+  - the zero/negative-numerator result and the N ≤ 1 NULL;
+  - `select_div_scale` from the NBASE weights and leading digits (`nbaseWeightFirstUint64`);
+  - `div_var`'s half-away-from-zero rounding via `bits.Div64`;
+  - for stddev, `pgNBaseWeightFirst(q, rscale)`, `sqrt_var`'s resWeight / resNdigits / f, the 128-bit argument
+    (`mulPow10To128`), the integer square root and `round_var`.
+- `isqrt128` seeds from float64, refines with Newton steps on 128/64-bit division, and corrects to the exact
+  floor.
+- Any bound it cannot meet returns ok=false, and `exactIntVariance` runs unchanged.
+- `intVarianceDisabled` is a test knob.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `b996b60d9`): Q39 21.717 / 21.752 →
+19.308 / 19.304 Ginstr/q, **−11.2 %**, which meets the 3 % bar (predicted ~6 %). The outputs of every TPC-DS
+variance query (Q17, Q35, Q39) are byte-identical. The sweep's flagged Q4 2.0× is host noise: equal instructions
+on both binaries (42.172 / 42.176 G).
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set PASS (no fires);
+RegressSuite counts equal to the slice-110 run except the plpgsql flapper, with `aggregates`, `window`,
+`numeric` and `groupingsets` byte-identical.
+
+Tests:
+
+- `TestIntVarianceMatchesBig` runs ~3 000 groups through the fixed-width path and compares each with
+  `exactIntVariance`'s output and scale: Q39-like quantities, small mixed-sign values, constant groups, int32
+  extremes, one- and two-row groups, and a 20 000-row group of values up to 10^6.
+- `TestIsqrt128` checks perfect squares, their neighbours and random 128-bit values.

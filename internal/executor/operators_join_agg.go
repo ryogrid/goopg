@@ -5810,8 +5810,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, false, false)
+			return st.intVariance(false, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
@@ -5824,8 +5823,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, true, false)
+			return st.intVariance(true, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
@@ -5837,8 +5835,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, false, true)
+			return st.intVariance(false, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
@@ -5853,8 +5850,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, true, true)
+			return st.intVariance(true, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)

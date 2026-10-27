@@ -2026,6 +2026,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       gatherMergeOp\.keyText, setOp\.mergeTextFlags\(\)\. Q47 16\.993/16\.985 → 16\.130/16\.127 Ginstr/q \(**−5\.1 %, meets
       the bar**\); Q47/Q67/Q14/Q57 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return: Q39's
       `filterOp\.nextPerRow` \(8\.4 %\) or Q23 / Q14 again\. Design: part 10 §110\.
+  - **Return 2026\-10\-27 \(loop \#211\)**: S9 exhausted at `b996b60d9` \(census ac\)\. G3 on DS Q39
+    \(`tmp/g3\-210/q39i\.data`\): big\-number numeric work is 13\.3 % — `exactIntVariance` 8\.2 % \(per\-group stddev\_samp
+    finalisation; `nat\.sqrt` 3\.7 %, big\.Int allocations, `intSums` 1\.0 %\) and the filter's stdev/mean division 4\.8 %
+    \(numericDiv already has a uint128 path\)\.
+    - C31: for int2/int4 inputs PG accumulates Σx, Σx² in int128 \(Int128AggState\) and numeric\_stddev\_internal turns
+      them into the variance and its square root; every intermediate of that computation for Q39's groups fits fixed
+      width \(variance mantissa < 2^63, sqrt\_var's argument < 2^128\), yet goopg does it all in big\.Int — new big\.Ints
+      per group and a Newton big\.Int square root\. Mechanism: `aggRuntime\.intVariance`, a 128\-bit fast path that
+      mirrors exactIntVariance step for step \(select\_div\_scale, div\_var round, sqrt\_var's argument and round\_var\)
+      with an integer square root seeded from float64, falling back to exactIntVariance on any bound\. Predicted ~6 %\.
+    - **Target \(C31\)**: TPC\-DS SF0\.25 **Q39**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `b996b60d9`\)\. Bar: −3 %\.
+    - **C31 LANDED \(slice 111\)**: `aggRuntime\.intVariance` / `intVarianceFixed` \(variance\_int128\_fast\.go\), used by
+      all four integer variance finalisers; exactIntVariance is the fallback\. Q39 21\.717/21\.752 → 19\.308/19\.304
+      Ginstr/q \(**−11\.2 %, meets the bar**\); Q17/Q35/Q39 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on
+      return: Q39's filter division \(numericDivBig cases the uint128 path declines\) or Q23/Q14\. Design: part 10 §111\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5631,6 +5647,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     live for this loop\.
   - S9 re\-check 2026\-10\-27 \(loop \#210\) — **exhausted at `2910f8451`**, census `routing\-20261027ab/` reused:
     `2910f8451` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#211\) — **exhausted at `b996b60d9`** \(M0122\-0012 slice 110 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ac/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
