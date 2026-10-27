@@ -880,6 +880,24 @@ heuristic stays live.)
   - Expected instrument: the repro identical to `analysis/p0e11/pg18\.out`; Q12/Q20/Q98 outputs identical to
     :65438 tpcds025\.
 
+- [ ] **P0\-E13 — LIKE's `\_` matches one BYTE, not one character, under UTF\-8**
+  \(filed 2026\-10\-27 by the loop, M0122\-0012 C17 read of matchSQLLike; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro values differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-27 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e13/like\-underscore\-multibyte\-repro\.sql`; PG 18\.3 expected
+    > `analysis/p0e13/pg18\-expected\.out` \(t f t t\); goopg `analysis/p0e13/goopg\-32e9a7306\.out` \(f t f f\)\.
+  - Symptom: `'é' LIKE '\_'` is false and `'é' LIKE '\_\_'` true; `'aéb' LIKE 'a\_b'` false; ILIKE likewise\.
+  - Cause \(read\): `matchSQLLikeWalk` \(internal/executor/expr\.go\) advances one byte for `\_` \(and compares the
+    escaped byte bytewise\)\. PG's MatchText \(src/backend/utils/adt/like\_match\.c\) advances by NextChar
+    \(pg\_mblen\) for `\_` under a multibyte encoding \(UTF8MatchText\)\. Pre\-dates C17: the `%`\-only fast path
+    declines patterns containing `\_`\.
+  - First step: in the walk, `\_` consumes one UTF\-8 rune \(utf8\.DecodeRuneInString width\) and the `%` backtrack
+    restarts on rune boundaries; ILIKE's strings\.ToLower path stays\. Check the evalFast/vectorised LIKE siblings
+    use the same matcher\.
+  - Expected instrument: the repro identical to `analysis/p0e13/pg18\-expected\.out`\.
+
 - [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
   \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
   Kind: impl
@@ -1763,6 +1781,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       findChildBlockDirect read the line\-pointer count and P\_FIRSTDATAKEY once per page\. Q72 26\.999/26\.995 →
       26\.170/26\.171 Ginstr/q \(**−3\.06 %, meets the bar**\); plans identical\. Misses 0\. Next on return: C17 \(Q13
       LIKE substring\) or a fresh G3 on Q14/Q23 \(decodeRowRangeInfo 13 %/9 %\)\. Design: part 9 §Slice 100\.
+    - **Target \(C17, loop \#197\)**: TPC\-H SF1 **Q13**, metric **instructions:u per query** \(`tools/h\-instr\.sh`
+      on tmp/q17\-clone, 5 runs\)\. Mechanism: a `%`\-only LIKE pattern \(no `\_`, no escape\) matched as prefix /
+      ordered substrings / suffix instead of the backtracking walk\. Bar: −3 %\.
+    - **C17 LANDED \(slice 101\)**: `matchLikeSegments` \(strings\.Index\) before the walk for `%`\-only patterns\. Q13
+      13\.815/13\.815 → 12\.226/12\.226 Ginstr/q \(**−11\.5 %, meets the bar**\); Q13 values identical\. Misses 0\.
+      Discovery: P0\-E13 \(LIKE `\_` bytewise under UTF\-8; S2, filed\)\. Next on return: a fresh G3 on Q14/Q23/Q17
+      \(decodeRowRangeInfo 13 %/9 %\) — the pool's remaining entries need re\-measurement\. Design: part 9 §101\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**

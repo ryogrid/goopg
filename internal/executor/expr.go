@@ -3583,6 +3583,14 @@ func likeEscapeRewrite(pattern, escape string, runeMode bool, pos int) (string, 
 // translation, so embedded special chars in the input never interact with
 // regex syntax).
 func matchSQLLike(s, pat string) bool {
+	if m, ok := matchLikeSegments(s, pat); ok {
+		return m
+	}
+	return matchSQLLikeWalk(s, pat)
+}
+
+// matchSQLLikeWalk is the general backtracking LIKE walk.
+func matchSQLLikeWalk(s, pat string) bool {
 	si, pi := 0, 0
 	starS, starP := -1, -1
 	for si < len(s) {
@@ -3625,6 +3633,47 @@ func matchSQLLike(s, pat string) bool {
 		pi++
 	}
 	return pi == len(pat)
+}
+
+// matchLikeSegments is matchSQLLike for a pattern whose only metacharacter is
+// '%' (ok=false otherwise: '_' or the backslash escape take the general
+// walk). Such a pattern is a glob of literal segments, and its match is
+// decided without backtracking: the first segment is a prefix, the last a
+// suffix of what remains, and each middle segment is found leftmost in
+// order — the answer the backtracking walk reaches, since a leftmost match of
+// a literal can never be beaten by a later one. strings.Index is a SIMD
+// substring search; TPC-H Q13's `o_comment NOT LIKE '%special%requests%'`
+// spent 7 % of its time in the byte-by-byte walk (M0122-0012 C17). PG's
+// MatchText (like_match.c) has the same bytewise semantics for '%' over a
+// single-byte or UTF-8 server encoding.
+func matchLikeSegments(s, pat string) (matched, ok bool) {
+	if strings.IndexByte(pat, '_') >= 0 || strings.IndexByte(pat, '\\') >= 0 {
+		return false, false
+	}
+	i := strings.IndexByte(pat, '%')
+	if i < 0 {
+		return s == pat, true
+	}
+	if !strings.HasPrefix(s, pat[:i]) {
+		return false, true
+	}
+	s, rest := s[i:], pat[i+1:]
+	for {
+		j := strings.IndexByte(rest, '%')
+		if j < 0 {
+			return strings.HasSuffix(s, rest), true
+		}
+		seg := rest[:j]
+		rest = rest[j+1:]
+		if seg == "" {
+			continue
+		}
+		k := strings.Index(s, seg)
+		if k < 0 {
+			return false, true
+		}
+		s = s[k+len(seg):]
+	}
 }
 
 // pgPatternToGoRE2 translates PostgreSQL-specific regex escapes that are not

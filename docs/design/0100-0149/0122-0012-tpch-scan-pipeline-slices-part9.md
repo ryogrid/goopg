@@ -745,3 +745,42 @@ Tests:
   internal pages included, the probe returns the per-probe accessor's bytes and errors for every slot, out of
   range included.
 - `TestLeafScanStartMatchesLinearWalk` still holds.
+
+## Slice 101 — C17: a `%`-only LIKE pattern is matched as literal segments (Q13 −11.5 % instructions)
+
+Loop #197, 2026-10-27. TPC-H Q13's `o_comment NOT LIKE '%special%requests%'` spent 7 % of Q13's samples in
+`matchSQLLike`, which walks byte by byte and backtracks.
+
+A pattern whose only metacharacter is `%` is a glob of literal segments, and its match needs no backtracking:
+
+- the first segment must be a prefix;
+- each middle segment is found leftmost, in order;
+- the last segment must be a suffix of what remains.
+
+That is the walk's answer, because a leftmost match of a literal is never beaten by a later one.
+
+**Change.** `matchLikeSegments` implements that with `strings.Index`, which is a vectorised substring search.
+`matchSQLLike` tries it first. Any pattern containing `_` or the backslash escape declines to the unchanged walk,
+now named `matchSQLLikeWalk`.
+
+**Target (written before measuring).** TPC-H SF1 Q13, instructions:u per query. The probe is the new
+`tools/h-instr.sh`, `ds-instr.sh`'s twin on `tmp/q17-clone`, run 5 times.
+
+| run | before | after |
+|---|---|---|
+| 1 | 13.815 G | 12.226 G |
+| 2 | 13.815 G | 12.226 G |
+
+That is **−11.5 %**, which meets the bar.
+
+Q13 values are unchanged: acceptance Q13 MATCH, spotcheck Q13 = 35. Gates: units; spotcheck; acceptance 24
+MATCH; sf025 PASS=99 with plans 99/99 same; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestMatchLikeSegmentsEqualsWalk`. It is exhaustive over every pattern of length ≤ 5 on {a, b, %} against
+every string of length ≤ 6 on {a, b}, then runs 200 000 random cases. It also checks that `_` and escape patterns
+decline.
+
+**Discovery, filed as P0-E13 (S2).** Reading the walk showed that `_` consumes one BYTE. PG's MatchText consumes
+one character (pg_mblen) under UTF-8. goopg answers `'é' LIKE '_'` = f and `'é' LIKE '__'` = t, where PG answers
+t and f. This predates C17 (the fast path declines `_`); the repro is under `analysis/p0e13/`.
