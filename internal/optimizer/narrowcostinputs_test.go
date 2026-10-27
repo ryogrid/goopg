@@ -853,3 +853,41 @@ func TestNarrowedWidthMemoMatchesAndResets(t *testing.T) {
 		t.Fatalf("after the clause change: joinrel triple = %+v, want a_out only", got)
 	}
 }
+
+// M0122-0012 C16c: every GEQO tour evaluates in a fresh searchCtx
+// (freshEvalCtx), and PG's tours share one PlannerInfo. The search memos must
+// therefore be the parent's maps in every tour context: a value one tour
+// memoises is a hit in the next. Before C16c each tour allocated its own on
+// first use and re-derived every joinrel's inputs once per tour.
+func TestGEQOTourContextsShareSearchMemos(t *testing.T) {
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.clauses = &restrictInfoList{}
+	e1 := s.freshEvalCtx()
+	u1 := e1.pathkeyUsefulnessFor(RelSet(3))
+	e1.innerUniqueMemo[innerUniqueKey{outer: 1, inner: 2}] = []innerUniqueEntry{{unique: true}}
+	rel := newRelOptInfo(RelSet(1), 10, 8)
+	e1.memoRelNarrowedColumns(rel)
+	e1.memoAttrNeededAbove(RelSet(1))
+
+	e2 := s.freshEvalCtx()
+	if u2 := e2.pathkeyUsefulnessFor(RelSet(3)); u2 != u1 {
+		t.Fatal("pathkey usefulness rebuilt in the second tour")
+	}
+	if len(e2.innerUniqueMemo[innerUniqueKey{outer: 1, inner: 2}]) != 1 {
+		t.Fatal("inner-unique verdict not visible to the second tour")
+	}
+	if _, hit := e2.narrowColsMemo[rel]; !hit {
+		t.Fatal("narrowed columns not visible to the second tour")
+	}
+	if _, hit := e2.attrNeededMemo[RelSet(1)]; !hit {
+		t.Fatal("above-tree set not visible to the second tour")
+	}
+	// A different clause list is a different search input: the memos reset.
+	s.clauses = &restrictInfoList{}
+	if e3 := s.freshEvalCtx(); e3.pathkeyUsefulnessFor(RelSet(3)) == u1 || len(e3.attrNeededMemo) != 0 {
+		t.Fatal("memos survived a clause-list change")
+	}
+}

@@ -1753,6 +1753,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       identical\. Misses 0\. Next on return: C16c — pathkey usefulness \(14\.8 % after C16b:
       equivalentWithin/countContainedIn/keyOf; PG compares canonical pathkeys by pointer\), same Target; overlaps
       C15\. Design: part 9 §Slice 94\.
+    - **C16c LANDED \(slice 95, loop \#189\)**: `pathkeyUsefulnessFor` memoised per relids, and `freshEvalCtx` now
+      hands every GEQO tour the parent's search memos \(it built a new searchCtx per tour, so the slice 93/94 memos
+      had been per\-tour only — their measured gains came from within\-tour repeats\)\. Q64 5\.683/5\.678 →
+      5\.213/5\.204 Ginstr/plan \(**−8\.3 %, meets the bar**; −19\.9 % over 93–95\); sweep Q64 860 ms; plans
+      identical\. Misses 0\. Next on return: re\-profile Q64 \(per\-path truncateUselessPathkeys, addPathsForJointype
+      allocation\)\. Design: part 9 §Slice 95\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5230,6 +5236,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `fb6c415f1`** \(M0122\-0012 slice 93 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b1f699edf`** \(M0122\-0012 slice 94 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

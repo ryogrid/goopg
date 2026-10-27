@@ -1,5 +1,7 @@
 package optimizer
 
+import "unsafe"
+
 // truncate_useless_pathkeys for join rels (M0146-0005n).
 //
 // PG's build_join_pathkeys returns truncate_useless_pathkeys(root, joinrel,
@@ -199,6 +201,44 @@ func (s *searchCtx) pathkeyUsefulnessFor(joinrelids RelSet) *pathkeyUsefulness {
 	if s == nil {
 		return nil
 	}
+	owner := s.currentUsefulMemoOwner()
+	if s.usefulMemo == nil || s.usefulMemoOwner != owner {
+		s.usefulMemo = make(map[RelSet]*pathkeyUsefulness)
+		s.usefulMemoOwner = owner
+	}
+	if u, hit := s.usefulMemo[joinrelids]; hit {
+		return u
+	}
+	u := s.buildPathkeyUsefulness(joinrelids)
+	s.usefulMemo[joinrelids] = u
+	return u
+}
+
+// usefulMemoOwner is the identity of every input pathkeyUsefulnessFor reads
+// besides the relids: the clause list (and its length) and the backing arrays
+// of the query, group and distinct pathkeys.
+type usefulMemoOwner struct {
+	clauses                 *restrictInfoList
+	nclauses                int
+	query, group, distinct  *PathKey
+	nquery, ngroup, ndistin int
+}
+
+func (s *searchCtx) currentUsefulMemoOwner() usefulMemoOwner {
+	o := usefulMemoOwner{clauses: s.clauses,
+		query: unsafe.SliceData(s.queryPathkeys), nquery: len(s.queryPathkeys),
+		group: unsafe.SliceData(s.groupPathkeys), ngroup: len(s.groupPathkeys),
+		distinct: unsafe.SliceData(s.distinctPathkeys), ndistin: len(s.distinctPathkeys)}
+	if s.clauses != nil {
+		o.nclauses = len(s.clauses.all)
+	}
+	return o
+}
+
+// buildPathkeyUsefulness is pathkeyUsefulnessFor's computation. The result is
+// shared by every caller asking for the same relids: its lazily formed
+// indexes (ecByKey, the *Meta lists) depend on nothing else either.
+func (s *searchCtx) buildPathkeyUsefulness(joinrelids RelSet) *pathkeyUsefulness {
 	if s.exprKeys == nil {
 		s.exprKeys = make(map[Expr]cachedKey)
 	}

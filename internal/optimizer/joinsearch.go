@@ -93,6 +93,13 @@ type searchCtx struct {
 	// non_unique_for_rels (analyzejoins.c): GEQO re-asks the same pairs on
 	// every tour (M0122-0012 C16b).
 	innerUniqueMemo map[innerUniqueKey][]innerUniqueEntry
+	// usefulMemo memoises pathkeyUsefulnessFor per joinrel relids: its
+	// fields read only the relids, the clause list and the query's
+	// ordering/grouping/distinct pathkeys, and GEQO rebuilds the same joinrel
+	// on every tour (M0122-0012 C16c). usefulMemoOwner records the inputs it
+	// was filled for; any change resets it.
+	usefulMemo      map[RelSet]*pathkeyUsefulness
+	usefulMemoOwner usefulMemoOwner
 	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
 	// search's evaluation counter, and whether this evaluation context's join
 	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.

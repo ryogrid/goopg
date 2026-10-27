@@ -431,3 +431,54 @@ in both modes, must match the uncached proof on the first call and on a memo hit
 PG compares canonical pathkeys by pointer (`pathkeys_contained_in`, `pathkeys_useful_for_merging` over
 `root->canon_pathkeys`). goopg re-derives keys and equivalence per comparison. That is the next step, C16c,
 which joins pool entry C15's "pathkey canonicalisation".
+
+## Slice 95 — C16c: GEQO tours share the search memos (Q64 planning −8.3 %)
+
+Loop #189, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Planned step.** Memoise `pathkeyUsefulnessFor` (14 % after slice 94: growslice and map building per joinrel)
+per joinrel relids.
+
+**First measurement: zero.** 5.688/5.692 G against 5.683/5.686 G. The profile showed the builder still running on
+every call. The cause: `geqoEvalTour` evaluates each tour in a NEW `searchCtx` (`freshEvalCtx`). That context
+shared only `exprKeys` and `ecIdx` with the parent. A memo allocated lazily on first use therefore lived for
+one tour.
+
+**Correction to slices 93/94.** Their memos (narrowed widths, inner-unique verdicts) were likewise per tour. The
+measured −6.7 % and −6.2 % stand, but they came from repeats within a tour, not from the ~500-tour reuse the
+write-ups assumed.
+
+PG's tours all evaluate against the one PlannerInfo, so whatever a tour derives from query-level state is there
+for the next.
+
+**Change.**
+
+- `pathkeyUsefulnessFor` memoises per relids (`usefulMemo`; the builder is now `buildPathkeyUsefulness`). The
+  owner record (`usefulMemoOwner`) is the clause list and its length plus the backing arrays and lengths of the
+  query, group and distinct pathkeys; any change resets the memo.
+- `freshEvalCtx` calls `prepareSharedMemos` on the parent and hands every tour the parent's maps, as it already
+  did for `exprKeys`/`ecIdx`. That covers `narrowColsMemo`, `attrNeededMemo` with its owner, `innerUniqueMemo`,
+  and `usefulMemo` with its owner.
+
+Each memo reads only state every tour shares: base rels, the clause list, the query pathkeys and the catalog.
+
+**Measured.**
+
+| run | before (slice 94) | after |
+|---|---|---|
+| 1 | 5.683 G | 5.213 G |
+| 2 | 5.678 G | 5.204 G |
+
+That is **−8.3 %**, which meets the 3 % bar. Over slices 93–95, Q64 planning is −19.9 % in instructions (6.49 →
+5.21 G). The sweep's Q64 reads 860 ms; the census median is 1019 ms.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestGEQOTourContextsShareSearchMemos`. A value one tour context memoises is a hit in the next, and a
+clause-list change resets the memos.
+
+**Next.** Re-profile Q64. Before this slice, the per-path pathkey truncation (`truncateUselessPathkeys`: 14.8 %)
+and `addPathsForJointype`'s own allocation were the largest remaining shares.
