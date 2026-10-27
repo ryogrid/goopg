@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
@@ -398,11 +399,13 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		// every unit test passed — EXPLAIN is the only way a user OBSERVES a
 		// cost, so of all the recursive entry points this is the one that must
 		// not default.
+		planStart := time.Now()
 		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner}, nil
+		planningNs := time.Since(planStart).Nanoseconds()
+		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner, PlanningNs: planningNs}, nil
 
 	case *parser.CopyStmt:
 		// EX3-03 cut 1: COPY (SELECT …) plans a full SELECT, so it threads

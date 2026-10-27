@@ -2769,10 +2769,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     per\-loop average but time is the total; PG's ExplainNode \(explain\.c\) divides startup and total time by nloops\.
   - Resume point: internal/executor/operators\_explain\.go, the actual\-time renderer: divide by loops as explain\.c
     does; ledger row 2026\-10\-24 \(post slice 91 recon\)\.
-- [ ] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
+- [x] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN summary fidelity; census 22/22, sf025 plans 99/99 same\)
   Parent: none
+  - Done 2026\-10\-27 \(loop \#186, item 10's "rest of M0122"\)\. Cause: the timer wrapped executor `buildNode` \(PG's
+    ExecInitNode, an Execution Time item\), never the optimizer, which ran earlier in the planner's ExplainStmt arm\.
+    The planner now stamps its inner `PlanWithSettings` duration on `optimizer.Explain.PlanningNs`; `buildNode` moved
+    into Execution Time; plain `EXPLAIN \(SUMMARY ON\)` prints Planning Time as PG does\. Live Q64 on the SF0\.25
+    clone: Planning 836/843 ms, Execution 632/315 ms, wall 1\.47/1\.16 s\. Test
+    `TestExplainPlanningTimeIsPlannerDuration`\. Design doc
+    `docs/design/0100\-0149/m0122\-0019\-planning\-time\-is\-planner\-duration\.md`\. Analysis\+rewrite inside the
+    timer ledgered\.
   - Filed 2026\-10\-23 from M0122\-0012 slice 78\. On the SF0\.25 clone `EXPLAIN \(ANALYZE\)` of Q64 prints
     `Planning Time: 0\.169 ms` while a plan\-only EXPLAIN of the same text takes 1\.6–2\.0 s wall \(profile: 96 % under
     optimizer\.PlanWithSettings → geqoSearch\); PG prints its whole planner time \(ExplainOnePlan's planduration,

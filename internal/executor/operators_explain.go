@@ -68,7 +68,15 @@ func (o *explainOp) Open(ctx *Context) error {
 		// number to report. Per-node time= bracket is suppressed
 		// when nodeStats.timing is false (the wrapper skips
 		// time.Now() at row granularity).
-		planStart := time.Now()
+		//
+		// Planning Time is the planner's own duration, stamped on the
+		// Explain node where the inner statement was planned (PG times
+		// pg_plan_query alone, explain.c:350-356). Execution Time starts
+		// before the operator tree is built: buildNode is goopg's
+		// ExecInitNode, which PG counts inside ExecutorStart, i.e. in
+		// Execution Time (explain.c:525-565) (M0122-0019).
+		planNs = o.plan.PlanningNs
+		execStart := time.Now()
 		var inner Operator
 		var err error
 		inner, stats, err = withInstrumentation(timing, func(scope *instrumenter) (Operator, error) {
@@ -77,9 +85,6 @@ func (o *explainOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		planNs = time.Since(planStart).Nanoseconds()
-
-		execStart := time.Now()
 		if err := inner.Open(ctx); err != nil {
 			return err
 		}
@@ -133,6 +138,10 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 
+	// Without ANALYZE, SUMMARY defaults to off and an explicit SUMMARY ON
+	// prints the planner's time alone (ExplainQuery: es->summary =
+	// summary_set ? summary : analyze; ExplainOnePlan, explain.c:624).
+	plainSummary := opts.Set.Summary && opts.Summary
 	if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
 		// FORMAT JSON/XML/YAML: emit one row whose cell is the
 		// serialized plan tree, nested under a top-level "Plan" key
@@ -144,6 +153,9 @@ func (o *explainOp) Open(ctx *Context) error {
 			root["Planning"] = planningBufferUsageJSON(trackIOTiming)
 		}
 		addExplainSettingsGroup(ctx, opts, root)
+		if plainSummary {
+			root["Planning Time"] = nsToMs(o.plan.PlanningNs)
+		}
 		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
 			return err
@@ -154,6 +166,10 @@ func (o *explainOp) Open(ctx *Context) error {
 	var b strings.Builder
 	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx))
 	appendExplainSettingsRow(ctx, opts, &o.rows)
+	if plainSummary {
+		o.rows = append(o.rows,
+			Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(o.plan.PlanningNs)))})
+	}
 	return nil
 }
 

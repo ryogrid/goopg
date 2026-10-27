@@ -3226,6 +3226,10 @@ type Explain struct {
 	pos     int
 	Options parser.ExplainOptions
 	Child   Node
+	// PlanningNs is the wall time the planner spent on Child, the figure
+	// EXPLAIN ANALYZE prints as "Planning Time" — PG's ExplainOneQuery
+	// times pg_plan_query alone (explain.c:350-356) (M0122-0019).
+	PlanningNs int64
 }
 
 func (n *Explain) Pos() int { return n.pos }
