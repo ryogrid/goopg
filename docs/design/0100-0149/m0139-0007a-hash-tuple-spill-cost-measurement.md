@@ -1,5 +1,7 @@
 # M0139-0007a (arm 1/2) — measure `GOOPG_PG_HASH_TUPLE_SPILL_COST` (R108)
 
+**Status 2026-10-26: PROMOTED by M0147-0021** — `GOOPG_PG_HASH_TUPLE_SPILL_COST` is retired and the PG currency always prices hash-join batches; see [`m0147-0021-promote-pg-hash-tuple-spill-cost.md`](m0147-0021-promote-pg-hash-tuple-spill-cost.md).
+
 Status: accepted (measured 2026-09-15; **decision: HOLD — stays default-off**)
 
 ## Task

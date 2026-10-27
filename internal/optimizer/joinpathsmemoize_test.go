@@ -195,12 +195,11 @@ func TestGetMemoizePathGates(t *testing.T) {
 	}
 
 	t.Run("switch off", func(t *testing.T) {
-		prev := MemoizeEnabled()
-		SetMemoizeEnabled(false)
-		defer SetMemoizeEnabled(prev)
+		off := cp
+		off.enableMemoize = false
 		outer := newOuter(10000)
 		inner, _ := memoInnerRel(innerRelids, outerRelids, 1)
-		if p := getMemoizePath(s, outer, outer.CheapestTotal, inner.CheapestParameterized[1], cp); p != nil {
+		if p := getMemoizePath(s, outer, outer.CheapestTotal, inner.CheapestParameterized[1], off); p != nil {
 			t.Fatal("enable_memoize = off must suppress the path")
 		}
 	})

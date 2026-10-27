@@ -13,28 +13,14 @@ package optimizer
 // that offering the full Pathlist WITHOUT that credit cannot move a single
 // plan — this file is what makes the offer non-trivial.
 //
-// DEFAULT ON SINCE M0146-0006 (2026-10-04); the history below explains why
-// it was gated off until then.
-//
-// WHY GATED OFF BY DEFAULT. `createPlanNode` (createplan.go) and the executor
-// (`incrementalSortOp`) both got their arms in exec-a/b (M0141-S7), so a
-// winning tournament no longer panics. The flag stays off anyway: the
-// 2026-09-17h corpus measurement ran the full TPC-DS SF0.25 corpus (99
-// queries, including all 14 Incremental-Sort witnesses) with
-// `GOOPG_INCREMENTAL_SORT=on` and found ZERO Incremental Sort nodes anywhere
-// — this arm reads `ordered.SearchCandidates`/`SearchCandidateKeys`, and
-// those are populated only inside `createOrderedPaths`
-// (upperordered.go:106-118); `electOrderedGrouping`
-// (upperorderedgrouping.go), the GROUP_AGG upper rel's own ORDER BY election
-// loop, calls `addOrderedPaths` directly without going through
-// `createOrderedPaths` first, so every GroupAgg-shaped witness (5 of the 14)
-// structurally cannot reach this arm regardless of how far S2b-5/S2b-6 take
-// the `anyTranslated` gate. See the design doc's 2026-09-17h update for the
-// full writeup and the follow-up this filed. Matches the off-by-default
-// convention every other experimental path family in this package already
-// uses (`GOOPG_PARTIAL_SORT_PATHS`, `GOOPG_PARTIAL_AGG_PATHS`, …). With the
-// flag at its default the ORDERED tournament is byte-identical to before
-// this file existed: `addIncrementalSortPaths` returns immediately.
+// DEFAULT ON SINCE M0146-0006 (2026-10-04). It was gated off behind
+// GOOPG_INCREMENTAL_SORT until the GroupAgg-shaped witnesses could reach it
+// (the 2026-09-17h corpus measurement found zero Incremental Sort nodes with
+// the flag on, because `electOrderedGrouping` bypassed `createOrderedPaths`);
+// the design doc's 2026-09-17h update has the history. M0147-0043 retired the
+// env switch: the arm is now gated only by PG's own `enable_incremental_sort`
+// (`cp.enableIncrementalSort`, PlannerSettings.EnableIncrementalSort), exactly
+// as planner.c's create_ordered_paths is.
 //
 // CHILDREN ARE ALREADY SAFE TO MATERIALIZE. The candidates this arm stacks a
 // PathIncrementalSort over come from `ordered.SearchCandidates` — real
@@ -48,83 +34,6 @@ package optimizer
 // executor Node, so offering N-1 losing candidates costs nothing beyond the
 // struct itself, and `createPlanNode` runs exactly once, on whichever path
 // `setCheapest` picks — unchanged from every other upper rel in this package.
-//
-// GUC NOTE. PG prices this decision under its own `enable_incremental_sort`
-// GUC (catalog.go / defaults.go already declare it, default on, but nothing
-// in costParams reads it — the same "declared but unconsumed" shape the
-// project has hit before). This arm reuses `cp.enableSort` instead of adding a
-// second unconsumed-until-wired GUC field: an Incremental Sort is still a
-// sort, and `enable_sort=off` already disables `sortPathForBounded`'s
-// full-sort arm the same way. Wiring the dedicated GUC is deferred (ledger
-// row `m0141-s7-incremental-sort-guc`), because it is orthogonal to whether
-// the arm exists at all and the flag gate already keeps this inert.
-
-import (
-	"os"
-	"strings"
-)
-
-// incrementalSortMode is the admission rule for the third arm.
-//
-//   - off — addOrderedPaths behaves exactly as before this file (arms 1/2
-//     only).
-//   - on (default) — every OTHER surviving search candidate whose own
-//     ordering shares a genuine partial prefix with the required sort keys
-//     is also offered, as an Incremental Sort, to the ORDERED rel's
-//     tournament.
-type incrementalSortMode int
-
-const (
-	incrementalSortOff incrementalSortMode = iota
-	incrementalSortOn
-)
-
-// incrementalSortPathsMode is read once at process start, like every other
-// plan-shaping knob in this package, so a plan cannot change shape
-// mid-statement.
-var incrementalSortPathsMode = incrementalSortModeFromEnv(os.Getenv("GOOPG_INCREMENTAL_SORT"))
-
-// incrementalSortModeFromEnv resolves the knob. Default ON since M0146-0006:
-// PG's create_ordered_paths makes this offer under enable_incremental_sort
-// (default on), the executor operator and its EXPLAIN rendering exist
-// (M0141-S7-exec-a/b), and the arm also honours the GUC itself
-// (`cp.enableIncrementalSort`). `off` is the operational escape hatch.
-func incrementalSortModeFromEnv(v string) incrementalSortMode {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "off", "false", "0":
-		return incrementalSortOff
-	default:
-		return incrementalSortOn
-	}
-}
-
-// incrementalSortModeLabel spells the mode the way an operator would export
-// it, so the flag-provenance label round-trips (flaglabels.go's contract).
-func incrementalSortModeLabel(m incrementalSortMode) string {
-	if m == incrementalSortOn {
-		return "on"
-	}
-	return "off"
-}
-
-// setIncrementalSortPathsModeForTest pins the mode for one test and returns
-// the restore func. The knob is process-global by design, so a test that
-// flips it must put it back.
-func setIncrementalSortPathsModeForTest(m incrementalSortMode) func() {
-	prev := incrementalSortPathsMode
-	incrementalSortPathsMode = m
-	return func() { incrementalSortPathsMode = prev }
-}
-
-// SetIncrementalSortPathsMode is the same hook across the package boundary,
-// taking the label an operator would export (`off` / `on`) and resolving it
-// through the SAME function production resolves the environment variable
-// with — so a caller cannot select a mode the env knob could not. Mirrors
-// `SetPartialSortPathsMode` / `SetPartialAggPathsMode`; process-global, so a
-// caller must run the returned restore.
-func SetIncrementalSortPathsMode(label string) (restore func()) {
-	return setIncrementalSortPathsModeForTest(incrementalSortModeFromEnv(label))
-}
 
 // upperOrderedIncrementalSortProducer is this arm's DPPATH trace string
 // (pathtrace.go), sibling to upperOrderedInputProducer/upperOrderedSortProducer
@@ -152,7 +61,7 @@ const upperOrderedIncrementalSortProducer = "upper.ordered.incrementalsort"
 // materialized Node is a faithful stats source for a sibling candidate's own
 // prefix, not an approximation specific to the seed.
 func addIncrementalSortPaths(ordered *RelOptInfo, input *Path, sortPathkeys []PathKey, cp costParams, limitTuples float64) {
-	if incrementalSortPathsMode != incrementalSortOn || !cp.enableIncrementalSort {
+	if !cp.enableIncrementalSort {
 		return
 	}
 	for i, candidate := range ordered.SearchCandidates {

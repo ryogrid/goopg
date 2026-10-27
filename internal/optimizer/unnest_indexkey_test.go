@@ -317,8 +317,6 @@ func findFirstAggregate(node Node) *Aggregate {
 func TestIndexKeyCorrelatedExistsDecorrelates(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -346,8 +344,6 @@ func TestIndexKeyCorrelatedExistsDecorrelates(t *testing.T) {
 func TestIndexKeyCorrelatedNotExistsDecorrelatesToAnti(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE NOT EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -369,8 +365,6 @@ func TestIndexKeyCorrelatedNotExistsDecorrelatesToAnti(t *testing.T) {
 func TestIndexKeyExistsWithInnerResidualDecorrelates(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a < i_b)"
@@ -403,8 +397,6 @@ func TestIndexKeyExistsWithInnerResidualDecorrelates(t *testing.T) {
 // than by a whole-table GROUP BY + join (measured 58.27 s → 86.65 s), so
 // even with the harvest enabled it must remain a SubPlan.
 func TestIndexKeyScalarProbeCheapStaysSubPlan(t *testing.T) {
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE o_val < (SELECT avg(i_a) FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -426,8 +418,6 @@ func TestIndexKeyScalarProbeCheapStaysSubPlan(t *testing.T) {
 func TestIndexKeyToggleDeterminism(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
 
@@ -472,8 +462,6 @@ func TestIndexKeyToggleDeterminism(t *testing.T) {
 func TestIndexKeyCompositeCorrelationDecorrelatesKeepingBothPairs(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
-	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a = outer_t.o_val)"

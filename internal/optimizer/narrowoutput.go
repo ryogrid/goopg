@@ -1,20 +1,10 @@
 package optimizer
 
-import "os"
-
-// narrowBuild resolves GOOPG_NARROW_BUILD at process start. Default ON since
-// P4-A §18 step 5: narrowing the build side changes plans (fewer batches at a
-// fixed work_mem), and the step-4 gate — value-identical corpus at 64/4/512 MB,
-// TPC-DS sweep neutral, zero row-shape panics — cleared it. `=0` opts back out
-// to the un-narrowed arm. Read once, in the server: putting it on a client
-// command line sets it where nothing reads it (handover §2).
-var narrowBuild = narrowBuildFromEnv(os.Getenv("GOOPG_NARROW_BUILD"))
-
-// narrowBuildFromEnv is the flag's polarity, factored out so tests and the
-// flag-provenance table resolve the same default the process starts with
-// (flaglabels.go's contract: no literal restating a default elsewhere).
-// Opt-out polarity (`=0` disables), matching GOOPG_PGSHAPED_DP.
-func narrowBuildFromEnv(v string) bool { return v != "0" }
+// Build-side narrowing has been the default since P4-A §18 step 5 (the step-4
+// gate: value-identical corpus at 64/4/512 MB, TPC-DS sweep neutral, zero
+// row-shape panics). It shipped behind GOOPG_NARROW_BUILD (`=0` opted out to
+// the un-narrowed arm, for both hash-build and merge inputs); M0147-0040
+// retired the switch — no gate, CI or bench script ever set it.
 
 // narrowBuildInput narrows a hash-join build side (node, layout) pair to the
 // statement's needed columns. Take2 P4-01, rev 10 step 3: the call site is
@@ -50,7 +40,7 @@ func narrowBuildFromEnv(v string) bool { return v != "0" }
 // guard is untouched: the derived positions come from `neededKeepSet` over
 // the built node's OWN schema, ascending by construction.
 func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerPath *Path) (Node, outputLayout) {
-	if !narrowBuild || kind != "PathHashJoin" {
+	if kind != "PathHashJoin" {
 		return innerNode, innerLay
 	}
 	if innerNode == nil || innerPath == nil || innerPath.Rel == nil || !innerPath.Rel.NeededColsKnown {
@@ -110,7 +100,7 @@ func narrowBuildInput(kind string, innerNode Node, innerLay outputLayout, innerP
 //
 // Every refusal returns the pair untouched, like the hash arm.
 func narrowMergeInput(node Node, lay outputLayout, side, join *Path) (Node, outputLayout) {
-	if !narrowBuild || node == nil || side == nil || side.Rel == nil || !side.Rel.NeededColsKnown {
+	if node == nil || side == nil || side.Rel == nil || !side.Rel.NeededColsKnown {
 		return node, lay
 	}
 	var keep []int
@@ -729,11 +719,11 @@ func sameOutputColumns(a, b Schema) bool {
 // whatever those columns hold. Dropping the ones no part of the statement
 // references shrinks the hash table proportionally.
 //
-// This file provides the transformation and its flag. The call site is
-// `joinInputsFor`, behind GOOPG_NARROW_BUILD (P4-A §18 step 3; default ON
-// since step 5 — the step-4 value gate was clean at all three work_mem
-// budgets and the TPC-DS sweep neutral, so the flag now selects the OLD
-// behaviour, not the new one).
+// This file provides the transformation. The call site is `joinInputsFor`
+// (P4-A §18 step 3; default ON since step 5 — the step-4 value gate was
+// clean at all three work_mem budgets and the TPC-DS sweep neutral). The
+// GOOPG_NARROW_BUILD opt-out that selected the old behaviour was retired
+// at M0147-0040.
 //
 // WHY A `Project` AND NOT A NARROWED SCAN (rev 7). `projectOp` sizes its output
 // row from the SAME list its schema comes from (`o.out = acquireRow(len(o.targets))`,

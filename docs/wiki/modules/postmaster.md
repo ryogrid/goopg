@@ -122,7 +122,7 @@ flowchart TD
     L -->|hit| M[executor.BuildFastIterator]
     L -->|miss| N[parser plan + optimizer.Plan + cache Put]
     M --> O[Open/Next/Close + CommandComplete]
-    O --> P[ReadyForQuery + maybeForceGCAfterCommit]
+    O --> P[ReadyForQuery]
 ```
 
 The simple-query path parses the entire SQL string; multi-statement batches
@@ -236,16 +236,11 @@ Shutdown ladder (`ShutdownDeadline`, default 120 s): drain in-flight
 connections after the accept loop exits; `STOPIMMEDIATE` bypasses the deadline
 (0 s wait, mirroring SIGQUIT). `reloadConfig` reloads GUCs.
 
-### GC throttling (`dispatch.go`)
+### GC throttling (retired)
 
-`maybeForceGCAfterCommit` is counter-first (no STW in the hot path): the atomic
-`queriesWithoutFreeCounter` is evaluated first; `runtime.ReadMemStats` (which
-requires a brief STW) only when a round is due. Real `runtime.GC()` +
-`debug.FreeOSMemory()` only past `heapReleaseThresholdBytes` (4 GiB HeapInuse)
-or every `queriesPerForcedFree` (10,000) queries. Gated by `GOOPG_FORCED_GC`
-env (default OFF) — `SetForcedGCEnabled` for tests. The 10,000 counter was
-raised from 8 because the original pgbench-8 caused a STW ReadMemStats on every
-query and full GC every ~8 queries (43% CPU at c=10 SO).
+The commit-path forced GC (`maybeForceGCAfterCommit`, gated by
+`GOOPG_FORCED_GC`, default OFF) was deleted by M0147-0015 (2026-10-25). The
+server relies on the Go runtime's own GC pacing (`GOGC` / `GOMEMLIMIT`).
 
 ### autovacuum subpackage
 
@@ -346,10 +341,6 @@ sequenceDiagram
 - **`datconnlimit` self-inclusive count** — the check registers the backend
   FIRST so `CountByDatName` includes the new connection, matching
   `CountDBConnections`. Superusers are counted but skip the reject check.
-
-- **GC free is opt-in** — the forced-GC trigger ships DISABLED
-  (`GOOPG_FORCED_GC` unset). Benchmark runs that want deterministic memory
-  return must set it, but the default avoids pgbench STW regressions.
 
 - **NOTIFY commit-visibility** — notifications queue on `pending` but are only
   delivered once the notifying transaction commits; ROLLBACK discards them.
@@ -634,17 +625,7 @@ the catalog `Type`:
 `maybeConvertCellsForClientEncoding` applies the client encoding conversion
 when `client_encoding != server_encoding`.
 
-## GC counter tuning (`dispatch.go`)
+## GC counter tuning (retired)
 
-`parseForcedGCEnv` reads `GOOPG_FORCED_GC` from the environment: unset/`0`/
-`false`/`off` disables, anything else enables. `maybeForceGCAfterCommit` is
-called after every commit:
-
-1. Bump `queriesWithoutFreeCounter` atomically.
-2. If `GOOPG_FORCED_GC` is off, return immediately (no STW).
-3. Every `queriesPerForcedFree` (10,000) queries, or when
-   `runtime.MemStats.HeapInuse > heapReleaseThresholdBytes` (4 GiB), run
-   `runtime.GC()` + `debug.FreeOSMemory()`.
-
-The 10,000-counter (raised from 8) avoids the STW `ReadMemStats` + full GC on
-every query that caused a 43% CPU regression at pgbench c=10 SO.
+The forced-GC counter and `GOOPG_FORCED_GC` were deleted by M0147-0015; see
+"GC throttling (retired)" above.

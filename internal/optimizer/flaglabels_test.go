@@ -103,8 +103,8 @@ var goopgEnvName = regexp.MustCompile(`^GOOPG_[A-Z0-9_]+$`)
 //
 // It walks the AST rather than matching `os.Getenv("GOOPG_…")` in raw text,
 // because the regex form had a hole that was silently exploited for an entire
-// milestone: GOOPG_INDEX_PROBE_MULT is read through the envFloatDefault helper
-// (cost_funcs.go), not a literal os.Getenv call, so the detector never saw it
+// milestone: GOOPG_INDEX_PROBE_MULT was read through the envFloatDefault helper
+// (cost_funcs.go, since deleted), not a literal os.Getenv call, so the detector never saw it
 // and the flag that multiplies every NL-index probe cost was absent from every
 // benchmark artefact this table exists to stamp. Any read path — direct,
 // helper-wrapped, or one this package has not invented yet — puts the name in a
@@ -115,9 +115,15 @@ var goopgEnvName = regexp.MustCompile(`^GOOPG_[A-Z0-9_]+$`)
 // which a raw-text regex would report as reads.
 func plannerEnvNames(t *testing.T) map[string]string {
 	t.Helper()
+	return plannerEnvNamesExcept(t, "")
+}
+
+// plannerEnvNamesExcept is plannerEnvNames with one source file left out.
+func plannerEnvNamesExcept(t *testing.T, skip string) map[string]string {
+	t.Helper()
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
+		return !strings.HasSuffix(fi.Name(), "_test.go") && fi.Name() != skip
 	}, 0)
 	if err != nil {
 		t.Fatalf("parse package dir: %v", err)
@@ -174,13 +180,16 @@ func TestFlagProvenanceTableCoversPlannerEnv(t *testing.T) {
 // through a helper was invisible to the guard above. GOOPG_INDEX_PROBE_MULT was
 // the flag that slipped through (read via envFloatDefault, later via
 // os.Getenv into indexProbeMultFromEnv) until M0146-0159 retired it.
-// GOOPG_INCREMENTAL_SORT has the same shape — os.Getenv handed to
-// incrementalSortModeFromEnv at package init — so its presence in the
-// detector's output is the regression test for the detector.
+// GOOPG_EXISTS_TO_ANY has the same shape — os.Getenv handed to
+// existsToAnyFromEnv at package init — so its presence in the detector's
+// output is the regression test for the detector. flaglabels.go is left out
+// of the scan because it names every flag, live or retired, and would satisfy
+// the check on its own. (The fixture was GOOPG_INCREMENTAL_SORT until
+// M0147-0043, then GOOPG_NLI_COSTGATE until M0147-0051 retired each read.)
 func TestFlagProvenanceDetectorSeesHelperWrappedReads(t *testing.T) {
-	names := plannerEnvNames(t)
-	if _, ok := names["GOOPG_INCREMENTAL_SORT"]; !ok {
-		t.Fatal("detector did not see GOOPG_INCREMENTAL_SORT; the helper-wrapped-read hole is back")
+	names := plannerEnvNamesExcept(t, "flaglabels.go")
+	if _, ok := names["GOOPG_EXISTS_TO_ANY"]; !ok {
+		t.Fatal("detector did not see GOOPG_EXISTS_TO_ANY; the helper-wrapped-read hole is back")
 	}
 }
 

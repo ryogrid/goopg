@@ -50,16 +50,16 @@ import (
 // SELECT (not DML), no modifying CTE, `max_parallel_workers_per_gather > 0`,
 // not already inside a worker, and `max_parallel_hazard(parse) != UNSAFE`.
 //
-// C-19a carries the two the search can answer from its own inputs: the GUC
-// (through costParams) and goopg's process kill switch (GOOPG_PARALLEL=off,
-// which retires with the post-pass at P5-08). The statement-kind and
+// C-19a carries the one the search can answer from its own inputs: the GUC
+// (through costParams). goopg's process kill switch GOOPG_PARALLEL=off was
+// retired at M0147-0045. The statement-kind and
 // isolation-level halves live at the dispatch seam today
 // (`statementIsParallelSafe`, `ParallelSettings.IsSerializable`) and reach
 // the search with C-19d, when a partial path can first be CHOSEN — until
 // then a partial path over a DML statement's FROM clause is priced and
 // discarded, which is harmless.
 func parallelModeOK(cp costParams) bool {
-	return ParallelEnabled() && cp.maxParallelWorkersPerGather > 0
+	return cp.maxParallelWorkersPerGather > 0
 }
 
 // setBaseRelConsiderParallel is `set_rel_consider_parallel` for every initial

@@ -891,12 +891,6 @@ func addPartialSetOpPath(setOpRel *RelOptInfo, setOpNode *SetOp, cp costParams, 
 		// either, so cost_append never applies to it upstream.
 		return
 	}
-	if gatherPathsMode == gatherPathsOff {
-		// The only reader is (eventually) generateUsefulGatherPaths, gated
-		// by the same mode — producing under `off` buys nothing, same
-		// reasoning as addPartialHashJoinPath's identical guard.
-		return
-	}
 	left, right := setOpRel.LeftBranchRel, setOpRel.RightBranchRel
 	// C-19a's join-rel rule (build_join_rel, relnode.c:842), applied to the
 	// SetOp's two inputs instead of a join's two sides: both must consider

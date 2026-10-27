@@ -401,9 +401,6 @@ func TestBuildKeepSetDeclinesWithoutTarget(t *testing.T) {
 // provable identity (same function over the same schema and set) made
 // observable.
 func TestNarrowBuildInputTargetArmNarrows(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	rel := ptRel([]string{"a", "b", "c", "d"}, map[string]bool{"b": true, "d": true}, true)
 	p := ptScanPath(rel)
@@ -457,9 +454,6 @@ func TestNarrowBuildInputTargetArmNarrows(t *testing.T) {
 // position. The derivation must decline the Target and fall back to the
 // name-based keep, which correctly keeps a.
 func TestNarrowBuildInputCoordinateMismatchFallsBack(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	rel := ptRel([]string{"a", "b", "c"}, map[string]bool{"a": true}, true)
 	p := ptScanPath(rel)
@@ -493,9 +487,6 @@ func TestNarrowBuildInputCoordinateMismatchFallsBack(t *testing.T) {
 // different coordinate space — the comparison is names IN ORDER, not a set —
 // so the Target declines and the name-based fallback keeps the right column.
 func TestNarrowBuildInputSameLengthReorderedFallsBack(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	rel := ptRel([]string{"a", "b", "c"}, map[string]bool{"a": true}, true)
 	p := ptScanPath(rel)
@@ -998,9 +989,6 @@ func TestDeriveJoinKeepsDeclines(t *testing.T) {
 // parent-aware arm emits the narrower Project — and where it declines, the
 // Slice-2 arms run unchanged.
 func TestNarrowBuildInputJoinKeepArm(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	root, rels, _, _ := slice3WitnessTree(t)
 	deriveJoinKeeps(root)
@@ -1043,9 +1031,6 @@ func TestNarrowBuildInputJoinKeepArm(t *testing.T) {
 // built schema declines to the Slice-2 arms rather than emitting an empty
 // (or full-width) Project.
 func TestJoinKeepSetEmptyDeclinesToSlice2(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	rel := ptRel([]string{"a", "b", "c", "d"}, map[string]bool{"b": true, "d": true}, true)
 	rel.JoinKeep, rel.JoinKeepKnown = map[string]bool{"zzz": true}, true
@@ -1067,9 +1052,6 @@ func TestJoinKeepSetEmptyDeclinesToSlice2(t *testing.T) {
 // are kept together (F4) — the derivation never wrong-narrows a self-join,
 // it just narrows less.
 func TestJoinKeepSetSelfJoinOverkeeps(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	int4 := catalog.Type{Name: "int4"}
 	sch := Schema{
@@ -2094,9 +2076,6 @@ func TestDeriveJoinKeepsMergePoison(t *testing.T) {
 // proof: the cut runs exactly when every side-operand sort-key column
 // survives in the keep, and declines (pair untouched) otherwise.
 func TestNarrowMergeInputSortKeyPreservation(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	mkSide := func(joinKeep map[string]bool) (*noNode, outputLayout, *Path) {
 		rel := newRelOptInfo(2, 100, 32)
@@ -2162,19 +2141,12 @@ func TestNarrowMergeInputSortKeyPreservation(t *testing.T) {
 		}
 	})
 
-	t.Run("declines keyless and flag-off", func(t *testing.T) {
+	t.Run("declines keyless", func(t *testing.T) {
 		node, lay, side := mkSide(map[string]bool{"k2": true, "v": true})
 		if got, _ := narrowMergeInput(node, lay, side, mkJoin()); got == nil {
 			t.Fatal("nil node back; a decline returns the pair untouched")
 		} else if _, ok := got.(*Project); ok {
 			t.Error("keyless merge narrowed; a join with no keys has no ordering to preserve")
-		}
-		narrowBuild = false
-		defer func() { narrowBuild = true }()
-		if got, _ := narrowMergeInput(node, lay, side, mkJoin(keys...)); got == nil {
-			t.Fatal("nil node back; a decline returns the pair untouched")
-		} else if _, ok := got.(*Project); ok {
-			t.Error("narrowed with the flag off; want the pair untouched")
 		}
 	})
 }
@@ -2183,9 +2155,6 @@ func TestNarrowMergeInputSortKeyPreservation(t *testing.T) {
 // sort order) survives narrowing — pairs come out in HashKeys list order,
 // translated onto the narrowed merged row.
 func TestNarrowMergeInputKeyOrderPreserved(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	boundKey := func(name string, index int, ids RelSet) *ColumnRef {
 		return &ColumnRef{Index: index, Name: name}
@@ -2248,9 +2217,6 @@ func TestNarrowMergeInputKeyOrderPreserved(t *testing.T) {
 // over the join path can inventory them — so the policy is decline, with the
 // plain-inner shape noted as a future resume point, not part of this cut.
 func TestNestedLoopInputsDeclinePolicy(t *testing.T) {
-	old := narrowBuild
-	narrowBuild = true
-	defer func() { narrowBuild = old }()
 
 	t.Run("narrowBuildInput refuses NL kinds", func(t *testing.T) {
 		rel := ptRel([]string{"a", "b"}, map[string]bool{"a": true}, true)

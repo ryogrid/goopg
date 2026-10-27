@@ -3,13 +3,9 @@ package postmaster
 import (
 	"context"
 	"errors"
-	"os"
 	"fmt"
-	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -28,99 +24,6 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
-
-// queryHeapHighWaterMark is the per-query peak HeapInuse seen at
-// the end of `dispatchSimpleQueryViaExecutor`. If a query crosses
-// the soft threshold (heapReleaseThresholdBytes) we trigger a GC
-// and return memory to the OS via debug.FreeOSMemory(). Cheaper
-// queries skip the call to avoid the GC-overhead regressions
-// M0032-0005 documented (91 % GC time on Q9).
-//
-// M0061-0004: WSL2 went down during the M0061-0003 sweep with
-// peak VmHWM=16 GB, suggesting a process-level memory pressure.
-// `maybeForceGCAfterCommit` had been a no-op since M0032 ripped
-// out the unconditional GC. We now do a *conditional* free —
-// only when HeapInuse crossed the threshold during this query.
-const heapReleaseThresholdBytes = 4 << 30 // 4 GiB
-
-// queriesWithoutFreeCounter accumulates queries since the last
-// FreeOSMemory(). Even if no single query crosses the threshold,
-// we still issue one Free every N queries so a long sequence of
-// medium queries (Q1..Q22 sweep) cannot accumulate unreclaimed
-// retained allocations indefinitely.
-var queriesWithoutFreeCounter int64
-
-// queriesPerForcedFree gates how often we invoke runtime.GC()+FreeOSMemory()
-// when no single query has exceeded heapReleaseThresholdBytes.  The original
-// value of 8 was sized for TPC-H (queries that take seconds each); at pgbench
-// rates (thousands of queries per second) it caused a world-stop ReadMemStats
-// on *every* query and a full GC every ~8 queries — accounting for 43% of
-// CPU at c=10 SO.  10 000 still guards against long TPC-H drifts (22 queries
-// × hours = far below 10 000) while eliminating the pgbench overhead.
-const queriesPerForcedFree = 10_000
-
-// ——— Forced-GC feature flag (user request: make the explicit GC triggers
-// switchable and ship them DISABLED) ———
-//
-// forcedGCEnabledFlag gates the ENTIRE maybeForceGCAfterCommit body,
-// including its condition checks: when cleared, neither the per-query
-// counter nor ReadMemStats/HeapInuse sampling ever runs, and no
-// runtime.GC()/debug.FreeOSMemory is issued from this path. Default is
-// OFF; operators re-enable with GOOPG_FORCED_GC=on|true|1 (env read once
-// at init) or programmatically via SetForcedGCEnabled.
-var forcedGCEnabledFlag atomic.Bool
-
-func init() {
-	forcedGCEnabledFlag.Store(parseForcedGCEnv(os.Getenv("GOOPG_FORCED_GC")))
-}
-
-// parseForcedGCEnv interprets the GOOPG_FORCED_GC environment value.
-// Anything other than an affirmative token leaves the trigger disabled.
-func parseForcedGCEnv(raw string) bool {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "on", "true", "1", "yes":
-		return true
-	}
-	return false
-}
-
-// SetForcedGCEnabled flips the forced-GC trigger at runtime (tests, future
-// control-plane wiring).
-func SetForcedGCEnabled(v bool) { forcedGCEnabledFlag.Store(v) }
-
-// forcedGCEnabled reports whether explicit commit-path GC triggers may run.
-func forcedGCEnabled() bool { return forcedGCEnabledFlag.Load() }
-
-// maybeForceGCAfterCommit triggers `runtime.GC()` +
-// `debug.FreeOSMemory()` at the end of a Query message when
-// either:
-//   - HeapInuse > heapReleaseThresholdBytes  (this query was big), or
-//   - we've gone queriesPerForcedFree queries without a Free   (drift).
-//
-// Hot-path discipline: the atomic counter check is evaluated first (no
-// STW).  runtime.ReadMemStats (which requires a brief stop-the-world) is
-// only called when the counter says a GC round is due — keeping the common
-// sub-threshold path to a single atomic operation.
-func maybeForceGCAfterCommit() {
-	if !forcedGCEnabled() {
-		// Flag-disabled: skip BOTH the condition bookkeeping (counter bump)
-		// and any GC/FreeOSMemory work — the call becomes a single atomic
-		// load on the hot path.
-		return
-	}
-	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
-	if n < queriesPerForcedFree {
-		return // fast path: single atomic add, no STW
-	}
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
-	if ms.HeapInuse < heapReleaseThresholdBytes {
-		return
-	}
-	runtime.GC()
-	debug.FreeOSMemory()
-}
 
 // dispatchSimpleQueryViaExecutor is the parser-driven path for the
 // simple-query protocol: it parses the SQL, plans each statement,
@@ -1400,14 +1303,6 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
 		sess.EndImplicitTransaction(true)
-		// Forced GC only helps after a transaction that actually wrote (a
-		// read-only SELECT produces no retained heap worth a GC round). Gate
-		// on the write-XID predicate so pgbench -S never pays even the atomic
-		// counter add (perf-optimize3-dash/08 doc 10). Use ectx.Tx.XID, the
-		// Context's in-place-updated copy, not the stale outer tx.
-		if ectx.DidWrite() {
-			maybeForceGCAfterCommit()
-		}
 		// NOTIFY becomes visible to listeners at the notifying transaction's
 		// commit; publish the buffer accumulated by this autocommit batch.
 		// M0118-0009.
@@ -2009,7 +1904,6 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_mergejoin", &ps.EnableMergeJoin)
 	readBool("enable_nestloop", &ps.EnableNestLoop)
 	readBool("enable_memoize", &ps.EnableMemoize)
-	readBool(misc.GoopgEnableNestLoopIndex, &ps.EnableNestLoopIndex)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
 	readBool("geqo", &ps.Geqo)
@@ -2137,7 +2031,6 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(ps.EnablePresortedAggregate),
 		bit(ps.Geqo),
 		strconv.Itoa(ps.GeqoThreshold),
-		bit(ps.EnableNestLoopIndex),
 		strconv.Itoa(ps.GeqoEffort),
 		strconv.Itoa(ps.GeqoPoolSize),
 		strconv.Itoa(ps.GeqoGenerations),

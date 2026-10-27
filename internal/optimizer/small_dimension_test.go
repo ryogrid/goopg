@@ -154,26 +154,6 @@ func TestSmallDimensionTagHonoursExplicitHint(t *testing.T) {
 	}
 }
 
-// TestSmallDimensionTagIgnoresRelSizeFallbackStage pins a deliberate
-// asymmetry. GOOPG_RELSIZE_FALLBACK stages which COST consumers trust a
-// block-derived cardinality, and turning it off must restore pre-M0125-0003
-// plans — plans in which the small-dimension property was populated at every
-// stage (by name). Gating this derivation on the same knob would make
-// `GOOPG_RELSIZE_FALLBACK=0` also delete M0054-0010's build-side pinning,
-// which is not what the knob promises.
-func TestSmallDimensionTagIgnoresRelSizeFallbackStage(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	cat := catWithBlocks(1)
-	region := tpchRegion()
-
-	for _, stage := range []int{0, 1, 2, 3} {
-		SetRelSizeFallbackStage(stage)
-		if !smallDimensionTag(cat, region) {
-			t.Errorf("stage %d: the small-dimension tag must not depend on the relsize knob", stage)
-		}
-	}
-}
-
 // TestIsSmallDimensionSideReadsTheNodeTag pins the read side after the move off
 // `catalog.Table`: the answer travels on the scan node (including through the
 // Filter / Project / Sort wrappers the join planner meets), so an IndexScan

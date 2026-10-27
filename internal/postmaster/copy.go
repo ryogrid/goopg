@@ -636,7 +636,6 @@ func (s *Server) handleCopyInFrame(w *libpq.FrameWriter, st *copyInState, f libp
 					if cerr := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); cerr != nil {
 						return true, cerr
 					}
-					maybeForceGCAfterCommit()
 					if cerr := w.ReadyForQuery(); cerr != nil {
 						return true, cerr
 					}
@@ -721,7 +720,6 @@ func (s *Server) handleCopyInFrame(w *libpq.FrameWriter, st *copyInState, f libp
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); err != nil {
 				return true, err
 			}
-			maybeForceGCAfterCommit()
 			if err := w.ReadyForQuery(); err != nil {
 				return true, err
 			}

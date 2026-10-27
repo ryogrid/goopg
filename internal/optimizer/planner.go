@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
@@ -398,11 +399,13 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		// every unit test passed — EXPLAIN is the only way a user OBSERVES a
 		// cost, so of all the recursive entry points this is the one that must
 		// not default.
+		planStart := time.Now()
 		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner}, nil
+		planningNs := time.Since(planStart).Nanoseconds()
+		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner, PlanningNs: planningNs}, nil
 
 	case *parser.CopyStmt:
 		// EX3-03 cut 1: COPY (SELECT …) plans a full SELECT, so it threads
@@ -2176,13 +2179,9 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
 	node = rewriteScanInputsWithSingleTablePredicates(node, cat, plannerSet)
-	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
-	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
-	// the equi-join predicate matches a single-column B-tree index
-	// on the inner side AND the cost gate accepts. The pass is a
-	// no-op when the package-level kill-switch is off
-	// (`SetNLIEnabled(false)`).
-	node = rewriteJoinsToNLI(node, cat, plannerSet)
+	// (M0054-0006's nested-loop-index post-pass, rewriteJoinsToNLI, ran
+	// here until M0147-0051 deleted it: PG has no such pass, and once
+	// M0147-0053 let the search build its last customer it rewrote no join.)
 	// R77: price the rewrite-built SEMI/ANTI NLIs BEFORE the upper
 	// elections (aggregate stage, ORDER BY arm) read their seeds —
 	// otherwise the elections stamp winners priced on the seam base
@@ -4871,31 +4870,13 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 				// would be unreachable.
 				jn.Algo = JoinAlgoHash
 			case JoinTypeRight, JoinTypeFull:
-				// M0127-P4.2 (design leftdeep-joins/07 §3): RIGHT and FULL
-				// are no longer PINNED to merge. The pin was never a
-				// semantic requirement — it was the absence of outer fill in
-				// the hash executor — and it charged every RIGHT/FULL join a
-				// sort of BOTH inputs whatever the inputs looked like.
-				//
-				// What replaces it is a choice, not a new pin: merge stays
-				// the answer when neither side has an estimate (which is
-				// what PG picks there too), and hash wins as soon as the
-				// sorts can be priced. chooseOuterFillJoinAlgo carries the
-				// reasoning.
+				// RIGHT and FULL take merge. M0127-P4.2's hash-or-merge
+				// choice for them sat behind GOOPG_HASH_OUTER_JOIN (default
+				// off) and was retired by M0147-0014: neither arm is PG's
+				// add_paths_to_joinrel — the PG-shaped search prices hash
+				// and merge for these types itself, and this post-search
+				// assignment serves only the trees it did not build.
 				jn.Algo = JoinAlgoMerge
-				if algo, ok := chooseOuterFillJoinAlgo(EstimateRows(jn.Left), EstimateRows(jn.Right)); ok {
-					jn.Algo = algo
-				}
-				if jn.Algo == JoinAlgoHash && jn.Type == JoinTypeRight {
-					// Build on the LEFT (non-preserved) side so the
-					// preserved right side streams as the probe: the mirror
-					// image of the LEFT default, and the orientation whose
-					// fill is per-probe-row (PG HJ_FILL_OUTER) rather than a
-					// post-probe sweep. FULL needs both halves whichever way
-					// it is oriented, so it keeps build-on-the-right and pays
-					// for the sweep (PG HJ_FILL_INNER_TUPLES).
-					jn.BuildLeft = true
-				}
 			}
 			// INNER joins: let the cost model pick when both sides
 			// have row estimates. Hash stays the M0003 fallback

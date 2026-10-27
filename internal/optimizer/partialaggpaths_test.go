@@ -268,26 +268,10 @@ func TestPartialAggRefusesNonDecomposableBeforePricing(t *testing.T) {
 	}
 }
 
-// TestPartialAggModeOffIsTheSerialControlArm: with the knob off the verdict must
-// be the retired size rule's, bit for bit. This is what makes the A/B in
-// DESIGN §6.3 an A/B rather than two different experiments.
-func TestPartialAggModeOffIsTheSerialControlArm(t *testing.T) {
-	defer setPartialAggPathsModeForTest(partialAggPathsOff)()
-	for _, frac := range []float64{1e-6, 1e-4, 1e-2, 0.1, 0.5, 1.0} {
-		for _, workers := range []int{1, 2, 4, 8} {
-			agg := aggFixture(t, frac, 2, 1)
-			want := splitAggregateIsProfitable(agg, workers, true)
-			if got := partialAggSplitPays(agg, workers, true); got != want {
-				t.Errorf("frac=%g workers=%d: mode off gave %v, size rule gives %v",
-					frac, workers, got, want)
-			}
-		}
-	}
-}
-
 // TestPartialAggModeOnPricesWhatTheSizeRuleRefused is the behavioural delta this
-// slice exists to create. `aggColumnStats` refuses to descend through a Project,
-// so the retired rule returns "cannot estimate" and declines outright — dropping
+// slice existed to create. `aggColumnStats` refuses to descend through a Project,
+// so the retired rule (splitAggregateIsProfitable, deleted at M0147-0047)
+// returned "cannot estimate" and declined outright — dropping
 // the Gather below the aggregate and funnelling the whole input into the leader.
 // The priced model has no such hole: `estimateNumGroups` never refuses.
 func TestPartialAggModeOnPricesWhatTheSizeRuleRefused(t *testing.T) {
@@ -304,9 +288,6 @@ func TestPartialAggModeOnPricesWhatTheSizeRuleRefused(t *testing.T) {
 		t.Skip("aggColumnStats learned to descend through Project; " +
 			"this test's premise is gone and the delta must be re-stated")
 	}
-	if splitAggregateIsProfitable(agg, 4, true) {
-		t.Fatal("premise broken: the size rule was expected to refuse")
-	}
 	tour := createPartialGroupingPaths(agg, 4, true, c19gParams())
 	if tour == nil {
 		t.Fatal("the priced model refused too — it has inherited the same hole")
@@ -314,31 +295,6 @@ func TestPartialAggModeOnPricesWhatTheSizeRuleRefused(t *testing.T) {
 	if !tour.splitWins() {
 		t.Errorf("the priced model declined a 5.9M-row/2-group aggregate "+
 			"(split=%v nosplit=%v)", tour.split.Cost, tour.noSplit.Cost)
-	}
-}
-
-// TestPartialAggModeLabelRoundTrips is flaglabels.go's contract: the token
-// inside `unset(…)` re-exported verbatim must reproduce the arm.
-func TestPartialAggModeLabelRoundTrips(t *testing.T) {
-	for _, label := range []string{"off", "on"} {
-		if got := partialAggModeLabel(partialAggModeFromEnv(label)); got != label {
-			t.Errorf("%q round-tripped to %q", label, got)
-		}
-	}
-	// The DEFAULT moved to `on` with C-19g's upper-rel-resident half, so the
-	// direction a typo falls in moved with it: `off` is the explicit opt-out
-	// and anything unrecognised reads as the shipped default. What must still
-	// hold is that a typo cannot silently DISABLE the shipped behaviour —
-	// which is the same property, pointed the other way.
-	for _, bogus := range []string{"", "OFF!", "no thanks", "false-ish"} {
-		if partialAggModeFromEnv(bogus) != partialAggPathsOn {
-			t.Errorf("%q disabled the mode; an unrecognised value must read as the default", bogus)
-		}
-	}
-	for _, off := range []string{"off", "OFF", " Off ", "false", "0"} {
-		if partialAggModeFromEnv(off) != partialAggPathsOff {
-			t.Errorf("%q did not select the serial control arm", off)
-		}
 	}
 }
 

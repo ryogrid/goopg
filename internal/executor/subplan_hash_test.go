@@ -2,7 +2,7 @@ package executor
 
 // Stage 11 (S3, design bundle D4.3): hashed execution for uncorrelated
 // IN / NOT IN sublinks. Every test here runs its query through BOTH the
-// hashed probe and the linear reference path (SetHashedSubPlanEnabled)
+// hashed probe and the linear reference path (hashedSubPlanForceLinear)
 // and asserts identical results — the linear path is the correctness
 // oracle. The unnest pass is suppressed around each query so the
 // sublink actually survives as a SubPlan (with unnesting on, an
@@ -45,11 +45,11 @@ func runBothHashPaths(t *testing.T, ctx *Context, sql string) []Row {
 	optimizer.SetSubqueryUnnestEnabled(false)
 	defer optimizer.SetSubqueryUnnestEnabled(true)
 
-	SetHashedSubPlanEnabled(true)
-	defer SetHashedSubPlanEnabled(true) // package default
+	hashedSubPlanForceLinear.Store(false)
+	defer hashedSubPlanForceLinear.Store(false) // package default
 	hashed := runQuery(t, ctx, sql)
 
-	SetHashedSubPlanEnabled(false)
+	hashedSubPlanForceLinear.Store(true)
 	linear := runQuery(t, ctx, sql)
 
 	if len(hashed) != len(linear) {
@@ -112,7 +112,7 @@ func TestHashedInProbeActuallyFires(t *testing.T) {
 
 	optimizer.SetSubqueryUnnestEnabled(false)
 	defer optimizer.SetSubqueryUnnestEnabled(true)
-	SetHashedSubPlanEnabled(true)
+	hashedSubPlanForceLinear.Store(false)
 
 	// The IN sits under an OR, where no pipeline can pull it up. That is
 	// the shape PG 18.3 itself runs as `(hashed SubPlan 1)`. A top-level IN

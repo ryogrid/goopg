@@ -275,18 +275,20 @@ func TestEnableGatherMergeOffFallsBackToGatherBelowSort(t *testing.T) {
 	}
 }
 
-// TestKillSwitchSuppressesGatherMerge — the kill switch must cover both
-// variants, or disabling parallelism would leave ordered queries parallel.
+// TestKillSwitchSuppressesGatherMerge — max_parallel_workers_per_gather = 0
+// must cover both variants, or disabling parallelism would leave ordered
+// queries parallel.
 func TestKillSwitchSuppressesGatherMerge(t *testing.T) {
 	tbl := bigTable(t, "gm_kill")
 	root := sortOver(seqScanOver(tbl), testKeys())
 
-	prev := ParallelEnabled()
-	SetParallelEnabled(false)
-	defer SetParallelEnabled(prev)
-
-	if gm := findGatherMerge(MaybeAddGather(root, parallelTestSettings())); gm != nil {
-		t.Fatal("kill switch did not suppress GatherMerge")
+	s := parallelTestSettings()
+	if findGatherMerge(MaybeAddGather(root, s)) == nil {
+		t.Fatal("fixture no longer places a GatherMerge with workers available — the pin is vacuous")
+	}
+	s.MaxWorkersPerGather = 0
+	if gm := findGatherMerge(MaybeAddGather(root, s)); gm != nil {
+		t.Fatal("max_parallel_workers_per_gather = 0 did not suppress GatherMerge")
 	}
 }
 

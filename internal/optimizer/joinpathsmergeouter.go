@@ -284,12 +284,10 @@ func matchUnsortedOuterMergePartial(s *searchCtx, joinrel, outer, inner *RelOptI
 	jt parser.JoinType, innerUnique bool, keys, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64,
 	scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet, mu mergeUnique) {
 
-	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff {
+	if s == nil || !s.parallelModeOK {
 		sub := "mode"
 		if s == nil {
 			sub = "s-nil"
-		} else if gatherPathsMode == gatherPathsOff {
-			sub = "gather-off"
 		}
 		tracePVetoCtx(s, "mergeu", traceRelids(joinrel), traceRelids(outer), traceRelids(inner), "M0", "sub="+sub+" jt="+traceJoinTypeName(jt))
 		return

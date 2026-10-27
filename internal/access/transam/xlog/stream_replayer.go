@@ -59,6 +59,34 @@ type StreamReplayer struct {
 	// can ask whether replay has reached end-of-WAL. nil before the
 	// first Run.
 	iter *RecordIterator
+	// lastCheckpoint is the last checkpoint record replay applied, the
+	// restartpoint candidate (see ReplayedCheckpoint); hasCheckpoint is
+	// false before the first.
+	lastCheckpoint ReplayedCheckpoint
+	hasCheckpoint  bool
+}
+
+// ReplayedCheckpoint is the last checkpoint record a standby replayed: PG's
+// XLogCtl->lastCheckPointRecPtr / lastCheckPointEndPtr / lastCheckPoint,
+// which RecoveryRestartPoint (xlog.c) records for every replayed
+// XLOG_CHECKPOINT_ONLINE/SHUTDOWN and CreateRestartPoint later adopts into
+// pg_control (M0122-0013).
+type ReplayedCheckpoint struct {
+	// StartLSN is the record's internal 1-based start (PG's ReadRecPtr is
+	// StartLSN-1); EndLSN is PG's EndRecPtr.
+	StartLSN uint64
+	EndLSN   uint64
+	// Fields and Time are the record's decoded CheckPoint struct.
+	Fields CheckPointFields
+	Time   int64
+}
+
+// LastCheckpoint returns the last checkpoint record replay applied; ok is
+// false before the first.
+func (sr *StreamReplayer) LastCheckpoint() (ReplayedCheckpoint, bool) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.lastCheckpoint, sr.hasCheckpoint
 }
 
 // NewStreamReplayer constructs a replayer rooted at `mgr`.
@@ -173,7 +201,20 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 				sr.onXactReplay(xid, committed)
 			}
 		}
+		// RecoveryRestartPoint (xlog.c): remember the checkpoint for the
+		// checkpointer's next restartpoint. A legacy 1-byte marker carries
+		// no CheckPoint struct and is not a restartpoint candidate.
+		var cpRec ReplayedCheckpoint
+		cpOK := false
+		if isCheckpointRecord(rec) {
+			if f, t, ok := decodeCheckPointStruct(checkpointStructOf(rec)); ok {
+				cpRec, cpOK = ReplayedCheckpoint{StartLSN: rec.StartLSN, EndLSN: rec.EndLSN, Fields: f, Time: t}, true
+			}
+		}
 		sr.mu.Lock()
+		if cpOK {
+			sr.lastCheckpoint, sr.hasCheckpoint = cpRec, true
+		}
 		sr.records++
 		if applied {
 			sr.applied++

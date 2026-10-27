@@ -155,38 +155,6 @@ func TestHandleStableInnerCached(t *testing.T) {
 	}
 }
 
-// TestHandleKillSwitchLegacyLifecycle: with the engine off, the
-// pre-Stage-9 lifecycle is byte-for-byte back — a correlated EXISTS
-// rebuilds on every call and never rescans.
-func TestHandleKillSwitchLegacyLifecycle(t *testing.T) {
-	// M0125-0036: this probe's `= -999 OR EXISTS (…)` shape is what the
-	// EXISTS→ANY conversion consumes; the correlated-SubPlan path it
-	// grades is still live for every EXISTS the conversion declines.
-	pinCorrelatedSubPlanPath(t)
-	SetSubPlanRescanEnabled(false)
-	t.Cleanup(func() { SetSubPlanRescanEnabled(true) }) // restore the ON default
-
-	ctx, cleanup := statsFixture(t)
-	defer cleanup()
-
-	runQuery(t, ctx,
-		"SELECT * FROM t1 WHERE t1.a = -999 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)")
-
-	s := handleStat(t, ctx)
-	if s.Calls != 3 {
-		t.Fatalf("Calls = %d, want 3", s.Calls)
-	}
-	if s.Rebuilds != s.Calls {
-		t.Errorf("Rebuilds = %d, want == Calls (%d) on the legacy path", s.Rebuilds, s.Calls)
-	}
-	if s.Rescans != 0 {
-		t.Errorf("Rescans = %d, want 0 on the legacy path", s.Rescans)
-	}
-	if len(ctx.SubPlanHandles) != 0 {
-		t.Errorf("SubPlanHandles allocated on the legacy path: %d", len(ctx.SubPlanHandles))
-	}
-}
-
 // TestCloseSubPlansIdempotent: teardown twice, and after handles were
 // already closed, is a no-op; a fresh evaluation after teardown builds
 // a new handle.

@@ -116,7 +116,7 @@ func TestSubPlanStatsCorrelatedExistsRescans(t *testing.T) {
 // TestSubPlanStatsCorrelatedScalarRescans covers the one path that
 // already reuses an operator: a correlated scalar subquery whose
 // inner plan is index-scan-based is built once and re-Opened per
-// outer row (CorrSubqOps). The first call is the build, the rest
+// outer row (the Stage-9 handle). The first call is the build, the rest
 // are rescans.
 func TestSubPlanStatsCorrelatedScalarRescans(t *testing.T) {
 	ctx, cleanup := statsFixture(t, "CREATE INDEX t2_a_idx ON t2 (a)")
@@ -130,7 +130,7 @@ func TestSubPlanStatsCorrelatedScalarRescans(t *testing.T) {
 		t.Fatalf("Calls = %d, want 3", s.Calls)
 	}
 	if s.Rescans == 0 {
-		t.Errorf("Rescans = 0, want > 0: the CorrSubqOps path should reuse the built operator (Rebuilds=%d)", s.Rebuilds)
+		t.Errorf("Rescans = 0, want > 0: the handle should reuse the built operator (Rebuilds=%d)", s.Rebuilds)
 	}
 	if s.Rebuilds+s.Rescans != s.Calls {
 		t.Errorf("Rebuilds(%d)+Rescans(%d) = %d, want == Calls(%d): every call must be accounted for",

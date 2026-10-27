@@ -7,24 +7,16 @@ import (
 	"github.com/goopg/goopg/internal/executor/hashsize"
 )
 
-// pgHashTupleSpillCost is an R108 measurement switch. Only the exact value
-// "1" enables the alternative planner price; unset and every other spelling
-// retain the executor-map geometry path.
-var pgHashTupleSpillCost = pgHashTupleSpillCostFromEnv(os.Getenv("GOOPG_PG_HASH_TUPLE_SPILL_COST"))
-
-func pgHashTupleSpillCostFromEnv(v string) bool { return v == "1" }
-
-func pgHashTupleSpillCostEnabled() bool { return pgHashTupleSpillCost }
-
-func setPGHashTupleSpillCostForTest(on bool) func() {
-	old := pgHashTupleSpillCost
-	pgHashTupleSpillCost = on
-	return func() { pgHashTupleSpillCost = old }
-}
+// R108's PG hash-join spill price. It shipped behind
+// GOOPG_PG_HASH_TUPLE_SPILL_COST (default off) and M0147-0021 promoted it: on
+// both TPC-DS corpora the arm priced ~164k candidates in PG currency (some
+// spilling) without moving a single winning plan or cost digit, so executor
+// memory cannot move either.
 
 // pgHashTupleSpillGeometry is the one R108 branch decision shared by costing
-// and trace. usePG is true only when the opt-in switch, packed hash geometry,
-// and both PG heap-page calculations are valid.
+// and trace. usePG is true only when packed hash geometry and both PG
+// heap-page calculations are valid; otherwise the executor-map geometry path
+// (hashsize.Choose) prices the batches.
 type pgHashTupleSpillGeometry struct {
 	usePG                 bool
 	hash                  pgHashGeometryResult
@@ -32,9 +24,6 @@ type pgHashTupleSpillGeometry struct {
 }
 
 func pgHashTupleSpillGeometryFor(in hashJoinInputs, cp costParams) pgHashTupleSpillGeometry {
-	if !pgHashTupleSpillCostEnabled() {
-		return pgHashTupleSpillGeometry{}
-	}
 	hash, ok := pgHashGeometry(in.innerRows, in.innerWidth, cp.workMem)
 	if !ok {
 		return pgHashTupleSpillGeometry{}

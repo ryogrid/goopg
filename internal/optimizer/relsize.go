@@ -2,140 +2,21 @@ package optimizer
 
 import (
 	"math"
-	"os"
-	"strconv"
-	"strings"
-	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// relsizeFallbackStage selects how many of the three planner consumers read the
-// block-count relation-size fallback. 0 is off, and off means the planner
-// behaves exactly as it did before M0125-0003 — no catalog read, no estimate,
-// byte-identical plans.
-//
-// The staging exists because a single flag switching all three consumers at
-// once produces one number and no attribution (design §D4):
-//
-//	1 — EstimateRows (and, until M0127-P6.2, the MultiHashJoin probe-side
-//	    choice). Shape-neutral for TPC-H; the cheap first cut. IMPLEMENTED.
-//	2 — + the bushy DP seed (rowCounts[i]). Where round 4's statistics
-//	    regressions live, because this is the first consumer that moves the
-//	    JOIN ORDER rather than a single node's choice. IMPLEMENTED.
-//	3 — + estimateBaseRelInfo.baseRows. NOT YET WIRED — stage 3.
-//
-// A stage enables every consumer up to and including itself, so setting 3 today
-// yields stage-2 behavior: the later consumer simply does not read the flag
-// yet. Values are cumulative by construction and stage 3 will need no
-// re-spelling of the knob.
-//
-// # Default: stage 2 since M0125-0005 (2026-07-30). It shipped OFF.
-//
-// M0125-0003 landed the fallback default-off, mirroring costDrivenJoinOrder
-// (bushy.go), because design §D5.3 predicted that at S-cold it plausibly
-// imports round 4's statistics regressions into every un-ANALYZEd server.
-// M0125-0005 measured that prediction on three independent workloads and it
-// did not hold — the fallback is a large win with no measured correctness
-// cost, so leaving it off was leaving the default wrong:
-//
-//   - TPC-H 21-query stream, S-cold: 693.8 s -> 494.0 s (1.40x), four wins to
-//     3.4x, ZERO regressions, identical rows. None of round 4's five regressed
-//     queries regressed here.
-//   - TPC-DS SF0.5, all 99 queries: timeout class 16 -> 13, PASS 79 -> 82, and
-//     zero MISMATCH/CKMISMATCH/ERROR — all 78 common PASSes agree on rows AND
-//     on value checksum. Common-PASS wall clock -18.8%.
-//   - scripts/tpch-spotcheck.sh, the gate every commit pays, S-cold: 75.0 s ->
-//     30.9 s (2.43x), Q12 62.4 s -> 19.6 s, identical row counts, peak scope
-//     memory unchanged.
-//
-// One measured cost, recorded here so the default is not remembered as free:
-// TPC-DS Q72 is 1.13x SLOWER (270 s -> 305 s at a 900 s budget), which crosses
-// the SF0.5 gate's 300 s cap and turns its PASS into a TIMEOUT. That is a
-// budget crossing, not a hang, and it is unexplained; deferral ledger row
-// 2026-07-30. Q35 — M0125-0003's own acceptance query — still times out, so
-// this default is NOT what Q35 was waiting for.
-//
-// Turning it back off is `GOOPG_RELSIZE_FALLBACK=0` (or off/false/no), which
-// restores byte-identical pre-M0125-0003 plans; that is the reopen path
-// design §7.3 RC-5 asks for.
-var relsizeFallbackStage atomic.Int64
-
-// defaultRelSizeFallbackStage is the stage an unset — or unrecognised —
-// GOOPG_RELSIZE_FALLBACK selects. See the flip rationale above.
-const defaultRelSizeFallbackStage = 2
-
-func init() {
-	relsizeFallbackStage.Store(int64(parseRelSizeFallbackStage(os.Getenv("GOOPG_RELSIZE_FALLBACK"))))
-}
-
-// parseRelSizeFallbackStage maps the GOOPG_RELSIZE_FALLBACK value to a stage.
-// "0"/"off"/"false"/"no" disable it; "1"/"2"/"3" select a stage exactly;
-// everything else — including the empty string, "on"/"true"/"yes", and any
-// unparseable value — is defaultRelSizeFallbackStage.
-//
-// M0125-0005 INVERTED the failure direction, and both halves of that are
-// deliberate:
-//
-//   - Unparseable now means "the default", not "off". While the flag shipped
-//     off, the hazard was a typo silently ENABLING a plan-shape change, so
-//     "off" was the safe landing. Now that stage 2 is what goopg ships, "off"
-//     is itself a deviation, and the hazard is a typo silently giving an
-//     operator a planner that production does not run. The only way to get
-//     non-default planner behavior is to spell a value this function
-//     recognises.
-//   - "on"/"true"/"yes" meant stage 1 while stage 1 was the whole feature.
-//     Post-flip that reading would be a trap: someone writing "true" to be
-//     sure it is enabled would silently get LESS than the default. They now
-//     mean the default. Nothing on record ever set the word forms — every
-//     measurement arm used the numerals — so no artefact changes meaning.
-//     Stage 1 specifically is still reachable, as "1".
-func parseRelSizeFallbackStage(v string) int {
-	switch s := strings.ToLower(strings.TrimSpace(v)); s {
-	case "0", "off", "false", "no":
-		return 0
-	case "", "on", "true", "yes":
-		return defaultRelSizeFallbackStage
-	default:
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 {
-			return defaultRelSizeFallbackStage
-		}
-		if n > 3 {
-			n = 3
-		}
-		return n
-	}
-}
-
-// SetRelSizeFallbackStage sets the fallback stage and returns the previous
-// value, so a test can restore it and stay order-independent.
-func SetRelSizeFallbackStage(stage int) int {
-	if stage < 0 {
-		stage = 0
-	}
-	return int(relsizeFallbackStage.Swap(int64(stage)))
-}
-
-// relSizeFallbackRows is the single gated entry point every staged consumer
-// goes through: it returns the block-count relation-size estimate for tbl, or 0
-// when the consumer introduced at `stage` is not enabled. 0 means "no estimate"
-// and every caller must keep its pre-M0125-0003 behavior on it — that is what
-// makes each staging commit inert until its flag value is set.
-//
-// The stage number is the CALLER's, not the flag's, so a consumer can never
-// accidentally read the fallback one stage early: stage 1 is stamped by
-// stage1RelSizeRows (planner.go, the SeqScan leaf) and stage 2 by
-// bushySeedRowCounts (bushy.go, the DP seed).
 // relSizeFallbackRows is the block-derived relation-size estimate, always on.
 //
 // take2 P1-05 retired the GOOPG_RELSIZE_FALLBACK staging. The flag existed to
-// sequence three consumers while the feature was being introduced; it has
-// shipped at stage 2 — every consumer enabled — since M0125-0005, so the only
-// states it still selected were "give this operator a planner production does
-// not run". That is the hazard flaglabels.go's header describes from the other
-// direction, and the flag had already twice caused artefacts to be stamped with
-// a regime they did not measure.
+// sequence three consumers while the feature was being introduced (M0125-0003,
+// default stage 2 since M0125-0005's TPC-H / TPC-DS measurement); once every
+// consumer was on, the only states it still selected were "give this operator a
+// planner production does not run". That is the hazard flaglabels.go's header
+// describes from the other direction, and the flag had already twice caused
+// artefacts to be stamped with a regime they did not measure. P1-05 left the
+// env read and its test setter behind, storing a stage nothing loaded;
+// M0147-0016 deleted them.
 //
 // The `stage` parameter is gone rather than ignored: a parameter every caller
 // passes a constant to, which nothing reads, is how the next reader concludes
@@ -163,8 +44,7 @@ func relSizeFallbackRows(cat catalog.Catalog, tbl *catalog.Table) int64 {
 // search reads a base relation's cardinality exactly once, through
 // `initialRelRows` → `baseRelInfo.filteredRows`, so there is no second consumer
 // left to shadow and nothing to stage: the placement is simply correct here, at
-// the stage the seam already runs at. `GOOPG_RELSIZE_FALLBACK=3` keeps
-// answering with stage-2 behaviour, as documented.
+// the stage the seam already runs at.
 //
 // Against the pre-filter stamping this replaces (both fields set to the raw
 // fallback), it differs in exactly one reachable state — an ANALYZEd relation

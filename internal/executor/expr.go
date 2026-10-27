@@ -3583,6 +3583,14 @@ func likeEscapeRewrite(pattern, escape string, runeMode bool, pos int) (string, 
 // translation, so embedded special chars in the input never interact with
 // regex syntax).
 func matchSQLLike(s, pat string) bool {
+	if m, ok := matchLikeSegments(s, pat); ok {
+		return m
+	}
+	return matchSQLLikeWalk(s, pat)
+}
+
+// matchSQLLikeWalk is the general backtracking LIKE walk.
+func matchSQLLikeWalk(s, pat string) bool {
 	si, pi := 0, 0
 	starS, starP := -1, -1
 	for si < len(s) {
@@ -3625,6 +3633,47 @@ func matchSQLLike(s, pat string) bool {
 		pi++
 	}
 	return pi == len(pat)
+}
+
+// matchLikeSegments is matchSQLLike for a pattern whose only metacharacter is
+// '%' (ok=false otherwise: '_' or the backslash escape take the general
+// walk). Such a pattern is a glob of literal segments, and its match is
+// decided without backtracking: the first segment is a prefix, the last a
+// suffix of what remains, and each middle segment is found leftmost in
+// order — the answer the backtracking walk reaches, since a leftmost match of
+// a literal can never be beaten by a later one. strings.Index is a SIMD
+// substring search; TPC-H Q13's `o_comment NOT LIKE '%special%requests%'`
+// spent 7 % of its time in the byte-by-byte walk (M0122-0012 C17). PG's
+// MatchText (like_match.c) has the same bytewise semantics for '%' over a
+// single-byte or UTF-8 server encoding.
+func matchLikeSegments(s, pat string) (matched, ok bool) {
+	if strings.IndexByte(pat, '_') >= 0 || strings.IndexByte(pat, '\\') >= 0 {
+		return false, false
+	}
+	i := strings.IndexByte(pat, '%')
+	if i < 0 {
+		return s == pat, true
+	}
+	if !strings.HasPrefix(s, pat[:i]) {
+		return false, true
+	}
+	s, rest := s[i:], pat[i+1:]
+	for {
+		j := strings.IndexByte(rest, '%')
+		if j < 0 {
+			return strings.HasSuffix(s, rest), true
+		}
+		seg := rest[:j]
+		rest = rest[j+1:]
+		if seg == "" {
+			continue
+		}
+		k := strings.Index(s, seg)
+		if k < 0 {
+			return false, true
+		}
+		s = s[k+len(seg):]
+	}
 }
 
 // pgPatternToGoRE2 translates PostgreSQL-specific regex escapes that are not
@@ -11269,8 +11318,8 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 	var loweredKey string
 	if lowered {
 		// D4.1: bind the correlation params before any inner-plan
-		// path runs — both the CorrSubqOps rescan below and a full
-		// rebuild read the slots via ExecParamRef.
+		// path runs — both the handle rescan below and a full rebuild
+		// read the slots via ExecParamRef.
 		var bindErr error
 		loweredKey, bindErr = bindSubPlanParams(x, x.ParParam, x.Args, row, ctx)
 		if bindErr != nil {
@@ -11289,8 +11338,7 @@ func evalSubquery(x *optimizer.SubqueryExpr, row Row, ctx *Context) (Datum, erro
 
 	// Fast path: correlated subquery whose inner plan is an index-probe
 	// chain. Skip the result caches entirely — the operator rescans correctly
-	// per outer row (Stage-9 handle, or the legacy CorrSubqOps registry
-	// when the engine is off), so the key-build + map overhead is
+	// per outer row (Stage-9 handle), so the key-build + map overhead is
 	// unnecessary. Rescanning caches nothing, so this path needs no
 	// volatility gate.
 	if !x.IsNonCorrelated && planIsIndexScanBased(x.Plan) {
@@ -11362,43 +11410,15 @@ func subqueryImpl(x *optimizer.SubqueryExpr, ctx *Context) (Datum, error) {
 	//    Scan the inner table ONCE (O(N)) to build key→value map, then do
 	//    O(1) lookups. Works even when no btree index exists.
 	if !x.IsNonCorrelated {
-		// Path 1: IndexScan-based (btree index exists). With the
-		// Stage-9 engine the generic handle serves this (classified
-		// rescanReOpen — identical lifecycle to the old CorrSubqOps
-		// registry, which remains only for the legacy kill-switch
-		// path).
+		// Path 1: IndexScan-based (btree index exists). The Stage-9
+		// handle serves this, classified rescanReOpen (the retired
+		// CorrSubqOps registry had the same lifecycle; M0147-0036).
 		if planIsIndexScanBased(x.Plan) {
-			if subPlanRescanEnabled() {
-				op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
-				if err != nil {
-					return Datum{}, err
-				}
-				defer done()
-				return subqueryReadOne(op, x)
-			}
-			if ctx.CorrSubqOps == nil {
-				ctx.CorrSubqOps = make(map[*optimizer.SubqueryExpr]Operator)
-			}
-			op, found := ctx.CorrSubqOps[x]
-			if found {
-				// Re-Open of an already-built operator: the one
-				// place goopg already does what upstream always
-				// does (ExecReScan rather than re-instantiate).
-				ctx.subPlanStat(x).Rescans++
-			} else {
-				ctx.subPlanStat(x).Rebuilds++
-				var buildErr error
-				op, buildErr = Build(x.Plan)
-				if buildErr != nil {
-					return Datum{}, buildErr
-				}
-				ctx.CorrSubqOps[x] = op
-			}
-			if err := op.Open(ctx); err != nil {
-				delete(ctx.CorrSubqOps, x)
-				_ = op.Close()
+			op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+			if err != nil {
 				return Datum{}, err
 			}
+			defer done()
 			return subqueryReadOne(op, x)
 		}
 

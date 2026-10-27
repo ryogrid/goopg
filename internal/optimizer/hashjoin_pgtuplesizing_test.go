@@ -18,24 +18,15 @@ func TestPGHashTupleSpillTraceMatchesCostFallbackAndDecision(t *testing.T) {
 		return lines[0]
 	}
 
-	restore := setPGHashTupleSpillCostForTest(false)
-	off := capture()
-	restore()
-	if !strings.Contains(off, "currency=map") || !strings.Contains(off, "pgtuplebytes=80") || !strings.Contains(off, "pgbuckets=1024") {
-		t.Fatalf("switch-off trace lacks map fallback or packed geometry: %q", off)
-	}
-
-	restore = setPGHashTupleSpillCostForTest(true)
+	// M0147-0021 promoted the PG currency, so a valid geometry always traces it.
 	on := capture()
-	restore()
-	if !strings.Contains(on, "currency=pg") || !strings.Contains(on, "pgouterpages=1") || !strings.Contains(on, "pginnerpages=6") {
-		t.Fatalf("valid switch-on trace lacks actual PG decision/pages: %q", on)
+	if !strings.Contains(on, "currency=pg") || !strings.Contains(on, "pgouterpages=1") || !strings.Contains(on, "pginnerpages=6") ||
+		!strings.Contains(on, "pgtuplebytes=80") || !strings.Contains(on, "pgbuckets=1024") {
+		t.Fatalf("valid trace lacks the PG decision, pages or packed geometry: %q", on)
 	}
 
 	outer.Rel.Width = 0
-	restore = setPGHashTupleSpillCostForTest(true)
 	invalid := capture()
-	restore()
 	if !strings.Contains(invalid, "currency=map") || !strings.Contains(invalid, "pgouterpages=-") {
 		t.Fatalf("invalid outer width must trace cost fallback: %q", invalid)
 	}

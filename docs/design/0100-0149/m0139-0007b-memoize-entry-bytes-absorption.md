@@ -1,5 +1,7 @@
 # M0139-0007b — port PG's Memoize entry-byte currency (absorption + measurement)
 
+**Status 2026-10-26: PROMOTED by M0147-0022** — `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST` is retired; the PG currency (with M0139-0007c's per-key term) always prices Memoize cache entries when the width is known. See [`m0147-0022-promote-pg-memoize-entry-bytes-cost.md`](m0147-0022-promote-pg-memoize-entry-bytes-cost.md).
+
 Status: accepted
 
 ## Task

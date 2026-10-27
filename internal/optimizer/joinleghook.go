@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"sync/atomic"
 )
 
@@ -9,7 +8,7 @@ import (
 // "The structural blocker, already located").
 //
 // joinInputsFor (createplanjoin.go) already narrows a hash join's INNER
-// (build) side (narrowBuildInput, narrowoutput.go, GOOPG_NARROW_BUILD) and
+// (build) side (narrowBuildInput, narrowoutput.go) and
 // BOTH sides of a merge join (narrowMergeInput). Three legs it never
 // reaches, because nothing in the pipeline ever wraps them: a hash join's
 // OUTER (probe) side, and both sides of every nested-loop shape (plain NL
@@ -36,22 +35,16 @@ import (
 // narrowBuildInput's existing keep-set derivation (buildKeepSet /
 // joinKeepSet / neededKeepSet) rather than inventing a second one, and
 // calls narrowPlanOutput with the result — the same "wrap in a *Project
-// naming only the kept columns" mechanism GOOPG_NARROW_BUILD and
-// GOOPG_NARROW_UPPER/GOOPG_NARROW_UPPER_SORT already ship. It is now
+// naming only the kept columns" mechanism the build-side and
+// upper-narrowing passes already ship. It is now
 // genuinely load-bearing: a leg this hook narrows changes the plan (the new
 // *Project node) and the row width flowing into whatever join sits above
 // it.
 //
-// narrowLegHook resolves GOOPG_NARROW_LEG_HOOK at process start. Opt-out
-// polarity (`=0` disables), matching every other narrowing flag in this
-// family (GOOPG_NARROW_BUILD, GOOPG_NARROW_UPPER, GOOPG_NARROW_UPPER_SORT):
-// the flag exists so a gate can measure the FLAG rather than the commit.
-var narrowLegHook = narrowLegHookFromEnv(os.Getenv("GOOPG_NARROW_LEG_HOOK"))
-
-// narrowLegHookFromEnv is the flag's polarity, factored out so tests
-// resolve the same default the process starts with (flaglabels.go's
-// contract: no literal restating a default elsewhere).
-func narrowLegHookFromEnv(v string) bool { return v != "0" }
+// The hook ran behind GOOPG_NARROW_LEG_HOOK (opt-out, `=0` disabled it) so a
+// gate could measure the flag rather than the commit. M0147-0031 retired the
+// switch: no gate, CI or bench script ever set it, and the hook is
+// unconditional.
 
 // legHookFireCount counts calls to narrowJoinLeg that found an
 // eligible-but-currently-unhooked leg (flag on, node still a bare
@@ -70,7 +63,7 @@ var legHookFireCount atomic.Int64
 // leg of an NLI join (`kind == "PathNestLoop(NLI)"` at the joinInputsFor
 // call site) — see the guard below for why.
 func narrowJoinLeg(n Node, lay outputLayout, p *Path, nliInner bool) (Node, outputLayout) {
-	if !narrowLegHook || n == nil {
+	if n == nil {
 		return n, lay
 	}
 	if _, already := n.(*Project); already {

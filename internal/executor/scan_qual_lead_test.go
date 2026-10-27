@@ -45,9 +45,9 @@ func TestScanQualLeadMatchesWholeQual(t *testing.T) {
 		scanSkipDisabled = true
 		whole := leadResult(t, ctx, q)
 		scanSkipDisabled = false
-		scanPrefilterOn.Store(false)
+		scanPrefilterForceLate.Store(true)
 		late := leadResult(t, ctx, q)
-		scanPrefilterOn.Store(true)
+		scanPrefilterForceLate.Store(false)
 		if got != whole || got != late {
 			t.Fatalf("%s:\nlead  %.200s\nwhole %.200s\nlate  %.200s", q, got, whole, late)
 		}

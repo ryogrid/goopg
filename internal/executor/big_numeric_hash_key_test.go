@@ -79,13 +79,13 @@ func TestBigNumericInProbeMatchesLinearOracle(t *testing.T) {
 	defer cleanup()
 
 	const q = "SELECT tag FROM bna WHERE k IN (SELECT k FROM bnb) ORDER BY tag"
-	SetHashedSubPlanEnabled(true)
-	t.Cleanup(func() { SetHashedSubPlanEnabled(true) })
+	hashedSubPlanForceLinear.Store(false)
+	t.Cleanup(func() { hashedSubPlanForceLinear.Store(false) })
 	hashed, err := runQueryWithErr(ctx, q)
 	if err != nil {
 		t.Fatalf("hashed: %v", err)
 	}
-	SetHashedSubPlanEnabled(false)
+	hashedSubPlanForceLinear.Store(true)
 	linear, err := runQueryWithErr(ctx, q)
 	if err != nil {
 		t.Fatalf("linear: %v", err)

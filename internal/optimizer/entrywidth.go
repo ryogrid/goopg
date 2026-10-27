@@ -51,7 +51,7 @@ func buildAvgVarBytes(build *Path, retained Schema) float64 {
 		return 0
 	}
 	full := build.Rel.AvgVarBytes
-	widths := build.Rel.ColVarBytes
+	widths := build.Rel.colVarBytes()
 	if len(widths) == 0 || len(retained) == 0 {
 		return full
 	}
@@ -99,6 +99,26 @@ func tableColVarBytes(tbl *catalog.Table) map[string]float64 {
 // share a column name) keeps the WIDER of the two widths: the map is consumed
 // by name, so a collision must resolve in the direction that over-states the
 // entry.
+// colVarBytes is r's ColVarBytes, forming a join rel's pending union from
+// its recorded inputs on first read: the same union, over the same inputs,
+// that the search used to form when it built the rel.
+func (r *RelOptInfo) colVarBytes() map[string]float64 {
+	if r == nil {
+		return nil
+	}
+	if r.colVarPending {
+		outer, inner := r.colVarFrom[0], r.colVarFrom[1]
+		m := outer.colVarBytes()
+		if inner != nil {
+			m = unionColVarBytes(m, inner.colVarBytes())
+		}
+		r.ColVarBytes = m
+		r.colVarFrom = [2]*RelOptInfo{}
+		r.colVarPending = false
+	}
+	return r.ColVarBytes
+}
+
 func unionColVarBytes(a, b map[string]float64) map[string]float64 {
 	if len(a) == 0 {
 		return b

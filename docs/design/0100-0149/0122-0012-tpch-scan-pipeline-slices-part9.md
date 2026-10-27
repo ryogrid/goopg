@@ -316,3 +316,473 @@ serial run.
 
 It is filed as **P0-E12** (S2, owner placement). The repro is `analysis/p0e12/`, with the expected output computed
 from the generator. The probe tests were not kept; the P0-E12 task names the regression test its fix needs.
+
+## Slice 93 — C16a: the join search memoises its narrowed-width inputs (Q64 planning −6.7 %)
+
+Loop #187, 2026-10-27, the first return under the owner's return-first rule. The census
+`analysis/m0122/m0122-0012/census-20261027/` (G1/G2 against release PG 18.3) puts TPC-DS Q64 in the combined top
+10 with an excess that is mostly **planning**: 636 ms per plan against release PG's 51.9 ms, about 584 of Q64's
+846 ms excess. All of it is GEQO, ~500 tours of `gimmeTree` → `makeJoinRel`. PG runs the same tour count, so the
+gap is the cost of each joinrel goopg builds. Profile (25 s of cache-busted plan-only EXPLAINs):
+
+| share | site |
+|---|---|
+| 59 % | `addPathsToJoinrel` (all join methods) |
+| 26 % | `mallocgc` (inclusive, spread) |
+| 12.7 % | pathkey usefulness / truncation |
+| 12.5 % | `joinrelNarrowedWidths`: `relNarrowedColumns` 6.8 %, `attrNeededAbove` 3.7 % |
+| 7.9 % | `innerRelProvenUnique` → `provableKeys` / `keysCovering` |
+
+`joinrelNarrowedWidths` (M0146-0234, build_joinrel_tlist for the cost triple) re-derived two pure inputs for every
+joinrel of every tour:
+
+- **`relNarrowedColumns(member)`**: the member's kept columns. It depends only on the base rel's leaf, needed set
+  and column statistics, all fixed before the search.
+- **`attrNeededAbove(relids)`**: the above-tree NAME set. It walks every clause and builds a map, and it depends
+  only on relids, the clause list and the statement's output set.
+
+PG computes `attr_needed` once per base rel (`build_base_rel_tlists`), and `build_joinrel_tlist` (relnode.c) reads
+it.
+
+**Change.** `searchCtx` memoises both for the search:
+
+- `narrowColsMemo` keyed by member rel;
+- `attrNeededMemo` keyed by relids, valid for one clause list at one length (a different list or length resets
+  it).
+
+Declines are memoised too. `joinrelNarrowedWidths` sums the members' kept columns in place instead of
+concatenating them. `baseRelNarrowedWidths` reads the same memos.
+
+**Measured (Target written before coding: Q64, instructions:u per cache-busted plan, `tools/ds-planinstr.sh`).**
+
+| run | before | after |
+|---|---|---|
+| 1 | 6.496 G | 6.061 G |
+| 2 | 6.490 G | 6.052 G |
+
+That is **−6.7 %**, which meets the 3 % bar. The SF0.25 sweep's Q64 reads 971 ms against the census median of
+1019 ms.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite per-case counts equal to the baseline
+except the plpgsql flapper; isolation PASS.
+
+Test: `TestNarrowedWidthMemoMatchesAndResets`.
+
+**Next (C16b).** `innerRelProvenUnique` re-proves inner uniqueness per call (`provableKeys` → `keysCovering`
+builds maps on every call). PG caches `innerrel_is_unique` results per (outer relids, inner rel) in
+`unique_for_rels` / `non_unique_for_rels` (analyzejoins.c). Re-profile after it, because addPaths and allocation
+dominate what remains.
+
+## Slice 94 — C16b: inner-unique verdicts are memoised for the search (Q64 planning −6.2 %)
+
+Loop #188, 2026-10-27, the same Target as slice 93: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Where the time went.** `innerRelProvenUnique` is the fail-closed half of PG's `innerrel_is_unique`. It ran
+in full on every call: `joinKeyPairOf` per key, then `provableKeys` → `keysCovering`, which build maps and walk
+the catalog's indexes and foreign keys. Three callers ask it for each pair a joinrel considers:
+`addPathsForJointype`, `extraInnerUnique` and the hash join's final cost input. GEQO re-asks the same pairs on
+every one of its ~500 tours.
+
+PG caches the verdicts on the inner rel instead: `unique_for_rels` / `non_unique_for_rels` (analyzejoins.c, the
+`innerrel_is_unique` cache).
+
+**Change.** `searchCtx.innerUniqueMemo` holds the verdict per (outer relids, inner relids, skipNonKeys, key
+set), checked after the cheap gates.
+
+- The key set is the caller's slice of `restrictInfo` pointers, all drawn from the search's clause list and
+  stable for the whole search.
+- The bucket hash mixes those pointers, and a hit compares the stored slice element by element. A collision
+  therefore cannot hand back another key set's verdict.
+
+The proof itself is now `innerRelProvenUniqueUncached`.
+
+**Measured.**
+
+| run | before (slice 93) | after |
+|---|---|---|
+| 1 | 6.052 G | 5.678 G |
+| 2 | 6.055 G | 5.679 G |
+
+That is **−6.2 %**, which meets the 3 % bar. The sweep's Q64 reads 944 ms; it was 971 ms after slice 93 and the
+census median is 1019 ms. Over the two slices, Q64 planning is −12.6 % in instructions.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestInnerRelProvenUniqueMemoMatchesUncached`. Every key-set prefix, with and without a non-key clause and
+in both modes, must match the uncached proof on the first call and on a memo hit.
+
+**Re-profile after slice 94** (`tmp/q64plan-c16b.pprof`):
+
+| share | site |
+|---|---|
+| 60.5 % | `addPathsForJointype` |
+| 26.8 % | `mallocgc` |
+| 14.8 % | `truncateUselessPathkeys` / `buildJoinPathkeysFor` (`pathkeyUsefulnessFor` 14 %, of it `equivalentWithin` 7.1 %, `countContainedIn` 5.8 %, `keyOf` 5.6 %) |
+| 12.75 % | `tryMergeJoinPath` / `sortInnerAndOuter` |
+| 11 % | `addNestLoopPathFor` |
+| 4.7 % | `joinrelNarrowedWidths` (was 12.5 %) |
+| 3.5 % | `innerRelProvenUnique` (was 7.9 %) |
+
+PG compares canonical pathkeys by pointer (`pathkeys_contained_in`, `pathkeys_useful_for_merging` over
+`root->canon_pathkeys`). goopg re-derives keys and equivalence per comparison. That is the next step, C16c,
+which joins pool entry C15's "pathkey canonicalisation".
+
+## Slice 95 — C16c: GEQO tours share the search memos (Q64 planning −8.3 %)
+
+Loop #189, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Planned step.** Memoise `pathkeyUsefulnessFor` (14 % after slice 94: growslice and map building per joinrel)
+per joinrel relids.
+
+**First measurement: zero.** 5.688/5.692 G against 5.683/5.686 G. The profile showed the builder still running on
+every call. The cause: `geqoEvalTour` evaluates each tour in a NEW `searchCtx` (`freshEvalCtx`). That context
+shared only `exprKeys` and `ecIdx` with the parent. A memo allocated lazily on first use therefore lived for
+one tour.
+
+**Correction to slices 93/94.** Their memos (narrowed widths, inner-unique verdicts) were likewise per tour. The
+measured −6.7 % and −6.2 % stand, but they came from repeats within a tour, not from the ~500-tour reuse the
+write-ups assumed.
+
+PG's tours all evaluate against the one PlannerInfo, so whatever a tour derives from query-level state is there
+for the next.
+
+**Change.**
+
+- `pathkeyUsefulnessFor` memoises per relids (`usefulMemo`; the builder is now `buildPathkeyUsefulness`). The
+  owner record (`usefulMemoOwner`) is the clause list and its length plus the backing arrays and lengths of the
+  query, group and distinct pathkeys; any change resets the memo.
+- `freshEvalCtx` calls `prepareSharedMemos` on the parent and hands every tour the parent's maps, as it already
+  did for `exprKeys`/`ecIdx`. That covers `narrowColsMemo`, `attrNeededMemo` with its owner, `innerUniqueMemo`,
+  and `usefulMemo` with its owner.
+
+Each memo reads only state every tour shares: base rels, the clause list, the query pathkeys and the catalog.
+
+**Measured.**
+
+| run | before (slice 94) | after |
+|---|---|---|
+| 1 | 5.683 G | 5.213 G |
+| 2 | 5.678 G | 5.204 G |
+
+That is **−8.3 %**, which meets the 3 % bar. Over slices 93–95, Q64 planning is −19.9 % in instructions (6.49 →
+5.21 G). The sweep's Q64 reads 860 ms; the census median is 1019 ms.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestGEQOTourContextsShareSearchMemos`. A value one tour context memoises is a hit in the next, and a
+clause-list change resets the memos.
+
+**Next.** Re-profile Q64. Before this slice, the per-path pathkey truncation (`truncateUselessPathkeys`: 14.8 %)
+and `addPathsForJointype`'s own allocation were the largest remaining shares.
+
+## Slice 96 — C16d: a join rel's column-width map is formed on first read (Q64 planning −6.8 %)
+
+Loop #190, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-profile after slice 95** (`tmp/q64plan-c16c2.pprof`):
+
+| share | site |
+|---|---|
+| 65 % | `addPathsForJointype` |
+| 23 % | `mallocgc` |
+| 16.2 % | `truncateUselessPathkeys` |
+| 8.5 % | `unionColVarBytes` (`makemap` + `mapassign_faststr` + map iteration) |
+| 7.3 % | `comparePathkeysDimRel` → unmemoised `pathKeyEqual` → `exprIdentityKey` |
+| 7.0 % | `buildPathkeyUsefulness` (about half of its calls now hit the memo) |
+
+`makeJoinRel` copied both inputs' `ColVarBytes` into a new map for every joinrel that publishes its inner side, on
+every tour.
+
+The map has two readers, and neither is in the search:
+
+- `buildAvgVarBytes`, at plan creation (createplanjoin.go);
+- the grouping-path width on the searched input rel (groupingpaths.go).
+
+**Change.** A join rel records the pair that built it in `colVarFrom` (the inner nil when the join publishes its
+outer alone) with `colVarPending` set. `(*RelOptInfo).colVarBytes()` forms the union on first read, recursively
+through pending inputs, then drops the references. Every reader goes through it: `buildAvgVarBytes`, the grouping
+width, and `relNarrowedColumns`.
+
+It is the same union over the same first pair, so the result is identical to the eager map. The union with
+wider-wins is order-independent in any case.
+
+**Measured.**
+
+| run | before (slice 95) | after |
+|---|---|---|
+| 1 | 5.214 G | 4.853 G |
+| 2 | 5.201 G | 4.858 G |
+
+That is **−6.8 %**, which meets the 3 % bar. Over slices 93–96, Q64 planning is −25.2 % in instructions (6.49 →
+4.86 G).
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+One sweep read total-delta +20 % under host load (load average 5–7: Q46 238 → 1016 ms, Q72, Q11, Q95). A rerun
+read −1.3 % (Q46 235 ms), so it was contention, not this planning-only change.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite per-case counts identical to the
+baseline; isolation PASS.
+
+Test: `TestJoinRelColVarBytesFormsOnFirstRead`. The lazy union matches the eager one through two levels, the
+inputs are released, and an outer-only join takes the outer's map.
+
+**Next candidates on the same Target.**
+
+- `truncateUselessPathkeys` per path (16 %).
+- `comparePathkeysDimRel`'s unmemoised `pathKeyEqual` (7 %). PG's `compare_pathkeys` is a pointer comparison over
+  canonical pathkeys.
+
+## Slice 97 — C16e: add_path's pathkey comparison goes through the identity-key memo (Q64 planning −4.8 %)
+
+Loop #191, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Where the time went.** `comparePathkeysDimRel` is add_path's pathkey dimension. It compared each key pair with
+the package `pathKeyEqual` → `exprEqual`, which formats both expressions' identity keys (`exprIdentityKey`) on
+every call. That was 7.3 % of Q64's planning after slice 95. Every new path is compared with every retained path
+of its rel.
+
+PG's `compare_pathkeys` compares canonical pathkey pointers.
+
+The joinrel already carries the search's identity-key memo: `usefulKeys.pathKeyEqual`, which
+`truncateUselessPathkeys` uses for the same keys. It is nil-safe and falls back to the unmemoised form.
+
+**Change.** Both arms of `comparePathkeysDimRel` compare through `rel.usefulKeys.pathKeyEqual`:
+
+- the equivalence-class arm (`pathkeyClass` set);
+- the syntactic arm, when the rel has a usefulness but no class.
+
+A rel with neither keeps `comparePathkeysDim`. The verdicts are unchanged, because the memo caches the same
+identity key `exprEqual` computes.
+
+**Measured.**
+
+| run | before (slice 96) | after |
+|---|---|---|
+| 1 | 4.852 G | 4.626 G |
+| 2 | 4.854 G | 4.618 G |
+
+That is **−4.8 %**, which meets the 3 % bar. Over slices 93–97, Q64 planning is −28.8 % in instructions (6.49 →
+4.62 G).
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestComparePathkeysDimRelMemoMatchesUnmemoised`. Over seven key lists it checks every pair against the
+unmemoised comparison, and that separately built equal keys and class-equal keys compare equal.
+
+**Remaining on Q64** (slice 95 profile, before 96/97):
+
+- `truncateUselessPathkeys` per path (16 %);
+- `buildPathkeyUsefulness` on memo misses (7 %);
+- `mallocgc` across `addPathsForJointype` (23 %).
+
+## Slice 98 — C16f: truncate_useless_pathkeys' kept length is memoised per key list (Q64 planning −30 %)
+
+Loop #192, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-profile after slice 97** (`tmp/q64plan-c16e.pprof`):
+
+| share | site |
+|---|---|
+| 20.1 % | `truncateUselessPathkeys` (via `buildJoinPathkeysFor`), the largest single share |
+| 21 % | `mallocgc` |
+| 14.8 % | `addNestLoopPathFor` |
+| 14.8 % | `tryMergeJoinPath` |
+
+A join path's pathkeys are `truncate_useless_pathkeys` of its outer's: the merge-useful prefix, the query-ordering
+prefix and the grouping/distinct members.
+
+The answer depends only on the joinrel's usefulness `u` and the key list. The same outer ordering is offered with
+every inner path and every join method, and since slice 95 `u` is shared by every GEQO tour. PG's version is
+cheap because canonical pathkeys compare by pointer; goopg re-derived identity keys, class lookups and prefix scans
+per call.
+
+**Change.** `u.truncMemo` maps (backing array, length) to the kept length, computed by `truncateUselessLen`.
+
+- A hit must match a stored copy of the list key by key. `PathKey ==` compares `Expr` by pointer; all 35 `Expr`
+  types are pointer receivers, so the comparison is safe.
+- The result always slices the CALLER's list (`keepPathkeys`, capacity-capped). A reused backing array can
+  therefore never answer for different contents, and no caller receives another caller's array.
+
+**Measured.**
+
+| run | before (slice 97) | after |
+|---|---|---|
+| 1 | 4.611 G | 3.229 G |
+| 2 | 4.615 G | 3.222 G |
+
+That is **−30.1 %**, which meets the 3 % bar.
+
+The gain exceeds the profile share (20 %). The removed calls also allocated (prefix slices, lazily formed
+metadata), and their GC work counts in instructions:u while pprof attributes it elsewhere.
+
+Because of the size, plans were checked beyond the gates: `EXPLAIN` with costs of Q64, Q72, Q14, Q39, Q17, Q25 and
+Q29 is byte-identical between the two binaries.
+
+Over slices 93–98, Q64 planning is −50.3 % in instructions (6.49 → 3.23 G). The sweep's Q64 reads 728 ms; the
+census median is 1019 ms and release PG 173 ms.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set no fires on either
+corpus; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation PASS.
+
+Test: `TestTruncateUselessPathkeysMemo`. It covers a repeated hit slicing the caller's list, an equal list in
+another array, and a rewritten array recomputed.
+
+## Slice 99 — C16g: the truncation memo keyed by contents (Q64 planning −2.96 %, below the bar)
+
+Loop #193, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-measure after slice 98.** Q64 plans in 488 ms (`EXPLAIN (SUMMARY ON)`, min of two; it was 636 ms before
+C16, and release PG is 52 ms).
+
+Profile (`tmp/q64plan-c16f.pprof`):
+
+| share | site |
+|---|---|
+| 29 % | `mallocgc` |
+| 16.2 % | `sortInnerAndOuter` |
+| 15.7 % | `tryMergeJoinPath`, of which `buildJoinPathkeysFor` 44 % and `sortPathFor` 18 % |
+| 9.8 % | `truncateUselessPathkeys` (`truncateUselessLen` 6.1 %, i.e. memo misses) |
+| 9.4 % | `addNestLoopPathFor` |
+| 7.9 % | `buildPathkeyUsefulness` (misses of the per-relids memo) |
+
+The slice 98 memo was keyed by the key list's backing array. `sort_inner_and_outer` forms a fresh outer key list
+on every call, so equal lists missed.
+
+**Change.** `truncMemo` is keyed by the list's first `PathKey` and its length, with a bucket of entries each
+verified by `slices.Equal`. An equal list anywhere hits, and the result still slices the caller's list.
+
+**Measured.**
+
+| run | before (slice 98) | after |
+|---|---|---|
+| 1 | 3.227 G | 3.135 G |
+| 2 | 3.228 G | 3.129 G |
+
+That is **−2.96 %**, which misses the 3 % bar. The spread is ±0.005 G, so the shortfall is real.
+
+Plans are identical and every gate is green: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99
+same; fire-set no fires on either corpus; TPC-H census 22/22; RegressSuite per-case counts identical; isolation
+PASS.
+
+It is landed as a plan-neutral reduction and recorded on the Below-bar list. The return-first miss counter is 1.
+
+The remaining Q64 planning cost is spread: allocation, the merge-join arms' sort-path construction, and the
+nested-loop arms. Any one mechanism there is likely to fall near the bar.
+
+## After slice 99 — C16h measured and dropped; one-task yield (2026-10-27)
+
+**C16h.** PG's `try_mergejoin_path` prices the sorted inputs inside `initial_cost_mergejoin` and builds nothing
+before `add_path_precheck`; `create_mergejoin_plan` makes the Sorts later. goopg's `tryMergeJoinPath` built both
+Sort paths (`sortPathFor`) first and formed the join pathkeys twice.
+
+The attempt computed each input's `cost_sort` figure first (`sortRunCostFor`), ran the precheck on it, and built
+the Sort paths from the same figure only for survivors.
+
+**Measured.** Q64 3.126/3.132 → 3.114/3.111 G per plan, −0.5 %. Q64's merge candidates rarely lose the precheck,
+so the avoided construction is small. The change was dropped, not landed.
+
+**Yield.** Slice 99 (−2.96 %) and C16h (−0.5 %) are two consecutive attempts below the 3 % bar, so the return-first
+rule yields for one task. M0119 holds only `[!]` M0119-0006 and M0147 has no selectable child, so the yield takes
+M0122-0013. M0122-0012 resumes after that task, with the miss counter reset.
+
+**Where Q64's planning stands.** 6.49 → 3.13 G over slices 93–99; `EXPLAIN (SUMMARY ON)` reports 488 ms against
+release PG's 52 ms.
+
+The rest is spread thin across allocation, the nested-loop and merge-join arms, and memo misses on joinrels seen
+once per tour. A next pass should start from a fresh G1–G3 census rather than from this query.
+
+## Slice 100 — C18: B-tree binary searches read per-page invariants once (Q72 −3.06 % instructions)
+
+Loop #196, 2026-10-27, the return after the one-task yield. G3 profiles over the census-20261027 top three (Q14,
+Q23, Q72), plus Q13:
+
+- **C1 is stale.** Q13's keys already hash through int64 maps; `mapaccess2_faststr` is gone.
+- **C2 predicts only ~1–1.5 %.** `compareFixedPrefix` is already a fixed-width fast path. `pgTInfo`'s 10 % in Q72
+  is the first-touch cache miss on each probed tuple, which PG pays too.
+- **New candidate C17.** Q13's `matchSQLLike` is 7 %.
+- **New candidate C18, taken.** In Q72, `leafScanStart` is 27.6 % and `findChildBlockDirect` 19.8 %. Their
+  probes go through `pgGetItemRawAllowDeadNoCopy`, which recomputed `PageLinePointerCount` (a header read and its
+  checks) and `pgDataSlot` (a special-space read) on EVERY probe. `PageLinePointerCount` plus `Header` were ~5 %
+  of samples. PG's `_bt_binsrch` reads `PageGetMaxOffsetNumber` and `P_FIRSTDATAKEY` once per page.
+
+**Change.**
+
+- `storage.PageGetItemRawAllowDeadNoCopyN` takes a caller-read line-pointer count, and the old function wraps it,
+  so the item checks stay in one place.
+- `nbtree.pageProbe` holds one latched page's count and first data slot.
+- `leafScanStart` and `findChildBlockDirect` build a `pageProbe` once per page and probe through it.
+
+**Target (written before measuring).** TPC-DS SF0.25 Q72, instructions:u per query (`tools/ds-instr.sh`, 5 runs).
+
+| run | before | after |
+|---|---|---|
+| 1 | 26.999 G | 26.170 G |
+| 2 | 26.995 G | 26.171 G |
+
+That is **−3.06 %**, which meets the bar.
+
+Sweep wall times (Q72 3.28 s) stay within Q72's known 2.5–3.3 s spread; instructions are the measure of record.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; TPC-H census 22/22;
+RegressSuite = baseline (plpgsql flap); isolation PASS. The fire-set gate is out of scope: no optimizer path
+changed.
+
+Tests:
+
+- `TestPageProbeMatchesPerProbeAccessor`: on every page of a 20 000-key, multi-level index, rightmost and
+  internal pages included, the probe returns the per-probe accessor's bytes and errors for every slot, out of
+  range included.
+- `TestLeafScanStartMatchesLinearWalk` still holds.
+
+## Slice 101 — C17: a `%`-only LIKE pattern is matched as literal segments (Q13 −11.5 % instructions)
+
+Loop #197, 2026-10-27. TPC-H Q13's `o_comment NOT LIKE '%special%requests%'` spent 7 % of Q13's samples in
+`matchSQLLike`, which walks byte by byte and backtracks.
+
+A pattern whose only metacharacter is `%` is a glob of literal segments, and its match needs no backtracking:
+
+- the first segment must be a prefix;
+- each middle segment is found leftmost, in order;
+- the last segment must be a suffix of what remains.
+
+That is the walk's answer, because a leftmost match of a literal is never beaten by a later one.
+
+**Change.** `matchLikeSegments` implements that with `strings.Index`, which is a vectorised substring search.
+`matchSQLLike` tries it first. Any pattern containing `_` or the backslash escape declines to the unchanged walk,
+now named `matchSQLLikeWalk`.
+
+**Target (written before measuring).** TPC-H SF1 Q13, instructions:u per query. The probe is the new
+`tools/h-instr.sh`, `ds-instr.sh`'s twin on `tmp/q17-clone`, run 5 times.
+
+| run | before | after |
+|---|---|---|
+| 1 | 13.815 G | 12.226 G |
+| 2 | 13.815 G | 12.226 G |
+
+That is **−11.5 %**, which meets the bar.
+
+Q13 values are unchanged: acceptance Q13 MATCH, spotcheck Q13 = 35. Gates: units; spotcheck; acceptance 24
+MATCH; sf025 PASS=99 with plans 99/99 same; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestMatchLikeSegmentsEqualsWalk`. It is exhaustive over every pattern of length ≤ 5 on {a, b, %} against
+every string of length ≤ 6 on {a, b}, then runs 200 000 random cases. It also checks that `_` and escape patterns
+decline.
+
+**Discovery, filed as P0-E13 (S2).** Reading the walk showed that `_` consumes one BYTE. PG's MatchText consumes
+one character (pg_mblen) under UTF-8. goopg answers `'é' LIKE '_'` = f and `'é' LIKE '__'` = t, where PG answers
+t and f. This predates C17 (the fast path declines `_`); the repro is under `analysis/p0e13/`.
+
+Continued in [part 10](0122-0012-tpch-scan-pipeline-slices-part10.md) from slice 102.

@@ -25,7 +25,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -453,13 +452,11 @@ func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 	}
 }
 
-// coopJoinBuild is E-18 slice 2's knob: OFF by default.
-//
-// It widens the cooperative build's Rule 3 so a build side that is a JOIN TREE
-// can be built cooperatively, which is the shape TPC-H Q9 needs and the one
-// `extractSeqScanFromPlan` refuses. It is a knob, not a default, because the
-// two objections recorded on that walker are both real and only one of them is
-// answered here:
+// E-18 slice 2: coopDrivingScan widens the cooperative build's Rule 3 so a
+// build side that is a JOIN TREE can be built cooperatively, which is the
+// shape TPC-H Q9 needs and the one `extractSeqScanFromPlan` refuses. The two
+// objections recorded on that walker are both real, and both are answered
+// here:
 //
 //   - CORRECTNESS (answered): the widened walk descends a HASH join's PROBE
 //     side only, and refuses every other node kind including Aggregate and
@@ -472,13 +469,14 @@ func extractSeqScanFromPlan(node optimizer.Node) *optimizer.SeqScan {
 //     producers by pointer, reusing the same sharedHashBuild machinery a
 //     Gather uses, so a producer does the driving scan and the probes only.
 //
-// Default ON (GOOPG_COOP_JOIN_BUILD=off to disable). Measured on TPC-H SF=1
+// It shipped as a knob (GOOPG_COOP_JOIN_BUILD, default ON since E-18; =off
+// disabled the join-tree widening) and M0147-0032 retired it: no gate, CI or
+// bench script ever set it. Measured on TPC-H SF=1
 // in PARALLEL mode (4 workers), fresh capped server per arm per rep, 5
 // alternating reps, every result set md5-identical between the arms:
 // Q20 1.91 -> 0.65 s (-66%, ranges disjoint), Q21 14.63 -> 13.75 s (-6.0%),
 // Q7 4.07 -> 3.79 s, Q9 10.75 -> 10.50 s; Q2/Q5/Q8/Q17/Q18 unchanged. No
 // query regressed in any rep.
-var coopJoinBuildOn = os.Getenv("GOOPG_COOP_JOIN_BUILD") != "off"
 
 // coopDrivingScan finds the scan a cooperative build's producers can partition.
 //
@@ -502,7 +500,7 @@ func coopDrivingScan(node optimizer.Node) *optimizer.SeqScan {
 		case *optimizer.Project:
 			node = n.Child
 		case *optimizer.Join:
-			if !coopJoinBuildOn || n.Algo != optimizer.JoinAlgoHash || n.Lateral {
+			if n.Algo != optimizer.JoinAlgoHash || n.Lateral {
 				return nil
 			}
 			if probeSideIsLeft(n) {

@@ -2,23 +2,10 @@ package optimizer
 
 import (
 	"math"
-	"os"
-	"strconv"
 
 	"github.com/goopg/goopg/internal/executor/hashsize"
 	"github.com/goopg/goopg/internal/parser"
 )
-
-// envFloatDefault reads a float from the environment, returning def when unset
-// or unparseable. Used for measurement-time cost-calibration overrides.
-func envFloatDefault(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return def
-}
 
 // Per-node cost functions, reproduced from PostgreSQL's costsize.c in PG's units
 // (seq_page_cost = 1.0). See docs/design/cost-model/ chapter 02. Phase C3.1:
@@ -315,7 +302,7 @@ func costSortRun(cp costParams, inputRows float64, ncols int, avgVarBytes float6
 
 // costSortRunWithWidth is costSortRun with the path-target width that PG's
 // relation_byte_size consumes. Width is planner-only: Goopg's EntryBytes stays
-// the executor and default-off costing currency.
+// the executor currency, and the costing fallback when width is not valid.
 func costSortRunWithWidth(cp costParams, inputRows float64, ncols int, avgVarBytes float64, limitTuples float64, width int, caller string) Cost {
 	rawInputRows := inputRows
 	// "We want to be sure the cost of a sort is never estimated as zero, even
@@ -347,8 +334,9 @@ func costSortRunWithWidth(cp costParams, inputRows float64, ncols int, avgVarByt
 		}
 		// cost_tuplesort computes input_bytes before clamping tuples to two,
 		// then either reuses that exact input volume or computes a bounded
-		// output volume after the clamp. Calculate it even with the switch off
-		// so the trace can expose both currencies; elect it only with the flag.
+		// output volume after the clamp. Both currencies are computed so the
+		// trace can expose them; the PG one is elected whenever its width is
+		// valid (the goopg one is the fallback for an unknown width).
 		pgValid := false
 		if input, ok := pgRelationByteSize(rawInputRows, width); ok {
 			pgInputBytes = input
@@ -362,7 +350,7 @@ func costSortRunWithWidth(cp costParams, inputRows float64, ncols int, avgVarByt
 		goopgBranch = sortByteBranch(cp, tuples, output, goopgInputBytes, goopgOutputBytes, goopgValid)
 		pgBranch = sortByteBranch(cp, tuples, output, pgInputBytes, pgOutputBytes, pgValid)
 		inputBytes, branch := goopgInputBytes, goopgBranch
-		if pgSortRelationBytesCostEnabled() && pgValid {
+		if pgValid {
 			inputBytes, branch = pgInputBytes, pgBranch
 			currency = "pg"
 		}
@@ -998,10 +986,12 @@ func hashJoinInitialCost(cp costParams, in hashJoinInputs) Cost {
 // single-batch build, else the inner written once at startup and both sides'
 // pages over the run.
 func hashJoinBatchCost(cp costParams, in hashJoinInputs) (startup, run float64) {
-	// R108 is deliberately opt-in. PG decides hash-table batches using packed
-	// HashJoinTuple geometry, then prices its batch I/O through the distinct
-	// heap-tuple page_size formula. It must not become an executor claim: map
-	// capacity and actual spills remain hashsize.Choose below.
+	// R108 (promoted by M0147-0021). PG decides hash-table batches using packed
+	// HashJoinTuple geometry (ExecChooseHashTableSize), then prices its batch
+	// I/O through the distinct heap-tuple page_size formula
+	// (initial_cost_hashjoin). It must not become an executor claim: map
+	// capacity and actual spills remain hashsize.Choose, which also prices the
+	// batches when a PG width is unknown.
 	if geometry := pgHashTupleSpillGeometryFor(in, cp); geometry.usePG {
 		if geometry.hash.numBatches > 1 {
 			startup = cp.seqPageCost * geometry.innerPages

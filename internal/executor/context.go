@@ -186,14 +186,6 @@ type Context struct {
 	// so workers read it without locking. Nil on a leader Context.
 	InitPlanValues map[*optimizer.SubqueryExpr]Datum
 
-	// CorrSubqOps caches pre-built, pre-opened operators for correlated
-	// scalar subqueries so the same plan can be rescanned for each outer
-	// row without repeated Build+openPrep (lock acquire + btree.Open)
-	// overhead. Populated by subqueryImpl; indexScanOp.Open detects the
-	// reuse and skips openPrep on subsequent calls. Operators are not
-	// explicitly closed (locks released at commit; GC handles memory).
-	CorrSubqOps map[*optimizer.SubqueryExpr]Operator
-
 	// CorrSubqHashMaps caches hash maps built for correlated scalar subqueries
 	// matching Project(Filter(SeqScan, inner_col = OuterColumnRef)). The hash
 	// map is built once by scanning the entire inner table (O(N)) and provides
@@ -1115,7 +1107,7 @@ type SubPlanSiteStats struct {
 	// (and later Close) the inner plan's operator tree.
 	Rebuilds int64
 	// Rescans is the number of Calls served by re-Opening an
-	// operator tree that was already built (the CorrSubqOps path).
+	// operator tree that was already built (the Stage-9 handle path).
 	Rescans int64
 	// CacheHits / CacheMisses count Calls answered from, or
 	// missing in, a result cache (the kvcache-backed sublink stores or the correlated
@@ -2099,18 +2091,6 @@ func (c *Context) MaterializeWriterXID() error {
 		sess.OnTopLevelXIDAssigned(xid)
 	}
 	return nil
-}
-
-// DidWrite reports whether this transaction has been assigned a real XID —
-// i.e. some write-path operation called MaterializeWriterXID. A read-only
-// transaction keeps XID == storage.InvalidTransactionID (M0093 lazy XID
-// allocation), so this is the cheap "did this transaction produce
-// garbage/durable work" predicate. Used to gate post-commit forced GC to
-// writing transactions (a read-only SELECT produces no retained heap worth
-// forcing a GC for). Read c.Tx.XID (the Context's in-place-updated copy),
-// never a stale outer snapshot of the Transaction value.
-func (c *Context) DidWrite() bool {
-	return c.Tx.XID != storage.InvalidTransactionID
 }
 
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.

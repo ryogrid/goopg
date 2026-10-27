@@ -286,72 +286,69 @@ func TestHashJoinUniqueVirtualGeometryLeavesExecutorSpillCostUnchanged(t *testin
 }
 
 func TestHashJoinInnerUniquePathInputReachesSerialAndPartialCosts(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		s, joinrel, outer, inner, keys := r90UniqueFixture(t)
-		s.parallelModeOK = true
-		joinrel.ConsiderParallel = true
-		outer.CheapestTotal = &Path{Rel: outer, Rows: outer.Rows, ParallelSafe: true}
-		inner.CheapestTotal = &Path{Rel: inner, Rows: inner.Rows, ParallelSafe: true}
-		inner.Pathlist = []*Path{inner.CheapestTotal}
-		outer.PartialPathlist = []*Path{{
-			Kind: PathSeqScan, Rel: outer, Rows: 25, ParallelSafe: true, ParallelAware: true, ParallelWorkers: 1,
-		}}
-		residual := &restrictInfo{relids: outer.Relids | inner.Relids, ecID: noEquivClass}
-		addPathsToJoinrel(s, joinrel, outer, inner, append(keys, residual), s.cp, nil)
+	s, joinrel, outer, inner, keys := r90UniqueFixture(t)
+	s.parallelModeOK = true
+	joinrel.ConsiderParallel = true
+	outer.CheapestTotal = &Path{Rel: outer, Rows: outer.Rows, ParallelSafe: true}
+	inner.CheapestTotal = &Path{Rel: inner, Rows: inner.Rows, ParallelSafe: true}
+	inner.Pathlist = []*Path{inner.CheapestTotal}
+	outer.PartialPathlist = []*Path{{
+		Kind: PathSeqScan, Rel: outer, Rows: 25, ParallelSafe: true, ParallelAware: true, ParallelWorkers: 1,
+	}}
+	residual := &restrictInfo{relids: outer.Relids | inner.Relids, ecID: noEquivClass}
+	addPathsToJoinrel(s, joinrel, outer, inner, append(keys, residual), s.cp, nil)
 
-		var serial, partial *Path
-		for _, p := range joinrel.Pathlist {
-			if p.Kind == PathHashJoin {
-				serial = p
-				break
-			}
+	var serial, partial *Path
+	for _, p := range joinrel.Pathlist {
+		if p.Kind == PathHashJoin {
+			serial = p
+			break
 		}
-		for _, p := range joinrel.PartialPathlist {
-			if p.Kind == PathHashJoin {
-				partial = p
-				break
-			}
+	}
+	for _, p := range joinrel.PartialPathlist {
+		if p.Kind == PathHashJoin {
+			partial = p
+			break
 		}
-		if serial == nil || partial == nil {
-			t.Fatalf("hash paths: serial=%v partial=%v", serial != nil, partial != nil)
-		}
-		if partial.Children[0].Rows != 25 || partial.Children[1].Rows != inner.Rows {
-			t.Fatalf("partial coordinates outer=%.0f inner=%.0f, want 25 and %.0f",
-				partial.Children[0].Rows, partial.Children[1].Rows, inner.Rows)
-		}
+	}
+	if serial == nil || partial == nil {
+		t.Fatalf("hash paths: serial=%v partial=%v", serial != nil, partial != nil)
+	}
+	if partial.Children[0].Rows != 25 || partial.Children[1].Rows != inner.Rows {
+		t.Fatalf("partial coordinates outer=%.0f inner=%.0f, want 25 and %.0f",
+			partial.Children[0].Rows, partial.Children[1].Rows, inner.Rows)
+	}
 
-		final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
-		bucket := s.estimateHashBucketSize(keys, inner.Relids)
-		wantSerial := hashJoinCost(s.cp, hashJoinInputs{
-			outer: serial.Children[0].Cost, inner: serial.Children[1].Cost,
-			outerRows: serial.Children[0].Rows, innerRows: serial.Children[1].Rows,
-			outputRows: joinrel.Rows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			// M0146-0012a slice C: the residual is qp_qual_cost.per_tuple,
-			// charged on hashjointuples inside hashJoinCost.
-			qualPerTuple: s.cp.cpuOperatorCost,
-			innerWidth:   pathWidth(serial.Children[1]),
-			outerCols:    pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
-			outerAvgVarBytes: pathAvgVarBytes(serial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(serial.Children[1]),
-		})
-		if serial.Cost != wantSerial {
-			t.Fatalf("serial cost = %+v, want %+v", serial.Cost, wantSerial)
-		}
-
-		wantPartialRows := clampRowEst(joinrel.Rows / getParallelDivisor(partial.Children[0].ParallelWorkers, s.cp.parallelLeaderParticipation))
-		wantPartial := hashJoinCost(s.cp, hashJoinInputs{
-			outer: partial.Children[0].Cost, inner: partial.Children[1].Cost,
-			outerRows: partial.Children[0].Rows, innerRows: partial.Children[1].Rows,
-			outputRows: wantPartialRows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
-			qualPerTuple: s.cp.cpuOperatorCost,
-			innerWidth:   pathWidth(partial.Children[1]),
-			outerCols:    pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
-			outerAvgVarBytes: pathAvgVarBytes(partial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(partial.Children[1]),
-		})
-		if partial.Cost != wantPartial {
-			t.Fatalf("partial cost = %+v, want %+v", partial.Cost, wantPartial)
-		}
+	final := s.hashJoinFinalCostInputFor(joinrel, outer, inner, parser.JoinInner, keys, keys)
+	bucket := s.estimateHashBucketSize(keys, inner.Relids)
+	wantSerial := hashJoinCost(s.cp, hashJoinInputs{
+		outer: serial.Children[0].Cost, inner: serial.Children[1].Cost,
+		outerRows: serial.Children[0].Rows, innerRows: serial.Children[1].Rows,
+		outputRows: joinrel.Rows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
+		// M0146-0012a slice C: the residual is qp_qual_cost.per_tuple,
+		// charged on hashjointuples inside hashJoinCost.
+		qualPerTuple: s.cp.cpuOperatorCost,
+		innerWidth:   pathWidth(serial.Children[1]),
+		outerCols:    pathNCols(serial.Children[0]), innerCols: pathNCols(serial.Children[1]),
+		outerAvgVarBytes: pathAvgVarBytes(serial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(serial.Children[1]),
 	})
+	if serial.Cost != wantSerial {
+		t.Fatalf("serial cost = %+v, want %+v", serial.Cost, wantSerial)
+	}
+
+	wantPartialRows := clampRowEst(joinrel.Rows / getParallelDivisor(partial.Children[0].ParallelWorkers, s.cp.parallelLeaderParticipation))
+	wantPartial := hashJoinCost(s.cp, hashJoinInputs{
+		outer: partial.Children[0].Cost, inner: partial.Children[1].Cost,
+		outerRows: partial.Children[0].Rows, innerRows: partial.Children[1].Rows,
+		outputRows: wantPartialRows, numHashClauses: len(keys), innerBucketSize: bucket, final: final,
+		qualPerTuple: s.cp.cpuOperatorCost,
+		innerWidth:   pathWidth(partial.Children[1]),
+		outerCols:    pathNCols(partial.Children[0]), innerCols: pathNCols(partial.Children[1]),
+		outerAvgVarBytes: pathAvgVarBytes(partial.Children[0]), innerAvgVarBytes: pathAvgVarBytes(partial.Children[1]),
+	})
+	if partial.Cost != wantPartial {
+		t.Fatalf("partial cost = %+v, want %+v", partial.Cost, wantPartial)
+	}
 }
 
 // TestHashJoinInnerUniqueReproducesPGQ31WebSalesDateDim pins M0146-0005e on
@@ -440,5 +437,41 @@ func TestSetOpLeafDistinctFor(t *testing.T) {
 	}
 	if setOpLeafDistinctFor(upperOrderedInput(10), 1, pairsFor("k", "v", "w")) {
 		t.Fatal("a non-set-op leaf proves nothing here")
+	}
+}
+
+// M0122-0012 C16b: innerRelProvenUnique memoises its verdicts for the search
+// (PG's innerrel_is_unique keeps unique_for_rels / non_unique_for_rels).
+// Each key set — every prefix of the fixture's keys, with and without a
+// non-key clause, in both skipNonKeys modes — must answer exactly what the
+// uncached proof answers, on the first call and on a memo hit, and distinct
+// key sets must not share a verdict.
+func TestInnerRelProvenUniqueMemoMatchesUncached(t *testing.T) {
+	s, _, outer, inner, keys := r90UniqueFixture(t)
+	var sets [][]*restrictInfo
+	for n := 1; n <= len(keys); n++ {
+		sets = append(sets, keys[:n:n], append([]*restrictInfo{{}}, keys[:n]...))
+	}
+	sawTrue, sawFalse := false, false
+	for pass := 0; pass < 2; pass++ {
+		for _, ks := range sets {
+			for _, skip := range []bool{false, true} {
+				want := s.innerRelProvenUniqueUncached(outer, inner, ks, skip)
+				if got := s.innerRelProvenUnique(outer, inner, ks, skip); got != want {
+					t.Fatalf("pass %d, %d keys, skip=%v: memoised %v, uncached %v", pass, len(ks), skip, got, want)
+				}
+				sawTrue, sawFalse = sawTrue || want, sawFalse || !want
+			}
+		}
+	}
+	if !sawTrue || !sawFalse {
+		t.Fatalf("fixture never exercised both verdicts (true seen %v, false seen %v)", sawTrue, sawFalse)
+	}
+	entries := 0
+	for _, es := range s.innerUniqueMemo {
+		entries += len(es)
+	}
+	if want := len(sets) * 2; entries != want {
+		t.Fatalf("memo holds %d verdicts, want one per key set and mode (%d)", entries, want)
 	}
 }

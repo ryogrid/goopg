@@ -138,52 +138,6 @@ func aggregateSplitIsSafe(a *Aggregate) bool {
 	return true
 }
 
-// ── the split cost model (chapter 11) ──────────────────────────────────────
-//
-// Relative cost constants, anchored on cOut = 1 (retrieving one group from a
-// hash table — PG's cpu_tuple_cost). See chapter 11 §3.3 for the derivation
-// and for the honest note that they are calibrated against one query.
-const (
-	// cXfer is one row crossing a Gather. PG charges 10x cpu_tuple_cost for a
-	// shm_mq write plus the reader's copy-out; goopg batches into a channel,
-	// so the per-tuple channel cost amortises away and what remains is
-	// MaterializeForTransfer — a row copy, not an IPC round trip.
-	cXfer = 2.0
-	// cTrans is one aggregate transition call, charged per aggregate.
-	cTrans = 1.0
-	// cHash is the per-group-column hashing charge per input row, at PG's
-	// cpu_operator_cost ratio.
-	cHash = 0.25
-	// cMerge is one partial state merged into the shared accumulator.
-	//
-	// This is the constant the gate turns on, and it is the one goopg does not
-	// share with PG at all. PG ships partial states through the Gather as
-	// tuples; goopg's Partial node emits no rows and merges into a
-	// mutex-guarded map instead (chapter 11 §2.1), so this is a lock
-	// acquisition plus a map probe plus a deep merge over aggRuntime's pointer
-	// fields — and it does not parallelise.
-	cMerge = 4.0
-	// cOut is one group emitted.
-	cOut = 1.0
-)
-
-// parallelDivisor reproduces upstream's get_parallel_divisor
-// (postgres/src/backend/optimizer/path/costsize.c:6474): the leader's
-// contribution counts only while it is positive, so d(1)=1.7, d(2)=2.4,
-// d(3)=3.1, and d(w)=w from four workers up.
-func parallelDivisor(workers int, leaderParticipates bool) float64 {
-	if workers <= 0 {
-		return 1
-	}
-	d := float64(workers)
-	if leaderParticipates {
-		if lc := 1.0 - 0.3*float64(workers); lc > 0 {
-			d += lc
-		}
-	}
-	return d
-}
-
 // groupsToRowsRatio estimates rho — per-worker groups times the divisor, over
 // input rows — for an aggregate, or reports that it cannot.
 //
@@ -264,39 +218,4 @@ func aggColumnStats(idx int, child Node) *catalog.ColumnStats {
 		return aggColumnStats(idx, x.Child)
 	}
 	return nil
-}
-
-// splitAggregateIsProfitable is the gate.
-//
-// It compares only the two alternatives that differ — split against no-split —
-// which share their entire subtree below the aggregate, so the shared term
-// cancels and no absolute cost model is needed (chapter 11 §2). Dividing the
-// comparison through by the input row count and substituting Gw = rho*R/d:
-//
-//	split wins  iff  cXfer + (A*cTrans + k*cHash)*(1 - 1/d)  >  rho*A*cMerge + (rho/d)*cOut
-//
-// Refuses when the ratio cannot be estimated. Refusal restores the pre-P9
-// shape — the Gather moves below the aggregate — which is slower but never
-// dangerous; accepting without evidence risks N group tables with no spill
-// path, and an out-of-memory is not a slow query.
-func splitAggregateIsProfitable(a *Aggregate, workers int, leaderParticipates bool) bool {
-	if a == nil || workers <= 0 {
-		return false
-	}
-	d := parallelDivisor(workers, leaderParticipates)
-	if d <= 1 {
-		return false
-	}
-	rho, ok := groupsToRowsRatio(a, d)
-	if !ok {
-		return false
-	}
-	nAggs := float64(len(a.Aggs))
-	if nAggs < 1 {
-		nAggs = 1
-	}
-	perRow := nAggs*cTrans + float64(len(a.GroupExprs))*cHash
-	saving := cXfer + perRow*(1-1/d)
-	cost := rho*nAggs*cMerge + (rho/d)*cOut
-	return saving > cost
 }

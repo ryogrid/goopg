@@ -297,41 +297,6 @@ func TestProbeChainBindsChildSlot(t *testing.T) {
 	}
 }
 
-// TestProbeChainKillSwitch pins GOOPG_JOIN_SLOT_CHAIN=off: the copy path must
-// still be reachable and must produce identical output, so the switch is a real
-// rollback and not a placebo.
-func TestProbeChainKillSwitch(t *testing.T) {
-	SetJoinSlotChainEnabled(false)
-	defer SetJoinSlotChainEnabled(true)
-
-	eachShape(t, func(t *testing.T, shape probeSlotShape) {
-		probe := &shapedProbeOp{
-			schema: chainSchema(2, 0),
-			shape:  shape,
-			rows: []Row{
-				{NewIntDatum(1), NewStringDatum("p1")},
-				{NewIntDatum(2), NewStringDatum("p2")},
-			},
-		}
-		build := []Row{
-			{NewIntDatum(1), NewStringDatum("b1a")},
-			{NewIntDatum(1), NewStringDatum("b1b")},
-			{NewIntDatum(2), NewStringDatum("b2a")},
-		}
-		o := chainFixture(optimizer.JoinTypeInner, probe, build, 2, 2)
-		if err := probe.Open(nil); err != nil {
-			t.Fatalf("open probe: %v", err)
-		}
-		got := drainJoin(t, o)
-		assertRows(t, got, []string{"1|p1|1|b1a", "1|p1|1|b1b", "2|p2|2|b2a"})
-		if o.lazyProbeSrc != TupleSlot(o.lazyProbeSlot) {
-			t.Fatalf("kill switch off but the probe source is %T — chaining still ran", o.lazyProbeSrc)
-		}
-	})
-}
-
-// TestProbeChainSemiAnti covers the outer-only emit slot: Semi/Anti return the
-// probe row alone, which P1.1 composes through lazyOuterOnlyOut instead of
 // flattening. Output width must stay len(o.schema) = the left width.
 func TestProbeChainSemiAnti(t *testing.T) {
 	build := []Row{{NewIntDatum(1), NewStringDatum("b1")}, {NewIntDatum(1), NewStringDatum("b1-dup")}}
@@ -527,20 +492,14 @@ func TestProbeSeamZeroAllocs(t *testing.T) {
 
 // BenchmarkProbeSeam measures the seam itself: one probe row per pull against a
 // *VirtualSlot child — the shape every interior seam of a left-deep chain has
-// under the 02 plan-shape contract. The `off` arm is the pre-P1.1 seam, kept
-// runnable by the kill switch so the delta stays reproducible.
+// under the 02 plan-shape contract. (Its pre-P1.1 `off` arm went with the
+// GOOPG_JOIN_SLOT_CHAIN switch, M0147-0035.)
 func BenchmarkProbeSeam(b *testing.B) {
-	run := func(b *testing.B, chained bool) {
-		SetJoinSlotChainEnabled(chained)
-		defer SetJoinSlotChainEnabled(true)
-		probe, o := newSeamFixture()
-		b.ReportAllocs()
-		for b.Loop() {
-			if err := drainSeam(probe, o); err != nil {
-				b.Fatalf("drain: %v", err)
-			}
+	probe, o := newSeamFixture()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := drainSeam(probe, o); err != nil {
+			b.Fatalf("drain: %v", err)
 		}
 	}
-	b.Run("chained", func(b *testing.B) { run(b, true) })
-	b.Run("off", func(b *testing.B) { run(b, false) })
 }

@@ -3,64 +3,19 @@ package optimizer
 // C-19e (P5-05): the `Gather Merge -> Sort -> partial` verdict as a priced
 // two-candidate tournament instead of a type switch.
 //
-// The tests below pin the three properties that make the replacement safe to
-// carry at `off` and honest to flip at `on`:
+// The tests below pin two properties of the promoted tournament (M0147-0020;
+// it shipped behind GOOPG_PARTIAL_SORT_PATHS, default off, until then):
 //
-//  1. INERTNESS. At the default the tournament is not consulted at all, so the
-//     serial control arm and the default arm are bit-identical to C-19g's
-//     behaviour. This is the property the whole flag exists to give.
-//  2. The tournament REACHES A VERDICT from cost, and the verdict responds to
+//  1. The tournament REACHES A VERDICT from cost, and the verdict responds to
 //     the cost inputs rather than to the node type — which is the difference
 //     between a cost model and a rule wearing one's clothes.
-//  3. The `mergeKeys` invariant survives: a per-worker Sort is produced ONLY
+//  2. The `mergeKeys` invariant survives: a per-worker Sort is produced ONLY
 //     under a Gather Merge (parallel_merge_test.go's file header — a plain
 //     Gather over per-worker Sorts returns unordered rows with no crash).
 
 import (
 	"testing"
 )
-
-// TestPartialSortModeFromEnvIsFailClosed pins the resolver's polarity. A typo
-// must not silently enable a plan shape whose measurement has not been run.
-func TestPartialSortModeFromEnvIsFailClosed(t *testing.T) {
-	for _, v := range []string{"", "off", "OFF", "no", "yes", "onn", " ", "2"} {
-		if got := partialSortModeFromEnv(v); got != partialSortPathsOff {
-			t.Errorf("partialSortModeFromEnv(%q) = %v, want off", v, got)
-		}
-	}
-	for _, v := range []string{"on", "ON", " on ", "paths", "true", "1"} {
-		if got := partialSortModeFromEnv(v); got != partialSortPathsOn {
-			t.Errorf("partialSortModeFromEnv(%q) = %v, want on", v, got)
-		}
-	}
-	// The label must round-trip through the resolver — flaglabels.go's
-	// contract: the token inside `unset(…)` re-exported reproduces the arm.
-	for _, m := range []partialSortMode{partialSortPathsOff, partialSortPathsOn} {
-		if got := partialSortModeFromEnv(partialSortModeLabel(m)); got != m {
-			t.Errorf("label round-trip failed for %v: label=%q resolved=%v",
-				m, partialSortModeLabel(m), got)
-		}
-	}
-}
-
-// TestPartialSortDefaultDelegatesToRetiredRule is the inertness proof. At `off`
-// the verdict must be the retired type switch's, for every input — including
-// the ones the tournament would answer differently.
-func TestPartialSortDefaultDelegatesToRetiredRule(t *testing.T) {
-	if partialSortPathsMode != partialSortPathsOff {
-		t.Fatalf("package default is %v, want off — the flag ships off",
-			partialSortPathsMode)
-	}
-	tbl := bigTable(t, "psp_default")
-	srt := sortOver(seqScanOver(tbl), testKeys())
-	for _, workers := range []int{0, 1, 2, 4} {
-		want := sortPartialRootPays(srt)
-		if got := partialSortRootPays(srt, workers, true); got != want {
-			t.Errorf("workers=%d: partialSortRootPays = %v, retired rule = %v — "+
-				"the off arm must delegate unchanged", workers, got, want)
-		}
-	}
-}
 
 // TestPartialSortTournamentPricesBothArms pins that the tournament actually
 // builds the two plans the post-pass builds, with the shapes those plans have.
@@ -118,8 +73,6 @@ func TestPartialSortTournamentPricesBothArms(t *testing.T) {
 }
 
 func TestPartialSortBothArmsUseTheEmittedInputWidth(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := DefaultPlannerSettings().costParams()
 	tbl := bigTable(t, "psp_pgwidth")
 	child := seqScanOver(tbl)
@@ -155,9 +108,6 @@ func TestPartialSortBothArmsUseTheEmittedInputWidth(t *testing.T) {
 // trade off against each other as the divisor moves, and neither is pinned by
 // construction.
 func TestPartialSortVerdictIsCostDriven(t *testing.T) {
-	restore := setPartialSortPathsModeForTest(partialSortPathsOn)
-	defer restore()
-
 	tbl := bigTable(t, "psp_cost")
 	cp := DefaultPlannerSettings().costParams()
 
@@ -193,9 +143,6 @@ func TestPartialSortVerdictIsCostDriven(t *testing.T) {
 // plain Gather. This is the wrong-results shape, so it is asserted against the
 // real post-pass rather than against the tournament.
 func TestPartialSortOnKeepsMergeKeysInvariant(t *testing.T) {
-	restore := setPartialSortPathsModeForTest(partialSortPathsOn)
-	defer restore()
-
 	tbl := bigTable(t, "psp_invariant")
 	root := sortOver(seqScanOver(tbl), testKeys())
 	got := MaybeAddGather(root, parallelTestSettings())

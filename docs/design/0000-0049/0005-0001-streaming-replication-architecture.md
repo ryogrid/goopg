@@ -207,6 +207,51 @@ position than PostgreSQL would, and its `pg_control` reports a stale checkpoint
 to any reader inspecting the directory \(including PG's own tools\). The resume
 point is in the deferral ledger, 2026\-09\-22, M0122\-0013.
 
+### The restartpoint \(2026\-10\-27, M0122\-0013\)
+
+The gap above is closed.
+
+- **Replay remembers the checkpoint.** `StreamReplayer` records the last
+  checkpoint record it applies as a `ReplayedCheckpoint`: the record's start and
+  end plus its decoded `CheckPoint` struct. This is PG's `RecoveryRestartPoint`
+  filling `XLogCtl->lastCheckPoint`, `lastCheckPointRecPtr` and
+  `lastCheckPointEndPtr`.
+- **The checkpointer uses it.** Standby startup installs that source
+  \(`Checkpointer.SetRestartPointSource`\), and promotion clears it.
+- **`runRecoveryFlush` follows `CreateRestartPoint`.** It takes its copy of the
+  replayed checkpoint BEFORE the flush \(`CheckPointGuts`\), so every page the
+  checkpoint's redo depends on is covered. After the flush, `adoptRestartPoint`
+  updates `pg_control`, but only when `checkPointCopy.redo` is older than the
+  replayed checkpoint's redo:
+  - `checkPoint` becomes the record's 0\-based start;
+  - `checkPointCopy` becomes the whole replayed struct;
+  - `minRecoveryPoint` rises to the record's end only in
+    `DB_IN_ARCHIVE_RECOVERY`, as upstream.
+
+Still no WAL is written.
+
+Startup crash recovery begins at `checkPointCopy.redo` \(`beginRecovery` →
+`ReplayFromDirWithMgrAt`\), so a restarted standby now replays from its last
+restartpoint instead of from its base backup's checkpoint.
+
+`TestE2E_PhysicalStandbyRestartPointAdvancesPgControl` covers the whole path:
+
+- the primary checkpoints and the standby replays that checkpoint;
+- a standby `CHECKPOINT` adopts it, and the standby's `pg_control` then equals
+  the primary's checkpoint and redo;
+- after a restart the standby keeps the replayed row and keeps streaming.
+
+With the wiring removed, the test fails on an unchanged redo.
+
+**Still missing** \(ledgered 2026\-10\-27\):
+
+- goopg never stamps `DB_IN_ARCHIVE_RECOVERY` on a standby, so the
+  `minRecoveryPoint` arm is dormant.
+- A shutdown restartpoint does not set `DB_SHUTDOWNED_IN_RECOVERY`.
+- Restartpoints do not drive WAL segment removal \(`KeepLogSeg` /
+  `RemoveOldXlogFiles` in `CreateRestartPoint`\).
+- The skip arm's `UpdateMinRecoveryPoint` is not ported.
+
 The complementary primary-restart boundary is pinned separately: a running
 standby must survive a primary Stop plus Start, redial the same endpoint, and
 replay a row committed after the primary returns. The reconnect loop retains

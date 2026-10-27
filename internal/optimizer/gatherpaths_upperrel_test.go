@@ -44,62 +44,41 @@ func upperRelSetOpWithPartials(t *testing.T, cp costParams) *RelOptInfo {
 // site: a SETOP rel with a partial path gets a PathGather offered on its
 // Pathlist, over the partial SetOp itself.
 func TestGenerateUpperRelGatherPathsOffersGatherOverPartialSetOp(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		cp := defaultCostParams()
-		rel := upperRelSetOpWithPartials(t, cp)
+	cp := defaultCostParams()
+	rel := upperRelSetOpWithPartials(t, cp)
 
-		generateUpperRelGatherPaths(rel, cp)
+	generateUpperRelGatherPaths(rel, cp)
 
-		if len(rel.Pathlist) != 1 {
-			t.Fatalf("Pathlist = %d entries, want 1 (the offered Gather)", len(rel.Pathlist))
-		}
-		g := rel.Pathlist[0]
-		if g.Kind != PathGather {
-			t.Fatalf("offered path kind = %v, want PathGather", g.Kind)
-		}
-		if len(g.Children) != 1 || g.Children[0] != rel.PartialPathlist[0] {
-			t.Fatal("the Gather is not over the partial SetOp")
-		}
-	})
+	if len(rel.Pathlist) != 1 {
+		t.Fatalf("Pathlist = %d entries, want 1 (the offered Gather)", len(rel.Pathlist))
+	}
+	g := rel.Pathlist[0]
+	if g.Kind != PathGather {
+		t.Fatalf("offered path kind = %v, want PathGather", g.Kind)
+	}
+	if len(g.Children) != 1 || g.Children[0] != rel.PartialPathlist[0] {
+		t.Fatal("the Gather is not over the partial SetOp")
+	}
 }
 
-// TestGenerateUpperRelGatherPathsRefusesUnderTop pins the task's own stated
-// policy: `top` admits only the search's FINAL rel, and an upper rel is
-// never a member of any search level — fail closed. The producer still
-// files (its guard is `off`-only), but the reader offers nothing.
-func TestGenerateUpperRelGatherPathsRefusesUnderTop(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsTop)()
-		cp := defaultCostParams()
-		rel := upperRelSetOpWithPartials(t, cp)
-
-		generateUpperRelGatherPaths(rel, cp)
-
-		if len(rel.Pathlist) != 0 {
-			t.Fatalf("Pathlist = %d entries under mode top, want 0 (upper rels are never the search's final rel)", len(rel.Pathlist))
-		}
-	})
-}
-
-// TestGenerateUpperRelGatherPathsRefusesUnderOff: the delegated call refuses,
-// same as for a search rel.
+// TestGenerateUpperRelGatherPathsRefusesUnderOff: with
+// max_parallel_workers_per_gather = 0 the delegated call refuses, same as for a
+// search rel (parallelModeOK). Rebased from the retired GOOPG_GATHER_PATHS=off
+// arm, M0147-0046.
 func TestGenerateUpperRelGatherPathsRefusesUnderOff(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsOff)()
-		cp := defaultCostParams()
-		rel := &RelOptInfo{ConsiderParallel: true}
-		rel.PartialPathlist = []*Path{{
-			Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
-			ParallelSafe: true, ParallelWorkers: 2,
-		}}
+	cp := defaultCostParams()
+	cp.maxParallelWorkersPerGather = 0
+	rel := &RelOptInfo{ConsiderParallel: true}
+	rel.PartialPathlist = []*Path{{
+		Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
+		ParallelSafe: true, ParallelWorkers: 2,
+	}}
 
-		generateUpperRelGatherPaths(rel, cp)
+	generateUpperRelGatherPaths(rel, cp)
 
-		if len(rel.Pathlist) != 0 {
-			t.Fatalf("Pathlist = %d entries under mode off, want 0", len(rel.Pathlist))
-		}
-	})
+	if len(rel.Pathlist) != 0 {
+		t.Fatalf("Pathlist = %d entries with max_parallel_workers_per_gather = 0, want 0", len(rel.Pathlist))
+	}
 }
 
 // TestGenerateUpperRelGatherPathsRefusesWhenParallelDisabled: with
@@ -107,51 +86,45 @@ func TestGenerateUpperRelGatherPathsRefusesUnderOff(t *testing.T) {
 // hand-filed (the producer itself would cap workers to 0 and file nothing),
 // isolating the READER's own gate from the producer's.
 func TestGenerateUpperRelGatherPathsRefusesWhenParallelDisabled(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		cp := defaultCostParams()
-		cp.maxParallelWorkersPerGather = 0
-		rel := &RelOptInfo{ConsiderParallel: true}
-		rel.PartialPathlist = []*Path{{
-			Kind: PathSetOp, Rows: 150, Cost: Cost{Total: 17},
-			ParallelSafe: true, ParallelWorkers: 2,
-			Children: []*Path{
-				{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
-				{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
-			},
-		}}
+	cp := defaultCostParams()
+	cp.maxParallelWorkersPerGather = 0
+	rel := &RelOptInfo{ConsiderParallel: true}
+	rel.PartialPathlist = []*Path{{
+		Kind: PathSetOp, Rows: 150, Cost: Cost{Total: 17},
+		ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{
+			{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
+			{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
+		},
+	}}
 
-		generateUpperRelGatherPaths(rel, cp)
+	generateUpperRelGatherPaths(rel, cp)
 
-		if len(rel.Pathlist) != 0 {
-			t.Fatalf("Pathlist = %d entries with parallel disabled, want 0", len(rel.Pathlist))
-		}
-	})
+	if len(rel.Pathlist) != 0 {
+		t.Fatalf("Pathlist = %d entries with parallel disabled, want 0", len(rel.Pathlist))
+	}
 }
 
 // TestGenerateUpperRelGatherPathsRespectsConsiderParallel: partials present
 // but the rel does not consider parallel (e.g. one branch refused) — the
 // reader gates on the same flag the producer stamps.
 func TestGenerateUpperRelGatherPathsRespectsConsiderParallel(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		cp := defaultCostParams()
-		rel := &RelOptInfo{ConsiderParallel: false}
-		rel.PartialPathlist = []*Path{{
-			Kind: PathSetOp, Rows: 150, Cost: Cost{Total: 17},
-			ParallelSafe: true, ParallelWorkers: 2,
-			Children: []*Path{
-				{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
-				{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
-			},
-		}}
+	cp := defaultCostParams()
+	rel := &RelOptInfo{ConsiderParallel: false}
+	rel.PartialPathlist = []*Path{{
+		Kind: PathSetOp, Rows: 150, Cost: Cost{Total: 17},
+		ParallelSafe: true, ParallelWorkers: 2,
+		Children: []*Path{
+			{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
+			{Kind: PathSeqScan, ParallelSafe: true, ParallelWorkers: 2},
+		},
+	}}
 
-		generateUpperRelGatherPaths(rel, cp)
+	generateUpperRelGatherPaths(rel, cp)
 
-		if len(rel.Pathlist) != 0 {
-			t.Fatalf("Pathlist = %d entries with ConsiderParallel=false, want 0", len(rel.Pathlist))
-		}
-	})
+	if len(rel.Pathlist) != 0 {
+		t.Fatalf("Pathlist = %d entries with ConsiderParallel=false, want 0", len(rel.Pathlist))
+	}
 }
 
 // TestGenerateUpperRelGatherPathsIgnoresRelWithoutPartials pins the
@@ -159,17 +132,14 @@ func TestGenerateUpperRelGatherPathsRespectsConsiderParallel(t *testing.T) {
 // producer files partials there today, so the reader must leave the rel
 // byte-identical (same Pathlist contents, not just the same length).
 func TestGenerateUpperRelGatherPathsIgnoresRelWithoutPartials(t *testing.T) {
-	withParallelOn(t, func() {
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		cp := defaultCostParams()
-		rel := &RelOptInfo{ConsiderParallel: true}
-		seed := &Path{Kind: PathSort, Rows: 10, Cost: Cost{Total: 50}}
-		rel.Pathlist = []*Path{seed}
+	cp := defaultCostParams()
+	rel := &RelOptInfo{ConsiderParallel: true}
+	seed := &Path{Kind: PathSort, Rows: 10, Cost: Cost{Total: 50}}
+	rel.Pathlist = []*Path{seed}
 
-		generateUpperRelGatherPaths(rel, cp)
+	generateUpperRelGatherPaths(rel, cp)
 
-		if len(rel.Pathlist) != 1 || rel.Pathlist[0] != seed {
-			t.Fatal("a rel with no partial paths was modified; the WINDOW/ORDERED/GROUP_AGG call sites must be inert")
-		}
-	})
+	if len(rel.Pathlist) != 1 || rel.Pathlist[0] != seed {
+		t.Fatal("a rel with no partial paths was modified; the WINDOW/ORDERED/GROUP_AGG call sites must be inert")
+	}
 }

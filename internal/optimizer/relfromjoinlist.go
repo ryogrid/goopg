@@ -101,6 +101,13 @@ type joinlistProblem struct {
 	// applies them in the Filter above the searched tree.
 	pushedDownQuals []Expr
 
+	// ojHeldQuals are outer-join ON conjuncts that reference only the join's
+	// preserved side (M0147-0053), each with the outer join's scope. They
+	// become restrict infos whose required relids are that scope, so the
+	// search applies them at the outer join itself — never as a scan
+	// restriction and never in the Filter above the tree.
+	ojHeldQuals []ojHeldQual
+
 	// orClauseSelDivisor is PG's consider_new_or_clause compensation: for a
 	// join OR clause from which extractRestrictionOrClauses derived redundant
 	// base restrictions, the product of their selectivities, by which the
@@ -669,6 +676,7 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// outerjoin-delayed in PG's distribute_qual_to_rels), so its RHS's
 	// clauses stay out of the equivalence classes.
 	s.clauses = buildRestrictInfosExcluding(prob.conjuncts, 0, itemSpans, antiRighthands(sjis))
+	s.clauses.appendOJHeld(prob.ojHeldQuals, itemSpans)
 	// M0146-0224: the delayed WHERE conjuncts, on the root problem only —
 	// the joinrel of every FROM item is where check_outerjoin_delay places
 	// them. One that does not resolve to this problem's items is left to
@@ -780,9 +788,8 @@ func (prob *joinlistProblem) searchOneProblem(items []joinlistRel, tupleFraction
 	// which is what keeps TPC-H Q1's `Finalize Agg -> Gather -> Partial Agg`
 	// (built by the post-pass) out of this slice's blast radius.
 	//
-	// It runs before the level-2 search reads `CheapestTotal`, and is a no-op
-	// unless GOOPG_GATHER_PATHS is `all` — see DESIGN.md §5 for why `top` is
-	// the arm to measure first.
+	// It runs before the level-2 search reads `CheapestTotal` (DESIGN.md §5;
+	// the GOOPG_GATHER_PATHS `off`/`top` arms were retired at M0147-0046).
 	s.addBaseRelGatherPaths()
 	// GEQO: when the query has >= geqo_threshold base relations and geqo is
 	// enabled, use the genetic query optimizer instead of the DP search.

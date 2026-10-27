@@ -723,6 +723,7 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 	// proves that per conjunct before any of them is admitted (see there for
 	// the two admissible destinations and why a third would be a wrong
 	// answer). A failed proof declines the statement.
+	var ojHeld []ojHeldQual
 	if len(outerLinks) > 0 {
 		// FAIL-CLOSED, and this is the guard the whole slice rests on. A
 		// flattened outer link is only safe because `join_is_legal` refuses
@@ -736,10 +737,6 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		if !outerLinksHaveSJInfos(outerLinks, ctx.joinInfoList) {
 			traceSeamDecline("outer-link-no-sjinfo", nrels, nprefix)
 			return node, pred, false
-		}
-		var onOuter []Expr
-		for _, lk := range outerLinks {
-			onOuter = append(onOuter, splitAnd(lk.pred)...)
 		}
 		if !outerOnQualsOK(outerLinks, spans) {
 			traceSeamDecline("outer-on-qual", nrels, nprefix)
@@ -758,8 +755,19 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		// sits on a nullable side (a WHERE conjunct reaching one was held
 		// above, and the ON conjuncts are not in the list yet).
 		derived, redundant := deriveOuterLinkConstants(outerLinks, conjuncts, spans)
-		for _, c := range onOuter {
-			if !redundant[c] {
+		for _, lk := range outerLinks {
+			for _, c := range splitAnd(lk.pred) {
+				if redundant[c] {
+					continue
+				}
+				// M0147-0053: a preserved-side-only conjunct must not join
+				// `conjuncts` — `partitionConjunctsForJoinPlanningScoped`
+				// would push it into the preserved scan, dropping rows the
+				// join null-extends. It travels as a held outer-join qual.
+				if rs, ok := relidsOfExpr(c, spans); ok && rs != 0 && relsSubset(rs, lk.preserved) {
+					ojHeld = append(ojHeld, ojHeldQual{clause: c, scopeCols: linkScopeCols(lk, spans)})
+					continue
+				}
 				conjuncts = append(conjuncts, c)
 			}
 		}
@@ -1221,6 +1229,8 @@ func tryPGShapedJoinSearch(node Node, pred Expr, ctx *resolveContext, cat catalo
 		scans:     leaves,
 		relInfos:  relInfos,
 		conjuncts: searchConjuncts,
+		// M0147-0053: outer-join ON conjuncts on the preserved side only.
+		ojHeldQuals: ojHeld,
 		// M0146-0224: priced at the root problem's full joinrel.
 		pushedDownQuals: pushedQuals,
 		// M0146-0127: the semijoin-derived equalities and their RHS operands.
@@ -1650,9 +1660,17 @@ func outerOnQualsOK(links []outerChainLink, spans []leafSpan) bool {
 				}
 			default:
 				// Preserved-side-only: `t LEFT JOIN p ON t.x > 5` keeps every
-				// `t` row and null-extends the ones failing the test. There is
-				// no destination in a searched tree that says that.
-				return false
+				// `t` row and null-extends the ones failing the test. PG keeps
+				// such a qual as a join clause of the outer join
+				// (distribute_qual_to_rels, initsplan.c: not is_pushed_down,
+				// required_relids = the join's scope), and so does the seam
+				// since M0147-0053: it is carried as an `ojHeldQual` whose
+				// restrict info is applied at the link and nowhere lower. Its
+				// scope must be expressible as one column per leaf, so a
+				// zero-width leaf on either side still declines.
+				if !linkScopeHasColumns(lk, spans) {
+					return false
+				}
 			}
 		}
 	}
@@ -3190,4 +3208,30 @@ func semiAntiPredHasKeyEq(pred, lk, rk Expr) bool {
 		}
 	}
 	return false
+}
+
+// linkScopeCols is an outer link's scope — its preserved and nullable leaves —
+// as one representative column per leaf (the leaf's first column), the form
+// `appendOJHeld` re-expresses in each joinlist problem's item coordinates.
+func linkScopeCols(lk outerChainLink, spans []leafSpan) []int {
+	var cols []int
+	scope := lk.preserved | lk.nullable
+	for t, sp := range spans {
+		if t < maxSearchRels && scope&(RelSet(1)<<uint(t)) != 0 {
+			cols = append(cols, sp.lo)
+		}
+	}
+	return cols
+}
+
+// linkScopeHasColumns reports whether every leaf in the link's scope has at
+// least one column, so `linkScopeCols` names each of them.
+func linkScopeHasColumns(lk outerChainLink, spans []leafSpan) bool {
+	scope := lk.preserved | lk.nullable
+	for t, sp := range spans {
+		if t < maxSearchRels && scope&(RelSet(1)<<uint(t)) != 0 && sp.hi <= sp.lo {
+			return false
+		}
+	}
+	return true
 }

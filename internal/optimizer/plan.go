@@ -756,8 +756,8 @@ type SeqScan struct {
 	TableSample *TableSampleSpec
 	// EstRelRows is the relation-size fallback's row estimate for Table,
 	// stamped once at plan-build time and 0 when it did not apply (the
-	// GOOPG_RELSIZE_FALLBACK flag is off, the relation is ANALYZEd, or no
-	// live block count was available). EstimateRows reads it only when
+	// relation is ANALYZEd, or no live block count was available).
+	// EstimateRows reads it only when
 	// TableStats.RowCount is absent.
 	//
 	// Stamped rather than computed on demand for two reasons. It mirrors
@@ -3226,6 +3226,10 @@ type Explain struct {
 	pos     int
 	Options parser.ExplainOptions
 	Child   Node
+	// PlanningNs is the wall time the planner spent on Child, the figure
+	// EXPLAIN ANALYZE prints as "Planning Time" — PG's ExplainOneQuery
+	// times pg_plan_query alone (explain.c:350-356) (M0122-0019).
+	PlanningNs int64
 }
 
 func (n *Explain) Pos() int { return n.pos }

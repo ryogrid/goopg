@@ -188,7 +188,6 @@ func TestOrderedInputArmFiresEndToEndAndRemovesTheSort(t *testing.T) {
 	ps := DefaultPlannerSettings()
 	ps.EnableHashJoin = false
 	ps.EnableNestLoop = false
-	ps.EnableNestLoopIndex = false
 
 	for _, c := range []struct {
 		name       string

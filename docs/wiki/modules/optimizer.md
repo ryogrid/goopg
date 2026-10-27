@@ -34,7 +34,7 @@ parallel Gather, PARAM_EXEC lowering). **56,019 LOC** across 90+ `.go` files.
 | `planner.go`           | 15,262 | Entry: `Plan()`, `planStmt`, 5000+line `planSelect` pipeline, FROM-item planning (scan, join, subquery, VALUES, CTE, SRF), WHERE/HAVING resolution, aggregate/window stage construction, expression resolution (`resolveExpr`, `resolveColumnRef`), min/max rewrite, INSERT/UPDATE/DELETE/MERGE planning, type-coercion helpers, schema management. The package's largest file by far. |
 | `unnest.go`            | 4,311  | Subquery pull-up and correlated-subquery decorrelation: EXIST/HOT-IN → semi/anti join, scalar/IN subquery → join. `unestSubqueriesInPlan`, `unestSubquery`, `unestExistsExpr`, `unestInExpr`, `unestScalarWithResiduals`. Param harvesting plus index-key-cheap probe detection. |
 | `plan.go`              | 2,672  | Plan IR: `Node`/`Expr` interfaces, `Schema`/`SchemaColumn`, all plan-node structs (50+), all expression structs (30+), `outputLayout` types. Source of truth for every executor-facing data structure. |
-| `nl_index_join.go`     | 1,527  | `rewriteJoinsToNLI` rule pass: converts plain nested loops into `NestedLoopIndexJoin` when the inner side has an equi-key index probe. Residual-qual pushdown, selective inner unwrap. |
+| `nl_index_join.go`     | ~150   | Index-probe helpers for the parameterised index paths (`eligibleLeadingPrefixIndexes`, `leadingPrefixProbeKeys`). The legacy `rewriteJoinsToNLI` post-pass that lived here was deleted at M0147-0051 |
 | `cardinality.go`       | 1,401  | `EstimateRows` bottom-up per-node row estimation. `seqScanRows`, `indexScanRows`, `tableRows`, `estimateBaseRelInfo`, `estimateJoin`, `estimateAggregate`, `estimateNumGroups`. Default selectivity constants and NDistinct look-up. |
 | `joinlayout.go`        | 1,353  | Column-coordinate translation: pos-map family for translating ColumnRef indices between pre-search and post-search coordinate spaces. By-name re-resolvers. The planner's main coordinate-space bridge. |
 | `exprwalk.go`          | 888    | Tree-walking infrastructure: `walkExprTree`, `walkPlanExprs`, `walkPlanExprsDeep`. Used by unnesting, folding, rewrite passes. |
@@ -96,11 +96,6 @@ Feature gates (all wrap package atomics + env var kill-switches):
 |---|---|---|---:|---:|---:|
 | `SetUnnestPreDPEnabled` | `GOOPG_UNEST_PREDP` | on | Run pull-up before join search |
 | `SetSubqueryUnnestEnabled` | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
-| `SetIndexKeyHarvestEnabled` | `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
-| `SetNLIEnabled` | `GOOPG_NLI` | on | Rewrite joins to NLI |
-| `SetNLICostGateLegacy` | `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
-| `SetParallelEnabled` | `GOOPG_PARALLEL` | on | Parallel query post-pass |
-| `ParallelEnabled` | — | — | Query-time check |
 
 ## Internal structure
 
@@ -152,7 +147,7 @@ graph TD
 5. WHERE resolution: `resolveExpr` walk with aggregate rejection (42803), `canonicalizeQual`.
 6. Sublink unnesting: correlated EXISTS/IN/NOT-IN → semi/anti join via `unestSubqueriesInPlan`.
 7. **Join-order search** — the central optimisation (see below).
-8. Late rewrite passes: `rewriteJoinsToNLI` (nested-loop index join conversion), `reduce_outer_joins` (outer→inner via NULL rejection), qual push-down, inner-join qual push-down.
+8. Late rewrite passes: `reduce_outer_joins` (outer→inner via NULL rejection), qual push-down, inner-join qual push-down.
 9. Aggregate/window stages: `buildAggregateStage` (HashAgg/SortAgg selection), `buildWindowStage`.
 10. Sort/Distinct/Limit wrapping.
 
@@ -383,7 +378,7 @@ sequenceDiagram
 
 - **Env-flag kill-switch culture** — every plan-shaping feature is gated by a process-start
   env var (`GOOPG_PGSHAPED_DP`, `GOOPG_UNNEST_PREDP`, `GOOPG_EXISTS_TO_ANY`,
-  `GOOPG_MEMOIZE`, `GOOPG_PARALLEL`, `GOOPG_COLLAPSE`, `GOOPG_NLI`, …). Benchmark gates
+  `GOOPG_COLLAPSE`, …; M0147 is retiring them — see `flagProvenanceRetired`). Benchmark gates
   stamp `planner-flags:` provenance lines via `FlagProvenanceTable`/`RenderFlagProvenanceEnv`.
   Flags are read once at process start (`init()`), so a plan cannot change shape mid-statement.
 
@@ -566,11 +561,6 @@ Every plan-shaping feature is gated by a process-start env var. The full list:
 | `GOOPG_PGSHAPED_DP` | on | PG-shaped join search (vs syntactic order) |
 | `GOOPG_UNEST_PREDP` | on | Unnest before join search |
 | `GOOPG_SUBQUERY_UNEST` | on | Sublink decorrelation |
-| `GOOPG_INDEXKEY_HARVEST` | on | Harvest inner-index params for NLI |
-| `GOOPG_NLI` | on | Rewrite joins to NLI |
-| `GOOPG_NLI_COST_GATE` | off | Use old cost gate for NLI |
-| `GOOPG_PARALLEL` | on | Parallel query post-pass |
-| `GOOPG_MEMOIZE` | on | Memoize path generation |
 | `GOOPG_COLLAPSE` | on | Explicit JOIN tree collapsing |
 | `GOOPG_EXISTS_TO_ANY` | on | EXISTS-to-ANY rewrite |
 | `GOOPG_REDUCE_OUTER_JOINS` | on | reduce_outer_joins pass |
@@ -982,7 +972,7 @@ The main planning pipeline in detail:
 
 7. **Join-order search**: the central optimisation (see below).
 
-8. **Late rewrite passes**: `rewriteJoinsToNLI` (NLI conversion),
+8. **Late rewrite passes**:
    `reduce_outer_joins` (outer→inner via NULL rejection), qual push-down,
    inner-join qual push-down, `inferAnchoredEqualities`.
 
@@ -1188,7 +1178,6 @@ These walkers are used by:
 - `unestSubqueriesInPlan`: finds all SubqueryExpr nodes in the tree.
 - `FoldConstants`: finds all BinaryOp/UnaryOp/CaseExpr with constant operands.
 - `lowerSubPlanParams`: finds all OuterColumnRef nodes for PARAM_EXEC lowering.
-- `rewriteJoinsToNLI`: finds all ColumnRef that reference the outer side.
 
 ## MIN/MAX rewrite (`planner.go`)
 

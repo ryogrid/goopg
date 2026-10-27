@@ -196,8 +196,6 @@ func TestCostWindowPartialPresortedMatchIsCheaperThanFullSort(t *testing.T) {
 }
 
 func TestAddWindowPathsUsesPreWindowEmittedWidth(t *testing.T) {
-	restore := setPGSortRelationBytesCostForTest(true)
-	defer restore()
 	cp := defaultCostParams()
 	cp.workMem = 100
 	in := upperOrderedInput(1000000)
@@ -752,29 +750,6 @@ func TestAddPartialSetOpPathRefusesNonStreaming(t *testing.T) {
 		if len(setOpRel.PartialPathlist) != 0 {
 			t.Fatalf("%s: PartialPathlist = %d entries, want 0 (not a streaming UNION ALL)", c.name, len(setOpRel.PartialPathlist))
 		}
-	}
-}
-
-// TestAddPartialSetOpPathRefusesUnderGatherPathsOff.
-func TestAddPartialSetOpPathRefusesUnderGatherPathsOff(t *testing.T) {
-	restore := setGatherPathsModeForTest(gatherPathsOff)
-	defer restore()
-	cp := defaultCostParams()
-	setOpRel := &RelOptInfo{}
-	mk := func() *RelOptInfo {
-		return &RelOptInfo{ConsiderParallel: true, PartialPathlist: []*Path{{
-			Kind: PathSeqScan, Rows: 100, Cost: Cost{Total: 100},
-			ParallelSafe: true, ParallelWorkers: 2,
-		}}}
-	}
-	setOpRel.LeftBranchRel = mk()
-	setOpRel.RightBranchRel = mk()
-	node := setOpTestNode(parser.SetOpUnion, true, upperOrderedInput(100), upperOrderedInput(100))
-
-	addPartialSetOpPath(setOpRel, node, cp, false)
-
-	if len(setOpRel.PartialPathlist) != 0 {
-		t.Fatalf("PartialPathlist = %d entries, want 0 under GOOPG_GATHER_PATHS=off", len(setOpRel.PartialPathlist))
 	}
 }
 

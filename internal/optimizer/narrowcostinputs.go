@@ -1,7 +1,6 @@
 package optimizer
 
 import (
-	"os"
 	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -53,27 +52,23 @@ import (
 // `parallelism` staying 0, artefacts in
 // docs/design/not_ralph/plan_parity_fix_take2/r128-parity-over-throughput/.
 //
-// It is now opt-OUT (`v != "0"`), matching the sibling `GOOPG_NARROW_*`
-// family. It remains the only one of them that gates a planner COST input
-// rather than executor plan shape — that distinction survives promotion even
-// though the opt-in/opt-out split no longer marks it.
+// It shipped as opt-OUT (`GOOPG_NARROW_COST_INPUTS=0`); M0147-0041 retired
+// that switch, so narrowing is unconditional in the server.
 //
 // The trade is recorded rather than hidden (R128 SCOPE §4): promotion
 // re-baselines every plan pin, changes 3 TPC-DS shapes (Q6/Q64/Q75) for no
 // TPC-DS gain, and makes R124's accepted planner-publishes-below-executor
 // divergence the shipped default rather than an opt-in arm. It is taken
 // because the goal counts PG-likeness and disclaims runtime.
-var narrowCostInputs = narrowCostInputsFromEnv(os.Getenv("GOOPG_NARROW_COST_INPUTS"))
+//
+// narrowCostInputsForceOff is a test seam, not a lever: no environment
+// variable or GUC reaches it. TestNarrowCostInputsReachesTheLiveSearch needs
+// an un-narrowed arm as its oracle — a searched join cost that moves between
+// the arms is the only proof the production call site in relfromjoinlist.go
+// still runs (the scanPrefilterForceLate precedent, M0147-0034).
+var narrowCostInputsForceOff bool
 
-func narrowCostInputsFromEnv(v string) bool { return v != "0" }
-
-func narrowCostInputsEnabled() bool { return narrowCostInputs }
-
-func setNarrowCostInputsForTest(on bool) func() {
-	old := narrowCostInputs
-	narrowCostInputs = on
-	return func() { narrowCostInputs = old }
-}
+func narrowCostInputsEnabled() bool { return !narrowCostInputsForceOff }
 
 // narrowedWidths is the width triple a base rel's paths may carry, or a
 // decline. `ok == false` means "this rel narrows nothing" and every path of it
@@ -90,7 +85,7 @@ type narrowedWidths struct {
 // It declines — rather than narrowing to something smaller than the truth — on
 // every input it cannot attribute:
 //
-//   - the flag is off, or the rel/leaf is missing;
+//   - the test seam forces narrowing off, or the rel/leaf is missing;
 //   - `NeededColsKnown == false` (the collector declined; NOT the same as an
 //     empty set);
 //   - an EMPTY keep-set. `SELECT count(*)` needs no column, but `Path.NCols`
@@ -148,7 +143,8 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 	// `buildAvgVarBytes` (which declines to the whole-relation sum).
 	// Cost-only: these Path fields never reach the executor, which sizes from
 	// `plan.AvgVarBytes` over REL fields (createplanjoin.go).
-	noColMap := len(rel.ColVarBytes) == 0
+	colVar := rel.colVarBytes()
+	noColMap := len(colVar) == 0
 	if noColMap && rel.AvgVarBytes != 0 {
 		return nil, false
 	}
@@ -170,7 +166,7 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 			// Coordinate conversion, not an aside: neededKeepSet matches column
 			// names case-SENSITIVELY, while ColVarBytes is lowercase-keyed
 			// (tableColVarBytes).
-			w, found := rel.ColVarBytes[strings.ToLower(col.Name)]
+			w, found := colVar[strings.ToLower(col.Name)]
 			if !found {
 				// Unattributed column — decline the whole rel rather than
 				// contribute a silent zero.
@@ -180,7 +176,7 @@ func relNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
 			// comment above.
 			kc.varBytes = w
 		}
-		if aw := rel.ColVarBytes[strings.ToLower(col.Name)]; aw > 0 {
+		if aw := colVar[strings.ToLower(col.Name)]; aw > 0 {
 			kc.width = int(aw)
 		} else if w, ok := derivedLeafColumnWidth(rel.baseLeaf, i); ok {
 			kc.width = w
@@ -255,19 +251,81 @@ func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
 		!s.outputColsKnown || s.outputCols == nil || s.clauses == nil || len(joinrel.publishedMembers) == 0 {
 		return narrowedWidths{}
 	}
-	keep, ok := s.attrNeededAbove(joinrel.Relids)
+	keep, ok := s.memoAttrNeededAbove(joinrel.Relids)
 	if !ok {
 		return narrowedWidths{}
 	}
-	var cols []keptColumn
+	var n narrowedWidths
 	for _, m := range joinrel.publishedMembers {
-		mc, ok := relNarrowedColumns(m)
+		mc, ok := s.memoRelNarrowedColumns(m)
 		if !ok {
 			return narrowedWidths{}
 		}
-		cols = append(cols, mc...)
+		for _, c := range mc {
+			if !keep[c.name] {
+				continue
+			}
+			n.ncols++
+			n.avgVarBytes += c.varBytes
+			n.outputWidth += c.width
+		}
 	}
-	return sumKeptColumns(cols, keep)
+	// The sumKeptColumns rules over the members' concatenation.
+	if n.ncols == 0 {
+		return narrowedWidths{}
+	}
+	if n.outputWidth < 1 {
+		n.outputWidth = 1
+	}
+	n.ok = true
+	return n
+}
+
+// narrowColsEntry / attrNeededEntry are the searchCtx memo values: a result
+// together with its ok flag, so a decline is memoised too.
+type narrowColsEntry struct {
+	cols []keptColumn
+	ok   bool
+}
+
+type attrNeededEntry struct {
+	keep map[string]bool
+	ok   bool
+}
+
+// memoRelNarrowedColumns is relNarrowedColumns memoised per rel for the
+// search. Its inputs — the rel's leaf, needed set and column statistics — are
+// fixed before the search starts. The returned slice is shared: read only.
+func (s *searchCtx) memoRelNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
+	if e, hit := s.narrowColsMemo[rel]; hit {
+		return e.cols, e.ok
+	}
+	cols, ok := relNarrowedColumns(rel)
+	if s.narrowColsMemo == nil {
+		s.narrowColsMemo = make(map[*RelOptInfo]narrowColsEntry)
+	}
+	s.narrowColsMemo[rel] = narrowColsEntry{cols: cols, ok: ok}
+	return cols, ok
+}
+
+// memoAttrNeededAbove is attrNeededAbove memoised per relids for the current
+// clause list (identity and length); a different list resets the memo. The
+// returned map is shared: read only.
+func (s *searchCtx) memoAttrNeededAbove(relids RelSet) (map[string]bool, bool) {
+	n := 0
+	if s.clauses != nil {
+		n = len(s.clauses.all)
+	}
+	if s.attrNeededMemo == nil || s.attrMemoList != s.clauses || s.attrMemoLen != n {
+		s.attrNeededMemo = make(map[RelSet]attrNeededEntry)
+		s.attrMemoList, s.attrMemoLen = s.clauses, n
+	}
+	if e, hit := s.attrNeededMemo[relids]; hit {
+		return e.keep, e.ok
+	}
+	keep, ok := s.attrNeededAbove(relids)
+	s.attrNeededMemo[relids] = attrNeededEntry{keep: keep, ok: ok}
+	return keep, ok
 }
 
 // attrNeededAbove is the NAME set of attributes a rel over relids must emit —
@@ -309,11 +367,11 @@ func (s *searchCtx) attrNeededAbove(relids RelSet) (map[string]bool, bool) {
 // relNarrowedColumns), so it keeps the statement-wide narrowing, as does any
 // rel the clause inventory cannot attribute.
 func (s *searchCtx) baseRelNarrowedWidths(rel *RelOptInfo) narrowedWidths {
-	cols, ok := relNarrowedColumns(rel)
+	cols, ok := s.memoRelNarrowedColumns(rel)
 	if !ok {
 		return narrowedWidths{}
 	}
-	if keep, known := s.attrNeededAbove(rel.Relids); known {
+	if keep, known := s.memoAttrNeededAbove(rel.Relids); known {
 		if n := sumKeptColumns(cols, keep); n.ok {
 			return n
 		}
@@ -439,7 +497,7 @@ func narrowJoinWidths(p *Path) {
 
 	// Rule 4: an index-only child's triple is NOT this round's narrowing.
 	// pathindexonly.go writes NCols/AvgVarBytes/OutputWidth unconditionally,
-	// independent of this flag, so treating `NCols > 0` as "we narrowed it"
+	// independent of this narrowing, so treating `NCols > 0` as "we narrowed it"
 	// would launder an IOS triple into a join sum on a rel that declined —
 	// while the NLI path for that same joinrel (inner from
 	// CheapestParameterized, NCols == 0) declined. Two paths of one joinrel in
@@ -502,7 +560,7 @@ func inheritNarrowedWidths(parent, child *Path) {
 	// Do NOT launder an index-only triple onto a wrapper (rule 3).
 	//
 	// Index-only paths carry `NCols` unconditionally — they are written by
-	// pathindexonly.go whether or not this flag is set, and they are the one
+	// pathindexonly.go whether or not this round narrows, and they are the one
 	// documented exemption from the all-or-none rule at the SCAN level. But a
 	// Gather is not exempt: it is a path this round writes. Without this
 	// guard, a rel that DECLINES to narrow (nil ColVarBytes — an un-ANALYZEd

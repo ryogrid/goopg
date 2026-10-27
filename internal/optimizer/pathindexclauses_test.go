@@ -100,37 +100,6 @@ func TestIndexPathClausesReordersCandidateOrderToIndexOrder(t *testing.T) {
 	}
 }
 
-// TestIndexPathClausesAgreesWithTheIndexPick is hard-won rule #2 applied to the
-// one twin this carrier has. `pickIndexCoveringLeadingPrefix` (the function
-// the NLI constructor shares) independently produces the ordered probe-value
-// list, and it is the reason the index was accepted at all. If the carrier's
-// keys ever disagreed with it, the path would be COSTED for one probe and BUILT
-// as another.
-func TestIndexPathClausesAgreesWithTheIndexPick(t *testing.T) {
-	cat, ps, _ := picComposite(t)
-	bound := picReversedBound()
-
-	innerToOuter := make(map[string]Expr, len(bound))
-	for _, c := range bound {
-		innerToOuter[c.innerCol] = c.outerKey
-	}
-	idx, pickKeys := pickIndexCoveringLeadingPrefix(cat, ps, innerToOuter)
-	if idx == nil {
-		t.Fatal("the fully-bound composite index was declined; the twin cannot be compared")
-	}
-
-	carried := indexPathClauses(idx, bound)
-	if len(carried) != len(pickKeys) {
-		t.Fatalf("carrier has %d keys, the index pick %d", len(carried), len(pickKeys))
-	}
-	for i := range carried {
-		if carried[i].key != pickKeys[i] {
-			t.Fatalf("key %d: carrier has %#v, index pick has %#v — the path would be costed for one probe and built as another",
-				i, carried[i].key, pickKeys[i])
-		}
-	}
-}
-
 // TestIndexPathClausesDeclinesOnAnUnboundColumn: PG builds a gapped list
 // happily (its btree applies whatever boundary conditions it has), but goopg's
 // `IndexScan.Keys` is positional and requires one expression per index column,

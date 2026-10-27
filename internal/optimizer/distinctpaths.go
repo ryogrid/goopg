@@ -349,7 +349,7 @@ func distinctCandidates(distinctRel *RelOptInfo, seed *Path, distinctNode *Disti
 // partial path for an empty distinct pathkey list is not: the empty-keys
 // case is left serial — a refusal, not an approximation.
 func addPartialDistinctPaths(u *upperRels, distinctRel *RelOptInfo, seed *Path, distinctNode *Distinct, child Node, cp costParams, ps PlannerSettings, partial *Path) {
-	if !parallelOn.Load() || ps.MaxParallelWorkersPerGather <= 0 {
+	if ps.MaxParallelWorkersPerGather <= 0 {
 		traceUpperGate("distinct-upper", "refused", "gate=statement")
 		return
 	}

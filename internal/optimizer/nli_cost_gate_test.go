@@ -54,61 +54,6 @@ func gateFixture(t *testing.T, outerRows, innerRows, innerKeyND int64) (Node, *S
 	return outer, inner, idx
 }
 
-func TestNLICostGateTable(t *testing.T) {
-	cases := []struct {
-		name       string
-		joinType   JoinType
-		outerRows  int64 // 0 = no stats
-		innerRows  int64
-		innerKeyND int64
-		want       bool
-	}{
-		// Q4 shape: ~57K date-filtered orders probing 6M lineitem via
-		// l_orderkey (nd≈1.5M → matchSet 4). 57640*4 < 6M+57640 → accept.
-		{"q4-selective-outer-accepts-semi", JoinTypeSemi, 57640, 6000000, 1500000, true},
-		// Q21-ish: 6M outer semi — 6M*4 = 24M > 6M+6M → keep hash.
-		{"large-outer-keeps-hash-semi", JoinTypeSemi, 6000000, 6000000, 1500000, false},
-		// Anti symmetric to Q4 shape.
-		{"q4-shape-anti-accepts", JoinTypeAnti, 57640, 6000000, 1500000, true},
-		{"large-outer-keeps-hash-anti", JoinTypeAnti, 6000000, 6000000, 1500000, false},
-		// No stats: OPTIMISTIC accept for every join type. The first cut
-		// rejected semi/anti here; measured reality inverted it — goopg's
-		// ANALYZE stats are in-memory and lost on restart, so no-stats is
-		// the COMMON case and rejecting it disabled semi/anti NLI in
-		// practice (fresh-server Q4 flipped to hash semi = the 276 s /
-		// 71x class this gate exists to prevent).
-		{"no-stats-semi-optimistic", JoinTypeSemi, 0, 0, 0, true},
-		{"no-stats-anti-optimistic", JoinTypeAnti, 0, 0, 0, true},
-		{"no-stats-inner-optimistic", JoinTypeInner, 0, 0, 0, true},
-		// INNER keeps the bare heuristic: 100K boundary.
-		{"inner-under-threshold", JoinTypeInner, 100000, 6000000, 1500000, true},
-		{"inner-over-threshold", JoinTypeInner, 100001, 6000000, 1500000, false},
-		// Fat match set (nd small): 1000 outer × matchSet 600 = 600K >
-		// 6000+1000 → keep hash even for a small outer.
-		{"fat-matchset-keeps-hash", JoinTypeSemi, 1000, 6000, 10, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			outer, inner, idx := gateFixture(t, tc.outerRows, tc.innerRows, tc.innerKeyND)
-			if got := nliCostGateAccepts(tc.joinType, outer, inner, idx); got != tc.want {
-				t.Fatalf("gate(%v, outer=%d, inner=%d, nd=%d) = %v, want %v",
-					tc.joinType, tc.outerRows, tc.innerRows, tc.innerKeyND, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestNLICostGateLegacyHatch(t *testing.T) {
-	SetNLICostGateLegacy(true)
-	t.Cleanup(func() { SetNLICostGateLegacy(false) })
-	// Legacy: stats-blind — a no-stats semi is accepted again (old
-	// optimistic behavior). GOOPG_NLI_COSTGATE=legacy maps to this.
-	outer, inner, idx := gateFixture(t, 0, 0, 0)
-	if !nliCostGateAccepts(JoinTypeSemi, outer, inner, idx) {
-		t.Fatal("legacy hatch did not restore the optimistic semi gate")
-	}
-}
-
 func TestEstimateSubplanCostPerCall(t *testing.T) {
 	outer, inner, idx := gateFixture(t, 1000, 6000000, 1500000)
 	_ = outer

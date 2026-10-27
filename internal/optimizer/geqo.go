@@ -478,19 +478,31 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 	if s.ecIdx == nil || s.ecIdx.clauses != s.clauses {
 		s.ecIdx = &classIndex{clauses: s.clauses}
 	}
+	s.prepareSharedMemos()
 	n := &searchCtx{
-		exprKeys:       s.exprKeys,
-		ecIdx:          s.ecIdx,
-		joinrels:       make([][]*RelOptInfo, s.nrels+1),
-		relMap:         make(map[RelSet]*RelOptInfo),
-		nrels:          s.nrels,
-		cp:             s.cp,
-		tupleFraction:  s.tupleFraction,
-		relInfos:       s.relInfos,
-		clauses:        s.clauses,
-		builder:        s.builder,
-		joinInfoList:   s.joinInfoList,
-		neededCols:     s.neededCols,
+		exprKeys: s.exprKeys,
+		ecIdx:    s.ecIdx,
+		// The search memos ride along for the same reason (M0122-0012
+		// C16c): each reads only state every tour shares — base rels, the
+		// clause list, the query pathkeys — and a per-tour memo re-derived
+		// every joinrel's inputs ~500 times on TPC-DS Q64.
+		narrowColsMemo:  s.narrowColsMemo,
+		attrNeededMemo:  s.attrNeededMemo,
+		attrMemoList:    s.attrMemoList,
+		attrMemoLen:     s.attrMemoLen,
+		innerUniqueMemo: s.innerUniqueMemo,
+		usefulMemo:      s.usefulMemo,
+		usefulMemoOwner: s.usefulMemoOwner,
+		joinrels:        make([][]*RelOptInfo, s.nrels+1),
+		relMap:          make(map[RelSet]*RelOptInfo),
+		nrels:           s.nrels,
+		cp:              s.cp,
+		tupleFraction:   s.tupleFraction,
+		relInfos:        s.relInfos,
+		clauses:         s.clauses,
+		builder:         s.builder,
+		joinInfoList:    s.joinInfoList,
+		neededCols:      s.neededCols,
 		neededColsKnown: s.neededColsKnown,
 		// Take2 P4-01 Slice 3: the above-tree set and its eligibility ride
 		// along, so joinrels a GEQO tour creates stamp exactly as the DP
@@ -523,6 +535,30 @@ func (s *searchCtx) freshEvalCtx() *searchCtx {
 		n.relMap[rel.Relids] = rel
 	}
 	return n
+}
+
+// prepareSharedMemos allocates the search memos on s and stamps their owners
+// with s's current inputs, so freshEvalCtx hands every tour the same maps
+// rather than each tour allocating its own on first use.
+func (s *searchCtx) prepareSharedMemos() {
+	if s.narrowColsMemo == nil {
+		s.narrowColsMemo = make(map[*RelOptInfo]narrowColsEntry)
+	}
+	n := 0
+	if s.clauses != nil {
+		n = len(s.clauses.all)
+	}
+	if s.attrNeededMemo == nil || s.attrMemoList != s.clauses || s.attrMemoLen != n {
+		s.attrNeededMemo = make(map[RelSet]attrNeededEntry)
+		s.attrMemoList, s.attrMemoLen = s.clauses, n
+	}
+	if s.innerUniqueMemo == nil {
+		s.innerUniqueMemo = make(map[innerUniqueKey][]innerUniqueEntry)
+	}
+	if owner := s.currentUsefulMemoOwner(); s.usefulMemo == nil || s.usefulMemoOwner != owner {
+		s.usefulMemo = make(map[RelSet]*pathkeyUsefulness)
+		s.usefulMemoOwner = owner
+	}
 }
 
 // clump is a group of already-joined relations within gimmeTree.

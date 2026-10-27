@@ -222,111 +222,107 @@ func cpIndexedProblem(t *testing.T, names []string) *joinlistProblem {
 // seq scan and the index scan — and the index twin is the serial index path
 // with its CPU share divided.
 func TestPartialIndexPath_PricedByCostIndexParallelArm(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-		prob := cpIndexedProblem(t, names)
-		s := cpSearch(t, prob)
-		cp := prob.cp
-		sawIndexTwin := false
-		for i, rel := range s.joinrels[1] {
-			tbl := prob.relInfos[i].table
-			var serialIdx *Path
-			for _, p := range rel.Pathlist {
-				if p.Kind == PathIndexScan && p.RequiredOuter == 0 && !p.IndexOnly {
-					serialIdx = p
-				}
-			}
-			var partialIdx, partialSeq *Path
-			for _, p := range rel.PartialPathlist {
-				switch p.Kind {
-				case PathIndexScan:
-					partialIdx = p
-				case PathSeqScan:
-					partialSeq = p
-				}
-			}
-			if serialIdx == nil || tbl.Stats.Pages < 1024 {
-				if partialIdx != nil {
-					t.Errorf("%s: partial index path without a serial one / on a small rel", tbl.Name)
-				}
-				continue
-			}
-			if partialIdx == nil {
-				t.Fatalf("%s: serial index path present but no partial twin (%d partial paths)", tbl.Name, len(rel.PartialPathlist))
-			}
-			if partialSeq == nil {
-				t.Fatalf("%s: the partial seq scan must coexist with the partial index path", tbl.Name)
-			}
-			sawIndexTwin = true
-			if partialIdx.ParallelWorkers <= 0 || !partialIdx.ParallelSafe {
-				t.Errorf("%s: twin workers %d safe %v", tbl.Name, partialIdx.ParallelWorkers, partialIdx.ParallelSafe)
-			}
-			if partialIdx.IndexInfo != serialIdx.IndexInfo || len(partialIdx.Pathkeys) != len(serialIdx.Pathkeys) || partialIdx.IndexScanDir != serialIdx.IndexScanDir {
-				t.Errorf("%s: twin must carry the serial path's index/pathkeys/direction", tbl.Name)
-			}
-			d := getParallelDivisor(partialIdx.ParallelWorkers, cp.parallelLeaderParticipation)
-			relTuples := float64(prob.relInfos[i].baseRows)
-			cpu := cp.cpuTupleCost * clampRowEst(relTuples)
-			if wantTotal := serialIdx.Cost.Total - cpu + cpu/d; math.Abs(partialIdx.Cost.Total-wantTotal) > 1e-6 {
-				t.Errorf("%s: twin total %.4f, want %.4f", tbl.Name, partialIdx.Cost.Total, wantTotal)
-			}
-			if partialIdx.Cost.Startup != serialIdx.Cost.Startup {
-				t.Errorf("%s: twin startup %v, serial %v", tbl.Name, partialIdx.Cost.Startup, serialIdx.Cost.Startup)
-			}
-			if want := clampRowEst(serialIdx.Rows / d); partialIdx.Rows != want {
-				t.Errorf("%s: twin rows %v, want %v", tbl.Name, partialIdx.Rows, want)
-			}
-			// The partial list is sorted by total cost, cheapest first.
-			for j := 1; j < len(rel.PartialPathlist); j++ {
-				if rel.PartialPathlist[j-1].Cost.Total > rel.PartialPathlist[j].Cost.Total {
-					t.Errorf("%s: partial list not sorted at %d", tbl.Name, j)
-				}
+	names := []string{"a", "b", "c"}
+	prob := cpIndexedProblem(t, names)
+	s := cpSearch(t, prob)
+	cp := prob.cp
+	sawIndexTwin := false
+	for i, rel := range s.joinrels[1] {
+		tbl := prob.relInfos[i].table
+		var serialIdx *Path
+		for _, p := range rel.Pathlist {
+			if p.Kind == PathIndexScan && p.RequiredOuter == 0 && !p.IndexOnly {
+				serialIdx = p
 			}
 		}
-		if !sawIndexTwin {
-			t.Fatal("fixture produced no partial index path; the pin would be vacuous")
-		}
-		// The serial arm is unchanged by construction: the same problem
-		// without parallel mode yields the same Pathlist on every base rel.
-		off := cpIndexedProblem(t, names)
-		off.cp.maxParallelWorkersPerGather = 0
-		s2 := cpSearch(t, off)
-		for i := range s.joinrels[1] {
-			on, offList := s.joinrels[1][i].Pathlist, s2.joinrels[1][i].Pathlist
-			if len(on) != len(offList) {
-				t.Fatalf("rel %d: serial pathlist differs with parallel on/off: %d vs %d", i, len(on), len(offList))
-			}
-			for j := range on {
-				if on[j].Kind != offList[j].Kind || on[j].Cost != offList[j].Cost || on[j].Rows != offList[j].Rows {
-					t.Errorf("rel %d path %d differs with parallel on/off", i, j)
-				}
-			}
-			if n := len(s2.joinrels[1][i].PartialPathlist); n != 0 {
-				t.Errorf("rel %d has %d partial paths at max_parallel_workers_per_gather = 0", i, n)
+		var partialIdx, partialSeq *Path
+		for _, p := range rel.PartialPathlist {
+			switch p.Kind {
+			case PathIndexScan:
+				partialIdx = p
+			case PathSeqScan:
+				partialSeq = p
 			}
 		}
-	})
+		if serialIdx == nil || tbl.Stats.Pages < 1024 {
+			if partialIdx != nil {
+				t.Errorf("%s: partial index path without a serial one / on a small rel", tbl.Name)
+			}
+			continue
+		}
+		if partialIdx == nil {
+			t.Fatalf("%s: serial index path present but no partial twin (%d partial paths)", tbl.Name, len(rel.PartialPathlist))
+		}
+		if partialSeq == nil {
+			t.Fatalf("%s: the partial seq scan must coexist with the partial index path", tbl.Name)
+		}
+		sawIndexTwin = true
+		if partialIdx.ParallelWorkers <= 0 || !partialIdx.ParallelSafe {
+			t.Errorf("%s: twin workers %d safe %v", tbl.Name, partialIdx.ParallelWorkers, partialIdx.ParallelSafe)
+		}
+		if partialIdx.IndexInfo != serialIdx.IndexInfo || len(partialIdx.Pathkeys) != len(serialIdx.Pathkeys) || partialIdx.IndexScanDir != serialIdx.IndexScanDir {
+			t.Errorf("%s: twin must carry the serial path's index/pathkeys/direction", tbl.Name)
+		}
+		d := getParallelDivisor(partialIdx.ParallelWorkers, cp.parallelLeaderParticipation)
+		relTuples := float64(prob.relInfos[i].baseRows)
+		cpu := cp.cpuTupleCost * clampRowEst(relTuples)
+		if wantTotal := serialIdx.Cost.Total - cpu + cpu/d; math.Abs(partialIdx.Cost.Total-wantTotal) > 1e-6 {
+			t.Errorf("%s: twin total %.4f, want %.4f", tbl.Name, partialIdx.Cost.Total, wantTotal)
+		}
+		if partialIdx.Cost.Startup != serialIdx.Cost.Startup {
+			t.Errorf("%s: twin startup %v, serial %v", tbl.Name, partialIdx.Cost.Startup, serialIdx.Cost.Startup)
+		}
+		if want := clampRowEst(serialIdx.Rows / d); partialIdx.Rows != want {
+			t.Errorf("%s: twin rows %v, want %v", tbl.Name, partialIdx.Rows, want)
+		}
+		// The partial list is sorted by total cost, cheapest first.
+		for j := 1; j < len(rel.PartialPathlist); j++ {
+			if rel.PartialPathlist[j-1].Cost.Total > rel.PartialPathlist[j].Cost.Total {
+				t.Errorf("%s: partial list not sorted at %d", tbl.Name, j)
+			}
+		}
+	}
+	if !sawIndexTwin {
+		t.Fatal("fixture produced no partial index path; the pin would be vacuous")
+	}
+	// The serial arm is unchanged by construction: the same problem
+	// without parallel mode yields the same Pathlist on every base rel.
+	off := cpIndexedProblem(t, names)
+	off.cp.maxParallelWorkersPerGather = 0
+	s2 := cpSearch(t, off)
+	for i := range s.joinrels[1] {
+		on, offList := s.joinrels[1][i].Pathlist, s2.joinrels[1][i].Pathlist
+		if len(on) != len(offList) {
+			t.Fatalf("rel %d: serial pathlist differs with parallel on/off: %d vs %d", i, len(on), len(offList))
+		}
+		for j := range on {
+			if on[j].Kind != offList[j].Kind || on[j].Cost != offList[j].Cost || on[j].Rows != offList[j].Rows {
+				t.Errorf("rel %d path %d differs with parallel on/off", i, j)
+			}
+		}
+		if n := len(s2.joinrels[1][i].PartialPathlist); n != 0 {
+			t.Errorf("rel %d has %d partial paths at max_parallel_workers_per_gather = 0", i, n)
+		}
+	}
 }
 
 // A `USING hash` index is not amcanparallel: no partial twin.
 func TestPartialIndexPath_HashIndexHasNoTwin(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-		prob := cpIndexedProblem(t, names)
-		for i := range names {
-			for _, idx := range prob.cat.IndexesOnTable(prob.relInfos[i].table) {
-				idx.DeclaredHash = true
+	names := []string{"a", "b", "c"}
+	prob := cpIndexedProblem(t, names)
+	for i := range names {
+		for _, idx := range prob.cat.IndexesOnTable(prob.relInfos[i].table) {
+			idx.DeclaredHash = true
+		}
+	}
+	s := cpSearch(t, prob)
+	for i, rel := range s.joinrels[1] {
+		for _, p := range rel.PartialPathlist {
+			if p.Kind == PathIndexScan {
+				t.Errorf("rel %d: a hash index produced a partial index path", i)
 			}
 		}
-		s := cpSearch(t, prob)
-		for i, rel := range s.joinrels[1] {
-			for _, p := range rel.PartialPathlist {
-				if p.Kind == PathIndexScan {
-					t.Errorf("rel %d: a hash index produced a partial index path", i)
-				}
-			}
-		}
-	})
+	}
 }
 
 // (c) drivingScan admits a bare btree range/full plain index scan, and only

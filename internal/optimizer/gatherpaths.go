@@ -18,8 +18,9 @@ package optimizer
 //
 // Design: docs/design/planner-c19d-gather-paths/DESIGN.md.
 //
-// ADMISSION IS `all` BY DEFAULT SINCE M0140-0003 (`GOOPG_GATHER_PATHS`, §5 of
-// that doc). Partial paths exist on BASE rels only until C-19f gives a
+// ADMISSION IS `all` SINCE M0140-0003 (§5 of that doc); M0147-0046 retired the
+// `GOOPG_GATHER_PATHS` `off`/`top` arms, so every rel with partial paths is
+// offered its Gathers, as PG's generate_useful_gather_paths does. Partial paths exist on BASE rels only until C-19f gives a
 // joinrel its own, so a Gather chosen here can sit BELOW a join and the joins
 // above it run serially in the leader — while the post-pass instead puts one
 // Gather ABOVE the whole hash-join subtree. The measured decision this
@@ -28,8 +29,8 @@ package optimizer
 // pre-registered "no match flip" per R43 rev 3 / K38 — the category-movement
 // criterion the plan-parity harness holds this milestone to, not a match-
 // count rise — and TPC-H/TPC-DS values gates held at the baseline arm.
-// `GOOPG_GATHER_PATHS=off` still reproduces the pre-M0140-0003 serial-search
-// control arm exactly, for any future A/B that needs it.
+// The serial-search control arm is now PG's own: `max_parallel_workers_per_gather
+// = 0` (no partial path is built, parallelModeOK).
 //
 // A BASE rel's Gather is WINNABLE since 2026-09-07 (ledger
 // `c19-baserel-scan-priced-on-output-rows`). It was not before: goopg priced a
@@ -49,93 +50,8 @@ package optimizer
 // is still the only producer of parallelism there — TODO_ALL C-19h, blocker 4.
 
 import (
-	"os"
-	"strings"
-
 	"github.com/goopg/goopg/internal/parser"
 )
-
-// gatherPathMode is the admission rule for the paths this file produces.
-//
-//   - off  — produce none. The search is unchanged by construction, which is
-//     this slice's serial-control-arm argument, and reproduces goopg's
-//     pre-M0140-0003 behaviour exactly.
-//   - top  — produce them only at the search's FINAL rel: the node the
-//     post-pass targets today. Inert on any multi-rel statement until C-19f
-//     populates a joinrel's partial list, and live the moment it does.
-//   - all  — PG-faithful: every rel with partial paths, base rels included.
-//     This is the arm that carries the ordering trap (take2 07 §3.2), and
-//     the DEFAULT since M0140-0003 measured it clear (category movement, no
-//     match-count regression, values gates held).
-type gatherPathMode int
-
-const (
-	gatherPathsOff gatherPathMode = iota
-	gatherPathsTop
-	gatherPathsAll
-)
-
-// gatherPathsMode is read once at process start, like every other plan-shaping
-// knob in this package, so a plan cannot change shape mid-statement.
-var gatherPathsMode = gatherPathModeFromEnv(os.Getenv("GOOPG_GATHER_PATHS"))
-
-// gatherPathModeFromEnv resolves the knob. An unset/empty environment
-// resolves to `all` — M0140-0003's landed default. An explicit,
-// unrecognised value (a typo, or the empty string spelled some other way)
-// resolves to `off` rather than falling through to the new default: this
-// stays a fail-closed switch for anyone deliberately typing an opt-out
-// string, on the same reasoning the pre-M0140-0003 version of this function
-// applied to the (then unmeasured) `all` arm.
-func gatherPathModeFromEnv(v string) gatherPathMode {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "":
-		return gatherPathsAll
-	case "top":
-		return gatherPathsTop
-	case "all", "on":
-		return gatherPathsAll
-	default:
-		return gatherPathsOff
-	}
-}
-
-// gatherPathModeLabel spells the mode the way an operator would export it, so
-// the flag-provenance label round-trips (flaglabels.go's contract: the token
-// inside `unset(…)` re-exported verbatim reproduces the arm).
-func gatherPathModeLabel(m gatherPathMode) string {
-	switch m {
-	case gatherPathsTop:
-		return "top"
-	case gatherPathsAll:
-		return "all"
-	default:
-		return "off"
-	}
-}
-
-// setGatherPathsModeForTest pins the mode for one test and returns the restore
-// func. The knob is process-global by design (read once at start), so a test
-// that flips it must put it back — the established shape in this package.
-func setGatherPathsModeForTest(m gatherPathMode) func() {
-	prev := gatherPathsMode
-	gatherPathsMode = m
-	return func() { gatherPathsMode = prev }
-}
-
-// SetGatherPathsMode is the same hook across the package boundary, taking the
-// label an operator would export (`off` / `top` / `all`) and resolving it
-// through the SAME function production resolves the environment variable with —
-// so a caller cannot select a mode the env knob could not.
-//
-// It exists for C-19f's executor consumer check: the item requires a fixture
-// where the parallel hash path WINS by cost to actually EXECUTE as a parallel
-// hash, and that test lives in internal/executor, which cannot reach an
-// unexported knob. `SetParallelEnabled` (parallel.go) is the same shape for the
-// post-pass's kill switch. Like it, this is process-global, so a caller must
-// run the returned restore.
-func SetGatherPathsMode(label string) (restore func()) {
-	return setGatherPathsModeForTest(gatherPathModeFromEnv(label))
-}
 
 // generateUsefulGatherPaths is `generate_useful_gather_paths` (allpaths.c:3236):
 // its `generate_gather_paths` body (allpaths.c:3099) — one Gather over the
@@ -188,16 +104,6 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "no-cp")
 		return
 	}
-	switch gatherPathsMode {
-	case gatherPathsOff:
-		s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
-		return
-	case gatherPathsTop:
-		if relLevel(rel.Relids) != s.nrels {
-			s.trace.gather(rel.Relids, len(rel.PartialPathlist), "mode")
-			return
-		}
-	}
 	// Gates passed: "admitted" means candidacy, not victory — whether a Gather
 	// path was filed and won reads off the `cost` line's cheapest kind. This
 	// separation is what makes S4's "generated but lost" distinguishable from
@@ -231,7 +137,7 @@ func (s *searchCtx) generateUsefulGatherPaths(rel *RelOptInfo, overrideRows bool
 	// survives to feed whatever wants it above (an ordered input to an upper
 	// rel, or an outer pathkey chain through the NLs over it).
 	cheapestPartial := rel.PartialPathlist[0]
-	incOn := incrementalSortPathsMode == incrementalSortOn && s.cp.enableIncrementalSort
+	incOn := s.cp.enableIncrementalSort
 	u := rel.usefulKeys
 	if u == nil {
 		u = s.pathkeyUsefulnessFor(rel.Relids)
@@ -466,9 +372,6 @@ func (s *searchCtx) pathkeySortableEarly(rel *RelOptInfo, e Expr) bool {
 // addBaseRelGatherPaths' own placement.
 func generateUpperRelGatherPaths(rel *RelOptInfo, cp costParams) {
 	if rel == nil || len(rel.PartialPathlist) == 0 {
-		return
-	}
-	if gatherPathsMode == gatherPathsTop {
 		return
 	}
 	s := &searchCtx{parallelModeOK: parallelModeOK(cp), cp: cp}
@@ -1231,7 +1134,7 @@ func setOpBranchDrivingKindIsSupported(p *Path) bool {
 // unparameterised path: an unparameterised Gather can change CheapestTotal,
 // and a stale CheapestTotal is what the join producers would read.
 func (s *searchCtx) addBaseRelGatherPaths() {
-	if s == nil || !s.parallelModeOK || gatherPathsMode == gatherPathsOff || len(s.joinrels) < 2 {
+	if s == nil || !s.parallelModeOK || len(s.joinrels) < 2 {
 		return
 	}
 	for _, rel := range s.joinrels[1] {

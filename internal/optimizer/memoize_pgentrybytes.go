@@ -1,23 +1,10 @@
 package optimizer
 
-import "os"
-
-// pgMemoizeEntryBytesCost is M0139-0007b's default-off planner comparison
-// switch, in the shape of R108/R113 (GOOPG_PG_HASH_TUPLE_SPILL_COST,
-// GOOPG_PG_SORT_RELATION_BYTES_COST). Only the exact value "1" elects PG's
-// cost_memoize_rescan tuple-byte currency in costMemoizeRescan; unset and
-// every other spelling retain goopg's hashsize.EntryBytes/kvcache currency.
-var pgMemoizeEntryBytesCost = pgMemoizeEntryBytesCostFromEnv(os.Getenv("GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST"))
-
-func pgMemoizeEntryBytesCostFromEnv(v string) bool { return v == "1" }
-
-func pgMemoizeEntryBytesCostEnabled() bool { return pgMemoizeEntryBytesCost }
-
-func setPGMemoizeEntryBytesCostForTest(on bool) func() {
-	old := pgMemoizeEntryBytesCost
-	pgMemoizeEntryBytesCost = on
-	return func() { pgMemoizeEntryBytesCost = old }
-}
+// M0139-0007b's PG cost_memoize_rescan tuple-byte currency. It shipped
+// behind GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST (default off, in the shape of
+// R108/R113); M0147-0022 promoted it — plan-neutral on both TPC-DS corpora
+// (41 / 26 Memoize nodes, 0 changed plan lines) — so costMemoizeRescan always
+// elects it when pgRelationByteSize succeeds.
 
 // PG's per-entry struct sizes (nodeMemoize.c:94-123), on the LP64 layout PG is
 // built for (8-byte pointers, 8-byte MAXALIGN — the only layout goopg targets):
@@ -43,7 +30,7 @@ const (
 // above: `sizeof(MemoizeEntry) + sizeof(MemoizeKey) + sizeof(MemoizeTuple) *
 // ntuples`. It is a fixed PG C-struct cost, not a goopg Go-shape estimate —
 // unlike memoizeEntryOverheadBytes (:92-102 above), which prices goopg's own
-// kvcache entry and stays the switch-off currency.
+// kvcache entry and stays the unknown-width fallback currency.
 func pgMemoizeEntryOverheadBytes(tuples float64) float64 {
 	return float64(pgMemoizeEntryStructBytes+pgMemoizeKeyStructBytes) + float64(pgMemoizeTupleStructBytes)*tuples
 }

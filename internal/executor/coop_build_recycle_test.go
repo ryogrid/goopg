@@ -54,13 +54,16 @@ func TestCoopBuildRecycledBatchesMatchSerialBuild(t *testing.T) {
 		sort.Strings(out)
 		return fmt.Sprintf("%d:%s", len(out), strings.Join(out, "|"))
 	}
-	oldCoop := coopJoinBuildOn
-	t.Cleanup(func() { coopJoinBuildOn = oldCoop })
 	borrowedBefore, recycledBefore := coopBorrowedProducers.Load(), coopRecycledBatches.Load()
 	for _, q := range queries {
-		coopJoinBuildOn = false
+		// The reference is a genuinely serial run: no parallel workers, so no
+		// cooperative build at all. (Until M0147-0032 it toggled
+		// GOOPG_COOP_JOIN_BUILD's variable, which gates only the join-tree
+		// widening in coopDrivingScan — these builds are a bare scan or a
+		// column-only Project, cooperative either way.)
+		ctx.MaxParallelWorkers = 0
 		want := run(q)
-		coopJoinBuildOn = true
+		ctx.MaxParallelWorkers = 4
 		for _, poison := range []bool{false, true} {
 			oldPoison := seqScanDeformPoison
 			seqScanDeformPoison = poison

@@ -32,7 +32,6 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/access/transam/multixact"
-	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/postmaster/autovacuum"
 	"github.com/goopg/goopg/internal/postmaster/walsummarizer"
@@ -292,15 +291,6 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// M0054-0006: NLI rollback switch. The default is "on"; set
-	// `GOOPG_DISABLE_NLI=1` to revert to the pre-M0054-0006 plan
-	// shape (the M0054-0006a-pre input-IndexScan rewrite stays
-	// active — only the NestedLoopIndexJoin promotion is gated).
-	if v := os.Getenv("GOOPG_DISABLE_NLI"); v == "1" || v == "true" {
-		optimizer.SetNLIEnabled(false)
-		logger.Info("nestloop index join disabled via env", "var", "GOOPG_DISABLE_NLI")
-	}
-
 	// M0098-0007: GC tuning knobs for OLTP workloads.
 	//
 	// GOGC: default 200 (vs Go runtime default of 100) unless overridden
@@ -392,18 +382,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// defaults; with one we apply the file's entries on top.
 	registry := misc.BuildDefaultRegistry()
 
-	// take2 P2-02c: goopg.enable_nestloop_index no longer bridges to a process
-	// global either. All six planner-method bridges are gone; each of them let
-	// the most-recent SET win process-wide, steering every other session's
-	// plans. optimizer.SetNLIEnabled survives as the test hook and the env
-	// default DefaultPlannerSettings seeds from.
+	// take2 P2-02c: none of the six planner-method GUCs bridges to a process
+	// global; each of them used to let the most-recent SET win process-wide,
+	// steering every other session's plans. (goopg.enable_nestloop_index, the
+	// last of them, was retired with the legacy NLI post-pass at M0147-0051.)
 	// `enable_memoize` NO LONGER bridges to a process global (take2 P2-02c).
 	// It did, and that made `SET enable_memoize = off` in one session disable
 	// Memoize for every other session on the server — the most-recent SET won
 	// process-wide. It is now a per-statement planner input carried on
 	// PlannerSettings, so a SET affects only the session that issued it.
-	// optimizer.SetMemoizeEnabled survives as the test hook and the
-	// GOOPG_MEMOIZE env kill-switch.
+	// (The process global it bridged to — optimizer.SetMemoizeEnabled and the
+	// GOOPG_MEMOIZE env kill-switch — was retired at M0147-0044.)
 	// take2 P2-02c: enable_presorted_aggregate, enable_hashagg, geqo and
 	// geqo_threshold NO LONGER bridge to process globals. Each did, and each
 	// therefore let one session's SET steer every other session's plans. All

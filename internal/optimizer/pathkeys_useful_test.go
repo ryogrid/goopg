@@ -102,3 +102,40 @@ func TestTruncateUselessPathkeysGroupingAndDistinct(t *testing.T) {
 		t.Fatalf("distinct members in any order: got %d keys, want 2", len(got))
 	}
 }
+
+// M0122-0012 C16f: truncateUselessPathkeys memoises the kept length per key
+// list. A hit returns the same length the computation gives, always slices
+// the CALLER's list (capacity-capped), and a backing array reused for
+// different keys is recomputed rather than answered from the memo.
+func TestTruncateUselessPathkeysMemo(t *testing.T) {
+	a := &ColumnRef{Index: 0, Name: "a"}
+	b := &ColumnRef{Index: 1, Name: "b"}
+	u := &pathkeyUsefulness{mergeExprs: []Expr{a}}
+	keys := []PathKey{{Expr: a, SortAsc: true}, {Expr: b, SortAsc: true}}
+	for i := 0; i < 3; i++ {
+		got := truncateUselessPathkeys(u, keys)
+		if len(got) != 1 || cap(got) != 1 || &got[0] != &keys[0] {
+			t.Fatalf("call %d: got %d keys (cap %d), want keys[:1:1] of the caller's list", i, len(got), cap(got))
+		}
+	}
+	if len(u.truncMemo) != 1 {
+		t.Fatalf("memo holds %d lists, want 1", len(u.truncMemo))
+	}
+	// An equal list in another array hits the same entry (C16g: keyed by
+	// contents) and is answered from the caller's array.
+	other := append([]PathKey(nil), keys...)
+	if got := truncateUselessPathkeys(u, other); len(got) != 1 || &got[0] != &other[0] {
+		t.Fatalf("equal list elsewhere: got %d keys from the wrong array", len(got))
+	}
+	if n := len(u.truncMemo[truncMemoKey{first: keys[0], n: 2}]); n != 1 {
+		t.Fatalf("an equal list added a second entry: %d", n)
+	}
+	// The same array rewritten: b leads, which no merge can use.
+	keys[0], keys[1] = keys[1], keys[0]
+	if got := truncateUselessPathkeys(u, keys); got != nil {
+		t.Fatalf("rewritten list answered from the memo: got %d keys, want none", len(got))
+	}
+	if n := u.truncateUselessLen(keys); n != 0 {
+		t.Fatalf("truncateUselessLen = %d, want 0", n)
+	}
+}

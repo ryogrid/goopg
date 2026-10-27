@@ -83,6 +83,17 @@ type restrictInfo struct {
 	// M0146-0005bo.
 	opLeftRelids, opRightRelids RelSet
 
+	// ojHeld marks an outer join's ON conjunct that references only the
+	// join's PRESERVED side (M0147-0053). PG's distribute_qual_to_rels
+	// (initsplan.c) does not push such a qual down — it is not
+	// is_pushed_down, so pushing it into the preserved scan would drop rows
+	// the join must null-extend — and gives it the outer join's scope as its
+	// required_relids, which places it in that join's restrictlist and
+	// nowhere lower. `relids` here is that widened scope, not the clause's
+	// own references; selectivity prices the clause as the single-relation
+	// restriction it is (clause_selectivity's NumRelids == 1 arm).
+	ojHeld bool
+
 	// inferred marks a clause synthesised by `inferAnchoredEqualities`
 	// (equiv_class.go:236) rather than written by the user. Per 04 §5 this is
 	// NOT an admissibility penalty — an inferred clause connects its two rels
@@ -1035,4 +1046,43 @@ func visitColumnRefsForTable(e Expr, onIdx func(int)) {
 				"tableForCol partition on an incomplete reference set", x))
 		},
 	})
+}
+
+// ojHeldQual is an outer join's preserved-side-only ON conjunct together with
+// the join's scope, given as one representative column per scope leaf so each
+// joinlist problem can re-express it in its own item coordinates (M0147-0053).
+type ojHeldQual struct {
+	clause    Expr
+	scopeCols []int
+}
+
+// appendOJHeld adds the held outer-join conjuncts this problem owns: those
+// whose whole scope resolves to two or more of its items. A scope that falls
+// inside one item belongs to the sub-problem that splits it, and a scope that
+// does not resolve here belongs to another problem; exactly one problem — the
+// lowest whose items separate the join's two sides — takes each qual.
+func (l *restrictInfoList) appendOJHeld(held []ojHeldQual, spans []leafSpan) {
+	if l == nil {
+		return
+	}
+	for _, h := range held {
+		var scope RelSet
+		ok := len(h.scopeCols) > 0
+		for _, col := range h.scopeCols {
+			rs, resolved := relidsOfExpr(&ColumnRef{Index: col}, spans)
+			if !resolved || rs == 0 {
+				ok = false
+				break
+			}
+			scope |= rs
+		}
+		if !ok || relLevel(scope) < 2 {
+			continue
+		}
+		own, resolved := relidsOfExpr(h.clause, spans)
+		if !resolved || own == 0 || !relsSubset(own, scope) {
+			continue
+		}
+		l.all = append(l.all, &restrictInfo{clause: h.clause, relids: scope, ecID: noEquivClass, ojHeld: true})
+	}
 }

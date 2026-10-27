@@ -31,26 +31,7 @@ func ncNeeded(names ...string) map[string]bool {
 	return m
 }
 
-// R128 re-pinned this to the promoted contract. It previously asserted the
-// opt-IN form (`v == "1"`, default OFF); the flag is now default ON and
-// opt-OUT, matching the sibling GOOPG_NARROW_* family. The test is inverted
-// rather than deleted so the contract stays pinned in both directions and a
-// silent reversion is caught.
-func TestNarrowCostInputsFlagIsOptOutAndDefaultOn(t *testing.T) {
-	// Only the exact string "0" disables. Everything else — including unset —
-	// leaves narrowing ON.
-	for _, v := range []string{"", "1", "true", "on", "yes", " 0", "0 ", "00", "false"} {
-		if !narrowCostInputsFromEnv(v) {
-			t.Errorf("value %q must leave cost-input narrowing ENABLED (default-on, opt-out)", v)
-		}
-	}
-	if narrowCostInputsFromEnv("0") {
-		t.Error(`"0" must disable cost-input narrowing`)
-	}
-}
-
 func TestRelNarrowedWidthsNarrowsToNeededColumns(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRel([]string{"a", "b", "c"}, ncNeeded("a", "c"), true,
 		map[string]float64{"a": 10, "b": 100, "c": 20})
 	got := relNarrowedWidths(rel)
@@ -74,7 +55,6 @@ func TestRelNarrowedWidthsNarrowsToNeededColumns(t *testing.T) {
 // The decline contract. Each of these must leave the path at the
 // relation-wide fallback rather than narrow to something smaller than truth.
 func TestRelNarrowedWidthsDeclines(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	colVar := map[string]float64{"a": 10, "b": 100}
 
 	cases := []struct {
@@ -106,19 +86,10 @@ func TestRelNarrowedWidthsDeclines(t *testing.T) {
 	}
 }
 
-func TestRelNarrowedWidthsInertWhenFlagOff(t *testing.T) {
-	defer setNarrowCostInputsForTest(false)()
-	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 10, "b": 100})
-	if got := relNarrowedWidths(rel); got.ok {
-		t.Fatalf("flag off must narrow nothing, got %+v", got)
-	}
-}
-
 // Case coordinates: neededKeepSet matches names case-SENSITIVELY while
 // ColVarBytes is lowercase-keyed, so the ToLower conversion is required. A
 // mixed-case column must still be attributed, not declined.
 func TestRelNarrowedWidthsLowercasesColVarLookup(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRel([]string{"MixedCase", "b"}, ncNeeded("MixedCase"), true,
 		map[string]float64{"mixedcase": 42, "b": 100})
 	got := relNarrowedWidths(rel)
@@ -133,7 +104,6 @@ func TestRelNarrowedWidthsLowercasesColVarLookup(t *testing.T) {
 // Rule 2: all three fields move together, never a narrowed NCols with a
 // full-width pathWidth (that is the two-currency defect R120 diagnosed).
 func TestNarrowedWidthsApplyToSetsAllThreeOrNone(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	n := narrowedWidths{ncols: 3, avgVarBytes: 30, outputWidth: 44, ok: true}
 	p := &Path{}
 	n.applyTo(p)
@@ -170,7 +140,6 @@ func TestPathAvgVarBytesRequiresNCols(t *testing.T) {
 // Gather/GatherMerge/Sort/Memoize. Without this, narrowing dies at the first
 // wrapper — and goopg's TPC-H plans are all parallel.
 func TestInheritNarrowedWidthsCopiesChildTriple(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	child := &Path{NCols: 4, AvgVarBytes: 88, OutputWidth: 120}
 	parent := &Path{}
 	inheritNarrowedWidths(parent, child)
@@ -180,7 +149,6 @@ func TestInheritNarrowedWidthsCopiesChildTriple(t *testing.T) {
 }
 
 func TestInheritNarrowedWidthsNoOpOnUnnarrowedChild(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	parent := &Path{}
 	inheritNarrowedWidths(parent, &Path{NCols: 0, AvgVarBytes: 77})
 	if parent.NCols != 0 || parent.AvgVarBytes != 0 {
@@ -188,20 +156,10 @@ func TestInheritNarrowedWidthsNoOpOnUnnarrowedChild(t *testing.T) {
 	}
 }
 
-func TestInheritNarrowedWidthsInertWhenFlagOff(t *testing.T) {
-	defer setNarrowCostInputsForTest(false)()
-	parent := &Path{}
-	inheritNarrowedWidths(parent, &Path{NCols: 4, AvgVarBytes: 88, OutputWidth: 120})
-	if parent.NCols != 0 {
-		t.Fatalf("flag off must inherit nothing, got %+v", parent)
-	}
-}
-
 // A(iii): all-or-none PER REL among the paths this round writes, with
 // index-only exempt. A mixed rel would let addPath compare two candidate costs
 // computed in different currencies.
 func TestNarrowBaseRelCostWidthsIsAllOrNonePerRel(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 10, "b": 100})
 	seq := &Path{Kind: PathSeqScan, Rel: rel}
 	partial := &Path{Kind: PathSeqScan, Rel: rel}
@@ -225,7 +183,6 @@ func TestNarrowBaseRelCostWidthsIsAllOrNonePerRel(t *testing.T) {
 }
 
 func TestNarrowBaseRelCostWidthsDeclinesWholeRel(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	// One kept column is unattributed ⇒ the WHOLE rel declines, so no path of
 	// it may carry a triple (rule 3).
 	rel := ncRel([]string{"a", "q"}, ncNeeded("a", "q"), true, map[string]float64{"a": 10})
@@ -238,6 +195,14 @@ func TestNarrowBaseRelCostWidthsDeclinesWholeRel(t *testing.T) {
 	if p1.NCols != 0 || p2.NCols != 0 {
 		t.Fatalf("a declining rel must leave every path un-narrowed: %+v %+v", p1, p2)
 	}
+}
+
+// forceNarrowCostInputsOffForTest selects the un-narrowed arm and returns the
+// restore func.
+func forceNarrowCostInputsOffForTest() func() {
+	old := narrowCostInputsForceOff
+	narrowCostInputsForceOff = true
+	return func() { narrowCostInputsForceOff = old }
 }
 
 // TestNarrowCostInputsReachesTheLiveSearch is the END-TO-END pin the SCOPE
@@ -287,7 +252,9 @@ func TestNarrowCostInputsReachesTheLiveSearch(t *testing.T) {
 	sel := stmts[0].(*parser.SelectStmt)
 
 	plan := func(on bool) Node {
-		defer setNarrowCostInputsForTest(on)()
+		if !on {
+			defer forceNarrowCostInputsOffForTest()()
+		}
 		n, err := PlanWithSettings(sel, cat, DefaultPlannerSettings())
 		if err != nil {
 			t.Fatalf("plan (narrow=%v): %v", on, err)
@@ -322,7 +289,6 @@ func TestNarrowCostInputsReachesTheLiveSearch(t *testing.T) {
 // is exactly the addPath bias rule 3 exists to prevent, re-entering through
 // the wrapper instead of the scan.
 func TestInheritNarrowedWidthsRefusesIndexOnlyChild(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	idxOnly := &Path{IndexOnly: true, NCols: 2, AvgVarBytes: 8, OutputWidth: 16}
 	gather := &Path{}
 	inheritNarrowedWidths(gather, idxOnly)
@@ -350,9 +316,9 @@ func TestInheritNarrowedWidthsRefusesIndexOnlyChild(t *testing.T) {
 // full-index-scan shape with none. If a parameterised index-only path is ever
 // added, this pin fails rather than that arm silently re-pricing.
 //
-// R128: the flag is now DEFAULT ON, so "the flag off" above describes the
-// opted-OUT arm (`=0`), not the default. The assertion is unchanged and still
-// correct; only which arm it is protecting has moved.
+// R128 made the flag default ON and M0147-0041 retired it, so "the flag off"
+// above now means a rel that declines to narrow (or the un-narrowed test
+// seam). The assertion is unchanged and still correct.
 func TestGetMemoizePathDeclinesIndexOnlyInner(t *testing.T) {
 	inner := &Path{IndexOnly: true, NCols: 2}
 	if len(inner.IndexClauses) != 0 {
@@ -375,7 +341,6 @@ func njNarrowed(n int, avg float64, w int) *Path {
 }
 
 func TestNarrowJoinWidthsSumsChildren(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	for _, kind := range []PathKind{PathHashJoin, PathMergeJoin, PathNestLoop} {
 		p := njPath(kind, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
 		narrowJoinWidths(p)
@@ -390,7 +355,6 @@ func TestNarrowJoinWidthsSumsChildren(t *testing.T) {
 // publishes-both arm so a future FULL executor cannot inherit the SEMI branch
 // by falling through.
 func TestNarrowJoinWidthsSemiAntiTakeOuterOnly(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	for _, jt := range []parser.JoinType{parser.JoinSemi, parser.JoinAnti} {
 		p := njPath(PathHashJoin, jt, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
 		narrowJoinWidths(p)
@@ -411,7 +375,6 @@ func TestNarrowJoinWidthsSemiAntiTakeOuterOnly(t *testing.T) {
 // Rule 1: a sum that is narrow on one side and full on the other is not a
 // currency.
 func TestNarrowJoinWidthsDeclinesOnUnnarrowedChild(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	for name, p := range map[string]*Path{
 		"outer un-narrowed": njPath(PathHashJoin, parser.JoinInner, &Path{}, njNarrowed(2, 5, 24)),
 		"inner un-narrowed": njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), &Path{}),
@@ -427,7 +390,6 @@ func TestNarrowJoinWidthsDeclinesOnUnnarrowedChild(t *testing.T) {
 // Rule 4 — the R121 leak one level up. Index-only paths carry the triple
 // UNCONDITIONALLY, so NCols>0 is not a proxy for "this round narrowed it".
 func TestNarrowJoinWidthsDeclinesOnIndexOnlyChild(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	ios := &Path{IndexOnly: true, NCols: 2, AvgVarBytes: 5, OutputWidth: 24}
 	for name, p := range map[string]*Path{
 		"index-only outer": njPath(PathHashJoin, parser.JoinInner, ios, njNarrowed(3, 10, 40)),
@@ -445,7 +407,6 @@ func TestNarrowJoinWidthsDeclinesOnIndexOnlyChild(t *testing.T) {
 // value and PathSetOp has exactly two children, so "has 2 children" or "has a
 // Jointype" would both read a set-op as an inner join.
 func TestNarrowJoinWidthsRefusesNonJoinKinds(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	for _, kind := range []PathKind{PathSetOp, PathGather, PathSort, PathMemoize, PathSeqScan} {
 		p := &Path{Kind: kind, Children: []*Path{njNarrowed(3, 10, 40), njNarrowed(2, 5, 24)}}
 		narrowJoinWidths(p)
@@ -455,8 +416,7 @@ func TestNarrowJoinWidthsRefusesNonJoinKinds(t *testing.T) {
 	}
 }
 
-func TestNarrowJoinWidthsIsIdempotentAndNilSafeAndFlagGated(t *testing.T) {
-	restore := setNarrowCostInputsForTest(true)
+func TestNarrowJoinWidthsIsIdempotentAndNilSafe(t *testing.T) {
 	// Rule 3: never overwrite an existing stamp.
 	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
 	p.NCols, p.AvgVarBytes, p.OutputWidth = 99, 99, 99
@@ -465,14 +425,6 @@ func TestNarrowJoinWidthsIsIdempotentAndNilSafeAndFlagGated(t *testing.T) {
 		t.Errorf("must not overwrite an existing stamp, got %d", p.NCols)
 	}
 	narrowJoinWidths(nil) // must not panic
-	restore()
-
-	defer setNarrowCostInputsForTest(false)()
-	off := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
-	narrowJoinWidths(off)
-	if off.NCols != 0 {
-		t.Errorf("flag off must stamp nothing, got %d", off.NCols)
-	}
 }
 
 // OutputWidth > 0 whenever NCols > 0, on every path this round writes. Both
@@ -480,7 +432,6 @@ func TestNarrowJoinWidthsIsIdempotentAndNilSafeAndFlagGated(t *testing.T) {
 // change to that floor cannot silently let a relation width be summed into a
 // narrowed one.
 func TestNarrowedTripleOutputWidthIsAlwaysPositive(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 0, "b": 100})
 	got := relNarrowedWidths(rel)
 	if !got.ok {
@@ -501,14 +452,13 @@ func TestNarrowedTripleOutputWidthIsAlwaysPositive(t *testing.T) {
 // away — but the rel figures are buildAvgVarBytes's over-charge decline for
 // the EXECUTOR's hash entry, and rels are singletons shared across candidates.
 func TestNarrowJoinWidthsWritesNoRelField(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := newRelOptInfo(3, 1000, 32)
 	rel.NCols, rel.AvgVarBytes = 37, 2080
 	rel.ColVarBytes = map[string]float64{"a": 1}
 	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
 	p.Rel = rel
 	narrowJoinWidths(p)
-	if rel.NCols != 37 || rel.AvgVarBytes != 2080 || len(rel.ColVarBytes) != 1 {
+	if rel.NCols != 37 || rel.AvgVarBytes != 2080 || len(rel.colVarBytes()) != 1 {
 		t.Fatalf("no RelOptInfo field may be written: %+v", rel)
 	}
 	if p.NCols != 5 {
@@ -528,7 +478,6 @@ func TestNarrowJoinWidthsWritesNoRelField(t *testing.T) {
 // PartialPathlist are written at exactly those two sites and nowhere else —
 // so pinning the funnel pins every producer, including future ones.
 func TestAddPathStampsJoinWidths(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 
 	serial := newRelOptInfo(3, 100, 32)
 	p := njPath(PathHashJoin, parser.JoinInner, njNarrowed(3, 10, 40), njNarrowed(2, 5, 24))
@@ -561,7 +510,6 @@ func TestAddPathStampsJoinWidths(t *testing.T) {
 // Non-top matters: the top join's triple has no consumer, so asserting there
 // would prove nothing.
 func TestNarrowJoinWidthsNarrowsANonTopJoinInALiveSearch(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	names := []string{"a", "b", "c"}
 	prob := cpBigProblem(names)
 
@@ -644,7 +592,6 @@ func ncRelNoStats(cols []string, needed map[string]bool) *RelOptInfo {
 }
 
 func TestRelNarrowedWidthsNarrowsNonTableLeaf(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRelNoStats([]string{"a", "b", "c", "d"}, ncNeeded("a", "c"))
 	got := relNarrowedWidths(rel)
 	if !got.ok {
@@ -668,7 +615,6 @@ func TestRelNarrowedWidthsNarrowsNonTableLeaf(t *testing.T) {
 // This is a LIVE trip-wire: five upper-rel sites assign AvgVarBytes alone, so
 // a successor extending narrowing beyond joinrels[1] will reach this state.
 func TestRelNarrowedWidthsDeclinesWhenAvgVarExistsButUnattributable(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	rel := ncRel([]string{"a", "b"}, ncNeeded("a"), true, nil) // ncRel sets AvgVarBytes=999
 	if rel.AvgVarBytes == 0 {
 		t.Fatal("fixture: this case needs a nonzero relation-wide figure")
@@ -682,7 +628,6 @@ func TestRelNarrowedWidthsDeclinesWhenAvgVarExistsButUnattributable(t *testing.T
 // A table with real per-column stats is unaffected by the new arm: it still
 // sums the map and still declines on an unattributed kept column.
 func TestRelNarrowedWidthsTableWithStatsUnaffectedByR124(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	ok := ncRel([]string{"a", "b"}, ncNeeded("a"), true, map[string]float64{"a": 10, "b": 100})
 	got := relNarrowedWidths(ok)
 	if !got.ok || got.avgVarBytes != 10 {
@@ -692,14 +637,6 @@ func TestRelNarrowedWidthsTableWithStatsUnaffectedByR124(t *testing.T) {
 	bad := ncRel([]string{"a", "q"}, ncNeeded("a", "q"), true, map[string]float64{"a": 10})
 	if got := relNarrowedWidths(bad); got.ok {
 		t.Errorf("an unattributed kept column must still decline: %+v", got)
-	}
-}
-
-func TestRelNarrowedWidthsNonTableLeafInertWhenFlagOff(t *testing.T) {
-	defer setNarrowCostInputsForTest(false)()
-	rel := ncRelNoStats([]string{"a", "b"}, ncNeeded("a"))
-	if got := relNarrowedWidths(rel); got.ok {
-		t.Fatalf("flag off must narrow nothing, got %+v", got)
 	}
 }
 
@@ -713,7 +650,6 @@ func TestRelNarrowedWidthsNonTableLeafInertWhenFlagOff(t *testing.T) {
 // was named for. This version calls buildAvgVarBytes directly and asserts the
 // inequality that IS the divergence.
 func TestR124AcceptedAvgVarDivergenceOnNonTableChild(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 
 	// A joinrel {non-table leaf, table}: ColVarBytes carries the table's
 	// columns only, and AvgVarBytes is the whole-relation sum, exactly as
@@ -751,7 +687,6 @@ func TestR124AcceptedAvgVarDivergenceOnNonTableChild(t *testing.T) {
 // column only while the output above the tree or a join clause reaching past
 // the joinrel reads it; a join key consumed inside the joinrel drops out.
 func TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	a := ncRel([]string{"a_key", "a_out"}, ncNeeded("a_key", "a_out", "b_key", "b_c", "c_key"), true,
 		map[string]float64{"a_key": 4, "a_out": 30})
 	a.Relids = RelSet(1)
@@ -795,7 +730,6 @@ func TestJoinrelNarrowedWidthsKeepsOnlyAttrNeededAbove(t *testing.T) {
 // query's output stay. A reltarget that keeps nothing (count(*) over
 // restrictions) keeps the statement-wide narrowing.
 func TestBaseRelNarrowedWidthsDropsRestrictionOnlyColumns(t *testing.T) {
-	defer setNarrowCostInputsForTest(true)()
 	d := ncRel([]string{"d_date_sk", "d_year", "d_moy"}, ncNeeded("d_date_sk", "d_year", "d_moy", "s_date_sk"), true,
 		map[string]float64{"d_date_sk": 4, "d_year": 4, "d_moy": 4})
 	d.Relids = RelSet(1)
@@ -861,5 +795,99 @@ func TestDerivedLeafColumnWidthFollowsSubqueryVars(t *testing.T) {
 		cte: &plannedCTE{name: "c", body: body, schema: body.schema, inlineEligible: true, selectOwned: true, refs: 1}}
 	if w, ok := derivedLeafColumnWidth(inl, 0); !ok || w != 17 {
 		t.Fatalf("inlined CTE output width = %d, %v; want 17 (an RTE_SUBQUERY)", w, ok)
+	}
+}
+
+// M0122-0012 C16a: joinrelNarrowedWidths reads its pure inputs through a
+// per-search memo (GEQO rebuilds every joinrel on each tour). The memo must
+// serve exactly what the unmemoised functions compute, decline included, and
+// must not survive a change of the clause list it was filled for.
+func TestNarrowedWidthMemoMatchesAndResets(t *testing.T) {
+	a := ncRel([]string{"a_key", "a_out"}, ncNeeded("a_key", "a_out"), true,
+		map[string]float64{"a_key": 4, "a_out": 30})
+	a.Relids = RelSet(1)
+	b := ncRel([]string{"b_key", "b_c"}, ncNeeded("b_key", "b_c"), true,
+		map[string]float64{"b_key": 4, "b_c": 8})
+	b.Relids = RelSet(2)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded("a_out"),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(3), "a_key", "b_key"),
+			clause(RelSet(6), "b_c", "c_key"),
+		}},
+	}
+	j := newRelOptInfo(RelSet(3), 10, 64)
+	j.publishedMembers = []*RelOptInfo{a, b}
+	for i := 0; i < 3; i++ {
+		if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 2 || got.outputWidth != 38 {
+			t.Fatalf("call %d: joinrel triple = %+v, want a_out + b_c (2 cols, width 38)", i, got)
+		}
+	}
+	if len(s.narrowColsMemo) != 2 || len(s.attrNeededMemo) != 1 {
+		t.Fatalf("memo sizes = %d rels, %d relids; want 2, 1", len(s.narrowColsMemo), len(s.attrNeededMemo))
+	}
+	wantCols, wantOK := relNarrowedColumns(b)
+	if gotCols, gotOK := s.memoRelNarrowedColumns(b); gotOK != wantOK || len(gotCols) != len(wantCols) {
+		t.Fatalf("memoised columns = %v/%v, want %v/%v", gotCols, gotOK, wantCols, wantOK)
+	}
+	// A rel that declines is memoised as a decline.
+	bad := ncRel([]string{"x"}, nil, false, nil)
+	j.publishedMembers = []*RelOptInfo{a, bad}
+	if got := s.joinrelNarrowedWidths(j); got.ok {
+		t.Fatalf("a declining member narrowed the joinrel: %+v", got)
+	}
+	if e, hit := s.narrowColsMemo[bad]; !hit || e.ok {
+		t.Fatalf("decline not memoised: %+v hit=%v", e, hit)
+	}
+	// Dropping the clause that reaches c changes the above-tree set; the memo
+	// filled for the longer list must not answer for the shorter one.
+	j.publishedMembers = []*RelOptInfo{a, b}
+	s.clauses.all = s.clauses.all[:1]
+	if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 1 || got.outputWidth != 30 {
+		t.Fatalf("after the clause change: joinrel triple = %+v, want a_out only", got)
+	}
+}
+
+// M0122-0012 C16c: every GEQO tour evaluates in a fresh searchCtx
+// (freshEvalCtx), and PG's tours share one PlannerInfo. The search memos must
+// therefore be the parent's maps in every tour context: a value one tour
+// memoises is a hit in the next. Before C16c each tour allocated its own on
+// first use and re-derived every joinrel's inputs once per tour.
+func TestGEQOTourContextsShareSearchMemos(t *testing.T) {
+	s, err := newSearchCtx(2, defaultCostParams(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.clauses = &restrictInfoList{}
+	e1 := s.freshEvalCtx()
+	u1 := e1.pathkeyUsefulnessFor(RelSet(3))
+	e1.innerUniqueMemo[innerUniqueKey{outer: 1, inner: 2}] = []innerUniqueEntry{{unique: true}}
+	rel := newRelOptInfo(RelSet(1), 10, 8)
+	e1.memoRelNarrowedColumns(rel)
+	e1.memoAttrNeededAbove(RelSet(1))
+
+	e2 := s.freshEvalCtx()
+	if u2 := e2.pathkeyUsefulnessFor(RelSet(3)); u2 != u1 {
+		t.Fatal("pathkey usefulness rebuilt in the second tour")
+	}
+	if len(e2.innerUniqueMemo[innerUniqueKey{outer: 1, inner: 2}]) != 1 {
+		t.Fatal("inner-unique verdict not visible to the second tour")
+	}
+	if _, hit := e2.narrowColsMemo[rel]; !hit {
+		t.Fatal("narrowed columns not visible to the second tour")
+	}
+	if _, hit := e2.attrNeededMemo[RelSet(1)]; !hit {
+		t.Fatal("above-tree set not visible to the second tour")
+	}
+	// A different clause list is a different search input: the memos reset.
+	s.clauses = &restrictInfoList{}
+	if e3 := s.freshEvalCtx(); e3.pathkeyUsefulnessFor(RelSet(3)) == u1 || len(e3.attrNeededMemo) != 0 {
+		t.Fatal("memos survived a clause-list change")
 	}
 }

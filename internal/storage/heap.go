@@ -2431,6 +2431,18 @@ func PageGetItemRawAllowDeadNoCopy(p Page, slot uint16) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return PageGetItemRawAllowDeadNoCopyN(p, slot, count)
+}
+
+// PageGetItemRawAllowDeadNoCopyN is PageGetItemRawAllowDeadNoCopy with the
+// page's line-pointer count supplied by the caller, who read it once
+// (PageLinePointerCount) for a run of probes on one latched page — PG's
+// _bt_binsrch reads PageGetMaxOffsetNumber once per page, not per probe
+// (M0122-0012 C18).
+func PageGetItemRawAllowDeadNoCopyN(p Page, slot uint16, count int) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
 	idx := int(slot) - 1
 	if idx < 0 || idx >= count {
 		return nil, ErrInvalidSlot

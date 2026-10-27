@@ -1,0 +1,30 @@
+  18754 seam-entry used=true
+  10869 seam-entry used=false
+   9716 seam-decline reason=size-or-no-joinlist nrels=0
+    918 seam-decline reason=lateral nrels=2
+    889 join-unsearched type=4
+    159 join-unsearched type=1
+    103 join-unsearched type=3
+     75 join-unsearched type=0
+     73 seam-decline reason=leaf-count nrels=2
+     37 join-unsearched type=5
+     34 seam-decline reason=outer-on-qual nrels=2
+     34 seam-decline reason=lateral nrels=3
+     28 join-unsearched type=2
+     19 seam-decline reason=prefix-exceeds-bindings nrels=3
+     18 seam-decline reason=outer-link-no-sjinfo nrels=2
+     15 join-unsearched type=6
+     10 seam-decline reason=leaf-count nrels=3
+     10 seam-decline reason=lateral nrels=1
+      8 seam-decline reason=outer-on-qual nrels=4
+      4 seam-decline reason=lateral nrels=4
+      3 seam-decline reason=outer-on-qual nrels=3
+      3 seam-decline reason=leaf-count nrels=4
+      3 seam-decline reason=chain-not-flattenable nrels=5
+      2 seam-decline reason=semianti-on-qual nrels=1
+      2 seam-decline reason=lateral nrels=5
+      1 seam-decline reason=residual-hits-pad nrels=3
+      1 seam-decline reason=residual-hits-pad nrels=1
+      1 seam-decline reason=outer-link-no-sjinfo nrels=3
+      1 seam-decline reason=leaf-count nrels=5
+      1 seam-decline reason=inner-on-qual-above-outer nrels=3

@@ -8,7 +8,8 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// M0125-0003 stage 1 — the GOOPG_RELSIZE_FALLBACK relation-size fallback.
+// M0125-0003 — the relation-size fallback (its GOOPG_RELSIZE_FALLBACK stage
+// knob is retired: take2 P1-05, M0147-0016).
 //
 // These tests pin two separate things, and the distinction matters when one of
 // them fails:
@@ -17,10 +18,8 @@ import (
 //     (postgres/src/backend/access/table/tableam.c), rule for rule. A failure
 //     here means goopg's estimate diverges from the number PostgreSQL would
 //     compute for the same relation.
-//   - the GATING keeps the landing commit inert: flag off changes nothing, and
-//     an ANALYZEd relation is untouched even with the flag on (design §D3).
-//     A failure here means the A/B measurement this milestone is built around
-//     would be reading a confounded signal.
+//   - the GUARD: an ANALYZEd relation is untouched by the fallback (design
+//     §D3). A failure here means a warm-statistics plan moved.
 //
 // Design: docs/design/0125-0003-relsize-fallback-and-tpch-stats-tradeoff.md
 
@@ -297,40 +296,7 @@ func TestEstimateRelSize_MatchesPostgresOracle(t *testing.T) {
 	}
 }
 
-// ── gating ───────────────────────────────────────────────────────────────────
-
-// TestParseRelSizeFallbackStage pins the knob's contract AFTER M0125-0005
-// flipped the default 0 -> 2. Two entries here are the flip itself and are the
-// ones to read first if this fails: the empty string is now the default rather
-// than off, and an unparseable value lands on the default rather than off —
-// because once stage 2 is what goopg ships, "off" is a deviation, so a typo
-// must not silently hand an operator a planner production does not run.
-func TestParseRelSizeFallbackStage(t *testing.T) {
-	cases := map[string]int{
-		"":      defaultRelSizeFallbackStage, // unset = the shipped default
-		"0":     0,                           // the explicit opt-out (design §7.3 RC-5's reopen path)
-		"off":   0,
-		"false": 0,
-		"no":    0,
-		" OFF ": 0,
-		// The word forms meant stage 1 while stage 1 was the whole feature.
-		// Post-flip they mean the default, so "true" cannot silently downgrade.
-		"on":      defaultRelSizeFallbackStage,
-		"true":    defaultRelSizeFallbackStage,
-		"YES":     defaultRelSizeFallbackStage,
-		"1":       1, // a numeral still selects its stage exactly
-		"2":       2,
-		"3":       3,
-		"9":       3,                           // clamped to the highest defined stage
-		"-1":      defaultRelSizeFallbackStage, // not a stage; not an opt-out either
-		"garbage": defaultRelSizeFallbackStage,
-	}
-	for in, want := range cases {
-		if got := parseRelSizeFallbackStage(in); got != want {
-			t.Errorf("parseRelSizeFallbackStage(%q) = %d, want %d", in, got, want)
-		}
-	}
-}
+// ── guard ────────────────────────────────────────────────────────────────────
 
 // TestRelSizeFallbackIsUnconditional replaces TestRelSizeFallbackStageGating.
 //
@@ -351,12 +317,9 @@ func TestRelSizeFallbackIsUnconditional(t *testing.T) {
 // TestRelSizeFallbackDoesNotFireWhenAnalyzed is design §D3's invariant, and the
 // property that makes the milestone's four-arm measurement interpretable: with
 // a positive TableStats.RowCount the estimate must be exactly what it was
-// before the fallback existed, in BOTH flag states. If this regresses, the W1
-// and W2 arms stop being a control and "no difference" would no longer mean
-// "not exercised".
+// before the fallback existed. If this regresses, the W1 and W2 arms stop being
+// a control and "no difference" would no longer mean "not exercised".
 func TestRelSizeFallbackDoesNotFireWhenAnalyzed(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-
 	analyzed := &catalog.Table{
 		Name:    "warm",
 		Columns: []catalog.Column{{Type: catalog.Type{Name: "int4"}}},
@@ -367,11 +330,8 @@ func TestRelSizeFallbackDoesNotFireWhenAnalyzed(t *testing.T) {
 	// would be off by two orders of magnitude.
 	scan := &SeqScan{Table: analyzed, EstRelRows: 999999}
 
-	for _, stage := range []int{0, 1, 2, 3} {
-		SetRelSizeFallbackStage(stage)
-		if got := seqScanRows(scan); got != 4242 {
-			t.Fatalf("stage %d: analyzed RowCount must win, got %d want 4242", stage, got)
-		}
+	if got := seqScanRows(scan); got != 4242 {
+		t.Fatalf("analyzed RowCount must win, got %d want 4242", got)
 	}
 }
 

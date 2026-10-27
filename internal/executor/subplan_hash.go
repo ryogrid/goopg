@@ -2,7 +2,6 @@ package executor
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -38,21 +37,15 @@ import (
 // per-correlation-key cached slices; AnyOp/AllOp/NotEqualAny forms use
 // non-equality operators and cannot hash.
 
-// hashedSubPlanOn is the operational kill switch. Default ON;
-// GOOPG_HASHED_SUBPLAN=off at server start (or
-// SetHashedSubPlanEnabled(false) from tests) restores the pure linear
-// path. Same pattern as GOOPG_SUBPLAN_RESCAN (subplan.go).
-var hashedSubPlanOn atomic.Bool
+// hashedSubPlanForceLinear is a TEST-ONLY seam (like scanPrefilterForceLate):
+// when set, the hashed IN probe and its EXPLAIN label are off and every IN
+// takes the linear scan over the cached slice — the correctness oracle the
+// hashed tests compare against. It replaced the operational switch
+// GOOPG_HASHED_SUBPLAN (default on, `=off` forced linear), which M0147-0037
+// retired: no gate, CI or bench script ever set it.
+var hashedSubPlanForceLinear atomic.Bool
 
-func init() {
-	hashedSubPlanOn.Store(os.Getenv("GOOPG_HASHED_SUBPLAN") != "off")
-}
-
-// SetHashedSubPlanEnabled toggles the hashed IN probe. Test-only API;
-// the operational switch is the environment variable read at init.
-func SetHashedSubPlanEnabled(on bool) { hashedSubPlanOn.Store(on) }
-
-func hashedSubPlanEnabled() bool { return hashedSubPlanOn.Load() }
+func hashedSubPlanEnabled() bool { return !hashedSubPlanForceLinear.Load() }
 
 // subPlanHashFamily classifies datum kinds into families inside which
 // datumKey equality provably agrees with compareEq equality — the

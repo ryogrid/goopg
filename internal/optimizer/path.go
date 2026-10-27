@@ -132,10 +132,11 @@ const (
 	// sort, not the whole input). Produced only by `addIncrementalSortPaths`
 	// (incrementalsortpaths.go). `createPlanNode` HAS an arm for it
 	// (`createIncrementalSortPlan`, createplansimple.go, exec-b) and the
-	// executor operator exists (`incrementalSortOp`, exec-a) — the flag
-	// (`GOOPG_INCREMENTAL_SORT`) stays off by default not because either is
-	// missing but because the 2026-09-17h corpus measurement (design doc's
-	// own update) found the arm inert on the full TPC-DS corpus at HEAD:
+	// executor operator exists (`incrementalSortOp`, exec-a). The arm is
+	// gated only by PG's `enable_incremental_sort` (its GOOPG_INCREMENTAL_SORT
+	// switch was promoted at M0146-0006 and retired at M0147-0043). It was
+	// held off until then because the 2026-09-17h corpus measurement (design
+	// doc's own update) found the arm inert on the full TPC-DS corpus:
 	// `ordered.SearchCandidates`/`SearchCandidateKeys` are populated only
 	// inside `createOrderedPaths`, and `electOrderedGrouping` — the GROUP_AGG
 	// upper rel's own ORDER BY election loop — calls `addOrderedPaths`
@@ -406,7 +407,7 @@ type Path struct {
 	// than its relation — PG's `pathtarget` at the granularity goopg needs for
 	// executor hash sizing.
 	//
-	// R121 widened that reading: with GOOPG_NARROW_COST_INPUTS on, a base-rel
+	// R121 widened that reading: with cost-input narrowing (narrowcostinputs.go), a base-rel
 	// scan path carries the columns the STATEMENT needs, which is not
 	// literally what the path emits — goopg's SeqScan does not project, and
 	// neither does its Sort. The figures are a COST currency, and the safe
@@ -609,8 +610,8 @@ type RelOptInfo struct {
 	// as DATA on the rel, the way NCols and AvgVarBytes already do.
 	//
 	// take2 P4-01 rev 10 step 1. Nothing reads these yet — the consumer is the
-	// build-side narrowing in `joinInputsFor`, which lands behind
-	// GOOPG_NARROW_BUILD in a later slice. Added first, and separately, so that
+	// build-side narrowing in `joinInputsFor`, which landed in a later slice
+	// (unconditional since M0147-0040). Added first, and separately, so that
 	// commit changes one thing.
 	//
 	// NeededColsKnown false means "no information": the collector declined the
@@ -671,8 +672,18 @@ type RelOptInfo struct {
 	// under-states the entry.
 	//
 	// Set alongside AvgVarBytes by the same two constructors; a join rel's
-	// map is the union of its inputs'.
+	// map is the union of its inputs'. Read it through colVarBytes(): a join
+	// rel's union is formed on first read (colVarFrom), not when the search
+	// builds the rel.
 	ColVarBytes map[string]float64
+	// colVarFrom are the inputs a join rel's ColVarBytes unions — the first
+	// pair that built it, the inner left nil when the join publishes its
+	// outer alone — pending until colVarBytes() first reads it. GEQO builds
+	// every joinrel of ~500 tours and nothing reads the union until plan
+	// creation or the upper rels: TPC-DS Q64 spent 8.5 % of its planning
+	// in the eager map copies (M0122-0012 C16d).
+	colVarFrom    [2]*RelOptInfo
+	colVarPending bool
 
 	Pathlist        []*Path
 	PartialPathlist []*Path

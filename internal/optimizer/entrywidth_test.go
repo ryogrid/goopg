@@ -123,3 +123,39 @@ func TestUnionColVarBytesKeepsTheWiderWidth(t *testing.T) {
 		t.Fatalf("nil-right union: got %v", got)
 	}
 }
+
+// M0122-0012 C16d: a join rel's ColVarBytes is formed on first read from the
+// inputs that built it, through any depth of pending joins, and equals the
+// eager union it replaces. A join publishing its outer alone (SEMI/ANTI)
+// takes the outer's map only.
+func TestJoinRelColVarBytesFormsOnFirstRead(t *testing.T) {
+	a := &RelOptInfo{Relids: 1, ColVarBytes: map[string]float64{"a_x": 4, "k": 3}}
+	b := &RelOptInfo{Relids: 2, ColVarBytes: map[string]float64{"b_y": 9, "k": 5}}
+	c := &RelOptInfo{Relids: 4, ColVarBytes: map[string]float64{"c_z": 2}}
+	ab := &RelOptInfo{Relids: 3, colVarFrom: [2]*RelOptInfo{a, b}, colVarPending: true}
+	abc := &RelOptInfo{Relids: 7, colVarFrom: [2]*RelOptInfo{ab, c}, colVarPending: true}
+	semi := &RelOptInfo{Relids: 5, colVarFrom: [2]*RelOptInfo{a, nil}, colVarPending: true}
+
+	want := unionColVarBytes(unionColVarBytes(a.ColVarBytes, b.ColVarBytes), c.ColVarBytes)
+	got := abc.colVarBytes()
+	if len(got) != len(want) {
+		t.Fatalf("lazy union = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("lazy union[%s] = %v, want %v", k, got[k], v)
+		}
+	}
+	if abc.colVarPending || ab.colVarPending || abc.colVarFrom != [2]*RelOptInfo{} {
+		t.Fatal("a formed union stayed pending or kept its inputs")
+	}
+	if len(ab.ColVarBytes) != 3 || ab.ColVarBytes["k"] != 5 {
+		t.Fatalf("inner pending rel formed %v, want a ∪ b with the wider k", ab.ColVarBytes)
+	}
+	if m := semi.colVarBytes(); len(m) != 2 || m["b_y"] != 0 {
+		t.Fatalf("outer-only join formed %v, want the outer's map alone", m)
+	}
+	if (*RelOptInfo)(nil).colVarBytes() != nil {
+		t.Fatal("nil rel produced a map")
+	}
+}

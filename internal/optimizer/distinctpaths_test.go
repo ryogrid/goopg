@@ -333,9 +333,6 @@ func sortedArmSettings() PlannerSettings {
 // The per-worker node is a group-only hashed Aggregate carrying the
 // PartialGroup mark the driving-scan walks descend through.
 func TestPartialDistinctHashedArmLowers(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
 	_, final := addPartialDistinctFor(t, d, upperSplitSettings())
@@ -390,9 +387,6 @@ func partialDistinctChain(final *Path) (gm, partial, workerSort *Path) {
 }
 
 func TestPartialDistinctArmFilesThePGShape(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
 	dr, final := addPartialDistinctFor(t, d, sortedArmSettings())
@@ -433,9 +427,6 @@ func TestPartialDistinctArmFilesThePGShape(t *testing.T) {
 // DistinctOn{PartialUnique} -> Sort -> driving scan stamped Parallel — the
 // marker is what lets gatherChildPlan's drivingScan assertion reach the scan.
 func TestPartialDistinctArmLowers(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
 	_, final := addPartialDistinctFor(t, d, sortedArmSettings())
@@ -479,9 +470,6 @@ func TestPartialDistinctArmLowers(t *testing.T) {
 // replaced by the worker-side one and the Gather spliced out, so the partial
 // subtree runs the join/scan itself once per worker.
 func TestPartialDistinctArmUnwrapsGather(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	d := sizedDistinctFixture(t, 5_900_000, 4)
 	gathered := &Gather{Child: d.Child, WorkersPlanned: 2, schema: d.Child.Output()}
@@ -514,9 +502,6 @@ func TestPartialDistinctArmUnwrapsGather(t *testing.T) {
 // input that does not already carry a Gather, and the parallelism kill
 // switch, each decline rather than building the shape.
 func TestPartialDistinctArmRefusals(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	t.Run("nested scope without existing gather", func(t *testing.T) {
 		ps := upperSplitSettings()
@@ -541,14 +526,6 @@ func TestPartialDistinctArmRefusals(t *testing.T) {
 		d := sizedDistinctFixture(t, 5_900_000, 4)
 		if _, final := addPartialDistinctFor(t, d, ps); final != nil {
 			t.Fatal("max_parallel_workers_per_gather=0 must refuse the arm")
-		}
-	})
-	t.Run("parallel off", func(t *testing.T) {
-		parallelOn.Store(false)
-		defer parallelOn.Store(true)
-		d := sizedDistinctFixture(t, 5_900_000, 4)
-		if _, final := addPartialDistinctFor(t, d, upperSplitSettings()); final != nil {
-			t.Fatal("the parallel kill switch must refuse the arm")
 		}
 	})
 }
@@ -616,9 +593,6 @@ func TestUniquePathCostIsCreateUpperUniquePath(t *testing.T) {
 // add_path keeps it among fuzzily equal costs (TPC-DS Q38/Q87's web_sales
 // leg, 890 against 891).
 func TestPartialDistinctSplitArmReestimatesOverCrossingRows(t *testing.T) {
-	prev := parallelOn.Load()
-	parallelOn.Store(true)
-	defer parallelOn.Store(prev)
 
 	const rows = 400_001
 	d := sizedDistinctFixture(t, rows, rows)

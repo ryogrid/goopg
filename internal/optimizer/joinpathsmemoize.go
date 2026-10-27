@@ -12,13 +12,13 @@ package optimizer
 //
 // # Why this is a PATH and not an attachment
 //
-// goopg already had a Memoize insertion rule — `maybeAttachMemoize`
-// (memoize.go) — and it runs on a BUILT `*NestedLoopIndexJoin`, after
-// `rewriteJoinsToNLI` has chosen the method. That is exactly what it can be for
-// the legacy enumerator, whose join method is decided by rules rather than by a
-// cost comparison. It is exactly what it must NOT be for the searched arm:
-// `walkRewriteNLI` skips a searched subtree (nl_index_join.go:110), so a
-// searched NLI never reached it at all, and bolting it on at `createPlan` time
+// goopg had a Memoize insertion rule — `maybeAttachMemoize` — that ran on a
+// BUILT `*NestedLoopIndexJoin` after the legacy NLI post-pass had chosen the
+// method (both deleted at M0147-0051). That suited an enumerator whose join
+// method was decided by rules rather than by a cost comparison. It is exactly
+// what it must NOT be for the searched arm: the post-pass skipped a searched
+// subtree, so a searched NLI never reached it at all, and bolting it on at
+// `createPlan` time
 // would make the executed plan cheaper than the plan the search costed — the
 // costed-≠-executed class this architecture exists to kill (06 §2.1). A cache
 // that only ever makes an NLI faster still changes which METHOD wins: the whole
@@ -113,12 +113,11 @@ func memoizeEntryOverheadBytes(tuples float64) float64 {
 //     join's sizing goes through, so a cached row and a hashed row are measured
 //     by one ruler and not two.
 //   - `get_expr_width` per cache key (`keyWidth`, `memoizeKeyWidths` below) IS
-//     now ported when the PG-faithful currency is enabled and
-//     `pgRelationByteSize` itself succeeds: every cache key here is a bare
+//     now ported and used whenever `pgRelationByteSize` succeeds: every cache key here is a bare
 //     `*ColumnRef` (`memoizeCacheKeys`'s only admitted shape), so `get_expr_width`
 //     reduces to the same ANALYZEd-width-or-typeWidth lookup every other width
-//     consumer in this package already shares. When the currency is off, or the
-//     PG byte-size substitution itself declined, the per-key term stays
+//     consumer in this package already shares. When the PG byte-size
+//     substitution declines, the per-key term stays
 //     `hashsize.EntryBytes(nkeys, 0)` — the goopg-native ruler paired with the
 //     goopg-native tuple-bytes term it sits beside, so neither term switches
 //     currency without the other.
@@ -140,28 +139,22 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 		tuples = 0
 	}
 
-	// R108/R113-shaped absorption arm (M0139-0007b): PG prices the cached
-	// tuple bytes with `relation_byte_size(tuples, width)` +
-	// `ExecEstimateCacheEntryOverheadBytes(tuples)` (costsize.c:2565-2566),
-	// where `width` is the PG-equivalent pathtarget width, not goopg's
-	// Datum/kvcache entry size. Off by default like its two siblings.
+	// M0139-0007b's PG currency, promoted by M0147-0022:
+	// PG prices the cached tuple bytes with `relation_byte_size(tuples,
+	// width)` + `ExecEstimateCacheEntryOverheadBytes(tuples)`
+	// (costsize.c:2565-2566), where `width` is the PG-equivalent pathtarget
+	// width, not goopg's Datum/kvcache entry size.
 	//
-	// The per-key term (M0139-0007c) now tracks the SAME currency choice as
-	// the tuple-bytes term beside it: `keyWidth` (the caller's ported
-	// `get_expr_width` sum, `memoizeKeyWidths`) only when the PG currency is
-	// on AND `pgRelationByteSize` itself succeeded — if that substitution
-	// declined, both terms fall back to goopg's own `hashsize.EntryBytes`
-	// ruler together, never a PG per-key width paired with a goopg tuple
-	// width or vice versa.
+	// The per-key term (M0139-0007c) tracks the SAME currency choice as the
+	// tuple-bytes term beside it: `keyWidth` (the caller's ported
+	// `get_expr_width` sum, `memoizeKeyWidths`) whenever `pgRelationByteSize`
+	// succeeds — if that substitution declines (no usable width), both terms
+	// fall back to goopg's own `hashsize.EntryBytes` ruler together, never a
+	// PG per-key width paired with a goopg tuple width or vice versa.
 	var tupleBytes, perKeyBytes float64
-	if pgMemoizeEntryBytesCostEnabled() {
-		if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
-			tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
-			perKeyBytes = keyWidth
-		} else {
-			tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
-			perKeyBytes = hashsize.EntryBytes(nkeys, 0)
-		}
+	if pgBytes, ok := pgRelationByteSize(tuples, width); ok {
+		tupleBytes = pgBytes + pgMemoizeEntryOverheadBytes(tuples)
+		perKeyBytes = keyWidth
 	} else {
 		tupleBytes = hashsize.EntryBytes(ncols, 0)*tuples + memoizeEntryOverheadBytes(tuples)
 		perKeyBytes = hashsize.EntryBytes(nkeys, 0)
@@ -214,8 +207,9 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 // shape named rather than dropped (a vacuous gate that is not written down is
 // indistinguishable from a forgotten one the day 03 §4.4's pin is relaxed):
 //
-//  1. `enable_memoize` — goopg's `memoizeOn`, the SAME switch the legacy
-//     insertion rule reads, so `SET enable_memoize = off` kills both arms.
+//  1. `enable_memoize` — the statement's `cp.enableMemoize`, the SAME setting
+//     the legacy insertion rule receives, so `SET enable_memoize = off` kills
+//     both arms.
 //  2. `outer_path->parent->rows < 2` (:696): with one outer row every probe is
 //     a first probe and a cache is pure overhead.
 //  3. LATERAL cache keys (`extract_lateral_vars_from_PHVs`, :704): goopg's
@@ -240,19 +234,17 @@ func costMemoizeRescan(cp costParams, inner Cost, tuples, calls, ndistinct float
 //     (`addParameterizedIndexPaths` declines a wrapped leaf, P5.5-e-ii-b).
 //  8. `paraminfo_get_equal_hashops` (:802): every key must be hashable. goopg's
 //     memoize cache keys on `Datum` values through `kvcache`, and the shape it
-//     can key on is the bare outer column — which is the same test
-//     `maybeAttachMemoize` applies (memoize.go:106-110), deliberately, so the
-//     legacy and searched arms cannot disagree about what is cacheable.
+//     can key on is the bare outer column (the test the deleted legacy
+//     `maybeAttachMemoize` also applied, M0147-0051).
 //
 // PG's `binary_mode` has no goopg counterpart: `kvcache` compares Datums by
 // their encoded form, which is the binary comparison PG switches into, so goopg
 // is unconditionally in the strict mode and never in the "logical" one. That is
 // a superset of what PG guarantees here, never a subset. Ledgered.
 func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path, cp costParams) *Path {
-	// take2 P2-02c: the per-STATEMENT setting, not the process global. The
-	// global remains as the env kill-switch (GOOPG_MEMOIZE) and as the legacy
-	// arm's gate; what it no longer carries is one session's SET.
-	if !cp.enableMemoize || !memoizeOn.Load() {
+	// take2 P2-02c: the per-STATEMENT setting, not a process global (the
+	// GOOPG_MEMOIZE global was retired at M0147-0044).
+	if !cp.enableMemoize {
 		return nil
 	}
 	if outerPath == nil || innerPath == nil || outer == nil {
@@ -298,12 +290,11 @@ func getMemoizePath(s *searchCtx, outer *RelOptInfo, outerPath, innerPath *Path,
 		// also the contract Path.NCols' own doc states ("read them through
 		// pathNCols ..., never directly").
 		//
-		// UNCONDITIONAL. R128 note: GOOPG_NARROW_COST_INPUTS is now DEFAULT
-		// ON, so the interesting arm is no longer the one this paragraph was
-		// written for -- narrowing normally DOES reach pathNCols here. The
-		// invariant below is still worth stating, and still holds, but read it
-		// as covering the opted-OUT arm (`=0`) rather than the default:
-		// with narrowing off the ONLY writer of Path.NCols is
+		// UNCONDITIONAL. Cost-input narrowing has been unconditional since
+		// M0147-0041 (default ON since R128), so narrowing normally DOES reach
+		// pathNCols here. The invariant below covers a rel that declines to
+		// narrow (and the un-narrowed test seam):
+		// with no narrowing the ONLY writer of Path.NCols is
 		// pathindexonly.go, and getMemoizePath cannot reach here on an
 		// index-only inner -- memoizeCacheKeys returns (nil,false) when
 		// len(innerPath.IndexClauses)==0, and the index-only producer emits

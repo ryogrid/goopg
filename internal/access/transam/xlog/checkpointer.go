@@ -299,6 +299,10 @@ type Checkpointer struct {
 	// the standby WAL stream is owned by the primary and its reconnect LSN is
 	// derived from that stream's durable tail.
 	recoveryMode atomic.Bool
+	// restartPointSrc, set on a standby, reports the last checkpoint record
+	// replay applied; runRecoveryFlush adopts it into pg_control after the
+	// flush, as CreateRestartPoint does (M0122-0013). nil: no restartpoints.
+	restartPointSrc atomic.Pointer[func() (ReplayedCheckpoint, bool)]
 
 	// retainer, when non-nil, runs after each successful
 	// checkpoint marker is durable. The slot-aware production
@@ -712,6 +716,20 @@ func (c *Checkpointer) SetRecoveryMode(enabled bool) {
 	c.recoveryMode.Store(enabled)
 }
 
+// SetRestartPointSource installs the replayed-checkpoint source a standby's
+// recovery flushes turn into restartpoints (nil disables them). Set by
+// standby startup, possibly after Run has started (hence atomic).
+func (c *Checkpointer) SetRestartPointSource(fn func() (ReplayedCheckpoint, bool)) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.restartPointSrc.Store(nil)
+		return
+	}
+	c.restartPointSrc.Store(&fn)
+}
+
 // runCheckpoint executes one checkpoint cycle. When `spread` is
 // true and CompletionTarget > 0, dirty-page writeback is paced so
 // it finishes near `start + Interval * CompletionTarget`. The WAL
@@ -1104,14 +1122,26 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	return nil
 }
 
-// runRecoveryFlush is the standby counterpart to a checkpoint.  It preserves
-// the durability ordering needed for replayed pages and CLOG, but deliberately
-// leaves WAL and pg_control untouched: those belong to the primary until
-// promotion.  In particular, the local WAL tail remains a valid physical
-// restart position for the walreceiver after Stop+Start.
+// runRecoveryFlush is the standby counterpart to a checkpoint — PG's
+// CreateRestartPoint.  It preserves the durability ordering needed for
+// replayed pages and CLOG and writes NO WAL: the stream belongs to the
+// primary until promotion, and the local WAL tail must stay a valid physical
+// restart position for the walreceiver after Stop+Start.  After the flush it
+// adopts the last replayed checkpoint into pg_control (adoptRestartPoint), so
+// a restarted standby begins replay at that checkpoint's redo rather than at
+// its base backup's.
 func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 	start := time.Now()
 	c.cfg.Logger.Info("recovery checkpoint start", "type", "standby")
+	// CreateRestartPoint takes its copy of the last replayed checkpoint
+	// BEFORE CheckPointGuts: every page that record's redo depends on was
+	// replayed, hence dirty or already written, when the copy was taken, so
+	// the flush below covers it.
+	var rp ReplayedCheckpoint
+	haveRP := false
+	if src := c.restartPointSrc.Load(); src != nil {
+		rp, haveRP = (*src)()
+	}
 	if err := c.flushDirty(c.buildPacer(ctx, false, start)); err != nil {
 		return fmt.Errorf("flush recovery dirty pages: %w", err)
 	}
@@ -1125,10 +1155,64 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 			return fmt.Errorf("sync recovery data files: %w", err)
 		}
 	}
+	if haveRP && c.cfg.DataDir != "" {
+		adopted, err := adoptRestartPoint(c.cfg.DataDir, rp)
+		if err != nil {
+			return fmt.Errorf("restartpoint pg_control update: %w", err)
+		}
+		if adopted {
+			c.cfg.Logger.Info("recovery restart point", "redo", rp.Fields.RedoLSN0, "checkpoint", rp.StartLSN-1)
+		}
+	}
 	c.numRequested.Add(1)
 	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// adoptRestartPoint is CreateRestartPoint's pg_control update (xlog.c):
+// when pg_control still shows an older checkpoint (checkPointCopy.redo <
+// the replayed checkpoint's redo), checkPoint and checkPointCopy become the
+// replayed checkpoint's, and — only while the control file shows
+// DB_IN_ARCHIVE_RECOVERY — minRecoveryPoint is raised to the record's end.
+// Nothing is written otherwise. Reports whether it advanced pg_control.
+func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint) (bool, error) {
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		return false, err
+	}
+	if !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
+		return false, nil
+	}
+	f := rp.Fields
+	err = control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		if !(cd.CheckPointCopyRedo < f.RedoLSN0) {
+			return
+		}
+		cd.CheckPoint = rp.StartLSN - 1
+		cd.CheckPointCopyRedo = f.RedoLSN0
+		cd.CheckPointCopyThisTLI = f.ThisTLI
+		cd.CheckPointCopyPrevTLI = f.PrevTLI
+		cd.CheckPointCopyFullPageWrites = f.FullPageWrites
+		cd.CheckPointCopyWalLevel = f.WalLevel
+		cd.CheckPointCopyNextXid = f.NextXid
+		cd.CheckPointCopyNextOid = f.NextOid
+		cd.CheckPointCopyNextMulti = f.NextMulti
+		cd.CheckPointCopyNextMultiOffset = f.NextMultiOffset
+		cd.CheckPointCopyOldestXid = f.OldestXid
+		cd.CheckPointCopyOldestXidDB = f.OldestXidDB
+		cd.CheckPointCopyOldestMulti = f.OldestMulti
+		cd.CheckPointCopyOldestMultiDB = f.OldestMultiDB
+		cd.CheckPointCopyTime = rp.Time
+		cd.CheckPointCopyOldestCommitTsXid = f.OldestCommitTsXid
+		cd.CheckPointCopyNewestCommitTsXid = f.NewestCommitTsXid
+		cd.CheckPointCopyOldestActiveXid = f.OldestActiveXid
+		if cd.State == control.DBStateInArchiveRecovery && cd.MinRecoveryPoint < rp.EndLSN {
+			cd.MinRecoveryPoint = rp.EndLSN
+			cd.MinRecoveryPointTLI = f.ThisTLI
+		}
+	})
+	return err == nil, err
 }
 
 // flushDirty drains the buffer pool's dirty set, using the paced

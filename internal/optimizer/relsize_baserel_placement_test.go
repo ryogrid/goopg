@@ -58,9 +58,6 @@ func newPlacementFixture(stats *catalog.TableStats) (*catalog.InMemory, rangeBin
 // by the reliability gate instead of by refusing to scale — which is what lets
 // the same code be right in the state below, where the premise is false.
 func TestRelSizeFallbackPlacementScalesWhenStatsAbsent(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-
 	cat, binding, scan, pred := newPlacementFixture(nil)
 
 	// The selectivity gate is the mechanism the equality rests on — assert it
@@ -111,9 +108,6 @@ func TestRelSizeFallbackPlacementScalesWhenStatsAbsent(t *testing.T) {
 // replaces threw the restored MCV list away and handed the search the whole
 // relation.
 func TestRelSizeFallbackPlacementScalesRestoredColumnStats(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-
 	cat, binding, scan, pred := newPlacementFixture(&catalog.TableStats{
 		Analyzed: true,
 		Columns: []catalog.ColumnStats{
@@ -148,12 +142,9 @@ func TestRelSizeFallbackPlacementScalesRestoredColumnStats(t *testing.T) {
 // the move from a pre-filter to a post-filter placement must not disturb: a
 // relation whose post-filter count is already positive is untouched, so a warm
 // server never reads a block-derived estimate over its own ANALYZEd one. The
-// nil-table and disabled-flag directions are the "no estimate means keep the
-// old answer" contract every staged consumer owes.
+// cold-relation and nil-info directions follow: a cold relation does receive
+// the estimate, and a nil info does not panic.
 func TestRelSizeFallbackPlacementInertWhenRowCountKnown(t *testing.T) {
-	defer SetRelSizeFallbackStage(SetRelSizeFallbackStage(0))
-	SetRelSizeFallbackStage(2)
-
 	cat, binding, scan, pred := newPlacementFixture(&catalog.TableStats{
 		RowCount: 4242,
 		Analyzed: true,

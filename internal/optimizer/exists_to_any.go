@@ -80,7 +80,7 @@ func init() {
 }
 
 // existsToAnyFromEnv is the kill-switch's polarity, factored out of init for
-// the provenance table (flaglabels.go); see memoizeFromEnv.
+// the provenance table (flaglabels.go).
 func existsToAnyFromEnv(v string) bool { return v != "off" }
 
 // SetExistsToAnyEnabled flips the EXISTS→ANY conversion. Test-only API;

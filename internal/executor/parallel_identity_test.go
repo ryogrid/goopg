@@ -44,14 +44,16 @@ func parallelIdentityFixture(t *testing.T) (*Context, func()) {
 	return ctx, cleanup
 }
 
-// runForced runs sql with Gather insertion forced on or off and returns the
-// rendered rows.
+// runForced runs sql with parallelism allowed (the default settings) or
+// refused (max_parallel_workers_per_gather = 0, PG's own switch) and returns
+// the rendered rows.
 func runForced(t *testing.T, ctx *Context, sql string, parallel bool) []string {
 	t.Helper()
-	prev := optimizer.ParallelEnabled()
-	optimizer.SetParallelEnabled(parallel)
-	defer optimizer.SetParallelEnabled(prev)
-
+	if !parallel {
+		serial := optimizer.DefaultPlannerSettings()
+		serial.MaxParallelWorkersPerGather = 0
+		return renderRows(runSQLWith(t, ctx, sql, serial))
+	}
 	rows, err := runQueryWithErr(ctx, sql)
 	if err != nil {
 		t.Fatalf("%s (parallel=%v): %v", sql, parallel, err)

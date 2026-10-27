@@ -71,10 +71,10 @@ func TestScanQualValueListIN(t *testing.T) {
 		}
 		want := sortedRowValues(t, ctx, orQ)
 		for _, on := range []bool{true, false} {
-			old := scanPrefilterOn.Load()
-			scanPrefilterOn.Store(on)
+			old := scanPrefilterForceLate.Load()
+			scanPrefilterForceLate.Store(!on)
 			got := sortedRowValues(t, ctx, inQ)
-			scanPrefilterOn.Store(old)
+			scanPrefilterForceLate.Store(old)
 			if strings.Join(got, "|") != strings.Join(want, "|") {
 				t.Fatalf("%s (early path %v): %d rows, the OR spelling gives %d", c.in, on, len(got), len(want))
 			}

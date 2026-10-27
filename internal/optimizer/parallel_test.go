@@ -334,14 +334,19 @@ func TestParallelWorkersReloptionWins(t *testing.T) {
 	}
 }
 
-// TestKillSwitchSuppressesGather pins the house-style escape hatch.
+// TestKillSwitchSuppressesGather pins PG's switch: with
+// max_parallel_workers_per_gather = 0 the post-pass places no Gather. (Rebased
+// from the retired GOOPG_PARALLEL=off arm, M0147-0045.)
 func TestKillSwitchSuppressesGather(t *testing.T) {
-	SetParallelEnabled(false)
-	defer SetParallelEnabled(true)
 	tbl := bigTable(t, "big")
 	root := &Project{Child: seqScanOver(tbl), schema: Schema{{Name: "a"}}}
-	if planHasGather(MaybeAddGather(root, parallelTestSettings())) {
-		t.Error("GOOPG_PARALLEL=off must suppress insertion")
+	s := parallelTestSettings()
+	if !planHasGather(MaybeAddGather(root, s)) {
+		t.Fatal("fixture no longer gathers with workers available — the pin is vacuous")
+	}
+	s.MaxWorkersPerGather = 0
+	if planHasGather(MaybeAddGather(root, s)) {
+		t.Error("max_parallel_workers_per_gather = 0 must suppress insertion")
 	}
 }
 

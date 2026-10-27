@@ -6,7 +6,7 @@ package executor
 // contracts:
 //
 //   - a Memoize-planned join returns the SAME rows as the bare NLI
-//     (planner.SetMemoizeEnabled off/on comparison);
+//     (enable_memoize off/on comparison through PlannerSettings);
 //   - EXPLAIN renders the Memoize node with its Cache Key line, and
 //     EXPLAIN ANALYZE reports Hits/Misses/Evictions/Overflows with the
 //     exact counts the key stream implies;
@@ -70,9 +70,6 @@ func TestMemoizeExplainAndResults(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
 
-	optimizer.SetMemoizeEnabled(true)
-	defer optimizer.SetMemoizeEnabled(true)
-
 	plan := explainText(t, ctx, memoizeJoinSQL)
 	if !strings.Contains(plan, "Nested Loop") {
 		t.Fatalf("fixture no longer plans an NLI join — the memoize pins are vacuous:\n%s", plan)
@@ -98,14 +95,19 @@ func TestMemoizeExplainAndResults(t *testing.T) {
 		t.Fatalf("memoized query: %v", err)
 	}
 
-	optimizer.SetMemoizeEnabled(false)
-	if off := explainText(t, ctx, memoizeJoinSQL); strings.Contains(off, "Memoize") {
-		t.Fatalf("Memoize node survived SetMemoizeEnabled(false):\n%s", off)
+	// enable_memoize = off for this statement only (PlannerSettings), the
+	// route a session's SET takes. Without the cache the cost model prefers a
+	// hash join, so hash and merge joins are switched off too: the arm under
+	// test is the bare NLI, the same join minus its Memoize.
+	noMemo := optimizer.DefaultPlannerSettings()
+	noMemo.EnableMemoize = false
+	noMemo.EnableHashJoin, noMemo.EnableMergeJoin = false, false
+	if off := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN "+memoizeJoinSQL, noMemo)), "\n"); strings.Contains(off, "Memoize") {
+		t.Fatalf("Memoize node survived enable_memoize = off:\n%s", off)
+	} else if !strings.Contains(off, "Nested Loop") {
+		t.Fatalf("enable_memoize = off arm no longer plans the NLI — the comparison is vacuous:\n%s", off)
 	}
-	withoutMemo, err := runQueryWithErr(ctx, memoizeJoinSQL)
-	if err != nil {
-		t.Fatalf("bare query: %v", err)
-	}
+	withoutMemo := runSQLWith(t, ctx, memoizeJoinSQL, noMemo)
 
 	// 40 rows; sum = 4 × (100+200+…+1000) = 22000.
 	for name, rows := range map[string][]Row{"memoized": withMemo, "bare": withoutMemo} {
@@ -128,9 +130,6 @@ func TestMemoizeAnalyzeCounters(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
 
-	optimizer.SetMemoizeEnabled(true)
-	defer optimizer.SetMemoizeEnabled(true)
-
 	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE "+memoizeJoinSQL)
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "Memoize") {
@@ -148,9 +147,6 @@ func TestMemoizeAnalyzeCounters(t *testing.T) {
 func TestMemoizeOverflowPassThrough(t *testing.T) {
 	ctx, cleanup := newMemoizeFixture(t)
 	defer cleanup()
-
-	optimizer.SetMemoizeEnabled(true)
-	defer optimizer.SetMemoizeEnabled(true)
 
 	savedWorkMem := ctx.WorkMem
 	ctx.WorkMem = 100 // budget = WorkMem/4 = 25 bytes < any entry

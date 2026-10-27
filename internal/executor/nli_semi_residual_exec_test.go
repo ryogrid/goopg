@@ -128,8 +128,6 @@ func nliResidualExplain(t *testing.T, ctx *Context, sql string) string {
 }
 
 func TestNLISemiResidualExecution(t *testing.T) {
-	optimizer.SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
@@ -156,8 +154,6 @@ func TestNLISemiResidualExecution(t *testing.T) {
 }
 
 func TestNLIAntiResidualExecution(t *testing.T) {
-	optimizer.SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { optimizer.SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 	ctx, cleanup := newNLIResidualFixtureLargeInner(t)
 	defer cleanup()
 
@@ -193,11 +189,13 @@ func TestNLISemiResidualMatchesSubPlanPath(t *testing.T) {
 	// o_val > 3 keeps {2,3,4}; EXISTS keeps {3}.
 	want := []string{"3"}
 
-	defer optimizer.SetIndexKeyHarvestEnabled(true) // restore the ON default
-	optimizer.SetIndexKeyHarvestEnabled(true)
 	nliGot := nliResidualRows(t, ctx, sql)
-	optimizer.SetIndexKeyHarvestEnabled(false)
+	// The SubPlan path: pull-up off (the test-only switch), which is what the
+	// retired GOOPG_INDEXKEY_HARVEST=off arm amounted to here (M0147-0049).
+	optimizer.SetSubqueryUnnestEnabled(false)
+	t.Cleanup(func() { optimizer.SetSubqueryUnnestEnabled(true) })
 	subplanGot := nliResidualRows(t, ctx, sql)
+	optimizer.SetSubqueryUnnestEnabled(true)
 
 	if len(nliGot) != 1 || nliGot[0] != want[0] {
 		t.Fatalf("NLI path: got %v want %v", nliGot, want)
@@ -209,8 +207,8 @@ func TestNLISemiResidualMatchesSubPlanPath(t *testing.T) {
 
 // TestScalarProbeCheapPolicyResultsAgree pins the S6 scalar policy from
 // the results side: an index-probe-cheap scalar stays a SubPlan with the
-// harvest on (planner test asserts the shape); here we require the
-// answer to be identical with the harvest on and off.
+// harvest (planner test asserts the shape); here we require the answer to
+// be identical on the decorrelated and the SubPlan path.
 func TestScalarProbeCheapPolicyResultsAgree(t *testing.T) {
 	ctx, cleanup := newNLIResidualFixture(t)
 	defer cleanup()
@@ -220,13 +218,15 @@ func TestScalarProbeCheapPolicyResultsAgree(t *testing.T) {
 	// 1<2 ✓, 4<5 ✓, 5<9 ✓, 7<NULL → NULL → excluded.
 	want := []string{"1", "2", "3"}
 
-	defer optimizer.SetIndexKeyHarvestEnabled(true) // restore the ON default
-	optimizer.SetIndexKeyHarvestEnabled(true)
 	onGot := nliResidualRows(t, ctx, sql)
-	optimizer.SetIndexKeyHarvestEnabled(false)
+	// The SubPlan path: pull-up off (the test-only switch), which is what the
+	// retired GOOPG_INDEXKEY_HARVEST=off arm amounted to here (M0147-0049).
+	optimizer.SetSubqueryUnnestEnabled(false)
+	t.Cleanup(func() { optimizer.SetSubqueryUnnestEnabled(true) })
 	offGot := nliResidualRows(t, ctx, sql)
+	optimizer.SetSubqueryUnnestEnabled(true)
 
-	for name, got := range map[string][]string{"harvest-on": onGot, "harvest-off": offGot} {
+	for name, got := range map[string][]string{"decorrelated": onGot, "subplan": offGot} {
 		if len(got) != len(want) {
 			t.Fatalf("%s: got %v want %v", name, got, want)
 		}

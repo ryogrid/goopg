@@ -123,8 +123,9 @@ func deriveOrderedSortInputKeep(keys []SortKey, aboveNames map[string]bool, abov
 // child.Output(), the same coordinate space `sizeUpperRelFromNode` itself
 // reads. Rows and Width are left exactly as sizeUpperRelFromNode set them:
 // this is Site A's NCols/AvgVarBytes currency fix only (fix1's own
-// precedent, and `pgSortRelationBytesCostEnabled()` — default off — is the
-// only consumer of rel.Width here, per M0141-S2a-fix1-sweep's design doc).
+// precedent, and the PG Sort byte price — default on since M0146-0234,
+// unconditional since M0147-0042 — is the only consumer of rel.Width here,
+// per M0141-S2a-fix1-sweep's design doc).
 func narrowOrderedRelWidths(rel *RelOptInfo, child Node, keep []int) {
 	if rel == nil || child == nil || len(keep) == 0 {
 		return

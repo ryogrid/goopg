@@ -16,8 +16,9 @@ package executor
 // Sort siblings; see subplan_handle_test.go and scan_deform_bound_test.go).
 //
 // The plan is built BY HAND (`optimizer.IncrementalSort{...}`) rather than
-// through `planSelect`'s tournament: `GOOPG_INCREMENTAL_SORT` stays off by
-// default (incrementalsortpaths.go), and getting a real query to WIN the
+// through `planSelect`'s tournament: written while `GOOPG_INCREMENTAL_SORT`
+// was off by default (the arm is now gated only by enable_incremental_sort,
+// M0147-0043), and getting a real query to WIN the
 // tournament is the broader M0141-S7 measurement goal, not exec-b's own
 // "does the wiring work" scope — the same staging TestBuildFastNodeKinds
 // (phase_c_test.go) already uses for its own hand-built plan nodes.
@@ -167,8 +168,8 @@ func TestIncrementalSortReachesBothBuilders(t *testing.T) {
 // `Sort Key:` / `Presorted Key:` pair (nodeIncrementalSort.c's
 // show_incremental_sort_keys, explain.c:2583-2823), not just the plain
 // Sort's single `Sort Key:` line. Reuses the same hand-built-plan technique
-// as TestIncrementalSortReachesBothBuilders above (GOOPG_INCREMENTAL_SORT
-// stays off, so a real query can never plan this node itself yet).
+// as TestIncrementalSortReachesBothBuilders above (written while the arm was
+// still gated off, so a real query could not plan this node itself).
 func TestExplainIncrementalSortPresortedKey(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()

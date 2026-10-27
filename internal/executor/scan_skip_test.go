@@ -171,9 +171,9 @@ func TestScanPrefilterSkipMatchesFullDecode(t *testing.T) {
 		scanSkipDisabled = true
 		want := sortedRowValues(t, ctx, q)
 		scanSkipDisabled = false
-		scanPrefilterOn.Store(false)
+		scanPrefilterForceLate.Store(true)
 		late := sortedRowValues(t, ctx, q)
-		scanPrefilterOn.Store(true)
+		scanPrefilterForceLate.Store(false)
 		if strings.Join(got, "|") != strings.Join(want, "|") || strings.Join(got, "|") != strings.Join(late, "|") {
 			t.Fatalf("%s: skipping %d rows, full %d, late %d\nskipping %v\nfull     %v", q, len(got), len(want), len(late),
 				got[:min(3, len(got))], want[:min(3, len(want))])

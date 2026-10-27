@@ -299,8 +299,6 @@ var exprSwitchInventory = map[string]walkerRole{
 	// dispatch survives inside the Rewrite closure — shift a *ColumnRef,
 	// veto *OuterColumnRef / *CTIDExpr — and the census attributes a
 	// closure's switch to its enclosing function. RC-1a class 48 → 47.
-	"nl_index_join.go:cloneExprShiftIdx":                        nonRecursiveClassifier,
-	"nl_index_join.go:residualCostMultiplier":                   nonRecursiveClassifier,
 	// planner.go:exprEqual and planner.go:planExprContentKey were CONVERTED by
 	// M0125-0024 and their pins are DELETED, not demoted: unlike commit 1's
 	// remapByPosMap, no per-type dispatch survives — both are now

@@ -54,9 +54,6 @@ func TestIsNarrowableLeaf(t *testing.T) {
 // tiers are narrowBuildInput's/narrowMergeInput's own tests' job, and this
 // hook calls the identical functions.
 func TestNarrowJoinLegCountsAndNarrows(t *testing.T) {
-	old := narrowLegHook
-	defer func() { narrowLegHook = old }()
-
 	lay := func() outputLayout { return outputLayout{7, 8, 9} }
 	scan := func() Node { return &SeqScan{schema: noSchema("k", "v", "unused")} }
 
@@ -66,29 +63,26 @@ func TestNarrowJoinLegCountsAndNarrows(t *testing.T) {
 
 	for _, tc := range []struct {
 		name      string
-		flag      bool
 		n         Node
 		p         *Path
 		nliInner  bool
 		wantCount int64
 		wantKeep  []string // nil = the pair must be returned unchanged
 	}{
-		{"flag off + bare scan: declines and does not count", false, scan(), knownSubset, false, 0, nil},
-		{"flag on + already a Project: declines silently", true,
+		{"already a Project: declines silently",
 			&Project{Child: scan(), schema: noSchema("k")}, knownSubset, false, 0, nil},
-		{"flag on + not a leaf at all: declines silently", true,
+		{"not a leaf at all: declines silently",
 			&noNode{sch: noSchema("k", "v", "unused")}, knownSubset, false, 0, nil},
-		{"flag on + nil path: counts but declines (unknown needed set)", true, scan(), nil, false, 1, nil},
-		{"flag on + nil rel: counts but declines", true, scan(), &Path{}, false, 1, nil},
-		{"flag on + unknown needed set: counts but declines", true, scan(), unknown, false, 1, nil},
-		{"flag on + needed set names everything: counts but declines (no-op cut)", true,
+		{"nil path: counts but declines (unknown needed set)", scan(), nil, false, 1, nil},
+		{"nil rel: counts but declines", scan(), &Path{}, false, 1, nil},
+		{"unknown needed set: counts but declines", scan(), unknown, false, 1, nil},
+		{"needed set names everything: counts but declines (no-op cut)",
 			scan(), knownAll, false, 1, nil},
-		{"flag on + needed set names a subset: counts AND narrows", true,
+		{"needed set names a subset: counts AND narrows",
 			scan(), knownSubset, false, 1, []string{"k", "v"}},
-		{"flag on + NLI inner + a narrowable subset: counts but declines (structural, not a keep-set refusal)", true,
+		{"NLI inner + a narrowable subset: counts but declines (structural, not a keep-set refusal)",
 			scan(), knownSubset, true, 1, nil},
 	} {
-		narrowLegHook = tc.flag
 		legHookFireCountAndReset() // clear any carry from a prior case
 
 		gotN, gotLay := narrowJoinLeg(tc.n, lay(), tc.p, tc.nliInner)
@@ -123,7 +117,6 @@ func TestNarrowJoinLegCountsAndNarrows(t *testing.T) {
 	}
 
 	// A nil node must decline without panicking on isNarrowableLeaf/Output().
-	narrowLegHook = true
 	legHookFireCountAndReset()
 	if gotN, gotLay := narrowJoinLeg(nil, lay(), knownSubset, false); gotN != nil || len(gotLay) != 3 {
 		t.Errorf("nil node: got (%v, %v), want (nil, unchanged layout)", gotN, gotLay)
@@ -204,28 +197,10 @@ func TestNarrowJoinLegFiresAndNarrowsOnLiveJoinSearch(t *testing.T) {
 	settings := DefaultPlannerSettings()
 	settings.EnableMergeJoin = false
 
-	old := narrowLegHook
-	defer func() { narrowLegHook = old }()
-
-	narrowLegHook = false
-	legHookFireCountAndReset()
-	planOff, err := PlanWithSettings(sel, cat, settings)
-	if err != nil {
-		t.Fatalf("plan (hook off): %v", err)
-	}
-	if got := legHookFireCountAndReset(); got != 0 {
-		t.Fatalf("hook off: fire count = %d, want 0 (the flag must gate the hook)", got)
-	}
-	joinOff := findFirstJoin(planOff)
-	if joinOff == nil {
-		t.Fatalf("test fixture broken: no join node found (hook off)\n%s", unaDump(planOff, 0))
-	}
-	if !joinChildColumnNames(joinOff)["jlh1_unused"] {
-		t.Fatalf("test fixture broken: hook-off join's children already lack jlh1_unused " +
-			"before this hook could be blamed for narrowing it")
-	}
-
-	narrowLegHook = true
+	// The hook is unconditional since M0147-0031 retired GOOPG_NARROW_LEG_HOOK,
+	// so there is no hook-off plan to compare against: jlh1_unused exists by
+	// construction (the catalog above), and the assertions below require the
+	// hook to have fired and to have cut it from the join's child.
 	legHookFireCountAndReset()
 	planOn, err := PlanWithSettings(sel, cat, settings)
 	if err != nil {

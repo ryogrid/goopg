@@ -16,17 +16,6 @@ import (
 //	(c) NO partial path is ever the final path — the serial control arm is
 //	    unchanged (nothing consumes PartialPathlist until C-19d).
 
-// withParallelOn runs f with the process kill switch on and the previous
-// state restored, so the pins do not depend on GOOPG_PARALLEL in the
-// environment.
-func withParallelOn(t *testing.T, f func()) {
-	t.Helper()
-	prev := ParallelEnabled()
-	SetParallelEnabled(true)
-	defer SetParallelEnabled(prev)
-	f()
-}
-
 func cpTable(name string) *catalog.Table {
 	schema := cpjSchema(name, rfjWidth)
 	cols := make([]catalog.Column, rfjWidth)
@@ -149,97 +138,93 @@ func TestConsiderParallel_SetAndClearedByShape(t *testing.T) {
 // and re-stamps the prebuilt path, and `parallelModeOK` gates all of it —
 // `max_parallel_workers_per_gather = 0` or the kill switch clears every rel.
 func TestSetBaseRelConsiderParallel_StampsRelsAndPrebuiltPaths(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-		prob := rfjProblem(names, []int64{1000, 1000, 1000}, []Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
-		prob.relInfos[1].table.Temp = true
-		prob.scans[1] = cpScan(prob.relInfos[1].table)
-		s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
-		if err != nil {
-			t.Fatal(err)
+	names := []string{"a", "b", "c"}
+	prob := rfjProblem(names, []int64{1000, 1000, 1000}, []Expr{rfjEq(names, 0, 1), rfjEq(names, 1, 2)})
+	prob.relInfos[1].table.Temp = true
+	prob.scans[1] = cpScan(prob.relInfos[1].table)
+	s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range s.joinrels[1] {
+		if rel.ConsiderParallel || rel.Pathlist[0].ParallelSafe {
+			t.Fatal("a rel that has not been through the step must not consider parallel")
 		}
-		for _, rel := range s.joinrels[1] {
-			if rel.ConsiderParallel || rel.Pathlist[0].ParallelSafe {
-				t.Fatal("a rel that has not been through the step must not consider parallel")
+	}
+	s.setBaseRelConsiderParallel(nil)
+	if !s.parallelModeOK {
+		t.Fatal("parallelModeOK false under the default max_parallel_workers_per_gather")
+	}
+	want := []bool{true, false, true}
+	for i, rel := range s.joinrels[1] {
+		if rel.ConsiderParallel != want[i] {
+			t.Errorf("rel %d ConsiderParallel = %v, want %v", i, rel.ConsiderParallel, want[i])
+		}
+		for _, p := range rel.Pathlist {
+			if p.ParallelSafe != want[i] {
+				t.Errorf("rel %d path ParallelSafe = %v, want the rel's flag %v", i, p.ParallelSafe, want[i])
 			}
 		}
-		s.setBaseRelConsiderParallel(nil)
-		if !s.parallelModeOK {
-			t.Fatal("parallelModeOK false under the default max_parallel_workers_per_gather")
-		}
-		want := []bool{true, false, true}
-		for i, rel := range s.joinrels[1] {
-			if rel.ConsiderParallel != want[i] {
-				t.Errorf("rel %d ConsiderParallel = %v, want %v", i, rel.ConsiderParallel, want[i])
-			}
-			for _, p := range rel.Pathlist {
-				if p.ParallelSafe != want[i] {
-					t.Errorf("rel %d path ParallelSafe = %v, want the rel's flag %v", i, p.ParallelSafe, want[i])
-				}
-			}
-		}
+	}
 
-		// max_parallel_workers_per_gather = 0: parallelModeOK false, every rel
-		// cleared (planner.c:339).
-		off := prob.cp
-		off.maxParallelWorkersPerGather = 0
-		s2, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, off, 0, nil)
-		if err != nil {
-			t.Fatal(err)
+	// max_parallel_workers_per_gather = 0: parallelModeOK false, every rel
+	// cleared (planner.c:339).
+	off := prob.cp
+	off.maxParallelWorkersPerGather = 0
+	s2, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, off, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.setBaseRelConsiderParallel(nil)
+	if s2.parallelModeOK {
+		t.Fatal("parallelModeOK must be false at max_parallel_workers_per_gather = 0")
+	}
+	for i, rel := range s2.joinrels[1] {
+		if rel.ConsiderParallel {
+			t.Errorf("rel %d considers parallel with the GUC at 0", i)
 		}
-		s2.setBaseRelConsiderParallel(nil)
-		if s2.parallelModeOK {
-			t.Fatal("parallelModeOK must be false at max_parallel_workers_per_gather = 0")
-		}
-		for i, rel := range s2.joinrels[1] {
-			if rel.ConsiderParallel {
-				t.Errorf("rel %d considers parallel with the GUC at 0", i)
-			}
-		}
-	})
+	}
 }
 
 // (a) continued: build_join_rel's propagation (relnode.c:842) — both inputs
 // AND the join clauses.
 func TestJoinrelConsiderParallel_BothInputsAndClauses(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b"}
-		safeClause := rfjEq(names, 0, 1)
-		unsafeClause := &BinaryOp{Op: parser.OpEq,
-			Left:  &FuncCall{Name: "nextval", Args: []Expr{&ColumnRef{Name: "a0", Index: 0, SourceTableIdx: 0}}},
-			Right: &ColumnRef{Name: "b0", Index: rfjWidth, SourceTableIdx: 1}}
-		run := func(t *testing.T, tempB bool, conj []Expr, want bool) {
-			t.Helper()
-			prob := rfjProblem(names, []int64{1000, 1000}, conj)
-			if tempB {
-				prob.relInfos[1].table.Temp = true
-			}
-			s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.leafSpans)
-			s.setBaseRelConsiderParallel(nil)
-			s.builder = newJoinRelBuilder(s, nil)
-			joinrel, err := s.makeJoinRel(s.joinrels[1][0], s.joinrels[1][1])
-			if err != nil || joinrel == nil {
-				t.Fatalf("makeJoinRel: %v %v", joinrel, err)
-			}
-			if joinrel.ConsiderParallel != want {
-				t.Fatalf("joinrel.ConsiderParallel = %v, want %v", joinrel.ConsiderParallel, want)
-			}
-			// Every path of the join rel carries the same flag — the
-			// uniformity the serial-arm argument rests on (file header).
-			for _, p := range joinrel.Pathlist {
-				if p.ParallelSafe != want {
-					t.Fatalf("join path %v ParallelSafe = %v, want %v", p.Kind, p.ParallelSafe, want)
-				}
+	names := []string{"a", "b"}
+	safeClause := rfjEq(names, 0, 1)
+	unsafeClause := &BinaryOp{Op: parser.OpEq,
+		Left:  &FuncCall{Name: "nextval", Args: []Expr{&ColumnRef{Name: "a0", Index: 0, SourceTableIdx: 0}}},
+		Right: &ColumnRef{Name: "b0", Index: rfjWidth, SourceTableIdx: 1}}
+	run := func(t *testing.T, tempB bool, conj []Expr, want bool) {
+		t.Helper()
+		prob := rfjProblem(names, []int64{1000, 1000}, conj)
+		if tempB {
+			prob.relInfos[1].table.Temp = true
+		}
+		s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.clauses = buildRestrictInfos(prob.conjuncts, 0, prob.leafSpans)
+		s.setBaseRelConsiderParallel(nil)
+		s.builder = newJoinRelBuilder(s, nil)
+		joinrel, err := s.makeJoinRel(s.joinrels[1][0], s.joinrels[1][1])
+		if err != nil || joinrel == nil {
+			t.Fatalf("makeJoinRel: %v %v", joinrel, err)
+		}
+		if joinrel.ConsiderParallel != want {
+			t.Fatalf("joinrel.ConsiderParallel = %v, want %v", joinrel.ConsiderParallel, want)
+		}
+		// Every path of the join rel carries the same flag — the
+		// uniformity the serial-arm argument rests on (file header).
+		for _, p := range joinrel.Pathlist {
+			if p.ParallelSafe != want {
+				t.Fatalf("join path %v ParallelSafe = %v, want %v", p.Kind, p.ParallelSafe, want)
 			}
 		}
-		t.Run("both safe, safe clause", func(t *testing.T) { run(t, false, []Expr{safeClause}, true) })
-		t.Run("one input temp", func(t *testing.T) { run(t, true, []Expr{safeClause}, false) })
-		t.Run("restricted join clause", func(t *testing.T) { run(t, false, []Expr{unsafeClause}, false) })
-	})
+	}
+	t.Run("both safe, safe clause", func(t *testing.T) { run(t, false, []Expr{safeClause}, true) })
+	t.Run("one input temp", func(t *testing.T) { run(t, true, []Expr{safeClause}, false) })
+	t.Run("restricted join clause", func(t *testing.T) { run(t, false, []Expr{unsafeClause}, false) })
 }
 
 // (b) compute_parallel_worker: the path-model twin answers exactly what the
@@ -300,153 +285,134 @@ func cpBigProblem(names []string) *joinlistProblem {
 // only, sized by compute_parallel_worker and priced by cost_seqscan's
 // parallel arm.
 func TestCreatePlainPartialPaths_LargeRelGetsAPartialSeqScanDividedByTheDivisor(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-		prob := cpBigProblem(names)
-		s := cpSearch(t, prob)
-		cp := prob.cp
-		for i, rel := range s.joinrels[1] {
-			tbl := prob.relInfos[i].table
-			pages := int64(tbl.Stats.Pages)
-			wantWorkers := computeParallelWorkerForRel(cp, pages, 0)
-			if wantWorkers == 0 {
-				if len(rel.PartialPathlist) != 0 {
-					t.Errorf("%s: %d pages is below min_parallel_table_scan_size but has %d partial paths", tbl.Name, pages, len(rel.PartialPathlist))
-				}
-				continue
-			}
-			if len(rel.PartialPathlist) != 1 {
-				t.Fatalf("%s: want exactly one partial path, got %d", tbl.Name, len(rel.PartialPathlist))
-			}
-			pp := rel.PartialPathlist[0]
-			if pp.Kind != PathSeqScan || pp.ParallelWorkers != wantWorkers || !pp.ParallelSafe {
-				t.Fatalf("%s: partial path = kind %v workers %d safe %v, want seq scan / %d / true", tbl.Name, pp.Kind, pp.ParallelWorkers, pp.ParallelSafe, wantWorkers)
-			}
-			d := getParallelDivisor(wantWorkers, cp.parallelLeaderParticipation)
-			// The same inputs buildInitialRels priced the serial scan on
-			// (see addBaseRelPartialPaths / baseSeqScanCostInputs):
-			// `baserel->pages` and `baserel->tuples`, NOT the
-			// post-restriction row count — the split that gives the Gather
-			// a crossover (ledger
-			// c19-baserel-scan-priced-on-output-rows). This fixture has no
-			// local filter, so the qual term is zero; the pages are the
-			// relation's real relpages rather than rows × width.
-			baseTuples := float64(prob.relInfos[i].baseRows)
-			disk := cp.seqPageCost * float64(baseRelPages(tbl, baseTuples))
-			cpu := cp.cpuTupleCost * baseTuples
-			wantTotal := disk + cpu/d
-			if diff := pp.Cost.Total - wantTotal; diff > 1e-6 || diff < -1e-6 {
-				t.Errorf("%s: partial total %.4f, want disk %.2f + cpu %.2f / divisor %.2f = %.4f", tbl.Name, pp.Cost.Total, disk, cpu, d, wantTotal)
-			}
-			if pp.Cost.Startup != 0 {
-				t.Errorf("%s: a seq scan has zero startup, got %v", tbl.Name, pp.Cost.Startup)
-			}
-			if want := clampRowEst(rel.Rows / d); pp.Rows != want {
-				t.Errorf("%s: partial rows %v, want clamp_row_est(%v / %v) = %v", tbl.Name, pp.Rows, rel.Rows, d, want)
-			}
-			// The serial scan is NOT divided: the partial path's saving is
-			// exactly the CPU share the workers take.
-			serial := rel.Pathlist[0]
-			if serial.Kind != PathPrebuilt || serial.ParallelWorkers != 0 {
-				t.Fatalf("%s: Pathlist[0] should be the serial prebuilt scan, got %v/%d", tbl.Name, serial.Kind, serial.ParallelWorkers)
-			}
-			if !(pp.Cost.Total < serial.Cost.Total) {
-				t.Errorf("%s: partial %v must be cheaper than serial %v", tbl.Name, pp.Cost.Total, serial.Cost.Total)
-			}
-		}
-		// A partial seq scan is never generated on a rel that does not
-		// consider parallel, whatever its size.
-		prob2 := cpBigProblem(names)
-		prob2.relInfos[0].table.Temp = true
-		s2 := cpSearch(t, prob2)
-		if n := len(s2.joinrels[1][0].PartialPathlist); n != 0 {
-			t.Errorf("temp relation has %d partial paths, want 0", n)
-		}
-		// And never once the GUC is 0.
-		prob3 := cpBigProblem(names)
-		prob3.cp.maxParallelWorkersPerGather = 0
-		s3 := cpSearch(t, prob3)
-		for i, rel := range s3.joinrels[1] {
+	names := []string{"a", "b", "c"}
+	prob := cpBigProblem(names)
+	s := cpSearch(t, prob)
+	cp := prob.cp
+	for i, rel := range s.joinrels[1] {
+		tbl := prob.relInfos[i].table
+		pages := int64(tbl.Stats.Pages)
+		wantWorkers := computeParallelWorkerForRel(cp, pages, 0)
+		if wantWorkers == 0 {
 			if len(rel.PartialPathlist) != 0 {
-				t.Errorf("rel %d has partial paths at max_parallel_workers_per_gather = 0", i)
+				t.Errorf("%s: %d pages is below min_parallel_table_scan_size but has %d partial paths", tbl.Name, pages, len(rel.PartialPathlist))
 			}
+			continue
 		}
-	})
+		if len(rel.PartialPathlist) != 1 {
+			t.Fatalf("%s: want exactly one partial path, got %d", tbl.Name, len(rel.PartialPathlist))
+		}
+		pp := rel.PartialPathlist[0]
+		if pp.Kind != PathSeqScan || pp.ParallelWorkers != wantWorkers || !pp.ParallelSafe {
+			t.Fatalf("%s: partial path = kind %v workers %d safe %v, want seq scan / %d / true", tbl.Name, pp.Kind, pp.ParallelWorkers, pp.ParallelSafe, wantWorkers)
+		}
+		d := getParallelDivisor(wantWorkers, cp.parallelLeaderParticipation)
+		// The same inputs buildInitialRels priced the serial scan on
+		// (see addBaseRelPartialPaths / baseSeqScanCostInputs):
+		// `baserel->pages` and `baserel->tuples`, NOT the
+		// post-restriction row count — the split that gives the Gather
+		// a crossover (ledger
+		// c19-baserel-scan-priced-on-output-rows). This fixture has no
+		// local filter, so the qual term is zero; the pages are the
+		// relation's real relpages rather than rows × width.
+		baseTuples := float64(prob.relInfos[i].baseRows)
+		disk := cp.seqPageCost * float64(baseRelPages(tbl, baseTuples))
+		cpu := cp.cpuTupleCost * baseTuples
+		wantTotal := disk + cpu/d
+		if diff := pp.Cost.Total - wantTotal; diff > 1e-6 || diff < -1e-6 {
+			t.Errorf("%s: partial total %.4f, want disk %.2f + cpu %.2f / divisor %.2f = %.4f", tbl.Name, pp.Cost.Total, disk, cpu, d, wantTotal)
+		}
+		if pp.Cost.Startup != 0 {
+			t.Errorf("%s: a seq scan has zero startup, got %v", tbl.Name, pp.Cost.Startup)
+		}
+		if want := clampRowEst(rel.Rows / d); pp.Rows != want {
+			t.Errorf("%s: partial rows %v, want clamp_row_est(%v / %v) = %v", tbl.Name, pp.Rows, rel.Rows, d, want)
+		}
+		// The serial scan is NOT divided: the partial path's saving is
+		// exactly the CPU share the workers take.
+		serial := rel.Pathlist[0]
+		if serial.Kind != PathPrebuilt || serial.ParallelWorkers != 0 {
+			t.Fatalf("%s: Pathlist[0] should be the serial prebuilt scan, got %v/%d", tbl.Name, serial.Kind, serial.ParallelWorkers)
+		}
+		if !(pp.Cost.Total < serial.Cost.Total) {
+			t.Errorf("%s: partial %v must be cheaper than serial %v", tbl.Name, pp.Cost.Total, serial.Cost.Total)
+		}
+	}
+	// A partial seq scan is never generated on a rel that does not
+	// consider parallel, whatever its size.
+	prob2 := cpBigProblem(names)
+	prob2.relInfos[0].table.Temp = true
+	s2 := cpSearch(t, prob2)
+	if n := len(s2.joinrels[1][0].PartialPathlist); n != 0 {
+		t.Errorf("temp relation has %d partial paths, want 0", n)
+	}
+	// And never once the GUC is 0.
+	prob3 := cpBigProblem(names)
+	prob3.cp.maxParallelWorkersPerGather = 0
+	s3 := cpSearch(t, prob3)
+	for i, rel := range s3.joinrels[1] {
+		if len(rel.PartialPathlist) != 0 {
+			t.Errorf("rel %d has partial paths at max_parallel_workers_per_gather = 0", i)
+		}
+	}
 }
 
 // (c) NO partial path is chosen as the final path, and the serial control arm
 // is unchanged: the chosen tree is the same with the parallel GUC at its
 // default and at 0, and no path in the chosen tree carries workers.
 func TestPartialPathIsNeverTheFinalPath(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-		prob := cpBigProblem(names)
-		s := cpSearch(t, prob)
-		partial := map[*Path]bool{}
-		nPartial := 0
-		for _, rel := range s.joinrels[1] {
-			for _, p := range rel.PartialPathlist {
-				partial[p] = true
-				nPartial++
-			}
+	names := []string{"a", "b", "c"}
+	prob := cpBigProblem(names)
+	s := cpSearch(t, prob)
+	partial := map[*Path]bool{}
+	nPartial := 0
+	for _, rel := range s.joinrels[1] {
+		for _, p := range rel.PartialPathlist {
+			partial[p] = true
+			nPartial++
 		}
-		if nPartial == 0 {
-			t.Fatal("fixture produced no partial paths; the pin would be vacuous")
+	}
+	if nPartial == 0 {
+		t.Fatal("fixture produced no partial paths; the pin would be vacuous")
+	}
+	final, err := s.finalPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var walk func(*Path)
+	walk = func(p *Path) {
+		if p == nil {
+			return
 		}
-		final, err := s.finalPath()
-		if err != nil {
-			t.Fatal(err)
+		if partial[p] {
+			t.Fatalf("a partial path (%v, %d workers) reached the chosen tree", p.Kind, p.ParallelWorkers)
 		}
-		var walk func(*Path)
-		walk = func(p *Path) {
-			if p == nil {
-				return
-			}
-			if partial[p] {
-				t.Fatalf("a partial path (%v, %d workers) reached the chosen tree", p.Kind, p.ParallelWorkers)
-			}
-			if p.ParallelWorkers != 0 {
-				t.Fatalf("chosen tree carries a path with %d workers", p.ParallelWorkers)
-			}
-			for _, c := range p.Children {
-				walk(c)
-			}
+		if p.ParallelWorkers != 0 {
+			t.Fatalf("chosen tree carries a path with %d workers", p.ParallelWorkers)
 		}
-		walk(final)
-		// M0140-0003 re-baseline: this fixture's original assumption — "join
-		// rels have no partial paths yet, C-19d/e produce them" — held only
-		// because `GOOPG_GATHER_PATHS` defaulted `off`. `addPartialHashJoinPath`
-		// (C-19f, joinpathsparallel.go) is a SEPARATE producer that is not
-		// gated behind any later pass; it fires during the ordinary DP search
-		// the moment the flag admits partial paths at all, so a join rel
-		// legitimately carries them under `top`/`all` (M0140-0002's
-		// adjudication). The property that actually matters — no partial path
-		// ever reaches the CHOSEN tree — is `walk(final)` above and is
-		// unconditional; this second loop only pins the join-rel-population
-		// timing, which is mode-dependent, so it is scoped to the `off` arm.
-		if gatherPathsMode == gatherPathsOff {
-			for lev := 2; lev < len(s.joinrels); lev++ {
-				for _, rel := range s.joinrels[lev] {
-					if len(rel.PartialPathlist) != 0 {
-						t.Fatalf("join rel %#x has partial paths before C-19d", uint32(rel.Relids))
-					}
-				}
-			}
+		for _, c := range p.Children {
+			walk(c)
 		}
+	}
+	walk(final)
+	// The property that matters — no partial path ever reaches the CHOSEN
+	// tree — is `walk(final)` above. Join rels legitimately carry partial
+	// paths (C-19f's producers run in the ordinary DP search); the check that
+	// they had none before C-19d was scoped to the GOOPG_GATHER_PATHS `off`
+	// arm, retired at M0147-0046.
 
-		// The whole production seam, both arms: identical trees.
-		on, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
-		if err != nil {
-			t.Fatal(err)
-		}
-		offProb := cpBigProblem(names)
-		offProb.cp.maxParallelWorkersPerGather = 0
-		off, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if a, b := planShapeString(on), planShapeString(off); a != b {
-			t.Fatalf("serial control arm moved:\nparallel on:\n%s\nparallel off:\n%s", a, b)
-		}
-	})
+	// The whole production seam, both arms: identical trees.
+	on, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), cpBigProblem(names))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offProb := cpBigProblem(names)
+	offProb.cp.maxParallelWorkersPerGather = 0
+	off, _, err := planJoinlistSearch(deconstructRangeVars(len(names)), offProb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := planShapeString(on), planShapeString(off); a != b {
+		t.Fatalf("serial control arm moved:\nparallel on:\n%s\nparallel off:\n%s", a, b)
+	}
 }

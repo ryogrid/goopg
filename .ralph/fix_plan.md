@@ -236,23 +236,82 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (M0119 → M0122-0012 → **M0147** → the rest of M0122 → M0131 → M0134 →
+    (**M0122-0012** → M0119 → **M0147** → the rest of M0122 → M0131 → M0134 →
     M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
-    **M0122-0012 outranks every M0147 task** (owner decision 2026-10-21) —
-    "M0122-0012" means its inline slices and any task with
-    `Parent: M0122-0012`. It is a living perf task, so it yields to M0147
-    only when (a) its entry and the baton name no runnable next slice (or
-    the named slice is blocked), or (b) its last TWO landed slices each
-    moved their own measured target (the target named in the slice's own
-    task entry before it landed) by less than 3% (diminishing returns).
-    Record the yield as the Skip-rationale token
-    `M0122-0012(yield: <a|b + evidence>)`; do not invent an M0122-0012 slice
-    to keep the priority, and re-check M0122-0012 first after each M0147
-    task closes. M0147 descendants inherit this rank — the S7
-    correctness-only carve-out does not demote them. **M0147-0000 is a
-    channel, not stock** (like M0146-0014): never select it; take its first
-    open child in file order (`M0147-0000(channel)`).
+    **M0122-0012 return-first rule (owner decision 2026-10-27; replaces the
+    2026-10-21 yield rule).** "M0122-0012" means its inline slices and any
+    task with `Parent: M0122-0012`. Until it is EXHAUSTED (below), after
+    M-NIGHTLY open items item 10 starts with M0122-0012: whenever any other
+    item-10 task (not items 0–9 or owner-placed P0 tasks) closes, parks or
+    blocks, or the one-task yield below ends, the next selection returns to
+    M0122-0012.
+    - **Bar:** an attempt must move its own pre-named target by at least 3%.
+      `Target:` — written in the entry BEFORE the attempt is measured — names
+      exactly ONE query and ONE metric, and the query must be in the newest
+      G2 top 10 by absolute excess. Metric: instructions:u; bytes only for
+      an allocation slice, and then instructions:u and cycles must be no
+      worse than +1%; wall time only on an idle host.
+    - **One-task yield:** when two consecutive M0122-0012 attempts since the
+      last return (landed, or measured and dropped) each missed the bar,
+      select exactly ONE other item-10 task in the order above (skipping
+      M0122-0012) and work it for one task — or one landed slice/commit of
+      a multi-loop task — then return. If no other item-10 task is
+      selectable, skip the yield. Record it in the entry
+      (`Yield <date>: <the two attempts + %>; worked <id>`); the miss counter
+      resets on return. A missing candidate is NOT a yield reason — generate.
+    - **On return, choose** the top eligible entry of the entry's
+      **Candidate pool**. Ineligible: everything on the entry's **Below-bar
+      list** — in particular the attempts that triggered the yield. The key
+      is the mechanism (code site + PG function) on the same target query:
+      the same mechanism on a different G2 query stays eligible.
+    - **No eligible candidate → generate** (owner-delegated: S8's "do not
+      invent work" does not apply; one pass per loop). Tools:
+      `analysis/m0122/m0122-0012/tools/` (committed copies of the loop's
+      census scripts).
+      - G1 Census: warm per-query timings with the same plan (parity MATCH)
+        on private clones — TPC-H SF1 and TPC-DS SF0.25 against **release**
+        PG (`bench/pg-release`, `analysis/timing-after-planprity-match/`
+        `pg-release-scripts/`; its numbers change only on a corpus or query
+        change), never the cassert reference clusters. Split planning from
+        execution and record allocation (`ds-planinstr.sh`, `ds-alloc.sh`).
+        Commit the table under `analysis/m0122/m0122-0012/census-<date>/`; a
+        committed census at most 3 days old may be reused, and each
+        attempt's own A/B is always fresh.
+      - G2 Rank queries by absolute excess time (goopg − PG), then ratio.
+      - G3 Profile the top three (perf record -g / pprof, plus the row-count
+        census for algorithmic gaps). Attribute the excess to symbols and
+        map each to a PG executor mechanism (cite the PG function) or to a
+        goopg-only overhead (allocation, clone/copy, deform, interpreted
+        expression, per-row re-resolution, planning).
+      - G4 A candidate qualifies when it is perf-only (values and plans
+        identical — plan-visible ideas go to the parity tasks), one
+        mechanism sized for one loop, not on the Below-bar list, and its
+        attributed share predicts at least 3% on a G2 top-10 query.
+        Design-sized levers (the ledgered structural ones) qualify through
+        their first slice-sized step, with a design doc.
+      - G5 Add every qualifying candidate to the pool (target query,
+        baseline, predicted %, PG citation), ranked by predicted gain; take
+        the top one and write its `Target:` before coding. Candidates are
+        pool bullets and inline slices, never `- [ ]` child tasks.
+    - **Rotation, not exhaustion:** three consecutive misses in one
+      mechanism family put that family on the Below-bar list and send G2 to
+      the next query.
+    - **EXHAUSTED** only when a fresh G1–G3 pass attributes the excess of
+      every G2 top-10 query to Below-bar mechanisms, or no query exceeds
+      release PG by at least 10% and 50 ms. Write
+      `EXHAUSTED at <sha> <date>` with the census path in the entry; item 10
+      then proceeds in the order above without M0122-0012. It re-opens when
+      a later G1–G3 pass — at most once per 7 days, run when item 10 is
+      reached — finds a qualifying candidate, or by owner decision.
+    - Baton: `.ralph/working_set.md` carries an `M0122-0012:` line
+      (PROMPT.md). Skip-rationale tokens: `M0122-0012(yield-b: <two attempts
+      + %>)` during the one-task yield, `M0122-0012(exhausted@<sha>)`
+      afterwards.
+    M0147 descendants inherit item-10 rank — the S7 correctness-only
+    carve-out does not demote them. **M0147-0000 is a channel, not stock**
+    (like M0146-0014): never select it; take its first open child in file
+    order (`M0147-0000(channel)`).
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
 the start of its own line: `Kind: recon|impl`, `Parent: <task-id|none>`, and on
@@ -421,8 +480,9 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   `## M0147` at the end of this file), per AGENT.md C5 (promote or delete —
   HOLD is not an outcome). Analysis and review:
   `/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`.
-- Rank: item 10 — M0122-0012 first (with the yield rule there), then M0147,
-  then the rest of M0122.
+- Rank: item 10 — superseded 2026-10-27 by the M0122-0012 return-first
+  rule (item 10); other item-10 work runs during its one-task yields and
+  after its exhaustion.
 - Order inside M0147: phase 1 goopg-private retirements (0010–0017), then
   phase 0 PG-port promotions (0020–0023; R3 — never discard a PG arm
   without an owner `[!]`), then phase 2 (0030 recon files the default-ON
@@ -438,6 +498,20 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   nested-loop estimates) may already hold now that SF0.25/SF1 are 99/99 —
   the loop may re-measure it and, if PG's plans match at both scales, flip
   M0146-0010a `[!]`→`[ ]` (owner authorisation recorded here).
+
+OWNER DECISIONS 2026-10-27 — M0122-0012 return-first:
+- M0122-0012 now heads item 10 (after M-NIGHTLY open items) and is
+  returned to after every other item-10 task until EXHAUSTED; the
+  2026-10-21 yield rule is replaced. Its rule (a) — "no runnable slice" —
+  yielded on 2026-10-24 after slice 92 although ledgered candidates
+  remained. The procedure (bar, one-task yield, Below-bar exclusion,
+  generation G1–G5, rotation, exhaustion) is in item 10.
+- The entry gained an owner-seeded Candidate pool and Below-bar list
+  (2026-10-27); the loop maintains both. The census scripts it used from
+  `tmp/` are committed under `analysis/m0122/m0122-0012/tools/`.
+- Other item-10 work (M0119, M0147, the rest of M0122) runs during
+  M0122-0012's one-task yields — the next selectable task in item-10
+  order — and after its exhaustion.
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -805,6 +879,24 @@ heuristic stays live.)
     first\.
   - Expected instrument: the repro identical to `analysis/p0e11/pg18\.out`; Q12/Q20/Q98 outputs identical to
     :65438 tpcds025\.
+
+- [ ] **P0\-E13 — LIKE's `\_` matches one BYTE, not one character, under UTF\-8**
+  \(filed 2026\-10\-27 by the loop, M0122\-0012 C17 read of matchSQLLike; S2 — wrong results\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro values differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-27 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Repro `analysis/p0e13/like\-underscore\-multibyte\-repro\.sql`; PG 18\.3 expected
+    > `analysis/p0e13/pg18\-expected\.out` \(t f t t\); goopg `analysis/p0e13/goopg\-32e9a7306\.out` \(f t f f\)\.
+  - Symptom: `'é' LIKE '\_'` is false and `'é' LIKE '\_\_'` true; `'aéb' LIKE 'a\_b'` false; ILIKE likewise\.
+  - Cause \(read\): `matchSQLLikeWalk` \(internal/executor/expr\.go\) advances one byte for `\_` \(and compares the
+    escaped byte bytewise\)\. PG's MatchText \(src/backend/utils/adt/like\_match\.c\) advances by NextChar
+    \(pg\_mblen\) for `\_` under a multibyte encoding \(UTF8MatchText\)\. Pre\-dates C17: the `%`\-only fast path
+    declines patterns containing `\_`\.
+  - First step: in the walk, `\_` consumes one UTF\-8 rune \(utf8\.DecodeRuneInString width\) and the `%` backtrack
+    restarts on rune boundaries; ILIKE's strings\.ToLower path stays\. Check the evalFast/vectorised LIKE siblings
+    use the same matcher\.
+  - Expected instrument: the repro identical to `analysis/p0e13/pg18\-expected\.out`\.
 
 - [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
   \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
@@ -1615,6 +1707,172 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Rank: below item 10 under the S7 carve\-out \(correctness/fidelity, no plan instrument\) unless the owner places it\.
   - First step: the free list → FSM move \(the only residual with an observable cost: index bloat across backends\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
+  - **Candidate pool (owner-seeded 2026-10-27 from the ledger and the slices' Open/Next/Left notes; the loop
+    maintains it and re-ranks it by predicted gain after each G1–G3 pass — return-first rule, banner item 10):**
+    - C1 Numeric hash-join and GROUP BY keys hashed as canonical strings (Q13 `mapaccess2_faststr` ~5%; HammerDB
+      TPC-H keys are numeric) — ledger :3169, :3171.
+    - C2 Q14/Q23 per-probe constant factor on `store_sales_pkey` probes: leafScanStart's generic comparator
+      (~12% of Q14, slice 80 "Left") and the join-aware read set for inner index scans (ledger :3210).
+    - C3 Q67 sort comparator memory access over eight `char(n)` keys (part 9, the merge-sort drop).
+    - C4 Q95 remaining excess (part 9 :205-211): the consumer's `retainBuildRow` copy and 10 M CTE rows through
+      two semi joins; slice 92 did not move end-to-end time.
+    - C5 Q78 sort rows plus merge-join output bytes after slice 88's −48% — re-measure first.
+    - C6 Lead-conjunct prefilter for a qual that reads the last column (slice 86 "Open").
+    - C7 Lazy deform before a selective hash probe, plus the Parallel Hash empty exit (ledger :3207, slice 72 "Next").
+    - C8 Nested-loop pair copy and the per-row index-only-scan output row (ledger :3186, :3187, :3196).
+    - C9 Borrow through merge join, Sort and Gather Merge (ledger :3172, :3177).
+    - C10 Hashed SAOP for numeric/date (ledger :3198); other hashed DISTINCT sorts (ledger :3204).
+    - C11 Lazy window evaluation (ledger :3208); Q51 still 2.7x (slice 62); PG inverse-transition moving aggregate.
+    - C12 Multi-key / grouping-set aggregate int lane plus the NULL group (ledger :3173);
+      `groupBoundsFixed` ~28 MB/run (slice 75).
+    - C13 Flat expression step program, no recursive 48-byte Datum return (ledger :3176, :3181) — design-sized;
+      needs a slice-sized first step (the evalFastLeaf proxy is on the Below-bar list).
+    - C14 VirtualSlot/PackedSlot arms in fastOperandPtr (ledger :3209); set-valued read set through joins
+      (ledger :3179 — re-measure on a release build before ranking).
+    - C15 Planning-time items: pathkey canonicalisation (ledger :3182, :3192); sublink lowering for
+      WindowAgg/SetOp/SRF (ledger :3212a).
+    - C16 \(added 2026\-10\-27 from census\-20261027, ranked FIRST by predicted gain\) TPC\-DS Q64 planning: goopg
+      636 ms vs release PG 51\.9 ms per plan \(~584 ms of Q64's 846 ms excess, ~57 % of its goopg time\)\. All of it
+      is GEQO's ~500 tours \(gimmeTree → makeJoinRel\); PG runs the same tour count, so the gap is per\-joinrel cost\.
+      Profile \(`tmp/q64plan.pprof`, 25 s\): addPaths 59 %, mallocgc 26 %, joinrelNarrowedWidths 12\.5 % \(its pure
+      inputs relNarrowedColumns 6\.8 % \+ attrNeededAbove 3\.7 %, recomputed per joinrel per tour; PG reads
+      attr\_needed computed once per base rel — build\_joinrel\_tlist, relnode\.c\), innerRelProvenUnique 7\.9 %
+      \(provableKeys/keysCovering per call; PG caches innerrel\_is\_unique results in unique\_for\_rels /
+      non\_unique\_for\_rels, analyzejoins\.c\), pathkey usefulness 12\.7 %\. Steps: C16a memoise the narrowed\-width
+      inputs; C16b cache inner\-unique proofs; then re\-profile\.
+    - C17 \(added 2026\-10\-27 loop \#196, G3\) TPC\-H Q13 `o\_comment NOT LIKE '%special%requests%'`:
+      `matchSQLLike` 7 % of Q13; a `%lit%lit%` pattern is a substring search \(PG's MatchText over bytes\)\.
+    - C18 \(added 2026\-10\-27 loop \#196, G3, ranked first\) B\-tree binary\-search probes re\-derive per\-page
+      invariants: `PageGetItemRawAllowDeadNoCopy` recomputes `PageLinePointerCount` and `pgDataSlot` reads the
+      special space on EVERY probe of `leafScanStart` / `findChildBlockDirect` \(TPC\-DS Q72: PageLinePointerCount
+      \+ Header ~5 % of samples; leafScanStart 27\.6 %, findChildBlockDirect 19\.8 %\); PG's \_bt\_binsrch reads
+      PageGetMaxOffsetNumber / P\_FIRSTDATAKEY once per page\. Q14/Q23 share the path \(btree search ~15–18 %\)\.
+      - G3 notes 2026\-10\-27: C1's premise is stale \(Q13 keys already on int64 maps; no mapaccess2\_faststr\)\. C2
+        \(Q14 comparator\) predicts ~1–1\.5 %: compareFixedPrefix already a fixed\-width fast path; pgTInfo's 10 % in
+        Q72 is the first\-touch cache miss of each probed tuple \(PG pays it too\), not key re\-decoding\.
+    - C19 \(added 2026\-10\-27 loop \#198, G3 on TPC\-H Q17\) data\-page checksum verification on buffer reads:
+      `pageChecksumBlock` 12\.25 % of Q17 \(per\-word bounds check \+ byte assembly \+ a pd\_checksum compare inside
+      the 32\-lane loop\)\. Both goopg clones and the release PG clusters have data checksums on \(version 1\); PG's
+      pg\_checksum\_block \(checksum\_impl\.h\) is written for compiler vectorisation\. Q14's index\-scan string
+      copies \(slicebytetostring ~3 %\) noted, not taken \(borrow/arena lifetime risk, P0\-E12 class\)\.
+    - Not M0122-0012 candidates (plan-visible → parity tasks): hashed SubPlan for EXISTS…OR EXISTS (slice 65);
+      Gather projection below the Gather (ledger :3190).
+  - **Below-bar list (ineligible on return for the same target query — key: mechanism = code site + PG function;
+    owner-seeded 2026-10-27; the loop appends every attempt that misses the 3% bar, landed or dropped):**
+    - Slice 35 projection under an aggregate (Q14 −2.5%); slice 61 cached-root descents (Q87 −1.4%; Q72 −2.1%);
+      slice 85 Gather worker VirtualSlot (Q10 −0.4% instructions).
+    - Dropped: evalFastLeaf proxy (reverted, Q6 slower; ledger :3181); operand leaf copy (loop #40); slice 8
+      verdict pre-pass (slower); slice 9 constant divisor; `MaterializedSlot.owned` elision (Q97 slower); per-Context
+      `pgIndexKeyColumns` cache (flat — relevant to C2); attcacheoff cached-offset deform (slice 72, flat); slice 72's
+      conditional NULL write and the skip-arm conditional NULL store (+4.7%); pdqsort (Q87 +8%) and
+      `SortStableFunc`; buffered stable merge sort (Q67 −3% instructions, +2.6% cycles); compact sort-to-GM-queue
+      (slice 89); NL stream outer copy (does not fire in Q10).
+    - Landed below the bar: C16g content\-keyed truncate\_useless\_pathkeys memo \(slice 99, Q64 planning
+      instructions −2\.96 %, `pathkeys\_useful\.go` truncMemo vs PG build\_join\_pathkeys\)\.
+    - Dropped: C16h merge candidates priced before their Sort paths are built \(`tryMergeJoinPath` vs PG
+      try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
+    - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
+      `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
+  - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
+    - Yield 2026\-10\-27 \(loop \#194\): C16g −2\.96 % \(slice 99, landed\) and C16h −0\.5 % \(dropped\) both missed the
+      bar on Q64 planning; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
+      M0119\-0006, M0147 holds no selectable child, so the first is M0122\-0013 \(ledgered resume point: a standby's
+      recovery checkpoint advancing pg\_control like PG's CreateRestartPoint\)\. Then return; the miss counter
+      resets\.
+      - Worked: M0122\-0013 standby restartpoint, landed 2026\-10\-27 \(loop \#195\)\. Yield over — the next item\-10
+        selection returns to M0122\-0012 with the miss counter at 0\.
+  - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
+    - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
+      Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
+    - **C18 LANDED \(slice 100\)**: `pageProbe` \+ `PageGetItemRawAllowDeadNoCopyN` — leafScanStart and
+      findChildBlockDirect read the line\-pointer count and P\_FIRSTDATAKEY once per page\. Q72 26\.999/26\.995 →
+      26\.170/26\.171 Ginstr/q \(**−3\.06 %, meets the bar**\); plans identical\. Misses 0\. Next on return: C17 \(Q13
+      LIKE substring\) or a fresh G3 on Q14/Q23 \(decodeRowRangeInfo 13 %/9 %\)\. Design: part 9 §Slice 100\.
+    - **Target \(C17, loop \#197\)**: TPC\-H SF1 **Q13**, metric **instructions:u per query** \(`tools/h\-instr\.sh`
+      on tmp/q17\-clone, 5 runs\)\. Mechanism: a `%`\-only LIKE pattern \(no `\_`, no escape\) matched as prefix /
+      ordered substrings / suffix instead of the backtracking walk\. Bar: −3 %\.
+    - **C17 LANDED \(slice 101\)**: `matchLikeSegments` \(strings\.Index\) before the walk for `%`\-only patterns\. Q13
+      13\.815/13\.815 → 12\.226/12\.226 Ginstr/q \(**−11\.5 %, meets the bar**\); Q13 values identical\. Misses 0\.
+      Discovery: P0\-E13 \(LIKE `\_` bytewise under UTF\-8; S2, filed\)\. Next on return: a fresh G3 on Q14/Q23/Q17
+      \(decodeRowRangeInfo 13 %/9 %\) — the pool's remaining entries need re\-measurement\. Design: part 9 §101\.
+    - **Target \(C19, loop \#198\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      5 runs\)\. Mechanism: pg\_checksum\_block over the page as 32\-lane uint32 rows without per\-word bounds checks
+      or the in\-loop pd\_checksum test\. Bar: −3 %\.
+    - **C19 LANDED \(slice 102\)**: `pageChecksumBlockRows` \(in\-place \[32\]uint32 rows, pd\_checksum masked once\);
+      portable form kept as fallback \+ oracle\. Q17 32\.104/32\.082 → 27\.848/27\.862 Ginstr/q \(**−13\.2 %, meets
+      the bar**\); micro 1058 vs 2473 ns/page; stored checksums unchanged\. Misses 0\. Next on return: re\-profile
+      Q17 \(decodeRowRangeInfo 23 %, NumericInt64FromStoredPayload 9 %\) or Q18\. Design: part 10 §102\.
+    - C20 \(added 2026\-10\-27 loop \#199, G3 on Q17/Q18 after C19\): `NumericInt64FromStoredPayload` 9\.35 % of Q17,
+      7\.3 % of Q18 \(lineitem's NUMERIC columns, HammerDB\); a third of it is the goopg\-only legacy\-text probe
+      \(`numericPayloadIsLegacyText`\), the rest 128\-bit accumulation for 1–2 base\-10000 digits\.
+    - **Target \(C20, loop \#199\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Mechanism: a short\-form NumericData fast path — reject the legacy\-text probe from the header bytes
+      \(byte 1 carries NUMERIC\_SHORT's 0x80; byte 0 ASCII non\-space\), accumulate ≤ 4 digits in uint64\. Bar: −3 %\.
+      - Not attempted: the line profile puts most of the legacy\-text probe in call overhead \+ the payload's first
+        touch \(paid by the decode anyway\); predicted ≈1–2 %, below the bar\. Superseded by C21\.
+    - C21 \(added loop \#199\): Q17's SubPlan, Aggregate\(avg\) → Bitmap Heap Scan on lineitem, clones every fetched
+      row \(`bitmapHeapScanOp\.emitRow` → `cloneRowOwned`, 8\.1 % of Q17 \+ its GC\) though the aggregate
+      provably keeps nothing \(aggregateBorrowsScanRows\): `markScanBorrowChain` hands the borrow only to seq scans\.
+      PG's bitmap heap scan stores a buffer tuple in the slot \(ExecStoreBufferHeapTuple\)\.
+    - **Target \(C21, loop \#199\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Bar: −3 %\.
+    - **C21 LANDED BELOW THE BAR \(slice 103\)**: `markScanBorrowChain` hands the borrow to `bitmapHeapScanOp`;
+      `emitRow` yields scanRow when no ctid column is emitted\. Q17 27\.860/27\.877 → 27\.299/27\.289 Ginstr/q =
+      **−2\.06 %, misses the 3 % bar** \(the 8 % profile share was mostly allocation/GC cycles, which instructions do
+      not count\); values and plans identical; Below\-bar list updated\. **Miss counter 1\.** Design: part 10 §103\.
+  - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
+    \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
+    - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
+      \(`tools/ds\-planinstr\.sh`, plan\-only EXPLAIN with a per\-run work\_mem change; planning is 636 of Q64's
+      1019 ms sweep time, and repeated runs of identical text skip planning via the plan cache, so whole\-query
+      instructions would not see it\)\. Bar: −3 %\.
+    - **C16a LANDED \(slice 93\)**: `searchCtx` memoises `relNarrowedColumns` per member rel and `attrNeededAbove`
+      per relids \(reset on a clause\-list change\)\. Q64 6\.496/6\.490 → 6\.061/6\.052 Ginstr/plan \(**−6\.7 %, meets
+      the bar**\); sweep Q64 971 ms vs census median 1019 ms; plans identical \(sf025 99/99 same, fire\-set no
+      fires, TPC\-H census 22/22\)\. Miss counter 0\. Next on return: C16b \(cache inner\-unique proofs,
+      innerrel\_is\_unique's unique\_for\_rels\), same Target query; re\-profile first\. Design:
+      part 9 §Slice 93\.
+    - **C16b LANDED \(slice 94, loop \#188\)**: `searchCtx.innerUniqueMemo` memoises innerRelProvenUnique per
+      \(outer relids, inner relids, skipNonKeys, key set\), hits verified element by element\. Q64 6\.052/6\.055 →
+      5\.678/5\.679 Ginstr/plan \(**−6\.2 %, meets the bar**; −12\.6 % over C16a\+b\); sweep Q64 944 ms; plans
+      identical\. Misses 0\. Next on return: C16c — pathkey usefulness \(14\.8 % after C16b:
+      equivalentWithin/countContainedIn/keyOf; PG compares canonical pathkeys by pointer\), same Target; overlaps
+      C15\. Design: part 9 §Slice 94\.
+    - **C16c LANDED \(slice 95, loop \#189\)**: `pathkeyUsefulnessFor` memoised per relids, and `freshEvalCtx` now
+      hands every GEQO tour the parent's search memos \(it built a new searchCtx per tour, so the slice 93/94 memos
+      had been per\-tour only — their measured gains came from within\-tour repeats\)\. Q64 5\.683/5\.678 →
+      5\.213/5\.204 Ginstr/plan \(**−8\.3 %, meets the bar**; −19\.9 % over 93–95\); sweep Q64 860 ms; plans
+      identical\. Misses 0\. Next on return: re\-profile Q64 \(per\-path truncateUselessPathkeys, addPathsForJointype
+      allocation\)\. Design: part 9 §Slice 95\.
+    - **C16d LANDED \(slice 96, loop \#190\)**: a join rel's ColVarBytes union is formed on first read
+      \(`colVarFrom`/`colVarBytes\(\)`\) instead of per joinrel per tour \(unionColVarBytes 8\.5 %\)\. Q64 5\.214/5\.201
+      → 4\.853/4\.858 Ginstr/plan \(**−6\.8 %, meets the bar**; −25\.2 % over 93–96\); plans identical\. Misses 0\.
+      Next on return: truncateUselessPathkeys per path \(16 %\) or comparePathkeysDimRel's unmemoised pathKeyEqual
+      \(7 %; PG compare\_pathkeys is a pointer compare\)\. Design: part 9 §Slice 96\.
+    - **C16e LANDED \(slice 97, loop \#191\)**: comparePathkeysDimRel compares keys through the rel's identity\-key
+      memo \(usefulKeys\.pathKeyEqual\) instead of re\-formatting both keys per comparison\. Q64 4\.852/4\.854 →
+      4\.626/4\.618 Ginstr/plan \(**−4\.8 %, meets the bar**; −28\.8 % over 93–97\); plans identical\. Misses 0\.
+      Next on return: re\-profile; truncateUselessPathkeys per path \(16 %\), buildPathkeyUsefulness misses \(7 %\)\.
+      Design: part 9 §Slice 97\.
+    - **C16f LANDED \(slice 98, loop \#192\)**: truncateUselessPathkeys memoises the kept length per key list
+      \(u\.truncMemo, verified key by key, always slicing the caller's list\)\. Q64 4\.611/4\.615 → 3\.229/3\.222
+      Ginstr/plan \(**−30\.1 %, meets the bar**; −50\.3 % over 93–98\); sweep Q64 728 ms \(census 1019, PG 173\);
+      EXPLAIN with costs byte\-identical on Q64/Q72/Q14/Q39/Q17/Q25/Q29\. Misses 0\. Next on return: re\-profile Q64;
+      planning now ~3\.2 G vs PG's 52 ms plan — measure planning ms again \(g1\-split\.sh\) before the next step\.
+      Design: part 9 §Slice 98\.
+    - **C16g LANDED BELOW THE BAR \(slice 99, loop \#193\)**: the truncation memo keyed by list CONTENTS \(first key
+      \+ length, verified with slices\.Equal\) so sort\_inner\_and\_outer's fresh lists hit\. Q64 3\.227/3\.228 →
+      3\.135/3\.129 Ginstr/plan = **−2\.96 %, misses the 3 % bar** \(spread ±0\.005 G, not noise\); plans identical,
+      all gates green; landed as plan\-neutral and added to the Below\-bar list\. **Miss counter 1\.** Q64 planning
+      488 ms by EXPLAIN SUMMARY at slice 98 \(PG 52\)\. Profile after slice 98: sortInnerAndOuter 16 %
+      \(tryMergeJoinPath 15\.7 %: buildJoinPathkeysFor 44 % of it, sortPathFor 18 %\), mallocgc 29 %,
+      addNestLoopPathFor 9\.4 %, buildPathkeyUsefulness 7\.9 %\. Design: part 9 §Slice 99\.
+    - **C16h MEASURED AND DROPPED \(loop \#194\)**: price a merge candidate's sorted inputs \(cost\_sort figure\)
+      for initial\_cost\_mergejoin \+ add\_path\_precheck and build the Sort paths only afterwards, join pathkeys
+      formed once\. Q64 3\.126/3\.132 → 3\.114/3\.111 Ginstr/plan = −0\.5 % \(precheck rarely rejects on Q64\)\.
+      **Second consecutive miss → one\-task yield** \(Yield record\)\. Profile at slice 99
+      \(`tmp/q64plan\-c16g\.pprof`\): truncateUselessLen still 4\.3 % \(misses follow per\-relids usefulness
+      misses\), addNestLoopPathFor 10\.3 %, tryMergeJoinPath 13\.9 %\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -2602,10 +2860,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       steady state 1\.09–1\.11 s\.
     - Left: `internal/utils/mmgr/mctx.go`'s permanentContext comment still says big numerics allocate there —
       fix in the next executor slice \(a comment\-only change after the gates would have invalidated their stamps\)\.
-- [ ] **M0122-0017 — EXPLAIN ANALYZE counts an index scan's rows before its own Filter**\.
+- [x] **M0122-0017 — EXPLAIN ANALYZE counts an index scan's rows before its own Filter**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN ANALYZE text fidelity; census 22/22, regress outputs unchanged\)
   Parent: none
+  - Done 2026\-10\-27 \(selected as item 10's "rest of M0122": M0122\-0012 yields, every M0147 child is done or held\)\.
+    Cause: the witness is a parameterised NL's inner probe whose residual conjunct EXPLAIN moves onto the scan's
+    `Filter:` \(M0146\-0005aj\) while goopg still evaluates it at the join, so the scan's rowsOut is pre\-filter\.
+    `walkPlanAnalyzeFiltered` now subtracts the probe's attributed rejections on that branch\. Design doc
+    `docs/design/0100\-0149/m0122\-0017\-param\-probe\-actual\-rows\.md`\.
+  - Test `TestExplainAnalyzeParamProbeRowsAfterMovedFilter`: `Index Scan … \(actual rows=0\.09 loops=100\)` / `Rows
+    Removed by Filter: 0` — identical to scratch PG 18\.3 for the same NL shape\.
+  - JSON/YAML/XML sibling gap ledgered \(2026\-10\-27\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree 22/22,
+    RegressSuite PASS \(81 mismatches; plpgsql flapper only\), Isolation PASS; fire\-set out of scope \(executor only\)\.
   - Filed 2026\-10\-23 from the M0122\-0012 slice\-73/74 per\-node rows census \(tmp/rows\-census\.sh\)\.
   - TPC\-DS Q17 / Q25 / Q29: `Index Scan using catalog\_sales\_pkey … Filter: \(cs\_bill\_customer\_sk = …\)` reports
     `actual rows=25\.63 loops=7511` with `Rows Removed by Filter: 26`; PG reports `rows=0\.00` — PG counts the tuples the
@@ -2633,19 +2901,33 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     ANALYZE on such a plan is distorted until this is understood\.
   - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
     timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
-- [ ] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
+- [x] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN ANALYZE time fidelity; census 22/22, sf025 plans 99/99 same\)
   Parent: none
+  - Done 2026\-10\-27 \(loop \#185, item 10's "rest of M0122"\)\. All four `actual time` renderers \(text label, Hash
+    line, Worker line, JSON\) divide by loops via `msPerLoop`, as explain\.c does\. Testing exposed a second defect:
+    `instrumentedOp` timed the gap between returns \(the parent's work included\), skipped the EOF call, and kept one
+    loop's startup, so a child out\-timed its parent\. It now times only its own Open/Next calls and sums startup per
+    loop \(InstrEndLoop\)\. Test `TestExplainAnalyzeActualTimePerLoop`\. Design doc
+    `docs/design/0100\-0149/m0122\-0020\-actual\-time\-per\-loop\.md`\. JSON `Node Type` label gap ledgered\.
   - Filed 2026\-10\-24 from M0122\-0012 post\-slice\-91 recon\. TPC\-DS Q14 on the SF0\.25 clone:
     `Index Scan using store\_sales\_pkey … \(actual time=0\.003\.\.1857\.725 rows=42\.54 loops=16173\)` — rows is the
     per\-loop average but time is the total; PG's ExplainNode \(explain\.c\) divides startup and total time by nloops\.
   - Resume point: internal/executor/operators\_explain\.go, the actual\-time renderer: divide by loops as explain\.c
     does; ledger row 2026\-10\-24 \(post slice 91 recon\)\.
-- [ ] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
+- [x] **M0122-0019 — EXPLAIN ANALYZE "Planning Time" omits the join search: TPC\-DS Q64 reports 0\.17 ms for ~1\.6 s**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN summary fidelity; census 22/22, sf025 plans 99/99 same\)
   Parent: none
+  - Done 2026\-10\-27 \(loop \#186, item 10's "rest of M0122"\)\. Cause: the timer wrapped executor `buildNode` \(PG's
+    ExecInitNode, an Execution Time item\), never the optimizer, which ran earlier in the planner's ExplainStmt arm\.
+    The planner now stamps its inner `PlanWithSettings` duration on `optimizer.Explain.PlanningNs`; `buildNode` moved
+    into Execution Time; plain `EXPLAIN \(SUMMARY ON\)` prints Planning Time as PG does\. Live Q64 on the SF0\.25
+    clone: Planning 836/843 ms, Execution 632/315 ms, wall 1\.47/1\.16 s\. Test
+    `TestExplainPlanningTimeIsPlannerDuration`\. Design doc
+    `docs/design/0100\-0149/m0122\-0019\-planning\-time\-is\-planner\-duration\.md`\. Analysis\+rewrite inside the
+    timer ledgered\.
   - Filed 2026\-10\-23 from M0122\-0012 slice 78\. On the SF0\.25 clone `EXPLAIN \(ANALYZE\)` of Q64 prints
     `Planning Time: 0\.169 ms` while a plan\-only EXPLAIN of the same text takes 1\.6–2\.0 s wall \(profile: 96 % under
     optimizer\.PlanWithSettings → geqoSearch\); PG prints its whole planner time \(ExplainOnePlan's planduration,
@@ -2654,6 +2936,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Standby restartpoint LANDED 2026\-10\-27 \(loop \#195, the M0122\-0012 one\-task yield\)**\. Movement: none —
+    recovery path\. `StreamReplayer` records the last replayed checkpoint \(PG RecoveryRestartPoint\);
+    `runRecoveryFlush` snapshots it before the flush and `adoptRestartPoint` then advances pg\_control's
+    checkPoint/checkPointCopy when its redo is older, minRecoveryPoint only in DB\_IN\_ARCHIVE\_RECOVERY
+    \(CreateRestartPoint\)\. A restarted standby now replays from its last restartpoint\.
+    - Pin: `TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl` \(standby pg\_control equals the primary's
+      checkpoint after a standby CHECKPOINT; restart keeps streaming\); FAILS with the wiring removed \(redo
+      unchanged 1016F80\)\. Units: `TestDecodeCheckPointStructRoundTrips`, `TestAdoptRestartPointAdvancesOnlyForward`,
+      `TestRecoveryFlushAdoptsReplayedCheckpoint`\.
+    - Residual \(ledgered\): no DB\_IN\_ARCHIVE\_RECOVERY stamp on a standby \(minRecoveryPoint arm dormant\), no
+      DB\_SHUTDOWNED\_IN\_RECOVERY on a shutdown restartpoint, no restartpoint\-driven WAL removal\.
+    - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"The restartpoint"\.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
     Design: `docs/design/0000-0049/0005-0001-streaming-replication-architecture.md`.
@@ -3392,6 +3686,8 @@ arm is dead solely because `GOOPG_GATHER_PATHS` is default-OFF), **K82** (Q14 is
 byte-identical under the flip, so the tracks are independent), **K92**
 (relabelling goopg's leader-prebuild as `Parallel Hash` would be a
 misdescription, i.e. the forcing the goal forbids).
+*Note 2026\-10\-26 \(M0147\-0016\): the "default\-OFF" above was true at filing; `GOOPG_GATHER_PATHS` is default
+`all` today \(`scripts/planner\-flags.env`: `unset\(all\)`\)\. K80's arm is live\.*
 
 Carry, do not rediscover: **K20** — `GOOPG_GATHER_PATHS` gates *partial paths
 only, not parallelism*; the post-pass emits a Gather regardless, so there is no
@@ -4217,6 +4513,18 @@ Sequencing: the S9 replenishment rule in the banner.)
   > filtered CTE scans \(their outer estimate and join method; Q4/Q11 routing:
   > SORT at SF0\.25, HASHSPILL M0141\-S2a\-fix2r\-a at SF1\), and Q14 statement
   > 2\'s inner is PG\'s probe chain\. Then re\-run the strict sweep\.
+  - **Re\-measured 2026\-10\-26 \(banner OWNER DECISIONS 2026\-10\-21 authorisation\), still held \[\!\]\.** Census
+    `routing\-20261026f` is PLAN\-PARITY 22/22, 99/99, 99/99 — and PG\'s own Q4 plan, matched exactly, ALSO nests loops
+    over filtered `CTE Scan on year\_total` inners \(rows=10/30 estimates\), so the escalation\'s "PG hash\-joins them"
+    premise is stale: the join half of the release test now holds by plan identity\.
+    - Strict arm \(`GOOPG\_NL\_BARE\_REEXEC=1`, SF0\.25 sweep, results `tmp/m0146\-0010a\-strict/`, log
+      `/tmp/strict\-sf025\.log`\): 54/99 ran before the sweep aborted on a server restart race after a forced shutdown;
+      **Q4, Q14 and Q54 TIMEOUT** \(300 s\); Q11 now PASS \(21 s\), Q5 9 s, Q7 3 s, Q31 5 s\.
+    - The live blocker is therefore EXECUTOR\-side: on the PG\-identical plan, goopg\'s strict re\-execution of the
+      bare `CTE Scan` inner is far costlier than PG\'s rescan of the CTE\'s already\-filled tuplestore
+      \(nodeCtescan\.c `ExecReScanCteScan` re\-reads the shared tuplestore; it never re\-runs the CTE\)\. Next step:
+      EXPLAIN ANALYZE Q4 under the strict arm on a private SF0\.25 clone and compare per\-node `loops`/rows with
+      :65438 tpcds025; check whether goopg\'s CTEScan rescan re\-runs or re\-copies the CTE producer\.
 - [x] **M0146-0012 — correlated restrictions as base-rel index quals**
   (full entry archived → `completed_milestones/completed_fix_plan_015.md`)
 - [ ] **M0146\-0012b — a multi\-relation EXISTS body\'s correlated
@@ -4955,6 +5263,127 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-24 — **exhausted at `50ecb096b`** \(M0147\-0012 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261024h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-25 — **exhausted at `1a41444e5`** \(M0147\-0013 `483b19112` changed internal/optimizer;
+    `1a41444e5` is analysis\-only\)\. Census `analysis/m0146/m0146\-0014/routing\-20261025a/`: TPC\-H 22/22, TPC\-DS
+    SF0\.25 99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\.
+    Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-25 — **exhausted at `033b6c14d`** \(M0147\-0014 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261025b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `51326adf2`** \(M0147\-0015 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `f5efcefdf`** \(M0147\-0016 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `9c3e12d47`** \(M0147\-0017 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `a4c64c462`** \(M0147\-0020 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `aafabf804`** \(M0147\-0021 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `4f7b216cd`** \(M0147\-0022 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **census reused at `e5f10324e`** \(analysis/fix\_plan\-only recon commit;
+    routing\-20261026f\'s capture `4f7b216cd` is an ancestor, no planner/executor/cost path changed\)\. Same items\-0\-9
+    tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `63d2ab399`** \(M0147\-0031 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `8ab965464`** \(M0147\-0032 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `07d3ad3e9`** \(M0147\-0033 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `a16b71cdf`** \(M0147\-0034 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `7608c9ff0`** \(M0147\-0035 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `eff6e2294`** \(M0147\-0036 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `f8a8392fd`** \(M0147\-0037 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `529af8c85`** \(M0147\-0038 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-26 — **exhausted at `61b3b0dbe`** \(M0147\-0039 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261026o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `16101a6a1`** \(M0147\-0040 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `6c45b63bd`** \(M0147\-0041 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027b/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `77d4c33b6`** \(M0147\-0042 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027c/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `abd93c55a`** \(M0147\-0043 changed internal/optimizer\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027d/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `dd246d001`** \(M0147\-0044 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027e/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `637799d73`** \(M0147\-0045 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027f/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `3a8bfaa96`** \(M0147\-0046 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027g/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b2665b45c`** \(M0147\-0047 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027h/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `5a9b2fb84`** \(M0147\-0049 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027i/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b7d73466c`** \(M0147\-0053 `54223610d` changed internal/optimizer \+
+    executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027j/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
+    every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b7da10d8d`** \(M0147\-0051 changed internal/optimizer \+ executor \+
+    postmaster\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
+    every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `e8367f901`** \(M0122\-0017 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `da7f0c117`** \(M0122\-0020 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `102bc10a4`** \(M0122\-0019 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `fb6c415f1`** \(M0122\-0012 slice 93 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `b1f699edf`** \(M0122\-0012 slice 94 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027p/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `c0d1f97ed`** \(M0122\-0012 slice 95 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027q/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `660e20d86`** \(M0122\-0012 slice 96 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `34ccf73db`** \(M0122\-0012 slice 97 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `d5e071c67`** \(M0122\-0012 slice 98 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027t/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `06d18e112`** \(M0122\-0012 slice 99 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027u/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `64aa8f62f`** \(M0122\-0012 slice 101 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -5673,6 +6102,20 @@ Movement: yes — TPCH match 12→15; CATEGORIES-EXCL-MATCH scan-type 8→4
   > \#\# ESCALATION 2026\-10\-16 \(S2\) — M0146\-0205: COPY inside BEGIN … ROLLBACK keeps its rows
   > Wrong results and loss of atomicity: a client that rolls back a failed load keeps its partial rows\. Filed under
   > M0146\-0204\. Owner: place it, or confirm below item 10\.
+- [ ] **M0146-0243 — Incremental Sort path counts `enable_sort` in `DisabledNodes`; PG's does not** \(filed 2026\-10\-27
+  by M0147\-0043\)\. `incrementalSortPathWithGroups` \(`internal/optimizer/incrementalsortpaths.go`\) sets
+  `DisabledNodes: disabledNodesFor\(\!cp\.enableSort, sub\)` and its comment says cost\_incremental\_sort folds
+  enable\_sort in via cost\_sort\. It does not: PG 18\.3 `cost_incremental_sort` asserts `enable_incremental_sort`
+  and sets `path\->disabled_nodes = input_disabled_nodes` \(`postgres/src/backend/optimizer/path/costsize.c:2123\-2125`\);
+  only `cost_sort` adds `enable_sort ? 0 : 1` \(:2162\)\. With `enable_sort=off` goopg disables an Incremental Sort that
+  PG would keep, so the ORDERED tournament can pick a different arm\.
+  Kind: impl
+  Parent: none
+  - Rank: below item 10 — no TPC\-H/TPC\-DS query diverges at default GUCs \(the census runs with enable\_sort on\)
+    \(S7 carve\-out\)\.
+  - First step: set `DisabledNodes` to the input's own count \(`sub\.DisabledNodes`\), fix the comment, and pin it with
+    a unit test that plans the ORDERED rel under `enable_sort=off` and expects the Incremental Sort to keep zero
+    disabled nodes; cross\-check one `SET enable_sort = off` EXPLAIN against a scratch PG\.
 - [x] **M0146-0206 — VACUUM tail truncation leaves the visibility map untruncated, so relallvisible exceeds relpages; a tail emptied by DELETE is not truncated** \(filed 2026\-10\-16 by M0146\-0204\)\.
   DONE 2026\-10\-16 \(owner, a181f6bfd\): `VisibilityMap\.TruncateRel` beside `opts\.FSM\.TruncateRel`,
   `VMTruncateForkForHeap` as the smgr\_redo `SMGR\_TRUNCATE\_VM` arm \(visibilitymap\_prepare\_truncate —
@@ -7332,8 +7775,9 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
 ## M0147 — Lever retirement (filed 2026-10-21, owner decision)
 
 **Milestone doc:** `docs/milestones/0147-lever-retirement.md`. **Rank:** banner item 10 — M0122-0012 →
-**M0147** → the rest of M0122; **M0122-0012 (its inline slices and any task with `Parent: M0122-0012`)
-outranks every M0147 task** until it yields under the banner's item-10 rule (OWNER DECISIONS 2026-10-21).
+**M0147** → the rest of M0122, under the M0122-0012 **return-first rule** in banner item 10 (OWNER DECISIONS
+2026-10-27): M0147 tasks run during M0122-0012's one-task yields (when next in item-10 order) and after its
+exhaustion.
 Basis: the 2026-10-21 lever census and its review
 (`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`).
 
@@ -7423,46 +7867,137 @@ Basis: the 2026-10-21 lever census and its review
     local_filters.go:631; keep `collectUnnestParamsAndResiduals` (EXISTS path). Tests:
     scalar_unnest_switch_test.go, executor/nl_semi_anti_join_test.go:119, cte_scalar_sublink_unnest_test.go:80 —
     rebase any that pin the default arm onto PG's SubPlan expectation. Ledger row 2819 (new row).
-- [ ] **M0147-0014 — retire `GOOPG_HASH_OUTER_JOIN`**
+- [x] **M0147-0014 — retire `GOOPG_HASH_OUTER_JOIN`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 27→26 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-25 \(M0122\-0012 yielded under rule \(a\)\)\. `hashOuterJoinEnabled`, `hashOuterJoinFromEnv`,
+    `chooseOuterFillJoinAlgo` deleted; the planner\.go RIGHT/FULL arm is plain `JoinAlgoMerge` \(the shipped default\);
+    the hash\-RIGHT `BuildLeft` branch went with the hash arm\. `deadcode ./cmd/...` diff: no new orphan\. flaglabels row
+    → `retired\(M0147\-0014\)`, planner\-flags\.env regenerated\. Four hash\-arm\-only tests deleted \(3 in joincost\_test\.go,
+    `TestPlanJoinRightFullTakesHashOnceCostable`\)\. Design doc `docs/design/0100\-0149/m0147\-0014\-retire\-hash\-outer\-join\.md`
+    \(C6\); ledger resolution row for the 2026\-08\-04 M0127\-P4\.2 and 2026\-09\-03 take2\-P6\-06 rows\.
+  - Gates: units, spotcheck, acceptance 24 MATCH \(vs baseline\-digests\), sf025 PASS=99 \(61 ck; SF025\_NO\_PLANS=1;
+    plans standalone same=99\), fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on tree 22/22,
+    RegressSuite, Isolation\.
   - joincost.go:52; keep `costInnerHash`/`costInnerMerge` (default `chooseInnerJoinAlgo`). Neither arm is PG: the
     post-search `chooseInner/OuterFillJoinAlgo` assignment (planner.go:4873-4887) is goopg-private — list it in
     M0147-0030's phase-2 inventory.
-- [ ] **M0147-0015 — retire `GOOPG_FORCED_GC`**
+- [x] **M0147-0015 — retire `GOOPG_FORCED_GC`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 26→25 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. The switch, `maybeForceGCAfterCommit` and its counters
+    deleted from dispatch\.go; its 4 call sites \(dispatch\.go autocommit, copy\.go ×2, txn\_verb\.go\) gone;
+    `\(\*Context\)\.DidWrite` deleted \(its only caller was the GC guard; deadcode does not flag exported methods, so
+    `git grep` confirmed\)\. forced\_gc\_flag\_test\.go and didwrite\_test\.go deleted\. Not a planner flag \(no
+    flaglabels row\); fire\-set out of scope \(fireset\-scope\.sh rc=1\)\. postmaster wiki updated\. Design doc
+    `docs/design/0100\-0149/m0147\-0015\-retire\-forced\-gc\.md` \(C6\)\. No ledger row named the lever\.
+  - Gates: `go test ./internal/postmaster/` PASS \(first run: `TestExplainSplitAggregateChainCosts` i/o timeout on its
+    2 s frame deadline during a 600k\-row INSERT under package\-parallel load; passes alone and on the full rerun\),
+    units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck; plans standalone same=99\), TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
   - postmaster/dispatch.go `maybeForceGCAfterCommit` and forced_gc_flag_test.go; run `go test ./internal/postmaster/`
     yourself (the units gate excludes it).
-- [ ] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
+- [x] **M0147-0016 — retire the dead `GOOPG_RELSIZE_FALLBACK` read and stale lever text**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 25→24 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. relsize\.go: the never\-loaded stage var \(only
+    Store/Swap at HEAD\), init read, parseRelSizeFallbackStage, SetRelSizeFallbackStage deleted; cost\_funcs\.go
+    `envFloatDefault` deleted; knob\-is\-live comments fixed in small\_dimension\.go, plan\.go, cardinality\.go;
+    flaglabels\.go PG\_SORT\_RELATION\_BYTES\_COST / INCREMENTAL\_SORT comments now say default ON;
+    tpch\-relsize\-arm\.sh reduced to cold/warm \(c2/w2 aliases, c1/w1 refused\); M0140 K80 "default\-OFF" text
+    annotated\. Tests: TestParseRelSizeFallbackStage and TestSmallDimensionTagIgnoresRelSizeFallbackStage deleted,
+    stage loops/setters dropped\. deadcode diff: only the two deleted funcs left the list\. planner\-flags\.env
+    unchanged \(row already retired\)\. Design doc
+    `docs/design/0100\-0149/m0147\-0016\-retire\-relsize\-fallback\-read\.md` \(C6\); ledger resolution row\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, fire\-set PASS \(fires=none on SF0\.25 and SF1\), TPC\-H census on
+    tree 22/22, RegressSuite, Isolation, sf025 PASS=99 \(61 ck\) \+ plans standalone same=99 \(first attempt refused
+    with FATAL while the nightly batch ran — re\-run after it exited, never FORCE=1\)\.
   - relsize.go:69 (read, stored, never loaded; retired take2-P1-05), its setter and ~10 test call sites
     (relsize_fallback_test.go, small_dimension_test.go, relsize_baserel_placement_test.go), the
     `scripts/tpch-relsize-arm.sh:186` arm that still drives it, the uncalled `envFloatDefault` (cost_funcs.go:14);
     stale comments relsize.go:55-61/:166, flaglabels.go:142/:162 (PG_SORT_RELATION_BYTES_COST and
     INCREMENTAL_SORT are default ON), and the stale "default-OFF" GATHER_PATHS text in the M0140 section.
-- [ ] **M0147-0017 — retire `GOOPG_DISABLE_NLI` (the M0054-0006 nested-loop-index rollback switch)**
+- [x] **M0147-0017 — retire `GOOPG_DISABLE_NLI` (the M0054-0006 nested-loop-index rollback switch)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 24→23 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Env read in cmd/goopg/main\.go deleted; the setter went
+    too — no PG\-equivalent concern, because the GUC route `goopg.enable_nestloop_index` \(PlannerSettings\) already
+    exists: `nliEnabled`, `SetNLIEnabled`, `NLIEnabled` deleted and DefaultPlannerSettings seeds `true`\.
+  - Tests: TestNLIRuleRespectsKillSwitch now plans with `PlannerSettings\.EnableNestLoopIndex=false`\. The two
+    cluster\-backed parity tests in internal/testutil/tpch were VACUOUS — their off arm called SetNLIEnabled in the test
+    process, which the cluster's server subprocess never saw, and on 5\-row fixtures the default plan is a Hash Join
+    anyway\. They now compare the default plan with a nested loop forced by PG's `enable\_hashjoin/enable\_mergejoin/
+    enable\_seqscan=off` \(new `cluster\.QueryWithOptions`, startup `options`\) and assert the two EXPLAINs differ\.
+  - Finding \(ledger row; M0147\-0030 note\): with those switches off, `goopg\.enable\_nestloop\_index=off` still did not
+    change the plan — the legacy post\-search rewriteJoinsToNLI pass did not fire\.
+  - Wiki cmd\-goopg\.md env table / flow updated\. Design doc
+    `docs/design/0100\-0149/m0147\-0017\-retire\-disable\-nli\.md` \(C6\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    on SF0\.25 and SF1\), TPC\-H census on tree 22/22, RegressSuite, Isolation, the two rebased cluster parity tests
+    PASS \(go test \-run TestNLIResultParity ./internal/testutil/tpch/\)\.
   - cmd/goopg/main.go:299 and the `SetNLIEnabled` plumbing the switch reaches; keep the setter only if tests use it
     to isolate a path and no PG-equivalent switch exists (`goopg.enable_nestloop_index` is the GUC route).
-- [ ] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
+- [x] **M0147-0020 — promote-or-delete `GOOPG_PARTIAL_SORT_PATHS` (ON = PG cost_sort / cost_gather_merge comparison; OFF = runtime-justified `sortPartialRootPays` type switch)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 23→22 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. C6 trace \(`GOOPG\_PGSHAPED\_DP\_TRACE=1`
+    captures, `upper gate=sort` records\): the post\-pass IS reached — OFF 3 `sort\-rule` verdicts at SF0\.25, 2 at SF1;
+    ON worker 1 / serial 1 / declined 1 at SF0\.25, worker 1 / serial 1 at SF1\. ON captures: goopg plans byte\-identical
+    to the OFF census \(0 diff lines\), PLAN\-PARITY 99/99 both\. TPC\-H census lane is serial \(post\-pass unreachable\);
+    TPC\-H parallel values via the acceptance arm\.
+  - Deleted: mode type/consts/env read/resolver/label, both test setters, the mode\-off branch;
+    `sortPartialRootPays` KEPT as the no\-tournament fallback\. flaglabels → `retired\(M0147\-0020\)`, planner\-flags\.env
+    regenerated\. Tests: the fail\-closed resolver test and the off\-inertness test deleted; two tests drop their mode pins\.
+    deadcode diff: only the two setters left\. Design doc
+    `docs/design/0100\-0149/m0147\-0020\-promote\-partial\-sort\-paths\.md` \(C\-19e DESIGN\.md status line added\); ledger row
+    \(residual: PG decides in generate\_useful\_gather\_paths/create\_ordered\_paths; goopg in a post\-pass with default
+    cost params\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - First: trace whether the post-pass is still reached now that Gather comes from the search (C6 trace over the
     full corpus). Unreachable: delete both arms. Reached: flip ON, run the gates, then delete the OFF arm. Never
     delete the ON arm without an owner `[!]` (R3). Runtime is not a rejection reason (S9(5)(a)).
-- [ ] **M0147-0021 — promote `GOOPG_PG_HASH_TUPLE_SPILL_COST` (costsize.c initial_cost_hashjoin / nodeHash.c ExecChooseHashTableSize)**
+- [x] **M0147-0021 — promote `GOOPG_PG_HASH_TUPLE_SPILL_COST` (costsize.c initial_cost_hashjoin / nodeHash.c ExecChooseHashTableSize)**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 22→21 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. C3 first: ON captures on both TPC\-DS corpora
+    byte\-identical to the OFF census \(0 diff lines incl\. costs; 99/99 both\) although the arm engaged \(`DPPGHASH
+    currency=pg` on \~164k offered hash joins, batches up to 131072\) — no plan moved, so executor memory cannot move;
+    acceptance arm \(TPC\-H SF1 executed, 24 MATCH\) and SF1 fire\-set \(fires=none\) PASS on the promoted tree\.
+  - Deleted the switch/env/resolver/enabled/test setter; `pgHashGeometry`/`pgHashSpillPages` kept; invalid PG width
+    still falls back to map pricing\. No DPPGHASH reader outside the package \(estimate\-audit does not parse it\)\.
+  - Tests: trace \+ cost tests rebased \(map reference = unknown\-width fallback\); three settings\-propagation tests'
+    `work\_mem` arms rebased from 16kB on the 100\-row build \(spilled only goopg's map geometry; PG's packed geometry
+    never batches it at a legal budget\) to 64kB on \~10000\-row builds with per\-arm baselines; wide IN shape pulls up
+    to a semi\-join, so work\_mem covers the other four sublink shapes\.
+  - Design doc `docs/design/0100\-0149/m0147\-0021\-promote\-pg\-hash\-tuple\-spill\-cost\.md`; m0139\-0007a doc status line;
+    ledger row \(resolves 2188's hash half; residual: executor still sizes with map geometry\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - **C3 first**: ledger row 2188 warns the planner may charge less memory than the executor allocates — the
     acceptance arm and the SF1 fire set must pass with the arm ON; a memory regression is NOT waived by
     S9(5)(a). Keep `pgHashGeometry`/`pgHashSpillPages`. Retiring the lever changes `tracePGHashTupleGeometry`'s
     PGSHAPED_DP_TRACE output — check the estimate-audit readers. On success delete the OFF arm; ledger 2188 new row.
-- [ ] **M0147-0022 — complete and promote `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`**
+- [x] **M0147-0022 — complete and promote `GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST`**
   Kind: impl
   Parent: M0147-0000
+  Movement: yes — lever-count 21→20 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 — PROMOTED \(M0122\-0012 yielded under rule \(a\)\)\. "Complete" was already done: the per\-key
+    `get\_expr\_width` term landed in M0139\-0007c \(`costMemoizeRescan` `keyWidth` / `memoizeKeyWidths`\); the task text
+    predates it\. ON captures: 0 changed plan lines on both TPC\-DS corpora \(41 / 26 Memoize nodes\), 99/99 both\.
+  - Deleted the switch/env/resolver/enabled/test setter; PG currency now whenever `pgRelationByteSize` succeeds,
+    unknown\-width fallback to goopg's ruler kept \(both terms together\); `pgRelationByteSize` kept\. Tests: the
+    switch\-off test replaced by an unknown\-width fallback test; two currency tests drop pins and OFF halves\.
+  - Design doc `docs/design/0100\-0149/m0147\-0022\-promote\-pg\-memoize\-entry\-bytes\-cost\.md`; m0139\-0007b doc status
+    line; ledger row \(resolves line 2189; residual: goopg min clamps \+ unknown\-width fallback\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
   - The port is incomplete: add PG's per-key `get_expr_width` term (cost_memoize_rescan /
     ExecEstimateCacheEntryOverheadBytes; ledger row 2189), then flip ON, run the gates, delete the OFF arm. Keep
     `pgRelationByteSize`.
@@ -7472,7 +8007,7 @@ Basis: the 2026-10-21 lever census and its review
   - blocked-on M0146-0010a (the same flip; Held, live blocker = the Q4/Q11 `year_total` CTE nested-loop estimates;
     M0142-0008c-2 already landed). Closes as a pointer when M0146-0010a lands (then delete the attach-time compat
     cache arm and the lever).
-- [ ] **M0147-0030 — phase 2 recon: default-ON levers' OFF arms (goopg-private legacy)**
+- [x] **M0147-0030 — phase 2 recon: default-ON levers' OFF arms (goopg-private legacy)**
   Kind: recon
   Parent: M0147-0000
   - Inventory every default-ON lever left in `scripts/lever-count.sh --list` (MEMOIZE, PARALLEL, EXISTS_TO_ANY,
@@ -7483,3 +8018,346 @@ Basis: the 2026-10-21 lever census and its review
     tests rebase onto a PG oracle expectation or PG's own switch (e.g. `max_parallel_workers_per_gather=0`
     instead of `GATHER_PATHS=off`; AGENT.md C4 amended 2026-10-21) before the arm goes.
   - Files one impl child per lever (M0147-0031…, `Parent: M0147-0000`), lowest risk first; done when they exist.
+  - Add to the inventory \(M0147\-0017 finding, 2026\-10\-26\): `goopg.enable_nestloop_index` and the post\-search
+    `rewriteJoinsToNLI` pass it gates — on a forced nested\-loop fixture the pass did not fire \(the search built the
+    join\); measure its reachability with a census under `PGOPTIONS='\-c goopg.enable_nestloop_index=off'` first\.
+  Movement: none — recon
+  - Done 2026\-10\-26: inventory `analysis/m0147/m0147\-0030/INVENTORY\.md` \(19 env levers \+ the two env\-less post\-search
+    passes\)\. No gate/CI/bench script sets any lever — every OFF arm is test/A\-B only\. Children M0147\-0031…0050 filed
+    below, lowest risk first \(executor kill\-switches → narrowing family → PG\-switch rebases → PG\-faithfulness\-in\-
+    question \(EXISTS\_TO\_ANY, INDEXKEY\_HARVEST\) → recon\)\.
+- [x] **M0147-0031 — retire `GOOPG_NARROW_LEG_HOOK` (counting-only join-leg hook switch)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 20→19 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Correction: the hook is NOT counting\-only — M0139\-S2 made
+    it load\-bearing \(narrowing `\*Project` on join legs\); the stale flaglabels comment and the 0030 inventory row are
+    corrected\. Switch \+ resolver deleted, hook unconditional; two tests rebased to the single arm; flaglabels →
+    `retired\(M0147\-0031\)`; deadcode diff empty\. Design doc `docs/design/0100\-0149/m0147\-0031\-retire\-narrow\-leg\-hook\.md`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
+  - joinleghook.go:49; the OFF arm changes no node (it only disables leg counting), 8 direct test refs in 1 file. Inert proof by construction; keep the hook. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0032 — retire `GOOPG_COOP_JOIN_BUILD` OFF arm (pre-coop nested build rebuild)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 19→18 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `coopJoinBuildOn` deleted; coopDrivingScan\'s Join arm
+    unconditional; the stale "OFF by default" comment corrected\. `TestCoopBuildRecycledBatchesMatchSerialBuild` took
+    its "serial" reference from the coop flag, which gates only the join\-tree widening — vacuous for its bare\-scan /
+    column\-only\-Project builds; rebased onto `ctx\.MaxParallelWorkers = 0`\. Design doc
+    `docs/design/0100\-0149/m0147\-0032\-retire\-coop\-join\-build\.md`\. Fire\-set out of scope \(executor only\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor parallel_hash_build.go:481; 4 direct test refs. Values gates + TPC-H parallel acceptance arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0033 — retire `GOOPG_NL_MATERIALIZE_WORK_MEM=0` (unbounded NL inner cache)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 18→17 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `nlInnerWorkMemEnabled`, both `setUnbounded` branches and
+    `materializeOp\.setUnbounded` deleted — the NL inner cache is always work\_mem\-bounded \(PG tuplestore spill\);
+    `withNLInnerWorkMem` helper \+ 3 calls and the spill test\'s env skip removed\. Ledger resolution row \(M0127\-P4\.3
+    knob\)\. Design doc `docs/design/0100\-0149/m0147\-0033\-retire\-nl\-materialize\-work\-mem\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor join_nl_stream.go:52; ON = PG tuplestore spill past work_mem (M0146-0010c); 3 direct test refs. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0034 — retire `GOOPG_SCAN_PREFILTER` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 17→16 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. The env lever \(`scanPrefilterOn` \+ init read \+
+    exported `SetScanPrefilterEnabled`\) is retired, but its forced\-LATE arm is a real oracle for 4 tests \(early vs late
+    values / error position / IN\-list / lead / skip identity\), so it stays as the unexported, env\-free test seam
+    `scanPrefilterForceLate` \(the `scanSkipDisabled` precedent; PG has no switch to force a late qual\)\. Design doc
+    `docs/design/0100\-0149/m0147\-0034\-retire\-scan\-prefilter\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor scan_prefilter.go:24; SetScanPrefilterEnabled ×5 — values-identity tests become single-arm. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0035 — retire `GOOPG_JOIN_SLOT_CHAIN` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 16→15 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Switch, exported test setter and the per\-join
+    `lazyChainProbe` field deleted; bindProbe chains whenever the child slot is wide enough; the copy path stays as the
+    narrow\-slot fallback\. OFF arm was NOT an oracle \(worker tests compare against a serial baseline\), so the
+    kill\-switch test and the benchmark/worker off arms were removed\. Design doc
+    `docs/design/0100\-0149/m0147\-0035\-retire\-join\-slot\-chain\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor operators_join_agg.go:1681; SetJoinSlotChainEnabled ×8. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0036 — retire `GOOPG_SUBPLAN_RESCAN` OFF arm (legacy per-call SubPlan + CorrSubqOps registry)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 15→14 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Switch \+ exported setter deleted; the legacy
+    Build/Open/Close\-per\-call branch of acquireSubPlanOp, subPlanResultCacheable\'s always\-true legacy arm, the
+    expr\.go CorrSubqOps branch and the `Context\.CorrSubqOps` field deleted — the Stage\-9 handle \(PG nodeSubplan
+    rescan shape\) is unconditional\. Legacy\-lifecycle test deleted; the DML engine\-settings test keeps its hashed\-IN
+    half\. Design doc `docs/design/0100\-0149/m0147\-0036\-retire\-subplan\-rescan\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor subplan.go:36; SetSubPlanRescanEnabled ×5; delete the legacy registry with it if nothing else reads it (deadcode diff). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0037 — retire `GOOPG_HASHED_SUBPLAN` OFF arm (linear IN-slice scan)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 14→13 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. Env lever \+ exported setter retired; the forced\-linear
+    arm is the hashed tests\' correctness ORACLE \(subplan\_hash\_test, big\-numeric, DML engine\-settings\), so it stays as
+    the unexported env\-free test seam `hashedSubPlanForceLinear` \(drives both the probe and the EXPLAIN label\);
+    the linear slice scan also stays as the production non\-hashable fallback\. Design doc
+    `docs/design/0100\-0149/m0147\-0037\-retire\-hashed\-subplan\.md`\. Fire\-set out of scope\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, TPC\-H census on tree
+    22/22, RegressSuite, Isolation\.
+  - executor subplan_hash.go:48; ON = PG hashed SubPlan; SetHashedSubPlanEnabled ×10; the linear path survives as the non-hashable fallback. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0038 — retire `GOOPG_NARROW_UPPER_SORT` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 13→12 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `narrowUpperSort` \+ resolver deleted; the upper\-Sort
+    narrowing site is unconditional under GOOPG\_NARROW\_UPPER \(0039 next\); flaglabels → `retired\(M0147\-0038\)`,
+    planner\-flags\.env regenerated; the flag\-off test keeps its NARROW\_UPPER=0 case\. Design doc
+    `docs/design/0100\-0149/m0147\-0038\-retire\-narrow\-upper\-sort\.md`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite, Isolation\.
+  - optimizer upper_narrow_chain.go:124; 2 direct test refs; flaglabels row. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0039 — retire `GOOPG_NARROW_UPPER` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 12→11 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-26 \(M0122\-0012 yielded under rule \(a\)\)\. `narrowUpper` \+ resolver deleted; both B\-01c upper
+    sites \(Aggregate, Sort\) unconditional; the two flag\-off pins deleted; flaglabels → `retired\(M0147\-0039\)`,
+    planner\-flags\.env regenerated\. Design doc `docs/design/0100\-0149/m0147\-0039\-retire\-narrow\-upper\.md`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, Isolation; RegressSuite PASS on rerun \(first run: no case diverged, only a
+    `TempDir RemoveAll … directory not empty` teardown flake\)\.
+  - optimizer upper_narrow_apply.go:90; 5 direct test refs in 2 files; it also gates NARROW_UPPER_SORT — land after 0038. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0040 — retire `GOOPG_NARROW_BUILD` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 11→10 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(M0122\-0012 yielded under rule \(a\)\)\. `narrowBuild` \+ `narrowBuildFromEnv` \+ resolver
+    deleted; `narrowBuildInput` and `narrowMergeInput` decline only on structural conditions; flaglabels →
+    `retired\(M0147\-0040\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0040\-retire\-narrow\-build\.md`\.
+  - Tests: none of the 34 refs was an OFF\-arm oracle — nine ON pins deleted, the wiring test's flag column and
+    flag\-off case dropped, the merge subtest kept its keyless half, the polarity test went with its function\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(363 s\), Isolation PASS \(543 s\)\.
+  - optimizer narrowoutput.go:11; 34 direct test refs in 2 files. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0041 — retire `GOOPG_NARROW_COST_INPUTS` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 10→9 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `16101a6a1`; M0122\-0012 yielded under rule \(a\)\)\. Env read,
+    `narrowCostInputsFromEnv`, `setNarrowCostInputsForTest` and the resolver deleted; flaglabels →
+    `retired\(M0147\-0041\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0041\-retire\-narrow\-cost\-inputs\.md`\.
+  - Tests: the live\-search pin uses the OFF arm as a genuine oracle \(a searched join cost must move\), so it keeps an
+    env\-free seam `narrowCostInputsForceOff` \(scanPrefilterForceLate precedent\)\. 24 ON pins and four switch\-only
+    tests deleted; no cost pin needed re\-deriving, since ON was already the default every pin ran under\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(311 s\), Isolation PASS \(547 s\)\.
+  - optimizer narrowcostinputs.go:66; setNarrowCostInputsForTest ×30; cost pins re-derived at narrowed widths. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0042 — retire `GOOPG_PG_SORT_RELATION_BYTES_COST` OFF arm (goopg Sort currency)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 9→8 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `6c45b63bd`; M0122\-0012 yielded under rule \(a\)\)\. Env read, polarity
+    func, `pgSortRelationBytesCostEnabled` and the test setter deleted; `costSortRunWithWidth` elects the PG
+    relation\_byte\_size currency whenever its width is valid, goopg entry bytes kept only as the unknown\-width
+    fallback; flaglabels → `retired\(M0147\-0042\)`, planner\-flags\.env regenerated\. Design doc
+    `docs/design/0100\-0149/m0147\-0042\-retire\-pg\-sort\-relation\-bytes\-cost\.md`\.
+  - Tests: six ON pins deleted, the switch\-off\-is\-legacy test deleted, the trace test's off half re\-pinned on the
+    width\-0 fallback \(`currency=goopg`, `pgbranch=unknown\-width`\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(321 s\), Isolation PASS \(559 s\)\. The first acceptance and
+    sf025 attempts refused while the nightly ran \(01:05\-02:21\); both passed on rerun after it ended\.
+  - optimizer sort_pgrelationbytes.go:17; ON = PG cost_sort relation bytes; setPGSortRelationBytesCostForTest ×8; keep the invalid-width fallback (M0147-0021 pattern). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0043 — retire `GOOPG_INCREMENTAL_SORT` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 8→7 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `77d4c33b6`; M0122\-0012 yielded under rule \(a\)\)\. Mode type, env read
+    and both setters deleted; `addIncrementalSortPaths` and the `generateUsefulGatherPaths` sibling gate only on
+    `cp\.enableIncrementalSort` \(PG's enable\_incremental\_sort\); flaglabels → `retired\(M0147\-0043\)`,
+    planner\-flags\.env regenerated\. Design doc `docs/design/0100\-0149/m0147\-0043\-retire\-incremental\-sort\.md`\.
+  - Tests: the OFF\-is\-inert test rebased onto `cp\.enableIncrementalSort = false`; three ON pins and the env\-polarity
+    test deleted; the flag\-detector test's helper\-wrapped fixture moved to `GOOPG_NLI_COSTGATE`, scanning with
+    `flaglabels\.go` excluded \(it names every flag and made the check vacuous\)\.
+  - Finding: the Incremental Sort path charges `enable_sort` in `DisabledNodes`; PG's `cost_incremental_sort` does
+    not \(costsize\.c:2123\-2125\)\. Filed as M0146\-0243 \(below item 10\) with a ledger row\.
+  - Gates: units, spotcheck, acceptance PASS, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(647 s\)\.
+  - optimizer incrementalsortpaths.go:86; 5 direct test refs; rebase onto PG enable_incremental_sort (PlannerSettings.EnableIncrementalSort). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0044 — retire `GOOPG_MEMOIZE` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 7→6 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `abd93c55a`; M0122\-0012 yielded under rule \(a\)\)\. `memoizeOn`, the env
+    read, `memoizeFromEnv`, `SetMemoizeEnabled` and `MemoizeEnabled` deleted; both Memoize arms answer only to the
+    statement's `enable_memoize`\. The legacy NLI insertion rule \(`maybeAttachMemoize`\) now receives
+    `ps\.EnableMemoize` via `walkRewriteNLI` — before this, a session's `SET enable_memoize = off` did not reach it\.
+    Design doc `docs/design/0100\-0149/m0147\-0044\-retire\-memoize\.md`\.
+  - Tests: attach/getMemoizePath kill\-switch tests rebased onto the per\-statement setting; executor
+    `TestMemoizeExplainAndResults` off arm plans through `runSQLWith` with EnableMemoize/HashJoin/MergeJoin off \(the
+    bare NLI\), and asserts it is still a Nested Loop\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(314 s\), Isolation PASS \(567 s\)\.
+  - optimizer memoize.go:34; SetMemoizeEnabled ×13; rebase onto PG enable_memoize (PlannerSettings.EnableMemoize). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0045 — retire `GOOPG_PARALLEL` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 6→5 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `dd246d001`; M0122\-0012 yielded under rule \(a\)\)\. `parallelOn`, the env
+    read, `parallelFromEnv`, `SetParallelEnabled`, `ParallelEnabled` and the post\-pass strip branch deleted; the four
+    gates \(`parallelModeOK`, partial DISTINCT, partial\-agg upper, post\-pass entry\) answer only to
+    max\_parallel\_workers\_per\_gather, which already refused/stripped at 0\. Design doc
+    `docs/design/0100\-0149/m0147\-0045\-retire\-parallel\.md`\.
+  - Tests: `withParallelOn` deleted and its 40 callers unwrapped; 7 direct ON pins deleted; both kill\-switch tests
+    rebased onto `MaxWorkersPerGather = 0` with a non\-vacuity check; executor `runForced` serial arm via `runSQLWith`
+    \+ `MaxParallelWorkersPerGather = 0`\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(323 s\), Isolation PASS \(543 s\)\.
+  - optimizer parallel.go:45; SetParallelEnabled ×8; rebase onto PG max_parallel_workers_per_gather = 0. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0046 — retire `GOOPG_GATHER_PATHS` `off`/`top` arms (AGENT.md C4)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 5→4 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `637799d73`; M0122\-0012 yielded under rule \(a\)\)\. Mode type, env read,
+    label/polarity funcs and both setters deleted; the ten off/top gates \(three gather generators, four partial join
+    producers, partial SetOp\) removed, so Gather admission is PG's generate\_useful\_gather\_paths at every rel with
+    partial paths\. Design doc `docs/design/0100\-0149/m0147\-0046\-retire\-gather\-paths\-off\-top\.md`\.
+  - Tests: `gpSearch`/`phjJoinrel` lose their mode parameter; six mode\-only tests/subtests deleted; the upper\-rel
+    refusal test and both executor C\-19f consumer checks rebased onto max\_parallel\_workers\_per\_gather = 0
+    \(`c19fSerialPlan`\); flaglabels' orphaned resolver comments \(0040/0041/0046\) cleaned\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(316 s\), Isolation PASS \(553 s\)\.
+  - optimizer gatherpaths.go:80; setGatherPathsModeForTest ×18 + SetGatherPathsMode ×5; rebase onto max_parallel_workers_per_gather = 0; `all` stays. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0047 — retire `GOOPG_PARTIAL_AGG_PATHS` OFF arm (retired size rule)**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 4→3 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `3a8bfaa96`; M0122\-0012 yielded under rule \(a\)\)\. Measured first: the OFF
+    arm is live and far from PG — TPC\-H 10/22, SF0\.25 78/99, SF1 74/99 vs 22/99/99 ON
+    \(`analysis/m0147/m0147\-0047/`\)\. Mode plumbing, both OFF branches, the size rule `splitAggregateIsProfitable`
+    with its five non\-PG constants, and the duplicate `parallelDivisor` deleted; the priced tournament is
+    unconditional\. Design doc `docs/design/0100\-0149/m0147\-0047\-retire\-partial\-agg\-paths\.md`\.
+  - Tests: 32 ON pins deleted; FailsClosed keeps its two PG refusals; nine OFF/size\-rule\-only tests deleted
+    \(incl\. a duplicate of TestGetParallelDivisor\); executor `runAggSplitPriced` no longer flips the mode\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(338 s\), Isolation PASS \(520 s\)\.
+  - optimizer partialaggpaths.go:62; setPartialAggPathsModeForTest ×35; measure reachability + ON-vs-OFF plan diff first (M0147-0020 recipe). Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [!] **M0147-0048 — decide and retire `GOOPG_EXISTS_TO_ANY` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  - Measured 2026\-10\-27 at `b2665b45c` \(`analysis/m0147/m0147\-0048/`\): with `GOOPG_EXISTS_TO_ANY=off` the census
+    reads TPC\-H 22/22, TPC\-DS SF0\.25 97/99 and SF1 97/99 — Q10 and Q35 SHAPE\-DIFF \(join\-order,
+    parameterisation, qual\-placement\) at both scales; ON is 22/99/99\. Q10/Q35 are the OR\-of\-EXISTS witnesses
+    the pass exists for, and PG's own plans show the hashed ANY SubPlan there\.
+  - Decision per this entry's rule: ON is NOT PG logic\. PG plans both forms in `make\_subplan` and setrefs\.c keeps
+    the cheaper per expected calls \(AlternativeSubPlan\); goopg's ON always takes the hashed form\. Neither arm is
+    PG's choice, so the OFF arm is not deleted without the owner \(R3\)\. The PG\-faithful route is M0146\-0012b
+    \(port the cost choice\), after which both arms retire together\.
+  > \#\# ESCALATION 2026\-10\-27 \(R3\) — M0147\-0048: retire the EXISTS→ANY OFF arm now, or hold it behind M0146\-0012b?
+  > ON matches PG on every corpus query \(OFF loses TPC\-DS Q10/Q35\), but ON is an unconditional stand\-in for PG's
+  > AlternativeSubPlan cost choice, not a port of it\. Owner: either authorise retiring OFF now \(lever\-count 3→2;
+  > the corpus evidence says ON is the closer arm\), or keep 0048 held until M0146\-0012b lands and retire both
+  > env arms in favour of the cost choice\. The loop continues with M0147\-0049 meanwhile\.
+  - optimizer exists_to_any.go:79; SetExistsToAnyEnabled ×6. ON is goopg's unconditional analogue of convert_EXISTS_to_ANY (PG keeps an AlternativeSubPlan; ledger M0146-0012b) — if ON is not PG logic, R3 needs an owner [!] before the OFF (PG-closer per-row SubPlan) arm goes. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0049 — measure and retire `GOOPG_INDEXKEY_HARVEST` OFF arm**
+  Kind: impl
+  Parent: M0147-0000
+  Movement: yes — lever-count 3→2 \(census 22/22·99/99·99/99 held\)
+  - Done 2026\-10\-27 \(S9 exhausted at `b2665b45c`, reused — `4ac79cdee` touched no planner path; M0122\-0012
+    yielded under rule \(a\); M0147\-0048 held \[\!\]\)\. Measured first: with the harvest off the corpus EXPLAIN text
+    is byte\-identical to on \(0 differing lines, all three corpora; `analysis/m0147/m0147\-0049/`\), so the
+    2026\-09\-05 not\-plan\-neutral note is superseded\. ON is the PG\-shaped arm \(PG pulls IN/EXISTS up before
+    any index choice\)\. Switch, env read and setter deleted; `harvestIndexKeyParams` unconditional\. Design doc
+    `docs/design/0100\-0149/m0147\-0049\-retire\-indexkey\-harvest\.md`\.
+  - Tests: 8 ON pins deleted; the two executor SubPlan\-path result tests now take that path from the test\-only
+    `SetSubqueryUnnestEnabled\(false\)` \(restored via t\.Cleanup\)\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(303 s\), Isolation PASS \(645 s\)\.
+  - optimizer unnest.go:38; SetIndexKeyHarvestEnabled ×22; after M0147-0013 the harvest serves IN/EXISTS only — re-measure reachability and the 2026-09-05 not-plan-neutral note first. Inventory row: `analysis/m0147/m0147-0030/INVENTORY.md`.
+- [x] **M0147-0050 — recon: `goopg.enable_nestloop_index` / `rewriteJoinsToNLI` and the post-search `jn.Algo` assignment reachability**
+  Kind: recon
+  Parent: M0147-0000
+  Movement: none — recon
+  - Done 2026\-10\-27 \(`analysis/m0147/m0147\-0050/`\)\. GUC off: corpus EXPLAIN byte\-identical \(22/99/99\)\.
+    Probe: the post\-pass rewrites 0 corpus joins and 20 regress joins \(12 LEFT, 8 INNER\); disabling it keeps the
+    regress suite PASS with the same 81 mismatches \(differences are temp\-file names, known flappers and an
+    unordered catalog listing\)\. The post\-search `jn\.Algo` assignment's customers: 2 FULL joins per TPC\-DS
+    corpus \(MATCH PG\) and 1306 regress joins \(889 CROSS\)\. Children filed below\.
+  - Run the three-corpus census with `PGOPTIONS='-c goopg.enable_nestloop_index=off'` (M0147-0017 finding: the pass
+    did not fire on a forced fixture) and count the join trees the PG-shaped search did not build (the M0147-0014
+    post-search assignment's only customers); file promote-or-delete children.
+- [x] **M0147-0051 — delete the legacy NLI post\-pass \(`rewriteJoinsToNLI`\) and `goopg\.enable_nestloop_index`**
+  Kind: impl
+  Parent: M0147-0050
+  Movement: none — parity held: the pass was corpus\-inert \(M0147\-0050\) and customer\-free after M0147\-0053 \(census 22/22·99/99·99/99, regress outputs unchanged bar the plpgsql flapper\)
+  - Done 2026\-10\-27\. Second trial \(call disabled\): units gate green\. Deleted the call, `rewriteJoinsToNLI`,
+    `walkRewriteNLI`, `tryBuildNLI` and the 22 helpers only it reached \(deadcode fixed point\), `memoize\.go`
+    \(`maybeAttachMemoize`\), the `GOOPG\_NLI\_COSTGATE` escape hatch, `PlannerSettings\.EnableNestLoopIndex` with its
+    readBool/fingerprint bit, and the `goopg\.enable\_nestloop\_index` GUC \(now an unrecognised parameter, as in
+    PG\)\. \~3400 lines removed\. Design doc `docs/design/0100\-0149/m0147\-0051\-delete\-legacy\-nli\-post\-pass\.md`\.
+  - Tests: six legacy\-only test files and the legacy tests in mixed files deleted; flag\-detector fixture →
+    `GOOPG\_EXISTS\_TO\_ANY`; misc GUC tests → `goopg\.enable\_opportunistic\_prune`\.
+  - Follow\-up noted in the design doc: `stampSemiProbePrices` and nlicensus's `rewrite` route are probably inert now\.
+  - Gates: units, postmaster package, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set
+    PASS \(fires=none both\), TPC\-H census on tree 22/22, RegressSuite PASS \(81 mismatches; only plpgsql moved,
+    1659→1655 diff lines\), Isolation PASS\.
+  - Filed by M0147\-0050: the pass rewrites no corpus join and changes no regress verdict; PG has no such pass \(its
+    parameterised index nested loop is an ordinary `match\_unsorted\_outer` path\)\.
+  - First step: list the 20 regress rewrites \(probe recipe in `analysis/m0147/m0147\-0050/README\.md`\) and compare
+    each statement's EXPLAIN with PG 18\.3; delete the pass, `tryBuildNLI`'s legacy callers, `maybeAttachMemoize` if
+    left unreachable, and the goopg\-private GUC \(keep accepting `SET goopg\.enable\_nestloop\_index` only if a
+    client depends on it\)\.
+  - **Blocked\-on M0147\-0052** \(2026\-10\-27 trial\)\. With the pass's single call site disabled, the units gate
+    fails exactly one test: `TestParallelNLIJointypeIdentity/left` \(`internal/executor/parallel\_nli\_jointype\_identity\_test\.go`\)\.
+    Its `o LEFT JOIN i ON i\.k = o\.k AND o\.id > 0` is a join the PG\-shaped search declines, and the legacy
+    pass is what turns it into the `Nested Loop Left Join` over an index probe that PG 18\.3 elects for this fixture
+    \(M0145\-0030\)\. Deleting the pass first would move such unsearched shapes AWAY from PG; the search must build them
+    first \(M0147\-0052\), after which the pass has no customers and goes\. No code changed by the trial\.
+  - **Unblocked 2026\-10\-27** by M0147\-0053 \(`54223610d`\): the witness now plans through the search, and its plan
+    is PG 18\.3's\. Re\-run the trial \(disable the call, units gate\) before deleting; any other test that still needs
+    the pass names the next unsearched class\.
+- [x] **M0147-0052 — recon: why regress joins bypass the PG\-shaped search \(the post\-search `jn\.Algo` population\)**
+  Kind: recon
+  Parent: M0147-0050
+  Movement: none — recon
+  - Done 2026\-10\-27 \(`analysis/m0147/m0147\-0052/`\)\. One probed regress run: seam declines by reason —
+    `lateral` 968 \(≈ the 889 unsearched CROSS joins\), `leaf\-count` 87, `outer\-on\-qual` 45, `prefix\-exceeds\-bindings`
+    19, `outer\-link\-no\-sjinfo` 19, tail 9 \(plus 9716 single\-relation statements that need no search\)\.
+    `lateral`/`leaf\-count` are banner\-S9\(2\)\-routed to M0145\-0003/0010; `outer\-on\-qual` filed below as the impl
+    child that unblocks M0147\-0051; the small classes stay listed in the README\.
+  - Filed by M0147\-0050: 1306 regress joins and 2 TPC\-DS FULL joins per scale reach `walkRewriteNLI` unsearched, so
+    `planFromItem`'s post\-search `jn\.Algo` assignment, not add\_paths\_to\_joinrel, picks their method\.
+  - First step: classify the 1306 by the reason the search declined them \(CROSS 889 first\); file a parity task per
+    class that PG plans through the search\.
+  - Witness for the NLI\-dependent class \(from the M0147\-0051 trial\): `TestParallelNLIJointypeIdentity/left` —
+    a LEFT JOIN whose ON clause carries an outer\-only conjunct \(`AND o\.id > 0`\)\. It unblocks M0147\-0051\.
+- [x] **M0147-0053 — admit outer\-join ON conjuncts that test only the preserved side \(the `outer\-on\-qual` seam decline\)**
+  Kind: impl
+  Parent: M0147-0052
+  Movement: none — instrument artefact: the class has no corpus or regress\-EXPLAIN witness \(census 22/22·99/99·99/99, regress outputs identical\); the witness statement now plans PG 18\.3's exact shape \(scratch\-PG verified\)
+  - Done 2026\-10\-27\. `outerOnQualsOK` admits a preserved\-side\-only conjunct; the seam carries it as an
+    `ojHeldQual` \(scope = one column per leaf\); `appendOJHeld` gives it a restrict info with the outer join's scope
+    as `relids` in exactly the problem that splits the join, flagged `ojHeld` and priced as a restriction
+    \(PG `distribute\_qual\_to\_rels`, `clause\_selectivity`\)\. Design doc
+    `docs/design/0100\-0149/m0147\-0053\-outer\-join\-preserved\-side\-on\-qual\.md`\.
+  - Witness `o LEFT JOIN i ON i\.k = o\.k AND o\.id > 0` now plans `Nested Loop Left Join` / `Join Filter: \(o\.id >
+    0\)` / parameterised index probe — identical to scratch PG 18\.3\. The fused\-NLI pin
+    `TestParallelNLIJointypeIdentity` is retired \(its last case now builds the decomposed family, pinned by
+    `parallel\_lateral\_left\_probe\_identity\_test\.go`\); the old RIGHT\-link decline test asserts the new placement\.
+  - Constant ON conjuncts still decline — ledger row 2026\-10\-27\.
+  - Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(61 ck\) \+ plans same=99, fire\-set PASS \(fires=none
+    both\), TPC\-H census on tree 22/22, RegressSuite PASS \(same 81 mismatches, outputs identical\), Isolation PASS\.
+  - Filed by M0147\-0052: `outerOnQualsOK` \(`internal/optimizer/joinsearchseam\.go`\) declines a LEFT/RIGHT link whose
+    ON clause carries a preserved\-side\-only conjunct or a constant \(45 regress decline events\), so the statement is
+    planned outside the PG\-shaped search\. PG keeps such a conjunct as a join clause of that outer join
+    \(`distribute\_qual\_to\_rels`, `postgres/src/backend/optimizer/plan/initsplan\.c`: `is\_pushed\_down` false, evaluated
+    in the join's restrictlist\), and its search builds the join\.
+  - Witness: `TestParallelNLIJointypeIdentity/left` \(`o LEFT JOIN i ON i\.k = o\.k AND o\.id > 0`; PG elects a
+    Nested Loop Left Join over the index probe\)\. Landing this unblocks M0147\-0051\.
+  - First step: carry the preserved\-side conjunct on the outer link as a join qual the searched join evaluates
+    \(not a residual Filter above the tree, not a scan restriction\), admit it in `outerOnQualsOK`, and check the
+    witness plans as PG does; then census \+ regress\.

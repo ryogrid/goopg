@@ -290,11 +290,8 @@ func TestParallelHashPathModelWinner(t *testing.T) {
 	chosen := 0
 	for _, sql := range c19fCorpus() {
 		t.Run(sql, func(t *testing.T) {
-			restoreOff := optimizer.SetGatherPathsMode("off")
-			serialPlan := c19fPlan(t, ctx, sql)
-			restoreOff()
+			serialPlan := c19fSerialPlan(t, ctx, sql)
 
-			restoreAll := optimizer.SetGatherPathsMode("all")
 			advanceStmtCounter(ctx)
 			stmts, err := parser.Parse(sql)
 			if err != nil {
@@ -303,7 +300,6 @@ func TestParallelHashPathModelWinner(t *testing.T) {
 			ps := c19fSettings()
 			ps.EnableParallelHash = true
 			parPlan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
-			restoreAll()
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}

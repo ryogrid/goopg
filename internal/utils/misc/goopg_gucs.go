@@ -8,9 +8,9 @@ package misc
 // M0122-0008 they were registered as wal_sender_memory_buffer,
 // enable_nestloop_index and enable_opportunistic_prune, so goopg accepted
 // SET and postgresql.conf lines that PG refuses and listed them as if they
-// were built-in.
+// were built-in. (goopg.enable_nestloop_index was retired at M0147-0051 with
+// the legacy NLI post-pass it switched off.)
 const (
 	GoopgWalSenderMemoryBuffer    = "goopg.wal_sender_memory_buffer"
-	GoopgEnableNestLoopIndex      = "goopg.enable_nestloop_index"
 	GoopgEnableOpportunisticPrune = "goopg.enable_opportunistic_prune"
 )

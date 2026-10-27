@@ -82,16 +82,24 @@ func comparePathkeysDim(a, b []PathKey) dimensionCmp {
 // a merge join sorted by `wr_web_page_sk` beside a nested loop sorted by
 // `wp_web_page_sk`; PG sees one pathkey, so add_path compares them on cost
 // alone and the nested loop's fast start evicts the fuzzily-equal merge.
+//
+// The key equality goes through the rel's identity-key memo
+// (usefulKeys.pathKeyEqual, nil-safe): add_path compares every new path's
+// pathkeys against every retained path's, and the unmemoised pathKeyEqual
+// formatted both expressions' identity keys on each comparison — 7 % of
+// TPC-DS Q64's planning (M0122-0012 C16e). PG's compare_pathkeys compares
+// canonical pathkey pointers.
 func comparePathkeysDimRel(rel *RelOptInfo, a, b []PathKey) dimensionCmp {
-	if rel == nil || rel.pathkeyClass == nil {
+	if rel == nil || (rel.pathkeyClass == nil && rel.usefulKeys == nil) {
 		return comparePathkeysDim(a, b)
 	}
+	u := rel.usefulKeys
 	n := min(len(a), len(b))
 	for i := 0; i < n; i++ {
-		if pathKeyEqual(a[i], b[i]) {
+		if u.pathKeyEqual(a[i], b[i]) {
 			continue
 		}
-		if a[i].SortAsc != b[i].SortAsc || a[i].NullsFirst != b[i].NullsFirst ||
+		if rel.pathkeyClass == nil || a[i].SortAsc != b[i].SortAsc || a[i].NullsFirst != b[i].NullsFirst ||
 			a[i].GroupingNulled != b[i].GroupingNulled || !rel.pathkeyClass(a[i].Expr, b[i].Expr) {
 			return dimIncomparable
 		}

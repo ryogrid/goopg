@@ -142,8 +142,10 @@ func TestSeamDeclinesAnUnconsumedInnerOnQualUnderARightLink(t *testing.T) {
 // admissible destinations for a RIGHT link, with the sides swapped: a
 // NULLABLE-side-only ON conjunct now reads a PREFIX relation (`a1 > 5` in the
 // RIGHT link's ON) and becomes a leaf local under the join, which is exact;
-// a PRESERVED-side-only one (`c1 > 5`) has no destination in a searched tree
-// and declines the statement.
+// a PRESERVED-side-only one (`c1 > 5`) is held at the outer join itself —
+// PG's distribute_qual_to_rels gives it the join's scope as required_relids
+// (M0147-0053; it declined the statement before) — and must be neither a scan
+// restriction on `c` nor part of the residual above the tree.
 func TestSeamRightLinkOnQualDestinations(t *testing.T) {
 	names := []string{"a", "b", "c"}
 	rows := []int64{100_000, 50_000, 10}
@@ -170,14 +172,32 @@ func TestSeamRightLinkOnQualDestinations(t *testing.T) {
 	node, ctx = seamChainFromSQL(t, names, rows, rightChain3)
 	root = node.(*Join)
 	root.Predicate = &BinaryOp{Op: parser.OpAnd, Left: root.Predicate, Right: seamLocal(names, 2)}
-	pred := seamLocal(names, 1)
-	out, residual, used = tryPGShapedJoinSearch(node, pred, ctx, nil)
-	if used {
-		t.Fatal("the seam searched a RIGHT link with a PRESERVED-side-only ON conjunct — " +
-			"pushed into c's scan it would drop rows that must be null-extended")
+	out, residual, used = tryPGShapedJoinSearch(node, nil, ctx, nil)
+	if !used {
+		t.Fatal("the seam declined a RIGHT link with a PRESERVED-side-only ON conjunct; " +
+			"it is held at the outer join since M0147-0053")
 	}
-	if out != node || residual != pred {
-		t.Fatal("the seam altered its inputs while declining")
+	if residual != nil {
+		t.Fatalf("residual = %v, want nil — above the tree `c1 > 5` would drop null-extended rows", residual)
+	}
+	if n := len(seamLeafLocalFilters(out)); n != 0 {
+		t.Fatalf("found %d leaf-local filters, want 0 — in c's scan `c1 > 5` would drop preserved rows", n)
+	}
+	held := false
+	for _, j := range rfjJoins(out) {
+		if j.Type != JoinTypeRight && j.Type != JoinTypeLeft {
+			continue
+		}
+		for _, c := range splitAnd(j.Predicate) {
+			if bo, ok := c.(*BinaryOp); ok && bo.Op == parser.OpGt {
+				if cr, ok := bo.Left.(*ColumnRef); ok && cr.Name == "c1" {
+					held = true
+				}
+			}
+		}
+	}
+	if !held {
+		t.Fatal("`c1 > 5` is not a qual of the searched outer join")
 	}
 }
 

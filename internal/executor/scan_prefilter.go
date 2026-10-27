@@ -1,34 +1,21 @@
 package executor
 
 import (
-	"os"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// scanPrefilterOn is E-17/EX3-08's operational kill switch. Default ON;
-// GOOPG_SCAN_PREFILTER=off at server start (or SetScanPrefilterEnabled(false)
-// from tests/benchmarks) restores the pre-take5 seam in which the scan
-// deforms every column and filterOp is the only evaluator.
-//
-// It exists so the E-17 measurement arm can price the prefilter against its
-// own absence on the SAME binary — the F-02 precedent (GOOPG_JOIN_SLOT_CHAIN),
-// where keeping the pre-fix seam runnable is what made the delta reproducible.
-// Read in planScanPrefilter, i.e. at Build time, so a toggle takes effect from
-// the next statement rather than mid-scan.
-var scanPrefilterOn atomic.Bool
-
-func init() {
-	scanPrefilterOn.Store(os.Getenv("GOOPG_SCAN_PREFILTER") != "off")
-}
-
-// SetScanPrefilterEnabled toggles the in-scan prefilter. Test-only API; the
-// operational switch is the environment variable read at init.
-func SetScanPrefilterEnabled(on bool) { scanPrefilterOn.Store(on) }
-
-func scanPrefilterEnabled() bool { return scanPrefilterOn.Load() }
+// scanPrefilterForceLate is a TEST-ONLY seam (like scanSkipDisabled): when set,
+// planScanPrefilter declines every qual, so the scan evaluates it LATE on the
+// finished row — the position the deleted filterOp occupied. Tests use it as
+// the oracle the EARLY position must agree with (values and error position).
+// It replaced E-17/EX3-08's operational switch GOOPG_SCAN_PREFILTER (default
+// on, `=off` forced late), which M0147-0034 retired: no gate, CI or bench
+// script ever set it. Read at Build time, so a toggle takes effect from the
+// next statement rather than mid-scan.
+var scanPrefilterForceLate atomic.Bool
 
 // scanPrefilter is the EARLY half of the scan's absorbed qual (E-17 / EX3-08
 // cut 2, design docs/design/executor-ex3-08-scan-resident-qual/DESIGN.md).
@@ -79,7 +66,7 @@ type scanPrefilter struct {
 // built on the exhaustiveness-gated walkExprRefs primitive; see
 // optimizer.PlanScanQual for why it is not a hand-written type switch here.
 func planScanPrefilter(pred optimizer.Expr, ncols int) (scanPrefilter, bool) {
-	if !scanPrefilterEnabled() {
+	if scanPrefilterForceLate.Load() {
 		return scanPrefilter{}, false
 	}
 	sq := optimizer.PlanScanQual(pred, ncols)

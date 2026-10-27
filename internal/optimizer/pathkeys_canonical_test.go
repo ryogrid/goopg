@@ -47,3 +47,49 @@ func TestAddPathCanonicalPathkeysEvictFuzzyTiedMerge(t *testing.T) {
 		t.Fatalf("opposite directions compare %v, want incomparable", got)
 	}
 }
+
+// M0122-0012 C16e: comparePathkeysDimRel compares keys through the rel's
+// identity-key memo. Its verdict must equal the unmemoised comparison for
+// every rel shape — no usefulness, usefulness without classes, classes
+// without usefulness — including structurally equal keys built as separate
+// nodes, which only the identity key (not pointer identity) equates.
+func TestComparePathkeysDimRelMemoMatchesUnmemoised(t *testing.T) {
+	a1 := &ColumnRef{Name: "a", SourceTableIdx: 1, Index: 0}
+	a2 := &ColumnRef{Name: "a", SourceTableIdx: 1, Index: 0} // equal, distinct node
+	b := &ColumnRef{Name: "b", SourceTableIdx: 2, Index: 1}
+	k := func(e Expr, asc bool) PathKey { return PathKey{Expr: e, SortAsc: asc} }
+	lists := [][]PathKey{
+		nil,
+		{k(a1, true)},
+		{k(a2, true)},
+		{k(a1, false)},
+		{k(a1, true), k(b, true)},
+		{k(a2, true), k(b, true)},
+		{k(b, true)},
+	}
+	u := &pathkeyUsefulness{keys: map[Expr]cachedKey{}}
+	withUseful := &RelOptInfo{}
+	withUseful.usefulKeys = u
+	rels := map[string]*RelOptInfo{
+		"no usefulness":        {},
+		"usefulness, no class": withUseful,
+	}
+	for name, rel := range rels {
+		for i, x := range lists {
+			for j, y := range lists {
+				if got, want := comparePathkeysDimRel(rel, x, y), comparePathkeysDim(x, y); got != want {
+					t.Fatalf("%s: lists %d vs %d: %v, want %v", name, i, j, got, want)
+				}
+			}
+		}
+	}
+	if got := comparePathkeysDimRel(withUseful, lists[1], lists[2]); got != dimEqual {
+		t.Fatalf("structurally equal keys compare %v, want equal", got)
+	}
+	// With classes, a class-equal pair stays one pathkey through the memo.
+	classRel := &RelOptInfo{pathkeyClass: func(x, y Expr) bool { return true }}
+	classRel.usefulKeys = u
+	if got := comparePathkeysDimRel(classRel, lists[1], lists[6]); got != dimEqual {
+		t.Fatalf("class-equal keys compare %v, want equal", got)
+	}
+}

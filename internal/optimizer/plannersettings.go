@@ -124,10 +124,6 @@ type PlannerSettings struct {
 	Geqo                     bool
 	GeqoThreshold            int
 
-	// EnableNestLoopIndex is goopg's `enable_nestloop_index`, the last of the
-	// six P2-02c bridges.
-	EnableNestLoopIndex bool
-
 	// The GEQO tuning knobs. take2 P3-10. All five were registered GUCs that
 	// reached nothing: geqoSearch ran at a hard-coded effort of 5, generations
 	// and pool size at their derived defaults, selection bias at a literal 2.0,
@@ -266,7 +262,6 @@ func DefaultPlannerSettings() PlannerSettings {
 
 		EnableHashAgg:            HashAggEnabled(),
 		EnablePresortedAggregate: PresortedAggEnabled(),
-		EnableNestLoopIndex:      NLIEnabled(),
 		Geqo:                     GeqoEnabled(),
 		GeqoEffort:               5,   // DEFAULT_GEQO_EFFORT
 		GeqoPoolSize:             0,   // 0 = derive from effort

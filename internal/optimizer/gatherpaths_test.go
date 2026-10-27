@@ -27,10 +27,9 @@ import (
 )
 
 // gpSearch is cpSearch plus this slice's step: the production protocol of
-// searchOneProblem, including addBaseRelGatherPaths, under an explicit mode.
-func gpSearch(t *testing.T, prob *joinlistProblem, mode gatherPathMode) *searchCtx {
+// searchOneProblem, including addBaseRelGatherPaths.
+func gpSearch(t *testing.T, prob *joinlistProblem) *searchCtx {
 	t.Helper()
-	defer setGatherPathsModeForTest(mode)()
 	s, err := buildInitialRels(prob.bindings, prob.scans, prob.relInfos, prob.cp, 0, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -185,31 +184,29 @@ func TestGatherMergePathCountsEnableGathermerge(t *testing.T) {
 // one cost_seqscan's parallel arm applied. Read from the real producer, so a
 // change to either side breaks the pin.
 func TestComputeGatherRowsUndoesTheScansDivisorOnce(t *testing.T) {
-	withParallelOn(t, func() {
-		prob := cpBigProblem([]string{"a", "b", "c"})
-		s := gpSearch(t, prob, gatherPathsOff)
-		found := 0
-		for _, rel := range s.joinrels[1] {
-			if len(rel.PartialPathlist) == 0 {
-				continue
-			}
-			found++
-			pp := rel.PartialPathlist[0]
-			d := getParallelDivisor(pp.ParallelWorkers, s.cp.parallelLeaderParticipation)
-			if want := clampRowEst(pp.Rows * d); computeGatherRows(pp, s.cp) != want {
-				t.Errorf("computeGatherRows = %v, want clamp(%v * %v) = %v", computeGatherRows(pp, s.cp), pp.Rows, d, want)
-			}
-			// And the round trip lands back on the relation's own count: the
-			// scan divided by d, the Gather multiplies by d. Allow one
-			// divisor's worth of clamp_row_est rounding, no more.
-			if diff := math.Abs(computeGatherRows(pp, s.cp) - rel.Rows); diff > d {
-				t.Errorf("round trip: gather rows %v vs rel rows %v (diff %v > divisor %v)", computeGatherRows(pp, s.cp), rel.Rows, diff, d)
-			}
+	prob := cpBigProblem([]string{"a", "b", "c"})
+	s := gpSearch(t, prob)
+	found := 0
+	for _, rel := range s.joinrels[1] {
+		if len(rel.PartialPathlist) == 0 {
+			continue
 		}
-		if found == 0 {
-			t.Fatal("fixture produced no partial path; the pin would be vacuous")
+		found++
+		pp := rel.PartialPathlist[0]
+		d := getParallelDivisor(pp.ParallelWorkers, s.cp.parallelLeaderParticipation)
+		if want := clampRowEst(pp.Rows * d); computeGatherRows(pp, s.cp) != want {
+			t.Errorf("computeGatherRows = %v, want clamp(%v * %v) = %v", computeGatherRows(pp, s.cp), pp.Rows, d, want)
 		}
-	})
+		// And the round trip lands back on the relation's own count: the
+		// scan divided by d, the Gather multiplies by d. Allow one
+		// divisor's worth of clamp_row_est rounding, no more.
+		if diff := math.Abs(computeGatherRows(pp, s.cp) - rel.Rows); diff > d {
+			t.Errorf("round trip: gather rows %v vs rel rows %v (diff %v > divisor %v)", computeGatherRows(pp, s.cp), rel.Rows, diff, d)
+		}
+	}
+	if found == 0 {
+		t.Fatal("fixture produced no partial path; the pin would be vacuous")
+	}
 }
 
 // (2) THE CROSSOVER. A Gather is worth it exactly when the CPU share the
@@ -389,74 +386,6 @@ func gpCountGathers(rel *RelOptInfo) int {
 	return n
 }
 
-// (6) The admission mode. `off` — the default — offers nothing, which is this
-// slice's serial-control-arm argument; `all` offers at a base rel; `top` offers
-// at the search's FINAL rel only. The pins are not vacuous in either direction:
-// the same fixture and the same partial path produce a Gather under one mode
-// and none under another.
-func TestGatherPathsModeGovernsAdmission(t *testing.T) {
-	withParallelOn(t, func() {
-		names := []string{"a", "b", "c"}
-
-		// Base rels: `off` vs `all`.
-		for _, tc := range []struct {
-			mode gatherPathMode
-			want int
-		}{
-			{gatherPathsOff, 0},
-			{gatherPathsTop, 0}, // a base rel is not the final rel of a 3-rel search
-			{gatherPathsAll, 1},
-		} {
-			s := gpSearch(t, cpBigProblem(names), gatherPathsOff)
-			rel := s.joinrels[1][0]
-			if len(rel.PartialPathlist) == 0 {
-				t.Fatal("fixture produced no partial path on rel 0; the pins would be vacuous")
-			}
-			makeGatherWorthwhile(rel, rel.PartialPathlist[0], s.cp)
-			restore := setGatherPathsModeForTest(tc.mode)
-			s.addBaseRelGatherPaths()
-			restore()
-			if got := gpCountGathers(rel); got != tc.want {
-				t.Errorf("mode %s: base rel has %d Gather paths, want %d", gatherPathModeLabel(tc.mode), got, tc.want)
-			}
-		}
-
-		// The final rel: `top` offers there, and a NON-final joinrel gets
-		// nothing under the same mode. Joinrels have no partial paths until
-		// C-19f, so one is installed by hand — the mode is what is under test,
-		// not the producer.
-		s := gpSearch(t, cpBigProblem(names), gatherPathsOff)
-		var mid, top *RelOptInfo
-		for lev := 2; lev < len(s.joinrels); lev++ {
-			for _, rel := range s.joinrels[lev] {
-				if relLevel(rel.Relids) == s.nrels {
-					top = rel
-				} else if mid == nil {
-					mid = rel
-				}
-			}
-		}
-		if mid == nil || top == nil {
-			t.Fatal("fixture has no intermediate and final joinrel pair")
-		}
-		for _, rel := range []*RelOptInfo{mid, top} {
-			rel.ConsiderParallel = true
-			sub := gpPartialSeqPath(rel, 0, 2)
-			rel.PartialPathlist = []*Path{sub}
-			makeGatherWorthwhile(rel, sub, s.cp)
-		}
-		defer setGatherPathsModeForTest(gatherPathsTop)()
-		s.generateUsefulGatherPaths(mid, false)
-		s.generateUsefulGatherPaths(top, false)
-		if got := gpCountGathers(mid); got != 0 {
-			t.Errorf("mode top offered %d Gather paths at a NON-final joinrel", got)
-		}
-		if got := gpCountGathers(top); got != 1 {
-			t.Errorf("mode top offered %d Gather paths at the final rel, want 1", got)
-		}
-	})
-}
-
 // (4) createPlanNode's arms: the executor node carries the SUBPATH's worker
 // count, its driving scan is stamped parallel (so EXPLAIN says "Parallel Seq
 // Scan" and the post-pass's label and this one agree), and the path's cost
@@ -466,35 +395,33 @@ func TestGatherPathsModeGovernsAdmission(t *testing.T) {
 // pathlist: whether a base-rel Gather SURVIVES add_path is the economics
 // question makeGatherWorthwhile documents, and it is not this pin's subject.
 func TestCreateGatherPlanCarriesWorkersAndStampsTheScan(t *testing.T) {
-	withParallelOn(t, func() {
-		s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}), gatherPathsOff)
-		rel := s.joinrels[1][0]
-		if len(rel.PartialPathlist) == 0 {
-			t.Fatal("fixture produced no partial path")
-		}
-		g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp, false)
-		if g == nil {
-			t.Fatal("makeGatherPath declined the fixture's partial seq scan")
-		}
-		node, _ := createPlanNode(g)
-		gather, ok := node.(*Gather)
-		if !ok {
-			t.Fatalf("createPlanNode(PathGather) = %T, want *Gather", node)
-		}
-		if want := g.Children[0].ParallelWorkers; gather.WorkersPlanned != want {
-			t.Errorf("WorkersPlanned = %d, want the subpath's %d", gather.WorkersPlanned, want)
-		}
-		scan := drivingScan(gather.Child)
-		if scan == nil {
-			t.Fatal("the built subtree has no driving scan; every worker would read the whole relation")
-		}
-		if sq, ok := scan.(*SeqScan); !ok || !sq.Parallel {
-			t.Errorf("driving scan %T is not stamped Parallel; EXPLAIN would not say \"Parallel\" and the label would disagree with the post-pass", scan)
-		}
-		if pc, set := gather.PlanCostInfo(); !set || pc.TotalCost != g.Cost.Total {
-			t.Errorf("the path's cost did not reach the node: %+v set=%v, want total %v", pc, set, g.Cost.Total)
-		}
-	})
+	s := gpSearch(t, cpBigProblem([]string{"a", "b", "c"}))
+	rel := s.joinrels[1][0]
+	if len(rel.PartialPathlist) == 0 {
+		t.Fatal("fixture produced no partial path")
+	}
+	g := makeGatherPath(rel, rel.PartialPathlist[0], s.cp, false)
+	if g == nil {
+		t.Fatal("makeGatherPath declined the fixture's partial seq scan")
+	}
+	node, _ := createPlanNode(g)
+	gather, ok := node.(*Gather)
+	if !ok {
+		t.Fatalf("createPlanNode(PathGather) = %T, want *Gather", node)
+	}
+	if want := g.Children[0].ParallelWorkers; gather.WorkersPlanned != want {
+		t.Errorf("WorkersPlanned = %d, want the subpath's %d", gather.WorkersPlanned, want)
+	}
+	scan := drivingScan(gather.Child)
+	if scan == nil {
+		t.Fatal("the built subtree has no driving scan; every worker would read the whole relation")
+	}
+	if sq, ok := scan.(*SeqScan); !ok || !sq.Parallel {
+		t.Errorf("driving scan %T is not stamped Parallel; EXPLAIN would not say \"Parallel\" and the label would disagree with the post-pass", scan)
+	}
+	if pc, set := gather.PlanCostInfo(); !set || pc.TotalCost != g.Cost.Total {
+		t.Errorf("the path's cost did not reach the node: %+v set=%v, want total %v", pc, set, g.Cost.Total)
+	}
 }
 
 // (4) …and it PANICS rather than emitting a Gather over a subtree the
@@ -573,118 +500,115 @@ func TestMaybeAddGatherDeclinesOnATreeThatAlreadyGathers(t *testing.T) {
 //   - a subpath already sorted on the useful keys is not re-sorted (the
 //     `is_sorted` continue — the bare Gather Merge loop filed it instead).
 func TestGenerateUsefulGatherPathsSortedPartialArm(t *testing.T) {
-	withParallelOn(t, func() {
-		spans := []leafSpan{{lo: 0, hi: 4}, {lo: 4, hi: 8}}
-		// A useful key: column 1 reads item 0 — inside a rel covering both.
-		useful := []PathKey{{Expr: &ColumnRef{Index: 1, Name: "x"}, SortAsc: true}}
+	spans := []leafSpan{{lo: 0, hi: 4}, {lo: 4, hi: 8}}
+	// A useful key: column 1 reads item 0 — inside a rel covering both.
+	useful := []PathKey{{Expr: &ColumnRef{Index: 1, Name: "x"}, SortAsc: true}}
 
-		newCtx := func(qpk []PathKey) (*searchCtx, *RelOptInfo, *Path) {
-			s, err := newSearchCtx(2, defaultCostParams(), nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			s.parallelModeOK = true
-			s.queryPathkeys = qpk
-			s.itemSpans = spans
-			rel := newRelOptInfo(relsetOf(0, 1), 1000, 32)
-			rel.ConsiderParallel = true
-			sub := gpPartialSeqPath(rel, 500, 2)
-			rel.PartialPathlist = []*Path{sub}
-			return s, rel, sub
+	newCtx := func(qpk []PathKey) (*searchCtx, *RelOptInfo, *Path) {
+		s, err := newSearchCtx(2, defaultCostParams(), nil)
+		if err != nil {
+			t.Fatal(err)
 		}
+		s.parallelModeOK = true
+		s.queryPathkeys = qpk
+		s.itemSpans = spans
+		rel := newRelOptInfo(relsetOf(0, 1), 1000, 32)
+		rel.ConsiderParallel = true
+		sub := gpPartialSeqPath(rel, 500, 2)
+		rel.PartialPathlist = []*Path{sub}
+		return s, rel, sub
+	}
 
-		// Happy path: the ordering is sortable early here, so the arm files
-		// Gather Merge -> Sort -> partial seq.
-		s, rel, sub := newCtx(useful)
-		defer setGatherPathsModeForTest(gatherPathsAll)()
-		s.generateUsefulGatherPaths(rel, false)
-		var gm *Path
-		for _, p := range rel.Pathlist {
-			if p.Kind == PathGatherMerge {
-				gm = p
-			}
+	// Happy path: the ordering is sortable early here, so the arm files
+	// Gather Merge -> Sort -> partial seq.
+	s, rel, sub := newCtx(useful)
+	s.generateUsefulGatherPaths(rel, false)
+	var gm *Path
+	for _, p := range rel.Pathlist {
+		if p.Kind == PathGatherMerge {
+			gm = p
 		}
-		if gm == nil {
-			t.Fatal("sorted-partial arm filed no Gather Merge for a sortable-early ordering")
-		}
-		if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
-			t.Fatalf("Gather Merge child kind = %v, want PathSort (worker-side sort)", gm.Children[0].Kind)
-		}
-		srt := gm.Children[0]
-		if len(srt.Children) != 1 || srt.Children[0] != sub {
-			t.Fatal("the Sort must wrap the cheapest partial path, not a new input")
-		}
-		if !pathkeysContainedIn(srt.Pathkeys, useful) || !pathkeysContainedIn(gm.Pathkeys, useful) {
-			t.Error("Sort and Gather Merge must carry the useful ordering so the keys survive upward")
-		}
-		if srt.ParallelWorkers != sub.ParallelWorkers {
-			t.Errorf("Sort path workers = %d, want the subpath's %d", srt.ParallelWorkers, sub.ParallelWorkers)
-		}
-		if srt.Rows != sub.Rows {
-			t.Errorf("worker-side Sort is priced on the subpath's per-worker rows %v, got %v", sub.Rows, srt.Rows)
-		}
+	}
+	if gm == nil {
+		t.Fatal("sorted-partial arm filed no Gather Merge for a sortable-early ordering")
+	}
+	if len(gm.Children) != 1 || gm.Children[0].Kind != PathSort {
+		t.Fatalf("Gather Merge child kind = %v, want PathSort (worker-side sort)", gm.Children[0].Kind)
+	}
+	srt := gm.Children[0]
+	if len(srt.Children) != 1 || srt.Children[0] != sub {
+		t.Fatal("the Sort must wrap the cheapest partial path, not a new input")
+	}
+	if !pathkeysContainedIn(srt.Pathkeys, useful) || !pathkeysContainedIn(gm.Pathkeys, useful) {
+		t.Error("Sort and Gather Merge must carry the useful ordering so the keys survive upward")
+	}
+	if srt.ParallelWorkers != sub.ParallelWorkers {
+		t.Errorf("Sort path workers = %d, want the subpath's %d", srt.ParallelWorkers, sub.ParallelWorkers)
+	}
+	if srt.Rows != sub.Rows {
+		t.Errorf("worker-side Sort is priced on the subpath's per-worker rows %v, got %v", sub.Rows, srt.Rows)
+	}
 
-		// No ordering wanted: the arm files nothing (the bare Gather still
-		// stands — it is generate_gather_paths' own candidate).
-		s2, rel2, _ := newCtx(nil)
-		s2.generateUsefulGatherPaths(rel2, false)
-		for _, p := range rel2.Pathlist {
-			if p.Kind == PathGatherMerge {
-				t.Error("a rel with no useful ordering must not get a Gather Merge")
-			}
+	// No ordering wanted: the arm files nothing (the bare Gather still
+	// stands — it is generate_gather_paths' own candidate).
+	s2, rel2, _ := newCtx(nil)
+	s2.generateUsefulGatherPaths(rel2, false)
+	for _, p := range rel2.Pathlist {
+		if p.Kind == PathGatherMerge {
+			t.Error("a rel with no useful ordering must not get a Gather Merge")
 		}
+	}
 
-		// A leading key the rel cannot sort early (item 2 is outside rel)
-		// truncates the prefix to nothing — upstream's `break`.
-		outside := []PathKey{{Expr: &ColumnRef{Index: 9, Name: "y"}, SortAsc: true}}
-		s3, rel3, _ := newCtx(outside)
-		s3.generateUsefulGatherPaths(rel3, false)
-		for _, p := range rel3.Pathlist {
-			if p.Kind == PathGatherMerge {
-				t.Error("a pathkey outside the rel's rels is not sortable early — no Gather Merge")
-			}
+	// A leading key the rel cannot sort early (item 2 is outside rel)
+	// truncates the prefix to nothing — upstream's `break`.
+	outside := []PathKey{{Expr: &ColumnRef{Index: 9, Name: "y"}, SortAsc: true}}
+	s3, rel3, _ := newCtx(outside)
+	s3.generateUsefulGatherPaths(rel3, false)
+	for _, p := range rel3.Pathlist {
+		if p.Kind == PathGatherMerge {
+			t.Error("a pathkey outside the rel's rels is not sortable early — no Gather Merge")
 		}
-		// Prefix truncation: [outside, inside] keeps nothing; [inside,
-		// outside] keeps the one-key prefix.
-		mixed := []PathKey{useful[0], outside[0]}
-		rel4 := newRelOptInfo(relsetOf(0, 1), 1000, 32)
-		rel4.ConsiderParallel = true
-		sub4 := gpPartialSeqPath(rel4, 500, 2)
-		rel4.PartialPathlist = []*Path{sub4}
-		s4, _ := newSearchCtx(2, defaultCostParams(), nil)
-		s4.parallelModeOK = true
-		s4.queryPathkeys = mixed
-		s4.itemSpans = spans
-		s4.generateUsefulGatherPaths(rel4, false)
-		var gm4 *Path
-		for _, p := range rel4.Pathlist {
-			if p.Kind == PathGatherMerge {
-				gm4 = p
-			}
+	}
+	// Prefix truncation: [outside, inside] keeps nothing; [inside,
+	// outside] keeps the one-key prefix.
+	mixed := []PathKey{useful[0], outside[0]}
+	rel4 := newRelOptInfo(relsetOf(0, 1), 1000, 32)
+	rel4.ConsiderParallel = true
+	sub4 := gpPartialSeqPath(rel4, 500, 2)
+	rel4.PartialPathlist = []*Path{sub4}
+	s4, _ := newSearchCtx(2, defaultCostParams(), nil)
+	s4.parallelModeOK = true
+	s4.queryPathkeys = mixed
+	s4.itemSpans = spans
+	s4.generateUsefulGatherPaths(rel4, false)
+	var gm4 *Path
+	for _, p := range rel4.Pathlist {
+		if p.Kind == PathGatherMerge {
+			gm4 = p
 		}
-		if gm4 == nil {
-			t.Fatal("truncation must keep the sortable-early prefix, not drop the ordering")
-		}
-		if len(gm4.Pathkeys) != 1 {
-			t.Errorf("truncated ordering should carry 1 pathkey, got %d", len(gm4.Pathkeys))
-		}
+	}
+	if gm4 == nil {
+		t.Fatal("truncation must keep the sortable-early prefix, not drop the ordering")
+	}
+	if len(gm4.Pathkeys) != 1 {
+		t.Errorf("truncated ordering should carry 1 pathkey, got %d", len(gm4.Pathkeys))
+	}
 
-		// Already-sorted subpath: the `is_sorted` continue — the bare arm
-		// covers it and no Sort is inserted between.
-		s5, rel5, sub5 := newCtx(useful)
-		sub5.Pathkeys = useful
-		s5.generateUsefulGatherPaths(rel5, false)
-		gmN := 0
-		for _, p := range rel5.Pathlist {
-			if p.Kind == PathGatherMerge {
-				gmN++
-				if p.Children[0].Kind == PathSort {
-					t.Error("a subpath already delivering the ordering must not be re-sorted")
-				}
+	// Already-sorted subpath: the `is_sorted` continue — the bare arm
+	// covers it and no Sort is inserted between.
+	s5, rel5, sub5 := newCtx(useful)
+	sub5.Pathkeys = useful
+	s5.generateUsefulGatherPaths(rel5, false)
+	gmN := 0
+	for _, p := range rel5.Pathlist {
+		if p.Kind == PathGatherMerge {
+			gmN++
+			if p.Children[0].Kind == PathSort {
+				t.Error("a subpath already delivering the ordering must not be re-sorted")
 			}
 		}
-		if gmN != 1 {
-			t.Errorf("want exactly the bare-arm Gather Merge over the sorted subpath, got %d", gmN)
-		}
-	})
+	}
+	if gmN != 1 {
+		t.Errorf("want exactly the bare-arm Gather Merge over the sorted subpath, got %d", gmN)
+	}
 }

@@ -256,3 +256,24 @@ Tracked under M0102-0010.
 - **Default-ON flip gate (loop #44):** full regress-port suite on a checksummed
   data dir — `go test -timeout 3000s -run TestPort_RegressSuite ./internal/testport/`
   → PASS (`ok ... 2618.543s`, 0 unexpected diffs).
+
+## The rows form of pg_checksum_block (2026-10-27, M0122-0012 C19)
+
+`pageChecksumBlock` had one form, which built each word from little-endian bytes. Per word it paid a bounds check,
+the byte assembly, and a `pd_checksum` offset compare. That loop was 12 % of TPC-H Q17, which verifies every
+lineitem page it reads in. Both goopg and the release PG clusters run with data checksums on (version 1).
+
+PG's `checksum_impl.h` lays the page out as `nChecksumSums`-word rows so a C compiler can vectorise the loop.
+
+**Change.** goopg now has two forms:
+
+- **`pageChecksumBlockRows`.** It reads the page in place as `[32]uint32` rows, masks `pd_checksum` once in row
+  0, and has no bounds checks in the lane loop. It is used on a little-endian host for a whole, 4-byte-aligned
+  page.
+- **`pageChecksumBlockPortable`.** This is the original. It covers every other case and is the oracle in
+  `TestPageChecksumRowsEqualsPortable`, which checks 2000 random pages, `pd_checksum` exclusion, an all-ones page
+  and an unaligned page.
+
+The algorithm and every stored checksum are unchanged.
+
+**Measured.** Micro-benchmark: 1058 ns against 2473 ns per page. TPC-H Q17: −13.2 % instructions:u per query.

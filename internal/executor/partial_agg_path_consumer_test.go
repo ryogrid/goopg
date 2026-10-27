@@ -32,17 +32,15 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// runAggSplitPriced is `runAggSplit` with the C-19g verdict live. The mode is
-// process-global by design (read once at process start, so a plan cannot change
-// shape mid-statement), so every caller must restore it.
+// runAggSplitPriced is `runAggSplit` with the C-19g verdict live. The verdict is
+// unconditional since M0147-0047 retired GOOPG_PARTIAL_AGG_PATHS, so this is now
+// runAggSplit itself; the name is kept so the callers still say which verdict
+// they rely on.
 func runAggSplitPriced(t *testing.T, ctx *Context, sql string, workers int) ([]string, bool) {
 	t.Helper()
-	restore := optimizer.SetPartialAggPathsMode("on")
-	defer restore()
 	return runAggSplit(t, ctx, sql, workers)
 }
 

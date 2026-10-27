@@ -76,91 +76,7 @@ func onOff(on bool) string {
 // Nothing here may be a literal that restates a default declared elsewhere —
 // that duplication IS the defect this file exists to make impossible.
 var flagResolvedState = map[string]func(string) string{
-	"GOOPG_MEMOIZE":           func(v string) string { return onOff(memoizeFromEnv(v)) },
-	"GOOPG_PARALLEL":          func(v string) string { return onOff(parallelFromEnv(v)) },
-	"GOOPG_EXISTS_TO_ANY":     func(v string) string { return onOff(existsToAnyFromEnv(v)) },
-	"GOOPG_INDEXKEY_HARVEST":  func(v string) string { return onOff(indexKeyHarvestFromEnv(v)) },
-	"GOOPG_HASH_OUTER_JOIN":   func(v string) string { return onOff(hashOuterJoinFromEnv(v)) },
-	// Take2 P4-01 rev 10 step 3: narrows hash-join build sides to the
-	// statement's needed columns. Default ON since step 5 (P4-A §18); `=0`
-	// opts back out to the un-narrowed arm.
-	"GOOPG_NARROW_BUILD": func(v string) string { return onOff(narrowBuildFromEnv(v)) },
-	// B-01c applying half, slice (b): narrows the input row of an upper
-	// Aggregate site whose stamped target the key-preservation gate passes,
-	// sinking the cut past order-preserving wrappers so the Sort beneath a
-	// sorted aggregation carries the narrowed row (upper_narrow_apply.go).
-	// Default ON, `=0` opts back out to the un-narrowed arm.
-	"GOOPG_NARROW_UPPER": func(v string) string { return onOff(narrowUpperFromEnv(v)) },
-	// B-01c applying half, slice (c): narrows the input row of an upper `*Sort`
-	// site — the general ORDER BY sort — re-basing the whole ancestor chain up
-	// to the node that absorbs the change (upper_narrow_chain.go). A separate
-	// flag from GOOPG_NARROW_UPPER because the two sites move different plan
-	// shapes and an A/B that cannot separate them cannot attribute a
-	// regression. Default ON; `=0` opts back out, as does GOOPG_NARROW_UPPER=0.
-	"GOOPG_NARROW_UPPER_SORT": func(v string) string { return onOff(narrowUpperSortFromEnv(v)) },
-	// M0139-S1: the join-leg hook (joinleghook.go). Default ON, `=0` opts
-	// back out — but unlike its three GOOPG_NARROW_* siblings above, S1's
-	// hook never changes a node; it only counts the legs a real narrowing
-	// pass would have something to say about. Flipping this flag off
-	// therefore does not change any plan captured today (M0139-S2 is what
-	// makes the flag load-bearing).
-	"GOOPG_NARROW_LEG_HOOK": func(v string) string { return onOff(narrowLegHookFromEnv(v)) },
-	// R121 Slice A, PROMOTED TO DEFAULT ON BY R128. It now shares the
-	// opt-OUT form (`=0` opts back out) with the three GOOPG_NARROW_* flags
-	// above, so the in/out distinction no longer separates them -- but it is
-	// still the only one of the family that gates a planner COST input rather
-	// than executor plan SHAPE, and artefacts must keep them distinct on that
-	// basis. (The previous comment here asserted "this one is opt-IN"; that
-	// was true until the promotion and is corrected rather than dropped, so a
-	// reader of an older artefact can date it.)
-	"GOOPG_NARROW_COST_INPUTS": func(v string) string { return onOff(narrowCostInputsFromEnv(v)) },
-	// C-19d: a MODE, not a boolean — off / top / all. It decides whether the
-	// search may choose a Gather at all, and at which rels, so an artefact
-	// that does not name it cannot say whether the plans it holds were free
-	// to parallelise. Rendered through the same label function the resolver
-	// uses, so the token inside `unset(…)` re-exported reproduces the arm.
-	"GOOPG_GATHER_PATHS": func(v string) string { return gatherPathModeLabel(gatherPathModeFromEnv(v)) },
-	"GOOPG_PARTIAL_AGG_PATHS": func(v string) string {
-		return partialAggModeLabel(partialAggModeFromEnv(v))
-	},
-	// C-19e: selects which authority decides `Gather Merge -> Sort -> partial`
-	// — the retired type switch or the priced two-candidate tournament. It
-	// moves the plan of every parallel ORDER BY / merge-input sort, so an
-	// artefact that does not name it cannot say which arm it measured.
-	"GOOPG_PARTIAL_SORT_PATHS": func(v string) string {
-		return partialSortModeLabel(partialSortModeFromEnv(v))
-	},
-	// R108's experiment is intentionally default-off. Its plan-changing arm
-	// must nevertheless be stamped so every A/B artefact names the geometry
-	// currency it used.
-	"GOOPG_PG_HASH_TUPLE_SPILL_COST": func(v string) string {
-		return onOff(pgHashTupleSpillCostFromEnv(v))
-	},
-	// R113's experiment is default-off and changes only Sort's planner byte
-	// price, but artefacts must name its currency for a reproducible A/B.
-	"GOOPG_PG_SORT_RELATION_BYTES_COST": func(v string) string {
-		return onOff(pgSortRelationBytesCostFromEnv(v))
-	},
-	// M0139-0007b's experiment is default-off and changes only Memoize's
-	// planner cache-entry byte price, but artefacts must name its currency for
-	// a reproducible A/B.
-	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": func(v string) string {
-		return onOff(pgMemoizeEntryBytesCostFromEnv(v))
-	},
-	// A mode, not a boolean: the artefact carries the word an operator would
-	// export to reproduce the arm.
-	"GOOPG_NLI_COSTGATE": func(v string) string {
-		if nliCostGateLegacyFromEnv(v) {
-			return "legacy"
-		}
-		return "current"
-	},
-	// M0141-S2b-2c / S7: gates addOrderedPaths' third arm (Incremental Sort
-	// over a losing search candidate). Default off — createPlanNode has no
-	// arm for PathIncrementalSort until the executor operator lands.
-	"GOOPG_INCREMENTAL_SORT": func(v string) string {
-		return incrementalSortModeLabel(incrementalSortModeFromEnv(v))
-	},
+	"GOOPG_EXISTS_TO_ANY": func(v string) string { return onOff(existsToAnyFromEnv(v)) },
 }
 
 // flagProvenanceOrder is the order the flags are stamped in. The first six are
@@ -170,20 +86,25 @@ var flagResolvedState = map[string]func(string) string{
 var flagProvenanceOrder = []string{
 	"GOOPG_RELSIZE_FALLBACK",
 	"GOOPG_COST_DRIVEN_JOINORDER",
+	// Retired at M0147-0044 — see flagProvenanceRetired.
 	"GOOPG_MEMOIZE",
+	// Retired at M0147-0045 — see flagProvenanceRetired.
 	"GOOPG_PARALLEL",
 	// Retired at M0145-0008 — see flagProvenanceRetired.
 	"GOOPG_PGSHAPED_DP",
 	"GOOPG_PGSHAPED_COLLAPSE",
 	"GOOPG_EXISTS_TO_ANY",
 	"GOOPG_UNNEST_PREDP",
+	// Retired at M0147-0049 — see flagProvenanceRetired.
 	"GOOPG_INDEXKEY_HARVEST",
+	// Retired at M0147-0051 — see flagProvenanceRetired.
 	"GOOPG_NLI_COSTGATE",
+	// Retired at M0147-0014 — see flagProvenanceRetired.
 	"GOOPG_HASH_OUTER_JOIN",
 	// Joined at planner-refactor-take2 P0-04c. It multiplies NL-index probe
 	// cost, so it moves the hash-vs-NL crossover on every join — and it had
 	// been readable, and absent from every artefact, since M0126. It escaped
-	// the completeness guard because it is read through envFloatDefault rather
+	// the completeness guard because it was read through envFloatDefault rather
 	// than a literal os.Getenv, which the old regex detector could not see.
 	// Retired at M0146-0159 — see flagProvenanceRetired.
 	"GOOPG_INDEX_PROBE_MULT",
@@ -194,22 +115,27 @@ var flagProvenanceOrder = []string{
 	// not name it cannot say which arm it measured.
 	// Joined at take2 P4-01 rev 10 step 3: narrows hash-join build sides,
 	// default ON since step 5 (P4-A §18 steps 3-5).
+	// Retired at M0147-0040 — see flagProvenanceRetired.
 	"GOOPG_NARROW_BUILD",
 	// Joined at take3 B-01c applying half, slice (b): narrows an upper
 	// Aggregate site's input row and sinks the cut past the Sort beneath a
 	// sorted aggregation, so an artefact that does not name it cannot say
 	// which sort payload it measured. Default ON.
+	// Retired at M0147-0039 — see flagProvenanceRetired.
 	"GOOPG_NARROW_UPPER",
 	// Joined at take3 B-01c applying half, slice (c): narrows the general
 	// ORDER BY sort's input row and re-bases the ancestor chain above it, so an
 	// artefact that does not name it cannot say which sort payload it measured.
 	// Default ON.
+	// Retired at M0147-0038 — see flagProvenanceRetired.
 	"GOOPG_NARROW_UPPER_SORT",
 	// Joined at M0139-S1: the join-leg hook (joinleghook.go). A pure
 	// decline that only counts eligible legs; no artefact captured before
 	// M0139-S2 lands can differ by this flag's value. Default ON.
+	// Retired at M0147-0031 — see flagProvenanceRetired.
 	"GOOPG_NARROW_LEG_HOOK",
 	// Joined at R121 (r121-narrow-cost-inputs/SCOPE.md). Default `off`.
+	// Retired at M0147-0041 — see flagProvenanceRetired.
 	"GOOPG_NARROW_COST_INPUTS",
 	// Joined at take3 C-19d (P5-04): admits `PathGather` / `PathGatherMerge`
 	// into the search. Default `all` since M0140-0003 landed the TPC-H/
@@ -217,7 +143,9 @@ var flagProvenanceOrder = []string{
 	// DESIGN.md §5; docs/design/0100-0149/
 	// m0140-0003-gather-paths-flip-lands-default-on.md). `off` still
 	// reproduces the pre-M0140-0003 arm.
+	// Retired at M0147-0046 — see flagProvenanceRetired.
 	"GOOPG_GATHER_PATHS",
+	// Retired at M0147-0047 — see flagProvenanceRetired.
 	"GOOPG_PARTIAL_AGG_PATHS",
 	// Joined at take3 E-21 Cut 1: admits a one-FROM-item statement to the path
 	// search, as PG's set_base_rel_pathlists does unconditionally
@@ -225,13 +153,17 @@ var flagProvenanceOrder = []string{
 	"GOOPG_ONEREL_SEARCH",
 	// Joined at take3 C-19e (P5-05). Default `off` pending the measurement in
 	// docs/design/planner-c19e-partial-sort/DESIGN.md §5.
+	// Retired at M0147-0020 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PARTIAL_SORT_PATHS",
+	// Retired at M0147-0021 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PG_HASH_TUPLE_SPILL_COST",
+	// Retired at M0147-0042 — see flagProvenanceRetired.
 	"GOOPG_PG_SORT_RELATION_BYTES_COST",
 	// Joined at M0139-0007b: gives cost_memoize_rescan's cache-entry byte
 	// estimate PG's relation_byte_size/ExecEstimateCacheEntryOverheadBytes
 	// currency instead of goopg's kvcache entry size. Default `off`, R108/
 	// R113-shaped.
+	// Retired at M0147-0022 (promoted) — see flagProvenanceRetired.
 	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST",
 	// Joined at R120 (r120-hashagg-width-currency/SCOPE.md), default `off`.
 	// Retired at M0137-0009 — see flagProvenanceRetired below.
@@ -239,6 +171,7 @@ var flagProvenanceOrder = []string{
 	// Joined at M0141-S2b-2c / S7: gates addOrderedPaths' third arm
 	// (incrementalsortpaths.go). Default `off` — createPlanNode has no arm
 	// for PathIncrementalSort until the executor operator lands.
+	// Retired at M0147-0043 — see flagProvenanceRetired.
 	"GOOPG_INCREMENTAL_SORT",
 	// Joined at M0145-0011: bypassed the `outer-over-derived` firewall
 	// (relfromjoinlist.go). Retired at M0145-0018 — see
@@ -346,6 +279,98 @@ var flagProvenanceRetired = map[string]string{
 	// it stays a SubPlan). M0147-0013 deleted the arm, so nothing reads the
 	// variable. `on` in an older artefact is the decorrelating arm.
 	"GOOPG_SCALAR_UNNEST": "M0147-0013",
+	// M0127-P4.2's hash-or-merge choice for a RIGHT/FULL join the post-search
+	// algorithm assignment reaches, default OFF (merge) since then. Neither arm
+	// is PG's add_paths_to_joinrel; M0147-0014 deleted the hash arm, so nothing
+	// reads the variable. `on` in an older artefact is the hash-choosing arm.
+	"GOOPG_HASH_OUTER_JOIN": "M0147-0014",
+	// C-19e's authority switch for `Gather Merge -> Sort -> partial`: the
+	// retired type switch (`off`, the default) or the priced cost_sort /
+	// cost_gather_merge tournament (`on`). M0147-0020 promoted the tournament —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is the type-switch arm; this binary always
+	// runs the tournament.
+	"GOOPG_PARTIAL_SORT_PATHS": "M0147-0020",
+	// R108's PG hash-join spill price (packed HashJoinTuple batch geometry +
+	// page_size batch I/O), default off since then. M0147-0021 promoted it —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is the executor-map pricing arm.
+	"GOOPG_PG_HASH_TUPLE_SPILL_COST": "M0147-0021",
+	// M0139-0007b's PG cost_memoize_rescan tuple-byte currency
+	// (relation_byte_size + ExecEstimateCacheEntryOverheadBytes + the per-key
+	// get_expr_width term), default off since then. M0147-0022 promoted it —
+	// plan-neutral on both TPC-DS corpora — so nothing reads the variable.
+	// `off` in an older artefact is goopg's kvcache-entry currency.
+	"GOOPG_PG_MEMOIZE_ENTRY_BYTES_COST": "M0147-0022",
+	// M0139-S1/S2's join-leg narrowing hook switch (default on, `=0` opted
+	// out). M0147-0031 made the hook unconditional, so nothing reads the
+	// variable. `off` in an older artefact is the un-narrowed-leg arm.
+	"GOOPG_NARROW_LEG_HOOK": "M0147-0031",
+	// B-01c slice (c)'s upper-Sort narrowing site switch (default on, `=0`
+	// opted out). M0147-0038 made the site unconditional under
+	// GOOPG_NARROW_UPPER, so nothing reads the variable. `off` in an older
+	// artefact is the un-narrowed-Sort arm.
+	"GOOPG_NARROW_UPPER_SORT": "M0147-0038",
+	// B-01c slice (b)'s upper-narrowing pass switch (default on, `=0` opted
+	// out of both the Aggregate and the Sort site). M0147-0039 made the pass
+	// unconditional, so nothing reads the variable. `off` in an older artefact
+	// is the un-narrowed-upper arm.
+	"GOOPG_NARROW_UPPER": "M0147-0039",
+	// P4-01 rev 10's build-side narrowing switch (default on, `=0` opted out
+	// of both the hash-build and the merge-input site). M0147-0040 made both
+	// sites unconditional, so nothing reads the variable. `off` in an older
+	// artefact is the un-narrowed-build arm.
+	"GOOPG_NARROW_BUILD": "M0147-0040",
+	// R121's cost-input narrowing switch (default on since R128, `=0` opted
+	// out to full-relation widths in the planner's cost inputs). M0147-0041
+	// made the narrowing unconditional, so nothing reads the variable. `off`
+	// in an older artefact is the un-narrowed-cost arm.
+	"GOOPG_NARROW_COST_INPUTS": "M0147-0041",
+	// R113's Sort planner byte price (PG cost_sort's relation_byte_size
+	// input; default on since M0146-0234, `=0` kept goopg's entry-byte
+	// currency). M0147-0042 made the PG currency unconditional whenever the
+	// planner width is valid, so nothing reads the variable. `off` in an
+	// older artefact is the goopg-currency Sort arm.
+	"GOOPG_PG_SORT_RELATION_BYTES_COST": "M0147-0042",
+	// addOrderedPaths' third arm (Incremental Sort over a losing search
+	// candidate; default on since M0146-0006, `off` dropped the arm).
+	// M0147-0043 left the arm gated only by PG's enable_incremental_sort, so
+	// nothing reads the variable. `off` in an older artefact is the
+	// seed-only ORDERED tournament.
+	"GOOPG_INCREMENTAL_SORT": "M0147-0043",
+	// The process-wide Memoize kill switch (default on, `off` disabled both
+	// the legacy NLI insertion rule and get_memoize_path). M0147-0044 left
+	// both arms answering only to the statement's enable_memoize, so nothing
+	// reads the variable. `off` in an older artefact is the no-Memoize arm.
+	"GOOPG_MEMOIZE": "M0147-0044",
+	// The process-wide parallel kill switch (default on, `off` refused every
+	// partial path and stripped Gathers). M0147-0045 left parallelism answering
+	// only to max_parallel_workers_per_gather, which already did both, so
+	// nothing reads the variable. `off` in an older artefact is the serial arm.
+	"GOOPG_PARALLEL": "M0147-0045",
+	// C-19d's admission MODE (off / top / all; default all since M0140-0003).
+	// M0147-0046 kept only `all` — every rel with partial paths is offered its
+	// Gathers, as generate_useful_gather_paths does — so nothing reads the
+	// variable. `off` in an older artefact is the serial-search arm; `top`
+	// admitted only the search's final rel.
+	"GOOPG_GATHER_PATHS": "M0147-0046",
+	// C-19g's split verdict mode (default on since 2026-09-07; `off` kept the
+	// retired size rule, splitAggregateIsProfitable, as the serial control
+	// arm). M0147-0047 made the priced tournament unconditional and deleted
+	// the size rule, so nothing reads the variable. `off` in an older artefact
+	// is the size-rule arm (TPC-H 10/22 vs PG when measured at retirement).
+	"GOOPG_PARTIAL_AGG_PATHS": "M0147-0047",
+	// The unnest index-key harvest switch (default on; `off` kept an
+	// index-absorbed correlation unaccounted, so the IN/EXISTS sublink stayed
+	// a per-row SubPlan). M0147-0049 made the harvest unconditional — the
+	// `off` arm's TPC-H/TPC-DS plans were byte-identical at retirement — so
+	// nothing reads the variable.
+	"GOOPG_INDEXKEY_HARVEST": "M0147-0049",
+	// D6.3a's escape hatch for the legacy NLI post-pass's semi/anti cost gate
+	// (`legacy` restored the stats-blind heuristic). M0147-0051 deleted the
+	// post-pass, so nothing reads the variable. `legacy` in an older artefact
+	// is that gate's old arm.
+	"GOOPG_NLI_COSTGATE": "M0147-0051",
 }
 
 // FlagProvenanceTable is the authoritative list of planner env flags that a

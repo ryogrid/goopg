@@ -33,40 +33,6 @@ func TestNLIRuleSkipsWhenInnerHasNoIndex(t *testing.T) {
 	}
 }
 
-// TestNLIRuleRespectsKillSwitch confirms `SetNLIEnabled(false)`
-// short-circuits the rewrite — the rollback path described in the
-// M0054-0006e design.
-func TestNLIRuleRespectsKillSwitch(t *testing.T) {
-	cat := catalog.NewInMemory()
-	parts, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
-		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := cat.CreateIndex(parser.ObjectName{Name: "part_pk"}, parts,
-		[]string{"p_partkey"}, true, "btree", true); err != nil {
-		t.Fatal(err)
-	}
-	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
-		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stmt := parseOne(t, `SELECT * FROM lineitem, part WHERE l_partkey = p_partkey`)
-
-	SetNLIEnabled(false)
-	defer SetNLIEnabled(true)
-	node, err := Plan(stmt, cat)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if findNLI(node) {
-		t.Fatalf("kill-switch off: did not expect NLI; tree: %s", describePlanTree(node))
-	}
-}
-
 // TestNLIRuleSkipsCompositeIndexWithPartialKey
 // (M0054-0006-followup-Q9-composite) asserts the regression
 // guard: when only the leading column of a composite index has

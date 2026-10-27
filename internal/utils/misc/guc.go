@@ -590,7 +590,7 @@ func NewRegistry() *Registry {
 // session successfully `SET`s the named variable (case-insensitive).
 // The callback receives the canonicalised value AFTER the session
 // layer is updated. Use cases: bridging SQL-level toggles to
-// package-level atomic flags such as `planner.SetNLIEnabled`. Only
+// package-level atomic flags. Only
 // one callback per name is supported; a second registration replaces
 // the first. (M0054-0006e-followup.)
 func (r *Registry) OnChange(name string, fn func(value string)) {
@@ -732,8 +732,8 @@ type ReloadResult struct {
 // both are reported as warnings and left untouched. Every other
 // context is applied with SourceConfigFile, and — because the server
 // is already live, unlike at boot — each successful change also fires
-// the registry's OnChange bridge so process-global toggles (e.g.
-// goopg.enable_nestloop_index) observe the new value immediately.
+// the registry's OnChange bridge so process-global toggles observe the new
+// value immediately.
 func (r *Registry) ApplyReloadEntries(entries []ConfigEntry) ReloadResult {
 	var res ReloadResult
 	present := make(map[string]bool, len(entries))

@@ -12,7 +12,7 @@ import (
 // out — see the sample's header). The name uses `\w` rather than `[a-z_]` because the registry
 // preserves PG's capitalised names (`DateStyle`, `TimeZone`,
 // `IntervalStyle`). A dotted name is goopg's own custom-namespace knob
-// (`goopg.enable_nestloop_index`).
+// (`goopg.enable_opportunistic_prune`).
 //
 // The trailing `(?:#.*)?` discards an inline hint comment. Values
 // containing a `#` inside single quotes are not currently present in
