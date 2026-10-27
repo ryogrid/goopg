@@ -2083,6 +2083,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - **Target \(C33, first slice\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`,
       5 runs × 2, fresh A/B\)\. Bar: −3 %\. Design doc to write first:
       `docs/design/0100\-0149/0122\-0012\-c33\-index\-scan\-read\-set\.md`\.
+  - **Loop \#215**: S9 reused census 20261028a \(`d1e6f0a79` is analysis\-only\)\. C33 design written:
+    `docs/design/0100\-0149/0122\-0012\-c33\-index\-scan\-read\-set\.md` — the deform analysis threads only an integer
+    bound \(`deformFoldRefs` = max ref \+ 1\) through buildNode / every deformBoundBelow arm, so a set cannot reach an
+    index scan without a signature change; the design adds a separate Build\-time pass
+    \(`indexScanReadSets`\) that walks the plan top\-down with a column set \(unknown nodes/expressions = all\), consumed
+    by the two IndexScan build arms as `colInfo\.skip`, leaving every existing bound path untouched\. Implementation is
+    the next loop's slice; nothing attempted, misses 0\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5703,6 +5710,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#214\) — **exhausted at `e3a2535f0`** \(C32 slice 1 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261028a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#215\) — **exhausted at `d1e6f0a79`**, census `routing\-20261028a/` reused:
+    `d1e6f0a79` is analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
+    this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
