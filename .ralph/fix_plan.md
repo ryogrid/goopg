@@ -2172,6 +2172,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestSkipLookAheadMatchesEntryWalk` \(mutation\-checked\)\. **Misses 0\.** Design: part 10 §113\. Next on
       return: re\-census S9, then Q72's descents \(`cursorAt` ~35 %: per\-descent page pin \+ bufmap lookup \+
       readOpaque\) or a fresh G1 census \(census\-20261027b expires 2026\-10\-30\)\.
+  - **Return 2026\-10\-28 \(loop \#221, misses 0\)**: S9 re\-census `routing\-20261028d` exhausted\. G3 on Q72 at
+    `4321d5793` \(`tmp/g3\-221/`\): descents \(`ResetScanCursor`\) 36\.6 %, nearly all the internal\-page binary
+    search\. Across the query the key\-compare chain is ~21 % — compareFixedPrefix 9\.7, comparePGIndexTupleAttrsAt
+    5\.5, PGCompareInt4 3\.3, compareAttr 2\.8 \(loop \#220 profile\)\. Each fixed\-width attribute goes through the
+    by\-value `PGKeyAttr\.compareAttr`, slice construction and an indirect `Compare` call\. PG's `\_bt\_compare` calls
+    the opclass proc too, but its int4/int8/date keys reach btint4cmp/btint8cmp with by\-value Datums
+    \(`index\_getattr` attcacheoff, `FunctionCall2Coll`\)\.
+    - C37: `PGKeyAttr\.IntWidth` \(2/4/8 for the signed\-integer comparators — int2, int4/date, int8/time/timestamp/
+      timestamptz — stamped by the executor's descriptor builder\); `compareFixedPrefix` compares such attributes
+      inline from the page bytes \(Desc negated\), no compareAttr / indirect call\.
+    - **Target \(C37\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C37 LANDED \(slice 114\)**: `PGKeyAttr\.IntWidth` \(stamped by `pgIndexIntWidthForOID`\) and the inline
+      signed\-integer arm in `compareFixedPrefix`\. Q72 23\.157/23\.156 → 21\.229/21\.231 Ginstr/q \(**−8\.3 %, meets the
+      bar**\); Q23 −2\.3 %; Q72 output identical; plans 99/99 same\. Tests `TestCompareFixedIntMatchesComparator`
+      \(mutation\-checked\), `TestPGIndexIntWidthMatchesComparator`\. **Misses 0\.** Design: part 10 §114\. Isolation
+      suite needs `\-timeout 30m` \(533–587 s against the 10\-minute default\)\. Next on return: re\-census S9, then a
+      fresh G1 refresh \(census\-20261027b expires 2026\-10\-30; release\-PG numbers are reusable, goopg's moved\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5809,6 +5827,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-28 \(loop \#220\) — **exhausted at `b68540921`**, fresh census `routing\-20261028c/`
     \(s9ax\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#221\) — **exhausted at `4321d5793`**, fresh census `routing\-20261028d/`
+    \(s9ay\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

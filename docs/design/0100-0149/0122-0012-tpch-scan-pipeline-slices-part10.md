@@ -653,3 +653,64 @@ look-ahead on, look-ahead off, and a sequential scan. The probes cover:
 - an ordered probe.
 
 The look-ahead fires on mid-run probes. A mutation that jumps without the before-probe test fails it.
+
+## Slice 114 — C37: signed-integer key attributes compared inline (Q72 −8.3 % instructions)
+
+Loop #221. The S9 census `routing-20261028d` (at `4321d5793`) is exhausted. G3 on DS Q72 after slice 113:
+
+- the skip scan's descents (`ResetScanCursor`) are 36.6 %, nearly all of it the internal-page binary search;
+- across the query the key-compare chain is ~21 %: `compareFixedPrefix`, `comparePGIndexTupleAttrsAt`,
+  `PGCompareInt4` and `compareAttr`.
+
+**Symptom.** Slice 55's cached-offset path, `compareFixedPrefix`, slices each fixed-width attribute straight out of
+both tuples. It still compared each one through:
+
+- `PGKeyAttr.compareAttr`, a by-value receiver with the NULL arms;
+- the opclass comparator as an indirect call;
+- a pair of slices.
+
+All of Q72's keys are int4 or date. PG's `_bt_compare` also calls the opclass proc. Its operands are by-value
+Datums, however, which `index_getattr` (attcacheoff) fetches with one load each. The per-attribute layers around the
+comparison were goopg's own.
+
+**Change:**
+
+- `nbtree.PGKeyAttr.IntWidth` records, beside `Compare`, that the comparator is the signed little-endian integer
+  order of a 2-, 4- or 8-byte image: btint2cmp, btint4cmp, btint8cmp, which date, time, timestamp and timestamptz
+  share.
+- The executor's descriptor builder stamps it (`pgIndexIntWidthForOID`) for exactly the OIDs that
+  `pgIndexComparatorForOID` maps to `PGCompareInt2/4/8`. oid keeps its unsigned comparator.
+- `compareFixedPrefix` compares such an attribute inline from the page bytes, negated for DESC.
+- Every other attribute, and every case the fast path already declined (null bitmap, varlena, overrun), is
+  unchanged.
+- `compareFixedIntDisabled` is the test knob.
+
+**Measured** (`tools/ds-instr.sh`, 3 runs × 2, a fresh A/B against `4321d5793`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-DS Q72 (Target) | 23.157 / 23.156 | 21.229 / 21.231 | **−8.3 %** |
+| TPC-DS Q23 | 61.413 | 59.976 | −2.3 % |
+
+The prediction was ~4 %; the result meets the 3 % bar. Q72's output is byte-identical. The sweep flagged
+`Q23 3s->6s (2.0x)`, a timing spike at the 5 s floor: Q23's instructions fell over the same A/B.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- fire-set: PASS, no fires;
+- RegressSuite: counts equal to the C36 run except the `plpgsql` flapper;
+- isolation suite: PASS in 533 s. One run first hit `go test`'s default 10-minute package timeout under host load,
+  with no hang; the suite needs `-timeout 30m`.
+
+**Tests:**
+
+- `TestCompareFixedIntMatchesComparator` (nbtree) compares random tuples three ways and requires the same sign and
+  deciding attribute, inline and through the comparator. The tuples mix int2, int4 and int8 attributes, include
+  DESC ones, and draw values near zero, at the type extremes and across the sign boundary. Reading int4 as
+  unsigned fails it.
+- `TestPGIndexIntWidthMatchesComparator` (executor) checks that the width stamp and the comparator table agree for
+  every built-in key type, matching the comparator functions by pointer.
