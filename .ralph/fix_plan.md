@@ -1996,6 +1996,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       acceptance 24 MATCH; plans 99/99 same\. Misses 0\. Next on return: hash\-table pre\-sizing needs a plan\-node
       numGroups \(planner change; ledgered\); or a fresh G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10
       §109\.
+  - **Return 2026\-10\-27 \(loop \#209\)**: S9 exhausted at `a8367e529` \(census ab\)\. **G1/G2 re\-run**:
+    `analysis/m0122/m0122\-0012/census\-20261027b/` \(HEAD `a8367e529`, 3 sf025 sweeps \+ 3 tpch\-gap runs vs the committed
+    release\-PG tsv\)\. Combined top 10 by excess: DS Q14 4322, DS Q23 2396, H Q17 1040, H Q13 1010, DS Q72 912,
+    H Q18 690, DS Q39 672, DS Q78 589, DS Q47 577, DS Q67 570 ms \(Q67 was 1344, Q72 1975, H Q18 1240; DS Q64 left
+    the top 10\)\. This census replaces census\-20261027 for ranking \(reusable until 2026\-10\-30\)\.
+    - G3 \(instructions:u, `tmp/g3\-208/h13i\.data`, `h17i\.data`\): H Q13 is hash\-join memory behaviour —
+      `mapaccess1\_fast64` in the probe 23\.8 % and `MaterializedSlot\.Get` 9\.7 % \(a one\-line slice read: first touch of
+      a build row\); both are cache misses that instructions:u does not count, so no qualifying candidate under the
+      bar's metric\. H Q17: numeric decode 13\.4 % \(NumericInt64FromStoredPayload 9\.7 %, the two legacy\-format
+      probes 3\.7 %\) — the C20 ground, whose line profile put the removable part at 1–2 %; the rest is the lineitem scan
+      \(decodeRowRangeInfo 12\.7 %, checksum 6 % after C19\)\. No candidate ≥ 3 % this pass; nothing attempted, miss
+      counter stays 0\. Next on return: G3 on DS Q39 \(hash\-key evaluation per probe row, evalHashKeyDatumSlot\), DS Q78,
+      DS Q47\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5595,6 +5608,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 \(loop \#208\) — **exhausted at `e35fff402`**, census `routing\-20261027aa/` reused:
     `e35fff402` touched internal/access/nbtree only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\.
     Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#209\) — **exhausted at `a8367e529`** \(M0122\-0012 slice 109 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ab/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
