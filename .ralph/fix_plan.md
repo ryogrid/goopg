@@ -2130,6 +2130,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       Q14 output byte\-identical; plans 99/99 same\. Test `TestIndexReadSetsMatchFullDecode` \(on/off/poison, 13
       queries, 11 arm\)\. **Misses 0\.** Design: `0122\-0012\-c33\-index\-scan\-read\-set\.md` §"Landed: C34"\. Next on
       return: re\-census S9 \(executor changed\), then a fresh G3 on the next top\-10 query \(Q23, H Q17/Q13, Q72\)\.
+  - **Return 2026\-10\-28 \(loop \#219, misses 0\)**: S9 re\-census `routing\-20261028b` exhausted\. Fresh G3
+    \(instructions:u, `tmp/g3\-219/`\) on DS Q23 and H Q17 at `39041efc5`\.
+    - Q23 is spread thin\. The IOS customer\_pkey probes are 16\.4 % cumulative but are PG\-equivalent descents;
+      the goopg\-only leftovers \(`indexKeyIsDecodable`, growslice, LookupColumn/EqualFold\) total ~1\.5 %\.
+    - Q17: decodeRowRangeInfo 15\.3 % self, skipAttrLen 3\.7 %, decodeScanRowRangeInfo 4\.9 %\. The probe's first
+      pass walks ~7 skipped columns per lineitem row to reach l\_partkey \(HammerDB column order\)\. Each skipped
+      column pays the bitmap/natts/info loads, a non\-inlined skipAttrLen call, a 48\-byte NullDatum copy from the
+      global and the poison\-flag test; PG's slot\_deform\_heap\_tuple step is att\_align\_pointer \+
+      att\_addlength\_pointer\.
+    - C35: a skip\-run loop — on reaching a skipped column, walk the whole run of consecutive skipped columns with
+      a precomputed per\-column skip length \(fixed width, or varlena header inline\), then clear the run's cells in
+      one bulk store \(NullDatum is the zero Datum\)\. Not slice 72's attcacheoff or conditional NULL store \(both on
+      the Below\-bar list\)\.
+    - **Target \(C35\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2,
+      fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C35 LANDED \(slice 112\)**: `skipColumnRun` \+ `colTypeInfo\.skipLen` \(coltypeinfo\.go\), called from
+      decodeRowRangeInfo's loop; the run's cells are cleared at once \(`clear`\)\. Q17 24\.973/24\.967 →
+      22\.604/22\.605 Ginstr/q \(**−9\.5 %, meets the bar**\); DS Q78 −1\.3 %, Q7 −0\.2 %; sf025 total −4\.7 %; values
+      and plans identical\. Test `TestSkipColumnRunMatchesPerColumnSkip` \(4 000 random tuples, run vs per\-column\)\.
+      **Misses 0\.** Design: part 10 §112\. Next on return: re\-census S9 \(executor changed\), then G3 on H Q13
+      \(mapaccess1\_fast64 is stall time — check instructions first\) or DS Q72/Q18\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5762,6 +5783,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#218\) — **exhausted at `b7befe4c0`**, census `routing\-20261028a/` reused:
     `b7befe4c0` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
     loop\. The C34 commit changes `internal/executor`, so the next loop re\-runs the census\.
+  - S9 re\-check 2026\-10\-28 \(loop \#219\) — **exhausted at `39041efc5`**, fresh census `routing\-20261028b/`
+    \(s9aw\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

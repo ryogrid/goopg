@@ -1438,6 +1438,22 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 		// bought nothing and cost 5.62 s = 2.5% of TPC-DS CPU on this one line
 		// (part 4; Go does not reliably elide it). Do not "simplify" this back.
 		c := &cols[i]
+		// C35: a run of skipped columns is walked in one tight loop and its
+		// cells cleared at once (NullDatum is the zero Datum).
+		if info != nil && info[i].skip && !skipColumnRunDisabled {
+			if j, noff := skipColumnRun(info, data, bitmap, i, min(to, storedNatts), off); j > i {
+				if seqScanDeformPoison {
+					for k := i; k < j; k++ {
+						dst[k] = deformPoisonDatum()
+					}
+				} else {
+					clear(dst[i:j])
+				}
+				off = noff
+				i = j - 1
+				continue
+			}
+		}
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
 		// M0097-0077: when the column has a precomputed MissingValue Datum
 		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it

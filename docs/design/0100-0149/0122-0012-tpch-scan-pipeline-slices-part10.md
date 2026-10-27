@@ -517,3 +517,79 @@ Tests:
   `exactIntVariance`'s output and scale: Q39-like quantities, small mixed-sign values, constant groups, int32
   extremes, one- and two-row groups, and a 20 000-row group of values up to 10^6.
 - `TestIsqrt128` checks perfect squares, their neighbours and random 128-bit values.
+
+## Slice 112 — C35: a run of skipped columns is walked in one tight loop (TPC-H Q17 −9.5 % instructions)
+
+Loop #219. The S9 census `routing-20261028b` (at `39041efc5`) is exhausted. G3 on TPC-H Q17 (G2 #3) at HEAD,
+with instructions:u:
+
+| symbol | self |
+|---|---|
+| `decodeRowRangeInfo` | 15.3 % |
+| `decodeScanRowRangeInfo` | 4.9 % |
+| `skipAttrLen` | 3.7 % |
+
+The lineitem probe scan's first pass (C32) walks about seven skipped columns per row to reach `l_partkey`, because
+HammerDB puts `l_partkey` eighth.
+
+**Symptom.** Each skipped column went through the full per-column loop:
+
+- the `cols[i]` address, the stored-natts and null-bitmap tests;
+- the `info[i]` loads (the lowered type-name string among them);
+- `catalog.AttAlignPointer`;
+- a non-inlined `skipAttrLen` call;
+- a 48-byte `NullDatum` copy loaded from the global;
+- the poison-flag test.
+
+PG's step for an attribute it walks past (`slot_deform_heap_tuple`, execTuples.c) is `att_align_pointer` plus
+`att_addlength_pointer`, with a by-reference value left as a pointer.
+
+**Change** (`coltypeinfo.go`, `codec.go`):
+
+- `resolveColTypeInfo` resolves `skipLen` per column, `skipAttrLen`'s rule decided once: the fixed width, −1 for a
+  varlena, or 0 when the column cannot be walked.
+- On reaching a skipped column, `decodeRowRangeInfo` calls `skipColumnRun`. It walks every consecutive skipped
+  column before the window end and the stored natts in one tight loop:
+  - a NULL column does not advance the offset;
+  - a fixed-width column aligns and adds its width;
+  - a varlena reproduces `AttAlignPointer` (align only on a zero pad byte) and `physicalPGVarlenaSize` (1-byte
+    header, 4-byte header) inline.
+- The run's cells are then cleared at once with `clear`, since `NullDatum` is the zero Datum. Under the debug
+  deform poison they are poisoned instead.
+- The run stops at a column that is not skipped, has no skip length, or does not measure: a TOAST pointer, or a
+  truncated or exhausted tuple. That column then takes the general loop exactly as before.
+- `skipColumnRunDisabled` is the test knob.
+
+This is neither of slice 72's mechanisms on the Below-bar list. That slice tried cached attribute offsets and
+conditional NULL stores per cell; this removes the per-column overhead of the walk itself.
+
+**Measured** (`tools/h-instr.sh`, 3 runs × 2, a fresh A/B against `39041efc5`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q17 (Target) | 24.973 / 24.967 | 22.604 / 22.605 | **−9.5 %** |
+| TPC-DS Q78 | 17.393 | 17.162 | −1.3 % |
+| TPC-DS Q7 | 6.185 | 6.175 | −0.2 % |
+
+The prediction was ~4 %; the result meets the 3 % bar. The SF0.25 sweep's total time moved −4.7 %.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- fire-set: PASS, no fires;
+- RegressSuite: counts equal to the C34 run except the `plpgsql` flapper;
+- isolation suite: PASS.
+
+**Test.** `TestSkipColumnRunMatchesPerColumnSkip` builds 4 000 random tuples with `EncodeRowPG`:
+
+- every alignment class;
+- short and 4-byte-header varlenas;
+- NULLs anywhere;
+- tuples shorter than the descriptor.
+
+It decodes each with a random skip mask over a random window, which may resume mid-row, once with the run and once
+without. It requires identical cells and resume offsets, and NULL in every skipped cell. A mutation that drops
+the fixed-width alignment fails it.
