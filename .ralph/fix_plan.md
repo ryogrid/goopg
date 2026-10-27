@@ -2064,6 +2064,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       rows when ≥ half were finished\. Q17 27\.28–27\.31 → 24\.96 Ginstr/q \(**−8\.6 %, meets the bar**\); TPC\-DS Q8
       −32\.9 %, Q26 −21\.0 %, Q7 −17\.7 %, Q59 \+0\.3 %\. The first \(skip\-table, full re\-decode\) form regressed Q59
       \+13\.9 % and was reworked before landing\. Misses 0\. Design: `0122\-0012\-c32\-lazy\-probe\-deform\.md` §Landed\.
+  - **Return 2026\-10\-28 \(loop \#214\)**: S9 exhausted at `e3a2535f0` \(census 20261028a\)\. Generate pass \(no attempt;
+    misses stay 0\):
+    - C32 coverage census \(debug build, top\-10 DS queries, `tmp/g3\-214/sz\-\*\.log`\): hash probes arm in Q14 40×,
+      Q23 18×, Q78 11×, Q10 8×, Q39/Q47/Q67/Q64/Q72 4–6×; the declines are probes that are themselves joins, a Gather
+      or a CTE scan, an expression key \(Q59\), or a non\-borrowing scan — slice 2 \(index/bitmap/Parallel Hash probes\)
+      would arm almost nothing new in the top 10, so it is not the next lever\. Q14 at HEAD 128\.635 G \(C32 moved it
+      −0\.5 %\)\.
+    - C33 \(G3 on Q14\): index\-scan heap fetches decode every column below `deformBound` — Q14's store\_sales probe
+      13 of 23 columns \(it reads ~4\), item 12 or 22 of 22; Q72's date\_dim 28/28, item 22/22, customer\_demographics
+      9/9 — while seq scans skip unread columns inside the window \(slice 19, `colTypeInfo\.skip` from
+      markProjectScanReads\)\. Decode under index scans is 6\.8 % of Q14's instructions \(2\.0 % of Q72's\)\. PG's
+      projection fetches only the attributes its expressions reference \(EEOP\_SCAN\_FETCHSOME, by\-reference values
+      left as pointers\); goopg's eager numeric/text conversion makes every decoded column cost\. Mechanism: thread a
+      column read set beside `deformBound` through buildNode \(nested\-loop inner, Memoize, Project\) into indexScanOp's
+      colInfo skip flags — the index\-scan twin of slice 19\. Predicted ~4 % on Q14; design\-sized \(read\-set threading
+      through joins is pool item C14's "set\-valued read set"\)\.
+    - **Target \(C33, first slice\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`,
+      5 runs × 2, fresh A/B\)\. Bar: −3 %\. Design doc to write first:
+      `docs/design/0100\-0149/0122\-0012\-c33\-index\-scan\-read\-set\.md`\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5681,6 +5700,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#213\) — **exhausted at `2349ef9b0`**, census `routing\-20261027ad/` reused:
     `2349ef9b0` is docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
     loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#214\) — **exhausted at `e3a2535f0`** \(C32 slice 1 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261028a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
