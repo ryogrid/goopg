@@ -2334,6 +2334,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       2\.03/2\.94 s vs C46 1\.95/1\.78 s\)\. Test `TestFinishAggLeavesStateUntouched`\. Design: part 11 §118\. **Miss
       counter 0\.** Next on return: S9 re\-census \(executor changed\), then G3 — DS Q14 / Q23 / H Q13 \(census\-20261028
       expires 2026\-10\-30\)\.
+  - **G3 2026\-10\-28 \(loop \#232, misses 0\)**: S9 re\-census `routing\-20261028i` exhausted\. Profiles at `102c74a5e`
+    \(`tmp/g3\-232/q\{14,23,78,39,59\}\.data`\), struct\-copy scan \(`tmp/g3\-232/copyscan\.sh`\) finds no large\-struct copy loop
+    in any hot symbol — the `movups` shares are 48\-byte Datum moves \(C13 class\)\.
+    - DS Q14 / Q23: `parseHeapTupleAlias` 4\.9 / 3\.8 % is 87 % on `raw\[22\]`, the first touch of each fetched heap tuple
+      \(PG pays it\); nbtree ~22 % of Q14 is PG\-equivalent descent work; Q23 `projectOp\.Next` 5\.1 % is the per\-column Datum
+      copy, 3\.66 % of it under aggregates — the slice\-35 mechanism, ceiling below 3 %\.
+    - DS Q59: `evalFastExpr` 19\.7 % \+ `evalFastCase` 6\.6 % \+ `aggEvalList` 3\.1 % — seven CASE aggregates' Datum returns
+      \(slices 89/90 already took the string compares\); instructions:u would see under 3 %\.
+    - DS Q39: `PageGetHeapTupleNoCopy` 5\.3 % is a store\-forwarding stall on the returned HeapTuple \(≈2–3 % instructions\);
+      **per\-tuple visibility ~4\.4 %** \(`TupleVisibleSubxact` call line 2\.5 % \+ transam 1\.9 %\)\.
+    - C47 \(design\-sized, first slices qualify per G4\): the seq scan skips per\-tuple visibility on a page with
+      PD\_ALL\_VISIBLE, as PG's heap\_prepare\_pagescan / page\_collect\_tuples \(heapam\.c\) do\. Finding: goopg's VACUUM
+      sets only the VM bit, never PD\_ALL\_VISIBLE \(PG vacuumlazy\.c PageSetAllVisible\), and DML never clears it \(PG
+      heap\_insert/update/delete PageClearAllVisible\); recovery DOES set it, so primary and standby pages diverge\.
+      `tmp/q64\-clone`: VM all\-visible on every block of the 4 largest relations, 0 pages with the page bit; PG
+      `:65438` tpcds025 ~99 % relallvisible\. Slices: \(1\) VACUUM sets the page bit, every `VM\.ClearBlock\*` DML site
+      clears it under the page write lock; \(2\) the scan skip; \(3\) corpora backfill — owner\-run\. Design:
+      `docs/design/0100\-0149/0122\-0012\-c47\-seqscan\-all\-visible\-page\-skip\.md`\.
+    - **Target \(C47\)**: TPC\-DS SF0\.25 **Q39**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B, on a private vacuumed copy of the clone whose pages carry the bit; plans identical to
+      the uncopied clone\)\. Bar: −3 %; predicted ~4 %\. Implementation is the next loops' slices; nothing attempted,
+      misses 0\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -6009,6 +6031,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     `a42524dd1` is ralph/docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#231\) — **exhausted at `923750127`**, fresh census `routing\-20261028h/`
     \(`923750127` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#232\) — **exhausted at `102c74a5e`**, fresh census `routing\-20261028i/`
+    \(`102c74a5e` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
     filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
