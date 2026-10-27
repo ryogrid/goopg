@@ -460,6 +460,8 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	if o.plan.Table != nil {
 		o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.plan.Table.Columns)
 		o.colInfo = resolveColTypeInfo(o.plan.Table.Columns)
+		// C34: walk past the columns no consumer reads.
+		applyIndexReadSet(ctx, o.plan, o.colInfo)
 	} else {
 		o.enumTypes = nil
 		o.colInfo = nil

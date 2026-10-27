@@ -1,6 +1,6 @@
 # M0122-0012 C33 — a read set for index-scan heap fetches
 
-Status: design (2026-10-28, loop #215; plumbing decided in loop #216, see "Plumbing"). Area: `internal/executor` (Build-time deform analysis, `indexScanOp`).
+Status: landed 2026-10-28 as C34, loop #218, as an executor-side pass (see "Landed: C34" at the end). Designed in loop #215; the plumbing was revised in loop #216, and the first attempt was dropped in loop #217. Area: `internal/executor` (Build-time deform analysis, `indexScanOp`).
 Perf-only: plans, values and EXPLAIN output unchanged. Parent: M0122-0012 (banner item 10). Target, written in the
 M0122-0012 entry in loop #214: TPC-DS SF0.25 Q14 instructions:u, bar −3 %, predicted ~4 %.
 
@@ -154,3 +154,103 @@ inert, and it was reverted.
 
 This needs a visitor that understands `OuterColumnRef`; `deformLateralOuterRefs` is today's integer-bound twin.
 That path, or the Plan()-tail pass above, is the next attempt. Both are design-sized.
+
+## Landed: C34, an executor-side pass (loop #218)
+
+**Upper bound first.** Before building, a throwaway binary skipped columns by table name (same binary on and off;
+Q14 output identical). Skipping every unread index-scan column took Q14 from 129.0 to 123.95 Ginstr/q (−3.9 %).
+
+| skipped | change |
+|---|---|
+| item alone | −2.6 % |
+| date\_dim alone | −0.9 % |
+| the fact tables | ±0 |
+| item with an integer bound of 12 | ±0 |
+
+The item volume is the CTE `cross_items`: about 750 k `item_pkey` probes under HashSetOp Intersect → Gather →
+lateral Nested Loop. Three things kept a read set from reaching those probes:
+
+- `buildCompleteChild` stops at SetOp;
+- the Gather worker build does not receive the consumer set;
+- the lateral join declines.
+
+The integer bound already stops at column 12, so the gain lies in a set.
+
+**Plumbing, revised.** Neither the Plan()-tail stamp nor a new build parameter was needed. The pass runs in the
+executor and is published per execution on `Context`:
+
+- `computeIndexReadSets(plan)` (`index_read_sets.go`) runs once per `OpIterator` in `OpIterator.Open`.
+- It sets `ctx.indexReadSets`, a `map[*optimizer.IndexScan][]bool`.
+- `OpIterator.Close` restores the caller's value, so a nested statement leaves the outer statement's sets in place.
+- `NewWorkerContext` copies the map into worker contexts. It is read-only once published.
+- `indexScanOp.openPrep` applies the set as `colInfo.skip` (`applyIndexReadSet`) after `resolveColTypeInfo`, which
+  returns a fresh slice per Open.
+- Every build path (`buildNode`, `BuildFast`, the worker builds) reaches the same `openPrep`, so none of them changed.
+- A missing entry, including the extended-protocol path that builds through `Build`, means full decode. A lookup
+  can therefore only ever narrow a scan whose plan root computed the set.
+
+**The walk** carries the set of output columns a parent may read (nil means every column) and mirrors the integer
+pass's arms (`deformBoundBelow`, `deformJoinBounds`):
+
+| node | set passed to the child |
+|---|---|
+| Project | the columns read by the targets the parent reads, plus every target `projectTargetSkippable` refuses (those are evaluated anyway); IsolatedScope means every column |
+| Filter, Sort, IncrementalSort, Limit, GatherMerge | need ∪ own expressions |
+| Gather, SubqueryScan, Materialize, Memoize | need, passed through |
+| Aggregate | a fresh set from `aggConsumerExprs`; a Finalize aggregate passes every column |
+| SetOp, DistinctOn, Distinct, CTEScan body | every column (whole rows are compared, emitted or materialised) |
+| Join (inner, left, right, full, cross) | need and the merged-space predicate split at the left width; positional keys at face value; a lateral join's left side also gets `lateralOuterReadSet` (the inner probe's and Memoize's OuterColumnRef\{Level 1\} and key ColumnRef reads, else every column) |
+| NestedLoopIndexJoin | outer: every column; the inner probe is not modelled |
+| any other node | the walk stops; no entry, so full decode |
+
+At an IndexScan the recorded set is need ∪ the Cond's columns ∪ the index key columns. A scan reached twice keeps
+the union.
+
+The expression reader, `exprReadSet`, is `consumerLiveColumns` plus one change: an uncorrelated sublink with no
+ParParam reads nothing of the row (`deformSublinkArgs`, slice 53). Q14's statement-2 date\_dim probe filters on
+`d_week_seq = (SELECT …)`, and without this the lateral join above it read its whole left side.
+
+**Measured** (instructions:u, 3 runs × 2, fresh A/B against a HEAD build):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-DS Q14 (Target) | 129.443 / 129.067 | 123.901 / 123.909 | **−4.1 %** |
+| TPC-DS Q23 | 62.606 | 62.102 | −0.8 % |
+| TPC-DS Q72 | 24.116 | 24.054 | −0.3 % |
+
+Plans are unchanged and Q14's output is byte-identical.
+
+**Gates:**
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- fire-set: PASS, no fires;
+- RegressSuite: counts equal to the C32 run except the `plpgsql` flapper;
+- isolation suite: PASS.
+
+**Test.** `TestIndexReadSetsMatchFullDecode` runs 13 queries three ways and requires identical rows, in order:
+read sets on, read sets off, and on with skipped cells poisoned. The queries cover:
+
+- lateral index nested loops;
+- a projection and a sort key over an otherwise unread inner column;
+- a residual on the inner;
+- aggregates;
+- INTERSECT;
+- a materialised CTE read through IN;
+- an uncorrelated sublink in the probe filter;
+- LIMIT;
+- a left join;
+- a Gather.
+
+`ctid` and whole-row references must decline. A hook counts the probes that skipped columns: 11 of 13 queries
+arm.
+
+**Left (ledgered):**
+
+- the NestedLoopIndexJoin inner probe;
+- bitmap-heap and index-only-scan heap fetches;
+- semi and anti joins, WindowAgg, Result and LockRows, which stop the walk;
+- seq scans under the same walk (slice 3 above);
+- the extended-protocol `Build` path.

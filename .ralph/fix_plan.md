@@ -2109,6 +2109,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     \(correct but inert\)\. **Miss counter 1\.** The remaining lever is lateral\-join consumer threading: right read set
     from the consumers' right columns ∪ predicate ∪ Cond, and left consumers ∪ the inner's OuterColumnRef\{Level 1\}
     reads — needs an OuterColumnRef\-aware visitor \(deformLateralOuterRefs is the int\-bound twin\); design\-sized\.
+  - **Loop \#218 \(misses 1\)**: S9 reused census 20261028a \(`b7befe4c0` ralph\-only\)\. Upper bound measured first with
+    a throwaway by\-table skip hack \(`tmp/g3\-218/`, same binary on/off, Q14 output identical\): every unread
+    index\-scan column skipped 129\.0 → 123\.95 Ginstr/q \(−3\.9 %\); item alone −2\.6 %, date\_dim −0\.9 %, the fact
+    tables ±0; item's integer bound 12 alone ±0\. The item volume is the CTE's ~750 k `item\_pkey` probes under
+    HashSetOp → Gather → lateral Nested Loop, which no consumer chain reaches \(SetOp, the Gather worker build and
+    lateral joins all break it\)\.
+    - C34: a Build\-time plan pass `indexReadSets` \(executor\) — the set\-valued twin of the deform walk over Project,
+      Filter, Sort, Limit, Aggregate, Join \(lateral included: the left side adds the inner probe's
+      OuterColumnRef\{Level 1\} reads\), Memoize, Gather/GatherMerge, SetOp and CTEScan inputs \(every column\),
+      SubqueryScan/Materialize; unknown nodes stop the walk \(no entry = full decode\)\. Published per execution on
+      `Context` \(copied into worker contexts\), applied in `indexScanOp\.openPrep` as `colInfo\.skip`\. PG:
+      EEOP\_SCAN\_FETCHSOME fetches only referenced attributes \(execExpr\.c ExecCreateExprSetupSteps\)\.
+    - **Target \(C34\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted −3\.5 % \(hack upper bound −3\.9 %\)\.
+    - **C34 LANDED \(loop \#218\)**: `index\_read\_sets\.go` — `computeIndexReadSets` runs in `OpIterator\.Open`,
+      published as `Context\.indexReadSets` \(restored at Close; copied by `NewWorkerContext`\), applied by
+      `indexScanOp\.openPrep` \(`applyIndexReadSet`\); `exprReadSet` accepts uncorrelated sublinks \(slice 53 rule\)\.
+      Q14 129\.443/129\.067 → 123\.901/123\.909 Ginstr/q \(**−4\.1 %, meets the bar**\); Q23 −0\.8 %, Q72 −0\.3 %;
+      Q14 output byte\-identical; plans 99/99 same\. Test `TestIndexReadSetsMatchFullDecode` \(on/off/poison, 13
+      queries, 11 arm\)\. **Misses 0\.** Design: `0122\-0012\-c33\-index\-scan\-read\-set\.md` §"Landed: C34"\. Next on
+      return: re\-census S9 \(executor changed\), then a fresh G3 on the next top\-10 query \(Q23, H Q17/Q13, Q72\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5738,6 +5759,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#217\) — **exhausted at `a3f833e78`**, census `routing\-20261028a/` reused:
     `a3f833e78` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
     loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#218\) — **exhausted at `b7befe4c0`**, census `routing\-20261028a/` reused:
+    `b7befe4c0` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\. The C34 commit changes `internal/executor`, so the next loop re\-runs the census\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

@@ -469,6 +469,13 @@ type OpIterator struct {
 	ctx     *Context
 	// trig is the statement's AFTER trigger query level (M0146-0076).
 	trig stmtAfterTriggers
+	// readSets is the plan's index-scan read sets, computed on the first
+	// Open (M0122-0012 C34); prevReadSets is the Context's value it
+	// replaced, restored at Close so a nested statement leaves its caller's
+	// sets in place.
+	readSets     indexReadSets
+	readSetsDone bool
+	prevReadSets indexReadSets
 }
 
 // BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
@@ -484,6 +491,10 @@ func BuildFastIterator(plan optimizer.Node) (*OpIterator, error) {
 // Open implements Operator.
 func (it *OpIterator) Open(ctx *Context) error {
 	it.ctx = ctx
+	if !it.readSetsDone {
+		it.readSets, it.readSetsDone = computeIndexReadSets(it.plan), true
+	}
+	it.prevReadSets, ctx.indexReadSets = ctx.indexReadSets, it.readSets
 	it.trig = stmtAfterTriggers{}
 	saved := it.trig.swapIn(ctx)
 	err := opOpen(it.tree, it.rootIdx, ctx)
@@ -511,6 +522,9 @@ func (it *OpIterator) Next() (TupleSlot, error) {
 
 // Close implements Operator.
 func (it *OpIterator) Close() error {
+	if it.ctx != nil {
+		it.ctx.indexReadSets = it.prevReadSets
+	}
 	saved := it.trig.swapIn(it.ctx)
 	defer it.trig.swapOut(it.ctx, saved)
 	return it.trig.finish(it.ctx, opClose(it.tree, it.rootIdx))
