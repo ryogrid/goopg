@@ -2347,6 +2347,46 @@ type aggregateOp struct {
 	aggCompiled    bool
 }
 
+// rollupCloseOrder puts a sorted single rollup's groups in the order PG's
+// one-pass AGG_SORTED emits them (nodeAgg.c agg_retrieve_direct): when the
+// next input row changes a grouping column, every group whose set includes
+// that column ends, the most detailed first, and the empty set's group ends
+// with the input. closedAt[i] is the row that ended rows[i]'s group (0:
+// still open at end of input, so it ends after row lastSeq); sets[setOf[i]]
+// is its grouping set, whose length is its depth in the rollup.
+//
+// This is the order the column comparator in Open rebuilds — groups of one
+// set close in input order, which for input sorted along the rollup is key
+// order, and the groups that close together share their prefix, the longer
+// set's group first — computed from two integers instead of key compares
+// (M0122-0012 C23; it was ~9 % of TPC-DS Q67). The caller uses it only when
+// no group was fed again after it closed, i.e. when the input really was
+// grouped along the rollup.
+func rollupCloseOrder(rows []Row, setOf, closedAt []int, sets [][]int, lastSeq int) []Row {
+	end := func(i int) int {
+		if closedAt[i] == 0 {
+			return lastSeq + 1
+		}
+		return closedAt[i]
+	}
+	idxOf := make([]int, len(rows))
+	for i := range idxOf {
+		idxOf[i] = i
+	}
+	sort.SliceStable(idxOf, func(a, b int) bool {
+		i, j := idxOf[a], idxOf[b]
+		if ei, ej := end(i), end(j); ei != ej {
+			return ei < ej
+		}
+		return len(sets[setOf[i]]) > len(sets[setOf[j]])
+	})
+	sorted := make([]Row, len(rows))
+	for pos, i := range idxOf {
+		sorted[pos] = rows[i]
+	}
+	return sorted
+}
+
 // groupRuntime is one accumulated output group: the GROUP BY key values, the
 // functionally-determined passthrough columns, and one aggRuntime per
 // AggregateCall. It used to be declared inside Open; it is package-level now
@@ -2359,6 +2399,11 @@ type groupRuntime struct {
 	groupValues     Row
 	passthroughVals Row // values of functionally-determined passthrough columns
 	aggs            []aggRuntime
+	// closeSeq is the input row (1-based) whose key left this group behind
+	// in a sorted rollup's drain; 0 while it is still the current group of
+	// its set. Only a sorted single-rollup aggregate stamps it (see
+	// rollupCloseOrder).
+	closeSeq int
 }
 
 // floatSpecialKind encodes the IEEE 754 special-value state for
@@ -2760,6 +2805,21 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		igroups, iorder = nil, nil
 	}
 
+	// M0122-0012 C23: a sorted single-rollup aggregate records when each
+	// group closes, so the emit below can put the groups in PG's one-pass
+	// order without a comparator (see rollupCloseOrder). curGroup[si] is
+	// the group the previous input row fed in set si; a row that feeds a
+	// different one closes it at rowSeq. A group fed again after it closed
+	// means the input is not grouped along the rollup, and closeOrderOK
+	// drops back to the comparator sort.
+	closeOrderOK := !rollupCloseOrderDisabled && o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil &&
+		o.plan.Mode == optimizer.AggModeSimple && len(o.plan.Rollups) <= 1 && len(o.plan.HashedRollups) == 0
+	var curGroup []*groupRuntime
+	if closeOrderOK {
+		curGroup = make([]*groupRuntime, len(sets))
+	}
+	rowSeq := 0
+
 	for {
 		slot, err := o.child.Next()
 		if err == EOF {
@@ -2790,6 +2850,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		rowSeq++
 		for si, set := range sets {
 			var gr *groupRuntime
 			// M0122-0012 slice 24: the int64 group lane (see intLane above).
@@ -2818,6 +2879,17 @@ func (o *aggregateOp) Open(ctx *Context) error {
 					gr = newGroup(si, set, allVals, slot)
 					groups[key] = gr
 					order = append(order, key)
+				}
+			}
+			if closeOrderOK {
+				if prev := curGroup[si]; prev != gr {
+					if gr.closeSeq != 0 {
+						closeOrderOK = false
+					}
+					if prev != nil {
+						prev.closeSeq = rowSeq
+					}
+					curGroup[si] = gr
 				}
 			}
 
@@ -2923,6 +2995,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// emitted[i] is the grouping set that produced o.rows[i]; consumed by the
 	// output sort below. M0125-0048.
 	emitted := make([]int, 0, len(order))
+	// closedAt[i] is o.rows[i]'s group closeSeq (M0122-0012 C23).
+	var closedAt []int
+	if closeOrderOK {
+		closedAt = make([]int, 0, len(order))
+	}
 	for idx, key := range order {
 		// M0062-followup: mirror the input-drain ctx check (line ~629)
 		// on the output-materialisation loop. A 1 M-group aggregate's
@@ -2943,6 +3020,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		o.rows = append(o.rows, out)
 		emitted = append(emitted, gr.setIdx)
+		if closeOrderOK {
+			closedAt = append(closedAt, gr.closeSeq)
+		}
 	}
 	// Sort output rows by GROUP BY key columns for deterministic ordering
 	// matching PostgreSQL's sort-based aggregate behavior. Without an explicit
@@ -2990,7 +3070,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			rollup = true
 		}
 	}
-	if nGroupCols > 0 && rollup {
+	if nGroupCols > 0 && rollup && closeOrderOK && len(rollupOrders) == 1 {
+		o.rows = rollupCloseOrder(o.rows, emitted, closedAt, o.plan.GroupingSets, rowSeq)
+	} else if nGroupCols > 0 && rollup {
 		rowSets := emitted
 		inSet := make([]map[int]bool, len(o.plan.GroupingSets))
 		for si, set := range o.plan.GroupingSets {
@@ -3191,6 +3273,11 @@ func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
 // aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
 // set it to compare the lane's output, order included, with the string path.
 var aggIntLaneDisabled = false
+
+// rollupCloseOrderDisabled sends a sorted rollup's output through the column
+// comparator instead of rollupCloseOrder. Tests set it to compare the two
+// orders.
+var rollupCloseOrderDisabled = false
 
 // appendDatumKey appends datumKey(d)'s bytes to buf (M0122-0012). The common
 // kinds are encoded in place; any other kind defers to datumKey itself, so

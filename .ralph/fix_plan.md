@@ -1843,6 +1843,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       scan's readCols to the three read columns \(slice 19\); even with consumerLiveColumns taught lowered sublinks
       \(Q17's join filter made it decline\), nothing further is skipped\. Q17's remaining decode is the three NEEDED
       NUMERICs\. **Second consecutive miss → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-27 \(loop \#202, after the M0122\-0013 yield; misses 0\)**: fresh G3 on DS Q23 / Q67 / Q39
+    \(perf record, `tmp/g3\-202/`\)\. Q23 is spread thin \(decodeRowRangeInfo 5\.3 %, btree probes ~10 % already C18\);
+    Q39 is expression evaluation \(evalFastExpr 8\.7 %\); Q67 has one goopg\-only mechanism, added as C23\.
+    - C23 \(G3 on Q67\): a SORTED single\-rollup aggregate \(Q67: 9 grouping sets, 255 275 groups\) hashes every
+      group and then re\-sorts all output rows with a comparator that does `map\[int\]bool` set\-membership lookups
+      and typed datum compares \(`aggregateOp\.Open\.func4` 9\.5 % of Q67 samples\) to rebuild PG's one\-pass order\.
+      PG emits each group when its prefix changes in the sorted input \(nodeAgg\.c agg\_retrieve\_direct\), so its
+      order is the input's close order — no comparator\. Predicted 7–9 %\.
+    - **Target \(C23\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs\);
+      baseline 24\.770/24\.773 Ginstr/q at `2eeabf36f`\. Bar: −3 %\.
+    - **C23 LANDED \(slice 104\)**: the drain stamps each group's `closeSeq` \(the row that left it behind in its
+      set\); `rollupCloseOrder` orders by \(close row, set length desc\), falling back to the comparator if a closed
+      group is fed again\. Q67 24\.770/24\.773 → 21\.477/21\.471 Ginstr/q \(**−13\.3 %, meets the bar**\); Q67 output
+      byte\-identical; plans 99/99 same; regress groupingsets/aggregates/window byte\-identical\. Misses 0\. Design:
+      part 10 §104\.
+    - C24 \(added loop \#202, after C23\): Q67's drain still hashes each input row into all nine sets' tables
+      \(appendGroupKey \+ trimmed char\(n\) keys \+ aeshash \+ mapaccess2\_faststr, ~8 % of Q67\); PG's sorted path
+      compares the row with the current group \(agg\_retrieve\_direct / execTuplesMatch\)\. Next on return: C24 on Q67,
+      or Q67's final Sort \(lessKeyVals \+ cmpbody ~20 %\) — re\-profile first\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5417,6 +5436,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `986df5900`** \(M0122\-0012 slice 103 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027w/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#202\) — **exhausted at `2eeabf36f`**, census `routing\-20261027w/` reused:
+    `6f2772917` \(ralph only\) and `2eeabf36f` \(internal/initdb, xlog, cmd\) touched no planner\-relevant path\. No task
+    is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
