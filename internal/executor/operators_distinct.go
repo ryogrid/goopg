@@ -190,7 +190,7 @@ func (o *distinctOnOp) appendDistinctOnKey(buf []byte, row Row) []byte {
 		if ki < len(o.keyTrims) && o.keyTrims[ki] && v.Kind == KindString {
 			// trimStringDatum's result (it acts on KindString only).
 			buf = append(buf, 's', ':')
-			buf = append(buf, strings.TrimRight(v.StringValue(), " ")...)
+			buf = append(buf, bcTrimRight(v.StringValue())...)
 		} else {
 			buf = appendDatumKey(buf, v)
 		}

@@ -1862,6 +1862,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(appendGroupKey \+ trimmed char\(n\) keys \+ aeshash \+ mapaccess2\_faststr, ~8 % of Q67\); PG's sorted path
       compares the row with the current group \(agg\_retrieve\_direct / execTuplesMatch\)\. Next on return: C24 on Q67,
       or Q67's final Sort \(lessKeyVals \+ cmpbody ~20 %\) — re\-profile first\.
+  - **Return 2026\-10\-27 \(loop \#203\)**: re\-profiled Q67 at `8432307f1` by instructions:u \(`tmp/g3\-203/q67i\.data`\):
+    final Sort 14\.7 %, worker Sort 7\.5 %, lessKeyVals 9\.3 %, cmpbody 6\.7 %, **strings\.TrimRight 6\.5 %**\.
+    - C25: the bpchar blank trim \(PG bcTruelen, varchar\.c\) runs as Go's byte\-at\-a\-time TrimRight over char\(50\)
+      padding \(~40 blanks\) once per sort\-key value \(trimStringDatum\) and once per grouping set per bpchar column
+      \(appendGroupColKey\)\. Mechanism: one helper `bcTrimRight` that drops whole 8\-byte words of blanks first, used at
+      all 19 blank\-trim sites \(sibling paths stay identical\)\. Predicted ~5 %\. lessKeyVals' cycles are mostly
+      key\-load cache misses \(the 48\-byte Datum copies after each load\), which instructions:u does not count\.
+    - **Target \(C25\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `8432307f1`\)\. Bar: −3 %\.
+    - **C25 LANDED \(slice 105\)**: `bcTrimRight` \(bctrim\.go\) at all 19 blank\-trim sites\. Q67 21\.471/21\.485 →
+      20\.618/20\.618 Ginstr/q \(**−4\.0 %, meets the bar**\); Q67 output byte\-identical; plans 99/99 same\. Misses 0\.
+      Next on return: Q67's final Sort — PG's SortTuple `datum1` \(first key inline in the sorted array, tuplesort\.c\)
+      against goopg's per\-row key slices reached through `perm` \(cycle\-side; check its instruction share first\),
+      or C24 \(drain hash vs current\-group compare\)\. Design: part 10 §105\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5439,6 +5453,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 \(loop \#202\) — **exhausted at `2eeabf36f`**, census `routing\-20261027w/` reused:
     `6f2772917` \(ralph only\) and `2eeabf36f` \(internal/initdb, xlog, cmd\) touched no planner\-relevant path\. No task
     is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#203\) — **exhausted at `8432307f1`** \(M0122\-0012 slice 104 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027x/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
+    for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

@@ -615,10 +615,10 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 					if ls, rs := stringValueInline(lp), stringValueInline(rp); plainCompareString(ls) && plainCompareString(rs) {
 						if lbp, rbp := binary.LittleEndian.Uint32(n.payload[8:]), binary.LittleEndian.Uint32(n.payload[12:]); lbp > 0 || rbp > 0 {
 							if lbp > 0 || n.payload[16]&1 != 0 {
-								ls = strings.TrimRight(ls, " ")
+								ls = bcTrimRight(ls)
 							}
 							if rbp > 0 || n.payload[16]&2 != 0 {
-								rs = strings.TrimRight(rs, " ")
+								rs = bcTrimRight(rs)
 							}
 						}
 						return NewBoolDatum(cmpResult(op, strings.Compare(ls, rs))), nil
@@ -784,10 +784,10 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 			// literal drops its trailing blanks.
 			if lbp, rbp := int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])); lbp > 0 || rbp > 0 {
 				if lbp > 0 || n.payload[16]&1 != 0 {
-					ls = strings.TrimRight(ls, " ")
+					ls = bcTrimRight(ls)
 				}
 				if rbp > 0 || n.payload[16]&2 != 0 {
-					rs = strings.TrimRight(rs, " ")
+					rs = bcTrimRight(rs)
 				}
 			}
 			*out = NewBoolDatum(cmpResult(op, strings.Compare(ls, rs)))

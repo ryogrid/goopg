@@ -158,3 +158,44 @@ current group instead (`agg_retrieve_direct`'s `execTuplesMatch` against the fir
 comparison against `curGroup[si]` would remove the hash lookup for the sorted case. That is the next candidate for
 Q67. Q67's final Sort of the 255 k rollup rows (`sortOp.lessKeyVals` + `cmpbody`, ~20 %) is the other large
 share.
+
+## Slice 105 — C25: the bpchar blank trim drops whole words of blanks (Q67 −4.0 % instructions)
+
+Loop #203 re-profiled Q67 after slice 104, this time sampling `instructions:u` (the bar's metric) instead of
+cycles. The cycle profile ranks the sort comparator first: `lessKeyVals` is 12.9 %, but most of its cycles are
+cache misses on each row's key slice, which do not count as instructions. By instructions:
+
+- the final Sort is 14.7 %, the worker Sort 7.5 %;
+- `lessKeyVals` is 9.3 % and `cmpbody` 6.7 %;
+- `strings.TrimRight` is 6.5 %.
+
+**Symptom.** bpchar comparison, hashing and grouping all work on the value without its trailing blanks (PG
+`bcTruelen`, varchar.c). goopg spells that as `strings.TrimRight(s, " ")`, which for a one-byte cutset is a byte
+loop. Q67's grouping keys are char(50) columns (i_category, i_class, i_brand, i_product_name) holding ~10 bytes of
+text and ~40 blanks. They are trimmed once per sort-key value (`trimStringDatum` from `evalSortKeyValueSlot`) and
+once per grouping set per column in the aggregate's group key (`appendGroupColKey`, nine sets).
+
+**Change.** A new helper, `bcTrimRight` (`bctrim.go`):
+
+- it drops whole 8-byte words of blanks first, then finishes byte by byte;
+- the 8-byte test against the constant `"        "` compiles to one load and one compare;
+- it returns exactly what `strings.TrimRight(s, " ")` returns.
+
+All 19 blank-trim sites in `internal/executor` now call it, so the sibling paths (codec, scalar compare, IN-list
+hash, DISTINCT, aggregate key) cannot disagree.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `8432307f1`): Q67 21.471 / 21.485 →
+20.618 / 20.618 Ginstr/q, **−4.0 %**, which meets the 3 % bar (predicted ~5 %). Q67's output is byte-identical.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set PASS (no fires on
+either corpus); RegressSuite per-case counts equal to the slice-104 run except the plpgsql flapper, with `strings`,
+`groupingsets`, `aggregates` and `join` byte-identical. The regress suite was run because `codec.go` is touched
+(hard-won rule 5).
+
+Test: `TestBcTrimRightMatchesTrimRight` covers padding lengths 0–41 around the stride, and bodies with tabs, NUL,
+multi-byte UTF-8 and leading blanks next to the padding.
+
+**Left on Q67.** The aggregate still trims each bpchar column once per grouping set; trimming once per row would
+need `allVals` pre-trimmed per column. The final Sort's comparator copies 48-byte Datums per key, and each row's key
+slice is a separate allocation reached through `perm`. PG keeps the first key inline in the SortTuple array
+(`datum1`, tuplesort.c), and that is the cycle-side lever.

@@ -242,7 +242,7 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 				// varchar_input removes excess trailing spaces only when the
 				// assignment value exceeds typmod. In-range trailing spaces are
 				// data and must survive COPY/INSERT/UPDATE unchanged.
-				stripped := strings.TrimRight(s, " ")
+				stripped := bcTrimRight(s)
 				if utf8.RuneCountInString(stripped) > n {
 					return "", &ExecError{Code: "22001",
 						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
@@ -295,7 +295,7 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			// where a char(6) holding the same is 6. Both survive only if the
 			// unbounded value is left alone, which is why this arm is guarded
 			// by `n >= 0` and not widened.
-			stripped := strings.TrimRight(s, " ")
+			stripped := bcTrimRight(s)
 			if utf8.RuneCountInString(stripped) > n {
 				return "", &ExecError{Code: "22001",
 					Message: fmt.Sprintf("value too long for type character(%d)", n)}

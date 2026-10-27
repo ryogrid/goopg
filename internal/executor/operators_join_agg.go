@@ -3265,7 +3265,7 @@ func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
 	if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
 		// trimStringDatum's result, without forming a new Datum.
 		buf = append(buf, 's', ':')
-		return append(buf, strings.TrimRight(v.StringValue(), " ")...)
+		return append(buf, bcTrimRight(v.StringValue())...)
 	}
 	return appendDatumKey(buf, v)
 }
