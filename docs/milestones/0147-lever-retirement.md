@@ -1,8 +1,8 @@
 # M0147 — Lever retirement
 
 **Filed:** 2026-10-21 (owner decision).
-**Status:** planned — banner item 10: M0122-0012 → **M0147** → the rest of M0122; **M0122-0012 (its inline
-slices and any task with `Parent: M0122-0012`) outranks every M0147 task** until it yields (banner item 10).
+**Status:** planned — banner item 10 under the M0122-0012 **return-first rule** (owner decision 2026-10-27):
+M0147 tasks run during M0122-0012's one-task yields (when next in item-10 order) and after its exhaustion.
 **Basis:** the 2026-10-21 lever census and its review
 (`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`), and the
 census at `analysis/m0146/m0146-0014/routing-20261021p` (TPC-H 22/22, TPC-DS SF0.25 99/99, SF1 99/99).

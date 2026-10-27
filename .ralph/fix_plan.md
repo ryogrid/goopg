@@ -236,23 +236,82 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (M0119 → M0122-0012 → **M0147** → the rest of M0122 → M0131 → M0134 →
+    (**M0122-0012** → M0119 → **M0147** → the rest of M0122 → M0131 → M0134 →
     M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
-    **M0122-0012 outranks every M0147 task** (owner decision 2026-10-21) —
-    "M0122-0012" means its inline slices and any task with
-    `Parent: M0122-0012`. It is a living perf task, so it yields to M0147
-    only when (a) its entry and the baton name no runnable next slice (or
-    the named slice is blocked), or (b) its last TWO landed slices each
-    moved their own measured target (the target named in the slice's own
-    task entry before it landed) by less than 3% (diminishing returns).
-    Record the yield as the Skip-rationale token
-    `M0122-0012(yield: <a|b + evidence>)`; do not invent an M0122-0012 slice
-    to keep the priority, and re-check M0122-0012 first after each M0147
-    task closes. M0147 descendants inherit this rank — the S7
-    correctness-only carve-out does not demote them. **M0147-0000 is a
-    channel, not stock** (like M0146-0014): never select it; take its first
-    open child in file order (`M0147-0000(channel)`).
+    **M0122-0012 return-first rule (owner decision 2026-10-27; replaces the
+    2026-10-21 yield rule).** "M0122-0012" means its inline slices and any
+    task with `Parent: M0122-0012`. Until it is EXHAUSTED (below), after
+    M-NIGHTLY open items item 10 starts with M0122-0012: whenever any other
+    item-10 task (not items 0–9 or owner-placed P0 tasks) closes, parks or
+    blocks, or the one-task yield below ends, the next selection returns to
+    M0122-0012.
+    - **Bar:** an attempt must move its own pre-named target by at least 3%.
+      `Target:` — written in the entry BEFORE the attempt is measured — names
+      exactly ONE query and ONE metric, and the query must be in the newest
+      G2 top 10 by absolute excess. Metric: instructions:u; bytes only for
+      an allocation slice, and then instructions:u and cycles must be no
+      worse than +1%; wall time only on an idle host.
+    - **One-task yield:** when two consecutive M0122-0012 attempts since the
+      last return (landed, or measured and dropped) each missed the bar,
+      select exactly ONE other item-10 task in the order above (skipping
+      M0122-0012) and work it for one task — or one landed slice/commit of
+      a multi-loop task — then return. If no other item-10 task is
+      selectable, skip the yield. Record it in the entry
+      (`Yield <date>: <the two attempts + %>; worked <id>`); the miss counter
+      resets on return. A missing candidate is NOT a yield reason — generate.
+    - **On return, choose** the top eligible entry of the entry's
+      **Candidate pool**. Ineligible: everything on the entry's **Below-bar
+      list** — in particular the attempts that triggered the yield. The key
+      is the mechanism (code site + PG function) on the same target query:
+      the same mechanism on a different G2 query stays eligible.
+    - **No eligible candidate → generate** (owner-delegated: S8's "do not
+      invent work" does not apply; one pass per loop). Tools:
+      `analysis/m0122/m0122-0012/tools/` (committed copies of the loop's
+      census scripts).
+      - G1 Census: warm per-query timings with the same plan (parity MATCH)
+        on private clones — TPC-H SF1 and TPC-DS SF0.25 against **release**
+        PG (`bench/pg-release`, `analysis/timing-after-planprity-match/`
+        `pg-release-scripts/`; its numbers change only on a corpus or query
+        change), never the cassert reference clusters. Split planning from
+        execution and record allocation (`ds-planinstr.sh`, `ds-alloc.sh`).
+        Commit the table under `analysis/m0122/m0122-0012/census-<date>/`; a
+        committed census at most 3 days old may be reused, and each
+        attempt's own A/B is always fresh.
+      - G2 Rank queries by absolute excess time (goopg − PG), then ratio.
+      - G3 Profile the top three (perf record -g / pprof, plus the row-count
+        census for algorithmic gaps). Attribute the excess to symbols and
+        map each to a PG executor mechanism (cite the PG function) or to a
+        goopg-only overhead (allocation, clone/copy, deform, interpreted
+        expression, per-row re-resolution, planning).
+      - G4 A candidate qualifies when it is perf-only (values and plans
+        identical — plan-visible ideas go to the parity tasks), one
+        mechanism sized for one loop, not on the Below-bar list, and its
+        attributed share predicts at least 3% on a G2 top-10 query.
+        Design-sized levers (the ledgered structural ones) qualify through
+        their first slice-sized step, with a design doc.
+      - G5 Add every qualifying candidate to the pool (target query,
+        baseline, predicted %, PG citation), ranked by predicted gain; take
+        the top one and write its `Target:` before coding. Candidates are
+        pool bullets and inline slices, never `- [ ]` child tasks.
+    - **Rotation, not exhaustion:** three consecutive misses in one
+      mechanism family put that family on the Below-bar list and send G2 to
+      the next query.
+    - **EXHAUSTED** only when a fresh G1–G3 pass attributes the excess of
+      every G2 top-10 query to Below-bar mechanisms, or no query exceeds
+      release PG by at least 10% and 50 ms. Write
+      `EXHAUSTED at <sha> <date>` with the census path in the entry; item 10
+      then proceeds in the order above without M0122-0012. It re-opens when
+      a later G1–G3 pass — at most once per 7 days, run when item 10 is
+      reached — finds a qualifying candidate, or by owner decision.
+    - Baton: `.ralph/working_set.md` carries an `M0122-0012:` line
+      (PROMPT.md). Skip-rationale tokens: `M0122-0012(yield-b: <two attempts
+      + %>)` during the one-task yield, `M0122-0012(exhausted@<sha>)`
+      afterwards.
+    M0147 descendants inherit item-10 rank — the S7 correctness-only
+    carve-out does not demote them. **M0147-0000 is a channel, not stock**
+    (like M0146-0014): never select it; take its first open child in file
+    order (`M0147-0000(channel)`).
 
 **New task fields (2026-09-18).** Every task filed from now on carries, each at
 the start of its own line: `Kind: recon|impl`, `Parent: <task-id|none>`, and on
@@ -421,8 +480,9 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   `## M0147` at the end of this file), per AGENT.md C5 (promote or delete —
   HOLD is not an outcome). Analysis and review:
   `/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`.
-- Rank: item 10 — M0122-0012 first (with the yield rule there), then M0147,
-  then the rest of M0122.
+- Rank: item 10 — superseded 2026-10-27 by the M0122-0012 return-first
+  rule (item 10); other item-10 work runs during its one-task yields and
+  after its exhaustion.
 - Order inside M0147: phase 1 goopg-private retirements (0010–0017), then
   phase 0 PG-port promotions (0020–0023; R3 — never discard a PG arm
   without an owner `[!]`), then phase 2 (0030 recon files the default-ON
@@ -438,6 +498,20 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   nested-loop estimates) may already hold now that SF0.25/SF1 are 99/99 —
   the loop may re-measure it and, if PG's plans match at both scales, flip
   M0146-0010a `[!]`→`[ ]` (owner authorisation recorded here).
+
+OWNER DECISIONS 2026-10-27 — M0122-0012 return-first:
+- M0122-0012 now heads item 10 (after M-NIGHTLY open items) and is
+  returned to after every other item-10 task until EXHAUSTED; the
+  2026-10-21 yield rule is replaced. Its rule (a) — "no runnable slice" —
+  yielded on 2026-10-24 after slice 92 although ledgered candidates
+  remained. The procedure (bar, one-task yield, Below-bar exclusion,
+  generation G1–G5, rotation, exhaustion) is in item 10.
+- The entry gained an owner-seeded Candidate pool and Below-bar list
+  (2026-10-27); the loop maintains both. The census scripts it used from
+  `tmp/` are committed under `analysis/m0122/m0122-0012/tools/`.
+- Other item-10 work (M0119, M0147, the rest of M0122) runs during
+  M0122-0012's one-task yields — the next selectable task in item-10
+  order — and after its exhaustion.
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -1615,6 +1689,43 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Rank: below item 10 under the S7 carve\-out \(correctness/fidelity, no plan instrument\) unless the owner places it\.
   - First step: the free list → FSM move \(the only residual with an observable cost: index bloat across backends\)\.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
+  - **Candidate pool (owner-seeded 2026-10-27 from the ledger and the slices' Open/Next/Left notes; the loop
+    maintains it and re-ranks it by predicted gain after each G1–G3 pass — return-first rule, banner item 10):**
+    - C1 Numeric hash-join and GROUP BY keys hashed as canonical strings (Q13 `mapaccess2_faststr` ~5%; HammerDB
+      TPC-H keys are numeric) — ledger :3169, :3171.
+    - C2 Q14/Q23 per-probe constant factor on `store_sales_pkey` probes: leafScanStart's generic comparator
+      (~12% of Q14, slice 80 "Left") and the join-aware read set for inner index scans (ledger :3210).
+    - C3 Q67 sort comparator memory access over eight `char(n)` keys (part 9, the merge-sort drop).
+    - C4 Q95 remaining excess (part 9 :205-211): the consumer's `retainBuildRow` copy and 10 M CTE rows through
+      two semi joins; slice 92 did not move end-to-end time.
+    - C5 Q78 sort rows plus merge-join output bytes after slice 88's −48% — re-measure first.
+    - C6 Lead-conjunct prefilter for a qual that reads the last column (slice 86 "Open").
+    - C7 Lazy deform before a selective hash probe, plus the Parallel Hash empty exit (ledger :3207, slice 72 "Next").
+    - C8 Nested-loop pair copy and the per-row index-only-scan output row (ledger :3186, :3187, :3196).
+    - C9 Borrow through merge join, Sort and Gather Merge (ledger :3172, :3177).
+    - C10 Hashed SAOP for numeric/date (ledger :3198); other hashed DISTINCT sorts (ledger :3204).
+    - C11 Lazy window evaluation (ledger :3208); Q51 still 2.7x (slice 62); PG inverse-transition moving aggregate.
+    - C12 Multi-key / grouping-set aggregate int lane plus the NULL group (ledger :3173);
+      `groupBoundsFixed` ~28 MB/run (slice 75).
+    - C13 Flat expression step program, no recursive 48-byte Datum return (ledger :3176, :3181) — design-sized;
+      needs a slice-sized first step (the evalFastLeaf proxy is on the Below-bar list).
+    - C14 VirtualSlot/PackedSlot arms in fastOperandPtr (ledger :3209); set-valued read set through joins
+      (ledger :3179 — re-measure on a release build before ranking).
+    - C15 Planning-time items: pathkey canonicalisation (ledger :3182, :3192); sublink lowering for
+      WindowAgg/SetOp/SRF (ledger :3212a).
+    - Not M0122-0012 candidates (plan-visible → parity tasks): hashed SubPlan for EXISTS…OR EXISTS (slice 65);
+      Gather projection below the Gather (ledger :3190).
+  - **Below-bar list (ineligible on return for the same target query — key: mechanism = code site + PG function;
+    owner-seeded 2026-10-27; the loop appends every attempt that misses the 3% bar, landed or dropped):**
+    - Slice 35 projection under an aggregate (Q14 −2.5%); slice 61 cached-root descents (Q87 −1.4%; Q72 −2.1%);
+      slice 85 Gather worker VirtualSlot (Q10 −0.4% instructions).
+    - Dropped: evalFastLeaf proxy (reverted, Q6 slower; ledger :3181); operand leaf copy (loop #40); slice 8
+      verdict pre-pass (slower); slice 9 constant divisor; `MaterializedSlot.owned` elision (Q97 slower); per-Context
+      `pgIndexKeyColumns` cache (flat — relevant to C2); attcacheoff cached-offset deform (slice 72, flat); slice 72's
+      conditional NULL write and the skip-arm conditional NULL store (+4.7%); pdqsort (Q87 +8%) and
+      `SortStableFunc`; buffered stable merge sort (Q67 −3% instructions, +2.6% cycles); compact sort-to-GM-queue
+      (slice 89); NL stream outer copy (does not fire in Q10).
+  - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5076,6 +5187,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `e8367f901`** \(M0122\-0017 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261027l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `da7f0c117`** \(M0122\-0020 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7467,8 +7581,9 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
 ## M0147 — Lever retirement (filed 2026-10-21, owner decision)
 
 **Milestone doc:** `docs/milestones/0147-lever-retirement.md`. **Rank:** banner item 10 — M0122-0012 →
-**M0147** → the rest of M0122; **M0122-0012 (its inline slices and any task with `Parent: M0122-0012`)
-outranks every M0147 task** until it yields under the banner's item-10 rule (OWNER DECISIONS 2026-10-21).
+**M0147** → the rest of M0122, under the M0122-0012 **return-first rule** in banner item 10 (OWNER DECISIONS
+2026-10-27): M0147 tasks run during M0122-0012's one-task yields (when next in item-10 order) and after its
+exhaustion.
 Basis: the 2026-10-21 lever census and its review
 (`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`).
 
