@@ -702,3 +702,46 @@ release PG's 52 ms.
 
 The rest is spread thin across allocation, the nested-loop and merge-join arms, and memo misses on joinrels seen
 once per tour. A next pass should start from a fresh G1–G3 census rather than from this query.
+
+## Slice 100 — C18: B-tree binary searches read per-page invariants once (Q72 −3.06 % instructions)
+
+Loop #196, 2026-10-27, the return after the one-task yield. G3 profiles over the census-20261027 top three (Q14,
+Q23, Q72), plus Q13:
+
+- **C1 is stale.** Q13's keys already hash through int64 maps; `mapaccess2_faststr` is gone.
+- **C2 predicts only ~1–1.5 %.** `compareFixedPrefix` is already a fixed-width fast path. `pgTInfo`'s 10 % in Q72
+  is the first-touch cache miss on each probed tuple, which PG pays too.
+- **New candidate C17.** Q13's `matchSQLLike` is 7 %.
+- **New candidate C18, taken.** In Q72, `leafScanStart` is 27.6 % and `findChildBlockDirect` 19.8 %. Their
+  probes go through `pgGetItemRawAllowDeadNoCopy`, which recomputed `PageLinePointerCount` (a header read and its
+  checks) and `pgDataSlot` (a special-space read) on EVERY probe. `PageLinePointerCount` plus `Header` were ~5 %
+  of samples. PG's `_bt_binsrch` reads `PageGetMaxOffsetNumber` and `P_FIRSTDATAKEY` once per page.
+
+**Change.**
+
+- `storage.PageGetItemRawAllowDeadNoCopyN` takes a caller-read line-pointer count, and the old function wraps it,
+  so the item checks stay in one place.
+- `nbtree.pageProbe` holds one latched page's count and first data slot.
+- `leafScanStart` and `findChildBlockDirect` build a `pageProbe` once per page and probe through it.
+
+**Target (written before measuring).** TPC-DS SF0.25 Q72, instructions:u per query (`tools/ds-instr.sh`, 5 runs).
+
+| run | before | after |
+|---|---|---|
+| 1 | 26.999 G | 26.170 G |
+| 2 | 26.995 G | 26.171 G |
+
+That is **−3.06 %**, which meets the bar.
+
+Sweep wall times (Q72 3.28 s) stay within Q72's known 2.5–3.3 s spread; instructions are the measure of record.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; TPC-H census 22/22;
+RegressSuite = baseline (plpgsql flap); isolation PASS. The fire-set gate is out of scope: no optimizer path
+changed.
+
+Tests:
+
+- `TestPageProbeMatchesPerProbeAccessor`: on every page of a 20 000-key, multi-level index, rightmost and
+  internal pages included, the probe returns the per-probe accessor's bytes and errors for every slot, out of
+  range included.
+- `TestLeafScanStartMatchesLinearWalk` still holds.

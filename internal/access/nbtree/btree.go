@@ -2528,10 +2528,14 @@ func findChildBlockDirect(f indexFormat, p storage.Page, key []byte, nextKey boo
 	if len(key) == 0 {
 		searchN = 0
 	}
+	pp, err := newPageProbe(p)
+	if err != nil {
+		return 0, err
+	}
 	idx := sort.Search(searchN, func(i int) bool {
 		// C3-S1: dead items keep ordering bytes. NoCopy (M0146-0088): the
 		// page is latched for the whole call and the probe only compares.
-		raw, err := pgGetItemRawAllowDeadNoCopy(p, uint16(i+1))
+		raw, err := pp.rawAllowDead(uint16(i + 1))
 		if err != nil {
 			return true // will surface at the final error check
 		}
@@ -4947,8 +4951,12 @@ func (bt *BTree) leafScanStart(p storage.Page, count int, lo []byte, loExclusive
 		return 1
 	}
 	f := bt.format()
+	pp, err := newPageProbe(p)
+	if err != nil {
+		return 1
+	}
 	skip := func(s int) (skipped, ok bool) {
-		r, err := pgGetItemRawAllowDeadNoCopy(p, uint16(s))
+		r, err := pp.rawAllowDead(uint16(s))
 		if err != nil {
 			return false, false
 		}

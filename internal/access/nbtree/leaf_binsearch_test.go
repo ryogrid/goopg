@@ -117,3 +117,70 @@ func TestLeafScanStartMatchesLinearWalk(t *testing.T) {
 }
 
 func ptrInt32(v int32) *int32 { return &v }
+
+// TestPageProbeMatchesPerProbeAccessor pins M0122-0012 C18: the binary
+// searches read items through pageProbe, which takes the page's line-pointer
+// count and P_FIRSTDATAKEY once (as _bt_binsrch does) instead of per probe.
+// On every page of a multi-level index — leaves and internal pages, rightmost
+// and not — it must return exactly what pgGetItemRawAllowDeadNoCopy returns,
+// out-of-range slots included.
+func TestPageProbeMatchesPerProbeAccessor(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 128})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 9301, Fork: storage.MainFork}
+	desc := int4Desc()
+	bt, err := CreateWithOptions(pool, rel, Options{KeyDesc: desc})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for i := 0; i < 20000; i++ {
+		v := int32((i * 7919) % 20000)
+		tid := storage.ItemPointer{Block: storage.BlockNumber(1 + i/100), Offset: uint16(1 + i%100)}
+		if err := bt.Insert(tup(t, desc.Attrs, [][]byte{int4Val(v)}, tid), tid); err != nil {
+			t.Fatalf("Insert(%d): %v", v, err)
+		}
+	}
+	nblocks, err := pool.NBlocks(rel)
+	if err != nil {
+		t.Fatalf("NBlocks: %v", err)
+	}
+	if nblocks < 10 {
+		t.Fatalf("index has %d blocks; the fixture needs internal pages", nblocks)
+	}
+	rightmost, inner := 0, 0
+	for blk := storage.BlockNumber(1); blk < nblocks; blk++ {
+		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			t.Fatalf("Pin %d: %v", blk, err)
+		}
+		slot.RLock()
+		p := slot.Page()
+		pp, err := newPageProbe(p)
+		if err != nil {
+			t.Fatalf("block %d: newPageProbe: %v", blk, err)
+		}
+		if pgFirstDataSlot(p) == PHiKey {
+			rightmost++
+		}
+		if count, _ := PGDataItemCount(p); count > 0 && !ReadPGOpaque(p).IsLeaf() {
+			inner++
+		}
+		for s := uint16(1); int(s) <= pp.lpCount+2; s++ {
+			want, wantErr := pgGetItemRawAllowDeadNoCopy(p, s)
+			got, gotErr := pp.rawAllowDead(s)
+			if (wantErr == nil) != (gotErr == nil) || string(want) != string(got) {
+				t.Fatalf("block %d slot %d: probe %x/%v, per-probe accessor %x/%v", blk, s, got, gotErr, want, wantErr)
+			}
+		}
+		slot.RUnlock()
+		pool.Unpin(slot)
+	}
+	if rightmost == 0 || inner == 0 {
+		t.Fatalf("fixture covered %d rightmost and %d internal pages; want both", rightmost, inner)
+	}
+}

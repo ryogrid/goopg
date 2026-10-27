@@ -135,6 +135,31 @@ func pgGetItemRawAllowDeadNoCopy(p storage.Page, slot uint16) ([]byte, error) {
 	return storage.PageGetItemRawAllowDeadNoCopy(p, pgDataSlot(p, slot))
 }
 
+// pageProbe holds one latched page's per-search invariants for a binary
+// search: its line-pointer count and P_FIRSTDATAKEY, which _bt_binsrch reads
+// once per page (PageGetMaxOffsetNumber, P_FIRSTDATAKEY) while goopg's probe
+// accessor re-derived both from the header and special space on every probe
+// — ~5 % of TPC-DS Q72 (M0122-0012 C18). Valid only while the page stays
+// latched, as the probes themselves are.
+type pageProbe struct {
+	p       storage.Page
+	lpCount int
+	first   uint16
+}
+
+func newPageProbe(p storage.Page) (pageProbe, error) {
+	n, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return pageProbe{}, err
+	}
+	return pageProbe{p: p, lpCount: n, first: pgFirstDataSlot(p)}, nil
+}
+
+// rawAllowDead is pgGetItemRawAllowDeadNoCopy over the cached invariants.
+func (pp pageProbe) rawAllowDead(slot uint16) ([]byte, error) {
+	return storage.PageGetItemRawAllowDeadNoCopyN(pp.p, slot+pp.first-1, pp.lpCount)
+}
+
 func pgItemIsDead(p storage.Page, slot uint16) (bool, error) {
 	return storage.PageItemIsDead(p, pgDataSlot(p, slot))
 }

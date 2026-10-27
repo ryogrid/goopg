@@ -1722,6 +1722,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(provableKeys/keysCovering per call; PG caches innerrel\_is\_unique results in unique\_for\_rels /
       non\_unique\_for\_rels, analyzejoins\.c\), pathkey usefulness 12\.7 %\. Steps: C16a memoise the narrowed\-width
       inputs; C16b cache inner\-unique proofs; then re\-profile\.
+    - C17 \(added 2026\-10\-27 loop \#196, G3\) TPC\-H Q13 `o\_comment NOT LIKE '%special%requests%'`:
+      `matchSQLLike` 7 % of Q13; a `%lit%lit%` pattern is a substring search \(PG's MatchText over bytes\)\.
+    - C18 \(added 2026\-10\-27 loop \#196, G3, ranked first\) B\-tree binary\-search probes re\-derive per\-page
+      invariants: `PageGetItemRawAllowDeadNoCopy` recomputes `PageLinePointerCount` and `pgDataSlot` reads the
+      special space on EVERY probe of `leafScanStart` / `findChildBlockDirect` \(TPC\-DS Q72: PageLinePointerCount
+      \+ Header ~5 % of samples; leafScanStart 27\.6 %, findChildBlockDirect 19\.8 %\); PG's \_bt\_binsrch reads
+      PageGetMaxOffsetNumber / P\_FIRSTDATAKEY once per page\. Q14/Q23 share the path \(btree search ~15–18 %\)\.
+      - G3 notes 2026\-10\-27: C1's premise is stale \(Q13 keys already on int64 maps; no mapaccess2\_faststr\)\. C2
+        \(Q14 comparator\) predicts ~1–1\.5 %: compareFixedPrefix already a fixed\-width fast path; pgTInfo's 10 % in
+        Q72 is the first\-touch cache miss of each probed tuple \(PG pays it too\), not key re\-decoding\.
     - Not M0122-0012 candidates (plan-visible → parity tasks): hashed SubPlan for EXISTS…OR EXISTS (slice 65);
       Gather projection below the Gather (ledger :3190).
   - **Below-bar list (ineligible on return for the same target query — key: mechanism = code site + PG function;
@@ -1746,6 +1756,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       resets\.
       - Worked: M0122\-0013 standby restartpoint, landed 2026\-10\-27 \(loop \#195\)\. Yield over — the next item\-10
         selection returns to M0122\-0012 with the miss counter at 0\.
+  - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
+    - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
+      Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
+    - **C18 LANDED \(slice 100\)**: `pageProbe` \+ `PageGetItemRawAllowDeadNoCopyN` — leafScanStart and
+      findChildBlockDirect read the line\-pointer count and P\_FIRSTDATAKEY once per page\. Q72 26\.999/26\.995 →
+      26\.170/26\.171 Ginstr/q \(**−3\.06 %, meets the bar**\); plans identical\. Misses 0\. Next on return: C17 \(Q13
+      LIKE substring\) or a fresh G3 on Q14/Q23 \(decodeRowRangeInfo 13 %/9 %\)\. Design: part 9 §Slice 100\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
