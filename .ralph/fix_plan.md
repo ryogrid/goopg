@@ -2277,6 +2277,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       misses the 3 % bar** \(the compiled filter still costs ~2/3 of the interpreted one on these short predicates\);
       Q7 −6\.2 %, Q88 −1\.1 %; plans 99/99 same; values identical\. Test `TestCompiledCondMatchesInterpreter`\. Design:
       part 11 §116\. **Second consecutive miss \(C42, C43\) → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-28 \(loop \#227, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`4370e7f2c`
+    xlog\-only\)\. G3 on H Q13 by **cycles:u** \(`tmp/g3\-227/h13c\.data`; Q13 is stall\-bound, instructions do not see
+    it\): `mapaccess1\_fast64` 16\.4 % \(10\.6 % the hash join probe, 5\.2 % the aggregate\), `MaterializedSlot\.Get` 6\.9 %
+    \(first read of the matched build row\), `nextLazy` 6\.5 %\. Each int\-lane probe pays three dependent misses \(map
+    slot → the `\[\]Row` one\-element backing array → cells\); PG's ExecScanHashBucket two \(bucket → tuple\)\.
+    - C44 \(design\-sized; first slice qualifies per G4\): `lazyIntHash map\[int64\]\[\]Row` →
+      `map\[int64\]intHashRows\{first Row; more \[\]Row\}` — a unique key's row inline in the map slot, read through
+      `intMatches` \(a scratch one\-element slice\) at the 36 sites, audited for slices held across a lookup\.
+      Design: `docs/design/0100\-0149/0122\-0012\-c44\-int\-hash\-inline\-first\-row\.md`\.
+    - **Target \(C44\)**: TPC\-H SF1 **Q13**, metric **wall time** \(median of 5 warm runs, idle host: 16 cores,
+      load < 2; alternating A/B on tmp/q17\-clone\), with instructions:u no worse than \+1 %\. Bar: −3 %; predicted
+      ~5 %\. Implementation is the next loop's slice; nothing attempted, misses 0\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5943,6 +5955,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#226\) — **exhausted at `602669237`**, fresh census `routing\-20261028g/`
     \(s9bb\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: the M0122\-0012 one\-task yield → M0122\-0013\.
+  - S9 re\-check 2026\-10\-28 \(loop \#227\) — **exhausted at `4370e7f2c`**, census `routing\-20261028g/` reused:
+    `4370e7f2c` touches only `internal/access/transam/xlog` and tests, outside the planner\-relevant paths\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: M0122\-0012 \(returned from the yield\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
