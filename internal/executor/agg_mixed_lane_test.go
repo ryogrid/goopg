@@ -18,6 +18,7 @@ package executor
 
 import (
 	"math/big"
+	"reflect"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -85,6 +86,49 @@ func TestAggIntOnlyLaneUnaffected(t *testing.T) {
 		}
 		if got.Format() != tc.want {
 			t.Errorf("sum(%s) = %s, want %s", tc.what, got.Format(), tc.want)
+		}
+	}
+}
+
+// TestFinishAggLeavesStateUntouched pins the invariant M0122-0012 C46 relies
+// on: finishAgg reads the group's state through a pointer (no longer a ~700
+// byte copy), so it must never write it. The mixed-lane fold is the one place
+// that used to reassign its by-value copy; it now returns locals. Finalizing a
+// state twice must give the same value both times and leave the state exactly
+// as the transitions built it.
+func TestFinishAggLeavesStateUntouched(t *testing.T) {
+	ctx := NewContext()
+	for _, tc := range []struct {
+		name string
+		vals []Datum
+		want string
+	}{
+		{"sum", mixedLaneValues(), "5.5"},
+		{"avg", mixedLaneValues(), "1.3750000000000000"},
+		{"sum", ints(1, 2, 3), "6"},
+		{"avg", ints(1, 2, 3), "2.0000000000000000"},
+		{"count", mixedLaneValues(), "4"},
+		{"max", ints(4, 9, 2), "9"},
+	} {
+		call := optimizer.AggregateCall{Name: tc.name, InputType: catalog.Type{Name: "numeric"}}
+		var st aggRuntime
+		for _, v := range tc.vals {
+			if err := applyAggValue(ctx, call, &st, v); err != nil {
+				t.Fatalf("%s: transition: %v", tc.name, err)
+			}
+		}
+		before := st
+		for pass := 1; pass <= 2; pass++ {
+			got, err := finishAggValue(ctx, call, &st)
+			if err != nil {
+				t.Fatalf("%s pass %d: finalize: %v", tc.name, pass, err)
+			}
+			if got.Format() != tc.want {
+				t.Errorf("%s pass %d = %s, want %s", tc.name, pass, got.Format(), tc.want)
+			}
+			if !reflect.DeepEqual(st, before) {
+				t.Fatalf("%s pass %d: finishAgg wrote the state\nbefore %+v\nafter  %+v", tc.name, pass, before, st)
+			}
 		}
 	}
 }

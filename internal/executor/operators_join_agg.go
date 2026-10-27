@@ -3852,7 +3852,8 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 	// First, count how many aggregates exist per SharedStateSlot to detect
 	// actual sharing (a slot with only one agg is not shared).
 	slotCount := map[int]int{}
-	for _, call := range o.plan.Aggs {
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
 		if call.SharedStateSlot >= 0 && call.UserAgg != nil {
 			slotCount[call.SharedStateSlot]++
 		}
@@ -3862,7 +3863,8 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 		computed bool
 	}
 	distinctSlotStates := map[int]slotState{}
-	for i, call := range o.plan.Aggs {
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
 		if call.SharedStateSlot < 0 || call.UserAgg == nil {
 			continue
 		}
@@ -3943,8 +3945,9 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 			gr.aggs[i].distinctUserAggRows = nil
 		}
 	}
-	for i, call := range o.plan.Aggs {
-		d, ferr := o.finishAgg(gr.aggs[i], call)
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
+		d, ferr := o.finishAgg(&gr.aggs[i], call)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -5462,10 +5465,16 @@ func aggDatumToFloat64(d Datum) float64 {
 // that case, so the error must reach the client rather than be turned into a
 // stale state or a NULL. Built-in finalization cannot fail, which is why the
 // bulk of the work lives in finishBuiltinAgg with no error channel at all.
-func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Datum, error) {
+// finishAgg and finishBuiltinAgg read the group's state and the call through
+// pointers and never write them (M0122-0012 C46): aggRuntime is ~700 bytes and
+// AggregateCall ~320, and copying both on every finalized group was most of the
+// finalize path's work in a many-group hash aggregate (TPC-H Q18). PG's
+// finalize_aggregate (nodeAgg.c) likewise works on AggStatePerAgg /
+// AggStatePerGroup pointers.
+func (o *aggregateOp) finishAgg(st *aggRuntime, call *optimizer.AggregateCall) (Datum, error) {
 	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
 	if call.WithinGroup {
-		return finishWithinGroupAgg(st, call, o.ctx), nil
+		return finishWithinGroupAgg(*st, *call, o.ctx), nil
 	}
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
@@ -5622,23 +5631,24 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 // An overflow in the fold leaves the state untouched: finishBuiltinAgg has no
 // error channel, and reporting the numeric lane alone is the pre-existing
 // behaviour for that (unreachable in practice) case.
-func foldIntLaneIntoNumeric(st aggRuntime) aggRuntime {
+//
+// It returns the folded (numericSum, sum) pair and leaves st itself untouched,
+// so the finalizers read the state through a pointer without copying it.
+func foldIntLaneIntoNumeric(st *aggRuntime) (numericSum Datum, sum int64) {
 	if st.numericSum.Kind != KindNumeric || st.sum == 0 {
-		return st
+		return st.numericSum, st.sum
 	}
 	total, err := numericAdd(st.numericSum, numericFromInt(st.sum))
 	if err != nil {
-		return st
+		return st.numericSum, st.sum
 	}
-	st.numericSum = total
-	st.sum = 0
-	return st
+	return total, 0
 }
 
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
-func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCall) Datum {
+func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.AggregateCall) Datum {
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -5656,24 +5666,24 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
-		st = foldIntLaneIntoNumeric(st)
-		if st.numericSum.Kind == KindNumeric {
+		numericSum, _ := foldIntLaneIntoNumeric(st)
+		if numericSum.Kind == KindNumeric {
 			// For float4 input, PostgreSQL uses float4 as the transition type
 			// (float4pl accumulation with intermediate float32 rounding). Simulate
 			// this by casting the final sum through float32 and formatting with
 			// float4 precision (6 significant digits). M0097-0115.
 			if isFloat4TypeName(call.InputType.Name) {
-				fsum := aggDatumToFloat64(st.numericSum)
+				fsum := aggDatumToFloat64(numericSum)
 				return NewStringDatum(strconv.FormatFloat(float64(float32(fsum)), 'g', 6, 32))
 			}
 			// For float8 input, format with 15 significant digits (PostgreSQL's
 			// float8out format) to avoid spurious trailing-digit differences. M0097-0035.
 			switch strings.ToLower(call.InputType.Name) {
 			case "float8", "double precision", "double", "float":
-				fsum := aggDatumToFloat64(st.numericSum)
+				fsum := aggDatumToFloat64(numericSum)
 				return NewStringDatum(strconv.FormatFloat(fsum, 'g', 15, 64))
 			}
-			return st.numericSum
+			return numericSum
 		}
 		return Datum{Kind: KindInt, Int: st.sum}
 	case "avg":
@@ -5689,20 +5699,20 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
-		st = foldIntLaneIntoNumeric(st)
+		numericSum, sum := foldIntLaneIntoNumeric(st)
 		// avg(float4/float8) returns float8 — use float64 division and format
 		// with %.15g to match PostgreSQL's float8out. M0097-0020.
 		if strings.EqualFold(call.Type.Name, "float8") || strings.EqualFold(call.Type.Name, "float4") {
 			var fsum float64
-			if st.numericSum.Kind == KindNumeric {
-				fsum = aggDatumToFloat64(st.numericSum)
+			if numericSum.Kind == KindNumeric {
+				fsum = aggDatumToFloat64(numericSum)
 			} else {
-				fsum = float64(st.sum)
+				fsum = float64(sum)
 			}
 			return NewStringDatum(strconv.FormatFloat(fsum/float64(st.count), 'g', 15, 64))
 		}
-		if st.numericSum.Kind == KindNumeric {
-			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
+		if numericSum.Kind == KindNumeric {
+			d, err := numericDiv(numericSum, numericFromInt(st.count), call.Pos())
 			if err != nil {
 				return NullDatum
 			}
@@ -5710,7 +5720,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		}
 		// avg(integer types) must return numeric, not integer (PostgreSQL
 		// behaviour: avg(int2/int4/int8) → numeric). M0097-0053.
-		numSum := numericFromInt(st.sum)
+		numSum := numericFromInt(sum)
 		d, err := numericDiv(numSum, numericFromInt(st.count), call.Pos())
 		if err != nil {
 			return NullDatum

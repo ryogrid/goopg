@@ -2313,6 +2313,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       MATCH, sf025 PASS=99 \(the loop \#229 run was killed at its stamp; re\-run loop \#230\)\. Test
       `TestProbeKeyColMatchesEvaluator`\. Design: part 11 §117\. **Miss counter 0\.** Next on return: G3 for a new
       candidate \(census\-20261028 expires 2026\-10\-30 → fresh G1 then\)\.
+  - **G3 2026\-10\-28 \(loop \#231, misses 0\)**: S9 re\-census `routing\-20261028h` exhausted\. H Q18 at `923750127`
+    by instructions:u \(`tmp/g3\-231/h18i\.data`\): `mapaccess1\_fast64` 11\.1 % \(60 % of it on the instruction after the
+    group control\-word load — stall skid on the first touch of each new group, PG pays it too\), decodeRowRangeInfo 7\.1 %,
+    NumericInt64FromStoredPayload 7\.0 %, seqScanOp\.Next 7\.0 %, checksums 4\.5 %; the aggregate ~19 %\. Annotated against
+    `go tool objdump`: `finalizeGroup` 3\.69 % \(83 % 64\-byte\-stride struct copies\), `finishAgg` 1\.18 % \(90 %\),
+    `finishBuiltinAgg` 1\.01 % \(88 %\), `foldIntLaneIntoNumeric` 1\.03 % \(95 %\)\. `aggRuntime` is 704 bytes and
+    `optimizer\.AggregateCall` 320; per group finalizeGroup copies the call in three `range o\.plan\.Aggs` loops and
+    passes both by value to finishAgg → finishBuiltinAgg → foldIntLaneIntoNumeric \(in and out\), ~1\.5 M groups\.
+    `applyAgg`'s hot lines are the 48\-byte Datum return of `aggEvalList` \(C13 class\), not struct copies\.
+    - C46: the finalize path takes `\*aggRuntime` / `\*optimizer\.AggregateCall` \(index loops, pointer params; a branch
+      that mutates the state works on a local copy so the caller's state is untouched as before\)\. PG:
+      finalize\_aggregates / finalize\_aggregate \(nodeAgg\.c\) take AggStatePerAgg / AggStatePerGroup pointers\.
+    - **Target \(C46\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `923750127`\)\. Bar: −3 %; predicted ~5 %\.
+    - **C46 LANDED \(slice 118\)**: `finishAgg` / `finishBuiltinAgg` take `\*aggRuntime` / `\*optimizer\.AggregateCall`,
+      `finalizeGroup` walks the calls by index, `foldIntLaneIntoNumeric` returns the folded \(numericSum, sum\) pair\.
+      Q18 41\.142/41\.112 → 39\.309/39\.292 Ginstr/q = **−4\.44 %, meets the bar**; DS Q67 −1\.9 %\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(its Q67 2 s→5 s reading was host variance: warm wall base
+      2\.03/2\.94 s vs C46 1\.95/1\.78 s\)\. Test `TestFinishAggLeavesStateUntouched`\. Design: part 11 §118\. **Miss
+      counter 0\.** Next on return: S9 re\-census \(executor changed\), then G3 — DS Q14 / Q23 / H Q13 \(census\-20261028
+      expires 2026\-10\-30\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5986,6 +6007,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     `d100bd483` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#229\) — **exhausted at `a42524dd1`**, census `routing\-20261028g/` reused:
     `a42524dd1` is ralph/docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#231\) — **exhausted at `923750127`**, fresh census `routing\-20261028h/`
+    \(`923750127` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

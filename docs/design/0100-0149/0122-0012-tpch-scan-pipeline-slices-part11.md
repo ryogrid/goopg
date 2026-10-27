@@ -196,3 +196,56 @@ identical rows, in order. Keys are int4, int8 and NUMERIC (HammerDB's TPC-H key 
 the joins are inner, left, right (the other input builds), full, semi, anti and NOT IN, plus a residual, an
 expression key (must not arm) and a projection between the join and its probe scan. Eight of the twelve arm. An
 off-by-one column mapping fails it.
+
+## Slice 118 — C46: the aggregate finalize path reads state and call through pointers (Q18 −4.44 %)
+
+Loop #231. G3 on TPC-H Q18 at `923750127` by instructions:u (`tmp/g3-231/h18i.data`):
+
+- `runtime.mapaccess1_fast64` 11.1 %, 60 % of it on the instruction after the group control-word load. That is stall
+  skid on the first touch of each new group's slot (~1.5 M groups in the `l_orderkey` hash aggregate), which PG's
+  TupleHashTable pays too;
+- decodeRowRangeInfo 7.1 %, NumericInt64FromStoredPayload 7.0 %, seqScanOp.Next 7.0 %, checksums 4.5 %;
+- the aggregate ~19 %.
+
+**Symptom.** Mapped against `go tool objdump`, most of the finalize path's samples are 64-byte-stride `movups` copy
+loops: `finalizeGroup` 3.69 % (83 % copies), `finishAgg` 1.18 % (90 %), `finishBuiltinAgg` 1.01 % (88 %),
+`foldIntLaneIntoNumeric` 1.03 % (95 %). `aggRuntime` is 704 bytes and `optimizer.AggregateCall` 320. For every
+finalized group, `finalizeGroup` copied the call in three `for i, call := range o.plan.Aggs` loops, passed state and
+call by value to `finishAgg`, which passed both by value again to `finishBuiltinAgg`, and the sum/avg arms copied
+the state into and out of `foldIntLaneIntoNumeric`. That is ~3 KB of copying per group. PG's finalize_aggregates /
+finalize_aggregate (nodeAgg.c) work on AggStatePerAgg / AggStatePerGroup pointers.
+
+`applyAgg`'s hot lines are different: the 48-byte Datum return of `aggEvalList` (C13 class), not struct copies.
+
+**Change.**
+
+- `finalizeGroup` walks `o.plan.Aggs` by index with `call := &o.plan.Aggs[i]`.
+- `finishAgg(st *aggRuntime, call *optimizer.AggregateCall)` and `finishBuiltinAgg` take pointers. Neither writes
+  `st` or `call`; the rare ordered-set branch still hands `finishWithinGroupAgg` copies.
+- `foldIntLaneIntoNumeric(st *aggRuntime) (numericSum Datum, sum int64)` returns the folded pair instead of a
+  modified copy of the state. The sum and avg arms read those locals. The group's state stays exactly as the
+  transitions built it, as it did when finishAgg worked on a copy.
+- Callers: the window operator passes `&running, &call`; the parallel-combine test helper passes its pointer.
+
+**Measured** (`analysis/m0122/m0122-0012/tools/h-instr.sh` and `ds-instr.sh`, 3 runs × 2 alternating rounds,
+fresh server per run, base binary at `923750127`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q18 (Target) | 41.142 / 41.112 | 39.309 / 39.292 | **−4.44 %** |
+| TPC-DS Q67 | 15.959 / 15.956 | 15.654 / 15.648 | −1.9 % |
+
+This meets the 3 % bar (predicted ~5 %). The sf025 sweep read Q67 at 4.3 s against 1.3 s in the previous sweep.
+That was host variance: warm wall time on the same host measured base 2.03 / 2.94 s against C46 1.95 / 1.78 s.
+
+Gates:
+
+- units;
+- spotcheck: Q12=2, Q13=35;
+- acceptance: 24 MATCH;
+- sf025 PASS=99 (61 ck-verified), plans 99/99 same;
+- fire-set: out of scope (executor-only).
+
+**Test.** `TestFinishAggLeavesStateUntouched` (agg\_mixed\_lane\_test.go) finalizes sum/avg/count/max states twice,
+including the mixed int/numeric lane, and requires the same value both times and a state `reflect.DeepEqual` to
+the one the transitions built. Writing the fold back into the state fails it.
