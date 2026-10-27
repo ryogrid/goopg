@@ -2643,10 +2643,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     ANALYZE on such a plan is distorted until this is understood\.
   - Resume point: profile the EXPLAIN ANALYZE run vs the bare run \(tmp/ds\-iprof\.sh with the `explain \(analyze,
     timing off\)` file\); look at the instrumentation wrapper \(maybeInstrument\) on rescans and in parallel workers\.
-- [ ] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
+- [x] **M0122-0020 — EXPLAIN ANALYZE prints a looped node's actual time as the total over loops, PG prints the per\-loop average**\.
   Kind: impl
-  Movement: none — EXPLAIN ANALYZE output fidelity \(correctness\-only; S7 carve\-out: below item 10 unless placed\)
+  Movement: none — correctness fix — no plan instrument \(EXPLAIN ANALYZE time fidelity; census 22/22, sf025 plans 99/99 same\)
   Parent: none
+  - Done 2026\-10\-27 \(loop \#185, item 10's "rest of M0122"\)\. All four `actual time` renderers \(text label, Hash
+    line, Worker line, JSON\) divide by loops via `msPerLoop`, as explain\.c does\. Testing exposed a second defect:
+    `instrumentedOp` timed the gap between returns \(the parent's work included\), skipped the EOF call, and kept one
+    loop's startup, so a child out\-timed its parent\. It now times only its own Open/Next calls and sums startup per
+    loop \(InstrEndLoop\)\. Test `TestExplainAnalyzeActualTimePerLoop`\. Design doc
+    `docs/design/0100\-0149/m0122\-0020\-actual\-time\-per\-loop\.md`\. JSON `Node Type` label gap ledgered\.
   - Filed 2026\-10\-24 from M0122\-0012 post\-slice\-91 recon\. TPC\-DS Q14 on the SF0\.25 clone:
     `Index Scan using store\_sales\_pkey … \(actual time=0\.003\.\.1857\.725 rows=42\.54 loops=16173\)` — rows is the
     per\-loop average but time is the total; PG's ExplainNode \(explain\.c\) divides startup and total time by nloops\.
@@ -5067,6 +5073,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `b7da10d8d`** \(M0147\-0051 changed internal/optimizer \+ executor \+
     postmaster\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027k/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99,
     every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `e8367f901`** \(M0122\-0017 changed internal/executor\)\. Census
+    `analysis/m0146/m0146\-0014/routing\-20261027l/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
+    No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

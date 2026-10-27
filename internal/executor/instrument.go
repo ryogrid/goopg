@@ -22,12 +22,11 @@ import (
 type nodeStats struct {
 	rowsOut    int64
 	loops      int64
-	startupNs  int64 // first-row latency in nanoseconds (per current Open)
-	totalNs    int64 // accumulated time across all Next calls (per current Open)
+	startupNs  int64 // time inside the node up to its first row, summed over loops (PG instr->startup)
+	totalNs    int64 // time inside the node's Open and Next calls, every loop (PG instr->total)
 	timing     bool  // tracks whether time.Now() snapshots are taken
 	gotFirst   bool  // first Next-since-Open returned a row
-	openTime   time.Time
-	rowDeltaT  time.Time
+	loopNs     int64 // time inside the node so far this loop (PG instr->counter)
 	// heapFetches counts the heap tuples an IndexOnlyScan had to fetch
 	// because the page was not ALL_VISIBLE (design 0118-0102). Mirrors
 	// upstream's IndexOnlyScanState.ioss_HeapFetches, surfaced by EXPLAIN
@@ -122,9 +121,9 @@ func (o *instrumentedOp) underlying() Operator { return o.inner }
 // counter sidecar.
 func (o *instrumentedOp) Schema() optimizer.Schema { return o.inner.Schema() }
 
-// Open increments the loop counter, snapshots the start time
-// (when timing is enabled), and resets per-Open stats so a
-// rescan produces fresh numbers.
+// Open increments the loop counter, times the wrapped Open (when timing is
+// enabled), and resets the per-loop counter so a rescan starts a fresh
+// cycle.
 func (o *instrumentedOp) Open(ctx *Context) error {
 	o.stats.loops++
 	if ctx != nil && ctx.Pool != nil {
@@ -147,13 +146,20 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 			o.stats.memSeeded = true
 		}
 	}
-	if o.stats.timing {
-		now := time.Now()
-		o.stats.openTime = now
-		o.stats.rowDeltaT = now
-		o.stats.gotFirst = false
+	if !o.stats.timing {
+		return o.inner.Open(ctx)
 	}
-	return o.inner.Open(ctx)
+	// The stopwatch runs only inside this node's own calls, as PG's
+	// InstrStartNode/InstrStopNode pair does (M0122-0020). Open is timed
+	// because goopg operators do there the work PG's first ExecProcNode
+	// does (hash build, sort, materialise).
+	o.stats.gotFirst = false
+	start := time.Now()
+	err := o.inner.Open(ctx)
+	d := time.Since(start).Nanoseconds()
+	o.stats.loopNs = d
+	o.stats.totalNs += d
+	return err
 }
 
 // accountBuffers rolls the storage.Pool's global hit/read/dirtied/written
@@ -193,11 +199,22 @@ func (o *instrumentedOp) accountBuffers() {
 	}
 }
 
-// Next records the per-row delta into the running total and
-// (on the first non-EOF row of this Open cycle) records the
-// startup time.
+// Next adds the call's own duration into the loop and running totals and
+// (on the first non-EOF row of this Open cycle) adds the loop's time so far
+// into the startup sum.
 func (o *instrumentedOp) Next() (TupleSlot, error) {
+	var start time.Time
+	if o.stats.timing {
+		start = time.Now()
+	}
 	slot, err := o.inner.Next()
+	if o.stats.timing {
+		// Every call counts, the one returning EOF included, and only the
+		// time spent inside it — not the parent's work between calls.
+		d := time.Since(start).Nanoseconds()
+		o.stats.loopNs += d
+		o.stats.totalNs += d
+	}
 	o.accountBuffers()
 	if err == EOF {
 		return nil, EOF
@@ -206,14 +223,12 @@ func (o *instrumentedOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	o.stats.rowsOut++
-	if o.stats.timing {
-		now := time.Now()
-		if !o.stats.gotFirst {
-			o.stats.startupNs = now.Sub(o.stats.openTime).Nanoseconds()
-			o.stats.gotFirst = true
-		}
-		o.stats.totalNs += now.Sub(o.stats.rowDeltaT).Nanoseconds()
-		o.stats.rowDeltaT = now
+	if o.stats.timing && !o.stats.gotFirst {
+		// PG's InstrEndLoop adds each cycle's firsttuple — the node's
+		// counter at its first row — into startup (instrument.c:117,154);
+		// EXPLAIN divides the sum by nloops.
+		o.stats.startupNs += o.stats.loopNs
+		o.stats.gotFirst = true
 	}
 	return slot, nil
 }

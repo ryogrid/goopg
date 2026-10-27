@@ -198,6 +198,20 @@ func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
+// msPerLoop mirrors PG's `startup_ms = 1000.0 * instrument->startup / nloops`
+// and `total_ms = 1000.0 * instrument->total / nloops` (explain.c:1833-1834,
+// 1899-1900): EXPLAIN ANALYZE's `actual time=` is the PER-LOOP average, like
+// `rows=` (M0122-0020). startupNs and totalNs accumulate across every loop
+// (instrument.go), so a node re-Open'd once per outer row would otherwise
+// print the sum of all its loops. loops<=0 returns the raw value, as
+// rowsPerLoop does.
+func msPerLoop(ns, loops int64) float64 {
+	if loops <= 0 {
+		return nsToMs(ns)
+	}
+	return nsToMs(ns) / float64(loops)
+}
+
 // rowsPerLoop mirrors PG's `rows = instrument->ntuples / nloops`
 // (explain.c:1835,1901): EXPLAIN ANALYZE's `rows=` is the PER-LOOP
 // average, not the cumulative total across every Open/Next cycle of a
@@ -719,7 +733,7 @@ func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, s
 		rowsAvg := rowsPerLoop(s.rowsOut, s.loops)
 		if s.timing {
 			line += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
-				nsToMs(s.totalNs), nsToMs(s.totalNs), rowsAvg, s.loops)
+				msPerLoop(s.totalNs, s.loops), msPerLoop(s.totalNs, s.loops), rowsAvg, s.loops)
 		} else {
 			line += fmt.Sprintf(" (actual rows=%.2f loops=%d)", rowsAvg, s.loops)
 		}
@@ -6235,7 +6249,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if s.timing {
 			// PG formats rows as float (e.g. "rows=5.00") for ANALYZE output.
 			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
-				nsToMs(s.startupNs), nsToMs(s.totalNs), rowsAvg, s.loops)
+				msPerLoop(s.startupNs, s.loops), msPerLoop(s.totalNs, s.loops), rowsAvg, s.loops)
 		} else {
 			label += fmt.Sprintf(" (actual rows=%.2f loops=%d)", rowsAvg, s.loops)
 		}
@@ -6361,7 +6375,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			for _, w := range ordered {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
 					"Worker %d:  actual time=%.3f..%.3f rows=%.2f loops=%d",
-					w.Worker, nsToMs(w.StartupNs), nsToMs(w.TotalNs), rowsPerLoop(w.RowsOut, w.Loops), w.Loops))})
+					w.Worker, msPerLoop(w.StartupNs, w.Loops), msPerLoop(w.TotalNs, w.Loops), rowsPerLoop(w.RowsOut, w.Loops), w.Loops))})
 			}
 		}
 	}
@@ -6535,8 +6549,8 @@ func planToJSONWithStatsNamed(n optimizer.Node, opts parser.ExplainOptions, stat
 		obj["Actual Rows"] = round2(rowsPerLoop(s.rowsOut, s.loops))
 		obj["Actual Loops"] = s.loops
 		if s.timing {
-			obj["Actual Startup Time"] = nsToMs(s.startupNs)
-			obj["Actual Total Time"] = nsToMs(s.totalNs)
+			obj["Actual Startup Time"] = msPerLoop(s.startupNs, s.loops)
+			obj["Actual Total Time"] = msPerLoop(s.totalNs, s.loops)
 		}
 		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
 			// ANALYZE (design 0118-0102). horizons.spec reads it via
