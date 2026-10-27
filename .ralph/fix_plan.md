@@ -1940,6 +1940,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       in PG\), which also removes the map insert and the emit loop's `groups\[key\]` re\-lookup \(~7 % together\) but
       drops the reopen check that guards against a sort/group\-equality mismatch; ledgered, not attempted\. Below\-bar
       list updated\. **Miss counter 1\.**
+  - **Return 2026\-10\-27 \(loop \#206\)**: S9 reused `routing\-20261027z` \(`acd4ff2d7` is no\-code\)\. Instruction
+    samples skid onto the instruction after a load \(trimStringDatum's 4 % sits on one `movabs` after the word load\),
+    so per\-symbol shares lean to stalls; structural repeated work is the safer lever\.
+    - C27: a multi\-set aggregate \(grouping sets\) evaluates each aggregate's argument once PER SET per input row —
+      `applyAgg` calls `aggEvalList\(o\.aggArgNodes, …\)` inside the drain's `for si, set := range sets` loop, so Q67's
+      `sum\(coalesce\(ss\_sales\_price\*ss\_quantity, 0\)\)` is computed 9× per row\. PG's ExecBuildAggTrans
+      \(execExpr\.c:3934\-3943\) evaluates a transition's arguments once and then calls the transition for each
+      concurrently evaluated grouping set\. Mechanism: per\-row cache of each aggregate's argument value, valid for
+      the current input row only, used when the aggregate computes more than one set; values that point at memory
+      \(Buf or arena\) are re\-evaluated, so only inline scalars are shared\. Predicted ~4–5 %\.
+    - **Target \(C27\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `acd4ff2d7`\)\. Bar: −3 %\.
+    - **C27 LANDED \(slice 107\)**: `aggArgShare` / `aggArgRow` / `aggArgSeen` / `aggArgVal` — a multi\-set aggregate
+      reuses an inline\-scalar argument already evaluated for the current row\. Q67 19\.065/19\.081 → 18\.221/18\.221
+      Ginstr/q \(**−4\.5 %, meets the bar**\); all 11 grouping\-set TPC\-DS queries byte\-identical; plans 99/99 same\.
+      **Misses reset to 0\.** Next on return: Q67's remaining excess \(Sort datum1, the no\-hash rollup after the
+      equality proof\) or a fresh G1 census \(census\-20261027 expires 2026\-10\-30; Q67 has fallen from 24\.77 to
+      18\.22 Ginstr/q\)\. Design: part 10 §107\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5529,6 +5547,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027z/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
     SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note \(plus
     P0\-E14\(owner\-placement\)\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#206\) — **exhausted at `acd4ff2d7`**, census `routing\-20261027z/` reused:
+    `acd4ff2d7` is ralph/docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live
+    for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

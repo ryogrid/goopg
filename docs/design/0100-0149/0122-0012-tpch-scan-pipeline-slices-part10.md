@@ -274,3 +274,55 @@ group, as in PG, and the output is emitted from a group list. That would also re
 re-lookup, about 7 % together. It would, however, drop the reopen check that is goopg's only guard against a sort
 key and a group key that disagree on equality (bpchar trimming, numeric scale, collation). That agreement has to
 be proven first.
+
+## Slice 107 — C27: a grouping-sets aggregate evaluates each argument once per row (Q67 −4.5 % instructions)
+
+Loop #206 reused census z (`acd4ff2d7` touched no code). The miss counter was 1.
+
+**Profiling note.** Sampled on `instructions:u`, `trimStringDatum`'s 4 % sits almost entirely on the instruction
+after its 8-byte load. That is sampling skid, so per-symbol instruction shares still lean towards stalls. This loop
+therefore looked for repeated work instead.
+
+**Symptom.** The hash drain routes each input row into every grouping set. For each set it runs every aggregate's
+`applyAgg`, and `applyAgg` evaluates the aggregate's argument (`aggEvalList(o.aggArgNodes, …)`). Q67's
+`sum(coalesce(ss_sales_price*ss_quantity, 0))` was therefore computed nine times per input row.
+
+**PG.** `ExecBuildAggTrans` (execExpr.c:3934–3943) evaluates a transition's arguments once and then calls the
+transition function "once for each concurrently evaluated grouping set".
+
+**Change** (`operators_join_agg.go`):
+
+- A multi-set aggregate arms a per-row argument cache: `aggArgShare`, plus `aggArgRow` advanced once per input row
+  in the drain, and `aggArgSeen` / `aggArgVal` per aggregate.
+- `applyAgg` reuses a value already evaluated for the current row.
+- Only inline scalars are kept (`Buf == nil && ArenaID == 0`). A value whose bytes live in `Buf` or an arena may
+  sit in scratch that the next aggregate's evaluation reuses, so it is evaluated again per set, as before.
+- Single-set aggregates and the sorted single-set paths (`openSorted`, `openSortedPartialEmit`) never arm the
+  cache: they return before the sets are built, and they require `GroupingSets == nil`.
+- `aggArgShareDisabled` is a test knob.
+
+A volatile argument (`random()`) now gives one value per row across the sets, as in PG; it used to give one per
+set.
+
+**Measured** (`tools/ds-instr.sh`, 5 runs × 2, a fresh A/B against `acd4ff2d7`): Q67 19.065 / 19.081 →
+18.221 / 18.221 Ginstr/q, **−4.5 %**, which meets the 3 % bar (predicted 4–5 %).
+
+**Values.** All 11 grouping-set TPC-DS queries (Q5, 14, 18, 22, 27, 36, 67, 70, 77, 80, 86) give byte-identical
+output on the two binaries.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set PASS (no fires);
+RegressSuite counts equal to the slice-106 run except the plpgsql flapper, with `groupingsets`, `aggregates` and
+`window` byte-identical.
+
+Test: `TestAggArgSharedAcrossGroupingSets` compares shared and per-set evaluation:
+
+- ROLLUP, GROUPING SETS and CUBE;
+- inline (int, numeric, float, CASE, coalesce) and non-inline (text) arguments, plus FILTER;
+- under both the hash and the sorted strategies.
+
+A temporary probe counted 11 588 cache hits in it.
+
+**Left (ledgered).**
+
+- FILTER clauses are still evaluated once per set; PG evaluates them once per transition too.
+- Text and other non-inline arguments are still evaluated once per set.

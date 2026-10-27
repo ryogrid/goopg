@@ -2330,6 +2330,15 @@ type aggregateOp struct {
 	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
 	currentRowVersion      int64   // incremented per input row
 
+	// M0122-0012 C27: a multi-set aggregate evaluates each aggregate's
+	// argument once per input row, not once per grouping set. aggArgRow is
+	// the drain's current input row (1-based); aggArgSeen[i] == aggArgRow
+	// means aggArgVal[i] is aggregate i's argument for that row.
+	aggArgShare bool
+	aggArgRow   int64
+	aggArgSeen  []int64
+	aggArgVal   []Datum
+
 	// E-06 (EX4-03): compiled per-call transition expressions. Node
 	// lists run parallel to plan.Aggs; extraNodes/orderNodes are
 	// per-call lists. aggDeclined marks whole-call UserAgg declines
@@ -2578,6 +2587,7 @@ func aggPlanUsesCTID(p *optimizer.Aggregate) bool {
 
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	o.aggArgShare = false
 	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
 
 	// P9 Finalize: publish the accumulator BEFORE opening the child, because
@@ -2686,6 +2696,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		sets = [][]int{all}
 	}
 	multiSet := len(sets) > 1
+	// M0122-0012 C27: PG's ExecBuildAggTrans (execExpr.c) evaluates a
+	// transition's arguments once and then calls the transition for each
+	// concurrently evaluated grouping set; applyAgg runs once per set, so
+	// the argument is cached for the current input row.
+	if multiSet && !aggArgShareDisabled {
+		o.aggArgShare, o.aggArgRow = true, 0
+		o.aggArgSeen = make([]int64, len(o.plan.Aggs))
+		o.aggArgVal = make([]Datum, len(o.plan.Aggs))
+	}
 
 	// A set with no active columns — an ungrouped aggregate, or the
 	// grand-total level of a ROLLUP — produces exactly one output row even
@@ -2851,6 +2870,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			return err
 		}
 		rowSeq++
+		o.aggArgRow++
 		for si, set := range sets {
 			var gr *groupRuntime
 			// M0122-0012 slice 24: the int64 group lane (see intLane above).
@@ -3273,6 +3293,10 @@ func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
 // aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
 // set it to compare the lane's output, order included, with the string path.
 var aggIntLaneDisabled = false
+
+// aggArgShareDisabled makes a multi-set aggregate evaluate each argument
+// once per grouping set again. Tests set it to compare the two.
+var aggArgShareDisabled = false
 
 // rollupCloseOrderDisabled sends a sorted rollup's output through the column
 // comparator instead of rollupCloseOrder. Tests set it to compare the two
@@ -4241,9 +4265,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 		st.count++
 		return nil
 	}
-	arg, err := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
-	if err != nil {
-		return err
+	// M0122-0012 C27: the same input row's argument, already evaluated for
+	// an earlier grouping set, is reused. Only inline scalars are kept: a
+	// value whose bytes live in Buf or an arena may sit in scratch that the
+	// next aggregate's evaluation reuses, so it is evaluated again.
+	var arg Datum
+	if o.aggArgShare && o.aggArgSeen[idx] == o.aggArgRow {
+		arg = o.aggArgVal[idx]
+	} else {
+		var err error
+		if arg, err = o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot); err != nil {
+			return err
+		}
+		if o.aggArgShare && arg.Buf == nil && arg.ArenaID == 0 {
+			o.aggArgVal[idx], o.aggArgSeen[idx] = arg, o.aggArgRow
+		}
 	}
 	// For user-defined aggregates with a strict sfunc: skip rows where any arg is NULL.
 	// STRICT means "returns null on null input" — sfunc not called when any arg is NULL.
