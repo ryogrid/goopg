@@ -784,3 +784,5 @@ decline.
 **Discovery, filed as P0-E13 (S2).** Reading the walk showed that `_` consumes one BYTE. PG's MatchText consumes
 one character (pg_mblen) under UTF-8. goopg answers `'é' LIKE '_'` = f and `'é' LIKE '__'` = t, where PG answers
 t and f. This predates C17 (the fast path declines `_`); the repro is under `analysis/p0e13/`.
+
+Continued in [part 10](0122-0012-tpch-scan-pipeline-slices-part10.md) from slice 102.

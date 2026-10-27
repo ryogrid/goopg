@@ -1750,6 +1750,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - G3 notes 2026\-10\-27: C1's premise is stale \(Q13 keys already on int64 maps; no mapaccess2\_faststr\)\. C2
         \(Q14 comparator\) predicts ~1–1\.5 %: compareFixedPrefix already a fixed\-width fast path; pgTInfo's 10 % in
         Q72 is the first\-touch cache miss of each probed tuple \(PG pays it too\), not key re\-decoding\.
+    - C19 \(added 2026\-10\-27 loop \#198, G3 on TPC\-H Q17\) data\-page checksum verification on buffer reads:
+      `pageChecksumBlock` 12\.25 % of Q17 \(per\-word bounds check \+ byte assembly \+ a pd\_checksum compare inside
+      the 32\-lane loop\)\. Both goopg clones and the release PG clusters have data checksums on \(version 1\); PG's
+      pg\_checksum\_block \(checksum\_impl\.h\) is written for compiler vectorisation\. Q14's index\-scan string
+      copies \(slicebytetostring ~3 %\) noted, not taken \(borrow/arena lifetime risk, P0\-E12 class\)\.
     - Not M0122-0012 candidates (plan-visible → parity tasks): hashed SubPlan for EXISTS…OR EXISTS (slice 65);
       Gather projection below the Gather (ledger :3190).
   - **Below-bar list (ineligible on return for the same target query — key: mechanism = code site + PG function;
@@ -1788,6 +1793,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       13\.815/13\.815 → 12\.226/12\.226 Ginstr/q \(**−11\.5 %, meets the bar**\); Q13 values identical\. Misses 0\.
       Discovery: P0\-E13 \(LIKE `\_` bytewise under UTF\-8; S2, filed\)\. Next on return: a fresh G3 on Q14/Q23/Q17
       \(decodeRowRangeInfo 13 %/9 %\) — the pool's remaining entries need re\-measurement\. Design: part 9 §101\.
+    - **Target \(C19, loop \#198\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      5 runs\)\. Mechanism: pg\_checksum\_block over the page as 32\-lane uint32 rows without per\-word bounds checks
+      or the in\-loop pd\_checksum test\. Bar: −3 %\.
+    - **C19 LANDED \(slice 102\)**: `pageChecksumBlockRows` \(in\-place \[32\]uint32 rows, pd\_checksum masked once\);
+      portable form kept as fallback \+ oracle\. Q17 32\.104/32\.082 → 27\.848/27\.862 Ginstr/q \(**−13\.2 %, meets
+      the bar**\); micro 1058 vs 2473 ns/page; stored checksums unchanged\. Misses 0\. Next on return: re\-profile
+      Q17 \(decodeRowRangeInfo 23 %, NumericInt64FromStoredPayload 9 %\) or Q18\. Design: part 10 §102\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5348,6 +5360,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `06d18e112`** \(M0122\-0012 slice 99 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027u/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `64aa8f62f`** \(M0122\-0012 slice 101 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

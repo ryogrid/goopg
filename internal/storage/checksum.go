@@ -1,6 +1,9 @@
 package storage
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"unsafe"
+)
 
 // Data-page checksums.
 //
@@ -53,7 +56,65 @@ func checksumComp(checksum, value uint32) uint32 {
 // mirroring pg_checksum_block. The pd_checksum word (low 16 bits of the
 // uint32 at byte offset 8) is treated as zero so the stored checksum does
 // not feed back into the computation. page must be exactly BlockSize bytes.
+//
+// On a little-endian host with a 4-byte-aligned whole page the words are
+// read in place as 32-lane rows (pageChecksumBlockRows); pageChecksumBlock-
+// Portable is the byte-assembling form, kept for every other case and as the
+// oracle the rows form is tested against.
 func pageChecksumBlock(page []byte) uint32 {
+	if hostLittleEndian && len(page) == BlockSize && uintptr(unsafe.Pointer(unsafe.SliceData(page)))%4 == 0 {
+		return pageChecksumBlockRows(page)
+	}
+	return pageChecksumBlockPortable(page)
+}
+
+// hostLittleEndian reports whether uint32 loads read the on-disk
+// little-endian words directly.
+var hostLittleEndian = binary.NativeEndian.Uint16([]byte{1, 0}) == 1
+
+// pageChecksumBlockRows is pg_checksum_block over the page viewed as rows of
+// nChecksumSums uint32 words — the layout checksum_impl.h's loop is written
+// for so a C compiler vectorises it. Each row is an array pointer, so the
+// inner loop carries no bounds checks, and pd_checksum is masked once in row
+// 0 instead of being tested for at every word: the old loop's per-word work
+// was 12 % of TPC-H Q17, which verifies every lineitem page it reads
+// (M0122-0012 C19).
+func pageChecksumBlockRows(page []byte) uint32 {
+	sums := checksumBaseOffsets
+	const rows = BlockSize / (4 * nChecksumSums)
+	words := unsafe.Slice((*uint32)(unsafe.Pointer(unsafe.SliceData(page))), BlockSize/4)
+	// pd_checksum is the low 16 bits of word 2 of row 0 (bytes 8..10).
+	r := (*[nChecksumSums]uint32)(words[0:nChecksumSums])
+	for j := range nChecksumSums {
+		v := r[j]
+		if j == 2 {
+			v &= 0xFFFF0000
+		}
+		sums[j] = checksumComp(sums[j], v)
+	}
+	for i := 1; i < rows; i++ {
+		r = (*[nChecksumSums]uint32)(words[i*nChecksumSums : (i+1)*nChecksumSums])
+		for j := range nChecksumSums {
+			tmp := sums[j] ^ r[j]
+			sums[j] = tmp*checksumFNVPrime ^ (tmp >> 17)
+		}
+	}
+	for j := range nChecksumSums {
+		sums[j] = checksumComp(sums[j], 0)
+	}
+	for j := range nChecksumSums {
+		sums[j] = checksumComp(sums[j], 0)
+	}
+	var result uint32
+	for j := range nChecksumSums {
+		result ^= sums[j]
+	}
+	return result
+}
+
+// pageChecksumBlockPortable is pg_checksum_block assembling each word from
+// little-endian bytes.
+func pageChecksumBlockPortable(page []byte) uint32 {
 	var sums [nChecksumSums]uint32
 	copy(sums[:], checksumBaseOffsets[:])
 
