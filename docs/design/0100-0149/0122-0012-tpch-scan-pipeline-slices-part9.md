@@ -586,3 +586,55 @@ unmemoised comparison, and that separately built equal keys and class-equal keys
 - `truncateUselessPathkeys` per path (16 %);
 - `buildPathkeyUsefulness` on memo misses (7 %);
 - `mallocgc` across `addPathsForJointype` (23 %).
+
+## Slice 98 — C16f: truncate_useless_pathkeys' kept length is memoised per key list (Q64 planning −30 %)
+
+Loop #192, 2026-10-27, the same Target: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Re-profile after slice 97** (`tmp/q64plan-c16e.pprof`):
+
+| share | site |
+|---|---|
+| 20.1 % | `truncateUselessPathkeys` (via `buildJoinPathkeysFor`), the largest single share |
+| 21 % | `mallocgc` |
+| 14.8 % | `addNestLoopPathFor` |
+| 14.8 % | `tryMergeJoinPath` |
+
+A join path's pathkeys are `truncate_useless_pathkeys` of its outer's: the merge-useful prefix, the query-ordering
+prefix and the grouping/distinct members.
+
+The answer depends only on the joinrel's usefulness `u` and the key list. The same outer ordering is offered with
+every inner path and every join method, and since slice 95 `u` is shared by every GEQO tour. PG's version is
+cheap because canonical pathkeys compare by pointer; goopg re-derived identity keys, class lookups and prefix scans
+per call.
+
+**Change.** `u.truncMemo` maps (backing array, length) to the kept length, computed by `truncateUselessLen`.
+
+- A hit must match a stored copy of the list key by key. `PathKey ==` compares `Expr` by pointer; all 35 `Expr`
+  types are pointer receivers, so the comparison is safe.
+- The result always slices the CALLER's list (`keepPathkeys`, capacity-capped). A reused backing array can
+  therefore never answer for different contents, and no caller receives another caller's array.
+
+**Measured.**
+
+| run | before (slice 97) | after |
+|---|---|---|
+| 1 | 4.611 G | 3.229 G |
+| 2 | 4.615 G | 3.222 G |
+
+That is **−30.1 %**, which meets the 3 % bar.
+
+The gain exceeds the profile share (20 %). The removed calls also allocated (prefix slices, lazily formed
+metadata), and their GC work counts in instructions:u while pprof attributes it elsewhere.
+
+Because of the size, plans were checked beyond the gates: `EXPLAIN` with costs of Q64, Q72, Q14, Q39, Q17, Q25 and
+Q29 is byte-identical between the two binaries.
+
+Over slices 93–98, Q64 planning is −50.3 % in instructions (6.49 → 3.23 G). The sweep's Q64 reads 728 ms; the
+census median is 1019 ms and release PG 173 ms.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99 with plans 99/99 same; fire-set no fires on either
+corpus; TPC-H census 22/22; RegressSuite = baseline (plpgsql flap); isolation PASS.
+
+Test: `TestTruncateUselessPathkeysMemo`. It covers a repeated hit slicing the caller's list, an equal list in
+another array, and a rewritten array recomputed.

@@ -1,6 +1,9 @@
 package optimizer
 
-import "unsafe"
+import (
+	"slices"
+	"unsafe"
+)
 
 // truncate_useless_pathkeys for join rels (M0146-0005n).
 //
@@ -70,6 +73,20 @@ type pathkeyUsefulness struct {
 	// queryPathkeys' expressions, formed once per rel for usefulForMerging
 	// (M0122-0012 slice 78).
 	mergeMeta, queryMeta []listKeyMeta
+	// truncMemo memoises truncateUselessPathkeys' kept length per key list,
+	// bucketed by the list's backing array and length and verified against
+	// a copy of the list on every hit (M0122-0012 C16f).
+	truncMemo map[truncMemoKey]truncMemoEntry
+}
+
+type truncMemoKey struct {
+	data *PathKey
+	n    int
+}
+
+type truncMemoEntry struct {
+	keys []PathKey
+	kept int
 }
 
 // classIndex is ecClassOf's index over ecMembers, which are the members of
@@ -310,6 +327,40 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	if u == nil || len(keys) == 0 {
 		return keys
 	}
+	// The kept length is a function of u and the key list's contents. The
+	// same outer ordering is offered to a joinrel with every inner path and
+	// join method, and u is shared by every GEQO tour (usefulMemo), so the
+	// answer repeats; PG's build_join_pathkeys is cheap because canonical
+	// pathkeys compare by pointer. A hit must match the stored copy key by
+	// key — PathKey compares Expr by pointer (every Expr is a pointer type) —
+	// so a reused backing array can never return another list's length, and
+	// the result always slices the caller's own list.
+	mk := truncMemoKey{data: unsafe.SliceData(keys), n: len(keys)}
+	if e, hit := u.truncMemo[mk]; hit && slices.Equal(e.keys, keys) {
+		return keepPathkeys(keys, e.kept)
+	}
+	n := u.truncateUselessLen(keys)
+	if u.truncMemo == nil {
+		u.truncMemo = make(map[truncMemoKey]truncMemoEntry)
+	}
+	u.truncMemo[mk] = truncMemoEntry{keys: slices.Clone(keys), kept: n}
+	return keepPathkeys(keys, n)
+}
+
+// keepPathkeys is keys' leading n, capacity-capped so an append cannot write
+// into the caller's list; nil for none.
+func keepPathkeys(keys []PathKey, n int) []PathKey {
+	switch {
+	case n == 0:
+		return nil
+	case n == len(keys):
+		return keys
+	}
+	return keys[:n:n]
+}
+
+// truncateUselessLen is truncate_useless_pathkeys' kept length.
+func (u *pathkeyUsefulness) truncateUselessLen(keys []PathKey) int {
 	n := u.usefulForMerging(keys)
 	// pathkeys_useful_for_ordering compares canonical (equivalence-class)
 	// pathkeys: an ordering on cs_item_sk serves a query ordered on
@@ -324,13 +375,7 @@ func truncateUselessPathkeys(u *pathkeyUsefulness, keys []PathKey) []PathKey {
 	if nDist := u.leadingMembersOf(keys, u.distinctPathkeys, &u.distinctMeta); nDist > n {
 		n = nDist
 	}
-	switch {
-	case n == 0:
-		return nil
-	case n == len(keys):
-		return keys
-	}
-	return keys[:n:n]
+	return n
 }
 
 // leadingMembersOf is pathkeys_useful_for_grouping and

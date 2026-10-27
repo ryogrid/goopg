@@ -1769,6 +1769,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       4\.626/4\.618 Ginstr/plan \(**−4\.8 %, meets the bar**; −28\.8 % over 93–97\); plans identical\. Misses 0\.
       Next on return: re\-profile; truncateUselessPathkeys per path \(16 %\), buildPathkeyUsefulness misses \(7 %\)\.
       Design: part 9 §Slice 97\.
+    - **C16f LANDED \(slice 98, loop \#192\)**: truncateUselessPathkeys memoises the kept length per key list
+      \(u\.truncMemo, verified key by key, always slicing the caller's list\)\. Q64 4\.611/4\.615 → 3\.229/3\.222
+      Ginstr/plan \(**−30\.1 %, meets the bar**; −50\.3 % over 93–98\); sweep Q64 728 ms \(census 1019, PG 173\);
+      EXPLAIN with costs byte\-identical on Q64/Q72/Q14/Q39/Q17/Q25/Q29\. Misses 0\. Next on return: re\-profile Q64;
+      planning now ~3\.2 G vs PG's 52 ms plan — measure planning ms again \(g1\-split\.sh\) before the next step\.
+      Design: part 9 §Slice 98\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5255,6 +5261,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `660e20d86`** \(M0122\-0012 slice 96 changed internal/optimizer\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027r/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `34ccf73db`** \(M0122\-0012 slice 97 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027s/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
