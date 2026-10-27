@@ -81,7 +81,7 @@ export AGENT_BACKEND="claude"
 
 # Claude API-token failover (owner, 2026-10-28) — ~/.ralph/ralph_loop.sh,
 # section "CLAUDE API-TOKEN FAILOVER". With AGENT_BACKEND=claude and the
-# variable NAMED below holding a Console API key (sk-ant-apiNN-…, exported
+# variable NAMED below holding an API key (sk-ant-api03-… / sk-ant-usr-…, exported
 # from ~/.bashrc before the shell that starts the loop), every loop runs on
 # that key. When the key is unusable the loop switches to the subscription
 # login at once and blocks the key:

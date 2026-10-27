@@ -54,6 +54,9 @@ TMP_OUT="$(mktemp)"
 
     # --- token validation ------------------------------------------------------
     check "console key accepted" claude_api_token_valid "$KEY_A"
+    check "usr key accepted" claude_api_token_valid "sk-ant-usr-1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    check "admin key rejected" eval '! claude_api_token_valid "sk-ant-admin01-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+    check "missing secret rejected" eval '! claude_api_token_valid "sk-ant-api03-"'
     check "oauth token rejected" eval '! claude_api_token_valid "sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
     check "garbage rejected" eval '! claude_api_token_valid "hello"'
 
