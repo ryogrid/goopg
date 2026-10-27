@@ -7971,12 +7971,31 @@ Basis: the 2026-10-21 lever census and its review
     pass is what turns it into the `Nested Loop Left Join` over an index probe that PG 18\.3 elects for this fixture
     \(M0145\-0030\)\. Deleting the pass first would move such unsearched shapes AWAY from PG; the search must build them
     first \(M0147\-0052\), after which the pass has no customers and goes\. No code changed by the trial\.
-- [ ] **M0147-0052 — recon: why regress joins bypass the PG\-shaped search \(the post\-search `jn\.Algo` population\)**
+- [x] **M0147-0052 — recon: why regress joins bypass the PG\-shaped search \(the post\-search `jn\.Algo` population\)**
   Kind: recon
   Parent: M0147-0050
+  Movement: none — recon
+  - Done 2026\-10\-27 \(`analysis/m0147/m0147\-0052/`\)\. One probed regress run: seam declines by reason —
+    `lateral` 968 \(≈ the 889 unsearched CROSS joins\), `leaf\-count` 87, `outer\-on\-qual` 45, `prefix\-exceeds\-bindings`
+    19, `outer\-link\-no\-sjinfo` 19, tail 9 \(plus 9716 single\-relation statements that need no search\)\.
+    `lateral`/`leaf\-count` are banner\-S9\(2\)\-routed to M0145\-0003/0010; `outer\-on\-qual` filed below as the impl
+    child that unblocks M0147\-0051; the small classes stay listed in the README\.
   - Filed by M0147\-0050: 1306 regress joins and 2 TPC\-DS FULL joins per scale reach `walkRewriteNLI` unsearched, so
     `planFromItem`'s post\-search `jn\.Algo` assignment, not add\_paths\_to\_joinrel, picks their method\.
   - First step: classify the 1306 by the reason the search declined them \(CROSS 889 first\); file a parity task per
     class that PG plans through the search\.
   - Witness for the NLI\-dependent class \(from the M0147\-0051 trial\): `TestParallelNLIJointypeIdentity/left` —
     a LEFT JOIN whose ON clause carries an outer\-only conjunct \(`AND o\.id > 0`\)\. It unblocks M0147\-0051\.
+- [ ] **M0147-0053 — admit outer\-join ON conjuncts that test only the preserved side \(the `outer\-on\-qual` seam decline\)**
+  Kind: impl
+  Parent: M0147-0052
+  - Filed by M0147\-0052: `outerOnQualsOK` \(`internal/optimizer/joinsearchseam\.go`\) declines a LEFT/RIGHT link whose
+    ON clause carries a preserved\-side\-only conjunct or a constant \(45 regress decline events\), so the statement is
+    planned outside the PG\-shaped search\. PG keeps such a conjunct as a join clause of that outer join
+    \(`distribute\_qual\_to\_rels`, `postgres/src/backend/optimizer/plan/initsplan\.c`: `is\_pushed\_down` false, evaluated
+    in the join's restrictlist\), and its search builds the join\.
+  - Witness: `TestParallelNLIJointypeIdentity/left` \(`o LEFT JOIN i ON i\.k = o\.k AND o\.id > 0`; PG elects a
+    Nested Loop Left Join over the index probe\)\. Landing this unblocks M0147\-0051\.
+  - First step: carry the preserved\-side conjunct on the outer link as a join qual the searched join evaluates
+    \(not a residual Filter above the tree, not a scan restriction\), admit it in `outerOnQualsOK`, and check the
+    witness plans as PG does; then census \+ regress\.
