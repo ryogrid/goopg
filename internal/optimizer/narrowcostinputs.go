@@ -250,19 +250,81 @@ func (s *searchCtx) joinrelNarrowedWidths(joinrel *RelOptInfo) narrowedWidths {
 		!s.outputColsKnown || s.outputCols == nil || s.clauses == nil || len(joinrel.publishedMembers) == 0 {
 		return narrowedWidths{}
 	}
-	keep, ok := s.attrNeededAbove(joinrel.Relids)
+	keep, ok := s.memoAttrNeededAbove(joinrel.Relids)
 	if !ok {
 		return narrowedWidths{}
 	}
-	var cols []keptColumn
+	var n narrowedWidths
 	for _, m := range joinrel.publishedMembers {
-		mc, ok := relNarrowedColumns(m)
+		mc, ok := s.memoRelNarrowedColumns(m)
 		if !ok {
 			return narrowedWidths{}
 		}
-		cols = append(cols, mc...)
+		for _, c := range mc {
+			if !keep[c.name] {
+				continue
+			}
+			n.ncols++
+			n.avgVarBytes += c.varBytes
+			n.outputWidth += c.width
+		}
 	}
-	return sumKeptColumns(cols, keep)
+	// The sumKeptColumns rules over the members' concatenation.
+	if n.ncols == 0 {
+		return narrowedWidths{}
+	}
+	if n.outputWidth < 1 {
+		n.outputWidth = 1
+	}
+	n.ok = true
+	return n
+}
+
+// narrowColsEntry / attrNeededEntry are the searchCtx memo values: a result
+// together with its ok flag, so a decline is memoised too.
+type narrowColsEntry struct {
+	cols []keptColumn
+	ok   bool
+}
+
+type attrNeededEntry struct {
+	keep map[string]bool
+	ok   bool
+}
+
+// memoRelNarrowedColumns is relNarrowedColumns memoised per rel for the
+// search. Its inputs — the rel's leaf, needed set and column statistics — are
+// fixed before the search starts. The returned slice is shared: read only.
+func (s *searchCtx) memoRelNarrowedColumns(rel *RelOptInfo) ([]keptColumn, bool) {
+	if e, hit := s.narrowColsMemo[rel]; hit {
+		return e.cols, e.ok
+	}
+	cols, ok := relNarrowedColumns(rel)
+	if s.narrowColsMemo == nil {
+		s.narrowColsMemo = make(map[*RelOptInfo]narrowColsEntry)
+	}
+	s.narrowColsMemo[rel] = narrowColsEntry{cols: cols, ok: ok}
+	return cols, ok
+}
+
+// memoAttrNeededAbove is attrNeededAbove memoised per relids for the current
+// clause list (identity and length); a different list resets the memo. The
+// returned map is shared: read only.
+func (s *searchCtx) memoAttrNeededAbove(relids RelSet) (map[string]bool, bool) {
+	n := 0
+	if s.clauses != nil {
+		n = len(s.clauses.all)
+	}
+	if s.attrNeededMemo == nil || s.attrMemoList != s.clauses || s.attrMemoLen != n {
+		s.attrNeededMemo = make(map[RelSet]attrNeededEntry)
+		s.attrMemoList, s.attrMemoLen = s.clauses, n
+	}
+	if e, hit := s.attrNeededMemo[relids]; hit {
+		return e.keep, e.ok
+	}
+	keep, ok := s.attrNeededAbove(relids)
+	s.attrNeededMemo[relids] = attrNeededEntry{keep: keep, ok: ok}
+	return keep, ok
 }
 
 // attrNeededAbove is the NAME set of attributes a rel over relids must emit —
@@ -304,11 +366,11 @@ func (s *searchCtx) attrNeededAbove(relids RelSet) (map[string]bool, bool) {
 // relNarrowedColumns), so it keeps the statement-wide narrowing, as does any
 // rel the clause inventory cannot attribute.
 func (s *searchCtx) baseRelNarrowedWidths(rel *RelOptInfo) narrowedWidths {
-	cols, ok := relNarrowedColumns(rel)
+	cols, ok := s.memoRelNarrowedColumns(rel)
 	if !ok {
 		return narrowedWidths{}
 	}
-	if keep, known := s.attrNeededAbove(rel.Relids); known {
+	if keep, known := s.memoAttrNeededAbove(rel.Relids); known {
 		if n := sumKeptColumns(cols, keep); n.ok {
 			return n
 		}

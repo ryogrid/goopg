@@ -77,6 +77,17 @@ type searchCtx struct {
 	// (classIndex): built once per clause list and shared by every rel and
 	// every GEQO tour, like exprKeys (M0122-0012 slice 78).
 	ecIdx *classIndex
+	// narrowColsMemo / attrNeededMemo memoise joinrelNarrowedWidths' pure
+	// inputs for the whole search: a member rel's kept columns, and the
+	// above-tree NAME set per relids. GEQO rebuilds every joinrel on each of
+	// its ~500 tours (TPC-DS Q64), and PG reads attr_needed computed once per
+	// base rel (build_joinrel_tlist, relnode.c) rather than re-deriving it per
+	// joinrel. attrNeededMemo is valid for attrMemoList at attrMemoLen
+	// clauses only (M0122-0012 C16a).
+	narrowColsMemo map[*RelOptInfo]narrowColsEntry
+	attrNeededMemo map[RelSet]attrNeededEntry
+	attrMemoList   *restrictInfoList
+	attrMemoLen    int
 	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
 	// search's evaluation counter, and whether this evaluation context's join
 	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.

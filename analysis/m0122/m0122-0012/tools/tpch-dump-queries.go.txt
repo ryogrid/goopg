@@ -1,0 +1,14 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/goopg/goopg/internal/testutil/tpch"
+)
+
+func main() {
+	for n, q := range tpch.Queries() {
+		os.WriteFile(fmt.Sprintf("tmp/g1-tpch-q%d.sql", n), []byte(q+";\n"), 0o644)
+	}
+}

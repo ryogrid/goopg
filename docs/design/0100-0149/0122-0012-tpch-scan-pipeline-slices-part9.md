@@ -316,3 +316,61 @@ serial run.
 
 It is filed as **P0-E12** (S2, owner placement). The repro is `analysis/p0e12/`, with the expected output computed
 from the generator. The probe tests were not kept; the P0-E12 task names the regression test its fix needs.
+
+## Slice 93 — C16a: the join search memoises its narrowed-width inputs (Q64 planning −6.7 %)
+
+Loop #187, 2026-10-27, the first return under the owner's return-first rule. The census
+`analysis/m0122/m0122-0012/census-20261027/` (G1/G2 against release PG 18.3) puts TPC-DS Q64 in the combined top
+10 with an excess that is mostly **planning**: 636 ms per plan against release PG's 51.9 ms, about 584 of Q64's
+846 ms excess. All of it is GEQO, ~500 tours of `gimmeTree` → `makeJoinRel`. PG runs the same tour count, so the
+gap is the cost of each joinrel goopg builds. Profile (25 s of cache-busted plan-only EXPLAINs):
+
+| share | site |
+|---|---|
+| 59 % | `addPathsToJoinrel` (all join methods) |
+| 26 % | `mallocgc` (inclusive, spread) |
+| 12.7 % | pathkey usefulness / truncation |
+| 12.5 % | `joinrelNarrowedWidths`: `relNarrowedColumns` 6.8 %, `attrNeededAbove` 3.7 % |
+| 7.9 % | `innerRelProvenUnique` → `provableKeys` / `keysCovering` |
+
+`joinrelNarrowedWidths` (M0146-0234, build_joinrel_tlist for the cost triple) re-derived two pure inputs for every
+joinrel of every tour:
+
+- **`relNarrowedColumns(member)`**: the member's kept columns. It depends only on the base rel's leaf, needed set
+  and column statistics, all fixed before the search.
+- **`attrNeededAbove(relids)`**: the above-tree NAME set. It walks every clause and builds a map, and it depends
+  only on relids, the clause list and the statement's output set.
+
+PG computes `attr_needed` once per base rel (`build_base_rel_tlists`), and `build_joinrel_tlist` (relnode.c) reads
+it.
+
+**Change.** `searchCtx` memoises both for the search:
+
+- `narrowColsMemo` keyed by member rel;
+- `attrNeededMemo` keyed by relids, valid for one clause list at one length (a different list or length resets
+  it).
+
+Declines are memoised too. `joinrelNarrowedWidths` sums the members' kept columns in place instead of
+concatenating them. `baseRelNarrowedWidths` reads the same memos.
+
+**Measured (Target written before coding: Q64, instructions:u per cache-busted plan, `tools/ds-planinstr.sh`).**
+
+| run | before | after |
+|---|---|---|
+| 1 | 6.496 G | 6.061 G |
+| 2 | 6.490 G | 6.052 G |
+
+That is **−6.7 %**, which meets the 3 % bar. The SF0.25 sweep's Q64 reads 971 ms against the census median of
+1019 ms.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite per-case counts equal to the baseline
+except the plpgsql flapper; isolation PASS.
+
+Test: `TestNarrowedWidthMemoMatchesAndResets`.
+
+**Next (C16b).** `innerRelProvenUnique` re-proves inner uniqueness per call (`provableKeys` → `keysCovering`
+builds maps on every call). PG caches `innerrel_is_unique` results per (outer relids, inner rel) in
+`unique_for_rels` / `non_unique_for_rels` (analyzejoins.c). Re-profile after it, because addPaths and allocation
+dominate what remains.

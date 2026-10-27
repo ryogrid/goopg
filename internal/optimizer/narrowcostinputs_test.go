@@ -797,3 +797,59 @@ func TestDerivedLeafColumnWidthFollowsSubqueryVars(t *testing.T) {
 		t.Fatalf("inlined CTE output width = %d, %v; want 17 (an RTE_SUBQUERY)", w, ok)
 	}
 }
+
+// M0122-0012 C16a: joinrelNarrowedWidths reads its pure inputs through a
+// per-search memo (GEQO rebuilds every joinrel on each tour). The memo must
+// serve exactly what the unmemoised functions compute, decline included, and
+// must not survive a change of the clause list it was filled for.
+func TestNarrowedWidthMemoMatchesAndResets(t *testing.T) {
+	a := ncRel([]string{"a_key", "a_out"}, ncNeeded("a_key", "a_out"), true,
+		map[string]float64{"a_key": 4, "a_out": 30})
+	a.Relids = RelSet(1)
+	b := ncRel([]string{"b_key", "b_c"}, ncNeeded("b_key", "b_c"), true,
+		map[string]float64{"b_key": 4, "b_c": 8})
+	b.Relids = RelSet(2)
+	clause := func(relids RelSet, l, r string) *restrictInfo {
+		return &restrictInfo{relids: relids, clause: &BinaryOp{Op: parser.OpEq,
+			Left: &ColumnRef{Name: l}, Right: &ColumnRef{Name: r}}}
+	}
+	s := &searchCtx{
+		outputEligible:  true,
+		outputColsKnown: true,
+		outputCols:      ncNeeded("a_out"),
+		clauses: &restrictInfoList{all: []*restrictInfo{
+			clause(RelSet(3), "a_key", "b_key"),
+			clause(RelSet(6), "b_c", "c_key"),
+		}},
+	}
+	j := newRelOptInfo(RelSet(3), 10, 64)
+	j.publishedMembers = []*RelOptInfo{a, b}
+	for i := 0; i < 3; i++ {
+		if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 2 || got.outputWidth != 38 {
+			t.Fatalf("call %d: joinrel triple = %+v, want a_out + b_c (2 cols, width 38)", i, got)
+		}
+	}
+	if len(s.narrowColsMemo) != 2 || len(s.attrNeededMemo) != 1 {
+		t.Fatalf("memo sizes = %d rels, %d relids; want 2, 1", len(s.narrowColsMemo), len(s.attrNeededMemo))
+	}
+	wantCols, wantOK := relNarrowedColumns(b)
+	if gotCols, gotOK := s.memoRelNarrowedColumns(b); gotOK != wantOK || len(gotCols) != len(wantCols) {
+		t.Fatalf("memoised columns = %v/%v, want %v/%v", gotCols, gotOK, wantCols, wantOK)
+	}
+	// A rel that declines is memoised as a decline.
+	bad := ncRel([]string{"x"}, nil, false, nil)
+	j.publishedMembers = []*RelOptInfo{a, bad}
+	if got := s.joinrelNarrowedWidths(j); got.ok {
+		t.Fatalf("a declining member narrowed the joinrel: %+v", got)
+	}
+	if e, hit := s.narrowColsMemo[bad]; !hit || e.ok {
+		t.Fatalf("decline not memoised: %+v hit=%v", e, hit)
+	}
+	// Dropping the clause that reaches c changes the above-tree set; the memo
+	// filled for the longer list must not answer for the shorter one.
+	j.publishedMembers = []*RelOptInfo{a, b}
+	s.clauses.all = s.clauses.all[:1]
+	if got := s.joinrelNarrowedWidths(j); !got.ok || got.ncols != 1 || got.outputWidth != 30 {
+		t.Fatalf("after the clause change: joinrel triple = %+v, want a_out only", got)
+	}
+}

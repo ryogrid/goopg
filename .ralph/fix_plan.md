@@ -1713,6 +1713,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       (ledger :3179 — re-measure on a release build before ranking).
     - C15 Planning-time items: pathkey canonicalisation (ledger :3182, :3192); sublink lowering for
       WindowAgg/SetOp/SRF (ledger :3212a).
+    - C16 \(added 2026\-10\-27 from census\-20261027, ranked FIRST by predicted gain\) TPC\-DS Q64 planning: goopg
+      636 ms vs release PG 51\.9 ms per plan \(~584 ms of Q64's 846 ms excess, ~57 % of its goopg time\)\. All of it
+      is GEQO's ~500 tours \(gimmeTree → makeJoinRel\); PG runs the same tour count, so the gap is per\-joinrel cost\.
+      Profile \(`tmp/q64plan.pprof`, 25 s\): addPaths 59 %, mallocgc 26 %, joinrelNarrowedWidths 12\.5 % \(its pure
+      inputs relNarrowedColumns 6\.8 % \+ attrNeededAbove 3\.7 %, recomputed per joinrel per tour; PG reads
+      attr\_needed computed once per base rel — build\_joinrel\_tlist, relnode\.c\), innerRelProvenUnique 7\.9 %
+      \(provableKeys/keysCovering per call; PG caches innerrel\_is\_unique results in unique\_for\_rels /
+      non\_unique\_for\_rels, analyzejoins\.c\), pathkey usefulness 12\.7 %\. Steps: C16a memoise the narrowed\-width
+      inputs; C16b cache inner\-unique proofs; then re\-profile\.
     - Not M0122-0012 candidates (plan-visible → parity tasks): hashed SubPlan for EXISTS…OR EXISTS (slice 65);
       Gather projection below the Gather (ledger :3190).
   - **Below-bar list (ineligible on return for the same target query — key: mechanism = code site + PG function;
@@ -1726,6 +1735,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `SortStableFunc`; buffered stable merge sort (Q67 −3% instructions, +2.6% cycles); compact sort-to-GM-queue
       (slice 89); NL stream outer copy (does not fire in Q10).
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
+  - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
+    \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
+    - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
+      \(`tools/ds\-planinstr\.sh`, plan\-only EXPLAIN with a per\-run work\_mem change; planning is 636 of Q64's
+      1019 ms sweep time, and repeated runs of identical text skip planning via the plan cache, so whole\-query
+      instructions would not see it\)\. Bar: −3 %\.
+    - **C16a LANDED \(slice 93\)**: `searchCtx` memoises `relNarrowedColumns` per member rel and `attrNeededAbove`
+      per relids \(reset on a clause\-list change\)\. Q64 6\.496/6\.490 → 6\.061/6\.052 Ginstr/plan \(**−6\.7 %, meets
+      the bar**\); sweep Q64 971 ms vs census median 1019 ms; plans identical \(sf025 99/99 same, fire\-set no
+      fires, TPC\-H census 22/22\)\. Miss counter 0\. Next on return: C16b \(cache inner\-unique proofs,
+      innerrel\_is\_unique's unique\_for\_rels\), same Target query; re\-profile first\. Design:
+      part 9 §Slice 93\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5198,6 +5219,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `da7f0c117`** \(M0122\-0020 changed internal/executor\)\. Census
     `analysis/m0146/m0146\-0014/routing\-20261027m/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every category 0\.
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `102bc10a4`** \(M0122\-0019 changed internal/optimizer \+ executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
