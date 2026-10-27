@@ -143,3 +143,56 @@ covering:
 - a lateral outer reference.
 
 A filter that divides by zero must raise the same error both ways.
+
+## Slice 117 — C45: the int lane reads a bare-column probe key in place (Q17 −3.85 %)
+
+Loop #229/#230. G3 on TPC-H Q17 at `a42524dd1`, attributed by innermost operator (`tmp/g3-229/h17*`):
+
+- `seqScanOp.Next` 35 % (first touches, checksums);
+- `decodeScanRowRangeInfo` 26 %;
+- `nextLazy` 10 %;
+- **`joinOp.evalHashKeyDatumSlot` 6.0 %** (evalFastExpr 3.2, self 2.0, `MaterializedSlot.Get` 0.7).
+
+**Symptom.** Q17's hash probe key is the bare column `l_partkey`. Yet each of the 6 M lineitem probe rows evaluated
+it through the general compiled evaluator: `evalFastExpr` dispatch, the merged-key `VirtualSlot` over
+{probe row, null other side}, the slot's `Get`, and a 48-byte `Datum` return. PG special-cases exactly this shape:
+a single-Var ExprState runs ExecJustOuterVar / ExecJustInnerVar (execExprInterp.c), which is what
+ExecHashGetHashValue's keys hit for a plain column key.
+
+**Change.** `joinOp.probeIntKeyDatum` replaces the int lane's `evalHashKeyDatumSlot` call in `nextLazy`. On the
+first probe row whose two side widths are known (`lazyLW`, `lazyRW` both > 0), it decides once per operator whether
+the single probe key is an `ExprColumnRef` landing on the probe side of the merged key layout:
+
+- `BuildLeft` (probe = right side, layout `[lazyLW nulls][probe]`): index in `[lazyLW, lazyLW+lazyRW)` maps to probe
+  column `idx-lazyLW`;
+- otherwise (probe = left side, layout `[probe][nulls]`): index in `[0, lazyLW)` is the probe column.
+
+When it does, the cell is read from the probe `MaterializedSlot`'s row directly (`MaterializedSlot.Get` is the
+same plain index, so the value is identical). A trimmed key (`probeKeyTrim`), an expression key, a key landing on
+the null side, a slot that is not a `MaterializedSlot` or an out-of-range column take `evalHashKeyDatumSlot` as
+before — the out-of-range case keeps the evaluator's XX000 error path. `probeKeyColDisabled` is the A/B and test
+knob; `probeKeyColArmed` counts arming operators for the test. The string lane and the multi-key composite lane
+are unchanged.
+
+**Measured** (`analysis/m0122/m0122-0012/tools/h-instr.sh`, 3 runs × 2 alternating rounds, fresh server per run,
+base binary at `a42524dd1`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q17 (Target) | 22.586 / 22.616 | 21.737 / 21.720 | **−3.85 %** |
+
+This meets the 3 % bar (predicted ~4 %). Miss counter reset to 0.
+
+Gates:
+
+- units (executor 49.9 s, all PASS);
+- spotcheck: Q12=2, Q13=35;
+- acceptance: 24 MATCH;
+- sf025 PASS=99 (61 ck-verified), no verdict changes;
+- fire-set: out of scope (executor-only change, `scripts/fireset-scope.sh`).
+
+**Test.** `TestProbeKeyColMatchesEvaluator` runs twelve hash joins with the in-place read on and off and requires
+identical rows, in order. Keys are int4, int8 and NUMERIC (HammerDB's TPC-H key type) with NULLs on both sides;
+the joins are inner, left, right (the other input builds), full, semi, anti and NOT IN, plus a residual, an
+expression key (must not arm) and a projection between the join and its probe scan. Eight of the twelve arm. An
+off-by-one column mapping fails it.

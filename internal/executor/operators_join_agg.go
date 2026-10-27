@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -157,6 +158,10 @@ type joinOp struct {
 	execExprs        exprTreeSlab
 	buildKeyNodes    []int32
 	probeKeyNodes    []int32
+	// probeKeyCol / probeKeyColSet: the probe-side column the single probe
+	// key reads in place when it compiles to a bare ColumnRef (C45), or -1.
+	probeKeyCol    int
+	probeKeyColSet bool
 	execResidualNode int32
 	execCompiled     bool
 
@@ -2094,7 +2099,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
+			kd, kok, kerr := o.probeIntKeyDatum(probeKeyNode, probeSlot, keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -7082,4 +7087,57 @@ func reuseRowLen(r Row, n int) Row {
 		return r[:n]
 	}
 	return make(Row, n)
+}
+
+// probeKeyColDisabled is the A/B and equivalence-test knob for C45.
+var probeKeyColDisabled = false
+
+// probeKeyColArmed is a test hook counting joins that read their probe key in
+// place (once per operator).
+var probeKeyColArmed = func() {}
+
+// probeIntKeyDatum is evalHashKeyDatumSlot for the int lane's single probe
+// key (M0122-0012 C45). When that key compiles to a bare ColumnRef that lands
+// on the probe side of the merged key layout, the cell is read in place from
+// the probe slot — PG's ExecJustOuterVar / ExecJustInnerVar
+// (execExprInterp.c), the special case ExecHashGetHashValue's single-Var key
+// takes — instead of a dispatch through evalFastExpr, the merged-key
+// VirtualSlot and the slot's Get with a 48-byte Datum return. TPC-H Q17's
+// l_partkey probe paid that for each of its 6 M lineitem rows. A trimmed key,
+// a key landing on the null side, or a slot that is not a MaterializedSlot
+// takes evalHashKeyDatumSlot exactly as before.
+func (o *joinOp) probeIntKeyDatum(node int32, probeSlot TupleSlot, keySlot SlotView) (Datum, bool, error) {
+	if !o.probeKeyColSet && o.lazyLW > 0 && o.lazyRW > 0 {
+		// Both side widths are known by the first probe row; a width still
+		// 0 (a child that reveals it only with its first row) is not cached.
+		o.probeKeyColSet = true
+		o.probeKeyCol = -1
+		if !probeKeyColDisabled && !o.probeKeyTrim[0] && node != noExpr && node >= 0 && int(node) < len(o.execExprs) &&
+			o.execExprs[node].Kind == ExprColumnRef {
+			idx := int(int32(binary.LittleEndian.Uint32(o.execExprs[node].payload[:])))
+			if o.plan.BuildLeft {
+				if idx >= o.lazyLW && idx-o.lazyLW < o.lazyRW {
+					o.probeKeyCol = idx - o.lazyLW
+				}
+			} else if idx >= 0 && idx < o.lazyLW {
+				o.probeKeyCol = idx
+			}
+			if o.probeKeyCol >= 0 {
+				probeKeyColArmed()
+			}
+		}
+	}
+	if c := o.probeKeyCol; o.probeKeyColSet && c >= 0 {
+		if ms, ok := probeSlot.(*MaterializedSlot); ok && c < len(ms.row) {
+			d := &ms.row[c]
+			if seqScanDeformPoison {
+				checkDeformPoison(*d)
+			}
+			if d.IsNull() {
+				return Datum{}, false, nil
+			}
+			return *d, true, nil
+		}
+	}
+	return o.evalHashKeyDatumSlot(node, o.probeKeyTrim[0], keySlot)
 }

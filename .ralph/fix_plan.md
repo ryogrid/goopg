@@ -2296,6 +2296,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       fresh\-server runs each \(load 0\.9–1\.4\): base median 1\.785 s, C44 1\.765 s = **−1\.1 %, misses the 3 % bar**
       \(first 5\-run set −2\.2 %, second ±0\); instructions:u 11\.957 → 11\.960 G\. The extra hop was not the stall that
       matters — the slot and the cells dominate\. Code reverted\. **Miss counter 1\.**
+  - **G3 2026\-10\-28 \(loop \#229, misses 1\)**: H Q17 at `a42524dd1` attributed by innermost operator
+    \(`tmp/g3\-229/h17\*`\): seqScanOp\.Next 35 % \(first touches, checksums\), decodeScanRowRangeInfo 26 %, nextLazy 10 %,
+    **`joinOp\.evalHashKeyDatumSlot` 6\.0 %** \(evalFastExpr 3\.2, self 2\.0, MaterializedSlot\.Get 0\.7\)\. The probe key is
+    the bare column `l\_partkey`, yet each of the 6 M probe rows evaluates it through the general compiled evaluator
+    \(merged\-key VirtualSlot → MaterializedSlot\.Get, a 48\-byte Datum return\)\.
+    - C45: a bare\-column probe\-key fast path — when the single probe key compiles to a ColumnRef into the probe row,
+      read that cell in place \(no evaluator dispatch\)\. PG: ExecJustOuterVar / ExecJustInnerVar
+      \(execExprInterp\.c\), the special\-cased single\-Var ExprState that ExecHashGetHashValue's keys use\.
+    - **Target \(C45\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2,
+      fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C45 LANDED \(slice 117\)**: `joinOp\.probeIntKeyDatum` reads the int lane's single bare\-column probe key
+      in place from the probe `MaterializedSlot` \(arming decided once per operator from `lazyLW`/`lazyRW` and the
+      merged key layout; trimmed, expression, null\-side or non\-materialized keys keep `evalHashKeyDatumSlot`\)\. Q17
+      22\.586/22\.616 → 21\.737/21\.720 Ginstr/q = **−3\.85 %, meets the bar**\. Gates: units, spotcheck, acceptance 24
+      MATCH, sf025 PASS=99 \(the loop \#229 run was killed at its stamp; re\-run loop \#230\)\. Test
+      `TestProbeKeyColMatchesEvaluator`\. Design: part 11 §117\. **Miss counter 0\.** Next on return: G3 for a new
+      candidate \(census\-20261028 expires 2026\-10\-30 → fresh G1 then\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5967,6 +5984,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: M0122\-0012 \(returned from the yield\)\.
   - S9 re\-check 2026\-10\-28 \(loop \#228\) — **exhausted at `d100bd483`**, census `routing\-20261028g/` reused:
     `d100bd483` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#229\) — **exhausted at `a42524dd1`**, census `routing\-20261028g/` reused:
+    `a42524dd1` is ralph/docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
