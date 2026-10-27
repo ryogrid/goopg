@@ -2042,6 +2042,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       all four integer variance finalisers; exactIntVariance is the fallback\. Q39 21\.717/21\.752 → 19\.308/19\.304
       Ginstr/q \(**−11\.2 %, meets the bar**\); Q17/Q35/Q39 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on
       return: Q39's filter division \(numericDivBig cases the uint128 path declines\) or Q23/Q14\. Design: part 10 §111\.
+  - **Return 2026\-10\-28 \(loop \#212\)**: S9 exhausted at `3d50052e6` \(census ad\)\. G3 on DS Q23 at HEAD
+    \(`tmp/g3\-212/q23i\.data`\): index scans 46 % / nbtree 31\.5 %, entered via indexScanOp\.nextLeafBatch 11\.1 % and
+    indexOnlyScanOp\.Rescan 10\.9 % \(rangeScanPosLeaf 14\.8 %\) — descents and leaf walks already worked by C18/C28;
+    PG 18's \_bt\_set\_startikey precheck applies only past a primitive scan's first page \(Q23's probes are one\-page
+    rescans\), so no lever there\. H Q17 plan \(`tmp/g3\-212/q17ea\.sql`\): Hash Join probe = bare Seq Scan on lineitem,
+    5 998 835 rows, 5 471 matches\.
+    - C32 \(design\-sized; first slice qualifies per G4\): lazy probe\-side deform — the lineitem scan decodes
+      l\_quantity and l\_extendedprice \(NUMERIC\) for every row although only 0\.09 % match the 182\-row hash table\.
+      PG's slot deforms lazily: ExecHashGetHashValue's FETCHSOME reaches only the key attribute, HJ\_SCAN\_BUCKET
+      fetches the rest for matching tuples \(slot\_getsomeattrs\_int, execTuples\.c\)\. Design:
+      `docs/design/0100\-0149/0122\-0012\-c32\-lazy\-probe\-deform\.md` \(negotiation at join Open, scan deferNonKey /
+      finishDeferred, join finish sites for every join type, debug poison of pending cells\)\. Predicted ~9 % on Q17
+      \(two of three decoded NUMERICs: ~13 % of Q17 is numeric decode\)\. Not attempted this loop \(design only\);
+      miss counter stays 0\.
+    - **Target \(C32, first slice\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs × 2, fresh A/B against the then\-HEAD\)\. Bar: −3 %\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -5650,6 +5666,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     live for this loop\.
   - S9 re\-check 2026\-10\-27 \(loop \#211\) — **exhausted at `b996b60d9`** \(M0122\-0012 slice 110 changed
     internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ac/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#212\) — **exhausted at `3d50052e6`** \(M0122\-0012 slice 111 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ad/`: TPC\-H 22/22, TPC\-DS SF0\.25
     99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
     live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
