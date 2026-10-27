@@ -3,6 +3,8 @@ package optimizer
 import (
 	"math"
 	"math/bits"
+	"slices"
+	"unsafe"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -118,6 +120,44 @@ func (s *searchCtx) innerRelProvenUnique(outer, inner *RelOptInfo, keys []*restr
 		inner.CheapestTotal == nil || inner.CheapestTotal.RequiredOuter != 0 {
 		return false
 	}
+	// The proof reads only the inner base rel, the outer relids and which
+	// clauses are in keys — restrictInfos from the search's clause list,
+	// stable for the whole search — so a verdict is reusable. A hit compares
+	// the key slice element by element: the hash only buckets.
+	k := innerUniqueKey{outer: outer.Relids, inner: inner.Relids, skipNonKeys: skipNonKeys, n: len(keys)}
+	for _, ri := range keys {
+		k.h = k.h*1099511628211 ^ uint64(uintptr(unsafe.Pointer(ri)))
+	}
+	for _, e := range s.innerUniqueMemo[k] {
+		if slices.Equal(e.keys, keys) {
+			return e.unique
+		}
+	}
+	unique := s.innerRelProvenUniqueUncached(outer, inner, keys, skipNonKeys)
+	if s.innerUniqueMemo == nil {
+		s.innerUniqueMemo = make(map[innerUniqueKey][]innerUniqueEntry)
+	}
+	s.innerUniqueMemo[k] = append(s.innerUniqueMemo[k], innerUniqueEntry{keys: slices.Clone(keys), unique: unique})
+	return unique
+}
+
+// innerUniqueKey buckets innerUniqueMemo; innerUniqueEntry holds the exact
+// key slice a verdict was proven for.
+type innerUniqueKey struct {
+	outer, inner RelSet
+	skipNonKeys  bool
+	n            int
+	h            uint64
+}
+
+type innerUniqueEntry struct {
+	keys   []*restrictInfo
+	unique bool
+}
+
+// innerRelProvenUniqueUncached is the proof itself; the caller has checked
+// the inner rel is a parameter-free base rel.
+func (s *searchCtx) innerRelProvenUniqueUncached(outer, inner *RelOptInfo, keys []*restrictInfo, skipNonKeys bool) bool {
 	innerRel := bits.TrailingZeros32(uint32(inner.Relids))
 	if innerRel < 0 || innerRel >= len(s.relInfos) || inner.Relids != RelSet(1)<<uint(innerRel) {
 		return false

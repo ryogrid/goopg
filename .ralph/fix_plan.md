@@ -1747,6 +1747,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       fires, TPC\-H census 22/22\)\. Miss counter 0\. Next on return: C16b \(cache inner\-unique proofs,
       innerrel\_is\_unique's unique\_for\_rels\), same Target query; re\-profile first\. Design:
       part 9 §Slice 93\.
+    - **C16b LANDED \(slice 94, loop \#188\)**: `searchCtx.innerUniqueMemo` memoises innerRelProvenUnique per
+      \(outer relids, inner relids, skipNonKeys, key set\), hits verified element by element\. Q64 6\.052/6\.055 →
+      5\.678/5\.679 Ginstr/plan \(**−6\.2 %, meets the bar**; −12\.6 % over C16a\+b\); sweep Q64 944 ms; plans
+      identical\. Misses 0\. Next on return: C16c — pathkey usefulness \(14\.8 % after C16b:
+      equivalentWithin/countContainedIn/keyOf; PG compares canonical pathkeys by pointer\), same Target; overlaps
+      C15\. Design: part 9 §Slice 94\.
   - **First batch\-filter slice LANDED 2026\-09\-22 \(loop \#11\)** as
     `d6e42a7f7`, **as infrastructure with NO performance claim**.
     Movement: none. Design:
@@ -5221,6 +5227,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
   - S9 re\-check 2026\-10\-27 — **exhausted at `102bc10a4`** \(M0122\-0019 changed internal/optimizer \+ executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027n/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `fb6c415f1`** \(M0122\-0012 slice 93 changed internal/optimizer\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027o/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

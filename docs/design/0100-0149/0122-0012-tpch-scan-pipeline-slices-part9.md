@@ -374,3 +374,60 @@ Test: `TestNarrowedWidthMemoMatchesAndResets`.
 builds maps on every call). PG caches `innerrel_is_unique` results per (outer relids, inner rel) in
 `unique_for_rels` / `non_unique_for_rels` (analyzejoins.c). Re-profile after it, because addPaths and allocation
 dominate what remains.
+
+## Slice 94 — C16b: inner-unique verdicts are memoised for the search (Q64 planning −6.2 %)
+
+Loop #188, 2026-10-27, the same Target as slice 93: TPC-DS SF0.25 Q64, instructions:u per cache-busted plan.
+
+**Where the time went.** `innerRelProvenUnique` is the fail-closed half of PG's `innerrel_is_unique`. It ran
+in full on every call: `joinKeyPairOf` per key, then `provableKeys` → `keysCovering`, which build maps and walk
+the catalog's indexes and foreign keys. Three callers ask it for each pair a joinrel considers:
+`addPathsForJointype`, `extraInnerUnique` and the hash join's final cost input. GEQO re-asks the same pairs on
+every one of its ~500 tours.
+
+PG caches the verdicts on the inner rel instead: `unique_for_rels` / `non_unique_for_rels` (analyzejoins.c, the
+`innerrel_is_unique` cache).
+
+**Change.** `searchCtx.innerUniqueMemo` holds the verdict per (outer relids, inner relids, skipNonKeys, key
+set), checked after the cheap gates.
+
+- The key set is the caller's slice of `restrictInfo` pointers, all drawn from the search's clause list and
+  stable for the whole search.
+- The bucket hash mixes those pointers, and a hit compares the stored slice element by element. A collision
+  therefore cannot hand back another key set's verdict.
+
+The proof itself is now `innerRelProvenUniqueUncached`.
+
+**Measured.**
+
+| run | before (slice 93) | after |
+|---|---|---|
+| 1 | 6.052 G | 5.678 G |
+| 2 | 6.055 G | 5.679 G |
+
+That is **−6.2 %**, which meets the 3 % bar. The sweep's Q64 reads 944 ms; it was 971 ms after slice 93 and the
+census median is 1019 ms. Over the two slices, Q64 planning is −12.6 % in instructions.
+
+Plans are identical: sf025 plans 99/99 same, fire-set no fires on either corpus, TPC-H census 22/22.
+
+Gates: units; spotcheck; acceptance 24 MATCH; sf025 PASS=99; RegressSuite = baseline (plpgsql flap); isolation
+PASS.
+
+Test: `TestInnerRelProvenUniqueMemoMatchesUncached`. Every key-set prefix, with and without a non-key clause and
+in both modes, must match the uncached proof on the first call and on a memo hit.
+
+**Re-profile after slice 94** (`tmp/q64plan-c16b.pprof`):
+
+| share | site |
+|---|---|
+| 60.5 % | `addPathsForJointype` |
+| 26.8 % | `mallocgc` |
+| 14.8 % | `truncateUselessPathkeys` / `buildJoinPathkeysFor` (`pathkeyUsefulnessFor` 14 %, of it `equivalentWithin` 7.1 %, `countContainedIn` 5.8 %, `keyOf` 5.6 %) |
+| 12.75 % | `tryMergeJoinPath` / `sortInnerAndOuter` |
+| 11 % | `addNestLoopPathFor` |
+| 4.7 % | `joinrelNarrowedWidths` (was 12.5 %) |
+| 3.5 % | `innerRelProvenUnique` (was 7.9 %) |
+
+PG compares canonical pathkeys by pointer (`pathkeys_contained_in`, `pathkeys_useful_for_merging` over
+`root->canon_pathkeys`). goopg re-derives keys and equivalence per comparison. That is the next step, C16c,
+which joins pool entry C15's "pathkey canonicalisation".

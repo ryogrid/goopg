@@ -88,6 +88,11 @@ type searchCtx struct {
 	attrNeededMemo map[RelSet]attrNeededEntry
 	attrMemoList   *restrictInfoList
 	attrMemoLen    int
+	// innerUniqueMemo memoises innerRelProvenUnique for the search, like
+	// PG's innerrel_is_unique caching its verdicts in unique_for_rels /
+	// non_unique_for_rels (analyzejoins.c): GEQO re-asks the same pairs on
+	// every tour (M0122-0012 C16b).
+	innerUniqueMemo map[innerUniqueKey][]innerUniqueEntry
 	// geqoEvalSeq / geqoProbe: the M0146-0214 GEQO trace (geqo.go) — the
 	// search's evaluation counter, and whether this evaluation context's join
 	// rels are traced. Trace-only; zero unless GOOPG_GEQO_TRACE is set.
