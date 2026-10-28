@@ -2625,6 +2625,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       consumer fails it\)\. Design: part 11 §124\. **Misses 0\.**
       - Residual \(ledgered\): scans under other parents \(a hash join's build side outside an aggregate chain, WindowAgg,
         SetOp\) still decode the bound's whole prefix; PG fetches only referenced attributes under any parent\.
+  - **G3 pass 2026\-10\-28 \(loop \#251, misses 0\)**: S9 fresh census `routing\-20261028o` at `c9acfdee9` \(22/22,
+    99/99, 99/99; nothing filed\)\. **cycles:u** at `c9acfdee9`, decode samples attributed by the scan's parent operator
+    \(`tmp/g3\-250/c57\-\*\.data`\): H Q13 9\.3 % and H Q17 19\.7 % \+ 3\.4 %, all under narrowing Projects or a bitmap fetch; DS
+    Q14 8\.8 % \(index probes already skip unread columns — `skipColumnRun` present, no NUMERIC conversion\), Q23 7\.9 %
+    \(under Projects\), Q72 1\.7 %, Q39 6\.1 % \(the inventory probe reads all four columns\)\. The C57 follow\-up \(other
+    parents\) has no ≥ 3 % instance in the top 10: what decodes now is read\. Q14's next leaves are first touches PG pays
+    too \(`parseHeapTupleAliasInto`, `bufmap\.Lookup`, `PagePruneXIDSet` = the pd\_prune\_xid read heap\_page\_prune\_opt
+    makes\) and nbtree descents\. H Q13's 17\.5 % `mapaccess1\_fast64` \(66 % hash\-join probe, 29 % group lookup\) is the
+    hash\-table structure family \(simplehash design, wall Target only\)\. **No qualifying candidate; not a miss\.**
+    - Next pass: refresh G1 \(C57 moved Q18/Q1; census\-20261028b ranks are stale\) and re\-evaluate EXHAUSTED — blocked
+      only by C47 \(Q39, blocked\-on P0\-E15\) and the hash\-table structure family\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6448,6 +6459,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#250\) — **exhausted at `9393a2b29`**, census `routing\-20261028n/` reused:
     `9393a2b29` touched xlog/cmd only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
     live\. \(The C57 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#251\) — **exhausted at `c9acfdee9`**, fresh census `routing\-20261028o/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
