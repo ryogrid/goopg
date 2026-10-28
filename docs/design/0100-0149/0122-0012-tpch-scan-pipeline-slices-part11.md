@@ -481,3 +481,63 @@ Gates:
 eight operands for +, - and *: mixed scales, signs, ints on either side, zero, and a value past the int64 lane. It
 requires the same value, kind, scale and error, and checks that NULL, string and int-int pairs are not admitted.
 Swapping subtraction for addition fails it.
+
+## Slice 124 — C57: a seq scan read only by an aggregate decodes only the aggregate's columns (Q18 −16.0 %)
+
+Loop #250. A cycles:u profile of TPC-H Q18 at `9393a2b29` (`tmp/g3-250/h18.data`) shows the query is one serial
+build. The IN-subquery `HashAggregate` (`GROUP BY l_orderkey HAVING sum(l_quantity) > 313`) over all of lineitem
+runs 3661 ms in the shared hash prebuild, and the workers then finish in about 150 ms. 21 % of the cycles are
+decoding in the seq scan directly under that aggregate:
+
+| symbol | samples |
+|---|---|
+| `decodeRowRangeInfo` | 1989 |
+| `NumericInt64FromStoredPayload` | 1712 |
+| `decodePhysicalPGValueLowered` | 851 |
+| `NewTimeDatum` | 561 |
+| `decodePhysicalPGVarlena` | 395 |
+
+The aggregate reads two columns. HammerDB's lineitem order is l\_shipdate, l\_orderkey, l\_discount,
+l\_extendedprice, l\_suppkey, l\_quantity, …, so the aggregate's prefix bound (`deformBoundBelow`, attrs 0–5)
+decoded a date and five NUMERICs per row to use two of them. Each NUMERIC decode converts the stored payload to
+the int64 lane.
+
+**PG.** The aggregate's input expressions fetch only the attributes they reference: ExecBuildAggTrans emits
+EEOP\_SCAN\_FETCHSOME up to the highest one. slot\_deform\_heap\_tuple then leaves each by-reference value as a
+pointer into the tuple, so a NUMERIC column that nothing reads costs PG no conversion.
+
+**Change.** goopg already had the mechanism for a Project above a scan (`markProjectScanReads`, slice 19): the
+scan's `readCols` names the columns its consumer reads, and `skipReadSet` adds an absorbed qual's columns. An
+Aggregate over a scan never set it. `buildCompleteChild` — reached from a plain or partial Aggregate with
+`aggConsumerExprs`, and down Sorts and a join's left side with each node's own readers added — now builds a
+`SeqScan`, or a `Filter` absorbed into one, through `buildCompleteScan`. That sets `readCols` to
+`deformScanReadSet(width, consumers...)`; an expression the walker does not understand leaves it nil (full decode),
+as before. The aggregate is built by `buildNode` on both the tree and the slab path, so there is no second site.
+`aggScanReadSetDisabled` is the A/B and test knob.
+
+C22 (loop #200) was this mechanism on TPC-H Q17 and measured ±0, because Q17's scan already sat under a Project.
+
+**Measured** (`tools/h-instr.sh`, 3 runs × 2 alternating, base at `9393a2b29`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q18 (Target) | 38.501 / 38.440 | 32.324 / 32.326 | **−16.0 %** |
+| TPC-H Q1 | 74.226 / 74.230 | 70.904 / 70.899 | −4.5 % |
+
+Q18 warm wall time (`tools/tpch-gap.sh`, pass 2, 3 alternating rounds, host load 1–2) went from a 3.68 s median
+to 3.38 s. Q1's lineitem scan under its Partial HashAggregate also stops converting l\_orderkey, l\_suppkey and
+l\_partkey. The TPC-DS SF0.25 sweep total moved −11.5 %.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- TestPort\_RegressSuite PASS.
+
+**Test.** `TestAggScanReadSetMatchesFullDecode` covers a table whose read columns sit between unread dates,
+NUMERICs and text, with NULLs. It runs hashed and sorted strategies over group keys, HAVING, FILTER, ORDER BY and
+DISTINCT inside the aggregate, a functionally dependent passthrough, count(\*), a qual on an otherwise unread
+column, and a join whose left side is the scan. Each must equal the full decode. Narrowing the read set to the
+first consumer fails it.

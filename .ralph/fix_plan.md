@@ -2600,6 +2600,31 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - Lesson: the leading key i\_category has ~10 values, so most compares tie on it and still walk every key; an
         abbreviation pays only when key 1 is high\-cardinality\. Before sizing a comparator lever, estimate the
         decided\-at\-key\-1 fraction from the key's distinct count, not from the comparator's share\.
+  - **Generate pass 2026\-10\-28 \(loop \#250, misses 0, returning from yield \#248\)**: S9 census reused \(`9393a2b29`
+    xlog/cmd only\)\. **cycles:u** G3 at HEAD \(`tmp/g3\-250/h13\.data`, `h18\.data`\)\. H Q18 is one serial build: the
+    IN\-subquery `HashAggregate` over lineitem runs 3661 ms in the shared hash prebuild, the workers 150 ms\. Samples
+    whose scan sits directly under that aggregate: `decodeRowRangeInfo` 1989, `NumericInt64FromStoredPayload` 1712,
+    `decodePhysicalPGValueLowered` 851, `NewTimeDatum` 561, `decodePhysicalPGVarlena` 395 — 5508 of 26138 \(21 %\)\.
+    HammerDB's lineitem order is l\_shipdate, l\_orderkey, l\_discount, l\_extendedprice, l\_suppkey, l\_quantity, …: the
+    aggregate's prefix bound \(attrs 0–5\) decodes a date and five NUMERICs \(each a payload → int64 conversion\) to use
+    two\. Only a Project above a scan sets its read set \(`markProjectScanReads`, slice 19\); an Aggregate does not\.
+    - C57: a plain or partial Aggregate directly over a SeqScan \(or Filter over one\) gives the scan its read set —
+      `deformScanReadSet` over `aggConsumerExprs`, merged with the absorbed qual by `skipReadSet` — in
+      `buildCompleteChild`\. PG: the aggregate's input expressions fetch only the attributes they reference
+      \(ExecBuildAggTrans → EEOP\_SCAN\_FETCHSOME; slot\_deform\_heap\_tuple leaves by\-reference values as pointers, so an
+      unreferenced NUMERIC costs PG no conversion\)\. Same mechanism as C22 \(dropped on H Q17, where a Project already
+      narrowed the scan\) on a different query — eligible\.
+    - **Target \(C57\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q18\.sql`, 3 runs × 2 alternating, fresh A/B vs `9393a2b29`\)\. Bar: −3 %; predicted ~8 % \(about
+      three fifths of the 21 % decode share: one date and three NUMERIC conversions of six decoded columns\)\.
+    - **C57 LANDED \(slice 124\)**: `buildCompleteChild` builds a `SeqScan` \(or a `Filter` absorbed into one\) through
+      `buildCompleteScan`, which sets the scan's `readCols` from the consumers \(`deformScanReadSet`\); `skipReadSet` adds
+      the qual's columns\. Q18 38\.501/38\.440 → 32\.324/32\.326 Ginstr/q = **−16\.0 %, meets the bar**; Q1 −4\.5 %; Q18 warm
+      wall 3\.68 → 3\.38 s median; sf025 sweep total −11\.5 % with plans 99/99 same\. Gates: units, spotcheck, acceptance 24
+      MATCH, sf025 PASS=99, TestPort\_RegressSuite PASS\. Test `TestAggScanReadSetMatchesFullDecode` \(narrowing to the first
+      consumer fails it\)\. Design: part 11 §124\. **Misses 0\.**
+      - Residual \(ledgered\): scans under other parents \(a hash join's build side outside an aggregate chain, WindowAgg,
+        SetOp\) still decode the bound's whole prefix; PG fetches only referenced attributes under any parent\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6420,6 +6445,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     `2ba95c383` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#249\) — **exhausted at `0b7126698`**, census `routing\-20261028n/` reused:
     `0b7126698` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#250\) — **exhausted at `9393a2b29`**, census `routing\-20261028n/` reused:
+    `9393a2b29` touched xlog/cmd only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C57 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
