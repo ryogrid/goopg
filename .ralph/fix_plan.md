@@ -2780,6 +2780,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - No qualifying candidate this pass; not a miss\.
     - > **NOTE:** M0122\-0021 is the topmost open M0122 task in file order, so it is the next one\-task yield target \(after
       > a second consecutive miss\); landing it makes the G3 rows census complete on the top two queries\.
+  - **G3 rows census by CTE body 2026\-10\-28 \(loop \#261, misses 1\)**: S9 census `routing\-20261028r` reused \(`3d6366064` ralph
+    only\)\. To see past the M0122\-0021 blind spots, each CTE body of DS Q14 and DS Q23 ran standalone on goopg \(q64\-clone,
+    `5a89cc5f5`\) and on the private release PG \(`bench/pg\-release`, :5556 — not a reference cluster\): serial EXPLAIN ANALYZE
+    for per\-node rows, plus bare wall time best of 3 \(`tmp/rc261/`\)\.
+    - Rows: identical at every reported node of `cross\_items`, `avg\_sales`, `frequent\_ss\_items`, `max\_store\_sales` and
+      `best\_ss\_customer` \(only `max\_store\_sales`' Sort reads 414 575 vs PG 404 921, PG's merge join stopping early\)\. **No
+      algorithmic gap** — the loop \#245 verdict now covers the CTE bodies too\.
+    - Wall \(goopg / PG ms\): cross\_items 694 / 294, avg\_sales 123 / 64, frequent\_ss\_items 734 / 265, max\_store\_sales
+      290 / 140, best\_ss\_customer 558 / 361 — a constant\-factor gap across seq scans, hash joins and aggregation\.
+    - `frequent\_ss\_items` by cycles: its string\-serialised 3\-key GROUP BY \(`mapaccess2\_faststr` 3\.7 %, `aeshashbody` 3\.3 %,
+      key `memmove`\) is ~8 % of the sub\-query, ~2 % of Q23 — C41's prediction stands\.
+    - goopg's EXPLAIN ANALYZE timing inflates the cross\_items body 4\.5× \(3163 ms vs 694 ms bare; M0122\-0018\) — per\-node
+      times are not comparable\.
+    - **No qualifying candidate; not a miss\.**
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -3952,6 +3966,10 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     Parallel Hash, Gather children, Parallel Seq Scan, Partial Aggregate — this task's symptom\) and, in Q47, the whole
     materialised CTE body \(`v1`: WindowAgg → GroupAggregate → Gather Merge → Sort … show no actuals\)\. The loop \#245
     "no algorithmic gap" verdict for Q14/Q23 therefore covered only about half of their nodes\.
+  - Correction \(loop \#261\): the CTE\-body and InitPlan blindness holds **serially too** \(`max\_parallel\_workers\_per\_gather =
+    0`: Q14 35 vs PG 76 node lines with actuals; `CTE cross\_items` / `CTE avg\_sales` bodies and `InitPlan` subtrees print no
+    actuals\), and a Hash built before the probe reports `rows=0\.00 loops=0` with its child scan\. So this task's fix must
+    instrument CTE bodies and InitPlans as well as worker subtrees\.
   - PG prints each node's own `\(actual … loops=…\)` everywhere, CTE bodies included \(ExplainNode recurses into
     `planstate\->initPlan` / CTE subplans with their own Instrumentation\); goopg's CTE body nodes are built lazily outside
     the instrumentation scope \(ledger 2026\-07\-04 M0122\-0003 rows describe the DML\-CTE variant\)\.
@@ -6641,6 +6659,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     live\.
   - S9 re\-check 2026\-10\-28 \(loop \#260\) — **exhausted at `c4f0fa916`**, census `routing\-20261028r/` reused:
     `c4f0fa916` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#261\) — **exhausted at `3d6366064`**, census `routing\-20261028r/` reused:
+    `3d6366064` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
