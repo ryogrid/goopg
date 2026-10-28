@@ -5667,7 +5667,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context
 	// already trimmed. Since the storage flip it is padded, so the cast has to
 	// do what upstream's does.
 	if d.Kind == KindString && isBpcharTypeName(sourceType) && isTextTargetTypeName(targetType) {
-		return NewStringDatum(strings.TrimRight(d.StringValue(), " ")), nil
+		return NewStringDatum(bcTrimRight(d.StringValue())), nil
 	}
 	if strings.EqualFold(targetType, "bytea") && d.Kind == KindInt {
 		switch byteaIntSourceWidth(sourceType) {
@@ -11982,12 +11982,12 @@ func concatOperandsAsText(op parser.OpCode, left, right Datum, lbp, rbp int64) (
 		return left, right
 	}
 	if lbp > 0 && left.Kind == KindString {
-		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+		if t := bcTrimRight(left.StringValue()); t != left.StringValue() {
 			left = NewStringDatum(t)
 		}
 	}
 	if rbp > 0 && right.Kind == KindString {
-		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+		if t := bcTrimRight(right.StringValue()); t != right.StringValue() {
 			right = NewStringDatum(t)
 		}
 	}
@@ -12028,12 +12028,12 @@ func comparisonOperandsAsBpchar(op parser.OpCode, left, right Datum, lbp, rbp in
 		return left, right
 	}
 	if (lbp > 0 || lLit) && left.Kind == KindString {
-		if t := strings.TrimRight(left.StringValue(), " "); t != left.StringValue() {
+		if t := bcTrimRight(left.StringValue()); t != left.StringValue() {
 			left = NewStringDatum(t)
 		}
 	}
 	if (rbp > 0 || rLit) && right.Kind == KindString {
-		if t := strings.TrimRight(right.StringValue(), " "); t != right.StringValue() {
+		if t := bcTrimRight(right.StringValue()); t != right.StringValue() {
 			right = NewStringDatum(t)
 		}
 	}
@@ -12093,7 +12093,7 @@ func trimStringDatum(d Datum) Datum {
 	if d.Kind != KindString {
 		return d
 	}
-	if t := strings.TrimRight(d.StringValue(), " "); t != d.StringValue() {
+	if t := bcTrimRight(d.StringValue()); t != d.StringValue() {
 		return NewStringDatum(t)
 	}
 	return d
@@ -12144,7 +12144,7 @@ func coerceBpcharArgDatum(arg optimizer.Expr, d Datum) Datum {
 // unbounded `bpchar` and every non-bpchar argument are passed through untouched.
 func bpcharArgAsText(arg optimizer.Expr, s string) string {
 	if declaredBpcharTypmod(arg) > 0 {
-		return strings.TrimRight(s, " ")
+		return bcTrimRight(s)
 	}
 	return s
 }
@@ -15308,7 +15308,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			// differently — a sibling pair that must not be "unified".
 			str := s.StringValue()
 			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
-				str = strings.TrimRight(str, " ")
+				str = bcTrimRight(str)
 			}
 			return Datum{Kind: KindInt, Int: int64(len([]rune(str)))}, nil
 		}
@@ -15369,7 +15369,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 			}
 			bl := s.StringValue()
 			if tm := declaredBpcharTypmod(x.Args[0]); tm > 0 {
-				bl = strings.TrimRight(bl, " ")
+				bl = bcTrimRight(bl)
 			}
 			return Datum{Kind: KindInt, Int: int64(8 * len(bl))}, nil
 		}
@@ -19531,7 +19531,7 @@ func pgInputIsValidTypedLen(v, typStr string) (bool, bool) {
 	// PostgreSQL's input functions check raw length (NO trailing space stripping).
 	if strings.Contains(base, "char") && !strings.Contains(base, "varying") {
 		// char(N): fixed-width; check stripped length
-		stripped := strings.TrimRight(v, " ")
+		stripped := bcTrimRight(v)
 		return len(stripped) <= n, true
 	}
 	// varchar(N): raw length check (varcharin does not strip trailing spaces).

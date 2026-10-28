@@ -234,6 +234,9 @@ func (o *indexScanOp) flushKills() {
 }
 
 type indexScanOp struct {
+	// cond is plan.Cond compiled for the per-row filter (C43).
+	cond compiledCond
+
 	// probeForm resolves the probe key's columns once and forms fixed-width
 	// probes from a template (M0122-0012 slice 80).
 	probeForm indexProbeForm
@@ -460,6 +463,8 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	if o.plan.Table != nil {
 		o.enumTypes, _ = resolveEnumColumns(ctx.Catalog, o.plan.Table.Columns)
 		o.colInfo = resolveColTypeInfo(o.plan.Table.Columns)
+		// C34: walk past the columns no consumer reads.
+		applyIndexReadSet(ctx, o.plan, o.colInfo)
 	} else {
 		o.enumTypes = nil
 		o.colInfo = nil
@@ -1292,7 +1297,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		//     point it at a row the plan never returned.
 		keepRow := true
 		if o.plan.Cond != nil {
-			d, cerr := evalExpr(o.plan.Cond, row, o.ctx)
+			d, cerr := o.cond.eval(o.plan.Cond, row, o.ctx)
 			if cerr != nil {
 				return nil, cerr
 			}

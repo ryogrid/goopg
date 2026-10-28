@@ -236,78 +236,25 @@ it to hold the lineage.)
    M0145-0003/0010, so these are NOT selectable work (archive 013).
 9. **M0143 remaining tasks: DISCHARGED** (milestone complete; archive 014).
 10. M-NIGHTLY open items, then the pre-existing milestones
-    (**M0122-0012** → M0119 → **M0147** → the rest of M0122 → M0131 → M0134 →
-    M0135/M0136 → M0095/M0110).
+    (M0119 → **M0147** → the already-filed M0122 tasks → **M0148** → M0131 →
+    M0134 → M0135/M0136 → M0095/M0110).
     (Reachable only after the S9 pass above files nothing.)
-    **M0122-0012 return-first rule (owner decision 2026-10-27; replaces the
-    2026-10-21 yield rule).** "M0122-0012" means its inline slices and any
-    task with `Parent: M0122-0012`. Until it is EXHAUSTED (below), after
-    M-NIGHTLY open items item 10 starts with M0122-0012: whenever any other
-    item-10 task (not items 0–9 or owner-placed P0 tasks) closes, parks or
-    blocks, or the one-task yield below ends, the next selection returns to
-    M0122-0012.
-    - **Bar:** an attempt must move its own pre-named target by at least 3%.
-      `Target:` — written in the entry BEFORE the attempt is measured — names
-      exactly ONE query and ONE metric, and the query must be in the newest
-      G2 top 10 by absolute excess. Metric: instructions:u; bytes only for
-      an allocation slice, and then instructions:u and cycles must be no
-      worse than +1%; wall time only on an idle host.
-    - **One-task yield:** when two consecutive M0122-0012 attempts since the
-      last return (landed, or measured and dropped) each missed the bar,
-      select exactly ONE other item-10 task in the order above (skipping
-      M0122-0012) and work it for one task — or one landed slice/commit of
-      a multi-loop task — then return. If no other item-10 task is
-      selectable, skip the yield. Record it in the entry
-      (`Yield <date>: <the two attempts + %>; worked <id>`); the miss counter
-      resets on return. A missing candidate is NOT a yield reason — generate.
-    - **On return, choose** the top eligible entry of the entry's
-      **Candidate pool**. Ineligible: everything on the entry's **Below-bar
-      list** — in particular the attempts that triggered the yield. The key
-      is the mechanism (code site + PG function) on the same target query:
-      the same mechanism on a different G2 query stays eligible.
-    - **No eligible candidate → generate** (owner-delegated: S8's "do not
-      invent work" does not apply; one pass per loop). Tools:
-      `analysis/m0122/m0122-0012/tools/` (committed copies of the loop's
-      census scripts).
-      - G1 Census: warm per-query timings with the same plan (parity MATCH)
-        on private clones — TPC-H SF1 and TPC-DS SF0.25 against **release**
-        PG (`bench/pg-release`, `analysis/timing-after-planprity-match/`
-        `pg-release-scripts/`; its numbers change only on a corpus or query
-        change), never the cassert reference clusters. Split planning from
-        execution and record allocation (`ds-planinstr.sh`, `ds-alloc.sh`).
-        Commit the table under `analysis/m0122/m0122-0012/census-<date>/`; a
-        committed census at most 3 days old may be reused, and each
-        attempt's own A/B is always fresh.
-      - G2 Rank queries by absolute excess time (goopg − PG), then ratio.
-      - G3 Profile the top three (perf record -g / pprof, plus the row-count
-        census for algorithmic gaps). Attribute the excess to symbols and
-        map each to a PG executor mechanism (cite the PG function) or to a
-        goopg-only overhead (allocation, clone/copy, deform, interpreted
-        expression, per-row re-resolution, planning).
-      - G4 A candidate qualifies when it is perf-only (values and plans
-        identical — plan-visible ideas go to the parity tasks), one
-        mechanism sized for one loop, not on the Below-bar list, and its
-        attributed share predicts at least 3% on a G2 top-10 query.
-        Design-sized levers (the ledgered structural ones) qualify through
-        their first slice-sized step, with a design doc.
-      - G5 Add every qualifying candidate to the pool (target query,
-        baseline, predicted %, PG citation), ranked by predicted gain; take
-        the top one and write its `Target:` before coding. Candidates are
-        pool bullets and inline slices, never `- [ ]` child tasks.
-    - **Rotation, not exhaustion:** three consecutive misses in one
-      mechanism family put that family on the Below-bar list and send G2 to
-      the next query.
-    - **EXHAUSTED** only when a fresh G1–G3 pass attributes the excess of
-      every G2 top-10 query to Below-bar mechanisms, or no query exceeds
-      release PG by at least 10% and 50 ms. Write
-      `EXHAUSTED at <sha> <date>` with the census path in the entry; item 10
-      then proceeds in the order above without M0122-0012. It re-opens when
-      a later G1–G3 pass — at most once per 7 days, run when item 10 is
-      reached — finds a qualifying candidate, or by owner decision.
-    - Baton: `.ralph/working_set.md` carries an `M0122-0012:` line
-      (PROMPT.md). Skip-rationale tokens: `M0122-0012(yield-b: <two attempts
-      + %>)` during the one-task yield, `M0122-0012(exhausted@<sha>)`
-      afterwards.
+    **M0122 filing pause (owner decision 2026-10-29).** M0122-0012 is complete
+    and its return-first/performance-candidate procedure is retired. Finish only
+    the M0122 tasks already present in this file at this decision; do not file
+    new M0122 tasks until the owner lifts this pause. Mandatory S2 and M-NIGHTLY
+    defect filing continues under their own rules, and M0148 discoveries are
+    filed under the selected M0148 suite task, not under M0122.
+    **M0148 regress coverage closure (owner decision 2026-10-29).** After the
+    already-filed M0122 queue has no selectable task, take M0148's first open
+    suite task in its canonical queue. A failing suite is not parked or closed
+    with a deferral-ledger row alone: immediately file each required missing
+    feature as an implementation child of that suite task, implement the
+    children, and keep the suite task open until the PG 18.3 expected output
+    matches. The first queue entries are `aggregates`, `copy`, `copy2`,
+    `copyselect`, `explain`, `float4`, `float8`; `create_*` cases and the
+    encoding/collation family are at the end. The binding queue and completion
+    rules are in `docs/milestones/0148-regress-coverage-closure.md`.
     M0147 descendants inherit item-10 rank — the S7 correctness-only
     carve-out does not demote them. **M0147-0000 is a channel, not stock**
     (like M0146-0014): never select it; take its first open child in file
@@ -480,9 +427,8 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   `## M0147` at the end of this file), per AGENT.md C5 (promote or delete —
   HOLD is not an outcome). Analysis and review:
   `/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`.
-- Rank: item 10 — superseded 2026-10-27 by the M0122-0012 return-first
-  rule (item 10); other item-10 work runs during its one-task yields and
-  after its exhaustion.
+- Rank: item 10. The temporary M0122-0012 return-first override was retired
+  by the owner on 2026-10-29.
 - Order inside M0147: phase 1 goopg-private retirements (0010–0017), then
   phase 0 PG-port promotions (0020–0023; R3 — never discard a PG arm
   without an owner `[!]`), then phase 2 (0030 recon files the default-ON
@@ -499,19 +445,13 @@ OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
   the loop may re-measure it and, if PG's plans match at both scales, flip
   M0146-0010a `[!]`→`[ ]` (owner authorisation recorded here).
 
-OWNER DECISIONS 2026-10-27 — M0122-0012 return-first:
-- M0122-0012 now heads item 10 (after M-NIGHTLY open items) and is
-  returned to after every other item-10 task until EXHAUSTED; the
-  2026-10-21 yield rule is replaced. Its rule (a) — "no runnable slice" —
-  yielded on 2026-10-24 after slice 92 although ledgered candidates
-  remained. The procedure (bar, one-task yield, Below-bar exclusion,
-  generation G1–G5, rotation, exhaustion) is in item 10.
-- The entry gained an owner-seeded Candidate pool and Below-bar list
-  (2026-10-27); the loop maintains both. The census scripts it used from
-  `tmp/` are committed under `analysis/m0122/m0122-0012/tools/`.
-- Other item-10 work (M0119, M0147, the rest of M0122) runs during
-  M0122-0012's one-task yields — the next selectable task in item-10
-  order — and after its exhaustion.
+OWNER DECISION 2026-10-29 — M0122-0012 closed; regress closure queued:
+- M0122-0012 is complete by owner decision. Its 2026-10-27 return-first,
+  candidate-generation, yield and exhaustion rules are retired.
+- New M0122 filing is paused. Finish the tasks already filed under M0122,
+  then enter M0148's regress-coverage queue as specified in banner item 10.
+- M0148 must implement missing prerequisites as suite-task children; a
+  deferral-ledger row by itself never completes or parks a suite task.
 
 **M-NIGHTLY filing is unconditional**: every loop reads
 `ci/logs/action-items.md` and files each new `## AI-` subject under M-NIGHTLY.
@@ -897,6 +837,70 @@ heuristic stays live.)
     restarts on rune boundaries; ILIKE's strings\.ToLower path stays\. Check the evalFast/vectorised LIKE siblings
     use the same matcher\.
   - Expected instrument: the repro identical to `analysis/p0e13/pg18\-expected\.out`\.
+
+- [ ] **P0\-E15 — VACUUM resurrects a rolled\-back INSERT: the aborted row becomes visible to every scan**
+  \(filed 2026\-10\-28 by the loop, M0122\-0012 C47 slice 2 safety review; S2 — wrong results / data integrity\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro counts differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-28 \(S2, wrong results — rolled\-back data reappears\) — OWNER PLACEMENT NEEDED\.**
+    > Filed, not selected: the loop continues with the banner\. `autovacuum` defaults to on, so any rolled\-back
+    > INSERT can reappear without a manual VACUUM\. Repro `analysis/p0e15/aborted\-insert\-ios\-repro\.sql`; PG 18\.3
+    > output `analysis/p0e15/pg18\.out` \(scratch PG on :5545\), goopg `analysis/p0e15/goopg\-102c74a5e\.out`;
+    > trigger probe `analysis/p0e15/trigger\-probe\.sql` / `trigger\-probe\-goopg\.out`\.
+  - Symptom: `INSERT 2000 rows; BEGIN; INSERT 99999; ROLLBACK; VACUUM;` — goopg `count\(\*\)` = 2001 \(PG 2000\),
+    `WHERE id = 99999` finds the row \(PG 0\), through a plain Seq Scan and through an Index Only Scan alike\.
+    Before the VACUUM goopg counts 2000\. Reproduced on a fresh `goopg init` server; the binary predates C47\.
+  - Cause 1 \(read, matches the symptom\): `storage\.PageFreezeOldTuples` \(internal/storage/freeze\.go\) rewrites
+    every xmin below the cutoff to FrozenTransactionID without checking that it committed\. PG never freezes an
+    aborted xmin: pruning removes aborted inserts as HEAPTUPLE\_DEAD \(heap\_prune\_satisfies\_vacuum, pruneheap\.c\)
+    and heap\_prepare\_freeze\_tuple \(heapam\.c\) errors on an xmin that did not commit\. goopg's
+    `PageVacuumPrune` takes only the horizon \(no clog\), so the aborted tuple survives the prune and is then frozen\.
+  - Cause 2: the freeze cutoff in `operators\_vacuum\.go` \(~l\.103\) is `nextXID \- freeze\_min\_age` in uint32 and is
+    clamped with a plain `fb > oldest`\. On a young cluster the subtraction wraps, the clamp makes the cutoff
+    OldestXmin, and every tuple below the horizon is frozen — vacuum\_freeze\_min\_age \(default 50 M\) is
+    ineffective\. PG's vacuum\_get\_cutoffs \(vacuum\.c\) uses circular TransactionIdPrecedes and
+    FirstNormalTransactionId\.
+  - Cause 3 \(same family\): `storage\.PageAllVisible` \(vm\.go\) requires only xmin < horizon, not a committed xmin,
+    so VACUUM sets the VM \(and since C47 slice 1, PD\_ALL\_VISIBLE\) on a page holding an aborted tuple\. In the
+    executor fixture \(no freeze\) the aborted tuple keeps xmin 4 while the VM says all\-visible, and an Index Only
+    Scan returns it\. PG's heap\_page\_is\_all\_visible / lazy\_scan\_prune need HEAPTUPLE\_LIVE \(xmin committed\)\. It
+    also admits LP\_DEAD items \(ledger 2026\-10\-28\)\.
+  - First step: give the prune and freeze passes a commit oracle \(vacuumCore already has the transam Manager\):
+    prune an aborted\-xmin tuple as dead, never freeze an xmin that did not commit, and make PageAllVisible demand a
+    committed xmin and no LP\_DEAD item; fix the cutoff arithmetic with circular XID comparisons\. Then the repro,
+    an aborted\-insert regression test per scan type, and the isolation/vacuum regress cases\.
+  - Expected instrument: the repro identical to `analysis/p0e15/pg18\.out`\.
+  - Blocks: M0122\-0012 C47 slice 2 \(a seq\-scan visibility skip on PD\_ALL\_VISIBLE would trust the same wrong
+    all\-visible decision\)\.
+- [ ] **P0\-E14 — SET ROLE survives ROLLBACK, and an INITIALLY DEFERRED constraint trigger fires at the statement, not at COMMIT**
+  \(filed 2026\-10\-27 by the loop, M0122\-0012 C26 RegressSuite review of the `triggers` case; S2 — wrong results /
+  privilege\)\.
+  Kind: impl
+  Movement: none — correctness fix — no plan instrument \(repro values differ from PG\)
+  Parent: none
+  - > **ESCALATION 2026\-10\-27 \(S2, wrong results \+ privilege\) — OWNER PLACEMENT NEEDED\.** Filed, not selected:
+    > the loop continues with the banner\. Repros `analysis/p0e14/repro\-role\.sql`, `repro\-deferred\.sql`; PG 18\.3
+    > output `\*\.pg\.out` \(scratch PG on :5545\), goopg output `\*\.goopg\.out` \(binary at `08a69974e` \+ C26\)\.
+  - Symptom 1 \(privilege\): `BEGIN; SET ROLE r; ROLLBACK;` leaves `current\_user` = r \(PG: the session user\);
+    likewise after an aborted transaction\. The session keeps the rolled\-back role's privileges — in the upstream
+    `triggers` block the next `SELECT` fails with `permission denied`\.
+  - Symptom 2 \(wrong result\): a `CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` fires at the INSERT
+    statement \(NOTICE before the next statement\); PG queues it and fires it at COMMIT\. A deferred trigger that
+    raises therefore fails the INSERT instead of the COMMIT\.
+  - The upstream `triggers` regress case flaps between two goopg states across runs on unchanged code \(c21 = c26 vs
+    c23 = c25 in tmp/\*\-regress\): with the trigger not firing at all \(row committed, no error, `t`\), or firing at
+    the INSERT with the role left set \(`f`\)\. Neither matches PG\.
+  - Cause \(read, not yet traced\): SET ROLE state lives on `connTxState` \(internal/postmaster/query\.go
+    `applySetRole`, dispatch\.go `ectx\.SetRole`\) with nothing undoing it at transaction end; PG's `role` is a GUC
+    rolled back by AtEOXact\_GUC \(src/backend/utils/misc/guc\.c\) on abort and on a non\-LOCAL SET inside a rolled\-back
+    transaction\. Constraint triggers \(`trig\.IsConstraint`, internal/executor/expr\.go ~9422\) do not consult
+    tgdeferrable/tginitdeferred; PG queues them in the after\-trigger event list and fires deferred ones at
+    AfterTriggerFireDeferred \(src/backend/commands/trigger\.c\)\.
+  - First step: snapshot the role state at transaction start and restore it on ROLLBACK/abort \(and for SET LOCAL at
+    commit\); then route `IsConstraint` triggers marked initially\-deferred into the deferred\-check queue that the
+    deferred FK/unique checks already use at COMMIT\.
+  - Expected instrument: both repros identical to their `\*\.pg\.out`; the `triggers` regress case stops flapping\.
 
 - [ ] **P0\-E12 — a computed text value over a borrowed scan aliases the scan's page arena: a hash aggregate's stored group keys are overwritten**
   \(filed 2026\-10\-24 by the loop, M0122\-0012 slice 92 follow\-up probe; S2 — wrong results\)\.
@@ -1706,9 +1710,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   Parent: M0122\-0010
   - Rank: below item 10 under the S7 carve\-out \(correctness/fidelity, no plan instrument\) unless the owner places it\.
   - First step: the free list → FSM move \(the only residual with an observable cost: index bloat across backends\)\.
-- [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
-  - **Candidate pool (owner-seeded 2026-10-27 from the ledger and the slices' Open/Next/Left notes; the loop
-    maintains it and re-ranks it by predicted gain after each G1–G3 pass — return-first rule, banner item 10):**
+- [x] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness**.
+  Kind: impl
+  Parent: none
+  Movement: none — owner closed the performance campaign on 2026-10-29; its landed slice measurements remain below.
+  - **Completed by owner decision 2026-10-29.** The return-first rule and new
+    candidate generation are retired; the historical candidate pool, slice
+    results and yield records below remain as the audit trail.
+  - **Historical candidate pool (owner-seeded 2026-10-27 from the ledger and the slices' Open/Next/Left notes):**
     - C1 Numeric hash-join and GROUP BY keys hashed as canonical strings (Q13 `mapaccess2_faststr` ~5%; HammerDB
       TPC-H keys are numeric) — ledger :3169, :3171.
     - C2 Q14/Q23 per-probe constant factor on `store_sales_pkey` probes: leafScanStart's generic comparator
@@ -1773,6 +1782,39 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       try\_mergejoin\_path / initial\_cost\_mergejoin, Q64 planning instructions −0\.5 %\)\.
     - Landed below the bar: C21 bitmap heap scan joins the scan borrow \(slice 103, Q17 instructions −2\.06 %,
       `bitmapHeapScanOp\.emitRow` vs PG ExecStoreBufferHeapTuple\)\.
+    - Dropped: C33 NLI\-inner index\-scan read set through buildCompleteChild \(Q14 instructions −0\.03 %: Q14's
+      probes sit under lateral Joins the consumer threading does not cross\)\.
+    - Dropped: C42 galloping binary search for the end of a leaf's in\-range run \(`scanLeafItems` hi test vs PG
+      `\_bt\_checkkeys`, Q14 instructions −0\.12 %: per\-item hi tests were only 0\.62 % of Q14\)\.
+    - Landed below the bar: C43 scan `Cond` compiled for evalFastExpr \(`compiledCond` vs PG ExecInitQual/ExecQual,
+      Q14 instructions −1\.94 %\)\.
+    - Dropped: C44 int\-lane hash table with the first build row inline \(`lazyIntHash` vs PG ExecScanHashBucket,
+      H Q13 wall −1\.1 %, instructions ±0\)\.
+    - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
+      vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
+    - Landed below the bar: C48 seq scan fetches its heap tuple in place \(`PageGetHeapTupleNoCopyInto` vs PG
+      heapgettup\_pagemode, DS Q10 instructions −2\.37 %, wall −10\.9 %\)\.
+    - Landed below the bar: C49 seq\-scan visibility check by pointer \(`TupleVisibleSubxactPtr` vs PG
+      HeapTupleSatisfiesVisibility, DS Q10 wall −2\.83 % median\)\.
+    - Landed below the bar: C50 searched\-CASE WHEN as a bool \(`fastComparisonBool` / `evalFastCase` vs PG
+      EEOP\_JUMP\_IF\_NOT\_TRUE, DS Q59 wall −0\.24 %, instructions −2\.6 %\)\.
+    - Landed below the bar: C51 HEAP\_HASEXTERNAL\-gated seq\-scan TOAST walk \(`scanNeedsDetoast` vs PG
+      HeapTupleHasExternal, H Q17 instructions −2\.94 %\)\.
+    - Dropped: C52 header fields stored one by one in `parseHeapTupleAliasInto` \(vs PG reading t\_data in place, H Q17
+      wall −0\.6 %, instructions −0\.44 %\)\.
+    - Landed below the bar: C53 NUMERIC arithmetic called directly from the compiled binary arm \(`fastNumericArith` vs
+      PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
+    - Dropped: C55 previous\-key memo in the hashed aggregate's int lane \(`aggregateOp\.Open` igroups vs PG
+      LookupTupleHashEntry, H Q18 instructions −1\.0 %\)\.
+    - Dropped: C61 right/full join matched bitmaps cached on the int probe index entry \(`matchedIntBucket` vs PG
+      HeapTupleHeaderSetMatch, H Q13 wall \+1\.7 %\)\.
+    - Dropped: C56 abbreviated leading text sort key \(`sortChunk` comparator vs PG varstr\_abbrev\_convert /
+      ApplySortComparator on SortTuple\.datum1, DS Q47 instructions −0\.55 %\)\.
+    - **Family on the Below\-bar list \(rotation rule, loop \#246\):** 48\-byte Datum / struct by\-value copy elimination \(C48, C49,
+      C50, C52, C53 — five attempts, all < 3 %; the last three consecutive\)\.
+    - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
+      consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
+      \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
   - **Yield record:** 2026-10-24 under the old rule (a) after slice 92 (superseded by the return-first rule).
     - Yield 2026\-10\-27 \(loop \#194\): C16g −2\.96 % \(slice 99, landed\) and C16h −0\.5 % \(dropped\) both missed the
       bar on Q64 planning; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
@@ -1781,6 +1823,47 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       resets\.
       - Worked: M0122\-0013 standby restartpoint, landed 2026\-10\-27 \(loop \#195\)\. Yield over — the next item\-10
         selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-27 \(loop \#200\): C21 −2\.06 % \(slice 103, landed\) and C22 ±0 % \(dropped\) missed the bar;
+      worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no selectable
+      child, so M0122\-0013 \(ledgered residual 2026\-10\-27: a standby never stamps DB\_IN\_ARCHIVE\_RECOVERY, so
+      the restartpoint's minRecoveryPoint arm is dormant and a shutdown restartpoint misses
+      DB\_SHUTDOWNED\_IN\_RECOVERY\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 standby pg\_control state, landed 2026\-10\-27 \(loop \#201\)\. Yield over — the next
+        item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#225\): C42 −0\.12 % \(dropped\) and C43 −1\.94 % \(slice 116, landed below the bar\)
+      missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006,
+      M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-27: CreateRestartPoint's WAL segment
+      removal — KeepLogSeg \+ RemoveOldXlogFiles after the pg\_control update — in `runRecoveryFlush` after
+      `adoptRestartPoint`\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 restartpoint WAL removal, landed 2026\-10\-28 \(loop \#226\)\. Yield over — the next item\-10
+        selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#236\): C48 −2\.37 % instructions \(slice 119, landed\) and C49 −2\.83 % wall median \(slice
+      120, landed\) missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
+      M0119\-0006, M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-28: CreateRestartPoint's
+      remaining steps — UpdateCheckPointDistanceEstimate from restartpoints, TruncateSUBTRANS on a hot standby,
+      PreallocXlogFiles; or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 restartpoint distance estimate, landed 2026\-10\-28 \(loop \#237\)\. Yield over — the next
+        item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#240\): C50 −0\.24 % wall \(slice 121, landed\) and C51 −2\.94 % instructions \(slice 122,
+      landed\) missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006,
+      M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-28: TruncateSUBTRANS on a hot standby,
+      PreallocXlogFiles, or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
+      - Worked: M0122\-0013 restartpoint moves RedoRecPtr \(volume\-trigger anchor\), landed 2026\-10\-28 \(loop \#241\)\.
+        Yield over — the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#243\): C52 −0\.6 % wall \(dropped\) and C53 −2\.2 % instructions \(slice 123, landed\)
+      missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no
+      selectable child, so M0122\-0013 \(ledgered 2026\-10\-28: the restartpoint skip arm returns before the flush as PG's
+      does, or the standby volume trigger measures the replay position, or PreallocXlogFiles\)\. Then return; misses
+      reset\.
+      - Worked: M0122\-0013 restartpoint skip arm without the flush, landed 2026\-10\-28 \(loop \#244\)\. Yield over —
+        the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#248\): C55 −1\.0 % instructions \(dropped\) and C56 −0\.55 % instructions \(dropped\) missed
+      the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no
+      selectable child \(0023, 0048 `\[\!\]`\), so M0122\-0013 \(ledgered 2026\-10\-28: the volume trigger in recovery
+      measures the replay position, the skip arm raises minRecoveryPoint, or PreallocXlogFiles\)\. Then return; misses
+      reset\.
+      - Worked: M0122\-0013 restartpoint requests follow the replayed WAL, landed 2026\-10\-28 \(loop \#249\)\. Yield over —
+        the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -1820,6 +1903,886 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `emitRow` yields scanRow when no ctid column is emitted\. Q17 27\.860/27\.877 → 27\.299/27\.289 Ginstr/q =
       **−2\.06 %, misses the 3 % bar** \(the 8 % profile share was mostly allocation/GC cycles, which instructions do
       not count\); values and plans identical; Below\-bar list updated\. **Miss counter 1\.** Design: part 10 §103\.
+    - C22 \(added loop \#200, G3 on Q17 after C21\): the main lineitem probe scan decodes columns 0–5 \(six
+      NUMERICs; decodeScanRowRange 21 % of Q17\) though only l\_partkey / l\_quantity / l\_extendedprice are read:
+      `buildCompleteChild` carries consumer\-completeness through the hash join to its left side \(slice 66\) but has
+      no seq\-scan case, so the scan's read set \(`readCols`, slice 19\) stays nil\. PG fetches only referenced
+      attributes \(EEOP\_SCAN\_FETCHSOME\)\. TID\-bitmap entry sizing \(goopg 2048\-bit vs PG MaxHeapTuplesPerPage
+      291\) noted, ~2 %, not taken\.
+    - **Target \(C22, loop \#200\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs\)\. Bar: −3 %\.
+    - **C22 MEASURED AND DROPPED \(loop \#200\)**: Q17 27\.304/27\.302 vs 27\.287/27\.322 Ginstr/q = ±0 %\. A
+      build trace showed the premise wrong: Join → Project → Seq Scan lineitem, and the Project already narrows the
+      scan's readCols to the three read columns \(slice 19\); even with consumerLiveColumns taught lowered sublinks
+      \(Q17's join filter made it decline\), nothing further is skipped\. Q17's remaining decode is the three NEEDED
+      NUMERICs\. **Second consecutive miss → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-27 \(loop \#202, after the M0122\-0013 yield; misses 0\)**: fresh G3 on DS Q23 / Q67 / Q39
+    \(perf record, `tmp/g3\-202/`\)\. Q23 is spread thin \(decodeRowRangeInfo 5\.3 %, btree probes ~10 % already C18\);
+    Q39 is expression evaluation \(evalFastExpr 8\.7 %\); Q67 has one goopg\-only mechanism, added as C23\.
+    - C23 \(G3 on Q67\): a SORTED single\-rollup aggregate \(Q67: 9 grouping sets, 255 275 groups\) hashes every
+      group and then re\-sorts all output rows with a comparator that does `map\[int\]bool` set\-membership lookups
+      and typed datum compares \(`aggregateOp\.Open\.func4` 9\.5 % of Q67 samples\) to rebuild PG's one\-pass order\.
+      PG emits each group when its prefix changes in the sorted input \(nodeAgg\.c agg\_retrieve\_direct\), so its
+      order is the input's close order — no comparator\. Predicted 7–9 %\.
+    - **Target \(C23\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs\);
+      baseline 24\.770/24\.773 Ginstr/q at `2eeabf36f`\. Bar: −3 %\.
+    - **C23 LANDED \(slice 104\)**: the drain stamps each group's `closeSeq` \(the row that left it behind in its
+      set\); `rollupCloseOrder` orders by \(close row, set length desc\), falling back to the comparator if a closed
+      group is fed again\. Q67 24\.770/24\.773 → 21\.477/21\.471 Ginstr/q \(**−13\.3 %, meets the bar**\); Q67 output
+      byte\-identical; plans 99/99 same; regress groupingsets/aggregates/window byte\-identical\. Misses 0\. Design:
+      part 10 §104\.
+    - C24 \(added loop \#202, after C23\): Q67's drain still hashes each input row into all nine sets' tables
+      \(appendGroupKey \+ trimmed char\(n\) keys \+ aeshash \+ mapaccess2\_faststr, ~8 % of Q67\); PG's sorted path
+      compares the row with the current group \(agg\_retrieve\_direct / execTuplesMatch\)\. Next on return: C24 on Q67,
+      or Q67's final Sort \(lessKeyVals \+ cmpbody ~20 %\) — re\-profile first\.
+  - **Return 2026\-10\-27 \(loop \#203\)**: re\-profiled Q67 at `8432307f1` by instructions:u \(`tmp/g3\-203/q67i\.data`\):
+    final Sort 14\.7 %, worker Sort 7\.5 %, lessKeyVals 9\.3 %, cmpbody 6\.7 %, **strings\.TrimRight 6\.5 %**\.
+    - C25: the bpchar blank trim \(PG bcTruelen, varchar\.c\) runs as Go's byte\-at\-a\-time TrimRight over char\(50\)
+      padding \(~40 blanks\) once per sort\-key value \(trimStringDatum\) and once per grouping set per bpchar column
+      \(appendGroupColKey\)\. Mechanism: one helper `bcTrimRight` that drops whole 8\-byte words of blanks first, used at
+      all 19 blank\-trim sites \(sibling paths stay identical\)\. Predicted ~5 %\. lessKeyVals' cycles are mostly
+      key\-load cache misses \(the 48\-byte Datum copies after each load\), which instructions:u does not count\.
+    - **Target \(C25\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `8432307f1`\)\. Bar: −3 %\.
+    - **C25 LANDED \(slice 105\)**: `bcTrimRight` \(bctrim\.go\) at all 19 blank\-trim sites\. Q67 21\.471/21\.485 →
+      20\.618/20\.618 Ginstr/q \(**−4\.0 %, meets the bar**\); Q67 output byte\-identical; plans 99/99 same\. Misses 0\.
+      Next on return: Q67's final Sort — PG's SortTuple `datum1` \(first key inline in the sorted array, tuplesort\.c\)
+      against goopg's per\-row key slices reached through `perm` \(cycle\-side; check its instruction share first\),
+      or C24 \(drain hash vs current\-group compare\)\. Design: part 10 §105\.
+  - **Return 2026\-10\-27 \(loop \#204\)**: instructions:u profile of Q67 at `08a69974e` \(`tmp/g3\-204/q67i\.data`\):
+    final Sort 17\.9 %, worker Sort 8\.9 %, sort\-key evaluation 8\.2 %, applyAgg 7\.8 %, aggregate map 4\.1 %;
+    **lessKeyVals 11\.4 % self**, cmpbody 7\.6 %\.
+    - C26: `sortOp\.lessKeyVals` copies both 48\-byte Datums of every key \(`av, bv := a\[i\], b\[i\]`\), tries
+      `fastCompareDatum` \(which declines every string pair\), then copies them again through the value\-receiver
+      `StringValue` before `strings\.Compare`\. PG compares in place: ApplySortComparator over Datums with a comparator
+      resolved once per key \(SortSupport, tuplesort\.c / sortsupport\.h; varstrfastcmp\_c for text\)\. Mechanism: compare
+      through pointers into the key slices, with a direct string arm for character\-string keys \(Buf\-backed bytes read
+      in place\) and the existing fast/typed fallbacks otherwise\. Predicted ~5 %\.
+    - **Target \(C26\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `08a69974e`\)\. Bar: −3 %\.
+    - **C26 LANDED \(slice 106\)**: `lessKeyVals` compares through pointers; string keys go straight to
+      `strings\.Compare` over `datumStringInPlace`\. Q67 20\.647/20\.616 → 19\.071/19\.065 Ginstr/q \(**−7\.6 %, meets
+      the bar**\); Q38 −2\.7 %; Q67 output byte\-identical; plans 99/99 same\. Misses 0\. Discovery: P0\-E14 \(S2,
+      filed\)\. Next on return: SortTuple `datum1` \(cycles\) or C24; or rotate G2 to Q14/Q23 \(Q67's excess has fallen
+      from 1344 ms\)\. Design: part 10 §106\.
+  - **Return 2026\-10\-27 \(loop \#205\)**: instructions:u profiles of DS Q14 and Q23 at `8d794539a`
+    \(`tmp/g3\-205/q14i\.data`, `q23i\.data`\): B\-tree descents ~20 % \(C18 territory\), heap decode, buffer lookups;
+    prune\-on\-access already once per block; no new mechanism ≥ 3 %\. Q67 re\-profiled \(`q67i\.data`\): aggregate
+    drain 30\.6 %, of which `groups\[string\(gkBuf\)\]` \(operators\_join\_agg\.go:2876\) 4\.0 % and the emit loop's
+    `groups\[key\]` re\-lookup 1\.5 %\.
+    - **Target \(C24\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `8d794539a`\)\. Mechanism: in a sorted rollup \(closeOrderOK\), compare the row's group key
+      with the current group's key for that set and consult the hash table only when the group changes \(PG
+      agg\_retrieve\_direct compares the row with the group's first tuple, execTuplesMatch\)\. Predicted ~3\.5 %\. Bar:
+      −3 %\.
+    - **C24 MEASURED AND DROPPED \(loop \#205\)**: Q67 19\.066/19\.055 → 18\.990/18\.978 Ginstr/q = **−0\.4 %, misses the
+      bar**\. The shortcut rarely fires where the lookups are: the detail sets have nearly one group per input row
+      \(255 275 groups from 133 k rows\), so almost every row changes group in them and still goes to the map\. The
+      remaining lever is structural — no hash table at all for a sorted rollup \(every key change founds a group, as
+      in PG\), which also removes the map insert and the emit loop's `groups\[key\]` re\-lookup \(~7 % together\) but
+      drops the reopen check that guards against a sort/group\-equality mismatch; ledgered, not attempted\. Below\-bar
+      list updated\. **Miss counter 1\.**
+  - **Return 2026\-10\-27 \(loop \#206\)**: S9 reused `routing\-20261027z` \(`acd4ff2d7` is no\-code\)\. Instruction
+    samples skid onto the instruction after a load \(trimStringDatum's 4 % sits on one `movabs` after the word load\),
+    so per\-symbol shares lean to stalls; structural repeated work is the safer lever\.
+    - C27: a multi\-set aggregate \(grouping sets\) evaluates each aggregate's argument once PER SET per input row —
+      `applyAgg` calls `aggEvalList\(o\.aggArgNodes, …\)` inside the drain's `for si, set := range sets` loop, so Q67's
+      `sum\(coalesce\(ss\_sales\_price\*ss\_quantity, 0\)\)` is computed 9× per row\. PG's ExecBuildAggTrans
+      \(execExpr\.c:3934\-3943\) evaluates a transition's arguments once and then calls the transition for each
+      concurrently evaluated grouping set\. Mechanism: per\-row cache of each aggregate's argument value, valid for
+      the current input row only, used when the aggregate computes more than one set; values that point at memory
+      \(Buf or arena\) are re\-evaluated, so only inline scalars are shared\. Predicted ~4–5 %\.
+    - **Target \(C27\)**: TPC\-DS SF0\.25 **Q67**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `acd4ff2d7`\)\. Bar: −3 %\.
+    - **C27 LANDED \(slice 107\)**: `aggArgShare` / `aggArgRow` / `aggArgSeen` / `aggArgVal` — a multi\-set aggregate
+      reuses an inline\-scalar argument already evaluated for the current row\. Q67 19\.065/19\.081 → 18\.221/18\.221
+      Ginstr/q \(**−4\.5 %, meets the bar**\); all 11 grouping\-set TPC\-DS queries byte\-identical; plans 99/99 same\.
+      **Misses reset to 0\.** Next on return: Q67's remaining excess \(Sort datum1, the no\-hash rollup after the
+      equality proof\) or a fresh G1 census \(census\-20261027 expires 2026\-10\-30; Q67 has fallen from 24\.77 to
+      18\.22 Ginstr/q\)\. Design: part 10 §107\.
+  - **Return 2026\-10\-27 \(loop \#207\)**: S9 exhausted at `83bfa2945` \(census aa\)\. G3 by instructions:u at HEAD:
+    Q23 map work in aggregateOp\.Open 5\.2 % \(drain lookup 2\.3 %, emit re\-lookup `groups\[key\]` 1\.8 %; ≤ 3 % even with
+    PG\-style table pre\-sizing — the plan carries no numGroups\), allocation spread thin; Q72 ~70 % B\-tree probing
+    \(`tmp/g3\-207/q72i\.data`\)\. A release\-PG instruction baseline for Q72 was attempted and denied by the permission
+    classifier \(starting bench/pg\-release\) — not retried\.
+    - C28 \(G3 on Q72\): both binary\-search sites — `findChildBlockDirect` \(internal pages\) and `leafScanStart` \(leaf,
+      non\-posting\) — run every probed tuple through `parseNoCopy` → `parseItemBody`, which validates, extracts the
+      downlink/body and builds an `item`, though in the tuple format the compared key is `raw` itself\. PG's
+      \_bt\_binsrch → \_bt\_compare reads the tuple in place\. Mechanism: compare `raw` directly, keeping only
+      parseItemBody's rejection checks \(length, t\_info size, posting / short heap\-TID pivot\)\. Under
+      findChildBlockDirect the parse layer is ~3\.3 % of Q72 \(parseItemBody 2\.3 %, parseAliasing 1\.0 %\)\. Predicted
+      ~3 %\.
+      - Noted, not taken: the leaf probe of a POSTING tuple calls parsePostingRaw, which allocates the TID array and
+        a key copy per probe \(Q72's probed indexes are unique, so it does not show there\)\.
+    - **Target \(C28\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `83bfa2945`\)\. Bar: −3 %\.
+    - **C28 LANDED \(slice 108\)**: `probeTupleOK` \(parseItemBody's rejections only\); findChildBlockDirect and
+      leafScanStart compare `raw` in place in the tuple format\. Q72 26\.166/26\.168 → 24\.351/24\.352 Ginstr/q
+      \(**−6\.9 %, meets the bar**\); Q72/Q14/Q23 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return:
+      the posting\-tuple leaf probe \(parsePostingRaw allocates per probe\) where an index has duplicates, or a fresh
+      G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10 §108\.
+  - **Return 2026\-10\-27 \(loop \#208\)**: S9 reused census aa \(`e35fff402` is nbtree\-only\)\. Q14 after C28 is flat
+    \(`tmp/g3\-208/q14i\.data`: nbtree 34 %, index\-scan heap fetch 31 %, no ≥ 3 % mechanism\)\. TPC\-H Q18
+    \(`tmp/g3\-208/h18i\.data`\): the hash aggregate on l\_orderkey \(~1\.5 M groups\) spends `igroups\[ik\]` 10\.3 % \(the
+    lookup PG also pays\), then `demoteIntGroups` at end of drain 2\.9 % \+ string\-map inserts/rehash \+
+    canonicalNumericKey allocations, and the emit loop's `groups\[key\]` re\-lookup 4\.0 %\.
+    - C29: the int64 lane is converted to string keys at the end of every drain only so the emit loop can walk
+      `order` \(key strings\) and look each group up again\. PG's agg\_retrieve\_hash\_table iterates the table's entries
+      \(ScanTupleHashTable\); nothing is re\-keyed or re\-looked\-up\. Mechanism: keep the founded groups in a
+      `\[\]\*groupRuntime` list in founding order, emit from it, and skip the end\-of\-drain demotion on the plain
+      \(Simple\-mode\) emit path\. Partial/Final/row\-transport paths keep key strings\. Predicted ~7 %\.
+    - **Target \(C29\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5 runs × 2, fresh
+      A/B against `e35fff402`\)\. Bar: −3 %\.
+    - **C29 LANDED \(slice 109\)**: `founded` \(founding\-order group list\); Simple\-mode emit walks it and skips the
+      end\-of\-drain int\-lane demotion\. Q18 44\.813/44\.962 → 42\.328/42\.304 Ginstr/q \(**−5\.7 %, meets the bar**\);
+      acceptance 24 MATCH; plans 99/99 same\. Misses 0\. Next on return: hash\-table pre\-sizing needs a plan\-node
+      numGroups \(planner change; ledgered\); or a fresh G1 \(census\-20261027 expires 2026\-10\-30\)\. Design: part 10
+      §109\.
+  - **Return 2026\-10\-27 \(loop \#209\)**: S9 exhausted at `a8367e529` \(census ab\)\. **G1/G2 re\-run**:
+    `analysis/m0122/m0122\-0012/census\-20261027b/` \(HEAD `a8367e529`, 3 sf025 sweeps \+ 3 tpch\-gap runs vs the committed
+    release\-PG tsv\)\. Combined top 10 by excess: DS Q14 4322, DS Q23 2396, H Q17 1040, H Q13 1010, DS Q72 912,
+    H Q18 690, DS Q39 672, DS Q78 589, DS Q47 577, DS Q67 570 ms \(Q67 was 1344, Q72 1975, H Q18 1240; DS Q64 left
+    the top 10\)\. This census replaces census\-20261027 for ranking \(reusable until 2026\-10\-30\)\.
+    - G3 \(instructions:u, `tmp/g3\-208/h13i\.data`, `h17i\.data`\): H Q13 is hash\-join memory behaviour —
+      `mapaccess1\_fast64` in the probe 23\.8 % and `MaterializedSlot\.Get` 9\.7 % \(a one\-line slice read: first touch of
+      a build row\); both are cache misses that instructions:u does not count, so no qualifying candidate under the
+      bar's metric\. H Q17: numeric decode 13\.4 % \(NumericInt64FromStoredPayload 9\.7 %, the two legacy\-format
+      probes 3\.7 %\) — the C20 ground, whose line profile put the removable part at 1–2 %; the rest is the lineitem scan
+      \(decodeRowRangeInfo 12\.7 %, checksum 6 % after C19\)\. No candidate ≥ 3 % this pass; nothing attempted, miss
+      counter stays 0\. Next on return: G3 on DS Q39 \(hash\-key evaluation per probe row, evalHashKeyDatumSlot\), DS Q78,
+      DS Q47\.
+  - **Return 2026\-10\-27 \(loop \#210\)**: S9 reused census ab \(`2910f8451` is analysis\-only\)\. G3 by instructions:u
+    \(`tmp/g3\-210/q\{39,78,47\}i\.data`\): Q39 evalFastExpr 9\.7 % = filterOp\.nextPerRow 8\.4 % \+ hash\-probe keys
+    \(evalHashKeyDatumSlot 7\.7 %: a column ref through evalFastExpr plus the slot read's first touch — no lever\); Q78
+    flat \(decodeRowRangeInfo 7\.9 %\); Q47 is Q67's shape — string sort/merge comparisons\.
+    - C30 \(G3 on Q47\): the Gather Merge / ordered\-merge comparator `mergeKeysLess` — the sibling of
+      `sortOp\.lessKeyVals` it must agree with — still copies both Datums per key, tries fastCompareDatum \(which
+      declines strings\), then `compareDatumTyped` → `textShapeAmbiguous` / `compareDatum`: 4\.6 % of Q47 under it\.
+      C26 gave lessKeyVals in\-place access and a character\-string arm; the merge comparator never got them\. PG's
+      Gather Merge heap compares with the same SortSupport comparators \(heap\_compare\_slots → ApplySortComparator\)\.
+      Mechanism: mergeKeysLess reads through pointers and takes the character\-string arm, with key text flags computed
+      once per merge \(sortKeyTextFlags\)\. Predicted 2\.5–3 %\.
+    - **Target \(C30\)**: TPC\-DS SF0\.25 **Q47**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `2910f8451`\)\. Bar: −3 %\.
+    - **C30 LANDED \(slice 110\)**: `mergeKeysLess\(keys, keyText, …\)` in place with the character\-string arm;
+      gatherMergeOp\.keyText, setOp\.mergeTextFlags\(\)\. Q47 16\.993/16\.985 → 16\.130/16\.127 Ginstr/q \(**−5\.1 %, meets
+      the bar**\); Q47/Q67/Q14/Q57 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on return: Q39's
+      `filterOp\.nextPerRow` \(8\.4 %\) or Q23 / Q14 again\. Design: part 10 §110\.
+  - **Return 2026\-10\-27 \(loop \#211\)**: S9 exhausted at `b996b60d9` \(census ac\)\. G3 on DS Q39
+    \(`tmp/g3\-210/q39i\.data`\): big\-number numeric work is 13\.3 % — `exactIntVariance` 8\.2 % \(per\-group stddev\_samp
+    finalisation; `nat\.sqrt` 3\.7 %, big\.Int allocations, `intSums` 1\.0 %\) and the filter's stdev/mean division 4\.8 %
+    \(numericDiv already has a uint128 path\)\.
+    - C31: for int2/int4 inputs PG accumulates Σx, Σx² in int128 \(Int128AggState\) and numeric\_stddev\_internal turns
+      them into the variance and its square root; every intermediate of that computation for Q39's groups fits fixed
+      width \(variance mantissa < 2^63, sqrt\_var's argument < 2^128\), yet goopg does it all in big\.Int — new big\.Ints
+      per group and a Newton big\.Int square root\. Mechanism: `aggRuntime\.intVariance`, a 128\-bit fast path that
+      mirrors exactIntVariance step for step \(select\_div\_scale, div\_var round, sqrt\_var's argument and round\_var\)
+      with an integer square root seeded from float64, falling back to exactIntVariance on any bound\. Predicted ~6 %\.
+    - **Target \(C31\)**: TPC\-DS SF0\.25 **Q39**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs ×
+      2, fresh A/B against `b996b60d9`\)\. Bar: −3 %\.
+    - **C31 LANDED \(slice 111\)**: `aggRuntime\.intVariance` / `intVarianceFixed` \(variance\_int128\_fast\.go\), used by
+      all four integer variance finalisers; exactIntVariance is the fallback\. Q39 21\.717/21\.752 → 19\.308/19\.304
+      Ginstr/q \(**−11\.2 %, meets the bar**\); Q17/Q35/Q39 outputs byte\-identical; plans 99/99 same\. Misses 0\. Next on
+      return: Q39's filter division \(numericDivBig cases the uint128 path declines\) or Q23/Q14\. Design: part 10 §111\.
+  - **Return 2026\-10\-28 \(loop \#212\)**: S9 exhausted at `3d50052e6` \(census ad\)\. G3 on DS Q23 at HEAD
+    \(`tmp/g3\-212/q23i\.data`\): index scans 46 % / nbtree 31\.5 %, entered via indexScanOp\.nextLeafBatch 11\.1 % and
+    indexOnlyScanOp\.Rescan 10\.9 % \(rangeScanPosLeaf 14\.8 %\) — descents and leaf walks already worked by C18/C28;
+    PG 18's \_bt\_set\_startikey precheck applies only past a primitive scan's first page \(Q23's probes are one\-page
+    rescans\), so no lever there\. H Q17 plan \(`tmp/g3\-212/q17ea\.sql`\): Hash Join probe = bare Seq Scan on lineitem,
+    5 998 835 rows, 5 471 matches\.
+    - C32 \(design\-sized; first slice qualifies per G4\): lazy probe\-side deform — the lineitem scan decodes
+      l\_quantity and l\_extendedprice \(NUMERIC\) for every row although only 0\.09 % match the 182\-row hash table\.
+      PG's slot deforms lazily: ExecHashGetHashValue's FETCHSOME reaches only the key attribute, HJ\_SCAN\_BUCKET
+      fetches the rest for matching tuples \(slot\_getsomeattrs\_int, execTuples\.c\)\. Design:
+      `docs/design/0100\-0149/0122\-0012\-c32\-lazy\-probe\-deform\.md` \(negotiation at join Open, scan deferNonKey /
+      finishDeferred, join finish sites for every join type, debug poison of pending cells\)\. Predicted ~9 % on Q17
+      \(two of three decoded NUMERICs: ~13 % of Q17 is numeric decode\)\. Not attempted this loop \(design only\);
+      miss counter stays 0\.
+    - **Target \(C32, first slice\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 5
+      runs × 2, fresh A/B against the then\-HEAD\)\. Bar: −3 %\.
+    - **C32 SLICE 1 LANDED \(loop \#213\)**: `probe\_defer\.go` — the first pass decodes up to the last probe key
+      \(skipping earlier non\-key read columns\), the join finishes matched/emitted rows \(resume at the saved offset, or
+      from column 0 when early columns were skipped\), through a narrowing Project; self\-disarm after 4096 deferred
+      rows when ≥ half were finished\. Q17 27\.28–27\.31 → 24\.96 Ginstr/q \(**−8\.6 %, meets the bar**\); TPC\-DS Q8
+      −32\.9 %, Q26 −21\.0 %, Q7 −17\.7 %, Q59 \+0\.3 %\. The first \(skip\-table, full re\-decode\) form regressed Q59
+      \+13\.9 % and was reworked before landing\. Misses 0\. Design: `0122\-0012\-c32\-lazy\-probe\-deform\.md` §Landed\.
+  - **Return 2026\-10\-28 \(loop \#214\)**: S9 exhausted at `e3a2535f0` \(census 20261028a\)\. Generate pass \(no attempt;
+    misses stay 0\):
+    - C32 coverage census \(debug build, top\-10 DS queries, `tmp/g3\-214/sz\-\*\.log`\): hash probes arm in Q14 40×,
+      Q23 18×, Q78 11×, Q10 8×, Q39/Q47/Q67/Q64/Q72 4–6×; the declines are probes that are themselves joins, a Gather
+      or a CTE scan, an expression key \(Q59\), or a non\-borrowing scan — slice 2 \(index/bitmap/Parallel Hash probes\)
+      would arm almost nothing new in the top 10, so it is not the next lever\. Q14 at HEAD 128\.635 G \(C32 moved it
+      −0\.5 %\)\.
+    - C33 \(G3 on Q14\): index\-scan heap fetches decode every column below `deformBound` — Q14's store\_sales probe
+      13 of 23 columns \(it reads ~4\), item 12 or 22 of 22; Q72's date\_dim 28/28, item 22/22, customer\_demographics
+      9/9 — while seq scans skip unread columns inside the window \(slice 19, `colTypeInfo\.skip` from
+      markProjectScanReads\)\. Decode under index scans is 6\.8 % of Q14's instructions \(2\.0 % of Q72's\)\. PG's
+      projection fetches only the attributes its expressions reference \(EEOP\_SCAN\_FETCHSOME, by\-reference values
+      left as pointers\); goopg's eager numeric/text conversion makes every decoded column cost\. Mechanism: thread a
+      column read set beside `deformBound` through buildNode \(nested\-loop inner, Memoize, Project\) into indexScanOp's
+      colInfo skip flags — the index\-scan twin of slice 19\. Predicted ~4 % on Q14; design\-sized \(read\-set threading
+      through joins is pool item C14's "set\-valued read set"\)\.
+    - **Target \(C33, first slice\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`,
+      5 runs × 2, fresh A/B\)\. Bar: −3 %\. Design doc to write first:
+      `docs/design/0100\-0149/0122\-0012\-c33\-index\-scan\-read\-set\.md`\.
+  - **Loop \#215**: S9 reused census 20261028a \(`d1e6f0a79` is analysis\-only\)\. C33 design written:
+    `docs/design/0100\-0149/0122\-0012\-c33\-index\-scan\-read\-set\.md` — the deform analysis threads only an integer
+    bound \(`deformFoldRefs` = max ref \+ 1\) through buildNode / every deformBoundBelow arm, so a set cannot reach an
+    index scan without a signature change; the design adds a separate Build\-time pass
+    \(`indexScanReadSets`\) that walks the plan top\-down with a column set \(unknown nodes/expressions = all\), consumed
+    by the two IndexScan build arms as `colInfo\.skip`, leaving every existing bound path untouched\. Implementation is
+    the next loop's slice; nothing attempted, misses 0\.
+  - **Loop \#216**: plumbing decided \(design §Plumbing\): `buildNode` has ~39 call sites, the slab builder
+    \(`buildRec`\) and the worker builds \(`BuildWorker` / Gather `buildChild`\) would all need a new parameter, package
+    state races between sessions, and stamping a cached plan from the executor races too — so the read set is stamped
+    at `Plan\(\)`'s tail as `IndexScan\.ReadCols` by `fillIndexScanReadCols` \(precedent `fillJoinHashKeys`\), with a
+    conservative optimizer expression walker checked against the executor's `deformScanReadSet`\. Nightly batch was
+    running \(load ~11\); implementation deferred to a fresh loop\. Nothing attempted, misses 0\.
+  - **C33 MEASURED AND DROPPED \(loop \#217\)**: implemented the slice the executor's existing consumer threading
+    allows — `buildCompleteChild` gained a NestedLoopIndexJoin case \(consumers split at the outer width; inner read
+    set = consumers' and predicate's inner columns ∪ Cond; outer consumers = their outer columns ∪ the probe's Key/
+    Keys/SAOPKeys/Low/HighKey/RangePrefix ∪ Memoize keys; any unenumerable expression declines\), applied as
+    indexScanOp `colInfo\.skip`; an on/off/poison equivalence test passed \(2 of 7 queries armed\)\. **Q14 128\.744 →
+    128\.701 G = −0\.03 %, misses the bar**; Q72, Q17, Q25, Q29 ±0\. Cause: Q14's probes are the inner IndexScans of
+    LATERAL / parameterised `Join`s \(lateralJoinStream\), not NestedLoopIndexJoins, and `joinLeftConsumers` declines
+    lateral joins, so no consumer chain reaches them; two\-table index nested loops plan as `Join` too\. Code reverted
+    \(correct but inert\)\. **Miss counter 1\.** The remaining lever is lateral\-join consumer threading: right read set
+    from the consumers' right columns ∪ predicate ∪ Cond, and left consumers ∪ the inner's OuterColumnRef\{Level 1\}
+    reads — needs an OuterColumnRef\-aware visitor \(deformLateralOuterRefs is the int\-bound twin\); design\-sized\.
+  - **Loop \#218 \(misses 1\)**: S9 reused census 20261028a \(`b7befe4c0` ralph\-only\)\. Upper bound measured first with
+    a throwaway by\-table skip hack \(`tmp/g3\-218/`, same binary on/off, Q14 output identical\): every unread
+    index\-scan column skipped 129\.0 → 123\.95 Ginstr/q \(−3\.9 %\); item alone −2\.6 %, date\_dim −0\.9 %, the fact
+    tables ±0; item's integer bound 12 alone ±0\. The item volume is the CTE's ~750 k `item\_pkey` probes under
+    HashSetOp → Gather → lateral Nested Loop, which no consumer chain reaches \(SetOp, the Gather worker build and
+    lateral joins all break it\)\.
+    - C34: a Build\-time plan pass `indexReadSets` \(executor\) — the set\-valued twin of the deform walk over Project,
+      Filter, Sort, Limit, Aggregate, Join \(lateral included: the left side adds the inner probe's
+      OuterColumnRef\{Level 1\} reads\), Memoize, Gather/GatherMerge, SetOp and CTEScan inputs \(every column\),
+      SubqueryScan/Materialize; unknown nodes stop the walk \(no entry = full decode\)\. Published per execution on
+      `Context` \(copied into worker contexts\), applied in `indexScanOp\.openPrep` as `colInfo\.skip`\. PG:
+      EEOP\_SCAN\_FETCHSOME fetches only referenced attributes \(execExpr\.c ExecCreateExprSetupSteps\)\.
+    - **Target \(C34\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted −3\.5 % \(hack upper bound −3\.9 %\)\.
+    - **C34 LANDED \(loop \#218\)**: `index\_read\_sets\.go` — `computeIndexReadSets` runs in `OpIterator\.Open`,
+      published as `Context\.indexReadSets` \(restored at Close; copied by `NewWorkerContext`\), applied by
+      `indexScanOp\.openPrep` \(`applyIndexReadSet`\); `exprReadSet` accepts uncorrelated sublinks \(slice 53 rule\)\.
+      Q14 129\.443/129\.067 → 123\.901/123\.909 Ginstr/q \(**−4\.1 %, meets the bar**\); Q23 −0\.8 %, Q72 −0\.3 %;
+      Q14 output byte\-identical; plans 99/99 same\. Test `TestIndexReadSetsMatchFullDecode` \(on/off/poison, 13
+      queries, 11 arm\)\. **Misses 0\.** Design: `0122\-0012\-c33\-index\-scan\-read\-set\.md` §"Landed: C34"\. Next on
+      return: re\-census S9 \(executor changed\), then a fresh G3 on the next top\-10 query \(Q23, H Q17/Q13, Q72\)\.
+  - **Return 2026\-10\-28 \(loop \#219, misses 0\)**: S9 re\-census `routing\-20261028b` exhausted\. Fresh G3
+    \(instructions:u, `tmp/g3\-219/`\) on DS Q23 and H Q17 at `39041efc5`\.
+    - Q23 is spread thin\. The IOS customer\_pkey probes are 16\.4 % cumulative but are PG\-equivalent descents;
+      the goopg\-only leftovers \(`indexKeyIsDecodable`, growslice, LookupColumn/EqualFold\) total ~1\.5 %\.
+    - Q17: decodeRowRangeInfo 15\.3 % self, skipAttrLen 3\.7 %, decodeScanRowRangeInfo 4\.9 %\. The probe's first
+      pass walks ~7 skipped columns per lineitem row to reach l\_partkey \(HammerDB column order\)\. Each skipped
+      column pays the bitmap/natts/info loads, a non\-inlined skipAttrLen call, a 48\-byte NullDatum copy from the
+      global and the poison\-flag test; PG's slot\_deform\_heap\_tuple step is att\_align\_pointer \+
+      att\_addlength\_pointer\.
+    - C35: a skip\-run loop — on reaching a skipped column, walk the whole run of consecutive skipped columns with
+      a precomputed per\-column skip length \(fixed width, or varlena header inline\), then clear the run's cells in
+      one bulk store \(NullDatum is the zero Datum\)\. Not slice 72's attcacheoff or conditional NULL store \(both on
+      the Below\-bar list\)\.
+    - **Target \(C35\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2,
+      fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C35 LANDED \(slice 112\)**: `skipColumnRun` \+ `colTypeInfo\.skipLen` \(coltypeinfo\.go\), called from
+      decodeRowRangeInfo's loop; the run's cells are cleared at once \(`clear`\)\. Q17 24\.973/24\.967 →
+      22\.604/22\.605 Ginstr/q \(**−9\.5 %, meets the bar**\); DS Q78 −1\.3 %, Q7 −0\.2 %; sf025 total −4\.7 %; values
+      and plans identical\. Test `TestSkipColumnRunMatchesPerColumnSkip` \(4 000 random tuples, run vs per\-column\)\.
+      **Misses 0\.** Design: part 10 §112\. Next on return: re\-census S9 \(executor changed\), then G3 on H Q13
+      \(mapaccess1\_fast64 is stall time — check instructions first\) or DS Q72/Q18\.
+  - **Return 2026\-10\-28 \(loop \#220, misses 0\)**: S9 re\-census `routing\-20261028c` exhausted\. G3 at
+    `b68540921` \(`tmp/g3\-220/`\):
+    - H Q18: map lookups 11 % \(stall skid\) and NUMERIC decode ~10 %; the legacy\-text / special\-spelling probes are
+      already early\-reject, their share is call overhead plus the payload's first touch \(C20's ≈1–2 % again\)\.
+    - H Q13: `MaterializedSlot\.Get` 9 % and `mapaccess1\_fast64` 25 % are the first touch of build rows after the
+      hash lookup — stall time, not instructions\. No instruction lever\.
+    - DS Q72: skip scan dominates — `btreeSkipEnum\.walkLeaf` ~43 % \(leaf entries\), `cursorAt` descents ~35 %\.
+    - C36: walkLeaf checks every leaf entry before the current group's probe\. PG 18 does that only three times
+      in a row, then `\_bt\_checkkeys\_look\_ahead` \(nbtutils\.c\) tests a tuple `targetdistance` ahead \(5, doubling
+      to MaxIndexTuplesPerPage/2; on a miss rechecks reset and the distance drops to /8\), and `\_bt\_readpage`
+      jumps there via `pstate\.skip`\. The state resets per page and on each array advance\. Port: a ScanCursor
+      skip slot \(`scanLeafItems` honours it\) and the look\-ahead in walkLeaf's before\-probe branch\.
+    - **Target \(C36\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~10 % \(walkLeaf ~43 %\)\.
+    - **C36 LANDED \(slice 113\)**: `skipLookAhead` in walkLeaf's before\-probe branch \+ `ScanCursor\.SkipTo` /
+      `LeafKeyAt` / `LeafItemCount` \(scanLeafItems honours the skip only without a hi bound\)\. Q72 23\.955/23\.954 →
+      23\.157/23\.154 Ginstr/q \(**−3\.3 %, meets the bar**; predicted ~10 % — most walked entries are matches or
+      group boundaries\); Q72 output identical; plans 99/99 same; sf025 total −3\.3 %\. Test
+      `TestSkipLookAheadMatchesEntryWalk` \(mutation\-checked\)\. **Misses 0\.** Design: part 10 §113\. Next on
+      return: re\-census S9, then Q72's descents \(`cursorAt` ~35 %: per\-descent page pin \+ bufmap lookup \+
+      readOpaque\) or a fresh G1 census \(census\-20261027b expires 2026\-10\-30\)\.
+  - **Return 2026\-10\-28 \(loop \#221, misses 0\)**: S9 re\-census `routing\-20261028d` exhausted\. G3 on Q72 at
+    `4321d5793` \(`tmp/g3\-221/`\): descents \(`ResetScanCursor`\) 36\.6 %, nearly all the internal\-page binary
+    search\. Across the query the key\-compare chain is ~21 % — compareFixedPrefix 9\.7, comparePGIndexTupleAttrsAt
+    5\.5, PGCompareInt4 3\.3, compareAttr 2\.8 \(loop \#220 profile\)\. Each fixed\-width attribute goes through the
+    by\-value `PGKeyAttr\.compareAttr`, slice construction and an indirect `Compare` call\. PG's `\_bt\_compare` calls
+    the opclass proc too, but its int4/int8/date keys reach btint4cmp/btint8cmp with by\-value Datums
+    \(`index\_getattr` attcacheoff, `FunctionCall2Coll`\)\.
+    - C37: `PGKeyAttr\.IntWidth` \(2/4/8 for the signed\-integer comparators — int2, int4/date, int8/time/timestamp/
+      timestamptz — stamped by the executor's descriptor builder\); `compareFixedPrefix` compares such attributes
+      inline from the page bytes \(Desc negated\), no compareAttr / indirect call\.
+    - **Target \(C37\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C37 LANDED \(slice 114\)**: `PGKeyAttr\.IntWidth` \(stamped by `pgIndexIntWidthForOID`\) and the inline
+      signed\-integer arm in `compareFixedPrefix`\. Q72 23\.157/23\.156 → 21\.229/21\.231 Ginstr/q \(**−8\.3 %, meets the
+      bar**\); Q23 −2\.3 %; Q72 output identical; plans 99/99 same\. Tests `TestCompareFixedIntMatchesComparator`
+      \(mutation\-checked\), `TestPGIndexIntWidthMatchesComparator`\. **Misses 0\.** Design: part 10 §114\. Isolation
+      suite needs `\-timeout 30m` \(533–587 s against the 10\-minute default\)\. Next on return: re\-census S9, then a
+      fresh G1 refresh \(census\-20261027b expires 2026\-10\-30; release\-PG numbers are reusable, goopg's moved\)\.
+  - **Return 2026\-10\-28 \(loop \#222, misses 0\)**: S9 re\-census `routing\-20261028e` exhausted\. **G1 refresh**
+    committed as `analysis/m0122/m0122\-0012/census\-20261028/` \(HEAD `f645129a8`, release\-PG numbers reused\); new
+    top 10: DS Q14 3205, DS Q23 2631, H Q18 1050 \(host variance — instructions fell 41\.912 → 40\.760 G since
+    census\-b\), H Q13 950, H Q17 900, DS Q72 796, **DS Q10 543 \(ratio 4\.05\)**, DS Q78 539, DS Q39 502, DS Q59 462 ms\.
+    - G3 on DS Q10 \(`tmp/g3\-222/q10i\*`\): decodeRowRangeInfo 21\.6 % self \(32 % cum\), seqScanOp\.Next 13 %\. The
+      plan is Nested Loop \(Join Filter `cd\_demo\_sk = c\.c\_current\_cdemo\_sk`\) with outer Seq Scan on
+      customer\_demographics \(1\.92 M rows\) and a Materialize of ~3 inner rows\. goopg decodes \(and, the outer
+      scan not borrowing under Sort, clones\) all nine columns of every outer row; PG's join filter fetches only
+      attribute 1 \(EEOP\_OUTER\_FETCHSOME\) and the projection the rest for the few matching rows\.
+    - C38: C32's lazy probe deform for the streaming nested loop's outer side — arm the outer seq scan \(directly
+      or under a bare\-reference projection\) with the outer columns the join predicate reads; the stream finishes
+      the row \(and re\-copies its cells into `outerRow`\) before any use beyond the predicate: an emitted pair, a
+      semi/anti emit, a null\-extended outer row\. Works for non\-borrowing scans because the page stays pinned
+      until the scan advances and `finishDeferred` re\-takes the content lock\.
+    - **Target \(C38\)**: TPC\-DS SF0\.25 **Q10**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~20 %\.
+    - **C38 LANDED \(slice 115\)**: `nlJoinStream\.armOuterDefer` / `finishOuterRow` \+ `seqScanOp\.armDefer\(keyCols,
+      requireBorrow\)`\. Q10 10\.255/10\.277 → 6\.889/6\.899 Ginstr/q \(**−32\.9 %, meets the bar**\); Q35 ±0 \(disarm path
+      free\); outputs of Q10/Q35/Q69/Q13/Q48 identical; plans 99/99 same\. A first gate sweep's \+13\.2 % \(Q78, Q26,
+      Q23\) was host contention: equal instructions, and the next sweep came back −15\.0 %\. Test
+      `TestNLOuterDeferMatchesEager` \(mutation\-checked\)\. **Misses 0\.** Design: part 11 §115\. Next on return:
+      re\-census S9, then G3 on the census\-20261028 top 10 \(Q14, Q23, H Q13/Q17, Q78, Q39, Q59\)\.
+  - **G3 pass 2026\-10\-28 \(loop \#223, misses 0\)**: S9 re\-census `routing\-20261028f` exhausted\. Profiled DS
+    Q78, Q39, Q59, H Q17 and DS Q23 at `821d93323` \(`tmp/g3\-223/`, instructions:u\)\. **No candidate predicted ≥ 3 %**,
+    so nothing was attempted \(not a miss\)\. Findings:
+    - Q78 and Q39 are spread thin \(no symbol above 6 %; evalFastExpr, seqScanOp\.Next, the hash probe and the
+      Gather queue copy are each 3–10 %\)\.
+    - Q59: the seven `CASE WHEN d\_day\_name = '<day>'` arms are 17\.9 % of the query, but slice 89's in\-place string
+      path already serves them\. What remains per arm is two `plainCompareString` scans, two `bcTrimRight`s and a
+      three\-way `strings\.Compare` for `=`: ~4 % in total, about half of it saveable\.
+    - H Q17: `seqScanOp\.Next`'s hottest lines are the first touch of each tuple header \(stall skid on the
+      visibility call's argument setup\) and the `needsDetoastPrefix` re\-scan of decoded cells \(~2 % of Q17\)\.
+    - DS Q23: index probes are 44\.7 % \(item\_pkey ~1\.15 M probes, customer\_pkey IOS\), spread over PG\-equivalent
+      descent work; the aggregate's string\-serialised group keys \(`mapaccess2\_faststr`, memmove, aeshash,
+      `formatBase10`\) ~4\.5 %, mostly hash/stall work a typed key would still pay\.
+    - Added to the pool \(each predicted < 3 % on its query\):
+      - C39: the decoder reports toast pointers so the per\-row `needsDetoastPrefix` re\-scan disappears \(H Q17
+        ~2 %\);
+      - C40: `=`/`<>` on two plain strings as length\-then\-bytes equality, with the constant side's
+        plain/trimmed form precomputed at compile time \(Q59 ~2 %\);
+      - C41: typed composite hash\-aggregate keys instead of serialised strings, PG's TupleHashTable
+        \(execGrouping\.c\) \(Q23 ~2 %\)\.
+    - Next pass: DS Q14 after C34 \(its lateral probes\), H Q13 by cycles \(stall\-bound; instructions do not see
+      it\), DS Q72 descents\.
+  - **G3 2026\-10\-28 \(loop \#224, misses 0\)**: DS Q14 at `ed521153d` \(`tmp/g3\-224/q14i\*`, attributed by innermost
+    operator\): index scans are 66 % — `indexScanOp\.Next` 28 %, `nextLeafBatch` 23 %, `Rescan` 12 %\. Inside
+    nextLeafBatch, each `store\_sales\_pkey` probe \(`ss\_item\_sk = X`, ~44 matching items\) tests every item against the
+    upper bound through compareHigh → comparePGIndexTuples → comparePGIndexTupleAttrsAt → compareFixedPrefix
+    \(~7–8 % of Q14 with BTreeTupleGetNAtts\)\.
+    - C42: `scanLeafItems` finds the end of the in\-range run by binary search, the twin of `leafScanStart`'s
+      search for its start \(`\_bt\_binsrch`\)\. It does so only after a run of in\-range items, galloping, so a
+      single\-match probe \(Q23's item\_pkey\) still tests one or two items\. Items before the found end skip the hi
+      test; the walk stops at the end as it would have\. PG tests each tuple through `\_bt\_checkkeys` with one opclass
+      call; goopg's per\-item chain is goopg\-only overhead\.
+    - **Target \(C42\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~5 %\.
+    - **C42 MEASURED AND DROPPED \(loop \#224\)**: Q14 117\.008/116\.968 → 116\.870/116\.825 Ginstr/q = **−0\.12 %,
+      misses the bar**\. The premise was wrong: the compares inside nextLeafBatch are mostly `leafScanStart`'s binary
+      search for the range start \(2\.31 % of Q14\), not per\-item hi tests \(0\.62 %\) — the store\_sales\_pkey probes
+      match far fewer items per page than the ~44 assumed\. Code reverted\. **Miss counter 1\.**
+  - **Loop \#225 \(misses 1\)**: S9 census reused \(`07f9d5c6a` ralph\-only\)\. Q14's heap\-fetch leads checked first:
+    pruning already runs once per new heap block \(`PagePruneXIDSet` 2\.0 % is each heap page's first touch, which PG
+    pays too\); same\-block pin reuse is rare for these probes\. The real lead: `indexScanOp\.Next` evaluates its `Cond`
+    per fetched row with the **interpreted** `evalExpr` — **7\.08 % of Q14** \(the date\_dim probes' `d\_year = 2001 AND
+    d\_moy = 11` and `d\_week\_seq = \(InitPlan\)`\) — where the seq scan's qual and the join residual already run
+    compiled \(`evalFastExpr`, slice 45\)\.
+    - C43: compile `IndexScan\.Cond` once per operator into an `exprTreeSlab` and evaluate it with `evalFastExpr`
+      over a reused slot, as `joinOp\.joinPredicateMatch` does\. PG evaluates the scan qual through ExecQual over a
+      compiled ExprState \(execExpr\.c\)\.
+    - **Target \(C43\)**: TPC\-DS SF0\.25 **Q14**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs ×
+      2, fresh A/B\)\. Bar: −3 %; predicted ~5 %\.
+    - **C43 LANDED BELOW THE BAR \(slice 116, `602669237`\)**: `compiledCond` \(compiled\_cond\.go\) for the index,
+      index\-only and bitmap heap scans' per\-row `Cond`\. Q14 116\.985/116\.965 → 114\.717/114\.720 Ginstr/q = **−1\.94 %,
+      misses the 3 % bar** \(the compiled filter still costs ~2/3 of the interpreted one on these short predicates\);
+      Q7 −6\.2 %, Q88 −1\.1 %; plans 99/99 same; values identical\. Test `TestCompiledCondMatchesInterpreter`\. Design:
+      part 11 §116\. **Second consecutive miss \(C42, C43\) → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-28 \(loop \#227, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`4370e7f2c`
+    xlog\-only\)\. G3 on H Q13 by **cycles:u** \(`tmp/g3\-227/h13c\.data`; Q13 is stall\-bound, instructions do not see
+    it\): `mapaccess1\_fast64` 16\.4 % \(10\.6 % the hash join probe, 5\.2 % the aggregate\), `MaterializedSlot\.Get` 6\.9 %
+    \(first read of the matched build row\), `nextLazy` 6\.5 %\. Each int\-lane probe pays three dependent misses \(map
+    slot → the `\[\]Row` one\-element backing array → cells\); PG's ExecScanHashBucket two \(bucket → tuple\)\.
+    - C44 \(design\-sized; first slice qualifies per G4\): `lazyIntHash map\[int64\]\[\]Row` →
+      `map\[int64\]intHashRows\{first Row; more \[\]Row\}` — a unique key's row inline in the map slot, read through
+      `intMatches` \(a scratch one\-element slice\) at the 36 sites, audited for slices held across a lookup\.
+      Design: `docs/design/0100\-0149/0122\-0012\-c44\-int\-hash\-inline\-first\-row\.md`\.
+    - **Target \(C44\)**: TPC\-H SF1 **Q13**, metric **wall time** \(median of 5 warm runs, idle host: 16 cores,
+      load < 2; alternating A/B on tmp/q17\-clone\), with instructions:u no worse than \+1 %\. Bar: −3 %; predicted
+      ~5 %\. Implementation is the next loop's slice; nothing attempted, misses 0\.
+    - **C44 MEASURED AND DROPPED \(loop \#228\)**: implemented as designed \(`intHashRows\{first, all, n\}` at all 45
+      sites incl\. the parallel shared build; equivalence and layout tests passed\)\. Q13 wall, 10 alternating
+      fresh\-server runs each \(load 0\.9–1\.4\): base median 1\.785 s, C44 1\.765 s = **−1\.1 %, misses the 3 % bar**
+      \(first 5\-run set −2\.2 %, second ±0\); instructions:u 11\.957 → 11\.960 G\. The extra hop was not the stall that
+      matters — the slot and the cells dominate\. Code reverted\. **Miss counter 1\.**
+  - **G3 2026\-10\-28 \(loop \#229, misses 1\)**: H Q17 at `a42524dd1` attributed by innermost operator
+    \(`tmp/g3\-229/h17\*`\): seqScanOp\.Next 35 % \(first touches, checksums\), decodeScanRowRangeInfo 26 %, nextLazy 10 %,
+    **`joinOp\.evalHashKeyDatumSlot` 6\.0 %** \(evalFastExpr 3\.2, self 2\.0, MaterializedSlot\.Get 0\.7\)\. The probe key is
+    the bare column `l\_partkey`, yet each of the 6 M probe rows evaluates it through the general compiled evaluator
+    \(merged\-key VirtualSlot → MaterializedSlot\.Get, a 48\-byte Datum return\)\.
+    - C45: a bare\-column probe\-key fast path — when the single probe key compiles to a ColumnRef into the probe row,
+      read that cell in place \(no evaluator dispatch\)\. PG: ExecJustOuterVar / ExecJustInnerVar
+      \(execExprInterp\.c\), the special\-cased single\-Var ExprState that ExecHashGetHashValue's keys use\.
+    - **Target \(C45\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2,
+      fresh A/B\)\. Bar: −3 %; predicted ~4 %\.
+    - **C45 LANDED \(slice 117\)**: `joinOp\.probeIntKeyDatum` reads the int lane's single bare\-column probe key
+      in place from the probe `MaterializedSlot` \(arming decided once per operator from `lazyLW`/`lazyRW` and the
+      merged key layout; trimmed, expression, null\-side or non\-materialized keys keep `evalHashKeyDatumSlot`\)\. Q17
+      22\.586/22\.616 → 21\.737/21\.720 Ginstr/q = **−3\.85 %, meets the bar**\. Gates: units, spotcheck, acceptance 24
+      MATCH, sf025 PASS=99 \(the loop \#229 run was killed at its stamp; re\-run loop \#230\)\. Test
+      `TestProbeKeyColMatchesEvaluator`\. Design: part 11 §117\. **Miss counter 0\.** Next on return: G3 for a new
+      candidate \(census\-20261028 expires 2026\-10\-30 → fresh G1 then\)\.
+  - **G3 2026\-10\-28 \(loop \#231, misses 0\)**: S9 re\-census `routing\-20261028h` exhausted\. H Q18 at `923750127`
+    by instructions:u \(`tmp/g3\-231/h18i\.data`\): `mapaccess1\_fast64` 11\.1 % \(60 % of it on the instruction after the
+    group control\-word load — stall skid on the first touch of each new group, PG pays it too\), decodeRowRangeInfo 7\.1 %,
+    NumericInt64FromStoredPayload 7\.0 %, seqScanOp\.Next 7\.0 %, checksums 4\.5 %; the aggregate ~19 %\. Annotated against
+    `go tool objdump`: `finalizeGroup` 3\.69 % \(83 % 64\-byte\-stride struct copies\), `finishAgg` 1\.18 % \(90 %\),
+    `finishBuiltinAgg` 1\.01 % \(88 %\), `foldIntLaneIntoNumeric` 1\.03 % \(95 %\)\. `aggRuntime` is 704 bytes and
+    `optimizer\.AggregateCall` 320; per group finalizeGroup copies the call in three `range o\.plan\.Aggs` loops and
+    passes both by value to finishAgg → finishBuiltinAgg → foldIntLaneIntoNumeric \(in and out\), ~1\.5 M groups\.
+    `applyAgg`'s hot lines are the 48\-byte Datum return of `aggEvalList` \(C13 class\), not struct copies\.
+    - C46: the finalize path takes `\*aggRuntime` / `\*optimizer\.AggregateCall` \(index loops, pointer params; a branch
+      that mutates the state works on a local copy so the caller's state is untouched as before\)\. PG:
+      finalize\_aggregates / finalize\_aggregate \(nodeAgg\.c\) take AggStatePerAgg / AggStatePerGroup pointers\.
+    - **Target \(C46\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `923750127`\)\. Bar: −3 %; predicted ~5 %\.
+    - **C46 LANDED \(slice 118\)**: `finishAgg` / `finishBuiltinAgg` take `\*aggRuntime` / `\*optimizer\.AggregateCall`,
+      `finalizeGroup` walks the calls by index, `foldIntLaneIntoNumeric` returns the folded \(numericSum, sum\) pair\.
+      Q18 41\.142/41\.112 → 39\.309/39\.292 Ginstr/q = **−4\.44 %, meets the bar**; DS Q67 −1\.9 %\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 PASS=99 \(its Q67 2 s→5 s reading was host variance: warm wall base
+      2\.03/2\.94 s vs C46 1\.95/1\.78 s\)\. Test `TestFinishAggLeavesStateUntouched`\. Design: part 11 §118\. **Miss
+      counter 0\.** Next on return: S9 re\-census \(executor changed\), then G3 — DS Q14 / Q23 / H Q13 \(census\-20261028
+      expires 2026\-10\-30\)\.
+  - **G3 2026\-10\-28 \(loop \#232, misses 0\)**: S9 re\-census `routing\-20261028i` exhausted\. Profiles at `102c74a5e`
+    \(`tmp/g3\-232/q\{14,23,78,39,59\}\.data`\), struct\-copy scan \(`tmp/g3\-232/copyscan\.sh`\) finds no large\-struct copy loop
+    in any hot symbol — the `movups` shares are 48\-byte Datum moves \(C13 class\)\.
+    - DS Q14 / Q23: `parseHeapTupleAlias` 4\.9 / 3\.8 % is 87 % on `raw\[22\]`, the first touch of each fetched heap tuple
+      \(PG pays it\); nbtree ~22 % of Q14 is PG\-equivalent descent work; Q23 `projectOp\.Next` 5\.1 % is the per\-column Datum
+      copy, 3\.66 % of it under aggregates — the slice\-35 mechanism, ceiling below 3 %\.
+    - DS Q59: `evalFastExpr` 19\.7 % \+ `evalFastCase` 6\.6 % \+ `aggEvalList` 3\.1 % — seven CASE aggregates' Datum returns
+      \(slices 89/90 already took the string compares\); instructions:u would see under 3 %\.
+    - DS Q39: `PageGetHeapTupleNoCopy` 5\.3 % is a store\-forwarding stall on the returned HeapTuple \(≈2–3 % instructions\);
+      **per\-tuple visibility ~4\.4 %** \(`TupleVisibleSubxact` call line 2\.5 % \+ transam 1\.9 %\)\.
+    - C47 \(design\-sized, first slices qualify per G4\): the seq scan skips per\-tuple visibility on a page with
+      PD\_ALL\_VISIBLE, as PG's heap\_prepare\_pagescan / page\_collect\_tuples \(heapam\.c\) do\. Finding: goopg's VACUUM
+      sets only the VM bit, never PD\_ALL\_VISIBLE \(PG vacuumlazy\.c PageSetAllVisible\), and DML never clears it \(PG
+      heap\_insert/update/delete PageClearAllVisible\); recovery DOES set it, so primary and standby pages diverge\.
+      `tmp/q64\-clone`: VM all\-visible on every block of the 4 largest relations, 0 pages with the page bit; PG
+      `:65438` tpcds025 ~99 % relallvisible\. Slices: \(1\) VACUUM sets the page bit, every `VM\.ClearBlock\*` DML site
+      clears it under the page write lock; \(2\) the scan skip; \(3\) corpora backfill — owner\-run\. Design:
+      `docs/design/0100\-0149/0122\-0012\-c47\-seqscan\-all\-visible\-page\-skip\.md`\.
+    - **Target \(C47\)**: TPC\-DS SF0\.25 **Q39**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B, on a private vacuumed copy of the clone whose pages carry the bit; plans identical to
+      the uncopied clone\)\. Bar: −3 %; predicted ~4 %\. Implementation is the next loops' slices; nothing attempted,
+      misses 0\.
+    - **C47 slice 1 LANDED \(loop \#233\)**: PD\_ALL\_VISIBLE producer \+ invalidation, no scan change\. The clears live in
+      `internal/storage/heap\.go` where every heap add / xmax stamp lands \(PageAddHeapTuple, PageSetHeapTupleXmax,
+      MovedPartition, the three Stamp\*OldTuple, XmaxMulti with an updater\); row locks keep it\. VACUUM's
+      `setPageAllVisible` sets it with the VM bit, the not\-all\-visible arm clears it\. Tests
+      `TestPageAllVisibleClearedByHeapChanges`, `TestPageAllVisibleFollowsVM` \(mutation\-checked\)\. Gates: units,
+      TestE2E\_Physical\*, pg\_waldump VM/prune/crash\-start testport, spotcheck, sf025 99/99\. Design §"Slice 1"\.
+      - Finding: `storage\.PageAllVisible` admits LP\_DEAD items; PG refuses all\-visible while any remain
+        \(pruneheap\.c `all\_visible && lpdead\_items == 0`\)\. Ledger row; not a wrong result for the seq scan\.
+      - Next: slice 2 — `seqScanOp` reads PD\_ALL\_VISIBLE once per page under the read lock and skips
+        `TupleVisibleSubxact` \(not in recovery\); `seqScanAllVisibleDisabled` knob; equivalence test; then the Q39 A/B on
+        a private clone copy whose pages carry the bit \(VACUUM skips VM\-all\-visible pages — check whether an
+        aggressive / DISABLE\_PAGE\_SKIPPING pass exists\)\.
+    - **C47 slice 2 BLOCKED on P0\-E15 \(loop \#234\)**: the safety review found VACUUM marks pages all\-visible \(and
+      freezes\) over aborted inserts; a scan that trusts PD\_ALL\_VISIBLE would return them\. Slice 1 stays \(no reader\)\.
+      M0122\-0012 moves to another candidate until P0\-E15 is fixed; C47 does not count as a miss\.
+  - **G3 2026\-10\-28 \(loop \#235, misses 0, C47 blocked\)**: S9 census reused \(`da5ccb973`/`6818860a2` ralph/analysis
+    only\)\. Q39 HeapTuple\-return copy sized first: Q39 18\.03 Ginstr/q, ~40 instr per scanned tuple over a few M inventory
+    tuples ≈ 0\.5–1 % — not attempted\. Profiles at `44fbe565b` \(`tmp/g3\-235/q\{72,10\}\.data`\): DS Q72 is nbtree descents
+    \(isPostingRaw 10 %, compareFixedPrefix 10 %, readItemID 8 %, findChildBlockDirect 8 %\) — PG\-equivalent work after
+    C18/C36/C37; DS Q10 is the scan: `seqScanOp\.Next` 23\.4 %, `PageGetHeapTupleNoCopy` 12\.2 % \(90 % on
+    `return parseHeapTupleAlias\(\.\.\.\)` — the ~80\-byte HeapTuple copied out of two non\-inlined calls, half of it a
+    store\-forwarding stall on the first 16\-byte reload\), `seqScanOp\.Next`'s call line 29 % of its share\.
+    - C48: fetch the heap tuple in place — `storage\.PageGetHeapTupleNoCopyInto\(p, slot, \*HeapTuple\)` fills the caller's
+      tuple field by field \(PageGetHeapTupleNoCopy becomes its wrapper\), and `seqScanOp` passes its own tuple\. PG:
+      heapgettup\_pagemode / heap\_getnextslot set `tuple\->t\_data` and `t\_len` in the scan descriptor's HeapTupleData
+      \(heapam\.c\), no struct copy\.
+    - **Target \(C48\)**: TPC\-DS SF0\.25 **Q10**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `6818860a2`\)\. Bar: −3 %; predicted ~4 %\.
+    - **C48 LANDED BELOW THE BAR \(slice 119\)**: `storage\.PageGetHeapTupleNoCopyInto` / `parseHeapTupleAliasInto` fill
+      the caller's tuple; the by\-value forms wrap them; `seqScanOp\.Next` passes a stack tuple \(does not escape\)\. Q10
+      6\.683/6\.715 → 6\.540/6\.541 Ginstr/q = **−2\.37 %, misses the 3 % bar**; warm wall 0\.294 → 0\.262 s \(−10\.9 %\), user
+      CPU −10 % — the share was mostly the store\-forwarding stall, which instructions barely count\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestPageGetHeapTupleNoCopyIntoReusesTuple`\. Design:
+      part 11 §119\. **Miss counter 1\.** Lesson: a stall\-shaped share \(samples on one store after a return, or a first
+      touch\) needs a wall\-time Target on an idle host\.
+  - **Return 2026\-10\-28 \(loop \#238, after the M0122\-0013 yield; misses 0\)**: fresh G1/G2 census
+    `analysis/m0122/m0122\-0012/census\-20261028b/` at `6a2f5b0e1` \(top 10: DS Q14 3376, DS Q23 1861, H Q18 1000, H Q13 890,
+    DS Q72 849, H Q17 720, DS Q78 494, DS Q39 456, DS Q47 449, DS Q59 441 ms; DS Q10 left the top 10\)\. G3:
+    - DS Q14 at HEAD \(`tmp/g3\-238/q14\.data`\): the in\-place heap fetch for index scans \(candidate \(a\)\) is no longer
+      visible \(< 1\.2 %\) — not attempted; `bufmap\.Lookup` 4\.3 % is 78 % on the first load of the hash bucket \(a cache
+      miss PG's BufTableLookup pays too\); `parseHeapTupleAliasInto` 5\.8 % first touch; nbtree ~19 % PG\-equivalent\.
+    - DS Q47 \(`tmp/g3\-238/q47\.data`\): sort compares — `cmpbody` 5\.8 % \(3\.7 % inside `sort\.symMerge\_func`, Go's
+      O\(n log² n\) stable merge\), `lessKeyVals` 3\.5 %, `trimStringDatum` 3\.4 % \(bpchar keys, as PG's per\-compare
+      bcTruelen\)\. Sort\-algorithm mechanisms are on the Below\-bar list \(pdqsort, SortStableFunc, buffered stable
+      merge sort: Q67 −3 % instructions but \+2\.6 % cycles\)\.
+    - Remaining lever across Q59 / H Q18 / Q23 / Q14: C13, the recursive 48\-byte Datum return \(design\-sized; needs a
+      slice\-sized first step with a design doc, wall Target\)\.
+    - C50 \(C13 first slice, loop \#239\): DS Q59 at HEAD \(`tmp/g3\-239/q59\.data`\): `evalFastExpr` 21\.6 %, `applyAgg` 7\.0 %,
+      `evalFastCase` 6\.4 % \(35 % on the WHEN evaluation, 19 % on `return evalFastExpr\(…, ci\.els, …\)` for the constant
+      `ELSE NULL`\), `aggEvalList` 3\.7 %\. Six of the seven CASE aggregates per row fail their WHEN and return the NULL ELSE,
+      each through 48\-byte Datum returns\. Slice: the searched\-CASE WHEN consumes a comparison's result as a bool through
+      `fastComparisonBool` \(evalFastExpr's two in\-place comparison branches factored out, shared by both callers\), and a
+      constant THEN/ELSE result is returned without re\-entering the evaluator\. PG: EEOP\_JUMP\_IF\_NOT\_TRUE reads the
+      comparison step's bool result in place; EEOP\_CONST writes the constant directly \(execExprInterp\.c\)\.
+    - **Target \(C50\)**: TPC\-DS SF0\.25 **Q59**, metric **warm wall time** \(`tools/ds\-warm\.sh <bin> 59 2 59`, 6 rounds
+      alternating, median, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~4 %\.
+    - **C50 LANDED BELOW THE BAR \(slice 121\)**: `fastComparisonBool` \(evalFastExpr's two in\-place comparison branches,
+      shared\) feeds evalFastCase's searched WHEN as a bool; `evalFastCaseResult` returns constant arms directly\. Q59 warm
+      wall median 0\.818 → 0\.816 s = **−0\.24 %, misses the 3 % bar**; instructions 11\.075 → 10\.788 G \(−2\.6 %\)\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test: `TestCaseCompiledMatchesInterpreted` \+2 cases \(an
+      inverted bool gives 11 mismatches\)\. Design: part 11 §121\. **Miss counter 1\.** Lesson: call/return overhead
+      shows in instructions, not wall — check before naming a wall Target\.
+  - **G3 2026\-10\-28 \(loop \#240, misses 1\)**: S9 `routing\-20261028l` exhausted\. TPC\-H Q17 at `d6476dbc4`
+    \(`tmp/g3\-240/h17\.data`\): `seqScanOp\.Next` 10\.2 % — 32 % of it in `needsDetoastPrefix` \(toast\.go:219–220, ~3\.3 % of Q17\):
+    every scanned row walks its decoded prefix for a KindToastPointer; `parseHeapTupleAliasInto` 5\.1 % \(61 % the header
+    composite store\); checksums 7\.7 % \(C19 done\); nextLazy 6\.3 %; projectOp 6\.1 %\.
+    - C51: gate the per\-row TOAST scan on the tuple's `HEAP\_HASEXTERNAL` infomask bit\. The decoder yields KindToastPointer
+      only for an external varlena \(header byte 0x01\), exactly what the bit records; goopg's writers set it from
+      `pgRowHasExternal` since 2026\-06\-26 \(the shipped corpora were loaded after\)\. PG: heap\_fill\_tuple sets
+      HEAP\_HASEXTERNAL and toast handling is guarded by `HeapTupleHasExternal\(tuple\)` \(heaptuple\.c, heapam\_handler\.c\)\.
+    - **Target \(C51\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `d6476dbc4`\)\. Bar: −3 %; predicted ~3\.3 %\.
+    - **C51 LANDED BELOW THE BAR \(slice 122\)**: `scanNeedsDetoast\(hasExternal, row, n\)` gates seqScanOp's three
+      prefix walks on HEAP\_HASEXTERNAL \(poison\-armed tests still walk and panic on a bitless TOAST pointer\)\. Q17
+      21\.242/21\.238 → 20\.612/20\.620 Ginstr/q = **−2\.94 %, misses the 3 % bar** \(not rounded\); Q1 −0\.5 %\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestScanDetoastGatedOnHasExternal`\. Design: part 11
+      §122\. **Second consecutive miss \(C50, C51\) → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-28 \(loop \#242, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`b9224032c` xlog
+    only\)\. G3: DS Q78 at HEAD \(`tmp/g3\-242/q78\.data`\) is flat — top symbol evalFastExpr 4\.1 %; interpreted sort keys
+    \(evalExprSlot under evalSortKeyValueSlot\) 0\.8 % — no ≥ 3 % mechanism\. H Q17's `parseHeapTupleAliasInto` header
+    composite store \(loop \#240 profile: 61 % of its 5\.1 %, 46 % on one `movups` store — the literal built on the stack and
+    copied into \*t\) is C48's site on a different query, so eligible\.
+    - C52: `parseHeapTupleAliasInto` writes the header fields straight into `\*t` \(no composite temporary, no 16\-byte
+      reload of narrower stores\)\. PG: heapgettup fills HeapTupleData's fields in place and reads the header through the
+      `t\_data` pointer \(HeapTupleHeaderGetRawXmin etc\.\), no copy\.
+    - **Target \(C52\)**: TPC\-H SF1 **Q17**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 17`, pass\-2
+      elapsed, 6 alternating rounds, median, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %;
+      predicted ~3 % \(stall\-shaped share, per the C48 lesson\)\.
+    - **C52 MEASURED AND DROPPED \(loop \#242\)**: implemented \(header fields stored one by one into `\*t`, a field\-count
+      guard in the reuse test\)\. Q17 warm wall 6 alternating rounds: median 1\.635 → 1\.625 s = **−0\.6 %, misses the 3 %
+      bar**; instructions 20\.590 → 20\.500 G \(−0\.44 %\)\. The 46 % on one `movups` was skid attribution of the tuple's
+      first touch, not a removable store\-forwarding cost\. Code reverted\. **Miss counter 1\.**
+      - Lesson: a single hot store right after a function's loads can be the skid of a cache miss on the source bytes;
+        check whether the source line is the first touch \(here `raw\[22\]` on line 529\) before calling it a stall\.
+  - **Generate pass 2026\-10\-28 \(loop \#246, misses 0\)**: S9 census reused \(`844eec2a6` ralph/analysis only\)\.
+    - **Rotation rule applied:** C50 \(−0\.24 % wall\), C52 \(−0\.6 % wall\), C53 \(−2\.2 % instructions\) are three consecutive
+      misses in one mechanism family — eliminating 48\-byte Datum / struct by\-value copies \(CASE result as a bool, the
+      tuple\-header store, numeric operands by value; C48/C49 before them too\)\. The family goes on the Below\-bar list;
+      C13\-style slices are ineligible until a later census shows a single copy site ≥ 3 %\.
+    - H Q18 group\-table presizing \(PG's build\_hash\_tables nbuckets from numGroups\): Go map growth is only
+      `uncheckedPutSlot` 0\.56 % \+ `split` 0\.18 % of Q18 \(`tmp/g3\-231/h18i\.data`\); the 11 % mapaccess is the first\-touch
+      stall PG pays too — not attempted\.
+    - State of the top 10 \(census\-20261028b\): copy family \(Below\-bar\), sort family \(Below\-bar\), first\-touch \+ nbtree
+      descents and map\-slot stalls \(PG\-equivalent work at a larger constant\), Q39 per\-tuple visibility \(C47, blocked on
+      P0\-E15\)\. EXHAUSTED is not met — Q39's lever is blocked, not Below\-bar — and no slice\-sized candidate remains\. The
+      only unexplored family is the hash\-table structure \(H Q13 / H Q18; one miss, C44\): design\-sized \(a PG\-style
+      simplehash for the int lane, simplehash\.h / TupleHashTable\)\.
+    - > **ADVISORY 2026\-10\-28 \(owner\):** placing P0\-E15 unblocks C47 \(Q39, ~4 % predicted\); otherwise M0122\-0012's
+      > next generate pass is the int\-lane simplehash design\. The loop continues per the rules; no decision is required
+      > to proceed\.
+  - **Return 2026\-10\-28 \(loop \#245, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`e5cad94b5` xlog only\)\.
+    G3: H Q1 re\-profiled at HEAD — `fastNumericArith` 10\.0 % self \(the 48\-byte operands passed by value into it and on
+    into numericAdd/Sub/Mul\), numericMul 2\.6 %, numericSub 1\.7 %\. An in\-place int64 lane there \(C54\) is C53's code site
+    and PG function on the same query — ineligible on Q1 by the Below\-bar key; no other top\-10 query is
+    arithmetic\-heavy\. Rows census \(G3's algorithmic\-gap check\) on DS Q14, Q23, Q72 at HEAD: no algorithmic gap — Q72's
+    inventory probe emits the same rows as PG \(next node loops 21593 = PG\); the apparent 20× is EXPLAIN ANALYZE
+    accounting → filed **M0122\-0021**\. Q44's Sort under WindowAgg drains 8912 rows vs PG's 11 \(run\-condition stop,
+    ledgered M0146\-0005dn; not a top\-10 query\)\. No qualifying candidate this pass; misses stay 0\.
+  - **Generate pass 2026\-10\-28 \(loop \#247, misses 0\)**: S9 census reused \(`569c3b7af` ralph only\)\. H Q18 at
+    `6a2f5b0e1` \(`tmp/g3\-231/h18i\.data`, instructions:u\): `runtime\.mapaccess1\_fast64` **11\.1 %** \(10\.0 % under
+    `aggregateOp\.Open`: the IN\-subquery's `GROUP BY l\_orderkey` int lane\) \+ `memhash64` 1\.1 %\. The HammerDB load
+    writes each order's lineitems together, so ~6 M input rows feed ~1\.5 M groups in runs of ~4 equal keys; each run's
+    later rows pay a full Go\-map hash and probe for the group the previous row already found\.
+    - C55: the int lane remembers the previous row's key and group and skips the map when the key repeats\. Not a PG
+      mechanism — PG's LookupTupleHashEntry \(execGrouping\.c, simplehash\.h\) hashes every row, at murmurhash32 \+
+      linear\-probe cost; this removes a goopg\-only per\-row cost \(Go's map hash and swiss probe\) for the clustered
+      case\. Precedent: C24 \(same idea in Q67's rollup drain, −0\.4 % there; a different site and query, so eligible\)\.
+      Values, group order and plans are unchanged: the memo only returns the group the map would return\.
+    - **Target \(C55\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q18\.sql`, 3 runs × 2 alternating, fresh A/B vs `569c3b7af`\)\. Bar: −3 %; predicted ~6 % \(three
+      quarters of the 12 % map share, less the first\-touch lookups that remain\)\.
+    - **C55 MEASURED AND DROPPED \(loop \#247\)**: implemented \(`lastIK`/`lastIG` in the int lane, an
+      `aggIntMemoDisabled` knob, `TestAggregateIntLaneMemoMatchesMap` — memo vs per\-row map vs string path over runs,
+      a returning key and mid\-stream NULL/fraction demotion; mutation\-checked\)\. Q18 38\.476/38\.438 → 38\.079/38\.090
+      Ginstr/q = **−1\.0 %, misses the 3 % bar** \(host load 0\.8\)\. The memo fired: ~0\.39 G saved ≈ 4\.5 M repeated rows ×
+      ~85 instructions per Go\-map lookup\. Code reverted\. **Miss counter 1\.**
+      - Lesson: an `instructions:u` *sampled* profile is not an instruction census — the PMI skids onto the
+        instruction after a long\-latency load, so a cache\-missing `mapaccess1\_fast64` drew 11 % of samples for ~1–2 %
+        of the instructions \(6 M lookups × ~85 = 0\.5 G of 38 G\)\. Size an instruction Target from
+        lookups × instructions\-per\-call \(or `perf stat` on a micro A/B\), not from the sampled share; the same skid
+        made C52's `movups` look hot\. The 11 % is stall time — the first touch of each of 1\.5 M groups, which PG's
+        simplehash pays too — so only a wall Target could see a structural table change\.
+  - **Generate pass 2026\-10\-28 \(loop \#248, misses 1\)**: S9 census reused \(`2ba95c383` ralph only\)\. DS Q47 at HEAD,
+    **cycles:u** \(`tmp/g3\-248/q47c\.data`\): `cmpbody` 11\.4 % \(55 % of it under `sortChunk`'s comparator, 15 % merge\-join
+    `bufferGroup`, 13 % the in\-memory run merge, 13 % Gather Merge\), `lessKeyVals` 6\.4 %, the sort closure 1\.9 %\. The CTE's
+    parallel Sort orders ~50 K rows per worker by \(i\_category, i\_brand, s\_store\_name, s\_company\_name, d\_year, d\_moy\);
+    every compare walks perm → keyvals\[p\] → \[\]Datum → string bytes, key by key\.
+    - C56: an abbreviated leading key for a character\-string first sort key — the first 8 bytes big\-endian in a uint64
+      per row, computed once before the sort; the comparator decides on the abbreviations when they differ and falls
+      back to the full comparison when they tie\. PG: `varstr\_abbrev\_convert` / `varstrcmp\_abbrev` installed by
+      `varstr\_sortsupport` \(varlena\.c\) and used through `ApplySortComparator` on `SortTuple\.datum1` \(tuplesort\.c\);
+      goopg's text order is byte order \(the C collation\), so the abbreviation is exact when it differs\. Not a
+      sort\-algorithm swap \(the Below\-bar sort family\): same algorithm, same comparisons, cheaper decided ones\.
+    - **Target \(C56\)**: TPC\-DS SF0\.25 **Q47**, metric **instructions:u per query** \(`tools/ds\-instr\.sh <bin> 47 3`, 2
+      alternating rounds, fresh A/B vs `2ba95c383`\)\. Bar: −3 %; predicted ~4 % \(the key\-1\-decided share of ~15 %\)\.
+    - **C56 MEASURED AND DROPPED \(loop \#248\)**: implemented \(`sortOp\.abbrevLeadingKey` → per\-row `\{v uint64, ok\}`;
+      `sortChunk`'s comparator decides on differing abbreviations, else `lessKeyVals`; a `sortAbbrevDisabled` knob;
+      `TestSortAbbrevLeadingKeyMatchesFullCompare` — long shared prefixes, prefix strings, empty, NULL, UTF\-8, bpchar,
+      ASC/DESC × NULLS FIRST/LAST, multi\-key; an inverted abbreviated order fails it\)\. Q47 15\.253/15\.225 →
+      15\.154/15\.151 Ginstr/q = **−0\.55 %, misses the 3 % bar**\. Code reverted\. **Second consecutive miss \(C55, C56\) →
+      one\-task yield** \(Yield record\)\.
+      - Lesson: the leading key i\_category has ~10 values, so most compares tie on it and still walk every key; an
+        abbreviation pays only when key 1 is high\-cardinality\. Before sizing a comparator lever, estimate the
+        decided\-at\-key\-1 fraction from the key's distinct count, not from the comparator's share\.
+  - **Generate pass 2026\-10\-28 \(loop \#250, misses 0, returning from yield \#248\)**: S9 census reused \(`9393a2b29`
+    xlog/cmd only\)\. **cycles:u** G3 at HEAD \(`tmp/g3\-250/h13\.data`, `h18\.data`\)\. H Q18 is one serial build: the
+    IN\-subquery `HashAggregate` over lineitem runs 3661 ms in the shared hash prebuild, the workers 150 ms\. Samples
+    whose scan sits directly under that aggregate: `decodeRowRangeInfo` 1989, `NumericInt64FromStoredPayload` 1712,
+    `decodePhysicalPGValueLowered` 851, `NewTimeDatum` 561, `decodePhysicalPGVarlena` 395 — 5508 of 26138 \(21 %\)\.
+    HammerDB's lineitem order is l\_shipdate, l\_orderkey, l\_discount, l\_extendedprice, l\_suppkey, l\_quantity, …: the
+    aggregate's prefix bound \(attrs 0–5\) decodes a date and five NUMERICs \(each a payload → int64 conversion\) to use
+    two\. Only a Project above a scan sets its read set \(`markProjectScanReads`, slice 19\); an Aggregate does not\.
+    - C57: a plain or partial Aggregate directly over a SeqScan \(or Filter over one\) gives the scan its read set —
+      `deformScanReadSet` over `aggConsumerExprs`, merged with the absorbed qual by `skipReadSet` — in
+      `buildCompleteChild`\. PG: the aggregate's input expressions fetch only the attributes they reference
+      \(ExecBuildAggTrans → EEOP\_SCAN\_FETCHSOME; slot\_deform\_heap\_tuple leaves by\-reference values as pointers, so an
+      unreferenced NUMERIC costs PG no conversion\)\. Same mechanism as C22 \(dropped on H Q17, where a Project already
+      narrowed the scan\) on a different query — eligible\.
+    - **Target \(C57\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q18\.sql`, 3 runs × 2 alternating, fresh A/B vs `9393a2b29`\)\. Bar: −3 %; predicted ~8 % \(about
+      three fifths of the 21 % decode share: one date and three NUMERIC conversions of six decoded columns\)\.
+    - **C57 LANDED \(slice 124\)**: `buildCompleteChild` builds a `SeqScan` \(or a `Filter` absorbed into one\) through
+      `buildCompleteScan`, which sets the scan's `readCols` from the consumers \(`deformScanReadSet`\); `skipReadSet` adds
+      the qual's columns\. Q18 38\.501/38\.440 → 32\.324/32\.326 Ginstr/q = **−16\.0 %, meets the bar**; Q1 −4\.5 %; Q18 warm
+      wall 3\.68 → 3\.38 s median; sf025 sweep total −11\.5 % with plans 99/99 same\. Gates: units, spotcheck, acceptance 24
+      MATCH, sf025 PASS=99, TestPort\_RegressSuite PASS\. Test `TestAggScanReadSetMatchesFullDecode` \(narrowing to the first
+      consumer fails it\)\. Design: part 11 §124\. **Misses 0\.**
+      - Residual \(ledgered\): scans under other parents \(a hash join's build side outside an aggregate chain, WindowAgg,
+        SetOp\) still decode the bound's whole prefix; PG fetches only referenced attributes under any parent\.
+  - **G3 pass 2026\-10\-28 \(loop \#251, misses 0\)**: S9 fresh census `routing\-20261028o` at `c9acfdee9` \(22/22,
+    99/99, 99/99; nothing filed\)\. **cycles:u** at `c9acfdee9`, decode samples attributed by the scan's parent operator
+    \(`tmp/g3\-250/c57\-\*\.data`\): H Q13 9\.3 % and H Q17 19\.7 % \+ 3\.4 %, all under narrowing Projects or a bitmap fetch; DS
+    Q14 8\.8 % \(index probes already skip unread columns — `skipColumnRun` present, no NUMERIC conversion\), Q23 7\.9 %
+    \(under Projects\), Q72 1\.7 %, Q39 6\.1 % \(the inventory probe reads all four columns\)\. The C57 follow\-up \(other
+    parents\) has no ≥ 3 % instance in the top 10: what decodes now is read\. Q14's next leaves are first touches PG pays
+    too \(`parseHeapTupleAliasInto`, `bufmap\.Lookup`, `PagePruneXIDSet` = the pd\_prune\_xid read heap\_page\_prune\_opt
+    makes\) and nbtree descents\. H Q13's 17\.5 % `mapaccess1\_fast64` \(66 % hash\-join probe, 29 % group lookup\) is the
+    hash\-table structure family \(simplehash design, wall Target only\)\. **No qualifying candidate; not a miss\.**
+    - Next pass: refresh G1 \(C57 moved Q18/Q1; census\-20261028b ranks are stale\) and re\-evaluate EXHAUSTED — blocked
+      only by C47 \(Q39, blocked\-on P0\-E15\) and the hash\-table structure family\.
+  - **Return / generate 2026\-10\-28 \(loop \#252, misses 0\)**: S9 census `routing\-20261028o` reused \(`efe44c909` ralph
+    only\)\. Fresh G1/G2 census `analysis/m0122/m0122\-0012/census\-20261028c/` at `c9acfdee9` \(top 10 by excess: DS Q14
+    3409, DS Q23 2109, DS Q72 926, H Q13 910, H Q17 700, H Q18 530, DS Q78 480, DS Q39 471, DS Q47 457, H Q10 440; DS Q7's
+    sweep median 1016 ms is the in\-sweep server\-age artefact — warm on a fresh server it runs 110 ms vs PG 104, so it is
+    not ranked\)\. G3 \(cycles:u\) on the new entrant H Q10 \(`tmp/g1\-252/h10\.data`\): the lineitem probe scan's qual
+    `l\_returnflag = 'R'::bpchar` is ~18 % of the query \(`evalFastExpr` 1627, `evalQual` 489, `evalFastBinaryApply` 457,
+    `fastComparisonBool` 140 of 15318 samples\) over 6 M rows\. Cause: the EARLY scan qual runs over
+    `rowSlotView\(o\.scanRow\)`, and `fastOperandPtr` resolves a column in place only for `\*MaterializedSlot` — so both of
+    `fastComparisonBool`'s in\-place branches \(typed `fastCompareDatum`, slice 89's plain\-string compare\) are skipped for
+    EVERY early scan qual and each row copies its operands through `evalFastBinaryApply`\. A sibling\-path gap:
+    evalFastExpr's ColumnRef arm already serves `rowSlotView`\.
+    - C58: `fastOperandPtr` gains the `rowSlotView` arm \(`&s\[colIdx\]`, bounds as the MaterializedSlot arm\)\. PG: the
+      scan qual reads the scan slot's `tts\_values` in place \(EEOP\_SCAN\_VAR feeding the comparison's fmgr call,
+      execExprInterp\.c\); no operand copy\.
+    - **Target \(C58\)**: TPC\-H SF1 **Q10**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q10\.sql`, 3 runs × 2 alternating, fresh A/B vs `efe44c909`\)\. Bar: −3 %; predicted ~6 % \(about a
+      third of the 18 % qual share\)\.
+    - **C58 LANDED \(slice 125\)**: `fastOperandPtr` reads an in\-range `rowSlotView` column in place\. Q10
+      24\.300/24\.296 → 22\.462/22\.446 Ginstr/q = **−7\.6 %, meets the bar**\. Gates: units, spotcheck, acceptance 24 MATCH,
+      sf025 PASS=99 with plans 99/99 same, TestPort\_RegressSuite PASS\. Tests `TestEarlyScanQualInPlaceMatchesLate`
+      \(a wrong\-column arm fails it\) and the updated `TestOperandPtrReadsInPlace` / `TestOuterRefCompiledMatchesInterpreted`
+      \(the general path is now driven by an identity `\*VirtualSlot`\)\. Design: part 11 §125\. **Misses 0\.**
+  - **G3 pass 2026\-10\-28 \(loop \#253, misses 0\)**: S9 fresh census `routing\-20261028p` at `5463cb473` \(22/22, 99/99,
+    99/99; nothing filed\)\. **cycles:u** at `5463cb473` \(`tmp/g3\-253/`\) on DS Q78, DS Q47 and H Q17, plus the share of
+    the general/interpreted evaluator \(`evalExprSlot`, `evalBinary`, `evalFastBinaryApply` self\) by caller — under 1 %
+    everywhere after C58, so no other operator misses the compiled/in\-place paths at scale\. DS Q78 is flat \(top symbol
+    `evalFastExpr` 3\.9 %\); DS Q47 is the sort family \(Below\-bar; C56 dropped\); H Q17 is `skipColumnRun` 7\.9 % \+
+    `decodeRowRangeInfo` 7\.6 % — the walk over HammerDB's varlena NUMERIC prefix that PG's slot\_deform\_heap\_tuple also
+    makes \(att\_addlength\_pointer per attribute\) — plus checksums and first touches\. **No qualifying candidate; not a
+    miss\.**
+    - Next generate pass: the hash\-table structure family is the only unexplored one in the top 10 \(H Q13
+      `mapaccess1\_fast64` 17\.5 % of cycles: 66 % hash\-join probe, 29 % group lookup; C44 and C55 are its two misses so
+      far\)\. Design\-sized: write the int\-lane open\-addressing table design \(PG simplehash\.h, ExecScanHashBucket\) and
+      take its first slice with an H Q13 **wall** Target on an idle host\.
+  - **Generate 2026\-10\-28 \(loop \#254, misses 0\)**: S9 census `routing\-20261028p` reused \(`b5bd577ed` ralph only\)\. Sizing
+    first \(calls × per\-call cost, the C55 lesson\): a micro\-benchmark at Q13's shape \(150 K int keys, 1\.5 M random probes\)
+    runs Go's `map\[int64\]\[\]Row` at ~45 ns per probe and a flat linear\-probe table at ~11 ns \(`/tmp/c59bench`\)\. Q13 is
+    fully serial \(Hash Right Join probing customer with 1\.48 M orders rows, then the c\_custkey HashAggregate\); its probe
+    `mapaccess1\_fast64` is ~11\.6 % of ~0\.94 s CPU per query \(~73 ns per probe in situ\), on the critical path\.
+    - C59 \(slice 1 of the int\-lane simplehash design, `docs/design/0100\-0149/0122\-0012\-c59\-int\-lane\-open\-addressing\.md`\):
+      the hash join's int\-lane probe reads a flat open\-addressing index built from `lazyIntHash` \(entries `\{key, rows\}`,
+      power\-of\-two capacity, load ≤ 2/3, Fibonacci hash, linear probe\); the map stays the source of truth for every
+      other site, and the index is rebuilt whenever the current map is not the one it was built from or its length
+      changed\. PG: the hash join's bucket array probed by `ExecScanHashBucket` \(nodeHash\.c\) and simplehash\.h's linear
+      probing for TupleHashTable — one array slot per probe, no control\-word group\.
+    - **Target \(C59\)**: TPC\-H SF1 **Q13**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 13`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~6–8 % \(70 % of
+      the 11\.6 % probe share\)\.
+    - **C59 LANDED \(slice 126, design slice 1\)**: `joinOp\.intProbeRows` reads `intProbeIndex`, a flat `\{key, rows\}`
+      linear\-probe array frozen from `lazyIntHash` \(rebuilt when the map's identity or length changes; > 2^20 keys keep
+      the map\)\. Q13 warm wall 1\.725 → 1\.665 s median = **−3\.5 %, meets the bar** \(faster in all 6 alternating rounds\);
+      instructions 11\.419/11\.414 → 11\.393/11\.392 G \(−0\.2 %\)\. Gates: units, spotcheck, acceptance 24 MATCH, sf025
+      PASS=99 with plans 99/99 same \(the sweep's \+20 % vs the C58 gate sweep is host variance: flat against the census
+      sweep, Q74/Q14 instructions flat\), TestPort\_RegressSuite PASS\. Tests `TestIntProbeIndexMatchesMap`,
+      `TestIntProbeIndexJoinsMatchMap` \(mutation\-checked: freshness guard, collision probing\)\. **Misses 0\.**
+      - Next in the family \(design §Later slices\): the hashed aggregate's int lane \(`igroups`, the other 29 % of Q13's
+        map share; H Q18\)\.
+  - **C59 slice 2 2026\-10\-28 \(loop \#255, misses 0\)**: S9 fresh census `routing\-20261028q` at `b0f3750d3` \(22/22, 99/99,
+    99/99; nothing filed\)\. Sizing \(cycles:u at `b0f3750d3`, `tmp/g3\-255/`\): the hashed aggregate's int\-lane map
+    \(`mapaccess1\_fast64` \+ `mapassign\_fast64` \+ `memhash64` under `aggregateOp\.Open`\) is **10\.8 %** of H Q18 \(the serial
+    IN\-subquery aggregate, 1\.5 M groups over 6 M lineitem rows\) and 6\.3 % of H Q13\.
+    - C60 \(design slice 2\): `igroups` becomes `intGroupTable` — interleaved `\{key, \*groupRuntime\}` entries,
+      power\-of\-two capacity, load ≤ 2/3 with doubling rehash, Fibonacci hash, linear probe — owned by the aggregate
+      \(inserts and lookups interleave, so a real table, not a frozen view\)\. PG: the hashed aggregate's TupleHashTable
+      is a simplehash\.h array \(`LookupTupleHashEntry`, execGrouping\.c; `build\_hash\_tables`\)\.
+    - **Target \(C60\)**: TPC\-H SF1 **Q18**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 18`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~5 % \(half of
+      the 10\.8 % share\)\.
+    - **C60 LANDED \(slice 127, design slice 2\)**: `intGroupTable` replaces `igroups`\. Q18 warm wall 3\.875 → 3\.75 s median
+      = **−3\.2 %, meets the bar** \(rounds overlap: host ran Q18 at 3\.57–4\.64 s\); supporting, load\-insensitive: user cycles
+      13\.87 → 12\.92 G median \(−6\.9 %, lower in all 3 rounds\), instructions 32\.35 → 31\.72 G \(−2\.2 %\); Q13 wall flat\.
+      Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 plans 99/99 same, TestPort\_RegressSuite PASS\. Tests
+      `TestIntGroupTableMatchesMap`, `TestAggregateIntGroupTableMatchesMap` \(mutation\-checked\)\. **Misses 0\.**
+      - Next in the family: design slice 3 \(replace `lazyIntHash` and `lazyMatchedI`; H Q13's residual
+        `mapaccess1\_fast64` under `nextLazy`/`fillSweepNext` is ~3\.3 %\) — size before attempting\.
+  - **G3 pass 2026\-10\-28 \(loop \#256, misses 0\)**: S9 fresh census `routing\-20261028r` at `5a89cc5f5` \(22/22, 99/99,
+    99/99; nothing filed\)\. **cycles:u** on DS Q14 \(`tmp/g3\-250/c57\-ds14\.data`\) and DS Q23 at HEAD \(`tmp/g3\-256/ds23\.data`\),
+    allocation / copy / hash symbols attributed by caller:
+    - Q14: nbtree descents and heap first touches \(PG\-equivalent\); `memmove`/`memclr` callers each ≤ 1\.1 % \(lateral
+      inner copy, the Gather queue row clear, decode clears — the copy family is Below\-bar\)\.
+    - Q23: the multi\-key GROUP BY's serialised string keys \(`mapaccess2\_faststr` 1\.76 %, `aeshashbody` 1\.68 %,
+      `appendGroupColKey` memmove 0\.64 %, `mapassign\_faststr` 0\.24 % — ~4\.3 %\) = pool item C41 \(typed composite keys,
+      PG TupleHashTable\)\. A typed table still hashes and compares the keys, so it removes perhaps half to two thirds:
+      predicted ~2–2\.6 %, below the bar\. Everything else ≤ 1\.2 %\.
+    - **No qualifying candidate; not a miss\.** The estimate\-sized group table \(ledgered\) sizes at ~1\.6 % of Q18 \(rehash
+      moves ≈ 2 × 1\.5 M entries\) — below the bar too\.
+  - **G3 pass 2026\-10\-28 \(loop \#257, misses 0\)**: S9 census `routing\-20261028r` reused \(`b5203895b` ralph only\)\.
+    **cycles:u** at `5a89cc5f5` \(`tmp/g3\-257/`\):
+    - DS Q72: nbtree only — `isPostingRaw` 13\.3 % \(11 % in `scanLeafItems` under the skip enumerator: the first touch of
+      each leaf tuple\), `readItemID` 9\.1 %, `compareFixedPrefix` 9\.0 %, `bufmap\.Lookup` 5\.6 %, descents 5\.5 %, `Pin` 5\.2 %\.
+      Slice 76 already matched the search count \(862 K cursors vs PG's 898 676 Index Searches over the same 2185 loops\):
+      the excess is PG\-equivalent descent and leaf work at a larger constant per descent\.
+    - DS Q39: scan, int\-lane join probe and Gather copy, each ≤ 6\.8 %; its one ≥ 3 % lever is C47 \(blocked\-on P0\-E15\)\.
+    - **No qualifying candidate; not a miss\.**
+    - Finding \(ledgered\): goopg's EXPLAIN ANALYZE omits PG 18's per\-index\-node `Index Searches: N` line
+      \(explain\.c show\_indexsearches\_info\), which is why the search\-count comparison needed a code dive\.
+    - > **ADVISORY 2026\-10\-28 \(loop \#257\):** after C57–C60 the top\-10 excess is nbtree descents, heap first touches and
+      > copy/clear sites at a larger constant than PG, plus three predicted\-below\-bar items \(C41 Q23 ~2–2\.6 %, C59 slice 3
+      > Q13 ≤ 3\.3 %, estimate\-sized group table Q18 ~1\.6 %\) and the blocked C47 \(Q39\)\. EXHAUSTED's wording \("attributed
+      > to Below\-bar mechanisms"\) cannot be met while C47 is blocked and the predicted\-below\-bar items were never
+      > attempted, so each loop re\-runs a G3 pass that files nothing\. Placing P0\-E15 \(unblocks C47\) or ruling on whether
+      > predicted\-below\-bar candidates count as Below\-bar would end the cycle\. The loop continues per the rules\.
+  - **G1/G2 refresh 2026\-10\-28 \(loop \#258, misses 0\)**: census `analysis/m0122/m0122\-0012/census\-20261028d/` at
+    `5a89cc5f5` \(host load 6–10\.5 from an unrelated workload — ranking input only\)\. Top 10: DS Q14 3934, DS Q23 2614, DS
+    Q72 1163, H Q13 1100, H Q17 780, DS Q47 699, DS Q78 634, DS Q67 556, DS Q39 546, DS Q59 490 ms \(DS Q7 not ranked: the
+    in\-sweep artefact\)\. H Q18 and H Q10 left after C57–C60; DS Q67 and DS Q59 entered\. G3 on the entrants:
+    - DS Q59 \(cycles:u, `tmp/g1\-258/ds59\.data`\): `fastComparisonBool` 8\.0 % self \(6\.0 % under `aggEvalList` — the seven
+      `CASE WHEN d\_day\_name = '<day>'` arms already take the in\-place plain\-string branch\), `evalFastCase` 5\.7 %\. Pool
+      item C40 \(pre\-decide the constant side's plain/trim test at compile time, `==` for `=`/`<>`\) sized by calls ×
+      per\-call cost: ~5 M comparisons × ~25 instructions ≈ 1 % of Q59's ~10\.8 G instructions, ~2\.5 % of cycles — below
+      the bar\. PG's bpchareq trims both sides per call too\.
+    - DS Q67: the sort family \(Below\-bar\)\.
+    - **No qualifying candidate; not a miss\.**
+  - **C59 slice 3a 2026\-10\-28 \(loop \#259, misses 0\)**: S9 census `routing\-20261028r` reused \(`13336ab8a` analysis
+    only\)\. H Q13's residual map share after slice 1 \(`tmp/g3\-255/h13\.data`\): `mapaccess1\_fast64` under `nextLazy` 2\.7 %
+    and `fillSweepNext` 0\.6 %, `mapassign\_fast64` 0\.6 % — the right join's matched flags: `matchedIntBucket` looks
+    `lazyMatchedI\[key\]` up for every matched probe row \(~1\.48 M lookups for 150 K keys\)\.
+    - C61: the probe index entry caches its key's matched bitmap \(`intProbeEntry\.matched`, set from
+      `matchedIntBucket`'s first map access for that key\), so later matches of the key read it from the entry the probe
+      just found; `lazyMatchedI` stays the source of truth for the fill sweep and the parallel merge, and the cache is
+      cleared whenever `lazyMatchedI` is not the map it was filled from \(held, so its address cannot be reused\)\. PG keeps
+      the match bit on the build tuple itself \(`HeapTupleHeaderSetMatch` in ExecScanHashBucket's caller, nodeHashjoin\.c\)
+      — no lookup per match\.
+    - **Target \(C61\)**: TPC\-H SF1 **Q13**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 13`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~3 % \(most of the
+      ~3\.9 % map share\)\.
+    - **C61 MEASURED AND DROPPED \(loop \#259\)**: implemented \(`intProbeEntry\.matched` cache set from `matchedIntBucket`'s
+      first map access, cleared when `lazyMatchedI` is another map; tests: right/full joins incl\. correlated
+      re\-execution and a multi\-batch right join vs the map path, plus a direct reset test — the reset\-guard mutation
+      fails it\)\. Q13 warm wall 6 alternating rounds: median 1\.72 → 1\.75 s \(**\+1\.7 %, misses the bar**\); user cycles
+      8\.11/7\.70 → 7\.79/7\.82 G \(mixed\), instructions 11\.24 → 11\.17 G \(−0\.6 %\)\. Code reverted\. **Miss counter 1\.**
+      - Lesson: the matched\-bitmap lookups follow the probe of the same key, so their map slots are warm — their sampled
+        share was not a stall the entry cache could remove\. Only the cold first touch of a structure is worth moving\.
+  - **G3 rows census 2026\-10\-28 \(loop \#260, misses 1\)**: S9 census `routing\-20261028r` reused \(`c4f0fa916` ralph only\)\.
+    goopg EXPLAIN ANALYZE at `5a89cc5f5` for DS Q47/Q78/Q67/Q59/Q39 against the cached PG 18 captures \(`tmp/rowcensus/`,
+    10\-23, after the 10\-20 corpus rebuild\) with `tools/rows\-census\.py`: no node over 3× PG among the reported ones\.
+    - **But the census is half blind**: goopg reports actuals for 35 of Q14's nodes vs PG's 80, Q23 19 vs 39, Q47 9 vs 23
+      — parallel worker subtrees and CTE bodies carry no `actual` \(M0122\-0021, scope note added there\)\. The loop \#245
+      "no algorithmic gap" verdict on Q14/Q23 is therefore unproven for half their plans\.
+    - No qualifying candidate this pass; not a miss\.
+    - > **NOTE:** M0122\-0021 is the topmost open M0122 task in file order, so it is the next one\-task yield target \(after
+      > a second consecutive miss\); landing it makes the G3 rows census complete on the top two queries\.
+  - **G3 rows census by CTE body 2026\-10\-28 \(loop \#261, misses 1\)**: S9 census `routing\-20261028r` reused \(`3d6366064` ralph
+    only\)\. To see past the M0122\-0021 blind spots, each CTE body of DS Q14 and DS Q23 ran standalone on goopg \(q64\-clone,
+    `5a89cc5f5`\) and on the private release PG \(`bench/pg\-release`, :5556 — not a reference cluster\): serial EXPLAIN ANALYZE
+    for per\-node rows, plus bare wall time best of 3 \(`tmp/rc261/`\)\.
+    - Rows: identical at every reported node of `cross\_items`, `avg\_sales`, `frequent\_ss\_items`, `max\_store\_sales` and
+      `best\_ss\_customer` \(only `max\_store\_sales`' Sort reads 414 575 vs PG 404 921, PG's merge join stopping early\)\. **No
+      algorithmic gap** — the loop \#245 verdict now covers the CTE bodies too\.
+    - Wall \(goopg / PG ms\): cross\_items 694 / 294, avg\_sales 123 / 64, frequent\_ss\_items 734 / 265, max\_store\_sales
+      290 / 140, best\_ss\_customer 558 / 361 — a constant\-factor gap across seq scans, hash joins and aggregation\.
+    - `frequent\_ss\_items` by cycles: its string\-serialised 3\-key GROUP BY \(`mapaccess2\_faststr` 3\.7 %, `aeshashbody` 3\.3 %,
+      key `memmove`\) is ~8 % of the sub\-query, ~2 % of Q23 — C41's prediction stands\.
+    - goopg's EXPLAIN ANALYZE timing inflates the cross\_items body 4\.5× \(3163 ms vs 694 ms bare; M0122\-0018\) — per\-node
+      times are not comparable\.
+    - **No qualifying candidate; not a miss\.**
+  - **G3 on Q14's `cross\_items` CTE body 2026\-10\-28 \(loop \#262, misses 1\)**: cycles:u standalone \(`tmp/g3\-262/ci\.data`\)\.
+    nbtree probes into `item\_pkey` from the two nested loops \(215 K \+ 107 K probes — PG's plan makes the same\) plus heap
+    first touches; no set\-operation or hashing hot spot\. No candidate; not a miss\.
+    - > **ESCALATION 2026\-10\-28 \(loop \#262\):** six consecutive generate passes \(\#251, \#253, \#256, \#257, \#258, \#260–\#262\)
+      > found no candidate ≥ 3 % after every top\-10 query was profiled at HEAD and the top two were row\-censused in full\.
+      > The remaining excess is PG\-equivalent work at a larger constant per operation, Below\-bar families, predicted\-below\-bar
+      > items \(C40, C41, estimate\-sized table\) and the blocked C47 \(P0\-E15\)\. Further G3 passes produce no information\.
+      > Owner decision needed: place P0\-E15 \(unblocks C47\), rule that predicted\-below\-bar candidates count as Below\-bar
+      > \(which would let EXHAUSTED be written\), or redirect item 10\.
+  - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
+    `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
+    `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
+    48\-byte Datums by value\) → its interval/time/date/string preamble → `a, b := left, right` \(18\.7 % of evalBinary\) →
+    numericSub/numericMul \(46 % on those two call lines\)\.
+    - C53: the compiled binary arm calls numericAdd/numericSub/numericMul itself when both operands are non\-NULL
+      KindNumeric/KindInt with at least one KindNumeric — exactly evalBinary's arm for those kinds \(promoteIntOperand on
+      both, then the numeric function\), without its frame, by\-value copies and preamble\. PG: the operator's function
+      \(numeric\_add / numeric\_sub / numeric\_mul\) is resolved at plan time and called through fmgr directly
+      \(execExprInterp\.c EEOP\_FUNCEXPR\_STRICT\)\.
+    - **Target \(C53\)**: TPC\-H SF1 **Q1**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `822503136`\)\. Bar: −3 %; predicted ~4 %\.
+    - **C53 LANDED BELOW THE BAR \(slice 123\)**: `fastNumericArithOperands` / `fastNumericArith` in evalFastExpr's
+      simple\-binary branch\. Q1 75\.898/75\.897 → 74\.233/74\.226 Ginstr/q = **−2\.20 %, misses the 3 % bar** \(the numeric
+      functions still take and return 48\-byte Datums by value\)\. Gates: units, spotcheck, acceptance 24 MATCH, sf025
+      99/99 plans same\. Test `TestFastNumericArithMatchesEvalBinary`\. Design: part 11 §123\. **Second consecutive miss
+      \(C52, C53\) → one\-task yield** \(Yield record\)\.
+  - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
+    \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
+    o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
+    pointer\) are passed by value on every tuple, and the Snapshot query methods have value receivers\.
+    `parseHeapTupleAliasInto`'s header composite store is 52 % of its 10 % — C48's own site on Q10, ineligible \(Below\-bar\)\.
+    - C49: `transam\.TupleVisibleSubxactPtr\(\*HeapTupleHeader, \*Snapshot, …\)` as the implementation \(the by\-value form
+      wraps it for the other 15 callers\), pointer receivers on Snapshot's read\-only query methods, and the seq scan
+      calls the pointer form\. PG: HeapTupleSatisfiesVisibility\(HeapTuple htup, Snapshot snapshot, Buffer\) takes both
+      by pointer \(heapam\_visibility\.c\)\.
+    - **Target \(C49\)**: TPC\-DS SF0\.25 **Q10**, metric **warm wall time** \(`tools/ds\-warm\.sh <bin> 10 2 10`, 3 rounds
+      alternating, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~5 %\. \(Wall, not
+      instructions: the share is stall\-shaped, per the C48 lesson\.\)
+    - **C49 LANDED BELOW THE BAR \(slice 120\)**: `TupleVisibleSubxactPtr` \(the by\-value form wraps it\),
+      `seesCommittedXIDWithSubxactsPtr`, pointer receivers on six read\-only Snapshot methods; `seqScanOp\.Next` calls the
+      pointer form\. Q10 warm wall 6 alternating rounds: median 0\.265 → 0\.2575 s = **−2\.83 %, misses the 3 % bar** \(mean
+      −3\.2 %, rounds −1\.5…−5\.5 %\); instructions 6\.538 → 6\.458 G \(−1\.2 %\)\. Gates: units, spotcheck, acceptance 24 MATCH,
+      sf025 99/99 plans same\. Design: part 11 §120\. **Second consecutive miss \(C48, C49\) → one\-task yield** \(Yield
+      record\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -2935,7 +3898,90 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
+- [ ] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-10\-28 \(loop \#245\) from the M0122\-0012 G3 rows census of TPC\-DS Q72 \(SF0\.25\)\. Captures:
+    `analysis/m0122/m0122\-0021/q72\-goopg\-e5cad94b5\.explain` \(goopg, private clone\) and
+    `q72\-pg18\-tpcds025\.explain` \(PG 18\.3 `:65438`, read\-only EXPLAIN ANALYZE\)\.
+  - Symptom: under the Gather, `Index Scan using inventory\_pkey on inventory` shows no `\(actual rows=… loops=…\)` on its
+    node line and four `Worker N:  actual time=… rows=180\.66…216\.30 loops=…` lines; PG prints `\(actual rows=9\.88
+    loops=2185\)` on the node line, `Rows Removed by Filter: 191`, and no per\-worker lines \(explain\.c prints them only
+    when `es\->workers\_state && es\->verbose`, line ~1885\)\. goopg's worker rows ≈ 9\.88 \+ 191, the pre\-filter count:
+    M0122\-0017's rowsOut subtraction covers the node line only\. The next node's loops prove the filter IS applied
+    \(date\_dim d2 loops 4981\+5354\+5370\+5888 = 21593 = PG\) — a reporting gap, not extra work\.
+  - First step: in the text ANALYZE renderer, aggregate worker instrumentation onto the node line \(PG's
+    InstrAggNode / ExplainNode totals\), print `Worker N:` lines only with VERBOSE, and apply the M0122\-0017
+    attributed\-rejection subtraction to the aggregate; Rows Removed by Filter summed across workers\.
+  - Expected instrument: Q72's inventory line identical to the PG capture \(modulo timing\); regress outputs unchanged\.
+  - **Scope measured 2026\-10\-28 \(loop \#260, M0122\-0012 G3 rows census\)**: the gap blinds the rows census on the
+    largest\-excess queries\. Node lines carrying `actual` at `5a89cc5f5` vs PG 18 \(`tmp/rowcensus/`\): DS Q14 35 vs 80, DS Q23
+    19 vs 39, DS Q47 9 vs 23, DS Q59 18 vs 23\. The unreported nodes are the parallel worker subtrees \(Parallel Hash Join,
+    Parallel Hash, Gather children, Parallel Seq Scan, Partial Aggregate — this task's symptom\) and, in Q47, the whole
+    materialised CTE body \(`v1`: WindowAgg → GroupAggregate → Gather Merge → Sort … show no actuals\)\. The loop \#245
+    "no algorithmic gap" verdict for Q14/Q23 therefore covered only about half of their nodes\.
+  - Correction \(loop \#261\): the CTE\-body and InitPlan blindness holds **serially too** \(`max\_parallel\_workers\_per\_gather =
+    0`: Q14 35 vs PG 76 node lines with actuals; `CTE cross\_items` / `CTE avg\_sales` bodies and `InitPlan` subtrees print no
+    actuals\), and a Hash built before the probe reports `rows=0\.00 loops=0` with its child scan\. So this task's fix must
+    instrument CTE bodies and InitPlans as well as worker subtrees\.
+  - PG prints each node's own `\(actual … loops=…\)` everywhere, CTE bodies included \(ExplainNode recurses into
+    `planstate\->initPlan` / CTE subplans with their own Instrumentation\); goopg's CTE body nodes are built lazily outside
+    the instrumentation scope \(ledger 2026\-07\-04 M0122\-0003 rows describe the DML\-CTE variant\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
+    yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
+    \(`SetReplayPositionSource`, wired in `cmd/goopg/standby\.go`, cleared at promotion\) and fires once per replay
+    segment — PG XLogPageRead's `XLogCheckpointNeeded\(readSegNo\)` → `RequestCheckpoint\(CHECKPOINT\_CAUSE\_XLOG\)`\.
+    Before: the received WAL counted, so a lagging replay requested a restartpoint on every 1\-s poll\.
+    - Pin: `TestCheckpointerVolumeTriggerRecoveryMeasuresReplay`; FAILS when it measures the writer and when the
+      once\-per\-segment guard is dropped\.
+    - Gates: units, TestE2E\_Physical\* family, `\-race` xlog, tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): the skip arm's UpdateMinRecoveryPoint; PreallocXlogFiles; TruncateSUBTRANS on a hot standby;
+      archive\_cleanup\_command\.
+  - **Restartpoint skip arm without the flush LANDED 2026\-10\-28 \(loop \#244, the M0122\-0012 one\-task yield\)**\.
+    Movement: none — recovery path\. `runRecoveryFlush` runs `restartPointSkips` \(no replayed checkpoint, or its redo not
+    newer than pg\_control's\) before the flush and, skipping, only stamps DB\_SHUTDOWNED\_IN\_RECOVERY on shutdown — PG
+    CreateRestartPoint's skip arm returns before CheckPointGuts\. Before: every timed request on a standby with no new
+    checkpoint record flushed and synced everything\.
+    - Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` flush counts \(adopt 1, repeat 0, source\-less 0\); FAILS with the skip
+      test forced off\.
+    - Gates: units, TestE2E\_Physical\* \+ BaseBackup/Standby/Promot testport, tpch\-spotcheck, acceptance 24 MATCH, sf025 99\.
+    - Residual \(ledgered\): the standby trigger measures received WAL \(PG: replay segment\); the skip arm's
+      UpdateMinRecoveryPoint\(InvalidXLogRecPtr, true\); PreallocXlogFiles; TruncateSUBTRANS on a hot standby\.
+  - **Restartpoint moves RedoRecPtr LANDED 2026\-10\-28 \(loop \#241, the M0122\-0012 one\-task yield\)**\. Movement:
+    none — recovery path\. Found while choosing the slice: a standby's checkpointer gets `max\_wal\_size` \(main\.go\) and
+    routes to `runRecoveryFlush`, but the restartpoint never moved `lastCheckpointRedoLSN`, so the volume trigger kept
+    its start\-up anchor and — after max\_wal\_size / \(1 \+ completion target\) of received WAL — ran a full restartpoint
+    flush \+ data\-file sync on every 1\-s volume tick\. The adopted arm now stores the restartpoint's redo / record start /
+    record end \(PG CreateRestartPoint: RedoRecPtr = lastCheckPoint\.redo; pg\_control checkPoint\), re\-anchoring
+    `volumeTriggerFires` and giving a BASE\_BACKUP from the standby the last restartpoint\.
+    - Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts CheckpointRedoLSN 8193 and the record start; FAILS with
+      the stores removed \(redo 0\)\.
+    - Gates: units, TestE2E\_Physical\* \+ BaseBackup testport, tpch\-spotcheck, acceptance 24 MATCH, sf025 PASS=99\.
+    - Residual \(ledgered\): the skip arm still flushes \(PG returns before CheckPointGuts\); the standby trigger measures
+      received WAL, PG the replay segment; PreallocXlogFiles; TruncateSUBTRANS on a hot standby;
+      archive\_cleanup\_command\.
+  - **Restartpoint distance estimate LANDED 2026\-10\-28 \(loop \#237, the M0122\-0012 one\-task yield\)**\. Movement:
+    none — recovery path\. `runRecoveryFlush`'s adopted arm calls `noteRestartPointDistance\(priorRedo, redo\)` before the
+    retainer: PG CreateRestartPoint's `UpdateCheckPointDistanceEstimate\(RedoRecPtr \- PriorRedoPtr\)` with PriorRedoPtr =
+    pg\_control's checkPointCopy\.redo before the update \(`adoptRestartPointPrior` reports it\), so the restartpoint's WAL
+    removal sizes its recycled spares from the standby's own redo cadence; a first restartpoint after a start measures
+    too\. The adopted redo becomes priorRedoLSN for the first checkpoint after a promotion\.
+    - Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` now asserts the estimate is 8192 − 16 after the restartpoint and
+      unchanged by a source\-less flush; FAILS with the call removed \(estimate 0\)\.
+    - Gates: units, TestE2E\_Physical\*, tpch\-spotcheck, acceptance 24 MATCH, sf025 PASS=99\.
+    - Residual \(ledgered\): PreallocXlogFiles, TruncateSUBTRANS on a hot standby, archive\_cleanup\_command;
+      restartpoints still timer\-driven\.
+  - **Restartpoint WAL removal LANDED 2026\-10\-28 \(loop \#226, the M0122\-0012 one\-task yield\)**\. Movement: none —
+    recovery path\. `runRecoveryFlush` calls the checkpointer's retainer \(`SlotAwareRetainer`, the primary's\) with the
+    adopted redo right after `adoptRestartPoint` advances pg\_control — PG CreateRestartPoint's XLByteToSeg\(RedoRecPtr\)
+    → KeepLogSeg → RemoveOldXlogFiles; the skip arm removes nothing\. A standby's pg\_wal no longer grows without bound\.
+    - Pin: `TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL` \(~40 MB of primary WAL; after the standby CHECKPOINT no
+      segment before the redo's survives; restart keeps streaming\); FAILS with the call removed \(2 old segments
+      survive\)\.
+    - Residual \(ledgered\): no restartpoint distance estimate, PreallocXlogFiles, TruncateSUBTRANS or
+      archive\_cleanup\_command; restartpoints still timer\-driven\.
+    - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"Restartpoint WAL removal"\.
   - **Standby restartpoint LANDED 2026\-10\-27 \(loop \#195, the M0122\-0012 one\-task yield\)**\. Movement: none —
     recovery path\. `StreamReplayer` records the last replayed checkpoint \(PG RecoveryRestartPoint\);
     `runRecoveryFlush` snapshots it before the flush and `adoptRestartPoint` then advances pg\_control's
@@ -2948,6 +3994,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Residual \(ledgered\): no DB\_IN\_ARCHIVE\_RECOVERY stamp on a standby \(minRecoveryPoint arm dormant\), no
       DB\_SHUTDOWNED\_IN\_RECOVERY on a shutdown restartpoint, no restartpoint\-driven WAL removal\.
     - Design: `docs/design/0000\-0049/0005\-0001\-streaming\-replication\-architecture\.md` §"The restartpoint"\.
+  - **Standby pg\_control state LANDED 2026\-10\-27 \(loop \#201, the second M0122\-0012 yield\)**\. A standby now stamps
+    DB\_IN\_ARCHIVE\_RECOVERY before replay and at the end of Open \(it stamped DB\_IN\_CRASH\_RECOVERY then
+    DB\_IN\_PRODUCTION\), a shutdown restartpoint leaves DB\_SHUTDOWNED\_IN\_RECOVERY \(both CreateRestartPoint arms\),
+    and promotion stamps DB\_IN\_PRODUCTION\. The restartpoint's minRecoveryPoint arm is live\. Pin: the restartpoint
+    E2E asserts all four states; units `TestBeginRecoveryStandbyIsArchiveRecovery`,
+    `TestShutdownRestartPointStampsShutdownedInRecovery`\. Residual: restartpoint WAL removal, skip\-arm
+    UpdateMinRecoveryPoint \(ledgered\)\. Design: 0005\-0001 §"A standby's pg\_control state"\.
   - **Standby recovery\-checkpoint mode LANDED 2026\-09\-22 \(loop \#12\)** as
     `e646499b0`. Movement: none — recovery path; `PLAN-SHAPE same=99 changed=0`.
     Design: `docs/design/0000-0049/0005-0001-streaming-replication-architecture.md`.
@@ -5384,6 +6437,186 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-27 — **exhausted at `64aa8f62f`** \(M0122\-0012 slice 101 changed internal/executor\)\.
     Census `analysis/m0146/m0146\-0014/routing\-20261027v/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
     category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 — **exhausted at `986df5900`** \(M0122\-0012 slice 103 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261027w/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#202\) — **exhausted at `2eeabf36f`**, census `routing\-20261027w/` reused:
+    `6f2772917` \(ralph only\) and `2eeabf36f` \(internal/initdb, xlog, cmd\) touched no planner\-relevant path\. No task
+    is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#203\) — **exhausted at `8432307f1`** \(M0122\-0012 slice 104 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027x/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
+    for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#204\) — **exhausted at `08a69974e`** \(M0122\-0012 slice 105 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027y/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note\. Item 10 is live
+    for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#205\) — **exhausted at `8d794539a`** \(M0122\-0012 slice 106 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027z/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99,
+    SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the `1f05de2c5` note \(plus
+    P0\-E14\(owner\-placement\)\)\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#206\) — **exhausted at `acd4ff2d7`**, census `routing\-20261027z/` reused:
+    `acd4ff2d7` is ralph/docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live
+    for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#207\) — **exhausted at `83bfa2945`** \(M0122\-0012 slice 107 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027aa/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#208\) — **exhausted at `e35fff402`**, census `routing\-20261027aa/` reused:
+    `e35fff402` touched internal/access/nbtree only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\.
+    Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#209\) — **exhausted at `a8367e529`** \(M0122\-0012 slice 109 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ab/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#210\) — **exhausted at `2910f8451`**, census `routing\-20261027ab/` reused:
+    `2910f8451` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#211\) — **exhausted at `b996b60d9`** \(M0122\-0012 slice 110 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ac/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-27 \(loop \#212\) — **exhausted at `3d50052e6`** \(M0122\-0012 slice 111 changed
+    internal/executor\)\. Census `analysis/m0146/m0146\-0014/routing\-20261027ad/`: TPC\-H 22/22, TPC\-DS SF0\.25
+    99/99, SF1 99/99, every category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#213\) — **exhausted at `2349ef9b0`**, census `routing\-20261027ad/` reused:
+    `2349ef9b0` is docs only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#214\) — **exhausted at `e3a2535f0`** \(C32 slice 1 changed internal/executor\)\.
+    Census `analysis/m0146/m0146\-0014/routing\-20261028a/`: TPC\-H 22/22, TPC\-DS SF0\.25 99/99, SF1 99/99, every
+    category 0\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#215\) — **exhausted at `d1e6f0a79`**, census `routing\-20261028a/` reused:
+    `d1e6f0a79` is analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
+    this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#216\) — **exhausted at `bafc2e139`**, census `routing\-20261028a/` reused:
+    `bafc2e139` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#217\) — **exhausted at `a3f833e78`**, census `routing\-20261028a/` reused:
+    `a3f833e78` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#218\) — **exhausted at `b7befe4c0`**, census `routing\-20261028a/` reused:
+    `b7befe4c0` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this
+    loop\. The C34 commit changes `internal/executor`, so the next loop re\-runs the census\.
+  - S9 re\-check 2026\-10\-28 \(loop \#219\) — **exhausted at `39041efc5`**, fresh census `routing\-20261028b/`
+    \(s9aw\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#220\) — **exhausted at `b68540921`**, fresh census `routing\-20261028c/`
+    \(s9ax\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#221\) — **exhausted at `4321d5793`**, fresh census `routing\-20261028d/`
+    \(s9ay\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#222\) — **exhausted at `f645129a8`**, fresh census `routing\-20261028e/`
+    \(s9az\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#223\) — **exhausted at `821d93323`**, fresh census `routing\-20261028f/`
+    \(s9ba\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#224\) — **exhausted at `ed521153d`**, census `routing\-20261028f/` reused:
+    `ed521153d` is ralph/analysis\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is
+    live for this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#225\) — **exhausted at `07f9d5c6a`**, census `routing\-20261028f/` reused:
+    `07f9d5c6a` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live for
+    this loop\.
+  - S9 re\-check 2026\-10\-28 \(loop \#226\) — **exhausted at `602669237`**, fresh census `routing\-20261028g/`
+    \(s9bb\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, CATEGORIES\-EXCL\-MATCH 0 everywhere\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: the M0122\-0012 one\-task yield → M0122\-0013\.
+  - S9 re\-check 2026\-10\-28 \(loop \#227\) — **exhausted at `4370e7f2c`**, census `routing\-20261028g/` reused:
+    `4370e7f2c` touches only `internal/access/transam/xlog` and tests, outside the planner\-relevant paths\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live: M0122\-0012 \(returned from the yield\)\.
+  - S9 re\-check 2026\-10\-28 \(loop \#228\) — **exhausted at `d100bd483`**, census `routing\-20261028g/` reused:
+    `d100bd483` is docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#229\) — **exhausted at `a42524dd1`**, census `routing\-20261028g/` reused:
+    `a42524dd1` is ralph/docs\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#231\) — **exhausted at `923750127`**, fresh census `routing\-20261028h/`
+    \(`923750127` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#232\) — **exhausted at `102c74a5e`**, fresh census `routing\-20261028i/`
+    \(`102c74a5e` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#234\) — **exhausted at `44fbe565b`**, census `routing\-20261028i/` reused:
+    `2ddabfd68` is docs\-only and `44fbe565b` touched internal/storage \+ commands/vacuum only\. No task is filed\. Same
+    items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#235\) — **exhausted at `6818860a2`**, census `routing\-20261028i/` reused:
+    `da5ccb973` / `6818860a2` are ralph/docs/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#236\) — **exhausted at `12f21f440`**, fresh census `routing\-20261028j/`
+    \(`12f21f440` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#237\) — **exhausted at `49db3ffa9`**, fresh census `routing\-20261028k/`
+    \(`49db3ffa9` touched internal/executor \+ transam\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task
+    is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#238\) — **exhausted at `6a2f5b0e1`**, census `routing\-20261028k/` reused:
+    `6a2f5b0e1` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#239\) — **exhausted at `3419876c9`**, census `routing\-20261028k/` reused:
+    `3419876c9` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#240\) — **exhausted at `d6476dbc4`**, fresh census `routing\-20261028l/`
+    \(`d6476dbc4` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#241\) — **exhausted at `de5bd21cc`**, fresh census `routing\-20261028m/`
+    \(`de5bd21cc` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#242\) — **exhausted at `b9224032c`**, census `routing\-20261028m/` reused:
+    `b9224032c` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#243\) — **exhausted at `822503136`**, census `routing\-20261028m/` reused:
+    `822503136` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#244\) — **exhausted at `d0f1515c0`**, fresh census `routing\-20261028n/`
+    \(`d0f1515c0` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#245\) — **exhausted at `e5cad94b5`**, census `routing\-20261028n/` reused:
+    `e5cad94b5` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#246\) — **exhausted at `844eec2a6`**, census `routing\-20261028n/` reused:
+    `844eec2a6` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#247\) — **exhausted at `569c3b7af`**, census `routing\-20261028n/` reused:
+    `569c3b7af` is ralph only \(no planner/executor path since `d0f1515c0`\)\. No task is filed\. Same items\-0\-9 tokens
+    as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#248\) — **exhausted at `2ba95c383`**, census `routing\-20261028n/` reused:
+    `2ba95c383` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#249\) — **exhausted at `0b7126698`**, census `routing\-20261028n/` reused:
+    `0b7126698` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#250\) — **exhausted at `9393a2b29`**, census `routing\-20261028n/` reused:
+    `9393a2b29` touched xlog/cmd only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C57 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#251\) — **exhausted at `c9acfdee9`**, fresh census `routing\-20261028o/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#252\) — **exhausted at `efe44c909`**, census `routing\-20261028o/` reused:
+    `efe44c909` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C58 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#253\) — **exhausted at `5463cb473`**, fresh census `routing\-20261028p/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#254\) — **exhausted at `b5bd577ed`**, census `routing\-20261028p/` reused:
+    `b5bd577ed` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C59 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#255\) — **exhausted at `b0f3750d3`**, fresh census `routing\-20261028q/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\. \(The C60 commit changes `internal/executor`: the next S9 pass captures
+    fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#256\) — **exhausted at `5a89cc5f5`**, fresh census `routing\-20261028r/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#257\) — **exhausted at `b5203895b`**, census `routing\-20261028r/` reused:
+    `b5203895b` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#258\) — **exhausted at `c3e5937a9`**, census `routing\-20261028r/` reused:
+    `c3e5937a9` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#259\) — **exhausted at `13336ab8a`**, census `routing\-20261028r/` reused:
+    `13336ab8a` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#260\) — **exhausted at `c4f0fa916`**, census `routing\-20261028r/` reused:
+    `c4f0fa916` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#261\) — **exhausted at `3d6366064`**, census `routing\-20261028r/` reused:
+    `3d6366064` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#262\) — **exhausted at `b54e7fa8d`**, census `routing\-20261028r/` reused:
+    `b54e7fa8d` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -7774,10 +9007,9 @@ Movement: yes — TPC\-DS SF0\.25 match 89→90, SF1 76→77 \(Q39\)
 
 ## M0147 — Lever retirement (filed 2026-10-21, owner decision)
 
-**Milestone doc:** `docs/milestones/0147-lever-retirement.md`. **Rank:** banner item 10 — M0122-0012 →
-**M0147** → the rest of M0122, under the M0122-0012 **return-first rule** in banner item 10 (OWNER DECISIONS
-2026-10-27): M0147 tasks run during M0122-0012's one-task yields (when next in item-10 order) and after its
-exhaustion.
+**Milestone doc:** `docs/milestones/0147-lever-retirement.md`. **Rank:** banner item 10 — after M0119 and before
+the already-filed M0122 tasks. The temporary M0122-0012 return-first override was retired by the owner on
+2026-10-29.
 Basis: the 2026-10-21 lever census and its review
 (`/home/ryo/work/tmp/ef5e65e27094282ab28769901e05621c/0----------plan-party-progress-1021.md`).
 
@@ -8361,3 +9593,23 @@ Basis: the 2026-10-21 lever census and its review
   - First step: carry the preserved\-side conjunct on the outer link as a join qual the searched join evaluates
     \(not a residual Filter above the tree, not a scan restriction\), admit it in `outerOnQualsOK`, and check the
     witness plans as PG does; then census \+ regress\.
+
+## M0148 — pg_regress coverage closure with prerequisite implementation (filed 2026-10-29, owner decision)
+
+**Milestone doc:** `docs/milestones/0148-regress-coverage-closure.md`.
+**Rank:** banner item 10 after the already-filed M0122 queue. The milestone
+document defines the canonical suite queue and is binding. A suite parent stays
+open until its output matches PostgreSQL 18.3; every missing prerequisite is
+filed and implemented as that suite task's child. Ledger-only parking is not a
+completion path.
+
+- [ ] **M0148-0001 — aggregates.sql regress coverage closure**.
+  Kind: impl
+  Parent: none
+  - Baseline first: run `scripts/pg-regress-runner.sh -v aggregates` at HEAD
+    and classify every remaining output difference against PG 18.3.
+  - File each missing feature as an implementation child with
+    `Parent: M0148-0001`, implement all such children, and re-run the suite.
+  - Complete only at byte-normalized expected-output parity, with the inventory
+    row promoted to `pass` / `pass_required=yes`, regenerated coverage docs,
+    and the next canonical M0148 suite task materialized.

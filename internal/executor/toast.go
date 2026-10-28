@@ -209,6 +209,25 @@ func needsDetoast(row Row) bool {
 	return false
 }
 
+// scanNeedsDetoast is needsDetoastPrefix for a row a scan decoded from a heap
+// tuple: a tuple without HEAP_HASEXTERNAL cannot hold an external TOAST
+// pointer — the decoder yields KindToastPointer only for an external varlena,
+// and every writer sets the bit from pgRowHasExternal, as PG's heap_fill_tuple
+// does — so the per-column walk runs only for a tuple that carries it. PG guards
+// its toast handling the same way (HeapTupleHasExternal). TPC-H Q17 spent ~3 %
+// walking lineitem's prefix on every row (M0122-0012 C51). With the deform
+// poison armed (tests), a tuple without the bit is still walked, and a TOAST
+// pointer in it panics: a writer that forgot the bit would be a wrong result.
+func scanNeedsDetoast(hasExternal bool, row Row, n int) bool {
+	if hasExternal {
+		return needsDetoastPrefix(row, n)
+	}
+	if seqScanDeformPoison && needsDetoastPrefix(row, n) {
+		panic("executor: a heap tuple without HEAP_HASEXTERNAL decoded to a TOAST pointer")
+	}
+	return false
+}
+
 // needsDetoastPrefix is needsDetoast over row[0:n], for callers holding a
 // partially-deformed row whose tail is stale (seqScanOp's prefilter path).
 // Scanning the whole row there would test the previous tuple's columns.

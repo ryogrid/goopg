@@ -777,7 +777,7 @@ func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pE
 					return err
 				}
 			}
-			val, ferr := aggHelper.finishAgg(running, call)
+			val, ferr := aggHelper.finishAgg(&running, &call)
 			if ferr != nil {
 				return ferr
 			}
@@ -853,7 +853,7 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 			if incremental {
 				aggStart, aggEnd = start, max(end, start)
 			}
-			val, ferr := aggHelper.finishAgg(running, call)
+			val, ferr := aggHelper.finishAgg(&running, &call)
 			if ferr != nil {
 				return ferr
 			}

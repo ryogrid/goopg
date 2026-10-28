@@ -245,12 +245,38 @@ With the wiring removed, the test fails on an unchanged redo.
 
 **Still missing** \(ledgered 2026\-10\-27\):
 
-- goopg never stamps `DB_IN_ARCHIVE_RECOVERY` on a standby, so the
-  `minRecoveryPoint` arm is dormant.
-- A shutdown restartpoint does not set `DB_SHUTDOWNED_IN_RECOVERY`.
 - Restartpoints do not drive WAL segment removal \(`KeepLogSeg` /
   `RemoveOldXlogFiles` in `CreateRestartPoint`\).
 - The skip arm's `UpdateMinRecoveryPoint` is not ported.
+
+### A standby's pg\_control state \(2026\-10\-27, M0122\-0013\)
+
+A goopg standby used to stamp `DB_IN_PRODUCTION` at startup, like a primary,
+and `DB_IN_CRASH_RECOVERY` while replaying. That made the restartpoint's
+`minRecoveryPoint` arm dormant and gave every tool reading `pg_control` the
+wrong picture.
+
+PG treats `standby.signal` as `ArchiveRecoveryRequested`
+\(`xlogrecovery.c:946-961`\). goopg now follows that through the whole lifecycle:
+
+| moment | state stamped | PG reference |
+|---|---|---|
+| replay begins \(`beginRecovery`\) | `DB_IN_ARCHIVE_RECOVERY`, not `DB_IN_CRASH_RECOVERY` | `xlogrecovery.c:946-961` |
+| end of Open | `DB_IN_ARCHIVE_RECOVERY` \(`stampInArchiveRecovery`\) | the standby serves in archive recovery |
+| shutdown restartpoint | `DB_SHUTDOWNED_IN_RECOVERY` | `CreateRestartPoint` |
+| promotion | `DB_IN_PRODUCTION` | end of `StartupXLOG`, `xlog.c:6204-6211` |
+
+The shutdown restartpoint stamps `DB_SHUTDOWNED_IN_RECOVERY` in two cases:
+
+- when it adopts a newer checkpoint while in archive recovery;
+- unconditionally when there is nothing newer to adopt, as the skip arm does
+  \(`xlog.c:7685-7692`\).
+
+A restarted standby replays from either state, since neither is
+`DB_SHUTDOWNED`.
+
+`TestE2E\_PhysicalStandbyRestartPointAdvancesPgControl` now asserts each state
+in turn: running, stopped, restarted, promoted.
 
 The complementary primary-restart boundary is pinned separately: a running
 standby must survive a primary Stop plus Start, redial the same endpoint, and
@@ -265,6 +291,133 @@ its durable tail and replays the complete outage interval in order.
 `TestE2E_PhysicalReplicationCatchesUpAfterStandbyCrash` kills a caught-up
 standby, commits twelve rows on the live primary, then asserts every row after
 the standby recovers and reconnects.
+
+### Restartpoint WAL removal \(2026\-10\-28, M0122\-0013\)
+
+After `CreateRestartPoint` updates pg\_control it deletes the WAL that the restartpoint made redundant (xlog.c):
+
+1. `XLByteToSeg(RedoRecPtr)` takes the restartpoint's redo segment.
+2. `KeepLogSeg` lowers it for replication slots and `wal_keep_size`, measured against the later of the received and
+   replayed positions.
+3. `RemoveOldXlogFiles` removes or recycles every older segment.
+
+Only the arm that adopted a restartpoint gets there; the skip arm returns before it. Until now a goopg standby kept
+every segment it ever received.
+
+`runRecoveryFlush` now calls the checkpointer's retainer with the adopted redo, right after `adoptRestartPoint`
+reports an advance. That is the same `SlotAwareRetainer` the primary's checkpoint uses, with the same slot horizons,
+`max_slot_wal_keep_size` invalidation and recycle-by-rename sizing. On a standby the retainer's writer is the one the
+walreceiver appends into, so its `WrittenLSN`, the retainer's lag yardstick, is the end of the received WAL: PG's
+`endptr`. Replay has already passed the adopted checkpoint record, which follows its redo, so no segment the
+replayer or a restarted walreceiver still needs is removed.
+
+`TestE2E_PhysicalStandbyRestartPointRemovesOldWAL` writes about 40 MB on the primary, checkpoints, and waits for the
+standby to replay past the checkpoint. It then requires:
+
+- before the standby CHECKPOINT, segments older than the redo's segment exist;
+- after it, none remain;
+- the standby still restarts and keeps streaming.
+
+With the retention call removed it fails: two old segments survive.
+
+### Restartpoint distance estimate \(2026\-10\-28, M0122\-0013\)
+
+`CreateRestartPoint` also feeds the checkpoint distance estimate before removing old WAL (xlog.c). It takes
+`PriorRedoPtr` as pg\_control's `checkPointCopy.redo` before the update, and runs
+`UpdateCheckPointDistanceEstimate(RedoRecPtr - PriorRedoPtr)` only in the arm that adopted a restartpoint.
+
+goopg now does the same:
+
+- `adoptRestartPointPrior` reports the prior redo it read.
+- `runRecoveryFlush` calls `noteRestartPointDistance(priorRedo, redo)` right before the retainer.
+- The retainer's recycled-spare sizing (`computeSpareSegments`, PG's XLOGfileslop) therefore follows the standby's
+  own restartpoint cadence. Before this the estimate stayed 0 on a standby.
+- Because the prior redo comes from pg\_control, the first restartpoint after a start already measures a distance.
+- The adopted redo becomes the checkpointer's prior redo, so the first checkpoint after a promotion measures from
+  it, as PG's would from pg\_control.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts an estimate of 8192 − 16 after the restartpoint, and no
+change from a source-less flush.
+
+### Restartpoint moves RedoRecPtr \(2026\-10\-28, M0122\-0013\)
+
+`CreateRestartPoint` sets `RedoRecPtr = XLogCtl->RedoRecPtr = lastCheckPoint.redo` and makes pg\_control's
+`checkPoint` the restartpoint's record (xlog.c). `RedoRecPtr` is what `XLogCheckpointNeeded` measures elapsed
+segments from. Replay calls that when it switches segments (xlogrecovery.c XLogPageRead) and requests the next
+restartpoint once `CheckPointSegments − 1` segments have gone by.
+
+goopg's restartpoint never moved the checkpointer's redo anchor (`lastCheckpointRedoLSN`). Every runtime's
+checkpointer, a standby's included, gets `max_wal_size` (cmd/goopg/main.go), and a standby runs in recovery mode,
+so `runCheckpoint` routes to `runRecoveryFlush`. The volume trigger kept the anchor it seeded at start, and once
+`max_wal_size / (1 + checkpoint_completion_target)` of WAL had arrived (512 MB at the defaults), every 1-second volume
+tick ran a full restartpoint flush and data-file sync.
+
+`runRecoveryFlush`'s adopted arm now stores:
+
+- the restartpoint's redo as `lastCheckpointRedoLSN`, which re-anchors `volumeTriggerFires`;
+- its record start and end as `lastCheckpointStartLSN` / `lastCheckpointLSN`.
+
+`CheckpointRedoLSN` / `LastCheckpointRecordLSN` therefore answer a BASE\_BACKUP from the standby with the last
+restartpoint, as PG's backup-from-standby starts there, instead of 0 and the received-WAL fallback. After a
+promotion, the first checkpoint's FPI epoch measures from the last restartpoint's redo, as PG's would.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts the redo (8193, 1-based) and the record start after the
+restartpoint. Removing the stores fails it.
+
+### Restartpoint skip arm without the flush \(2026\-10\-28, M0122\-0013\)
+
+When there is no replayed checkpoint, or the last one's redo is not newer than pg\_control's `checkPointCopy.redo`,
+`CreateRestartPoint` returns before `CheckPointGuts` (xlog.c). It updates `minRecoveryPoint`, and for a shutdown
+request stamps `DB_SHUTDOWNED_IN_RECOVERY`, but flushes no buffer, CLOG page or data file.
+
+goopg flushed everything first and only then found nothing to adopt, so every timed request on a standby that had
+seen no new checkpoint record was a full flush and data-file sync. `runRecoveryFlush` now calls
+`restartPointSkips` (same test, against pg\_control) before the flush, and in the skip arm only stamps the shutdown
+state. A restarted standby replays from pg\_control's redo, so pages left unflushed are recovered from WAL, as in PG.
+Without a data directory or pg\_control the flush runs as before.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` counts flushes. The adopting restartpoint flushes once; a repeat
+with nothing newer, and a source-less one, flush zero times. Forcing the skip test off fails it. The standby restart,
+promotion and base-backup E2Es pass.
+
+Still missing (ledgered):
+
+- ~~the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
+  reading~~ — resolved by the next section;
+- no `PreallocXlogFiles`;
+- no `TruncateSUBTRANS` at a restartpoint;
+- no `archive_cleanup_command`;
+- restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
+  `RequestCheckpoint`.
+
+### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
+
+On a standby PG requests a restartpoint from the startup process's read loop: `XLogPageRead` (xlogrecovery.c), when
+it leaves a segment, calls `XLogCheckpointNeeded(readSegNo)` and, if it holds, `RequestCheckpoint(CHECKPOINT_CAUSE_XLOG)`.
+The distance is the same `CheckPointSegments - 1` the primary uses, measured from `RedoRecPtr` (the last restartpoint's
+redo); the position is the segment **replay** is reading, not the end of the received WAL.
+
+goopg's checkpointer polls the max\_wal\_size trigger once a second against the writer's `WrittenLSN`, which on a
+standby is the received WAL. A startup process that lagged the receiver (or a `recovery_min_apply_delay`) therefore
+requested restartpoints for WAL it had not replayed, and, because a restartpoint with no newer replayed checkpoint
+leaves the anchor in place, it requested one on every poll; each was a pg\_control read in the skip arm.
+
+Now:
+
+- `Checkpointer.SetReplayPositionSource` installs the replayer's `ApplyLSN` (standby startup, `cmd/goopg/standby.go`;
+  cleared at promotion). In recovery mode `volumeTriggerFires` measures that position.
+- In recovery a request fires once per replay segment (`recoveryVolumeSegNo`): PG evaluates the test only when replay
+  leaves a segment, so the next request comes from the next segment, not the next poll.
+- The primary path is unchanged: outside recovery the source is ignored, and without a source a standby falls back to
+  the writer's position.
+
+Remaining difference: PG tests the segment just finished (`readSegNo` before the switch), goopg the segment holding
+the last applied record — the same count once replay is inside the next segment, at most one poll apart.
+
+Pin: `TestCheckpointerVolumeTriggerRecoveryMeasuresReplay` — received WAL 40 segments ahead with replay in the
+anchor's segment does not fire; 3 replayed segments do; the same segment does not re-request; the next does; an
+adopted redo re-anchors; the primary ignores the source. Measuring the writer, or dropping the once-per-segment
+guard, fails it.
 
 ### Promotion restart invariant
 

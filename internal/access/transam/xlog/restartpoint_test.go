@@ -69,7 +69,7 @@ func TestAdoptRestartPointAdvancesOnlyForward(t *testing.T) {
 
 	dir := t.TempDir()
 	writeTestControl(t, dir, control.DBStateInProduction, 100)
-	if ok, err := adoptRestartPoint(dir, rp); err != nil || !ok {
+	if ok, err := adoptRestartPoint(dir, rp, true, false); err != nil || !ok {
 		t.Fatalf("adopt newer checkpoint: ok=%v err=%v", ok, err)
 	}
 	cd, err := control.ReadControlFile(dir)
@@ -85,18 +85,18 @@ func TestAdoptRestartPointAdvancesOnlyForward(t *testing.T) {
 		t.Fatalf("minRecoveryPoint moved outside archive recovery: %d", cd.MinRecoveryPoint)
 	}
 	// The same checkpoint again: not newer, nothing written.
-	if ok, err := adoptRestartPoint(dir, rp); err != nil || ok {
+	if ok, err := adoptRestartPoint(dir, rp, true, false); err != nil || ok {
 		t.Fatalf("re-adopt: ok=%v err=%v, want no update", ok, err)
 	}
 	older := rp
 	older.Fields.RedoLSN0 = 3000
-	if ok, _ := adoptRestartPoint(dir, older); ok {
+	if ok, _ := adoptRestartPoint(dir, older, true, false); ok {
 		t.Fatal("an older checkpoint moved pg_control back")
 	}
 
 	arch := t.TempDir()
 	writeTestControl(t, arch, control.DBStateInArchiveRecovery, 100)
-	if ok, err := adoptRestartPoint(arch, rp); err != nil || !ok {
+	if ok, err := adoptRestartPoint(arch, rp, true, false); err != nil || !ok {
 		t.Fatalf("adopt in archive recovery: ok=%v err=%v", ok, err)
 	}
 	if cd, _ := control.ReadControlFile(arch); cd.MinRecoveryPoint != 5121 || cd.MinRecoveryPointTLI != 1 {
@@ -164,7 +164,8 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	wg.Wait()
 
 	before := w.WrittenLSN()
-	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{DataDir: dir})
+	flusher := &fakeFlusher{}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{DataDir: dir})
 	cp.SetRecoveryMode(true)
 	cp.SetRestartPointSource(sr.LastCheckpoint)
 	if err := cp.CheckpointNow(); err != nil {
@@ -181,6 +182,38 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 		t.Fatalf("pg_control after restartpoint: redo=%d checkPoint=%d nextXid=%d; want 8192/%d/801",
 			cd.CheckPointCopyRedo, cd.CheckPoint, cd.CheckPointCopyNextXid, start2-1)
 	}
+	// CreateRestartPoint updates the checkpoint distance estimate from
+	// pg_control's prior redo (16) to the adopted one (8192) before removing
+	// old WAL — even on the first restartpoint after a start (M0122-0013).
+	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {
+		t.Fatalf("checkpoint distance estimate after the restartpoint = %v, want %d", got, 8192-16)
+	}
+	// ... and moves RedoRecPtr / the checkpoint record to the restartpoint's,
+	// the anchor the volume trigger measures max_wal_size from and the pair a
+	// BASE_BACKUP from the standby starts at (M0122-0013).
+	if got := cp.CheckpointRedoLSN(); got != 8192+1 {
+		t.Fatalf("checkpoint redo after the restartpoint = %d, want %d (1-based)", got, 8192+1)
+	}
+	if got := cp.LastCheckpointRecordLSN(); got != start2 {
+		t.Fatalf("checkpoint record after the restartpoint = %d, want %d", got, start2)
+	}
+	// CreateRestartPoint's skip arm: asked again with no newer replayed
+	// checkpoint, it returns before CheckPointGuts — no flush (M0122-0013).
+	flusher.mu.Lock()
+	flushes := flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("adopting restartpoint flushed %d times, want 1", flushes)
+	}
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatalf("repeat recovery checkpoint: %v", err)
+	}
+	flusher.mu.Lock()
+	flushes = flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("restartpoint with nothing newer to adopt flushed (%d flushes, want 1)", flushes)
+	}
 	// Without a source a recovery flush leaves pg_control alone (e646499b0).
 	cp.SetRestartPointSource(nil)
 	writeTestControl(t, dir, control.DBStateInProduction, 16)
@@ -189,5 +222,53 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	}
 	if cd, _ := control.ReadControlFile(dir); cd.CheckPointCopyRedo != 16 {
 		t.Fatalf("source-less recovery flush moved redo to %d", cd.CheckPointCopyRedo)
+	}
+	// ... skips the flush, as there is no replayed checkpoint at all ...
+	flusher.mu.Lock()
+	flushes = flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("source-less recovery flush flushed (%d flushes, want 1)", flushes)
+	}
+	// ... and, adopting nothing, leaves the estimate where it was.
+	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {
+		t.Fatalf("source-less recovery flush moved the distance estimate to %v", got)
+	}
+}
+
+// TestShutdownRestartPointStampsShutdownedInRecovery pins CreateRestartPoint's
+// shutdown arms (xlog.c:7685-7692, 7786-7787): a shutdown restartpoint that
+// adopts a newer checkpoint in DB_IN_ARCHIVE_RECOVERY leaves
+// DB_SHUTDOWNED_IN_RECOVERY, and one with nothing newer to adopt stamps it
+// unconditionally; a non-shutdown flush with nothing to adopt writes nothing.
+func TestShutdownRestartPointStampsShutdownedInRecovery(t *testing.T) {
+	rp := ReplayedCheckpoint{StartLSN: 5001, EndLSN: 5121,
+		Fields: CheckPointFields{RedoLSN0: 4000, ThisTLI: 1, PrevTLI: 1}}
+
+	adopt := t.TempDir()
+	writeTestControl(t, adopt, control.DBStateInArchiveRecovery, 100)
+	if ok, err := adoptRestartPoint(adopt, rp, true, true); err != nil || !ok {
+		t.Fatalf("shutdown adopt: ok=%v err=%v", ok, err)
+	}
+	if cd, _ := control.ReadControlFile(adopt); cd.State != control.DBStateShutdownedInRecovery || cd.CheckPointCopyRedo != 4000 {
+		t.Fatalf("after shutdown adopt: state=%d redo=%d", cd.State, cd.CheckPointCopyRedo)
+	}
+
+	skip := t.TempDir()
+	writeTestControl(t, skip, control.DBStateInArchiveRecovery, 9000)
+	if ok, err := adoptRestartPoint(skip, rp, true, true); err != nil || ok {
+		t.Fatalf("shutdown skip: ok=%v err=%v", ok, err)
+	}
+	if cd, _ := control.ReadControlFile(skip); cd.State != control.DBStateShutdownedInRecovery || cd.CheckPointCopyRedo != 9000 {
+		t.Fatalf("after shutdown skip: state=%d redo=%d", cd.State, cd.CheckPointCopyRedo)
+	}
+
+	none := t.TempDir()
+	writeTestControl(t, none, control.DBStateInArchiveRecovery, 100)
+	if _, err := adoptRestartPoint(none, ReplayedCheckpoint{}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if cd, _ := control.ReadControlFile(none); cd.State != control.DBStateInArchiveRecovery {
+		t.Fatalf("non-shutdown flush with nothing to adopt changed state to %d", cd.State)
 	}
 }

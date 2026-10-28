@@ -127,18 +127,12 @@ wasted turns).
     enumerate every open `[ ]` task ranked items 0-9 as `id(gate)` tokens —
     `channel`, `below-item-10`, `owner-<what>`, `blocked-on <id>` — and `n/a`
     is not acceptable while any such task exists.
-  - `M0122-0012:` its return-first state (banner item 10): `active — <candidate
-    id + Target>`, `yield-b — <the two below-bar attempts + %>; one task: <id>`,
-    or `exhausted@<sha> <date>` (next G1–G3 pass due <date>). The durable record
-    is the M0122-0012 entry (Candidate pool, Below-bar list, Yield record); this
-    line is the hand-off. Added 2026-10-27 (owner).
   - `Gates run:` which verification gates passed/failed this loop
   - `In-flight:` any gate/process you had to abandon: exact command, log/output
     path, PID state when killed, and what result was still needed (write `none`
     when nothing was abandoned)
 - If the task is fully COMPLETE and committed, replace the contents with just
-  `(idle — nothing in flight)` so the next loop starts clean — but keep the
-  `M0122-0012:` line (it survives the idle wipe).
+  `(idle — nothing in flight)` so the next loop starts clean.
 
 ## Headless Execution Reality — background tasks DIE at turn end (CRITICAL)
 You run in headless `-p` mode. When you emit your final message the session

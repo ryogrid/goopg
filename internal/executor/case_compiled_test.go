@@ -44,6 +44,12 @@ func TestCaseCompiledMatchesInterpreted(t *testing.T) {
 		{Operand: i, Whens: []optimizer.CaseWhen{w(num(6), lit("six")), w(lit("5"), lit("five"))}, Else: lit("other")},
 		// simple over a numeric operand
 		{Operand: n, Whens: []optimizer.CaseWhen{w(num(5), lit("five")), w(lit("0.7"), lit("seven-tenths"))}},
+		// M0122-0012 C50: searched WHENs consumed as bools through
+		// fastComparisonBool — an int comparison (the non-string branch),
+		// <> and < on the char(9) column, NULL operands falling back — with
+		// constant THEN / ELSE arms returned without the evaluator.
+		{Whens: []optimizer.CaseWhen{w(gt(i, num(5)), lit("gt5")), w(&optimizer.BinaryOp{Op: parser.OpNe, Left: day, Right: lit("Sunday")}, num(7))}, Else: lit("else")},
+		{Whens: []optimizer.CaseWhen{w(&optimizer.BinaryOp{Op: parser.OpLt, Left: day, Right: lit("Sunday")}, n), w(eq(i, num(0)), &optimizer.NullConst{})}, Else: num(42)},
 		// nested CASE in a THEN, a non-bool WHEN in the searched form
 		{Whens: []optimizer.CaseWhen{
 			w(i, lit("non-bool when")),

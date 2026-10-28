@@ -2,6 +2,7 @@ package nbtree
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -84,6 +85,12 @@ type PGKeyAttr struct {
 	// FIRST, so a caller building a descriptor from pg_index.indoption must
 	// carry both bits across rather than deriving one from the other.
 	NullsFirst bool
+	// IntWidth, when non-zero, says Compare is the signed little-endian
+	// integer comparison of an IntWidth-byte image (PGCompareInt2/4/8 —
+	// btint2cmp/btint4cmp/btint8cmp, which date/time/timestamp share), so
+	// compareFixedPrefix may compare the bytes inline (M0122-0012 C37). The
+	// descriptor builder stamps it beside Compare; 0 means "call Compare".
+	IntWidth uint8
 }
 
 // PGIndexKeyDesc is the per-index key descriptor: the first nkeyatts
@@ -316,6 +323,31 @@ func compareFixedPrefix(desc *PGIndexKeyDesc, a, b []byte, ncmp int) (res, at in
 		if end > sizeA || end > sizeB {
 			return 0, 0, false
 		}
+		if w := att.IntWidth; w != 0 && int(w) == n && !compareFixedIntDisabled {
+			// The signed-integer opclasses inline: btint4cmp's by-value
+			// comparison without compareAttr's slices and indirect call.
+			var x, y int64
+			switch w {
+			case 4:
+				x, y = int64(int32(binary.LittleEndian.Uint32(a[off:]))), int64(int32(binary.LittleEndian.Uint32(b[off:])))
+			case 8:
+				x, y = int64(binary.LittleEndian.Uint64(a[off:])), int64(binary.LittleEndian.Uint64(b[off:]))
+			default:
+				x, y = int64(int16(binary.LittleEndian.Uint16(a[off:]))), int64(int16(binary.LittleEndian.Uint16(b[off:])))
+			}
+			if x != y {
+				res := 1
+				if x < y {
+					res = -1
+				}
+				if att.Desc {
+					res = -res
+				}
+				return res, i, true
+			}
+			off = end
+			continue
+		}
 		if res := att.compareAttr(a[off:end], false, b[off:end], false); res != 0 {
 			return res, i, true
 		}
@@ -323,6 +355,9 @@ func compareFixedPrefix(desc *PGIndexKeyDesc, a, b []byte, ncmp int) (res, at in
 	}
 	return 0, ncmp, true
 }
+
+// compareFixedIntDisabled is the A/B and equivalence-test knob for C37.
+var compareFixedIntDisabled = false
 
 func comparePGIndexTuples(desc *PGIndexKeyDesc, a, b []byte, withHeapTID bool) (int, error) {
 	res, nattsA, nattsB, err := comparePGIndexTupleAttrs(desc, a, b)

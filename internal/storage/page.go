@@ -153,6 +153,31 @@ func (h PageHeader) SetFlags(v PageFlag) {
 	binary.LittleEndian.PutUint16(h.Page[10:12], uint16(v))
 }
 
+// PageIsAllVisible, PageSetAllVisible and PageClearAllVisible are bufpage.h's
+// macros over pd_flags' PD_ALL_VISIBLE: every tuple on the page is visible to
+// every current and future snapshot. VACUUM sets the bit together with the
+// visibility map's ALL_VISIBLE bit (lazy_scan_prune), every heap change that
+// can make a tuple invisible to someone clears it under the page's exclusive
+// lock (heap_insert / heap_update / heap_delete), and a seq scan may then skip
+// per-tuple visibility on the page (heap_prepare_pagescan). M0122-0012 C47.
+func PageIsAllVisible(p Page) bool {
+	return len(p) >= SizeOfPageHeaderData && PageFlag(binary.LittleEndian.Uint16(p[10:12]))&PDAllVisible != 0
+}
+
+// PageSetAllVisible sets PD_ALL_VISIBLE.
+func PageSetAllVisible(p Page) {
+	binary.LittleEndian.PutUint16(p[10:12], binary.LittleEndian.Uint16(p[10:12])|uint16(PDAllVisible))
+}
+
+// PageClearAllVisible clears PD_ALL_VISIBLE and reports whether it was set.
+func PageClearAllVisible(p Page) bool {
+	if !PageIsAllVisible(p) {
+		return false
+	}
+	binary.LittleEndian.PutUint16(p[10:12], binary.LittleEndian.Uint16(p[10:12])&^uint16(PDAllVisible))
+	return true
+}
+
 func (h PageHeader) Lower() uint16 { return binary.LittleEndian.Uint16(h.Page[12:14]) }
 func (h PageHeader) SetLower(v uint16) {
 	binary.LittleEndian.PutUint16(h.Page[12:14], v)

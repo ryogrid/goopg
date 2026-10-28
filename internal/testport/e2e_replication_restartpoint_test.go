@@ -45,6 +45,10 @@ func TestE2E_PhysicalStandbyRestartPointAdvancesPgControl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read standby pg_control: %v", err)
 	}
+	// A running standby is in archive recovery (xlogrecovery.c:946-952).
+	if before.State != control.DBStateInArchiveRecovery {
+		t.Fatalf("running standby pg_control state = %s, want in archive recovery", control.DBStateName(before.State))
+	}
 
 	// A primary checkpoint, then a row after it: once the standby shows the
 	// row it has replayed the checkpoint record.
@@ -83,8 +87,16 @@ func TestE2E_PhysicalStandbyRestartPointAdvancesPgControl(t *testing.T) {
 	if err := rc.Standby.Stop(cluster.ShutdownFast); err != nil {
 		t.Fatalf("stop standby: %v", err)
 	}
+	// A shutdown restartpoint leaves DB_SHUTDOWNED_IN_RECOVERY
+	// (CreateRestartPoint with CHECKPOINT_IS_SHUTDOWN).
+	if cd, err := control.ReadControlFile(rc.Standby.DataDir()); err != nil || cd.State != control.DBStateShutdownedInRecovery {
+		t.Fatalf("stopped standby pg_control state = %v (err %v), want shut down in recovery", stateName(cd), err)
+	}
 	if err := rc.Standby.Start(); err != nil {
 		t.Fatalf("restart standby: %v", err)
+	}
+	if cd, err := control.ReadControlFile(rc.Standby.DataDir()); err != nil || cd.State != control.DBStateInArchiveRecovery {
+		t.Fatalf("restarted standby pg_control state = %v (err %v), want in archive recovery", stateName(cd), err)
 	}
 	if err := runSQLSimple(t, rc.Primary, "INSERT INTO restartpoint_t VALUES (2)"); err != nil {
 		t.Fatalf("insert after standby restart: %v", err)
@@ -92,4 +104,23 @@ func TestE2E_PhysicalStandbyRestartPointAdvancesPgControl(t *testing.T) {
 	if got := waitForPhysicalIDs(t, rc.Standby, "restartpoint_t", 2, 30*time.Second); !equalIDs(got, []string{"1", "2"}) {
 		t.Fatalf("standby did not resume from its restartpoint: got %v, want [1 2]", got)
 	}
+
+	// Promotion ends recovery: DB_IN_PRODUCTION, as the end of StartupXLOG.
+	if err := rc.Primary.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop primary before promotion: %v", err)
+	}
+	if err := rc.Promote(); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	insertEventually(t, rc.Standby, "INSERT INTO restartpoint_t VALUES (3)", 30*time.Second)
+	if cd, err := control.ReadControlFile(rc.Standby.DataDir()); err != nil || cd.State != control.DBStateInProduction {
+		t.Fatalf("promoted standby pg_control state = %v (err %v), want in production", stateName(cd), err)
+	}
+}
+
+func stateName(cd *control.ControlFileData) string {
+	if cd == nil {
+		return "<unreadable>"
+	}
+	return control.DBStateName(cd.State)
 }

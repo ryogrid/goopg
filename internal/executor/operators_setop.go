@@ -59,6 +59,9 @@ type setOp struct {
 	mergeLive [2]bool
 	mergeInit bool
 	mergeErr  error
+	// mergeKeyText is sortKeyTextFlags(plan.MergeKeys), built on first use
+	// (mergeKeysLess's string arm).
+	mergeKeyText []bool
 	// mergeKeySlot presents a transferred row and its input slot's tid to
 	// the merge-key evaluation (M0146-0052); scratch, reused per row.
 	mergeKeySlot MaterializedSlot
@@ -183,7 +186,7 @@ func (o *setOp) nextMerge() (TupleSlot, error) {
 	switch {
 	case o.mergeLive[0] && o.mergeLive[1]:
 		pick = 0
-		if mergeKeysLess(o.plan.MergeKeys, o.mergeKeys[1], o.mergeKeys[0], &o.mergeErr) {
+		if mergeKeysLess(o.plan.MergeKeys, o.mergeTextFlags(), o.mergeKeys[1], o.mergeKeys[0], &o.mergeErr) {
 			pick = 1
 		}
 		if o.mergeErr != nil {
@@ -503,8 +506,9 @@ func (o *setOp) nextSorted() (TupleSlot, error) {
 		}
 	}
 	keys := o.plan.MergeKeys
+	keyText := o.mergeTextFlags()
 	less := func(a, b []Datum) bool {
-		return mergeKeysLess(keys, a, b, &o.mergeErr)
+		return mergeKeysLess(keys, keyText, a, b, &o.mergeErr)
 	}
 	for {
 		if o.pendingN > 0 {
@@ -554,4 +558,12 @@ func (o *setOp) nextSorted() (TupleSlot, error) {
 		}
 		o.pendingRow, o.pendingN = row, n
 	}
+}
+
+// mergeTextFlags returns sortKeyTextFlags(plan.MergeKeys), computed once.
+func (o *setOp) mergeTextFlags() []bool {
+	if o.mergeKeyText == nil {
+		o.mergeKeyText = sortKeyTextFlags(o.plan.MergeKeys)
+	}
+	return o.mergeKeyText
 }

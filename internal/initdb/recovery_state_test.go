@@ -23,7 +23,7 @@ import (
 func TestBeginRecoveryReadsPgControlState(t *testing.T) {
 	t.Run("clean shutdown is not recovery", func(t *testing.T) {
 		dir := freshDataDir(t)
-		d, err := beginRecovery(dir)
+		d, err := beginRecovery(dir, false)
 		if err != nil {
 			t.Fatalf("beginRecovery: %v", err)
 		}
@@ -43,7 +43,7 @@ func TestBeginRecoveryReadsPgControlState(t *testing.T) {
 		dir := freshDataDir(t)
 		setState(t, dir, control.DBStateInProduction)
 
-		d, err := beginRecovery(dir)
+		d, err := beginRecovery(dir, false)
 		if err != nil {
 			t.Fatalf("beginRecovery: %v", err)
 		}
@@ -68,7 +68,7 @@ func TestBeginRecoveryReadsPgControlState(t *testing.T) {
 		dir := freshDataDir(t)
 		setState(t, dir, control.DBStateShutdownedInRecovery)
 
-		d, err := beginRecovery(dir)
+		d, err := beginRecovery(dir, false)
 		if err != nil {
 			t.Fatalf("beginRecovery: %v", err)
 		}
@@ -90,7 +90,7 @@ func TestBeginRecoveryReadsPgControlState(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		d, err := beginRecovery(dir)
+		d, err := beginRecovery(dir, false)
 		if err != nil {
 			t.Fatalf("beginRecovery: %v", err)
 		}
@@ -108,7 +108,7 @@ func TestBeginRecoveryReadsPgControlState(t *testing.T) {
 	// checks only PG_VERSION). It must start, not fail, and must fall back to
 	// the stream scan by reporting redo 0.
 	t.Run("absent pg_control degrades to the scan", func(t *testing.T) {
-		d, err := beginRecovery(t.TempDir())
+		d, err := beginRecovery(t.TempDir(), false)
 		if err != nil {
 			t.Fatalf("beginRecovery on a directory with no pg_control: %v", err)
 		}
@@ -193,5 +193,37 @@ func setState(t *testing.T, dir string, state uint32) {
 		cd.State = state
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestBeginRecoveryStandbyIsArchiveRecovery pins M0122-0013: a standby's
+// recovery is archive recovery (standby.signal is upstream's
+// ArchiveRecoveryRequested), so the state stamped before replay is
+// DB_IN_ARCHIVE_RECOVERY, not DB_IN_CRASH_RECOVERY (xlogrecovery.c:946-961) —
+// whether the standby was running (DB_IN_ARCHIVE_RECOVERY) or shut down by a
+// restartpoint (DB_SHUTDOWNED_IN_RECOVERY), both of which still need replay.
+// stampInArchiveRecovery is the state the standby then serves in.
+func TestBeginRecoveryStandbyIsArchiveRecovery(t *testing.T) {
+	for _, prev := range []uint32{control.DBStateInArchiveRecovery, control.DBStateShutdownedInRecovery, control.DBStateInProduction} {
+		dir := freshDataDir(t)
+		setState(t, dir, prev)
+		d, err := beginRecovery(dir, true)
+		if err != nil {
+			t.Fatalf("prev=%d: beginRecovery: %v", prev, err)
+		}
+		if !d.crashRecovery {
+			t.Fatalf("prev=%d: a standby start skipped replay", prev)
+		}
+		if got := readControl(t, dir).State; got != control.DBStateInArchiveRecovery {
+			t.Fatalf("prev=%d: state stamped before replay = %d, want %d (DB_IN_ARCHIVE_RECOVERY)",
+				prev, got, control.DBStateInArchiveRecovery)
+		}
+	}
+	dir := freshDataDir(t)
+	if err := stampInArchiveRecovery(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := readControl(t, dir).State; got != control.DBStateInArchiveRecovery {
+		t.Fatalf("stampInArchiveRecovery left state %d", got)
 	}
 }

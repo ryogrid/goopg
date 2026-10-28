@@ -1,8 +1,6 @@
 package executor
 
 import (
-	"strings"
-
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -96,7 +94,7 @@ func (h *inListHash) probe(operand Datum, negated bool) (Datum, bool) {
 	case operand.Kind == KindString && h.strs != nil:
 		key := operand.StringValue()
 		if h.trimOperand {
-			key = strings.TrimRight(key, " ")
+			key = bcTrimRight(key)
 		}
 		_, found = h.strs[key]
 	case operand.Kind == KindInt && h.ints != nil:

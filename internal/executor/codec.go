@@ -242,7 +242,7 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 				// varchar_input removes excess trailing spaces only when the
 				// assignment value exceeds typmod. In-range trailing spaces are
 				// data and must survive COPY/INSERT/UPDATE unchanged.
-				stripped := strings.TrimRight(s, " ")
+				stripped := bcTrimRight(s)
 				if utf8.RuneCountInString(stripped) > n {
 					return "", &ExecError{Code: "22001",
 						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
@@ -295,7 +295,7 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 			// where a char(6) holding the same is 6. Both survive only if the
 			// unbounded value is left alone, which is why this arm is guarded
 			// by `n >= 0` and not widened.
-			stripped := strings.TrimRight(s, " ")
+			stripped := bcTrimRight(s)
 			if utf8.RuneCountInString(stripped) > n {
 				return "", &ExecError{Code: "22001",
 					Message: fmt.Sprintf("value too long for type character(%d)", n)}
@@ -1438,6 +1438,22 @@ func decodeRowRangeInfo(dst Row, cols []catalog.Column, info []colTypeInfo, data
 		// bought nothing and cost 5.62 s = 2.5% of TPC-DS CPU on this one line
 		// (part 4; Go does not reliably elide it). Do not "simplify" this back.
 		c := &cols[i]
+		// C35: a run of skipped columns is walked in one tight loop and its
+		// cells cleared at once (NullDatum is the zero Datum).
+		if info != nil && info[i].skip && !skipColumnRunDisabled {
+			if j, noff := skipColumnRun(info, data, bitmap, i, min(to, storedNatts), off); j > i {
+				if seqScanDeformPoison {
+					for k := i; k < j; k++ {
+						dst[k] = deformPoisonDatum()
+					}
+				} else {
+					clear(dst[i:j])
+				}
+				off = noff
+				i = j - 1
+				continue
+			}
+		}
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
 		// M0097-0077: when the column has a precomputed MissingValue Datum
 		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it

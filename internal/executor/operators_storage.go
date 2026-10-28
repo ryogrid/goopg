@@ -1090,6 +1090,36 @@ type seqScanOp struct {
 	// nil when nothing would be skipped. A survivor is then decoded from
 	// column 0 with colInfo, so a skipped cell never reaches a consumer.
 	pfInfo []colTypeInfo
+	// probeDeferFrom, when > 0, is one past a hash join's last probe-key
+	// column (M0122-0012 C32, armProbeDefer): the first pass decodes columns
+	// [0, probeDeferFrom) and stops, and the join calls finishDeferred for the
+	// rows it matches or emits, which resumes at probeDeferFrom from the
+	// saved byte offset — PG's lazy slot deform (slot_getsomeattrs resuming
+	// at tts_nvalid), which reaches only the hash key attribute in
+	// ExecHashGetHashValue. 0 when not armed. Reset on Open.
+	probeDeferFrom int
+	// probeDeferInfo, when non-nil, is colInfo with the read non-key columns
+	// before probeDeferFrom also marked skip, so the first pass decodes only
+	// the keys there; finishDeferred then re-decodes the row from column 0.
+	// nil when every read column before the stop is a key, and finishDeferred
+	// resumes at the stop instead.
+	probeDeferInfo []colTypeInfo
+	// deferRows / deferFinished count rows returned deferred and rows the
+	// join finished; a join that finishes most of its rows disarms the
+	// deferral (probeDeferDisarmRows), since every finished row pays for both
+	// passes.
+	deferRows     int
+	deferFinished int
+	// deferPending marks o.scanRow as holding only the first pass of the
+	// last returned tuple; deferData/deferBitmap/deferNatts/deferBound/
+	// deferOff are what finishDeferred resumes from (the page stays pinned
+	// until the scan advances).
+	deferPending bool
+	deferData    []byte
+	deferBitmap  []byte
+	deferNatts   int
+	deferBound   int
+	deferOff     int
 	// pfSlab / pfIdx are the COMPILED form of the prefilter predicate, built
 	// once in Open (where a *Context exists, which constant folding needs) and
 	// immutable after. Per-operator rather than shared: each parallel worker
@@ -1679,6 +1709,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		}
 	}
 	o.pfInfo = nil
+	o.probeDeferFrom, o.probeDeferInfo, o.deferPending = 0, nil, false
 	if o.prefilterSet && !scanSkipDisabled {
 		o.pfInfo = prefilterSkipInfo(o.colInfo, o.prefilter.MaxCols, o.qual)
 	}
@@ -1939,6 +1970,7 @@ func (o *seqScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.rel
+	o.deferPending = false
 	for {
 		if o.pinned == nil && o.activePage == nil {
 			// Serial: curBlock walks 0..nBlocks-1 locally. Parallel: the
@@ -2057,8 +2089,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// TestDecodedRowDoesNotAliasSourceBuffer). A ring-buffer page is a
 			// private copy that stays valid until the scan leaves the page.
 			// The copy into a scratch buffer this replaced was ~6 % of a
-			// TPC-H Q1 scan.
-			tuple, err := storage.PageGetHeapTupleNoCopy(page, o.curSlot)
+			// TPC-H Q1 scan. The tuple header and slices are filled in
+			// place rather than returned by value (M0122-0012 C48), as
+			// heapgettup_pagemode fills the scan's HeapTupleData.
+			var tuple storage.HeapTuple
+			err := storage.PageGetHeapTupleNoCopyInto(page, o.curSlot, &tuple)
 			o.curSlot++
 			if err != nil {
 				if o.pinned != nil {
@@ -2069,7 +2104,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			// The header and the snapshot go by pointer, as
+			// HeapTupleSatisfiesVisibility takes them (M0122-0012 C49).
+			if !transam.TupleVisibleSubxactPtr(&tuple.Header, &o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the
@@ -2160,6 +2197,10 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			// HEAP_HASEXTERNAL: only a tuple carrying it can decode to a
+			// TOAST pointer, so the per-row prefix walks below run only then
+			// (M0122-0012 C51; PG guards toast work with HeapTupleHasExternal).
+			hasExternal := tuple.Header.Infomask&storage.HeapHasExternal != 0
 			// EX1-01: the narrowed survivor width. Unset (0) or full
 			// width takes the exact pre-EX1-01 path below; otherwise
 			// only [0, deformBound) is deformed and the tail keeps its
@@ -2219,7 +2260,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// analogue because PG never detoasts a row at all —
 				// expansion happens per-argument inside the called function,
 				// fmgr.h:248,292,309. Ledger: e17-lazy-detoast-divergence.)
-				if !needsDetoastPrefix(o.scanRow, o.prefilter.MaxCols) {
+				if !scanNeedsDetoast(hasExternal, o.scanRow, o.prefilter.MaxCols) {
 					keep, perr := o.evalPrefilter()
 					if perr == nil {
 						earlyDecided = true
@@ -2262,6 +2303,47 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// armed; any consumer read past survivorBound then panics
 				// instead of observing a stale Datum.
 				poisonDeformTail(o.scanRow, survivorBound)
+			} else if o.probeDeferFrom > 0 && o.probeDeferFrom <= survivorBound &&
+				(o.probeDeferInfo != nil || o.probeDeferFrom < survivorBound) {
+				// M0122-0012 C32: decode up to the last hash-probe key and
+				// stop; finishDeferred resumes from here if the join uses the
+				// row. The cells past the stop are NULL until then. A key
+				// that came out toasted cannot be judged in place, so that
+				// row is finished here and takes the ordinary path below.
+				from := o.probeDeferFrom
+				first := o.colInfo
+				if o.probeDeferInfo != nil {
+					first = o.probeDeferInfo
+				}
+				off, derr := o.decodeScanRowRangeInfo(first, tuple.Data, tuple.Bitmap, storedNatts, 0, from, 0)
+				if derr != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+				if scanNeedsDetoast(hasExternal, o.scanRow, from) {
+					if o.probeDeferInfo != nil {
+						from, off = 0, 0
+					}
+					if _, derr := o.decodeScanRowRangeInfo(o.colInfo, tuple.Data, tuple.Bitmap, storedNatts, from, survivorBound, off); derr != nil {
+						if o.pinned != nil {
+							o.pinned.RUnlock()
+						}
+						continue
+					}
+				} else {
+					for i := from; i < survivorBound; i++ {
+						o.scanRow[i] = NullDatum
+					}
+					o.deferPending = true
+					o.deferData, o.deferBitmap, o.deferNatts, o.deferBound, o.deferOff = tuple.Data, tuple.Bitmap, storedNatts, survivorBound, off
+					o.deferRows++
+					if o.deferRows >= probeDeferDisarmRows && 2*o.deferFinished >= o.deferRows {
+						o.probeDeferFrom = 0 // later rows decode eagerly
+					}
+				}
+				poisonDeformTail(o.scanRow, survivorBound)
 			} else if survivorBound < len(o.cols) {
 				if _, derr := o.decodeScanRowRange(tuple.Data, tuple.Bitmap, storedNatts, 0, survivorBound, 0); derr != nil {
 					if o.pinned != nil {
@@ -2291,7 +2373,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		// tuple's datums (or poison when armed), so a whole-row
 		// needsDetoast here could false-positive on a stale tail
 		// pointer and skip a LIVE tuple via the continue below.
-		if needsDetoastPrefix(row, survivorBound) {
+		if scanNeedsDetoast(hasExternal, row, survivorBound) {
 			detoasted, err := DetoastRowBound(o.ctx, rel, o.cols, row, survivorBound)
 				if err != nil {
 					if o.pinned != nil {

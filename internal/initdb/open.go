@@ -418,7 +418,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// record is replayed. Until this slice goopg never read State at all,
 	// so a crashed cluster was indistinguishable from a clean one both to
 	// goopg and to anything reading the control file mid-replay.
-	recov, err := beginRecovery(abs)
+	// A standby's recovery is archive recovery (standby.signal is upstream's
+	// ArchiveRecoveryRequested), and pg_control says so (M0122-0013).
+	startStandby := false
+	if abs != "" {
+		startStandby, _ = IsStandby(abs)
+	}
+	recov, err := beginRecovery(abs, startStandby)
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
@@ -3031,7 +3037,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// resumed inserting WAL over goopg's tail, with no PANIC and nothing
 	// alarming logged. Live data loss; see
 	// docs/design/0131-0014-pgcontrol-runtime-state-and-durability.md §S17.
-	if err := stampInProduction(abs); err != nil {
+	//
+	// A standby stays in archive recovery until promotion: upstream keeps
+	// DB_IN_ARCHIVE_RECOVERY for the whole of a standby's life and stamps
+	// DB_IN_PRODUCTION only at the end of StartupXLOG, after promotion
+	// (M0122-0013). goopg stamped DB_IN_PRODUCTION on a standby too.
+	stamp := stampInProduction
+	if standby {
+		stamp = stampInArchiveRecovery
+	}
+	if err := stamp(abs); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -3068,6 +3083,20 @@ func stampInProduction(dataDir string) error {
 		return nil
 	}
 	return fmt.Errorf("stamp pg_control DB_IN_PRODUCTION: %w", err)
+}
+
+// stampInArchiveRecovery is stampInProduction for a standby: pg_control shows
+// DB_IN_ARCHIVE_RECOVERY, upstream's state for the whole of a standby's
+// recovery (xlogrecovery.c:946-952), until promotion stamps DB_IN_PRODUCTION.
+func stampInArchiveRecovery(dataDir string) error {
+	err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInArchiveRecovery
+		cd.Time = time.Now().Unix()
+	})
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("stamp pg_control DB_IN_ARCHIVE_RECOVERY: %w", err)
 }
 
 // aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.

@@ -92,6 +92,10 @@ type colTypeInfo struct {
 	// asked for but leaves a by-reference value as a pointer. Set per scan in
 	// Open, only for a column skipAttrLen can measure.
 	skip bool
+	// skipLen is skipAttrLen's length rule resolved once for skipColumnRun
+	// (M0122-0012 C35): the fixed width when positive, -1 for a varlena, 0
+	// when the column cannot be measured without decoding.
+	skipLen int16
 }
 
 // skipAttrLen is the byte length of a column's stored value at data, measured
@@ -117,6 +121,95 @@ func skipAttrLen(ci *colTypeInfo, data []byte) (int, bool) {
 	}
 	return n, true
 }
+
+// colSkipLen resolves skipAttrLen's length rule for one column: -1 for a
+// varlena, the fixed width for a by-value column, 0 when it cannot be walked.
+func colSkipLen(ci *colTypeInfo) int16 {
+	if ci.isVarlena {
+		return -1
+	}
+	if ci.intWidth != 0 {
+		return int16(ci.intWidth)
+	}
+	if ci.attByVal && ci.attLen > 0 {
+		return ci.attLen
+	}
+	return 0
+}
+
+// skipColumnRun walks the run of consecutive skipped columns starting at i
+// (and before end) and returns the first column it did not walk and the
+// offset reached (M0122-0012 C35). It is decodeRowRangeInfo's skip arm —
+// catalog.AttAlignPointer, then skipAttrLen — for a whole run at once, the
+// shape of PG's slot_deform_heap_tuple step (att_align_pointer +
+// att_addlength_pointer): the per-column info, bitmap and natts loads, the
+// skipAttrLen call and the per-cell NullDatum copy were most of a skipped
+// column's cost (TPC-H Q17's probe scan walks ~7 per lineitem row to reach
+// l_partkey). A NULL column is walked without advancing. It stops, leaving
+// that column to the general loop, at a column that is not skipped, has no
+// skip length, or does not measure (a TOAST pointer, a truncated or exhausted
+// tuple) — the general loop then gives it exactly the treatment it gave
+// before. The caller clears the walked cells.
+func skipColumnRun(info []colTypeInfo, data, bitmap []byte, i, end, off int) (int, int) {
+	hasNulls := len(bitmap) > 0
+	for ; i < end; i++ {
+		ci := &info[i]
+		if !ci.skip {
+			break
+		}
+		if hasNulls && (bitmap[i>>3]>>(uint(i)&7))&1 == 0 {
+			continue
+		}
+		if off >= len(data) {
+			break
+		}
+		o, n := off, int(ci.skipLen)
+		switch {
+		case n > 0:
+			if a := ci.align; a > 1 {
+				o = (o + a - 1) &^ (a - 1)
+			}
+			if o >= len(data) || len(data)-o < n {
+				return i, off
+			}
+		case n < 0:
+			b := data[o]
+			if b == 0 {
+				if a := ci.align; a > 1 {
+					o = (o + a - 1) &^ (a - 1)
+				}
+				if o >= len(data) {
+					return i, off
+				}
+				b = data[o]
+			}
+			if b&0x01 == 0x01 {
+				if b == 0x01 {
+					return i, off
+				}
+				n = int(b >> 1)
+				if n > len(data)-o {
+					return i, off
+				}
+			} else {
+				if len(data)-o < 4 {
+					return i, off
+				}
+				n = int((binary.LittleEndian.Uint32(data[o:]) >> 2) & 0x3FFFFFFF)
+				if n < 4 || n > len(data)-o {
+					return i, off
+				}
+			}
+		default:
+			return i, off
+		}
+		off = o + n
+	}
+	return i, off
+}
+
+// skipColumnRunDisabled is the A/B and equivalence-test knob for C35.
+var skipColumnRunDisabled = false
 
 // physicalPGVarlenaSize is VARSIZE_ANY over a stored varlena header: the short
 // 1-byte form, or the 4-byte form compressed or not (its size field counts the
@@ -159,6 +252,7 @@ func resolveColTypeInfo(cols []catalog.Column) []colTypeInfo {
 			intWidth:   intWidthForLoweredName(t, lower),
 			isNumeric:  numericFastForLoweredName(t, lower),
 		}
+		info[i].skipLen = colSkipLen(&info[i])
 	}
 	return info
 }

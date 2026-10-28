@@ -303,6 +303,17 @@ type Checkpointer struct {
 	// replay applied; runRecoveryFlush adopts it into pg_control after the
 	// flush, as CreateRestartPoint does (M0122-0013). nil: no restartpoints.
 	restartPointSrc atomic.Pointer[func() (ReplayedCheckpoint, bool)]
+	// replayPosSrc, set on a standby, reports the replay position (the
+	// end of the last applied record, in WrittenLSN's units). In recovery
+	// the max_wal_size trigger measures it instead of the received WAL, as
+	// PG's XLogPageRead tests XLogCheckpointNeeded(readSegNo) on the segment
+	// replay is reading (M0122-0013). nil: the writer's position.
+	replayPosSrc atomic.Pointer[func() uint64]
+	// recoveryVolumeSegNo is the replay segment of the last recovery
+	// volume request (+1; 0 before any): a request fires only from a newer
+	// segment, PG's evaluation point — XLogPageRead tests once per segment
+	// it leaves, not on every poll.
+	recoveryVolumeSegNo atomic.Uint64
 
 	// retainer, when non-nil, runs after each successful
 	// checkpoint marker is durable. The slot-aware production
@@ -427,12 +438,36 @@ func (c *Checkpointer) updateCheckPointDistanceEstimate(redoLSN uint64) {
 	if prior == 0 || redoLSN <= prior {
 		return
 	}
-	nbytes := float64(redoLSN - prior)
+	c.addCheckPointDistanceLocked(float64(redoLSN - prior))
+}
+
+// addCheckPointDistanceLocked folds one cycle's redo distance into the
+// estimate (UpdateCheckPointDistanceEstimate's body). distMu held.
+func (c *Checkpointer) addCheckPointDistanceLocked(nbytes float64) {
 	if c.checkPointDistanceEstimate < nbytes {
 		c.checkPointDistanceEstimate = nbytes
 	} else {
 		c.checkPointDistanceEstimate = 0.90*c.checkPointDistanceEstimate + 0.10*nbytes
 	}
+}
+
+// noteRestartPointDistance is CreateRestartPoint's estimate step (xlog.c):
+// PriorRedoPtr is pg_control's checkPointCopy.redo as it stood before the
+// restartpoint replaced it, and UpdateCheckPointDistanceEstimate(RedoRecPtr -
+// PriorRedoPtr) runs before the old WAL is removed, so the removal's spare-
+// segment sizing sees this cycle. Unlike the primary path, the prior redo
+// comes from pg_control, so a standby's first restartpoint after a start
+// already measures a distance. The adopted redo becomes priorRedoLSN, which
+// the next checkpoint after a promotion measures from, as PG's would from
+// pg_control (M0122-0013).
+func (c *Checkpointer) noteRestartPointDistance(priorRedo, redo uint64) {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	c.priorRedoLSN = redo
+	if priorRedo == 0 || redo <= priorRedo {
+		return
+	}
+	c.addCheckPointDistanceLocked(float64(redo - priorRedo))
 }
 
 // CheckPointDistanceEstimate returns the current moving-average estimate
@@ -646,6 +681,17 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 		return false
 	}
 	written := vr.WrittenLSN()
+	recovery := false
+	if src := c.replayPosSrc.Load(); src != nil && c.recoveryMode.Load() {
+		// A standby requests a restartpoint by the WAL it has REPLAYED:
+		// PG's XLogPageRead (xlogrecovery.c) calls
+		// XLogCheckpointNeeded(readSegNo) when replay leaves a segment, so
+		// WAL that has arrived but is not yet replayed (a lagging startup
+		// process, recovery_min_apply_delay) does not count. Measuring the
+		// received WAL requested a restartpoint on every poll once the
+		// receiver ran ahead, each one a pg_control read in the skip arm.
+		written, recovery = (*src)(), true
+	}
 	segSize := c.segmentSize()
 	// lastCheckpointRedoLSN is stored 1-based (internal convention);
 	// convert back to the 0-based byte position segment numbers use.
@@ -658,7 +704,19 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 	if newSegNo < oldSegNo {
 		return false
 	}
-	return newSegNo-oldSegNo >= c.elapsedSegmentsNeeded()
+	if newSegNo-oldSegNo < c.elapsedSegmentsNeeded() {
+		return false
+	}
+	if recovery {
+		// Once per replay segment: a restartpoint adopts only a newer
+		// replayed checkpoint, so the anchor may stay put; PG re-requests
+		// at the next segment switch, not on every poll.
+		if last := c.recoveryVolumeSegNo.Load(); last != 0 && newSegNo+1 <= last {
+			return false
+		}
+		c.recoveryVolumeSegNo.Store(newSegNo + 1)
+	}
+	return true
 }
 
 // elapsedSegmentsNeeded is XLogCheckpointNeeded's `CheckPointSegments - 1`
@@ -730,6 +788,21 @@ func (c *Checkpointer) SetRestartPointSource(fn func() (ReplayedCheckpoint, bool
 	c.restartPointSrc.Store(&fn)
 }
 
+// SetReplayPositionSource installs the standby's replay position (in
+// WrittenLSN's units) for the max_wal_size trigger in recovery — PG's
+// XLogCheckpointNeeded(readSegNo) in XLogPageRead (nil: the writer's
+// position). Set by standby startup, possibly after Run has started.
+func (c *Checkpointer) SetReplayPositionSource(fn func() uint64) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.replayPosSrc.Store(nil)
+		return
+	}
+	c.replayPosSrc.Store(&fn)
+}
+
 // runCheckpoint executes one checkpoint cycle. When `spread` is
 // true and CompletionTarget > 0, dirty-page writeback is paced so
 // it finishes near `start + Interval * CompletionTarget`. The WAL
@@ -792,7 +865,7 @@ func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
 	if c.recoveryMode.Load() {
-		return c.runRecoveryFlush(ctx)
+		return c.runRecoveryFlush(ctx, shutdown)
 	}
 	start := time.Now()
 	checkpointType := "requested"
@@ -1130,7 +1203,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 // adopts the last replayed checkpoint into pg_control (adoptRestartPoint), so
 // a restarted standby begins replay at that checkpoint's redo rather than at
 // its base backup's.
-func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
+func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) error {
 	start := time.Now()
 	c.cfg.Logger.Info("recovery checkpoint start", "type", "standby")
 	// CreateRestartPoint takes its copy of the last replayed checkpoint
@@ -1141,6 +1214,32 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 	haveRP := false
 	if src := c.restartPointSrc.Load(); src != nil {
 		rp, haveRP = (*src)()
+	}
+	// CreateRestartPoint's skip arm (xlog.c): with no replayed checkpoint
+	// newer than pg_control's, there is nothing to adopt, and PG returns
+	// before CheckPointGuts — no buffer, CLOG or data-file flush. Only a
+	// shutdown restartpoint still stamps DB_SHUTDOWNED_IN_RECOVERY
+	// (adoptRestartPoint's skip arm). A restarted standby replays from
+	// pg_control's redo, so the unflushed pages are recovered from WAL as in
+	// PG. Flushing first made every timed or volume-triggered request on a
+	// standby with no new checkpoint a full flush and data-file sync
+	// (M0122-0013). Without a data directory (no pg_control to compare
+	// against) the flush runs as before.
+	if c.cfg.DataDir != "" {
+		skip, err := restartPointSkips(c.cfg.DataDir, rp, haveRP)
+		if err != nil {
+			return fmt.Errorf("restartpoint pg_control read: %w", err)
+		}
+		if skip {
+			if shutdown {
+				if _, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, true); err != nil {
+					return fmt.Errorf("restartpoint pg_control update: %w", err)
+				}
+			}
+			c.numRequested.Add(1)
+			c.cfg.Logger.Debug("skipping restartpoint, already performed", "redo", rp.Fields.RedoLSN0)
+			return nil
+		}
 	}
 	if err := c.flushDirty(c.buildPacer(ctx, false, start)); err != nil {
 		return fmt.Errorf("flush recovery dirty pages: %w", err)
@@ -1155,13 +1254,42 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 			return fmt.Errorf("sync recovery data files: %w", err)
 		}
 	}
-	if haveRP && c.cfg.DataDir != "" {
-		adopted, err := adoptRestartPoint(c.cfg.DataDir, rp)
+	if c.cfg.DataDir != "" && (haveRP || shutdown) {
+		adopted, priorRedo, err := adoptRestartPointPrior(c.cfg.DataDir, rp, haveRP, shutdown)
 		if err != nil {
 			return fmt.Errorf("restartpoint pg_control update: %w", err)
 		}
 		if adopted {
 			c.cfg.Logger.Info("recovery restart point", "redo", rp.Fields.RedoLSN0, "checkpoint", rp.StartLSN-1)
+			// CreateRestartPoint then deletes the WAL the restartpoint made
+			// redundant (xlog.c: XLByteToSeg(RedoRecPtr) → KeepLogSeg →
+			// RemoveOldXlogFiles), the same retention the primary's
+			// checkpoint runs — slot horizons, max_slot_wal_keep_size and
+			// recycle-by-rename included. Only the arm that adopted a
+			// restartpoint gets there; the skip arm returns first. The
+			// retainer's lag yardstick, the writer's WrittenLSN, is the end
+			// of the received WAL, KeepLogSeg's endptr (the later of the
+			// receive and replay positions). Without it a standby's pg_wal
+			// grew without bound (M0122-0013).
+			// CreateRestartPoint moves RedoRecPtr to the restartpoint's redo
+			// (xlog.c: RedoRecPtr = XLogCtl->RedoRecPtr = lastCheckPoint.redo)
+			// and pg_control's checkPoint to its record. RedoRecPtr is what
+			// XLogCheckpointNeeded measures elapsed segments from, so the
+			// volume trigger (volumeTriggerFires) re-anchors here; without it
+			// a standby kept the anchor it seeded at start and, once
+			// max_wal_size / (1 + checkpoint_completion_target) of WAL had
+			// arrived, ran a full restartpoint flush on every volume tick.
+			// The same pair answers a BASE_BACKUP taken from the standby,
+			// which PG starts at the last restartpoint (M0122-0013).
+			c.lastCheckpointRedoLSN.Store(rp.Fields.RedoLSN0 + 1)
+			c.lastCheckpointLSN.Store(rp.EndLSN)
+			c.lastCheckpointStartLSN.Store(rp.StartLSN)
+			c.noteRestartPointDistance(priorRedo, rp.Fields.RedoLSN0)
+			if c.retainer != nil {
+				if err := c.retainer.Retain(rp.Fields.RedoLSN0 + 1); err != nil {
+					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
+				}
+			}
 		}
 	}
 	c.numRequested.Add(1)
@@ -1170,19 +1298,48 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context) error {
 	return nil
 }
 
-// adoptRestartPoint is CreateRestartPoint's pg_control update (xlog.c):
-// when pg_control still shows an older checkpoint (checkPointCopy.redo <
-// the replayed checkpoint's redo), checkPoint and checkPointCopy become the
-// replayed checkpoint's, and — only while the control file shows
-// DB_IN_ARCHIVE_RECOVERY — minRecoveryPoint is raised to the record's end.
-// Nothing is written otherwise. Reports whether it advanced pg_control.
-func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint) (bool, error) {
+// restartPointSkips is CreateRestartPoint's skip test: no replayed checkpoint
+// (XLogRecPtrIsInvalid(lastCheckPointRecPtr)), or one whose redo is not newer
+// than pg_control's checkPointCopy.redo. A missing control file never skips.
+func restartPointSkips(dataDir string, rp ReplayedCheckpoint, haveRP bool) (bool, error) {
 	cd, err := control.ReadControlFile(dataDir)
 	if err != nil || cd == nil {
 		return false, err
 	}
-	if !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
-		return false, nil
+	return !haveRP || !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0), nil
+}
+
+// adoptRestartPoint is CreateRestartPoint's pg_control update (xlog.c):
+// when pg_control still shows an older checkpoint (checkPointCopy.redo <
+// the replayed checkpoint's redo), checkPoint and checkPointCopy become the
+// replayed checkpoint's, and — only while the control file shows
+// DB_IN_ARCHIVE_RECOVERY — minRecoveryPoint is raised to the record's end
+// and a shutdown restartpoint leaves DB_SHUTDOWNED_IN_RECOVERY. When there is
+// no newer checkpoint (haveRP false, or one already adopted) only a shutdown
+// writes, stamping DB_SHUTDOWNED_IN_RECOVERY whatever the state, as the
+// skip arm does (xlog.c:7685-7692). Reports whether it advanced the
+// checkpoint.
+func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown bool) (bool, error) {
+	adopted, _, err := adoptRestartPointPrior(dataDir, rp, haveRP, shutdown)
+	return adopted, err
+}
+
+// adoptRestartPointPrior is adoptRestartPoint also reporting pg_control's
+// checkPointCopy.redo as it stood before the update — CreateRestartPoint's
+// PriorRedoPtr, which feeds the checkpoint distance estimate.
+func adoptRestartPointPrior(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown bool) (bool, uint64, error) {
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		return false, 0, err
+	}
+	priorRedo := cd.CheckPointCopyRedo
+	if !haveRP || !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
+		if !shutdown {
+			return false, priorRedo, nil
+		}
+		return false, priorRedo, control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateShutdownedInRecovery
+		})
 	}
 	f := rp.Fields
 	err = control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
@@ -1207,12 +1364,17 @@ func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint) (bool, error) {
 		cd.CheckPointCopyOldestCommitTsXid = f.OldestCommitTsXid
 		cd.CheckPointCopyNewestCommitTsXid = f.NewestCommitTsXid
 		cd.CheckPointCopyOldestActiveXid = f.OldestActiveXid
-		if cd.State == control.DBStateInArchiveRecovery && cd.MinRecoveryPoint < rp.EndLSN {
-			cd.MinRecoveryPoint = rp.EndLSN
-			cd.MinRecoveryPointTLI = f.ThisTLI
+		if cd.State == control.DBStateInArchiveRecovery {
+			if cd.MinRecoveryPoint < rp.EndLSN {
+				cd.MinRecoveryPoint = rp.EndLSN
+				cd.MinRecoveryPointTLI = f.ThisTLI
+			}
+			if shutdown {
+				cd.State = control.DBStateShutdownedInRecovery
+			}
 		}
 	})
-	return err == nil, err
+	return err == nil, priorRedo, err
 }
 
 // flushDirty drains the buffer pool's dirty set, using the paced

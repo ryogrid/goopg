@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -83,6 +84,9 @@ type joinOp struct {
 	// column yields a datum that is not int64-representable.
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
+	// intProbe is the flat probe index over lazyIntHash (C59,
+	// int_probe_index.go), rebuilt whenever the map changes.
+	intProbe intProbeIndex
 
 	// EX3-02 Cut 1 (stratum B): per-joinOp build arena for variable-width
 	// payloads (dense_build.go). Parented to the statement context, released
@@ -157,6 +161,10 @@ type joinOp struct {
 	execExprs        exprTreeSlab
 	buildKeyNodes    []int32
 	probeKeyNodes    []int32
+	// probeKeyCol / probeKeyColSet: the probe-side column the single probe
+	// key reads in place when it compiles to a bare ColumnRef (C45), or -1.
+	probeKeyCol    int
+	probeKeyColSet bool
 	execResidualNode int32
 	execCompiled     bool
 
@@ -362,6 +370,9 @@ type joinOp struct {
 	// arrived after the sweep was claimed (parallel_hash_shared.go,
 	// M0146-0005dj).
 	parallelFill      *parallelHashBuild
+	// probeFinish completes a probe row whose non-key columns the probe scan
+	// deferred (M0122-0012 C32, armProbeDefer); nil when not armed.
+	probeFinish func() error
 	parallelProbing   bool
 	parallelSkipProbe bool
 	parallelSweeps    bool
@@ -769,6 +780,7 @@ func (o *joinOp) adoptProbeSide(probeIsLeft bool) error {
 	if o.batches != nil {
 		o.batches.nbatchOutstart = o.batches.nbatch
 	}
+	o.armProbeDefer()
 	return nil
 }
 
@@ -821,6 +833,7 @@ func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
 	if o.batches != nil {
 		o.batches.nbatchOutstart = o.batches.nbatch
 	}
+	o.armProbeDefer()
 	return nil
 }
 
@@ -1879,6 +1892,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := o.finishProbe(); err != nil {
+				return nil, err
+			}
 			o.lazyProbeSrc = nil
 			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
@@ -2086,7 +2102,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// int64 fast-path: hash the probe key as an int64 (no per-row
 			// string alloc). A probe key that isn't int64-representable
 			// cannot equal any (all-int64) build key → no match.
-			kd, kok, kerr := o.evalHashKeyDatumSlot(probeKeyNode, o.probeKeyTrim[0], keySlot)
+			kd, kok, kerr := o.probeIntKeyDatum(probeKeyNode, probeSlot, keySlot)
 			if kerr != nil {
 				return nil, kerr
 			}
@@ -2098,6 +2114,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				// would be a wasted map probe on the majority of rows while
 				// batch 0 is being probed.
 				if bs := o.batches; bs != nil && bs.nbatch > 1 {
+					if err := o.finishProbe(); err != nil {
+						return nil, err
+					}
 					routed, rerr := bs.routeProbeRow(joinBatchHash(kd), slotRow(probeSlot))
 					if rerr != nil {
 						return nil, rerr
@@ -2107,7 +2126,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					}
 				}
 				if ik, iok := datumToInt64Key(kd); iok {
-					matches = o.lazyIntHash[ik]
+					matches = o.intProbeRows(ik)
 					matchIntKey, haveIntKey = ik, true
 				}
 			}
@@ -2122,6 +2141,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			// M0127-P3.2: `key` IS the canonical form joinBatchHash hashes,
 			// so the string lane routes without re-deriving anything.
 			if bs := o.batches; ok && bs != nil && bs.nbatch > 1 {
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				routed, rerr := bs.routeProbeRow(hashKeyString(key), slotRow(probeSlot))
 				if rerr != nil {
 					return nil, rerr
@@ -2170,6 +2192,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		if o.plan.Type == optimizer.JoinTypeSemi || o.plan.Type == optimizer.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
+				// C32: the residual reads the probe row beyond its keys.
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				// Probe source already bound by bindProbe.
 				for _, m := range matches {
 					o.lazyBuildSlot.row = m
@@ -2194,6 +2220,10 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if anyMatch {
 				continue
 			}
+			// C32: the emitted row must be complete.
+			if err := o.finishProbe(); err != nil {
+				return nil, err
+			}
 			o.lazyProbeSrc = nil
 			return o.outerOnlyEmit(probeSlot, chained), nil
 		}
@@ -2202,12 +2232,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 				// The preserved side is the PROBE side: emit the row with
 				// the build side null-padded. The probe source is already
 				// bound; virtualOut composes the two in plan order.
+				if err := o.finishProbe(); err != nil {
+					return nil, err
+				}
 				o.lazyProbeSrc = nil
 				o.lazyBuildSlot.row = nullBuild
 				return o.lazyVirtualOut, nil
 			}
 			// No matches and nothing to preserve — skip this probe row.
+			// C32: the one exit that never finishes a deferred probe row —
+			// PG never fetches past the hash key for it either.
 			continue
+		}
+		// C32: the residual and the emitted row read the probe row beyond
+		// its keys (PG's HJ_SCAN_BUCKET).
+		if err := o.finishProbe(); err != nil {
+			return nil, err
 		}
 		o.lazyMatches = matches
 		// M0127-P4.2: hand the emit loop this bucket's matched bitmap so a
@@ -2237,6 +2277,7 @@ func (o *joinOp) Close() error {
 	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
+	o.intProbe = intProbeIndex{}
 	// EX3-02 Cut 1: drop the stratum-B arena with the table. A
 	// shared-adopted arena is only dereferenced here (statement end
 	// reclaims it); the serial arena is Released eagerly.
@@ -2330,6 +2371,15 @@ type aggregateOp struct {
 	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
 	currentRowVersion      int64   // incremented per input row
 
+	// M0122-0012 C27: a multi-set aggregate evaluates each aggregate's
+	// argument once per input row, not once per grouping set. aggArgRow is
+	// the drain's current input row (1-based); aggArgSeen[i] == aggArgRow
+	// means aggArgVal[i] is aggregate i's argument for that row.
+	aggArgShare bool
+	aggArgRow   int64
+	aggArgSeen  []int64
+	aggArgVal   []Datum
+
 	// E-06 (EX4-03): compiled per-call transition expressions. Node
 	// lists run parallel to plan.Aggs; extraNodes/orderNodes are
 	// per-call lists. aggDeclined marks whole-call UserAgg declines
@@ -2347,6 +2397,46 @@ type aggregateOp struct {
 	aggCompiled    bool
 }
 
+// rollupCloseOrder puts a sorted single rollup's groups in the order PG's
+// one-pass AGG_SORTED emits them (nodeAgg.c agg_retrieve_direct): when the
+// next input row changes a grouping column, every group whose set includes
+// that column ends, the most detailed first, and the empty set's group ends
+// with the input. closedAt[i] is the row that ended rows[i]'s group (0:
+// still open at end of input, so it ends after row lastSeq); sets[setOf[i]]
+// is its grouping set, whose length is its depth in the rollup.
+//
+// This is the order the column comparator in Open rebuilds — groups of one
+// set close in input order, which for input sorted along the rollup is key
+// order, and the groups that close together share their prefix, the longer
+// set's group first — computed from two integers instead of key compares
+// (M0122-0012 C23; it was ~9 % of TPC-DS Q67). The caller uses it only when
+// no group was fed again after it closed, i.e. when the input really was
+// grouped along the rollup.
+func rollupCloseOrder(rows []Row, setOf, closedAt []int, sets [][]int, lastSeq int) []Row {
+	end := func(i int) int {
+		if closedAt[i] == 0 {
+			return lastSeq + 1
+		}
+		return closedAt[i]
+	}
+	idxOf := make([]int, len(rows))
+	for i := range idxOf {
+		idxOf[i] = i
+	}
+	sort.SliceStable(idxOf, func(a, b int) bool {
+		i, j := idxOf[a], idxOf[b]
+		if ei, ej := end(i), end(j); ei != ej {
+			return ei < ej
+		}
+		return len(sets[setOf[i]]) > len(sets[setOf[j]])
+	})
+	sorted := make([]Row, len(rows))
+	for pos, i := range idxOf {
+		sorted[pos] = rows[i]
+	}
+	return sorted
+}
+
 // groupRuntime is one accumulated output group: the GROUP BY key values, the
 // functionally-determined passthrough columns, and one aggRuntime per
 // AggregateCall. It used to be declared inside Open; it is package-level now
@@ -2359,6 +2449,11 @@ type groupRuntime struct {
 	groupValues     Row
 	passthroughVals Row // values of functionally-determined passthrough columns
 	aggs            []aggRuntime
+	// closeSeq is the input row (1-based) whose key left this group behind
+	// in a sorted rollup's drain; 0 while it is still the current group of
+	// its set. Only a sorted single-rollup aggregate stamps it (see
+	// rollupCloseOrder).
+	closeSeq int
 }
 
 // floatSpecialKind encodes the IEEE 754 special-value state for
@@ -2533,6 +2628,7 @@ func aggPlanUsesCTID(p *optimizer.Aggregate) bool {
 
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	o.aggArgShare = false
 	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
 
 	// P9 Finalize: publish the accumulator BEFORE opening the child, because
@@ -2624,6 +2720,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
+	// M0122-0012 C29: founded lists every group in founding order — the
+	// order `order` lists their keys in — so the Simple-mode emit walks the
+	// groups themselves, as PG's agg_retrieve_hash_table iterates the hash
+	// table's entries (ScanTupleHashTable), instead of looking every group up
+	// again by key. With it the int64 lane need not be re-keyed into the
+	// string map at the end of the drain. Partial / Final / row-transport
+	// aggregates publish or rebuild by key and keep `order`.
+	var founded []*groupRuntime
+	emitFounded := o.plan.Mode == optimizer.AggModeSimple && !aggEmitFoundedDisabled
 
 	nGroupCols := len(o.plan.GroupExprs)
 
@@ -2641,6 +2746,15 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		sets = [][]int{all}
 	}
 	multiSet := len(sets) > 1
+	// M0122-0012 C27: PG's ExecBuildAggTrans (execExpr.c) evaluates a
+	// transition's arguments once and then calls the transition for each
+	// concurrently evaluated grouping set; applyAgg runs once per set, so
+	// the argument is cached for the current input row.
+	if multiSet && !aggArgShareDisabled {
+		o.aggArgShare, o.aggArgRow = true, 0
+		o.aggArgSeen = make([]int64, len(o.plan.Aggs))
+		o.aggArgVal = make([]Datum, len(o.plan.Aggs))
+	}
 
 	// A set with no active columns — an ungrouped aggregate, or the
 	// grand-total level of a ROLLUP — produces exactly one output row even
@@ -2667,6 +2781,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		key := o.setGroupKey(si, nil, nil, multiSet)
 		groups[key] = &groupRuntime{setIdx: si, groupValues: gv, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 		order = append(order, key)
+		founded = append(founded, groups[key])
 	}
 
 	// A group lives until the aggregate finishes, so its runtime, its
@@ -2746,19 +2861,36 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// up exactly as the string path alone would have built them.
 	intLane := !aggIntLaneDisabled && !multiSet && len(sets) == 1 && len(sets[0]) == 1 &&
 		!(o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit)
-	var igroups map[int64]*groupRuntime
+	// M0122-0012 C60: the lane's groups live in an intGroupTable (PG's
+	// simplehash TupleHashTable), not a Go map.
+	var igroups *intGroupTable
 	var iorder []int64
 	if intLane {
-		igroups = make(map[int64]*groupRuntime)
+		igroups = newIntGroupTable()
 	}
 	demoteIntGroups := func() {
 		for _, ik := range iorder {
 			key := canonicalNumericKey(ik, 0)
-			groups[key] = igroups[ik]
+			groups[key] = igroups.get(ik)
 			order = append(order, key)
 		}
 		igroups, iorder = nil, nil
 	}
+
+	// M0122-0012 C23: a sorted single-rollup aggregate records when each
+	// group closes, so the emit below can put the groups in PG's one-pass
+	// order without a comparator (see rollupCloseOrder). curGroup[si] is
+	// the group the previous input row fed in set si; a row that feeds a
+	// different one closes it at rowSeq. A group fed again after it closed
+	// means the input is not grouped along the rollup, and closeOrderOK
+	// drops back to the comparator sort.
+	closeOrderOK := !rollupCloseOrderDisabled && o.plan.Strategy == optimizer.AggStrategySorted && o.plan.GroupingSets != nil &&
+		o.plan.Mode == optimizer.AggModeSimple && len(o.plan.Rollups) <= 1 && len(o.plan.HashedRollups) == 0
+	var curGroup []*groupRuntime
+	if closeOrderOK {
+		curGroup = make([]*groupRuntime, len(sets))
+	}
+	rowSeq := 0
 
 	for {
 		slot, err := o.child.Next()
@@ -2790,16 +2922,19 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		rowSeq++
+		o.aggArgRow++
 		for si, set := range sets {
 			var gr *groupRuntime
 			// M0122-0012 slice 24: the int64 group lane (see intLane above).
 			if intLane {
 				if ik, ok := datumToInt64Key(allVals[set[0]]); ok {
-					gr = igroups[ik]
+					gr = igroups.get(ik)
 					if gr == nil {
 						gr = newGroup(si, set, allVals, slot)
-						igroups[ik] = gr
+						igroups.put(ik, gr)
 						iorder = append(iorder, ik)
+						founded = append(founded, gr)
 					}
 				} else {
 					intLane = false
@@ -2818,6 +2953,18 @@ func (o *aggregateOp) Open(ctx *Context) error {
 					gr = newGroup(si, set, allVals, slot)
 					groups[key] = gr
 					order = append(order, key)
+					founded = append(founded, gr)
+				}
+			}
+			if closeOrderOK {
+				if prev := curGroup[si]; prev != gr {
+					if gr.closeSeq != 0 {
+						closeOrderOK = false
+					}
+					if prev != nil {
+						prev.closeSeq = rowSeq
+					}
+					curGroup[si] = gr
 				}
 			}
 
@@ -2847,7 +2994,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 	}
 
-	if intLane {
+	if intLane && !emitFounded {
 		demoteIntGroups()
 	}
 
@@ -2919,11 +3066,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		accum.mu.Unlock()
 	}
 
-	o.rows = make([]Row, 0, len(order))
+	nEmit := len(order)
+	if emitFounded {
+		nEmit = len(founded)
+	}
+	o.rows = make([]Row, 0, nEmit)
 	// emitted[i] is the grouping set that produced o.rows[i]; consumed by the
 	// output sort below. M0125-0048.
-	emitted := make([]int, 0, len(order))
-	for idx, key := range order {
+	emitted := make([]int, 0, nEmit)
+	// closedAt[i] is o.rows[i]'s group closeSeq (M0122-0012 C23).
+	var closedAt []int
+	if closeOrderOK {
+		closedAt = make([]int, 0, nEmit)
+	}
+	for idx := 0; idx < nEmit; idx++ {
 		// M0062-followup: mirror the input-drain ctx check (line ~629)
 		// on the output-materialisation loop. A 1 M-group aggregate's
 		// rebuild can otherwise take seconds without a cancel
@@ -2933,7 +3089,12 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		gr := groups[key]
+		var gr *groupRuntime
+		if emitFounded {
+			gr = founded[idx]
+		} else {
+			gr = groups[order[idx]]
+		}
 		if gr == nil {
 			continue
 		}
@@ -2943,6 +3104,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		o.rows = append(o.rows, out)
 		emitted = append(emitted, gr.setIdx)
+		if closeOrderOK {
+			closedAt = append(closedAt, gr.closeSeq)
+		}
 	}
 	// Sort output rows by GROUP BY key columns for deterministic ordering
 	// matching PostgreSQL's sort-based aggregate behavior. Without an explicit
@@ -2990,7 +3154,9 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			rollup = true
 		}
 	}
-	if nGroupCols > 0 && rollup {
+	if nGroupCols > 0 && rollup && closeOrderOK && len(rollupOrders) == 1 {
+		o.rows = rollupCloseOrder(o.rows, emitted, closedAt, o.plan.GroupingSets, rowSeq)
+	} else if nGroupCols > 0 && rollup {
 		rowSets := emitted
 		inSet := make([]map[int]bool, len(o.plan.GroupingSets))
 		for si, set := range o.plan.GroupingSets {
@@ -3183,7 +3349,7 @@ func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
 	if ci < len(o.gkTrims) && o.gkTrims[ci] && v.Kind == KindString {
 		// trimStringDatum's result, without forming a new Datum.
 		buf = append(buf, 's', ':')
-		return append(buf, strings.TrimRight(v.StringValue(), " ")...)
+		return append(buf, bcTrimRight(v.StringValue())...)
 	}
 	return appendDatumKey(buf, v)
 }
@@ -3191,6 +3357,20 @@ func (o *aggregateOp) appendGroupColKey(buf []byte, ci int, v Datum) []byte {
 // aggIntLaneDisabled turns the hashed aggregate's int64 group lane off. Tests
 // set it to compare the lane's output, order included, with the string path.
 var aggIntLaneDisabled = false
+
+// aggArgShareDisabled makes a multi-set aggregate evaluate each argument
+// once per grouping set again. Tests set it to compare the two.
+var aggArgShareDisabled = false
+
+// aggEmitFoundedDisabled makes a Simple-mode hash aggregate emit by
+// re-looking each group up by key (and re-key its int64 lane) again. Tests
+// set it to compare the two.
+var aggEmitFoundedDisabled = false
+
+// rollupCloseOrderDisabled sends a sorted rollup's output through the column
+// comparator instead of rollupCloseOrder. Tests set it to compare the two
+// orders.
+var rollupCloseOrderDisabled = false
 
 // appendDatumKey appends datumKey(d)'s bytes to buf (M0122-0012). The common
 // kinds are encoded in place; any other kind defers to datumKey itself, so
@@ -3678,7 +3858,8 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 	// First, count how many aggregates exist per SharedStateSlot to detect
 	// actual sharing (a slot with only one agg is not shared).
 	slotCount := map[int]int{}
-	for _, call := range o.plan.Aggs {
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
 		if call.SharedStateSlot >= 0 && call.UserAgg != nil {
 			slotCount[call.SharedStateSlot]++
 		}
@@ -3688,7 +3869,8 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 		computed bool
 	}
 	distinctSlotStates := map[int]slotState{}
-	for i, call := range o.plan.Aggs {
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
 		if call.SharedStateSlot < 0 || call.UserAgg == nil {
 			continue
 		}
@@ -3769,8 +3951,9 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 			gr.aggs[i].distinctUserAggRows = nil
 		}
 	}
-	for i, call := range o.plan.Aggs {
-		d, ferr := o.finishAgg(gr.aggs[i], call)
+	for i := range o.plan.Aggs {
+		call := &o.plan.Aggs[i]
+		d, ferr := o.finishAgg(&gr.aggs[i], call)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -4154,9 +4337,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 		st.count++
 		return nil
 	}
-	arg, err := o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot)
-	if err != nil {
-		return err
+	// M0122-0012 C27: the same input row's argument, already evaluated for
+	// an earlier grouping set, is reused. Only inline scalars are kept: a
+	// value whose bytes live in Buf or an arena may sit in scratch that the
+	// next aggregate's evaluation reuses, so it is evaluated again.
+	var arg Datum
+	if o.aggArgShare && o.aggArgSeen[idx] == o.aggArgRow {
+		arg = o.aggArgVal[idx]
+	} else {
+		var err error
+		if arg, err = o.aggEvalList(o.aggArgNodes, idx, call.Arg, slot); err != nil {
+			return err
+		}
+		if o.aggArgShare && arg.Buf == nil && arg.ArenaID == 0 {
+			o.aggArgVal[idx], o.aggArgSeen[idx] = arg, o.aggArgRow
+		}
 	}
 	// For user-defined aggregates with a strict sfunc: skip rows where any arg is NULL.
 	// STRICT means "returns null on null input" — sfunc not called when any arg is NULL.
@@ -5276,10 +5471,16 @@ func aggDatumToFloat64(d Datum) float64 {
 // that case, so the error must reach the client rather than be turned into a
 // stale state or a NULL. Built-in finalization cannot fail, which is why the
 // bulk of the work lives in finishBuiltinAgg with no error channel at all.
-func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Datum, error) {
+// finishAgg and finishBuiltinAgg read the group's state and the call through
+// pointers and never write them (M0122-0012 C46): aggRuntime is ~700 bytes and
+// AggregateCall ~320, and copying both on every finalized group was most of the
+// finalize path's work in a many-group hash aggregate (TPC-H Q18). PG's
+// finalize_aggregate (nodeAgg.c) likewise works on AggStatePerAgg /
+// AggStatePerGroup pointers.
+func (o *aggregateOp) finishAgg(st *aggRuntime, call *optimizer.AggregateCall) (Datum, error) {
 	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
 	if call.WithinGroup {
-		return finishWithinGroupAgg(st, call, o.ctx), nil
+		return finishWithinGroupAgg(*st, *call, o.ctx), nil
 	}
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
@@ -5436,23 +5637,24 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call optimizer.AggregateCall) (Da
 // An overflow in the fold leaves the state untouched: finishBuiltinAgg has no
 // error channel, and reporting the numeric lane alone is the pre-existing
 // behaviour for that (unreachable in practice) case.
-func foldIntLaneIntoNumeric(st aggRuntime) aggRuntime {
+//
+// It returns the folded (numericSum, sum) pair and leaves st itself untouched,
+// so the finalizers read the state through a pointer without copying it.
+func foldIntLaneIntoNumeric(st *aggRuntime) (numericSum Datum, sum int64) {
 	if st.numericSum.Kind != KindNumeric || st.sum == 0 {
-		return st
+		return st.numericSum, st.sum
 	}
 	total, err := numericAdd(st.numericSum, numericFromInt(st.sum))
 	if err != nil {
-		return st
+		return st.numericSum, st.sum
 	}
-	st.numericSum = total
-	st.sum = 0
-	return st
+	return total, 0
 }
 
 // finishBuiltinAgg finalizes a built-in aggregate. Split out of finishAgg by
 // M0125-0025 so that adding the error channel the user-defined path needs did
 // not have to touch this body's ~100 returns, none of which can fail.
-func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCall) Datum {
+func (o *aggregateOp) finishBuiltinAgg(st *aggRuntime, call *optimizer.AggregateCall) Datum {
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -5470,24 +5672,24 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
-		st = foldIntLaneIntoNumeric(st)
-		if st.numericSum.Kind == KindNumeric {
+		numericSum, _ := foldIntLaneIntoNumeric(st)
+		if numericSum.Kind == KindNumeric {
 			// For float4 input, PostgreSQL uses float4 as the transition type
 			// (float4pl accumulation with intermediate float32 rounding). Simulate
 			// this by casting the final sum through float32 and formatting with
 			// float4 precision (6 significant digits). M0097-0115.
 			if isFloat4TypeName(call.InputType.Name) {
-				fsum := aggDatumToFloat64(st.numericSum)
+				fsum := aggDatumToFloat64(numericSum)
 				return NewStringDatum(strconv.FormatFloat(float64(float32(fsum)), 'g', 6, 32))
 			}
 			// For float8 input, format with 15 significant digits (PostgreSQL's
 			// float8out format) to avoid spurious trailing-digit differences. M0097-0035.
 			switch strings.ToLower(call.InputType.Name) {
 			case "float8", "double precision", "double", "float":
-				fsum := aggDatumToFloat64(st.numericSum)
+				fsum := aggDatumToFloat64(numericSum)
 				return NewStringDatum(strconv.FormatFloat(fsum, 'g', 15, 64))
 			}
-			return st.numericSum
+			return numericSum
 		}
 		return Datum{Kind: KindInt, Int: st.sum}
 	case "avg":
@@ -5503,20 +5705,20 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
 		}
-		st = foldIntLaneIntoNumeric(st)
+		numericSum, sum := foldIntLaneIntoNumeric(st)
 		// avg(float4/float8) returns float8 — use float64 division and format
 		// with %.15g to match PostgreSQL's float8out. M0097-0020.
 		if strings.EqualFold(call.Type.Name, "float8") || strings.EqualFold(call.Type.Name, "float4") {
 			var fsum float64
-			if st.numericSum.Kind == KindNumeric {
-				fsum = aggDatumToFloat64(st.numericSum)
+			if numericSum.Kind == KindNumeric {
+				fsum = aggDatumToFloat64(numericSum)
 			} else {
-				fsum = float64(st.sum)
+				fsum = float64(sum)
 			}
 			return NewStringDatum(strconv.FormatFloat(fsum/float64(st.count), 'g', 15, 64))
 		}
-		if st.numericSum.Kind == KindNumeric {
-			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
+		if numericSum.Kind == KindNumeric {
+			d, err := numericDiv(numericSum, numericFromInt(st.count), call.Pos())
 			if err != nil {
 				return NullDatum
 			}
@@ -5524,7 +5726,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 		}
 		// avg(integer types) must return numeric, not integer (PostgreSQL
 		// behaviour: avg(int2/int4/int8) → numeric). M0097-0053.
-		numSum := numericFromInt(st.sum)
+		numSum := numericFromInt(sum)
 		d, err := numericDiv(numSum, numericFromInt(st.count), call.Pos())
 		if err != nil {
 			return NullDatum
@@ -5661,8 +5863,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, false, false)
+			return st.intVariance(false, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
@@ -5675,8 +5876,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, true, false)
+			return st.intVariance(true, false)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
@@ -5688,8 +5888,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, false, true)
+			return st.intVariance(false, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
@@ -5704,8 +5903,7 @@ func (o *aggregateOp) finishBuiltinAgg(st aggRuntime, call optimizer.AggregateCa
 			return NullDatum
 		}
 		if st.intExact {
-			sx, sxx := st.intSums()
-			return exactIntVariance(sx, sxx, st.count, true, true)
+			return st.intVariance(true, true)
 		}
 		if st.numericExact {
 			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)
@@ -6905,4 +7103,57 @@ func reuseRowLen(r Row, n int) Row {
 		return r[:n]
 	}
 	return make(Row, n)
+}
+
+// probeKeyColDisabled is the A/B and equivalence-test knob for C45.
+var probeKeyColDisabled = false
+
+// probeKeyColArmed is a test hook counting joins that read their probe key in
+// place (once per operator).
+var probeKeyColArmed = func() {}
+
+// probeIntKeyDatum is evalHashKeyDatumSlot for the int lane's single probe
+// key (M0122-0012 C45). When that key compiles to a bare ColumnRef that lands
+// on the probe side of the merged key layout, the cell is read in place from
+// the probe slot — PG's ExecJustOuterVar / ExecJustInnerVar
+// (execExprInterp.c), the special case ExecHashGetHashValue's single-Var key
+// takes — instead of a dispatch through evalFastExpr, the merged-key
+// VirtualSlot and the slot's Get with a 48-byte Datum return. TPC-H Q17's
+// l_partkey probe paid that for each of its 6 M lineitem rows. A trimmed key,
+// a key landing on the null side, or a slot that is not a MaterializedSlot
+// takes evalHashKeyDatumSlot exactly as before.
+func (o *joinOp) probeIntKeyDatum(node int32, probeSlot TupleSlot, keySlot SlotView) (Datum, bool, error) {
+	if !o.probeKeyColSet && o.lazyLW > 0 && o.lazyRW > 0 {
+		// Both side widths are known by the first probe row; a width still
+		// 0 (a child that reveals it only with its first row) is not cached.
+		o.probeKeyColSet = true
+		o.probeKeyCol = -1
+		if !probeKeyColDisabled && !o.probeKeyTrim[0] && node != noExpr && node >= 0 && int(node) < len(o.execExprs) &&
+			o.execExprs[node].Kind == ExprColumnRef {
+			idx := int(int32(binary.LittleEndian.Uint32(o.execExprs[node].payload[:])))
+			if o.plan.BuildLeft {
+				if idx >= o.lazyLW && idx-o.lazyLW < o.lazyRW {
+					o.probeKeyCol = idx - o.lazyLW
+				}
+			} else if idx >= 0 && idx < o.lazyLW {
+				o.probeKeyCol = idx
+			}
+			if o.probeKeyCol >= 0 {
+				probeKeyColArmed()
+			}
+		}
+	}
+	if c := o.probeKeyCol; o.probeKeyColSet && c >= 0 {
+		if ms, ok := probeSlot.(*MaterializedSlot); ok && c < len(ms.row) {
+			d := &ms.row[c]
+			if seqScanDeformPoison {
+				checkDeformPoison(*d)
+			}
+			if d.IsNull() {
+				return Datum{}, false, nil
+			}
+			return *d, true, nil
+		}
+	}
+	return o.evalHashKeyDatumSlot(node, o.probeKeyTrim[0], keySlot)
 }

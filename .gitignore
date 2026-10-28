@@ -6,6 +6,9 @@
 .ralph/.ralph_session
 .ralph/.ralph_session_history
 .ralph/.claude_session_id
+.ralph/.claude_session_id.api
+.ralph/.claude_auth_state.json
+.ralph/.claude_auth_state.json.tmp.*
 .ralph/.devin_session_id
 .ralph/.response_analysis
 .ralph/.circuit_breaker_state

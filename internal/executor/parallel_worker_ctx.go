@@ -82,6 +82,7 @@ func NewWorkerContext(leader *Context, workerMctx *mmgr.Context, workerCtx conte
 	w.TxnLockBackendID = leader.TxnLockBackendID
 	w.ProcNum = leader.ProcNum
 	w.Params = leader.Params
+	w.indexReadSets = leader.indexReadSets
 	w.Now = leader.Now
 	w.MaxRows = leader.MaxRows
 	w.WorkMem = leader.WorkMem

@@ -1086,6 +1086,10 @@ type Context struct {
 	// DELETE has no new). M0100-0007.
 	MergeOldRow Row
 	MergeNewRow Row
+	// indexReadSets is the executing statement's index-scan read sets
+	// (computeIndexReadSets, M0122-0012 C34), published by OpIterator.Open
+	// and copied into worker contexts. Read-only once published.
+	indexReadSets indexReadSets
 }
 
 // SubPlanSiteStats counts what one sublink expression (a

@@ -82,6 +82,26 @@ func pgIndexComparatorForOID(oid uint32) nbtree.PGAttrComparator {
 	return nil
 }
 
+// pgIndexIntWidthForOID is the image width of a key type whose comparator
+// pgIndexComparatorForOID answers with PGCompareInt2/4/8 (signed integer
+// order), or 0 — nbtree.PGKeyAttr.IntWidth (M0122-0012 C37). It must list
+// exactly the OIDs those three cases list; oid's unsigned order is not one.
+func pgIndexIntWidthForOID(oid uint32, typLen int16) uint8 {
+	var w uint8
+	switch oid {
+	case catalog.OIDInt2:
+		w = 2
+	case catalog.OIDInt4, catalog.OIDDate:
+		w = 4
+	case catalog.OIDInt8, catalog.OIDTime, catalog.OIDTimestamp, catalog.OIDTimestampTZ:
+		w = 8
+	}
+	if int16(w) != typLen {
+		return 0
+	}
+	return w
+}
+
 // pgIndexKeyTypeOID resolves a key column's declared type to the built-in type
 // OID whose opclass orders it.
 //
@@ -301,6 +321,7 @@ func buildPGIndexKeyDesc(idx *catalog.Index) (*nbtree.PGIndexKeyDesc, error) {
 			Compare:    cmp,
 			Desc:       desc,
 			NullsFirst: nullsFirst,
+			IntWidth:   pgIndexIntWidthForOID(typOID, ta.TypLen),
 		})
 	}
 	return &nbtree.PGIndexKeyDesc{Attrs: attrs}, nil

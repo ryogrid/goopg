@@ -587,43 +587,9 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// read: a character-string comparison never qualifies, and finding
 		// that out per row cost TPC-DS Q81's `ctr1.ctr_state = ctr_state`
 		// 9 % more instructions.
-		if n.constVal == nil && op.IsComparison() && n.payload[16]&4 == 0 &&
-			binary.LittleEndian.Uint64(n.payload[8:16]) == 0 {
-			if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && !lp.IsNull() && lp.Kind != KindString {
-				if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && !rp.IsNull() && fastBinarySimple(n, op, lp, rp) {
-					checkDeformPoison(*lp)
-					checkDeformPoison(*rp)
-					if c, ok := fastCompareDatum(lp, rp); ok {
-						return NewBoolDatum(cmpResult(op, c)), nil
-					}
-				}
-			}
-		}
-		// A character-string comparison of two operands that live somewhere
-		// already compares them in place when both are plain strings: that
-		// is evalFastBinaryApply's plain-string branch (slice 30), reached
-		// without copying four Datums through the two operand calls and the
-		// apply. The general path gets there the same way — two strings fail
-		// fastBinarySimple, and coerceUnknownLit replaces a literal only
-		// opposite an operand of the coerced kind, which a string is not
-		// when that kind is not KindString. TPC-DS Q2's and Q59's seven
-		// `CASE WHEN d_day_name = '<day>'` arms per row went the long way
-		// (M0122-0012 slice 89).
-		if op.IsComparison() && n.payload[16]&4 != 0 && (n.constVal == nil || DatumKind(n.payload[17]) != KindString) {
-			if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && lp.Kind == KindString {
-				if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && rp.Kind == KindString {
-					if ls, rs := stringValueInline(lp), stringValueInline(rp); plainCompareString(ls) && plainCompareString(rs) {
-						if lbp, rbp := binary.LittleEndian.Uint32(n.payload[8:]), binary.LittleEndian.Uint32(n.payload[12:]); lbp > 0 || rbp > 0 {
-							if lbp > 0 || n.payload[16]&1 != 0 {
-								ls = strings.TrimRight(ls, " ")
-							}
-							if rbp > 0 || n.payload[16]&2 != 0 {
-								rs = strings.TrimRight(rs, " ")
-							}
-						}
-						return NewBoolDatum(cmpResult(op, strings.Compare(ls, rs))), nil
-					}
-				}
+		if op.IsComparison() {
+			if b, ok := fastComparisonBool(exprs, n, op, slot, ctx); ok {
+				return NewBoolDatum(b), nil
 			}
 		}
 		left, err := evalFastExpr(exprs, n.childA, slot, ctx)
@@ -689,6 +655,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				if c, ok := fastCompareDatum(&left, &right); ok {
 					return NewBoolDatum(cmpResult(op, c)), nil
 				}
+			}
+			// M0122-0012 C53: NUMERIC (or int and NUMERIC) arithmetic calls
+			// the numeric function itself — evalBinary's arm for those
+			// kinds is exactly promoteIntOperand on both sides and then
+			// numericAdd / numericSub / numericMul — instead of passing both
+			// 48-byte operands by value through evalBinary's preamble. PG
+			// resolves numeric_add / numeric_mul at plan time and calls them
+			// directly (EEOP_FUNCEXPR_STRICT). TPC-H Q1's three per-row
+			// products went the long way.
+			if (op == parser.OpAdd || op == parser.OpSub || op == parser.OpMul) && fastNumericArithOperands(&left, &right) {
+				result, err := fastNumericArith(op, left, right)
+				if err != nil {
+					return Datum{}, err
+				}
+				if err := fastIntOverflow(n, &result); err != nil {
+					return Datum{}, err
+				}
+				return result, nil
 			}
 			result, err := evalBinary(op, left, right, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))), ctx)
 			if err != nil {
@@ -784,10 +768,10 @@ func evalFastBinaryApply(n *ExprNode, op parser.OpCode, lp, rp *Datum, ctx *Cont
 			// literal drops its trailing blanks.
 			if lbp, rbp := int64(binary.LittleEndian.Uint32(n.payload[8:])), int64(binary.LittleEndian.Uint32(n.payload[12:])); lbp > 0 || rbp > 0 {
 				if lbp > 0 || n.payload[16]&1 != 0 {
-					ls = strings.TrimRight(ls, " ")
+					ls = bcTrimRight(ls)
 				}
 				if rbp > 0 || n.payload[16]&2 != 0 {
-					rs = strings.TrimRight(rs, " ")
+					rs = bcTrimRight(rs)
 				}
 			}
 			*out = NewBoolDatum(cmpResult(op, strings.Compare(ls, rs)))
@@ -879,10 +863,22 @@ func fastOperandPtr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) 
 	n := &exprs[idx]
 	switch n.Kind {
 	case ExprColumnRef:
-		if s, ok := slot.(*MaterializedSlot); ok {
-			colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		switch s := slot.(type) {
+		case *MaterializedSlot:
 			if colIdx >= 0 && colIdx < len(s.row) {
 				return &s.row[colIdx]
+			}
+		case rowSlotView:
+			// The seq scan's EARLY qual runs over rowSlotView(scanRow)
+			// (evalPrefilter). Without this arm every early qual missed
+			// both in-place comparison branches of fastComparisonBool and
+			// copied its operands through evalFastBinaryApply per row —
+			// TPC-H Q10's l_returnflag = 'R' over 6 M lineitem rows was ~18 %
+			// of the query (M0122-0012 C58). PG's scan qual reads the scan
+			// slot's tts_values in place (EEOP_SCAN_VAR).
+			if colIdx >= 0 && colIdx < len(s) {
+				return &s[colIdx]
 			}
 		}
 	case ExprOuterColumnRef, ExprExecParamRef:
@@ -1190,6 +1186,85 @@ type exprCaseInfo struct {
 	whenLit      []bool
 }
 
+
+// fastNumericArithOperands reports that evalBinary's +, - and * on left and
+// right would take its NUMERIC arm with nothing before it applying: both
+// non-NULL, each KindNumeric or KindInt, at least one KindNumeric (no time,
+// date, interval or string operand reaches it). fastNumericArith is that arm.
+// Must agree with evalBinary (pattern_sibling_paths_must_agree; C53).
+func fastNumericArithOperands(left, right *Datum) bool {
+	return !left.IsNull() && !right.IsNull() &&
+		(left.Kind == KindNumeric || right.Kind == KindNumeric) &&
+		(left.Kind == KindNumeric || left.Kind == KindInt) &&
+		(right.Kind == KindNumeric || right.Kind == KindInt)
+}
+
+// fastNumericArith is evalBinary's NUMERIC +, - and * arm for operands
+// fastNumericArithOperands admits.
+func fastNumericArith(op parser.OpCode, left, right Datum) (Datum, error) {
+	promoteIntOperand(&left)
+	promoteIntOperand(&right)
+	switch op {
+	case parser.OpAdd:
+		return numericAdd(left, right)
+	case parser.OpSub:
+		return numericSub(left, right)
+	default:
+		return numericMul(left, right)
+	}
+}
+
+// fastComparisonBool is evalFastExpr's two in-place comparison branches for a
+// comparison node n with opcode op: (result, true) when one applies, (_,
+// false) when the general path must evaluate it. evalFastExpr wraps the
+// result in a bool Datum; evalFastCase's searched WHEN consumes it as a bool,
+// as PG's EEOP_JUMP_IF_NOT_TRUE reads the comparison step's result in place
+// (M0122-0012 C50). One helper serves both so they cannot disagree. NULL
+// operands never take it: both branches require non-NULL values, and NULL
+// handling stays with the general path.
+func fastComparisonBool(exprs exprTreeSlab, n *ExprNode, op parser.OpCode, slot SlotView, ctx *Context) (bool, bool) {
+	if n.constVal == nil && op.IsComparison() && n.payload[16]&4 == 0 &&
+		binary.LittleEndian.Uint64(n.payload[8:16]) == 0 {
+		if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && !lp.IsNull() && lp.Kind != KindString {
+			if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && !rp.IsNull() && fastBinarySimple(n, op, lp, rp) {
+				checkDeformPoison(*lp)
+				checkDeformPoison(*rp)
+				if c, ok := fastCompareDatum(lp, rp); ok {
+					return cmpResult(op, c), true
+				}
+			}
+		}
+	}
+	// A character-string comparison of two operands that live somewhere
+	// already compares them in place when both are plain strings: that
+	// is evalFastBinaryApply's plain-string branch (slice 30), reached
+	// without copying four Datums through the two operand calls and the
+	// apply. The general path gets there the same way — two strings fail
+	// fastBinarySimple, and coerceUnknownLit replaces a literal only
+	// opposite an operand of the coerced kind, which a string is not
+	// when that kind is not KindString. TPC-DS Q2's and Q59's seven
+	// `CASE WHEN d_day_name = '<day>'` arms per row went the long way
+	// (M0122-0012 slice 89).
+	if op.IsComparison() && n.payload[16]&4 != 0 && (n.constVal == nil || DatumKind(n.payload[17]) != KindString) {
+		if lp := fastOperandPtr(exprs, n.childA, slot, ctx); lp != nil && lp.Kind == KindString {
+			if rp := fastOperandPtr(exprs, n.childB, slot, ctx); rp != nil && rp.Kind == KindString {
+				if ls, rs := stringValueInline(lp), stringValueInline(rp); plainCompareString(ls) && plainCompareString(rs) {
+					if lbp, rbp := binary.LittleEndian.Uint32(n.payload[8:]), binary.LittleEndian.Uint32(n.payload[12:]); lbp > 0 || rbp > 0 {
+						if lbp > 0 || n.payload[16]&1 != 0 {
+							ls = bcTrimRight(ls)
+						}
+						if rbp > 0 || n.payload[16]&2 != 0 {
+							rs = bcTrimRight(rs)
+						}
+					}
+					return cmpResult(op, strings.Compare(ls, rs)), true
+				}
+			}
+		}
+	}
+	return false, false
+}
+
 // evalFastCase is evalCaseExpr's compiled twin and must agree with it arm
 // for arm: the operand is evaluated once; each WHEN in order is a boolean
 // predicate (searched form) or `operand = WHEN` resolved through
@@ -1207,6 +1282,23 @@ func evalFastCase(exprs exprTreeSlab, ci *exprCaseInfo, slot SlotView, ctx *Cont
 		operand = v
 	}
 	for i, w := range ci.whens {
+		// Searched form over a comparison: consume its result as a bool
+		// through the in-place comparison evalFastExpr itself takes, instead
+		// of a bool Datum returned through two calls (M0122-0012 C50; PG's
+		// EEOP_JUMP_IF_NOT_TRUE). Anything else — NULL operands included —
+		// takes the evaluator below, exactly as before.
+		if !hasOperand {
+			if wn := &exprs[w]; wn.Kind == ExprBinaryOp && wn.childA != noExpr && wn.childB != noExpr {
+				if op := parser.OpCode(wn.payload[0]); op.IsComparison() {
+					if matched, ok := fastComparisonBool(exprs, wn, op, slot, ctx); ok {
+						if matched {
+							return evalFastCaseResult(exprs, ci.thens[i], slot, ctx)
+						}
+						continue
+					}
+				}
+			}
+		}
 		whenVal, err := evalFastExpr(exprs, w, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -1224,11 +1316,27 @@ func evalFastCase(exprs exprTreeSlab, ci *exprCaseInfo, slot SlotView, ctx *Cont
 			matched = whenVal.Kind == KindBool && whenVal.BoolValue()
 		}
 		if matched {
-			return evalFastExpr(exprs, ci.thens[i], slot, ctx)
+			return evalFastCaseResult(exprs, ci.thens[i], slot, ctx)
 		}
 	}
 	if ci.els != noExpr {
-		return evalFastExpr(exprs, ci.els, slot, ctx)
+		return evalFastCaseResult(exprs, ci.els, slot, ctx)
 	}
 	return NullDatum, nil
+}
+
+// evalFastCaseResult evaluates a CASE result arm. A constant arm — TPC-DS
+// Q59's `ELSE null`, taken by six of its seven CASE aggregates per row — is
+// returned as evalFastExpr's ExprConstVal / ExprNullConst arms return it,
+// without re-entering the evaluator (EEOP_CONST writes the constant in place).
+func evalFastCaseResult(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (Datum, error) {
+	if idx >= 0 && int(idx) < len(exprs) {
+		switch n := &exprs[idx]; n.Kind {
+		case ExprConstVal:
+			return *n.constVal, nil
+		case ExprNullConst:
+			return NullDatum, nil
+		}
+	}
+	return evalFastExpr(exprs, idx, slot, ctx)
 }

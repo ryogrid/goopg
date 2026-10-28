@@ -1,0 +1,15 @@
+CREATE TABLE p0e15b (id int);
+CREATE INDEX p0e15b_id ON p0e15b (id);
+INSERT INTO p0e15b SELECT g FROM generate_series(1, 2000) g;
+BEGIN;
+INSERT INTO p0e15b VALUES (99999);
+ROLLBACK;
+SELECT 'before VACUUM' AS phase, count(*) FROM p0e15b;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM p0e15b;
+VACUUM p0e15b;
+SELECT 'after VACUUM' AS phase, count(*) FROM p0e15b;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM p0e15b;
+SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT 'after VACUUM, seq scan only' AS phase, count(*) FROM p0e15b;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM p0e15b;
+DROP TABLE p0e15b;

@@ -1,0 +1,32 @@
+CREATE TABLE
+CREATE INDEX
+INSERT 0 2000
+BEGIN
+INSERT 0 1
+ROLLBACK
+VACUUM
+SET
+SET
+               QUERY PLAN                
+-----------------------------------------
+ Index Only Scan using p0e15_id on p0e15
+   Index Cond: (id = 99999)
+(2 rows)
+
+ id 
+----
+(0 rows)
+
+RESET
+RESET
+ count 
+-------
+  2000
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE

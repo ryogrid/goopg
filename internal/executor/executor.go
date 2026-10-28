@@ -697,9 +697,45 @@ func buildCompleteChild(n optimizer.Node, bound int, consumers []optimizer.Expr,
 			return nil, err
 		}
 		return finishJoinNode(p, left, right, leftBound, rightBound, scope), nil
+	case *optimizer.SeqScan:
+		return buildCompleteScan(n, bound, consumers, scope)
+	case *optimizer.Filter:
+		// A Filter directly over the scan is absorbed into it (slice 29):
+		// the scan evaluates the qual itself and skipReadSet adds the
+		// qual's columns.
+		if _, ok := p.Child.(*optimizer.SeqScan); ok {
+			return buildCompleteScan(n, bound, consumers, scope)
+		}
 	}
 	return buildNode(n, bound, scope)
 }
+
+// buildCompleteScan builds a seq scan (or a Filter absorbed into one) whose
+// rows reach only consumers, and gives the scan their read set (M0122-0012
+// C57): the scan decodes, of its deform window, only the columns the
+// consumers and its own qual read. TPC-H Q18's IN-subquery HashAggregate
+// reads l_orderkey and l_quantity, but HammerDB's lineitem puts l_shipdate,
+// l_discount, l_extendedprice and l_suppkey before l_quantity, so the prefix
+// bound alone decoded a date and five NUMERICs per row to use two. PG's
+// aggregate input expressions fetch only what they reference
+// (ExecBuildAggTrans, EEOP_SCAN_FETCHSOME), and slot_deform_heap_tuple
+// leaves a by-reference value as a pointer, so a column nobody reads costs
+// PG no conversion. Unknown consumer shapes leave the read set nil (full
+// decode), as markProjectScanReads does.
+func buildCompleteScan(n optimizer.Node, bound int, consumers []optimizer.Expr, scope *instrumenter) (Operator, error) {
+	op, err := buildNode(n, bound, scope)
+	if err != nil || scanSkipDisabled || aggScanReadSetDisabled {
+		return op, err
+	}
+	if so := unwrapSeqScanOp(op); so != nil {
+		so.readCols = deformScanReadSet(len(so.cols), consumers...)
+	}
+	return op, nil
+}
+
+// aggScanReadSetDisabled turns buildCompleteScan's read set off. Tests and
+// the A/B set it to compare the narrowed scan with the full decode.
+var aggScanReadSetDisabled = false
 
 // finishJoinNode wires a Join over its built children — shared by buildNode's
 // Join arm and buildCompleteChild so the two cannot drift.

@@ -1,0 +1,44 @@
+CREATE TABLE
+CREATE INDEX
+INSERT 0 2000
+BEGIN
+INSERT 0 1
+ROLLBACK
+     phase     | count 
+---------------+-------
+ before VACUUM |  2000
+(1 row)
+
+        QUERY PLAN        
+--------------------------
+ Aggregate
+   ->  Seq Scan on p0e15b
+(2 rows)
+
+VACUUM
+    phase     | count 
+--------------+-------
+ after VACUUM |  2001
+(1 row)
+
+        QUERY PLAN        
+--------------------------
+ Aggregate
+   ->  Seq Scan on p0e15b
+(2 rows)
+
+SET
+SET
+SET
+            phase            | count 
+-----------------------------+-------
+ after VACUUM, seq scan only |  2001
+(1 row)
+
+        QUERY PLAN        
+--------------------------
+ Aggregate
+   ->  Seq Scan on p0e15b
+(2 rows)
+
+DROP TABLE

@@ -321,13 +321,27 @@ func vacuumCore(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNod
 		// ALL_VISIBLE when every remaining tuple is visible to the horizon;
 		// additionally ALL_FROZEN when the freeze pass ran and every live
 		// tuple sits at-or-below this pass's freeze cutoff.
+		//
+		// The heap page's PD_ALL_VISIBLE goes with the map's ALL_VISIBLE bit
+		// (M0122-0012 C47): lazy_scan_prune sets it with PageSetAllVisible and
+		// dirties the page before visibilitymap_set, and clears it with the
+		// map when the page is no longer all-visible (vacuumlazy.c). The map
+		// record's redo sets it on a standby (recovery.go), so this keeps the
+		// primary's pages the same. A seq scan skips per-tuple visibility on
+		// a page with the bit.
 		if opts.VM != nil {
 			switch {
 			case opts.FreezeBelow > 0 && storage.PageAllFrozen(page, opts.FreezeBelow):
+				pageDirty = setPageAllVisible(pool, slot, page) || pageDirty
 				opts.VM.SetAllFrozen(rel, blk)
 			case storage.PageAllVisible(page, horizon):
+				pageDirty = setPageAllVisible(pool, slot, page) || pageDirty
 				opts.VM.SetAllVisible(rel, blk)
 			default:
+				if storage.PageClearAllVisible(page) {
+					pool.MarkDirty(slot)
+					pageDirty = true
+				}
 				opts.VM.ClearBlockNoWAL(rel, blk)
 			}
 		}
@@ -481,4 +495,17 @@ func Analyze(pool *storage.Pool, mgr *transam.Manager, rel storage.RelFileNode, 
 		out.AvgWidth = float64(totalBytes) / float64(out.Rows)
 	}
 	return out, nil
+}
+
+// setPageAllVisible sets the page's PD_ALL_VISIBLE and dirties it when it was
+// not already set, reporting whether it did (PageSetAllVisible +
+// MarkBufferDirty in lazy_scan_prune). The caller holds the page's cleanup
+// lock.
+func setPageAllVisible(pool *storage.Pool, slot *storage.Slot, page storage.Page) bool {
+	if storage.PageIsAllVisible(page) {
+		return false
+	}
+	storage.PageSetAllVisible(page)
+	pool.MarkDirty(slot)
+	return true
 }

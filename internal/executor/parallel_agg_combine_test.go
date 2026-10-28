@@ -43,7 +43,7 @@ func finishAggValue(ctx *Context, call optimizer.AggregateCall, st *aggRuntime) 
 	op := aggTestOp(ctx)
 	c := call
 	c.Arg = &optimizer.ColumnRef{Index: 0}
-	return op.finishAgg(*st, c)
+	return op.finishAgg(st, &c)
 }
 
 // datumFloatForTest coerces a finished aggregate result to float64.
