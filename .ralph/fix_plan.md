@@ -1861,6 +1861,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
     - Dropped: C55 previous\-key memo in the hashed aggregate's int lane \(`aggregateOp\.Open` igroups vs PG
       LookupTupleHashEntry, H Q18 instructions −1\.0 %\)\.
+    - Dropped: C61 right/full join matched bitmaps cached on the int probe index entry \(`matchedIntBucket` vs PG
+      HeapTupleHeaderSetMatch, H Q13 wall \+1\.7 %\)\.
     - Dropped: C56 abbreviated leading text sort key \(`sortChunk` comparator vs PG varstr\_abbrev\_convert /
       ApplySortComparator on SortTuple\.datum1, DS Q47 instructions −0\.55 %\)\.
     - **Family on the Below\-bar list \(rotation rule, loop \#246\):** 48\-byte Datum / struct by\-value copy elimination \(C48, C49,
@@ -2749,6 +2751,26 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       the bar\. PG's bpchareq trims both sides per call too\.
     - DS Q67: the sort family \(Below\-bar\)\.
     - **No qualifying candidate; not a miss\.**
+  - **C59 slice 3a 2026\-10\-28 \(loop \#259, misses 0\)**: S9 census `routing\-20261028r` reused \(`13336ab8a` analysis
+    only\)\. H Q13's residual map share after slice 1 \(`tmp/g3\-255/h13\.data`\): `mapaccess1\_fast64` under `nextLazy` 2\.7 %
+    and `fillSweepNext` 0\.6 %, `mapassign\_fast64` 0\.6 % — the right join's matched flags: `matchedIntBucket` looks
+    `lazyMatchedI\[key\]` up for every matched probe row \(~1\.48 M lookups for 150 K keys\)\.
+    - C61: the probe index entry caches its key's matched bitmap \(`intProbeEntry\.matched`, set from
+      `matchedIntBucket`'s first map access for that key\), so later matches of the key read it from the entry the probe
+      just found; `lazyMatchedI` stays the source of truth for the fill sweep and the parallel merge, and the cache is
+      cleared whenever `lazyMatchedI` is not the map it was filled from \(held, so its address cannot be reused\)\. PG keeps
+      the match bit on the build tuple itself \(`HeapTupleHeaderSetMatch` in ExecScanHashBucket's caller, nodeHashjoin\.c\)
+      — no lookup per match\.
+    - **Target \(C61\)**: TPC\-H SF1 **Q13**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 13`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~3 % \(most of the
+      ~3\.9 % map share\)\.
+    - **C61 MEASURED AND DROPPED \(loop \#259\)**: implemented \(`intProbeEntry\.matched` cache set from `matchedIntBucket`'s
+      first map access, cleared when `lazyMatchedI` is another map; tests: right/full joins incl\. correlated
+      re\-execution and a multi\-batch right join vs the map path, plus a direct reset test — the reset\-guard mutation
+      fails it\)\. Q13 warm wall 6 alternating rounds: median 1\.72 → 1\.75 s \(**\+1\.7 %, misses the bar**\); user cycles
+      8\.11/7\.70 → 7\.79/7\.82 G \(mixed\), instructions 11\.24 → 11\.17 G \(−0\.6 %\)\. Code reverted\. **Miss counter 1\.**
+      - Lesson: the matched\-bitmap lookups follow the probe of the same key, so their map slots are warm — their sampled
+        share was not a stall the entry cache could remove\. Only the cold first touch of a structure is worth moving\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6596,6 +6618,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     live\.
   - S9 re\-check 2026\-10\-28 \(loop \#258\) — **exhausted at `c3e5937a9`**, census `routing\-20261028r/` reused:
     `c3e5937a9` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#259\) — **exhausted at `13336ab8a`**, census `routing\-20261028r/` reused:
+    `13336ab8a` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
