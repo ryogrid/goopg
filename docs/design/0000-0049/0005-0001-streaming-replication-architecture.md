@@ -339,8 +339,37 @@ goopg now does the same:
 Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts an estimate of 8192 − 16 after the restartpoint, and no
 change from a source-less flush.
 
+### Restartpoint moves RedoRecPtr \(2026\-10\-28, M0122\-0013\)
+
+`CreateRestartPoint` sets `RedoRecPtr = XLogCtl->RedoRecPtr = lastCheckPoint.redo` and makes pg\_control's
+`checkPoint` the restartpoint's record (xlog.c). `RedoRecPtr` is what `XLogCheckpointNeeded` measures elapsed
+segments from. Replay calls that when it switches segments (xlogrecovery.c XLogPageRead) and requests the next
+restartpoint once `CheckPointSegments − 1` segments have gone by.
+
+goopg's restartpoint never moved the checkpointer's redo anchor (`lastCheckpointRedoLSN`). Every runtime's
+checkpointer, a standby's included, gets `max_wal_size` (cmd/goopg/main.go), and a standby runs in recovery mode,
+so `runCheckpoint` routes to `runRecoveryFlush`. The volume trigger kept the anchor it seeded at start, and once
+`max_wal_size / (1 + checkpoint_completion_target)` of WAL had arrived (512 MB at the defaults), every 1-second volume
+tick ran a full restartpoint flush and data-file sync.
+
+`runRecoveryFlush`'s adopted arm now stores:
+
+- the restartpoint's redo as `lastCheckpointRedoLSN`, which re-anchors `volumeTriggerFires`;
+- its record start and end as `lastCheckpointStartLSN` / `lastCheckpointLSN`.
+
+`CheckpointRedoLSN` / `LastCheckpointRecordLSN` therefore answer a BASE\_BACKUP from the standby with the last
+restartpoint, as PG's backup-from-standby starts there, instead of 0 and the received-WAL fallback. After a
+promotion, the first checkpoint's FPI epoch measures from the last restartpoint's redo, as PG's would.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts the redo (8193, 1-based) and the record start after the
+restartpoint. Removing the stores fails it.
+
 Still missing (ledgered):
 
+- the restartpoint skip arm still flushes: PG's returns before `CheckPointGuts` when there is no newer checkpoint
+  to adopt;
+- the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
+  reading;
 - no `PreallocXlogFiles`;
 - no `TruncateSUBTRANS` at a restartpoint;
 - no `archive_cleanup_command`;

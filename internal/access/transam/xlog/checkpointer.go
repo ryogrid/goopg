@@ -1196,6 +1196,19 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			// of the received WAL, KeepLogSeg's endptr (the later of the
 			// receive and replay positions). Without it a standby's pg_wal
 			// grew without bound (M0122-0013).
+			// CreateRestartPoint moves RedoRecPtr to the restartpoint's redo
+			// (xlog.c: RedoRecPtr = XLogCtl->RedoRecPtr = lastCheckPoint.redo)
+			// and pg_control's checkPoint to its record. RedoRecPtr is what
+			// XLogCheckpointNeeded measures elapsed segments from, so the
+			// volume trigger (volumeTriggerFires) re-anchors here; without it
+			// a standby kept the anchor it seeded at start and, once
+			// max_wal_size / (1 + checkpoint_completion_target) of WAL had
+			// arrived, ran a full restartpoint flush on every volume tick.
+			// The same pair answers a BASE_BACKUP taken from the standby,
+			// which PG starts at the last restartpoint (M0122-0013).
+			c.lastCheckpointRedoLSN.Store(rp.Fields.RedoLSN0 + 1)
+			c.lastCheckpointLSN.Store(rp.EndLSN)
+			c.lastCheckpointStartLSN.Store(rp.StartLSN)
 			c.noteRestartPointDistance(priorRedo, rp.Fields.RedoLSN0)
 			if c.retainer != nil {
 				if err := c.retainer.Retain(rp.Fields.RedoLSN0 + 1); err != nil {

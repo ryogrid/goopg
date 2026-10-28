@@ -187,6 +187,15 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {
 		t.Fatalf("checkpoint distance estimate after the restartpoint = %v, want %d", got, 8192-16)
 	}
+	// ... and moves RedoRecPtr / the checkpoint record to the restartpoint's,
+	// the anchor the volume trigger measures max_wal_size from and the pair a
+	// BASE_BACKUP from the standby starts at (M0122-0013).
+	if got := cp.CheckpointRedoLSN(); got != 8192+1 {
+		t.Fatalf("checkpoint redo after the restartpoint = %d, want %d (1-based)", got, 8192+1)
+	}
+	if got := cp.LastCheckpointRecordLSN(); got != start2 {
+		t.Fatalf("checkpoint record after the restartpoint = %d, want %d", got, start2)
+	}
 	// Without a source a recovery flush leaves pg_control alone (e646499b0).
 	cp.SetRestartPointSource(nil)
 	writeTestControl(t, dir, control.DBStateInProduction, 16)
