@@ -2771,6 +2771,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       8\.11/7\.70 → 7\.79/7\.82 G \(mixed\), instructions 11\.24 → 11\.17 G \(−0\.6 %\)\. Code reverted\. **Miss counter 1\.**
       - Lesson: the matched\-bitmap lookups follow the probe of the same key, so their map slots are warm — their sampled
         share was not a stall the entry cache could remove\. Only the cold first touch of a structure is worth moving\.
+  - **G3 rows census 2026\-10\-28 \(loop \#260, misses 1\)**: S9 census `routing\-20261028r` reused \(`c4f0fa916` ralph only\)\.
+    goopg EXPLAIN ANALYZE at `5a89cc5f5` for DS Q47/Q78/Q67/Q59/Q39 against the cached PG 18 captures \(`tmp/rowcensus/`,
+    10\-23, after the 10\-20 corpus rebuild\) with `tools/rows\-census\.py`: no node over 3× PG among the reported ones\.
+    - **But the census is half blind**: goopg reports actuals for 35 of Q14's nodes vs PG's 80, Q23 19 vs 39, Q47 9 vs 23
+      — parallel worker subtrees and CTE bodies carry no `actual` \(M0122\-0021, scope note added there\)\. The loop \#245
+      "no algorithmic gap" verdict on Q14/Q23 is therefore unproven for half their plans\.
+    - No qualifying candidate this pass; not a miss\.
+    - > **NOTE:** M0122\-0021 is the topmost open M0122 task in file order, so it is the next one\-task yield target \(after
+      > a second consecutive miss\); landing it makes the G3 rows census complete on the top two queries\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -3937,6 +3946,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     InstrAggNode / ExplainNode totals\), print `Worker N:` lines only with VERBOSE, and apply the M0122\-0017
     attributed\-rejection subtraction to the aggregate; Rows Removed by Filter summed across workers\.
   - Expected instrument: Q72's inventory line identical to the PG capture \(modulo timing\); regress outputs unchanged\.
+  - **Scope measured 2026\-10\-28 \(loop \#260, M0122\-0012 G3 rows census\)**: the gap blinds the rows census on the
+    largest\-excess queries\. Node lines carrying `actual` at `5a89cc5f5` vs PG 18 \(`tmp/rowcensus/`\): DS Q14 35 vs 80, DS Q23
+    19 vs 39, DS Q47 9 vs 23, DS Q59 18 vs 23\. The unreported nodes are the parallel worker subtrees \(Parallel Hash Join,
+    Parallel Hash, Gather children, Parallel Seq Scan, Partial Aggregate — this task's symptom\) and, in Q47, the whole
+    materialised CTE body \(`v1`: WindowAgg → GroupAggregate → Gather Merge → Sort … show no actuals\)\. The loop \#245
+    "no algorithmic gap" verdict for Q14/Q23 therefore covered only about half of their nodes\.
+  - PG prints each node's own `\(actual … loops=…\)` everywhere, CTE bodies included \(ExplainNode recurses into
+    `planstate\->initPlan` / CTE subplans with their own Instrumentation\); goopg's CTE body nodes are built lazily outside
+    the instrumentation scope \(ledger 2026\-07\-04 M0122\-0003 rows describe the DML\-CTE variant\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
@@ -6621,6 +6639,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#259\) — **exhausted at `13336ab8a`**, census `routing\-20261028r/` reused:
     `13336ab8a` is analysis/ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
     live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#260\) — **exhausted at `c4f0fa916`**, census `routing\-20261028r/` reused:
+    `c4f0fa916` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
