@@ -2658,6 +2658,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       sf025 PASS=99 with plans 99/99 same, TestPort\_RegressSuite PASS\. Tests `TestEarlyScanQualInPlaceMatchesLate`
       \(a wrong\-column arm fails it\) and the updated `TestOperandPtrReadsInPlace` / `TestOuterRefCompiledMatchesInterpreted`
       \(the general path is now driven by an identity `\*VirtualSlot`\)\. Design: part 11 §125\. **Misses 0\.**
+  - **G3 pass 2026\-10\-28 \(loop \#253, misses 0\)**: S9 fresh census `routing\-20261028p` at `5463cb473` \(22/22, 99/99,
+    99/99; nothing filed\)\. **cycles:u** at `5463cb473` \(`tmp/g3\-253/`\) on DS Q78, DS Q47 and H Q17, plus the share of
+    the general/interpreted evaluator \(`evalExprSlot`, `evalBinary`, `evalFastBinaryApply` self\) by caller — under 1 %
+    everywhere after C58, so no other operator misses the compiled/in\-place paths at scale\. DS Q78 is flat \(top symbol
+    `evalFastExpr` 3\.9 %\); DS Q47 is the sort family \(Below\-bar; C56 dropped\); H Q17 is `skipColumnRun` 7\.9 % \+
+    `decodeRowRangeInfo` 7\.6 % — the walk over HammerDB's varlena NUMERIC prefix that PG's slot\_deform\_heap\_tuple also
+    makes \(att\_addlength\_pointer per attribute\) — plus checksums and first touches\. **No qualifying candidate; not a
+    miss\.**
+    - Next generate pass: the hash\-table structure family is the only unexplored one in the top 10 \(H Q13
+      `mapaccess1\_fast64` 17\.5 % of cycles: 66 % hash\-join probe, 29 % group lookup; C44 and C55 are its two misses so
+      far\)\. Design\-sized: write the int\-lane open\-addressing table design \(PG simplehash\.h, ExecScanHashBucket\) and
+      take its first slice with an H Q13 **wall** Target on an idle host\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6487,6 +6499,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#252\) — **exhausted at `efe44c909`**, census `routing\-20261028o/` reused:
     `efe44c909` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
     live\. \(The C58 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#253\) — **exhausted at `5463cb473`**, fresh census `routing\-20261028p/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
