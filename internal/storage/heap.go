@@ -514,12 +514,20 @@ func ParseHeapTuple(raw []byte) (HeapTuple, error) {
 // field aliases `raw`; caller must hold the page pin AND a content
 // RLock for the lifetime of the returned tuple.
 func parseHeapTupleAlias(raw []byte) (HeapTuple, error) {
+	var t HeapTuple
+	err := parseHeapTupleAliasInto(raw, &t)
+	return t, err
+}
+
+// parseHeapTupleAliasInto is parseHeapTupleAlias filling the caller's tuple in
+// place (M0122-0012 C48); *t is left untouched on error.
+func parseHeapTupleAliasInto(raw []byte, t *HeapTuple) error {
 	if len(raw) < SizeOfHeapTupleHeaderData {
-		return HeapTuple{}, fmt.Errorf("%w: raw len=%d", ErrCorruptTuple, len(raw))
+		return fmt.Errorf("%w: raw len=%d", ErrCorruptTuple, len(raw))
 	}
 	hoff := int(raw[22])
 	if hoff < SizeOfHeapTupleHeaderData || hoff > len(raw) {
-		return HeapTuple{}, fmt.Errorf("%w: invalid t_hoff=%d len=%d", ErrCorruptTuple, hoff, len(raw))
+		return fmt.Errorf("%w: invalid t_hoff=%d len=%d", ErrCorruptTuple, hoff, len(raw))
 	}
 	infomask := binary.LittleEndian.Uint16(raw[20:22])
 	infomask2 := binary.LittleEndian.Uint16(raw[18:20])
@@ -528,23 +536,24 @@ func parseHeapTupleAlias(raw []byte) (HeapTuple, error) {
 		natts := int(infomask2 & HeapNattsMask)
 		bmLen := (natts + 7) / 8
 		if SizeOfHeapTupleHeaderData+bmLen > hoff {
-			return HeapTuple{}, fmt.Errorf("%w: null bitmap of %d bytes overruns t_hoff=%d", ErrCorruptTuple, bmLen, hoff)
+			return fmt.Errorf("%w: null bitmap of %d bytes overruns t_hoff=%d", ErrCorruptTuple, bmLen, hoff)
 		}
 		bitmap = raw[SizeOfHeapTupleHeaderData : SizeOfHeapTupleHeaderData+bmLen]
 	}
-	return HeapTuple{
-		Header: HeapTupleHeader{
-			Xmin:      TransactionID(binary.LittleEndian.Uint32(raw[0:4])),
-			Xmax:      TransactionID(binary.LittleEndian.Uint32(raw[4:8])),
-			Xvac:      TransactionID(binary.LittleEndian.Uint32(raw[8:12])),
-			CTID:      ItemPointer{Block: BlockNumber(binary.LittleEndian.Uint32(raw[12:16])), Offset: binary.LittleEndian.Uint16(raw[16:18])},
-			Infomask2: infomask2,
-			Infomask:  infomask,
-			Hoff:      uint8(hoff),
-		},
-		Bitmap: bitmap,
-		Data:   raw[hoff:],
-	}, nil
+	// Every field is written, so a tuple reused across calls carries nothing
+	// from the previous one.
+	t.Header = HeapTupleHeader{
+		Xmin:      TransactionID(binary.LittleEndian.Uint32(raw[0:4])),
+		Xmax:      TransactionID(binary.LittleEndian.Uint32(raw[4:8])),
+		Xvac:      TransactionID(binary.LittleEndian.Uint32(raw[8:12])),
+		CTID:      ItemPointer{Block: BlockNumber(binary.LittleEndian.Uint32(raw[12:16])), Offset: binary.LittleEndian.Uint16(raw[16:18])},
+		Infomask2: infomask2,
+		Infomask:  infomask,
+		Hoff:      uint8(hoff),
+	}
+	t.Bitmap = bitmap
+	t.Data = raw[hoff:]
+	return nil
 }
 
 // ItemIDFlags mirrors PostgreSQL ItemId state bits.
@@ -859,30 +868,43 @@ func PageGetHeapTupleInto(p Page, slot uint16, buf []byte) (HeapTuple, []byte, e
 // underneath us). Used by the indexScanOp hot read path
 // (M0092-0006); other callers should keep using PageGetHeapTuple.
 func PageGetHeapTupleNoCopy(p Page, slot uint16) (HeapTuple, error) {
+	var t HeapTuple
+	err := PageGetHeapTupleNoCopyInto(p, slot, &t)
+	return t, err
+}
+
+// PageGetHeapTupleNoCopyInto is PageGetHeapTupleNoCopy filling the caller's
+// tuple in place, as heapgettup_pagemode sets the scan descriptor's
+// HeapTupleData (t_data, t_len) rather than returning a copy (M0122-0012
+// C48). Returning the ~80-byte HeapTuple by value out of two non-inlined
+// calls cost a copy per call and a store-forwarding stall on its first reload:
+// about 18 % of TPC-DS Q10's samples, a seq scan per outer row. On error *t
+// is left untouched.
+func PageGetHeapTupleNoCopyInto(p Page, slot uint16, t *HeapTuple) error {
 	if slot == 0 {
-		return HeapTuple{}, ErrInvalidSlot
+		return ErrInvalidSlot
 	}
 	count, err := PageLinePointerCount(p)
 	if err != nil {
-		return HeapTuple{}, err
+		return err
 	}
 	idx := int(slot) - 1
 	if idx < 0 || idx >= count {
-		return HeapTuple{}, ErrInvalidSlot
+		return ErrInvalidSlot
 	}
 	item, err := readItemID(p, idx)
 	if err != nil {
-		return HeapTuple{}, err
+		return err
 	}
 	if item.Flags != ItemIDNormal {
-		return HeapTuple{}, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
 	}
 	off := int(item.Offset)
 	ln := int(item.Length)
 	if off < 0 || ln < 0 || off+ln > len(p) {
-		return HeapTuple{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+		return fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
 	}
-	return parseHeapTupleAlias(p[off : off+ln])
+	return parseHeapTupleAliasInto(p[off:off+ln], t)
 }
 
 // PageAddItemRaw appends an arbitrary blob as a new item on the page,

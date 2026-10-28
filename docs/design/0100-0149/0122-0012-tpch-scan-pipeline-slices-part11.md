@@ -249,3 +249,53 @@ Gates:
 **Test.** `TestFinishAggLeavesStateUntouched` (agg\_mixed\_lane\_test.go) finalizes sum/avg/count/max states twice,
 including the mixed int/numeric lane, and requires the same value both times and a state `reflect.DeepEqual` to
 the one the transitions built. Writing the fold back into the state fails it.
+
+## Slice 119 — C48: the seq scan fetches its heap tuple in place (Q10 −2.4 % instructions, below the bar; −11 % wall)
+
+Loop #235. C47 (the all-visible scan skip) is blocked on P0-E15, so G3 went to the top-10 queries not profiled
+recently, at `44fbe565b` (`tmp/g3-235/`).
+
+- **DS Q72:** nbtree descents (isPostingRaw 10 %, compareFixedPrefix 10 %, readItemID 8 %, findChildBlockDirect 8 %)
+  — PG-equivalent work after C18/C36/C37.
+- **DS Q10:** the scan. `seqScanOp.Next` 23.4 %, `PageGetHeapTupleNoCopy` 12.2 %, `parseHeapTupleAlias` 4.4 %.
+- **The Q39 sizing of the same mechanism** came out at 0.5–1 % (18.03 Ginstr/q over a few million tuples), so Q10,
+  which scans per outer row, is the target.
+
+**Symptom.** In `PageGetHeapTupleNoCopy`, 90 % of the samples sit on `return parseHeapTupleAlias(...)`. Half of
+them land on one `movups` store: the ~80-byte HeapTuple is assembled with 2- and 4-byte stores, returned by value
+through two non-inlined calls, and reloaded 16 bytes at a time, which is a store-forwarding stall. The call line in
+`seqScanOp.Next` carries another 29 % of that function's share. PG fills the scan descriptor's HeapTupleData in
+place (heapgettup\_pagemode: `tuple->t_data = PageGetItem(...)`, `t_len`), with no struct copy.
+
+**Change.** `storage.PageGetHeapTupleNoCopyInto(p, slot, *HeapTuple)` and `parseHeapTupleAliasInto` fill the
+caller's tuple field by field. Every field is written, so a reused tuple carries nothing over; on error the tuple
+is untouched. `PageGetHeapTupleNoCopy` and `parseHeapTupleAlias` are now thin wrappers, so one implementation
+serves both forms. `seqScanOp.Next` passes a stack tuple. Escape analysis confirms `t does not escape`, so there is
+no allocation.
+
+**Measured** (`tools/ds-instr.sh` 3 runs × 2 alternating, and `tools/ds-warm.sh` warm wall, base at `44fbe565b`,
+idle host, load 0.5–0.9):
+
+| query | metric | before | after | change |
+|---|---|---|---|---|
+| TPC-DS Q10 (Target) | Ginstr/q | 6.683 / 6.715 | 6.540 / 6.541 | **−2.37 %** |
+| TPC-DS Q10 | warm wall s/q | 0.299 / 0.289 | 0.263 / 0.261 | −10.9 % |
+
+This misses the 3 % bar on the pre-named metric. The sampled share was mostly the stall, which instructions:u
+barely count, while wall time (−11 %) and user CPU (−10 %) see it. It is landed below the bar, as C21 and C43 were:
+a faithful port with no plan or value change. It goes on the Below-bar list, and the miss counter is now 1.
+
+**Lesson for G5:** when the samples behind a share sit on one store or load right after a call return
+(store-forwarding) or a first touch, the instruction metric undercounts. Name wall time on an idle host as the
+Target metric instead.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same.
+
+**Test.** `TestPageGetHeapTupleNoCopyIntoReusesTuple` (storage) reuses one tuple across alternating NULL-bearing and
+NULL-free tuples. Each fetch must equal the by-value fetch, and a failed fetch must leave the tuple untouched.
+Leaving the bitmap unwritten fails it.

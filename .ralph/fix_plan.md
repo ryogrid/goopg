@@ -1847,6 +1847,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       H Q13 wall −1\.1 %, instructions ±0\)\.
     - Dropped: C24 current\-group key compare before the hash lookup in a sorted rollup's drain \(`aggregateOp\.Open`
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
+    - Landed below the bar: C48 seq scan fetches its heap tuple in place \(`PageGetHeapTupleNoCopyInto` vs PG
+      heapgettup\_pagemode, DS Q10 instructions −2\.37 %, wall −10\.9 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -2406,6 +2408,26 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - **C47 slice 2 BLOCKED on P0\-E15 \(loop \#234\)**: the safety review found VACUUM marks pages all\-visible \(and
       freezes\) over aborted inserts; a scan that trusts PD\_ALL\_VISIBLE would return them\. Slice 1 stays \(no reader\)\.
       M0122\-0012 moves to another candidate until P0\-E15 is fixed; C47 does not count as a miss\.
+  - **G3 2026\-10\-28 \(loop \#235, misses 0, C47 blocked\)**: S9 census reused \(`da5ccb973`/`6818860a2` ralph/analysis
+    only\)\. Q39 HeapTuple\-return copy sized first: Q39 18\.03 Ginstr/q, ~40 instr per scanned tuple over a few M inventory
+    tuples ≈ 0\.5–1 % — not attempted\. Profiles at `44fbe565b` \(`tmp/g3\-235/q\{72,10\}\.data`\): DS Q72 is nbtree descents
+    \(isPostingRaw 10 %, compareFixedPrefix 10 %, readItemID 8 %, findChildBlockDirect 8 %\) — PG\-equivalent work after
+    C18/C36/C37; DS Q10 is the scan: `seqScanOp\.Next` 23\.4 %, `PageGetHeapTupleNoCopy` 12\.2 % \(90 % on
+    `return parseHeapTupleAlias\(\.\.\.\)` — the ~80\-byte HeapTuple copied out of two non\-inlined calls, half of it a
+    store\-forwarding stall on the first 16\-byte reload\), `seqScanOp\.Next`'s call line 29 % of its share\.
+    - C48: fetch the heap tuple in place — `storage\.PageGetHeapTupleNoCopyInto\(p, slot, \*HeapTuple\)` fills the caller's
+      tuple field by field \(PageGetHeapTupleNoCopy becomes its wrapper\), and `seqScanOp` passes its own tuple\. PG:
+      heapgettup\_pagemode / heap\_getnextslot set `tuple\->t\_data` and `t\_len` in the scan descriptor's HeapTupleData
+      \(heapam\.c\), no struct copy\.
+    - **Target \(C48\)**: TPC\-DS SF0\.25 **Q10**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `6818860a2`\)\. Bar: −3 %; predicted ~4 %\.
+    - **C48 LANDED BELOW THE BAR \(slice 119\)**: `storage\.PageGetHeapTupleNoCopyInto` / `parseHeapTupleAliasInto` fill
+      the caller's tuple; the by\-value forms wrap them; `seqScanOp\.Next` passes a stack tuple \(does not escape\)\. Q10
+      6\.683/6\.715 → 6\.540/6\.541 Ginstr/q = **−2\.37 %, misses the 3 % bar**; warm wall 0\.294 → 0\.262 s \(−10\.9 %\), user
+      CPU −10 % — the share was mostly the store\-forwarding stall, which instructions barely count\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestPageGetHeapTupleNoCopyIntoReusesTuple`\. Design:
+      part 11 §119\. **Miss counter 1\.** Lesson: a stall\-shaped share \(samples on one store after a return, or a first
+      touch\) needs a wall\-time Target on an idle host\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -6088,6 +6110,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#234\) — **exhausted at `44fbe565b`**, census `routing\-20261028i/` reused:
     `2ddabfd68` is docs\-only and `44fbe565b` touched internal/storage \+ commands/vacuum only\. No task is filed\. Same
     items\-0\-9 tokens as the loop \#205 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#235\) — **exhausted at `6818860a2`**, census `routing\-20261028i/` reused:
+    `da5ccb973` / `6818860a2` are ralph/docs/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

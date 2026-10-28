@@ -2089,8 +2089,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// TestDecodedRowDoesNotAliasSourceBuffer). A ring-buffer page is a
 			// private copy that stays valid until the scan leaves the page.
 			// The copy into a scratch buffer this replaced was ~6 % of a
-			// TPC-H Q1 scan.
-			tuple, err := storage.PageGetHeapTupleNoCopy(page, o.curSlot)
+			// TPC-H Q1 scan. The tuple header and slices are filled in
+			// place rather than returned by value (M0122-0012 C48), as
+			// heapgettup_pagemode fills the scan's HeapTupleData.
+			var tuple storage.HeapTuple
+			err := storage.PageGetHeapTupleNoCopyInto(page, o.curSlot, &tuple)
 			o.curSlot++
 			if err != nil {
 				if o.pinned != nil {
