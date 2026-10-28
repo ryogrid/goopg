@@ -541,3 +541,52 @@ NUMERICs and text, with NULLs. It runs hashed and sorted strategies over group k
 DISTINCT inside the aggregate, a functionally dependent passthrough, count(\*), a qual on an otherwise unread
 column, and a join whose left side is the scan. Each must equal the full decode. Narrowing the read set to the
 first consumer fails it.
+
+## Slice 125 — C58: the seq scan's early qual reads its operands in place (Q10 −7.6 %)
+
+Loop #252. A cycles:u profile of TPC-H Q10 at `c9acfdee9` (`tmp/g1-252/h10.data`; Q10 is new in census-20261028c's top
+10) shows the lineitem probe scan's qual `l_returnflag = 'R'::bpchar` taking about 18 % of the query over 6 M rows:
+
+| symbol under `seqScanOp.evalQual` | samples (of 15318) |
+|---|---|
+| `evalFastExpr` | 1627 |
+| `evalQual` itself | 489 |
+| `evalFastBinaryApply` | 457 |
+| `fastComparisonBool` | 140 |
+
+**Cause.** The scan evaluates an absorbed qual EARLY on the deformed prefix through `evalPrefilter`, which passes
+`rowSlotView(o.scanRow)`. `fastComparisonBool`'s two in-place branches find their operands with `fastOperandPtr`.
+Those branches are slice 75's typed `fastCompareDatum` and slice 89's plain-string compare, and `fastOperandPtr`
+resolved a column only on a `*MaterializedSlot`. Every early scan qual therefore missed both branches, and each row
+copied its operands through `evalFastBinaryApply`. That is the common case: every TPC-H and TPC-DS filter on a base
+table runs early. It is a sibling-path gap, since evalFastExpr's ColumnRef arm already served `rowSlotView`.
+
+**PG.** The scan's qual reads the scan slot's `tts_values` in place: EEOP\_SCAN\_VAR feeds the comparison function's
+arguments (execExprInterp.c), with no operand copy.
+
+**Change.** `fastOperandPtr` gains a `rowSlotView` arm that returns `&s[colIdx]` for an in-range column, with the same
+bounds test as the `*MaterializedSlot` arm. Out-of-range columns still return nil, so evalFastExpr raises the error.
+Slice 75's general-path pin (`TestOuterRefCompiledMatchesInterpreted`) used `rowSlotView` as its "unknown slot kind".
+It now uses an identity `*VirtualSlot` for that and checks `rowSlotView` as an in-place kind.
+
+**Measured** (`tools/h-instr.sh`, 3 runs × 2 alternating, base at `efe44c909`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q10 (Target) | 24.300 / 24.296 | 22.462 / 22.446 | **−7.6 %** |
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- TestPort\_RegressSuite PASS.
+
+**Tests.**
+
+- `TestEarlyScanQualInPlaceMatchesLate` runs 24 quals at the EARLY position (in place now) and at the forced LATE
+  position (`scanPrefilterForceLate`). They cover int, numeric, date, bpchar with padding, varchar and text, NULLs,
+  all six comparisons, the literal on either side, and column against column. Each must keep the same rows. Pointing
+  the arm at the wrong column fails it (`i = 7`: 2 rows vs 71).
+- `TestOperandPtrReadsInPlace` now expects a row view's in-range column in place and an out-of-range one nil.

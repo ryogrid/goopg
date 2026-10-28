@@ -2636,6 +2636,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     hash\-table structure family \(simplehash design, wall Target only\)\. **No qualifying candidate; not a miss\.**
     - Next pass: refresh G1 \(C57 moved Q18/Q1; census\-20261028b ranks are stale\) and re\-evaluate EXHAUSTED — blocked
       only by C47 \(Q39, blocked\-on P0\-E15\) and the hash\-table structure family\.
+  - **Return / generate 2026\-10\-28 \(loop \#252, misses 0\)**: S9 census `routing\-20261028o` reused \(`efe44c909` ralph
+    only\)\. Fresh G1/G2 census `analysis/m0122/m0122\-0012/census\-20261028c/` at `c9acfdee9` \(top 10 by excess: DS Q14
+    3409, DS Q23 2109, DS Q72 926, H Q13 910, H Q17 700, H Q18 530, DS Q78 480, DS Q39 471, DS Q47 457, H Q10 440; DS Q7's
+    sweep median 1016 ms is the in\-sweep server\-age artefact — warm on a fresh server it runs 110 ms vs PG 104, so it is
+    not ranked\)\. G3 \(cycles:u\) on the new entrant H Q10 \(`tmp/g1\-252/h10\.data`\): the lineitem probe scan's qual
+    `l\_returnflag = 'R'::bpchar` is ~18 % of the query \(`evalFastExpr` 1627, `evalQual` 489, `evalFastBinaryApply` 457,
+    `fastComparisonBool` 140 of 15318 samples\) over 6 M rows\. Cause: the EARLY scan qual runs over
+    `rowSlotView\(o\.scanRow\)`, and `fastOperandPtr` resolves a column in place only for `\*MaterializedSlot` — so both of
+    `fastComparisonBool`'s in\-place branches \(typed `fastCompareDatum`, slice 89's plain\-string compare\) are skipped for
+    EVERY early scan qual and each row copies its operands through `evalFastBinaryApply`\. A sibling\-path gap:
+    evalFastExpr's ColumnRef arm already serves `rowSlotView`\.
+    - C58: `fastOperandPtr` gains the `rowSlotView` arm \(`&s\[colIdx\]`, bounds as the MaterializedSlot arm\)\. PG: the
+      scan qual reads the scan slot's `tts\_values` in place \(EEOP\_SCAN\_VAR feeding the comparison's fmgr call,
+      execExprInterp\.c\); no operand copy\.
+    - **Target \(C58\)**: TPC\-H SF1 **Q10**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q10\.sql`, 3 runs × 2 alternating, fresh A/B vs `efe44c909`\)\. Bar: −3 %; predicted ~6 % \(about a
+      third of the 18 % qual share\)\.
+    - **C58 LANDED \(slice 125\)**: `fastOperandPtr` reads an in\-range `rowSlotView` column in place\. Q10
+      24\.300/24\.296 → 22\.462/22\.446 Ginstr/q = **−7\.6 %, meets the bar**\. Gates: units, spotcheck, acceptance 24 MATCH,
+      sf025 PASS=99 with plans 99/99 same, TestPort\_RegressSuite PASS\. Tests `TestEarlyScanQualInPlaceMatchesLate`
+      \(a wrong\-column arm fails it\) and the updated `TestOperandPtrReadsInPlace` / `TestOuterRefCompiledMatchesInterpreted`
+      \(the general path is now driven by an identity `\*VirtualSlot`\)\. Design: part 11 §125\. **Misses 0\.**
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6462,6 +6484,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#251\) — **exhausted at `c9acfdee9`**, fresh census `routing\-20261028o/` \(TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
     the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#252\) — **exhausted at `efe44c909`**, census `routing\-20261028o/` reused:
+    `efe44c909` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C58 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

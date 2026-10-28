@@ -863,10 +863,22 @@ func fastOperandPtr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) 
 	n := &exprs[idx]
 	switch n.Kind {
 	case ExprColumnRef:
-		if s, ok := slot.(*MaterializedSlot); ok {
-			colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		colIdx := int(int32(binary.LittleEndian.Uint32(n.payload[:])))
+		switch s := slot.(type) {
+		case *MaterializedSlot:
 			if colIdx >= 0 && colIdx < len(s.row) {
 				return &s.row[colIdx]
+			}
+		case rowSlotView:
+			// The seq scan's EARLY qual runs over rowSlotView(scanRow)
+			// (evalPrefilter). Without this arm every early qual missed
+			// both in-place comparison branches of fastComparisonBool and
+			// copied its operands through evalFastBinaryApply per row —
+			// TPC-H Q10's l_returnflag = 'R' over 6 M lineitem rows was ~18 %
+			// of the query (M0122-0012 C58). PG's scan qual reads the scan
+			// slot's tts_values in place (EEOP_SCAN_VAR).
+			if colIdx >= 0 && colIdx < len(s) {
+				return &s[colIdx]
 			}
 		}
 	case ExprOuterColumnRef, ExprExecParamRef:

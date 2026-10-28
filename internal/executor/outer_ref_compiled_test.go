@@ -92,11 +92,16 @@ func TestOuterRefCompiledMatchesInterpreted(t *testing.T) {
 				if !sameResult(got, gotErr, want, wantErr) {
 					t.Fatalf("outer %d expr %d row %d: compiled %q (%v), interpreted %q (%v)", oi, ei, r, got.Format(), gotErr, want.Format(), wantErr)
 				}
-				// A slot kind the in-place read does not know takes the
-				// general path and must agree too.
+				// The seq scan's early qual slot is read in place too (C58).
 				got, gotErr = evalFastExpr(slab, idx, rowSlotView(inner[r]), ctx)
 				if !sameResult(got, gotErr, want, wantErr) {
 					t.Fatalf("outer %d expr %d row %d (row view): compiled %q (%v), interpreted %q (%v)", oi, ei, r, got.Format(), gotErr, want.Format(), wantErr)
+				}
+				// A slot kind the in-place read does not know takes the
+				// general path and must agree too.
+				got, gotErr = evalFastExpr(slab, idx, identityVirtualSlot(slot), ctx)
+				if !sameResult(got, gotErr, want, wantErr) {
+					t.Fatalf("outer %d expr %d row %d (virtual): compiled %q (%v), interpreted %q (%v)", oi, ei, r, got.Format(), gotErr, want.Format(), wantErr)
 				}
 			}
 		}
@@ -107,10 +112,11 @@ func TestOuterRefCompiledMatchesInterpreted(t *testing.T) {
 }
 
 // TestOperandPtrReadsInPlace pins the in-place operand read itself: a
-// materialized row's column, an outer row's column, a set parameter and a
-// folded constant are returned where they lie; anything it cannot read safely
-// (another slot kind, an out-of-range index, an unset parameter, a nil
-// Context, a node that must be evaluated) is nil, left to evalFastExpr.
+// materialized row's column, a row view's column (the seq scan's early qual
+// slot, C58), an outer row's column, a set parameter and a folded constant
+// are returned where they lie; anything it cannot read safely (another slot
+// kind, an out-of-range index, an unset parameter, a nil Context, a node that
+// must be evaluated) is nil, left to evalFastExpr.
 func TestOperandPtrReadsInPlace(t *testing.T) {
 	row := Row{NewIntDatum(1), NewIntDatum(2)}
 	outer := Row{NewIntDatum(3)}
@@ -127,6 +133,9 @@ func TestOperandPtrReadsInPlace(t *testing.T) {
 	if p := fastOperandPtr(slab, col, ms, ctx); p != &row[1] {
 		t.Fatalf("materialized column: %p, want %p", p, &row[1])
 	}
+	if p := fastOperandPtr(slab, col, rowSlotView(row), ctx); p != &row[1] {
+		t.Fatalf("row view column: %p, want %p", p, &row[1])
+	}
 	if p := fastOperandPtr(slab, out, ms, ctx); p != &outer[0] {
 		t.Fatalf("outer column: %p, want %p", p, &outer[0])
 	}
@@ -137,15 +146,27 @@ func TestOperandPtrReadsInPlace(t *testing.T) {
 		t.Fatalf("constant: %v", p)
 	}
 	for name, p := range map[string]*Datum{
-		"row view":     fastOperandPtr(slab, col, rowSlotView(row), ctx),
-		"out of range": fastOperandPtr(slab, colBad, ms, ctx),
-		"unset":        fastOperandPtr(slab, unset, ms, ctx),
-		"nil context":  fastOperandPtr(slab, out, ms, nil),
-		"expression":   fastOperandPtr(slab, expr, ms, ctx),
-		"no node":      fastOperandPtr(slab, noExpr, ms, ctx),
+		"virtual slot":   fastOperandPtr(slab, col, identityVirtualSlot(ms), ctx),
+		"row view range": fastOperandPtr(slab, colBad, rowSlotView(row), ctx),
+		"out of range":   fastOperandPtr(slab, colBad, ms, ctx),
+		"unset":          fastOperandPtr(slab, unset, ms, ctx),
+		"nil context":    fastOperandPtr(slab, out, ms, nil),
+		"expression":     fastOperandPtr(slab, expr, ms, ctx),
+		"no node":        fastOperandPtr(slab, noExpr, ms, ctx),
 	} {
 		if p != nil {
 			t.Fatalf("%s: %v, want nil", name, *p)
 		}
 	}
+}
+
+// identityVirtualSlot is a *VirtualSlot whose column i is ms's column i: a
+// slot kind fastOperandPtr does not read in place, so evalFastExpr takes its
+// general path over it.
+func identityVirtualSlot(ms *MaterializedSlot) *VirtualSlot {
+	cols := make([]virtualCol, len(ms.row))
+	for i := range cols {
+		cols[i] = virtualCol{sourceIdx: 0, sourceCol: int16(i)}
+	}
+	return NewVirtualSlot(nil, []TupleSlot{ms}, cols)
 }
