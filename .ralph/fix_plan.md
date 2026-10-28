@@ -1859,6 +1859,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       wall −0\.6 %, instructions −0\.44 %\)\.
     - Landed below the bar: C53 NUMERIC arithmetic called directly from the compiled binary arm \(`fastNumericArith` vs
       PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
+    - **Family on the Below\-bar list \(rotation rule, loop \#246\):** 48\-byte Datum / struct by\-value copy elimination \(C48, C49,
+      C50, C52, C53 — five attempts, all < 3 %; the last three consecutive\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -2517,6 +2519,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       first touch, not a removable store\-forwarding cost\. Code reverted\. **Miss counter 1\.**
       - Lesson: a single hot store right after a function's loads can be the skid of a cache miss on the source bytes;
         check whether the source line is the first touch \(here `raw\[22\]` on line 529\) before calling it a stall\.
+  - **Generate pass 2026\-10\-28 \(loop \#246, misses 0\)**: S9 census reused \(`844eec2a6` ralph/analysis only\)\.
+    - **Rotation rule applied:** C50 \(−0\.24 % wall\), C52 \(−0\.6 % wall\), C53 \(−2\.2 % instructions\) are three consecutive
+      misses in one mechanism family — eliminating 48\-byte Datum / struct by\-value copies \(CASE result as a bool, the
+      tuple\-header store, numeric operands by value; C48/C49 before them too\)\. The family goes on the Below\-bar list;
+      C13\-style slices are ineligible until a later census shows a single copy site ≥ 3 %\.
+    - H Q18 group\-table presizing \(PG's build\_hash\_tables nbuckets from numGroups\): Go map growth is only
+      `uncheckedPutSlot` 0\.56 % \+ `split` 0\.18 % of Q18 \(`tmp/g3\-231/h18i\.data`\); the 11 % mapaccess is the first\-touch
+      stall PG pays too — not attempted\.
+    - State of the top 10 \(census\-20261028b\): copy family \(Below\-bar\), sort family \(Below\-bar\), first\-touch \+ nbtree
+      descents and map\-slot stalls \(PG\-equivalent work at a larger constant\), Q39 per\-tuple visibility \(C47, blocked on
+      P0\-E15\)\. EXHAUSTED is not met — Q39's lever is blocked, not Below\-bar — and no slice\-sized candidate remains\. The
+      only unexplored family is the hash\-table structure \(H Q13 / H Q18; one miss, C44\): design\-sized \(a PG\-style
+      simplehash for the int lane, simplehash\.h / TupleHashTable\)\.
+    - > **ADVISORY 2026\-10\-28 \(owner\):** placing P0\-E15 unblocks C47 \(Q39, ~4 % predicted\); otherwise M0122\-0012's
+      > next generate pass is the int\-lane simplehash design\. The loop continues per the rules; no decision is required
+      > to proceed\.
   - **Return 2026\-10\-28 \(loop \#245, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`e5cad94b5` xlog only\)\.
     G3: H Q1 re\-profiled at HEAD — `fastNumericArith` 10\.0 % self \(the 48\-byte operands passed by value into it and on
     into numericAdd/Sub/Mul\), numericMul 2\.6 %, numericSub 1\.7 %\. An in\-place int64 lane there \(C54\) is C53's code site
@@ -6325,6 +6343,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#245\) — **exhausted at `e5cad94b5`**, census `routing\-20261028n/` reused:
     `e5cad94b5` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
     note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#246\) — **exhausted at `844eec2a6`**, census `routing\-20261028n/` reused:
+    `844eec2a6` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
