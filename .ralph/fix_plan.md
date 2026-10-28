@@ -2711,6 +2711,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestIntGroupTableMatchesMap`, `TestAggregateIntGroupTableMatchesMap` \(mutation\-checked\)\. **Misses 0\.**
       - Next in the family: design slice 3 \(replace `lazyIntHash` and `lazyMatchedI`; H Q13's residual
         `mapaccess1\_fast64` under `nextLazy`/`fillSweepNext` is ~3\.3 %\) — size before attempting\.
+  - **G3 pass 2026\-10\-28 \(loop \#256, misses 0\)**: S9 fresh census `routing\-20261028r` at `5a89cc5f5` \(22/22, 99/99,
+    99/99; nothing filed\)\. **cycles:u** on DS Q14 \(`tmp/g3\-250/c57\-ds14\.data`\) and DS Q23 at HEAD \(`tmp/g3\-256/ds23\.data`\),
+    allocation / copy / hash symbols attributed by caller:
+    - Q14: nbtree descents and heap first touches \(PG\-equivalent\); `memmove`/`memclr` callers each ≤ 1\.1 % \(lateral
+      inner copy, the Gather queue row clear, decode clears — the copy family is Below\-bar\)\.
+    - Q23: the multi\-key GROUP BY's serialised string keys \(`mapaccess2\_faststr` 1\.76 %, `aeshashbody` 1\.68 %,
+      `appendGroupColKey` memmove 0\.64 %, `mapassign\_faststr` 0\.24 % — ~4\.3 %\) = pool item C41 \(typed composite keys,
+      PG TupleHashTable\)\. A typed table still hashes and compares the keys, so it removes perhaps half to two thirds:
+      predicted ~2–2\.6 %, below the bar\. Everything else ≤ 1\.2 %\.
+    - **No qualifying candidate; not a miss\.** The estimate\-sized group table \(ledgered\) sizes at ~1\.6 % of Q18 \(rehash
+      moves ≈ 2 × 1\.5 M entries\) — below the bar too\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6550,6 +6561,9 @@ Sequencing: the S9 replenishment rule in the banner.)
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
     the loop \#246 note\. Item 10 is live\. \(The C60 commit changes `internal/executor`: the next S9 pass captures
     fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#256\) — **exhausted at `5a89cc5f5`**, fresh census `routing\-20261028r/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
