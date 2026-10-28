@@ -164,7 +164,8 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	wg.Wait()
 
 	before := w.WrittenLSN()
-	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{DataDir: dir})
+	flusher := &fakeFlusher{}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{DataDir: dir})
 	cp.SetRecoveryMode(true)
 	cp.SetRestartPointSource(sr.LastCheckpoint)
 	if err := cp.CheckpointNow(); err != nil {
@@ -196,6 +197,23 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	if got := cp.LastCheckpointRecordLSN(); got != start2 {
 		t.Fatalf("checkpoint record after the restartpoint = %d, want %d", got, start2)
 	}
+	// CreateRestartPoint's skip arm: asked again with no newer replayed
+	// checkpoint, it returns before CheckPointGuts — no flush (M0122-0013).
+	flusher.mu.Lock()
+	flushes := flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("adopting restartpoint flushed %d times, want 1", flushes)
+	}
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatalf("repeat recovery checkpoint: %v", err)
+	}
+	flusher.mu.Lock()
+	flushes = flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("restartpoint with nothing newer to adopt flushed (%d flushes, want 1)", flushes)
+	}
 	// Without a source a recovery flush leaves pg_control alone (e646499b0).
 	cp.SetRestartPointSource(nil)
 	writeTestControl(t, dir, control.DBStateInProduction, 16)
@@ -204,6 +222,13 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	}
 	if cd, _ := control.ReadControlFile(dir); cd.CheckPointCopyRedo != 16 {
 		t.Fatalf("source-less recovery flush moved redo to %d", cd.CheckPointCopyRedo)
+	}
+	// ... skips the flush, as there is no replayed checkpoint at all ...
+	flusher.mu.Lock()
+	flushes = flusher.calls
+	flusher.mu.Unlock()
+	if flushes != 1 {
+		t.Fatalf("source-less recovery flush flushed (%d flushes, want 1)", flushes)
 	}
 	// ... and, adopting nothing, leaves the estimate where it was.
 	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {

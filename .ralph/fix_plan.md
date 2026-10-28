@@ -1902,6 +1902,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       selectable child, so M0122\-0013 \(ledgered 2026\-10\-28: the restartpoint skip arm returns before the flush as PG's
       does, or the standby volume trigger measures the replay position, or PreallocXlogFiles\)\. Then return; misses
       reset\.
+      - Worked: M0122\-0013 restartpoint skip arm without the flush, landed 2026\-10\-28 \(loop \#244\)\. Yield over —
+        the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -3666,6 +3668,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint skip arm without the flush LANDED 2026\-10\-28 \(loop \#244, the M0122\-0012 one\-task yield\)**\.
+    Movement: none — recovery path\. `runRecoveryFlush` runs `restartPointSkips` \(no replayed checkpoint, or its redo not
+    newer than pg\_control's\) before the flush and, skipping, only stamps DB\_SHUTDOWNED\_IN\_RECOVERY on shutdown — PG
+    CreateRestartPoint's skip arm returns before CheckPointGuts\. Before: every timed request on a standby with no new
+    checkpoint record flushed and synced everything\.
+    - Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` flush counts \(adopt 1, repeat 0, source\-less 0\); FAILS with the skip
+      test forced off\.
+    - Gates: units, TestE2E\_Physical\* \+ BaseBackup/Standby/Promot testport, tpch\-spotcheck, acceptance 24 MATCH, sf025 99\.
+    - Residual \(ledgered\): the standby trigger measures received WAL \(PG: replay segment\); the skip arm's
+      UpdateMinRecoveryPoint\(InvalidXLogRecPtr, true\); PreallocXlogFiles; TruncateSUBTRANS on a hot standby\.
   - **Restartpoint moves RedoRecPtr LANDED 2026\-10\-28 \(loop \#241, the M0122\-0012 one\-task yield\)**\. Movement:
     none — recovery path\. Found while choosing the slice: a standby's checkpointer gets `max\_wal\_size` \(main\.go\) and
     routes to `runRecoveryFlush`, but the restartpoint never moved `lastCheckpointRedoLSN`, so the volume trigger kept
@@ -6283,6 +6295,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#243\) — **exhausted at `822503136`**, census `routing\-20261028m/` reused:
     `822503136` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
     owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#244\) — **exhausted at `d0f1515c0`**, fresh census `routing\-20261028n/`
+    \(`d0f1515c0` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

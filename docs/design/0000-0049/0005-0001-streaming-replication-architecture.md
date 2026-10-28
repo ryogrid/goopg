@@ -364,10 +364,24 @@ promotion, the first checkpoint's FPI epoch measures from the last restartpoint'
 Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts the redo (8193, 1-based) and the record start after the
 restartpoint. Removing the stores fails it.
 
+### Restartpoint skip arm without the flush \(2026\-10\-28, M0122\-0013\)
+
+When there is no replayed checkpoint, or the last one's redo is not newer than pg\_control's `checkPointCopy.redo`,
+`CreateRestartPoint` returns before `CheckPointGuts` (xlog.c). It updates `minRecoveryPoint`, and for a shutdown
+request stamps `DB_SHUTDOWNED_IN_RECOVERY`, but flushes no buffer, CLOG page or data file.
+
+goopg flushed everything first and only then found nothing to adopt, so every timed request on a standby that had
+seen no new checkpoint record was a full flush and data-file sync. `runRecoveryFlush` now calls
+`restartPointSkips` (same test, against pg\_control) before the flush, and in the skip arm only stamps the shutdown
+state. A restarted standby replays from pg\_control's redo, so pages left unflushed are recovered from WAL, as in PG.
+Without a data directory or pg\_control the flush runs as before.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` counts flushes. The adopting restartpoint flushes once; a repeat
+with nothing newer, and a source-less one, flush zero times. Forcing the skip test off fails it. The standby restart,
+promotion and base-backup E2Es pass.
+
 Still missing (ledgered):
 
-- the restartpoint skip arm still flushes: PG's returns before `CheckPointGuts` when there is no newer checkpoint
-  to adopt;
 - the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
   reading;
 - no `PreallocXlogFiles`;

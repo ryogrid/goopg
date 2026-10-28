@@ -1166,6 +1166,32 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 	if src := c.restartPointSrc.Load(); src != nil {
 		rp, haveRP = (*src)()
 	}
+	// CreateRestartPoint's skip arm (xlog.c): with no replayed checkpoint
+	// newer than pg_control's, there is nothing to adopt, and PG returns
+	// before CheckPointGuts — no buffer, CLOG or data-file flush. Only a
+	// shutdown restartpoint still stamps DB_SHUTDOWNED_IN_RECOVERY
+	// (adoptRestartPoint's skip arm). A restarted standby replays from
+	// pg_control's redo, so the unflushed pages are recovered from WAL as in
+	// PG. Flushing first made every timed or volume-triggered request on a
+	// standby with no new checkpoint a full flush and data-file sync
+	// (M0122-0013). Without a data directory (no pg_control to compare
+	// against) the flush runs as before.
+	if c.cfg.DataDir != "" {
+		skip, err := restartPointSkips(c.cfg.DataDir, rp, haveRP)
+		if err != nil {
+			return fmt.Errorf("restartpoint pg_control read: %w", err)
+		}
+		if skip {
+			if shutdown {
+				if _, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, true); err != nil {
+					return fmt.Errorf("restartpoint pg_control update: %w", err)
+				}
+			}
+			c.numRequested.Add(1)
+			c.cfg.Logger.Debug("skipping restartpoint, already performed", "redo", rp.Fields.RedoLSN0)
+			return nil
+		}
+	}
 	if err := c.flushDirty(c.buildPacer(ctx, false, start)); err != nil {
 		return fmt.Errorf("flush recovery dirty pages: %w", err)
 	}
@@ -1221,6 +1247,17 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// restartPointSkips is CreateRestartPoint's skip test: no replayed checkpoint
+// (XLogRecPtrIsInvalid(lastCheckPointRecPtr)), or one whose redo is not newer
+// than pg_control's checkPointCopy.redo. A missing control file never skips.
+func restartPointSkips(dataDir string, rp ReplayedCheckpoint, haveRP bool) (bool, error) {
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		return false, err
+	}
+	return !haveRP || !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0), nil
 }
 
 // adoptRestartPoint is CreateRestartPoint's pg_control update (xlog.c):
