@@ -276,6 +276,12 @@ type SubxactResolver interface {
 // the tuple is visible iff its creating xid's top-level transaction
 // was committed AND the subxact itself was not rolled back.
 func SeesCommittedXIDWithSubxacts(snap Snapshot, xid storage.TransactionID, r SubxactResolver) bool {
+	return seesCommittedXIDWithSubxactsPtr(&snap, xid, r)
+}
+
+// seesCommittedXIDWithSubxactsPtr is SeesCommittedXIDWithSubxacts over a
+// snapshot pointer, for TupleVisibleSubxactPtr's per-tuple path (C49).
+func seesCommittedXIDWithSubxactsPtr(snap *Snapshot, xid storage.TransactionID, r SubxactResolver) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
@@ -297,6 +303,15 @@ func SeesCommittedXIDWithSubxacts(snap Snapshot, xid storage.TransactionID, r Su
 // standard TupleVisible behaviour, so all existing callers continue
 // to work.
 func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, r SubxactResolver, curcid storage.CommandId, combo *ComboCIDStore, mxs *multixact.Store) bool {
+	return TupleVisibleSubxactPtr(&h, &snap, currentXID, r, curcid, combo, mxs)
+}
+
+// TupleVisibleSubxactPtr is TupleVisibleSubxact over pointers to the tuple
+// header and the snapshot, as HeapTupleSatisfiesVisibility takes its HeapTuple
+// and Snapshot (heapam_visibility.c). A seq scan calls it once per tuple, and
+// passing the ~80-byte Snapshot and the header by value there was ~5 % of
+// TPC-DS Q10 (M0122-0012 C49). It reads both and writes neither.
+func TupleVisibleSubxactPtr(h *storage.HeapTupleHeader, snap *Snapshot, currentXID storage.TransactionID, r SubxactResolver, curcid storage.CommandId, combo *ComboCIDStore, mxs *multixact.Store) bool {
 	if h.Xmin == storage.InvalidTransactionID {
 		return false
 	}
@@ -314,12 +329,12 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 		if xmaxIsLockOnly {
 			return true
 		}
-		cmin := GetCmin(h, combo)
+		cmin := GetCmin(*h, combo)
 		if cmin >= curcid {
 			return false
 		}
 		if isCurrentTxXID(h.Xmax, currentXID, r) {
-			cmax := GetCmax(h, combo)
+			cmax := GetCmax(*h, combo)
 			if cmax >= curcid {
 				return true // deleted by later command — pre-image visible
 			}
@@ -335,7 +350,7 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 			return false
 		}
 		if h.Infomask&storage.HeapXminCommitted == 0 {
-			if !SeesCommittedXIDWithSubxacts(snap, h.Xmin, r) {
+			if !seesCommittedXIDWithSubxactsPtr(snap, h.Xmin, r) {
 				return false
 			}
 		} else if !snap.SeesCommittedXIDHinted(h.Xmin) {
@@ -385,7 +400,7 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	}
 
 	if isCurrentTxXID(effXmax, currentXID, r) {
-		cmax := GetCmax(h, combo)
+		cmax := GetCmax(*h, combo)
 		if cmax >= curcid {
 			return true // deleted by later command — pre-image visible
 		}
@@ -401,7 +416,7 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 		// when the snapshot was taken, e.g. origSnap in EPQ re-evaluation).
 		return !snap.SeesCommittedXID(effXmax)
 	}
-	return !SeesCommittedXIDWithSubxacts(snap, effXmax, r)
+	return !seesCommittedXIDWithSubxactsPtr(snap, effXmax, r)
 }
 
 // IsSelfXID reports whether xid belongs to the current transaction — either

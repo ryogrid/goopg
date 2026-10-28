@@ -299,3 +299,47 @@ Gates:
 **Test.** `TestPageGetHeapTupleNoCopyIntoReusesTuple` (storage) reuses one tuple across alternating NULL-bearing and
 NULL-free tuples. Each fetch must equal the by-value fetch, and a failed fetch must leave the tuple untouched.
 Leaving the bitmap unwritten fails it.
+
+## Slice 120 — C49: the seq scan's visibility check takes the header and snapshot by pointer (Q10 wall −2.8 % median, below the bar)
+
+Loop #236. DS Q10 re-profiled on the C48 binary (`tmp/g3-236/q10.data`). `seqScanOp.Next` is 22.6 %, and 24.6 % of
+that is on the call line `transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, …)`, about 5.6 % of Q10. Every tuple
+passed the header and the ~80-byte `Snapshot` (two slices and a clog pointer) by value, and the Snapshot query
+methods (`SeesCommittedXID`, `SeesCommittedXIDHinted`, `HasInProgress`, …) had value receivers.
+HeapTupleSatisfiesVisibility (heapam\_visibility.c) takes the HeapTuple and the Snapshot by pointer.
+
+`parseHeapTupleAliasInto`'s header composite store, 52 % of its 10 %, is C48's own site on the same query. The
+Below-bar rule makes it ineligible here.
+
+**Change.**
+
+- `transam.TupleVisibleSubxactPtr(*HeapTupleHeader, *Snapshot, …)` is now the implementation.
+  `TupleVisibleSubxact` wraps it, so its other 15 callers are unchanged.
+- `seesCommittedXIDWithSubxactsPtr` is the same split for `SeesCommittedXIDWithSubxacts`.
+- The six read-only Snapshot query methods take `*Snapshot`. None writes the receiver; the only calls are
+  `sort.Search` reads.
+- `seqScanOp.Next` calls the pointer form with `&tuple.Header, &o.ctx.Snap`.
+
+**Measured** (`tools/ds-warm.sh` warm wall, 6 alternating rounds, base at `12f21f440`, load 1.1–2.0; and
+`tools/ds-instr.sh`):
+
+| metric | before | after | change |
+|---|---|---|---|
+| Q10 warm wall, median of 6 (Target) | 0.265 s | 0.2575 s | **−2.83 %** |
+| Q10 warm wall, mean of 6 | 0.2657 s | 0.2572 s | −3.2 % |
+| Q10 instructions:u | 6.538 G | 6.458 G | −1.2 % |
+
+Judged by the median, as C44 was, this misses the 3 % bar. The per-round differences run from −1.5 % to −5.5 %,
+and the mean would pass. It is landed below the bar: a faithful port with no plan or value change, and an
+instruction count that also falls. This is the second consecutive miss (C48, C49), so it triggers the one-task
+yield.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same.
+
+No new test: the visibility logic is unchanged and still reached through the existing callers' tests, the units
+suite and every scan gate. The pointer form is the body the by-value wrapper calls.

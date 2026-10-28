@@ -135,7 +135,7 @@ const snapshotLinearScanThreshold = 16
 // snapshotLinearScanThreshold. For small N the linear scan stays
 // because branch prediction + cache locality make the simple loop
 // faster than sort.Search's call overhead.
-func (s Snapshot) HasInProgress(xid storage.TransactionID) bool {
+func (s *Snapshot) HasInProgress(xid storage.TransactionID) bool {
 	n := len(s.InProgress)
 	if n <= snapshotLinearScanThreshold {
 		for _, in := range s.InProgress {
@@ -153,7 +153,7 @@ func (s Snapshot) HasInProgress(xid storage.TransactionID) bool {
 
 // HasAborted returns true when xid belongs to a rolled-back transaction
 // whose status is tracked in this snapshot's Aborted list (M0100-0002).
-func (s Snapshot) HasAborted(xid storage.TransactionID) bool {
+func (s *Snapshot) HasAborted(xid storage.TransactionID) bool {
 	n := len(s.Aborted)
 	if n == 0 {
 		return false
@@ -182,7 +182,7 @@ func (s Snapshot) HasAborted(xid storage.TransactionID) bool {
 // rw-conflict against a writer the reader already sees as committed: reading a
 // tuple version whose writer committed before our snapshot is an ordinary read
 // (wr-dependency), not an anti-dependency.
-func (s Snapshot) XidIsConcurrent(xid storage.TransactionID) bool {
+func (s *Snapshot) XidIsConcurrent(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
@@ -197,7 +197,7 @@ func (s Snapshot) XidIsConcurrent(xid storage.TransactionID) bool {
 
 // SeesCommittedXID reports whether xid is visible as committed to this
 // snapshot under the v0 model.
-func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
+func (s *Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
@@ -281,7 +281,7 @@ func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 // The HasAborted check is retained even though PG's branch has no equivalent:
 // it is an in-memory lookup, and it is a cheap backstop for the crash-recovery
 // case SeesCommittedXID's comment describes.
-func (s Snapshot) SeesCommittedXIDHinted(xid storage.TransactionID) bool {
+func (s *Snapshot) SeesCommittedXIDHinted(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
@@ -310,7 +310,7 @@ func (s Snapshot) SeesCommittedXIDHinted(xid storage.TransactionID) bool {
 // TxnStatusCommitted both read as "not aborted", so consulting the CLOG cannot
 // hide live work — it only hides aborts the in-memory Aborted array forgot,
 // which after a restart is all of them (the array is rebuilt empty).
-func (s Snapshot) clogSaysNotAborted(xid storage.TransactionID) bool {
+func (s *Snapshot) clogSaysNotAborted(xid storage.TransactionID) bool {
 	if s.clog == nil {
 		return true
 	}

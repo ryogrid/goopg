@@ -2104,7 +2104,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !transam.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
+			// The header and the snapshot go by pointer, as
+			// HeapTupleSatisfiesVisibility takes them (M0122-0012 C49).
+			if !transam.TupleVisibleSubxactPtr(&tuple.Header, &o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.CmdID, o.ctx.comboStore(), o.ctx.MultiXact) {
 				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
 				// invisible-tuple conflict-out is gated by the spatial predicate —
 				// only a concurrent insert that MATCHES this scan's region forms the

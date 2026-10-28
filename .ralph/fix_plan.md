@@ -1849,6 +1849,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       vs PG agg\_retrieve\_direct / execTuplesMatch, Q67 instructions −0\.4 %\)\.
     - Landed below the bar: C48 seq scan fetches its heap tuple in place \(`PageGetHeapTupleNoCopyInto` vs PG
       heapgettup\_pagemode, DS Q10 instructions −2\.37 %, wall −10\.9 %\)\.
+    - Landed below the bar: C49 seq\-scan visibility check by pointer \(`TupleVisibleSubxactPtr` vs PG
+      HeapTupleSatisfiesVisibility, DS Q10 wall −2\.83 % median\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -1874,6 +1876,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `adoptRestartPoint`\)\. Then return; misses reset\.
       - Worked: M0122\-0013 restartpoint WAL removal, landed 2026\-10\-28 \(loop \#226\)\. Yield over — the next item\-10
         selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#236\): C48 −2\.37 % instructions \(slice 119, landed\) and C49 −2\.83 % wall median \(slice
+      120, landed\) missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]`
+      M0119\-0006, M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-28: CreateRestartPoint's
+      remaining steps — UpdateCheckPointDistanceEstimate from restartpoints, TruncateSUBTRANS on a hot standby,
+      PreallocXlogFiles; or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2428,6 +2435,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestPageGetHeapTupleNoCopyIntoReusesTuple`\. Design:
       part 11 §119\. **Miss counter 1\.** Lesson: a stall\-shaped share \(samples on one store after a return, or a first
       touch\) needs a wall\-time Target on an idle host\.
+  - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
+    \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
+    o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
+    pointer\) are passed by value on every tuple, and the Snapshot query methods have value receivers\.
+    `parseHeapTupleAliasInto`'s header composite store is 52 % of its 10 % — C48's own site on Q10, ineligible \(Below\-bar\)\.
+    - C49: `transam\.TupleVisibleSubxactPtr\(\*HeapTupleHeader, \*Snapshot, …\)` as the implementation \(the by\-value form
+      wraps it for the other 15 callers\), pointer receivers on Snapshot's read\-only query methods, and the seq scan
+      calls the pointer form\. PG: HeapTupleSatisfiesVisibility\(HeapTuple htup, Snapshot snapshot, Buffer\) takes both
+      by pointer \(heapam\_visibility\.c\)\.
+    - **Target \(C49\)**: TPC\-DS SF0\.25 **Q10**, metric **warm wall time** \(`tools/ds\-warm\.sh <bin> 10 2 10`, 3 rounds
+      alternating, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~5 %\. \(Wall, not
+      instructions: the share is stall\-shaped, per the C48 lesson\.\)
+    - **C49 LANDED BELOW THE BAR \(slice 120\)**: `TupleVisibleSubxactPtr` \(the by\-value form wraps it\),
+      `seesCommittedXIDWithSubxactsPtr`, pointer receivers on six read\-only Snapshot methods; `seqScanOp\.Next` calls the
+      pointer form\. Q10 warm wall 6 alternating rounds: median 0\.265 → 0\.2575 s = **−2\.83 %, misses the 3 % bar** \(mean
+      −3\.2 %, rounds −1\.5…−5\.5 %\); instructions 6\.538 → 6\.458 G \(−1\.2 %\)\. Gates: units, spotcheck, acceptance 24 MATCH,
+      sf025 99/99 plans same\. Design: part 11 §120\. **Second consecutive miss \(C48, C49\) → one\-task yield** \(Yield
+      record\)\.
   - **Return 2026\-10\-27 \(loop \#187\)**: G1/G2 census committed at `analysis/m0122/m0122\-0012/census\-20261027/`
     \(combined top 10: DS Q14, Q23, Q72, H Q17, DS Q67, H Q18, H Q13, DS Q39, DS Q64, DS Q78\)\. Took C16a\.
     - **Target \(C16a\)**: TPC\-DS SF0\.25 **Q64**, metric **instructions:u per cache\-busted plan**
@@ -6113,6 +6138,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#235\) — **exhausted at `6818860a2`**, census `routing\-20261028i/` reused:
     `da5ccb973` / `6818860a2` are ralph/docs/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
     note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#236\) — **exhausted at `12f21f440`**, fresh census `routing\-20261028j/`
+    \(`12f21f440` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
