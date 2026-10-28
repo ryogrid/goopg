@@ -2517,6 +2517,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       first touch, not a removable store\-forwarding cost\. Code reverted\. **Miss counter 1\.**
       - Lesson: a single hot store right after a function's loads can be the skid of a cache miss on the source bytes;
         check whether the source line is the first touch \(here `raw\[22\]` on line 529\) before calling it a stall\.
+  - **Return 2026\-10\-28 \(loop \#245, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`e5cad94b5` xlog only\)\.
+    G3: H Q1 re\-profiled at HEAD — `fastNumericArith` 10\.0 % self \(the 48\-byte operands passed by value into it and on
+    into numericAdd/Sub/Mul\), numericMul 2\.6 %, numericSub 1\.7 %\. An in\-place int64 lane there \(C54\) is C53's code site
+    and PG function on the same query — ineligible on Q1 by the Below\-bar key; no other top\-10 query is
+    arithmetic\-heavy\. Rows census \(G3's algorithmic\-gap check\) on DS Q14, Q23, Q72 at HEAD: no algorithmic gap — Q72's
+    inventory probe emits the same rows as PG \(next node loops 21593 = PG\); the apparent 20× is EXPLAIN ANALYZE
+    accounting → filed **M0122\-0021**\. Q44's Sort under WindowAgg drains 8912 rows vs PG's 11 \(run\-condition stop,
+    ledgered M0146\-0005dn; not a top\-10 query\)\. No qualifying candidate this pass; misses stay 0\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -3667,6 +3675,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
+- [ ] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-10\-28 \(loop \#245\) from the M0122\-0012 G3 rows census of TPC\-DS Q72 \(SF0\.25\)\. Captures:
+    `analysis/m0122/m0122\-0021/q72\-goopg\-e5cad94b5\.explain` \(goopg, private clone\) and
+    `q72\-pg18\-tpcds025\.explain` \(PG 18\.3 `:65438`, read\-only EXPLAIN ANALYZE\)\.
+  - Symptom: under the Gather, `Index Scan using inventory\_pkey on inventory` shows no `\(actual rows=… loops=…\)` on its
+    node line and four `Worker N:  actual time=… rows=180\.66…216\.30 loops=…` lines; PG prints `\(actual rows=9\.88
+    loops=2185\)` on the node line, `Rows Removed by Filter: 191`, and no per\-worker lines \(explain\.c prints them only
+    when `es\->workers\_state && es\->verbose`, line ~1885\)\. goopg's worker rows ≈ 9\.88 \+ 191, the pre\-filter count:
+    M0122\-0017's rowsOut subtraction covers the node line only\. The next node's loops prove the filter IS applied
+    \(date\_dim d2 loops 4981\+5354\+5370\+5888 = 21593 = PG\) — a reporting gap, not extra work\.
+  - First step: in the text ANALYZE renderer, aggregate worker instrumentation onto the node line \(PG's
+    InstrAggNode / ExplainNode totals\), print `Worker N:` lines only with VERBOSE, and apply the M0122\-0017
+    attributed\-rejection subtraction to the aggregate; Rows Removed by Filter summed across workers\.
+  - Expected instrument: Q72's inventory line identical to the PG capture \(modulo timing\); regress outputs unchanged\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint skip arm without the flush LANDED 2026\-10\-28 \(loop \#244, the M0122\-0012 one\-task yield\)**\.
     Movement: none — recovery path\. `runRecoveryFlush` runs `restartPointSkips` \(no replayed checkpoint, or its redo not
@@ -6298,6 +6322,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#244\) — **exhausted at `d0f1515c0`**, fresh census `routing\-20261028n/`
     \(`d0f1515c0` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
     filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#245\) — **exhausted at `e5cad94b5`**, census `routing\-20261028n/` reused:
+    `e5cad94b5` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
