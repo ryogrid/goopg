@@ -2738,6 +2738,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       > to Below\-bar mechanisms"\) cannot be met while C47 is blocked and the predicted\-below\-bar items were never
       > attempted, so each loop re\-runs a G3 pass that files nothing\. Placing P0\-E15 \(unblocks C47\) or ruling on whether
       > predicted\-below\-bar candidates count as Below\-bar would end the cycle\. The loop continues per the rules\.
+  - **G1/G2 refresh 2026\-10\-28 \(loop \#258, misses 0\)**: census `analysis/m0122/m0122\-0012/census\-20261028d/` at
+    `5a89cc5f5` \(host load 6–10\.5 from an unrelated workload — ranking input only\)\. Top 10: DS Q14 3934, DS Q23 2614, DS
+    Q72 1163, H Q13 1100, H Q17 780, DS Q47 699, DS Q78 634, DS Q67 556, DS Q39 546, DS Q59 490 ms \(DS Q7 not ranked: the
+    in\-sweep artefact\)\. H Q18 and H Q10 left after C57–C60; DS Q67 and DS Q59 entered\. G3 on the entrants:
+    - DS Q59 \(cycles:u, `tmp/g1\-258/ds59\.data`\): `fastComparisonBool` 8\.0 % self \(6\.0 % under `aggEvalList` — the seven
+      `CASE WHEN d\_day\_name = '<day>'` arms already take the in\-place plain\-string branch\), `evalFastCase` 5\.7 %\. Pool
+      item C40 \(pre\-decide the constant side's plain/trim test at compile time, `==` for `=`/`<>`\) sized by calls ×
+      per\-call cost: ~5 M comparisons × ~25 instructions ≈ 1 % of Q59's ~10\.8 G instructions, ~2\.5 % of cycles — below
+      the bar\. PG's bpchareq trims both sides per call too\.
+    - DS Q67: the sort family \(Below\-bar\)\.
+    - **No qualifying candidate; not a miss\.**
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6583,6 +6594,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#257\) — **exhausted at `b5203895b`**, census `routing\-20261028r/` reused:
     `b5203895b` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
     live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#258\) — **exhausted at `c3e5937a9`**, census `routing\-20261028r/` reused:
+    `c3e5937a9` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
