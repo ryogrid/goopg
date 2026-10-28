@@ -1861,6 +1861,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
     - Dropped: C55 previous\-key memo in the hashed aggregate's int lane \(`aggregateOp\.Open` igroups vs PG
       LookupTupleHashEntry, H Q18 instructions −1\.0 %\)\.
+    - Dropped: C56 abbreviated leading text sort key \(`sortChunk` comparator vs PG varstr\_abbrev\_convert /
+      ApplySortComparator on SortTuple\.datum1, DS Q47 instructions −0\.55 %\)\.
     - **Family on the Below\-bar list \(rotation rule, loop \#246\):** 48\-byte Datum / struct by\-value copy elimination \(C48, C49,
       C50, C52, C53 — five attempts, all < 3 %; the last three consecutive\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -1908,6 +1910,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       reset\.
       - Worked: M0122\-0013 restartpoint skip arm without the flush, landed 2026\-10\-28 \(loop \#244\)\. Yield over —
         the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#248\): C55 −1\.0 % instructions \(dropped\) and C56 −0\.55 % instructions \(dropped\) missed
+      the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no
+      selectable child \(0023, 0048 `\[\!\]`\), so M0122\-0013 \(ledgered 2026\-10\-28: the volume trigger in recovery
+      measures the replay position, the skip arm raises minRecoveryPoint, or PreallocXlogFiles\)\. Then return; misses
+      reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2569,6 +2576,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         lookups × instructions\-per\-call \(or `perf stat` on a micro A/B\), not from the sampled share; the same skid
         made C52's `movups` look hot\. The 11 % is stall time — the first touch of each of 1\.5 M groups, which PG's
         simplehash pays too — so only a wall Target could see a structural table change\.
+  - **Generate pass 2026\-10\-28 \(loop \#248, misses 1\)**: S9 census reused \(`2ba95c383` ralph only\)\. DS Q47 at HEAD,
+    **cycles:u** \(`tmp/g3\-248/q47c\.data`\): `cmpbody` 11\.4 % \(55 % of it under `sortChunk`'s comparator, 15 % merge\-join
+    `bufferGroup`, 13 % the in\-memory run merge, 13 % Gather Merge\), `lessKeyVals` 6\.4 %, the sort closure 1\.9 %\. The CTE's
+    parallel Sort orders ~50 K rows per worker by \(i\_category, i\_brand, s\_store\_name, s\_company\_name, d\_year, d\_moy\);
+    every compare walks perm → keyvals\[p\] → \[\]Datum → string bytes, key by key\.
+    - C56: an abbreviated leading key for a character\-string first sort key — the first 8 bytes big\-endian in a uint64
+      per row, computed once before the sort; the comparator decides on the abbreviations when they differ and falls
+      back to the full comparison when they tie\. PG: `varstr\_abbrev\_convert` / `varstrcmp\_abbrev` installed by
+      `varstr\_sortsupport` \(varlena\.c\) and used through `ApplySortComparator` on `SortTuple\.datum1` \(tuplesort\.c\);
+      goopg's text order is byte order \(the C collation\), so the abbreviation is exact when it differs\. Not a
+      sort\-algorithm swap \(the Below\-bar sort family\): same algorithm, same comparisons, cheaper decided ones\.
+    - **Target \(C56\)**: TPC\-DS SF0\.25 **Q47**, metric **instructions:u per query** \(`tools/ds\-instr\.sh <bin> 47 3`, 2
+      alternating rounds, fresh A/B vs `2ba95c383`\)\. Bar: −3 %; predicted ~4 % \(the key\-1\-decided share of ~15 %\)\.
+    - **C56 MEASURED AND DROPPED \(loop \#248\)**: implemented \(`sortOp\.abbrevLeadingKey` → per\-row `\{v uint64, ok\}`;
+      `sortChunk`'s comparator decides on differing abbreviations, else `lessKeyVals`; a `sortAbbrevDisabled` knob;
+      `TestSortAbbrevLeadingKeyMatchesFullCompare` — long shared prefixes, prefix strings, empty, NULL, UTF\-8, bpchar,
+      ASC/DESC × NULLS FIRST/LAST, multi\-key; an inverted abbreviated order fails it\)\. Q47 15\.253/15\.225 →
+      15\.154/15\.151 Ginstr/q = **−0\.55 %, misses the 3 % bar**\. Code reverted\. **Second consecutive miss \(C55, C56\) →
+      one\-task yield** \(Yield record\)\.
+      - Lesson: the leading key i\_category has ~10 values, so most compares tie on it and still walk every key; an
+        abbreviation pays only when key 1 is high\-cardinality\. Before sizing a comparator lever, estimate the
+        decided\-at\-key\-1 fraction from the key's distinct count, not from the comparator's share\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6375,6 +6404,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#247\) — **exhausted at `569c3b7af`**, census `routing\-20261028n/` reused:
     `569c3b7af` is ralph only \(no planner/executor path since `d0f1515c0`\)\. No task is filed\. Same items\-0\-9 tokens
     as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#248\) — **exhausted at `2ba95c383`**, census `routing\-20261028n/` reused:
+    `2ba95c383` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
