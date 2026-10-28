@@ -1855,6 +1855,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       EEOP\_JUMP\_IF\_NOT\_TRUE, DS Q59 wall −0\.24 %, instructions −2\.6 %\)\.
     - Landed below the bar: C51 HEAP\_HASEXTERNAL\-gated seq\-scan TOAST walk \(`scanNeedsDetoast` vs PG
       HeapTupleHasExternal, H Q17 instructions −2\.94 %\)\.
+    - Dropped: C52 header fields stored one by one in `parseHeapTupleAliasInto` \(vs PG reading t\_data in place, H Q17
+      wall −0\.6 %, instructions −0\.44 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -2489,6 +2491,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       21\.242/21\.238 → 20\.612/20\.620 Ginstr/q = **−2\.94 %, misses the 3 % bar** \(not rounded\); Q1 −0\.5 %\. Gates: units,
       spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestScanDetoastGatedOnHasExternal`\. Design: part 11
       §122\. **Second consecutive miss \(C50, C51\) → one\-task yield** \(Yield record\)\.
+  - **Return 2026\-10\-28 \(loop \#242, after the M0122\-0013 yield; misses 0\)**: S9 census reused \(`b9224032c` xlog
+    only\)\. G3: DS Q78 at HEAD \(`tmp/g3\-242/q78\.data`\) is flat — top symbol evalFastExpr 4\.1 %; interpreted sort keys
+    \(evalExprSlot under evalSortKeyValueSlot\) 0\.8 % — no ≥ 3 % mechanism\. H Q17's `parseHeapTupleAliasInto` header
+    composite store \(loop \#240 profile: 61 % of its 5\.1 %, 46 % on one `movups` store — the literal built on the stack and
+    copied into \*t\) is C48's site on a different query, so eligible\.
+    - C52: `parseHeapTupleAliasInto` writes the header fields straight into `\*t` \(no composite temporary, no 16\-byte
+      reload of narrower stores\)\. PG: heapgettup fills HeapTupleData's fields in place and reads the header through the
+      `t\_data` pointer \(HeapTupleHeaderGetRawXmin etc\.\), no copy\.
+    - **Target \(C52\)**: TPC\-H SF1 **Q17**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 17`, pass\-2
+      elapsed, 6 alternating rounds, median, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %;
+      predicted ~3 % \(stall\-shaped share, per the C48 lesson\)\.
+    - **C52 MEASURED AND DROPPED \(loop \#242\)**: implemented \(header fields stored one by one into `\*t`, a field\-count
+      guard in the reuse test\)\. Q17 warm wall 6 alternating rounds: median 1\.635 → 1\.625 s = **−0\.6 %, misses the 3 %
+      bar**; instructions 20\.590 → 20\.500 G \(−0\.44 %\)\. The 46 % on one `movups` was skid attribution of the tuple's
+      first touch, not a removable store\-forwarding cost\. Code reverted\. **Miss counter 1\.**
+      - Lesson: a single hot store right after a function's loads can be the skid of a cache miss on the source bytes;
+        check whether the source line is the first touch \(here `raw\[22\]` on line 529\) before calling it a stall\.
   - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
     \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
     o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
@@ -6234,6 +6253,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#241\) — **exhausted at `de5bd21cc`**, fresh census `routing\-20261028m/`
     \(`de5bd21cc` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
     filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#242\) — **exhausted at `b9224032c`**, census `routing\-20261028m/` reused:
+    `b9224032c` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
