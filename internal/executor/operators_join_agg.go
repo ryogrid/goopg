@@ -84,6 +84,9 @@ type joinOp struct {
 	// column yields a datum that is not int64-representable.
 	lazyIntHash   map[int64][]Row
 	lazyHashIsInt bool
+	// intProbe is the flat probe index over lazyIntHash (C59,
+	// int_probe_index.go), rebuilt whenever the map changes.
+	intProbe intProbeIndex
 
 	// EX3-02 Cut 1 (stratum B): per-joinOp build arena for variable-width
 	// payloads (dense_build.go). Parented to the statement context, released
@@ -2123,7 +2126,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					}
 				}
 				if ik, iok := datumToInt64Key(kd); iok {
-					matches = o.lazyIntHash[ik]
+					matches = o.intProbeRows(ik)
 					matchIntKey, haveIntKey = ik, true
 				}
 			}
@@ -2274,6 +2277,7 @@ func (o *joinOp) Close() error {
 	o.closeLateralStream()
 	o.lazyHash = nil
 	o.lazyIntHash = nil
+	o.intProbe = intProbeIndex{}
 	// EX3-02 Cut 1: drop the stratum-B arena with the table. A
 	// shared-adopted arena is only dereferenced here (statement end
 	// reclaims it); the serial arena is Released eagerly.

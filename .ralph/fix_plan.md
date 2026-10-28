@@ -2670,6 +2670,29 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `mapaccess1\_fast64` 17\.5 % of cycles: 66 % hash\-join probe, 29 % group lookup; C44 and C55 are its two misses so
       far\)\. Design\-sized: write the int\-lane open\-addressing table design \(PG simplehash\.h, ExecScanHashBucket\) and
       take its first slice with an H Q13 **wall** Target on an idle host\.
+  - **Generate 2026\-10\-28 \(loop \#254, misses 0\)**: S9 census `routing\-20261028p` reused \(`b5bd577ed` ralph only\)\. Sizing
+    first \(calls × per\-call cost, the C55 lesson\): a micro\-benchmark at Q13's shape \(150 K int keys, 1\.5 M random probes\)
+    runs Go's `map\[int64\]\[\]Row` at ~45 ns per probe and a flat linear\-probe table at ~11 ns \(`/tmp/c59bench`\)\. Q13 is
+    fully serial \(Hash Right Join probing customer with 1\.48 M orders rows, then the c\_custkey HashAggregate\); its probe
+    `mapaccess1\_fast64` is ~11\.6 % of ~0\.94 s CPU per query \(~73 ns per probe in situ\), on the critical path\.
+    - C59 \(slice 1 of the int\-lane simplehash design, `docs/design/0100\-0149/0122\-0012\-c59\-int\-lane\-open\-addressing\.md`\):
+      the hash join's int\-lane probe reads a flat open\-addressing index built from `lazyIntHash` \(entries `\{key, rows\}`,
+      power\-of\-two capacity, load ≤ 2/3, Fibonacci hash, linear probe\); the map stays the source of truth for every
+      other site, and the index is rebuilt whenever the current map is not the one it was built from or its length
+      changed\. PG: the hash join's bucket array probed by `ExecScanHashBucket` \(nodeHash\.c\) and simplehash\.h's linear
+      probing for TupleHashTable — one array slot per probe, no control\-word group\.
+    - **Target \(C59\)**: TPC\-H SF1 **Q13**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 13`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~6–8 % \(70 % of
+      the 11\.6 % probe share\)\.
+    - **C59 LANDED \(slice 126, design slice 1\)**: `joinOp\.intProbeRows` reads `intProbeIndex`, a flat `\{key, rows\}`
+      linear\-probe array frozen from `lazyIntHash` \(rebuilt when the map's identity or length changes; > 2^20 keys keep
+      the map\)\. Q13 warm wall 1\.725 → 1\.665 s median = **−3\.5 %, meets the bar** \(faster in all 6 alternating rounds\);
+      instructions 11\.419/11\.414 → 11\.393/11\.392 G \(−0\.2 %\)\. Gates: units, spotcheck, acceptance 24 MATCH, sf025
+      PASS=99 with plans 99/99 same \(the sweep's \+20 % vs the C58 gate sweep is host variance: flat against the census
+      sweep, Q74/Q14 instructions flat\), TestPort\_RegressSuite PASS\. Tests `TestIntProbeIndexMatchesMap`,
+      `TestIntProbeIndexJoinsMatchMap` \(mutation\-checked: freshness guard, collision probing\)\. **Misses 0\.**
+      - Next in the family \(design §Later slices\): the hashed aggregate's int lane \(`igroups`, the other 29 % of Q13's
+        map share; H Q18\)\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6502,6 +6525,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#253\) — **exhausted at `5463cb473`**, fresh census `routing\-20261028p/` \(TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
     the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#254\) — **exhausted at `b5bd577ed`**, census `routing\-20261028p/` reused:
+    `b5bd577ed` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
+    live\. \(The C59 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
