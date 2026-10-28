@@ -2794,6 +2794,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - goopg's EXPLAIN ANALYZE timing inflates the cross\_items body 4\.5× \(3163 ms vs 694 ms bare; M0122\-0018\) — per\-node
       times are not comparable\.
     - **No qualifying candidate; not a miss\.**
+  - **G3 on Q14's `cross\_items` CTE body 2026\-10\-28 \(loop \#262, misses 1\)**: cycles:u standalone \(`tmp/g3\-262/ci\.data`\)\.
+    nbtree probes into `item\_pkey` from the two nested loops \(215 K \+ 107 K probes — PG's plan makes the same\) plus heap
+    first touches; no set\-operation or hashing hot spot\. No candidate; not a miss\.
+    - > **ESCALATION 2026\-10\-28 \(loop \#262\):** six consecutive generate passes \(\#251, \#253, \#256, \#257, \#258, \#260–\#262\)
+      > found no candidate ≥ 3 % after every top\-10 query was profiled at HEAD and the top two were row\-censused in full\.
+      > The remaining excess is PG\-equivalent work at a larger constant per operation, Below\-bar families, predicted\-below\-bar
+      > items \(C40, C41, estimate\-sized table\) and the blocked C47 \(P0\-E15\)\. Further G3 passes produce no information\.
+      > Owner decision needed: place P0\-E15 \(unblocks C47\), rule that predicted\-below\-bar candidates count as Below\-bar
+      > \(which would let EXHAUSTED be written\), or redirect item 10\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6661,6 +6670,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     `c4f0fa916` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#261\) — **exhausted at `3d6366064`**, census `routing\-20261028r/` reused:
     `3d6366064` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#262\) — **exhausted at `b54e7fa8d`**, census `routing\-20261028r/` reused:
+    `b54e7fa8d` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
