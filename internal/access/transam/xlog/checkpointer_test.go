@@ -402,6 +402,67 @@ func TestCheckpointerVolumeTriggerDisabled(t *testing.T) {
 	}
 }
 
+// TestCheckpointerVolumeTriggerRecoveryMeasuresReplay pins the standby side
+// of the max_wal_size trigger (M0122-0013): in recovery it measures the
+// REPLAY position, as PG's XLogPageRead tests
+// XLogCheckpointNeeded(readSegNo) on the segment replay leaves, so received
+// but unreplayed WAL never requests a restartpoint; and it requests once per
+// replay segment, since a restartpoint that finds no newer checkpoint leaves
+// the anchor where it was. Outside recovery the source is ignored.
+func TestCheckpointerVolumeTriggerRecoveryMeasuresReplay(t *testing.T) {
+	const seg = 4096
+	cp := &Checkpointer{cfg: CheckpointerConfig{MaxWALBytes: 4 * seg, SegmentSize: seg}}
+	cp.volumeAnchor.Store(10 * seg)
+	replay := uint64(10*seg + 100)
+	cp.SetReplayPositionSource(func() uint64 { return replay })
+	received := stubReporter{lsn: 50 * seg}
+
+	// Primary (not in recovery): the replay source is ignored.
+	if !cp.volumeTriggerFires(received) {
+		t.Fatal("primary: did not fire 40 segments past the anchor")
+	}
+
+	cp.SetRecoveryMode(true)
+	if cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: fired on received WAL while replay is in the anchor's segment")
+	}
+	replay = 13*seg - 1
+	if cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: fired 2 replayed segments past the anchor; CheckPointSegments-1 = 3")
+	}
+	replay = 13 * seg
+	if !cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: did not fire 3 replayed segments past the anchor")
+	}
+	// No newer checkpoint was adopted, so the anchor stays: the same
+	// replay segment must not request again on the next poll.
+	replay = 13*seg + 500
+	if cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: requested twice from one replay segment")
+	}
+	replay = 14 * seg
+	if !cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: did not re-request from the next replay segment")
+	}
+	// An adopted restartpoint moves the anchor (redo, 1-based).
+	cp.lastCheckpointRedoLSN.Store(14*seg + 1)
+	replay = 16 * seg
+	if cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: fired 2 replayed segments past the restartpoint's redo")
+	}
+	replay = 17 * seg
+	if !cp.volumeTriggerFires(received) {
+		t.Fatal("recovery: did not fire 3 replayed segments past the restartpoint's redo")
+	}
+
+	// Without a source a standby falls back to the writer's position.
+	cp.SetReplayPositionSource(nil)
+	cp.recoveryVolumeSegNo.Store(0)
+	if !cp.volumeTriggerFires(received) {
+		t.Fatal("recovery without a replay source: did not measure the writer")
+	}
+}
+
 type stubReporter struct{ lsn uint64 }
 
 func (s stubReporter) WrittenLSN() uint64 { return s.lsn }

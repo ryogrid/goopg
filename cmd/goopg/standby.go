@@ -166,6 +166,9 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	// (CreateRestartPoint), so a restarted standby replays from there.
 	if rt.Checkpointer != nil && replayer != nil {
 		rt.Checkpointer.SetRestartPointSource(replayer.LastCheckpoint)
+		// The max_wal_size trigger requests restartpoints by the replayed
+		// WAL, as PG's XLogPageRead does, not by the received WAL.
+		rt.Checkpointer.SetReplayPositionSource(replayer.ApplyLSN)
 	}
 	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
 		WAL:          rt.WAL,
@@ -435,6 +438,7 @@ func (sc *standbyController) finalizePromotion() error {
 	if sc.rt.Checkpointer != nil {
 		sc.rt.Checkpointer.SetRecoveryMode(false)
 		sc.rt.Checkpointer.SetRestartPointSource(nil)
+		sc.rt.Checkpointer.SetReplayPositionSource(nil)
 	}
 	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
 	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion

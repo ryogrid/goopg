@@ -1915,6 +1915,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       selectable child \(0023, 0048 `\[\!\]`\), so M0122\-0013 \(ledgered 2026\-10\-28: the volume trigger in recovery
       measures the replay position, the skip arm raises minRecoveryPoint, or PreallocXlogFiles\)\. Then return; misses
       reset\.
+      - Worked: M0122\-0013 restartpoint requests follow the replayed WAL, landed 2026\-10\-28 \(loop \#249\)\. Yield over —
+        the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -3765,6 +3767,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     attributed\-rejection subtraction to the aggregate; Rows Removed by Filter summed across workers\.
   - Expected instrument: Q72's inventory line identical to the PG capture \(modulo timing\); regress outputs unchanged\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
+    yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
+    \(`SetReplayPositionSource`, wired in `cmd/goopg/standby\.go`, cleared at promotion\) and fires once per replay
+    segment — PG XLogPageRead's `XLogCheckpointNeeded\(readSegNo\)` → `RequestCheckpoint\(CHECKPOINT\_CAUSE\_XLOG\)`\.
+    Before: the received WAL counted, so a lagging replay requested a restartpoint on every 1\-s poll\.
+    - Pin: `TestCheckpointerVolumeTriggerRecoveryMeasuresReplay`; FAILS when it measures the writer and when the
+      once\-per\-segment guard is dropped\.
+    - Gates: units, TestE2E\_Physical\* family, `\-race` xlog, tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): the skip arm's UpdateMinRecoveryPoint; PreallocXlogFiles; TruncateSUBTRANS on a hot standby;
+      archive\_cleanup\_command\.
   - **Restartpoint skip arm without the flush LANDED 2026\-10\-28 \(loop \#244, the M0122\-0012 one\-task yield\)**\.
     Movement: none — recovery path\. `runRecoveryFlush` runs `restartPointSkips` \(no replayed checkpoint, or its redo not
     newer than pg\_control's\) before the flush and, skipping, only stamps DB\_SHUTDOWNED\_IN\_RECOVERY on shutdown — PG
@@ -6406,6 +6418,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     as the loop \#246 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#248\) — **exhausted at `2ba95c383`**, census `routing\-20261028n/` reused:
     `2ba95c383` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#249\) — **exhausted at `0b7126698`**, census `routing\-20261028n/` reused:
+    `0b7126698` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

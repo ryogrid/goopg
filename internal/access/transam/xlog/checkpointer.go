@@ -303,6 +303,17 @@ type Checkpointer struct {
 	// replay applied; runRecoveryFlush adopts it into pg_control after the
 	// flush, as CreateRestartPoint does (M0122-0013). nil: no restartpoints.
 	restartPointSrc atomic.Pointer[func() (ReplayedCheckpoint, bool)]
+	// replayPosSrc, set on a standby, reports the replay position (the
+	// end of the last applied record, in WrittenLSN's units). In recovery
+	// the max_wal_size trigger measures it instead of the received WAL, as
+	// PG's XLogPageRead tests XLogCheckpointNeeded(readSegNo) on the segment
+	// replay is reading (M0122-0013). nil: the writer's position.
+	replayPosSrc atomic.Pointer[func() uint64]
+	// recoveryVolumeSegNo is the replay segment of the last recovery
+	// volume request (+1; 0 before any): a request fires only from a newer
+	// segment, PG's evaluation point — XLogPageRead tests once per segment
+	// it leaves, not on every poll.
+	recoveryVolumeSegNo atomic.Uint64
 
 	// retainer, when non-nil, runs after each successful
 	// checkpoint marker is durable. The slot-aware production
@@ -670,6 +681,17 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 		return false
 	}
 	written := vr.WrittenLSN()
+	recovery := false
+	if src := c.replayPosSrc.Load(); src != nil && c.recoveryMode.Load() {
+		// A standby requests a restartpoint by the WAL it has REPLAYED:
+		// PG's XLogPageRead (xlogrecovery.c) calls
+		// XLogCheckpointNeeded(readSegNo) when replay leaves a segment, so
+		// WAL that has arrived but is not yet replayed (a lagging startup
+		// process, recovery_min_apply_delay) does not count. Measuring the
+		// received WAL requested a restartpoint on every poll once the
+		// receiver ran ahead, each one a pg_control read in the skip arm.
+		written, recovery = (*src)(), true
+	}
 	segSize := c.segmentSize()
 	// lastCheckpointRedoLSN is stored 1-based (internal convention);
 	// convert back to the 0-based byte position segment numbers use.
@@ -682,7 +704,19 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 	if newSegNo < oldSegNo {
 		return false
 	}
-	return newSegNo-oldSegNo >= c.elapsedSegmentsNeeded()
+	if newSegNo-oldSegNo < c.elapsedSegmentsNeeded() {
+		return false
+	}
+	if recovery {
+		// Once per replay segment: a restartpoint adopts only a newer
+		// replayed checkpoint, so the anchor may stay put; PG re-requests
+		// at the next segment switch, not on every poll.
+		if last := c.recoveryVolumeSegNo.Load(); last != 0 && newSegNo+1 <= last {
+			return false
+		}
+		c.recoveryVolumeSegNo.Store(newSegNo + 1)
+	}
+	return true
 }
 
 // elapsedSegmentsNeeded is XLogCheckpointNeeded's `CheckPointSegments - 1`
@@ -752,6 +786,21 @@ func (c *Checkpointer) SetRestartPointSource(fn func() (ReplayedCheckpoint, bool
 		return
 	}
 	c.restartPointSrc.Store(&fn)
+}
+
+// SetReplayPositionSource installs the standby's replay position (in
+// WrittenLSN's units) for the max_wal_size trigger in recovery — PG's
+// XLogCheckpointNeeded(readSegNo) in XLogPageRead (nil: the writer's
+// position). Set by standby startup, possibly after Run has started.
+func (c *Checkpointer) SetReplayPositionSource(fn func() uint64) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.replayPosSrc.Store(nil)
+		return
+	}
+	c.replayPosSrc.Store(&fn)
 }
 
 // runCheckpoint executes one checkpoint cycle. When `spread` is

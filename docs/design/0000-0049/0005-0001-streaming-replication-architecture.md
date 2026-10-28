@@ -382,13 +382,42 @@ promotion and base-backup E2Es pass.
 
 Still missing (ledgered):
 
-- the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
-  reading;
+- ~~the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
+  reading~~ — resolved by the next section;
 - no `PreallocXlogFiles`;
 - no `TruncateSUBTRANS` at a restartpoint;
 - no `archive_cleanup_command`;
 - restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
   `RequestCheckpoint`.
+
+### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
+
+On a standby PG requests a restartpoint from the startup process's read loop: `XLogPageRead` (xlogrecovery.c), when
+it leaves a segment, calls `XLogCheckpointNeeded(readSegNo)` and, if it holds, `RequestCheckpoint(CHECKPOINT_CAUSE_XLOG)`.
+The distance is the same `CheckPointSegments - 1` the primary uses, measured from `RedoRecPtr` (the last restartpoint's
+redo); the position is the segment **replay** is reading, not the end of the received WAL.
+
+goopg's checkpointer polls the max\_wal\_size trigger once a second against the writer's `WrittenLSN`, which on a
+standby is the received WAL. A startup process that lagged the receiver (or a `recovery_min_apply_delay`) therefore
+requested restartpoints for WAL it had not replayed, and, because a restartpoint with no newer replayed checkpoint
+leaves the anchor in place, it requested one on every poll; each was a pg\_control read in the skip arm.
+
+Now:
+
+- `Checkpointer.SetReplayPositionSource` installs the replayer's `ApplyLSN` (standby startup, `cmd/goopg/standby.go`;
+  cleared at promotion). In recovery mode `volumeTriggerFires` measures that position.
+- In recovery a request fires once per replay segment (`recoveryVolumeSegNo`): PG evaluates the test only when replay
+  leaves a segment, so the next request comes from the next segment, not the next poll.
+- The primary path is unchanged: outside recovery the source is ignored, and without a source a standby falls back to
+  the writer's position.
+
+Remaining difference: PG tests the segment just finished (`readSegNo` before the switch), goopg the segment holding
+the last applied record — the same count once replay is inside the next segment, at most one poll apart.
+
+Pin: `TestCheckpointerVolumeTriggerRecoveryMeasuresReplay` — received WAL 40 segments ahead with replay in the
+anchor's segment does not fire; 3 replayed segments do; the same segment does not re-request; the next does; an
+adopted redo re-anchors; the primary ignores the source. Measuring the writer, or dropping the once-per-segment
+guard, fails it.
 
 ### Promotion restart invariant
 
