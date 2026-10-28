@@ -427,12 +427,36 @@ func (c *Checkpointer) updateCheckPointDistanceEstimate(redoLSN uint64) {
 	if prior == 0 || redoLSN <= prior {
 		return
 	}
-	nbytes := float64(redoLSN - prior)
+	c.addCheckPointDistanceLocked(float64(redoLSN - prior))
+}
+
+// addCheckPointDistanceLocked folds one cycle's redo distance into the
+// estimate (UpdateCheckPointDistanceEstimate's body). distMu held.
+func (c *Checkpointer) addCheckPointDistanceLocked(nbytes float64) {
 	if c.checkPointDistanceEstimate < nbytes {
 		c.checkPointDistanceEstimate = nbytes
 	} else {
 		c.checkPointDistanceEstimate = 0.90*c.checkPointDistanceEstimate + 0.10*nbytes
 	}
+}
+
+// noteRestartPointDistance is CreateRestartPoint's estimate step (xlog.c):
+// PriorRedoPtr is pg_control's checkPointCopy.redo as it stood before the
+// restartpoint replaced it, and UpdateCheckPointDistanceEstimate(RedoRecPtr -
+// PriorRedoPtr) runs before the old WAL is removed, so the removal's spare-
+// segment sizing sees this cycle. Unlike the primary path, the prior redo
+// comes from pg_control, so a standby's first restartpoint after a start
+// already measures a distance. The adopted redo becomes priorRedoLSN, which
+// the next checkpoint after a promotion measures from, as PG's would from
+// pg_control (M0122-0013).
+func (c *Checkpointer) noteRestartPointDistance(priorRedo, redo uint64) {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	c.priorRedoLSN = redo
+	if priorRedo == 0 || redo <= priorRedo {
+		return
+	}
+	c.addCheckPointDistanceLocked(float64(redo - priorRedo))
 }
 
 // CheckPointDistanceEstimate returns the current moving-average estimate
@@ -1156,7 +1180,7 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 		}
 	}
 	if c.cfg.DataDir != "" && (haveRP || shutdown) {
-		adopted, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, shutdown)
+		adopted, priorRedo, err := adoptRestartPointPrior(c.cfg.DataDir, rp, haveRP, shutdown)
 		if err != nil {
 			return fmt.Errorf("restartpoint pg_control update: %w", err)
 		}
@@ -1172,6 +1196,7 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			// of the received WAL, KeepLogSeg's endptr (the later of the
 			// receive and replay positions). Without it a standby's pg_wal
 			// grew without bound (M0122-0013).
+			c.noteRestartPointDistance(priorRedo, rp.Fields.RedoLSN0)
 			if c.retainer != nil {
 				if err := c.retainer.Retain(rp.Fields.RedoLSN0 + 1); err != nil {
 					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
@@ -1196,15 +1221,24 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 // skip arm does (xlog.c:7685-7692). Reports whether it advanced the
 // checkpoint.
 func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown bool) (bool, error) {
+	adopted, _, err := adoptRestartPointPrior(dataDir, rp, haveRP, shutdown)
+	return adopted, err
+}
+
+// adoptRestartPointPrior is adoptRestartPoint also reporting pg_control's
+// checkPointCopy.redo as it stood before the update — CreateRestartPoint's
+// PriorRedoPtr, which feeds the checkpoint distance estimate.
+func adoptRestartPointPrior(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown bool) (bool, uint64, error) {
 	cd, err := control.ReadControlFile(dataDir)
 	if err != nil || cd == nil {
-		return false, err
+		return false, 0, err
 	}
+	priorRedo := cd.CheckPointCopyRedo
 	if !haveRP || !(cd.CheckPointCopyRedo < rp.Fields.RedoLSN0) {
 		if !shutdown {
-			return false, nil
+			return false, priorRedo, nil
 		}
-		return false, control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		return false, priorRedo, control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
 			cd.State = control.DBStateShutdownedInRecovery
 		})
 	}
@@ -1241,7 +1275,7 @@ func adoptRestartPoint(dataDir string, rp ReplayedCheckpoint, haveRP, shutdown b
 			}
 		}
 	})
-	return err == nil, err
+	return err == nil, priorRedo, err
 }
 
 // flushDirty drains the buffer pool's dirty set, using the paced

@@ -320,9 +320,27 @@ standby to replay past the checkpoint. It then requires:
 
 With the retention call removed it fails: two old segments survive.
 
+### Restartpoint distance estimate \(2026\-10\-28, M0122\-0013\)
+
+`CreateRestartPoint` also feeds the checkpoint distance estimate before removing old WAL (xlog.c). It takes
+`PriorRedoPtr` as pg\_control's `checkPointCopy.redo` before the update, and runs
+`UpdateCheckPointDistanceEstimate(RedoRecPtr - PriorRedoPtr)` only in the arm that adopted a restartpoint.
+
+goopg now does the same:
+
+- `adoptRestartPointPrior` reports the prior redo it read.
+- `runRecoveryFlush` calls `noteRestartPointDistance(priorRedo, redo)` right before the retainer.
+- The retainer's recycled-spare sizing (`computeSpareSegments`, PG's XLOGfileslop) therefore follows the standby's
+  own restartpoint cadence. Before this the estimate stayed 0 on a standby.
+- Because the prior redo comes from pg\_control, the first restartpoint after a start already measures a distance.
+- The adopted redo becomes the checkpointer's prior redo, so the first checkpoint after a promotion measures from
+  it, as PG's would from pg\_control.
+
+Pin: `TestRecoveryFlushAdoptsReplayedCheckpoint` asserts an estimate of 8192 − 16 after the restartpoint, and no
+change from a source-less flush.
+
 Still missing (ledgered):
 
-- restartpoints do not feed the checkpoint-distance estimate (`UpdateCheckPointDistanceEstimate`);
 - no `PreallocXlogFiles`;
 - no `TruncateSUBTRANS` at a restartpoint;
 - no `archive_cleanup_command`;

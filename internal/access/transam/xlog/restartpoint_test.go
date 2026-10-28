@@ -181,6 +181,12 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 		t.Fatalf("pg_control after restartpoint: redo=%d checkPoint=%d nextXid=%d; want 8192/%d/801",
 			cd.CheckPointCopyRedo, cd.CheckPoint, cd.CheckPointCopyNextXid, start2-1)
 	}
+	// CreateRestartPoint updates the checkpoint distance estimate from
+	// pg_control's prior redo (16) to the adopted one (8192) before removing
+	// old WAL — even on the first restartpoint after a start (M0122-0013).
+	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {
+		t.Fatalf("checkpoint distance estimate after the restartpoint = %v, want %d", got, 8192-16)
+	}
 	// Without a source a recovery flush leaves pg_control alone (e646499b0).
 	cp.SetRestartPointSource(nil)
 	writeTestControl(t, dir, control.DBStateInProduction, 16)
@@ -189,6 +195,10 @@ func TestRecoveryFlushAdoptsReplayedCheckpoint(t *testing.T) {
 	}
 	if cd, _ := control.ReadControlFile(dir); cd.CheckPointCopyRedo != 16 {
 		t.Fatalf("source-less recovery flush moved redo to %d", cd.CheckPointCopyRedo)
+	}
+	// ... and, adopting nothing, leaves the estimate where it was.
+	if got := cp.CheckPointDistanceEstimate(); got != 8192-16 {
+		t.Fatalf("source-less recovery flush moved the distance estimate to %v", got)
 	}
 }
 
