@@ -390,3 +390,53 @@ Gates:
 **Test.** `TestCaseCompiledMatchesInterpreted` gains two cases: an int comparison (the non-string branch), `<>` and
 `<` on the char(9) column, NULL operands falling back, and constant THEN/ELSE arms. Inverting the bool in the new
 path produces 11 mismatches against the interpreter.
+
+## Slice 122 — C51: the seq scan's per-row TOAST walk runs only for a tuple with HEAP\_HASEXTERNAL (Q17 −2.94 %, below the bar)
+
+Loop #240. TPC-H Q17 at `d6476dbc4` (`tmp/g3-240/h17.data`): `seqScanOp.Next` is 10.2 %, and 32 % of that is in
+`needsDetoastPrefix` (toast.go:219–220), about 3.3 % of Q17. Every scanned lineitem row walks its decoded prefix
+looking for a KindToastPointer.
+
+PG never walks rows like this. heap\_fill\_tuple stamps `HEAP_HASEXTERNAL` in t\_infomask when any attribute is an
+external TOAST pointer, and toast handling is guarded by `HeapTupleHasExternal(tuple)` (heaptuple.c,
+heapam\_handler.c). Values are detoasted per argument inside the functions that need them.
+
+**Why the bit is a sound gate in goopg:**
+
+- The decoder yields `KindToastPointer` only for an external varlena (header byte `0x01`, codec.go), which is
+  exactly what the bit records.
+- Every heap writer that can store one stamps the bit from `pgRowHasExternal` (operators\_storage.go ×3,
+  packedtuple.go, initdb's toastable path); this has been true since 2026-06-26.
+- The two initdb sites without it write small bootstrap catalog rows straight from `EncodeRowPG`, which never holds
+  a pointer.
+- Raw tuple copies and redo carry the writer's infomask unchanged.
+- The shipped corpora were loaded in October, after the bit was introduced.
+
+**Change.** `seqScanOp.Next` reads `hasExternal` from the tuple's infomask once. Its three prefix walks (the
+prefilter guard, the probe-defer guard, the post-decode detoast) go through `scanNeedsDetoast(hasExternal, row, n)`,
+which walks only when the bit is set. With the deform poison armed (tests), a bitless tuple is still walked, and a
+TOAST pointer found in one panics. A writer that forgot the bit would otherwise return a raw pointer, which is a
+wrong result.
+
+**Measured** (`tools/h-instr.sh`, 3 runs × 2 alternating, base at `d6476dbc4`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q17 (Target) | 21.242 / 21.238 | 20.612 / 20.620 | **−2.94 %** |
+| TPC-H Q1 (info) | 76.314 | 75.898 | −0.5 % |
+
+This misses the 3 % bar by 0.06 percentage points. It is not rounded up. It is landed below the bar: PG's own
+guard, with no plan or value change. It is the second consecutive miss (C50, C51), so it triggers the one-task
+yield.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same.
+
+**Test.** `TestScanDetoastGatedOnHasExternal` (toast\_test.go) first checks that the stored tuples carry
+HEAP\_HASEXTERNAL exactly for the two rows with external values. It then scans external and inline rows whole, through
+a prefilter, and with a narrowed read set, with the poison armed. Skipping the walk for a tuple that has the bit
+fails it.

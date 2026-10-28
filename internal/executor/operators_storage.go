@@ -2197,6 +2197,10 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
 			// was not explicitly set (legacy goopg rows without PG format).
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			// HEAP_HASEXTERNAL: only a tuple carrying it can decode to a
+			// TOAST pointer, so the per-row prefix walks below run only then
+			// (M0122-0012 C51; PG guards toast work with HeapTupleHasExternal).
+			hasExternal := tuple.Header.Infomask&storage.HeapHasExternal != 0
 			// EX1-01: the narrowed survivor width. Unset (0) or full
 			// width takes the exact pre-EX1-01 path below; otherwise
 			// only [0, deformBound) is deformed and the tail keeps its
@@ -2256,7 +2260,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// analogue because PG never detoasts a row at all —
 				// expansion happens per-argument inside the called function,
 				// fmgr.h:248,292,309. Ledger: e17-lazy-detoast-divergence.)
-				if !needsDetoastPrefix(o.scanRow, o.prefilter.MaxCols) {
+				if !scanNeedsDetoast(hasExternal, o.scanRow, o.prefilter.MaxCols) {
 					keep, perr := o.evalPrefilter()
 					if perr == nil {
 						earlyDecided = true
@@ -2318,7 +2322,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					}
 					continue
 				}
-				if needsDetoastPrefix(o.scanRow, from) {
+				if scanNeedsDetoast(hasExternal, o.scanRow, from) {
 					if o.probeDeferInfo != nil {
 						from, off = 0, 0
 					}
@@ -2369,7 +2373,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		// tuple's datums (or poison when armed), so a whole-row
 		// needsDetoast here could false-positive on a stale tail
 		// pointer and skip a LIVE tuple via the continue below.
-		if needsDetoastPrefix(row, survivorBound) {
+		if scanNeedsDetoast(hasExternal, row, survivorBound) {
 			detoasted, err := DetoastRowBound(o.ctx, rel, o.cols, row, survivorBound)
 				if err != nil {
 					if o.pinned != nil {

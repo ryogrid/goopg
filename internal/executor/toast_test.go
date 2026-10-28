@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"encoding/binary"
 	"strings"
 	"testing"
@@ -612,5 +613,78 @@ func TestToastRelFor(t *testing.T) {
 	}
 	if toast.RelOid != rel.RelOid+100_000_000 {
 		t.Errorf("RelOid: want %d, got %d", rel.RelOid+100_000_000, toast.RelOid)
+	}
+}
+
+// TestScanDetoastGatedOnHasExternal pins M0122-0012 C51: the seq scan walks a
+// row's decoded prefix for TOAST pointers only when the tuple carries
+// HEAP_HASEXTERNAL. That is safe only while every writer stamps the bit for a
+// row holding an external value (pgRowHasExternal, PG's heap_fill_tuple), so
+// the test checks the bit on the stored tuples first, then scans a mix of
+// external and inline rows — whole-row, through a prefilter (WHERE on the
+// first column) and with a narrowed read set — with the deform poison armed,
+// which makes a bitless tuple that decodes to a TOAST pointer panic.
+func TestScanDetoastGatedOnHasExternal(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE toast_gate (id int, data text, tag int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "toast_gate"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	big := map[int64]string{1: incompressibleString(40000), 3: incompressibleString(30000)}
+	for id := int64(1); id <= 4; id++ {
+		v, ok := big[id]
+		if !ok {
+			v = "small-" + strconv.FormatInt(id, 10)
+		}
+		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{NewIntDatum(id), NewStringDatum(v), NewIntDatum(id * 10)}); err != nil {
+			t.Fatalf("insert %d: %v", id, err)
+		}
+	}
+	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := storage.PageLinePointerCount(slot.Page())
+	external := 0
+	for s := uint16(1); int(s) <= n; s++ {
+		tup, err := storage.PageGetHeapTupleNoCopy(slot.Page(), s)
+		if err != nil {
+			continue
+		}
+		has := tup.Header.Infomask&storage.HeapHasExternal != 0
+		isBig := len(tup.Data) < 200 && s%2 == 1 // ids 1 and 3 hold 18-byte pointers
+		if has != isBig {
+			t.Fatalf("slot %d: HEAP_HASEXTERNAL=%v, want %v", s, has, isBig)
+		}
+		if has {
+			external++
+		}
+	}
+	ctx.Pool.Unpin(slot)
+	if external != 2 {
+		t.Fatalf("%d tuples carry HEAP_HASEXTERNAL, want 2", external)
+	}
+	old := seqScanDeformPoison
+	seqScanDeformPoison = true
+	defer func() { seqScanDeformPoison = old }()
+	rows := runQuery(t, ctx, "SELECT id, length(data), tag FROM toast_gate ORDER BY id")
+	want := []int64{40000, 7, 30000, 7}
+	if len(rows) != 4 {
+		t.Fatalf("got %d rows", len(rows))
+	}
+	for i, r := range rows {
+		if r[1].Int != want[i] || r[2].Int != int64(i+1)*10 {
+			t.Fatalf("row %d = %v, want length %d tag %d", i, r, want[i], (i+1)*10)
+		}
+	}
+	rows = runQuery(t, ctx, "SELECT data FROM toast_gate WHERE id = 3")
+	if len(rows) != 1 || rows[0][0].StringValue() != big[3] {
+		t.Fatalf("prefiltered external row not detoasted: %d rows", len(rows))
+	}
+	rows = runQuery(t, ctx, "SELECT tag FROM toast_gate WHERE id < 3 ORDER BY tag")
+	if len(rows) != 2 || rows[0][0].Int != 10 || rows[1][0].Int != 20 {
+		t.Fatalf("narrowed scan = %v", rows)
 	}
 }

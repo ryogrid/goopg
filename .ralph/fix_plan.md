@@ -1853,6 +1853,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       HeapTupleSatisfiesVisibility, DS Q10 wall −2\.83 % median\)\.
     - Landed below the bar: C50 searched\-CASE WHEN as a bool \(`fastComparisonBool` / `evalFastCase` vs PG
       EEOP\_JUMP\_IF\_NOT\_TRUE, DS Q59 wall −0\.24 %, instructions −2\.6 %\)\.
+    - Landed below the bar: C51 HEAP\_HASEXTERNAL\-gated seq\-scan TOAST walk \(`scanNeedsDetoast` vs PG
+      HeapTupleHasExternal, H Q17 instructions −2\.94 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -1885,6 +1887,10 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       PreallocXlogFiles; or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
       - Worked: M0122\-0013 restartpoint distance estimate, landed 2026\-10\-28 \(loop \#237\)\. Yield over — the next
         item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#240\): C50 −0\.24 % wall \(slice 121, landed\) and C51 −2\.94 % instructions \(slice 122,
+      landed\) missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006,
+      M0147 no selectable child, so M0122\-0013 \(ledgered resume point 2026\-10\-28: TruncateSUBTRANS on a hot standby,
+      PreallocXlogFiles, or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2466,6 +2472,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test: `TestCaseCompiledMatchesInterpreted` \+2 cases \(an
       inverted bool gives 11 mismatches\)\. Design: part 11 §121\. **Miss counter 1\.** Lesson: call/return overhead
       shows in instructions, not wall — check before naming a wall Target\.
+  - **G3 2026\-10\-28 \(loop \#240, misses 1\)**: S9 `routing\-20261028l` exhausted\. TPC\-H Q17 at `d6476dbc4`
+    \(`tmp/g3\-240/h17\.data`\): `seqScanOp\.Next` 10\.2 % — 32 % of it in `needsDetoastPrefix` \(toast\.go:219–220, ~3\.3 % of Q17\):
+    every scanned row walks its decoded prefix for a KindToastPointer; `parseHeapTupleAliasInto` 5\.1 % \(61 % the header
+    composite store\); checksums 7\.7 % \(C19 done\); nextLazy 6\.3 %; projectOp 6\.1 %\.
+    - C51: gate the per\-row TOAST scan on the tuple's `HEAP\_HASEXTERNAL` infomask bit\. The decoder yields KindToastPointer
+      only for an external varlena \(header byte 0x01\), exactly what the bit records; goopg's writers set it from
+      `pgRowHasExternal` since 2026\-06\-26 \(the shipped corpora were loaded after\)\. PG: heap\_fill\_tuple sets
+      HEAP\_HASEXTERNAL and toast handling is guarded by `HeapTupleHasExternal\(tuple\)` \(heaptuple\.c, heapam\_handler\.c\)\.
+    - **Target \(C51\)**: TPC\-H SF1 **Q17**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `d6476dbc4`\)\. Bar: −3 %; predicted ~3\.3 %\.
+    - **C51 LANDED BELOW THE BAR \(slice 122\)**: `scanNeedsDetoast\(hasExternal, row, n\)` gates seqScanOp's three
+      prefix walks on HEAP\_HASEXTERNAL \(poison\-armed tests still walk and panic on a bitless TOAST pointer\)\. Q17
+      21\.242/21\.238 → 20\.612/20\.620 Ginstr/q = **−2\.94 %, misses the 3 % bar** \(not rounded\); Q1 −0\.5 %\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestScanDetoastGatedOnHasExternal`\. Design: part 11
+      §122\. **Second consecutive miss \(C50, C51\) → one\-task yield** \(Yield record\)\.
   - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
     \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
     o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
@@ -6192,6 +6213,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#239\) — **exhausted at `3419876c9`**, census `routing\-20261028k/` reused:
     `3419876c9` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
     owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#240\) — **exhausted at `d6476dbc4`**, fresh census `routing\-20261028l/`
+    \(`d6476dbc4` touched internal/executor\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task is
+    filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
