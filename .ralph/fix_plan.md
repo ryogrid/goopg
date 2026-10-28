@@ -1859,6 +1859,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       wall −0\.6 %, instructions −0\.44 %\)\.
     - Landed below the bar: C53 NUMERIC arithmetic called directly from the compiled binary arm \(`fastNumericArith` vs
       PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
+    - Dropped: C55 previous\-key memo in the hashed aggregate's int lane \(`aggregateOp\.Open` igroups vs PG
+      LookupTupleHashEntry, H Q18 instructions −1\.0 %\)\.
     - **Family on the Below\-bar list \(rotation rule, loop \#246\):** 48\-byte Datum / struct by\-value copy elimination \(C48, C49,
       C50, C52, C53 — five attempts, all < 3 %; the last three consecutive\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
@@ -2543,6 +2545,30 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     inventory probe emits the same rows as PG \(next node loops 21593 = PG\); the apparent 20× is EXPLAIN ANALYZE
     accounting → filed **M0122\-0021**\. Q44's Sort under WindowAgg drains 8912 rows vs PG's 11 \(run\-condition stop,
     ledgered M0146\-0005dn; not a top\-10 query\)\. No qualifying candidate this pass; misses stay 0\.
+  - **Generate pass 2026\-10\-28 \(loop \#247, misses 0\)**: S9 census reused \(`569c3b7af` ralph only\)\. H Q18 at
+    `6a2f5b0e1` \(`tmp/g3\-231/h18i\.data`, instructions:u\): `runtime\.mapaccess1\_fast64` **11\.1 %** \(10\.0 % under
+    `aggregateOp\.Open`: the IN\-subquery's `GROUP BY l\_orderkey` int lane\) \+ `memhash64` 1\.1 %\. The HammerDB load
+    writes each order's lineitems together, so ~6 M input rows feed ~1\.5 M groups in runs of ~4 equal keys; each run's
+    later rows pay a full Go\-map hash and probe for the group the previous row already found\.
+    - C55: the int lane remembers the previous row's key and group and skips the map when the key repeats\. Not a PG
+      mechanism — PG's LookupTupleHashEntry \(execGrouping\.c, simplehash\.h\) hashes every row, at murmurhash32 \+
+      linear\-probe cost; this removes a goopg\-only per\-row cost \(Go's map hash and swiss probe\) for the clustered
+      case\. Precedent: C24 \(same idea in Q67's rollup drain, −0\.4 % there; a different site and query, so eligible\)\.
+      Values, group order and plans are unchanged: the memo only returns the group the map would return\.
+    - **Target \(C55\)**: TPC\-H SF1 **Q18**, metric **instructions:u per query** \(`tools/h\-instr\.sh`,
+      `tmp/g1\-tpch\-q18\.sql`, 3 runs × 2 alternating, fresh A/B vs `569c3b7af`\)\. Bar: −3 %; predicted ~6 % \(three
+      quarters of the 12 % map share, less the first\-touch lookups that remain\)\.
+    - **C55 MEASURED AND DROPPED \(loop \#247\)**: implemented \(`lastIK`/`lastIG` in the int lane, an
+      `aggIntMemoDisabled` knob, `TestAggregateIntLaneMemoMatchesMap` — memo vs per\-row map vs string path over runs,
+      a returning key and mid\-stream NULL/fraction demotion; mutation\-checked\)\. Q18 38\.476/38\.438 → 38\.079/38\.090
+      Ginstr/q = **−1\.0 %, misses the 3 % bar** \(host load 0\.8\)\. The memo fired: ~0\.39 G saved ≈ 4\.5 M repeated rows ×
+      ~85 instructions per Go\-map lookup\. Code reverted\. **Miss counter 1\.**
+      - Lesson: an `instructions:u` *sampled* profile is not an instruction census — the PMI skids onto the
+        instruction after a long\-latency load, so a cache\-missing `mapaccess1\_fast64` drew 11 % of samples for ~1–2 %
+        of the instructions \(6 M lookups × ~85 = 0\.5 G of 38 G\)\. Size an instruction Target from
+        lookups × instructions\-per\-call \(or `perf stat` on a micro A/B\), not from the sampled share; the same skid
+        made C52's `movups` look hot\. The 11 % is stall time — the first touch of each of 1\.5 M groups, which PG's
+        simplehash pays too — so only a wall Target could see a structural table change\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6346,6 +6372,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#246\) — **exhausted at `844eec2a6`**, census `routing\-20261028n/` reused:
     `844eec2a6` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
     owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#247\) — **exhausted at `569c3b7af`**, census `routing\-20261028n/` reused:
+    `569c3b7af` is ralph only \(no planner/executor path since `d0f1515c0`\)\. No task is filed\. Same items\-0\-9 tokens
+    as the loop \#246 note\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
