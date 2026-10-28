@@ -2437,6 +2437,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test `TestPageGetHeapTupleNoCopyIntoReusesTuple`\. Design:
       part 11 §119\. **Miss counter 1\.** Lesson: a stall\-shaped share \(samples on one store after a return, or a first
       touch\) needs a wall\-time Target on an idle host\.
+  - **Return 2026\-10\-28 \(loop \#238, after the M0122\-0013 yield; misses 0\)**: fresh G1/G2 census
+    `analysis/m0122/m0122\-0012/census\-20261028b/` at `6a2f5b0e1` \(top 10: DS Q14 3376, DS Q23 1861, H Q18 1000, H Q13 890,
+    DS Q72 849, H Q17 720, DS Q78 494, DS Q39 456, DS Q47 449, DS Q59 441 ms; DS Q10 left the top 10\)\. G3:
+    - DS Q14 at HEAD \(`tmp/g3\-238/q14\.data`\): the in\-place heap fetch for index scans \(candidate \(a\)\) is no longer
+      visible \(< 1\.2 %\) — not attempted; `bufmap\.Lookup` 4\.3 % is 78 % on the first load of the hash bucket \(a cache
+      miss PG's BufTableLookup pays too\); `parseHeapTupleAliasInto` 5\.8 % first touch; nbtree ~19 % PG\-equivalent\.
+    - DS Q47 \(`tmp/g3\-238/q47\.data`\): sort compares — `cmpbody` 5\.8 % \(3\.7 % inside `sort\.symMerge\_func`, Go's
+      O\(n log² n\) stable merge\), `lessKeyVals` 3\.5 %, `trimStringDatum` 3\.4 % \(bpchar keys, as PG's per\-compare
+      bcTruelen\)\. Sort\-algorithm mechanisms are on the Below\-bar list \(pdqsort, SortStableFunc, buffered stable
+      merge sort: Q67 −3 % instructions but \+2\.6 % cycles\)\.
+    - Remaining lever across Q59 / H Q18 / Q23 / Q14: C13, the recursive 48\-byte Datum return \(design\-sized; needs a
+      slice\-sized first step with a design doc, wall Target\)\.
   - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
     \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
     o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
@@ -6157,6 +6169,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#237\) — **exhausted at `49db3ffa9`**, fresh census `routing\-20261028k/`
     \(`49db3ffa9` touched internal/executor \+ transam\): TPC\-H 22/22, SF0\.25 99/99, SF1 99/99, every category 0\. No task
     is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#238\) — **exhausted at `6a2f5b0e1`**, census `routing\-20261028k/` reused:
+    `6a2f5b0e1` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
+    note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
