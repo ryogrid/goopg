@@ -1,6 +1,6 @@
 # M0122-0012 C59 — the int lane's open-addressing hash tables (PG simplehash)
 
-Status: slice 1 landed 2026-10-28 (loop #254). Later slices are open (ledgered).
+Status: slices 1 and 2 landed 2026-10-28 (loops #254, #255). Slice 3 is open (ledgered).
 
 ## Problem
 
@@ -78,11 +78,58 @@ Gates:
   left, right, full, semi and anti joins on int, int8 and NUMERIC keys with NULLs.
 - Dropping the freshness guard fails the first test; stopping at the first collision fails it too.
 
+### Slice 2 (landed): the hashed aggregate's int-lane group table (C60)
+
+`igroups map[int64]*groupRuntime` became `intGroupTable` (internal/executor/int\_group\_table.go):
+
+- **Entries.** Interleaved `{key int64, g *groupRuntime}` entries, 16 bytes each, where a nil `g` marks an empty
+  slot.
+- **Growth.** It starts at 64 slots and doubles with a full rehash past a 2/3 load. PG's `build_hash_tables` sizes
+  its table from the planner's group estimate instead; that is ledgered.
+- **Lookup.** The same Fibonacci hash and linear probe as slice 1.
+- **Lifetime.** Inserts and lookups interleave, so this is a real table owned by the aggregate's `Open`, not a
+  frozen view.
+- **Order unchanged.** Groups are still emitted in founding order (the `founded` / `iorder` lists), never in table
+  order. The demotion to the string lane reads the table by `iorder`.
+
+`aggIntTableDisabled` keeps the map, for the A/B and the tests.
+
+**Sizing.** At `b0f3750d3` the int lane's map (`mapaccess1_fast64` + `mapassign_fast64` + `memhash64` under
+`aggregateOp.Open`) was 10.8 % of H Q18's cycles and 6.3 % of H Q13's.
+
+**Target.** TPC-H SF1 Q18, warm wall (6 alternating rounds, median, host load < 2), with instructions no worse than
++1 %.
+
+**Measured** (base `b0f3750d3`):
+
+- **Wall.** 3.875 → 3.75 s median, **−3.2 %**, meeting the bar. The rounds overlap: the host ran Q18 at 3.57–4.64 s
+  that hour.
+- **Load-insensitive check, 3 rounds.** User-mode cycles 13.87 → 12.92 G median (−6.9 %, lower in every round);
+  instructions 32.35 → 31.72 G (−2.2 %).
+- **Q13.** Wall flat (1.755 → 1.775 s median): its group lookups are a smaller share than the join probe slice 1
+  took.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same;
+- TestPort\_RegressSuite PASS.
+
+**Tests.**
+
+- `TestIntGroupTableMatchesMap` covers 60 K keys through many doublings: multiples of 2^40, negatives and the int64
+  extremes. Every key keeps its group, and absent keys find nothing.
+- `TestAggregateIntGroupTableMatchesMap` runs SQL aggregates with tens of thousands of groups and a mid-stream
+  NULL/fraction demotion. The output, order included, must equal the map's.
+- Mutations: dropping the probe step loses groups, and an over-full table hangs.
+
 ### Later slices (open)
 
-1. **The hashed aggregate's int lane.** `igroups map[int64]*groupRuntime` becomes a simplehash-style table owned by
-   the aggregate. Its inserts and lookups interleave, so it is a real table rather than a frozen view. This is the
-   other 29 % of Q13's map share; H Q18's group lookup shares it.
-2. **Replace `lazyIntHash`.** Replace the map itself, removing the duplicate memory and the rebuild guard. That
+1. **Replace `lazyIntHash`.** Replace the map itself, removing the duplicate memory and the rebuild guard. That
    touches the batch, spill, shared-build and outer-fill sites, and the shared parallel build would then share one
-   array as PG does.
+   array as PG does. The right/full join's matched-flags map (`lazyMatchedI`, ~2.7 % of H Q13's cycles after slice
+   1) goes with it.
+2. **Size from the estimate.** Size the group table from the plan's group estimate, as PG's `build_hash_tables`
+   does, instead of growing from 64.

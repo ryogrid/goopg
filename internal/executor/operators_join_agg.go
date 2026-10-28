@@ -2861,15 +2861,17 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	// up exactly as the string path alone would have built them.
 	intLane := !aggIntLaneDisabled && !multiSet && len(sets) == 1 && len(sets[0]) == 1 &&
 		!(o.plan.Mode == optimizer.AggModeFinal && o.plan.PartialEmit)
-	var igroups map[int64]*groupRuntime
+	// M0122-0012 C60: the lane's groups live in an intGroupTable (PG's
+	// simplehash TupleHashTable), not a Go map.
+	var igroups *intGroupTable
 	var iorder []int64
 	if intLane {
-		igroups = make(map[int64]*groupRuntime)
+		igroups = newIntGroupTable()
 	}
 	demoteIntGroups := func() {
 		for _, ik := range iorder {
 			key := canonicalNumericKey(ik, 0)
-			groups[key] = igroups[ik]
+			groups[key] = igroups.get(ik)
 			order = append(order, key)
 		}
 		igroups, iorder = nil, nil
@@ -2927,10 +2929,10 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			// M0122-0012 slice 24: the int64 group lane (see intLane above).
 			if intLane {
 				if ik, ok := datumToInt64Key(allVals[set[0]]); ok {
-					gr = igroups[ik]
+					gr = igroups.get(ik)
 					if gr == nil {
 						gr = newGroup(si, set, allVals, slot)
-						igroups[ik] = gr
+						igroups.put(ik, gr)
 						iorder = append(iorder, ik)
 						founded = append(founded, gr)
 					}

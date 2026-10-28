@@ -2693,6 +2693,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       `TestIntProbeIndexJoinsMatchMap` \(mutation\-checked: freshness guard, collision probing\)\. **Misses 0\.**
       - Next in the family \(design §Later slices\): the hashed aggregate's int lane \(`igroups`, the other 29 % of Q13's
         map share; H Q18\)\.
+  - **C59 slice 2 2026\-10\-28 \(loop \#255, misses 0\)**: S9 fresh census `routing\-20261028q` at `b0f3750d3` \(22/22, 99/99,
+    99/99; nothing filed\)\. Sizing \(cycles:u at `b0f3750d3`, `tmp/g3\-255/`\): the hashed aggregate's int\-lane map
+    \(`mapaccess1\_fast64` \+ `mapassign\_fast64` \+ `memhash64` under `aggregateOp\.Open`\) is **10\.8 %** of H Q18 \(the serial
+    IN\-subquery aggregate, 1\.5 M groups over 6 M lineitem rows\) and 6\.3 % of H Q13\.
+    - C60 \(design slice 2\): `igroups` becomes `intGroupTable` — interleaved `\{key, \*groupRuntime\}` entries,
+      power\-of\-two capacity, load ≤ 2/3 with doubling rehash, Fibonacci hash, linear probe — owned by the aggregate
+      \(inserts and lookups interleave, so a real table, not a frozen view\)\. PG: the hashed aggregate's TupleHashTable
+      is a simplehash\.h array \(`LookupTupleHashEntry`, execGrouping\.c; `build\_hash\_tables`\)\.
+    - **Target \(C60\)**: TPC\-H SF1 **Q18**, metric **warm wall time** \(`tools/tpch\-gap\.sh <bin> <label> 18`, pass 2, 6
+      alternating rounds, median, host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~5 % \(half of
+      the 10\.8 % share\)\.
+    - **C60 LANDED \(slice 127, design slice 2\)**: `intGroupTable` replaces `igroups`\. Q18 warm wall 3\.875 → 3\.75 s median
+      = **−3\.2 %, meets the bar** \(rounds overlap: host ran Q18 at 3\.57–4\.64 s\); supporting, load\-insensitive: user cycles
+      13\.87 → 12\.92 G median \(−6\.9 %, lower in all 3 rounds\), instructions 32\.35 → 31\.72 G \(−2\.2 %\); Q13 wall flat\.
+      Gates: units, spotcheck, acceptance 24 MATCH, sf025 PASS=99 plans 99/99 same, TestPort\_RegressSuite PASS\. Tests
+      `TestIntGroupTableMatchesMap`, `TestAggregateIntGroupTableMatchesMap` \(mutation\-checked\)\. **Misses 0\.**
+      - Next in the family: design slice 3 \(replace `lazyIntHash` and `lazyMatchedI`; H Q13's residual
+        `mapaccess1\_fast64` under `nextLazy`/`fillSweepNext` is ~3\.3 %\) — size before attempting\.
   - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
     `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
     `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
@@ -6528,6 +6546,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#254\) — **exhausted at `b5bd577ed`**, census `routing\-20261028p/` reused:
     `b5bd577ed` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is
     live\. \(The C59 commit changes `internal/executor`: the next S9 pass captures fresh\.\)
+  - S9 re\-check 2026\-10\-28 \(loop \#255\) — **exhausted at `b0f3750d3`**, fresh census `routing\-20261028q/` \(TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\)\. No task is filed\. Same items\-0\-9 tokens as
+    the loop \#246 note\. Item 10 is live\. \(The C60 commit changes `internal/executor`: the next S9 pass captures
+    fresh\.\)
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
