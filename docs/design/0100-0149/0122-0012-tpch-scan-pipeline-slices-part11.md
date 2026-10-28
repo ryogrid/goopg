@@ -440,3 +440,44 @@ Gates:
 HEAP\_HASEXTERNAL exactly for the two rows with external values. It then scans external and inline rows whole, through
 a prefilter, and with a narrowed read set, with the poison armed. Skipping the walk for a tuple that has the bit
 fails it.
+
+## Slice 123 — C53: the compiled binary arm calls the NUMERIC arithmetic function itself (Q1 −2.2 %, below the bar)
+
+Loop #243. TPC-H Q1 at `822503136` (`tmp/g3-243/h1.data`): `evalFastExpr` 27.0 %, `evalBinary` 12.1 % (79 % movups),
+`applyAgg` 8.7 %. Each row computes `l_extendedprice * (1 - l_discount)` and `… * (1 + l_tax)` in NUMERIC. Every
+operator went through the following chain:
+
+1. evalFastExpr calls `evalBinary(op, left, right)` with the two 48-byte Datums passed by value.
+2. `evalBinary` walks its interval / time / date / string preamble.
+3. `a, b := left, right` copies the operands again (18.7 % of evalBinary).
+4. `numericSub` / `numericMul` run; their two call lines hold 46 % of evalBinary.
+
+PG resolves the operator's function (numeric\_add / numeric\_sub / numeric\_mul) at plan time and calls it directly
+(EEOP\_FUNCEXPR\_STRICT).
+
+**Change.** In evalFastExpr's simple-binary branch, `fastNumericArithOperands` admits +, - and * when both operands
+are non-NULL, each is KindNumeric or KindInt, and at least one is KindNumeric. For those kinds no earlier arm of
+evalBinary applies. `fastNumericArith` then does exactly what evalBinary's arm does: promoteIntOperand on both
+sides, then numericAdd / numericSub / numericMul. Everything else keeps calling evalBinary.
+
+**Measured** (`tools/h-instr.sh`, 3 runs × 2 alternating, base at `822503136`):
+
+| query | before | after | change |
+|---|---|---|---|
+| TPC-H Q1 (Target) | 75.898 / 75.897 | 74.233 / 74.226 | **−2.20 %** |
+
+This misses the 3 % bar. The numeric functions still take and return 48-byte Datums by value, and that copying is
+most of what remains on the two call lines. It is landed below the bar: a faithful port with no plan or value
+change. It is the second consecutive miss (C52, C53), so it triggers the one-task yield.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same.
+
+**Test.** `TestFastNumericArithMatchesEvalBinary` runs fastNumericArith against evalBinary on every admitted pair of
+eight operands for +, - and *: mixed scales, signs, ints on either side, zero, and a value past the int64 lane. It
+requires the same value, kind, scale and error, and checks that NULL, string and int-int pairs are not admitted.
+Swapping subtraction for addition fails it.

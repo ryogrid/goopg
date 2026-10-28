@@ -656,6 +656,24 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 					return NewBoolDatum(cmpResult(op, c)), nil
 				}
 			}
+			// M0122-0012 C53: NUMERIC (or int and NUMERIC) arithmetic calls
+			// the numeric function itself — evalBinary's arm for those
+			// kinds is exactly promoteIntOperand on both sides and then
+			// numericAdd / numericSub / numericMul — instead of passing both
+			// 48-byte operands by value through evalBinary's preamble. PG
+			// resolves numeric_add / numeric_mul at plan time and calls them
+			// directly (EEOP_FUNCEXPR_STRICT). TPC-H Q1's three per-row
+			// products went the long way.
+			if (op == parser.OpAdd || op == parser.OpSub || op == parser.OpMul) && fastNumericArithOperands(&left, &right) {
+				result, err := fastNumericArith(op, left, right)
+				if err != nil {
+					return Datum{}, err
+				}
+				if err := fastIntOverflow(n, &result); err != nil {
+					return Datum{}, err
+				}
+				return result, nil
+			}
 			result, err := evalBinary(op, left, right, int(int32(binary.LittleEndian.Uint32(n.payload[4:]))), ctx)
 			if err != nil {
 				return Datum{}, err
@@ -1156,6 +1174,33 @@ type exprCaseInfo struct {
 	whenLit      []bool
 }
 
+
+// fastNumericArithOperands reports that evalBinary's +, - and * on left and
+// right would take its NUMERIC arm with nothing before it applying: both
+// non-NULL, each KindNumeric or KindInt, at least one KindNumeric (no time,
+// date, interval or string operand reaches it). fastNumericArith is that arm.
+// Must agree with evalBinary (pattern_sibling_paths_must_agree; C53).
+func fastNumericArithOperands(left, right *Datum) bool {
+	return !left.IsNull() && !right.IsNull() &&
+		(left.Kind == KindNumeric || right.Kind == KindNumeric) &&
+		(left.Kind == KindNumeric || left.Kind == KindInt) &&
+		(right.Kind == KindNumeric || right.Kind == KindInt)
+}
+
+// fastNumericArith is evalBinary's NUMERIC +, - and * arm for operands
+// fastNumericArithOperands admits.
+func fastNumericArith(op parser.OpCode, left, right Datum) (Datum, error) {
+	promoteIntOperand(&left)
+	promoteIntOperand(&right)
+	switch op {
+	case parser.OpAdd:
+		return numericAdd(left, right)
+	case parser.OpSub:
+		return numericSub(left, right)
+	default:
+		return numericMul(left, right)
+	}
+}
 
 // fastComparisonBool is evalFastExpr's two in-place comparison branches for a
 // comparison node n with opcode op: (result, true) when one applies, (_,

@@ -1857,6 +1857,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       HeapTupleHasExternal, H Q17 instructions −2\.94 %\)\.
     - Dropped: C52 header fields stored one by one in `parseHeapTupleAliasInto` \(vs PG reading t\_data in place, H Q17
       wall −0\.6 %, instructions −0\.44 %\)\.
+    - Landed below the bar: C53 NUMERIC arithmetic called directly from the compiled binary arm \(`fastNumericArith` vs
+      PG numeric\_add/numeric\_mul via fmgr, H Q1 instructions −2\.2 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -1895,6 +1897,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       PreallocXlogFiles, or replay's CheckPointSegments\-driven restartpoint request\)\. Then return; misses reset\.
       - Worked: M0122\-0013 restartpoint moves RedoRecPtr \(volume\-trigger anchor\), landed 2026\-10\-28 \(loop \#241\)\.
         Yield over — the next item\-10 selection returns to M0122\-0012 with the miss counter at 0\.
+    - Yield 2026\-10\-28 \(loop \#243\): C52 −0\.6 % wall \(dropped\) and C53 −2\.2 % instructions \(slice 123, landed\)
+      missed the bar; worked: the next loop takes ONE item\-10 task in order — M0119 holds only `\[\!\]` M0119\-0006, M0147 no
+      selectable child, so M0122\-0013 \(ledgered 2026\-10\-28: the restartpoint skip arm returns before the flush as PG's
+      does, or the standby volume trigger measures the replay position, or PreallocXlogFiles\)\. Then return; misses
+      reset\.
   - **Return 2026\-10\-27 \(loop \#196\)**: C1 stale, C2 below 3 % predicted \(G3 above\); took C18\.
     - **Target \(C18\)**: TPC\-DS SF0\.25 **Q72**, metric **instructions:u per query** \(`tools/ds\-instr\.sh`, 5 runs;
       Q72 plans in 73 ms of a 2\.6 s run, so execution dominates\)\. Bar: −3 %\.
@@ -2508,6 +2515,23 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       first touch, not a removable store\-forwarding cost\. Code reverted\. **Miss counter 1\.**
       - Lesson: a single hot store right after a function's loads can be the skid of a cache miss on the source bytes;
         check whether the source line is the first touch \(here `raw\[22\]` on line 529\) before calling it a stall\.
+  - **G3 2026\-10\-28 \(loop \#243, misses 1\)**: TPC\-H Q1 at `822503136` \(`tmp/g3\-243/h1\.data`\): `evalFastExpr` 27\.0 %,
+    `evalBinary` 12\.1 % \(79 % movups\), `applyAgg` 8\.7 %, decodeRowRangeInfo 8\.4 %, `aggEvalList` 4\.8 %\. Q1's
+    `l\_extendedprice \* \(1 \- l\_discount\) \* \(1 \+ l\_tax\)` per row goes evalFastExpr → `evalBinary\(op, left, right\)` \(two
+    48\-byte Datums by value\) → its interval/time/date/string preamble → `a, b := left, right` \(18\.7 % of evalBinary\) →
+    numericSub/numericMul \(46 % on those two call lines\)\.
+    - C53: the compiled binary arm calls numericAdd/numericSub/numericMul itself when both operands are non\-NULL
+      KindNumeric/KindInt with at least one KindNumeric — exactly evalBinary's arm for those kinds \(promoteIntOperand on
+      both, then the numeric function\), without its frame, by\-value copies and preamble\. PG: the operator's function
+      \(numeric\_add / numeric\_sub / numeric\_mul\) is resolved at plan time and called through fmgr directly
+      \(execExprInterp\.c EEOP\_FUNCEXPR\_STRICT\)\.
+    - **Target \(C53\)**: TPC\-H SF1 **Q1**, metric **instructions:u per query** \(`tools/h\-instr\.sh`, 3 runs × 2
+      alternating, fresh A/B vs `822503136`\)\. Bar: −3 %; predicted ~4 %\.
+    - **C53 LANDED BELOW THE BAR \(slice 123\)**: `fastNumericArithOperands` / `fastNumericArith` in evalFastExpr's
+      simple\-binary branch\. Q1 75\.898/75\.897 → 74\.233/74\.226 Ginstr/q = **−2\.20 %, misses the 3 % bar** \(the numeric
+      functions still take and return 48\-byte Datums by value\)\. Gates: units, spotcheck, acceptance 24 MATCH, sf025
+      99/99 plans same\. Test `TestFastNumericArithMatchesEvalBinary`\. Design: part 11 §123\. **Second consecutive miss
+      \(C52, C53\) → one\-task yield** \(Yield record\)\.
   - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
     \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
     o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
@@ -6256,6 +6280,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#242\) — **exhausted at `b9224032c`**, census `routing\-20261028m/` reused:
     `b9224032c` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
     note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#243\) — **exhausted at `822503136`**, census `routing\-20261028m/` reused:
+    `822503136` is ralph\-only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
