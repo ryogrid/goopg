@@ -1851,6 +1851,8 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       heapgettup\_pagemode, DS Q10 instructions −2\.37 %, wall −10\.9 %\)\.
     - Landed below the bar: C49 seq\-scan visibility check by pointer \(`TupleVisibleSubxactPtr` vs PG
       HeapTupleSatisfiesVisibility, DS Q10 wall −2\.83 % median\)\.
+    - Landed below the bar: C50 searched\-CASE WHEN as a bool \(`fastComparisonBool` / `evalFastCase` vs PG
+      EEOP\_JUMP\_IF\_NOT\_TRUE, DS Q59 wall −0\.24 %, instructions −2\.6 %\)\.
     - Dropped: C22 read set for a seq scan at the bottom of a consumer\-complete chain \(`buildCompleteChild` \+
       consumerLiveColumns over lowered sublinks, Q17 instructions ±0 %: the lineitem scan already had readCols
       \{l\_extendedprice, l\_quantity, l\_partkey\} via the Project above it, slice 19\)\.
@@ -2449,6 +2451,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       merge sort: Q67 −3 % instructions but \+2\.6 % cycles\)\.
     - Remaining lever across Q59 / H Q18 / Q23 / Q14: C13, the recursive 48\-byte Datum return \(design\-sized; needs a
       slice\-sized first step with a design doc, wall Target\)\.
+    - C50 \(C13 first slice, loop \#239\): DS Q59 at HEAD \(`tmp/g3\-239/q59\.data`\): `evalFastExpr` 21\.6 %, `applyAgg` 7\.0 %,
+      `evalFastCase` 6\.4 % \(35 % on the WHEN evaluation, 19 % on `return evalFastExpr\(…, ci\.els, …\)` for the constant
+      `ELSE NULL`\), `aggEvalList` 3\.7 %\. Six of the seven CASE aggregates per row fail their WHEN and return the NULL ELSE,
+      each through 48\-byte Datum returns\. Slice: the searched\-CASE WHEN consumes a comparison's result as a bool through
+      `fastComparisonBool` \(evalFastExpr's two in\-place comparison branches factored out, shared by both callers\), and a
+      constant THEN/ELSE result is returned without re\-entering the evaluator\. PG: EEOP\_JUMP\_IF\_NOT\_TRUE reads the
+      comparison step's bool result in place; EEOP\_CONST writes the constant directly \(execExprInterp\.c\)\.
+    - **Target \(C50\)**: TPC\-DS SF0\.25 **Q59**, metric **warm wall time** \(`tools/ds\-warm\.sh <bin> 59 2 59`, 6 rounds
+      alternating, median, idle host load < 2\), instructions:u no worse than \+1 %\. Bar: −3 %; predicted ~4 %\.
+    - **C50 LANDED BELOW THE BAR \(slice 121\)**: `fastComparisonBool` \(evalFastExpr's two in\-place comparison branches,
+      shared\) feeds evalFastCase's searched WHEN as a bool; `evalFastCaseResult` returns constant arms directly\. Q59 warm
+      wall median 0\.818 → 0\.816 s = **−0\.24 %, misses the 3 % bar**; instructions 11\.075 → 10\.788 G \(−2\.6 %\)\. Gates: units,
+      spotcheck, acceptance 24 MATCH, sf025 99/99 plans same\. Test: `TestCaseCompiledMatchesInterpreted` \+2 cases \(an
+      inverted bool gives 11 mismatches\)\. Design: part 11 §121\. **Miss counter 1\.** Lesson: call/return overhead
+      shows in instructions, not wall — check before naming a wall Target\.
   - **G3 2026\-10\-28 \(loop \#236, misses 1\)**: S9 `routing\-20261028j` exhausted\. DS Q10 re\-profiled on the C48 binary
     \(`tmp/g3\-236/q10\.data`\): `seqScanOp\.Next` 22\.6 %, 24\.6 % of it on the `transam\.TupleVisibleSubxact\(tuple\.Header,
     o\.ctx\.Snap, …\)` call line \(~5\.6 % of Q10\): the tuple header and the ~80\-byte `Snapshot` \(two slices, a clog
@@ -6172,6 +6189,9 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-28 \(loop \#238\) — **exhausted at `6a2f5b0e1`**, census `routing\-20261028k/` reused:
     `6a2f5b0e1` touched internal/access/transam/xlog only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205
     note \(plus P0\-E15 owner\-placement\)\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-28 \(loop \#239\) — **exhausted at `3419876c9`**, census `routing\-20261028k/` reused:
+    `3419876c9` is ralph/analysis only\. No task is filed\. Same items\-0\-9 tokens as the loop \#205 note \(plus P0\-E15
+    owner\-placement\)\. Item 10 is live\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

@@ -343,3 +343,50 @@ Gates:
 
 No new test: the visibility logic is unchanged and still reached through the existing callers' tests, the units
 suite and every scan gate. The pointer form is the body the by-value wrapper calls.
+
+## Slice 121 — C50: a searched CASE consumes its WHEN comparison as a bool (Q59 instructions −2.6 %, wall ±0, below the bar)
+
+Loop #239, the first slice of C13 (the recursive 48-byte Datum return) after the fresh census `census-20261028b`.
+DS Q59 at HEAD (`tmp/g3-239/q59.data`):
+
+- `evalFastExpr` 21.6 %, `applyAgg` 7.0 %, `evalFastCase` 6.4 %, `aggEvalList` 3.7 %.
+- In `evalFastCase`, 35 % is on the WHEN evaluation and 19 % on `return evalFastExpr(…, ci.els, …)` for the constant
+  `ELSE NULL`.
+- Six of Q59's seven `sum(CASE WHEN d_day_name = '<day>' THEN ss_sales_price ELSE NULL END)` per row fail their WHEN,
+  and each pays a bool Datum returned through two calls plus a NULL Datum returned through another.
+
+**Change.**
+
+- `fastComparisonBool` holds evalFastExpr's two in-place comparison branches: the non-string `fastCompareDatum`
+  branch (slice 75) and the plain-string branch (slice 89). It returns `(result, true)`, or `(_, false)` when the
+  general path must run.
+- evalFastExpr's comparison arm wraps the result in a bool Datum. `evalFastCase`'s searched WHEN consumes it as a
+  bool, as PG's EEOP\_JUMP\_IF\_NOT\_TRUE reads the comparison step's result in place (execExprInterp.c).
+- One helper serves both callers, so they cannot disagree. NULL operands never take it.
+- `evalFastCaseResult` returns a constant THEN/ELSE arm (`ExprConstVal`, `ExprNullConst`) the way evalFastExpr's
+  arms do, without re-entering the evaluator (EEOP\_CONST).
+
+**Measured** (base at `3419876c9`, idle host, load 0.5–0.8):
+
+| metric | before | after | change |
+|---|---|---|---|
+| Q59 warm wall, median of 6 (Target) | 0.818 s | 0.816 s | **−0.24 %** |
+| Q59 instructions:u | 11.075 G | 10.788 G | −2.6 % |
+
+Wall time does not move: the removed instructions were cheap, well-predicted calls, and the cost that remains is
+the per-row work around them. This misses the 3 % bar by far. It is landed below the bar, like C43: a faithful port
+with an instruction gain and no plan or value change. Miss counter 1.
+
+**Lesson for G5:** a share made of call and return overhead, rather than a stall, shows up in instructions but not
+in wall time. Before naming a wall Target, check the share's instruction count with `perf annotate` or a quick A/B.
+
+Gates:
+
+- units;
+- spotcheck;
+- acceptance: 24 MATCH;
+- sf025 PASS=99, with plans 99/99 same.
+
+**Test.** `TestCaseCompiledMatchesInterpreted` gains two cases: an int comparison (the non-string branch), `<>` and
+`<` on the char(9) column, NULL operands falling back, and constant THEN/ELSE arms. Inverting the bool in the new
+path produces 11 mismatches against the interpreter.
