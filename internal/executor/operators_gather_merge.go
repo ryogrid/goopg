@@ -106,6 +106,8 @@ type gatherMergeOp struct {
 	// when no instrumentation scope was stored.
 	scope        *instrumenter
 	workerTables []nodeStatsTable
+	// prebuildTable — see gatherOp.prebuildTable (M0122-0021 slice 4).
+	prebuildTable nodeStatsTable
 
 	// liveCols, when set, marks the only columns of the worker (and the
 	// leader's own) rows that the merge keys and the consumers above read;
@@ -135,7 +137,7 @@ func (o *gatherMergeOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 // the pre-sized slot; uninstrumented builds (no stored scope) pass an
 // explicit nil. The scope travels as an argument — no package-global
 // handoff, no mutex (M-NIGHTLY-instrumentscope-race-fix).
-func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
+func (o *gatherMergeOp) buildChildForSlot(slot int, wctx *Context) (Operator, error) {
 	if o.scope == nil {
 		return o.buildChild(nil)
 	}
@@ -143,6 +145,12 @@ func (o *gatherMergeOp) buildChildForSlot(slot int) (Operator, error) {
 	op, err := o.buildChild(fresh)
 	if err != nil {
 		return nil, err
+	}
+	// M0122-0021 slice 4: a worker's lazily built subtrees (SubPlans,
+	// cooperative builds) file into its own site table, which only its
+	// goroutine touches; the leader keeps the statement scope.
+	if wctx != nil {
+		wctx.explainScope = fresh
 	}
 	if slot >= 0 && slot < len(o.workerTables) {
 		o.workerTables[slot] = fresh.table
@@ -197,7 +205,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 
 	// P8: build shared hash tables once, before fan-out. Same ordering
 	// requirement as gatherOp — before worker contexts, before goroutines.
-	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild)
+	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild, o.prebuildScope())
 	if err != nil {
 		return err
 	}
@@ -258,7 +266,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	if n == 0 || ctx.ParallelLeaderParticipation {
 		// EX0-03b: leader Open-time instrumented site — fresh table into
 		// slot n.
-		child, err := o.buildChildForSlot(n)
+		child, err := o.buildChildForSlot(n, nil)
 		if err != nil {
 			return err
 		}
@@ -331,7 +339,7 @@ func (o *gatherMergeOp) runWorker(idx int, wctx *Context) error {
 	// never reaching the client. That is exactly M0127-P5.9's Q17 "hang",
 	// which gatherOp fixed (startChannelCloser) and this sibling did not.
 	defer close(o.chans[idx])
-	child, err := o.buildChildForSlot(idx)
+	child, err := o.buildChildForSlot(idx, wctx)
 	if err != nil {
 		return err
 	}
@@ -623,6 +631,7 @@ func (o *gatherMergeOp) Close() error {
 	// above supplies the happens-before edge) into the Context-keyed
 	// carrier, copying only rows/loops/time per node.
 	foldGatherWorkerStats(o.ctx, o.workerTables)
+	foldPrebuildStats(o.ctx, o.prebuildTable)
 
 	for _, w := range o.workers {
 		MergeWorkerContext(o.ctx, w)
@@ -690,4 +699,14 @@ func (o *gatherMergeOp) expandLive(src *gmSource, compact Row) Row {
 		full[c] = compact[j]
 	}
 	return full
+}
+
+// prebuildScope — see gatherOp.prebuildScope (M0122-0021 slice 4).
+func (o *gatherMergeOp) prebuildScope() *instrumenter {
+	if o.scope == nil {
+		return nil
+	}
+	pre := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
+	o.prebuildTable = pre.table
+	return pre
 }

@@ -576,9 +576,11 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 // its line printed no `(actual …)`, while the per-site `Worker N:` lines
 // carried the only numbers (M0122-0021).
 //
-// The site entries are the complete population (the leader is a site), so
-// they replace any counter an existing entry holds rather than adding to
-// it. Buffer, WAL and memory counters are not aggregated: each site's
+// An existing entry is added to, not replaced: since M0122-0021 slices 3-4
+// the statement scope legitimately holds counters for such a node — work the
+// leader built lazily in its own Context (a SubPlan, a cooperative build) —
+// while each site's eagerly built tree files only into the site's table, so
+// nothing is counted twice. Buffer, WAL and memory counters are not aggregated: each site's
 // deltas are read off pool-global counters that the other sites advance
 // concurrently, so their sum is not the node's usage (ledger M0122-0021).
 func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStatsTable, timing bool) nodeStatsTable {
@@ -597,8 +599,6 @@ func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStat
 			cp := *prev
 			agg = &cp
 		}
-		agg.rowsOut, agg.loops, agg.startupNs, agg.totalNs = 0, 0, 0, 0
-		agg.filterRejected, agg.joinFilterRejected, agg.probeFilterRejected, agg.heapFetches = 0, 0, 0, 0
 		for _, w := range ws {
 			agg.rowsOut += w.RowsOut
 			agg.loops += w.Loops
@@ -669,4 +669,39 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 		sc.setInstrumentScope(scope)
 	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
+}
+
+// foldPrebuildStats folds a Gather's shared hash prebuild instrumentation
+// into the per-site carrier as one more leader-side site (M0122-0021 slice
+// 4). goopg builds each shareable hash join's table ONCE, in the leader, and
+// the participants adopt it, so the build input reports one loop. PG with
+// parallel_hash off has every participant build its own copy and reports
+// loops = participants (nodeHash.c MultiExecHash per participant) — an
+// execution difference this records rather than imitates. Leader-flagged, so
+// it never renders as a `Worker N:` line.
+func foldPrebuildStats(ctx *Context, table nodeStatsTable) {
+	if ctx == nil || len(table) == 0 {
+		return
+	}
+	for node, st := range table {
+		if node == nil || st == nil || st.loops == 0 {
+			continue
+		}
+		if ctx.GatherWorkerStats == nil {
+			ctx.GatherWorkerStats = make(workerNodeStatsTable)
+		}
+		ctx.GatherWorkerStats[node] = append(ctx.GatherWorkerStats[node], workerNodeStat{
+			Worker:    -1,
+			RowsOut:   st.rowsOut,
+			Loops:     st.loops,
+			StartupNs: st.startupNs,
+			TotalNs:   st.totalNs,
+
+			FilterRejected:      st.filterRejected,
+			JoinFilterRejected:  st.joinFilterRejected,
+			ProbeFilterRejected: st.probeFilterRejected,
+			HeapFetches:         st.heapFetches,
+			Leader:              true,
+		})
+	}
 }

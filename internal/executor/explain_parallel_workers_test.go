@@ -509,9 +509,10 @@ func TestExplainAnalyzeEmptyWorkerCarrierByteIdentical(t *testing.T) {
 }
 
 // TestAggregateWorkerInstrumentationSumsSites pins the InstrAggNode fold
-// (M0122-0021): every counter the sites carry adds up, the site entries
-// replace (never add to) an existing entry's counters — they are the
-// complete population — and the existing entry's buffer counters survive.
+// (M0122-0021): every counter the sites carry adds up, the sites add to an
+// existing entry's counters (lazily built leader-side work files into the
+// statement scope since slices 3-4), its buffer counters survive, and the
+// original record is not mutated.
 func TestAggregateWorkerInstrumentationSumsSites(t *testing.T) {
 	scan := &optimizer.SeqScan{}
 	join := &optimizer.SeqScan{}
@@ -535,8 +536,8 @@ func TestAggregateWorkerInstrumentationSumsSites(t *testing.T) {
 		t.Errorf("scan aggregate = %+v, want rows 35 loops 6 startup 6 total 60 filtered 7 heap 3 timing", s)
 	}
 	j := got[join]
-	if j == nil || j.rowsOut != 10 || j.loops != 2 || j.joinFilterRejected != 14 || j.probeFilterRejected != 7 || j.bufHit != 7 {
-		t.Errorf("join aggregate = %+v, want rows 10 loops 2 joinFiltered 14 probe 7 bufHit 7 (sites replace counters)", j)
+	if j == nil || j.rowsOut != 109 || j.loops != 11 || j.joinFilterRejected != 14 || j.probeFilterRejected != 7 || j.bufHit != 7 {
+		t.Errorf("join aggregate = %+v, want rows 99+10 loops 9+2 joinFiltered 14 probe 7 bufHit 7 (sites add to the entry)", j)
 	}
 	if orig.rowsOut != 99 || orig.loops != 9 {
 		t.Errorf("the original entry was mutated: %+v", orig)
@@ -548,5 +549,56 @@ func TestAggregateWorkerInstrumentationSumsSites(t *testing.T) {
 	}
 	if out := aggregateWorkerInstrumentation(nil, nil, false); out != nil {
 		t.Errorf("empty carrier must return the table unchanged, got %+v", out)
+	}
+}
+
+// TestExplainAnalyzeSharedPrebuildInputActuals pins M0122-0021 slice 4: the
+// build input of a hash join the Gather prebuilds once, in the leader
+// (prebuildSharedHashJoins), reports that one execution — `loops=1` with
+// every row — instead of no actuals at all. The prebuild tree used to build
+// uninstrumented, and every site adopted the shared table without opening
+// its own build child, so the node had no record. PG with parallel_hash off
+// has every participant build its own copy and prints loops = participants;
+// goopg's one shared build is the recorded execution difference, reported
+// as it happened.
+func TestExplainAnalyzeSharedPrebuildInputActuals(t *testing.T) {
+	ctx := spillFixture(t, 1200, 4000, 400)
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	gathered := planGatheredJoin(t, ctx, spillJoinSQL, 2)
+	if _, planned, ok := findGatherNode(gathered); !ok || planned <= 0 {
+		t.Fatalf("precondition: gathered plan needs a Gather with workers")
+	}
+	// The plan is fixed; only the runtime cooperative build is switched off
+	// (parallelBuildEligible's block threshold), so the prebuild builds the
+	// table itself — the TPC-DS Q72 household_demographics case — rather than
+	// through producers slice 3 already folds.
+	ctx.MinParallelTableScanBlocks = 1 << 30
+	ctx.GatherWorkerStats = nil
+	lines := runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, TIMING OFF) "+spillJoinSQL, gathered)
+	joined := strings.Join(lines, "\n")
+	hashAt := -1
+	for i, l := range lines {
+		if strings.Contains(l, "->  Hash") && !strings.Contains(l, "Hash Join") {
+			hashAt = i
+		}
+	}
+	if hashAt < 0 {
+		t.Fatalf("no Hash node in ANALYZE output:\n%s", joined)
+	}
+	if !strings.Contains(lines[hashAt], "loops=1)") {
+		t.Errorf("shared Hash line %q does not report the single leader-side build:\n%s", strings.TrimSpace(lines[hashAt]), joined)
+	}
+	for _, l := range lines[hashAt+1:] {
+		if strings.Contains(l, "->") {
+			if !strings.Contains(l, "loops=1)") {
+				t.Errorf("build input %q does not report the single leader-side build:\n%s", strings.TrimSpace(l), joined)
+			}
+			break
+		}
+	}
+	if strings.Contains(joined, "loops=0)") {
+		t.Errorf("a node still reports loops=0:\n%s", joined)
 	}
 }

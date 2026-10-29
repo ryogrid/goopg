@@ -151,6 +151,10 @@ type gatherOp struct {
 	// when no instrumentation scope was stored.
 	scope        *instrumenter
 	workerTables []nodeStatsTable
+	// prebuildTable is the instrumentation of the shared hash prebuild
+	// (prebuildSharedHashJoins) under EXPLAIN ANALYZE, folded at Close as
+	// a leader-side site (M0122-0021 slice 4); nil otherwise.
+	prebuildTable nodeStatsTable
 }
 
 // EX0-03b (new): setInstrumentScope implements instrumentScopeCarrier,
@@ -165,7 +169,7 @@ func (o *gatherOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 // the pre-sized slot; uninstrumented builds (no stored scope) pass an
 // explicit nil. The scope travels as an argument — no package-global
 // handoff, no mutex (M-NIGHTLY-instrumentscope-race-fix).
-func (o *gatherOp) buildChildForSlot(slot int) (Operator, error) {
+func (o *gatherOp) buildChildForSlot(slot int, wctx *Context) (Operator, error) {
 	if o.scope == nil {
 		return o.buildChild(nil)
 	}
@@ -173,6 +177,12 @@ func (o *gatherOp) buildChildForSlot(slot int) (Operator, error) {
 	op, err := o.buildChild(fresh)
 	if err != nil {
 		return nil, err
+	}
+	// M0122-0021 slice 4: a worker's lazily built subtrees (SubPlans,
+	// cooperative builds) file into its own site table, which only its
+	// goroutine touches; the leader keeps the statement scope.
+	if wctx != nil {
+		wctx.explainScope = fresh
 	}
 	if slot >= 0 && slot < len(o.workerTables) {
 		o.workerTables[slot] = fresh.table
@@ -242,7 +252,7 @@ func collectBitmapScans(op Operator, dst *[]*bitmapHeapScanOp) {
 // copies. Nesting is not a concern: a Gather never appears inside another
 // Gather's partial subtree (terminatesPartial refuses it).
 func (o *gatherOp) prebuildHashJoins(ctx *Context) error {
-	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild)
+	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild, o.prebuildScope())
 	if err != nil {
 		return err
 	}
@@ -365,7 +375,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 
 	if o.leaderRuns {
 		// EX0-03b: leader instrumented site — fresh table into slot n.
-		child, err := o.buildChildForSlot(n)
+		child, err := o.buildChildForSlot(n, nil)
 		if err != nil {
 			return err
 		}
@@ -412,7 +422,7 @@ func (o *gatherOp) startChannelCloser() {
 // batches to the leader.
 func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	// EX0-03b: worker instrumented site — fresh table into slot idx.
-	child, err := o.buildChildForSlot(idx)
+	child, err := o.buildChildForSlot(idx, wctx)
 	if err != nil {
 		return err
 	}
@@ -584,6 +594,7 @@ func (o *gatherOp) Close() error {
 	// above supplies the happens-before edge) into the Context-keyed
 	// carrier, copying only rows/loops/time per node.
 	foldGatherWorkerStats(o.ctx, o.workerTables)
+	foldPrebuildStats(o.ctx, o.prebuildTable)
 
 	// 4. Fold per-worker notices back, then release the arenas the leader
 	//    allocated. Both happen after the join, which supplies the
@@ -624,4 +635,15 @@ func (o *gatherOp) Close() error {
 		return err
 	}
 	return nil
+}
+
+// prebuildScope returns a fresh instrumenter for the shared hash prebuild
+// under EXPLAIN ANALYZE (nil otherwise) and keeps its table for Close's fold.
+func (o *gatherOp) prebuildScope() *instrumenter {
+	if o.scope == nil {
+		return nil
+	}
+	pre := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
+	o.prebuildTable = pre.table
+	return pre
 }

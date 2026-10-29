@@ -213,7 +213,7 @@ func probeSideIsLeft(p *optimizer.Join) bool {
 //
 // Returns nil when the subtree has no shareable hash join, which is the common
 // case and costs nothing — the check is on the plan, not on a built tree.
-func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(scope *instrumenter) (Operator, error)) (map[*optimizer.Join]*sharedHashBuild, error) {
+func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(scope *instrumenter) (Operator, error), scope *instrumenter) (map[*optimizer.Join]*sharedHashBuild, error) {
 	// Decide from the PLAN, before building anything. An earlier cut built the
 	// tree unconditionally and then looked for joins in it, which called the
 	// Gather's child-builder one extra time — harmless for the production
@@ -222,11 +222,12 @@ func prebuildSharedHashJoins(ctx *Context, plan optimizer.Node, buildChild func(
 	if !optimizer.HasShareableHashJoin(plan) {
 		return nil, nil
 	}
-	// EX0-03b: prebuild throwaway tree — scope explicitly NIL
-	// (uninstrumented, exactly today's behavior; covers both Gather and
-	// GatherMerge prebuild call sites). Its drains would double-count the
-	// same plan keys into a worker/leader table.
-	tree, err := buildChild(nil)
+	// EX0-03b / M0122-0021 slice 4: the prebuild tree builds under the
+	// caller's scope — a FRESH table of its own under EXPLAIN ANALYZE (never
+	// a worker's or the leader's, which would double-count the same plan
+	// keys), nil otherwise. The caller folds it as one more site: the build
+	// inputs ran exactly once, here.
+	tree, err := buildChild(scope)
 	if err != nil {
 		return nil, err
 	}
@@ -708,11 +709,19 @@ func (o *joinOp) parallelBuildLazyHashTable(ctx *Context, buildLeft bool) (bool,
 	// SharedHashBuilds map may already be published to a surrounding Gather's
 	// participants, and mutating it here would be a write to a map those
 	// goroutines are reading.
+	var nestedScope *instrumenter
+	if ctx.explainScope != nil {
+		nestedScope = &instrumenter{timing: ctx.explainScope.timing, table: make(nodeStatsTable)}
+	}
 	nested, err := prebuildSharedHashJoins(ctx, buildPlan, func(scope *instrumenter) (Operator, error) {
 		return buildNode(buildPlan, buildBound, scope)
-	})
+	}, nestedScope)
 	if err != nil {
 		return false, err
+	}
+	if nestedScope != nil {
+		// The nested builds ran once, in the leader (M0122-0021 slice 4).
+		foldCoopBuildStats(ctx.explainScope, []nodeStatsTable{nestedScope.table})
 	}
 	defer func() {
 		for _, sb := range nested {
