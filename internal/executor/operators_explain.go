@@ -5011,8 +5011,15 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		}
 		return "(" + name + ")"
 	case *optimizer.ArraySubqueryExpr:
-		// ARRAY_SUBLINK: upstream prints `ARRAY(<plan_name>)`.
-		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"
+		// ARRAY_SUBLINK: a correlated one is a SubPlan, printed
+		// `ARRAY(SubPlan N)`; an uncorrelated one is an initplan whose
+		// output Param deparses as `(InitPlan N).col1` (ruleutils.c
+		// get_parameter), as the scalar InitPlan arm above.
+		name := subPlanName(reg, x, x.Plan)
+		if x.IsNonCorrelated && strings.HasPrefix(name, "InitPlan") {
+			return "(" + name + ").col1"
+		}
+		return "ARRAY(" + name + ")"
 	case *optimizer.InExpr:
 		return formatInExprPG(x, reg, qualify)
 	case *optimizer.IsNullExpr:

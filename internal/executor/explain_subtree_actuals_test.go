@@ -280,3 +280,40 @@ func TestExplainAnalyzeBitmapHeapBlocks(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainUncorrelatedArraySublinkIsInitPlan pins M0122-0021 residual 9:
+// an uncorrelated ARRAY(SELECT …) is PG's initplan (subselect.c make_subplan
+// → SS_make_initplan_from_plan), not a per-row SubPlan:
+//
+//   - it prints `InitPlan 1` at its query level's top node, before the
+//     children, and the reference deparses as `(InitPlan 1).col1` — the
+//     plain EXPLAIN below is PG 18.3's text line for line. goopg printed
+//     `ARRAY(SubPlan 1)` under the scan, because NodeSublinks' walker never
+//     descended into the `= ANY (…)` operand, so the level never saw the
+//     sublink;
+//   - it runs once: under ANALYZE the subtree reports loops=1 over three
+//     outer rows (goopg re-ran it per row, loops=3).
+func TestExplainUncorrelatedArraySublinkIsInitPlan(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	got := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT count(*) FROM mo WHERE k = ANY(ARRAY(SELECT id FROM mi WHERE v > 500)) AND pad > 2")
+	want := []string{
+		"Aggregate",
+		"  InitPlan 1",
+		"    ->  Seq Scan on mi",
+		"          Filter: (v > 500)",
+		"  ->  Seq Scan on mo",
+		"        Filter: ((pad > 2) AND (k = ANY ((InitPlan 1).col1)))",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("plain EXPLAIN:\n got:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	out := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, ARRAY(SELECT v FROM mi WHERE v > 500) FROM mo WHERE pad < 3"), "\n")
+	for _, w := range []string{"InitPlan 1", "->  Seq Scan on mi (actual rows=5.00 loops=1)"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("ANALYZE: missing %q:\n%s", w, out)
+		}
+	}
+}

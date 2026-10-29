@@ -174,6 +174,12 @@ func SublinkIsInitPlan(e Expr) bool {
 	switch x := e.(type) {
 	case *SubqueryExpr:
 		return x.IsNonCorrelated || x.ParamInitPlan
+	case *ArraySubqueryExpr:
+		// subselect.c make_subplan: an uncorrelated ARRAY_SUBLINK, like an
+		// EXPR / ROWCOMPARE / MULTIEXPR one, becomes an initplan
+		// (SS_make_initplan_from_plan) — evaluated once, charged as an
+		// initplan, printed `InitPlan N` (M0122-0021).
+		return x.IsNonCorrelated
 	case *ExistsExpr:
 		return sublinkIsUncorrelated(x.Plan, x.Args, x.ParParam)
 	}

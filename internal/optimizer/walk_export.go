@@ -147,22 +147,36 @@ func NodeSublinks(n Node) []SublinkRef {
 	}
 	var out []SublinkRef
 	seen := map[Node]struct{}{}
+	collect := func(sub Expr) {
+		for _, sp := range ExprSubplans(sub) {
+			if sp == nil {
+				continue
+			}
+			if _, ok := seen[sp]; ok {
+				continue
+			}
+			seen[sp] = struct{}{}
+			out = append(out, SublinkRef{Expr: sub, Plan: sp})
+		}
+	}
 	for _, e := range exprs {
 		if e == nil {
 			continue
 		}
-		walkExprTree(e, func(sub Expr) {
-			for _, sp := range ExprSubplans(sub) {
-				if sp == nil {
-					continue
-				}
-				if _, ok := seen[sp]; ok {
-					continue
-				}
-				seen[sp] = struct{}{}
-				out = append(out, SublinkRef{Expr: sub, Plan: sp})
-			}
-		})
+		// The slot walker reaches every same-scope child exprChildSlots
+		// enumerates — an IN list, the operand of `= ANY (…)` — where
+		// walkExprTree's hand list stops, which hid
+		// `k = ANY (ARRAY(SELECT …))`'s initplan from initplan placement,
+		// charging and plan_id numbering (M0122-0021). It aborts on a type
+		// exprChildSlots does not know; walkExprTree then still runs, so
+		// no sublink the old walk found is lost (seen de-duplicates).
+		walked := walkExprRefs(e, scopeIgnore, exprVisitor{Visit: func(sub Expr) bool {
+			collect(sub)
+			return true
+		}})
+		if !walked {
+			walkExprTree(e, collect)
+		}
 	}
 	return out
 }

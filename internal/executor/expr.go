@@ -11688,6 +11688,31 @@ func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (D
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 		}
 	}
+	// An uncorrelated ARRAY sublink is PG's initplan (subselect.c
+	// make_subplan): evaluated once and reused, so its subtree reports
+	// one loop. Cached under a constant key in the scoped store, as the
+	// non-correlated EXISTS is (M0122-0021).
+	if x.IsNonCorrelated {
+		stat := ctx.subPlanStat(x)
+		stat.Calls++
+		cacheKey := ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
+		if cached, ok := ctx.subqCacheGet(cacheKey, true); ok && len(cached) == 1 {
+			stat.CacheHits++
+			return cached[0], nil
+		}
+		stat.CacheMisses++
+		val, err := evalArraySubqueryOnce(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		ctx.subqCachePut(cacheKey, true, []Datum{val})
+		return val, nil
+	}
+	return evalArraySubqueryOnce(x, row, ctx)
+}
+
+// evalArraySubqueryOnce runs the ARRAY sublink's plan for one outer row.
+func evalArraySubqueryOnce(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
