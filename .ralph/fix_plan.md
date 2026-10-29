@@ -723,6 +723,18 @@ heuristic stays live.)
     - Ledgered: the re\-sent overlap is trimmed, not overwritten as XLogWalRcvWrite does; no divergence detection\.
   Movement: none — replication correctness — no plan instrument \(walreceiver/walsender only\)
 
+- [ ] pgbench/nightly — pgbench nightly stage failed: `pgbench: error: PQendcopy failed` \(AI\-20261030\-002852\-001; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+  - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. pgbench\.log line 59 is `extendBatch …/base/5/16409: … no space
+    left on device` during `\-i \-s 50` — the host root filesystem was full \(120 MB free\) ~00:50–01:10\. 43 GB of stale
+    TPC\-DS SF1 capture clones \(tmp/s9\[q\-x\]\-…, tmp/m24…\) were removed at ~01:12; 41 GB free since\.
+  - Next: re\-run the repro at HEAD \(or let the next nightly confirm\) and check off as stale/environmental\.
+- [ ] testport/stage — stage testport FAILED with no parseable cause \(AI\-20261030\-002852\-002; repro: `bash ci/batch/stages/stage\-testport\.sh` with REPO\_ROOT/RUN\_DIR set\)\.
+  - Not a reopen of the 2026\-10\-22 testport/stage task \(that was a 2 h TestPort\_IsolationSuite timeout\)\.
+  - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. regress\-diffs/prepare\_raw\.txt shows `DDL catalog sync: pg\_class:
+    wal: write …/pg\_wal/…: no space left on device` in TestPort\_RegressSuite — the same full\-disk window as the
+    pgbench item\.
+  - Next: re\-run the repro at HEAD \(or let the next nightly confirm\) and check off as stale/environmental\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
 - [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
@@ -4217,6 +4229,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Recovery shell commands report wait events LANDED 2026\-10\-30 \(`be383bdfe`\)**\.
+    Movement: none — pg\_stat\_activity reporting\. PG wraps restore\_command / recovery\_end\_command /
+    archive\_cleanup\_command in pgstat\_report\_wait\_start; goopg reported nothing\.
+    - IPC events RestoreCommand / RecoveryEndCommand / ArchiveCleanupCommand; `reportCommandWait`; pg\_wait\_events rows\.
+    - Pin: `TestRecoveryCommandsReportWaitEvents` \(mutation\-checked\)\.
+    - Gate note: the code commit waited for the 2026\-10\-30 nightly batch — tpcds\-sf025 refuses while it runs; the
+      host disk was full ~00:50–01:10 \(43 GB of stale capture clones removed\), which also failed that nightly's
+      testport/pgbench stages\.
+    - Residual \(ledgered, needs owner placement — M0122 filing paused\): pg\_stat\_activity timestamp/id columns are
+      text, and its timestamps drift behind wall clock after host sleep \(monotonic\-clock derived\)\.
   - **Timeline history through RECOVERYHISTORY LANDED 2026\-10\-30 \(`0603610a5`\)**\. Movement: none — recovery path\.
     readTimeLineHistory/existsTimeLineHistory don't keep the file; restoreTimeLineHistoryFiles keeps
     \[checkpoint TLI, target\); goopg kept every probed file, the target's included\.

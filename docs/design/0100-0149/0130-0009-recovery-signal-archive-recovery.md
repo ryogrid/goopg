@@ -389,3 +389,23 @@ history during archive recovery like this:
 - All three were mutation-checked.
 
 **Still open (ledgered):** start-time archive recovery takes no restartpoints.
+
+## Update 2026-10-30 — recovery shell commands report wait events (M0122-0013, `be383bdfe`)
+
+goopg reported no wait event while a recovery shell command ran, so a checkpointer stuck in a slow
+`archive_cleanup_command` looked idle in pg\_stat\_activity. PG wraps every one of them in
+`pgstat_report_wait_start`:
+- `RestoreArchivedFile` (xlogarchive.c) uses `WAIT_EVENT_RESTORE_COMMAND`;
+- `ExecuteRecoveryCommand` (xlog.c) uses `WAIT_EVENT_RECOVERY_END_COMMAND` or `WAIT_EVENT_ARCHIVE_CLEANUP_COMMAND`.
+
+**The port.**
+- `activity` gains three IPC wait events, `RestoreCommand`, `RecoveryEndCommand` and `ArchiveCleanupCommand`,
+  following wait\_event\_names.txt.
+- `reportCommandWait` sets the event on the pg\_stat\_activity entry of the goroutine that runs the command, and clears
+  it when the child exits.
+- An unregistered caller reports nothing. Start-time archive recovery is one: it runs before the server registers any
+  backend.
+- `pg_wait_events` lists the three events, with PG's descriptions.
+
+**Pin:** `TestRecoveryCommandsReportWaitEvents`. Each command shows its IPC event while it runs and nothing afterwards.
+The test fails when reporting is turned off.
