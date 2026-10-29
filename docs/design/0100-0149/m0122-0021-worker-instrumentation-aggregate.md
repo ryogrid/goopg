@@ -2,7 +2,8 @@
 
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
-lazy subtrees). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
+producers). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -171,14 +172,47 @@ serially as well as in parallel plans.
   build, because the cooperative path (slice 3) otherwise masks the plain prebuild.
 - `-race` on the parallel/coop/explain tests is clean. Gates PASS. Census `routing-20261029d`: 22/22, 99/99, 99/99.
 
+## Residual 2 — expression-level subqueries and bitmap producers
+
+- Five sites in `internal/executor/expr.go` built a subquery's inner plan with `Build()`, which carries no
+  instrumentation scope: `evalArraySubquery` (ARRAY(SELECT)), `evalRowConstructorInExpr` (row IN),
+  `evalRowFuncCallVsSubqueryExpr` (`ROW() = (SELECT)`), `evalMultiAssignSubqRow` (multi-assignment SET) and
+  `buildCorrSubqHashMap`. They now call `buildNode(plan, deformBoundNone, ctx.explainScope)`, as `acquireSubPlanOp`
+  does. Each rebuild files into the same per-node record (`scopeStats`), so the loops add up per call. The correlated
+  ARRAY() output is identical to PG 18.3's.
+- **Bitmap producers.** Bitmap Index Scan, BitmapAnd and BitmapOr printed no actuals in any context. The heap scan
+  builds its producer subtree inside `openPrep` with a nil scope. The reason is that `maybeInstrument`'s generic
+  wrapper would hide `buildBitmap` from the heap scan's `bitmapProducer` assertion.
+  - `bitmapHeapScanOp`, `bitmapAndOp` and `bitmapOrOp` implement `instrumentScopeCarrier` and build their children
+    under the scope from their own Build. `newInstrumentedNLIInner` forwards the scope too, because a bitmap heap
+    scan that is a nested-loop probe never passes through `maybeInstrument`.
+  - `maybeInstrument` wraps a producer in `instrumentedBitmapOp`, which follows PG's MultiExec accounting
+    (nodeBitmapIndexscan.c, nodeBitmapAnd.c, nodeBitmapOr.c):
+    - each `buildBitmap` call is one loop, and its time counts as both startup and total;
+    - rows are the TIDs added (`bitmapTupleCounter`; the index scan counts `addOne` calls, which is PG's `nTuples`);
+    - BitmapAnd and BitmapOr report 0 rows;
+    - `Open` is the ExecInit-time setup PG does not instrument, so it only seeds the buffer and memory baselines.
+  - Parallel: `prebuildBitmap` builds the shared bitmap once, in the leader, from a throwaway tree. It now takes the
+    Gather's prebuild scope and hands it to each target heap scan. The hash and bitmap prebuilds share one
+    `prebuildTable`, which is folded and reset at Close. The producer therefore reports `loops=1`, which is also PG's
+    count: its parallel bitmap heap scan runs the index scan once, in the first participant
+    (`BitmapShouldInitializeSharedState`).
+  - Checked against a scratch PG 18.3 (`enable_indexscan=off` to force bitmap paths): the serial and NLI-probe
+    (`loops=10`) node lines are identical. The differences are PG's `Heap Blocks:` and `Index Searches:` lines, which
+    goopg does not print (ledgered), and the BitmapAnd / BitmapOr shapes, which goopg did not plan for those queries
+    (planner, ledgered).
+- Tests: `TestExplainAnalyzeExpressionSubqueryActuals` (fails 4 assertions with the old `Build()` calls) and
+  `TestExplainAnalyzeBitmapProducerActuals` (serial, and a hand-built Gather over the forced bitmap plan).
+
 ## Remaining residuals (each ledgered 2026-10-29)
 
 1. ~~The SubPlan/InitPlan header carries goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)` annotation~~ —
    dropped 2026-10-29 (`04cc96f3b`). PG prints the bare label (explain.c `ExplainSubPlans`), and the subtree's work now
    shows through each node's own actuals. The counters stay in `ctx.SubPlanStats` for tests and diagnostics (they were
    the correlated-subquery planning bundle's gate-V6 instrument).
-2. Expression-level subqueries built with `Build()` print no actuals: ARRAY(), row-constructor IN, multi-assignment
-   SET, and the correlated hash map.
+2. ~~Expression-level subqueries built with `Build()` print no actuals: ARRAY(), row-constructor IN, multi-assignment
+   SET, and the correlated hash map.~~ Fixed 2026-10-29 (`d38dd96ed`), together with the bitmap producers (see
+   "Residual 2" above).
 3. Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
    `Worker N:  Hits:` line per worker.
 4. The NLI probe's own `Cond` filter has no rejection counter, so it prints no `Rows Removed by Filter`.
@@ -186,3 +220,10 @@ serially as well as in parallel plans.
 6. goopg's correlated-SubPlan value cache lowers loops relative to PG. This is an execution difference.
 7. A shared or cooperative build reports one loop where PG reports one per participant. This is an execution
    difference.
+8. UPDATE / DELETE child scans print no actuals, and a MULTIEXPR SubPlan (`SET (a, b) = (SELECT …)`) is not
+   rendered. The DML source scans are built outside the operator's scope.
+9. An uncorrelated ARRAY() prints `SubPlan 1`. PG makes it an initplan and prints `InitPlan 1` (subselect.c
+   make_subplan).
+10. Bitmap Heap Scan prints no `Heap Blocks: exact=… lossy=…` line (explain.c show_tidbitmap_info).
+11. The correlated value hash map scans the inner table once, so it reports `loops=1`. PG re-runs the SubPlan on every
+    call. This is an execution difference, like 6.

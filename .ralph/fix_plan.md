@@ -3983,10 +3983,44 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       ExplainSubPlans\); goopg's `\(calls= rebuilds= rescans= hits= misses=\)` annotation dropped, counters kept in
       `ctx\.SubPlanStats`\. Tests read them there\. Gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025
       PASS=99; census `routing\-20261029e` 22/22·99/99·99/99\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): expression\-level subqueries \(ARRAY\(\), row IN, multi\-assign SET, corr hash map\) uninstrumented; per\-worker
-      Memoize `Hits` lines; NLI probe Cond filter count; per\-site Buffers/WAL/memory\.
+    - Residual 2 done 2026\-10\-29 \(`d38dd96ed`\): expression\-level subqueries and bitmap producers report actuals\.
+      - ARRAY\(\), row IN, `ROW\(\) = \(SELECT\)`, multi\-assign SET and the corr hash map build in `ctx\.explainScope`
+        \(were `Build\(\)`\)\. The correlated ARRAY\(\) line is identical to a scratch PG 18\.3's\.
+      - Found on the way: Bitmap Index Scan / BitmapAnd / BitmapOr printed no actuals anywhere \(the heap scan built
+        the producer in Open with nil scope\)\. Now the bitmap ops carry the scope \(instrumentScopeCarrier, also via
+        the NLI probe sidecar\), and `instrumentedBitmapOp` counts PG's MultiExec semantics: one loop per
+        `buildBitmap`, rows = TIDs \(nodeBitmapIndexscan\.c nTuples\), 0 for And/Or\. The Gather's bitmap prebuild
+        folds as one leader site \(loops=1, as PG's parallel bitmap heap scan\)\. Serial and NLI\-probe lines identical
+        to scratch PG apart from `Heap Blocks:` / `Index Searches:`, which goopg does not print \(ledgered\)\.
+      - Tests `TestExplainAnalyzeExpressionSubqueryActuals` \(fails 4 assertions without the fix\),
+        `TestExplainAnalyzeBitmapProducerActuals` \(serial \+ Gather\)\.
+      - Gates units, tpch\-spotcheck \(Q12=2, Q13=35\), tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE
+        same=99\); census `routing\-20261029f` 22/22·99/99·99/99\.
+      - New residuals \(ledgered 2026\-10\-29\): DML \(Update/Delete\) child scans print no actuals and a MULTIEXPR
+        SubPlan is not rendered; an uncorrelated ARRAY\(\) prints `SubPlan 1` where PG prints `InitPlan 1`; no
+        `Heap Blocks:` line; the corr hash map scans once \(loops=1\) where PG re\-runs the SubPlan per call
+        \(execution difference\)\.
+      - Filed: M0122\-0022 \(row comparison against a multi\-column subquery errors\)\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): DML child actuals \+ MULTIEXPR SubPlan
+      rendering; per\-worker Memoize `Hits` lines; NLI probe Cond filter count; per\-site Buffers/WAL/memory;
+      uncorrelated ARRAY\(\) InitPlan label; `Heap Blocks:`\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
+- [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-10\-29 \(loop \#6, M0122\-0021 residual 2 probe\)\. Correctness only, no plan\-instrument rationale →
+    queues below item 10 \(S7 carve\-out\); placement is owner\-only\.
+  - Repro \(goopg, any table\): `SELECT k FROM mo WHERE \(k, pad\*100\) = \(SELECT id, v FROM mi WHERE mi\.id = 1\)` →
+    `ERROR: scalar subquery returned 2 columns, expected 1` \(42601\); the correlated form fails the same way, and
+    `ROW\(k, pad\) = \(SELECT id, v … WHERE mi\.id = mo\.k\)` fails with `SubPlan parameter $0 read before assignment`\.
+  - PG 18\.3 runs all three: a ROWCOMPARE\_SUBLINK \(parse\_expr\.c transformSubLink, `row op \(SELECT …\)`\), planned
+    as `\(\(k = \(SubPlan 1\)\.col1\) AND \(pad = \(SubPlan 1\)\.col2\)\)` — an InitPlan when uncorrelated
+    \(subselect\.c make\_subplan\)\.
+  - First step: find where the parenthesised row on the left reaches the scalar\-subquery path \(the
+    `scalar subquery returned` site, internal/executor/expr\.go evalSubquery\) and route it to the row\-compare
+    evaluator \(evalRowFuncCallVsSubqueryExpr\); then fix the `ROW\(\)` form's parameter binding\.
+  - Expected instrument: Movement: regress \(new pin\); PG's result rows for the three repros\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
@@ -6693,6 +6727,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-29 — **exhausted at `f15a1ac3c`**, census `routing\-20261029d/` reused \(`f15a1ac3c` is
     ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - Census 2026\-10\-29 at `04cc96f3b` \(M0122\-0021 residual 1 changed internal/executor\) — `routing\-20261029e/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `d38dd96ed` \(M0122\-0021 residual 2 changed internal/executor\) — `routing\-20261029f/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
