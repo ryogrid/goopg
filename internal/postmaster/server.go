@@ -206,6 +206,14 @@ type Config struct {
 	// M0106-0010 batched-34.
 	IsStandby func() bool
 
+	// HotStandbyDisabled is hot_standby = off (PGC_POSTMASTER, read at
+	// start). While IsStandby reports recovery, every connection — normal or
+	// replication — is refused after its startup packet, as PG's
+	// canAcceptConnections returns CAC_NOTHOTSTANDBY in PM_RECOVERY and
+	// backend_startup.c FATALs it; a promotion ends recovery and lifts the
+	// refusal (M0122-0013).
+	HotStandbyDisabled bool
+
 	// RecoveryLSNs, when non-nil, reports the standby's received and
 	// replayed WAL positions for pg_last_wal_receive_lsn /
 	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
@@ -1010,6 +1018,16 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	params, err := s.handleStartup(r, w)
 	if err != nil {
 		logger.Info("startup failed", "err", err)
+		return
+	}
+	// canAcceptConnections (postmaster.c) → CAC_NOTHOTSTANDBY: a standby
+	// with hot_standby = off accepts no connection while in recovery; the
+	// refusal comes after the startup packet and before authentication
+	// (backend_startup.c), so a cancel request still works.
+	if s.cfg.HotStandbyDisabled && s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+		s.writeFatalDetail(w, errcodes.CannotConnectNow,
+			"the database system is not accepting connections", "Hot standby mode is disabled.")
+		logger.Info("connection refused: hot standby mode is disabled")
 		return
 	}
 	// Clear the handshake deadline; idle-timeout policy is a separate concern.
@@ -2026,6 +2044,18 @@ func (s *Server) writeFatal(w *libpq.FrameWriter, code errcodes.Code, msg string
 		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
 		{Code: libpq.FieldSQLState, Value: string(code)},
 		{Code: libpq.FieldMessage, Value: msg},
+	})
+	_ = w.Flush()
+}
+
+// writeFatalDetail is writeFatal plus a DETAIL field.
+func (s *Server) writeFatalDetail(w *libpq.FrameWriter, code errcodes.Code, msg, detail string) {
+	_ = w.WriteErrorResponse([]libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "FATAL"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
+		{Code: libpq.FieldSQLState, Value: string(code)},
+		{Code: libpq.FieldMessage, Value: msg},
+		{Code: libpq.FieldDetail, Value: detail},
 	})
 	_ = w.Flush()
 }

@@ -993,6 +993,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// control-plane PROMOTE command. It must be wired into
 	// server.Config BEFORE srv.Run begins so the very first PROMOTE
 	// after startup has a handler.
+	// hot_standby (PGC_POSTMASTER): off refuses every connection while the
+	// server is a standby (canAcceptConnections, CAC_NOTHOTSTANDBY).
+	cfg.HotStandbyDisabled = !boolGUC(registry, "hot_standby", true)
 	var sc *standbyController
 	if rt != nil && rt.Standby {
 		sc = startStandby(ctx, rt, registry, logger)

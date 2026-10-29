@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -430,5 +431,74 @@ func TestBackendFlushAfterOnChangePropagatesToActivityRegistry(t *testing.T) {
 	}
 	if n, ok := act.BackendFlushAfterOverride(); !ok || n != 0 {
 		t.Errorf("BackendFlushAfterOverride after SET 0 = (%d, %v), want (0, true)", n, ok)
+	}
+}
+
+// TestHotStandbyDisabledRefusesConnections pins hot_standby = off: while the
+// server is a standby, every connection is refused after its startup packet
+// with PG's FATAL 57P03 "the database system is not accepting connections" /
+// DETAIL "Hot standby mode is disabled." (canAcceptConnections →
+// CAC_NOTHOTSTANDBY, backend_startup.c); once recovery ends (promotion) the
+// same server accepts connections, and with hot_standby on a standby accepts
+// them. goopg registered hot_standby but never read it.
+func TestHotStandbyDisabledRefusesConnections(t *testing.T) {
+	var standby atomic.Bool
+	start := func(t *testing.T, disabled bool) (string, func()) {
+		t.Helper()
+		srv := New(Config{
+			Address:            "127.0.0.1:0",
+			Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+			AcceptDeadline:     25 * time.Millisecond,
+			HandshakeTimeout:   2 * time.Second,
+			IsStandby:          standby.Load,
+			HotStandbyDisabled: disabled,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- srv.Run(ctx) }()
+		<-srv.Ready()
+		return srv.Addr().String(), func() { cancel(); <-done }
+	}
+	firstFrame := func(t *testing.T, addr string, params map[string]string) libpq.Frame {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		writeStartupPacket(t, conn, params)
+		f, err := libpq.NewFrameReader(conn).ReadFrame()
+		if err != nil {
+			t.Fatalf("read first frame: %v", err)
+		}
+		return f
+	}
+	user := map[string]string{"user": "alice", "database": "postgres"}
+	repl := map[string]string{"user": "alice", "database": "postgres", "replication": "true"}
+
+	addr, stop := start(t, true)
+	defer stop()
+	standby.Store(true)
+	for _, params := range []map[string]string{user, repl} {
+		f := firstFrame(t, addr, params)
+		if f.Type != libpq.MsgErrorResponse {
+			t.Fatalf("standby with hot_standby = off answered %c, want an ErrorResponse (replication=%q)", f.Type, params["replication"])
+		}
+		got := parseErrorFields(t, f.Payload)
+		if got['S'] != "FATAL" || got['C'] != "57P03" || got['M'] != "the database system is not accepting connections" || got['D'] != "Hot standby mode is disabled." {
+			t.Errorf("refusal fields = %v, want PG's FATAL 57P03 not-accepting-connections / hot-standby-disabled", got)
+		}
+	}
+	standby.Store(false) // promoted
+	if f := firstFrame(t, addr, user); f.Type != libpq.MsgAuthentication {
+		t.Errorf("after promotion the server answered %c, want AuthenticationOk", f.Type)
+	}
+
+	addr2, stop2 := start(t, false)
+	defer stop2()
+	standby.Store(true)
+	if f := firstFrame(t, addr2, user); f.Type != libpq.MsgAuthentication {
+		t.Errorf("standby with hot_standby = on answered %c, want AuthenticationOk", f.Type)
 	}
 }
