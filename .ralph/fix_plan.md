@@ -991,6 +991,22 @@ heuristic stays live.)
   - Fix: PG's CreateDataDirLockFile \(miscinit\.c CreateLockFile\) before initdb\.Open — O\_EXCL, live owner refuses
     with PG's errmsg/errhint, stale \(dead/own/parent/PG\_GRANDPARENT\_PID\) replaced; unlinked on exit while ours\.
   - Pins: `TestCreateDataDirLockFile`, `TestStartRefusesLiveDataDirLock` \(fails with the lock skipped\)\.
+- [x] **P0\-E20 — a mistyped or signalled restore\_command ended archive recovery and promoted**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: restore\_command 'goopgcpx %f %p' — before: promoted
+  to TLI 2 at the local WAL end; fixed: FATAL "could not restore file … from archive: command not found",
+  recovery\.signal kept, no promotion\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`7d2f398fa`\)\.**
+    > Found while porting M0122\-0013's shutdown\-during\-recovery residual: the same RestoreArchivedFile
+    > classification decides both\.
+  - Symptom: every restore\_command failure read as the end of the archive, so a command\-not\-found \(exit 127\) or a
+    signalled child promoted and abandoned the rest of the archive\.
+  - Fix: RestoreArchivedFile's wait\_result\_is\_signal\(SIGTERM\) → shutdown and wait\_result\_is\_any\_signal → FATAL
+    \(xlogarchive\.c\); archive recovery returns the error instead of ending\.
+  - Pins: `TestRestoreArchivedFileFailureClassification`, `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`
+    \(both fail with the classification off\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4187,6 +4203,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Shutdown during archive recovery \+ FATAL restore failures LANDED 2026\-10\-29 \(`7d2f398fa`\)** — fixes P0\-E20
+    \(S2, recorded above\)\. Movement: none — recovery path\. PG's startup process exits on a fast shutdown
+    \(StartupProcShutdownHandler / ProcessStartupProcInterrupts\) and RestoreArchivedFile is FATAL on a signal or an
+    unrunnable command; goopg ignored the shutdown and read every failure as the end of the archive\.
+    - `RestoreArchivedFileContext` \(classification, %r/%%, process\-group SIGTERM on cancel\);
+      `RunArchiveRecoveryWith\(ctx, …\)`; `endInterruptedArchiveRecovery` \(no promotion, recovery\.signal kept,
+      DB\_SHUTDOWNED\_IN\_RECOVERY, no checkpoint\); `goopg stop` signals a starting server\.
+    - Pins: `TestRestoreArchivedFileFailureClassification`, `TestRestoreArchivedFilePlaceholders`,
+      `TestRestoreArchivedFileShutdownKillsCommand`, `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`,
+      `TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished` \(mutation\-checked\); live probes: stop in 60 ms →
+      "shut down in recovery"; missing command → FATAL\.
+    - Gates: units, postmaster, `\-race` xlog restore tests, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): crash recovery ignores shutdown; immediate stop of a starting server \(SIGQUIT\);
+      shutdown restartpoint not adopted; DB\_IN\_PRODUCTION during recovery\.signal recovery; no RECOVERYXLOG /
+      wrong\-size check; pg\_wal read before the archive\.
   - **Data\-directory lock before recovery \+ SIGHUP during recovery LANDED 2026\-10\-29 \(`ca0bde402`\)** — fixes
     P0\-E19 \(S2, recorded above\)\. Movement: none — server startup\. PG CreateDataDirLockFile runs before the startup
     process; the startup process applies SIGHUP reloads at ProcessStartupProcInterrupts and RestoreArchivedFile reads

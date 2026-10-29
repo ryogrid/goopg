@@ -229,3 +229,52 @@ hit Go's default action for SIGHUP and terminated the process.
   shared-memory key, status line).
 - SIGTERM/SIGINT during start-time recovery cancels only the context. Recovery runs to the end, and `goopg stop` cannot
   reach a server that has no control socket yet.
+
+## Update 2026-10-29 — shutdown during archive recovery and FATAL restore failures (M0122-0013, `7d2f398fa`; P0-E20)
+
+**The defects.** goopg read every `restore_command` failure as the end of the archive, and nothing in start-time archive
+recovery looked at SIGTERM/SIGINT.
+- **P0-E20 (S2, data loss):** a mistyped command (exit 127, "command not found") or a child killed by a signal ended
+  recovery at the local WAL end. goopg then promoted to a new timeline and abandoned the rest of the archive. PG
+  reports these at FATAL precisely so that recovery is not assumed complete.
+- **Fast shutdown:** a SIGTERM/SIGINT was ignored until the archive was exhausted. goopg then promoted, and exited only
+  afterwards.
+
+**The port (`RestoreArchivedFile`, xlogarchive.c; `StartupProcShutdownHandler` / `ProcessStartupProcInterrupts`,
+startup.c).**
+- `RestoreArchivedFileContext` classifies failures as upstream does:
+  - a child killed by SIGTERM, or the shell's exit 128\+15, returns `ErrRecoveryShutdown`;
+  - any other signal, or an exit status above 125, returns `RestoreFatalError` with `wait_result_to_str`'s text
+    ("command not found", "child process was terminated by signal 9: Killed", …);
+  - anything else is the normal end of the archive.
+- The command expands `BuildRestoreCommand`'s `%f`, `%p`, `%r` and `%%`; `%r` and `%%` used to be left verbatim.
+- A cancelled context sends SIGTERM to the command's process group, the way the postmaster signals the startup
+  process's group.
+- `RunArchiveRecoveryWith` takes the shutdown context and checks it before every fetch and every segment replay. It
+  returns shutdown and FATAL errors instead of reading them as an exhausted archive.
+- `endInterruptedArchiveRecovery` leaves recovery unfinished: no promotion, `recovery.signal` kept, and no shutdown
+  checkpoint, because a server in recovery writes no checkpoint record.
+  - A shutdown request stamps `DB_SHUTDOWNED_IN_RECOVERY` and exits 0.
+  - Anything else is FATAL with exit 1, as when the startup process dies FATAL.
+- `goopg stop` signals a server whose lock file has no control socket yet: SIGINT for fast, SIGTERM for smart, as
+  `pg_ctl stop` does.
+
+**Pins:**
+- `TestRestoreArchivedFileFailureClassification`, `TestRestoreArchivedFilePlaceholders` and
+  `TestRestoreArchivedFileShutdownKillsCommand`.
+- `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`.
+- `TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished`: stop during a slow `restore_command` leaves no new
+  timeline, `recovery.signal` kept and pg\_control in "shut down in recovery"; the next start resumes recovery and
+  promotes.
+- Four mutations fail these tests: context not passed, signal classification off, group kill off, state not stamped.
+- Live probes:
+  - `goopg stop` returned in 60 ms, and `pg_controldata` reports "shut down in recovery".
+  - A missing command is FATAL, with no promotion and `recovery.signal` kept.
+
+**Still open (ledgered):**
+- `initdb.Open`'s crash recovery ignores a shutdown request.
+- `-mode immediate` cannot stop a server that is still starting, because SIGQUIT is unhandled.
+- The shutdown does not adopt the last replayed checkpoint as a restartpoint.
+- pg\_control shows `DB_IN_PRODUCTION`, not `DB_IN_ARCHIVE_RECOVERY`, during recovery.signal recovery.
+- There is no `RECOVERYXLOG` temporary name and no wrong-size check on a restored file.
+- pg\_wal is read before the archive.
