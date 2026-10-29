@@ -469,3 +469,54 @@ sessions) or sent the fast-shutdown cancel.
 simple and `\bind`, prints PG 18's lines for both stop modes.
 
 **Still open (ledgered):** the immediate path still waits for session goroutines.
+
+## Update 2026-10-30 — the walreceiver's connection preamble (M0122-0013, `7a5f06436`)
+
+PG's WalReceiverMain runs these steps on every connection before it streams. goopg's walreceiver used to send
+START\_REPLICATION straight after the startup handshake.
+
+1. **IDENTIFY\_SYSTEM** (`identifySystem`):
+   - It applies libpqrcv\_identify\_system's result-shape check (one row, at least three fields).
+   - The primary's `systemid` must equal the standby's pg\_control identifier. Otherwise: "database system
+     identifier differs between the primary and standby".
+   - The primary's timeline must not be behind the start timeline. Otherwise: "highest timeline %u of the primary
+     is behind recovery timeline %u".
+   - `WalReceiverConfig.SystemID` = 0 skips the identifier check. Only in-process tests leave it zero; `goopg
+     start` passes `LoadOrCreateSystemID`.
+2. **WalRcvFetchTimeLineHistoryFiles** (`fetchTimelineHistoryFiles`): for every timeline from the start timeline to
+   the primary's that pg\_wal lacks, it runs TIMELINE\_HISTORY. It checks the result shape and file name, as
+   libpqrcv\_readtimelinehistoryfile does, and writes the content verbatim (`xlog.WriteHistoryContent`). An
+   existing file is left alone. Timeline 1 has none.
+3. **START\_REPLICATION**: the command is libpqrcv\_startstreaming's, `START_REPLICATION SLOT "name" X/X TIMELINE
+   n`. The slot name is quoted, there is no PHYSICAL keyword, and the start timeline is always given.
+   `WalReceiverConfig.StartTLI` defaults to the WAL writer's timeline.
+
+Two related changes:
+
+- **Promotion's timeline.** Standby promotion took the old timeline plus one. It now takes StartupXLOG's
+  `findNewestTimeLine(recoveryTargetTLI) + 1` over pg\_wal (`xlog.FindNewestTimeline`). Fetching the history files
+  is what makes this work: a standby on timeline 1 whose primary already reached timeline 3 is promoted onto
+  timeline 4.
+- **Walsender timeline.** IDENTIFY\_SYSTEM, READ\_REPLICATION\_SLOT and the START\_REPLICATION timeline check now
+  read the WAL writer's live timeline (`currentTimeline`). They used to read the copy taken at startup, which
+  stayed on the old timeline after an in-process promotion. With the new behind-timeline check, that stale value
+  would have refused a downstream standby.
+
+**Pins:**
+
+- `TestWalReceiverFetchesMissingTimelineHistory` (the primary's writer is on timeline 3, and its Config.Timeline is
+  unset);
+- `TestWalReceiverIdentifySystemChecks`;
+- `TestBuildStartReplicationCommand`;
+- `TestStandbyControllerPromoteSkipsKnownTimelines`.
+
+Each fails when its behaviour is disabled. The PG 18 → goopg failover E2E shows that a PG walsender accepts the
+new command and the identifier check.
+
+**Still open (ledgered):**
+
+- The end-of-timeline handshake (CopyDone, then the next-timeline result set), on both the walsender and the
+  walreceiver.
+- The standby's writer switch and replay onto the child timeline, per recovery\_target\_timeline.
+- `.done` markers for fetched history files.
+- TIMELINE\_HISTORY of a missing file: goopg returns an empty row, where PG raises an error.

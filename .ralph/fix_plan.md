@@ -4244,6 +4244,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **The walreceiver runs WalReceiverMain's preamble LANDED 2026\-10\-30 \(`7a5f06436`\)**\. Movement: none —
+    replication protocol\. Before, START\_REPLICATION went out straight after the startup handshake: no
+    IDENTIFY\_SYSTEM, no history fetch, no TIMELINE\.
+    - IDENTIFY\_SYSTEM checks: system identifier, and a primary timeline behind the start one\.
+      WalRcvFetchTimeLineHistoryFiles\. The command is libpqrcv\_startstreaming's \(`SLOT "x"`, `TIMELINE n`\)\.
+    - Promotion takes findNewestTimeLine \+ 1 \(`xlog\.FindNewestTimeline`\)\. The walsender reports the writer's live
+      timeline\.
+    - Pins: `TestWalReceiverFetchesMissingTimelineHistory`, `TestWalReceiverIdentifySystemChecks`,
+      `TestBuildStartReplicationCommand`, `TestStandbyControllerPromoteSkipsKnownTimelines` \(all mutation\-checked\)\.
+      Gates: units, replication/replcluster/xlog, 12 replication \+ failover E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): the end\-of\-timeline handshake on both sides and the timeline switch it drives\;
+      `\.done` markers for fetched history files\; TIMELINE\_HISTORY of a missing file\.
   - **Sessions report why a stop ends them LANDED 2026\-10\-30 \(`f97dccda6`, `2bc45c8b3`\)**\. Movement: none —
     session teardown messages\. Before, an idle session saw only "server closed the connection unexpectedly", and
     a busy one got "canceling statement due to user request"\.
