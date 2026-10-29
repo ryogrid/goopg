@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -639,7 +640,8 @@ func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
 	}()
 	oldTLI := rt.WAL.TimelineID()
 	localEnd := rt.WAL.WrittenLSN()
-	endOfLog, lastStart, err := xlog.RunArchiveRecovery(rt.StorageMgr, dir, "cp "+filepath.Join(archive, "%f")+" %p", int64(segSize))
+	recovered, err := xlog.RunArchiveRecovery(rt.StorageMgr, dir, "cp "+filepath.Join(archive, "%f")+" %p", int64(segSize))
+	endOfLog := recovered.EndOfLog
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +655,7 @@ func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{EndOfLog: endOfLog, LastStart: lastStart}, logger); err != nil {
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{Recovery: recovered}, logger); err != nil {
 		t.Fatalf("promoteAfterRecovery: %v", err)
 	}
 	// The end-of-recovery checkpoint may legitimately retire the restored
@@ -746,5 +748,142 @@ func TestStandbyControllerPromoteTakesCheckpoint(t *testing.T) {
 	}
 	if cd.CheckPointCopyThisTLI != oldTLI+1 {
 		t.Errorf("pg_control checkpoint copy TLI = %d after promotion, want %d", cd.CheckPointCopyThisTLI, oldTLI+1)
+	}
+}
+
+// TestPromoteAfterRecoveryFollowsTimelines pins archive recovery from a base
+// backup taken on timeline 1 of a server that was later promoted to
+// timeline 2: recovery follows the history onto timeline 2 (PG's
+// recovery_target_timeline = 'latest'), the writer crosses the switch the
+// way a following standby does, and the promotion's new timeline is 3 —
+// past every timeline the archive knows — with history 1 → 2 → 3.
+func TestPromoteAfterRecoveryFollowsTimelines(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	primary := filepath.Join(t.TempDir(), "primary")
+	backup := filepath.Join(t.TempDir(), "backup")
+	archive := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: primary}); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 4000)
+	appendUntil := func(rt *initdb.Runtime, lsn uint64) {
+		t.Helper()
+		for rt.WAL.WrittenLSN() < lsn {
+			if _, _, err := rt.WAL.Append(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Timeline 1, then a base backup of the stopped primary.
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: primary, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	appendUntil(rt, rt.WAL.WrittenLSN()+segSize+segSize/3)
+	rt.Close()
+	if out, err := exec.Command("cp", "-a", primary, backup).CombinedOutput(); err != nil {
+		t.Fatalf("cp: %v %s", err, out)
+	}
+
+	// The primary is promoted to timeline 2 and writes on.
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: primary, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switchLSN := rt.WAL.WrittenLSN()
+	_, prev := rt.WAL.InsertPosition()
+	if err := rt.WAL.SwitchTimeline(2, switchLSN, prev); err != nil {
+		t.Fatal(err)
+	}
+	primaryWAL := filepath.Join(primary, "pg_wal")
+	if err := xlog.WriteHistory(primaryWAL, 2, []xlog.TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN, Reason: "test promotion"}}); err != nil {
+		t.Fatal(err)
+	}
+	appendUntil(rt, switchLSN+segSize+segSize/2)
+	rt.Close()
+
+	// Archive everything the primary wrote.
+	ents, err := os.ReadDir(primaryWAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if _, _, ok := xlog.ParseXLogFileName(e.Name(), 0); ok || strings.HasSuffix(e.Name(), ".history") {
+			b, err := os.ReadFile(filepath.Join(primaryWAL, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(archive, e.Name()), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Archive recovery of the backup, then promotion.
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: backup, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			rt.Close()
+		}
+	}()
+	if got := rt.WAL.TimelineID(); got != 1 {
+		t.Fatalf("precondition: backup writer timeline = %d, want 1", got)
+	}
+	recovered, err := xlog.RunArchiveRecovery(rt.StorageMgr, backup, "cp "+filepath.Join(archive, "%f")+" %p", int64(segSize))
+	if err != nil {
+		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	if recovered.EndTLI != 2 || recovered.EndOfLog <= switchLSN {
+		t.Fatalf("recovery ended on TLI %d at %X, want timeline 2 past the switch %X", recovered.EndTLI, recovered.EndOfLog, switchLSN)
+	}
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{Recovery: recovered}, logger); err != nil {
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	if got := rt.WAL.TimelineID(); got != 3 {
+		t.Errorf("writer timeline = %d after promotion, want 3", got)
+	}
+	backupWAL := filepath.Join(backup, "pg_wal")
+	entries, err := xlog.ReadHistory(backupWAL, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []xlog.TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN}, {TLI: 2, SwitchLSN: recovered.EndOfLog}}
+	if len(entries) != 2 || entries[0].TLI != want[0].TLI || entries[0].SwitchLSN != want[0].SwitchLSN ||
+		entries[1].TLI != want[1].TLI || entries[1].SwitchLSN != want[1].SwitchLSN {
+		t.Errorf("timeline 3 history = %+v, want 1@%X, 2@%X", entries, switchLSN, recovered.EndOfLog)
+	}
+	at, _, err := rt.WAL.Append(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at < recovered.EndOfLog {
+		t.Errorf("post-promotion WAL starts at %X, inside the replayed WAL (EndOfLog %X)", at, recovered.EndOfLog)
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	postEnd := rt.WAL.WrittenLSN()
+	rt.Close()
+	closed = true
+
+	rt2, err := initdb.Open(initdb.OpenOptions{DataDir: backup, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("reopen after promotion: %v", err)
+	}
+	defer rt2.Close()
+	if got := rt2.WAL.TimelineID(); got != 3 {
+		t.Errorf("reopened writer timeline = %d, want 3", got)
+	}
+	if got := rt2.WAL.WrittenLSN(); got < postEnd {
+		t.Errorf("reopened WAL ends at %X, before the post-promotion end %X", got, postEnd)
 	}
 }

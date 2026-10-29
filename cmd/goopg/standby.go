@@ -471,7 +471,7 @@ func promotionCheckpoint(rt *initdb.Runtime, wait bool, logger *slog.Logger) {
 	// undo the promotion's timeline; the scheduled checkpoint after a
 	// restart, when the writer opens on the new timeline, does it instead.
 	if rt.WAL != nil && rt.DataDir != "" {
-		if cd, err := control.ReadControlFile(rt.DataDir); err == nil && rt.WAL.TimelineID() < cd.CheckPointCopyThisTLI {
+		if cd, err := control.ReadControlFile(rt.DataDir); err == nil && cd != nil && rt.WAL.TimelineID() < cd.CheckPointCopyThisTLI {
 			logger.Warn("end-of-recovery checkpoint skipped: the WAL writer is still on the old timeline",
 				"writer_tli", rt.WAL.TimelineID(), "control_tli", cd.CheckPointCopyThisTLI)
 			return
@@ -609,43 +609,89 @@ func switchWriterToNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN
 // end — it never wrote them — so without this the writer resumed at its own
 // end and the first post-promotion record overwrote WAL whose changes
 // replay had already applied (a crash then left pages ahead of the WAL that
-// describes them). PG's startup process reads that WAL through its own
-// reader and the new timeline begins at EndOfLog (StartupXLOG). Feeding the
-// restored bytes through AppendRaw — the walreceiver's path, which writes
-// the identical bytes back into the same segment files — gives the writer
-// the position a streaming standby would have, so the shared timeline
-// switch applies unchanged.
-func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64) error {
-	if rt.WAL == nil {
-		return nil
-	}
-	from := rt.WAL.WrittenLSN()
-	if endOfLog <= from {
+// describes them; P0-E17). PG's startup process reads that WAL through its
+// own reader and the new timeline begins at EndOfLog (StartupXLOG). Feeding
+// the restored bytes through AppendRaw — the walreceiver's path, which writes
+// the identical bytes back into the same segment files, one segment at a
+// time — gives the writer the position a streaming standby would have, so
+// the shared timeline switch applies unchanged.
+//
+// When recovery followed the history onto newer timelines, the writer
+// crosses each switch the same way a standby following a timeline does:
+// append up to the timeline's begin, switch the writer onto it there, go on.
+// The switch zero-fills the new timeline's copy of the segment past its
+// begin (copySegmentPrefix), so those restored bytes are read before it.
+func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64, timelines []xlog.TimelineSpan) error {
+	if rt.WAL == nil || endOfLog <= rt.WAL.WrittenLSN() {
 		return nil
 	}
 	walDir := walDirFor(rt)
 	segSize := uint64(rt.WAL.SegmentSize())
-	tli := rt.WAL.TimelineID()
-	stream := make([]byte, 0, endOfLog-from)
-	for pos := from; pos < endOfLog; {
-		segNo, off := pos/segSize, pos%segSize
-		n := min(segSize-off, endOfLog-pos)
-		name := filepath.Join(walDir, xlog.FormatSegmentNameTLI(segNo, tli))
+	readRestored := func(a, b uint64) ([]byte, error) {
+		segNo, off := a/segSize, a%segSize
+		name, ok, err := xlog.NewestSegmentPath(walDir, segNo)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("segment %d missing", segNo)
+		}
 		f, err := os.Open(name)
 		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		buf := make([]byte, b-a)
+		if _, err := f.ReadAt(buf, int64(off)); err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		return buf, nil
+	}
+	appendRange := func(a, b uint64) error {
+		for pos := a; pos < b; {
+			n := min(segSize-pos%segSize, b-pos)
+			buf, err := readRestored(pos, pos+n)
+			if err != nil {
+				return err
+			}
+			if _, _, err := rt.WAL.AppendRaw(buf); err != nil {
+				return fmt.Errorf("append: %w", err)
+			}
+			pos += n
+		}
+		return nil
+	}
+	for _, sp := range timelines {
+		if sp.TLI <= rt.WAL.TimelineID() || sp.Begin >= endOfLog {
+			continue
+		}
+		if sp.Begin < rt.WAL.WrittenLSN() {
+			return fmt.Errorf("adopt restored WAL: local WAL on timeline %d extends to %X, past timeline %d's start %X",
+				rt.WAL.TimelineID(), rt.WAL.WrittenLSN(), sp.TLI, sp.Begin)
+		}
+		if err := appendRange(rt.WAL.WrittenLSN(), sp.Begin); err != nil {
 			return fmt.Errorf("adopt restored WAL: %w", err)
 		}
-		buf := make([]byte, n)
-		_, err = f.ReadAt(buf, int64(off))
-		_ = f.Close()
-		if err != nil {
-			return fmt.Errorf("adopt restored WAL: read %s: %w", name, err)
+		segEnd := (sp.Begin/segSize + 1) * segSize
+		var hold []byte
+		if tail := min(segEnd, endOfLog); tail > sp.Begin {
+			b, err := readRestored(sp.Begin, tail)
+			if err != nil {
+				return fmt.Errorf("adopt restored WAL: %w", err)
+			}
+			hold = b
 		}
-		stream = append(stream, buf...)
-		pos += n
+		if err := rt.WAL.SwitchTimeline(sp.TLI, sp.Begin, 0); err != nil {
+			return fmt.Errorf("adopt restored WAL: follow timeline %d: %w", sp.TLI, err)
+		}
+		if len(hold) > 0 {
+			if _, _, err := rt.WAL.AppendRaw(hold); err != nil {
+				return fmt.Errorf("adopt restored WAL: append: %w", err)
+			}
+		}
 	}
-	if _, _, err := rt.WAL.AppendRaw(stream); err != nil {
-		return fmt.Errorf("adopt restored WAL: append: %w", err)
+	if err := appendRange(rt.WAL.WrittenLSN(), endOfLog); err != nil {
+		return fmt.Errorf("adopt restored WAL: %w", err)
 	}
 	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
 		return fmt.Errorf("adopt restored WAL: flush: %w", err)
@@ -656,8 +702,7 @@ func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64) error {
 // archiveRecoveryEnd is what the recovery.signal promotion needs from the
 // archive recovery that preceded it.
 type archiveRecoveryEnd struct {
-	EndOfLog           uint64 // end of the last record replayed past the local end (RunArchiveRecovery); 0 = none
-	LastStart          uint64 // that record's start
+	Recovery           xlog.ArchiveRecoveryResult // what RunArchiveRecovery replayed
 	RecoveryEndCommand string
 	WalLevel           int32
 }
@@ -684,7 +729,15 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	if err != nil {
 		return fmt.Errorf("promote after recovery: load timeline_id: %w", err)
 	}
-	newTLI := oldTLI + 1
+	rec := end.Recovery
+	// Recovery may have followed the history onto a newer timeline: the
+	// parent of the new one is the timeline recovery ended on (EndOfLogTLI),
+	// and the new one is past every timeline the archive knows
+	// (findNewestTimeLine + 1, StartupXLOG), so it cannot collide.
+	if rec.EndTLI > oldTLI {
+		oldTLI = rec.EndTLI
+	}
+	newTLI := max(oldTLI, rec.NewestTLI) + 1
 	walDir := walDirFor(rt)
 
 	// The switch point is PG's EndOfLog: the end of the last record
@@ -697,11 +750,11 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 		endLSN = rt.WAL.WrittenLSN()
 		_, prevRecPtr = rt.WAL.InsertPosition()
 	}
-	if end.EndOfLog > endLSN {
-		if err := adoptRestoredWAL(rt, end.EndOfLog); err != nil {
+	if rec.EndOfLog > endLSN {
+		if err := adoptRestoredWAL(rt, rec.EndOfLog, rec.Timelines); err != nil {
 			return fmt.Errorf("promote after recovery: %w", err)
 		}
-		endLSN, prevRecPtr = end.EndOfLog, end.LastStart-1
+		endLSN, prevRecPtr = rec.EndOfLog, rec.LastStart-1
 	}
 
 	prev, err := xlog.ReadHistory(walDir, oldTLI)
@@ -793,6 +846,9 @@ func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logg
 	cd, err := control.ReadControlFile(rt.DataDir)
 	if err != nil {
 		return fmt.Errorf("recovery_end_command: read pg_control: %w", err)
+	}
+	if cd == nil {
+		return fmt.Errorf("recovery_end_command: pg_control missing")
 	}
 	segSize := xlog.DefaultSegmentSize
 	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {

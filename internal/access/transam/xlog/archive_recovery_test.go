@@ -89,7 +89,8 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	endOfLog, lastStart, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
+	res, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
+	endOfLog, lastStart := res.EndOfLog, res.LastStart
 	if err != nil {
 		t.Fatalf("RunArchiveRecovery: %v", err)
 	}
@@ -138,5 +139,81 @@ func TestRestoreArchivedFileSucceeds(t *testing.T) {
 	// Verify the file exists.
 	if _, err := os.Stat(filepath.Join(dir, segName)); err != nil {
 		t.Errorf("segment file not created: %v", err)
+	}
+}
+
+// TestRunArchiveRecoveryFollowsTimelineHistory pins the timeline-following
+// archive recovery of PG's recovery_target_timeline = 'latest': the newest
+// timeline is found from the archive's history files (findNewestTimeLine),
+// its history gives the expected timelines (readTimeLineHistory), and each
+// segment is read from the newest timeline that has it and began at or
+// before it (XLogFileReadAnyTLI). The archive holds timeline 1 up to a
+// switch in segment 1 and timeline 2 from there. goopg used to fetch only
+// timeline-1 names, so it stopped at the switch and silently dropped every
+// record written on timeline 2.
+func TestRunArchiveRecoveryFollowsTimelineHistory(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switchLSN := w.WrittenLSN()
+	_, prev := w.InsertPosition()
+	if err := w.SwitchTimeline(2, switchLSN, prev); err != nil {
+		t.Fatal(err)
+	}
+	var end uint64
+	for w.WrittenLSN() < 3*uint64(segSize)+uint64(segSize)/2 {
+		if _, e, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		} else {
+			end = e
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecovery(mgr, dataDir, "cp "+filepath.Join(archive, "%f")+" %p", segSize)
+	if err != nil {
+		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	if res.NewestTLI != 2 || res.EndTLI != 2 {
+		t.Errorf("newest TLI %d, end TLI %d, want 2 and 2", res.NewestTLI, res.EndTLI)
+	}
+	if res.EndOfLog != end {
+		t.Errorf("EndOfLog = %X, want timeline 2's last record end %X", res.EndOfLog, end)
+	}
+	if len(res.Timelines) != 2 || res.Timelines[1] != (TimelineSpan{TLI: 2, Begin: switchLSN}) {
+		t.Errorf("expected timelines = %+v, want [{1 0} {2 %X}]", res.Timelines, switchLSN)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(2))); err != nil {
+		t.Errorf("timeline 2's history file not restored: %v", err)
+	}
+	// Segment 1 holds the switch: timeline 2's copy is the one to read.
+	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 2))); err != nil {
+		t.Errorf("timeline 2's switch segment not restored: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 1))); !os.IsNotExist(err) {
+		t.Errorf("timeline 1's copy of the switch segment was restored (err %v); timeline 2's should win", err)
 	}
 }

@@ -566,6 +566,12 @@ func openSegmentFile(walDir string, segNo uint64) (*os.File, error) {
 	return os.Open(path)
 }
 
+// NewestSegmentPath returns the path of segment segNo on the newest timeline
+// that has a file for it in walDir (ok false when none does).
+func NewestSegmentPath(walDir string, segNo uint64) (string, bool, error) {
+	return newestSegmentPath(walDir, segNo, ^uint32(0))
+}
+
 // newestSegmentPath returns the path of segment segNo on the newest timeline
 // at or below maxTLI that has it.
 func newestSegmentPath(walDir string, segNo uint64, maxTLI uint32) (string, bool, error) {
