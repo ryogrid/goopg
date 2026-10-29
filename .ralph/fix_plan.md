@@ -723,17 +723,19 @@ heuristic stays live.)
     - Ledgered: the re\-sent overlap is trimmed, not overwritten as XLogWalRcvWrite does; no divergence detection\.
   Movement: none — replication correctness — no plan instrument \(walreceiver/walsender only\)
 
-- [ ] pgbench/nightly — pgbench nightly stage failed: `pgbench: error: PQendcopy failed` \(AI\-20261030\-002852\-001; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+- [x] pgbench/nightly — pgbench nightly stage failed: `pgbench: error: PQendcopy failed` \(AI\-20261030\-002852\-001; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
   - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. pgbench\.log line 59 is `extendBatch …/base/5/16409: … no space
     left on device` during `\-i \-s 50` — the host root filesystem was full \(120 MB free\) ~00:50–01:10\. 43 GB of stale
     TPC\-DS SF1 capture clones \(tmp/s9\[q\-x\]\-…, tmp/m24…\) were removed at ~01:12; 41 GB free since\.
-  - Next: re\-run the repro at HEAD \(or let the next nightly confirm\) and check off as stale/environmental\.
-- [ ] testport/stage — stage testport FAILED with no parseable cause \(AI\-20261030\-002852\-002; repro: `bash ci/batch/stages/stage\-testport\.sh` with REPO\_ROOT/RUN\_DIR set\)\.
+  - Stale, environmental — passes at HEAD c6a3c5c76 \(2026\-10\-30 02:20–02:31, idle host, 42 GB free\): the stage repro
+    exited 0, `pgbench PASS \(0 failed txns; tps 4420/6728/10195\)`, data dir cleaned by the stage's trap\.
+- [x] testport/stage — stage testport FAILED with no parseable cause \(AI\-20261030\-002852\-002; repro: `bash ci/batch/stages/stage\-testport\.sh` with REPO\_ROOT/RUN\_DIR set\)\.
   - Not a reopen of the 2026\-10\-22 testport/stage task \(that was a 2 h TestPort\_IsolationSuite timeout\)\.
   - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. regress\-diffs/prepare\_raw\.txt shows `DDL catalog sync: pg\_class:
     wal: write …/pg\_wal/…: no space left on device` in TestPort\_RegressSuite — the same full\-disk window as the
     pgbench item\.
-  - Next: re\-run the repro at HEAD \(or let the next nightly confirm\) and check off as stale/environmental\.
+  - Stale, environmental — passes at HEAD c6a3c5c76 \(2026\-10\-30 02:31–03:03\): the stage repro exited 0,
+    `testport PASS`, `ok internal/testport 1745\.954s`\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
