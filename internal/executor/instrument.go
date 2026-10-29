@@ -126,6 +126,26 @@ func (o *instrumentedOp) Schema() optimizer.Schema { return o.inner.Schema() }
 // cycle.
 func (o *instrumentedOp) Open(ctx *Context) error {
 	o.stats.loops++
+	o.seedCounters(ctx)
+	if !o.stats.timing {
+		return o.inner.Open(ctx)
+	}
+	// The stopwatch runs only inside this node's own calls, as PG's
+	// InstrStartNode/InstrStopNode pair does (M0122-0020). Open is timed
+	// because goopg operators do there the work PG's first ExecProcNode
+	// does (hash build, sort, materialise).
+	o.stats.gotFirst = false
+	start := time.Now()
+	err := o.inner.Open(ctx)
+	d := time.Since(start).Nanoseconds()
+	o.stats.loopNs = d
+	o.stats.totalNs += d
+	return err
+}
+
+// seedCounters captures the buffer / WAL / memory sources and, on the
+// node's first Open, the baselines accountBuffers diffs against.
+func (o *instrumentedOp) seedCounters(ctx *Context) {
 	if ctx != nil && ctx.Pool != nil {
 		o.pool = ctx.Pool
 		if !o.stats.bufSeeded {
@@ -146,20 +166,64 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 			o.stats.memSeeded = true
 		}
 	}
-	if !o.stats.timing {
-		return o.inner.Open(ctx)
+}
+
+// instrumentedBitmapOp instruments a bitmap producer (BitmapIndexScan,
+// BitmapAnd, BitmapOr). PG runs these through MultiExecProcNode, never
+// ExecProcNode: each MultiExec call is one loop, and the node's rows are
+// the TIDs it added — InstrStopNode(instrument, nTuples) in
+// MultiExecBitmapIndexScan, 0 in MultiExecBitmapAnd / MultiExecBitmapOr
+// (nodeBitmapIndexscan.c, nodeBitmapAnd.c, nodeBitmapOr.c). goopg's
+// counterpart of MultiExec is buildBitmap, so the loop and row counters
+// move there; Open is the ExecInit-time setup PG does not instrument.
+// (M0122-0021 residual 2.)
+type instrumentedBitmapOp struct {
+	instrumentedOp
+}
+
+// bitmapTupleCounter reports the TIDs the producer's last buildBitmap
+// added — PG's nTuples. Producers that do not implement it (BitmapAnd,
+// BitmapOr) report 0 rows, as PG's do.
+type bitmapTupleCounter interface {
+	lastBitmapTuples() int64
+}
+
+func (o *instrumentedBitmapOp) Open(ctx *Context) error {
+	o.seedCounters(ctx)
+	return o.inner.Open(ctx)
+}
+
+func (o *instrumentedBitmapOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
+	var start time.Time
+	if o.stats.timing {
+		start = time.Now()
 	}
-	// The stopwatch runs only inside this node's own calls, as PG's
-	// InstrStartNode/InstrStopNode pair does (M0122-0020). Open is timed
-	// because goopg operators do there the work PG's first ExecProcNode
-	// does (hash build, sort, materialise).
-	o.stats.gotFirst = false
-	start := time.Now()
-	err := o.inner.Open(ctx)
-	d := time.Since(start).Nanoseconds()
-	o.stats.loopNs = d
-	o.stats.totalNs += d
-	return err
+	tbm, err := o.inner.(bitmapProducer).buildBitmap(ctx)
+	o.stats.loops++
+	if o.stats.timing {
+		// One call is one whole loop: PG's first InstrStopNode of the
+		// cycle is also its last, so startup equals the loop's time.
+		d := time.Since(start).Nanoseconds()
+		o.stats.loopNs = d
+		o.stats.totalNs += d
+		o.stats.startupNs += d
+	}
+	o.accountBuffers()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := o.inner.(bitmapTupleCounter); ok {
+		o.stats.rowsOut += tc.lastBitmapTuples()
+	}
+	return tbm, nil
+}
+
+// BindOuter forwards a nested-loop parent's slot to the wrapped producer
+// (bitmapOuterBinder); a producer that cannot be parameterised ignores it.
+func (o *instrumentedBitmapOp) BindOuter(slot SlotView, outerWidth int) {
+	if b, ok := o.inner.(bitmapOuterBinder); ok {
+		b.BindOuter(slot, outerWidth)
+	}
 }
 
 // accountBuffers rolls the storage.Pool's global hit/read/dirtied/written
@@ -293,6 +357,11 @@ func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrument
 	}
 	if fr, ok := in.(filterRemoveCounter); ok {
 		fr.setFilterRemoveCounter(&stats.filterRejected)
+	}
+	// A bitmap heap probe builds its bitmap-producing subtree in Open, so
+	// it needs the scope to instrument that subtree (M0122-0021).
+	if sc, ok := in.(instrumentScopeCarrier); ok {
+		sc.setInstrumentScope(scope)
 	}
 	return &instrumentedNLIInner{inner: in, stats: stats}
 }
@@ -667,6 +736,9 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	}
 	if sc, ok := op.(instrumentScopeCarrier); ok {
 		sc.setInstrumentScope(scope)
+	}
+	if _, ok := op.(bitmapProducer); ok {
+		return &instrumentedBitmapOp{instrumentedOp{inner: op, plan: plan, stats: stats}}
 	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
 }

@@ -3,6 +3,8 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // TestExplainAnalyzeCTEBodyAndSubPlanActuals pins M0122-0021 slice 3: the
@@ -90,5 +92,90 @@ func TestExplainAnalyzeCoopBuildInputActuals(t *testing.T) {
 	}
 	if strings.Contains(out, "loops=0)") {
 		t.Errorf("a node still reports loops=0:\n%s", out)
+	}
+}
+
+// TestExplainAnalyzeExpressionSubqueryActuals pins M0122-0021 residual 2: the
+// subqueries goopg evaluates from inside expression evaluation report their
+// subtree's (actual …), as PG's do (every SubPlan / InitPlan has its own
+// Instrumentation, explain.c ExplainSubPlans). Before the fix these sites
+// built the inner plan with Build() — no instrumentation scope — and the
+// subtree printed bare:
+//
+//   - ARRAY(SELECT …), correlated and not (evalArraySubquery). The
+//     correlated line is byte-identical to PG 18.3's;
+//   - the correlated value hash map (buildCorrSubqHashMap). goopg scans the
+//     inner table once and probes the map per outer row, so the scan reports
+//     one loop carrying every row; PG re-runs the SubPlan per call (loops=12,
+//     Rows Removed by Filter: 10). That is an execution difference, recorded
+//     in the deferral ledger, not a rendering one.
+func TestExplainAnalyzeExpressionSubqueryActuals(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		name, sql string
+		want      []string
+	}{
+		{
+			name: "correlated ARRAY()",
+			sql:  "SELECT k, ARRAY(SELECT v FROM mi WHERE mi.id = mo.k) FROM mo WHERE pad < 3",
+			want: []string{"Index Scan using mi_pkey on mi (actual rows=1.00 loops=3)"},
+		},
+		{
+			name: "uncorrelated ARRAY()",
+			sql:  "SELECT ARRAY(SELECT v FROM mi WHERE v > 500)",
+			want: []string{"Seq Scan on mi (actual rows=5.00 loops=1)", "Rows Removed by Filter: 5"},
+		},
+		{
+			name: "correlated value hash map",
+			sql:  "SELECT k, (SELECT id FROM mi WHERE mi.v = mo.pad) FROM mo WHERE pad < 12",
+			want: []string{"Seq Scan on mi (actual rows=10.00 loops=1)"},
+		},
+	}
+	for _, tc := range cases {
+		out := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) "+tc.sql), "\n")
+		for _, w := range tc.want {
+			if !strings.Contains(out, w) {
+				t.Errorf("%s: missing %q:\n%s", tc.name, w, out)
+			}
+		}
+	}
+}
+
+// TestExplainAnalyzeBitmapProducerActuals pins the bitmap half of M0122-0021
+// residual 2: Bitmap Index Scan (and BitmapAnd / BitmapOr above it) report
+// actuals as PG's do. PG runs these through MultiExecProcNode — one loop per
+// call, rows = the TIDs the index scan added (MultiExecBitmapIndexScan's
+// InstrStopNode(…, nTuples)); 0 for BitmapAnd / BitmapOr. goopg built the
+// producer subtree inside the heap scan's Open with no scope, so it printed
+// no actuals anywhere: serially, as a nested-loop probe, and below a Gather,
+// where the leader builds the shared bitmap once (prebuildBitmap) and PG's
+// parallel bitmap heap scan likewise runs the index scan once.
+func TestExplainAnalyzeBitmapProducerActuals(t *testing.T) {
+	ctx := spillFixture(t, 2000, 10, 400)
+	if err := runDDL(t, ctx, "CREATE INDEX sp_probe_k ON sp_probe (k)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	const sql = "SELECT pad FROM sp_probe WHERE k = 7"
+	const want = "Bitmap Index Scan on sp_probe_k (actual rows=5.00 loops=1)"
+	explain := "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) " + sql
+
+	serial := strings.Join(runExplainOverChild(t, ctx, explain, planBitmapForced(t, ctx, sql)), "\n")
+	if !strings.Contains(serial, want) {
+		t.Errorf("serial: missing %q:\n%s", want, serial)
+	}
+
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+	ctx.GatherWorkerStats = nil
+	gathered := &optimizer.Gather{Child: planBitmapForced(t, ctx, sql), WorkersPlanned: 2}
+	lines := runExplainOverChild(t, ctx, explain, gathered)
+	par := strings.Join(lines, "\n")
+	if !strings.Contains(par, "Gather") || !strings.Contains(par, want) {
+		t.Errorf("below a Gather: missing %q:\n%s", want, par)
+	}
+	if strings.Contains(par, "loops=0)") {
+		t.Errorf("a node reports loops=0:\n%s", par)
 	}
 }

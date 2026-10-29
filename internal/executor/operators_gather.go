@@ -307,7 +307,7 @@ func (o *gatherOp) Open(ctx *Context) error {
 
 	// S5.6: pre-build the bitmap scan (if any) so workers share the result
 	// rather than each running their own index scan.
-	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild); err != nil {
+	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild, o.prebuildScope()); err != nil {
 		o.startChannelCloser()
 		return err
 	}
@@ -595,6 +595,7 @@ func (o *gatherOp) Close() error {
 	// carrier, copying only rows/loops/time per node.
 	foldGatherWorkerStats(o.ctx, o.workerTables)
 	foldPrebuildStats(o.ctx, o.prebuildTable)
+	o.prebuildTable = nil
 
 	// 4. Fold per-worker notices back, then release the arenas the leader
 	//    allocated. Both happen after the join, which supplies the
@@ -643,7 +644,10 @@ func (o *gatherOp) prebuildScope() *instrumenter {
 	if o.scope == nil {
 		return nil
 	}
-	pre := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
-	o.prebuildTable = pre.table
-	return pre
+	// The hash and bitmap prebuilds share one table, folded (and reset)
+	// once at Close.
+	if o.prebuildTable == nil {
+		o.prebuildTable = make(nodeStatsTable)
+	}
+	return &instrumenter{timing: o.scope.timing, table: o.prebuildTable}
 }

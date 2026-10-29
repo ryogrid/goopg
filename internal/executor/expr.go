@@ -10654,7 +10654,7 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -10766,7 +10766,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
 
-	innerOp, err := Build(sqOp.Plan)
+	innerOp, err := buildNode(sqOp.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -11619,7 +11619,7 @@ func extractCorrSubqHashInfo(n optimizer.Node) (corrSubqHashInfo, bool) {
 // buildCorrSubqHashMap scans the inner SeqScan once and builds
 // key → value map where key = datumKey(scan[joinColIdx]) and value = eval(projExpr).
 func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum, error) {
-	scanOp, err := Build(info.scan)
+	scanOp, err := buildNode(info.scan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return nil, err
 	}
@@ -11692,7 +11692,7 @@ func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (D
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -11742,7 +11742,7 @@ func evalMultiAssignSubqRow(x *optimizer.MultiAssignSubqRow, row Row, ctx *Conte
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return nil, err
 	}

@@ -218,7 +218,7 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 	// participant claims disjoint pages from it. gatherOp has done this since
 	// S5.6; Gather Merge did not, which is the same sibling-drift class as the
 	// index claim set below.
-	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild); err != nil {
+	if err := o.prebuildBitmap(ctx, o.plan.Child, o.buildChild, o.prebuildScope()); err != nil {
 		return err
 	}
 
@@ -632,6 +632,7 @@ func (o *gatherMergeOp) Close() error {
 	// carrier, copying only rows/loops/time per node.
 	foldGatherWorkerStats(o.ctx, o.workerTables)
 	foldPrebuildStats(o.ctx, o.prebuildTable)
+	o.prebuildTable = nil
 
 	for _, w := range o.workers {
 		MergeWorkerContext(o.ctx, w)
@@ -706,7 +707,10 @@ func (o *gatherMergeOp) prebuildScope() *instrumenter {
 	if o.scope == nil {
 		return nil
 	}
-	pre := &instrumenter{timing: o.scope.timing, table: make(nodeStatsTable)}
-	o.prebuildTable = pre.table
-	return pre
+	// The hash and bitmap prebuilds share one table, folded (and reset)
+	// once at Close.
+	if o.prebuildTable == nil {
+		o.prebuildTable = make(nodeStatsTable)
+	}
+	return &instrumenter{timing: o.scope.timing, table: o.prebuildTable}
 }
