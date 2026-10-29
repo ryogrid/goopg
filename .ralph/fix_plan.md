@@ -4142,6 +4142,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Archive\-recovery promotion records EndOfLog as the switch point LANDED 2026\-10\-29 \(`69c31e230`\)**\.
+    Movement: none — recovery path\. PG writes the new timeline's history with EndOfLog \(end of the last replayed
+    record\); goopg used the writer's pre\-archive WrittenLSN, so restored segments were left out of the boundary\.
+    - `RunArchiveRecovery` returns endOfLog; `promoteAfterRecovery` uses the later of it and the writer's end\.
+    - Pins: `TestRunArchiveRecoveryFetchesThenStops` \(endOfLog\), `TestPromoteAfterRecoveryHistorySwitchPoint`\.
+    - Gates: units, `\-race` xlog, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Finding: goopg has no WAL archiver \(no archive\_mode/archive\_command, no \.ready/\.done\) — PG's
+      RemoveNonParentXlogFiles `.ready` exception and the `.partial` rename have nothing to act on; the standby
+      promotion's `Writer\.SwitchTimeline` already removes old\-timeline segments past the switch segment\.
+    - Residual \(ledgered 2026\-10\-21 item 1\): the writer is not repositioned/switched after archive recovery\.
   - **Recovery parameters validated at start; restore\_command PGC\_SIGHUP LANDED 2026\-10\-29 \(`04b33fccf`\)**\.
     Movement: none — recovery path\. PG's validateRecoveryParameters \(xlogrecovery\.c\): recovery\.signal without
     standby mode and without restore\_command is FATAL; a standby with neither primary\_conninfo nor restore\_command

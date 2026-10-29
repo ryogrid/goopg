@@ -83,7 +83,7 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 
 | File | What |
 |------|------|
-| `internal/config/defaults.go` | Registered `restore_command` GUC (string, default `""`, `ContextPostmaster`) |
+| `internal/config/defaults.go` | Registered `restore_command` GUC (string, default `""`; `ContextPostmaster` at first, PGC\_SIGHUP since 2026-10-29 — see the update below) |
 | `internal/initdb/standby.go` | Added `IsRecovery()`, `RemoveRecoverySignal()` — mirror `IsStandby()`/`RemoveStandbySignal()` for `recovery.signal` |
 | `internal/initdb/open.go` | Added `Recovery bool` field to `Runtime`; check for `recovery.signal` at Open time |
 | `cmd/goopg/main.go` | Archive recovery path at startup: when `recovery.signal` present (and `standby.signal` absent), call `RunArchiveRecovery` → `promoteAfterRecovery` → become primary |
@@ -92,6 +92,31 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 ### Deferred
 
 - `recovery_target_time` / `recovery_target_xid` / `recovery_target_name` (PITR targets)
-- `archive_cleanup_command`
+- ~~`archive_cleanup_command`~~ — landed 2026-10-29 (M0122-0013; design 0005-0001)
 - `recovery_target_timeline` beyond "latest"
 - TLI-aware segment fetch (`FormatSegmentNameTLI` currently hardcodes TLI=1 in the fetch loop)
+
+## Updates (M0122-0013, 2026-10-29)
+
+- **Start-up validation.** `validateRecoveryParameters` (xlogrecovery.c) is ported: `recovery.signal` without
+  `standby.signal` and without `restore_command` is FATAL, and the signal file stays. Before this, goopg deleted the
+  signal file and started as a primary. `restore_command` is PGC\_SIGHUP (`04b33fccf`).
+- **`recovery_end_command`** runs at the end of archive recovery, inside `promoteAfterRecovery` and before
+  `recovery.signal` is removed (`7911ddeda`).
+- **Timeline switch point = EndOfLog** (`69c31e230`). PG writes the new timeline's history file with EndOfLog, the end
+  of the last replayed record (xlog.c `StartupXLOG` → `writeTimeLineHistory`). `promoteAfterRecovery` used the
+  running writer's `WrittenLSN`, which is the local end from before archive recovery. So whenever `restore_command`
+  supplied segments, the history file named a switch point earlier than the WAL actually replayed.
+  - `RunArchiveRecovery` now returns `endOfLog`: the `EndLSN` of the last record it replayed past the local end, or 0
+    when the archive supplied nothing.
+  - `promoteAfterRecovery` uses the later of `endOfLog` and the writer's end.
+  - Pins: `TestRunArchiveRecoveryFetchesThenStops` (`endOfLog` equals the archived record's end) and
+    `TestPromoteAfterRecoveryHistorySwitchPoint` (restored vs nothing restored).
+- **Still open:**
+  - The running WAL writer is neither repositioned past the restored WAL nor switched to the new timeline after
+    archive recovery, so post-promotion WAL starts at the writer's old end on the old timeline (ledger 2026-10-21,
+    item 1). `endOfLog` is the boundary that switch will use.
+  - The fetch loop still hardcodes TLI 1 (above).
+  - goopg has no WAL archiver (`archive_mode` / `archive_command`, `.ready` / `.done`). So PG's
+    `RemoveNonParentXlogFiles` exception for `.ready` segments and the old timeline's `.partial` rename, which needs
+    `XLogArchivingActive()`, have nothing to act on.
