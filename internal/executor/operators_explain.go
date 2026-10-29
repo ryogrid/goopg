@@ -102,6 +102,10 @@ func (o *explainOp) Open(ctx *Context) error {
 			return err
 		}
 		execNs = time.Since(execStart).Nanoseconds()
+		// Nodes below a Gather report the sum over their execution sites
+		// on their own line, as PG folds worker instrumentation into the
+		// node's (InstrAggNode) before ExplainNode runs (M0122-0021).
+		stats = aggregateWorkerInstrumentation(stats, ctx.GatherWorkerStats, timing)
 
 		if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
 			// Upstream nests the plan tree under a top-level "Plan" key, with
@@ -6383,15 +6387,38 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// in workerStats — so a main-line-only fix would leave the plan that
 	// motivated this change (TPC-H Q12) printing byte-identical pre-filter
 	// numbers. The same Filter substitution is therefore required here.
-	if len(workerStats) > 0 {
+	// M0122-0021: PG prints these lines only under VERBOSE (explain.c
+	// ExplainNode, `es->workers_state && es->verbose`) and only for
+	// worker_instrument — the leader's share lives in the node line's
+	// aggregate (aggregateWorkerInstrumentation), never on a line of its
+	// own. A site that never looped prints nothing (`nloops <= 0`).
+	if opts.Verbose && len(workerStats) > 0 {
 		if ws, ok := workerStats[statSrc]; ok && len(ws) > 0 {
-			ordered := make([]workerNodeStat, len(ws))
-			copy(ordered, ws)
+			ordered := make([]workerNodeStat, 0, len(ws))
+			for _, w := range ws {
+				if !w.Leader && w.Loops > 0 {
+					ordered = append(ordered, w)
+				}
+			}
 			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			timing := !opts.Set.Timing || opts.Timing
 			for _, w := range ordered {
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
-					"Worker %d:  actual time=%.3f..%.3f rows=%.2f loops=%d",
-					w.Worker, msPerLoop(w.StartupNs, w.Loops), msPerLoop(w.TotalNs, w.Loops), rowsPerLoop(w.RowsOut, w.Loops), w.Loops))})
+				rowsOut := w.RowsOut
+				// The node line's M0122-0017 subtraction, per site: the
+				// probe's share of the join residual's rejections counted
+				// at this worker's own join.
+				if attachedFilterNode == n && filterRowsRemoved > 0 {
+					rowsOut -= paramProbeRejectedAtSite(reg, workerStats, w.Worker)
+					if rowsOut < 0 {
+						rowsOut = 0
+					}
+				}
+				line := fmt.Sprintf("Worker %d:  actual ", w.Worker)
+				if timing {
+					line += fmt.Sprintf("time=%.3f..%.3f ", msPerLoop(w.StartupNs, w.Loops), msPerLoop(w.TotalNs, w.Loops))
+				}
+				line += fmt.Sprintf("rows=%.2f loops=%d", rowsPerLoop(rowsOut, w.Loops), w.Loops)
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 			}
 		}
 	}

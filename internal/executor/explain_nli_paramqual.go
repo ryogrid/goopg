@@ -364,3 +364,24 @@ func splitParamQualRejections(n optimizer.Node, s *nodeStats) (probe, join int64
 		return s.probeFilterRejected, s.joinFilterRejected - s.probeFilterRejected
 	}
 }
+
+// paramProbeRejectedAtSite is splitParamQualRejections' probe share for one
+// execution site of a parameterized nested loop that ran below a Gather:
+// the join's own entry for that worker slot, so a `Worker N:` line under
+// the probe subtracts what that worker's join rejected, not the total over
+// all sites (M0122-0021). reg.paramRow is the join while its probe prints.
+func paramProbeRejectedAtSite(reg *subPlanReg, workerStats workerNodeStatsTable, worker int) int64 {
+	if reg == nil || reg.paramRow == nil {
+		return 0
+	}
+	for _, w := range workerStats[reg.paramRow] {
+		if w.Worker == worker {
+			probe, _ := splitParamQualRejections(reg.paramRow, &nodeStats{
+				joinFilterRejected:  w.JoinFilterRejected,
+				probeFilterRejected: w.ProbeFilterRejected,
+			})
+			return probe
+		}
+	}
+	return 0
+}

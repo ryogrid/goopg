@@ -394,6 +394,21 @@ type workerNodeStat struct {
 	// E-17 absorbed the qual into the scan, the scan is what runs inside
 	// workers.
 	FilterRejected int64
+	// JoinFilterRejected / ProbeFilterRejected / HeapFetches are the site's
+	// remaining per-node counters (nodeStats' joinFilterRejected,
+	// probeFilterRejected, heapFetches). PG's InstrAggNode folds every one
+	// of them into the node's own instrumentation, so the node line's
+	// `Rows Removed by Join Filter`, a parameterized probe's moved-Filter
+	// subtraction and `Heap Fetches` all need the per-site values
+	// (M0122-0021).
+	JoinFilterRejected  int64
+	ProbeFilterRejected int64
+	HeapFetches         int64
+	// Leader marks the leader's site (the last slot). PG keeps the
+	// leader's counters in planstate->instrument and prints `Worker N:`
+	// lines only for worker_instrument, so the leader never gets a line
+	// of its own — it only contributes to the node-line aggregate.
+	Leader bool
 }
 
 // EX0-03b (new): workerNodeStatsTable maps a shared inner-plan Node back
@@ -429,10 +444,69 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 				StartupNs: st.startupNs,
 				TotalNs:   st.totalNs,
 
-				FilterRejected: st.filterRejected,
+				FilterRejected:      st.filterRejected,
+				JoinFilterRejected:  st.joinFilterRejected,
+				ProbeFilterRejected: st.probeFilterRejected,
+				HeapFetches:         st.heapFetches,
+				Leader:              idx == len(tables)-1,
 			})
 		}
 	}
+}
+
+// aggregateWorkerInstrumentation gives every node that ran below a Gather
+// one node-level stats entry summed over all of its execution sites —
+// workers and leader — as PG's ExecParallelRetrieveInstrumentation does
+// with InstrAggNode (execParallel.c, instrument.c:166): startup, total,
+// ntuples, nloops, nfiltered1 and nfiltered2 add up, and EXPLAIN divides
+// by the summed nloops (explain.c ExplainNode). Without it such a node has
+// no stats entry at all — each site files into its own fresh table — and
+// its line printed no `(actual …)`, while the per-site `Worker N:` lines
+// carried the only numbers (M0122-0021).
+//
+// The site entries are the complete population (the leader is a site), so
+// they replace any counter an existing entry holds rather than adding to
+// it. Buffer, WAL and memory counters are not aggregated: each site's
+// deltas are read off pool-global counters that the other sites advance
+// concurrently, so their sum is not the node's usage (ledger M0122-0021).
+func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStatsTable, timing bool) nodeStatsTable {
+	if len(workers) == 0 {
+		return stats
+	}
+	if stats == nil {
+		stats = make(nodeStatsTable)
+	}
+	for node, ws := range workers {
+		if node == nil || len(ws) == 0 {
+			continue
+		}
+		agg := &nodeStats{timing: timing}
+		if prev, ok := stats[node]; ok && prev != nil {
+			cp := *prev
+			agg = &cp
+		}
+		agg.rowsOut, agg.loops, agg.startupNs, agg.totalNs = 0, 0, 0, 0
+		agg.filterRejected, agg.joinFilterRejected, agg.probeFilterRejected, agg.heapFetches = 0, 0, 0, 0
+		for _, w := range ws {
+			agg.rowsOut += w.RowsOut
+			agg.loops += w.Loops
+			agg.startupNs += w.StartupNs
+			agg.totalNs += w.TotalNs
+			agg.filterRejected += w.FilterRejected
+			agg.joinFilterRejected += w.JoinFilterRejected
+			agg.probeFilterRejected += w.ProbeFilterRejected
+			agg.heapFetches += w.HeapFetches
+		}
+		if agg.loops == 0 {
+			// No site ever opened the node. Today that is a shared hash
+			// build input (prebuildSharedHashJoins builds it once,
+			// uninstrumented, before any site runs), so `loops=0` would
+			// misreport work that did happen; leave the node as it was.
+			continue
+		}
+		stats[node] = agg
+	}
+	return stats
 }
 
 // maybeInstrument is called by buildNode right before each switch arm

@@ -288,7 +288,7 @@ func TestFoldGatherWorkerStatsCopiesFourFields(t *testing.T) {
 	wantN1 := []workerNodeStat{
 		{Worker: 0, RowsOut: 10, Loops: 1, StartupNs: 100, TotalNs: 200},
 		{Worker: 1, RowsOut: 30, Loops: 1, StartupNs: 300, TotalNs: 400},
-		{Worker: 3, RowsOut: 4, Loops: 1, StartupNs: 40, TotalNs: 50},
+		{Worker: 3, RowsOut: 4, Loops: 1, StartupNs: 40, TotalNs: 50, Leader: true},
 	}
 	if got := ctx.GatherWorkerStats[n1]; !reflect.DeepEqual(got, wantN1) {
 		t.Errorf("carrier[n1] = %+v, want %+v", got, wantN1)
@@ -347,6 +347,11 @@ func workerShape(lines []string) string {
 // SHAPE. Deliberately NOT asserted: exact per-worker rows= (schedule-
 // dependent). Leader participation is off so the leader builds no table —
 // the count pins workers only.
+//
+// M0122-0021: PG prints the `Worker N:` lines only under VERBOSE
+// (explain.c ExplainNode), so the runs use EXPLAIN (ANALYZE, VERBOSE,
+// TIMING OFF); TestExplainAnalyzeParallelNodeLineAggregatesSites pins the
+// non-VERBOSE half.
 func TestExplainAnalyzeParallelWorkerLinesShape(t *testing.T) {
 	ctx := spillFixture(t, 200, 200, 40)
 	ctx.WorkMem = 0
@@ -373,7 +378,7 @@ func TestExplainAnalyzeParallelWorkerLinesShape(t *testing.T) {
 		// appends — same precedent as ctx.HashJoinStats = nil in the
 		// spill-identity test).
 		ctx.GatherWorkerStats = nil
-		return runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, TIMING OFF) "+scanSQL, gathered)
+		return runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, VERBOSE, TIMING OFF) "+scanSQL, gathered)
 	}
 
 	for runIdx := 0; runIdx < 2; runIdx++ {
@@ -407,6 +412,77 @@ func TestExplainAnalyzeParallelWorkerLinesShape(t *testing.T) {
 	}
 }
 
+// scanActualRe pulls the parallel scan's node-line actuals.
+var scanActualRe = regexp.MustCompile(`Parallel Seq Scan on sp_probe .*\(actual rows=(\d+\.\d+) loops=(\d+)\)`)
+
+// TestExplainAnalyzeParallelNodeLineAggregatesSites pins M0122-0021: a node
+// that ran below a Gather prints its own `(actual …)` summed over every
+// execution site — workers AND leader — as PG's InstrAggNode does
+// (instrument.c), and without VERBOSE no `Worker N:` line at all. Before
+// the fix the scan line carried no actuals and one `Worker N:` line per
+// site, the leader's slot included. With VERBOSE the worker lines return,
+// still one per launched worker: the leader never gets a line of its own.
+func TestExplainAnalyzeParallelNodeLineAggregatesSites(t *testing.T) {
+	ctx := spillFixture(t, 200, 200, 40)
+	ctx.WorkMem = 0
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = true
+
+	const scanSQL = `SELECT * FROM sp_probe`
+	gathered := planGatheredJoin(t, ctx, scanSQL, 2)
+	_, planned, ok := findGatherNode(gathered)
+	if !ok || planned <= 0 {
+		t.Fatalf("precondition: gathered plan needs a Gather with workers (ok=%v planned=%d)", ok, planned)
+	}
+	launched := planned
+	if launched > ctx.MaxParallelWorkers {
+		launched = ctx.MaxParallelWorkers
+	}
+
+	ctx.GatherWorkerStats = nil
+	plain := strings.Join(runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, TIMING OFF) "+scanSQL, gathered), "\n")
+	if got := len(workerLineRe.FindAllString(plain, -1)); got != 0 {
+		t.Errorf("non-VERBOSE output has %d Worker lines, want 0 (PG prints them only under VERBOSE):\n%s", got, plain)
+	}
+	m := scanActualRe.FindStringSubmatch(plain)
+	if m == nil {
+		t.Fatalf("parallel scan line carries no (actual …):\n%s", plain)
+	}
+	var sites, loopsSum int64
+	for node, ws := range ctx.GatherWorkerStats {
+		if _, isScan := node.(*optimizer.SeqScan); !isScan {
+			continue
+		}
+		for _, w := range ws {
+			sites++
+			loopsSum += w.Loops
+		}
+	}
+	if sites != int64(launched)+1 {
+		t.Fatalf("precondition: %d scan sites, want %d workers + leader", sites, launched)
+	}
+	if m[2] != fmt.Sprint(loopsSum) {
+		t.Errorf("scan loops=%s, want the sum over sites %d:\n%s", m[2], loopsSum, plain)
+	}
+	var perLoop float64
+	fmt.Sscanf(m[1], "%f", &perLoop)
+	if total := perLoop * float64(loopsSum); total < 199.5 || total > 200.5 {
+		t.Errorf("scan rows=%s × loops=%d = %.2f, want the table's 200 rows:\n%s", m[1], loopsSum, total, plain)
+	}
+
+	ctx.GatherWorkerStats = nil
+	verbose := strings.Join(runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, VERBOSE, TIMING OFF) "+scanSQL, gathered), "\n")
+	if got := len(workerLineRe.FindAllString(verbose, -1)); got > launched {
+		t.Errorf("VERBOSE output has %d Worker lines for %d workers — the leader got a line:\n%s", got, launched, verbose)
+	}
+	if strings.Contains(verbose, fmt.Sprintf("Worker %d:", launched)) {
+		t.Errorf("VERBOSE output prints the leader's slot as Worker %d:\n%s", launched, verbose)
+	}
+	if strings.Contains(verbose, "actual time=") {
+		t.Errorf("TIMING OFF output prints a time:\n%s", verbose)
+	}
+}
+
 // TestExplainAnalyzeEmptyWorkerCarrierByteIdentical is the item-class pin
 // for EX0-03b (design §4): the walker change is unreachable when the
 // carrier is empty, so a render with a nil carrier and one with an empty
@@ -429,5 +505,48 @@ func TestExplainAnalyzeEmptyWorkerCarrierByteIdentical(t *testing.T) {
 	}
 	if nilOut, emptyOut := render(nil), render(workerNodeStatsTable{}); nilOut != emptyOut {
 		t.Errorf("empty-carrier render differs:\n--- nil ---\n%s\n--- empty ---\n%s", nilOut, emptyOut)
+	}
+}
+
+// TestAggregateWorkerInstrumentationSumsSites pins the InstrAggNode fold
+// (M0122-0021): every counter the sites carry adds up, the site entries
+// replace (never add to) an existing entry's counters — they are the
+// complete population — and the existing entry's buffer counters survive.
+func TestAggregateWorkerInstrumentationSumsSites(t *testing.T) {
+	scan := &optimizer.SeqScan{}
+	join := &optimizer.SeqScan{}
+	orig := &nodeStats{rowsOut: 99, loops: 9, bufHit: 7}
+	stats := nodeStatsTable{join: orig}
+	carrier := workerNodeStatsTable{
+		scan: {
+			{Worker: 0, RowsOut: 10, Loops: 2, StartupNs: 1, TotalNs: 10, FilterRejected: 3, HeapFetches: 1},
+			{Worker: 1, RowsOut: 20, Loops: 3, StartupNs: 2, TotalNs: 20, FilterRejected: 4, HeapFetches: 2},
+			{Worker: 2, RowsOut: 5, Loops: 1, StartupNs: 3, TotalNs: 30, Leader: true},
+		},
+		join: {
+			{Worker: 0, RowsOut: 4, Loops: 1, JoinFilterRejected: 6, ProbeFilterRejected: 2},
+			{Worker: 1, RowsOut: 6, Loops: 1, JoinFilterRejected: 8, ProbeFilterRejected: 5, Leader: true},
+		},
+	}
+	got := aggregateWorkerInstrumentation(stats, carrier, true)
+	s := got[scan]
+	if s == nil || s.rowsOut != 35 || s.loops != 6 || s.startupNs != 6 || s.totalNs != 60 ||
+		s.filterRejected != 7 || s.heapFetches != 3 || !s.timing {
+		t.Errorf("scan aggregate = %+v, want rows 35 loops 6 startup 6 total 60 filtered 7 heap 3 timing", s)
+	}
+	j := got[join]
+	if j == nil || j.rowsOut != 10 || j.loops != 2 || j.joinFilterRejected != 14 || j.probeFilterRejected != 7 || j.bufHit != 7 {
+		t.Errorf("join aggregate = %+v, want rows 10 loops 2 joinFiltered 14 probe 7 bufHit 7 (sites replace counters)", j)
+	}
+	if orig.rowsOut != 99 || orig.loops != 9 {
+		t.Errorf("the original entry was mutated: %+v", orig)
+	}
+	idle := &optimizer.SeqScan{}
+	got = aggregateWorkerInstrumentation(got, workerNodeStatsTable{idle: {{Worker: 0}, {Worker: 1, Leader: true}}}, true)
+	if _, ok := got[idle]; ok {
+		t.Errorf("a node no site opened got an entry (it would print loops=0): %+v", got[idle])
+	}
+	if out := aggregateWorkerInstrumentation(nil, nil, false); out != nil {
+		t.Errorf("empty carrier must return the table unchanged, got %+v", out)
 	}
 }
