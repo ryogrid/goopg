@@ -7321,6 +7321,13 @@ Sequencing: the S9 replenishment rule in the banner.)
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. ea\-ratchet FAIL \(8 NEW, pre\-existing at 997db829b, ledgered\)\.
   - Census 2026\-10\-29 at `45b925ffd` \(IN\-list correlation fix changed internal/optimizer\) — `routing\-20261029n/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical; fire\-set no fires\.
+  - Census 2026\-10\-30, S9 exhausted at `8c85bc43d` \(M0122\-0014 `a45162dc3` changed internal/executor\) —
+    `routing\-20261030a/`: TPC\-H 22/22, SF0\.25 99/99, SF1 99/99\. CATEGORIES\-EXCL\-MATCH 0 everywhere; goopg plan text
+    byte\-identical to routing\-20261029n\. Nothing filed\. Open item 0\-9 tasks:
+    - M0146\-0014\(channel\), M0146\-0042\(channel\);
+    - M0146\-0007/0012b/0067/0175\(below\-item\-10\);
+    - M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239/0243\(below\-item\-10\);
+    - M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003\); M0146\-0010a and M0146\-0035 are held `\[\!\]`\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
