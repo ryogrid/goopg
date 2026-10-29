@@ -6372,6 +6372,14 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		// leader site's into the node entry — and the workers' follow as
 		// `Worker N:` lines at the node's end.
 		if _, isBHS := n.(*optimizer.BitmapHeapScan); isBHS {
+			// `Rows Removed by Index Recheck` (nfiltered2 per loop, %.0f,
+			// zero suppressed) prints directly under `Recheck Cond:`,
+			// before the Filter lines (explain.c T_BitmapHeapScan arm).
+			if s, ok := stats[n]; ok && s != nil && s.recheckRejected > 0 && s.loops > 0 {
+				line := Row{NewStringDatum(detailIndent + fmt.Sprintf("Rows Removed by Index Recheck: %.0f",
+					float64(s.recheckRejected)/float64(s.loops)))}
+				insertAfterDetail(rows, detailIndent+"Recheck Cond: ", line)
+			}
 			if s, ok := stats[n]; ok && s != nil {
 				if line := formatHeapBlocks(s.exactPages, s.lossyPages); line != "" {
 					*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
@@ -8217,4 +8225,18 @@ func formatHeapBlocks(exact, lossy int64) string {
 		line += fmt.Sprintf(" lossy=%d", lossy)
 	}
 	return line
+}
+
+// insertAfterDetail inserts line after the last row starting with prefix —
+// the node's own detail line, since the node's details are the most recent
+// rows — or appends it when no such row exists.
+func insertAfterDetail(rows *[]Row, prefix string, line Row) {
+	for i := len(*rows) - 1; i >= 0; i-- {
+		r := (*rows)[i]
+		if len(r) == 1 && strings.HasPrefix(r[0].StringValue(), prefix) {
+			*rows = append((*rows)[:i+1], append([]Row{line}, (*rows)[i+1:]...)...)
+			return
+		}
+	}
+	*rows = append(*rows, line)
 }

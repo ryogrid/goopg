@@ -317,3 +317,42 @@ func TestExplainUncorrelatedArraySublinkIsInitPlan(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainAnalyzeBitmapIndexRecheckRemoved pins M0122-0021 residual 14: a
+// lossy bitmap page is walked whole and every tuple rechecked against the
+// original index qual; the ones the recheck rejects are PG's nfiltered2 on the
+// Bitmap Heap Scan, printed as `Rows Removed by Index Recheck` directly under
+// `Recheck Cond:` and before the Filter / Heap Blocks lines (explain.c
+// T_BitmapHeapScan arm; nodeBitmapHeapscan.c InstrCountFiltered2). goopg
+// rejected them with a bare return and printed nothing. A tiny work_mem forces
+// every page lossy, so the scan rechecks whole pages and rejects every
+// non-matching tuple on them.
+func TestExplainAnalyzeBitmapIndexRecheckRemoved(t *testing.T) {
+	ctx := spillFixture(t, 2000, 10, 400)
+	if err := runDDL(t, ctx, "CREATE INDEX sp_probe_k ON sp_probe (k)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	ctx.WorkMem = 1 // smallest bitmap: every page lossy
+	const sql = "SELECT pad FROM sp_probe WHERE k < 40"
+	lines := runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) "+sql, planBitmapForced(t, ctx, sql))
+	out := strings.Join(lines, "\n")
+	at := -1
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "Recheck Cond:") {
+			at = i
+		}
+	}
+	if at < 0 || at+1 >= len(lines) {
+		t.Fatalf("no Recheck Cond line:\n%s", out)
+	}
+	var removed int64
+	if n, _ := fmt.Sscanf(strings.TrimSpace(lines[at+1]), "Rows Removed by Index Recheck: %d", &removed); n != 1 || removed <= 0 {
+		t.Errorf("the line after Recheck Cond is %q, want a positive `Rows Removed by Index Recheck`:\n%s", strings.TrimSpace(lines[at+1]), out)
+	}
+	if !strings.Contains(out, "Heap Blocks:") || !strings.Contains(out, " lossy=") {
+		t.Errorf("work_mem=1 should make the bitmap lossy:\n%s", out)
+	}
+	if !strings.Contains(out, "(actual rows=200.00 loops=1)") {
+		t.Errorf("the recheck must still return exactly the 200 matching rows:\n%s", out)
+	}
+}

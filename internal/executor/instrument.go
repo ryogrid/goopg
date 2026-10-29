@@ -43,6 +43,12 @@ type nodeStats struct {
 	exactPages int64
 	lossyPages int64
 
+	// recheckRejected counts the tuples a Bitmap Heap Scan's recheck of
+	// the original index qual rejected — PG's nfiltered2 on that node
+	// (nodeBitmapHeapscan.c BitmapHeapNext, InstrCountFiltered2), surfaced
+	// as `Rows Removed by Index Recheck` (M0122-0021).
+	recheckRejected int64
+
 	// filterRejected counts tuples a Filter operator rejected (scan-level
 	// qual). Mirrors upstream's Instrumentation.nfiltered1 for scan nodes,
 	// surfaced by EXPLAIN ANALYZE as "Rows Removed by Filter".
@@ -370,6 +376,9 @@ func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrument
 	if hb, ok := in.(heapBlocksCounter); ok {
 		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
 	}
+	if rr, ok := in.(recheckRemoveCounter); ok {
+		rr.setRecheckRemoveCounter(&stats.recheckRejected)
+	}
 	// A bitmap heap probe builds its bitmap-producing subtree in Open, so
 	// it needs the scope to instrument that subtree (M0122-0021).
 	if sc, ok := in.(instrumentScopeCarrier); ok {
@@ -495,6 +504,13 @@ type heapBlocksCounter interface {
 	setHeapBlocksCounters(exact, lossy *int64)
 }
 
+// recheckRemoveCounter is implemented by the bitmap heap scan: it ++es
+// stats.recheckRejected for each tuple its index-qual recheck rejects.
+// Surfaces as "Rows Removed by Index Recheck".
+type recheckRemoveCounter interface {
+	setRecheckRemoveCounter(*int64)
+}
+
 // joinFilterRemoveCounter is implemented by join operators that
 // evaluate join residual qual(s) and reject candidate matches.
 // maybeInstrument hands the operator a pointer to its node's
@@ -611,6 +627,9 @@ type workerNodeStat struct {
 	// show_tidbitmap_info over sinstrument). M0122-0021.
 	ExactPages int64
 	LossyPages int64
+	// RecheckRejected is the site's nfiltered2; summed into the node like
+	// FilterRejected (instrument.c InstrAggNode).
+	RecheckRejected int64
 	// Leader marks the leader's site (the last slot). PG keeps the
 	// leader's counters in planstate->instrument and prints `Worker N:`
 	// lines only for worker_instrument, so the leader never gets a line
@@ -657,6 +676,7 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 				HeapFetches:         st.heapFetches,
 				ExactPages:          st.exactPages,
 				LossyPages:          st.lossyPages,
+				RecheckRejected:     st.recheckRejected,
 				Leader:              idx == len(tables)-1,
 			})
 		}
@@ -705,6 +725,7 @@ func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStat
 			agg.joinFilterRejected += w.JoinFilterRejected
 			agg.probeFilterRejected += w.ProbeFilterRejected
 			agg.heapFetches += w.HeapFetches
+			agg.recheckRejected += w.RecheckRejected
 			if w.Leader {
 				agg.exactPages += w.ExactPages
 				agg.lossyPages += w.LossyPages
@@ -761,6 +782,9 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	if hb, ok := op.(heapBlocksCounter); ok {
 		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
 	}
+	if rr, ok := op.(recheckRemoveCounter); ok {
+		rr.setRecheckRemoveCounter(&stats.recheckRejected)
+	}
 	if jf, ok := op.(joinFilterRemoveCounter); ok {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
 	}
@@ -810,6 +834,7 @@ func foldPrebuildStats(ctx *Context, table nodeStatsTable) {
 			HeapFetches:         st.heapFetches,
 			ExactPages:          st.exactPages,
 			LossyPages:          st.lossyPages,
+			RecheckRejected:     st.recheckRejected,
 			Leader:              true,
 		})
 	}

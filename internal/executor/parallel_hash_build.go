@@ -1022,7 +1022,7 @@ func foldCoopBuildStats(scope *instrumenter, sites []nodeStatsTable) {
 	}
 	type agg struct {
 		rows, filtered, joinFiltered, probeFiltered, heap int64
-		exactPages, lossyPages                            int64
+		exactPages, lossyPages, recheck                   int64
 		startup, total                                    int64
 		looped                                            bool
 	}
@@ -1044,6 +1044,7 @@ func foldCoopBuildStats(scope *instrumenter, sites []nodeStatsTable) {
 			a.heap += st.heapFetches
 			a.exactPages += st.exactPages
 			a.lossyPages += st.lossyPages
+			a.recheck += st.recheckRejected
 			if st.loops > 0 {
 				if !a.looped || st.startupNs < a.startup {
 					a.startup = st.startupNs
@@ -1064,6 +1065,7 @@ func foldCoopBuildStats(scope *instrumenter, sites []nodeStatsTable) {
 		s.heapFetches += a.heap
 		s.exactPages += a.exactPages
 		s.lossyPages += a.lossyPages
+		s.recheckRejected += a.recheck
 		if a.looped {
 			s.loops++
 			s.startupNs += a.startup

@@ -410,6 +410,9 @@ type bitmapHeapScanOp struct {
 	// (heapBlocksCounter), bumped beside exactPages / lossyPages; nil
 	// outside ANALYZE (M0122-0021).
 	statExact, statLossy *int64
+	// recheckRemoved: the tuples the BitmapQual recheck rejected
+	// (recheckRemoveCounter); nil outside ANALYZE (M0122-0021).
+	recheckRemoved *int64
 
 	// pbm, when non-nil, makes this a PARALLEL bitmap scan: pages are claimed
 	// from a shared atomic allocator instead of iterating locally, so N
@@ -432,6 +435,9 @@ func (o *bitmapHeapScanOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 // setFilterRemoveCounter implements filterRemoveCounter (see indexScanOp's).
 func (o *bitmapHeapScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
+
+// setRecheckRemoveCounter implements recheckRemoveCounter.
+func (o *bitmapHeapScanOp) setRecheckRemoveCounter(p *int64) { o.recheckRemoved = p }
 
 // setHeapBlocksCounters implements heapBlocksCounter.
 func (o *bitmapHeapScanOp) setHeapBlocksCounters(exact, lossy *int64) {
@@ -939,6 +945,9 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 			return nil, read, evalErr
 		}
 		if !passed {
+			if o.recheckRemoved != nil {
+				*o.recheckRemoved++
+			}
 			return nil, read, nil // recheck failed, skip
 		}
 	}
