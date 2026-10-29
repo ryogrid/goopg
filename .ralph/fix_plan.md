@@ -4173,6 +4173,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **hot\_standby = off refuses connections to a standby LANDED 2026\-10\-29 \(`1821d1af2`\)**\. Movement: none —
+    connection admission\. PG canAcceptConnections → CAC\_NOTHOTSTANDBY: FATAL 57P03 "the database system is not
+    accepting connections" / "Hot standby mode is disabled\." for every connection in recovery; goopg never read
+    hot\_standby\.
+    - `Config\.HotStandbyDisabled` \(from hot\_standby at start\); refusal right after handleStartup while IsStandby\(\)\.
+    - Pin: `TestHotStandbyDisabledRefusesConnections` \(mutation\-checked\)\. Gates: units, postmaster, cmd/goopg,
+      replication E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): with hot\_standby on, PG also refuses until consistency / the recovery snapshot is ready;
+      goopg accepts reads at once\.
   - **Restartpoint truncates pg\_subtrans LANDED 2026\-10\-29 \(`8aa917e47`\)**\. Movement: none — standby checkpointer
     path\. CreateRestartPoint's TruncateSUBTRANS \(xlog\.c\); goopg truncated only after a primary checkpoint, so a
     standby's subxact map and pg\_subtrans grew without bound\.

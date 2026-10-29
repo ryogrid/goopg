@@ -739,3 +739,27 @@ is registered but not consumed (ledgered). The hook's horizon is at most datfroz
 transaction still running on the primary, so the truncation is safe on a standby.
 
 Pin: `TestRestartPointTruncatesSubtrans` (adopted arm truncates once, skip arm never; mutation-checked).
+
+### hot\_standby = off refuses connections to a standby \(2026\-10\-29, M0122\-0013, `1821d1af2`\)
+
+`hot_standby` was registered (PGC\_POSTMASTER, default on) but goopg never read it, so a standby always accepted
+connections. PG with `hot_standby = off` accepts none while it is in recovery:
+- `canAcceptConnections` (postmaster.c) returns `CAC_NOTHOTSTANDBY` in `PM_RECOVERY`.
+- backend\_startup.c raises FATAL 57P03 "the database system is not accepting connections", DETAIL "Hot standby mode
+  is disabled.". This happens after the startup packet and before authentication.
+- Replication connections are refused too.
+- Cancel requests still work, because they are handled while reading the startup packet.
+- A promotion (`PM_RUN`) lifts the refusal.
+
+What changed:
+- `postmaster.Config.HotStandbyDisabled` is read from `hot_standby` at start.
+- `Server` refuses right after `handleStartup` whenever `IsStandby()` reports recovery. The new helper
+  `writeFatalDetail` builds the error.
+
+Pin: `TestHotStandbyDisabledRefusesConnections` (mutation-checked). It checks that normal and replication
+connections are refused with PG's fields, that the same server accepts connections after promotion, and that a
+standby with `hot_standby = on` accepts them.
+
+Still different: PG with `hot_standby = on` also refuses connections until recovery reaches consistency or the
+recovery snapshot is ready ("the database system is not yet accepting connections"). goopg's standby accepts reads
+as soon as it starts (ledgered).
