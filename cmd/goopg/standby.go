@@ -563,7 +563,7 @@ func walDirFor(rt *initdb.Runtime) string {
 //  4. Persist newTLI to the flat file and pg_control.
 //  5. Run recovery_end_command.
 //  6. Remove recovery.signal.
-func promoteAfterRecovery(rt *initdb.Runtime, recoveryEndCommand string, logger *slog.Logger) error {
+func promoteAfterRecovery(rt *initdb.Runtime, endOfLog uint64, recoveryEndCommand string, logger *slog.Logger) error {
 	if rt.DataDir == "" {
 		return nil
 	}
@@ -574,11 +574,17 @@ func promoteAfterRecovery(rt *initdb.Runtime, recoveryEndCommand string, logger 
 	newTLI := oldTLI + 1
 	walDir := walDirFor(rt)
 
-	// Use WrittenLSN as the switch point (the archive recovery loop
-	// replayed everything through the WAL writer).
+	// The switch point is PG's EndOfLog: the end of the last record
+	// replayed (xlog.c StartupXLOG → writeTimeLineHistory). Segments the
+	// archive supplied lie past the writer's own end, so their last record
+	// (endOfLog, from RunArchiveRecovery) is the switch point when there is
+	// one; otherwise the local WAL the writer holds ends the log.
 	var endLSN uint64
 	if rt.WAL != nil {
 		endLSN = rt.WAL.WrittenLSN()
+	}
+	if endOfLog > endLSN {
+		endLSN = endOfLog
 	}
 
 	prev, err := xlog.ReadHistory(walDir, oldTLI)

@@ -27,11 +27,17 @@ import (
 //     a. If the segment does not exist locally, fetch it via restore_command.
 //     b. If restore_command fails, the archive is exhausted — exit.
 //     c. Read the segment's records and replay them into mgr.
-//  3. Return nil when the archive is exhausted (the caller then promotes).
+//  3. Return when the archive is exhausted (the caller then promotes).
+//
+// endOfLog is the end of the last record replayed from a restored or
+// beyond-the-local-end segment — PG's EndOfLog, the timeline switch point
+// the promotion writes into the new timeline's history file (xlog.c
+// StartupXLOG → writeTimeLineHistory). 0 when no such record was replayed;
+// the caller then keeps the writer's own end.
 //
 // segmentSize of 0 means "derive from the cluster's own WAL" (via
 // detectSegmentSizeAt / DefaultSegmentSize).
-func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) error {
+func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) (endOfLog uint64, err error) {
 	walDir := filepath.Join(dataDir, "pg_wal")
 
 	// Determine the highest local segment so we know where to resume.
@@ -39,7 +45,7 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 	// locally available; we fetch segments beyond that.
 	highestSeg, err := highestLocalSegment(walDir)
 	if err != nil {
-		return fmt.Errorf("wal: archive recovery: scan local segments: %w", err)
+		return 0, fmt.Errorf("wal: archive recovery: scan local segments: %w", err)
 	}
 
 	if segmentSize <= 0 {
@@ -70,16 +76,16 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 			if err := RestoreArchivedFile(restoreCommand, walDir, segName); err != nil {
 				// Archive exhausted or restore_command not configured.
 				// This is the normal termination condition.
-				return nil
+				return endOfLog, nil
 			}
 		} else if err != nil {
-			return fmt.Errorf("wal: archive recovery: stat %s: %w", localPath, err)
+			return endOfLog, fmt.Errorf("wal: archive recovery: stat %s: %w", localPath, err)
 		}
 
 		// Read and decode records from this segment.
 		records, err := ReadSegmentRecords(walDir, nextSeg, segmentSize)
 		if err != nil {
-			return fmt.Errorf("wal: archive recovery: read segment %s: %w", segName, err)
+			return endOfLog, fmt.Errorf("wal: archive recovery: read segment %s: %w", segName, err)
 		}
 
 		// Replay the records. ReplayRecords is idempotent via pd_lsn, so
@@ -87,7 +93,10 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 		// or a prior iteration) are silently skipped.
 		if len(records) > 0 {
 			if _, err := ReplayRecords(mgr, records); err != nil {
-				return fmt.Errorf("wal: archive recovery: replay segment %s: %w", segName, err)
+				return endOfLog, fmt.Errorf("wal: archive recovery: replay segment %s: %w", segName, err)
+			}
+			if last := records[len(records)-1].EndLSN; last > endOfLog {
+				endOfLog = last
 			}
 		}
 

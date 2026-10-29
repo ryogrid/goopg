@@ -959,7 +959,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if rt != nil && rt.Recovery && !rt.Standby {
 		restoreCmd := stringGUC(registry, "restore_command", "")
 		logger.Info("archive recovery starting", "restore_command", restoreCmd)
-		if err := xlog.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0); err != nil {
+		endOfLog, err := xlog.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0)
+		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
 			return 1
 		}
@@ -967,7 +968,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// Promote: bump TLI, write history, update pg_control,
 		// and remove recovery.signal. Mirrors finalizePromotion
 		// in standby.go but without the standby controller.
-		if err := promoteAfterRecovery(rt, stringGUC(registry, "recovery_end_command", ""), logger); err != nil {
+		if err := promoteAfterRecovery(rt, endOfLog, stringGUC(registry, "recovery_end_command", ""), logger); err != nil {
 			fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
 			return 1
 		}

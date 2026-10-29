@@ -70,7 +70,8 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(make([]byte, 88)); err != nil {
+	_, recEnd, err := w.Append(make([]byte, 88))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -88,8 +89,14 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	if err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize); err != nil {
+	endOfLog, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
+	if err != nil {
 		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	// EndOfLog — the promotion's timeline switch point — is the end of the
+	// last record replayed from the restored segment.
+	if endOfLog != recEnd {
+		t.Errorf("endOfLog = %X, want the archived record's end %X", endOfLog, recEnd)
 	}
 	// Segment 0 came from the archive; segment 1 is absent there, which is
 	// how the loop learns the archive is exhausted.

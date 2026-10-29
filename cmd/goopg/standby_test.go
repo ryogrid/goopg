@@ -489,7 +489,7 @@ func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
 
 	rt, dir := open(t)
 	out := filepath.Join(t.TempDir(), "r.txt")
-	if err := promoteAfterRecovery(rt, "echo %r > '"+out+"'", logger); err != nil {
+	if err := promoteAfterRecovery(rt, 0, "echo %r > '"+out+"'", logger); err != nil {
 		t.Fatalf("promoteAfterRecovery: %v", err)
 	}
 	if got, err := os.ReadFile(out); err != nil || len(strings.TrimSpace(string(got))) != 24 {
@@ -500,7 +500,7 @@ func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
 	}
 
 	rt, dir = open(t)
-	err := promoteAfterRecovery(rt, "kill -9 $$", logger)
+	err := promoteAfterRecovery(rt, 0, "kill -9 $$", logger)
 	if err == nil || !strings.Contains(err.Error(), "recovery_end_command") {
 		t.Fatalf("signal-killed recovery_end_command: err = %v, want a recovery_end_command error", err)
 	}
@@ -540,5 +540,57 @@ func TestValidateRecoveryParameters(t *testing.T) {
 		if warned := strings.Contains(logBuf.String(), `specified neither \"primary_conninfo\" nor \"restore_command\"`); warned != tc.wantWarn {
 			t.Errorf("%s: warned = %v, want %v (log %q)", tc.name, warned, tc.wantWarn, logBuf.String())
 		}
+	}
+}
+
+// TestPromoteAfterRecoveryHistorySwitchPoint pins the timeline switch point
+// archive-recovery promotion writes into the new timeline's history file:
+// PG's EndOfLog, the end of the last replayed record (xlog.c StartupXLOG →
+// writeTimeLineHistory). Segments the archive supplied lie past the running
+// writer's end, so RunArchiveRecovery's endOfLog wins when it is later;
+// with nothing restored (0) the writer's own end stays the switch point.
+// goopg used to record the writer's pre-archive end in both cases.
+func TestPromoteAfterRecoveryHistorySwitchPoint(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		name  string
+		extra uint64 // endOfLog past the writer's end; 0 = nothing restored
+	}{
+		{"records restored from the archive", 3 << 20},
+		{"nothing restored", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+				t.Fatalf("initdb.Init: %v", err)
+			}
+			rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rt.Close()
+			oldTLI, err := initdb.LoadOrCreateTimelineID(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			written := rt.WAL.WrittenLSN()
+			var endOfLog uint64
+			want := written
+			if tc.extra > 0 {
+				endOfLog = written + tc.extra
+				want = endOfLog
+			}
+			if err := promoteAfterRecovery(rt, endOfLog, "", logger); err != nil {
+				t.Fatalf("promoteAfterRecovery: %v", err)
+			}
+			entries, err := xlog.ReadHistory(walDirFor(rt), oldTLI+1)
+			if err != nil || len(entries) == 0 {
+				t.Fatalf("ReadHistory: %v (entries %v)", err, entries)
+			}
+			last := entries[len(entries)-1]
+			if last.TLI != oldTLI || last.SwitchLSN != want {
+				t.Errorf("history entry = TLI %d switch %X, want TLI %d switch %X", last.TLI, last.SwitchLSN, oldTLI, want)
+			}
+		})
 	}
 }
