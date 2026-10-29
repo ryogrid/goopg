@@ -4158,6 +4158,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Checkpoints serialised; immediate requests end spread pacing; RequestCheckpoint LANDED 2026\-10\-29 \(`250baa3d4`\)**\.
+    Movement: none — checkpointer path\. PG's single checkpointer: no overlap, RequestCheckpoint wakes it,
+    ImmediateCheckpointRequested stops a spread checkpoint's throttling\.
+    - `runMu` serialises runCheckpoint \(checkpointOpts: spread / shutdown / timed\); CheckpointNow/Shutdown announce an
+      immediate waiter \(pendingImmediate \+ immediateWake\); `RequestCheckpoint\(\)` is a no\-wait forced spread request
+      served by Run \(false without a loop\)\.
+    - The streaming promotion now requests its checkpoint \(PG CHECKPOINT\_FORCE\); the recovery\.signal end still waits\.
+    - Pins: `TestCheckpointerSerialisesCheckpoints`, `TestCheckpointerImmediateRequestEndsSpreadPacing` \(both
+      mutation\-checked\), `TestCheckpointerRequestCheckpoint`\.
+    - Gates: units, `\-race` xlog, initdb, postmaster, cmd/goopg, replication/promotion/checkpoint E2Es,
+      tpch\-spotcheck, sf025 99/99\.
   - **End\-of\-recovery checkpoint after both promotions LANDED 2026\-10\-29 \(`ac119d315`\)**\. Movement: none —
     recovery path\. PG: promotion → end\-of\-recovery record then RequestCheckpoint\(CHECKPOINT\_FORCE\); archive recovery
     without a promote trigger → END\_OF\_RECOVERY \| IMMEDIATE \| WAIT checkpoint \(xlog\.c\)\. goopg waited for the
