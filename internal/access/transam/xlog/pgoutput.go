@@ -104,6 +104,11 @@ type PgOutput struct {
 	// catalog-only initial scaffolding before publications
 	// existed.
 	filter RelationFilter
+
+	// messages is pgoutput's "messages" option: logical decoding
+	// messages are written only when the subscriber asked for them
+	// (pgoutput_message returns early otherwise).
+	messages bool
 }
 
 // NewPgOutput constructs a plugin that writes pgoutput messages
@@ -180,6 +185,19 @@ func (p *PgOutput) Message(transactional bool, lsn uint64, prefix string, payloa
 	buf = append(buf, payload...)
 	_, err := p.w.Write(buf)
 	return err
+}
+
+// SetMessages sets pgoutput's "messages" option.
+func (p *PgOutput) SetMessages(on bool) { p.messages = on }
+
+// LogicalMessage is pgoutput_message: when the "messages" option is on it
+// writes the MESSAGE frame (logicalrep_write_message); otherwise it drops the
+// message. Implements MessagePlugin.
+func (p *PgOutput) LogicalMessage(_ storage.TransactionID, lsn uint64, transactional bool, prefix string, content []byte) error {
+	if !p.messages {
+		return nil
+	}
+	return p.Message(transactional, lsn, prefix, content)
 }
 
 // Change emits `R` (if not yet sent) followed by `I` or `D`.

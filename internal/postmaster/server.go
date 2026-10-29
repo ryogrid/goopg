@@ -1450,7 +1450,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum, user)
+	// replication=database (exact, as backend_startup.c compares it) makes a
+	// database-bound walsender (am_db_walsender).
+	replDatabase := isReplication && params["replication"] == "database"
+	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, replDatabase, app, params["database"], sessCtx, pid, procNum, user)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1755,7 +1758,7 @@ func (s *Server) cleanupSessionTempObjects(sess *misc.SessionRegistry) {
 	im.DropTempNamespace(owner)
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication, replDatabase bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
 	extended := newExtendedState()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
@@ -1943,7 +1946,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName)
+				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase)
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()

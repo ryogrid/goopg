@@ -172,6 +172,13 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		}
 		return nil
 	}
+	if h.Rmid == RmgrLogicalMessage && h.Info&XLRRmgrInfoMask == xlogLogicalMessage {
+		m, err := DecodeLogicalMessage(r.XLog.MainData)
+		if err != nil {
+			return err
+		}
+		return d.applyLogicalMessage(storage.TransactionID(h.XID), r.EndLSN, m)
+	}
 	if h.Rmid != RmgrHeap {
 		return nil
 	}

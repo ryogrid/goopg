@@ -110,11 +110,24 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 		plugin.SetFilter(buildPublicationFilter(s.cfg.PubSub, pubNames, dbOidVar...))
 	}
 
+	// pgoutput's "messages" option (parse_output_parameters,
+	// defGetBoolean): logical decoding messages reach the subscriber only
+	// when it asked for them.
+	if v, ok := args.Options["messages"]; ok {
+		on, perr := parsePgoutputBool(v)
+		if perr != nil {
+			return s.writeStreamingError(w, errcodes.SyntaxError, perr.Error())
+		}
+		plugin.SetMessages(on)
+	}
+
 	dec, err := xlog.NewSlotDecoderWithSnapshot(s.cfg.Slots, args.SlotName, s.cfg.WAL, walDir, segSize, plugin, xlog.SlotSnapshot{Catalog: snap})
 	if err != nil {
 		return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 	}
 	defer dec.Close()
+	// logicalmsg_decode skips a message emitted from another database.
+	dec.SetDatabase(resolveConnDBOid(im, dbName))
 
 	// Receive-side goroutine: parse standby-status frames so the
 	// slot's confirmed_flush_lsn advances. The decoder's commit
@@ -335,6 +348,18 @@ func walsenderCatalogDBOidVar(im *catalog.InMemory, dbName string) []uint32 {
 // costs three lines and keeps this package independent of postmaster.
 type databaseOidResolver interface {
 	ResolveDatabaseOid(name string) (uint32, bool)
+}
+
+// parsePgoutputBool is defGetBoolean for an output-plugin option value:
+// true/false, on/off, yes/no, 1/0 (case-insensitive).
+func parsePgoutputBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "on", "yes", "1":
+		return true, nil
+	case "false", "off", "no", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("messages requires a Boolean value")
 }
 
 // resolveConnDBOid resolves a connection's database name to its physical

@@ -18335,6 +18335,10 @@ case "pg_char_to_encoding":
 	// M-NIGHTLY AI-20260810-011258-003.
 	case "pg_create_physical_replication_slot":
 		return evalPgCreatePhysicalReplicationSlot(x, slot, ctx)
+	// pg_logical_emit_message(transactional, prefix, message[, flush]) —
+	// LogLogicalMessage. See expr_logicalmsg.go.
+	case "pg_logical_emit_message":
+		return evalPgLogicalEmitMessage(x, slot, ctx)
 	case "pg_drop_replication_slot":
 		return evalPgDropReplicationSlot(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID

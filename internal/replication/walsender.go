@@ -148,7 +148,9 @@ func extractCString(buf []byte) (string, error) {
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string) (bool, error) {
+// dbBound reports a database-bound walsender (replication=database,
+// am_db_walsender); IDENTIFY_SYSTEM then names dbName.
+func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -157,7 +159,7 @@ func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *li
 	upper := strings.ToUpper(trimmed)
 	switch {
 	case upper == "IDENTIFY_SYSTEM":
-		return true, s.replyIdentifySystem(w)
+		return true, s.replyIdentifySystem(w, dbName, dbBound)
 	case strings.HasPrefix(upper, "CREATE_REPLICATION_SLOT "):
 		return true, s.replyCreateReplicationSlot(w, trimmed[len("CREATE_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
@@ -245,7 +247,12 @@ func (s *Handler) replyTimelineHistory(w *libpq.FrameWriter, args string) error 
 //	timeline  : int4   — current timeline from pg_control (M0130-S8)
 //	xlogpos   : text   — current write LSN as `X/X` hex pair
 //	dbname    : text   — empty for physical replication
-func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
+//
+// dbname is the connection's database for a database-bound walsender
+// (IdentifySystem: MyDatabaseId is valid only under replication=database)
+// and NULL for a physical one — pg_recvlogical refuses a logical connection
+// without it, and pg_receivewal / pg_basebackup refuse a physical one with it.
+func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter, dbName string, dbBound bool) error {
 	systemID := s.cfg.SystemID
 	if systemID == "" {
 		// Mirror upstream's 64-bit decimal format. The real value
@@ -270,7 +277,10 @@ func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
 		[]byte(systemID),
 		[]byte(formatTimeline(s.currentTimeline())),
 		[]byte(formatLSN(lsn)),
-		nil, // dbname is NULL for physical replication
+		nil, // dbname: NULL unless database-bound
+	}
+	if dbBound && dbName != "" {
+		row[3] = []byte(dbName)
 	}
 	if err := w.WriteDataRow(row); err != nil {
 		return err

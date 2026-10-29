@@ -48,6 +48,10 @@ type SlotDecoder struct {
 	Snapshot SlotSnapshot
 }
 
+// SetDatabase limits decoded logical messages to the slot's database
+// (Decoder.SetDatabase).
+func (s *SlotDecoder) SetDatabase(dbOid uint32) { s.decoder.SetDatabase(dbOid) }
+
 // NewSlotDecoder wires a logical-slot consumer. `slotName` must
 // already exist in `slots` (created via `Slots.CreateLogical`).
 // The iterator is anchored at the slot's current `RestartLSN`.
