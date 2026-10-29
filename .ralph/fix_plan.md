@@ -1007,6 +1007,20 @@ heuristic stays live.)
     \(xlogarchive\.c\); archive recovery returns the error instead of ending\.
   - Pins: `TestRestoreArchivedFileFailureClassification`, `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`
     \(both fail with the classification off\)\.
+- [x] **P0\-E21 — archive recovery read a base backup's partial local segment and skipped the rest of it**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: local segment 0 cut at the backup end A0, archive
+  copy holding record B to 118 — before: EndOfLog A0, B never replayed; fixed: the archived copy is restored and
+  replayed\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`58b4511c2`\)\.**
+    > It was M0122\-0013's ledgered residual "pg\_wal read before the archive"; the probe showed it loses data\.
+  - Symptom: the local copy won, so recovery replayed the tail segment only to the backup end, then later segments
+    past the gap, and promoted on a history with a hole; Open also wrote a checkpoint record at the local end\.
+  - Fix: XLogFileReadAnyTLI's archive\-first order, RECOVERYXLOG \+ wrong\-size check \+ KeepFileRestoredFromArchive,
+    recovery\.signal treated as archive recovery in Open \(no WAL written before it ends\)\.
+  - Pins: `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment`, `TestRestoreArchivedFileThroughRecoveryXLog`\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4203,6 +4217,17 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Archive before pg\_wal \+ RECOVERYXLOG \+ recovery\.signal as archive recovery LANDED 2026\-10\-29
+    \(`58b4511c2`\)** — fixes P0\-E21 \(S2, recorded above\)\. Movement: none — recovery path\.
+    - `have\(\)` archive\-first; `RestoreArchivedFileContext` → RECOVERYXLOG/RECOVERYHISTORY, wrong\-size FATAL,
+      rename over the local copy; Open: DB\_IN\_ARCHIVE\_RECOVERY \+ recovery\-mode checkpoints for recovery\.signal;
+      promotion leaves recovery mode; wal\_init\_zero = off segments full\-size\.
+    - Pins: `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment`, `TestRestoreArchivedFileThroughRecoveryXLog`
+      \(mutation\-checked; the first mutation run exposed an EndOfLog\-only assertion that could not see the gap\)\.
+    - Gates: units, postmaster, `\-race` xlog, replication/recovery/crash\-start/resetwal/waldump ports,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): writer descriptor on the replaced tail segment; no restartpoints in start\-time archive
+      recovery; restored history files kept\.
   - **Shutdown during archive recovery \+ FATAL restore failures LANDED 2026\-10\-29 \(`7d2f398fa`\)** — fixes P0\-E20
     \(S2, recorded above\)\. Movement: none — recovery path\. PG's startup process exits on a fast shutdown
     \(StartupProcShutdownHandler / ProcessStartupProcInterrupts\) and RestoreArchivedFile is FATAL on a signal or an

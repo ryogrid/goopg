@@ -278,3 +278,45 @@ startup.c).**
 - pg\_control shows `DB_IN_PRODUCTION`, not `DB_IN_ARCHIVE_RECOVERY`, during recovery.signal recovery.
 - There is no `RECOVERYXLOG` temporary name and no wrong-size check on a restored file.
 - pg\_wal is read before the archive.
+
+## Update 2026-10-29 — archive before pg\_wal, RECOVERYXLOG, recovery.signal is archive recovery (M0122-0013, `58b4511c2`; P0-E21)
+
+**The defect (P0-E21, S2 — data loss).** A base backup's last local segment holds WAL only up to the backup end; the
+archive's copy of the same segment also holds what the primary wrote afterwards. goopg read the local copy first.
+- It replayed that segment only up to the backup end, then went on to the next segments from the archive. Everything
+  in between was skipped.
+- `EndOfLog` still landed at the true end, so nothing looked wrong. The promotion then built the new timeline on a
+  history with a hole in it.
+- Opening the data directory also wrote an end-of-crash-recovery checkpoint record at the local end. That spot is where
+  the archived copy holds the primary's WAL.
+
+**The port.**
+- `have()` follows `XLogFileReadAnyTLI`: XLOG\_FROM\_ARCHIVE is tried before XLOG\_FROM\_PG\_WAL. The local copy is used
+  only when the archive lacks the file, because it "could be an old, un-filled or partly-filled version".
+- `RestoreArchivedFileContext` follows `RestoreArchivedFile` and `KeepFileRestoredFromArchive`:
+  - the command restores into `RECOVERYXLOG` (`RECOVERYHISTORY` for history files), after removing any leftover file of
+    that name, so a failed restore never touches the local copy;
+  - a segment of the wrong size is FATAL ("archive file … has wrong size");
+  - the restored file is renamed over the pg\_wal copy and the directory is synced;
+  - both temporary names are removed when recovery ends (`FinishWalRecovery`).
+- `initdb.Open` treats recovery.signal as archive recovery (`ArchiveRecoveryRequested`):
+  - pg\_control is `DB_IN_ARCHIVE_RECOVERY` from the start;
+  - the checkpointer runs in recovery mode, so the end-of-crash-recovery checkpoint becomes a restartpoint flush and no
+    WAL record is written before recovery ends.
+- `promoteAfterRecovery` leaves recovery mode before its end-of-recovery checkpoint, then stamps `DB_IN_PRODUCTION`.
+- With `wal_init_zero = off`, a new segment is still made full-size, as `XLogFileInitInternal` writes its last byte.
+  goopg used to leave the file short, which the size check and external tools reject.
+
+**Pins:**
+- `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment` covers the base-backup shape. After recovery, pg\_wal's
+  tail segment is the archived copy and replays past the backup end. pg\_control goes from `DB_IN_ARCHIVE_RECOVERY` to
+  `DB_IN_PRODUCTION`, and a restart lands on the new timeline. The test fails with pg\_wal preferred, and fails with
+  Open's recovery mode off.
+- `TestRestoreArchivedFileThroughRecoveryXLog` checks that a failed restore leaves the local copy alone, that a short
+  restore is FATAL, and that a good restore replaces the local copy. It fails with the size check off.
+
+**Still open (ledgered):**
+- The writer keeps a descriptor for a tail segment that the restored copy replaces. This is correct only because the
+  bytes are identical.
+- Start-time archive recovery takes no restartpoints.
+- Restored history files are kept in pg\_wal.
