@@ -422,3 +422,24 @@ dump, and `postmaster.pid` left behind.
   command".
 - The immediate path still waits for session goroutines.
 - Crash replay is not interruptible.
+
+## Update 2026-10-30 — crash replay stops on a shutdown request (M0122-0013, `6c78ab6c4`)
+
+`initdb.Open`'s crash replay could not be stopped, so a SIGTERM, SIGINT or SIGQUIT during crash recovery waited for the
+whole replay. PG's startup process checks for interrupts before every record (`ProcessStartupProcInterrupts`) and
+exits on a shutdown request.
+
+- `xlog.ReplayFromDirWithMgrAtInterruptible` asks `interrupted` before every record. Once it reports true, replay
+  returns an error wrapping `ErrRecoveryShutdown`. The old entry points pass nil.
+- `initdb.OpenOptions.Interrupted` is passed through to crash replay.
+- `goopg start` passes `ctx.Err() != nil`: SIGTERM and SIGINT cancel the context, and SIGQUIT does too through
+  `immediateShutdown`. `endInterruptedCrashRecovery` then ends the start:
+  - a fast shutdown stamps `DB_SHUTDOWNED_IN_RECOVERY` (the shutdown restartpoint's skip arm);
+  - an immediate shutdown writes nothing, so `DB_IN_CRASH_RECOVERY` stays;
+  - both exit 0.
+- Nothing is written to WAL, because replay runs before the WAL writer opens. The next start replays from the same
+  redo point.
+
+**Pins:** `TestOpenCrashReplayIsInterruptible` (fails with the check removed) and `TestEndInterruptedCrashRecovery`.
+
+**Still open (ledgered):** Open's post-replay phases still run to completion once replay has finished.

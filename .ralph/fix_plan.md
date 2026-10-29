@@ -4244,6 +4244,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Crash replay stops on a shutdown request LANDED 2026\-10\-30 \(`6c78ab6c4`\)**\. Movement: none — crash recovery\.
+    ProcessStartupProcInterrupts per record; goopg's crash replay could not be stopped\.
+    - `ReplayFromDirWithMgrAtInterruptible`, `OpenOptions\.Interrupted`, `endInterruptedCrashRecovery` \(fast →
+      DB\_SHUTDOWNED\_IN\_RECOVERY, immediate → untouched\)\.
+    - Pins: `TestOpenCrashReplayIsInterruptible` \(mutation\-checked\), `TestEndInterruptedCrashRecovery`\. Gates: units,
+      recovery/crash/durability E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): Open's post\-replay phases not interruptible\.
   - **SIGQUIT is the immediate shutdown LANDED 2026\-10\-30 \(`108e7a630`\)**\. Movement: none — signal handling\.
     pmdie SIGQUIT; goopg hit Go's default \(goroutine dump, exit 2, postmaster\.pid left\)\.
     - `immediateShutdown` \(cmd/goopg, whole of goopg start\), `Server\.StopImmediate` \(shared with STOPIMMEDIATE\);
