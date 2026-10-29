@@ -56,7 +56,13 @@ func TimelineHistoryFileName(tli uint32) string {
 // an error, and this matches that contract for any TLI whose history
 // hasn't been written yet.
 func ReadHistory(walDir string, tli uint32) ([]TimelineHistoryEntry, error) {
-	path := filepath.Join(walDir, TimelineHistoryFileName(tli))
+	return ReadHistoryFile(filepath.Join(walDir, TimelineHistoryFileName(tli)))
+}
+
+// ReadHistoryFile is ReadHistory for a history file at path — archive
+// recovery reads a restored history through RECOVERYHISTORY
+// (readTimeLineHistory). A missing file returns (nil, nil).
+func ReadHistoryFile(path string) ([]TimelineHistoryEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

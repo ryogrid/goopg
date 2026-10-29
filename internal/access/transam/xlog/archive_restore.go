@@ -83,6 +83,19 @@ func RestoreArchivedFile(restoreCommand, walDir, segmentName string) error {
 //   - otherwise (the archive does not have the file): a plain error — the
 //     caller falls back to pg_wal, or this is the normal end of recovery.
 func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, xlogfname, recoverName string, expectedSize int64, lastRestartPointFname string) error {
+	return restoreArchivedFile(ctx, restoreCommand, walDir, xlogfname, recoverName, expectedSize, lastRestartPointFname, true)
+}
+
+// RestoreArchivedFileTemp is RestoreArchivedFile without
+// KeepFileRestoredFromArchive: the restored file stays at walDir/recoverName
+// for the caller to read, and the pg_wal copy is not replaced —
+// readTimeLineHistory / existsTimeLineHistory read a restored history file
+// this way and do not keep it.
+func RestoreArchivedFileTemp(ctx context.Context, restoreCommand, walDir, xlogfname, recoverName string, lastRestartPointFname string) error {
+	return restoreArchivedFile(ctx, restoreCommand, walDir, xlogfname, recoverName, 0, lastRestartPointFname, false)
+}
+
+func restoreArchivedFile(ctx context.Context, restoreCommand, walDir, xlogfname, recoverName string, expectedSize int64, lastRestartPointFname string, keep bool) error {
 	if restoreCommand == "" {
 		return fmt.Errorf("wal: restore_command is not configured")
 	}
@@ -126,6 +139,9 @@ func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, xlo
 		}
 		if expectedSize > 0 && st.Size() != expectedSize {
 			return &RestoreFatalError{Msg: fmt.Sprintf("archive file \"%s\" has wrong size: %d instead of %d", xlogfname, st.Size(), expectedSize)}
+		}
+		if !keep {
+			return nil
 		}
 		if err := keepFileRestoredFromArchive(walDir, recoverPath, xlogfname); err != nil {
 			return &RestoreFatalError{Msg: err.Error()}

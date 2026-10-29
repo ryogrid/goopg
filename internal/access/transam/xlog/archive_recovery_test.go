@@ -258,8 +258,17 @@ func TestRunArchiveRecoveryFollowsTimelineHistory(t *testing.T) {
 	if len(res.Timelines) != 2 || res.Timelines[1] != (TimelineSpan{TLI: 2, Begin: switchLSN}) {
 		t.Errorf("expected timelines = %+v, want [{1 0} {2 %X}]", res.Timelines, switchLSN)
 	}
-	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(2))); err != nil {
-		t.Errorf("timeline 2's history file not restored: %v", err)
+	// readTimeLineHistory reads the target's history through RECOVERYHISTORY
+	// and does not keep it: restoreTimeLineHistoryFiles keeps only
+	// [checkpoint TLI, target). The entries are reported for the promotion.
+	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(2))); !os.IsNotExist(err) {
+		t.Errorf("the target timeline's history file was kept in pg_wal (err %v)", err)
+	}
+	if len(res.TargetHistory) != 1 || res.TargetHistory[0] != (TimelineHistoryEntry{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}) {
+		t.Errorf("TargetHistory = %+v, want timeline 2's file verbatim", res.TargetHistory)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, RecoveryHistoryName)); !os.IsNotExist(err) {
+		t.Errorf("RECOVERYHISTORY left in pg_wal (err %v)", err)
 	}
 	// Segment 1 holds the switch: timeline 2's copy is the one to read.
 	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 2))); err != nil {
@@ -352,5 +361,73 @@ func TestRunArchiveRecoveryTargetTimeline(t *testing.T) {
 		if want := fmt.Sprintf("recovery target timeline %d does not exist", tli); !errors.As(err, &fatal) || fatal.Msg != want {
 			t.Errorf("target %d: err = %v, want FATAL %q", tli, err, want)
 		}
+	}
+}
+
+// TestRunArchiveRecoveryKeepsIntermediateHistoryFiles pins
+// restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI): with the
+// archive at timeline 3 (1 -> 2 -> 3) and recovery starting on timeline 1,
+// timeline 2's history file is copied into pg_wal and timeline 3's — the
+// target's, read through RECOVERYHISTORY — is not.
+func TestRunArchiveRecoveryKeepsIntermediateHistoryFiles(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	var switches []uint64
+	for tli := uint32(2); tli <= 3; tli++ {
+		for w.WrittenLSN() < uint64(tli-1)*uint64(segSize)+uint64(segSize)/2 {
+			if _, _, err := w.Append(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sw := w.WrittenLSN()
+		_, prev := w.InsertPosition()
+		if err := w.SwitchTimeline(tli, sw, prev); err != nil {
+			t.Fatal(err)
+		}
+		switches = append(switches, sw)
+	}
+	for w.WrittenLSN() < 2*uint64(segSize)+uint64(segSize)*3/4 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h2 := []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switches[0], Reason: "first"}}
+	h3 := append(append([]TimelineHistoryEntry(nil), h2...), TimelineHistoryEntry{TLI: 2, SwitchLSN: switches[1], Reason: "second"})
+	if err := WriteHistory(archive, 2, h2); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 3, h3); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecovery(mgr, dataDir, "cp "+filepath.Join(archive, "%f")+" %p", segSize)
+	if err != nil {
+		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	if res.TargetTLI != 3 || res.EndTLI != 3 || len(res.TargetHistory) != 2 || res.TargetHistory[1].Reason != "second" {
+		t.Fatalf("target %d, end %d, history %+v; want timeline 3 with its two-line history", res.TargetTLI, res.EndTLI, res.TargetHistory)
+	}
+	if got, err := ReadHistory(walDir, 2); err != nil || len(got) != 1 || got[0] != h2[0] {
+		t.Errorf("timeline 2's history in pg_wal = %+v, %v; want it kept (restoreTimeLineHistoryFiles)", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(3))); !os.IsNotExist(err) {
+		t.Errorf("the target timeline 3's history file was kept in pg_wal (err %v)", err)
 	}
 }

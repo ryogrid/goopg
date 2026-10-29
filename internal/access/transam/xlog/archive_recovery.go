@@ -53,6 +53,11 @@ type ArchiveRecoveryResult struct {
 	// TargetTLI is the recovery target timeline (recoveryTargetTLI): the
 	// timeline whose history recovery follows.
 	TargetTLI uint32
+	// TargetHistory is TargetTLI's history file as read (nil for timeline 1
+	// or when it has none). The history file is read through RECOVERYHISTORY
+	// and not kept in pg_wal, so the promotion builds the new timeline's
+	// history from these entries.
+	TargetHistory []TimelineHistoryEntry
 	// Timelines is the expected history, oldest first (expectedTLEs).
 	Timelines []TimelineSpan
 }
@@ -169,12 +174,37 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		_ = os.Remove(filepath.Join(walDir, RecoveryXLogName))
 		_ = os.Remove(filepath.Join(walDir, RecoveryHistoryName))
 	}()
+	// historyPath finds tli's history file the way readTimeLineHistory and
+	// existsTimeLineHistory do in archive recovery: restored from the
+	// archive into RECOVERYHISTORY (not kept in pg_wal), else the pg_wal
+	// copy. ok is false when neither has it.
+	historyPath := func(tli uint32) (string, bool, error) {
+		if ctx.Err() != nil {
+			return "", false, ErrRecoveryShutdown
+		}
+		name := TimelineHistoryFileName(tli)
+		if cmd := restoreCommand(); cmd != "" {
+			err := RestoreArchivedFileTemp(ctx, cmd, walDir, name, RecoveryHistoryName, lastRestartPointFname)
+			if err == nil {
+				return filepath.Join(walDir, RecoveryHistoryName), true, nil
+			}
+			var fatal *RestoreFatalError
+			if errors.Is(err, ErrRecoveryShutdown) || errors.As(err, &fatal) {
+				return "", false, err
+			}
+		}
+		local := filepath.Join(walDir, name)
+		if _, err := os.Stat(local); err == nil {
+			return local, true, nil
+		}
+		return "", false, nil
+	}
 	// findNewestTimeLine: the newest timeline whose history file exists,
 	// probing upward from start.
 	findNewest := func(start uint32) (uint32, error) {
 		newest := start
 		for probe := start + 1; ; probe++ {
-			ok, err := have(TimelineHistoryFileName(probe), RecoveryHistoryName, 0)
+			_, ok, err := historyPath(probe)
 			if err != nil {
 				return 0, err
 			}
@@ -190,7 +220,7 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	case TargetTimelineNumeric:
 		// Timeline 1 does not have a history file, all else should.
 		if target.TLI != 1 {
-			ok, err := have(TimelineHistoryFileName(target.TLI), RecoveryHistoryName, 0)
+			_, ok, err := historyPath(target.TLI)
 			if err != nil {
 				return res, fmt.Errorf("wal: archive recovery: %w", err)
 			}
@@ -217,21 +247,30 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		}
 		res.NewestTLI = newest
 	}
+	// expectedTLEs = readTimeLineHistory(recoveryTargetTLI), read through
+	// RECOVERYHISTORY; the entries are kept verbatim for the promotion's
+	// writeTimeLineHistory, which copies the parent's history the same way.
+	// The start timeline must be on it (InitWalRecovery's "not a child"
+	// FATAL).
 	res.Timelines = []TimelineSpan{{TLI: startTLI}}
-	if targetTLI != startTLI {
-		// expectedTLEs = readTimeLineHistory(recoveryTargetTLI); the start
-		// timeline must be on it (InitWalRecovery's "not a child" FATAL).
+	if targetTLI != 1 {
+		path, ok, err := historyPath(targetTLI)
+		if err != nil {
+			return res, fmt.Errorf("wal: archive recovery: %w", err)
+		}
 		var entries []TimelineHistoryEntry
-		if targetTLI != 1 {
-			var err error
-			if entries, err = ReadHistory(walDir, targetTLI); err != nil {
+		if ok {
+			if entries, err = ReadHistoryFile(path); err != nil {
 				return res, fmt.Errorf("wal: archive recovery: %w", err)
 			}
 		}
+		res.TargetHistory = entries
+	}
+	if targetTLI != startTLI {
 		res.Timelines = res.Timelines[:0]
 		var begin uint64
 		onHistory := false
-		for _, e := range entries {
+		for _, e := range res.TargetHistory {
 			res.Timelines = append(res.Timelines, TimelineSpan{TLI: e.TLI, Begin: begin})
 			begin = e.SwitchLSN
 			onHistory = onHistory || e.TLI == startTLI
@@ -239,6 +278,20 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		res.Timelines = append(res.Timelines, TimelineSpan{TLI: targetTLI, Begin: begin})
 		if !onHistory {
 			return res, &RestoreFatalError{Msg: fmt.Sprintf("requested timeline %d is not a child of this server's history", targetTLI)}
+		}
+	}
+	// restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI)
+	// (StartupXLOG): the history files of the timelines between the start
+	// and the target — not the target's own — are copied into pg_wal for a
+	// cascading standby or a later archive.
+	for tli := startTLI; tli < targetTLI; tli++ {
+		if tli == 1 {
+			continue
+		}
+		err := RestoreArchivedFileContext(ctx, restoreCommand(), walDir, TimelineHistoryFileName(tli), RecoveryHistoryName, 0, lastRestartPointFname)
+		var fatal *RestoreFatalError
+		if errors.Is(err, ErrRecoveryShutdown) || errors.As(err, &fatal) {
+			return res, fmt.Errorf("wal: archive recovery: %w", err)
 		}
 	}
 

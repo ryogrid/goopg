@@ -791,11 +791,18 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 		endLSN, prevRecPtr = rec.EndOfLog, rec.LastStart-1
 	}
 
-	prev, err := xlog.ReadHistory(walDir, oldTLI)
-	if err != nil {
-		return fmt.Errorf("promote after recovery: read prior history: %w", err)
+	// writeTimeLineHistory copies the parent's history: archive recovery
+	// read the target timeline's history through RECOVERYHISTORY without
+	// keeping it in pg_wal, so the parent's entries come from there when the
+	// parent is the target; otherwise from the pg_wal copy.
+	prev := rec.TargetHistory
+	if oldTLI != rec.TargetTLI || rec.TargetTLI == 0 {
+		var err error
+		if prev, err = xlog.ReadHistory(walDir, oldTLI); err != nil {
+			return fmt.Errorf("promote after recovery: read prior history: %w", err)
+		}
 	}
-	entries := append(prev, xlog.TimelineHistoryEntry{
+	entries := append(append([]xlog.TimelineHistoryEntry(nil), prev...), xlog.TimelineHistoryEntry{
 		TLI:       oldTLI,
 		SwitchLSN: endLSN,
 		Reason:    "archive recovery complete",
