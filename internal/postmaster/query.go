@@ -789,6 +789,11 @@ func (s *Server) respondSelectOne(w *libpq.FrameWriter) error {
 // client received a clean error response and is ready for the next query).
 var errQueryErrorSent = errors.New("server: error response sent to client")
 
+// errQuickdieSent reports that an immediate shutdown ended the statement:
+// quickdie's notice was sent instead of the statement's error, and the
+// connection must close (the backend exits).
+var errQuickdieSent = errors.New("server: immediate shutdown notice sent to client")
+
 // writeQueryError emits an ErrorResponse with the given SQLSTATE plus a
 // trailing ReadyForQuery, matching how upstream finishes a failed simple
 // Query (the parse error is reported and the connection stays open).
@@ -798,6 +803,12 @@ var errQueryErrorSent = errors.New("server: error response sent to client")
 // multi-statement loop can detect the error-and-stop condition without
 // sending a duplicate ReadyForQuery (M0097-0003 normalization fix).
 func (s *Server) writeQueryError(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error {
+	// An immediate stop interrupted the statement: quickdie reports only
+	// its own notice, never the statement's (cancellation) error.
+	if s.immediateStopping.Load() {
+		s.writeQuickdie(w)
+		return errQuickdieSent
+	}
 	fields := []libpq.ErrorField{
 		{Code: libpq.FieldSeverity, Value: "ERROR"},
 		{Code: libpq.FieldSeverityNonLocal, Value: "ERROR"},

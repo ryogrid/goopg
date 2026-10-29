@@ -380,6 +380,10 @@ type Server struct {
 	// runCancel cancels Run's context; StopImmediate uses it. Set once Run
 	// has created the context.
 	runCancel atomic.Pointer[context.CancelFunc]
+	// immediateStopping is set by StopImmediate before it cancels Run's
+	// context: sessions then end the way quickdie does (PMQUIT_FOR_STOP),
+	// not with the fast-shutdown FATAL.
+	immediateStopping atomic.Bool
 
 	cancelReg *backendCancelRegistry
 
@@ -848,9 +852,25 @@ func (s *Server) StopImmediate(reason string) {
 		}
 	}
 	s.shutdownDeadline = 0
+	s.immediateStopping.Store(true)
 	if cancel := s.runCancel.Load(); cancel != nil {
 		(*cancel)()
 	}
+}
+
+// writeQuickdie is quickdie's message for an immediate-mode stop
+// (postgres.c, PMQUIT_FOR_STOP): a WARNING_CLIENT_ONLY notice — not an
+// ErrorResponse — with SQLSTATE 57P01, after which the backend exits and the
+// connection simply closes. The statement in progress gets no error of its
+// own.
+func (s *Server) writeQuickdie(w *libpq.FrameWriter) {
+	_ = w.WriteNoticeResponse([]libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "WARNING"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+		{Code: libpq.FieldSQLState, Value: string(errcodes.AdminShutdown)},
+		{Code: libpq.FieldMessage, Value: "terminating connection due to immediate shutdown command"},
+	})
+	_ = w.Flush()
 }
 
 // reloadConfig re-parses cfg.ConfigPath (if set) and re-applies its
@@ -1803,7 +1823,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	var copyIn *copyInState
 	for {
 		if ctx.Err() != nil {
-			s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+			if s.immediateStopping.Load() {
+				s.writeQuickdie(w)
+			} else {
+				s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+			}
 			return
 		}
 		f, err := r.ReadFrame()
@@ -1825,6 +1849,19 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				logger.Info("connection read error", "err", err)
+			}
+			// The read was cut short by a shutdown (the connCtx watcher's
+			// deadline wakes an idle session): the backend still reports
+			// why it is going away before the socket closes — quickdie's
+			// notice for an immediate stop, die()'s FATAL 57P01 for a fast
+			// one — as PG's idle backend does on SIGQUIT / SIGTERM.
+			if ctx.Err() != nil {
+				_ = raw.SetWriteDeadline(time.Now().Add(time.Second))
+				if s.immediateStopping.Load() {
+					s.writeQuickdie(w)
+				} else {
+					s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+				}
 			}
 			return
 		}
@@ -1926,6 +1963,12 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 					break
 				}
 				logger.Info("query write error", "err", err)
+				// A statement an immediate stop cut short without reaching
+				// writeQueryError still gets quickdie's notice before the
+				// connection closes.
+				if s.immediateStopping.Load() && !errors.Is(err, errQuickdieSent) {
+					s.writeQuickdie(w)
+				}
 				return
 			}
 			copyIn = nextCopyIn

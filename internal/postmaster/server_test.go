@@ -565,3 +565,115 @@ func TestHotStandbyNotConsistentRefusesConnections(t *testing.T) {
 		t.Errorf("promoted server answered %c, want AuthenticationOk", f.Type)
 	}
 }
+
+// TestStopImmediateSendsQuickdieNotice pins quickdie's PMQUIT_FOR_STOP
+// message: on an immediate stop a session gets a WARNING notice — not an
+// ErrorResponse — with SQLSTATE 57P01 "terminating connection due to
+// immediate shutdown command", and the connection closes. goopg sent the
+// fast-shutdown FATAL "terminating connection due to administrator
+// command".
+// TestFastStopSendsAdminShutdownFatal: a fast stop (the run context's
+// cancel, pmdie SIGTERM) wakes an idle session, which reports die()'s
+// FATAL 57P01 "terminating connection due to administrator command"
+// before closing, as PG's idle backend does.
+func TestFastStopSendsAdminShutdownFatal(t *testing.T) {
+	srv := New(Config{
+		Address:          "127.0.0.1:0",
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AcceptDeadline:   25 * time.Millisecond,
+		HandshakeTimeout: 2 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	<-srv.Ready()
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	writeStartupPacket(t, conn, map[string]string{"user": "alice", "database": "postgres"})
+	r := libpq.NewFrameReader(conn)
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("startup: %v", err)
+		}
+		if f.Type == libpq.MsgReadyForQuery {
+			break
+		}
+	}
+	cancel()
+	f, err := r.ReadFrame()
+	if err != nil {
+		t.Fatalf("read after the fast stop: %v", err)
+	}
+	if f.Type != libpq.MsgErrorResponse {
+		t.Fatalf("got message %c, want an ErrorResponse", f.Type)
+	}
+	got := parseErrorFields(t, f.Payload)
+	if got['S'] != "FATAL" || got['C'] != "57P01" || got['M'] != "terminating connection due to administrator command" {
+		t.Errorf("error fields = %v, want die()'s FATAL 57P01", got)
+	}
+	if _, err := r.ReadFrame(); err == nil {
+		t.Error("connection still open after the FATAL")
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the fast stop")
+	}
+}
+
+func TestStopImmediateSendsQuickdieNotice(t *testing.T) {
+	srv := New(Config{
+		Address:          "127.0.0.1:0",
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AcceptDeadline:   25 * time.Millisecond,
+		HandshakeTimeout: 2 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	<-srv.Ready()
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	writeStartupPacket(t, conn, map[string]string{"user": "alice", "database": "postgres"})
+	r := libpq.NewFrameReader(conn)
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("startup: %v", err)
+		}
+		if f.Type == libpq.MsgReadyForQuery {
+			break
+		}
+	}
+	srv.StopImmediate("test: immediate stop")
+	f, err := r.ReadFrame()
+	if err != nil {
+		t.Fatalf("read after the immediate stop: %v", err)
+	}
+	if f.Type != libpq.MsgNoticeResponse {
+		t.Fatalf("got message %c, want a NoticeResponse", f.Type)
+	}
+	got := parseErrorFields(t, f.Payload)
+	if got['S'] != "WARNING" || got['C'] != "57P01" || got['M'] != "terminating connection due to immediate shutdown command" {
+		t.Errorf("notice fields = %v, want quickdie's WARNING 57P01", got)
+	}
+	if _, err := r.ReadFrame(); err == nil {
+		t.Error("connection still open after the quickdie notice")
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after StopImmediate")
+	}
+}
