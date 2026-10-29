@@ -1,8 +1,8 @@
 # M0122-0021 — EXPLAIN ANALYZE: nodes below a Gather report their own actuals
 
-Status: slice 1 landed 2026-10-29 (`881b3e314`), slice 2 (NLI inner / Memoize, `28a5ff4c9`), slice 3 (CTE bodies,
-SubPlans/InitPlans, cooperative build inputs, `(never executed)`, `132bf92d2`). The task stays open for the
-shared-hash-build input (slice 4) and the residuals listed under "Remaining".
+Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
+(CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
+lazy subtrees). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -146,3 +146,41 @@ serially as well as in parallel plans.
   - goopg's correlated-SubPlan value cache skips executions PG performs, so loops can come out lower than PG's;
   - SubPlans inside parallel workers and the other expression-level subqueries built with `Build()` (ARRAY(),
     row IN, multi-assignment SET, the correlated hash map) stay uninstrumented.
+
+## Slice 4 — the Gather's shared hash prebuild, worker lazy subtrees
+
+- `prebuildSharedHashJoins` builds each shareable hash join's table **once**, in the leader, from a throwaway tree.
+  The participants adopt the table and never open their own build child, so before this slice the build input had no
+  record anywhere (TPC-DS Q72's `household_demographics` Hash).
+  - Fix: the function now takes the caller's scope. Under ANALYZE, Gather and Gather Merge pass a fresh table
+    (`prebuildScope`) and fold it at Close as a leader-flagged site (`foldPrebuildStats`). The input therefore
+    reports `loops=1` with every row.
+  - The cooperative build's own nested prebuild folds into the statement scope instead.
+- **Execution difference (recorded, not imitated):** PG with `parallel_hash` off has every participant build its own
+  copy, so it prints `Hash (actual rows=1200.00 loops=4)`. goopg builds once and shares, so it prints `loops=1`.
+  Reporting PG's count would describe work goopg did not do.
+- `buildChildForSlot` gives each worker Context its site instrumenter as `explainScope`. Worker SubPlans and
+  cooperative builds then file into that worker's table, which only its goroutine writes, and fold the same way slice 1
+  folds other site entries.
+- `aggregateWorkerInstrumentation` now **adds** site sums to an existing statement-scope entry instead of replacing
+  it. Since slice 3, lazily built leader-side work (SubPlans, cooperative builds) lands in the statement scope, while
+  the eager site trees still file only into site tables, so nothing is counted twice.
+- Q72 (SF0.25): node lines with actuals went from 24 to 26 (PG: 26). Capture:
+  `analysis/m0122/m0122-0021/q72-goopg-slice4.explain`.
+- Test: `TestExplainAnalyzeSharedPrebuildInputActuals`, mutation-checked. It switches off only the runtime cooperative
+  build, because the cooperative path (slice 3) otherwise masks the plain prebuild.
+- `-race` on the parallel/coop/explain tests is clean. Gates PASS. Census `routing-20261029d`: 22/22, 99/99, 99/99.
+
+## Remaining residuals (each ledgered 2026-10-29)
+
+1. The SubPlan/InitPlan header carries goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)` annotation, which PG
+   does not print.
+2. Expression-level subqueries built with `Build()` print no actuals: ARRAY(), row-constructor IN, multi-assignment
+   SET, and the correlated hash map.
+3. Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
+   `Worker N:  Hits:` line per worker.
+4. The NLI probe's own `Cond` filter has no rejection counter, so it prints no `Rows Removed by Filter`.
+5. Buffers/WAL/memory are not aggregated across sites, because their counters are pool-global.
+6. goopg's correlated-SubPlan value cache lowers loops relative to PG. This is an execution difference.
+7. A shared or cooperative build reports one loop where PG reports one per participant. This is an execution
+   difference.
