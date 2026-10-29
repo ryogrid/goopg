@@ -142,3 +142,32 @@ shared by both promotions. Before it switches, `promoteAfterRecovery` brings the
 `adoptRestoredWAL`, feeding the segments `restore_command` supplied through `Writer.AppendRaw`. Before this change
 the writer resumed at its pre-archive end and overwrote restored, already-replayed WAL (S2). Details are in
 `0130-0009-recovery-signal-archive-recovery.md`.
+
+## Update 2026-10-29 — end-of-recovery checkpoint (M0122-0013)
+
+PG ends recovery with a checkpoint (xlog.c):
+- **Promotion:** `CreateEndOfRecoveryRecord`, then `StartupXLOG` requests an online checkpoint
+  (`RequestCheckpoint(CHECKPOINT_FORCE)`).
+- **Archive recovery ending without a promote trigger:** `PerformRecoveryXLogAction` waits for
+  `CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT`.
+
+goopg's promotions used to wait for the checkpoint schedule. Until then pg\_control kept the last restartpoint on the
+old timeline.
+
+`promotionCheckpoint` (cmd/goopg/standby.go) now runs `CheckpointNow`:
+- **Streaming promotion:** as its last step, after the `DB_IN_PRODUCTION` stamp.
+- **recovery.signal promotion:** right after the timeline switch and before `recovery_end_command`, in PG's order.
+
+Details:
+- It is synchronous in both cases. PG's promoted request does not wait, but goopg's checkpointer has no request queue
+  and does not serialise concurrent runs.
+- A failure is a WARNING, as with the crash-recovery `endOfRecoveryCheckpoint`.
+- It is skipped if the writer is still on the old timeline, because the checkpointer stamps the writer's TLI.
+
+Pins: `TestStandbyControllerPromoteTakesCheckpoint`, and `TestPromoteAfterRecoveryAdoptsRestoredWAL` (checkpoint copy on
+the new TLI, redo past EndOfLog). Both fail without the checkpoint.
+
+Still different (ledgered):
+- The recovery.signal path marks the timeline change with `XLOG_END_OF_RECOVERY`, where PG writes an end-of-recovery
+  shutdown checkpoint. Both are valid timeline-changing records.
+- The promoted checkpoint is waited for.
