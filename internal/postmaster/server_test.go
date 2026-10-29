@@ -502,3 +502,66 @@ func TestHotStandbyDisabledRefusesConnections(t *testing.T) {
 		t.Errorf("standby with hot_standby = on answered %c, want AuthenticationOk", f.Type)
 	}
 }
+
+// TestHotStandbyNotConsistentRefusesConnections pins the hot_standby = on
+// gate: until replay reaches a consistent recovery state the postmaster is
+// in PM_RECOVERY, and canAcceptConnections refuses every connection —
+// normal or replication — with FATAL 57P03 "the database system is not yet
+// accepting connections" / "Consistent recovery state has not been yet
+// reached."; once consistent (PM_HOT_STANDBY) they are accepted. goopg's
+// standby accepted reads before replay was consistent.
+func TestHotStandbyNotConsistentRefusesConnections(t *testing.T) {
+	var standby, consistent atomic.Bool
+	standby.Store(true)
+	srv := New(Config{
+		Address:              "127.0.0.1:0",
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AcceptDeadline:       25 * time.Millisecond,
+		HandshakeTimeout:     2 * time.Second,
+		IsStandby:            standby.Load,
+		HotStandbyConsistent: consistent.Load,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	<-srv.Ready()
+	defer func() { cancel(); <-done }()
+	addr := srv.Addr().String()
+	firstFrame := func(params map[string]string) libpq.Frame {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		writeStartupPacket(t, conn, params)
+		f, err := libpq.NewFrameReader(conn).ReadFrame()
+		if err != nil {
+			t.Fatalf("read first frame: %v", err)
+		}
+		return f
+	}
+	user := map[string]string{"user": "alice", "database": "postgres"}
+	repl := map[string]string{"user": "alice", "database": "postgres", "replication": "true"}
+	for _, params := range []map[string]string{user, repl} {
+		f := firstFrame(params)
+		if f.Type != libpq.MsgErrorResponse {
+			t.Fatalf("inconsistent standby answered %c, want an ErrorResponse (replication=%q)", f.Type, params["replication"])
+		}
+		got := parseErrorFields(t, f.Payload)
+		if got['S'] != "FATAL" || got['C'] != "57P03" || got['M'] != "the database system is not yet accepting connections" ||
+			got['D'] != "Consistent recovery state has not been yet reached." {
+			t.Errorf("refusal fields = %v, want PG's FATAL 57P03 not-yet-accepting / consistency detail", got)
+		}
+	}
+	consistent.Store(true)
+	if f := firstFrame(user); f.Type != libpq.MsgAuthentication {
+		t.Errorf("consistent standby answered %c, want AuthenticationOk", f.Type)
+	}
+	consistent.Store(false)
+	standby.Store(false) // promoted: no longer in recovery
+	if f := firstFrame(user); f.Type != libpq.MsgAuthentication {
+		t.Errorf("promoted server answered %c, want AuthenticationOk", f.Type)
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -1287,5 +1288,42 @@ func TestRecoveryStopXidAndSingleTarget(t *testing.T) {
 	}
 	if err := r.Set("recovery_target_xid", "99999999999999999999999", misc.SourceConfigFile); err == nil {
 		t.Error("an overflowing recovery_target_xid was accepted")
+	}
+}
+
+// TestStandbyConsistencyPoint pins reachedConsistency for the hot-standby
+// gate: the consistency point is max(minRecoveryPoint, the checkpoint's
+// redo, backupEndPoint) as InitWalRecovery leaves pg_control
+// (backupEndRequired never becomes consistent by position), and Consistent
+// latches once replay passes it.
+func TestStandbyConsistencyPoint(t *testing.T) {
+	dir := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.UpdateControlFile(dir, func(cd *control.ControlFileData) {
+		cd.MinRecoveryPoint = 0x3000
+		cd.CheckPointCopyRedo = 0x5000
+		cd.BackupEndPoint = 0x4000
+		cd.BackupEndRequired = false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	at, never := recoveryConsistencyPoint(dir)
+	if at != 0x5000 || never {
+		t.Fatalf("consistency point %X (never %v), want 5000", at, never)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	behind := &standbyController{replayer: xlog.NewStreamReplayer(mgr, 0x4fff), consistentAt: at}
+	if behind.Consistent() {
+		t.Error("replay at 4FFF reported consistent before 5000")
+	}
+	caught := &standbyController{replayer: xlog.NewStreamReplayer(mgr, 0x5000), consistentAt: at}
+	if !caught.Consistent() || !caught.Consistent() {
+		t.Error("replay at 5000 not consistent")
+	}
+	required := &standbyController{replayer: xlog.NewStreamReplayer(mgr, 0x9000), consistentAt: at, neverConsistent: true}
+	if required.Consistent() {
+		t.Error("backupEndRequired reported consistent by position")
 	}
 }

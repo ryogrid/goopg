@@ -214,6 +214,13 @@ type Config struct {
 	// refusal (M0122-0013).
 	HotStandbyDisabled bool
 
+	// HotStandbyConsistent, when non-nil, reports whether the standby's
+	// replay has reached a consistent recovery state (CheckRecoveryConsistency
+	// → PMSIGNAL_BEGIN_HOT_STANDBY). Until it does, a standby in recovery
+	// refuses every connection — normal or replication — with
+	// CAC_NOTHOTSTANDBY's "not yet accepting connections" (M0122-0013).
+	HotStandbyConsistent func() bool
+
 	// RecoveryLSNs, when non-nil, reports the standby's received and
 	// replayed WAL positions for pg_last_wal_receive_lsn /
 	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
@@ -1019,6 +1026,16 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		s.writeFatalDetail(w, errcodes.CannotConnectNow,
 			"the database system is not accepting connections", "Hot standby mode is disabled.")
 		logger.Info("connection refused: hot standby mode is disabled")
+		return
+	}
+	// Hot standby is on but the startup process has not yet reached a
+	// consistent state: the postmaster is still in PM_RECOVERY, not
+	// PM_HOT_STANDBY, so canAcceptConnections again returns
+	// CAC_NOTHOTSTANDBY, reported with the consistency detail.
+	if s.cfg.HotStandbyConsistent != nil && s.cfg.IsStandby != nil && s.cfg.IsStandby() && !s.cfg.HotStandbyConsistent() {
+		s.writeFatalDetail(w, errcodes.CannotConnectNow,
+			"the database system is not yet accepting connections", "Consistent recovery state has not been yet reached.")
+		logger.Info("connection refused: consistent recovery state not yet reached")
 		return
 	}
 	// Clear the handshake deadline; idle-timeout policy is a separate concern.

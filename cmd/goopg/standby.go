@@ -70,6 +70,16 @@ type standbyController struct {
 	replayerDone   chan struct{}
 	replayer       *xlog.StreamReplayer
 
+	// consistentAt is the replay position at which recovery becomes
+	// consistent (CheckRecoveryConsistency: minRecoveryPoint, raised to the
+	// checkpoint's redo as InitWalRecovery does, and backupEndPoint), as a
+	// PG position; consistent latches once replay has passed it.
+	// neverConsistent is set when pg_control says backupEndRequired — the
+	// XLOG_BACKUP_END goopg never emits would be needed first.
+	consistentAt    uint64
+	neverConsistent bool
+	consistent      atomic.Bool
+
 	// signalCancel cancels the promote.signal poller goroutine.
 	// Close cancels it explicitly; a successful Promote also
 	// returns from the watcher loop on its own.
@@ -195,6 +205,7 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		signalDone:         sigDone,
 		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
+	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
 	// Clear any stale promote.signal left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever
@@ -1067,4 +1078,43 @@ func shutdownAtRecoveryTarget(rt *initdb.Runtime, action string, logger *slog.Lo
 	}
 	logger.Info("shutdown at recovery target")
 	return 0
+}
+
+// recoveryConsistencyPoint is the replay position at which a standby's
+// recovery becomes consistent, from pg_control as InitWalRecovery leaves it:
+// minRecoveryPoint, raised to the checkpoint's redo when older, and the
+// backup's end point. never reports backupEndRequired, which waits for an
+// XLOG_BACKUP_END record rather than a position. A missing pg_control makes
+// recovery consistent at once.
+func recoveryConsistencyPoint(dataDir string) (at uint64, never bool) {
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		return 0, false
+	}
+	at = max(cd.MinRecoveryPoint, cd.CheckPointCopyRedo, cd.BackupEndPoint)
+	return at, cd.BackupEndRequired
+}
+
+// Consistent is reachedConsistency for hot standby: whether replay has
+// passed the consistency point (CheckRecoveryConsistency). It latches, and
+// logs PG's "consistent recovery state reached at X/X" the first time it is
+// observed.
+func (sc *standbyController) Consistent() bool {
+	if sc.consistent.Load() {
+		return true
+	}
+	if sc.neverConsistent {
+		return false
+	}
+	applied := uint64(0)
+	if sc.replayer != nil {
+		applied = sc.replayer.ApplyLSN()
+	}
+	if applied < sc.consistentAt {
+		return false
+	}
+	if sc.consistent.CompareAndSwap(false, true) && sc.logger != nil {
+		sc.logger.Info(fmt.Sprintf("consistent recovery state reached at %X/%X", uint32(applied>>32), uint32(applied)))
+	}
+	return true
 }
