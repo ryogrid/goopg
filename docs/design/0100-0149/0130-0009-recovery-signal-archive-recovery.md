@@ -360,3 +360,32 @@ goopg registered `recovery_target_timeline` but always followed 'latest'.
 - A standby follows only the newest timeline.
 - An empty value reads as 'latest'.
 - The "not a child" FATAL lacks PG's errdetail.
+
+## Update 2026-10-30 — timeline history through RECOVERYHISTORY (M0122-0013, `0603610a5`)
+
+goopg restored every probed history file into pg\_wal under its own name, including the target timeline's. PG handles
+history during archive recovery like this:
+- `readTimeLineHistory` and `existsTimeLineHistory` restore it into `RECOVERYHISTORY` and read it from there,
+  without keeping it.
+- `restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI)` copies into pg\_wal only the files for the timelines
+  between the start and the target, not the target's own.
+
+**The port.**
+- `RestoreArchivedFileTemp` is `RestoreArchivedFile` without `KeepFileRestoredFromArchive`.
+- `historyPath` restores into `RECOVERYHISTORY`, falling back to the pg\_wal copy. It serves `findNewestTimeLine`, the
+  numeric-target existence check and the target's history.
+- The target's entries are reported verbatim as `TargetHistory`.
+- The `[start, target)` history files are kept in pg\_wal.
+- `promoteAfterRecovery` copies the parent's history from `TargetHistory` when the parent is the target, as
+  `writeTimeLineHistory` reads it through `RECOVERYHISTORY` too. Reading pg\_wal alone would now drop every ancestor
+  line.
+
+**Pins:**
+- `TestRunArchiveRecoveryFollowsTimelineHistory` (updated): the target's history is not kept, and `TargetHistory` is
+  verbatim.
+- `TestRunArchiveRecoveryKeepsIntermediateHistoryFiles`: with timelines 1 → 2 → 3, timeline 2's file is kept and
+  timeline 3's is not.
+- `TestPromoteAfterRecoveryFollowsTimelines` catches a promotion that reads pg\_wal only.
+- All three were mutation-checked.
+
+**Still open (ledgered):** start-time archive recovery takes no restartpoints.
