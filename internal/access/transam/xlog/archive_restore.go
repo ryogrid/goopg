@@ -59,3 +59,57 @@ func RestoreArchivedFile(restoreCommand, walDir, segmentName string) error {
 	}
 	return nil
 }
+
+// ReplacePercentPlaceholders is PG's replace_percent_placeholders
+// (src/common/percentrepl.c): "%%" becomes "%", "%<letter>" becomes vals'
+// entry for that letter, and anything else — an unknown letter, or a lone "%"
+// at the end — is an invalid value for paramName (ERRCODE_INVALID_PARAMETER_VALUE
+// in PG), reported with PG's message and detail.
+func ReplacePercentPlaceholders(instr, paramName string, vals map[byte]string) (string, error) {
+	var b strings.Builder
+	for i := 0; i < len(instr); i++ {
+		if instr[i] != '%' {
+			b.WriteByte(instr[i])
+			continue
+		}
+		if i+1 >= len(instr) {
+			return "", fmt.Errorf("invalid value for parameter \"%s\": \"%s\" (String ends unexpectedly after escape character \"%%\".)", paramName, instr)
+		}
+		i++
+		if instr[i] == '%' {
+			b.WriteByte('%')
+			continue
+		}
+		v, ok := vals[instr[i]]
+		if !ok {
+			return "", fmt.Errorf("invalid value for parameter \"%s\": \"%s\" (String contains unexpected placeholder \"%%%c\".)", paramName, instr, instr[i])
+		}
+		b.WriteString(v)
+	}
+	return b.String(), nil
+}
+
+// ExecuteRecoveryCommand is PG's ExecuteRecoveryCommand (xlogarchive.c) for
+// archive_cleanup_command: %r becomes the WAL file holding the oldest
+// restartpoint's redo (GetOldestRestartPoint — pg_control's
+// checkPointCopy.redo and timeline), the command runs through the shell as
+// system() does, and a non-zero exit is the caller's WARNING
+// (failOnSignal false). An invalid placeholder is an error before anything
+// runs.
+func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) error {
+	if segSize <= 0 {
+		segSize = DefaultSegmentSize
+	}
+	fname := XLogFileName(restartTLI, restartRedo/uint64(segSize), segSize)
+	cmd, err := ReplacePercentPlaceholders(command, commandName, map[byte]string{'r': fname})
+	if err != nil {
+		return err
+	}
+	c := exec.Command("sh", "-c", cmd)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("%s \"%s\": %w", commandName, command, err)
+	}
+	return nil
+}

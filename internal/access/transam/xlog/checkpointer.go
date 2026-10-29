@@ -321,6 +321,9 @@ type Checkpointer struct {
 	// fake. nil disables WAL pruning entirely (the v0 default —
 	// caller opts in by passing SetRetainer).
 	retainer Retainer
+	// archiveCleanupSrc reports archive_cleanup_command's current value
+	// (PGC_SIGHUP, read at each restartpoint); nil: none (M0122-0013).
+	archiveCleanupSrc atomic.Pointer[func() string]
 
 	// intervalOverrideNS carries SIGHUP/reload-driven interval changes to
 	// the Run loop (parity bundle D-2): the armed ticker is rebuilt from
@@ -512,6 +515,20 @@ func (c *Checkpointer) SetMaxWALBytes(b uint64) {
 // disables pruning (the v0 default). Production wiring passes a
 // *SlotAwareRetainer that consults the replication-slot registry.
 // Call before Run starts.
+// SetArchiveCleanupCommandSource installs the reader of
+// archive_cleanup_command, which a standby's restartpoint runs once it has
+// adopted a replayed checkpoint (CreateRestartPoint, xlog.c). nil: none.
+func (c *Checkpointer) SetArchiveCleanupCommandSource(fn func() string) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.archiveCleanupSrc.Store(nil)
+		return
+	}
+	c.archiveCleanupSrc.Store(&fn)
+}
+
 func (c *Checkpointer) SetRetainer(r Retainer) {
 	c.retainer = r
 }
@@ -1301,12 +1318,34 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
 				}
 			}
+			c.runArchiveCleanupCommand(rp)
 		}
 	}
 	c.numRequested.Add(1)
 	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// runArchiveCleanupCommand is CreateRestartPoint's last step (xlog.c): with
+// archive_cleanup_command set, ExecuteRecoveryCommand runs it with %r naming
+// the WAL file of the oldest restartpoint — pg_control's checkPointCopy.redo
+// and timeline, which the restartpoint just made rp's. Only the arm that
+// adopted a restartpoint gets here; the skip arm returns first. A failure is
+// a WARNING (failOnSignal false); an invalid placeholder, PG's ERROR in the
+// checkpointer, is logged and the checkpointer carries on.
+func (c *Checkpointer) runArchiveCleanupCommand(rp ReplayedCheckpoint) {
+	src := c.archiveCleanupSrc.Load()
+	if src == nil {
+		return
+	}
+	cmd := (*src)()
+	if cmd == "" {
+		return
+	}
+	if err := ExecuteRecoveryCommand(cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
+		c.cfg.Logger.Warn("archive_cleanup_command failed", "err", err)
+	}
 }
 
 // raiseMinRecoveryPointToReplay is UpdateMinRecoveryPoint(InvalidXLogRecPtr,

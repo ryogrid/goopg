@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -338,5 +339,70 @@ func TestRestartPointSkipRaisesMinRecoveryPointToReplay(t *testing.T) {
 				t.Errorf("the skip arm moved checkPointCopy.redo to %d", cd.CheckPointCopyRedo)
 			}
 		})
+	}
+}
+
+// TestReplacePercentPlaceholders pins PG's replace_percent_placeholders:
+// %% is a literal %, a known letter is substituted, and an unknown letter or
+// a trailing % is an invalid parameter value.
+func TestReplacePercentPlaceholders(t *testing.T) {
+	vals := map[byte]string{'r': "000000010000000000000003"}
+	for _, tc := range []struct{ in, want string }{
+		{"rm -f %r", "rm -f 000000010000000000000003"},
+		{"echo %%r %r", "echo %r 000000010000000000000003"},
+		{"no placeholders", "no placeholders"},
+	} {
+		got, err := ReplacePercentPlaceholders(tc.in, "archive_cleanup_command", vals)
+		if err != nil || got != tc.want {
+			t.Errorf("%q -> %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"echo %f", "echo %"} {
+		if _, err := ReplacePercentPlaceholders(bad, "archive_cleanup_command", vals); err == nil || !strings.Contains(err.Error(), `invalid value for parameter "archive_cleanup_command"`) {
+			t.Errorf("%q: err = %v, want PG's invalid-value error", bad, err)
+		}
+	}
+}
+
+// TestRestartPointRunsArchiveCleanupCommand pins CreateRestartPoint's last
+// step: a restartpoint that adopted a replayed checkpoint runs
+// archive_cleanup_command with %r = the WAL file holding that checkpoint's
+// redo (GetOldestRestartPoint after the pg_control update); the skip arm
+// returns before it and runs nothing.
+func TestRestartPointRunsArchiveCleanupCommand(t *testing.T) {
+	const segSize = 1 << 16
+	run := func(t *testing.T, controlRedo uint64) string {
+		dir := t.TempDir()
+		writeTestControl(t, dir, control.DBStateInArchiveRecovery, controlRedo)
+		w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: segSize, PageHeaders: true, TimelineID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		out := filepath.Join(dir, "cleanup.out")
+		cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{DataDir: dir, SegmentSize: segSize})
+		cp.SetRecoveryMode(true)
+		// Redo in the fourth 64 KiB segment: %r is segment 3 on timeline 1.
+		cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+			return ReplayedCheckpoint{StartLSN: 3*segSize + 0x101, EndLSN: 3*segSize + 0x200, Fields: CheckPointFields{RedoLSN0: 3*segSize + 0x10, ThisTLI: 1}}, true
+		})
+		cp.SetArchiveCleanupCommandSource(func() string { return "printf %%s %r > " + out })
+		if err := cp.CheckpointNow(); err != nil {
+			t.Fatalf("recovery checkpoint: %v", err)
+		}
+		b, err := os.ReadFile(out)
+		if os.IsNotExist(err) {
+			return ""
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if got := run(t, 16); got != "000000010000000000000003" {
+		t.Errorf("adopted restartpoint: archive_cleanup_command saw %%r = %q, want 000000010000000000000003", got)
+	}
+	if got := run(t, 3*segSize+0x10); got != "" {
+		t.Errorf("skip arm ran archive_cleanup_command (%%r = %q); PG returns before it", got)
 	}
 }

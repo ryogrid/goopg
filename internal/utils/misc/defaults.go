@@ -1654,6 +1654,15 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
+	// archive_cleanup_command: the shell command a standby runs at every
+	// restartpoint, %r naming the oldest WAL file still needed (guc_tables.c,
+	// PGC_SIGHUP, WAL_ARCHIVE_RECOVERY; xlog.c CreateRestartPoint). Read by
+	// the checkpointer at each restartpoint (M0122-0013).
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_cleanup_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,

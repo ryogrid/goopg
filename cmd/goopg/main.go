@@ -777,6 +777,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				rt.Checkpointer.SetMaxWALBytes(uint64(mb) * 1024 * 1024)
 			}
 		}
+		// archive_cleanup_command is PGC_SIGHUP: the restartpoint reads the
+		// registry's current value each time it runs (M0122-0013).
+		rt.Checkpointer.SetArchiveCleanupCommandSource(func() string {
+			if v, ok := registry.Get("archive_cleanup_command"); ok {
+				return v.Display()
+			}
+			return ""
+		})
 		if v, ok := registry.Get("checkpoint_completion_target"); ok {
 			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
 				rt.Checkpointer.SetCompletionTarget(f)
