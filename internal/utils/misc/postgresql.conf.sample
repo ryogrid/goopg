@@ -161,6 +161,8 @@
 
 # - Archive Recovery -
 
+#recovery_target_xid = ''	# the transaction ID up to which recovery will proceed
+				# (change requires restart)
 #recovery_target_lsn = ''	# the WAL LSN up to which recovery will proceed
 				# (change requires restart)
 #recovery_target_inclusive = on	# Specifies whether to stop:

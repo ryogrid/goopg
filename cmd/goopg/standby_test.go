@@ -1259,3 +1259,33 @@ func TestPromoteAfterRecoveryToTargetLSN(t *testing.T) {
 		t.Errorf("history file %q does not end with PG's reason line (reason + its own newline)", raw)
 	}
 }
+
+// TestRecoveryStopXidAndSingleTarget pins how goopg start reads the
+// recovery targets: recovery_target_xid is strtou64(s, NULL, 0) truncated
+// to a TransactionId, and setting it together with recovery_target_lsn is
+// error_multiple_recovery_targets' "multiple recovery targets specified"
+// with PG's errdetail.
+func TestRecoveryStopXidAndSingleTarget(t *testing.T) {
+	r := misc.BuildDefaultRegistry()
+	if err := r.Set("recovery_target_xid", "0x2ee", misc.SourceConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	if got := recoveryStop(r); !got.XidSet || got.Xid != 750 || got.Set || !got.Inclusive {
+		t.Errorf("xid target: %+v, want xid 750 inclusive", got)
+	}
+	if err := checkSingleRecoveryTarget(r); err != nil {
+		t.Errorf("one target: %v", err)
+	}
+	if err := r.Set("recovery_target_lsn", "0/3000000", misc.SourceConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	err := checkSingleRecoveryTarget(r)
+	var fatal *xlog.RestoreFatalError
+	if !errors.As(err, &fatal) || fatal.Msg != "multiple recovery targets specified" ||
+		fatal.Detail != `At most one of "recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid" may be set.` {
+		t.Errorf("two targets: err = %v (%+v)", err, fatal)
+	}
+	if err := r.Set("recovery_target_xid", "99999999999999999999999", misc.SourceConfigFile); err == nil {
+		t.Error("an overflowing recovery_target_xid was accepted")
+	}
+}

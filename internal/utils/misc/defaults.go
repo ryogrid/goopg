@@ -1687,8 +1687,8 @@ func BuildDefaultRegistry() *Registry {
 		CheckFn: checkRecoveryTargetTimeline,
 	}))
 	// The recovery-target family (guc_tables.c WAL_RECOVERY_TARGET) that
-	// archive recovery honours: an LSN target, whether the stop includes
-	// the target record, and what happens once it is reached. The xid,
+	// archive recovery honours: an LSN or xid target, whether the stop
+	// includes the target record, and what happens once it is reached. The
 	// name, time and 'immediate' targets are not registered — setting one
 	// is an unknown-parameter startup error rather than a target silently
 	// ignored.
@@ -1697,6 +1697,12 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 		CheckFn: checkRecoveryTargetLSN,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_xid", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetXid,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "recovery_target_inclusive", Type: TypeBool, BootVal: "on",

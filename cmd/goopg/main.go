@@ -993,6 +993,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// pending reload (ProcessStartupProcInterrupts), then reads it.
 		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
 		// at the next fetch or segment and cancels a running restore_command.
+		if err := checkSingleRecoveryTarget(registry); err != nil {
+			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
+		}
 		stop := recoveryStop(registry)
 		// Crash replay in initdb.Open has already applied the local WAL; a
 		// stop point inside it cannot be honoured.
@@ -1011,11 +1014,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
 		}
 		if recovered.ReachedTarget {
-			when := "before"
-			if recovered.StopAfter {
-				when = "after"
-			}
-			logger.Info(fmt.Sprintf("recovery stopping %s WAL location (LSN) \"%X/%X\"", when, uint32(recovered.StopLSN>>32), uint32(recovered.StopLSN)))
+			logger.Info(recovered.StopMessage())
 			// recovery_target_action: shutdown ends here, leaving recovery
 			// unfinished; pause becomes shutdown without hot_standby.
 			if action := recoveryTargetAction(registry); action != "promote" {

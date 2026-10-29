@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/transam/control"
@@ -556,5 +557,94 @@ func TestRunArchiveRecoveryStopsAtTargetLSN(t *testing.T) {
 	}
 	if got := res.StopReason(); got != "no recovery target specified" {
 		t.Errorf("unreached reason %q", got)
+	}
+}
+
+// TestRunArchiveRecoveryStopsAtTargetXid pins recoveryStopsBefore /
+// recoveryStopsAfter for recovery_target_xid: only the COMMIT or ABORT
+// record whose xl_xid equals the target ends recovery (equality — a later
+// commit of a lower or higher xid never does), before it or after applying
+// it; StopReason is "before|after transaction N" and StopMessage names
+// commit vs abort. Abort records stop it too.
+func TestRunArchiveRecoveryStopsAtTargetXid(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct{ start, end uint64 }
+	ends := map[uint32]rec{}
+	var last uint64
+	xids := []uint32{700, 702, 701, 705, 703} // completion order is not xid order
+	for i, xid := range xids {
+		for j := 0; j < 50; j++ {
+			if _, _, err := w.Append(make([]byte, 2000)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var framed []byte
+		if i == 3 {
+			framed, err = EncodeXactAbortPG(storage.TransactionID(xid))
+		} else {
+			framed, err = EncodeXactCommitPG(storage.TransactionID(xid), false)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, e, err := w.Append(framed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ends[xid] = rec{s, e}
+		last = e
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	run := func(stop RecoveryStop) ArchiveRecoveryResult {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	res := run(RecoveryStop{XidSet: true, Xid: 701, Inclusive: true})
+	if !res.ReachedTarget || res.StopKind != StopAtXid || res.StopXid != 701 || !res.StopIsCommit || res.EndOfLog != ends[701].end {
+		t.Errorf("inclusive xid 701: %+v; want stop after its commit at %X", res, ends[701].end)
+	}
+	if got := res.StopReason(); got != "after transaction 701" {
+		t.Errorf("reason %q", got)
+	}
+	if got := res.StopMessage(); !strings.HasPrefix(got, "recovery stopping after commit of transaction 701, time ") {
+		t.Errorf("message %q", got)
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 701, Inclusive: false})
+	if !res.ReachedTarget || res.StopAfter || res.StopPoint != ends[701].start-1 || res.EndOfLog >= ends[701].start {
+		t.Errorf("exclusive xid 701: %+v; want stop before its commit at %X", res, ends[701].start-1)
+	}
+	if got := res.StopReason(); got != "before transaction 701" {
+		t.Errorf("reason %q", got)
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 705, Inclusive: true})
+	if !res.ReachedTarget || res.StopIsCommit || res.EndOfLog != ends[705].end ||
+		!strings.HasPrefix(res.StopMessage(), "recovery stopping after abort of transaction 705") {
+		t.Errorf("abort target: %+v (%s)", res, res.StopMessage())
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 704, Inclusive: true})
+	if res.ReachedTarget || res.EndOfLog != last {
+		t.Errorf("absent xid 704: %+v; want not reached, whole archive replayed", res)
 	}
 }

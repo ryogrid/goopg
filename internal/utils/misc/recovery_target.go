@@ -139,3 +139,25 @@ func checkRecoveryTargetLSN(value string) error {
 	}
 	return nil
 }
+
+// ParseRecoveryTargetXid is check_recovery_target_xid plus its assign hook:
+// strtou64(s, NULL, 0) — rejected only on ERANGE — truncated to a
+// TransactionId. An empty value is no xid target (ok with set false).
+func ParseRecoveryTargetXid(value string) (xid uint32, set, ok bool) {
+	if value == "" {
+		return 0, false, true
+	}
+	n, ok := cStrtoul(value)
+	if !ok {
+		return 0, true, false
+	}
+	return uint32(n), true, true
+}
+
+// checkRecoveryTargetXid is recovery_target_xid's check hook.
+func checkRecoveryTargetXid(value string) error {
+	if _, _, ok := ParseRecoveryTargetXid(value); !ok {
+		return &ValidationError{Msg: `invalid value for parameter "recovery_target_xid": "` + value + `"`}
+	}
+	return nil
+}

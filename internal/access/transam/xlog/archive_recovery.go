@@ -14,11 +14,13 @@ package xlog
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/storage"
@@ -57,8 +59,15 @@ type ArchiveRecoveryResult struct {
 	// (the ReadRecPtr of the record it stopped at), after applying that
 	// record when StopAfter (recoveryStopLSN / recoveryStopAfter).
 	ReachedTarget bool
+	StopKind      StopKind
 	StopLSN       uint64
 	StopAfter     bool
+	// StopXid, StopIsCommit and StopXactTime describe the transaction end
+	// record an xid target stopped at (recoveryStopXid, recoveryStopTime:
+	// xact_time, microseconds since 2000-01-01).
+	StopXid      uint32
+	StopIsCommit bool
+	StopXactTime int64
 	// StopPoint is where the recovered WAL ends at the target, as a PG
 	// position: the stop record's start, or its end when StopAfter.
 	StopPoint uint64
@@ -363,15 +372,37 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		// first record whose ReadRecPtr reaches the target ends recovery —
 		// before it (recovery_target_inclusive off) or after applying it
 		// (on). The records after it are never replayed.
+		//
+		// recovery_target_xid: only the end record of that transaction —
+		// a COMMIT or an ABORT whose xl_xid equals the target (equality,
+		// never "greater": xids are assigned at start, not in completion
+		// order) — ends recovery, before it or after applying it.
 		stopped := false
-		if stop.Set {
+		if stop.Set || stop.XidSet {
 			for i, r := range records {
 				readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
-				if readRecPtr < stop.LSN {
+				hit := false
+				if stop.Set && readRecPtr >= stop.LSN {
+					hit = true
+					res.StopKind = StopAtLSN
+					res.StopLSN = readRecPtr
+				} else if stop.XidSet && r.XLog != nil && r.XLog.Header.Rmid == RmgrXact {
+					op := r.XLog.Header.Info & xlogXactOpMask
+					if (op == xlogXactCommit || op == xlogXactAbort) && r.XLog.Header.XID == stop.Xid {
+						hit = true
+						res.StopKind = StopAtXid
+						res.StopXid = r.XLog.Header.XID
+						res.StopIsCommit = op == xlogXactCommit
+						if len(r.XLog.MainData) >= 8 {
+							res.StopXactTime = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
+						}
+					}
+				}
+				if !hit {
 					continue
 				}
 				stopped = true
-				res.ReachedTarget, res.StopLSN, res.StopAfter = true, readRecPtr, stop.Inclusive
+				res.ReachedTarget, res.StopAfter = true, stop.Inclusive
 				res.StopPoint = readRecPtr
 				if stop.Inclusive {
 					res.StopPoint = r.EndLSN
@@ -397,13 +428,25 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	}
 }
 
-// RecoveryStop is an LSN recovery target: recovery_target_lsn (Set when the
-// setting is non-empty) and recovery_target_inclusive.
+// RecoveryStop is the recovery target: recovery_target_lsn (Set when that
+// setting is non-empty), recovery_target_xid (XidSet), and
+// recovery_target_inclusive. At most one target is set (the
+// "multiple recovery targets specified" check).
 type RecoveryStop struct {
 	Set       bool
 	LSN       uint64 // PG LSN (0-based)
+	XidSet    bool
+	Xid       uint32
 	Inclusive bool
 }
+
+// StopKind is which recovery target stopped recovery.
+type StopKind int
+
+const (
+	StopAtLSN StopKind = iota + 1
+	StopAtXid
+)
 
 // StopReason is getRecoveryStopReason's text, which the promotion writes
 // as the new timeline history's reason: "before|after LSN X/X\n" (the
@@ -417,7 +460,31 @@ func (r ArchiveRecoveryResult) StopReason() string {
 	if r.StopAfter {
 		when = "after"
 	}
+	if r.StopKind == StopAtXid {
+		return fmt.Sprintf("%s transaction %d", when, r.StopXid)
+	}
 	return fmt.Sprintf("%s LSN %X/%X\n", when, uint32(r.StopLSN>>32), uint32(r.StopLSN))
+}
+
+// StopMessage is the LOG line recoveryStopsBefore/After writes when the
+// target is reached: "recovery stopping before|after WAL location (LSN)
+// "X/X"", or "recovery stopping before|after commit|abort of transaction N,
+// time T" (T as timestamptz_to_str in the server's zone).
+func (r ArchiveRecoveryResult) StopMessage() string {
+	when := "before"
+	if r.StopAfter {
+		when = "after"
+	}
+	if r.StopKind == StopAtXid {
+		what := "abort"
+		if r.StopIsCommit {
+			what = "commit"
+		}
+		const pgEpochUnixMicros = 946684800 * 1000000
+		t := time.UnixMicro(r.StopXactTime + pgEpochUnixMicros)
+		return fmt.Sprintf("recovery stopping %s %s of transaction %d, time %s", when, what, r.StopXid, t.Format("2006-01-02 15:04:05.999999-07"))
+	}
+	return fmt.Sprintf("recovery stopping %s WAL location (LSN) \"%X/%X\"", when, uint32(r.StopLSN>>32), uint32(r.StopLSN))
 }
 
 // highestLocalSegment returns the highest segment number found in walDir

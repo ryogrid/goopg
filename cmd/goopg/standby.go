@@ -988,15 +988,27 @@ func recoveryTargetTimeline(registry *misc.Registry) xlog.TargetTimeline {
 // recoveryStop reads recovery_target_lsn and recovery_target_inclusive
 // (their check hooks validated them when the configuration was loaded).
 func recoveryStop(registry *misc.Registry) xlog.RecoveryStop {
-	value := stringGUC(registry, "recovery_target_lsn", "")
-	if value == "" {
-		return xlog.RecoveryStop{}
+	stop := xlog.RecoveryStop{Inclusive: boolGUC(registry, "recovery_target_inclusive", true)}
+	if value := stringGUC(registry, "recovery_target_lsn", ""); value != "" {
+		stop.LSN, stop.Set = misc.ParsePGLSN(value)
 	}
-	lsn, ok := misc.ParsePGLSN(value)
-	if !ok {
-		return xlog.RecoveryStop{}
+	if xid, set, ok := misc.ParseRecoveryTargetXid(stringGUC(registry, "recovery_target_xid", "")); set && ok {
+		stop.Xid, stop.XidSet = xid, true
 	}
-	return xlog.RecoveryStop{Set: true, LSN: lsn, Inclusive: boolGUC(registry, "recovery_target_inclusive", true)}
+	return stop
+}
+
+// checkSingleRecoveryTarget is error_multiple_recovery_targets: at most one
+// recovery target may be set. PG raises it from the target GUCs' assign
+// hooks while the configuration loads, so the server does not start.
+func checkSingleRecoveryTarget(registry *misc.Registry) error {
+	if stringGUC(registry, "recovery_target_lsn", "") != "" && stringGUC(registry, "recovery_target_xid", "") != "" {
+		return &xlog.RestoreFatalError{
+			Msg:    "multiple recovery targets specified",
+			Detail: `At most one of "recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid" may be set.`,
+		}
+	}
+	return nil
 }
 
 // recoveryTargetAction is recovery_target_action as validateRecoveryParameters
@@ -1018,7 +1030,7 @@ func recoveryTargetAction(registry *misc.Registry) string {
 // written position, a PG position) is the earliest point the recovery can
 // stop at.
 func checkRecoveryTargetReached(stop xlog.RecoveryStop, res xlog.ArchiveRecoveryResult, localEnd uint64) error {
-	if !stop.Set {
+	if !stop.Set && !stop.XidSet {
 		return nil
 	}
 	if !res.ReachedTarget {
