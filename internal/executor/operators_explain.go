@@ -79,7 +79,10 @@ func (o *explainOp) Open(ctx *Context) error {
 		execStart := time.Now()
 		var inner Operator
 		var err error
+		prevScope := ctx.explainScope
+		defer func() { ctx.explainScope = prevScope }()
 		inner, stats, err = withInstrumentation(timing, func(scope *instrumenter) (Operator, error) {
+			ctx.explainScope = scope
 			return buildNode(o.plan.Child, deformBoundNone, scope)
 		})
 		if err != nil {
@@ -749,7 +752,10 @@ func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, s
 		est, cost, width := hashNodeCost(c)
 		line += fmt.Sprintf("  (cost=%.2f..%.2f rows=%d width=%d)", cost, cost, est, width)
 	}
-	if s != nil {
+	if s != nil && s.loops == 0 {
+		// explain.c ExplainNode: an instrumented node with nloops == 0.
+		line += " (never executed)"
+	} else if s != nil {
 		rowsAvg := rowsPerLoop(s.rowsOut, s.loops)
 		if s.timing {
 			line += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
@@ -6241,7 +6247,14 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			statSrc = attachedFilterNode
 		}
 	}
-	if s, ok := stats[statSrc]; ok && s != nil {
+	if s, ok := stats[statSrc]; ok && s != nil && s.loops == 0 {
+		// explain.c ExplainNode: an instrumented node that never looped
+		// prints ` (never executed)` instead of its actuals. Every path that
+		// executes a node files into its record (M0122-0021 slices 1-3), so a
+		// zero-loop record is a node that did not run: an untaken branch,
+		// an inner the outer never reached.
+		label += " (never executed)"
+	} else if s, ok := stats[statSrc]; ok && s != nil {
 		// PG's `rows=` is instrument->ntuples / nloops (explain.c:1835), a
 		// PER-LOOP average, not the cumulative total — a node re-Open'd once
 		// per outer row (correlated subplan / NL inner side) would otherwise
@@ -6360,7 +6373,10 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// byte accounting is a budget approximation, not a report-grade
 	// number).
 	if m, isMemo := n.(*optimizer.Memoize); isMemo {
-		if ms := memoStats[m]; ms != nil {
+		// show_memoize_info prints the counters only once the cache missed
+		// at least once (explain.c, `cache_misses > 0`); a Memoize that
+		// never ran prints none.
+		if ms := memoStats[m]; ms != nil && ms.Misses > 0 {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
 				"Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
 				ms.Hits, ms.Misses, ms.Evictions, ms.Overflows))})

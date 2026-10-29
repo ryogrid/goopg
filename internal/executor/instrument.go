@@ -287,8 +287,7 @@ type instrumentedMemoProbe struct {
 }
 
 func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrumenter) *instrumentedNLIInner {
-	stats := &nodeStats{timing: scope.timing}
-	scope.table[plan] = stats
+	stats := scopeStats(plan, scope)
 	if hf, ok := in.(heapFetchCounter); ok {
 		hf.setHeapFetchCounter(&stats.heapFetches)
 	}
@@ -622,6 +621,24 @@ func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStat
 	return stats
 }
 
+// scopeStats returns plan's stats record in scope, creating it on first
+// use. A plan node can be built more than once in one scope — every
+// reference to a materialized CTE builds an operator over the one shared
+// body node, and a SubPlan rebuilt per outer row (rescanRebuild) builds its
+// inner plan again. PG has one PlanState and one Instrumentation per plan
+// node across all its loops, so every build of the node files into the same
+// record: a replaying reference that never opens its body adds nothing, and
+// a rebuilt SubPlan's loops accumulate instead of the last build's
+// overwriting them (M0122-0021 slice 3).
+func scopeStats(plan optimizer.Node, scope *instrumenter) *nodeStats {
+	if s, ok := scope.table[plan]; ok && s != nil {
+		return s
+	}
+	s := &nodeStats{timing: scope.timing}
+	scope.table[plan] = s
+	return s
+}
+
 // maybeInstrument is called by buildNode right before each switch arm
 // returns. When scope is non-nil it allocates a stats
 // record keyed on plan and wraps op; when nil it returns op
@@ -630,8 +647,7 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	if scope == nil || op == nil {
 		return op
 	}
-	stats := &nodeStats{timing: scope.timing}
-	scope.table[plan] = stats
+	stats := scopeStats(plan, scope)
 	// Hand an IndexOnlyScan (or any heap-fetch-counting operator) a pointer
 	// to its stats.heapFetches so it can tally heap fetches during Open;
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)

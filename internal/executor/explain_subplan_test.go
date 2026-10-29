@@ -353,15 +353,14 @@ func TestJoinLabelPinsPGLabels(t *testing.T) {
 // the expectation is that SubPlan children are NOT instrumented today.
 // This test observes the real rendered output and pins it.
 //
-// Observed (2026-09-19): the SubPlan subtree executes (the header
+// Observed (2026-09-19): the SubPlan subtree executed (the header
 // renders `calls=N` from ctx.SubPlanStats, a separate channel from
-// nodeStatsTable instrumentation) yet its inner nodes carry NO
-// `(actual ...)` bracket — SubPlan children are never instrumented
-// today. Upstream PG's instrument.c does instrument them (its EXPLAIN
-// ANALYZE renders `(actual time=... rows=... loops=N)` on the subtree),
-// so this is both the answer to the task's open question — forcing nil
-// scope at acquireSubPlanOp's Build sites is a bug-for-bug-compatible
-// simplification — and a recorded PG-fidelity gap in its own right.
+// nodeStatsTable instrumentation) yet its inner nodes carried NO
+// `(actual ...)` bracket — upstream PG's instrument.c does instrument
+// them. M0122-0021 slice 3 closed that gap: acquireSubPlanOp now builds
+// under ctx.explainScope, the EXPLAIN ANALYZE instrumenter explainOp
+// publishes for its run, so every SubPlan subtree line must carry
+// actuals.
 func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 	pinCorrelatedSubPlanPath(t)
 	ctx, cleanup := explainSubPlanFixture(t)
@@ -393,8 +392,8 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 
 	// Locate the "SubPlan 1 (...)" header — the header line carries the
 	// per-call counters — then require: (a) calls>=1 so the subtree truly
-	// executed, and (b) every subtree line below it is estimate-only, i.e.
-	// carries a `(cost=...)` but no `(actual ...)` bracket.
+	// executed, and (b) every subtree line below it carries an
+	// `(actual ...)` bracket.
 	var headerIdx = -1
 	for i, l := range lines {
 		if strings.HasPrefix(strings.TrimSpace(l), "SubPlan 1") {
@@ -417,8 +416,8 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 			break
 		}
 		sawSubtree = true
-		if strings.Contains(l, "(actual") {
-			t.Errorf("SubPlan child unexpectedly instrumented (a non-nil scope leaked into its lazy build?):\n%s", plan)
+		if !strings.Contains(l, "(actual") {
+			t.Errorf("SubPlan child line %q carries no actuals (acquireSubPlanOp built it outside the EXPLAIN scope?):\n%s", strings.TrimSpace(l), plan)
 		}
 	}
 	if !sawSubtree {

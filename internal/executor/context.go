@@ -240,6 +240,15 @@ type Context struct {
 	// EX0-03b (new).
 	GatherWorkerStats workerNodeStatsTable
 
+	// explainScope is the EXPLAIN ANALYZE instrumenter for the statement
+	// being executed, set by explainOp for the duration of its run (nil
+	// otherwise). Subtrees built lazily during execution — a SubPlan's or
+	// InitPlan's inner plan (acquireSubPlanOp) — build under it, so they
+	// report actuals as PG's ExplainNode prints for every subplan
+	// (M0122-0021 slice 3). NewWorkerContext copies fields explicitly and
+	// leaves it nil: a worker never writes the leader's stats table.
+	explainScope *instrumenter
+
 	// SortStats carries the per-Sort ANALYZE counters (method / space),
 	// keyed by plan node like HashJoinStats. Published at the end of a
 	// successful sortOp.Open; failed Opens publish nothing, so their nodes

@@ -287,6 +287,9 @@ func subPlanResultCacheable(ctx *Context, key optimizer.Expr, plan optimizer.Nod
 // acquireSubPlanOp returns an OPEN operator for the sublink's inner
 // plan plus a done() the caller must invoke after draining.
 //
+// Under EXPLAIN ANALYZE the inner plan builds in ctx.explainScope, so the
+// SubPlan / InitPlan subtree reports actuals (M0122-0021 slice 3).
+//
 // The operator is built once per
 // statement and re-run per the handle's rescanKind; done() is a no-op —
 // the operator stays open, owned by the handle, until CloseSubPlans.
@@ -299,7 +302,7 @@ func acquireSubPlanOp(ctx *Context, key optimizer.Expr, plan optimizer.Node, for
 	h := getSubPlanHandle(ctx, key, plan, forExists)
 	noop := func() {}
 	if !h.built {
-		op, err := Build(plan)
+		op, err := buildNode(plan, deformBoundNone, ctx.explainScope)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -344,7 +347,7 @@ func acquireSubPlanOp(ctx *Context, key optimizer.Expr, plan optimizer.Node, for
 	default: // rescanRebuild
 		h.close()
 		stat.Rebuilds++
-		op, err := Build(plan)
+		op, err := buildNode(plan, deformBoundNone, ctx.explainScope)
 		if err != nil {
 			return nil, nil, err
 		}

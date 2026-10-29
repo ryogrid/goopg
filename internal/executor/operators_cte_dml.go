@@ -329,8 +329,12 @@ type cteScanOp struct {
 	slot MaterializedSlot
 }
 
-func newCteScanOp(p *optimizer.CTEScan) (*cteScanOp, error) {
-	child, err := Build(p.Child)
+func newCteScanOp(p *optimizer.CTEScan, scope *instrumenter) (*cteScanOp, error) {
+	// The body builds under the scan's own EXPLAIN ANALYZE scope (nil
+	// outside ANALYZE), so the `CTE x` section prints actuals as PG's does
+	// (M0122-0021 slice 3); every reference files into the body's one
+	// record (scopeStats).
+	child, err := buildNode(p.Child, deformBoundNone, scope)
 	if err != nil {
 		return nil, err
 	}

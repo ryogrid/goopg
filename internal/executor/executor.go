@@ -113,7 +113,7 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 		// (same CTE declaration, same ctx.CTERowCache entry). This implements PostgreSQL's
 		// CTE optimization-fence: a volatile CTE (e.g. random()) produces the
 		// same rows regardless of how many times it is referenced. M0097-0099.
-		op, err := newCteScanOp(p)
+		op, err := newCteScanOp(p, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -288,9 +288,11 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 					Message: fmt.Sprintf("NestedLoopIndexJoin memoizes a %T, which is not an index probe", innerScan)}
 			}
 			// EXPLAIN ANALYZE instruments both nodes (M0122-0021 slice 2):
-			// the probe under the plan's inner node, the cache under
-			// InnerMemo — no-ops without a scope.
-			innerScan = instrumentNLIInner(p.InnerMemo, newMemoizeOp(p.InnerMemo, instrumentMemoProbe(p.Inner, probe, scope)), scope)
+			// the cache under InnerMemo and the probe under InnerMemo.Child
+			// — the node EXPLAIN renders below the Memoize, which a rewrite
+			// that replaces Inner can leave distinct from it (unwrap's
+			// remap, inner-join qual pushdown) — no-ops without a scope.
+			innerScan = instrumentNLIInner(p.InnerMemo, newMemoizeOp(p.InnerMemo, instrumentMemoProbe(p.InnerMemo.Child, probe, scope)), scope)
 		} else {
 			innerScan = instrumentNLIInner(p.Inner, innerScan, scope)
 		}
