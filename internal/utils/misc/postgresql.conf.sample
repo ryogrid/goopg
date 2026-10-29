@@ -192,8 +192,11 @@
                                         # (SIGHUP to apply)
 #primary_slot_name = ''                 # replication slot to use on primary
                                         # (SIGHUP to apply)
-#restore_command = ''                    # shell command to fetch WAL from archive
-                                        # (change requires restart)
+#restore_command = ''                    # command to use to restore an archived WAL file
+                                        # placeholders: %p = path of file to restore
+                                        #               %f = file name only
+                                        # e.g. 'cp /mnt/server/archivedir/%f %p'
+                                        # (SIGHUP to apply)
 #archive_cleanup_command = ''            # command to execute at every restartpoint
                                         # (SIGHUP to apply)
 #recovery_end_command = ''               # command to execute at completion of recovery

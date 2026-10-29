@@ -619,6 +619,34 @@ func promoteAfterRecovery(rt *initdb.Runtime, recoveryEndCommand string, logger 
 	return nil
 }
 
+// validateRecoveryParameters is the compulsory-parameter check of PG's
+// validateRecoveryParameters (xlogrecovery.c), run when archive recovery was
+// requested (a standby.signal or recovery.signal file):
+//   - standby mode with neither primary_conninfo nor restore_command: a
+//     WARNING — the server polls pg_wal for files placed there;
+//   - archive recovery without standby mode and without restore_command:
+//     FATAL, returned as an error; the start aborts and recovery.signal
+//     stays, so the operator can supply the command and restart.
+//
+// goopg used to warn, delete recovery.signal and start as a primary, which
+// opened a restored backup without replaying its archived WAL.
+func validateRecoveryParameters(rt *initdb.Runtime, restoreCommand, primaryConnInfo string, logger *slog.Logger) error {
+	if rt == nil || (!rt.Standby && !rt.Recovery) {
+		return nil
+	}
+	if rt.Standby {
+		if primaryConnInfo == "" && restoreCommand == "" {
+			logger.Warn(`specified neither "primary_conninfo" nor "restore_command"`,
+				"hint", "The database server will regularly poll the pg_wal subdirectory to check for files placed there.")
+		}
+		return nil
+	}
+	if restoreCommand == "" {
+		return errors.New(`must specify "restore_command" when standby mode is not enabled`)
+	}
+	return nil
+}
+
 // runRecoveryEndCommand is the recovery_end_command arm of PG's
 // CleanupAfterArchiveRecovery (xlog.c): ExecuteRecoveryCommand with
 // failOnSignal true. %r is the WAL file holding the oldest restartpoint's

@@ -643,3 +643,39 @@ func TestTransactionBuffersFromGUC_NilRegistry(t *testing.T) {
 		t.Errorf("nil registry: got %d, want 0 (Open auto-tunes)", got)
 	}
 }
+
+// TestStartRecoverySignalWithoutRestoreCommandIsFatal pins
+// validateRecoveryParameters at `goopg start`: recovery.signal without
+// standby.signal and without restore_command refuses to start (PG: FATAL
+// "must specify \"restore_command\" when standby mode is not enabled") and
+// leaves recovery.signal in place. goopg used to delete the signal file and
+// start as a primary, opening a restored backup without its archived WAL.
+func TestStartRecoverySignalWithoutRestoreCommandIsFatal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"init", "-D", dir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit=%d stderr=%q", code, stderr.String())
+	}
+	signal := filepath.Join(dir, "recovery.signal")
+	if err := os.WriteFile(signal, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"start", "-D", dir, "--listen", "127.0.0.1:0"}, &stdout, &stderr) }()
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Errorf("start exit=%d, want 1", code)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatalf("start did not refuse to run with recovery.signal and no restore_command (stderr %q)", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `FATAL: must specify "restore_command" when standby mode is not enabled`) {
+		t.Errorf("stderr %q lacks PG's FATAL message", stderr.String())
+	}
+	if _, err := os.Stat(signal); err != nil {
+		t.Errorf("recovery.signal removed although the start was refused: %v", err)
+	}
+}

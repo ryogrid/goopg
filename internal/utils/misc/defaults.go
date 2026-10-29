@@ -1647,11 +1647,13 @@ func BuildDefaultRegistry() *Registry {
 	// Archive recovery: restore_command is the shell command used to fetch
 	// WAL segments from archival storage during archive recovery (triggered
 	// by recovery.signal). %f expands to the segment filename, %p to the
-	// destination path in pg_wal. Empty default disables archive fetch;
-	// ContextPostmaster because changing it requires a restart.
+	// destination path in pg_wal. PGC_SIGHUP as in PG 18 (guc_tables.c,
+	// WAL_ARCHIVE_RECOVERY): a reload reaches recovery (M0122-0013). An empty
+	// value with recovery.signal and no standby.signal is FATAL at start
+	// (validateRecoveryParameters, cmd/goopg).
 	r.MustRegister(NewVariable(Variable{
 		Name: "restore_command", Type: TypeString, BootVal: "",
-		Context: ContextPostmaster,
+		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	// archive_cleanup_command: the shell command a standby runs at every

@@ -508,3 +508,37 @@ func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
 		t.Error("recovery.signal removed although recovery_end_command failed with a signal")
 	}
 }
+
+// TestValidateRecoveryParameters pins the compulsory-parameter check of PG's
+// validateRecoveryParameters (xlogrecovery.c): recovery.signal without
+// standby.signal needs restore_command (FATAL); a standby with neither
+// primary_conninfo nor restore_command only warns; no signal file, nothing.
+func TestValidateRecoveryParameters(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	for _, tc := range []struct {
+		name              string
+		rt                *initdb.Runtime
+		restore, conninfo string
+		wantErr, wantWarn bool
+	}{
+		{"recovery without restore_command", &initdb.Runtime{Recovery: true}, "", "", true, false},
+		{"recovery with restore_command", &initdb.Runtime{Recovery: true}, "cp /a/%f %p", "", false, false},
+		{"standby with neither", &initdb.Runtime{Standby: true}, "", "", false, true},
+		{"standby with conninfo", &initdb.Runtime{Standby: true}, "", "host=p", false, false},
+		{"standby and recovery signals, neither command", &initdb.Runtime{Standby: true, Recovery: true}, "", "", false, true},
+		{"no signal file", &initdb.Runtime{}, "", "", false, false},
+	} {
+		logBuf.Reset()
+		err := validateRecoveryParameters(tc.rt, tc.restore, tc.conninfo, logger)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+		if err != nil && err.Error() != `must specify "restore_command" when standby mode is not enabled` {
+			t.Errorf("%s: error %q is not PG's message", tc.name, err)
+		}
+		if warned := strings.Contains(logBuf.String(), `specified neither \"primary_conninfo\" nor \"restore_command\"`); warned != tc.wantWarn {
+			t.Errorf("%s: warned = %v, want %v (log %q)", tc.name, warned, tc.wantWarn, logBuf.String())
+		}
+	}
+}
