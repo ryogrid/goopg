@@ -40,6 +40,14 @@ func (o *explainOp) Schema() optimizer.Schema {
 func (o *explainOp) Open(ctx *Context) error {
 	o.rows = nil
 	opts := o.plan.Options
+	// PG 18: BUFFERS defaults to ANALYZE when not written
+	// (explain_state.c ParseExplainOptionList: `es->buffers =
+	// buffers_set ? es->buffers : es->analyze`), so a plain
+	// EXPLAIN ANALYZE prints the Buffers lines; an explicit BUFFERS
+	// OFF still wins (M0122-0021).
+	if !opts.Set.Buffers {
+		opts.Buffers = opts.Analyze
+	}
 	var stats nodeStatsTable
 	var planNs, execNs int64
 
