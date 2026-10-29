@@ -370,6 +370,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// processes at its next check — never Go's default terminate-on-SIGHUP.
 	startupHup := newStartupReload(logger)
 	defer startupHup.stop()
+	// SIGQUIT is the immediate shutdown (pg_ctl stop -m immediate), caught
+	// for the whole of goopg start.
+	quit := newImmediateShutdown(logger, cancel)
+	defer quit.stop()
 
 	cfg := postmaster.Config{
 		Address: *addr,
@@ -522,6 +526,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
+		}
+		quit.setRuntime(rt)
+		if quit.Requested() {
+			// SIGQUIT during crash recovery: exit without a checkpoint.
+			return 0
 		}
 		recordClusterStateGUCs(registry, *dataDir)
 		// AIO engine startup line: surfaces the chosen method,
@@ -994,7 +1003,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
 		// at the next fetch or segment and cancels a running restore_command.
 		if err := checkSingleRecoveryTarget(registry); err != nil {
-			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
+			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
 		}
 		stop := recoveryStop(registry)
 		// Crash replay in initdb.Open has already applied the local WAL; a
@@ -1011,7 +1020,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			err = checkRecoveryTargetReached(stop, recovered, localEnd)
 		}
 		if err != nil {
-			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
+			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
 		}
 		if recovered.ReachedTarget {
 			logger.Info(recovered.StopMessage())
@@ -1066,6 +1075,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// starts; the server's own SIGHUP handler takes over from here.
 	startupHup.process(registry, cfg.ConfigPath, *dataDir)
 	srv := postmaster.New(cfg)
+	quit.setServer(srv)
+	if quit.Requested() {
+		return 0
+	}
 	runErr := srv.Run(ctx)
 	cpCancel()
 	if sc != nil {
@@ -1334,14 +1347,13 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 		// The server is still in its startup phase (crash or archive
 		// recovery): the lock file exists but the control socket is not
 		// bound yet. Signal it, as pg_ctl stop always does — SIGTERM for
-		// smart, SIGINT for fast; goopg start stops recovery on either.
+		// smart, SIGINT for fast, SIGQUIT for immediate.
 		sig := syscall.SIGINT
 		switch {
 		case strings.EqualFold(*mode, "smart"):
 			sig = syscall.SIGTERM
 		case stopCmd == "STOPIMMEDIATE":
-			fmt.Fprintln(stderr, "goopg stop: the server is still starting up; -mode immediate needs the control socket — use -mode fast")
-			return 1
+			sig = syscall.SIGQUIT
 		}
 		if err := syscall.Kill(pf.PID, sig); err != nil {
 			fmt.Fprintf(stderr, "goopg stop: could not send stop signal (PID: %d): %v\n", pf.PID, err)

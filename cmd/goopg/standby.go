@@ -943,6 +943,8 @@ var _ = walDirFor
 // Close skips its shutdown checkpoint, as a server still in recovery writes
 // no checkpoint record.
 //
+//   - An immediate shutdown (SIGQUIT; immediate is set) ends here with exit 0
+//     and no pg_control update at all.
 //   - A shutdown request (xlog.ErrRecoveryShutdown: SIGTERM/SIGINT, or the
 //     restore_command child killed by SIGTERM) is upstream's fast shutdown
 //     during recovery: the startup process exits, the checkpointer's
@@ -952,8 +954,13 @@ var _ = walDirFor
 //     unrunnable command), a read or replay error — is the startup process
 //     dying FATAL: the postmaster aborts startup and exits 1, and pg_control
 //     keeps its in-recovery state, so the next start recovers again.
-func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, logger *slog.Logger, stderr io.Writer) int {
+func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, immediate bool, logger *slog.Logger, stderr io.Writer) int {
 	rt.SetImmediateShutdown()
+	if immediate && errors.Is(err, xlog.ErrRecoveryShutdown) {
+		// An immediate shutdown (SIGQUIT) writes nothing — no shutdown
+		// restartpoint, so pg_control keeps its in-recovery state.
+		return 0
+	}
 	if errors.Is(err, xlog.ErrRecoveryShutdown) {
 		logger.Info("received fast shutdown request during archive recovery; recovery not completed, recovery.signal kept")
 		if uerr := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {

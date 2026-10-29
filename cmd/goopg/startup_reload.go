@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/postmaster"
 	"github.com/goopg/goopg/internal/utils/misc"
 )
 
@@ -79,4 +81,78 @@ func (r *startupReload) process(registry *misc.Registry, configPath, dataDir str
 		r.logger.Warn("reload", "issue", w)
 	}
 	r.logger.Info("reload complete", "path", configPath, "changed", result.Changed, "warnings", len(result.Warnings))
+}
+
+// immediateShutdown is goopg start's SIGQUIT handling — the postmaster's
+// immediate shutdown (pmdie SIGQUIT → "received immediate shutdown
+// request", pg_ctl stop -m immediate). It is registered for the whole life
+// of goopg start, so Go's default SIGQUIT action (dump every goroutine and
+// exit 2, leaving postmaster.pid behind) never runs:
+//   - before the server runs (crash or archive recovery), it marks the
+//     runtime so its Close writes no shutdown checkpoint, records the
+//     request, and cancels the start context — archive recovery stops at
+//     its next check, and goopg start returns without promoting and
+//     without touching pg_control's state;
+//   - once the server runs, it is Server.StopImmediate, the same path as
+//     `goopg stop -mode immediate`.
+type immediateShutdown struct {
+	logger    *slog.Logger
+	cancel    func()
+	ch        chan os.Signal
+	done      chan struct{}
+	requested atomic.Bool
+	rt        atomic.Pointer[initdb.Runtime]
+	srv       atomic.Pointer[postmaster.Server]
+}
+
+func newImmediateShutdown(logger *slog.Logger, cancel func()) *immediateShutdown {
+	q := &immediateShutdown{logger: logger, cancel: cancel, ch: make(chan os.Signal, 1), done: make(chan struct{})}
+	signal.Notify(q.ch, syscall.SIGQUIT)
+	go func() {
+		for {
+			select {
+			case <-q.done:
+				return
+			case <-q.ch:
+				q.trigger()
+			}
+		}
+	}()
+	return q
+}
+
+// trigger runs one immediate shutdown request.
+func (q *immediateShutdown) trigger() {
+	if !q.requested.CompareAndSwap(false, true) {
+		return
+	}
+	if srv := q.srv.Load(); srv != nil {
+		srv.StopImmediate("received immediate shutdown request")
+	} else {
+		q.logger.Info("received immediate shutdown request")
+		if rt := q.rt.Load(); rt != nil {
+			rt.SetImmediateShutdown()
+		}
+	}
+	q.cancel()
+}
+
+// setRuntime hands the opened runtime over; a request that arrived while it
+// was opening (crash recovery) is applied to it now.
+func (q *immediateShutdown) setRuntime(rt *initdb.Runtime) {
+	q.rt.Store(rt)
+	if q.requested.Load() && rt != nil {
+		rt.SetImmediateShutdown()
+	}
+}
+
+// setServer hands the built server over before it runs.
+func (q *immediateShutdown) setServer(srv *postmaster.Server) { q.srv.Store(srv) }
+
+// Requested reports whether an immediate shutdown was requested.
+func (q *immediateShutdown) Requested() bool { return q != nil && q.requested.Load() }
+
+func (q *immediateShutdown) stop() {
+	signal.Stop(q.ch)
+	close(q.done)
 }

@@ -377,6 +377,10 @@ type Server struct {
 	// connWG.Wait() after the accept loop exits. See ShutdownDeadline.
 	shutdownDeadline time.Duration
 
+	// runCancel cancels Run's context; StopImmediate uses it. Set once Run
+	// has created the context.
+	runCancel atomic.Pointer[context.CancelFunc]
+
 	cancelReg *backendCancelRegistry
 
 	// controlListener is the operator-facing command socket; nil
@@ -639,6 +643,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// Optional — disabled when DataDir is empty (e.g. tests).
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
+	s.runCancel.Store(&runCancel)
 	if s.cfg.DataDir != "" {
 		if err := s.startControlPlane(runCtx, runCancel, ln); err != nil {
 			return err
@@ -777,23 +782,7 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		return nil
 	}
 	cl.OnStopImmediate = func() error {
-		s.cfg.Logger.Info("control: immediate stop requested")
-		// Immediate shutdown: deliberately skip BOTH the OnStop
-		// CheckpointNow AND (via the runtime flag set by the wired
-		// callback) the final Runtime.Close shutdown checkpoint, so
-		// pg_control's State stays DB_IN_PRODUCTION. The cluster then
-		// looks unclean to pg_resetwal/pg_rewind/pg_controldata and is
-		// recovered via WAL replay on the next start. Mirrors upstream's
-		// immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
-		if s.cfg.OnStopImmediate != nil {
-			if err := s.cfg.OnStopImmediate(); err != nil {
-				s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
-			}
-		}
-		// Zero deadline: Run() logs and returns immediately without
-		// waiting for backends — mirrors upstream's SIGQUIT.
-		s.shutdownDeadline = 0
-		runCancel()
+		s.StopImmediate("control: immediate stop requested")
 		return nil
 	}
 	cl.OnReload = func() error {
@@ -841,6 +830,27 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		}
 	}()
 	return nil
+}
+
+// StopImmediate is the postmaster's immediate shutdown (SIGQUIT,
+// pg_ctl stop -m immediate; `goopg stop -mode immediate` over the control
+// socket): it deliberately skips BOTH the OnStop CheckpointNow AND (via the
+// runtime flag OnStopImmediate sets) the final Runtime.Close shutdown
+// checkpoint, so pg_control's State stays as the running server left it.
+// The cluster then looks unclean to pg_resetwal/pg_rewind/pg_controldata
+// and is recovered via WAL replay on the next start. (M0110-0004 / RW-002
+// b; SIGQUIT wiring M0122-0013.)
+func (s *Server) StopImmediate(reason string) {
+	s.cfg.Logger.Info(reason)
+	if s.cfg.OnStopImmediate != nil {
+		if err := s.cfg.OnStopImmediate(); err != nil {
+			s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
+		}
+	}
+	s.shutdownDeadline = 0
+	if cancel := s.runCancel.Load(); cancel != nil {
+		(*cancel)()
+	}
 }
 
 // reloadConfig re-parses cfg.ConfigPath (if set) and re-applies its
