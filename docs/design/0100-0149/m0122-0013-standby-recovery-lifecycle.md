@@ -443,3 +443,29 @@ exits on a shutdown request.
 **Pins:** `TestOpenCrashReplayIsInterruptible` (fails with the check removed) and `TestEndInterruptedCrashRecovery`.
 
 **Still open (ledgered):** Open's post-replay phases still run to completion once replay has finished.
+
+## Update 2026-10-30 — sessions report why a stop ends them (M0122-0013, `f97dccda6`, `2bc45c8b3`)
+
+On a stop PG's backends say why they are going away before the socket closes. goopg either said nothing (idle
+sessions) or sent the fast-shutdown cancel.
+
+| stop | PG | goopg before | goopg now |
+|---|---|---|---|
+| immediate, idle or busy | quickdie (`PMQUIT_FOR_STOP`): NoticeResponse WARNING 57P01 "terminating connection due to immediate shutdown command" | nothing (idle) / ERROR 57014 "canceling statement due to user request" (busy) | the quickdie notice |
+| fast, idle | die() then `ProcessInterrupts`: FATAL 57P01 "terminating connection due to administrator command" | nothing | the FATAL |
+| fast, busy | the same FATAL alone — `ProcDiePending` is checked before `QueryCancelPending` | ERROR 57014, then the FATAL | the FATAL alone |
+
+- `Server.StopImmediate` sets `immediateStopping` before it cancels Run's context.
+- Idle sessions: the connCtx watcher's deadline breaks `ReadFrame`. When Run's context is cancelled, the read-error
+  branch writes the message, with a fresh write deadline, before it returns.
+- Busy sessions: `shutdownEndsStatement` is shared by both error writers, `writeQueryError` (simple query) and
+  `writeExtendedMessageError` (extended protocol). It writes quickdie's notice on an immediate stop, or the FATAL
+  when the error is a 57014 cancel and Run's context is done. It then returns `errShutdownSent`, which closes the
+  connection. Any other error raised during a stop is still the statement's own.
+- `Server.runCtx` tells a server stop apart from a session-only cancel such as a terminate or a disconnect.
+
+**Pins:** `TestStopImmediateSendsQuickdieNotice`, `TestFastStopSendsAdminShutdownFatal` and
+`TestShutdownReplacesStatementCancel`. All three are mutation-checked. A live psql probe of idle and busy sessions,
+simple and `\bind`, prints PG 18's lines for both stop modes.
+
+**Still open (ledgered):** the immediate path still waits for session goroutines.

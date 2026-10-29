@@ -4244,6 +4244,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Sessions report why a stop ends them LANDED 2026\-10\-30 \(`f97dccda6`, `2bc45c8b3`\)**\. Movement: none —
+    session teardown messages\. Before, an idle session saw only "server closed the connection unexpectedly", and
+    a busy one got "canceling statement due to user request"\.
+    - Immediate stop: quickdie's WARNING 57P01 "terminating connection due to immediate shutdown command" to idle,
+      busy and extended\-protocol sessions\. Fast stop: die\(\)'s FATAL 57P01 alone \(no 57014 first\)\.
+      `shutdownEndsStatement` is shared by `writeQueryError` and `writeExtendedMessageError`\.
+    - Pins: `TestStopImmediateSendsQuickdieNotice`, `TestFastStopSendsAdminShutdownFatal`,
+      `TestShutdownReplacesStatementCancel` \(all mutation\-checked\); live psql probe \(simple \+ `\\bind`\)\. Gates:
+      units, postmaster, sigquit/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): the immediate path still waits for session goroutines \(connWG\)\.
   - **Crash replay stops on a shutdown request LANDED 2026\-10\-30 \(`6c78ab6c4`\)**\. Movement: none — crash recovery\.
     ProcessStartupProcInterrupts per record; goopg's crash replay could not be stopped\.
     - `ReplayFromDirWithMgrAtInterruptible`, `OpenOptions\.Interrupted`, `endInterruptedCrashRecovery` \(fast →
