@@ -183,6 +183,13 @@ type OpenOptions struct {
 	// you — that's a separate operator action.
 	DataDir string
 
+	// Interrupted, when non-nil, is asked before every crash-replay record
+	// (the redo loop's ProcessStartupProcInterrupts). Once it reports true,
+	// Open stops replaying and returns an error wrapping
+	// xlog.ErrRecoveryShutdown — a shutdown request during crash recovery
+	// (goopg start's SIGTERM / SIGINT / SIGQUIT).
+	Interrupted func() bool
+
 	// PoolSlots is the number of buffer pool slots to allocate.
 	// Defaults to 16384 when zero (128 MB at BlockSize=8 KB), which
 	// matches upstream PostgreSQL's `shared_buffers` boot default.
@@ -454,7 +461,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// instead of being reconstructed by scanning the stream for a record
 	// goopg's own isCheckpointRecord recognises. The scan survives as the
 	// fallback for redo == 0 (fresh cluster / no control file).
-	if _, err := xlog.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
+	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}

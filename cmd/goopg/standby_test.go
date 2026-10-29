@@ -1327,3 +1327,35 @@ func TestStandbyConsistencyPoint(t *testing.T) {
 		t.Error("backupEndRequired reported consistent by position")
 	}
 }
+
+// TestEndInterruptedCrashRecovery pins how goopg start ends when a shutdown
+// request stopped crash replay: a fast shutdown records
+// DB_SHUTDOWNED_IN_RECOVERY (the shutdown restartpoint's skip arm), an
+// immediate one (SIGQUIT) leaves pg_control as crash recovery stamped it;
+// both exit 0.
+func TestEndInterruptedCrashRecovery(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, immediate := range []bool{false, true} {
+		dir := t.TempDir()
+		if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+			t.Fatal(err)
+		}
+		if err := control.UpdateControlFile(dir, func(cd *control.ControlFileData) { cd.State = control.DBStateInCrashRecovery }); err != nil {
+			t.Fatal(err)
+		}
+		if code := endInterruptedCrashRecovery(dir, immediate, logger, io.Discard); code != 0 {
+			t.Errorf("immediate=%v: exit %d, want 0", immediate, code)
+		}
+		cd, err := control.ReadControlFile(dir)
+		if err != nil || cd == nil {
+			t.Fatal(err)
+		}
+		want := control.DBStateShutdownedInRecovery
+		if immediate {
+			want = control.DBStateInCrashRecovery
+		}
+		if cd.State != want {
+			t.Errorf("immediate=%v: state %s, want %s", immediate, control.DBStateName(cd.State), control.DBStateName(want))
+		}
+	}
+}

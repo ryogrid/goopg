@@ -499,7 +499,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		transactionBuffers := intGUC(registry, "transaction_buffers", 0)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
-			DataDir:               *dataDir,
+			DataDir: *dataDir,
+			// A shutdown request (SIGTERM/SIGINT/SIGQUIT cancel ctx) stops
+			// crash replay at its next record.
+			Interrupted:           func() bool { return ctx.Err() != nil },
 			PoolSlots:             poolSlots,
 			WALInitZero:           walInitZero,
 			WALSenderMemoryBuffer: walSenderMemBuf,
@@ -523,6 +526,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			TrackIOTiming:         trackIOTiming,
 			TransactionBuffers:    transactionBuffers,
 		})
+		if err != nil && errors.Is(err, xlog.ErrRecoveryShutdown) {
+			return endInterruptedCrashRecovery(*dataDir, quit.Requested(), logger, stderr)
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1

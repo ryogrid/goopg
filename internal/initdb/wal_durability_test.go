@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"errors"
 	"encoding/binary"
 	"path/filepath"
 	"testing"
@@ -258,4 +259,59 @@ func TestWalXactRecordsCarryStopTimestamp(t *testing.T) {
 			t.Errorf("%s record xact_time %d outside [%d, %d]", name, got, before, after)
 		}
 	}
+}
+
+// TestOpenCrashReplayIsInterruptible pins the redo loop's
+// ProcessStartupProcInterrupts for crash recovery: Open asks Interrupted
+// before every replayed record and, once it reports true, stops and returns
+// an error wrapping xlog.ErrRecoveryShutdown without opening the cluster;
+// the next Open replays to the end. goopg's crash replay could not be
+// stopped, so a shutdown request waited for all of it.
+func TestOpenCrashReplayIsInterruptible(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
+		if err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		if tx.XID, err = rt.TxnMgr.AssignXID(tx); err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		if err := rt.TxnMgr.Commit(tx); err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		rt.Close()
+		t.Fatal(err)
+	}
+	rt.SetImmediateShutdown() // crash: no shutdown checkpoint, records past the redo point
+	rt.Close()
+
+	calls := 0
+	_, err = Open(OpenOptions{DataDir: dir, PoolSlots: 16, Interrupted: func() bool {
+		calls++
+		return true
+	}})
+	if !errors.Is(err, xlog.ErrRecoveryShutdown) {
+		t.Fatalf("interrupted Open: err = %v, want ErrRecoveryShutdown", err)
+	}
+	if calls == 0 {
+		t.Fatal("Interrupted was never asked during crash replay")
+	}
+	rt, err = Open(OpenOptions{DataDir: dir, PoolSlots: 16})
+	if err != nil {
+		t.Fatalf("Open after the interrupted replay: %v", err)
+	}
+	rt.Close()
 }

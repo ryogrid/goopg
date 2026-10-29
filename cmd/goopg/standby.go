@@ -1125,3 +1125,28 @@ func (sc *standbyController) Consistent() bool {
 	}
 	return true
 }
+
+// endInterruptedCrashRecovery ends goopg start when a shutdown request
+// stopped initdb.Open's crash replay. Nothing was written to WAL (replay
+// runs before the WAL writer opens). A fast shutdown is upstream's
+// shutdown during recovery: the checkpointer's shutdown restartpoint finds
+// no new checkpoint and records DB_SHUTDOWNED_IN_RECOVERY
+// (CreateRestartPoint's skip arm with CHECKPOINT_IS_SHUTDOWN); an
+// immediate shutdown (SIGQUIT) writes nothing, leaving
+// DB_IN_CRASH_RECOVERY. Either way the next start replays from the same
+// redo point. Exit 0, as the postmaster's normal shutdown exit.
+func endInterruptedCrashRecovery(dataDir string, immediate bool, logger *slog.Logger, stderr io.Writer) int {
+	if immediate {
+		return 0
+	}
+	logger.Info("received fast shutdown request during crash recovery; recovery not completed")
+	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateShutdownedInRecovery
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "goopg start: crash recovery: could not update pg_control: %v\n", err)
+		return 1
+	}
+	logger.Info("database system is shut down")
+	return 0
+}

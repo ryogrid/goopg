@@ -2138,6 +2138,10 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 // correctness. Replaying too little is the direction that loses data, and
 // pg_control can never point past the WAL it was written from.
 func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (ReplayStats, error) {
+	return replayRecordsFrom(mgr, records, redoLSN, nil)
+}
+
+func replayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64, interrupted func() bool) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
 	startIdx, checkpointLSN := replayStartAt(records, redoLSN)
 	stats.CheckpointLSN = checkpointLSN
@@ -2155,6 +2159,9 @@ func ReplayRecordsFrom(mgr *storage.Manager, records []Record, redoLSN uint64) (
 	}
 
 	for i, r := range records[startIdx:] {
+		if interrupted != nil && interrupted() {
+			return stats, fmt.Errorf("wal: replay stopped before record %d lsn %d: %w", startIdx+i, r.StartLSN, ErrRecoveryShutdown)
+		}
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
 			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", startIdx+i, r.StartLSN, r.EndLSN, err)
@@ -5722,6 +5729,14 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 // pointer (M0131-S20.2). initdb.Open passes pg_control's checkPointCopy.redo
 // here; redoLSN == 0 falls back to the stream scan. See ReplayRecordsFrom.
 func ReplayFromDirWithMgrAt(mgr *storage.Manager, walDir string, segmentSize int64, redoLSN uint64) (ReplayStats, error) {
+	return ReplayFromDirWithMgrAtInterruptible(mgr, walDir, segmentSize, redoLSN, nil)
+}
+
+// ReplayFromDirWithMgrAtInterruptible is ReplayFromDirWithMgrAt that asks
+// interrupted before every record — the redo loop's
+// ProcessStartupProcInterrupts — and stops, returning an error wrapping
+// ErrRecoveryShutdown, once it reports true. nil never interrupts.
+func ReplayFromDirWithMgrAtInterruptible(mgr *storage.Manager, walDir string, segmentSize int64, redoLSN uint64, interrupted func() bool) (ReplayStats, error) {
 	records, err := ReadAll(walDir, segmentSize)
 	if err != nil {
 		// Missing pg_wal on a fresh data dir is fine — no records
@@ -5731,7 +5746,7 @@ func ReplayFromDirWithMgrAt(mgr *storage.Manager, walDir string, segmentSize int
 		}
 		return ReplayStats{}, err
 	}
-	return ReplayRecordsFrom(mgr, records, redoLSN)
+	return replayRecordsFrom(mgr, records, redoLSN, interrupted)
 }
 
 // replayHeapVacuum applies one logical heap-vacuum prune record.
