@@ -356,3 +356,79 @@ func TestExplainAnalyzeBitmapIndexRecheckRemoved(t *testing.T) {
 		t.Errorf("the recheck must still return exactly the 200 matching rows:\n%s", out)
 	}
 }
+
+// TestExplainAnalyzeVerboseWorkerBlocks pins M0122-0021 residual 12: PG
+// writes each worker's lines into one per-worker buffer and flushes the
+// buffers after the node's other details (explain.c ExplainOpenWorker /
+// ExplainFlushWorkersState). Under VERBOSE a worker's block is its
+// `Worker N:  actual …` line followed by that worker's node detail
+// (here `Heap Blocks:`) indented one level deeper; without VERBOSE the block
+// is the single `Worker N:  Heap Blocks:` line. goopg printed the VERBOSE
+// actual lines and the detail lines as two separate flat runs. The parallel
+// heap scan's label also carries PG's `Parallel ` prefix (the plan flag the
+// Gather stamps; the arm ignored it — ledger M0134-0001).
+func TestExplainAnalyzeVerboseWorkerBlocks(t *testing.T) {
+	ctx := spillFixture(t, 2000, 10, 400)
+	if err := runDDL(t, ctx, "CREATE INDEX sp_probe_k ON sp_probe (k)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	const sql = "SELECT pad FROM sp_probe WHERE k < 40"
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = false // every page is a worker's
+
+	for _, verbose := range []bool{true, false} {
+		ctx.GatherWorkerStats = nil
+		opts := "ANALYZE, COSTS OFF, TIMING OFF"
+		if verbose {
+			opts += ", VERBOSE"
+		}
+		// The planner stamps Parallel when it builds the Gather path
+		// (createplangather.go stampParallelScan); a hand-built Gather has
+		// to stamp it itself.
+		child := planBitmapForced(t, ctx, sql)
+		stampBitmapParallel(child)
+		lines := runExplainOverChild(t, ctx, "EXPLAIN ("+opts+") "+sql, optimizer.NewGather(0, child, 2))
+		out := strings.Join(lines, "\n")
+		if !strings.Contains(out, "->  Parallel Bitmap Heap Scan on") {
+			t.Errorf("verbose=%v: missing the `Parallel Bitmap Heap Scan` label:\n%s", verbose, out)
+		}
+		blocks := 0
+		for i, l := range lines {
+			trimmed := strings.TrimLeft(l, " ")
+			if !strings.HasPrefix(trimmed, "Worker ") {
+				continue
+			}
+			indent := len(l) - len(trimmed)
+			if verbose {
+				if !strings.Contains(trimmed, ":  actual rows=") {
+					continue // a Gather-level line, not the scan's
+				}
+				if i+1 >= len(lines) || !strings.HasPrefix(lines[i+1], strings.Repeat(" ", indent+2)+"Heap Blocks: exact=") {
+					t.Errorf("verbose: worker block %q is not followed by its Heap Blocks line indented one level:\n%s", trimmed, out)
+				}
+				blocks++
+			} else if strings.Contains(trimmed, ":  Heap Blocks: exact=") {
+				blocks++
+			}
+			if strings.Contains(trimmed, "actual") && !verbose {
+				t.Errorf("non-verbose printed a worker actual line %q:\n%s", trimmed, out)
+			}
+		}
+		if blocks == 0 {
+			t.Errorf("verbose=%v: no worker block for the heap scan:\n%s", verbose, out)
+		}
+	}
+}
+
+// stampBitmapParallel marks the bitmap heap scan under the transparent
+// wrappers parallel-aware, as stampParallelScan does for a planned Gather.
+func stampBitmapParallel(n optimizer.Node) {
+	switch x := n.(type) {
+	case *optimizer.BitmapHeapScan:
+		x.Parallel = true
+	case *optimizer.Project:
+		stampBitmapParallel(x.Child)
+	case *optimizer.Filter:
+		stampBitmapParallel(x.Child)
+	}
+}

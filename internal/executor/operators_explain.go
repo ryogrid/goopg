@@ -6441,6 +6441,10 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// worker_instrument — the leader's share lives in the node line's
 	// aggregate (aggregateWorkerInstrumentation), never on a line of its
 	// own. A site that never looped prints nothing (`nloops <= 0`).
+	// M0122-0021 residual 12: every per-worker line this node prints goes
+	// into that worker's block, flushed once after the node's other
+	// details (see workerBlocks).
+	var wblocks workerBlocks
 	if opts.Verbose && len(workerStats) > 0 {
 		if ws, ok := workerStats[statSrc]; ok && len(ws) > 0 {
 			ordered := make([]workerNodeStat, 0, len(ws))
@@ -6462,12 +6466,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 						rowsOut = 0
 					}
 				}
-				line := fmt.Sprintf("Worker %d:  actual ", w.Worker)
+				line := "actual "
 				if timing {
 					line += fmt.Sprintf("time=%.3f..%.3f ", msPerLoop(w.StartupNs, w.Loops), msPerLoop(w.TotalNs, w.Loops))
 				}
 				line += fmt.Sprintf("rows=%.2f loops=%d", rowsPerLoop(rowsOut, w.Loops), w.Loops)
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+				wblocks.add(w.Worker, line)
 			}
 		}
 	}
@@ -6502,8 +6506,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			copy(ordered, ws)
 			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
 			for _, w := range ordered {
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
-					"Worker %d:  %s", w.Worker, formatSortStatLine(w)))})
+				wblocks.add(w.Worker, formatSortStatLine(w))
 			}
 		}
 	}
@@ -6558,8 +6561,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			}
 			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
 			for _, w := range ordered {
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
-					"Worker %d:  %s", w.Worker, formatHeapBlocks(w.ExactPages, w.LossyPages)))})
+				wblocks.add(w.Worker, formatHeapBlocks(w.ExactPages, w.LossyPages))
 			}
 		}
 	}
@@ -6580,12 +6582,13 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			}
 			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
 			for _, w := range ordered {
-				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
-					"Worker %d:  Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
-					w.Worker, w.Hits, w.Misses, w.Evictions, w.Overflows))})
+				wblocks.add(w.Worker, fmt.Sprintf("Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
+					w.Hits, w.Misses, w.Evictions, w.Overflows))
 			}
 		}
 	}
+
+	wblocks.flush(rows, detailIndent)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -7539,14 +7542,22 @@ func describePlanMode(n optimizer.Node, nm *explainNames, verbose bool) string {
 			// name PG uses and let the missing relation be conspicuous.
 			return "Bitmap Heap Scan"
 		}
+		// PG prefixes "Parallel " for a parallel-aware bitmap heap scan
+		// (explain.c ExplainNode, plan->parallel_aware), as the SeqScan and
+		// IndexScan arms do; the flag is stamped at Gather construction
+		// (M0134-0001 S17) but this arm never read it.
+		label := "Bitmap Heap Scan on "
+		if p.Parallel {
+			label = "Parallel " + label
+		}
 		if dname := nm.disambiguatedName(n); dname != "" {
-			return "Bitmap Heap Scan on " + scanTargetRef(explainRelName(p.Table, verbose), dname)
+			return label + scanTargetRef(explainRelName(p.Table, verbose), dname)
 		}
 		// P0-04: alias branch, same rule as the SeqScan arm.
 		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
-			return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose) + " " + p.Alias
+			return label + explainRelName(p.Table, verbose) + " " + p.Alias
 		}
-		return "Bitmap Heap Scan on " + explainRelName(p.Table, verbose)
+		return label + explainRelName(p.Table, verbose)
 	case *optimizer.BitmapIndexScan:
 		// PG names the INDEX here, not the table.
 		if p.Index == nil {
@@ -8239,4 +8250,42 @@ func insertAfterDetail(rows *[]Row, prefix string, line Row) {
 		}
 	}
 	*rows = append(*rows, line)
+}
+
+// workerBlocks collects one node's per-worker lines by fan-out slot. PG
+// writes each worker's lines into its own buffer (explain.c
+// ExplainOpenWorker) — the VERBOSE `actual …` line, then the node's
+// Sort Method / Memoize Hits / Heap Blocks detail — and flushes the buffers
+// in worker order once the node's other details, Buffers included, are out
+// (ExplainFlushWorkersState). A block's first line carries the
+// `Worker N:  ` prefix; its later lines indent one level deeper. Without
+// VERBOSE each block is the single detail line, exactly as before
+// (M0122-0021 residual 12).
+type workerBlocks map[int][]string
+
+func (b *workerBlocks) add(worker int, line string) {
+	if *b == nil {
+		*b = make(workerBlocks)
+	}
+	(*b)[worker] = append((*b)[worker], line)
+}
+
+func (b workerBlocks) flush(rows *[]Row, indent string) {
+	if len(b) == 0 {
+		return
+	}
+	slots := make([]int, 0, len(b))
+	for w := range b {
+		slots = append(slots, w)
+	}
+	sort.Ints(slots)
+	for _, w := range slots {
+		for i, line := range b[w] {
+			if i == 0 {
+				*rows = append(*rows, Row{NewStringDatum(indent + fmt.Sprintf("Worker %d:  %s", w, line))})
+				continue
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "  " + line)})
+		}
+	}
 }
