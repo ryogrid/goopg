@@ -4142,6 +4142,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint runs archive\_cleanup\_command LANDED 2026\-10\-29 \(`9ef148c9e`\)**\. Movement: none — recovery
+    path\. CreateRestartPoint's last step: ExecuteRecoveryCommand with `%r` = the oldest restartpoint's WAL file
+    \(pg\_control checkPointCopy\.redo \+ TLI\); a failure is a WARNING\. The GUC was not registered at all; it now is
+    \(string, '', PGC\_SIGHUP, sample line\), read at each restartpoint\.
+    - Ported helpers: `ReplacePercentPlaceholders` \(percentrepl\.c\), `ExecuteRecoveryCommand` \(xlogarchive\.c\)\.
+    - Pins: `TestReplacePercentPlaceholders`, `TestRestartPointRunsArchiveCleanupCommand` \(skip arm runs nothing\);
+      the latter fails with the call removed\.
+    - Gates: units, `\-race` xlog, misc, postmaster, replication E2Es, tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): recovery\_end\_command unregistered; restore\_command context postmaster vs PG SIGHUP;
+      no ArchiveCleanupCommand wait event; PreallocXlogFiles; TruncateSUBTRANS on a hot standby\.
   - **Restartpoint skip arm raises minRecoveryPoint LANDED 2026\-10\-29 \(`28cdbd4a9`\)**\. Movement: none — recovery
     path\. CreateRestartPoint's skip arm runs `UpdateMinRecoveryPoint\(InvalidXLogRecPtr, true\)` before returning\.
     `runRecoveryFlush` now does the same through `raiseMinRecoveryPointToReplay`: minRecoveryPoint rises to the replay

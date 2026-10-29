@@ -387,7 +387,7 @@ Still missing (ledgered):
   reading~~ — resolved by the next section;
 - no `PreallocXlogFiles`;
 - no `TruncateSUBTRANS` at a restartpoint;
-- no `archive_cleanup_command`;
+- ~~no `archive_cleanup_command`~~ — resolved 2026-10-29 (see "archive\_cleanup\_command at a restartpoint");
 - restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
   `RequestCheckpoint`.
 
@@ -407,6 +407,32 @@ records none; that gap is ledgered.
 
 Pin: `TestRestartPointSkipRaisesMinRecoveryPointToReplay` covers three cases: raised, replay behind, and unset stays
 unset. It also asserts the skip arm still flushes nothing. Neutralising the call fails it.
+
+### archive\_cleanup\_command at a restartpoint \(2026\-10\-29, M0122\-0013\)
+
+`CreateRestartPoint` ends by running `archive_cleanup_command` through `ExecuteRecoveryCommand` (xlog.c,
+xlogarchive.c):
+- `%r` becomes the WAL file name of the oldest restartpoint. `GetOldestRestartPoint` reads pg\_control's
+  `checkPointCopy.redo` and timeline, which the restartpoint has just updated.
+- Placeholder substitution follows `replace_percent_placeholders`: `%%` is a literal `%`, and an unknown letter or a
+  trailing `%` is an invalid parameter value.
+- The command runs through `system()`. A non-zero exit is a WARNING (`failOnSignal` false).
+
+Until now goopg did not register the GUC at all. It existed only in the generated list of PG parameter names, so
+neither `SHOW` nor the restartpoint knew it. Now:
+- the GUC is registered as PG defines it (string, `''`, PGC\_SIGHUP), with its `postgresql.conf.sample` line;
+- `xlog.ReplacePercentPlaceholders` and `xlog.ExecuteRecoveryCommand` port the two C helpers;
+- the adopted restartpoint arm calls `runArchiveCleanupCommand` after WAL retention, and the skip arm returns before
+  it;
+- the checkpointer reads the GUC through `SetArchiveCleanupCommandSource` at every restartpoint, so a reloaded value
+  takes effect.
+
+Pins: `TestReplacePercentPlaceholders`; `TestRestartPointRunsArchiveCleanupCommand`, which checks that `%r` is segment
+3 for a redo in segment 3 and that the skip arm runs nothing.
+
+Still missing (ledgered): `recovery_end_command` is unregistered (it runs at the end of recovery with
+`failOnSignal` true); `restore_command` is registered as postmaster\-context where PG 18 has PGC\_SIGHUP; the
+command's `ArchiveCleanupCommand` wait event is not reported.
 
 ### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
 
