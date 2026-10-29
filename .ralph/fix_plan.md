@@ -977,6 +977,20 @@ heuristic stays live.)
     \(xlogrecovery\.c\); the writer crosses each switch; new TLI = newest \+ 1\.
   - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory`, `TestPromoteAfterRecoveryFollowsTimelines` \(both fail with
     the history ignored\)\.
+- [x] **P0\-E19 — a second goopg start on a live server's data directory ran recovery against it**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — corrupts a shared resource\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: the second start on another port ran crash
+  recovery, checkpointed into the live WAL, overwrote and then deleted the owner's postmaster\.pid; fixed: FATAL
+  "lock file "postmaster\.pid" already exists" before Open\)
+  - > **ESCALATION 2026\-10\-29 \(S2, shared\-resource corruption\) — RECORDED FOR THE OWNER; already fixed in\-task
+    > \(`ca0bde402`\)\.** Found while scoping M0122\-0013's restore\_command\-SIGHUP residual: a reload during
+    > recovery needs the pid file to exist then, and the lock it requires is this fix\.
+  - Symptom: goopg wrote postmaster\.pid only when the listener bound and never checked it at start\.
+  - Fix: PG's CreateDataDirLockFile \(miscinit\.c CreateLockFile\) before initdb\.Open — O\_EXCL, live owner refuses
+    with PG's errmsg/errhint, stale \(dead/own/parent/PG\_GRANDPARENT\_PID\) replaced; unlinked on exit while ours\.
+  - Pins: `TestCreateDataDirLockFile`, `TestStartRefusesLiveDataDirLock` \(fails with the lock skipped\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4173,6 +4187,20 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Data\-directory lock before recovery \+ SIGHUP during recovery LANDED 2026\-10\-29 \(`ca0bde402`\)** — fixes
+    P0\-E19 \(S2, recorded above\)\. Movement: none — server startup\. PG CreateDataDirLockFile runs before the startup
+    process; the startup process applies SIGHUP reloads at ProcessStartupProcInterrupts and RestoreArchivedFile reads
+    restore\_command per call\. goopg had no lock until the listener bound, and a SIGHUP before then killed it\.
+    - `control\.CreateDataDirLockFile` / `RemoveDataDirLockFile`; `startupReload` \(flag \+ synchronous
+      ProcessConfigFile at the fetch boundary and before srv\.Run\); `RunArchiveRecoveryWith`; `goopg reload` signals a
+      still\-starting server; `misc\.ReloadConfigEntries` shared with the server's reload\.
+    - Pins: `TestCreateDataDirLockFile`, `TestRemoveDataDirLockFileOnlyOwn`, `TestStartRefusesLiveDataDirLock`,
+      `TestStartupReloadAppliesSIGHUP`, `TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch` \(mutation\-checked\);
+      live probe: reload during a slow restore\_command applied at the next fetch\.
+    - Gates: units, postmaster, cmd/goopg, replication/promotion/archive E2Es, crash\-start/resetwal/amcheck ports,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): goopg's 5\-line pid file vs PG's 8\-line one; SIGTERM during start\-time recovery only
+      cancels the context and `goopg stop` cannot reach a server with no control socket yet\.
   - **hot\_standby = off refuses connections to a standby LANDED 2026\-10\-29 \(`1821d1af2`\)**\. Movement: none —
     connection admission\. PG canAcceptConnections → CAC\_NOTHOTSTANDBY: FATAL 57P03 "the database system is not
     accepting connections" / "Hot standby mode is disabled\." for every connection in recovery; goopg never read

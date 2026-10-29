@@ -172,3 +172,60 @@ the history chain and survive a restart. Both fail when the history is ignored.
 - Only 'latest' is supported; an explicit `recovery_target_timeline` or 'current' is not.
 - Local WAL that extends past a timeline switch is refused, where PG would read the newer timeline from that point.
 - Restored parent history files stay in pg\_wal; PG reads them to a temporary name.
+
+## Update 2026-10-29 — data-directory lock and SIGHUP during recovery (M0122-0013, `ca0bde402`; P0-E19)
+
+**The defect (S2, P0-E19).** goopg wrote `postmaster.pid` only once the listener was bound, and nothing read it at
+start. A second `goopg start` on the data directory of a live server, on another port, therefore:
+
+- ran crash recovery against the live server's WAL and wrote a checkpoint into it;
+- overwrote the owner's `postmaster.pid`;
+- served connections;
+- deleted the owner's lock file when it stopped.
+
+PG refuses at once in `CreateDataDirLockFile` (miscinit.c `CreateLockFile`).
+
+**The port.**
+- `control.CreateDataDirLockFile` follows `CreateLockFile` with `isDDLock`:
+  - It creates the file with `O_EXCL`, retrying up to 100 times.
+  - It refuses when the existing file names a live process, with PG's errmsg and errhint: `lock file
+    "postmaster.pid" already exists` and `Is another postmaster (PID n) running in data directory "…"?`. A negative
+    pid gives the `postgres` hint.
+  - An empty file is refused with "is empty" and a non-numeric one with "bogus data".
+  - A dead pid, our own pid, our parent's or `PG_GRANDPARENT_PID` is stale: the file is unlinked and the create
+    retried.
+  - Upstream's orphaned-shared-memory probe has no counterpart, because goopg backends are goroutines of the server
+    process.
+- `goopg start` takes the lock before `initdb.Open`, so before crash and archive recovery. A missing directory is still
+  reported by `Open`. The file first holds only the pid, the data directory and the start time; `WritePIDFile` fills in
+  the listen address and socket path when the listener binds. On exit, `RemoveDataDirLockFile` unlinks the file only
+  while it still names this process.
+- `ParsePIDFile` keeps the empty trailing lines of a startup-phase lock file.
+
+**SIGHUP during recovery.** With the pid now discoverable during recovery, `pg_ctl reload` (a `kill -HUP`) would have
+hit Go's default action for SIGHUP and terminated the process.
+- `startupReload` registers SIGHUP before the lock is taken. Its signal goroutine only sets a flag, as the startup
+  process's handler sets `got_SIGHUP`.
+- `process` applies `ProcessConfigFile(PGC_SIGHUP)` synchronously:
+  - at the archive-recovery fetch boundary (`ProcessStartupProcInterrupts`);
+  - once more before the server starts, after which the server's own handler takes over.
+- `RunArchiveRecoveryWith` reads `restore_command` before every fetch, as `RestoreArchivedFile` reads
+  `recoveryRestoreCommand` on each call.
+- `goopg reload` sends SIGHUP directly to a server whose socket line is still empty, as `pg_ctl reload` always does.
+- `misc.ReloadConfigEntries` reads postgresql.conf and then postgresql.auto.conf for both the server's reload and the
+  startup phase.
+
+**Pins:**
+- `TestCreateDataDirLockFile` and `TestRemoveDataDirLockFileOnlyOwn`.
+- `TestStartRefusesLiveDataDirLock`: the FATAL and HINT text; the owner's lock file and pg\_control are left unchanged.
+- `TestStartRecoverySignalWithoutRestoreCommandIsFatal`: the lock is released on a FATAL exit.
+- `TestStartupReloadAppliesSIGHUP` and `TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch`.
+- Each mechanism was mutation-checked.
+- A live probe sent `goopg reload` during a slow `restore_command`. The reload was applied at the next fetch, which then
+  used the new command.
+
+**Still open (ledgered):**
+- The lock file keeps goopg's 5-line format, not PG's 8-line `postmaster.pid` (port, socket directory, listen address,
+  shared-memory key, status line).
+- SIGTERM/SIGINT during start-time recovery cancels only the context. Recovery runs to the end, and `goopg stop` cannot
+  reach a server that has no control socket yet.
