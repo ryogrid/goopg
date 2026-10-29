@@ -778,8 +778,11 @@ func emitHashNodeLine(rows *[]Row, label string, indent int, c optimizer.Node, s
 // queue is drained in a loop because a sublink's own plan can
 // reference further sublinks, which assign higher numbers as they
 // are rendered (matching upstream's nested-SubPlan output).
-// spStats, when non-nil (the ANALYZE path), appends this sublink's
-// measured execution counters to its `SubPlan N` line.
+// spStats is unused for text since M0122-0021: PG prints the bare
+// `SubPlan N` / `InitPlan N` label (explain.c ExplainSubPlans) and reports
+// the subtree's work through each node's own (actual …), which goopg now
+// prints too. The sublink counters stay in ctx.SubPlanStats for tests and
+// diagnostics.
 func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, spStats map[optimizer.Expr]*SubPlanSiteStats, render func(optimizer.Node, int)) {
 	for {
 		pending := reg.takePending()
@@ -796,10 +799,6 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 				kind = "InitPlan"
 			}
 			line := detailIndent + fmt.Sprintf("%s %d", kind, sp.n)
-			if s := spStats[sp.expr]; s != nil {
-				line += fmt.Sprintf(" (calls=%d rebuilds=%d rescans=%d hits=%d misses=%d)",
-					s.Calls, s.Rebuilds, s.Rescans, s.CacheHits, s.CacheMisses)
-			}
 			*rows = append(*rows, Row{NewStringDatum(line)})
 			if sp.plan != nil {
 				// A PARAM_EXEC inside this body is supplied by this exact

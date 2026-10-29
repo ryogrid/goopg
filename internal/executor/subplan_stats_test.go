@@ -178,10 +178,11 @@ func TestSubPlanStatsNonCorrelatedCachesAfterFirst(t *testing.T) {
 	}
 }
 
-// TestSubPlanStatsExplainAnalyzeSurface checks the counters reach
-// the user: EXPLAIN ANALYZE annotates the `SubPlan N` line, plain
-// EXPLAIN leaves it bare (nothing has executed, so there is nothing
-// to report).
+// TestSubPlanStatsExplainAnalyzeSurface checks the counters still reach
+// ctx.SubPlanStats under EXPLAIN ANALYZE while the `SubPlan N` line stays
+// bare, as PG prints it (explain.c ExplainSubPlans). Until M0122-0021 the
+// line carried goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)`;
+// the subtree now reports its work through each node's own (actual …).
 func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
@@ -190,30 +191,28 @@ func TestSubPlanStatsExplainAnalyzeSurface(t *testing.T) {
 	// line is `SubPlan 2` (PG 18.3 plan_id order, M0146-0005bv).
 	const probe = "SELECT * FROM t1 WHERE t1.a = -999 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)"
 
-	plain := strings.Join(runExplainRows(t, ctx, "EXPLAIN "+probe), "\n")
-	for _, line := range strings.Split(plain, "\n") {
-		if strings.Contains(line, "SubPlan 2") && strings.Contains(line, "calls=") {
-			t.Errorf("plain EXPLAIN must not carry counters:\n%s", plain)
-		}
-	}
-
+	ctx.SubPlanStats = nil
 	analyzed := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE) "+probe), "\n")
-	var counterLine string
+	var subPlanLine string
 	for _, line := range strings.Split(analyzed, "\n") {
 		if strings.Contains(line, "SubPlan 2") {
-			counterLine = strings.TrimSpace(line)
+			subPlanLine = strings.TrimSpace(line)
 		}
 	}
-	if counterLine == "" {
+	if subPlanLine == "" {
 		t.Fatalf("no SubPlan line in EXPLAIN ANALYZE output:\n%s", analyzed)
 	}
-	for _, want := range []string{"calls=", "rebuilds=", "rescans=", "hits=", "misses="} {
-		if !strings.Contains(counterLine, want) {
-			t.Errorf("SubPlan line %q missing %q", counterLine, want)
+	if subPlanLine != "SubPlan 2" {
+		t.Errorf("SubPlan line %q: want the bare PG label `SubPlan 2`", subPlanLine)
+	}
+	var maxCalls int64
+	for _, st := range ctx.SubPlanStats {
+		if st != nil && st.Calls > maxCalls {
+			maxCalls = st.Calls
 		}
 	}
-	if !strings.Contains(counterLine, "calls=3") {
-		t.Errorf("SubPlan line %q: want calls=3 (one per t1 row)", counterLine)
+	if maxCalls != 3 {
+		t.Errorf("ctx.SubPlanStats max Calls = %d, want 3 (one per t1 row)", maxCalls)
 	}
 }
 

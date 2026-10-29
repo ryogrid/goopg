@@ -209,7 +209,9 @@ type Context struct {
 	// outer row, or reuse it?" — is invisible in EXPLAIN output
 	// otherwise, and was previously answered only by Fermi
 	// estimates (see the correlated-subquery-planning design
-	// bundle, gate V6). Surfaced by EXPLAIN ANALYZE.
+	// bundle, gate V6). Tests and diagnostics read it here; EXPLAIN
+	// ANALYZE no longer prints it on the SubPlan line, which PG prints
+	// bare (M0122-0021).
 	//
 	// Written on the single statement-executing goroutine, in the
 	// same style as the sublink result caches above; no synchronisation.
