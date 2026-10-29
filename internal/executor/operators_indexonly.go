@@ -24,6 +24,8 @@ import (
 type indexOnlyScanOp struct {
 	// cond is plan.Cond compiled for the per-row filter (C43).
 	cond compiledCond
+	// filterRemoved: as indexScanOp.filterRemoved (M0122-0021).
+	filterRemoved *int64
 
 	// probeForm resolves the probe key's columns once and forms fixed-width
 	// probes from a template (M0122-0012 slice 80).
@@ -106,6 +108,9 @@ type indexOnlyScanOp struct {
 // setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
 // ANALYZE can surface this scan's heap-fetch count (design 0118-0102).
 func (o *indexOnlyScanOp) setHeapFetchCounter(c *int64) { o.heapFetchCount = c }
+
+// setFilterRemoveCounter implements filterRemoveCounter (see indexScanOp's).
+func (o *indexOnlyScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 func newIndexOnlyScanOp(p *optimizer.IndexOnlyScan) *indexOnlyScanOp {
 	return &indexOnlyScanOp{plan: p}
@@ -600,6 +605,9 @@ func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 			if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+				if o.filterRemoved != nil {
+					*o.filterRemoved++
+				}
 				continue
 			}
 		}

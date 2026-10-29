@@ -317,6 +317,8 @@ type bitmapHeapScanOp struct {
 	// so Bitmap Index Scan / BitmapAnd / BitmapOr report actuals as PG's do
 	// (M0122-0021). nil outside EXPLAIN ANALYZE.
 	scope *instrumenter
+	// filterRemoved: the tuples Cond rejected (see indexScanOp's).
+	filterRemoved *int64
 
 	// borrowRows is set at Build when every operator up to a borrowing root
 	// consumes each row before the next Next() and keeps nothing of it
@@ -423,6 +425,9 @@ func newBitmapHeapScanOp(p *optimizer.BitmapHeapScan) *bitmapHeapScanOp {
 func (o *bitmapHeapScanOp) Schema() optimizer.Schema { return o.plan.Output() }
 
 func (o *bitmapHeapScanOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// setFilterRemoveCounter implements filterRemoveCounter (see indexScanOp's).
+func (o *bitmapHeapScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 // Open is the single-scan entry point: one-time setup, then let Next build the
 // bitmap lazily. A nested-loop parent instead calls openPrep once and Rescan per
@@ -926,6 +931,9 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 			return nil, read, cerr
 		}
 		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			if o.filterRemoved != nil {
+				*o.filterRemoved++
+			}
 			return nil, read, nil // filtered out; the caller skips a nil slot
 		}
 	}

@@ -236,6 +236,12 @@ func (o *indexScanOp) flushKills() {
 type indexScanOp struct {
 	// cond is plan.Cond compiled for the per-row filter (C43).
 	cond compiledCond
+	// filterRemoved counts the visible tuples cond rejected — PG's
+	// nfiltered1 on the scan node (execScan.h ExecScan,
+	// InstrCountFiltered1), shown as `Rows Removed by Filter`. Handed over
+	// by maybeInstrument or the NLI probe sidecar; nil outside EXPLAIN
+	// ANALYZE (M0122-0021).
+	filterRemoved *int64
 
 	// probeForm resolves the probe key's columns once and forms fixed-width
 	// probes from a template (M0122-0012 slice 80).
@@ -405,6 +411,11 @@ type indexScanOp struct {
 	// with. Set by lookupKey/lookupKeys, cleared per Rescan.
 	hashProbeFingerprint []byte
 }
+
+// setFilterRemoveCounter implements filterRemoveCounter: the probe owns its
+// Cond, so it owns the rejection count, as seqScanOp does for its absorbed
+// qual.
+func (o *indexScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
 
 func newIndexScanOp(p *optimizer.IndexScan) *indexScanOp {
 	return &indexScanOp{plan: p}
@@ -1302,6 +1313,9 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 				return nil, cerr
 			}
 			keepRow = !d.IsNull() && d.Kind == KindBool && d.BoolValue()
+			if !keepRow && o.filterRemoved != nil {
+				*o.filterRemoved++
+			}
 		}
 		if keepRow {
 			// Record the actual (HOT-resolved) live slot for

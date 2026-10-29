@@ -179,3 +179,43 @@ func TestExplainAnalyzeBitmapProducerActuals(t *testing.T) {
 		t.Errorf("a node reports loops=0:\n%s", par)
 	}
 }
+
+// TestExplainAnalyzeProbeCondRowsRemoved pins M0122-0021 residual 4: a
+// nested-loop index probe that evaluates its own Cond (the relation's local
+// quals, IndexScan.Cond) reports the tuples it rejected as `Rows Removed by
+// Filter`, per loop with PG's %.0f rounding — PG keeps the count as the scan
+// node's nfiltered1 (execScan.h ExecScan, InstrCountFiltered1;
+// explain.c show_instrumentation_count). indexScanOp rejected with a bare
+// `continue` and counted nothing, so the line was missing. Here 3 of the 10
+// probes are rejected: 3 / 10 loops prints `0`, exactly as PG 18.3 prints for
+// the same data. The index-only and bitmap heap probes count the same way.
+func TestExplainAnalyzeProbeCondRowsRemoved(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM mo JOIN mi ON mi.id = mo.k AND mi.v > 300")
+	out := strings.Join(lines, "\n")
+	want := []string{
+		"->  Index Scan using mi_pkey on mi (actual rows=0.70 loops=10)",
+		"Filter: (v > 300)",
+		"Rows Removed by Filter: 0",
+	}
+	at := -1
+	for i, l := range lines {
+		if strings.Contains(l, want[0]) {
+			at = i
+		}
+	}
+	if at < 0 {
+		t.Fatalf("no memoized index probe in:\n%s", out)
+	}
+	for i, w := range want[1:] {
+		got := ""
+		if at+2+i < len(lines) {
+			got = strings.TrimSpace(lines[at+2+i])
+		}
+		if got != w {
+			t.Errorf("probe detail line %d = %q, want %q:\n%s", i+2, got, w, out)
+		}
+	}
+}
