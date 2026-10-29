@@ -287,7 +287,12 @@ func buildNode(plan optimizer.Node, bound int, scope *instrumenter) (Operator, e
 				return nil, &ExecError{Code: "XX000", Pos: p.Pos(),
 					Message: fmt.Sprintf("NestedLoopIndexJoin memoizes a %T, which is not an index probe", innerScan)}
 			}
-			innerScan = newMemoizeOp(p.InnerMemo, probe)
+			// EXPLAIN ANALYZE instruments both nodes (M0122-0021 slice 2):
+			// the probe under the plan's inner node, the cache under
+			// InnerMemo — no-ops without a scope.
+			innerScan = instrumentNLIInner(p.InnerMemo, newMemoizeOp(p.InnerMemo, instrumentMemoProbe(p.Inner, probe, scope)), scope)
+		} else {
+			innerScan = instrumentNLIInner(p.Inner, innerScan, scope)
 		}
 		// M0071-0013 Stage D-1: NLI now composes outer + inner via
 		// a persistent VirtualSlot. outerMS.row is overwritten per

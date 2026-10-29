@@ -141,6 +141,32 @@ func TestMemoizeAnalyzeCounters(t *testing.T) {
 	}
 }
 
+// TestMemoizeAnalyzeNodeActuals pins M0122-0021 slice 2: the Memoize and
+// the probe under it print their own (actual …), as PG instruments both —
+// the cache loops once per outer row (ExecReScanMemoize) and the probe once
+// per cache miss, the only calls that reach it (nodeMemoize.c ExecMemoize).
+// Before the fix both lines printed no actuals: the NLI drives its inner
+// through nliInner, never through an instrumented Operator.
+func TestMemoizeAnalyzeNodeActuals(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	joined := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) "+memoizeJoinSQL), "\n")
+	for _, want := range []string{
+		"Memoize (actual rows=1.00 loops=40)",
+		"(actual rows=1.00 loops=10)", // the probe: one loop per miss
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q:\n%s", want, joined)
+		}
+	}
+	for _, l := range strings.Split(joined, "\n") {
+		if strings.Contains(l, "Index Scan") && strings.Contains(l, " on mi") && !strings.Contains(l, "loops=10)") {
+			t.Errorf("probe line %q does not report one loop per miss:\n%s", strings.TrimSpace(l), joined)
+		}
+	}
+}
+
 // TestMemoizeOverflowPassThrough — WorkMem so small no entry can be
 // stored: every probe misses, every completed entry overflows, and the
 // results are still exact (pass-through, never a partial serve).

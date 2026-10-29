@@ -264,6 +264,119 @@ func (o *instrumentedOp) RowsAffected() int64 {
 	return 0
 }
 
+// instrumentedNLIInner is maybeInstrument's twin for a nested-loop index
+// join's inner side (M0122-0021 slice 2). The probe and its Memoize are not
+// Operators — the join drives them through nliInner's BindOuter / Rescan /
+// Next — so buildNode built them bare and they reported no actuals at all,
+// serially and below a Gather alike. PG instruments both nodes: a Memoize
+// loops once per rescan (ExecReScanMemoize per outer row) and its probe
+// once per cache miss, since only a miss reaches it (nodeMemoize.c
+// ExecMemoize). Counting a loop per Rescan here yields exactly those
+// numbers. The stats file under the plan node in the active scope, so a
+// per-site scope below a Gather folds them like any other node.
+type instrumentedNLIInner struct {
+	inner nliInner
+	stats *nodeStats
+}
+
+// instrumentedMemoProbe is the same sidecar for the probe a Memoize caches:
+// memoProbe additionally hands over the probe's keys.
+type instrumentedMemoProbe struct {
+	*instrumentedNLIInner
+	probe memoProbe
+}
+
+func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrumenter) *instrumentedNLIInner {
+	stats := &nodeStats{timing: scope.timing}
+	scope.table[plan] = stats
+	if hf, ok := in.(heapFetchCounter); ok {
+		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
+	if fr, ok := in.(filterRemoveCounter); ok {
+		fr.setFilterRemoveCounter(&stats.filterRejected)
+	}
+	return &instrumentedNLIInner{inner: in, stats: stats}
+}
+
+// instrumentNLIInner wraps an NLI inner (a bare probe or a Memoize) when an
+// instrumentation scope is live; with none it returns in unchanged.
+func instrumentNLIInner(plan optimizer.Node, in nliInner, scope *instrumenter) nliInner {
+	if scope == nil || in == nil || plan == nil {
+		return in
+	}
+	return newInstrumentedNLIInner(plan, in, scope)
+}
+
+// instrumentMemoProbe wraps the probe under a Memoize when a scope is live.
+func instrumentMemoProbe(plan optimizer.Node, in memoProbe, scope *instrumenter) memoProbe {
+	if scope == nil || in == nil || plan == nil {
+		return in
+	}
+	return &instrumentedMemoProbe{instrumentedNLIInner: newInstrumentedNLIInner(plan, in, scope), probe: in}
+}
+
+func (o *instrumentedMemoProbe) probeKeys() []optimizer.Expr { return o.probe.probeKeys() }
+
+func (o *instrumentedNLIInner) Schema() optimizer.Schema       { return o.inner.Schema() }
+func (o *instrumentedNLIInner) openPrep(ctx *Context) error    { return o.inner.openPrep(ctx) }
+func (o *instrumentedNLIInner) BindOuter(slot SlotView, w int) { o.inner.BindOuter(slot, w) }
+func (o *instrumentedNLIInner) Close() error                   { return o.inner.Close() }
+func (o *instrumentedNLIInner) unwrapNLIInner() nliInner       { return o.inner }
+
+// Rescan starts a loop: PG's rescan ends the previous cycle (InstrEndLoop)
+// and the next ExecProcNode starts a new one. The probe's descent happens
+// here, so the call is timed into the loop like an Operator's Open.
+func (o *instrumentedNLIInner) Rescan(outerSlot SlotView, outerWidth int) error {
+	o.stats.loops++
+	o.stats.gotFirst = false
+	o.stats.loopNs = 0
+	if !o.stats.timing {
+		return o.inner.Rescan(outerSlot, outerWidth)
+	}
+	start := time.Now()
+	err := o.inner.Rescan(outerSlot, outerWidth)
+	d := time.Since(start).Nanoseconds()
+	o.stats.loopNs = d
+	o.stats.totalNs += d
+	return err
+}
+
+// Next mirrors instrumentedOp.Next: rows returned, the call's own time, and
+// the loop's time to its first row into startup.
+func (o *instrumentedNLIInner) Next() (TupleSlot, error) {
+	var start time.Time
+	if o.stats.timing {
+		start = time.Now()
+	}
+	slot, err := o.inner.Next()
+	if o.stats.timing {
+		d := time.Since(start).Nanoseconds()
+		o.stats.loopNs += d
+		o.stats.totalNs += d
+	}
+	if err != nil {
+		return slot, err
+	}
+	o.stats.rowsOut++
+	if o.stats.timing && !o.stats.gotFirst {
+		o.stats.startupNs += o.stats.loopNs
+		o.stats.gotFirst = true
+	}
+	return slot, nil
+}
+
+// unwrapNLIInner strips EXPLAIN ANALYZE sidecars so the FOR UPDATE
+// TID-provider walks see the concrete probe.
+func unwrapNLIInner(in nliInner) nliInner {
+	for {
+		w, ok := in.(interface{ unwrapNLIInner() nliInner })
+		if !ok {
+			return in
+		}
+		in = w.unwrapNLIInner()
+	}
+}
+
 // instrumentScopeCarrier is implemented by operators whose child-plan
 // buildNode calls happen lazily, inside their own Open(), rather than
 // during the original Build() dispatch that constructed them (e.g.
