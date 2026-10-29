@@ -4078,8 +4078,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         22/22·99/99·99/99, plan text byte\-identical\.
       - Discoveries \(ledgered\): no bounded \(top\-N\) sort, i\.e\. no ExecSetTupleBound through Limit / Gather Merge;
         VERBOSE `Output:` placement, qualification and narrowing differ from PG\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-site Buffers/WAL/memory; DML child
-      actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\. Execution differences \(record
+    - BUFFERS default done 2026\-10\-29 \(`ee57789ff`\): EXPLAIN ANALYZE now defaults BUFFERS on, as PG 18 does
+      \(explain\_state\.c `es\->buffers = buffers\_set ? es\->buffers : es\->analyze`\)\. An explicit BUFFERS OFF still
+      wins\.
+      - The old PG 17\-default test is inverted \(`TestExplainBuffersDefaultsToAnalyze` plus its JSON twin\)\.
+      - Pass\-required regress cases that run EXPLAIN ANALYZE without BUFFERS OFF \(select\_into\) print errors or
+        zero\-row plans only, so they are unaffected\.
+      - Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99; census
+        `routing\-20261029m` 22/22·99/99·99/99\.
+      - `make ea\-ratchet` FAILs: 8 NEW findings \(Q64 x7, Q99\)\. The binaries of the staged tree, HEAD and this
+        session's start \(997db829b\) all give the same result, so the failure is pre\-existing\. Ledgered with a bisect
+        resume point\.
+      - Ledgered: no `Planning:` Buffers section, because goopg's catalogs are not shared\-buffer pages\. The
+        per\-node Buffers numbers that now print by default are pool\-global deltas \(residual 5\)\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-site Buffers/WAL/memory \(now visible
+      by default, so next\); DML child actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\. Execution differences \(record
       only\): SubPlan value cache, shared/coop builds, corr hash map, TID\-bitmap lossify\. Adjacent renderer work
       ledgered outside this task's actuals scope: VERBOSE Output lines\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
@@ -6820,6 +6833,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `fdde69739` \(M0122\-0021 residual 12 changed internal/executor\) — `routing\-20261029l/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029k\.
+  - Census 2026\-10\-29 at `ee57789ff` \(M0122\-0021 BUFFERS default changed internal/executor\) — `routing\-20261029m/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. ea\-ratchet FAIL \(8 NEW, pre\-existing at 997db829b, ledgered\)\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
