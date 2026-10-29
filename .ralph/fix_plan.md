@@ -4001,9 +4001,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         `Heap Blocks:` line; the corr hash map scans once \(loops=1\) where PG re\-runs the SubPlan per call
         \(execution difference\)\.
       - Filed: M0122\-0022 \(row comparison against a multi\-column subquery errors\)\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): DML child actuals \+ MULTIEXPR SubPlan
-      rendering; per\-worker Memoize `Hits` lines; NLI probe Cond filter count; per\-site Buffers/WAL/memory;
-      uncorrelated ARRAY\(\) InitPlan label; `Heap Blocks:`\.
+    - Residual 4 done 2026\-10\-29 \(`c49bd9b71`\): index, index\-only and bitmap heap probes count their own Cond
+      rejections \(`filterRemoveCounter`; PG nfiltered1, execScan\.h InstrCountFiltered1\), so a nested\-loop probe
+      prints `Rows Removed by Filter`\.
+      - Taken ahead of the DML residual: no TPC\-H/TPC\-DS query is DML, and the DML path is a hand\-written heap
+        scanner \(`extractScan` → `scanMatching` / `updateViaIndex`\) with no operator tree to instrument\.
+      - The memoized probe is identical to a scratch PG 18\.3 \(`Rows Removed by Filter: 0` for 3 rejects over 10
+        loops\), apart from Memoize `Memory Usage` and `Index Searches`, which were already ledgered\.
+      - Test `TestExplainAnalyzeProbeCondRowsRemoved` \(mutation\-checked\)\. Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm
+        \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029g` 22/22·99/99·99/99\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-worker Memoize `Hits` lines;
+      `Heap Blocks:`; uncorrelated ARRAY\(\) InitPlan label; per\-site Buffers/WAL/memory; DML child actuals \+
+      MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6729,6 +6738,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - Census 2026\-10\-29 at `04cc96f3b` \(M0122\-0021 residual 1 changed internal/executor\) — `routing\-20261029e/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `d38dd96ed` \(M0122\-0021 residual 2 changed internal/executor\) — `routing\-20261029f/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `c49bd9b71` \(M0122\-0021 residual 4 changed internal/executor\) — `routing\-20261029g/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

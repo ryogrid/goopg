@@ -3,7 +3,7 @@
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
-producers). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+producers); residual 4 `c49bd9b71` (probe Cond rejection count). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -215,7 +215,13 @@ serially as well as in parallel plans.
    "Residual 2" above).
 3. Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
    `Worker N:  Hits:` line per worker.
-4. The NLI probe's own `Cond` filter has no rejection counter, so it prints no `Rows Removed by Filter`.
+4. ~~The NLI probe's own `Cond` filter has no rejection counter, so it prints no `Rows Removed by Filter`.~~ Fixed
+   2026-10-29 (`c49bd9b71`): `indexScanOp`, `indexOnlyScanOp` and `bitmapHeapScanOp` implement `filterRemoveCounter`
+   and count the visible tuples their Cond rejects. This is PG's `nfiltered1` (execScan.h `ExecScan`,
+   `InstrCountFiltered1`). `maybeInstrument` and the NLI probe sidecar already handed the counter over, and the
+   renderer already reads the scan node's own count. The memoized probe line is identical to PG 18.3's, including
+   `Rows Removed by Filter: 0` for 3 rejects over 10 loops (`%.0f` of the per-loop average). Test:
+   `TestExplainAnalyzeProbeCondRowsRemoved`.
 5. Buffers/WAL/memory are not aggregated across sites, because their counters are pool-global.
 6. goopg's correlated-SubPlan value cache lowers loops relative to PG. This is an execution difference.
 7. A shared or cooperative build reports one loop where PG reports one per participant. This is an execution
