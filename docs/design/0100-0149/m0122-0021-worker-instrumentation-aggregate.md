@@ -3,7 +3,7 @@
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
-producers); residual 4 `c49bd9b71` (probe Cond rejection count). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -213,8 +213,20 @@ serially as well as in parallel plans.
 2. ~~Expression-level subqueries built with `Build()` print no actuals: ARRAY(), row-constructor IN, multi-assignment
    SET, and the correlated hash map.~~ Fixed 2026-10-29 (`d38dd96ed`), together with the bitmap producers (see
    "Residual 2" above).
-3. Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
-   `Worker N:  Hits:` line per worker.
+3. ~~Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
+   `Worker N:  Hits:` line per worker.~~ Fixed 2026-10-29 (`910e30183`).
+   - The main line was already the leader's own counters, because the leader's site runs in the leader Context.
+     The workers' counters were lost: each worker Context's `MemoizeStats` was never merged back.
+   - `MergeWorkerContext` now folds them into `Context.MemoizeWorkerStats`, tagged with the worker's fan-out slot,
+     as `SortWorkerStats` already was.
+   - The renderer prints one `Worker N:  Hits: …` line per worker that missed at least once, sorted by slot, after
+     the Buffers/WAL/Memory lines, without VERBOSE. This is PG's `show_memoize_info` over `shared_info`, flushed by
+     `ExplainFlushWorkersState` at the node's end.
+   - TPC-DS Q72 SF0.25 has PG's shape: a leader line plus three worker lines, whose hits and misses sum to the
+     node's 61015 loops (capture `analysis/m0122/m0122-0021/q72-goopg-residual3.explain`).
+   - Test: `TestExplainAnalyzeMemoizeWorkerLines`.
+   - Under VERBOSE, PG nests each worker's lines in one block under its `Worker N:  actual …` line. goopg prints them
+     flat. This is ledgered as item 12.
 4. ~~The NLI probe's own `Cond` filter has no rejection counter, so it prints no `Rows Removed by Filter`.~~ Fixed
    2026-10-29 (`c49bd9b71`): `indexScanOp`, `indexOnlyScanOp` and `bitmapHeapScanOp` implement `filterRemoveCounter`
    and count the visible tuples their Cond rejects. This is PG's `nfiltered1` (execScan.h `ExecScan`,
@@ -233,3 +245,7 @@ serially as well as in parallel plans.
 10. Bitmap Heap Scan prints no `Heap Blocks: exact=… lossy=…` line (explain.c show_tidbitmap_info).
 11. The correlated value hash map scans the inner table once, so it reports `loops=1`. PG re-runs the SubPlan on every
     call. This is an execution difference, like 6.
+12. Under VERBOSE, PG writes each worker's lines into one block flushed at the node's end: `Worker N:  actual …`,
+    followed by that worker's `Hits:` / `Sort Method:` lines indented under it. goopg prints the `actual` lines
+    before Sort/Buffers and the Memoize/Sort worker lines as separate flat lines. Its flat Sort worker lines also
+    come before `Buffers:`, where PG's come after.

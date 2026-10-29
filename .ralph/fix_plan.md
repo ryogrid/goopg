@@ -4010,9 +4010,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         loops\), apart from Memoize `Memory Usage` and `Index Searches`, which were already ledgered\.
       - Test `TestExplainAnalyzeProbeCondRowsRemoved` \(mutation\-checked\)\. Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm
         \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029g` 22/22·99/99·99/99\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-worker Memoize `Hits` lines;
-      `Heap Blocks:`; uncorrelated ARRAY\(\) InitPlan label; per\-site Buffers/WAL/memory; DML child actuals \+
-      MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\.
+    - Residual 3 done 2026\-10\-29 \(`910e30183`\): below a Gather each worker's Memoize counters print as a
+      `Worker N:  Hits: …` line\.
+      - `MergeWorkerContext` folds each worker Context's `MemoizeStats` into `Context\.MemoizeWorkerStats`, tagged
+        with the worker's slot \(the SortWorkerStats discipline\)\. Before this, the worker counters were dropped at
+        the join\. The leader's own counters stay the main line, as PG's `mstate\->stats` do\.
+      - The renderer prints one line per worker that missed at least once, sorted by slot, after
+        Buffers/WAL/Memory, and without VERBOSE \(explain\.c show\_memoize\_info over `shared\_info`\)\.
+      - TPC\-DS Q72 SF0\.25 \(private clone `tmp/q64\-clone`\): the leader line plus Worker 0\.\.2 lines\. Their hits \+
+        misses sum to loops=61015, the same shape and total as PG\. Capture
+        `analysis/m0122/m0122\-0021/q72\-goopg\-residual3\.explain`\.
+      - Test `TestExplainAnalyzeMemoizeWorkerLines` \(mutation\-checked; leader participation off, so PG prints no main
+        line\)\. Gates: units, `\-race` on the parallel/explain families, tpch\-spotcheck, tpch\-acceptance\-arm
+        \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029h` 22/22·99/99·99/99\.
+      - New residual \(ledgered\): the VERBOSE per\-worker block layout\. PG nests each worker's Hits / Sort Method
+        lines under its `Worker N:  actual …` line, after Buffers\. goopg prints them as flat lines, and its Sort
+        worker lines come before Buffers\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): `Heap Blocks:`; uncorrelated ARRAY\(\)
+      InitPlan label; VERBOSE per\-worker block layout; per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR
+      SubPlan rendering \(last: no benchmark query is DML\)\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6740,6 +6756,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - Census 2026\-10\-29 at `d38dd96ed` \(M0122\-0021 residual 2 changed internal/executor\) — `routing\-20261029f/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `c49bd9b71` \(M0122\-0021 residual 4 changed internal/executor\) — `routing\-20261029g/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `910e30183` \(M0122\-0021 residual 3 changed internal/executor\) — `routing\-20261029h/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
