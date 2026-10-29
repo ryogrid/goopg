@@ -3,7 +3,8 @@
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
-producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan); residual 14 `28c6de6c8` (Rows Removed by Index
+Recheck). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -270,7 +271,13 @@ serially as well as in parallel plans.
 13. goopg's TID bitmap is sized and lossified by its own heuristic, not by PG's `tbm_calculate_entries` /
     `tbm_lossify`. At small `work_mem` it therefore goes lossy where PG stays exact. This is an execution difference;
     the `Heap Blocks:` line reports what goopg actually did.
-14. `Rows Removed by Index Recheck` (PG's `nfiltered2`) is not counted.
+14. ~~`Rows Removed by Index Recheck` (PG's `nfiltered2`) is not counted.~~ Fixed 2026-10-29 (`28c6de6c8`).
+    - `bitmapHeapScanOp` implements `recheckRemoveCounter` and counts each tuple the BitmapQual recheck rejects.
+    - The site counts are summed like `FilterRejected`.
+    - The renderer inserts the line directly under the node's `Recheck Cond:`, ahead of the Filter lines, as PG's
+      T_BitmapHeapScan arm orders them.
+    - Line order is identical to PG 18.3. The counts follow goopg's own lossify policy (item 13).
+    - Test: `TestExplainAnalyzeBitmapIndexRecheckRemoved`.
 11. The correlated value hash map scans the inner table once, so it reports `loops=1`. PG re-runs the SubPlan on every
     call. This is an execution difference, like 6.
 12. Under VERBOSE, PG writes each worker's lines into one block flushed at the node's end: `Worker N:  actual …`,

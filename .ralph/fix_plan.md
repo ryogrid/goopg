@@ -4057,9 +4057,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - New residuals \(ledgered\): ARRAY target width estimate \(8 vs PG 36\); VERBOSE Output lines for Result
         and sublink bodies; ARRAY result is a text string, not a typed array; `walkExprTree`'s other planner
         callers still stop at InExpr\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): `Rows Removed by Index Recheck`; VERBOSE
-      per\-worker block layout; per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR SubPlan rendering
-      \(last: no benchmark query is DML\)\.
+    - Residual 14 done 2026\-10\-29 \(`28c6de6c8`\): a Bitmap Heap Scan counts the tuples its BitmapQual recheck
+      rejects \(PG nfiltered2\) and prints `Rows Removed by Index Recheck` directly under `Recheck Cond:`\.
+      - Carried per site like FilterRejected \(summed\); the coop and prebuild folds carry it too\.
+      - Line order identical to a scratch PG 18\.3 at work\_mem=64kB\. The counts differ because goopg's bitmap
+        goes fully lossy \(2942 pages\) where PG keeps 869 exact and 2073 lossy\. That is the ledgered tbmLossify
+        heuristic, now quantified in the ledger\.
+      - Test `TestExplainAnalyzeBitmapIndexRecheckRemoved` \(mutation\-checked\)\. Gates: units, `\-race`,
+        tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census
+        `routing\-20261029k` 22/22·99/99·99/99\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): VERBOSE per\-worker block layout;
+      per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is
+      DML\)\. Execution differences \(record only\): SubPlan value cache, shared/coop builds, corr hash map, TID\-bitmap
+      lossify\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6794,6 +6804,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `7ad6a9d6b` \(M0122\-0021 residual 9 changed internal/optimizer \+ executor\) — `routing\-20261029j/`:
     TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029i\.
+  - Census 2026\-10\-29 at `28c6de6c8` \(M0122\-0021 residual 14 changed internal/executor\) — `routing\-20261029k/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
