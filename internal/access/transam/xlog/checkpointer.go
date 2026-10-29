@@ -1231,6 +1231,17 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			return fmt.Errorf("restartpoint pg_control read: %w", err)
 		}
 		if skip {
+			// The skip arm still runs UpdateMinRecoveryPoint(InvalidXLogRecPtr,
+			// true): minRecoveryPoint moves up to the end of the replayed WAL,
+			// so a standby restarted after this point does not open for
+			// read-only connections at a point before it (xlog.c, "it would be
+			// rather weird if the database opened up ... before the last
+			// shutdown") (M0122-0013).
+			if src := c.replayPosSrc.Load(); src != nil {
+				if err := raiseMinRecoveryPointToReplay(c.cfg.DataDir, (*src)()); err != nil {
+					return fmt.Errorf("restartpoint minRecoveryPoint update: %w", err)
+				}
+			}
 			if shutdown {
 				if _, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, true); err != nil {
 					return fmt.Errorf("restartpoint pg_control update: %w", err)
@@ -1296,6 +1307,33 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// raiseMinRecoveryPointToReplay is UpdateMinRecoveryPoint(InvalidXLogRecPtr,
+// true) as the checkpointer runs it (xlog.c): with pg_control's
+// minRecoveryPoint unset nothing moves (updateMinRecoveryPoint goes false);
+// otherwise minRecoveryPoint is raised to the replay position —
+// GetCurrentReplayRecPtr, PG's lastReplayedEndRecPtr, which is replayEnd
+// (StreamReplayer.ApplyLSN) — when that is later. The timeline stays
+// pg_control's: goopg's replayer follows one timeline and tracks none, so
+// minRecoveryPointTLI (or, unset, checkPointCopy's) is the replay timeline.
+func raiseMinRecoveryPointToReplay(dataDir string, replayEnd uint64) error {
+	raise := func(cd *control.ControlFileData) bool {
+		return cd.MinRecoveryPoint != 0 && cd.MinRecoveryPoint < replayEnd
+	}
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil || !raise(cd) {
+		return err
+	}
+	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		if !raise(cd) {
+			return
+		}
+		cd.MinRecoveryPoint = replayEnd
+		if cd.MinRecoveryPointTLI == 0 {
+			cd.MinRecoveryPointTLI = cd.CheckPointCopyThisTLI
+		}
+	})
 }
 
 // restartPointSkips is CreateRestartPoint's skip test: no replayed checkpoint

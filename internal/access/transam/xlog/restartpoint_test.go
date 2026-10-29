@@ -272,3 +272,71 @@ func TestShutdownRestartPointStampsShutdownedInRecovery(t *testing.T) {
 		t.Fatalf("non-shutdown flush with nothing to adopt changed state to %d", cd.State)
 	}
 }
+
+// TestRestartPointSkipRaisesMinRecoveryPointToReplay pins CreateRestartPoint's
+// skip arm: with no replayed checkpoint newer than pg_control's it flushes
+// nothing, yet still runs UpdateMinRecoveryPoint(InvalidXLogRecPtr, true), so
+// minRecoveryPoint rises to the replay position (GetCurrentReplayRecPtr). A
+// replay position behind minRecoveryPoint leaves it, and an unset
+// minRecoveryPoint stays unset (updateMinRecoveryPoint = false).
+func TestRestartPointSkipRaisesMinRecoveryPointToReplay(t *testing.T) {
+	cases := []struct {
+		name            string
+		minRecovery     uint64
+		replayEnd       uint64
+		wantMinRecovery uint64
+	}{
+		{"raised to the replay position", 9000, 12345, 12345},
+		{"replay behind minRecoveryPoint", 9000, 5000, 9000},
+		{"unset minRecoveryPoint stays unset", 0, 12345, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestControl(t, dir, control.DBStateInArchiveRecovery, 8192)
+			if err := control.UpdateControlFile(dir, func(cd *control.ControlFileData) {
+				cd.MinRecoveryPoint = tc.minRecovery
+				if tc.minRecovery != 0 {
+					cd.MinRecoveryPointTLI = 1
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: 1 << 16, PageHeaders: true, TimelineID: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			flusher := &fakeFlusher{}
+			cp := NewCheckpointer(flusher, w, CheckpointerConfig{DataDir: dir})
+			cp.SetRecoveryMode(true)
+			// pg_control already holds this checkpoint's redo: the skip arm.
+			cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+				return ReplayedCheckpoint{StartLSN: 8001, EndLSN: 8100, Fields: CheckPointFields{RedoLSN0: 8192, ThisTLI: 1}}, true
+			})
+			cp.SetReplayPositionSource(func() uint64 { return tc.replayEnd })
+			if err := cp.CheckpointNow(); err != nil {
+				t.Fatalf("recovery checkpoint: %v", err)
+			}
+			flusher.mu.Lock()
+			calls := flusher.calls
+			flusher.mu.Unlock()
+			if calls != 0 {
+				t.Errorf("the skip arm flushed %d time(s); PG returns before CheckPointGuts", calls)
+			}
+			cd, err := control.ReadControlFile(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cd.MinRecoveryPoint != tc.wantMinRecovery {
+				t.Errorf("minRecoveryPoint = %d, want %d", cd.MinRecoveryPoint, tc.wantMinRecovery)
+			}
+			if tc.wantMinRecovery != 0 && cd.MinRecoveryPointTLI != 1 {
+				t.Errorf("minRecoveryPointTLI = %d, want 1", cd.MinRecoveryPointTLI)
+			}
+			if cd.CheckPointCopyRedo != 8192 {
+				t.Errorf("the skip arm moved checkPointCopy.redo to %d", cd.CheckPointCopyRedo)
+			}
+		})
+	}
+}
