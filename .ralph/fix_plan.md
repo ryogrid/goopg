@@ -947,6 +947,22 @@ heuristic stays live.)
     evalRowFuncCallVsSubqueryExpr; then fix the `ROW\(\)` form's parameter binding\.
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(PG's rows for the three repros\)\.
 
+- [x] **P0\-E17 — recovery\.signal promotion wrote over WAL restored from the archive**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013, whose ledgered residual it was; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: post\-promotion record at 0x3000029 inside replayed
+  WAL ending 0x4001060 → after the fix it starts at EndOfLog on the new timeline\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`02bf60de2`\)\.**
+    > The defect was M0122\-0013's ledgered residual \(2026\-10\-21 row item 1\) and its fix was the slice in progress,
+    > so it landed under that task; filed here so the S2 record is complete\.
+  - Symptom: after archive recovery \(`recovery\.signal` \+ `restore\_command`\) the running WAL writer stayed at its
+    pre\-archive end on the old timeline; the first post\-promotion record overwrote restored WAL whose changes replay
+    had already applied — a crash then leaves pages ahead of their WAL; the history file named a TLI the WAL lacked\.
+  - Fix: `adoptRestoredWAL` \(restored bytes through `Writer\.AppendRaw`\) \+ `switchWriterToNewTimeline` \(shared with
+    the streaming promotion\): new timeline at EndOfLog, XLOG\_END\_OF\_RECOVERY first \(PG StartupXLOG\)\.
+  - Pin: `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(fails with the adoption removed\)\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -4142,6 +4158,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\.signal promotion adopts the restored WAL and switches timeline LANDED 2026\-10\-29 \(`02bf60de2`\)** —
+    fixes P0\-E17 \(S2, data loss, recorded above\)\. Movement: none — correctness fix — no plan instrument\.
+    - The writer used to resume at its pre\-archive end on the old TLI and overwrite restored, already\-replayed WAL\.
+    - `RunArchiveRecovery` returns the last record's start too; `adoptRestoredWAL` feeds the restored bytes through
+      `Writer\.AppendRaw`; `switchWriterToNewTimeline` \(factored out of the streaming promotion\) switches at EndOfLog
+      and writes XLOG\_END\_OF\_RECOVERY\.
+    - Pins: `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(byte\-identical restored segment, history = EndOfLog, new TLI,
+      new WAL ≥ EndOfLog, restart on the new TLI; mutation\-checked\), `TestPromoteAfterRecoveryHistorySwitchPoint`\.
+    - Gates: units, `\-race` xlog \+ cmd/goopg promotion, cmd/goopg, TestE2E\_Physical\* \+ NativeOnly…Promotion,
+      tpch\-spotcheck, sf025 99/99\.
   - **Archive\-recovery promotion records EndOfLog as the switch point LANDED 2026\-10\-29 \(`69c31e230`\)**\.
     Movement: none — recovery path\. PG writes the new timeline's history with EndOfLog \(end of the last replayed
     record\); goopg used the writer's pre\-archive WrittenLSN, so restored segments were left out of the boundary\.

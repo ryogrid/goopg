@@ -112,10 +112,25 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
   - `promoteAfterRecovery` uses the later of `endOfLog` and the writer's end.
   - Pins: `TestRunArchiveRecoveryFetchesThenStops` (`endOfLog` equals the archived record's end) and
     `TestPromoteAfterRecoveryHistorySwitchPoint` (restored vs nothing restored).
+- **The writer adopts the restored WAL and switches timeline** (`02bf60de2`; P0-E17, S2 data loss).
+  - **Defect:** after archive recovery the running writer still sat at its pre-archive end on the old timeline. A
+    probe showed the first post-promotion record written at `0x3000029`, inside replayed WAL ending at `0x4001060`, on
+    TLI 1. That record overwrote WAL whose changes were already in the data pages.
+  - **Fix:**
+    - `RunArchiveRecovery` also returns the last record's start.
+    - `adoptRestoredWAL` feeds the restored byte range [writer end, EndOfLog) through `Writer.AppendRaw`. That is the
+      walreceiver's path, and it writes the identical bytes back into the same files. The writer then stands where a
+      streaming standby's would.
+    - `switchWriterToNewTimeline` is factored out of the streaming promotion, and both promotions call it. It runs
+      `SwitchTimeline` at EndOfLog, writes `XLOG_END_OF_RECOVERY`, flushes, and sets `minRecoveryPoint`, as PG's
+      `StartupXLOG` (`XLogInitNewTimeline`, `CreateEndOfRecoveryRecord`) does.
+  - **Pin:** `TestPromoteAfterRecoveryAdoptsRestoredWAL` restores real archived segments, then checks:
+    - the restored segment is byte-identical after promotion;
+    - the history file names EndOfLog;
+    - the writer is on the new TLI, and new WAL starts at EndOfLog or later;
+    - a restart reopens on the new TLI.
+    It fails if the adoption is removed.
 - **Still open:**
-  - The running WAL writer is neither repositioned past the restored WAL nor switched to the new timeline after
-    archive recovery, so post-promotion WAL starts at the writer's old end on the old timeline (ledger 2026-10-21,
-    item 1). `endOfLog` is the boundary that switch will use.
   - The fetch loop still hardcodes TLI 1 (above).
   - goopg has no WAL archiver (`archive_mode` / `archive_command`, `.ready` / `.done`). So PG's
     `RemoveNonParentXlogFiles` exception for `.ready` segments and the old timeline's `.partial` rename, which needs

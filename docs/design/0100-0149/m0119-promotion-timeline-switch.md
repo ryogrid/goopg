@@ -134,3 +134,11 @@ desc: END_OF_RECOVERY tli 2; prev tli 1; time …; wal_level replica
   into future new-timeline names; goopg removes them.
 - **Promotion checkpoint.** PG requests one after the end-of-recovery
   record; goopg's checkpointer runs on its own schedule.
+
+## Update 2026-10-29 — recovery.signal promotion (M0122-0013, P0-E17)
+
+The archive-recovery promotion now goes through the same switch. `switchWriterToNewTimeline` (cmd/goopg/standby.go) is
+shared by both promotions. Before it switches, `promoteAfterRecovery` brings the writer to EndOfLog with
+`adoptRestoredWAL`, feeding the segments `restore_command` supplied through `Writer.AppendRaw`. Before this change
+the writer resumed at its pre-archive end and overwrote restored, already-replayed WAL (S2). Details are in
+`0130-0009-recovery-signal-archive-recovery.md`.
