@@ -404,7 +404,13 @@ func TestExplainAnalyzeVerboseWorkerBlocks(t *testing.T) {
 					continue // a Gather-level line, not the scan's
 				}
 				if i+1 >= len(lines) || !strings.HasPrefix(lines[i+1], strings.Repeat(" ", indent+2)+"Heap Blocks: exact=") {
-					t.Errorf("verbose: worker block %q is not followed by its Heap Blocks line indented one level:\n%s", trimmed, out)
+					// show_tidbitmap_info skips a worker with no exact or
+					// lossy pages (explain.c), so a worker the parallel
+					// bitmap scan handed no page has no Heap Blocks line.
+					if !strings.Contains(trimmed, "actual rows=0.00") {
+						t.Errorf("verbose: worker block %q is not followed by its Heap Blocks line indented one level:\n%s", trimmed, out)
+					}
+					continue
 				}
 				blocks++
 			} else if strings.Contains(trimmed, ":  Heap Blocks: exact=") {
