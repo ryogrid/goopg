@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
+	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/utils/misc"
 )
 
 // TestStandbyControllerPromoteRemovesSignal exercises the happy
@@ -1084,5 +1085,34 @@ func TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment(t *testing.T) {
 	defer rt.Close()
 	if rt.WAL.TimelineID() != newTLI || rt.WAL.WrittenLSN() <= trueEnd {
 		t.Errorf("after restart: TLI %d end %X, want TLI %d past %X", rt.WAL.TimelineID(), rt.WAL.WrittenLSN(), newTLI, trueEnd)
+	}
+}
+
+// TestRecoveryTargetTimelineReadsRawValue pins that an empty
+// recovery_target_timeline is not read as the default: PG's check hook
+// parses it as strtoul("") = timeline 0, which recovery then reports as
+// "recovery target timeline 0 does not exist". goopg's string-GUC helper
+// falls back to the default on an empty value, which turned an empty value into
+// 'latest'.
+func TestRecoveryTargetTimelineReadsRawValue(t *testing.T) {
+	for _, c := range []struct {
+		set  string
+		want xlog.TargetTimeline
+	}{
+		{"", xlog.TargetTimeline{Goal: xlog.TargetTimelineNumeric, TLI: 0}},
+		{"latest", xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}},
+		{"current", xlog.TargetTimeline{Goal: xlog.TargetTimelineCurrent}},
+		{"3", xlog.TargetTimeline{Goal: xlog.TargetTimelineNumeric, TLI: 3}},
+	} {
+		r := misc.BuildDefaultRegistry()
+		if err := r.Set("recovery_target_timeline", c.set, misc.SourceConfigFile); err != nil {
+			t.Fatalf("set %q: %v", c.set, err)
+		}
+		if got := recoveryTargetTimeline(r); got != c.want {
+			t.Errorf("recovery_target_timeline = %q: got %+v, want %+v", c.set, got, c.want)
+		}
+	}
+	if got := recoveryTargetTimeline(misc.BuildDefaultRegistry()); got != (xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}) {
+		t.Errorf("default: got %+v, want latest", got)
 	}
 }

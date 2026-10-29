@@ -956,6 +956,10 @@ func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, logger *slog.L
 		return 0
 	}
 	fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+	var fatal *xlog.RestoreFatalError
+	if errors.As(err, &fatal) && fatal.Detail != "" {
+		fmt.Fprintf(stderr, "DETAIL: %s\n", fatal.Detail)
+	}
 	return 1
 }
 
@@ -963,7 +967,15 @@ func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, logger *slog.L
 // for archive recovery; its check hook already rejected an unparseable
 // value when the configuration was loaded.
 func recoveryTargetTimeline(registry *misc.Registry) xlog.TargetTimeline {
-	goal, tli, _ := misc.ParseRecoveryTargetTimeline(stringGUC(registry, "recovery_target_timeline", "latest"))
+	// The raw value, not stringGUC's fallback: an empty setting is
+	// strtoul("") = timeline 0, which recovery then reports as missing.
+	value := "latest"
+	if registry != nil {
+		if v, ok := registry.Get("recovery_target_timeline"); ok {
+			value = v.Display()
+		}
+	}
+	goal, tli, _ := misc.ParseRecoveryTargetTimeline(value)
 	switch goal {
 	case misc.RecoveryTargetTimelineCurrent:
 		return xlog.TargetTimeline{Goal: xlog.TargetTimelineCurrent}

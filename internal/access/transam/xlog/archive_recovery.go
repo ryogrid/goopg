@@ -139,8 +139,13 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 	// (GetOldestRestartPoint — pg_control's checkPointCopy). Start-time
 	// recovery takes no restartpoints, so it is fixed for the whole pass.
 	lastRestartPointFname := XLogFileName(0, 0, segmentSize)
+	// CheckPointLoc: the latest checkpoint record (pg_control; goopg reads
+	// no backup_label at recovery), which must lie on the start timeline
+	// in the target's history.
+	var checkPointLoc uint64
 	if cd, err := control.ReadControlFile(dataDir); err == nil && cd != nil && cd.CheckPointCopyThisTLI != 0 {
 		startTLI = cd.CheckPointCopyThisTLI
+		checkPointLoc = cd.CheckPoint
 		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
 	}
 	// have reports whether name was restored from the archive or, failing
@@ -276,8 +281,22 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 			onHistory = onHistory || e.TLI == startTLI
 		}
 		res.Timelines = append(res.Timelines, TimelineSpan{TLI: targetTLI, Begin: begin})
+		// InitWalRecovery: the checkpoint must lie on its own timeline in
+		// the target's history. tliSwitchPoint fails first when the start
+		// timeline is not in that history at all; otherwise the checkpoint
+		// must precede the point where the target forked off from it
+		// (tliOfPointInHistory(CheckPointLoc, expectedTLEs) == CheckPointTLI).
 		if !onHistory {
-			return res, &RestoreFatalError{Msg: fmt.Sprintf("requested timeline %d is not a child of this server's history", targetTLI)}
+			return res, &RestoreFatalError{Msg: fmt.Sprintf("requested timeline %d is not in this server's history", startTLI)}
+		}
+		for _, e := range res.TargetHistory {
+			if e.TLI == startTLI && checkPointLoc >= e.SwitchLSN {
+				return res, &RestoreFatalError{
+					Msg: fmt.Sprintf("requested timeline %d is not a child of this server's history", targetTLI),
+					Detail: fmt.Sprintf("Latest checkpoint in file \"pg_control\" is at %X/%X on timeline %d, but in the history of the requested timeline, the server forked off from that timeline at %X/%X.",
+						uint32(checkPointLoc>>32), uint32(checkPointLoc), startTLI, uint32(e.SwitchLSN>>32), uint32(e.SwitchLSN)),
+				}
+			}
 		}
 	}
 	// restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI)

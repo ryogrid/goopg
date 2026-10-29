@@ -37,7 +37,11 @@ var ErrRecoveryShutdown = errors.New("archive recovery interrupted by a shutdown
 // (exit status above 125, wait_result_is_any_signal(rc, true)). Upstream
 // aborts recovery there because returning "not found" would make the
 // caller assume recovery is complete and start up the database.
-type RestoreFatalError struct{ Msg string }
+type RestoreFatalError struct {
+	Msg string
+	// Detail is the errdetail line, when the FATAL has one.
+	Detail string
+}
 
 func (e *RestoreFatalError) Error() string { return e.Msg }
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -429,5 +430,54 @@ func TestRunArchiveRecoveryKeepsIntermediateHistoryFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(3))); !os.IsNotExist(err) {
 		t.Errorf("the target timeline 3's history file was kept in pg_wal (err %v)", err)
+	}
+}
+
+// TestRunArchiveRecoveryCheckpointMustPrecedeTheFork pins InitWalRecovery's
+// two checks of the start point against the target timeline's history:
+//   - the start (checkpoint) timeline must be in that history at all —
+//     tliSwitchPoint's "requested timeline N is not in this server's
+//     history";
+//   - the checkpoint must lie before the point where the target forked off
+//     from it (tliOfPointInHistory(CheckPointLoc) == CheckPointTLI) — the
+//     "is not a child" FATAL with PG's errdetail.
+//
+// goopg only checked the first, and with the second's message, so a
+// checkpoint past the fork point was replayed onto the target's history.
+func TestRunArchiveRecoveryCheckpointMustPrecedeTheFork(t *testing.T) {
+	archive := t.TempDir()
+	const fork = uint64(0x5000)
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: fork, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(startTLI uint32, checkPoint uint64, target TargetTimeline) error {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestControl(t, dataDir, 0, checkPoint)
+		if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+			cd.CheckPointCopyThisTLI = startTLI
+			cd.CheckPoint = checkPoint
+		}); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		_, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, 1<<20, target)
+		return err
+	}
+
+	err := run(1, 0x6000, TargetTimeline{})
+	var fatal *RestoreFatalError
+	if !errors.As(err, &fatal) || fatal.Msg != "requested timeline 2 is not a child of this server's history" ||
+		fatal.Detail != `Latest checkpoint in file "pg_control" is at 0/6000 on timeline 1, but in the history of the requested timeline, the server forked off from that timeline at 0/5000.` {
+		t.Errorf("checkpoint past the fork: err = %v (%+v)", err, fatal)
+	}
+	if err := run(1, 0x4000, TargetTimeline{}); err != nil {
+		t.Errorf("checkpoint before the fork: %v", err)
+	}
+	err = run(3, 0x4000, TargetTimeline{Goal: TargetTimelineNumeric, TLI: 2})
+	if !errors.As(err, &fatal) || fatal.Msg != "requested timeline 3 is not in this server's history" {
+		t.Errorf("start timeline off the target's history: err = %v", err)
 	}
 }
