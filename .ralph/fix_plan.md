@@ -4066,10 +4066,22 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - Test `TestExplainAnalyzeBitmapIndexRecheckRemoved` \(mutation\-checked\)\. Gates: units, `\-race`,
         tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census
         `routing\-20261029k` 22/22·99/99·99/99\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): VERBOSE per\-worker block layout;
-      per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is
-      DML\)\. Execution differences \(record only\): SubPlan value cache, shared/coop builds, corr hash map, TID\-bitmap
-      lossify\.
+    - Residual 12 done 2026\-10\-29 \(`fdde69739`\): per\-worker lines print as PG's per\-worker blocks\.
+      - The VERBOSE `actual …` line and the Sort Method / Memoize Hits / Heap Blocks lines go into one `workerBlocks`
+        entry per slot\. The blocks are flushed after Buffers/WAL/Memory: first line `Worker N:  `, the rest indented
+        one level \(explain\.c ExplainOpenWorker / ExplainFlushWorkersState\)\. Non\-VERBOSE output is unchanged\.
+      - Layout identical to a scratch PG 18\.3 for a parallel Sort over a Parallel Bitmap Heap Scan\.
+      - Also: the BitmapHeapScan label honours the plan's Parallel flag \(`Parallel Bitmap Heap Scan`; the label half
+        of the open M0134\-0001 ledger row\)\.
+      - Test `TestExplainAnalyzeVerboseWorkerBlocks` \(mutation\-checked\)\. Gates: units, `\-race`, tpch\-spotcheck,
+        tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029l`
+        22/22·99/99·99/99, plan text byte\-identical\.
+      - Discoveries \(ledgered\): no bounded \(top\-N\) sort, i\.e\. no ExecSetTupleBound through Limit / Gather Merge;
+        VERBOSE `Output:` placement, qualification and narrowing differ from PG\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-site Buffers/WAL/memory; DML child
+      actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\. Execution differences \(record
+      only\): SubPlan value cache, shared/coop builds, corr hash map, TID\-bitmap lossify\. Adjacent renderer work
+      ledgered outside this task's actuals scope: VERBOSE Output lines\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6806,6 +6818,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029i\.
   - Census 2026\-10\-29 at `28c6de6c8` \(M0122\-0021 residual 14 changed internal/executor\) — `routing\-20261029k/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `fdde69739` \(M0122\-0021 residual 12 changed internal/executor\) — `routing\-20261029l/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029k\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

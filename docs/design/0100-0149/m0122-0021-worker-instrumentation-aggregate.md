@@ -4,7 +4,7 @@ Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
 producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan); residual 14 `28c6de6c8` (Rows Removed by Index
-Recheck). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+Recheck); residual 12 `fdde69739` (per-worker blocks). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -280,7 +280,20 @@ serially as well as in parallel plans.
     - Test: `TestExplainAnalyzeBitmapIndexRecheckRemoved`.
 11. The correlated value hash map scans the inner table once, so it reports `loops=1`. PG re-runs the SubPlan on every
     call. This is an execution difference, like 6.
-12. Under VERBOSE, PG writes each worker's lines into one block flushed at the node's end: `Worker N:  actual …`,
+12. ~~Under VERBOSE, PG writes each worker's lines into one block flushed at the node's end: `Worker N:  actual …`,
     followed by that worker's `Hits:` / `Sort Method:` lines indented under it. goopg prints the `actual` lines
     before Sort/Buffers and the Memoize/Sort worker lines as separate flat lines. Its flat Sort worker lines also
-    come before `Buffers:`, where PG's come after.
+    come before `Buffers:`, where PG's come after.~~ Fixed 2026-10-29 (`fdde69739`).
+    - `walkPlanAnalyzeFiltered` collects every per-worker line into a `workerBlocks` map keyed by fan-out slot:
+      the VERBOSE `actual …` line first, then the Sort Method, Memoize Hits or Heap Blocks detail.
+    - The map is flushed once, after the Buffers/WAL/Memory lines. Each block's first line carries the
+      `Worker N:  ` prefix, and later lines are indented two more spaces, as `ExplainOpenWorker` indents.
+    - Without VERBOSE every block is a single line, so that output is byte-identical to before.
+    - The same commit makes the BitmapHeapScan label honour the plan's `Parallel` flag.
+    - Test: `TestExplainAnalyzeVerboseWorkerBlocks`.
+15. goopg has no bounded (top-N) sort. A Limit's bound never reaches the Sort (PG's `ExecSetTupleBound`, which also
+    passes through Gather Merge), so the Sort's actuals and its `Sort Method:` line differ from PG's
+    `top-N heapsort`. This is an execution difference, ledgered.
+16. VERBOSE `Output:` lines differ from PG in placement (PG prints them under the node line), qualification,
+    narrowing, and presence (PG prints none on a Bitmap Index Scan). This renderer work is outside the actuals scope
+    and is ledgered.
