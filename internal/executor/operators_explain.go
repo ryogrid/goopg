@@ -134,7 +134,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, explainHashMem(ctx))
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx))
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -4012,6 +4012,9 @@ type subPlanReg struct {
 	// unexecuted nodes, and reg-less callers stay byte-identical.
 	sortStats   map[*optimizer.Sort]SortStat
 	sortWorkers map[*optimizer.Sort][]SortStat
+	// memoWorkers is the per-worker Memoize carrier (Context.
+	// MemoizeWorkerStats), held here for the same reason as sortWorkers.
+	memoWorkers map[*optimizer.Memoize][]MemoizeStats
 	// execParamSources is the owning sublink's validated PARAM_EXEC
 	// input map while that sublink body renders. It is body-scoped (set /
 	// restored by emitSubPlanSubtrees), not statement-global: PG resolves
@@ -6116,10 +6119,11 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, hashMem int64) {
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64) {
 	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
+	reg.memoWorkers = memoWorkers
 	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)
 }
 
@@ -6505,6 +6509,29 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if s, ok := stats[n]; ok && s != nil {
 			if line := formatMemoryLine(s); line != "" {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
+	// M0122-0021 residual 3: one `Worker N:  Hits: …` line per parallel
+	// worker that missed at least once, sorted by slot. PG writes these into
+	// the per-worker buffers (show_memoize_info → ExplainOpenWorker) and
+	// flushes them at the end of the node's details, after Buffers
+	// (ExplainFlushWorkersState); it prints them without VERBOSE. The
+	// leader's counters are the main line above.
+	if m, isMemo := n.(*optimizer.Memoize); isMemo && reg != nil {
+		if ws := reg.memoWorkers[m]; len(ws) > 0 {
+			ordered := make([]MemoizeStats, 0, len(ws))
+			for _, w := range ws {
+				if w.Misses > 0 {
+					ordered = append(ordered, w)
+				}
+			}
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
+					w.Worker, w.Hits, w.Misses, w.Evictions, w.Overflows))})
 			}
 		}
 	}

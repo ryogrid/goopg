@@ -37,6 +37,9 @@ type MemoizeStats struct {
 	Misses    int64
 	Evictions int64
 	Overflows int64
+	// Worker is the fan-out slot of a MemoizeWorkerStats entry; unused on
+	// the leader's MemoizeStats entry.
+	Worker int
 }
 
 // memoizeStat returns (lazily allocating) the stats block for m.

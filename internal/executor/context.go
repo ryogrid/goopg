@@ -222,6 +222,15 @@ type Context struct {
 	// SubPlanStats. Lazily allocated by memoizeStat. S7.
 	MemoizeStats map[*optimizer.Memoize]*MemoizeStats
 
+	// MemoizeWorkerStats carries one entry per parallel worker per
+	// executed Memoize node, tagged with the worker's fan-out slot and
+	// folded post-join by MergeWorkerContext — PG's
+	// MemoizeState.shared_info, rendered as `Worker N:  Hits: …` lines
+	// (explain.c show_memoize_info). The leader's own counters stay in
+	// MemoizeStats and render the main line, as PG's mstate->stats do.
+	// M0122-0021 residual 3.
+	MemoizeWorkerStats map[*optimizer.Memoize][]MemoizeStats
+
 	// HashJoinStats carries the per-hash-join ANALYZE counters
 	// (buckets / batches / peak memory), keyed by plan node like the two
 	// maps above. Lazily allocated by hashJoinStat. M0127-P3.5.
