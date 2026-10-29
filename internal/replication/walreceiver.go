@@ -28,12 +28,14 @@ package replication
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,6 +115,24 @@ type WalReceiverConfig struct {
 	// instead of silently downgrading to plaintext, since that would
 	// defeat the operator's explicit encryption requirement.
 	SSLMode string
+
+	// SystemID is the standby's own pg_control system identifier.
+	// IDENTIFY_SYSTEM's systemid must equal it, as WalReceiverMain
+	// requires ("database system identifier differs between the primary
+	// and standby"). Zero skips the comparison, for callers without a
+	// pg_control (in-process tests).
+	SystemID uint64
+
+	// StartTLI is the timeline streaming starts on — WalReceiverMain's
+	// startpointTLI, sent as START_REPLICATION's TIMELINE and checked
+	// against the primary's timeline. Zero means the local WAL writer's
+	// timeline.
+	StartTLI uint32
+
+	// WALDir is the standby's pg_wal, where the history files of the
+	// timelines between StartTLI and the primary's are written when
+	// missing (WalRcvFetchTimeLineHistoryFiles). Empty skips the fetch.
+	WALDir string
 }
 
 // WalReceiver is the standby-side replication client. Construct via
@@ -138,6 +158,9 @@ type WalReceiver struct {
 	// (in which case all the SetReceivedLSN / MarkMessageReceived
 	// calls become no-ops via the nil-check helpers below).
 	monHandle *xlog.Receiver
+
+	// primaryTLI is the primary's timeline IDENTIFY_SYSTEM reported.
+	primaryTLI uint32
 }
 
 // checkSSLMode rejects sslmode values that promise encryption goopg
@@ -201,6 +224,17 @@ func DialWalReceiver(ctx context.Context, cfg WalReceiverConfig) (*WalReceiver, 
 		_ = conn.Close()
 		return nil, err
 	}
+	if rec.cfg.StartTLI == 0 {
+		rec.cfg.StartTLI = cfg.WAL.TimelineID()
+	}
+	if err := rec.identifySystem(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := rec.fetchTimelineHistoryFiles(rec.cfg.StartTLI, rec.primaryTLI); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := rec.startStreaming(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -254,11 +288,157 @@ func (r *WalReceiver) handshake() error {
 	}
 }
 
+// queryResult is one replication command's result set, read by
+// replicationQuery.
+type queryResult struct {
+	nfields int
+	rows    [][][]byte
+}
+
+// replicationQuery runs a simple-query replication command and collects
+// its result set up to ReadyForQuery — libpqsrv_exec plus PQresultStatus
+// for the commands that return tuples. An ErrorResponse becomes the
+// returned error's text (PQerrorMessage).
+func (r *WalReceiver) replicationQuery(cmd string) (queryResult, error) {
+	var res queryResult
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return res, err
+	}
+	if err := r.w.Flush(); err != nil {
+		return res, err
+	}
+	var errMsg string
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return res, err
+		}
+		switch f.Type {
+		case libpq.MsgRowDescription:
+			if len(f.Payload) < 2 {
+				return res, errors.New("malformed RowDescription")
+			}
+			res.nfields = int(binary.BigEndian.Uint16(f.Payload))
+		case libpq.MsgDataRow:
+			row, err := decodeDataRow(f.Payload)
+			if err != nil {
+				return res, err
+			}
+			res.rows = append(res.rows, row)
+		case libpq.MsgErrorResponse:
+			errMsg = summariseErrorResponse(f.Payload)
+		case libpq.MsgReadyForQuery:
+			if errMsg != "" {
+				return res, errors.New(errMsg)
+			}
+			return res, nil
+		}
+	}
+}
+
+// decodeDataRow splits a DataRow payload into its column values (nil for
+// NULL). The values are copied: the frame reader reuses its buffer.
+func decodeDataRow(p []byte) ([][]byte, error) {
+	if len(p) < 2 {
+		return nil, errors.New("malformed DataRow")
+	}
+	n := int(binary.BigEndian.Uint16(p))
+	p = p[2:]
+	cols := make([][]byte, n)
+	for i := range cols {
+		if len(p) < 4 {
+			return nil, errors.New("malformed DataRow")
+		}
+		l := int32(binary.BigEndian.Uint32(p))
+		p = p[4:]
+		if l < 0 {
+			continue
+		}
+		if int(l) > len(p) {
+			return nil, errors.New("malformed DataRow")
+		}
+		cols[i] = append([]byte{}, p[:l]...)
+		p = p[l:]
+	}
+	return cols, nil
+}
+
+// identifySystem runs IDENTIFY_SYSTEM and makes WalReceiverMain's two
+// checks before streaming starts: the primary's system identifier must
+// equal the standby's own, and the primary's timeline must not be behind
+// the one streaming starts on. The result shape is libpqrcv_identify_system's
+// (one row, at least three fields).
+func (r *WalReceiver) identifySystem() error {
+	res, err := r.replicationQuery("IDENTIFY_SYSTEM")
+	if err != nil {
+		return fmt.Errorf("walreceiver: could not receive database system identifier and timeline ID from the primary server: %w", err)
+	}
+	if res.nfields < 3 || len(res.rows) != 1 {
+		return fmt.Errorf("walreceiver: invalid response from primary server: Could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields.",
+			len(res.rows), res.nfields, 1, 3)
+	}
+	primarySysid := string(res.rows[0][0])
+	tli, err := strconv.ParseInt(string(res.rows[0][1]), 10, 32)
+	if err != nil || tli < 0 {
+		return fmt.Errorf("walreceiver: invalid response from primary server: timeline %q", res.rows[0][1])
+	}
+	r.primaryTLI = uint32(tli)
+	if r.cfg.SystemID != 0 {
+		standbySysid := strconv.FormatUint(r.cfg.SystemID, 10)
+		if primarySysid != standbySysid {
+			return fmt.Errorf("walreceiver: database system identifier differs between the primary and standby: The primary's identifier is %s, the standby's identifier is %s.",
+				primarySysid, standbySysid)
+		}
+	}
+	if r.primaryTLI < r.cfg.StartTLI {
+		return fmt.Errorf("walreceiver: highest timeline %d of the primary is behind recovery timeline %d",
+			r.primaryTLI, r.cfg.StartTLI)
+	}
+	return nil
+}
+
+// fetchTimelineHistoryFiles writes the history file of every timeline in
+// [first, last] that pg_wal lacks, read with TIMELINE_HISTORY —
+// WalRcvFetchTimeLineHistoryFiles. Timeline 1 has none. The files are
+// fetched even for timelines recovery does not follow, so that a later
+// promotion (findNewestTimeLine) does not pick a timeline the primary
+// already used.
+func (r *WalReceiver) fetchTimelineHistoryFiles(first, last uint32) error {
+	if r.cfg.WALDir == "" {
+		return nil
+	}
+	for tli := first; tli <= last && tli != 0; tli++ {
+		if tli == 1 {
+			continue
+		}
+		name := xlog.TimelineHistoryFileName(tli)
+		if _, err := os.Stat(filepath.Join(r.cfg.WALDir, name)); err == nil {
+			continue
+		}
+		slog.Info(fmt.Sprintf("fetching timeline history file for timeline %d from primary server", tli))
+		res, err := r.replicationQuery(fmt.Sprintf("TIMELINE_HISTORY %d", tli))
+		if err != nil {
+			return fmt.Errorf("walreceiver: could not receive timeline history file from the primary server: %w", err)
+		}
+		if res.nfields != 2 || len(res.rows) != 1 {
+			return fmt.Errorf("walreceiver: invalid response from primary server: Expected 1 tuple with 2 fields, got %d tuples with %d fields.",
+				len(res.rows), res.nfields)
+		}
+		if string(res.rows[0][0]) != name {
+			return fmt.Errorf("walreceiver: primary reported unexpected file name for timeline history file of timeline %d", tli)
+		}
+		if err := xlog.WriteHistoryContent(r.cfg.WALDir, tli, res.rows[0][1]); err != nil {
+			return fmt.Errorf("walreceiver: %w", err)
+		}
+	}
+	return nil
+}
+
 // startStreaming sends START_REPLICATION and waits for the CopyBoth
 // handoff. Any ErrorResponse mid-handshake is reported to the caller
 // for human triage.
 func (r *WalReceiver) startStreaming() error {
-	cmd := buildStartReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN)
+	cmd := buildStartReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN, r.cfg.StartTLI)
 	if err := r.w.WriteQuery(cmd); err != nil {
 		return fmt.Errorf("walreceiver: write START_REPLICATION: %w", err)
 	}
@@ -514,12 +694,15 @@ func streamingStartLSN(written uint64, segSize int64) uint64 {
 	return written - written%uint64(segSize)
 }
 
-func buildStartReplicationCommand(slotName string, startLSN uint64) string {
+// buildStartReplicationCommand is libpqrcv_startstreaming's physical
+// command: the slot name double-quoted, no PHYSICAL keyword, and always
+// the TIMELINE of the start point.
+func buildStartReplicationCommand(slotName string, startLSN uint64, tli uint32) string {
+	cmd := "START_REPLICATION"
 	if slotName != "" {
-		return fmt.Sprintf("START_REPLICATION SLOT %s PHYSICAL %s",
-			slotName, formatLSN(startLSN))
+		cmd += fmt.Sprintf(" SLOT \"%s\"", slotName)
 	}
-	return fmt.Sprintf("START_REPLICATION PHYSICAL %s", formatLSN(startLSN))
+	return cmd + fmt.Sprintf(" %s TIMELINE %d", formatLSN(startLSN), tli)
 }
 
 // WalReceiverLauncherConfig is the narrow slice of the standby runtime the
@@ -548,6 +731,12 @@ type WalReceiverLauncherConfig struct {
 	// ApplyLSNFunc is forwarded to WalReceiverConfig.ApplyLSNFunc so
 	// standby status updates report real replay progress.
 	ApplyLSNFunc func() uint64
+
+	// SystemID and WALDir are forwarded to WalReceiverConfig: the
+	// standby's pg_control identifier IDENTIFY_SYSTEM must match, and the
+	// pg_wal fetched history files land in.
+	SystemID uint64
+	WALDir   string
 }
 
 // StartWalReceiver dials the primary identified by `primary_conninfo`
@@ -618,6 +807,8 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 				ApplicationName: appName,
 				ApplyLSNFunc:    cfg.ApplyLSNFunc,
 				SSLMode:         sslmode,
+				SystemID:        cfg.SystemID,
+				WALDir:          cfg.WALDir,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",

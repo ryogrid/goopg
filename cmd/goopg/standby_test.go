@@ -330,6 +330,56 @@ func TestStandbyControllerPromoteWritesTimelineHistory(t *testing.T) {
 	}
 }
 
+// TestStandbyControllerPromoteSkipsKnownTimelines: the new timeline is past
+// every timeline whose history file pg_wal holds — StartupXLOG's
+// findNewestTimeLine(recoveryTargetTLI) + 1 — not the standby's own plus
+// one. The walreceiver fetches the primary's history files for exactly this:
+// a standby on timeline 1 whose primary already reached timeline 3 must not
+// reuse timeline 2 or 3 when it is promoted.
+func TestStandbyControllerPromoteSkipsKnownTimelines(t *testing.T) {
+	dataDir := initStandbyDir(t)
+	walDir := filepath.Join(dataDir, "pg_wal")
+	for tli, body := range map[uint32]string{
+		2: "1\t0/3000098\tno recovery target specified\n",
+		3: "1\t0/3000098\tno recovery target specified\n2\t0/5000060\tno recovery target specified\n",
+	} {
+		if err := os.WriteFile(filepath.Join(walDir, xlog.TimelineHistoryFileName(tli)), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := startStandby(parent, rt, nil, logger)
+	defer sc.Close()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := sc.Promote(context.Background()); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(walDir, "00000004.history"))
+	if err != nil {
+		t.Fatalf("read the new timeline's history: %v", err)
+	}
+	if !bytes.HasPrefix(body, []byte("1\t")) {
+		t.Errorf("timeline 4 history = %q, want it to fork from timeline 1", body)
+	}
+	tliBytes, err := os.ReadFile(filepath.Join(dataDir, "global", "timeline_id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(tliBytes); got != 4 {
+		t.Errorf("persisted TLI = %d, want 4", got)
+	}
+}
+
 // TestStandbyControllerPromoteRetryableAfterFailure is the review/260831-2
 // CM-1 guard. A Promote that fails (here: a cancelled context caught while
 // waiting for the walreceiver to exit) leaves the node a standby, so the

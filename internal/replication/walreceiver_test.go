@@ -227,3 +227,15 @@ func TestParsePrimaryConninfoFull(t *testing.T) {
 		t.Fatalf("default sslmode = %q, want empty", sslmode)
 	}
 }
+
+// TestBuildStartReplicationCommand: the physical command is
+// libpqrcv_startstreaming's — slot name double-quoted, no PHYSICAL
+// keyword, always the start point's TIMELINE.
+func TestBuildStartReplicationCommand(t *testing.T) {
+	if got, want := buildStartReplicationCommand("standby", 0x3000000, 2), `START_REPLICATION SLOT "standby" 0/3000000 TIMELINE 2`; got != want {
+		t.Errorf("with slot = %q, want %q", got, want)
+	}
+	if got, want := buildStartReplicationCommand("", 0x100000000, 1), `START_REPLICATION 1/0 TIMELINE 1`; got != want {
+		t.Errorf("without slot = %q, want %q", got, want)
+	}
+}

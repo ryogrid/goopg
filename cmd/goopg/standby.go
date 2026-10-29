@@ -184,12 +184,20 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		// WAL, as PG's XLogPageRead does, not by the received WAL.
 		rt.Checkpointer.SetReplayPositionSource(replayer.ApplyLSN)
 	}
+	var systemID uint64
+	var rcvWALDir string
+	if rt.DataDir != "" {
+		systemID, _ = initdb.LoadOrCreateSystemID(rt.DataDir)
+		rcvWALDir = walDirFor(rt)
+	}
 	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
 		WAL:          rt.WAL,
 		Receivers:    rt.WalReceivers,
 		Registry:     registry,
 		Logger:       logger,
 		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
+		SystemID:     systemID,
+		WALDir:       rcvWALDir,
 	})
 
 	sc := &standbyController{
@@ -374,8 +382,12 @@ func (sc *standbyController) finalizePromotion() error {
 		if err != nil {
 			return fmt.Errorf("promote: load timeline_id: %w", err)
 		}
-		newTLI := oldTLI + 1
 		walDir := walDirFor(sc.rt)
+		// StartupXLOG: newTLI = findNewestTimeLine(recoveryTargetTLI) + 1.
+		// The walreceiver fetches the primary's history files, so a
+		// timeline the primary (or a sibling standby) already used is
+		// skipped instead of reused.
+		newTLI := xlog.FindNewestTimeline(walDir, oldTLI) + 1
 
 		// The switch point is the end of the last record replay
 		// applied: received bytes past it are a partial record, which

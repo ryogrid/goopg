@@ -268,7 +268,7 @@ func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
 	}
 	row := [][]byte{
 		[]byte(systemID),
-		[]byte(formatTimeline(s.cfg.Timeline)),
+		[]byte(formatTimeline(s.currentTimeline())),
 		[]byte(formatLSN(lsn)),
 		nil, // dbname is NULL for physical replication
 	}
@@ -494,7 +494,7 @@ func (s *Handler) replyReadReplicationSlot(w *libpq.FrameWriter, args string) er
 		if slot.RestartLSN != 0 {
 			row[1] = []byte(formatLSN(slot.RestartLSN))
 			// Reserved slot positions are on the current timeline (M0130-S8).
-			row[2] = []byte(formatTimeline(s.cfg.Timeline))
+			row[2] = []byte(formatTimeline(s.currentTimeline()))
 		}
 	}
 	if err := w.WriteDataRow(row); err != nil {
@@ -533,10 +533,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// M0130-S8: validate and resolve timeline. Zero means "current timeline"
 	// (the default when the client omits TIMELINE). An explicit TLI must not
 	// exceed the current timeline (PG rejects a TLI in the future).
-	curTLI := s.cfg.Timeline
-	if curTLI == 0 {
-		curTLI = 1 // server not configured with a TLI — default bootstrap
-	}
+	curTLI := s.currentTimeline()
 	if args.Timeline != 0 {
 		if args.Timeline > int(curTLI) {
 			return s.writeQueryError(w, errcodes.InternalError,
@@ -1099,6 +1096,24 @@ func parseReplicationSlotOptions(raw string, kind xlog.SlotKind) error {
 		}
 	}
 	return nil
+}
+
+// currentTimeline is the timeline the server is writing WAL on — the WAL
+// writer's, which a promotion moves (walsender.c reports
+// GetWALInsertionTimeLine), else the configured one read at startup;
+// zero reads as timeline 1. Config.Timeline alone stayed on the old
+// timeline after an in-process promotion.
+func (s *Handler) currentTimeline() uint32 {
+	tli := s.cfg.Timeline
+	if s.cfg.WAL != nil {
+		if w := s.cfg.WAL.TimelineID(); w != 0 {
+			tli = w
+		}
+	}
+	if tli == 0 {
+		tli = 1
+	}
+	return tli
 }
 
 // formatTimeline returns the TLI as a decimal string for the IDENTIFY_SYSTEM
