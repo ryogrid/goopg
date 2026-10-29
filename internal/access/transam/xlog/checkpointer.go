@@ -351,6 +351,24 @@ type Checkpointer struct {
 	priorRedoLSN               uint64
 	checkPointDistanceEstimate float64
 
+	// runMu makes checkpoints one at a time, as PG's single checkpointer
+	// process does: the timer and volume triggers, SQL CHECKPOINT, base
+	// backup, promotion and the shutdown checkpoint used to be able to run
+	// runCheckpoint concurrently (M0122-0013).
+	runMu sync.Mutex
+	// pendingImmediate counts callers waiting for runMu that want an
+	// IMMEDIATE checkpoint; immediateWake interrupts a spread checkpoint's
+	// pacer sleep. Together they are PG's ImmediateCheckpointRequested:
+	// CheckpointWriteDelay stops throttling once an immediate request is
+	// queued, so the running checkpoint finishes at full speed and the
+	// waiter's own checkpoint follows.
+	pendingImmediate atomic.Int32
+	immediateWake    chan struct{}
+	// requestC carries RequestCheckpoint's no-wait requests to Run;
+	// loopRunning reports whether Run is serving it.
+	requestC    chan struct{}
+	loopRunning atomic.Bool
+
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
 	// num_timed     — timer-driven cycles
@@ -390,9 +408,11 @@ func (c *Checkpointer) Stats() Stats {
 func NewCheckpointer(flusher DirtyPageFlusher, wal checkpointWAL, cfg CheckpointerConfig) *Checkpointer {
 	cfg.withDefaults()
 	c := &Checkpointer{
-		flusher: flusher,
-		wal:     wal,
-		cfg:     cfg,
+		flusher:       flusher,
+		wal:           wal,
+		cfg:           cfg,
+		immediateWake: make(chan struct{}, 1),
+		requestC:      make(chan struct{}, 1),
 	}
 	c.statsResetAt.Store(time.Now().UnixNano())
 	return c
@@ -591,6 +611,8 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	// seed and be absorbed into the anchor, which silently widens the
 	// first max_wal_size window. Production semantics are unchanged —
 	// both hooks still bracket the entire timer/volume loop.
+	c.loopRunning.Store(true)
+	defer c.loopRunning.Store(false)
 	if c.cfg.OnLoopStart != nil {
 		c.cfg.OnLoopStart()
 	}
@@ -602,6 +624,13 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-c.requestC:
+			// RequestCheckpoint: a forced, spread checkpoint — PG's
+			// CHECKPOINT_FORCE without IMMEDIATE. No idle skip (FORCE);
+			// counted as requested, not timed.
+			if err := c.runCheckpointOpts(ctx, checkpointOpts{spread: true}); err != nil {
+				c.cfg.Logger.Warn("requested checkpoint failed", "err", err)
+			}
 		case <-timer.C:
 			// Idle skip (xlog.c:7005–7019): a timeout checkpoint that would
 			// start at the same WAL position as the last completed one is a
@@ -760,7 +789,37 @@ func (c *Checkpointer) elapsedSegmentsNeeded() uint64 {
 // subcommand both call this. Spread/throttling is bypassed;
 // the caller asked for fast.
 func (c *Checkpointer) CheckpointNow() error {
-	return c.runCheckpoint(context.Background(), false, false)
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{})
+}
+
+// RequestCheckpoint asks for a forced checkpoint without waiting for it —
+// PG's RequestCheckpoint(CHECKPOINT_FORCE) (checkpointer.c): the request
+// sets the checkpointer's flags and wakes it, and the checkpoint is spread
+// over checkpoint_completion_target like a timed one. Requests made while
+// one is pending coalesce, as PG ORs request flags. Reports whether Run is
+// serving requests; when it is not (no checkpointer loop: tools, tests) the
+// request is dropped and the caller decides what to do.
+func (c *Checkpointer) RequestCheckpoint() bool {
+	if c == nil || !c.loopRunning.Load() {
+		return false
+	}
+	select {
+	case c.requestC <- struct{}{}:
+	default: // one is already pending; it will cover this request
+	}
+	return true
+}
+
+// announceImmediate registers a waiter for an IMMEDIATE checkpoint and
+// wakes a spread checkpoint's pacer so it stops throttling.
+func (c *Checkpointer) announceImmediate() {
+	c.pendingImmediate.Add(1)
+	select {
+	case c.immediateWake <- struct{}{}:
+	default:
+	}
 }
 
 // CheckpointShutdown runs a synchronous shutdown checkpoint: identical
@@ -775,7 +834,9 @@ func (c *Checkpointer) CheckpointNow() error {
 // WAL regardless of State, so this is primarily an on-disk
 // compatibility surface (M0110-0004 / RW-002).
 func (c *Checkpointer) CheckpointShutdown() error {
-	return c.runCheckpoint(context.Background(), false, true)
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{shutdown: true})
 }
 
 // SetRecoveryMode makes checkpoints flush received data without appending a
@@ -881,12 +942,36 @@ func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
 }
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
+	return c.runCheckpointOpts(ctx, checkpointOpts{spread: spread, shutdown: shutdown, timed: spread})
+}
+
+// checkpointOpts are the checkpoint request flags runCheckpointOpts acts on.
+type checkpointOpts struct {
+	spread   bool // paced over checkpoint_completion_target (not IMMEDIATE)
+	shutdown bool // shutdown checkpoint: pg_control state DB_SHUTDOWNED
+	timed    bool // checkpoint_timeout cause: pg_stat_checkpointer num_timed
+}
+
+// runCheckpointOpts runs one checkpoint, serialised with every other one
+// (runMu), as PG's single checkpointer process runs one at a time.
+func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) error {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+	spread, shutdown := o.spread, o.shutdown
+	if spread && c.pendingImmediate.Load() == 0 {
+		// A wake left by an immediate request that has since been served
+		// must not cut this checkpoint's first pacing step short.
+		select {
+		case <-c.immediateWake:
+		default:
+		}
+	}
 	if c.recoveryMode.Load() {
 		return c.runRecoveryFlush(ctx, shutdown)
 	}
 	start := time.Now()
 	checkpointType := "requested"
-	if spread {
+	if o.timed {
 		checkpointType = "scheduled"
 	}
 	// M0057-0001: log checkpoint start so benchmark runs can confirm
@@ -1151,7 +1236,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			c.cfg.Logger.Warn("pg_control update failed after checkpoint", "err", err)
 		}
 	}
-	if spread {
+	if o.timed {
 		c.numTimed.Add(1)
 	} else {
 		c.numRequested.Add(1)
@@ -1479,6 +1564,12 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 		if progress >= 1.0 {
 			return nil
 		}
+		// ImmediateCheckpointRequested (checkpointer.c CheckpointWriteDelay):
+		// a queued IMMEDIATE request ends the throttling, so this
+		// checkpoint finishes at full speed and the waiter's follows.
+		if c.pendingImmediate.Load() > 0 {
+			return nil
+		}
 		deadline := start.Add(time.Duration(float64(target) * progress))
 		wait := time.Until(deadline)
 		if wait <= 0 {
@@ -1487,6 +1578,8 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.immediateWake:
+			return nil
 		case <-time.After(wait):
 			return nil
 		}

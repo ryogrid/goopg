@@ -441,7 +441,7 @@ func (sc *standbyController) finalizePromotion() error {
 	// StartupXLOG ends a promotion by requesting an online checkpoint
 	// (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c): not needed for
 	// consistency, but the last restartpoint may be far back.
-	promotionCheckpoint(sc.rt, sc.logger)
+	promotionCheckpoint(sc.rt, false, sc.logger)
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil
 }
@@ -453,12 +453,16 @@ func (sc *standbyController) finalizePromotion() error {
 // call it once the writer is on the new timeline and the checkpointer has
 // left recovery mode, so the checkpoint record and pg_control's
 // checkPointCopy carry the new timeline and a crash replays from here
-// instead of from the last restartpoint. It runs synchronously: PG's
-// promoted request does not wait, but goopg's checkpointer has no request
-// queue and does not serialise concurrent runs (ledger M0122-0013). A
-// failure is a WARNING — recovery itself is complete and the next scheduled
-// checkpoint redoes the bookkeeping, as endOfRecoveryCheckpoint treats it.
-func promotionCheckpoint(rt *initdb.Runtime, logger *slog.Logger) {
+// instead of from the last restartpoint.
+//
+// wait selects the arm: the archive-recovery end waits for an immediate
+// checkpoint (CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT); a promotion
+// only requests a forced, spread one and goes on
+// (RequestCheckpoint(CHECKPOINT_FORCE)) — served by the checkpointer loop,
+// or run here when no loop is serving requests. A failure is a WARNING:
+// recovery itself is complete and the next scheduled checkpoint redoes the
+// bookkeeping, as endOfRecoveryCheckpoint treats it.
+func promotionCheckpoint(rt *initdb.Runtime, wait bool, logger *slog.Logger) {
 	if rt == nil || rt.Checkpointer == nil {
 		return
 	}
@@ -472,6 +476,9 @@ func promotionCheckpoint(rt *initdb.Runtime, logger *slog.Logger) {
 				"writer_tli", rt.WAL.TimelineID(), "control_tli", cd.CheckPointCopyThisTLI)
 			return
 		}
+	}
+	if !wait && rt.Checkpointer.RequestCheckpoint() {
+		return
 	}
 	if err := rt.Checkpointer.CheckpointNow(); err != nil {
 		logger.Warn("end-of-recovery checkpoint failed; promotion is complete but pg_control still points at the last restartpoint", "err", err)
@@ -725,7 +732,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	// end-of-recovery checkpoint before anything else (PerformRecoveryXLogAction:
 	// CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT), and before
 	// CleanupAfterArchiveRecovery runs recovery_end_command.
-	promotionCheckpoint(rt, logger)
+	promotionCheckpoint(rt, true, logger)
 
 	// CleanupAfterArchiveRecovery runs recovery_end_command once archive
 	// recovery has ended (xlog.c). A signal-killed command is FATAL: the

@@ -1188,3 +1188,149 @@ type nilDiscardWriter struct{}
 func (nilDiscardWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
+
+// concurrencyFlusher records how many FlushAll calls overlap.
+type concurrencyFlusher struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+}
+
+func (f *concurrencyFlusher) FlushAll() error {
+	f.mu.Lock()
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	f.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	f.mu.Lock()
+	f.active--
+	f.mu.Unlock()
+	return nil
+}
+
+// TestCheckpointerSerialisesCheckpoints pins that checkpoints run one at a
+// time, as PG's single checkpointer process runs them (M0122-0013): SQL
+// CHECKPOINT, base backup, promotion and the shutdown checkpoint used to be
+// able to run runCheckpoint concurrently with each other and the timer.
+func TestCheckpointerSerialisesCheckpoints(t *testing.T) {
+	w, err := NewWriter(Config{WALDir: filepath.Join(t.TempDir(), "pg_wal"), SegmentSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	flusher := &concurrencyFlusher{}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
+		Interval: time.Hour,
+		Logger:   slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := cp.CheckpointNow(); err != nil {
+				t.Errorf("CheckpointNow: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if flusher.maxActive != 1 {
+		t.Errorf("%d checkpoints flushed at once, want 1", flusher.maxActive)
+	}
+}
+
+// slowPacedFlusher drives the spread pacer for n steps.
+type slowPacedFlusher struct {
+	n       int
+	started chan struct{}
+}
+
+func (p *slowPacedFlusher) FlushAll() error { return nil }
+
+func (p *slowPacedFlusher) FlushAllPaced(pacer func(progress float64) error) error {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	for i := 0; i < p.n; i++ {
+		if err := pacer(float64(i+1) / float64(p.n)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TestCheckpointerImmediateRequestEndsSpreadPacing pins PG's
+// ImmediateCheckpointRequested (checkpointer.c CheckpointWriteDelay): an
+// IMMEDIATE request queued behind a spread checkpoint ends its throttling,
+// so the request is served in time instead of after checkpoint_timeout ×
+// checkpoint_completion_target.
+func TestCheckpointerImmediateRequestEndsSpreadPacing(t *testing.T) {
+	w, err := NewWriter(Config{WALDir: filepath.Join(t.TempDir(), "pg_wal"), SegmentSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	flusher := &slowPacedFlusher{n: 10, started: make(chan struct{}, 1)}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
+		Interval:         20 * time.Second,
+		CompletionTarget: 0.9, // the spread checkpoint alone would take ~18 s
+		Logger:           slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+	spreadDone := make(chan error, 1)
+	go func() { spreadDone <- cp.runCheckpoint(context.Background(), true, false) }()
+	<-flusher.started
+	start := time.Now()
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatalf("CheckpointNow: %v", err)
+	}
+	if err := <-spreadDone; err != nil {
+		t.Fatalf("spread checkpoint: %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("immediate checkpoint waited %v behind the spread one; the pacer should stop throttling", took)
+	}
+}
+
+// TestCheckpointerRequestCheckpoint pins RequestCheckpoint — PG's
+// RequestCheckpoint(CHECKPOINT_FORCE) without WAIT: refused (false) when no
+// Run loop serves requests; with the loop running it returns at once, the
+// loop takes the checkpoint, and it counts as requested, not timed.
+func TestCheckpointerRequestCheckpoint(t *testing.T) {
+	w, err := NewWriter(Config{WALDir: filepath.Join(t.TempDir(), "pg_wal"), SegmentSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	started := make(chan struct{})
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		Interval:    time.Hour,
+		Logger:      slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+		OnLoopStart: func() { close(started) },
+	})
+	if cp.RequestCheckpoint() {
+		t.Fatal("RequestCheckpoint accepted with no Run loop serving it")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = cp.Run(ctx); close(done) }()
+	<-started
+	if !cp.RequestCheckpoint() {
+		t.Fatal("RequestCheckpoint refused with the Run loop running")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for cp.LastCheckpointLSN() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cp.LastCheckpointLSN() == 0 {
+		t.Fatal("the requested checkpoint never ran")
+	}
+	if st := cp.Stats(); st.NumRequested != 1 || st.NumTimed != 0 {
+		t.Errorf("stats = requested %d timed %d, want 1 / 0", st.NumRequested, st.NumTimed)
+	}
+	cancel()
+	<-done
+}
