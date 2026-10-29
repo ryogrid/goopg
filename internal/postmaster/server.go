@@ -380,6 +380,10 @@ type Server struct {
 	// runCancel cancels Run's context; StopImmediate uses it. Set once Run
 	// has created the context.
 	runCancel atomic.Pointer[context.CancelFunc]
+	// runCtx is Run's context; shuttingDown reads it. A session's own
+	// context is also cancelled by a terminate or a disconnect, so it cannot
+	// tell a server shutdown apart.
+	runCtx atomic.Pointer[context.Context]
 	// immediateStopping is set by StopImmediate before it cancels Run's
 	// context: sessions then end the way quickdie does (PMQUIT_FOR_STOP),
 	// not with the fast-shutdown FATAL.
@@ -648,6 +652,7 @@ func (s *Server) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	s.runCancel.Store(&runCancel)
+	s.runCtx.Store(&runCtx)
 	if s.cfg.DataDir != "" {
 		if err := s.startControlPlane(runCtx, runCancel, ln); err != nil {
 			return err
@@ -871,6 +876,36 @@ func (s *Server) writeQuickdie(w *libpq.FrameWriter) {
 		{Code: libpq.FieldMessage, Value: "terminating connection due to immediate shutdown command"},
 	})
 	_ = w.Flush()
+}
+
+// shuttingDown reports whether Run's context is cancelled — a fast or
+// immediate stop is under way.
+func (s *Server) shuttingDown() bool {
+	p := s.runCtx.Load()
+	return p != nil && (*p).Err() != nil
+}
+
+// shutdownEndsStatement reports a statement a server stop cut short the way
+// the backend's interrupt handling does, in place of the statement's own
+// error:
+//   - an immediate stop: quickdie's notice (writeQuickdie);
+//   - a fast stop: the statement's cancellation becomes die()'s FATAL 57P01
+//     "terminating connection due to administrator command" —
+//     ProcessInterrupts checks ProcDiePending before QueryCancelPending, so
+//     the client never sees "canceling statement due to user request".
+//
+// It returns errShutdownSent when it wrote the message (the caller closes
+// the connection without writing anything else), nil otherwise.
+func (s *Server) shutdownEndsStatement(w *libpq.FrameWriter, code errcodes.Code) error {
+	if s.immediateStopping.Load() {
+		s.writeQuickdie(w)
+		return errShutdownSent
+	}
+	if code == errcodes.QueryCanceled && s.shuttingDown() {
+		s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+		return errShutdownSent
+	}
+	return nil
 }
 
 // reloadConfig re-parses cfg.ConfigPath (if set) and re-applies its
@@ -1966,7 +2001,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// A statement an immediate stop cut short without reaching
 				// writeQueryError still gets quickdie's notice before the
 				// connection closes.
-				if s.immediateStopping.Load() && !errors.Is(err, errQuickdieSent) {
+				if s.immediateStopping.Load() && !errors.Is(err, errShutdownSent) {
 					s.writeQuickdie(w)
 				}
 				return

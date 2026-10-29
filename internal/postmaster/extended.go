@@ -84,6 +84,11 @@ func newExtendedState() *extendedState {
 }
 
 func (s *Server) writeExtendedMessageError(w *libpq.FrameWriter, em *extendedMessageError) error {
+	// As in writeQueryError: a stop's message replaces the error, and the
+	// non-nil return closes the connection.
+	if err := s.shutdownEndsStatement(w, em.Code); err != nil {
+		return err
+	}
 	routine := em.Routine
 	if routine == "" {
 		routine = "postmaster.runPostStartupLoop"

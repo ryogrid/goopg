@@ -1,8 +1,10 @@
 package postmaster
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"github.com/goopg/goopg/internal/utils/activity"
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/libpq"
+	"github.com/goopg/goopg/internal/utils/errcodes"
 )
 
 // startTestServer launches a Server bound to an ephemeral port and returns
@@ -624,6 +627,74 @@ func TestFastStopSendsAdminShutdownFatal(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after the fast stop")
+	}
+}
+
+// TestShutdownReplacesStatementCancel: a statement a fast stop cancels is
+// reported with die()'s FATAL alone — ProcessInterrupts checks
+// ProcDiePending before QueryCancelPending, so PG never sends the 57014
+// "canceling statement due to user request" first. Both error writers
+// (simple query and extended protocol) take the same path; an error that
+// is not the cancellation, or one raised while the server runs, is written
+// as before.
+func TestShutdownReplacesStatementCancel(t *testing.T) {
+	writeBoth := func(s *Server, code errcodes.Code) (simpleErr, extErr error, frames []libpq.Frame) {
+		var buf bytes.Buffer
+		w := libpq.NewFrameWriter(&buf)
+		simpleErr = s.writeQueryError(w, code, "canceling statement due to user request")
+		extErr = s.writeExtendedMessageError(w, &extendedMessageError{Code: code, Message: "canceling statement due to user request"})
+		_ = w.Flush()
+		r := libpq.NewFrameReader(&buf)
+		for {
+			f, err := r.ReadFrame()
+			if err != nil {
+				break
+			}
+			// The reader reuses its payload buffer across frames.
+			f.Payload = append([]byte(nil), f.Payload...)
+			frames = append(frames, f)
+		}
+		return simpleErr, extErr, frames
+	}
+	stopping := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stopping.runCtx.Store(&ctx)
+
+	simpleErr, extErr, frames := writeBoth(stopping, errcodes.QueryCanceled)
+	if !errors.Is(simpleErr, errShutdownSent) || !errors.Is(extErr, errShutdownSent) {
+		t.Fatalf("errors = %v, %v; want errShutdownSent from both writers", simpleErr, extErr)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want one FATAL per writer", len(frames))
+	}
+	for _, f := range frames {
+		if f.Type != libpq.MsgErrorResponse {
+			t.Fatalf("got message %c, want an ErrorResponse", f.Type)
+		}
+		got := parseErrorFields(t, f.Payload)
+		if got['S'] != "FATAL" || got['C'] != "57P01" || got['M'] != "terminating connection due to administrator command" {
+			t.Errorf("error fields = %v, want die()'s FATAL 57P01", got)
+		}
+	}
+
+	// Any other error during the stop is the statement's own.
+	simpleErr, extErr, frames = writeBoth(stopping, errcodes.DivisionByZero)
+	if !errors.Is(simpleErr, errQueryErrorSent) || extErr != nil || len(frames) != 3 {
+		t.Fatalf("non-cancel error during a stop: errors %v, %v, %d frames; want the plain ERROR path", simpleErr, extErr, len(frames))
+	}
+
+	// A cancellation while the server runs (pg_cancel_backend) is the
+	// ordinary 57014 ERROR.
+	running := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	live := context.Background()
+	running.runCtx.Store(&live)
+	simpleErr, _, frames = writeBoth(running, errcodes.QueryCanceled)
+	if !errors.Is(simpleErr, errQueryErrorSent) || len(frames) != 3 {
+		t.Fatalf("cancel while running: error %v, %d frames; want ERROR + ReadyForQuery + ERROR", simpleErr, len(frames))
+	}
+	if got := parseErrorFields(t, frames[0].Payload); got['S'] != "ERROR" || got['C'] != "57014" {
+		t.Errorf("cancel while running fields = %v, want ERROR 57014", got)
 	}
 }
 
