@@ -2,6 +2,8 @@ package xlog
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -148,7 +150,7 @@ func TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch(t *testing.T) {
 		return working
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize)
+	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize, TargetTimeline{})
 	if err != nil {
 		t.Fatalf("RunArchiveRecoveryWith: %v", err)
 	}
@@ -265,5 +267,90 @@ func TestRunArchiveRecoveryFollowsTimelineHistory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 1))); !os.IsNotExist(err) {
 		t.Errorf("timeline 1's copy of the switch segment was restored (err %v); timeline 2's should win", err)
+	}
+}
+
+// TestRunArchiveRecoveryTargetTimeline pins recovery_target_timeline's
+// other goals (validateRecoveryParameters): 'current' and a numeric
+// timeline follow that timeline's history instead of the newest one; a
+// numeric timeline with no history file is FATAL "recovery target timeline
+// N does not exist" (timeline 1 never has one). Whatever the target, the
+// newest archived timeline is still found, so the promotion's new timeline
+// cannot collide with it. goopg only ever followed 'latest'.
+func TestRunArchiveRecoveryTargetTimeline(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switchLSN := w.WrittenLSN()
+	_, prev := w.InsertPosition()
+	if err := w.SwitchTimeline(2, switchLSN, prev); err != nil {
+		t.Fatal(err)
+	}
+	var end uint64
+	for w.WrittenLSN() < 3*uint64(segSize)+uint64(segSize)/2 {
+		if _, e, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		} else {
+			end = e
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(target TargetTimeline) (ArchiveRecoveryResult, error) {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, target)
+	}
+
+	for _, c := range []struct {
+		name   string
+		target TargetTimeline
+		tli    uint32
+		end    uint64
+	}{
+		{"current", TargetTimeline{Goal: TargetTimelineCurrent}, 1, switchLSN},
+		{"numeric 1", TargetTimeline{Goal: TargetTimelineNumeric, TLI: 1}, 1, switchLSN},
+		{"numeric 2", TargetTimeline{Goal: TargetTimelineNumeric, TLI: 2}, 2, end},
+		{"latest", TargetTimeline{}, 2, end},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := run(c.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.TargetTLI != c.tli || res.EndTLI != c.tli || res.EndOfLog != c.end {
+				t.Errorf("target %d, end TLI %d, EndOfLog %X; want target %d ending at %X on it",
+					res.TargetTLI, res.EndTLI, res.EndOfLog, c.tli, c.end)
+			}
+			if res.NewestTLI != 2 {
+				t.Errorf("newest TLI %d, want 2 (the archive's newest, whatever the target)", res.NewestTLI)
+			}
+		})
+	}
+	for _, tli := range []uint32{5, 0} {
+		_, err := run(TargetTimeline{Goal: TargetTimelineNumeric, TLI: tli})
+		var fatal *RestoreFatalError
+		if want := fmt.Sprintf("recovery target timeline %d does not exist", tli); !errors.As(err, &fatal) || fatal.Msg != want {
+			t.Errorf("target %d: err = %v, want FATAL %q", tli, err, want)
+		}
 	}
 }

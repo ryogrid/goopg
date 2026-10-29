@@ -46,11 +46,32 @@ type ArchiveRecoveryResult struct {
 	// EndOfLogTLI); 0 when nothing was replayed.
 	EndTLI uint32
 	// NewestTLI is the newest timeline whose history file exists locally or
-	// in the archive (findNewestTimeLine). The promotion's new timeline is
-	// NewestTLI+1, so it cannot collide with one already in the archive.
+	// in the archive, probing from the target (findNewestTimeLine). The
+	// promotion's new timeline is NewestTLI+1, so it cannot collide with one
+	// already in the archive.
 	NewestTLI uint32
+	// TargetTLI is the recovery target timeline (recoveryTargetTLI): the
+	// timeline whose history recovery follows.
+	TargetTLI uint32
 	// Timelines is the expected history, oldest first (expectedTLEs).
 	Timelines []TimelineSpan
+}
+
+// TargetTimelineGoal is recovery_target_timeline's kind
+// (RecoveryTargetTimeLineGoal); the zero value is 'latest', the default.
+type TargetTimelineGoal int
+
+const (
+	TargetTimelineLatest  TargetTimelineGoal = iota // 'latest': findNewestTimeLine
+	TargetTimelineCurrent                           // 'current': pg_control's timeline
+	TargetTimelineNumeric                           // an explicit timeline ID
+)
+
+// TargetTimeline is recovery_target_timeline: the goal and, for
+// TargetTimelineNumeric, the requested timeline.
+type TargetTimeline struct {
+	Goal TargetTimelineGoal
+	TLI  uint32
 }
 
 // RunArchiveRecovery executes the archive-recovery loop, following the
@@ -74,7 +95,7 @@ type ArchiveRecoveryResult struct {
 // segmentSize of 0 means "derive from the cluster's own WAL" (via
 // detectSegmentSizeAt / DefaultSegmentSize).
 func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) (ArchiveRecoveryResult, error) {
-	return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return restoreCommand }, segmentSize)
+	return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return restoreCommand }, segmentSize, TargetTimeline{})
 }
 
 // RunArchiveRecoveryWith is RunArchiveRecovery with restore_command read
@@ -89,7 +110,7 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // in_restore_command); either way the result wraps ErrRecoveryShutdown and
 // recovery is left unfinished. A *RestoreFatalError from a fetch aborts
 // recovery instead of ending it, as upstream's FATAL does.
-func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64) (ArchiveRecoveryResult, error) {
+func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -148,22 +169,64 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		_ = os.Remove(filepath.Join(walDir, RecoveryXLogName))
 		_ = os.Remove(filepath.Join(walDir, RecoveryHistoryName))
 	}()
-	res.NewestTLI = startTLI
-	for probe := startTLI + 1; ; probe++ {
-		ok, err := have(TimelineHistoryFileName(probe), RecoveryHistoryName, 0)
+	// findNewestTimeLine: the newest timeline whose history file exists,
+	// probing upward from start.
+	findNewest := func(start uint32) (uint32, error) {
+		newest := start
+		for probe := start + 1; ; probe++ {
+			ok, err := have(TimelineHistoryFileName(probe), RecoveryHistoryName, 0)
+			if err != nil {
+				return 0, err
+			}
+			if !ok {
+				return newest, nil
+			}
+			newest = probe
+		}
+	}
+	// validateRecoveryParameters' recovery_target_timeline step.
+	targetTLI := startTLI
+	switch target.Goal {
+	case TargetTimelineNumeric:
+		// Timeline 1 does not have a history file, all else should.
+		if target.TLI != 1 {
+			ok, err := have(TimelineHistoryFileName(target.TLI), RecoveryHistoryName, 0)
+			if err != nil {
+				return res, fmt.Errorf("wal: archive recovery: %w", err)
+			}
+			if !ok {
+				return res, &RestoreFatalError{Msg: fmt.Sprintf("recovery target timeline %d does not exist", target.TLI)}
+			}
+		}
+		targetTLI = target.TLI
+	case TargetTimelineLatest:
+		newest, err := findNewest(startTLI)
 		if err != nil {
 			return res, fmt.Errorf("wal: archive recovery: %w", err)
 		}
-		if !ok {
-			break
+		targetTLI = newest
+	}
+	res.TargetTLI = targetTLI
+	// The promotion's new timeline is findNewestTimeLine(recoveryTargetTLI)
+	// + 1 whatever the target, so it cannot collide with an archived one.
+	res.NewestTLI = targetTLI
+	if target.Goal != TargetTimelineLatest {
+		newest, err := findNewest(targetTLI)
+		if err != nil {
+			return res, fmt.Errorf("wal: archive recovery: %w", err)
 		}
-		res.NewestTLI = probe
+		res.NewestTLI = newest
 	}
 	res.Timelines = []TimelineSpan{{TLI: startTLI}}
-	if res.NewestTLI != startTLI {
-		entries, err := ReadHistory(walDir, res.NewestTLI)
-		if err != nil {
-			return res, fmt.Errorf("wal: archive recovery: %w", err)
+	if targetTLI != startTLI {
+		// expectedTLEs = readTimeLineHistory(recoveryTargetTLI); the start
+		// timeline must be on it (InitWalRecovery's "not a child" FATAL).
+		var entries []TimelineHistoryEntry
+		if targetTLI != 1 {
+			var err error
+			if entries, err = ReadHistory(walDir, targetTLI); err != nil {
+				return res, fmt.Errorf("wal: archive recovery: %w", err)
+			}
 		}
 		res.Timelines = res.Timelines[:0]
 		var begin uint64
@@ -173,9 +236,9 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 			begin = e.SwitchLSN
 			onHistory = onHistory || e.TLI == startTLI
 		}
-		res.Timelines = append(res.Timelines, TimelineSpan{TLI: res.NewestTLI, Begin: begin})
+		res.Timelines = append(res.Timelines, TimelineSpan{TLI: targetTLI, Begin: begin})
 		if !onHistory {
-			return res, fmt.Errorf("wal: archive recovery: requested timeline %d is not a child of this server's history (timeline %d)", res.NewestTLI, startTLI)
+			return res, &RestoreFatalError{Msg: fmt.Sprintf("requested timeline %d is not a child of this server's history", targetTLI)}
 		}
 	}
 

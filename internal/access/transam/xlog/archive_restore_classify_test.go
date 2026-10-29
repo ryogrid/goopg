@@ -140,7 +140,7 @@ func TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown(t *testing.T) {
 	}
 	run := func(ctx context.Context, dataDir, cmd string) error {
 		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-		_, err := RunArchiveRecoveryWith(ctx, mgr, dataDir, func() string { return cmd }, 1<<20)
+		_, err := RunArchiveRecoveryWith(ctx, mgr, dataDir, func() string { return cmd }, 1<<20, TargetTimeline{})
 		return err
 	}
 

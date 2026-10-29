@@ -996,7 +996,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
-		}, 0)
+		}, 0, recoveryTargetTimeline(registry))
 		if err != nil {
 			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
 		}

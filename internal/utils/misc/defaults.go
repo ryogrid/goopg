@@ -1684,6 +1684,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "recovery_target_timeline", Type: TypeString, BootVal: "latest",
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetTimeline,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "hot_standby", Type: TypeBool, BootVal: "on",
