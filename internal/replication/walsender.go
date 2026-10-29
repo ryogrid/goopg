@@ -540,13 +540,18 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 				fmt.Sprintf("requested starting point %d is ahead of the current timeline %d",
 					args.Timeline, curTLI))
 		}
-		if args.Timeline < int(curTLI) {
-			// The standby is on an older timeline. PG serves WAL from
-			// that timeline up to the switch point recorded in the
-			// history file, then EOF. goopg currently stores all
-			// pre-switch segments under TLI=1 filenames, so this
-			// works naturally when the old TLI is 1. For TLI > 1,
-			// the segment-naming migration (M0130-S8.3x) is needed.
+	}
+	// StartReplication: a TIMELINE older than the current one is historic.
+	// WAL is streamed only up to the point where this server's history
+	// switched off it (tliSwitchPoint over the current timeline's history),
+	// and the stream then ends with the next timeline and its start.
+	var hist historicTimeline
+	if args.Mode != "LOGICAL" && args.Timeline != 0 && uint32(args.Timeline) != curTLI {
+		var code errcodes.Code
+		var err error
+		hist, code, err = s.historicTimeline(uint32(args.Timeline), curTLI, args.StartLSN)
+		if err != nil {
+			return s.writeQueryError(w, code, err.Error())
 		}
 	}
 	if args.SlotName != "" {
@@ -558,6 +563,12 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
 		}
 		defer func() { _ = s.cfg.Slots.SetActive(args.SlotName, false) }()
+	}
+
+	// "If there is nothing to stream, don't even enter COPY mode": the
+	// start point is already the end of the historic timeline.
+	if hist.set && args.StartLSN >= hist.validUpto {
+		return s.endHistoricStreaming(w, hist)
 	}
 
 	// Hand the connection over to CopyBoth streaming mode.
@@ -704,14 +715,14 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			<-receiveDone
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
-				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteCommandComplete("START_STREAMING")
 				_ = w.ReadyForQuery()
 			}
 			return nil
 		case <-receiveDone:
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
-				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteCommandComplete("START_STREAMING")
 				_ = w.ReadyForQuery()
 			}
 			return nil
@@ -720,6 +731,18 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			// (XLogSendPhysical sends SendRqstPtr, the flush position), not
 			// the chunk's end; the data's end is StartLSN+len.
 			walEnd := max(chunk.EndLSN, s.cfg.WAL.FlushedLSN())
+			if hist.set {
+				// A historic timeline's WAL ends at its switch point,
+				// and SendRqstPtr is that point.
+				walEnd = hist.validUpto
+				if chunk.StartLSN >= hist.validUpto {
+					return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
+				}
+				if chunk.EndLSN > hist.validUpto {
+					chunk.Payload = chunk.Payload[:hist.validUpto-chunk.StartLSN]
+					chunk.EndLSN = hist.validUpto
+				}
+			}
 			frame := libpq.EncodeWALData(chunk.StartLSN, walEnd, time.Now().UTC(), chunk.Payload)
 			if err := w.WriteCopyData(frame); err != nil {
 				streamCancel()
@@ -731,6 +754,9 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			}
 			if senderHandle != nil {
 				senderHandle.SetSentLSN(chunk.EndLSN)
+			}
+			if hist.set && chunk.EndLSN >= hist.validUpto {
+				return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
 			}
 			// Reset the keepalive timer — fresh WAL implies the
 			// standby has just heard from us.
@@ -757,7 +783,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 				<-receiveDone
 				if clientSentCopyDone {
 					_ = w.WriteCopyDone()
-					_ = w.WriteCommandComplete("START_REPLICATION")
+					_ = w.WriteCommandComplete("START_STREAMING")
 					_ = w.ReadyForQuery()
 				}
 				return nil
@@ -775,6 +801,84 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 		}
 	}
+}
+
+// historicTimeline is StartReplication's sendTimeLineIsHistoric state: the
+// requested timeline's WAL ends at validUpto, where nextTLI begins.
+type historicTimeline struct {
+	set       bool
+	validUpto uint64
+	nextTLI   uint32
+}
+
+// historicTimeline resolves a START_REPLICATION TIMELINE older than the
+// current one: tliSwitchPoint over the current timeline's history file
+// gives the end of the requested timeline and the timeline that follows it.
+// The errors are StartReplication's (55000) and tliSwitchPoint's (an
+// elog-style ERROR, XX000).
+func (s *Handler) historicTimeline(tli, curTLI uint32, startLSN uint64) (historicTimeline, errcodes.Code, error) {
+	entries, err := xlog.ReadHistory(s.cfg.WALDirPath, curTLI)
+	if err != nil {
+		return historicTimeline{}, errcodes.InternalError, err
+	}
+	for i, e := range entries {
+		if e.TLI != tli {
+			continue
+		}
+		next := curTLI
+		if i+1 < len(entries) {
+			next = entries[i+1].TLI
+		}
+		if e.SwitchLSN < startLSN {
+			return historicTimeline{}, errcodes.ObjectNotInPrerequisiteState, fmt.Errorf("requested starting point %s on timeline %d is not in this server's history: This server's history forked from timeline %d at %s.",
+				formatLSN(startLSN), tli, tli, formatLSN(e.SwitchLSN))
+		}
+		return historicTimeline{set: true, validUpto: e.SwitchLSN, nextTLI: next}, "", nil
+	}
+	return historicTimeline{}, errcodes.InternalError, fmt.Errorf("requested timeline %d is not in this server's history", tli)
+}
+
+// finishHistoricCopy ends a historic timeline's stream once its switch
+// point has been sent, as XLogSendPhysical and WalSndLoop do: CopyDone,
+// then wait for the client's CopyDone (libpqrcv_endstreaming), then the
+// next-timeline result set.
+func (s *Handler) finishHistoricCopy(w *libpq.FrameWriter, hist historicTimeline, receiveDone <-chan struct{}, clientSentCopyDone *bool, streamCancel context.CancelFunc) error {
+	if err := w.WriteCopyDone(); err != nil {
+		streamCancel()
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		streamCancel()
+		return err
+	}
+	<-receiveDone
+	streamCancel()
+	if !*clientSentCopyDone {
+		return nil // the client went away
+	}
+	return s.endHistoricStreaming(w, hist)
+}
+
+// endHistoricStreaming sends StartReplication's closing result set for a
+// historic timeline — one row of next_tli (int8) and next_tli_startpos
+// (text) — then CommandComplete START_STREAMING.
+func (s *Handler) endHistoricStreaming(w *libpq.FrameWriter, hist historicTimeline) error {
+	if err := w.WriteRowDescription([]libpq.FieldDescription{
+		{Name: "next_tli", TypeOID: oidInt8, TypeSize: 8, TypeModifier: -1, Format: 0},
+		{Name: "next_tli_startpos", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+	if err := w.WriteDataRow([][]byte{
+		[]byte(strconv.FormatUint(uint64(hist.nextTLI), 10)),
+		[]byte(formatLSN(hist.validUpto)),
+	}); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("START_STREAMING"); err != nil {
+		return err
+	}
+	return w.ReadyForQuery()
 }
 
 // handleStandbyCopyData decodes a client-side CopyData payload and

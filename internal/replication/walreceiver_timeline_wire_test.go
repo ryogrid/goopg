@@ -20,7 +20,7 @@ const timelineTestSysID = "7300000000000000001"
 // startTimelinePrimary runs a walsender whose WAL writer is on timeline tli
 // and whose pg_wal holds the given history files. postmaster.Config.Timeline
 // is left unset: IDENTIFY_SYSTEM must report the writer's timeline.
-func startTimelinePrimary(t *testing.T, tli uint32, history map[uint32]string) (string, func()) {
+func startTimelinePrimary(t *testing.T, tli uint32, history map[uint32]string) (string, *xlog.Writer, string, func()) {
 	t.Helper()
 	dataDir := t.TempDir()
 	walDir := filepath.Join(dataDir, "pg_wal")
@@ -47,7 +47,7 @@ func startTimelinePrimary(t *testing.T, tli uint32, history map[uint32]string) (
 	done := make(chan error, 1)
 	go func() { done <- srv.Run(ctx) }()
 	<-srv.Ready()
-	return srv.Addr().String(), func() {
+	return srv.Addr().String(), w, walDir, func() {
 		cancel()
 		<-done
 		_ = w.Close()
@@ -74,7 +74,7 @@ func newStandbyWAL(t *testing.T) (*xlog.Writer, string) {
 func TestWalReceiverFetchesMissingTimelineHistory(t *testing.T) {
 	h2 := "1\t0/3000098\tno recovery target specified\n"
 	h3 := "1\t0/3000098\tno recovery target specified\n2\t0/5000060\tno recovery target specified\n"
-	addr, stop := startTimelinePrimary(t, 3, map[uint32]string{2: h2, 3: h3})
+	addr, _, _, stop := startTimelinePrimary(t, 3, map[uint32]string{2: h2, 3: h3})
 	defer stop()
 
 	standbyWAL, walDir := newStandbyWAL(t)
@@ -112,7 +112,7 @@ func TestWalReceiverFetchesMissingTimelineHistory(t *testing.T) {
 // from a primary with another system identifier, or whose timeline is
 // behind the one streaming starts on.
 func TestWalReceiverIdentifySystemChecks(t *testing.T) {
-	addr, stop := startTimelinePrimary(t, 1, nil)
+	addr, _, _, stop := startTimelinePrimary(t, 1, nil)
 	defer stop()
 
 	cases := []struct {
