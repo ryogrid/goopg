@@ -4,11 +4,14 @@ Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
 producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan); residual 14 `28c6de6c8` (Rows Removed by Index
-Recheck); residual 12 `fdde69739` (per-worker blocks); BUFFERS defaults to ANALYZE `ee57789ff`. **Task closed 2026-10-29.** Each still-open item under "Remaining residuals" (end of file) has its own fix_plan
-task: M0122-0023 (per-backend buffer usage), M0122-0024 (DML child actuals), M0122-0025 (bounded top-N sort),
-M0122-0026 (TID-bitmap lossify port), M0122-0027 (VERBOSE Output / ARRAY width), M0122-0028 (walkExprTree audit),
-M0122-0029 (BitmapOr paths), M0122-0030 (ea-ratchet drift). The execution differences (items 6, 7, 11) are recorded
-and are not imitated.
+Recheck); residual 12 `fdde69739` (per-worker blocks); BUFFERS defaults to ANALYZE `ee57789ff`. **Task closed 2026-10-29.** The still-open items under "Remaining residuals" (end of file) are deferral-ledger rows
+awaiting owner placement. The owner's M0122 filing pause forbids new M0122 tasks; a short-lived M0122-0022..0030 filing
+was withdrawn. The execution differences (items 6, 7, 11) are recorded and are not imitated.
+**Wrong-results regression from residual 9, fixed in `45b925ffd`.** An uncorrelated ARRAY sublink is computed once
+per statement. The planner's escape check (`exprsHaveEscapingOuterRef`) walked with `walkExprTree`, so it could not see
+an outer reference inside an IN list. `ARRAY(SELECT … WHERE mi.id IN (mo.k, 99))` therefore read as uncorrelated, and
+every row got the first row's array. Both escape walks now use `walkSameScopeExprs`, the slot walker with the
+`walkExprTree` fallback.
 
 ## Problem
 
