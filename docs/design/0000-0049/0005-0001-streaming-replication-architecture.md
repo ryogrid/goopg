@@ -472,6 +472,35 @@ Still missing (ledgered): no `RecoveryEndCommand` wait event; `RemoveNonParentXl
 renaming of the last old-timeline segment, which `CleanupAfterArchiveRecovery` performs after the command, are not
 ported.
 
+### Recovery parameters are validated at start; restore\_command is PGC\_SIGHUP \(2026\-10\-29, M0122\-0013\)
+
+When archive recovery was requested, PG's `validateRecoveryParameters` (xlogrecovery.c) checks the compulsory
+parameters:
+- **Standby mode:** having neither `primary_conninfo` nor `restore_command` is a WARNING ("specified neither …";
+  hint: the server polls `pg_wal`).
+- **Archive recovery without standby mode:** a missing `restore_command` is FATAL ("must specify
+  \"restore\_command\" when standby mode is not enabled").
+
+goopg handled the second case by logging a warning, **deleting `recovery.signal`, and starting as a primary**. That
+opens a restored base backup without replaying its archived WAL, which is the inconsistent state the FATAL exists to
+prevent.
+
+What changed:
+- `validateRecoveryParameters` (cmd/goopg/standby.go) now ports both arms. `goopg start` exits 1 with PG's message, and
+  `recovery.signal` stays so the operator can supply the command and restart.
+- `restore_command` is registered as PGC\_SIGHUP, as in PG 18 (guc\_tables.c), with PG's sample-file lines. Its one
+  consumer, the start-time archive recovery, reads it before the server accepts connections.
+
+Pins:
+- `TestValidateRecoveryParameters` covers six signal/parameter combinations, and checks PG's error text and warning.
+- `TestStartRecoverySignalWithoutRestoreCommandIsFatal` runs `goopg start` and checks exit 1, the FATAL text, and that
+  `recovery.signal` is kept.
+
+Still missing (ledgered): goopg's archive recovery reads `restore_command` once, at start. PG's startup process
+re-reads it after a SIGHUP while recovery runs, which matters for a long `recovery.signal` recovery. The rest of
+`validateRecoveryParameters` (recovery\_target\_action, recovery\_target\_time parsing, recovery\_target\_timeline)
+is not ported here.
+
 ### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
 
 On a standby PG requests a restartpoint from the startup process's read loop: `XLogPageRead` (xlogrecovery.c), when

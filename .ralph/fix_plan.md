@@ -4142,6 +4142,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Recovery parameters validated at start; restore\_command PGC\_SIGHUP LANDED 2026\-10\-29 \(`04b33fccf`\)**\.
+    Movement: none — recovery path\. PG's validateRecoveryParameters \(xlogrecovery\.c\): recovery\.signal without
+    standby mode and without restore\_command is FATAL; a standby with neither primary\_conninfo nor restore\_command
+    warns\.
+    - goopg used to delete recovery\.signal and start as a primary, opening a restored backup without its archived
+      WAL; now `goopg start` exits 1 with PG's message and recovery\.signal stays\.
+    - restore\_command registered PGC\_SIGHUP \(PG 18 guc\_tables\.c\) with PG's sample lines\.
+    - Pins: `TestValidateRecoveryParameters`, `TestStartRecoverySignalWithoutRestoreCommandIsFatal`\.
+    - Gates: units, misc, postmaster, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): archive recovery reads restore\_command once at start \(PG re\-reads on SIGHUP during
+      recovery\); rest of validateRecoveryParameters \(recovery\_target\_action / time / timeline\) not ported here\.
   - **recovery\_end\_command at the end of archive recovery LANDED 2026\-10\-29 \(`7911ddeda`\)**\. Movement: none —
     recovery path\. CleanupAfterArchiveRecovery's first step: ExecuteRecoveryCommand with failOnSignal true, `%r` =
     pg\_control checkPointCopy redo file; a signal \(or shell status \> 125\) is FATAL, any other failure a WARNING\.
