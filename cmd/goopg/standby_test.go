@@ -1409,3 +1409,82 @@ func TestEndInterruptedCrashRecovery(t *testing.T) {
 		}
 	}
 }
+
+// TestFollowUpstreamTimeline: when the upstream ends the timeline being
+// streamed, the standby's writer moves on only as the startup process would
+// — rescanLatestTimeLine for 'latest' (newest history file), the target's
+// history for a numeric target, never for 'current' — and only when the
+// target's history lists the current timeline and the local WAL ends exactly
+// at the point where that history leaves it.
+func TestFollowUpstreamTimeline(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	setup := func(t *testing.T, history map[uint32]string) (*xlog.Writer, string, uint64) {
+		t.Helper()
+		dataDir := t.TempDir()
+		walDir := filepath.Join(dataDir, "pg_wal")
+		w, err := xlog.NewWriter(xlog.Config{WALDir: walDir, SegmentSize: 4096})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = w.Close() })
+		if _, _, err := w.Append([]byte("some wal")); err != nil {
+			t.Fatal(err)
+		}
+		end := w.WrittenLSN()
+		for tli, body := range history {
+			body = strings.ReplaceAll(body, "END", fmt.Sprintf("%X/%X", uint32(end>>32), uint32(end)))
+			if err := os.WriteFile(filepath.Join(walDir, xlog.TimelineHistoryFileName(tli)), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return w, dataDir, end
+	}
+	latest := xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}
+	tl3 := map[uint32]string{2: "1\tEND\tx\n", 3: "1\tEND\tx\n2\t0/FFFFFF\tx\n"}
+
+	t.Run("latest moves to the child of the current timeline", func(t *testing.T) {
+		w, dataDir, end := setup(t, tl3)
+		moved, err := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, latest, logger)
+		if err != nil || !moved || w.TimelineID() != 2 || w.WrittenLSN() != end {
+			t.Fatalf("moved=%v err=%v timeline=%d end=%X; want timeline 2 at %X", moved, err, w.TimelineID(), w.WrittenLSN(), end)
+		}
+		if tli, _ := initdb.LoadOrCreateTimelineID(dataDir); tli != 2 {
+			t.Errorf("persisted timeline = %d, want 2", tli)
+		}
+	})
+	t.Run("current stays", func(t *testing.T) {
+		w, dataDir, _ := setup(t, tl3)
+		moved, _ := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, xlog.TargetTimeline{Goal: xlog.TargetTimelineCurrent}, logger)
+		if moved || w.TimelineID() != 1 {
+			t.Errorf("moved=%v timeline=%d; 'current' must stay on timeline 1", moved, w.TimelineID())
+		}
+	})
+	t.Run("numeric target follows its own history", func(t *testing.T) {
+		w, dataDir, _ := setup(t, tl3)
+		moved, err := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, xlog.TargetTimeline{Goal: xlog.TargetTimelineNumeric, TLI: 2}, logger)
+		if err != nil || !moved || w.TimelineID() != 2 {
+			t.Errorf("moved=%v err=%v timeline=%d; want timeline 2", moved, err, w.TimelineID())
+		}
+	})
+	t.Run("not a child", func(t *testing.T) {
+		w, dataDir, _ := setup(t, map[uint32]string{2: "5\tEND\tx\n"})
+		moved, _ := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, latest, logger)
+		if moved || w.TimelineID() != 1 {
+			t.Errorf("moved=%v; a history that does not list timeline 1 must not be followed", moved)
+		}
+	})
+	t.Run("forked off before the local WAL end", func(t *testing.T) {
+		w, dataDir, _ := setup(t, map[uint32]string{2: "1\t0/10\tx\n"})
+		moved, _ := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, latest, logger)
+		if moved || w.TimelineID() != 1 {
+			t.Errorf("moved=%v; a fork point before the local WAL end must not be followed", moved)
+		}
+	})
+	t.Run("switch point not reached yet", func(t *testing.T) {
+		w, dataDir, _ := setup(t, map[uint32]string{2: "1\t0/FFFFFF\tx\n"})
+		moved, err := followUpstreamTimeline(w, filepath.Join(dataDir, "pg_wal"), dataDir, latest, logger)
+		if moved || err != nil || w.TimelineID() != 1 {
+			t.Errorf("moved=%v err=%v; the writer must quietly wait for the rest of timeline 1", moved, err)
+		}
+	})
+}

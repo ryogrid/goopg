@@ -198,6 +198,14 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
 		SystemID:     systemID,
 		WALDir:       rcvWALDir,
+		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
+			if rcvWALDir == "" {
+				return
+			}
+			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
+				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
+			}
+		},
 	})
 
 	sc := &standbyController{
@@ -579,6 +587,75 @@ func boundPromoteToServer(sc *standbyController) func() error {
 		defer cancel()
 		return sc.Promote(ctx)
 	}
+}
+
+// followUpstreamTimeline is the startup process's turn when the upstream
+// reports that the timeline being streamed has ended — rescanLatestTimeLine
+// for recovery_target_timeline = 'latest', the expectedTLEs walk for a
+// numeric target; 'current' never moves. The target is the newest timeline
+// whose history file pg_wal holds (the walreceiver fetched the upstream's),
+// or the numeric one. Its history must list the current timeline ("new
+// timeline %u is not a child of database system timeline %u"), and the
+// local WAL must not extend past the point where the history leaves it
+// ("new timeline %u forked off current database system timeline %u before
+// current recovery point %X/%X"). When the local WAL ends exactly there, the
+// writer moves onto the timeline that follows the current one in the
+// target's history (SwitchTimeline: the switch segment is copied to the new
+// timeline's name), so the walreceiver's next connection streams it. It
+// reports whether the writer moved.
+func followUpstreamTimeline(w *xlog.Writer, walDir, dataDir string, goal xlog.TargetTimeline, logger *slog.Logger) (bool, error) {
+	cur := w.TimelineID()
+	var target uint32
+	switch goal.Goal {
+	case xlog.TargetTimelineCurrent:
+		return false, nil
+	case xlog.TargetTimelineNumeric:
+		target = goal.TLI
+	default:
+		target = xlog.FindNewestTimeline(walDir, cur)
+	}
+	if target <= cur {
+		return false, nil
+	}
+	history, err := xlog.ReadHistory(walDir, target)
+	if err != nil {
+		return false, err
+	}
+	next, switchLSN, found := target, uint64(0), false
+	for i, e := range history {
+		if e.TLI == cur {
+			switchLSN, found = e.SwitchLSN, true
+			if i+1 < len(history) {
+				next = history[i+1].TLI
+			}
+			break
+		}
+	}
+	if !found {
+		logger.Info(fmt.Sprintf("new timeline %d is not a child of database system timeline %d", target, cur))
+		return false, nil
+	}
+	pos := w.WrittenLSN()
+	if pos > switchLSN {
+		logger.Info(fmt.Sprintf("new timeline %d forked off current database system timeline %d before current recovery point %X/%X",
+			target, cur, uint32(pos>>32), uint32(pos)))
+		return false, nil
+	}
+	if pos < switchLSN {
+		// The rest of the current timeline has not arrived yet; the next
+		// connection streams it.
+		return false, nil
+	}
+	if dataDir != "" {
+		if err := initdb.WriteTimelineID(dataDir, next); err != nil {
+			return false, err
+		}
+	}
+	if err := w.SwitchTimeline(next, switchLSN, 0); err != nil {
+		return false, fmt.Errorf("follow timeline %d: %w", next, err)
+	}
+	logger.Info(fmt.Sprintf("new target timeline is %d", target))
+	return true, nil
 }
 
 // walDirFor is a small helper used by the standby launchers and
