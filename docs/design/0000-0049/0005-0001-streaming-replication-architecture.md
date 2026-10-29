@@ -386,7 +386,7 @@ Still missing (ledgered):
 - ~~the standby's volume trigger measures the received WAL (`WrittenLSN`), where PG measures the segment replay is
   reading~~ — resolved by the next section;
 - no `PreallocXlogFiles`;
-- no `TruncateSUBTRANS` at a restartpoint;
+- ~~no `TruncateSUBTRANS` at a restartpoint~~ — resolved 2026-10-29 (see "pg\_subtrans truncation at a restartpoint");
 - ~~no `archive_cleanup_command`~~ — resolved 2026-10-29 (see "archive\_cleanup\_command at a restartpoint");
 - restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
   `RequestCheckpoint`.
@@ -724,3 +724,18 @@ that multi-timeline protocol work.
   - `0002-0003-redo-records.md` (logical record kinds the
     standby will replay).
 - This milestone: `docs/milestones/0005-streaming-replication-support.md`.
+
+### pg\_subtrans truncation at a restartpoint \(2026\-10\-29, M0122\-0013, `8aa917e47`\)
+
+`CreateRestartPoint` (xlog.c) runs `TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning())` after WAL retention
+and before `archive_cleanup_command`. goopg's `TruncateSubtransFn` hook ran only after a primary checkpoint, so a
+long-running standby's subxact map and its pg\_subtrans segments grew without bound.
+
+The adopted restartpoint arm of `runRecoveryFlush` now calls the hook. The skip arm returns before it, as PG's does.
+
+PG skips the truncation when `hot_standby` is off, because `StartupSUBTRANS` has not run yet. goopg's standby always
+serves reads and its subxact map is always live, so it truncates on every adopted restartpoint. `hot_standby` itself
+is registered but not consumed (ledgered). The hook's horizon is at most datfrozenxid, which is older than any
+transaction still running on the primary, so the truncation is safe on a standby.
+
+Pin: `TestRestartPointTruncatesSubtrans` (adopted arm truncates once, skip arm never; mutation-checked).

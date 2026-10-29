@@ -4173,6 +4173,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint truncates pg\_subtrans LANDED 2026\-10\-29 \(`8aa917e47`\)**\. Movement: none — standby checkpointer
+    path\. CreateRestartPoint's TruncateSUBTRANS \(xlog\.c\); goopg truncated only after a primary checkpoint, so a
+    standby's subxact map and pg\_subtrans grew without bound\.
+    - The adopted restartpoint arm calls `TruncateSubtransFn` after WAL retention, before archive\_cleanup\_command;
+      unconditional because goopg's standby is always hot \(hot\_standby unconsumed — ledgered\)\.
+    - Pin: `TestRestartPointTruncatesSubtrans` \(mutation\-checked\)\. Gates: units, `\-race` xlog, replication E2Es,
+      tpch\-spotcheck, sf025 99/99\.
   - **recovery\.signal end takes an END\_OF\_RECOVERY shutdown checkpoint LANDED 2026\-10\-29 \(`a75b43cf0`\)**\.
     Movement: none — recovery path\. PG PerformRecoveryXLogAction: without a promote trigger the timeline change is an
     XLOG\_CHECKPOINT\_SHUTDOWN with PrevTimeLineID = old TLI, not XLOG\_END\_OF\_RECOVERY\.
