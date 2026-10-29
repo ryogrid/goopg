@@ -433,3 +433,41 @@ func TestExecuteRecoveryCommandSignalClassification(t *testing.T) {
 		}
 	}
 }
+
+// TestRestartPointTruncatesSubtrans pins CreateRestartPoint's pg_subtrans
+// truncation (TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning()),
+// xlog.c): a restartpoint that adopted a replayed checkpoint truncates once,
+// after WAL retention; the skip arm returns before it. Without it a
+// long-running standby's subxact map and pg_subtrans segments grew without
+// bound — only the primary's checkpoint truncated them.
+func TestRestartPointTruncatesSubtrans(t *testing.T) {
+	const segSize = 1 << 16
+	run := func(t *testing.T, controlRedo uint64) int {
+		dir := t.TempDir()
+		writeTestControl(t, dir, control.DBStateInArchiveRecovery, controlRedo)
+		w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: segSize, PageHeaders: true, TimelineID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		calls := 0
+		cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+			DataDir: dir, SegmentSize: segSize,
+			TruncateSubtransFn: func() error { calls++; return nil },
+		})
+		cp.SetRecoveryMode(true)
+		cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+			return ReplayedCheckpoint{StartLSN: 3*segSize + 0x101, EndLSN: 3*segSize + 0x200, Fields: CheckPointFields{RedoLSN0: 3*segSize + 0x10, ThisTLI: 1}}, true
+		})
+		if err := cp.CheckpointNow(); err != nil {
+			t.Fatalf("recovery checkpoint: %v", err)
+		}
+		return calls
+	}
+	if got := run(t, 16); got != 1 {
+		t.Errorf("adopted restartpoint truncated pg_subtrans %d times, want 1", got)
+	}
+	if got := run(t, 3*segSize+0x10); got != 0 {
+		t.Errorf("skip arm truncated pg_subtrans %d times; CreateRestartPoint returns before it", got)
+	}
+}

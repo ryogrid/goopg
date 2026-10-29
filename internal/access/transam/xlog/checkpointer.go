@@ -210,7 +210,8 @@ type CheckpointerConfig struct {
 	TruncateCLOGFn func() error
 
 	// TruncateSubtransFn, when non-nil, is called at the end of each
-	// successful checkpoint AFTER the checkpoint marker is durable, alongside
+	// successful checkpoint AFTER the checkpoint marker is durable — and at
+	// each adopted restartpoint on a standby (CreateRestartPoint) — alongside
 	// TruncateCLOGFn, to truncate pg_subtrans (both the in-memory subxact map
 	// and its on-disk SLRU mirror) up to the same conservative horizon
 	// (M0122-0009). Without this, a long-lived cluster's subxact parent-link
@@ -1429,6 +1430,20 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			if c.retainer != nil {
 				if err := c.retainer.Retain(rp.Fields.RedoLSN0 + 1); err != nil {
 					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
+				}
+			}
+			// CreateRestartPoint then truncates pg_subtrans
+			// (TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning()),
+			// xlog.c) — without it a long-running standby's subxact map and
+			// pg_subtrans segments grew without bound. PG skips it when
+			// hot_standby is off because StartupSUBTRANS has not run; goopg's
+			// standby always serves reads and its subxact map is always live,
+			// so it truncates on every adopted restartpoint. The hook's
+			// horizon (≤ datfrozenxid) is older than any transaction still
+			// running on the primary.
+			if c.cfg.TruncateSubtransFn != nil {
+				if err := c.cfg.TruncateSubtransFn(); err != nil {
+					c.cfg.Logger.Warn("restartpoint subtrans truncation failed", "err", err)
 				}
 			}
 			c.runArchiveCleanupCommand(rp)
