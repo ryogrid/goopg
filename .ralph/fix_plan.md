@@ -4244,6 +4244,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **The walsender ends a historic timeline at its switch point LANDED 2026\-10\-30 \(`bd29bc303`\)**\. Movement:
+    none — replication protocol\. Before, a request for an older timeline streamed straight past its end\.
+    - tliSwitchPoint over the current history, with PG's two errors \(55000 / XX000\)\. No COPY at the switch point;
+      otherwise clamp at the switch point, CopyDone, then the \(next\_tli, next\_tli\_startpos\) row and START\_STREAMING\.
+    - Pins: `TestWalsenderEndsHistoricTimelineAtSwitchPoint` \(3 mutations\), `TestHistoricTimelineNotInHistory`\.
+      Oracle `TestE2E_PGStandbyFollowsGoopgTimelineSwitch`: a PG 18\.3 standby follows a goopg promotion to timeline 2
+      \(fails without the historic path\)\. Gates: units, replication E2E family, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): the goopg walreceiver side \(CopyDone handshake, writer switch, recovery\_target\_timeline\)\.
   - **The walreceiver runs WalReceiverMain's preamble LANDED 2026\-10\-30 \(`7a5f06436`\)**\. Movement: none —
     replication protocol\. Before, START\_REPLICATION went out straight after the startup handshake: no
     IDENTIFY\_SYSTEM, no history fetch, no TIMELINE\.

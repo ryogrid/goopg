@@ -520,3 +520,45 @@ new command and the identifier check.
 - The standby's writer switch and replay onto the child timeline, per recovery\_target\_timeline.
 - `.done` markers for fetched history files.
 - TIMELINE\_HISTORY of a missing file: goopg returns an empty row, where PG raises an error.
+
+## Update 2026-10-30 — the walsender ends a historic timeline (M0122-0013, `bd29bc303`)
+
+A START\_REPLICATION whose TIMELINE is older than the server's own is a historic request (StartReplication's
+`sendTimeLineIsHistoric`). goopg's walsender used to stream it from the current timeline's WAL straight past the
+point where that timeline ended. It now works as follows:
+
+1. **`historicTimeline`** finds the requested timeline in the current timeline's history file
+   (`tliSwitchPoint`). It returns where that timeline ends (`validUpto`) and the timeline that follows: the next
+   history line's, or the current one. Two errors:
+   - 55000 "requested starting point %X/%X on timeline %u is not in this server's history" with "This server's
+     history forked from timeline %u at %X/%X.", when the start point is past the switch point;
+   - XX000 "requested timeline %u is not in this server's history", tliSwitchPoint's elog-style error.
+2. **Nothing to stream**: a start point already at the switch point enters no COPY mode ("If there is nothing to
+   stream, don't even enter COPY mode").
+3. **Streaming**: WAL chunks are clamped at the switch point, and every frame's walEnd is the switch point
+   (XLogSendPhysical's SendRqstPtr). Once the switch point has been sent, the walsender sends CopyDone
+   (`finishHistoricCopy`) and waits for the client's CopyDone.
+4. **Closing reply** (`endHistoricStreaming`): one row of `next_tli` (int8) and `next_tli_startpos` (text), then
+   CommandComplete `START_STREAMING`.
+
+Physical streaming also completes as `START_STREAMING` in the non-historic case (EndReplicationCommand), not
+`START_REPLICATION`.
+
+The WAL before the switch point is read through the iterator's older-timeline fallback. SwitchTimeline copies the
+switch segment's prefix to the new timeline's name, so the bytes are the ones the old timeline wrote.
+
+**Pins:**
+
+- `TestWalsenderEndsHistoricTimelineAtSwitchPoint`: a writer on timeline 3 with a two-line history. Disabling the
+  clamp, the no-COPY arm or historic detection each fails it.
+- `TestHistoricTimelineNotInHistory`.
+- **Oracle**, `TestE2E_PGStandbyFollowsGoopgTimelineSwitch` (PG's 004\_timeline\_switch shape): a PG 18.3 standby
+  backed up from a goopg primary on timeline 1 is started against a goopg standby promoted to timeline 2. It
+  fetches the history, streams timeline 1 to the switch point, moves to timeline 2, and sees a row written after
+  the promotion (`received_tli` = 2). It fails when historic detection is disabled.
+
+**Still open (ledgered):**
+
+- The goopg walreceiver half: answering CopyDone, reading the next-timeline row, switching the standby's WAL
+  writer at `next_tli_startpos`, and choosing the timeline per recovery\_target\_timeline.
+- wal\_sender\_timeout.
