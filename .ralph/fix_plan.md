@@ -4244,6 +4244,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\_target\_lsn / \_inclusive / \_action LANDED 2026\-10\-30 \(`d882de595`\)**\. Movement: none — recovery
+    targets\. recoveryStopsBefore/After \(LSN arm\), PerformWalRecovery's end\-of\-redo FATALs, getRecoveryStopReason
+    as the history reason; goopg had no target settings at all and wrote "archive recovery complete"\.
+    - GUCs \+ check hook \(ParsePGLSN\); `RecoveryStop`, `ArchiveRecoveryResult\.StopReason`; `checkRecoveryTargetReached`,
+      `recoveryTargetAction`, `shutdownAtRecoveryTarget`\.
+    - Pins: `TestRunArchiveRecoveryStopsAtTargetLSN`, `TestRecoveryTargetChecksAndAction`,
+      `TestPromoteAfterRecoveryToTargetLSN`, `TestStartRecoveryTargetLSNFatals` \(mutation\-checked\)\. Gates: units,
+      replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): xid/name/time/immediate targets; pause with hot\_standby on; targets on a standby;
+      consistency point = local\-WAL end\.
   - **Checkpoint must precede the target's fork point \+ empty recovery\_target\_timeline LANDED 2026\-10\-30
     \(`c9720ce9b`\)** — fixes P0\-E22 \(S2, recorded above\)\. Movement: none — recovery start validation\.
     - Both InitWalRecovery checks \("not in this server's history" / "not a child" \+ errdetail\); DETAIL printed by

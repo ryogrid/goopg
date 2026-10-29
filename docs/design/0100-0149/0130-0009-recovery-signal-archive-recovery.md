@@ -434,3 +434,46 @@ fails when its fix is removed.
 **Still open (ledgered):**
 - goopg reads no `backup_label` at recovery, so the start point and the errdetail always come from pg\_control.
 - A standby follows only the newest timeline.
+
+## Update 2026-10-30 — recovery\_target\_lsn, recovery\_target\_inclusive, recovery\_target\_action (M0122-0013, `d882de595`)
+
+goopg did not register the recovery-target settings; setting one was an unknown-parameter startup error. Point-in-time
+recovery to an LSN was therefore impossible. The new timeline's history also always said "archive recovery complete"
+where PG writes `getRecoveryStopReason()`.
+
+**The port.**
+- **Settings:**
+  - `recovery_target_lsn` accepts '' or a valid pg\_lsn (`check_recovery_target_lsn`; `ParsePGLSN` is
+    `pg_lsn_in_internal`);
+  - `recovery_target_inclusive` defaults to on;
+  - `recovery_target_action` is one of pause, promote or shutdown, defaulting to pause;
+  - postgresql.conf.sample has PG's lines.
+
+  The xid, name, time and 'immediate' targets stay unregistered, so setting one is still a startup error rather than a
+  target that is silently ignored.
+- **Stop logic** (`recoveryStopsBefore` / `recoveryStopsAfter`, LSN arm): the first record whose ReadRecPtr reaches the
+  target ends recovery, after that record when inclusive and before it otherwise. No later record is replayed. The
+  result carries `ReachedTarget`, `StopLSN`, `StopAfter` and `StopPoint`, and `StopReason()` returns
+  `"after|before LSN X/X\\n"` (the trailing newline is PG's) or "no recovery target specified".
+- **End of redo** (`PerformWalRecovery`):
+  - an unreached target is FATAL "recovery ended before configured recovery target was reached";
+  - a stop point inside the WAL that `initdb.Open` already replayed is FATAL "requested recovery stop point is before
+    consistent recovery point";
+  - the action then applies:
+    - promote promotes;
+    - shutdown leaves recovery unfinished, with `DB_SHUTDOWNED_IN_RECOVERY` and `recovery.signal` kept;
+    - pause becomes shutdown when hot\_standby is off, as `validateRecoveryParameters` does, and otherwise (unsupported
+      here) shuts down with a WARNING.
+- `promoteAfterRecovery` writes `StopReason()` as the history reason.
+
+**Pins:**
+- `TestRunArchiveRecoveryStopsAtTargetLSN`, `TestRecoveryTargetChecksAndAction` and
+  `TestPromoteAfterRecoveryToTargetLSN` (end to end: switch at the target record's end, PG's reason line).
+- `TestStartRecoveryTargetLSNFatals`.
+- All were mutation-checked.
+
+**Still open (ledgered):**
+- The xid, name, time and 'immediate' targets.
+- Pause with hot\_standby on.
+- Targets on a standby.
+- The consistency point is the local-WAL end, not minRecoveryPoint.
