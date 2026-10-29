@@ -3911,7 +3911,7 @@ func (r *Runtime) Close() error {
 		// recovery, and goopg's own next start replays WAL. Mirrors
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
 		slog.Default().Info("immediate shutdown: skipping final checkpoint",
-			"note", "pg_control left at DB_IN_PRODUCTION; recovery on next start")
+			"note", "pg_control state left as it was; recovery on next start")
 	} else if r.Checkpointer != nil {
 		// Use the shutdown variant so pg_control's State lands on
 		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean

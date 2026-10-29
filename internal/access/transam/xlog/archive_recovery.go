@@ -13,6 +13,8 @@
 package xlog
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,7 +74,7 @@ type ArchiveRecoveryResult struct {
 // segmentSize of 0 means "derive from the cluster's own WAL" (via
 // detectSegmentSizeAt / DefaultSegmentSize).
 func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) (ArchiveRecoveryResult, error) {
-	return RunArchiveRecoveryWith(mgr, dataDir, func() string { return restoreCommand }, segmentSize)
+	return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return restoreCommand }, segmentSize)
 }
 
 // RunArchiveRecoveryWith is RunArchiveRecovery with restore_command read
@@ -80,7 +82,14 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // PGC_SIGHUP and RestoreArchivedFile reads recoveryRestoreCommand at each
 // call, so a reload processed while recovery runs (the startup process's
 // ProcessStartupProcInterrupts) changes the command the next fetch uses.
-func RunArchiveRecoveryWith(mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64) (ArchiveRecoveryResult, error) {
+//
+// ctx is the shutdown request: it is checked before every fetch and every
+// segment replay (ProcessStartupProcInterrupts' shutdown_requested) and
+// cancels a running restore_command (StartupProcShutdownHandler while
+// in_restore_command); either way the result wraps ErrRecoveryShutdown and
+// recovery is left unfinished. A *RestoreFatalError from a fetch aborts
+// recovery instead of ending it, as upstream's FATAL does.
+func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -100,17 +109,42 @@ func RunArchiveRecoveryWith(mgr *storage.Manager, dataDir string, restoreCommand
 	}
 
 	startTLI := uint32(1)
+	// %r: the file holding the oldest restartpoint's redo
+	// (GetOldestRestartPoint — pg_control's checkPointCopy). Start-time
+	// recovery takes no restartpoints, so it is fixed for the whole pass.
+	lastRestartPointFname := XLogFileName(0, 0, segmentSize)
 	if cd, err := control.ReadControlFile(dataDir); err == nil && cd != nil && cd.CheckPointCopyThisTLI != 0 {
 		startTLI = cd.CheckPointCopyThisTLI
+		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
 	}
-	have := func(name string) bool {
-		if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
-			return true
+	// have reports whether name is in pg_wal or was restored into it. A
+	// shutdown request or a FATAL restore failure is returned as the error.
+	have := func(name string) (bool, error) {
+		if ctx.Err() != nil {
+			return false, ErrRecoveryShutdown
 		}
-		return RestoreArchivedFile(restoreCommand(), walDir, name) == nil
+		if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
+			return true, nil
+		}
+		err := RestoreArchivedFileContext(ctx, restoreCommand(), walDir, name, lastRestartPointFname)
+		if err == nil {
+			return true, nil
+		}
+		var fatal *RestoreFatalError
+		if errors.Is(err, ErrRecoveryShutdown) || errors.As(err, &fatal) {
+			return false, err
+		}
+		return false, nil
 	}
 	res.NewestTLI = startTLI
-	for probe := startTLI + 1; have(TimelineHistoryFileName(probe)); probe++ {
+	for probe := startTLI + 1; ; probe++ {
+		ok, err := have(TimelineHistoryFileName(probe))
+		if err != nil {
+			return res, fmt.Errorf("wal: archive recovery: %w", err)
+		}
+		if !ok {
+			break
+		}
 		res.NewestTLI = probe
 	}
 	res.Timelines = []TimelineSpan{{TLI: startTLI}}
@@ -148,7 +182,11 @@ func RunArchiveRecoveryWith(mgr *storage.Manager, dataDir string, restoreCommand
 			if sp.Begin != 0 && seg < sp.Begin/uint64(segmentSize) {
 				continue // the segment predates this timeline
 			}
-			if have(FormatSegmentNameTLI(seg, sp.TLI)) {
+			ok, err := have(FormatSegmentNameTLI(seg, sp.TLI))
+			if err != nil {
+				return res, fmt.Errorf("wal: archive recovery: %w", err)
+			}
+			if ok {
 				chosen = sp.TLI
 				break
 			}
@@ -157,6 +195,9 @@ func RunArchiveRecoveryWith(mgr *storage.Manager, dataDir string, restoreCommand
 			return res, nil // archive exhausted — the normal end
 		}
 		curTLI = chosen
+		if ctx.Err() != nil {
+			return res, fmt.Errorf("wal: archive recovery: %w", ErrRecoveryShutdown)
+		}
 
 		records, err := ReadSegmentRecords(walDir, seg, segmentSize)
 		if err != nil {

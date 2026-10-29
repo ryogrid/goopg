@@ -1,6 +1,7 @@
 package xlog
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -147,7 +148,7 @@ func TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch(t *testing.T) {
 		return working
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	res, err := RunArchiveRecoveryWith(mgr, dataDir, getter, segSize)
+	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize)
 	if err != nil {
 		t.Fatalf("RunArchiveRecoveryWith: %v", err)
 	}

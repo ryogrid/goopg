@@ -991,13 +991,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		logger.Info("archive recovery starting", "restore_command", stringGUC(registry, "restore_command", ""))
 		// restore_command is PGC_SIGHUP: each fetch first processes a
 		// pending reload (ProcessStartupProcInterrupts), then reads it.
-		recovered, err := xlog.RunArchiveRecoveryWith(rt.StorageMgr, rt.DataDir, func() string {
+		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
+		// at the next fetch or segment and cancels a running restore_command.
+		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
 		}, 0)
 		if err != nil {
-			fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
-			return 1
+			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
 		}
 		logger.Info("archive recovery complete; promoting to primary")
 		// Promote: bump TLI, write history, update pg_control,
@@ -1307,14 +1308,33 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 	if strings.EqualFold(*mode, "immediate") {
 		stopCmd = "STOPIMMEDIATE"
 	}
-	reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
-	if err != nil {
-		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
-		return 1
-	}
-	if reply != "OK" {
-		fmt.Fprintf(stderr, "goopg stop: unexpected reply %q\n", reply)
-		return 1
+	if pf.SocketPath == "" {
+		// The server is still in its startup phase (crash or archive
+		// recovery): the lock file exists but the control socket is not
+		// bound yet. Signal it, as pg_ctl stop always does — SIGTERM for
+		// smart, SIGINT for fast; goopg start stops recovery on either.
+		sig := syscall.SIGINT
+		switch {
+		case strings.EqualFold(*mode, "smart"):
+			sig = syscall.SIGTERM
+		case stopCmd == "STOPIMMEDIATE":
+			fmt.Fprintln(stderr, "goopg stop: the server is still starting up; -mode immediate needs the control socket — use -mode fast")
+			return 1
+		}
+		if err := syscall.Kill(pf.PID, sig); err != nil {
+			fmt.Fprintf(stderr, "goopg stop: could not send stop signal (PID: %d): %v\n", pf.PID, err)
+			return 1
+		}
+	} else {
+		reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg stop: %v\n", err)
+			return 1
+		}
+		if reply != "OK" {
+			fmt.Fprintf(stderr, "goopg stop: unexpected reply %q\n", reply)
+			return 1
+		}
 	}
 	// Wait for the process to actually exit so a follow-up
 	// `goopg start` doesn't race with the previous incarnation.

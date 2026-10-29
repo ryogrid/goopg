@@ -10,6 +10,7 @@
 package xlog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -17,49 +18,140 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
-// RestoreArchivedFile shells out to restoreCommand to fetch the
-// named WAL segment into walDir. %f expands to the segment filename
-// (e.g. "000000010000000000000001"), %p to the destination path
-// (filepath.Join(walDir, segmentName)). Returns nil when the command
-// exits zero AND the destination file exists afterward; returns an
-// error describing the failure otherwise (non-zero exit, missing
-// file, or I/O error).
-//
-// restoreCommand may be empty — callers should guard against that
-// before calling (an empty command always errors, matching upstream's
-// "restore_command not configured" guard).
+// ErrRecoveryShutdown reports that archive recovery stopped for a shutdown
+// request: goopg start's context was cancelled (SIGTERM/SIGINT), or the
+// restore_command child died of SIGTERM. Upstream's startup process
+// proc_exit(1)s in both cases (StartupProcShutdownHandler while
+// in_restore_command, and RestoreArchivedFile's wait_result_is_signal(rc,
+// SIGTERM) arm) — recovery is not completed and nothing is promoted.
+var ErrRecoveryShutdown = errors.New("archive recovery interrupted by a shutdown request")
+
+// RestoreFatalError is a restore_command failure RestoreArchivedFile
+// reports at FATAL rather than as the end of the archive: the child died of
+// a signal other than SIGTERM, or the shell reported an unrunnable command
+// (exit status above 125, wait_result_is_any_signal(rc, true)). Upstream
+// aborts recovery there because returning "not found" would make the
+// caller assume recovery is complete and start up the database.
+type RestoreFatalError struct{ Msg string }
+
+func (e *RestoreFatalError) Error() string { return e.Msg }
+
+// RestoreArchivedFile is RestoreArchivedFileContext without cancellation
+// and with %r expanding to the zero restart-point file name.
 func RestoreArchivedFile(restoreCommand, walDir, segmentName string) error {
+	return RestoreArchivedFileContext(context.Background(), restoreCommand, walDir, segmentName, XLogFileName(0, 0, DefaultSegmentSize))
+}
+
+// RestoreArchivedFileContext shells out to restoreCommand to fetch the
+// named WAL file into walDir, as upstream's RestoreArchivedFile
+// (xlogarchive.c) does. BuildRestoreCommand's placeholders apply: %f is the
+// file name, %p the destination path, %r lastRestartPointFname (the file
+// holding the oldest restartpoint's redo), %% a literal percent; any other
+// placeholder is a FATAL invalid value.
+//
+// It returns nil when the command exits zero and the file exists. A
+// failure is classified as upstream does:
+//   - ctx cancelled while the command runs, or the child killed by SIGTERM
+//     (or the shell's exit 128+SIGTERM): ErrRecoveryShutdown. Cancelling
+//     sends SIGTERM to the command's process group, as the postmaster
+//     signals the startup process's group on a fast shutdown.
+//   - any other signal, or an exit status above 125 (command not found /
+//     not executable): *RestoreFatalError, "could not restore file ... from
+//     archive: <wait_result_to_str>".
+//   - otherwise (the archive does not have the file): a plain error — the
+//     normal end of archive recovery.
+func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, segmentName, lastRestartPointFname string) error {
 	if restoreCommand == "" {
 		return fmt.Errorf("wal: restore_command is not configured")
 	}
-
+	if ctx.Err() != nil {
+		return ErrRecoveryShutdown
+	}
 	destPath := filepath.Join(walDir, segmentName)
-
-	// Build the command: replace %f with segment filename and %p
-	// with the destination path, matching upstream
-	// BuildRestoreCommand in postgres/src/common/archive.c.
-	cmd := restoreCommand
-	cmd = strings.ReplaceAll(cmd, "%f", segmentName)
-	cmd = strings.ReplaceAll(cmd, "%p", destPath)
+	cmd, err := ReplacePercentPlaceholders(restoreCommand, "restore_command", map[byte]string{
+		'f': segmentName,
+		'p': destPath,
+		'r': lastRestartPointFname,
+	})
+	if err != nil {
+		return &RestoreFatalError{Msg: err.Error()}
+	}
 
 	// Execute via sh -c so the operator can use pipes, redirects, etc.
-	// This is what upstream's system() does.
-	c := exec.Command("sh", "-c", cmd)
+	// This is what upstream's system() does. The child gets its own
+	// process group so a shutdown can signal the shell and whatever it
+	// is waiting on.
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
-		return fmt.Errorf("wal: restore_command %q exited: %w", cmd, err)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGTERM) }
+	c.WaitDelay = 5 * time.Second
+	runErr := c.Run()
+	if ctx.Err() != nil {
+		return ErrRecoveryShutdown
 	}
+	if runErr == nil {
+		if _, err := os.Stat(destPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("wal: restore_command succeeded but %s not found: %w", destPath, err)
+			}
+			return &RestoreFatalError{Msg: fmt.Sprintf("could not stat file \"%s\": %v", destPath, err)}
+		}
+		return nil
+	}
+	if waitResultIsSignal(runErr, syscall.SIGTERM) {
+		return ErrRecoveryShutdown
+	}
+	if waitResultIsAnySignal(runErr) {
+		return &RestoreFatalError{Msg: fmt.Sprintf("could not restore file \"%s\" from archive: %s", segmentName, waitResultToStr(runErr))}
+	}
+	return fmt.Errorf("wal: could not restore file \"%s\" from archive: %s", segmentName, waitResultToStr(runErr))
+}
 
-	// Upstream also verifies the file exists and has expectedSize,
-	// but we don't know the expected size for an unfetched segment
-	// (it could be short on the final segment). Just check existence.
-	if _, err := os.Stat(destPath); err != nil {
-		return fmt.Errorf("wal: restore_command succeeded but %s not found: %w", destPath, err)
+// waitResultIsSignal is wait_result_is_signal (src/common/wait_error.c):
+// the child died of signum, or the shell exited 128+signum reporting it.
+func waitResultIsSignal(err error, signum syscall.Signal) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
 	}
-	return nil
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return ws.Signal() == signum
+	}
+	return ee.ExitCode() == 128+int(signum)
+}
+
+// waitResultToStr is wait_result_to_str (src/common/wait_error.c).
+func waitResultToStr(err error) string {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return err.Error()
+	}
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return fmt.Sprintf("child process was terminated by signal %d: %s", int(ws.Signal()), signalDescription(ws.Signal()))
+	}
+	switch code := ee.ExitCode(); code {
+	case 126:
+		return "command not executable"
+	case 127:
+		return "command not found"
+	default:
+		return fmt.Sprintf("child process exited with exit code %d", code)
+	}
+}
+
+// signalDescription is pg_strsignal's text: strsignal(3) on glibc, which
+// capitalises the first letter (Go's Signal.String is lower case).
+func signalDescription(sig syscall.Signal) string {
+	d := sig.String()
+	if d == "" {
+		return d
+	}
+	return strings.ToUpper(d[:1]) + d[1:]
 }
 
 // ReplacePercentPlaceholders is PG's replace_percent_placeholders

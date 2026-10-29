@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -896,3 +897,37 @@ func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logg
 var _ postmaster.Config
 var _ = xlog.DefaultSegmentSize
 var _ = walDirFor
+
+// endInterruptedArchiveRecovery ends goopg start when recovery.signal's
+// archive recovery did not run to the end of the archive. Recovery is left
+// unfinished — no promotion, recovery.signal stays, so the next start
+// resumes archive recovery — and nothing is written to WAL: the runtime's
+// Close skips its shutdown checkpoint, as a server still in recovery writes
+// no checkpoint record.
+//
+//   - A shutdown request (xlog.ErrRecoveryShutdown: SIGTERM/SIGINT, or the
+//     restore_command child killed by SIGTERM) is upstream's fast shutdown
+//     during recovery: the startup process exits, the checkpointer's
+//     shutdown restartpoint (CreateRestartPoint with CHECKPOINT_IS_SHUTDOWN)
+//     records DB_SHUTDOWNED_IN_RECOVERY, and the postmaster exits 0.
+//   - Anything else — a FATAL restore_command failure (a signal or an
+//     unrunnable command), a read or replay error — is the startup process
+//     dying FATAL: the postmaster aborts startup and exits 1, and pg_control
+//     keeps its in-recovery state, so the next start recovers again.
+func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, logger *slog.Logger, stderr io.Writer) int {
+	rt.SetImmediateShutdown()
+	if errors.Is(err, xlog.ErrRecoveryShutdown) {
+		logger.Info("received fast shutdown request during archive recovery; recovery not completed, recovery.signal kept")
+		if uerr := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateShutdownedInRecovery
+			cd.Time = time.Now().Unix()
+		}); uerr != nil && !errors.Is(uerr, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "goopg start: archive recovery: could not update pg_control: %v\n", uerr)
+			return 1
+		}
+		logger.Info("database system is shut down")
+		return 0
+	}
+	fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+	return 1
+}

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -740,5 +741,147 @@ func TestStartRefusesLiveDataDirLock(t *testing.T) {
 	}
 	if ctlAfter, _ := os.ReadFile(filepath.Join(dir, "global", "pg_control")); !bytes.Equal(ctlBefore, ctlAfter) {
 		t.Errorf("pg_control rewritten by the refused start")
+	}
+}
+
+// TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished pins a fast
+// shutdown during recovery.signal's archive recovery, as upstream handles
+// one in the startup process:
+//   - goopg stop reaches a server whose lock file has no control socket yet
+//     by signalling its pid (pg_ctl stop's kill(pid, SIGINT));
+//   - the running restore_command is interrupted, not waited out;
+//   - recovery is left unfinished — no new timeline, recovery.signal kept,
+//     pg_control DB_SHUTDOWNED_IN_RECOVERY — and the start exits 0;
+//   - the next start resumes archive recovery and promotes.
+//
+// goopg ignored the request until the archive was exhausted, then
+// promoted and only exited afterwards.
+func TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"init", "-D", dir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit=%d stderr=%q", code, stderr.String())
+	}
+	pidFile := filepath.Join(t.TempDir(), "restore.pid")
+	conf := filepath.Join(dir, "postgresql.conf")
+	appendConf := func(line string) {
+		t.Helper()
+		f, err := os.OpenFile(conf, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendConf("restore_command = 'sleep 60 & echo $! > " + pidFile + "; wait'")
+	signalPath := filepath.Join(dir, "recovery.signal")
+	if err := os.WriteFile(signalPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var startOut, startErr bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"start", "-D", dir, "--listen", "127.0.0.1:0"}, &startOut, &startErr) }()
+	var sleepPID int
+	for deadline := time.Now().Add(60 * time.Second); sleepPID == 0; {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			fmt.Sscanf(string(b), "%d", &sleepPID)
+		}
+		select {
+		case code := <-done:
+			t.Fatalf("start exited %d before restore_command ran", code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restore_command never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pf, err := control.ParsePIDFile(dir)
+	if err != nil || pf.SocketPath != "" {
+		t.Fatalf("lock file during recovery = %+v, %v; want one with no socket line", pf, err)
+	}
+	stopped := time.Now()
+	stdout.Reset()
+	stderr.Reset()
+	// In-process the server's pid is the test binary's own, so stop's wait
+	// for the pid to exit can only time out; the signal it sends (SIGINT to
+	// that pid) is what is under test, and start's exit is checked below.
+	run([]string{"stop", "-D", dir, "-t", "1"}, &stdout, &stderr)
+	if strings.Contains(stderr.String(), "could not send stop signal") || strings.Contains(stderr.String(), "control") {
+		t.Fatalf("stop did not signal the starting server: %q", stderr.String())
+	}
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("start exit=%d after a fast shutdown, want 0 (stderr %q)", code, startErr.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("start did not exit after the stop request")
+	}
+	if waited := time.Since(stopped); waited > 20*time.Second {
+		t.Errorf("shutdown took %v — restore_command was waited out", waited)
+	}
+	if syscall.Kill(sleepPID, 0) == nil {
+		time.Sleep(time.Second)
+		if syscall.Kill(sleepPID, 0) == nil {
+			_ = syscall.Kill(sleepPID, syscall.SIGKILL)
+			t.Errorf("restore_command child %d survived the shutdown", sleepPID)
+		}
+	}
+	if _, err := os.Stat(signalPath); err != nil {
+		t.Errorf("recovery.signal removed by an interrupted recovery: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pg_wal", "00000002.history")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an interrupted recovery promoted to timeline 2 (stat err %v)", err)
+	}
+	cd, err := control.ReadControlFile(dir)
+	if err != nil || cd == nil {
+		t.Fatalf("read pg_control: %v", err)
+	}
+	if cd.State != control.DBStateShutdownedInRecovery {
+		t.Errorf("pg_control state = %v, want DB_SHUTDOWNED_IN_RECOVERY", cd.State)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "postmaster.pid")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("postmaster.pid left behind: %v", err)
+	}
+
+	// The next start resumes archive recovery: an exhausted archive now
+	// ends it and the server promotes.
+	appendConf("restore_command = 'false'")
+	startOut.Reset()
+	startErr.Reset()
+	go func() { done <- run([]string{"start", "-D", dir, "--listen", "127.0.0.1:0"}, &startOut, &startErr) }()
+	for deadline := time.Now().Add(90 * time.Second); ; {
+		if pf, err := control.ParsePIDFile(dir); err == nil && pf.SocketPath != "" {
+			break
+		}
+		select {
+		case code := <-done:
+			t.Fatalf("resumed start exited %d (stderr %q)", code, startErr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resumed start never became ready")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	pf, err = control.ParsePIDFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := control.Send(pf.SocketPath, "STOP", 30*time.Second); err != nil || reply != "OK" {
+		t.Fatalf("STOP reply %q err %v", reply, err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("resumed start exit=%d", code)
+	}
+	if _, err := os.Stat(signalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("recovery.signal still present after the resumed recovery promoted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pg_wal", "00000002.history")); err != nil {
+		t.Errorf("resumed recovery did not promote to timeline 2: %v", err)
 	}
 }
