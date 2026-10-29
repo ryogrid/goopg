@@ -406,6 +406,10 @@ type bitmapHeapScanOp struct {
 	// Stats.
 	exactPages int64
 	lossyPages int64
+	// statExact / statLossy are the node's EXPLAIN ANALYZE page counters
+	// (heapBlocksCounter), bumped beside exactPages / lossyPages; nil
+	// outside ANALYZE (M0122-0021).
+	statExact, statLossy *int64
 
 	// pbm, when non-nil, makes this a PARALLEL bitmap scan: pages are claimed
 	// from a shared atomic allocator instead of iterating locally, so N
@@ -428,6 +432,28 @@ func (o *bitmapHeapScanOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 // setFilterRemoveCounter implements filterRemoveCounter (see indexScanOp's).
 func (o *bitmapHeapScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
+
+// setHeapBlocksCounters implements heapBlocksCounter.
+func (o *bitmapHeapScanOp) setHeapBlocksCounters(exact, lossy *int64) {
+	o.statExact, o.statLossy = exact, lossy
+}
+
+// countPage records one heap page fetched from an exact or a lossy bitmap
+// entry — PG counts every page BitmapHeapScanNextBlock reads
+// (heapam_handler.c), visible tuples or not.
+func (o *bitmapHeapScanOp) countPage(lossy bool) {
+	if lossy {
+		o.lossyPages++
+		if o.statLossy != nil {
+			*o.statLossy++
+		}
+		return
+	}
+	o.exactPages++
+	if o.statExact != nil {
+		*o.statExact++
+	}
+}
 
 // Open is the single-scan entry point: one-time setup, then let Next build the
 // bitmap lazily. A nested-loop parent instead calls openPrep once and Rescan per
@@ -688,11 +714,7 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 			o.pageBlock = block
 			o.pageLossy = lossy
 
-			if lossy {
-				o.lossyPages++
-			} else {
-				o.exactPages++
-			}
+			o.countPage(lossy)
 
 			// Reset per-page arena. The arena is only acquired when the
 			// executor Context carries one (see Open), and Close already
@@ -787,7 +809,7 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		}
 
 		if entry.isLossy {
-			o.lossyPages++
+			o.countPage(true)
 			// Walk every line pointer on the page, exactly as the serial path
 			// does. The previous code `continue`d here and claimed to be
 			// matching the serial path — which was itself dropping lossy pages,
@@ -819,7 +841,7 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		// It survived because bitmap paths never won on cost, so this arm had
 		// never run. `o.parOffsets`/`o.parOff` now hold the position, and the
 		// page is only released once its offsets are exhausted.
-		o.exactPages++
+		o.countPage(false)
 		n := tbmExtractPageTuple(entry, nil)
 		if n == 0 {
 			continue

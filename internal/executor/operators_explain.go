@@ -6357,6 +6357,21 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 			}
 		}
 
+		// M0122-0021: a Bitmap Heap Scan's `Heap Blocks:` line, after its
+		// Recheck Cond / Filter / Rows Removed lines (explain.c
+		// show_tidbitmap_info). Text mode prints only the non-zero counts,
+		// and nothing when both are zero. Below a Gather the line is the
+		// leader's own pages — aggregateWorkerInstrumentation sums only the
+		// leader site's into the node entry — and the workers' follow as
+		// `Worker N:` lines at the node's end.
+		if _, isBHS := n.(*optimizer.BitmapHeapScan); isBHS {
+			if s, ok := stats[n]; ok && s != nil {
+				if line := formatHeapBlocks(s.exactPages, s.lossyPages); line != "" {
+					*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+				}
+			}
+		}
+
 		// M0128-P5.2: "Rows Removed by Join Filter" — a join node
 		// rejected candidate matches on its residual qual. The count is
 		// from the join node's own stats.joinFilterRejected. Mirrors
@@ -6509,6 +6524,27 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 		if s, ok := stats[n]; ok && s != nil {
 			if line := formatMemoryLine(s); line != "" {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
+	// M0122-0021: one `Worker N:  Heap Blocks: …` line per parallel worker
+	// that fetched a page, sorted by slot — show_tidbitmap_info walks
+	// sinstrument and skips workers with no pages; like the Memoize lines
+	// below they land in the per-worker buffers flushed at the node's end
+	// and print without VERBOSE.
+	if _, isBHS := n.(*optimizer.BitmapHeapScan); isBHS {
+		if ws := workerStats[n]; len(ws) > 0 {
+			ordered := make([]workerNodeStat, 0, len(ws))
+			for _, w := range ws {
+				if !w.Leader && (w.ExactPages > 0 || w.LossyPages > 0) {
+					ordered = append(ordered, w)
+				}
+			}
+			sort.Slice(ordered, func(i, j int) bool { return ordered[i].Worker < ordered[j].Worker })
+			for _, w := range ordered {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+					"Worker %d:  %s", w.Worker, formatHeapBlocks(w.ExactPages, w.LossyPages)))})
 			}
 		}
 	}
@@ -8158,4 +8194,20 @@ func parenBalancedInside(s string) bool {
 		}
 	}
 	return depth == 0
+}
+
+// formatHeapBlocks renders PG's text `Heap Blocks:` detail
+// (show_tidbitmap_info): each count only when non-zero, "" when both are.
+func formatHeapBlocks(exact, lossy int64) string {
+	if exact == 0 && lossy == 0 {
+		return ""
+	}
+	line := "Heap Blocks:"
+	if exact > 0 {
+		line += fmt.Sprintf(" exact=%d", exact)
+	}
+	if lossy > 0 {
+		line += fmt.Sprintf(" lossy=%d", lossy)
+	}
+	return line
 }

@@ -34,6 +34,15 @@ type nodeStats struct {
 	// increments it directly via a pointer handed to it in maybeInstrument.
 	heapFetches int64
 
+	// exactPages / lossyPages count the heap pages a Bitmap Heap Scan
+	// fetched from an exact / a lossy bitmap entry — PG's
+	// BitmapHeapScanState.stats (heapam_handler.c BitmapHeapScanNextBlock),
+	// surfaced as `Heap Blocks: exact=N lossy=M` (explain.c
+	// show_tidbitmap_info). Handed to the operator by maybeInstrument
+	// (heapBlocksCounter). M0122-0021.
+	exactPages int64
+	lossyPages int64
+
 	// filterRejected counts tuples a Filter operator rejected (scan-level
 	// qual). Mirrors upstream's Instrumentation.nfiltered1 for scan nodes,
 	// surfaced by EXPLAIN ANALYZE as "Rows Removed by Filter".
@@ -358,6 +367,9 @@ func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrument
 	if fr, ok := in.(filterRemoveCounter); ok {
 		fr.setFilterRemoveCounter(&stats.filterRejected)
 	}
+	if hb, ok := in.(heapBlocksCounter); ok {
+		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
+	}
 	// A bitmap heap probe builds its bitmap-producing subtree in Open, so
 	// it needs the scope to instrument that subtree (M0122-0021).
 	if sc, ok := in.(instrumentScopeCarrier); ok {
@@ -476,6 +488,13 @@ type filterRemoveCounter interface {
 	setFilterRemoveCounter(*int64)
 }
 
+// heapBlocksCounter is implemented by the bitmap heap scan: maybeInstrument
+// hands it its node's stats.exactPages / stats.lossyPages so the scan can ++
+// one of them per heap page fetched. Surfaces as "Heap Blocks:".
+type heapBlocksCounter interface {
+	setHeapBlocksCounters(exact, lossy *int64)
+}
+
 // joinFilterRemoveCounter is implemented by join operators that
 // evaluate join residual qual(s) and reject candidate matches.
 // maybeInstrument hands the operator a pointer to its node's
@@ -585,6 +604,13 @@ type workerNodeStat struct {
 	JoinFilterRejected  int64
 	ProbeFilterRejected int64
 	HeapFetches         int64
+	// ExactPages / LossyPages are the site's Bitmap Heap Scan page counts.
+	// Unlike the counters above PG does NOT sum them into the node: the
+	// `Heap Blocks:` line is the leader's own pages, and each worker's
+	// print as a `Worker N:  Heap Blocks:` line (explain.c
+	// show_tidbitmap_info over sinstrument). M0122-0021.
+	ExactPages int64
+	LossyPages int64
 	// Leader marks the leader's site (the last slot). PG keeps the
 	// leader's counters in planstate->instrument and prints `Worker N:`
 	// lines only for worker_instrument, so the leader never gets a line
@@ -629,6 +655,8 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 				JoinFilterRejected:  st.joinFilterRejected,
 				ProbeFilterRejected: st.probeFilterRejected,
 				HeapFetches:         st.heapFetches,
+				ExactPages:          st.exactPages,
+				LossyPages:          st.lossyPages,
 				Leader:              idx == len(tables)-1,
 			})
 		}
@@ -677,6 +705,10 @@ func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStat
 			agg.joinFilterRejected += w.JoinFilterRejected
 			agg.probeFilterRejected += w.ProbeFilterRejected
 			agg.heapFetches += w.HeapFetches
+			if w.Leader {
+				agg.exactPages += w.ExactPages
+				agg.lossyPages += w.LossyPages
+			}
 		}
 		if agg.loops == 0 {
 			// No site ever opened the node. Today that is a shared hash
@@ -726,6 +758,9 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	if fr, ok := op.(filterRemoveCounter); ok {
 		fr.setFilterRemoveCounter(&stats.filterRejected)
 	}
+	if hb, ok := op.(heapBlocksCounter); ok {
+		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
+	}
 	if jf, ok := op.(joinFilterRemoveCounter); ok {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
 	}
@@ -773,6 +808,8 @@ func foldPrebuildStats(ctx *Context, table nodeStatsTable) {
 			JoinFilterRejected:  st.joinFilterRejected,
 			ProbeFilterRejected: st.probeFilterRejected,
 			HeapFetches:         st.heapFetches,
+			ExactPages:          st.exactPages,
+			LossyPages:          st.lossyPages,
 			Leader:              true,
 		})
 	}

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -216,6 +217,66 @@ func TestExplainAnalyzeProbeCondRowsRemoved(t *testing.T) {
 		}
 		if got != w {
 			t.Errorf("probe detail line %d = %q, want %q:\n%s", i+2, got, w, out)
+		}
+	}
+}
+
+// TestExplainAnalyzeBitmapHeapBlocks pins M0122-0021's `Heap Blocks:` line:
+// PG prints the pages a Bitmap Heap Scan fetched, split exact / lossy
+// (explain.c show_tidbitmap_info from BitmapHeapScanState.stats, counted once
+// per page in heapam_handler.c BitmapHeapScanNextBlock). goopg counted the
+// pages already (exactPages / lossyPages) but nothing reported them. Below a
+// Gather the main line is the leader's own pages and each worker that fetched
+// one prints a `Worker N:  Heap Blocks:` line, so the main line plus the
+// worker lines account for the serial scan's pages exactly.
+func TestExplainAnalyzeBitmapHeapBlocks(t *testing.T) {
+	ctx := spillFixture(t, 2000, 10, 400)
+	if err := runDDL(t, ctx, "CREATE INDEX sp_probe_k ON sp_probe (k)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	const sql = "SELECT pad FROM sp_probe WHERE k < 40"
+	explain := "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) " + sql
+	exactPages := func(lines []string, workerLines bool) (sum int64, n int) {
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			var w, e int64
+			if workerLines {
+				if c, _ := fmt.Sscanf(l, "Worker %d:  Heap Blocks: exact=%d", &w, &e); c == 2 {
+					sum += e
+					n++
+				}
+			} else if c, _ := fmt.Sscanf(l, "Heap Blocks: exact=%d", &e); c == 1 {
+				sum += e
+				n++
+			}
+		}
+		return sum, n
+	}
+
+	serialLines := runExplainOverChild(t, ctx, explain, planBitmapForced(t, ctx, sql))
+	serial, n := exactPages(serialLines, false)
+	if n != 1 || serial <= 1 {
+		t.Fatalf("serial: want one `Heap Blocks: exact=N` line over several pages, got %d line(s) totalling %d:\n%s",
+			n, serial, strings.Join(serialLines, "\n"))
+	}
+
+	ctx.MaxParallelWorkers = 8
+	for _, leaderRuns := range []bool{true, false} {
+		ctx.ParallelLeaderParticipation = leaderRuns
+		ctx.GatherWorkerStats = nil
+		parLines := runExplainOverChild(t, ctx, explain, &optimizer.Gather{Child: planBitmapForced(t, ctx, sql), WorkersPlanned: 2})
+		out := strings.Join(parLines, "\n")
+		leader, leaderLines := exactPages(parLines, false)
+		workers, workerLines := exactPages(parLines, true)
+		if leader+workers != serial {
+			t.Errorf("leader participation %v: the leader line (%d) plus worker lines (%d) must equal the serial pages (%d):\n%s",
+				leaderRuns, leader, workers, serial, out)
+		}
+		// Without the leader every page is a worker's: PG's leader stats
+		// stay zero, so it prints no main line, only worker lines.
+		if !leaderRuns && (leaderLines != 0 || workerLines == 0) {
+			t.Errorf("leader participation off: want only `Worker N:  Heap Blocks:` lines, got %d main / %d worker:\n%s",
+				leaderLines, workerLines, out)
 		}
 	}
 }
