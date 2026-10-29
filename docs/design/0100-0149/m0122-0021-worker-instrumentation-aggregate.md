@@ -3,7 +3,7 @@
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
-producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -242,7 +242,23 @@ serially as well as in parallel plans.
    rendered. The DML source scans are built outside the operator's scope.
 9. An uncorrelated ARRAY() prints `SubPlan 1`. PG makes it an initplan and prints `InitPlan 1` (subselect.c
    make_subplan).
-10. Bitmap Heap Scan prints no `Heap Blocks: exact=… lossy=…` line (explain.c show_tidbitmap_info).
+10. ~~Bitmap Heap Scan prints no `Heap Blocks: exact=… lossy=…` line (explain.c show_tidbitmap_info).~~ Fixed
+    2026-10-29 (`431cec8d7`).
+    - `bitmapHeapScanOp` already counted the pages it fetched (`countPage`, once per page from an exact or a lossy
+      entry, as PG's `BitmapHeapScanNextBlock` counts them). It now reports them to `nodeStats.exactPages` /
+      `lossyPages` through `heapBlocksCounter`, which `maybeInstrument` and the NLI probe sidecar hand over.
+    - The text line prints only the non-zero counts, after Recheck Cond / Filter / Rows Removed.
+    - Below a Gather, PG does not sum the pages. The node line shows the leader's own pages, and each worker with
+      pages prints `Worker N:  Heap Blocks:` (from `sinstrument`), without VERBOSE. To match:
+      - `workerNodeStat` carries the per-site counts;
+      - `aggregateWorkerInstrumentation` adds only the leader site's counts to the node entry;
+      - the worker lines print at the node's end, beside the Memoize ones.
+    - Serial and NLI-probe output is identical to PG 18.3.
+    - Test: `TestExplainAnalyzeBitmapHeapBlocks`.
+13. goopg's TID bitmap is sized and lossified by its own heuristic, not by PG's `tbm_calculate_entries` /
+    `tbm_lossify`. At small `work_mem` it therefore goes lossy where PG stays exact. This is an execution difference;
+    the `Heap Blocks:` line reports what goopg actually did.
+14. `Rows Removed by Index Recheck` (PG's `nfiltered2`) is not counted.
 11. The correlated value hash map scans the inner table once, so it reports `loops=1`. PG re-runs the SubPlan on every
     call. This is an execution difference, like 6.
 12. Under VERBOSE, PG writes each worker's lines into one block flushed at the node's end: `Worker N:  actual …`,

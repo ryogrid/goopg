@@ -4026,9 +4026,24 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - New residual \(ledgered\): the VERBOSE per\-worker block layout\. PG nests each worker's Hits / Sort Method
         lines under its `Worker N:  actual …` line, after Buffers\. goopg prints them as flat lines, and its Sort
         worker lines come before Buffers\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): `Heap Blocks:`; uncorrelated ARRAY\(\)
-      InitPlan label; VERBOSE per\-worker block layout; per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR
-      SubPlan rendering \(last: no benchmark query is DML\)\.
+    - Residual 10 done 2026\-10\-29 \(`431cec8d7`\): Bitmap Heap Scan prints PG's `Heap Blocks: exact=N lossy=M`\.
+      - The op already counted pages but nothing reported them\. It now hands the counts to `nodeStats` through
+        `heapBlocksCounter` \(maybeInstrument and the NLI probe sidecar\)\. Text mode prints non\-zero counts only,
+        after Recheck Cond / Filter / Rows Removed \(explain\.c show\_tidbitmap\_info\)\.
+      - Below a Gather PG does not sum the pages: the main line is the leader's own, and every worker that fetched a
+        page gets a `Worker N:  Heap Blocks:` line\. goopg now matches: `workerNodeStat` carries
+        ExactPages/LossyPages, the aggregate adds only the leader site's, and the worker lines print at the node's
+        end\.
+      - Serial and NLI\-probe lines are identical to a scratch PG 18\.3\. At work\_mem=64kB goopg's TID bitmap goes
+        lossy where PG stays exact\. That is goopg's own lossify heuristic, an execution difference, ledgered\.
+      - Test `TestExplainAnalyzeBitmapHeapBlocks` \(serial; Gather with the leader on and off; mutation\-checked\)\.
+        Gates: units, `\-race`, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE
+        same=99\); census `routing\-20261029i` 22/22·99/99·99/99\.
+      - New residuals \(ledgered\): goopg's TID\-bitmap sizing / lossification is not PG's tidbitmap\.c;
+        `Rows Removed by Index Recheck` is not counted\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): uncorrelated ARRAY\(\) InitPlan label;
+      `Rows Removed by Index Recheck`; VERBOSE per\-worker block layout; per\-site Buffers/WAL/memory; DML child
+      actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6758,6 +6773,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - Census 2026\-10\-29 at `c49bd9b71` \(M0122\-0021 residual 4 changed internal/executor\) — `routing\-20261029g/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `910e30183` \(M0122\-0021 residual 3 changed internal/executor\) — `routing\-20261029h/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `431cec8d7` \(M0122\-0021 residual 10 changed internal/executor\) — `routing\-20261029i/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
