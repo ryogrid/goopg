@@ -805,7 +805,7 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	entries := append(append([]xlog.TimelineHistoryEntry(nil), prev...), xlog.TimelineHistoryEntry{
 		TLI:       oldTLI,
 		SwitchLSN: endLSN,
-		Reason:    "archive recovery complete",
+		Reason:    rec.StopReason(), // getRecoveryStopReason
 	})
 	if err := xlog.WriteHistory(walDir, newTLI, entries); err != nil {
 		return fmt.Errorf("promote after recovery: write timeline history: %w", err)
@@ -983,4 +983,76 @@ func recoveryTargetTimeline(registry *misc.Registry) xlog.TargetTimeline {
 		return xlog.TargetTimeline{Goal: xlog.TargetTimelineNumeric, TLI: tli}
 	}
 	return xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}
+}
+
+// recoveryStop reads recovery_target_lsn and recovery_target_inclusive
+// (their check hooks validated them when the configuration was loaded).
+func recoveryStop(registry *misc.Registry) xlog.RecoveryStop {
+	value := stringGUC(registry, "recovery_target_lsn", "")
+	if value == "" {
+		return xlog.RecoveryStop{}
+	}
+	lsn, ok := misc.ParsePGLSN(value)
+	if !ok {
+		return xlog.RecoveryStop{}
+	}
+	return xlog.RecoveryStop{Set: true, LSN: lsn, Inclusive: boolGUC(registry, "recovery_target_inclusive", true)}
+}
+
+// recoveryTargetAction is recovery_target_action as validateRecoveryParameters
+// leaves it: 'pause' becomes 'shutdown' when hot_standby is off.
+func recoveryTargetAction(registry *misc.Registry) string {
+	action := stringGUC(registry, "recovery_target_action", "pause")
+	if action == "pause" && !boolGUC(registry, "hot_standby", true) {
+		return "shutdown"
+	}
+	return action
+}
+
+// checkRecoveryTargetReached is the end-of-redo target check of
+// PerformWalRecovery: a target that was never reached is FATAL ("recovery
+// ended before configured recovery target was reached"), and one reached
+// before the recovery became consistent is FATAL too ("requested recovery
+// stop point is before consistent recovery point"). goopg's crash replay in
+// initdb.Open has already applied the local WAL, so its end (the writer's
+// written position, a PG position) is the earliest point the recovery can
+// stop at.
+func checkRecoveryTargetReached(stop xlog.RecoveryStop, res xlog.ArchiveRecoveryResult, localEnd uint64) error {
+	if !stop.Set {
+		return nil
+	}
+	if !res.ReachedTarget {
+		return &xlog.RestoreFatalError{Msg: "recovery ended before configured recovery target was reached"}
+	}
+	if res.StopPoint < localEnd {
+		return &xlog.RestoreFatalError{Msg: "requested recovery stop point is before consistent recovery point"}
+	}
+	return nil
+}
+
+// shutdownAtRecoveryTarget is recovery_target_action = 'shutdown' (and
+// 'pause', which goopg cannot honour — see below): the startup process
+// logs "shutdown at recovery target" and exits, the postmaster shuts down
+// normally, the checkpointer's shutdown restartpoint records
+// DB_SHUTDOWNED_IN_RECOVERY, and recovery.signal stays — the next start
+// recovers again. No promotion, no WAL written.
+//
+// 'pause' with hot_standby on keeps the server up, paused in recovery and
+// accepting read-only connections until pg_wal_replay_resume(); goopg's
+// archive recovery runs before the server accepts connections, so it
+// cannot pause there and shuts down instead, with a WARNING.
+func shutdownAtRecoveryTarget(rt *initdb.Runtime, action string, logger *slog.Logger, stderr io.Writer) int {
+	if action == "pause" {
+		logger.Warn("recovery_target_action = 'pause' is not supported during start-time archive recovery; shutting down at the recovery target instead")
+	}
+	rt.SetImmediateShutdown()
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateShutdownedInRecovery
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "goopg start: shutdown at recovery target: could not update pg_control: %v\n", err)
+		return 1
+	}
+	logger.Info("shutdown at recovery target")
+	return 0
 }

@@ -53,6 +53,15 @@ type ArchiveRecoveryResult struct {
 	// TargetTLI is the recovery target timeline (recoveryTargetTLI): the
 	// timeline whose history recovery follows.
 	TargetTLI uint32
+	// ReachedTarget reports that the LSN target stopped recovery at StopLSN
+	// (the ReadRecPtr of the record it stopped at), after applying that
+	// record when StopAfter (recoveryStopLSN / recoveryStopAfter).
+	ReachedTarget bool
+	StopLSN       uint64
+	StopAfter     bool
+	// StopPoint is where the recovered WAL ends at the target, as a PG
+	// position: the stop record's start, or its end when StopAfter.
+	StopPoint uint64
 	// TargetHistory is TargetTLI's history file as read (nil for timeline 1
 	// or when it has none). The history file is read through RECOVERYHISTORY
 	// and not kept in pg_wal, so the promotion builds the new timeline's
@@ -100,7 +109,7 @@ type TargetTimeline struct {
 // segmentSize of 0 means "derive from the cluster's own WAL" (via
 // detectSegmentSizeAt / DefaultSegmentSize).
 func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) (ArchiveRecoveryResult, error) {
-	return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return restoreCommand }, segmentSize, TargetTimeline{})
+	return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return restoreCommand }, segmentSize, TargetTimeline{}, RecoveryStop{})
 }
 
 // RunArchiveRecoveryWith is RunArchiveRecovery with restore_command read
@@ -115,7 +124,7 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 // in_restore_command); either way the result wraps ErrRecoveryShutdown and
 // recovery is left unfinished. A *RestoreFatalError from a fetch aborts
 // recovery instead of ending it, as upstream's FATAL does.
-func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline) (ArchiveRecoveryResult, error) {
+func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64, target TargetTimeline, stop RecoveryStop) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -350,6 +359,29 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		if err != nil {
 			return res, fmt.Errorf("wal: archive recovery: read segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
 		}
+		// recoveryStopsBefore / recoveryStopsAfter for an LSN target: the
+		// first record whose ReadRecPtr reaches the target ends recovery —
+		// before it (recovery_target_inclusive off) or after applying it
+		// (on). The records after it are never replayed.
+		stopped := false
+		if stop.Set {
+			for i, r := range records {
+				readRecPtr := r.StartLSN - 1 // 1-based internal start -> PG ReadRecPtr
+				if readRecPtr < stop.LSN {
+					continue
+				}
+				stopped = true
+				res.ReachedTarget, res.StopLSN, res.StopAfter = true, readRecPtr, stop.Inclusive
+				res.StopPoint = readRecPtr
+				if stop.Inclusive {
+					res.StopPoint = r.EndLSN
+					records = records[:i+1]
+				} else {
+					records = records[:i]
+				}
+				break
+			}
+		}
 		if len(records) > 0 {
 			if _, err := ReplayRecords(mgr, records); err != nil {
 				return res, fmt.Errorf("wal: archive recovery: replay segment %s: %w", FormatSegmentNameTLI(seg, chosen), err)
@@ -358,8 +390,34 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 				res.EndOfLog, res.LastStart, res.EndTLI = last.EndLSN, last.StartLSN, chosen
 			}
 		}
+		if stopped {
+			return res, nil
+		}
 		seg++
 	}
+}
+
+// RecoveryStop is an LSN recovery target: recovery_target_lsn (Set when the
+// setting is non-empty) and recovery_target_inclusive.
+type RecoveryStop struct {
+	Set       bool
+	LSN       uint64 // PG LSN (0-based)
+	Inclusive bool
+}
+
+// StopReason is getRecoveryStopReason's text, which the promotion writes
+// as the new timeline history's reason: "before|after LSN X/X\n" (the
+// trailing newline is upstream's) when an LSN target stopped recovery,
+// "no recovery target specified" otherwise.
+func (r ArchiveRecoveryResult) StopReason() string {
+	if !r.ReachedTarget {
+		return "no recovery target specified"
+	}
+	when := "before"
+	if r.StopAfter {
+		when = "after"
+	}
+	return fmt.Sprintf("%s LSN %X/%X\n", when, uint32(r.StopLSN>>32), uint32(r.StopLSN))
 }
 
 // highestLocalSegment returns the highest segment number found in walDir

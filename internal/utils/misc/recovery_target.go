@@ -98,3 +98,44 @@ func checkRecoveryTargetTimeline(value string) error {
 	}
 	return nil
 }
+
+// ParsePGLSN is pg_lsn_in_internal (utils/adt/pg_lsn.c): one to eight hex
+// digits, '/', one to eight hex digits, nothing else.
+func ParsePGLSN(s string) (uint64, bool) {
+	hexRun := func(t string) int {
+		n := 0
+		for n < len(t) && hexDigit(t[n]) >= 0 {
+			n++
+		}
+		return n
+	}
+	len1 := hexRun(s)
+	if len1 < 1 || len1 > 8 || len1 >= len(s) || s[len1] != '/' {
+		return 0, false
+	}
+	rest := s[len1+1:]
+	len2 := hexRun(rest)
+	if len2 < 1 || len2 > 8 || len2 != len(rest) {
+		return 0, false
+	}
+	var hi, lo uint64
+	for i := 0; i < len1; i++ {
+		hi = hi<<4 | uint64(hexDigit(s[i]))
+	}
+	for i := 0; i < len2; i++ {
+		lo = lo<<4 | uint64(hexDigit(rest[i]))
+	}
+	return hi<<32 | lo, true
+}
+
+// checkRecoveryTargetLSN is check_recovery_target_lsn: an empty value means
+// no LSN target; anything else must be a valid pg_lsn.
+func checkRecoveryTargetLSN(value string) error {
+	if value == "" {
+		return nil
+	}
+	if _, ok := ParsePGLSN(value); !ok {
+		return &ValidationError{Msg: `invalid value for parameter "recovery_target_lsn": "` + value + `"`}
+	}
+	return nil
+}

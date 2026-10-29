@@ -17,6 +17,7 @@ import (
 
 	"github.com/goopg/goopg/internal/utils/misc"
 	"github.com/goopg/goopg/internal/access/transam/control"
+	"github.com/goopg/goopg/internal/initdb"
 )
 
 // TestNoArgsPrintsUsage guards the contract from
@@ -883,5 +884,72 @@ func TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "pg_wal", "00000002.history")); err != nil {
 		t.Errorf("resumed recovery did not promote to timeline 2: %v", err)
+	}
+}
+
+// TestStartRecoveryTargetLSNFatals pins goopg start's recovery_target_lsn
+// end-of-redo checks: a target the archive never reaches is FATAL
+// "recovery ended before configured recovery target was reached", and a
+// target inside the WAL initdb.Open already replayed is FATAL "requested
+// recovery stop point is before consistent recovery point". Neither
+// promotes: recovery.signal stays and no new timeline appears.
+func TestStartRecoveryTargetLSNFatals(t *testing.T) {
+	for _, c := range []struct{ lsn, want string }{
+		{"FFFFFFFF/0", "FATAL: recovery ended before configured recovery target was reached"},
+		{"0/1", "FATAL: requested recovery stop point is before consistent recovery point"},
+	} {
+		t.Run(c.lsn, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"init", "-D", dir}, &stdout, &stderr); code != 0 {
+				t.Fatalf("init exit=%d stderr=%q", code, stderr.String())
+			}
+			// Local WAL past the target: records after the first one, left
+			// for initdb.Open's crash replay (no shutdown checkpoint).
+			rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 5; i++ {
+				if _, _, err := rt.WAL.Append(make([]byte, 200)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+				t.Fatal(err)
+			}
+			rt.SetImmediateShutdown()
+			rt.Close()
+			f, err := os.OpenFile(filepath.Join(dir, "postgresql.conf"), os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintf(f, "restore_command = 'false'\nrecovery_target_lsn = '%s'\n", c.lsn)
+			f.Close()
+			signal := filepath.Join(dir, "recovery.signal")
+			if err := os.WriteFile(signal, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stderr.Reset()
+			done := make(chan int, 1)
+			go func() { done <- run([]string{"start", "-D", dir, "--listen", "127.0.0.1:0"}, &stdout, &stderr) }()
+			select {
+			case code := <-done:
+				if code != 1 {
+					t.Errorf("start exit=%d, want 1", code)
+				}
+			case <-time.After(90 * time.Second):
+				t.Fatalf("start did not fail (stderr %q)", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), c.want) {
+				t.Errorf("stderr %q lacks %q", stderr.String(), c.want)
+			}
+			if _, err := os.Stat(signal); err != nil {
+				t.Errorf("recovery.signal removed: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "pg_wal", "00000002.history")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("a failed recovery promoted (err %v)", err)
+			}
+		})
 	}
 }

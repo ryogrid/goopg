@@ -993,12 +993,34 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// pending reload (ProcessStartupProcInterrupts), then reads it.
 		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
 		// at the next fetch or segment and cancels a running restore_command.
+		stop := recoveryStop(registry)
+		// Crash replay in initdb.Open has already applied the local WAL; a
+		// stop point inside it cannot be honoured.
+		localEnd := uint64(0)
+		if rt.WAL != nil {
+			localEnd = rt.WAL.WrittenLSN()
+		}
 		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
 			startupHup.process(registry, cfg.ConfigPath, *dataDir)
 			return stringGUC(registry, "restore_command", "")
-		}, 0, recoveryTargetTimeline(registry))
+		}, 0, recoveryTargetTimeline(registry), stop)
+		if err == nil {
+			err = checkRecoveryTargetReached(stop, recovered, localEnd)
+		}
 		if err != nil {
 			return endInterruptedArchiveRecovery(rt, err, logger, stderr)
+		}
+		if recovered.ReachedTarget {
+			when := "before"
+			if recovered.StopAfter {
+				when = "after"
+			}
+			logger.Info(fmt.Sprintf("recovery stopping %s WAL location (LSN) \"%X/%X\"", when, uint32(recovered.StopLSN>>32), uint32(recovered.StopLSN)))
+			// recovery_target_action: shutdown ends here, leaving recovery
+			// unfinished; pause becomes shutdown without hot_standby.
+			if action := recoveryTargetAction(registry); action != "promote" {
+				return shutdownAtRecoveryTarget(rt, action, logger, stderr)
+			}
 		}
 		logger.Info("archive recovery complete; promoting to primary")
 		// Promote: bump TLI, write history, update pg_control,

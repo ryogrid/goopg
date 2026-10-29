@@ -151,7 +151,7 @@ func TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch(t *testing.T) {
 		return working
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize, TargetTimeline{})
+	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize, TargetTimeline{}, RecoveryStop{})
 	if err != nil {
 		t.Fatalf("RunArchiveRecoveryWith: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestRunArchiveRecoveryTargetTimeline(t *testing.T) {
 			t.Fatal(err)
 		}
 		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-		return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, target)
+		return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, target, RecoveryStop{})
 	}
 
 	for _, c := range []struct {
@@ -463,7 +463,7 @@ func TestRunArchiveRecoveryCheckpointMustPrecedeTheFork(t *testing.T) {
 			t.Fatal(err)
 		}
 		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-		_, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, 1<<20, target)
+		_, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, 1<<20, target, RecoveryStop{})
 		return err
 	}
 
@@ -479,5 +479,82 @@ func TestRunArchiveRecoveryCheckpointMustPrecedeTheFork(t *testing.T) {
 	err = run(3, 0x4000, TargetTimeline{Goal: TargetTimelineNumeric, TLI: 2})
 	if !errors.As(err, &fatal) || fatal.Msg != "requested timeline 3 is not in this server's history" {
 		t.Errorf("start timeline off the target's history: err = %v", err)
+	}
+}
+
+// TestRunArchiveRecoveryStopsAtTargetLSN pins recoveryStopsBefore /
+// recoveryStopsAfter for recovery_target_lsn: the first record whose
+// ReadRecPtr reaches the target ends recovery — after applying it with
+// recovery_target_inclusive on, before it with off — and no later record is
+// replayed; StopReason is getRecoveryStopReason's "after|before LSN X/X\n".
+// A target past the end of the archive is not reached.
+func TestRunArchiveRecoveryStopsAtTargetLSN(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct{ start, end uint64 }
+	var recs []rec
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		s, e, err := w.Append(make([]byte, 2000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec{s, e})
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A record in the second segment; ReadRecPtr = internal start - 1.
+	k := len(recs) - 20
+	target := recs[k].start - 1
+	run := func(stop RecoveryStop) ArchiveRecoveryResult {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	lsn := func(v uint64) string { return fmt.Sprintf("%X/%X", uint32(v>>32), uint32(v)) }
+
+	res := run(RecoveryStop{Set: true, LSN: target, Inclusive: true})
+	if !res.ReachedTarget || !res.StopAfter || res.StopLSN != target || res.EndOfLog != recs[k].end || res.StopPoint != recs[k].end {
+		t.Errorf("inclusive: %+v; want stop after the record at %s, EndOfLog %X", res, lsn(target), recs[k].end)
+	}
+	if want := "after LSN " + lsn(target) + "\n"; res.StopReason() != want {
+		t.Errorf("inclusive reason %q, want %q", res.StopReason(), want)
+	}
+
+	res = run(RecoveryStop{Set: true, LSN: target, Inclusive: false})
+	if !res.ReachedTarget || res.StopAfter || res.StopLSN != target || res.EndOfLog != recs[k-1].end || res.StopPoint != target {
+		t.Errorf("exclusive: %+v; want stop before the record at %s, EndOfLog %X", res, lsn(target), recs[k-1].end)
+	}
+	if want := "before LSN " + lsn(target) + "\n"; res.StopReason() != want {
+		t.Errorf("exclusive reason %q, want %q", res.StopReason(), want)
+	}
+
+	// A target inside record k stops at the next record, the first whose
+	// ReadRecPtr reaches it.
+	res = run(RecoveryStop{Set: true, LSN: target + 8, Inclusive: false})
+	if res.StopLSN != recs[k+1].start-1 || res.EndOfLog != recs[k].end {
+		t.Errorf("mid-record target: stop %X EndOfLog %X; want stop at %X, EndOfLog %X", res.StopLSN, res.EndOfLog, recs[k+1].start-1, recs[k].end)
+	}
+
+	res = run(RecoveryStop{Set: true, LSN: recs[len(recs)-1].end + 0x1000, Inclusive: true})
+	if res.ReachedTarget || res.EndOfLog != recs[len(recs)-1].end {
+		t.Errorf("target past the archive: %+v; want not reached, whole archive replayed", res)
+	}
+	if got := res.StopReason(); got != "no recovery target specified" {
+		t.Errorf("unreached reason %q", got)
 	}
 }

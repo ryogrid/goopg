@@ -161,8 +161,16 @@
 
 # - Archive Recovery -
 
+#recovery_target_lsn = ''	# the WAL LSN up to which recovery will proceed
+				# (change requires restart)
+#recovery_target_inclusive = on	# Specifies whether to stop:
+				# just after the specified recovery target (on)
+				# just before the recovery target (off)
+				# (change requires restart)
 #recovery_target_timeline = 'latest'    # 'latest' | 'current' | timeline OID
                                         # (change requires restart)
+#recovery_target_action = 'pause'	# 'pause', 'promote', 'shutdown'
+					# (change requires restart)
 
 
 #------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -1114,5 +1115,147 @@ func TestRecoveryTargetTimelineReadsRawValue(t *testing.T) {
 	}
 	if got := recoveryTargetTimeline(misc.BuildDefaultRegistry()); got != (xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}) {
 		t.Errorf("default: got %+v, want latest", got)
+	}
+}
+
+// TestRecoveryTargetChecksAndAction pins the end-of-redo target rules of
+// PerformWalRecovery and validateRecoveryParameters: an unreached target is
+// FATAL "recovery ended before configured recovery target was reached"; a
+// stop point before the WAL initdb.Open already replayed is FATAL
+// "requested recovery stop point is before consistent recovery point";
+// recovery_target_action 'pause' becomes 'shutdown' without hot_standby.
+func TestRecoveryTargetChecksAndAction(t *testing.T) {
+	stop := xlog.RecoveryStop{Set: true, LSN: 0x5000}
+	fatalMsg := func(err error) string {
+		var f *xlog.RestoreFatalError
+		if errors.As(err, &f) {
+			return f.Msg
+		}
+		return fmt.Sprint(err)
+	}
+	if err := checkRecoveryTargetReached(xlog.RecoveryStop{}, xlog.ArchiveRecoveryResult{}, 0x9000); err != nil {
+		t.Errorf("no target: %v", err)
+	}
+	if got := fatalMsg(checkRecoveryTargetReached(stop, xlog.ArchiveRecoveryResult{}, 0x1000)); got != "recovery ended before configured recovery target was reached" {
+		t.Errorf("unreached: %q", got)
+	}
+	reached := xlog.ArchiveRecoveryResult{ReachedTarget: true, StopLSN: 0x5000, StopPoint: 0x5000}
+	if got := fatalMsg(checkRecoveryTargetReached(stop, reached, 0x6000)); got != "requested recovery stop point is before consistent recovery point" {
+		t.Errorf("before the local end: %q", got)
+	}
+	if err := checkRecoveryTargetReached(stop, reached, 0x5000); err != nil {
+		t.Errorf("at the local end: %v", err)
+	}
+
+	for _, c := range []struct {
+		action, hotStandby, want string
+	}{
+		{"pause", "on", "pause"},
+		{"pause", "off", "shutdown"},
+		{"promote", "off", "promote"},
+		{"shutdown", "on", "shutdown"},
+	} {
+		r := misc.BuildDefaultRegistry()
+		if err := r.Set("recovery_target_action", c.action, misc.SourceConfigFile); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Set("hot_standby", c.hotStandby, misc.SourceConfigFile); err != nil {
+			t.Fatal(err)
+		}
+		if got := recoveryTargetAction(r); got != c.want {
+			t.Errorf("action %s, hot_standby %s: got %s, want %s", c.action, c.hotStandby, got, c.want)
+		}
+	}
+}
+
+// TestPromoteAfterRecoveryToTargetLSN is point-in-time recovery to
+// recovery_target_lsn end to end: archive recovery stops after the target
+// record, the promotion switches timeline at that record's end, and the new
+// timeline's history names the stop the way getRecoveryStopReason does
+// ("after LSN X/X"). goopg ignored the target, replayed the whole archive
+// and wrote "archive recovery complete".
+func TestPromoteAfterRecoveryToTargetLSN(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	archive := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	start := rt.WAL.WrittenLSN()
+	type rec struct{ start, end uint64 }
+	var recs []rec
+	for rt.WAL.WrittenLSN() < start+3*segSize {
+		s, e, err := rt.WAL.Append(make([]byte, 4000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec{s, e})
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	rt.Close()
+
+	walDir := filepath.Join(dir, "pg_wal")
+	keepSeg := start/segSize + 1
+	ents, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if _, seg, ok := xlog.ParseXLogFileName(e.Name(), 0); ok && seg > keepSeg {
+			if err := os.Rename(filepath.Join(walDir, e.Name()), filepath.Join(archive, e.Name())); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "recovery.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	localEnd := rt.WAL.WrittenLSN()
+	// A record well inside the archived range.
+	k := len(recs) - 30
+	if recs[k].start <= localEnd {
+		t.Fatalf("precondition: target record %X is not past the local end %X", recs[k].start, localEnd)
+	}
+	target := recs[k].start - 1
+	stop := xlog.RecoveryStop{Set: true, LSN: target, Inclusive: true}
+	recovered, err := xlog.RunArchiveRecoveryWith(context.Background(), rt.StorageMgr, dir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, int64(segSize), xlog.TargetTimeline{}, stop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRecoveryTargetReached(stop, recovered, localEnd); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.EndOfLog != recs[k].end {
+		t.Fatalf("EndOfLog %X, want the target record's end %X", recovered.EndOfLog, recs[k].end)
+	}
+	oldTLI := rt.WAL.TimelineID()
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{Recovery: recovered}, logger); err != nil {
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	newTLI := rt.WAL.TimelineID()
+	hist, err := xlog.ReadHistory(walDir, newTLI)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("new timeline history: %+v, %v", hist, err)
+	}
+	last := hist[len(hist)-1]
+	wantReason := fmt.Sprintf("after LSN %X/%X", uint32(target>>32), uint32(target))
+	if last.TLI != oldTLI || last.SwitchLSN != recs[k].end || last.Reason != wantReason {
+		t.Errorf("history entry %+v; want TLI %d switched at %X, reason %q", last, oldTLI, recs[k].end, wantReason)
+	}
+	raw, _ := os.ReadFile(filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
+	if !strings.HasSuffix(string(raw), wantReason+"\n\n") {
+		t.Errorf("history file %q does not end with PG's reason line (reason + its own newline)", raw)
 	}
 }
