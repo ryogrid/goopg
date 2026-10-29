@@ -4,7 +4,11 @@ Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
 producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan); residual 14 `28c6de6c8` (Rows Removed by Index
-Recheck); residual 12 `fdde69739` (per-worker blocks); BUFFERS defaults to ANALYZE `ee57789ff`. The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+Recheck); residual 12 `fdde69739` (per-worker blocks); BUFFERS defaults to ANALYZE `ee57789ff`. **Task closed 2026-10-29.** Each still-open item under "Remaining residuals" (end of file) has its own fix_plan
+task: M0122-0023 (per-backend buffer usage), M0122-0024 (DML child actuals), M0122-0025 (bounded top-N sort),
+M0122-0026 (TID-bitmap lossify port), M0122-0027 (VERBOSE Output / ARRAY width), M0122-0028 (walkExprTree audit),
+M0122-0029 (BitmapOr paths), M0122-0030 (ea-ratchet drift). The execution differences (items 6, 7, 11) are recorded
+and are not imitated.
 
 ## Problem
 

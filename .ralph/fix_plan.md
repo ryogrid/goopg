@@ -3898,7 +3898,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
-- [ ] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
+- [x] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
   Kind: impl
   Parent: none
   - Filed 2026\-10\-28 \(loop \#245\) from the M0122\-0012 G3 rows census of TPC\-DS Q72 \(SF0\.25\)\. Captures:
@@ -4097,6 +4097,21 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       ledgered outside this task's actuals scope: VERBOSE Output lines\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
+  - **Closed 2026\-10\-29 \(loop \#6 session\)\.** The stated scope is done: worker subtrees fold onto the node line,
+    and CTE bodies, SubPlans/InitPlans, Memoize, shared/coop builds, expression subqueries and bitmap producers report
+    actuals\. Added on top: `Heap Blocks:`, `Rows Removed by Index Recheck`, probe `Rows Removed by Filter`,
+    per\-worker Memoize and Heap Blocks lines in PG's per\-worker block layout, the bare SubPlan label, uncorrelated
+    ARRAY as an initplan, and BUFFERS defaulting to ANALYZE \(PG 18\)\.
+    - Not fixed here; each has a ledger row and is filed as its own task: M0122\-0023 \(per\-backend buffer usage,
+      residual 5\), M0122\-0024 \(DML child actuals \+ MULTIEXPR SubPlan, residual 8\), M0122\-0025 \(bounded top\-N
+      sort\), M0122\-0026 \(TID\-bitmap sizing/lossify port\), M0122\-0027 \(VERBOSE Output lines \+ ARRAY width/typed
+      result\), M0122\-0028 \(walkExprTree IN\-list audit\), M0122\-0029 \(BitmapOr paths \+ `Disabled:` line\),
+      M0122\-0030 \(pre\-existing ea\-ratchet drift\)\.
+    - Recorded, not imitated: execution differences — SubPlan value cache, the corr hash map, one shared/coop build
+      where PG builds per participant\.
+    - Movement: none — instrument artefact — EXPLAIN ANALYZE instrumentation is invisible to the plan instruments
+      \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
+      TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
   Kind: impl
   Parent: none
@@ -4112,6 +4127,77 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     `scalar subquery returned` site, internal/executor/expr\.go evalSubquery\) and route it to the row\-compare
     evaluator \(evalRowFuncCallVsSubqueryExpr\); then fix the `ROW\(\)` form's parameter binding\.
   - Expected instrument: Movement: regress \(new pin\); PG's result rows for the three repros\.
+- [ ] **M0122\-0023 — EXPLAIN \(BUFFERS\) counts per backend and per parallel site, as PG's pgBufferUsage does**\.
+  Kind: impl
+  Parent: M0122\-0021
+  - Today: `instrumentedOp\.accountBuffers` diffs the pool\-global `Pool\.BufferCounters` atomics\. Other sessions'
+    and concurrent workers' reads therefore land on whichever node's Next is running, and site counts are never
+    summed\. Since `ee57789ff` these lines print on every EXPLAIN ANALYZE\.
+  - PG: per\-backend `pgBufferUsage`; `InstrStartNode` / `InstrStopNode` take `BufferUsageAccumDiff`; workers'
+    usage is summed with `InstrAggNode` / `BufferUsageAdd` \(instrument\.c\)\.
+  - First step: design a per\-execution\-context counter handle that reaches the pool\. There are 116 executor
+    `Pool\.Pin` sites, plus nbtree/storage pins that see no Context\. Pick the threading point \(a
+    `Pool\.PinCounted\(tag, \*BufferUsage\)` behind a ctx helper, plus a per\-scan handle for nbtree\), then carry
+    Buf\* in `workerNodeStat`\. Hot path: run the TPC\-B smoke gate before and after\.
+  - Expected instrument: Movement none \(EXPLAIN text\); pin a test where two concurrent sessions' Buffers lines stay
+    separate\.
+- [ ] **M0122\-0024 — EXPLAIN ANALYZE of UPDATE / DELETE: child scan actuals and the MULTIEXPR SubPlan**\.
+  Kind: impl
+  Parent: M0122\-0021
+  - goopg prints the ModifyTable line's actuals only\. Its child scan has no `\(actual …\)` and no Rows Removed by
+    Filter, and `SET \(a, b\) = \(SELECT …\)`'s SubPlan is not rendered\. PG instruments the child like any node and
+    lists the SubPlan under the scan\.
+  - The DML operators do not run an operator tree\. `extractScan` → `scanMatching` / `updateViaIndex` is a
+    hand\-written heap scanner \(internal/executor/operators\_storage\.go\)\.
+  - First step: count matched/rejected tuples on the child plan node's stats \(loops=1\) in scanMatching and
+    updateViaIndex, then render the MULTIEXPR sublink in emitSubPlanSubtrees\. Verify against a scratch PG, never a
+    reference cluster\.
+- [ ] **M0122\-0025 — bounded \(top\-N\) sort: a Limit's bound reaches the Sort, as PG's ExecSetTupleBound**\.
+  Kind: impl
+  Parent: M0122\-0021
+  - PG passes the bound down \(execProcnode\.c ExecSetTupleBound, through Gather Merge into each worker\) and keeps
+    only the top N \(tuplesort\.c make\_bounded\_heap\)\. It prints `Sort Method: top\-N heapsort  Memory: 25kB`\.
+    goopg sorts every input row \(quicksort ~1900kB on the probe\)\.
+  - First step: port ExecSetTupleBound for Limit → Sort / Gather Merge / Append / Result, and the bounded heap with
+    its method label\. Execution and performance change: run the full gate set \+ fire\-set\.
+- [ ] **M0122\-0026 — port PG's TID\-bitmap sizing and lossification \(tidbitmap\.c\)**\.
+  Kind: impl
+  Parent: M0122\-0021
+  - goopg: `tbmCalculateMaxEntries` = work\_mem / \(bitmapWords\+64\); `tbmLossify` weights exact pages x5 and lossifies
+    the fullest page one at a time\. At work\_mem=64kB a 2942\-page bitmap goes fully lossy, where PG keeps 869 exact
+    \+ 2073 lossy \(Rows Removed by Index Recheck 200000 vs 140615\)\.
+  - First step: port tbm\_calculate\_entries and tbm\_lossify / tbm\_mark\_page\_lossy chunk semantics, then re\-compare
+    Heap Blocks and Index Recheck against PG at small work\_mem\.
+- [ ] **M0122\-0027 — EXPLAIN VERBOSE Output lines, and ARRAY\(SELECT …\) width / typed result**\.
+  Kind: impl
+  Parent: M0122\-0021
+  - Output lines: PG prints `Output:` under the node line, qualified \(`bt2\.c`\), narrowed to the emitted columns,
+    and none on a Bitmap Index Scan or for a Result's initplan reference \(`\(InitPlan 1\)\.col1`\)\. goopg prints it
+    after the details, unqualified and unnarrowed\.
+  - ARRAY: an ARRAY target is estimated at element width \(8 vs PG 36, get\_typavgwidth\)\. evalArraySubquery returns a
+    text array string, not a typed array Datum\.
+- [ ] **M0122\-0028 — audit walkExprTree callers: the hand walker stops at InExpr / `= ANY \(…\)` operands**\.
+  Kind: recon
+  Parent: M0122\-0021
+  - NodeSublinks moved to the slot walker in `7ad6a9d6b`\. The other ~109 walkExprTree callers \(e\.g\.
+    planHasOuterRef, which decides IsNonCorrelated\) still skip IN lists and ANY operands\. Correctness risk: a
+    sublink referencing an outer column only inside `x IN \(outer\.c, …\)` may be labelled uncorrelated and cached\.
+  - First step: write a probe for that shape and compare its result with PG; list the callers whose verdict changes
+    with walkExprRefs\.
+- [ ] **M0122\-0029 — OR\-clause bitmap paths \(BitmapOr\) and PG 18's `Disabled: true` line**\.
+  Kind: recon
+  Parent: M0122\-0021
+  - `WHERE a < 100 OR b < 50` with indexes on a and b: PG plans BitmapOr of two Bitmap Index Scans
+    \(indxpath\.c generate\_bitmap\_or\_paths\)\. goopg plans a Seq Scan and keeps it even with enable\_seqscan off\.
+    PG 18 also prints `Disabled: true` on a disabled node\. No census record shows it today\.
+  - First step: instrument addPath on the base rel for that query and check whether a BitmapOr path is generated\.
+- [ ] **M0122\-0030 — pre\-existing ea\-ratchet drift: 8 NEW findings \(TPC\-DS Q64 x7, Q99\)**\.
+  Kind: recon
+  Parent: none
+  - `make ea\-ratchet` fails identically with the binaries of ee57789ff, fdde69739 and 997db829b, so the drift
+    predates the M0122\-0021 session\. Likely the 2026\-10\-19/20 TPC\-DS corpus reload \(PG statistics imported\)\.
+  - First step: bisect with `EA\_SKIP\_BUILD=1 EA\_BIN=<bin> EA\_OUT=tmp/… make ea\-ratchet` back to the 2026\-09\-22
+    baseline\. If the reload caused it, re\-pinning the baseline is an owner decision\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
