@@ -409,3 +409,28 @@ goopg reported no wait event while a recovery shell command ran, so a checkpoint
 
 **Pin:** `TestRecoveryCommandsReportWaitEvents`. Each command shows its IPC event while it runs and nothing afterwards.
 The test fails when reporting is turned off.
+
+## Update 2026-10-30 — the checkpoint must precede the target's fork point (M0122-0013, `c9720ce9b`; P0-E22)
+
+`InitWalRecovery` checks the start point against the target timeline's history twice:
+- `tliSwitchPoint` fails when the checkpoint's timeline is not in that history at all ("requested timeline N is not in
+  this server's history").
+- `tliOfPointInHistory(CheckPointLoc, expectedTLEs)` must equal `CheckPointTLI`, i.e. the checkpoint must precede the
+  point where the target forked off. Otherwise recovery fails with FATAL "requested timeline N is not a child of this
+  server's history" and an errdetail naming both positions.
+
+goopg did only the first check, with the second's message (P0-E22, S2). A checkpoint past the fork point was accepted,
+and the target timeline's WAL was replayed over data that already carried the abandoned timeline's changes.
+
+**The fix.**
+- `RunArchiveRecoveryWith` reads pg\_control's `CheckPoint` and applies both checks.
+- `RestoreFatalError` carries an errdetail, which `goopg start` prints as `DETAIL:`.
+- An empty `recovery_target_timeline` is read raw, so it is `strtoul("")` = timeline 0 ("recovery target timeline 0
+  does not exist"), not the default 'latest'.
+
+**Pins:** `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork` and `TestRecoveryTargetTimelineReadsRawValue`. Each
+fails when its fix is removed.
+
+**Still open (ledgered):**
+- goopg reads no `backup_label` at recovery, so the start point and the errdetail always come from pg\_control.
+- A standby follows only the newest timeline.

@@ -1035,6 +1035,19 @@ heuristic stays live.)
   - Fix: XLogFileReadAnyTLI's archive\-first order, RECOVERYXLOG \+ wrong\-size check \+ KeepFileRestoredFromArchive,
     recovery\.signal treated as archive recovery in Open \(no WAL written before it ends\)\.
   - Pins: `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment`, `TestRestoreArchivedFileThroughRecoveryXLog`\.
+- [x] **P0\-E22 — archive recovery accepted a checkpoint past the target timeline's fork point**
+  \(found and fixed 2026\-10\-30 by the loop inside M0122\-0013; S2 — data corruption\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(test: checkpoint 0/6000 on TLI 1, target TLI 2 forked at
+  0/5000 — before: accepted; fixed: FATAL "requested timeline 2 is not a child of this server's history" \+ DETAIL\)
+  - > **ESCALATION 2026\-10\-30 \(S2, data corruption\) — RECORDED FOR THE OWNER; already fixed in\-task \(`c9720ce9b`\)\.**
+    > Found while porting the "not a child" errdetail residual: goopg checked only that the start timeline appears in
+    > the target's history, not that the checkpoint precedes the fork\.
+  - Symptom: the target timeline's WAL replayed over data that already held the abandoned timeline's changes past the
+    fork point\.
+  - Fix: InitWalRecovery's tliSwitchPoint and tliOfPointInHistory checks \(xlogrecovery\.c\)\.
+  - Pin: `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork` \(fails with the fork check removed\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4231,6 +4244,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Checkpoint must precede the target's fork point \+ empty recovery\_target\_timeline LANDED 2026\-10\-30
+    \(`c9720ce9b`\)** — fixes P0\-E22 \(S2, recorded above\)\. Movement: none — recovery start validation\.
+    - Both InitWalRecovery checks \("not in this server's history" / "not a child" \+ errdetail\); DETAIL printed by
+      goopg start; `recoveryTargetTimeline` reads the raw GUC value\.
+    - Pins: `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork`, `TestRecoveryTargetTimelineReadsRawValue`
+      \(mutation\-checked\)\. Gates: units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): no backup\_label consumption at recovery; standby follows only the newest timeline\.
   - **Recovery shell commands report wait events LANDED 2026\-10\-30 \(`be383bdfe`\)**\.
     Movement: none — pg\_stat\_activity reporting\. PG wraps restore\_command / recovery\_end\_command /
     archive\_cleanup\_command in pgstat\_report\_wait\_start; goopg reported nothing\.
