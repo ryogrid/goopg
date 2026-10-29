@@ -94,7 +94,7 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 - `recovery_target_time` / `recovery_target_xid` / `recovery_target_name` (PITR targets)
 - ~~`archive_cleanup_command`~~ — landed 2026-10-29 (M0122-0013; design 0005-0001)
 - `recovery_target_timeline` beyond "latest"
-- TLI-aware segment fetch (`FormatSegmentNameTLI` currently hardcodes TLI=1 in the fetch loop)
+- ~~TLI-aware segment fetch (`FormatSegmentNameTLI` hardcoded TLI=1 in the fetch loop)~~ — landed 2026-10-29 (`173eca961`, below)
 
 ## Updates (M0122-0013, 2026-10-29)
 
@@ -135,3 +135,40 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
   - goopg has no WAL archiver (`archive_mode` / `archive_command`, `.ready` / `.done`). So PG's
     `RemoveNonParentXlogFiles` exception for `.ready` segments and the old timeline's `.partial` rename, which needs
     `XLogArchivingActive()`, have nothing to act on.
+
+## Update 2026-10-29 — timeline-following archive recovery (M0122-0013, `173eca961`; P0-E18)
+
+**Defect (S2, data loss).** The fetch loop named segments on TLI 1 only. Restoring a base backup of a server that had
+been promoted, recovery stopped at the timeline switch and promoted from there, silently dropping every record written
+on the later timeline. A mutation run of the new test shows exactly that: recovery ended on TLI 1 at the switch point.
+
+**PG behaviour** (, the default; xlogrecovery.c):
+-  probes  files upward from the start timeline.
+-  turns the newest one into the expected timelines.
+-  reads each segment from the newest expected timeline that has it and began at or before it, and
+  never goes back to a timeline older than the last segment's.
+
+**Ported:**
+- `RunArchiveRecovery` returns `ArchiveRecoveryResult`: `EndOfLog`, `LastStart`, `EndTLI`, `NewestTLI` and
+  `Timelines`.
+  - The start TLI comes from pg\_control.
+  - History files are probed locally or via `restore_command`, and restored into pg\_wal.
+  - The start timeline must appear on the newest timeline's history. Otherwise recovery fails with PG's "not a child of
+    this server's history" error.
+  - The loop starts at the highest local segment, not after it, so a newer timeline's copy of the switch segment is
+    read.
+- `adoptRestoredWAL` crosses each timeline switch in the restored range the way a following standby does: it appends
+  up to the timeline's begin, runs `SwitchTimeline` there, and goes on. It reads the restored bytes of the switch
+  segment before the switch zero-fills them. It also appends one segment at a time, which removes the previous
+  whole-range buffer.
+- `promoteAfterRecovery` takes the parent timeline as `EndTLI` and the new timeline as `NewestTLI + 1`, which can't
+  collide with any timeline in the archive (). The history becomes 1 → 2 → 3.
+
+**Pins:** `TestRunArchiveRecoveryFollowsTimelineHistory` and `TestPromoteAfterRecoveryFollowsTimelines`. The second
+takes a base backup on TLI 1, promotes the primary to TLI 2, then checks that recovery plus promotion end on TLI 3 with
+the history chain and survive a restart. Both fail when the history is ignored.
+
+**Still open (ledgered):**
+- Only 'latest' is supported; an explicit `recovery_target_timeline` or 'current' is not.
+- Local WAL that extends past a timeline switch is refused, where PG would read the newer timeline from that point.
+- Restored parent history files stay in pg\_wal; PG reads them to a temporary name.

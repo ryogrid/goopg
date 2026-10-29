@@ -963,6 +963,21 @@ heuristic stays live.)
     the streaming promotion\): new timeline at EndOfLog, XLOG\_END\_OF\_RECOVERY first \(PG StartupXLOG\)\.
   - Pin: `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(fails with the adoption removed\)\.
 
+- [x] **P0\-E18 — archive recovery stopped at a timeline switch and dropped the later timeline's WAL**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013, whose ledgered residual it was; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(mutation run: recovery ended on TLI 1 exactly at the switch;
+  fixed: ends on TLI 2 past it, promotes to TLI 3\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`173eca961`\)\.**
+    > It was M0122\-0013's ledgered residual \("archive fetch hardcodes TLI 1"\) and its fix was the slice in progress\.
+  - Symptom: restoring a base backup of a server that had been promoted, `RunArchiveRecovery` fetched timeline\-1
+    names only, stopped at the switch and promoted — every transaction committed on the later timeline was lost\.
+  - Fix: PG's recovery\_target\_timeline = 'latest' — findNewestTimeLine, readTimeLineHistory, XLogFileReadAnyTLI
+    \(xlogrecovery\.c\); the writer crosses each switch; new TLI = newest \+ 1\.
+  - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory`, `TestPromoteAfterRecoveryFollowsTimelines` \(both fail with
+    the history ignored\)\.
+
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
 
@@ -4158,6 +4173,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Archive recovery follows the timeline history LANDED 2026\-10\-29 \(`173eca961`\)** — fixes P0\-E18 \(S2, recorded
+    above\)\. Movement: none — correctness fix — no plan instrument\.
+    - `RunArchiveRecovery` → `ArchiveRecoveryResult`: newest TLI from history files \(local or restore\_command\),
+      expected timelines, per\-segment newest\-TLI choice from the highest local segment; "not a child" check\.
+    - `adoptRestoredWAL` crosses each switch \(SwitchTimeline at the timeline's begin\) and appends per segment \(no
+      whole\-range buffer\); promotion parent = EndTLI, new TLI = NewestTLI \+ 1\.
+    - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory`, `TestPromoteAfterRecoveryFollowsTimelines`
+      \(mutation\-checked\)\.
+    - Gates: units, `\-race` xlog \+ promotion, cmd/goopg, replication/promotion/checkpoint E2Es, tpch\-spotcheck,
+      sf025 99/99\.
+    - Residual \(ledgered\): only 'latest' \(no explicit recovery\_target\_timeline / 'current'\); local WAL past a
+      timeline switch is refused, PG would read the newer timeline there; restored parent history files are kept in
+      pg\_wal \(PG reads them to a temp name\)\.
   - **Checkpoints serialised; immediate requests end spread pacing; RequestCheckpoint LANDED 2026\-10\-29 \(`250baa3d4`\)**\.
     Movement: none — checkpointer path\. PG's single checkpointer: no overlap, RequestCheckpoint wakes it,
     ImmediateCheckpointRequested stops a spread checkpoint's throttling\.
