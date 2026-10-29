@@ -4244,6 +4244,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **SIGQUIT is the immediate shutdown LANDED 2026\-10\-30 \(`108e7a630`\)**\. Movement: none — signal handling\.
+    pmdie SIGQUIT; goopg hit Go's default \(goroutine dump, exit 2, postmaster\.pid left\)\.
+    - `immediateShutdown` \(cmd/goopg, whole of goopg start\), `Server\.StopImmediate` \(shared with STOPIMMEDIATE\);
+      `goopg stop \-mode immediate` signals a starting server\.
+    - Pin: `TestE2E_GoopgSigquitIsImmediateShutdown` \(mutation\-checked\); probes: busy session stopped in 0\.1 s,
+      crash recovery on restart; archive recovery left in place\. Gates: units, postmaster, recovery/replication/crash
+      E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): quickdie client message; the immediate path still waits for sessions; crash replay not
+      interruptible\.
   - **Hot standby waits for a consistent recovery state LANDED 2026\-10\-30 \(`8527ab50e`\)**\. Movement: none — connection
     admission\. canAcceptConnections CAC\_NOTHOTSTANDBY in PM\_RECOVERY: FATAL 57P03 "not yet accepting connections" /
     "Consistent recovery state has not been yet reached\."; goopg accepted reads at once\.
