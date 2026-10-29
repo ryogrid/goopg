@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/goopg/goopg/internal/utils/activity"
 )
 
 // ErrRecoveryShutdown reports that archive recovery stopped for a shutdown
@@ -125,7 +127,9 @@ func restoreArchivedFile(ctx context.Context, restoreCommand, walDir, xlogfname,
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGTERM) }
 	c.WaitDelay = 5 * time.Second
+	endWait := reportCommandWait(activity.WaitRestoreCommand)
 	runErr := c.Run()
+	endWait()
 	if ctx.Err() != nil {
 		return ErrRecoveryShutdown
 	}
@@ -273,10 +277,32 @@ func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, res
 	c := exec.Command("sh", "-c", cmd)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
+	event := activity.WaitArchiveCleanupCommand
+	if commandName == "recovery_end_command" {
+		event = activity.WaitRecoveryEndCommand
+	}
+	endWait := reportCommandWait(event)
+	err = c.Run()
+	endWait()
+	if err != nil {
 		return waitResultIsAnySignal(err), fmt.Errorf("%s \"%s\": %w", commandName, command, err)
 	}
 	return false, nil
+}
+
+// reportCommandWait is pgstat_report_wait_start(WAIT_EVENT_...) for a
+// recovery shell command run by a process registered in pg_stat_activity
+// (the checkpointer for archive_cleanup_command, a standby's startup work
+// for recovery_end_command); the returned function is
+// pgstat_report_wait_end. Unregistered callers — start-time archive recovery
+// runs before the server registers anything — report nothing.
+func reportCommandWait(event string) func() {
+	reg, procNum, ok := activity.LookupCurrentGoroutine()
+	if !ok || reg == nil {
+		return func() {}
+	}
+	reg.WaitEventStart(procNum, activity.WaitTypeIPC, event)
+	return func() { reg.WaitEventEnd(procNum) }
 }
 
 // waitResultIsAnySignal is wait_result_is_any_signal(rc, true)

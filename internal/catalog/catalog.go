@@ -11065,9 +11065,12 @@ func (c *InMemory) registerSystemTables() {
 			{"BufferPin", "BufferPin", "Waiting to acquire an exclusive pin on a buffer."},
 			{"Extension", "Extension", "Waiting in an extension."},
 			{"IPC", "AppendReady", "Waiting for subplan nodes of an Append plan node to be ready."},
+			{"IPC", "ArchiveCleanupCommand", "Waiting for archive_cleanup_command to complete."},
 			{"IPC", "BackendTermination", "Waiting for the termination of another backend."},
 			{"IPC", "BgWorkerShutdown", "Waiting for background worker to shut down."},
 			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
+			{"IPC", "RecoveryEndCommand", "Waiting for recovery_end_command to complete."},
+			{"IPC", "RestoreCommand", "Waiting for restore_command to complete."},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_wait_events"] = pgWaitEvents

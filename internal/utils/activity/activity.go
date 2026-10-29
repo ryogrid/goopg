@@ -103,6 +103,14 @@ const (
 	// transaction waiting for a snapshot no concurrent serializable writer
 	// can make unsafe.
 	WaitSafeSnapshot = "SafeSnapshot"
+
+	// Recovery shell commands (wait_event_names.txt, WaitEventIPC): the
+	// process running restore_command (RestoreArchivedFile),
+	// recovery_end_command or archive_cleanup_command (ExecuteRecoveryCommand)
+	// waits on the child until it exits.
+	WaitRestoreCommand        = "RestoreCommand"
+	WaitRecoveryEndCommand    = "RecoveryEndCommand"
+	WaitArchiveCleanupCommand = "ArchiveCleanupCommand"
 )
 
 // Activity-type events  (PG_WAIT_ACTIVITY).
