@@ -489,7 +489,7 @@ func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
 
 	rt, dir := open(t)
 	out := filepath.Join(t.TempDir(), "r.txt")
-	if err := promoteAfterRecovery(rt, 0, "echo %r > '"+out+"'", logger); err != nil {
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{RecoveryEndCommand: "echo %r > '" + out + "'"}, logger); err != nil {
 		t.Fatalf("promoteAfterRecovery: %v", err)
 	}
 	if got, err := os.ReadFile(out); err != nil || len(strings.TrimSpace(string(got))) != 24 {
@@ -500,7 +500,7 @@ func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
 	}
 
 	rt, dir = open(t)
-	err := promoteAfterRecovery(rt, 0, "kill -9 $$", logger)
+	err := promoteAfterRecovery(rt, archiveRecoveryEnd{RecoveryEndCommand: "kill -9 $$"}, logger)
 	if err == nil || !strings.Contains(err.Error(), "recovery_end_command") {
 		t.Fatalf("signal-killed recovery_end_command: err = %v, want a recovery_end_command error", err)
 	}
@@ -543,54 +543,160 @@ func TestValidateRecoveryParameters(t *testing.T) {
 	}
 }
 
-// TestPromoteAfterRecoveryHistorySwitchPoint pins the timeline switch point
-// archive-recovery promotion writes into the new timeline's history file:
-// PG's EndOfLog, the end of the last replayed record (xlog.c StartupXLOG →
-// writeTimeLineHistory). Segments the archive supplied lie past the running
-// writer's end, so RunArchiveRecovery's endOfLog wins when it is later;
-// with nothing restored (0) the writer's own end stays the switch point.
-// goopg used to record the writer's pre-archive end in both cases.
+// TestPromoteAfterRecoveryHistorySwitchPoint pins the switch point with
+// nothing restored from the archive: the writer's own end (with its xl_prev)
+// stays the boundary. The restored case is TestPromoteAfterRecoveryAdopts
+// RestoredWAL, which needs real archived segments.
 func TestPromoteAfterRecoveryHistorySwitchPoint(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, tc := range []struct {
-		name  string
-		extra uint64 // endOfLog past the writer's end; 0 = nothing restored
-	}{
-		{"records restored from the archive", 3 << 20},
-		{"nothing restored", 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
-				t.Fatalf("initdb.Init: %v", err)
-			}
-			rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
-			if err != nil {
+	dir := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatalf("initdb.Init: %v", err)
+	}
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	oldTLI, err := initdb.LoadOrCreateTimelineID(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := rt.WAL.WrittenLSN()
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{}, logger); err != nil {
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	entries, err := xlog.ReadHistory(walDirFor(rt), oldTLI+1)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("ReadHistory: %v (entries %v)", err, entries)
+	}
+	if last := entries[len(entries)-1]; last.TLI != oldTLI || last.SwitchLSN != written {
+		t.Errorf("history entry = TLI %d switch %X, want TLI %d switch %X", last.TLI, last.SwitchLSN, oldTLI, written)
+	}
+	if got := rt.WAL.TimelineID(); got != oldTLI+1 {
+		t.Errorf("writer timeline = %d after promotion, want %d", got, oldTLI+1)
+	}
+}
+
+// TestPromoteAfterRecoveryAdoptsRestoredWAL pins archive-recovery promotion
+// over segments restore_command supplied past the local end of WAL. PG's new
+// timeline begins at EndOfLog, the end of the last replayed record, and its
+// first record is XLOG_END_OF_RECOVERY (StartupXLOG). goopg's running writer
+// never wrote the restored segments, so it used to resume at its own,
+// earlier end on the old timeline and overwrite WAL whose changes replay had
+// already applied. Now: the restored bytes are untouched, the history file
+// names EndOfLog, the writer is on the new timeline, and new WAL starts at
+// EndOfLog or later.
+func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	archive := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	start := rt.WAL.WrittenLSN()
+	payload := make([]byte, 4000)
+	for rt.WAL.WrittenLSN() < start+3*segSize {
+		if _, _, err := rt.WAL.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	rt.Close()
+
+	// Move every segment past the next one into the archive: the restarted
+	// server's local WAL ends there, and archive recovery restores the rest.
+	walDir := filepath.Join(dir, "pg_wal")
+	keepSeg := start/segSize + 1
+	ents, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if _, seg, ok := xlog.ParseXLogFileName(e.Name(), 0); ok && seg > keepSeg {
+			if err := os.Rename(filepath.Join(walDir, e.Name()), filepath.Join(archive, e.Name())); err != nil {
 				t.Fatal(err)
 			}
-			defer rt.Close()
-			oldTLI, err := initdb.LoadOrCreateTimelineID(dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			written := rt.WAL.WrittenLSN()
-			var endOfLog uint64
-			want := written
-			if tc.extra > 0 {
-				endOfLog = written + tc.extra
-				want = endOfLog
-			}
-			if err := promoteAfterRecovery(rt, endOfLog, "", logger); err != nil {
-				t.Fatalf("promoteAfterRecovery: %v", err)
-			}
-			entries, err := xlog.ReadHistory(walDirFor(rt), oldTLI+1)
-			if err != nil || len(entries) == 0 {
-				t.Fatalf("ReadHistory: %v (entries %v)", err, entries)
-			}
-			last := entries[len(entries)-1]
-			if last.TLI != oldTLI || last.SwitchLSN != want {
-				t.Errorf("history entry = TLI %d switch %X, want TLI %d switch %X", last.TLI, last.SwitchLSN, oldTLI, want)
-			}
-		})
+		}
+	}
+
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			rt.Close()
+		}
+	}()
+	oldTLI := rt.WAL.TimelineID()
+	localEnd := rt.WAL.WrittenLSN()
+	endOfLog, lastStart, err := xlog.RunArchiveRecovery(rt.StorageMgr, dir, "cp "+filepath.Join(archive, "%f")+" %p", int64(segSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endOfLog <= localEnd {
+		t.Fatalf("precondition: archive recovery replayed nothing past the local end (%X <= %X)", endOfLog, localEnd)
+	}
+	restoredSeg := localEnd / segSize
+	restoredName := filepath.Join(walDir, xlog.FormatSegmentNameTLI(restoredSeg, oldTLI))
+	before, err := os.ReadFile(restoredName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{EndOfLog: endOfLog, LastStart: lastStart}, logger); err != nil {
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	after, err := os.ReadFile(restoredName)
+	if err != nil {
+		t.Fatalf("restored segment %s gone after promotion: %v", restoredName, err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("restored old-timeline segment %s was rewritten by promotion", filepath.Base(restoredName))
+	}
+	if got := rt.WAL.TimelineID(); got != oldTLI+1 {
+		t.Errorf("writer timeline = %d after promotion, want %d", got, oldTLI+1)
+	}
+	entries, err := xlog.ReadHistory(walDir, oldTLI+1)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("ReadHistory: %v (entries %v)", err, entries)
+	}
+	if last := entries[len(entries)-1]; last.SwitchLSN != endOfLog {
+		t.Errorf("history switch point = %X, want EndOfLog %X", last.SwitchLSN, endOfLog)
+	}
+	at, _, err := rt.WAL.Append(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at < endOfLog {
+		t.Errorf("post-promotion WAL starts at %X, inside the WAL replayed from the archive (EndOfLog %X)", at, endOfLog)
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	postEnd := rt.WAL.WrittenLSN()
+	rt.Close()
+	closed = true
+
+	// A restart reopens on the new timeline with the post-promotion WAL.
+	rt2, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("reopen after promotion: %v", err)
+	}
+	defer rt2.Close()
+	if got := rt2.WAL.TimelineID(); got != oldTLI+1 {
+		t.Errorf("reopened writer timeline = %d, want %d", got, oldTLI+1)
+	}
+	if got := rt2.WAL.WrittenLSN(); got < postEnd {
+		t.Errorf("reopened WAL ends at %X, before the post-promotion WAL's end %X", got, postEnd)
 	}
 }

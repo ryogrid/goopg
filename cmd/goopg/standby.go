@@ -398,34 +398,8 @@ func (sc *standbyController) finalizePromotion() error {
 		}); err != nil {
 			return fmt.Errorf("promote: update pg_control TLI: %w", err)
 		}
-		// Move the running writer onto the new timeline at once, and
-		// make XLOG_END_OF_RECOVERY its first record, as StartupXLOG does
-		// at the end of archive recovery (XLogInitNewTimeline,
-		// CreateEndOfRecoveryRecord). The writer used to stay on the old
-		// timeline until restart, so post-promotion WAL carried the old
-		// TLI and the first checkpoint stamped it back into pg_control.
-		if sc.rt.WAL != nil && endLSN > 0 {
-			if err := sc.rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
-				return fmt.Errorf("promote: switch WAL timeline: %w", err)
-			}
-			rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, sc.walLevel)
-			if err != nil {
-				return fmt.Errorf("promote: encode end-of-recovery record: %w", err)
-			}
-			_, recEnd, err := sc.rt.WAL.Append(rec)
-			if err != nil {
-				return fmt.Errorf("promote: write end-of-recovery record: %w", err)
-			}
-			if err := sc.rt.WAL.FlushUpTo(recEnd); err != nil {
-				return fmt.Errorf("promote: flush end-of-recovery record: %w", err)
-			}
-			// So crash recovery follows the timeline change to here.
-			if err := control.UpdateControlFile(sc.rt.DataDir, func(cd *control.ControlFileData) {
-				cd.MinRecoveryPoint = recEnd
-				cd.MinRecoveryPointTLI = newTLI
-			}); err != nil {
-				return fmt.Errorf("promote: update pg_control min recovery point: %w", err)
-			}
+		if err := switchWriterToNewTimeline(sc.rt, oldTLI, newTLI, endLSN, prevRecPtr, sc.walLevel); err != nil {
+			return fmt.Errorf("promote: %w", err)
 		}
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
@@ -552,6 +526,99 @@ func walDirFor(rt *initdb.Runtime) string {
 	return filepath.Join(rt.DataDir, "pg_wal")
 }
 
+// switchWriterToNewTimeline moves the running WAL writer onto newTLI at
+// endLSN — the end of the last replayed record — and makes
+// XLOG_END_OF_RECOVERY its first record, as StartupXLOG does at the end of
+// archive recovery (XLogInitNewTimeline, CreateEndOfRecoveryRecord), then
+// points pg_control's minRecoveryPoint past it so crash recovery follows the
+// timeline change. The writer used to stay on the old timeline until
+// restart, so post-promotion WAL carried the old TLI. Shared by the
+// streaming promotion and the recovery.signal promotion.
+func switchWriterToNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN, prevRecPtr uint64, walLevel int32) error {
+	if rt.WAL == nil || endLSN == 0 {
+		return nil
+	}
+	if err := rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
+		return fmt.Errorf("switch WAL timeline: %w", err)
+	}
+	rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, walLevel)
+	if err != nil {
+		return fmt.Errorf("encode end-of-recovery record: %w", err)
+	}
+	_, recEnd, err := rt.WAL.Append(rec)
+	if err != nil {
+		return fmt.Errorf("write end-of-recovery record: %w", err)
+	}
+	if err := rt.WAL.FlushUpTo(recEnd); err != nil {
+		return fmt.Errorf("flush end-of-recovery record: %w", err)
+	}
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.MinRecoveryPoint = recEnd
+		cd.MinRecoveryPointTLI = newTLI
+	}); err != nil {
+		return fmt.Errorf("update pg_control min recovery point: %w", err)
+	}
+	return nil
+}
+
+// adoptRestoredWAL brings the running WAL writer to endOfLog after archive
+// recovery. The segments restore_command supplied lie past the writer's
+// end — it never wrote them — so without this the writer resumed at its own
+// end and the first post-promotion record overwrote WAL whose changes
+// replay had already applied (a crash then left pages ahead of the WAL that
+// describes them). PG's startup process reads that WAL through its own
+// reader and the new timeline begins at EndOfLog (StartupXLOG). Feeding the
+// restored bytes through AppendRaw — the walreceiver's path, which writes
+// the identical bytes back into the same segment files — gives the writer
+// the position a streaming standby would have, so the shared timeline
+// switch applies unchanged.
+func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64) error {
+	if rt.WAL == nil {
+		return nil
+	}
+	from := rt.WAL.WrittenLSN()
+	if endOfLog <= from {
+		return nil
+	}
+	walDir := walDirFor(rt)
+	segSize := uint64(rt.WAL.SegmentSize())
+	tli := rt.WAL.TimelineID()
+	stream := make([]byte, 0, endOfLog-from)
+	for pos := from; pos < endOfLog; {
+		segNo, off := pos/segSize, pos%segSize
+		n := min(segSize-off, endOfLog-pos)
+		name := filepath.Join(walDir, xlog.FormatSegmentNameTLI(segNo, tli))
+		f, err := os.Open(name)
+		if err != nil {
+			return fmt.Errorf("adopt restored WAL: %w", err)
+		}
+		buf := make([]byte, n)
+		_, err = f.ReadAt(buf, int64(off))
+		_ = f.Close()
+		if err != nil {
+			return fmt.Errorf("adopt restored WAL: read %s: %w", name, err)
+		}
+		stream = append(stream, buf...)
+		pos += n
+	}
+	if _, _, err := rt.WAL.AppendRaw(stream); err != nil {
+		return fmt.Errorf("adopt restored WAL: append: %w", err)
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		return fmt.Errorf("adopt restored WAL: flush: %w", err)
+	}
+	return nil
+}
+
+// archiveRecoveryEnd is what the recovery.signal promotion needs from the
+// archive recovery that preceded it.
+type archiveRecoveryEnd struct {
+	EndOfLog           uint64 // end of the last record replayed past the local end (RunArchiveRecovery); 0 = none
+	LastStart          uint64 // that record's start
+	RecoveryEndCommand string
+	WalLevel           int32
+}
+
 // promoteAfterRecovery runs the post-recovery promotion sequence for
 // archive recovery (M0130-S9). Mirrors finalizePromotion but does not
 // require a standby controller — the archive recovery loop already
@@ -561,9 +628,11 @@ func walDirFor(rt *initdb.Runtime) string {
 //  2. Append a history entry for oldTLI + endLSN.
 //  3. Write the timeline history file for newTLI.
 //  4. Persist newTLI to the flat file and pg_control.
-//  5. Run recovery_end_command.
-//  6. Remove recovery.signal.
-func promoteAfterRecovery(rt *initdb.Runtime, endOfLog uint64, recoveryEndCommand string, logger *slog.Logger) error {
+//  5. Bring the writer to EndOfLog (adoptRestoredWAL), switch it to newTLI
+//     and write XLOG_END_OF_RECOVERY (switchWriterToNewTimeline).
+//  6. Run recovery_end_command.
+//  7. Remove recovery.signal.
+func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *slog.Logger) error {
 	if rt.DataDir == "" {
 		return nil
 	}
@@ -579,12 +648,16 @@ func promoteAfterRecovery(rt *initdb.Runtime, endOfLog uint64, recoveryEndComman
 	// archive supplied lie past the writer's own end, so their last record
 	// (endOfLog, from RunArchiveRecovery) is the switch point when there is
 	// one; otherwise the local WAL the writer holds ends the log.
-	var endLSN uint64
+	var endLSN, prevRecPtr uint64
 	if rt.WAL != nil {
 		endLSN = rt.WAL.WrittenLSN()
+		_, prevRecPtr = rt.WAL.InsertPosition()
 	}
-	if endOfLog > endLSN {
-		endLSN = endOfLog
+	if end.EndOfLog > endLSN {
+		if err := adoptRestoredWAL(rt, end.EndOfLog); err != nil {
+			return fmt.Errorf("promote after recovery: %w", err)
+		}
+		endLSN, prevRecPtr = end.EndOfLog, end.LastStart-1
 	}
 
 	prev, err := xlog.ReadHistory(walDir, oldTLI)
@@ -608,11 +681,14 @@ func promoteAfterRecovery(rt *initdb.Runtime, endOfLog uint64, recoveryEndComman
 	}); err != nil {
 		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
 	}
+	if err := switchWriterToNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, end.WalLevel); err != nil {
+		return fmt.Errorf("promote after recovery: %w", err)
+	}
 
 	// CleanupAfterArchiveRecovery runs recovery_end_command once archive
 	// recovery has ended (xlog.c). A signal-killed command is FATAL: the
 	// recovery.signal stays, so the next start retries recovery.
-	if err := runRecoveryEndCommand(rt, recoveryEndCommand, logger); err != nil {
+	if err := runRecoveryEndCommand(rt, end.RecoveryEndCommand, logger); err != nil {
 		return fmt.Errorf("promote after recovery: %w", err)
 	}
 

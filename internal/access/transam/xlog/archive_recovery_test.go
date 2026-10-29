@@ -89,7 +89,7 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	endOfLog, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
+	endOfLog, lastStart, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
 	if err != nil {
 		t.Fatalf("RunArchiveRecovery: %v", err)
 	}
@@ -97,6 +97,9 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 	// last record replayed from the restored segment.
 	if endOfLog != recEnd {
 		t.Errorf("endOfLog = %X, want the archived record's end %X", endOfLog, recEnd)
+	}
+	if lastStart == 0 || lastStart >= endOfLog {
+		t.Errorf("lastStart = %X, want the archived record's start (< %X)", lastStart, endOfLog)
 	}
 	// Segment 0 came from the archive; segment 1 is absent there, which is
 	// how the loop learns the archive is exhausted.
