@@ -4688,6 +4688,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **pg\_logical\_emit\_message producer and decoding LANDED 2026\-10\-30 \(`a45162dc3`\)**\. Movement: none — logical
+    decoding messages \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH\)\. Design:
+    `docs/design/0100-0149/0122-0014-logical-message-producer.md` \(draft → landed\)\.
+    - LogLogicalMessage → an RM\_LOGICALMSG record \(pg\_waldump decodes it as PG does\)\. logicalmsg\_decode /
+      ReorderBufferQueueMessage: transactional queued in the xact, non\-transactional immediate, database filter\.
+      pgoutput `messages` option\.
+    - Found and fixed: IDENTIFY\_SYSTEM's dbname was always NULL, so pg\_recvlogical could not connect\. It is now
+      named for replication=database connections\.
+    - Pins: `TestLogicalMessageDecoding` \(mutation\-checked\), `TestLogicalMessageCodec`, `TestPgOutputMessagesOption`\.
+      Oracle `TestE2E\_LogicalMessageReachesPgRecvlogical` \(PG 18\.3 pg\_recvlogical\; fails without the dbname fix\)\.
+    - Gates: units, postmaster, testport replication \+ pgoutput\-interop \+ pg\_basebackup/receivewal \(44\),
+      tpch\-spotcheck, tpch\-acceptance\-arm 24 MATCH, sf025 99/99\.
+    - Residuals ledgered\.
   - **MESSAGE wire half LANDED 2026\-09\-22 \(loop \#13\)** as `8170a6f29`.
     Movement: none — replication wire format.
     Design: `docs/design/0100-0149/0122-0014-pgoutput-message-wire.md`.
