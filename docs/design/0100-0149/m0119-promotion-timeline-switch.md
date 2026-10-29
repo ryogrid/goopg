@@ -171,3 +171,27 @@ Still different (ledgered):
 - The recovery.signal path marks the timeline change with `XLOG_END_OF_RECOVERY`, where PG writes an end-of-recovery
   shutdown checkpoint. Both are valid timeline-changing records.
 - The promoted checkpoint is waited for.
+
+## Update 2026-10-29 — end-of-recovery checkpoint on the recovery.signal path (M0122-0013, `a75b43cf0`)
+
+`PerformRecoveryXLogAction` (xlog.c) ends recovery in one of two ways:
+- **Promotion triggered:** the lightweight `XLOG_END_OF_RECOVERY` record.
+- **Archive recovery without a promote trigger:** `CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT`. `CreateCheckPoint`
+  treats it as "really a shutdown checkpoint, just issued at a different time": an `XLOG_CHECKPOINT_SHUTDOWN` on the
+  new timeline whose `PrevTimeLineID` is the timeline recovery forked off from.
+
+goopg's recovery.signal path wrote `XLOG_END_OF_RECOVERY`, followed by an ordinary checkpoint. Now:
+- `checkpointOpts.endOfRecovery` / `prevTLI` select the shutdown record format: no `XLOG_CHECKPOINT_REDO`, no
+  running-xacts, and `PrevTimeLineID = prevTLI`. pg\_control is left in `DB_IN_PRODUCTION`. (PG stamps
+  `DB_SHUTDOWNED` here and `StartupXLOG` moves it to production right after, so the end state is the same.)
+- `Checkpointer.CheckpointEndOfRecovery(prevTLI)` runs it immediately and waits.
+- `endArchiveRecoveryOnNewTimeline` switches the writer and takes that checkpoint as the first record on the new
+  timeline. It falls back to `XLOG_END_OF_RECOVERY` only when there is no checkpointer. A failed checkpoint fails the
+  start, as an ERROR in PG's startup process does.
+- `promotionCheckpoint` is now only the streaming promotion's request.
+
+Pins:
+- `TestCheckpointerEndOfRecoveryCheckpoint`: exactly one record, shutdown type, This/Prev TLI 3/2, in production; an
+  ordinary checkpoint afterwards keeps Prev = This.
+- Both archive-promotion tests assert that the first record on the new timeline is this checkpoint. They fail with
+  `info 0x90` (`XLOG_END_OF_RECOVERY`) if the old path is restored.

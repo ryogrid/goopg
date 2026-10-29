@@ -4173,6 +4173,15 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\.signal end takes an END\_OF\_RECOVERY shutdown checkpoint LANDED 2026\-10\-29 \(`a75b43cf0`\)**\.
+    Movement: none — recovery path\. PG PerformRecoveryXLogAction: without a promote trigger the timeline change is an
+    XLOG\_CHECKPOINT\_SHUTDOWN with PrevTimeLineID = old TLI, not XLOG\_END\_OF\_RECOVERY\.
+    - `checkpointOpts\.endOfRecovery`/`prevTLI` \+ `CheckpointEndOfRecovery`; `endArchiveRecoveryOnNewTimeline` takes it
+      as the first record on the new timeline \(EOR record only without a checkpointer\)\.
+    - Pins: `TestCheckpointerEndOfRecoveryCheckpoint`; both archive\-promotion tests assert the first record
+      \(mutation\-checked\)\.
+    - Gates: units, `\-race` xlog, cmd/goopg, initdb, postmaster, replication/promotion/checkpoint E2Es,
+      tpch\-spotcheck, sf025 99/99\.
   - **Archive recovery follows the timeline history LANDED 2026\-10\-29 \(`173eca961`\)** — fixes P0\-E18 \(S2, recorded
     above\)\. Movement: none — correctness fix — no plan instrument\.
     - `RunArchiveRecovery` → `ArchiveRecoveryResult`: newest TLI from history files \(local or restore\_command\),
