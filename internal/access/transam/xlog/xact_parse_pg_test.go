@@ -158,3 +158,31 @@ func TestParseXactRecordAbortSubxacts(t *testing.T) {
 		t.Fatalf("subxacts = %v, want [401 402]", parsed.Subxacts)
 	}
 }
+
+// TestEncodeXactRecordsAtWriteXactTime pins that the timed encoders put the
+// transaction's stop timestamp in xact_time (the first eight bytes of
+// xl_xact_commit / xl_xact_abort) without disturbing the chunks after it.
+func TestEncodeXactRecordsAtWriteXactTime(t *testing.T) {
+	const at = int64(846_000_000_123_456) // 2026-10-23, µs since 2000-01-01
+	commit, err := EncodeXactCommitPGWithRelsAt(at, 42, []storage.TransactionID{43}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abort, err := EncodeXactAbortPGWithRelsAt(at, 44, []storage.TransactionID{45}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, payload := range map[string][]byte{"commit": commit, "abort": abort} {
+		info, mainData := decodeMainData(t, payload)
+		if got := int64(binary.LittleEndian.Uint64(mainData[:8])); got != at {
+			t.Errorf("%s xact_time = %d, want %d", name, got, at)
+		}
+		parsed, err := ParseXactRecord(info, mainData)
+		if err != nil || len(parsed.Subxacts) != 1 {
+			t.Errorf("%s: parsed %+v, %v; want its one subxact", name, parsed, err)
+		}
+	}
+	if now := TimestampTzNow(); now < at {
+		t.Errorf("TimestampTzNow() = %d, before 2026-10-23", now)
+	}
+}

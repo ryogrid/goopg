@@ -1248,6 +1248,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		defer commitStampMu.RUnlock()
 		var payload []byte
 		var perr error
+		// xact_time: the transaction's stop timestamp
+		// (GetCurrentTransactionStopTimestamp), taken as its end record is
+		// written.
+		stopTime := xlog.TimestampTzNow()
 		switch kind {
 		case transam.XactCommit:
 			// The relations the transaction dropped go into the commit record
@@ -1262,7 +1266,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, true)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1280,12 +1284,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
-			payload, perr = xlog.EncodeXactAbortPGWithRels(xid, nil, txnMgr.PendingAbortRelDeletes(xid))
+			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, nil, txnMgr.PendingAbortRelDeletes(xid))
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}

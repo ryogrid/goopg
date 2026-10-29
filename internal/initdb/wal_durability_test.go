@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"encoding/binary"
 	"path/filepath"
 	"testing"
 
@@ -182,4 +183,79 @@ func TestWalWriterLoopDrainsBuffer(t *testing.T) {
 	// Give the loop a moment to fire.  The 10ns delay means it fires in <1ms.
 	// We just check that the runtime stays alive (no panic/deadlock).
 	// A real flush race would surface in -race mode.
+}
+
+// TestWalXactRecordsCarryStopTimestamp pins xact_time in the commit and
+// abort records the xact-marker hook writes: XactLogCommitRecord /
+// XactLogAbortRecord store the transaction's stop timestamp
+// (GetCurrentTransactionStopTimestamp, microseconds since 2000-01-01).
+// goopg wrote 0, so a PG standby, pg_waldump and recovery_target_time saw
+// every transaction end at 2000-01-01 00:00:00 UTC.
+func TestWalXactRecordsCarryStopTimestamp(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := xlog.TimestampTzNow()
+	var commitXid, abortXid storage.TransactionID
+	for i, commit := range []bool{true, false} {
+		tx, err := rt.TxnMgr.Begin(transam.IsolationReadCommitted)
+		if err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		xid, err := rt.TxnMgr.AssignXID(tx)
+		if err != nil {
+			rt.Close()
+			t.Fatal(err)
+		}
+		tx.XID = xid
+		if commit {
+			commitXid = xid
+			err = rt.TxnMgr.Commit(tx)
+		} else {
+			abortXid = xid
+			err = rt.TxnMgr.Rollback(tx)
+		}
+		if err != nil {
+			rt.Close()
+			t.Fatalf("transaction %d: %v", i, err)
+		}
+	}
+	after := xlog.TimestampTzNow()
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		rt.Close()
+		t.Fatal(err)
+	}
+	rt.WAL = nil
+	rt.Close()
+
+	records, err := xlog.ReadAll(filepath.Join(dir, "pg_wal"), 0)
+	if err != nil {
+		t.Fatalf("ReadAll WAL: %v", err)
+	}
+	seen := map[storage.TransactionID]int64{}
+	for _, r := range records {
+		if r.XLog == nil || r.XLog.Header.Rmid != xlog.RmgrXact || len(r.XLog.MainData) < 8 {
+			continue
+		}
+		xid := storage.TransactionID(r.XLog.Header.XID)
+		if xid == commitXid || xid == abortXid {
+			seen[xid] = int64(binary.LittleEndian.Uint64(r.XLog.MainData[:8]))
+		}
+	}
+	for name, xid := range map[string]storage.TransactionID{"commit": commitXid, "abort": abortXid} {
+		got, ok := seen[xid]
+		if !ok {
+			t.Errorf("%s record for xid %d not found", name, xid)
+			continue
+		}
+		if got < before || got > after {
+			t.Errorf("%s record xact_time %d outside [%d, %d]", name, got, before, after)
+		}
+	}
 }

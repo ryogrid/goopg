@@ -404,8 +404,8 @@ const (
 
 // EncodeXactCommitPG builds a PostgreSQL xl_xact_commit record, framed for the
 // assembled path. The committing xid is carried in the record header (xl_xid),
-// not the body. The body is xact_time (s8, always 0 — goopg has no commit
-// timestamp). When hasInvals is set (the transaction changed a nailed catalog),
+// not the body. The body is xact_time (s8; 0 here — the production commit
+// path stamps the commit time through EncodeXactCommitPGWithRelsAt). When hasInvals is set (the transaction changed a nailed catalog),
 // XLOG_XACT_HAS_INFO + xinfo{HAS_INVALS} + an empty invals array (nmsgs=0) are
 // appended, so standby replay unlinks the relcache init files (the old
 // RecordKindXactCommitInval signal). No block references; opcode = XLOG_XACT_COMMIT.
@@ -432,6 +432,22 @@ func EncodeXactCommitPGWithSubxacts(xid storage.TransactionID, subxacts []storag
 // (xact.c:5940-5946). Replay removes their files (xact_redo_commit →
 // DropRelationFiles) and the WAL summarizer gives each fork limit block 0.
 func EncodeXactCommitPGWithRels(xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, hasInvals bool) ([]byte, error) {
+	return EncodeXactCommitPGWithRelsAt(0, xid, subxacts, rels, hasInvals)
+}
+
+// TimestampTzNow is GetCurrentTimestamp: the current time as a TimestampTz,
+// microseconds since 2000-01-01 00:00:00 UTC.
+func TimestampTzNow() int64 {
+	const pgEpochUnixMicros = 946684800 * 1000000
+	return time.Now().UnixMicro() - pgEpochUnixMicros
+}
+
+// EncodeXactCommitPGWithRelsAt is EncodeXactCommitPGWithRels with the
+// record's xact_time: XactLogCommitRecord stores the transaction's stop
+// timestamp (GetCurrentTransactionStopTimestamp) there — what
+// recovery_target_time, pg_waldump and a standby's
+// pg_last_xact_replay_timestamp() read. The un-timed encoders write 0.
+func EncodeXactCommitPGWithRelsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode, hasInvals bool) ([]byte, error) {
 	info := xlogXactCommit
 	var xinfo uint32
 	if hasInvals {
@@ -443,7 +459,7 @@ func EncodeXactCommitPGWithRels(xid storage.TransactionID, subxacts []storage.Tr
 	if len(rels) > 0 {
 		xinfo |= xactXinfoHasRelfilelocators
 	}
-	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	mainData := binary.LittleEndian.AppendUint64(nil, uint64(xactTime)) // xact_time
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
 		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
@@ -495,8 +511,8 @@ func appendXactRelFileLocators(mainData []byte, rels []storage.RelFileNode) []by
 	return mainData
 }
 
-// EncodeXactAbortPG builds a PostgreSQL xl_xact_abort record (xact_time s8 = 0,
-// no chunks). The aborting xid is carried in the header (xl_xid); opcode =
+// EncodeXactAbortPG builds a PostgreSQL xl_xact_abort record (xact_time 0 —
+// the production path uses EncodeXactAbortPGWithRelsAt — no chunks). The aborting xid is carried in the header (xl_xid); opcode =
 // XLOG_XACT_ABORT.
 func EncodeXactAbortPG(xid storage.TransactionID) ([]byte, error) {
 	return EncodeXactAbortPGWithSubxacts(xid, nil)
@@ -514,6 +530,12 @@ func EncodeXactAbortPGWithSubxacts(xid storage.TransactionID, subxacts []storage
 // relations created by the aborting transaction, which its abort removes
 // (XactLogAbortRecord's HAS_RELFILELOCATORS chunk, xact.c:6093-6099).
 func EncodeXactAbortPGWithRels(xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode) ([]byte, error) {
+	return EncodeXactAbortPGWithRelsAt(0, xid, subxacts, rels)
+}
+
+// EncodeXactAbortPGWithRelsAt is EncodeXactAbortPGWithRels with the record's
+// xact_time (XactLogAbortRecord stores GetCurrentTransactionStopTimestamp).
+func EncodeXactAbortPGWithRelsAt(xactTime int64, xid storage.TransactionID, subxacts []storage.TransactionID, rels []storage.RelFileNode) ([]byte, error) {
 	info := xlogXactAbort
 	var xinfo uint32
 	if len(subxacts) > 0 {
@@ -522,7 +544,7 @@ func EncodeXactAbortPGWithRels(xid storage.TransactionID, subxacts []storage.Tra
 	if len(rels) > 0 {
 		xinfo |= xactXinfoHasRelfilelocators
 	}
-	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	mainData := binary.LittleEndian.AppendUint64(nil, uint64(xactTime)) // xact_time
 	if xinfo != 0 {
 		info |= xlogXactHasInfo
 		mainData = binary.LittleEndian.AppendUint32(mainData, xinfo)
