@@ -17457,7 +17457,12 @@ func exprsHaveEscapingOuterRef(depth int, esc outerRefPred, exprs ...Expr) bool 
 		if e == nil || found {
 			continue
 		}
-		walkExprTree(e, func(inner Expr) {
+		// walkSameScopeExprs: walkExprTree never visits an IN list or a
+		// `= ANY (…)` operand, so `mi.id IN (mo.k, 99)` read as having no
+		// outer reference and its sublink was marked uncorrelated — an
+		// uncorrelated ARRAY sublink is computed once per statement, so
+		// every row got the first row's array (M0122-0021).
+		walkSameScopeExprs(e, func(inner Expr) {
 			if found {
 				return
 			}
@@ -17502,7 +17507,7 @@ func planHasEscapingOuterRefFlat(node Node, depth int, esc outerRefPred) bool {
 		if found {
 			return
 		}
-		walkExprTree(e, func(inner Expr) {
+		walkSameScopeExprs(e, func(inner Expr) {
 			if !found && outerRefEscapes(inner, depth, esc) {
 				found = true
 			}
