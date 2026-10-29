@@ -10,11 +10,13 @@
 package xlog
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // RestoreArchivedFile shells out to restoreCommand to fetch the
@@ -90,26 +92,43 @@ func ReplacePercentPlaceholders(instr, paramName string, vals map[byte]string) (
 }
 
 // ExecuteRecoveryCommand is PG's ExecuteRecoveryCommand (xlogarchive.c) for
-// archive_cleanup_command: %r becomes the WAL file holding the oldest
-// restartpoint's redo (GetOldestRestartPoint — pg_control's
-// checkPointCopy.redo and timeline), the command runs through the shell as
-// system() does, and a non-zero exit is the caller's WARNING
-// (failOnSignal false). An invalid placeholder is an error before anything
-// runs.
-func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) error {
+// archive_cleanup_command and recovery_end_command: %r becomes the WAL file
+// holding the oldest restartpoint's redo (GetOldestRestartPoint — pg_control's
+// checkPointCopy.redo and timeline), and the command runs through the shell as
+// system() does. A failure returns an error and anySignal, which is PG's
+// wait_result_is_any_signal(rc, true): the child died of a signal, or exited
+// above 125 (the shell's report of a signalled or unrunnable command). The
+// caller decides the level — WARNING, or FATAL on a signal when it passed
+// failOnSignal (recovery_end_command). An invalid placeholder is an error
+// before anything runs.
+func ExecuteRecoveryCommand(command, commandName string, restartRedo uint64, restartTLI uint32, segSize int64) (anySignal bool, err error) {
 	if segSize <= 0 {
 		segSize = DefaultSegmentSize
 	}
 	fname := XLogFileName(restartTLI, restartRedo/uint64(segSize), segSize)
 	cmd, err := ReplacePercentPlaceholders(command, commandName, map[byte]string{'r': fname})
 	if err != nil {
-		return err
+		return false, err
 	}
 	c := exec.Command("sh", "-c", cmd)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	if err := c.Run(); err != nil {
-		return fmt.Errorf("%s \"%s\": %w", commandName, command, err)
+		return waitResultIsAnySignal(err), fmt.Errorf("%s \"%s\": %w", commandName, command, err)
 	}
-	return nil
+	return false, nil
+}
+
+// waitResultIsAnySignal is wait_result_is_any_signal(rc, true)
+// (src/common/wait_error.c) for an exec error: a signalled child, or an exit
+// status above 125.
+func waitResultIsAnySignal(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return true
+	}
+	return ee.ExitCode() > 125
 }

@@ -59,6 +59,9 @@ const promoteSignalPollInterval = 250 * time.Millisecond
 type standbyController struct {
 	rt     *initdb.Runtime
 	logger *slog.Logger
+	// recoveryEndCommand reads recovery_end_command (PGC_SIGHUP) at
+	// promotion time; nil reads as empty (M0122-0013).
+	recoveryEndCommand func() string
 
 	receiverCancel context.CancelFunc
 	receiverDone   chan struct{}
@@ -179,16 +182,17 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 	})
 
 	sc := &standbyController{
-		rt:             rt,
-		logger:         logger,
-		receiverCancel: rcvCancel,
-		receiverDone:   rcvDone,
-		replayerCancel: rplCancel,
-		replayerDone:   rplDone,
-		replayer:       replayer,
-		signalCancel:   sigCancel,
-		signalDone:     sigDone,
-		walLevel:       walLevelEnum(stringGUC(registry, "wal_level", "replica")),
+		rt:                 rt,
+		logger:             logger,
+		recoveryEndCommand: func() string { return stringGUC(registry, "recovery_end_command", "") },
+		receiverCancel:     rcvCancel,
+		receiverDone:       rcvDone,
+		replayerCancel:     rplCancel,
+		replayerDone:       rplDone,
+		replayer:           replayer,
+		signalCancel:       sigCancel,
+		signalDone:         sigDone,
+		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
 	// Clear any stale promote.signal left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
@@ -440,6 +444,17 @@ func (sc *standbyController) finalizePromotion() error {
 		sc.rt.Checkpointer.SetRestartPointSource(nil)
 		sc.rt.Checkpointer.SetReplayPositionSource(nil)
 	}
+	// Archive recovery is over: run recovery_end_command, as
+	// CleanupAfterArchiveRecovery does before StartupXLOG stamps
+	// DB_IN_PRODUCTION (xlog.c). A command killed by a signal fails the
+	// promotion (failOnSignal); any other failure is a WARNING.
+	var endCmd string
+	if sc.recoveryEndCommand != nil {
+		endCmd = sc.recoveryEndCommand()
+	}
+	if err := runRecoveryEndCommand(sc.rt, endCmd, sc.logger); err != nil {
+		return fmt.Errorf("promote: %w", err)
+	}
 	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
 	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion
 	// (xlog.c:6204-6211) (M0122-0013).
@@ -546,8 +561,9 @@ func walDirFor(rt *initdb.Runtime) string {
 //  2. Append a history entry for oldTLI + endLSN.
 //  3. Write the timeline history file for newTLI.
 //  4. Persist newTLI to the flat file and pg_control.
-//  5. Remove recovery.signal.
-func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
+//  5. Run recovery_end_command.
+//  6. Remove recovery.signal.
+func promoteAfterRecovery(rt *initdb.Runtime, recoveryEndCommand string, logger *slog.Logger) error {
 	if rt.DataDir == "" {
 		return nil
 	}
@@ -587,12 +603,50 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
 	}
 
+	// CleanupAfterArchiveRecovery runs recovery_end_command once archive
+	// recovery has ended (xlog.c). A signal-killed command is FATAL: the
+	// recovery.signal stays, so the next start retries recovery.
+	if err := runRecoveryEndCommand(rt, recoveryEndCommand, logger); err != nil {
+		return fmt.Errorf("promote after recovery: %w", err)
+	}
+
 	if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
 		return fmt.Errorf("promote after recovery: remove recovery.signal: %w", err)
 	}
 	logger.Info("archive recovery promotion complete",
 		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 		"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
+	return nil
+}
+
+// runRecoveryEndCommand is the recovery_end_command arm of PG's
+// CleanupAfterArchiveRecovery (xlog.c): ExecuteRecoveryCommand with
+// failOnSignal true. %r is the WAL file holding the oldest restartpoint's
+// redo — GetOldestRestartPoint reads pg_control's checkPointCopy (redo and
+// timeline). A command that fails with a signal (or a shell status above
+// 125, wait_result_is_any_signal) is FATAL, returned as an error; any other
+// failure is a WARNING and recovery ends normally. Empty command: nothing
+// runs.
+func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logger) error {
+	if command == "" || rt == nil || rt.DataDir == "" {
+		return nil
+	}
+	cd, err := control.ReadControlFile(rt.DataDir)
+	if err != nil {
+		return fmt.Errorf("recovery_end_command: read pg_control: %w", err)
+	}
+	segSize := xlog.DefaultSegmentSize
+	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {
+		segSize = rt.WAL.SegmentSize()
+	}
+	anySignal, err := xlog.ExecuteRecoveryCommand(command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
+	if err == nil {
+		return nil
+	}
+	if anySignal {
+		return err
+	}
+	logger.Warn("recovery_end_command failed", "err", err)
 	return nil
 }
 

@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
@@ -382,5 +384,127 @@ func TestStandbyControllerPromoteRetryableAfterFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, initdb.StandbySignalFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("standby.signal still present after retry (err=%v)", err)
+	}
+}
+
+// TestStandbyControllerPromoteRunsRecoveryEndCommand pins the
+// recovery_end_command arm of CleanupAfterArchiveRecovery (xlog.c): promotion
+// runs the command once with %r = the WAL file holding pg_control's
+// checkpoint-copy redo (GetOldestRestartPoint); a plain failure is a WARNING
+// and promotion completes; a command killed by a signal fails the promotion
+// (failOnSignal), leaving the node a standby that can retry.
+func TestStandbyControllerPromoteRunsRecoveryEndCommand(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	promote := func(t *testing.T, cmd string) (*initdb.Runtime, string, error) {
+		t.Helper()
+		dataDir := initStandbyDir(t)
+		rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { rt.Close() })
+		parent, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		sc := startStandby(parent, rt, nil, logger)
+		t.Cleanup(sc.Close)
+		sc.recoveryEndCommand = func() string { return cmd }
+		time.Sleep(20 * time.Millisecond)
+		return rt, dataDir, sc.Promote(context.Background())
+	}
+
+	t.Run("runs with the restartpoint file", func(t *testing.T) {
+		out := filepath.Join(t.TempDir(), "r.txt")
+		rt, dataDir, err := promote(t, "echo %r > '"+out+"'")
+		if err != nil {
+			t.Fatalf("Promote: %v", err)
+		}
+		cd, err := control.ReadControlFile(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seg := rt.WAL.SegmentSize()
+		want := xlog.XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(seg), seg)
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("recovery_end_command did not run: %v", err)
+		}
+		if strings.TrimSpace(string(got)) != want {
+			t.Errorf("%%r = %q, want %q", strings.TrimSpace(string(got)), want)
+		}
+	})
+
+	t.Run("plain failure is a warning", func(t *testing.T) {
+		rt, _, err := promote(t, "exit 3")
+		if err != nil {
+			t.Fatalf("Promote with a failing (non-signal) recovery_end_command: %v, want success", err)
+		}
+		if rt.Standby {
+			t.Error("still a standby after promotion")
+		}
+	})
+
+	t.Run("signal is fatal", func(t *testing.T) {
+		rt, dataDir, err := promote(t, "kill -9 $$")
+		if err == nil || !strings.Contains(err.Error(), "recovery_end_command") {
+			t.Fatalf("Promote with a signal-killed recovery_end_command: err = %v, want a recovery_end_command error", err)
+		}
+		cd, cerr := control.ReadControlFile(dataDir)
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		if cd.State == control.DBStateInProduction {
+			t.Error("pg_control stamped DB_IN_PRODUCTION although recovery_end_command failed with a signal")
+		}
+		_ = rt
+	})
+}
+
+// TestPromoteAfterRecoveryRunsRecoveryEndCommand pins the same
+// CleanupAfterArchiveRecovery arm on the recovery.signal path: archive
+// recovery's promotion runs recovery_end_command before removing
+// recovery.signal; a signal-killed command fails the promotion and leaves
+// recovery.signal in place, so the next start retries recovery.
+func TestPromoteAfterRecoveryRunsRecoveryEndCommand(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	open := func(t *testing.T) (*initdb.Runtime, string) {
+		t.Helper()
+		dir := t.TempDir()
+		if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+			t.Fatalf("initdb.Init: %v", err)
+		}
+		rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { rt.Close() })
+		if err := os.WriteFile(filepath.Join(dir, initdb.RecoverySignalFile), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return rt, dir
+	}
+	signalPresent := func(dir string) bool {
+		_, err := os.Stat(filepath.Join(dir, initdb.RecoverySignalFile))
+		return err == nil
+	}
+
+	rt, dir := open(t)
+	out := filepath.Join(t.TempDir(), "r.txt")
+	if err := promoteAfterRecovery(rt, "echo %r > '"+out+"'", logger); err != nil {
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || len(strings.TrimSpace(string(got))) != 24 {
+		t.Errorf("recovery_end_command output = %q (err %v), want a 24-character WAL file name", got, err)
+	}
+	if signalPresent(dir) {
+		t.Error("recovery.signal still present after a successful promotion")
+	}
+
+	rt, dir = open(t)
+	err := promoteAfterRecovery(rt, "kill -9 $$", logger)
+	if err == nil || !strings.Contains(err.Error(), "recovery_end_command") {
+		t.Fatalf("signal-killed recovery_end_command: err = %v, want a recovery_end_command error", err)
+	}
+	if !signalPresent(dir) {
+		t.Error("recovery.signal removed although recovery_end_command failed with a signal")
 	}
 }

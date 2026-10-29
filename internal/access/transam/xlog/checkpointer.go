@@ -1343,7 +1343,7 @@ func (c *Checkpointer) runArchiveCleanupCommand(rp ReplayedCheckpoint) {
 	if cmd == "" {
 		return
 	}
-	if err := ExecuteRecoveryCommand(cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
+	if _, err := ExecuteRecoveryCommand(cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
 		c.cfg.Logger.Warn("archive_cleanup_command failed", "err", err)
 	}
 }

@@ -406,3 +406,30 @@ func TestRestartPointRunsArchiveCleanupCommand(t *testing.T) {
 		t.Errorf("skip arm ran archive_cleanup_command (%%r = %q); PG returns before it", got)
 	}
 }
+
+// TestExecuteRecoveryCommandSignalClassification pins
+// wait_result_is_any_signal(rc, true) (src/common/wait_error.c), which
+// ExecuteRecoveryCommand's caller uses to pick the level for a
+// failOnSignal command (recovery_end_command): a plain non-zero exit is not
+// a signal (WARNING), a shell status above 125 (command not found: 127) and
+// a child killed by a signal are (FATAL).
+func TestExecuteRecoveryCommandSignalClassification(t *testing.T) {
+	for _, tc := range []struct {
+		cmd        string
+		wantErr    bool
+		wantSignal bool
+	}{
+		{"true", false, false},
+		{"exit 3", true, false},
+		{"exit 127", true, true},
+		{"kill -9 $$", true, true},
+	} {
+		sig, err := ExecuteRecoveryCommand(tc.cmd, "recovery_end_command", 0, 1, DefaultSegmentSize)
+		if (err != nil) != tc.wantErr || sig != tc.wantSignal {
+			t.Errorf("%q: signal=%v err=%v, want signal=%v err?=%v", tc.cmd, sig, err, tc.wantSignal, tc.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), `recovery_end_command "`+tc.cmd+`"`) {
+			t.Errorf("%q: error %q lacks PG's `%%s \"%%s\"` prefix", tc.cmd, err)
+		}
+	}
+}

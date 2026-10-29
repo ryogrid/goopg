@@ -196,6 +196,8 @@
                                         # (change requires restart)
 #archive_cleanup_command = ''            # command to execute at every restartpoint
                                         # (SIGHUP to apply)
+#recovery_end_command = ''               # command to execute at completion of recovery
+                                        # (SIGHUP to apply)
 #wal_receiver_status_interval = 10      # 0-2147483 s; 0 disables status updates
                                         # (SIGHUP to apply)
 #hot_standby = on                       # allow read-only queries during recovery

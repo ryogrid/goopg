@@ -964,7 +964,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			// Promote: bump TLI, write history, update pg_control,
 			// and remove recovery.signal. Mirrors finalizePromotion
 			// in standby.go but without the standby controller.
-			if err := promoteAfterRecovery(rt, logger); err != nil {
+			if err := promoteAfterRecovery(rt, stringGUC(registry, "recovery_end_command", ""), logger); err != nil {
 				fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
 				return 1
 			}

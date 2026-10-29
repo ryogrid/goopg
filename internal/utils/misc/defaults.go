@@ -1663,6 +1663,15 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
+	// recovery_end_command: the shell command run once at the end of archive
+	// recovery — standby promotion or the end of recovery.signal recovery
+	// (guc_tables.c PGC_SIGHUP; xlog.c CleanupAfterArchiveRecovery). Read at
+	// promotion (M0122-0013).
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_end_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
 		MinVal: 0, MaxVal: 2147483,
