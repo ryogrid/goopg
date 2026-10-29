@@ -4244,6 +4244,12 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\_target\_xid \+ multiple\-targets FATAL LANDED 2026\-10\-30 \(`77e3f4ed5`\)**\. Movement: none — recovery
+    targets\. COMMIT/ABORT xl\_xid equality \(recoveryStopsBefore/After\), error\_multiple\_recovery\_targets\.
+    - Pins: `TestRunArchiveRecoveryStopsAtTargetXid`, `TestRecoveryStopXidAndSingleTarget` \(mutation\-checked\)\. Gates:
+      units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): two\-phase records; xact\_time = 0 in commit records blocks recovery\_target\_time;
+      recovery\_target\_name / 'immediate'\.
   - **recovery\_target\_lsn / \_inclusive / \_action LANDED 2026\-10\-30 \(`d882de595`\)**\. Movement: none — recovery
     targets\. recoveryStopsBefore/After \(LSN arm\), PerformWalRecovery's end\-of\-redo FATALs, getRecoveryStopReason
     as the history reason; goopg had no target settings at all and wrote "archive recovery complete"\.

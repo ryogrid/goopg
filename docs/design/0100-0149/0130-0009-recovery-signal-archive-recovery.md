@@ -477,3 +477,23 @@ where PG writes `getRecoveryStopReason()`.
 - Pause with hot\_standby on.
 - Targets on a standby.
 - The consistency point is the local-WAL end, not minRecoveryPoint.
+
+## Update 2026-10-30 — recovery\_target\_xid and the single-target check (M0122-0013, `77e3f4ed5`)
+
+- `recovery_target_xid` is registered with `check_recovery_target_xid`: `strtou64(s, NULL, 0)`, rejected only on
+  ERANGE and truncated to a TransactionId.
+- **The stop rule** (`recoveryStopsBefore` / `recoveryStopsAfter`): only the COMMIT or ABORT record whose `xl_xid`
+  equals the target ends recovery. The test is equality only, because xids are assigned when a transaction starts, not
+  in completion order. Recovery stops before that record, or after applying it when inclusive.
+  - `StopReason` is "before|after transaction N".
+  - `StopMessage` is PG's LOG line, "recovery stopping before|after commit|abort of transaction N, time T".
+- **Single target:** setting `recovery_target_lsn` and `recovery_target_xid` together is FATAL "multiple recovery
+  targets specified", with `error_multiple_recovery_targets`' errdetail.
+
+**Pins:** `TestRunArchiveRecoveryStopsAtTargetXid` (the fixture's completion order differs from xid order; it covers
+an abort target and an absent xid) and `TestRecoveryStopXidAndSingleTarget`. Both were mutation-checked.
+
+**Still open (ledgered):**
+- `COMMIT PREPARED` / `ABORT PREPARED`: replay refuses the two-phase opcodes.
+- Commit records carry `xact_time = 0`, which blocks `recovery_target_time` and makes the LOG time 2000-01-01.
+- `recovery_target_name` and `'immediate'`.
