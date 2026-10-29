@@ -142,10 +142,10 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 been promoted, recovery stopped at the timeline switch and promoted from there, silently dropping every record written
 on the later timeline. A mutation run of the new test shows exactly that: recovery ended on TLI 1 at the switch point.
 
-**PG behaviour** (, the default; xlogrecovery.c):
--  probes  files upward from the start timeline.
--  turns the newest one into the expected timelines.
--  reads each segment from the newest expected timeline that has it and began at or before it, and
+**PG behaviour** (`recovery_target_timeline = 'latest'`, the default; xlogrecovery.c):
+- `findNewestTimeLine` probes `<tli>.history` files upward from the start timeline.
+- `readTimeLineHistory` turns the newest one into the expected timelines.
+- `XLogFileReadAnyTLI` reads each segment from the newest expected timeline that has it and began at or before it, and
   never goes back to a timeline older than the last segment's.
 
 **Ported:**
@@ -162,7 +162,7 @@ on the later timeline. A mutation run of the new test shows exactly that: recove
   segment before the switch zero-fills them. It also appends one segment at a time, which removes the previous
   whole-range buffer.
 - `promoteAfterRecovery` takes the parent timeline as `EndTLI` and the new timeline as `NewestTLI + 1`, which can't
-  collide with any timeline in the archive (). The history becomes 1 → 2 → 3.
+  collide with any timeline in the archive (`StartupXLOG`). The history becomes 1 → 2 → 3.
 
 **Pins:** `TestRunArchiveRecoveryFollowsTimelineHistory` and `TestPromoteAfterRecoveryFollowsTimelines`. The second
 takes a base backup on TLI 1, promotes the primary to TLI 2, then checks that recovery plus promotion end on TLI 3 with
