@@ -1,7 +1,7 @@
 # M0122-0021 — EXPLAIN ANALYZE: nodes below a Gather report their own actuals
 
-Status: slice 1 landed 2026-10-29 (`fc4b696a3`). The task stays open for the CTE-body, InitPlan, shared-hash-build
-and Memoize-subtree gaps listed under "Remaining".
+Status: slice 1 landed 2026-10-29 (`881b3e314`); slice 2 (NLI inner / Memoize) landed 2026-10-29 (`28a5ff4c9`). The
+task stays open for the CTE-body, InitPlan and shared-hash-build gaps listed under "Remaining".
 
 ## Problem
 
@@ -75,10 +75,38 @@ PG prints 26 node lines with actuals and no worker lines.
    Q72's `Hash` over `household_demographics` has no actuals, where PG has `rows=1200.00 loops=4` (each participant
    builds its own copy when Parallel Hash is off). A faithful report needs a design call, because goopg does this
    work once where PG does it per participant.
-2. **Memoize below a Gather.** Q72's Memoize and its date_dim d1 probe have no entries in any site table, so they
-   print no actuals. PG prints `(actual rows=0.19 loops=61015)` plus per-worker `Hits` lines.
+2. ~~Memoize below a Gather~~ — landed as slice 2 (below). Residuals: the `Hits:` line below a Gather shows one
+   site's counters rather than PG's leader line + per-worker `Worker N:  Hits:` lines, and the NLI probe's own
+   `Cond` filter is evaluated inside `indexScanOp` without a rejection counter, so it prints no
+   `Rows Removed by Filter` (PG: `Rows Removed by Filter: 1` on Q72's d1 probe).
 3. **CTE bodies and InitPlans** have no actuals, even in serial plans. Their nodes are built lazily outside the
    instrumentation scope (loop #261 correction in the fix_plan entry).
 4. **Buffers/WAL/memory** are not aggregated for sites. Each site's deltas come from pool-global counters that the
    other sites advance at the same time (ledger).
 5. **`(never executed)`.** PG prints it for `nloops == 0`. goopg prints nothing for a node that has no entry.
+
+## Slice 2 — the nested-loop index join's inner side
+
+The cause was not the Gather. `NestedLoopIndexJoin`'s inner probe (an Index Scan, Index Only Scan or Bitmap Heap Scan)
+and its optional Memoize (`InnerMemo`) are not Operators. The join drives them through `nliInner`
+(`BindOuter` / `Rescan` / `Next`), so `buildNode` builds them directly and `maybeInstrument` never wraps them. Both
+lines therefore printed no actuals, in serial plans as well as below a Gather.
+
+- PG instruments both nodes. The Memoize gets one loop per rescan (`ExecReScanMemoize` per outer row). The probe gets
+  one loop per cache miss, because only a miss calls it (nodeMemoize.c `ExecMemoize`).
+- `instrumentedNLIInner` / `instrumentedMemoProbe` (instrument.go) are `maybeInstrument`'s sidecar for this
+  protocol:
+  - a loop per `Rescan`, which is timed like an Operator's Open;
+  - rows and time per `Next`;
+  - stats filed under the plan node in the active scope. The probe is keyed on `NestedLoopIndexJoin.Inner`, which
+    is the same node as `InnerMemo.Child`, and the cache on `InnerMemo`.
+  - Per-site scopes below a Gather fold these the same way slice 1 folds any other node.
+- `unwrapNLIInner` strips the sidecar for the FOR UPDATE TID-provider walks (`nliInnerIndexScan`, and lockrows'
+  bitmap arms), which need the concrete probe.
+- Q72 SF0.25:
+  - `Memoize (actual rows=0.19 loops=61015)` is identical to PG.
+  - The d1 probe reports `loops=2954`; PG reports 2852. The per-worker caches fill differently.
+  - Serially, every node line carries actuals, and probe loops equal misses (1718).
+  - Captures: `analysis/m0122/m0122-0021/q72-goopg-slice2{,-serial}.explain`.
+- Test: `TestMemoizeAnalyzeNodeActuals`. Gates: units, tpch-spotcheck, tpch-acceptance-arm (24 MATCH) and the sf025
+  sweep all PASS. Census `routing-20261029b`: 22/22, 99/99, 99/99.

@@ -1,0 +1,66 @@
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=100.00 loops=1)
+   ->  Sort (actual rows=100.00 loops=1)
+         Sort Key: (count(*)) DESC, item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+         Sort Method: quicksort  Memory: 59kB
+         ->  GroupAggregate (actual rows=153.00 loops=1)
+               Group Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+               ->  Nested Loop Left Join (actual rows=153.00 loops=1)
+                     Join Filter: (catalog_sales.cs_promo_sk = promotion.p_promo_sk)
+                     Rows Removed by Join Filter: 45747
+                     ->  Nested Loop (actual rows=153.00 loops=1)
+                           Join Filter: (d3.d_date > (d1.d_date + 5))
+                           Rows Removed by Join Filter: 7
+                           ->  Gather Merge (actual rows=160.00 loops=1)
+                                 Workers Planned: 3
+                                 Workers Launched: 3
+                                 ->  Sort (actual rows=40.00 loops=4)
+                                       Sort Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+                                       Sort Method: quicksort  Memory: 235kB
+                                       Worker 0:  Sort Method: quicksort  Memory: 228kB
+                                       Worker 1:  Sort Method: quicksort  Memory: 264kB
+                                       Worker 2:  Sort Method: quicksort  Memory: 235kB
+                                       ->  Nested Loop (actual rows=40.00 loops=4)
+                                             Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                             ->  Nested Loop (actual rows=40.00 loops=4)
+                                                   ->  Nested Loop (actual rows=40.00 loops=4)
+                                                         Join Filter: (d1.d_week_seq = d2.d_week_seq)
+                                                         Rows Removed by Join Filter: 5358
+                                                         ->  Nested Loop (actual rows=5398.25 loops=4)
+                                                               ->  Nested Loop (actual rows=546.25 loops=4)
+                                                                     ->  Nested Loop (actual rows=2974.00 loops=4)
+                                                                           ->  Hash Join (actual rows=15253.75 loops=4)
+                                                                                 Hash Cond: (catalog_sales.cs_bill_hdemo_sk = household_demographics.hd_demo_sk)
+                                                                                 ->  Parallel Seq Scan on catalog_sales (actual rows=90099.25 loops=4)
+                                                                                 ->  Hash
+                                                                                       Buckets: 2048  Batches: 1  Memory Usage: 255kB  Build Time: 2.466 ms
+                                                                                       ->  Seq Scan on household_demographics
+                                                                                             Filter: (hd_buy_potential = '1001-5000'::bpchar)
+                                                                           ->  Memoize (actual rows=0.19 loops=61015)
+                                                                                 Cache Key: catalog_sales.cs_sold_date_sk
+                                                                                 Cache Mode: logical
+                                                                                 Hits: 14477  Misses: 749  Evictions: 0  Overflows: 0
+                                                                                 ->  Index Scan using date_dim_pkey on date_dim d1 (actual rows=0.23 loops=2954)
+                                                                                       Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                                                                       Filter: (d_year = 1998)
+                                                                     ->  Index Scan using customer_demographics_pkey on customer_demographics (actual rows=0.18 loops=11896)
+                                                                           Index Cond: (cd_demo_sk = catalog_sales.cs_bill_cdemo_sk)
+                                                                           Filter: (cd_marital_status = 'S'::bpchar)
+                                                               ->  Index Scan using inventory_pkey on inventory (actual rows=9.88 loops=2185)
+                                                                     Index Cond: (inv_item_sk = catalog_sales.cs_item_sk)
+                                                                     Filter: (inv_quantity_on_hand < catalog_sales.cs_quantity)
+                                                                     Rows Removed by Filter: 191
+                                                         ->  Index Scan using date_dim_pkey on date_dim d2 (actual rows=1.00 loops=21593)
+                                                               Index Cond: (d_date_sk = inventory.inv_date_sk)
+                                                   ->  Index Scan using warehouse_pkey on warehouse (actual rows=1.00 loops=160)
+                                                         Index Cond: (w_warehouse_sk = inventory.inv_warehouse_sk)
+                                             ->  Index Scan using item_pkey on item (actual rows=1.00 loops=160)
+                                                   Index Cond: (i_item_sk = inventory.inv_item_sk)
+                           ->  Index Scan using date_dim_pkey on date_dim d3 (actual rows=1.00 loops=160)
+                                 Index Cond: (d_date_sk = catalog_sales.cs_ship_date_sk)
+                     ->  Seq Scan on promotion (actual rows=300.00 loops=1)
+ Planning Time: 69.058 ms
+ Execution Time: 3087.472 ms
+(62 rows)
+

@@ -3941,9 +3941,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Design: `docs/design/0100\-0149/m0122\-0021\-worker\-instrumentation\-aggregate\.md`\.
     - Movement \(slice\): yes — Q72 SF0\.25 EXPLAIN ANALYZE node lines with actuals 8→24 \(PG 26\)\.
   - Remaining slices \(each ledgered 2026\-10\-29\), in order:
-    - Slice 2 — Memoize below a Gather: Q72's Memoize and its `date\_dim d1` probe have no entry in any site table
-      \(PG `actual rows=0\.19 loops=61015` plus per\-worker `Hits` lines\)\. First step: find why the Memoize arm's
-      operator is not wrapped by `maybeInstrument` under a per\-site scope\.
+    - Slice 2 done 2026\-10\-29 \(`28a5ff4c9`\): the cause was the NLI inner protocol, not the Gather — the probe and its
+      Memoize are driven through `nliInner` \(BindOuter/Rescan/Next\), so `maybeInstrument` never wrapped them, serially
+      too\.
+      - `instrumentedNLIInner` / `instrumentedMemoProbe` \(instrument\.go\): a loop per Rescan, rows/time per Next, keyed
+        on `NestedLoopIndexJoin\.Inner` / `InnerMemo` — PG's ExecReScanMemoize per outer row, probe only on a miss
+        \(nodeMemoize\.c ExecMemoize\); `unwrapNLIInner` keeps the FOR UPDATE TID walks on the concrete probe\.
+      - Q72 SF0\.25: `Memoize \(actual rows=0\.19 loops=61015\)` identical to PG; d1 probe loops 2954 \(PG 2852, per\-worker
+        cache fill\)\. Serial Q72: every node line carries actuals; probe loops = misses \(1718\)\.
+      - Test `TestMemoizeAnalyzeNodeActuals`; gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99;
+        census `routing\-20261029b` 22/22·99/99·99/99\.
+      - Residuals \(ledgered\): the `Hits:` line below a Gather shows one site, not PG's leader line \+ per\-worker lines;
+        the NLI probe's own Cond filter has no rejection counter \(no `Rows Removed by Filter`\)\.
     - Slice 3 — CTE bodies and InitPlans \(serial too, loop \#261 correction above\)\.
     - Slice 4 — shared hash build input: `prebuildSharedHashJoins` builds the inner once from a nil\-scope tree, so
       every site reports loops=0 and the Hash line shows no actuals \(PG `rows=1200\.00 loops=4`, one build per
@@ -6640,6 +6649,11 @@ Sequencing: the S9 replenishment rule in the banner.)
     `3d6366064` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#262\) — **exhausted at `b54e7fa8d`**, census `routing\-20261028r/` reused:
     `b54e7fa8d` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `59adcaea7`**, fresh census `routing\-20261029a/` \(trigger `881b3e314`,
+    M0122\-0021 slice 1 changed internal/executor; TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0
+    everywhere\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `28a5ff4c9` \(M0122\-0021 slice 2 changed internal/executor\) — `routing\-20261029b/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
