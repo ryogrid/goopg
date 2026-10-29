@@ -72,6 +72,15 @@ type ArchiveRecoveryResult struct {
 // segmentSize of 0 means "derive from the cluster's own WAL" (via
 // detectSegmentSizeAt / DefaultSegmentSize).
 func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, segmentSize int64) (ArchiveRecoveryResult, error) {
+	return RunArchiveRecoveryWith(mgr, dataDir, func() string { return restoreCommand }, segmentSize)
+}
+
+// RunArchiveRecoveryWith is RunArchiveRecovery with restore_command read
+// through restoreCommand before every archive fetch. restore_command is
+// PGC_SIGHUP and RestoreArchivedFile reads recoveryRestoreCommand at each
+// call, so a reload processed while recovery runs (the startup process's
+// ProcessStartupProcInterrupts) changes the command the next fetch uses.
+func RunArchiveRecoveryWith(mgr *storage.Manager, dataDir string, restoreCommand func() string, segmentSize int64) (ArchiveRecoveryResult, error) {
 	var res ArchiveRecoveryResult
 	walDir := filepath.Join(dataDir, "pg_wal")
 
@@ -98,7 +107,7 @@ func RunArchiveRecovery(mgr *storage.Manager, dataDir, restoreCommand string, se
 		if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
 			return true
 		}
-		return RestoreArchivedFile(restoreCommand, walDir, name) == nil
+		return RestoreArchivedFile(restoreCommand(), walDir, name) == nil
 	}
 	res.NewestTLI = startTLI
 	for probe := startTLI + 1; have(TimelineHistoryFileName(probe)); probe++ {

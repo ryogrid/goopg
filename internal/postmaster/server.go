@@ -854,24 +854,15 @@ func (s *Server) reloadConfig() {
 		s.cfg.Logger.Warn("control: reload requested but no GUC registry is configured")
 		return
 	}
-	var entries []misc.ConfigEntry
-	if s.cfg.ConfigPath != "" {
-		parsed, err := misc.ParseConfigFile(s.cfg.ConfigPath)
-		if err != nil {
-			s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
-			return
-		}
-		entries = parsed
-	}
 	// postgresql.auto.conf after postgresql.conf, as at boot: ALTER SYSTEM's
 	// values win, and one it RESET is absent here, so ApplyReloadEntries
-	// reverts it to its default.
-	autoEntries, err := misc.AutoConfEntries(s.cfg.DataDir)
+	// reverts it to its default. The startup-phase reload in goopg start
+	// reads the same entries.
+	entries, err := misc.ReloadConfigEntries(s.cfg.ConfigPath, s.cfg.DataDir)
 	if err != nil {
-		s.cfg.Logger.Error("control: reload failed to parse "+misc.AutoConfFileName, "err", err)
+		s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
 		return
 	}
-	entries = append(entries, autoEntries...)
 	result := registry.ApplyReloadEntries(entries)
 	for _, w := range result.Warnings {
 		s.cfg.Logger.Warn("control: reload", "issue", w)

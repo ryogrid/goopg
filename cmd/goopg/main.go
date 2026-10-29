@@ -363,6 +363,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// `goopg stop` once milestone 7 builds it.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	// SIGHUP is caught from here on, as the postmaster's handler is
+	// installed before the startup process runs: until the server's own
+	// reload handler is live, a SIGHUP (pg_ctl reload finds the pid in the
+	// lock file taken below) only flags a reload that the startup phase
+	// processes at its next check — never Go's default terminate-on-SIGHUP.
+	startupHup := newStartupReload(logger)
+	defer startupHup.stop()
 
 	cfg := postmaster.Config{
 		Address: *addr,
@@ -428,6 +435,30 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			}
 			cfg.Registry = registry
 			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
+		}
+	}
+	// CreateDataDirLockFile (PostmasterMain): postmaster.pid is created
+	// before the data directory is touched — before crash or archive
+	// recovery — so a second server on a directory a live one owns stops
+	// here. A directory that does not exist is left to initdb.Open's error.
+	if *dataDir != "" {
+		if st, err := os.Stat(*dataDir); err == nil && st.IsDir() {
+			lockErr := control.CreateDataDirLockFile(*dataDir, control.PIDFile{
+				PID:       os.Getpid(),
+				DataDir:   *dataDir,
+				StartedAt: time.Now(),
+			})
+			if lockErr != nil {
+				fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", lockErr)
+				var le *control.LockFileError
+				if errors.As(lockErr, &le) && le.Hint != "" {
+					fmt.Fprintf(stderr, "HINT: %s\n", le.Hint)
+				}
+				return 1
+			}
+			// The lock file's on_proc_exit unlink; the server's own teardown
+			// removes it first on a normal run.
+			defer func() { _ = control.RemoveDataDirLockFile(*dataDir) }()
 		}
 	}
 	var rt *initdb.Runtime
@@ -957,9 +988,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if rt != nil && rt.Recovery && !rt.Standby {
-		restoreCmd := stringGUC(registry, "restore_command", "")
-		logger.Info("archive recovery starting", "restore_command", restoreCmd)
-		recovered, err := xlog.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0)
+		logger.Info("archive recovery starting", "restore_command", stringGUC(registry, "restore_command", ""))
+		// restore_command is PGC_SIGHUP: each fetch first processes a
+		// pending reload (ProcessStartupProcInterrupts), then reads it.
+		recovered, err := xlog.RunArchiveRecoveryWith(rt.StorageMgr, rt.DataDir, func() string {
+			startupHup.process(registry, cfg.ConfigPath, *dataDir)
+			return stringGUC(registry, "restore_command", "")
+		}, 0)
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
 			return 1
@@ -1004,6 +1039,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.RecoveryLSNs = sc.recoveryLSNs
 	}
 
+	// A reload that arrived during startup is applied before the server
+	// starts; the server's own SIGHUP handler takes over from here.
+	startupHup.process(registry, cfg.ConfigPath, *dataDir)
 	srv := postmaster.New(cfg)
 	runErr := srv.Run(ctx)
 	cpCancel()
@@ -1393,6 +1431,18 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stderr, "goopg reload: %v\n", err)
 		return 1
+	}
+	// A server still in its startup phase (crash or archive recovery) has
+	// written the lock file but not yet bound the control socket, so its
+	// SocketPath line is empty: signal it directly, as pg_ctl reload always
+	// does (kill(pid, SIGHUP)). Its startup-phase handler applies the reload.
+	if pf.SocketPath == "" {
+		if err := syscall.Kill(pf.PID, syscall.SIGHUP); err != nil {
+			fmt.Fprintf(stderr, "goopg reload: could not send reload signal (PID: %d): %v\n", pf.PID, err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "goopg reload: configuration reload signalled")
+		return 0
 	}
 	reply, err := control.Send(pf.SocketPath, "RELOAD", 5*time.Second)
 	if err != nil {

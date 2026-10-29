@@ -112,6 +112,55 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 	}
 }
 
+// TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch pins that
+// restore_command (PGC_SIGHUP) is read before every archive fetch, as
+// RestoreArchivedFile reads recoveryRestoreCommand at each call: a reload
+// that changes it mid-recovery takes effect at the next fetch. The getter
+// hands out a failing command until the history probe has run and the
+// working one afterwards — a recovery that captured the first value would
+// restore nothing.
+func TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, recEnd, err := w.Append(make([]byte, 88))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	working := "cp " + filepath.Join(archive, "%f") + " %p"
+	calls := 0
+	getter := func() string {
+		calls++
+		if calls == 1 { // the 00000002.history probe
+			return "false"
+		}
+		return working
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecoveryWith(mgr, dataDir, getter, segSize)
+	if err != nil {
+		t.Fatalf("RunArchiveRecoveryWith: %v", err)
+	}
+	if res.EndOfLog != recEnd {
+		t.Errorf("EndOfLog = %X, want %X: the changed restore_command was not used", res.EndOfLog, recEnd)
+	}
+	// One read for the history probe, one per segment fetch (segment 0
+	// restored, segment 1 the end of the archive).
+	if calls < 3 {
+		t.Errorf("restore_command read %d times, want once per fetch (>= 3)", calls)
+	}
+}
+
 func TestRestoreArchivedFileEmptyCommand(t *testing.T) {
 	err := RestoreArchivedFile("", "/tmp", "000000010000000000000001")
 	if err == nil {

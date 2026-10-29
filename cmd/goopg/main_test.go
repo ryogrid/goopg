@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -677,5 +679,66 @@ func TestStartRecoverySignalWithoutRestoreCommandIsFatal(t *testing.T) {
 	}
 	if _, err := os.Stat(signal); err != nil {
 		t.Errorf("recovery.signal removed although the start was refused: %v", err)
+	}
+	// The data-directory lock taken before recovery is released on the
+	// FATAL exit, as the lock file's on_proc_exit unlink does.
+	if _, err := os.Stat(filepath.Join(dir, "postmaster.pid")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("postmaster.pid left behind by the refused start: %v", err)
+	}
+}
+
+// TestStartRefusesLiveDataDirLock pins CreateDataDirLockFile: a start on a
+// data directory whose postmaster.pid names a live process fails with PG's
+// FATAL and HINT before touching the directory — no crash recovery, no
+// checkpoint, the owner's lock file intact. Without the lock a second
+// server ran crash recovery against the live one's WAL, checkpointed into
+// it, overwrote its postmaster.pid and deleted it on exit.
+func TestStartRefusesLiveDataDirLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"init", "-D", dir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit=%d stderr=%q", code, stderr.String())
+	}
+	owner := exec.Command("sleep", "60")
+	if err := owner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = owner.Process.Kill()
+		_ = owner.Wait()
+	})
+	lockPath := filepath.Join(dir, "postmaster.pid")
+	lock := fmt.Sprintf("%d\n%s\n1700000000000\n127.0.0.1:5999\n%s\n", owner.Process.Pid, dir, filepath.Join(dir, ".s.goopg.ctl"))
+	if err := os.WriteFile(lockPath, []byte(lock), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctlBefore, err := os.ReadFile(filepath.Join(dir, "global", "pg_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"start", "-D", dir, "--listen", "127.0.0.1:0"}, &stdout, &stderr) }()
+	select {
+	case code := <-done:
+		if code != 1 {
+			t.Errorf("start exit=%d, want 1", code)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatalf("start did not refuse a data directory locked by a live process (stderr %q)", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `FATAL: lock file "postmaster.pid" already exists`) {
+		t.Errorf("stderr %q lacks PG's FATAL message", stderr.String())
+	}
+	wantHint := fmt.Sprintf(`HINT: Is another postmaster (PID %d) running in data directory "%s"?`, owner.Process.Pid, dir)
+	if !strings.Contains(stderr.String(), wantHint) {
+		t.Errorf("stderr %q lacks %q", stderr.String(), wantHint)
+	}
+	if got, _ := os.ReadFile(lockPath); string(got) != lock {
+		t.Errorf("live owner's postmaster.pid changed to %q", got)
+	}
+	if ctlAfter, _ := os.ReadFile(filepath.Join(dir, "global", "pg_control")); !bytes.Equal(ctlBefore, ctlAfter) {
+		t.Errorf("pg_control rewritten by the refused start")
 	}
 }
