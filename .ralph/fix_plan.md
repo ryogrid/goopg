@@ -3979,8 +3979,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       - Q72 SF0\.25 node lines with actuals 24 → 26 \(PG 26\)\. Test `TestExplainAnalyzeSharedPrebuildInputActuals`
         \(mutation\-checked; switches off only the runtime coop build\); \-race clean; gates PASS; census
         `routing\-20261029d` 22/22·99/99·99/99\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): SubPlan header annotation PG lacks;
-      expression\-level subqueries \(ARRAY\(\), row IN, multi\-assign SET, corr hash map\) uninstrumented; per\-worker
+    - Residual 1 done 2026\-10\-29 \(`04cc96f3b`\): the SubPlan/InitPlan label is PG's bare `SubPlan N` \(explain\.c
+      ExplainSubPlans\); goopg's `\(calls= rebuilds= rescans= hits= misses=\)` annotation dropped, counters kept in
+      `ctx\.SubPlanStats`\. Tests read them there\. Gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025
+      PASS=99; census `routing\-20261029e` 22/22·99/99·99/99\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): expression\-level subqueries \(ARRAY\(\), row IN, multi\-assign SET, corr hash map\) uninstrumented; per\-worker
       Memoize `Hits` lines; NLI probe Cond filter count; per\-site Buffers/WAL/memory\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
@@ -6686,6 +6689,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 re\-check 2026\-10\-29 — **exhausted at `56a368db9`**, census `routing\-20261029c/` reused \(`56a368db9` is
     ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - Census 2026\-10\-29 at `b93ad5337` \(M0122\-0021 slice 4 changed internal/executor\) — `routing\-20261029d/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `f15a1ac3c`**, census `routing\-20261029d/` reused \(`f15a1ac3c` is
+    ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `04cc96f3b` \(M0122\-0021 residual 1 changed internal/executor\) — `routing\-20261029e/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

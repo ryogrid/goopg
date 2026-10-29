@@ -173,8 +173,10 @@ serially as well as in parallel plans.
 
 ## Remaining residuals (each ledgered 2026-10-29)
 
-1. The SubPlan/InitPlan header carries goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)` annotation, which PG
-   does not print.
+1. ~~The SubPlan/InitPlan header carries goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)` annotation~~ —
+   dropped 2026-10-29 (`04cc96f3b`). PG prints the bare label (explain.c `ExplainSubPlans`), and the subtree's work now
+   shows through each node's own actuals. The counters stay in `ctx.SubPlanStats` for tests and diagnostics (they were
+   the correlated-subquery planning bundle's gate-V6 instrument).
 2. Expression-level subqueries built with `Build()` print no actuals: ARRAY(), row-constructor IN, multi-assignment
    SET, and the correlated hash map.
 3. Under a Gather, the Memoize `Hits:` line shows one site's counters. PG prints the leader line plus one
