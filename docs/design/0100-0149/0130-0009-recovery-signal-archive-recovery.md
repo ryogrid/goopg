@@ -320,3 +320,21 @@ archive's copy of the same segment also holds what the primary wrote afterwards.
   bytes are identical.
 - Start-time archive recovery takes no restartpoints.
 - Restored history files are kept in pg\_wal.
+
+## Update 2026-10-29 — the writer reopens replaced segments (M0122-0013, `6001f288f`)
+
+Archive recovery puts the archived copy of a segment in place by rename. The WAL writer opened by `initdb.Open`
+still held a descriptor for the replaced local tail segment. Promotion's `adoptRestoredWAL` appends, and anything
+else written there, therefore went to the orphaned inode. That was correct only because those bytes equalled the
+archived copy. PG opens no WAL for writing until recovery ends.
+
+**Fix:**
+- `Writer.ReopenSegmentFiles` flushes and then drops every cached segment descriptor, quiesced like
+  `SwitchTimeline`. The next write opens each segment by its path.
+- `promoteAfterRecovery` calls it before it reads the writer's end and appends the restored WAL.
+
+**Pin:** `TestReopenSegmentFilesWritesTheReplacedSegment` writes a record after the open segment was renamed over,
+and checks that it is in pg\_wal's file. It fails when the descriptors are kept.
+
+**Still open (ledgered):** start-time archive recovery takes no restartpoints, and restored history files are kept in
+pg\_wal.
