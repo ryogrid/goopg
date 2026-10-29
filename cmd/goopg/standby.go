@@ -775,6 +775,12 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	// one; otherwise the local WAL the writer holds ends the log.
 	var endLSN, prevRecPtr uint64
 	if rt.WAL != nil {
+		// Archive recovery may have replaced a segment the writer opened
+		// before recovery (the archived copy wins over pg_wal); from here on
+		// every write must reach the file now in pg_wal.
+		if err := rt.WAL.ReopenSegmentFiles(); err != nil {
+			return fmt.Errorf("promote after recovery: %w", err)
+		}
 		endLSN = rt.WAL.WrittenLSN()
 		_, prevRecPtr = rt.WAL.InsertPosition()
 	}

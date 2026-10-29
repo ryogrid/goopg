@@ -1,6 +1,7 @@
 package xlog
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -148,5 +149,57 @@ func TestEndOfRecoveryRecordRoundTrips(t *testing.T) {
 	endTime, thisTLI, prevTLI, walLevel, err := DecodeEndOfRecovery(dec.XLog.MainData)
 	if err != nil || endTime != 814_000_000_000_000 || thisTLI != 2 || prevTLI != 1 || walLevel != 1 {
 		t.Errorf("decoded (%d, %d, %d, %d, %v), want (814000000000000, 2, 1, 1)", endTime, thisTLI, prevTLI, walLevel, err)
+	}
+}
+
+// TestReopenSegmentFilesWritesTheReplacedSegment pins Writer.ReopenSegmentFiles:
+// once a segment the writer has open is replaced by rename — archive recovery
+// putting the archived copy in place (KeepFileRestoredFromArchive) — the next
+// write must land in the file now under that name. Without dropping the
+// cached descriptor it lands in the orphaned inode and is gone from pg_wal.
+func TestReopenSegmentFilesWritesTheReplacedSegment(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(Config{WALDir: dir, SegmentSize: DefaultSegmentSize, SystemID: 1, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	_, end, err := w.Append([]byte("before-recovery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	seg := filepath.Join(dir, FormatSegmentNameTLI(0, 1))
+	orig, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The "archived copy": same bytes, renamed over the open segment.
+	tmp := filepath.Join(dir, RecoveryXLogName)
+	if err := os.WriteFile(tmp, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.ReopenSegmentFiles(); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("written-after-recovery")
+	_, end2, err := w.Append(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end2); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(got[:end2], payload) {
+		t.Fatal("the record written after the segment was replaced is not in pg_wal's file")
 	}
 }
