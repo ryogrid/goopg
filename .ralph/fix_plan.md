@@ -3927,6 +3927,29 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - PG prints each node's own `\(actual … loops=…\)` everywhere, CTE bodies included \(ExplainNode recurses into
     `planstate\->initPlan` / CTE subplans with their own Instrumentation\); goopg's CTE body nodes are built lazily outside
     the instrumentation scope \(ledger 2026\-07\-04 M0122\-0003 rows describe the DML\-CTE variant\)\.
+  - Slice 1 done 2026\-10\-29 \(`fc4b696a3`\): worker instrumentation is aggregated onto the node line\.
+    - `aggregateWorkerInstrumentation` \(internal/executor/instrument\.go\) folds every site's counters \(workers \+
+      leader\) into one node entry before rendering — PG's InstrAggNode \(instrument\.c\) via
+      ExecParallelRetrieveInstrumentation; `Worker N:` lines print only with VERBOSE, never for the leader slot,
+      skip zero\-loop sites, honour TIMING OFF, and subtract the probe share per site \(`paramProbeRejectedAtSite`\)\.
+    - Q72 SF0\.25 \(private clone `tmp/q64\-clone` :5592\): node lines with actuals 8 → 24 of PG's 26; the inventory line
+      is identical to PG \(`actual rows=9\.88 loops=2185`, `Rows Removed by Filter: 191`\)\. Captures
+      `analysis/m0122/m0122\-0021/q72\-goopg\-slice1\{,\-verbose\}\.explain`\.
+    - Tests: `TestAggregateWorkerInstrumentationSumsSites`, `TestExplainAnalyzeParallelNodeLineAggregatesSites`;
+      `TestExplainAnalyzeParallelWorkerLinesShape` now runs under VERBOSE\.
+    - Gates: units, tpch\-spotcheck \(Q12=2, Q13=35\), tpch\-acceptance\-arm \(24 MATCH\), tpcds\-sf025 sweep PASS \(PLAN\-SHAPE same=99\)\.
+    - Design: `docs/design/0100\-0149/m0122\-0021\-worker\-instrumentation\-aggregate\.md`\.
+    - Movement \(slice\): yes — Q72 SF0\.25 EXPLAIN ANALYZE node lines with actuals 8→24 \(PG 26\)\.
+  - Remaining slices \(each ledgered 2026\-10\-29\), in order:
+    - Slice 2 — Memoize below a Gather: Q72's Memoize and its `date\_dim d1` probe have no entry in any site table
+      \(PG `actual rows=0\.19 loops=61015` plus per\-worker `Hits` lines\)\. First step: find why the Memoize arm's
+      operator is not wrapped by `maybeInstrument` under a per\-site scope\.
+    - Slice 3 — CTE bodies and InitPlans \(serial too, loop \#261 correction above\)\.
+    - Slice 4 — shared hash build input: `prebuildSharedHashJoins` builds the inner once from a nil\-scope tree, so
+      every site reports loops=0 and the Hash line shows no actuals \(PG `rows=1200\.00 loops=4`, one build per
+      participant\); needs a design call — goopg does the work once\.
+    - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\); `\(never executed\)` for
+      nloops = 0 not printed\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
