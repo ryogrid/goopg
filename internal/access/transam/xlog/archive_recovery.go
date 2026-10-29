@@ -117,28 +117,40 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 		startTLI = cd.CheckPointCopyThisTLI
 		lastRestartPointFname = XLogFileName(cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo/uint64(segmentSize), segmentSize)
 	}
-	// have reports whether name is in pg_wal or was restored into it. A
-	// shutdown request or a FATAL restore failure is returned as the error.
-	have := func(name string) (bool, error) {
+	// have reports whether name was restored from the archive or, failing
+	// that, is in pg_wal — XLogFileReadAnyTLI tries XLOG_FROM_ARCHIVE
+	// before XLOG_FROM_PG_WAL because the local copy may be an old or
+	// partly-filled version restored with the base backup; a restored copy
+	// replaces it. A shutdown request or a FATAL restore failure is
+	// returned as the error.
+	have := func(name, recoverName string, expectedSize int64) (bool, error) {
 		if ctx.Err() != nil {
 			return false, ErrRecoveryShutdown
+		}
+		if cmd := restoreCommand(); cmd != "" {
+			err := RestoreArchivedFileContext(ctx, cmd, walDir, name, recoverName, expectedSize, lastRestartPointFname)
+			if err == nil {
+				return true, nil
+			}
+			var fatal *RestoreFatalError
+			if errors.Is(err, ErrRecoveryShutdown) || errors.As(err, &fatal) {
+				return false, err
+			}
 		}
 		if _, err := os.Stat(filepath.Join(walDir, name)); err == nil {
 			return true, nil
 		}
-		err := RestoreArchivedFileContext(ctx, restoreCommand(), walDir, name, lastRestartPointFname)
-		if err == nil {
-			return true, nil
-		}
-		var fatal *RestoreFatalError
-		if errors.Is(err, ErrRecoveryShutdown) || errors.As(err, &fatal) {
-			return false, err
-		}
 		return false, nil
 	}
+	// FinishWalRecovery: a partial RECOVERYXLOG or a leftover
+	// RECOVERYHISTORY is removed when archive recovery ends.
+	defer func() {
+		_ = os.Remove(filepath.Join(walDir, RecoveryXLogName))
+		_ = os.Remove(filepath.Join(walDir, RecoveryHistoryName))
+	}()
 	res.NewestTLI = startTLI
 	for probe := startTLI + 1; ; probe++ {
-		ok, err := have(TimelineHistoryFileName(probe))
+		ok, err := have(TimelineHistoryFileName(probe), RecoveryHistoryName, 0)
 		if err != nil {
 			return res, fmt.Errorf("wal: archive recovery: %w", err)
 		}
@@ -182,7 +194,7 @@ func RunArchiveRecoveryWith(ctx context.Context, mgr *storage.Manager, dataDir s
 			if sp.Begin != 0 && seg < sp.Begin/uint64(segmentSize) {
 				continue // the segment predates this timeline
 			}
-			ok, err := have(FormatSegmentNameTLI(seg, sp.TLI))
+			ok, err := have(FormatSegmentNameTLI(seg, sp.TLI), RecoveryXLogName, segmentSize)
 			if err != nil {
 				return res, fmt.Errorf("wal: archive recovery: %w", err)
 			}

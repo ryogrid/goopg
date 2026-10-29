@@ -937,3 +937,152 @@ func assertEndOfRecoveryCheckpoint(t *testing.T, dataDir string, segSize int64, 
 			cd.CheckPointCopyThisTLI, cd.CheckPointCopyPrevTLI, cd.State, newTLI, oldTLI)
 	}
 }
+
+// TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment pins
+// XLogFileReadAnyTLI's archive-before-pg_wal order. A base backup's last
+// local segment holds WAL only up to the backup's end; the archive's copy
+// of the same segment holds what the primary wrote after it. goopg read
+// the local copy, so recovery skipped the rest of that segment — then
+// replayed later segments past the gap and promoted at the gap, losing
+// every record in it. PG prefers the archived copy (the local one "could
+// be an old, un-filled or partly-filled version"), restores it through
+// RECOVERYXLOG and replaces the local file with it.
+func TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	archive := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segSize := uint64(rt.WAL.SegmentSize())
+	walDir := filepath.Join(dir, "pg_wal")
+	payload := make([]byte, 4000)
+	for i := 0; i < 8; i++ {
+		if _, _, err := rt.WAL.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backupEnd := rt.WAL.WrittenLSN()
+	if err := rt.WAL.FlushUpTo(backupEnd); err != nil {
+		t.Fatal(err)
+	}
+	tli := rt.WAL.TimelineID()
+	tailSeg := backupEnd / segSize
+	tailName := xlog.FormatSegmentNameTLI(tailSeg, tli)
+	partial, err := os.ReadFile(filepath.Join(walDir, tailName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The primary keeps writing after the backup: the rest of the tail
+	// segment and into the next one.
+	for rt.WAL.WrittenLSN() < (tailSeg+1)*segSize+8000 {
+		if _, _, err := rt.WAL.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	trueEnd := rt.WAL.WrittenLSN()
+	if err := rt.WAL.FlushUpTo(trueEnd); err != nil {
+		t.Fatal(err)
+	}
+	rt.SetImmediateShutdown() // no shutdown checkpoint: pg_control stays before backupEnd
+	rt.Close()
+
+	// The archive gets every segment; pg_wal keeps the backup's partial
+	// copy of the tail segment and nothing after it.
+	ents, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if _, seg, ok := xlog.ParseXLogFileName(e.Name(), 0); ok {
+			data, err := os.ReadFile(filepath.Join(walDir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(archive, e.Name()), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if seg > tailSeg {
+				if err := os.Remove(filepath.Join(walDir, e.Name())); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(walDir, tailName), partial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "recovery.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open replays the local WAL as part of the archive recovery and writes
+	// no WAL of its own: no end-of-crash-recovery checkpoint record may land
+	// at the local end, where the archived copy holds the primary's WAL.
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cd, err := control.ReadControlFile(dir); err != nil || cd == nil || cd.State != control.DBStateInArchiveRecovery {
+		rt.Close()
+		t.Fatalf("pg_control during recovery.signal recovery = %+v, %v; want DB_IN_ARCHIVE_RECOVERY", cd, err)
+	}
+	if got := rt.WAL.WrittenLSN(); got != backupEnd {
+		rt.Close()
+		t.Fatalf("precondition: local WAL ends at %X, want the backup end %X", got, backupEnd)
+	}
+	recovered, err := xlog.RunArchiveRecovery(rt.StorageMgr, dir, "cp "+filepath.Join(archive, "%f")+" %p", int64(segSize))
+	if err != nil {
+		rt.Close()
+		t.Fatal(err)
+	}
+	if recovered.EndOfLog != trueEnd {
+		rt.Close()
+		t.Fatalf("archive recovery ended at %X, want %X: the WAL after the backup end in segment %s was skipped",
+			recovered.EndOfLog, trueEnd, tailName)
+	}
+	// The segment replayed — and now in pg_wal — is the archived copy: its
+	// records run past the backup end. With the local copy preferred, the
+	// rest of the segment was skipped while the next segment's records were
+	// still replayed after the gap, so EndOfLog alone cannot tell.
+	archivedTail, err := os.ReadFile(filepath.Join(archive, tailName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(walDir, tailName)); !bytes.Equal(got, archivedTail) {
+		t.Errorf("pg_wal's %s is not the archived copy after archive recovery", tailName)
+	}
+	tailRecs, err := xlog.ReadSegmentRecords(walDir, tailSeg, int64(segSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tailRecs) == 0 || tailRecs[len(tailRecs)-1].EndLSN <= backupEnd {
+		t.Errorf("segment %s replays only up to the backup end %X", tailName, backupEnd)
+	}
+	for _, tmp := range []string{xlog.RecoveryXLogName, xlog.RecoveryHistoryName} {
+		if _, err := os.Stat(filepath.Join(walDir, tmp)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left in pg_wal after archive recovery: %v", tmp, err)
+		}
+	}
+	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{Recovery: recovered}, logger); err != nil {
+		rt.Close()
+		t.Fatalf("promoteAfterRecovery: %v", err)
+	}
+	newTLI := rt.WAL.TimelineID()
+	if cd, err := control.ReadControlFile(dir); err != nil || cd == nil || cd.State != control.DBStateInProduction {
+		t.Errorf("pg_control after promotion = %+v, %v; want DB_IN_PRODUCTION", cd, err)
+	}
+	rt.Close()
+	rt, err = initdb.Open(initdb.OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("reopen after promotion: %v", err)
+	}
+	defer rt.Close()
+	if rt.WAL.TimelineID() != newTLI || rt.WAL.WrittenLSN() <= trueEnd {
+		t.Errorf("after restart: TLI %d end %X, want TLI %d past %X", rt.WAL.TimelineID(), rt.WAL.WrittenLSN(), newTLI, trueEnd)
+	}
+}

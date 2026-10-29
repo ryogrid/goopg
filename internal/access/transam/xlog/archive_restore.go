@@ -39,21 +39,40 @@ type RestoreFatalError struct{ Msg string }
 
 func (e *RestoreFatalError) Error() string { return e.Msg }
 
-// RestoreArchivedFile is RestoreArchivedFileContext without cancellation
-// and with %r expanding to the zero restart-point file name.
+// RecoveryXLogName and RecoveryHistoryName are the fixed names
+// RestoreArchivedFile restores a WAL segment / timeline history file under
+// before it replaces the pg_wal copy ("RECOVERYXLOG" / "RECOVERYHISTORY"):
+// a failed or wrong restore never touches the local file.
+const (
+	RecoveryXLogName    = "RECOVERYXLOG"
+	RecoveryHistoryName = "RECOVERYHISTORY"
+)
+
+// RestoreArchivedFile is RestoreArchivedFileContext without cancellation,
+// restoring through RECOVERYXLOG with no size check and %r expanding to
+// the zero restart-point file name.
 func RestoreArchivedFile(restoreCommand, walDir, segmentName string) error {
-	return RestoreArchivedFileContext(context.Background(), restoreCommand, walDir, segmentName, XLogFileName(0, 0, DefaultSegmentSize))
+	return RestoreArchivedFileContext(context.Background(), restoreCommand, walDir, segmentName, RecoveryXLogName, 0, XLogFileName(0, 0, DefaultSegmentSize))
 }
 
-// RestoreArchivedFileContext shells out to restoreCommand to fetch the
-// named WAL file into walDir, as upstream's RestoreArchivedFile
-// (xlogarchive.c) does. BuildRestoreCommand's placeholders apply: %f is the
-// file name, %p the destination path, %r lastRestartPointFname (the file
-// holding the oldest restartpoint's redo), %% a literal percent; any other
-// placeholder is a FATAL invalid value.
+// RestoreArchivedFileContext fetches xlogfname from the archive with
+// restoreCommand and, on success, makes it the pg_wal copy — upstream's
+// RestoreArchivedFile (xlogarchive.c) followed by
+// KeepFileRestoredFromArchive:
+//   - the command restores into walDir/recoverName (any leftover file of
+//     that name is removed first), so a failed or inappropriate restore
+//     never overwrites the local copy;
+//   - BuildRestoreCommand's placeholders apply: %f is xlogfname, %p the
+//     recoverName path, %r lastRestartPointFname (the file holding the
+//     oldest restartpoint's redo), %% a literal percent; any other
+//     placeholder is a FATAL invalid value;
+//   - a restored file whose size is not expectedSize (when > 0) is FATAL
+//     ("archive file ... has wrong size"): plowing on would mistake it for
+//     the end of WAL;
+//   - the restored file is renamed over walDir/xlogfname, replacing any
+//     local copy, and the directory is synced (durable_rename).
 //
-// It returns nil when the command exits zero and the file exists. A
-// failure is classified as upstream does:
+// A failure is classified as upstream does:
 //   - ctx cancelled while the command runs, or the child killed by SIGTERM
 //     (or the shell's exit 128+SIGTERM): ErrRecoveryShutdown. Cancelling
 //     sends SIGTERM to the command's process group, as the postmaster
@@ -62,18 +81,21 @@ func RestoreArchivedFile(restoreCommand, walDir, segmentName string) error {
 //     not executable): *RestoreFatalError, "could not restore file ... from
 //     archive: <wait_result_to_str>".
 //   - otherwise (the archive does not have the file): a plain error — the
-//     normal end of archive recovery.
-func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, segmentName, lastRestartPointFname string) error {
+//     caller falls back to pg_wal, or this is the normal end of recovery.
+func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, xlogfname, recoverName string, expectedSize int64, lastRestartPointFname string) error {
 	if restoreCommand == "" {
 		return fmt.Errorf("wal: restore_command is not configured")
 	}
 	if ctx.Err() != nil {
 		return ErrRecoveryShutdown
 	}
-	destPath := filepath.Join(walDir, segmentName)
+	recoverPath := filepath.Join(walDir, recoverName)
+	if err := os.Remove(recoverPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return &RestoreFatalError{Msg: fmt.Sprintf("could not remove file \"%s\": %v", recoverPath, err)}
+	}
 	cmd, err := ReplacePercentPlaceholders(restoreCommand, "restore_command", map[byte]string{
-		'f': segmentName,
-		'p': destPath,
+		'f': xlogfname,
+		'p': recoverPath,
 		'r': lastRestartPointFname,
 	})
 	if err != nil {
@@ -95,11 +117,18 @@ func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, seg
 		return ErrRecoveryShutdown
 	}
 	if runErr == nil {
-		if _, err := os.Stat(destPath); err != nil {
+		st, err := os.Stat(recoverPath)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("wal: restore_command succeeded but %s not found: %w", destPath, err)
+				return fmt.Errorf("wal: restore_command returned a zero exit status, but %s does not exist", recoverPath)
 			}
-			return &RestoreFatalError{Msg: fmt.Sprintf("could not stat file \"%s\": %v", destPath, err)}
+			return &RestoreFatalError{Msg: fmt.Sprintf("could not stat file \"%s\": %v", recoverPath, err)}
+		}
+		if expectedSize > 0 && st.Size() != expectedSize {
+			return &RestoreFatalError{Msg: fmt.Sprintf("archive file \"%s\" has wrong size: %d instead of %d", xlogfname, st.Size(), expectedSize)}
+		}
+		if err := keepFileRestoredFromArchive(walDir, recoverPath, xlogfname); err != nil {
+			return &RestoreFatalError{Msg: err.Error()}
 		}
 		return nil
 	}
@@ -107,9 +136,32 @@ func RestoreArchivedFileContext(ctx context.Context, restoreCommand, walDir, seg
 		return ErrRecoveryShutdown
 	}
 	if waitResultIsAnySignal(runErr) {
-		return &RestoreFatalError{Msg: fmt.Sprintf("could not restore file \"%s\" from archive: %s", segmentName, waitResultToStr(runErr))}
+		return &RestoreFatalError{Msg: fmt.Sprintf("could not restore file \"%s\" from archive: %s", xlogfname, waitResultToStr(runErr))}
 	}
-	return fmt.Errorf("wal: could not restore file \"%s\" from archive: %s", segmentName, waitResultToStr(runErr))
+	return fmt.Errorf("wal: could not restore file \"%s\" from archive: %s", xlogfname, waitResultToStr(runErr))
+}
+
+// keepFileRestoredFromArchive is KeepFileRestoredFromArchive's file
+// handling: the restored file replaces walDir/xlogfname (rename over any
+// local copy), made durable by syncing the file and the directory. goopg
+// has no WAL archiver, so there is no .done status file to force.
+func keepFileRestoredFromArchive(walDir, recoverPath, xlogfname string) error {
+	target := filepath.Join(walDir, xlogfname)
+	if f, err := os.Open(recoverPath); err == nil {
+		serr := f.Sync()
+		_ = f.Close()
+		if serr != nil {
+			return fmt.Errorf("could not fsync file \"%s\": %v", recoverPath, serr)
+		}
+	}
+	if err := os.Rename(recoverPath, target); err != nil {
+		return fmt.Errorf("could not rename file \"%s\" to \"%s\": %v", recoverPath, target, err)
+	}
+	if d, err := os.Open(walDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // waitResultIsSignal is wait_result_is_signal (src/common/wait_error.c):

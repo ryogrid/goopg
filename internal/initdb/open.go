@@ -420,11 +420,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// goopg and to anything reading the control file mid-replay.
 	// A standby's recovery is archive recovery (standby.signal is upstream's
 	// ArchiveRecoveryRequested), and pg_control says so (M0122-0013).
-	startStandby := false
+	// recovery.signal is ArchiveRecoveryRequested too: crash replay and the
+	// archive recovery that follows are one recovery, so pg_control shows
+	// DB_IN_ARCHIVE_RECOVERY from the start, as StartupXLOG stamps it.
+	startStandby, startRecovery := false, false
 	if abs != "" {
 		startStandby, _ = IsStandby(abs)
+		startRecovery, _ = IsRecovery(abs)
 	}
-	recov, err := beginRecovery(abs, startStandby)
+	recov, err := beginRecovery(abs, startStandby || startRecovery)
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
@@ -2791,7 +2795,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// but it must not append its own checkpoint records to the primary-owned
 	// WAL stream.  Its reconnect LSN is the received WAL tail, so a local
 	// marker would corrupt the stream position after a clean restart.
-	cp.SetRecoveryMode(standby)
+	//
+	// recovery.signal's archive recovery is recovery too: no checkpoint
+	// record may be written before it ends — the end-of-crash-recovery
+	// checkpoint below becomes a restartpoint flush, and a WAL record
+	// written at the local end would sit where the archived copy of that
+	// segment (which archive recovery prefers) holds the primary's WAL.
+	// The promotion leaves recovery mode before its end-of-recovery
+	// checkpoint.
+	cp.SetRecoveryMode(standby || recovery)
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -3043,7 +3055,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// DB_IN_PRODUCTION only at the end of StartupXLOG, after promotion
 	// (M0122-0013). goopg stamped DB_IN_PRODUCTION on a standby too.
 	stamp := stampInProduction
-	if standby {
+	if standby || recovery {
 		stamp = stampInArchiveRecovery
 	}
 	if err := stamp(abs); err != nil {

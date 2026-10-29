@@ -806,8 +806,22 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	}); err != nil {
 		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
 	}
+	// Archive recovery ran with recovery-mode checkpoints (no WAL records);
+	// the end-of-recovery checkpoint on the new timeline is a real one.
+	if rt.Checkpointer != nil {
+		rt.Checkpointer.SetRecoveryMode(false)
+	}
 	if err := endArchiveRecoveryOnNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, end.WalLevel); err != nil {
 		return fmt.Errorf("promote after recovery: %w", err)
+	}
+	// Recovery is over: DB_IN_ARCHIVE_RECOVERY → DB_IN_PRODUCTION, as the end
+	// of StartupXLOG stamps it (the end-of-recovery checkpoint already does
+	// when there is a checkpointer).
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("promote after recovery: stamp pg_control DB_IN_PRODUCTION: %w", err)
 	}
 
 	// CleanupAfterArchiveRecovery runs recovery_end_command once archive

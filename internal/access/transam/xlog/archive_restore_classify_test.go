@@ -37,7 +37,7 @@ func TestRestoreArchivedFileFailureClassification(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := RestoreArchivedFileContext(context.Background(), c.cmd, t.TempDir(), seg, "000000010000000000000000")
+			err := RestoreArchivedFileContext(context.Background(), c.cmd, t.TempDir(), seg, RecoveryXLogName, 0, "000000010000000000000000")
 			var fatal *RestoreFatalError
 			switch {
 			case err == nil:
@@ -67,7 +67,7 @@ func TestRestoreArchivedFilePlaceholders(t *testing.T) {
 	const seg, rp = "000000010000000000000003", "000000010000000000000002"
 	out := filepath.Join(dir, "expanded")
 	cmd := `echo "%r|%%|%f" > ` + out + ` && touch %p`
-	if err := RestoreArchivedFileContext(context.Background(), cmd, dir, seg, rp); err != nil {
+	if err := RestoreArchivedFileContext(context.Background(), cmd, dir, seg, RecoveryXLogName, 0, rp); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	got, err := os.ReadFile(out)
@@ -92,7 +92,7 @@ func TestRestoreArchivedFileShutdownKillsCommand(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		done <- RestoreArchivedFileContext(ctx, cmd, dir, "000000010000000000000001", "000000010000000000000000")
+		done <- RestoreArchivedFileContext(ctx, cmd, dir, "000000010000000000000001", RecoveryXLogName, 0, "000000010000000000000000")
 	}()
 	var sleepPID int
 	for deadline := time.Now().Add(10 * time.Second); sleepPID == 0; {
@@ -163,4 +163,56 @@ func TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown(t *testing.T) {
 			t.Fatalf("err = %v, want ErrRecoveryShutdown", err)
 		}
 	})
+}
+
+// TestRestoreArchivedFileThroughRecoveryXLog pins RestoreArchivedFile's
+// temporary name and KeepFileRestoredFromArchive:
+//   - a restore that fails (here after writing junk to %p) leaves the local
+//     pg_wal copy untouched, because %p is RECOVERYXLOG, not the segment;
+//   - a restored file of the wrong size is FATAL ("archive file ... has
+//     wrong size") rather than a short segment mistaken for the end of WAL;
+//   - a good restore replaces the local copy.
+func TestRestoreArchivedFileThroughRecoveryXLog(t *testing.T) {
+	const seg = "000000010000000000000004"
+	const size = 1 << 16
+	dir := t.TempDir()
+	local := filepath.Join(dir, seg)
+	if err := os.WriteFile(local, make([]byte, size), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := func(cmd string) error {
+		return RestoreArchivedFileContext(context.Background(), cmd, dir, seg, RecoveryXLogName, size, "000000010000000000000000")
+	}
+
+	if err := restore("echo junk > %p; exit 1"); err == nil || errors.Is(err, ErrRecoveryShutdown) {
+		t.Fatalf("failed restore: err = %v, want the end-of-archive error", err)
+	}
+	if got, _ := os.ReadFile(local); len(got) != size || got[0] != 0 {
+		t.Fatalf("a failed restore changed the local copy (len %d)", len(got))
+	}
+
+	err := restore("echo short > %p")
+	var fatal *RestoreFatalError
+	if !errors.As(err, &fatal) || fatal.Msg != `archive file "`+seg+`" has wrong size: 6 instead of 65536` {
+		t.Fatalf("short restore: err = %v, want the wrong-size FATAL", err)
+	}
+	if got, _ := os.ReadFile(local); len(got) != size {
+		t.Fatalf("a wrong-size restore replaced the local copy (len %d)", len(got))
+	}
+
+	archived := filepath.Join(t.TempDir(), seg)
+	full := make([]byte, size)
+	full[0] = 0xAB
+	if err := os.WriteFile(archived, full, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restore("cp " + archived + " %p"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(local); len(got) != size || got[0] != 0xAB {
+		t.Fatalf("the restored copy did not replace the local one")
+	}
+	if _, err := os.Stat(filepath.Join(dir, RecoveryXLogName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("RECOVERYXLOG left behind: %v", err)
+	}
 }
