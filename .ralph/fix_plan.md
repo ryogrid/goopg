@@ -4217,6 +4217,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\_target\_timeline 'current' / numeric targets LANDED 2026\-10\-29 \(`4caa86ca8`\)**\. Movement: none —
+    recovery path\. validateRecoveryParameters / check\_recovery\_target\_timeline; goopg always followed 'latest'\.
+    - `misc\.ParseRecoveryTargetTimeline` \+ check hook; `RunArchiveRecoveryWith\(…, target\)`; NewestTLI stays
+      findNewestTimeLine\(target\)\.
+    - Pins: `TestRunArchiveRecoveryTargetTimeline`, `TestParseRecoveryTargetTimeline` \(mutation\-checked\)\. Gates:
+      units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): standby follows only the newest timeline; empty value reads as 'latest'; "not a child"
+      errdetail\.
   - **The writer reopens segments archive recovery replaced LANDED 2026\-10\-29 \(`6001f288f`\)**\. Movement: none —
     promotion path\. KeepFileRestoredFromArchive renames the archived copy over the local segment; the writer's
     descriptor still named the replaced inode \(PG opens no WAL for writing until recovery ends\)\.

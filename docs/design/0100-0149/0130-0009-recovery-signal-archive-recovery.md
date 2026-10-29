@@ -338,3 +338,25 @@ and checks that it is in pg\_wal's file. It fails when the descriptors are kept.
 
 **Still open (ledgered):** start-time archive recovery takes no restartpoints, and restored history files are kept in
 pg\_wal.
+
+## Update 2026-10-29 — recovery\_target\_timeline 'current' and numeric targets (M0122-0013, `4caa86ca8`)
+
+goopg registered `recovery_target_timeline` but always followed 'latest'.
+- `misc.ParseRecoveryTargetTimeline` and the GUC's check hook port `check_recovery_target_timeline`:
+  - "current" and "latest" are taken by name;
+  - anything else is read as `strtoul(s, NULL, 0)` (prefix base, longest digit prefix, 0 when there is none);
+  - only an overflow is rejected, with PG's errdetail.
+- `RunArchiveRecoveryWith` takes the target, following `validateRecoveryParameters`:
+  - 'current' follows pg\_control's timeline;
+  - a numeric N follows N's history, and is FATAL "recovery target timeline N does not exist" when N≠1 has no history
+    file;
+  - for every target, the start timeline must be on the target's history.
+- `NewestTLI` is still `findNewestTimeLine(target)`, so the promotion's new timeline cannot collide with an archived
+  one. `TargetTLI` is reported.
+
+**Pins:** `TestRunArchiveRecoveryTargetTimeline` and `TestParseRecoveryTargetTimeline` (mutation-checked).
+
+**Still open (ledgered):**
+- A standby follows only the newest timeline.
+- An empty value reads as 'latest'.
+- The "not a child" FATAL lacks PG's errdetail.
