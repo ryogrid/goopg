@@ -656,12 +656,21 @@ func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
 	if err := promoteAfterRecovery(rt, archiveRecoveryEnd{EndOfLog: endOfLog, LastStart: lastStart}, logger); err != nil {
 		t.Fatalf("promoteAfterRecovery: %v", err)
 	}
-	after, err := os.ReadFile(restoredName)
-	if err != nil {
-		t.Fatalf("restored segment %s gone after promotion: %v", restoredName, err)
-	}
-	if !bytes.Equal(before, after) {
+	// The end-of-recovery checkpoint may legitimately retire the restored
+	// segment (it lies below the new redo); if it is still there, promotion
+	// must not have rewritten it.
+	if after, err := os.ReadFile(restoredName); err == nil && !bytes.Equal(before, after) {
 		t.Errorf("restored old-timeline segment %s was rewritten by promotion", filepath.Base(restoredName))
+	}
+	// PerformRecoveryXLogAction's end-of-recovery checkpoint: pg_control's
+	// checkpoint copy is on the new timeline and its redo lies past EndOfLog.
+	cd, err := control.ReadControlFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cd.CheckPointCopyThisTLI != oldTLI+1 || cd.CheckPointCopyRedo < endOfLog {
+		t.Errorf("pg_control checkpoint = TLI %d redo %X, want the end-of-recovery checkpoint on TLI %d past EndOfLog %X",
+			cd.CheckPointCopyThisTLI, cd.CheckPointCopyRedo, oldTLI+1, endOfLog)
 	}
 	if got := rt.WAL.TimelineID(); got != oldTLI+1 {
 		t.Errorf("writer timeline = %d after promotion, want %d", got, oldTLI+1)
@@ -698,5 +707,44 @@ func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
 	}
 	if got := rt2.WAL.WrittenLSN(); got < postEnd {
 		t.Errorf("reopened WAL ends at %X, before the post-promotion WAL's end %X", got, postEnd)
+	}
+}
+
+// TestStandbyControllerPromoteTakesCheckpoint pins the checkpoint StartupXLOG
+// requests after a promotion (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c):
+// once the writer is on the new timeline, a checkpoint moves pg_control's
+// checkpoint copy onto it, so a crash after promotion replays from there and
+// not from the last restartpoint.
+func TestStandbyControllerPromoteTakesCheckpoint(t *testing.T) {
+	dataDir := initStandbyDir(t)
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := startStandby(parent, rt, nil, logger)
+	defer sc.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	oldTLI := rt.WAL.TimelineID()
+	before := rt.Checkpointer.LastCheckpointLSN()
+	if err := sc.Promote(context.Background()); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if got := rt.WAL.TimelineID(); got != oldTLI+1 {
+		t.Fatalf("precondition: writer timeline = %d after promotion, want %d", got, oldTLI+1)
+	}
+	if after := rt.Checkpointer.LastCheckpointLSN(); after <= before {
+		t.Errorf("no checkpoint after promotion: last checkpoint %X, before %X", after, before)
+	}
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cd.CheckPointCopyThisTLI != oldTLI+1 {
+		t.Errorf("pg_control checkpoint copy TLI = %d after promotion, want %d", cd.CheckPointCopyThisTLI, oldTLI+1)
 	}
 }
