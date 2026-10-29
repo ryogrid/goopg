@@ -763,3 +763,26 @@ standby with `hot_standby = on` accepts them.
 Still different: PG with `hot_standby = on` also refuses connections until recovery reaches consistency or the
 recovery snapshot is ready ("the database system is not yet accepting connections"). goopg's standby accepts reads
 as soon as it starts (ledgered).
+
+## Update 2026-10-30 — hot standby waits for a consistent recovery state (M0122-0013, `8527ab50e`)
+
+With `hot_standby = on`, PG's postmaster stays in PM\_RECOVERY until the startup process reaches a consistent recovery
+state (`CheckRecoveryConsistency` → `PMSIGNAL_BEGIN_HOT_STANDBY`). Until then `canAcceptConnections` returns
+CAC\_NOTHOTSTANDBY for every connection, normal or replication: FATAL 57P03 "the database system is not yet accepting
+connections", with the detail "Consistent recovery state has not been yet reached.". goopg's standby accepted reads at
+once.
+
+- `standbyController` computes the consistency point from pg\_control as `InitWalRecovery` leaves it: `max(minRecoveryPoint,
+  checkpoint redo, backupEndPoint)`. A `backupEndRequired` backup never becomes consistent by position.
+- `Consistent()` latches once the replayed position passes that point, and logs "consistent recovery state reached at X/X".
+- `postmaster.Config.HotStandbyConsistent` drives the refusal, which sits right after the startup packet next to the
+  `hot_standby = off` refusal.
+- A base-backup standby is consistent as soon as replay passes the backup's redo point. The replication and promotion
+  end-to-end tests are unaffected.
+
+**Pins:** `TestHotStandbyNotConsistentRefusesConnections` and `TestStandbyConsistencyPoint`. Both were mutation-checked.
+
+**Still open (ledgered):**
+- The recovery-snapshot readiness wait (STANDBY\_SNAPSHOT\_READY from XLOG\_RUNNING\_XACTS).
+- `XLOG_BACKUP_END`, so `backupEndRequired` backups never become consistent.
+- `ReachedEndOfBackup`'s pg\_control update.

@@ -4244,6 +4244,14 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Hot standby waits for a consistent recovery state LANDED 2026\-10\-30 \(`8527ab50e`\)**\. Movement: none — connection
+    admission\. canAcceptConnections CAC\_NOTHOTSTANDBY in PM\_RECOVERY: FATAL 57P03 "not yet accepting connections" /
+    "Consistent recovery state has not been yet reached\."; goopg accepted reads at once\.
+    - consistency point = max\(minRecoveryPoint, checkpoint redo, backupEndPoint\); `standbyController\.Consistent`;
+      `Config\.HotStandbyConsistent`\.
+    - Pins: `TestHotStandbyNotConsistentRefusesConnections`, `TestStandbyConsistencyPoint` \(mutation\-checked\)\. Gates:
+      units, postmaster, replication/promotion E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): recovery\-snapshot readiness; XLOG\_BACKUP\_END; ReachedEndOfBackup pg\_control update\.
   - **Commit/abort records carry xact\_time LANDED 2026\-10\-30 \(`b1cc9d108`\)**\. Movement: none — WAL record body\.
     XactLogCommitRecord/XactLogAbortRecord store GetCurrentTransactionStopTimestamp; goopg wrote 0\.
     - `EncodeXactCommitPGWithRelsAt` / `EncodeXactAbortPGWithRelsAt`, `TimestampTzNow`; the initdb xact\-marker hook
