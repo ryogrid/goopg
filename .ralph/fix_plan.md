@@ -4142,6 +4142,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **recovery\_end\_command at the end of archive recovery LANDED 2026\-10\-29 \(`7911ddeda`\)**\. Movement: none —
+    recovery path\. CleanupAfterArchiveRecovery's first step: ExecuteRecoveryCommand with failOnSignal true, `%r` =
+    pg\_control checkPointCopy redo file; a signal \(or shell status \> 125\) is FATAL, any other failure a WARNING\.
+    - GUC registered \(string, '', PGC\_SIGHUP, sample line\); `ExecuteRecoveryCommand` returns the any\-signal
+      classification \(wait\_result\_is\_any\_signal\)\.
+    - Runs from the standby promotion \(before the DB\_IN\_PRODUCTION stamp\) and from `promoteAfterRecovery` \(before
+      recovery\.signal is removed, so a FATAL retries recovery on next start\)\.
+    - Pins: `TestExecuteRecoveryCommandSignalClassification`, `TestStandbyControllerPromoteRunsRecoveryEndCommand`,
+      `TestPromoteAfterRecoveryRunsRecoveryEndCommand`\.
+    - Gates: units, `\-race` xlog, misc, postmaster, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): RecoveryEndCommand wait event; RemoveNonParentXlogFiles and the old\-timeline `.partial`
+      rename; restore\_command context \(postmaster vs PGC\_SIGHUP\)\.
   - **Restartpoint runs archive\_cleanup\_command LANDED 2026\-10\-29 \(`9ef148c9e`\)**\. Movement: none — recovery
     path\. CreateRestartPoint's last step: ExecuteRecoveryCommand with `%r` = the oldest restartpoint's WAL file
     \(pg\_control checkPointCopy\.redo \+ TLI\); a failure is a WARNING\. The GUC was not registered at all; it now is

@@ -430,9 +430,47 @@ neither `SHOW` nor the restartpoint knew it. Now:
 Pins: `TestReplacePercentPlaceholders`; `TestRestartPointRunsArchiveCleanupCommand`, which checks that `%r` is segment
 3 for a redo in segment 3 and that the skip arm runs nothing.
 
-Still missing (ledgered): `recovery_end_command` is unregistered (it runs at the end of recovery with
-`failOnSignal` true); `restore_command` is registered as postmaster\-context where PG 18 has PGC\_SIGHUP; the
-command's `ArchiveCleanupCommand` wait event is not reported.
+Still missing (ledgered): ~~`recovery_end_command` is unregistered~~ — resolved 2026-10-29 (next section);
+`restore_command` is registered as postmaster\-context where PG 18 has PGC\_SIGHUP; the command's
+`ArchiveCleanupCommand` wait event is not reported.
+
+### recovery\_end\_command at the end of archive recovery \(2026\-10\-29, M0122\-0013\)
+
+PG runs `recovery_end_command` once archive recovery ends. `StartupXLOG` calls `CleanupAfterArchiveRecovery` (xlog.c)
+when `ArchiveRecoveryRequested`, after `PerformRecoveryXLogAction` and `XLogReportParameters` and before it stamps
+`DB_IN_PRODUCTION`. The command goes through `ExecuteRecoveryCommand` with `failOnSignal` true:
+- `%r` is the WAL file holding pg\_control's checkpoint-copy redo (`GetOldestRestartPoint`).
+- A command whose wait status `wait_result_is_any_signal(rc, true)` reports as signalled is FATAL. That covers a
+  signal-killed child and a shell exit above 125 (src/common/wait_error.c).
+- Any other failure is a WARNING.
+
+goopg ends archive recovery in two places. Both now run the command through `runRecoveryEndCommand`
+(cmd/goopg/standby.go):
+- **Standby promotion** (`standbyController` promote path): after the checkpointer leaves recovery mode, before the
+  `DB_IN_PRODUCTION` stamp. A FATAL fails the promotion. That promotion stays retryable, because the in-flight guard is
+  released on every exit.
+- **recovery.signal promotion** (`promoteAfterRecovery`): after the timeline switch, before `recovery.signal` is
+  removed. A FATAL aborts the start and leaves the signal file, so the next start retries recovery. That is the
+  restart PG's FATAL in the startup process implies.
+
+Other changes:
+- The GUC is registered as PG defines it (string, `''`, PGC\_SIGHUP), with its `postgresql.conf.sample` line.
+- `xlog.ExecuteRecoveryCommand` now also returns the any-signal classification (`waitResultIsAnySignal`).
+  `archive_cleanup_command` keeps WARNING for every failure (`failOnSignal` false).
+
+Pins:
+- `TestExecuteRecoveryCommandSignalClassification`: `exit 3` is a plain failure; `exit 127` and `kill -9 $$` count as
+  signals.
+- `TestStandbyControllerPromoteRunsRecoveryEndCommand`: checks `%r`, that a plain failure promotes, and that a signal
+  fails the promotion and leaves pg\_control out of production.
+- `TestPromoteAfterRecoveryRunsRecoveryEndCommand`: on success the signal file is removed; on a signal it is kept.
+
+A literal `%` in the command must be written `%%`, as in PG. The first version of the test tripped over this: its
+temp-dir name contained `%r`.
+
+Still missing (ledgered): no `RecoveryEndCommand` wait event; `RemoveNonParentXlogFiles` and the `.partial`
+renaming of the last old-timeline segment, which `CleanupAfterArchiveRecovery` performs after the command, are not
+ported.
 
 ### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
 
