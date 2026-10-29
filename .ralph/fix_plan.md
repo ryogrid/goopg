@@ -1048,6 +1048,27 @@ heuristic stays live.)
     fork point\.
   - Fix: InitWalRecovery's tliSwitchPoint and tliOfPointInHistory checks \(xlogrecovery\.c\)\.
   - Pin: `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork` \(fails with the fork check removed\)\.
+- [!] **P0\-E23 — a goopg standby loses replayed rows when it restarts after replaying its primary's shutdown checkpoint**
+  \(found 2026\-10\-30 by the loop inside M0122\-0013; S2 — data loss on the standby; NOT fixed\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  - > **ESCALATION 2026\-10\-30 \(S2, data loss\) — OWNER PLACEMENT NEEDED\.** Pre\-existing; unrelated to the
+    > timeline work that found it\. Held `[!]` with its root: M0122\-0013 is held under S4 \(see its escalation\),
+    > and an S2 waits for the owner's placement anyway\.
+  - Repro \(deterministic, 8 s\):
+    - PG 18\.3 primary A, goopg standby C made with pg\_basebackup\.
+    - INSERT row 1 \(in the backup\) and row 2 \(replayed by C\); C shows both\.
+    - Stop A \(fast; C receives A's shutdown checkpoint\), stop C \(fast\), start A, start C\.
+    - INSERT row 3: C shows rows 1 and 3, not row 2\.
+    - Without stopping A first \(no shutdown checkpoint replayed\), all three rows survive\.
+    - Probe source: `tmp/p0\-e23\-repro/zz\_probe\_standby\_restart\_test\.go\.txt` \(run it with
+      `ZZ\_STOP\_A\_FIRST=1`\); log `tmp/p0\-e23\-repro/run\.log`\.
+  - Observed: after the restart, replay starts at the end of the received WAL \(`standby mode: starting continuous WAL
+    replay start\_lsn=` = written\_lsn \+ 1\)\. Row 2's change is not re\-replayed, and it is not visible from disk\.
+  - Not yet ruled out: runRecoveryFlush flushes buffers and CLOG before adopting a restartpoint, so a plain flush gap is
+    unlikely\. Next suspects:
+    - what sets the continuous\-replay start on restart \(pg\_control redo vs the received end\);
+    - whether the shutdown checkpoint's replay changes xid/clog state, so that row 2's xmin reads as not committed\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -4243,7 +4264,41 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     - Movement: none — instrument artefact — EXPLAIN ANALYZE instrumentation is invisible to the plan instruments
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
-- [ ] **M0122-0013 — Physical/streaming replication & standby**.
+- [!] **M0122-0013 — Physical/streaming replication & standby**. HELD by the loop 2026\-10\-30 under S4 \(lineage
+  budget\)\.
+  - > **ESCALATION 2026\-10\-30 \(S4 lineage budget\) — OWNER DECISION NEEDED to re\-open \(a `LINEAGE\-BASELINE`
+    > re\-pin\) or to leave M0122\-0013 held\.** The commit guard rejected filing P0\-E23 under this root\. Its last five
+    > completed descendants, P0\-E18 … P0\-E22, are all `Movement: none`\. They were S2 recovery defects fixed in\-task,
+    > and no S3 instrument \(PG match count, CATEGORIES, ea\-ratchet, regress diff counts\) can see standby or recovery
+    > work\.
+    - What was attempted: 38 slices \(the LANDED entries below\)\. They port PG's standby, recovery and replication
+      lifecycle:
+      - restartpoints and recovery commands;
+      - archive recovery: targets, timelines, restore classification;
+      - shutdown handling: interruptible replay, SIGQUIT, quickdie messages;
+      - timeline following: walreceiver preamble, walsender historic timeline, standby follow\.
+    - What each step proved: every slice is pinned by mutation\-checked unit tests\. The cross\-engine ones are pinned
+      by PG 18\.3 oracle E2Es \(PG standby follows goopg, goopg standby follows PG\)\. Five real S2 defects were found
+      and fixed \(P0\-E18 … E22\)\.
+    - Remaining blocker: S4 itself\. The work is correctness and feature parity with no plan\-parity instrument\. One
+      new S2 is open: P0\-E23, held below with this root\.
+    - Expected movement if unblocked: none on the S3 instruments\. The relevant instrument would be the PG recovery
+      TAP suite \(D\-003, `postgres/src/test/recovery`\), not yet ported\. Ported counterparts so far: 004\_timeline\_switch
+      in both directions\.
+    - Remaining size: the ledgered M0122\-0013 residuals \(about 20 rows\)\. Largest: P0\-E23\, recovery\_target\_time /
+      name / immediate \(executor\-side\)\, backup\_label / XLOG\_BACKUP\_END\, the standby start\-up timeline from
+      the history\, no WAL archiver\.
+  - **A goopg standby follows its upstream's timeline switch LANDED 2026\-10\-30 \(`8ea3e1d0e`\)**\. Movement: none —
+    replication protocol\. Before, the walreceiver read the server's CopyDone as a disconnect and reconnected on the
+    same timeline forever\.
+    - Walreceiver: libpqrcv\_endstreaming \(CopyDone, the next\_tli row, history fetch\), and the no\-COPY reply →
+      `\*EndOfTimeline`\. The launcher hands it to `OnEndOfTimeline`; when the timeline is unchanged it waits 5 s\.
+    - Standby: `followUpstreamTimeline` \(rescanLatestTimeLine / numeric target / 'current' stays\; not\-a\-child and
+      forked\-off checks\; SwitchTimeline at the fork \+ timeline\_id\)\.
+    - Pins: `TestWalReceiverEndsHistoricTimeline`, `TestFollowUpstreamTimeline` \(mutation\-checked\)\. Oracle
+      `TestE2E\_GoopgStandbyFollowsPGTimelineSwitch` \(a PG 18\.3 promotion; fails without the follow hook\)\. Gates:
+      units, replication E2E family 14/14, tpch\-spotcheck, sf025 99/99\.
+    - Found: P0\-E23 \(S2, filed above with an escalation\)\. Residuals ledgered\.
   - **The walsender ends a historic timeline at its switch point LANDED 2026\-10\-30 \(`bd29bc303`\)**\. Movement:
     none — replication protocol\. Before, a request for an older timeline streamed straight past its end\.
     - tliSwitchPoint over the current history, with PG's two errors \(55000 / XX000\)\. No COPY at the switch point;

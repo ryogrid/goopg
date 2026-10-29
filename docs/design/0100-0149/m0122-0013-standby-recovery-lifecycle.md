@@ -6,6 +6,9 @@ a standby's recovery lifecycle, moved verbatim and in their original order; new 
 here. Archive recovery through recovery.signal (restore\_command, timelines, targets, promotion) is documented in
 [0130-0009](0130-0009-recovery-signal-archive-recovery.md).
 
+Status: held 2026-10-30 — M0122-0013 is `[!]` under the S4 lineage budget (owner escalation in `.ralph/fix_plan.md`);
+the sections below are landed.
+
 ## Sections
 
 ### The restartpoint \(2026\-10\-27, M0122\-0013\)
@@ -562,3 +565,63 @@ switch segment's prefix to the new timeline's name, so the bytes are the ones th
 - The goopg walreceiver half: answering CopyDone, reading the next-timeline row, switching the standby's WAL
   writer at `next_tli_startpos`, and choosing the timeline per recovery\_target\_timeline.
 - wal\_sender\_timeout.
+
+## Update 2026-10-30 — a goopg standby follows its upstream's timeline switch (M0122-0013, `8ea3e1d0e`)
+
+This is the receiver half of the end-of-timeline protocol. The walsender half is the previous section.
+
+**Walreceiver** (`internal/replication/walreceiver.go`):
+
+- **Server CopyDone.** `Run` no longer treats the server's CopyDone as a disconnect. `endStreaming` follows
+  libpqrcv\_endstreaming:
+  1. It answers with CopyDone.
+  2. It reads either the `(next_tli, next_tli_startpos)` row plus CommandComplete, or a bare CommandComplete (the
+     server shut down; the caller reconnects).
+  3. It applies PG's two checks: "unexpected result set after end-of-streaming" and "error reading result of
+     streaming command".
+  4. It fetches the history files of the timelines the server moved to, as WalReceiverMain does after
+     endstreaming, and returns `*EndOfTimeline`.
+
+  The frame-reader goroutine stops at the ReadyForQuery that follows CopyDone, so TIMELINE\_HISTORY can run on the
+  same connection.
+- **No-COPY reply.** A START\_REPLICATION answered without COPY, because the start point is already a historic
+  timeline's end, makes DialWalReceiver return `*EndOfTimeline`. It logs "primary server contains no more WAL on
+  requested timeline %u", as libpqrcv\_startstreaming's false return does.
+- **Launcher.** `StartWalReceiver` hands `*EndOfTimeline` to `WalReceiverLauncherConfig.OnEndOfTimeline`. If the
+  WAL writer is still on the same timeline afterwards, it waits wal\_retrieve\_retry\_interval (the 5 s default)
+  before reconnecting, as WalRcvWaitForStartPosition waits for the startup process.
+
+**Standby** (`cmd/goopg/standby.go`, `followUpstreamTimeline`) does the startup process's part:
+
+- **Target timeline:**
+  - 'latest': the newest timeline with a history file in pg\_wal (rescanLatestTimeLine);
+  - a numeric target: that timeline;
+  - 'current': never moves.
+- **Checks on the target's history:**
+  - It must list the current timeline. Otherwise: LOG "new timeline %u is not a child of database system timeline
+    %u".
+  - The local WAL must not extend past the fork. Otherwise: LOG "new timeline %u forked off current database system
+    timeline %u before current recovery point %X/%X".
+- **Switch.** When the local WAL ends exactly at the fork, `global/timeline_id` is written and the writer moves to
+  the next timeline in the target's history at that point (SwitchTimeline). It logs "new target timeline is %u".
+  The next connection then streams that timeline.
+
+**Pins:**
+
+- `TestWalReceiverEndsHistoricTimeline`: a goopg primary on timeline 3. The standby walks 1 → 2 → 3, including a dial
+  that starts exactly at a switch point.
+- `TestFollowUpstreamTimeline`: 'latest', 'current', numeric, not-a-child, forked-off, and not-reached-yet.
+- **Oracle**, `TestE2E_GoopgStandbyFollowsPGTimelineSwitch`: a goopg standby of a PG 18.3 primary is repointed at a
+  PG standby after that standby's promotion to timeline 2. The goopg standby streams the rest of timeline 1, switches,
+  and sees a row written after the promotion. It fails with the follow hook disabled.
+
+**Found:** P0-E23 (S2, filed). A goopg standby that replays its primary's shutdown checkpoint and then restarts loses
+earlier replayed rows. The oracle E2E stops the goopg standby before the old primary, so it never replays that
+checkpoint before a restart.
+
+**Still open (ledgered):**
+
+- The forked-off check uses the received WAL end, not the replay position.
+- A restart before a restartpoint on the new timeline reopens the writer on pg\_control's old timeline and re-follows.
+- The reconnect wait does not read wal\_retrieve\_retry\_interval.
+- No archive\_status markers.
