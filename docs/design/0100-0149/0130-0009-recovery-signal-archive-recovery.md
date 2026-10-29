@@ -497,3 +497,21 @@ an abort target and an absent xid) and `TestRecoveryStopXidAndSingleTarget`. Bot
 - `COMMIT PREPARED` / `ABORT PREPARED`: replay refuses the two-phase opcodes.
 - Commit records carry `xact_time = 0`, which blocks `recovery_target_time` and makes the LOG time 2000-01-01.
 - `recovery_target_name` and `'immediate'`.
+
+## Update 2026-10-30 — commit and abort records carry xact\_time (M0122-0013, `b1cc9d108`)
+
+goopg wrote `xact_time = 0` into every `xl_xact_commit` and `xl_xact_abort`. A PG standby, `pg_waldump` and any time
+target therefore saw every transaction end at 2000-01-01 00:00:00 UTC. PG's `XactLogCommitRecord` and
+`XactLogAbortRecord` store the transaction's stop timestamp (`GetCurrentTransactionStopTimestamp`).
+
+- `EncodeXactCommitPGWithRelsAt` and `EncodeXactAbortPGWithRelsAt` write the given TimestampTz. The un-timed encoders,
+  used by fixtures, keep writing 0.
+- `TimestampTzNow` is `GetCurrentTimestamp` (microseconds since 2000-01-01 UTC).
+- The xact-marker hook in `initdb.Open` stamps each end record with the transaction's stop time.
+- PG's `pg_waldump` on a goopg segment now prints, for example, "COMMIT 2026-10-30 04:21:12.164944 JST".
+
+**Pins:** `TestWalXactRecordsCarryStopTimestamp` (a real commit and rollback land inside the before/after window; fails
+with the time zeroed) and `TestEncodeXactRecordsAtWriteXactTime`.
+
+**Still open (ledgered):** `recovery_target_time` itself. goopg's timestamptz input parser is unexported inside
+`internal/executor`.

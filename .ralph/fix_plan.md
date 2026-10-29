@@ -4244,6 +4244,13 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Commit/abort records carry xact\_time LANDED 2026\-10\-30 \(`b1cc9d108`\)**\. Movement: none — WAL record body\.
+    XactLogCommitRecord/XactLogAbortRecord store GetCurrentTransactionStopTimestamp; goopg wrote 0\.
+    - `EncodeXactCommitPGWithRelsAt` / `EncodeXactAbortPGWithRelsAt`, `TimestampTzNow`; the initdb xact\-marker hook
+      stamps the stop time\. pg\_waldump shows real COMMIT/ABORT times\.
+    - Pins: `TestWalXactRecordsCarryStopTimestamp` \(mutation\-checked\), `TestEncodeXactRecordsAtWriteXactTime`\. Gates:
+      units, replication/recovery/PG\-standby E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): recovery\_target\_time — needs a timestamptz parser outside internal/executor\.
   - **recovery\_target\_xid \+ multiple\-targets FATAL LANDED 2026\-10\-30 \(`77e3f4ed5`\)**\. Movement: none — recovery
     targets\. COMMIT/ABORT xl\_xid equality \(recoveryStopsBefore/After\), error\_multiple\_recovery\_targets\.
     - Pins: `TestRunArchiveRecoveryStopsAtTargetXid`, `TestRecoveryStopXidAndSingleTarget` \(mutation\-checked\)\. Gates:
