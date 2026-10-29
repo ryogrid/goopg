@@ -3953,12 +3953,28 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         census `routing\-20261029b` 22/22·99/99·99/99\.
       - Residuals \(ledgered\): the `Hits:` line below a Gather shows one site, not PG's leader line \+ per\-worker lines;
         the NLI probe's own Cond filter has no rejection counter \(no `Rows Removed by Filter`\)\.
-    - Slice 3 — CTE bodies and InitPlans \(serial too, loop \#261 correction above\)\.
+    - Slice 3 done 2026\-10\-29 \(`132bf92d2`\): CTE bodies, SubPlans/InitPlans and cooperative hash\-build inputs are
+      instrumented; zero\-loop nodes print `\(never executed\)`\.
+      - CTE body: `newCteScanOp` builds under the scan's scope\. SubPlan/InitPlan: `acquireSubPlanOp` builds under
+        `Context\.explainScope`, published by explainOp for its run \(nil in workers\)\. `scopeStats`: one record per plan
+        node per scope \(PG one Instrumentation per node\)\.
+      - Cooperative build \(E\-18\): per\-producer tables folded as ONE execution of the build input
+        \(`foldCoopBuildStats`\) — the input sat at loops=0 before \(main tree too\)\.
+      - `\(never executed\)` on node and Hash lines \(explain\.c, nloops = 0\); Memoize `Hits:` only when misses \> 0
+        \(show\_memoize\_info\); memoized probe keyed on `InnerMemo\.Child` \(the rendered node\)\.
+      - DS SF0\.25 serial: Q14 node lines with actuals 35 → 76 \(PG 76\); Q23 23 → 41 \+ 6 never executed, identical
+        to PG's node set\. Captures `analysis/m0122/m0122\-0021/ds\-g\{14,23\}\-serial\-slice3\.explain`\.
+      - Tests `TestExplainAnalyzeCTEBodyAndSubPlanActuals`, `TestExplainAnalyzeCoopBuildInputActuals`
+        \(mutation\-checked\); `TestExplainAnalyzeSubPlanScopeObservation` inverted \(it pinned the gap\)\.
+      - Gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99; census `routing\-20261029c`
+        22/22·99/99·99/99\.
+      - Residuals \(ledgered\): goopg\-only `\(calls=… rebuilds=…\)` SubPlan header annotation; SubPlan value cache
+        lowers loops vs PG; SubPlans in workers and ARRAY\(\)/row\-IN/multi\-assign/corr\-hash\-map subqueries uninstrumented\.
     - Slice 4 — shared hash build input: `prebuildSharedHashJoins` builds the inner once from a nil\-scope tree, so
       every site reports loops=0 and the Hash line shows no actuals \(PG `rows=1200\.00 loops=4`, one build per
       participant\); needs a design call — goopg does the work once\.
-    - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\); `\(never executed\)` for
-      nloops = 0 not printed\.
+    - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
+      in slice 3\.\)
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
@@ -6653,6 +6669,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     M0122\-0021 slice 1 changed internal/executor; TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0
     everywhere\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - Census 2026\-10\-29 at `28a5ff4c9` \(M0122\-0021 slice 2 changed internal/executor\) — `routing\-20261029b/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `2ffd7717f`**, census `routing\-20261029b/` reused \(`2ffd7717f` is
+    ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `132bf92d2` \(M0122\-0021 slice 3 changed internal/executor\) — `routing\-20261029c/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner

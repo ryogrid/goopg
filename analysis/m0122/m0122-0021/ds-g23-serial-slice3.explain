@@ -1,0 +1,97 @@
+SET
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=1.00 loops=1)
+   CTE frequent_ss_items
+     ->  HashAggregate (actual rows=0.00 loops=1)
+           Group Key: substr((item.i_item_desc)::text, 1, 30), item.i_item_sk, date_dim_2.d_date
+           Filter: (count(*) > 4)
+           Rows Removed by Filter: 403882
+           ->  Hash Join (actual rows=414575.00 loops=1)
+                 Hash Cond: (store_sales.ss_item_sk = item.i_item_sk)
+                 ->  Hash Join (actual rows=414575.00 loops=1)
+                       Hash Cond: (store_sales.ss_sold_date_sk = date_dim_2.d_date_sk)
+                       ->  Seq Scan on store_sales (actual rows=719876.00 loops=1)
+                       ->  Hash (actual rows=1461.00 loops=1)
+                             Buckets: 2048  Batches: 1  Memory Usage: 336kB  Build Time: 3.066 ms
+                             ->  Seq Scan on date_dim date_dim_2 (actual rows=1461.00 loops=1)
+                                   Filter: (d_year = ANY ('{2000,2001,2002,2003}'::integer[]))
+                                   Rows Removed by Filter: 71588
+                 ->  Hash (actual rows=18000.00 loops=1)
+                       Buckets: 32768  Batches: 1  Memory Usage: 5406kB  Build Time: 9.362 ms
+                       ->  Seq Scan on item (actual rows=18000.00 loops=1)
+   CTE best_ss_customer
+     ->  HashAggregate (actual rows=13.00 loops=1)
+           Group Key: customer_1.c_customer_sk
+           Filter: (sum(((store_sales_2.ss_quantity)::numeric * store_sales_2.ss_sales_price)) > (0.95000000000000000000 * (InitPlan 2).col1))
+           Rows Removed by Filter: 45146
+           InitPlan 2
+             ->  Aggregate (actual rows=1.00 loops=1)
+                   ->  GroupAggregate (actual rows=30419.00 loops=1)
+                         Group Key: customer.c_customer_sk
+                         ->  Merge Join (actual rows=404920.00 loops=1)
+                               Merge Cond: (store_sales_1.ss_customer_sk = customer.c_customer_sk)
+                               ->  Sort (actual rows=414575.00 loops=1)
+                                     Sort Key: store_sales_1.ss_customer_sk
+                                     Sort Method: quicksort  Memory: 77733kB
+                                     ->  Hash Join (actual rows=414575.00 loops=1)
+                                           Hash Cond: (store_sales_1.ss_sold_date_sk = date_dim_3.d_date_sk)
+                                           ->  Seq Scan on store_sales store_sales_1 (actual rows=719876.00 loops=1)
+                                           ->  Hash (actual rows=1461.00 loops=1)
+                                                 Buckets: 2048  Batches: 1  Memory Usage: 268kB  Build Time: 3.728 ms
+                                                 ->  Seq Scan on date_dim date_dim_3 (actual rows=1461.00 loops=1)
+                                                       Filter: (d_year = ANY ('{2000,2001,2002,2003}'::integer[]))
+                                                       Rows Removed by Filter: 71588
+                               ->  Index Only Scan using customer_pkey on customer (actual rows=100000.00 loops=1)
+                                     Heap Fetches: 0
+           ->  Hash Join (actual rows=687754.00 loops=1)
+                 Hash Cond: (store_sales_2.ss_customer_sk = customer_1.c_customer_sk)
+                 ->  Seq Scan on store_sales store_sales_2 (actual rows=719876.00 loops=1)
+                 ->  Hash (actual rows=100000.00 loops=1)
+                       Buckets: 131072  Batches: 1  Memory Usage: 13176kB  Build Time: 66.639 ms
+                       ->  Index Only Scan using customer_pkey on customer customer_1 (actual rows=100000.00 loops=1)
+                             Heap Fetches: 0
+   ->  Aggregate (actual rows=1.00 loops=1)
+         ->  Append (actual rows=0.00 loops=1)
+               ->  Hash Right Semi Join (actual rows=0.00 loops=1)
+                     Hash Cond: (best_ss_customer.c_customer_sk = catalog_sales.cs_bill_customer_sk)
+                     ->  CTE Scan on best_ss_customer (actual rows=1.00 loops=1)
+                     ->  Hash (actual rows=0.00 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 48kB  Build Time: 1394.250 ms
+                           ->  Hash Join (actual rows=0.00 loops=1)
+                                 Hash Cond: (catalog_sales.cs_item_sk = frequent_ss_items.item_sk)
+                                 ->  Hash Join (never executed)
+                                       Hash Cond: (catalog_sales.cs_sold_date_sk = date_dim.d_date_sk)
+                                       ->  Seq Scan on catalog_sales (never executed)
+                                       ->  Hash (never executed)
+                                             ->  Seq Scan on date_dim (never executed)
+                                                   Filter: ((d_year = 2000) AND (d_moy = 7))
+                                 ->  Hash (actual rows=0.00 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 48kB  Build Time: 1394.230 ms
+                                       ->  HashAggregate (actual rows=0.00 loops=1)
+                                             Group Key: frequent_ss_items.item_sk
+                                             ->  CTE Scan on frequent_ss_items (actual rows=0.00 loops=1)
+               ->  Hash Right Semi Join (actual rows=0.00 loops=1)
+                     Hash Cond: (best_ss_customer_1.c_customer_sk = web_sales.ws_bill_customer_sk)
+                     ->  CTE Scan on best_ss_customer best_ss_customer_1 (actual rows=1.00 loops=1)
+                     ->  Hash (actual rows=0.00 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 48kB  Build Time: 0.070 ms
+                           ->  Nested Loop (actual rows=0.00 loops=1)
+                                 ->  Hash Join (actual rows=0.00 loops=1)
+                                       Hash Cond: (web_sales.ws_item_sk = frequent_ss_items_1.item_sk)
+                                       ->  Seq Scan on web_sales (actual rows=1.00 loops=1)
+                                       ->  Hash (actual rows=0.00 loops=1)
+                                             Buckets: 1024  Batches: 1  Memory Usage: 48kB  Build Time: 0.002 ms
+                                             ->  HashAggregate (actual rows=0.00 loops=1)
+                                                   Group Key: frequent_ss_items_1.item_sk
+                                                   ->  CTE Scan on frequent_ss_items frequent_ss_items_1 (actual rows=0.00 loops=1)
+                                 ->  Memoize (never executed)
+                                       Cache Key: web_sales.ws_sold_date_sk
+                                       Cache Mode: logical
+                                       ->  Index Scan using date_dim_pkey on date_dim date_dim_1 (never executed)
+                                             Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+                                             Filter: ((d_year = 2000) AND (d_moy = 7))
+ Planning Time: 8.500 ms
+ Execution Time: 3319.393 ms
+(92 rows)
+

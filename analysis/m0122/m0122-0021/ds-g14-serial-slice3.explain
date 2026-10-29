@@ -1,0 +1,157 @@
+SET
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=100.00 loops=1)
+   CTE cross_items
+     ->  Hash Join (actual rows=16173.00 loops=1)
+           Hash Cond: ((item_3.i_brand_id = iss.i_brand_id) AND (item_3.i_class_id = iss.i_class_id) AND (item_3.i_category_id = iss.i_category_id))
+           ->  Seq Scan on item item_3 (actual rows=18000.00 loops=1)
+           ->  Hash (actual rows=3817.00 loops=1)
+                 Build Time: 4482.174 ms
+                 ->  HashSetOp Intersect (actual rows=3817.00 loops=1)
+                       ->  HashSetOp Intersect (actual rows=3837.00 loops=1)
+                             ->  Hash Join (actual rows=411724.00 loops=1)
+                                   Hash Cond: (store_sales_1.ss_item_sk = iss.i_item_sk)
+                                   ->  Hash Join (actual rows=411724.00 loops=1)
+                                         Hash Cond: (store_sales_1.ss_sold_date_sk = d1.d_date_sk)
+                                         ->  Seq Scan on store_sales store_sales_1 (actual rows=719876.00 loops=1)
+                                         ->  Hash (actual rows=1096.00 loops=1)
+                                               Buckets: 2048  Batches: 1  Memory Usage: 174kB  Build Time: 25.584 ms
+                                               ->  Seq Scan on date_dim d1 (actual rows=1096.00 loops=1)
+                                                     Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                                     Rows Removed by Filter: 71953
+                                   ->  Hash (actual rows=18000.00 loops=1)
+                                         Buckets: 32768  Batches: 1  Memory Usage: 5333kB  Build Time: 20.583 ms
+                                         ->  Seq Scan on item iss (actual rows=18000.00 loops=1)
+                             ->  Nested Loop (actual rows=215662.00 loops=1)
+                                   ->  Hash Join (actual rows=215662.00 loops=1)
+                                         Hash Cond: (catalog_sales_1.cs_sold_date_sk = d2.d_date_sk)
+                                         ->  Seq Scan on catalog_sales catalog_sales_1 (actual rows=360397.00 loops=1)
+                                         ->  Hash (actual rows=1096.00 loops=1)
+                                               Buckets: 2048  Batches: 1  Memory Usage: 225kB  Build Time: 1.847 ms
+                                               ->  Seq Scan on date_dim d2 (actual rows=1096.00 loops=1)
+                                                     Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                                     Rows Removed by Filter: 71953
+                                   ->  Index Scan using item_pkey on item ics (actual rows=1.00 loops=215662)
+                                         Index Cond: (i_item_sk = catalog_sales_1.cs_item_sk)
+                       ->  Nested Loop (actual rows=107668.00 loops=1)
+                             ->  Hash Join (actual rows=107668.00 loops=1)
+                                   Hash Cond: (web_sales_1.ws_sold_date_sk = d3.d_date_sk)
+                                   ->  Seq Scan on web_sales web_sales_1 (actual rows=179956.00 loops=1)
+                                   ->  Hash (actual rows=1096.00 loops=1)
+                                         Buckets: 2048  Batches: 1  Memory Usage: 225kB  Build Time: 1.888 ms
+                                         ->  Seq Scan on date_dim d3 (actual rows=1096.00 loops=1)
+                                               Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                               Rows Removed by Filter: 71953
+                             ->  Index Scan using item_pkey on item iws (actual rows=1.00 loops=107668)
+                                   Index Cond: (i_item_sk = web_sales_1.ws_item_sk)
+   CTE avg_sales
+     ->  Aggregate (actual rows=1.00 loops=1)
+           ->  Append (actual rows=735054.00 loops=1)
+                 ->  Hash Join (actual rows=411724.00 loops=1)
+                       Hash Cond: (store_sales_2.ss_sold_date_sk = date_dim_3.d_date_sk)
+                       ->  Seq Scan on store_sales store_sales_2 (actual rows=719876.00 loops=1)
+                       ->  Hash (actual rows=1096.00 loops=1)
+                             Buckets: 2048  Batches: 1  Memory Usage: 174kB  Build Time: 1.783 ms
+                             ->  Seq Scan on date_dim date_dim_3 (actual rows=1096.00 loops=1)
+                                   Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                   Rows Removed by Filter: 71953
+                 ->  Hash Join (actual rows=215662.00 loops=1)
+                       Hash Cond: (catalog_sales_2.cs_sold_date_sk = date_dim_4.d_date_sk)
+                       ->  Seq Scan on catalog_sales catalog_sales_2 (actual rows=360397.00 loops=1)
+                       ->  Hash (actual rows=1096.00 loops=1)
+                             Buckets: 2048  Batches: 1  Memory Usage: 174kB  Build Time: 1.820 ms
+                             ->  Seq Scan on date_dim date_dim_4 (actual rows=1096.00 loops=1)
+                                   Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                   Rows Removed by Filter: 71953
+                 ->  Hash Join (actual rows=107668.00 loops=1)
+                       Hash Cond: (web_sales_2.ws_sold_date_sk = date_dim_5.d_date_sk)
+                       ->  Seq Scan on web_sales web_sales_2 (actual rows=179956.00 loops=1)
+                       ->  Hash (actual rows=1096.00 loops=1)
+                             Buckets: 2048  Batches: 1  Memory Usage: 174kB  Build Time: 1.729 ms
+                             ->  Seq Scan on date_dim date_dim_5 (actual rows=1096.00 loops=1)
+                                   Filter: ((d_year >= 1999) AND (d_year <= 2001))
+                                   Rows Removed by Filter: 71953
+   ->  Sort (actual rows=100.00 loops=1)
+         Sort Key: ('store'::text), item.i_brand_id, item.i_class_id, item.i_category_id
+         Sort Method: quicksort  Memory: 3741kB
+         ->  GroupAggregate (actual rows=13066.00 loops=1)
+               Group Key: ('store'::text), item.i_brand_id, item.i_class_id, item.i_category_id
+               Group Key: ('store'::text), item.i_brand_id, item.i_class_id
+               Group Key: ('store'::text), item.i_brand_id
+               Group Key: ('store'::text)
+               Group Key: ()
+               ->  Sort (actual rows=5961.00 loops=1)
+                     Sort Key: ('store'::text), item.i_brand_id, item.i_class_id, item.i_category_id
+                     Sort Method: quicksort  Memory: 1707kB
+                     ->  Append (actual rows=5961.00 loops=1)
+                           ->  GroupAggregate (actual rows=2512.00 loops=1)
+                                 Group Key: item.i_brand_id, item.i_class_id, item.i_category_id
+                                 Filter: (sum(((store_sales.ss_quantity)::numeric * store_sales.ss_list_price)) > (InitPlan 3).col1)
+                                 Rows Removed by Filter: 734
+                                 InitPlan 3
+                                   ->  CTE Scan on avg_sales (actual rows=1.00 loops=1)
+                                 ->  Sort (actual rows=21135.00 loops=1)
+                                       Sort Key: item.i_brand_id, item.i_class_id, item.i_category_id
+                                       Sort Method: quicksort  Memory: 73313kB
+                                       ->  Nested Loop (actual rows=21135.00 loops=1)
+                                             ->  Nested Loop (actual rows=688034.00 loops=1)
+                                                   ->  Nested Loop (actual rows=16173.00 loops=1)
+                                                         ->  HashAggregate (actual rows=16173.00 loops=1)
+                                                               Group Key: cross_items.ss_item_sk
+                                                               ->  CTE Scan on cross_items (actual rows=16173.00 loops=1)
+                                                         ->  Index Scan using item_pkey on item (actual rows=1.00 loops=16173)
+                                                               Index Cond: (i_item_sk = cross_items.ss_item_sk)
+                                                   ->  Index Scan using store_sales_pkey on store_sales (actual rows=42.54 loops=16173)
+                                                         Index Cond: (ss_item_sk = item.i_item_sk)
+                                             ->  Index Scan using date_dim_pkey on date_dim (actual rows=0.03 loops=688034)
+                                                   Index Cond: (d_date_sk = store_sales.ss_sold_date_sk)
+                                                   Filter: ((d_year = 2001) AND (d_moy = 11))
+                           ->  GroupAggregate (actual rows=2039.00 loops=1)
+                                 Group Key: item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id
+                                 Filter: (sum(((catalog_sales.cs_quantity)::numeric * catalog_sales.cs_list_price)) > (InitPlan 4).col1)
+                                 Rows Removed by Filter: 767
+                                 InitPlan 4
+                                   ->  CTE Scan on avg_sales avg_sales_1 (actual rows=1.00 loops=1)
+                                 ->  Sort (actual rows=11597.00 loops=1)
+                                       Sort Key: item_1.i_brand_id, item_1.i_class_id, item_1.i_category_id
+                                       Sort Method: quicksort  Memory: 46207kB
+                                       ->  Nested Loop (actual rows=11597.00 loops=1)
+                                             ->  Nested Loop (actual rows=344663.00 loops=1)
+                                                   ->  Nested Loop (actual rows=16173.00 loops=1)
+                                                         ->  HashAggregate (actual rows=16173.00 loops=1)
+                                                               Group Key: cross_items_1.ss_item_sk
+                                                               ->  CTE Scan on cross_items cross_items_1 (actual rows=16173.00 loops=1)
+                                                         ->  Index Scan using item_pkey on item item_1 (actual rows=1.00 loops=16173)
+                                                               Index Cond: (i_item_sk = cross_items_1.ss_item_sk)
+                                                   ->  Index Scan using catalog_sales_pkey on catalog_sales (actual rows=21.31 loops=16173)
+                                                         Index Cond: (cs_item_sk = item_1.i_item_sk)
+                                             ->  Index Scan using date_dim_pkey on date_dim date_dim_1 (actual rows=0.03 loops=344663)
+                                                   Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                                   Filter: ((d_year = 2001) AND (d_moy = 11))
+                           ->  GroupAggregate (actual rows=1410.00 loops=1)
+                                 Group Key: item_2.i_brand_id, item_2.i_class_id, item_2.i_category_id
+                                 Filter: (sum(((web_sales.ws_quantity)::numeric * web_sales.ws_list_price)) > (InitPlan 5).col1)
+                                 Rows Removed by Filter: 686
+                                 InitPlan 5
+                                   ->  CTE Scan on avg_sales avg_sales_2 (actual rows=1.00 loops=1)
+                                 ->  Sort (actual rows=6094.00 loops=1)
+                                       Sort Key: item_2.i_brand_id, item_2.i_class_id, item_2.i_category_id
+                                       Sort Method: quicksort  Memory: 24281kB
+                                       ->  Nested Loop (actual rows=6094.00 loops=1)
+                                             ->  Nested Loop (actual rows=172139.00 loops=1)
+                                                   ->  Nested Loop (actual rows=16173.00 loops=1)
+                                                         ->  HashAggregate (actual rows=16173.00 loops=1)
+                                                               Group Key: cross_items_2.ss_item_sk
+                                                               ->  CTE Scan on cross_items cross_items_2 (actual rows=16173.00 loops=1)
+                                                         ->  Index Scan using item_pkey on item item_2 (actual rows=1.00 loops=16173)
+                                                               Index Cond: (i_item_sk = cross_items_2.ss_item_sk)
+                                                   ->  Index Scan using web_sales_pkey on web_sales (actual rows=10.64 loops=16173)
+                                                         Index Cond: (ws_item_sk = item_2.i_item_sk)
+                                             ->  Index Scan using date_dim_pkey on date_dim date_dim_2 (actual rows=0.04 loops=172139)
+                                                   Index Cond: (d_date_sk = web_sales.ws_sold_date_sk)
+                                                   Filter: ((d_year = 2001) AND (d_moy = 11))
+ Planning Time: 11.668 ms
+ Execution Time: 8402.439 ms
+(152 rows)
+

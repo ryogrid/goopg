@@ -1,7 +1,8 @@
 # M0122-0021 — EXPLAIN ANALYZE: nodes below a Gather report their own actuals
 
-Status: slice 1 landed 2026-10-29 (`881b3e314`); slice 2 (NLI inner / Memoize) landed 2026-10-29 (`28a5ff4c9`). The
-task stays open for the CTE-body, InitPlan and shared-hash-build gaps listed under "Remaining".
+Status: slice 1 landed 2026-10-29 (`881b3e314`), slice 2 (NLI inner / Memoize, `28a5ff4c9`), slice 3 (CTE bodies,
+SubPlans/InitPlans, cooperative build inputs, `(never executed)`, `132bf92d2`). The task stays open for the
+shared-hash-build input (slice 4) and the residuals listed under "Remaining".
 
 ## Problem
 
@@ -110,3 +111,38 @@ lines therefore printed no actuals, in serial plans as well as below a Gather.
   - Captures: `analysis/m0122/m0122-0021/q72-goopg-slice2{,-serial}.explain`.
 - Test: `TestMemoizeAnalyzeNodeActuals`. Gates: units, tpch-spotcheck, tpch-acceptance-arm (24 MATCH) and the sf025
   sweep all PASS. Census `routing-20261029b`: 22/22, 99/99, 99/99.
+
+## Slice 3 — CTE bodies, SubPlans / InitPlans, cooperative builds, `(never executed)`
+
+These subtrees are built outside the top-level operator tree, so before this slice none of them printed actuals,
+serially as well as in parallel plans.
+
+| subtree | where it was built | fix |
+|---|---|---|
+| materialized CTE body | `newCteScanOp` with `Build()` (no scope) | builds under the scan's own scope |
+| SubPlan / InitPlan inner plan | `acquireSubPlanOp`, lazily during execution | `explainOp` publishes its instrumenter as `Context.explainScope` for its run; `acquireSubPlanOp` builds under it. Workers get nil, because `NewWorkerContext` copies fields explicitly |
+| cooperative hash-build input (E-18) | producer goroutines, nil scope; the tree `buildNode` made is never opened | each producer gets a fresh table; `foldCoopBuildStats` folds them as **one** execution (rows summed, loops +1, earliest startup, latest total), which is what PG's serial Hash child reports |
+
+- `scopeStats`: every build of one plan node within a scope files into the same record, because PG keeps one
+  Instrumentation per plan node across all its loops. As a result:
+  - the CTE reference that replays from the cache never opens its body and adds nothing;
+  - a SubPlan rebuilt per call (`rescanRebuild`) accumulates its loops instead of each build overwriting the last.
+- `(never executed)` (explain.c `ExplainNode`, `nloops == 0`) now prints on the node line and on the synthesized
+  Hash line. Every executing path now files into its node's record, so a zero-loop record means the node really
+  did not run.
+- The Memoize `Hits:` line prints only when `cache_misses > 0` (`show_memoize_info`).
+- The memoized probe is keyed on `InnerMemo.Child`, the node EXPLAIN renders. A rewrite that replaces `Inner`
+  (unwrap's remap, the inner-join qual pushdown) can leave it distinct from `Inner`.
+- Measured on TPC-DS SF0.25 serial (`analysis/m0122/m0122-0021/ds-g{14,23}-serial-slice3.explain` vs
+  `tmp/rc261/p{14,23}.txt`):
+  - Q14: node lines with actuals 35 → 76 (PG: 76).
+  - Q23: 23 → 41 actuals plus 6 `(never executed)`. PG has 41 plus 6, on the same nodes.
+- Tests: `TestExplainAnalyzeCTEBodyAndSubPlanActuals` (CTE body, InitPlan, correlated SubPlan, never-executed inner)
+  and `TestExplainAnalyzeCoopBuildInputActuals` (mutation-checked).
+  `TestExplainAnalyzeSubPlanScopeObservation` had pinned the old gap; it now requires actuals.
+- Residuals (ledgered):
+  - the SubPlan/InitPlan header still carries goopg's `(calls=… rebuilds=… rescans=… hits=… misses=…)`
+    annotation, which PG does not print;
+  - goopg's correlated-SubPlan value cache skips executions PG performs, so loops can come out lower than PG's;
+  - SubPlans inside parallel workers and the other expression-level subqueries built with `Build()` (ARRAY(),
+    row IN, multi-assignment SET, the correlated hash map) stay uninstrumented.
