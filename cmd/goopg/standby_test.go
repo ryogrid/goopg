@@ -684,6 +684,7 @@ func TestPromoteAfterRecoveryAdoptsRestoredWAL(t *testing.T) {
 	if last := entries[len(entries)-1]; last.SwitchLSN != endOfLog {
 		t.Errorf("history switch point = %X, want EndOfLog %X", last.SwitchLSN, endOfLog)
 	}
+	assertEndOfRecoveryCheckpoint(t, dir, int64(segSize), endOfLog, oldTLI, oldTLI+1)
 	at, _, err := rt.WAL.Append(payload)
 	if err != nil {
 		t.Fatal(err)
@@ -861,6 +862,7 @@ func TestPromoteAfterRecoveryFollowsTimelines(t *testing.T) {
 		entries[1].TLI != want[1].TLI || entries[1].SwitchLSN != want[1].SwitchLSN {
 		t.Errorf("timeline 3 history = %+v, want 1@%X, 2@%X", entries, switchLSN, recovered.EndOfLog)
 	}
+	assertEndOfRecoveryCheckpoint(t, backup, int64(segSize), recovered.EndOfLog, 2, 3)
 	at, _, err := rt.WAL.Append(payload)
 	if err != nil {
 		t.Fatal(err)
@@ -885,5 +887,53 @@ func TestPromoteAfterRecoveryFollowsTimelines(t *testing.T) {
 	}
 	if got := rt2.WAL.WrittenLSN(); got < postEnd {
 		t.Errorf("reopened WAL ends at %X, before the post-promotion end %X", got, postEnd)
+	}
+}
+
+// firstRecordOnNewTimeline returns the first WAL record starting at or after
+// endOfLog — the record that marks the timeline change.
+func firstRecordOnNewTimeline(t *testing.T, walDir string, segSize int64, endOfLog uint64) xlog.Record {
+	t.Helper()
+	recs, err := xlog.ReadAll(walDir, segSize)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	for _, r := range recs {
+		if r.StartLSN >= endOfLog {
+			return r
+		}
+	}
+	t.Fatalf("no record at or after EndOfLog %X", endOfLog)
+	return xlog.Record{}
+}
+
+// assertEndOfRecoveryCheckpoint checks PerformRecoveryXLogAction's arm for
+// archive recovery that ends without a promote trigger: the first record on
+// the new timeline is an end-of-recovery checkpoint — a shutdown-type
+// XLOG_CHECKPOINT_SHUTDOWN whose ThisTimeLineID is the new timeline and
+// PrevTimeLineID the one recovery ended on — not XLOG_END_OF_RECOVERY, and
+// pg_control's checkpoint copy carries both timelines.
+func assertEndOfRecoveryCheckpoint(t *testing.T, dataDir string, segSize int64, endOfLog uint64, oldTLI, newTLI uint32) {
+	t.Helper()
+	r := firstRecordOnNewTimeline(t, filepath.Join(dataDir, "pg_wal"), segSize, endOfLog)
+	if r.XLog == nil || r.XLog.Header.Rmid != xlog.RmgrXLog || r.XLog.Header.Info&0xF0 != 0x00 || len(r.XLog.MainData) < 16 {
+		var rm, info uint8
+		if r.XLog != nil {
+			rm, info = uint8(r.XLog.Header.Rmid), r.XLog.Header.Info
+		}
+		t.Fatalf("first record on the new timeline is rmgr %d info %#x, want an XLOG_CHECKPOINT_SHUTDOWN", rm, info)
+	}
+	this := binary.LittleEndian.Uint32(r.XLog.MainData[8:12])
+	prev := binary.LittleEndian.Uint32(r.XLog.MainData[12:16])
+	if this != newTLI || prev != oldTLI {
+		t.Errorf("end-of-recovery checkpoint ThisTimeLineID %d PrevTimeLineID %d, want %d and %d", this, prev, newTLI, oldTLI)
+	}
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		t.Fatalf("ReadControlFile: %v", err)
+	}
+	if cd.CheckPointCopyThisTLI != newTLI || cd.CheckPointCopyPrevTLI != oldTLI || cd.State != control.DBStateInProduction {
+		t.Errorf("pg_control checkpoint copy TLI %d prev %d state %v, want %d / %d / in production",
+			cd.CheckPointCopyThisTLI, cd.CheckPointCopyPrevTLI, cd.State, newTLI, oldTLI)
 	}
 }

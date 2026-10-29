@@ -441,28 +441,23 @@ func (sc *standbyController) finalizePromotion() error {
 	// StartupXLOG ends a promotion by requesting an online checkpoint
 	// (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c): not needed for
 	// consistency, but the last restartpoint may be far back.
-	promotionCheckpoint(sc.rt, false, sc.logger)
+	promotionCheckpoint(sc.rt, sc.logger)
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil
 }
 
-// promotionCheckpoint runs the checkpoint that follows the end of recovery:
-// the online checkpoint StartupXLOG requests after a promotion, and the
-// end-of-recovery checkpoint PerformRecoveryXLogAction waits for when
-// archive recovery ends without a promote trigger (xlog.c). Both promotions
-// call it once the writer is on the new timeline and the checkpointer has
-// left recovery mode, so the checkpoint record and pg_control's
-// checkPointCopy carry the new timeline and a crash replays from here
-// instead of from the last restartpoint.
-//
-// wait selects the arm: the archive-recovery end waits for an immediate
-// checkpoint (CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT); a promotion
-// only requests a forced, spread one and goes on
-// (RequestCheckpoint(CHECKPOINT_FORCE)) — served by the checkpointer loop,
-// or run here when no loop is serving requests. A failure is a WARNING:
-// recovery itself is complete and the next scheduled checkpoint redoes the
-// bookkeeping, as endOfRecoveryCheckpoint treats it.
-func promotionCheckpoint(rt *initdb.Runtime, wait bool, logger *slog.Logger) {
+// promotionCheckpoint requests the online checkpoint StartupXLOG asks for at
+// the end of a promotion (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c): not
+// needed for consistency, but the last restartpoint may be far back. The
+// promotion calls it once the writer is on the new timeline and the
+// checkpointer has left recovery mode, so the checkpoint record and
+// pg_control's checkPointCopy carry the new timeline. The checkpointer loop
+// serves the request; with no loop serving requests it runs here. A failure
+// is a WARNING — recovery itself is complete and the next scheduled
+// checkpoint redoes the bookkeeping, as endOfRecoveryCheckpoint treats it.
+// (Archive recovery ending without a promote trigger takes its
+// end-of-recovery checkpoint in endArchiveRecoveryOnNewTimeline instead.)
+func promotionCheckpoint(rt *initdb.Runtime, logger *slog.Logger) {
 	if rt == nil || rt.Checkpointer == nil {
 		return
 	}
@@ -477,7 +472,7 @@ func promotionCheckpoint(rt *initdb.Runtime, wait bool, logger *slog.Logger) {
 			return
 		}
 	}
-	if !wait && rt.Checkpointer.RequestCheckpoint() {
+	if rt.Checkpointer.RequestCheckpoint() {
 		return
 	}
 	if err := rt.Checkpointer.CheckpointNow(); err != nil {
@@ -584,6 +579,38 @@ func switchWriterToNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN
 	if err := rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
 		return fmt.Errorf("switch WAL timeline: %w", err)
 	}
+	return appendEndOfRecoveryRecord(rt, oldTLI, newTLI, walLevel)
+}
+
+// endArchiveRecoveryOnNewTimeline moves the writer onto newTLI at endLSN and
+// ends archive recovery as PG does when no promote was triggered
+// (PerformRecoveryXLogAction): an end-of-recovery checkpoint —
+// CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT, a shutdown-type checkpoint
+// whose PrevTimeLineID is oldTLI — is the first record on the new timeline
+// and marks the timeline change, instead of the XLOG_END_OF_RECOVERY a
+// promotion writes. It runs before CleanupAfterArchiveRecovery's
+// recovery_end_command. Without a checkpointer (tools) the end-of-recovery
+// record marks the change instead. A failed checkpoint fails the start, as
+// an ERROR in PG's startup process does.
+func endArchiveRecoveryOnNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN, prevRecPtr uint64, walLevel int32) error {
+	if rt.WAL == nil || endLSN == 0 {
+		return nil
+	}
+	if rt.Checkpointer == nil {
+		return switchWriterToNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, walLevel)
+	}
+	if err := rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
+		return fmt.Errorf("switch WAL timeline: %w", err)
+	}
+	if err := rt.Checkpointer.CheckpointEndOfRecovery(oldTLI); err != nil {
+		return fmt.Errorf("end-of-recovery checkpoint: %w", err)
+	}
+	return nil
+}
+
+// appendEndOfRecoveryRecord writes XLOG_END_OF_RECOVERY as the first record
+// on newTLI (CreateEndOfRecoveryRecord) and points minRecoveryPoint past it.
+func appendEndOfRecoveryRecord(rt *initdb.Runtime, oldTLI, newTLI uint32, walLevel int32) error {
 	rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, walLevel)
 	if err != nil {
 		return fmt.Errorf("encode end-of-recovery record: %w", err)
@@ -717,10 +744,10 @@ type archiveRecoveryEnd struct {
 //  3. Write the timeline history file for newTLI.
 //  4. Persist newTLI to the flat file and pg_control.
 //  5. Bring the writer to EndOfLog (adoptRestoredWAL), switch it to newTLI
-//     and write XLOG_END_OF_RECOVERY (switchWriterToNewTimeline).
-//  6. Take the end-of-recovery checkpoint (promotionCheckpoint).
-//  7. Run recovery_end_command.
-//  8. Remove recovery.signal.
+//     and take the end-of-recovery checkpoint there — the first record on
+//     the new timeline (endArchiveRecoveryOnNewTimeline).
+//  6. Run recovery_end_command.
+//  7. Remove recovery.signal.
 func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *slog.Logger) error {
 	if rt.DataDir == "" {
 		return nil
@@ -778,14 +805,9 @@ func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *sl
 	}); err != nil {
 		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
 	}
-	if err := switchWriterToNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, end.WalLevel); err != nil {
+	if err := endArchiveRecoveryOnNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, end.WalLevel); err != nil {
 		return fmt.Errorf("promote after recovery: %w", err)
 	}
-	// Archive recovery that ends without a promote trigger waits for an
-	// end-of-recovery checkpoint before anything else (PerformRecoveryXLogAction:
-	// CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT), and before
-	// CleanupAfterArchiveRecovery runs recovery_end_command.
-	promotionCheckpoint(rt, true, logger)
 
 	// CleanupAfterArchiveRecovery runs recovery_end_command once archive
 	// recovery has ended (xlog.c). A signal-killed command is FATAL: the

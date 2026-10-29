@@ -812,6 +812,20 @@ func (c *Checkpointer) RequestCheckpoint() bool {
 	return true
 }
 
+// CheckpointEndOfRecovery takes the checkpoint that ends archive recovery
+// without a promote trigger — CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT
+// (PerformRecoveryXLogAction, xlog.c). It is a shutdown-type checkpoint
+// record on the writer's (new) timeline whose PrevTimeLineID is prevTLI, the
+// timeline recovery ended on: PG lets the timeline change only in a
+// shutdown checkpoint or an end-of-recovery record, and this one is the
+// former. pg_control ends in DB_IN_PRODUCTION (PG stamps DB_SHUTDOWNED here
+// and StartupXLOG moves it to production right after).
+func (c *Checkpointer) CheckpointEndOfRecovery(prevTLI uint32) error {
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{endOfRecovery: true, prevTLI: prevTLI})
+}
+
 // announceImmediate registers a waiter for an IMMEDIATE checkpoint and
 // wakes a spread checkpoint's pacer so it stops throttling.
 func (c *Checkpointer) announceImmediate() {
@@ -950,6 +964,13 @@ type checkpointOpts struct {
 	spread   bool // paced over checkpoint_completion_target (not IMMEDIATE)
 	shutdown bool // shutdown checkpoint: pg_control state DB_SHUTDOWNED
 	timed    bool // checkpoint_timeout cause: pg_stat_checkpointer num_timed
+	// endOfRecovery is CHECKPOINT_END_OF_RECOVERY: "really a shutdown
+	// checkpoint, just issued at a different time" (CreateCheckPoint) — a
+	// shutdown-type record (no redo record, no running-xacts) whose
+	// PrevTimeLineID is prevTLI, the timeline recovery forked off from, so
+	// it marks the timeline change; the cluster stays in production.
+	endOfRecovery bool
+	prevTLI       uint32
 }
 
 // runCheckpointOpts runs one checkpoint, serialised with every other one
@@ -958,6 +979,10 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 	spread, shutdown := o.spread, o.shutdown
+	// recordShutdown selects the shutdown record format, which an
+	// end-of-recovery checkpoint shares; shutdown alone drives the
+	// DB_SHUTDOWNED state and the recovery-mode flush below.
+	recordShutdown := shutdown || o.endOfRecovery
 	if spread && c.pendingImmediate.Load() == 0 {
 		// A wake left by an immediate request that has since been served
 		// must not cut this checkpoint's first pacing step short.
@@ -1020,7 +1045,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	// so the record itself marks the redo point (upstream comment, xlog.c).
 	var redoAppendErr error
 	sampleRedo := computeRedo
-	if c.cfg.PGCompatCheckpoints && !shutdown {
+	if c.cfg.PGCompatCheckpoints && !recordShutdown {
 		sampleRedo = func() uint64 {
 			rec, err := EncodeCheckpointRedoPG()
 			if err != nil {
@@ -1118,6 +1143,9 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 	// Resolve PrevTLI/OldestXidDB/OldestMultiDB and every floor now, so the
 	// pg_control writer below reads the same values the record encodes
 	// rather than re-deriving them.
+	if o.endOfRecovery && o.prevTLI != 0 {
+		cpFields.PrevTLI = o.prevTLI // XLogCtl->PrevTimeLineID (CreateCheckPoint)
+	}
 	cpFields = cpFields.withDefaults()
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
@@ -1131,7 +1159,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		// synthesises the running-xacts state on the wasShutdown path) and
 		// stamp oldestActiveXid = InvalidTransactionId, exactly like PG.
 		oldestActive := uint32(0)
-		if !shutdown {
+		if !recordShutdown {
 			xids, oldestRunning, latestCompleted := c.runningXacts(nextXid)
 			oldestActive = oldestRunning
 			rx, rerr := EncodeRunningXactsPG(uint32(max(nextXid, 3)), oldestRunning, latestCompleted, xids)
@@ -1145,7 +1173,7 @@ func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) 
 		var cerr error
 		cpFields.RedoLSN0 = redoLSN0
 		cpFields.OldestActiveXid = oldestActive
-		checkpointPayload, cerr = EncodeCheckpointPGFields(shutdown, cpFields)
+		checkpointPayload, cerr = EncodeCheckpointPGFields(recordShutdown, cpFields)
 		if cerr != nil {
 			return fmt.Errorf("encode checkpoint record: %w", cerr)
 		}

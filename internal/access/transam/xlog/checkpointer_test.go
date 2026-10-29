@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -1333,4 +1334,77 @@ func TestCheckpointerRequestCheckpoint(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// TestCheckpointerEndOfRecoveryCheckpoint pins CHECKPOINT_END_OF_RECOVERY
+// (CreateCheckPoint: "really a shutdown checkpoint, just issued at a
+// different time"): the record is an XLOG_CHECKPOINT_SHUTDOWN — no
+// XLOG_CHECKPOINT_REDO or running-xacts record before it — whose
+// PrevTimeLineID is the timeline recovery forked off from, and the cluster
+// stays in production. An ordinary checkpoint keeps PrevTimeLineID =
+// ThisTimeLineID.
+func TestCheckpointerEndOfRecoveryCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	globalDir := filepath.Join(dir, "global")
+	if err := os.MkdirAll(globalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8192)
+	le := binary.LittleEndian
+	le.PutUint64(buf[0:], 0x0102030405060708)
+	le.PutUint32(buf[8:], 1800)
+	le.PutUint32(buf[16:], 6)
+	le.PutUint32(buf[292:], crc32.Checksum(buf[:292], crc32.MakeTable(crc32.Castagnoli)))
+	if err := os.WriteFile(filepath.Join(globalDir, "pg_control"), buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 1 << 20, PageHeaders: true, TimelineID: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		DataDir: dir, PGCompatCheckpoints: true, TimelineIDFn: w.TimelineID,
+		Logger: slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+	before := w.WrittenLSN()
+	if err := cp.CheckpointEndOfRecovery(2); err != nil {
+		t.Fatalf("CheckpointEndOfRecovery: %v", err)
+	}
+	recs, err := ReadAll(walDir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var written []Record
+	for _, r := range recs {
+		if r.StartLSN > before {
+			written = append(written, r)
+		}
+	}
+	if len(written) != 1 || written[0].XLog == nil {
+		t.Fatalf("end-of-recovery checkpoint wrote %d records, want exactly the checkpoint", len(written))
+	}
+	h, md := written[0].XLog.Header, written[0].XLog.MainData
+	if h.Rmid != RmgrXLog || h.Info&0xF0 != 0x00 || len(md) < 16 {
+		t.Fatalf("record rmgr %d info %#x, want XLOG_CHECKPOINT_SHUTDOWN", h.Rmid, h.Info)
+	}
+	if this, prev := le.Uint32(md[8:12]), le.Uint32(md[12:16]); this != 3 || prev != 2 {
+		t.Errorf("ThisTimeLineID %d PrevTimeLineID %d, want 3 and 2", this, prev)
+	}
+	cd, err := control.ReadControlFile(dir)
+	if err != nil || cd == nil {
+		t.Fatalf("ReadControlFile: %v", err)
+	}
+	if cd.State != control.DBStateInProduction || cd.CheckPointCopyThisTLI != 3 || cd.CheckPointCopyPrevTLI != 2 {
+		t.Errorf("pg_control state %v TLI %d prev %d, want in production, 3, 2", cd.State, cd.CheckPointCopyThisTLI, cd.CheckPointCopyPrevTLI)
+	}
+
+	// An ordinary checkpoint afterwards: PrevTimeLineID = ThisTimeLineID.
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	if cd, err := control.ReadControlFile(dir); err != nil || cd == nil || cd.CheckPointCopyPrevTLI != 3 {
+		t.Errorf("ordinary checkpoint PrevTimeLineID = %v (err %v), want 3", cd, err)
+	}
 }
