@@ -4041,9 +4041,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
         same=99\); census `routing\-20261029i` 22/22·99/99·99/99\.
       - New residuals \(ledgered\): goopg's TID\-bitmap sizing / lossification is not PG's tidbitmap\.c;
         `Rows Removed by Index Recheck` is not counted\.
-    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): uncorrelated ARRAY\(\) InitPlan label;
-      `Rows Removed by Index Recheck`; VERBOSE per\-worker block layout; per\-site Buffers/WAL/memory; DML child
-      actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\.
+    - Residual 9 done 2026\-10\-29 \(`7ad6a9d6b`\): an uncorrelated ARRAY\(SELECT …\) is an initplan, as in PG
+      \(subselect\.c make\_subplan\)\.
+      - `SublinkIsInitPlan` classifies it, so it gets the `InitPlan N` label, placement with its level's initPlans
+        and PG's initplan cost charge \(`cost=1\.12\.\.2\.52`, PG's numbers\)\. The reference prints
+        `\(InitPlan N\)\.col1`\.
+      - `evalArraySubquery` caches the result in the scoped sublink store, so it runs once \(ANALYZE loops=1\)\.
+      - Root cause of the misplacement: `NodeSublinks` walked with `walkExprTree`, which never descends into
+        `InExpr`, so `= ANY \(ARRAY\(…\)\)` was invisible to the level\. It now uses the slot walker
+        \(`walkExprRefs`\) and falls back to `walkExprTree` when that walk aborts, so no sublink found before is
+        lost\. Pre\-order and CASE slot order are unchanged\.
+      - The probe's plain EXPLAIN is identical to PG 18\.3's\. Test `TestExplainUncorrelatedArraySublinkIsInitPlan`\.
+      - Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\),
+        tpcds\-fireset PASS \(no query fired\); census `routing\-20261029j` 22/22·99/99·99/99, plan text byte\-identical\.
+      - New residuals \(ledgered\): ARRAY target width estimate \(8 vs PG 36\); VERBOSE Output lines for Result
+        and sublink bodies; ARRAY result is a text string, not a typed array; `walkExprTree`'s other planner
+        callers still stop at InExpr\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): `Rows Removed by Index Recheck`; VERBOSE
+      per\-worker block layout; per\-site Buffers/WAL/memory; DML child actuals \+ MULTIEXPR SubPlan rendering
+      \(last: no benchmark query is DML\)\.
     - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
       in slice 3\.\)
 - [ ] **M0122\-0022 — a row comparison against a multi\-column subquery errors instead of comparing**\.
@@ -6776,6 +6792,8 @@ Sequencing: the S9 replenishment rule in the banner.)
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
   - Census 2026\-10\-29 at `431cec8d7` \(M0122\-0021 residual 10 changed internal/executor\) — `routing\-20261029i/`: TPC\-H
     22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `7ad6a9d6b` \(M0122\-0021 residual 9 changed internal/optimizer \+ executor\) — `routing\-20261029j/`:
+    TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029i\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category

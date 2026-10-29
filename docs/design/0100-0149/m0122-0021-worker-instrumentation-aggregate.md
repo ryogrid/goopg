@@ -3,7 +3,7 @@
 Status: slices 1–4 landed 2026-10-29 — `881b3e314` (worker fold), `28a5ff4c9` (NLI inner / Memoize), `132bf92d2`
 (CTE bodies, SubPlans/InitPlans, cooperative builds, `(never executed)`), `b93ad5337` (shared hash prebuild, worker
 lazy subtrees); residuals 1–2 `04cc96f3b` (bare SubPlan label), `d38dd96ed` (expression-level subqueries, bitmap
-producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
+producers); residual 4 `c49bd9b71` (probe Cond rejection count); residual 3 `910e30183` (per-worker Memoize lines); residual 10 `431cec8d7` (Heap Blocks); residual 9 `7ad6a9d6b` (uncorrelated ARRAY is an initplan). The task stays open for the ledgered residuals listed under "Remaining residuals" (end of file).
 
 ## Problem
 
@@ -240,8 +240,20 @@ serially as well as in parallel plans.
    difference.
 8. UPDATE / DELETE child scans print no actuals, and a MULTIEXPR SubPlan (`SET (a, b) = (SELECT …)`) is not
    rendered. The DML source scans are built outside the operator's scope.
-9. An uncorrelated ARRAY() prints `SubPlan 1`. PG makes it an initplan and prints `InitPlan 1` (subselect.c
-   make_subplan).
+9. ~~An uncorrelated ARRAY() prints `SubPlan 1`. PG makes it an initplan and prints `InitPlan 1` (subselect.c
+   make_subplan).~~ Fixed 2026-10-29 (`7ad6a9d6b`).
+   - `SublinkIsInitPlan` now classifies a non-correlated `ArraySubqueryExpr` as an initplan. That one predicate
+     drives the label, the placement with the level's initPlans, and the initplan cost charge, which now matches
+     PG's numbers.
+   - The reference deparses as `(InitPlan N).col1`.
+   - `evalArraySubquery` caches the uncorrelated result in the scoped sublink store, so the subtree reports one
+     loop.
+   - Why it was misplaced: `NodeSublinks` used `walkExprTree`, whose hand-written list of node kinds stops at
+     `InExpr`, so `= ANY (ARRAY(…))` never reached the level enumeration. `NodeSublinks` now walks with
+     `walkExprRefs` (the `exprChildSlots`-based walker). It falls back to `walkExprTree` when that walk aborts on
+     an unknown node type, so no sublink found before is lost.
+   - Census plan text is unchanged on all three corpora.
+   - Test: `TestExplainUncorrelatedArraySublinkIsInitPlan`.
 10. ~~Bitmap Heap Scan prints no `Heap Blocks: exact=… lossy=…` line (explain.c show_tidbitmap_info).~~ Fixed
     2026-10-29 (`431cec8d7`).
     - `bitmapHeapScanOp` already counted the pages it fetched (`countPage`, once per page from an exact or a lossy
