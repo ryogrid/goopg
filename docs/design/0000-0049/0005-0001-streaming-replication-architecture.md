@@ -247,7 +247,8 @@ With the wiring removed, the test fails on an unchanged redo.
 
 - Restartpoints do not drive WAL segment removal \(`KeepLogSeg` /
   `RemoveOldXlogFiles` in `CreateRestartPoint`\).
-- The skip arm's `UpdateMinRecoveryPoint` is not ported.
+- ~~The skip arm's `UpdateMinRecoveryPoint` is not ported.~~ Ported 2026-10-29 (see "Restartpoint skip arm raises
+  minRecoveryPoint").
 
 ### A standby's pg\_control state \(2026\-10\-27, M0122\-0013\)
 
@@ -389,6 +390,23 @@ Still missing (ledgered):
 - no `archive_cleanup_command`;
 - restartpoints still follow the checkpointer's timer instead of replay's `CheckPointSegments`-driven
   `RequestCheckpoint`.
+
+### Restartpoint skip arm raises minRecoveryPoint \(2026\-10\-29, M0122\-0013\)
+
+The skip arm returns before `CheckPointGuts`, but first runs `UpdateMinRecoveryPoint(InvalidXLogRecPtr, true)`
+(xlog.c). Called that way, in the checkpointer, the function behaves as follows:
+- If pg\_control's `minRecoveryPoint` is unset, nothing changes (`updateMinRecoveryPoint` goes false).
+- Otherwise `minRecoveryPoint` rises to `GetCurrentReplayRecPtr()`, the end of the last replayed record, whenever that
+  is later. This keeps a standby restarted afterwards from opening for read-only connections at an earlier point.
+
+goopg's skip arm only stamped the shutdown state. `runRecoveryFlush` now calls `raiseMinRecoveryPointToReplay` with
+the checkpointer's replay-position source. That source is `StreamReplayer.ApplyLSN`, which already equals PG's
+`lastReplayedEndRecPtr`, so no unit conversion is needed. The timeline stays pg\_control's
+`minRecoveryPointTLI`, falling back to `checkPointCopy`'s when unset. goopg's replayer follows one timeline and
+records none; that gap is ledgered.
+
+Pin: `TestRestartPointSkipRaisesMinRecoveryPointToReplay` covers three cases: raised, replay behind, and unset stays
+unset. It also asserts the skip arm still flushes nothing. Neutralising the call fails it.
 
 ### Restartpoint requests follow the replayed WAL \(2026\-10\-28, M0122\-0013\)
 

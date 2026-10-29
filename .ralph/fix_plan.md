@@ -4142,6 +4142,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
       TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
 - [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - **Restartpoint skip arm raises minRecoveryPoint LANDED 2026\-10\-29 \(`28cdbd4a9`\)**\. Movement: none — recovery
+    path\. CreateRestartPoint's skip arm runs `UpdateMinRecoveryPoint\(InvalidXLogRecPtr, true\)` before returning\.
+    `runRecoveryFlush` now does the same through `raiseMinRecoveryPointToReplay`: minRecoveryPoint rises to the replay
+    position \(`StreamReplayer\.ApplyLSN` = PG's lastReplayedEndRecPtr\) when later; an unset one stays unset\.
+    - Pin: `TestRestartPointSkipRaisesMinRecoveryPointToReplay` \(raise / behind / unset; skip arm flushes nothing\);
+      fails with the call neutralised\.
+    - Gates: units, `\-race` xlog, TestE2E\_Physical\*, the standby / base\-backup / promotion / restartpoint E2Es,
+      tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): the replayer tracks no timeline, so the TLI stays pg\_control's; PreallocXlogFiles;
+      TruncateSUBTRANS on a hot standby; archive\_cleanup\_command\.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
     \(`SetReplayPositionSource`, wired in `cmd/goopg/standby\.go`, cleared at promotion\) and fires once per replay
