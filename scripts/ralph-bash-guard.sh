@@ -486,7 +486,7 @@ if writes_to "$IF" "$nomsg"; then
   deny "shell write to CLAUDE.md/AGENT.md. The loop does not edit its instruction files (H4). A rule that looks wrong is an escalation: write an escalation block into the task and mark it [!]."
 fi
 HB="([\"'[:space:];&|)/]|$)"
-PROT="ralph-[A-Za-z0-9_-]*guard[A-Za-z0-9_.-]*|ralph_protected_regions\.py|ralph-githooks-test\.sh|\.githooks${HB}|\.claude/settings(\.local)?\.json|\.codex${HB}|\.devin${HB}|\.ralph/PROMPT\.md|\.ralph/gate-exceptions\.md|ref-clusters-ensure\.sh|lib/ref-clusters\.sh|tpch-ref-recover\.sh|lib/gate-stamp\.sh|tpcds-fireset-timeout-allow\.tsv|lever-count\.sh|(~|\\\$HOME|\\\$\{HOME\}|/home/[A-Za-z0-9_.-]+|/root)/\.ralph${HB}|\.git/(config|hooks)"
+PROT="ralph-[A-Za-z0-9_-]*guard[A-Za-z0-9_.-]*|ralph_protected_regions\.py|ralph-githooks-test\.sh|\.githooks${HB}|\.claude/settings(\.local)?\.json|\.codex${HB}|\.devin${HB}|\.ralph/PROMPT\.md|\.ralph/gate-exceptions\.md|ref-clusters-ensure\.sh|lib/ref-clusters\.sh|tpch-ref-recover\.sh|lib/gate-stamp\.sh|tpcds-fireset-timeout-allow\.tsv|lever-count\.sh|s9-census-due\.sh|(~|\\\$HOME|\\\$\{HOME\}|/home/[A-Za-z0-9_.-]+|/root)/\.ralph${HB}|\.git/(config|hooks)"
 if writes_to "$PROT" "$nomsg"; then
   deny "shell write/rm/mv/chmod of a harness mechanism file (ralph guards, .githooks, .claude/settings(.local).json, .codex/ and .devin/ hook wiring, .ralph/PROMPT.md, .ralph/gate-exceptions.md, ref-cluster / gate-stamp plumbing, .git/config, ~/.ralph/). These are owner-only (M5): write an escalation block into the task and mark it [!]."
 fi

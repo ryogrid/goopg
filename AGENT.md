@@ -441,7 +441,8 @@ If Go symbol operations fail:
 
 ## Loop discipline (for Ralph)
 
-- One item per loop. Task-selection authority is exactly two places:
+- One item per loop (a banner S9 census pass is not an item — S9(4a)).
+  Task-selection authority is exactly two places:
   `.ralph/PROMPT.md` (procedure and rules) and the `## Current Priority`
   section at the head of `.ralph/fix_plan.md` (rank order + the Selection
   rules subsection, which holds S1/S2/S6/S7/S8/S9 and the M-NIGHTLY selection

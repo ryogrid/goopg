@@ -76,6 +76,7 @@ HARNESS_SUFFIXES = (
     "scripts/lib/gate-stamp.sh",
     "scripts/tpcds-fireset-timeout-allow.tsv",
     "scripts/lever-count.sh",
+    "scripts/s9-census-due.sh",
     "scripts/ralph-prev-loop-check.sh",
     ".git/config",
 )

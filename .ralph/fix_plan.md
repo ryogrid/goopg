@@ -77,17 +77,27 @@ banner at the next `## ` line).
   while they hold an ungated actionable slice or a fileable census
   record of their own; nor do S7-carve-out/below-item-10 descendants
   — run ONE replenishment pass BEFORE item 10:
-  (1) Census freshness — reuse the newest
-  `analysis/m0146/m0146-0014/routing-*/` artifact iff its ROUTING.md's
-  recorded capture sha is an ancestor of HEAD AND no commit since
-  touches `internal/optimizer`, `internal/planner`, `internal/executor`
-  or `*cost*|*stat*|*selfuncs*` paths AND no corpus reload is recorded
-  after the artifact (e.g. the 2026-10-13 SF1 stale-load reload — a
-  corpus change does not move HEAD); otherwise capture fresh
-  (`scripts/jointree-parity-capture.sh` per corpus) and re-run
-  `scripts/pg-plan-parity-diff.py --verbose`. If the captures cannot
-  run (e.g. the source server is live and the capture refuses), item
-  10 is live FOR THIS LOOP.
+  (1) Census freshness (amended 2026-10-30, owner) — run
+  `scripts/s9-census-due.sh` bare from the repository root (protected;
+  the trigger set is in its header). Its verdict is the authority for
+  this S9 pass: do not re-census because a commit "could" move plans,
+  and do not skip a `DUE`. Any first line other than `REUSE …`, or a
+  non-zero exit, counts as `DUE`. Corpus reloads and rebuilds are in
+  the script too (the owner bumps its `CORPUS_EPOCH`).
+  - `REUSE` of an `exhausted` artifact: the S9 pass ends — no note, no
+    commit, no census — and item 10 is live.
+  - `REUSE` of an artifact that filed a task: apply (2)-(4) to the
+    records of the captures named by the script's `BASE` lines.
+  - `DUE`: capture fresh (`scripts/jointree-parity-capture.sh` per
+    corpus, output under `tmp/`) and re-run
+    `scripts/pg-plan-parity-diff.py --verbose`.
+  Put all three captures in ONE directory under `tmp/`. If the
+  captures cannot run (e.g. the source server is live and the
+  capture refuses), item 10 is live FOR THIS LOOP. This rule governs
+  the S9 pass only: a task's own capture gates (AGENT.md G-table, the
+  M0147 "S9 census unchanged" gate) run as their rules say, and they
+  compare against the script's `BASE` lines, not the newest routing
+  directory.
   (2) A record is ACTIONABLE when it is non-MATCH and its census route
   is not a live (`[ ]` or `[!]`) task and not the leaf-count/lateral
   classes owned by M0145-0003/0010. For TPC-H, each non-MATCH query is
@@ -114,18 +124,47 @@ banner at the next `## ` line).
   was cleared by owner verification 2026-10-16 — see (2)). The filed task
   inherits item-3 rank under S7 (named family + plan-instrument
   rationale) — it is selected before item 10.
-  (4) Bounds — ONE filing per pass, never a batch. A pass that files
-  nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
+  (4) Bounds — ONE filing per pass, never a batch. A `DUE` census
+  that files nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
   entry — the note MUST list every open `[ ]` task ranked items 0-9
   and the gate making it non-actionable, as `id(gate)` tokens using
   the closed vocabulary `channel`, `below-item-10`, `owner-<what>`,
   `blocked-on <id>` (e.g. `M0146-0178(owner-reload SF0.25)`), so an
   owner gate such as a pending corpus reload is auditable in the
-  record — and re-runs only after HEAD advances past that sha in the
-  planner-relevant paths above — otherwise item 10 is live for that
-  loop. A replenishment task that closes `Movement: none` must name
+  record (or the one-line form in (4a)) — and re-runs only when
+  `scripts/s9-census-due.sh` says `DUE`; otherwise item 10 is live for
+  that loop. A replenishment task that closes `Movement: none` must name
   why its premise/record was stale; after TWO consecutive such closes
   without a landed fix, stop filing and write the S8 escalation.
+  (4a) Recording a census (owner 2026-10-30).
+  - ROUTING.md's first line is
+    `# M0146-0014 — census at <sha> (<date>): <verdict>`. Add
+    `tree=<git write-tree>` ONLY when the capture's binary was built
+    while `git diff --quiet -- internal cmd scripts bench go.mod go.sum`
+    held (working tree equal to the index); otherwise omit it. The
+    script falls back to the capture commit. The script parses both.
+  - An unchanged census is one where
+    `scripts/s9-census-due.sh --compare <capture-dir>` exits 0 (every
+    corpus `IDENTICAL` to its `BASE`, `#` header lines excluded) AND
+    the verdict (per-corpus match counts and the CATEGORIES-EXCL-MATCH
+    line) equals the previous one. For an unchanged census, commit
+    ONLY `ROUTING.md`. It carries the trigger, capture sha, `tree=`,
+    the match table, and per corpus the `--compare` line, the engine
+    binary's sha256 and the capture's repo head (AGENT.md G3: the
+    evidence that a new binary was measured). Delete the capture,
+    diff and class files from `tmp/`; they never enter `analysis/`.
+  - A changed plan text or verdict commits the full capture, as
+    before.
+  - For an unchanged exhausted census the M0146-0014 `exhausted at`
+    note is one line naming the previous note. That line satisfies
+    (4)'s `id(gate)` list while the list is unchanged. (The
+    working_set `Skip-rationale:` still enumerates its tokens per
+    PROMPT.md.)
+  - An S9 pass is not a task: it never counts toward
+    TASKS_COMPLETED_THIS_LOOP. After any S9 pass the same loop goes on
+    with normal selection: the task the pass filed, or item 10 after
+    an exhausted pass. PROMPT.md "ONE task per loop" counts that task,
+    not the census.
   (5) Plan-parity direction (owner directive 2026-10-16) — binds all
       parity work, S9-filed or owner-seeded:
       (a) Runtime is never a rejection reason. A change that moves a
@@ -419,6 +458,19 @@ OWNER DECISIONS 2026-10-20 — TPC-DS corpora REBUILT for M0146-0216 slices 4+5:
   corpus were removed (re-run the gates).
 - M0146-0216: the owner gate is cleared; the loop re-censuses and closes it
   once its open child M0146-0236 is resolved.
+
+OWNER DECISIONS 2026-10-30 — S9 census waste:
+- Under the old S9(1) path rule ("any commit touching internal/optimizer,
+  internal/planner, internal/executor or *cost*|*stat*|*selfuncs*"),
+  replication, WAL and executor-runtime commits re-ran the full
+  three-corpus census. Since routing-20261021a every census re-captured
+  byte-identical plan text (verdict 22/22·99/99·99/99) and committed
+  ~21k lines; 2026-10-26..30, about half were skippable even by path
+  (e.g. 9ba5792cb, 046833c3b after M0122-0014 replication slices).
+- S9(1) now defers to `scripts/s9-census-due.sh` (tree-keyed reuse, a
+  plan-input trigger set, 24 h backstop; harness-protected); S9(4a)
+  commits only ROUTING.md for an unchanged census, and an S9 pass is
+  not a task — the same loop goes on to item 10.
 
 OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
 - Plan parity is complete on all three corpora (routing-20261021p: 22/22,
