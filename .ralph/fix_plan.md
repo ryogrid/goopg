@@ -791,6 +791,19 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
+- [ ] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
+  M0122\-0014\)\.
+  Kind: impl
+  Parent: none
+  - `scripts/tpcds\-sf025\-regression\.sh` appends every server start and the plan channel's planner DP trace \(about
+    138 MB per sweep\) to `bench/tpcds/runtime\_goopg/goopg\.sf025\.log`, and nothing rotates it\. At 159 GB, the plan
+    channel's `wc \-l` took about 50 minutes, so two sweeps ran past the 60\-minute foreground limit before writing a
+    stamp\. The file is also a large share of the disk headroom; the disk was at 97% with 30 GB free\.
+  - Workaround landed \(`1a7fddb3d`\): `SF025\_LOG` is overridable \(`SF025\_LOG=tmp/<file> scripts/tpcds\-sf025\-regression\.sh
+    sweep`\)\.
+  - Owner decision needed: rotate or retire the 159 GB file, which the loop left untouched; per\-run log files; or
+    replace the `wc \-l` line count with a byte offset \(`stat \-c %s`\) so log size stops mattering\.
+
 - [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
   \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.
   Kind: impl
@@ -4740,6 +4753,19 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **ALTER PUBLICATION ADD / SET / DROP TABLE LANDED 2026\-10\-30 \(`2738001df`\)**\. Movement: none — regress publication
+    2209→2213 \(gains offset by cascades from unmodelled CREATE forms\)\. Before, every form except OWNER TO was a silent
+    no\-op, so pg\_dump's `ADD TABLE ONLY` restored no membership\.
+    - Parser → `AlterPublicationTablesStmt` \(column lists, row filters and TABLES IN SCHEMA stay no\-ops\)\. Executor:
+      PG's 42704 / 55000 / 42P01 / 42710 / 42704 errors, duplicate folding\. pg\_publication\_rel rows are journalled
+      and survive a restart\.
+    - Fixed alongside: pg\_publication\_rel prqual/prattrs were "" instead of NULL \(`\\dRp+` printed `() WHERE`\)\.
+    - Pins: `TestAlterPublicationTables`, `TestParseAlterPublicationTables`,
+      `TestParseAlterPublicationUnmodelledTableFormsStayNoop`\. Gates: units, parser/catalog/initdb, testport
+      publication/pgoutput/subscription 28, tpch\-spotcheck, acceptance arm 24 MATCH, fire\-set PASS \(no fires\),
+      sf025 99/99\.
+    - Found: `go test \./internal/postmaster` fails intermittently, the same way at HEAD and at 2bc45c8b3
+      \(ledgered\)\. Also the sf025 log growth, filed under M\-NIGHTLY\.
   - **Replica\-identity column flags \+ CheckCmdReplicaIdentity LANDED 2026\-10\-30 \(`4a0cf54cc`\)**\. Movement: none — regress
     publication 2209→2209 \(its RI cases sit behind the ALTER PUBLICATION ADD TABLE no\-op\)\.
     - The Relation message flags only identity columns \(FULL all, DEFAULT PK, USING INDEX the index, NOTHING none\;

@@ -174,3 +174,53 @@ the next loop.
   - `postgres/src/backend/commands/publicationcmds.c`,
     `subscriptioncmds.c` — DDL semantics this loop targets for
     eventual parity.
+
+## Update 2026-10-30 — ALTER PUBLICATION ... ADD / SET / DROP TABLE (M0122-0014, `2738001df`)
+
+PG 18.3 reference: `postgres/src/backend/parser/gram.y` (AlterPublicationStmt, pub_obj_list),
+`postgres/src/backend/commands/publicationcmds.c` (AlterPublicationTables, CheckAlterPublication, OpenTableList),
+`postgres/src/backend/catalog/pg_publication.c` (publication_add_relation).
+
+Every ALTER PUBLICATION form other than OWNER TO used to be a `CompatNoopStmt`. That includes `ALTER PUBLICATION p
+ADD TABLE ONLY s.t`, which is how pg_dump writes publication membership, so a restored dump lost all of it.
+
+**Parser** (`internal/parser/ddl.go`): `{ ADD | SET | DROP } TABLE [ONLY] t [*] [, ...]` becomes
+`AlterPublicationTablesStmt`. An item with a column list, a row filter, or a TABLES IN SCHEMA entry keeps the whole
+statement the compat no-op it was. goopg models none of those features, and a syntax error on SQL PG accepts would be
+worse.
+
+**Executor** (`execAlterPublicationTables`):
+
+| case | result |
+|---|---|
+| publication does not exist | 42704 |
+| FOR ALL TABLES publication | 55000, with detail "Tables cannot be added to or dropped from FOR ALL TABLES publications." |
+| table does not exist | 42P01 |
+| ADD of a member | 42710 "relation \"%s\" is already member of publication \"%s\"" |
+| DROP of a non-member | 42704 "relation \"%s\" is not part of the publication" |
+| SET | replaces the list |
+
+Tables named twice are folded (OpenTableList). The registry update is `PubSub.SetPublicationTables`. Membership is
+journalled as pg_publication_rel rows: `writePublicationMemberRowsFor` for added tables and
+`deletePublicationMemberRows` (xmax) for dropped ones. The startup reload rebuilds the registry from those rows; a
+live probe across a restart keeps the SET result.
+
+**Virtual view fix:** pg_publication_rel's `prqual` / `prattrs` were `""`, so psql's `\dRp+` printed every member
+as `"public.t" () WHERE`. They are now `VirtualNull`.
+
+**Pins:** `TestAlterPublicationTables`, `TestParseAlterPublicationTables`,
+`TestParseAlterPublicationUnmodelledTableFormsStayNoop`.
+
+**regress publication** goes from 2209 to 2213 diff lines.
+
+- Now matching PG: the FOR ALL TABLES errors, the member listings, and the deferrable-key replica-identity error.
+- Offsetting them: ALTERs on publications whose CREATE uses unmodelled features (TABLES IN SCHEMA, row filters) now
+  fail visibly, and a DROP fails after an ADD whose column list kept it a no-op.
+
+**Still open (ledgered):**
+
+- TABLES IN SCHEMA, column lists and row filters.
+- `ALTER PUBLICATION ... SET (option ...)` and RENAME TO are still no-ops.
+- `CREATE PUBLICATION ... FOR TABLE ONLY t` fails to parse.
+- `DROP PUBLICATION a, b` is not parsed.
+- The ownership check (must be owner of publication) is not applied.
