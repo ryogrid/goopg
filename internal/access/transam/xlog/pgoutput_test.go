@@ -561,3 +561,56 @@ func TestPgOutputEmitsChangeForNonDefaultDB(t *testing.T) {
 		t.Errorf("DB-2 change leaked into the default snapshot: %x", buf1.Bytes())
 	}
 }
+
+// TestPgOutputRelationMessageFields pins the Relation message against
+// logicalrep_write_rel / logicalrep_write_namespace / logicalrep_write_attrs:
+// a table in public is named "public" (an empty namespace means pg_catalog to
+// a PG subscriber), relreplident follows the table, and each column carries
+// its atttypmod — varchar(10) → 14, numeric(8,2) → (8<<16|2)+4, int4 → -1.
+func TestPgOutputRelationMessageFields(t *testing.T) {
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "items"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "label", Type: catalog.Type{Name: "varchar", Args: []int64{10}}, Ordinal: 1},
+		{Name: "price", Type: catalog.Type{Name: "numeric", Args: []int64{8, 2}}, Ordinal: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl.ReplicaIdentity = "f"
+	snap := BuildCatalogSnapshot(c, nil)
+	rel, _ := snap.Lookup(c.RelFileNode(tbl))
+	var buf bytes.Buffer
+	if err := NewPgOutput(snap, &buf).writeRelation(rel); err != nil {
+		t.Fatal(err)
+	}
+	b := buf.Bytes()
+	rest := b[5:] // 'R' + relid
+	cstr := func() string {
+		i := bytes.IndexByte(rest, 0)
+		s := string(rest[:i])
+		rest = rest[i+1:]
+		return s
+	}
+	if ns, name := cstr(), cstr(); ns != "public" || name != "items" {
+		t.Fatalf("namespace/name = %q/%q, want public/items", ns, name)
+	}
+	if rest[0] != 'f' {
+		t.Errorf("relreplident = %q, want 'f'", rest[0])
+	}
+	natts := binary.BigEndian.Uint16(rest[1:3])
+	rest = rest[3:]
+	want := map[string]int32{"id": -1, "label": 14, "price": (8<<16 | 2) + 4}
+	for i := 0; i < int(natts); i++ {
+		rest = rest[1:] // flags
+		name := cstr()
+		typmod := int32(binary.BigEndian.Uint32(rest[4:8]))
+		rest = rest[8:]
+		if typmod != want[name] {
+			t.Errorf("column %s atttypmod = %d, want %d", name, typmod, want[name])
+		}
+	}
+	if relationNamespace("pg_catalog") != "" || relationNamespace("sales") != "sales" {
+		t.Error("pg_catalog must be written empty and other namespaces by name")
+	}
+}

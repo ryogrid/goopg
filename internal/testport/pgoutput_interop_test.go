@@ -3212,3 +3212,52 @@ func TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply(t *testing.T) {
 			postSrc, killCommitted, got)
 	}
 }
+
+// TestPort_PgoutputInteropGoopgToPGUnqualifiedTable: a table the goopg
+// publisher created WITHOUT a schema (goopg records it with an empty Schema)
+// replicates to a PG 18.3 subscriber. The Relation message must name its
+// namespace "public": logicalrep_read_namespace reads an empty namespace as
+// pg_catalog, so the subscriber used to look for pg_catalog.t and apply
+// nothing. TestPort_PgoutputInteropGoopgToPG creates public.t explicitly and
+// never saw it.
+func TestPort_PgoutputInteropGoopgToPGUnqualifiedTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	baseDir := t.TempDir()
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2pg_unq", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindPG,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2pg_unq_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2pg_unq_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v varchar(10))")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v varchar(10))")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'hello')")
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (2, 'world')")
+	psc.Publisher.Exec(t, "UPDATE t SET v = 'updated' WHERE id = 2")
+
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "2" {
+		t.Fatalf("subscriber row count after replication: got %q want 2", got)
+	}
+}

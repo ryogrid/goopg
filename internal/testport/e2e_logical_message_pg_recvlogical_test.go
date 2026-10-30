@@ -122,6 +122,12 @@ func TestE2E_LogicalMessageReachesPgRecvlogical(t *testing.T) {
 	if bytes.Contains(data, []byte("rolled-back")) {
 		t.Error("a message from a rolled-back transaction reached the subscriber")
 	}
+	// The Relation message names the table's namespace: "public", not the
+	// empty string a PG subscriber reads as pg_catalog
+	// (logicalrep_write_namespace / logicalrep_read_namespace).
+	if !bytes.Contains(data, []byte("public\x00lm_t\x00")) {
+		t.Errorf("Relation message does not name namespace public:\n% x", data)
+	}
 	// The transactional message sits inside a BEGIN ... COMMIT; the
 	// non-transactional one does not.
 	lastB := bytes.LastIndexByte(data[:inXact], 'B')

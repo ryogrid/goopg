@@ -27,6 +27,7 @@ package xlog
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/nodes"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -40,6 +41,9 @@ type RelationDef struct {
 	Name    string
 	OID     uint32
 	Columns []ColumnDef
+	// ReplIdent is pg_class.relreplident ('d', 'f', 'i', 'n'), which the
+	// Relation message carries (logicalrep_write_rel).
+	ReplIdent byte
 }
 
 // ColumnDef mirrors `catalog.Column` but lives in the snapshot
@@ -50,6 +54,9 @@ type ColumnDef struct {
 	Type    catalog.Type
 	NotNull bool
 	Ordinal int
+	// Typmod is pg_attribute.atttypmod (-1 for none), which the Relation
+	// message carries per column (logicalrep_write_attrs).
+	Typmod int32
 }
 
 // CatalogSnapshot is the slot-creation-time view of all user
@@ -86,10 +93,11 @@ func BuildCatalogSnapshot(c *catalog.InMemory, regOut func(string, uint32) strin
 	out.RegOut = regOut
 	for _, t := range tables {
 		def := &RelationDef{
-			Schema:  t.Schema,
-			Name:    t.Name,
-			OID:     t.OID,
-			Columns: make([]ColumnDef, len(t.Columns)),
+			Schema:    t.Schema,
+			Name:      t.Name,
+			OID:       t.OID,
+			Columns:   make([]ColumnDef, len(t.Columns)),
+			ReplIdent: catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0],
 		}
 		for i, col := range t.Columns {
 			def.Columns[i] = ColumnDef{
@@ -97,6 +105,7 @@ func BuildCatalogSnapshot(c *catalog.InMemory, regOut func(string, uint32) strin
 				Type:    col.Type,
 				NotNull: col.NotNull,
 				Ordinal: col.Ordinal,
+				Typmod:  nodes.ColumnTypmod(col.Type.Name, col.Type.Args),
 			}
 		}
 		out.rels[t.OID] = def
