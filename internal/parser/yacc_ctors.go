@@ -828,8 +828,8 @@ func NewDropPolicyStmt(pos int, name string, table ObjectName, ifExists bool) *D
 	return &DropPolicyStmt{pos: pos, Name: name, Table: table, IfExists: ifExists}
 }
 
-func NewDropPublicationStmt(pos int, name string, ifExists bool) *DropPublicationStmt {
-	return &DropPublicationStmt{pos: pos, Name: name, IfExists: ifExists}
+func NewDropPublicationStmt(pos int, names []string, ifExists bool) *DropPublicationStmt {
+	return &DropPublicationStmt{pos: pos, Name: names[0], Names: names, IfExists: ifExists}
 }
 
 func NewDropSubscriptionStmt(pos int, name string, ifExists bool) *DropSubscriptionStmt {

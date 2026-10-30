@@ -313,6 +313,22 @@ func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uin
 	return &out, nil
 }
 
+// SetPublicationOptions replaces a publication's publish actions (ALTER
+// PUBLICATION ... SET ( ... )). AllTables is not changed. It returns the
+// updated publication.
+func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbOid ...uint32) (*Publication, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return nil, fmt.Errorf("publication %q does not exist", name)
+	}
+	pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete = opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	return &out, nil
+}
+
 // PublicationsForDBOid returns every publication belonging to dbOid in name
 // order. Each entry is a deep copy. M0119-0004 (DU-002 per-DB publication
 // scoping).

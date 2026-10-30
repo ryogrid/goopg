@@ -3012,7 +3012,10 @@ func (s *CreatePublicationStmt) stmtNode() {}
 type DropPublicationStmt struct {
 	pos      int
 	IfExists bool
-	Name     string
+	Name     string // the first of Names
+	// Names lists every publication `DROP PUBLICATION a, b` names, in
+	// order.
+	Names []string
 }
 
 func (s *DropPublicationStmt) Pos() int  { return s.pos }
@@ -3055,6 +3058,17 @@ type AlterPublicationTablesStmt struct {
 
 func (s *AlterPublicationTablesStmt) Pos() int  { return s.pos }
 func (s *AlterPublicationTablesStmt) stmtNode() {}
+
+// AlterPublicationOptionsStmt — `ALTER PUBLICATION name SET ( option = value
+// [, ...] )` (publicationcmds.c AlterPublicationOptions).
+type AlterPublicationOptionsStmt struct {
+	pos  int
+	Name string
+	With map[string]string
+}
+
+func (s *AlterPublicationOptionsStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationOptionsStmt) stmtNode() {}
 
 // AlterPublicationOwnerStmt — `ALTER PUBLICATION name OWNER TO { new_owner |
 // CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER PUBLICATION

@@ -2442,11 +2442,25 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 			}
 			stmt.AllTables = true
 		} else if p.acceptKeyword(KwTable) {
-			tables, err := p.parseObjectList()
-			if err != nil {
-				return nil, err
+			// pub_obj_list TABLE items: [ONLY] name [*] (gram.y
+			// PublicationObjSpec relation_expr).
+			for {
+				p.acceptIdentKeyword("only")
+				obj, err := p.parseObjectName()
+				if err != nil {
+					return nil, err
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+					p.advance()
+				}
+				stmt.Tables = append(stmt.Tables, obj)
+				if !p.acceptSymbol(",") {
+					break
+				}
+				// pub_obj_list: a later item may repeat TABLE
+				// (`TABLE a, TABLE b`) or continue bare (`TABLE a, b`).
+				p.acceptKeyword(KwTable)
 			}
-			stmt.Tables = tables
 		} else {
 			return nil, p.errAtCur("expected ALL TABLES or TABLE after FOR")
 		}
@@ -6033,7 +6047,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &DropPublicationStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
+		return &DropPublicationStmt{pos: t.Pos, IfExists: ifExists, Name: name, Names: []string{name}}, nil
 	case KwSubscription:
 		p.advance()
 		ifExists, name, err := p.parseDropPubSubTail("subscription")
@@ -8810,6 +8824,13 @@ func (p *parser) parseAlter() (Stmt, error) {
 				action = "set"
 			case p.acceptKeyword(KwDrop):
 				action = "drop"
+			}
+			if action == "set" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts, err := p.parsePubSubWithList()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterPublicationOptionsStmt{pos: t.Pos, Name: name, With: opts}, nil
 			}
 			if action != "" && p.acceptKeyword(KwTable) {
 				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}

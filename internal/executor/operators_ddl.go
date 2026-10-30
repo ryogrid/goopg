@@ -205,6 +205,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterPublicationOwner(s)
 	case *parser.AlterPublicationTablesStmt:
 		return nil, o.execAlterPublicationTables(s)
+	case *parser.AlterPublicationOptionsStmt:
+		return nil, o.execAlterPublicationOptions(s)
 	case *parser.AlterSubscriptionOwnerStmt:
 		return nil, o.execAlterSubscriptionOwner(s)
 	case *parser.CreateEventTriggerStmt:
@@ -1191,24 +1193,8 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	}
 	opts := catalog.DefaultPublicationOptions()
 	opts.AllTables = s.AllTables
-	if pub, ok := s.With["publish"]; ok {
-		opts.PublishInsert = false
-		opts.PublishUpdate = false
-		opts.PublishDelete = false
-		for _, kind := range splitCommaList(pub) {
-			switch kind {
-			case "insert":
-				opts.PublishInsert = true
-			case "update":
-				opts.PublishUpdate = true
-			case "delete":
-				opts.PublishDelete = true
-			case "truncate":
-				// Out of scope: silently accept.
-			default:
-				return &ExecError{Code: "22023", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized publish action %q", kind)}
-			}
-		}
+	if err := applyPublicationOptions(s.With, &opts); err != nil {
+		return err
 	}
 	// Canonicalise each table reference to the qualified form the
 	// walsender's publication filter compares against
@@ -1266,19 +1252,39 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	// B3.3: capture the OID before the registry drop, then stamp xmax on
 	// the pg_publication row and its pg_publication_rel members (kind 51
 	// retired).
-	var pubOID uint32
+	// DROP PUBLICATION a, b (RemoveObjects): every name is resolved before
+	// any is dropped — PG's DROP is transactional and a missing name aborts
+	// it whole, while goopg's registry drop is not, so a missing name must
+	// fail the statement before the first drop. IF EXISTS skips a missing
+	// name with PG's NOTICE.
+	names := s.Names
+	if len(names) == 0 {
+		names = []string{s.Name}
+	}
 	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
-		pubOID = pub.OID
+	type target struct {
+		name string
+		oid  uint32
 	}
-	if err := o.ctx.PubSub.DropPublication(s.Name, pubDBOid); err != nil {
-		if s.IfExists {
-			return nil
+	var targets []target
+	for _, name := range names {
+		pub, ok := o.ctx.PubSub.LookupPublication(name, pubDBOid)
+		if !ok || pub == nil {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("publication \"%s\" does not exist, skipping", name))
+				continue
+			}
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", name)}
 		}
-		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+		targets = append(targets, target{name, pub.OID})
 	}
-	if pubOID != 0 {
-		deletePublicationCatalogRows(o.ctx, pubOID)
+	for _, t := range targets {
+		if err := o.ctx.PubSub.DropPublication(t.name, pubDBOid); err != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+		}
+		if t.oid != 0 {
+			deletePublicationCatalogRows(o.ctx, t.oid)
+		}
 	}
 	return nil
 }
@@ -1375,6 +1381,68 @@ func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
 		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("role %q does not exist", newOwner)}
 	}
 	return oid, nil
+}
+
+// applyPublicationOptions is parse_publication_options (publicationcmds.c)
+// for the options goopg models: `publish` resets the four actions and sets
+// the listed ones (42601 "unrecognized value for publication option
+// \"publish\": \"%s\""; truncate is accepted and not tracked);
+// publish_via_partition_root and publish_generated_columns are accepted and
+// not tracked; any other name is 42601 "unrecognized publication parameter:
+// \"%s\"".
+func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOptions) error {
+	for name, value := range with {
+		switch name {
+		case "publish":
+			opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete = false, false, false
+			for _, kind := range splitCommaList(value) {
+				switch kind {
+				case "insert":
+					opts.PublishInsert = true
+				case "update":
+					opts.PublishUpdate = true
+				case "delete":
+					opts.PublishDelete = true
+				case "truncate":
+				default:
+					return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized value for publication option \"publish\": \"%s\"", kind)}
+				}
+			}
+		case "publish_via_partition_root", "publish_generated_columns":
+		default:
+			return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized publication parameter: \"%s\"", name)}
+		}
+	}
+	return nil
+}
+
+// execAlterPublicationOptions handles ALTER PUBLICATION name SET ( ... ) as
+// AlterPublicationOptions does: the options are re-parsed over the current
+// ones (an option not named keeps its value; `publish` resets all four
+// actions first), the registry is updated and the pg_publication row is
+// rewritten.
+func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	pub, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid)
+	if !ok {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
+	}
+	opts := catalog.PublicationOptions{AllTables: pub.AllTables, PublishInsert: pub.PublishInsert,
+		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete}
+	if err := applyPublicationOptions(s.With, &opts); err != nil {
+		return err
+	}
+	updated, err := o.ctx.PubSub.SetPublicationOptions(s.Name, opts, dbOid)
+	if err != nil {
+		return &ExecError{Code: "42704", Message: err.Error()}
+	}
+	if err := upsertPublicationCatalogRow(o.ctx, updated); err != nil {
+		return fmt.Errorf("pg_publication journal: %w", err)
+	}
+	return nil
 }
 
 // execAlterPublicationTables handles ALTER PUBLICATION name { ADD | SET |

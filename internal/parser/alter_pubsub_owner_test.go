@@ -57,15 +57,14 @@ func TestParseAlterSubscriptionOwner(t *testing.T) {
 }
 
 // TestParseAlterPublicationOtherFormsStillNoop confirms an unmodelled
-// ALTER PUBLICATION/SUBSCRIPTION tail (RENAME TO, SET (option ...), ADD
-// TABLES IN SCHEMA, the subscription forms) still parses without error as
-// the pre-existing compatibility no-op — ADD / SET / DROP TABLE is modelled
-// (TestParseAlterPublicationTables) —
+// ALTER PUBLICATION/SUBSCRIPTION tail (RENAME TO, ADD TABLES IN SCHEMA, the
+// subscription forms) still parses without error as the pre-existing
+// compatibility no-op — ADD / SET / DROP TABLE and SET ( options ) are
+// modelled (TestParseAlterPublicationTables, TestParsePublicationDDLForms) —
 // rather than erroring or being misrouted into the OWNER TO path.
 func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 	cases := []string{
 		"ALTER PUBLICATION mypub RENAME TO otherpub",
-		"ALTER PUBLICATION mypub SET (publish = 'insert')",
 		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		"ALTER SUBSCRIPTION mysub SET PUBLICATION p2",
@@ -143,5 +142,34 @@ func TestParseAlterPublicationUnmodelledTableFormsStayNoop(t *testing.T) {
 		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
 			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
 		}
+	}
+}
+
+// TestParsePublicationDDLForms: ALTER PUBLICATION ... SET ( options )
+// (AlterPublicationOptions), DROP PUBLICATION's name list (gram.y DropStmt
+// name_list), and CREATE PUBLICATION's [ONLY] t [*] table items (pub_obj_list
+// relation_expr; a later item may repeat TABLE).
+func TestParsePublicationDDLForms(t *testing.T) {
+	stmts, err := Parse("ALTER PUBLICATION p SET (publish = 'insert, update')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o, ok := stmts[0].(*AlterPublicationOptionsStmt); !ok || o.Name != "p" || o.With["publish"] != "insert, update" {
+		t.Errorf("SET options = %#v", stmts[0])
+	}
+	stmts, err = Parse("DROP PUBLICATION IF EXISTS a, b CASCADE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := stmts[0].(*DropPublicationStmt); !ok || !d.IfExists || len(d.Names) != 2 || d.Names[0] != "a" || d.Names[1] != "b" || d.Name != "a" {
+		t.Errorf("DROP list = %#v", stmts[0])
+	}
+	stmts, err = Parse("CREATE PUBLICATION p FOR TABLE ONLY s.t1, t2 *, TABLE t3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := stmts[0].(*CreatePublicationStmt)
+	if !ok || len(c.Tables) != 3 || c.Tables[0].Schema != "s" || c.Tables[0].Name != "t1" || c.Tables[1].Name != "t2" || c.Tables[2].Name != "t3" {
+		t.Errorf("CREATE tables = %#v", stmts[0])
 	}
 }

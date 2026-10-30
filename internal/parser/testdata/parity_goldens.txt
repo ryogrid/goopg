@@ -850,7 +850,7 @@ DROP POLICY IF EXISTS p ON t CASCADE	DropPolicyStmt{Name="p",Table=ObjectName{Sc
 DROP POLICY p ON t	DropPolicyStmt{Name="p",Table=ObjectName{Schema="",Name="t"},IfExists=false}
 DROP PROCEDURE IF EXISTS p, q CASCADE	DropProcedureStmt{IfExists=true,Name=ObjectName{Schema="",Name="p"},Names=[ObjectName{Schema="",Name="q"}],Args=∅,Behavior=1,ObjKind=""}
 DROP PROCEDURE p(int)	DropProcedureStmt{IfExists=false,Name=ObjectName{Schema="",Name="p"},Names=∅,Args=[FunctionArg{Name="",Mode=0,ModeExplicit=false,Type=ColumnType{Schema="",Name="int",Args=∅,IsArray=false},Default=∅}],Behavior=0,ObjKind=""}
-DROP PUBLICATION p	DropPublicationStmt{IfExists=false,Name="p"}
+DROP PUBLICATION p	DropPublicationStmt{IfExists=false,Name="p",Names=["p"]}
 DROP ROUTINE r(int)	DropProcedureStmt{IfExists=false,Name=ObjectName{Schema="",Name="r"},Names=∅,Args=[FunctionArg{Name="",Mode=0,ModeExplicit=false,Type=ColumnType{Schema="",Name="int",Args=∅,IsArray=false},Default=∅}],Behavior=0,ObjKind="routine"}
 DROP RULE IF EXISTS r ON s.t CASCADE	DropRuleStmt{Name="r",Table=ObjectName{Schema="s",Name="t"},IfExists=true}
 DROP RULE r ON t	DropRuleStmt{Name="r",Table=ObjectName{Schema="",Name="t"},IfExists=false}

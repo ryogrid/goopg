@@ -451,3 +451,55 @@ func TestAlterPublicationTables(t *testing.T) {
 	wantErr("ALTER PUBLICATION pall ADD TABLE a", "55000", `publication "pall" is defined as FOR ALL TABLES`)
 	wantErr("ALTER PUBLICATION nopub ADD TABLE a", "42704", `publication "nopub" does not exist`)
 }
+
+// TestPublicationDDLForms pins three publication DDL forms against
+// publicationcmds.c:
+//   - ALTER PUBLICATION ... SET ( publish = ... ) re-parses the actions
+//     (AlterPublicationOptions); a bad value or parameter is 42601;
+//   - DROP PUBLICATION a, b drops all of them; a missing name fails the whole
+//     statement before any drop (PG's DROP is transactional), and IF EXISTS
+//     skips it;
+//   - CREATE PUBLICATION ... FOR TABLE ONLY t accepts the ONLY item.
+func TestPublicationDDLForms(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	im := ctx.Catalog.(*catalog.InMemory)
+	if _, err := im.CreateTable(parser.ObjectName{Schema: "public", Name: "a"}, []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}}}); err != nil {
+		t.Fatal(err)
+	}
+	mustDDL := func(q string) {
+		t.Helper()
+		if err := runDDL(t, ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	wantErr := func(q, code, msg string) {
+		t.Helper()
+		var ee *ExecError
+		if err := runDDL(t, ctx, q); !errors.As(err, &ee) || ee.Code != code || ee.Message != msg {
+			t.Errorf("%s: got %v, want %s %q", q, err, code, msg)
+		}
+	}
+	exists := func(name string) bool { _, ok := ctx.PubSub.LookupPublication(name); return ok }
+
+	mustDDL("CREATE PUBLICATION p1 FOR TABLE ONLY a")
+	mustDDL("ALTER PUBLICATION p1 SET (publish = 'insert')")
+	if pub, _ := ctx.PubSub.LookupPublication("p1"); !pub.PublishInsert || pub.PublishUpdate || pub.PublishDelete {
+		t.Errorf("after SET publish=insert: %+v", pub)
+	}
+	wantErr("ALTER PUBLICATION p1 SET (publish = 'cluster')", "42601", `unrecognized value for publication option "publish": "cluster"`)
+	wantErr("ALTER PUBLICATION p1 SET (foo = 'x')", "42601", `unrecognized publication parameter: "foo"`)
+
+	mustDDL("CREATE PUBLICATION p2")
+	mustDDL("CREATE PUBLICATION p3")
+	wantErr("DROP PUBLICATION p2, nosuch", "42704", `publication "nosuch" does not exist`)
+	if !exists("p2") {
+		t.Fatal("p2 was dropped although the statement failed on a later name")
+	}
+	mustDDL("DROP PUBLICATION IF EXISTS nosuch, p2")
+	mustDDL("DROP PUBLICATION p1, p3")
+	if exists("p1") || exists("p2") || exists("p3") {
+		t.Error("DROP PUBLICATION left a named publication behind")
+	}
+}

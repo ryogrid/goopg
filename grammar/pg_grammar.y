@@ -161,7 +161,7 @@
 %type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
 
-%type <strs>	constr_name_list
+%type <strs>	constr_name_list pub_name_list
 %type <b>	constraints_set_mode opt_no_inherit opt_ctas_with_data
 %type <node>	trunc_name_list trunc_name
 %type <exprs>	opt_func_call_args
