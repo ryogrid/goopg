@@ -399,3 +399,55 @@ func TestCheckCmdReplicaIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestAlterPublicationTables pins AlterPublicationTables (publicationcmds.c):
+// ADD appends (refusing a member, 42710), DROP removes (refusing a
+// non-member, 42704), SET replaces with duplicates folded (OpenTableList),
+// and a FOR ALL TABLES publication refuses all three (55000). It used to be a
+// silent no-op, so pg_dump's `ALTER PUBLICATION p ADD TABLE ONLY s.t` restored
+// no membership.
+func TestAlterPublicationTables(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	im := ctx.Catalog.(*catalog.InMemory)
+	for _, n := range []string{"a", "b", "c"} {
+		if _, err := im.CreateTable(parser.ObjectName{Schema: "public", Name: n}, []catalog.Column{
+			{Name: "id", Type: catalog.Type{Name: "int4"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustDDL := func(q string) {
+		t.Helper()
+		if err := runDDL(t, ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	wantErr := func(q, code, msg string) {
+		t.Helper()
+		var ee *ExecError
+		if err := runDDL(t, ctx, q); !errors.As(err, &ee) || ee.Code != code || ee.Message != msg {
+			t.Errorf("%s: got %v, want %s %q", q, err, code, msg)
+		}
+	}
+	tables := func() []string {
+		pub, _ := ctx.PubSub.LookupPublication("p")
+		return pub.Tables
+	}
+	mustDDL("CREATE PUBLICATION p FOR TABLE a")
+	mustDDL("ALTER PUBLICATION p ADD TABLE ONLY public.b, c")
+	if got := tables(); len(got) != 3 || got[0] != "public.a" || got[1] != "public.b" || got[2] != "public.c" {
+		t.Fatalf("after ADD: %v", got)
+	}
+	wantErr("ALTER PUBLICATION p ADD TABLE a", "42710", `relation "a" is already member of publication "p"`)
+	mustDDL("ALTER PUBLICATION p DROP TABLE a")
+	wantErr("ALTER PUBLICATION p DROP TABLE a", "42704", `relation "a" is not part of the publication`)
+	mustDDL("ALTER PUBLICATION p SET TABLE c, c")
+	if got := tables(); len(got) != 1 || got[0] != "public.c" {
+		t.Fatalf("after SET: %v", got)
+	}
+	mustDDL("CREATE PUBLICATION pall FOR ALL TABLES")
+	wantErr("ALTER PUBLICATION pall ADD TABLE a", "55000", `publication "pall" is defined as FOR ALL TABLES`)
+	wantErr("ALTER PUBLICATION nopub ADD TABLE a", "42704", `publication "nopub" does not exist`)
+}

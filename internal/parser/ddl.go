@@ -8798,6 +8798,53 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return &AlterSubscriptionOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
 		}
+		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].
+		// Other ADD/SET/DROP forms (SET (option ...), TABLES IN SCHEMA) stay
+		// the compat no-op below.
+		if pubSubKind == KwPublication {
+			action := ""
+			switch {
+			case p.acceptKeyword(KwAdd):
+				action = "add"
+			case p.acceptKeyword(KwSet):
+				action = "set"
+			case p.acceptKeyword(KwDrop):
+				action = "drop"
+			}
+			if action != "" && p.acceptKeyword(KwTable) {
+				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}
+				modelled := true
+				for modelled {
+					// A TABLES IN SCHEMA item, a column list `t (a, b)`
+					// or a row filter `t WHERE (...)` is a publication
+					// feature goopg does not model: the statement stays
+					// the compat no-op below, as before, rather than
+					// failing on syntax PG accepts.
+					if p.cur().Kind == TokenKeyword && Keyword(p.cur().Value) == KwTables {
+						modelled = false
+						break
+					}
+					p.acceptIdentKeyword("only")
+					obj, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+						p.advance()
+					}
+					stmt.Tables = append(stmt.Tables, obj)
+					switch {
+					case p.cur().Kind == TokenSymbol && p.cur().Value == ",":
+						p.advance()
+						continue
+					case p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";"):
+						return stmt, nil
+					default:
+						modelled = false
+					}
+				}
+			}
+		}
 		// Other ALTER PUBLICATION/SUBSCRIPTION forms: consume as no-op.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

@@ -203,6 +203,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropSubscription(s)
 	case *parser.AlterPublicationOwnerStmt:
 		return nil, o.execAlterPublicationOwner(s)
+	case *parser.AlterPublicationTablesStmt:
+		return nil, o.execAlterPublicationTables(s)
 	case *parser.AlterSubscriptionOwnerStmt:
 		return nil, o.execAlterSubscriptionOwner(s)
 	case *parser.CreateEventTriggerStmt:
@@ -1373,6 +1375,105 @@ func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
 		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("role %q does not exist", newOwner)}
 	}
 	return oid, nil
+}
+
+// execAlterPublicationTables handles ALTER PUBLICATION name { ADD | SET |
+// DROP } TABLE t [, ...] as AlterPublicationTables (publicationcmds.c) does:
+// the publication must exist and must not be FOR ALL TABLES (55000, "Tables
+// cannot be added to or dropped from FOR ALL TABLES publications."); every
+// table must exist (42P01); ADD refuses a member (42710 "relation \"%s\" is
+// already member of publication \"%s\"", publication_add_relation); DROP
+// refuses a non-member (42704 "relation \"%s\" is not part of the
+// publication"); SET replaces the list. A table named twice is one entry
+// (OpenTableList filters duplicates). Membership is journalled as
+// pg_publication_rel rows — written for added tables, xmax-stamped for dropped
+// ones — which the startup reload rebuilds the registry from.
+func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	pub, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid)
+	if !ok {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
+	}
+	if pub.AllTables {
+		return &ExecError{Code: "55000",
+			Message: fmt.Sprintf("publication \"%s\" is defined as FOR ALL TABLES", s.Name),
+			Detail:  "Tables cannot be added to or dropped from FOR ALL TABLES publications."}
+	}
+	type member struct{ qname, name string }
+	var listed []member
+	seen := map[string]bool{}
+	for _, t := range s.Tables {
+		tbl, ok := o.ctx.Catalog.LookupTable(t, dbOid)
+		if !ok && t.Schema == "" {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name}, dbOid)
+		}
+		if !ok {
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
+		}
+		if q := tbl.QualifiedName(); !seen[q] {
+			seen[q] = true
+			listed = append(listed, member{q, tbl.Name})
+		}
+	}
+	current := map[string]bool{}
+	for _, q := range pub.Tables {
+		current[q] = true
+	}
+	var next []string
+	switch s.Action {
+	case "add":
+		next = append(next, pub.Tables...)
+		for _, m := range listed {
+			if current[m.qname] {
+				return &ExecError{Code: "42710", Message: fmt.Sprintf("relation \"%s\" is already member of publication \"%s\"", m.name, s.Name)}
+			}
+			next = append(next, m.qname)
+		}
+	case "drop":
+		drop := map[string]bool{}
+		for _, m := range listed {
+			if !current[m.qname] {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("relation \"%s\" is not part of the publication", m.name)}
+			}
+			drop[m.qname] = true
+		}
+		for _, q := range pub.Tables {
+			if !drop[q] {
+				next = append(next, q)
+			}
+		}
+	default: // set
+		for _, m := range listed {
+			next = append(next, m.qname)
+		}
+	}
+	updated, err := o.ctx.PubSub.SetPublicationTables(s.Name, next, dbOid)
+	if err != nil {
+		return &ExecError{Code: "42704", Message: err.Error()}
+	}
+	nextSet := map[string]bool{}
+	for _, q := range next {
+		nextSet[q] = true
+	}
+	var added, removed []string
+	for _, q := range next {
+		if !current[q] {
+			added = append(added, q)
+		}
+	}
+	for _, q := range pub.Tables {
+		if !nextSet[q] {
+			removed = append(removed, q)
+		}
+	}
+	if err := writePublicationMemberRowsFor(o.ctx, updated, added); err != nil {
+		return fmt.Errorf("pg_publication_rel journal: %w", err)
+	}
+	deletePublicationMemberRows(o.ctx, updated.OID, removed)
+	return nil
 }
 
 // execAlterPublicationOwner handles ALTER PUBLICATION name OWNER TO newowner.

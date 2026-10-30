@@ -479,8 +479,12 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 					"", // oid of the pg_publication_rel row itself
 					fmt.Sprintf("%d", pub.OID),
 					relOID,
-					"", // prqual: row filter — out of scope
-					"", // prattrs: column list — out of scope
+					// prqual / prattrs are NULL without a row filter /
+					// column list (goopg models neither). They were "",
+					// which psql's \dRp+ (describe.c) reads as present
+					// and prints as `"public.t" () WHERE`.
+					catalog.VirtualNull, // prqual
+					catalog.VirtualNull, // prattrs
 				})
 			}
 		}

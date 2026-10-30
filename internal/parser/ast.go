@@ -3041,6 +3041,21 @@ type DropSubscriptionStmt struct {
 func (s *DropSubscriptionStmt) Pos() int  { return s.pos }
 func (s *DropSubscriptionStmt) stmtNode() {}
 
+// AlterPublicationTablesStmt — `ALTER PUBLICATION name { ADD | SET | DROP }
+// TABLE [ONLY] t [*] [, ...]` (gram.y AlterPublicationStmt with a
+// pub_obj_list of TABLE objects; publicationcmds.c AlterPublicationTables).
+// Action is "add", "set" or "drop". pg_dump writes publication membership
+// as `ALTER PUBLICATION p ADD TABLE ONLY s.t;`.
+type AlterPublicationTablesStmt struct {
+	pos    int
+	Name   string
+	Action string
+	Tables []ObjectName
+}
+
+func (s *AlterPublicationTablesStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationTablesStmt) stmtNode() {}
+
 // AlterPublicationOwnerStmt — `ALTER PUBLICATION name OWNER TO { new_owner |
 // CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER PUBLICATION
 // form goopg models (RENAME TO / SET / ADD|DROP|SET TABLE fall through to the

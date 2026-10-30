@@ -57,14 +57,16 @@ func TestParseAlterSubscriptionOwner(t *testing.T) {
 }
 
 // TestParseAlterPublicationOtherFormsStillNoop confirms an unmodelled
-// ALTER PUBLICATION/SUBSCRIPTION tail (RENAME TO, SET, ADD/DROP/SET TABLE)
-// still parses without error as the pre-existing compatibility no-op,
+// ALTER PUBLICATION/SUBSCRIPTION tail (RENAME TO, SET (option ...), ADD
+// TABLES IN SCHEMA, the subscription forms) still parses without error as
+// the pre-existing compatibility no-op — ADD / SET / DROP TABLE is modelled
+// (TestParseAlterPublicationTables) —
 // rather than erroring or being misrouted into the OWNER TO path.
 func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 	cases := []string{
 		"ALTER PUBLICATION mypub RENAME TO otherpub",
-		"ALTER PUBLICATION mypub ADD TABLE t1",
 		"ALTER PUBLICATION mypub SET (publish = 'insert')",
+		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
 		"ALTER SUBSCRIPTION mysub SET PUBLICATION p2",
 		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
@@ -84,5 +86,62 @@ func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 				t.Fatalf("stmt type = %T, want *CompatNoopStmt (no-op stub)", stmts[0])
 			}
 		})
+	}
+}
+
+// TestParseAlterPublicationTables: ALTER PUBLICATION name { ADD | SET | DROP }
+// TABLE [ONLY] t [*] [, ...] parses into AlterPublicationTablesStmt (gram.y
+// AlterPublicationStmt, pub_obj_list of TABLE objects). pg_dump writes
+// membership as `ALTER PUBLICATION p ADD TABLE ONLY s.t;`; it used to be a
+// silent compat no-op, so a restored dump lost every member table.
+func TestParseAlterPublicationTables(t *testing.T) {
+	cases := []struct {
+		sql    string
+		action string
+		tables []ObjectName
+	}{
+		{"ALTER PUBLICATION p ADD TABLE ONLY public.t1", "add", []ObjectName{{Schema: "public", Name: "t1"}}},
+		{"ALTER PUBLICATION p SET TABLE a, b *", "set", []ObjectName{{Name: "a"}, {Name: "b"}}},
+		{"ALTER PUBLICATION p DROP TABLE s.c", "drop", []ObjectName{{Schema: "s", Name: "c"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.sql, func(t *testing.T) {
+			stmts, err := Parse(c.sql)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			st, ok := stmts[0].(*AlterPublicationTablesStmt)
+			if !ok {
+				t.Fatalf("stmt type = %T, want *AlterPublicationTablesStmt", stmts[0])
+			}
+			if st.Name != "p" || st.Action != c.action || len(st.Tables) != len(c.tables) {
+				t.Fatalf("got %+v, want action %s tables %v", st, c.action, c.tables)
+			}
+			for i, want := range c.tables {
+				if st.Tables[i].Schema != want.Schema || st.Tables[i].Name != want.Name {
+					t.Errorf("table %d = %+v, want %+v", i, st.Tables[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestParseAlterPublicationUnmodelledTableFormsStayNoop: a column list, a row
+// filter or a TABLES IN SCHEMA item is a publication feature goopg does not
+// model; such an ALTER PUBLICATION stays the compat no-op it was, instead of
+// a syntax error on SQL PG accepts.
+func TestParseAlterPublicationUnmodelledTableFormsStayNoop(t *testing.T) {
+	for _, sql := range []string{
+		"ALTER PUBLICATION p ADD TABLE t (a, b)",
+		"ALTER PUBLICATION p SET TABLE t WHERE (a > 1)",
+		"ALTER PUBLICATION p ADD TABLE t, TABLES IN SCHEMA s",
+	} {
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
+			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
+		}
 	}
 }

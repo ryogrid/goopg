@@ -297,6 +297,22 @@ func (p *PubSub) LookupPublication(name string, dbOid ...uint32) (*Publication, 
 	return &out, true
 }
 
+// SetPublicationTables replaces a publication's member tables
+// (ALTER PUBLICATION ... ADD / SET / DROP TABLE; the caller computes the new
+// list). It returns the updated publication.
+func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uint32) (*Publication, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return nil, fmt.Errorf("publication %q does not exist", name)
+	}
+	pub.Tables = append([]string(nil), tables...)
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	return &out, nil
+}
+
 // PublicationsForDBOid returns every publication belonging to dbOid in name
 // order. Each entry is a deep copy. M0119-0004 (DU-002 per-DB publication
 // scoping).
