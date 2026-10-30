@@ -207,14 +207,14 @@ func (p *Pool) startReadPrologue(tag BufferTag) (*ReadOp, error) {
 		// Transient state (just evicted, or a lost CAS): re-resolve.
 	}
 
-	victimIdx, wasDirty, oldTag, err := p.claimVictim()
+	victimIdx, wasDirty, oldTag, claimGen, err := p.claimVictim()
 	if err != nil {
 		p.pinMu.Unlock()
 		return nil, err
 	}
 	s := &p.slots[victimIdx]
 
-	if err := p.evictVictim(victimIdx, wasDirty, oldTag); err != nil {
+	if err := p.evictVictim(victimIdx, wasDirty, oldTag, claimGen); err != nil {
 		p.releaseVictimSlot(victimIdx)
 		p.pinMu.Unlock()
 		return nil, fmt.Errorf("flush victim: %w", err)

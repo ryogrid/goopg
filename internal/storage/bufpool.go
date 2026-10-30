@@ -564,6 +564,7 @@ const (
 	evPinLoadPublish
 	evPinNewPublish
 	evReleaseVictimSlot
+	evInvalidateGenBump
 )
 
 func (k slotEventKind) String() string {
@@ -586,6 +587,8 @@ func (k slotEventKind) String() string {
 		return "PinNew-publish"
 	case evReleaseVictimSlot:
 		return "releaseVictimSlot"
+	case evInvalidateGenBump:
+		return "invalidateGenBump"
 	default:
 		return "unknown"
 	}
@@ -1454,13 +1457,24 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 	for i := range p.slots {
 		s := &p.slots[i]
 		st := s.state.Load()
-		if !stateValid(st) {
-			continue
-		}
 		if s.tag.Rel != rel {
 			continue
 		}
 		if statePin(st) > 0 {
+			continue
+		}
+		if stateIO(st) {
+			// In-flight eviction flush / pin-load of this relation's page.
+			// PG's DropRelationBuffers takes the buffer content lock (which
+			// waits out the I/O) and DISCARDS the dirty page of the
+			// invalidated relation without writing it. A claim has already
+			// cleared valid+dirty, so the plain bit-clear below cannot reach
+			// the slot; bumping the generation instead makes the in-flight
+			// flush discard itself (see the claimGen check in evictVictim).
+			p.bumpSlotGen(s, st)
+			continue
+		}
+		if !stateValid(st) {
 			continue
 		}
 		// Try to atomically clear valid+dirty bits.
@@ -1473,6 +1487,17 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 	}
 }
 
+// bumpSlotGen stamps a generation bump onto a slot observed in st, used to
+// signal in-flight claim holders (evictVictim/pin-load) that their page's
+// relation was invalidated underneath them. Best-effort CAS: a concurrent
+// state change means its owner already observed something newer.
+func (p *Pool) bumpSlotGen(s *Slot, st uint64) {
+	g := stateGen(st)
+	newSt := (st &^ slotGenMask) | (uint64((g+1)&0x7FFF) << slotGenShift)
+	s.state.CompareAndSwap(st, newSt)
+	p.traceSlotEvent(s.idx, evReleaseVictimSlot, s.tag, st, newSt)
+}
+
 // InvalidateBlock evicts the slot bound to tag if it exists and is unpinned.
 func (p *Pool) InvalidateBlock(tag BufferTag) {
 	slotIdx, _ := p.bm.Lookup(tag)
@@ -1481,7 +1506,19 @@ func (p *Pool) InvalidateBlock(tag BufferTag) {
 	}
 	s := &p.slots[slotIdx]
 	st := s.state.Load()
-	if !stateValid(st) || statePin(st) > 0 {
+	if statePin(st) > 0 {
+		return
+	}
+	if stateIO(st) {
+		// In-flight eviction/pin-load of this exact tag: generation-bump so
+		// the in-flight flush discards (PG: DropRelationBuffers discards the
+		// dirty page; see the claimGen check in evictVictim).
+		if s.tag == tag {
+			p.bumpSlotGen(s, st)
+		}
+		return
+	}
+	if !stateValid(st) {
 		return
 	}
 	newSt := st &^ (slotValidBit | slotDirtyBit)
@@ -1561,12 +1598,15 @@ func (p *Pool) releaseVictimSlot(victimIdx int) {
 }
 
 // claimVictim finds a victim slot using clock-sweep and atomically sets
-// ioInflight, clearing valid+dirty. Returns (idx, wasDirty, oldTag).
+// ioInflight, clearing valid+dirty. Returns (idx, wasDirty, oldTag, claimGen).
+// claimGen is the generation stamped by the successful claim; evictVictim
+// re-checks it before flushing: a concurrent InvalidateRel/InvalidateBlock
+// bumps it, signaling the flush to discard (PG DropRelationBuffers parity).
 // MUST be called with pinMu held.
-func (p *Pool) claimVictim() (victimIdx int, wasDirty bool, oldTag BufferTag, err error) {
+func (p *Pool) claimVictim() (victimIdx int, wasDirty bool, oldTag BufferTag, claimGen uint32, err error) {
 	n := len(p.slots)
 	if n == 0 {
-		return 0, false, BufferTag{}, ErrNoBuffer
+		return 0, false, BufferTag{}, 0, ErrNoBuffer
 	}
 	maxProbes := n * (maxUsageCount + 2)
 	for probe := 0; probe < maxProbes; probe++ {
@@ -1610,16 +1650,16 @@ func (p *Pool) claimVictim() (victimIdx int, wasDirty bool, oldTag BufferTag, er
 				tag = BufferTag{}
 			}
 			p.traceSlotEvent(int32(i), evClaimVictim, tag, old, newSt)
-			return i, wasValid && dirty, tag, nil
+			return i, wasValid && dirty, tag, newGen, nil
 		}
 		// Another goroutine modified this slot concurrently; try next.
 	}
-	return 0, false, BufferTag{}, ErrNoBuffer
+	return 0, false, BufferTag{}, 0, ErrNoBuffer
 }
 
 // evictVictim flushes (if dirty) and removes the old tag from bufmap.
 // MUST be called with pinMu held.
-func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error {
+func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag, claimGen uint32) error {
 	if oldTag == (BufferTag{}) {
 		return nil // slot was free
 	}
@@ -1651,6 +1691,29 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	if p.OnFlushWait != nil {
 		p.OnFlushWait()
 	}
+	// A concurrent InvalidateRel/InvalidateBlock (TRUNCATE / DROP / vacuum
+	// tail truncate) bumps this slot's generation while our claim is in
+	// flight (the claim cleared valid+dirty, so the invalidation's plain
+	// bit-CAS cannot reach the slot). PG's DropRelationBuffers takes the
+	// content lock and DISCARDS the dirty page of the invalidated relation
+	// — it never writes it. Mirror that: on a generation mismatch skip the
+	// flush and retire the slot as if the page were clean. Writing the
+	// stale image can land past a concurrent TRUNCATE's new end, and
+	// goopg's smgr rejects writes beyond nblocks (smgr.go writeBlock):
+	// the nightly pgbench "flush victim: write … blk N: out of range
+	// (nblocks=0)" abort of the client's next statement (AI-20261031-
+	// 002109-005) was exactly this race — pgbench's per-workload
+	// `truncate pgbench_history` racing the eviction of a dirty history
+	// page from the previous workload.
+	if stateGen(s.state.Load()) != claimGen {
+		p.traceSlotEvent(int32(victimIdx), evInvalidateGenBump, oldTag, s.state.Load(), s.state.Load())
+		s.contentMu.Unlock()
+		p.pinMu.Lock()
+		p.bmDelete(oldTag, int32(victimIdx))
+		p.tombstones.Add(1)
+		p.maybeCompact()
+		return nil
+	}
 	recordIOTrace(oldTag, "preFlush", s.page)
 	flushErr := p.flushSlot(oldTag, s.page)
 	if p.OnFlushDone != nil {
@@ -1676,6 +1739,17 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		}
 	}
 	if flushErr != nil {
+		// Residual window: the slot's generation was bumped (TRUNCATE/DROP
+		// invalidation) between the pre-write gen check above and the
+		// write's r.mu acquisition, and the concurrent truncate landed
+		// first, so the write correctly failed against storage that is
+		// gone. PG's DropRelationBuffers discards this page, so discard
+		// it too. A flush failure on an un-invalidated slot is a real
+		// defect: propagate it unchanged.
+		if stateGen(s.state.Load()) != claimGen {
+			p.traceSlotEvent(int32(victimIdx), evInvalidateGenBump, oldTag, s.state.Load(), s.state.Load())
+			return nil
+		}
 		return flushErr
 	}
 	p.sharedWrittenCount.Add(1)
@@ -1792,14 +1866,14 @@ func (p *Pool) PinNewWithXID(rel RelFileNode, createXID TransactionID) (*Slot, B
 func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
 	p.pinMu.Lock()
 
-	victimIdx, wasDirty, oldTag, err := p.claimVictim()
+	victimIdx, wasDirty, oldTag, claimGen, err := p.claimVictim()
 	if err != nil {
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
 	s := &p.slots[victimIdx]
 
-	if err := p.evictVictim(victimIdx, wasDirty, oldTag); err != nil {
+	if err := p.evictVictim(victimIdx, wasDirty, oldTag, claimGen); err != nil {
 		p.releaseVictimSlot(victimIdx)
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, fmt.Errorf("flush victim: %w", err)
@@ -2026,14 +2100,14 @@ func (p *Pool) pinSlow(tag BufferTag) (*Slot, error) {
 // Returns (slot, nil) on success, (nil, err) on error.
 func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	// Find a victim.
-	victimIdx, wasDirty, oldTag, err := p.claimVictim()
+	victimIdx, wasDirty, oldTag, claimGen, err := p.claimVictim()
 	if err != nil {
 		return nil, err
 	}
 	s := &p.slots[victimIdx]
 
 	// Evict the old contents.
-	if err := p.evictVictim(victimIdx, wasDirty, oldTag); err != nil {
+	if err := p.evictVictim(victimIdx, wasDirty, oldTag, claimGen); err != nil {
 		p.releaseVictimSlot(victimIdx)
 		return nil, fmt.Errorf("flush victim: %w", err)
 	}
@@ -2711,7 +2785,13 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 	// responsible for flushing it through its own dirty-bit lifecycle.
 	stale := make([]bool, len(slots))
 	for i, s := range slots {
-		stale[i] = s.tag != tags[i]
+		st := s.state.Load()
+		// Tag mismatch = slot repurposed (the M-NIGHTLY cross-relation
+		// write class). Lost valid/dirty = the page was invalidated under
+		// this batch (TRUNCATE/DROP discard): PG's checkpoint never writes
+		// a buffer DropRelationBuffers discarded, and writing a block that
+		// outlived the truncate's new end fails in smgr. Skip those.
+		stale[i] = s.tag != tags[i] || !stateValid(st) || !stateDirty(st)
 	}
 
 	var maxLSN LSN

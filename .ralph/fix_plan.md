@@ -789,6 +789,45 @@ heuristic stays live.)
   - Stale, environmental — passes at HEAD c6a3c5c76 \(2026\-10\-30 02:31–03:03\): the stage repro exited 0,
     `testport PASS`, `ok internal/testport 1745\.954s`\.
 
+- [x] units/internal/access/transam/xlog — TestCheckpointerVolumeTrigger: `volume trigger did not fire within 2s` \(AI\-20261031\-002109\-001; repro: `go test \-timeout 10m \./internal/access/transam/xlog/`\)\.
+  - Stale, load\-induced — passes at HEAD fc635ff66 \(this loop, idle host, whole package 27\.1 s\)\. The nightly lane ran
+    the full units suite concurrently \(58\.4 s package time vs 27\.1 s idle\); the 2 s trigger window is a timing bound
+    under load, same class as AI\-20261017\-005127\-001 above\.
+- [x] testport/TestE2E\_GoopgStandbyFollowsPGTimelineSwitch — `query did not reach count >= 1 within 30s` \(AI\-20261031\-002109\-002; repro: `go test \-v \-run \'^TestE2E\_GoopgStandbyFollowsPGTimelineSwitch$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 59\.9 s\)\.
+- [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 213\.29 s \(AI\-20261031\-002109\-003; repro: `go test \-v \-run \'^TestE2E\_PGReadsThreeLevelCatalogBtree$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 279\.2 s, beside the running units suite: no code change\)\.
+- [x] testport/TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL — `fill: context deadline exceeded` \(AI\-20261031\-002109\-004; repro: `go test \-v \-run \'^TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 41\.0 s, same lane run as \-002/\-003\)\.
+- [x] **pgbench/nightly — `flush victim: write …/base/5/16406 blk 2681: out of range \(nblocks=0\)` on the \-S workload; S2 data\-loss escalation** \(AI\-20261031\-002109\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`; also failed in the previous run\)
+  Kind: impl
+  Parent: none
+  - Reproduced at fc635ff66 \(this loop, idle host, full \-i s=50 \+ 3\-workload sequence, 1 in 2 stage\-equivalent runs\)\.
+  - Evidence: 16406 = pgbench\_history \(pgbench\_tellers=16407, pgbench\_accounts=16409\). A watcher caught the history
+    file at **0 bytes** at the moment of the client abort; accounts intact\. Autovacuum log timeline shows the history
+    file shrinking 1134→853 pages \(W1→W2 boundary window\) and →0 bytes \(W3 initial\-vacuum window\)\.
+  - Root cause \(stack\-instrumented debug build\): the truncates of 16406 during workloads are pgbench's own
+    `truncate pgbench\_history` at every workload start \(pgbench\.c:7375\)\. Legitimate; the defect is the race:
+    `claimVictim` evicts a dirty history page from the previous workload and its CAS clears valid+dirty, so
+    `InvalidateRel`'s CAS misses the in\-flight slot; the flush then writes a block past the truncate's new end and
+    smgr rejects it \(writeBlock nblocks gate\), aborting the next client statement\. PG prevents this via
+    DropRelationBuffers \(bufmgr\.c:4533\): content lock waits the I/O, dirty page DISCARDED, never written\.
+  - Fix \(this loop\): generation‑signal port of DropRelationBuffers — InvalidateRel/InvalidateBlock gen‑bump an
+    ioInflight slot; evictVictim re‑checks the claim generation pre‑write \(skip flush, retire as clean\) and
+    post‑flush‑failure \(discard\); flushBatch \(checkpoint\) skips slots invalidated after the dirty scan\.
+    Design `docs/design/0100-0149/m-nightly-truncate-eviction-flush-race.md`; tests
+    `internal/storage/truncate_invalidate_flush_test.go` \(deterministic via OnFlushWait; mutation check reproduces
+    the nightly error with the gen check removed\)\.
+  - Gates \(this loop\): storage+vacuum go test; \-race storage; units \(precommit scope=units\); full stage\-pgbench
+    repro; tpch\-spotcheck; commit‑hook pgbench smoke\.
+  - Closed 2026\-10\-31 \(fix loop\)\. Full stage\-pgbench repro with the fix: `pgbench PASS \(0 failed txns;
+    tps 1821\.728175/2185\.078638/5386\.402103\)`, stage exit 0 \(the race aborted the \-S workload in 2 of 2
+    nightlies and 1 in 2 pre\-fix repro runs\)\. `\-race` on internal/storage clean; units gate PASS \(first
+    attempt FAILed only in internal/initdb — TestWalCommitRecordOnDisk stuck in fsync while the pgbench
+    repro ran concurrently on the same host, the known load/swap class; PASS on idle re\-run\)\;
+    tpch\-spotcheck Q12 rows=2 / Q13 rows=35 PASS; testport 3\-E2E repro PASS \(59\.9/279\.2/41\.0 s\)\.
+    Movement: none — correctness fix — no plan instrument
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
 - [x] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
@@ -1141,6 +1180,25 @@ heuristic stays live.)
     unlikely\. Next suspects:
     - what sets the continuous\-replay start on restart \(pg\_control redo vs the received end\);
     - whether the shutdown checkpoint's replay changes xid/clog state, so that row 2's xmin reads as not committed\.
+
+- [ ] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+  Kind: impl
+  Parent: none
+  - Stack\-instrumented pgbench \-i: the `drop table if exists pgbench\_accounts, pgbench\_branches, pgbench\_history,
+    pgbench\_tellers cascade` statement executes via `ddlOp.Next → execTruncate → truncateTableAndPartitions →
+    Manager.TruncateRelation` four times \(relfilenodes synthesized 16406/16407/16409/16411\)\. `TruncateRelation` opens
+    with O\_CREATE, so four 0\-byte files exist before `create tables`, and the created tables reuse exactly those
+    oids\. The name resolution of missing tables synthesizes the next oids and consumes them from the allocator\.
+  - Not data\-losing \(later CREATE/inserts land correctly; the nightly failures trace to the separate eviction\-flush
+    race, fixed same day\) — filing to record the routing\+side\-effect, not worked this loop\.
+- [ ] **autovacuum ANALYZE reports relpages far above the relation's block count** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+  Kind: recon
+  Parent: none
+  - pgbench server logs \(nightly \+ local repro\): `analyze done table=.pgbench\_branches rows=50 pages=132` \(and
+    pages=205 at 01:56:16\) for a 1\-block file; `.pgbench\_tellers rows=500 pages=39` for a 3\-block file;
+    `.pgbench\_history rows=16093 pages=104` tracks nblocks closely, so the inflation is per\-table\.
+  - Consequence: inflated relpages flow into pg\_class/cost model \(M0146\-0009 statistics territory — interleaveable
+    when a first\-divergence is stats\-driven\)\. Not worked this loop; repro \(nightly stage\) was mid\-triage\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
