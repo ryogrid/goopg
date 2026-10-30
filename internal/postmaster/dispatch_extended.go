@@ -459,6 +459,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *misc
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot = s.subscriptionSlotHooks()
 	}
 	// ON COMMIT DROP at COMMIT changes the catalog with no DDL statement to
 	// trip the per-statement invalidation (sibling of the simple-query wiring

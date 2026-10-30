@@ -702,6 +702,13 @@ type Context struct {
 	// for its periodic poll. nil disables the wakeup (the launcher
 	// still converges via the timer). M0103-0002.
 	OnSubscriptionChange func()
+	// CreateSubscriptionSlot / DropSubscriptionSlot create and drop a
+	// subscription's slot on its publisher (CreateSubscription's
+	// walrcv_create_slot, DropSubscription's ReplicationSlotDropAtPubNode).
+	// They return a ready *ExecError (PG's message and SQLSTATE) on
+	// failure. nil — tests without a server — skips the publisher side.
+	CreateSubscriptionSlot func(subName, conninfo, slotName string) error
+	DropSubscriptionSlot   func(subName, conninfo, slotName string) error
 
 	// DataDir is the cluster's data directory, used by DDL operators that
 	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,

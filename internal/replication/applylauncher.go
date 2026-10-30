@@ -105,6 +105,41 @@ func NewApplyLauncher(cfg ApplyLauncherConfig) *ApplyLauncher {
 // Called from execCreateSubscription / execDropSubscription so DDL
 // becomes observable in pg_stat_subscription within ≤PollInterval ms
 // instead of waiting for the periodic tick.
+// CreatePublisherSlot creates slotName on the publisher a subscription's
+// conninfo names (CREATE SUBSCRIPTION with connect and create_slot). The
+// connection is made the way the apply worker makes it: the conninfo's host,
+// port and application_name, and this server's own user.
+func (l *ApplyLauncher) CreatePublisherSlot(conninfo, slotName string) error {
+	return CreateRemoteLogicalSlot(context.Background(), l.publisherConfig(conninfo, slotName))
+}
+
+// DropPublisherSlot drops slotName on the subscription's publisher (DROP
+// SUBSCRIPTION).
+func (l *ApplyLauncher) DropPublisherSlot(conninfo, slotName string) error {
+	return DropRemoteSlot(context.Background(), l.publisherConfig(conninfo, slotName))
+}
+
+// StopWorker stops the apply worker of subscription name, if one runs, and
+// waits for it to exit (logicalrep_worker_stop). DROP SUBSCRIPTION calls it
+// after removing the subscription, so the next reconcile does not restart
+// the worker, and before dropping the publisher's slot, which the worker
+// would otherwise keep active.
+func (l *ApplyLauncher) StopWorker(name string) {
+	l.mu.Lock()
+	w := l.workers[name]
+	delete(l.workers, name)
+	l.mu.Unlock()
+	if w != nil {
+		w.cancel()
+		<-w.done
+	}
+}
+
+func (l *ApplyLauncher) publisherConfig(conninfo, slotName string) LogicalReceiverConfig {
+	addr, appName := parseSubscriptionConninfo(conninfo)
+	return LogicalReceiverConfig{PrimaryAddr: addr, User: l.cfg.User, ApplicationName: appName, SlotName: slotName}
+}
+
 func (l *ApplyLauncher) Wake() {
 	if l == nil {
 		return

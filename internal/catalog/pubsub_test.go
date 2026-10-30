@@ -92,16 +92,27 @@ func TestPubSubDropPublication(t *testing.T) {
 	}
 }
 
-// TestPubSubCreateSubscription pins the round-trip and the
-// SlotName default (=name when empty).
+// TestPubSubCreateSubscription pins the round-trip and that SlotName is
+// stored as given ("" = slot_name = NONE; the name default is the executor's).
 func TestPubSubCreateSubscription(t *testing.T) {
 	ps := NewPubSub()
 	sub, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1", "p2"}, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.SlotName != "s1" {
-		t.Errorf("SlotName=%q want s1 (default to subscription name)", sub.SlotName)
+	// The registry stores slotName as given: "" is slot_name = NONE (PG's
+	// NULL subslotname). The "default to the subscription name" rule is
+	// DefineSubscription's (the executor's), pinned by the executor's
+	// subscription DDL tests; defaulting it here made NONE unrepresentable.
+	if sub.SlotName != "" {
+		t.Errorf("SlotName=%q want \"\" (stored as given; NONE)", sub.SlotName)
+	}
+	sub2, err := ps.CreateSubscription("s2", "host=remote dbname=app", []string{"p1"}, "myslot", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub2.SlotName != "myslot" {
+		t.Errorf("SlotName=%q want myslot", sub2.SlotName)
 	}
 	if sub.Conninfo != "host=remote dbname=app" {
 		t.Errorf("Conninfo=%q", sub.Conninfo)

@@ -1328,10 +1328,16 @@ func TestPort_SubscriptionSurvivesRestart(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
+	// The dummy publishers are unreachable, so the subscriptions are
+	// created fully disassociated from the publisher (connect = false,
+	// create_slot = false, slot_name = NONE): PG's CREATE SUBSCRIPTION
+	// connects and creates the slot by default and fails with 08006 when
+	// the publisher is down. The statement under test is the pg_subscription
+	// heap journaling, not the publisher handshake.
 	stmts := []string{
-		"CREATE SUBSCRIPTION b44_sub CONNECTION 'host=remote dbname=app' PUBLICATION b44_pub WITH (enabled = false)",
+		"CREATE SUBSCRIPTION b44_sub CONNECTION 'host=remote dbname=app' PUBLICATION b44_pub WITH (enabled = false, connect = false, create_slot = false, slot_name = NONE)",
 		"ALTER SUBSCRIPTION b44_sub OWNER TO postgres",
-		"CREATE SUBSCRIPTION b44_gone CONNECTION 'host=remote dbname=app' PUBLICATION b44_p2 WITH (enabled = false)",
+		"CREATE SUBSCRIPTION b44_gone CONNECTION 'host=remote dbname=app' PUBLICATION b44_p2 WITH (enabled = false, connect = false, create_slot = false, slot_name = NONE)",
 		"DROP SUBSCRIPTION b44_gone",
 	}
 	for _, s := range stmts {

@@ -448,8 +448,24 @@ func (s *Handler) replyDropReplicationSlot(w *libpq.FrameWriter, args string) er
 			"DROP_REPLICATION_SLOT requires a slot name")
 	}
 	name := unquoteIdent(tokens[0])
-	if err := s.cfg.Slots.Drop(name); err != nil {
-		return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
+	// DROP_REPLICATION_SLOT name WAIT (ReplicationSlotDrop with nowait =
+	// false) waits for the slot's current owner to release it instead of
+	// failing on an active slot. A dropping subscriber stops its apply
+	// worker first, but the publisher's walsender releases the slot only
+	// once that connection has wound down. goopg bounds the wait (PG's is
+	// interruptible but unbounded): this handler has no client context to
+	// notice a vanished client.
+	wait := len(tokens) > 1 && strings.EqualFold(tokens[1], "WAIT")
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		err := s.cfg.Slots.Drop(name)
+		if err == nil {
+			break
+		}
+		if !wait || !errors.Is(err, xlog.ErrSlotInUse) || time.Now().After(deadline) {
+			return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if err := w.WriteCommandComplete("DROP_REPLICATION_SLOT"); err != nil {
 		return err

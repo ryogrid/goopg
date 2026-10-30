@@ -3261,3 +3261,102 @@ func TestPort_PgoutputInteropGoopgToPGUnqualifiedTable(t *testing.T) {
 		t.Fatalf("subscriber row count after replication: got %q want 2", got)
 	}
 }
+
+// TestPort_PgoutputInteropGoopgToGoopg: goopg to goopg logical replication,
+// slot lifecycle included. CREATE SUBSCRIPTION (create_slot defaults to true)
+// creates the logical slot on the publisher, as CreateSubscription's
+// walrcv_create_slot does — it never did, so the apply worker's
+// START_REPLICATION failed with "replication slot does not exist" on every
+// retry and nothing replicated. An UPDATE of a non-key column (sent without
+// an old tuple) lands on the right row through the Relation message's
+// replica-identity flags. DROP SUBSCRIPTION drops the slot on the publisher
+// (ReplicationSlotDropAtPubNode), so no slot is left pinning WAL.
+func TestPort_PgoutputInteropGoopgToGoopg(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'g2g_sub'"); got != "1" {
+		t.Fatalf("publisher slots named g2g_sub after CREATE SUBSCRIPTION = %s, want 1", got)
+	}
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'two'", 1, 60*time.Second)
+	psc.Publisher.Exec(t, "UPDATE t SET v = 'updated' WHERE id = 2")
+	psc.Publisher.Exec(t, "DELETE FROM t WHERE id = 1")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	psc.WaitForRow(t, "t", "id = 1", 0, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM t"); got != "1" {
+		t.Fatalf("subscriber rows = %s, want 1 (no stale pre-update row)", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_sub")
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'g2g_sub'"); got != "0" {
+		t.Errorf("publisher slots named g2g_sub after DROP SUBSCRIPTION = %s, want 0", got)
+	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgSlotLifecycle: a goopg subscriber of a PG
+// 18.3 publisher creates its slot there on CREATE SUBSCRIPTION and drops it
+// on DROP SUBSCRIPTION, as a PG subscriber does. The PG publisher's own
+// pg_replication_slots is the oracle.
+func TestPort_PgoutputInteropPGToGoopgSlotLifecycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_slot", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "pg2g_slot_sub",
+		PublicationName:  "p",
+		SubscriptionName: "pg2g_slot_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+	if got := psc.Publisher.QueryScalar(t, "SELECT plugin || '/' || slot_type FROM pg_replication_slots WHERE slot_name = 'pg2g_slot_sub'"); got != "pgoutput/logical" {
+		t.Fatalf("PG publisher slot after CREATE SUBSCRIPTION = %q, want pgoutput/logical", got)
+	}
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'hello'", 1, 60*time.Second)
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION pg2g_slot_sub")
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg2g_slot_sub'"); got != "0" {
+		t.Errorf("PG publisher slots after DROP SUBSCRIPTION = %s, want 0", got)
+	}
+}

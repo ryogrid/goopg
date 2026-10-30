@@ -1325,6 +1325,18 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
 		return err
 	}
+	// CreateSubscription with connect = true and create_slot = true creates
+	// the slot on the publisher (walrcv_create_slot) and reports NOTICE
+	// "created replication slot \"%s\" on publisher". Without it the apply
+	// worker's START_REPLICATION finds no slot and exits on every retry.
+	// It runs before the registry insert: PG's catalog row rolls back with
+	// a failed CREATE SUBSCRIPTION, goopg's registry insert does not.
+	if opts.connect && opts.createSlot && o.ctx.CreateSubscriptionSlot != nil {
+		if err := o.ctx.CreateSubscriptionSlot(s.Name, s.Conninfo, slotName); err != nil {
+			return err
+		}
+		o.ctx.AddNotice(fmt.Sprintf("created replication slot \"%s\" on publisher", slotName))
+	}
 	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, opts.enabled, o.currentDDLOwnerOID(), subDBOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -1345,15 +1357,33 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	}
 	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
-	var dropOID uint32
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
-		dropOID = sub.OID
-	}
-	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
 		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("subscription \"%s\" does not exist, skipping", s.Name))
 			return nil
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription \"%s\" does not exist", s.Name)}
+	}
+	dropOID := sub.OID
+	// DropSubscription's order: the subscription goes away, its workers stop
+	// (the hook stops the apply worker, which the registry removal keeps
+	// from being restarted), then the slot is dropped on the publisher
+	// (ReplicationSlotDropAtPubNode, missing_ok = false). A failure rolls
+	// PG's whole DROP back; goopg restores the registry entry. A slot left
+	// behind would pin WAL on the publisher forever.
+	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	if sub.SlotName != "" && o.ctx.DropSubscriptionSlot != nil {
+		if err := o.ctx.DropSubscriptionSlot(s.Name, sub.Conninfo, sub.SlotName); err != nil {
+			o.ctx.PubSub.CreateSubscriptionDuringRecovery(sub)
+			if o.ctx.OnSubscriptionChange != nil {
+				o.ctx.OnSubscriptionChange()
+			}
+			return err
+		}
+		o.ctx.AddNotice(fmt.Sprintf("dropped replication slot \"%s\" on publisher", sub.SlotName))
 	}
 	// B4.4: xmax-stamp the pg_subscription heap row (replaces kind 54).
 	if err := syncSubscriptionRow(o.ctx, dropOID, nil); err != nil {

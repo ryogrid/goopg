@@ -65,7 +65,12 @@ type Subscription struct {
 	Owner        uint32
 	Publications []string
 	Enabled      bool
-	SlotName     string
+	// SlotName is pg_subscription.subslotname: "" is NULL, i.e.
+	// slot_name = NONE (no publisher-side slot — DROP SUBSCRIPTION then
+	// skips ReplicationSlotDropAtPubNode). The subscription-name default
+	// for an unspecified slot_name is applied by the executor
+	// (DefineSubscription), not stored here.
+	SlotName string
 	// DBOid is the database this subscription's apply worker resolves
 	// local relations against — the connection's real dbOid at CREATE
 	// SUBSCRIPTION time (catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)),
@@ -405,9 +410,9 @@ func (p *PubSub) Publications() []*Publication {
 }
 
 // CreateSubscription registers a new subscription owned by the bootstrap
-// superuser. slotName defaults to name when empty (matches upstream).
-// Callers that know the connection's currently-effective role should use
-// CreateSubscriptionAsOwner instead.
+// superuser. slotName is stored as given — "" is slot_name = NONE; see
+// CreateSubscriptionAsOwner. Callers that know the connection's
+// currently-effective role should use CreateSubscriptionAsOwner instead.
 func (p *PubSub) CreateSubscription(name, conninfo string, publications []string, slotName string, enabled bool) (*Subscription, error) {
 	return p.CreateSubscriptionAsOwner(name, conninfo, publications, slotName, enabled, 10)
 }
@@ -429,9 +434,12 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 	if _, ok := p.subscriptions[key]; ok {
 		return nil, ErrSubscriptionExists
 	}
-	if slotName == "" {
-		slotName = name
-	}
+	// slotName is stored as given: "" means slot_name = NONE (PG's NULL
+	// subslotname). The subscription-name default for an unspecified
+	// slot_name is CreateSubscription's (DefineSubscription's), which the
+	// executor applies before calling here; defaulting again at this layer
+	// made NONE indistinguishable from the default and made DROP
+	// SUBSCRIPTION chase a slot the subscription never had.
 	sub := &Subscription{
 		Name:         name,
 		OID:          p.nextOID,

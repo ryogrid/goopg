@@ -7,6 +7,7 @@ package executor
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -501,5 +502,66 @@ func TestPublicationDDLForms(t *testing.T) {
 	mustDDL("DROP PUBLICATION p1, p3")
 	if exists("p1") || exists("p2") || exists("p3") {
 		t.Error("DROP PUBLICATION left a named publication behind")
+	}
+}
+
+// TestSubscriptionPublisherSlotHooks pins CREATE / DROP SUBSCRIPTION's
+// publisher side (subscriptioncmds.c): the slot is created on the publisher
+// only with connect and create_slot (both default true), a failure leaves no
+// subscription behind; DROP SUBSCRIPTION drops the slot after removing the
+// subscription and restores it when the publisher side fails (PG's DROP
+// rolls back); IF EXISTS on a missing subscription is a NOTICE.
+func TestSubscriptionPublisherSlotHooks(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	var created, dropped []string
+	var failCreate, failDrop error
+	ctx.CreateSubscriptionSlot = func(sub, conninfo, slot string) error {
+		if failCreate != nil {
+			return failCreate
+		}
+		created = append(created, slot)
+		return nil
+	}
+	ctx.DropSubscriptionSlot = func(sub, conninfo, slot string) error {
+		if failDrop != nil {
+			return failDrop
+		}
+		dropped = append(dropped, slot)
+		return nil
+	}
+	const conn = "host=127.0.0.1 port=1 dbname=postgres"
+	mustDDL := func(q string) {
+		t.Helper()
+		if err := runDDL(t, ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	exists := func(name string) bool { _, ok := ctx.PubSub.LookupSubscription(name); return ok }
+
+	mustDDL("CREATE SUBSCRIPTION s1 CONNECTION '" + conn + "' PUBLICATION p")
+	mustDDL("CREATE SUBSCRIPTION s2 CONNECTION '" + conn + "' PUBLICATION p WITH (create_slot = false, slot_name = 'other')")
+	mustDDL("CREATE SUBSCRIPTION s3 CONNECTION '" + conn + "' PUBLICATION p WITH (connect = false, enabled = false, create_slot = false, slot_name = NONE)")
+	if fmt.Sprint(created) != "[s1]" {
+		t.Errorf("publisher slots created = %v, want only s1's", created)
+	}
+	failCreate = &ExecError{Code: "08006", Message: `subscription "s4" could not connect to the publisher: refused`}
+	if err := runDDL(t, ctx, "CREATE SUBSCRIPTION s4 CONNECTION '"+conn+"' PUBLICATION p"); err == nil || exists("s4") {
+		t.Errorf("failed slot creation: err=%v, subscription exists=%v; want an error and no subscription", err, exists("s4"))
+	}
+	failDrop = &ExecError{Code: "08006", Message: `could not drop replication slot "s1" on publisher: down`}
+	if err := runDDL(t, ctx, "DROP SUBSCRIPTION s1"); err == nil || !exists("s1") {
+		t.Errorf("failed slot drop: err=%v, subscription exists=%v; want an error and the subscription kept", err, exists("s1"))
+	}
+	failDrop = nil
+	mustDDL("DROP SUBSCRIPTION s1")
+	if exists("s1") || fmt.Sprint(dropped) != "[s1]" {
+		t.Errorf("after DROP: exists=%v dropped=%v, want gone and [s1]", exists("s1"), dropped)
+	}
+	ctx.TakeNotices()
+	mustDDL("DROP SUBSCRIPTION IF EXISTS nosuch")
+	if n := ctx.TakeNotices(); len(n) != 1 || n[0] != `subscription "nosuch" does not exist, skipping` {
+		t.Errorf("IF EXISTS notices = %v", n)
 	}
 }

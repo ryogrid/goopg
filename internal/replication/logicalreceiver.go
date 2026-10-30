@@ -25,6 +25,7 @@
 package replication
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -201,7 +202,12 @@ func DialLogicalReceiver(ctx context.Context, cfg LogicalReceiverConfig) (*Logic
 // dial opens a fresh connection and walks through the v3 startup
 // and START_REPLICATION handshakes. The resulting r.conn / r.r /
 // r.w are owned by the current iteration of Run.
-func (r *LogicalReceiver) dial(ctx context.Context) error {
+// dial connects to the publisher and starts streaming.
+func (r *LogicalReceiver) dial(ctx context.Context) error { return r.dialAndStream(ctx) }
+
+// connect dials the publisher and completes the replication=database
+// startup handshake, leaving the connection in command mode.
+func (r *LogicalReceiver) connect(ctx context.Context) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -239,6 +245,14 @@ func (r *LogicalReceiver) dial(ctx context.Context) error {
 		r.closeConn()
 		return err
 	}
+	return nil
+}
+
+// dialAndStream connects (connect) and starts streaming.
+func (r *LogicalReceiver) dialAndStream(ctx context.Context) error {
+	if err := r.connect(ctx); err != nil {
+		return err
+	}
 	if err := r.startStreaming(); err != nil {
 		r.closeConn()
 		return err
@@ -249,6 +263,89 @@ func (r *LogicalReceiver) dial(ctx context.Context) error {
 // handshake performs the v3 startup with `replication=database`
 // and drains frames until ReadyForQuery. The publisher's side
 // is the existing goopg server.
+// ErrPublisherConnect marks a failure to reach or log into the publisher
+// (walrcv_connect returning NULL), as distinct from a replication command
+// the publisher refused (*RemoteCommandError).
+var ErrPublisherConnect = errors.New("could not connect to the publisher")
+
+// RemoteCommandError is an ErrorResponse a publisher returned for a
+// replication command (walrcv_exec's WALRCV_ERROR with res->sqlstate).
+type RemoteCommandError struct {
+	SQLState string
+	Message  string
+}
+
+func (e *RemoteCommandError) Error() string { return "ERROR:  " + e.Message }
+
+// runRemoteReplicationCommand connects to the publisher as a
+// replication=database client, runs one replication command, and reads its
+// reply up to ReadyForQuery.
+func runRemoteReplicationCommand(ctx context.Context, cfg LogicalReceiverConfig, cmd string) error {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	var cmdErr *RemoteCommandError
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+		}
+		switch f.Type {
+		case libpq.MsgErrorResponse:
+			cmdErr = &RemoteCommandError{}
+			for p := f.Payload; len(p) > 1; {
+				code := p[0]
+				end := bytes.IndexByte(p[1:], 0)
+				if end < 0 {
+					break
+				}
+				val := string(p[1 : 1+end])
+				switch code {
+				case 'C':
+					cmdErr.SQLState = val
+				case 'M':
+					cmdErr.Message = val
+				}
+				p = p[2+end:]
+			}
+		case libpq.MsgReadyForQuery:
+			if cmdErr != nil {
+				return cmdErr
+			}
+			return nil
+		}
+	}
+}
+
+// CreateRemoteLogicalSlot creates the subscription's logical slot on the
+// publisher, as CreateSubscription does through walrcv_create_slot with
+// CRS_NOEXPORT_SNAPSHOT: `CREATE_REPLICATION_SLOT "name" LOGICAL pgoutput
+// (SNAPSHOT 'nothing')`.
+func CreateRemoteLogicalSlot(ctx context.Context, cfg LogicalReceiverConfig) error {
+	return runRemoteReplicationCommand(ctx, cfg, fmt.Sprintf(`CREATE_REPLICATION_SLOT %s LOGICAL pgoutput (SNAPSHOT 'nothing')`, quoteSlotIdent(cfg.SlotName)))
+}
+
+// DropRemoteSlot drops the subscription's slot on the publisher, as
+// ReplicationSlotDropAtPubNode does: `DROP_REPLICATION_SLOT name WAIT`.
+func DropRemoteSlot(ctx context.Context, cfg LogicalReceiverConfig) error {
+	return runRemoteReplicationCommand(ctx, cfg, fmt.Sprintf(`DROP_REPLICATION_SLOT %s WAIT`, quoteSlotIdent(cfg.SlotName)))
+}
+
+// quoteSlotIdent double-quotes a slot name (quote_identifier; slot names
+// are restricted to [a-z0-9_], so no escaping is needed).
+func quoteSlotIdent(name string) string { return `"` + name + `"` }
+
 func (r *LogicalReceiver) handshake() error {
 	params := map[string]string{
 		"user":        r.cfg.User,
