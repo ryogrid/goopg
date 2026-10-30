@@ -7433,6 +7433,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - Census 2026\-10\-30, S9 exhausted at `ed2227a64` \(`4a0cf54cc` changed internal/executor\) — `routing\-20261030c/`:
     22/22·99/99·99/99, plan text identical to routing\-20261030b\. Nothing filed; open item 0\-9 tasks and gates as in the
     20261030a note\.
+  - S9 exhausted at `e3598f114` \(2026\-10\-30; DUE after `2738001df`\) — `routing\-20261030d/ROUTING\.md` only \(unchanged
+    census, S9\(4a\)\); id\(gate\) list as in the 20261030a note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
