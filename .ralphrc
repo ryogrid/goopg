@@ -74,9 +74,9 @@ export BASH_MAX_TIMEOUT_MS=3600000       # 60 min ceiling (race-gate + spotcheck
 # Non-default backends reuse the core loop via adapters in ralph_loop.sh
 # (build_agent_command + normalize_agent_output). Environment variable
 # AGENT_BACKEND overrides this file.
-export AGENT_BACKEND="claude"
+#export AGENT_BACKEND="claude"
 #export AGENT_BACKEND="codex"
-#export AGENT_BACKEND="opencode"
+export AGENT_BACKEND="opencode"
 #export AGENT_BACKEND="devin"
 
 # Claude API-token failover (owner, 2026-10-28) — ~/.ralph/ralph_loop.sh,
@@ -104,8 +104,14 @@ CLAUDE_API_SHORT_RETRY_HOURS=1
 # Optional per-invocation spend cap in api mode (claude --max-budget-usd):
 #CLAUDE_API_MAX_BUDGET_USD=20
 # OpenCode backend settings (used only when AGENT_BACKEND=opencode).
-# Model in provider/model format; empty = CLI default.
-#OPENCODE_MODEL=""
+# Model in provider/model format; empty = CLI default. A same-named
+# environment variable overrides this value.
+# Pinned 2026-10-30: the built-in default resolves to the opencode console
+# provider, whose API key expired (provider.auth 401 api_key_expired killed
+# every loop within seconds). Pin the local Strata model instead:
+# Qwen3.8-Flash-Next Swift IQ3_S Q4_0 256k. Requires the strata provider
+# block in opencode.json (owner's uncommitted work).
+OPENCODE_MODEL="strata/qwen3.8-flash-next-swift"
 # Auto-approve permissions not explicitly denied (required for unattended
 # loops; dangerous - keep the permission policy in opencode.json tight).
 OPENCODE_AUTO=true
