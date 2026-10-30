@@ -4892,6 +4892,9 @@ func (o *updateOp) Open(ctx *Context) error {
 	if !dmlPrivilegePermitted(ctx, o.plan.Table, "UPDATE") {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
+	if err := checkCmdReplicaIdentity(ctx, o.plan.Table, true); err != nil {
+		return err
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -6788,6 +6791,9 @@ func (o *deleteOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	if !dmlPrivilegePermitted(ctx, o.plan.Table, "DELETE") {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
+	if err := checkCmdReplicaIdentity(ctx, o.plan.Table, false); err != nil {
+		return err
 	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lmgr.RowExclusiveLock); err != nil {

@@ -57,6 +57,10 @@ type ColumnDef struct {
 	// Typmod is pg_attribute.atttypmod (-1 for none), which the Relation
 	// message carries per column (logicalrep_write_attrs).
 	Typmod int32
+	// ReplIdent marks a column of the table's replica identity — the
+	// Relation message's LOGICALREP_IS_REPLICA_IDENTITY flag
+	// (identityColumns).
+	ReplIdent bool
 }
 
 // CatalogSnapshot is the slot-creation-time view of all user
@@ -99,16 +103,44 @@ func BuildCatalogSnapshot(c *catalog.InMemory, regOut func(string, uint32) strin
 			Columns:   make([]ColumnDef, len(t.Columns)),
 			ReplIdent: catalog.ReplIdentOrDefault(t.ReplicaIdentity)[0],
 		}
+		ident := identityColumns(c, t, def.ReplIdent, dbOid...)
 		for i, col := range t.Columns {
 			def.Columns[i] = ColumnDef{
-				Name:    col.Name,
-				Type:    col.Type,
-				NotNull: col.NotNull,
-				Ordinal: col.Ordinal,
-				Typmod:  nodes.ColumnTypmod(col.Type.Name, col.Type.Args),
+				Name:      col.Name,
+				Type:      col.Type,
+				NotNull:   col.NotNull,
+				Ordinal:   col.Ordinal,
+				Typmod:    nodes.ColumnTypmod(col.Type.Name, col.Type.Args),
+				ReplIdent: ident == nil || ident[col.Name],
 			}
 		}
 		out.rels[t.OID] = def
+	}
+	return out
+}
+
+// identityColumns is the column set logicalrep_write_attrs flags as replica
+// identity (RelationGetIdentityKeyBitmap): every column under FULL (nil
+// means all), the primary key's columns under DEFAULT, the
+// indisreplident index's columns under USING INDEX, and none under NOTHING
+// or when the index the mode names does not exist.
+func identityColumns(c *catalog.InMemory, t *catalog.Table, replIdent byte, dbOid ...uint32) map[string]bool {
+	if replIdent == 'f' {
+		return nil
+	}
+	out := map[string]bool{}
+	if replIdent != 'd' && replIdent != 'i' {
+		return out
+	}
+	for _, idx := range c.IndexesOnTable(t, dbOid...) {
+		// rd_replidindex (RelationGetIndexList) never names a deferrable
+		// index. Sibling of executor.hasReplicaIdentity.
+		if idx.IsImmediate() && ((replIdent == 'd' && idx.Primary) || (replIdent == 'i' && idx.IsReplicaIdentity)) {
+			for _, col := range idx.Columns {
+				out[col] = true
+			}
+			break
+		}
 	}
 	return out
 }

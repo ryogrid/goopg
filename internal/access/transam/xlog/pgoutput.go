@@ -265,12 +265,16 @@ func (p *PgOutput) writeRelation(rel *RelationDef) error {
 	buf = append(buf, ident)
 	buf = appendUint16(buf, uint16(len(rel.Columns)))
 	for _, col := range rel.Columns {
-		// flag byte: bit 0 = LOGICALREP_IS_REPLICA_IDENTITY.
-		// v0 marks every column as part of REPLICA IDENTITY
-		// DEFAULT — close enough that the apply worker's
-		// row-resolution path works for tables with primary
-		// keys; refines once 0008-0003 lands.
-		buf = append(buf, 1)
+		// flag byte: bit 0 = LOGICALREP_IS_REPLICA_IDENTITY, set only on
+		// the replica identity's columns (logicalrep_write_attrs). It
+		// used to be set on every column, and a subscriber locating a
+		// row for an old-tuple-less UPDATE by the flagged columns then
+		// searched for the NEW non-key values.
+		var flags byte
+		if col.ReplIdent {
+			flags = 1
+		}
+		buf = append(buf, flags)
 		buf = appendCString(buf, col.Name)
 		buf = appendUint32(buf, pgoColumnTypeOID(col.Type))
 		// atttypmod (logicalrep_write_attrs), -1 for none.

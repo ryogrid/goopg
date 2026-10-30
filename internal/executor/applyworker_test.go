@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"fmt"
 	"encoding/binary"
 	"log/slog"
 	"strings"
@@ -1406,5 +1407,94 @@ func TestApplyDefaultsForMissingIgnoresFalseMask(t *testing.T) {
 
 	if string(row[1].Buf) != "publisher-value" {
 		t.Errorf("row[1] overwritten despite missing[1]=false: got %q", row[1].Buf)
+	}
+}
+
+// TestApplyWorkerUpdatesNonKeyColumnOverPgoutput: an UPDATE that changes a
+// non-key column, sent without an old tuple (goopg's HOT-update shape under
+// REPLICA IDENTITY DEFAULT), must update the subscriber's row. The
+// subscriber locates the row by the columns the Relation message flags as
+// replica identity, as PG's apply worker does; logicalrep_write_attrs flags
+// only the primary key's columns under DEFAULT. goopg's publisher flagged
+// EVERY column, so the subscriber searched for the NEW label and never found
+// the row: the UPDATE was silently lost. The subscriber here has no primary
+// key, so only the publisher's flags can locate the row.
+func TestApplyWorkerUpdatesNonKeyColumnOverPgoutput(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubIM := pubCat.(*catalog.InMemory)
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	if _, err := pubIM.CreateIndex(parser.ObjectName{Name: "items_pkey"}, pubTbl, []string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	snap := xlog.BuildCatalogSnapshot(pubIM, nil)
+	rel := pubCat.RelFileNode(pubTbl)
+
+	var buf bytes.Buffer
+	po := xlog.NewPgOutput(snap, &buf)
+	var frames [][]byte // one buffer per step: pgoutputMessageLength has no 'U' arm
+	tuple := func(id int, label string) []byte {
+		return wrapAsHeapTuple(t, encodeBodyV0([]any{id, label}, []string{"int4", "text"}), 2)
+	}
+	steps := []func() error{
+		func() error { return po.Begin(41, 0x100) },
+		func() error { return po.Change(xlog.Change{Kind: xlog.ChangeInsert, Rel: rel, NewTuple: tuple(7, "alpha")}) },
+		func() error { return po.Change(xlog.Change{Kind: xlog.ChangeInsert, Rel: rel, NewTuple: tuple(8, "gamma")}) },
+		func() error { return po.Commit(41, 0x100) },
+		func() error { return po.Begin(42, 0x200) },
+		func() error { return po.Change(xlog.Change{Kind: xlog.ChangeUpdate, Rel: rel, NewTuple: tuple(7, "beta")}) },
+		func() error { return po.Commit(42, 0x200) },
+	}
+	for _, s := range steps {
+		buf.Reset()
+		if err := s(); err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, append([]byte(nil), buf.Bytes()...))
+	}
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+	for _, f := range frames {
+		if f[0] != 'U' {
+			driveStream(t, w, f)
+			continue
+		}
+		m, err := xlog.DecodeMessage(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.ApplyMessage(m); err != nil {
+			t.Fatalf("ApplyMessage(U): %v", err)
+		}
+	}
+
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool, scanCtx.Catalog, scanCtx.TxnMgr, scanCtx.Tx, scanCtx.Snap = subCtx.Pool, subCat, subCtx.TxnMgr, tx, snap2
+	scan := newSeqScanOp(&optimizer.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]string{}
+	for _, r := range rows {
+		got[r[0].Int] = r[1].StringValue()
+	}
+	if len(rows) != 2 || got[7] != "beta" || got[8] != "gamma" {
+		var all []string
+		for _, r := range rows {
+			all = append(all, fmt.Sprintf("(%d,%s)", r[0].Int, r[1].StringValue()))
+		}
+		t.Errorf("subscriber rows = %v, want exactly (7,beta) and (8,gamma)", all)
 	}
 }

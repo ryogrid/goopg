@@ -337,3 +337,65 @@ func TestAlterSubscriptionOwnerTo(t *testing.T) {
 		t.Errorf("sub.Owner = %d, want %d (new_sub_owner's OID)", sub.Owner, roleOID)
 	}
 }
+
+// TestCheckCmdReplicaIdentity pins CheckCmdReplicaIdentity
+// (execReplication.c): UPDATE / DELETE on a table that publishes them but has
+// no replica identity is refused with 55000; a primary key, REPLICA IDENTITY
+// FULL, or a publication that does not publish the operation lets it run; a
+// DEFERRABLE primary key is not a replica identity (RelationGetIndexList).
+func TestCheckCmdReplicaIdentity(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	im := ctx.Catalog.(*catalog.InMemory)
+	mk := func(name string) *catalog.Table {
+		tbl, err := im.CreateTable(parser.ObjectName{Schema: "public", Name: name}, []catalog.Column{
+			{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+			{Name: "v", Type: catalog.Type{Name: "text"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tbl
+	}
+	nokey, withpk, defpk, full, insonly := mk("nokey"), mk("withpk"), mk("defpk"), mk("full"), mk("insonly")
+	if _, err := im.CreateIndex(parser.ObjectName{Schema: "public", Name: "withpk_pkey"}, withpk, []string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	dpk, err := im.CreateIndex(parser.ObjectName{Schema: "public", Name: "defpk_pkey"}, defpk, []string{"id"}, true, "btree", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpk.Deferrable = true
+	full.ReplicaIdentity = "f"
+	for _, q := range []string{
+		"CREATE PUBLICATION p FOR TABLE nokey, withpk, defpk, full",
+		"CREATE PUBLICATION pi FOR TABLE insonly WITH (publish = 'insert')",
+	} {
+		if err := runDDL(t, ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	cases := []struct {
+		tbl      *catalog.Table
+		isUpdate bool
+		wantErr  string
+	}{
+		{nokey, true, `cannot update table "nokey" because it does not have a replica identity and publishes updates`},
+		{nokey, false, `cannot delete from table "nokey" because it does not have a replica identity and publishes deletes`},
+		{defpk, true, `cannot update table "defpk" because it does not have a replica identity and publishes updates`},
+		{withpk, true, ""},
+		{full, false, ""},
+		{insonly, true, ""},
+	}
+	for _, c := range cases {
+		err := checkCmdReplicaIdentity(ctx, c.tbl, c.isUpdate)
+		var ee *ExecError
+		switch {
+		case c.wantErr == "" && err != nil:
+			t.Errorf("%s update=%v: unexpected %v", c.tbl.Name, c.isUpdate, err)
+		case c.wantErr != "" && (!errors.As(err, &ee) || ee.Code != "55000" || ee.Message != c.wantErr):
+			t.Errorf("%s update=%v: got %v, want 55000 %q", c.tbl.Name, c.isUpdate, err, c.wantErr)
+		}
+	}
+}
