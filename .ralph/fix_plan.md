@@ -4753,6 +4753,11 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **Publication DDL forms LANDED 2026\-10\-30 \(`32bbaaf04`\)**\. Movement: yes — regress publication 2213→2208\.
+    - ALTER PUBLICATION SET \(options\) \(was a no\-op\)\; DROP PUBLICATION name lists, validated before any drop, with
+      the IF EXISTS NOTICE\; CREATE … FOR TABLE \[ONLY\] t \[\*\]\. Shared applyPublicationOptions uses PG's 42601 errors\.
+    - Pins: `TestPublicationDDLForms` \(mutation\-checked\), `TestParsePublicationDDLForms`\. Goldens: 1 line \(Names\)\.
+      Gates: units, testport 28, tpch\-spotcheck, acceptance arm 24 MATCH, fire\-set PASS, sf025 99/99\.
   - **ALTER PUBLICATION ADD / SET / DROP TABLE LANDED 2026\-10\-30 \(`2738001df`\)**\. Movement: none — regress publication
     2209→2213 \(gains offset by cascades from unmodelled CREATE forms\)\. Before, every form except OWNER TO was a silent
     no\-op, so pg\_dump's `ADD TABLE ONLY` restored no membership\.

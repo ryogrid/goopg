@@ -224,3 +224,34 @@ as `"public.t" () WHERE`. They are now `VirtualNull`.
 - `CREATE PUBLICATION ... FOR TABLE ONLY t` fails to parse.
 - `DROP PUBLICATION a, b` is not parsed.
 - The ownership check (must be owner of publication) is not applied.
+
+## Update 2026-10-30 — SET ( options ), DROP name lists, FOR TABLE ONLY (M0122-0014, `32bbaaf04`)
+
+- **ALTER PUBLICATION name SET ( ... )** was a compat no-op. It now parses into `AlterPublicationOptionsStmt`, and
+  `execAlterPublicationOptions` follows AlterPublicationOptions: the options are applied over the current ones
+  (`publish` resets all four actions; an option not named keeps its value), `PubSub.SetPublicationOptions` updates
+  the registry, and `upsertPublicationCatalogRow` rewrites the pg_publication row, which survives a restart. CREATE
+  and ALTER share `applyPublicationOptions`, which ports parse_publication_options for the options goopg models:
+
+  | input | result |
+  |---|---|
+  | bad `publish` value | 42601 "unrecognized value for publication option \"publish\": \"%s\"" (was 22023 "unrecognized publish action") |
+  | unknown parameter | 42601 "unrecognized publication parameter: \"%s\"" |
+  | publish\_via\_partition\_root, publish\_generated\_columns | accepted, not tracked |
+
+- **DROP PUBLICATION** now takes gram.y's name list (`pub_name_list` in `goopg_ext.y`;
+  `DropPublicationStmt.Names`, with `Name` = the first). Every name is resolved before any is dropped. PG's DROP is
+  transactional and a missing name aborts it whole; goopg's registry drop is not, so `DROP PUBLICATION a, nosuch`
+  must leave `a` in place. IF EXISTS skips a missing name with PG's NOTICE "publication \"%s\" does not exist,
+  skipping" (it used to skip silently).
+- **CREATE PUBLICATION ... FOR TABLE** items are `[ONLY] name [*]`, and a later item may repeat TABLE (pub\_obj\_list).
+  `FOR TABLE ONLY t` used to be a syntax error.
+
+**Pins:** `TestPublicationDDLForms` (validate-before-drop mutation caught), `TestParsePublicationDDLForms`.
+`parity_goldens` gains `Names=["p"]` on its one DROP PUBLICATION entry.
+
+**regress publication:** 2213 → 2208.
+
+**Still open (ledgered):** TABLES IN SCHEMA, column lists and row filters; RENAME TO; the publication ownership
+check; publish\_via\_partition\_root and publish\_generated\_columns are not tracked (pg\_publication shows `f` / `n`);
+the `WITH (foo)` value-less option is a parser error, where PG reports "unrecognized publication parameter".
