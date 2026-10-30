@@ -4688,6 +4688,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **Replica\-identity column flags \+ CheckCmdReplicaIdentity LANDED 2026\-10\-30 \(`4a0cf54cc`\)**\. Movement: none — regress
+    publication 2209→2209 \(its RI cases sit behind the ALTER PUBLICATION ADD TABLE no\-op\)\.
+    - The Relation message flags only identity columns \(FULL all, DEFAULT PK, USING INDEX the index, NOTHING none\;
+      deferrable never\)\. Before, a goopg subscriber kept a stale row next to an updated one \(latent: goopg→goopg does
+      not deliver yet\)\.
+    - UPDATE/DELETE on a table publishing them without a replica identity → 55000 with PG's message and hint\.
+    - Pins: `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput`, `TestCheckCmdReplicaIdentity` \(mutation\-checked\)\.
+      Gates: units, testport replication/pgoutput/subscription 41, tpch\-spotcheck, acceptance arm 24 MATCH, sf025
+      99/99\.
+    - Residuals ledgered\.
   - **pgoutput Relation message fidelity LANDED 2026\-10\-30 \(`f0c7b6718`\)**\. Movement: none — logical replication
     wire format\. A PG subscriber applied nothing for a goopg table created without a schema: the namespace was
     written "" and logicalrep\_read\_namespace reads "" as pg\_catalog\.

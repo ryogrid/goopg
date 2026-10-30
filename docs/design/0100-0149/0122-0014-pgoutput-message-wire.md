@@ -124,3 +124,55 @@ explicit schema verbatim.
   under FULL, the primary key under DEFAULT, the index columns under INDEX, none under NOTHING.
 - `nodes.ColumnTypmod` has no interval arm, so a qualified interval column sends -1 where pg_attribute has the packed
   typmod.
+
+## Update 2026-10-30 — replica-identity column flags and CheckCmdReplicaIdentity (`4a0cf54cc`)
+
+PG 18.3 reference: `postgres/src/backend/replication/logical/proto.c` (logicalrep_write_attrs),
+`postgres/src/backend/utils/cache/relcache.c` (RelationGetIndexList's rd_replidindex selection,
+RelationGetIdentityKeyBitmap), `postgres/src/backend/executor/execReplication.c` (CheckCmdReplicaIdentity).
+
+### Relation message flags
+
+`ColumnDef.ReplIdent` drives the LOGICALREP_IS_REPLICA_IDENTITY flag. `xlog.identityColumns` builds the set:
+
+| relreplident | flagged columns |
+|---|---|
+| FULL | every column |
+| DEFAULT | the primary key's |
+| USING INDEX | the indisreplident index's |
+| NOTHING | none |
+
+A deferrable (non-immediate) index never counts, as rd_replidindex never names one.
+
+Every column used to be flagged. goopg's apply worker, like PG's, locates the row for an UPDATE sent without an old
+tuple by the flagged columns, and goopg sends HOT updates under DEFAULT without one. The subscriber therefore searched
+for the new non-key values and kept the stale row beside the new one. `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput`
+shows the result before the fix: `(7,alpha)`, `(8,gamma)`, `(7,beta)`. This is latent today, because goopg-to-goopg
+subscription does not yet deliver end to end.
+
+### CheckCmdReplicaIdentity
+
+Flagging no columns for a table with no identity is only correct because PG never streams such a change.
+`checkCmdReplicaIdentity`, called from `updateOp.Open` / `deleteOp.Open` once per result relation, refuses an
+UPDATE (DELETE) on a table that publishes it but has no replica identity. A replica identity here means the immediate
+primary key under DEFAULT, the immediate indisreplident index under USING INDEX, or FULL. The error is 55000 "cannot
+update table \"%s\" because it does not have a replica identity and publishes updates" (or the delete form), with
+PG's hint. Partitioned tables are skipped, as in PG. `hasReplicaIdentity` and `xlog.identityColumns` are siblings
+and pick the same index.
+
+Without the check, a PG subscriber that has a primary key would reject goopg's no-identity UPDATEs ("publisher did not
+send replica identity column expected by the logical replication target relation").
+
+**Pins:** `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput` and `TestCheckCmdReplicaIdentity` (deferrable
+mutation caught). A live probe shows PG's messages.
+
+**regress publication** stays at 2209 diff lines. Its replica-identity cases run after `ALTER PUBLICATION … ADD
+TABLE`, which goopg accepts as a no-op, or go through partitions and row filters.
+
+**Still open (ledgered):**
+
+- ALTER PUBLICATION ADD / SET / DROP TABLE is a no-op.
+- goopg-to-goopg subscription does not deliver.
+- Publication membership through a partitioned ancestor is not modelled.
+- Row filters and column lists are not supported.
+- REPLICA IDENTITY FULL UPDATEs send no old tuple.
