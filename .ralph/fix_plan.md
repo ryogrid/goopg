@@ -7338,6 +7338,10 @@ Sequencing: the S9 replenishment rule in the banner.)
     - M0146\-0007/0012b/0067/0175\(below\-item\-10\);
     - M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239/0243\(below\-item\-10\);
     - M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003\); M0146\-0010a and M0146\-0035 are held `\[\!\]`\.
+  - Census 2026\-10\-30, S9 exhausted at `f70664de8` \(`f0c7b6718` touched internal/executor with a \_test\.go file
+    only; re\-captured anyway so reuse holds strictly\) — `routing\-20261030b/`: 22/22·99/99·99/99, plan text
+    byte\-identical to routing\-20261030a\. Nothing filed; the open item 0\-9 tasks and their gates are as in the
+    20261030a note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
