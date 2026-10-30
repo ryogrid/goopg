@@ -89,3 +89,38 @@ This is the wire half. SQL\-level `pg_logical_emit_message` requires
 `RM_LOGICALMSG` records to be created, classified and fed to the decoder in
 transactional order, and stays an open M0122\-0014 continuation with its own
 draft design \(`0122-0014-logical-message-producer.md`\).
+
+## Update 2026-10-30 — the Relation message's namespace, relreplident and atttypmod (`f0c7b6718`)
+
+PG 18.3 reference: `postgres/src/backend/replication/logical/proto.c` (logicalrep_write_rel,
+logicalrep_write_namespace, logicalrep_write_attrs, logicalrep_read_namespace).
+
+`PgOutput.writeRelation` used to write three fields that didn't follow the source table:
+
+| field | before | now | PG |
+|---|---|---|---|
+| namespace | `rel.Schema` verbatim: empty for a table created without a schema | `relationNamespace`: "public" for goopg's empty Schema, "" only for pg\_catalog | logicalrep_write_namespace |
+| relreplident | always `'d'` | the table's `catalog.ReplIdentOrDefault` | `rd_rel->relreplident` |
+| per-column typmod | always -1 | `ColumnDef.Typmod` | `att->atttypmod` |
+
+`ColumnDef.Typmod` comes from `nodes.ColumnTypmod`. `TestAttTypmodSiblingsAgree` pins it against the pg_attribute
+writer's `executor.pgAttTypmod`.
+
+The empty namespace was a real interop defect. A PG subscriber reads an empty namespace as pg_catalog
+(logicalrep_read_namespace), so it looked for `pg_catalog.t` and silently applied nothing.
+`TestPort_PgoutputInteropGoopgToPG` never saw this: it creates `public.t` explicitly, and goopg records an
+explicit schema verbatim.
+
+**Pins:**
+
+- `TestPgOutputRelationMessageFields`.
+- **Oracle**, `TestPort_PgoutputInteropGoopgToPGUnqualifiedTable`: a PG 18.3 subscriber applies an unqualified goopg
+  table. It fails with the mapping reverted.
+- The pg_recvlogical E2E checks for `public` in the stream.
+
+**Still open (ledgered):**
+
+- Every column is still flagged as replica identity. logicalrep_write_attrs flags only the identity columns: all
+  under FULL, the primary key under DEFAULT, the index columns under INDEX, none under NOTHING.
+- `nodes.ColumnTypmod` has no interval arm, so a qualified interval column sends -1 where pg_attribute has the packed
+  typmod.

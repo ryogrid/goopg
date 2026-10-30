@@ -4688,6 +4688,16 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **pgoutput Relation message fidelity LANDED 2026\-10\-30 \(`f0c7b6718`\)**\. Movement: none — logical replication
+    wire format\. A PG subscriber applied nothing for a goopg table created without a schema: the namespace was
+    written "" and logicalrep\_read\_namespace reads "" as pg\_catalog\.
+    - Namespace by name \(only pg\_catalog as ""\), relreplident from the table, per\-column atttypmod
+      \(nodes\.ColumnTypmod, pinned to executor\.pgAttTypmod\)\.
+    - Pins: `TestPgOutputRelationMessageFields`, `TestAttTypmodSiblingsAgree`\. Oracle
+      `TestPort\_PgoutputInteropGoopgToPGUnqualifiedTable` \(fails with the mapping reverted\)\.
+    - Gates: units, testport pgoutput\-interop \+ replication \(37\), tpch\-spotcheck, acceptance arm 24 MATCH, sf025
+      99/99\.
+    - Residuals ledgered \(replica\-identity column flags, interval typmod\)\.
   - **pg\_logical\_emit\_message producer and decoding LANDED 2026\-10\-30 \(`a45162dc3`\)**\. Movement: none — logical
     decoding messages \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH\)\. Design:
     `docs/design/0100-0149/0122-0014-logical-message-producer.md` \(draft → landed\)\.
