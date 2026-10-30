@@ -791,7 +791,7 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
-- [ ] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
+- [x] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
   M0122\-0014\)\.
   Kind: impl
   Parent: none
@@ -803,6 +803,13 @@ heuristic stays live.)
     sweep`\)\.
   - Owner decision needed: rotate or retire the 159 GB file, which the loop left untouched; per\-run log files; or
     replace the `wc \-l` line count with a byte offset \(`stat \-c %s`\) so log size stops mattering\.
+  - Closed 2026\-10\-30 \(owner directed all three options\)\. The 159 GB file retired: manifest \+ head/tail 1 MiB
+    samples \+ SHA\-256s in `tmp/retired\_20261030/`; disk 97% → 82% \(31 GB → 179 GB free\)\. Per\-run sweep
+    logs: `scripts/tpcds\-sf025\-regression\.sh` now defaults `SF025\_LOG` to a per\-invocation
+    `goopg\.sf025\-<ts>\.log` in the runtime dir \(caller `SF025\_LOG=` still wins\), pruned to the 10 newest\.
+    `bench/tpcds/server\.sh start sf025` rotates the shared default through \.1\.\.\.5 \(the remaining
+    persistent writer\)\. Plan channel: `wc \-l` replaced by a `stat \-c %s` byte offset \+ `tail \-c`,
+    so extraction cost is O\(appended\) and log size stops mattering\.
 
 - [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
   \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.

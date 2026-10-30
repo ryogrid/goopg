@@ -28,6 +28,28 @@ READY_TIMEOUT="${TPCDS_READY_TIMEOUT:-180}"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# rotate_log_generations <file> <keep> — move <file> to <file>.1, shifting the
+# existing generations, dropping the oldest (classic N-generation rotator).
+#
+# Rotation for the sf025 log (owner item filed 2026-10-30 under M0122-0014):
+# the plan channel appends ~138 MB of planner DP trace per capture and the
+# shared log grew to 159 GB in six weeks (its `wc -l` alone took ~50 min;
+# 1a7fddb3d filed this item; the 159 GB file was retired 2026-10-30 — manifest
+# in tmp/retired-20261030/). The sweep harness now logs to per-run files it
+# prunes itself (scripts/tpcds-sf025-regression.sh), so server.sh start is the
+# remaining persistent writer of the shared path — rotate it on every start.
+rotate_log_generations() {
+    local base="$1" keep="$2" i
+    [[ -e "${base}" ]] || return 0
+    rm -f -- "${base}.${keep}"
+    for ((i = keep - 1; i >= 1; i--)); do
+        if [[ -e "${base}.${i}" ]]; then
+            mv -f -- "${base}.${i}" "${base}.$((i + 1))"
+        fi
+    done
+    mv -f -- "${base}" "${base}.1"
+}
+
 goopg_target() {
     # sets DATA / PORT / SCOPE / LOG for sf1|sf025
     case "$1" in
@@ -96,6 +118,9 @@ goopg_start() {
         echo "tpcds-server:   the measurement convention wants it written explicitly (512MB)." >&2
     fi
     goopg_stop "$1" >/dev/null
+    if [[ "$1" == sf025 ]]; then
+        rotate_log_generations "${LOG}" 5
+    fi
     local hba_arg=()
     [[ -f "${DATA}/pg_hba.conf" ]] && hba_arg=(--hba "${DATA}/pg_hba.conf")
     echo "tpcds-server: starting $1 capped (scope ${SCOPE}) on ${TPCDS_HOST}:${PORT}"
