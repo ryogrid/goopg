@@ -7527,6 +7527,10 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 exhausted at `cfc5b5497` \(2026\-10\-30; DUE after `32bbaaf04`\) — `routing\-20261030e/ROUTING\.md` only \(unchanged
   - S9 exhausted at `5657546d8` \(2026\-10\-30; DUE after `5657546d8`, reason=plan\-relevant\-change\) —
     `routing\-20261030f/ROUTING\.md` only \(unchanged census\)\; the id\(gate\) list is unchanged from the note above\.
+  - S9 exhausted at `56dea44e6` \(2026\-10\-31; DUE after `56dea44e6`, reason=plan\-relevant\-change — the
+    flush\-race fix touched `internal/storage/bufpool\.go`\, in the trigger set\) — `routing\-20261031a/ROUTING\.md`
+    only \(unchanged census\, S9\(4a\)\; `tree=` omitted: the capture ran with in\-progress ALTER SUBSCRIPTION edits
+    in the working tree\)\; the id\(gate\) list is unchanged from the note above\.
     census\); id\(gate\) list as in the 20261030a note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
