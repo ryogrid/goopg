@@ -255,3 +255,42 @@ as `"public.t" () WHERE`. They are now `VirtualNull`.
 **Still open (ledgered):** TABLES IN SCHEMA, column lists and row filters; RENAME TO; the publication ownership
 check; publish\_via\_partition\_root and publish\_generated\_columns are not tracked (pg\_publication shows `f` / `n`);
 the `WITH (foo)` value-less option is a parser error, where PG reports "unrecognized publication parameter".
+
+## Update 2026-10-30 — publisher-side slot lifecycle: CREATE/DROP SUBSCRIPTION (M0122-0014, `5657546d8`)
+
+- **CREATE SUBSCRIPTION created no slot on the publisher.** CreateSubscription calls `walrcv_create_slot` when
+  connect and create_slot (both default true) are on, and reports NOTICE "created replication slot \"%s\" on
+  publisher". goopg skipped it, so the apply worker's START_REPLICATION failed "replication slot \"s\" does not
+  exist" on every retry — a goopg subscriber of a goopg publisher received nothing (the delivery gap ledgered
+  2026-10-30). The executor now calls a `CreateSubscriptionSlot` hook **before** the registry insert (PG's catalog
+  row rolls back with a failed CREATE; goopg's registry insert does not). `postmaster.subscriptionSlotHooks` maps
+  failures onto subscriptioncmds.c: unreachable publisher → 08006 "subscription \"%s\" could not connect to the
+  publisher"; a refused CREATE_REPLICATION_SLOT → 08P01 "could not create replication slot \"%s\"".
+- **DROP SUBSCRIPTION** follows DropSubscription's order: registry entry removed → worker stopped → slot dropped
+  on the publisher (`DropSubscriptionSlot` → `DROP_REPLICATION_SLOT "s" WAIT`, ReplicationSlotDropAtPubNode with
+  missing\_ok = false). `ApplyLauncher.StopWorker` mirrors logicalrep_worker_stop (cancel + join) so the next
+  reconcile does not restart the worker and the slot is not active. A publisher-side failure restores the registry
+  entry (PG's DROP rolls back) — a slot left behind pins WAL on the publisher forever.
+- **DROP_REPLICATION_SLOT ... WAIT** on the walsender: `Slots.Drop` retried while the slot is owned
+  (`xlog.ErrSlotInUse`), bounded at 5 min where PG's ReplicationSlotDrop wait is interruptible and unbounded
+  (the handler has no client context to notice a vanished client).
+- **slot_name = NONE layering fix.** `CreateSubscriptionAsOwner` defaulted an empty slotName to the subscription
+  name, so NONE was stored as a real slot name: DROP chased a phantom slot on the (unreachable) publisher, and
+  pg\_subscription showed a subslotname PG stores NULL. DefineSubscription's name default belongs to the
+  executor (it applies it); the registry stores slotName as given — "" is NULL subslotname, rendered NULL by
+  `buildPGSubscriptionRow` and round-tripped through the heap journal/reload path.
+
+**Pins:** `TestSubscriptionPublisherSlotHooks` (create-gate on connect∧createSlot, no subscription on failed
+create, registry restore on failed drop, IF EXISTS NOTICE); `TestPgSubscriptionViewRendersRows` NONE arm.
+**Ports:** `TestPort_PgoutputInteropGoopgToGoopg` (slot exists on the publisher after CREATE, INSERT/UPDATE/
+DELETE deliver — UPDATE of a non-key column lands through the Relation message's identity flags — slot gone
+after DROP); `TestPort_PgoutputInteropPGToGoopgSlotLifecycle` (PG 18.3's own pg_replication_slots as oracle:
+pgoutput/logical appears on CREATE, vanishes on DROP).
+
+**Movement:** none — subscription DDL / replication; the plan instruments are blind to it (sf025 PLAN-SHAPE
+same=99, arm 24 MATCH). regress publication unaffected.
+
+**Still open (ledgered):** ALTER SUBSCRIPTION ... SET (slot\_name = NONE) / ENABLE / DISABLE / REFRESH PUBLICATION
+are not implemented — the escape hatch PG documents for a subscription whose publisher is unreachable is
+unavailable, so a dummy-conninfo subscription in a test must be created fully disassociated; the apply worker
+does not confirm LSNs back on a DROP race; two-phase / streams / two\_phase options are accepted, not modelled.

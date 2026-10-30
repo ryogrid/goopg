@@ -4760,6 +4760,25 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **Publisher-side slot lifecycle LANDED 2026-10-30 \(`5657546d8`\)**\. Movement: none — subscription DDL /
+    replication \(sf025 PLAN\-SHAPE same=99, arm 24 MATCH\)\.
+    - CREATE SUBSCRIPTION creates the slot on the publisher \(walrcv\_create\_slot: CREATE\_REPLICATION\_SLOT
+      "s" LOGICAL pgoutput \(SNAPSHOT 'nothing'\)\) before the registry insert, with PG's NOTICE and the
+      08006 / 08P01 errors; DROP SUBSCRIPTION removes the registry row, stops the apply worker
+      \(logicalrep\_worker\_stop\), drops the slot on the publisher \(DROP\_REPLICATION\_SLOT "s" WAIT,
+      missing\_ok = false\) and restores the registry row when the publisher refuses\.
+    - goopg→goopg logical replication now DELIVERS \(the 2026-10-30 ledgered gap: no slot ever existed, so
+      START\_REPLICATION failed on every retry\)\. walsender: DROP\_REPLICATION\_SLOT … WAIT, bounded retry
+      while the slot is owned\.
+    - Fix: CreateSubscriptionAsOwner stored "" slotName as the subscription name — slot\_name = NONE became
+      indistinguishable from the default and DROP chased phantom slots; the name default now lives only in
+      the executor \(DefineSubscription\), the registry stores as given, pg\_subscription renders NULL\.
+    - Pins: TestSubscriptionPublisherSlotHooks, TestPgSubscriptionViewRendersRows \(NONE arm\); ports:
+      TestPort\_PgoutputInteropGoopgToGoopg, TestPort\_PgoutputInteropPGToGoopgSlotLifecycle\.
+      Gates: units, testport pgoutput\-interop \+ subscription families, tpch\-spotcheck, acceptance arm
+      24 MATCH, sf025 99/99 \(fire\-set out of scope\)\.
+    - Residuals ledgered: ALTER SUBSCRIPTION SET \(slot\_name = NONE\) / ENABLE / DISABLE / REFRESH not
+      implemented — the PG escape hatch for an unreachable publisher is unavailable\.
   - **Publication DDL forms LANDED 2026\-10\-30 \(`32bbaaf04`\)**\. Movement: yes — regress publication 2213→2208\.
     - ALTER PUBLICATION SET \(options\) \(was a no\-op\)\; DROP PUBLICATION name lists, validated before any drop, with
       the IF EXISTS NOTICE\; CREATE … FOR TABLE \[ONLY\] t \[\*\]\. Shared applyPublicationOptions uses PG's 42601 errors\.
@@ -7448,6 +7467,8 @@ Sequencing: the S9 replenishment rule in the banner.)
   - S9 exhausted at `e3598f114` \(2026\-10\-30; DUE after `2738001df`\) — `routing\-20261030d/ROUTING\.md` only \(unchanged
     census, S9\(4a\)\); id\(gate\) list as in the 20261030a note above\.
   - S9 exhausted at `cfc5b5497` \(2026\-10\-30; DUE after `32bbaaf04`\) — `routing\-20261030e/ROUTING\.md` only \(unchanged
+  - S9 exhausted at `5657546d8` \(2026\-10\-30; DUE after `5657546d8`, reason=plan\-relevant\-change\) —
+    `routing\-20261030f/ROUTING\.md` only \(unchanged census\)\; the id\(gate\) list is unchanged from the note above\.
     census\); id\(gate\) list as in the 20261030a note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
