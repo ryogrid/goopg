@@ -249,3 +249,38 @@ units (`ralph-precommit-test.sh` units scope), `tpch-spotcheck.sh`
 `tpcds-sf025-regression.sh` sweep, commit-hook pgbench smoke; pre-existing
 postmaster package flakes (ledger 2026-10-30 M0122-0014 row) reproduced
 identically at HEAD.
+
+## Follow-up 4: reltuples=1 on pgbench_branches closed as not-a-defect (filed 2026-10-31, loop #5)
+
+The second relpages-triage item claimed an analyzer/vacuum visibility
+defect: "reltuples renders 1 on a 10-row pgbench_branches; launcher analyze
+rows=1, vacuum live=1 of 10". The recon rig
+(`tmp/mnightly-reltuples-rig.sh`, goopg :5617 vs a PG 18.3 temp cluster
+:5618) showed the premise itself is false.
+
+**pgbench scale semantics**: `pgbench -i -s 1` creates pgbench_branches
+with exactly **1 row** (branches = scale, tellers = 10×scale,
+accounts = 100000×scale, history = 0). `SELECT count(*)` = 1 on goopg
+right after `-i`; the PG 18.3 oracle (stock `initdb` + stock `pgbench -i`)
+renders the same branches=1 / tellers=10 / history=0 and reltuples=1 after
+ANALYZE. Launcher `analyze rows=1`, `reltuples=1`, and vacuum `live=1,
+dead=0` are honest numbers for a 1-row table; `dead=0` after ~14k tpcb
+transactions matches HOT-chain pruning at insert (heap_prune keeps the
+latest version of each HOT chain).
+
+The bisection ladder (INSERT+ANALYZE / UPDATE 9 / COPY 10 / COPY+UPDATE 9
+/ COPY+ALTER ADD PRIMARY KEY +UPDATE) agrees with PG 18.3 at every point
+(count(*) and reltuples 10/10) — the COPY/rewrite/update
+invisible-versions hypothesis is dead at SQL level; the loop #4 pin
+(5000 visible after COPY) already covered the same ground from the
+counters side. The filed "10 rows, 69 blocks" sampler line was run
+conflation: `t=10` came from the SCALE=10 rig, `rows=1` logs from the
+SCALE=1 rig (1 row — correct), and the probe's `branches t=1 p=4` line
+was a default-SCALE=1 probe.
+
+Rig-reuse note: pgbench 16+ DDL uses columns `bid`/`bbalance`/`filler`
+(the old `branchid` spelling errors identically on PG 18.3 — not a goopg
+divergence), so rig SQL must use the new names.
+
+No code change; no ledger row (parity verified, nothing deferred). The
+third relpages-triage item (post-TRUNCATE cost estimate) remains open.

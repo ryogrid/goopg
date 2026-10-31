@@ -1271,7 +1271,7 @@ heuristic stays live.)
     counts the parent OID \(goopg writes parent storage; PG counts per partition\)\.
   - Movement: none — plan instruments blind \(pgstat accounting; spotcheck Q12/Q13 canonical, acceptance arm
     MATCH set, sf025 sweep same — see Gates\)\.
-- [ ] **pgbench\_branches reltuples renders 1 \(10\-row table\) — analyzer and vacuum see 1 visible of 10 live rows on an idle pgbench table** \(filed 2026\-10\-31 by the relpages recon loop\)
+- [x] **pgbench\_branches reltuples renders 1 \(10\-row table\) — analyzer and vacuum see 1 visible of 10 live rows on an idle pgbench table** \(filed 2026\-10\-31 by the relpages recon loop; CLOSED not\-a\-defect 2026\-10\-31 loop #5\)
   Kind: recon
   Parent: none
   - s=1 trio rig: pgbench\_branches \(10 rows, 69 blocks after W1\) — launcher analyze logs `rows=1` at
@@ -1286,6 +1286,28 @@ heuristic stays live.)
     \(SCALE=1\) \+ `tmp/mnightly-copy-probe.sh` pieces: reproduce at pure\-SQL level \(COPY 10 rows → UPDATE
     9 rows → ANALYZE; check reltuples\) — likely a `COPY committed rows invisible to later snapshots` family;
     the COPY probe above showed n\_live\_tup=0, consistent with COPY\-committed tuples judged invisible\.
+  - Resolution \(loop #5, rig `tmp/mnightly-reltuples-rig.sh`, goopg 5617 vs PG 18\.3 temp cluster 5618\):
+    - **The "10\-row table" premise is false\.`pgbench -i -s 1` creates pgbench\_branches with exactly 1 row**
+      \(pgbench scale semantics: branches = scale, tellers = 10×scale, accounts = 100000×scale\)\.
+      `SELECT count(*) FROM pgbench_branches` = 1 on goopg immediately after \-i; the PG 18\.3 oracle
+      \(stock initdb \+ stock pgbench \-i \-s 1\) renders branches=1, tellers=10, history=0,
+      reltuples=1 after ANALYZE — byte\-for\-byte the same numbers goopg produced\.
+    - So launcher `analyze rows=1`, `reltuples=1`, and vacuum `live=1, dead=0` are all HONEST for a
+      1\-row table; `dead=0` after 14k\-transaction W1 is consistent with HOT\-chain pruning at insert
+      \(heap\_prune keeps the latest version of each HOT chain\)\.
+    - Bisection ladder \(pure SQL, both engines\): INSERT\+ANALYZE / UPDATE 9 / COPY 10 / COPY\+UPDATE 9 /
+      COPY\+ALTER ADD PRIMARY KEY \(\+UPDATE\) — count\(\*\) and reltuples agree 10/10 at every step,
+      goopg == PG 18\.3\)\. No COPY/rewrite/update visibility defect exists at SQL level\.
+    - The trio\-rig "10 rows, 69 blocks" line was run conflation: the s=10 rig sampler shows
+      `branches t=10` \(correct\), the 15:04/15:05 `rows=1` logs came from the s=1 run \(1 row — correct\);
+      the filed entry merged the two runs\. The probe sampler `branches t=1 p=4` was a default\-SCALE=1
+      probe \(1 row, \~4 pages — correct\)\.
+    - Legacy probe n\_live\_tup=0 on COPY: explained by the loop #4 counters bug \(fixed, `9d0db8766`\)\.
+    - Rig SQL note for reuse: pgbench 16\+ DDL uses columns `bid`/`bbalance`/`filler` \(not the legacy
+      `branchid`\)\; `WHERE branchid` errors identically on PG 18\.3 — not a goopg divergence\.
+  - Movement: closed as **not\-a\-defect** \(parity verified against the PG 18\.3 oracle at every probe
+    point; no code change, no ledger row — nothing deferred\)\. Next M\-NIGHTLY in file order:
+    post\-TRUNCATE cost divergence \(Kind: impl, next entry\)\.
 - [ ] **Post\-TRUNCATE empty\-table cost estimate diverges from PG — goopg rows=1270/cost 22.70, PG rows=610/cost 16.10; reltuples renders 0 where PG keeps −1** \(filed 2026\-10\-31 by the relpages recon loop\)
   Kind: impl
   Parent: none
