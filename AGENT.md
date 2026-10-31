@@ -474,6 +474,42 @@ If Go symbol operations fail:
   newly-discovered follow-ups, and note any tasks that turned out to be
   larger than expected.
 
+## Ralph loop operations on the opencode backend (2026-10-31)
+
+Consequence of the 2026-10-30/31 incident investigation
+(`tmp/opencode-backend-debbug/`): opencode v2 runs agent sessions inside a
+detached background service (`opencode serve --service`); the
+`opencode run` CLI is only a client of it. That service outlives the loop,
+and a session hosted by it keeps editing and committing after the loop's
+process tree dies (ghost commits `5657546d8` + `fc635ff66` landed ~1.5 h
+after the harness died at 20:35, with no loop log, metrics, or status block).
+
+- The loop now starts OpenCode with `--standalone` (private in-process
+  server, `~/.ralph/ralph_loop.sh:build_opencode_command`), so loop timeout,
+  SIGTERM, and the stop script's descendant sweep all reach the agent.
+- Stop procedure: `~/.ralph/ralph-stop.sh` (SIGTERM ladder with the
+  descendant subtree snapshotted BEFORE the root is signalled). It reports a
+  shared OpenCode service daemon and stops it only with
+  `--stop-opencode-service` (interactive TUIs share the daemon — confirm
+  first). Do NOT Ctrl-C the loop (bash defers the trap while the foreground
+  pipeline lives; the OpenCode CLI's slow finalizer can leave the tree in a
+  half-killed state); `pkill opencode` is a last resort — it drops every
+  OpenCode session on the machine.
+- Do NOT `opencode -s <loop-session-id>` and do not attach a TUI to the
+  loop's shared service to browse loop sessions: resuming a loop session
+  injects user messages into the loop's context.
+- Restart checklist after any stop/kill: (1) `git status` — decide
+  commit/stash/discard for tracked WIP from the killed loop (ghost-agent
+  edits included); (2) `pgrep -af 'opencode (run|serve)'` — no foreign
+  residue; (3) `scripts/ralph-prev-loop-check.sh` — with no live agent it
+  now also checks the newest log group, and an `ANOMALY` line must be
+  carried into the next loop's `working_set.md` rewrite; (4) start the loop
+  from the ralph screen window with `ralph --live --verbose`.
+- Preflight: the loop probes the pinned provider's `options.baseURL` from
+  `opencode.json` at startup and WARNs when it is unreachable (expired
+  provider key / dead local model server must not be discovered by burning
+  loops).
+
 ## Completion and Deferral Discipline
 
 - Do not mark a milestone as complete in `.ralph/fix_plan.md` until there is

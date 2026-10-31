@@ -17,6 +17,30 @@
         }
       }
     },
+    "strata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Strata (local)",
+      "options": {
+        "baseURL": "http://192.168.56.1:8080/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen3.8-flash-next-coder": {
+          "name": "Qwen3.8-Flash-Next Coder (Strata)",
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "qwen3.8-flash-next-swift": {
+          "name": "Qwen3.8-Flash-Next Swift IQ3_S Q4_0 256k (Strata)",
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
+        }
+      }
+    },
    "opencode": {
      "models": {
        "muse-spark-1.3-contributor-free": {
