@@ -3527,3 +3527,88 @@ func parseLSN(t *testing.T, s string) uint64 {
 func lsnText(v uint64) string {
 	return fmt.Sprintf("%X/%X", v>>32, v&0xFFFFFFFF)
 }
+
+// TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh pins the
+// 2026-10-31 M0122-0014 refresh half of ALTER SUBSCRIPTION ...
+// SET/ADD/DROP PUBLICATION: with refresh = true (the default) the arms
+// dial the publisher (AlterSubscription_refresh's walrcv_connect,
+// subscriptioncmds.c:838-850) and run check_publications' SELECT over the
+// publisher's pg_publication (:447-460). The harness pins what the wire
+// shows: a publication the publisher HAS lands silently; a publication it
+// LACKS still lands — check_publications raises ereport(WARNING), not an
+// error (:493-501), and psc.Exec fails the test on any ERROR, so landing
+// pins PG's non-error shape. (The WARNING's exact text is pinned at
+// executor level by TestAlterSubscriptionPublications; the dead-publisher
+// 08006 arm needs a dead-publisher cluster, so it is pinned through the
+// injected hook there as well.) DROP PUBLICATION is the connect-only arm:
+// PG passes validate_publications = NULL, so no name is checked, yet the
+// dial still happens. The pg_subscription view's subpublications column
+// is the observation point.
+func TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_pubsalter", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_pubsalter_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_pubsalter_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	subs := func() string {
+		t.Helper()
+		return psc.Subscriber.QueryScalar(t,
+			"SELECT subpublications FROM pg_subscription WHERE subname = 'g2g_pubsalter_sub'")
+	}
+	if got := subs(); got != "{p}" {
+		t.Fatalf("subpublications after CREATE = %q, want {p}", got)
+	}
+
+	// ADD of a publication that exists on the publisher: dial + check
+	// pass, the list lands (merge_publications appends).
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p2 FOR TABLE t")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub ADD PUBLICATION p2")
+	if got := subs(); got != "{p,p2}" {
+		t.Fatalf("subpublications after ADD p2 = %q, want {p,p2}", got)
+	}
+
+	// ADD of a publication the publisher LACKS: WARNING, not an error —
+	// the statement lands with the name in the list.
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub ADD PUBLICATION px")
+	if got := subs(); got != "{p,p2,px}" {
+		t.Fatalf("subpublications after ADD px (publisher lacks it) = %q, want {p,p2,px}", got)
+	}
+
+	// DROP is connect-only (validate_publications = NULL) and lands.
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub DROP PUBLICATION px")
+	if got := subs(); got != "{p,p2}" {
+		t.Fatalf("subpublications after DROP px = %q, want {p,p2}", got)
+	}
+
+	// SET replaces the list; p2 exists on the publisher, p does not
+	// matter: p is already gone from the list before the dial (PG
+	// validates the STATEMENT list for SET).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub SET PUBLICATION p2")
+	if got := subs(); got != "{p2}" {
+		t.Fatalf("subpublications after SET p2 = %q, want {p2}", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_pubsalter_sub")
+}

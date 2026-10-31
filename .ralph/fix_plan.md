@@ -4970,7 +4970,32 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
-  - **ALTER SUBSCRIPTION SET / ADD / DROP PUBLICATION \(statement side\) LANDED 2026-10-31 \(this commit\)**\.
+  - **ALTER SUBSCRIPTION publication-list refresh half (dial + check\_publications) LANDED 2026-10-31 \(this commit\)**\.
+    Movement: none — subscription DDL, plan instruments blind \(spotcheck, acceptance arm 24 MATCH, fireset no
+    fires, sf025 sweep 99/99\)\.
+    - Closes ledger item \(1\) of the 2026\-10\-31 refresh row: the refresh=true arms dial the publisher
+      \(walrcv\_connect twin replication\.CheckRemotePublications over the replication=database handshake;
+      08006 "subscription %q could not connect to the publisher"\) and run check\_publications' SELECT
+      \(subscriptioncmds\.c:447\-460\) over the publisher's virtual pg\_publication: SET/ADD validate the
+      statement list, DROP is connect\-only \(validate\_publications = NULL\)\. A publisher\-missing name is
+      PG's WARNING \(ereport\(WARNING\) :493\-501 — singular/plural "publication\(s\) %s do\(es\) not exist on
+      the publisher"\) and the statement LANDS; query failure → XX000 "could not receive list of publications
+      from the publisher"; connect/query failure aborts before the registry write \(PG updates the tuple only
+      after the arm's refresh returns\)\.
+    - Server hook: subscriptionSlotHooks' third arm ectx\.CheckPublicationsOnPublisher \(both build sites
+      wired\; nil in test contexts skips the publisher side, the slot hooks' convention\)\. Publisher side
+      needed no change — the walsender dispatcher falls non\-replication verbs through to the regular SQL
+      handler \(measured live, first try\)\.
+    - Pins: TestAlterSubscriptionPublications hook arms \(validate lists per action\, both WARNING texts via
+      TakeNotices\, the 08006 abort leaves the list untouched\, refresh=false never dials\) \+
+      TestPort\_PgoutputInteropGoopgToGoopgAlterPubsRefresh \(live goopg→goopg: publisher\-known ADD lands\;
+      publisher\-unknown ADD LANDS \(psc\.Exec fails on any ERROR — pins the non\-error shape\)\; DROP
+      connect\-only\; SET replaces\; observed via pg\_subscription\.subpublications\)\.
+    - Deferred \(ledgered 2026\-10\-31\): fetch\_table\_list over the open dial\, pg\_subscription\_rel 'i' rows
+      \+ initial COPY \+ i→d→s \(the tablesync library stays unwired in production\)\, the eager worker
+      restart\, copy\_data modelled\, the two\_phase\+copy\_data 55000 arms \(no two\_phase field\)\; the dead\-
+      publisher 08006 / XX000 live pins need a dead\-publisher cluster the pubsubcluster harness lacks.
+  - **ALTER SUBSCRIPTION SET / ADD / DROP PUBLICATION \(statement side\) LANDED 2026-10-31 \(`b48b79212`\)**\.
     Movement: none — subscription DDL, plan instruments blind \(tpch\-spotcheck, acceptance arm 24 MATCH, fireset
     no fires\)\.
     - The three gram\.y:10873\-10901 publication\-list arms \(ALTER\_SUBSCRIPTION\_\{SET,ADD,DROP\}\_PUBLICATION,

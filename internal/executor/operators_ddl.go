@@ -1727,11 +1727,12 @@ func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) err
 //
 // refresh = true (the default) passes PG's two gates — a disabled
 // subscription 55000 with the per-action hint (:1392-1408/1437-1456) and
-// an explicit transaction block 25001 (PreventInTransactionBlock) — and
-// then lands the list change: goopg's AlterSubscription_refresh half
-// (publisher-side publication check, pg_subscription_rel 'i' rows, the
-// tablesync COPY) is not wired in production (ledgered), so no
-// table-sync work fires; the new list reaches the publisher on the
+// an explicit transaction block 25001 (PreventInTransactionBlock) — then
+// runs AlterSubscription_refresh's publisher-connection half (dial +
+// check_publications, below) and lands the list change. The rest of
+// goopg's AlterSubscription_refresh — fetch_table_list, pg_subscription_rel
+// 'i' rows, the tablesync COPY — is not wired in production (ledgered), so
+// no table-sync work fires; the new list reaches the publisher on the
 // apply worker's next START_REPLICATION, where publication_names is
 // sent. copy_data validates and is accepted-not-modelled, as the SET
 // arm treats its accepted options.
@@ -1830,6 +1831,38 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
 			return &ExecError{Code: "25001", Pos: s.Pos(),
 				Message: "ALTER SUBSCRIPTION with refresh cannot run inside a transaction block"}
+		}
+	}
+
+	// AlterSubscription_refresh's publisher half (refresh = true only,
+	// subscriptioncmds.c:820-880): walrcv_connect (connect failure is
+	// ERRCODE_CONNECTION_FAILURE 08006, "subscription %q could not connect
+	// to the publisher"), then check_publications (:443) over
+	// pg_publication for the validated names — SET's list, ADD's list;
+	// DROP passes NULL (PG validates no names there) and only needs the
+	// dial. A missing publication is a WARNING (:493-501), NOT an error:
+	// the statement lands and the refresh machinery skips that
+	// publication's tables. The rest of the half — fetch_table_list, the
+	// pg_subscription_rel 'i' rows, the tablesync COPY, the eager worker
+	// restart — is ledgered; the hook is nil in test contexts without a
+	// server, which keeps the list-write unit-testable.
+	if refresh && o.ctx.CheckPublicationsOnPublisher != nil {
+		validate := s.Publications
+		if s.Action == "drop" {
+			validate = nil
+		}
+		missing, cerr := o.ctx.CheckPublicationsOnPublisher(s.Name, sub.Conninfo, validate)
+		if cerr != nil {
+			return cerr
+		}
+		if len(missing) == 1 {
+			o.ctx.AddNotice(fmt.Sprintf("publication %q does not exist on the publisher", missing[0]))
+		} else if len(missing) > 1 {
+			quoted := make([]string, len(missing))
+			for i, m := range missing {
+				quoted[i] = `"` + m + `"`
+			}
+			o.ctx.AddNotice(fmt.Sprintf("publications %s do not exist on the publisher", strings.Join(quoted, ", ")))
 		}
 	}
 

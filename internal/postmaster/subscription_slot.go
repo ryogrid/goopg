@@ -9,19 +9,25 @@ import (
 )
 
 // subscriptionSlotHooks returns the executor hooks that create and drop a
-// subscription's slot on its publisher, mapping failures onto
-// subscriptioncmds.c's errors:
+// subscription's slot on its publisher, and that run ALTER SUBSCRIPTION's
+// publication-existence check, mapping failures onto subscriptioncmds.c's
+// errors:
 //
 //   - the publisher cannot be reached: 08006 "subscription \"%s\" could not
-//     connect to the publisher: %s" (CREATE), or 08006 "could not connect to
-//     publisher when attempting to drop replication slot \"%s\": %s" with
-//     its ALTER SUBSCRIPTION hint (DROP);
+//     connect to the publisher: %s" (CREATE, and the same
+//     ERRCODE_CONNECTION_FAILURE arm in AlterSubscription_refresh :844-850),
+//     or 08006 "could not connect to publisher when attempting to drop
+//     replication slot \"%s\": %s" with its ALTER SUBSCRIPTION hint (DROP);
 //   - the publisher refuses CREATE_REPLICATION_SLOT: 08P01 "could not create
 //     replication slot \"%s\": %s" (libpqrcv_create_slot);
 //   - the publisher refuses DROP_REPLICATION_SLOT: 08006 "could not drop
 //     replication slot \"%s\" on publisher: %s"
-//     (ReplicationSlotDropAtPubNode with missing_ok = false).
-func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, slotName string) error) {
+//     (ReplicationSlotDropAtPubNode with missing_ok = false);
+//   - the publisher refuses check_publications' SELECT: XX000 "could not
+//     receive list of publications from the publisher: %s" (:455-459, the
+//     res->status != WALRCV_OK_TUPLES arm carries no errcode).
+func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, slotName string) error,
+	checkPubs func(subName, conninfo string, pubs []string) ([]string, error)) {
 	create = func(subName, conninfo, slotName string) error {
 		err := s.applyLauncher.CreatePublisherSlot(conninfo, slotName)
 		var rce *replication.RemoteCommandError
@@ -54,5 +60,19 @@ func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, s
 				Hint:    "Use ALTER SUBSCRIPTION ... DISABLE to disable the subscription, and then use ALTER SUBSCRIPTION ... SET (slot_name = NONE) to disassociate it from the slot."}
 		}
 	}
-	return create, drop
+	checkPubs = func(subName, conninfo string, pubs []string) ([]string, error) {
+		missing, err := s.applyLauncher.CheckPublications(conninfo, pubs)
+		var rce *replication.RemoteCommandError
+		switch {
+		case err == nil:
+			return missing, nil
+		case errors.As(err, &rce):
+			return nil, &executor.ExecError{Code: "XX000",
+				Message: fmt.Sprintf("could not receive list of publications from the publisher: %s", rce.Error())}
+		default:
+			return nil, &executor.ExecError{Code: "08006",
+				Message: fmt.Sprintf("subscription \"%s\" could not connect to the publisher: %v", subName, errors.Unwrap(err))}
+		}
+	}
+	return create, drop, checkPubs
 }

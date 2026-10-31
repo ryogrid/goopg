@@ -342,6 +342,103 @@ func DropRemoteSlot(ctx context.Context, cfg LogicalReceiverConfig) error {
 	return runRemoteReplicationCommand(ctx, cfg, fmt.Sprintf(`DROP_REPLICATION_SLOT %s WAIT`, quoteSlotIdent(cfg.SlotName)))
 }
 
+// CheckRemotePublications dials the publisher and runs check_publications'
+// query (subscriptioncmds.c:447-460) —
+//
+//	SELECT t.pubname FROM pg_catalog.pg_publication t WHERE t.pubname IN ('a', 'b')
+//
+// (names through quote_literal_cstr) — and returns the requested names the
+// publisher does NOT report, in request order. A nil/empty pubs list is
+// connect-only: AlterSubscription_refresh always dials (fetch_table_list
+// follows it), so ALTER ... DROP PUBLICATION WITH (refresh = true) must
+// reach a live publisher before its list change lands, and PG validates no
+// names for DROP (validate_publications is NULL there).
+//
+// Error shapes for the caller's mapping: an unreachable publisher returns an
+// ErrPublisherConnect-wrapped error; the publisher's own ErrorResponse
+// returns a *RemoteCommandError (PG turns that into "could not receive list
+// of publications from the publisher: %s").
+func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pubs []string) ([]string, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	if len(pubs) == 0 {
+		return nil, nil // connect-only dial succeeded
+	}
+	var cmd strings.Builder
+	cmd.WriteString("SELECT t.pubname FROM\n pg_catalog.pg_publication t WHERE\n t.pubname IN (")
+	for i, p := range pubs {
+		if i > 0 {
+			cmd.WriteString(", ")
+		}
+		cmd.WriteString(quotePublicationLiteral(p))
+	}
+	cmd.WriteString(")")
+	if err := r.w.WriteQuery(cmd.String()); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	present := map[string]bool{}
+	var cmdErr *RemoteCommandError
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+		}
+		switch f.Type {
+		case libpq.MsgDataRow:
+			row, derr := decodeDataRow(f.Payload)
+			if derr != nil {
+				return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, derr)
+			}
+			if len(row) > 0 && row[0] != nil {
+				present[string(row[0])] = true
+			}
+		case libpq.MsgErrorResponse:
+			cmdErr = &RemoteCommandError{}
+			for p := f.Payload; len(p) > 1; {
+				code := p[0]
+				end := bytes.IndexByte(p[1:], 0)
+				if end < 0 {
+					break
+				}
+				val := string(p[1 : 1+end])
+				switch code {
+				case 'C':
+					cmdErr.SQLState = val
+				case 'M':
+					cmdErr.Message = val
+				}
+				p = p[2+end:]
+			}
+		case libpq.MsgReadyForQuery:
+			if cmdErr != nil {
+				return nil, cmdErr
+			}
+			var missing []string
+			for _, p := range pubs {
+				if !present[p] {
+					missing = append(missing, p)
+				}
+			}
+			return missing, nil
+		}
+	}
+}
+
+// quotePublicationLiteral mirrors quote_literal_cstr: single-quoted,
+// embedded single quotes doubled.
+func quotePublicationLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 // quoteSlotIdent double-quotes a slot name (quote_identifier; slot names
 // are restricted to [a-z0-9_], so no escaping is needed).
 func quoteSlotIdent(name string) string { return `"` + name + `"` }

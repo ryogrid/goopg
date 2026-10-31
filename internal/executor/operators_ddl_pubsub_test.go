@@ -831,6 +831,76 @@ func TestAlterSubscriptionPublications(t *testing.T) {
 	}
 	wantPubs("s", "solo")
 
+	// The publisher-connection half (AlterSubscription_refresh →
+	// check_publications, subscriptioncmds.c:443): inject the server hook.
+	// A missing publication is a WARNING and the statement lands; a hook
+	// error (08006 connect / XX000 query) aborts before the list write.
+	var hookName, hookConn string
+	var hookPubs []string
+	hookCalls := 0
+	var hookMissing []string
+	var hookErr error
+	ctx.CheckPublicationsOnPublisher = func(subName, conninfo string, pubs []string) ([]string, error) {
+		hookCalls++
+		hookName, hookConn, hookPubs = subName, conninfo, pubs
+		return hookMissing, hookErr
+	}
+	// SET validates the statement list.
+	create("ALTER SUBSCRIPTION s SET PUBLICATION p1")
+	if hookCalls != 1 || hookName != "s" || !strings.Contains(hookConn, "host=remote") {
+		t.Fatalf("hook call = %d %q %q, want 1 \"s\" host=remote", hookCalls, hookName, hookConn)
+	}
+	if len(hookPubs) != 1 || hookPubs[0] != "p1" {
+		t.Fatalf("SET validate list = %v, want [p1]", hookPubs)
+	}
+	wantPubs("s", "p1")
+	if n := ctx.TakeNotices(); len(n) != 0 {
+		t.Fatalf("clean publisher check left notices %v", n)
+	}
+	// ADD validates the statement list; DROP passes nil (PG's
+	// validate_publications = NULL arm).
+	create("ALTER SUBSCRIPTION s ADD PUBLICATION q1, q2")
+	if len(hookPubs) != 2 || hookPubs[0] != "q1" || hookPubs[1] != "q2" {
+		t.Fatalf("ADD validate list = %v, want [q1 q2]", hookPubs)
+	}
+	wantPubs("s", "p1", "q1", "q2")
+	create("ALTER SUBSCRIPTION s DROP PUBLICATION q2")
+	if hookPubs != nil {
+		t.Fatalf("DROP validate list = %v, want nil", hookPubs)
+	}
+	wantPubs("s", "p1", "q1")
+	// Missing publications: singular and plural WARNING shapes
+	// (errmsg_plural, :493-501), statement lands.
+	hookMissing = []string{"p9"}
+	create("ALTER SUBSCRIPTION s ADD PUBLICATION p9")
+	notices := ctx.TakeNotices()
+	if len(notices) != 1 || notices[0] != `publication "p9" does not exist on the publisher` {
+		t.Fatalf("singular missing notices = %v", notices)
+	}
+	wantPubs("s", "p1", "q1", "p9")
+	hookMissing = []string{"p9", "p10"}
+	create("ALTER SUBSCRIPTION s SET PUBLICATION p9, p10")
+	notices = ctx.TakeNotices()
+	if len(notices) != 1 || notices[0] != `publications "p9", "p10" do not exist on the publisher` {
+		t.Fatalf("plural missing notices = %v", notices)
+	}
+	wantPubs("s", "p9", "p10")
+	// A hook error maps to PG's message+SQLSTATE and aborts before the
+	// list write (PG updates the tuple only after the refresh succeeds).
+	hookMissing = nil
+	hookErr = &ExecError{Code: "08006", Message: `subscription "s" could not connect to the publisher: dial tcp: lookup remote: no such host`}
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION solo"),
+		"08006", "could not connect to the publisher")
+	wantPubs("s", "p9", "p10")
+	// refresh = false never dials (PG's gate skips the whole refresh).
+	before := hookCalls
+	create("ALTER SUBSCRIPTION s SET PUBLICATION p1 WITH (refresh = false)")
+	if hookCalls != before {
+		t.Fatalf("refresh=false dialed the publisher (%d calls)", hookCalls-before)
+	}
+	wantPubs("s", "p1")
+	hookErr = nil
+
 	// Unknown subscription name is 42704 on all three arms.
 	for _, sql := range []string{
 		"ALTER SUBSCRIPTION nosuch SET PUBLICATION p",

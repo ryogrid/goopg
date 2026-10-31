@@ -396,3 +396,56 @@ round-trip), AlterSubscription\_refresh's pg\_subscription\_rel 'i' rows + per-t
 machine (the `internal/replication` tablesync library is unwired in production), the eager apply-worker
 restart on a list change (PG's 25001 gate exists precisely because it restarts the worker inside the
 command), and copy\_data's modelled effect.
+
+## Update 2026-10-31 — ALTER SUBSCRIPTION publication-list refresh half: publisher dial + check\_publications (M0122-0014)
+
+- **What the statement-side slice left open, item (1).** The 2026-10-31 slice above ledgered
+  AlterSubscription\_refresh's publisher half. This slice lands its **first two steps** for all three
+  publication-list arms when refresh = true: PG's `walrcv_connect(sub->conninfo)` (:838-850) and
+  `check_publications` (:443-501). The rest — `fetch_table_list`, the pg\_subscription\_rel 'i' rows, the
+  per-table COPY through the tablesync machine, the eager worker restart — stays ledgered (the library is
+  still unwired); `REFRESH PUBLICATION` itself stays a compat no-op.
+- **Client.** `replication.CheckRemotePublications(ctx, cfg, pubs)` (logicalreceiver.go) is the
+  walrcv\_exec twin of `runRemoteReplicationCommand`: dial (replication=database, the same
+  LogicalReceiver.connect handshake the slot path uses), write PG's exact
+  `SELECT t.pubname FROM pg_catalog.pg_publication t WHERE t.pubname IN ('a', 'b')` (names through a
+  `quote_literal_cstr` twin), collect DataRows via the existing `decodeDataRow`, return the requested
+  names the publisher lacks, in request order. An empty pubs list is **connect-only**: ALTER … DROP
+  PUBLICATION passes validate\_publications = NULL (:1431), yet AlterSubscription\_refresh dials anyway
+  (fetch\_table\_list follows), so a DROP's refresh requires a reachable publisher. Unreachable publisher →
+  ErrPublisherConnect-wrapped; publisher's ErrorResponse → *RemoteCommandError.
+- **Server hook.** `subscriptionSlotHooks` gains its third arm (subscription\_slot.go):
+  `ectx.CheckPublicationsOnPublisher` maps dial failure → **08006** "subscription %q could not connect to
+  the publisher: %s" (ERRCODE\_CONNECTION\_FAILURE, the same code arm the CREATE slot path measures live)
+  and query failure → **XX000** "could not receive list of publications from the publisher: %s"
+  (:455-459 carries no errcode). Wired at both executor-context build sites next to the slot hooks; nil
+  (test contexts) skips the publisher side, exactly like the slot hooks.
+- **Executor arm.** In `execAlterSubscriptionPublications`, between the refresh gates and the list write:
+  SET/ADD validate the STATEMENT list (`stmt->publication`), DROP validates none. A missing publication is
+  a **WARNING, not an error** (:493-501, `ereport(WARNING)` + `errmsg_plural`) — the statement lands and
+  the name goes into subpublications; the refresh machinery would skip that publication's tables. Singular
+  `publication "x" does not exist on the publisher`; plural `publications "x", "y" do not exist on the
+  publisher` (names double-quoted, comma-separated — GetPublicationsStr quote\_literal=false,
+  pg\_subscription.c:41). A connect/query failure aborts before the registry write (PG updates the tuple
+  only after the arm's refresh returns, :1558-1573).
+- **Publisher side (no change needed).** The walsender's dispatcher falls through non-replication verbs
+  to the regular SQL handler (walsender.go header), so the plain SELECT on the replication=database
+  connection answers from the virtual pg\_publication view — measured live, first try.
+- **Pins:** `TestAlterSubscriptionPublications` grows the injected-hook arms (SET/ADD validate list,
+  DROP's nil validate list, singular + plural WARNING texts via TakeNotices, the 08006 abort with the list
+  untouched, refresh=false never dials); `TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh` pins the
+  live goopg→goopg wire: ADD of a publisher-known publication lands, ADD of a publisher-unknown
+  publication **lands** (psc.Exec fails the test on any ERROR — pinning PG's non-error shape), DROP
+  connect-only lands, SET replaces; observed through the pg\_subscription view's subpublications.
+  The dead-publisher 08006 and the query-failure XX000 arms are pinned through the injected hook (the
+  harness has one live publisher; a dead-publisher cluster is not in the harness).
+
+**Movement:** none — subscription DDL; the plan instruments are blind to it (spotcheck, arm 24 MATCH,
+fireset no fires, sf025 sweep 99/99).
+
+**Still open (ledgered):** fetch\_table\_list over the dial (the publisher's table list for the new
+publications — the same connection is already open in the hook today; the ledgered next step threads it),
+pg\_subscription\_rel 'i' rows + per-table initial COPY + i→d→s (the unwired tablesync library), the
+eager apply-worker restart on a list change, copy\_data's modelled effect, the
+two\_phase=enabled + copy\_data 55000 arms (goopg does not model two\_phase), and the dead-publisher 08006 /
+XX000 arms' live-cluster pin.

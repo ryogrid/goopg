@@ -709,6 +709,14 @@ type Context struct {
 	// failure. nil — tests without a server — skips the publisher side.
 	CreateSubscriptionSlot func(subName, conninfo, slotName string) error
 	DropSubscriptionSlot   func(subName, conninfo, slotName string) error
+	// CheckPublicationsOnPublisher dials subName's publisher and reports
+	// which of pubs the publisher lacks — AlterSubscription_refresh's
+	// check_publications (subscriptioncmds.c:443, its SELECT over
+	// pg_publication), with pubs empty for the connect-only dial (PG's
+	// DROP PUBLICATION refresh validates no names). It returns a ready
+	// *ExecError (PG's message and SQLSTATE) on connect/query failure. nil
+	// — tests without a server — skips the publisher side. M0122-0014.
+	CheckPublicationsOnPublisher func(subName, conninfo string, pubs []string) (missing []string, err error)
 
 	// DataDir is the cluster's data directory, used by DDL operators that
 	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,

@@ -119,6 +119,15 @@ func (l *ApplyLauncher) DropPublisherSlot(conninfo, slotName string) error {
 	return DropRemoteSlot(context.Background(), l.publisherConfig(conninfo, slotName))
 }
 
+// CheckPublications dials conninfo as a subscription connection and reports
+// which of pubs the publisher lacks (check_publications,
+// subscriptioncmds.c:443). pubs empty = connect-only dial
+// (AlterSubscription_refresh always connects; DROP PUBLICATION validates no
+// names).
+func (l *ApplyLauncher) CheckPublications(conninfo string, pubs []string) ([]string, error) {
+	return CheckRemotePublications(context.Background(), l.publisherConfig(conninfo, ""), pubs)
+}
+
 // StopWorker stops the apply worker of subscription name, if one runs, and
 // waits for it to exit (logicalrep_worker_stop). DROP SUBSCRIPTION calls it
 // after removing the subscription, so the next reconcile does not restart
