@@ -751,6 +751,10 @@ func (c *CopyFromExecutor) storeCopyRow(row Row) error {
 	// indexes must be updated separately, otherwise index scans
 	// return zero rows for COPY-loaded data.
 	maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptr)
+	// CIM_SINGLE twin of the flushBatch emit: heap_insert ends with
+	// pgstat_count_heap_insert(relation, 1) (heapam.c:2251), so each single-row
+	// COPY insert counts one tuple (M-NIGHTLY, 2026-10-31).
+	recordRelInsert(c.ctx, tableOIDFromCatalog(c.plan.Table), 1)
 	c.rowsIn++
 	return nil
 }
@@ -803,6 +807,16 @@ func (c *CopyFromExecutor) flushBatch() error {
 	if err != nil {
 		return err
 	}
+	// pgstat row counters: heap_multi_insert ends with
+	// pgstat_count_heap_insert(rel, ntuples) (heapam.c:2702), so a COPY FROM
+	// batch counts as one multi-insert of len(batch) rows. goopg's COPY never
+	// called recordRelInsert, so COPY-loaded tables carried ins=0/mod=0 and
+	// the autovacuum insert-growth triggers (needsVacuum ins arm,
+	// needsAnalyze mod arm) never fired for pgbench -i style loads
+	// (M-NIGHTLY, 2026-10-31). recordRelInsert keeps INSERT's staged
+	// semantics: folded into pending immediately in autocommit, staged until
+	// COMMIT in an explicit block.
+	recordRelInsert(c.ctx, tableOIDFromCatalog(c.plan.Table), int64(len(batch)))
 	for i, row := range batch {
 		maintainUniqueIndexesForInsert(c.ctx, c.plan.Table, c.cols, row, ptrs[i])
 	}

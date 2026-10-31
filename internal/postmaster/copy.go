@@ -205,6 +205,17 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 	ectx.VM = s.cfg.VM
 	ectx.Tx = tx
 	ectx.Snap = snap
+	// Session identity, exactly as dispatch wires every other statement: the
+	// pgstat relation counters (COPY's recordRelInsert staging/pending tiers)
+	// are keyed by sessionStatsID(ectx), and pg_stat_force_next_flush() from
+	// this connection flushes the SAME id only if the hand-built COPY context
+	// carries it. Without this, COPY-loaded counters sat in the id-0 bucket,
+	// unreachable by the session's flush and the pg_stat_get_* getters
+	// (M-NIGHTLY COPY pgstat loop, same class as the M0119-0006 GetSetting
+	// wiring below).
+	if sess != nil {
+		ectx.AdvisorySessionIdentity = sess
+	}
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
 	// Thread session identity (M0134-0009 round 2, R5 — the named SELECT/COPY
