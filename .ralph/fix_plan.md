@@ -1234,7 +1234,7 @@ heuristic stays live.)
     - Files the findings below stay in fix\_plan; repro rigs: `tmp/mnightly\-\{relpages,trio,trunc,copy\}\-rig\.sh`
       \(tmp, uncommitted\)\.
   - Movement: none — plan instruments blind \(recon closed as not\-a\-defect; no code staged\)\.
-- [ ] **COPY skips the pgstat row counters — n\_tup\_ins / n\_live\_tup undercount COPY loads, and autovacuum triggers miss COPY\-loaded data** \(filed 2026\-10\-31 by the relpages recon loop\)
+- [x] **COPY skips the pgstat row counters — n\_tup\_ins / n\_live\_tup undercount COPY loads, and autovacuum triggers miss COPY\-loaded data** \(filed 2026\-10\-31 by the relpages recon loop\)
   Kind: impl
   Parent: none
   - Probe \(goopg vs PG 18\.3 temp cluster, 5000\-row `\copy` into an empty table\): goopg `n\_tup\_ins=0 n\_live\_tup=0`;
@@ -1245,6 +1245,32 @@ heuristic stays live.)
   - Resume: the COPY executor emit site \(internal/executor COPY path\) must call recordRelInsert\(ctx, oid, n\)
     with the loaded row count per PG's copy\.c pgstat\_report\_copy \(pgstat count per batch\); keep the
     abort\-staged semantics of recordRelInsert\.
+  - CLOSED 2026\-10\-31 loop \#4: COPY FROM now feeds the counters at the two heap\-write arms of
+    `storeCopyRow`, mirroring PG's counting inside the heap routines \(not copy\.c itself — PG 18 counts in
+    `heap_insert`/`heap\_multi\_insert`, heapam\.c:2251/2702\):
+    - `flushBatch` \(CIM\_MULTI, CopyMultiInsertBufferFlush twin\) emits `recordRelInsert\(ctx, tableOIDFromCatalog\(plan.Table\), len\(batch\)\)`
+      once per batch after placement — per\-tuple buffered rows land the batch count at flush, exactly as PG's
+      buffered tuples count at buffer flush; mid\-stream error leaves the unflushed tail uncounted \(PG parity\)\.
+    - the CIM\_SINGLE arm \(forced by BEFORE ROW triggers\) emits one tuple per stored row\.
+    - trigger\-suppressed rows \(BEFORE trigger RETURN NULL\) are not stored, not counted — asserted in the unit test\.
+    - second gap found on the way \(hard\-won rule 2, sibling wiring\): the hand\-built COPY `ectx` in
+      `postmaster/copy\.go` never set `AdvisorySessionIdentity`, so COPY counters folded into the id\-0 bucket
+      and the session's own `pg\_stat\_force\_next\_flush\(\)`/`pg\_stat\_get\_\*` getters could not reach them on a
+      live server\. Wired to `sess` \(same \*misc\.SessionRegistry dispatch wires every other statement;
+      same class as the M0119\-0006 GetSetting wiring\)\.
+  - Tests: `internal/executor/copy\_pgstat\_test\.go` \(multi/single/suppressed arms: TriggerSnapshot ins+mod
+    deltas, shared\-tier tuplesInserted/deltaLive/changedTuples/insSinceVacuum deltas, commit/abort tier math
+    twin\)\; `internal/testport/copy\_pgstat\_server\_test\.go` \(wire\-protocol CopyIn via lib/pq driver\.Stmt
+    path, one session: `pg\_stat\_get\_tuples\_inserted`/`live\_tuples`/`ins\_since\_vacuum`/`mod\_since\_analyze`
+    all read 5000 after `pg\_stat\_force\_next\_flush\(\)` — the filed probe's pair at the getter layer PG's view
+    itself is built on \(system\_views\.sql\)\)\. `testutil/cluster`: `DSN\(\)` accessor added for
+    single\-session tests\.
+  - Residuals to ledger \(2026\-10\-31\): the `pg\_stat\_\*\_tables` VIEW cells `n\_tup\_ins`/`n\_live\_tup` stay
+    honest\-0/reltuples renderers for every DML class \(M0122\-0003 design\)\; no statement\-end stats flush
+    \(pending reaches shared only via explicit `pg\_stat\_force\_next\_flush\(\)`\)\; COPY into a partitioned parent
+    counts the parent OID \(goopg writes parent storage; PG counts per partition\)\.
+  - Movement: none — plan instruments blind \(pgstat accounting; spotcheck Q12/Q13 canonical, acceptance arm
+    MATCH set, sf025 sweep same — see Gates\)\.
 - [ ] **pgbench\_branches reltuples renders 1 \(10\-row table\) — analyzer and vacuum see 1 visible of 10 live rows on an idle pgbench table** \(filed 2026\-10\-31 by the relpages recon loop\)
   Kind: recon
   Parent: none

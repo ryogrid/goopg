@@ -178,3 +178,74 @@ family); post-TRUNCATE empty-relation cost (goopg 22.70/1270 vs PG
 Repro rigs only (no code staged; instrumentation reverted before commit):
 mini trio s=1 60s×3, trio s=50 120s×3, TRUNCATE cost probe vs PG temp
 cluster, COPY probe vs PG temp cluster; census unchanged (REUSE).
+
+## Follow-up 3: COPY feeds the pgstat row counters (filed 2026-10-31, loop #4)
+
+The relpages triage above filed three divergences; the first worked was
+"COPY skips the pgstat row counters": a 5000-row `\copy` left
+`pg_stat_get_tuples_inserted`/`pg_stat_get_live_tuples` at 0 (PG: 5000), and
+the COPY-loaded tables' autovacuum insert-growth triggers
+(`needsVacuum` ins arm, `needsAnalyze` mod arm) never fired — pgbench `-i`
+tables sat un-analyzed until update traffic fed the mod counter.
+
+PG counts inserts inside the heap routines, not in copy.c:
+`heap_insert` ends with `pgstat_count_heap_insert(relation, 1)`
+(heapam.c:2251) and `heap_multi_insert` with
+`pgstat_count_heap_insert(rel, ntuples)` (heapam.c:2702). goopg's COPY
+executor writes through the same arms (`storeCopyRow` CIM_SINGLE,
+`flushBatch` CIM_MULTI = the CopyMultiInsertBufferFlush twin) but never
+called `recordRelInsert`, so the counters (staging/pending/shared tiers and
+the direct-write autovacuum-trigger store) saw nothing.
+
+The fix emits at exactly those two sites:
+
+- `flushBatch`: one `recordRelInsert(ctx, tableOIDFromCatalog(plan.Table),
+  len(batch))` per batch, after tuple placement succeeds — buffered rows
+  count at flush like PG's CopyMultiInsertInfo buffers; a stream that dies
+  mid-batch leaves the unflushed tail uncounted, as PG does;
+- the CIM_SINGLE arm: one tuple per stored row.
+
+Trigger-suppressed rows (BEFORE trigger `RETURN NULL`) never reach the
+heap-write arm and are not counted (the M0146-0055 suppression rule; PG's
+tuple never reaches `heap_insert`, so no count).
+
+A second gap sat behind the emit (hard-won rule 2): the COPY wire handler
+builds its `ectx` by hand and had never set `AdvisorySessionIdentity`, so
+`sessionStatsID(ectx)` was 0 and COPY's folded counters sat in a bucket the
+connection's own `pg_stat_force_next_flush()` (which flushes
+`sessionStatsID(ctx)` of the observing statement) could not drain. Setting
+`ectx.AdvisorySessionIdentity = sess` — the same `*misc.SessionRegistry`
+dispatch wires for every other statement — lands COPY's counters where the
+session's flush and the `pg_stat_get_*` getters read them (same class as
+the M0119-0006 `GetSetting` wiring for the same hand-built context).
+
+Semantics kept from the INSERT path (`recordRelInsert`): autocommit folds
+staging into pending at record time; an explicit block stages until
+COMMIT/ROLLBACK; the abort math counts attempted tuples, moves them to the
+dead side, and emits no change events (`applyXactToPending` = PG's
+AtEOXact_PgStat_Relations). COPY runs its own auto-commit transaction even
+inside an open block (pre-existing, ledger'd), which matches PG reporting
+COPY's counts at statement end.
+
+Residuals (ledger 2026-10-31): the `pg_stat_*_tables` VIEW's
+`n_tup_ins`/`n_live_tup` cells remain honest-0/reltuples renderers for
+every DML class (M0122-0003 design; the getter layer the view is built on
+is now exact for COPY); pending counters reach shared only via explicit
+`pg_stat_force_next_flush()` (PG flushes at statement end); COPY into a
+partitioned parent counts the parent, PG counts partitions.
+
+Tests: `internal/executor/copy_pgstat_test.go` (multi/single/suppressed
+arms; trigger + shared-tier deltas; commit/abort math twin) and
+`internal/testport/copy_pgstat_server_test.go` (wire CopyIn over one
+session; all four getters read 5000 after the flush). The testport pin
+needs one connection for COPY + observing statements — `cluster.DSN()` was
+added for that, and lib/pq's CopyIn lives on its driver.Stmt path
+(`tx.Prepare(pq.CopyIn(...))` + row Execs + Close).
+
+### Gates
+
+units (`ralph-precommit-test.sh` units scope), `tpch-spotcheck.sh`
+(Q12/Q13 canonical), acceptance arm vs `tmp/arm-off-20261030.txt`,
+`tpcds-sf025-regression.sh` sweep, commit-hook pgbench smoke; pre-existing
+postmaster package flakes (ledger 2026-10-30 M0122-0014 row) reproduced
+identically at HEAD.
