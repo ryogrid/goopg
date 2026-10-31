@@ -4818,6 +4818,30 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **ALTER SUBSCRIPTION escape hatch LANDED 2026-10-31 \(`c8de1fe4c`\)**\. Movement: none — subscription DDL
+    \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH, fireset no fires, SF0\.25 99/99 \+ SF1 99/99 both arms\)\.
+    - AlterSubscription's ENABLE / DISABLE and SET \(options\) arms \(ALTER\_SUBSCRIPTION\_ENABLED /
+      ALTER\_SUBSCRIPTION\_OPTIONS, subscriptioncmds\.c:1339\-1357 and 1159\-1341\) — the escape hatch DROP's 08006
+      hint names: DISABLE \(launcher reconcile stops the worker, releasing the publisher slot\) → SET \(slot\_name =
+      NONE\) \(disassociated, "" = NULL subslotname\) → DROP SUBSCRIPTION completes against a publisher that never
+      answers\. Closes the 2026\-10\-30 residual "the PG escape hatch for an unreachable publisher is unavailable"\.
+    - Parser `AlterSubscriptionEnableStmt` / `AlterSubscriptionSetStmt` \(SET requires a following `\(`, so SET
+      PUBLICATION / REFRESH / SKIP / RENAME keep the compat no\-op; `SET \(\)` is the upstream no\-op, CREATE's
+      `WITH \(\)` stays an error\); catalog `SetSubscriptionEnabled` / `SetSubscriptionSlotName`; executor arms with
+      PG's 42704 / 55000 "cannot enable subscription that does not have a slot name" / 55000 "cannot set slot\_name =
+      NONE for enabled subscription" / 42601 per\-call supported\_opts / 22023 origin, values through CREATE's
+      defGet\* twins; subenabled / subslotname re\-synced to the pg\_subscription heap, round\-tripped by
+      `reloadSubscriptionsFromHeap`\. goopg wakes the launcher on DISABLE as well \(PG wakes only on ENABLE,
+      1355 — documented deviation: the sequence needs the worker and its slot lease released before the SET\)\.
+    - Pins: `TestAlterSubscriptionEscapeHatch` \(the DISABLE→NONE sequence + every error arm\),
+      `TestParseAlterSubscriptionEscapeHatch`, `TestPubSubSetSubscriptionEnabledAndSlot`, two ALTER SUBSCRIPTION
+      rows in `TestDDLCommandTagMatchesPostgres`\. Gates: units, tpch\-spotcheck Q12=2/Q13=35, tpch\-acceptance\-arm
+      24 MATCH, sf025 sweep PASS, fireset PASS \(no fires\), commit\-hook pgbench smoke PASS\.
+    - Residuals ledgered: REFRESH PUBLICATION / SET PUBLICATION / ADD / DROP PUBLICATION / RENAME / CONNECTION /
+      SKIP \(lsn\) stay compat no\-ops; the supported\-but\-unmodelled SET options validate then drop \(pg\_subscription
+      renders defaults\); synchronous\_commit is not validated through set\_config\_option; the namein 63\-byte
+      truncation and the "failover requires binary = true" check are not reproduced; the apply worker still sends no
+      status updates, so a live slot's confirmed\_flush never advances \(2026\-10\-30 item \(b\)\)\.
   - **Publisher-side slot lifecycle LANDED 2026-10-30 \(`5657546d8`\)**\. Movement: none — subscription DDL /
     replication \(sf025 PLAN\-SHAPE same=99, arm 24 MATCH\)\.
     - CREATE SUBSCRIPTION creates the slot on the publisher \(walrcv\_create\_slot: CREATE\_REPLICATION\_SLOT
