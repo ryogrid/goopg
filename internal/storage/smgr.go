@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -651,9 +652,17 @@ func (m *Manager) CloseRelation(rel RelFileNode) {
 // TruncateRelation truncates rel's backing file to zero blocks. The
 // caller is responsible for invalidating buffer-pool slots that hold
 // pages of rel before calling this.
+//
+// Truncate NEVER creates the file: PG's mdtruncate
+// (src/backend/storage/smgr/md.c:1291) walks the relation's already-open
+// segment descriptors and does nothing when the relation has none, so a
+// relation with no storage (PG's partitioned parents, relfilenode 0, carry
+// no file at all) is a no-op here — not a 0-byte file on disk (the
+// M-NIGHTLY "0-byte relfilenode file" class). The file-open policy is
+// relFileForTruncate.
 func (m *Manager) TruncateRelation(rel RelFileNode) error {
-	f, err := m.relFile(rel)
-	if err != nil {
+	f, opened, err := m.relFileForTruncate(rel)
+	if err != nil || !opened {
 		return err
 	}
 	return f.truncateToZero()
@@ -663,17 +672,63 @@ func (m *Manager) TruncateRelation(rel RelFileNode) error {
 // Idempotent: a no-op if the file already has n or fewer blocks (mirrors
 // TruncateRelation's zero-block idempotency and upstream's
 // XLOG_SMGR_TRUNCATE redo, which can be replayed twice on a crash-restart
-// loop). The caller is responsible for invalidating buffer-pool slots that
-// hold pages of rel at or past n before calling this. M0131-S21a-2 part 6.
+// loop) and a no-op when the file does not exist, per TruncateRelation's
+// mdtruncate parity. The caller is responsible for invalidating
+// buffer-pool slots that hold pages of rel at or past n before calling
+// this. M0131-S21a-2 part 6.
 func (m *Manager) TruncateRelationTo(rel RelFileNode, n BlockNumber) error {
-	f, err := m.relFile(rel)
-	if err != nil {
+	f, opened, err := m.relFileForTruncate(rel)
+	if err != nil || !opened {
 		return err
 	}
 	if f.nBlocks() <= n {
 		return nil
 	}
 	return f.truncateTo(n)
+}
+
+// relFileForTruncate resolves rel for the truncate paths. A handle already
+// open through the read/write paths is returned as-is. A not-yet-open
+// relation is opened WITHOUT os.O_CREATE (PG's mdopen/PathNameOpenFile
+// carries no O_CREAT; md.c's truncate acts on already-open segments), so a
+// missing file returns opened=false rather than materialising an empty
+// file. os.MkdirAll is deliberately not called on this path: a missing
+// relation directory means the relation has no storage, which is a no-op
+// for truncate.
+func (m *Manager) relFileForTruncate(rel RelFileNode) (*relFile, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.files[rel]; ok {
+		return f, true, nil
+	}
+	path := m.relPath(rel)
+	osFile, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("open %s: %w", path, err)
+	}
+	st, err := osFile.Stat()
+	if err != nil {
+		_ = osFile.Close()
+		return nil, false, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if st.Size()%BlockSize != 0 {
+		_ = osFile.Close()
+		return nil, false, fmt.Errorf("file %s size %d not multiple of %d", path, st.Size(), BlockSize)
+	}
+	f := &relFile{
+		f:              osFile,
+		path:           path,
+		nblocks:        BlockNumber(st.Size() / BlockSize),
+		rel:            rel,
+		checksums:      m.cfg.ChecksumsEnabled,
+		ignoreChecksum: m.cfg.IgnoreChecksumFailure,
+		onChecksumFail: m.cfg.OnChecksumFailure,
+	}
+	m.files[rel] = f
+	return f, true, nil
 }
 
 func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {

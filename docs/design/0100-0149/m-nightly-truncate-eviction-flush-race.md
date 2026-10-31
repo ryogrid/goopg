@@ -60,3 +60,78 @@ The bgwriter path already re-checks `valid+dirty+tag` under `contentMu.RLock` be
 ## Gates
 
 `go test ./internal/storage/ ./internal/commands/vacuum/`; `go test -race ./internal/storage/`; units (precommit scope=units); TPC-H spot-check Q12=2 Q13=35; full `stage-pgbench.sh` repro; commit-hook pgbench smoke.
+
+## Follow-up: 0-byte relfilenode files (filed 2026-10-31, same diagnosis run)
+
+The same AI-20261031-002109-005 stack-instrumented pgbench diagnosis recorded
+a second item: pgbench -i's opening
+`drop table if exists pgbench_accounts, … cascade` executing via
+`ddlOp.Next → execTruncate → truncateTableAndPartitions → Manager.TruncateRelation`
+four times, synthesising relfilenodes 16406/16407/16409/16411, leaving four
+0-byte files that the later CREATEs then reused.
+
+### Verification (2026-10-31 loop)
+
+The routing claim **does not reproduce at HEAD** (`6c62c820c`):
+`execDropTable` never reaches the truncate executor — the missing-name arm
+short-circuits with the PG-parity NOTICE (`table "m1" does not exist,
+skipping`), consumes no OID (nextOID unchanged), and creates no file;
+without IF EXISTS it raises 42P01. Verified at executor level (fixture)
+and server level (fresh cluster, pgbench-style drop as the first user
+statement: file inventory unchanged, first CREATE gets relfilenode
+max+1 = 16406). The 0-byte files in the nightly data dir therefore come
+from the two mechanisms the diagnosis *also* observed, which do reproduce:
+
+### Landed fixes
+
+- **smgr truncate never creates the file.** `Manager.relFile` opens with
+  `O_RDWR|O_CREATE` + `MkdirAll` — correct for read/write paths, wrong for
+  truncate: any truncate of a storage-less relation materialised a 0-byte
+  file (and a database directory). PG's `mdtruncate`
+  (`src/backend/storage/smgr/md.c:1291`) walks the relation's *already-open*
+  segment descriptors: a relation with no open segments is a no-op.
+  `TruncateRelation`/`TruncateRelationTo` now route through
+  `relFileForTruncate`, which opens `O_RDWR` **without** `O_CREATE`, skips
+  `MkdirAll`, and returns `opened=false` on `fs.ErrNotExist` → no-op.
+- **TRUNCATE skips partitioned parents.** `truncateTableAndPartitions`
+  now returns after the child recursion when `len(tbl.PartitionKey) > 0`,
+  mirroring PG's ExecuteTruncateGuts "Skip partitioned tables as there is
+  nothing to do" (`src/backend/commands/tablecmds.c:2148-2150`). goopg
+  parents carry a synthesized relfilenode (PG: relfilenode 0, no file), so
+  without the skip the parent-level undo snapshot, `InvalidateRel`,
+  `TruncateRelation`, FSM/VM drop and index re-create all ran against the
+  parent — creating/truncating a file PG never touches. `TRUNCATE ONLY p`
+  on a partitioned parent already errors (operators_ddl.go, PG
+  "cannot truncate only a partitioned table").
+
+### Deviations (recorded)
+
+- goopg partitioned parents keep a synthesized relfilenode and the
+  0-byte file the CREATE path makes; PG has relfilenode 0 and no file at
+  all. Full CREATE-time parity is ledger-deferred (see
+  `.ralph/deferral_ledger.md`, 2026-10-31 rows), as are the
+  VACUUM FULL/CLUSTER sibling truncate sites (operators_ddl.go ~21373,
+  ~27745-27763, ~28067) and the read-path `relFile` O_CREATE policy.
+
+### Tests
+
+- `internal/storage/smgr_truncate_nocreate_test.go` — truncate of a
+  missing file/missing db dir is a no-op (no file, no directory),
+  truncate of an existing file still truncates (zero and N-block forms).
+- `internal/executor/drop_truncate_nostorage_test.go` — DROP IF EXISTS
+  arm: 4 notices, NextOID unmoved, file inventory unchanged, next CREATE
+  next-in-sequence; 42P01 without IF EXISTS; DROP removes catalog row +
+  file; TRUNCATE of a storage-less relation no-ops without creating the
+  file; TRUNCATE on a partitioned parent leaves a materialised parent
+  file untouched (1 block), truncates leaves to 0, parent file is not
+  resurrected after removal.
+- `internal/testport/drop_if_exists_no_storage_test.go` — server pin on
+  a fresh cluster: pgbench-style DROP IF EXISTS changes no file
+  (no user-range stubs), consumes no OIDs (next CREATE relfilenode =
+  ref_before + 1).
+
+### Gates
+
+`go test ./internal/storage/ ./internal/executor/`; testport
+`TestDropTableIfExistsMissingNoStorage`; units (precommit scope=units);
+TPC-H spot-check; acceptance-arm; TPC-DS SF0.25 sweep; hook pgbench smoke.

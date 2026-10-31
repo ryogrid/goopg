@@ -17459,6 +17459,17 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 			}
 		}
 	}
+	// PG's ExecuteTruncateGuts skips partitioned parents: "Skip partitioned
+	// tables as there is nothing to do" (tablecmds.c:2148-2150). A partitioned
+	// parent (relkind='p') carries no storage of its own in PG (relfilenode
+	// 0, no file), so all leaf truncation happens in the recursion above and
+	// the parent-level heap/FSM/VM/index work below must not run. goopg
+	// parents carry a synthesized relfilenode, so this guard is what keeps
+	// TRUNCATE from materialising a 0-byte file through the smgr
+	// (M-NIGHTLY 0-byte relfilenode-file class).
+	if len(tbl.PartitionKey) > 0 {
+		return nil
+	}
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
