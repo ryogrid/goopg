@@ -40,9 +40,9 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral port. Race-safe enough
@@ -2092,8 +2092,8 @@ func TestPort_PgoutputInteropPGToGoopgKillAndReconnect(t *testing.T) {
 // This is the first rung that exercises the M0103-0007 Scenario A
 // async DoD invariant from `docs/design/0103-0005-...`:
 //
-//   subscriber count(*) ∈ [killCommitted - asyncLossBound + 1,
-//                          killCommitted + 1]
+//	subscriber count(*) ∈ [killCommitted - asyncLossBound + 1,
+//	                       killCommitted + 1]
 //
 // with asyncLossBound = 50 rows. Rungs 1–21 verified apply-worker
 // correctness under sustained load; rung 22 closed the SIGKILL +
@@ -3359,4 +3359,171 @@ func TestPort_PgoutputInteropPGToGoopgSlotLifecycle(t *testing.T) {
 	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg2g_slot_sub'"); got != "0" {
 		t.Errorf("PG publisher slots after DROP SUBSCRIPTION = %s, want 0", got)
 	}
+}
+
+// TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush measures the
+// 2026-10-30 M0122-0014 ledger item (b): "the apply worker never sends
+// standby status updates, so a published slot's confirmed_flush stays at
+// its initial value on the publisher and WAL retention grows while a
+// subscription runs". The receiver loop has since shipped the
+// XLogWalRcvSendReply arms (10 s ticker, keepalive reply-request, eager
+// push after each applied commit), and the logical walsender parses
+// 'r' frames into Slots.AdvanceConfirmedFlushLSN. This test measures the
+// claim on the live wire: after one applied INSERT, the publisher slot's
+// confirmed_flush_lsn must have moved forward from its post-creation
+// value, monotonically, within the status cadence.
+func TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_flush", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_flush_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_flush_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	slotLSN := func() uint64 {
+		v := psc.Publisher.QueryScalar(t,
+			"SELECT coalesce(confirmed_flush_lsn::text, '0/0') FROM pg_replication_slots WHERE slot_name = 'g2g_flush_sub'")
+		return parseLSN(t, v)
+	}
+	initial := slotLSN()
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'flush-me')")
+	psc.WaitForRow(t, "t", "id = 1 AND v = 'flush-me'", 1, 60*time.Second)
+
+	// The applied commit's LSN reaches the publisher on the eager
+	// push (one RTT) or the next StatusInterval tick (<= 10 s).
+	deadline := time.Now().Add(30 * time.Second)
+	var got uint64
+	for {
+		got = slotLSN()
+		if got > initial {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher slot confirmed_flush_lsn did not advance past its post-creation value "+
+				"(initial=%s, now=%s) within 30 s of an applied commit — ledger item (b) reproduces",
+				lsnText(initial), lsnText(got))
+		}
+		time.Sleep(time.Second)
+	}
+	// A second commit must move it forward again (monotonic, not a
+	// one-shot jump): retention tracks apply, PG XLogWalRcvSendReply →
+	// LogicalConfirmReceivedLocation.
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (2, 'again')")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'again'", 1, 60*time.Second)
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		if second := slotLSN(); second > got {
+			got = second
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher slot confirmed_flush_lsn did not advance a second time (prev=%s)",
+				lsnText(got))
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush is the parity
+// oracle for the same invariant: a REAL PG 18.3 publisher advances the
+// slot's confirmed_flush_lsn only from the client's standby status
+// updates (LogicalConfirmReceivedLocation), so this passing with a
+// stock PG publisher pins that goopg's subscriber 'r' frames carry
+// usable LSNs and keep WAL retention bounded against a PostgreSQL
+// publisher too.
+func TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_flush", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "pg2g_flush_sub",
+		PublicationName:  "p",
+		SubscriptionName: "pg2g_flush_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	slotLSN := func() uint64 {
+		v := psc.Publisher.QueryScalar(t,
+			"SELECT coalesce(confirmed_flush_lsn::text, '0/0') FROM pg_replication_slots WHERE slot_name = 'pg2g_flush_sub'")
+		return parseLSN(t, v)
+	}
+	initial := slotLSN()
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'flush-me')")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'flush-me'", 1, 60*time.Second)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if got := slotLSN(); got > initial {
+			return // PG advanced confirmed_flush from goopg's 'r' status update.
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PG publisher slot confirmed_flush_lsn stayed at %s for 30 s after an applied commit — "+
+				"goopg's subscriber status updates do not satisfy PG's LogicalConfirmReceivedLocation",
+				lsnText(initial))
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// parseLSN turns PostgreSQL's "X/Y" hex-pair text into a comparable
+// uint64 (the wire's 64-bit LSN). "0/0" and NULL render as 0.
+func parseLSN(t *testing.T, s string) uint64 {
+	t.Helper()
+	hi, lo, found := strings.Cut(strings.TrimSpace(s), "/")
+	if !found {
+		t.Fatalf("malformed LSN %q", s)
+	}
+	h, err := strconv.ParseUint(hi, 16, 32)
+	if err != nil {
+		t.Fatalf("malformed LSN high half %q: %v", s, err)
+	}
+	l, err := strconv.ParseUint(lo, 16, 32)
+	if err != nil {
+		t.Fatalf("malformed LSN low half %q: %v", s, err)
+	}
+	return h<<32 | l
+}
+
+func lsnText(v uint64) string {
+	return fmt.Sprintf("%X/%X", v>>32, v&0xFFFFFFFF)
 }

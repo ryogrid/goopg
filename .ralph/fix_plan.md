@@ -4994,6 +4994,18 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       renders defaults\); synchronous\_commit is not validated through set\_config\_option; the namein 63\-byte
       truncation and the "failover requires binary = true" check are not reproduced; the apply worker still sends no
       status updates, so a live slot's confirmed\_flush never advances \(2026\-10\-30 item \(b\)\)\.
+    - **Item \(b\) CLOSED measured 2026\-10\-31 \(loop \#7\)**: the claim is stale — the receiver loop's
+      XLogWalRcvSendReply arms \(10 s StatusInterval ticker, keepalive reply\-request, eager push after each
+      applied commit; logicalreceiver\.go sendStatus\) and the walsender's 'r' parse into
+      Slots\.AdvanceConfirmedFlushLSN \(walsender\.go handleStandbyCopyData\) do advance the publisher slot's
+      confirmed\_flush\_lsn on the live wire\. Movement: none — measurement closure \(pins only, no code\;
+      census routing\-20261031c covers the tree\)\. Pins: `TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush`
+      \(goopg publisher advances past its post\-creation value, monotonically over two commits, 11\.8 s\) and
+      `TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush` — the parity oracle: a stock PG 18\.3 slot
+      advances on goopg's 'r' frames, proving the echoed pgoutput EndLSNs are real WAL LSNs \(PG moves
+      confirmed\_flush only via LogicalConfirmReceivedLocation\)\. Residual ledgered 2026\-10\-31: the goopg
+      publisher's decoder commit path also advances confirmed\_flush per decoded commit — PG's retention is
+      ack\-driven only, so a goopg publisher can release WAL ahead of a lagging subscriber\.
   - **Publisher-side slot lifecycle LANDED 2026-10-30 \(`5657546d8`\)**\. Movement: none — subscription DDL /
     replication \(sf025 PLAN\-SHAPE same=99, arm 24 MATCH\)\.
     - CREATE SUBSCRIPTION creates the slot on the publisher \(walrcv\_create\_slot: CREATE\_REPLICATION\_SLOT
