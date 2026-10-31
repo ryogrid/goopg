@@ -8153,16 +8153,19 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		if hasToastRel {
 			reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 		}
-		// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
-		// then the persisted block count and live-tuple estimate. Mirrors
-		// pg_class — a freshly created, never-analyzed relation reads back as
-		// relpages=0 / reltuples=-1 in real PG, but goopg has historically
-		// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
-		// every catalog-reading test; populate the real counts once Stats lands.
-		// M0118-0008 (vacuum-no-cleanup-lock).
+		// relpages / reltuples: PG's pg_class tuple for a relation that has
+		// never been vacuumed/analyzed — and for a TRUNCATEd one, whose
+		// relfilenode the truncate replaces (RelationSetNewRelfilenode writes
+		// relpages=0, reltuples=-1, relallvisible=0) — carries reltuples=-1,
+		// the "never vacuumed or analyzed" sentinel, with relpages=0. goopg's
+		// stand-in is Stats.Analyzed; once VACUUM/ANALYZE lands, the measured
+		// counts render. M0118-0008 (vacuum-no-cleanup-lock); the -1 sentinel
+		// arm is the M-NIGHTLY post-TRUNCATE parity fix (2026-10-31): the
+		// rig-measured PG pair is (-1,0), where goopg historically surfaced
+		// (0,0).
 		relpages := "0"
-		reltuples := "0"
-		if t.Stats != nil {
+		reltuples := "-1"
+		if t.Stats != nil && t.Stats.Analyzed {
 			relpages = strconv.Itoa(t.Stats.Pages)
 			reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
 		}

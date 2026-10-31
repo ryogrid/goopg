@@ -410,14 +410,32 @@ func estimateRelSizeRows(blocks int64, width int) float64 {
 // tableDataWidth is get_rel_data_width(rel, attr_widths)
 // (postgres/src/backend/optimizer/util/plancat.c): the sum of the relation's
 // per-attribute average widths. It is a property of the RELATION, so every
-// column counts — not just the ones a particular query projects — and it needs
-// no statistics, which is what makes it usable on a cold-started server.
+// column counts — not just the ones a particular query projects.
+//
+// Per attribute the width comes from the ANALYZEd pg_statistic average width
+// when one exists — upstream's examine_attribute fills `attr_widths[i]` from
+// `att_avg_width`, the same value pg_stats.avg_width reports — and falls back
+// to get_typavgwidth (the typeWidth twin) for a column with no usable stats
+// (examine_attribute: stats missing, stadistinct-only rows, AvgWidth 0 from a
+// pre-width pg_statistic write). The analyzed arm is load-bearing for the
+// post-TRUNCATE probe: PG keeps pg_statistic rows across TRUNCATE (the
+// relation OID is unchanged), so a truncated, unanalyzed relation probes with
+// the MEASURED widths, not type defaults (measured 2026-10-31: table
+// `(id int, pad text)` of 100-char strings: PG 4+101+28=133 bytes/tuple →
+// 61 rows/page → EXPLAIN rows=610; type defaults `(4, 32)` → 64 bytes →
+// rows=1270). M0122-0003 pgbench trio family; fix_plan post-TRUNCATE cost item.
 func tableDataWidth(tbl *catalog.Table) int {
 	if tbl == nil {
 		return 1
 	}
 	w := 0
 	for i := range tbl.Columns {
+		if st := tbl.Stats; st != nil && i < len(st.Columns) {
+			if aw := int(st.Columns[i].AvgWidth); aw > 0 {
+				w += aw
+				continue
+			}
+		}
 		w += typeWidth(tbl.Columns[i].Type)
 	}
 	if w < 1 {

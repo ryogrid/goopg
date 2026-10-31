@@ -284,3 +284,54 @@ divergence), so rig SQL must use the new names.
 
 No code change; no ledger row (parity verified, nothing deferred). The
 third relpages-triage item (post-TRUNCATE cost estimate) remains open.
+
+## Follow-up 5: post-TRUNCATE cost parity — sentinel + probe widths (filed 2026-10-31, loop #6)
+
+The third relpages-triage item: on `(id int, pad text)` with 100-char pads,
+after ANALYZE + TRUNCATE, PG renders pg_class `(-1,0)` and plans
+`Seq Scan cost=0.00..16.10 rows=610`; goopg rendered `(0,0)` and planned
+`22.70/1270`.
+
+**The pages axis was never broken.** 22.70 = 10 pages + 0.01·1270 — goopg's
+probe fired the same 10-page never-analyzed floor (estimateRelSize rule 1).
+The entire gap was the ROW side, and it decomposed exactly:
+
+- rows 1270 = 10 pages × (8168 usable / (28 overhead + **36** width)) — the
+  probe width came from the declared types (int 4 + text get_typavgwidth 32)
+  because the truncate loop cleared the entire `Stats` struct, column stats
+  included.
+- PG's 610 = 10 × (8168 / (28 + **105**)) — TRUNCATE preserves pg_statistic
+  (rows key on the relation OID, which a truncate does not change), so
+  examine_attribute feeds the ANALYZEd att_avg_widths (4 + 101) into
+  get_rel_data_width. Verified live on a second shape:
+  (4+51+61+4)+28 = 148 → 55/blk → EXPLAIN rows=550 exact.
+
+The fixes, one per side:
+
+1. **Sentinel.** The truncate loop now pointer-replaces Stats with
+   RowCount/Pages=0, Analyzed=false, AllVisible cleared, **Columns kept**,
+   and persists sidecar rowcount=**-1** — PG's
+   RelationSetNewRelfilenode new-relation state (reltuples=-1, relpages=0,
+   relallvisible=0), not a measured zero. The initdb sidecar decode maps
+   rowcount<0 to Analyzed=false, so a restart reloads the unanalyzed
+   relation with the restored column widths — pg_class's own persistence.
+2. **Probe width.** tableDataWidth takes the analyzed per-column AvgWidth
+   (the pg_stats.avg_width value — goopg's analyzeVarsizeAny already matches
+   PG's +1-short-header convention) when >0, falling back to typeWidth per
+   column, exactly examine_attribute's stats/no-stats arms.
+3. **Renderer.** The virtual pg_class reltuples cell renders **-1** while
+   unanalyzed (the M0118 "keep 0 to avoid churn" waiver is retired — the
+   churn is the divergence being closed).
+
+`TestTruncateCostParityWithPG` (internal/testport) runs the fixture against
+a stock PG 18.3 temp cluster (testutil/pgcluster; the TPC-H reference
+:65432 stays untouched per R1), compares the pg_class pair and the Seq Scan
+cost line post-TRUNCATE, then RESTARTS goopg and re-checks both — the
+sentinel survives the sidecar reload and the probe lands on 610 from the
+restored widths.
+
+Residuals (ledger 2026-10-31): the EXPLAIN width column (36 vs 0 under
+count(*)) is the plan-width model's missing target pruning; TRUNCATE
+ROLLBACK does not undo the stats reset; `UPDATE pg_class SET reltuples=-1`
+does not persist the sentinel; TRUNCATE leaves index relstats untouched
+where PG gives every index a new relfilenode.

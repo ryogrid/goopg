@@ -4534,7 +4534,17 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// analyzed" and apply upstream's 10-page floor to it. M0125-0003.
 		stats := &catalog.TableStats{Columns: colStats, Analyzed: true}
 		if sz, ok := sizeMap[relid]; ok {
-			stats.RowCount = sz.rowCount
+			if sz.rowCount < 0 {
+				// pg_class's reltuples=-1 sentinel persisted by TRUNCATE
+				// (RelationSetNewRelfilenode's new-relation state): the
+				// relation is unanalyzed, so Analyzed flips back off and
+				// RowCount stays 0 — the planner's 10-page probe floor fires,
+				// on the restored column widths, exactly as PG probes a
+				// TRUNCATEd relation.
+				stats.Analyzed = false
+			} else {
+				stats.RowCount = sz.rowCount
+			}
 			stats.Pages = int(sz.pages)
 			if sz.allVisible >= 0 {
 				stats.AllVisible, stats.AllVisibleSet = int32(sz.allVisible), true

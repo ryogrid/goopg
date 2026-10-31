@@ -17168,18 +17168,30 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 	// empty table, where PostgreSQL resets to 0/-1 and estimates its 10-page
 	// floor (2550 on the same fixture).
 	//
-	// Clearing Stats returns the relation to the never-analyzed state, which is
-	// what makes the block-derived fallback fire and produce PG's answer. The
-	// zeroed size row is persisted for the same reason VACUUM's is (P1-03): an
-	// in-memory-only reset would come back stale after a restart.
+	// The reset is PG's new-relfilenode state exactly: the truncate replaces
+	// the relfilenode, and RelationSetNewRelfilenode writes the pg_class tuple
+	// with relpages=0, reltuples=-1 (the "never vacuumed or analyzed"
+	// sentinel), relallvisible=0. The per-column pg_statistic rows SURVIVE
+	// (they key on the relation OID, which the truncate keeps), so the
+	// planner's next probe of the empty relation uses the analyzed widths —
+	// the M-NIGHTLY post-TRUNCATE cost parity: PG probes `(id int, pad
+	// text)`@(101) at 61 rows/page (rows=610), where dropping the whole Stats
+	// struct probed at the type defaults (127 rows/page, rows=1270). The
+	// sentinel rides the sidecar as rowcount=-1 so a restart reloads the
+	// unanalyzed state (initdb/open.go decode arm), mirroring pg_class's own
+	// persistence.
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-		if hasIM {
-			im.UpdateRelStats(entry.tbl, 0, 0)
+		if entry.tbl.Stats != nil {
+			// Pointer-replace (as UpdateRelStats does): a concurrent planner
+			// never sees a torn struct. Columns (pg_statistic) are kept.
+			merged := *entry.tbl.Stats
+			merged.RowCount, merged.Pages, merged.Analyzed = 0, 0, false
+			merged.AllVisible, merged.AllVisibleSet = 0, false
+			entry.tbl.Stats = &merged
 		}
-		entry.tbl.Stats = nil
 		// Non-fatal, as in the VACUUM path: a TRUNCATE that has already done
 		// its work must not fail on a statistics write.
-		_ = persistRelSize(o.ctx, entry.tbl, 0, 0)
+		_ = persistRelSize(o.ctx, entry.tbl, -1, 0)
 	}
 
 	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.

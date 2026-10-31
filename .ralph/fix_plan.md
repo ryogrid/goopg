@@ -1308,7 +1308,7 @@ heuristic stays live.)
   - Movement: closed as **not\-a\-defect** \(parity verified against the PG 18\.3 oracle at every probe
     point; no code change, no ledger row — nothing deferred\)\. Next M\-NIGHTLY in file order:
     post\-TRUNCATE cost divergence \(Kind: impl, next entry\)\.
-- [ ] **Post\-TRUNCATE empty\-table cost estimate diverges from PG — goopg rows=1270/cost 22.70, PG rows=610/cost 16.10; reltuples renders 0 where PG keeps −1** \(filed 2026\-10\-31 by the relpages recon loop\)
+- [x] **Post\-TRUNCATE empty\-table cost estimate diverges from PG — goopg rows=1270/cost 22.70, PG rows=610/cost 16.10; reltuples renders 0 where PG keeps −1** \(filed 2026\-10\-31 by the relpages recon loop; CLOSED landed 2026\-10\-31 loop #6\)
   Kind: impl
   Parent: none
   - Rig \(200k\-row table, ANALYZE, TRUNCATE\): PG post\-TRUNCATE pg\_class \(reltuples,relpages\)=\(\-1,0\) →
@@ -1319,6 +1319,38 @@ heuristic stays live.)
     22\.70/1270\) — M0146\-0009 statistics territory, interleaveable when a first\-divergence is stats\-driven\.
   - Resume: internal/executor/pg\_class relstats rendering \+ the estimate\_rel\_size twin's empty/unanalyzed
     arm \(internal/optimizer/relsize\.go\)\; pin with a TPC‑free cost test \(two EXPLAINs vs PG \:65432\)\.
+  - Diagnosis \(loop #6, rig re\-run\)\:
+    - \(a\) root cause: the truncate loop \(operators_ddl\.go:17175\) wrote sidecar \(0,0\) and `Stats = nil` —
+      a MEASURED zero, where PG's RelationSetNewRelfilenode writes the pg\_class tuple with reltuples=\-1\.
+      The rig's "≈2270\-block shape" reading was wrong on the pages axis: cost 22\.70 = 10 pages \+
+      0\.01×1270 — goopg DID fire the 10\-page floor; the whole gap was rows \(density\)\.
+    - \(b\) root cause: probe tuple width\. PG keeps pg\_statistic across TRUNCATE \(keyed on the relation
+      OID, which truncate does not change\) → examine\_attribute feeds the ANALYZEd att\_avg\_widths into
+      get\_rel\_data\_width: fixture \(id int, pad text\)@(100 chars) = 4\+101\+28 overhead = 133 B/tuple →
+      61 rows/blk → 10 blk → 610\. goopg nil'ed the whole Stats struct, losing the widths → type
+      defaults 4\+32\+28 = 64 → 127/blk → 1270\. Verified against PG \(tb table 4\+51\+61\+4\+28=148 →
+      55 → EXPLAIN rows=550 exact\)\.
+    - pg\_stats avg\_width convention parity confirmed: goopg analyzeVarsizeAny \(payload\+1 short header\)
+      already equals PG's att\_avg\_width \(101/51/61\) — only the CONSUMER ignored it\.
+  - Fix \(three arms \+ pin\)\:
+    - operators_ddl\.go truncate loop: pointer\-replace Stats with RowCount/Pages=0, Analyzed=false,
+      AllVisible cleared, **Columns kept**; persistRelSize writes rowcount=\-1 \(the sentinel rides the
+      sidecar\) — UpdateRelStats dropped \(it forces Analyzed=true\)\.
+    - initdb/open\.go sidecar decode: rowcount<0 → Analyzed=false, RowCount stays 0 \(sentinel survives
+      restart like PG's pg\_class tuple\)\.
+    - optimizer/relsize\.go tableDataWidth: per\-column analyzed ColumnStats\.AvgWidth when \>0 \(examine\_attribute
+      arm\), typeWidth fallback per column \(get\_typavgwidth arm\)\.
+    - catalog\.go virtual pg\_class renderer: unanalyzed renders reltuples=\-1 \(was "0 historically,
+      avoid churn" — the churn is now the point\)\.
+  - Pin: `internal/testport/truncate_cost_parity_server_test.go` \(TestTruncateCostParityWithPG\): fixture
+    on goopg \+ stock PG 18\.3 temp cluster \(testutil/pgcluster — TPC‑free, :65432 untouched per R1\)\;
+    post\-TRUNCATE pg\_class pair \+ Seq Scan cost line equal, then goopg RESTART re\-checks both \(sentinel
+    sidecar \+ width restore\)\. 8\.6s PASS\.
+  - Rig post\-fix: goopg \-1\|0, cost 0\.00\.\.16\.10 rows=610, Aggregate 17\.62\.\.17\.64 == PG exactly;
+    post\-insert\-no\-analyze arm matches too \(floor stays until next analyze, PG identical\)\.
+  - Movement: landed; residuals \(a\) scan width column 36 vs 0, \(b\) TRUNCATE ROLLBACK stats undo,
+    \(c\) UPDATE pg\_class \-1 sidecar persistence, \(d\) index relstats reset on TRUNCATE → ledger
+    2026\-10\-31 "post\-TRUNCATE cost" row\. No M\-NIGHTLY items remain from the 20261031 run\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
