@@ -27,7 +27,8 @@ import (
 //     receive list of publications from the publisher: %s" (:455-459, the
 //     res->status != WALRCV_OK_TUPLES arm carries no errcode).
 func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, slotName string) error,
-	checkPubs func(subName, conninfo string, pubs []string) ([]string, error)) {
+	checkPubs func(subName, conninfo string, pubs []string) ([]string, error),
+	refresh func(subName, conninfo string, dbOid uint32, pubs []string, copyData bool) error) {
 	create = func(subName, conninfo, slotName string) error {
 		err := s.applyLauncher.CreatePublisherSlot(conninfo, slotName)
 		var rce *replication.RemoteCommandError
@@ -74,5 +75,8 @@ func (s *Server) subscriptionSlotHooks() (create, drop func(subName, conninfo, s
 				Message: fmt.Sprintf("subscription \"%s\" could not connect to the publisher: %v", subName, errors.Unwrap(err))}
 		}
 	}
-	return create, drop, checkPubs
+	refresh = func(subName, conninfo string, dbOid uint32, pubs []string, copyData bool) error {
+		return s.RefreshSubscriptionOnPublisher(subName, conninfo, dbOid, pubs, copyData)
+	}
+	return create, drop, checkPubs, refresh
 }

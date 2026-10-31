@@ -449,3 +449,83 @@ pg\_subscription\_rel 'i' rows + per-table initial COPY + i→d→s (the unwired
 eager apply-worker restart on a list change, copy\_data's modelled effect, the
 two\_phase=enabled + copy\_data 55000 arms (goopg does not model two\_phase), and the dead-publisher 08006 /
 XX000 arms' live-cluster pin.
+
+## Update 2026-11-01 — refresh data half: fetch\_table\_list, 'i' rows, initial COPY, worker restart (M0122-0014)
+
+AlterSubscription\_refresh's data half (subscriptioncmds.c:820-880) lands for refresh=true
+SET / ADD / DROP PUBLICATION. New `internal/postmaster/subscription_refresh.go`
+(`RefreshSubscriptionOnPublisher`, wired through `subscriptionSlotHooks`' 4th arm →
+`ectx.RefreshSubscriptionOnPublisher`):
+
+1. **fetch\_table\_list** (:2103) over the dial — `FetchPublicationTables`
+   (`internal/replication/logicalreceiver.go::queryRows` + `PubTable`) runs the PG16+
+   `pg_publication` / `pg_publication_rel` / `pg_namespace` join over the publisher
+   connection; a remote refusal maps to XX000, a dial failure to 08006 (same arms as the
+   check\_publications hook above).
+2. **Local resolution with the 42P01 arm** (:2176-2181) — every fetched name resolves
+   through the search-path catalog wrapper BEFORE any `pg_subscription_rel` write; a
+   published table missing on the subscriber aborts the statement ("table %s does not
+   exist on the subscriber") with zero row changes.
+3. **Row swap** — rows for tables that left the merged list drop
+   (`RemoveSubscriptionRel`; PG TRUNCATEs the relations too — ledgered), entering tables
+   seed 'i' rows (`create_subscription_rel`); `copy_data = false` marks them READY
+   (i→s→r waypoints, no COPY).
+4. **Initial COPY** — `copy_data = true` drives `RunTableSyncManager`: one fresh
+   publisher connection + one `COPY <rel> TO STDOUT` → CopyFromExecutor exchange per
+   non-'r' row (the tablesync workers' job); per-rel failures aggregate to XX000 after
+   the sweep. Sync-end promotion advances completed rows 's'→'r' (LSN 1) so the
+   relaunched worker's 's' gate doesn't swallow the first streamed commit.
+5. **Ordering + restart** — PG updates the `pg_subscription` tuple AFTER the refresh
+   returns (subscriptioncmds.c:834-879), so the executor calls the refresh hook BEFORE
+   `SetSubscriptionPublications`: a 42P01/XX000/08006 abort leaves the publication list
+   unchanged (the earlier "list-write-not-rolled-back" deviation is closed — a retried
+   ADD of the same publication no longer hits its own 42710 duplicate guard). The hook
+   kills the apply worker (`StopWorker`, PG's kill-inside-refresh); the executor's
+   post-write launcher kick (`OnSubscriptionChange`) relaunches it dialing the committed
+   list (PG's wake-after-commit). goopg restarts eagerly inside the command where PG
+   lets the running stream end first (ledgered).
+
+**Two replication-stream fixes landed on the way** (both were blockers for the
+post-restart streaming pin):
+
+* **Slot resume off-by-one** (`internal/access/transam/xlog/slot_decoder.go`):
+  `ConfirmedFlushLSN` is the EXCLUSIVE resume boundary (the LSN the next
+  START\_REPLICATION begins at — `NewRecordIterator` derives `pos = startLSN − 1`), but
+  the decoder advanced it to `rec.EndLSN`, the commit record's LAST byte. Every relaunched
+  logical stream therefore started one byte early, read the record header mid-tail, and
+  died with "invalid record header: padding bytes nonzero" — which is what killed the
+  apply worker after every eager restart (slot left ACTIVE, clean server STOP hanging
+  behind the deadlocked session). The advance now stores `rec.EndLSN + 1`.
+* **Walsender exit arms** (`internal/replication/logicalwalsender.go`): the
+  `streamCtx.Done` and `runErr` select arms awaited `receiveDone`, but the reader
+  goroutine parks in ReadFrame on a LIVE socket — the subscriber side stays connected
+  across an eager worker restart — so both arms deadlocked forever whenever the decoder
+  exited without the client disconnecting (ctx cancel = worker stop; decoder failure =
+  any WAL/decode error). The arms now cancel the stream and return without joining the
+  reader (the physical replyStartReplication loop never joins it either; the reader
+  exits when the connection tears down), and a real decode error is surfaced to the
+  client via `writeStreamingError` before returning.
+
+**Pins:** `TestPort_PgoutputInteropGoopgToGoopgRefreshData` (goopg→goopg): ADD p1
+initial-COPYs t's 5 pre-ADD rows, the row reaches 'r', a post-ADD INSERT streams through
+the restarted worker; ADD p2 (subscriber lacks u) 42P01-aborts leaving NO row and NO
+data and the publication list unchanged (the retry then lands cleanly); the retry COPYs
+u's 3 rows and leaves two 'r' rows; DROP p1 keeps both rows (t stays published through
+dummy) with t's data intact; DROP p2 removes u's row (u leaves every remaining
+publication) keeping u's data. `TestIsPermanentClassifier` pins "replication slot is
+active" (55006) as transient so a restart racing the old stream's slot release retries
+with backoff instead of aborting. `TestPort_…AlterPubsRefresh` (loop #9) stays green.
+
+**Gates (index-staged):** executor + replication + catalog + xlog + postmaster-arm unit
+suites, tpch-spotcheck Q12=2 / Q13=35, TPC-H acceptance-arm 24/24 value MATCH, tpcds
+sf025 sweep 99/99 plan-shape identical; fireset-scope OUT (no optimizer/planner/cost
+paths); s9 census REUSE (routing-20261101).
+
+**Still open (ledgered):** the CREATE SUBSCRIPTION initial-sync arm (rows + COPY at
+commit, driven by the launcher today), ALTER … REFRESH PUBLICATION as a standalone
+statement arm, the TRUNCATE-on-drop-tables half of RemoveSubscriptionRel,
+subpublications / subrel heap persistence, the real sync-LSN recorded at 's' (the v0
+transport carries LSN 1), the eager-restart window (PG lets the stream drain; goopg
+kills in-command), and re-application of streamed transactions that raced the
+initial COPY (PK dedup is the current safety net; PG's sync-LSN skip-forward is not
+modelled).

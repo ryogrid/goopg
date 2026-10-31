@@ -202,6 +202,8 @@ func TestIsPermanentClassifier(t *testing.T) {
 		{"ctx-deadline", context.DeadlineExceeded, true},
 		{"start-replication-rejected",
 			fmt.Errorf("logicalreceiver: START_REPLICATION rejected: slot does not exist"), true},
+		{"slot-active-transient",
+			fmt.Errorf("logicalreceiver: START_REPLICATION rejected: 55006: replication slot is active"), false},
 		{"startup-rejected",
 			fmt.Errorf("logicalreceiver: server rejected startup: invalid user"), true},
 		{"pgoutput-decode",

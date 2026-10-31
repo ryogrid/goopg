@@ -3612,3 +3612,126 @@ func TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh(t *testing.T) {
 
 	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_pubsalter_sub")
 }
+
+// TestPort_PgoutputInteropGoopgToGoopgRefreshData pins the DATA half of
+// AlterSubscription_refresh (subscriptioncmds.c:820-880) landed
+// 2026-11-01 (M0122-0014): refresh = true over the post-merge list runs
+// fetch_table_list (:2103) on the publisher, seeds pg_subscription_rel
+// rows for the entering tables (create_subscription_rel), drives one
+// initial-COPY exchange per row (the tablesync workers' COPY <rel> TO
+// STDOUT, riding the replication=database connection), removes the rows
+// of tables that left the list (RemoveSubscriptionRel — the TRUNCATE
+// half is ledgered), and restarts the apply worker so it streams with
+// the new list. The published table missing on the SUBSCRIBER is the
+// 42P01 arm ("table %s does not exist on the subscriber", :2176-2181),
+// and PG's all-names-first check keeps the statement's list change
+// out of the catalog when it aborts — goopg's in-memory registry keeps
+// the merged list (ledgered deviation), so the pin observes the rows,
+// not the list, as the abort artifact: NO row is created, NO data
+// copied. Observation points: the pg_subscription_rel view (relstate /
+// row count) and subscriber-side row counts.
+func TestPort_PgoutputInteropGoopgToGoopgRefreshData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_refreshdata", pubsubcluster.Options{
+		RepoRoot:         repo,
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_refreshdata_sub",
+		PublicationName:  "dummy",
+		SubscriptionName: "g2g_refreshdata_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The subscription starts on a publication whose table exists
+	// everywhere but stays out of the refresh path's way; p1/p2 join
+	// later through ADD PUBLICATION, the refresh machinery's entry ramp.
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t") // opts.PublicationName = dummy FOR TABLE t
+	psc.CreateSubscription(t)
+
+	subrelCount := func() string {
+		t.Helper()
+		return psc.Subscriber.QueryScalar(t,
+			"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+				"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')")
+	}
+
+	// ADD p1: t's 5 pre-existing publisher rows reach the subscriber
+	// through the refresh's initial COPY (they predate the ADD, so
+	// streaming alone cannot deliver them), the pg_subscription_rel
+	// row reaches 'r', and the restarted worker keeps streaming the
+	// new list (post-ADD INSERT lands).
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p1 FOR TABLE t")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p1")
+	psc.WaitForRow(t, "t", "TRUE", 5, 20*time.Second)
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"1", 20*time.Second)
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (6,'f')")
+	psc.WaitForRow(t, "t", "TRUE", 6, 20*time.Second)
+
+	// ADD p2 publishes u, which the subscriber LACKS: 42P01. No row is
+	// seeded, no data copied — PG resolves every fetched name BEFORE
+	// touching pg_subscription_rel (:2163-2181), and the rel count
+	// above pins the statement left exactly one row behind.
+	psc.Publisher.Exec(t, "CREATE TABLE u (id int PRIMARY KEY)")
+	psc.Publisher.Exec(t, "INSERT INTO u VALUES (1),(2),(3)")
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p2 FOR TABLE u")
+	if err := psc.Subscriber.ExecErr("ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p2"); err == nil ||
+		!strings.Contains(err.Error(), "does not exist on the subscriber") {
+		t.Fatalf("ADD PUBLICATION p2 (subscriber lacks u): err = %v, want 42P01 \"does not exist on the subscriber\"", err)
+	}
+	if got := subrelCount(); got != "1" {
+		t.Fatalf("pg_subscription_rel rows after the 42P01 abort = %s, want 1 (no row seeded for u)", got)
+	}
+
+	// Create u locally, retry the ADD: the row seeds, the COPY lands
+	// u's 3 pre-ADD rows, and the sweep leaves two 'r' rows.
+	psc.Subscriber.Exec(t, "CREATE TABLE u (id int PRIMARY KEY)")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p2")
+	psc.WaitForRow(t, "u", "TRUE", 3, 20*time.Second)
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"2", 20*time.Second)
+
+	// DROP p1: t remains published through dummy (FOR TABLE t), so the
+	// merged list {dummy,p2} still covers t and u — BOTH rows stay
+	// (fetch_table_list returns {t,u}; RemoveSubscriptionRel only fires
+	// for rows whose rel is in NO remaining publication).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub DROP PUBLICATION p1")
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"2", 20*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM t"); got != "6" {
+		t.Fatalf("t rows after DROP PUBLICATION p1 = %s, want 6 (copied data kept; TRUNCATE ledgered)", got)
+	}
+
+	// DROP p2: u now belongs to NO remaining publication ({dummy} =
+	// {t}), so u's row leaves the list: RemoveSubscriptionRel removes
+	// it; the copied data in u stays (TRUNCATE half ledgered).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub DROP PUBLICATION p2")
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"1", 20*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM u"); got != "3" {
+		t.Fatalf("u rows after DROP PUBLICATION p2 = %s, want 3 (data kept; TRUNCATE ledgered)", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_refreshdata_sub")
+}

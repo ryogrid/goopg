@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -194,17 +195,57 @@ func (s *Handler) runLogicalWalsender(ctx context.Context, r *libpq.FrameReader,
 
 	select {
 	case <-streamCtx.Done():
-		<-receiveDone
+		// Session-level teardown (apply-worker stop during ALTER
+		// SUBSCRIPTION, connection ctx cancel). The reader is
+		// parked in ReadFrame on a LIVE socket — the subscriber
+		// side stays up through a worker restart — so awaiting
+		// receiveDone here deadlocked the session forever: the
+		// slot's ACTIVE mark persisted (deferred SetActive(false)
+		// never ran), the relaunched worker lost its relaunch to
+		// 55006, and the server's clean STOP hung behind the
+		// session. The physical replyStartReplication loop never
+		// joins the reader on this arm; the reader goroutine
+		// exits on its own when the client finally disconnects,
+		// and the buffered channels keep the decoder/keepalive
+		// goroutines leak-free.
+		slog.Debug("logical walsender: stream ctx done",
+			"slot", args.SlotName, "ctxErr", streamCtx.Err())
+		streamCancel()
+		return nil
+	case <-receiveDone:
+		// The client vanished (FIN/RST surfaced as a ReadFrame
+		// error, or a clean CopyDone/Terminate). The reader
+		// goroutine exits on any of those and closes receiveDone,
+		// but on a plain disconnect nothing else wakes this
+		// select: the decoder idles silently on a quiet publisher
+		// and the 10 s keepalive's write vanishes into the socket
+		// buffer. Without this arm the session lived for minutes
+		// (observed forever), keeping the slot's ACTIVE mark —
+		// and an eager apply-worker restart (ALTER SUBSCRIPTION
+		// ... refresh) then lost its relaunch to
+		// 55006 "replication slot is active" until the 10 s
+		// launcher poll. The physical replyStartReplication
+		// select already carries the symmetric arm.
+		streamCancel()
 		<-runErr
 		<-keepaliveDone
 		return nil
 	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, xlog.ErrClosed) {
+			slog.Info("logical walsender: decoder run failed",
+				"slot", args.SlotName, "err", err)
+		}
 		streamCancel()
-		<-receiveDone
 		<-keepaliveDone
 		if errors.Is(err, context.Canceled) || errors.Is(err, xlog.ErrClosed) {
 			return nil
 		}
+		// A real decode failure must reach the client (PG sends an
+		// ErrorResponse and drops the stream). Await NOTHING on the
+		// reader side first: the subscriber keeps the socket open
+		// through worker restarts, so the reader parks in ReadFrame
+		// forever and joining receiveDone here deadlocked the
+		// session (slot ACTIVE + hung STOP, see the ctx-done arm).
 		if err != nil {
 			return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 		}

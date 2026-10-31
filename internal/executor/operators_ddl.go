@@ -1769,7 +1769,6 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 			copyData = b
 		}
 	}
-	_ = copyData // consumed by the ledgered refresh half's table-sync COPY
 
 	// PG's order: the list work (publicationListToArray /
 	// check_duplicates_in_publist for SET, merge_publications for
@@ -1842,10 +1841,11 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 	// DROP passes NULL (PG validates no names there) and only needs the
 	// dial. A missing publication is a WARNING (:493-501), NOT an error:
 	// the statement lands and the refresh machinery skips that
-	// publication's tables. The rest of the half — fetch_table_list, the
-	// pg_subscription_rel 'i' rows, the tablesync COPY, the eager worker
-	// restart — is ledgered; the hook is nil in test contexts without a
-	// server, which keeps the list-write unit-testable.
+	// publication's tables. The data half (fetch_table_list, the
+	// pg_subscription_rel rows, the tablesync COPY, the worker kill)
+	// runs below, before the list write; the hook is nil in test
+	// contexts without a server, which keeps the list-write
+	// unit-testable.
 	if refresh && o.ctx.CheckPublicationsOnPublisher != nil {
 		validate := s.Publications
 		if s.Action == "drop" {
@@ -1866,6 +1866,21 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 		}
 	}
 
+	// AlterSubscription_refresh's data half (subscriptioncmds.c:820-880)
+	// over the post-merge list: fetch_table_list, the pg_subscription_rel
+	// row swap, the tablesync COPY (skipped for WITH (copy_data = false),
+	// where PG marks the rows READY), and the apply-worker kill. PG runs
+	// the refresh BEFORE writing the pg_subscription tuple (the tuple
+	// update is the command's last step), so a fetch failure (XX000),
+	// connect failure (08006) or a published table missing locally
+	// (42P01) aborts with the subscription's publication list unchanged
+	// — a later ADD of the same publication retries cleanly. goopg's
+	// registry write is the commit point and sits after this call.
+	if refresh && o.ctx.RefreshSubscriptionOnPublisher != nil {
+		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, sub.Conninfo, subDBOid, next, copyData); rerr != nil {
+			return rerr
+		}
+	}
 	if err := o.ctx.PubSub.SetSubscriptionPublications(s.Name, next, subDBOid); err != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -1876,9 +1891,10 @@ func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPub
 		}
 	}
 	// Launcher kick, as the ENABLE/DISABLE arms do (goopg's twin of
-	// ApplyLauncherWakeupAtCommit). The running apply worker keeps its
-	// current stream; the list swap lands on its next START_REPLICATION
-	// (ledgered with the eager-restart half of the refresh machinery).
+	// ApplyLauncherWakeupAtCommit): it relaunches the apply worker the
+	// refresh killed, now dialing with the committed list. The
+	// kill-in-refresh + kick-relaunch split mirrors PG's
+	// kill-during-refresh / wake-after-commit ordering.
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
 	}

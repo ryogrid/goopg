@@ -128,6 +128,19 @@ func (l *ApplyLauncher) CheckPublications(conninfo string, pubs []string) ([]str
 	return CheckRemotePublications(context.Background(), l.publisherConfig(conninfo, ""), pubs)
 }
 
+// FetchPublicationTables returns the tables published by pubs on the
+// subscription's publisher — AlterSubscription_refresh's fetch_table_list
+// (subscriptioncmds.c:2103-2160).
+func (l *ApplyLauncher) FetchPublicationTables(conninfo string, pubs []string) ([]PubTable, error) {
+	return FetchPublicationTables(context.Background(), l.publisherConfig(conninfo, ""), pubs)
+}
+
+// OpenPublisherConn dials one authenticated publisher query connection
+// for a tablesync COPY (RunTableSyncManager's OpenConn target).
+func (l *ApplyLauncher) OpenPublisherConn(conninfo string) (*PublisherConn, error) {
+	return OpenPublisherConn(context.Background(), l.publisherConfig(conninfo, ""))
+}
+
 // StopWorker stops the apply worker of subscription name, if one runs, and
 // waits for it to exit (logicalrep_worker_stop). DROP SUBSCRIPTION calls it
 // after removing the subscription, so the next reconcile does not restart

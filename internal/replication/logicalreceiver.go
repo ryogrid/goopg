@@ -379,13 +379,39 @@ func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pub
 		cmd.WriteString(quotePublicationLiteral(p))
 	}
 	cmd.WriteString(")")
-	if err := r.w.WriteQuery(cmd.String()); err != nil {
+	rows, err := r.queryRows(cmd.String())
+	if err != nil {
+		return nil, err
+	}
+	present := map[string]bool{}
+	for _, row := range rows {
+		if len(row) > 0 && row[0] != nil {
+			present[string(row[0])] = true
+		}
+	}
+	var missing []string
+	for _, p := range pubs {
+		if !present[p] {
+			missing = append(missing, p)
+		}
+	}
+	return missing, nil
+}
+
+// queryRows runs one simple query on the already-connected receiver and
+// collects its result set up to ReadyForQuery — the walrcv_exec twin for
+// the tuple-returning subscriptioncmds.c queries (check_publications
+// :447-460, fetch_table_list :2103-2160). The publisher's own
+// ErrorResponse becomes a *RemoteCommandError; transport failures are
+// ErrPublisherConnect-wrapped.
+func (r *LogicalReceiver) queryRows(cmd string) ([][][]byte, error) {
+	if err := r.w.WriteQuery(cmd); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
 	}
 	if err := r.w.Flush(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
 	}
-	present := map[string]bool{}
+	var rows [][][]byte
 	var cmdErr *RemoteCommandError
 	for {
 		f, err := r.r.ReadFrame()
@@ -398,9 +424,7 @@ func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pub
 			if derr != nil {
 				return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, derr)
 			}
-			if len(row) > 0 && row[0] != nil {
-				present[string(row[0])] = true
-			}
+			rows = append(rows, row)
 		case libpq.MsgErrorResponse:
 			cmdErr = &RemoteCommandError{}
 			for p := f.Payload; len(p) > 1; {
@@ -422,15 +446,91 @@ func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pub
 			if cmdErr != nil {
 				return nil, cmdErr
 			}
-			var missing []string
-			for _, p := range pubs {
-				if !present[p] {
-					missing = append(missing, p)
-				}
-			}
-			return missing, nil
+			return rows, nil
 		}
 	}
+}
+
+// PubTable is one published table reported by fetch_table_list: the
+// schema-qualified name. The third result column (attrs int2vector) is not
+// consumed — goopg publications publish whole tables.
+type PubTable struct {
+	Schema string
+	Name   string
+}
+
+// FetchPublicationTables dials the publisher and runs PG 16+'s
+// fetch_table_list query (subscriptioncmds.c:2103-2160) over pubs,
+// returning the published tables. The query is byte-verbatim PG's
+// server_version >= 160000 branch:
+//
+//	SELECT DISTINCT n.nspname, c.relname, gpt.attrs
+//	       FROM pg_class c
+//	         JOIN pg_namespace n ON n.oid = c.relnamespace
+//	         JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*
+//	                FROM pg_publication
+//	                WHERE pubname IN ( 'p', ... )) AS gpt
+//	             ON gpt.relid = c.oid
+func FetchPublicationTables(ctx context.Context, cfg LogicalReceiverConfig, pubs []string) ([]PubTable, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	var cmd strings.Builder
+	cmd.WriteString("SELECT DISTINCT n.nspname, c.relname, gpt.attrs\n" +
+		"       FROM pg_class c\n" +
+		"         JOIN pg_namespace n ON n.oid = c.relnamespace\n" +
+		"         JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*\n" +
+		"                FROM pg_publication\n" +
+		"                WHERE pubname IN ( ")
+	for i, p := range pubs {
+		if i > 0 {
+			cmd.WriteString(", ")
+		}
+		cmd.WriteString(quotePublicationLiteral(p))
+	}
+	cmd.WriteString(" )) AS gpt\n             ON gpt.relid = c.oid")
+	rows, err := r.queryRows(cmd.String())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PubTable, 0, len(rows))
+	for _, row := range rows {
+		if len(row) < 2 || row[0] == nil || row[1] == nil {
+			continue
+		}
+		out = append(out, PubTable{Schema: string(row[0]), Name: string(row[1])})
+	}
+	return out, nil
+}
+
+// PublisherConn is an authenticated publisher connection parked at
+// ReadyForQuery with framed I/O — exactly the shape RunTableSyncManager's
+// OpenConn contract demands (upstream's fresh per-tablesync-worker
+// connection; RunTableSync drives COPY <rel> TO STDOUT over it).
+type PublisherConn struct {
+	Reader *libpq.FrameReader
+	Writer *libpq.FrameWriter
+	Close  func() error
+}
+
+// OpenPublisherConn dials and authenticates one publisher connection
+// (replication=database startup, like the slot / publication-check path —
+// the walsender falls plain verbs through to the regular handler, so COPY
+// rides it), without entering any replication stream.
+func OpenPublisherConn(ctx context.Context, cfg LogicalReceiverConfig) (*PublisherConn, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	return &PublisherConn{Reader: r.r, Writer: r.w, Close: func() error { r.closeConn(); return nil }}, nil
 }
 
 // quotePublicationLiteral mirrors quote_literal_cstr: single-quoted,
@@ -827,6 +927,13 @@ func isPermanent(err error) bool {
 	}
 	msg := err.Error()
 	switch {
+	case strings.Contains(msg, "replication slot is active"):
+		// 55006: the publisher's walsender from a just-dead connection
+		// can still hold the slot for a moment — exactly the state an
+		// eager worker restart (ALTER SUBSCRIPTION ... refresh) meets.
+		// Transient: the loop retries with backoff and acquires the
+		// slot, as PG's launcher relaunches the slot-active worker.
+		return false
 	case strings.Contains(msg, "START_REPLICATION rejected"):
 		return true
 	case strings.Contains(msg, "server rejected startup"):

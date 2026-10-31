@@ -717,6 +717,15 @@ type Context struct {
 	// *ExecError (PG's message and SQLSTATE) on connect/query failure. nil
 	// — tests without a server — skips the publisher side. M0122-0014.
 	CheckPublicationsOnPublisher func(subName, conninfo string, pubs []string) (missing []string, err error)
+	// RefreshSubscriptionOnPublisher runs AlterSubscription_refresh's
+	// data half after the publication-list write: fetch_table_list, the
+	// pg_subscription_rel row swap (drop rows of tables that left the
+	// list, seed 'i' rows for tables that entered), the tablesync COPY
+	// (skipped for WITH (copy_data = false), where rows go straight to
+	// READY), and the apply-worker restart so the new list streams. It
+	// returns a ready *ExecError (PG's message and SQLSTATE). nil —
+	// tests without a server — skips the data half. M0122-0014.
+	RefreshSubscriptionOnPublisher func(subName, conninfo string, dbOid uint32, pubs []string, copyData bool) error
 
 	// DataDir is the cluster's data directory, used by DDL operators that
 	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,

@@ -736,6 +736,29 @@ func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*Subscriptio
 	return &out, nil
 }
 
+// DropSubscriptionRel removes one tablesync row. Mirrors upstream's
+// RemoveSubscriptionRel — AlterSubscription_refresh drops the rows
+// of tables that left the publication list (PG also TRUNCATEs those
+// tables and drops their per-table slots/origins; goopg's refresh
+// records the row removal only, the TRUNCATE half is ledgered).
+// Returns ErrSubscriptionRelNotFound when the row is absent.
+func (p *PubSub) DropSubscriptionRel(subName string, relOID uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rels, ok := p.subRels[subName]
+	if !ok {
+		return ErrSubscriptionRelNotFound
+	}
+	if _, ok := rels[relOID]; !ok {
+		return ErrSubscriptionRelNotFound
+	}
+	delete(rels, relOID)
+	if len(rels) == 0 {
+		delete(p.subRels, subName)
+	}
+	return nil
+}
+
 // AdvanceSubscriptionRel transitions one tablesync row to a new
 // state, optionally bumping its LSN. The state must be one of
 // `i`/`d`/`s`/`r`, and the transition must be legal under

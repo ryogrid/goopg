@@ -84,6 +84,10 @@ type ReplPeer interface {
 	// libpq multi-host reconnect against a dead publisher.
 	Kill() error
 	Exec(t *testing.T, sql string)
+	// ExecErr runs sql and returns the server's error (nil on success)
+	// instead of failing the test — statements expected to report an
+	// SQLSTATE (ALTER SUBSCRIPTION refresh's arms).
+	ExecErr(sql string) error
 	QueryScalar(t *testing.T, sql string) string
 	// Pgbench runs the cluster-local pgbench binary with the supplied
 	// args appended after the standard connection flags

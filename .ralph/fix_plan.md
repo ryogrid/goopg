@@ -4970,6 +4970,48 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **Refresh data half \(fetch\_table\_list → 'i' rows → tablesync COPY → worker restart\) LANDED 2026-11-01 \(this commit\)**\.
+    Movement: none — subscription DDL + two replication-stream fixes, plan instruments blind \(tpch-spotcheck
+    Q12=2/Q13=35, acceptance arm 24 MATCH, sf025 sweep 99/99 plan-shape identical, fireset-scope OUT, s9 census
+    REUSE routing-20261101\)\.
+    - New `internal/postmaster/subscription_refresh.go::RefreshSubscriptionOnPublisher` \(slot-hook 4th arm,
+      ectx.RefreshSubscriptionOnPublisher, both dispatch build sites\): fetch\_table\_list
+      \(subscriptioncmds\.c:2103 — FetchPublicationTables/pg\_publication join over the dial, XX000 remote
+      refusal / 08006 dial failure\), all-names local resolution BEFORE any row write with the 42P01
+      "table %s does not exist on the subscriber" arm \(:2176-2181\), RemoveSubscriptionRel for leaving
+      tables \(TRUNCATE half ledgered\), create\_subscription\_rel 'i' seeds for entering tables,
+      copy\_data=false → READY marking \(i→s→r waypoints\), copy\_data=true → RunTableSyncManager
+      \(fresh publisher ConnPair + COPY <rel> TO STDOUT → CopyFromExecutor per non-'r' row; per-rel
+      failures aggregate to XX000 after the sweep\), sync-end 's'→'r' promotion \(LSN 1\) so the
+      relaunched worker's 's' gate doesn't eat the first streamed commit\.
+    - Ordering fix: the refresh hook runs BEFORE SetSubscriptionPublications \(PG updates the
+      pg\_subscription tuple only after AlterSubscription\_refresh returns, :834-879\) — a 42P01/XX000/08006
+      abort leaves subpublications unchanged and a retried ADD of the same publication no longer hits its
+      own 42710 guard \(closes the loop #9 "list-write-not-rolled-back" ledger note\)\. Restart split: hook
+      StopWorker \(PG kill-inside-refresh\) + executor's post-write OnSubscriptionChange kick
+      \(wake-after-commit, relaunched worker dials the committed list\)\.
+    - Replication-stream fixes \(both blocked the post-restart streaming pin\): \(a\) slot\_decoder
+      AdvanceConfirmedFlushLSN stores rec\.EndLSN+1 — ConfirmedFlushLSN is the EXCLUSIVE resume boundary
+      \(NewRecordIterator pos = startLSN − 1\); storing inclusive EndLSN made every relaunched stream read
+      its first header one byte early → "invalid record header: padding bytes nonzero" → decoder death on
+      every worker restart; pinned \(semantics updated\) in TestSlotDecoderRunsPlugin/TestSlotDecoderPgCommitAdvance\.
+      \(b\) logicalwalsender select arms: the streamCtx\.Done and runErr arms awaited receiveDone, but the
+      reader parks in ReadFrame on a LIVE socket \(subscriber survives an eager restart\) → session
+      deadlock, slot ACTIVE stuck, clean STOP hang; arms now cancel-and-return \(physical-loop convention\),
+      real decode errors surface via writeStreamingError\. isPermanent: "replication slot is active" \(55006\)
+      reclassified transient → reconnect backoff, pinned in TestIsPermanentClassifier case
+      slot-active-transient\.
+    - Pins: TestPort\_PgoutputInteropGoopgToGoopgRefreshData \(goopg→goopg: ADD p1 initial-COPY 5 rows +
+      'r' + post-ADD INSERT streams through the restarted worker; ADD p2 42P01 abort — zero rows, zero
+      data, list unchanged, retry lands cleanly; retry COPYs u's 3 rows, two 'r' rows; DROP p1 keeps both
+      rows \(t stays published via dummy\) + data intact; DROP p2 removes u's row, keeps u's data\)\;
+      TestAlterSubscriptionPublications hook arms re-verified against the new ordering\; ExecErr plumbing
+      \(pubsubcluster/pgcluster\) supports the 42P01 pin\.
+    - Deferred \(ledgered 2026-11-01\): CREATE SUBSCRIPTION initial sync \(launcher-side seeding today, not
+      commit-time rows+COPY\), ALTER … REFRESH PUBLICATION standalone arm, TRUNCATE on dropping tables,
+      subpublications/subrel heap persistence, real sync-LSN at 's' \(v0 transport writes 1\), the
+      eager-restart window \(PG drains the old stream first\), COPY/streamed-xact overlap
+      \(PK-dedup safety net, no sync-LSN skip-forward\)\.
   - **ALTER SUBSCRIPTION publication-list refresh half (dial + check\_publications) LANDED 2026-10-31 \(this commit\)**\.
     Movement: none — subscription DDL, plan instruments blind \(spotcheck, acceptance arm 24 MATCH, fireset no
     fires, sf025 sweep 99/99\)\.

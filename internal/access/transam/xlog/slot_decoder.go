@@ -150,7 +150,15 @@ func (s *SlotDecoder) Run(ctx context.Context) error {
 		// rounds up so the on-disk state file always reflects
 		// the most recent acked commit.
 		if recordIsXactCommit(rec) {
-			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN); err != nil {
+			// ConfirmedFlushLSN is an EXCLUSIVE boundary: it is
+			// the LSN the next START_REPLICATION resumes from, so
+			// it must be the first byte AFTER the flushed commit
+			// (rec.EndLSN is inclusive of the record's last byte).
+			// Storing EndLSN itself made a slot restart read its
+			// first record header one byte early — a
+			// "padding bytes nonzero" failure of every relaunched
+			// logical stream after a commit was flushed.
+			if err := s.slots.AdvanceConfirmedFlushLSN(s.slotName, rec.EndLSN+1); err != nil {
 				return fmt.Errorf("wal: slot %q advance confirmed_flush_lsn: %w", s.slotName, err)
 			}
 		}

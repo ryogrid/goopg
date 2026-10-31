@@ -208,6 +208,7 @@ func (f *fakeScalarPeer) Stop() error  { return nil }
 func (f *fakeScalarPeer) Kill() error  { return nil }
 
 func (f *fakeScalarPeer) Exec(t *testing.T, sql string) {}
+func (f *fakeScalarPeer) ExecErr(sql string) error      { return nil }
 
 func (f *fakeScalarPeer) Pgbench(t *testing.T, args ...string) string { return "" }
 

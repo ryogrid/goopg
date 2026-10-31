@@ -448,14 +448,24 @@ func (c *Cluster) Conninfo(applicationName string) string {
 // if psql exits non-zero.
 func (c *Cluster) Exec(t *testing.T, sqlText string) {
 	t.Helper()
+	if err := c.ExecErr(sqlText); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// ExecErr runs `psql -v ON_ERROR_STOP=1 -c sqlText` and returns the
+// failure (with psql's output) instead of failing the test — for
+// statements expected to report an SQLSTATE.
+func (c *Cluster) ExecErr(sqlText string) error {
 	cmd := exec.Command(filepath.Join(c.bin, "psql"),
 		"-h", c.Host(), "-p", fmt.Sprintf("%d", c.Port()),
 		"-U", c.user, "-d", c.database,
 		"-v", "ON_ERROR_STOP=1", "-c", sqlText)
 	cmd.Env = c.env()
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("pgcluster: psql exec %q: %v\n%s", sqlText, err, out)
+		return fmt.Errorf("pgcluster: psql exec %q: %v\n%s", sqlText, err, out)
 	}
+	return nil
 }
 
 // QueryScalar runs `psql -tA -c sql` and returns the trimmed stdout.

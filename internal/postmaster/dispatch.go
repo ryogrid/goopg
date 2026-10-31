@@ -561,7 +561,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
-		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot, ectx.CheckPublicationsOnPublisher = s.subscriptionSlotHooks()
+		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot, ectx.CheckPublicationsOnPublisher,
+			ectx.RefreshSubscriptionOnPublisher = s.subscriptionSlotHooks()
 	}
 	ectx.DataDir = s.cfg.DataDir
 	// Keep the connection-time role set + auth UserStore in sync when the
