@@ -797,6 +797,9 @@ heuristic stays live.)
   - Stale, load\-induced — passes at HEAD \(this loop: 59\.9 s\)\.
 - [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 213\.29 s \(AI\-20261031\-002109\-003; repro: `go test \-v \-run \'^TestE2E\_PGReadsThreeLevelCatalogBtree$\' \./internal/testport/`\)\.
   - Stale, load\-induced — passes at HEAD \(this loop: 279\.2 s, beside the running units suite: no code change\)\.
+- [ ] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — `create tables 5500\.\.: context deadline exceeded` \(129\.89 s; AI\-20261101\-010139\-002; also failed in the previous run; repro: `go test \-v \-run \'^TestE2E\_PGReadsThreeLevelCatalogBtree$\' \./internal/testport/`\)
+  - REOPENED — the AI\-20261031\-002109\-003 closure noted 279\.2 s under lane load, which already exceeds the test's ~120 s create\-tables deadline: the failure is the deadline vs. DDL throughput under load, failing two nightly runs in a row\.
+- [ ] race/internal/initdb — `TestStatWALIOPreallocationCounters/preallocate-on: wal_segments_preallocated_total="2" want 1, wal_init_zero_bytes_total="16384" want 8192` \(exactly doubled; AI\-20261101\-010139\-001; first seen 20261101; repro: `go test \-race \-timeout 45m \./internal/initdb/`\)
 - [x] testport/TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL — `fill: context deadline exceeded` \(AI\-20261031\-002109\-004; repro: `go test \-v \-run \'^TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL$\' \./internal/testport/`\)\.
   - Stale, load\-induced — passes at HEAD \(this loop: 41\.0 s, same lane run as \-002/\-003\)\.
 - [x] **pgbench/nightly — `flush victim: write …/base/5/16406 blk 2681: out of range \(nblocks=0\)` on the \-S workload; S2 data\-loss escalation** \(AI\-20261031\-002109\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`; also failed in the previous run\)

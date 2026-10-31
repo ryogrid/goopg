@@ -61,9 +61,18 @@ func TestE2E_PGReadsThreeLevelCatalogBtree(t *testing.T) {
 		for i := lo; i < lo+batch && i < n; i++ {
 			fmt.Fprintf(&b, "CREATE TABLE lvl_%05d (a int);", i)
 		}
-		if err := runSQLSimple(t, g, b.String()); err != nil {
+		// AI-20261101-010139-002: the nightly testport lane runs the whole
+		// suite concurrently (~5,000 s lane); 100 CREATEs plus catalog flush
+		// and checkpoint spikes exceeded runSQLSimple's fixed 10 s per-batch
+		// deadline at batch 5500.. in two nightly runs in a row. This test
+		// measures btree level structure, not DDL latency, so the bulk
+		// create gets a load-tolerant deadline.
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		_, qerr := g.Query(ctx, b.String())
+		cancel()
+		if qerr != nil {
 			logTail, _ := os.ReadFile(g.LogPath())
-			t.Fatalf("create tables %d..: %v\n--- goopg log ---\n%s", lo, err, tailLines(string(logTail), 30))
+			t.Fatalf("create tables %d..: %v\n--- goopg log ---\n%s", lo, qerr, tailLines(string(logTail), 30))
 		}
 	}
 	if err := runSQLSimple(t, g, "INSERT INTO lvl_04321 VALUES (7)"); err != nil {
