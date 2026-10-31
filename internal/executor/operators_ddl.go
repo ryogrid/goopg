@@ -213,6 +213,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterSubscriptionEnable(s)
 	case *parser.AlterSubscriptionSetStmt:
 		return nil, o.execAlterSubscriptionSet(s)
+	case *parser.AlterSubscriptionPublicationsStmt:
+		return nil, o.execAlterSubscriptionPublications(s)
 	case *parser.CreateEventTriggerStmt:
 		return nil, o.execCreateEventTrigger(s)
 	case *parser.AlterEventTriggerStmt:
@@ -1706,6 +1708,146 @@ func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) err
 		if herr := syncSubscriptionRow(o.ctx, sub.OID, sub); herr != nil {
 			return fmt.Errorf("pg_subscription heap write: %w", herr)
 		}
+	}
+	return nil
+}
+
+// execAlterSubscriptionPublications handles ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION name_list [WITH (...)] —
+// AlterSubscription's ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION arms
+// (subscriptioncmds.c:1374-1475). The list algebra is PG's verbatim
+// (merge_publications :2402): SET replaces (a duplicate in the new list
+// is 42710 via publicationListToArray → check_duplicates_in_publist),
+// ADD appends refusing names already present (42710 "publication %q is
+// already in subscription %q"), DROP removes refusing names absent from
+// the list (42704 "publication %q is not in subscription %q") and the
+// drop-to-empty case (42704 "cannot drop all the publications from a
+// subscription"). WITH carries the arms' supported_opts, refresh +
+// copy_data (subscriptioncmds.c:1380/1424); other keys are 42601.
+//
+// refresh = true (the default) passes PG's two gates — a disabled
+// subscription 55000 with the per-action hint (:1392-1408/1437-1456) and
+// an explicit transaction block 25001 (PreventInTransactionBlock) — and
+// then lands the list change: goopg's AlterSubscription_refresh half
+// (publisher-side publication check, pg_subscription_rel 'i' rows, the
+// tablesync COPY) is not wired in production (ledgered), so no
+// table-sync work fires; the new list reaches the publisher on the
+// apply worker's next START_REPLICATION, where publication_names is
+// sent. copy_data validates and is accepted-not-modelled, as the SET
+// arm treats its accepted options.
+func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPublicationsStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	// parse_subscription_options over the arms' supported_opts. goopg's
+	// WITH clause is a map, so keys are validated in sorted order (the
+	// determinism convention parseAlterSubscriptionSetOptions uses).
+	refresh, copyData := true, true
+	names := make([]string, 0, len(s.Options))
+	for k := range s.Options {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name != "refresh" && name != "copy_data" {
+			return &ExecError{Code: "42601", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized subscription parameter: %q", name)}
+		}
+		b, berr := defGetSubscriptionBoolean(name, s.Options[name], s.Pos())
+		if berr != nil {
+			return berr
+		}
+		if name == "refresh" {
+			refresh = b
+		} else {
+			copyData = b
+		}
+	}
+	_ = copyData // consumed by the ledgered refresh half's table-sync COPY
+
+	// PG's order: the list work (publicationListToArray /
+	// check_duplicates_in_publist for SET, merge_publications for
+	// ADD/DROP) runs before the refresh gates.
+	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
+		return err
+	}
+	next := sub.Publications
+	switch s.Action {
+	case "set":
+		next = append([]string(nil), s.Publications...)
+	case "add", "drop":
+		isAdd := s.Action == "add"
+		next = append([]string(nil), sub.Publications...)
+		for _, pub := range s.Publications {
+			found := false
+			for i := range next {
+				if next[i] == pub {
+					found = true
+					if isAdd {
+						return &ExecError{Code: "42710", Pos: s.Pos(),
+							Message: fmt.Sprintf("publication %q is already in subscription %q", pub, s.Name)}
+					}
+					next = append(append([]string(nil), next[:i]...), next[i+1:]...)
+					break
+				}
+			}
+			if isAdd && !found {
+				next = append(next, pub)
+			} else if !isAdd && !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("publication %q is not in subscription %q", pub, s.Name)}
+			}
+		}
+		// merge_publications :2445 — the drop-to-empty refusal.
+		if !isAdd && len(next) == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: "cannot drop all the publications from a subscription"}
+		}
+	}
+
+	if refresh {
+		// subscriptioncmds.c:1392-1399 (SET) / :1440-1452 (ADD/DROP):
+		// the refresh machinery needs a live subscription; PG refuses the
+		// default and names the escape hatch in the hint.
+		if !sub.Enabled {
+			hint := "Use ALTER SUBSCRIPTION ... SET PUBLICATION ... WITH (refresh = false)."
+			switch s.Action {
+			case "add":
+				hint = "Use ALTER SUBSCRIPTION ... ADD PUBLICATION ... WITH (refresh = false) instead."
+			case "drop":
+				hint = "Use ALTER SUBSCRIPTION ... DROP PUBLICATION ... WITH (refresh = false) instead."
+			}
+			return &ExecError{Code: "55000", Pos: s.Pos(),
+				Message: "ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions",
+				Hint:  hint}
+		}
+		// PreventInTransactionBlock (utility.c:4395), goopg's 25001 pattern.
+		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			return &ExecError{Code: "25001", Pos: s.Pos(),
+				Message: "ALTER SUBSCRIPTION with refresh cannot run inside a transaction block"}
+		}
+	}
+
+	if err := o.ctx.PubSub.SetSubscriptionPublications(s.Name, next, subDBOid); err != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subpublications text[].
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if herr := syncSubscriptionRow(o.ctx, sub.OID, sub); herr != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", herr)
+		}
+	}
+	// Launcher kick, as the ENABLE/DISABLE arms do (goopg's twin of
+	// ApplyLauncherWakeupAtCommit). The running apply worker keeps its
+	// current stream; the list swap lands on its next START_REPLICATION
+	// (ledgered with the eager-restart half of the refresh machinery).
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
 	}
 	return nil
 }

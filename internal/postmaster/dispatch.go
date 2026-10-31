@@ -4201,7 +4201,7 @@ func stmtCommandTag(stmt parser.Stmt) (string, bool) {
 		return "DROP PUBLICATION", true
 	case *parser.CreateSubscriptionStmt:
 		return "CREATE SUBSCRIPTION", true
-	case *parser.AlterSubscriptionOwnerStmt, *parser.AlterSubscriptionEnableStmt, *parser.AlterSubscriptionSetStmt:
+	case *parser.AlterSubscriptionOwnerStmt, *parser.AlterSubscriptionEnableStmt, *parser.AlterSubscriptionSetStmt, *parser.AlterSubscriptionPublicationsStmt:
 		return "ALTER SUBSCRIPTION", true
 	case *parser.DropSubscriptionStmt:
 		return "DROP SUBSCRIPTION", true

@@ -3124,6 +3124,23 @@ type AlterSubscriptionSetStmt struct {
 func (s *AlterSubscriptionSetStmt) Pos() int  { return s.pos }
 func (s *AlterSubscriptionSetStmt) stmtNode() {}
 
+// AlterSubscriptionPublicationsStmt is ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION name_list [WITH (...)] —
+// AlterSubscription's ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION kinds
+// (gram.y:10873-10901, bare name_list; subscriptioncmds.c:1374-1475).
+// Action is "set", "add" or "drop"; the WITH options carry refresh and
+// copy_data (the arms' supported_opts).
+type AlterSubscriptionPublicationsStmt struct {
+	pos          int
+	Name         string
+	Action       string
+	Publications []string
+	Options      map[string]string
+}
+
+func (s *AlterSubscriptionPublicationsStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionPublicationsStmt) stmtNode() {}
+
 // CreateEventTriggerStmt — `CREATE EVENT TRIGGER name ON event
 //
 //	[WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]

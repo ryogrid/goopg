@@ -2519,6 +2519,32 @@ func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
+// parseAlterSubscriptionPubsTail parses the name_list + optional WITH
+// block of ALTER SUBSCRIPTION name { SET | ADD | DROP } PUBLICATION,
+// sharing CREATE SUBSCRIPTION ... PUBLICATION's ident convention
+// (TokenIdent names, raw value — gram.y:10873-10901 name_list).
+func (p *parser) parseAlterSubscriptionPubsTail(pos int, name, action string) (Stmt, error) {
+	stmt := &AlterSubscriptionPublicationsStmt{pos: pos, Name: name, Action: action}
+	for {
+		if p.cur().Kind != TokenIdent {
+			return nil, p.errAtCur("expected publication name")
+		}
+		stmt.Publications = append(stmt.Publications, p.cur().Value)
+		p.advance()
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if p.acceptKeyword(KwWith) {
+		opts, err := p.parsePubSubWithList(false)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Options = opts
+	}
+	return stmt, nil
+}
+
 // parseCreateEventTriggerTail picks up after CREATE EVENT TRIGGER.
 // Grammar (postgres/src/backend/parser/gram.y CreateEventTrigStmt):
 //
@@ -8829,16 +8855,41 @@ func (p *parser) parseAlter() (Stmt, error) {
 			case p.acceptIdentKeyword("disable"):
 				return &AlterSubscriptionEnableStmt{pos: t.Pos, Name: name, Enabled: false}, nil
 			}
-			// ALTER SUBSCRIPTION name SET ( option = value [, ...] ).
-			// "set" is a registered keyword (KwSet), so it arrives as a
-			// TokenKeyword, not an ident. SET PUBLICATION / SET OWNER TO
-			// stay the compat no-op below.
-			if p.acceptKeyword(KwSet) && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				opts, err := p.parsePubSubWithList(true)
-				if err != nil {
-					return nil, err
+			// ALTER SUBSCRIPTION name SET ( option = value [, ...] ) —
+			// ALTER_SUBSCRIPTION_OPTIONS — and SET PUBLICATION name_list
+			// [WITH (...)] — ALTER_SUBSCRIPTION_SET_PUBLICATION (gram.y
+			// :10895, bare name_list). "set" is a registered keyword
+			// (KwSet), so it arrives as a TokenKeyword, not an ident.
+			// SET ( takes the OPTIONS arm; SET PUBLICATION the list arm;
+			// SET OWNER TO and friends stay the compat no-op below.
+			if p.acceptKeyword(KwSet) {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					opts, err := p.parsePubSubWithList(true)
+					if err != nil {
+						return nil, err
+					}
+					return &AlterSubscriptionSetStmt{pos: t.Pos, Name: name, Options: opts}, nil
 				}
-				return &AlterSubscriptionSetStmt{pos: t.Pos, Name: name, Options: opts}, nil
+				if p.acceptKeyword(KwPublication) {
+					return p.parseAlterSubscriptionPubsTail(t.Pos, name, "set")
+				}
+			}
+			// ALTER SUBSCRIPTION name { ADD | DROP } PUBLICATION
+			// name_list [WITH (...)] — ALTER_SUBSCRIPTION_{ADD,DROP}_
+			// PUBLICATION (gram.y:10873/10884; "add"/"drop" arrive as
+			// registered keywords exactly like ALTER PUBLICATION's TABLE
+			// arms below).
+			if pubSubKind == KwSubscription {
+				pubAction := ""
+				switch {
+				case p.acceptKeyword(KwAdd):
+					pubAction = "add"
+				case p.acceptKeyword(KwDrop):
+					pubAction = "drop"
+				}
+				if pubAction != "" && p.acceptKeyword(KwPublication) {
+					return p.parseAlterSubscriptionPubsTail(t.Pos, name, pubAction)
+				}
 			}
 		}
 		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].

@@ -67,7 +67,8 @@ func TestParseAlterPublicationOtherFormsStillNoop(t *testing.T) {
 		"ALTER PUBLICATION mypub RENAME TO otherpub",
 		"ALTER PUBLICATION mypub ADD TABLES IN SCHEMA s",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
-		"ALTER SUBSCRIPTION mysub SET PUBLICATION p2",
+		// SET PUBLICATION p2 left this list when the publication-list
+		// arms landed (M0122-0014, TestParseAlterSubscriptionPublications).
 		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
 	}
 	for _, sql := range cases {
@@ -179,8 +180,8 @@ func TestParsePublicationDDLForms(t *testing.T) {
 // ALTER_SUBSCRIPTION_OPTIONS kinds, subscriptioncmds.c): ENABLE, DISABLE,
 // and SET ( option = value … ), including the empty list that upstream
 // treats as a no-op. The compat no-op must keep swallowing the unmodelled
-// tails (SET PUBLICATION, REFRESH, SKIP, RENAME), and PUBLICATION must not
-// take the subscription-only ENABLE/SET arms.
+// tails (REFRESH, SKIP, RENAME), and PUBLICATION must not take the
+// subscription-only ENABLE/SET arms.
 func TestParseAlterSubscriptionEscapeHatch(t *testing.T) {
 	enableCases := []struct {
 		sql     string
@@ -231,9 +232,9 @@ func TestParseAlterSubscriptionEscapeHatch(t *testing.T) {
 		}
 	}
 	// The unmodelled tails, and PUBLICATION's non-take of the
-	// subscription-only arms, stay CompatNoop.
+	// subscription-only arms, stay CompatNoop. (SET PUBLICATION left this
+	// list when the publication-list arms landed — M0122-0014.)
 	for _, sql := range []string{
-		"ALTER SUBSCRIPTION mysub SET PUBLICATION p2",
 		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
 		"ALTER SUBSCRIPTION mysub SKIP (lsn = '0/16B3740')",
 		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
@@ -247,5 +248,91 @@ func TestParseAlterSubscriptionEscapeHatch(t *testing.T) {
 		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
 			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
 		}
+	}
+}
+
+// TestParseAlterSubscriptionPublications pins the three publication-list
+// arms of ALTER SUBSCRIPTION — gram.y:10873-10901's bare name_list forms
+// SET/ADD/DROP PUBLICATION, each with the optional WITH (… ) options
+// block (M0122-0014). ALTER PUBLICATION's ADD/SET/DROP TABLE arms keep
+// their own shape (the subscription arms must not take them), and
+// ALTER PUBLICATION name ADD/DROP of a non-TABLE tail stays CompatNoop.
+func TestParseAlterSubscriptionPublications(t *testing.T) {
+	cases := []struct {
+		sql     string
+		action  string
+		pubs    []string
+		withOpt string // refresh, when set
+	}{
+		{"ALTER SUBSCRIPTION mysub SET PUBLICATION p2", "set", []string{"p2"}, ""},
+		{"ALTER SUBSCRIPTION mysub SET PUBLICATION p1, p2, p3", "set", []string{"p1", "p2", "p3"}, ""},
+		{"ALTER SUBSCRIPTION mysub ADD PUBLICATION p3", "add", []string{"p3"}, ""},
+		{"ALTER SUBSCRIPTION mysub ADD PUBLICATION p3, p4 WITH (refresh = false)", "add", []string{"p3", "p4"}, "false"},
+		{"ALTER SUBSCRIPTION mysub DROP PUBLICATION p1", "drop", []string{"p1"}, ""},
+		{"ALTER SUBSCRIPTION mysub DROP PUBLICATION p1, p2 WITH (copy_data = false)", "drop", []string{"p1", "p2"}, ""},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		s, ok := stmts[0].(*AlterSubscriptionPublicationsStmt)
+		if !ok {
+			t.Fatalf("%q: stmt type = %T, want *AlterSubscriptionPublicationsStmt", tc.sql, stmts[0])
+		}
+		if s.Name != "mysub" || s.Action != tc.action {
+			t.Errorf("%q: Name=%q Action=%q, want mysub/%q", tc.sql, s.Name, s.Action, tc.action)
+		}
+		if len(s.Publications) != len(tc.pubs) {
+			t.Fatalf("%q: Publications=%v, want %v", tc.sql, s.Publications, tc.pubs)
+		}
+		for i, p := range tc.pubs {
+			if s.Publications[i] != p {
+				t.Errorf("%q: Publications[%d]=%q, want %q", tc.sql, i, s.Publications[i], p)
+			}
+		}
+		if tc.withOpt != "" && s.Options["refresh"] != tc.withOpt {
+			t.Errorf("%q: Options[refresh]=%q, want %q", tc.sql, s.Options["refresh"], tc.withOpt)
+		}
+		if tc.sql == "ALTER SUBSCRIPTION mysub DROP PUBLICATION p1, p2 WITH (copy_data = false)" && s.Options["copy_data"] != "false" {
+			t.Errorf("%q: Options[copy_data]=%q, want false", tc.sql, s.Options["copy_data"])
+		}
+	}
+
+	// SET ( keeps the OPTIONS arm; SET (slot_name …) is unambiguous.
+	stmts, err := Parse("ALTER SUBSCRIPTION mysub SET (slot_name = 's')")
+	if err != nil {
+		t.Fatalf("Parse SET options: %v", err)
+	}
+	if _, ok := stmts[0].(*AlterSubscriptionSetStmt); !ok {
+		t.Errorf("SET (…): stmt type = %T, want *AlterSubscriptionSetStmt", stmts[0])
+	}
+
+	// ALTER PUBLICATION's ADD TABLE arm is untouched by the subscription
+	// arms, and a bare ALTER PUBLICATION ADD <ident> (no TABLE) stays
+	// CompatNoop.
+	pubStmt, err := Parse("ALTER PUBLICATION mypub ADD TABLE t")
+	if err != nil {
+		t.Fatalf("Parse ALTER PUBLICATION ADD TABLE: %v", err)
+	}
+	if pt, ok := pubStmt[0].(*AlterPublicationTablesStmt); !ok || pt.Action != "add" {
+		t.Errorf("ALTER PUBLICATION ADD TABLE: stmt = %T, want *AlterPublicationTablesStmt add", pubStmt[0])
+	}
+	for _, sql := range []string{
+		"ALTER PUBLICATION mypub ADD foo",
+		"ALTER SUBSCRIPTION mysub SET FOO bar",
+	} {
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
+			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
+		}
+	}
+
+	// A missing name_list is a parse error (gram.y name_list is non-empty).
+	if _, err := Parse("ALTER SUBSCRIPTION mysub SET PUBLICATION"); err == nil {
+		t.Error("SET PUBLICATION with no list: parse succeeded, want error")
 	}
 }

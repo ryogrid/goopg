@@ -513,6 +513,24 @@ func (p *PubSub) SetSubscriptionSlotName(name string, slotName string, dbOid ...
 	return nil
 }
 
+// SetSubscriptionPublications replaces a subscription's publication list
+// (the subpublications column). Backs ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION: the executor runs PG's
+// merge_publications list algebra (subscriptioncmds.c:2402) and hands
+// the resolved list here. Returns ErrSubscriptionNotFound when name is
+// unknown. dbOid is variadic (mirrors SetSubscriptionSlotName).
+func (p *PubSub) SetSubscriptionPublications(name string, publications []string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Publications = append([]string(nil), publications...)
+	return nil
+}
+
 // DropSubscription removes a subscription. Returns
 // ErrSubscriptionNotFound when name is unknown. Tablesync rows
 // for the subscription are dropped at the same time so a

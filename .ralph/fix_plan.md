@@ -4970,6 +4970,31 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **ALTER SUBSCRIPTION SET / ADD / DROP PUBLICATION \(statement side\) LANDED 2026-10-31 \(this commit\)**\.
+    Movement: none — subscription DDL, plan instruments blind \(tpch\-spotcheck, acceptance arm 24 MATCH, fireset
+    no fires\)\.
+    - The three gram\.y:10873\-10901 publication\-list arms \(ALTER\_SUBSCRIPTION\_\{SET,ADD,DROP\}\_PUBLICATION,
+      subscriptioncmds\.c:1374\-1475\) leave the compat no\-op: parser `AlterSubscriptionPublicationsStmt` \(SET
+      branches on `\(` = options vs PUBLICATION = list; ADD/DROP take PUBLICATION only, so ALTER PUBLICATION …
+      ADD TABLE and the REFRESH/SKIP/RENAME tails are untouched\)\, PG's merge\_publications algebra verbatim
+      \(SET replaces / ADD appends / DROP removes; 42710 "publication name %q used more than once" +
+      "publication %q is already in subscription %q"; 42704 "publication %q is not in subscription %q" +
+      "cannot drop all the publications from a subscription"\)\, the refresh gates \(disabled 55000 + the
+      per\-action hints, explicit\-tx 25001 "ALTER SUBSCRIPTION with refresh cannot run inside a transaction
+      block"\)\, refresh/copy\_data validation \(42601 outside the arms' supported\_opts\)\, catalog
+      `SetSubscriptionPublications` \+ pg\_subscription subpublications heap re\-sync \+ launcher wake\.
+    - Found \(ordering pin\): PG runs merge\_publications BEFORE the refresh gates — a single\-publication
+      `DROP PUBLICATION` on a disabled subscription raises the 42704 drop\-to\-empty error, not the disabled
+      55000; pinned in `TestAlterSubscriptionPublications`\.
+    - Pins: `TestParseAlterSubscriptionPublications`, `TestAlterSubscriptionPublications` \(mutation\-style:
+      every arm re\-reads the registry snapshot\)\, 3 `TestDDLCommandTagMatchesPostgres` rows; two stale
+      CompatNoop expectations for `SET PUBLICATION p2` updated in the parser tests\.
+    - Deferred \(ledgered 2026\-10\-31\): the AlterSubscription\_refresh data half — the publisher\-side
+      `publication %s does not exist on the publisher` check \(subscriptioncmds\.c:498\)\, pg\_subscription\_rel
+      'i' rows \+ the tablesync initial COPY \(the internal/replication tablesync library is unwired in
+      production\)\, the eager apply\-worker restart on a list change \(PG's reason the refresh is
+      PreventInTransactionBlock\)\, copy\_data's modelled effect; REFRESH PUBLICATION itself stays a compat
+      no\-op\.
   - **ALTER SUBSCRIPTION escape hatch LANDED 2026-10-31 \(`c8de1fe4c`\)**\. Movement: none — subscription DDL
     \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH, fireset no fires, SF0\.25 99/99 \+ SF1 99/99 both arms\)\.
     - AlterSubscription's ENABLE / DISABLE and SET \(options\) arms \(ALTER\_SUBSCRIPTION\_ENABLED /

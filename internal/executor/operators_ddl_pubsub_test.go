@@ -694,3 +694,149 @@ func TestSubscriptionPublisherSlotHooks(t *testing.T) {
 		t.Errorf("IF EXISTS notices = %v", n)
 	}
 }
+
+// TestAlterSubscriptionPublications pins the ALTER SUBSCRIPTION
+// { SET | ADD | DROP } PUBLICATION arms (subscriptioncmds.c:1374-1475,
+// merge_publications :2402) — the 2026-10-31 ledgered residual "the rest
+// of item (a)". List algebra, error arms, the refresh gates (disabled
+// 55000 + per-action hint, explicit transaction block 25001), option
+// validation (refresh/copy_data only) and the registry state are all
+// pinned mutation-style: every arm re-looks-up the registry snapshot.
+func TestAlterSubscriptionPublications(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	create := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("runDDL %q: %v", sql, err)
+		}
+	}
+	create("CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1")
+	create("CREATE SUBSCRIPTION gone CONNECTION 'host=remote dbname=app' PUBLICATION pg WITH (connect = false, enabled = false, create_slot = false, slot_name = NONE)")
+
+	subs := func(name string) []string {
+		t.Helper()
+		s, ok := ctx.PubSub.LookupSubscription(name)
+		if !ok {
+			t.Fatalf("subscription %s not registered", name)
+		}
+		return s.Publications
+	}
+	wantPubs := func(name string, want ...string) {
+		t.Helper()
+		got := subs(name)
+		if len(got) != len(want) {
+			t.Fatalf("%s Publications = %v, want %v", name, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s Publications = %v, want %v", name, got, want)
+			}
+		}
+	}
+
+	// SET replaces the list; ADD appends; DROP removes, order-preserving.
+	create("ALTER SUBSCRIPTION s SET PUBLICATION p2")
+	wantPubs("s", "p2")
+	create("ALTER SUBSCRIPTION s ADD PUBLICATION p3, p4")
+	wantPubs("s", "p2", "p3", "p4")
+	create("ALTER SUBSCRIPTION s DROP PUBLICATION p3")
+	wantPubs("s", "p2", "p4")
+
+	// merge_publications refusals: ADD of a present name (42710), DROP of
+	// an absent name (42704), drop-to-empty (42704), duplicate in the
+	// new list (42710, check_duplicates_in_publist).
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s ADD PUBLICATION p2"),
+		"42710", `publication "p2" is already in subscription "s"`)
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s DROP PUBLICATION p9"),
+		"42704", `publication "p9" is not in subscription "s"`)
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s DROP PUBLICATION p2, p4"),
+		"42704", "cannot drop all the publications from a subscription")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION a, b, a"),
+		"42710", `publication name "a" used more than once`)
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s ADD PUBLICATION q, q"),
+		"42710", `publication name "q" used more than once`)
+	wantPubs("s", "p2", "p4") // no refused statement touched the list
+
+	// The refresh gates on the disabled subscription: 55000 with the
+	// per-action hint (subscriptioncmds.c:1392-1399/1440-1452), and the
+	// WITH (refresh = false) escape hatch succeeding.
+	checkHint := func(sql, code, msg, hintSub string) {
+		t.Helper()
+		err := runDDL(t, ctx, sql)
+		var ee *ExecError
+		if !errors.As(err, &ee) {
+			t.Fatalf("%q: err %v, want %s", sql, err, code)
+		}
+		if ee.Code != code || !strings.Contains(ee.Message, msg) {
+			t.Fatalf("%q: %s %q, want %s %q", sql, ee.Code, ee.Message, code, msg)
+		}
+		if !strings.Contains(ee.Hint, hintSub) {
+			t.Errorf("%q: hint %q does not contain %q", sql, ee.Hint, hintSub)
+		}
+	}
+	checkHint("ALTER SUBSCRIPTION gone SET PUBLICATION p1", "55000",
+		"ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions",
+		"Use ALTER SUBSCRIPTION ... SET PUBLICATION ... WITH (refresh = false).")
+	checkHint("ALTER SUBSCRIPTION gone ADD PUBLICATION p1", "55000",
+		"ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions",
+		"Use ALTER SUBSCRIPTION ... ADD PUBLICATION ... WITH (refresh = false) instead.")
+	// Widen the list so the DROP arm reaches the refresh gate (PG runs
+	// merge_publications first — a drop-to-empty is the 42704 above, not
+	// the disabled-55000).
+	create("ALTER SUBSCRIPTION gone SET PUBLICATION pg, p1 WITH (refresh = false)")
+	checkHint("ALTER SUBSCRIPTION gone DROP PUBLICATION p1", "55000",
+		"ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions",
+		"Use ALTER SUBSCRIPTION ... DROP PUBLICATION ... WITH (refresh = false) instead.")
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION gone SET PUBLICATION p1 WITH (refresh = false)"); err != nil {
+		t.Fatalf("disabled SET with refresh=false: %v", err)
+	}
+	wantPubs("gone", "p1")
+	// PG ordering pin: on the disabled subscription the drop-to-empty
+	// merge refusal still fires first (merge_publications precedes the
+	// refresh gates).
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION gone DROP PUBLICATION p1"),
+		"42704", "cannot drop all the publications from a subscription")
+
+	// Option arms: the publication arms' supported_opts are refresh +
+	// copy_data; CREATE/SET-only keys and typos are 42601 (the SET arm's
+	// same shape); values run through defGetSubscriptionBoolean.
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s ADD PUBLICATION p5 WITH (slot_name = 'x')"),
+		"42601", "unrecognized subscription parameter: \"slot_name\"")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION p6 WITH (foo = 'x')"),
+		"42601", "unrecognized subscription parameter: \"foo\"")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION p6 WITH (refresh = 'nope')"),
+		"42601", "refresh requires a Boolean value")
+	// copy_data validates and is accepted-not-modelled.
+	create("ALTER SUBSCRIPTION s ADD PUBLICATION p5 WITH (copy_data = false, refresh = true)")
+	wantPubs("s", "p2", "p4", "p5")
+
+	// PreventInTransactionBlock (refresh default true): inside an explicit
+	// block the statement is 25001 and touches nothing; after ROLLBACK the
+	// same statement succeeds.
+	ctx.Session = NewBasicSession()
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION solo"),
+		"25001", "ALTER SUBSCRIPTION with refresh cannot run inside a transaction block")
+	if err := runTransactionStmt(t, ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	wantPubs("s", "p2", "p4", "p5")
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s SET PUBLICATION solo"); err != nil {
+		t.Fatalf("post-ROLLBACK SET PUBLICATION: %v", err)
+	}
+	wantPubs("s", "solo")
+
+	// Unknown subscription name is 42704 on all three arms.
+	for _, sql := range []string{
+		"ALTER SUBSCRIPTION nosuch SET PUBLICATION p",
+		"ALTER SUBSCRIPTION nosuch ADD PUBLICATION p",
+		"ALTER SUBSCRIPTION nosuch DROP PUBLICATION p",
+	} {
+		wantExecErr(t, runDDL(t, ctx, sql), "42704", `subscription "nosuch" does not exist`)
+	}
+}

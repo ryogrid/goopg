@@ -344,3 +344,55 @@ synchronous\_commit is not validated through `set_config_option`; the namein 63-
 DROP PUBLICATION / RENAME TO / CONNECTION / SKIP stay compat no-ops (REFRESH needs AlterSubscription\_refresh's
 tablesync machinery); the apply worker still sends no standby status updates, so a live slot's confirmed\_flush
 stays at its initial value.
+
+## Update 2026-10-31 — ALTER SUBSCRIPTION SET / ADD / DROP PUBLICATION (M0122-0014)
+
+- **The statement half of the publication-list arms.** gram.y:10873-10901's three bare-name_list forms —
+  `ALTER SUBSCRIPTION name { SET | ADD | DROP } PUBLICATION name_list [WITH (…)]` (AlterSubscription's
+  `ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION` kinds, subscriptioncmds.c:1374-1475) — were compat no-ops.
+  This slice lands the **statement side**: parse, list algebra, option validation, the refresh gates, the
+  registry write and the pg\_subscription heap re-sync. The data half (AlterSubscription\_refresh) stays
+  ledgered — see "Still open" below; `REFRESH PUBLICATION` remains a compat no-op.
+- **Parser.** New `AlterSubscriptionPublicationsStmt{Name, Action, Publications, Options}` (ast.go). The
+  subscription tail's `SET` arm branches on the next token: `(` takes the OPTIONS arm as before, `PUBLICATION`
+  takes the list arm; `ADD`/`DROP` are new keyword arms taken only when followed by `PUBLICATION`, so
+  `ALTER PUBLICATION … ADD TABLE …` keeps its own arm and every other subscription tail (`REFRESH`, `SKIP`,
+  `RENAME TO`) stays the compat no-op. `parseAlterSubscriptionPubsTail` shares CREATE's ident-name convention;
+  the WITH block reuses `parsePubSubWithList(false)` (non-empty, like CREATE's).
+- **List algebra is PG's verbatim** (merge\_publications :2402 / check\_duplicates\_in\_publist): SET replaces
+  (duplicate in the new list → 42710 `publication name "x" used more than once`); ADD appends, refusing a name
+  already present (42710 `publication "x" is already in subscription "s"`); DROP removes, refusing a name not
+  in the list (42704 `publication "x" is not in subscription "s"`) and the drop-to-empty case (42704 `cannot
+  drop all the publications from a subscription`). **PG ordering law found in testing:** the list algebra runs
+  *before* the refresh gates, so on a single-publication subscription a `DROP PUBLICATION` of that name raises
+  the 42704 drop-to-empty error, not the disabled-55000 — pinned.
+- **Refresh gates** (`refresh` defaults true; the arms' `supported_opts` are refresh + copy\_data, anything
+  else 42601 "unrecognized subscription parameter", values through CREATE's `defGetSubscriptionBoolean`
+  twin): disabled subscription → 55000 "ALTER SUBSCRIPTION with refresh is not allowed for disabled
+  subscriptions" with the per-action hint PG writes at :1392-1408/1440-1456 (SET's period-terminated form,
+  ADD/DROP's "… WITH (refresh = false) instead."); explicit transaction block → 25001 "ALTER SUBSCRIPTION
+  with refresh cannot run inside a transaction block" (PreventInTransactionBlock, goopg's
+  `Session.InExplicitTransaction()` pattern). `copy_data` validates, is accepted-not-modelled (the ledgered
+  refresh half's COPY would consume it).
+- **State landing.** New `PubSub.SetSubscriptionPublications` (pubsub.go) swaps the registry list under the
+  mutex; `syncSubscriptionRow` rewrites the pg\_subscription heap row's `subpublications` text[]
+  (`buildPGSubscriptionRow` renders it; the heap-reload round-trip decodes via `ParseTextArrayLiteral`,
+  already pinned). `OnSubscriptionChange` wakes the launcher like the ENABLE/DISABLE arms; the running apply
+  worker keeps its current stream — the new list reaches the publisher on the worker's next
+  START\_REPLICATION, where `publication_names` is sent (eager restart ledgered).
+- **Pins:** `TestParseAlterSubscriptionPublications` (three arms, WITH tails, OPTIONS-arm non-take, ALTER
+  PUBLICATION non-take, empty-list parse error), `TestAlterSubscriptionPublications` (mutation algebra +
+  order preservation, all five merge refusals, the disabled-gate hints per action + the refresh=false escape
+  hatch, the 42601/Boolean option arms, the BEGIN/ROLLBACK 25001 arm, the ordering pin), three
+  `TestDDLCommandTagMatchesPostgres` rows. Two stale CompatNoop expectations for `SET PUBLICATION p2` were
+  updated (both parser tests).
+
+**Movement:** none — subscription DDL; the plan instruments are blind to it (spotcheck 20/20, arm 24 MATCH,
+fireset all-clear).
+
+**Still open (ledgered):** the data half — the publisher-side check that the new publications exist
+(`publication %s does not exist on the publisher`, check\_publications\_exist :498, needs a publisher
+round-trip), AlterSubscription\_refresh's pg\_subscription\_rel 'i' rows + per-table COPY + tablesync state
+machine (the `internal/replication` tablesync library is unwired in production), the eager apply-worker
+restart on a list change (PG's 25001 gate exists precisely because it restarts the worker inside the
+command), and copy\_data's modelled effect.
