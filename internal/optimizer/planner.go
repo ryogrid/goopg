@@ -11081,6 +11081,9 @@ func resolveInListAfterAggregate(x *parser.InExpr, agg *aggregateSurface) (Expr,
 		}
 		out.List[i] = r
 	}
+	if err := checkAnyAllArrayOperand(x, out.List); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -17163,8 +17166,42 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			}
 			out.List[i] = r
 		}
+		if err := checkAnyAllArrayOperand(x, out.List); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
+}
+
+// checkAnyAllArrayOperand enforces PG's make_scalar_array_op (parse_oper.c)
+// rule for the list form of `x op ANY (...)` / `x op ALL (...)`: the right
+// operand must be an array. The subquery form is PG's AEXPR_OP_ANY_SUBLINK
+// and never reaches here; a direct `ANY (ARRAY[...])` splice is legal by
+// construction (parser.InExpr.SplicedArray — the elements ARE the array);
+// `((ARRAY[1]))` resolves to an array_construct FuncCall, a cast literal
+// carries its `[]` target type, and an array column carries IsArray — all
+// accepted. A resolved SCALAR operand is the 42809 PG 18.3 reports for
+// `SELECT 1 = ANY (1);`: "op ANY/ALL (array) requires array on right
+// side". M0122-0015f. A bare string literal is exempt: PG coerces the
+// UNKNOWN literal to an array type and parses the literal as an array
+// (malformed input is 22P02); that evaluation path diverges today as well
+// and is ledgered, so this change leaves it exactly as it was. An operand
+// whose type cannot be resolved statically (e.g. a scalar sublink planned
+// without output typing) is left to the existing runtime behavior.
+func checkAnyAllArrayOperand(x *parser.InExpr, list []Expr) error {
+	if !x.Quantified || x.Subquery != nil || x.SplicedArray || len(list) != 1 {
+		return nil
+	}
+	if _, isLit := list[0].(*StringConst); isLit {
+		return nil
+	}
+	if _, resolvable := ExprResultType(list[0]); !resolvable {
+		return nil
+	}
+	if exprIsArrayTyped(list[0]) {
+		return nil
+	}
+	return &PlanError{Pos: x.Pos(), Code: "42809", Message: "op ANY/ALL (array) requires array on right side"}
 }
 
 // oneElementInAsComparison is transformAExprIn's (parse_expr.c) one-element

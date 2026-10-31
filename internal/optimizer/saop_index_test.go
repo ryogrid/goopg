@@ -206,7 +206,12 @@ func TestSAOPUnmovedShapes(t *testing.T) {
 		{"additive IN", "SELECT i_item_id FROM item WHERE i_item_sk + 1 IN (2, 3)"},
 		// Const-array gate.
 		{"IN subquery", "SELECT i_item_id FROM item WHERE i_item_sk IN (SELECT s_sk FROM store)"},
-		{"column element", "SELECT i_item_id FROM item WHERE i_item_sk = ANY (i_flag)"},
+		// `= ANY (i_flag)` is not an unmoved shape: PG 18.3 rejects the
+		// scalar operand at parse-analysis with 42809 (parse_oper.c
+		// make_scalar_array_op), pinned by TestAnyAllScalarOperandRejected
+		// (M0122-0015f). The column-ELEMENT case that stays legal in PG is
+		// the ARRAY[i_flag] form below.
+		{"array of column", "SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[i_flag])"},
 		{"mixed const/col", "SELECT i_item_id FROM item WHERE i_item_sk IN (2, i_flag)"},
 		// Unindexed column (the TPC-H Q12 bench shape: no index, no probe).
 		{"unindexed col", "SELECT i_item_id FROM item WHERE i_flag IN (2, 3)"},
@@ -222,6 +227,55 @@ func TestSAOPUnmovedShapes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAnyAllScalarOperandRejected pins M0122-0015f: PG's
+// make_scalar_array_op (parse_oper.c) demands an array right operand for
+// `x op ANY (...)` / `x op ALL (...)` — measured byte-for-byte against the
+// PG 18.3 oracle, which answers `SELECT 1 = ANY (1);` with SQLSTATE 42809
+// "op ANY/ALL (array) requires array on right side". The positive controls
+// are the forms the oracle ACCEPTS and goopg must keep planning: the
+// direct ARRAY[...] splice, a parenthesised ARRAY (array_construct),
+// ARRAY over a column, the `'{1}'` literal (PG coerces UNKNOWN to the
+// array type; its evaluation path is ledgered), a subquery, and the plain
+// IN spelling with a column element.
+func TestAnyAllScalarOperandRejected(t *testing.T) {
+	c := saopFixture(t)
+	t.Run("reject", func(t *testing.T) {
+		for _, sql := range []string{
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (i_flag)",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (2)",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (i_flag + 1)",
+			"SELECT i_item_id FROM item WHERE i_item_sk > ALL (i_flag)",
+			"SELECT i_item_id FROM item WHERE i_item_sk != ANY (2)",
+			"SELECT i_item_sk = ANY (true) FROM item",
+		} {
+			_, err := Plan(parseOne(t, sql), c)
+			pe, ok := err.(*PlanError)
+			if !ok {
+				t.Errorf("%s: want *PlanError, got %v", sql, err)
+				continue
+			}
+			if pe.Code != "42809" || pe.Message != "op ANY/ALL (array) requires array on right side" {
+				t.Errorf("%s: got %s %q, want 42809 make_scalar_array_op message", sql, pe.Code, pe.Message)
+			}
+		}
+	})
+	t.Run("accept", func(t *testing.T) {
+		for _, sql := range []string{
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[2, 3])",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY ((ARRAY[2]))",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[i_flag])",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY ('{1}')",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (SELECT s_sk FROM store)",
+			"SELECT i_item_id FROM item WHERE i_item_sk IN (2, i_flag)",
+			"SELECT i_item_id FROM item WHERE i_item_sk = ANY (ARRAY[2]::int4[])",
+		} {
+			if _, err := Plan(parseOne(t, sql), c); err != nil {
+				t.Errorf("%s: want plan, got %v", sql, err)
+			}
+		}
+	})
 }
 
 // TestSAOPNumSAScansCost pins the B-14 cost slice in btreeIndexAMCost

@@ -2613,7 +2613,7 @@ a_expr:
 	| a_expr like_op any_or_some '(' expr_list ')'
 			{ $$ = quantifiedAny(yylex, $<p>2, $1, OpCode($2), nil, $5, $<p>5) }
 	| a_expr like_op ALL '(' expr_list ')'
-			{ $$ = NewInExpr($<p>2, $1, false, OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
+			{ $$ = quantifiedAll(yylex, $<p>2, $1, OpCode($2), $5, $<p>5) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2624,7 +2624,7 @@ a_expr:
 			}
 	| a_expr subq_op ALL '(' expr_list ')'
 			{
-				$$ = NewInExpr($<p>2, $1, false, binOp(yylex, $2), true, nil, unwrapAnyArray(yylex, $5, $<p>5))
+				$$ = quantifiedAll(yylex, $<p>2, $1, binOp(yylex, $2), $5, $<p>5)
 			}
 	| a_expr subq_op ANY select_with_parens
 			{

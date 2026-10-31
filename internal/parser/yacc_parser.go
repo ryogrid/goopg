@@ -14103,7 +14103,7 @@ yydefault:
 		yyDollar = yyS[yypt-6 : yypt+1]
 //line ../../tmp/goopg_grammar.y:2794
 		{
-			yyVAL.expr = NewInExpr(yyDollar[2].p, yyDollar[1].expr, false, OpCode(yyDollar[2].ival), true, nil, unwrapAnyArray(yylex, yyDollar[5].exprs, yyDollar[5].p))
+			yyVAL.expr = quantifiedAll(yylex, yyDollar[2].p, yyDollar[1].expr, OpCode(yyDollar[2].ival), yyDollar[5].exprs, yyDollar[5].p)
 		}
 	case 483:
 		yyDollar = yyS[yypt-6 : yypt+1]
@@ -14121,7 +14121,7 @@ yydefault:
 		yyDollar = yyS[yypt-6 : yypt+1]
 //line ../../tmp/goopg_grammar.y:2804
 		{
-			yyVAL.expr = NewInExpr(yyDollar[2].p, yyDollar[1].expr, false, binOp(yylex, yyDollar[2].str), true, nil, unwrapAnyArray(yylex, yyDollar[5].exprs, yyDollar[5].p))
+			yyVAL.expr = quantifiedAll(yylex, yyDollar[2].p, yyDollar[1].expr, binOp(yylex, yyDollar[2].str), yyDollar[5].exprs, yyDollar[5].p)
 		}
 	case 486:
 		yyDollar = yyS[yypt-4 : yypt+1]

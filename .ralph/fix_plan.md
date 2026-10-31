@@ -5229,7 +5229,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       are unimplemented; a WARNING preceding an ERROR in the same statement is
       lost; CREATE FOREIGN TABLE reports the command tag `CREATE TABLE`;
       foreign\-catalog heaps are single\-database across restarts\.
-  - [ ] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
+  - [x] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
     Kind: impl
     Parent: M0122-0015
     Found 2026\-10\-12 while testing M0122\-0015b\.
@@ -5238,6 +5238,26 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       make\_scalar\_array\_op\)\. Same for the OPERATOR\(\.\.\.\) spelling\.
     - First step: reject a non\-array right operand in the analyzer\'s
       ANY/ALL typing\.
+    - LANDED 2026\-11\-01 \(this commit\) — the quantified desugar marks its
+      three ARRAY splice sites with `parser\.InExpr\.SplicedArray`
+      \(direct `ANY \(ARRAY\[\.\.\.\]\)` is scalar\-element by construction and
+      must stay legal\); `checkAnyAllArrayOperand` gates the resolved list at
+      both twin producers \(planInExpr + resolveInListAfterAggregate\),
+      rejecting statically\-resolved scalars with the oracle\'s exact
+      42809 message/caret/SQLSTATE and accepting the subquery/splice/
+      array\-typed/\(ARRAY\[1\]\)/NULL forms\. Bare string literals stay
+      status\-quo \(PG\'s UNKNOWN\->array coercion + the pre\-existing
+      `ANY \(a, b\)` expr\-list laxness ledgered 2026\-11\-01\)\.
+      Design `docs/design/0100\-0149/0122\-0015f\-any\-all\-array\-operand\.md`\.
+      - Pins: `TestAnyAllScalarOperandRejected` \(6 rejects + 7 accepts incl\.
+        `ANY \(ARRAY\[i\_flag\]\)` and `ANY \('\{1\}'\)`\)\;
+        `TestSAOPUnmovedShapes` swapped its PG\-rejected `= ANY \(i\_flag\)`
+        case for the legal `ANY \(ARRAY\[i\_flag\]\)` shape; 40 parser
+        goldens regenerated additive\-only \(all 16 splice `true` lines
+        reviewed\)\.
+    Movement: none — analyzer typing; the 42809 shape exists in no TPC
+    query \(fireset fires=none, 99/99 plans unchanged\; acceptance arm 24
+    MATCH\; sf025 sweep PASS\; spotcheck Q12=2/Q13=35\)\.
   - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
