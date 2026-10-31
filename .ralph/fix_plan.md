@@ -1181,7 +1181,7 @@ heuristic stays live.)
     - what sets the continuous\-replay start on restart \(pg\_control redo vs the received end\);
     - whether the shutdown checkpoint's replay changes xid/clog state, so that row 2's xmin reads as not committed\.
 
-- [ ] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+- [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: impl
   Parent: none
   - Stack\-instrumented pgbench \-i: the `drop table if exists pgbench\_accounts, pgbench\_branches, pgbench\_history,
@@ -1191,6 +1191,22 @@ heuristic stays live.)
     oids\. The name resolution of missing tables synthesizes the next oids and consumes them from the allocator\.
   - Not data\-losing \(later CREATE/inserts land correctly; the nightly failures trace to the separate eviction\-flush
     race, fixed same day\) — filing to record the routing\+side\-effect, not worked this loop\.
+  - CLOSED 2026\-10\-31 loop \#2: the filed routing **verified NOT reproducing at HEAD** \(executor fixture \+ fresh\-cluster
+    server probe: DROP IF EXISTS takes the NOTICE arm, consumes no OID, creates no file; 42P01 without IF EXISTS\)\.
+    Two real 0\-byte\-file mechanisms from the same diagnosis DID reproduce and landed:
+    - `Manager.TruncateRelation`/`TruncateRelationTo` opened `O_RDWR|O_CREATE` \+ `MkdirAll` — truncate of a
+      storage\-less relation materialised a 0\-byte file\. Now via `relFileForTruncate`: no `O_CREATE`, no
+      `MkdirAll`, missing file → no\-op, per `postgres/src/backend/storage/smgr/md.c:1291` \(mdtruncate walks
+      already\-open segments\)\.
+    - `truncateTableAndPartitions` ran parent\-level storage work on partitioned parents \(goopg parents have a
+      synthesized relfilenode\)\. Now skipped after the child recursion when `PartitionKey != nil`, per
+      `tablecmds.c:2148\-2150` "Skip partitioned tables as there is nothing to do"\.
+    - Tests: `internal/storage/smgr_truncate_nocreate_test\.go`, `internal/executor/drop_truncate_nostorage_test\.go`,
+      `internal/testport/drop_if_exists_no_storage_test\.go`\. Design doc: `docs/design/0100\-0149/m\-nightly\-truncate\-
+      eviction\-flush\-race\.md` "Follow\-up: 0\-byte relfilenode files" \+ README row\.
+    - Residuals to ledger \(2026\-10\-31\): partitioned\-parent relfilenode=0/no\-file at CREATE; VACUUM FULL/CLUSTER
+      sibling truncate sites \(operators_ddl\.go ~21373, ~27745\-27763, ~28067\)\; read\-path `relFile` O\_CREATE policy;
+      TRUNCATE ONLY partitioned SQLSTATE divergence \(goopg 0A000 vs PG 42809\)\.
 - [ ] **autovacuum ANALYZE reports relpages far above the relation's block count** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: recon
   Parent: none
