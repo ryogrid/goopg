@@ -135,3 +135,46 @@ from the two mechanisms the diagnosis *also* observed, which do reproduce:
 `go test ./internal/storage/ ./internal/executor/`; testport
 `TestDropTableIfExistsMissingNoStorage`; units (precommit scope=units);
 TPC-H spot-check; acceptance-arm; TPC-DS SF0.25 sweep; hook pgbench smoke.
+
+## Follow-up 2: "relpages far above the block count" triage (filed 2026-10-31, recon loop #3)
+
+The AI-20261031-002109-005 diagnosis also filed "autovacuum ANALYZE reports
+relpages far above the relation's block count" (`analyze done
+table=.pgbench_branches rows=50 pages=132` "for a 1-block file"). The recon
+loop reproduced the nightly pgbench trio under instrumentation (launcher
+tick gates untouched; analyzer print: nBlocks / manager-cached nblocks /
+on-disk file size; vacuum print: scanned, visited, VM-skips, lastNonEmpty,
+keep; smgr print: every TruncateRelation/To with before-count) and closed
+the item as **not a defect**:
+
+- Every ANALYZE's `pages` equalled the manager handle count AND the on-disk
+  file block count at sample time (99/99/99 … 4003/4003/4003). A mid-workload
+  `pages=132` is real dead-tuple bloat — PG's relpages reads the same.
+- The "1-block file" side of the comparison is an observation-time artifact:
+  pgbench's own lifecycle rebuilds the tables after those log lines
+  (`-i` drop+create+COPY; `-S` init `TRUNCATE pgbench_history` — caught by
+  the instrumentation as `RECON-TRUNC-ZERO rel=16406 cachedBefore=4003`),
+  and pgbench's init `VACUUM ANALYZE` re-persists fresh stats (pg_class
+  sampler showed `t0 p0 f0` after the -S init truncate: TRUNCATE zeroes
+  `tbl.Stats` at operators_ddl.go:17179, PG parity per trunc.c:282-285
+  vac_update_relstats(0,0)).
+- The launcher's `vacuum done pages=` field counts VISITED pages (VM-skips
+  uncounted: visits=1049 vs scanned=4003), which made the nightly vacuum
+  lines look inconsistent with the analyze lines.
+- Vacuum's tail truncation, VM-skip nonempty accounting (vacuumlazy.c
+  heap_vac_scan_next_block port at vacuum.go:177-184), and the truncate
+  decision were all measured PG-shaped; no live-data truncation observed
+  (the first worry: it is correctly guarded).
+
+Three real divergences surfaced by the same rigs and were filed as open
+M-NIGHTLY tasks: COPY skips the pgstat row counters (probe: goopg
+n_tup_ins=0/n_live_tup=0 vs PG 5000/5000); pgbench_branches reltuples=1
+on an idle 10-row table (COPY/rewrite-then-update visibility undercount
+family); post-TRUNCATE empty-relation cost (goopg 22.70/1270 vs PG
+16.10/610, reltuples 0 vs -1). Repro rigs live in `tmp/mnightly-*.sh`.
+
+### Gates
+
+Repro rigs only (no code staged; instrumentation reverted before commit):
+mini trio s=1 60s×3, trio s=50 120s×3, TRUNCATE cost probe vs PG temp
+cluster, COPY probe vs PG temp cluster; census unchanged (REUSE).

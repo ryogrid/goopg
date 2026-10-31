@@ -1207,7 +1207,7 @@ heuristic stays live.)
     - Residuals to ledger \(2026\-10\-31\): partitioned\-parent relfilenode=0/no\-file at CREATE; VACUUM FULL/CLUSTER
       sibling truncate sites \(operators_ddl\.go ~21373, ~27745\-27763, ~28067\)\; read\-path `relFile` O\_CREATE policy;
       TRUNCATE ONLY partitioned SQLSTATE divergence \(goopg 0A000 vs PG 42809\)\.
-- [ ] **autovacuum ANALYZE reports relpages far above the relation's block count** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+- [x] **autovacuum ANALYZE reports relpages far above the relation's block count** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: recon
   Parent: none
   - pgbench server logs \(nightly \+ local repro\): `analyze done table=.pgbench\_branches rows=50 pages=132` \(and
@@ -1215,6 +1215,62 @@ heuristic stays live.)
     `.pgbench\_history rows=16093 pages=104` tracks nblocks closely, so the inflation is per\-table\.
   - Consequence: inflated relpages flow into pg\_class/cost model \(M0146\-0009 statistics territory — interleaveable
     when a first\-divergence is stats\-driven\)\. Not worked this loop; repro \(nightly stage\) was mid\-triage\.
+  - CLOSED 2026\-10\-31 loop \#3 \(recon\): **no relpages inflation defect reproduces**\. Instrumented pgbench\-trio
+    repros \(s=1 60s×3 and s=50 120s×3, launcher ticks live\) printed nBlocks / manager\-cached nblocks /
+    on\-disk file blocks at every ANALYZE: the three agreed at every sample \(99/99/99, 110/110/110,
+    1800/1800/1800, 4003/4003/4003 …\) — the analyzer's pages is the true block count AT SAMPLE TIME; a
+    mid\-workload `pages=132` reflects real dead\-tuple bloat, as PG's relpages would\.
+    - The "for a 1\-block file" half is an observation\-time artifact: pgbench's own lifecycle rebuilds the
+      tables after those log lines — `-i` \(drop\+create\+COPY\+vacuum analyze\) and `-S` init
+      `TRUNCATE pgbench_history` \(instrumented: `RECON-TRUNC-ZERO rel=16406 cachedBefore=4003` at
+      \-S init\) — and pgbench's init `VACUUM ANALYZE` re\-persists fresh stats\. The diagnosing loop
+      compared mid\-workload log lines against the later fresh/empty file state\.
+    - The launcher's `vacuum done pages=` field counts VISITED pages, not nBlocks \(VM\-skipped
+      all\-visible pages are not counted: visits=25 vs scanned=110, visits=1049 vs scanned=4003\) —
+      a log\-field naming artifact that made nightly numbers look inconsistent with the analyze lines\.
+    - TRUNCATE zeroes the stats \(operators\_ddl\.go:17179 `tbl.Stats = nil` \+ pgstat trigger reset\):
+      sampler confirmed `t=0 p=0 f=0` after the \-S init truncate — pg\_class/cost model never keep
+      inflated values past a TRUNCATE\. PG parity per trunc\.c:282\-285 \(vac\_update\_relstats\(0,0\)\)\.
+    - Files the findings below stay in fix\_plan; repro rigs: `tmp/mnightly\-\{relpages,trio,trunc,copy\}\-rig\.sh`
+      \(tmp, uncommitted\)\.
+  - Movement: none — plan instruments blind \(recon closed as not\-a\-defect; no code staged\)\.
+- [ ] **COPY skips the pgstat row counters — n\_tup\_ins / n\_live\_tup undercount COPY loads, and autovacuum triggers miss COPY\-loaded data** \(filed 2026\-10\-31 by the relpages recon loop\)
+  Kind: impl
+  Parent: none
+  - Probe \(goopg vs PG 18\.3 temp cluster, 5000\-row `\copy` into an empty table\): goopg `n\_tup\_ins=0 n\_live\_tup=0`;
+    PG `n\_tup\_ins=5000 n\_live\_tup=5000`\.
+  - Consequence: pgbench \-i \(COPY\-loaded\) tables carry ins=0 → the insert\-growth autoanalyze/vacuum triggers
+    \(needsVacuum ins arm, anlThresh via mod\) never fire for COPY\-only changes; accounts sat un\-analyzed until
+    W1 updates fed the mod counter \(14:27:20 analyze accounts in the s=50 rig\)\.
+  - Resume: the COPY executor emit site \(internal/executor COPY path\) must call recordRelInsert\(ctx, oid, n\)
+    with the loaded row count per PG's copy\.c pgstat\_report\_copy \(pgstat count per batch\); keep the
+    abort\-staged semantics of recordRelInsert\.
+- [ ] **pgbench\_branches reltuples renders 1 \(10\-row table\) — analyzer and vacuum see 1 visible of 10 live rows on an idle pgbench table** \(filed 2026\-10\-31 by the relpages recon loop\)
+  Kind: recon
+  Parent: none
+  - s=1 trio rig: pgbench\_branches \(10 rows, 69 blocks after W1\) — launcher analyze logs `rows=1` at
+    15:04:01 and 15:05:06 \(W1 finished ≥60s prior, all clients exited\), and pgbench's \-S init SQL ANALYZE
+    persists reltuples=1 at 15:09:5x \(sampler `branches t=1` through the idle window\) while
+    `pg\_stat…seq\_scan` renders keep the file at 69 blocks\.
+  - Vacuum's live count matches \(15:04:01 pass live=1, dead=0 — the 9 latest versions are invisible AND not
+    counted dead, so nothing is pruned — no data loss, stats undercount\)\.
+  - Hypotheses to test: pgbench \-i's `ALTER TABLE … ADD PRIMARY KEY` rewrite \+ W1 HOT updates leave
+    committed versions invisible long after commit \(clog/commit\-ts visibility lag? snapshot minting in the
+    launcher tx? cmd‑id/cmin stamping in COPY\-then\-rewrite tables?\)\. Repro rig: `tmp/mnightly-trio-rig.sh`
+    \(SCALE=1\) \+ `tmp/mnightly-copy-probe.sh` pieces: reproduce at pure\-SQL level \(COPY 10 rows → UPDATE
+    9 rows → ANALYZE; check reltuples\) — likely a `COPY committed rows invisible to later snapshots` family;
+    the COPY probe above showed n\_live\_tup=0, consistent with COPY\-committed tuples judged invisible\.
+- [ ] **Post\-TRUNCATE empty\-table cost estimate diverges from PG — goopg rows=1270/cost 22.70, PG rows=610/cost 16.10; reltuples renders 0 where PG keeps −1** \(filed 2026\-10\-31 by the relpages recon loop\)
+  Kind: impl
+  Parent: none
+  - Rig \(200k\-row table, ANALYZE, TRUNCATE\): PG post\-TRUNCATE pg\_class \(reltuples,relpages\)=\(\-1,0\) →
+    `Seq Scan cost=0.00..16.10 rows=610`; goopg \(0,0\) → `Seq Scan cost=0.00..22.70 rows=1270`\.
+  - Two sub\-divergences: \(a\) TRUNCATE writes reltuples=0 where PG's new\-relfilenode relstuple stays the
+    \-1 "never analyzed" sentinel \(trunc\.c:282\-285 path renders \-1\)\; \(b\) the unanalyzed\-empty relation
+    estimator uses different defaults \(PG: 10\-block probe ⇒ 16\.10/610\; goopg ≈ 2270\-block shape ⇒
+    22\.70/1270\) — M0146\-0009 statistics territory, interleaveable when a first\-divergence is stats\-driven\.
+  - Resume: internal/executor/pg\_class relstats rendering \+ the estimate\_rel\_size twin's empty/unanalyzed
+    arm \(internal/optimizer/relsize\.go\)\; pin with a TPC‑free cost test \(two EXPLAINs vs PG \:65432\)\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
