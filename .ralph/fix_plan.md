@@ -7556,6 +7556,12 @@ Sequencing: the S9 replenishment rule in the banner.)
     only \(unchanged census\, S9\(4a\)\; `tree=` omitted: the capture ran with in\-progress ALTER SUBSCRIPTION edits
     in the working tree\)\; the id\(gate\) list is unchanged from the note above\.
     census\); id\(gate\) list as in the 20261030a note above\.
+  - S9 exhausted at `c8de1fe4c` \(2026\-10\-31; DUE after `c8de1fe4c`, reason=plan\-relevant\-change — the ALTER
+    SUBSCRIPTION slice touched `internal/optimizer/planner\.go`\, `internal/parser/ddl\.go` \+ `ast\.go`\,
+    `internal/catalog/pubsub\.go` and `internal/postmaster/dispatch\.go`, all in the trigger set\) —
+    `routing\-20261031b/ROUTING\.md` only \(unchanged census, S9\(4a\)\; capture at head `bd20cec5b` with
+    `tree=e3df993166e67fc78c7a8aecdbece6910db2c39a` — `git diff --quiet -- internal cmd scripts bench go.mod go.sum`
+    held at capture time\)\; the id\(gate\) list is unchanged from the note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
