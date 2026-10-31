@@ -346,6 +346,91 @@ func mutuallyExclusiveSubOpts(a, b string, pos int) error {
 	}
 }
 
+// alterSubscriptionSupportedOpts is AlterSubscription's ALTER_SUBSCRIPTION_OPTIONS
+// supported_opts (subscriptioncmds.c:1159-1162): slot_name, synchronous_commit,
+// binary, streaming, two_phase, disable_on_error, password_required,
+// run_as_owner, failover, origin. The CREATE-only options (connect,
+// create_slot, enabled, copy_data) are NOT accepted by SET — PG's
+// parse_subscription_options reports them as unrecognized for this call.
+var alterSubscriptionSupportedOpts = map[string]bool{
+	"slot_name":          true,
+	"synchronous_commit": true,
+	"binary":             true,
+	"streaming":          true,
+	"two_phase":          true,
+	"disable_on_error":   true,
+	"password_required":  true,
+	"run_as_owner":       true,
+	"failover":           true,
+	"origin":             true,
+}
+
+// parseAlterSubscriptionSetOptions ports the option scan of
+// ALTER_SUBSCRIPTION_OPTIONS (subscriptioncmds.c:1164-1341). slot_name is
+// the modelled option: it returns slotName with ok=true, "" meaning
+// NONE (gram.y's `slot_name '=' NONE` produces lowercase "none"). PG
+// writes the given slot name straight into subslotname via namein
+// (subscriptioncmds.c:1181-1184) and validates it only when the slot is
+// used at START_REPLICATION, so — unlike goopg's CREATE arm — ALTER does
+// not run validateReplicationSlotName here; the namein 63-byte truncation
+// is not reproduced (ledgered). The remaining supported options validate
+// their values with CREATE's defGet* twins and are then accepted-not-
+// modelled, matching CREATE's treatment of the same columns (the registry
+// has no fields for them and pg_subscription renders defaults — the
+// 0008-0003 design doc records it). A key outside the supported set is
+// 42601 "unrecognized subscription parameter", the same 42601 shape
+// CREATE's arm raises.
+func parseAlterSubscriptionSetOptions(opts map[string]string, pos int) (slotName string, ok bool, err error) {
+	names := make([]string, 0, len(opts))
+	for k := range opts {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		val := opts[name]
+		if !alterSubscriptionSupportedOpts[name] {
+			return "", false, &ExecError{
+				Code:    "42601",
+				Pos:     pos,
+				Message: fmt.Sprintf("unrecognized subscription parameter: %q", name),
+			}
+		}
+		switch name {
+		case "slot_name":
+			if strings.EqualFold(val, "none") {
+				slotName, ok = "", true
+				continue
+			}
+			slotName, ok = val, true
+		case "binary", "two_phase", "disable_on_error",
+			"password_required", "run_as_owner", "failover":
+			if _, berr := defGetSubscriptionBoolean(name, val, pos); berr != nil {
+				return "", false, berr
+			}
+		case "streaming":
+			if _, serr := defGetStreamingMode(name, val, pos); serr != nil {
+				return "", false, serr
+			}
+		case "origin":
+			// subscriptioncmds.c:316-322 — 22023, as in the CREATE arm.
+			if !strings.EqualFold(val, logicalRepOriginNone) &&
+				!strings.EqualFold(val, logicalRepOriginAny) {
+				return "", false, &ExecError{
+					Code:    "22023",
+					Pos:     pos,
+					Message: fmt.Sprintf("unrecognized origin value: %q", val),
+				}
+			}
+		case "synchronous_commit":
+			// PG validates through set_config_option (subscriptioncmds.c:
+			// 229-231); the goopg GUC registry is not reachable from the DDL
+			// operator, so — exactly as in the CREATE arm — the value is
+			// accepted unvalidated (ledgered).
+		}
+	}
+	return slotName, ok, nil
+}
+
 func mustAlsoSetSubOpt(a, b string, pos int) error {
 	return &ExecError{
 		Code:    "42601",

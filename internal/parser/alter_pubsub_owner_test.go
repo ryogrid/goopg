@@ -173,3 +173,79 @@ func TestParsePublicationDDLForms(t *testing.T) {
 		t.Errorf("CREATE tables = %#v", stmts[0])
 	}
 }
+
+// TestParseAlterSubscriptionEscapeHatch pins the ALTER SUBSCRIPTION
+// escape-hatch trio (AlterSubscription's ALTER_SUBSCRIPTION_ENABLED and
+// ALTER_SUBSCRIPTION_OPTIONS kinds, subscriptioncmds.c): ENABLE, DISABLE,
+// and SET ( option = value … ), including the empty list that upstream
+// treats as a no-op. The compat no-op must keep swallowing the unmodelled
+// tails (SET PUBLICATION, REFRESH, SKIP, RENAME), and PUBLICATION must not
+// take the subscription-only ENABLE/SET arms.
+func TestParseAlterSubscriptionEscapeHatch(t *testing.T) {
+	enableCases := []struct {
+		sql     string
+		enabled bool
+	}{
+		{"ALTER SUBSCRIPTION mysub ENABLE", true},
+		{"ALTER SUBSCRIPTION mysub enable", true},
+		{"ALTER SUBSCRIPTION mysub DISABLE", false},
+	}
+	for _, tc := range enableCases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		e, ok := stmts[0].(*AlterSubscriptionEnableStmt)
+		if !ok {
+			t.Fatalf("%q: stmt type = %T, want *AlterSubscriptionEnableStmt", tc.sql, stmts[0])
+		}
+		if e.Name != "mysub" || e.Enabled != tc.enabled {
+			t.Errorf("%q: Name=%q Enabled=%v", tc.sql, e.Name, e.Enabled)
+		}
+	}
+	setCases := []struct {
+		sql  string
+		opts map[string]string
+	}{
+		{"ALTER SUBSCRIPTION mysub SET (slot_name = NONE)", map[string]string{"slot_name": "none"}},
+		{"ALTER SUBSCRIPTION mysub SET (slot_name = 'my_slot')", map[string]string{"slot_name": "my_slot"}},
+		{"ALTER SUBSCRIPTION mysub SET (binary = true, synchronous_commit = 'on')", map[string]string{"binary": "true", "synchronous_commit": "on"}},
+		{"ALTER SUBSCRIPTION mysub SET ()", map[string]string{}},
+	}
+	for _, tc := range setCases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		s, ok := stmts[0].(*AlterSubscriptionSetStmt)
+		if !ok {
+			t.Fatalf("%q: stmt type = %T, want *AlterSubscriptionSetStmt", tc.sql, stmts[0])
+		}
+		if s.Name != "mysub" || len(s.Options) != len(tc.opts) {
+			t.Fatalf("%q: Name=%q Options=%v, want %v", tc.sql, s.Name, s.Options, tc.opts)
+		}
+		for k, v := range tc.opts {
+			if s.Options[k] != v {
+				t.Errorf("%q: Options[%q] = %q, want %q", tc.sql, k, s.Options[k], v)
+			}
+		}
+	}
+	// The unmodelled tails, and PUBLICATION's non-take of the
+	// subscription-only arms, stay CompatNoop.
+	for _, sql := range []string{
+		"ALTER SUBSCRIPTION mysub SET PUBLICATION p2",
+		"ALTER SUBSCRIPTION mysub REFRESH PUBLICATION",
+		"ALTER SUBSCRIPTION mysub SKIP (lsn = '0/16B3740')",
+		"ALTER SUBSCRIPTION mysub RENAME TO othersub",
+		"ALTER PUBLICATION mypub ENABLE",
+		"ALTER PUBLICATION mypub DISABLE",
+	} {
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
+			t.Errorf("%q: stmt type = %T, want *CompatNoopStmt", sql, stmts[0])
+		}
+	}
+}

@@ -475,6 +475,44 @@ func (p *PubSub) SetSubscriptionOwner(name string, owner uint32, dbOid ...uint32
 	return nil
 }
 
+// SetSubscriptionEnabled flips a subscription's enabled flag. Returns
+// ErrSubscriptionNotFound when name is unknown. Backs ALTER SUBSCRIPTION
+// name ENABLE / DISABLE (AlterSubscription's ALTER_SUBSCRIPTION_ENABLED
+// kind). The apply launcher's reconcile stops the worker of a disabled
+// subscription and launches one for an enabled subscription on its next
+// pass (Wake makes that immediate).
+// dbOid is variadic (mirrors LookupSubscription); omitted defaults to
+// DefaultDBOid. M0119-0004.
+func (p *PubSub) SetSubscriptionEnabled(name string, enabled bool, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Enabled = enabled
+	return nil
+}
+
+// SetSubscriptionSlotName rewrites a subscription's slot name; "" is
+// slot_name = NONE (PG's NULL subslotname — the disassociation that lets a
+// subscription survive its publisher being unreachable forever, cf.
+// DropSubscriptionSlot's 08006 hint). Returns ErrSubscriptionNotFound when
+// name is unknown. Backs ALTER SUBSCRIPTION name SET (slot_name = ...).
+// dbOid is variadic (mirrors LookupSubscription).
+func (p *PubSub) SetSubscriptionSlotName(name string, slotName string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.SlotName = slotName
+	return nil
+}
+
 // DropSubscription removes a subscription. Returns
 // ErrSubscriptionNotFound when name is unknown. Tablesync rows
 // for the subscription are dropped at the same time so a

@@ -2466,7 +2466,7 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 		}
 	}
 	if p.acceptKeyword(KwWith) {
-		opts, err := p.parsePubSubWithList()
+		opts, err := p.parsePubSubWithList(false)
 		if err != nil {
 			return nil, err
 		}
@@ -2510,7 +2510,7 @@ func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
 		p.advance()
 	}
 	if p.acceptKeyword(KwWith) {
-		opts, err := p.parsePubSubWithList()
+		opts, err := p.parsePubSubWithList(false)
 		if err != nil {
 			return nil, err
 		}
@@ -2637,13 +2637,20 @@ func (p *parser) parseCreateAccessMethodTail(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
-// parsePubSubWithList parses `(key = value [, key = value …])`. Values
-// may be string literals, identifiers, or boolean keywords.
-func (p *parser) parsePubSubWithList() (map[string]string, error) {
+// parsePubSubWithList parses `(key = value [, key value …])`. Values
+// may be string literals, identifiers, or boolean keywords. allowEmpty
+// admits the empty list `()` — ALTER SUBSCRIPTION SET () is legal and a
+// no-op upstream (parse_subscription_options over an empty DefElem list);
+// CREATE WITH keeps it a parse error as before.
+func (p *parser) parsePubSubWithList(allowEmpty bool) (map[string]string, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after WITH")
 	}
 	out := map[string]string{}
+	if allowEmpty && p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		p.advance()
+		return out, nil
+	}
 	for {
 		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
 			return nil, p.errAtCur("expected option name in WITH list")
@@ -8812,6 +8819,28 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return &AlterSubscriptionOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
 		}
+		// ALTER SUBSCRIPTION name ENABLE | DISABLE (AlterSubscription's
+		// ALTER_SUBSCRIPTION_ENABLED kind; "enable"/"disable" are unreserved,
+		// taken as idents exactly like ALTER EVENT TRIGGER … ENABLE).
+		if pubSubKind == KwSubscription {
+			switch {
+			case p.acceptIdentKeyword("enable"):
+				return &AlterSubscriptionEnableStmt{pos: t.Pos, Name: name, Enabled: true}, nil
+			case p.acceptIdentKeyword("disable"):
+				return &AlterSubscriptionEnableStmt{pos: t.Pos, Name: name, Enabled: false}, nil
+			}
+			// ALTER SUBSCRIPTION name SET ( option = value [, ...] ).
+			// "set" is a registered keyword (KwSet), so it arrives as a
+			// TokenKeyword, not an ident. SET PUBLICATION / SET OWNER TO
+			// stay the compat no-op below.
+			if p.acceptKeyword(KwSet) && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts, err := p.parsePubSubWithList(true)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterSubscriptionSetStmt{pos: t.Pos, Name: name, Options: opts}, nil
+			}
+		}
 		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].
 		// Other ADD/SET/DROP forms (SET (option ...), TABLES IN SCHEMA) stay
 		// the compat no-op below.
@@ -8826,7 +8855,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				action = "drop"
 			}
 			if action == "set" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				opts, err := p.parsePubSubWithList()
+				opts, err := p.parsePubSubWithList(false)
 				if err != nil {
 					return nil, err
 				}

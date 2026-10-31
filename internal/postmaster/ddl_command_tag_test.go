@@ -51,6 +51,8 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"drop publication", `DROP PUBLICATION pub`, "DROP PUBLICATION"},
 		{"create subscription", `CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p`, "CREATE SUBSCRIPTION"},
 		{"alter subscription owner", `ALTER SUBSCRIPTION s OWNER TO postgres`, "ALTER SUBSCRIPTION"},
+		{"alter subscription disable", `ALTER SUBSCRIPTION s DISABLE`, "ALTER SUBSCRIPTION"},
+		{"alter subscription set slot", `ALTER SUBSCRIPTION s SET (slot_name = NONE)`, "ALTER SUBSCRIPTION"},
 		{"drop subscription", `DROP SUBSCRIPTION s`, "DROP SUBSCRIPTION"},
 		{"create access method", `CREATE ACCESS METHOD am2 TYPE TABLE HANDLER heap_tableam_handler`, "CREATE ACCESS METHOD"},
 		{"alter operator set", `ALTER OPERATOR === (int4, int4) SET (RESTRICT = eqsel)`, "ALTER OPERATOR"},

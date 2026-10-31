@@ -209,6 +209,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterPublicationOptions(s)
 	case *parser.AlterSubscriptionOwnerStmt:
 		return nil, o.execAlterSubscriptionOwner(s)
+	case *parser.AlterSubscriptionEnableStmt:
+		return nil, o.execAlterSubscriptionEnable(s)
+	case *parser.AlterSubscriptionSetStmt:
+		return nil, o.execAlterSubscriptionSet(s)
 	case *parser.CreateEventTriggerStmt:
 		return nil, o.execCreateEventTrigger(s)
 	case *parser.AlterEventTriggerStmt:
@@ -1621,6 +1625,86 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
 		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 			return fmt.Errorf("pg_subscription heap write: %w", err)
+		}
+	}
+	return nil
+}
+
+// execAlterSubscriptionEnable handles ALTER SUBSCRIPTION name ENABLE /
+// DISABLE — AlterSubscription's ALTER_SUBSCRIPTION_ENABLED case
+// (subscriptioncmds.c:1337-1357). ENABLE on a subscription whose slot_name
+// is NONE is a prerequisite failure. The launcher kick (goopg's twin of
+// ApplyLauncherWakeupAtCommit) makes the reconcile pass stop the worker of
+// a DISABLED subscription and start one for an ENABLED one immediately;
+// PG leaves the disable-side stop to the launcher's next reload, goopg's
+// Wake stops it now, which is what releases the publisher slot ahead of a
+// following SET (slot_name = NONE) — the documented escape hatch (see
+// subscriptionSlotHooks' DROP 08006 hint).
+func (o *ddlOp) execAlterSubscriptionEnable(s *parser.AlterSubscriptionEnableStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	// subscriptioncmds.c:1344-1348.
+	if s.Enabled && sub.SlotName == "" {
+		return &ExecError{Code: "55000", Pos: s.Pos(), Message: "cannot enable subscription that does not have a slot name"}
+	}
+	if err := o.ctx.PubSub.SetSubscriptionEnabled(s.Name, s.Enabled, subDBOid); err != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subenabled.
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", err)
+		}
+	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
+	}
+	return nil
+}
+
+// execAlterSubscriptionSet handles ALTER SUBSCRIPTION name SET (...),
+// AlterSubscription's ALTER_SUBSCRIPTION_OPTIONS case
+// (subscriptioncmds.c:1157-1342). slot_name = NONE requires the
+// subscription to be disabled first (subscriptioncmds.c:1172-1178):
+// "The subscription must be disabled to allow slot_name as 'none',
+// otherwise, the apply worker will repeatedly try to stream the data
+// using that slot_name which neither exists on the publisher nor the
+// user will be allowed to create it." A name change is written straight
+// through (PG's namein write). The remaining options are validated and
+// accepted-not-modelled (parseAlterSubscriptionSetOptions). An empty list
+// is a no-op (PG rewrites the tuple unchanged).
+func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	slotName, slotSet, err := parseAlterSubscriptionSetOptions(s.Options, s.Pos())
+	if err != nil {
+		return err
+	}
+	if !slotSet {
+		return nil
+	}
+	if slotName == "" && sub.Enabled {
+		return &ExecError{Code: "55000", Pos: s.Pos(), Message: "cannot set slot_name = NONE for enabled subscription"}
+	}
+	if serr := o.ctx.PubSub.SetSubscriptionSlotName(s.Name, slotName, subDBOid); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subslotname.
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if herr := syncSubscriptionRow(o.ctx, sub.OID, sub); herr != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", herr)
 		}
 	}
 	return nil

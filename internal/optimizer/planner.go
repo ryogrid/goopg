@@ -343,7 +343,8 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
 		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt,
-		*parser.AlterPublicationOwnerStmt, *parser.AlterPublicationTablesStmt, *parser.AlterPublicationOptionsStmt, *parser.AlterSubscriptionOwnerStmt:
+		*parser.AlterPublicationOwnerStmt, *parser.AlterPublicationTablesStmt, *parser.AlterPublicationOptionsStmt, *parser.AlterSubscriptionOwnerStmt,
+		*parser.AlterSubscriptionEnableStmt, *parser.AlterSubscriptionSetStmt:
 		// M0008 logical-replication DDL flows through DDL too;
 		// the executor's DDL operator handles them by mutating
 		// the runtime's *catalog.PubSub registry. See

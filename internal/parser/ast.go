@@ -3097,6 +3097,33 @@ type AlterSubscriptionOwnerStmt struct {
 func (s *AlterSubscriptionOwnerStmt) Pos() int  { return s.pos }
 func (s *AlterSubscriptionOwnerStmt) stmtNode() {}
 
+// AlterSubscriptionEnableStmt — `ALTER SUBSCRIPTION name ENABLE | DISABLE`
+// (AlterSubscription's ALTER_SUBSCRIPTION_ENABLED kind, subscriptioncmds.c).
+// Enabled carries true for ENABLE, false for DISABLE.
+type AlterSubscriptionEnableStmt struct {
+	pos     int
+	Name    string
+	Enabled bool
+}
+
+func (s *AlterSubscriptionEnableStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionEnableStmt) stmtNode() {}
+
+// AlterSubscriptionSetStmt — `ALTER SUBSCRIPTION name SET ( option = value
+// [, ...] )` (ALTER_SUBSCRIPTION_OPTIONS). Options is the raw WITH-style
+// key/value map; slot_name is modelled (NONE disassociates the slot), the
+// remaining supported options are accepted-not-modelled like their CREATE
+// twins, and an unsupported key is 42601 "unrecognized subscription
+// parameter".
+type AlterSubscriptionSetStmt struct {
+	pos     int
+	Name    string
+	Options map[string]string
+}
+
+func (s *AlterSubscriptionSetStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionSetStmt) stmtNode() {}
+
 // CreateEventTriggerStmt — `CREATE EVENT TRIGGER name ON event
 //
 //	[WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]

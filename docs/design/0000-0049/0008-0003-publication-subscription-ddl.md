@@ -294,3 +294,53 @@ same=99, arm 24 MATCH). regress publication unaffected.
 are not implemented — the escape hatch PG documents for a subscription whose publisher is unreachable is
 unavailable, so a dummy-conninfo subscription in a test must be created fully disassociated; the apply worker
 does not confirm LSNs back on a DROP race; two-phase / streams / two\_phase options are accepted, not modelled.
+
+## Update 2026-10-31 — ALTER SUBSCRIPTION escape hatch: ENABLE / DISABLE / SET (slot\_name) (M0122-0014)
+
+- **The trio DROP's 08006 hint names.** The 2026-10-30 slot-lifecycle slice left DROP SUBSCRIPTION raising 08006
+  with PG's hint "use ALTER SUBSCRIPTION … DISABLE, then ALTER SUBSCRIPTION … SET (slot\_name = NONE)" — but
+  neither statement existed, so the documented escape hatch for a subscription whose publisher is unreachable was
+  unusable (ledgered 2026-10-30, item (a) of the slot-lifecycle row). This slice implements
+  AlterSubscription's `ALTER_SUBSCRIPTION_ENABLED` and `ALTER_SUBSCRIPTION_OPTIONS` kinds
+  (subscriptioncmds.c:1339-1357 and 1159-1341), so the sequence DISABLE → SET (slot\_name = NONE) → DROP
+  SUBSCRIPTION runs end to end against a publisher that never answers: DISABLE stops the apply worker
+  (launcher reconcile), the worker's exit releases the publisher slot, the NONE write disassociates it
+  ("" = NULL subslotname), and DROP sees `SlotName == ""` and skips the publisher call.
+- **Parser.** `AlterSubscriptionEnableStmt` / `AlterSubscriptionSetStmt` (ast.go), parsed in parseAlter's
+  subscription tail: `enable`/`disable` are unreserved, taken as idents exactly like ALTER EVENT TRIGGER … ENABLE;
+  `SET` requires a following `(` (KwSet arrives as a keyword token), so `SET PUBLICATION`, `REFRESH PUBLICATION`,
+  `SKIP (lsn …)`, `RENAME TO` and `OWNER TO` keep their existing arms (the compat no-op, and OWNER TO's real one).
+  `parsePubSubWithList` gains an `allowEmpty` flag for ALTER's `SET ()` — legal upstream (parse\_subscription\_options
+  over an empty DefElem list, the tuple is rewritten unchanged) — while CREATE's `WITH ()` stays a parse error.
+- **Registry + heap.** `PubSub.SetSubscriptionEnabled` / `SetSubscriptionSlotName` (pubsub.go) flip the row under
+  the registry mutex, mirroring SetSubscriptionOwner; the executor re-syncs the pg\_subscription heap row through
+  `syncSubscriptionRow` (subenabled / subslotname are rendered by `buildPGSubscriptionRow`), so the ALTER survives a
+  restart via `reloadSubscriptionsFromHeap` (cols 5 and 14).
+- **Executor arms, error-for-error (subscriptioncmds.c).** 42704 `subscription "x" does not exist` on both arms;
+  55000 "cannot enable subscription that does not have a slot name" (1344-1348 — a `slot_name = NONE` subscription
+  cannot be re-enabled); 55000 "cannot set slot\_name = NONE for enabled subscription" (1172-1178, PG's exact
+  two-part message); the option scan applies ALTER's own `supported_opts` (slot\_name, synchronous\_commit, binary,
+  streaming, two\_phase, disable\_on\_error, password\_required, run\_as\_owner, failover, origin — subscriptioncmds.c:
+  1159-1162), so the CREATE-only options (connect, create\_slot, enabled, copy\_data) are 42601 "unrecognized
+  subscription parameter", values run through CREATE's `defGet*` twins, origin keeps the 22023 arm. A new slot name
+  is written straight through as PG's `namein` write does — ALTER validates the slot name nowhere (PG validates at
+  START\_REPLICATION), unlike the CREATE arm's `validateReplicationSlotName`.
+- **Launcher kick.** ENABLE/DISABLE call `OnSubscriptionChange` (the apply launcher's Wake → reconcile: disabled
+  subs drop out of the enabled set, `reconcile` stops their workers, `!s.Enabled` guard). PG wakes at commit only
+  for ENABLE (subscriptioncmds.c:1355); goopg also wakes on DISABLE — the deviation the design records, because
+  the escape hatch needs the worker (and the publisher's slot lease) released *now*, not at the launcher's next
+  reload.
+- **Pins:** `TestParseAlterSubscriptionEscapeHatch` (statements + the no-op tails + PUBLICATION not taking the
+  subscription-only arms), `TestAlterSubscriptionEscapeHatch` (the error arms + the DISABLE→NONE sequence + the
+  accepted-not-modelled options + `SET ()` no-op), `TestPubSubSetSubscriptionEnabledAndSlot`, two
+  `TestDDLCommandTagMatchesPostgres` rows for the CommandComplete tag.
+
+**Movement:** none — subscription DDL; the plan instruments are blind to it (sf025 PLAN-SHAPE same=99, arm 24 MATCH).
+
+**Still open (ledgered):** the accepted-not-modelled options are validated then dropped — pg\_subscription renders
+defaults (subbinary f, substream f, subtwophasestate d, subsynccommit off, suborigin any) whatever ALTER SET wrote;
+synchronous\_commit is not validated through `set_config_option`; the namein 63-byte truncation and the
+"failover requires binary = true" check are not reproduced; ALTER SUBSCRIPTION … REFRESH PUBLICATION / SET / ADD /
+DROP PUBLICATION / RENAME TO / CONNECTION / SKIP stay compat no-ops (REFRESH needs AlterSubscription\_refresh's
+tablesync machinery); the apply worker still sends no standby status updates, so a live slot's confirmed\_flush
+stays at its initial value.

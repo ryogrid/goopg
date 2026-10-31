@@ -137,6 +137,56 @@ func TestPubSubDuplicateSubscriptionName(t *testing.T) {
 	}
 }
 
+// TestPubSubSetSubscriptionEnabledAndSlot pins the two ALTER SUBSCRIPTION
+// mutators: SetSubscriptionEnabled (ENABLE / DISABLE) and
+// SetSubscriptionSlotName (SET (slot_name = ...), "" = NONE). Both return
+// ErrSubscriptionNotFound on an unknown name and leave the row untouched.
+func TestPubSubSetSubscriptionEnabledAndSlot(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1"}, "s1", true); err != nil {
+		t.Fatal(err)
+	}
+	// CreateSubscription returns a snapshot copy (the registry hands out
+	// pointers via LookupSubscription); re-look-up after each mutator.
+	lookup := func() *Subscription {
+		s, ok := ps.LookupSubscription("s1")
+		if !ok {
+			t.Fatal("s1 not registered")
+		}
+		return s
+	}
+	if err := ps.SetSubscriptionEnabled("s1", false); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().Enabled {
+		t.Error("Enabled=true after DISABLE, want false")
+	}
+	if err := ps.SetSubscriptionEnabled("s1", true); err != nil {
+		t.Fatal(err)
+	}
+	if !lookup().Enabled {
+		t.Error("Enabled=false after ENABLE, want true")
+	}
+	if err := ps.SetSubscriptionSlotName("s1", "new_slot"); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().SlotName != "new_slot" {
+		t.Errorf("SlotName=%q want new_slot", lookup().SlotName)
+	}
+	if err := ps.SetSubscriptionSlotName("s1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().SlotName != "" {
+		t.Errorf("SlotName=%q want \"\" (NONE)", lookup().SlotName)
+	}
+	if err := ps.SetSubscriptionEnabled("nosuch", true); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Errorf("SetSubscriptionEnabled nosuch: err=%v want ErrSubscriptionNotFound", err)
+	}
+	if err := ps.SetSubscriptionSlotName("nosuch", "x"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Errorf("SetSubscriptionSlotName nosuch: err=%v want ErrSubscriptionNotFound", err)
+	}
+}
+
 // TestSubscriptionRelStateMachineHappyPath pins the canonical
 // upstream tablesync flow: i → d → s → r. Each AdvanceSubscriptionRel
 // returns the freshly-updated row with state + LSN bumped.

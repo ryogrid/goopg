@@ -8,6 +8,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -337,6 +338,134 @@ func TestAlterSubscriptionOwnerTo(t *testing.T) {
 	if sub.Owner != roleOID {
 		t.Errorf("sub.Owner = %d, want %d (new_sub_owner's OID)", sub.Owner, roleOID)
 	}
+}
+
+// wantExecErr asserts err is an *ExecError with the given code and a
+// message containing substr.
+func wantExecErr(t *testing.T, err error, code, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error %s %q, got nil", code, substr)
+	}
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != code {
+		t.Errorf("ExecError.Code = %q, want %q (err=%v)", ee.Code, code, err)
+	}
+	if !strings.Contains(ee.Message, substr) {
+		t.Errorf("message %q does not contain %q", ee.Message, substr)
+	}
+}
+
+// TestAlterSubscriptionEscapeHatch pins the escape-hatch trio that
+// DROP SUBSCRIPTION's 08006 hint names ("ALTER SUBSCRIPTION ... DISABLE" /
+// "SET (slot_name = NONE)") and that the 0008-0003 design doc lists as
+// CREATE/DROP's residual: ENABLE / DISABLE / SET (slot_name = ...).
+// Error arms mirror subscriptioncmds.c's AlterSubscription: 42704 for an
+// unknown name, 55000 "cannot enable subscription that does not have a
+// slot name" (1344-1348), 55000 "cannot set slot_name = NONE for enabled
+// subscription" (1172-1178), 42601 for an option outside ALTER's
+// supported set (parse_subscription_options), 22023 for a bad origin.
+func TestAlterSubscriptionEscapeHatch(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	create := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("runDDL %q: %v", sql, err)
+		}
+	}
+	// Enabled sub: default slot_name = subscription name "s".
+	create("CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1")
+	// Disabled sub created with slot_name = NONE (the escape-hatch end
+	// state; CREATE requires the companions enabled=false, create_slot=false
+	// — subscriptioncmds.c:399-440).
+	create("CREATE SUBSCRIPTION gone CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (connect = false, enabled = false, create_slot = false, slot_name = NONE)")
+
+	// ENABLE / DISABLE mutate Enabled; the no-slot arm refuses ENABLE.
+	// LookupSubscription returns a snapshot copy, so re-look-up after each
+	// ALTER.
+	subOf := func(name string) *catalog.Subscription {
+		s, ok := ctx.PubSub.LookupSubscription(name)
+		if !ok {
+			t.Fatalf("subscription %s not registered", name)
+		}
+		return s
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s DISABLE"); err != nil {
+		t.Fatalf("DISABLE: %v", err)
+	}
+	if subOf("s").Enabled {
+		t.Error("Enabled=true after DISABLE")
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s ENABLE"); err != nil {
+		t.Fatalf("ENABLE: %v", err)
+	}
+	if !subOf("s").Enabled {
+		t.Error("Enabled=false after ENABLE")
+	}
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION gone ENABLE"),
+		"55000", "cannot enable subscription that does not have a slot name")
+
+	// SET (slot_name = ...): rename writes straight through (PG's namein
+	// write, no slot-name validation on this path); NONE requires the
+	// sub disabled first — DISABLE then NONE runs (the documented
+	// sequence).
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (slot_name = 's_new')"); err != nil {
+		t.Fatalf("SET slot_name: %v", err)
+	}
+	if subOf("s").SlotName != "s_new" {
+		t.Errorf("SlotName = %q, want s_new", subOf("s").SlotName)
+	}
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (slot_name = NONE)"),
+		"55000", "cannot set slot_name = NONE for enabled subscription")
+	if subOf("s").SlotName != "s_new" {
+		t.Errorf("SlotName = %q after refused NONE, want s_new untouched", subOf("s").SlotName)
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s DISABLE"); err != nil {
+		t.Fatalf("DISABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (slot_name = NONE)"); err != nil {
+		t.Fatalf("DISABLED SET slot_name = NONE: %v", err)
+	}
+	if subOf("s").SlotName != "" {
+		t.Errorf("SlotName = %q, want \"\" (NONE)", subOf("s").SlotName)
+	}
+
+	// Option validation arms: ALTER's supported set rejects CREATE-only
+	// options as unrecognized (PG's per-call supported_opts), values run
+	// through CREATE's defGet* twins, and an empty list is a no-op.
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (connect = false)"),
+		"42601", "unrecognized subscription parameter")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (enabled = true)"),
+		"42601", "unrecognized subscription parameter")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (foo = 'x')"),
+		"42601", "unrecognized subscription parameter: \"foo\"")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (binary = 'nope')"),
+		"42601", "binary requires a Boolean value")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (streaming = 'nope')"),
+		"42601", "streaming requires a Boolean value")
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (origin = 'nope')"),
+		"22023", "unrecognized origin value")
+	// Accepted-not-modelled options validate and succeed; an empty list
+	// changes nothing.
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s SET (synchronous_commit = 'remote_apply', binary = true, two_phase = false, origin = any)"); err != nil {
+		t.Fatalf("accepted-not-modelled SET: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s SET ()"); err != nil {
+		t.Fatalf("empty SET list: %v", err)
+	}
+	if s2 := subOf("s"); s2.SlotName != "" || s2.Enabled {
+		t.Errorf("state after SET (): SlotName=%q Enabled=%v, want \"\"/false preserved by the no-op (sub was disabled above)", s2.SlotName, s2.Enabled)
+	}
+
+	// Unknown subscription name is 42704 on both arms.
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION nosuch ENABLE"), "42704", `subscription "nosuch" does not exist`)
+	wantExecErr(t, runDDL(t, ctx, "ALTER SUBSCRIPTION nosuch SET (slot_name = 'x')"), "42704", `subscription "nosuch" does not exist`)
 }
 
 // TestCheckCmdReplicaIdentity pins CheckCmdReplicaIdentity
