@@ -1,17 +1,17 @@
 package optimizer
 
 import (
-	"reflect"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/parser/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/parser/analyzer"
 )
 
 // viewPlanDepth is a goroutine-local-ish counter that prevents infinite
@@ -1488,10 +1488,10 @@ func planSelectWithSettings(s *parser.SelectStmt, cat catalog.Catalog, plannerSe
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = nil
 			}
-		// A-01(ii) cut 2: shares the statement scope (see left branch above).
-		// B-12e: and the statement's settings (plannerSet) — same
-		// hand-threading as the left branch.
-		right, rerr := planSelectWithSettings(seg.stmt, cat, plannerSet, scope)
+			// A-01(ii) cut 2: shares the statement scope (see left branch above).
+			// B-12e: and the statement's settings (plannerSet) — same
+			// hand-threading as the left branch.
+			right, rerr := planSelectWithSettings(seg.stmt, cat, plannerSet, scope)
 			if seg.cutAt != nil {
 				seg.cutAt.SetOp = savedSetOps[i+1] // restore for plan-cache
 			}
@@ -4851,54 +4851,54 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 				// will re-evaluate at plan-finalisation time
 				// when bindings are rebuilt.
 			} else {
-			switch jn.Type {
-			case JoinTypeInner, JoinTypeLeft:
-				jn.Algo = JoinAlgoHash
-			case JoinTypeAnti:
-				// R40/K69: ANTI became reachable here when demotedForPlan
-				// started transplanting the S9.3 LEFT->ANTI verdict. This
-				// switch had no ANTI arm, so the join kept the nested-loop
-				// default and probed the inner index once per outer row —
-				// 1.4M descents on TPC-DS Q78's store_sales arm, measured at
-				// 16s -> 54s. Hash is the same algorithm `unnest.go` already
-				// builds its own SEMI/ANTI joins with (JoinAlgoHash), so this
-				// is an exercised executor path, not a new one. PG picks a
-				// Merge Anti Join for this shape; choosing between hash and
-				// merge on cost is join-METHOD parity and stays out of scope
-				// here — what this arm fixes is the absence of any choice.
-				// SEMI is deliberately absent: mapJoinType never emits it
-				// (applyDemotion produces no SEMI verdict), so an arm for it
-				// would be unreachable.
-				jn.Algo = JoinAlgoHash
-			case JoinTypeRight, JoinTypeFull:
-				// RIGHT and FULL take merge. M0127-P4.2's hash-or-merge
-				// choice for them sat behind GOOPG_HASH_OUTER_JOIN (default
-				// off) and was retired by M0147-0014: neither arm is PG's
-				// add_paths_to_joinrel — the PG-shaped search prices hash
-				// and merge for these types itself, and this post-search
-				// assignment serves only the trees it did not build.
-				jn.Algo = JoinAlgoMerge
-			}
-			// INNER joins: let the cost model pick when both sides
-			// have row estimates. Hash stays the M0003 fallback
-			// when either side is unanalysed.
-			if jn.Type == JoinTypeInner {
-				lRows := EstimateRows(jn.Left)
-				rRows := EstimateRows(jn.Right)
-				if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
-					jn.Algo = algo
+				switch jn.Type {
+				case JoinTypeInner, JoinTypeLeft:
+					jn.Algo = JoinAlgoHash
+				case JoinTypeAnti:
+					// R40/K69: ANTI became reachable here when demotedForPlan
+					// started transplanting the S9.3 LEFT->ANTI verdict. This
+					// switch had no ANTI arm, so the join kept the nested-loop
+					// default and probed the inner index once per outer row —
+					// 1.4M descents on TPC-DS Q78's store_sales arm, measured at
+					// 16s -> 54s. Hash is the same algorithm `unnest.go` already
+					// builds its own SEMI/ANTI joins with (JoinAlgoHash), so this
+					// is an exercised executor path, not a new one. PG picks a
+					// Merge Anti Join for this shape; choosing between hash and
+					// merge on cost is join-METHOD parity and stays out of scope
+					// here — what this arm fixes is the absence of any choice.
+					// SEMI is deliberately absent: mapJoinType never emits it
+					// (applyDemotion produces no SEMI verdict), so an arm for it
+					// would be unreachable.
+					jn.Algo = JoinAlgoHash
+				case JoinTypeRight, JoinTypeFull:
+					// RIGHT and FULL take merge. M0127-P4.2's hash-or-merge
+					// choice for them sat behind GOOPG_HASH_OUTER_JOIN (default
+					// off) and was retired by M0147-0014: neither arm is PG's
+					// add_paths_to_joinrel — the PG-shaped search prices hash
+					// and merge for these types itself, and this post-search
+					// assignment serves only the trees it did not build.
+					jn.Algo = JoinAlgoMerge
 				}
-				// Build-side selection: when the cost-driven (or
-				// rule-driven) algorithm landed on hash, build on
-				// the smaller side. LEFT joins keep the right-as-
-				// build default because the executor's outer-row
-				// emission walks the left (preserved) side as the
-				// probe stream.
-				if jn.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
-					jn.BuildLeft = true
+				// INNER joins: let the cost model pick when both sides
+				// have row estimates. Hash stays the M0003 fallback
+				// when either side is unanalysed.
+				if jn.Type == JoinTypeInner {
+					lRows := EstimateRows(jn.Left)
+					rRows := EstimateRows(jn.Right)
+					if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+						jn.Algo = algo
+					}
+					// Build-side selection: when the cost-driven (or
+					// rule-driven) algorithm landed on hash, build on
+					// the smaller side. LEFT joins keep the right-as-
+					// build default because the executor's outer-row
+					// emission walks the left (preserved) side as the
+					// probe stream.
+					if jn.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
+						jn.BuildLeft = true
+					}
 				}
 			}
-		}
 		} // close else from allLeavesAreTableScans guard
 		// M0145-0005 slice 3: record the link + right leaf (or fold the
 		// table to one opaque leaf for a non-descendable join type).
@@ -4928,14 +4928,20 @@ func groupedJoinSourceBindings(rv parser.RangeVar, cat catalog.Catalog, out Sche
 	item := rv.Subquery.FromExprs[0]
 	rvars := append([]parser.RangeVar{item.Base}, func() []parser.RangeVar {
 		x := make([]parser.RangeVar, len(item.Joins))
-		for i := range item.Joins { x[i] = item.Joins[i].Right }
+		for i := range item.Joins {
+			x[i] = item.Joins[i].Right
+		}
 		return x
 	}()...)
 	bindings := make([]rangeBinding, 0, len(rvars))
 	for source, inner := range rvars {
-		if inner.Subquery != nil || inner.TableFunc != nil { return nil, false }
+		if inner.Subquery != nil || inner.TableFunc != nil {
+			return nil, false
+		}
 		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: inner.Schema, Name: inner.Name})
-		if !ok { return nil, false }
+		if !ok {
+			return nil, false
+		}
 		b := rangeBinding{table: tbl, alias: inner.Alias, sourceIdx: int16(source + 1), columnOffsets: make(map[string]int)}
 		for _, c := range tbl.Columns {
 			for idx, sc := range out {
@@ -4962,7 +4968,9 @@ func groupedJoinSourceBindings(rv parser.RangeVar, cat catalog.Catalog, out Sche
 }
 
 func bindingColumnOffset(b rangeBinding, i int, name string) int {
-	if idx, ok := b.columnOffsets[strings.ToLower(name)]; ok { return idx }
+	if idx, ok := b.columnOffsets[strings.ToLower(name)]; ok {
+		return idx
+	}
 	return b.offset + i
 }
 
@@ -5009,9 +5017,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// DML CTE: rows are materialized at runtime in
 				// ctx.MaterializedCTEs; use MaterializedCTEScan.
 				scan := &MaterializedCTEScan{
-					pos:    rv.Pos(),
-					Name:   ce.name,
-					Alias:  alias,
+					pos:       rv.Pos(),
+					Name:      ce.name,
+					Alias:     alias,
 					schema:    ce.schema,
 					RTID:      rtid,
 					SourceIdx: sourceIdx,
@@ -5026,10 +5034,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			// inlining, which is the safe direction. M0125-0035.
 			ce.refs++
 			scan := &CTEScan{
-				pos:    rv.Pos(),
-				Name:   ce.name,
-				Alias:  alias,
-				Child:  ce.body,
+				pos:       rv.Pos(),
+				Name:      ce.name,
+				Alias:     alias,
+				Child:     ce.body,
 				schema:    cteRefSchema(ce.schema, sourceIdx),
 				cte:       ce,
 				RTID:      rtid,
@@ -5444,7 +5452,6 @@ func remapSubqueryColumnRefs(n Node) Node {
 	return n
 }
 
-
 // containsSetOp reports whether the plan subtree rooted at n contains
 // a SetOp or RecursiveUnion node.  Hash-join conversion must be skipped
 // when a join side contains a set operation because the column indices
@@ -5483,7 +5490,6 @@ func containsSetOp(n Node) bool {
 	}
 	return false
 }
-
 
 // collectInheritanceDescendants performs a breadth-first traversal of the
 // inheritance tree rooted at parentOID and returns all descendants in BFS
@@ -8959,7 +8965,6 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		}
 	}
 
-
 	// C-18 (P4-09): the WINDOW upper rel's one path over the whole chain.
 	// The producer returns a fresh chain of `*WindowAgg`s with the same specs
 	// over the same input (single candidate ⇒ field-for-field the nodes built
@@ -10136,23 +10141,23 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// (see buildWindowStage).
 	outputCtx.rtScope = rtableScopeFrom(inputCtx)
 	surface := &aggregateSurface{
-		input:               inputCtx,
-		output:              outputCtx,
-		groupByExpr:         groupByExpr,
-		groupByInputCol:     groupByInputCol,
-		groupByMergedByName: groupByMergedByName,
-		groupByAmbiguous:    groupByAmbiguous,
-		groupByExprQual:     groupByExprQual,
-		aggregateByKey:      aggByKey,
-		aggregateAmbiguous:  aggAmbiguous,
-		aggregateByKeyQual:  aggByKeyQual,
-		groupingCallCol:     groupingCallCol,
-		groupCommonSlots:    groupCommonSlots,
-		node:                    aggNode,
-		funcDepCols:             map[int]int{},
+		input:                  inputCtx,
+		output:                 outputCtx,
+		groupByExpr:            groupByExpr,
+		groupByInputCol:        groupByInputCol,
+		groupByMergedByName:    groupByMergedByName,
+		groupByAmbiguous:       groupByAmbiguous,
+		groupByExprQual:        groupByExprQual,
+		aggregateByKey:         aggByKey,
+		aggregateAmbiguous:     aggAmbiguous,
+		aggregateByKeyQual:     aggByKeyQual,
+		groupingCallCol:        groupingCallCol,
+		groupCommonSlots:       groupCommonSlots,
+		node:                   aggNode,
+		funcDepCols:            map[int]int{},
 		originalGroupInputCols: originalGroupInputCols,
-		prunedInputCols:         prunedInputCols,
-		cat:                     cat,
+		prunedInputCols:        prunedInputCols,
+		cat:                    cat,
 	}
 
 	var having Expr
@@ -12274,6 +12279,7 @@ func seqWinsEqualityProbe(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.
 	// this round exists for.
 	return seqCost.Total < idxCost.Total
 }
+
 // planIsBareSeqScanTree reports whether `n` is a single-relation scan tree
 // that reached no index path at all — a `*SeqScan` under nothing but
 // recognised, index-neutral wrappers.
@@ -12620,27 +12626,29 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		s.Limit != nil || s.Offset != nil {
 		return nil, false, nil
 	}
-	// M0148-0001c slice (b): the tlist length is NOT a planagg.c gate. It
+	// M0148-0001c slices (b)/(c): the tlist length is NOT a planagg.c gate. It
 	// loops the min/max aggs of root->agginfos (planagg.c:160-183, one InitPlan
 	// per agg) and create_minmaxagg_plan's tlist keeps EVERY non-aggregate
 	// entry beside the InitPlan Params (createplan.c:2588-2612:
 	// `make_result(tlist, quals, NULL)` over the surviving tlist). aggregates.sql's
 	// `select max(unique2), generate_series(1,3) as g from tenk1 order by g desc`
 	// (expected block postgres/src/test/regress/expected/aggregates.out:1169-1180)
-	// is exactly that shape. Scope bound for this slice (ledgered): EXACTLY ONE
-	// strict min/max agg target — a multi-agg tlist needs N InitPlans numbered
-	// as one list, and the claimLevelInitPlans ordering is only proven for one —
-	// and jointree-surviving non-agg targets (validated below).
-	aggIdx := -1
+	// is the one-agg form; the minmaxtest block (aggregates.out:1069-1092) is the
+	// two-agg form (`select min(f1), max(f1) from minmaxtest`, InitPlan 1 +
+	// InitPlan 2 over one childless Result). Every min/max target must be a
+	// STRICT per-agg shape (can_minmax_aggs, planagg.c:236-306 via
+	// strictMinMaxTarget); a tlist carrying a min/max-named call that is not the
+	// built-in shape (DISTINCT, FILTER, window, …) declines the whole rewrite.
+	var aggIdx []int
 	for i, t := range s.Targets {
 		if _, isMM := strictMinMaxTarget(t.Expr); isMM {
-			if aggIdx >= 0 {
-				return nil, false, nil
-			}
-			aggIdx = i
+			aggIdx = append(aggIdx, i)
+		} else if fc, isCall := t.Expr.(*parser.FuncCall); isCall &&
+			(strings.EqualFold(fc.Name.Name, "min") || strings.EqualFold(fc.Name.Name, "max")) {
+			return nil, false, nil
 		}
 	}
-	if aggIdx < 0 {
+	if len(aggIdx) == 0 {
 		return nil, false, nil
 	}
 	// planagg.c:121-137: the jointree must collapse to ONE RTE_RELATION. The
@@ -12689,7 +12697,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// decline to the ordinary Aggregate path.
 	survivors := make([]Expr, len(s.Targets))
 	for i, t := range s.Targets {
-		if i == aggIdx {
+		if intHas(aggIdx, i) {
 			continue
 		}
 		e, ok := minmaxTListSurvivor(t.Expr, ctx)
@@ -12699,26 +12707,128 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		survivors[i] = e
 	}
 
-	t := s.Targets[aggIdx]
-	fc, ok := t.Expr.(*parser.FuncCall)
-	if !ok {
-		return nil, false, nil
+	// One InitPlan per strict min/max target, in tlist order (planagg.c:160-183
+	// walks root->agginfos in the order preprocessing_minmax_aggregates
+	// collected them, i.e. the tlist order: InitPlan 1 = the FIRST agg). Each
+	// build re-resolves the WHERE inside the builder: the IOS cond remap below
+	// rewrites ColumnRef coordinates into covered-index space, so the resolved
+	// predicate Expr must not be shared across InitPlans.
+	pos := s.Pos()
+	initExprs := make([]Expr, 0, len(aggIdx))
+	aggCols := make([]SchemaColumn, 0, len(aggIdx))
+	for _, ai := range aggIdx {
+		t := s.Targets[ai]
+		fc, isCall := t.Expr.(*parser.FuncCall)
+		if !isCall {
+			return nil, false, nil
+		}
+		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, fc, &t)
+		if berr != nil {
+			return nil, false, berr
+		}
+		if !ok {
+			return nil, false, nil
+		}
+		initExprs = append(initExprs, init)
+		aggCols = append(aggCols, sc)
 	}
+	// ---- gate tail: assemble the rewritten top node (createplan.c:2546-2612
+	// create_minmaxagg_plan) ----
+	if len(s.Targets) == 1 {
+		return &Result{pos: pos, Targets: []Expr{initExprs[0]},
+			schema: Schema{{Name: aggCols[0].Name, Type: aggCols[0].Type}}}, true, nil
+	}
+	resTargets := make([]Expr, 0, len(s.Targets))
+	resSchema := make(Schema, 0, len(s.Targets))
+	// The ProjectSet's OtherExprs (its non-SRF target expressions): the agg
+	// slots and the const slots read the Result's row by position; an SRF slot
+	// is nil, which is the executor's marker for "filled from SrfCols"
+	// (operators_project_set.go, as buildSelectSrfProjectSet builds it).
+	other := make([]Expr, len(s.Targets))
+	psSchema := make(Schema, len(s.Targets))
+	var srfCols []SrfCol
+	nextAgg := 0
+	for i, t := range s.Targets {
+		if nextAgg < len(aggIdx) && aggIdx[nextAgg] == i {
+			sc := aggCols[nextAgg]
+			other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: sc.Name, Type: sc.Type}
+			resTargets = append(resTargets, initExprs[nextAgg])
+			resSchema = append(resSchema, sc)
+			psSchema[i] = sc
+			nextAgg++
+			continue
+		}
+		name := t.Alias
+		if name == "" {
+			if fc, ok := t.Expr.(*parser.FuncCall); ok && fc.Name.Schema == "" {
+				name = strings.ToLower(fc.Name.Name)
+			} else {
+				name = exprOutputName(t.Expr)
+			}
+		}
+		e := survivors[i]
+		if fc, isGS := e.(*FuncCall); isGS && len(fc.Args) >= 2 {
+			// A tlist SRF is NOT a Result target to evaluate: PG leaves the
+			// funcexpr in the Result's tlist and sets a ProjectSet ABOVE it
+			// (createplan.c's MinMaxAggPath tlist keeps the funcexpr; the
+			// ProjectSet expands it against the childless Result's single
+			// row). goopg's SrfCol carries the resolved args instead.
+			sc := SrfCol{ColIdx: i, Start: fc.Args[0], Stop: fc.Args[1]}
+			if len(fc.Args) == 3 {
+				sc.Step = fc.Args[2]
+			}
+			srfCols = append(srfCols, sc)
+			// Element type: the select-list SRF mode's int8 (the builder's
+			// generate_series default at ~6808) — the zip emits int64 datums.
+			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			continue
+		}
+		other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: name, Type: exprType(e)}
+		resTargets = append(resTargets, e)
+		resSchema = append(resSchema, SchemaColumn{Name: name, Type: exprType(e)})
+		psSchema[i] = SchemaColumn{Name: name, Type: exprType(e)}
+	}
+	res := &Result{pos: pos, Targets: resTargets, schema: resSchema}
+	if len(srfCols) == 0 {
+		// Const-only extras: the childless Result emits them in its one row.
+		// PG adds the ProjectSet only when the tlist holds a set-returning
+		// expr (createplan.c's tlist SRF split), so no ProjectSet here.
+		return res, true, nil
+	}
+	return &ProjectSet{pos: pos, Child: res, SrfCols: srfCols,
+		OtherExprs: other, schema: psSchema}, true, nil
+}
+
+// buildMinMaxInitPlan implements build_minmax_path (planagg.c:316-448) for ONE
+// strict min/max target of rewriteMinMaxAggregates: the InitPlan subquery
+// `SELECT <arg> FROM t WHERE <arg> IS NOT NULL [AND <where>] ORDER BY <arg>
+// <ASC NULLS LAST | DESC NULLS FIRST> LIMIT 1` — the IOS / composite-prefix /
+// SeqScan / const-Result shapes below — returned as the non-correlated scalar
+// SubqueryExpr plus its output column. PG names the minmaxagg TLE after the
+// aggregate (`min`/`max`) unless the tlist supplied an alias. ok=false mirrors
+// build_minmax_path returning false (no MinMaxAggPath): the gate then keeps
+// the ordinary Aggregate path; resolve errors propagate.
+//
+// The WHERE qual is resolved INSIDE this builder (not threaded from the gate):
+// the IOS cond remap rewrites ColumnRef Index values into covered-index
+// coordinates, so one resolved Expr shared across two InitPlans (slice (c):
+// `min(f1), max(f1)` over one table) would be remapped twice.
+func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, fc *parser.FuncCall, t *parser.ResTarget) (Expr, SchemaColumn, bool, error) {
 	// min → forward IOS (isMax=false); max → Backward IOS (isMax=true).
 	if fc.Name.Schema != "" {
-		return nil, false, nil
+		return nil, SchemaColumn{}, false, nil
 	}
 	isMax := false
 	if strings.EqualFold(fc.Name.Name, "max") {
 		isMax = true
 	} else if !strings.EqualFold(fc.Name.Name, "min") {
-		return nil, false, nil
+		return nil, SchemaColumn{}, false, nil
 	}
 	// Per-agg reject (can_minmax_aggs, planagg.c:236-306): arg count,
 	// DISTINCT, ORDER BY, FILTER, window, WITHIN GROUP, star.
 	if len(fc.Args) != 1 || fc.Star || fc.Distinct || fc.Over != nil ||
 		fc.Filter != nil || len(fc.OrderBy) > 0 || len(fc.WithinGroup) > 0 {
-		return nil, false, nil
+		return nil, SchemaColumn{}, false, nil
 	}
 	pos := s.Pos()
 
@@ -12728,14 +12838,14 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// resolved value IS the target (`SELECT 100 …`, planagg.c build_minmax_path).
 	argExpr, err := resolveExpr(fc.Args[0], ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, SchemaColumn{}, false, err
 	}
 	// S6 Slice 3d: the arg may be a plain column Var or a constant expression
 	// (`max(100)`, aggregates.sql block 14). Anything else — e.g. an expression
 	// over a column like min(x + 1) — keeps the ordinary Aggregate path.
 	argCR, isColumn := argExpr.(*ColumnRef)
 	if !isColumn && !isConstantExpr(argExpr) {
-		return nil, false, nil
+		return nil, SchemaColumn{}, false, nil
 	}
 	// Hoisted so the column and constant branches (below) can both assign them
 	// and the shared top-level wrap can read them.
@@ -12759,7 +12869,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	if s.Where != nil {
 		wherePred, err = resolveExpr(s.Where, ctx)
 		if err != nil {
-			return nil, false, err
+			return nil, SchemaColumn{}, false, err
 		}
 		walkExprTree(wherePred, func(e Expr) {
 			if _, ok := e.(*OuterColumnRef); ok {
@@ -12778,7 +12888,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			// descend into nested plans.
 			deeper, ok := deepenOuterRefs(wherePred)
 			if !ok {
-				return nil, false, nil
+				return nil, SchemaColumn{}, false, nil
 			}
 			wherePred = deeper
 		}
@@ -12834,7 +12944,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
 			if !ok {
-				return nil, false, nil
+				return nil, SchemaColumn{}, false, nil
 			}
 			cond := Expr(isNotNullIOS)
 			if wherePred != nil {
@@ -12893,7 +13003,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 					if name != argCR.Name {
 						col, ok := cat.LookupColumn(tbl, name)
 						if !ok {
-							return nil, false, nil
+							return nil, SchemaColumn{}, false, nil
 						}
 						colTypeForName = col.Type
 					}
@@ -12964,7 +13074,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 			// keeps the Aggregate; the Sort fallback below is reached only when
 			// such an index exists but the index-only probe declined (PG would
 			// take that index path — ledgered).
-			return nil, false, nil
+			return nil, SchemaColumn{}, false, nil
 		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
@@ -13006,11 +13116,11 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		// arg would need a Filter above the scan — out of scope, stays on the
 		// Aggregate path) and the constant has a resolvable type.
 		if wherePred != nil {
-			return nil, false, nil
+			return nil, SchemaColumn{}, false, nil
 		}
 		ct, ok := ExprResultType(argExpr)
 		if !ok {
-			return nil, false, nil // untyped constant (e.g. NULL literal)
+			return nil, SchemaColumn{}, false, nil // untyped constant (e.g. NULL literal)
 		}
 		colType = ct
 		otf := &IsNullExpr{pos: pos, Operand: argExpr, Negated: true}
@@ -13028,69 +13138,17 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// (executor/expr.go evalSubquery; subplan.go header).
 	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: !correlated, ParamInitPlan: correlated}
 
-	// The childless Result top node (T_Result, nodeResult.c): one row whose
-	// targets are the InitPlan value and — for a multi-target tlist
-	// (M0148-0001c slice (b)) — the jointree-surviving non-agg entries, the
-	// whole surviving tlist of createplan.c's `make_result(tlist, quals, NULL)`
-	// (createplan.c:2588-2612).
-	if len(s.Targets) == 1 {
-		return &Result{pos: pos, Targets: []Expr{init},
-			schema: Schema{{Name: label, Type: colType}}}, true, nil
-	}
-	resTargets := []Expr{init}
-	resSchema := Schema{{Name: label, Type: colType}}
-	// The ProjectSet's OtherExprs (its non-SRF target expressions): the agg
-	// slot and the const slots read the Result's row by position; an SRF slot
-	// is nil, which is the executor's marker for "filled from SrfCols"
-	// (operators_project_set.go, as buildSelectSrfProjectSet builds it).
-	other := make([]Expr, len(s.Targets))
-	psSchema := make(Schema, len(s.Targets))
-	var srfCols []SrfCol
-	for i, t := range s.Targets {
-		if i == aggIdx {
-			other[i] = &ColumnRef{pos: pos, Index: 0, Name: label, Type: colType}
-			psSchema[i] = SchemaColumn{Name: label, Type: colType}
-			continue
+	return init, SchemaColumn{Name: label, Type: colType}, true, nil
+}
+
+// intHas reports whether i appears in the sorted index list xs.
+func intHas(xs []int, i int) bool {
+	for _, x := range xs {
+		if x == i {
+			return true
 		}
-		name := t.Alias
-		if name == "" {
-			if fc, ok := t.Expr.(*parser.FuncCall); ok && fc.Name.Schema == "" {
-				name = strings.ToLower(fc.Name.Name)
-			} else {
-				name = exprOutputName(t.Expr)
-			}
-		}
-		e := survivors[i]
-		if fc, isGS := e.(*FuncCall); isGS && len(fc.Args) >= 2 {
-			// A tlist SRF is NOT a Result target to evaluate: PG leaves the
-			// funcexpr in the Result's tlist and sets a ProjectSet ABOVE it
-			// (createplan.c's MinMaxAggPath tlist keeps the funcexpr; the
-			// ProjectSet expands it against the childless Result's single
-			// row). goopg's SrfCol carries the resolved args instead.
-			sc := SrfCol{ColIdx: i, Start: fc.Args[0], Stop: fc.Args[1]}
-			if len(fc.Args) == 3 {
-				sc.Step = fc.Args[2]
-			}
-			srfCols = append(srfCols, sc)
-			// Element type: the select-list SRF mode's int8 (the builder's
-			// generate_series default at ~6808) — the zip emits int64 datums.
-			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
-			continue
-		}
-		other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: name, Type: exprType(e)}
-		resTargets = append(resTargets, e)
-		resSchema = append(resSchema, SchemaColumn{Name: name, Type: exprType(e)})
-		psSchema[i] = SchemaColumn{Name: name, Type: exprType(e)}
 	}
-	res := &Result{pos: pos, Targets: resTargets, schema: resSchema}
-	if len(srfCols) == 0 {
-		// Const-only extras: the childless Result emits them in its one row.
-		// PG adds the ProjectSet only when the tlist holds a set-returning
-		// expr (createplan.c's tlist SRF split), so no ProjectSet here.
-		return res, true, nil
-	}
-	return &ProjectSet{pos: pos, Child: res, SrfCols: srfCols,
-		OtherExprs: other, schema: psSchema}, true, nil
+	return false
 }
 
 // strictMinMaxTarget reports whether a SELECT target expression is a bare,
@@ -13181,26 +13239,35 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 	if len(s.OrderBy) == 0 && !s.Distinct {
 		return rewritten, true
 	}
-	// The gate (rewriteMinMaxAggregates) already proved the tlist holds
-	// exactly ONE strict min/max agg — M0148-0001c slice (b) generalized the
-	// old len(Targets)==1-and-its-Expr-is-min/max gate — so re-scan for it
-	// here rather than threading it through the function's return signature.
-	aggIdx := -1
-	var fc *parser.FuncCall
-	for i, t := range s.Targets {
+	// The gate (rewriteMinMaxAggregates) already proved every min/max target
+	// is a strict one — M0148-0001c slices (b)/(c) generalized the old
+	// single-agg gate (planagg.c:160-183 builds one InitPlan per agg) — so
+	// re-scan the tlist for the (FuncCall, output-label) pairs here rather
+	// than threading them through the function's return signature.
+	var aggFcs []*parser.FuncCall
+	var aggLabels []string
+	for _, t := range s.Targets {
 		if f, isMM := strictMinMaxTarget(t.Expr); isMM {
-			aggIdx = i
-			fc = f
+			aggFcs = append(aggFcs, f)
+			aggLabels = append(aggLabels, "") // filled from outSchema below
 		}
 	}
-	if aggIdx < 0 {
+	if len(aggFcs) == 0 {
 		return nil, false
 	}
 	outSchema := rewritten.Output()
 	if len(outSchema) != len(s.Targets) {
 		return nil, false
 	}
-	label := outSchema[aggIdx].Name
+	{
+		k := 0
+		for i, t := range s.Targets {
+			if f, isMM := strictMinMaxTarget(t.Expr); isMM && k < len(aggFcs) && aggFcs[k] == f {
+				aggLabels[k] = outSchema[i].Name
+				k++
+			}
+		}
+	}
 
 	out := rewritten
 	if len(s.OrderBy) > 0 {
@@ -13222,8 +13289,16 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 					return nil, false
 				}
 			}
-			substituted, ok := substituteMinMaxOrderByExpr(sb.Expr, fc, label)
-			if !ok {
+			var substituted parser.Expr
+			var matched bool
+			for k, fc := range aggFcs {
+				if sub, ok := substituteMinMaxOrderByExpr(sb.Expr, fc, aggLabels[k]); ok {
+					substituted = sub
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				// M0148-0001c slice (b): ORDER BY over a NON-agg target —
 				// aggregates.sql's `order by g desc` for
 				// `generate_series(1,3) as g`. transformSortClause resolves
@@ -13273,6 +13348,7 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 //  3. an expression that CONTAINS the FuncCall as a strict sub-expression
 //     (`ORDER BY max(unique2)+1`), which is substituted in place, keeping
 //     the rest of the expression (and any COLLATE wrapper) intact.
+//
 // Any other shape returns (nil, false) — the escape hatch.
 func substituteMinMaxOrderByExpr(e parser.Expr, fc *parser.FuncCall, label string) (parser.Expr, bool) {
 	if ic, ok := e.(*parser.IntegerConst); ok {
@@ -16745,19 +16821,19 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
-			case "regexp_instr", "regexp_count":
-				// pg_proc.dat oids 6254-6262: both prorettype int4. M0134-0070.
-				return catalog.Type{Name: "int4"}
-			case "regexp_like":
-				// pg_proc.dat oids 6263-6264: prorettype bool. M0134-0070.
-				return catalog.Type{Name: "bool"}
-			case "regexp_substr":
-				// pg_proc.dat oids 6265-6269: prorettype text. M0134-0070.
-				return catalog.Type{Name: "text"}
-			case "regexp_replace":
-				// pg_proc.dat oids 2284/2285/6251/6252/6253: prorettype text in
-				// all 5 overloads (3/4/5/6-arg). M0134-0070 Round F.
-				return catalog.Type{Name: "text"}
+		case "regexp_instr", "regexp_count":
+			// pg_proc.dat oids 6254-6262: both prorettype int4. M0134-0070.
+			return catalog.Type{Name: "int4"}
+		case "regexp_like":
+			// pg_proc.dat oids 6263-6264: prorettype bool. M0134-0070.
+			return catalog.Type{Name: "bool"}
+		case "regexp_substr":
+			// pg_proc.dat oids 6265-6269: prorettype text. M0134-0070.
+			return catalog.Type{Name: "text"}
+		case "regexp_replace":
+			// pg_proc.dat oids 2284/2285/6251/6252/6253: prorettype text in
+			// all 5 overloads (3/4/5/6-arg). M0134-0070 Round F.
+			return catalog.Type{Name: "text"}
 		case "array_agg":
 			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
 			if len(x.Args) > 0 {
@@ -19055,13 +19131,13 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			list[i] = remapColumnRefsToSchema(item, oldSchema, newIndex)
 		}
 		return &InExpr{
-			pos:             x.Pos(),
-			Operand:         remapColumnRefsToSchema(x.Operand, oldSchema, newIndex),
-			Negated:         x.Negated,
-			NotEqualAny:     x.NotEqualAny,
-			AnyOp:           x.AnyOp,
-			AllOp:           x.AllOp,
-			Plan:            x.Plan,
+			pos:         x.Pos(),
+			Operand:     remapColumnRefsToSchema(x.Operand, oldSchema, newIndex),
+			Negated:     x.Negated,
+			NotEqualAny: x.NotEqualAny,
+			AnyOp:       x.AnyOp,
+			AllOp:       x.AllOp,
+			Plan:        x.Plan,
 			// Subquery: a remap copies the SAME sublink, so the retained
 			// body still describes its Plan (M0142-0008a-3i-route-a).
 			Subquery:        x.Subquery,
@@ -19302,13 +19378,13 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			list[i] = shiftColumnRefsBy(item, delta)
 		}
 		return &InExpr{
-			pos:             x.Pos(),
-			Operand:         shiftColumnRefsBy(x.Operand, delta),
-			Negated:         x.Negated,
-			NotEqualAny:     x.NotEqualAny,
-			AnyOp:           x.AnyOp,
-			AllOp:           x.AllOp,
-			Plan:            x.Plan,
+			pos:         x.Pos(),
+			Operand:     shiftColumnRefsBy(x.Operand, delta),
+			Negated:     x.Negated,
+			NotEqualAny: x.NotEqualAny,
+			AnyOp:       x.AnyOp,
+			AllOp:       x.AllOp,
+			Plan:        x.Plan,
 			// Subquery: a remap copies the SAME sublink, so the retained
 			// body still describes its Plan (M0142-0008a-3i-route-a).
 			Subquery:        x.Subquery,
@@ -19659,7 +19735,6 @@ func findExprInTargets(re Expr, targets []Expr) int {
 	return -1
 }
 
-
 // modResultType is mod()'s result type over its argument types (pg_proc
 // mod(int2,int2) int2 / mod(int4,int4) int4 / mod(int8,int8) int8 /
 // mod(numeric,numeric) numeric). M0146-0044.
@@ -19696,4 +19771,3 @@ func modResultType(args []Expr) catalog.Type {
 	}
 	return catalog.Type{Name: "numeric"}
 }
-

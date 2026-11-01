@@ -168,10 +168,25 @@ func TestExplainMinMaxMultiTargetProjectSet(t *testing.T) {
 		t.Errorf("want [20|5], got %v", got)
 	}
 
-	// Scope bounds (deferral ledger): a multi-agg tlist and an aggregate
-	// extra keep the ordinary Aggregate path.
+	// M0148-0001c slice (c): the two-agg min/maxttest shape lands — TWO
+	// InitPlans (min forward, max Backward) over one childless Result, each
+	// InitPlan a Limit over the presorted IOS (aggregates.out:1069-1092).
+	pairPlan := strings.Join(renderRows(runSQL(t, ctx, "EXPLAIN (COSTS OFF) select min(u2), max(u2) from mmt")), "\n")
+	for _, want := range []string{"Result", "InitPlan 1", "InitPlan 2", "Limit", "Index Only Scan"} {
+		if !strings.Contains(pairPlan, want) {
+			t.Errorf("multi-agg EXPLAIN missing %q:\n%s", want, pairPlan)
+		}
+	}
+	if strings.Contains(pairPlan, "Aggregate") {
+		t.Errorf("multi-agg should be the InitPlan rewrite, not the Aggregate path:\n%s", pairPlan)
+	}
+	if got := renderRows(runSQL(t, ctx, "select min(u2), max(u2) from mmt")); len(got) != 1 || got[0] != "1|20" {
+		t.Errorf("multi-agg rows = %v, want [1|20]", got)
+	}
+
+	// Scope bounds (deferral ledger): an aggregate extra keeps the ordinary
+	// Aggregate path.
 	for _, q := range []string{
-		"EXPLAIN (COSTS OFF) select min(u2), max(u2) from mmt",
 		"EXPLAIN (COSTS OFF) select max(u2), count(*) from mmt",
 	} {
 		p := strings.Join(renderRows(runSQL(t, ctx, q)), "\n")
