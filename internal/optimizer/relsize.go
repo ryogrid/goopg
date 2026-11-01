@@ -490,20 +490,31 @@ func estimateTableRowsFallback(cat catalog.Catalog, tbl *catalog.Table) int64 {
 		relpages = int64(tbl.Stats.Pages)
 		analyzed = tbl.Stats.Analyzed
 	}
+	hasSubclass := len(tbl.PartitionKey) > 0 || len(im.InheritanceChildren(tbl.OID)) > 0
 	_, rows := estimateRelSize(relSizeInputs{
 		curpages:  blocks,
 		relpages:  relpages,
 		reltuples: rowCount,
 		analyzed:  analyzed,
-		// A partitioned parent is upstream's relhassubclass case: it holds no
-		// rows of its own, so the 10-page floor must not be applied to it.
-		// Plain (non-partition) inheritance parents are NOT detected here —
-		// see the deferral ledger row for M0125-0003.
-		hasSubclass: len(tbl.PartitionKey) > 0,
+		// pg_class.relhassubclass: a partitioned parent, or a plain
+		// inheritance parent with children (M0148-0001c2 — the M0125-0003
+		// residual). estimate_rel_size (tableam.c table_block_relation_estimate_size)
+		// skips the 10-page floor for both: a parent's own heap is usually
+		// tiny or empty and its children carry the rows, so PG sizes the
+		// regress minmaxtest parent at its 1 real page (254 rows), not 10.
+		hasSubclass: hasSubclass,
 		fillfactor:  fillfactr,
 		dataWidth:   tableDataWidth(tbl),
 	})
 	if rows <= 0 {
+		// An inheritance parent whose own heap is empty is KNOWN empty —
+		// estimate_rel_size's tuples = 0 — and its member rel prices at
+		// clamp_row_est's 1 row, which set_append_rel_size then adds to the
+		// children's sizes. goopg's 0 means "unknown" (and zeroes the
+		// UNION ALL sum in estimateSetOp), so report PG's clamped 1.
+		if hasSubclass && len(tbl.PartitionKey) == 0 {
+			return 1
+		}
 		return 0
 	}
 	if rows > float64(math.MaxInt64) {

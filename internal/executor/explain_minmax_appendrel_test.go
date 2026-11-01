@@ -201,3 +201,30 @@ func TestExplainMinMaxAppendRelDistinctElection(t *testing.T) {
 		t.Errorf("Unique total %.2f charges the InitPlans again (Result startup %.2f):\n%s", uniqueTotal, resultStartup, strings.Join(costed, "\n"))
 	}
 }
+
+// M0148-0001c2 arm (2): estimate_rel_size skips the 10-page floor for a
+// relhassubclass parent (tableam.c), and set_append_rel_size sizes the
+// appendrel as the sum of its members, each clamped to one row. An empty
+// inheritance parent over an empty child therefore plans PG's
+// HashAggregate over `Append rows=1851` (1 + 1850), not a one-row Sort/Group
+// — the 10-page floor on the parent had been masking that the Append was
+// sized from the parent alone. Costs verified against PG 18.3.
+func TestInheritanceParentRelSize(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"create table ip1 (a int, b int, c int, d int, primary key (a, b))",
+		"create table ip1c () inherits (ip1)",
+	} {
+		runSQL(t, ctx, q)
+	}
+	plan := strings.Join(renderRows(runSQL(t, ctx, "explain select * from ip1 group by a,b,c,d")), "\n")
+	if !strings.HasPrefix(plan, "HashAggregate") || !strings.Contains(plan, "Append  (cost=") || !strings.Contains(plan, "rows=1851") {
+		t.Errorf("inheritance appendrel size:\n%s\nwant HashAggregate over Append rows=1851 (PG 18.3)", plan)
+	}
+	for _, want := range []string{"Seq Scan on ip1  (cost=0.00..0.01 rows=1 ", "Seq Scan on ip1c  (cost=0.00..18.50 rows=1850 "} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("member estimate %q missing:\n%s", want, plan)
+		}
+	}
+}
