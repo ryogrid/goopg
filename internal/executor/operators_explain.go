@@ -1593,6 +1593,62 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				}
 			}
 			return tc, true
+		case *optimizer.ProjectSet:
+			// M0148-0001c slice (b): the SELECT-list SRF mode publishes one
+			// output column per SELECT target. An SrfCol slot's source is
+			// the SRF CALL ITSELF — PG's Sort Key over
+			// `generate_series(1,3) as g` (aggregates.out:1173
+			// `Sort Key: (generate_series(1, 3)) DESC`) deparses the
+			// funcexpr out of the child's targetlist, so hand the caller a
+			// synthesised generate_series call (a renderer-synthesised Expr,
+			// the established idiom: chaseAggregateResultArgs, the R66
+			// Star/Distinct FuncCall arm); its S18 wrap adds the outer pair.
+			// A non-SRF slot (OtherExprs) is an expression over the child
+			// row, so the chase steps down through it exactly as the Project
+			// passthrough does — landing on the min/max Result's InitPlan
+			// target for the agg slot (the slice (a) arm above).
+			col, ok := cur.(*optimizer.ColumnRef)
+			if !ok {
+				return nil, false
+			}
+			j := col.Index
+			for _, sc := range n.SrfCols {
+				if sc.ColIdx != j {
+					continue
+				}
+				if sc.Wrapped || sc.Start == nil || sc.Stop == nil {
+					return nil, false
+				}
+				args := []optimizer.Expr{sc.Start, sc.Stop}
+				if sc.Step != nil {
+					args = append(args, sc.Step)
+				}
+				return &optimizer.FuncCall{Name: "generate_series", Args: args}, true
+			}
+			if j < 0 || j >= len(n.OtherExprs) {
+				return nil, false
+			}
+			t := n.OtherExprs[j]
+			if t == nil || exprHasSubplanOrOuterRef(t) {
+				return nil, false
+			}
+			if tc, isCol := t.(*optimizer.ColumnRef); isCol {
+				c := n.Child
+				if c == nil || tc.Index < 0 {
+					return nil, false
+				}
+				cout := c.Output()
+				if tc.Index >= len(cout) || cout[tc.Index].Name != tc.Name {
+					return nil, false
+				}
+				cur = tc
+				node = c
+				continue
+			}
+			if exprHasTableZeroRef(t) {
+				return nil, false
+			}
+			return t, true
 		case *optimizer.WindowAgg:
 			// M0146-0005bc: a WindowAgg publishes its input's columns at
 			// the same positions and appends the window results after

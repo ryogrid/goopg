@@ -88,3 +88,95 @@ func TestExplainKeyOverMinMaxResultInitPlanRef(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainMinMaxMultiTargetProjectSet pins M0148-0001c slice (b): a
+// multi-target tlist holding exactly ONE strict min/max agg plus a Var-free
+// generate_series extra takes PG's create_minmaxagg_plan shape — the whole
+// surviving tlist sits in the childless Result's targets, the tlist SRF is
+// expanded by the ProjectSet above it, and the ORDER BY over the SRF's alias
+// renders the funcexpr itself (the block at
+// postgres/src/test/regress/expected/aggregates.out:1169-1180):
+//
+//	Sort
+//	  Sort Key: (generate_series(1, 3)) DESC
+//	  InitPlan 1
+//	    ->  Limit
+//	          ->  Index Only Scan Backward using tenk1_unique2 on tenk1
+//	                Index Cond: (unique2 IS NOT NULL)
+//	  ->  ProjectSet
+//	        ->  Result
+func TestExplainMinMaxMultiTargetProjectSet(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE mmt (u2 int)",
+		"INSERT INTO mmt SELECT g FROM generate_series(1, 20) g",
+		"CREATE INDEX mmt_u2 ON mmt (u2)",
+		"ANALYZE mmt",
+	} {
+		runSQL(t, ctx, q)
+	}
+	plan := strings.Join(renderRows(runSQL(t, ctx,
+		"EXPLAIN (COSTS OFF) select max(u2), generate_series(1,3) as g from mmt order by g desc")), "\n")
+	for _, want := range []string{
+		"Sort Key: (generate_series(1, 3)) DESC",
+		"InitPlan 1",
+		"->  Limit",
+		"->  Index Only Scan Backward using mmt_u2 on mmt",
+		"Index Cond: (u2 IS NOT NULL)",
+		"->  ProjectSet",
+		"->  Result",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("want %q, as PG prints:\n%s", want, plan)
+		}
+	}
+	if strings.Contains(plan, "Aggregate") {
+		t.Errorf("multi-target tlist fell back to the Aggregate path:\n%s", plan)
+	}
+	// PG prints the query level's initPlan list on the top node (the Sort),
+	// BEFORE the children; a Result-deep InitPlan line would land after the
+	// ProjectSet arrow.
+	if iInit, iPS := strings.Index(plan, "InitPlan 1"), strings.Index(plan, "->  ProjectSet"); iInit >= 0 && iPS >= 0 && iInit > iPS {
+		t.Errorf("InitPlan 1 must print on the Sort, above ProjectSet:\n%s", plan)
+	}
+	// The executed rows: the ProjectSet zips the SRF's 3 steps over the
+	// childless Result's one row, each carrying the InitPlan's max.
+	rows := renderRows(runSQL(t, ctx,
+		"select max(u2), generate_series(1,3) as g from mmt order by g desc"))
+	want := []string{"20|3", "20|2", "20|1"}
+	if len(rows) != len(want) {
+		t.Fatalf("want rows %v, got %v", want, rows)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Errorf("row %d: want %q, got %v", i, want[i], rows)
+		}
+	}
+
+	// Const-only extra: no SRF to expand, so no ProjectSet — the surviving
+	// tlist is the childless Result's own targets (createplan.c:2588-2612).
+	constPlan := strings.Join(renderRows(runSQL(t, ctx,
+		"EXPLAIN (COSTS OFF) select max(u2), 5 from mmt")), "\n")
+	if !strings.Contains(constPlan, "Result") || !strings.Contains(constPlan, "InitPlan 1") {
+		t.Errorf("want Result + InitPlan 1 for the const-extra rewrite:\n%s", constPlan)
+	}
+	if strings.Contains(constPlan, "ProjectSet") {
+		t.Errorf("no ProjectSet is due without a tlist SRF:\n%s", constPlan)
+	}
+	if got := renderRows(runSQL(t, ctx, "select max(u2), 5 from mmt")); len(got) != 1 || got[0] != "20|5" {
+		t.Errorf("want [20|5], got %v", got)
+	}
+
+	// Scope bounds (deferral ledger): a multi-agg tlist and an aggregate
+	// extra keep the ordinary Aggregate path.
+	for _, q := range []string{
+		"EXPLAIN (COSTS OFF) select min(u2), max(u2) from mmt",
+		"EXPLAIN (COSTS OFF) select max(u2), count(*) from mmt",
+	} {
+		p := strings.Join(renderRows(runSQL(t, ctx, q)), "\n")
+		if !strings.Contains(p, "Aggregate") {
+			t.Errorf("%s: scope bound — want the Aggregate path:\n%s", q, p)
+		}
+	}
+}

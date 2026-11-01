@@ -12620,7 +12620,27 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		s.Limit != nil || s.Offset != nil {
 		return nil, false, nil
 	}
-	if len(s.Targets) != 1 {
+	// M0148-0001c slice (b): the tlist length is NOT a planagg.c gate. It
+	// loops the min/max aggs of root->agginfos (planagg.c:160-183, one InitPlan
+	// per agg) and create_minmaxagg_plan's tlist keeps EVERY non-aggregate
+	// entry beside the InitPlan Params (createplan.c:2588-2612:
+	// `make_result(tlist, quals, NULL)` over the surviving tlist). aggregates.sql's
+	// `select max(unique2), generate_series(1,3) as g from tenk1 order by g desc`
+	// (expected block postgres/src/test/regress/expected/aggregates.out:1169-1180)
+	// is exactly that shape. Scope bound for this slice (ledgered): EXACTLY ONE
+	// strict min/max agg target — a multi-agg tlist needs N InitPlans numbered
+	// as one list, and the claimLevelInitPlans ordering is only proven for one —
+	// and jointree-surviving non-agg targets (validated below).
+	aggIdx := -1
+	for i, t := range s.Targets {
+		if _, isMM := strictMinMaxTarget(t.Expr); isMM {
+			if aggIdx >= 0 {
+				return nil, false, nil
+			}
+			aggIdx = i
+		}
+	}
+	if aggIdx < 0 {
 		return nil, false, nil
 	}
 	// planagg.c:121-137: the jointree must collapse to ONE RTE_RELATION. The
@@ -12655,7 +12675,31 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		}
 	}
 
-	t := s.Targets[0]
+	// Slice (b): every non-agg target must survive the rewrite's emptied
+	// main jointree. build_minmax_path moves the relation RTE into the
+	// InitPlan subquery (planagg.c:362-420 builds a fresh single-column RTE)
+	// and PG plans the main query over the jointree-less Query, so a relation
+	// Var in the main tlist has no range table left to resolve against;
+	// create_minmaxagg_plan keeps only entries that compute without one
+	// (createplan.c:2588-2612). Mirror that here: each non-agg target must
+	// resolve to a constant expression, or to a bare generate_series over
+	// constants — the tlist SRF createplan.c leaves in the Result's targets
+	// for the ProjectSet above to expand. Column refs, sublinks, other
+	// aggregates and other SRF kinds (unnest, regexp_matches, user SRFs)
+	// decline to the ordinary Aggregate path.
+	survivors := make([]Expr, len(s.Targets))
+	for i, t := range s.Targets {
+		if i == aggIdx {
+			continue
+		}
+		e, ok := minmaxTListSurvivor(t.Expr, ctx)
+		if !ok {
+			return nil, false, nil
+		}
+		survivors[i] = e
+	}
+
+	t := s.Targets[aggIdx]
 	fc, ok := t.Expr.(*parser.FuncCall)
 	if !ok {
 		return nil, false, nil
@@ -12985,9 +13029,123 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: !correlated, ParamInitPlan: correlated}
 
 	// The childless Result top node (T_Result, nodeResult.c): one row whose
-	// single target is the InitPlan value.
-	return &Result{pos: pos, Targets: []Expr{init},
-		schema: Schema{{Name: label, Type: colType}}}, true, nil
+	// targets are the InitPlan value and — for a multi-target tlist
+	// (M0148-0001c slice (b)) — the jointree-surviving non-agg entries, the
+	// whole surviving tlist of createplan.c's `make_result(tlist, quals, NULL)`
+	// (createplan.c:2588-2612).
+	if len(s.Targets) == 1 {
+		return &Result{pos: pos, Targets: []Expr{init},
+			schema: Schema{{Name: label, Type: colType}}}, true, nil
+	}
+	resTargets := []Expr{init}
+	resSchema := Schema{{Name: label, Type: colType}}
+	// The ProjectSet's OtherExprs (its non-SRF target expressions): the agg
+	// slot and the const slots read the Result's row by position; an SRF slot
+	// is nil, which is the executor's marker for "filled from SrfCols"
+	// (operators_project_set.go, as buildSelectSrfProjectSet builds it).
+	other := make([]Expr, len(s.Targets))
+	psSchema := make(Schema, len(s.Targets))
+	var srfCols []SrfCol
+	for i, t := range s.Targets {
+		if i == aggIdx {
+			other[i] = &ColumnRef{pos: pos, Index: 0, Name: label, Type: colType}
+			psSchema[i] = SchemaColumn{Name: label, Type: colType}
+			continue
+		}
+		name := t.Alias
+		if name == "" {
+			if fc, ok := t.Expr.(*parser.FuncCall); ok && fc.Name.Schema == "" {
+				name = strings.ToLower(fc.Name.Name)
+			} else {
+				name = exprOutputName(t.Expr)
+			}
+		}
+		e := survivors[i]
+		if fc, isGS := e.(*FuncCall); isGS && len(fc.Args) >= 2 {
+			// A tlist SRF is NOT a Result target to evaluate: PG leaves the
+			// funcexpr in the Result's tlist and sets a ProjectSet ABOVE it
+			// (createplan.c's MinMaxAggPath tlist keeps the funcexpr; the
+			// ProjectSet expands it against the childless Result's single
+			// row). goopg's SrfCol carries the resolved args instead.
+			sc := SrfCol{ColIdx: i, Start: fc.Args[0], Stop: fc.Args[1]}
+			if len(fc.Args) == 3 {
+				sc.Step = fc.Args[2]
+			}
+			srfCols = append(srfCols, sc)
+			// Element type: the select-list SRF mode's int8 (the builder's
+			// generate_series default at ~6808) — the zip emits int64 datums.
+			psSchema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			continue
+		}
+		other[i] = &ColumnRef{pos: pos, Index: len(resTargets), Name: name, Type: exprType(e)}
+		resTargets = append(resTargets, e)
+		resSchema = append(resSchema, SchemaColumn{Name: name, Type: exprType(e)})
+		psSchema[i] = SchemaColumn{Name: name, Type: exprType(e)}
+	}
+	res := &Result{pos: pos, Targets: resTargets, schema: resSchema}
+	if len(srfCols) == 0 {
+		// Const-only extras: the childless Result emits them in its one row.
+		// PG adds the ProjectSet only when the tlist holds a set-returning
+		// expr (createplan.c's tlist SRF split), so no ProjectSet here.
+		return res, true, nil
+	}
+	return &ProjectSet{pos: pos, Child: res, SrfCols: srfCols,
+		OtherExprs: other, schema: psSchema}, true, nil
+}
+
+// strictMinMaxTarget reports whether a SELECT target expression is a bare,
+// per-agg-valid min() / max() call: the tlist entry preprocess_minmax_aggregates
+// recognises (can_minmax_aggs, planagg.c:236-306 — single argument, no DISTINCT,
+// no ORDER BY, no FILTER, no window, no WITHIN GROUP, no star; the unqualified
+// name is goopg's existing reject, as catalog-resolved min/max in another
+// schema is not the built-in pair). The FuncCall is returned so callers can
+// reuse it (wrapMinMaxOrderByDistinct's structural ORDER BY matching).
+func strictMinMaxTarget(e parser.Expr) (*parser.FuncCall, bool) {
+	fc, ok := e.(*parser.FuncCall)
+	if !ok || fc.Name.Schema != "" {
+		return nil, false
+	}
+	if !strings.EqualFold(fc.Name.Name, "min") && !strings.EqualFold(fc.Name.Name, "max") {
+		return nil, false
+	}
+	if len(fc.Args) != 1 || fc.Star || fc.Distinct || fc.Over != nil ||
+		fc.Filter != nil || len(fc.OrderBy) > 0 || len(fc.WithinGroup) > 0 {
+		return nil, false
+	}
+	return fc, true
+}
+
+// minmaxTListSurvivor resolves a NON-aggregate SELECT target of the min/max
+// rewrite and reports whether it can live in the rewritten main tlist. See the
+// gate in rewriteMinMaxAggregates: the main jointree is emptied, so the entry
+// must compute without any relation column — a constant expression, or a bare
+// generate_series over constants (the tlist SRF createplan.c hands to the
+// ProjectSet above). The resolved Expr is returned for the assembly.
+func minmaxTListSurvivor(e parser.Expr, ctx *resolveContext) (Expr, bool) {
+	r, err := resolveExpr(e, ctx)
+	if err != nil || r == nil {
+		return nil, false
+	}
+	if fc, isCall := r.(*FuncCall); isCall {
+		// The ONLY call form the rewrite may carry is the tlist SRF it plans
+		// as a ProjectSet slot. isConstantExpr cannot be the gate for a
+		// FuncCall: it recurses on the args only, so a 0-arg call —
+		// `count(*)`, an aggregate the rewrite must never swallow — reads
+		// "constant".
+		if !strings.EqualFold(fc.Name, "generate_series") || len(fc.Args) < 2 || len(fc.Args) > 3 {
+			return nil, false
+		}
+		for _, a := range fc.Args {
+			if !isConstantExpr(a) {
+				return nil, false
+			}
+		}
+		return r, true
+	}
+	if isConstantExpr(r) {
+		return r, true
+	}
+	return nil, false
 }
 
 // wrapMinMaxOrderByDistinct re-attaches ORDER BY / SELECT DISTINCT around a
@@ -13023,18 +13181,26 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 	if len(s.OrderBy) == 0 && !s.Distinct {
 		return rewritten, true
 	}
-	// The gate (rewriteMinMaxAggregates) already proved len(s.Targets) == 1
-	// and that its Expr is a bare min/max FuncCall — re-extract it here
-	// rather than threading it through the function's return signature.
-	fc, ok := s.Targets[0].Expr.(*parser.FuncCall)
-	if !ok {
+	// The gate (rewriteMinMaxAggregates) already proved the tlist holds
+	// exactly ONE strict min/max agg — M0148-0001c slice (b) generalized the
+	// old len(Targets)==1-and-its-Expr-is-min/max gate — so re-scan for it
+	// here rather than threading it through the function's return signature.
+	aggIdx := -1
+	var fc *parser.FuncCall
+	for i, t := range s.Targets {
+		if f, isMM := strictMinMaxTarget(t.Expr); isMM {
+			aggIdx = i
+			fc = f
+		}
+	}
+	if aggIdx < 0 {
 		return nil, false
 	}
 	outSchema := rewritten.Output()
-	if len(outSchema) != 1 {
+	if len(outSchema) != len(s.Targets) {
 		return nil, false
 	}
-	label := outSchema[0].Name
+	label := outSchema[aggIdx].Name
 
 	out := rewritten
 	if len(s.OrderBy) > 0 {
@@ -13045,9 +13211,26 @@ func wrapMinMaxOrderByDistinct(s *parser.SelectStmt, rewritten Node, cat catalog
 		orderCtx.cat = cat
 		keys := make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
+			if len(s.Targets) > 1 {
+				// Slice (b) scope bound (ledgered): an ordinal over a
+				// MULTI-target tlist names the ordinal-th output column
+				// (transformSortClause's ORDER_BY_ATTNOM maps to the resno),
+				// which the single-label substitution below cannot express;
+				// decline to the Aggregate path rather than sort by the
+				// aggregate.
+				if _, isIC := sb.Expr.(*parser.IntegerConst); isIC {
+					return nil, false
+				}
+			}
 			substituted, ok := substituteMinMaxOrderByExpr(sb.Expr, fc, label)
 			if !ok {
-				return nil, false
+				// M0148-0001c slice (b): ORDER BY over a NON-agg target —
+				// aggregates.sql's `order by g desc` for
+				// `generate_series(1,3) as g`. transformSortClause resolves
+				// that name against the tlist's output names, and the
+				// rewritten output publishes every target's name, so the
+				// raw expression resolves against outSchema directly.
+				substituted = sb.Expr
 			}
 			e, err := resolveExpr(substituted, orderCtx)
 			if err != nil {

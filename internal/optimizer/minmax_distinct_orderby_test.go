@@ -194,18 +194,91 @@ func TestRewriteMinMaxAggDistinctOnDeclines(t *testing.T) {
 	}
 }
 
-// TestRewriteMinMaxAggMultiTargetOrderByDeclines — brief criterion 4:
-// `select max(x), generate_series(1,3) as g from t order by g desc` is
-// multi-target (out of scope for S19, and for the earlier multi-target
-// slice) and must still decline.
-func TestRewriteMinMaxAggMultiTargetOrderByDeclines(t *testing.T) {
+// TestRewriteMinMaxAggMultiTargetProjectSet — M0148-0001c slice (b):
+// `select max(x), generate_series(1,3) as g from t order by g desc`
+// (aggregates.sql, expected block at
+// postgres/src/test/regress/expected/aggregates.out:1169-1180) is no longer a
+// decline: planagg.c gates on the AGGS, not the tlist length (planagg.c:160-183),
+// and create_minmaxagg_plan's `make_result(tlist, quals, NULL)` keeps the whole
+// surviving tlist (createplan.c:2588-2612), with the ProjectSet above expanding
+// the tlist SRF. The plan must be Sort → ProjectSet → childless Result/InitPlan
+// with NO Aggregate node.
+func TestRewriteMinMaxAggMultiTargetProjectSet(t *testing.T) {
 	cat, _ := minmaxRewriteCatalog(t)
 	plan, err := Plan(parseOne(t, "SELECT max(x), generate_series(1,3) AS g FROM t ORDER BY g DESC"), cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	if !planContainsAggregate(plan) {
-		t.Fatalf("plan has no *Aggregate node; want the ordinary Aggregate path (multi-target must decline the rewrite)")
+	if planContainsAggregate(plan) {
+		t.Fatalf("plan holds an *Aggregate; want the min/max rewrite (Sort → ProjectSet → Result):\n%s", planShapeString(plan))
+	}
+	sort, ok := plan.(*Sort)
+	if !ok {
+		t.Fatalf("plan root is %T, want *Sort", plan)
+	}
+	if len(sort.Keys) != 1 {
+		t.Fatalf("Sort has %d keys, want 1", len(sort.Keys))
+	}
+	if cr, isCol := sort.Keys[0].Expr.(*ColumnRef); !isCol || cr.Index != 1 || cr.Name != "g" {
+		t.Fatalf("Sort key = %#v, want ColumnRef(g) at index 1 (the SRF slot)", sort.Keys[0].Expr)
+	}
+	ps, ok := sort.Child.(*ProjectSet)
+	if !ok {
+		t.Fatalf("Sort child is %T, want *ProjectSet", sort.Child)
+	}
+	if len(ps.SrfCols) != 1 || ps.SrfCols[0].ColIdx != 1 {
+		t.Fatalf("ProjectSet SrfCols = %+v, want one slot at ColIdx 1", ps.SrfCols)
+	}
+	if len(ps.OtherExprs) != 2 || ps.OtherExprs[1] != nil {
+		t.Fatalf("ProjectSet OtherExprs = %+v, want 2 slots (nil at the SRF slot)", ps.OtherExprs)
+	}
+	if cr, isCol := ps.OtherExprs[0].(*ColumnRef); !isCol || cr.Index != 0 || cr.Name != "max" {
+		t.Fatalf("agg passthrough = %#v, want ColumnRef(max) at index 0 (the Result row)", ps.OtherExprs[0])
+	}
+	res, ok := ps.Child.(*Result)
+	if !ok {
+		t.Fatalf("ProjectSet child is %T, want *Result", ps.Child)
+	}
+	if res.Child != nil {
+		t.Fatalf("Result has a child; want the childless nodeResult.c shape")
+	}
+	if len(res.Targets) != 1 {
+		t.Fatalf("Result has %d targets, want 1 (the SRF is expanded above, not evaluated here)", len(res.Targets))
+	}
+	sq, ok := res.Targets[0].(*SubqueryExpr)
+	if !ok || !SublinkIsInitPlan(sq) {
+		t.Fatalf("Result target is %T, want the InitPlan SubqueryExpr", res.Targets[0])
+	}
+	if len(res.Output()) != 1 || res.Output()[0].Name != "max" {
+		t.Fatalf("Result output = %v, want the single max column", res.Output())
+	}
+	if len(ps.Output()) != 2 || ps.Output()[0].Name != "max" || ps.Output()[1].Name != "g" {
+		t.Fatalf("ProjectSet output = %v, want (max, g)", ps.Output())
+	}
+}
+
+// TestRewriteMinMaxAggMultiTargetDeclines — slice (b) scope bounds (deferral
+// ledger): the rewrite stays bounded to ONE strict min/max agg and
+// jointree-surviving extras. A multi-agg tlist, an aggregate extra, a
+// non-generate_series SRF extra, a relation-Var extra, an expression mixing two
+// min/max aggs, and an ordinal ORDER BY over a multi-target tlist all keep the
+// ordinary Aggregate path.
+func TestRewriteMinMaxAggMultiTargetDeclines(t *testing.T) {
+	cat, _ := minmaxRewriteCatalog(t)
+	for _, q := range []string{
+		"SELECT min(x), max(x) FROM t",                               // two InitPlans
+		"SELECT max(x), count(*) FROM t",                             // aggregate extra
+		"SELECT max(x), unnest(ARRAY[1,2]) FROM t",                   // SRF kind we do not zip
+		"SELECT min(x) + max(x) FROM t",                              // no bare min/max tlist entry
+		"SELECT max(x), generate_series(1,3) AS g FROM t ORDER BY 1", // ordinal over multi-target
+	} {
+		plan, err := Plan(parseOne(t, q), cat)
+		if err != nil {
+			t.Fatalf("%s: plan: %v", q, err)
+		}
+		if !planContainsAggregate(plan) {
+			t.Errorf("%s: want the ordinary Aggregate path (scope bound), got:\n%s", q, planShapeString(plan))
+		}
 	}
 }
 
