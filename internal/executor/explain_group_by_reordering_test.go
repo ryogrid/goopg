@@ -216,3 +216,26 @@ func TestSortedAggInheritsDisabledSort(t *testing.T) {
 		t.Errorf("values: %s", got)
 	}
 }
+
+// M0148-0001e: EXPLAIN VERBOSE qualifies every qual and key column, even for
+// one relation — show_scan_qual uses `useprefix = IsA(plan, SubqueryScan) ||
+// es->verbose`, show_upper_qual / show_sort_group_keys `es->rtable_size > 1
+// || es->verbose` (explain.c). The plain form stays bare.
+func TestExplainVerboseQualifiesKeysAndQuals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE vq (a int, b int)")
+	ps := optimizer.DefaultPlannerSettings()
+	verbose := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT a FROM vq WHERE b > 1 ORDER BY a", ps)), "\n")
+	for _, want := range []string{"Sort Key: vq.a", "Filter: (vq.b > 1)", "Seq Scan on public.vq"} {
+		if !strings.Contains(verbose, want) {
+			t.Errorf("VERBOSE: want %q (PG 18.3); got:\n%s", want, verbose)
+		}
+	}
+	plain := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) SELECT a FROM vq WHERE b > 1 ORDER BY a", ps)), "\n")
+	for _, want := range []string{"Sort Key: a", "Filter: (b > 1)"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("plain: want %q; got:\n%s", want, plain)
+		}
+	}
+}

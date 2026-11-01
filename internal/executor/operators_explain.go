@@ -480,7 +480,7 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
-	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
@@ -2743,7 +2743,10 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 	// `Filter: (cd_marital_status <> cd_marital_status)` becomes the
 	// readable `(cd1.cd_marital_status <> cd2.cd_marital_status)`.
 	// (VERBOSE does not force prefixing here yet — see the deferral row.)
-	qualify := reg.names().qualify() && !explainIsScanNode(n)
+	qualify := reg.names().qualify()
+	if explainIsScanNode(n) {
+		qualify = reg.names().qualifyScan()
+	}
 	switch p := n.(type) {
 	case *optimizer.Result:
 		// A childless Result's targets carry sublinks (the S6 min/max
@@ -6247,7 +6250,7 @@ func schemaColumnNames(n optimizer.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int) {
-	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize, opts.Verbose), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers
@@ -6789,7 +6792,7 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 // through the recursive Plans re-render.
 func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool, rtableSize int) map[string]any {
 	// P0-04e: one name table for the whole plan, as in planToJSON.
-	nm := newExplainNamesSized(n, rtableSize)
+	nm := newExplainNamesSized(n, rtableSize, opts.Verbose)
 	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm})
 }
 
@@ -6934,7 +6937,7 @@ func planToJSON(n optimizer.Node, opts parser.ExplainOptions, rtableSize int) ma
 	// P0-04e: one name table for the whole plan, shared down the
 	// recursion — a per-node table would count only that subtree's
 	// relations and qualify differently from the text walker.
-	nm := newExplainNamesSized(n, rtableSize)
+	nm := newExplainNamesSized(n, rtableSize, opts.Verbose)
 	return planToJSONNamed(n, opts, &subPlanReg{rel: nm})
 }
 
@@ -7001,7 +7004,10 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 	// qualify decision as the text walker's `Filter:` detail line, so the
 	// two walkers state the same qual.
 	if filter != nil {
-		fqual := reg.names().qualify() && !explainIsScanNode(n)
+		fqual := reg.names().qualify()
+		if explainIsScanNode(n) {
+			fqual = reg.names().qualifyScan()
+		}
 		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
 	}
 	if opts.Verbose {

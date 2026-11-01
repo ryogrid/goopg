@@ -132,8 +132,12 @@ func TestExplainSortGroupKeyParenthesisation(t *testing.T) {
 		if !strings.Contains(analyze, "Group Key: ((g % 10000))") || !strings.Contains(analyze, "Sort Key: ((g % 10000))") {
 			t.Errorf("EXPLAIN ANALYZE diverges from plain form; got:\n%s", analyze)
 		}
-		if !strings.Contains(verbose, "Group Key: ((g % 10000))") || !strings.Contains(verbose, "Sort Key: ((g % 10000))") {
-			t.Errorf("EXPLAIN VERBOSE diverges from plain form; got:\n%s", verbose)
+		// VERBOSE keeps the wrapping and qualifies the column
+		// (show_sort_group_keys: `useprefix = es->rtable_size > 1 ||
+		// es->verbose`; sqljson.out prints `Sort Key: ((i.i % 2))` under
+		// VERBOSE for a single relation). M0148-0001e.
+		if !strings.Contains(verbose, "Group Key: ((agg_data.g % 10000))") || !strings.Contains(verbose, "Sort Key: ((agg_data.g % 10000))") {
+			t.Errorf("EXPLAIN VERBOSE diverges from PG's qualified form; got:\n%s", verbose)
 		}
 	})
 }

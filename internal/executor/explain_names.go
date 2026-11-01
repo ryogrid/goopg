@@ -117,6 +117,9 @@ type explainNames struct {
 	// rtableSize is PG's es->rtable_size for the explained statement when
 	// the planner reported it (optimizer.Explain.RtableSize), else 0.
 	rtableSize int
+	// verbose is es->verbose: EXPLAIN (VERBOSE) qualifies every qual and
+	// key column (qualify / qualifyScan).
+	verbose bool
 }
 
 // nodePtr returns a unique string id for a plan node.
@@ -125,14 +128,15 @@ func nodePtr(n optimizer.Node) string { return fmt.Sprintf("%p", n) }
 // newExplainNames builds the name table for the plan rooted at n, with the
 // statement's range-table size unknown.
 func newExplainNames(n optimizer.Node) *explainNames {
-	return newExplainNamesSized(n, 0)
+	return newExplainNamesSized(n, 0, false)
 }
 
 // newExplainNamesSized is newExplainNames given the statement's range-table
 // size from the planner (optimizer.Explain.RtableSize), 0 when unknown.
-func newExplainNamesSized(n optimizer.Node, rtableSize int) *explainNames {
+func newExplainNamesSized(n optimizer.Node, rtableSize int, verbose bool) *explainNames {
 	nm := &explainNames{
 		rtableSize: rtableSize,
+		verbose:    verbose,
 		bySource:   map[int32]string{},
 		taken:      map[string]int{},
 		seen:       map[int32]bool{},
@@ -158,8 +162,22 @@ func newExplainNamesSized(n optimizer.Node, rtableSize int) *explainNames {
 // counts those (`SELECT … FROM (SELECT * FROM btg ORDER BY …) q1 GROUP BY …`
 // prints `Group Key: btg.x`), so the planner's statement-wide count wins
 // when it is known.
+//
+// VERBOSE forces it too: show_upper_qual, show_sort_group_keys,
+// show_grouping_sets, show_window_def/keys and show_memoize_info all use
+// `useprefix = es->rtable_size > 1 || es->verbose` (M0148-0001e). The
+// per-node Output: list is the exception (show_plan_tlist, rtable_size
+// only) and does not come through here.
 func (nm *explainNames) qualify() bool {
-	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1)
+	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1 || nm.verbose)
+}
+
+// qualifyScan is show_scan_qual's rule for a scan node's own quals
+// (`Filter:`, `Index Cond:`, `Recheck Cond:`): `useprefix =
+// IsA(plan, SubqueryScan) || es->verbose` — bare unless VERBOSE, however many
+// relations the statement holds.
+func (nm *explainNames) qualifyScan() bool {
+	return nm != nil && nm.verbose
 }
 
 // name returns the printed relation name for a binding, or "" when the
