@@ -11352,9 +11352,13 @@ Movement: yes — regress aggregates diff lines 377 → 372
     input_disabled_nodes floor, in addAggPath); `group by g%10000` under
     work_mem 64kB + enable_sort off is now PG's HashAggregate.
 Movement: yes — regress aggregates diff lines 372 → 362
-  - Open (task stays `[ ]`): verbose `array_agg(DISTINCT …)` case
-    rendering (VERBOSE prefix rule — M0125-0039 arm a; Output line =
-    0001f); Index Cond pushdown (IOS Filter repeating its Index Cond);
+  - LANDED slice 6 `6d6fa7019` (2026-11-02, run-2 loop #20): EXPLAIN
+    VERBOSE qualifies quals and keys (show_scan_qual `SubqueryScan ||
+    verbose`, upper quals/keys `rtable_size > 1 || verbose`); resolves
+    ledger M0125-0039 arm a. 7 suites improved, 27 unchanged.
+Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578, subselect 1462 → 1438)
+  - Open (task stays `[ ]`): the array_agg(DISTINCT …) block's Output line
+    (0001f); Index Cond pushdown (IOS Filter repeating its Index Cond);
     hunks 2847, 3129 (the expected-file numbering of the remaining
     aggregates hunks; re-derive from a fresh single-suite run).
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.

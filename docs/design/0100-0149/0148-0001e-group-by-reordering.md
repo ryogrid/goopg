@@ -6,7 +6,8 @@ size qualification) landed `f1709f7ab` (run-2 loop #16); slice 3 (merge-join
 outer Incremental Sort) landed `f26987104` (run-2 loop #17); slice 4
 (reordering over presorted\-aggregate keys) landed `058e52bae` (run-2 loop
 #18); slice 5 (sorted Agg paths inherit disabled\_nodes) landed `11579ae1d`
-(run\-2 loop #19); the task stays open
+(run\-2 loop #19); slice 6 (VERBOSE prefix rule) landed `6d6fa7019`
+(run\-2 loop #20); the task stays open
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -179,13 +180,37 @@ spills — and goopg elected GroupAggregate over a Sort on cost.
   and the change does not); the other 32 suites unchanged.
 - Pin: `TestSortedAggInheritsDisabledSort`.
 
+## Slice 6 — EXPLAIN VERBOSE qualifies quals and keys
+
+`explain.c` forces column prefixes under VERBOSE: `show_scan_qual` uses
+`useprefix = IsA(plan, SubqueryScan) || es->verbose`, while
+`show_upper_qual`, `show_sort_group_keys`, `show_grouping_sets`,
+`show_window_def` / `show_window_keys` and `show_memoize_info` use
+`es->rtable_size > 1 || es->verbose`; only `show_plan_tlist` (the Output:
+list) stays on `rtable_size`. goopg never let VERBOSE force a prefix (ledger
+M0125\-0039 arm a), so single\-relation VERBOSE plans printed `Group Key: y,
+x` / `Index Cond: (y < 0)` where PG prints `btg.y, btg.x` / `(btg.y < 0)`
+(`sqljson.out` shows the same rule: `Sort Key: ((i.i % 2))` beside a bare
+`Output: ((i % 2)), i`).
+
+- `explainNames` carries `es->verbose` (`newExplainNamesSized(n, rtableSize,
+  verbose)`, set by the text, ANALYZE, JSON and JSON\+stats renderers);
+  `qualify()` ORs it in for upper nodes, and `qualifyScan()` is
+  `show_scan_qual`'s rule for a scan node's own quals (text walker and the
+  JSON Filter property). Output: lines go through neither.
+- Regress runner, HEAD vs change over 34 suites: aggregates 362 → 360,
+  explain 592 → 578, groupingsets 872 → 868, join 15046 → 15030, limit
+  126 → 120, subselect 1462 → 1438, window 1898 → 1892 diff lines; 27
+  unchanged. Lines that stay different are prefixed lines inside hunks whose
+  plans already differ.
+- Pins: `TestExplainVerboseQualifiesKeysAndQuals`; the VERBOSE arm of
+  `TestExplainSortGroupKeyParenthesisation` now asserts PG's
+  `((agg_data.g % 10000))`.
+
 ## Remaining (task stays open)
 
-- The `array_agg(DISTINCT w)` block's remaining lines: VERBOSE does not force
-  column prefixing (`Group Key: btg.y, btg.x`, `Index Cond: (btg.y < 0)`;
-  PG's `useprefix = … || es->verbose` in show\_scan\_qual, show\_upper\_qual
-  and show\_sort\_group\_keys — ledger row M0125\-0039 arm a), the Output
-  line (M0148\-0001f), and a `Filter` that repeats the Index Cond.
+- The `array_agg(DISTINCT w)` block's remaining lines: the Output line
+  (M0148\-0001f) and a `Filter` that repeats the Index Cond.
 
 - The verbose `array_agg(DISTINCT …)` case and the `Disabled: true` lines
   (the latter belong to M0148-0001f).
