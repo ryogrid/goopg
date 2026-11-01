@@ -11021,6 +11021,35 @@ completion path.
     Remaining 0001c slices: (c) inheritance-tree Merge Append
     min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
     sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
+  - LANDED loop #18-#20 slice (c) part 1 `91a958dd2` — multi-agg min/max
+    tlist lands as N InitPlans over the one childless Result: the gate
+    became the per-agg loop (`aggIdx []int`; a min/max-named call that is
+    NOT the strict `can_minmax_aggs` shape rejects the whole rewrite,
+    planagg.c:100-115), the per-agg body moved to `buildMinMaxInitPlan`
+    (WHERE re-resolved per agg — the IOS covered-index remap rewrites
+    ColumnRef space, so one resolved predicate must not serve two
+    InitPlans), the Result's targets carry one InitPlan Param per agg in
+    tlist order (createplan.c:2546-2612), and `wrapMinMaxOrderByDistinct`
+    substitutes per (FuncCall, label) pair with the slice (b) raw-name
+    fallback. Inheritance parents STAY declined (gate
+    `AccessibleInheritanceChildren`). Pins:
+    `TestRewriteMinMaxAggMultiInitPlans` (min forward / max Backward IOS)
+    + the executor EXPLAIN shape/rows in
+    `TestExplainMinMaxMultiTargetProjectSet`; the `min(x), max(x)`
+    declines-case moved to landing. aggregates stays at 28 hunks (the
+    corpus has no plain-table multi-agg EXPLAIN). Movement: fireset gate
+    SF0.25+SF1 99/99+99/99 `fires=none`, spotcheck Q12=2/Q13=35, sf025
+    sweep 99/99 identical, acceptance arm 24 MATCH, precommit smoke PASS.
+    Deferral ledger: the inheritance sub-slice (appendrel MergeAppend:
+    per-child IOS incl. DESC-index + partial-index predicate proof, each
+    `Index Cond: (f1 IS NOT NULL)`, merged by Merge Append — plus the
+    rendering half: child RTE aliases `minmaxtest_1..9` with GLOBAL
+    numbering across InitPlans, the Merge Append `Sort Key:` line
+    (explain arm TODO operators_explain.go:6741)) and the ordinal
+    ORDER-BY scope bound extended to the multi-agg tlist.
+    Remaining 0001c slices: (c2) inheritance-tree Merge Append
+    min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
+    sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
 - [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl

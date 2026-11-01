@@ -1,9 +1,10 @@
-# M0148-0001c — Sort/Group Key over a min/max-rewritten Result; multi-target tlist + ProjectSet
+# M0148-0001c — Sort/Group Key over a min/max-rewritten Result; multi-target tlist + ProjectSet; multi-agg InitPlans
 
-**Loop:** #16 slice (a), #17 slice (b) (2026-11-01) · **Parent:** M0148-0001 `aggregates.sql` regress coverage closure
+**Loop:** #16 slice (a), #17 slice (b), #18/#19/#20 slice (c) part 1 (2026-11-01) · **Parent:** M0148-0001 `aggregates.sql` regress coverage closure
 **Baseline:** `scripts/pg-regress-runner.sh -v aggregates` at `bd65d86bc` → 33 hunks
 **After slice (a):** 29 hunks (4 closed: expected-lines 950 / 967 / 984 / 1001; no new diffs)
 **After slice (b):** 28 hunks (1016 closed byte-exact; 1066 / 1145 remain, see Remaining)
+**After slice (c) part 1:** 28 hunks (hunk 1066 awaits the inheritance sub-slice; the multi-InitPlan machinery itself is unit-witnessed)
 
 ## Why
 
@@ -226,10 +227,99 @@ goopg declined the whole rewrite at `len(s.Targets) != 1` and printed
   24 MATCH; fireset gate (SF0.25 + SF1) — `internal/optimizer` staged ⇒
   G9 IN-SCOPE; pre-commit pgbench smoke via the hook.
 
+## Slice (c) part 1 — multi-agg tlist: N InitPlans over one childless Result
+
+**Loop:** #18/#19/#20 (finished at `91a958dd2`). Query shape (the minmaxtest
+witness, `postgres/src/test/regress/expected/aggregates.out:1229-1292`):
+`select min(f1), max(f1) from <plain indexed table>` must plan as
+
+```
+Result
+  InitPlan 1
+    ->  Limit
+          ->  Index Only Scan using …
+                Index Cond: (f1 IS NOT NULL)
+  InitPlan 2
+    ->  Limit
+          ->  Index Only Scan Backward using …
+                Index Cond: (f1 IS NOT NULL)
+```
+
+### Mechanism in the oracle
+
+- `preprocess_minmax_aggregates` LOOPS `root->agginfos` (planagg.c:160-183):
+  one `build_minmax_path` per strict min/max agg, one MinMaxAggInfo, one
+  InitPlan each — InitPlan 1 = the FIRST agg in tlist order (min at
+  aggregates.out:1231-1236, max at :1237-1243).
+- `create_minmaxagg_plan` (createplan.c:2546-2612) emits ONE `Result` whose
+  tlist carries one InitPlan Param per agg (plus the jointree-surviving
+  non-agg entries, slice (b)) — `make_result(tlist, quals, NULL)`.
+
+### Design
+
+1. **Gate.** The slice (b) single-`aggIdx` scan became a list: every strict
+   min/max target is collected (`aggIdx []int`); a min/max-NAMED call that is
+   NOT the strict shape (DISTINCT/FILTER/window/…) rejects the WHOLE rewrite
+   (PG: `can_minmax_aggs` false for one agg → no MinMaxAggPath at all,
+   planagg.c:100-115).
+2. **Per-agg builder `buildMinMaxInitPlan`.** The former inline body is now a
+   function over `(s, cat, ctx, tbl, fc, t)` returning the InitPlan
+   `*SubqueryExpr` + its output `SchemaColumn` (`min`/`max`, tlist alias
+   wins). The WHERE is resolved INSIDE the builder: the IOS cond remap
+   (`remapColumnRefsToSchema`) rewrites ColumnRef coordinates into
+   covered-index space, so one resolved Expr shared across two InitPlans
+   (`min(f1), max(f1)` over one table) would be remapped twice.
+3. **Assembly.** tlist order is preserved (the `list_concat` order
+   create_minmaxagg_plan walks): agg slots take their InitPlan in
+   `aggIdx` order, surviving const slots keep their positions; the
+   ProjectSet's `OtherExprs` reference the Result row by the position each
+   entry was appended at. Single-target tlists keep the exact slice (a)
+   node.
+4. **ORDER BY re-attach.** `wrapMinMaxOrderByDistinct` re-scans the
+   (FuncCall, label) PAIRS from `outSchema`; each ORDER BY item is tried
+   against every agg's structural key (first match wins), then falls back
+   to raw resolution against the rewritten output (slice (b) rule).
+   Ordinals over a multi-target tlist still decline (ledgered).
+5. **Inheritance stays declined** (gate: `AccessibleInheritanceChildren` > 0,
+   partitioned parents): the minmaxtest hunk 1066 needs the appendrel
+   MergeAppend inner plus four rendering behaviours goopg does not have
+   yet — child RTE aliases `minmaxtest_1..9` (global numbering continues
+   ACROSS InitPlans), the `Merge Append` `Sort Key:` line, per-child
+   `Index Cond: (f1 IS NOT NULL)` from the added NullTest (indxpath.c:2764),
+   and the DESC-index/partial-index per-child path selection (planagg.c
+   appendrel, create_minmaxagg_plan:2659-2713). Deferral ledger rows.
+
+### Slice (c) part 1 files
+
+- `internal/optimizer/planner.go`: gate `aggIdx []int` + lax-call reject,
+  `buildMinMaxInitPlan` extraction (per-agg WHERE resolve), multi-agg
+  assembly, `wrapMinMaxOrderByDistinct` pair substitution.
+- Tests: `TestRewriteMinMaxAggMultiInitPlans` (two InitPlan SubqueryExpr
+  targets, min forward / max Backward IOS, output names) in
+  `minmax_distinct_orderby_test.go`; the `min(x), max(x)` case moved out of
+  `TestRewriteMinMaxAggMultiTargetDeclines`;
+  `TestExplainMinMaxMultiTargetProjectSet` now pins the rendered
+  `InitPlan 1`/`InitPlan 2`/`Limit`×2 shape and the executed `(min, max)`
+  row in `explain_correlated_minmax_test.go`.
+
+### Slice (c) part 1 verification
+
+- `scripts/pg-regress-runner.sh -v aggregates`: 28 hunks, unchanged (no
+  corpus query is a plain-table multi-agg EXPLAIN; hunk 1066 is the
+  inheritance shape, still declined).
+- `go test -p 2 ./internal/optimizer/ ./internal/executor/`: green except
+  the documented `TestCopyFromZonelessTimetzTakesSessionZone` DST flake.
+- TPC-H spotcheck Q12=2 / Q13=35; TPC-DS sf025 sweep 99/99 shapes identical;
+  acceptance arm (off) 24 MATCH; fireset gate SF0.25 + SF1 99/99 + 99/99,
+  `fires=none` (no corpus query carries a multi-agg scalar min/max);
+  pre-commit pgbench smoke via the hook.
+
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
-- **(c)** hunk 1066: inheritance-tree min/max → Merge Append under the
-  Limit (planagg's per-child index paths).
+- **(c2)** hunk 1066: inheritance-tree min/max → Merge Append under the
+  Limit (planagg's per-child index paths) + the four rendering behaviours
+  above (child RTE aliases, Merge Append Sort Key, per-child Index Cond,
+  DESC/partial-index paths).
 - **(d)** hunk 1108/1145: correlated `distinct min(f1) … where unique1 > f1`
   sharing one `InitPlan 1` + `SubPlan 2` (PG moves the InitPlan into the
   SubPlan; goopg rejects the correlated rewrite at M0146-0114's gate).
