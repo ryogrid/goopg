@@ -2877,7 +2877,10 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				if s, ok := keyNode.(*optimizer.Sort); ok && len(s.Keys) == len(keys) {
 					keyNode, keys = s.Child, s.Keys
 				}
-				full, _ := sortKeyParts(keyNode, keys, reg, qualify)
+				full, ok := appendRelMergeKeyParts(p, reg, qualify)
+				if !ok {
+					full, _ = sortKeyParts(keyNode, keys, reg, qualify)
+				}
 				*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(full, ", "))})
 			}
 		}
@@ -7948,6 +7951,36 @@ func setOpCommandName(p *optimizer.SetOp) string {
 // A Merge Append chain (MergeKeys set, M0141-S2b-4c) absorbs only merge links
 // and a plain Append chain only plain links: an Append beneath a Merge
 // Append, or the reverse, is a separate node in PG and keeps its own line.
+// appendRelMergeKeyParts renders an inheritance appendrel's Merge Append keys
+// (SetOp.RTID set, M0148-0001c). PG's MergeAppend sort columns are the
+// parent rel's Vars (the appendrel's reltarget), so explain.c's
+// show_merge_append_keys deparses them against the parent RTE's
+// set_rtable_names name — `minmaxtest.f1` for the first InitPlan,
+// `minmaxtest_5.f1 DESC` for the second — never a member scan's. ok=false
+// for any other SetOp or a non-column key.
+func appendRelMergeKeyParts(p *optimizer.SetOp, reg *subPlanReg, qualify bool) ([]string, bool) {
+	if p.RTID == 0 {
+		return nil, false
+	}
+	name := ""
+	if nm := reg.names(); nm != nil {
+		name = nm.bySource[p.RTID]
+	}
+	full := make([]string, 0, len(p.MergeKeys))
+	for _, k := range p.MergeKeys {
+		col, ok := k.Expr.(*optimizer.ColumnRef)
+		if !ok {
+			return nil, false
+		}
+		s := col.Name
+		if qualify && name != "" {
+			s = name + "." + col.Name
+		}
+		full = append(full, s+sortOrderSuffix(k))
+	}
+	return full, true
+}
+
 func setOpAppendBranches(p *optimizer.SetOp, out []optimizer.Node) []optimizer.Node {
 	for _, side := range [...]optimizer.Node{p.Left, p.Right} {
 		if inner, ok := side.(*optimizer.SetOp); ok && setOpRendersAsAppend(inner) &&

@@ -12671,16 +12671,25 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	if !ok || tbl.View != nil || tbl.IsMatView {
 		return nil, false, nil
 	}
-	// Partitioned parents store no rows (planIndexScanFromWhere:8316) and a
-	// plain `FROM parent` scans the inheritance tree, not the leaf — both
-	// would make the single-leaf inner scan wrong.
+	// Partitioned parents store no rows (planIndexScanFromWhere:8316): the
+	// single-leaf inner scan would be wrong, and the partitioned appendrel
+	// is not built here (ledgered).
 	if len(tbl.PartitionKey) > 0 {
 		return nil, false, nil
 	}
-	if im := inMemoryCat(cat); im != nil {
-		if len(catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), currentTempOwner(cat))) > 0 {
-			return nil, false, nil
-		}
+	// M0148-0001c slice (c2): a plain `FROM parent` over an inheritance tree
+	// is an appendrel (expand_inherited_rtentry). planagg.c:121-137 accepts
+	// it — the RTE is still one RTE_RELATION — and build_minmax_path's
+	// presorted path over it is the Merge Append of the members' ordered
+	// index paths (generate_orderedappend_paths). `FROM ONLY parent`
+	// (rte->inh = false) stays the plain single-relation shape.
+	var members []*catalog.Table
+	if im := inMemoryCat(cat); im != nil && !rv.Only {
+		members = collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
+	}
+	refname := rv.Alias
+	if refname == "" {
+		refname = strings.ToLower(tbl.Name)
 	}
 
 	// Slice (b): every non-agg target must survive the rewrite's emptied
@@ -12722,7 +12731,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		if !isCall {
 			return nil, false, nil
 		}
-		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, fc, &t)
+		init, sc, ok, berr := buildMinMaxInitPlan(s, cat, ctx, tbl, members, refname, fc, &t)
 		if berr != nil {
 			return nil, false, berr
 		}
@@ -12813,7 +12822,11 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 // the IOS cond remap rewrites ColumnRef Index values into covered-index
 // coordinates, so one resolved Expr shared across two InitPlans (slice (c):
 // `min(f1), max(f1)` over one table) would be remapped twice.
-func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, fc *parser.FuncCall, t *parser.ResTarget) (Expr, SchemaColumn, bool, error) {
+//
+// members non-empty marks tbl as an inheritance parent whose appendrel the
+// subquery scans (slice (c2)); refname is the parent RTE's alias name the
+// member scans print under (`minmaxtest minmaxtest_1`).
+func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolveContext, tbl *catalog.Table, members []*catalog.Table, refname string, fc *parser.FuncCall, t *parser.ResTarget) (Expr, SchemaColumn, bool, error) {
 	// min → forward IOS (isMax=false); max → Backward IOS (isMax=true).
 	if fc.Name.Schema != "" {
 		return nil, SchemaColumn{}, false, nil
@@ -12928,6 +12941,21 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 			SourceTableIdx: 1,
 		}, Negated: true}
 
+		if len(members) > 0 {
+			// Slice (c2): the appendrel's presorted path is a Merge Append of
+			// one ordered index path per member. A WHERE qual would have to be
+			// pushed into every member (set_append_rel_size's per-child
+			// restriction translation) — not built here; it declines.
+			if wherePred != nil || indexOnlyScanRejected(cat) {
+				return nil, SchemaColumn{}, false, nil
+			}
+			merge, ok := buildMinMaxAppendRelMerge(cat, ctx, tbl, members, refname, argCR, colType, isMax, pos)
+			if !ok {
+				return nil, SchemaColumn{}, false, nil
+			}
+			inner = &Limit{pos: pos, Child: merge, Limit: &IntegerConst{pos: pos, Value: 1}}
+		}
+
 		// A btree index whose leading column is the agg column supplies the sorted
 		// path for free (build_minmax_path's cheapest-path-for-pathkeys; the index's
 		// natural ASC order IS min's pathkey). findBTreeIndexForColumn declines
@@ -12939,7 +12967,7 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 		// The index-only shape is off the table when the session disabled it
 		// (review/260831-2 X-8) — the SeqScan+Agg fallback below is what PG
 		// falls back to as well.
-		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil, wherePred); idx != nil &&
+		if idx := findBTreeIndexForColumn(cat, tbl, argCR.Name, nil, wherePred); inner == nil && idx != nil &&
 			!indexOnlyScanRejected(cat) &&
 			(wherePred == nil || wherePredSafeForIOS(wherePred, argCR)) {
 			covered, ok := cat.LookupColumn(tbl, argCR.Name)
@@ -12971,7 +12999,7 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 				Index:    idx,
 				Covered:  []catalog.Column{*covered},
 				Cond:     cond,
-				Backward: isMax,
+				Backward: minmaxScanBackward(idx, 0, isMax),
 				schema: Schema{{Name: argCR.Name, Type: colType,
 					SourceTableIdx: 1}},
 			}
@@ -13048,7 +13076,7 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 					Index:    idx,
 					Covered:  coveredCols,
 					Cond:     cond,
-					Backward: isMax,
+					Backward: minmaxScanBackward(idx, k, isMax),
 					schema:   iosSchema,
 				}
 				// The k+1-wide covered row must be sliced down to the agg column so
@@ -13139,6 +13167,118 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 	init := &SubqueryExpr{pos: pos, Plan: inner, IsNonCorrelated: !correlated, ParamInitPlan: correlated}
 
 	return init, SchemaColumn{Name: label, Type: colType}, true, nil
+}
+
+// minmaxScanBackward is the scan direction build_minmax_path's ordered index
+// path takes for the agg column at index key position k: min wants ASC, max
+// DESC (fetch_agg_sort_op), and build_index_pathkeys reads a DESC key column
+// backward for ASC (indxpath.c ForwardScanDirection vs BackwardScanDirection
+// per the index's indoption). The IndexOnlyScan reads its index in natural
+// order and Backward reverses it, so a DESC column flips the flag: `max(x)`
+// over `(x desc)` is a FORWARD scan. (Before M0148-0001c (c2) the flag was
+// isMax alone, and `max(x)` over a DESC index returned the minimum.)
+func minmaxScanBackward(idx *catalog.Index, k int, isMax bool) bool {
+	desc := k < len(idx.ColDescending) && idx.ColDescending[k]
+	return isMax != desc
+}
+
+// buildMinMaxAppendRelMerge builds slice (c2)'s presorted appendrel path for
+// one min/max aggregate over an inheritance parent: generate_orderedappend_paths
+// (allpaths.c) over the members' ordered index paths, merged by a Merge Append
+// on the agg column — ASC NULLS LAST for min, DESC NULLS FIRST for max
+// (planagg.c:163-179's sortop). Members are the parent itself (its own rows,
+// the appendrel's first child) then every descendant in
+// collectInheritanceDescendants order, the order the inheritance scan fans
+// out in (expand_inherited_rtentry's find_all_inheritors order).
+//
+// Each member is an Index Only Scan over a btree index led by the agg column,
+// read in the direction minmaxScanBackward picks, with the `col IS NOT NULL`
+// NullTest as its Index Cond — except a partial index whose predicate is that
+// very NullTest: check_index_predicates drops a restriction the predicate
+// implies from indrestrictinfo, so the scan prints no Index Cond (the
+// regress `minmaxtest3i ... where f1 is not null` child). A member with no
+// such index declines the whole rewrite: PG would merge a Sort over its
+// cheapest path there instead, which goopg does not build here (ledgered).
+//
+// Naming: every member scan carries the parent's refname as its alias and a
+// fresh RTID, and the chain's top link carries the parent RTE's RTID
+// (allocated FIRST) — so set_rtable_names hands the parent the bare name and
+// the members `_1`…`_N`, continuing across InitPlans (aggregates.out:1225-1246).
+func buildMinMaxAppendRelMerge(cat catalog.Catalog, ctx *resolveContext, parent *catalog.Table, members []*catalog.Table, refname string, argCR *ColumnRef, colType catalog.Type, isMax bool, pos int) (Node, bool) {
+	scope := rtableScopeFrom(ctx)
+	parentRTID := scope.Alloc()
+	mergeKey := SortKey{Expr: &ColumnRef{pos: pos, Index: 0, Name: argCR.Name, Type: colType, SourceTableIdx: 1},
+		Desc: isMax, NullsFirst: isMax}
+	var chain Node
+	for _, m := range append([]*catalog.Table{parent}, members...) {
+		col, ok := cat.LookupColumn(m, argCR.Name)
+		if !ok {
+			return nil, false
+		}
+		idx, predNotNull := minmaxMemberIndex(cat, m, argCR.Name)
+		if idx == nil {
+			return nil, false
+		}
+		var cond Expr
+		if !predNotNull {
+			cond = &IsNullExpr{pos: pos, Operand: &ColumnRef{pos: pos, Index: 0, Name: argCR.Name,
+				Type: colType, SourceTableIdx: 1}, Negated: true}
+		}
+		ios := &IndexOnlyScan{
+			pos:      pos,
+			Table:    m,
+			Alias:    refname,
+			Index:    idx,
+			Covered:  []catalog.Column{*col},
+			Cond:     cond,
+			Backward: minmaxScanBackward(idx, 0, isMax),
+			RTID:     scope.Alloc(),
+			schema:   Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}},
+		}
+		if chain == nil {
+			chain = ios
+			continue
+		}
+		chain = &SetOp{pos: pos, Left: chain, Right: ios, Op: parser.SetOpUnion, All: true,
+			MergeKeys: []SortKey{mergeKey}}
+	}
+	top, ok := chain.(*SetOp)
+	if !ok {
+		return nil, false
+	}
+	top.RTID = parentRTID
+	top.AppendRelName = refname
+	return top, true
+}
+
+// minmaxMemberIndex finds an appendrel member's ordered index for
+// buildMinMaxAppendRelMerge: a btree index led by col that
+// findBTreeIndexForColumn accepts, else a single-column partial btree index
+// on col whose predicate is exactly `col IS NOT NULL` — the restriction
+// build_minmax_path adds, so predicate_implied_by proves it (equal clauses)
+// and predNotNull reports that the scan needs no Index Cond.
+func minmaxMemberIndex(cat catalog.Catalog, tbl *catalog.Table, col string) (idx *catalog.Index, predNotNull bool) {
+	if idx := findBTreeIndexForColumn(cat, tbl, col, nil, nil); idx != nil {
+		return idx, false
+	}
+	for _, ix := range cat.IndexesOnTable(tbl) {
+		if strings.ToLower(ix.Method) != "btree" || !ix.HasPredicate ||
+			len(ix.Columns) != 1 || ix.Columns[0] != col {
+			continue
+		}
+		pred, err := ResolveIndexPredicate(ix.Predicate, tbl)
+		if err != nil {
+			continue
+		}
+		nt, ok := pred.(*IsNullExpr)
+		if !ok || !nt.Negated {
+			continue
+		}
+		if cr, ok := nt.Operand.(*ColumnRef); ok && cr.Name == col {
+			return ix, true
+		}
+	}
+	return nil, false
 }
 
 // intHas reports whether i appears in the sorted index list xs.

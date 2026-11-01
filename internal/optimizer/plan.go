@@ -3346,6 +3346,15 @@ type SetOp struct {
 	// one `Merge Append` with its `Sort Key:`. Built only serially, never
 	// under a Gather.
 	MergeKeys []SortKey
+	// RTID / AppendRelName name the inheritance parent an appendrel chain
+	// stands for — PG's Append/MergeAppend `apprelids`, which
+	// ExplainPreScanNode adds to rels_used so set_rtable_names names the
+	// parent RTE before its children (`Sort Key: minmaxtest.f1` over
+	// `minmaxtest minmaxtest_1`, …). Set only on the TOP link of the chain
+	// built by the min/max appendrel rewrite (M0148-0001c); 0 / "" leave the
+	// node nameless, as every other construction site does.
+	RTID          int32
+	AppendRelName string
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

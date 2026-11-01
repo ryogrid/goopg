@@ -91,6 +91,13 @@ type explainNames struct {
 	// for node labels — the existing bySource/taken/seen serve column
 	// qualification, which has different collision rules.
 	nodeLabels map[string]string
+	// labelSeen is the node-label pass's visited set, kept across collect
+	// calls: the root pass already labels sublink bodies (they hang off
+	// NodeSubplans), and the per-subplan collect operators_explain runs
+	// before rendering an `InitPlan N` body must not relabel them from a
+	// fresh claim table — two InitPlans over one appendrel printed their
+	// members `_1`…`_4` twice where PG continues `_6`…`_9` (M0148-0001c).
+	labelSeen map[string]bool
 	// parent maps each plan node (nodePtr) to the node it was first
 	// reached from in collect's walk, and scopes caches each node's
 	// subtree SourceTableIdx → RTID map. Together they let columnIn
@@ -426,7 +433,10 @@ func (nm *explainNames) collect(n optimizer.Node) {
 	// entries with the same first-wins dedup, so label suffixes and
 	// column-qualifier suffixes agree with each other.
 	labelTaken := map[string]int{}
-	labelSeen := map[string]bool{}
+	if nm.labelSeen == nil {
+		nm.labelSeen = map[string]bool{}
+	}
+	labelSeen := nm.labelSeen
 	for _, e := range found {
 		if e.base == "" {
 			continue
@@ -566,6 +576,13 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
 		}
+	case *optimizer.SetOp:
+		// An appendrel's parent RTE (Append/MergeAppend apprelids, which
+		// ExplainPreScanNode adds to rels_used): the parent claims its
+		// name before the children (M0148-0001c).
+		if p.RTID != 0 && p.AppendRelName != "" {
+			return p.AppendRelName, true
+		}
 	}
 	return "", false
 }
@@ -625,6 +642,8 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 	case *optimizer.MaterializedCTEScan:
 		rtid = p.RTID
 	case *optimizer.BitmapHeapScan:
+		rtid = p.RTID
+	case *optimizer.SetOp:
 		rtid = p.RTID
 	default:
 		return 0, false
