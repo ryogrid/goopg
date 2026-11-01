@@ -60,3 +60,38 @@ func TestGroupByKeysReorderedToInputPathkeys(t *testing.T) {
 		t.Errorf("enable_group_by_reordering = off must keep the written order:\n%s", plan)
 	}
 }
+
+// M0148-0001e: EXPLAIN qualifies upper-node columns when the statement's
+// range table holds more than one entry (explain.c `useprefix =
+// es->rtable_size > 1`), counting RTEs that left no plan node. aggregates.out's
+// q1 case: the FROM subquery's Subquery Scan is stripped as trivial, so only
+// btg is visible, yet PG prints `btg.x` because q1 is still an RTE. The
+// planner reports the size on the Explain node (Explain.RtableSize); a bare
+// single-table query (the test above) keeps bare names.
+func TestExplainQualifiesForStrippedSubqueryRTE(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE btg (x int NOT NULL, y int NOT NULL, z text, w int)",
+		"INSERT INTO btg SELECT i % 10, i % 10, 'abc' || i % 10, i FROM generate_series(1, 100) AS i",
+		"CREATE INDEX btg_x_y_idx ON btg(x, y)",
+		"ANALYZE btg",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableHashAgg = false
+	ps.EnableSeqScan = false
+	q := "EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT * FROM btg ORDER BY x, y, w, z) AS q1 GROUP BY w, x, z, y"
+	want := strings.Join([]string{
+		"GroupAggregate",
+		"  Group Key: btg.x, btg.y, btg.w, btg.z",
+		"  ->  Incremental Sort",
+		"        Sort Key: btg.x, btg.y, btg.w, btg.z",
+		"        Presorted Key: btg.x, btg.y",
+		"        ->  Index Scan using btg_x_y_idx on btg",
+	}, "\n")
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n"); got != want {
+		t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", q, got, want)
+	}
+}

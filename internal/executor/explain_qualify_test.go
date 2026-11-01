@@ -469,7 +469,7 @@ func TestJSONCollapsesProjectFilterWrappersLikeText(t *testing.T) {
 			}
 		}
 	}
-	obj := planToJSON(proj, parser.ExplainOptions{})
+	obj := planToJSON(proj, parser.ExplainOptions{}, 0)
 	walkJSON(obj)
 	for _, nt := range types {
 		if nt == "Projection" || nt == "Filter" {

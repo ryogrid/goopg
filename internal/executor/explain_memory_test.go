@@ -185,7 +185,7 @@ func TestInstrumentedOpAccountsMemory(t *testing.T) {
 func TestPlanToJSONWithStatsRendersMemoryWhenNonzero(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {memPeak: 8192, memAllocated: 65536}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Memory: true}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Memory: true}, stats, false, 0)
 	if got, ok := obj["Memory Used"].(int64); !ok || got != 8 {
 		t.Errorf("Memory Used = %v, want 8 (8192 bytes / 1024)", obj["Memory Used"])
 	}
@@ -200,7 +200,7 @@ func TestPlanToJSONWithStatsRendersMemoryWhenNonzero(t *testing.T) {
 func TestPlanToJSONWithStatsOmitsMemoryWhenOptionOff(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {memPeak: 4096, memAllocated: 16384}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{}, stats, false, 0)
 	if _, ok := obj["Memory Used"]; ok {
 		t.Errorf("Memory Used present without opts.Memory, want absent")
 	}

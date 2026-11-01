@@ -3238,6 +3238,12 @@ type Explain struct {
 	// EXPLAIN ANALYZE prints as "Planning Time" — PG's ExplainOneQuery
 	// times pg_plan_query alone (explain.c:350-356) (M0122-0019).
 	PlanningNs int64
+	// RtableSize is the explained statement's range-table size (PG's
+	// es->rtable_size), counting RTEs that left no plan node — a pulled-up
+	// or stripped subquery, a view, a removed join. EXPLAIN qualifies
+	// upper-node columns when it exceeds 1. Zero means unknown: the renderer
+	// then counts the relations visible in the plan.
+	RtableSize int
 }
 
 func (n *Explain) Pos() int { return n.pos }

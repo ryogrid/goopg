@@ -458,7 +458,7 @@ func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
 func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
 		t.Errorf("Shared I/O Read Time = %v, want 2.0", obj["Shared I/O Read Time"])
 	}
@@ -477,7 +477,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 0 {
 		t.Errorf("Shared I/O Read Time = %v, want 0 (present)", obj["Shared I/O Read Time"])
 	}
@@ -495,7 +495,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *tes
 func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false, 0)
 	if _, ok := obj["Shared I/O Read Time"]; ok {
 		t.Errorf("Shared I/O Read Time present with trackIOTiming=false, want absent")
 	}
@@ -515,7 +515,7 @@ func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	for _, key := range []string{
 		"Local I/O Read Time", "Local I/O Write Time",
 		"Temp I/O Read Time", "Temp I/O Write Time",
@@ -533,7 +533,7 @@ func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *test
 func TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false, 0)
 	for _, key := range []string{
 		"Local I/O Read Time", "Local I/O Write Time",
 		"Temp I/O Read Time", "Temp I/O Write Time",

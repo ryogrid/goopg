@@ -109,6 +109,21 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 // on P2-04 because the plan cache is cross-session and carries no GUC
 // fingerprint.
 func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, error) {
+	node, _, err := planWithRtableSize(stmt, cat, plannerSet)
+	return node, err
+}
+
+// planWithRtableSize is PlanWithSettings that also reports the statement's
+// range-table size — PG's list_length(plannedstmt->rtable) less its RTE_GROUP
+// entry, which EXPLAIN reads as es->rtable_size (explain.c ExplainPrintPlan).
+// Every RTE consumes one RTID from the statement scope (rtableScope F6:
+// FROM relations, subquery / view / VALUES / function entries — pulled up or
+// not — partition and inheritance children, sublink and CTE bodies), so the
+// scope's allocation count is that size. EXPLAIN needs it because a
+// subquery or view RTE leaves no node in a plan whose Subquery Scan was
+// pulled up or stripped, yet PG still qualifies upper-node columns
+// (`useprefix = es->rtable_size > 1`) for it. M0148-0001e.
+func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerSettings) (Node, int, error) {
 	// P0-E8: one planState per top-level statement (planstate.go); a
 	// re-entrant call (a view body, EXPLAIN's inner statement, COPY
 	// (query)) already carries its statement's and shares it.
@@ -150,7 +165,7 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	scope := newRtableScope()
 	node, err := planStmtWithSettings(stmt, cat, plannerSet, scope)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// Cost-model doc 13 Phase 2's final NLI-layout reconciliation
 	// (`reconcileNLILayout`) lost its only production call site here at
@@ -243,7 +258,7 @@ func PlanWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet PlannerS
 	// M0146-0034: record which index scan carries the ORDER BY, for the
 	// parallel post-pass that runs on this plan without the statement.
 	markIndexOrderRelied(node, stmt)
-	return node, nil
+	return node, int(scope.next - 1), nil
 }
 
 func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
@@ -402,12 +417,12 @@ func planStmtWithSettings(stmt parser.Stmt, cat catalog.Catalog, plannerSet Plan
 		// cost, so of all the recursive entry points this is the one that must
 		// not default.
 		planStart := time.Now()
-		inner, err := PlanWithSettings(explainInner, cat, plannerSet)
+		inner, rtableSize, err := planWithRtableSize(explainInner, cat, plannerSet)
 		if err != nil {
 			return nil, err
 		}
 		planningNs := time.Since(planStart).Nanoseconds()
-		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner, PlanningNs: planningNs}, nil
+		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner, PlanningNs: planningNs, RtableSize: rtableSize}, nil
 
 	case *parser.CopyStmt:
 		// EX3-03 cut 1: COPY (SELECT …) plans a full SELECT, so it threads

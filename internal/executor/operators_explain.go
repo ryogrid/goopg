@@ -125,7 +125,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			// horizons.spec reads ...->0->'Plan'->'Heap Fetches', so the
 			// wrapper is load-bearing (design 0118-0102).
 			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
-			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming)}
+			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming, o.plan.RtableSize)}
 			if opts.Buffers {
 				root["Planning"] = planningBufferUsageJSON(trackIOTiming)
 			}
@@ -142,7 +142,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx))
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats, ctx.HashJoinStats, ctx.GatherLaunched, ctx.GatherWorkerStats, ctx.SortStats, ctx.SortWorkerStats, ctx.MemoizeWorkerStats, explainHashMem(ctx), o.plan.RtableSize)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -162,7 +162,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		// serialized plan tree, nested under a top-level "Plan" key
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
-		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
+		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts, o.plan.RtableSize)}
 		if opts.Buffers {
 			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
 			root["Planning"] = planningBufferUsageJSON(trackIOTiming)
@@ -179,7 +179,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 	var b strings.Builder
-	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx))
+	walkPlan(&b, o.plan.Child, 0, &o.rows, opts, explainHashMem(ctx), o.plan.RtableSize)
 	appendExplainSettingsRow(ctx, opts, &o.rows)
 	if plainSummary {
 		o.rows = append(o.rows,
@@ -479,8 +479,8 @@ func (o *explainOp) Close() error { return nil }
 // `(rows=N)` is only appended when opts.Costs is true (the PG
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
-func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64) {
-	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+func walkPlan(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, hashMem int64, rtableSize int) {
+	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
 	walkPlanFiltered(n, depth, rows, opts, nil, nil, reg)
 }
@@ -6246,8 +6246,8 @@ func schemaColumnNames(n optimizer.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64) {
-	reg := &subPlanReg{rel: newExplainNames(n), cte: collectCTEHoist(n), hashMemLimit: hashMem}
+func walkPlanAnalyze(b *strings.Builder, n optimizer.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[optimizer.Expr]*SubPlanSiteStats, memoStats map[*optimizer.Memoize]*MemoizeStats, hashStats map[*optimizer.Join]*HashJoinStats, gatherLaunched gatherLaunchedTable, workerStats workerNodeStatsTable, sortStats map[*optimizer.Sort]SortStat, sortWorkers map[*optimizer.Sort][]SortStat, memoWorkers map[*optimizer.Memoize][]MemoizeStats, hashMem int64, rtableSize int) {
+	reg := &subPlanReg{rel: newExplainNamesSized(n, rtableSize), cte: collectCTEHoist(n), hashMemLimit: hashMem}
 	reg.reservePGPlanIDs(n)
 	reg.sortStats, reg.sortWorkers = sortStats, sortWorkers
 	reg.memoWorkers = memoWorkers
@@ -6787,9 +6787,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 // trackIOTiming is the caller's track_io_timing GUC snapshot (see the
 // "Shared I/O Read/Write Time" gating below) and is threaded unchanged
 // through the recursive Plans re-render.
-func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
+func planToJSONWithStats(n optimizer.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool, rtableSize int) map[string]any {
 	// P0-04e: one name table for the whole plan, as in planToJSON.
-	nm := newExplainNames(n)
+	nm := newExplainNamesSized(n, rtableSize)
 	return planToJSONWithStatsNamed(n, opts, stats, trackIOTiming, &subPlanReg{rel: nm})
 }
 
@@ -6930,11 +6930,11 @@ func jsonCollapse(n optimizer.Node) (surviving optimizer.Node, filter optimizer.
 // only when opts.Verbose is set (matches upstream's behaviour
 // where columns are part of VERBOSE output, not the default
 // JSON shape).
-func planToJSON(n optimizer.Node, opts parser.ExplainOptions) map[string]any {
+func planToJSON(n optimizer.Node, opts parser.ExplainOptions, rtableSize int) map[string]any {
 	// P0-04e: one name table for the whole plan, shared down the
 	// recursion — a per-node table would count only that subtree's
 	// relations and qualify differently from the text walker.
-	nm := newExplainNames(n)
+	nm := newExplainNamesSized(n, rtableSize)
 	return planToJSONNamed(n, opts, &subPlanReg{rel: nm})
 }
 

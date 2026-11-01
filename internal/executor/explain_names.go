@@ -114,14 +114,25 @@ type explainNames struct {
 	// scope resolves to a transparent inlined CTE can be chased into the
 	// CTE body (transparentCTEFor). M0146-0021.
 	nodes map[int32]optimizer.Node
+	// rtableSize is PG's es->rtable_size for the explained statement when
+	// the planner reported it (optimizer.Explain.RtableSize), else 0.
+	rtableSize int
 }
 
 // nodePtr returns a unique string id for a plan node.
 func nodePtr(n optimizer.Node) string { return fmt.Sprintf("%p", n) }
 
-// newExplainNames builds the name table for the plan rooted at n.
+// newExplainNames builds the name table for the plan rooted at n, with the
+// statement's range-table size unknown.
 func newExplainNames(n optimizer.Node) *explainNames {
+	return newExplainNamesSized(n, 0)
+}
+
+// newExplainNamesSized is newExplainNames given the statement's range-table
+// size from the planner (optimizer.Explain.RtableSize), 0 when unknown.
+func newExplainNamesSized(n optimizer.Node, rtableSize int) *explainNames {
 	nm := &explainNames{
+		rtableSize: rtableSize,
 		bySource:   map[int32]string{},
 		taken:      map[string]int{},
 		seen:       map[int32]bool{},
@@ -140,8 +151,15 @@ func newExplainNames(n optimizer.Node) *explainNames {
 // (explain.c show_upper_qual / show_sort_group_keys): a single-relation
 // query keeps the bare column names PostgreSQL prints for it, so the common
 // case of EXPLAIN output is byte-identical to before this table existed.
+//
+// The plan-visible relation count undercounts PG's range table whenever an
+// RTE left no node: a FROM subquery or view pulled up into its parent, a
+// Subquery Scan stripped as trivial, a removed join's relation. PG still
+// counts those (`SELECT … FROM (SELECT * FROM btg ORDER BY …) q1 GROUP BY …`
+// prints `Group Key: btg.x`), so the planner's statement-wide count wins
+// when it is known.
 func (nm *explainNames) qualify() bool {
-	return nm != nil && len(nm.bySource) > 1
+	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1)
 }
 
 // name returns the printed relation name for a binding, or "" when the
