@@ -3,7 +3,9 @@
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
 slice 1 landed `fed4f53ed` (run-2 loop #15, 2026-11-02); slice 2 (range-table
 size qualification) landed `f1709f7ab` (run-2 loop #16); slice 3 (merge-join
-outer Incremental Sort) landed `f26987104` (run-2 loop #17); the task stays open
+outer Incremental Sort) landed `f26987104` (run-2 loop #17); slice 4
+(reordering over presorted\-aggregate keys) landed `058e52bae` (run-2 loop
+#18); the task stays open
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -134,7 +136,35 @@ beat the written (w, x, z) order.
   326 → 307; the other 32 suites unchanged.
 - Pin: `TestMergeJoinOuterIncrementalSort`.
 
+## Slice 4 — reordering over the presorted\-aggregate keys
+
+`adjust_group_pathkeys_for_groupagg` (`planner.c`) appends an ordered or
+DISTINCT aggregate's sort keys behind the GROUP BY keys in
+`root->group_pathkeys`; `group_keys_reorder_by_pathkeys` reorders only the
+first `num_groupby_pathkeys` of that list (the walk over the input's pathkeys
+stops at the first one past them) and `list_concat_unique_ptr` keeps the
+aggregate keys behind the reordered prefix. Slice 1 offered no reordering at
+all when the presorted\-aggregate keys were in use, so
+`SELECT y, x, array_agg(distinct w) FROM btg WHERE y < 0 GROUP BY x, y`
+sorted on (x, y, w) above the `btg_y_x_w_idx` Index Only Scan, where PG
+groups as `y, x` straight off it.
+
+- `groupKeyPositions` now always returns the GROUP BY positions;
+  `groupKeyOrderings` reorders that prefix of the key list (checked to be the
+  processed group clause, else only the written order is offered), compares
+  the matched count with the GROUP BY count, and appends the aggregate keys
+  behind the reordered prefix.
+- Regress runner, HEAD vs change over 34 suites: aggregates 377 → 372 diff
+  lines; the other 33 unchanged.
+- Pin: `TestGroupByReorderKeepsPresortedAggregateKeys`.
+
 ## Remaining (task stays open)
+
+- The `array_agg(DISTINCT w)` block's remaining lines: VERBOSE does not force
+  column prefixing (`Group Key: btg.y, btg.x`, `Index Cond: (btg.y < 0)`;
+  PG's `useprefix = … || es->verbose` in show\_scan\_qual, show\_upper\_qual
+  and show\_sort\_group\_keys — ledger row M0125\-0039 arm a), the Output
+  line (M0148\-0001f), and a `Filter` that repeats the Index Cond.
 
 - The verbose `array_agg(DISTINCT …)` case and the `Disabled: true` lines
   (the latter belong to M0148-0001f).

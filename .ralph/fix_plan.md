@@ -11342,6 +11342,11 @@ Movement: yes — regress aggregates diff lines -217/+179 → -214/+176
     existed. btg merge-join block byte-identical; incremental_sort 326 → 307
     diff lines.
 Movement: yes — regress aggregates diff lines 390 → 377
+  - LANDED slice 4 `058e52bae` (2026-11-02, run-2 loop #18): GROUP BY
+    reordering also over the presorted-aggregate keys (reorder the
+    num_groupby_pathkeys prefix, keep the aggregate keys behind it); the
+    array_agg(DISTINCT w) block lost its Sort and groups as `y, x`.
+Movement: yes — regress aggregates diff lines 377 → 372
   - Open (task stays `[ ]`): verbose
     `array_agg(DISTINCT …)` case; `group by g%10000` Hash vs Sort election;
     Index Cond pushdown (no duplicated Filter); hunks 2847, 3129.
