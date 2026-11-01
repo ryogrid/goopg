@@ -95,3 +95,54 @@ func TestExplainQualifiesForStrippedSubqueryRTE(t *testing.T) {
 		t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", q, got, want)
 	}
 }
+
+// M0148-0001e: PG 18's try_mergejoin_path sorts a merge join's outer with an
+// Incremental Sort when the outer path already delivers a leading prefix of
+// the merge ordering (outer_presorted_keys; initial_cost_mergejoin prices
+// cost_incremental_sort). sort_inner_and_outer offers the `x`-first rotation
+// of the merge keys, t1's (x, y) index scan is presorted on x, and the
+// GroupAggregate above takes the join's (x, w, z) order with no Sort —
+// aggregates.out's "Utilize the ordering of merge join" case, verified
+// against PG 18.3. enable_incremental_sort = off falls back to full Sorts.
+func TestMergeJoinOuterIncrementalSort(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE btg (x int NOT NULL, y int NOT NULL, z text, w int)",
+		"INSERT INTO btg SELECT i % 10, i % 10, 'abc' || i % 10, i FROM generate_series(1, 100) AS i",
+		"CREATE INDEX btg_x_y_idx ON btg(x, y)",
+		"ANALYZE btg",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableHashAgg = false
+	ps.EnableSeqScan = false
+	ps.EnableHashJoin = false
+	ps.EnableNestLoop = false
+	q := "EXPLAIN (COSTS OFF) SELECT count(*) FROM btg t1 JOIN btg t2 ON t1.w = t2.w AND t1.x = t2.x AND t1.z = t2.z GROUP BY t1.w, t1.z, t1.x"
+	want := strings.Join([]string{
+		"GroupAggregate",
+		"  Group Key: t1.x, t1.w, t1.z",
+		"  ->  Merge Join",
+		"        Merge Cond: ((t1.x = t2.x) AND (t1.w = t2.w) AND (t1.z = t2.z))",
+		"        ->  Incremental Sort",
+		"              Sort Key: t1.x, t1.w, t1.z",
+		"              Presorted Key: t1.x",
+		"              ->  Index Scan using btg_x_y_idx on btg t1",
+		"        ->  Sort",
+		"              Sort Key: t2.x, t2.w, t2.z",
+		"              ->  Index Scan using btg_x_y_idx on btg t2",
+	}, "\n")
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n"); got != want {
+		t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", q, got, want)
+	}
+	vq := "SELECT t1.x, t1.w, count(*) FROM btg t1 JOIN btg t2 ON t1.w = t2.w AND t1.x = t2.x AND t1.z = t2.z GROUP BY t1.w, t1.z, t1.x ORDER BY t1.w LIMIT 3"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, vq, ps)), ";"); got != "1|1|1;2|2|1;3|3|1" {
+		t.Errorf("values: %s", got)
+	}
+	ps.EnableIncrementalSort = false
+	if plan := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n"); strings.Contains(plan, "Incremental Sort") {
+		t.Errorf("enable_incremental_sort = off must not build an Incremental Sort:\n%s", plan)
+	}
+}

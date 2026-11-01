@@ -284,7 +284,7 @@ func sortInnerAndOuter(s *searchCtx, joinrel, outer, inner *RelOptInfo, cp costP
 		// pathkeys makes that a property of the construction instead of a
 		// check — the groups partition `keys`, so the concatenation is a
 		// permutation of it.
-		addMergeJoinPath(joinrel, o, i, outer, inner, cp, jt, innerUnique, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+		addMergeJoinPath(s, joinrel, o, i, outer, inner, cp, jt, innerUnique, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
 		// E-20 Cut 3: PG's `sort_inner_and_outer` loop offers a partial
 		// mergejoin per ordering (`cheapest_partial_outer` +
 		// `cheapest_safe_inner`, joinpath.c:1535-1545), beside the serial
@@ -336,9 +336,12 @@ func rotateToFront(groups []mergeKeyGroup, front int) []mergeKeyGroup {
 //     goopg keeps it whole, which can only leave `addPath` distinguishing two
 //     paths PG would have merged — more paths considered, never fewer, and
 //     never a different winner on cost. Ledgered.
-func addMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
+func addMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outer, inner *RelOptInfo, cp costParams, jt parser.JoinType, innerUnique bool, outerKeys, innerKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
+	}
+	if inc := mergeOuterIncrementalSort(s, o, outerKeys, cp); inc != nil {
+		o = inc
 	}
 	// `sort_inner_and_outer` chooses the result ordering itself, so the outer
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
@@ -496,6 +499,39 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 			// create_mergejoin_path (pathnode.c:2660). C-19a.
 		ParallelSafe: parallelSafeWith(joinrel, op, ip),
 	}, "mergejoin")
+}
+
+// mergeOuterIncrementalSort is PG 18's incremental arm of try_mergejoin_path /
+// try_partial_mergejoin_path (joinpath.c): when the outer must be sorted to
+// `keys` but its path already delivers a leading prefix of them
+// (`pathkeys_count_contained_in` → outer_presorted_keys > 0) and
+// enable_incremental_sort is on, the outer is sorted by an Incremental Sort
+// over that prefix (initial_cost_mergejoin prices cost_incremental_sort,
+// create_mergejoin_plan builds the node). aggregates.out's btg merge join:
+// the `x`-first merge ordering sorts t1's (x, y) index scan as
+// `Incremental Sort (Presorted Key: t1.x)` and wins. The inner never gets one
+// — incremental sort does not support mark/restore.
+//
+// Nil when a plain Sort applies: the outer is already ordered, nothing is
+// presorted, the GUC is off, or the presorted group count cannot be estimated
+// (searchRelNumGroups' column-only rule; no search context in unit callers).
+func mergeOuterIncrementalSort(s *searchCtx, o *Path, keys []PathKey, cp costParams) *Path {
+	if s == nil || o == nil || len(keys) == 0 || !cp.enableIncrementalSort {
+		return nil
+	}
+	var u *pathkeyUsefulness
+	if o.Rel != nil {
+		u = o.Rel.usefulKeys
+	}
+	contained, presorted := u.countContainedIn(o.Pathkeys, keys)
+	if contained || presorted == 0 {
+		return nil
+	}
+	groups, ok := s.searchRelNumGroups(o.Rel, o.Pathkeys[:presorted], o.Rows)
+	if !ok {
+		return nil
+	}
+	return incrementalSortPathWithGroups(o.Rel, o, keys, presorted, groups, cp, -1)
 }
 
 // sortPathFor wraps `sub` in an explicit Sort delivering `keys` — PG's
