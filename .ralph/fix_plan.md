@@ -11175,7 +11175,7 @@ completion path.
   -140/+163 → -136/+160; the old hunk 1066 region closed byte-exact).
   Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same, acceptance
   arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
-- [ ] **M0148-0001c2 — min/max InitPlan cost residuals (member geometry and
+- [x] **M0148-0001c2 — min/max InitPlan cost residuals (member geometry and
   the unpriced branches)**.
   Kind: impl
   Parent: M0148-0001c
@@ -11240,6 +11240,11 @@ completion path.
     - Still open: arm (4) searched IOS NullTest-as-Index-Cond (+ partial
       index proof), the partial-index member geometry, and the outer scan
       of a correlated min/max SubPlan (tlist SubPlan cost, ledgered).
+  - CLOSED run-2 loop #15: arms (1)-(3) landed (`5040c8c72`, `0e11ec1de`,
+    `91b5b6308`); arm (4) and the partial-index member geometry moved to
+    M0148-0001c3 (filed after the regress-closing children: it closes no
+    regress hunk).
+  Movement: none — instrument artefact — costs moved to PG's exactly (scratch-PG witnesses; TPC-H Q2/Q11 cost text in routing-20261102f) but no regress text, plan shape or census verdict depends on them.
 - [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
@@ -11393,6 +11398,23 @@ completion path.
   GroupAggregate) vs goopg hash order. PG: `nodeAgg.c
   process_ordered_aggregate_single/multi` (tuplestore drain per agg per
   group). Verify hunks 2186, 2420.
+- [ ] **M0148-0001c3 — searched index paths take a NullTest as an index
+  qual; NullTest-proven partial indexes; unanalysed partial-index size**.
+  Kind: impl
+  Parent: M0148-0001c
+  Split from M0148-0001c2 (arm 4 + residual). PG's match\_clause\_to\_indexcol
+  (indxpath.c) accepts `col IS [NOT] NULL` as an index clause on a btree
+  (amsearchnulls), so `WHERE x IS NOT NULL ORDER BY x` plans `Index Cond: (x IS
+  NOT NULL)`; goopg's searched ordered IOS keeps it as `Filter:` and skips a
+  partial index whose predicate the NullTest proves (check\_index\_predicates /
+  predicate\_implied\_by). Also: a never-analysed partial index's tuple count
+  (PG reads the index's own size; regress minmaxtest3i 0.14..74.79 vs goopg
+  0.15..86.21). Resume: internal/optimizer pathindexclauses.go /
+  pathindexordered.go (NullTest clause arm; predicate proof for the NullTest),
+  costindex.go estimateIndexGeometry (partial-index real tuples). Measure the
+  regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
+  aggregates, join) HEAD vs change before landing; no aggregates hunk depends
+  on it, hence filed after the regress-closing M0148-0001 children.
 - Pre-existing gate flakes recorded (NOT caused by 0001a/b — reproduced on
   the stashed clean HEAD under identical load):
   `TestExplainSplitAggregateChainCosts` (2s absolute conn deadline from dial
