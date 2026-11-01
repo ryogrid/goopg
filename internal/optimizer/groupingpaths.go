@@ -508,8 +508,19 @@ func aggInputPGWidth(child Node, agg *Aggregate) int {
 // create_groupingsets_path's) parallel_safe — `rel->consider_parallel &&
 // subpath->parallel_safe` (pathnode.c) — so that add_path keeps a
 // parallel-safe aggregate beside a cheaper one over a Gather (M0146-0231).
+//
+// It also gives the path cost_agg's disabled_nodes floor (costsize.c:
+// `path->disabled_nodes = input_disabled_nodes`, plus one for a hashed
+// strategy under enable_hashagg = off, which the hashed arm adds itself). The
+// sorted arms built their Agg with no count of their own, so a GroupAggregate
+// over a Sort that enable_sort = off disabled compared as enabled and beat
+// the HashAggregate PG elects — aggregates.out's `group by g%10000` under
+// work_mem = 64kB (M0148-0001e).
 func addAggPath(grouped *RelOptInfo, p *Path, producer string) {
 	p.ParallelSafe = parallelSafeWith(grouped, p.Children...)
+	if in := disabledNodesFor(false, p.Children...); p.DisabledNodes < in {
+		p.DisabledNodes = in
+	}
 	addPath(grouped, p, producer)
 }
 

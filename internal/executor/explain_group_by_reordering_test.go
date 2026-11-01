@@ -183,3 +183,36 @@ func TestGroupByReorderKeepsPresortedAggregateKeys(t *testing.T) {
 		t.Errorf("enable_group_by_reordering = off must keep the written order:\n%s", plan)
 	}
 }
+
+// M0148-0001e: cost_agg (costsize.c) starts an Agg path's disabled_nodes from
+// its input's, so a GroupAggregate over a Sort that enable_sort = off disabled
+// counts one disabled node and loses to an enabled HashAggregate however much
+// the hash spills. aggregates.out: `group by g%10000` with work_mem = 64kB,
+// enable_hashagg on and enable_sort off is a HashAggregate in PG 18.3; goopg's
+// sorted arms carried no count and the GroupAggregate won on cost.
+func TestSortedAggInheritsDisabledSort(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE agg_data_20k AS SELECT g FROM generate_series(0, 19999) g",
+		"ANALYZE agg_data_20k",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.WorkMem = 64 * 1024
+	ps.EnableSort = false
+	q := "EXPLAIN (COSTS OFF) SELECT g%10000 AS c1, sum(g::numeric) AS c2, count(*) AS c3 FROM agg_data_20k GROUP BY g%10000"
+	want := strings.Join([]string{
+		"HashAggregate",
+		"  Group Key: (g % 10000)",
+		"  ->  Seq Scan on agg_data_20k",
+	}, "\n")
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n"); got != want {
+		t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", q, got, want)
+	}
+	vq := "SELECT count(*), sum(c3) FROM (SELECT g%10000 AS c1, count(*) AS c3 FROM agg_data_20k GROUP BY g%10000) s"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, vq, ps)), ";"); got != "10000|20000" {
+		t.Errorf("values: %s", got)
+	}
+}
