@@ -11227,6 +11227,19 @@ completion path.
     - Still open: arm (3) unpriced composite/SeqScan/const InitPlan
       branches, arm (4) searched IOS NullTest-as-Index-Cond, and the
       partial-index member geometry (ledgered).
+  - LANDED run-2 loop #14 arm (3) `91b5b6308` (+ pins `8c7aff0e8`) — the
+    remaining min/max InitPlan branches priced as PG, all exact vs scratch
+    PG 18.3: composite-prefix IOS (cost\_index over k+1 index quals, width
+    the agg column: `0.29..4.48 rows=10`), `max(100)`'s Seq Scan (plain
+    cost\_seqscan, constant width) under a gating Result that now copies
+    its child's cost (copy\_plan\_costsize; `Result 0.00..155.00`), and
+    slice (d)'s equality-pinned scan (the Filter carries cost\_seqscan with
+    the quals' operator cost: `0.00..1.06 rows=1`).
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset (3 corpora) fires=none, pgbench smoke.
+    - Still open: arm (4) searched IOS NullTest-as-Index-Cond (+ partial
+      index proof), the partial-index member geometry, and the outer scan
+      of a correlated min/max SubPlan (tlist SubPlan cost, ledgered).
 - [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl

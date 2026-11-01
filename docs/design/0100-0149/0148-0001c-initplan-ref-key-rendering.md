@@ -516,9 +516,12 @@ printed `HashAggregate (Group Key: min(t1.f1)) → Aggregate`.
 
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
-- **(child M0148-0001c2)** min/max cost residuals: pricing of the
-  composite-prefix, Sort-over-SeqScan and constant-argument InitPlan branches
-  (still legacy) and the searched IOS NullTest-as-Index-Cond. The tree-height
+- **(child M0148-0001c2)** min/max cost residuals: the searched IOS
+  NullTest-as-Index-Cond (arm (4)). Arm (3) landed `91b5b6308`: the
+  composite-prefix IOS, the constant-argument Seq Scan (under a gating Result
+  that now copies its child's cost, as create\_gating\_plan's
+  copy\_plan\_costsize does) and slice (d)'s equality-pinned Seq Scan are
+  priced exactly as PG 18.3. The tree-height
   arm landed `5040c8c72`: `estimateIndexGeometry` reads btm\_fastlevel off the
   btree metapage (`catalog.IndexTreeHeightFunc`, PG's `_bt_getrootheight`), so
   the minmaxtest members and TPC-H's `partsupp_supplier_fkidx` descents equal
