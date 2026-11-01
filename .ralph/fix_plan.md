@@ -5258,7 +5258,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
     Movement: none — analyzer typing; the 42809 shape exists in no TPC
     query \(fireset fires=none, 99/99 plans unchanged\; acceptance arm 24
     MATCH\; sf025 sweep PASS\; spotcheck Q12=2/Q13=35\)\.
-  - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
+  - [x] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
     Parent: M0122-0015
@@ -5289,6 +5289,87 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       2026\-09\-22 — this task is committable again.** The port and the ledger
       rows landed; the fix itself is still open and is the durable\-fix
       sibling\-audit described above.
+    - LANDED 2026\-11\-01 \(this commit\) — both COPY plan sites now resolve
+      through the dispatch scoping, no fourth field\-by\-field patch:
+      `dispatchCopyViaExecutor` plans via `optimizer.PlanWithSettings` +
+      `sessionPlanCatalog`/`resolveConnDBOid`/`sessionPlannerSettings` \(the
+      dispatch PlanCatalog shape, M0122\-0007 slice 4c\) and stamps the
+      context through `wireExtensionRows` + `ectx.PlanCatalog`; the
+      Rule\-#2 twin `runInlineCopy` \(multi\-statement batch, borrows the
+      batch ectx\) plans via `ctxPlanCatalog`/`ctxPlannerSettings` \(the
+      executeOneSimpleStmt shape\).
+      - Live probe \(scratch cluster, PG 18\.3 client tools\): standalone
+        `COPY t1 TO STDOUT`/`FROM STDIN` in a `CREATE DATABASE` database
+        work \(42P01 gone\); `public\.`\-qualified spelling works; the
+        multi\-statement twin `BEGIN; COPY t1 TO STDOUT; COMMIT` works;
+        `pg_dump <userdb>` completes with its data section \(was dying at
+        the first COPY\), and the dump round\-trips through psql into a
+        fresh database \(3/3 rows\)\; the default\-database control and
+        inline FROM \+ ROLLBACK \(rows not persisted\) unchanged\.
+      - Pin: `TestCopyStandaloneResolvesNonDefaultDatabase`
+        \(postmaster/copy\_executor\_test\.go\): user\-db TO \(both
+        spellings\), FROM twin proven through a re\-read, the inline\-batch
+        twin, and the DefaultDBOid\-fallback control on the default
+        database\. Mutation\-checked: reverting the standalone plan line
+        fails it with the production 42P01\; reverting the twin line fails
+        it at the inline arm\.
+      - Sibling audit \(the task\'s own requirement\): every other
+        `executor.NewContext` site in postmaster is already scoped on
+        purpose — subscription refresh stamps the subscriber\'s dbOid
+        \(M0122\-0014\)\; `runAuthidHeapTxn` and the database\-DDL heap sync
+        guards stamp DefaultDBOid \(shared catalog\) or the created
+        database\'s oid; the extended path wires per\-DB via
+        `wireExtensionRows` \(dispatch\_extended\.go:241\)\;
+        `subscription refresh` passes the resolved table object
+        directly\. COPY was the last under\-scoped site\.
+      - Unblocks the test\-port tier: 18 of the 23 unported
+        `005_pg_dump_filterfile` assertions are PORTED \(this commit —
+        subtests `pg\_dumpall\_exclude\_database` \+
+        `restore\_of\_other\_objects`\)\; the ported pair closes defects
+        \(2\)\/\(3\) of that file\'s measured list \(pg\_proc leak by
+        M0122\-0015d, PREPARE by 0015c, COPY by this task\)\. CSV 69→87
+        of 92\; regen\-testport \+ check\-testport\-inventory PASS\.
+      - Newly measured \(filed as M0122\-0015h below, S2\): the remaining
+        5 assertions need `pg\_get\_indexdef`/`pg\_get\_triggerdef`, which
+        return empty strings — `pg_dump` archives INDEX/TRIGGER entries
+        with empty bodies, so restores lose index/trigger DDL\.
+      - Observed \(pre\-existing, not filed — no nightly subject\):
+        `TestSimpleQueryBatchAbortUndoesEarlierCreateTable`
+        \(dispatch\_batch\_atomicity\_test\.go\) flakes under
+        `go test \-parallel 4` load \(CREATE TABLE undo lost\) and passes
+        in isolation; reproduced IDENTICALLY on the unmodified tree twice\.
+    Movement: none — client\-tool/session correctness\; no plan instrument
+    \(fireset\-scope OUT on `internal/postmaster/copy\.go`\; tpch\-spotcheck
+    Q12=2/Q13=35\; acceptance arm 24 MATCH\; sf025 sweep 99/99
+    plan\-shape identical\; s9 census REUSE\)\.
+  - [ ] **M0122\-0015h — `pg\_get\_indexdef` / `pg\_get\_triggerdef` return the
+    empty string, so `pg\_dump` archives INDEX/TRIGGER entries with no DDL**
+    \(filed 2026\-11\-01 by the M0122\-0015a loop while unblocking the
+    `005\_pg\_dump\_filterfile` sourcedb arms\)\.
+    - > **ESCALATION 2026\-11\-01 \(S2, data loss on restore\).** The custom\-format
+      > dump of ANY table with an index or trigger archives those TOC entries
+      > with EMPTY bodies\; `pg\_restore` replays a bare `;` and the restored
+      > database silently lacks every index and trigger\. Measured on the
+      > `005` fixture: `pg\_restore --list filter\_test.dump` lists
+      > `251; 1259 16463 INDEX public t1_idx1` and `253; 2620 16465 TRIGGER
+      > public t1 trg1`, and `pg\_restore --file` emits comment blocks + `;`
+      > for each — no `CREATE INDEX`/`CREATE TRIGGER` text\.
+    - Cause: `SELECT pg\_get\_indexdef\(i\.indexrelid\) FROM pg\_index i` → empty
+      string\; `SELECT pg\_get\_triggerdef\(oid\) FROM pg\_trigger` → empty string
+      \(rows exist — `count\(\*\) FROM pg\_trigger WHERE tgname IN
+      \('trg1','trg2'\)` = 2\)\. pg\_dump\'s `collectIndexDefinitions` /
+      trigger collection build the archived DDL from exactly these functions
+      \(`pg\_dump\.sh`/`index\.c`/\`trigger\.c\`\)\.
+    - First step: implement `pg\_get\_indexdef\(oid\)` as PG\'s
+      `pg\_get\_indexdef\_internal` \(`catalog/pg\_index\.c` is the entry; the
+      deparse is `ruleutils\.c: pg\_get\_indexdef\_worker` — the same machinery
+      goopg\'s EXPLAIN index rendering already walks\) and `pg\_get\_triggerdef`
+      as PG\'s `pg\_get\_triggerdef\_worker` \(ruleutils\.c\)\; the pin is the
+      `005` index/trigger arm \(5 assertions\), ported with it\.
+    - Rank: below item 10 under the S7 correctness\-only carve\-out \(no plan
+      instrument\; expected `Movement: regress`/`none`\)\.
+    Kind: bug
+    Parent: M0122\-0015
   - [!] **BLOCKED — OWNER ACTION NEEDED \(2026\-09\-22, loop \#17\)**. The
     foreign\-table durability work below is complete, fully gated and
     **staged**, but `git commit` cannot land it: the `commit-msg` hook exits
