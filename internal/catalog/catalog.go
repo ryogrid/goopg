@@ -3533,6 +3533,38 @@ type commentKey struct {
 }
 
 // StatisticsObject tracks one CREATE STATISTICS object. M0097-0023.
+// statisticsObjKindArray renders pg_statistic_ext.stxkind, the "char"[] of
+// enabled statistics kinds, as CreateStatistics (statscmds.c:385-507) builds
+// it: the requested kinds, or all of ndistinct/dependencies/mcv when none was
+// requested and the object spans two or more columns/expressions, then 'e'
+// whenever the ON list holds an expression — in d, f, m, e order. psql's
+// `\d` / `\dX` read it through `'d' = any(stxkind)`; the stub's empty
+// string answered NULL there.
+func statisticsObjKindArray(obj *StatisticsObject) string {
+	want := map[string]bool{}
+	for _, k := range obj.Kinds {
+		want[strings.ToLower(k)] = true
+	}
+	numcols := len(obj.Columns) + len(obj.Exprs)
+	if len(want) == 0 && numcols >= 2 {
+		want["ndistinct"], want["dependencies"], want["mcv"] = true, true, true
+	}
+	var kinds []string
+	if want["ndistinct"] {
+		kinds = append(kinds, "d")
+	}
+	if want["dependencies"] {
+		kinds = append(kinds, "f")
+	}
+	if want["mcv"] {
+		kinds = append(kinds, "m")
+	}
+	if obj.HasExpr || len(obj.Exprs) > 0 {
+		kinds = append(kinds, "e")
+	}
+	return "{" + strings.Join(kinds, ",") + "}"
+}
+
 type StatisticsObject struct {
 	Name     string // unqualified name
 	Schema   string // schema name (empty = public)
@@ -10876,7 +10908,12 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "stxstattarget", Type: Type{Name: "int4"}, Ordinal: 5},
 			{Name: "stxkeys", Type: Type{Name: "int2[]"}, Ordinal: 6},
 			{Name: "stxexprs", Type: Type{Name: "text"}, Ordinal: 7},
-			{Name: "stxkind", Type: Type{Name: "text"}, Ordinal: 8},
+			// PG's stxkind is "char"[] (pg_statistic_ext.h), as the
+			// executor's PGStatisticExtColumnsPG18 and pg_attribute already
+			// say. Typed `text` here, the planner rejected psql's
+			// `'d' = any(stxkind)` (every `\d <table>`) once M0122-0015f
+			// started enforcing make_scalar_array_op's array operand rule.
+			{Name: "stxkind", Type: Type{Name: "char[]"}, Ordinal: 8},
 		},
 		OID: 3381,
 	}
@@ -10917,7 +10954,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 			row[6] = "" // stxkeys
 			row[7] = "" // stxexprs
-			row[8] = "" // stxkind
+			row[8] = statisticsObjKindArray(obj) // stxkind
 			out = append(out, row)
 		}
 		return out

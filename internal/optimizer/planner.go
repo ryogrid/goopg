@@ -13116,7 +13116,39 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 			// keeps the Aggregate; the Sort fallback below is reached only when
 			// such an index exists but the index-only probe declined (PG would
 			// take that index path — ledgered).
-			return nil, SchemaColumn{}, false, nil
+			//
+			// M0148-0001c slice (d): unless a WHERE conjunct pins the agg
+			// column to a pseudo-constant (`f1 = 5`, or a correlated
+			// `t1.f1 = t0.f1` — an outer Var is a Param in the subquery).
+			// The equality puts the column in an EquivalenceClass with a
+			// constant, so its pathkey is redundant (pathkeys.c
+			// make_pathkey_from_sortinfo / EC_MUST_BE_REDUNDANT) and
+			// query_pathkeys come out empty: every path is "presorted", and
+			// the cheapest — the plain filtered seq scan — is taken with no
+			// Sort (aggregates.out:1308-1316, `Limit → Seq Scan on int4_tbl
+			// t1 / Filter: ((f1 IS NOT NULL) AND (f1 = t0.f1))`).
+			if !minmaxArgPinnedByEquality(wherePred, argCR) {
+				return nil, SchemaColumn{}, false, nil
+			}
+			alias := refname
+			if strings.EqualFold(alias, tbl.Name) {
+				alias = ""
+			}
+			seq := &SeqScan{pos: pos, Table: tbl, Alias: alias, schema: tableSchemaWithSource(tbl, 1)}
+			// The scan's restriction list: build_minmax_path's NullTest is
+			// lcons'd first; the EC equalities come back after every other
+			// qual (generate_base_implied_equalities), and order_qual_clauses
+			// keeps cost ties in that order.
+			conj := equivalenceClausesLast(append([]Expr{isNotNull}, splitConjuncts(wherePred, nil)...), nil)
+			pred := conj[0]
+			for _, c := range conj[1:] {
+				pred = andExpr(pos, pred, c)
+			}
+			proj := &Project{pos: pos, Child: &Filter{pos: pos, Child: seq, Predicate: pred},
+				Targets: []Expr{&ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
+					Type: argCR.Type, SourceTableIdx: 1}},
+				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
+			inner = &Limit{pos: pos, Child: proj, Limit: &IntegerConst{pos: pos, Value: 1}}
 		}
 		if inner == nil {
 			// SeqScan fallback: no qualifying index — neither the leading-column
@@ -13294,6 +13326,37 @@ func buildMinMaxAppendRelMerge(cat catalog.Catalog, ctx *resolveContext, parent 
 	top.setPlanCost(PlanCost{StartupCost: mc.Startup, TotalCost: mc.Total, PlanRows: sumRows,
 		PlanWidth: TupleWidth(top.Output())})
 	return top, true
+}
+
+// minmaxArgPinnedByEquality reports whether a top-level conjunct of where
+// equates the agg column with a pseudo-constant — a plain constant or bind
+// parameter (isPlainConstantBound), or an outer-level column, which the
+// subquery sees as a Param. Such an equality makes the column's pathkey
+// redundant (M0148-0001c slice (d)), so build_minmax_path needs no ordered
+// path at all.
+func minmaxArgPinnedByEquality(where Expr, arg *ColumnRef) bool {
+	if where == nil || arg == nil {
+		return false
+	}
+	for _, c := range splitConjuncts(where, nil) {
+		b, ok := c.(*BinaryOp)
+		if !ok || b.Op != parser.OpEq {
+			continue
+		}
+		for _, side := range [][2]Expr{{b.Left, b.Right}, {b.Right, b.Left}} {
+			cr, ok := side[0].(*ColumnRef)
+			if !ok || cr.Name != arg.Name || cr.Index != arg.Index {
+				continue
+			}
+			if isPlainConstantBound(side[1]) {
+				return true
+			}
+			if _, outer := side[1].(*OuterColumnRef); outer {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // minmaxRelTuples is baserel->tuples for a min/max subquery relation:

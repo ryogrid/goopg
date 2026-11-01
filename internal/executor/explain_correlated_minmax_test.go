@@ -195,3 +195,55 @@ func TestExplainMinMaxMultiTargetProjectSet(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c slice (d): an equality pinning the agg column to a
+// pseudo-constant — a literal, or an outer column (a Param inside the
+// sublink) — makes build_minmax_path's pathkey redundant, so PG plans the
+// InitPlan as `Limit → Seq Scan` with no Sort even without an index
+// (aggregates.out:1300-1316, bug #18465's DISTINCT case). goopg declined the
+// rewrite (no presorted index) and printed an Aggregate.
+func TestMinMaxEqualityPinnedSeqScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE mmp (f1 int4)",
+		"INSERT INTO mmp VALUES (0), (123456), (-123456), (2147483647), (-2147483647), (NULL)",
+		"ANALYZE mmp",
+	} {
+		runSQL(t, ctx, q)
+	}
+	for _, tc := range []struct{ q, want string }{
+		{"EXPLAIN (COSTS OFF) SELECT f1, (SELECT min(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1) FROM mmp t0", strings.Join([]string{
+			"Seq Scan on mmp t0",
+			"  SubPlan 2",
+			"    ->  Result",
+			"          InitPlan 1",
+			"            ->  Limit",
+			"                  ->  Seq Scan on mmp t1",
+			"                        Filter: ((f1 IS NOT NULL) AND (f1 = t0.f1))",
+		}, "\n")},
+		{"EXPLAIN (COSTS OFF) SELECT max(f1) FROM mmp WHERE f1 = 5 AND f1 > 2", strings.Join([]string{
+			"Result",
+			"  InitPlan 1",
+			"    ->  Limit",
+			"          ->  Seq Scan on mmp",
+			"                Filter: ((f1 IS NOT NULL) AND (f1 > 2) AND (f1 = 5))",
+		}, "\n")},
+	} {
+		if got := strings.Join(renderRows(runSQL(t, ctx, tc.q)), "\n"); got != tc.want {
+			t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", tc.q, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ q, want string }{
+		{"SELECT f1, (SELECT DISTINCT min(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1) FROM mmp t0 ORDER BY f1",
+			"-2147483647|-2147483647;-123456|-123456;0|0;123456|123456;2147483647|2147483647;NULL|NULL"},
+		{"SELECT f1, (SELECT max(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1 AND t1.f1 > 0) FROM mmp t0 ORDER BY f1",
+			"-2147483647|NULL;-123456|NULL;0|NULL;123456|123456;2147483647|2147483647;NULL|NULL"},
+		{"SELECT min(f1), max(f1) FROM mmp WHERE f1 = 0", "0|0"},
+		{"SELECT min(f1) FROM mmp WHERE f1 = 7", "NULL"},
+	} {
+		if got := strings.Join(renderRows(runSQL(t, ctx, tc.q)), ";"); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+		}
+	}
+}
