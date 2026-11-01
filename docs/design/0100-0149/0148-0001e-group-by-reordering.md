@@ -5,7 +5,8 @@ slice 1 landed `fed4f53ed` (run-2 loop #15, 2026-11-02); slice 2 (range-table
 size qualification) landed `f1709f7ab` (run-2 loop #16); slice 3 (merge-join
 outer Incremental Sort) landed `f26987104` (run-2 loop #17); slice 4
 (reordering over presorted\-aggregate keys) landed `058e52bae` (run-2 loop
-#18); the task stays open
+#18); slice 5 (sorted Agg paths inherit disabled\_nodes) landed `11579ae1d`
+(run\-2 loop #19); the task stays open
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -157,6 +158,26 @@ groups as `y, x` straight off it.
 - Regress runner, HEAD vs change over 34 suites: aggregates 377 → 372 diff
   lines; the other 33 unchanged.
 - Pin: `TestGroupByReorderKeepsPresortedAggregateKeys`.
+
+## Slice 5 — sorted Agg paths inherit their input's disabled\_nodes
+
+`cost_agg` (`costsize.c`) sets `path->disabled_nodes = input_disabled_nodes`
+for every Agg path, plus one for `AGG_HASHED` under `enable_hashagg = off`.
+goopg's hashed and rollup arms set their counts, but the sorted GROUP\_AGG
+arms built their Agg with none, so a GroupAggregate over a Sort that
+`enable_sort = off` disabled compared as enabled. `group by g%10000` with
+`work_mem = 64kB`, `enable_hashagg` on and `enable_sort` off is a
+HashAggregate in PG 18.3 — the Sort is disabled however much the hash
+spills — and goopg elected GroupAggregate over a Sort on cost.
+
+- `addAggPath` floors the path's `DisabledNodes` at its children's sum; arms
+  that already count more (hashed under `enable_hashagg = off`, rollup sorts)
+  keep theirs.
+- Regress runner, HEAD vs change over 34 suites: aggregates 372 → 362 diff
+  lines; join 15046 → 15048 is the known nondeterministic row order of an
+  unordered hash left join (re\-run standalone, the base build shows the swap
+  and the change does not); the other 32 suites unchanged.
+- Pin: `TestSortedAggInheritsDisabledSort`.
 
 ## Remaining (task stays open)
 

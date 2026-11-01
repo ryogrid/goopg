@@ -11347,9 +11347,16 @@ Movement: yes — regress aggregates diff lines 390 → 377
     num_groupby_pathkeys prefix, keep the aggregate keys behind it); the
     array_agg(DISTINCT w) block lost its Sort and groups as `y, x`.
 Movement: yes — regress aggregates diff lines 377 → 372
-  - Open (task stays `[ ]`): verbose
-    `array_agg(DISTINCT …)` case; `group by g%10000` Hash vs Sort election;
-    Index Cond pushdown (no duplicated Filter); hunks 2847, 3129.
+  - LANDED slice 5 `11579ae1d` (2026-11-02, run-2 loop #19): grouping Agg
+    paths carry their input's disabled_nodes (cost_agg's
+    input_disabled_nodes floor, in addAggPath); `group by g%10000` under
+    work_mem 64kB + enable_sort off is now PG's HashAggregate.
+Movement: yes — regress aggregates diff lines 372 → 362
+  - Open (task stays `[ ]`): verbose `array_agg(DISTINCT …)` case
+    rendering (VERBOSE prefix rule — M0125-0039 arm a; Output line =
+    0001f); Index Cond pushdown (IOS Filter repeating its Index Cond);
+    hunks 2847, 3129 (the expected-file numbering of the remaining
+    aggregates hunks; re-derive from a fresh single-suite run).
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
   Kind: impl
   Parent: M0148-0001
