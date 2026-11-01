@@ -11227,19 +11227,21 @@ completion path.
       (`t1.a, t1.b, t2.z`) close. Hunks 1248/1271 are M0148-0001k's (member
       aliases `t1_1`/`t1_2`; partitioned parent Var naming `p_t1.a` vs
       goopg's `p_t1_1.a`).
-  - WIP run-2 loop #7 (implemented, unit-green, NOT applied/committed —
-    the staged slice (d) of 0001c must land first; nightly holds the gates):
-    patch `tmp/m0148-0001d-wip.patch` (sha256 68975b9b…) — `redundantConstGroupKeys`
+  - LANDED run-2 loop #10 slice 1 `5ae6f5416` — `redundantConstGroupKeys`
     gains pathkey\_is\_redundant's duplicate-EC arm (union-find over WHERE +
     inner-join ON `col = col`, same type, no outer join in FROM; a const pin
-    propagates through the class; a repeat of the SAME column stays a key)
-    + pin `TestGroupByKeysRedundantByEquivalence` (6 shapes vs scratch PG
-    18.3 + values; mutation-checked). Regress aggregates on HEAD + patch:
-    27 → 25 (hunks 1211/1225 closed, nothing else moved). Ledger at land
-    time: cross-type equalities unmerged; scan-qual derivation divergence
-    witnessed — PG rewrites `c = d AND d = 2` to `(c = 2) AND (d = 2)`
-    (generate\_base\_implied\_equalities\_const), goopg filters
-    `((c = d) AND (d = 2) AND (c = 2))` (pre-existing, not this patch).
+    propagates through the class; a repeat of the SAME column stays a key).
+    Pin `TestGroupByKeysRedundantByEquivalence` (6 shapes vs scratch PG 18.3
+    + values; mutation-checked). Hunks 1211/1225 closed byte-exact.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+    - Remaining in 0001d's scope: hunk 1271 — the partitioned `p_t1` group
+      key prints the first leaf's Var (`p_t1_1.a, p_t1_1.b`) where PG prints
+      the parent's (`p_t1.a, p_t1.b`): PG groups over the appendrel parent's
+      Vars (the Append's tlist is the parent rel's), goopg's key chase
+      descends into the first Append member. Hunk 1248 is 0001k's (member
+      aliases); 1341 is 0001h's (DROP CASCADE view notices).
+  Movement: yes — regress aggregates 26 → 24 hunks (slice 1).
 - [ ] **M0148-0001e — Incremental Sort presorted-key plans and
   GroupAggregate pathkey alignment**.
   Kind: impl
