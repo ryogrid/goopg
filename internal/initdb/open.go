@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
@@ -2923,6 +2924,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return 0, false
 		}
 		return int64(n), true
+	}
+
+	// M0148-0001c2: _bt_getrootheight for the planner's btree descent cost —
+	// btm_fastlevel from the metapage (block 0), 0 for a rootless tree.
+	catalog.IndexTreeHeightFunc = func(rel storage.RelFileNode) (int, bool) {
+		if !pool.Exists(rel) {
+			return 0, false
+		}
+		if n, err := pool.NBlocks(rel); err != nil || n == 0 {
+			return 0, false
+		}
+		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+		if err != nil {
+			return 0, false
+		}
+		defer pool.Unpin(slot)
+		slot.RLock()
+		m := nbtree.ParseMeta(slot.Page())
+		slot.RUnlock()
+		if m.Magic != nbtree.BTreeMagicPG {
+			return 0, false
+		}
+		if m.Root == 0 { // P_NONE
+			return 0, true
+		}
+		return int(m.FastLevel), true
 	}
 
 	// M0146-0237: estimate_rel_size's RelationGetNumberOfBlocks for the

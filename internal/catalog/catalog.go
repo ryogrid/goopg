@@ -109,6 +109,24 @@ func IndexRealPages(idx *Index) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// IndexTreeHeightFunc reads a btree index's search-tree height from its
+// metapage — nbtpage.c _bt_getrootheight: btm_fastlevel, or 0 when the tree
+// has no root yet (btm_root == P_NONE). get_relation_info stores it as
+// IndexOptInfo.tree_height, which btcostestimate's descent cost reads
+// (selfuncs.c: (tree_height + 1) * 50 * cpu_operator_cost). ok=false when the
+// fork is absent or block 0 is not a btree metapage. Set by initdb with the
+// server's buffer pool; nil (unit tests, tools) leaves the estimate in place.
+var IndexTreeHeightFunc func(rel storage.RelFileNode) (int, bool)
+
+// IndexTreeHeightIn is IndexTreeHeightFunc for idx, its file located where
+// cat.IndexRelFileNode places it (as IndexRealPagesIn does).
+func IndexTreeHeightIn(cat Catalog, idx *Index) (int, bool) {
+	if idx == nil || IndexTreeHeightFunc == nil || cat == nil {
+		return 0, false
+	}
+	return IndexTreeHeightFunc(cat.IndexRelFileNode(idx))
+}
+
 // IndexRealPagesIn is IndexRealPages resolved through cat: the file is looked
 // up where cat.IndexRelFileNode places it. An index in the postgres database
 // carries DBOid 0 or the namespace key DefaultDBOid (1), and its file sits

@@ -637,9 +637,20 @@ func estimateIndexGeometry(cat catalog.Catalog, idx *catalog.Index, tbl *catalog
 		}
 	}
 
-	// Tree height: how many INTERNAL levels sit above the leaves. PG's
-	// `_bt_getrootheight` reports 0 for a single-page index, which is what
-	// log_fanout(tuples) - 1 gives once the leaf level is discounted.
+	// Tree height: how many INTERNAL levels sit above the leaves. PG reads
+	// it off the metapage (get_relation_info → _bt_getrootheight:
+	// btm_fastlevel), so a btree with a storage file answers exactly
+	// (M0148-0001c2: the regress minmaxtest member indexes are single-page
+	// roots, height 0, where the tuple-count guess below said 1 and priced
+	// every descent 0.125 too high). The estimate stays the fallback for a
+	// catalog with no storage attached.
+	if idx != nil && isBTreeIndex(idx) && idx.HasStorage() {
+		if h, ok := catalog.IndexTreeHeightIn(cat, idx); ok {
+			return indexPages, indexTuples, h
+		}
+	}
+	// PG's `_bt_getrootheight` reports 0 for a single-page index, which is
+	// what log_fanout(tuples) - 1 gives once the leaf level is discounted.
 	treeHeight = 0
 	if perPage > 1 && indexTuples > perPage {
 		levels := math.Ceil(math.Log(indexTuples) / math.Log(perPage))
