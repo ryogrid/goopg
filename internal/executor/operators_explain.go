@@ -1479,6 +1479,23 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 				return nil, false
 			}
 			t := n.Targets[col.Index]
+			// M0148-0001c slice (a): the min/max-rewrite Result's target
+			// (rewriteMinMaxAggregates, planner.go) is a scalar InitPlan
+			// sublink, and PG's targetlist entry there is the initplan
+			// Param, which get_variable/get_special_variable prints
+			// `(InitPlan N).col1`. Hand the sublink to the caller:
+			// formatExprQual's SubqueryExpr arm (R65 arm B) renders the
+			// label, and each key site's S18 wrap adds the outer pair for
+			// a non-Var referent, giving aggregates.out's
+			// `Sort Key: ((InitPlan 1).col1)` and
+			// `Group Key: (InitPlan 1).col1`. Every other subplan target
+			// keeps the M0146-0129 decline below.
+			if sq, isSQ := t.(*optimizer.SubqueryExpr); isSQ && optimizer.SublinkIsInitPlan(sq) && sq.Plan != nil {
+				out := n.Output()
+				if col.Index < len(out) && out[col.Index].Name == col.Name {
+					return sq, true
+				}
+			}
 			if _, isCol := t.(*optimizer.ColumnRef); isCol || exprHasSubplanOrOuterRef(t) || exprHasTableZeroRef(t) {
 				return nil, false
 			}
@@ -2352,6 +2369,12 @@ func sortKeyParts(child optimizer.Node, keys []optimizer.SortKey, reg *subPlanRe
 				if ch, ok := chaseKeyExprColumns(keyExpr, child, reg, qualify); ok && keyExprReachesKeptScan(ch, reg) {
 					keyExpr = ch
 				}
+			} else if ch, ok := chaseKeyExprToInitPlanRef(keyExpr, child, reg); ok {
+				// M0148-0001c slice (a): a computed key over a min/max-rewritten
+				// Result (aggregates.sql's `order by max(unique2)+1`): each
+				// column deparse lands on the Result's initplan Param target,
+				// printing `(((InitPlan 1).col1 + 1))`.
+				keyExpr = ch
 			}
 		}
 		s := formatKeyExprQual(keyExpr, reg, qualify)
@@ -2481,6 +2504,36 @@ func chaseKeyExprColumns(key optimizer.Expr, child optimizer.Node, reg *subPlanR
 		return displayColumn(c, "("+formatExprQual(chased, reg, qualify)+")", reg)
 	})
 	if !ok || !changed {
+		return nil, false
+	}
+	return out, true
+}
+
+// chaseKeyExprToInitPlanRef rewrites the columns of a computed Sort/Group
+// key that resolve (through resolveKeySource) to a scalar InitPlan sublink
+// in the child's targetlist — the min/max-rewrite Result's output label,
+// which PG prints as the initplan param `(InitPlan N).col1`
+// (M0148-0001c slice (a), aggregates.sql's
+// `Sort Key: (((InitPlan 1).col1 + 1))`). Only columns that land on an
+// InitPlan sublink are replaced; ok is false when nothing lands, so every
+// other computed key keeps its established rendering.
+func chaseKeyExprToInitPlanRef(key optimizer.Expr, child optimizer.Node, reg *subPlanReg) (optimizer.Expr, bool) {
+	if reg == nil || key == nil || child == nil {
+		return nil, false
+	}
+	hit := false
+	out, ok := optimizer.CloneExprReplacingColumnRefs(key, func(c *optimizer.ColumnRef) optimizer.Expr {
+		chased, ok := resolveKeySource(c, child, reg)
+		if !ok {
+			return c
+		}
+		if sq, isSQ := chased.(*optimizer.SubqueryExpr); isSQ && optimizer.SublinkIsInitPlan(sq) {
+			hit = true
+			return sq
+		}
+		return c
+	})
+	if !ok || !hit {
 		return nil, false
 	}
 	return out, true
