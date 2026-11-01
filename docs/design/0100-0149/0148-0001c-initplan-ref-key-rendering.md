@@ -1,10 +1,11 @@
-# M0148-0001c — Sort/Group Key over a min/max-rewritten Result; multi-target tlist + ProjectSet; multi-agg InitPlans
+# M0148-0001c — Sort/Group Key over a min/max-rewritten Result; multi-target tlist + ProjectSet; multi-agg InitPlans; inheritance Merge Append
 
-**Loop:** #16 slice (a), #17 slice (b), #18/#19/#20 slice (c) part 1 (2026-11-01) · **Parent:** M0148-0001 `aggregates.sql` regress coverage closure
+**Loop:** #16 slice (a), #17 slice (b), #18/#19/#20 slice (c) part 1, run-2 loop #2 slice (c2) (2026-11-01) · **Parent:** M0148-0001 `aggregates.sql` regress coverage closure
 **Baseline:** `scripts/pg-regress-runner.sh -v aggregates` at `bd65d86bc` → 33 hunks
 **After slice (a):** 29 hunks (4 closed: expected-lines 950 / 967 / 984 / 1001; no new diffs)
 **After slice (b):** 28 hunks (1016 closed byte-exact; 1066 / 1145 remain, see Remaining)
 **After slice (c) part 1:** 28 hunks (hunk 1066 awaits the inheritance sub-slice; the multi-InitPlan machinery itself is unit-witnessed)
+**After slice (c2):** 29 hunks, diff lines \-185/\+177 → \-140/\+163 (the `min(f1), max(f1) from minmaxtest` block is byte\-exact; old hunk 1066 split into the two sub\-hunks of the DISTINCT block's Unique\+Sort vs HashAggregate election, child 0001c\-cost)
 
 ## Why
 
@@ -314,12 +315,104 @@ Result
   `fires=none` (no corpus query carries a multi-agg scalar min/max);
   pre-commit pgbench smoke via the hook.
 
+## Slice (c2) — inheritance appendrel: Merge Append InitPlans (hunk 1066)
+
+Target (`aggregates.out:1225-1246`): `select min(f1), max(f1) from
+minmaxtest` over a parent with three inheritance children prints one InitPlan
+per aggregate, each `Limit → Merge Append` over one Index Only Scan per
+member, members aliased `minmaxtest_1`…`_4` (InitPlan 1) and `_6`…`_9`
+(InitPlan 2), `Sort Key: minmaxtest.f1` / `minmaxtest_5.f1 DESC`.
+
+### Mechanism in the oracle
+
+- `preprocess_minmax_aggregates` (planagg.c:121-137) requires ONE
+  `RTE_RELATION` in the jointree — an inheritance parent qualifies (`inh` is
+  not a gate). `build_minmax_path` plans the subquery through
+  `query_planner`, which expands the appendrel (`expand_inherited_rtentry`),
+  and takes `get_cheapest_fractional_path_for_pathkeys` over the final rel:
+  `generate_orderedappend_paths` (allpaths.c) offers a Merge Append whose
+  members each supply the agg ordering.
+- Per member, `build_index_paths` reads the btree in the direction the
+  pathkey needs against the column's `indoption`: an ASC index reads Backward
+  for max, a DESC index reads Backward for min.
+- `check_index_predicates` (indxpath.c) proves a partial index whose
+  predicate is implied by the restriction and removes implied clauses from
+  `indrestrictinfo`, so the `f1 IS NOT NULL` member over
+  `minmaxtest3i ... where f1 is not null` prints no `Index Cond`.
+- Naming: `ExplainPreScanNode` adds an Append/MergeAppend's `apprelids` (the
+  parent RTE) to `rels_used`, so `select_rtable_names_for_explain` names the
+  parent first (bare / `_5`) and its member RTEs after it; numbering is
+  statement-global across InitPlans. `show_merge_append_keys` deparses the
+  sort columns as the parent's Vars.
+
+### Design
+
+- Gate (`rewriteMinMaxAggregates`): partitioned parents still decline; a
+  plain `FROM parent` collects `collectInheritanceDescendants` (the same
+  member order the inheritance scan fans out in); `FROM ONLY` leaves the
+  member list empty (plain single-relation path). `refname` = FROM alias or
+  the lowercased relation name.
+- `buildMinMaxAppendRelMerge` (called by `buildMinMaxInitPlan` when members
+  are present; a WHERE or a disabled index-only shape declines): per member
+  `minmaxMemberIndex` (a `findBTreeIndexForColumn` btree led by the column,
+  else a single-column partial btree whose predicate is exactly
+  `col IS NOT NULL`, reported `predNotNull`), an `IndexOnlyScan` with
+  `Alias = refname`, a fresh RTID, `Cond = col IS NOT NULL` unless
+  `predNotNull`, and `Backward = minmaxScanBackward(idx, 0, isMax)`. Members
+  chain into left-deep ordered-merge `SetOp` links (`MergeKeys` = the column
+  ASC NULLS LAST / DESC NULLS FIRST) — the executor's existing Merge Append
+  (`setOp.nextMerge`). A member without such an index declines the rewrite
+  (PG would merge a Sort over that member's cheapest path).
+- `SetOp.RTID` / `SetOp.AppendRelName` (new; only the chain's TOP link) are
+  the apprelids analogue. The parent RTID is allocated before the members',
+  so `renumberRTIDsFlatRtableOrder` keeps it first in the level and
+  `explainNames` (`explainRelBaseName` / `explainNodeRTID` SetOp arms) hands
+  it the bare name. `appendRelMergeKeyParts` renders the `Sort Key:` against
+  `bySource[SetOp.RTID]`.
+- `explainNames.labelSeen` is now kept across `collect` calls. The root
+  collect already walks sublink bodies; the per-subplan collect
+  `operators_explain` runs before an `InitPlan N` body restarted the label
+  claims and overwrote InitPlan 2's member labels with `_1`…`_4`.
+- Direction fix (`minmaxScanBackward`): `Backward = isMax != ColDescending[k]`
+  in the single-column, composite-prefix and appendrel builders. Before it,
+  `max(x)` over `(x desc)` returned the minimum — a wrong-result defect
+  reachable on any table (S2 record in the fix\_plan entry).
+
+### Slice (c2) files
+
+- `internal/optimizer/planner.go` — gate, `buildMinMaxInitPlan` members /
+  refname parameters, `buildMinMaxAppendRelMerge`, `minmaxMemberIndex`,
+  `minmaxScanBackward`.
+- `internal/optimizer/plan.go` — `SetOp.RTID`, `SetOp.AppendRelName`.
+- `internal/executor/explain_names.go` — SetOp arms, persistent `labelSeen`.
+- `internal/executor/operators_explain.go` — `appendRelMergeKeyParts`.
+- `internal/executor/explain_minmax_appendrel_test.go` —
+  `TestExplainMinMaxAppendRelMergeAppend` (block byte-exact, values incl.
+  FROM ONLY / member edits / alias naming), `TestMinMaxOverDescIndexDirection`.
+
+### Slice (c2) verification
+
+- `scripts/pg-regress-runner.sh -v aggregates`: the minmaxtest EXPLAIN block
+  matches; only the DISTINCT block's election differs (Unique+Sort vs
+  HashAggregate). Every other hunk is byte-identical to the pre-slice diff.
+- PG oracle (scratch PG 18.3 on 5545): the DISTINCT election is an
+  `add_path` fuzzy tie — InitPlans cost 0.64..0.69 each, Result 1.38..1.39,
+  hash vs Unique+Sort totals within 1%, the Unique's pathkeys win; with one
+  key the startup gap exceeds 1% and HashAggregate stays (matching the
+  single-agg `distinct max(unique2)` block). goopg prices the appendrel
+  InitPlans with the legacy estimate (0.00..0.03), so the tie never forms.
+- Mutation check: reverting the direction rule fails both new pins.
+- Gates: tpch spotcheck Q12=2/Q13=35; sf025 sweep PASS=99 MISMATCH=0, 99
+  shapes same; acceptance arm off 24 MATCH; fireset SF0.25+SF1 99/99
+  `fires=none`; precommit pgbench smoke.
+
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
-- **(c2)** hunk 1066: inheritance-tree min/max → Merge Append under the
-  Limit (planagg's per-child index paths) + the four rendering behaviours
-  above (child RTE aliases, Merge Append Sort Key, per-child Index Cond,
-  DESC/partial-index paths).
+- **(c3, child M0148-0001c-cost)** the DISTINCT block over the appendrel
+  InitPlans: price the min/max InitPlan subpaths as PG does (per-member
+  `cost_index` index-only path, `cost_merge_append`, the Limit's fractional
+  cost) so `createDistinctPaths` meets PG's `add_path` fuzzy tie and keeps
+  Unique+Sort.
 - **(d)** hunk 1108/1145: correlated `distinct min(f1) … where unique1 > f1`
   sharing one `InitPlan 1` + `SubPlan 2` (PG moves the InitPlan into the
   SubPlan; goopg rejects the correlated rewrite at M0146-0114's gate).

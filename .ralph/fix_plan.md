@@ -836,6 +836,18 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
+- [x] **min\(x\) / max\(x\) over a DESC btree index return the opposite extreme** \(filed 2026\-11\-01 by the loop inside
+  M0148\-0001c slice \(c2\); S2 wrong\-result class\)\.
+  Kind: impl
+  Parent: none
+  - Repro: `create table dt\(x int\); create index on dt\(x desc\); insert into dt select generate\_series\(1,100\);
+    select max\(x\) from dt` returned 1 \(and `min\(x\)` 100\)\. The min/max InitPlan rewrite set the Index Only Scan's
+    `Backward = isMax` without consulting the index column's `ColDescending`; PG's build\_index\_pathkeys reads a DESC
+    column backward for ASC\.
+  - Fixed in `c4b80c6d6` \(`minmaxScanBackward`: `Backward = isMax != desc`, in the single\-column, composite\-prefix
+    and appendrel builders\); pin `TestMinMaxOverDescIndexDirection` \(mutation\-checked\)\. Fixed in the same commit
+    because slice \(c2\)'s `minmaxtest2i \(f1 desc\)` member needs exactly this rule\.
+  - Movement: none — correctness fix — no plan instrument \(no TPC\-H/TPC\-DS index is DESC\)\.
 - [x] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
   M0122\-0014\)\.
   Kind: impl
@@ -11050,6 +11062,51 @@ completion path.
     Remaining 0001c slices: (c2) inheritance-tree Merge Append
     min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
     sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
+  - LANDED run-2 loop #2 slice (c2) `c4b80c6d6` — an inheritance parent's
+    min/max plans PG's appendrel shape: per agg, `Limit → Merge Append` of
+    one Index Only Scan per member (`buildMinMaxAppendRelMerge`, ordered
+    `SetOp` chain; partial index whose predicate is `col IS NOT NULL` ⇒ no
+    Index Cond via `minmaxMemberIndex`); `FROM ONLY` keeps the plain shape.
+    `SetOp.RTID`/`AppendRelName` are PG's apprelids: the parent claims the
+    bare name, members `_1`..`_4`, InitPlan 2 continues `_5`/`_6`..`_9`;
+    `appendRelMergeKeyParts` prints `Sort Key: minmaxtest_5.f1 DESC`;
+    `explainNames.labelSeen` now persists across collect calls (the
+    per-subplan collect relabelled InitPlan 2's members `_1`..`_4`).
+    `minmaxScanBackward` fixes the DESC-index direction (S2 wrong-result
+    record under M-NIGHTLY "Manually discovered").
+    Pins: `TestExplainMinMaxAppendRelMergeAppend` (aggregates.out:1225-1246
+    byte-exact + values), `TestMinMaxOverDescIndexDirection`.
+    Movement: yes — regress aggregates diff lines -185/+177 → -140/+163
+    (minmaxtest EXPLAIN block byte-exact; hunks 28 → 29 because old hunk
+    1066 split — the DISTINCT block's election remains, child
+    M0148-0001c1). Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99
+    MISMATCH=0 shapes 99 same, acceptance arm 24 MATCH, fireset
+    SF0.25+SF1 fires=none, pgbench smoke.
+    Remaining 0001c work: M0148-0001c1 (DISTINCT election over the
+    appendrel InitPlans), (d) correlated `distinct min` hunk 1145.
+- [ ] **M0148-0001c1 — price the min/max InitPlan subpaths as PG does
+  (DISTINCT election over appendrel InitPlans)**.
+  Kind: impl
+  Parent: M0148-0001c
+  `select distinct min(f1), max(f1) from minmaxtest` must plan
+  `Unique → Sort (Sort Key: ((InitPlan 1).col1), ((InitPlan 2).col1)) →
+  Result` (aggregates.out:1254-1281); goopg plans `HashAggregate`. PG
+  oracle (scratch PG 18.3): each InitPlan costs `Limit 0.64..0.69` over
+  `Merge Append 0.64..394.50 rows=7865` (never-analyzed members: the
+  10-page heuristic, IOS 0.14..16.59 / 0.15..92.55), Result 1.38..1.39;
+  hash and Unique+Sort totals fall within add_path's 1% fuzz with
+  startups also within 1%, so the Unique's pathkeys dominate (with ONE key
+  the startup gap exceeds 1% and HashAggregate stays — the single-agg
+  `distinct max(unique2)` block). goopg prices the rewrite's IOS/Merge
+  Append/Limit with the legacy estimate (0.00..0.03), so the tie never
+  forms. PG: build_minmax_path's subpath cost (planagg.c:443-448
+  `get_cheapest_fractional_path_for_pathkeys` → cost_index index-only +
+  cost_merge_append + the Limit's fraction `path_fraction = 1/rows`),
+  `create_minmaxagg_path` (pathnode.c: initplan costs summed into the
+  Result's startup), then create_final_distinct_paths' add_path.
+  Verify: `scripts/pg-regress-runner.sh -v aggregates` — the two sub-hunks
+  at expected-lines ~1101/1124 close; single-agg `distinct max(unique2)`
+  keeps HashAggregate.
 - [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
@@ -11117,6 +11174,22 @@ completion path.
   for balk. PG: `createplan.c` (create_gatherwp) + `costsize.c
   final_cost_agg`/`cost_gather` + reloption parallel workers
   (`relation_get_parallel_workers`). Verify hunks 1899, 2847.
+- [ ] **M0148-0001k — inheritance/partition appendrel scans: per-member
+  restriction pushdown and `<parent>_N` member aliases**.
+  Kind: impl
+  Parent: M0148-0001
+  Witnessed while scoping M0148-0001c (c2): `select * from minmaxtest where
+  f1 > 1` over an inheritance tree plans `Append  Filter: (minmaxtest.f1 >
+  1)` with members `Seq Scan on minmaxtest1`, where PG pushes the
+  translated restriction into every member (`Seq Scan on minmaxtest1
+  minmaxtest_2 / Filter: (f1 > 1)`); partitions likewise (`Seq Scan on pp1`
+  vs PG `pp1 pp_1`). PG: `set_append_rel_size` (allpaths.c, restriction
+  translation via `adjust_appendrel_attrs`), `expand_single_inheritance_child`
+  (child RTE alias = parent's eref aliasname), `ExplainPreScanNode`
+  apprelids. Resume: the fan-outs in `internal/optimizer/planner.go`
+  (~5277 inheritance, the partition-leaf loop above it); member naming can
+  reuse c2's `SetOp.RTID`/`AppendRelName`. Scope: also moves `inherit`,
+  `partition_*` regress EXPLAINs; record the affected-hunk census first.
 - [ ] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
   interleave) + group output order for `mode() within group`**.
   Kind: impl
