@@ -11194,7 +11194,7 @@ completion path.
   NullTest proves. Each arm moves index costs corpus-wide: census each.
   Verify: scratch-PG cost comparison of the minmaxtest block (Result
   1.38..1.39) and the TPC census unchanged.
-- [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
+- [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
   Parent: M0148-0001
@@ -11242,6 +11242,21 @@ completion path.
       descends into the first Append member. Hunk 1248 is 0001k's (member
       aliases); 1341 is 0001h's (DROP CASCADE view notices).
   Movement: yes — regress aggregates 26 → 24 hunks (slice 1).
+  - LANDED run-2 loop #11 slice 2 `896430e99` — hunk 1271: a multi-leaf
+    partition fan-out's top SetOp carries the parent RTE (SetOp.RTID /
+    AppendRelName, the c2 apprelids mechanism) and every leaf allocates a
+    fresh RTID, so Append-level columns print the partitioned parent's
+    Vars (`Group Key: p_t1.a, p_t1.b`). Pin
+    `TestPartitionedGroupKeyNamesParent`. Regress runner HEAD vs change:
+    aggregates 24 → 23, partition\_join −383/−376 lines, partition\_aggregate
+    −60/−65, inherit −7/−6, partition\_prune +6/−1 (member labels that
+    matched only through goopg's default-partition-first expansion order —
+    see M0148-0001k).
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+  - CLOSED run-2 loop #11: every 0001d hunk is closed (1248 is 0001k's,
+    1341 is 0001h's).
+  Movement: yes — regress aggregates 26 → 23 hunks over slices 1-2.
 - [ ] **M0148-0001e — Incremental Sort presorted-key plans and
   GroupAggregate pathkey alignment**.
   Kind: impl
@@ -11314,6 +11329,13 @@ completion path.
   (~5277 inheritance, the partition-leaf loop above it); member naming can
   reuse c2's `SetOp.RTID`/`AppendRelName`. Scope: also moves `inherit`,
   `partition_*` regress EXPLAINs; record the affected-hunk census first.
+  - Found run-2 loop #11 (M0148-0001d slice 2): goopg expands a partitioned
+    table's DEFAULT partition first; PG orders the members by partition
+    bound with the default last (PartitionDesc order, expand_partitioned_rtentry).
+    With the parent now claiming the bare alias, members print `t2_1` for
+    `mc3p_default` where PG prints `t2_9` (partition\_prune). Resume:
+    collectAllPartitionLeaves' order (planner.go) against PG's bound order.
+
 - [ ] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
   interleave) + group output order for `mode() within group`**.
   Kind: impl
