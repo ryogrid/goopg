@@ -11212,6 +11212,21 @@ completion path.
       0.28 vs 0.14 → minmaxtest Result 2.15 vs PG 1.38), arm (3) the
       unpriced composite/SeqScan/const InitPlan branches, arm (4) the
       searched IOS NullTest-as-Index-Cond.
+  - LANDED run-2 loop #13 arm (1) `5040c8c72` (+ pin `ac21e50d8`) — btree
+    tree\_height read off the metapage (`catalog.IndexTreeHeightFunc`,
+    wired in initdb: btm\_fastlevel, 0 for a rootless tree) and used by
+    `estimateIndexGeometry`; the tuple-count guess is the fallback.
+    minmaxtest members now equal PG except the partial-index member
+    (0.15..86.21 vs 0.14..74.79); minmaxtest Result 1.40 vs PG 1.38 (was
+    2.15). TPC-H Q2/Q11 `partsupp_supplier_fkidx` startup 0.30 → 0.42 = PG;
+    no plan shape changed (PLAN-PARITY 99/99, 99/99, 22/22). Regress runner
+    on 10 suites text-identical.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset fires=none (TPC-H Q2/Q11 cost-only),
+      pgbench smoke.
+    - Still open: arm (3) unpriced composite/SeqScan/const InitPlan
+      branches, arm (4) searched IOS NullTest-as-Index-Cond, and the
+      partial-index member geometry (ledgered).
 - [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl

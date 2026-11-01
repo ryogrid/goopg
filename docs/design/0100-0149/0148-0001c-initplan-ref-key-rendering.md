@@ -516,9 +516,14 @@ printed `HashAggregate (Group Key: min(t1.f1)) → Aggregate`.
 
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
-- **(child M0148-0001c2)** min/max cost residuals: never-analysed index
-  tree height (`_bt_getrootheight`) and pricing of the composite-prefix,
-  Sort-over-SeqScan and constant-argument InitPlan branches (still legacy).
+- **(child M0148-0001c2)** min/max cost residuals: pricing of the
+  composite-prefix, Sort-over-SeqScan and constant-argument InitPlan branches
+  (still legacy) and the searched IOS NullTest-as-Index-Cond. The tree-height
+  arm landed `5040c8c72`: `estimateIndexGeometry` reads btm\_fastlevel off the
+  btree metapage (`catalog.IndexTreeHeightFunc`, PG's `_bt_getrootheight`), so
+  the minmaxtest members and TPC-H's `partsupp_supplier_fkidx` descents equal
+  PG's (minmaxtest Result 1.40 vs PG 1.38; the partial-index member's tuple
+  count remains).
   The relhassubclass arm landed `0e11ec1de`: inheritance parents skip the
   10-page floor (estimate\_rel\_size) and fan-out appendrels are sized as the
   sum of their members, each clamped to one row (set\_append\_rel\_size) —
