@@ -11320,6 +11320,17 @@ completion path.
   `pathkeys.c`, `createplan.c create_incremental_sort`, `costsize.c
   cost_incremental_sort`, projection-capable scan pathkeys. Verify hunks
   2607-2759, 2847, 3129.
+  - LANDED slice 1 `fed4f53ed` (2026-11-02, run-2 loop #15): GROUP BY keys
+    reordered to the input's pathkeys (get_useful_group_keys_orderings /
+    group_keys_reorder_by_pathkeys) for the sorted GROUP_AGG arms;
+    `enable_group_by_reordering` consumed. btg `GROUP BY y, x` and
+    `GROUP BY z, y, w, x` now byte-identical; q1 lost its Sort + Subquery
+    Scan. Design: docs/design/0100-0149/0148-0001e-group-by-reordering.md.
+Movement: yes — regress aggregates diff lines -126/+150 → -105/+122
+  - Open (task stays `[ ]`): q1 `Group Key: btg.x, btg.y` vs PG bare `x, y`;
+    merge-join merge-key order election feeding a presorted GROUP BY; verbose
+    `array_agg(DISTINCT …)` case; `group by g%10000` Hash vs Sort election;
+    Index Cond pushdown (no duplicated Filter); hunks 2847, 3129.
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
   Kind: impl
   Parent: M0148-0001
