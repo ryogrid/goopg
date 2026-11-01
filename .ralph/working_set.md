@@ -7,25 +7,25 @@
   `d36d05876`, census `be2248839`, baton this commit; HEAD pushed, code tree clean.
 - Files: `internal/optimizer/planner.go` (gate `aggIdx` scan + `strictMinMaxTarget` +
   `minmaxTListSurvivor`; assembly = childless Result over the surviving tlist + `ProjectSet
-  {SrfCols, OtherExprs}` above; `wrapMinMaxOrderByDistinct` re-scan/label/raw-name fallback/
-  ordinal decline); `internal/executor/operators_explain.go` (new `*optimizer.ProjectSet` arm in
-  `resolveKeySourceDepth`); tests `minmax_distinct_orderby_test.go` (S19 decline pin → landing +
-  5 scope bounds) and `explain_correlated_minmax_test.go` (new pin); design doc 0148-0001c +
-  README row; fix_plan 0001c; 3 ledger rows; `analysis/m0146/m0146-0014/routing-20261101f/`.
+  {SrfCols, OtherExprs}` above; `wrapMinMaxOrderByDistinct` re-scan/label/raw-name fallback/ordinal
+  decline); `internal/executor/operators_explain.go` (new `*optimizer.ProjectSet` arm in
+  `resolveKeySourceDepth`); pins in `minmax_distinct_orderby_test.go` (S19 decline pin → landing +
+  5 scope bounds) and `explain_correlated_minmax_test.go`; design doc 0148-0001c + README row;
+  fix_plan 0001c; 3 ledger rows; `analysis/m0146/m0146-0014/routing-20261101f/`.
 - Key symbols: `rewriteMinMaxAggregates` (gate ~12618, assembly ~13030); `strictMinMaxTarget`
   (= can_minmax_aggs shape); `minmaxTListSurvivor` dispatches on `*FuncCall` FIRST —
-  `isConstantExpr` reads a 0-arg call (`count(*)`) as constant (pin caught it); `SrfCol` +
+  `isConstantExpr` reads a 0-arg call (`count(*)`) as constant (the pin caught it); `SrfCol` +
   `OtherExprs` nil-slot marker; `openSelectSrfMode` zip executor (unchanged); the ProjectSet chase
   arm (synth `optimizer.FuncCall{generate_series}` → S18 parens); `LevelInitPlansOf` descends the
-  ProjectSet so `InitPlan 1` prints on the Sort.
+  ProjectSet, so `InitPlan 1` prints on the Sort.
 - Hypothesis/Findings: planagg gates per-AGG, not on tlist length; `create_minmaxagg_plan` =
-  `make_result(tlist, quals, NULL)` keeps every non-agg entry; `build_minmax_path` EMPTIES the
-  main jointree (the RTE moves into the InitPlan subquery) — the reason extras must be
-  Var/sublink/aggregate-free. TPC-DS/TPC-H carry no multi-target min/max tlist ⇒ fires=none.
+  `make_result(tlist, quals, NULL)` keeps every non-agg entry; `build_minmax_path` EMPTIES the main
+  jointree (the RTE moves into the InitPlan subquery) — why extras must be Var/sublink/aggregate
+  free. TPC-DS/TPC-H carry no multi-target min/max tlist ⇒ fires=none.
 - Next step: **M0148-0001c slice (c)** — inheritance/appendrel min/max (hunk 1066, 72→38 lines):
   planagg accepts a single RangeTblRef that is an appendrel (planagg.c:121-137),
-  `build_minmax_path` builds a path per child, and `create_minmaxagg_plan` puts Merge Append of
-  the per-child index paths under the Limit. Lift goopg's two gate declines (planner.go ~12649
+  `build_minmax_path` builds a path per child, and `create_minmaxagg_plan` puts Merge Append of the
+  per-child index paths under the Limit. Lift goopg's two gate declines (planner.go ~12649
   `len(tbl.PartitionKey) > 0`, ~12652 `AccessibleInheritanceChildren`). Then (d) hunk 1145
   (correlated `distinct min` sharing InitPlan 1 + SubPlan 2; M0146-0114 declines it today).
 - Top-residual: aggregates 28 hunks; largest single block = parallel-agg 7 hunks 1667-1756
@@ -37,8 +37,7 @@
   P0-E9/E10/E11/E13/E15 = ESCALATION, OWNER PLACEMENT NEEDED. Slice (c) over the 1667-1756 block:
   M0148 discipline advances the suite queue in expected-line order; 1066 is the next queued hunk.
 - Gates run: optimizer+executor units PASS (only the DST `timetz` flake — a pure COPY-decode test
-  whose EDT assertion is past the 2026-11-01 transition); runner 29→28; spotcheck Q12=2/Q13=35
-  stamped; sf025 sweep stamped (plan-shape 99/99); acceptance arm off 24 MATCH stamped; fireset
-  gate SF0.25+SF1 PASS fires=none (G9 IN-SCOPE: optimizer staged); pgbench smoke via hook (both
-  commits); census DUE → consumed (routing-20261101f, fireset stamp PASS code_tree 1f1ba3af18a3).
+  whose EDT assertion is past the 2026-11-01 transition); runner 29→28; spotcheck Q12=2/Q13=35;
+  sf025 sweep (plan-shape 99/99); acceptance arm off 24 MATCH; fireset SF0.25+SF1 PASS fires=none
+  (G9 IN-SCOPE: optimizer staged); pgbench smoke via hook; census consumed (routing-20261101f).
 - In-flight: none.
