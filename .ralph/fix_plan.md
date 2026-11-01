@@ -11327,8 +11327,16 @@ completion path.
     `GROUP BY z, y, w, x` now byte-identical; q1 lost its Sort + Subquery
     Scan. Design: docs/design/0100-0149/0148-0001e-group-by-reordering.md.
 Movement: yes — regress aggregates diff lines -126/+150 → -105/+122
-  - Open (task stays `[ ]`): q1 `Group Key: btg.x, btg.y` vs PG bare `x, y`;
-    merge-join merge-key order election feeding a presorted GROUP BY; verbose
+  - LANDED slice 2 `f1709f7ab` (2026-11-02, run-2 loop #16): EXPLAIN
+    qualifies upper-node columns by the statement's range-table size
+    (es->rtable_size counts RTEs left with no plan node: pulled-up or
+    stripped subqueries, views, removed joins) via Explain.RtableSize. Fixes
+    q1 (PG prints `Group Key: btg.x, …`; slice 1's records had the direction
+    reversed). Regress: incremental_sort -66/-66, window -60/-60,
+    groupingsets -7/-7, aggregates -3/-3, subselect -3/-3, join -2/-2,
+    select_distinct -1/-1; 27 suites unchanged.
+Movement: yes — regress aggregates diff lines -217/+179 → -214/+176
+  - Open (task stays `[ ]`): merge-join merge-key order election feeding a presorted GROUP BY; verbose
     `array_agg(DISTINCT …)` case; `group by g%10000` Hash vs Sort election;
     Index Cond pushdown (no duplicated Filter); hunks 2847, 3129.
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.

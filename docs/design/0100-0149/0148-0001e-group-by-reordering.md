@@ -1,7 +1,8 @@
 # M0148-0001e — GROUP BY keys reordered to the input's pathkeys
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
-slice 1 landed `fed4f53ed` (run-2 loop #15, 2026-11-02); the task stays open
+slice 1 landed `fed4f53ed` (run-2 loop #15, 2026-11-02); slice 2 (range-table
+size qualification) landed `f1709f7ab` (run-2 loop #16); the task stays open
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -74,10 +75,36 @@ The reordered `PathKey` list becomes the Agg's `grpColIdx` order, so
 - Gates: tpch spotcheck, TPC-DS SF0.25 sweep (99 shapes same), TPC-H
   acceptance arm, fire set on SF0.25 / SF1 / TPC-H — fires=none.
 
+## Slice 2 — upper-node qualification by the range-table size
+
+PG's EXPLAIN qualifies sort and group keys, join conditions and upper quals
+when `es->rtable_size > 1` (`explain.c`: `list_length(plannedstmt->rtable)`
+less the RTE\_GROUP entry). The flat range table keeps every RTE a plan node
+no longer shows — a FROM subquery or view pulled up into its parent, a
+Subquery Scan `setrefs.c` strips as trivial, a relation removed by join
+removal. The `q1` case (`FROM (SELECT * FROM btg ORDER BY …) q1 GROUP BY …`)
+prints `Group Key: btg.x, btg.y, btg.w, btg.z` in PG; goopg counted only the
+plan-visible relations and printed bare `x, y, w, z` (corrected 2026-11-02:
+slice 1's records had the direction reversed).
+
+- Every RTE already consumes one RTID from the statement scope
+  (`rtableScope`, recorded choice F6), so the scope's allocation count is the
+  range-table size. `planWithRtableSize` (`internal/optimizer/planner.go`)
+  reports it and the EXPLAIN branch stores it on `Explain.RtableSize`.
+- `explainNames.qualify()` (`internal/executor/explain_names.go`) ORs it with
+  the plan-visible relation count; `newExplainNamesSized` carries it from the
+  text, ANALYZE, JSON and JSON\+stats renderers. Zero means unknown and keeps
+  the plan-visible rule.
+- Regress runner, HEAD vs change over 34 EXPLAIN-heavy suites: aggregates
+  −3/−3 lines, incremental\_sort −66/−66, window −60/−60, groupingsets −7/−7,
+  subselect −3/−3, join −2/−2, select\_distinct −1/−1; the other 27 suites
+  unchanged. Lines left partly qualified (`Sort Key: unique1,
+  tenk1.stringu1`) sit on plans that already differ and name a lateral
+  subquery's derived column goopg cannot bind.
+- Pin: `TestExplainQualifiesForStrippedSubqueryRTE`.
+
 ## Remaining (task stays open)
 
-- `q1` case: goopg prints `Group Key: btg.x, btg.y` where PG prints bare
-  `x, y` (single-relation deparse context of the pulled-up subquery).
 - The merge-join case: PG elects the merge keys in the order that lets the
   join output feed the reordered GROUP BY presorted; goopg keeps the written
   merge-key order and sorts above the join.
