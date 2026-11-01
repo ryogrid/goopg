@@ -11336,7 +11336,13 @@ Movement: yes — regress aggregates diff lines -126/+150 → -105/+122
     groupingsets -7/-7, aggregates -3/-3, subselect -3/-3, join -2/-2,
     select_distinct -1/-1; 27 suites unchanged.
 Movement: yes — regress aggregates diff lines -217/+179 → -214/+176
-  - Open (task stays `[ ]`): merge-join merge-key order election feeding a presorted GROUP BY; verbose
+  - LANDED slice 3 `f26987104` (2026-11-02, run-2 loop #17): merge join
+    sorts a presorted outer with an Incremental Sort (PG 18
+    try_mergejoin_path outer_presorted_keys); the rotation election already
+    existed. btg merge-join block byte-identical; incremental_sort 326 → 307
+    diff lines.
+Movement: yes — regress aggregates diff lines 390 → 377
+  - Open (task stays `[ ]`): verbose
     `array_agg(DISTINCT …)` case; `group by g%10000` Hash vs Sort election;
     Index Cond pushdown (no duplicated Filter); hunks 2847, 3129.
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.

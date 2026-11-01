@@ -2,7 +2,8 @@
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
 slice 1 landed `fed4f53ed` (run-2 loop #15, 2026-11-02); slice 2 (range-table
-size qualification) landed `f1709f7ab` (run-2 loop #16); the task stays open
+size qualification) landed `f1709f7ab` (run-2 loop #16); slice 3 (merge-join
+outer Incremental Sort) landed `f26987104` (run-2 loop #17); the task stays open
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -103,10 +104,37 @@ slice 1's records had the direction reversed).
   subquery's derived column goopg cannot bind.
 - Pin: `TestExplainQualifiesForStrippedSubqueryRTE`.
 
+## Slice 3 — merge join sorts a presorted outer incrementally
+
+The merge-join case (`btg t1 JOIN btg t2 ON t1.w = t2.w AND t1.x = t2.x AND
+t1.z = t2.z GROUP BY t1.w, t1.z, t1.x` with hash and nested-loop joins off)
+was not a merge-key election gap: goopg's `sortInnerAndOuter` already offers
+one rotation per merge key, as `sort_inner_and_outer` does. What it lacked is
+PG 18's incremental arm of `try_mergejoin_path` /
+`try_partial_mergejoin_path` (`joinpath.c`): `pathkeys_count_contained_in`
+counts how much of the outer sort ordering the outer path already delivers
+(`outer_presorted_keys`), and with `enable_incremental_sort` on and a
+non\-empty prefix `initial_cost_mergejoin` prices `cost_incremental_sort`
+while `create_mergejoin_plan` builds an Incremental Sort. The inner never gets
+one — incremental sort supports no mark/restore. goopg always priced a full
+Sort, so the `x`\-first rotation (t1's (x, y) index scan presorted on x) never
+beat the written (w, x, z) order.
+
+- `mergeOuterIncrementalSort` (`internal/optimizer/joinpathsmerge.go`) builds
+  `incrementalSortPathWithGroups` over the outer when its pathkeys cover a
+  leading prefix of the merge ordering, with the presorted group count from
+  `searchRelNumGroups` (as the Gather Merge arm does); nil falls back to the
+  plain Sort.
+- Used by `addMergeJoinPath` (the `sort_inner_and_outer` arm) and
+  `tryPartialMergeJoinPath` (the partial twin); the
+  `generate_mergejoin_paths` arm never sorts its already\-ordered outer.
+- Regress runner, HEAD vs change over 34 suites: aggregates 390 → 377 diff
+  lines (the block is byte\-identical: Merge Cond (x, w, z), Incremental Sort
+  Presorted Key t1.x, GroupAggregate with no Sort), incremental\_sort
+  326 → 307; the other 32 suites unchanged.
+- Pin: `TestMergeJoinOuterIncrementalSort`.
+
 ## Remaining (task stays open)
 
-- The merge-join case: PG elects the merge keys in the order that lets the
-  join output feed the reordered GROUP BY presorted; goopg keeps the written
-  merge-key order and sorts above the join.
 - The verbose `array_agg(DISTINCT …)` case and the `Disabled: true` lines
   (the latter belong to M0148-0001f).
