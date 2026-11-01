@@ -7,7 +7,8 @@ outer Incremental Sort) landed `f26987104` (run-2 loop #17); slice 4
 (reordering over presorted\-aggregate keys) landed `058e52bae` (run-2 loop
 #18); slice 5 (sorted Agg paths inherit disabled\_nodes) landed `11579ae1d`
 (run\-2 loop #19); slice 6 (VERBOSE prefix rule) landed `6d6fa7019`
-(run\-2 loop #20); the task stays open
+(run\-2 loop #20); **closed** 2026\-11\-02 (run\-2 loop #21) — residue
+moved to M0148\-0001f and M0148\-0001e1 (below)
 for the remaining `btg`-region hunks (below)
 **Target:** aggregates hunks around expected-lines 2607-2759 (the `btg`
 block: `GROUP BY y, x` / `GROUP BY z, y, w, x` over `btg_x_y_idx`)
@@ -207,7 +208,25 @@ x` / `Index Cond: (y < 0)` where PG prints `btg.y, btg.x` / `(btg.y < 0)`
   `TestExplainSortGroupKeyParenthesisation` now asserts PG's
   `((agg_data.g % 10000))`.
 
-## Remaining (task stays open)
+## Closure (2026\-11\-02, run\-2 loop #21)
+
+Every `btg`\-region plan gap is landed. What is left of the block moves to
+two tasks rather than staying here:
+
+- The Output line of the `array_agg(DISTINCT w)` block and the
+  `Disabled: true` lines → M0148\-0001f (EXPLAIN Output() rendering).
+- The Index Only Scan `Filter` that repeats its Index Cond → M0148\-0001e1.
+  A probe showed it is general, not aggregate\-specific: any range qual on
+  the leading column of a multi\-column btree index keeps the whole WHERE as
+  a Filter, and a clause on a later index column is Filter\-only, where PG
+  puts every index\-matchable clause in `Index Cond` and drops implied quals
+  (`create_indexscan_plan` / `is_redundant_with_indexclauses`). goopg's
+  `tryRangeIndexScan` keeps the Filter on purpose for composite indexes
+  because the btree range scan compares encoded composite keys bytewise and
+  a strict bound can leak trailing\-column rows — an executor correctness
+  question, so it is its own task.
+
+## Remaining at closure (moved)
 
 - The `array_agg(DISTINCT w)` block's remaining lines: the Output line
   (M0148\-0001f) and a `Filter` that repeats the Index Cond.

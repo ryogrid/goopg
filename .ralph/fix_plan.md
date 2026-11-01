@@ -11308,7 +11308,7 @@ completion path.
   - CLOSED run-2 loop #11: every 0001d hunk is closed (1248 is 0001k's,
     1341 is 0001h's).
   Movement: yes — regress aggregates 26 → 23 hunks over slices 1-2.
-- [ ] **M0148-0001e — Incremental Sort presorted-key plans and
+- [x] **M0148-0001e — Incremental Sort presorted-key plans and
   GroupAggregate pathkey alignment**.
   Kind: impl
   Parent: M0148-0001
@@ -11357,10 +11357,16 @@ Movement: yes — regress aggregates diff lines 372 → 362
     verbose`, upper quals/keys `rtable_size > 1 || verbose`); resolves
     ledger M0125-0039 arm a. 7 suites improved, 27 unchanged.
 Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578, subselect 1462 → 1438)
-  - Open (task stays `[ ]`): the array_agg(DISTINCT …) block's Output line
-    (0001f); Index Cond pushdown (IOS Filter repeating its Index Cond);
-    hunks 2847, 3129 (the expected-file numbering of the remaining
-    aggregates hunks; re-derive from a fresh single-suite run).
+  - CLOSED 2026-11-02 (run-2 loop #21): every btg-region plan gap the
+    task named is landed (slices 1-6). Residue moved, not dropped:
+    - the array_agg(DISTINCT …) block's Output line and the `Disabled:
+      true` lines → M0148-0001f (its stated scope);
+    - the Index Only Scan `Filter` repeating its Index Cond → filed as
+      M0148-0001e1 (an executor-sensitive composite-index range-scan
+      change; ledger row 2026-11-02);
+    - the `group by g%10000` election landed as slice 5; "hunks 2847,
+      3129" were stale expected-file numbers for the btg / g%10000 hunks,
+      both now closed.
 - [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
   Kind: impl
   Parent: M0148-0001
@@ -11456,6 +11462,33 @@ Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578
   regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
   aggregates, join) HEAD vs change before landing; no aggregates hunk depends
   on it, hence filed after the regress-closing M0148-0001 children.
+- [ ] **M0148-0001e1 — composite-index range quals as Index Cond (no
+  repeated Filter)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001e (its "Index Cond pushdown" item). A range qual on
+  the leading column of a MULTI-column btree index keeps the whole WHERE as a
+  Filter above the scan (`Index Cond: (y < 3)` + `Filter: (y < 3)`), and a
+  clause on a later index column stays Filter-only (`a < 3 AND b > 5` on
+  (a, b, c, d) → `Index Cond: (a < 3)`, `Filter: ((a < 3) AND (b > 5))`)
+  where PG puts every index-matchable clause in `Index Cond` and drops the
+  quals the index clauses imply (createplan.c create\_indexscan\_plan:
+  qpqual = scan\_clauses minus is\_redundant\_with\_indexclauses; nbtree
+  \_bt\_checkkeys evaluates non-boundary scan keys per index tuple).
+  goopg's guard is deliberate: tryRangeIndexScan (planner.go) drops the
+  Filter only for a single-column index because "a composite index's
+  trailing columns can leak on an exclusive-lo blob-padded bound" (the
+  btree range scan compares encoded composite keys bytewise). Resume:
+  internal/access/nbtree/btree.go rangeScanPosLeaf — prove or fix prefix
+  semantics for strict/inclusive bounds on composite keys (PG's
+  \_bt\_first / \_bt\_compare treat a shorter scan key as a prefix);
+  then let the planner's index-scan builders (tryRangeIndexScan and the
+  searched index paths) drop the redundant Filter and carry the extra
+  index-column clauses as index quals the executor checks per tuple.
+  Measure the regress movement (create\_index, btree\_index, select,
+  aggregates, join, inherit) HEAD vs change and run the TPC gates (wrong
+  results here are row-count regressions).
+
 - Pre-existing gate flakes recorded (NOT caused by 0001a/b — reproduced on
   the stashed clean HEAD under identical load):
   `TestExplainSplitAggregateChainCosts` (2s absolute conn deadline from dial
