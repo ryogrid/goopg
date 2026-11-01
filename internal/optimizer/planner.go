@@ -5227,9 +5227,15 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
 				// A-01(ii) cut 1 (F7): each fan-out leaf consumes its
-				// own RTID — the first leaf reuses this RTE's
-				// allocation, the rest allocate fresh.
-				firstLeaf := true
+				// own RTID. With one leaf it reuses this RTE's
+				// allocation; with several, M0148-0001d gives this
+				// RTE's RTID to the Append itself (below) — PG's
+				// Append carries the partitioned parent as apprelids,
+				// so set_rtable_names names the parent and Append-level
+				// columns print `p_t1.a`, not the first leaf's
+				// `p_t1_1.a` (aggregates.out:1271-1280) — and every leaf
+				// allocates fresh.
+				firstLeaf := len(leaves) == 1
 				for _, leaf := range leaves {
 					leafRTID := rtid
 					if !firstLeaf {
@@ -5258,6 +5264,13 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 							Right: wrapped,
 							All:   true,
 						}
+					}
+				}
+				if top, ok := root.(*SetOp); ok {
+					top.RTID = rtid
+					top.AppendRelName = rv.Alias
+					if top.AppendRelName == "" {
+						top.AppendRelName = strings.ToLower(tbl.Name)
 					}
 				}
 				if root != nil {
