@@ -5,7 +5,8 @@
 **After slice (a):** 29 hunks (4 closed: expected-lines 950 / 967 / 984 / 1001; no new diffs)
 **After slice (b):** 28 hunks (1016 closed byte-exact; 1066 / 1145 remain, see Remaining)
 **After slice (c) part 1:** 28 hunks (hunk 1066 awaits the inheritance sub-slice; the multi-InitPlan machinery itself is unit-witnessed)
-**After slice (c2):** 29 hunks, diff lines \-185/\+177 → \-140/\+163 (the `min(f1), max(f1) from minmaxtest` block is byte\-exact; old hunk 1066 split into the two sub\-hunks of the DISTINCT block's Unique\+Sort vs HashAggregate election, child 0001c\-cost)
+**After slice (c1, M0148-0001c1):** 27 hunks, diff lines \-136/\+160 (the whole minmaxtest region, old hunk 1066, closed byte\-exact)
+**After slice (c2):** 29 hunks, diff lines \-185/\+177 → \-140/\+163 (the `min(f1), max(f1) from minmaxtest` block is byte\-exact; old hunk 1066 split into the two sub\-hunks of the DISTINCT block's Unique\+Sort vs HashAggregate election, child M0148\-0001c1)
 
 ## Why
 
@@ -406,13 +407,71 @@ member, members aliased `minmaxtest_1`…`_4` (InitPlan 1) and `_6`…`_9`
   shapes same; acceptance arm off 24 MATCH; fireset SF0.25+SF1 99/99
   `fires=none`; precommit pgbench smoke.
 
+## Slice (c1, child M0148-0001c1) — PG-priced min/max InitPlans
+
+Target (`aggregates.out:1254-1281`): `select distinct min(f1), max(f1) from
+minmaxtest` plans `Unique → Sort → Result` in PG; goopg elected
+`HashAggregate`.
+
+### Mechanism in the oracle
+
+- `build_minmax_path` (planagg.c:443-470) takes
+  `get_cheapest_fractional_path_for_pathkeys` with
+  `path_fraction = 1 / final_rel->rows` and records
+  `mminfo->pathcost = startup + path_fraction × (total − startup)`.
+- `create_minmaxagg_path` (pathnode.c) sums the pathcosts into the path's
+  startup; total adds the tlist cost and `cpu_tuple_cost`. The InitPlans
+  are made at createplan time, after `SS_charge_for_initplans`, so they are
+  charged exactly once.
+- `create_final_distinct_paths` then `add_path`s the sorted (Sort + Unique)
+  and hashed candidates. With the InitPlans at 0.69 each, totals and
+  startups both fall within the 1% fuzz for two keys and the sorted path's
+  pathkeys dominate; with one key the startup gap exceeds 1% and the cheaper
+  HashAggregate stays (aggregates.out's `distinct max(unique2)`).
+
+### Design
+
+- `stampMinMaxIndexOnlyCost`: cost\_index (goopg's `costIndexScan`,
+  index-only arm) per min/max IOS — restriction selectivity of the NullTest
+  (plus a pushed WHERE) via `clauseSelectivity`, every clause an index qual
+  (0 for a partial index whose predicate is the NullTest), rows
+  `clamp_row_est(tuples × sel)`, `relAllVisibleFraction`, total table pages
+  over every appendrel member. Single-column and appendrel branches only.
+- Appendrel top link: `mergeAppendCost` over the members' summed costs.
+- The Limit needs nothing new: its display cost already is
+  `adjust_limit_rows_costs` over its input, i.e. the pathcost.
+- `chargeMinMaxResult` sets the Result's `InitPlanCharge` to the sum of
+  `initPlanCost` over its InitPlans at rewrite time and marks it
+  `minmaxCharged`; `initPlanChargeWalk.level` skips a marked Result's
+  sublinks unless the Result is the level's own top (where the recount sets
+  the identical value).
+
+### Slice (c1) verification
+
+- Scratch PG 18.3 vs goopg on the same fixture: an analysed 10k-row table
+  prices identically (IOS 0.29..343.29, Limit 0.29..0.32, Result
+  0.32..0.33). The appendrel prices higher than PG (Result 2.42 vs 1.38):
+  member startup 0.28 vs 0.14 (tree height estimated from the heap tuple
+  count; PG reads `_bt_getrootheight` = 0) and the parent at 2537 rows vs
+  254 (the 10-page floor still applies to a plain inheritance parent). Both
+  are filed as M0148-0001c2; the election regime (fuzzy tie) is the same.
+- `scripts/pg-regress-runner.sh -v aggregates`: 29 → 27 hunks; no other
+  hunk moved.
+- Pins: `TestExplainMinMaxAppendRelDistinctElection` (shape; Result startup
+  = Σ Limit totals; Unique not double-charged). Mutations — dropping the
+  mark, dropping the pre-charge — each fail it. The optimizer DISTINCT tests
+  accept either elected strategy: their storage-less one-row fixture prices
+  the IOS heap fetches at ~8, inside the fuzz, where the sorted path wins as
+  in PG.
+- Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same, acceptance
+  arm 24 MATCH, fireset SF0.25+SF1 `fires=none`, pgbench smoke.
+
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
-- **(c3, child M0148-0001c-cost)** the DISTINCT block over the appendrel
-  InitPlans: price the min/max InitPlan subpaths as PG does (per-member
-  `cost_index` index-only path, `cost_merge_append`, the Limit's fractional
-  cost) so `createDistinctPaths` meets PG's `add_path` fuzzy tie and keeps
-  Unique+Sort.
+- **(child M0148-0001c2)** min/max cost residuals: never-analysed index
+  tree height (`_bt_getrootheight`), the 10-page floor on plain inheritance
+  parents (relhassubclass), and pricing of the composite-prefix,
+  Sort-over-SeqScan and constant-argument InitPlan branches (still legacy).
 - **(d)** hunk 1108/1145: correlated `distinct min(f1) … where unique1 > f1`
   sharing one `InitPlan 1` + `SubPlan 2` (PG moves the InitPlan into the
   SubPlan; goopg rejects the correlated rewrite at M0146-0114's gate).

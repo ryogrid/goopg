@@ -11083,8 +11083,9 @@ completion path.
     MISMATCH=0 shapes 99 same, acceptance arm 24 MATCH, fireset
     SF0.25+SF1 fires=none, pgbench smoke.
     Remaining 0001c work: M0148-0001c1 (DISTINCT election over the
-    appendrel InitPlans), (d) correlated `distinct min` hunk 1145.
-- [ ] **M0148-0001c1 — price the min/max InitPlan subpaths as PG does
+    appendrel InitPlans — DONE `68997af77`, the hunk 1066 region closed),
+    (d) correlated `distinct min` hunk 1145, cost residuals M0148-0001c2.
+- [x] **M0148-0001c1 — price the min/max InitPlan subpaths as PG does
   (DISTINCT election over appendrel InitPlans)**.
   Kind: impl
   Parent: M0148-0001c
@@ -11107,6 +11108,42 @@ completion path.
   Verify: `scripts/pg-regress-runner.sh -v aggregates` — the two sub-hunks
   at expected-lines ~1101/1124 close; single-agg `distinct max(unique2)`
   keeps HashAggregate.
+  - DONE run-2 loop #3 `68997af77`: `stampMinMaxIndexOnlyCost` (cost_index
+    index-only per min/max IOS, single-column and appendrel branches),
+    `mergeAppendCost` on the appendrel top link, `chargeMinMaxResult`
+    (create_minmaxagg_path: the Result pre-charged with Σ InitPlan
+    pathcosts; `Result.minmaxCharged` keeps the tail charge walk from
+    counting them again below another level top). `select max(u) from big`
+    prices exactly as PG (Result 0.32..0.33); the appendrel prices 2.42 vs
+    PG 1.38 (member geometry, M0148-0001c2) inside the same fuzzy-tie
+    regime, so the two-key DISTINCT elects Unique → Sort → Result as PG.
+    - Pin `TestExplainMinMaxAppendRelDistinctElection` (mutation-checked);
+      the optimizer DISTINCT tests accept either elected strategy (their
+      storage-less one-row fixture prices the IOS at ~8; sorted wins, as in
+      PG).
+  Movement: yes — regress aggregates 29 → 27 hunks (diff lines
+  -140/+163 → -136/+160; the old hunk 1066 region closed byte-exact).
+  Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same, acceptance
+  arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+- [ ] **M0148-0001c2 — min/max InitPlan cost residuals (member geometry and
+  the unpriced branches)**.
+  Kind: impl
+  Parent: M0148-0001c
+  Residuals of M0148-0001c1, measured on the minmaxtest fixture against a
+  scratch PG 18.3: (1) a never-analysed tiny btree's tree height is
+  estimated from the heap tuple count (`estimateIndexGeometry` → height 1,
+  IOS startup 0.28) where PG reads `_bt_getrootheight` off the metapage
+  (0, startup 0.14); (2) estimate_rel_size's 10-page floor still applies to
+  a plain inheritance parent (relhassubclass; `estimateTableRowsFallback`
+  sets `hasSubclass` only for partitioned parents) — parent 2537 rows vs
+  PG 254; (3) the composite-prefix IOS, the Sort-over-SeqScan fallback and
+  the constant-argument InitPlans are still legacy-priced; (4) witnessed:
+  the searched ordered IOS for `where f1 is not null order by f1` keeps the
+  NullTest as `Filter:` where PG makes it an `Index Cond`
+  (match_clause_to_indexcol's NullTest arm), and skips a partial index the
+  NullTest proves. Each arm moves index costs corpus-wide: census each.
+  Verify: scratch-PG cost comparison of the minmaxtest block (Result
+  1.38..1.39) and the TPC census unchanged.
 - [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
