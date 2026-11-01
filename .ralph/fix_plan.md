@@ -836,6 +836,38 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
+- [x] **testport/TestPort\_RegressSuite — index\_including, index\_including\_gist: every psql `\\d` failed 42809** \(AI\-20261102\-000225\-003; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Bisected to `91bc8262a` \(M0122\-0015f's `op ANY \(non\-array\)` 42809 gate\): psql reads extended statistics with
+    `'d' = any\(stxkind\)` and the planner's pg\_statistic\_ext stub typed stxkind `text`, so `\\d`, `\\d\+`, `\\dS`, `\\dX`
+    all failed\.
+  - Fixed in `359e35c97`: stxkind typed `char\[\]` \(as PG and the executor's PGStatisticExtColumnsPG18\) and populated
+    with CreateStatistics' kind array \(`statisticsObjKindArray`, d/f/m/e\); pin `TestPgStatisticExtStxkindIsCharArray`;
+    both subtests PASS again\.
+  - Remaining pre\-existing psql gaps seen while checking the meta\-command battery are filed as
+    M\-NIGHTLY\-psql\-meta below \(regnamespace output, `\\du`, `\\dx`, `\\dO`; `\\db` is M0134\-0176b\)\.
+  Movement: none — correctness fix — no plan instrument \(psql meta\-commands\)\.
+- [ ] **M\-NIGHTLY\-psql\-meta — psql meta\-commands still failing or diverging on a fresh goopg cluster** \(filed
+  2026\-11\-02 while verifying AI\-20261102\-000225\-003\)\.
+  Kind: impl
+  Parent: none
+  - `\\du`: `column r.rolinherit does not exist`; `\\dx`: `column ae.default_version does not exist`
+    \(pg\_available\_extensions\); `\\dO`: `function pg\_catalog.pg\_collation\_is\_visible does not exist`; `\\db` is
+    M0134\-0176b \(pg\_tablespace\_location\)\.
+  - `\\d`/`\\dX` print `stxnamespace::regnamespace` as the oid \(`2200.sq` vs PG `public.sq`\): regnamespace output
+    is not the namespace name \(see M0134\-0168d for the input side\)\.
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\. Resume: the catalog stubs / builtins named
+    above; witness each against a scratch PG 18\.3 with the same meta\-command\.
+- [x] **units/internal/executor — TestCopyFromZonelessTimetzTakesSessionZone hard\-codes EDT** \(filed 2026\-11\-02;
+  AI\-20261102\-000225\-001 units/internal/executor and \-002 race/internal/executor — both this test only\)\.
+  Kind: impl
+  Parent: none
+  - Test\-side date sensitivity, documented as a flake in the M0148\-0001a/b notes \(loop \#16\) with no fix filed: a
+    zone\-less `10:00:00` resolves the session zone at today's date \(DecodeTimeOnly → GetCurrentDateTime\), so after US
+    DST ended 2026\-11\-01 the correct New York offset is \-18000 and the hard\-coded \-14400 failed every units run\.
+  - Fixed in `4af9db738` \(test\-only\): the expectation is derived from the tz database for the date the test runs on\.
+  Movement: none — correctness fix — no plan instrument \(test\-only\)\.
 - [x] **min\(x\) / max\(x\) over a DESC btree index return the opposite extreme** \(filed 2026\-11\-01 by the loop inside
   M0148\-0001c slice \(c2\); S2 wrong\-result class\)\.
   Kind: impl
@@ -10964,7 +10996,7 @@ completion path.
       Movement: none (postmaster units green; spotcheck Q12=2/Q13=35).
   - Post-children state: 33 hunks remain; all map to the children below.
     Runner diff `tmp/regress-diffs/aggregates.diff` (891 lines).
-- [ ] **M0148-0001c — scalar group aggregates become InitPlan + Limit over an
+- [x] **M0148-0001c — scalar group aggregates become InitPlan + Limit over an
   index scan (min/max optimization)**.
   Kind: impl
   Parent: M0148-0001
@@ -11085,6 +11117,24 @@ completion path.
     Remaining 0001c work: M0148-0001c1 (DISTINCT election over the
     appendrel InitPlans — DONE `68997af77`, the hunk 1066 region closed),
     (d) correlated `distinct min` hunk 1145, cost residuals M0148-0001c2.
+  - LANDED run-2 loop #9 slice (d) `359e35c97` (committed together with the
+    AI-20261102-000225-003 `\d` fix, one gated tree) — an equality pinning
+    the agg column to a literal, bind param or outer column makes the
+    min/max pathkey redundant (EC with a const), so with no presorted
+    index the InitPlan is `Limit → Seq Scan` with Filter `NullTest, other
+    quals, EC equalities last` and no Sort (`minmaxArgPinnedByEquality`;
+    scan carries the FROM alias). Closes hunk 1145 byte-exact; every 0001c
+    hunk in 950-1145 is closed.
+    - Pin `TestMinMaxEqualityPinnedSeqScan` (shapes + values incl. NULL
+      outer rows; forcing the decline fails it). Ledger row: expression
+      pseudo-constants (`t0.f1 + 1`) and the redundant-pathkey case with a
+      presorted index still take the old paths.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+  - CLOSED run-2 loop #9: all of 0001c's own hunks (950-1145) are closed;
+    the cost residuals stay open as child M0148-0001c2.
+  Movement: yes — regress aggregates 33 → 26 hunks over slices (a)-(d) (this
+  slice 27 → 26).
 - [x] **M0148-0001c1 — price the min/max InitPlan subpaths as PG does
   (DISTINCT election over appendrel InitPlans)**.
   Kind: impl
@@ -11155,6 +11205,41 @@ completion path.
   `remove_useless_groupby_columns` (planner.c) + EC-driven grouping keys
   (`optimizer/inherit/agg_group_keys`? no: `pathkeys.c`/`equivalences.c`
   canonical ordering). Verify hunks 1172-1232.
+  - Recon run-2 loop #5 (2026-11-02, no code; the nightly batch held the
+    gates): current hunks 1211/1225 are this task. goopg already removes
+    t1.c/t1.d (PK, `pruneUselessGroupByColumns`) and t2.z (t2 PK covered),
+    but keeps `t2.x`/`t2.y`. PG drops them in standard\_qp\_callback
+    (planner.c:3502-3525): `make_pathkeys_for_sortclauses_extended(...,
+    remove_redundant = true)` removes from processed\_groupClause every item
+    whose pathkey is redundant — `pathkey_is_redundant` (pathkeys.c): its EC
+    holds a constant (ported: `redundantConstGroupKeys`,
+    groupkeyconst.go, M0146-0005ak) OR its EC is already in the pathkey list
+    (NOT ported). The inner-join ON `t1.a = t2.x and t1.b = t2.y` merges
+    {t1.a, t2.x} and {t1.b, t2.y}, so the later members go.
+    - Plan: beside the const arm (planner.go ~9823), union-find the input
+      column indices over top-level WHERE and INNER-join ON `col = col`
+      conjuncts (bare columns, same type; outer-join ON clauses form no
+      merged EC in PG 16+ and must not count), walk groupExprs in order and
+      drop a key whose class already had a kept member; the dropped column
+      rides the same functionally-determined passthrough the const arm uses
+      (`pruned` map).
+    - Expected: hunks 1211 (`Group Key: t1.a, t1.b`) and 1225
+      (`t1.a, t1.b, t2.z`) close. Hunks 1248/1271 are M0148-0001k's (member
+      aliases `t1_1`/`t1_2`; partitioned parent Var naming `p_t1.a` vs
+      goopg's `p_t1_1.a`).
+  - WIP run-2 loop #7 (implemented, unit-green, NOT applied/committed —
+    the staged slice (d) of 0001c must land first; nightly holds the gates):
+    patch `tmp/m0148-0001d-wip.patch` (sha256 68975b9b…) — `redundantConstGroupKeys`
+    gains pathkey\_is\_redundant's duplicate-EC arm (union-find over WHERE +
+    inner-join ON `col = col`, same type, no outer join in FROM; a const pin
+    propagates through the class; a repeat of the SAME column stays a key)
+    + pin `TestGroupByKeysRedundantByEquivalence` (6 shapes vs scratch PG
+    18.3 + values; mutation-checked). Regress aggregates on HEAD + patch:
+    27 → 25 (hunks 1211/1225 closed, nothing else moved). Ledger at land
+    time: cross-type equalities unmerged; scan-qual derivation divergence
+    witnessed — PG rewrites `c = d AND d = 2` to `(c = 2) AND (d = 2)`
+    (generate\_base\_implied\_equalities\_const), goopg filters
+    `((c = d) AND (d = 2) AND (c = 2))` (pre-existing, not this patch).
 - [ ] **M0148-0001e — Incremental Sort presorted-key plans and
   GroupAggregate pathkey alignment**.
   Kind: impl
