@@ -10967,6 +10967,26 @@ completion path.
   Also the `(InitPlan 1).col1` label rendering (see 0001f).
   Verify: `scripts/pg-regress-runner.sh -v aggregates` hunks at
   expected-lines 950-1108.
+  - LANDED loop #16 slice (a) `31b75104b` — label rendering at the Sort /
+    Group Key sites above a min/max-rewritten Result: the key chase
+    (`resolveKeySourceDepth` Result arm) lands on the initplan
+    `SubqueryExpr` target (fail-closed: name-checked index,
+    `SublinkIsInitPlan`, non-nil plan), and computed keys gain
+    `chaseKeyExprToInitPlanRef` (only columns landing on an InitPlan
+    sublink are replaced). The sites' existing S18 wrap + the
+    `formatExprQual` SubqueryExpr arm render
+    `Group Key: (InitPlan 1).col1`, `Sort Key: ((InitPlan 1).col1)`,
+    `Sort Key: (((InitPlan 1).col1 + 1))`. Closed 4 hunks (33 → 29:
+    expected-lines 950/967/984/1001). Pin:
+    `TestExplainKeyOverMinMaxResultInitPlanRef`.
+    Movement: spotcheck Q12=2/Q13=35, sf025 sweep 99/99 plans identical,
+    acceptance arm 24 MATCH (fireset-scope OUT: internal/executor, G9).
+    Remaining 0001c slices: (b) SRF multi-target
+    `max(unique2), generate_series(1,3)` hunk 1016 (needs multi-target
+    min/max rewrite + ProjectSet + the `(generate_series(1, 3))` SRF-label
+    rendering entangled with 0001f), (c) inheritance-tree Merge Append
+    min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
+    sharing hunk 1108 (SubPlan numbering + added `IS NOT NULL` qual).
 - [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
@@ -11056,3 +11076,11 @@ completion path.
   isolated; CreateTable already documented 2026-11-01 loop #14).
   Pre-commit smoke excludes internal/postmaster (cluster-backed), so the
   commit gate is unaffected.
+- Loop #16 adds a date-boundary flake of the same documentation class:
+  `internal/executor TestCopyFromZonelessTimetzTakesSessionZone` asserts a
+  \-14400 \(EDT\) zone offset "on today's date" for TimeZone="America/New_York";
+  US DST ended 2026-11-01 \(02:00 local\) so the offset is \-18000 \(EST\) and
+  the assertion inverts. Reproduced identically on the stashed clean HEAD
+  \(0.079s, no code change\); it goes green again as the host date moves
+  inside the DST period. Test-side date sensitivity, not a product defect;
+  no fix filed \(candidate: pin a fixed evaluation date in the test\).
