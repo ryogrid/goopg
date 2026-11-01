@@ -11194,6 +11194,24 @@ completion path.
   NullTest proves. Each arm moves index costs corpus-wide: census each.
   Verify: scratch-PG cost comparison of the minmaxtest block (Result
   1.38..1.39) and the TPC census unchanged.
+  - LANDED run-2 loop #12 arm (2) `0e11ec1de` — estimate\_rel\_size's
+    10-page floor skipped for any relhassubclass parent (inheritance too),
+    and a fan-out appendrel (inheritance / partitions) sized as the sum of
+    its members, each clamped to one row (`fanOutAppendRel`,
+    `appendRelMemberRows`; a known-empty relhassubclass parent reports
+    clamp\_row\_est's 1). minmaxtest parent member `rows=254
+    (0.14..16.59)` and Merge Append rows=7865 now equal PG; an empty
+    parent over an empty child plans PG's HashAggregate over `Append
+    rows=1851`. Pin `TestInheritanceParentRelSize`.
+    - Regress runner HEAD vs change on 9 suites (aggregates, inherit,
+      alter\_table, join, select\_parallel, union, partition\_join/prune/
+      aggregate): text-identical except join's nondeterministic ±1 line.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+    - Still open: arm (1) tree height from the metapage (member startup
+      0.28 vs 0.14 → minmaxtest Result 2.15 vs PG 1.38), arm (3) the
+      unpriced composite/SeqScan/const InitPlan branches, arm (4) the
+      searched IOS NullTest-as-Index-Cond.
 - [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl

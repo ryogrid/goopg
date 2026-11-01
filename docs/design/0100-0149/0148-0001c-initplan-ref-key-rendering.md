@@ -517,9 +517,12 @@ printed `HashAggregate (Group Key: min(t1.f1)) → Aggregate`.
 ## Remaining slices of M0148-0001c (open, fix_plan entry)
 
 - **(child M0148-0001c2)** min/max cost residuals: never-analysed index
-  tree height (`_bt_getrootheight`), the 10-page floor on plain inheritance
-  parents (relhassubclass), and pricing of the composite-prefix,
+  tree height (`_bt_getrootheight`) and pricing of the composite-prefix,
   Sort-over-SeqScan and constant-argument InitPlan branches (still legacy).
+  The relhassubclass arm landed `0e11ec1de`: inheritance parents skip the
+  10-page floor (estimate\_rel\_size) and fan-out appendrels are sized as the
+  sum of their members, each clamped to one row (set\_append\_rel\_size) —
+  the minmaxtest parent member and Merge Append rows now equal PG's.
 - **(d)** landed (section above); the remaining aggregates hunks belong to
   the other M0148-0001 children (0001d…0001k).
 - Slice (b) scope bounds, each with a deferral ledger row: multi-agg tlists
