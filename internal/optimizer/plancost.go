@@ -182,6 +182,19 @@ func DeriveLegacyDisplayCost(n Node, rows int64) PlanCost {
 		// blocking reading — the conservative one for a startup column.
 		out.StartupCost = childTotal + cp.cpuOperatorCost*float64(len(x.Aggs))*childRowsOf(n)
 		out.TotalCost = out.StartupCost + perRow
+	case *Result:
+		if x.OneTimeFilter != nil && x.Child != nil {
+			// A gating Result (a One-Time Filter over a child) costs exactly
+			// its child: create_gating_plan's copy_plan_costsize
+			// (createplan.c) — the constant qual is evaluated once and
+			// projection is the child's (M0148-0001c2: the `max(100)`
+			// InitPlan's `Result → Seq Scan`).
+			out.StartupCost = childStartup
+			out.TotalCost = childTotal
+			break
+		}
+		out.StartupCost = childStartup
+		out.TotalCost = childTotal + perRow
 	case *Filter:
 		if agg, ok := x.Child.(*Aggregate); ok {
 			// M0146-0214: a Filter over an Aggregate is its HAVING. cost_agg

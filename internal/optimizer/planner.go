@@ -13106,6 +13106,19 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 					Backward: minmaxScanBackward(idx, k, isMax),
 					schema:   iosSchema,
 				}
+				// M0148-0001c2 arm (3): cost_index over the prefix equalities and
+				// the NullTest, all k+1 of them index quals; the path's tlist is the
+				// agg column alone (the Project above slices it), so that is the width.
+				selExpr := Expr(isNotNull)
+				for _, q := range prefixQuals {
+					selExpr = andExpr(pos, q, selExpr)
+				}
+				stampMinMaxIndexOnlyCost(ios, cat, ctx.settings.costParams(), tbl, idx,
+					clauseSelectivity(selExpr, &SeqScan{Table: tbl, schema: ctx.schema}), k+1, 0)
+				if pc, ok := ios.PlanCostInfo(); ok {
+					pc.PlanWidth = TupleWidth(Schema{{Name: argCR.Name, Type: colType}})
+					ios.setPlanCost(pc)
+				}
 				// The k+1-wide covered row must be sliced down to the agg column so
 				// the InitPlan emits exactly one column. The Project sits ABOVE the
 				// IOS and BELOW the Limit, mirroring the SeqScan fallback's
@@ -13157,7 +13170,14 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 			for _, c := range conj[1:] {
 				pred = andExpr(pos, pred, c)
 			}
-			proj := &Project{pos: pos, Child: &Filter{pos: pos, Child: seq, Predicate: pred},
+			filt := &Filter{pos: pos, Child: seq, Predicate: pred}
+			// M0148-0001c2 arm (3): the Filter carries the scan's quals, so
+			// it takes cost_seqscan's price — EXPLAIN prints the pair as one
+			// `Seq Scan` line.
+			stampMinMaxSeqScanCost(filt, cat, ctx.settings.costParams(), tbl, pred,
+				clauseSelectivity(andExpr(pos, isNotNull, wherePred), &SeqScan{Table: tbl, schema: ctx.schema}),
+				TupleWidth(Schema{{Name: argCR.Name, Type: colType}}))
+			proj := &Project{pos: pos, Child: filt,
 				Targets: []Expr{&ColumnRef{pos: pos, Index: argCR.Index, Name: argCR.Name,
 					Type: argCR.Type, SourceTableIdx: 1}},
 				schema: Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}}}
@@ -13212,6 +13232,9 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 		colType = ct
 		otf := &IsNullExpr{pos: pos, Operand: argExpr, Negated: true}
 		seq := &SeqScan{pos: pos, Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		// M0148-0001c2 arm (3): a plain cost_seqscan, its tlist the constant.
+		stampMinMaxSeqScanCost(seq, cat, ctx.settings.costParams(), tbl, nil, 1,
+			TupleWidth(Schema{{Name: label, Type: colType}}))
 		innerRes := &Result{pos: pos, Targets: []Expr{argExpr},
 			OneTimeFilter: otf, Child: seq,
 			schema: Schema{{Name: label, Type: colType, SourceTableIdx: 1}}}
@@ -13370,6 +13393,31 @@ func minmaxArgPinnedByEquality(where Expr, arg *ColumnRef) bool {
 		}
 	}
 	return false
+}
+
+// stampMinMaxSeqScanCost prices a min/max InitPlan's sequential scan with
+// cost_seqscan (M0148-0001c2 arm (3)): every page at seq_page_cost, every
+// tuple at cpu_tuple_cost plus its restriction's per-tuple operator cost
+// (cost_qual_eval: a NullTest is free, an operator is one cpu_operator_cost),
+// rows the restricted relation's (clamp_row_est), width the subquery tlist's.
+// node is the SeqScan itself, or the Filter that carries its quals — the pair
+// EXPLAIN prints as one `Seq Scan` line.
+func stampMinMaxSeqScanCost(node planCostSetter, cat catalog.Catalog, cp costParams, tbl *catalog.Table, quals Expr, sel float64, width int) {
+	relTuples := minmaxRelTuples(cat, tbl)
+	relPages := baseRelPages(tbl, relTuples)
+	ops := 0.0
+	if quals != nil {
+		_, ops = qualEvalOps(quals)
+	}
+	c := costSeqscan(cp, relPages, relTuples, ops)
+	if !(sel > 0) || sel > 1 {
+		sel = 1
+	}
+	rows := math.RoundToEven(relTuples * sel)
+	if rows < 1 {
+		rows = 1
+	}
+	node.setPlanCost(PlanCost{StartupCost: c.Startup, TotalCost: c.Total, PlanRows: rows, PlanWidth: width})
 }
 
 // minmaxRelTuples is baserel->tuples for a min/max subquery relation:
