@@ -10921,3 +10921,138 @@ completion path.
   - Complete only at byte-normalized expected-output parity, with the inventory
     row promoted to `pass` / `pass_required=yes`, regenerated coverage docs,
     and the next canonical M0148 suite task materialized.
+  - Baseline run 2026-11-01 (loop #15) at `5a43057d6`: 40 hunks / 988 diff
+    lines (`tmp/m0148/aggregates-baseline-5a43057d6.log`,
+    `tmp/regress-diffs/aggregates.diff`). Classification: 4 FILTER-syntax
+    hunks (incl. the aggordview1 CREATE-view cascade), 1 WITHIN-GROUP wording
+    hunk, 2 bitwise COPY/bit-in hunks, 7 EXPLAIN-Output/format hunks, 11
+    plan-shape hunks (scalar-agg InitPlan, GROUP BY reduction, pathkey order,
+    Incremental Sort, parallel agg), 7 pg_get_viewdef hunks, 1 DROP-CASCADE
+    NOTICE hunk, 1 NOTICE-ordering hunk, rest parallel/format.
+  - - [x] **M0148-0001a — aggregate clause cross-product grammar arms.**
+      Kind: impl
+      Parent: M0148-0001
+      Landed loop #15: nine `name_or_call` arms (args-ORDER-BY × FILTER ±OVER,
+      DISTINCT-args-ORDER-BY × FILTER ±OVER, args-ORDER-BY × WITHIN GROUP
+      raising gram.y's production-time "cannot use multiple ORDER BY clauses
+      with WITHIN GROUP" (42601, caret at WITHIN), WITHIN GROUP × FILTER);
+      the FILTER pipeline itself already existed (M0097-0007/-0032/-0035).
+      Closed 6 hunks incl. the aggordview1 chain (its SELECT now matches PG:
+      rank/percentile_disc WITHIN GROUP + FILTER execute correctly).
+      Movement: none (no optimizer/planner files staged; fireset-scope OUT).
+  - - [x] **M0148-0001b — bit_in/varbit_in text prefix scan.**
+      Kind: impl
+      Parent: M0148-0001
+      Landed loop #15: `nodes.ScanBitInput` (varbit.c:147-276/452-577: b/B
+      binary, x/X hex ×4 MSB-first, bare binary from 0; rune-aware first
+      bad-char 22P02; VARBITMAXLEN 54000) shared by the codec assignment arms
+      (canonical digit text stored), `parseBitFromString` (pgwire consts) and
+      a new string→bit/varbit cast arm with cast-time 22026/22001. Closed
+      2 hunks (bitwise COPY row + BIT_AND/OR/XOR results).
+      Movement: none (postmaster units green; spotcheck Q12=2/Q13=35).
+  - Post-children state: 33 hunks remain; all map to the children below.
+    Runner diff `tmp/regress-diffs/aggregates.diff` (891 lines).
+- [ ] **M0148-0001c — scalar group aggregates become InitPlan + Limit over an
+  index scan (min/max optimization)**.
+  Kind: impl
+  Parent: M0148-0001
+  `select max(unique2) from tenk1 order by 1` must plan InitPlan → Limit →
+  Index Only Scan Backward (tenk1_unique2), not Aggregate→Index Scan; same
+  for `max(unique2), generate_series(...)` (InitPlan + Result + ProjectSet),
+  inheritance-tree min/max (Merge Append + Limit, `minmaxtest`), and the
+  shared `InitPlan 1` + `SubPlan 2` shape for the correlated `distinct min`
+  subquery. PG: scalar-group-agg → InitPlan transform (PG13+
+  `optimizer/prep/prepagg.c`; `planner.c` scalar-group path) +
+  `createplan.c` `create_limit`/`create_indexscan` (backward scan) costing.
+  Also the `(InitPlan 1).col1` label rendering (see 0001f).
+  Verify: `scripts/pg-regress-runner.sh -v aggregates` hunks at
+  expected-lines 950-1108.
+- [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
+  and canonical pathkey key order**.
+  Kind: impl
+  Parent: M0148-0001
+  `group by t1.a,t1.b,t1.c,t1.d` over a unique-indexed join key reduces the
+  Group Key to `t1.a, t1.b` (partitioned p_t1 PK case: parent Vars, not
+  leaf-branch Vars); key ORDER is canonical pathkey order (`Group Key: x, y`
+  for `group by y, x` when the index presorts). PG:
+  `remove_useless_groupby_columns` (planner.c) + EC-driven grouping keys
+  (`optimizer/inherit/agg_group_keys`? no: `pathkeys.c`/`equivalences.c`
+  canonical ordering). Verify hunks 1172-1232.
+- [ ] **M0148-0001e — Incremental Sort presorted-key plans and
+  GroupAggregate pathkey alignment**.
+  Kind: impl
+  Parent: M0148-0001
+  `GROUP BY z,y,w,x` over `btg_x_y_idx` → GroupAggregate + Incremental Sort
+  (Presorted Key: x, y) with Group Key reordered to index pathkeys; merge-join
+  presorted group input; the `HashAggregate` vs `GroupAggregate+Sort` election
+  for `group by g%10000` on `agg_data_20k`; Index Cond pushdown (no
+  duplicated Filter) and Subquery-Scan elision (`q1` case). PG:
+  `pathkeys.c`, `createplan.c create_incremental_sort`, `costsize.c
+  cost_incremental_sort`, projection-capable scan pathkeys. Verify hunks
+  2607-2759, 2847, 3129.
+- [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
+  Kind: impl
+  Parent: M0148-0001
+  PG's verbose/explain prints the PRUNED per-node targetlist with qualified
+  Vars (`tenk1_2.unique1`, not all columns bare), aggregate-expression labels
+  (`(sum((s1.s1 + s2.s2)))`, `ARRAY(SubPlan 1)`, `PARTIAL variance(...)`,
+  `(InitPlan 1).col1`), `ORDER BY`/`Group Key` operand parenthesization
+  (`(g % 10000)` not `((g % 10000))`), `Function Call:` before `Output:`, and
+  the merge-scan `Disabled: true` lines. PG: `explain.c` `show_tle`/
+  `explain_target_list` + `ruleutils.c` deparse context. Verify hunks
+  608-690, 1899-1929, 2910-2947, 3129 key-text lines.
+- [ ] **M0148-0001g — pg_get_viewdef deparser fidelity**.
+  Kind: impl
+  Parent: M0148-0001
+  goopg echoes a lowercase near-verbatim view text; PG deparses the stored
+  parse tree: upper-case keywords, qualified column refs (`v.a`),
+  coerced-constant casts (`(0,NULL::integer,NULL::text)`,
+  `(0.5)::double precision`, `'AZZZZ'::name`), output AS names, function-RTE
+  column aliases (`i(i)`), `ORDER BY c USING ~<~ NULLS LAST` rendering, and
+  WITHIN GROUP/FILTER aggregate clauses. PG: `ruleutils.c
+  pg_get_viewdef_worker`/`generate_viewdef`/`get_rule_expr` (+
+  `transformRuleExpr` T_Aggref agg_order/agg_within_group/agg_filter arms).
+  Verify hunks 1637-1726, 2284.
+- [ ] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
+  Kind: impl
+  Parent: M0148-0001
+  `drop table t1 cascade` must emit "drop cascades to 8 other objects /
+  DETAIL: drop cascades to view nontemp1 … temporal4" — CREATE VIEW must
+  record AUTO dependencies on its referenced relations (pg_depend). PG:
+  `recordDependencyOn` from `parse_analysis` (dependency.c
+  reportDependentObjects). Verify hunk 1302.
+- [ ] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
+  Partial over parallel scans)**.
+  Kind: impl
+  Parent: M0148-0001
+  `v_pagg_test` (view over GROUP BY agg) with `parallel_setup_cost=0`,
+  `max_parallel_workers_per_gather=4`, `parallel_workers=4` reloption:
+  Finalize HashAggregate → Gather → Partial HashAggregate → Parallel Seq
+  Scan (view-expanded), and `balk(hundred)` → Finalize Aggregate → Gather →
+  Partial → Parallel Index Only Scan. goopg has the split machinery
+  (parallel_agg_combine.go) but declines the election through the view /
+  for balk. PG: `createplan.c` (create_gatherwp) + `costsize.c
+  final_cost_agg`/`cost_gather` + reloption parallel workers
+  (`relation_get_parallel_workers`). Verify hunks 1899, 2847.
+- [ ] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
+  interleave) + group output order for `mode() within group`**.
+  Kind: impl
+  Parent: M0148-0001
+  PG transitions the DISTINCT-agg input through the sort/tuplestore per
+  aggregate: `my_avg(distinct one), my_sum(one)` prints
+  `avg_transfn called with 1,1,3,3` (per-agg drain), goopg interleaves
+  `1,3,1,3`; the `mode() within group` group rows come out sorted (PG's
+  GroupAggregate) vs goopg hash order. PG: `nodeAgg.c
+  process_ordered_aggregate_single/multi` (tuplestore drain per agg per
+  group). Verify hunks 2186, 2420.
+- Pre-existing gate flakes recorded (NOT caused by 0001a/b — reproduced on
+  the stashed clean HEAD under identical load):
+  `TestExplainSplitAggregateChainCosts` (2s absolute conn deadline from dial
+  covering ~1.2M in-process inserted rows; deterministic failure on the
+  loaded host 2026-11-01 noon, passed loop #14's morning run and nightly CI
+  on idle hosts), and the instant-fail family
+  `TestSimpleQueryBatchAbortUndoesEarlierCreate{Table,Type}` +
+  `TestConnTxSessionNilWhenNotExplicit` (fail under `-parallel 4`, pass
+  isolated; CreateTable already documented 2026-11-01 loop #14).
+  Pre-commit smoke excludes internal/postmaster (cluster-backed), so the
+  commit gate is unaffected.

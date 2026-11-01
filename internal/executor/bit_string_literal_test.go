@@ -88,6 +88,37 @@ func TestBitStringLiteralHexDecode(t *testing.T) {
 	}
 }
 
+// TestBitTextPrefixInsert pins the M0148-0001 fix: text arriving with PG's
+// unquoted bit_in prefix spelling — what COPY data and text→bit casts carry,
+// e.g. aggregates.sql's `COPY bitwise_test ... B0101` row — is scanned by
+// PG's prefix rule (varbit.c:165-184), not rejected on the leading "B".
+func TestBitTextPrefixInsert(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE bit_prefix(b bit(4), v bit varying(8))"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO bit_prefix VALUES ('B0101'::bit(4), 'x1F'::bit varying(8))"); err != nil {
+		t.Fatalf("INSERT prefixed text: %v", err)
+	}
+	rows := runDMLRows(t, ctx, "SELECT b, v FROM bit_prefix")
+	if len(rows) != 1 || rows[0][0].StringValue() != "0101" || rows[0][1].StringValue() != "00011111" {
+		t.Fatalf("rows = %v, want one row {0101, 00011111}", rows)
+	}
+
+	// A prefix'd string whose scanned bit count violates typmod reports the
+	// BIT count, not the raw text length (varbit.c:207-213).
+	err := runDDL(t, ctx, "INSERT INTO bit_prefix(b) VALUES ('B01'::bit(4))")
+	assertBitError(t, err, "22026", "bit string length 2 does not match type bit(4)")
+
+	// The quoted B'…' spelling as TEXT is invalid in PG too (the quote is
+	// stripped by the scanner, so bit_in sees B'101' literally and chokes on
+	// the ').
+	err = runDDL(t, ctx, "INSERT INTO bit_prefix(b) VALUES ('B''101''')")
+	assertBitError(t, err, "22P02", `"'" is not a valid binary digit`)
+}
+
 func assertBitError(t *testing.T, err error, wantCode, wantMsg string) {
 	t.Helper()
 	if err == nil {

@@ -1098,6 +1098,35 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 			return NewStringDatum(intToBitTypmodString(v.Int, srcWidth, n)), nil
 		}
+		// string::bit / string::bit varying: the pg_cast castfuncs bit() and
+		// varbit() (varbit.c) run the FULL bit_in input scan — the b/B and
+		// x/X prefix arms included (M0148-0001: this arm silently
+		// stringified, so `'B0101'::bit(4)` printed the raw text) — and THEN
+		// the typmod check at CAST time: bit() is the 22026 exact-match arm
+		// (varbit.c:207-213), varbit() the 22001 upper bound
+		// (varbit.c:508-514), against the SCANNED bit count (hex digits
+		// expand ×4). The same scan guards the assignment chokepoint
+		// (coerceTextLikeDatum's bit arms); this is its cast-time sibling
+		// (pattern_sibling_paths_must_agree).
+		if v.Kind == KindString && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			digits, berr := scanBitInput(v.StringValue())
+			if berr != nil {
+				berr.Pos = x.Pos()
+				return Datum{}, berr
+			}
+			if n := int(x.Typmod); n > 0 {
+				if strings.EqualFold(castTargetType, "bit") {
+					if len(digits) != n {
+						return Datum{}, &ExecError{Code: "22026", Pos: x.Pos(),
+							Message: fmt.Sprintf("bit string length %d does not match type bit(%d)", len(digits), n)}
+					}
+				} else if len(digits) > n {
+					return Datum{}, &ExecError{Code: "22001", Pos: x.Pos(),
+						Message: fmt.Sprintf("bit string too long for type bit varying(%d)", n)}
+				}
+			}
+			return NewStringDatum(digits), nil
+		}
 		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err

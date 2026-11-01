@@ -308,19 +308,26 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 		}
 	} else if tname == "bit" {
 		// bit(n): fixed-length, EXACT bit count — no padding/truncation on
-		// assignment. Mirrors varbit.c bit_in's binary-digit scan (only '0'/
-		// '1' accepted, ERRCODE_INVALID_TEXT_REPRESENTATION 22P02 on anything
-		// else) followed by the exact-length check (ERRCODE_STRING_DATA_
-		// LENGTH_MISMATCH 22026 when atttypmod is set and bitlen != atttypmod).
+		// assignment. Mirrors varbit.c bit_in's input scan (leading b/B is
+		// binary, x/X is hex expanded 4 bits per digit, anything else is
+		// binary from position 0 — varbit.c:165-184; digit-set errors are
+		// ERRCODE_INVALID_TEXT_REPRESENTATION 22P02) followed by the
+		// exact-length check (ERRCODE_STRING_DATA_LENGTH_MISMATCH 22026 when
+		// atttypmod is set and bitlen != atttypmod). The scanned CANONICAL
+		// digit text is what gets stored — bit_out prints bare digits, so a
+		// COPY'd `B0101` round-trips as `0101`, matching PG byte-for-byte.
 		// A B'...'/X'...' literal (decodeBitStringLit, internal/parser/expr.go)
 		// already validated its own digit set at parse time, but this is the
 		// single chokepoint every OTHER path into a bit(n) column also passes
 		// through — a plain string literal (`'10'::bit(11)`, implicit
-		// assignment coercion) or a computed text value never went through the
-		// parser's literal decoder at all. M0134-0092.
-		if err := validateBitDigits(s); err != nil {
-			return "", err
+		// assignment coercion), COPY data (`B0101`, aggregates.sql
+		// bitwise_test), or a computed text value never went through the
+		// parser's literal decoder at all. M0134-0092, M0148-0001.
+		digits, berr := scanBitInput(s)
+		if berr != nil {
+			return "", berr
 		}
+		s = digits
 		if len(t.Args) > 0 {
 			n := int(t.Args[0])
 			if len(s) != n {
@@ -332,9 +339,11 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 		// bit varying(n): like bit(n) but the length check is an upper bound
 		// (ERRCODE_STRING_DATA_RIGHT_TRUNCATION 22001, "too long"), not an
 		// exact match — varbit.c varbit_in's `bitlen > atttypmod` arm.
-		if err := validateBitDigits(s); err != nil {
-			return "", err
+		digits, berr := scanBitInput(s)
+		if berr != nil {
+			return "", berr
 		}
+		s = digits
 		if len(t.Args) > 0 {
 			n := int(t.Args[0])
 			if len(s) > n {
@@ -455,18 +464,20 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 	return s, nil
 }
 
-// validateBitDigits checks that s contains only '0'/'1' characters, matching
-// varbit.c bit_in/varbit_in's binary-digit scan. Reports the first offending
-// character with PG's exact wording and SQLSTATE (22P02,
-// ERRCODE_INVALID_TEXT_REPRESENTATION).
-func validateBitDigits(s string) error {
-	for i := 0; i < len(s); i++ {
-		if s[i] != '0' && s[i] != '1' {
-			return &ExecError{Code: "22P02",
-				Message: fmt.Sprintf("%q is not a valid binary digit", string(s[i]))}
-		}
+// scanBitInput runs PG's bit_in/varbit_in text scan (see nodes.ScanBitInput)
+// and wraps its rejection in goopg's ExecError with PG's exact SQLSTATE:
+// 22P02 for an invalid binary/hexadecimal digit, 54000 for a hex input whose
+// bit length exceeds VARBITMAXLEN. The returned text is the canonical
+// digit string that gets stored (prefix stripped, hex expanded).
+// M0134-0092 (digit-set scan), M0148-0001 (b/B/x/X prefix + hex arms —
+// aggregates.sql COPYs `B0101` into a bit column, which the old
+// digits-only scan rejected on the leading "B").
+func scanBitInput(s string) (string, *ExecError) {
+	digits, code, msg, ok := nodes.ScanBitInput(s)
+	if !ok {
+		return "", &ExecError{Code: code, Message: msg}
 	}
-	return nil
+	return digits, nil
 }
 
 // pgBoolIn reproduces PostgreSQL's boolean input conversion —
