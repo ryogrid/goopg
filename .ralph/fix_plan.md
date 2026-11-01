@@ -10981,12 +10981,46 @@ completion path.
     `TestExplainKeyOverMinMaxResultInitPlanRef`.
     Movement: spotcheck Q12=2/Q13=35, sf025 sweep 99/99 plans identical,
     acceptance arm 24 MATCH (fireset-scope OUT: internal/executor, G9).
-    Remaining 0001c slices: (b) SRF multi-target
-    `max(unique2), generate_series(1,3)` hunk 1016 (needs multi-target
-    min/max rewrite + ProjectSet + the `(generate_series(1, 3))` SRF-label
-    rendering entangled with 0001f), (c) inheritance-tree Merge Append
+  - LANDED loop #17 slice (b) — multi-target min/max tlist becomes
+    `Sort → ProjectSet → childless Result` (aggregates hunk 1016 closed
+    byte-exact, 29 → 28). The gate drops `len(s.Targets) != 1`:
+    planagg.c gates per AGG (`can_minmax_aggs`:236), not the tlist length,
+    and `create_minmaxagg_plan`'s `make_result(tlist, quals, NULL)`
+    (createplan.c:2546-2612) keeps every non-agg entry. New
+    `strictMinMaxTarget` finds the one strict min/max target; new
+    `minmaxTListSurvivor` admits only jointree-surviving extras — constants
+    and bare `generate_series` over constants, because `build_minmax_path`
+    moves the relation RTE into the InitPlan subquery and the main jointree
+    is emptied, leaving no RTE for a relation Var. (Trap the pin caught:
+    `isConstantExpr` recurses on args only, so a 0-arg FuncCall —
+    `count(*)` — reads "constant"; the helper dispatches on `*FuncCall`
+    first.) Assembly: InitPlan + surviving consts in the childless Result,
+    SRF targets become `SrfCols` with `OtherExprs` nil at SRF slots, and a
+    `ProjectSet` zips them above (const-only extras ⇒ no ProjectSet); the
+    executor's proven `openSelectSrfMode` path is reused unchanged.
+    `wrapMinMaxOrderByDistinct` re-scans for the agg (label from
+    `outSchema[aggIdx]`), resolves a declined ORDER BY item's RAW
+    expression against the rewritten output (that is `order by g`), and
+    declines ordinals over a multi-target tlist. New
+    `*optimizer.ProjectSet` chase arm: SRF slot ⇒ renderer-synthesised
+    `generate_series` FuncCall ⇒ `Sort Key: (generate_series(1, 3)) DESC`
+    via S18; non-SRF slot steps through `OtherExprs` into the Result (the
+    slice (a) arm ⇒ `(InitPlan 1).col1`). `InitPlan 1` lands on the Sort
+    for free: `LevelInitPlansOf` descends through the ProjectSet child.
+    Pins: `TestRewriteMinMaxAggMultiTargetProjectSet` +
+    `TestRewriteMinMaxAggMultiTargetDeclines` (the old
+    `TestRewriteMinMaxAggMultiTargetOrderByDeclines` pinned the decline
+    this slice replaces), `TestExplainMinMaxMultiTargetProjectSet`
+    (rendered block texts, InitPlan-above-ProjectSet order, rows
+    `20|3/20|2/20|1`, const-extra shape, scope bounds).
+    Movement: spotcheck Q12=2/Q13=35, sf025 sweep, acceptance arm 24 MATCH,
+    fireset gate SF0.25+SF1 (G9 IN-SCOPE, optimizer staged). Deferral
+    ledger: multi-agg tlist (N InitPlans), non-`generate_series` SRF extras
+    + Var/sublink/aggregate-bearing extras, ordinal ORDER BY over a
+    multi-target tlist.
+    Remaining 0001c slices: (c) inheritance-tree Merge Append
     min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
-    sharing hunk 1108 (SubPlan numbering + added `IS NOT NULL` qual).
+    sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
 - [ ] **M0148-0001d — GROUP BY column reduction via functional dependencies
   and canonical pathkey key order**.
   Kind: impl
