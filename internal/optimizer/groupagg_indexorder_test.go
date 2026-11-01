@@ -82,9 +82,23 @@ func TestIndexOrderedGroupingCanonical(t *testing.T) {
 	if a.Strategy != AggStrategySorted {
 		t.Fatalf("Strategy = %d, want AggStrategySorted", a.Strategy)
 	}
-	ios, ok := a.Child.(*IndexOnlyScan)
+	// M0148-0001e: the ordered index path now also reaches the aggregate
+	// through the searched input's candidates with the GROUP BY keys
+	// reordered to its pathkeys (get_useful_group_keys_orderings); that input
+	// carries the search boundary's Project, which EXPLAIN never prints. Look
+	// through it — what this pins is that no Sort sits between the aggregate
+	// and the ordered index scan.
+	in := a.Child
+	for {
+		if p, ok := in.(*Project); ok {
+			in = p.Child
+			continue
+		}
+		break
+	}
+	ios, ok := in.(*IndexOnlyScan)
 	if !ok {
-		t.Fatalf("Aggregate.Child is %T, want *IndexOnlyScan (no Sort)", a.Child)
+		t.Fatalf("Aggregate input is %T, want *IndexOnlyScan (no Sort)", in)
 	}
 	if ios.Index != idx {
 		t.Fatalf("IndexOnlyScan.Index = %v, want btg_x_y_idx", ios.Index)

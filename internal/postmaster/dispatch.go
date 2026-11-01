@@ -1908,6 +1908,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_memoize", &ps.EnableMemoize)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
+	readBool("enable_group_by_reordering", &ps.EnableGroupByReordering)
 	readBool("geqo", &ps.Geqo)
 	// take2 P3-10: the five remaining GEQO knobs. Zero is MEANINGFUL for
 	// geqo_pool_size and geqo_generations (PG reads it as "derive me"), so they
@@ -2031,6 +2032,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(ps.EnableBitmapScan),
 		bit(ps.EnableHashAgg),
 		bit(ps.EnablePresortedAggregate),
+		bit(ps.EnableGroupByReordering),
 		bit(ps.Geqo),
 		strconv.Itoa(ps.GeqoThreshold),
 		strconv.Itoa(ps.GeqoEffort),

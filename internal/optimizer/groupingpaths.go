@@ -704,7 +704,6 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// carries its ordering only as a derivation (inputNodePathkeys:
 			// a CTE scan over a sorted body, a sorted aggregate, a Sort); the
 			// searched-input candidates below cover the join-search case.
-			isSorted := false
 			// M0146-0134: the seed's ordering is compared through the
 			// searched rel's equivalence classes, as PG's canonical pathkeys
 			// are — make_ordered_path then builds ONE ordering step for the
@@ -713,104 +712,117 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			if sr := searchedJoinInputRelOf(child); sr != nil {
 				seedUseful = sr.usefulKeys
 			}
-			if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
-				func() bool { c, _ := seedUseful.countContainedIn(seedKeys, pathkeysForSortKeys(keys)); return c }() {
-				sorted := *seed
-				sorted.Pathkeys = seedKeys
-				presortedSpec := *aggNode
-				presortedSpec.GroupInputKeys = equivalentGroupInputKeys(seedKeys, pathkeysForSortKeys(keys), len(presortedSpec.GroupExprs))
-				addAggPath(grouped, &Path{
-					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
-					Rel: grouped, Rows: numGroups,
-					Cost: costAggClause(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
-						len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth, aggClauseCosts(cp, &presortedSpec, aggSplitSimple)),
-					// M0146-0189: the group keys' pathkeys, as every other
-					// grouping arm files (the sort and search-candidate arms,
-					// the partial split). The seed's own keys name the same
-					// ordering in the joined tree's coordinates; PG's canonical
-					// pathkeys make the two one, but syntactic ones made add_path
-					// call them PATHKEYS_DIFFERENT, so a fuzzily-tied, slow-start
-					// Finalize split survived beside this fast-start path and won
-					// on total (TPC-DS Q77's ws).
-					Pathkeys: pathkeysForSortKeys(keys), Children: []*Path{&sorted},
-				}, groupAggSortedProducer)
-				isSorted = true // upstream offers no Sort over this same path
-			}
-			if !ok && !isSorted {
-				// M0144-0003c: narrowed seed — see sortSeed above.
-				// M0146-0006: make_ordered_path (planner.c) sorts the cheapest
-				// input incrementally when its pathkeys already deliver a
-				// leading prefix of the group keys and enable_incremental_sort
-				// is on, and fully otherwise — never both. TPC-DS Q64's
-				// cross_sales CTE groups an item-ordered input:
-				// `GroupAggregate <- Incremental Sort (Presorted Key:
-				// item.i_item_sk)`.
-				groupPathkeys := pathkeysForSortKeys(keys)
-				var sortedInput *Path
-				if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
-					if _, n := seedUseful.countContainedIn(seedKeys, groupPathkeys); n > 0 {
-						incSeed := *sortSeed
-						incSeed.Pathkeys = seedKeys
-						sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
+			// M0148-0001e: get_useful_group_keys_orderings (pathkeys.c) — the
+			// written order, plus the keys reordered to the input's pathkeys
+			// (group_keys_reorder_by_pathkeys) when that ordering serves more
+			// of them; make_ordered_path then builds no Sort, an Incremental
+			// Sort or a Sort for each (add_paths_to_grouping_rel).
+			for _, ord := range groupKeyOrderings(seedUseful, inputNodePathkeys(child), keys, groupKeyPositions(aggNode, presorted), cp, ps) {
+				isSorted := false
+				if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
+					func() bool { c, _ := seedUseful.countContainedIn(seedKeys, pathkeysForSortKeys(ord.keys)); return c }() {
+					sorted := *seed
+					sorted.Pathkeys = seedKeys
+					presortedSpec := *aggNode
+					presortedSpec.GroupKeyOrder = ord.groupKeyOrder(presortedSpec.GroupKeyOrder)
+					presortedSpec.GroupInputKeys = equivalentGroupInputKeys(seedKeys, pathkeysForSortKeys(ord.keys), len(presortedSpec.GroupExprs))
+					addAggPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &presortedSpec,
+						Rel: grouped, Rows: numGroups,
+						Cost: costAggClause(cp, AggStrategySorted, inputRows, sorted.Cost.Startup, sorted.Cost.Total,
+							len(presortedSpec.GroupExprs), numGroups, len(presortedSpec.Aggs), inWidth, aggClauseCosts(cp, &presortedSpec, aggSplitSimple)),
+						// M0146-0189: the group keys' pathkeys, as every other
+						// grouping arm files (the sort and search-candidate arms,
+						// the partial split). The seed's own keys name the same
+						// ordering in the joined tree's coordinates; PG's canonical
+						// pathkeys make the two one, but syntactic ones made add_path
+						// call them PATHKEYS_DIFFERENT, so a fuzzily-tied, slow-start
+						// Finalize split survived beside this fast-start path and won
+						// on total (TPC-DS Q77's ws).
+						Pathkeys: pathkeysForSortKeys(ord.keys), Children: []*Path{&sorted},
+					}, groupAggSortedProducer)
+					isSorted = true // upstream offers no Sort over this same path
+				}
+				if !ok && !isSorted {
+					// M0144-0003c: narrowed seed — see sortSeed above.
+					// M0146-0006: make_ordered_path (planner.c) sorts the cheapest
+					// input incrementally when its pathkeys already deliver a
+					// leading prefix of the group keys and enable_incremental_sort
+					// is on, and fully otherwise — never both. TPC-DS Q64's
+					// cross_sales CTE groups an item-ordered input:
+					// `GroupAggregate <- Incremental Sort (Presorted Key:
+					// item.i_item_sk)`.
+					groupPathkeys := pathkeysForSortKeys(ord.keys)
+					var sortedInput *Path
+					if seedKeys := inputNodePathkeys(child); cp.enableIncrementalSort && len(seedKeys) > 0 {
+						if _, n := seedUseful.countContainedIn(seedKeys, groupPathkeys); n > 0 {
+							incSeed := *sortSeed
+							incSeed.Pathkeys = seedKeys
+							sortedInput = incrementalSortPathOver(grouped, &incSeed, child, groupPathkeys, n, cp, -1)
+						}
 					}
+					if sortedInput == nil {
+						sortedInput = sortPathForBounded(sortSeed, groupPathkeys, cp, -1)
+					}
+					// R47 slice 1: per-candidate spec clone (see PLAIN arm).
+					sortSpec := *aggNode
+					sortSpec.GroupKeyOrder = ord.groupKeyOrder(sortSpec.GroupKeyOrder)
+					addAggPath(grouped, &Path{
+						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
+						Rel: grouped, Rows: numGroups,
+						Cost: costAggClause(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
+							len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth, aggClauseCosts(cp, &sortSpec, aggSplitSimple)),
+						Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
+					}, groupAggSortedProducer)
 				}
-				if sortedInput == nil {
-					sortedInput = sortPathForBounded(sortSeed, groupPathkeys, cp, -1)
-				}
-				// R47 slice 1: per-candidate spec clone (see PLAIN arm).
-				sortSpec := *aggNode
-				addAggPath(grouped, &Path{
-					Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &sortSpec,
-					Rel: grouped, Rows: numGroups,
-					Cost: costAggClause(cp, AggStrategySorted, inputRows, sortedInput.Cost.Startup, sortedInput.Cost.Total,
-						len(sortSpec.GroupExprs), numGroups, len(sortSpec.Aggs), inWidth, aggClauseCosts(cp, &sortSpec, aggSplitSimple)),
-					Pathkeys: sortedInput.Pathkeys, Children: []*Path{sortedInput},
-				}, groupAggSortedProducer)
 			}
 			if sr := searchedJoinInputRelOf(child); sr != nil {
-				groupPathkeys := pathkeysForSortKeys(keys)
 				candKeys := validatedSearchCandidateKeys(sr.Pathlist, child.Output())
 				for i, cand := range sr.Pathlist {
 					if i >= len(candKeys) {
 						continue
 					}
-					// make_ordered_path: a presorted runner-up feeds the
-					// aggregate as-is, a partially presorted one through an
-					// Incremental Sort (M0146-0006), and one with no
-					// presorted key is not offered (only the cheapest input
-					// is fully sorted, above).
-					// M0146-0134: through the searched rel's equivalence
-					// classes, as PG's canonical pathkeys compare — Q64's
-					// input ordered on cs_item_sk is presorted for the
-					// group key i_item_sk the join equates it with.
-					contained, nCommon := sr.usefulKeys.countContainedIn(candKeys[i], groupPathkeys)
-					if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
-						continue
+					for _, ord := range groupKeyOrderings(sr.usefulKeys, candKeys[i], keys, groupKeyPositions(aggNode, presorted), cp, ps) {
+						groupPathkeys := pathkeysForSortKeys(ord.keys)
+						// make_ordered_path: a presorted runner-up feeds the
+						// aggregate as-is, a partially presorted one through an
+						// Incremental Sort (M0146-0006), and one with no
+						// presorted key is not offered (only the cheapest input
+						// is fully sorted, above).
+						// M0146-0134: through the searched rel's equivalence
+						// classes, as PG's canonical pathkeys compare — Q64's
+						// input ordered on cs_item_sk is presorted for the
+						// group key i_item_sk the join equates it with.
+						contained, nCommon := sr.usefulKeys.countContainedIn(candKeys[i], groupPathkeys)
+						if !contained && (nCommon == 0 || !cp.enableIncrementalSort) {
+							continue
+						}
+						cNode := searchedCandidateInput(child, cand)
+						if cNode == nil {
+							continue
+						}
+						cs := newPrebuiltPath(grouped, cNode)
+						cs.ParallelSafe = grouped.ParallelSafeForPath() && cand.ParallelSafe
+						cs.Rows = inputRows
+						cs.Cost = cand.Cost
+						cs.Pathkeys = candKeys[i]
+						in := cs
+						if !contained {
+							in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
+						}
+						candSpec := *aggNode
+						candSpec.GroupKeyOrder = ord.groupKeyOrder(candSpec.GroupKeyOrder)
+						if contained {
+							candSpec.GroupInputKeys = equivalentGroupInputKeys(candKeys[i], groupPathkeys, len(candSpec.GroupExprs))
+						}
+						addAggPath(grouped, &Path{
+							Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
+							Rel: grouped, Rows: numGroups,
+							Cost: costAggClause(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
+								len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth, aggClauseCosts(cp, &candSpec, aggSplitSimple)),
+							Pathkeys: groupPathkeys, Children: []*Path{in},
+						}, groupAggSearchProducer)
 					}
-					cNode := searchedCandidateInput(child, cand)
-					if cNode == nil {
-						continue
-					}
-					cs := newPrebuiltPath(grouped, cNode)
-					cs.ParallelSafe = grouped.ParallelSafeForPath() && cand.ParallelSafe
-					cs.Rows = inputRows
-					cs.Cost = cand.Cost
-					cs.Pathkeys = candKeys[i]
-					in := cs
-					if !contained {
-						in = incrementalSortPathOver(grouped, cs, child, groupPathkeys, nCommon, cp, -1)
-					}
-					candSpec := *aggNode
-					if contained {
-						candSpec.GroupInputKeys = equivalentGroupInputKeys(candKeys[i], groupPathkeys, len(candSpec.GroupExprs))
-					}
-					addAggPath(grouped, &Path{
-						Kind: PathAgg, AggStrategy: AggStrategySorted, Agg: &candSpec,
-						Rel: grouped, Rows: numGroups,
-						Cost: costAggClause(cp, AggStrategySorted, inputRows, in.Cost.Startup, in.Cost.Total,
-							len(candSpec.GroupExprs), numGroups, len(candSpec.Aggs), inWidth, aggClauseCosts(cp, &candSpec, aggSplitSimple)),
-						Pathkeys: groupPathkeys, Children: []*Path{in},
-					}, groupAggSearchProducer)
 				}
 			}
 			// M0146-0005au: a UNION ALL input whose members already emit
@@ -1225,4 +1237,114 @@ func indexOrderedAggInput(aggNode *Aggregate, child Node, cat catalog.Catalog) (
 		return built, &clone, true
 	}
 	return nil, nil, false
+}
+
+// groupKeyOrdering is one GroupByOrdering of get_useful_group_keys_orderings
+// (pathkeys.c): the group sort keys in a candidate order and, for a
+// reordering, the GroupExprs index of each key (the Group Key: line's order).
+type groupKeyOrdering struct {
+	keys  []SortKey
+	order []int // nil: the written (processed group clause) order
+}
+
+// groupKeyOrder returns the Aggregate.GroupKeyOrder for this ordering: its
+// own permutation, or prev (the written-order rendering) when it is the
+// original ordering.
+func (o groupKeyOrdering) groupKeyOrder(prev []int) []int {
+	if o.order == nil {
+		return prev
+	}
+	return append([]int(nil), o.order...)
+}
+
+// groupKeyPositions is the GroupExprs index of each groupKeysSortKeys key, or
+// nil when the keys are the presorted-aggregate keys (no reordering then:
+// get_useful_group_keys_orderings searches only num_groupby_pathkeys).
+func groupKeyPositions(aggNode *Aggregate, presorted bool) []int {
+	if presorted {
+		return nil
+	}
+	ks := groupClauseKeys(aggNode)
+	pos := make([]int, len(ks))
+	for i, k := range ks {
+		pos[i] = k.Pos
+	}
+	return pos
+}
+
+// groupKeyOrderings is get_useful_group_keys_orderings (pathkeys.c,
+// M0148-0001e): always the written order; and, when enable_group_by_reordering
+// is on, the input is sorted in some way its pathkeys are not already a prefix
+// of the group keys, the keys reordered by group_keys_reorder_by_pathkeys —
+// the input's matching prefix first, in input order, then the rest in written
+// order — provided at least one key matched, incremental sort is on or every
+// key matched, and the result differs from the written order.
+func groupKeyOrderings(u *pathkeyUsefulness, inputKeys []PathKey, keys []SortKey, pos []int, cp costParams, ps PlannerSettings) []groupKeyOrdering {
+	out := []groupKeyOrdering{{keys: keys}}
+	if pos == nil || len(pos) != len(keys) || !ps.EnableGroupByReordering || len(inputKeys) == 0 {
+		return out
+	}
+	groupPK := pathkeysForSortKeys(keys)
+	if contained, _ := u.countContainedIn(groupPK, inputKeys); contained {
+		return out // pathkeys_contained_in(path->pathkeys, group_pathkeys)
+	}
+	perm, n := reorderGroupKeysByPathkeys(u, inputKeys, groupPK)
+	if n == 0 || !(cp.enableIncrementalSort || n == len(keys)) {
+		return out
+	}
+	identity := true
+	for i, j := range perm {
+		if i != j {
+			identity = false
+			break
+		}
+	}
+	if identity {
+		return out // compare_pathkeys(...) == PATHKEYS_EQUAL
+	}
+	rk := make([]SortKey, len(perm))
+	order := make([]int, len(perm))
+	for i, j := range perm {
+		rk[i] = keys[j]
+		order[i] = pos[j]
+	}
+	return append(out, groupKeyOrdering{keys: rk, order: order})
+}
+
+// reorderGroupKeysByPathkeys is group_keys_reorder_by_pathkeys (pathkeys.c):
+// walk the input's pathkeys and move each that is a group key to the front,
+// stopping at the first that is not; the remaining group keys follow in
+// their written order. It returns the permutation (indices into groupPK) and
+// the number of keys the input's ordering covers.
+func reorderGroupKeysByPathkeys(u *pathkeyUsefulness, inputKeys, groupPK []PathKey) ([]int, int) {
+	used := make([]bool, len(groupPK))
+	perm := make([]int, 0, len(groupPK))
+	for _, ik := range inputKeys {
+		if len(perm) >= len(groupPK) {
+			break
+		}
+		found := -1
+		for j, gk := range groupPK {
+			if used[j] {
+				continue
+			}
+			if u.pathKeyEqual(ik, gk) || (ik.SortAsc == gk.SortAsc && ik.NullsFirst == gk.NullsFirst &&
+				ik.GroupingNulled == gk.GroupingNulled && u.equivalentWithin(ik.Expr, gk.Expr)) {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			break
+		}
+		used[found] = true
+		perm = append(perm, found)
+	}
+	n := len(perm)
+	for j := range groupPK {
+		if !used[j] {
+			perm = append(perm, j)
+		}
+	}
+	return perm, n
 }

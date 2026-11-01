@@ -85,6 +85,11 @@ type PlannerSettings struct {
 	// EnableIncrementalSort is PG's `enable_incremental_sort` (default on).
 	EnableIncrementalSort bool
 
+	// EnableGroupByReordering is PG's `enable_group_by_reordering` (default
+	// on): get_useful_group_keys_orderings offers the GROUP BY keys reordered
+	// to an input path's pathkeys besides their written order (M0148-0001e).
+	EnableGroupByReordering bool
+
 	// EnableMaterial is PG's `enable_material` — a generation gate at the
 	// producer (joinpath.c:1897), not a counted flag like the methods above:
 	// the matpath is simply never created when it is off.
@@ -253,6 +258,7 @@ func DefaultPlannerSettings() PlannerSettings {
 		EnableParallelHash: true,
 		EnableSort:      true,
 		EnableIncrementalSort: true,
+		EnableGroupByReordering: true,
 		EnableSeqScan:    true,
 		EnableIndexScan:  true,
 		EnableBitmapScan: true,
