@@ -717,7 +717,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// (group_keys_reorder_by_pathkeys) when that ordering serves more
 			// of them; make_ordered_path then builds no Sort, an Incremental
 			// Sort or a Sort for each (add_paths_to_grouping_rel).
-			for _, ord := range groupKeyOrderings(seedUseful, inputNodePathkeys(child), keys, groupKeyPositions(aggNode, presorted), cp, ps) {
+			for _, ord := range groupKeyOrderings(seedUseful, inputNodePathkeys(child), keys, groupKeyPositions(aggNode), cp, ps, aggNode.GroupExprs) {
 				isSorted := false
 				if seedKeys := inputNodePathkeys(child); !ok && len(seedKeys) > 0 &&
 					func() bool { c, _ := seedUseful.countContainedIn(seedKeys, pathkeysForSortKeys(ord.keys)); return c }() {
@@ -782,7 +782,7 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 					if i >= len(candKeys) {
 						continue
 					}
-					for _, ord := range groupKeyOrderings(sr.usefulKeys, candKeys[i], keys, groupKeyPositions(aggNode, presorted), cp, ps) {
+					for _, ord := range groupKeyOrderings(sr.usefulKeys, candKeys[i], keys, groupKeyPositions(aggNode), cp, ps, aggNode.GroupExprs) {
 						groupPathkeys := pathkeysForSortKeys(ord.keys)
 						// make_ordered_path: a presorted runner-up feeds the
 						// aggregate as-is, a partially presorted one through an
@@ -1257,13 +1257,13 @@ func (o groupKeyOrdering) groupKeyOrder(prev []int) []int {
 	return append([]int(nil), o.order...)
 }
 
-// groupKeyPositions is the GroupExprs index of each groupKeysSortKeys key, or
-// nil when the keys are the presorted-aggregate keys (no reordering then:
-// get_useful_group_keys_orderings searches only num_groupby_pathkeys).
-func groupKeyPositions(aggNode *Aggregate, presorted bool) []int {
-	if presorted {
-		return nil
-	}
+// groupKeyPositions is the GroupExprs index of each GROUP BY key in the
+// processed group clause order — root->group_pathkeys' first
+// num_groupby_pathkeys entries. The presorted-aggregate keys
+// (adjust_group_pathkeys_for_groupagg) carry these same keys first and the
+// aggregates' ORDER BY / DISTINCT keys behind them; groupKeyOrderings
+// reorders only the GROUP BY prefix.
+func groupKeyPositions(aggNode *Aggregate) []int {
 	ks := groupClauseKeys(aggNode)
 	pos := make([]int, len(ks))
 	for i, k := range ks {
@@ -1279,17 +1279,32 @@ func groupKeyPositions(aggNode *Aggregate, presorted bool) []int {
 // the input's matching prefix first, in input order, then the rest in written
 // order — provided at least one key matched, incremental sort is on or every
 // key matched, and the result differs from the written order.
-func groupKeyOrderings(u *pathkeyUsefulness, inputKeys []PathKey, keys []SortKey, pos []int, cp costParams, ps PlannerSettings) []groupKeyOrdering {
+//
+// keys may be the presorted-aggregate keys: the GROUP BY keys (pos, in order)
+// followed by the aggregates' sort keys. As in group_keys_reorder_by_pathkeys
+// only that GROUP BY prefix (num_groupby_pathkeys) is reordered — the walk
+// stops at the input's first pathkey past it — and the aggregate keys stay
+// behind it (list_concat_unique_ptr), so `GROUP BY x, y` with
+// `array_agg(DISTINCT w)` over a (y, x, w) index groups as `y, x` with no Sort.
+func groupKeyOrderings(u *pathkeyUsefulness, inputKeys []PathKey, keys []SortKey, pos []int, cp costParams, ps PlannerSettings, groupExprs []Expr) []groupKeyOrdering {
 	out := []groupKeyOrdering{{keys: keys}}
-	if pos == nil || len(pos) != len(keys) || !ps.EnableGroupByReordering || len(inputKeys) == 0 {
+	ng := len(pos)
+	if ng == 0 || ng > len(keys) || !ps.EnableGroupByReordering || len(inputKeys) == 0 {
 		return out
+	}
+	// The GROUP BY prefix must be the processed group clause itself; a key
+	// list built some other way is offered only as written.
+	for i, p := range pos {
+		if p < 0 || p >= len(groupExprs) || !exprEqual(keys[i].Expr, groupExprs[p]) {
+			return out
+		}
 	}
 	groupPK := pathkeysForSortKeys(keys)
 	if contained, _ := u.countContainedIn(groupPK, inputKeys); contained {
 		return out // pathkeys_contained_in(path->pathkeys, group_pathkeys)
 	}
-	perm, n := reorderGroupKeysByPathkeys(u, inputKeys, groupPK)
-	if n == 0 || !(cp.enableIncrementalSort || n == len(keys)) {
+	perm, n := reorderGroupKeysByPathkeys(u, inputKeys, groupPK[:ng])
+	if n == 0 || !(cp.enableIncrementalSort || n == ng) {
 		return out
 	}
 	identity := true
@@ -1302,12 +1317,13 @@ func groupKeyOrderings(u *pathkeyUsefulness, inputKeys []PathKey, keys []SortKey
 	if identity {
 		return out // compare_pathkeys(...) == PATHKEYS_EQUAL
 	}
-	rk := make([]SortKey, len(perm))
+	rk := make([]SortKey, 0, len(keys))
 	order := make([]int, len(perm))
 	for i, j := range perm {
-		rk[i] = keys[j]
+		rk = append(rk, keys[j])
 		order[i] = pos[j]
 	}
+	rk = append(rk, keys[ng:]...)
 	return append(out, groupKeyOrdering{keys: rk, order: order})
 }
 

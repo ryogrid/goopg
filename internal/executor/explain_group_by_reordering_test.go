@@ -146,3 +146,40 @@ func TestMergeJoinOuterIncrementalSort(t *testing.T) {
 		t.Errorf("enable_incremental_sort = off must not build an Incremental Sort:\n%s", plan)
 	}
 }
+
+// M0148-0001e: with a presorted aggregate (adjust_group_pathkeys_for_groupagg
+// appends array_agg(DISTINCT w)'s key behind the GROUP BY keys),
+// group_keys_reorder_by_pathkeys still reorders the GROUP BY prefix
+// (num_groupby_pathkeys) to the input's pathkeys and keeps the aggregate key
+// behind it. aggregates.out: `GROUP BY x, y` with array_agg(DISTINCT w) over
+// btg_y_x_w_idx groups as `y, x` straight off the Index Only Scan — no Sort.
+func TestGroupByReorderKeepsPresortedAggregateKeys(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE btg (x int NOT NULL, y int NOT NULL, z text, w int NOT NULL)",
+		"INSERT INTO btg SELECT i % 10, i % 10, 'abc' || i % 10, i FROM generate_series(1, 100) AS i",
+		"CREATE INDEX btg_y_x_w_idx ON btg(y, x, w)",
+		"ANALYZE btg",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableHashAgg = false
+	ps.EnableSeqScan = false
+	q := "EXPLAIN (COSTS OFF) SELECT y, x, array_agg(distinct w) FROM btg WHERE y < 0 GROUP BY x, y"
+	plan := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n")
+	lines := strings.Split(plan, "\n")
+	if len(lines) < 3 || lines[0] != "GroupAggregate" || lines[1] != "  Group Key: y, x" ||
+		lines[2] != "  ->  Index Only Scan using btg_y_x_w_idx on btg" || strings.Contains(plan, "Sort") {
+		t.Errorf("want PG 18.3's GroupAggregate (Group Key: y, x) directly over the Index Only Scan:\n%s", plan)
+	}
+	vq := "SELECT y, x, array_agg(distinct w ORDER BY w) FROM btg WHERE y < 2 GROUP BY x, y ORDER BY 1, 2"
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, vq, ps)), ";"); got != "0|0|{10,20,30,40,50,60,70,80,90,100};1|1|{1,11,21,31,41,51,61,71,81,91}" {
+		t.Errorf("values: %s", got)
+	}
+	ps.EnableGroupByReordering = false
+	if plan := strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n"); !strings.Contains(plan, "Group Key: x, y") {
+		t.Errorf("enable_group_by_reordering = off must keep the written order:\n%s", plan)
+	}
+}
