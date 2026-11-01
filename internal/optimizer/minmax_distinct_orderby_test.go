@@ -8,19 +8,15 @@ import (
 
 // TestRewriteMinMaxAggDistinct — S19 acceptance (1): `SELECT DISTINCT
 // max(unique2) FROM tenk1`-shape (`select distinct max(x) from t`) must still
-// rewrite to the InitPlan shape, now wrapped in a Distinct (rendered "Unique"
-// in EXPLAIN) node on top of the Result. M0134-0001 S19.
+// rewrite to the InitPlan shape, now wrapped in a DISTINCT node on top of the
+// Result (hashed or sorted, per the cost election). M0134-0001 S19.
 func TestRewriteMinMaxAggDistinct(t *testing.T) {
 	cat, tbl := minmaxRewriteCatalog(t)
 	plan, err := Plan(parseOne(t, "SELECT DISTINCT max(x) FROM t"), cat)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	dist, ok := plan.(*Distinct)
-	if !ok {
-		t.Fatalf("plan root is %T, want *Distinct", plan)
-	}
-	_, _, _, child := digMinMaxInner(t, dist.Child)
+	_, _, _, child := digMinMaxInner(t, minmaxDistinctInput(t, plan))
 	ios, ok := child.(*IndexOnlyScan)
 	if !ok {
 		t.Fatalf("Limit child is %T, want *IndexOnlyScan", child)
@@ -31,6 +27,28 @@ func TestRewriteMinMaxAggDistinct(t *testing.T) {
 	if ios.Table != tbl {
 		t.Fatalf("IOS Table = %v, want %v", ios.Table, tbl)
 	}
+}
+
+// minmaxDistinctInput returns the rewritten Result under a DISTINCT wrap of
+// either strategy: create_final_distinct_paths elects between the hashed
+// Distinct and the sorted Unique (DistinctOn over a Sort) on cost, and since
+// M0148-0001c1 the min/max Result carries create_minmaxagg_path's real cost,
+// so which one wins depends on the InitPlan's price (this storage-less
+// one-row fixture prices its index-only scan's heap fetches at ~8, inside
+// add_path's fuzz, and the sorted path's pathkeys win — as in PG).
+func minmaxDistinctInput(t *testing.T, plan Node) Node {
+	t.Helper()
+	switch d := plan.(type) {
+	case *Distinct:
+		return d.Child
+	case *DistinctOn:
+		if s, ok := d.Child.(*Sort); ok {
+			return s.Child
+		}
+		return d.Child
+	}
+	t.Fatalf("plan root is %T, want a DISTINCT wrap (*Distinct or *DistinctOn)", plan)
+	return nil
 }
 
 // TestRewriteMinMaxAggOrderByOrdinal — S19 acceptance (2): `ORDER BY 1`
@@ -140,11 +158,7 @@ func TestRewriteMinMaxAggMinDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	dist, ok := plan.(*Distinct)
-	if !ok {
-		t.Fatalf("plan root is %T, want *Distinct", plan)
-	}
-	digMinMaxInner(t, dist.Child)
+	digMinMaxInner(t, minmaxDistinctInput(t, plan))
 }
 
 // TestRewriteMinMaxAggOrderByUnresolvedDeclines — escape hatch: an ORDER BY

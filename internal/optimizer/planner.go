@@ -2,6 +2,7 @@ package optimizer
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -12744,8 +12745,10 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 	// ---- gate tail: assemble the rewritten top node (createplan.c:2546-2612
 	// create_minmaxagg_plan) ----
 	if len(s.Targets) == 1 {
-		return &Result{pos: pos, Targets: []Expr{initExprs[0]},
-			schema: Schema{{Name: aggCols[0].Name, Type: aggCols[0].Type}}}, true, nil
+		res := &Result{pos: pos, Targets: []Expr{initExprs[0]},
+			schema: Schema{{Name: aggCols[0].Name, Type: aggCols[0].Type}}}
+		chargeMinMaxResult(res, initExprs)
+		return res, true, nil
 	}
 	resTargets := make([]Expr, 0, len(s.Targets))
 	resSchema := make(Schema, 0, len(s.Targets))
@@ -12798,6 +12801,7 @@ func rewriteMinMaxAggregates(s *parser.SelectStmt, ctx *resolveContext, cat cata
 		psSchema[i] = SchemaColumn{Name: name, Type: exprType(e)}
 	}
 	res := &Result{pos: pos, Targets: resTargets, schema: resSchema}
+	chargeMinMaxResult(res, initExprs)
 	if len(srfCols) == 0 {
 		// Const-only extras: the childless Result emits them in its one row.
 		// PG adds the ProjectSet only when the tlist holds a set-returning
@@ -13003,6 +13007,16 @@ func buildMinMaxInitPlan(s *parser.SelectStmt, cat catalog.Catalog, ctx *resolve
 				schema: Schema{{Name: argCR.Name, Type: colType,
 					SourceTableIdx: 1}},
 			}
+			// M0148-0001c1: price the path build_minmax_path takes
+			// (cost_index, index-only), its restriction the NullTest plus
+			// the pushed WHERE, all of it index quals.
+			selExpr := Expr(isNotNull)
+			if wherePred != nil {
+				selExpr = andExpr(pos, isNotNull, wherePred)
+			}
+			stampMinMaxIndexOnlyCost(ios, cat, ctx.settings.costParams(), tbl, idx,
+				clauseSelectivity(selExpr, &SeqScan{Table: tbl, schema: ctx.schema}),
+				len(splitConjuncts(cond, nil)), 0)
 			inner = &Limit{pos: pos, Child: ios, Limit: &IntegerConst{pos: pos, Value: 1}}
 		}
 
@@ -13209,8 +13223,17 @@ func buildMinMaxAppendRelMerge(cat catalog.Catalog, ctx *resolveContext, parent 
 	parentRTID := scope.Alloc()
 	mergeKey := SortKey{Expr: &ColumnRef{pos: pos, Index: 0, Name: argCR.Name, Type: colType, SourceTableIdx: 1},
 		Desc: isMax, NullsFirst: isMax}
+	all := append([]*catalog.Table{parent}, members...)
+	// M0148-0001c1: root->total_table_pages over the subquery's relations —
+	// every appendrel member (cost_index's index_pages_fetched input).
+	totalPages := 0.0
+	for _, m := range all {
+		totalPages += float64(baseRelPages(m, minmaxRelTuples(cat, m)))
+	}
+	cp := ctx.settings.costParams()
+	var sumStartup, sumTotal, sumRows float64
 	var chain Node
-	for _, m := range append([]*catalog.Table{parent}, members...) {
+	for _, m := range all {
 		col, ok := cat.LookupColumn(m, argCR.Name)
 		if !ok {
 			return nil, false
@@ -13235,6 +13258,22 @@ func buildMinMaxAppendRelMerge(cat catalog.Catalog, ctx *resolveContext, parent 
 			RTID:     scope.Alloc(),
 			schema:   Schema{{Name: argCR.Name, Type: colType, SourceTableIdx: 1}},
 		}
+		// The member's restriction is the translated NullTest; a partial
+		// index whose predicate is that NullTest carries it as its
+		// predicate, not an index qual (genericcostestimate's
+		// add_predicate_to_index_quals keeps it in the selectivity).
+		nq := 1
+		if predNotNull {
+			nq = 0
+		}
+		probe := &SeqScan{Table: m, schema: tableSchemaWithSource(m, 1)}
+		notNull := &IsNullExpr{pos: pos, Operand: &ColumnRef{pos: pos, Index: columnIndexOf(m, argCR.Name),
+			Name: argCR.Name, Type: colType, SourceTableIdx: 1}, Negated: true}
+		stampMinMaxIndexOnlyCost(ios, cat, cp, m, idx, clauseSelectivity(notNull, probe), nq, totalPages)
+		pc, _ := ios.PlanCostInfo()
+		sumStartup += pc.StartupCost
+		sumTotal += pc.TotalCost
+		sumRows += pc.PlanRows
 		if chain == nil {
 			chain = ios
 			continue
@@ -13248,7 +13287,99 @@ func buildMinMaxAppendRelMerge(cat catalog.Catalog, ctx *resolveContext, parent 
 	}
 	top.RTID = parentRTID
 	top.AppendRelName = refname
+	// create_merge_append_path over the members' presorted paths: no Sort
+	// is added, so the inputs' costs are summed as they stand
+	// (cost_merge_append, costsize.c).
+	mc := mergeAppendCost(cp, len(all), sumRows, sumStartup, sumTotal)
+	top.setPlanCost(PlanCost{StartupCost: mc.Startup, TotalCost: mc.Total, PlanRows: sumRows,
+		PlanWidth: TupleWidth(top.Output())})
 	return top, true
+}
+
+// minmaxRelTuples is baserel->tuples for a min/max subquery relation:
+// ANALYZE's count when there is one, else estimate_rel_size's block-derived
+// fallback (relSizeFallbackRows), as the search seeds a base rel.
+func minmaxRelTuples(cat catalog.Catalog, tbl *catalog.Table) float64 {
+	r := tableRows(tbl)
+	if r <= 0 {
+		r = relSizeFallbackRows(cat, tbl)
+	}
+	if r < 1 {
+		r = 1
+	}
+	return float64(r)
+}
+
+// columnIndexOf is col's position in tbl's column list (0 when absent — the
+// callers pass a column they already looked up).
+func columnIndexOf(tbl *catalog.Table, col string) int {
+	for i, c := range tbl.Columns {
+		if c.Name == col {
+			return i
+		}
+	}
+	return 0
+}
+
+// stampMinMaxIndexOnlyCost prices one build_minmax_path index-only scan with
+// goopg's cost_index port (costIndexScan, index-only arm) and records it on
+// the node (M0148-0001c1). sel is the relation's restriction selectivity —
+// the `col IS NOT NULL` NullTest and any pushed WHERE — every clause of
+// which is an index qual (nIndexQuals of them; no qpquals remain). The
+// node's rows are the restricted relation's (clamp_row_est), the input
+// build_minmax_path's path_fraction = 1 / final_rel->rows divides, which the
+// Limit above derives (adjust_limit_rows_costs). totalPages 0 means the
+// relation alone (root->total_table_pages of a one-relation subquery).
+func stampMinMaxIndexOnlyCost(ios *IndexOnlyScan, cat catalog.Catalog, cp costParams, tbl *catalog.Table, idx *catalog.Index, sel float64, nIndexQuals int, totalPages float64) {
+	relTuples := minmaxRelTuples(cat, tbl)
+	relPages := baseRelPages(tbl, relTuples)
+	if totalPages <= 0 {
+		totalPages = float64(relPages)
+	}
+	if !(sel > 0) || sel > 1 {
+		sel = 1
+	}
+	indexPages, indexTuples, treeHeight := estimateIndexGeometry(cat, idx, tbl, relTuples)
+	in := indexScanInputs{
+		relPages:        relPages,
+		relTuples:       relTuples,
+		indexPages:      indexPages,
+		indexTuples:     indexTuples,
+		treeHeight:      treeHeight,
+		selectivity:     sel,
+		correlation:     indexCorrelationFor(idx, leadingKeyStats(idx, tbl)),
+		totalTablePages: totalPages,
+		loopCount:       1,
+		indexOnly:       true,
+		allVisFrac:      relAllVisibleFraction(cat, tbl, relPages),
+		numIndexQuals:   float64(nIndexQuals),
+	}
+	c := costIndexScan(cp, in)
+	rows := math.RoundToEven(relTuples * sel)
+	if rows < 1 {
+		rows = 1
+	}
+	ios.setPlanCost(PlanCost{StartupCost: c.Startup, TotalCost: c.Total, PlanRows: rows,
+		PlanWidth: TupleWidth(ios.Output())})
+}
+
+// chargeMinMaxResult is create_minmaxagg_path's cost (pathnode.c): the
+// Result's startup is the sum of its InitPlans' path costs (each
+// build_minmax_path pathcost = the Limit's cost over the presorted path —
+// startup + path_fraction × run cost — which initPlanCost reads off the
+// InitPlan's top node), so a DISTINCT / ORDER BY elected above the rewrite
+// sees them (create_final_distinct_paths' add_path fuzz). The tail charge
+// walk leaves a minmaxCharged Result's InitPlans alone below another level
+// top, so they are charged once, as in PG.
+func chargeMinMaxResult(res *Result, inits []Expr) {
+	charge := 0.0
+	for _, e := range inits {
+		if sq, ok := e.(*SubqueryExpr); ok && sq.Plan != nil && SublinkIsInitPlan(sq) {
+			charge += initPlanCost(sq, sq.Plan)
+		}
+	}
+	res.setInitPlanCharge(charge)
+	res.minmaxCharged = true
 }
 
 // minmaxMemberIndex finds an appendrel member's ordered index for

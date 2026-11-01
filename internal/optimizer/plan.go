@@ -2022,6 +2022,14 @@ type Result struct {
 	// Child: nil = childless single-emit Result; set = one row per child row.
 	Child  Node
 	schema Schema
+	// minmaxCharged marks the min/max rewrite's Result (M0148-0001c1): its
+	// InitPlanCharge already holds the InitPlans' path costs, as
+	// create_minmaxagg_path (pathnode.c) sums mminfo->pathcost into the
+	// MinMaxAggPath itself. PG builds those InitPlans at createplan time,
+	// after SS_charge_for_initplans ran, so they are charged exactly once;
+	// the tail charge walk therefore does not count them again for an
+	// enclosing level top (a DISTINCT / ORDER BY above the Result).
+	minmaxCharged bool
 }
 
 func (n *Result) Pos() int       { return n.pos }

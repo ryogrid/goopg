@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -133,5 +135,69 @@ func TestMinMaxOverDescIndexDirection(t *testing.T) {
 	plan = strings.Join(renderRows(runSQL(t, ctx, "explain (costs off) select min(x) from mmdesc")), "\n")
 	if !strings.Contains(plan, "->  Index Only Scan Backward using mmdesc_x on mmdesc") {
 		t.Errorf("min over a DESC index must scan backward, as PG prints:\n%s", plan)
+	}
+}
+
+// M0148-0001c1: the min/max Result carries create_minmaxagg_path's cost —
+// the sum of its InitPlans' path costs — so the DISTINCT elected above it
+// meets PG's add_path fuzzy tie: with two keys the hashed and sorted paths
+// cost within 1% on both startup and total and the sorted one wins on
+// pathkeys (aggregates.out:1254-1281's Unique → Sort). The tail initPlan
+// charge must not count those InitPlans a second time on the Unique.
+func TestExplainMinMaxAppendRelDistinctElection(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"create table minmaxtest(f1 int)",
+		"create table minmaxtest1() inherits (minmaxtest)",
+		"create table minmaxtest2() inherits (minmaxtest)",
+		"create table minmaxtest3() inherits (minmaxtest)",
+		"create index minmaxtesti on minmaxtest(f1)",
+		"create index minmaxtest1i on minmaxtest1(f1)",
+		"create index minmaxtest2i on minmaxtest2(f1 desc)",
+		"create index minmaxtest3i on minmaxtest3(f1) where f1 is not null",
+		"insert into minmaxtest values(11), (12)",
+		"insert into minmaxtest1 values(13), (14)",
+		"insert into minmaxtest2 values(15), (16)",
+		"insert into minmaxtest3 values(17), (18)",
+	} {
+		runSQL(t, ctx, q)
+	}
+	plan := renderRows(runSQL(t, ctx, "explain (costs off) select distinct min(f1), max(f1) from minmaxtest"))
+	top := []string{plan[0], plan[len(plan)-3], plan[len(plan)-2], plan[len(plan)-1]}
+	want := []string{"Unique", "  ->  Sort", "        Sort Key: ((InitPlan 1).col1), ((InitPlan 2).col1)", "        ->  Result"}
+	if strings.Join(top, "\n") != strings.Join(want, "\n") {
+		t.Errorf("distinct over the appendrel min/max:\n%s\nwant PG's Unique → Sort → Result", strings.Join(plan, "\n"))
+	}
+
+	costed := renderRows(runSQL(t, ctx, "explain select distinct min(f1), max(f1) from minmaxtest"))
+	startup := func(line string) (float64, float64) {
+		var s, tot float64
+		i := strings.Index(line, "(cost=")
+		if i < 0 {
+			t.Fatalf("no cost on %q", line)
+		}
+		if _, err := fmt.Sscanf(line[i:], "(cost=%f..%f", &s, &tot); err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		return s, tot
+	}
+	var limitTotals, resultStartup, uniqueTotal float64
+	for _, l := range costed {
+		switch {
+		case strings.Contains(l, "->  Limit"):
+			_, tot := startup(l)
+			limitTotals += tot
+		case strings.Contains(l, "->  Result"):
+			resultStartup, _ = startup(l)
+		case strings.HasPrefix(l, "Unique"):
+			_, uniqueTotal = startup(l)
+		}
+	}
+	if limitTotals <= 0 || math.Abs(resultStartup-limitTotals) > 0.011 {
+		t.Errorf("Result startup %.2f, want the InitPlans' Limit totals %.2f:\n%s", resultStartup, limitTotals, strings.Join(costed, "\n"))
+	}
+	if uniqueTotal > resultStartup+0.1 {
+		t.Errorf("Unique total %.2f charges the InitPlans again (Result startup %.2f):\n%s", uniqueTotal, resultStartup, strings.Join(costed, "\n"))
 	}
 }

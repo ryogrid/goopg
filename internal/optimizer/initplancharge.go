@@ -206,6 +206,10 @@ func (c *initPlanChargeWalk) level(top Node) {
 				continue
 			}
 			c.level(sl.Plan)
+			if r, ok := n.(*Result); ok && r.minmaxCharged && n != self {
+				// Already in the Result's own cost (create_minmaxagg_path).
+				continue
+			}
 			if SublinkIsInitPlan(sl.Expr) && !counted[sl.Plan] {
 				counted[sl.Plan] = true
 				charge += initPlanCost(sl.Expr, sl.Plan)
