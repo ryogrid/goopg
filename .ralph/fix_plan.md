@@ -896,7 +896,7 @@ heuristic stays live.)
     - Gates on code\_tree f0bbb93a1291: units, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
     - Not done \(ledger\): bulk layouts still pack leaves 100 %; the base/5 mirror still walks every catalog block\.
   Movement: none — correctness/performance fix — no plan instrument \(catalog DDL\)\.
-- [ ] **M\-NIGHTLY\-0001h\-create\-function\-sql — must\-pass regress case create\_function\_sql regressed by 73b858090 \(M0148\-0001h\)**
+- [x] **M\-NIGHTLY\-0001h\-create\-function\-sql — must\-pass regress case create\_function\_sql regressed by 73b858090 \(M0148\-0001h\)**
   \(filed 2026\-11\-03 from the TestPort\_RegressSuite gate of ddce38f80\)\.
   Kind: impl
   Parent: M0148\-0001h
@@ -908,6 +908,12 @@ heuristic stays live.)
   - Fix: 0001h slice 2 — execCreateView resolves an unqualified non\-temp view into `currentWritableSchema\(o\.ctx\)`
     as CREATE TABLE does \(operators\_ddl\.go ~2618\); re\-run TestPort\_RegressSuite \(create\_function\_sql must
     pass\) and the 0001h unit pin\.
+  - Fixed in 605d654ed \(0001h slice 2\): CREATE VIEW placement by search\_path \(temp\-relation views stay bare\), DROP
+    SCHEMA CASCADE drops members before the namespace, DROP VIEW resolves through search\_path, cascade notices name
+    visible views bare\. TestPort\_RegressSuite PASS; pins TestCreateViewPlacedBySearchPath,
+    TestDropSchemaCascadeDropsItsViews \(mutation\-checked\)\. Gates on code\_tree e8ab94f5adc4: units, spotcheck, sf025
+    99/99, acceptance 24 MATCH, fire\-set fires=none, TestPort\_PgDump\*\.
+  Movement: yes — regress runner diff lines create\_function\_sql 272 → 242, create\_view 2501 → 2467, alter\_table 3718 → 3679, aggregates 251 → 247
 - [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
     alone wedges at HEAD before blaming load\.
@@ -11567,6 +11573,14 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     the faithful fix is OID-bound dependencies recorded at CREATE VIEW
     (pg_depend).
   Movement: none — correctness fix (data loss) — no plan instrument; the aggregates single-suite hunk stays until causes (3)+(4) land; pin TestDropTableCascadeLeavesOtherSchemasViews
+  - Slice 2 LANDED 605d654ed (2026-11-03): CREATE VIEW placement by search_path,
+    DROP SCHEMA CASCADE member-first order, DROP VIEW search_path resolution,
+    visibility-qualified cascade notices; also fixed the must-pass
+    create_function_sql regression slice 1 introduced.
+    - aggregates `drop table t1 cascade` hunk: the four nontemp views are
+      gone; the four temporal views remain — implicitly temporary views over
+      create_view's temp t1 that PG drops at that session's end (cause 4,
+      temp-object session scope). Next slice.
 - [ ] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
   Partial over parallel scans)**.
   Kind: impl
