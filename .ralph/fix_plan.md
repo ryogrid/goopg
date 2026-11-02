@@ -11391,7 +11391,15 @@ Movement: yes — regress aggregates hunks 24 → 21 (diff lines 360 → 348)
     `rtable_size > 1` rule. Unmatched PG Output: lines 979 → 895 across 34
     suites; 0 wrongly-qualified.
 Movement: yes — regress join diff lines 15034 → 14932 (subselect 1438 → 1384)
-  - Open (task stays `[ ]`): Output: content — pruned per-node targetlists
+  - LANDED slice 3 `52feaacf9` (2026-11-02, run-2 loop #24): an
+    Aggregate's VERBOSE Output: deparses its targetlist (grouping columns +
+    aggregate calls, via aggOutputKeyExpr). Unmatched PG Output: lines
+    895 → 889.
+Movement: yes — regress aggregates diff lines 348 → 344
+  - Open (task stays `[ ]`): Output: content — Function Scan columns
+    unqualified (function RTE not in the EXPLAIN name table); Aggregate
+    output order (GROUP BY vs targetlist); `PARTIAL` prefix; parenthesised
+    expressions above an aggregate; pruned per-node targetlists
     (PG's scan/join tlists carry only the needed columns), expression labels
     (`sum((x + y))`, `PARTIAL variance(...)`, `array_agg(DISTINCT w)`,
     `(InitPlan 1).col1`), key parenthesisation residue.

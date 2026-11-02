@@ -3,6 +3,7 @@
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
 slice 1 (`Disabled: true`) landed `29d2af8d5` (run\-2 loop #22, 2026\-11\-02);
 slice 2 (Output: placement and prefix) landed `2faedaef2` (run\-2 loop #23);
+slice 3 (Aggregate Output: deparse) landed `52feaacf9` (run\-2 loop #24);
 the task stays open for the Output: targetlist work
 **Target:** aggregates hunks with `Output:` lines (expected\-lines 608, 646,
 2946, 2982, the array\_agg\(DISTINCT\) block) and the merge\-join
@@ -74,6 +75,22 @@ M0148\-0001e) — while goopg printed bare names everywhere.
   bare.
 - Pin: `TestExplainVerboseOutputPlacementAndPrefix`.
 
+## Slice 3 — an Aggregate's Output: deparses its targetlist
+
+`show_plan_tlist` prints the node's targetlist expressions; for an Aggregate
+those are its grouping columns and aggregate calls (`y, sum((x + y)),
+count(*), avg(x)`), where goopg printed the output schema's names (`y, sum,
+count, avg`). `explainOutputNames` now resolves each Aggregate output column
+through `aggOutputKeyExpr` — the resolution the Sort Key above an aggregate
+already uses — and formats it under `show_plan_tlist`'s prefix rule.
+Grouping\-sets aggregates keep the names for now.
+
+- Regress runner, HEAD vs change over 34 suites: unmatched PG `Output:` lines
+  895 → 889 (aggregates, inherit, join, select\_distinct, subselect, with
+  smaller; 28 unchanged). Every newly emitted aggregate line moved toward
+  PG; what still differs in them is listed below.
+- Pin: `TestExplainVerboseAggregateOutputDeparsed`.
+
 ## Remaining (task stays open)
 
 - Output: the pruned per\-node targetlist with qualified Vars, aggregate
@@ -82,3 +99,11 @@ M0148\-0001e) — while goopg printed bare names everywhere.
   before Group Key / Sort Key), `Function Call:` before `Output:`
   (`explain.c` `show_plan_tlist`, `ruleutils.c` deparse context).
 - Group Key / Sort Key operand parenthesisation residue.
+- Function Scan columns are unqualified in multi\-relation statements
+  (`s2` where PG prints `s2.s2`): the function RTE is not registered as a
+  named relation in the EXPLAIN name table.
+- Aggregate output column order follows the GROUP BY clause, PG's the
+  targetlist (`x, y, array_agg(...)` vs `y, x, array_agg(...)`).
+- A Partial Aggregate prints `variance(...)` where PG prints
+  `PARTIAL variance(...)`; nodes above an aggregate print column names where
+  PG prints the parenthesised expression (`(sum((x.x + y.y)))`).
