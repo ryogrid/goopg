@@ -7720,7 +7720,15 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				seen := map[string]bool{}
 
 				// Direct view dependents + all their transitive view/matview deps via BFS.
-				viewNames := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0148-0001h: by the RESOLVED table identity, as the RESTRICT
+				// path does (M0134-0069). The raw parsed name has an empty
+				// Schema for an unqualified DROP TABLE, which disables the
+				// schema filter below — so dropping one t1 also dropped every
+				// other schema's views over a different t1 (aggregates.sql's
+				// temp t1 took create_view.sql's testviewschm2 views). PG walks
+				// pg_depend by OID (findDependentObjects).
+				resolvedCascade := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+				viewNames := viewsDependingOnTable(im, resolvedCascade, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, vn := range viewNames {
 					k := vn.String()
 					if !seen[k] {
@@ -7737,7 +7745,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					}
 				}
 				// Direct materialized view dependents + all their transitive deps via BFS.
-				matViewNames := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				matViewNames := matViewsDependingOnRelation(im, resolvedCascade, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, mvn := range matViewNames {
 					k := mvn.String()
 					if !seen[k] {
@@ -7816,20 +7824,73 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName, dbOid uint32) []parser.ObjectName {
 	var deps []parser.ObjectName
 	tblLower := strings.ToLower(tableName.Name)
-	tblSchema := strings.ToLower(tableName.Schema)
+	tblSchema := normViewDepSchema(tableName.Schema)
 	for _, tbl := range im.AllUserViews(dbOid) {
 		if tbl.View == nil {
 			continue
 		}
-		// Only check views in the same schema (fast path to avoid scanning all views).
-		if tblSchema != "" && strings.ToLower(tbl.Schema) != tblSchema {
-			continue
-		}
-		if selectRefsViewName(tbl.View, tblLower) {
+		// M0148-0001h: an explicitly qualified reference matches only when
+		// its schema is the dropped table's (`vs2.t1` is not public.t1 — the
+		// catalog spells public as "", which the old filter read as "any
+		// schema", so dropping public.t1 took vs2's views over vs2.t1). An
+		// unqualified reference keeps the previous rule: any view when the
+		// table is in public, else views in the table's own schema. PG binds
+		// the dependency by OID at CREATE VIEW (pg_depend); this name
+		// heuristic is the ledgered stand-in.
+		if selectRefsRelation(tbl.View, tblSchema, tblLower, normViewDepSchema(tbl.Schema)) {
 			deps = append(deps, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
 		}
 	}
 	return deps
+}
+
+// normViewDepSchema maps the catalog's empty public schema to "public".
+func normViewDepSchema(s string) string {
+	if s == "" {
+		return "public"
+	}
+	return strings.ToLower(s)
+}
+
+// selectRefsRelation reports whether sel (or a sub-select, set-op branch or
+// join input) references schema.name: a qualified reference by its schema,
+// an unqualified one when the table is in public (any view) or the view is in the
+// table's schema.
+func selectRefsRelation(sel *parser.SelectStmt, schema, name, viewSchema string) bool {
+	if sel == nil {
+		return false
+	}
+	refs := func(rv *parser.RangeVar) bool {
+		if rv.Subquery != nil {
+			return selectRefsRelation(rv.Subquery, schema, name, viewSchema)
+		}
+		if !strings.EqualFold(rv.Name, name) {
+			return false
+		}
+		if rv.Schema != "" {
+			return normViewDepSchema(rv.Schema) == schema
+		}
+		return schema == "public" || viewSchema == schema
+	}
+	for i := range sel.From {
+		if refs(&sel.From[i]) {
+			return true
+		}
+	}
+	for _, fe := range sel.FromExprs {
+		if refs(&fe.Base) {
+			return true
+		}
+		for j := range fe.Joins {
+			if refs(&fe.Joins[j].Right) {
+				return true
+			}
+		}
+	}
+	if sel.SetOp != nil && selectRefsRelation(sel.SetOp.Right, schema, name, viewSchema) {
+		return true
+	}
+	return sel.SetOpOperand != nil && selectRefsRelation(sel.SetOpOperand, schema, name, viewSchema)
 }
 
 // functionsDependingOnTable returns all routines whose TableDeps reference the given table/view name.
