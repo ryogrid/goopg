@@ -1,7 +1,7 @@
 # M0148-0001h — DROP TABLE … CASCADE drops only the views over the dropped table
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
-slice 1 landed 2026\-11\-03 in `73b858090`; the task stays open
+slices 1\-2 landed 2026\-11\-03; the task stays open
 **Target:** the aggregates hunk at `drop table t1 cascade` (expected\-line
 ~1302)
 
@@ -57,12 +57,58 @@ Causes 3 and 4 are what the aggregates hunk still shows.
   SF0.25 sweep (99), TPC\-H acceptance arm (24 MATCH), fire\-set (no query
   fired on any corpus).
 
+## Slice 2 — view placement and schema drops (2026\-11\-03)
+
+Slice 1 regressed the must\-pass regress case `create_function_sql`. Its
+`CREATE VIEW functestv3` under `search_path = temp_func_test, public` landed
+in public, so the schema\-scoped match no longer linked it to
+`temp_func_test.functest3`. The case passed at b11a5eca0; slice 1's gates
+did not include `TestPort_RegressSuite`.
+
+- `execCreateView` places an unqualified view in the creation namespace
+  (`currentWritableSchema`, DefineView → RangeVarGetCreationNamespace), as
+  CREATE TABLE does. The exception is a view whose FROM items resolve to a
+  temporary relation: PG makes that view temporary (view.c
+  `isQueryUsingTempRelation`), and goopg keys temporary relations bare, so
+  it stays unqualified.
+- The DROP TABLE CASCADE notice names a dependent view or matview
+  unqualified when its schema is on the search path (`dropCascadeObjectName`,
+  getRelationDescription's RelationIsVisible rule): `view functestv3`, not
+  `view temp_func_test.functestv3`.
+- `DROP SCHEMA … CASCADE` unregisters the namespace after dropping its
+  members (dependency.c deletes the dependents first). The member views used
+  to be dropped after the schema was gone, so the IF EXISTS guard reported
+  `schema "s" does not exist, skipping` and left each view behind.
+  - The member\-view loop shares one dropped set.
+  - A listed table name that no longer resolves is skipped. A table renamed
+    after ALTER … SET SCHEMA is reported under a stale name; that is
+    ledgered.
+- `DROP VIEW` resolves an unqualified name through search\_path
+  (`resolveRelationBySearchPath`, RangeVarGetRelid order: a temporary
+  relation, then each path schema).
+- Pins: `TestCreateViewPlacedBySearchPath`, which covers placement and the
+  temp exception; `TestDropSchemaCascadeDropsItsViews`. Both are
+  mutation\-checked.
+- Regress\-runner diff lines, HEAD → change:
+
+  | suite | before | after |
+  |---|---|---|
+  | create\_view | 2501 | 2467 |
+  | create\_function\_sql | 272 | 242 |
+  | alter\_table | 3718 | 3679 |
+  | aggregates | 251 | 247 |
+
+  rules, matview, with, select\_views and namespace are unchanged.
+  `TestPort_RegressSuite` and `TestPort_PgDump*` pass.
+
 ## Remaining (task stays open)
 
-- Slice 2: CREATE VIEW creates an unqualified non\-temp view in the first
-  writable search\-path schema (mirror CREATE TABLE's `currentWritableSchema`
-  pre\-resolution in `execCreateView`), so create\_view.sql's views live in
-  `testviewschm2`.
+- PG's implicit\-temp NOTICE `view "v" will be a temporary view` is not
+  emitted, and temp views are not placed in a pg\_temp namespace.
+- `DROP SCHEMA … CASCADE` still does not print PG's dependency\-ordered
+  cascade list.
+- Other unqualified view lookups (ALTER VIEW, COMMENT ON VIEW, GRANT) do not
+  go through `resolveRelationBySearchPath` yet.
 - Temp tables in a temp namespace identity for dependency matching.
 - The faithful model: record the view's referenced relation OIDs at CREATE
   VIEW (persisted) and match by OID in `viewsDependingOnTable` /

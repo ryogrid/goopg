@@ -6985,6 +6985,18 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			return err
 		}
 	}
+	// DefineView creates an unqualified view in the creation namespace, the
+	// first schema on search_path (RangeVarGetCreationNamespace), as CREATE
+	// TABLE pre-resolves above. A view over a temporary relation becomes a
+	// temporary view instead (view.c isQueryUsingTempRelation), and goopg
+	// keys temporary relations bare, so it stays unqualified. Without this a
+	// view created under `search_path = s, public` landed in public, and
+	// DROP TABLE s.t CASCADE (scoped by schema since M0148-0001h) missed it.
+	if s.Name.Schema == "" && !s.Temporary && !o.viewQueryUsesTempRelation(s.Query) {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			s.Name.Schema = ws
+		}
+	}
 	if !s.OrReplace {
 		if existing, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing.View == nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
@@ -7225,6 +7237,7 @@ func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectN
 func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 	dropped := make(map[string]bool)
 	for _, name := range s.Names {
+		name = o.resolveRelationBySearchPath(name)
 		// Before dropping, collect all transitive deps and emit ONE aggregate notice.
 		if s.Behavior == parser.DropCascade {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -7733,14 +7746,14 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					k := vn.String()
 					if !seen[k] {
 						seen[k] = true
-						deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
+						deps = append(deps, cascadeDep{kind: "view", display: "view " + dropCascadeObjectName(vn, o.ctx), viewName: vn})
 					}
 					// Transitively reachable views/matviews from this view.
 					for _, td := range collectAllViewTransitiveDeps(im, vn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
-							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + dropCascadeObjectName(td.name, o.ctx), viewName: td.name})
 						}
 					}
 				}
@@ -7750,14 +7763,14 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					k := mvn.String()
 					if !seen[k] {
 						seen[k] = true
-						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + mvn.String(), viewName: mvn})
+						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + dropCascadeObjectName(mvn, o.ctx), viewName: mvn})
 					}
 					// Transitively reachable matviews from this matview.
 					for _, td := range collectAllViewTransitiveDeps(im, mvn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
-							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + dropCascadeObjectName(td.name, o.ctx), viewName: td.name})
 						}
 					}
 				}
@@ -7891,6 +7904,53 @@ func selectRefsRelation(sel *parser.SelectStmt, schema, name, viewSchema string)
 		return true
 	}
 	return sel.SetOpOperand != nil && selectRefsRelation(sel.SetOpOperand, schema, name, viewSchema)
+}
+
+// viewQueryUsesTempRelation is isQueryUsingTempRelation over the FROM items
+// selectRefsRelation walks: true when one of them resolves to a temporary
+// relation.
+func (o *ddlOp) viewQueryUsesTempRelation(sel *parser.SelectStmt) bool {
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	return selectAnyRangeVar(sel, func(rv *parser.RangeVar) bool {
+		if rv.Name == "" {
+			return false
+		}
+		t, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}, dbOid)
+		return ok && t.Temp
+	})
+}
+
+// selectAnyRangeVar reports whether fn holds for a relation FROM item of sel,
+// its sub-selects, join inputs or set-operation branches.
+func selectAnyRangeVar(sel *parser.SelectStmt, fn func(*parser.RangeVar) bool) bool {
+	if sel == nil {
+		return false
+	}
+	visit := func(rv *parser.RangeVar) bool {
+		if rv.Subquery != nil {
+			return selectAnyRangeVar(rv.Subquery, fn)
+		}
+		return fn(rv)
+	}
+	for i := range sel.From {
+		if visit(&sel.From[i]) {
+			return true
+		}
+	}
+	for _, fe := range sel.FromExprs {
+		if visit(&fe.Base) {
+			return true
+		}
+		for j := range fe.Joins {
+			if visit(&fe.Joins[j].Right) {
+				return true
+			}
+		}
+	}
+	if sel.SetOp != nil && selectAnyRangeVar(sel.SetOp.Right, fn) {
+		return true
+	}
+	return sel.SetOpOperand != nil && selectAnyRangeVar(sel.SetOpOperand, fn)
 }
 
 // functionsDependingOnTable returns all routines whose TableDeps reference the given table/view name.
@@ -21874,17 +21934,6 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				return &ExecError{Code: "3F000", Pos: s.Pos(),
 					Message: fmt.Sprintf("schema %q does not exist", schemaName)}
 			}
-			// Schema is registered; unregister it.
-			// B1.1: journal the drop as a pg_namespace heap DELETE
-			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
-			// is needed to locate the row. Replaces the bespoke
-			// RecordKindDropSchema record (M0110-0003, retired).
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
-				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
-					return fmt.Errorf("drop-schema catalog heap: %w", err)
-				}
-			}
-			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -21915,8 +21964,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						}
 					}
 					sort.Strings(droppedViews)
+					// One dropped set for the whole schema: a member view an
+					// earlier member's cascade already removed is skipped, not
+					// reported as missing.
+					dropped := map[string]bool{}
 					for _, vn := range droppedViews {
-						dropped := map[string]bool{}
 						_ = o.execDropOneView(parser.ObjectName{Schema: schemaName, Name: vn}, true, parser.DropCascade, s.Pos(), dropped)
 					}
 					// Collect operator classes in the schema. M0097-0022.
@@ -21947,8 +21999,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
 					}
 				}
-				// Drop each table in the schema.
+				// Drop each table in the schema. A listed name that no longer
+				// resolves is skipped: TablesInSchema can report a stale name
+				// for a table renamed after ALTER … SET SCHEMA (deferral
+				// ledger 2026-11-03), and the namespace is unregistered only
+				// after this loop, so failing here would strand the schema.
 				for _, tbl := range tables {
+					if _, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !ok {
+						continue
+					}
 					if err := o.ctx.Catalog.DropTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
@@ -21967,6 +22026,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					)
 				}
 			}
+			// The namespace goes last, after its members (dependency.c
+			// deletes the dependents before the referenced object): the
+			// member views are dropped by schema-qualified name, and
+			// execDropOneView's IF EXISTS guard reports and skips a name
+			// whose schema is already gone — which left every view placed in
+			// the schema behind once CREATE VIEW honoured search_path.
+			// B1.1: journal the drop as a pg_namespace heap DELETE
+			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
+			// is needed to locate the row. Replaces the bespoke
+			// RecordKindDropSchema record (M0110-0003, retired).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
+				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
+					return fmt.Errorf("drop-schema catalog heap: %w", err)
+				}
+			}
+			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		return nil
 	}
@@ -28591,6 +28666,38 @@ func dropCascadeObjectName(name parser.ObjectName, ctx *Context) string {
 		}
 	}
 	return name.String()
+}
+
+// resolveRelationBySearchPath is RangeVarGetRelid's namespace search for an
+// unqualified relation name: a temporary relation (goopg keys those bare)
+// first, then each search_path schema in order. It returns the name
+// qualified with the schema it resolved in (public stays bare, matching the
+// catalog's keying), or name unchanged when nothing resolves. Views created
+// unqualified under a non-public search_path live in that schema, so DROP
+// VIEW must find them there rather than only in public.
+func (o *ddlOp) resolveRelationBySearchPath(name parser.ObjectName) parser.ObjectName {
+	if name.Schema != "" {
+		return name
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if t, ok := o.ctx.Catalog.LookupTable(name, dbOid); ok && t.Temp {
+		return name
+	}
+	for _, sc := range lockTableSearchSchemas(o.ctx) {
+		if strings.EqualFold(sc, "pg_catalog") || strings.EqualFold(sc, "information_schema") {
+			continue
+		}
+		if strings.EqualFold(sc, "public") {
+			if _, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: name.Name}, dbOid); ok {
+				return name
+			}
+			continue
+		}
+		if _, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid); ok {
+			return parser.ObjectName{Schema: sc, Name: name.Name}
+		}
+	}
+	return name
 }
 
 // lookupTableWithSearch finds a table by name, falling back to search_path schemas
