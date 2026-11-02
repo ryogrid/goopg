@@ -834,6 +834,31 @@ heuristic stays live.)
     tpch\-spotcheck Q12 rows=2 / Q13 rows=35 PASS; testport 3\-E2E repro PASS \(59\.9/279\.2/41\.0 s\)\.
     Movement: none — correctness fix — no plan instrument
 
+- [ ] **testport/TestPort\_PgDumpConnectionSetup — pg\_dump view bodies no longer match the pins** \(AI\-20261103\-004134\-003; repro: `go test \-v \-run '^TestPort\_PgDumpConnectionSetup$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-11\-03\. Caused by M0148\-0001g \(cc0d25b7f\): pg\_get\_viewdef now prints ruleutils layout, so the pins
+    for goopg's old one\-line body \(`SELECT id, name FROM public\.foo WHERE qty > 0;`\) fail\. The new text is also
+    wrong: pg\_dump runs with `search\_path = ''`, where PG's generate\_relation\_name qualifies a relation that is not
+    visible \(`FROM public\.foo`\); the deparser prints `FROM foo` unconditionally\. The fix is in the deparser
+    \(qualify when not visible on the session search\_path\), and the pins move to PG's text\.
+- [ ] testport/TestE2E\_PGCrashStartOnGoopgTornContrecord — hosted PG logged `FATAL: the database system is not yet accepting connections` during crash recovery of the goopg directory \(AI\-20261103\-004134\-001; repro: `go test \-v \-run '^TestE2E\_PGCrashStartOnGoopgTornContrecord$' \./internal/testport/`\)\.
+  - Filed 2026\-11\-03\. Recovery itself completed \(redo done, end\-of\-recovery checkpoint, ready\); the FATAL is a
+    client connecting before consistency — check stale \(load\) first, then whether the test's readiness probe races
+    PG's startup\.
+- [ ] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 670\.53 s \(AI\-20261103\-004134\-002; repro: `go test \-v \-run '^TestE2E\_PGReadsThreeLevelCatalogBtree$' \./internal/testport/`\)\.
+  - REOPENED: the 75bc49273 per\-batch deadline \(AI\-20261101\-010139\-002\) did not hold — 670 s is the third failure
+    in four nightlies\. The log tail is continuous `bgwriter flush pages=100`\.
+- [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
+  - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
+    alone wedges at HEAD before blaming load\.
+- [ ] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+  Kind: impl
+  Parent: none
+  - REOPENED: same signature as AI\-20261031\-002109\-005 \(16406 = pgbench\_history, truncate vs in\-flight eviction
+    flush\), whose generation\-signal fix \(m\-nightly\-truncate\-eviction\-flush\-race\) did not hold — this time
+    nblocks=50, not 0, so a partial truncate/re\-extend window remains\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
 - [x] **testport/TestPort\_RegressSuite — index\_including, index\_including\_gist: every psql `\\d` failed 42809** \(AI\-20261102\-000225\-003; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
@@ -11457,6 +11482,27 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   record AUTO dependencies on its referenced relations (pg_depend). PG:
   `recordDependencyOn` from `parse_analysis` (dependency.c
   reportDependentObjects). Verify hunk 1302.
+  - CORRECTION 2026-11-02 (run-2 loop #30): the hunk is the reverse of the
+    text above — PG prints only `drop cascades to table t1c`; goopg
+    additionally dropped create_view.sql's eight testviewschm2 views
+    (nontemp1 … temporal4) when aggregates.sql dropped its TEMP t1. A
+    data-loss defect: view dependencies are matched by NAME, not OID.
+    Root causes found: (1) the DROP TABLE CASCADE path passed the raw
+    unqualified name (empty schema = "any"), unlike RESTRICT (M0134-0069);
+    (2) qualified references were compared by name only; (3) CREATE VIEW
+    under `search_path = s, public` places the view in public, not s;
+    (4) a temp table resolves with the public-equivalent empty schema, so
+    its drop matches public views over an unqualified same name.
+  - Slice 1 LANDED 73b858090 (2026-11-03): (1)+(2) fixed in operators_ddl.go
+    viewsDependingOnTable / selectRefsRelation + the CASCADE call; pin
+    TestDropTableCascadeLeavesOtherSchemasViews (fails before the fix).
+    Gates on one code_tree 8d2a3340fd7a: units, tpch-spotcheck, sf025 (99),
+    acceptance arm (24 MATCH), fire-set (fires=none on all three corpora).
+    Design docs/design/0100-0149/0148-0001h-drop-cascade-view-scope.md.
+    (3)+(4) are the remaining causes of the aggregates hunk — next slices;
+    the faithful fix is OID-bound dependencies recorded at CREATE VIEW
+    (pg_depend).
+  Movement: none — correctness fix (data loss) — no plan instrument; the aggregates single-suite hunk stays until causes (3)+(4) land; pin TestDropTableCascadeLeavesOtherSchemasViews
 - [ ] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
   Partial over parallel scans)**.
   Kind: impl
