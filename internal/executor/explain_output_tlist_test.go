@@ -108,3 +108,30 @@ func TestExplainVerboseOutputFollowsSelectListOverAggregate(t *testing.T) {
 		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
 	}
 }
+
+// M0148-0001f: a split aggregate's lower half deparses its Aggrefs with
+// ruleutils' `PARTIAL ` marking (get_agg_expr, DO_AGGSPLIT_SKIPFINAL), and the
+// Gather above references them as parenthesised non-Vars; the Finalize node
+// prints the plain call. PG 18.3 prints exactly this tree for the statement.
+func TestExplainVerbosePartialAggregateOutput(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE pa (a int, b int)")
+	runSQL(t, ctx, "INSERT INTO pa SELECT i, i % 10 FROM generate_series(1, 1000) i")
+	q := "SELECT sum(a), count(*) FROM pa"
+	got := strings.Join(runExplainOverChild(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) "+q, planGatheredJoin(t, ctx, q, 2)), "\n")
+	want := strings.Join([]string{
+		"Finalize Aggregate",
+		"  Output: sum(a), count(*)",
+		"  ->  Gather",
+		"        Output: (PARTIAL sum(a)), (PARTIAL count(*))",
+		"        Workers Planned: 2",
+		"        ->  Partial Aggregate",
+		"              Output: PARTIAL sum(a), PARTIAL count(*)",
+		"              ->  Parallel Seq Scan on public.pa",
+		"                    Output: a, b",
+	}, "\n")
+	if got != want {
+		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
+	}
+}

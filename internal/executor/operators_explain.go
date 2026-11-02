@@ -6279,7 +6279,7 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 					if !hit {
 						continue
 					}
-					txt := formatExprQual(e, reg, qualify)
+					txt := partialAggPrefix(agg, i) + formatExprQual(e, reg, qualify)
 					if _, isVar := e.(*optimizer.ColumnRef); !isVar {
 						txt = "(" + txt + ")"
 					}
@@ -6298,7 +6298,7 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 		for i := range out {
 			col := &optimizer.ColumnRef{Index: i, Name: out[i].Name, Type: out[i].Type}
 			if e, hit := aggOutputKeyExpr(col, agg, reg, qualify); hit {
-				names[i] = formatExprQual(e, reg, qualify)
+				names[i] = partialAggPrefix(agg, i) + formatExprQual(e, reg, qualify)
 			}
 		}
 		return names
@@ -8560,8 +8560,26 @@ func explainPassThroughChild(n optimizer.Node) optimizer.Node {
 		return p.Child
 	case *optimizer.Limit:
 		return p.Child
+	case *optimizer.Gather:
+		return p.Child
+	case *optimizer.GatherMerge:
+		return p.Child
 	}
 	return nil
+}
+
+// partialAggPrefix is ruleutils' get_agg_expr marking for a split aggregate's
+// lower half: an Aggref that skips its final function (DO_AGGSPLIT_SKIPFINAL)
+// deparses as `PARTIAL variance(...)`. Output column i of agg is an aggregate
+// call when it follows the grouping columns.
+func partialAggPrefix(agg *optimizer.Aggregate, i int) string {
+	if agg == nil || agg.Mode != optimizer.AggModePartial {
+		return ""
+	}
+	if j := i - len(agg.GroupExprs); j >= 0 && j < len(agg.Aggs) {
+		return "PARTIAL "
+	}
+	return ""
 }
 
 // explainAggProjectionOutput renders the Output: of an Aggregate, or of a
