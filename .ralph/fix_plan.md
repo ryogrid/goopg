@@ -11367,7 +11367,7 @@ Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578
     - the `group by g%10000` election landed as slice 5; "hunks 2847,
       3129" were stale expected-file numbers for the btg / g%10000 hunks,
       both now closed.
-- [ ] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
+- [x] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
   Kind: impl
   Parent: M0148-0001
   PG's verbose/explain prints the PRUNED per-node targetlist with qualified
@@ -11405,14 +11405,21 @@ Movement: yes — regress aggregates diff lines 344 → 328
     select list (from the invisible Project) with resjunk grouping columns,
     parenthesised on pass-through nodes. Unmatched PG Output: 884 → 881.
 Movement: yes — regress aggregates diff lines 328 → 322
-  - Open (task stays `[ ]`): Output: content — cast deparsing inside
-    expressions; other SRF scan kinds unregistered (unnest,
-    generate_subscripts, user SRFs); Aggregate
-    output order (GROUP BY vs targetlist); `PARTIAL` prefix; parenthesised
-    expressions above an aggregate; pruned per-node targetlists
-    (PG's scan/join tlists carry only the needed columns), expression labels
-    (`sum((x + y))`, `PARTIAL variance(...)`, `array_agg(DISTINCT w)`,
-    `(InitPlan 1).col1`), key parenthesisation residue.
+  - LANDED slice 6 `be7ff69eb` (2026-11-02, run-2 loop #27): Partial
+    Aggregate Output: prints `PARTIAL sum(a)` (get_agg_expr skip-final
+    marking), the Gather / Gather Merge above `(PARTIAL sum(a))`. Unmatched
+    PG Output: lines 242 → 238 on the 9 aggregate/Gather suites.
+Movement: yes — regress aggregates diff lines 169 → 161
+  - CLOSED 2026-11-02 (run-2 loop #27): the named items are landed —
+    Disabled lines (slice 1), Output placement + show_plan_tlist prefix
+    (slice 2), aggregate labels (slices 3, 6), function-RTE naming (slice 4),
+    select-list order + resjunk + parenthesisation over aggregates (slice 5);
+    `Function Call:` already prints after `Output:` as in PG, and the
+    `(g % 10000)` group-key parenthesisation matched with M0148-0001e slice 5.
+    Residue moved, not dropped: pruned per-node targetlists (planner-side,
+    the dominant remaining Output gap) → filed M0148-0001f1; cast deparsing,
+    other SRF kinds, resjunk sort keys and join outputs over aggregates are
+    ledgered (2026-11-02 rows) and listed in M0148-0001f1's scope.
 - [ ] **M0148-0001g — pg_get_viewdef deparser fidelity**.
   Kind: impl
   Parent: M0148-0001
@@ -11497,6 +11504,26 @@ Movement: yes — regress aggregates diff lines 328 → 322
   regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
   aggregates, join) HEAD vs change before landing; no aggregates hunk depends
   on it, hence filed after the regress-closing M0148-0001 children.
+- [ ] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node
+  targetlists and remaining deparse gaps**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001f (closed). PG prints each plan node's own
+  targetlist: scans and joins carry only the columns needed above them
+  (create_scan_plan / use_physical_tlist decides when a scan keeps its full
+  physical tlist; build_path_tlist otherwise), where goopg's `Output:` lists
+  the node's whole output schema — the dominant class of the ~880 unmatched
+  PG `Output:` lines across the 34 EXPLAIN-heavy regress suites. Also in
+  scope (ledgered 2026-11-02): implicit casts and typed literals in deparsed
+  expressions (`((sum(tenthous))::double precision + (random() *
+  '0'::double precision))`); RTIDs for the remaining SRF scan kinds (unnest,
+  generate_subscripts, user SRFs, ROWS FROM); resjunk sort-key entries;
+  join / Result nodes above an aggregate. Resume: the planner must carry a
+  per-node needed-column list (or the executor-side narrowing must expose
+  it) for explainOutputNames (internal/executor/operators_explain.go) to
+  print; measure `grep -c '^- *Output:'` across the 34 suites HEAD vs
+  change. Display only — no plan or result change expected; run the TPC
+  gates anyway.
 - [ ] **M0148-0001e1 — composite-index range quals as Index Cond (no
   repeated Filter)**.
   Kind: impl

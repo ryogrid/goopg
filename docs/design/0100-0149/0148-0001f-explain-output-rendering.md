@@ -6,7 +6,9 @@ slice 2 (Output: placement and prefix) landed `2faedaef2` (run\-2 loop #23);
 slice 3 (Aggregate Output: deparse) landed `52feaacf9` (run\-2 loop #24);
 slice 4 (generate\_series RTE naming) landed `5d9870a21` (run\-2 loop #25);
 slice 5 (Output: over an aggregate) landed `c2c98388e` (run\-2 loop #26);
-the task stays open for the Output: targetlist work
+slice 6 (`PARTIAL` marking) landed `be7ff69eb` (run\-2 loop #27); **closed**
+2026\-11\-02 — residue filed as M0148\-0001f1;
+
 **Target:** aggregates hunks with `Output:` lines (expected\-lines 608, 646,
 2946, 2982, the array\_agg\(DISTINCT\) block) and the merge\-join
 `Disabled: true` blocks (2761, 2795, 2818)
@@ -133,7 +135,29 @@ Project (above the Agg/Sort chain, or between the Sort and the Agg).
   lines 884 → 881; aggregates 328 → 322 diff lines; 33 unchanged.
 - Pin: `TestExplainVerboseOutputFollowsSelectListOverAggregate`.
 
-## Remaining (task stays open)
+## Slice 6 — `PARTIAL` marking on a split aggregate's lower half
+
+ruleutils' `get_agg_expr` marks an Aggref whose aggsplit skips the final
+function with `PARTIAL `, so a Partial Aggregate prints `Output: PARTIAL
+sum(a), PARTIAL count(*)` and the Gather above references them as
+`(PARTIAL sum(a)), (PARTIAL count(*))`; the Finalize node prints the plain
+call. `partialAggPrefix` adds the marking for `AggModePartial` nodes, and
+Gather / Gather Merge join the pass\-through set.
+
+- Regress runner, HEAD vs change over the 9 aggregate/Gather suites:
+  unmatched PG `Output:` lines 242 → 238; aggregates 169 → 161 diff lines.
+- Pin: `TestExplainVerbosePartialAggregateOutput`.
+
+## Closure (2026\-11\-02, run\-2 loop #27)
+
+The task's named items are landed. `Function Call:` already prints after
+`Output:` as PG does, and the `(g % 10000)` group\-key parenthesisation
+matched with M0148\-0001e slice 5. The dominant remaining `Output:` gap —
+PG prints each node's pruned targetlist, goopg the whole output schema —
+needs a per\-node needed\-column list from the planner, so it is filed as
+M0148\-0001f1 together with the deparse residue below.
+
+## Remaining at closure (moved to M0148\-0001f1)
 
 - Output: the pruned per\-node targetlist with qualified Vars, aggregate
   labels (`(sum(...))`, `PARTIAL variance(...)`, `ARRAY(SubPlan 1)`,
