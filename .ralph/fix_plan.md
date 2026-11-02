@@ -859,6 +859,11 @@ heuristic stays live.)
 - [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
     alone wedges at HEAD before blaming load\.
+  - 2026\-11\-03 05:45 at HEAD 3b6eefe46, idle host: `pg\-regress\-runner inherit` completes \(2 m 03 s including
+    setup; 3186\-line diff, same FAIL class\), no wedge\. Nightly wedge probe at 1 m: backend 103 active on
+    `alter table p1 drop constraint f1\_pos;`, another backend waiting on LWLock WALWriteLock, while the pgbench lane
+    ran beside it\. Next: whether a WAL\-write stall under co\-load can hold that ALTER past 120 s \(read the bundle's
+    goroutines\.txt in `tmp/nightly\-src\-20261103\-004134/tmp/regress\-wedge/inherit` if it still exists\)\.
 - [ ] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
   Kind: impl
   Parent: none
