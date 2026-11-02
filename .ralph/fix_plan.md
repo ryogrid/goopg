@@ -11432,6 +11432,17 @@ Movement: yes — regress aggregates diff lines 169 → 161
   pg_get_viewdef_worker`/`generate_viewdef`/`get_rule_expr` (+
   `transformRuleExpr` T_Aggref agg_order/agg_within_group/agg_filter arms).
   Verify hunks 1637-1726, 2284.
+  - LANDED slice 1 `cc0d25b7f` (2026-11-02, run-2 loop #28): subset port of
+    get_query_def (viewdef_deparse.go): pretty-indent layout, qualification
+    by rtable size, output names, FROM aliases + column-alias lists, typed
+    VALUES constants, get_simple_values_rte, aggregate DISTINCT/ORDER
+    BY/USING/FILTER; stored text outside the subset. The seven agg_view1
+    hunks match. Design: docs/design/0100-0149/0148-0001g-viewdef-deparser.md.
+Movement: yes — regress aggregates hunks 21 → 14 (diff lines 314 → 266)
+  - Open (task stays `[ ]`): aggordview1 (WITHIN GROUP, argument coercions
+    `(0.5)::double precision` / `'AZZZZ'::name`); pretty-mode
+    parenthesisation (isSimpleNode) for psql \d+; joins, set ops, CTEs,
+    windows, CASE, casts, sublinks, search-path schema qualification.
 - [ ] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
   Kind: impl
   Parent: M0148-0001
