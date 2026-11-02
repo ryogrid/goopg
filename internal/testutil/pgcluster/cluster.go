@@ -539,6 +539,16 @@ func (c *Cluster) WaitReady(ctx context.Context, timeout time.Duration) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// Start returns once the port listens, which precedes the end of
+		// crash recovery; a connection before then is refused with a logged
+		// FATAL ("the database system is not yet accepting connections")
+		// that log-cleanliness assertions then trip on. Wait as pg_ctl -w
+		// does (wait_for_postmaster_start) until postmaster.pid reports
+		// the postmaster done starting up.
+		if !c.postmasterDoneStarting() {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		db, err := c.OpenDB()
 		if err == nil {
 			var n int
@@ -551,6 +561,27 @@ func (c *Cluster) WaitReady(ctx context.Context, timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("pgcluster: not ready within %s", timeout)
+}
+
+// postmasterDoneStarting reports whether postmaster.pid's
+// LOCK_FILE_LINE_PM_STATUS line reads PM_STATUS_READY or PM_STATUS_STANDBY
+// (pidfile.h; pg_ctl.c wait_for_postmaster_start). A missing file or a file
+// without that line yet (CreateDataDirLockFile writes it last) is not ready.
+func (c *Cluster) postmasterDoneStarting() bool {
+	data, err := os.ReadFile(filepath.Join(c.dataDir, "postmaster.pid"))
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(data), "\n")
+	const lockFileLinePMStatus = 8
+	if len(lines) < lockFileLinePMStatus {
+		return false
+	}
+	switch lines[lockFileLinePMStatus-1] {
+	case "ready   ", "standby ":
+		return true
+	}
+	return false
 }
 
 func (c *Cluster) env() []string {
