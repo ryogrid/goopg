@@ -6251,6 +6251,44 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 		return names
 	}
 	qualify := reg.names().qualifyTlist()
+	// A Sort / Incremental Sort / Limit evaluates nothing: each output column
+	// is an OUTER_VAR into the child's targetlist, deparsed through it as
+	// get_special_variable does. Over an Aggregate that is the Agg's own
+	// targetlist entry — a grouping column prints as its Var, an aggregate as
+	// `(sum((x.x + y.y)))`, parenthesised as any non-Var referent (the Sort
+	// Key line resolves its keys the same way). Other children keep the
+	// column names: goopg's narrowing placeholders and substituted tableoid
+	// constants are not PG targetlist entries.
+	// The Agg's targetlist is the SELECT list: create_plan folds the
+	// projection into the projection-capable Agg, so its order and its
+	// computed expressions are the select list's (`sum((x.x + y.y)), y.y`),
+	// and every pass-through node above it references those entries
+	// (`(sum((x.x + y.y))), y.y`). goopg keeps that projection in an
+	// EXPLAIN-invisible Project above the Agg / Sort chain; render the chain
+	// from it.
+	if txt, ok := explainAggProjectionOutput(n, reg, qualify); ok {
+		return txt
+	}
+	if child := explainPassThroughChild(n); child != nil {
+		if agg := childAggregateThroughFilters(child); agg != nil && agg.GroupingSets == nil {
+			out := child.Output()
+			if len(out) == len(names) {
+				for i, c := range out {
+					col := &optimizer.ColumnRef{Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+					e, hit := aggOutputKeyExpr(col, agg, reg, qualify)
+					if !hit {
+						continue
+					}
+					txt := formatExprQual(e, reg, qualify)
+					if _, isVar := e.(*optimizer.ColumnRef); !isVar {
+						txt = "(" + txt + ")"
+					}
+					names[i] = txt
+				}
+			}
+			return names
+		}
+	}
 	// An Aggregate's targetlist is its grouping columns and aggregate calls:
 	// show_plan_tlist deparses each (`s2.s2, sum((s1.s1 + s2.s2))`), where
 	// the output schema only names them (`s2, sum`). aggOutputKeyExpr is the
@@ -8510,4 +8548,105 @@ func explainNodeDisabled(n optimizer.Node) bool {
 	}
 	pc, set := c.PlanCostInfo()
 	return set && pc.Disabled
+}
+
+// explainPassThroughChild is the child of a node whose targetlist is purely
+// OUTER_VAR references to its child's (Sort, Incremental Sort, Limit), or nil.
+func explainPassThroughChild(n optimizer.Node) optimizer.Node {
+	switch p := n.(type) {
+	case *optimizer.Sort:
+		return p.Child
+	case *optimizer.IncrementalSort:
+		return p.Child
+	case *optimizer.Limit:
+		return p.Child
+	}
+	return nil
+}
+
+// explainAggProjectionOutput renders the Output: of an Aggregate, or of a
+// pass-through node over one, from the invisible Project that holds the
+// statement's projection above the chain: each Project target deparsed with
+// the aggregate's outputs substituted (aggOutputKeyExpr), parenthesised on
+// the pass-through nodes when not a plain Var. ok is false when the chain has
+// no such Project or a target cannot be rewritten.
+func explainAggProjectionOutput(n optimizer.Node, reg *subPlanReg, qualify bool) ([]string, bool) {
+	agg, isAgg := n.(*optimizer.Aggregate)
+	var proj *optimizer.Project
+	if !isAgg {
+		child := explainPassThroughChild(n)
+		if child == nil {
+			return nil, false
+		}
+		agg, _ = child.(*optimizer.Aggregate)
+		// The projection may sit between the pass-through node and the Agg
+		// (Sort -> Project -> Agg): that Project is the Agg's targetlist.
+		if pr, ok := child.(*optimizer.Project); ok && agg == nil {
+			if a, ok := pr.Child.(*optimizer.Aggregate); ok {
+				agg, proj = a, pr
+			}
+		}
+	}
+	if agg == nil || agg.GroupingSets != nil || reg == nil {
+		return nil, false
+	}
+	// Walk up through pass-through nodes to the Project.
+	cur := n
+	for proj == nil {
+		p, ok := reg.names().parent[nodePtr(cur)]
+		if !ok || p == nil {
+			return nil, false
+		}
+		if pr, ok := p.(*optimizer.Project); ok {
+			proj = pr
+			break
+		}
+		if explainPassThroughChild(p) == nil {
+			return nil, false
+		}
+		cur = p
+	}
+	if len(proj.Targets) == 0 || len(proj.Targets) > len(agg.Output()) {
+		return nil, false
+	}
+	out := make([]string, 0, len(proj.Targets)+len(agg.GroupExprs))
+	render := func(e optimizer.Expr) string {
+		txt := formatExprQual(e, reg, qualify)
+		if _, isVar := e.(*optimizer.ColumnRef); !isVar && !isAgg {
+			txt = "(" + txt + ")"
+		}
+		return txt
+	}
+	// A grouping column the select list does not name as a plain column stays
+	// in the targetlist as a resjunk entry after it (the GROUP BY clause
+	// references a tlist entry), so PG prints `(sum((x.x + y.y))), y.y`.
+	plain := map[int]bool{}
+	for _, t := range proj.Targets {
+		if c, ok := t.(*optimizer.ColumnRef); ok {
+			plain[c.Index] = true
+		}
+	}
+	for _, t := range proj.Targets {
+		e, ok := optimizer.CloneExprReplacingColumnRefs(t, func(c *optimizer.ColumnRef) optimizer.Expr {
+			if r, hit := aggOutputKeyExpr(c, agg, reg, qualify); hit {
+				return r
+			}
+			return c
+		})
+		if !ok {
+			return nil, false
+		}
+		out = append(out, render(e))
+	}
+	aggOut := agg.Output()
+	for gi := 0; gi < len(agg.GroupExprs) && gi < len(aggOut); gi++ {
+		if plain[gi] {
+			continue
+		}
+		col := &optimizer.ColumnRef{Index: gi, Name: aggOut[gi].Name, Type: aggOut[gi].Type, SourceTableIdx: aggOut[gi].SourceTableIdx}
+		if e, hit := aggOutputKeyExpr(col, agg, reg, qualify); hit {
+			out = append(out, render(e))
+		}
+	}
+	return out, true
 }

@@ -82,3 +82,29 @@ func TestExplainGenerateSeriesColumnsQualified(t *testing.T) {
 		t.Errorf("a lone function RTE keeps bare Output (rtable_size 1); got:\n%s", single)
 	}
 }
+
+// M0148-0001f: the Agg's targetlist is the SELECT list (create_plan folds
+// the projection into the projection-capable Agg) plus, as resjunk entries,
+// the grouping columns the list does not name — so PG prints
+// `sum((x + y)), y` at the Agg and `(sum((x + y))), y` on the Sort that
+// references it. goopg holds the projection in an EXPLAIN-invisible Project
+// above the chain; EXPLAIN renders the chain from it.
+func TestExplainVerboseOutputFollowsSelectListOverAggregate(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE ga (x int, y int)")
+	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT sum(x + y) FROM ga GROUP BY y ORDER BY 1", optimizer.DefaultPlannerSettings())), "\n")
+	want := strings.Join([]string{
+		"Sort",
+		"  Output: (sum((x + y))), y",
+		"  Sort Key: (sum((ga.x + ga.y)))",
+		"  ->  HashAggregate",
+		"        Output: sum((x + y)), y",
+		"        Group Key: ga.y",
+		"        ->  Seq Scan on public.ga",
+		"              Output: x, y",
+	}, "\n")
+	if got != want {
+		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
+	}
+}
