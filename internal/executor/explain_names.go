@@ -172,6 +172,13 @@ func (nm *explainNames) qualify() bool {
 	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1 || nm.verbose)
 }
 
+// qualifyTlist is show_plan_tlist's rule for the VERBOSE Output: list:
+// `useprefix = es->rtable_size > 1` — the statement's relation count alone,
+// VERBOSE does not force it (M0148-0001f).
+func (nm *explainNames) qualifyTlist() bool {
+	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1)
+}
+
 // qualifyScan is show_scan_qual's rule for a scan node's own quals
 // (`Filter:`, `Index Cond:`, `Recheck Cond:`): `useprefix =
 // IsA(plan, SubqueryScan) || es->verbose` — bare unless VERBOSE, however many

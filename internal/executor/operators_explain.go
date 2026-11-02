@@ -623,16 +623,17 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	if explainNodeDisabled(n) || (attachedFilterNode != nil && explainNodeDisabled(attachedFilterNode)) {
 		*rows = append(*rows, Row{NewStringDatum(detailIndent + "Disabled: true")})
 	}
+	// explain.c ExplainNode: VERBOSE's show_plan_tlist runs next — before
+	// Inner Unique and the node-type switch that prints every qual and key
+	// (M0148-0001f).
+	if opts.Verbose {
+		if cols := explainOutputNames(n, reg); len(cols) > 0 {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + "Output: " + strings.Join(cols, ", "))})
+		}
+	}
 	reg.withFilterSrc(attachedFilterNode, func() {
 		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 	})
-
-	if opts.Verbose {
-		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
-			*rows = append(*rows, Row{NewStringDatum(outline)})
-		}
-	}
 
 	// The `CTE <name>` sections belong to the top plan node, before its
 	// InitPlans and children — upstream prints them from the top node's
@@ -6238,6 +6239,26 @@ func isCanonicalISODate(v string) bool {
 // schemaColumnNames returns the names of n's output columns,
 // or nil when the node doesn't expose a schema (Insert/Update/
 // Delete operators run for side effects and have empty Output).
+// explainOutputNames is the VERBOSE `Output:` list: the node's output column
+// names, each qualified by its relation when show_plan_tlist's rule says so —
+// `useprefix = es->rtable_size > 1` (explain.c; VERBOSE itself does not force
+// it, unlike quals and keys). Only a column that still carries its source
+// binding (a plain relation column) is qualified; computed outputs keep their
+// name. M0148-0001f.
+func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
+	names := schemaColumnNames(n)
+	if reg == nil || !reg.names().qualifyTlist() {
+		return names
+	}
+	for i, c := range n.Output() {
+		if c.SourceTableIdx == 0 {
+			continue
+		}
+		names[i] = reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
+	}
+	return names
+}
+
 func schemaColumnNames(n optimizer.Node) []string {
 	out := n.Output()
 	if len(out) == 0 {
@@ -6434,6 +6455,14 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	// an enable_* GUC turned off (plan_is_disabled; M0148-0001f).
 	if explainNodeDisabled(n) || (attachedFilterNode != nil && explainNodeDisabled(attachedFilterNode)) {
 		*rows = append(*rows, Row{NewStringDatum(detailIndent + "Disabled: true")})
+	}
+	// explain.c ExplainNode: VERBOSE's show_plan_tlist runs next — before
+	// Inner Unique and the node-type switch that prints every qual and key
+	// (M0148-0001f).
+	if opts.Verbose {
+		if cols := explainOutputNames(n, reg); len(cols) > 0 {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + "Output: " + strings.Join(cols, ", "))})
+		}
 	}
 	reg.withFilterSrc(attachedFilterNode, func() {
 		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
@@ -6724,13 +6753,6 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	}
 
 	wblocks.flush(rows, detailIndent)
-
-	if opts.Verbose {
-		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := detailIndent + "Output: " + strings.Join(cols, ", ")
-			*rows = append(*rows, Row{NewStringDatum(outline)})
-		}
-	}
 
 	// The CTE sections print with their instrumentation intact: every
 	// reference shares one body Node, so the section IS the subtree that
@@ -7025,7 +7047,7 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 		obj["Filter"] = wrapParen(formatExprQual(filter, reg, fqual))
 	}
 	if opts.Verbose {
-		if cols := schemaColumnNames(n); len(cols) > 0 {
+		if cols := explainOutputNames(n, reg); len(cols) > 0 {
 			obj["Output"] = cols
 		}
 	}
