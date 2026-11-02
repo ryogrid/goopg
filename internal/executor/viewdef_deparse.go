@@ -46,6 +46,7 @@ type viewDeparser struct {
 type vdRTE struct {
 	refname string
 	cols    []string
+	types   []string // catalog type names, relation RTEs only
 }
 
 // deparseViewDef returns view's pg_get_viewdef text (with the trailing ';'),
@@ -269,6 +270,11 @@ func (d *viewDeparser) buildRangeTable(from []parser.RangeVar) {
 			}
 			for _, c := range tbl.Columns {
 				r.cols = append(r.cols, c.Name)
+				typ := c.Type.Name
+				if c.Type.IsArray {
+					typ = ""
+				}
+				r.types = append(r.types, typ)
 			}
 		}
 		d.rtes = append(d.rtes, r)
@@ -639,8 +645,12 @@ func (d *viewDeparser) funcArg(a parser.Expr) {
 
 // funcCall is get_func_expr / get_agg_expr for a plain or aggregate call.
 func (d *viewDeparser) funcCall(f *parser.FuncCall) {
-	if f.Over != nil || len(f.WithinGroup) > 0 || f.Name.Schema != "" {
+	if f.Over != nil || f.Name.Schema != "" {
 		d.fail()
+		return
+	}
+	if len(f.WithinGroup) > 0 {
+		d.orderedSetCall(f)
 		return
 	}
 	for _, v := range f.Variadic {
@@ -726,4 +736,111 @@ func (d *viewDeparser) sortGroupExpr(e parser.Expr, targets []parser.ResTarget) 
 		}
 	}
 	d.expr(e)
+}
+
+// orderedSetCall is get_agg_expr for an ordered-set aggregate:
+// `name(direct args) WITHIN GROUP (ORDER BY …) [FILTER (WHERE …)]`. The
+// direct arguments print as the analyser coerced them: percentile_disc /
+// percentile_cont take double precision, so a numeric or integer literal is
+// an implicit cast shown with its label (`(0.5)::double precision` —
+// get_func_expr prints arguments with showimplicit); a hypothetical-set
+// aggregate's direct arguments take their ORDER BY column's type, so an
+// unknown literal resolves to it (`'AZZZZ'::name`) and an int4 literal
+// against an int4 column stays bare.
+func (d *viewDeparser) orderedSetCall(f *parser.FuncCall) {
+	if f.Distinct || f.Star || len(f.OrderBy) > 0 {
+		d.fail()
+		return
+	}
+	name := strings.ToLower(f.Name.Name)
+	d.appendString(pgQuoteIdent(f.Name.Name) + "(")
+	switch name {
+	case "percentile_disc", "percentile_cont":
+		if len(f.Args) != 1 || len(f.WithinGroup) != 1 {
+			d.fail()
+			return
+		}
+		switch a := f.Args[0].(type) {
+		case *parser.NumericConst:
+			if strings.HasPrefix(a.Value, "-") {
+				d.fail()
+				return
+			}
+			d.appendString("(" + a.Value + ")::double precision")
+		case *parser.IntegerConst:
+			if a.Value < 0 {
+				d.fail()
+				return
+			}
+			d.appendString("(" + strconv.FormatInt(a.Value, 10) + ")::double precision")
+		default:
+			d.fail()
+			return
+		}
+	case "rank", "dense_rank", "percent_rank", "cume_dist":
+		if len(f.Args) != len(f.WithinGroup) {
+			d.fail()
+			return
+		}
+		for i, a := range f.Args {
+			if i > 0 {
+				d.appendString(", ")
+			}
+			typ := d.exprColumnType(f.WithinGroup[i].Expr)
+			switch x := a.(type) {
+			case *parser.IntegerConst:
+				if pgFormatTypeName(typ) != "integer" || x.Value < 0 || x.Value > 2147483647 {
+					d.fail()
+					return
+				}
+				d.appendString(strconv.FormatInt(x.Value, 10))
+			case *parser.StringConst:
+				if typ == "" || strings.Contains(x.Value, `\`) {
+					d.fail()
+					return
+				}
+				d.appendString("'" + strings.ReplaceAll(x.Value, "'", "''") + "'::" + pgFormatTypeName(typ))
+			default:
+				d.fail()
+				return
+			}
+		}
+	default:
+		d.fail()
+		return
+	}
+	d.appendString(") WITHIN GROUP (ORDER BY ")
+	for i, sb := range f.WithinGroup {
+		if i > 0 {
+			d.appendString(", ")
+		}
+		d.expr(sb.Expr)
+		d.sortOptions(sb)
+	}
+	d.appendString(")")
+	if f.Filter != nil {
+		d.appendString(" FILTER (WHERE ")
+		d.expr(f.Filter)
+		d.appendString(")")
+	}
+}
+
+// exprColumnType is the catalog type name of a column reference to a
+// relation RTE, or "" when e is not one.
+func (d *viewDeparser) exprColumnType(e parser.Expr) string {
+	c, ok := e.(*parser.ColumnRef)
+	if !ok || c.Schema != "" {
+		return ""
+	}
+	for _, r := range d.rtes {
+		if c.Table != "" && r.refname != c.Table {
+			continue
+		}
+		for i, col := range r.cols {
+			if col == c.Column && i < len(r.types) {
+				return strings.ToLower(r.types[i])
+			}
+		}
+	}
+	return ""
 }

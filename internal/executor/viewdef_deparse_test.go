@@ -24,6 +24,10 @@ func TestPgGetViewdefDeparse(t *testing.T) {
 		"create view vd_single as select max(a order by b + 1) from (values (1,3),(2,4)) v(a,b)",
 		"create table vd_t (ten int, hundred int)",
 		"create view vd_where as select ten, count(*) from vd_t where hundred > 5 group by ten order by ten",
+		"create table vd_os (ten int, thousand int, hundred int, string4 name)",
+		"create view vd_ordset as select ten, percentile_disc(0.5) within group (order by thousand) as p50, " +
+			"percentile_disc(0.5) within group (order by thousand) filter (where hundred=1) as px, " +
+			"rank(5,'AZZZZ',50) within group (order by hundred, string4 desc, hundred) from vd_os group by ten order by ten",
 	} {
 		runSQL(t, ctx, q)
 	}
@@ -35,6 +39,13 @@ func TestPgGetViewdefDeparse(t *testing.T) {
 		{"vd_agg", " SELECT count(DISTINCT v.a) AS count,\n    max(v.b) AS max\n   FROM ( VALUES (1,3,'foo'::text), (0,NULL::integer,NULL::text)) v(a, b, c),\n    generate_series(1, 3) i(i);"},
 		{"vd_single", " SELECT max(a ORDER BY (b + 1)) AS max\n   FROM ( VALUES (1,3), (2,4)) v(a, b);"},
 		{"vd_where", " SELECT ten,\n    count(*) AS count\n   FROM vd_t\n  WHERE (hundred > 5)\n  GROUP BY ten\n  ORDER BY ten;"},
+		// aggregates.out's aggordview1: ordered-set direct arguments print as
+		// coerced (float8 for percentile_disc, the ORDER BY column's type for
+		// the hypothetical-set rank).
+		{"vd_ordset", " SELECT ten,\n    percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY thousand) AS p50,\n" +
+			"    percentile_disc((0.5)::double precision) WITHIN GROUP (ORDER BY thousand) FILTER (WHERE (hundred = 1)) AS px,\n" +
+			"    rank(5, 'AZZZZ'::name, 50) WITHIN GROUP (ORDER BY hundred, string4 DESC, hundred) AS rank\n" +
+			"   FROM vd_os\n  GROUP BY ten\n  ORDER BY ten;"},
 	} {
 		if got := get("select pg_get_viewdef('" + tc.view + "')"); got != tc.want {
 			t.Errorf("%s:\n got: %q\nwant: %q (PG 18.3)", tc.view, got, tc.want)
