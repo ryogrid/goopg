@@ -834,7 +834,7 @@ heuristic stays live.)
     tpch\-spotcheck Q12 rows=2 / Q13 rows=35 PASS; testport 3\-E2E repro PASS \(59\.9/279\.2/41\.0 s\)\.
     Movement: none — correctness fix — no plan instrument
 
-- [ ] **testport/TestPort\_PgDumpConnectionSetup — pg\_dump view bodies no longer match the pins** \(AI\-20261103\-004134\-003; repro: `go test \-v \-run '^TestPort\_PgDumpConnectionSetup$' \./internal/testport/`\)\.
+- [x] **testport/TestPort\_PgDumpConnectionSetup — pg\_dump view bodies no longer match the pins** \(AI\-20261103\-004134\-003; repro: `go test \-v \-run '^TestPort\_PgDumpConnectionSetup$' \./internal/testport/`\)\.
   Kind: impl
   Parent: none
   - Filed 2026\-11\-03\. Caused by M0148\-0001g \(cc0d25b7f\): pg\_get\_viewdef now prints ruleutils layout, so the pins
@@ -842,6 +842,13 @@ heuristic stays live.)
     wrong: pg\_dump runs with `search\_path = ''`, where PG's generate\_relation\_name qualifies a relation that is not
     visible \(`FROM public\.foo`\); the deparser prints `FROM foo` unconditionally\. The fix is in the deparser
     \(qualify when not visible on the session search\_path\), and the pins move to PG's text\.
+  - Fixed in f3f0d0d02: relationVisibleFunc ports RelationIsVisible \(effective search\_path, pg\_catalog implicit
+    first, shadowing by an earlier schema\) and the deparser qualifies an invisible relation; non\-public relations no
+    longer fall back\. Pins moved to PG's text; pin `TestPgGetViewdefQualifiesInvisibleRelations` \(PG 18\.3 scratch
+    oracle, mutation\-checked\)\. Repro PASS; TestPort\_PgDump\* PASS; regress matview 352 → 351 diff lines, five
+    other view suites byte\-identical\. Gates on code\_tree 92942f09cc6e: units, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness fix — no plan instrument \(pg\_get\_viewdef text; regress matview \-1 diff line\)\.
 - [ ] testport/TestE2E\_PGCrashStartOnGoopgTornContrecord — hosted PG logged `FATAL: the database system is not yet accepting connections` during crash recovery of the goopg directory \(AI\-20261103\-004134\-001; repro: `go test \-v \-run '^TestE2E\_PGCrashStartOnGoopgTornContrecord$' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Recovery itself completed \(redo done, end\-of\-recovery checkpoint, ready\); the FATAL is a
     client connecting before consistency — check stale \(load\) first, then whether the test's readiness probe races
@@ -11581,8 +11588,9 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   window functions and WINDOW clauses, CASE, explicit casts, sublinks,
   string/numeric literals outside VALUES and function arguments (their
   coercion labels need the analysed types), composite-returning FROM
-  functions (attribute alias lists), relations outside the search path
-  (generate_relation_name qualification). The rules and create_view suites
+  functions (attribute alias lists). (Relations outside the search path —
+  generate_relation_name qualification — landed in f3f0d0d02 under
+  M-NIGHTLY AI-20261103-004134-003.) The rules and create_view suites
   are the measurement targets (most of their viewdef lines come through
   \d+, i.e. pretty mode). Measure with the regress runner HEAD vs change.
 - [ ] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node

@@ -91,3 +91,17 @@ filed as M0148\-0001g1.
 - Pretty mode's precedence\-based parenthesisation (`isSimpleNode`).
 - Joins, set operations, CTEs, window functions, CASE, casts, sublinks,
   schema qualification by search\-path visibility.
+
+## Follow\-up 2026\-11\-03 — search\-path qualification (f3f0d0d02)
+
+The slice\-1 rule above ("public relations; others fall back") was wrong for
+public too: `generate_relation_name` qualifies any relation
+`RelationIsVisible` rejects, and pg\_dump runs with an empty search\_path, so
+PG dumps `FROM public.foo` where goopg printed `FROM foo`
+(AI\-20261103\-004134\-003, `TestPort_PgDumpConnectionSetup`).
+`relationVisibleFunc` now ports `RelationIsVisible` over the session's
+effective search\_path (pg\_catalog searched first unless listed; a relation
+is visible when the first path schema holding its name is its own), and an
+invisible relation prints `schema.name`. Non\-public relations no longer fall
+back. Pin: `TestPgGetViewdefQualifiesInvisibleRelations`; regress matview
+gains the `mvtest_mvschema` viewdef.
