@@ -849,13 +849,44 @@ heuristic stays live.)
     other view suites byte\-identical\. Gates on code\_tree 92942f09cc6e: units, spotcheck, sf025 99/99, acceptance
     24 MATCH, fire\-set fires=none\.
   Movement: none — correctness fix — no plan instrument \(pg\_get\_viewdef text; regress matview \-1 diff line\)\.
-- [ ] testport/TestE2E\_PGCrashStartOnGoopgTornContrecord — hosted PG logged `FATAL: the database system is not yet accepting connections` during crash recovery of the goopg directory \(AI\-20261103\-004134\-001; repro: `go test \-v \-run '^TestE2E\_PGCrashStartOnGoopgTornContrecord$' \./internal/testport/`\)\.
+- [x] testport/TestE2E\_PGCrashStartOnGoopgTornContrecord — hosted PG logged `FATAL: the database system is not yet accepting connections` during crash recovery of the goopg directory \(AI\-20261103\-004134\-001; repro: `go test \-v \-run '^TestE2E\_PGCrashStartOnGoopgTornContrecord$' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Recovery itself completed \(redo done, end\-of\-recovery checkpoint, ready\); the FATAL is a
     client connecting before consistency — check stale \(load\) first, then whether the test's readiness probe races
     PG's startup\.
+  - Root cause: a harness race, not recovery\. pgcluster\.Start returns when the port listens, before crash recovery
+    ends; WaitReady then connected at once and PG refused it with the logged FATAL that assertNoFatalInPGLog trips on\.
+  - Fixed in 3258bb18b: WaitReady first waits, as pg\_ctl \-w does \(pg\_ctl\.c:637\), for postmaster\.pid's PM\_STATUS line to
+    read `ready` or `standby`; pin TestPostmasterDoneStartingReadsPMStatusLine\. TestE2E\_PG\* family PASS except
+    ThreeLevelCatalogBtree \(below\)\. Gates: units, spotcheck, sf025 99/99\.
+  Movement: none — test harness only — no plan instrument\.
 - [ ] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 670\.53 s \(AI\-20261103\-004134\-002; repro: `go test \-v \-run '^TestE2E\_PGReadsThreeLevelCatalogBtree$' \./internal/testport/`\)\.
   - REOPENED: the 75bc49273 per\-batch deadline \(AI\-20261101\-010139\-002\) did not hold — 670 s is the third failure
     in four nightlies\. The log tail is continuous `bgwriter flush pages=100`\.
+  - 2026\-11\-03: NOT stale — fails at HEAD on a lightly loaded host \(642\.89 s, `create tables 7900\.\.: context deadline
+    exceeded`\)\. Not a code regression either: a CREATE TABLE probe \(fsync off, batches of 100\) at HEAD and at 75bc49273
+    trade places run to run \(4000 tables in 67–130 s\)\. The cost per batch grows with the relation count \(quadratic
+    total\), so the 60 s per\-batch deadline is crossed near 8000 relations once the host is busy\.
+  - Profile at 5000 relations \(600 creates in 21 s\): mirrorCatalogRelToPostgresDB 40 % \(walks EVERY block of every
+    mirrored catalog per DDL, allocating an 8 KB copy per block; MarkDirtyForceFPI on the changed pages\), pwrite 37 %\.
+    The changed\-page count is not constant: rebuildSysBtreeWithNewEntry rewrites a whole multi\-level catalog index when a
+    leaf is full, and buildBulkSysBtreeLayout packs non\-rightmost leaves 100 % full, so an insert into a middle leaf
+    \(e\.g\. the `\_lvl\_…` array type in pg\_type\_typname\_nsp\_index\) rebuilds the index again\. Owned by
+    M\-NIGHTLY\-catalog\-btree\-split below\.
+- [ ] **M\-NIGHTLY\-catalog\-btree\-split — catalog indexes rebuild wholesale on a full leaf instead of splitting it;
+  bulk layout packs leaves 100 % full** \(filed 2026\-11\-03 from AI\-20261103\-004134\-002\)\.
+  Kind: impl
+  Parent: none
+  - PG: catalog index inserts go through \_bt\_doinsert → \_bt\_split \(nbtinsert\.c\), touching the split pair and the
+    parent; nbtsort builds leaves at BTREE\_DEFAULT\_FILLFACTOR 90 \(nbtsort\.c \_bt\_buildadd\)\. goopg's
+    internal/executor/sys\_catalog\_btree\_multilevel\.go rebuilds every page \(rebuildSysBtreeWithNewEntry\) and packs at
+    100 % \(buildBulkSysBtreeLayout; initdb's pgBuildBtreeBulkLoadSized twin\)\.
+  - Effect: CREATE TABLE cost grows linearly with the catalog size \(quadratic bulk DDL; ThreeLevelCatalogBtree times
+    out near 8000 relations\)\. The base/5 mirror \(mirrorCatalogRelToPostgresDB\) then copies and FPIs every rewritten
+    page, and walks every catalog block per DDL\.
+  - Resume: split the full leaf in place \(the split pair \+ parent downlink; internal/access/nbtree has a split to model
+    on\), keeping the PG on\-disk format PG reads after a basebackup; pack bulk leaves at fillfactor 90 in BOTH twins
+    \(executor and initdb\); then measure the probe in tmp/ddl\-probe\.sh and the ThreeLevel test\. Mirror only the blocks
+    a DDL dirtied as a second step\.
 - [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
     alone wedges at HEAD before blaming load\.
