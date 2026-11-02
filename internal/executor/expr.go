@@ -12502,6 +12502,18 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		if view == nil || view.View == nil || view.ViewDef == "" {
 			return NullDatum, nil
 		}
+		// M0148-0001g: deparse the stored body as ruleutils prints the
+		// analysed query (viewdef_deparse.go); outside its subset, fall back
+		// to the captured text below.
+		pretty := false
+		if len(x.Args) >= 2 {
+			if pv, perr := evalExprSlot(x.Args[1], slot, ctx); perr == nil && !pv.IsNull() {
+				pretty = pv.Kind != KindBool || pv.BoolValue()
+			}
+		}
+		if txt, ok := deparseViewDef(view, im, pretty); ok {
+			return NewStringDatum(txt), nil
+		}
 		def := view.ViewDef
 		// A `CREATE VIEW v (c1, c2, …) AS …` explicit column list renames the
 		// view's output columns. PG's pg_get_viewdef bakes those names into the
