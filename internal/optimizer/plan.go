@@ -2380,6 +2380,10 @@ type GenerateSeries struct {
 	// not specified. Consumed by the EXPLAIN Function Scan label.
 	Alias  string
 	schema Schema
+	// RTID is the function RTE's statement-unique range-table identity, so
+	// EXPLAIN names its columns (`s2.s2`) and counts it like any relation
+	// (set_rtable_names covers function RTEs too). M0148-0001f.
+	RTID int32
 }
 
 // UserSrfScan executes a user-defined SETOF SQL/plpgsql function in the FROM

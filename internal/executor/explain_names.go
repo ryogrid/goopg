@@ -581,6 +581,13 @@ func (nm *explainNames) register(rtid int32, base string, node optimizer.Node) {
 // prints after `Seq Scan on` / `CTE Scan on`.
 func explainRelBaseName(n optimizer.Node) (string, bool) {
 	switch p := n.(type) {
+	case *optimizer.GenerateSeries:
+		// A function RTE's refname is its alias, else the function name
+		// (set_rtable_names / get_rte_alias).
+		if p.Alias != "" {
+			return p.Alias, true
+		}
+		return "generate_series", true
 	case *optimizer.SeqScan:
 		if p.Alias != "" {
 			return p.Alias, true
@@ -685,6 +692,8 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 	case *optimizer.MaterializedCTEScan:
 		rtid = p.RTID
 	case *optimizer.BitmapHeapScan:
+		rtid = p.RTID
+	case *optimizer.GenerateSeries:
 		rtid = p.RTID
 	case *optimizer.SetOp:
 		rtid = p.RTID

@@ -62,3 +62,23 @@ func TestExplainVerboseAggregateOutputDeparsed(t *testing.T) {
 		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
 	}
 }
+
+// M0148-0001f: a generate_series FROM item is a range-table entry PG names by
+// its alias (set_rtable_names covers function RTEs), so in a multi-relation
+// statement its column prints `s1.s1` in Output: and quals, as base-relation
+// columns do. goopg's GenerateSeries carried no RTID and stayed bare.
+func TestExplainGenerateSeriesColumnsQualified(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE oa (a int, b int)")
+	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT oa.b, s1 FROM oa, generate_series(1, 3) s1 WHERE oa.a = s1", optimizer.DefaultPlannerSettings())), "\n")
+	for _, want := range []string{"Function Scan on pg_catalog.generate_series s1", "Output: s1.s1", "s1.s1)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("want %q (PG 18.3); got:\n%s", want, got)
+		}
+	}
+	single := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT s1 FROM generate_series(1, 3) s1", optimizer.DefaultPlannerSettings())), "\n")
+	if !strings.Contains(single, "Output: s1\n") && !strings.HasSuffix(single, "Output: s1") {
+		t.Errorf("a lone function RTE keeps bare Output (rtable_size 1); got:\n%s", single)
+	}
+}

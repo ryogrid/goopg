@@ -5006,6 +5006,12 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		if err != nil {
 			return nil, rangeBinding{}, err
 		}
+		// M0148-0001f: the function RTE's RTID (consumed above) reaches the
+		// scan node EXPLAIN names it by. generate_series first — the SRF the
+		// regress suites qualify most (`s2.s2`).
+		if gs, ok := node.(*GenerateSeries); ok && gs.RTID == 0 {
+			gs.RTID = rtid
+		}
 		return node, b, nil
 	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
