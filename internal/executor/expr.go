@@ -12511,7 +12511,7 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 				pretty = pv.Kind != KindBool || pv.BoolValue()
 			}
 		}
-		if txt, ok := deparseViewDef(view, im, pretty); ok {
+		if txt, ok := deparseViewDef(view, im, relationVisibleFunc(ctx, im), pretty); ok {
 			return NewStringDatum(txt), nil
 		}
 		def := view.ViewDef

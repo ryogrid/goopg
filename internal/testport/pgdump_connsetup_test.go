@@ -10081,11 +10081,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
 		// whole dump when pg_get_viewdef returns empty; goopg now returns the
 		// captured raw view body, so the `CREATE VIEW … AS <body>` statement is
-		// emitted. Assert both the header and the verbatim body — the regression
-		// guard for the pg_get_viewdef fix.
+		// emitted. Assert both the header and the body, which since M0148-0001g
+		// is ruleutils' text — `public.foo` qualified because pg_dump runs with
+		// search_path = '' (generate_relation_name).
 		viewDefs := []string{
 			"CREATE VIEW public.foo_view AS",
-			"SELECT id, name FROM public.foo WHERE qty > 0;",
+			" SELECT id,\n    name\n   FROM public.foo\n  WHERE (qty > 0);",
 		}
 		for _, sub := range viewDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -10099,7 +10100,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// underlying `id, name`. Regression guard for applyViewColumnAliases.
 		rviewDefs := []string{
 			"CREATE VIEW public.foo_rview AS",
-			"SELECT id AS col_a, name AS col_b FROM public.foo;",
+			" SELECT id AS col_a,\n    name AS col_b\n   FROM public.foo;",
 		}
 		for _, sub := range rviewDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -10181,8 +10182,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// statement is emitted. Regression guard for the matview ViewDef wiring.
 		matViewDefs := []string{
 			"CREATE MATERIALIZED VIEW public.foo_mv AS",
-			"SELECT id, name FROM public.foo WHERE qty > 0",
-			"WITH NO DATA;",
+			" SELECT id,\n    name\n   FROM public.foo\n  WHERE (qty > 0)\n  WITH NO DATA;",
 		}
 		for _, sub := range matViewDefs {
 			if !strings.Contains(res.Stdout, sub) {

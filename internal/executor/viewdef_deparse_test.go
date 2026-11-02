@@ -58,3 +58,45 @@ func TestPgGetViewdefDeparse(t *testing.T) {
 		t.Errorf("pretty mode must not print non-pretty parentheses: %q", got)
 	}
 }
+
+// generate_relation_name qualifies a relation RelationIsVisible rejects:
+// outside the search path (pg_dump empties search_path), or shadowed
+// by a same-named relation in an earlier path schema. Expected text from a
+// PG 18.3 scratch cluster.
+func TestPgGetViewdefQualifiesInvisibleRelations(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"create table vq_foo (id int, name text, qty int)",
+		"create view vq_view as select id, name from vq_foo where qty > 0",
+		"create schema vq_s",
+		"create table vq_s.t (a int)",
+		"create view vq_vs as select a from vq_s.t",
+		"create table vq_s.vq_foo (z int)",
+	} {
+		runSQL(t, ctx, q)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	get := func(q string) string { return strings.Join(renderRows(runSQLWith(t, ctx, q, ps)), "\n") }
+	check := func(view, want string) {
+		t.Helper()
+		if got := get("select pg_get_viewdef('" + view + "')"); got != want {
+			t.Errorf("%s:\n got: %q\nwant: %q (PG 18.3)", view, got, want)
+		}
+	}
+	check("vq_view", " SELECT id,\n    name\n   FROM vq_foo\n  WHERE (qty > 0);")
+	check("vq_vs", " SELECT a\n   FROM vq_s.t;")
+	searchPath := func(v string) {
+		ctx.GetSetting = func(name string) (string, bool) {
+			if name == "search_path" {
+				return v, true
+			}
+			return "", false
+		}
+	}
+	searchPath("vq_s, public")
+	check("public.vq_view", " SELECT id,\n    name\n   FROM public.vq_foo\n  WHERE (qty > 0);")
+	check("vq_vs", " SELECT a\n   FROM t;")
+	searchPath("''")
+	check("public.vq_view", " SELECT id,\n    name\n   FROM public.vq_foo\n  WHERE (qty > 0);")
+}

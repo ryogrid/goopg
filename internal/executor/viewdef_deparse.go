@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 
@@ -36,6 +37,7 @@ type viewDeparser struct {
 	buf         []byte
 	indentLevel int
 	cat         *catalog.InMemory
+	visible     func(schema, name string) bool
 	pretty      bool
 	rtes        []*vdRTE
 	useprefix   bool
@@ -45,6 +47,7 @@ type viewDeparser struct {
 // vdRTE is one FROM item: its printed refname and output columns.
 type vdRTE struct {
 	refname string
+	relname string // relation RTEs: generate_relation_name's text
 	cols    []string
 	types   []string // catalog type names, relation RTEs only
 }
@@ -55,7 +58,9 @@ type vdRTE struct {
 // PRETTYFLAG_PAREN elides operator parentheses by precedence (isSimpleNode),
 // which this file does not model yet, so a pretty request is served only for
 // queries without operator expressions — where both modes print the same.
-func deparseViewDef(view *catalog.Table, cat *catalog.InMemory, pretty bool) (string, bool) {
+// visible is RelationIsVisible over the session's search_path (schema ""
+// is public); a relation it does not reach prints schema-qualified.
+func deparseViewDef(view *catalog.Table, cat *catalog.InMemory, visible func(schema, name string) bool, pretty bool) (string, bool) {
 	if view == nil || view.ViewDef == "" || cat == nil {
 		return "", false
 	}
@@ -71,7 +76,7 @@ func deparseViewDef(view *catalog.Table, cat *catalog.InMemory, pretty bool) (st
 	for _, c := range view.Columns {
 		colnames = append(colnames, c.Name)
 	}
-	d := &viewDeparser{cat: cat, ok: true, pretty: pretty}
+	d := &viewDeparser{cat: cat, visible: visible, ok: true, pretty: pretty}
 	d.selectQuery(sel, colnames)
 	if !d.ok {
 		return "", false
@@ -257,12 +262,19 @@ func (d *viewDeparser) buildRangeTable(from []parser.RangeVar) {
 				return
 			}
 			tbl, found := d.cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
-			// generate_relation_name qualifies a relation the search path
-			// does not reach; without the session's path here, anything
-			// outside public falls back.
-			if !found || (tbl.Schema != "" && tbl.Schema != "public") {
+			if !found || d.visible == nil {
 				d.fail()
 				return
+			}
+			// generate_relation_name: qualify a relation the search path
+			// does not reach (RelationIsVisible).
+			schema := tbl.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			r.relname = pgQuoteIdent(strings.ToLower(tbl.Name))
+			if !d.visible(schema, strings.ToLower(tbl.Name)) {
+				r.relname = pgQuoteIdent(schema) + "." + r.relname
 			}
 			r.refname = rv.Alias
 			if r.refname == "" {
@@ -354,7 +366,7 @@ func (d *viewDeparser) fromItem(rv parser.RangeVar, r *vdRTE) {
 	switch {
 	case rv.Subquery != nil:
 		d.appendString("(")
-		sub := &viewDeparser{cat: d.cat, ok: true, pretty: d.pretty, indentLevel: d.indentLevel}
+		sub := &viewDeparser{cat: d.cat, visible: d.visible, ok: true, pretty: d.pretty, indentLevel: d.indentLevel}
 		sub.selectQuery(rv.Subquery, nil)
 		if !sub.ok {
 			d.fail()
@@ -381,7 +393,7 @@ func (d *viewDeparser) fromItem(rv parser.RangeVar, r *vdRTE) {
 		d.appendString(" " + pgQuoteIdent(r.refname))
 		d.columnAliasList(r.cols)
 	default:
-		d.appendString(pgQuoteIdent(strings.ToLower(rv.Name)))
+		d.appendString(r.relname)
 		if rv.Alias != "" {
 			d.appendString(" " + pgQuoteIdent(rv.Alias))
 		}
@@ -843,4 +855,32 @@ func (d *viewDeparser) exprColumnType(e parser.Expr) string {
 		}
 	}
 	return ""
+}
+
+// relationVisibleFunc is RelationIsVisible (namespace.c) over the session's
+// effective search_path: pg_catalog is searched first unless the path lists
+// it, and a relation is visible when the first path schema holding its name
+// is its own schema.
+func relationVisibleFunc(ctx *Context, cat *catalog.InMemory) func(schema, name string) bool {
+	path := searchPathSchemas(ctx)
+	if !slices.Contains(path, "pg_catalog") {
+		path = append([]string{"pg_catalog"}, path...)
+	}
+	return func(schema, name string) bool {
+		if !slices.Contains(path, schema) {
+			return false
+		}
+		for _, s := range path {
+			t, ok := cat.LookupTable(parser.ObjectName{Schema: s, Name: name})
+			if !ok {
+				continue
+			}
+			ts := t.Schema
+			if ts == "" {
+				ts = "public"
+			}
+			return ts == schema
+		}
+		return false
+	}
 }
