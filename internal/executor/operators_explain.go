@@ -6247,7 +6247,25 @@ func isCanonicalISODate(v string) bool {
 // name. M0148-0001f.
 func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 	names := schemaColumnNames(n)
-	if reg == nil || !reg.names().qualifyTlist() {
+	if reg == nil {
+		return names
+	}
+	qualify := reg.names().qualifyTlist()
+	// An Aggregate's targetlist is its grouping columns and aggregate calls:
+	// show_plan_tlist deparses each (`s2.s2, sum((s1.s1 + s2.s2))`), where
+	// the output schema only names them (`s2, sum`). aggOutputKeyExpr is the
+	// same resolution the Sort Key above an aggregate already uses.
+	if agg, ok := n.(*optimizer.Aggregate); ok && agg.GroupingSets == nil {
+		out := n.Output()
+		for i := range out {
+			col := &optimizer.ColumnRef{Index: i, Name: out[i].Name, Type: out[i].Type}
+			if e, hit := aggOutputKeyExpr(col, agg, reg, qualify); hit {
+				names[i] = formatExprQual(e, reg, qualify)
+			}
+		}
+		return names
+	}
+	if !qualify {
 		return names
 	}
 	for i, c := range n.Output() {

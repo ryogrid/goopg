@@ -41,3 +41,24 @@ func TestExplainVerboseOutputPlacementAndPrefix(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001f: an Aggregate's VERBOSE Output: is its targetlist deparsed —
+// grouping columns and aggregate calls (`y, sum((x + y)), count(*), avg(x)`),
+// not the output schema's names (`y, sum, count, avg`). Verified against PG
+// 18.3's show_plan_tlist for this statement.
+func TestExplainVerboseAggregateOutputDeparsed(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	runSQL(t, ctx, "CREATE TABLE ga (x int, y int)")
+	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT y, sum(x + y), count(*), avg(x) FROM ga GROUP BY y", optimizer.DefaultPlannerSettings())), "\n")
+	want := strings.Join([]string{
+		"HashAggregate",
+		"  Output: y, sum((x + y)), count(*), avg(x)",
+		"  Group Key: ga.y",
+		"  ->  Seq Scan on public.ga",
+		"        Output: x, y",
+	}, "\n")
+	if got != want {
+		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
+	}
+}
