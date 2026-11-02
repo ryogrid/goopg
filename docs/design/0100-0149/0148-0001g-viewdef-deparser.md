@@ -1,7 +1,9 @@
 # M0148-0001g — pg\_get\_viewdef deparses the view as ruleutils prints it
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
-slice 1 landed `cc0d25b7f` (run\-2 loop #28, 2026\-11\-02); the task stays open
+slice 1 landed `cc0d25b7f` (run\-2 loop #28, 2026\-11\-02); slice 2 (ordered\-set
+aggregates) landed `025d72204` (run\-2 loop #29); **closed** 2026\-11\-02 —
+breadth residue filed as M0148\-0001g1
 **Target:** the aggregates `pg_get_viewdef` hunks (the seven `agg_view1`
 variants at expected\-lines 1667\-1756, `aggordview1` at 2317) and the same
 function's output in other suites (rules, create\_view)
@@ -59,7 +61,29 @@ PG's form; anything outside the subset reports `ok=false` and
   as `t(t)` and a non\-public relation unqualified; both now fall back.
 - Pin: `TestPgGetViewdefDeparse`.
 
-## Remaining (task stays open)
+## Slice 2 — ordered\-set aggregates
+
+`get_agg_expr` prints an ordered\-set aggregate as `name(direct args) WITHIN
+GROUP (ORDER BY …) [FILTER (WHERE …)]`, its direct arguments as the analyser
+coerced them (`get_func_expr` prints arguments with showimplicit):
+`percentile_disc` / `percentile_cont` take double precision, so a literal is
+an implicit cast shown with its label (`(0.5)::double precision`); a
+hypothetical\-set aggregate's direct arguments take the matching ORDER BY
+column's type (`rank(5, 'AZZZZ'::name, 50)`). `orderedSetCall` renders these
+shapes; relation RTEs carry their columns' catalog types for the labels.
+
+- Regress runner, HEAD vs change over 35 suites: aggregates 266 → 251 diff
+  lines / 14 → 13 hunks (`aggordview1` matches); the other 34 unchanged.
+- Pin: `TestPgGetViewdefDeparse` (aggordview1 shape).
+
+## Closure (2026\-11\-02, run\-2 loop #29)
+
+Both aggregates hunk groups the task names match. The deparser's breadth —
+pretty mode (psql `\d+`), joins, set operations, CTEs, windows, CASE, casts,
+sublinks, literal coercions outside VALUES, search\-path qualification — is
+filed as M0148\-0001g1.
+
+## Remaining at closure (moved to M0148\-0001g1)
 
 - `aggordview1`: WITHIN GROUP aggregates and argument coercions
   (`percentile_disc((0.5)::double precision)`, `'AZZZZ'::name`) need the

@@ -11420,7 +11420,7 @@ Movement: yes — regress aggregates diff lines 169 → 161
     the dominant remaining Output gap) → filed M0148-0001f1; cast deparsing,
     other SRF kinds, resjunk sort keys and join outputs over aggregates are
     ledgered (2026-11-02 rows) and listed in M0148-0001f1's scope.
-- [ ] **M0148-0001g — pg_get_viewdef deparser fidelity**.
+- [x] **M0148-0001g — pg_get_viewdef deparser fidelity**.
   Kind: impl
   Parent: M0148-0001
   goopg echoes a lowercase near-verbatim view text; PG deparses the stored
@@ -11439,10 +11439,16 @@ Movement: yes — regress aggregates diff lines 169 → 161
     BY/USING/FILTER; stored text outside the subset. The seven agg_view1
     hunks match. Design: docs/design/0100-0149/0148-0001g-viewdef-deparser.md.
 Movement: yes — regress aggregates hunks 21 → 14 (diff lines 314 → 266)
-  - Open (task stays `[ ]`): aggordview1 (WITHIN GROUP, argument coercions
-    `(0.5)::double precision` / `'AZZZZ'::name`); pretty-mode
-    parenthesisation (isSimpleNode) for psql \d+; joins, set ops, CTEs,
-    windows, CASE, casts, sublinks, search-path schema qualification.
+  - LANDED slice 2 `025d72204` (2026-11-02, run-2 loop #29): ordered-set
+    aggregates (WITHIN GROUP) with coerced direct arguments
+    (`(0.5)::double precision`, hypothetical-set `'AZZZZ'::name`).
+    aggordview1 matches.
+Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
+  - CLOSED 2026-11-02 (run-2 loop #29): both hunk groups the task names
+    (1637-1726 agg_view1, 2284 aggordview1) match. Breadth residue filed as
+    M0148-0001g1 (pretty mode / psql \d+, joins, set ops, CTEs, windows,
+    CASE, casts, sublinks, literals outside VALUES, search-path schema
+    qualification) — ledgered 2026-11-02.
 - [ ] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
   Kind: impl
   Parent: M0148-0001
@@ -11515,6 +11521,24 @@ Movement: yes — regress aggregates hunks 21 → 14 (diff lines 314 → 266)
   regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
   aggregates, join) HEAD vs change before landing; no aggregates hunk depends
   on it, hence filed after the regress-closing M0148-0001 children.
+- [ ] **M0148-0001g1 — pg_get_viewdef deparser breadth (pretty mode,
+  joins, set operations, CTEs, coercions)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001g (closed). internal/executor/viewdef_deparse.go
+  deparses a subset of view queries and falls back to the stored body text
+  elsewhere. Missing PG behaviour (ruleutils.c): pretty mode
+  (pg_get_viewdef(v, true) and psql's \d+ — PRETTYFLAG_PAREN elides
+  parentheses by precedence via isSimpleNode / get_simple_binary_op_name);
+  JOIN syntax (get_from_clause_item JoinExpr arms, USING/NATURAL column
+  merging), set operations (get_setop_query), WITH (get_with_clause),
+  window functions and WINDOW clauses, CASE, explicit casts, sublinks,
+  string/numeric literals outside VALUES and function arguments (their
+  coercion labels need the analysed types), composite-returning FROM
+  functions (attribute alias lists), relations outside the search path
+  (generate_relation_name qualification). The rules and create_view suites
+  are the measurement targets (most of their viewdef lines come through
+  \d+, i.e. pretty mode). Measure with the regress runner HEAD vs change.
 - [ ] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node
   targetlists and remaining deparse gaps**.
   Kind: impl
