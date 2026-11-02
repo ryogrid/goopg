@@ -859,7 +859,7 @@ heuristic stays live.)
     read `ready` or `standby`; pin TestPostmasterDoneStartingReadsPMStatusLine\. TestE2E\_PG\* family PASS except
     ThreeLevelCatalogBtree \(below\)\. Gates: units, spotcheck, sf025 99/99\.
   Movement: none — test harness only — no plan instrument\.
-- [ ] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 670\.53 s \(AI\-20261103\-004134\-002; repro: `go test \-v \-run '^TestE2E\_PGReadsThreeLevelCatalogBtree$' \./internal/testport/`\)\.
+- [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 670\.53 s \(AI\-20261103\-004134\-002; repro: `go test \-v \-run '^TestE2E\_PGReadsThreeLevelCatalogBtree$' \./internal/testport/`\)\.
   - REOPENED: the 75bc49273 per\-batch deadline \(AI\-20261101\-010139\-002\) did not hold — 670 s is the third failure
     in four nightlies\. The log tail is continuous `bgwriter flush pages=100`\.
   - 2026\-11\-03: NOT stale — fails at HEAD on a lightly loaded host \(642\.89 s, `create tables 7900\.\.: context deadline
@@ -872,7 +872,9 @@ heuristic stays live.)
     leaf is full, and buildBulkSysBtreeLayout packs non\-rightmost leaves 100 % full, so an insert into a middle leaf
     \(e\.g\. the `\_lvl\_…` array type in pg\_type\_typname\_nsp\_index\) rebuilds the index again\. Owned by
     M\-NIGHTLY\-catalog\-btree\-split below\.
-- [ ] **M\-NIGHTLY\-catalog\-btree\-split — catalog indexes rebuild wholesale on a full leaf instead of splitting it;
+  - Fixed by M\-NIGHTLY\-catalog\-btree\-split \(ddce38f80\): the test passes in 45\.5 s \(was 643 s FAIL\)\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog DDL; probe 4000 CREATE TABLE 67–130 s → 11\.2 s\)\.
+- [x] **M\-NIGHTLY\-catalog\-btree\-split — catalog indexes rebuild wholesale on a full leaf instead of splitting it;
   bulk layout packs leaves 100 % full** \(filed 2026\-11\-03 from AI\-20261103\-004134\-002\)\.
   Kind: impl
   Parent: none
@@ -887,6 +889,25 @@ heuristic stays live.)
     on\), keeping the PG on\-disk format PG reads after a basebackup; pack bulk leaves at fillfactor 90 in BOTH twins
     \(executor and initdb\); then measure the probe in tmp/ddl\-probe\.sh and the ThreeLevel test\. Mirror only the blocks
     a DDL dirtied as a second step\.
+  - LANDED ddce38f80: in\-place \_bt\_split / \_bt\_insert\_parent / \_bt\_newroot port with \_bt\_findsplitloc's default strategy
+    \(fillfactor 90/70 on rightmost pages\); design `docs/design/0100\-0149/m\-nightly\-catalog\-btree\-split\.md`\.
+    - Pins TestSysBtreeSplitsInPlace, TestSysBtreeAscendingSplitsLeaveFillfactorPages \(mutation\-checked\)\.
+    - Probe 4000 tables 67–130 s → 11\.2 s; ThreeLevel 643 s → 45\.5 s; TestE2E\_ 34 PASS\.
+    - Gates on code\_tree f0bbb93a1291: units, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+    - Not done \(ledger\): bulk layouts still pack leaves 100 %; the base/5 mirror still walks every catalog block\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog DDL\)\.
+- [ ] **M\-NIGHTLY\-0001h\-create\-function\-sql — must\-pass regress case create\_function\_sql regressed by 73b858090 \(M0148\-0001h\)**
+  \(filed 2026\-11\-03 from the TestPort\_RegressSuite gate of ddce38f80\)\.
+  Kind: impl
+  Parent: M0148\-0001h
+  - `DROP TABLE functest3 CASCADE` no longer reports/drops `view functestv3`: the view is created under
+    `search\_path = temp\_func\_test, public` but goopg places it in public \(0001h cause 3, execCreateView ignores
+    search\_path\), and 0001h's schema\-scoped matching no longer links it to temp\_func\_test\.functest3\. The nightly at
+    b11a5eca0 \(before 0001h\) passed it; fails at HEAD 3258bb18b and at ddce38f80\. 0001h's gates did not include the
+    regress suite\.
+  - Fix: 0001h slice 2 — execCreateView resolves an unqualified non\-temp view into `currentWritableSchema\(o\.ctx\)`
+    as CREATE TABLE does \(operators\_ddl\.go ~2618\); re\-run TestPort\_RegressSuite \(create\_function\_sql must
+    pass\) and the 0001h unit pin\.
 - [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
     alone wedges at HEAD before blaming load\.
