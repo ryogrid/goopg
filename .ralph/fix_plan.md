@@ -11385,9 +11385,16 @@ Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578
     The three merge-join blocks are byte-identical. Design:
     docs/design/0100-0149/0148-0001f-explain-output-rendering.md.
 Movement: yes — regress aggregates hunks 24 → 21 (diff lines 360 → 348)
-  - Open (task stays `[ ]`): the Output: targetlist rendering (pruned
-    tlist, qualified Vars, aggregate labels, placement before Group/Sort
-    Key), `Function Call:` ordering, key parenthesisation residue.
+  - LANDED slice 2 `2faedaef2` (2026-11-02, run-2 loop #23): VERBOSE
+    Output: printed right after the node line (before Inner Unique and every
+    qual/key) and its columns qualified by show_plan_tlist's
+    `rtable_size > 1` rule. Unmatched PG Output: lines 979 → 895 across 34
+    suites; 0 wrongly-qualified.
+Movement: yes — regress join diff lines 15034 → 14932 (subselect 1438 → 1384)
+  - Open (task stays `[ ]`): Output: content — pruned per-node targetlists
+    (PG's scan/join tlists carry only the needed columns), expression labels
+    (`sum((x + y))`, `PARTIAL variance(...)`, `array_agg(DISTINCT w)`,
+    `(InitPlan 1).col1`), key parenthesisation residue.
 - [ ] **M0148-0001g — pg_get_viewdef deparser fidelity**.
   Kind: impl
   Parent: M0148-0001

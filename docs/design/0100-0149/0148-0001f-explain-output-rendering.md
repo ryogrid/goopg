@@ -2,6 +2,7 @@
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
 slice 1 (`Disabled: true`) landed `29d2af8d5` (run\-2 loop #22, 2026\-11\-02);
+slice 2 (Output: placement and prefix) landed `2faedaef2` (run\-2 loop #23);
 the task stays open for the Output: targetlist work
 **Target:** aggregates hunks with `Output:` lines (expected\-lines 608, 646,
 2946, 2982, the array\_agg\(DISTINCT\) block) and the merge\-join
@@ -49,6 +50,29 @@ goopg never printed the line, so the three merge\-join blocks under
   groupingsets). Those are pre\-existing plan gaps the line now makes
   visible, ledgered.
 - Pin: `TestExplainDisabledNodes`.
+
+## Slice 2 — VERBOSE `Output:` placement and prefix
+
+`ExplainNode` prints VERBOSE's `show_plan_tlist` directly after the node line
+and `Disabled:`, before `Inner Unique` and the node\-type switch that prints
+every qual and key. goopg printed `Output:` after them. And
+`show_plan_tlist` qualifies its columns by `useprefix = es->rtable_size > 1`
+alone — VERBOSE does not force it, unlike quals and keys (slice 6 of
+M0148\-0001e) — while goopg printed bare names everywhere.
+
+- Both text walkers emit `Output:` right after the `Disabled` line.
+- `explainOutputNames` qualifies each output column that still carries its
+  source binding (`SourceTableIdx`) through `columnIn` when
+  `explainNames.qualifyTlist()` (plan\-visible relations > 1 or
+  `rtableSize > 1`) holds; computed outputs keep their names. The text walkers
+  and `planToJSON`'s `Output` property share it.
+- Regress runner, HEAD vs change over 34 suites: PG `Output:` lines left
+  unmatched 979 → 895; join 15034 → 14932 diff lines, subselect
+  1438 → 1384, rangefuncs, select\_distinct and with smaller; 29 suites
+  unchanged — placement alone reorders lines inside hunks whose Output
+  content still differs. No goopg `Output:` line is qualified where PG's is
+  bare.
+- Pin: `TestExplainVerboseOutputPlacementAndPrefix`.
 
 ## Remaining (task stays open)
 
