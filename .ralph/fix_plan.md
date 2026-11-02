@@ -11396,8 +11396,12 @@ Movement: yes — regress join diff lines 15034 → 14932 (subselect 1438 → 13
     aggregate calls, via aggOutputKeyExpr). Unmatched PG Output: lines
     895 → 889.
 Movement: yes — regress aggregates diff lines 348 → 344
-  - Open (task stays `[ ]`): Output: content — Function Scan columns
-    unqualified (function RTE not in the EXPLAIN name table); Aggregate
+  - LANDED slice 4 `5d9870a21` (2026-11-02, run-2 loop #25):
+    generate_series FROM items carry their RTE's RTID, so EXPLAIN names
+    their columns (`s2.s2`). Unmatched PG Output: lines 889 → 884.
+Movement: yes — regress aggregates diff lines 344 → 328
+  - Open (task stays `[ ]`): Output: content — other SRF scan kinds
+    unregistered (unnest, generate_subscripts, user SRFs); Aggregate
     output order (GROUP BY vs targetlist); `PARTIAL` prefix; parenthesised
     expressions above an aggregate; pruned per-node targetlists
     (PG's scan/join tlists carry only the needed columns), expression labels

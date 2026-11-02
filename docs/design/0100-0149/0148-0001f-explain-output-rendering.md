@@ -4,6 +4,7 @@
 slice 1 (`Disabled: true`) landed `29d2af8d5` (run\-2 loop #22, 2026\-11\-02);
 slice 2 (Output: placement and prefix) landed `2faedaef2` (run\-2 loop #23);
 slice 3 (Aggregate Output: deparse) landed `52feaacf9` (run\-2 loop #24);
+slice 4 (generate\_series RTE naming) landed `5d9870a21` (run\-2 loop #25);
 the task stays open for the Output: targetlist work
 **Target:** aggregates hunks with `Output:` lines (expected\-lines 608, 646,
 2946, 2982, the array\_agg\(DISTINCT\) block) and the merge\-join
@@ -91,6 +92,24 @@ Grouping\-sets aggregates keep the names for now.
   PG; what still differs in them is listed below.
 - Pin: `TestExplainVerboseAggregateOutputDeparsed`.
 
+## Slice 4 — generate\_series FROM items enter the name table
+
+A function RTE is a range\-table entry like any relation: `set_rtable_names`
+gives it a refname (its alias, else the function name) and ruleutils
+qualifies its columns under the statement's prefix rule
+(`Output: s2.s2, sum((s1.s1 + s2.s2))`). goopg's `planScanRangeVar` consumed
+an RTID for every table\-function RTE but never stamped it, so
+`GenerateSeries` never entered the EXPLAIN name table and its columns printed
+bare.
+
+- `GenerateSeries.RTID` is stamped from the RTE's RTID in
+  `planScanRangeVar` (the flat\-rtable renumbering reaches it through its
+  RTID field); `explainNodeRTID` and `explainRelBaseName` register it.
+- Regress runner, HEAD vs change over 34 suites: unmatched PG `Output:`
+  lines 889 → 884; aggregates 344 → 328 diff lines, explain, inherit and join
+  smaller; 30 unchanged.
+- Pin: `TestExplainGenerateSeriesColumnsQualified`.
+
 ## Remaining (task stays open)
 
 - Output: the pruned per\-node targetlist with qualified Vars, aggregate
@@ -99,9 +118,8 @@ Grouping\-sets aggregates keep the names for now.
   before Group Key / Sort Key), `Function Call:` before `Output:`
   (`explain.c` `show_plan_tlist`, `ruleutils.c` deparse context).
 - Group Key / Sort Key operand parenthesisation residue.
-- Function Scan columns are unqualified in multi\-relation statements
-  (`s2` where PG prints `s2.s2`): the function RTE is not registered as a
-  named relation in the EXPLAIN name table.
+- Other SRF scan kinds (`generate_subscripts`, `unnest`, user SRFs, ROWS
+  FROM) still carry no RTID, so their columns stay unqualified.
 - Aggregate output column order follows the GROUP BY clause, PG's the
   targetlist (`x, y, array_agg(...)` vs `y, x, array_agg(...)`).
 - A Partial Aggregate prints `variance(...)` where PG prints
