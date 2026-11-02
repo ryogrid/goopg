@@ -5,6 +5,7 @@ slice 1 (`Disabled: true`) landed `29d2af8d5` (run\-2 loop #22, 2026\-11\-02);
 slice 2 (Output: placement and prefix) landed `2faedaef2` (run\-2 loop #23);
 slice 3 (Aggregate Output: deparse) landed `52feaacf9` (run\-2 loop #24);
 slice 4 (generate\_series RTE naming) landed `5d9870a21` (run\-2 loop #25);
+slice 5 (Output: over an aggregate) landed `c2c98388e` (run\-2 loop #26);
 the task stays open for the Output: targetlist work
 **Target:** aggregates hunks with `Output:` lines (expected\-lines 608, 646,
 2946, 2982, the array\_agg\(DISTINCT\) block) and the merge\-join
@@ -110,6 +111,28 @@ bare.
   smaller; 30 unchanged.
 - Pin: `TestExplainGenerateSeriesColumnsQualified`.
 
+## Slice 5 — Output: over an aggregate follows the select list
+
+`create_plan` folds the projection into the projection\-capable Agg, so the
+Agg's targetlist is the SELECT list (`sum((x + y))`) plus, as resjunk
+entries, the grouping columns the list does not name; a Sort or Limit above
+references those entries, printing each non\-Var parenthesised
+(`(sum((x + y))), y`). goopg keeps the projection in an EXPLAIN\-invisible
+Project (above the Agg/Sort chain, or between the Sort and the Agg).
+
+- `explainAggProjectionOutput` renders an Aggregate, or a pass\-through node
+  over one, from that Project: each target with the aggregate outputs
+  substituted (`aggOutputKeyExpr`), resjunk grouping columns appended,
+  parenthesised on the pass\-through nodes. Without such a Project a
+  pass\-through node over an Aggregate renders each column through
+  `aggOutputKeyExpr`; other children keep their names (a broader rendering
+  through `sortKeyParts` was tried first and printed goopg's narrowing NULL
+  placeholders and substituted tableoid constants, which are not PG
+  targetlist entries).
+- Regress runner, HEAD vs change over 34 suites: unmatched PG `Output:`
+  lines 884 → 881; aggregates 328 → 322 diff lines; 33 unchanged.
+- Pin: `TestExplainVerboseOutputFollowsSelectListOverAggregate`.
+
 ## Remaining (task stays open)
 
 - Output: the pruned per\-node targetlist with qualified Vars, aggregate
@@ -120,8 +143,9 @@ bare.
 - Group Key / Sort Key operand parenthesisation residue.
 - Other SRF scan kinds (`generate_subscripts`, `unnest`, user SRFs, ROWS
   FROM) still carry no RTID, so their columns stay unqualified.
-- Aggregate output column order follows the GROUP BY clause, PG's the
-  targetlist (`x, y, array_agg(...)` vs `y, x, array_agg(...)`).
+- Cast deparsing inside expressions (`(sum(tenthous) + (random() * 0))` vs
+  PG `((sum(tenthous))::double precision + (random() * '0'::double
+  precision))`): goopg's deparser omits implicit casts and literal types.
 - A Partial Aggregate prints `variance(...)` where PG prints
-  `PARTIAL variance(...)`; nodes above an aggregate print column names where
-  PG prints the parenthesised expression (`(sum((x.x + y.y)))`).
+  `PARTIAL variance(...)`; join and other non\-pass\-through nodes above an
+  aggregate still print column names.

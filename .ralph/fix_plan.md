@@ -11400,8 +11400,14 @@ Movement: yes — regress aggregates diff lines 348 → 344
     generate_series FROM items carry their RTE's RTID, so EXPLAIN names
     their columns (`s2.s2`). Unmatched PG Output: lines 889 → 884.
 Movement: yes — regress aggregates diff lines 344 → 328
-  - Open (task stays `[ ]`): Output: content — other SRF scan kinds
-    unregistered (unnest, generate_subscripts, user SRFs); Aggregate
+  - LANDED slice 5 `c2c98388e` (2026-11-02, run-2 loop #26): Output: of
+    an Aggregate and of a Sort/IncrementalSort/Limit over it follows the
+    select list (from the invisible Project) with resjunk grouping columns,
+    parenthesised on pass-through nodes. Unmatched PG Output: 884 → 881.
+Movement: yes — regress aggregates diff lines 328 → 322
+  - Open (task stays `[ ]`): Output: content — cast deparsing inside
+    expressions; other SRF scan kinds unregistered (unnest,
+    generate_subscripts, user SRFs); Aggregate
     output order (GROUP BY vs targetlist); `PARTIAL` prefix; parenthesised
     expressions above an aggregate; pruned per-node targetlists
     (PG's scan/join tlists carry only the needed columns), expression labels
