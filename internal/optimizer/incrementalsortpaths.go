@@ -130,9 +130,12 @@ func incrementalSortPathWithGroups(ordered *RelOptInfo, sub *Path, sortPathkeys 
 	}
 	sp := &Path{
 		Kind: PathIncrementalSort,
-		// `cost_incremental_sort` folds enable_sort's flag in via
-		// `cost_sort` upstream (costsize.c:2144).
-		DisabledNodes: disabledNodesFor(!cp.enableSort, sub),
+		// `cost_incremental_sort` sets `path->disabled_nodes =
+		// input_disabled_nodes` (costsize.c): enable_sort does not reach it —
+		// enable_incremental_sort = off simply never builds the path. Folding
+		// enable_sort in printed `Disabled: true` under an Incremental Sort PG
+		// leaves enabled, and priced it as disabled (M0148-0001f).
+		DisabledNodes: disabledNodesFor(false, sub),
 		Rel:           ordered,
 		// M0146-0149: cost_incremental_sort sets path->rows from the
 		// CLAMPED input_tuples (costsize.c), so an Incremental Sort over a

@@ -44,6 +44,11 @@ type PlanCost struct {
 	// perWorkerDisplayRows reads it so a scan already priced per worker is
 	// not divided a second time (M0141-S2b-16).
 	PerWorker bool
+	// Disabled is PG's plan_is_disabled (explain.c): the node's own
+	// disabled_nodes exceed the sum over its children — an enable_* GUC
+	// turned THIS node off, not something below it. EXPLAIN prints
+	// `Disabled: true` for it (M0148-0001f).
+	Disabled bool
 }
 
 // PlanCostInfo returns the node's cost annotation and whether one was set.
@@ -93,13 +98,43 @@ func stampPlanCost(n Node, p *Path) {
 	if !ok {
 		return
 	}
+	disabled := pathSelfDisabled(p)
+	if p.Kind == PathPrebuilt {
+		// A prebuilt path re-wraps a node an earlier search already built and
+		// stamped (an upper rel's input); it carries no disabled count of its
+		// own, so the node keeps the bit its own path gave it.
+		if c, ok := n.(PlanCostCarrier); ok {
+			if prev, set := c.PlanCostInfo(); set && prev.Disabled {
+				disabled = true
+			}
+		}
+	}
 	setter.setPlanCost(PlanCost{
 		StartupCost: p.Cost.Startup,
 		TotalCost:   p.Cost.Total,
 		PlanRows:    p.Rows,
 		PlanWidth:   TupleWidth(n.Output()),
 		PerWorker:   p.ParallelWorkers > 0,
+		Disabled:    disabled,
 	})
+}
+
+// pathSelfDisabled is plan_is_disabled over the path a node was built from:
+// create_plan copies each path's disabled_nodes onto its plan, and a plan is
+// disabled when its count exceeds its children's sum (an Append's and
+// MergeAppend's children included, as there). goopg's Path.Children are the
+// plan's inputs in the same sense.
+func pathSelfDisabled(p *Path) bool {
+	if p == nil || p.DisabledNodes == 0 {
+		return false
+	}
+	children := 0
+	for _, c := range p.Children {
+		if c != nil {
+			children += c.DisabledNodes
+		}
+	}
+	return p.DisabledNodes > children
 }
 
 // DeriveLegacyDisplayCost prices a node the path search did not produce.

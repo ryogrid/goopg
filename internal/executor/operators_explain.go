@@ -617,6 +617,12 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 	// all indent at the CURRENT es->indent, same column for every property
 	// of a node).
 	detailIndent := strings.Repeat(" ", childIndent*2)
+	// explain.c ExplainNode: right after the node line, before Output and
+	// every other property, TEXT format prints `Disabled: true` for a node
+	// an enable_* GUC turned off (plan_is_disabled; M0148-0001f).
+	if explainNodeDisabled(n) || (attachedFilterNode != nil && explainNodeDisabled(attachedFilterNode)) {
+		*rows = append(*rows, Row{NewStringDatum(detailIndent + "Disabled: true")})
+	}
 	reg.withFilterSrc(attachedFilterNode, func() {
 		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 	})
@@ -6423,6 +6429,12 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	detailIndent := strings.Repeat(" ", childIndent*2)
+	// explain.c ExplainNode: right after the node line, before Output and
+	// every other property, TEXT format prints `Disabled: true` for a node
+	// an enable_* GUC turned off (plan_is_disabled; M0148-0001f).
+	if explainNodeDisabled(n) || (attachedFilterNode != nil && explainNodeDisabled(attachedFilterNode)) {
+		*rows = append(*rows, Row{NewStringDatum(detailIndent + "Disabled: true")})
+	}
 	reg.withFilterSrc(attachedFilterNode, func() {
 		emitNodeDetailLines(n, detailIndent, opts.Verbose, rows, attachedFilter, reg)
 	})
@@ -6999,6 +7011,8 @@ func planToJSONNamed(n optimizer.Node, opts parser.ExplainOptions, reg *subPlanR
 	obj["Startup Cost"] = startup
 	obj["Total Cost"] = total
 	obj["Plan Width"] = width
+	// explain.c: non-text formats always carry the Disabled property.
+	obj["Disabled"] = explainNodeDisabled(n)
 	// P0-04e: the collapsed Filter's predicate rides as PG's "Filter"
 	// property on the surviving node. Same outermost-only rule and same
 	// qualify decision as the text walker's `Filter:` detail line, so the
@@ -8444,4 +8458,16 @@ func (b workerBlocks) flush(rows *[]Row, indent string) {
 			*rows = append(*rows, Row{NewStringDatum(indent + "  " + line)})
 		}
 	}
+}
+
+// explainNodeDisabled reports PG's plan_is_disabled for a rendered node: the
+// search stamped it from the node's path (PlanCost.Disabled). Nodes the
+// search did not build carry no count and are never disabled.
+func explainNodeDisabled(n optimizer.Node) bool {
+	c, ok := n.(optimizer.PlanCostCarrier)
+	if !ok {
+		return false
+	}
+	pc, set := c.PlanCostInfo()
+	return set && pc.Disabled
 }
