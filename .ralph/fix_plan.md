@@ -11378,6 +11378,16 @@ Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578
   the merge-scan `Disabled: true` lines. PG: `explain.c` `show_tle`/
   `explain_target_list` + `ruleutils.c` deparse context. Verify hunks
   608-690, 1899-1929, 2910-2947, 3129 key-text lines.
+  - LANDED slice 1 `29d2af8d5` (2026-11-02, run-2 loop #22): `Disabled:
+    true` per PG 18 plan_is_disabled (PlanCost.Disabled stamped from the
+    producing path; prebuilt re-stamps keep the bit; JSON property), and
+    Incremental Sort no longer counts enable_sort (cost_incremental_sort).
+    The three merge-join blocks are byte-identical. Design:
+    docs/design/0100-0149/0148-0001f-explain-output-rendering.md.
+Movement: yes — regress aggregates hunks 24 → 21 (diff lines 360 → 348)
+  - Open (task stays `[ ]`): the Output: targetlist rendering (pruned
+    tlist, qualified Vars, aggregate labels, placement before Group/Sort
+    Key), `Function Call:` ordering, key parenthesisation residue.
 - [ ] **M0148-0001g — pg_get_viewdef deparser fidelity**.
   Kind: impl
   Parent: M0148-0001
