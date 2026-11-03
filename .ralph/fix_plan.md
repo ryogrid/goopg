@@ -11097,7 +11097,7 @@ open until its output matches PostgreSQL 18.3; every missing prerequisite is
 filed and implemented as that suite task's child. Ledger-only parking is not a
 completion path.
 
-- [ ] **M0148-0001 — aggregates.sql regress coverage closure**.
+- [x] **M0148-0001 — aggregates.sql regress coverage closure**.
   Kind: impl
   Parent: none
   - Baseline first: run `scripts/pg-regress-runner.sh -v aggregates` at HEAD
@@ -11107,6 +11107,14 @@ completion path.
   - Complete only at byte-normalized expected-output parity, with the inventory
     row promoted to `pass` / `pass_required=yes`, regenerated coverage docs,
     and the next canonical M0148 suite task materialized.
+  - LANDED 2026-11-04 in 80c8249f9 (last slice M0148-0001f3a, typed
+    text-literal labels): `scripts/pg-regress-runner.sh aggregates` PASS
+    (100% parity, stable x3); TestPort_RegressSuite/aggregates PASS in the
+    full ordered run; inventory row → pass / pass_required=yes, coverage
+    docs regenerated, make check-testport-inventory OK. Open residue
+    children (c3a, c3b, e2, f3, g1, h1, i2, j2, k1) carry differences in
+    OTHER suites only; next suite materialized as M0148-0002 (copy).
+  Movement: yes — regress runner aggregates 40 hunks (baseline 5a43057d6) → PASS; inventory regress pass count +1
   - Baseline run 2026-11-01 (loop #15) at `5a43057d6`: 40 hunks / 988 diff
     lines (`tmp/m0148/aggregates-baseline-5a43057d6.log`,
     `tmp/regress-diffs/aggregates.diff`). Classification: 4 FILTER-syntax
@@ -11997,7 +12005,13 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   (get\_const\_expr labels a text Const) — needs builtin function /
   aggregate parameter types (catalog.builtinProcsByName is a hand-curated
   handful; generate from pg\_proc.dat). Closing it closes the aggregates
-  suite (M0148-0001). Resume:
+  suite (M0148-0001).
+  Text-parameter literals LANDED 2026-11-04 in 80c8249f9 as M0148-0001f3a
+  (catalog.BuiltinProcSignatures + literalArgIsText; aggregates closed).
+  Still open in (3): literals coerced to NON-text parameters (date,
+  interval: PG prints the canonical output text, `'3 mons'::interval` for
+  TPC-H Q15's `'3 month'`), operator operands, user-defined functions.
+  Resume:
   internal/executor/operators_explain.go explainOutputNames (join arm:
   needed columns from the parent), optimizer sort-input target placement.
 - [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
@@ -12179,3 +12193,32 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   order; PG orders by inhseqno/child OID). Measure: partition_prune /
   partition_join / inherit regress runner HEAD vs change, and isolation
   eval-plan-qual for (a).
+- [ ] **M0148-0002 — copy.sql regress coverage closure**.
+  Kind: impl
+  Parent: none
+  - Canonical queue entry 2 (docs/milestones/0148-regress-coverage-closure.md),
+    materialized 2026-11-04 after M0148-0001 closed.
+  - Baseline 2026-11-04 at 80c8249f9: 7 hunks / 292 diff lines
+    (`tmp/m0148/copy-baseline/copy.diff`). Classification, each to be filed
+    as a `Kind: impl` child before implementing (PG oracle: copyfromparse.c,
+    copyfrom.c, copyto.c, copy.c ProcessCopyOptions):
+    (a) text/CSV line endings — a DOS `\r\n` file reads `abc\r`, and the
+        end-of-copy marker `\.` must be alone on its line ("end-of-copy
+        marker is not alone on its line", CopyReadLineText);
+    (b) COPY into a partitioned table routes no rows (`tableoid | count`
+        empty) and COPY FREEZE is not rejected on partitioned / foreign
+        tables (CopyFrom checks);
+    (c) COPY FROM ... WHERE (syntax error at `where`) and the
+        pg_stat_progress_copy INFO lines;
+    (d) ON_ERROR ignore ("N rows were skipped due to data type
+        incompatibility") and PG's input-error texts (goopg leaks
+        strconv.ParseInt);
+    (e) HEADER MATCH (column name mismatch / wrong number of fields in
+        header line, "match" rejected for COPY TO) and the dropped-column
+        header case;
+    (f) DEFAULT option (`option "default" not recognized`) and varchar(n)
+        length errors;
+    (g) unpopulated matview wording ("cannot copy from unpopulated
+        materialized view" + HINT).
+  - Complete only at runner parity with the inventory row promoted, coverage
+    docs regenerated, and M0148-0003 (copy2) materialized.
