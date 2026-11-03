@@ -11854,6 +11854,22 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   internal/optimizer/pathindexrestrict.go addOneRestrictionIndexPath,
   createplanindex.go, executor operators_index.go,
   operators_explain.go formatIndexCond.
+- [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
+  fail "does not exist"**.
+  Kind: impl
+  Parent: M0148-0001c3
+  Split from M0148-0001c3b item (4). A restart's pg_class / pg_index reload
+  keys relations `public.<name>` while a live session keys them bare;
+  LookupTable / lookupIndexLocked accept either, but DropView, DropTable,
+  RenameTable and DropIndex deleted by the exact key, so the executor's
+  existence check passed and the catalog delete missed. PG drops them.
+  - LANDED c544710da (2026-11-04) — CLOSED: lookupTableKeyLocked +
+    lookupIndexLocked give the mutators the key the relation lives under.
+    Design docs/design/0100-0149/0148-0001c3c-restart-catalog-key-resolution.md.
+    Pin TestDropResolvesRestartKeySpelling; live restart repro (DROP VIEW
+    bare/qualified, DROP INDEX, RENAME, drops persist across a further
+    restart).
+  Movement: none — correctness fix — no plan instrument (post-restart DDL; regress runs never restart)
 - [ ] **M0148-0001c3b — index-only scans over a proven partial index;
   unanalysed partial-index size; expression columns block HOT**.
   Kind: impl
@@ -11868,7 +11884,11 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   expression-index columns (Columns[i]==""; RelationGetIndexAttrBitmap adds
   the expressions' Vars) — an update of a column used only inside an
   index expression may go HOT and leave the expression index stale.
-  (4) Seen while probing (2026-11-03; 2026-11-04: reproduced for views at
+  (4) MOVED to M0148-0001c3c (closed 2026-11-04). (5) Audit the other
+  exact-key catalog mutators (sequences, matviews, types, functions) for
+  the restart key spelling (c3c fixed DropView/DropTable/RenameTable/
+  DropIndex); and `\\di` on a fresh cluster lists pg_class_oid_index etc.
+  under schema public with no table (pre-existing, seen at HEAD). Seen while probing (2026-11-03; 2026-11-04: reproduced for views at
   HEAD — create table + view, restart once, `DROP VIEW vv` → `view "vv"
   does not exist` while \\dv still lists it): after two server
   restarts `DROP INDEX nt_y_part` on a partial index created before them
