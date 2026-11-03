@@ -883,7 +883,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			}, partialAggGatherMergeProducer)
 		}
 	}
-	if keepGather && (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) {
+	if keepGather && (groupingHashable(aggNode, presorted) || groupingSetsHashable(aggNode)) {
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		hashSpec := *aggNode
 		addPath(grouped, &Path{

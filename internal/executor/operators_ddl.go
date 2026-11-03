@@ -27168,6 +27168,22 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 			continue
 		}
 		n := name.Name
+		// M0148-0001j1: the functions and aggregates that depend on the
+		// type (dependency.c findDependentObjects): 2BP01 under RESTRICT,
+		// reported and dropped first under CASCADE.
+		var depOID, depArrayOID uint32
+		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok {
+			depOID, depArrayOID = et.OID, et.ArrayOID
+		} else if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil {
+			depOID, depArrayOID = ct.OID, ct.ArrayOID
+		} else if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok {
+			depOID, depArrayOID = rt.OID, rt.ArrayOID
+		}
+		if depOID != 0 {
+			if err := o.dropTypeDependents(strings.ToLower(n), depOID, depArrayOID, s.Cascade, s.Pos()); err != nil {
+				return err
+			}
+		}
 		// Try to drop as enum first, then as composite type. M0097-0064.
 		// Stamp pg_type row before in-memory delete (need OID while et still exists).
 		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE

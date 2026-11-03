@@ -999,7 +999,11 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 	// rollup beside a hashed MixedAggregate with a better startup, so the
 	// Sort above elects between the two on total cost (TPC-DS Q18,
 	// M0146-0009o).
-	if aggNode.GroupingSets != nil && !groupingHasSpecialAgg(aggNode) {
+	// M0148-0001j1: ordered aggregates (DISTINCT / ORDER BY / WITHIN GROUP)
+	// take this arm too — with them PG cannot hash at all
+	// (GROUPING_CAN_USE_HASH needs numOrderedAggs == 0), so the sorted
+	// rollups are their only path, and no MixedAggregate is offered.
+	if aggNode.GroupingSets != nil {
 		if rkeys, ok := rollupSortKeys(aggNode); ok {
 			rollupPathkeys := pathkeysForSortKeys(rkeys)
 			// M0146-0020b: several rollups leave the output unordered
@@ -1018,6 +1022,9 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			// AGG_MIXED one over the same input — the knapsack-chosen
 			// rollups hashed, the rest sorted (MixedAggregate).
 			mixedHashed, mixedSorted, mixedOK := mixedGroupingRollups(cp, aggNode, sortSeed, inputRows)
+			if groupingHasSpecialAgg(aggNode) {
+				mixedOK = false
+			}
 			addMixed := func(input *Path, inDisabled int, producer string) {
 				if !mixedOK {
 					return
@@ -1083,9 +1090,10 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 
 	// HASHED. Offered whenever hashable; enable_hashagg = off marks it
 	// DisabledNodes (B-17a preference, never skip) instead of deleting it.
-	// Grouping sets always hash (today's fall-through; executor has one
-	// hash table per set).
-	if (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) &&
+	// Grouping sets hash (executor has one hash table per set) unless an
+	// ordered aggregate forbids it and the sorted rollups above stand
+	// (groupingSetsHashable).
+	if (groupingHashable(aggNode, presorted) || groupingSetsHashable(aggNode)) &&
 		!groupingSetsHashTooBig(cp, aggNode, seed, numGroups) {
 		// R47 slice 1: per-candidate spec clone (see PLAIN arm).
 		hashSpec := *aggNode
@@ -1104,6 +1112,22 @@ func addGroupingPaths(grouped *RelOptInfo, seed *Path, aggNode *Aggregate, child
 			Children:      []*Path{seed},
 		}, groupAggHashedProducer)
 	}
+}
+
+// groupingSetsHashable is the grouping-sets half of the HASHED gate. PG
+// hashes no grouping with an ordered aggregate (numOrderedAggs), grouping
+// sets included; goopg keeps the hashed path for one only when its sets form
+// no rollup the sorted arm can run, so the grouping still has a path
+// (M0148-0001j1).
+func groupingSetsHashable(a *Aggregate) bool {
+	if a.GroupingSets == nil {
+		return false
+	}
+	if !groupingHasSpecialAgg(a) {
+		return true
+	}
+	_, sortable := rollupSortKeys(a)
+	return !sortable
 }
 
 // groupingSetsHashTooBig is consider_groupingsets_paths' unsorted-arm check
