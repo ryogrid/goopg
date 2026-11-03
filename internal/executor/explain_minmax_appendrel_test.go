@@ -222,7 +222,9 @@ func TestInheritanceParentRelSize(t *testing.T) {
 	if !strings.HasPrefix(plan, "HashAggregate") || !strings.Contains(plan, "Append  (cost=") || !strings.Contains(plan, "rows=1851") {
 		t.Errorf("inheritance appendrel size:\n%s\nwant HashAggregate over Append rows=1851 (PG 18.3)", plan)
 	}
-	for _, want := range []string{"Seq Scan on ip1  (cost=0.00..0.01 rows=1 ", "Seq Scan on ip1c  (cost=0.00..18.50 rows=1850 "} {
+	// Members print with the parent's refname suffixed (M0148-0001k):
+	// `Seq Scan on ip1 ip1_1`, `Seq Scan on ip1c ip1_2`, as PG 18.3 does.
+	for _, want := range []string{"Seq Scan on ip1 ip1_1  (cost=0.00..0.01 rows=1 ", "Seq Scan on ip1c ip1_2  (cost=0.00..18.50 rows=1850 "} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("member estimate %q missing:\n%s", want, plan)
 		}

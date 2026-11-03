@@ -1304,6 +1304,15 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 			// SetOp node deparses through its own flagged input. The arm
 			// is another query level, so what the chase returns is pinned
 			// to its evaluating node, as past a join.
+			// An inheritance / partition appendrel is not a UNION of
+			// query levels: its Vars belong to the parent RTE, which the
+			// Append itself carries, and PG deparses them with the
+			// parent's refname (`Group Key: t1.a` over `Seq Scan on t1
+			// t1_1`). Decline, so the key is named at its own level where
+			// the Append claims the source (M0148-0001k).
+			if n.RTID != 0 && n.AppendRelName != "" && !n.IsUnionAllAppendRel() {
+				return nil, false
+			}
 			col, ok := cur.(*optimizer.ColumnRef)
 			if !ok || n.Op != parser.SetOpUnion || n.Left == nil || col.Index < 0 {
 				return nil, false

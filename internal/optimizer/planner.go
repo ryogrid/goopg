@@ -182,6 +182,10 @@ func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet Planne
 	// could see refs==1 while a later sibling subquery adds a second
 	// reference to the same shared body.
 	pushQualsThroughSingleRefCTEs(node)
+	// M0148-0001k: a restriction on an inheritance / partition appendrel
+	// filters at every member scan, as set_append_rel_size gives each
+	// child rel its own translated copy (appendrel_pushdown.go).
+	pushAppendRelRestrictions(node)
 	// M0127-P2.2 RETIRED `reselectDegenerateHashKeys` here. Qual placement
 	// (the two passes above plus the per-scope join pass) can pin a hash
 	// join's key column to a constant on BOTH inputs, which collapsed the
@@ -5264,6 +5268,14 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// `p_t1_1.a` (aggregates.out:1271-1280) — and every leaf
 				// allocates fresh.
 				firstLeaf := len(leaves) == 1
+				// expand_single_inheritance_child: a child RTE's alias is the
+				// parent's refname, so set_rtable_names prints the members
+				// `<parent>_N` (`Seq Scan on pp1 pp_1`) once the Append has
+				// claimed the bare name (M0148-0001k).
+				memberAlias := rv.Alias
+				if memberAlias == "" && len(leaves) > 1 {
+					memberAlias = strings.ToLower(tbl.Name)
+				}
 				for _, leaf := range leaves {
 					leafRTID := rtid
 					if !firstLeaf {
@@ -5276,7 +5288,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec, RTID: leafRTID,
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: memberAlias, schema: leafPhysSchema, LockParentOID: tbl.OID, TableSample: tsSpec, RTID: leafRTID,
 						EstRelRows: stage1RelSizeRows(cat, leaf), SmallDim: smallDimensionTag(cat, leaf), UniqueKeys: uniqueKeyColumnSets(cat, leaf)}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
@@ -5320,7 +5332,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
-			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema, TableSample: tsSpec, RTID: rtid,
+			// The Append is the parent RTE (apprelids) and every member —
+			// the parent's own scan included — is an expanded child RTE
+			// aliased with the parent's refname, so EXPLAIN prints
+			// `Seq Scan on minmaxtest minmaxtest_1`, `… minmaxtest1
+			// minmaxtest_2` (expand_single_inheritance_child,
+			// set_rtable_names; M0148-0001k).
+			memberAlias := rv.Alias
+			if memberAlias == "" {
+				memberAlias = strings.ToLower(tbl.Name)
+			}
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: memberAlias, schema: ctx.schema, TableSample: tsSpec, RTID: scope.Alloc(),
 				EstRelRows: stage1RelSizeRows(cat, tbl), SmallDim: smallDimensionTag(cat, tbl), UniqueKeys: uniqueKeyColumnSets(cat, tbl)}
 			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
 			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
@@ -5335,7 +5357,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
 				// type re-validation against the parent (alter-table-4 perm 4).
 				// A-01(ii) cut 1 (F7): each fan-out leaf consumes its own RTID.
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec, RTID: scope.Alloc(),
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: memberAlias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID, TableSample: tsSpec, RTID: scope.Alloc(),
 					EstRelRows: stage1RelSizeRows(cat, child), SmallDim: smallDimensionTag(cat, child), UniqueKeys: uniqueKeyColumnSets(cat, child)}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
@@ -5350,6 +5372,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					Right: childNode,
 					All:   true,
 				}
+			}
+			if top, ok := root.(*SetOp); ok {
+				top.RTID = rtid
+				top.AppendRelName = memberAlias
 			}
 			b.tableOidColIdx = len(b.table.Columns)
 			ctx.schema = root.Output()

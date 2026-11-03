@@ -932,6 +932,18 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// through the first child — `"*SELECT* 2".wsr_web_site_sk` when
 			// that member stays a Subquery Scan, the scan's own column when
 			// it was pulled up (TPC-DS Q5's wsr arm, M0146-0042).
+			// An inheritance / partition appendrel's parent RTE is the
+			// Append itself (planScanRangeVar stamps its RTID): a Var of
+			// the parent deparses with the PARENT's refname — `t1.a`
+			// over `Seq Scan on t1 t1_1` — never the first member's
+			// (M0148-0001k, aggregates.out `Group Key: t1.a`).
+			if p.RTID != 0 && p.AppendRelName != "" && !p.IsUnionAllAppendRel() {
+				if name, ok := nm.bySource[p.RTID]; ok && name != "" {
+					if out := p.Output(); idx < len(out) {
+						return pgQuoteIdent(name) + "." + pgQuoteIdent(out[idx].Name)
+					}
+				}
+			}
 			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput &&
 				!p.IsUnionAllAppendRel() {
 				return ""
