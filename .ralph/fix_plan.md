@@ -914,7 +914,7 @@ heuristic stays live.)
     TestDropSchemaCascadeDropsItsViews \(mutation\-checked\)\. Gates on code\_tree e8ab94f5adc4: units, spotcheck, sf025
     99/99, acceptance 24 MATCH, fire\-set fires=none, TestPort\_PgDump\*\.
   Movement: yes — regress runner diff lines create\_function\_sql 272 → 242, create\_view 2501 → 2467, alter\_table 3718 → 3679, aggregates 251 → 247
-- [ ] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
+- [x] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
   - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
     alone wedges at HEAD before blaming load\.
   - 2026\-11\-03 05:45 at HEAD 3b6eefe46, idle host: `pg\-regress\-runner inherit` completes \(2 m 03 s including
@@ -922,6 +922,16 @@ heuristic stays live.)
     `alter table p1 drop constraint f1\_pos;`, another backend waiting on LWLock WALWriteLock, while the pgbench lane
     ran beside it\. Next: whether a WAL\-write stall under co\-load can hold that ALTER past 120 s \(read the bundle's
     goroutines\.txt in `tmp/nightly\-src\-20261103\-004134/tmp/regress\-wedge/inherit` if it still exists\)\.
+  - Diagnosis 2026\-11\-03 \(bundle gone\): the case cost grows with the catalog — 4 s fresh, 19 s in\-suite, 66 s after
+    3000 filler tables\. Its 50 psql `\\d` commands each re\-plan catalog queries after a DDL; buildVirtualValues built
+    one constant expression per virtual\-catalog cell and every plan walker visited them \(planning 64 % of the profile\),
+    though the executor re\-materialises virtual rows at Open\. The catalog btree rebuild \(ddce38f80\) was the other half
+    \(standalone runner 123 s → 64 s\)\.
+  - Fixed in a4584b7de: virtual Values carry VirtualRowCount only \(RowCount\(\) for estimates/EXPLAIN\)\. At 3000 relations
+    `\\d\+` after DDL 1\.26 → 0\.35 s, inherit\.sql 66 → 24 s, byte\-identical output\. Design
+    `docs/design/0100\-0149/m\-nightly\-virtual\-catalog\-plan\-rows\.md`\. Gates on code\_tree d65238311abf: units, RegressSuite \+
+    PgDump \+ Isolation families, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog query planning; TPC plans unchanged\)\.
 - [ ] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
   Kind: impl
   Parent: none
