@@ -932,12 +932,21 @@ heuristic stays live.)
     `docs/design/0100\-0149/m\-nightly\-virtual\-catalog\-plan\-rows\.md`\. Gates on code\_tree d65238311abf: units, RegressSuite \+
     PgDump \+ Isolation families, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
   Movement: none — correctness/performance fix — no plan instrument \(catalog query planning; TPC plans unchanged\)\.
-- [ ] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+- [x] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
   Kind: impl
   Parent: none
   - REOPENED: same signature as AI\-20261031\-002109\-005 \(16406 = pgbench\_history, truncate vs in\-flight eviction
     flush\), whose generation\-signal fix \(m\-nightly\-truncate\-eviction\-flush\-race\) did not hold — this time
     nblocks=50, not 0, so a partial truncate/re\-extend window remains\.
+  - Root cause: the stale page outlived the truncate as a VALID buffer — InvalidateRel skipped a pinned slot \(a
+    transient bgwriter/checkpointer/autovacuum pin under TRUNCATE's AccessExclusiveLock\) and silently dropped a slot
+    whose state CAS lost a race; the relation was re\-extended to 50 blocks and the page's eviction flush wrote blk 677\.
+  - Fixed in 2c6643a4c: invalidateSlot retries like PG's InvalidateBuffer; InvalidateRelForTruncate waits out a pin \(10 s
+    bound\) for the heap and its indexes; every invalidation retries a lost CAS\. Pin TestTruncateWaitsOutPinnedDirtyPage
+    \(mutation reproduces the nightly signature\)\. Design follow\-up 4 in m\-nightly\-truncate\-eviction\-flush\-race\.md\.
+  - Gates on code\_tree e1f8331e90ec: storage \-race, units, full stage\-pgbench repro PASS \(0 failed txns\), spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness fix \(S2 data\-loss class\) — no plan instrument\.
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
