@@ -11991,7 +11991,13 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   use\_physical\_tlist / build\_path\_tlist), some inner nodes print no
   Output, `Inner Unique: true` missing — the bulk of join.sql's 361
   unmatched PG Output lines. (3) 2026-11-02 ledger items: casts / typed
-  literals, SRF RTIDs, Result above an aggregate. Resume:
+  literals, SRF RTIDs, Result above an aggregate. Typed literals are now
+  aggregates.sql's ONLY remaining difference (2026-11-04): a string literal
+  argument of a text parameter prints `','` where PG prints `','::text`
+  (get\_const\_expr labels a text Const) — needs builtin function /
+  aggregate parameter types (catalog.builtinProcsByName is a hand-curated
+  handful; generate from pg\_proc.dat). Closing it closes the aggregates
+  suite (M0148-0001). Resume:
   internal/executor/operators_explain.go explainOutputNames (join arm:
   needed columns from the parent), optimizer sort-input target placement.
 - [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
@@ -12122,6 +12128,23 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     M0148-0001i2.
   Movement: yes — regress runner aggregates −6 lines (v_pagg_test top Sort and qualification gone), select_views 1503 → 1502
 
+- [x] **M0148-0001i3 — a cast over an SRF prints as a Result above the
+  ProjectSet; the sort key deparses through it**.
+  Kind: impl
+  Parent: M0148-0001i2
+  Split from M0148-0001i2 part (2). PG's split\_pathtarget\_at\_srfs
+  evaluates `unnest(...)::integer` in a Result above the ProjectSet and a
+  sort key on it deparses as `(((unnest(...)))::integer)`; goopg's
+  ProjectSet evaluates both and printed `Sort Key: …, t`.
+  - LANDED 04def79cf (2026-11-04) — CLOSED: UnnestCol.ExplicitCast
+    (planner; CastType alone also carries the inferred element type),
+    srfNeedsResultAbove synthesises the Result in the text walkers,
+    resolveKeySourceDepth's ProjectSet arm deparses the key. Design
+    docs/design/0100-0149/0148-0001i3-srf-cast-result.md. Pin
+    TestExplainSRFCastResult. Gates on code_tree 6c307605ea21: units,
+    RegressSuite + PgDump + Isolation, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire-set fires=none x3.
+  Movement: yes — regress runner aggregates 31 → 20 (the v_pagg_test hunk now differs only by the `','::text` literal label)
 - [ ] **M0148-0001i2 — simple views pulled up into the parent join search;
   SRF-targetlist Result with the cast sort key**.
   Kind: impl
@@ -12135,7 +12158,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   `unnest(...)::integer` in a `Result` above the `ProjectSet` and sorts by
   the full expression (`Sort Key: pagg_test.y,
   (((unnest(...)))::integer)`); goopg sorts by the subquery column `t`
-  with no Result. Resume: internal/optimizer/derivedpullup.go (admit
+  with no Result. — MOVED to M0148-0001i3 (closed 2026-11-04). Resume: internal/optimizer/derivedpullup.go (admit
   view RangeVars), the ProjectSet / SRF target placement in the subquery
   planner.
 - [ ] **M0148-0001k1 — appendrel residue: EPQ-aware member quals, plan-time
