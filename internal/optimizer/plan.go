@@ -1546,6 +1546,15 @@ type AggregateCall struct {
 	// -1 means no sharing. When ≥ 0, applyAgg uses the shared slot instead of
 	// the per-call aggRuntime.userState. M0097-0035.
 	SharedStateSlot int
+	// Presorted is PG's Aggref.aggpresorted (M0148-0001j): the aggregate's
+	// input already arrives ordered by its DISTINCT / ORDER BY sort list
+	// within each group, so the executor runs the transition function per
+	// row, dropping a DISTINCT repeat, instead of buffering the group's
+	// inputs and sorting them at finish (nodeAgg.c build_pertrans_for_aggref,
+	// aggsortrequired = false). Set only by markPresortedAggs, once the
+	// winning grouping path's input ordering is known to cover the sort list.
+	// The zero value buffers, which is correct for any input order.
+	Presorted bool
 }
 
 func (a AggregateCall) Pos() int { return a.pos }

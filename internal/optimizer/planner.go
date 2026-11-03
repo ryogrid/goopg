@@ -10061,10 +10061,15 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// PG calls sfunc once per row when multiple aggregates share the same transition state.
 	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
 	{
+		// M0148-0001j: find_compatible_trans (prepagg.c) shares a transition
+		// state only between aggregates whose whole argument list and
+		// DISTINCT / ORDER BY clauses are equal — `my_avg(x ORDER BY x DESC)`
+		// and `my_sum(x)` each run their own transition calls.
 		type stateKey struct {
 			sfunc, stype, argKey, initcond string
 			distinct                       bool
 			filterKey                      string
+			orderKey                       string
 		}
 		slotByKey := map[stateKey]int{}
 		nextSlot := 0
@@ -10079,8 +10084,15 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 				// Filtered aggregates share state only when filters match (handle via key).
 			}
 			argK := ""
-			if pa.Arg != nil {
-				argK = planExprContentKey(pa.Arg)
+			for ai, a := range aggregateArgExprs(pa) {
+				if ai > 0 {
+					argK += "\x00"
+				}
+				argK += planExprContentKey(a)
+			}
+			orderK := ""
+			for _, sk := range pa.OrderBy {
+				orderK += fmt.Sprintf("%s/%t/%t\x00", planExprContentKey(sk.Expr), sk.Desc, sk.NullsFirst)
 			}
 			filterK := ""
 			if pa.Filter != nil {
@@ -10092,6 +10104,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 				argKey:    argK,
 				distinct:  pa.Distinct,
 				filterKey: filterK,
+				orderKey:  orderK,
 				initcond:  pa.UserAgg.InitCond, // aggregates with different INITCONDs must not share state
 			}
 			if slot, exists := slotByKey[sk]; exists {

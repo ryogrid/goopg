@@ -2588,6 +2588,9 @@ type aggRuntime struct {
 	// with DISTINCT (and optional ORDER BY). Deferred to finishAgg for correct
 	// multi-arg dedup and ORDER BY sort before sfunc calls. M0097-0035.
 	distinctUserAggRows [][]Datum // inner: [sortKey0..., arg0, arg1, ...]
+	// presortedSeen holds the argument keys a presorted DISTINCT user
+	// aggregate has already transitioned in this group (M0148-0001j).
+	presortedSeen map[string]struct{}
 }
 
 func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
@@ -3884,8 +3887,10 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 		if call.SharedStateSlot < 0 || call.UserAgg == nil {
 			continue
 		}
-		if !(call.Distinct || len(call.OrderBy) > 0) {
-			// Non-DISTINCT sync: copy userState as before.
+		if !(call.Distinct || len(call.OrderBy) > 0) || call.Presorted {
+			// Non-DISTINCT sync: copy userState as before. A presorted
+			// DISTINCT / ORDER BY leader ran its transitions per row too
+			// (M0148-0001j), so its followers copy the same way.
 			if i == 0 {
 				continue
 			}
@@ -4742,7 +4747,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 			// deduplication and/or sorting in finishAgg. M0097-0035.
 			// Non-DISTINCT with ORDER BY also needs row accumulation so rows can
 			// be sorted before sfunc calls (PostgreSQL semantics). M0097-0113.
-			if call.Distinct || len(call.OrderBy) > 0 {
+			// M0148-0001j: a presorted aggregate (PG's aggpresorted) already
+			// receives its group's inputs in sort-list order, so it takes the
+			// per-row path below, dropping DISTINCT repeats there.
+			if (call.Distinct || len(call.OrderBy) > 0) && !call.Presorted {
 				// Build row: [sortKey0, ..., arg0, arg1, ...extraArgs].
 				// Sort keys first (for ORDER BY), then arg values for sfunc. M0097-0035.
 				nSortKeys := len(call.OrderBy)
@@ -4814,6 +4822,29 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 						sfuncArgs = append(sfuncArgs, ev)
 					}
 				}
+			}
+			if call.Distinct && call.Presorted {
+				// nodeAgg's EEOP_AGG_PRESORTED_DISTINCT_* step: an input equal
+				// to one already seen in this group makes no transition call.
+				// Keyed like the buffered path's dedupe (datumKey per
+				// argument) and over the whole group, not just the previous
+				// row, so a mis-ordered input can only reorder calls.
+				var kb strings.Builder
+				for ai, d := range sfuncArgs[1:] {
+					if ai > 0 {
+						kb.WriteByte('\t')
+					}
+					kb.WriteString(datumKey(d))
+				}
+				k := kb.String()
+				if _, dup := st.presortedSeen[k]; dup {
+					st.hasValue = true
+					return nil
+				}
+				if st.presortedSeen == nil {
+					st.presortedSeen = map[string]struct{}{}
+				}
+				st.presortedSeen[k] = struct{}{}
 			}
 			newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
 			if sfuncRaised(serr) {
