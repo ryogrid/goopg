@@ -11677,7 +11677,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
     fires=none. Residue (view pull-up) filed as M0148-0001i1.
   Movement: yes — regress runner aggregates single-suite 209 → 208 diff lines (v_pagg_test hunk now differs only in view pull-up)
-- [ ] **M0148-0001k — inheritance/partition appendrel scans: per-member
+- [x] **M0148-0001k — inheritance/partition appendrel scans: per-member
   restriction pushdown and `<parent>_N` member aliases**.
   Kind: impl
   Parent: M0148-0001
@@ -11699,6 +11699,21 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     With the parent now claiming the bare alias, members print `t2_1` for
     `mc3p_default` where PG prints `t2_9` (partition\_prune). Resume:
     collectAllPartitionLeaves' order (planner.go) against PG's bound order.
+  - LANDED c0c648b80 (2026-11-03) — CLOSED: members carry the parent's
+    refname (`Seq Scan on minmaxtest1 minmaxtest_2`; inheritance Append
+    takes the parent RTID); a restriction filters at every member scan
+    (appendrel_pushdown.go, set_append_rel_size; moved, not copied); keys
+    above the Append name the parent (resolveKeySourceDepth declines the
+    first-branch chase for an inheritance/partition appendrel). Locking /
+    modifying plans keep the Append Filter — their EPQ recheck reads the
+    qual above the scan chain (isolation eval-plan-qual returned a removed
+    row when it moved). Design
+    docs/design/0100-0149/0148-0001k-appendrel-member-quals.md. Pin
+    TestExplainAppendRelMembers (mutation-checked). Gates on code_tree
+    4d6897878bca: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none. Residue filed as
+    M0148-0001k1.
+  Movement: yes — regress runner aggregates 9 → 8 hunks (208 → 193 lines), partition_join 5974 → 5801, partition_aggregate 1540 → 1473, tablesample 5 → 4 hunks; partition_prune 6382 → 6785 (no plan-time pruning)
 
 - [ ] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
   interleave) + group output order for `mode() within group`**.
@@ -11846,3 +11861,21 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   instead of Plan + Project. Measure: aggregates / create_view / rules /
   select_views regress runner HEAD vs change, and the TPC-H Q15 plan (view
   revenue0) on the fire-set.
+- [ ] **M0148-0001k1 — appendrel residue: EPQ-aware member quals, plan-time
+  partition pruning, member order**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001k (closed). (a) Locking / modifying plans (FOR
+  UPDATE/SHARE, UPDATE, DELETE, MERGE) keep the restriction on the Append:
+  lockRowsOp.findFilterPred and the DML EPQ rechecks read the qual above
+  the scan chain; teach them to recheck the member's own Filter, then drop
+  planTakesRowMarksOrModifies (appendrel_pushdown.go). (b) goopg scans
+  every partition: PG prunes at plan time (partprune.c
+  prune_append_rel_partitions / gen_partprune_steps), which is most of
+  partition_prune's 6785-line diff and the member numbering there. (c)
+  Member order: a partitioned table's DEFAULT partition expands first (PG:
+  PartitionDesc bound order, default last), and inheritance children came
+  back in a different order after a restart (InheritanceChildren reload
+  order; PG orders by inhseqno/child OID). Measure: partition_prune /
+  partition_join / inherit regress runner HEAD vs change, and isolation
+  eval-plan-qual for (a).
