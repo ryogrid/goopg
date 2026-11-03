@@ -5166,7 +5166,14 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
 			}
 		}
-		inner, err := Plan(tbl.View, cat)
+		// The view body is planned under the statement's own settings, as
+		// PG plans a view after the rewriter expands it into a subquery
+		// RTE (fireRIRrules): the session's planner GUCs — the parallel
+		// costs among them — reach the view's relations exactly as they
+		// reach the outer query's. Planning it under the defaults kept every
+		// view serial under `parallel_setup_cost = 0` (aggregates.sql
+		// v_pagg_test, M0148-0001i).
+		inner, err := PlanWithSettings(tbl.View, cat, ps)
 		if err != nil {
 			return nil, rangeBinding{}, err
 		}

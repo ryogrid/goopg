@@ -2497,6 +2497,13 @@ type aggRuntime struct {
 	// bytea mode's RAW bytes just as well as text mode's UTF-8 (finishAgg
 	// renders bytea through byteaOutMode at the end either way).
 	strAccum []byte
+	// strFirstDelim is the delimiter that came with string_agg's first
+	// unordered piece. PG's state keeps every piece's leading delimiter and
+	// skips the first only when finishing (string_agg_finalfn's cursor), so
+	// string_agg_combine joins two partial states with the SECOND state's
+	// first delimiter; strAccum drops it, so it is kept here for the
+	// combine phase (M0148-0001i).
+	strFirstDelim string
 	// arrayElems holds the accumulated element format-strings for
 	// array_agg(expr); arrayElemNull[i] marks element i as NULL
 	// (reserved — current applyAgg skips NULL inputs, so this is
@@ -4640,6 +4647,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 			}
 			if st.hasValue {
 				st.strAccum = append(st.strAccum, delimRaw...)
+			} else {
+				st.strFirstDelim = delimRaw
 			}
 			st.strAccum = append(st.strAccum, raw...)
 			st.hasValue = true
@@ -4668,6 +4677,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 		}
 		if st.hasValue {
 			st.strAccum = append(st.strAccum, delim...)
+		} else {
+			st.strFirstDelim = delim
 		}
 		st.strAccum = append(st.strAccum, sv...)
 		st.hasValue = true

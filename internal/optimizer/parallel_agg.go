@@ -63,9 +63,28 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 		"regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
 		"covar_pop", "covar_samp", "regr_r2", "regr_slope", "regr_intercept", "corr":
 		return true
+	case "array_agg":
+		// prepagg.c: array_agg_serialize/deserialize use the input type's
+		// send/receive, and RECORD is disclaimed (parse_agg.c
+		// agg_args_support_sendreceive: record_recv needs the anonymous
+		// record's typmod) — so an anonymous-record argument keeps the
+		// aggregate whole (aggregates.sql: array_agg over a subquery row).
+		if strings.EqualFold(call.InputType.Name, "record") {
+			return false
+		}
+		return true
+	case "string_agg":
+		// PG 18 gives both a combine function (array_agg_combine,
+		// array_agg_array_combine, string_agg_combine) and marks them
+		// PARALLEL SAFE, so an unordered, non-DISTINCT call splits; the
+		// combined result concatenates the partial states in the order the
+		// combine phase receives them, which PG documents as unspecified
+		// for an aggregate without ORDER BY (aggregates.sql's v_pagg_test
+		// plans Partial HashAggregate over string_agg/array_agg). The
+		// ORDER BY and DISTINCT forms were refused above. M0148-0001i.
+		return true
 	default:
-		// Includes array_agg and string_agg (order-dependent), the
-		// WITHIN GROUP ordered-set aggregates, and anything new.
+		// Includes the WITHIN GROUP ordered-set aggregates and anything new.
 		return false
 	}
 }

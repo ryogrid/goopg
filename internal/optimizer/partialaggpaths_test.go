@@ -244,7 +244,7 @@ func TestPartialAggRefusesWhenWorkerDuplicationSaturatesTheBoundary(t *testing.T
 // let alone split. Refusal is a nil tournament, not a losing candidate.
 func TestPartialAggRefusesNonDecomposableBeforePricing(t *testing.T) {
 	cases := map[string]func(*Aggregate){
-		"array_agg is not decomposable": func(a *Aggregate) { a.Aggs[0].Name = "array_agg" },
+		"percentile_cont can not split": func(a *Aggregate) { a.Aggs[0].Name = "percentile_cont" },
 		"DISTINCT is per-worker":        func(a *Aggregate) { a.Aggs[0].Distinct = true },
 		"internal ORDER BY is ordered":  func(a *Aggregate) { a.Aggs[0].OrderBy = []SortKey{{}} },
 		"a user aggregate has no combine": func(a *Aggregate) {

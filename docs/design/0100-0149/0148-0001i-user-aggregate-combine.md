@@ -1,8 +1,8 @@
 # M0148\-0001i — user\-defined aggregates split across Gather (COMBINEFUNC)
 
 **Parent:** M0148\-0001 `aggregates.sql` regress coverage closure · **Status:**
-slice 1 landed 2026\-11\-03 (the `balk` hunk); the task stays open for the
-`v_pagg_test` hunk
+slices 1\-2 landed 2026\-11\-03; closed (the view\-pull\-up residue of the
+`v_pagg_test` hunk moved to M0148\-0001i1)
 
 ## Target
 
@@ -83,11 +83,58 @@ goopg planned `Aggregate -> Index Only Scan`.
   - `TestSerialAggregateNeverCallsCombineFunc` — PG 18.3 returns 6
   - `TestAggregateIsDecomposableWhitelist` — user\-aggregate cases
 
-## Remaining
+## Slice 2 — `array_agg`/`string_agg` split; views planned under session settings
 
-- The `v_pagg_test` hunk (expected\-line ~1929): the view\-expanded
-  `string_agg`/`regexp_split` query. PG elects Finalize HashAggregate over
-  Parallel Seq Scan, and goopg also adds a top Sort; separate causes.
+`v_pagg_test` (expected\-line ~1929) aggregates `string_agg`/`array_agg` per
+`y` in a subquery, unnests the results, and re\-aggregates. PG plans
+`Finalize HashAggregate -> Gather -> Partial HashAggregate -> Parallel Seq
+Scan` for the inner aggregate. Two causes kept goopg serial:
+
+- **`array_agg`/`string_agg` were refused** as "order\-dependent", on the
+  claim that PG treats them as parallel\-restricted. That is wrong for PG 18:
+  both have combine functions (`array_agg_combine`,
+  `array_agg_array_combine`, `string_agg_combine`) and are PARALLEL SAFE.
+  - Their unordered, non\-DISTINCT forms are now decomposable.
+  - Combine follows PG. `string_agg` appends the second state *with* its
+    leading delimiter, kept as `strFirstDelim` because PG's state keeps the
+    first delimiter and skips it only in the final function. `array_agg`
+    concatenates the elements and their NULL flags; for array inputs the
+    dimensions must agree (2202E).
+  - Both states travel through the row transport.
+  - PG does not split `array_agg` over an anonymous RECORD argument
+    (parse\-agg.c `agg_args_support_sendreceive`), and neither does goopg.
+    goopg types a table's whole\-row reference as `record` too, so it also
+    keeps `array_agg(p)` over a named composite whole, where PG splits it
+    (ledger).
+- **Views were planned under the default settings.** `planScanRangeVar`
+  called `Plan(tbl.View, cat)`, so none of the session's planner GUCs,
+  `parallel_setup_cost = 0` among them, reached a view's body. It now calls
+  `PlanWithSettings(tbl.View, cat, ps)`, as PG plans a view after the
+  rewriter expands it into a subquery.
+
+Verification:
+
+- The inner aggregate of `v_pagg_test` now plans PG's split.
+- The aggregates single\-suite run goes from 209 to 208 diff lines (still 9
+  hunks).
+- create\_view, rules, select\_views, with, select\_parallel, matview,
+  groupingsets and create\_aggregate are byte\-identical against HEAD.
+- `TestPort_RegressSuite`, `TestPort_PgDump*` and `TestPort_Isolation*`
+  pass; the fire\-set shows no changed plan on any corpus.
+- Pins: `TestUnorderedStringArrayAggSplit` (split, multiset\-equal to
+  serial) and `TestStringArrayAggCombineAndTransport` (delimiter, NULL
+  flags, dimensions, round trip). The refusal pins now use the ORDER BY,
+  DISTINCT and ordered\-set forms.
+
+## Remaining (M0148\-0001i1)
+
+- The rest of the `v_pagg_test` hunk comes from goopg planning a view as an
+  opaque sub\-plan; PG pulls the view's subquery up into the outer query:
+  - a redundant top `Sort` for `order by y`, which the outer GroupAggregate
+    already provides;
+  - no `Result` node between the Sort and the ProjectSet;
+  - unqualified names (`Group Key: y`, not `pagg_test.y`);
+  - the sort key printed as `t`, not the cast expression.
 - **Pre\-existing:** an expression over a split aggregate's NullTest
   (`sum(hundred) IS NULL`) fails in the Finalize with
   `column ref … out of Slot range`, at HEAD for builtins too.

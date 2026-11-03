@@ -146,6 +146,47 @@ func combineAggRuntime(call optimizer.AggregateCall, dst, src *aggRuntime, ctx *
 		dst.regrSumXY += src.regrSumXY
 		dst.regrSumYY += src.regrSumYY
 
+	case "string_agg":
+		// string_agg_combine (varlena.c): an empty side takes the other's
+		// state; otherwise the second state is appended WITH its leading
+		// delimiter (the first piece's), which the state still carries.
+		if !src.hasValue {
+			break
+		}
+		if !dst.hasValue {
+			dst.strAccum = append([]byte(nil), src.strAccum...)
+			dst.strFirstDelim = src.strFirstDelim
+			dst.boolResult = src.boolResult
+			dst.hasValue = true
+			break
+		}
+		dst.strAccum = append(dst.strAccum, src.strFirstDelim...)
+		dst.strAccum = append(dst.strAccum, src.strAccum...)
+		dst.boolResult = dst.boolResult || src.boolResult
+
+	case "array_agg":
+		// array_agg_combine / array_agg_array_combine (array_userfuncs.c):
+		// the second state's elements follow the first's; for array inputs
+		// the dimensions must agree.
+		if !src.hasValue {
+			break
+		}
+		if !dst.hasValue {
+			dst.arrayElems = append([]string(nil), src.arrayElems...)
+			dst.arrayElemNull = append([]bool(nil), src.arrayElemNull...)
+			dst.arrayOfArrays = src.arrayOfArrays
+			dst.arrayShape = append([]int(nil), src.arrayShape...)
+			dst.hasValue = true
+			break
+		}
+		if dst.arrayOfArrays || src.arrayOfArrays {
+			if !sameArrayShape(dst.arrayShape, src.arrayShape) {
+				return &ExecError{Code: "2202E", Message: "cannot accumulate arrays of different dimensionality"}
+			}
+		}
+		dst.arrayElems = append(dst.arrayElems, src.arrayElems...)
+		dst.arrayElemNull = append(dst.arrayElemNull, src.arrayElemNull...)
+
 	default:
 		return fmt.Errorf("internal error: no combine rule for aggregate %q; "+
 			"aggregateIsDecomposable should have refused the parallel split", name)

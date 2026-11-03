@@ -13,6 +13,7 @@ package executor
 import (
 	"math"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -76,8 +77,8 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 		what string
 		call optimizer.AggregateCall
 	}{
-		{"array_agg (order-dependent)", optimizer.AggregateCall{Name: "array_agg"}},
-		{"string_agg (order-dependent)", optimizer.AggregateCall{Name: "string_agg"}},
+		{"array_agg with its own ORDER BY", optimizer.AggregateCall{Name: "array_agg", OrderBy: []optimizer.SortKey{{}}}},
+		{"string_agg DISTINCT", optimizer.AggregateCall{Name: "string_agg", Distinct: true}},
 		{"DISTINCT (needs global dedup)", optimizer.AggregateCall{Name: "count", Distinct: true}},
 		{"ORDER BY inside the aggregate", optimizer.AggregateCall{Name: "sum", OrderBy: []optimizer.SortKey{{}}}},
 		{"percentile_cont (WITHIN GROUP)", optimizer.AggregateCall{Name: "percentile_cont"}},
@@ -91,6 +92,14 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 	} {
 		if aggregateIsDecomposable(tc.call) {
 			t.Errorf("%s must NOT be decomposable", tc.what)
+		}
+	}
+
+	// M0148-0001i: unordered array_agg / string_agg split as in PG 18
+	// (array_agg_combine, string_agg_combine).
+	for _, name := range []string{"array_agg", "string_agg"} {
+		if !aggregateIsDecomposable(optimizer.AggregateCall{Name: name}) {
+			t.Errorf("unordered %s should be decomposable (PG 18 has a combine function)", name)
 		}
 	}
 
@@ -299,7 +308,59 @@ func TestCombineExactIntegerLane(t *testing.T) {
 // no combine rule must error rather than return a plausible wrong answer.
 func TestCombineRejectsUnknownAggregate(t *testing.T) {
 	var a, b aggRuntime
-	if err := combineAggRuntime(optimizer.AggregateCall{Name: "array_agg"}, &a, &b, nil); err == nil {
+	if err := combineAggRuntime(optimizer.AggregateCall{Name: "percentile_cont"}, &a, &b, nil); err == nil {
 		t.Error("an aggregate with no combine rule must error, not guess")
+	}
+}
+
+// string_agg_combine (varlena.c) appends the second partial state WITH its
+// leading delimiter — the first piece's own — and array_agg_combine
+// concatenates the elements and their NULL flags; both survive the row
+// transport unchanged (M0148-0001i).
+func TestStringArrayAggCombineAndTransport(t *testing.T) {
+	sa := optimizer.AggregateCall{Name: "string_agg"}
+	dst := aggRuntime{hasValue: true, strAccum: []byte("a,b"), strFirstDelim: ","}
+	src := aggRuntime{hasValue: true, strAccum: []byte("c|d"), strFirstDelim: "|"}
+	if err := combineAggRuntime(sa, &dst, &src, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(dst.strAccum); got != "a,b|c|d" {
+		t.Errorf("string_agg combine = %q, want %q (second state keeps its first delimiter)", got, "a,b|c|d")
+	}
+	var empty aggRuntime
+	if err := combineAggRuntime(sa, &empty, &src, nil); err != nil || string(empty.strAccum) != "c|d" || empty.strFirstDelim != "|" {
+		t.Errorf("string_agg into empty: %q/%q err %v", empty.strAccum, empty.strFirstDelim, err)
+	}
+	d, err := serializeAggRuntime("string_agg", &dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := deserializeAggRuntime("string_agg", d.BytesValue())
+	if err != nil || string(back.strAccum) != "a,b|c|d" || back.strFirstDelim != "," || !back.hasValue {
+		t.Errorf("string_agg round trip: %+v err %v", back, err)
+	}
+
+	aa := optimizer.AggregateCall{Name: "array_agg"}
+	adst := aggRuntime{hasValue: true, arrayElems: []string{"1", ""}, arrayElemNull: []bool{false, true}}
+	asrc := aggRuntime{hasValue: true, arrayElems: []string{"3"}, arrayElemNull: []bool{false}}
+	if err := combineAggRuntime(aa, &adst, &asrc, nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(adst.arrayElems, ",") != "1,,3" || len(adst.arrayElemNull) != 3 || !adst.arrayElemNull[1] {
+		t.Errorf("array_agg combine = %v / %v", adst.arrayElems, adst.arrayElemNull)
+	}
+	ad, err := serializeAggRuntime("array_agg", &adst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aback, err := deserializeAggRuntime("array_agg", ad.BytesValue())
+	if err != nil || strings.Join(aback.arrayElems, ",") != "1,,3" || !aback.arrayElemNull[1] || !aback.hasValue {
+		t.Errorf("array_agg round trip: %+v err %v", aback, err)
+	}
+	// array_agg over arrays: mismatched dimensions are PG's 2202E.
+	x := aggRuntime{hasValue: true, arrayOfArrays: true, arrayShape: []int{2}, arrayElems: []string{"{1,2}"}}
+	y := aggRuntime{hasValue: true, arrayOfArrays: true, arrayShape: []int{3}, arrayElems: []string{"{1,2,3}"}}
+	if err := combineAggRuntime(aa, &x, &y, nil); err == nil || !strings.Contains(err.Error(), "different dimensionality") {
+		t.Errorf("mismatched array_agg dims combined: %v", err)
 	}
 }
