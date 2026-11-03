@@ -5965,26 +5965,14 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 }
 
 func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
-	var rows [][]Expr
+	n := 0
 	if tbl.VirtualRows != nil {
-		raw := tbl.VirtualRows()
-		rows = make([][]Expr, len(raw))
-		for i, r := range raw {
-			cells := make([]Expr, len(tbl.Columns))
-			for j := range tbl.Columns {
-				if j < len(r) {
-					cells[j] = TypedVirtualCell(pos, r[j], tbl.Columns[j].Type.Name)
-				} else {
-					cells[j] = &NullConst{pos: pos}
-				}
-			}
-			rows[i] = cells
-		}
+		n = len(tbl.VirtualRows())
 	}
-	// VirtualSource is preserved so the executor can re-materialise
+	// VirtualSource is preserved so the executor re-materialises the
 	// rows at run time (the plan cache may otherwise serve a stale
-	// snapshot — see M0094-0005).
-	return &Values{pos: pos, Rows: rows, schema: schema, VirtualSource: tbl}
+	// snapshot — see M0094-0005); the plan keeps only their count.
+	return &Values{pos: pos, schema: schema, VirtualSource: tbl, VirtualRowCount: n}
 }
 
 // planStandaloneValuesSelect plans a standalone `VALUES (r1), (r2), ...` statement.

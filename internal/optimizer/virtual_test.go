@@ -9,9 +9,9 @@ import (
 
 // TestPlanSelectFromVirtualPgClass: a SELECT against pg_catalog.pg_class
 // should plan as Project(Filter(Values)) — the virtual table emits a
-// materialised Values node populated from the in-memory catalog
-// state at plan time, with the WHERE predicate and the projection
-// applied on top.
+// Values node that carries the catalog's row count at plan time (its
+// rows are materialised by the executor at Open), with the WHERE
+// predicate and the projection applied on top.
 //
 // pgbench probes `SELECT relkind FROM pg_catalog.pg_class WHERE
 // oid=$1::pg_catalog.regclass` to learn whether a relation is
@@ -42,8 +42,14 @@ func TestPlanSelectFromVirtualPgClass(t *testing.T) {
 	if !ok {
 		t.Fatalf("Filter.Child=%T want *Values", filt.Child)
 	}
-	if len(v.Rows) < 1 {
-		t.Errorf("rows=%d want ≥1 (at least the user table seeded)", len(v.Rows))
+	if v.RowCount() < 1 {
+		t.Errorf("rows=%d want ≥1 (at least the user table seeded)", v.RowCount())
+	}
+	// The executor re-materialises a virtual source at Open; the plan
+	// keeps only the count, so re-planning a catalog query does not
+	// build (and walk) one expression per catalog cell.
+	if v.Rows != nil {
+		t.Errorf("virtual Values carries %d plan-time rows; want none (count only)", len(v.Rows))
 	}
 	// Schema must list the four pg_class columns we expose so the
 	// WHERE/projection above can resolve them by name.

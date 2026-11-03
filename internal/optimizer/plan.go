@@ -2352,14 +2352,31 @@ func (n *Limit) Output() Schema { return n.Child.Output() }
 // by calling VirtualSource.VirtualRows() on Open so the cross-session
 // plan cache cannot serve a stale snapshot of a dynamic view
 // (M0094-0005).
+//
+// A virtual catalog's Values carries no plan-time Rows, only their count
+// (VirtualRowCount, for estimation): the executor never reads plan-time
+// cells of a VirtualSource, and building one constant expression per
+// catalog cell — then walking every one of them in each plan walker —
+// made re-planning a catalog query cost O(catalog size) after every DDL
+// (M-NIGHTLY regress/suite-wedge, `inherit`'s \d after DDL).
 type Values struct {
 	// M0146-0005dr: this node's query-level initPlan cost.
 	InitPlanCharge
 
-	pos           int
-	Rows          [][]Expr
-	schema        Schema
-	VirtualSource *catalog.Table
+	pos             int
+	Rows            [][]Expr
+	schema          Schema
+	VirtualSource   *catalog.Table
+	VirtualRowCount int
+}
+
+// RowCount is the number of rows the node produces as planned: the literal
+// rows, or a virtual catalog's row count at plan time.
+func (n *Values) RowCount() int {
+	if n.VirtualSource != nil && len(n.Rows) == 0 {
+		return n.VirtualRowCount
+	}
+	return len(n.Rows)
 }
 
 func (n *Values) Pos() int       { return n.pos }

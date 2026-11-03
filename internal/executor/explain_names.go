@@ -410,7 +410,7 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			}
 			cteWalked[key] = true
 		}
-		if v, ok := node.(*optimizer.Values); ok && len(v.Rows) > 1 {
+		if v, ok := node.(*optimizer.Values); ok && v.RowCount() > 1 {
 			valuesNodes = append(valuesNodes, node)
 		}
 		if base, ok := explainRelBaseName(node); ok {

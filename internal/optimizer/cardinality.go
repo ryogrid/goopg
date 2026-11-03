@@ -142,7 +142,7 @@ func EstimateRows(n Node) int64 {
 		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
 		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *Values:
-		return int64(len(x.Rows))
+		return int64(x.RowCount())
 	case *Filter:
 		child := EstimateRows(x.Child)
 		if child <= 0 {
