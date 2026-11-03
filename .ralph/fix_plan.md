@@ -11715,7 +11715,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     M0148-0001k1.
   Movement: yes — regress runner aggregates 9 → 8 hunks (208 → 193 lines), partition_join 5974 → 5801, partition_aggregate 1540 → 1473, tablesample 5 → 4 hunks; partition_prune 6382 → 6785 (no plan-time pruning)
 
-- [ ] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
+- [x] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
   interleave) + group output order for `mode() within group`**.
   Kind: impl
   Parent: M0148-0001
@@ -11726,6 +11726,40 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   GroupAggregate) vs goopg hash order. PG: `nodeAgg.c
   process_ordered_aggregate_single/multi` (tuplestore drain per agg per
   group). Verify hunks 2186, 2420.
+  - LANDED a4f88b4aa (2026-11-03) — CLOSED: a grouping with a DISTINCT /
+    ORDER BY / WITHIN GROUP aggregate is never hashed (groupingHashable =
+    PG numOrderedAggs == 0; sorted arms take the group-key order when no
+    presorted keys exist); the elected aggregate marks PG's aggpresorted
+    (AggregateCall.Presorted, markPresortedAggs — only when the winner's
+    input pathkeys carry group keys + the agg's sort list; also on the
+    winner's spec, which an ORDER BY above rebuilds) and applyAgg runs it
+    per row, a DISTINCT repeat skipped (NOTICE 1,1,3,3); the state-sharing
+    key covers all args and the ORDER BY clause (find_compatible_trans).
+    Design docs/design/0100-0149/0148-0001j-ordered-aggregate-strategy-and-presorted.md.
+    Pins TestOrderedSetAggregateGroupingIsNotHashed,
+    TestPresortedAggregatesAreMarked, TestSharedStateSlotSeparatesOrderBy,
+    executor TestPresortedUserAggTransitionOrder. Gates on code_tree
+    5cb5da4c30a4: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue filed
+    as M0148-0001j1.
+  Movement: yes — regress runner aggregates 605 → 567 lines (mode() group-order hunk and DISTINCT NOTICE-order hunk gone); 13 other suites byte-identical
+
+- [ ] **M0148-0001j1 — ordered aggregates under grouping sets run sorted;
+  DROP TYPE CASCADE drops dependent functions**.
+  Kind: impl
+  Parent: M0148-0001j
+  Residue of M0148-0001j. (1) PG never hashes a grouping with an ordered
+  aggregate, grouping sets included: `select ten, count(distinct s) from jt
+  group by rollup(ten)` plans `GroupAggregate  Group Key: ten  Group Key:
+  ()` over `Sort`; goopg plans `MixedAggregate` (no sorted grouping-sets
+  executor; groupingHashable's callers OR in GroupingSets). PG:
+  planner.c consider_groupingsets_paths / nodeAgg.c AGG_SORTED phases.
+  (2) `DROP TYPE avg_state CASCADE` leaves functions whose signature uses
+  the type (PG drops them with "drop cascades to function
+  avg_finalfn(avg_state)"); a re-CREATE then fails "function already
+  exists" and the stale function returns NULL. PG: dependency.c
+  (pg_depend type → proc). Resume: internal/executor DROP TYPE cascade
+  path (operators_ddl.go).
 - [ ] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
