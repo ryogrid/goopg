@@ -1454,14 +1454,54 @@ func (p *Pool) TruncateRelationTail(rel RelFileNode, keep BlockNumber) error {
 }
 
 func (p *Pool) InvalidateRel(rel RelFileNode) {
+	p.invalidateRel(rel, false)
+}
+
+// InvalidateRelForTruncate is InvalidateRel for a caller that holds the
+// relation exclusively (TRUNCATE's AccessExclusiveLock): a slot still pinned
+// can only be a transient pin — the bgwriter, the checkpointer, an
+// autovacuum pass — so, as PG's DropRelationBuffers → InvalidateBuffer does,
+// it waits for the pin to drop and discards the page instead of skipping it.
+// InvalidateRel keeps skipping pinned slots: its other callers (rewrites,
+// rollback, index builds) may hold a pin of their own.
+func (p *Pool) InvalidateRelForTruncate(rel RelFileNode) {
+	p.invalidateRel(rel, true)
+}
+
+func (p *Pool) invalidateRel(rel RelFileNode, waitPins bool) {
 	for i := range p.slots {
 		s := &p.slots[i]
-		st := s.state.Load()
 		if s.tag.Rel != rel {
 			continue
 		}
-		if statePin(st) > 0 {
-			continue
+		p.invalidateSlot(s, int32(i), func(t BufferTag) bool { return t.Rel == rel }, waitPins)
+	}
+}
+
+// invalidateWaitLimit bounds how long invalidateSlot waits for a pinned
+// slot to be released before giving up on it. PG's InvalidateBuffer waits
+// without bound (bufmgr.c: "this could be an infinite loop if the refcount
+// is messed up"); a goopg pin leak must not hang a TRUNCATE forever.
+var invalidateWaitLimit = 10 * time.Second
+
+// invalidateSlot is InvalidateBuffer (bufmgr.c) for one slot whose tag
+// matches: it retries until the slot is discarded, no longer holds a
+// matching page, or (in flight) has been told to discard. A pinned slot is
+// waited out when waitPins is set and skipped otherwise. The former
+// single-shot version also dropped a slot whose state CAS lost a race, so
+// a concurrent state change (usage-count bump, clock-sweep decrement) — or,
+// for TRUNCATE, a transient pin (bgwriter, checkpointer, autovacuum) — left
+// the truncated relation's dirty page valid under its old tag; once the
+// relation was re-extended past it, that page's eviction flush wrote a
+// block past the new end — "flush victim: write … blk 677: out of range
+// (nblocks=50)" in the 2026-11-03 nightly (AI-20261103-004134-005).
+func (p *Pool) invalidateSlot(s *Slot, idx int32, match func(BufferTag) bool, waitPins bool) {
+	var deadline time.Time
+	backoff := 10 * time.Microsecond
+	for {
+		st := s.state.Load()
+		if !match(s.tag) {
+			return
 		}
 		if stateIO(st) {
 			// In-flight eviction flush / pin-load of this relation's page.
@@ -1471,18 +1511,37 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 			// cleared valid+dirty, so the plain bit-clear below cannot reach
 			// the slot; bumping the generation instead makes the in-flight
 			// flush discard itself (see the claimGen check in evictVictim).
-			p.bumpSlotGen(s, st)
+			if p.bumpSlotGen(s, st) {
+				return
+			}
 			continue
 		}
 		if !stateValid(st) {
+			return
+		}
+		if statePin(st) > 0 {
+			if !waitPins {
+				return
+			}
+			// PG: "We assume the reason for it to be pinned is that ...
+			// someone else is flushing the page out. Wait for the IO to
+			// finish" and retry.
+			if deadline.IsZero() {
+				deadline = time.Now().Add(invalidateWaitLimit)
+			} else if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(backoff)
+			if backoff < time.Millisecond {
+				backoff *= 2
+			}
 			continue
 		}
-		// Try to atomically clear valid+dirty bits.
-		// We only clear if the slot is still valid+unpinned.
 		newSt := st &^ (slotValidBit | slotDirtyBit)
 		if s.state.CompareAndSwap(st, newSt) {
-			p.bmDelete(s.tag, int32(i))
+			p.bmDelete(s.tag, idx)
 			p.tombstones.Add(1)
+			return
 		}
 	}
 }
@@ -1490,42 +1549,24 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 // bumpSlotGen stamps a generation bump onto a slot observed in st, used to
 // signal in-flight claim holders (evictVictim/pin-load) that their page's
 // relation was invalidated underneath them. Best-effort CAS: a concurrent
-// state change means its owner already observed something newer.
-func (p *Pool) bumpSlotGen(s *Slot, st uint64) {
+// state change means its owner already observed something newer; callers
+// that must deliver the signal retry on false.
+func (p *Pool) bumpSlotGen(s *Slot, st uint64) bool {
 	g := stateGen(st)
 	newSt := (st &^ slotGenMask) | (uint64((g+1)&0x7FFF) << slotGenShift)
-	s.state.CompareAndSwap(st, newSt)
+	ok := s.state.CompareAndSwap(st, newSt)
 	p.traceSlotEvent(s.idx, evReleaseVictimSlot, s.tag, st, newSt)
+	return ok
 }
 
-// InvalidateBlock evicts the slot bound to tag if it exists and is unpinned.
+// InvalidateBlock evicts the slot bound to tag if it exists and is unpinned
+// (retrying a CAS that loses a race; an in-flight slot is told to discard).
 func (p *Pool) InvalidateBlock(tag BufferTag) {
 	slotIdx, _ := p.bm.Lookup(tag)
 	if slotIdx < 0 {
 		return
 	}
-	s := &p.slots[slotIdx]
-	st := s.state.Load()
-	if statePin(st) > 0 {
-		return
-	}
-	if stateIO(st) {
-		// In-flight eviction/pin-load of this exact tag: generation-bump so
-		// the in-flight flush discards (PG: DropRelationBuffers discards the
-		// dirty page; see the claimGen check in evictVictim).
-		if s.tag == tag {
-			p.bumpSlotGen(s, st)
-		}
-		return
-	}
-	if !stateValid(st) {
-		return
-	}
-	newSt := st &^ (slotValidBit | slotDirtyBit)
-	if s.state.CompareAndSwap(st, newSt) {
-		p.bmDelete(tag, slotIdx)
-		p.tombstones.Add(1)
-	}
+	p.invalidateSlot(&p.slots[slotIdx], slotIdx, func(t BufferTag) bool { return t == tag }, false)
 }
 
 // ErrNoBuffer is returned when every slot is pinned and the clock

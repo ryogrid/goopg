@@ -17813,7 +17813,11 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		sess.RecordTruncate(entry)
 	}
 
-	o.ctx.Pool.InvalidateRel(rel)
+	// AI-20261103-004134-005: TRUNCATE holds the relation exclusively, so a
+	// pinned buffer is a transient bgwriter/checkpointer/autovacuum pin —
+	// wait it out and discard the page (DropRelationBuffers), or its later
+	// eviction flush writes past the re-extended relation's end.
+	o.ctx.Pool.InvalidateRelForTruncate(rel)
 	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -17830,7 +17834,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	}
 	for _, idx := range idxs {
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		o.ctx.Pool.InvalidateRel(idxRel)
+		o.ctx.Pool.InvalidateRelForTruncate(idxRel)
 		if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}

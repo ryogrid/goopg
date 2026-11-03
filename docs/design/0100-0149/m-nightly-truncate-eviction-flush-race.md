@@ -335,3 +335,62 @@ count(*)) is the plan-width model's missing target pruning; TRUNCATE
 ROLLBACK does not undo the stats reset; `UPDATE pg_class SET reltuples=-1`
 does not persist the sentinel; TRUNCATE leaves index relstats untouched
 where PG gives every index a new relfilenode.
+
+## Follow\-up 4: a pinned or CAS\-racing slot survived the truncate (AI\-20261103\-004134\-005, 2026\-11\-03)
+
+The 2026\-11\-03 nightly failed with the same family of error:
+`flush victim: write …/base/5/16406 blk 677: out of range (nblocks=50)`. The
+generation signal above only covers a slot that is already in flight when
+TRUNCATE runs. Here the file had been re\-extended to 50 blocks, which means
+the stale page outlived the truncate as a **valid** buffer. `InvalidateRel`
+missed it in two ways:
+
+- **A pinned slot was skipped.** TRUNCATE holds AccessExclusiveLock, so the
+  only pins left are transient ones: the bgwriter or checkpointer flushing
+  the page, or an autovacuum pass.
+- **A lost CAS was dropped silently.** Any concurrent change to the slot's
+  state word lost the invalidation: a usage\-count bump, a clock\-sweep
+  decrement, or a pin coming and going.
+
+PG's `InvalidateBuffer` (bufmgr.c) handles both: on a pinned buffer it waits
+for the I/O and retries (`goto retry`), and it acts only under the buffer
+header lock.
+
+Change (`internal/storage/bufpool.go`):
+
+- `invalidateSlot` replaces the single\-shot body and retries until one of
+  three outcomes:
+  - the slot is discarded (valid and dirty cleared, bufmap entry removed);
+  - the slot no longer holds a matching page;
+  - the slot is in flight and has been told to discard. `bumpSlotGen` now
+    reports whether its CAS won, and a lost CAS is retried.
+- `InvalidateRelForTruncate` also **waits out a pin**, with exponential
+  backoff of 10 µs to 1 ms per poll and a 10 s bound. A goopg pin leak must
+  not hang TRUNCATE forever; PG's own loop is unbounded. TRUNCATE uses it
+  for the heap and its indexes (`truncateTableAndPartitions`).
+- `InvalidateRel` and `InvalidateBlock` keep skipping pinned slots but now
+  retry a lost CAS. Their other callers (rewrites, rollback, index builds)
+  may hold a pin of their own, and PG raises an error in that case
+  (`buffer is pinned in InvalidateBuffer`) — `TestInvalidateTreatsInFlightSlotAsPinned`
+  pins that contract.
+
+Test: `TestTruncateWaitsOutPinnedDirtyPage`.
+
+- A dirty page of the relation stays pinned while TRUNCATE runs, and the
+  holder dirties it again and releases it.
+- The relation is then re\-extended to 2 blocks, and every slot is cycled
+  through eviction.
+- With the wait removed, the test fails with
+  `flush victim: write …/7411 blk 5: out of range`, the nightly signature.
+- With the fix, it passes.
+
+Gates:
+
+- `go test -race ./internal/storage/`, the units gate, and the full
+  `stage-pgbench.sh` repro (PASS, 0 failed transactions).
+- TPC\-H spotcheck, TPC\-DS SF0.25, TPC\-H acceptance arm and fire\-set: no
+  change.
+
+Deferred (ledger): DROP (`rel_drop_storage.go`) and the rewrite paths still
+use the non\-waiting `InvalidateRel`; a transiently pinned dirty page of a
+dropped relation can still be flushed after the unlink.
