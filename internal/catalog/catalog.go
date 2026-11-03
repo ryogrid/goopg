@@ -13295,6 +13295,36 @@ func key(name parser.ObjectName) string {
 	return name.Schema + "." + name.Name
 }
 
+// lookupTableKeyLocked resolves name in ns the way LookupTable does and
+// returns the map key the relation actually lives under. A live session keys
+// an unqualified relation by its bare name while a restart's pg_class reload
+// keys it "public.<name>" (the lookupIndexLocked note), so a mutator that
+// deletes or re-keys by key(name) alone found the relation through
+// LookupTable yet missed its entry: after a restart, DROP VIEW of a view
+// created before it failed "view does not exist" while \dv still listed it
+// (M0148-0001c3b). Callers hold c.mu.
+func lookupTableKeyLocked(ns *tableNamespace, name parser.ObjectName) (*Table, string, bool) {
+	if t, ok := ns.tables[key(name)]; ok {
+		return t, key(name), true
+	}
+	if name.Schema == "" {
+		if t, ok := ns.tables["public."+name.Name]; ok {
+			return t, "public." + name.Name, true
+		}
+		return nil, "", false
+	}
+	if t, ok := ns.tables[name.Name]; ok {
+		tSchema := t.Schema
+		if tSchema == "" {
+			tSchema = "public"
+		}
+		if strings.EqualFold(tSchema, name.Schema) {
+			return t, name.Name, true
+		}
+	}
+	return nil, "", false
+}
+
 // LookupTable returns the table with the given name, or false when
 // the name doesn't resolve. Unqualified lookups fall back to the
 // `pg_catalog` schema so HammerDB's `SELECT FROM pg_indexes ...`
@@ -13550,11 +13580,10 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	oldK := key(old)
 	newK := key(new)
-	tbl, exists := ns.tables[oldK]
+	tbl, oldK, exists := lookupTableKeyLocked(ns, old)
 	if !exists {
-		return fmt.Errorf("relation %q does not exist", oldK)
+		return fmt.Errorf("relation %q does not exist", key(old))
 	}
 	if _, exists2 := ns.tables[newK]; exists2 {
 		// root-0031: report the BARE new relation name, not the schema-qualified
@@ -13755,13 +13784,12 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool, dbOid ...uint
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	t, ok := ns.tables[k]
+	t, k, ok := lookupTableKeyLocked(ns, name)
 	if !ok {
 		if ifExists {
 			return nil
 		}
-		return fmt.Errorf("view %q does not exist", k)
+		return fmt.Errorf("view %q does not exist", key(name))
 	}
 	if t.View == nil {
 		return fmt.Errorf("%q is not a view", k)
@@ -22536,10 +22564,9 @@ func (c *InMemory) DropTable(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	tbl, exists := ns.tables[k]
+	tbl, k, exists := lookupTableKeyLocked(ns, name)
 	if !exists {
-		return fmt.Errorf("relation %q does not exist", k)
+		return fmt.Errorf("relation %q does not exist", key(name))
 	}
 	if idxs, ok := ns.byTable[tbl.OID]; ok {
 		for idxKey := range idxs {
@@ -22644,10 +22671,11 @@ func (c *InMemory) DropIndex(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	idx, ok := ns.indexes[k]
+	// The key the index actually lives under (lookupIndexLocked: bare vs
+	// "public." across a restart), as for lookupTableKeyLocked.
+	idx, k, ok := c.lookupIndexLocked(name, resolveDBOid(dbOid))
 	if !ok {
-		return fmt.Errorf("index %q does not exist", k)
+		return fmt.Errorf("index %q does not exist", key(name))
 	}
 	delete(ns.indexes, k)
 	if idxs, ok := ns.byTable[idx.Table.OID]; ok {
