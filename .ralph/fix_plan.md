@@ -11831,6 +11831,12 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   expression-index columns (Columns[i]==""; RelationGetIndexAttrBitmap adds
   the expressions' Vars) — an update of a column used only inside an
   index expression may go HOT and leave the expression index stale.
+  (4) Seen while probing (2026-11-03, not yet reduced): after two server
+  restarts `DROP INDEX nt_y_part` on a partial index created before them
+  failed `index "nt_y_part" does not exist` while `CREATE INDEX nt_y_part`
+  failed `relation "public.nt_y_part" already exists` — reproduce on a
+  fresh cluster (create table + partial index, restart twice, DROP INDEX)
+  before fixing; PG drops it.
 - [ ] **M0148-0001g1 — pg_get_viewdef deparser breadth (pretty mode,
   joins, set operations, CTEs, coercions)**.
   Kind: impl
