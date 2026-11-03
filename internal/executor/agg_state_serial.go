@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // aggStateFieldBelt reports whether st carries any field outside the
@@ -328,4 +330,48 @@ func (r *byteReader) bigRat() *big.Rat {
 		return nil
 	}
 	return new(big.Rat).SetFrac(num, den)
+}
+
+// serializeAggCall is serializeAggRuntime keyed by the call: a user-defined
+// aggregate (CREATE AGGREGATE … COMBINEFUNC, M0148-0001i) ships its
+// transition-state Datum — PG ships a non-internal transition type as is,
+// and an internal one only through its SERIALFUNC, which the planner then
+// requires (optimizer.AggregateIsDecomposable) — plus hasValue and
+// userStateSet, the two flags the combine and finalize paths read.
+func serializeAggCall(call optimizer.AggregateCall, st *aggRuntime) (Datum, error) {
+	if call.UserAgg == nil {
+		return serializeAggRuntime(call.Name, st)
+	}
+	shadow := *st
+	shadow.userStateSet, shadow.userState = false, Datum{}
+	if err := aggStateFieldBelt(&shadow); err != nil {
+		return Datum{}, err
+	}
+	buf := []byte{boolByte(st.hasValue), boolByte(st.userStateSet)}
+	if st.userStateSet {
+		buf = encodeDatum(st.userState.MaterializeArena(), buf)
+	}
+	return NewBytesDatum(buf), nil
+}
+
+// deserializeAggCall is serializeAggCall's inverse.
+func deserializeAggCall(call optimizer.AggregateCall, data []byte) (aggRuntime, error) {
+	if call.UserAgg == nil {
+		return deserializeAggRuntime(call.Name, data)
+	}
+	var st aggRuntime
+	rd := &byteReader{data: data}
+	st.hasValue = rd.bool()
+	st.userStateSet = rd.bool()
+	if st.userStateSet {
+		st.userState = rd.datum()
+	}
+	if rd.err != nil {
+		return st, fmt.Errorf("internal error: truncated serialized state for aggregate %q: %v", call.Name, rd.err)
+	}
+	if rd.pos != len(data) {
+		return st, fmt.Errorf("internal error: %d trailing bytes in serialized state for aggregate %q",
+			len(data)-rd.pos, call.Name)
+	}
+	return st, nil
 }

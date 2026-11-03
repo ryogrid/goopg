@@ -83,12 +83,22 @@ func TestAggregateIsDecomposableWhitelist(t *testing.T) {
 		{"percentile_cont (WITHIN GROUP)", optimizer.AggregateCall{Name: "percentile_cont"}},
 		{"user aggregate without COMBINEFUNC", optimizer.AggregateCall{
 			Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f"}}},
-		{"user aggregate declaring COMBINEFUNC (no combine rule for user aggs)",
+		{"user aggregate with COMBINEFUNC but not PARALLEL SAFE (default unsafe)",
 			optimizer.AggregateCall{Name: "myagg", UserAgg: &catalog.UserAggregate{SFunc: "f", CombineFunc: "c"}}},
+		{"user aggregate with an internal state type and no SERIALFUNC",
+			optimizer.AggregateCall{Name: "myagg", UserAgg: &catalog.UserAggregate{
+				SFunc: "f", CombineFunc: "c", Parallel: "safe", SType: "internal"}}},
 	} {
 		if aggregateIsDecomposable(tc.call) {
 			t.Errorf("%s must NOT be decomposable", tc.what)
 		}
+	}
+
+	// M0148-0001i: a PARALLEL SAFE user aggregate with a COMBINEFUNC splits;
+	// combineUserAggState runs the COMBINEFUNC in the combine phase.
+	if !aggregateIsDecomposable(optimizer.AggregateCall{Name: "myagg", UserAgg: &catalog.UserAggregate{
+		SFunc: "f", CombineFunc: "c", Parallel: "safe", SType: "int8"}}) {
+		t.Error("a PARALLEL SAFE user aggregate with a COMBINEFUNC should be decomposable")
 	}
 
 	// The whitelist must refuse anything it does not know. applyAgg's default
@@ -132,7 +142,7 @@ func (h *aggHarness) run(values []Datum, parts int) (serial, combined Datum) {
 	}
 	acc := states[0]
 	for i := 1; i < parts; i++ {
-		if err := combineAggRuntime(h.name, &acc, &states[i], nil); err != nil {
+		if err := combineAggRuntime(optimizer.AggregateCall{Name: h.name}, &acc, &states[i], nil); err != nil {
 			h.t.Fatalf("%s combine: %v", h.name, err)
 		}
 	}
@@ -212,7 +222,7 @@ func TestCombineVarianceEmptyPartial(t *testing.T) {
 	before := withData
 
 	// empty into populated
-	if err := combineAggRuntime("var_pop", &withData, &empty, nil); err != nil {
+	if err := combineAggRuntime(optimizer.AggregateCall{Name: "var_pop"}, &withData, &empty, nil); err != nil {
 		t.Fatalf("combine empty into populated: %v", err)
 	}
 	if withData.count != before.count || math.IsNaN(withData.floatM2) {
@@ -221,7 +231,7 @@ func TestCombineVarianceEmptyPartial(t *testing.T) {
 
 	// populated into empty
 	var acc aggRuntime
-	if err := combineAggRuntime("var_pop", &acc, &before, nil); err != nil {
+	if err := combineAggRuntime(optimizer.AggregateCall{Name: "var_pop"}, &acc, &before, nil); err != nil {
 		t.Fatalf("combine populated into empty: %v", err)
 	}
 	if acc.count != before.count {
@@ -289,7 +299,7 @@ func TestCombineExactIntegerLane(t *testing.T) {
 // no combine rule must error rather than return a plausible wrong answer.
 func TestCombineRejectsUnknownAggregate(t *testing.T) {
 	var a, b aggRuntime
-	if err := combineAggRuntime("array_agg", &a, &b, nil); err == nil {
+	if err := combineAggRuntime(optimizer.AggregateCall{Name: "array_agg"}, &a, &b, nil); err == nil {
 		t.Error("an aggregate with no combine rule must error, not guess")
 	}
 }

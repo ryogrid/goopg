@@ -26030,6 +26030,19 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}
 	}
+	agg.Parallel = s.Parallel
+	agg.SerialFunc = s.SerialFunc
+	// COMBINEFUNC strictness: a user routine reports its own; a builtin
+	// combine function (int8pl, float8pl, int4larger, …) is strict, as every
+	// pg_proc.dat entry usable as aggcombinefn is.
+	if s.CombineFunc != "" {
+		agg.CombineFuncStrict = true
+		if rs := routineRegistry(o.ctx); rs != nil {
+			if candidates := rs.LookupByName(parser.ObjectName{Name: s.CombineFunc}); len(candidates) > 0 {
+				agg.CombineFuncStrict = candidates[0].Strict
+			}
+		}
+	}
 	// Check if the sfunc is STRICT by looking it up in the routine registry.
 	// A strict sfunc skips NULL inputs (the aggregate state is unchanged on NULL rows). M0097-0035.
 	if rs := routineRegistry(o.ctx); rs != nil && s.SFunc != "" {

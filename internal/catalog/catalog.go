@@ -3915,6 +3915,16 @@ type UserAggregate struct {
 	InitCond        string   // initial condition string (may be empty)
 	FinalFuncModify string   // FINALFUNC_MODIFY: "", "read_only", "shareable", "read_write" (DU-002 slice 405)
 	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
+	// Parallel is the PARALLEL option ("safe"/"restricted"/"unsafe"; "" =
+	// unsafe, PG's default proparallel for CREATE AGGREGATE).
+	Parallel string
+	// SerialFunc is SERIALFUNC (""): PG splits an aggregate whose state
+	// type is internal only when it can serialise the state.
+	SerialFunc string
+	// CombineFuncStrict reports whether COMBINEFUNC is STRICT: the combine
+	// phase then follows the strict-transition rules (skip NULL partials;
+	// adopt the first partial into a NULL initial state).
+	CombineFuncStrict bool
 	Variadic        bool     // true when declared with VARIADIC input arg
 	Owner           uint32   // pg_proc.proowner (role OID); 0 means "unset, defaults to bootstrap superuser" — see OwnerOrDefault. M0119-0004.
 	NamespaceOID    uint32   // pg_proc.pronamespace (schema OID); 0 means "unset, defaults to public" — see NamespaceOIDOrDefault. DU-002 slice 405 resume point (a).

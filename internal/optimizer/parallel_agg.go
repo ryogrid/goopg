@@ -38,15 +38,20 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 		// order, which parallel scans do not preserve.
 		return false
 	}
-	if call.UserAgg != nil {
-		// Never decomposable. goopg's combineAggRuntime has no rule to invoke
-		// a user combinefunc — it deep-merges the typed aggRuntime fields
-		// (count, intResult, floatSx, ...), not transition-state datums — so a
-		// user aggregate that declared COMBINEFUNC would still hit the
-		// combineAggRuntime default arm and error at combine time. Refuse
-		// fail-closed (M0134-0001 S10a); invoking the user combinefunc is a
-		// separate, deferred slice.
-		return false
+	if ua := call.UserAgg; ua != nil {
+		// A user aggregate splits as PG's can_partial_agg / get_agg_clause_costs
+		// allow (planner.c, clauses.c): it must declare a COMBINEFUNC, be
+		// PARALLEL SAFE (proparallel; unspecified means unsafe), and — with an
+		// internal state type — have a SERIALFUNC to ship the state. The
+		// executor combines the partial states by calling the COMBINEFUNC
+		// (combineUserAggState, M0148-0001i).
+		if ua.CombineFunc == "" || ua.Parallel != "safe" {
+			return false
+		}
+		if strings.EqualFold(ua.SType, "internal") && ua.SerialFunc == "" {
+			return false
+		}
+		return true
 	}
 
 	switch normalizeAggName(call.Name) {

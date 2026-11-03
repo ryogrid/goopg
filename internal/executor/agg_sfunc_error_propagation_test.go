@@ -128,12 +128,6 @@ func TestRaisingSFuncAbortsStatement(t *testing.T) {
 			wantMsg: "final boom 6",
 			preFix:  "NULL",
 		},
-		{
-			name:    "CombineFunc",
-			sql:     `SELECT p_csum(a) FROM raise_t`,
-			wantMsg: "combine boom",
-			preFix:  "6 (the un-combined partial state)",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cleanup := newRaisingAggFixture(t)
@@ -211,5 +205,24 @@ func TestMissingSFuncStillFallsThrough(t *testing.T) {
 	if got, _ := datumInt64(rows[0][0]); got != 6 {
 		t.Errorf("built-in sum = %d, want 6 — a built-in aggregate's finalization "+
 			"must not be affected by the user-defined error path", got)
+	}
+}
+
+// A serial aggregate never calls its COMBINEFUNC: PG runs the combine
+// function only in the combine phase of a split (Finalize) aggregate.
+// Measured on PG 18.3 (2026-11-03): `SELECT p_csum(a) FROM raise_t` plans as
+// a plain Aggregate over a Seq Scan and returns 6 — the raising p_comb is
+// never reached. This case used to sit in TestRaisingSFuncAbortsStatement
+// expecting "combine boom", which only goopg's former serial
+// COMBINEFUNC(NULL, state) call produced (removed in M0148-0001i).
+func TestSerialAggregateNeverCallsCombineFunc(t *testing.T) {
+	ctx, cleanup := newRaisingAggFixture(t)
+	defer cleanup()
+	rows, err := runQueryErr(t, ctx, `SELECT p_csum(a) FROM raise_t`)
+	if err != nil {
+		t.Fatalf("SELECT p_csum(a) FROM raise_t: %v; PG 18.3 returns 6 (no combine call in a serial plan)", err)
+	}
+	if got := strings.Join(renderRows(rows), ","); got != "6" {
+		t.Errorf("p_csum = %q, want 6 (PG 18.3)", got)
 	}
 }

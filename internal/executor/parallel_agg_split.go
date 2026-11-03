@@ -73,12 +73,24 @@ func newAggPartialAccum() *aggPartialAccum {
 // states is consumed by reference: the caller must not touch it afterwards.
 // That is safe because a Partial node merges its groups exactly once, at the
 // end of its own Open, and never reads them again.
-func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states []aggRuntime, aggs []optimizer.AggregateCall) error {
+func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states []aggRuntime, aggs []optimizer.AggregateCall, ctx *Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	dst, ok := a.groups[key]
 	if !ok {
+		// A user aggregate's combine state starts from INITCOND, and the
+		// first partial is combined into it (nodeAgg's combine phase), not
+		// adopted as the state.
+		for i := range aggs {
+			if i < len(states) && aggs[i].UserAgg != nil {
+				var init aggRuntime
+				if err := combineAggRuntime(aggs[i], &init, &states[i], ctx); err != nil {
+					return err
+				}
+				states[i] = init
+			}
+		}
 		// First worker to see this group owns it. groupValues and passthrough
 		// are functionally determined by the key, so whichever worker arrives
 		// first is as correct as any other.
@@ -94,7 +106,7 @@ func (a *aggPartialAccum) merge(key string, groupValues, passthrough Row, states
 		if i >= len(dst.states) || i >= len(states) {
 			break
 		}
-		if err := combineAggRuntime(aggs[i].Name, &dst.states[i], &states[i], aggs[i].Arg); err != nil {
+		if err := combineAggRuntime(aggs[i], &dst.states[i], &states[i], ctx); err != nil {
 			return err
 		}
 	}

@@ -1609,8 +1609,12 @@ func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
 				stmt.CombineFunc = strings.ToLower(valStr)
 			case "finalfunc_modify":
 				stmt.FinalFuncModify = strings.ToLower(valStr)
+			case "parallel":
+				stmt.Parallel = strings.ToLower(valStr)
+			case "serialfunc":
+				stmt.SerialFunc = strings.ToLower(valStr)
 			// Accepted but ignored options.
-			case "parallel", "sspace", "serialfunc", "deserialfunc",
+			case "sspace", "deserialfunc",
 				"mstype", "msfunc", "minvfunc", "mfinalfunc", "minitcond",
 				"sortop", "hypothetical", "mspace":
 				// ignore

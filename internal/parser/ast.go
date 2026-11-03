@@ -2185,6 +2185,8 @@ type CreateAggregateStmt struct {
 	CombineFunc     string // combine function name (for parallel aggregation)
 	InitCond        string // initial condition string (e.g. "0" or "{0,0}")
 	FinalFuncModify string // FINALFUNC_MODIFY: "read_only"/"shareable"/"read_write" (lower-cased, "" if unspecified)
+	Parallel        string // PARALLEL: "safe"/"restricted"/"unsafe" (lower-cased, "" if unspecified = unsafe)
+	SerialFunc      string // SERIALFUNC name ("" if unspecified)
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }

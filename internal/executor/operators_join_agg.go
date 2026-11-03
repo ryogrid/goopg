@@ -2562,6 +2562,9 @@ type aggRuntime struct {
 	// Initialized from initcond; updated by sfunc on each row.
 	userState    Datum
 	userStateSet bool // true once userState has been initialized
+	// userNoTrans is nodeAgg's noTransValue for the combine phase: the
+	// state came from a NULL INITCOND and no partial has been combined yet.
+	userNoTrans bool
 	// withinGroupElems accumulates per-row values for WITHIN GROUP (ORDER BY ...)
 	// ordered-set aggregates (percentile_cont, percentile_disc, rank, dense_rank, mode).
 	// Each entry is [sortKey0, sortKey1, ..., valueExpr]. M0097-0035.
@@ -3020,7 +3023,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			if gr == nil {
 				continue
 			}
-			if err := pub.merge(key, gr.groupValues, gr.passthroughVals, gr.aggs, o.plan.Aggs); err != nil {
+			if err := pub.merge(key, gr.groupValues, gr.passthroughVals, gr.aggs, o.plan.Aggs, o.ctx); err != nil {
 				return err
 			}
 		}
@@ -3444,7 +3447,7 @@ func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, orde
 		row = append(row, gr.groupValues...)
 		row = append(row, gr.passthroughVals...)
 		for i := range gr.aggs {
-			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i])
+			d, err := serializeAggCall(o.plan.Aggs[i], &gr.aggs[i])
 			if err != nil {
 				return err
 			}
@@ -3502,7 +3505,7 @@ func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
 		row = append(row, cur.groupValues...)
 		row = append(row, cur.passthroughVals...)
 		for i := range cur.aggs {
-			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i])
+			d, err := serializeAggCall(o.plan.Aggs[i], &cur.aggs[i])
 			if err != nil {
 				return err
 			}
@@ -3631,7 +3634,7 @@ func (o *aggregateOp) decodePartialStateRow(row Row) (*partialStateRow, error) {
 					"want serialized bytes", i, sd.Kind),
 			}
 		}
-		st, err := deserializeAggRuntime(o.plan.Aggs[i].Name, sd.BytesValue())
+		st, err := deserializeAggCall(o.plan.Aggs[i], sd.BytesValue())
 		if err != nil {
 			return nil, err
 		}
@@ -3677,7 +3680,7 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 		*order = append(*order, key)
 	}
 	for i := range dr.states {
-		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+		if err := combineAggRuntime(o.plan.Aggs[i], &gr.aggs[i], &dr.states[i], o.ctx); err != nil {
 			return err
 		}
 	}
@@ -3832,7 +3835,7 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 			curParts = dr.keyParts
 		}
 		for i := range dr.states {
-			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+			if err := combineAggRuntime(o.plan.Aggs[i], &cur.aggs[i], &dr.states[i], o.ctx); err != nil {
 				return err
 			}
 		}
@@ -5594,19 +5597,12 @@ func (o *aggregateOp) finishAgg(st *aggRuntime, call *optimizer.AggregateCall) (
 			return NullDatum, nil
 		}
 		state := st.userState
-		// Apply CombineFunc when defined: combinefunc(NULL, partial_state).
-		// Even in non-parallel mode, PG calls the combine function once to merge
-		// the NULL initial combine-state with the single partial state. A STRICT
-		// combinefunc with a NULL first arg returns NULL (the balk aggregate pattern). M0097-0122.
-		if ua.CombineFunc != "" {
-			combined, cerr := executeSFuncCall(ua.CombineFunc, []Datum{NullDatum, state}, o.ctx)
-			if sfuncRaised(cerr) {
-				return NullDatum, cerr
-			}
-			if cerr == nil {
-				state = combined
-			}
-		}
+		// No combine call here. PG runs the COMBINEFUNC only in the combine
+		// phase of a split (Finalize) aggregate — combineUserAggState — never
+		// in a serial plan. The former serial combinefunc(NULL, state) call
+		// (M0097-0122) imitated the parallel balk() result and turned every
+		// serial user aggregate with a strict COMBINEFUNC wrong (int8pl → 0
+		// for a 495000 sum).
 		if ua.FinalFunc == "" {
 			return state, nil
 		}
@@ -6399,6 +6395,27 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 		}
 	case "int2pl":
 		if len(args) == 2 {
+			a, _ := datumInt64(args[0])
+			b, _ := datumInt64(args[1])
+			return NewIntDatum(a + b), nil
+		}
+	case "int2_sum", "int4_sum":
+		// int2_sum/int4_sum(int8, int2/int4) → int8 (numeric.c): NOT strict —
+		// a NULL state takes the first non-NULL input; a NULL input keeps the
+		// state. Missing from this table, a CREATE AGGREGATE … SFUNC =
+		// int4_sum fell through as "not found" and returned INITCOND for every
+		// input (0 for a 495000 sum; M0148-0001i).
+		if len(args) == 2 {
+			if args[0].IsNull() {
+				if args[1].IsNull() {
+					return NullDatum, nil
+				}
+				b, _ := datumInt64(args[1])
+				return NewIntDatum(b), nil
+			}
+			if args[1].IsNull() {
+				return args[0], nil
+			}
 			a, _ := datumInt64(args[0])
 			b, _ := datumInt64(args[1])
 			return NewIntDatum(a + b), nil
