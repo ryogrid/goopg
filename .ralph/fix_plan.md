@@ -11913,7 +11913,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   print; measure `grep -c '^- *Output:'` across the 34 suites HEAD vs
   change. Display only — no plan or result change expected; run the TPC
   gates anyway.
-- [ ] **M0148-0001e1 — composite-index range quals as Index Cond (no
+- [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
   repeated Filter)**.
   Kind: impl
   Parent: M0148-0001
@@ -11939,6 +11939,41 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   Measure the regress movement (create\_index, btree\_index, select,
   aggregates, join, inherit) HEAD vs change and run the TPC gates (wrong
   results here are row-count regressions).
+  - LANDED a147188c6 (2026-11-03) — CLOSED (residue split): a
+    leading-column range on a composite btree records `local`
+    (restrictionRangeOnColumn), so no Filter repeats it — the executor's
+    strictness-aware composite padding (M0134-0001 S4) already made the
+    bound exact; a 52-query differential probe (index / bitmap / seq,
+    NULLs + duplicates, tuple AND blob key formats) is identical. VERBOSE
+    qualifies the index-column side (indexCondColumnPrefix; `Index Cond:
+    (btg.y < 0)`). Design
+    docs/design/0100-0149/0148-0001e1-composite-range-index-quals.md. Pin
+    TestRangeScanCompositeIndexDropsFilter (replaces ...KeepsFilter).
+    Gates on code_tree 8c5a94c41cfa: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none x3. Residue filed as M0148-0001e2.
+  Movement: yes — regress runner aggregates 459 → 443 (btg hunk gone; 10 → 9 hunks), subselect 2492 → 2488, join 17855 → 17853
+
+- [ ] **M0148-0001e2 — clauses on later index columns as per-tuple Index
+  Cond; ranges behind an equality prefix without the Filter recheck**.
+  Kind: impl
+  Parent: M0148-0001e1
+  Residue of M0148-0001e1. (1) `a < 3 AND b > 5` on (a, b, c, d) prints
+  `Index Cond: (a < 3)` + `Filter: (b > 5)`; PG prints `Index Cond: ((a <
+  3) AND (b > 5))` — every index-matchable clause is an index qual, the
+  non-boundary ones checked per index tuple (nbtree \_bt\_checkkeys,
+  build\_index\_paths' index\_clauses over all columns). Needs the
+  executor's index scans to evaluate extra scan keys against the index
+  tuple. (2) `a = 1 AND b > 5`: the bound behind an equality prefix keeps
+  its Filter recheck (restrictionRangeOnColumn pos > 0 records no
+  `local`) because the open-ended scan runs to the prefix's padded upper
+  bound, past entries whose b is NULL; PG's strict scan keys stop at
+  NULLs (\_bt\_first / required-key end-of-scan). (3) The legacy rule
+  path tryRangeIndexScan (planner.go) keeps its composite guard. Resume:
+  internal/executor/operators_index.go (scan-key check per entry),
+  internal/optimizer/pathindexrestrict.go, createplanindex.go. Verify with
+  the e1 differential probe extended to later-column clauses + regress
+  create\_index / btree\_index.
 
 - Pre-existing gate flakes recorded (NOT caused by 0001a/b — reproduced on
   the stashed clean HEAD under identical load):
