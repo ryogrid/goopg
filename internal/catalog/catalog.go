@@ -24224,6 +24224,19 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 	return ct
 }
 
+// AllCompositeTypes returns a snapshot of every registered composite type
+// (every database), in no particular order. M0148-0001j2: DROP TYPE's
+// dependency walk reaches composite-type attributes through it.
+func (c *InMemory) AllCompositeTypes() []*CompositeType {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*CompositeType, 0, len(c.compositeTypes))
+	for _, ct := range c.compositeTypes {
+		out = append(out, ct)
+	}
+	return out
+}
+
 // LookupCompositeType returns the OID-bearing metadata for a composite type, or
 // nil if no such type exists. DU-002 slice 242.
 func (c *InMemory) LookupCompositeType(name string, dbOid ...uint32) *CompositeType {
@@ -25825,6 +25838,9 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ..
 			continue
 		}
 		for _, col := range tbl.Columns {
+			if col.Dropped {
+				continue
+			}
 			if strings.ToLower(col.Type.Name) == nameKey || strings.ToLower(col.DeclaredTypeName) == nameKey {
 				dependentTables = append(dependentTables, tbl.Name)
 				break

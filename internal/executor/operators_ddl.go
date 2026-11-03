@@ -4339,6 +4339,21 @@ afterExistsCheck:
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// The relation is registered from here on, but its rollback entry is
+	// recorded only further down (before the heap sync). A statement that
+	// fails in between — the inline FOREIGN KEY type check, a constraint
+	// validation — must not strand the half-built table: PG's CREATE TABLE
+	// is undone with its transaction. Record the undo entry on that error
+	// path too. M0148-0001j2 (the stranded table blocked DROP TYPE in
+	// regress enum).
+	createUndoRecorded := false
+	defer func() {
+		if retErr != nil && !createUndoRecorded {
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+			}
+		}
+	}()
 	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
 	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
 	// role's own CREATE TABLE (including CREATE TEMP TABLE, which shares this
@@ -4629,6 +4644,7 @@ afterExistsCheck:
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
 			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
+	createUndoRecorded = true
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -27143,8 +27159,15 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 			fields[idx].Collation = cmd.Collation
 		}
 	}
-	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
-	// single-subcommand branches for the per-relation rationale).
+	o.replaceCompositeFields(cat, ct, fields)
+	return nil
+}
+
+// replaceCompositeFields installs a composite type's new attribute list: one
+// xmax-stamp of its pg_type / pg_class / pg_attribute rows and one re-sync
+// (see execAlterType's single-subcommand branches for the per-relation
+// rationale). Shared with DROP TYPE … CASCADE's attribute drop (M0148-0001j2).
+func (o *ddlOp) replaceCompositeFields(cat *catalog.InMemory, ct *catalog.CompositeType, fields []catalog.CompositeField) {
 	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
 		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
 		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
@@ -27153,9 +27176,8 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 	}
-	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
+	ct2 := cat.RegisterCompositeTypeWithFields(ct.Name, fields, o.ctx.CurrentDatabaseOid)
 	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
-	return nil
 }
 
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
@@ -27909,47 +27931,18 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
 		}
-		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
-		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
-		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
-			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.OID, o.ctx.Tx.XID)
-				// Also stamp the auto-generated array type row. DU-002 slice 251.
-				if d.ArrayOID != 0 {
-					deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.ArrayOID, o.ctx.Tx.XID)
-				}
-				// B2.1b: the domain's pg_constraint rows die with it.
-				for _, chk := range d.Checks {
-					deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
-				}
-				mirrorTypeCatalogFiles(o.ctx)
-				mirrorConstraintCatalogFiles(o.ctx)
+		// M0148-0001j2: a domain's dependents are found the way DROP TYPE
+		// finds them (findDependentObjects): columns of the domain (the
+		// COLUMN is dropped under CASCADE, not its table), composite
+		// attributes, domains over it, functions. RESTRICT is 2BP01.
+		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok {
+			if err := o.dropTypeDependents(strings.ToLower(name.Name), d.OID, d.ArrayOID, s.Cascade, s.Pos()); err != nil {
+				return err
 			}
-		}
-		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
-		// B2.1b: no bespoke WAL record — the heap deletes above ARE the
-		// journal (kind 120 retired).
-		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
-		if err == nil {
-			for _, tblName := range names {
-				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
-			}
+			o.dropDomainObject(cat, d)
 			continue
 		}
-		if err.Error() == "dependent objects" {
-			// names contains the tables blocking the drop.
-			depName := ""
-			if len(names) > 0 {
-				depName = names[0]
-			}
-			return &ExecError{
-				Code:    "2BP01",
-				Pos:     s.Pos(),
-				Message: fmt.Sprintf("cannot drop type %s because other objects depend on it", name.Name),
-				Detail:  fmt.Sprintf("table %s depends on type %s", depName, name.Name),
-				Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
-			}
-		}
+		err := fmt.Errorf("type %q does not exist", name.Name)
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", name.Name))
 			continue
@@ -27972,12 +27965,23 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
 func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	return o.dropColumn(tbl, act, only, false)
+}
+
+// dropColumn is ALTER TABLE … DROP COLUMN's body. fromDependency marks a
+// column removed by a dependency cascade (DROP TYPE / DROP DOMAIN …
+// CASCADE): PG deletes it through doDeletion → RemoveAttributeById, which
+// runs none of ATPrepDropColumn / ATExecDropColumn's user-command checks —
+// a typed table's column and an inherited column (each partition's and
+// child's own pg_depend row is reached separately) are dropped too.
+// M0148-0001j2.
+func (o *ddlOp) dropColumn(tbl *catalog.Table, act parser.AlterTableAction, only, fromDependency bool) error {
 	// M0134-0183: a typed table may not lose a column outside its defining
 	// composite type. First check in ATPrepDropColumn
 	// (postgres/src/backend/commands/tablecmds.c:9260-9263), which runs in
 	// PG's prep pass before ATExecDropColumn's checks below — precedes even
 	// the IF EXISTS / column-existence check. 42809, no errposition.
-	if tbl.OfTypeOID != 0 {
+	if tbl.OfTypeOID != 0 && !fromDependency {
 		return &ExecError{Code: "42809", Pos: 0, Message: "cannot drop column from typed table"}
 	}
 	// Find the column to drop.
@@ -28007,7 +28011,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	// live-hierarchy check keeps the guard off stale Inherited flags (a
 	// parent-side DROP COLUMN leaves the child flag set). PG emits no errposition
 	// here, so Pos is 0. 42P16.
-	if tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+	if !fromDependency && tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
 		return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot drop inherited column %q", act.ColumnName)}
 	}
 

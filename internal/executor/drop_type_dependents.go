@@ -37,14 +37,52 @@ import (
 // re-CREATE failed "function already exists" and the stale function
 // returned NULL.
 
+// M0148-0001j2 extends the walk to the remaining pg_depend edges a type
+// carries (heap_create_with_catalog / AddNewAttributeTuples,
+// DefineDomain's GenerateTypeDependencies):
+//
+//   - a table column of the type depends on it — object (pg_class, table
+//     OID, attnum), described `column x of table t`; CASCADE drops the
+//     column, not the table;
+//   - an attribute of a composite type is the same edge on the composite
+//     type's relation (`column p of composite type ct2`);
+//   - a domain depends NORMALLY on its base type, and is itself a type
+//     with its own array type and dependents (`type dct`), so the walk
+//     recurses through it.
+//
+// A column typed `t[]` depends on the array type, which is why PG reports
+// it as `column z of table tc depends on type t[]`.
+//
+// Siblings are ordered by object_address_comparator: OID descending, then
+// classId ascending (pg_type 1247 < pg_proc 1255 < pg_class 1259), then
+// objsubid ascending.
+
+const (
+	depClassType  = 1247 // pg_type
+	depClassProc  = 1255 // pg_proc
+	depClassClass = 1259 // pg_class
+)
+
 type typeDepNode struct {
-	kind     string // "type", "arraytype", "function", "aggregate", "table"
+	kind     string // "type", "arraytype", "domain", "function", "aggregate", "table", "column", "attribute"
 	oid      uint32
+	classID  uint32
+	subID    int
 	desc     string
 	routine  *catalog.Routine
 	agg      *catalog.UserAggregate
 	table    *catalog.Table
+	column   string                 // column / attribute name
+	comp     *catalog.CompositeType // attribute owner
+	domain   *catalog.Domain
 	internal bool
+	// Type-like nodes ("type", "domain", and their "arraytype"): the type's
+	// name and OIDs the dependents are matched against; elem links an array
+	// node to its element type node.
+	tname     string
+	tOID      uint32
+	tArrayOID uint32
+	elem      *typeDepNode
 }
 
 type typeDepTarget struct {
@@ -52,11 +90,52 @@ type typeDepTarget struct {
 	dependee *typeDepNode
 }
 
-// typeDependentObjects returns the objects DROP TYPE of the type (oid,
-// arrayOID, display name) must drop, in deletion order (dependents first),
-// each with the object it was reached from. The type itself and its array
-// type are not included.
-func typeDependentObjects(cat catalog.Catalog, typeName string, oid, arrayOID uint32) []typeDepTarget {
+// depTypeRef parses a type spelling (`public.ct`, `ct[]`, `varchar(5)`,
+// `"CT"`) to its bare lower-case name and array-ness.
+func depTypeRef(spelling string) (string, bool) {
+	s := strings.TrimSpace(spelling)
+	isArray := false
+	for strings.HasSuffix(s, "[]") {
+		s, isArray = strings.TrimSpace(strings.TrimSuffix(s, "[]")), true
+	}
+	if i := strings.IndexByte(s, '('); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	s = depTypeBaseName(s)
+	return strings.ToLower(strings.Trim(s, `"`)), isArray
+}
+
+// columnTypeRef is a column's declared type: the domain name when it was
+// declared over a domain (Type.Name then holds the resolved base type),
+// else its type.
+func columnTypeRef(col catalog.Column) (string, bool) {
+	if col.DeclaredTypeName != "" {
+		name, arr := depTypeRef(col.DeclaredTypeName)
+		return name, arr || col.Type.IsArray
+	}
+	name, arr := depTypeRef(col.Type.Name)
+	return name, arr || col.Type.IsArray
+}
+
+// relationDependencyDesc is getRelationDescription's kind word.
+func relationDependencyDesc(tbl *catalog.Table) string {
+	switch {
+	case tbl.ForeignServerName != "":
+		return "foreign table " + tbl.Name
+	case tbl.IsMatView:
+		return "materialized view " + tbl.Name
+	case tbl.View != nil:
+		return "view " + tbl.Name
+	default:
+		return "table " + tbl.Name
+	}
+}
+
+// typeDependentObjects returns the objects DROP TYPE / DROP DOMAIN of the
+// type (oid, arrayOID, display name) must drop, in deletion order
+// (dependents first), each with the object it was reached from. The type
+// itself and its array type are not included.
+func typeDependentObjects(cat catalog.Catalog, dbOid uint32, typeName string, oid, arrayOID uint32) []typeDepTarget {
 	im, ok := cat.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -66,37 +145,54 @@ func typeDependentObjects(cat catalog.Catalog, typeName string, oid, arrayOID ui
 		routines = rs.List()
 	}
 	aggs := im.ListUserAggregates()
+	tables := im.UserTableHandles(catalog.NamespaceDBOid(dbOid))
+	var comps []*catalog.CompositeType
+	for _, ct := range im.AllCompositeTypes() {
+		if im.LookupCompositeType(ct.Name, dbOid) == ct {
+			comps = append(comps, ct)
+		}
+	}
+	sort.Slice(comps, func(i, j int) bool { return comps[i].OID < comps[j].OID })
+	var domains []*catalog.Domain
+	for _, d := range im.AllDomains() {
+		if ld, ok := im.LookupDomain(d.Name, dbOid); ok && ld == d {
+			domains = append(domains, d)
+		}
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i].OID < domains[j].OID })
 
-	matches := func(t catalog.Type, tOID uint32, wantArray bool) bool {
+	// matches reports whether a reference (static type t / OID tOID) names
+	// the type-like node base (its array type when wantArray).
+	matches := func(base *typeDepNode, t catalog.Type, tOID uint32, wantArray bool) bool {
 		if tOID != 0 {
 			if wantArray {
-				return arrayOID != 0 && tOID == arrayOID
+				return base.tArrayOID != 0 && tOID == base.tArrayOID
 			}
-			return oid != 0 && tOID == oid
+			return base.tOID != 0 && tOID == base.tOID
 		}
 		name, isArray := depTypeBaseName(t.Name), t.IsArray
 		if strings.HasSuffix(name, "[]") {
 			name, isArray = strings.TrimSuffix(name, "[]"), true
-		} else if strings.HasPrefix(name, "_") && strings.EqualFold(name[1:], typeName) {
+		} else if strings.HasPrefix(name, "_") && strings.EqualFold(name[1:], base.tname) {
 			name, isArray = name[1:], true
 		}
-		return isArray == wantArray && strings.EqualFold(name, typeName)
+		return isArray == wantArray && strings.EqualFold(name, base.tname)
 	}
-	matchesName := func(name string, wantArray bool) bool {
-		isArray := strings.HasSuffix(name, "[]")
-		return isArray == wantArray && strings.EqualFold(depTypeBaseName(strings.TrimSuffix(name, "[]")), typeName)
+	matchesName := func(base *typeDepNode, spelling string, wantArray bool) bool {
+		name, isArray := depTypeRef(spelling)
+		return isArray == wantArray && name == strings.ToLower(base.tname)
 	}
-	routineUses := func(r *catalog.Routine, wantArray bool) bool {
+	routineUses := func(base *typeDepNode, r *catalog.Routine, wantArray bool) bool {
 		for i, t := range r.ArgTypes {
 			var tOID uint32
 			if i < len(r.ArgTypeOIDs) {
 				tOID = r.ArgTypeOIDs[i]
 			}
-			if matches(t, tOID, wantArray) {
+			if matches(base, t, tOID, wantArray) {
 				return true
 			}
 		}
-		return matches(r.ReturnType, r.ReturnTypeOID, wantArray)
+		return matches(base, r.ReturnType, r.ReturnTypeOID, wantArray)
 	}
 	aggResultType := func(a *catalog.UserAggregate) string {
 		if a.FinalFunc != "" {
@@ -113,18 +209,18 @@ func typeDependentObjects(cat catalog.Catalog, typeName string, oid, arrayOID ui
 		}
 		return a.SType
 	}
-	aggUses := func(a *catalog.UserAggregate, wantArray bool) bool {
+	aggUses := func(base *typeDepNode, a *catalog.UserAggregate, wantArray bool) bool {
 		for _, t := range a.ArgTypes {
-			if matchesName(t, wantArray) {
+			if matchesName(base, t, wantArray) {
 				return true
 			}
 		}
-		return matchesName(aggResultType(a), wantArray)
+		return matchesName(base, aggResultType(a), wantArray)
 	}
 
 	nodes := map[string]*typeDepNode{}
-	node := func(kind string, key uint32, mk func() *typeDepNode) *typeDepNode {
-		k := fmt.Sprintf("%s/%d", kind, key)
+	node := func(kind string, key uint32, sub int, mk func() *typeDepNode) *typeDepNode {
+		k := fmt.Sprintf("%s/%d/%d", kind, key, sub)
 		if n, ok := nodes[k]; ok {
 			return n
 		}
@@ -133,47 +229,114 @@ func typeDependentObjects(cat catalog.Catalog, typeName string, oid, arrayOID ui
 		return n
 	}
 	fnNode := func(r *catalog.Routine) *typeDepNode {
-		return node("function", r.OID, func() *typeDepNode {
-			return &typeDepNode{kind: "function", oid: r.OID, desc: "function " + routineDependencyDesc(r), routine: r}
+		return node("function", r.OID, 0, func() *typeDepNode {
+			return &typeDepNode{kind: "function", oid: r.OID, classID: depClassProc, desc: "function " + routineDependencyDesc(r), routine: r}
 		})
 	}
 	aggNode := func(a *catalog.UserAggregate) *typeDepNode {
-		return node("aggregate", a.OID, func() *typeDepNode {
-			return &typeDepNode{kind: "aggregate", oid: a.OID, desc: "function " + aggregateDependencyDesc(a), agg: a}
+		return node("aggregate", a.OID, 0, func() *typeDepNode {
+			return &typeDepNode{kind: "aggregate", oid: a.OID, classID: depClassProc, desc: "function " + aggregateDependencyDesc(a), agg: a}
 		})
 	}
-	root := &typeDepNode{kind: "type", oid: oid, desc: "type " + typeName}
-	arr := &typeDepNode{kind: "arraytype", oid: arrayOID, desc: "type " + typeName + "[]", internal: true}
+	arrayNode := func(base *typeDepNode) *typeDepNode {
+		return node("arraytype", base.tArrayOID, int(base.tOID), func() *typeDepNode {
+			return &typeDepNode{kind: "arraytype", oid: base.tArrayOID, classID: depClassType,
+				desc: "type " + base.tname + "[]", internal: true, tname: base.tname, elem: base}
+		})
+	}
+	root := &typeDepNode{kind: "type", oid: oid, classID: depClassType, desc: "type " + typeName,
+		tname: typeName, tOID: oid, tArrayOID: arrayOID}
 
 	dependents := func(n *typeDepNode) []*typeDepNode {
 		var out []*typeDepNode
 		switch n.kind {
-		case "type", "arraytype":
-			wantArray := n.kind == "arraytype"
-			if n.kind == "type" && (arrayOID != 0 || oid == 0) {
-				out = append(out, arr)
+		case "type", "domain", "arraytype":
+			base, wantArray := n, false
+			if n.kind == "arraytype" {
+				base, wantArray = n.elem, true
+			}
+			if !wantArray && (base.tArrayOID != 0 || base.tOID == 0) {
+				out = append(out, arrayNode(base))
 			}
 			for _, r := range routines {
-				if routineUses(r, wantArray) {
+				if routineUses(base, r, wantArray) {
 					out = append(out, fnNode(r))
 				}
 			}
 			for _, a := range aggs {
-				if aggUses(a, wantArray) {
+				if aggUses(base, a, wantArray) {
 					out = append(out, aggNode(a))
 				}
 			}
 			// A typed table (`CREATE TABLE … OF type`) depends on its
 			// type (heap_create_with_catalog records reloftype).
-			if !wantArray && oid != 0 {
-				for _, tbl := range im.AllTables() {
-					if tbl.OfTypeOID == oid {
+			if !wantArray && base.tOID != 0 {
+				for _, tbl := range tables {
+					if tbl.OfTypeOID == base.tOID {
 						tb := tbl
-						out = append(out, node("table", tb.OID, func() *typeDepNode {
-							return &typeDepNode{kind: "table", oid: tb.OID, desc: "table " + tb.Name, table: tb}
+						out = append(out, node("table", tb.OID, 0, func() *typeDepNode {
+							return &typeDepNode{kind: "table", oid: tb.OID, classID: depClassClass, desc: "table " + tb.Name, table: tb}
 						}))
 					}
 				}
+			}
+			// Columns of the type (AddNewAttributeTuples records each
+			// attribute's dependency on atttypid).
+			lname := strings.ToLower(base.tname)
+			for _, tbl := range tables {
+				if tbl.IsSequence {
+					continue
+				}
+				for ci, col := range tbl.Columns {
+					if col.Dropped {
+						continue
+					}
+					name, isArr := columnTypeRef(col)
+					if name != lname || isArr != wantArray {
+						continue
+					}
+					tb, cname, sub := tbl, col.Name, ci+1
+					out = append(out, node("column", tb.OID, sub, func() *typeDepNode {
+						return &typeDepNode{kind: "column", oid: tb.OID, classID: depClassClass, subID: sub,
+							desc: "column " + cname + " of " + relationDependencyDesc(tb), table: tb, column: cname}
+					}))
+				}
+			}
+			// Attributes of composite types (the composite type's
+			// relation carries the same per-attribute dependency).
+			for _, ct := range comps {
+				for fi, f := range ct.Fields {
+					if !matchesName(base, f.ColType, wantArray) {
+						continue
+					}
+					c, fname, sub := ct, f.Name, fi+1
+					out = append(out, node("attribute", c.RelOID, sub, func() *typeDepNode {
+						return &typeDepNode{kind: "attribute", oid: c.RelOID, classID: depClassClass, subID: sub,
+							desc: "column " + fname + " of composite type " + c.Name, comp: c, column: fname}
+					}))
+				}
+			}
+			// Domains over the type (GenerateTypeDependencies: a domain
+			// depends normally on its base type).
+			for _, d := range domains {
+				if d.OID == base.tOID {
+					continue
+				}
+				hit := false
+				if d.BaseOID != 0 && !d.Base.IsArray && !wantArray {
+					hit = d.BaseOID == base.tOID
+				} else {
+					name, isArr := depTypeRef(d.Base.Name)
+					hit = name == lname && (isArr || d.Base.IsArray) == wantArray
+				}
+				if !hit {
+					continue
+				}
+				dd := d
+				out = append(out, node("domain", dd.OID, 0, func() *typeDepNode {
+					return &typeDepNode{kind: "domain", oid: dd.OID, classID: depClassType, desc: "type " + dd.Name,
+						domain: dd, tname: dd.Name, tOID: dd.OID, tArrayOID: dd.ArrayOID}
+				}))
 			}
 		case "function":
 			name := n.routine.Name
@@ -186,7 +349,16 @@ func typeDependentObjects(cat catalog.Catalog, typeName string, oid, arrayOID ui
 				}
 			}
 		}
-		sort.SliceStable(out, func(i, j int) bool { return out[i].oid > out[j].oid })
+		sort.SliceStable(out, func(i, j int) bool {
+			a, b := out[i], out[j]
+			if a.oid != b.oid {
+				return a.oid > b.oid
+			}
+			if a.classID != b.classID {
+				return a.classID < b.classID
+			}
+			return a.subID < b.subID
+		})
 		return out
 	}
 
@@ -255,7 +427,7 @@ func dependencyTypeName(name string, isArray bool) string {
 // with a reportable dependent is 2BP01; CASCADE reports them (one NOTICE, or
 // a count with a DETAIL list) and drops them in deletion order.
 func (o *ddlOp) dropTypeDependents(typeName string, oid, arrayOID uint32, cascade bool, pos int) error {
-	targets := typeDependentObjects(o.ctx.Catalog, typeName, oid, arrayOID)
+	targets := typeDependentObjects(o.ctx.Catalog, o.ctx.CurrentDatabaseOid, typeName, oid, arrayOID)
 	var reported []typeDepTarget
 	for i := len(targets) - 1; i >= 0; i-- {
 		if !targets[i].node.internal {
@@ -297,6 +469,30 @@ func (o *ddlOp) dropTypeDependents(typeName string, oid, arrayOID uint32, cascad
 			if err := o.dropTableByRef(name, t.node.table, false); err != nil {
 				return err
 			}
+		case "column":
+			// The column, not its table (ATExecDropColumn via
+			// doDeletion's RemoveAttributeById). A table dropped earlier
+			// in this walk takes its columns with it.
+			tbl := t.node.table
+			if im == nil || !tableStillRegistered(im, o.ctx.CurrentDatabaseOid, tbl) {
+				continue
+			}
+			act := parser.AlterTableAction{Kind: parser.AlterTableDropColumn, ColumnName: t.node.column}
+			if err := o.dropColumn(tbl, act, false, true); err != nil {
+				return err
+			}
+		case "attribute":
+			if im == nil {
+				continue
+			}
+			if err := o.dropCompositeAttribute(im, t.node.comp, t.node.column); err != nil {
+				return err
+			}
+		case "domain":
+			if im == nil {
+				continue
+			}
+			o.dropDomainObject(im, t.node.domain)
 		case "function":
 			if rs == nil {
 				continue
@@ -309,4 +505,46 @@ func (o *ddlOp) dropTypeDependents(typeName string, oid, arrayOID uint32, cascad
 		}
 	}
 	return nil
+}
+
+// tableStillRegistered reports whether tbl is still a live relation of the
+// database (a cascade may have dropped it before reaching its column).
+func tableStillRegistered(im *catalog.InMemory, dbOid uint32, tbl *catalog.Table) bool {
+	for _, t := range im.UserTableHandles(catalog.NamespaceDBOid(dbOid)) {
+		if t == tbl {
+			return true
+		}
+	}
+	return false
+}
+
+// dropCompositeAttribute removes attribute name from composite type ct, as
+// ALTER TYPE … DROP ATTRIBUTE does (execAlterTypeAttrCmds' re-sync).
+func (o *ddlOp) dropCompositeAttribute(cat *catalog.InMemory, ct *catalog.CompositeType, name string) error {
+	fields := make([]catalog.CompositeField, 0, len(ct.Fields))
+	for _, f := range ct.Fields {
+		if !strings.EqualFold(f.Name, name) {
+			fields = append(fields, f)
+		}
+	}
+	o.replaceCompositeFields(cat, ct, fields)
+	return nil
+}
+
+// dropDomainObject removes a domain whose dependents are already gone: its
+// pg_type rows (the domain and its array) and CHECK constraint rows are
+// stamped deleted, then the catalog entry is removed.
+func (o *ddlOp) dropDomainObject(cat *catalog.InMemory, d *catalog.Domain) {
+	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.OID, o.ctx.Tx.XID)
+		if d.ArrayOID != 0 {
+			deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.ArrayOID, o.ctx.Tx.XID)
+		}
+		for _, chk := range d.Checks {
+			deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
+		}
+		mirrorTypeCatalogFiles(o.ctx)
+		mirrorConstraintCatalogFiles(o.ctx)
+	}
+	_, _ = cat.DropDomain(d.Name, true, false, o.ctx.CurrentDatabaseOid)
 }
