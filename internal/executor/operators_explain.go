@@ -687,10 +687,51 @@ func walkPlanFiltered(n optimizer.Node, indent int, rows *[]Row, opts parser.Exp
 		if lbl, ok := hashBuildChild(n, c); ok {
 			ci = emitHashNodeLine(rows, lbl, childIndent, c, showCosts, nil)
 		}
+		if srfNeedsResultAbove(c) {
+			ci = emitHashNodeLine(rows, "Result", ci, c, showCosts, nil)
+		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanFiltered(c, ci, rows, opts, nil, nil, reg)
 		restore()
 	}
+}
+
+// srfNeedsResultAbove reports whether the node printed for c is a
+// ProjectSet with an SRF inside an enclosing scalar expression — a cast of
+// each unnest element (`unnest(...)::integer`) or a wrapper
+// (`generate_series(1, n) % 4`). PG's split_pathtarget_at_srfs (tlist.c)
+// evaluates the bare SRF in the ProjectSet and the expression over it in a
+// Result above (aggregates.sql v_pagg_test: `Sort -> Result -> ProjectSet`);
+// goopg's ProjectSet evaluates both, so EXPLAIN synthesises that Result, as
+// it does the Hash node over a hash join's build side (M0148-0001i2).
+func srfNeedsResultAbove(c optimizer.Node) bool {
+	for c != nil {
+		switch w := c.(type) {
+		case *optimizer.Project:
+			c = w.Child
+			continue
+		case *optimizer.Filter:
+			c = w.Child
+			continue
+		case *optimizer.ProjectSet:
+			if len(w.Wrappers) > 0 {
+				return true
+			}
+			for _, u := range w.UnnestCols {
+				if u.ExplicitCast || u.Wrapped {
+					return true
+				}
+			}
+			for _, sc := range w.SrfCols {
+				if sc.Wrapped {
+					return true
+				}
+			}
+			return false
+		}
+		return false
+	}
+	return false
 }
 
 // hashBuildChild reports whether c is the input a hash join n builds its
@@ -1610,6 +1651,31 @@ func resolveKeySourceDepth(expr optimizer.Expr, node optimizer.Node, reg *subPla
 			}
 			return tc, true
 		case *optimizer.ProjectSet:
+			// M0148-0001i2: a column that is an unnest whose elements are
+			// cast lands on the Result PG plans above the ProjectSet
+			// (split_pathtarget_at_srfs): its targetlist entry is the cast
+			// over an OUTER_VAR into the ProjectSet's `unnest(...)`, so the
+			// key deparses as `(((unnest(ARR)))::integer)` — each non-Var
+			// referent parenthesised — with ARR's own columns chased into
+			// the ProjectSet's input (aggregates.sql v_pagg_test).
+			if ucol, ok := cur.(*optimizer.ColumnRef); ok && reg != nil {
+				for _, u := range n.UnnestCols {
+					if u.ColIdx != ucol.Index || !u.ExplicitCast || u.Wrapped || u.ArrExpr == nil {
+						continue
+					}
+					qualify := reg.names().qualify()
+					arr := u.ArrExpr
+					if chased, hit := chaseKeyExprColumns(arr, n.Child, reg, qualify); hit {
+						arr = chased
+					}
+					typ, tok := castTypeName(u.CastType, 0)
+					if !tok {
+						return nil, false
+					}
+					srf := "(unnest(" + formatExprQual(arr, reg, qualify) + "))"
+					return displayColumn(ucol, "(("+srf+")::"+typ+")", reg), true
+				}
+			}
 			// M0148-0001c slice (b): the SELECT-list SRF mode publishes one
 			// output column per SELECT target. An SrfCol slot's source is
 			// the SRF CALL ITSELF — PG's Sort Key over
@@ -7015,6 +7081,9 @@ func walkPlanAnalyzeFiltered(n optimizer.Node, indent int, rows *[]Row, opts par
 					*rows = append(*rows, Row{NewStringDatum(strings.Repeat(" ", ci*2) + line)})
 				}
 			}
+		}
+		if srfNeedsResultAbove(c) {
+			ci = emitHashNodeLine(rows, "Result", ci, c, showCostsA, hashInputStats(c, stats))
 		}
 		restore := reg.enterParamInner(n, c)
 		walkPlanAnalyzeFiltered(c, ci, rows, opts, stats, spStats, memoStats, hashStats, gatherLaunched, workerStats, nil, nil, 0, reg)

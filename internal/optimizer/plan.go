@@ -2547,6 +2547,11 @@ type UnnestCol struct {
 	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
 	// Wrapped: see SrfCol.Wrapped. M0118-0008.
 	Wrapped bool
+	// ExplicitCast marks a CastType the SQL wrote over the unnest that
+	// changes the element type (`unnest(a)::integer` over text[]) — PG
+	// evaluates it in a Result above the ProjectSet. A CastType inferred
+	// from the array's element type is not (M0148-0001i3).
+	ExplicitCast bool
 }
 
 // RegexpMatchesCol describes one regexp_matches(string, pattern[, flags])

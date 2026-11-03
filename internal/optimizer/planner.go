@@ -6971,6 +6971,29 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
 	}
 
+	// canonicalScalarTypeName folds a scalar type's spellings (int/integer/
+	// int4, bigint/int8, …) to one name; other names are lower-cased as is.
+	canonicalScalarTypeName := func(t string) string {
+		switch t = strings.ToLower(strings.TrimSpace(t)); t {
+		case "int", "integer":
+			return "int4"
+		case "bigint":
+			return "int8"
+		case "smallint":
+			return "int2"
+		case "real":
+			return "float4"
+		case "double precision", "float":
+			return "float8"
+		case "boolean":
+			return "bool"
+		case "decimal":
+			return "numeric"
+		case "character varying":
+			return "varchar"
+		}
+		return t
+	}
 	// Resolve unnest array args against ctx. M0097-0106.
 	// When no explicit cast is given, infer the element type from the array type
 	// so the executor produces correctly-typed elements (e.g. int4 not text). M0097-0035.
@@ -7010,7 +7033,20 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 				}
 			}
 		}
-		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType}
+		// M0148-0001i3: a cast the SQL wrote over the unnest that changes the
+		// element type is an expression over the SRF, which PG evaluates in a
+		// Result above the ProjectSet (split_pathtarget_at_srfs); the
+		// inferred element type, or a cast to the element's own type (a
+		// no-op coercion the parser drops), is not.
+		explicitCast := false
+		if u.castType != "" {
+			elem := strings.ToLower(exprType(arrResolved).Name)
+			for strings.HasSuffix(elem, "[]") {
+				elem = elem[:len(elem)-2]
+			}
+			explicitCast = canonicalScalarTypeName(u.castType) != canonicalScalarTypeName(elem)
+		}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType, ExplicitCast: explicitCast}
 	}
 
 	// Resolve regexp_matches args against ctx. M0122-0002.
