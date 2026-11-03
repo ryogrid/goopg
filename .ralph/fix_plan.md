@@ -11948,7 +11948,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     filed as M0148-0001f2.
   Movement: yes — regress runner aggregates 443 → 358 (unmatched PG Output lines 11 → 2; single-suite 5 → 2 hunks), inherit 3208 → 3192, subselect 2531 → 2518
 
-- [ ] **M0148-0001f2 — EXPLAIN VERBOSE Output: joins over subqueries and
+- [x] **M0148-0001f2 — EXPLAIN VERBOSE Output: joins over subqueries and
   aggregates; sort-input expressions; join-input tlists**.
   Kind: impl
   Parent: M0148-0001f1
@@ -11967,6 +11967,33 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   internal/executor/operators_explain.go explainOutputNames (join arm:
   resolve each output column through the child's projection, as
   explainAggProjectionOutput does for aggregates).
+  - LANDED b5779a59e (2026-11-04) — CLOSED (residue split): a subquery
+    column (SourceTableIdx 0) above a join deparses through the child plan
+    to the expression computing it (explainDeparseThroughChildren:
+    join side / pass-through / renaming Project → Aggregate, formatted in
+    the aggregate's own scope). Design
+    docs/design/0100-0149/0148-0001f2-output-through-subquery-tlists.md.
+    Pin TestExplainVerboseOutputThroughSubquery. Gates on code_tree
+    ce499308b9a0: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue filed
+    as M0148-0001f3.
+  Movement: yes — regress runner aggregates 48 → 31 (unmatched PG Output lines 2 → 0; single-suite: 1 hunk left, the v_pagg_test SRF Result)
+
+- [ ] **M0148-0001f3 — EXPLAIN VERBOSE Output: sort-input expressions,
+  join targetlists, Inner Unique**.
+  Kind: impl
+  Parent: M0148-0001f2
+  Residue of M0148-0001f2. (1) make\_sort\_input\_target evaluates a
+  non-volatile select-list expression below the Sort (`Output: c, (a *
+  2), a` on the scan, `((a * 2))` above); goopg evaluates it after the
+  Sort (plan shape). (2) Join inputs / joins carry columns not needed
+  above them (`Output: f1.a, f1.b, ft.b, …` vs PG `f1.a, ft.b, …`,
+  use\_physical\_tlist / build\_path\_tlist), some inner nodes print no
+  Output, `Inner Unique: true` missing — the bulk of join.sql's 361
+  unmatched PG Output lines. (3) 2026-11-02 ledger items: casts / typed
+  literals, SRF RTIDs, Result above an aggregate. Resume:
+  internal/executor/operators_explain.go explainOutputNames (join arm:
+  needed columns from the parent), optimizer sort-input target placement.
 - [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
   repeated Filter)**.
   Kind: impl
