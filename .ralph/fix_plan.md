@@ -1373,6 +1373,45 @@ heuristic stays live.)
     - what sets the continuous\-replay start on restart \(pg\_control redo vs the received end\);
     - whether the shutdown checkpoint's replay changes xid/clog state, so that row 2's xmin reads as not committed\.
 
+- [ ] **P0\-E24 — a partitioned table disappears after a server restart; its partitions survive as plain tables**
+  \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — a table and its routing are lost\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-04 \(S2, data loss\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing \(reproduced on a HEAD build, `406e379a4`\)\.
+  - Repro on a fresh cluster: `create table q (k int, v int) partition by range (k); create table q1 partition of
+    q for values from (0) to (10); insert into q values (1,2);` → restart → `select * from q` fails 42P01
+    `relation "q" does not exist`; `q1` still returns the row and `pg_class` shows only `q1` \(relkind `r`\)\.
+  - Cause \(read, not yet fixed\): internal/initdb/open.go loadUserTablesFromHeapForDB admits relkinds
+    `r m v S f` only — a partitioned parent \(relkind `p`\) is never re\-registered, and the partition's parent
+    link / bound \(pg\_inherits, relpartbound, pg\_partitioned\_table\) has nothing to attach to\.
+  - First step: admit relkind `p` in the reload and restore PartitionMethod / PartitionKey from
+    pg\_partitioned\_table, the partition bound from relpartbound and the parent link from pg\_inherits; prove with
+    a two\-restart test \(memory: JSON catalog cache retired — test with TWO restarts\)\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro returns PG's rows after
+    two restarts\)\.
+
+- [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
+  \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-04 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing\.
+  - Repro on a fresh cluster: `create type m as enum ('b','a'); create table em (v m); insert into em values
+    ('b'),('a');` → restart → `select v from em order by v` returns `a, b` \(PG: `b, a`, enum sort order\);
+    `insert into em values ('zzz')` succeeds \(PG: 22P02 invalid input value for enum m\);
+    `select pg_typeof(v) from em` is `text`\. `\\d em` still prints `m` because psql reads the pg\_attribute heap\.
+  - Cause \(read, not yet fixed\): loadUserTablesFromHeapForDB builds each column's Type with
+    `catalog.OIDToTypeName(atttypid)`, whose default arm returns `"text"` for any OID it does not know — every
+    user enum, composite, domain and range type\. A later catalog re\-sync of the table would then write
+    atttypid = text into the heap as well\.
+  - Also: DROP TYPE / DROP DOMAIN \(M0148\-0001j2\) cannot see such columns after a restart\.
+  - First step: resolve user type OIDs in the reload \(enum / composite / domain / range lookups by OID, after
+    those registries reload\) to their names, setting DeclaredTypeName \+ the base Type for a domain column as
+    CREATE TABLE does; prove with a two\-restart test per type kind\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro matches PG after two
+    restarts\)\.
+
 - [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: impl
   Parent: none
@@ -11784,7 +11823,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     fires=none x3. Residue filed as M0148-0001j2.
   Movement: yes — regress runner groupingsets 1653 → 1614, typed_table 135 → 133
 
-- [ ] **M0148-0001j2 — DROP TYPE: column / attribute / domain dependents,
+- [x] **M0148-0001j2 — DROP TYPE: column / attribute / domain dependents,
   OID order across catalogs; pg_proc array-arg OIDs**.
   Kind: impl
   Parent: M0148-0001j1
@@ -11805,6 +11844,45 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   internal/executor/drop_type_dependents.go typeDependentObjects; catalog
   OID allocation (routines vs relations); routine ArgTypeOIDs resolution
   at CREATE FUNCTION.
+  - LANDED 2026-11-04 in 05b02362f — CLOSED (residue split to
+    M0148-0001j3): item (1). The walk reaches table columns (also through
+    the array type), composite attributes and domains, recursing through
+    the domain, in object_address_comparator order. CASCADE drops columns
+    (dropColumn fromDependency: no typed-table/inherited guard), attributes
+    (shared replaceCompositeFields) and domains (dropDomainObject).
+    execDropDomain uses the same walk; DROP DOMAIN CASCADE used to drop
+    whole TABLES. Also fixed: a CREATE TABLE failing after registration
+    (inline FK type check) left the relation behind, even under ROLLBACK.
+    Design docs/design/0100-0149/0148-0001j2-drop-type-column-dependents.md.
+    Pin TestDropTypeColumnDependents. Live probes byte-identical to a
+    scratch PG. Gates on code_tree 43a470fd: units, RegressSuite + PgDump
+    + Isolation, spotcheck, sf025 99/99, acceptance, fire-set fires=none x3.
+  Movement: regress — 37-suite A/B: alter_table 3648→3623, domain 1752→1718, create_table 639→615, plpgsql 4009→4000, insert 1057→1055; enum unchanged; create_type 402→406 and privileges 3879→3925 on residue (routine OID order, missing type USAGE checks)
+- [ ] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
+  type USAGE privilege checks, DROP TYPE of a domain, composite-array
+  pg\_proc OIDs**.
+  Kind: impl
+  Parent: M0148-0001j2
+  Residue of M0148-0001j2 (items 2-5 carried over plus new findings).
+  (1) Routine OIDs come from a counter apart from relation/type OIDs, so a
+  mixed function/column/domain dependent list reports out of PG order
+  (regress create\_type myvarchar: PG lists the domain last; typed\_table
+  `persons, get_all_persons(), persons2`). (2) pg\_proc.proargtypes holds 0
+  for a composite-array argument (`st[]`). (3) `(s).total` on a composite
+  SQL-function parameter errors "applied to type unknown"; `CREATE TABLE …
+  OF t (name WITH OPTIONS …)` repeating a column is accepted (PG 42701).
+  (4) Grouping sets with no sorted rollup hash an ordered aggregate. (5)
+  NEW: type USAGE privilege checks are missing (aclcheck\_error\_type:
+  CREATE TABLE / ALTER TABLE ADD COLUMN / ALTER COLUMN TYPE / CREATE TYPE /
+  ALTER TYPE ADD ATTRIBUTE / CREATE DOMAIN / CREATE FUNCTION / CREATE
+  AGGREGATE / CREATE CAST / CREATE OPERATOR) — regress privileges creates
+  objects PG refuses, which then block `DROP DOMAIN priv_testdomain1`.
+  (6) NEW: `DROP TYPE <domain>` is accepted by PG (RemoveObjects over
+  pg\_type); goopg's execDropType does not resolve domains. (7) NEW: view
+  columns over the type depend through the `_RETURN` rule, not modelled.
+  Resume: catalog OID allocation (one counter for routines and relations,
+  as PG's GetNewOidWithIndex); executor type-reference resolution for an
+  aclcheck on USAGE (pg_type typacl); execDropType domain arm.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
