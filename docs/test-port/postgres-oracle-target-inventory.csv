@@ -1,6 +1,6 @@
 id,suite_id,kind,item_path,status,pass_required,deferred_to,rationale
 ,regress-sql,regress,postgres/src/test/regress/sql/advisory_lock.sql,pass,yes,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-,regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+,regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,pass,yes,-,M0148-0001: aggregates.sql closed by the M0148-0001a..k / c3 / e1 / f1 / f2 / i1 / i3 / j / j1 children and the typed text-literal labels (M0148-0001f3 slice); scripts/pg-regress-runner.sh aggregates: PASS (100% parity); TestPort_RegressSuite/aggregates: PASS
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_generic.sql,failed,no,-,"Sized M0134-0088 (2026-08-24); PARKED — needs CREATE LANGUAGE parser support/ALTER AGGREGATE registry unification/OWNER TO role-membership check/full text-search DDL family/FDW-SERVER duplicate guard, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,failed,no,-,"Sized M0134-0089 (2026-08-24); PARKED — needs pg_describe_object (entirely unimplemented), contsel/contjoinsel builtin registration, quoted ALTER OPERATOR SET option names, OWNER-check, already-set COMMUTATOR/NEGATOR collision guard, see deferral ledger"
 ,regress-sql,regress,postgres/src/test/regress/sql/alter_table.sql,failed,no,-,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

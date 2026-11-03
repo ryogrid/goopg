@@ -5190,6 +5190,13 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
 			args[i] = formatExprQual(a, reg, qualify)
+			// M0148-0001f3: a string literal is an unknown-type Const that
+			// parse analysis coerces to the parameter's type, and
+			// get_const_expr labels a text Const: `string_agg((x)::text,
+			// ','::text)`, `regexp_split_to_array(t, ','::text)`.
+			if sc, isStr := a.(*optimizer.StringConst); isStr && literalArgIsText(x, i) {
+				args[i] = "'" + strings.ReplaceAll(sc.Value, "'", "''") + "'::text"
+			}
 			// M0146-0005cn: a text-only function's string argument is
 			// coerced to text, and get_func_expr shows argument coercions
 			// (`substr((ca_zip)::text, 1, 5)`, `upper((ca_country)::text)`).
@@ -5865,6 +5872,72 @@ func formatLikeOpExpr(x *optimizer.BinaryOp, reg *subPlanReg, qualify bool) (str
 // through an implicit cast that EXPLAIN shows.
 var textOnlyFuncs = map[string]bool{
 	"substr": true, "substring": true, "upper": true, "lower": true, "initcap": true,
+}
+
+// literalArgIsText reports whether argument i of fc, a string literal,
+// resolves to a text parameter: every PG 18 built-in overload of fc's name
+// with fc's arity whose parameters accept the other arguments' known types
+// (polymorphic parameters accept anything; an argument of unknown static
+// type or another literal constrains nothing) declares text at i — the
+// candidate set func_select_candidate narrows to (parse_func.c). No
+// candidate, or candidates that disagree, leaves the literal unlabelled.
+func literalArgIsText(fc *optimizer.FuncCall, i int) bool {
+	sigs := catalog.BuiltinProcSignatures(fc.Name)
+	if len(sigs) == 0 {
+		return false
+	}
+	found := false
+	for _, sig := range sigs {
+		if len(sig) != len(fc.Args) {
+			continue
+		}
+		ok := true
+		for j, a := range fc.Args {
+			if j == i {
+				continue
+			}
+			if _, lit := a.(*optimizer.StringConst); lit {
+				continue
+			}
+			t, known := optimizer.ExprResultType(a)
+			if !known || t.Name == "" {
+				continue
+			}
+			if !procParamAccepts(sig[j], t) {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		if sig[i] != "text" {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+// procParamAccepts reports whether a pg_proc parameter typname accepts an
+// argument of static type t (exact type, or a polymorphic parameter).
+func procParamAccepts(param string, t catalog.Type) bool {
+	if strings.HasPrefix(param, "any") || param == "record" {
+		return true
+	}
+	want := param
+	isArr := strings.HasPrefix(param, "_")
+	if isArr {
+		want = param[1:]
+	}
+	if isArr != t.IsArray {
+		return false
+	}
+	a, b := catalog.TypeNameToOID(want), catalog.TypeNameToOID(t.Name)
+	if a != 0 && b != 0 {
+		return a == b
+	}
+	return strings.EqualFold(want, t.Name)
 }
 
 // stringTypeName classifies e's static type as "varchar", "bpchar" or
