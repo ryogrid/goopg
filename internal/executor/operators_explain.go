@@ -6371,11 +6371,98 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 	}
 	for i, c := range n.Output() {
 		if c.SourceTableIdx == 0 {
+			// A subquery output (no relation of its own): ruleutils deparses
+			// the OUTER/INNER Var through the child plan's targetlist down to
+			// the expression that computes it (M0148-0001f2).
+			if txt, ok := explainDeparseThroughChildren(n, i, reg, qualify); ok {
+				names[i] = txt
+			}
 			continue
 		}
 		names[i] = reg.names().columnIn(n, c.SourceTableIdx, c.Name, true)
 	}
 	return names
+}
+
+// explainDeparseThroughChildren is get_special_variable for an output
+// column that names no relation — a column of a subquery PG's
+// trivial_subqueryscan removed. It walks column idx of n down through joins
+// (the side holding it), pass-through nodes and renaming Projects to the
+// node that computes it; an Aggregate there yields its grouping expression or
+// aggregate call, deparsed and parenthesised when not a plain Var, as PG
+// prints `s2.s2, (sum((s1.s1 + s2.s2)))` above a lateral aggregate subquery
+// (aggregates.sql). Any other shape — a kept Subquery Scan (PG prints the
+// RTE alias there), an expression target, grouping sets — reports false.
+func explainDeparseThroughChildren(n optimizer.Node, idx int, reg *subPlanReg, qualify bool) (string, bool) {
+	for depth := 0; n != nil && idx >= 0 && depth < 64; depth++ {
+		switch p := n.(type) {
+		case *optimizer.Join:
+			if p.Left == nil || p.Right == nil {
+				return "", false
+			}
+			lw, rw := len(p.Left.Output()), len(p.Right.Output())
+			if len(p.Output()) != lw+rw {
+				return "", false
+			}
+			if idx < lw {
+				n = p.Left
+			} else {
+				n, idx = p.Right, idx-lw
+			}
+		case *optimizer.Sort:
+			n = p.Child
+		case *optimizer.IncrementalSort:
+			n = p.Child
+		case *optimizer.Limit:
+			n = p.Child
+		case *optimizer.Filter:
+			n = p.Child
+		case *optimizer.Materialize:
+			n = p.Child
+		case *optimizer.Gather:
+			n = p.Child
+		case *optimizer.GatherMerge:
+			n = p.Child
+		case *optimizer.Project:
+			if idx >= len(p.Targets) {
+				return "", false
+			}
+			cr, ok := p.Targets[idx].(*optimizer.ColumnRef)
+			if !ok {
+				return "", false
+			}
+			n, idx = p.Child, cr.Index
+		case *optimizer.Aggregate:
+			if p.GroupingSets != nil {
+				return "", false
+			}
+			out := p.Output()
+			if idx >= len(out) {
+				return "", false
+			}
+			col := &optimizer.ColumnRef{Index: idx, Name: out[idx].Name, Type: out[idx].Type, SourceTableIdx: out[idx].SourceTableIdx}
+			// The expression's column references belong to the
+			// Aggregate's own query level: resolve them there, not in the
+			// scope of the node whose Output line is being printed.
+			restore := reg.enter(p)
+			e, hit := aggOutputKeyExpr(col, p, reg, qualify)
+			txt := ""
+			if hit {
+				txt = partialAggPrefix(p, idx) + formatExprQual(e, reg, qualify)
+			}
+			restore()
+			if !hit {
+				return "", false
+			}
+			if _, isVar := e.(*optimizer.ColumnRef); !isVar {
+				txt = "(" + txt + ")"
+			}
+			return txt, true
+		default:
+			return "", false
+		}
+	}
+	return "", false
 }
 
 func schemaColumnNames(n optimizer.Node) []string {
