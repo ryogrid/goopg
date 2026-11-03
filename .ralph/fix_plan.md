@@ -11893,7 +11893,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   M-NIGHTLY AI-20261103-004134-003.) The rules and create_view suites
   are the measurement targets (most of their viewdef lines come through
   \d+, i.e. pretty mode). Measure with the regress runner HEAD vs change.
-- [ ] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node
+- [x] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node
   targetlists and remaining deparse gaps**.
   Kind: impl
   Parent: M0148-0001
@@ -11913,6 +11913,38 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   print; measure `grep -c '^- *Output:'` across the 34 suites HEAD vs
   change. Display only — no plan or result change expected; run the TPC
   gates anyway.
+  - LANDED 4b447b223 (2026-11-03) — CLOSED (residue split): a scan's
+    Output is the statement projection above it (explainScanProjectionOutput;
+    through Filters / Sort — resjunk keys — / Limit, only when the Project
+    is a PG targetlist up to the root); Append / Merge Append print no
+    Output (show_plan_tlist); appendrel member scans print the Append
+    columns the consumer reads (explainAppendMemberOutput, CP_EXACT_TLIST).
+    Design docs/design/0100-0149/0148-0001f1-explain-verbose-scan-tlists.md.
+    Pin TestExplainVerboseScanOutputTlist. Gates on code_tree
+    122eb355af61: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue
+    filed as M0148-0001f2.
+  Movement: yes — regress runner aggregates 443 → 358 (unmatched PG Output lines 11 → 2; single-suite 5 → 2 hunks), inherit 3208 → 3192, subselect 2531 → 2518
+
+- [ ] **M0148-0001f2 — EXPLAIN VERBOSE Output: joins over subqueries and
+  aggregates; sort-input expressions; join-input tlists**.
+  Kind: impl
+  Parent: M0148-0001f1
+  Residue of M0148-0001f1. (1) A join over a pulled-up subquery /
+  aggregate prints the subquery's column names (`Output: s1.s1, s2, sm`)
+  where PG deparses the referenced expressions (`s1.s1, s2.s2,
+  (sum((s1.s1 + s2.s2)))`) — aggregates.sql hunk 1 and the bulk of join's
+  361 unmatched PG Output lines; ruleutils resolves OUTER/INNER Vars
+  through the child plan's tlist (get_special_variable). (2)
+  make\_sort\_input\_target evaluates a non-volatile select-list
+  expression below the Sort (`Output: c, (a * 2), a` on the scan,
+  `((a * 2))` above); goopg computes it after the Sort (plan shape). (3)
+  Join inputs' physical vs projected tlists (use\_physical\_tlist) and the
+  missing `Inner Unique: true`. (4) 2026-11-02 ledger items: implicit casts
+  / typed literals, SRF RTIDs, Result above an aggregate. Resume:
+  internal/executor/operators_explain.go explainOutputNames (join arm:
+  resolve each output column through the child's projection, as
+  explainAggProjectionOutput does for aggregates).
 - [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
   repeated Filter)**.
   Kind: impl
