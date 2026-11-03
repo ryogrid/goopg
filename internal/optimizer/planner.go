@@ -250,7 +250,7 @@ func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet Planne
 	wrapAppendRelMembers(node)
 	// M0146-0005df: renumber RTIDs into PG's flattened range-table order
 	// while the SubqueryScan wrappers still mark the levels PG keeps.
-	renumberRTIDsFlatRtableOrder(node)
+	renumberRTIDsFlatRtableOrder(node, scope.pulledViews())
 	// M0146-0005dr: SS_charge_for_initplans — each query level's top node
 	// carries its initPlans' cost. Before the strip, while the Subquery Scan
 	// wrappers still mark the levels PG keeps; EXPLAIN's own inner
@@ -4104,6 +4104,13 @@ type rtableScope struct {
 	// its WHERE before the push: is_safe_append_member is decided on the
 	// member PG's pull-up saw, before set_append_rel_size pushes anything.
 	appendMemberOrigWhere map[*parser.SelectStmt]parser.Expr
+	// pulledViewRoots marks the planned root of each expanded view that
+	// carries no SubqueryScan level boundary (M0148-0001i1): PG either pulls
+	// such a view up — appending its range table after the parent's own
+	// entries (pull_up_simple_subquery) — or keeps it as a level of its
+	// own; either way its relations follow the parent level's in the flat
+	// range table, which renumberRTIDsFlatRtableOrder reproduces.
+	pulledViewRoots map[Node]bool
 }
 
 // recordAppendMemberOrigWhere notes member m's WHERE before a push.
@@ -4151,6 +4158,14 @@ func (s *rtableScope) Alloc() int32 {
 	id := s.next
 	s.next++
 	return id
+}
+
+// pulledViews is the pulledViewRoots set, nil-safe.
+func (s *rtableScope) pulledViews() map[Node]bool {
+	if s == nil {
+		return nil
+	}
+	return s.pulledViewRoots
 }
 
 // rtableScopeFrom returns the statement scope reachable from ctx by
@@ -5174,14 +5189,39 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
 			}
 		}
-		// The view body is planned under the statement's own settings, as
-		// PG plans a view after the rewriter expands it into a subquery
-		// RTE (fireRIRrules): the session's planner GUCs — the parallel
-		// costs among them — reach the view's relations exactly as they
-		// reach the outer query's. Planning it under the defaults kept every
-		// view serial under `parallel_setup_cost = 0` (aggregates.sql
-		// v_pagg_test, M0148-0001i).
-		inner, err := PlanWithSettings(tbl.View, cat, ps)
+		// M0148-0001i1: the rewriter's expansion (fireRIRrules). PG replaces
+		// a view reference by a subquery RTE holding the view's query, with
+		// the reference's refname (the alias, else the view's name) and the
+		// view's column names as its column aliases; the planner then plans
+		// it like any FROM subquery, in the statement's own range table
+		// (so EXPLAIN qualifies `pagg_test.y`) and with its pathkeys visible
+		// to the outer query (convert_subquery_pathkeys — no redundant top
+		// Sort over an ordered view, aggregates.sql v_pagg_test). The view
+		// body used to be planned as a separate statement under a renaming
+		// Project. The derived-table path also applies the statement's own
+		// planner settings (M0148-0001i). Views are not pulled up into the
+		// parent's join search here (pull_up_subqueries) — the view-owner
+		// privilege tagging below works on the planned subtree.
+		vrv := rv
+		vrv.Schema, vrv.Name = "", ""
+		vrv.Subquery = tbl.View
+		vrv.TableFunc = nil
+		vrv.TableSample = nil
+		vrv.Only = false
+		if vrv.Alias == "" {
+			vrv.Alias = strings.ToLower(tbl.Name)
+		}
+		cols := make([]string, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			cols[i] = c.Name
+		}
+		for i, c := range rv.Columns {
+			if i < len(cols) {
+				cols[i] = c
+			}
+		}
+		vrv.Columns = cols
+		node, vb, err := planSubqueryRangeVar(vrv, cat, sourceIdx, lateralCtx, ps, scope)
 		if err != nil {
 			return nil, rangeBinding{}, err
 		}
@@ -5192,55 +5232,22 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		// every scan's PrivilegeCheckRole unset. M0122-0008 (view-owner
 		// privilege gap).
 		if !(tbl.SecurityInvokerSet && tbl.SecurityInvoker) {
-			tagViewOwnerScans(inner, tbl.Owner)
+			tagViewOwnerScans(node, tbl.Owner)
 		}
-		innerSchema := inner.Output()
-		if len(innerSchema) != len(tbl.Columns) {
+		if _, kept := node.(*SubqueryScan); !kept && scope != nil {
+			if scope.pulledViewRoots == nil {
+				scope.pulledViewRoots = map[Node]bool{}
+			}
+			scope.pulledViewRoots[node] = true
+		}
+		if n := len(node.Output()); n != len(tbl.Columns) {
 			return nil, rangeBinding{}, &PlanError{
 				Pos:     rv.Pos(),
 				Code:    "42P10",
-				Message: fmt.Sprintf("view %q has %d columns but its body produces %d", tbl.QualifiedName(), len(tbl.Columns), len(innerSchema)),
+				Message: fmt.Sprintf("view %q has %d columns but its body produces %d", tbl.QualifiedName(), len(tbl.Columns), n),
 			}
 		}
-		// Rebuild the outer ctx schema using the view's column
-		// names but the inner plan's column types — types
-		// flow from the planned inner so downstream
-		// comparisons see the right type tag.
-		schema := make(Schema, len(tbl.Columns))
-		for i, c := range tbl.Columns {
-			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type, SourceTableIdx: b.sourceIdx}
-		}
-		ctx.schema = schema
-		// M0063-0001: wrap the inner plan in a Project that
-		// re-aliases columns to the view's catalog names. Without
-		// this rename, `inner.Output()` continues to expose the
-		// view body's target-list names (e.g. `l_suppkey`,
-		// `sum`), but the OUTER scope resolves columns against
-		// the view's catalog Table (`supplier_no`,
-		// `total_revenue`). Downstream re-resolution passes
-		// (M0063-0001's NLI Key Name re-bind, `reresolveJoinByName`,
-		// etc.) need `inner.Output()` to advertise the same names
-		// the outer scope resolved against — otherwise the
-		// re-bind fails to match and the original (incorrect)
-		// FROM-cumulative Index is left in place. Q15b's NLI
-		// of supplier-on-revenue0 was the canonical breakage.
-		targets := make([]Expr, len(tbl.Columns))
-		for i, c := range tbl.Columns {
-			targets[i] = &ColumnRef{
-				pos:   rv.Pos(),
-				Index: i,
-				Name:  c.Name,
-				Type:  innerSchema[i].Type,
-			}
-		}
-		renamed := &Project{
-			pos:           rv.Pos(),
-			Child:         inner,
-			Targets:       targets,
-			schema:        append(Schema(nil), schema...),
-			IsolatedScope: true,
-		}
-		return renamed, b, nil
+		return node, vb, nil
 	}
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil

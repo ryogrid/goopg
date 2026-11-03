@@ -41,7 +41,12 @@ import (
 //
 // RTID feeds only EXPLAIN's relation naming (explain_names.go), so the
 // renumbering changes no plan and no result.
-func renumberRTIDsFlatRtableOrder(root Node) {
+//
+// M0148-0001i1: pulledViews marks expanded views planned without a
+// SubqueryScan boundary. Their relations are a nested walk placed after the
+// level's own entries and before its kept subquery levels — where
+// pull_up_simple_subquery appends a pulled-up view's range table.
+func renumberRTIDsFlatRtableOrder(root Node, pulledViews map[Node]bool) {
 	if root == nil {
 		return
 	}
@@ -61,7 +66,7 @@ func renumberRTIDsFlatRtableOrder(root Node) {
 	var collectLevel func(top Node) (ids []int32, subs []Node)
 	collectLevel = func(top Node) (ids []int32, subs []Node) {
 		var own []int32
-		var kept []Node
+		var kept, pulled []Node
 		seen := map[Node]bool{}
 		var walk func(n Node)
 		walk = func(n Node) {
@@ -69,6 +74,10 @@ func renumberRTIDsFlatRtableOrder(root Node) {
 				return
 			}
 			seen[n] = true
+			if n != top && pulledViews[n] {
+				pulled = append(pulled, n)
+				return
+			}
 			if id := nodeRTID(n); id != 0 {
 				own = append(own, id)
 			}
@@ -142,6 +151,11 @@ func renumberRTIDsFlatRtableOrder(root Node) {
 		}
 		sort.SliceStable(own, func(i, j int) bool { return own[i] < own[j] })
 		ids = own
+		for _, p := range pulled {
+			pids, psubs := collectLevel(p)
+			ids = append(ids, pids...)
+			subs = append(subs, psubs...)
+		}
 		for _, k := range kept {
 			kids, ksubs := collectLevel(k)
 			ids = append(ids, kids...)
