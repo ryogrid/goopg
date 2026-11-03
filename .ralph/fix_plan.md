@@ -11744,7 +11744,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     as M0148-0001j1.
   Movement: yes — regress runner aggregates 605 → 567 lines (mode() group-order hunk and DISTINCT NOTICE-order hunk gone); 13 other suites byte-identical
 
-- [ ] **M0148-0001j1 — ordered aggregates under grouping sets run sorted;
+- [x] **M0148-0001j1 — ordered aggregates under grouping sets run sorted;
   DROP TYPE CASCADE drops dependent functions**.
   Kind: impl
   Parent: M0148-0001j
@@ -11760,6 +11760,43 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   exists" and the stale function returns NULL. PG: dependency.c
   (pg_depend type → proc). Resume: internal/executor DROP TYPE cascade
   path (operators_ddl.go).
+  - LANDED 41be0e3ca (2026-11-03) — CLOSED: the sorted-rollup arm admits
+    ordered aggregates with no Mixed path and groupingSetsHashable keeps
+    hashing only when no sorted rollup exists (rollup/cube/grouping sets
+    with count(distinct)/array_agg ORDER BY/mode() plan and return as PG);
+    drop_type_dependents.go rebuilds the pg_depend edges (functions,
+    array type internal, aggregates via their support functions not
+    stype, typed tables) and runs findDependentObjects' walk — 2BP01 with
+    PG's DETAIL under RESTRICT, reported + dropped under CASCADE (enum,
+    composite, range). Design
+    docs/design/0100-0149/0148-0001j1-sorted-grouping-sets-and-drop-type-dependents.md.
+    Pins TestGroupingSetsOrderedAggRunsSorted, TestDropTypeDependents.
+    Gates on code_tree d7155d26414d: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none x3. Residue filed as M0148-0001j2.
+  Movement: yes — regress runner groupingsets 1653 → 1614, typed_table 135 → 133
+
+- [ ] **M0148-0001j2 — DROP TYPE: column / attribute / domain dependents,
+  OID order across catalogs; pg_proc array-arg OIDs**.
+  Kind: impl
+  Parent: M0148-0001j1
+  Residue of M0148-0001j1. (1) findDependentObjects also reaches columns
+  of ordinary tables (`drop cascades to column x of table t`, the column
+  dropped), attributes of other composite types and domains over the type
+  — drop_type_dependents.go covers functions, aggregates and typed tables
+  only. (2) goopg's routine OIDs come from a counter apart from relation
+  OIDs, so a mixed table/function dependent list reports in a different
+  order (regress typed_table: PG `persons, get_all_persons(), persons2`).
+  (3) pg_proc.proargtypes holds 0 for a composite-array argument (`st[]`;
+  ArgTypeOIDs unresolved). (4) Seen while probing: a SQL function using
+  `(s).total` on a composite parameter errors "column notation .total
+  applied to type unknown"; `CREATE TABLE … OF t (name WITH OPTIONS …)`
+  repeating a column is accepted where PG raises 42701 (typed_table
+  persons4). (5) Grouping sets that form no sorted rollup still hash with
+  an ordered aggregate (PG sorts or errors). Resume:
+  internal/executor/drop_type_dependents.go typeDependentObjects; catalog
+  OID allocation (routines vs relations); routine ArgTypeOIDs resolution
+  at CREATE FUNCTION.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
