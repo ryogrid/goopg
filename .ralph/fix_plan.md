@@ -11868,7 +11868,9 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   expression-index columns (Columns[i]==""; RelationGetIndexAttrBitmap adds
   the expressions' Vars) — an update of a column used only inside an
   index expression may go HOT and leave the expression index stale.
-  (4) Seen while probing (2026-11-03, not yet reduced): after two server
+  (4) Seen while probing (2026-11-03; 2026-11-04: reproduced for views at
+  HEAD — create table + view, restart once, `DROP VIEW vv` → `view "vv"
+  does not exist` while \\dv still lists it): after two server
   restarts `DROP INDEX nt_y_part` on a partial index created before them
   failed `index "nt_y_part" does not exist` while `CREATE INDEX nt_y_part`
   failed `relation "public.nt_y_part" already exists` — reproduce on a
@@ -12042,7 +12044,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
   resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
   namespace regress runner HEAD vs change.
-- [ ] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
+- [x] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
   outer query (top Sort, Result node, unqualified names)**.
   Kind: impl
   Parent: M0148-0001
@@ -12059,6 +12061,36 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   instead of Plan + Project. Measure: aggregates / create_view / rules /
   select_views regress runner HEAD vs change, and the TPC-H Q15 plan (view
   revenue0) on the fire-set.
+  - LANDED 86cd7eff0 (2026-11-04) — CLOSED (residue split): a view
+    reference is expanded into a subquery RTE (fireRIRrules) and planned by
+    planSubqueryRangeVar — the outer query sees its ordering (no redundant
+    top Sort) and its relations are named in the statement's range table
+    (`Group Key: pagg_test.y`); an unwrapped view numbers after its level
+    (rtableScope.pulledViewRoots, renumberRTIDsFlatRtableOrder). View-owner
+    tagging unchanged. Design
+    docs/design/0100-0149/0148-0001i1-views-as-subquery-rtes.md. Pin
+    TestViewPlansAsSubqueryRTE. Gates on code_tree 23b569bd3aa3: units,
+    RegressSuite + PgDump + Isolation, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire-set fires=none x3 (Q15 unchanged). Residue filed as
+    M0148-0001i2.
+  Movement: yes — regress runner aggregates −6 lines (v_pagg_test top Sort and qualification gone), select_views 1503 → 1502
+
+- [ ] **M0148-0001i2 — simple views pulled up into the parent join search;
+  SRF-targetlist Result with the cast sort key**.
+  Kind: impl
+  Parent: M0148-0001i1
+  Residue of M0148-0001i1. (1) pull\_up\_subqueries flattens a simple,
+  non-security-barrier view into the parent's join search; goopg plans
+  the expanded view as a derived leaf (expandDerivedPullups runs on the
+  syntactic FROM list, before view expansion) — the view-owner
+  checkAsUser must travel with the pulled-up RTEs (tagViewOwnerScans works
+  on the planned subtree). (2) aggregates.sql v\_pagg\_test: PG evaluates
+  `unnest(...)::integer` in a `Result` above the `ProjectSet` and sorts by
+  the full expression (`Sort Key: pagg_test.y,
+  (((unnest(...)))::integer)`); goopg sorts by the subquery column `t`
+  with no Result. Resume: internal/optimizer/derivedpullup.go (admit
+  view RangeVars), the ProjectSet / SRF target placement in the subquery
+  planner.
 - [ ] **M0148-0001k1 — appendrel residue: EPQ-aware member quals, plan-time
   partition pruning, member order**.
   Kind: impl
