@@ -11760,7 +11760,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   exists" and the stale function returns NULL. PG: dependency.c
   (pg_depend type → proc). Resume: internal/executor DROP TYPE cascade
   path (operators_ddl.go).
-- [ ] **M0148-0001c3 — searched index paths take a NullTest as an index
+- [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
   Parent: M0148-0001c
@@ -11777,6 +11777,60 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
   aggregates, join) HEAD vs change before landing; no aggregates hunk depends
   on it, hence filed after the regress-closing M0148-0001 children.
+  - LANDED 0c056f9df (2026-11-03) — CLOSED (residue split): probing the
+    NullTest cases found partial indexes filed EVERY row after CREATE
+    INDEX — a partial UNIQUE index rejected rows outside its predicate and
+    ON CONFLICT treated them as conflicts. Now maintainUniqueIndexesForInsert,
+    the upsert maintenance, the unique checks and arbiterKey skip rows the
+    predicate rejects (ExecInsertIndexTuples); a restarted partial index
+    keeps its predicate (IndexPredicateExpr parses PredicateString); HOT is
+    refused on INCLUDE/predicate columns while the key-update classification
+    stays key-only (updateChangesIndexKeys; isolation
+    lock-update-traversal); the prover takes predtest.c's NullTest rules;
+    dropPartialIndexImpliedQuals removes predicate-implied quals over
+    index/IOS/single-index bitmap scans (not in locking/DML plans). Design
+    docs/design/0100-0149/0148-0001c3-partial-index-predicates.md. Pins
+    TestPartialUniqueIndexConstrainsOnlyAdmittedRows,
+    TestPartialIndexScanDropsImpliedQuals,
+    TestProvePartialIndexPredicateNullTest. Gates on code_tree
+    0007e7c6092a: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue:
+    M0148-0001c3a (NullTest index quals), M0148-0001c3b (IOS over partial
+    indexes, unanalysed partial-index size, expression columns in HOT).
+  Movement: none — correctness fix — no plan instrument (13-suite regress A/B byte-identical apart from join row-order noise; scratch-PG probe of partial unique/upsert/maintenance/restart now identical)
+
+- [ ] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
+  searched paths**.
+  Kind: impl
+  Parent: M0148-0001c3
+  PG's match\_clause\_to\_indexcol (indxpath.c) takes a NullTest on an
+  index column as an index clause (amsearchnulls): `WHERE x IS NOT NULL
+  ORDER BY x LIMIT 1` plans `Index Only Scan … Index Cond: (x IS NOT
+  NULL)`, `WHERE x IS NULL` `Index Cond: (x IS NULL)`, and `x IS NOT NULL
+  AND x < 5` `Index Cond: ((x IS NOT NULL) AND (x < 5))`; goopg keeps them
+  as `Filter:`. Needs: an indexPathClause NullTest kind on the restriction
+  / index-only / ordered producers (IS NULL only over an index with
+  NULL-keyed entries), selectivity (nulltestsel), the executor scan key
+  (SK_SEARCHNULL / SK_SEARCHNOTNULL over the NULLS-LAST btree range) and
+  Index Cond rendering in index-column order (PG orders indexquals by
+  indexcol, WHERE order within a column). Resume:
+  internal/optimizer/pathindexrestrict.go addOneRestrictionIndexPath,
+  createplanindex.go, executor operators_index.go,
+  operators_explain.go formatIndexCond.
+- [ ] **M0148-0001c3b — index-only scans over a proven partial index;
+  unanalysed partial-index size; expression columns block HOT**.
+  Kind: impl
+  Parent: M0148-0001c3
+  (1) indexCoversColumns (pathindexonly.go) refuses every partial index;
+  PG's check\_index\_only accepts a proven one and ignores the columns of
+  restrictions the predicate implies (`select y from nt where x is not null
+  and y < 10` → `Index Only Scan using nt_y_part`, `Index Cond: (y < 10)`).
+  (2) A never-analysed partial index's tuple count (PG reads the index's
+  own size; regress minmaxtest3i 0.14..74.79 vs goopg 0.15..86.21):
+  costindex.go estimateIndexGeometry. (3) hotUpdateEligible ignores
+  expression-index columns (Columns[i]==""; RelationGetIndexAttrBitmap adds
+  the expressions' Vars) — an update of a column used only inside an
+  index expression may go HOT and leave the expression index stale.
 - [ ] **M0148-0001g1 — pg_get_viewdef deparser breadth (pretty mode,
   joins, set operations, CTEs, coercions)**.
   Kind: impl
