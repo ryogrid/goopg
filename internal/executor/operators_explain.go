@@ -6303,6 +6303,17 @@ func explainOutputNames(n optimizer.Node, reg *subPlanReg) []string {
 		return names
 	}
 	qualify := reg.names().qualifyTlist()
+	// show_plan_tlist (explain.c): "The tlist of an Append isn't real
+	// helpful, so suppress it" — likewise MergeAppend (M0148-0001f1).
+	if so, ok := n.(*optimizer.SetOp); ok && setOpRendersAsAppend(so) {
+		return nil
+	}
+	if txt, ok := explainScanProjectionOutput(n, reg, qualify); ok {
+		return txt
+	}
+	if txt, ok := explainAppendMemberOutput(n, reg, qualify); ok {
+		return txt
+	}
 	// A Sort / Incremental Sort / Limit evaluates nothing: each output column
 	// is an OUTER_VAR into the child's targetlist, deparsed through it as
 	// get_special_variable does. Over an Aggregate that is the Agg's own
@@ -8632,6 +8643,266 @@ func partialAggPrefix(agg *optimizer.Aggregate, i int) string {
 		return "PARTIAL "
 	}
 	return ""
+}
+
+// explainScanProjectionOutput renders a scan's Output: from the statement's
+// projection when goopg keeps it in an EXPLAIN-invisible Project directly
+// above the scan (through the Filters that collapse into the scan's line).
+// PG folds that projection into the projection-capable scan — create_plan
+// hands the final targetlist to the scan (CP_EXACT_TLIST at the top level) —
+// so `select a from t` prints `Output: a`, not the table's every column, and
+// a sublink in the select list prints `(SubPlan 1)` there (M0148-0001f1).
+// Only the statement projection qualifies: a Project that is the plan root
+// or reaches it through pass-through nodes (Sort, Limit, Gather). goopg's
+// other Projects (appendrel tableoid / remap wrappers, narrowing) are not PG
+// targetlists, so ok is false for them and the schema names stand.
+func explainScanProjectionOutput(n optimizer.Node, reg *subPlanReg, qualify bool) ([]string, bool) {
+	switch n.(type) {
+	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan, *optimizer.BitmapHeapScan,
+		*optimizer.GenerateSeries, *optimizer.GenerateSubscripts, *optimizer.FromUnnest, *optimizer.UserSrfScan:
+	default:
+		return nil, false
+	}
+	nm := reg.names()
+	if nm == nil {
+		return nil, false
+	}
+	// Between the scan and the Project: the Filters that collapse into the
+	// scan's line, and Sort / Limit nodes, below which PG computes the same
+	// targetlist (plus each sort key the list lacks, as a resjunk entry).
+	var proj *optimizer.Project
+	var sortKeys []optimizer.Expr
+	for cur := n; proj == nil; {
+		p := nm.parent[nodePtr(cur)]
+		switch w := p.(type) {
+		case *optimizer.Filter:
+			cur = w
+			continue
+		case *optimizer.Limit:
+			cur = w
+			continue
+		case *optimizer.Sort:
+			for _, k := range w.Keys {
+				sortKeys = append(sortKeys, k.Expr)
+			}
+			cur = w
+			continue
+		case *optimizer.Project:
+			proj = w
+			continue
+		}
+		return nil, false
+	}
+	if len(proj.Targets) == 0 {
+		return nil, false
+	}
+	for up := optimizer.Node(proj); ; {
+		p, ok := nm.parent[nodePtr(up)]
+		if !ok || p == nil {
+			break
+		}
+		// The sort-input projection (make_sort_input_target) sits below
+		// the statement projection; both are PG targetlists.
+		_, isProj := p.(*optimizer.Project)
+		_, isFilter := p.(*optimizer.Filter)
+		if !isProj && !isFilter && explainPassThroughChild(p) == nil {
+			return nil, false
+		}
+		up = p
+	}
+	out := make([]string, len(proj.Targets))
+	for i, t := range proj.Targets {
+		out[i] = formatExprQual(t, reg, qualify)
+	}
+	for _, k := range sortKeys {
+		txt := formatExprQual(k, reg, qualify)
+		dup := false
+		for _, o := range out {
+			if o == txt {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, txt)
+		}
+	}
+	return out, true
+}
+
+// explainAppendMemberOutput renders the Output: of a scan that is a member
+// of a UNION ALL appendrel: only the columns the Append's consumer reads, as
+// create_append_plan builds each child with CP_EXACT_TLIST over the parent
+// rel's reltarget (`Parallel Seq Scan on public.tenk1 tenk1_1  Output:
+// tenk1_1.unique1` under `variance(unique1)`) — goopg's member scans keep
+// their whole schema, and the restriction pushed into a member is evaluated
+// on the scan, so its columns are not in the list (M0148-0001f1). The
+// consumer is the node above the outermost Append (through Filters, whose
+// columns it also needs): an Aggregate (grouping and aggregate expressions)
+// or the statement Project. Each needed Append column is translated down
+// through the member's wrapper Projects to the scan. ok is false for any
+// other shape, keeping the schema names.
+func explainAppendMemberOutput(n optimizer.Node, reg *subPlanReg, qualify bool) ([]string, bool) {
+	switch n.(type) {
+	case *optimizer.SeqScan, *optimizer.IndexScan, *optimizer.IndexOnlyScan, *optimizer.BitmapHeapScan:
+	default:
+		return nil, false
+	}
+	nm := reg.names()
+	if nm == nil {
+		return nil, false
+	}
+	// Up from the scan: member Filters, then the member's wrapper Projects
+	// (whose targets map Append columns to scan columns), then the Append
+	// chain.
+	var path []*optimizer.Project
+	cur := n
+	for {
+		p := nm.parent[nodePtr(cur)]
+		if f, ok := p.(*optimizer.Filter); ok {
+			cur = f
+			continue
+		}
+		if pr, ok := p.(*optimizer.Project); ok {
+			path = append(path, pr)
+			cur = pr
+			continue
+		}
+		break
+	}
+	so, ok := nm.parent[nodePtr(cur)].(*optimizer.SetOp)
+	if !ok || !setOpRendersAsAppend(so) {
+		return nil, false
+	}
+	top := so
+	for {
+		p, isSetOp := nm.parent[nodePtr(top)].(*optimizer.SetOp)
+		if !isSetOp || !setOpRendersAsAppend(p) {
+			break
+		}
+		top = p
+	}
+	width := len(top.Output())
+	var needed []int
+	seen := map[int]bool{}
+	note := func(e optimizer.Expr) {
+		if e == nil {
+			return
+		}
+		optimizer.WalkExprTree(e, func(x optimizer.Expr) {
+			if c, isCol := x.(*optimizer.ColumnRef); isCol && c.Index >= 0 && c.Index < width && !seen[c.Index] {
+				seen[c.Index] = true
+				needed = append(needed, c.Index)
+			}
+		})
+	}
+	consumer := nm.parent[nodePtr(top)]
+	for {
+		f, isFilter := consumer.(*optimizer.Filter)
+		if !isFilter {
+			break
+		}
+		note(f.Predicate)
+		consumer = nm.parent[nodePtr(f)]
+	}
+	switch c := consumer.(type) {
+	case *optimizer.Aggregate:
+		if c.GroupingSets != nil {
+			return nil, false
+		}
+		for _, g := range c.GroupExprs {
+			note(g)
+		}
+		for i := range c.Aggs {
+			a := &c.Aggs[i]
+			note(a.Arg)
+			note(a.Arg2)
+			for _, e := range a.ExtraArgs {
+				note(e)
+			}
+			note(a.Filter)
+			for _, k := range a.OrderBy {
+				note(k.Expr)
+			}
+			for _, k := range a.WithinGroupOrderBy {
+				note(k.Expr)
+			}
+		}
+		for _, e := range c.Passthrough {
+			note(e)
+		}
+	case *optimizer.Project:
+		for _, t := range c.Targets {
+			note(t)
+		}
+	case nil:
+		// The Append is the plan root: its whole output is the result.
+		for k := 0; k < width; k++ {
+			note(&optimizer.ColumnRef{Index: k})
+		}
+	default:
+		return nil, false
+	}
+	if len(needed) == 0 {
+		return nil, false
+	}
+	out := make([]string, 0, len(needed))
+	for _, k := range needed {
+		var e optimizer.Expr = &optimizer.ColumnRef{Index: k}
+		// Outermost member Project first (path was collected bottom-up):
+		// each level's targets replace the references into its output.
+		for i := len(path) - 1; i >= 0; i-- {
+			targets := path[i].Targets
+			bad := false
+			e2, cok := optimizer.CloneExprReplacingColumnRefs(e, func(c *optimizer.ColumnRef) optimizer.Expr {
+				if c.Index < 0 || c.Index >= len(targets) {
+					bad = true
+					return c
+				}
+				return targets[c.Index]
+			})
+			if !cok || bad {
+				return nil, false
+			}
+			e = e2
+		}
+		// goopg's UNION type unification can wrap a branch column in a cast
+		// to its own type; PG adds no such node.
+		if c, isCast := e.(*optimizer.CastExpr); isCast {
+			if col, isCol := c.Operand.(*optimizer.ColumnRef); isCol && strings.EqualFold(col.Type.Name, c.TargetType) && !col.Type.IsArray {
+				e = col
+			}
+		}
+		col, isCol := e.(*optimizer.ColumnRef)
+		if !isCol {
+			// A member's own select-list expression (`select a + 1 from
+			// t1 union all …`) is computed by the member scan.
+			if len(path) == 0 || exprIsConstLike(e) {
+				return nil, false
+			}
+			out = append(out, formatExprQual(e, reg, qualify))
+			continue
+		}
+		if len(path) == 0 {
+			sch := n.Output()
+			if col.Index >= len(sch) {
+				return nil, false
+			}
+			col = &optimizer.ColumnRef{Index: col.Index, Name: sch[col.Index].Name, Type: sch[col.Index].Type, SourceTableIdx: sch[col.Index].SourceTableIdx}
+		}
+		out = append(out, formatExprQual(col, reg, qualify))
+	}
+	return out, true
+}
+
+// exprIsConstLike reports a constant target — goopg's substituted tableoid
+// and narrowing placeholders, which are not PG targetlist entries.
+func exprIsConstLike(e optimizer.Expr) bool {
+	switch e.(type) {
+	case *optimizer.IntegerConst, *optimizer.StringConst, *optimizer.NullConst, *optimizer.BooleanConst, *optimizer.NumericConst:
+		return true
+	}
+	return false
 }
 
 // explainAggProjectionOutput renders the Output: of an Aggregate, or of a

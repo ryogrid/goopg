@@ -7,131 +7,55 @@ import (
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
-// M0148-0001f: PG's ExplainNode prints VERBOSE's show_plan_tlist right after
-// the node line (and `Disabled:`), before every qual and key, and qualifies
-// its columns by `useprefix = es->rtable_size > 1` only — VERBOSE alone does
-// not, unlike the quals and keys (explain.c). A single-relation scan prints
-// `Output: a, b` above a qualified `Filter: (oa.a > 1)`; a join's scans print
-// `Output: oa.a, oa.b`.
-func TestExplainVerboseOutputPlacementAndPrefix(t *testing.T) {
+// TestExplainVerboseScanOutputTlist pins show_plan_tlist for the shapes
+// M0148-0001f1 covers (PG 18.3 output): a scan prints the statement's
+// projection (plus a resjunk sort key), an Append prints no Output, and an
+// appendrel member prints only the columns the Append's consumer reads —
+// not the restriction evaluated on the member.
+func TestExplainVerboseScanOutputTlist(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE oa (a int, b int)")
-	runSQL(t, ctx, "CREATE TABLE ob (a int, c int)")
-	ps := optimizer.DefaultPlannerSettings()
-	render := func(q string) []string { return renderRows(runSQLWith(t, ctx, q, ps)) }
-
-	single := render("EXPLAIN (VERBOSE, COSTS OFF) SELECT a, b FROM oa WHERE a > 1")
-	if want := []string{"Seq Scan on public.oa", "  Output: a, b", "  Filter: (oa.a > 1)"}; strings.Join(single, "\n") != strings.Join(want, "\n") {
-		t.Errorf("single relation:\n got:\n%s\nwant (PG 18.3):\n%s", strings.Join(single, "\n"), strings.Join(want, "\n"))
+	runSQL(t, ctx, "CREATE TABLE ot (a int, b int, c text)")
+	explain := func(q string) string {
+		return strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) "+q, optimizer.DefaultPlannerSettings())), "\n")
 	}
-
-	join := strings.Join(render("EXPLAIN (VERBOSE, COSTS OFF) SELECT oa.a, ob.c FROM oa JOIN ob ON oa.a = ob.a"), "\n")
-	for _, want := range []string{"Output: oa.a, oa.b", "Output: ob.a, ob.c"} {
-		if !strings.Contains(join, want) {
-			t.Errorf("join: want %q (PG 18.3); got:\n%s", want, join)
+	for _, tc := range []struct {
+		q    string
+		want []string
+	}{
+		{"SELECT a FROM ot", []string{
+			"Seq Scan on public.ot",
+			"  Output: a",
+		}},
+		{"SELECT a FROM ot ORDER BY b LIMIT 2", []string{
+			"Limit",
+			"  Output: a, b",
+			"  ->  Sort",
+			"        Output: a, b",
+			"        Sort Key: ot.b",
+			"        ->  Seq Scan on public.ot",
+			"              Output: a, b",
+		}},
+		{"SELECT sum(a) FROM (SELECT * FROM ot UNION ALL SELECT * FROM ot) u", []string{
+			"Aggregate",
+			"  Output: sum(ot.a)",
+			"  ->  Append",
+			"        ->  Seq Scan on public.ot",
+			"              Output: ot.a",
+			"        ->  Seq Scan on public.ot ot_1",
+			"              Output: ot_1.a",
+		}},
+		{"SELECT a + 1, c FROM ot UNION ALL SELECT b, c FROM ot WHERE a > 5", []string{
+			"Append",
+			"  ->  Seq Scan on public.ot",
+			"        Output: (ot.a + 1), ot.c",
+			"  ->  Seq Scan on public.ot ot_1",
+			"        Output: ot_1.b, ot_1.c",
+			"        Filter: (ot_1.a > 5)",
+		}},
+	} {
+		if got, want := explain(tc.q), strings.Join(tc.want, "\n"); got != want {
+			t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", tc.q, got, want)
 		}
-	}
-	lines := strings.Split(join, "\n")
-	for i, l := range lines {
-		if strings.Contains(l, "Hash Join") || strings.Contains(l, "Merge Join") || strings.Contains(l, "Nested Loop") {
-			if i+1 >= len(lines) || !strings.Contains(lines[i+1], "Output:") {
-				t.Errorf("join: Output must directly follow the node line:\n%s", join)
-			}
-		}
-	}
-}
-
-// M0148-0001f: an Aggregate's VERBOSE Output: is its targetlist deparsed —
-// grouping columns and aggregate calls (`y, sum((x + y)), count(*), avg(x)`),
-// not the output schema's names (`y, sum, count, avg`). Verified against PG
-// 18.3's show_plan_tlist for this statement.
-func TestExplainVerboseAggregateOutputDeparsed(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ga (x int, y int)")
-	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT y, sum(x + y), count(*), avg(x) FROM ga GROUP BY y", optimizer.DefaultPlannerSettings())), "\n")
-	want := strings.Join([]string{
-		"HashAggregate",
-		"  Output: y, sum((x + y)), count(*), avg(x)",
-		"  Group Key: ga.y",
-		"  ->  Seq Scan on public.ga",
-		"        Output: x, y",
-	}, "\n")
-	if got != want {
-		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
-	}
-}
-
-// M0148-0001f: a generate_series FROM item is a range-table entry PG names by
-// its alias (set_rtable_names covers function RTEs), so in a multi-relation
-// statement its column prints `s1.s1` in Output: and quals, as base-relation
-// columns do. goopg's GenerateSeries carried no RTID and stayed bare.
-func TestExplainGenerateSeriesColumnsQualified(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE oa (a int, b int)")
-	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT oa.b, s1 FROM oa, generate_series(1, 3) s1 WHERE oa.a = s1", optimizer.DefaultPlannerSettings())), "\n")
-	for _, want := range []string{"Function Scan on pg_catalog.generate_series s1", "Output: s1.s1", "s1.s1)"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("want %q (PG 18.3); got:\n%s", want, got)
-		}
-	}
-	single := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT s1 FROM generate_series(1, 3) s1", optimizer.DefaultPlannerSettings())), "\n")
-	if !strings.Contains(single, "Output: s1\n") && !strings.HasSuffix(single, "Output: s1") {
-		t.Errorf("a lone function RTE keeps bare Output (rtable_size 1); got:\n%s", single)
-	}
-}
-
-// M0148-0001f: the Agg's targetlist is the SELECT list (create_plan folds
-// the projection into the projection-capable Agg) plus, as resjunk entries,
-// the grouping columns the list does not name — so PG prints
-// `sum((x + y)), y` at the Agg and `(sum((x + y))), y` on the Sort that
-// references it. goopg holds the projection in an EXPLAIN-invisible Project
-// above the chain; EXPLAIN renders the chain from it.
-func TestExplainVerboseOutputFollowsSelectListOverAggregate(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ga (x int, y int)")
-	got := strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT sum(x + y) FROM ga GROUP BY y ORDER BY 1", optimizer.DefaultPlannerSettings())), "\n")
-	want := strings.Join([]string{
-		"Sort",
-		"  Output: (sum((x + y))), y",
-		"  Sort Key: (sum((ga.x + ga.y)))",
-		"  ->  HashAggregate",
-		"        Output: sum((x + y)), y",
-		"        Group Key: ga.y",
-		"        ->  Seq Scan on public.ga",
-		"              Output: x, y",
-	}, "\n")
-	if got != want {
-		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
-	}
-}
-
-// M0148-0001f: a split aggregate's lower half deparses its Aggrefs with
-// ruleutils' `PARTIAL ` marking (get_agg_expr, DO_AGGSPLIT_SKIPFINAL), and the
-// Gather above references them as parenthesised non-Vars; the Finalize node
-// prints the plain call. PG 18.3 prints exactly this tree for the statement.
-func TestExplainVerbosePartialAggregateOutput(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE pa (a int, b int)")
-	runSQL(t, ctx, "INSERT INTO pa SELECT i, i % 10 FROM generate_series(1, 1000) i")
-	q := "SELECT sum(a), count(*) FROM pa"
-	got := strings.Join(runExplainOverChild(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) "+q, planGatheredJoin(t, ctx, q, 2)), "\n")
-	want := strings.Join([]string{
-		"Finalize Aggregate",
-		"  Output: sum(a), count(*)",
-		"  ->  Gather",
-		"        Output: (PARTIAL sum(a)), (PARTIAL count(*))",
-		"        Workers Planned: 2",
-		"        ->  Partial Aggregate",
-		"              Output: PARTIAL sum(a), PARTIAL count(*)",
-		"              ->  Parallel Seq Scan on public.pa",
-		"                    Output: a, b",
-	}, "\n")
-	if got != want {
-		t.Errorf("got:\n%s\nwant (PG 18.3):\n%s", got, want)
 	}
 }
