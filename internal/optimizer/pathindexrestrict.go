@@ -387,7 +387,7 @@ func partialIndexUsable(tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr
 	if !idx.HasPredicate {
 		return true
 	}
-	resolved, err := ResolveIndexPredicate(idx.Predicate, tbl)
+	resolved, err := ResolveIndexPredicateOf(idx, tbl)
 	if err != nil || resolved == nil {
 		return false
 	}

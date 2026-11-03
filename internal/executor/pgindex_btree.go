@@ -435,6 +435,12 @@ func (ctx *Context) arbiterKey(oc *optimizer.OnConflictPlan, tbl *catalog.Table,
 	if oc == nil || oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
+	// A row outside a partial arbiter's predicate is not in that index: it
+	// cannot conflict there (ExecCheckIndexConstraints skips the index) and
+	// files no entry — the nil key's existing meaning (M0148-0001c3).
+	if !indexPredicateAdmits(ctx, oc.ArbiterIndex, tbl, tbl.Columns, row) {
+		return nil, nil
+	}
 	idx := oc.ArbiterIndex
 	desc := ctx.pgIndexKeyDesc(idx)
 	if desc == nil {

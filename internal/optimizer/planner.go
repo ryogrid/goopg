@@ -186,6 +186,10 @@ func planWithRtableSize(stmt parser.Stmt, cat catalog.Catalog, plannerSet Planne
 	// filters at every member scan, as set_append_rel_size gives each
 	// child rel its own translated copy (appendrel_pushdown.go).
 	pushAppendRelRestrictions(node)
+	// M0148-0001c3: a partial index scan drops the restrictions its
+	// predicate implies (create_indexscan_plan's qpqual; locking and
+	// modifying plans keep them for the EPQ recheck).
+	node = dropPartialIndexImpliedQuals(node)
 	// M0127-P2.2 RETIRED `reselectDegenerateHashKeys` here. Qual placement
 	// (the two passes above plus the per-scope join pass) can pin a hash
 	// join's key column to a constant on BOTH inputs, which collapsed the
@@ -13576,7 +13580,7 @@ func minmaxMemberIndex(cat catalog.Catalog, tbl *catalog.Table, col string) (idx
 			len(ix.Columns) != 1 || ix.Columns[0] != col {
 			continue
 		}
-		pred, err := ResolveIndexPredicate(ix.Predicate, tbl)
+		pred, err := ResolveIndexPredicateOf(ix, tbl)
 		if err != nil {
 			continue
 		}
@@ -14010,7 +14014,7 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 			if queryClause == nil {
 				continue
 			}
-			resolvedPred, err := ResolveIndexPredicate(idx.Predicate, tbl)
+			resolvedPred, err := ResolveIndexPredicateOf(idx, tbl)
 			if err != nil || resolvedPred == nil {
 				continue
 			}

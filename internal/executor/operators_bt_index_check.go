@@ -457,8 +457,8 @@ func btIndexHeapAllIndexed(x *optimizer.FuncCall, slot SlotView, ctx *Context, i
 	}
 	keyExprs := resolveIndexKeyExprs(tbl, idx)
 	var predExpr optimizer.Expr
-	if idx.HasPredicate && idx.Predicate != nil {
-		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
+	if idx.HasPredicate {
+		predExpr, _ = optimizer.ResolveIndexPredicateOf(idx, tbl)
 	}
 
 	sctx := mmgr.Acquire(ctx.Mctx, mmgr.KindExpr)

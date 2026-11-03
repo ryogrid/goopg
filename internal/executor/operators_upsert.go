@@ -1291,6 +1291,11 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 		if skipOID != 0 && idx.OID == skipOID {
 			continue
 		}
+		// A partial index files only the rows its predicate admits
+		// (ExecInsertIndexTuples, M0148-0001c3).
+		if !indexPredicateAdmits(o.ctx, idx, tbl, cols, row) {
+			continue
+		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := openIndexBTree(o.ctx, idx, idxRel)
 		if err != nil {
@@ -1328,6 +1333,11 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 	}
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		// A partial index files only the rows its predicate admits
+		// (ExecInsertIndexTuples, M0148-0001c3).
+		if !indexPredicateAdmits(o.ctx, idx, tbl, cols, row) {
 			continue
 		}
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)

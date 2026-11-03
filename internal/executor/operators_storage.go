@@ -4017,6 +4017,32 @@ func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.
 }
 
 func hotUpdateEligible(plan *optimizer.Update, ctx *Context) bool {
+	if updateChangesIndexKeys(plan, ctx) {
+		return false
+	}
+	// RelationGetIndexAttrBitmap's HOT-blocking set also holds the INCLUDE
+	// columns and the predicate's columns (M0148-0001c3): changing an
+	// INCLUDE column must refresh the stored value, and changing a
+	// predicate column can move the row into or out of a partial index.
+	// Neither is a KEY attribute, so updateChangesIndexKeys (the lock
+	// strength and HEAP_KEYS_UPDATED) leaves them out.
+	for _, idx := range ctx.Catalog.IndexesOnTable(plan.Table, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		attrs := append(append([]string(nil), idx.IncludeColumns...), indexPredicateColumns(idx, plan.Table)...)
+		for _, name := range attrs {
+			for i, set := range plan.Set {
+				if set != nil && plan.Table.Columns[i].Name == name {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// updateChangesIndexKeys reports whether the UPDATE assigns an index key
+// column — goopg's INDEX_ATTR_BITMAP_KEY: the update is then a key update
+// (StatusUpdate, HEAP_KEYS_UPDATED) that conflicts with FOR KEY SHARE.
+func updateChangesIndexKeys(plan *optimizer.Update, ctx *Context) bool {
 	indexes := ctx.Catalog.IndexesOnTable(plan.Table, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		for _, idxCol := range idx.Columns {
@@ -4025,12 +4051,12 @@ func hotUpdateEligible(plan *optimizer.Update, ctx *Context) bool {
 					continue
 				}
 				if plan.Table.Columns[i].Name == idxCol {
-					return false // indexed column is being changed
+					return true // indexed column is being changed
 				}
 			}
 		}
 	}
-	return true
+	return false
 }
 
 // markHeapPruneOptDirty emits a logical opportunistic-pruning WAL record
@@ -5242,15 +5268,16 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 
 	// Modification phase: HOT update when eligible, else delete+insert.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	keysChanged := updateChangesIndexKeys(o.plan, o.ctx)
 	idxTbl := o.plan.Table
 	// M0118-0003 (write-path half): an UPDATE that changes an index *key*
-	// column (hotEligible is false — INCLUDE columns are excluded from a
-	// covering index's key list, so this matches the HEAP_KEYS_UPDATED stamp
+	// column (keysChanged — INCLUDE and predicate columns block HOT but are
+	// not key columns, so this matches the HEAP_KEYS_UPDATED stamp
 	// below) is a StatusUpdate that conflicts with every lock strength; a no-key
 	// UPDATE is a StatusNoKeyUpdate that does NOT conflict with FOR KEY SHARE.
 	// Classify once so the write-path wait matches how the locker decoded it.
 	updReqStatus := multixact.StatusNoKeyUpdate
-	if !hotEligible {
+	if keysChanged {
 		updReqStatus = multixact.StatusUpdate
 	}
 	fksToRecheckIdx := o.childFKsToRecheck()
@@ -5599,7 +5626,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
 					// UPDATE is treated key-changing by goopg (KeysUpdated stamped
 					// below), so the updater status is StatusUpdate (keysUpdated=true).
-					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
+					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, keysChanged)
 				} else {
 					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 					if stampIdxErr == nil {
@@ -5664,7 +5691,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// not eligible). FOR KEY SHARE uses this bit to decide whether to
 				// wait on this xmax. Mirrors upstream heap_update's HEAP_KEYS_UPDATED
 				// stamping via PageSetHeapTupleKeysUpdated.
-				if !hotEligible && !isCrossPartitionMoveIdx {
+				if keysChanged && !isCrossPartitionMoveIdx {
 					if s2, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
 						s2.Lock()
 						_ = storage.PageSetHeapTupleKeysUpdated(s2.Page(), pu.slot)
@@ -6205,11 +6232,12 @@ func (o *updateOp) next() (TupleSlot, error) {
 	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait
 	// exactly as updateViaIndex does (key-column change → StatusUpdate, else
 	// StatusNoKeyUpdate), so a propagated FOR KEY SHARE lock blocks a key-UPDATE
-	// but not a no-key UPDATE — the same hotEligible signal that stamps
-	// HEAP_KEYS_UPDATED. INCLUDE columns are excluded from a covering index's
-	// key list, so a no-key UPDATE stays no-key here.
+	// but not a no-key UPDATE — the same key-change signal that stamps
+	// HEAP_KEYS_UPDATED. INCLUDE and predicate columns block HOT but are not
+	// key columns, so a no-key UPDATE stays no-key here (M0148-0001c3).
+	keysChangedSeq := updateChangesIndexKeys(o.plan, o.ctx)
 	updReqStatusSeq := multixact.StatusNoKeyUpdate
-	if !hotEligibleSeq {
+	if keysChangedSeq {
 		updReqStatusSeq = multixact.StatusUpdate
 	}
 	fksToRecheckSeq := o.childFKsToRecheck()
@@ -6523,7 +6551,7 @@ func (o *updateOp) next() (TupleSlot, error) {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
 					// UPDATE is key-changing in goopg, so keysUpdated=true.
-					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
+					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, keysChangedSeq)
 				} else {
 					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 					if stampErr == nil {
@@ -7486,8 +7514,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	// Classify once so the write-path wait (below) matches how a locker
 	// decoded it, mirroring updateViaIndex/updateOp.Next (M0119-0009).
+	keysChangedFrom := updateChangesIndexKeys(o.plan, o.ctx)
 	updReqStatusFrom := multixact.StatusNoKeyUpdate
-	if !hotEligible {
+	if keysChangedFrom {
 		updReqStatusFrom = multixact.StatusUpdate
 	}
 	fksToRecheckFrom := o.childFKsToRecheck()
@@ -7758,7 +7787,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			// Preserve a pre-existing non-conflicting foreign locker into a
 			// {updater + survivors} multi (M0118-0004 producer); plain single-xid
 			// stamp otherwise. keysUpdated=true (non-HOT write).
-			stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldTup.Header, true)
+			stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldTup.Header, keysChangedFrom)
 			if stampErr != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -8598,6 +8627,11 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		return
 	}
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
+		// A partial index files only the rows its predicate admits
+		// (ExecInsertIndexTuples, M0148-0001c3).
+		if !indexPredicateAdmits(ctx, idx, tbl, cols, row) {
+			continue
+		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
@@ -8986,6 +9020,11 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
+		// A row outside a partial unique index's predicate is not in the
+		// index and cannot conflict there (M0148-0001c3).
+		if !indexPredicateAdmits(ctx, idx, tbl, cols, row) {
+			continue
+		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := openIndexBTree(ctx, idx, idxRel)
 		if err != nil {
@@ -9103,7 +9142,14 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
-		if !forceAll && oldRow != nil && !indexKeyColumnsChanged(idx, cols, oldRow, newRow, ctx.Catalog) {
+		// A partial unique index constrains only the rows its predicate
+		// admits; an update that moves a row INTO the predicate must be
+		// probed even with its key unchanged (M0148-0001c3).
+		if !indexPredicateAdmits(ctx, idx, tbl, cols, newRow) {
+			continue
+		}
+		newlyAdmitted := idx.HasPredicate && oldRow != nil && !indexPredicateAdmits(ctx, idx, tbl, cols, oldRow)
+		if !forceAll && oldRow != nil && !newlyAdmitted && !indexKeyColumnsChanged(idx, cols, oldRow, newRow, ctx.Catalog) {
 			// Key columns unchanged — cannot collide with itself. Skip the probe.
 			continue
 		}

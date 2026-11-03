@@ -592,7 +592,7 @@ func estimateIndexGeometry(cat catalog.Catalog, idx *catalog.Index, tbl *catalog
 	// coordinates, so no search context is needed here.
 	if idx != nil && idx.HasPredicate && tbl != nil &&
 		tbl.Stats != nil && tbl.Stats.Analyzed && len(tbl.Stats.Columns) > 0 {
-		if rp, err := ResolveIndexPredicate(idx.Predicate, tbl); err == nil && rp != nil {
+		if rp, err := ResolveIndexPredicateOf(idx, tbl); err == nil && rp != nil {
 			if sel := clauseSelectivity(rp, &SeqScan{Table: tbl}); sel > 0 && sel <= 1 {
 				indexTuples = relTuples * sel
 				if indexTuples < 1 {
