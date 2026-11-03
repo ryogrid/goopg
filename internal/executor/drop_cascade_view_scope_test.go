@@ -4,7 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // M0148-0001h: DROP TABLE … CASCADE must not drop views over a different
@@ -102,5 +104,51 @@ func TestDropSchemaCascadeDropsItsViews(t *testing.T) {
 	ps := optimizer.DefaultPlannerSettings()
 	if got := strings.Join(renderRows(runSQLWith(t, ctx, "select relname from pg_class where relname in ('v4', 't4')", ps)), ","); got != "" {
 		t.Errorf("drop schema vs4 cascade left %q", got)
+	}
+}
+
+type viewTempSessionStub struct{ id uint64 }
+
+func (s viewTempSessionStub) UniqueID() uint64 { return s.id }
+
+// A view over a temporary relation is implicitly temporary (view.c
+// DefineView: NOTICE `view "v" will be a temporary view`) and belongs to the
+// session: backend exit drops it with the session's temp tables
+// (RemoveTempRelations → cleanupSessionTempObjects → DropSessionTempObjects).
+// create_view.sql's temporal1..4 used to outlive their session, so
+// aggregates.sql's `drop table t1 cascade` reported and dropped them
+// (M0148-0001h cause 4).
+func TestImplicitTempViewIsSessionScoped(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	ctx.AdvisorySessionIdentity = viewTempSessionStub{id: 42}
+	runSQL(t, ctx, "create temp table tt5 (a int)")
+	ctx.TakeNotices()
+	runSQL(t, ctx, "create view v5 as select * from tt5")
+	notices := strings.Join(ctx.TakeNotices(), "\n")
+	if !strings.Contains(notices, `view "v5" will be a temporary view`) {
+		t.Errorf("notices = %q, want the implicit temporary-view NOTICE", notices)
+	}
+	runSQL(t, ctx, "create temp view v6 as select 1 as x")
+	if got := strings.Join(ctx.TakeNotices(), "\n"); strings.Contains(got, "will be a temporary view") {
+		t.Errorf("explicit TEMP view reported %q", got)
+	}
+	for _, name := range []string{"v5", "v6"} {
+		v, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok || !v.Temp || v.TempOwner != "s42" {
+			t.Fatalf("%s: found=%v Temp=%v TempOwner=%q, want a temp view owned by s42", name, ok, ok && v.Temp, func() string {
+				if ok {
+					return v.TempOwner
+				}
+				return ""
+			}())
+		}
+	}
+	im := cat.(*catalog.InMemory)
+	im.DropSessionTempObjects("s42")
+	for _, name := range []string{"tt5", "v5", "v6"} {
+		if _, ok := cat.LookupTable(parser.ObjectName{Name: name}); ok {
+			t.Errorf("%s survived the session's temp cleanup", name)
+		}
 	}
 }

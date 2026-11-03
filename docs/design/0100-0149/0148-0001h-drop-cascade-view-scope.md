@@ -1,7 +1,7 @@
 # M0148-0001h — DROP TABLE … CASCADE drops only the views over the dropped table
 
 **Parent:** M0148-0001 `aggregates.sql` regress coverage closure · **Status:**
-slices 1\-2 landed 2026\-11\-03; the task stays open
+slices 1\-3 landed 2026\-11\-03; closed (residue in M0148\-0001h1)
 **Target:** the aggregates hunk at `drop table t1 cascade` (expected\-line
 ~1302)
 
@@ -101,10 +101,31 @@ did not include `TestPort_RegressSuite`.
   rules, matview, with, select\_views and namespace are unchanged.
   `TestPort_RegressSuite` and `TestPort_PgDump*` pass.
 
-## Remaining (task stays open)
+## Slice 3 — temporary views are session\-scoped (2026\-11\-03)
 
-- PG's implicit\-temp NOTICE `view "v" will be a temporary view` is not
-  emitted, and temp views are not placed in a pg\_temp namespace.
+- `execCreateView` marks a view temporary when it is declared TEMP, or when
+  it is unqualified and its FROM items resolve to a temporary relation. PG
+  makes the latter implicitly temporary and emits
+  `NOTICE: view "v" will be a temporary view` (view.c DefineView).
+- A temporary view gets `Temp`/`TempOwner`, so backend exit
+  (`cleanupSessionTempObjects` → `DropSessionTempObjects`,
+  RemoveTempRelations) drops it with the session's temp tables.
+- create\_view.sql's `temporal1..4` therefore no longer outlive their
+  session, and aggregates.sql's `drop table t1 cascade` hunk is gone:
+  aggregates goes from 11 to 10 hunks and 247 to 231 diff lines, and
+  create\_view from 2467 to 2427. The other eight measured suites are
+  unchanged.
+- Pin: `TestImplicitTempViewIsSessionScoped`, which covers the NOTICE, the
+  explicit TEMP view, the Temp stamp and session\-exit cleanup. It is
+  mutation\-checked.
+
+## Closure
+
+The aggregates hunk this task names is matched. The remaining fidelity
+items move to M0148\-0001h1:
+
+- A temporary view keeps goopg's bare key; PG places it in the session's
+  pg\_temp namespace.
 - `DROP SCHEMA … CASCADE` still does not print PG's dependency\-ordered
   cascade list.
 - Other unqualified view lookups (ALTER VIEW, COMMENT ON VIEW, GRANT) do not

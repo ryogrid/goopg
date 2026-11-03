@@ -6992,7 +6992,14 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// keys temporary relations bare, so it stays unqualified. Without this a
 	// view created under `search_path = s, public` landed in public, and
 	// DROP TABLE s.t CASCADE (scoped by schema since M0148-0001h) missed it.
-	if s.Name.Schema == "" && !s.Temporary && !o.viewQueryUsesTempRelation(s.Query) {
+	viewIsTemp := s.Temporary
+	if !viewIsTemp && s.Name.Schema == "" && o.viewQueryUsesTempRelation(s.Query) {
+		// DefineView (view.c): "If the user didn't explicitly ask for a
+		// temporary view, check whether we need one implicitly."
+		viewIsTemp = true
+		o.ctx.AddNotice(fmt.Sprintf("view %q will be a temporary view", s.Name.Name))
+	}
+	if s.Name.Schema == "" && !viewIsTemp {
 		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
 			s.Name.Schema = ws
 		}
@@ -7106,6 +7113,17 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			vt.Owner = o.ctx.NonSuperuserRole
 		}
 		vt.ViewDef = s.RawDef
+		// A temporary view — declared TEMP, or implicitly temporary over a
+		// temporary relation — belongs to the session's temp namespace and is
+		// dropped at backend exit with the session's other temp relations
+		// (RemoveTempRelations; cleanupSessionTempObjects). Without the stamp
+		// create_view.sql's temporal1..4 outlived their session and
+		// aggregates.sql's `drop table t1 cascade` dropped them (M0148-0001h
+		// cause 4).
+		if viewIsTemp {
+			vt.Temp = true
+			vt.TempOwner = sessionTempOwner(o.ctx)
+		}
 		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
 		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
 		// `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (DU-002 slice 365).
