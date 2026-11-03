@@ -950,6 +950,32 @@ heuristic stays live.)
 
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
 
+- [x] **Serial user aggregates with a COMBINEFUNC / a builtin int4\_sum SFUNC returned wrong values** \(S2 wrong\-result
+  class; found 2026\-11\-03 inside M0148\-0001i\)\.
+  Kind: impl
+  Parent: M0148\-0001i
+  - `CREATE AGGREGATE mysum8\(int4\) \(SFUNC = int4\_sum\(int8, int4\), STYPE = int8, COMBINEFUNC = int8pl, …\)` returned 0
+    for a 495000 sum \(PG 18.3: 495000 serial and parallel\); a strict SQL COMBINEFUNC turned the sum NULL\.
+  - Causes: the serial finish called COMBINEFUNC\(NULL, state\) \(M0097\-0122\), and int4\_sum/int2\_sum were missing
+    from executeSFuncCall's builtin table \(silent "not found" kept INITCOND\)\.
+  - Fixed in d4a5f0b30; pins TestSerialUserAggregateWithBuiltinSFuncAndCombineFunc \(mutation\-checked both ways\),
+    TestSerialAggregateNeverCallsCombineFunc \(PG returns 6\)\.
+  Movement: none — correctness fix — no plan instrument \(user\-aggregate values\)\.
+- [ ] **An expression with a NullTest over a split aggregate fails in the Finalize** \(filed 2026\-11\-03 from M0148\-0001i\)\.
+  Kind: impl
+  Parent: none
+  - With a parallel split forced \(parallel\_workers=4, parallel\_setup\_cost=0\), `SELECT sum\(hundred\) IS NULL FROM tenk1`
+    errors `column ref hundred/6 out of Slot range 1` \(at HEAD, builtins too\); `sum\(hundred\) \+ 1` works\. PG returns `f`\.
+  - Resume: the Finalize Aggregate's output evaluation of a NullTest wrapping an AggregateCall resolves the call's
+    argument against the transport row instead of the finalized aggregate value \(compare the `\+` path\)\.
+- [ ] **executeSFuncCall: an unknown builtin SFUNC/COMBINEFUNC falls through silently** \(filed 2026\-11\-03 from M0148\-0001i\)\.
+  Kind: impl
+  Parent: none
+  - The builtin table is hand\-written; a name missing from it returns errSFuncNotFound and the aggregate keeps its
+    state \(int4\_sum returned INITCOND until d4a5f0b30\)\. PG resolves any pg\_proc function\. Resume: route builtin names
+    through the scalar builtin\-function evaluator, or reject at CREATE AGGREGATE \(42883\) a SFUNC/COMBINEFUNC that
+    cannot be executed\.
+
 - [x] **testport/TestPort\_RegressSuite — index\_including, index\_including\_gist: every psql `\\d` failed 42809** \(AI\-20261102\-000225\-003; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
   Kind: impl
   Parent: none
@@ -11622,6 +11648,23 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   for balk. PG: `createplan.c` (create_gatherwp) + `costsize.c
   final_cost_agg`/`cost_gather` + reloption parallel workers
   (`relation_get_parallel_workers`). Verify hunks 1899, 2847.
+  - Slice 1 LANDED d4a5f0b30 (2026-11-03): PARALLEL SAFE user aggregates with a
+    COMBINEFUNC split (Finalize/Gather/Partial); combineUserAggState is
+    nodeAgg's combine phase (INITCOND start, strict rules); the row
+    transport ships user states. The `balk(hundred)` hunk (~2880) now
+    matches. Design docs/design/0100-0149/0148-0001i-user-aggregate-combine.md.
+    - Fixed on the way (S2 class, PG 18.3-measured): the serial finish
+      called COMBINEFUNC(NULL, state) — PG never calls it outside a split
+      (p_csum returns 6; a strict SQL combinefn turned a sum NULL); and
+      int4_sum/int2_sum were missing as builtin SFUNCs (sum returned
+      INITCOND 0).
+    - Gates on code_tree 2c62d08629d2: units, RegressSuite + PgDump,
+      spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none.
+    - Remaining here: the `v_pagg_test` hunk (~1929) — PG elects Finalize
+      HashAggregate -> Gather -> Partial HashAggregate -> Parallel Seq Scan
+      under GroupAggregate/Sort/ProjectSet; goopg plans serially and adds a
+      top Sort.
+  Movement: yes — regress runner aggregates 10 → 9 hunks / 231 → 209 diff lines (balk hunk matched)
 - [ ] **M0148-0001k — inheritance/partition appendrel scans: per-member
   restriction pushdown and `<parent>_N` member aliases**.
   Kind: impl
