@@ -11563,7 +11563,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     M0148-0001g1 (pretty mode / psql \d+, joins, set ops, CTEs, windows,
     CASE, casts, sublinks, literals outside VALUES, search-path schema
     qualification) — ledgered 2026-11-02.
-- [ ] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
+- [x] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
   Kind: impl
   Parent: M0148-0001
   `drop table t1 cascade` must emit "drop cascades to 8 other objects /
@@ -11600,6 +11600,15 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
       gone; the four temporal views remain — implicitly temporary views over
       create_view's temp t1 that PG drops at that session's end (cause 4,
       temp-object session scope). Next slice.
+  - Slice 3 LANDED 7dddb23c0 (2026-11-03) — CLOSED: temporary views are
+    session-scoped. A view declared TEMP, or unqualified over a temp relation
+    (implicit, with PG's `view "v" will be a temporary view` NOTICE), is
+    stamped Temp/TempOwner and dropped at backend exit. Pin
+    TestImplicitTempViewIsSessionScoped (mutation-checked). Gates on
+    code_tree aa857a73053a: units, RegressSuite + PgDump + Isolation,
+    spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none.
+    Residue filed as M0148-0001h1.
+  Movement: yes — regress runner aggregates 11 → 10 hunks / 247 → 231 diff lines (drop-cascade hunk matched), create_view 2467 → 2427
 - [ ] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
   Partial over parallel scans)**.
   Kind: impl
@@ -11749,3 +11758,19 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   \(0.079s, no code change\); it goes green again as the host date moves
   inside the DST period. Test-side date sensitivity, not a product defect;
   no fix filed \(candidate: pin a fixed evaluation date in the test\).
+- [ ] **M0148-0001h1 — view/relation dependencies by OID, pg_temp placement,
+  DROP SCHEMA cascade listing**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001h (closed). goopg still matches view dependencies by
+  relation NAME at drop time (viewsDependingOnTable / selectRefsRelation /
+  matViewsDependingOnRelation / functionsDependingOnTable); PG records them
+  by OID in pg_depend at CREATE VIEW (recordDependencyOnExpr from
+  DefineView/StoreViewQuery) and walks them by OID (findDependentObjects).
+  Also open: temporary relations/views keep goopg's bare key instead of the
+  session's pg_temp namespace (so a temp t1 is matched as public);
+  `DROP SCHEMA … CASCADE` does not print PG's dependency-ordered list;
+  TablesInSchema reports a stale name after RENAME following SET SCHEMA;
+  ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
+  resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
+  namespace regress runner HEAD vs change.
