@@ -3000,7 +3000,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			*rows = append(*rows, Row{NewStringDatum(indent + "Presorted Key: " + strings.Join(bare[:p.PresortedCount], ", "))})
 		}
 	case *optimizer.IndexScan:
-		if cond := formatIndexCond(p, reg); cond != "" {
+		if cond := formatIndexCondPrefixed(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)); cond != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
 		// `Filter:` comes from either of two places, and upstream renders both
@@ -3035,7 +3035,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// leading-column bounds as the index scan arm does. A key-less
 		// bitmap renders nothing.
 		if p != nil && p.Index != nil {
-			if cond := formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg); cond != "" {
+			if cond := formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)); cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}
 		}
@@ -3092,7 +3092,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// EXCLUSIVE) renders on the same line, since PG prints one
 		// `Index Cond:` holding every index qual.
 		var condParts []string
-		if bound := formatIndexOnlyCond(p, reg); bound != "" {
+		if bound := formatIndexOnlyCondPrefixed(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)); bound != "" {
 			condParts = append(condParts, bound)
 		}
 		if p.Cond != nil {
@@ -3703,6 +3703,14 @@ func formatJoinFilter(p *optimizer.Join, reg *subPlanReg, qualify bool) string {
 // IndexScan node as a PG-style `(col = key)` (or range) expression.
 // Empty when the scan has no bound (full-range probe).
 func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
+	return formatIndexCondPrefixed(p, reg, "")
+}
+
+// formatIndexCondPrefixed is formatIndexCond with each index-column name
+// prefixed — `<refname>.` under EXPLAIN VERBOSE, where show_scan_qual
+// deparses the index quals with useprefix (M0148-0001e1:
+// `Index Cond: (btg.y < 0)`).
+func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix string) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
@@ -3713,7 +3721,7 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		for _, k := range p.SAOPKeys {
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
-		cond := p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
+		cond := prefix + p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
 		// M0146-0005ch: the same folded array Const the Filter-side
 		// formatInExprPG prints (sibling renderers of one SAOP).
 		if p.Table != nil {
@@ -3722,7 +3730,7 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 					continue
 				}
 				if cast, lit, ok := inListArrayConst(c.Type, p.SAOPKeys); ok {
-					col := p.Index.Columns[0]
+					col := prefix + p.Index.Columns[0]
 					if cast != "" {
 						col = "(" + col + ")::" + cast
 					}
@@ -3734,7 +3742,7 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 		// M0145-0029: bounds on the second column (PG
 		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
 		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > 1 {
-			col := p.Index.Columns[1]
+			col := prefix + p.Index.Columns[1]
 			if p.LowKey != nil {
 				op := ">="
 				if p.LowOp == parser.OpGt {
@@ -3761,9 +3769,9 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if np := len(p.RangePrefix); np > 0 && np < len(p.Index.Columns) {
 		parts := make([]string, 0, np+2)
 		for i, k := range p.RangePrefix {
-			parts = append(parts, p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
+			parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
 		}
-		col := p.Index.Columns[np]
+		col := prefix + p.Index.Columns[np]
 		if p.LowKey != nil {
 			op := ">="
 			if p.LowOp == parser.OpGt {
@@ -3788,11 +3796,11 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
 		}
 		return indexCondAndText(parts)
 	}
-	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
+	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 }
 
 // formatIndexOnlyCond is formatIndexCond for an IndexOnlyScan. The two nodes
@@ -3801,6 +3809,11 @@ func formatIndexCond(p *optimizer.IndexScan, reg *subPlanReg) string {
 // must render with the same strictness the executor scans with — a `>` bound
 // printed as `>=` would misdescribe the plan.
 func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
+	return formatIndexOnlyCondPrefixed(p, reg, "")
+}
+
+// formatIndexOnlyCondPrefixed — see formatIndexCondPrefixed.
+func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, prefix string) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
@@ -3809,11 +3822,30 @@ func formatIndexOnlyCond(p *optimizer.IndexOnlyScan, reg *subPlanReg) string {
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
+			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKey(k, reg)
 		}
 		return indexCondAndText(parts)
 	}
-	return formatIndexCondParts(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg)
+	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+}
+
+// indexCondColumnPrefix is the `<refname>.` an index qual's column side
+// takes under EXPLAIN VERBOSE (show_scan_qual's useprefix = es->verbose),
+// the same refname the node label prints; "" otherwise.
+func indexCondColumnPrefix(verbose bool, n optimizer.Node, tbl *catalog.Table, alias string, reg *subPlanReg) string {
+	if !verbose {
+		return ""
+	}
+	if dname := reg.names().disambiguatedName(n); dname != "" {
+		return dname + "."
+	}
+	if alias != "" {
+		return alias + "."
+	}
+	if tbl != nil {
+		return strings.ToLower(tbl.Name) + "."
+	}
+	return ""
 }
 
 // formatIndexCondKey renders the key side of one Index Cond bound. The
@@ -3922,12 +3954,23 @@ func nestLoopParamThroughOuter(x *optimizer.OuterColumnRef, reg *subPlanReg, use
 // formatIndexCondParts is the shared body of formatIndexCond /
 // formatIndexOnlyCond: sibling paths that must not disagree.
 func formatIndexCondParts(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg) string {
+	return formatIndexCondPartsPrefixed(index, keys, key, lowKey, highKey, lowOp, highOp, reg, "")
+}
+
+// formatIndexCondPartsPrefixed — see formatIndexCondPrefixed.
+func formatIndexCondPartsPrefixed(index *catalog.Index, keys []optimizer.Expr, key, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
 	p := struct {
 		Keys                 []optimizer.Expr
 		Key, LowKey, HighKey optimizer.Expr
 		LowOp, HighOp        parser.OpCode
 	}{keys, key, lowKey, highKey, lowOp, highOp}
 	cols := index.Columns
+	if prefix != "" {
+		cols = make([]string, len(index.Columns))
+		for i, c := range index.Columns {
+			cols[i] = prefix + c
+		}
+	}
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {

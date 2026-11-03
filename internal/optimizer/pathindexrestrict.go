@@ -229,7 +229,7 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 			op = swapInequalityOp(op)
 		}
 		c := &indexPathClause{indexCol: pos, key: val, op: op}
-		if pos == 0 && len(idx.Columns) == 1 {
+		if pos == 0 {
 			c.local = conj
 		}
 		switch op {
