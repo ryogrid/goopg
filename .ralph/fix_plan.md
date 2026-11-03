@@ -964,6 +964,7 @@ heuristic stays live.)
 - [ ] **An expression with a NullTest over a split aggregate fails in the Finalize** \(filed 2026\-11\-03 from M0148\-0001i\)\.
   Kind: impl
   Parent: none
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\.
   - With a parallel split forced \(parallel\_workers=4, parallel\_setup\_cost=0\), `SELECT sum\(hundred\) IS NULL FROM tenk1`
     errors `column ref hundred/6 out of Slot range 1` \(at HEAD, builtins too\); `sum\(hundred\) \+ 1` works\. PG returns `f`\.
   - Resume: the Finalize Aggregate's output evaluation of a NullTest wrapping an AggregateCall resolves the call's
@@ -971,6 +972,7 @@ heuristic stays live.)
 - [ ] **executeSFuncCall: an unknown builtin SFUNC/COMBINEFUNC falls through silently** \(filed 2026\-11\-03 from M0148\-0001i\)\.
   Kind: impl
   Parent: none
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\.
   - The builtin table is hand\-written; a name missing from it returns errSFuncNotFound and the aggregate keeps its
     state \(int4\_sum returned INITCOND until d4a5f0b30\)\. PG resolves any pg\_proc function\. Resume: route builtin names
     through the scalar builtin\-function evaluator, or reject at CREATE AGGREGATE \(42883\) a SFUNC/COMBINEFUNC that
@@ -11635,7 +11637,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none.
     Residue filed as M0148-0001h1.
   Movement: yes — regress runner aggregates 11 → 10 hunks / 247 → 231 diff lines (drop-cascade hunk matched), create_view 2467 → 2427
-- [ ] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
+- [x] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
   Partial over parallel scans)**.
   Kind: impl
   Parent: M0148-0001
@@ -11665,6 +11667,16 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
       under GroupAggregate/Sort/ProjectSet; goopg plans serially and adds a
       top Sort.
   Movement: yes — regress runner aggregates 10 → 9 hunks / 231 → 209 diff lines (balk hunk matched)
+  - Slice 2 LANDED 8397f3cdd (2026-11-03) — CLOSED: unordered array_agg /
+    string_agg split as in PG 18 (combine functions; RECORD argument refused
+    per agg_args_support_sendreceive), and a view's body is planned under
+    the session's PlannerSettings (Plan(tbl.View) used the defaults, so no
+    planner GUC reached a view). The v_pagg_test inner aggregate now plans
+    PG's Finalize HashAggregate -> Gather -> Partial HashAggregate split.
+    Gates on code_tree dc912175300d: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none. Residue (view pull-up) filed as M0148-0001i1.
+  Movement: yes — regress runner aggregates single-suite 209 → 208 diff lines (v_pagg_test hunk now differs only in view pull-up)
 - [ ] **M0148-0001k — inheritance/partition appendrel scans: per-member
   restriction pushdown and `<parent>_N` member aliases**.
   Kind: impl
@@ -11817,3 +11829,20 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
   resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
   namespace regress runner HEAD vs change.
+- [ ] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
+  outer query (top Sort, Result node, unqualified names)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001i (closed). planScanRangeVar plans a view body as a
+  separate statement and wraps it in a renaming Project; PG's rewriter
+  expands the view into a subquery RTE that the planner pulls up
+  (pull_up_subqueries), so the outer query sees the view's pathkeys and
+  rtable. aggregates.sql v_pagg_test (~1929) still differs by: a redundant
+  top `Sort Key: y` (the outer GroupAggregate already delivers y order), no
+  `Result` node between the Sort and the ProjectSet, `Group Key: y` instead
+  of `pagg_test.y` (separate rtable scope), and the sort key printed as `t`
+  instead of the cast expression. Resume: plan the view as a subquery
+  RangeVar in the outer statement's rtableScope (the derived-table path)
+  instead of Plan + Project. Measure: aggregates / create_view / rules /
+  select_views regress runner HEAD vs change, and the TPC-H Q15 plan (view
+  revenue0) on the fire-set.
