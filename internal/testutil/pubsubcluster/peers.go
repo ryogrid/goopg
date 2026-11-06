@@ -41,11 +41,19 @@ func (g *goopgPeer) Stop() error  { return g.c.Stop(cluster.ShutdownFast) }
 func (g *goopgPeer) Kill() error  { return g.c.Kill() }
 func (g *goopgPeer) Exec(t *testing.T, sql string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := g.c.Query(ctx, sql); err != nil {
+	if err := g.ExecErr(sql); err != nil {
 		t.Fatalf("goopg exec %q: %v", sql, err)
 	}
+}
+
+// ExecErr runs sql and returns the server's error (nil on success)
+// instead of failing the test — for statements expected to report an
+// SQLSTATE (ALTER SUBSCRIPTION refresh's 42P01 / 08006 arms).
+func (g *goopgPeer) ExecErr(sql string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := g.c.Query(ctx, sql)
+	return err
 }
 func (g *goopgPeer) Pgbench(t *testing.T, args ...string) string {
 	t.Helper()
@@ -89,6 +97,7 @@ func (p *pgPeer) Stop() error                                 { return p.c.Stop(
 func (p *pgPeer) Kill() error                                 { return p.c.Kill() }
 func (p *pgPeer) Exec(t *testing.T, sql string)               { p.c.Exec(t, sql) }
 func (p *pgPeer) QueryScalar(t *testing.T, sql string) string { return p.c.QueryScalar(t, sql) }
+func (p *pgPeer) ExecErr(sql string) error                    { return p.c.ExecErr(sql) }
 func (p *pgPeer) Pgbench(t *testing.T, args ...string) string {
 	return p.c.Pgbench(t, args...)
 }

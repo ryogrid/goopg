@@ -2,6 +2,7 @@ package executor
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -25,6 +26,19 @@ import (
 func TestCopyFromZonelessTimetzTakesSessionZone(t *testing.T) {
 	cols := []catalog.Column{{Name: "t", Type: catalog.Type{Name: "timetz"}}}
 
+	// A bare time carries no date, so DecodeTimeOnly resolves the session
+	// zone at TODAY's date (GetCurrentDateTime) — the New York offset is
+	// -04 under DST and -05 outside it. The expectation is derived from the
+	// tz database for the date the test runs on; a hard-coded EDT offset
+	// turned this test red every day between November and March
+	// (M-NIGHTLY, first seen after DST ended 2026-11-01).
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tz database lacks America/New_York: %v", err)
+	}
+	today := time.Now().In(ny)
+	_, nyOffset := time.Date(today.Year(), today.Month(), today.Day(), 10, 0, 0, 0, ny).Zone()
+
 	cases := []struct {
 		zone string
 		want int
@@ -33,7 +47,7 @@ func TestCopyFromZonelessTimetzTakesSessionZone(t *testing.T) {
 		{"", 0, "no session zone set: the boot default is UTC"},
 		{"UTC", 0, "explicit UTC"},
 		{"Asia/Tokyo", 9 * 3600, "PG 18.3 answers 10:00:00+09"},
-		{"America/New_York", -4 * 3600, "DST-aware: EDT on today's date"},
+		{"America/New_York", nyOffset, "DST-aware: today's EDT/EST offset"},
 	}
 	for _, tc := range cases {
 		// TEXT reader.

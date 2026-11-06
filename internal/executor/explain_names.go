@@ -91,6 +91,13 @@ type explainNames struct {
 	// for node labels — the existing bySource/taken/seen serve column
 	// qualification, which has different collision rules.
 	nodeLabels map[string]string
+	// labelSeen is the node-label pass's visited set, kept across collect
+	// calls: the root pass already labels sublink bodies (they hang off
+	// NodeSubplans), and the per-subplan collect operators_explain runs
+	// before rendering an `InitPlan N` body must not relabel them from a
+	// fresh claim table — two InitPlans over one appendrel printed their
+	// members `_1`…`_4` twice where PG continues `_6`…`_9` (M0148-0001c).
+	labelSeen map[string]bool
 	// parent maps each plan node (nodePtr) to the node it was first
 	// reached from in collect's walk, and scopes caches each node's
 	// subtree SourceTableIdx → RTID map. Together they let columnIn
@@ -107,14 +114,29 @@ type explainNames struct {
 	// scope resolves to a transparent inlined CTE can be chased into the
 	// CTE body (transparentCTEFor). M0146-0021.
 	nodes map[int32]optimizer.Node
+	// rtableSize is PG's es->rtable_size for the explained statement when
+	// the planner reported it (optimizer.Explain.RtableSize), else 0.
+	rtableSize int
+	// verbose is es->verbose: EXPLAIN (VERBOSE) qualifies every qual and
+	// key column (qualify / qualifyScan).
+	verbose bool
 }
 
 // nodePtr returns a unique string id for a plan node.
 func nodePtr(n optimizer.Node) string { return fmt.Sprintf("%p", n) }
 
-// newExplainNames builds the name table for the plan rooted at n.
+// newExplainNames builds the name table for the plan rooted at n, with the
+// statement's range-table size unknown.
 func newExplainNames(n optimizer.Node) *explainNames {
+	return newExplainNamesSized(n, 0, false)
+}
+
+// newExplainNamesSized is newExplainNames given the statement's range-table
+// size from the planner (optimizer.Explain.RtableSize), 0 when unknown.
+func newExplainNamesSized(n optimizer.Node, rtableSize int, verbose bool) *explainNames {
 	nm := &explainNames{
+		rtableSize: rtableSize,
+		verbose:    verbose,
 		bySource:   map[int32]string{},
 		taken:      map[string]int{},
 		seen:       map[int32]bool{},
@@ -133,8 +155,36 @@ func newExplainNames(n optimizer.Node) *explainNames {
 // (explain.c show_upper_qual / show_sort_group_keys): a single-relation
 // query keeps the bare column names PostgreSQL prints for it, so the common
 // case of EXPLAIN output is byte-identical to before this table existed.
+//
+// The plan-visible relation count undercounts PG's range table whenever an
+// RTE left no node: a FROM subquery or view pulled up into its parent, a
+// Subquery Scan stripped as trivial, a removed join's relation. PG still
+// counts those (`SELECT … FROM (SELECT * FROM btg ORDER BY …) q1 GROUP BY …`
+// prints `Group Key: btg.x`), so the planner's statement-wide count wins
+// when it is known.
+//
+// VERBOSE forces it too: show_upper_qual, show_sort_group_keys,
+// show_grouping_sets, show_window_def/keys and show_memoize_info all use
+// `useprefix = es->rtable_size > 1 || es->verbose` (M0148-0001e). The
+// per-node Output: list is the exception (show_plan_tlist, rtable_size
+// only) and does not come through here.
 func (nm *explainNames) qualify() bool {
-	return nm != nil && len(nm.bySource) > 1
+	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1 || nm.verbose)
+}
+
+// qualifyTlist is show_plan_tlist's rule for the VERBOSE Output: list:
+// `useprefix = es->rtable_size > 1` — the statement's relation count alone,
+// VERBOSE does not force it (M0148-0001f).
+func (nm *explainNames) qualifyTlist() bool {
+	return nm != nil && (len(nm.bySource) > 1 || nm.rtableSize > 1)
+}
+
+// qualifyScan is show_scan_qual's rule for a scan node's own quals
+// (`Filter:`, `Index Cond:`, `Recheck Cond:`): `useprefix =
+// IsA(plan, SubqueryScan) || es->verbose` — bare unless VERBOSE, however many
+// relations the statement holds.
+func (nm *explainNames) qualifyScan() bool {
+	return nm != nil && nm.verbose
 }
 
 // name returns the printed relation name for a binding, or "" when the
@@ -360,7 +410,7 @@ func (nm *explainNames) collect(n optimizer.Node) {
 			}
 			cteWalked[key] = true
 		}
-		if v, ok := node.(*optimizer.Values); ok && len(v.Rows) > 1 {
+		if v, ok := node.(*optimizer.Values); ok && v.RowCount() > 1 {
 			valuesNodes = append(valuesNodes, node)
 		}
 		if base, ok := explainRelBaseName(node); ok {
@@ -426,7 +476,10 @@ func (nm *explainNames) collect(n optimizer.Node) {
 	// entries with the same first-wins dedup, so label suffixes and
 	// column-qualifier suffixes agree with each other.
 	labelTaken := map[string]int{}
-	labelSeen := map[string]bool{}
+	if nm.labelSeen == nil {
+		nm.labelSeen = map[string]bool{}
+	}
+	labelSeen := nm.labelSeen
 	for _, e := range found {
 		if e.base == "" {
 			continue
@@ -528,6 +581,13 @@ func (nm *explainNames) register(rtid int32, base string, node optimizer.Node) {
 // prints after `Seq Scan on` / `CTE Scan on`.
 func explainRelBaseName(n optimizer.Node) (string, bool) {
 	switch p := n.(type) {
+	case *optimizer.GenerateSeries:
+		// A function RTE's refname is its alias, else the function name
+		// (set_rtable_names / get_rte_alias).
+		if p.Alias != "" {
+			return p.Alias, true
+		}
+		return "generate_series", true
 	case *optimizer.SeqScan:
 		if p.Alias != "" {
 			return p.Alias, true
@@ -565,6 +625,13 @@ func explainRelBaseName(n optimizer.Node) (string, bool) {
 		}
 		if p.Table != nil {
 			return strings.ToLower(p.Table.Name), true
+		}
+	case *optimizer.SetOp:
+		// An appendrel's parent RTE (Append/MergeAppend apprelids, which
+		// ExplainPreScanNode adds to rels_used): the parent claims its
+		// name before the children (M0148-0001c).
+		if p.RTID != 0 && p.AppendRelName != "" {
+			return p.AppendRelName, true
 		}
 	}
 	return "", false
@@ -625,6 +692,10 @@ func explainNodeRTID(n optimizer.Node) (int32, bool) {
 	case *optimizer.MaterializedCTEScan:
 		rtid = p.RTID
 	case *optimizer.BitmapHeapScan:
+		rtid = p.RTID
+	case *optimizer.GenerateSeries:
+		rtid = p.RTID
+	case *optimizer.SetOp:
 		rtid = p.RTID
 	default:
 		return 0, false
@@ -861,6 +932,18 @@ func (nm *explainNames) resolvedColumn(n optimizer.Node, idx int, requireSetOp b
 			// through the first child — `"*SELECT* 2".wsr_web_site_sk` when
 			// that member stays a Subquery Scan, the scan's own column when
 			// it was pulled up (TPC-DS Q5's wsr arm, M0146-0042).
+			// An inheritance / partition appendrel's parent RTE is the
+			// Append itself (planScanRangeVar stamps its RTID): a Var of
+			// the parent deparses with the PARENT's refname — `t1.a`
+			// over `Seq Scan on t1 t1_1` — never the first member's
+			// (M0148-0001k, aggregates.out `Group Key: t1.a`).
+			if p.RTID != 0 && p.AppendRelName != "" && !p.IsUnionAllAppendRel() {
+				if name, ok := nm.bySource[p.RTID]; ok && name != "" {
+					if out := p.Output(); idx < len(out) {
+						return pgQuoteIdent(name) + "." + pgQuoteIdent(out[idx].Name)
+					}
+				}
+			}
 			if !requireSetOp && p.Op != parser.SetOpIntersect && p.Op != parser.SetOpExcept && !p.UnionDistinctInput &&
 				!p.IsUnionAllAppendRel() {
 				return ""

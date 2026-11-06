@@ -222,8 +222,11 @@ func TestPartialAggregateRefusals(t *testing.T) {
 		// order-independent (a scalar count), so nothing here became
 		// nondeterministic — keeps its exact positional comparison.
 		{name: "distinct-agg", sql: "SELECT count(DISTINCT v) FROM pq_agg"},
-		{name: "string_agg", sql: "SELECT string_agg(s, ',') FROM pq_agg", orderSensitive: true},
-		{name: "array_agg", sql: "SELECT array_agg(v) FROM pq_agg", orderSensitive: true},
+		// An aggregate's own ORDER BY still refuses the split (PG cannot
+		// partially aggregate an ordered call either). The unordered forms
+		// split since M0148-0001i — TestUnorderedStringArrayAggSplit.
+		{name: "string_agg-ordered", sql: "SELECT string_agg(s, ',' ORDER BY s) FROM pq_agg"},
+		{name: "array_agg-ordered", sql: "SELECT array_agg(v ORDER BY v) FROM pq_agg"},
 	}
 
 	for _, tc := range cases {
@@ -282,5 +285,40 @@ func TestPartialAggregateAccumulatorRetracted(t *testing.T) {
 				"previous run's",
 				i, first[i], second[i])
 		}
+	}
+}
+
+// TestUnorderedStringArrayAggSplit: unordered array_agg / string_agg split
+// across the Gather as PG 18 splits them (array_agg_combine,
+// string_agg_combine; aggregates.sql v_pagg_test, M0148-0001i). The combined
+// value concatenates the partial states in arrival order, which PG leaves
+// unspecified without an ORDER BY, so the result is compared with the serial
+// one as a multiset: a dropped or duplicated element still fails.
+func TestUnorderedStringArrayAggSplit(t *testing.T) {
+	ctx, cleanup := pqAggFixture(t)
+	defer cleanup()
+	for _, sql := range []string{
+		"SELECT string_agg(s, ',') FROM pq_agg",
+		"SELECT array_agg(v) FROM pq_agg",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			serialRows, err := runQueryWithErr(ctx, sql)
+			if err != nil {
+				t.Fatalf("serial: %v", err)
+			}
+			want := renderRows(serialRows)
+			got, isSplit := runAggSplit(t, ctx, sql, 4)
+			if !isSplit {
+				t.Fatal("unordered aggregate did not split (PG 18 splits it)")
+			}
+			if len(got) != len(want) {
+				t.Fatalf("got %d rows, want %d", len(got), len(want))
+			}
+			for i := range want {
+				if g, w := pqAggMultiset(got[i]), pqAggMultiset(want[i]); g != w {
+					t.Errorf("row %d: got %q, want %q (as multisets)", i, got[i], want[i])
+				}
+			}
+		})
 	}
 }

@@ -2677,12 +2677,10 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	// after server restart) are left alone — the EOS-sentinel rule
 	// in decodeRecord handles their trailing zeros if any.
 	wasNew := false
-	if s.cfg.Preallocate {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			wasNew = true
-		} else if err != nil {
-			return nil, fmt.Errorf("wal: stat %s: %w", path, err)
-		}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		wasNew = true
+	} else if err != nil {
+		return nil, fmt.Errorf("wal: stat %s: %w", path, err)
 	}
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -2690,7 +2688,19 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}
 
-	if wasNew {
+	if wasNew && !s.cfg.Preallocate {
+		// wal_init_zero = off: XLogFileInitInternal still makes the file
+		// full-size, writing a single byte at its end instead of
+		// zero-filling. A WAL segment file is always wal_segment_size bytes
+		// — archive recovery's "archive file has wrong size" check and
+		// external tools rely on it.
+		if err := f.Truncate(s.cfg.SegmentSize); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("wal: extend %s: %w", path, err)
+		}
+	}
+
+	if wasNew && s.cfg.Preallocate {
 		if err := preallocateSegment(f, s.cfg.SegmentSize); err != nil {
 			_ = f.Close()
 			return nil, err

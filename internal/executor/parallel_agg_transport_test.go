@@ -288,8 +288,14 @@ func aggRuntimeStateEqual(name string, a, b aggRuntime) bool {
 // dropping fields, a non-whitelist name has no rule, and a truncated or
 // padded frame is a corruption error, not a partial decode.
 func TestAggRuntimeSerializationRefusals(t *testing.T) {
-	if _, err := serializeAggRuntime("array_agg", &aggRuntime{}); err == nil {
-		t.Error("array_agg serialised — the whitelist and the codec disagree")
+	if _, err := serializeAggRuntime("percentile_cont", &aggRuntime{}); err == nil {
+		t.Error("percentile_cont serialised — the whitelist and the codec disagree")
+	}
+	if _, err := serializeAggRuntime("array_agg", &aggRuntime{arrayElems: []string{"1"}, arrayElemKeys: [][]Datum{{NewIntDatum(1)}}}); err == nil {
+		t.Error("an ordered array_agg state serialised — its sort keys would be dropped")
+	}
+	if _, err := serializeAggRuntime("string_agg", &aggRuntime{strElems: []string{"a"}}); err == nil {
+		t.Error("an ordered string_agg state serialised — its sort keys would be dropped")
 	}
 	if _, err := serializeAggRuntime("count", &aggRuntime{distinct: map[string]struct{}{"x": {}}}); err == nil {
 		t.Error("a DISTINCT-carrying state serialised — the field belt is open")
@@ -297,8 +303,11 @@ func TestAggRuntimeSerializationRefusals(t *testing.T) {
 	if _, err := serializeAggRuntime("sum", &aggRuntime{strAccum: []byte("ab")}); err == nil {
 		t.Error("a string_agg accumulator serialised through the sum arm")
 	}
+	if _, err := deserializeAggRuntime("percentile_cont", []byte{1}); err == nil {
+		t.Error("percentile_cont deserialised")
+	}
 	if _, err := deserializeAggRuntime("array_agg", []byte{1}); err == nil {
-		t.Error("array_agg deserialised")
+		t.Error("a truncated array_agg frame decoded")
 	}
 	if _, err := deserializeAggRuntime("count", []byte{1, 2}); err == nil {
 		t.Error("a truncated count frame decoded")

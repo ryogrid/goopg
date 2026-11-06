@@ -249,8 +249,8 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 		cols[i] = col
 	}
 	var predExpr optimizer.Expr
-	if idx.HasPredicate && idx.Predicate != nil {
-		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
+	if idx.HasPredicate {
+		predExpr, _ = optimizer.ResolveIndexPredicateOf(idx, tbl)
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	tblRel := o.ctx.Catalog.RelFileNode(tbl)
@@ -453,8 +453,8 @@ func (o *reindexOp) buildIndexShadow(idx *catalog.Index, pos int) (storage.RelFi
 		cols[i] = col
 	}
 	var predExpr optimizer.Expr
-	if idx.HasPredicate && idx.Predicate != nil {
-		predExpr, _ = optimizer.ResolveIndexPredicate(idx.Predicate, tbl)
+	if idx.HasPredicate {
+		predExpr, _ = optimizer.ResolveIndexPredicateOf(idx, tbl)
 	}
 	shadowRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	shadowRel.RelOid = o.ctx.Catalog.AllocOID()

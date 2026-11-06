@@ -155,6 +155,8 @@ func TestUpperSplitLosesWhenGroupingReducesNothing(t *testing.T) {
 // `count(distinct …)` cannot be split, but the Gather still belongs BELOW it —
 // which is what `terminatesPartial` makes the post-pass do. Gating the whole
 // producer on decomposability cost TPC-H Q16 its Gather in the C-19h census.
+// A DISTINCT aggregate is never hashed (numOrderedAggs, M0148-0001j), so the
+// gathered arm is a sorted one: a Sort over the Gather, or a Gather Merge.
 func TestUpperSplitOffersTheGatheredArmForANonSplittableAggregate(t *testing.T) {
 
 	agg := sizedAggFixture(t, 5_900_000, 2, 8, 2)
@@ -170,7 +172,15 @@ func TestUpperSplitOffersTheGatheredArmForANonSplittableAggregate(t *testing.T) 
 	}
 	gathered := false
 	for _, p := range grouped.Pathlist {
-		if p.Kind == PathAgg && len(p.Children) == 1 && p.Children[0].Kind == PathGather {
+		if p.Kind != PathAgg || len(p.Children) != 1 {
+			continue
+		}
+		if p.AggStrategy == AggStrategyHashed {
+			t.Errorf("a DISTINCT aggregate got a hashed candidate: %v", p.Cost)
+		}
+		in := p.Children[0]
+		if in.Kind == PathGatherMerge ||
+			(in.Kind == PathSort && len(in.Children) == 1 && in.Children[0].Kind == PathGather) {
 			gathered = true
 		}
 	}

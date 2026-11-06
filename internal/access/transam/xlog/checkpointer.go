@@ -210,7 +210,8 @@ type CheckpointerConfig struct {
 	TruncateCLOGFn func() error
 
 	// TruncateSubtransFn, when non-nil, is called at the end of each
-	// successful checkpoint AFTER the checkpoint marker is durable, alongside
+	// successful checkpoint AFTER the checkpoint marker is durable — and at
+	// each adopted restartpoint on a standby (CreateRestartPoint) — alongside
 	// TruncateCLOGFn, to truncate pg_subtrans (both the in-memory subxact map
 	// and its on-disk SLRU mirror) up to the same conservative horizon
 	// (M0122-0009). Without this, a long-lived cluster's subxact parent-link
@@ -321,6 +322,9 @@ type Checkpointer struct {
 	// fake. nil disables WAL pruning entirely (the v0 default —
 	// caller opts in by passing SetRetainer).
 	retainer Retainer
+	// archiveCleanupSrc reports archive_cleanup_command's current value
+	// (PGC_SIGHUP, read at each restartpoint); nil: none (M0122-0013).
+	archiveCleanupSrc atomic.Pointer[func() string]
 
 	// intervalOverrideNS carries SIGHUP/reload-driven interval changes to
 	// the Run loop (parity bundle D-2): the armed ticker is rebuilt from
@@ -347,6 +351,24 @@ type Checkpointer struct {
 	distMu                     sync.Mutex
 	priorRedoLSN               uint64
 	checkPointDistanceEstimate float64
+
+	// runMu makes checkpoints one at a time, as PG's single checkpointer
+	// process does: the timer and volume triggers, SQL CHECKPOINT, base
+	// backup, promotion and the shutdown checkpoint used to be able to run
+	// runCheckpoint concurrently (M0122-0013).
+	runMu sync.Mutex
+	// pendingImmediate counts callers waiting for runMu that want an
+	// IMMEDIATE checkpoint; immediateWake interrupts a spread checkpoint's
+	// pacer sleep. Together they are PG's ImmediateCheckpointRequested:
+	// CheckpointWriteDelay stops throttling once an immediate request is
+	// queued, so the running checkpoint finishes at full speed and the
+	// waiter's own checkpoint follows.
+	pendingImmediate atomic.Int32
+	immediateWake    chan struct{}
+	// requestC carries RequestCheckpoint's no-wait requests to Run;
+	// loopRunning reports whether Run is serving it.
+	requestC    chan struct{}
+	loopRunning atomic.Bool
 
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
@@ -387,9 +409,11 @@ func (c *Checkpointer) Stats() Stats {
 func NewCheckpointer(flusher DirtyPageFlusher, wal checkpointWAL, cfg CheckpointerConfig) *Checkpointer {
 	cfg.withDefaults()
 	c := &Checkpointer{
-		flusher: flusher,
-		wal:     wal,
-		cfg:     cfg,
+		flusher:       flusher,
+		wal:           wal,
+		cfg:           cfg,
+		immediateWake: make(chan struct{}, 1),
+		requestC:      make(chan struct{}, 1),
 	}
 	c.statsResetAt.Store(time.Now().UnixNano())
 	return c
@@ -512,6 +536,20 @@ func (c *Checkpointer) SetMaxWALBytes(b uint64) {
 // disables pruning (the v0 default). Production wiring passes a
 // *SlotAwareRetainer that consults the replication-slot registry.
 // Call before Run starts.
+// SetArchiveCleanupCommandSource installs the reader of
+// archive_cleanup_command, which a standby's restartpoint runs once it has
+// adopted a replayed checkpoint (CreateRestartPoint, xlog.c). nil: none.
+func (c *Checkpointer) SetArchiveCleanupCommandSource(fn func() string) {
+	if c == nil {
+		return
+	}
+	if fn == nil {
+		c.archiveCleanupSrc.Store(nil)
+		return
+	}
+	c.archiveCleanupSrc.Store(&fn)
+}
+
 func (c *Checkpointer) SetRetainer(r Retainer) {
 	c.retainer = r
 }
@@ -574,6 +612,8 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	// seed and be absorbed into the anchor, which silently widens the
 	// first max_wal_size window. Production semantics are unchanged —
 	// both hooks still bracket the entire timer/volume loop.
+	c.loopRunning.Store(true)
+	defer c.loopRunning.Store(false)
 	if c.cfg.OnLoopStart != nil {
 		c.cfg.OnLoopStart()
 	}
@@ -585,6 +625,13 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-c.requestC:
+			// RequestCheckpoint: a forced, spread checkpoint — PG's
+			// CHECKPOINT_FORCE without IMMEDIATE. No idle skip (FORCE);
+			// counted as requested, not timed.
+			if err := c.runCheckpointOpts(ctx, checkpointOpts{spread: true}); err != nil {
+				c.cfg.Logger.Warn("requested checkpoint failed", "err", err)
+			}
 		case <-timer.C:
 			// Idle skip (xlog.c:7005–7019): a timeout checkpoint that would
 			// start at the same WAL position as the last completed one is a
@@ -743,7 +790,51 @@ func (c *Checkpointer) elapsedSegmentsNeeded() uint64 {
 // subcommand both call this. Spread/throttling is bypassed;
 // the caller asked for fast.
 func (c *Checkpointer) CheckpointNow() error {
-	return c.runCheckpoint(context.Background(), false, false)
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{})
+}
+
+// RequestCheckpoint asks for a forced checkpoint without waiting for it —
+// PG's RequestCheckpoint(CHECKPOINT_FORCE) (checkpointer.c): the request
+// sets the checkpointer's flags and wakes it, and the checkpoint is spread
+// over checkpoint_completion_target like a timed one. Requests made while
+// one is pending coalesce, as PG ORs request flags. Reports whether Run is
+// serving requests; when it is not (no checkpointer loop: tools, tests) the
+// request is dropped and the caller decides what to do.
+func (c *Checkpointer) RequestCheckpoint() bool {
+	if c == nil || !c.loopRunning.Load() {
+		return false
+	}
+	select {
+	case c.requestC <- struct{}{}:
+	default: // one is already pending; it will cover this request
+	}
+	return true
+}
+
+// CheckpointEndOfRecovery takes the checkpoint that ends archive recovery
+// without a promote trigger — CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT
+// (PerformRecoveryXLogAction, xlog.c). It is a shutdown-type checkpoint
+// record on the writer's (new) timeline whose PrevTimeLineID is prevTLI, the
+// timeline recovery ended on: PG lets the timeline change only in a
+// shutdown checkpoint or an end-of-recovery record, and this one is the
+// former. pg_control ends in DB_IN_PRODUCTION (PG stamps DB_SHUTDOWNED here
+// and StartupXLOG moves it to production right after).
+func (c *Checkpointer) CheckpointEndOfRecovery(prevTLI uint32) error {
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{endOfRecovery: true, prevTLI: prevTLI})
+}
+
+// announceImmediate registers a waiter for an IMMEDIATE checkpoint and
+// wakes a spread checkpoint's pacer so it stops throttling.
+func (c *Checkpointer) announceImmediate() {
+	c.pendingImmediate.Add(1)
+	select {
+	case c.immediateWake <- struct{}{}:
+	default:
+	}
 }
 
 // CheckpointShutdown runs a synchronous shutdown checkpoint: identical
@@ -758,7 +849,9 @@ func (c *Checkpointer) CheckpointNow() error {
 // WAL regardless of State, so this is primarily an on-disk
 // compatibility surface (M0110-0004 / RW-002).
 func (c *Checkpointer) CheckpointShutdown() error {
-	return c.runCheckpoint(context.Background(), false, true)
+	c.announceImmediate()
+	defer c.pendingImmediate.Add(-1)
+	return c.runCheckpointOpts(context.Background(), checkpointOpts{shutdown: true})
 }
 
 // SetRecoveryMode makes checkpoints flush received data without appending a
@@ -864,12 +957,47 @@ func (c *Checkpointer) nextMultiXact() (next, nextOffset, oldest uint32) {
 }
 
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
+	return c.runCheckpointOpts(ctx, checkpointOpts{spread: spread, shutdown: shutdown, timed: spread})
+}
+
+// checkpointOpts are the checkpoint request flags runCheckpointOpts acts on.
+type checkpointOpts struct {
+	spread   bool // paced over checkpoint_completion_target (not IMMEDIATE)
+	shutdown bool // shutdown checkpoint: pg_control state DB_SHUTDOWNED
+	timed    bool // checkpoint_timeout cause: pg_stat_checkpointer num_timed
+	// endOfRecovery is CHECKPOINT_END_OF_RECOVERY: "really a shutdown
+	// checkpoint, just issued at a different time" (CreateCheckPoint) — a
+	// shutdown-type record (no redo record, no running-xacts) whose
+	// PrevTimeLineID is prevTLI, the timeline recovery forked off from, so
+	// it marks the timeline change; the cluster stays in production.
+	endOfRecovery bool
+	prevTLI       uint32
+}
+
+// runCheckpointOpts runs one checkpoint, serialised with every other one
+// (runMu), as PG's single checkpointer process runs one at a time.
+func (c *Checkpointer) runCheckpointOpts(ctx context.Context, o checkpointOpts) error {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+	spread, shutdown := o.spread, o.shutdown
+	// recordShutdown selects the shutdown record format, which an
+	// end-of-recovery checkpoint shares; shutdown alone drives the
+	// DB_SHUTDOWNED state and the recovery-mode flush below.
+	recordShutdown := shutdown || o.endOfRecovery
+	if spread && c.pendingImmediate.Load() == 0 {
+		// A wake left by an immediate request that has since been served
+		// must not cut this checkpoint's first pacing step short.
+		select {
+		case <-c.immediateWake:
+		default:
+		}
+	}
 	if c.recoveryMode.Load() {
 		return c.runRecoveryFlush(ctx, shutdown)
 	}
 	start := time.Now()
 	checkpointType := "requested"
-	if spread {
+	if o.timed {
 		checkpointType = "scheduled"
 	}
 	// M0057-0001: log checkpoint start so benchmark runs can confirm
@@ -918,7 +1046,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// so the record itself marks the redo point (upstream comment, xlog.c).
 	var redoAppendErr error
 	sampleRedo := computeRedo
-	if c.cfg.PGCompatCheckpoints && !shutdown {
+	if c.cfg.PGCompatCheckpoints && !recordShutdown {
 		sampleRedo = func() uint64 {
 			rec, err := EncodeCheckpointRedoPG()
 			if err != nil {
@@ -1016,6 +1144,9 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// Resolve PrevTLI/OldestXidDB/OldestMultiDB and every floor now, so the
 	// pg_control writer below reads the same values the record encodes
 	// rather than re-deriving them.
+	if o.endOfRecovery && o.prevTLI != 0 {
+		cpFields.PrevTLI = o.prevTLI // XLogCtl->PrevTimeLineID (CreateCheckPoint)
+	}
 	cpFields = cpFields.withDefaults()
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
@@ -1029,7 +1160,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		// synthesises the running-xacts state on the wasShutdown path) and
 		// stamp oldestActiveXid = InvalidTransactionId, exactly like PG.
 		oldestActive := uint32(0)
-		if !shutdown {
+		if !recordShutdown {
 			xids, oldestRunning, latestCompleted := c.runningXacts(nextXid)
 			oldestActive = oldestRunning
 			rx, rerr := EncodeRunningXactsPG(uint32(max(nextXid, 3)), oldestRunning, latestCompleted, xids)
@@ -1043,7 +1174,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		var cerr error
 		cpFields.RedoLSN0 = redoLSN0
 		cpFields.OldestActiveXid = oldestActive
-		checkpointPayload, cerr = EncodeCheckpointPGFields(shutdown, cpFields)
+		checkpointPayload, cerr = EncodeCheckpointPGFields(recordShutdown, cpFields)
 		if cerr != nil {
 			return fmt.Errorf("encode checkpoint record: %w", cerr)
 		}
@@ -1134,7 +1265,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 			c.cfg.Logger.Warn("pg_control update failed after checkpoint", "err", err)
 		}
 	}
-	if spread {
+	if o.timed {
 		c.numTimed.Add(1)
 	} else {
 		c.numRequested.Add(1)
@@ -1231,6 +1362,17 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 			return fmt.Errorf("restartpoint pg_control read: %w", err)
 		}
 		if skip {
+			// The skip arm still runs UpdateMinRecoveryPoint(InvalidXLogRecPtr,
+			// true): minRecoveryPoint moves up to the end of the replayed WAL,
+			// so a standby restarted after this point does not open for
+			// read-only connections at a point before it (xlog.c, "it would be
+			// rather weird if the database opened up ... before the last
+			// shutdown") (M0122-0013).
+			if src := c.replayPosSrc.Load(); src != nil {
+				if err := raiseMinRecoveryPointToReplay(c.cfg.DataDir, (*src)()); err != nil {
+					return fmt.Errorf("restartpoint minRecoveryPoint update: %w", err)
+				}
+			}
 			if shutdown {
 				if _, err := adoptRestartPoint(c.cfg.DataDir, rp, haveRP, true); err != nil {
 					return fmt.Errorf("restartpoint pg_control update: %w", err)
@@ -1290,12 +1432,75 @@ func (c *Checkpointer) runRecoveryFlush(ctx context.Context, shutdown bool) erro
 					c.cfg.Logger.Warn("restartpoint wal retention failed", "err", err)
 				}
 			}
+			// CreateRestartPoint then truncates pg_subtrans
+			// (TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning()),
+			// xlog.c) — without it a long-running standby's subxact map and
+			// pg_subtrans segments grew without bound. PG skips it when
+			// hot_standby is off because StartupSUBTRANS has not run; goopg's
+			// standby always serves reads and its subxact map is always live,
+			// so it truncates on every adopted restartpoint. The hook's
+			// horizon (≤ datfrozenxid) is older than any transaction still
+			// running on the primary.
+			if c.cfg.TruncateSubtransFn != nil {
+				if err := c.cfg.TruncateSubtransFn(); err != nil {
+					c.cfg.Logger.Warn("restartpoint subtrans truncation failed", "err", err)
+				}
+			}
+			c.runArchiveCleanupCommand(rp)
 		}
 	}
 	c.numRequested.Add(1)
 	c.cfg.Logger.Info("recovery checkpoint complete", "type", "standby",
 		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// runArchiveCleanupCommand is CreateRestartPoint's last step (xlog.c): with
+// archive_cleanup_command set, ExecuteRecoveryCommand runs it with %r naming
+// the WAL file of the oldest restartpoint — pg_control's checkPointCopy.redo
+// and timeline, which the restartpoint just made rp's. Only the arm that
+// adopted a restartpoint gets here; the skip arm returns first. A failure is
+// a WARNING (failOnSignal false); an invalid placeholder, PG's ERROR in the
+// checkpointer, is logged and the checkpointer carries on.
+func (c *Checkpointer) runArchiveCleanupCommand(rp ReplayedCheckpoint) {
+	src := c.archiveCleanupSrc.Load()
+	if src == nil {
+		return
+	}
+	cmd := (*src)()
+	if cmd == "" {
+		return
+	}
+	if _, err := ExecuteRecoveryCommand(cmd, "archive_cleanup_command", rp.Fields.RedoLSN0, rp.Fields.ThisTLI, c.cfg.SegmentSize); err != nil {
+		c.cfg.Logger.Warn("archive_cleanup_command failed", "err", err)
+	}
+}
+
+// raiseMinRecoveryPointToReplay is UpdateMinRecoveryPoint(InvalidXLogRecPtr,
+// true) as the checkpointer runs it (xlog.c): with pg_control's
+// minRecoveryPoint unset nothing moves (updateMinRecoveryPoint goes false);
+// otherwise minRecoveryPoint is raised to the replay position —
+// GetCurrentReplayRecPtr, PG's lastReplayedEndRecPtr, which is replayEnd
+// (StreamReplayer.ApplyLSN) — when that is later. The timeline stays
+// pg_control's: goopg's replayer follows one timeline and tracks none, so
+// minRecoveryPointTLI (or, unset, checkPointCopy's) is the replay timeline.
+func raiseMinRecoveryPointToReplay(dataDir string, replayEnd uint64) error {
+	raise := func(cd *control.ControlFileData) bool {
+		return cd.MinRecoveryPoint != 0 && cd.MinRecoveryPoint < replayEnd
+	}
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil || !raise(cd) {
+		return err
+	}
+	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		if !raise(cd) {
+			return
+		}
+		cd.MinRecoveryPoint = replayEnd
+		if cd.MinRecoveryPointTLI == 0 {
+			cd.MinRecoveryPointTLI = cd.CheckPointCopyThisTLI
+		}
+	})
 }
 
 // restartPointSkips is CreateRestartPoint's skip test: no replayed checkpoint
@@ -1402,6 +1607,12 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 		if progress >= 1.0 {
 			return nil
 		}
+		// ImmediateCheckpointRequested (checkpointer.c CheckpointWriteDelay):
+		// a queued IMMEDIATE request ends the throttling, so this
+		// checkpoint finishes at full speed and the waiter's follows.
+		if c.pendingImmediate.Load() > 0 {
+			return nil
+		}
 		deadline := start.Add(time.Duration(float64(target) * progress))
 		wait := time.Until(deadline)
 		if wait <= 0 {
@@ -1410,6 +1621,8 @@ func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.T
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.immediateWake:
+			return nil
 		case <-time.After(wait):
 			return nil
 		}

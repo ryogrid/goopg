@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -59,12 +60,25 @@ const promoteSignalPollInterval = 250 * time.Millisecond
 type standbyController struct {
 	rt     *initdb.Runtime
 	logger *slog.Logger
+	// recoveryEndCommand reads recovery_end_command (PGC_SIGHUP) at
+	// promotion time; nil reads as empty (M0122-0013).
+	recoveryEndCommand func() string
 
 	receiverCancel context.CancelFunc
 	receiverDone   chan struct{}
 	replayerCancel context.CancelFunc
 	replayerDone   chan struct{}
 	replayer       *xlog.StreamReplayer
+
+	// consistentAt is the replay position at which recovery becomes
+	// consistent (CheckRecoveryConsistency: minRecoveryPoint, raised to the
+	// checkpoint's redo as InitWalRecovery does, and backupEndPoint), as a
+	// PG position; consistent latches once replay has passed it.
+	// neverConsistent is set when pg_control says backupEndRequired — the
+	// XLOG_BACKUP_END goopg never emits would be needed first.
+	consistentAt    uint64
+	neverConsistent bool
+	consistent      atomic.Bool
 
 	// signalCancel cancels the promote.signal poller goroutine.
 	// Close cancels it explicitly; a successful Promote also
@@ -170,26 +184,44 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *misc.Reg
 		// WAL, as PG's XLogPageRead does, not by the received WAL.
 		rt.Checkpointer.SetReplayPositionSource(replayer.ApplyLSN)
 	}
+	var systemID uint64
+	var rcvWALDir string
+	if rt.DataDir != "" {
+		systemID, _ = initdb.LoadOrCreateSystemID(rt.DataDir)
+		rcvWALDir = walDirFor(rt)
+	}
 	replication.StartWalReceiver(rcvCtx, rcvDone, replication.WalReceiverLauncherConfig{
 		WAL:          rt.WAL,
 		Receivers:    rt.WalReceivers,
 		Registry:     registry,
 		Logger:       logger,
 		ApplyLSNFunc: standbyApplyLSNFunc(replayer),
+		SystemID:     systemID,
+		WALDir:       rcvWALDir,
+		OnEndOfTimeline: func(eot *replication.EndOfTimeline) {
+			if rcvWALDir == "" {
+				return
+			}
+			if _, err := followUpstreamTimeline(rt.WAL, rcvWALDir, rt.DataDir, recoveryTargetTimeline(registry), logger); err != nil {
+				logger.Warn("standby: could not follow the upstream's timeline switch", "err", err)
+			}
+		},
 	})
 
 	sc := &standbyController{
-		rt:             rt,
-		logger:         logger,
-		receiverCancel: rcvCancel,
-		receiverDone:   rcvDone,
-		replayerCancel: rplCancel,
-		replayerDone:   rplDone,
-		replayer:       replayer,
-		signalCancel:   sigCancel,
-		signalDone:     sigDone,
-		walLevel:       walLevelEnum(stringGUC(registry, "wal_level", "replica")),
+		rt:                 rt,
+		logger:             logger,
+		recoveryEndCommand: func() string { return stringGUC(registry, "recovery_end_command", "") },
+		receiverCancel:     rcvCancel,
+		receiverDone:       rcvDone,
+		replayerCancel:     rplCancel,
+		replayerDone:       rplDone,
+		replayer:           replayer,
+		signalCancel:       sigCancel,
+		signalDone:         sigDone,
+		walLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
 	}
+	sc.consistentAt, sc.neverConsistent = recoveryConsistencyPoint(rt.DataDir)
 	// Clear any stale promote.signal left by a previous run before
 	// starting the watcher. Upstream's xlogrecovery.c initialises
 	// the trigger state in StartupXLOG before the replay loop ever
@@ -358,8 +390,12 @@ func (sc *standbyController) finalizePromotion() error {
 		if err != nil {
 			return fmt.Errorf("promote: load timeline_id: %w", err)
 		}
-		newTLI := oldTLI + 1
 		walDir := walDirFor(sc.rt)
+		// StartupXLOG: newTLI = findNewestTimeLine(recoveryTargetTLI) + 1.
+		// The walreceiver fetches the primary's history files, so a
+		// timeline the primary (or a sibling standby) already used is
+		// skipped instead of reused.
+		newTLI := xlog.FindNewestTimeline(walDir, oldTLI) + 1
 
 		// The switch point is the end of the last record replay
 		// applied: received bytes past it are a partial record, which
@@ -394,34 +430,8 @@ func (sc *standbyController) finalizePromotion() error {
 		}); err != nil {
 			return fmt.Errorf("promote: update pg_control TLI: %w", err)
 		}
-		// Move the running writer onto the new timeline at once, and
-		// make XLOG_END_OF_RECOVERY its first record, as StartupXLOG does
-		// at the end of archive recovery (XLogInitNewTimeline,
-		// CreateEndOfRecoveryRecord). The writer used to stay on the old
-		// timeline until restart, so post-promotion WAL carried the old
-		// TLI and the first checkpoint stamped it back into pg_control.
-		if sc.rt.WAL != nil && endLSN > 0 {
-			if err := sc.rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
-				return fmt.Errorf("promote: switch WAL timeline: %w", err)
-			}
-			rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, sc.walLevel)
-			if err != nil {
-				return fmt.Errorf("promote: encode end-of-recovery record: %w", err)
-			}
-			_, recEnd, err := sc.rt.WAL.Append(rec)
-			if err != nil {
-				return fmt.Errorf("promote: write end-of-recovery record: %w", err)
-			}
-			if err := sc.rt.WAL.FlushUpTo(recEnd); err != nil {
-				return fmt.Errorf("promote: flush end-of-recovery record: %w", err)
-			}
-			// So crash recovery follows the timeline change to here.
-			if err := control.UpdateControlFile(sc.rt.DataDir, func(cd *control.ControlFileData) {
-				cd.MinRecoveryPoint = recEnd
-				cd.MinRecoveryPointTLI = newTLI
-			}); err != nil {
-				return fmt.Errorf("promote: update pg_control min recovery point: %w", err)
-			}
+		if err := switchWriterToNewTimeline(sc.rt, oldTLI, newTLI, endLSN, prevRecPtr, sc.walLevel); err != nil {
+			return fmt.Errorf("promote: %w", err)
 		}
 		sc.logger.Info("promote: timeline bumped",
 			"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
@@ -440,6 +450,17 @@ func (sc *standbyController) finalizePromotion() error {
 		sc.rt.Checkpointer.SetRestartPointSource(nil)
 		sc.rt.Checkpointer.SetReplayPositionSource(nil)
 	}
+	// Archive recovery is over: run recovery_end_command, as
+	// CleanupAfterArchiveRecovery does before StartupXLOG stamps
+	// DB_IN_PRODUCTION (xlog.c). A command killed by a signal fails the
+	// promotion (failOnSignal); any other failure is a WARNING.
+	var endCmd string
+	if sc.recoveryEndCommand != nil {
+		endCmd = sc.recoveryEndCommand()
+	}
+	if err := runRecoveryEndCommand(sc.rt, endCmd, sc.logger); err != nil {
+		return fmt.Errorf("promote: %w", err)
+	}
 	// Recovery is over: pg_control leaves DB_IN_ARCHIVE_RECOVERY for
 	// DB_IN_PRODUCTION, as the end of StartupXLOG stamps it after promotion
 	// (xlog.c:6204-6211) (M0122-0013).
@@ -449,8 +470,46 @@ func (sc *standbyController) finalizePromotion() error {
 	}); err != nil {
 		return fmt.Errorf("promote: stamp pg_control DB_IN_PRODUCTION: %w", err)
 	}
+	// StartupXLOG ends a promotion by requesting an online checkpoint
+	// (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c): not needed for
+	// consistency, but the last restartpoint may be far back.
+	promotionCheckpoint(sc.rt, sc.logger)
 	sc.logger.Info("promote: standby.signal removed; runtime is now primary")
 	return nil
+}
+
+// promotionCheckpoint requests the online checkpoint StartupXLOG asks for at
+// the end of a promotion (RequestCheckpoint(CHECKPOINT_FORCE), xlog.c): not
+// needed for consistency, but the last restartpoint may be far back. The
+// promotion calls it once the writer is on the new timeline and the
+// checkpointer has left recovery mode, so the checkpoint record and
+// pg_control's checkPointCopy carry the new timeline. The checkpointer loop
+// serves the request; with no loop serving requests it runs here. A failure
+// is a WARNING — recovery itself is complete and the next scheduled
+// checkpoint redoes the bookkeeping, as endOfRecoveryCheckpoint treats it.
+// (Archive recovery ending without a promote trigger takes its
+// end-of-recovery checkpoint in endArchiveRecoveryOnNewTimeline instead.)
+func promotionCheckpoint(rt *initdb.Runtime, logger *slog.Logger) {
+	if rt == nil || rt.Checkpointer == nil {
+		return
+	}
+	// The checkpoint stamps the writer's timeline into pg_control. If the
+	// writer was not switched (no WAL to switch at), a checkpoint would
+	// undo the promotion's timeline; the scheduled checkpoint after a
+	// restart, when the writer opens on the new timeline, does it instead.
+	if rt.WAL != nil && rt.DataDir != "" {
+		if cd, err := control.ReadControlFile(rt.DataDir); err == nil && cd != nil && rt.WAL.TimelineID() < cd.CheckPointCopyThisTLI {
+			logger.Warn("end-of-recovery checkpoint skipped: the WAL writer is still on the old timeline",
+				"writer_tli", rt.WAL.TimelineID(), "control_tli", cd.CheckPointCopyThisTLI)
+			return
+		}
+	}
+	if rt.Checkpointer.RequestCheckpoint() {
+		return
+	}
+	if err := rt.Checkpointer.CheckpointNow(); err != nil {
+		logger.Warn("end-of-recovery checkpoint failed; promotion is complete but pg_control still points at the last restartpoint", "err", err)
+	}
 }
 
 // Close cancels both goroutines and waits for them to exit. Safe to
@@ -530,11 +589,250 @@ func boundPromoteToServer(sc *standbyController) func() error {
 	}
 }
 
+// followUpstreamTimeline is the startup process's turn when the upstream
+// reports that the timeline being streamed has ended — rescanLatestTimeLine
+// for recovery_target_timeline = 'latest', the expectedTLEs walk for a
+// numeric target; 'current' never moves. The target is the newest timeline
+// whose history file pg_wal holds (the walreceiver fetched the upstream's),
+// or the numeric one. Its history must list the current timeline ("new
+// timeline %u is not a child of database system timeline %u"), and the
+// local WAL must not extend past the point where the history leaves it
+// ("new timeline %u forked off current database system timeline %u before
+// current recovery point %X/%X"). When the local WAL ends exactly there, the
+// writer moves onto the timeline that follows the current one in the
+// target's history (SwitchTimeline: the switch segment is copied to the new
+// timeline's name), so the walreceiver's next connection streams it. It
+// reports whether the writer moved.
+func followUpstreamTimeline(w *xlog.Writer, walDir, dataDir string, goal xlog.TargetTimeline, logger *slog.Logger) (bool, error) {
+	cur := w.TimelineID()
+	var target uint32
+	switch goal.Goal {
+	case xlog.TargetTimelineCurrent:
+		return false, nil
+	case xlog.TargetTimelineNumeric:
+		target = goal.TLI
+	default:
+		target = xlog.FindNewestTimeline(walDir, cur)
+	}
+	if target <= cur {
+		return false, nil
+	}
+	history, err := xlog.ReadHistory(walDir, target)
+	if err != nil {
+		return false, err
+	}
+	next, switchLSN, found := target, uint64(0), false
+	for i, e := range history {
+		if e.TLI == cur {
+			switchLSN, found = e.SwitchLSN, true
+			if i+1 < len(history) {
+				next = history[i+1].TLI
+			}
+			break
+		}
+	}
+	if !found {
+		logger.Info(fmt.Sprintf("new timeline %d is not a child of database system timeline %d", target, cur))
+		return false, nil
+	}
+	pos := w.WrittenLSN()
+	if pos > switchLSN {
+		logger.Info(fmt.Sprintf("new timeline %d forked off current database system timeline %d before current recovery point %X/%X",
+			target, cur, uint32(pos>>32), uint32(pos)))
+		return false, nil
+	}
+	if pos < switchLSN {
+		// The rest of the current timeline has not arrived yet; the next
+		// connection streams it.
+		return false, nil
+	}
+	if dataDir != "" {
+		if err := initdb.WriteTimelineID(dataDir, next); err != nil {
+			return false, err
+		}
+	}
+	if err := w.SwitchTimeline(next, switchLSN, 0); err != nil {
+		return false, fmt.Errorf("follow timeline %d: %w", next, err)
+	}
+	logger.Info(fmt.Sprintf("new target timeline is %d", target))
+	return true, nil
+}
+
 // walDirFor is a small helper used by the standby launchers and
 // promotion path so they agree on where pg_wal lives. Centralising
 // this avoids drift if the layout ever changes.
 func walDirFor(rt *initdb.Runtime) string {
 	return filepath.Join(rt.DataDir, "pg_wal")
+}
+
+// switchWriterToNewTimeline moves the running WAL writer onto newTLI at
+// endLSN — the end of the last replayed record — and makes
+// XLOG_END_OF_RECOVERY its first record, as StartupXLOG does at the end of
+// archive recovery (XLogInitNewTimeline, CreateEndOfRecoveryRecord), then
+// points pg_control's minRecoveryPoint past it so crash recovery follows the
+// timeline change. The writer used to stay on the old timeline until
+// restart, so post-promotion WAL carried the old TLI. Shared by the
+// streaming promotion and the recovery.signal promotion.
+func switchWriterToNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN, prevRecPtr uint64, walLevel int32) error {
+	if rt.WAL == nil || endLSN == 0 {
+		return nil
+	}
+	if err := rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
+		return fmt.Errorf("switch WAL timeline: %w", err)
+	}
+	return appendEndOfRecoveryRecord(rt, oldTLI, newTLI, walLevel)
+}
+
+// endArchiveRecoveryOnNewTimeline moves the writer onto newTLI at endLSN and
+// ends archive recovery as PG does when no promote was triggered
+// (PerformRecoveryXLogAction): an end-of-recovery checkpoint —
+// CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT, a shutdown-type checkpoint
+// whose PrevTimeLineID is oldTLI — is the first record on the new timeline
+// and marks the timeline change, instead of the XLOG_END_OF_RECOVERY a
+// promotion writes. It runs before CleanupAfterArchiveRecovery's
+// recovery_end_command. Without a checkpointer (tools) the end-of-recovery
+// record marks the change instead. A failed checkpoint fails the start, as
+// an ERROR in PG's startup process does.
+func endArchiveRecoveryOnNewTimeline(rt *initdb.Runtime, oldTLI, newTLI uint32, endLSN, prevRecPtr uint64, walLevel int32) error {
+	if rt.WAL == nil || endLSN == 0 {
+		return nil
+	}
+	if rt.Checkpointer == nil {
+		return switchWriterToNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, walLevel)
+	}
+	if err := rt.WAL.SwitchTimeline(newTLI, endLSN, prevRecPtr); err != nil {
+		return fmt.Errorf("switch WAL timeline: %w", err)
+	}
+	if err := rt.Checkpointer.CheckpointEndOfRecovery(oldTLI); err != nil {
+		return fmt.Errorf("end-of-recovery checkpoint: %w", err)
+	}
+	return nil
+}
+
+// appendEndOfRecoveryRecord writes XLOG_END_OF_RECOVERY as the first record
+// on newTLI (CreateEndOfRecoveryRecord) and points minRecoveryPoint past it.
+func appendEndOfRecoveryRecord(rt *initdb.Runtime, oldTLI, newTLI uint32, walLevel int32) error {
+	rec, err := xlog.EncodeEndOfRecoveryPG(xlog.PGTimestampTz(time.Now()), newTLI, oldTLI, walLevel)
+	if err != nil {
+		return fmt.Errorf("encode end-of-recovery record: %w", err)
+	}
+	_, recEnd, err := rt.WAL.Append(rec)
+	if err != nil {
+		return fmt.Errorf("write end-of-recovery record: %w", err)
+	}
+	if err := rt.WAL.FlushUpTo(recEnd); err != nil {
+		return fmt.Errorf("flush end-of-recovery record: %w", err)
+	}
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.MinRecoveryPoint = recEnd
+		cd.MinRecoveryPointTLI = newTLI
+	}); err != nil {
+		return fmt.Errorf("update pg_control min recovery point: %w", err)
+	}
+	return nil
+}
+
+// adoptRestoredWAL brings the running WAL writer to endOfLog after archive
+// recovery. The segments restore_command supplied lie past the writer's
+// end — it never wrote them — so without this the writer resumed at its own
+// end and the first post-promotion record overwrote WAL whose changes
+// replay had already applied (a crash then left pages ahead of the WAL that
+// describes them; P0-E17). PG's startup process reads that WAL through its
+// own reader and the new timeline begins at EndOfLog (StartupXLOG). Feeding
+// the restored bytes through AppendRaw — the walreceiver's path, which writes
+// the identical bytes back into the same segment files, one segment at a
+// time — gives the writer the position a streaming standby would have, so
+// the shared timeline switch applies unchanged.
+//
+// When recovery followed the history onto newer timelines, the writer
+// crosses each switch the same way a standby following a timeline does:
+// append up to the timeline's begin, switch the writer onto it there, go on.
+// The switch zero-fills the new timeline's copy of the segment past its
+// begin (copySegmentPrefix), so those restored bytes are read before it.
+func adoptRestoredWAL(rt *initdb.Runtime, endOfLog uint64, timelines []xlog.TimelineSpan) error {
+	if rt.WAL == nil || endOfLog <= rt.WAL.WrittenLSN() {
+		return nil
+	}
+	walDir := walDirFor(rt)
+	segSize := uint64(rt.WAL.SegmentSize())
+	readRestored := func(a, b uint64) ([]byte, error) {
+		segNo, off := a/segSize, a%segSize
+		name, ok, err := xlog.NewestSegmentPath(walDir, segNo)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("segment %d missing", segNo)
+		}
+		f, err := os.Open(name)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		buf := make([]byte, b-a)
+		if _, err := f.ReadAt(buf, int64(off)); err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		return buf, nil
+	}
+	appendRange := func(a, b uint64) error {
+		for pos := a; pos < b; {
+			n := min(segSize-pos%segSize, b-pos)
+			buf, err := readRestored(pos, pos+n)
+			if err != nil {
+				return err
+			}
+			if _, _, err := rt.WAL.AppendRaw(buf); err != nil {
+				return fmt.Errorf("append: %w", err)
+			}
+			pos += n
+		}
+		return nil
+	}
+	for _, sp := range timelines {
+		if sp.TLI <= rt.WAL.TimelineID() || sp.Begin >= endOfLog {
+			continue
+		}
+		if sp.Begin < rt.WAL.WrittenLSN() {
+			return fmt.Errorf("adopt restored WAL: local WAL on timeline %d extends to %X, past timeline %d's start %X",
+				rt.WAL.TimelineID(), rt.WAL.WrittenLSN(), sp.TLI, sp.Begin)
+		}
+		if err := appendRange(rt.WAL.WrittenLSN(), sp.Begin); err != nil {
+			return fmt.Errorf("adopt restored WAL: %w", err)
+		}
+		segEnd := (sp.Begin/segSize + 1) * segSize
+		var hold []byte
+		if tail := min(segEnd, endOfLog); tail > sp.Begin {
+			b, err := readRestored(sp.Begin, tail)
+			if err != nil {
+				return fmt.Errorf("adopt restored WAL: %w", err)
+			}
+			hold = b
+		}
+		if err := rt.WAL.SwitchTimeline(sp.TLI, sp.Begin, 0); err != nil {
+			return fmt.Errorf("adopt restored WAL: follow timeline %d: %w", sp.TLI, err)
+		}
+		if len(hold) > 0 {
+			if _, _, err := rt.WAL.AppendRaw(hold); err != nil {
+				return fmt.Errorf("adopt restored WAL: append: %w", err)
+			}
+		}
+	}
+	if err := appendRange(rt.WAL.WrittenLSN(), endOfLog); err != nil {
+		return fmt.Errorf("adopt restored WAL: %w", err)
+	}
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		return fmt.Errorf("adopt restored WAL: flush: %w", err)
+	}
+	return nil
+}
+
+// archiveRecoveryEnd is what the recovery.signal promotion needs from the
+// archive recovery that preceded it.
+type archiveRecoveryEnd struct {
+	Recovery           xlog.ArchiveRecoveryResult // what RunArchiveRecovery replayed
+	RecoveryEndCommand string
+	WalLevel           int32
 }
 
 // promoteAfterRecovery runs the post-recovery promotion sequence for
@@ -546,8 +844,12 @@ func walDirFor(rt *initdb.Runtime) string {
 //  2. Append a history entry for oldTLI + endLSN.
 //  3. Write the timeline history file for newTLI.
 //  4. Persist newTLI to the flat file and pg_control.
-//  5. Remove recovery.signal.
-func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
+//  5. Bring the writer to EndOfLog (adoptRestoredWAL), switch it to newTLI
+//     and take the end-of-recovery checkpoint there — the first record on
+//     the new timeline (endArchiveRecoveryOnNewTimeline).
+//  6. Run recovery_end_command.
+//  7. Remove recovery.signal.
+func promoteAfterRecovery(rt *initdb.Runtime, end archiveRecoveryEnd, logger *slog.Logger) error {
 	if rt.DataDir == "" {
 		return nil
 	}
@@ -555,24 +857,55 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("promote after recovery: load timeline_id: %w", err)
 	}
-	newTLI := oldTLI + 1
+	rec := end.Recovery
+	// Recovery may have followed the history onto a newer timeline: the
+	// parent of the new one is the timeline recovery ended on (EndOfLogTLI),
+	// and the new one is past every timeline the archive knows
+	// (findNewestTimeLine + 1, StartupXLOG), so it cannot collide.
+	if rec.EndTLI > oldTLI {
+		oldTLI = rec.EndTLI
+	}
+	newTLI := max(oldTLI, rec.NewestTLI) + 1
 	walDir := walDirFor(rt)
 
-	// Use WrittenLSN as the switch point (the archive recovery loop
-	// replayed everything through the WAL writer).
-	var endLSN uint64
+	// The switch point is PG's EndOfLog: the end of the last record
+	// replayed (xlog.c StartupXLOG → writeTimeLineHistory). Segments the
+	// archive supplied lie past the writer's own end, so their last record
+	// (endOfLog, from RunArchiveRecovery) is the switch point when there is
+	// one; otherwise the local WAL the writer holds ends the log.
+	var endLSN, prevRecPtr uint64
 	if rt.WAL != nil {
+		// Archive recovery may have replaced a segment the writer opened
+		// before recovery (the archived copy wins over pg_wal); from here on
+		// every write must reach the file now in pg_wal.
+		if err := rt.WAL.ReopenSegmentFiles(); err != nil {
+			return fmt.Errorf("promote after recovery: %w", err)
+		}
 		endLSN = rt.WAL.WrittenLSN()
+		_, prevRecPtr = rt.WAL.InsertPosition()
+	}
+	if rec.EndOfLog > endLSN {
+		if err := adoptRestoredWAL(rt, rec.EndOfLog, rec.Timelines); err != nil {
+			return fmt.Errorf("promote after recovery: %w", err)
+		}
+		endLSN, prevRecPtr = rec.EndOfLog, rec.LastStart-1
 	}
 
-	prev, err := xlog.ReadHistory(walDir, oldTLI)
-	if err != nil {
-		return fmt.Errorf("promote after recovery: read prior history: %w", err)
+	// writeTimeLineHistory copies the parent's history: archive recovery
+	// read the target timeline's history through RECOVERYHISTORY without
+	// keeping it in pg_wal, so the parent's entries come from there when the
+	// parent is the target; otherwise from the pg_wal copy.
+	prev := rec.TargetHistory
+	if oldTLI != rec.TargetTLI || rec.TargetTLI == 0 {
+		var err error
+		if prev, err = xlog.ReadHistory(walDir, oldTLI); err != nil {
+			return fmt.Errorf("promote after recovery: read prior history: %w", err)
+		}
 	}
-	entries := append(prev, xlog.TimelineHistoryEntry{
+	entries := append(append([]xlog.TimelineHistoryEntry(nil), prev...), xlog.TimelineHistoryEntry{
 		TLI:       oldTLI,
 		SwitchLSN: endLSN,
-		Reason:    "archive recovery complete",
+		Reason:    rec.StopReason(), // getRecoveryStopReason
 	})
 	if err := xlog.WriteHistory(walDir, newTLI, entries); err != nil {
 		return fmt.Errorf("promote after recovery: write timeline history: %w", err)
@@ -586,6 +919,30 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 	}); err != nil {
 		return fmt.Errorf("promote after recovery: update pg_control TLI: %w", err)
 	}
+	// Archive recovery ran with recovery-mode checkpoints (no WAL records);
+	// the end-of-recovery checkpoint on the new timeline is a real one.
+	if rt.Checkpointer != nil {
+		rt.Checkpointer.SetRecoveryMode(false)
+	}
+	if err := endArchiveRecoveryOnNewTimeline(rt, oldTLI, newTLI, endLSN, prevRecPtr, end.WalLevel); err != nil {
+		return fmt.Errorf("promote after recovery: %w", err)
+	}
+	// Recovery is over: DB_IN_ARCHIVE_RECOVERY → DB_IN_PRODUCTION, as the end
+	// of StartupXLOG stamps it (the end-of-recovery checkpoint already does
+	// when there is a checkpointer).
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("promote after recovery: stamp pg_control DB_IN_PRODUCTION: %w", err)
+	}
+
+	// CleanupAfterArchiveRecovery runs recovery_end_command once archive
+	// recovery has ended (xlog.c). A signal-killed command is FATAL: the
+	// recovery.signal stays, so the next start retries recovery.
+	if err := runRecoveryEndCommand(rt, end.RecoveryEndCommand, logger); err != nil {
+		return fmt.Errorf("promote after recovery: %w", err)
+	}
 
 	if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
 		return fmt.Errorf("promote after recovery: remove recovery.signal: %w", err)
@@ -593,6 +950,68 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 	logger.Info("archive recovery promotion complete",
 		"old_tli", oldTLI, "new_tli", newTLI, "switch_lsn", endLSN,
 		"history_file", filepath.Join(walDir, xlog.TimelineHistoryFileName(newTLI)))
+	return nil
+}
+
+// validateRecoveryParameters is the compulsory-parameter check of PG's
+// validateRecoveryParameters (xlogrecovery.c), run when archive recovery was
+// requested (a standby.signal or recovery.signal file):
+//   - standby mode with neither primary_conninfo nor restore_command: a
+//     WARNING — the server polls pg_wal for files placed there;
+//   - archive recovery without standby mode and without restore_command:
+//     FATAL, returned as an error; the start aborts and recovery.signal
+//     stays, so the operator can supply the command and restart.
+//
+// goopg used to warn, delete recovery.signal and start as a primary, which
+// opened a restored backup without replaying its archived WAL.
+func validateRecoveryParameters(rt *initdb.Runtime, restoreCommand, primaryConnInfo string, logger *slog.Logger) error {
+	if rt == nil || (!rt.Standby && !rt.Recovery) {
+		return nil
+	}
+	if rt.Standby {
+		if primaryConnInfo == "" && restoreCommand == "" {
+			logger.Warn(`specified neither "primary_conninfo" nor "restore_command"`,
+				"hint", "The database server will regularly poll the pg_wal subdirectory to check for files placed there.")
+		}
+		return nil
+	}
+	if restoreCommand == "" {
+		return errors.New(`must specify "restore_command" when standby mode is not enabled`)
+	}
+	return nil
+}
+
+// runRecoveryEndCommand is the recovery_end_command arm of PG's
+// CleanupAfterArchiveRecovery (xlog.c): ExecuteRecoveryCommand with
+// failOnSignal true. %r is the WAL file holding the oldest restartpoint's
+// redo — GetOldestRestartPoint reads pg_control's checkPointCopy (redo and
+// timeline). A command that fails with a signal (or a shell status above
+// 125, wait_result_is_any_signal) is FATAL, returned as an error; any other
+// failure is a WARNING and recovery ends normally. Empty command: nothing
+// runs.
+func runRecoveryEndCommand(rt *initdb.Runtime, command string, logger *slog.Logger) error {
+	if command == "" || rt == nil || rt.DataDir == "" {
+		return nil
+	}
+	cd, err := control.ReadControlFile(rt.DataDir)
+	if err != nil {
+		return fmt.Errorf("recovery_end_command: read pg_control: %w", err)
+	}
+	if cd == nil {
+		return fmt.Errorf("recovery_end_command: pg_control missing")
+	}
+	segSize := xlog.DefaultSegmentSize
+	if rt.WAL != nil && rt.WAL.SegmentSize() > 0 {
+		segSize = rt.WAL.SegmentSize()
+	}
+	anySignal, err := xlog.ExecuteRecoveryCommand(command, "recovery_end_command", cd.CheckPointCopyRedo, cd.CheckPointCopyThisTLI, segSize)
+	if err == nil {
+		return nil
+	}
+	if anySignal {
+		return err
+	}
+	logger.Warn("recovery_end_command failed", "err", err)
 	return nil
 }
 
@@ -605,3 +1024,218 @@ func promoteAfterRecovery(rt *initdb.Runtime, logger *slog.Logger) error {
 var _ postmaster.Config
 var _ = xlog.DefaultSegmentSize
 var _ = walDirFor
+
+// endInterruptedArchiveRecovery ends goopg start when recovery.signal's
+// archive recovery did not run to the end of the archive. Recovery is left
+// unfinished — no promotion, recovery.signal stays, so the next start
+// resumes archive recovery — and nothing is written to WAL: the runtime's
+// Close skips its shutdown checkpoint, as a server still in recovery writes
+// no checkpoint record.
+//
+//   - An immediate shutdown (SIGQUIT; immediate is set) ends here with exit 0
+//     and no pg_control update at all.
+//   - A shutdown request (xlog.ErrRecoveryShutdown: SIGTERM/SIGINT, or the
+//     restore_command child killed by SIGTERM) is upstream's fast shutdown
+//     during recovery: the startup process exits, the checkpointer's
+//     shutdown restartpoint (CreateRestartPoint with CHECKPOINT_IS_SHUTDOWN)
+//     records DB_SHUTDOWNED_IN_RECOVERY, and the postmaster exits 0.
+//   - Anything else — a FATAL restore_command failure (a signal or an
+//     unrunnable command), a read or replay error — is the startup process
+//     dying FATAL: the postmaster aborts startup and exits 1, and pg_control
+//     keeps its in-recovery state, so the next start recovers again.
+func endInterruptedArchiveRecovery(rt *initdb.Runtime, err error, immediate bool, logger *slog.Logger, stderr io.Writer) int {
+	rt.SetImmediateShutdown()
+	if immediate && errors.Is(err, xlog.ErrRecoveryShutdown) {
+		// An immediate shutdown (SIGQUIT) writes nothing — no shutdown
+		// restartpoint, so pg_control keeps its in-recovery state.
+		return 0
+	}
+	if errors.Is(err, xlog.ErrRecoveryShutdown) {
+		logger.Info("received fast shutdown request during archive recovery; recovery not completed, recovery.signal kept")
+		if uerr := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateShutdownedInRecovery
+			cd.Time = time.Now().Unix()
+		}); uerr != nil && !errors.Is(uerr, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "goopg start: archive recovery: could not update pg_control: %v\n", uerr)
+			return 1
+		}
+		logger.Info("database system is shut down")
+		return 0
+	}
+	fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+	var fatal *xlog.RestoreFatalError
+	if errors.As(err, &fatal) && fatal.Detail != "" {
+		fmt.Fprintf(stderr, "DETAIL: %s\n", fatal.Detail)
+	}
+	return 1
+}
+
+// recoveryTargetTimeline reads recovery_target_timeline (PGC_POSTMASTER)
+// for archive recovery; its check hook already rejected an unparseable
+// value when the configuration was loaded.
+func recoveryTargetTimeline(registry *misc.Registry) xlog.TargetTimeline {
+	// The raw value, not stringGUC's fallback: an empty setting is
+	// strtoul("") = timeline 0, which recovery then reports as missing.
+	value := "latest"
+	if registry != nil {
+		if v, ok := registry.Get("recovery_target_timeline"); ok {
+			value = v.Display()
+		}
+	}
+	goal, tli, _ := misc.ParseRecoveryTargetTimeline(value)
+	switch goal {
+	case misc.RecoveryTargetTimelineCurrent:
+		return xlog.TargetTimeline{Goal: xlog.TargetTimelineCurrent}
+	case misc.RecoveryTargetTimelineNumeric:
+		return xlog.TargetTimeline{Goal: xlog.TargetTimelineNumeric, TLI: tli}
+	}
+	return xlog.TargetTimeline{Goal: xlog.TargetTimelineLatest}
+}
+
+// recoveryStop reads recovery_target_lsn and recovery_target_inclusive
+// (their check hooks validated them when the configuration was loaded).
+func recoveryStop(registry *misc.Registry) xlog.RecoveryStop {
+	stop := xlog.RecoveryStop{Inclusive: boolGUC(registry, "recovery_target_inclusive", true)}
+	if value := stringGUC(registry, "recovery_target_lsn", ""); value != "" {
+		stop.LSN, stop.Set = misc.ParsePGLSN(value)
+	}
+	if xid, set, ok := misc.ParseRecoveryTargetXid(stringGUC(registry, "recovery_target_xid", "")); set && ok {
+		stop.Xid, stop.XidSet = xid, true
+	}
+	return stop
+}
+
+// checkSingleRecoveryTarget is error_multiple_recovery_targets: at most one
+// recovery target may be set. PG raises it from the target GUCs' assign
+// hooks while the configuration loads, so the server does not start.
+func checkSingleRecoveryTarget(registry *misc.Registry) error {
+	if stringGUC(registry, "recovery_target_lsn", "") != "" && stringGUC(registry, "recovery_target_xid", "") != "" {
+		return &xlog.RestoreFatalError{
+			Msg:    "multiple recovery targets specified",
+			Detail: `At most one of "recovery_target", "recovery_target_lsn", "recovery_target_name", "recovery_target_time", "recovery_target_xid" may be set.`,
+		}
+	}
+	return nil
+}
+
+// recoveryTargetAction is recovery_target_action as validateRecoveryParameters
+// leaves it: 'pause' becomes 'shutdown' when hot_standby is off.
+func recoveryTargetAction(registry *misc.Registry) string {
+	action := stringGUC(registry, "recovery_target_action", "pause")
+	if action == "pause" && !boolGUC(registry, "hot_standby", true) {
+		return "shutdown"
+	}
+	return action
+}
+
+// checkRecoveryTargetReached is the end-of-redo target check of
+// PerformWalRecovery: a target that was never reached is FATAL ("recovery
+// ended before configured recovery target was reached"), and one reached
+// before the recovery became consistent is FATAL too ("requested recovery
+// stop point is before consistent recovery point"). goopg's crash replay in
+// initdb.Open has already applied the local WAL, so its end (the writer's
+// written position, a PG position) is the earliest point the recovery can
+// stop at.
+func checkRecoveryTargetReached(stop xlog.RecoveryStop, res xlog.ArchiveRecoveryResult, localEnd uint64) error {
+	if !stop.Set && !stop.XidSet {
+		return nil
+	}
+	if !res.ReachedTarget {
+		return &xlog.RestoreFatalError{Msg: "recovery ended before configured recovery target was reached"}
+	}
+	if res.StopPoint < localEnd {
+		return &xlog.RestoreFatalError{Msg: "requested recovery stop point is before consistent recovery point"}
+	}
+	return nil
+}
+
+// shutdownAtRecoveryTarget is recovery_target_action = 'shutdown' (and
+// 'pause', which goopg cannot honour — see below): the startup process
+// logs "shutdown at recovery target" and exits, the postmaster shuts down
+// normally, the checkpointer's shutdown restartpoint records
+// DB_SHUTDOWNED_IN_RECOVERY, and recovery.signal stays — the next start
+// recovers again. No promotion, no WAL written.
+//
+// 'pause' with hot_standby on keeps the server up, paused in recovery and
+// accepting read-only connections until pg_wal_replay_resume(); goopg's
+// archive recovery runs before the server accepts connections, so it
+// cannot pause there and shuts down instead, with a WARNING.
+func shutdownAtRecoveryTarget(rt *initdb.Runtime, action string, logger *slog.Logger, stderr io.Writer) int {
+	if action == "pause" {
+		logger.Warn("recovery_target_action = 'pause' is not supported during start-time archive recovery; shutting down at the recovery target instead")
+	}
+	rt.SetImmediateShutdown()
+	if err := control.UpdateControlFile(rt.DataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateShutdownedInRecovery
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "goopg start: shutdown at recovery target: could not update pg_control: %v\n", err)
+		return 1
+	}
+	logger.Info("shutdown at recovery target")
+	return 0
+}
+
+// recoveryConsistencyPoint is the replay position at which a standby's
+// recovery becomes consistent, from pg_control as InitWalRecovery leaves it:
+// minRecoveryPoint, raised to the checkpoint's redo when older, and the
+// backup's end point. never reports backupEndRequired, which waits for an
+// XLOG_BACKUP_END record rather than a position. A missing pg_control makes
+// recovery consistent at once.
+func recoveryConsistencyPoint(dataDir string) (at uint64, never bool) {
+	cd, err := control.ReadControlFile(dataDir)
+	if err != nil || cd == nil {
+		return 0, false
+	}
+	at = max(cd.MinRecoveryPoint, cd.CheckPointCopyRedo, cd.BackupEndPoint)
+	return at, cd.BackupEndRequired
+}
+
+// Consistent is reachedConsistency for hot standby: whether replay has
+// passed the consistency point (CheckRecoveryConsistency). It latches, and
+// logs PG's "consistent recovery state reached at X/X" the first time it is
+// observed.
+func (sc *standbyController) Consistent() bool {
+	if sc.consistent.Load() {
+		return true
+	}
+	if sc.neverConsistent {
+		return false
+	}
+	applied := uint64(0)
+	if sc.replayer != nil {
+		applied = sc.replayer.ApplyLSN()
+	}
+	if applied < sc.consistentAt {
+		return false
+	}
+	if sc.consistent.CompareAndSwap(false, true) && sc.logger != nil {
+		sc.logger.Info(fmt.Sprintf("consistent recovery state reached at %X/%X", uint32(applied>>32), uint32(applied)))
+	}
+	return true
+}
+
+// endInterruptedCrashRecovery ends goopg start when a shutdown request
+// stopped initdb.Open's crash replay. Nothing was written to WAL (replay
+// runs before the WAL writer opens). A fast shutdown is upstream's
+// shutdown during recovery: the checkpointer's shutdown restartpoint finds
+// no new checkpoint and records DB_SHUTDOWNED_IN_RECOVERY
+// (CreateRestartPoint's skip arm with CHECKPOINT_IS_SHUTDOWN); an
+// immediate shutdown (SIGQUIT) writes nothing, leaving
+// DB_IN_CRASH_RECOVERY. Either way the next start replays from the same
+// redo point. Exit 0, as the postmaster's normal shutdown exit.
+func endInterruptedCrashRecovery(dataDir string, immediate bool, logger *slog.Logger, stderr io.Writer) int {
+	if immediate {
+		return 0
+	}
+	logger.Info("received fast shutdown request during crash recovery; recovery not completed")
+	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateShutdownedInRecovery
+		cd.Time = time.Now().Unix()
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "goopg start: crash recovery: could not update pg_control: %v\n", err)
+		return 1
+	}
+	logger.Info("database system is shut down")
+	return 0
+}

@@ -351,7 +351,8 @@ func TestKillSwitchSuppressesGather(t *testing.T) {
 }
 
 // TestMaybeAddGatherOrderSensitiveAggregateGathersBelow pins M0134-0001 S16:
-// an order-sensitive aggregate (array_agg with no ORDER BY) refuses only its
+// an aggregate that cannot split (array_agg with its own ORDER BY; the
+// unordered form splits since M0148-0001i, as in PG 18) refuses only its
 // own SPLIT — never the whole statement. A Gather may still be placed BELOW a
 // plain, non-split Aggregate to parallelise the scan, matching PG's shape
 // (`postgres/src/backend/optimizer/util/clauses.c max_parallel_hazard_walker`
@@ -361,7 +362,7 @@ func TestKillSwitchSuppressesGather(t *testing.T) {
 func TestMaybeAddGatherOrderSensitiveAggregateGathersBelow(t *testing.T) {
 	tbl := bigTable(t, "big")
 	scan := seqScanOver(tbl)
-	agg := &Aggregate{Child: scan, Aggs: []AggregateCall{{Name: "array_agg"}}}
+	agg := &Aggregate{Child: scan, Aggs: []AggregateCall{{Name: "array_agg", OrderBy: []SortKey{{}}}}}
 
 	out := MaybeAddGather(agg, parallelTestSettings())
 
@@ -371,7 +372,7 @@ func TestMaybeAddGatherOrderSensitiveAggregateGathersBelow(t *testing.T) {
 		t.Fatalf("expected the root to stay a plain Aggregate, got %T", out)
 	}
 	if outAgg.Mode != AggModeSimple {
-		t.Errorf("array_agg must not be split: Mode = %v, want AggModeSimple", outAgg.Mode)
+		t.Errorf("ordered array_agg must not be split: Mode = %v, want AggModeSimple", outAgg.Mode)
 	}
 	if _, isGather := outAgg.Child.(*Gather); !isGather {
 		t.Errorf("expected a Gather directly below the Aggregate, got %T", outAgg.Child)

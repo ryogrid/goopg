@@ -34,6 +34,21 @@ type nodeStats struct {
 	// increments it directly via a pointer handed to it in maybeInstrument.
 	heapFetches int64
 
+	// exactPages / lossyPages count the heap pages a Bitmap Heap Scan
+	// fetched from an exact / a lossy bitmap entry — PG's
+	// BitmapHeapScanState.stats (heapam_handler.c BitmapHeapScanNextBlock),
+	// surfaced as `Heap Blocks: exact=N lossy=M` (explain.c
+	// show_tidbitmap_info). Handed to the operator by maybeInstrument
+	// (heapBlocksCounter). M0122-0021.
+	exactPages int64
+	lossyPages int64
+
+	// recheckRejected counts the tuples a Bitmap Heap Scan's recheck of
+	// the original index qual rejected — PG's nfiltered2 on that node
+	// (nodeBitmapHeapscan.c BitmapHeapNext, InstrCountFiltered2), surfaced
+	// as `Rows Removed by Index Recheck` (M0122-0021).
+	recheckRejected int64
+
 	// filterRejected counts tuples a Filter operator rejected (scan-level
 	// qual). Mirrors upstream's Instrumentation.nfiltered1 for scan nodes,
 	// surfaced by EXPLAIN ANALYZE as "Rows Removed by Filter".
@@ -126,6 +141,26 @@ func (o *instrumentedOp) Schema() optimizer.Schema { return o.inner.Schema() }
 // cycle.
 func (o *instrumentedOp) Open(ctx *Context) error {
 	o.stats.loops++
+	o.seedCounters(ctx)
+	if !o.stats.timing {
+		return o.inner.Open(ctx)
+	}
+	// The stopwatch runs only inside this node's own calls, as PG's
+	// InstrStartNode/InstrStopNode pair does (M0122-0020). Open is timed
+	// because goopg operators do there the work PG's first ExecProcNode
+	// does (hash build, sort, materialise).
+	o.stats.gotFirst = false
+	start := time.Now()
+	err := o.inner.Open(ctx)
+	d := time.Since(start).Nanoseconds()
+	o.stats.loopNs = d
+	o.stats.totalNs += d
+	return err
+}
+
+// seedCounters captures the buffer / WAL / memory sources and, on the
+// node's first Open, the baselines accountBuffers diffs against.
+func (o *instrumentedOp) seedCounters(ctx *Context) {
 	if ctx != nil && ctx.Pool != nil {
 		o.pool = ctx.Pool
 		if !o.stats.bufSeeded {
@@ -146,20 +181,64 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 			o.stats.memSeeded = true
 		}
 	}
-	if !o.stats.timing {
-		return o.inner.Open(ctx)
+}
+
+// instrumentedBitmapOp instruments a bitmap producer (BitmapIndexScan,
+// BitmapAnd, BitmapOr). PG runs these through MultiExecProcNode, never
+// ExecProcNode: each MultiExec call is one loop, and the node's rows are
+// the TIDs it added — InstrStopNode(instrument, nTuples) in
+// MultiExecBitmapIndexScan, 0 in MultiExecBitmapAnd / MultiExecBitmapOr
+// (nodeBitmapIndexscan.c, nodeBitmapAnd.c, nodeBitmapOr.c). goopg's
+// counterpart of MultiExec is buildBitmap, so the loop and row counters
+// move there; Open is the ExecInit-time setup PG does not instrument.
+// (M0122-0021 residual 2.)
+type instrumentedBitmapOp struct {
+	instrumentedOp
+}
+
+// bitmapTupleCounter reports the TIDs the producer's last buildBitmap
+// added — PG's nTuples. Producers that do not implement it (BitmapAnd,
+// BitmapOr) report 0 rows, as PG's do.
+type bitmapTupleCounter interface {
+	lastBitmapTuples() int64
+}
+
+func (o *instrumentedBitmapOp) Open(ctx *Context) error {
+	o.seedCounters(ctx)
+	return o.inner.Open(ctx)
+}
+
+func (o *instrumentedBitmapOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
+	var start time.Time
+	if o.stats.timing {
+		start = time.Now()
 	}
-	// The stopwatch runs only inside this node's own calls, as PG's
-	// InstrStartNode/InstrStopNode pair does (M0122-0020). Open is timed
-	// because goopg operators do there the work PG's first ExecProcNode
-	// does (hash build, sort, materialise).
-	o.stats.gotFirst = false
-	start := time.Now()
-	err := o.inner.Open(ctx)
-	d := time.Since(start).Nanoseconds()
-	o.stats.loopNs = d
-	o.stats.totalNs += d
-	return err
+	tbm, err := o.inner.(bitmapProducer).buildBitmap(ctx)
+	o.stats.loops++
+	if o.stats.timing {
+		// One call is one whole loop: PG's first InstrStopNode of the
+		// cycle is also its last, so startup equals the loop's time.
+		d := time.Since(start).Nanoseconds()
+		o.stats.loopNs = d
+		o.stats.totalNs += d
+		o.stats.startupNs += d
+	}
+	o.accountBuffers()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := o.inner.(bitmapTupleCounter); ok {
+		o.stats.rowsOut += tc.lastBitmapTuples()
+	}
+	return tbm, nil
+}
+
+// BindOuter forwards a nested-loop parent's slot to the wrapped producer
+// (bitmapOuterBinder); a producer that cannot be parameterised ignores it.
+func (o *instrumentedBitmapOp) BindOuter(slot SlotView, outerWidth int) {
+	if b, ok := o.inner.(bitmapOuterBinder); ok {
+		b.BindOuter(slot, outerWidth)
+	}
 }
 
 // accountBuffers rolls the storage.Pool's global hit/read/dirtied/written
@@ -264,6 +343,129 @@ func (o *instrumentedOp) RowsAffected() int64 {
 	return 0
 }
 
+// instrumentedNLIInner is maybeInstrument's twin for a nested-loop index
+// join's inner side (M0122-0021 slice 2). The probe and its Memoize are not
+// Operators — the join drives them through nliInner's BindOuter / Rescan /
+// Next — so buildNode built them bare and they reported no actuals at all,
+// serially and below a Gather alike. PG instruments both nodes: a Memoize
+// loops once per rescan (ExecReScanMemoize per outer row) and its probe
+// once per cache miss, since only a miss reaches it (nodeMemoize.c
+// ExecMemoize). Counting a loop per Rescan here yields exactly those
+// numbers. The stats file under the plan node in the active scope, so a
+// per-site scope below a Gather folds them like any other node.
+type instrumentedNLIInner struct {
+	inner nliInner
+	stats *nodeStats
+}
+
+// instrumentedMemoProbe is the same sidecar for the probe a Memoize caches:
+// memoProbe additionally hands over the probe's keys.
+type instrumentedMemoProbe struct {
+	*instrumentedNLIInner
+	probe memoProbe
+}
+
+func newInstrumentedNLIInner(plan optimizer.Node, in nliInner, scope *instrumenter) *instrumentedNLIInner {
+	stats := scopeStats(plan, scope)
+	if hf, ok := in.(heapFetchCounter); ok {
+		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
+	if fr, ok := in.(filterRemoveCounter); ok {
+		fr.setFilterRemoveCounter(&stats.filterRejected)
+	}
+	if hb, ok := in.(heapBlocksCounter); ok {
+		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
+	}
+	if rr, ok := in.(recheckRemoveCounter); ok {
+		rr.setRecheckRemoveCounter(&stats.recheckRejected)
+	}
+	// A bitmap heap probe builds its bitmap-producing subtree in Open, so
+	// it needs the scope to instrument that subtree (M0122-0021).
+	if sc, ok := in.(instrumentScopeCarrier); ok {
+		sc.setInstrumentScope(scope)
+	}
+	return &instrumentedNLIInner{inner: in, stats: stats}
+}
+
+// instrumentNLIInner wraps an NLI inner (a bare probe or a Memoize) when an
+// instrumentation scope is live; with none it returns in unchanged.
+func instrumentNLIInner(plan optimizer.Node, in nliInner, scope *instrumenter) nliInner {
+	if scope == nil || in == nil || plan == nil {
+		return in
+	}
+	return newInstrumentedNLIInner(plan, in, scope)
+}
+
+// instrumentMemoProbe wraps the probe under a Memoize when a scope is live.
+func instrumentMemoProbe(plan optimizer.Node, in memoProbe, scope *instrumenter) memoProbe {
+	if scope == nil || in == nil || plan == nil {
+		return in
+	}
+	return &instrumentedMemoProbe{instrumentedNLIInner: newInstrumentedNLIInner(plan, in, scope), probe: in}
+}
+
+func (o *instrumentedMemoProbe) probeKeys() []optimizer.Expr { return o.probe.probeKeys() }
+
+func (o *instrumentedNLIInner) Schema() optimizer.Schema       { return o.inner.Schema() }
+func (o *instrumentedNLIInner) openPrep(ctx *Context) error    { return o.inner.openPrep(ctx) }
+func (o *instrumentedNLIInner) BindOuter(slot SlotView, w int) { o.inner.BindOuter(slot, w) }
+func (o *instrumentedNLIInner) Close() error                   { return o.inner.Close() }
+func (o *instrumentedNLIInner) unwrapNLIInner() nliInner       { return o.inner }
+
+// Rescan starts a loop: PG's rescan ends the previous cycle (InstrEndLoop)
+// and the next ExecProcNode starts a new one. The probe's descent happens
+// here, so the call is timed into the loop like an Operator's Open.
+func (o *instrumentedNLIInner) Rescan(outerSlot SlotView, outerWidth int) error {
+	o.stats.loops++
+	o.stats.gotFirst = false
+	o.stats.loopNs = 0
+	if !o.stats.timing {
+		return o.inner.Rescan(outerSlot, outerWidth)
+	}
+	start := time.Now()
+	err := o.inner.Rescan(outerSlot, outerWidth)
+	d := time.Since(start).Nanoseconds()
+	o.stats.loopNs = d
+	o.stats.totalNs += d
+	return err
+}
+
+// Next mirrors instrumentedOp.Next: rows returned, the call's own time, and
+// the loop's time to its first row into startup.
+func (o *instrumentedNLIInner) Next() (TupleSlot, error) {
+	var start time.Time
+	if o.stats.timing {
+		start = time.Now()
+	}
+	slot, err := o.inner.Next()
+	if o.stats.timing {
+		d := time.Since(start).Nanoseconds()
+		o.stats.loopNs += d
+		o.stats.totalNs += d
+	}
+	if err != nil {
+		return slot, err
+	}
+	o.stats.rowsOut++
+	if o.stats.timing && !o.stats.gotFirst {
+		o.stats.startupNs += o.stats.loopNs
+		o.stats.gotFirst = true
+	}
+	return slot, nil
+}
+
+// unwrapNLIInner strips EXPLAIN ANALYZE sidecars so the FOR UPDATE
+// TID-provider walks see the concrete probe.
+func unwrapNLIInner(in nliInner) nliInner {
+	for {
+		w, ok := in.(interface{ unwrapNLIInner() nliInner })
+		if !ok {
+			return in
+		}
+		in = w.unwrapNLIInner()
+	}
+}
+
 // instrumentScopeCarrier is implemented by operators whose child-plan
 // buildNode calls happen lazily, inside their own Open(), rather than
 // during the original Build() dispatch that constructed them (e.g.
@@ -293,6 +495,20 @@ type heapFetchCounter interface {
 // it can ++ on each rejection. Surfaces as "Rows Removed by Filter".
 type filterRemoveCounter interface {
 	setFilterRemoveCounter(*int64)
+}
+
+// heapBlocksCounter is implemented by the bitmap heap scan: maybeInstrument
+// hands it its node's stats.exactPages / stats.lossyPages so the scan can ++
+// one of them per heap page fetched. Surfaces as "Heap Blocks:".
+type heapBlocksCounter interface {
+	setHeapBlocksCounters(exact, lossy *int64)
+}
+
+// recheckRemoveCounter is implemented by the bitmap heap scan: it ++es
+// stats.recheckRejected for each tuple its index-qual recheck rejects.
+// Surfaces as "Rows Removed by Index Recheck".
+type recheckRemoveCounter interface {
+	setRecheckRemoveCounter(*int64)
 }
 
 // joinFilterRemoveCounter is implemented by join operators that
@@ -394,6 +610,31 @@ type workerNodeStat struct {
 	// E-17 absorbed the qual into the scan, the scan is what runs inside
 	// workers.
 	FilterRejected int64
+	// JoinFilterRejected / ProbeFilterRejected / HeapFetches are the site's
+	// remaining per-node counters (nodeStats' joinFilterRejected,
+	// probeFilterRejected, heapFetches). PG's InstrAggNode folds every one
+	// of them into the node's own instrumentation, so the node line's
+	// `Rows Removed by Join Filter`, a parameterized probe's moved-Filter
+	// subtraction and `Heap Fetches` all need the per-site values
+	// (M0122-0021).
+	JoinFilterRejected  int64
+	ProbeFilterRejected int64
+	HeapFetches         int64
+	// ExactPages / LossyPages are the site's Bitmap Heap Scan page counts.
+	// Unlike the counters above PG does NOT sum them into the node: the
+	// `Heap Blocks:` line is the leader's own pages, and each worker's
+	// print as a `Worker N:  Heap Blocks:` line (explain.c
+	// show_tidbitmap_info over sinstrument). M0122-0021.
+	ExactPages int64
+	LossyPages int64
+	// RecheckRejected is the site's nfiltered2; summed into the node like
+	// FilterRejected (instrument.c InstrAggNode).
+	RecheckRejected int64
+	// Leader marks the leader's site (the last slot). PG keeps the
+	// leader's counters in planstate->instrument and prints `Worker N:`
+	// lines only for worker_instrument, so the leader never gets a line
+	// of its own — it only contributes to the node-line aggregate.
+	Leader bool
 }
 
 // EX0-03b (new): workerNodeStatsTable maps a shared inner-plan Node back
@@ -429,10 +670,95 @@ func foldGatherWorkerStats(ctx *Context, tables []nodeStatsTable) {
 				StartupNs: st.startupNs,
 				TotalNs:   st.totalNs,
 
-				FilterRejected: st.filterRejected,
+				FilterRejected:      st.filterRejected,
+				JoinFilterRejected:  st.joinFilterRejected,
+				ProbeFilterRejected: st.probeFilterRejected,
+				HeapFetches:         st.heapFetches,
+				ExactPages:          st.exactPages,
+				LossyPages:          st.lossyPages,
+				RecheckRejected:     st.recheckRejected,
+				Leader:              idx == len(tables)-1,
 			})
 		}
 	}
+}
+
+// aggregateWorkerInstrumentation gives every node that ran below a Gather
+// one node-level stats entry summed over all of its execution sites —
+// workers and leader — as PG's ExecParallelRetrieveInstrumentation does
+// with InstrAggNode (execParallel.c, instrument.c:166): startup, total,
+// ntuples, nloops, nfiltered1 and nfiltered2 add up, and EXPLAIN divides
+// by the summed nloops (explain.c ExplainNode). Without it such a node has
+// no stats entry at all — each site files into its own fresh table — and
+// its line printed no `(actual …)`, while the per-site `Worker N:` lines
+// carried the only numbers (M0122-0021).
+//
+// An existing entry is added to, not replaced: since M0122-0021 slices 3-4
+// the statement scope legitimately holds counters for such a node — work the
+// leader built lazily in its own Context (a SubPlan, a cooperative build) —
+// while each site's eagerly built tree files only into the site's table, so
+// nothing is counted twice. Buffer, WAL and memory counters are not aggregated: each site's
+// deltas are read off pool-global counters that the other sites advance
+// concurrently, so their sum is not the node's usage (ledger M0122-0021).
+func aggregateWorkerInstrumentation(stats nodeStatsTable, workers workerNodeStatsTable, timing bool) nodeStatsTable {
+	if len(workers) == 0 {
+		return stats
+	}
+	if stats == nil {
+		stats = make(nodeStatsTable)
+	}
+	for node, ws := range workers {
+		if node == nil || len(ws) == 0 {
+			continue
+		}
+		agg := &nodeStats{timing: timing}
+		if prev, ok := stats[node]; ok && prev != nil {
+			cp := *prev
+			agg = &cp
+		}
+		for _, w := range ws {
+			agg.rowsOut += w.RowsOut
+			agg.loops += w.Loops
+			agg.startupNs += w.StartupNs
+			agg.totalNs += w.TotalNs
+			agg.filterRejected += w.FilterRejected
+			agg.joinFilterRejected += w.JoinFilterRejected
+			agg.probeFilterRejected += w.ProbeFilterRejected
+			agg.heapFetches += w.HeapFetches
+			agg.recheckRejected += w.RecheckRejected
+			if w.Leader {
+				agg.exactPages += w.ExactPages
+				agg.lossyPages += w.LossyPages
+			}
+		}
+		if agg.loops == 0 {
+			// No site ever opened the node. Today that is a shared hash
+			// build input (prebuildSharedHashJoins builds it once,
+			// uninstrumented, before any site runs), so `loops=0` would
+			// misreport work that did happen; leave the node as it was.
+			continue
+		}
+		stats[node] = agg
+	}
+	return stats
+}
+
+// scopeStats returns plan's stats record in scope, creating it on first
+// use. A plan node can be built more than once in one scope — every
+// reference to a materialized CTE builds an operator over the one shared
+// body node, and a SubPlan rebuilt per outer row (rescanRebuild) builds its
+// inner plan again. PG has one PlanState and one Instrumentation per plan
+// node across all its loops, so every build of the node files into the same
+// record: a replaying reference that never opens its body adds nothing, and
+// a rebuilt SubPlan's loops accumulate instead of the last build's
+// overwriting them (M0122-0021 slice 3).
+func scopeStats(plan optimizer.Node, scope *instrumenter) *nodeStats {
+	if s, ok := scope.table[plan]; ok && s != nil {
+		return s
+	}
+	s := &nodeStats{timing: scope.timing}
+	scope.table[plan] = s
+	return s
 }
 
 // maybeInstrument is called by buildNode right before each switch arm
@@ -443,8 +769,7 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	if scope == nil || op == nil {
 		return op
 	}
-	stats := &nodeStats{timing: scope.timing}
-	scope.table[plan] = stats
+	stats := scopeStats(plan, scope)
 	// Hand an IndexOnlyScan (or any heap-fetch-counting operator) a pointer
 	// to its stats.heapFetches so it can tally heap fetches during Open;
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
@@ -453,6 +778,12 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	}
 	if fr, ok := op.(filterRemoveCounter); ok {
 		fr.setFilterRemoveCounter(&stats.filterRejected)
+	}
+	if hb, ok := op.(heapBlocksCounter); ok {
+		hb.setHeapBlocksCounters(&stats.exactPages, &stats.lossyPages)
+	}
+	if rr, ok := op.(recheckRemoveCounter); ok {
+		rr.setRecheckRemoveCounter(&stats.recheckRejected)
 	}
 	if jf, ok := op.(joinFilterRemoveCounter); ok {
 		jf.setJoinFilterRemoveCounter(&stats.joinFilterRejected)
@@ -465,5 +796,46 @@ func maybeInstrument(plan optimizer.Node, op Operator, scope *instrumenter) Oper
 	if sc, ok := op.(instrumentScopeCarrier); ok {
 		sc.setInstrumentScope(scope)
 	}
+	if _, ok := op.(bitmapProducer); ok {
+		return &instrumentedBitmapOp{instrumentedOp{inner: op, plan: plan, stats: stats}}
+	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
+}
+
+// foldPrebuildStats folds a Gather's shared hash prebuild instrumentation
+// into the per-site carrier as one more leader-side site (M0122-0021 slice
+// 4). goopg builds each shareable hash join's table ONCE, in the leader, and
+// the participants adopt it, so the build input reports one loop. PG with
+// parallel_hash off has every participant build its own copy and reports
+// loops = participants (nodeHash.c MultiExecHash per participant) — an
+// execution difference this records rather than imitates. Leader-flagged, so
+// it never renders as a `Worker N:` line.
+func foldPrebuildStats(ctx *Context, table nodeStatsTable) {
+	if ctx == nil || len(table) == 0 {
+		return
+	}
+	for node, st := range table {
+		if node == nil || st == nil || st.loops == 0 {
+			continue
+		}
+		if ctx.GatherWorkerStats == nil {
+			ctx.GatherWorkerStats = make(workerNodeStatsTable)
+		}
+		ctx.GatherWorkerStats[node] = append(ctx.GatherWorkerStats[node], workerNodeStat{
+			Worker:    -1,
+			RowsOut:   st.rowsOut,
+			Loops:     st.loops,
+			StartupNs: st.startupNs,
+			TotalNs:   st.totalNs,
+
+			FilterRejected:      st.filterRejected,
+			JoinFilterRejected:  st.joinFilterRejected,
+			ProbeFilterRejected: st.probeFilterRejected,
+			HeapFetches:         st.heapFetches,
+			ExactPages:          st.exactPages,
+			LossyPages:          st.lossyPages,
+			RecheckRejected:     st.recheckRejected,
+			Leader:              true,
+		})
+	}
 }

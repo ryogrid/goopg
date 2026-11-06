@@ -28,12 +28,14 @@ package replication
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,6 +115,24 @@ type WalReceiverConfig struct {
 	// instead of silently downgrading to plaintext, since that would
 	// defeat the operator's explicit encryption requirement.
 	SSLMode string
+
+	// SystemID is the standby's own pg_control system identifier.
+	// IDENTIFY_SYSTEM's systemid must equal it, as WalReceiverMain
+	// requires ("database system identifier differs between the primary
+	// and standby"). Zero skips the comparison, for callers without a
+	// pg_control (in-process tests).
+	SystemID uint64
+
+	// StartTLI is the timeline streaming starts on — WalReceiverMain's
+	// startpointTLI, sent as START_REPLICATION's TIMELINE and checked
+	// against the primary's timeline. Zero means the local WAL writer's
+	// timeline.
+	StartTLI uint32
+
+	// WALDir is the standby's pg_wal, where the history files of the
+	// timelines between StartTLI and the primary's are written when
+	// missing (WalRcvFetchTimeLineHistoryFiles). Empty skips the fetch.
+	WALDir string
 }
 
 // WalReceiver is the standby-side replication client. Construct via
@@ -138,6 +158,9 @@ type WalReceiver struct {
 	// (in which case all the SetReceivedLSN / MarkMessageReceived
 	// calls become no-ops via the nil-check helpers below).
 	monHandle *xlog.Receiver
+
+	// primaryTLI is the primary's timeline IDENTIFY_SYSTEM reported.
+	primaryTLI uint32
 }
 
 // checkSSLMode rejects sslmode values that promise encryption goopg
@@ -201,6 +224,17 @@ func DialWalReceiver(ctx context.Context, cfg WalReceiverConfig) (*WalReceiver, 
 		_ = conn.Close()
 		return nil, err
 	}
+	if rec.cfg.StartTLI == 0 {
+		rec.cfg.StartTLI = cfg.WAL.TimelineID()
+	}
+	if err := rec.identifySystem(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := rec.fetchTimelineHistoryFiles(rec.cfg.StartTLI, rec.primaryTLI); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := rec.startStreaming(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -254,17 +288,267 @@ func (r *WalReceiver) handshake() error {
 	}
 }
 
+// queryResult is one replication command's result set, read by
+// replicationQuery.
+type queryResult struct {
+	nfields int
+	rows    [][][]byte
+}
+
+// replicationQuery runs a simple-query replication command and collects
+// its result set up to ReadyForQuery — libpqsrv_exec plus PQresultStatus
+// for the commands that return tuples. An ErrorResponse becomes the
+// returned error's text (PQerrorMessage).
+func (r *WalReceiver) replicationQuery(cmd string) (queryResult, error) {
+	var res queryResult
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return res, err
+	}
+	if err := r.w.Flush(); err != nil {
+		return res, err
+	}
+	var errMsg string
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return res, err
+		}
+		switch f.Type {
+		case libpq.MsgRowDescription:
+			if len(f.Payload) < 2 {
+				return res, errors.New("malformed RowDescription")
+			}
+			res.nfields = int(binary.BigEndian.Uint16(f.Payload))
+		case libpq.MsgDataRow:
+			row, err := decodeDataRow(f.Payload)
+			if err != nil {
+				return res, err
+			}
+			res.rows = append(res.rows, row)
+		case libpq.MsgErrorResponse:
+			errMsg = summariseErrorResponse(f.Payload)
+		case libpq.MsgReadyForQuery:
+			if errMsg != "" {
+				return res, errors.New(errMsg)
+			}
+			return res, nil
+		}
+	}
+}
+
+// decodeDataRow splits a DataRow payload into its column values (nil for
+// NULL). The values are copied: the frame reader reuses its buffer.
+func decodeDataRow(p []byte) ([][]byte, error) {
+	if len(p) < 2 {
+		return nil, errors.New("malformed DataRow")
+	}
+	n := int(binary.BigEndian.Uint16(p))
+	p = p[2:]
+	cols := make([][]byte, n)
+	for i := range cols {
+		if len(p) < 4 {
+			return nil, errors.New("malformed DataRow")
+		}
+		l := int32(binary.BigEndian.Uint32(p))
+		p = p[4:]
+		if l < 0 {
+			continue
+		}
+		if int(l) > len(p) {
+			return nil, errors.New("malformed DataRow")
+		}
+		cols[i] = append([]byte{}, p[:l]...)
+		p = p[l:]
+	}
+	return cols, nil
+}
+
+// identifySystem runs IDENTIFY_SYSTEM and makes WalReceiverMain's two
+// checks before streaming starts: the primary's system identifier must
+// equal the standby's own, and the primary's timeline must not be behind
+// the one streaming starts on. The result shape is libpqrcv_identify_system's
+// (one row, at least three fields).
+func (r *WalReceiver) identifySystem() error {
+	res, err := r.replicationQuery("IDENTIFY_SYSTEM")
+	if err != nil {
+		return fmt.Errorf("walreceiver: could not receive database system identifier and timeline ID from the primary server: %w", err)
+	}
+	if res.nfields < 3 || len(res.rows) != 1 {
+		return fmt.Errorf("walreceiver: invalid response from primary server: Could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields.",
+			len(res.rows), res.nfields, 1, 3)
+	}
+	primarySysid := string(res.rows[0][0])
+	tli, err := strconv.ParseInt(string(res.rows[0][1]), 10, 32)
+	if err != nil || tli < 0 {
+		return fmt.Errorf("walreceiver: invalid response from primary server: timeline %q", res.rows[0][1])
+	}
+	r.primaryTLI = uint32(tli)
+	if r.cfg.SystemID != 0 {
+		standbySysid := strconv.FormatUint(r.cfg.SystemID, 10)
+		if primarySysid != standbySysid {
+			return fmt.Errorf("walreceiver: database system identifier differs between the primary and standby: The primary's identifier is %s, the standby's identifier is %s.",
+				primarySysid, standbySysid)
+		}
+	}
+	if r.primaryTLI < r.cfg.StartTLI {
+		return fmt.Errorf("walreceiver: highest timeline %d of the primary is behind recovery timeline %d",
+			r.primaryTLI, r.cfg.StartTLI)
+	}
+	return nil
+}
+
+// fetchTimelineHistoryFiles writes the history file of every timeline in
+// [first, last] that pg_wal lacks, read with TIMELINE_HISTORY —
+// WalRcvFetchTimeLineHistoryFiles. Timeline 1 has none. The files are
+// fetched even for timelines recovery does not follow, so that a later
+// promotion (findNewestTimeLine) does not pick a timeline the primary
+// already used.
+func (r *WalReceiver) fetchTimelineHistoryFiles(first, last uint32) error {
+	if r.cfg.WALDir == "" {
+		return nil
+	}
+	for tli := first; tli <= last && tli != 0; tli++ {
+		if tli == 1 {
+			continue
+		}
+		name := xlog.TimelineHistoryFileName(tli)
+		if _, err := os.Stat(filepath.Join(r.cfg.WALDir, name)); err == nil {
+			continue
+		}
+		slog.Info(fmt.Sprintf("fetching timeline history file for timeline %d from primary server", tli))
+		res, err := r.replicationQuery(fmt.Sprintf("TIMELINE_HISTORY %d", tli))
+		if err != nil {
+			return fmt.Errorf("walreceiver: could not receive timeline history file from the primary server: %w", err)
+		}
+		if res.nfields != 2 || len(res.rows) != 1 {
+			return fmt.Errorf("walreceiver: invalid response from primary server: Expected 1 tuple with 2 fields, got %d tuples with %d fields.",
+				len(res.rows), res.nfields)
+		}
+		if string(res.rows[0][0]) != name {
+			return fmt.Errorf("walreceiver: primary reported unexpected file name for timeline history file of timeline %d", tli)
+		}
+		if err := xlog.WriteHistoryContent(r.cfg.WALDir, tli, res.rows[0][1]); err != nil {
+			return fmt.Errorf("walreceiver: %w", err)
+		}
+	}
+	return nil
+}
+
+// EndOfTimeline reports that the primary has no more WAL on the timeline
+// streaming was started on: it ended the copy at that timeline's switch
+// point (or entered no copy at all), as a walsender serving a historic
+// timeline does. The standby decides from its timeline history files whether
+// to move to a newer timeline (rescanLatestTimeLine) before reconnecting.
+type EndOfTimeline struct {
+	TLI      uint32 // the timeline that ended
+	NextTLI  uint32 // next_tli from the server's result set; 0 when absent
+	StartLSN uint64 // next_tli_startpos; 0 when absent
+}
+
+func (e *EndOfTimeline) Error() string {
+	return fmt.Sprintf("walreceiver: primary server contains no more WAL on requested timeline %d", e.TLI)
+}
+
+// endStreaming leaves streaming COPY mode after the server's CopyDone —
+// libpqrcv_endstreaming: send CopyDone, then read either the
+// (next_tli, next_tli_startpos) result set and CommandComplete, or just
+// CommandComplete when the server was shut down. Then, as WalReceiverMain
+// does, fetch the history files of any timeline the server moved to. A
+// result set yields *EndOfTimeline; a bare CommandComplete yields nil (the
+// caller reconnects).
+func (r *WalReceiver) endStreaming(ctx context.Context, frames <-chan libpq.Frame) error {
+	if err := r.w.WriteCopyDone(); err != nil {
+		return fmt.Errorf("walreceiver: could not send end-of-streaming message to primary: %w", err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return fmt.Errorf("walreceiver: could not send end-of-streaming message to primary: %w", err)
+	}
+	res, completed, errMsg, err := readStreamingResult(ctx, frames)
+	if err != nil {
+		return err
+	}
+	return r.finishEndOfStreaming(res, completed, errMsg)
+}
+
+// readStreamingResult collects the frames that close a START_REPLICATION
+// command up to ReadyForQuery.
+func readStreamingResult(ctx context.Context, frames <-chan libpq.Frame) (res queryResult, completed bool, errMsg string, err error) {
+	for {
+		var f libpq.Frame
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return res, false, "", ctx.Err()
+		case f, ok = <-frames:
+		}
+		if !ok {
+			return res, false, "", errors.New("walreceiver: connection closed while ending streaming")
+		}
+		switch f.Type {
+		case libpq.MsgRowDescription:
+			if len(f.Payload) >= 2 {
+				res.nfields = int(binary.BigEndian.Uint16(f.Payload))
+			}
+		case libpq.MsgDataRow:
+			row, derr := decodeDataRow(f.Payload)
+			if derr != nil {
+				return res, false, "", derr
+			}
+			res.rows = append(res.rows, row)
+		case libpq.MsgCommandComplete:
+			completed = true
+		case libpq.MsgErrorResponse:
+			errMsg = summariseErrorResponse(f.Payload)
+		case libpq.MsgReadyForQuery:
+			return res, completed, errMsg, nil
+		}
+	}
+}
+
+// finishEndOfStreaming checks a START_REPLICATION command's closing reply
+// the way libpqrcv_endstreaming does and fetches the next timeline's
+// history.
+func (r *WalReceiver) finishEndOfStreaming(res queryResult, completed bool, errMsg string) error {
+	var nextTLI uint32
+	var startLSN uint64
+	if res.nfields > 0 || len(res.rows) > 0 {
+		if res.nfields < 2 || len(res.rows) != 1 {
+			return errors.New("walreceiver: unexpected result set after end-of-streaming")
+		}
+		tli, err := strconv.ParseInt(string(res.rows[0][0]), 10, 32)
+		if err != nil || tli < 0 {
+			return fmt.Errorf("walreceiver: unexpected result set after end-of-streaming: next_tli %q", res.rows[0][0])
+		}
+		nextTLI = uint32(tli)
+		startLSN, _ = parseLSN(string(res.rows[0][1]))
+	}
+	if errMsg != "" || !completed {
+		return fmt.Errorf("walreceiver: error reading result of streaming command: %s", errMsg)
+	}
+	if nextTLI == 0 {
+		return nil // the server shut down
+	}
+	if err := r.fetchTimelineHistoryFiles(r.cfg.StartTLI, nextTLI); err != nil {
+		return err
+	}
+	return &EndOfTimeline{TLI: r.cfg.StartTLI, NextTLI: nextTLI, StartLSN: startLSN}
+}
+
 // startStreaming sends START_REPLICATION and waits for the CopyBoth
 // handoff. Any ErrorResponse mid-handshake is reported to the caller
-// for human triage.
+// for human triage. A reply without CopyBoth — the start point is already
+// the end of a historic timeline — is *EndOfTimeline
+// (libpqrcv_startstreaming returning false).
 func (r *WalReceiver) startStreaming() error {
-	cmd := buildStartReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN)
+	cmd := buildStartReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN, r.cfg.StartTLI)
 	if err := r.w.WriteQuery(cmd); err != nil {
 		return fmt.Errorf("walreceiver: write START_REPLICATION: %w", err)
 	}
 	if err := r.w.Flush(); err != nil {
 		return fmt.Errorf("walreceiver: flush START_REPLICATION: %w", err)
 	}
+	var noCopy queryResult
+	noCopyCompleted := false
 	for {
 		f, err := r.r.ReadFrame()
 		if err != nil {
@@ -276,6 +560,26 @@ func (r *WalReceiver) startStreaming() error {
 		case libpq.MsgErrorResponse:
 			return fmt.Errorf("walreceiver: START_REPLICATION rejected: %s",
 				summariseErrorResponse(f.Payload))
+		case libpq.MsgRowDescription:
+			if len(f.Payload) >= 2 {
+				noCopy.nfields = int(binary.BigEndian.Uint16(f.Payload))
+			}
+		case libpq.MsgDataRow:
+			row, err := decodeDataRow(f.Payload)
+			if err != nil {
+				return err
+			}
+			noCopy.rows = append(noCopy.rows, row)
+		case libpq.MsgCommandComplete:
+			noCopyCompleted = true
+		case libpq.MsgReadyForQuery:
+			slog.Info(fmt.Sprintf("primary server contains no more WAL on requested timeline %d", r.cfg.StartTLI))
+			err := r.finishEndOfStreaming(noCopy, noCopyCompleted, "")
+			if err == nil {
+				// No next timeline was reported; the timeline still ended.
+				err = &EndOfTimeline{TLI: r.cfg.StartTLI}
+			}
+			return err
 		}
 		// Other frames pre-CopyBoth (NoticeResponse, etc.) are
 		// ignored.
@@ -295,6 +599,7 @@ func (r *WalReceiver) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(frames)
+		copyDone := false
 		for {
 			f, err := r.r.ReadFrame()
 			if err != nil {
@@ -307,6 +612,13 @@ func (r *WalReceiver) Run(ctx context.Context) error {
 			select {
 			case frames <- libpq.Frame{Type: f.Type, Payload: payload}:
 			case <-ctx.Done():
+				return
+			}
+			// After the server's CopyDone the connection is back in
+			// command mode once ReadyForQuery arrives; stop reading there
+			// so endStreaming can issue TIMELINE_HISTORY on it.
+			copyDone = copyDone || f.Type == libpq.MsgCopyDone
+			if copyDone && f.Type == libpq.MsgReadyForQuery {
 				return
 			}
 		}
@@ -326,6 +638,11 @@ func (r *WalReceiver) Run(ctx context.Context) error {
 		case f, ok := <-frames:
 			if !ok {
 				return nil
+			}
+			if f.Type == libpq.MsgCopyDone {
+				err := r.endStreaming(ctx, frames)
+				_ = r.Close()
+				return err
 			}
 			if err := r.handleFrame(f); err != nil {
 				_ = r.Close()
@@ -514,12 +831,15 @@ func streamingStartLSN(written uint64, segSize int64) uint64 {
 	return written - written%uint64(segSize)
 }
 
-func buildStartReplicationCommand(slotName string, startLSN uint64) string {
+// buildStartReplicationCommand is libpqrcv_startstreaming's physical
+// command: the slot name double-quoted, no PHYSICAL keyword, and always
+// the TIMELINE of the start point.
+func buildStartReplicationCommand(slotName string, startLSN uint64, tli uint32) string {
+	cmd := "START_REPLICATION"
 	if slotName != "" {
-		return fmt.Sprintf("START_REPLICATION SLOT %s PHYSICAL %s",
-			slotName, formatLSN(startLSN))
+		cmd += fmt.Sprintf(" SLOT \"%s\"", slotName)
 	}
-	return fmt.Sprintf("START_REPLICATION PHYSICAL %s", formatLSN(startLSN))
+	return cmd + fmt.Sprintf(" %s TIMELINE %d", formatLSN(startLSN), tli)
 }
 
 // WalReceiverLauncherConfig is the narrow slice of the standby runtime the
@@ -548,7 +868,26 @@ type WalReceiverLauncherConfig struct {
 	// ApplyLSNFunc is forwarded to WalReceiverConfig.ApplyLSNFunc so
 	// standby status updates report real replay progress.
 	ApplyLSNFunc func() uint64
+
+	// SystemID and WALDir are forwarded to WalReceiverConfig: the
+	// standby's pg_control identifier IDENTIFY_SYSTEM must match, and the
+	// pg_wal fetched history files land in.
+	SystemID uint64
+	WALDir   string
+
+	// OnEndOfTimeline runs when the primary reports that the timeline
+	// streaming started on has ended (*EndOfTimeline). It is the startup
+	// process's turn (rescanLatestTimeLine): it may move WAL onto a newer
+	// timeline before the walreceiver reconnects. When the WAL writer's
+	// timeline is unchanged afterwards, the reconnect waits
+	// wal_retrieve_retry_interval. nil only applies that wait.
+	OnEndOfTimeline func(*EndOfTimeline)
 }
+
+// walRetrieveRetryInterval is wal_retrieve_retry_interval's default (5s):
+// how long the startup process waits before asking for WAL again after a
+// source had none.
+const walRetrieveRetryInterval = 5 * time.Second
 
 // StartWalReceiver dials the primary identified by `primary_conninfo`
 // and runs a `WalReceiver` in a goroutine, reconnecting with
@@ -618,7 +957,16 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 				ApplicationName: appName,
 				ApplyLSNFunc:    cfg.ApplyLSNFunc,
 				SSLMode:         sslmode,
+				SystemID:        cfg.SystemID,
+				WALDir:          cfg.WALDir,
 			})
+			var eot *EndOfTimeline
+			if errors.As(err, &eot) {
+				if !followEndOfTimeline(ctx, cfg, logger, eot) {
+					return
+				}
+				continue
+			}
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
 					"event", xlog.EventWalreceiverDialFailed,
@@ -647,6 +995,12 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			if ctx.Err() != nil {
 				return
 			}
+			if errors.As(runErr, &eot) {
+				if !followEndOfTimeline(ctx, cfg, logger, eot) {
+					return
+				}
+				continue
+			}
 			if runErr != nil {
 				logger.Warn("walreceiver disconnect; will reconnect",
 					"event", xlog.EventWalreceiverDisconnect,
@@ -658,6 +1012,29 @@ func StartWalReceiver(ctx context.Context, done chan struct{}, cfg WalReceiverLa
 			}
 		}
 	}()
+}
+
+// followEndOfTimeline hands an ended timeline to cfg.OnEndOfTimeline and,
+// when the WAL writer stayed on the same timeline (no newer one to follow
+// yet, or recovery_target_timeline keeps it), waits
+// wal_retrieve_retry_interval before the next connection — WalReceiverMain
+// waiting in WalRcvWaitForStartPosition for the startup process. It returns
+// false once ctx is cancelled.
+func followEndOfTimeline(ctx context.Context, cfg WalReceiverLauncherConfig, logger *slog.Logger, eot *EndOfTimeline) bool {
+	before := cfg.WAL.TimelineID()
+	logger.Info(eot.Error(), "next_tli", eot.NextTLI, "next_tli_startpos", formatLSN(eot.StartLSN))
+	if cfg.OnEndOfTimeline != nil {
+		cfg.OnEndOfTimeline(eot)
+	}
+	if cfg.WAL.TimelineID() != before {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(walRetrieveRetryInterval):
+		return true
+	}
 }
 
 // parsePrimaryConninfo extracts the host:port from a libpq-style

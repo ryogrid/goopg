@@ -112,7 +112,11 @@ bench_foreign_procs() {
 source "${REPO_ROOT}/scripts/lib/bench-engine-id.sh"
 
 TPCDS_GOOPG_LOG="${TPCDS_RUNTIME_DIR}/goopg.tpcds.log"
-SF025_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf025.log"
+# SF025_LOG is overridable (1a7fddb3d) and the rotation the owner item called
+# for landed 2026-10-30: sweeps log to per-run goopg.sf025-<ts>.log pruned to
+# 10 (scripts/tpcds-sf025-regression.sh) and `server.sh start sf025` rotates
+# this default file through .1..5, so growth is bounded on every writer path.
+SF025_LOG="${SF025_LOG:-${TPCDS_RUNTIME_DIR}/goopg.sf025.log}"
 TPCDS_PG_LOG="${TPCDS_RUNTIME_DIR}/pg.log"
 
 # --- goopg runtime knobs (same rationale as bench/tpch/env_goopg.sh) -------

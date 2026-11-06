@@ -56,7 +56,13 @@ type bitmapIndexScanOp struct {
 	// probe's bounds (M0146-0061), set by lookupBounds as indexRangeBounds
 	// returns them (a DESC column swaps the plan's operators).
 	rangeLoExcl, rangeHiExcl bool
+
+	// lastTuples is the TID count of the last buildBitmap — PG's nTuples,
+	// which EXPLAIN ANALYZE reports as the node's rows (M0122-0021).
+	lastTuples int64
 }
+
+func (o *bitmapIndexScanOp) lastBitmapTuples() int64 { return o.lastTuples }
 
 func newBitmapIndexScanOp(p *optimizer.BitmapIndexScan) *bitmapIndexScanOp {
 	return &bitmapIndexScanOp{plan: p}
@@ -133,6 +139,7 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	// tbm is sized by work_mem.
 	maxEntries := tbmCalculateMaxEntries(o.ctx.WorkMem)
 	tbm := &TIDBitmap{maxEntries: maxEntries}
+	o.lastTuples = 0
 
 	// Determine whether recheck is needed (prefix scan on composite index).
 	recheck := o.needsRecheck()
@@ -167,6 +174,7 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 			tbm.recheckAny = true
 		}
 		tbm.addOne(ptr.Block, ptr.Offset, recheck)
+		o.lastTuples++
 		return true, nil
 	}
 	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, o.rangeLoExcl, o.rangeHiExcl, scanFn); err != nil {
@@ -303,6 +311,15 @@ type bitmapHeapScanOp struct {
 	// cond is plan.Cond compiled for the per-row filter (C43).
 	cond compiledCond
 
+	// scope is the EXPLAIN ANALYZE instrumenter live at this op's own Build
+	// (instrumentScopeCarrier). The bitmap-producing subtree builds in
+	// openPrep, long after that Build returned, and is instrumented in it
+	// so Bitmap Index Scan / BitmapAnd / BitmapOr report actuals as PG's do
+	// (M0122-0021). nil outside EXPLAIN ANALYZE.
+	scope *instrumenter
+	// filterRemoved: the tuples Cond rejected (see indexScanOp's).
+	filterRemoved *int64
+
 	// borrowRows is set at Build when every operator up to a borrowing root
 	// consumes each row before the next Next() and keeps nothing of it
 	// (markScanBorrowChain): emitRow then yields scanRow instead of a clone
@@ -389,6 +406,13 @@ type bitmapHeapScanOp struct {
 	// Stats.
 	exactPages int64
 	lossyPages int64
+	// statExact / statLossy are the node's EXPLAIN ANALYZE page counters
+	// (heapBlocksCounter), bumped beside exactPages / lossyPages; nil
+	// outside ANALYZE (M0122-0021).
+	statExact, statLossy *int64
+	// recheckRemoved: the tuples the BitmapQual recheck rejected
+	// (recheckRemoveCounter); nil outside ANALYZE (M0122-0021).
+	recheckRemoved *int64
 
 	// pbm, when non-nil, makes this a PARALLEL bitmap scan: pages are claimed
 	// from a shared atomic allocator instead of iterating locally, so N
@@ -406,6 +430,36 @@ func newBitmapHeapScanOp(p *optimizer.BitmapHeapScan) *bitmapHeapScanOp {
 }
 
 func (o *bitmapHeapScanOp) Schema() optimizer.Schema { return o.plan.Output() }
+
+func (o *bitmapHeapScanOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// setFilterRemoveCounter implements filterRemoveCounter (see indexScanOp's).
+func (o *bitmapHeapScanOp) setFilterRemoveCounter(p *int64) { o.filterRemoved = p }
+
+// setRecheckRemoveCounter implements recheckRemoveCounter.
+func (o *bitmapHeapScanOp) setRecheckRemoveCounter(p *int64) { o.recheckRemoved = p }
+
+// setHeapBlocksCounters implements heapBlocksCounter.
+func (o *bitmapHeapScanOp) setHeapBlocksCounters(exact, lossy *int64) {
+	o.statExact, o.statLossy = exact, lossy
+}
+
+// countPage records one heap page fetched from an exact or a lossy bitmap
+// entry — PG counts every page BitmapHeapScanNextBlock reads
+// (heapam_handler.c), visible tuples or not.
+func (o *bitmapHeapScanOp) countPage(lossy bool) {
+	if lossy {
+		o.lossyPages++
+		if o.statLossy != nil {
+			*o.statLossy++
+		}
+		return
+	}
+	o.exactPages++
+	if o.statExact != nil {
+		*o.statExact++
+	}
+}
 
 // Open is the single-scan entry point: one-time setup, then let Next build the
 // bitmap lazily. A nested-loop parent instead calls openPrep once and Rescan per
@@ -543,7 +597,7 @@ func (o *bitmapHeapScanOp) openPrep(ctx *Context) error {
 	}
 
 	// Build the outer operator (a BitmapIndexScan or BitmapAnd/BitmapOr tree).
-	outerOp, err := buildNode(o.plan.Outer, deformBoundFull, nil)
+	outerOp, err := buildNode(o.plan.Outer, deformBoundFull, o.scope)
 	if err != nil {
 		return err
 	}
@@ -666,11 +720,7 @@ func (o *bitmapHeapScanOp) nextSerial() (TupleSlot, error) {
 			o.pageBlock = block
 			o.pageLossy = lossy
 
-			if lossy {
-				o.lossyPages++
-			} else {
-				o.exactPages++
-			}
+			o.countPage(lossy)
 
 			// Reset per-page arena. The arena is only acquired when the
 			// executor Context carries one (see Open), and Close already
@@ -765,7 +815,7 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		}
 
 		if entry.isLossy {
-			o.lossyPages++
+			o.countPage(true)
 			// Walk every line pointer on the page, exactly as the serial path
 			// does. The previous code `continue`d here and claimed to be
 			// matching the serial path — which was itself dropping lossy pages,
@@ -797,7 +847,7 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 		// It survived because bitmap paths never won on cost, so this arm had
 		// never run. `o.parOffsets`/`o.parOff` now hold the position, and the
 		// page is only released once its offsets are exhausted.
-		o.exactPages++
+		o.countPage(false)
 		n := tbmExtractPageTuple(entry, nil)
 		if n == 0 {
 			continue
@@ -895,6 +945,9 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 			return nil, read, evalErr
 		}
 		if !passed {
+			if o.recheckRemoved != nil {
+				*o.recheckRemoved++
+			}
 			return nil, read, nil // recheck failed, skip
 		}
 	}
@@ -909,6 +962,9 @@ func (o *bitmapHeapScanOp) fetchOneTupleLocked(block storage.BlockNumber, offset
 			return nil, read, cerr
 		}
 		if d.IsNull() || d.Kind != KindBool || !d.BoolValue() {
+			if o.filterRemoved != nil {
+				*o.filterRemoved++
+			}
 			return nil, read, nil // filtered out; the caller skips a nil slot
 		}
 	}
@@ -1103,7 +1159,12 @@ type bitmapAndOp struct {
 	inputs     []Operator
 	inputBitmaps []bitmapProducer
 	ctx        *Context
+	// scope is the EXPLAIN ANALYZE instrumenter live at this op's own
+	// Build (instrumentScopeCarrier); its inputs build in Open.
+	scope *instrumenter
 }
+
+func (o *bitmapAndOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 func newBitmapAndOp(p *optimizer.BitmapAnd) *bitmapAndOp {
 	return &bitmapAndOp{plan: p}
@@ -1116,7 +1177,7 @@ func (o *bitmapAndOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull, nil)
+		op, err := buildNode(input, deformBoundFull, o.scope)
 		if err != nil {
 			return err
 		}
@@ -1184,7 +1245,11 @@ type bitmapOrOp struct {
 	inputs       []Operator
 	inputBitmaps []bitmapProducer
 	ctx          *Context
+	// scope: as bitmapAndOp.scope.
+	scope *instrumenter
 }
+
+func (o *bitmapOrOp) setInstrumentScope(s *instrumenter) { o.scope = s }
 
 func newBitmapOrOp(p *optimizer.BitmapOr) *bitmapOrOp {
 	return &bitmapOrOp{plan: p}
@@ -1197,7 +1262,7 @@ func (o *bitmapOrOp) Open(ctx *Context) error {
 	o.inputs = make([]Operator, len(o.plan.Inputs))
 	o.inputBitmaps = make([]bitmapProducer, len(o.plan.Inputs))
 	for i, input := range o.plan.Inputs {
-		op, err := buildNode(input, deformBoundFull, nil)
+		op, err := buildNode(input, deformBoundFull, o.scope)
 		if err != nil {
 			return err
 		}

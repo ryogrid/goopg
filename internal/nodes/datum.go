@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // PostgreSQL type OIDs used by the scalar Const subset (pg_type.dat).
@@ -429,26 +430,90 @@ func bitVarlena(bitLen int32, data []byte) []byte {
 	return b
 }
 
-// parseBitFromString parses a bit-string literal like '10101010' into (bitLen,
-// packed bytes, ok). Only '0' and '1' are accepted; empty string → bitLen=0,
-// zero data bytes (just the header+bit_len). Returns (0, nil, false) on non-bit
-// characters. The packed bytes are left-aligned, MSB first, with the last byte
+// varBitMaxLen mirrors VARBITMAXLEN (postgres/src/include/utils/varbit.h:83,
+// INT_MAX - BITS_PER_BYTE + 1), the cap varbit.c:195-199 enforces on HEX
+// input length (in hex digits) before expanding to bits.
+const varBitMaxLen = math.MaxInt32 - 8 + 1
+
+// ScanBitInput reproduces the input scan of bit_in/varbit_in
+// (postgres/src/backend/utils/adt/varbit.c:147-276 and 452-577): a leading
+// 'b'/'B' marks binary digits, 'x'/'X' marks hex digits (each expanding to
+// four binary digits, MSB first), and any other leading character means
+// binary from position 0 — "This allows things like cast('1001' as bit) to
+// work transparently" (varbit.c:176-184). The quoted spelling B'101' is a
+// SCANNER production (scan.l xbstart strips the quote), so bit_in sees the
+// UNQUOTED "B101" — which is why COPY data and text casts carry the prefix.
+// Returns the canonical binary-digit text (exactly what bit_out prints back).
+// On invalid input it reports PG's SQLSTATE and message: the first offending
+// CHARACTER (multibyte-aware, as pg_mblen scans) as 22P02 `"c" is not a valid
+// binary digit` / `"c" is not a valid hexadecimal digit`, and hex input
+// longer than VARBITMAXLEN/4 as 54000 "bit string length exceeds the maximum
+// allowed (2147483640)". The typmod length checks are deliberately NOT here:
+// bit_in (22026 exact match) and varbit_in (22001 upper bound) apply them to
+// the BIT COUNT, which for hex input is 4×len — callers see that via the
+// returned digit string.
+func ScanBitInput(s string) (digits string, code, msg string, ok bool) {
+	body := s
+	ishex := false
+	if len(s) > 0 {
+		switch s[0] {
+		case 'b', 'B':
+			body = s[1:]
+		case 'x', 'X':
+			body, ishex = s[1:], true
+		}
+	}
+	if ishex {
+		if len(body) > varBitMaxLen/4 {
+			return "", "54000", fmt.Sprintf("bit string length exceeds the maximum allowed (%d)", varBitMaxLen), false
+		}
+		digits := make([]byte, 0, len(body)*4)
+		for i := 0; i < len(body); i++ {
+			var v byte
+			switch c := body[i]; {
+			case c >= '0' && c <= '9':
+				v = c - '0'
+			case c >= 'a' && c <= 'f':
+				v = c - 'a' + 10
+			case c >= 'A' && c <= 'F':
+				v = c - 'A' + 10
+			default:
+				r, _ := utf8.DecodeRuneInString(body[i:])
+				return "", "22P02", fmt.Sprintf("%q is not a valid hexadecimal digit", string(r)), false
+			}
+			digits = append(digits, '0'+(v>>3)&1, '0'+(v>>2)&1, '0'+(v>>1)&1, '0'+v&1)
+		}
+		return string(digits), "", "", true
+	}
+	for i := 0; i < len(body); i++ {
+		if body[i] != '0' && body[i] != '1' {
+			r, _ := utf8.DecodeRuneInString(body[i:])
+			return "", "22P02", fmt.Sprintf("%q is not a valid binary digit", string(r)), false
+		}
+	}
+	return body, "", "", true
+}
+
+// parseBitFromString parses a bit-string literal like '10101010' into
+// (bitLen, packed bytes, ok), accepting the same b/B and x/X prefix scan as
+// PG's bit_in/varbit_in (see ScanBitInput). Empty string → bitLen=0, zero
+// data bytes (just the header+bit_len). Returns (0, nil, false) on invalid
+// input. The packed bytes are left-aligned, MSB first, with the last byte
 // zero-padded on the right — byte-identical to PG's bit_in (varbit.c).
 func parseBitFromString(s string) (int32, []byte, bool) {
-	bitLen := int32(len(s))
+	digits, _, _, ok := ScanBitInput(s)
+	if !ok {
+		return 0, nil, false
+	}
+	bitLen := int32(len(digits))
 	if bitLen == 0 {
 		return 0, nil, true
 	}
 	nBytes := (int(bitLen) + 7) / 8
 	data := make([]byte, nBytes)
 	for i := 0; i < int(bitLen); i++ {
-		switch s[i] {
-		case '1':
+		if digits[i] == '1' {
 			data[i/8] |= 1 << (7 - (i % 8))
-		case '0':
-			// zero bit — no-op (byte is already zero)
-		default:
-			return 0, nil, false
 		}
 	}
 	return bitLen, data, true

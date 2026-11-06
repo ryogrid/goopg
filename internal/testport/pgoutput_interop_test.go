@@ -40,9 +40,9 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/goopg/goopg/internal/access/transam/xlog"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
-	"github.com/goopg/goopg/internal/access/transam/xlog"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral port. Race-safe enough
@@ -2092,8 +2092,8 @@ func TestPort_PgoutputInteropPGToGoopgKillAndReconnect(t *testing.T) {
 // This is the first rung that exercises the M0103-0007 Scenario A
 // async DoD invariant from `docs/design/0103-0005-...`:
 //
-//   subscriber count(*) ∈ [killCommitted - asyncLossBound + 1,
-//                          killCommitted + 1]
+//	subscriber count(*) ∈ [killCommitted - asyncLossBound + 1,
+//	                       killCommitted + 1]
 //
 // with asyncLossBound = 50 rows. Rungs 1–21 verified apply-worker
 // correctness under sustained load; rung 22 closed the SIGKILL +
@@ -3211,4 +3211,527 @@ func TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply(t *testing.T) {
 		t.Fatalf("subscriber post-failover row src = %q, want \"post\" (killCommitted=%d, count=%d)",
 			postSrc, killCommitted, got)
 	}
+}
+
+// TestPort_PgoutputInteropGoopgToPGUnqualifiedTable: a table the goopg
+// publisher created WITHOUT a schema (goopg records it with an empty Schema)
+// replicates to a PG 18.3 subscriber. The Relation message must name its
+// namespace "public": logicalrep_read_namespace reads an empty namespace as
+// pg_catalog, so the subscriber used to look for pg_catalog.t and apply
+// nothing. TestPort_PgoutputInteropGoopgToPG creates public.t explicitly and
+// never saw it.
+func TestPort_PgoutputInteropGoopgToPGUnqualifiedTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	baseDir := t.TempDir()
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2pg_unq", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindPG,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2pg_unq_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2pg_unq_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v varchar(10))")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v varchar(10))")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'hello')")
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (2, 'world')")
+	psc.Publisher.Exec(t, "UPDATE t SET v = 'updated' WHERE id = 2")
+
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "2" {
+		t.Fatalf("subscriber row count after replication: got %q want 2", got)
+	}
+}
+
+// TestPort_PgoutputInteropGoopgToGoopg: goopg to goopg logical replication,
+// slot lifecycle included. CREATE SUBSCRIPTION (create_slot defaults to true)
+// creates the logical slot on the publisher, as CreateSubscription's
+// walrcv_create_slot does — it never did, so the apply worker's
+// START_REPLICATION failed with "replication slot does not exist" on every
+// retry and nothing replicated. An UPDATE of a non-key column (sent without
+// an old tuple) lands on the right row through the Relation message's
+// replica-identity flags. DROP SUBSCRIPTION drops the slot on the publisher
+// (ReplicationSlotDropAtPubNode), so no slot is left pinning WAL.
+func TestPort_PgoutputInteropGoopgToGoopg(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'g2g_sub'"); got != "1" {
+		t.Fatalf("publisher slots named g2g_sub after CREATE SUBSCRIPTION = %s, want 1", got)
+	}
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'two'", 1, 60*time.Second)
+	psc.Publisher.Exec(t, "UPDATE t SET v = 'updated' WHERE id = 2")
+	psc.Publisher.Exec(t, "DELETE FROM t WHERE id = 1")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	psc.WaitForRow(t, "t", "id = 1", 0, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM t"); got != "1" {
+		t.Fatalf("subscriber rows = %s, want 1 (no stale pre-update row)", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_sub")
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'g2g_sub'"); got != "0" {
+		t.Errorf("publisher slots named g2g_sub after DROP SUBSCRIPTION = %s, want 0", got)
+	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgSlotLifecycle: a goopg subscriber of a PG
+// 18.3 publisher creates its slot there on CREATE SUBSCRIPTION and drops it
+// on DROP SUBSCRIPTION, as a PG subscriber does. The PG publisher's own
+// pg_replication_slots is the oracle.
+func TestPort_PgoutputInteropPGToGoopgSlotLifecycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_slot", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "pg2g_slot_sub",
+		PublicationName:  "p",
+		SubscriptionName: "pg2g_slot_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+	if got := psc.Publisher.QueryScalar(t, "SELECT plugin || '/' || slot_type FROM pg_replication_slots WHERE slot_name = 'pg2g_slot_sub'"); got != "pgoutput/logical" {
+		t.Fatalf("PG publisher slot after CREATE SUBSCRIPTION = %q, want pgoutput/logical", got)
+	}
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'hello'", 1, 60*time.Second)
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION pg2g_slot_sub")
+	if got := psc.Publisher.QueryScalar(t, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg2g_slot_sub'"); got != "0" {
+		t.Errorf("PG publisher slots after DROP SUBSCRIPTION = %s, want 0", got)
+	}
+}
+
+// TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush measures the
+// 2026-10-30 M0122-0014 ledger item (b): "the apply worker never sends
+// standby status updates, so a published slot's confirmed_flush stays at
+// its initial value on the publisher and WAL retention grows while a
+// subscription runs". The receiver loop has since shipped the
+// XLogWalRcvSendReply arms (10 s ticker, keepalive reply-request, eager
+// push after each applied commit), and the logical walsender parses
+// 'r' frames into Slots.AdvanceConfirmedFlushLSN. This test measures the
+// claim on the live wire: after one applied INSERT, the publisher slot's
+// confirmed_flush_lsn must have moved forward from its post-creation
+// value, monotonically, within the status cadence.
+func TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_flush", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_flush_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_flush_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	slotLSN := func() uint64 {
+		v := psc.Publisher.QueryScalar(t,
+			"SELECT coalesce(confirmed_flush_lsn::text, '0/0') FROM pg_replication_slots WHERE slot_name = 'g2g_flush_sub'")
+		return parseLSN(t, v)
+	}
+	initial := slotLSN()
+
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1, 'flush-me')")
+	psc.WaitForRow(t, "t", "id = 1 AND v = 'flush-me'", 1, 60*time.Second)
+
+	// The applied commit's LSN reaches the publisher on the eager
+	// push (one RTT) or the next StatusInterval tick (<= 10 s).
+	deadline := time.Now().Add(30 * time.Second)
+	var got uint64
+	for {
+		got = slotLSN()
+		if got > initial {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher slot confirmed_flush_lsn did not advance past its post-creation value "+
+				"(initial=%s, now=%s) within 30 s of an applied commit — ledger item (b) reproduces",
+				lsnText(initial), lsnText(got))
+		}
+		time.Sleep(time.Second)
+	}
+	// A second commit must move it forward again (monotonic, not a
+	// one-shot jump): retention tracks apply, PG XLogWalRcvSendReply →
+	// LogicalConfirmReceivedLocation.
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (2, 'again')")
+	psc.WaitForRow(t, "t", "id = 2 AND v = 'again'", 1, 60*time.Second)
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		if second := slotLSN(); second > got {
+			got = second
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("publisher slot confirmed_flush_lsn did not advance a second time (prev=%s)",
+				lsnText(got))
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush is the parity
+// oracle for the same invariant: a REAL PG 18.3 publisher advances the
+// slot's confirmed_flush_lsn only from the client's standby status
+// updates (LogicalConfirmReceivedLocation), so this passing with a
+// stock PG publisher pins that goopg's subscriber 'r' frames carry
+// usable LSNs and keep WAL retention bounded against a PostgreSQL
+// publisher too.
+func TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_flush", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "pg2g_flush_sub",
+		PublicationName:  "p",
+		SubscriptionName: "pg2g_flush_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	slotLSN := func() uint64 {
+		v := psc.Publisher.QueryScalar(t,
+			"SELECT coalesce(confirmed_flush_lsn::text, '0/0') FROM pg_replication_slots WHERE slot_name = 'pg2g_flush_sub'")
+		return parseLSN(t, v)
+	}
+	initial := slotLSN()
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'flush-me')")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'flush-me'", 1, 60*time.Second)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if got := slotLSN(); got > initial {
+			return // PG advanced confirmed_flush from goopg's 'r' status update.
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PG publisher slot confirmed_flush_lsn stayed at %s for 30 s after an applied commit — "+
+				"goopg's subscriber status updates do not satisfy PG's LogicalConfirmReceivedLocation",
+				lsnText(initial))
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// parseLSN turns PostgreSQL's "X/Y" hex-pair text into a comparable
+// uint64 (the wire's 64-bit LSN). "0/0" and NULL render as 0.
+func parseLSN(t *testing.T, s string) uint64 {
+	t.Helper()
+	hi, lo, found := strings.Cut(strings.TrimSpace(s), "/")
+	if !found {
+		t.Fatalf("malformed LSN %q", s)
+	}
+	h, err := strconv.ParseUint(hi, 16, 32)
+	if err != nil {
+		t.Fatalf("malformed LSN high half %q: %v", s, err)
+	}
+	l, err := strconv.ParseUint(lo, 16, 32)
+	if err != nil {
+		t.Fatalf("malformed LSN low half %q: %v", s, err)
+	}
+	return h<<32 | l
+}
+
+func lsnText(v uint64) string {
+	return fmt.Sprintf("%X/%X", v>>32, v&0xFFFFFFFF)
+}
+
+// TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh pins the
+// 2026-10-31 M0122-0014 refresh half of ALTER SUBSCRIPTION ...
+// SET/ADD/DROP PUBLICATION: with refresh = true (the default) the arms
+// dial the publisher (AlterSubscription_refresh's walrcv_connect,
+// subscriptioncmds.c:838-850) and run check_publications' SELECT over the
+// publisher's pg_publication (:447-460). The harness pins what the wire
+// shows: a publication the publisher HAS lands silently; a publication it
+// LACKS still lands — check_publications raises ereport(WARNING), not an
+// error (:493-501), and psc.Exec fails the test on any ERROR, so landing
+// pins PG's non-error shape. (The WARNING's exact text is pinned at
+// executor level by TestAlterSubscriptionPublications; the dead-publisher
+// 08006 arm needs a dead-publisher cluster, so it is pinned through the
+// injected hook there as well.) DROP PUBLICATION is the connect-only arm:
+// PG passes validate_publications = NULL, so no name is checked, yet the
+// dial still happens. The pg_subscription view's subpublications column
+// is the observation point.
+func TestPort_PgoutputInteropGoopgToGoopgAlterPubsRefresh(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_pubsalter", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          t.TempDir(),
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_pubsalter_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2g_pubsalter_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
+
+	subs := func() string {
+		t.Helper()
+		return psc.Subscriber.QueryScalar(t,
+			"SELECT subpublications FROM pg_subscription WHERE subname = 'g2g_pubsalter_sub'")
+	}
+	if got := subs(); got != "{p}" {
+		t.Fatalf("subpublications after CREATE = %q, want {p}", got)
+	}
+
+	// ADD of a publication that exists on the publisher: dial + check
+	// pass, the list lands (merge_publications appends).
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p2 FOR TABLE t")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub ADD PUBLICATION p2")
+	if got := subs(); got != "{p,p2}" {
+		t.Fatalf("subpublications after ADD p2 = %q, want {p,p2}", got)
+	}
+
+	// ADD of a publication the publisher LACKS: WARNING, not an error —
+	// the statement lands with the name in the list.
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub ADD PUBLICATION px")
+	if got := subs(); got != "{p,p2,px}" {
+		t.Fatalf("subpublications after ADD px (publisher lacks it) = %q, want {p,p2,px}", got)
+	}
+
+	// DROP is connect-only (validate_publications = NULL) and lands.
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub DROP PUBLICATION px")
+	if got := subs(); got != "{p,p2}" {
+		t.Fatalf("subpublications after DROP px = %q, want {p,p2}", got)
+	}
+
+	// SET replaces the list; p2 exists on the publisher, p does not
+	// matter: p is already gone from the list before the dial (PG
+	// validates the STATEMENT list for SET).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_pubsalter_sub SET PUBLICATION p2")
+	if got := subs(); got != "{p2}" {
+		t.Fatalf("subpublications after SET p2 = %q, want {p2}", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_pubsalter_sub")
+}
+
+// TestPort_PgoutputInteropGoopgToGoopgRefreshData pins the DATA half of
+// AlterSubscription_refresh (subscriptioncmds.c:820-880) landed
+// 2026-11-01 (M0122-0014): refresh = true over the post-merge list runs
+// fetch_table_list (:2103) on the publisher, seeds pg_subscription_rel
+// rows for the entering tables (create_subscription_rel), drives one
+// initial-COPY exchange per row (the tablesync workers' COPY <rel> TO
+// STDOUT, riding the replication=database connection), removes the rows
+// of tables that left the list (RemoveSubscriptionRel — the TRUNCATE
+// half is ledgered), and restarts the apply worker so it streams with
+// the new list. The published table missing on the SUBSCRIBER is the
+// 42P01 arm ("table %s does not exist on the subscriber", :2176-2181),
+// and PG's all-names-first check keeps the statement's list change
+// out of the catalog when it aborts — goopg's in-memory registry keeps
+// the merged list (ledgered deviation), so the pin observes the rows,
+// not the list, as the abort artifact: NO row is created, NO data
+// copied. Observation points: the pg_subscription_rel view (relstate /
+// row count) and subscriber-side row counts.
+func TestPort_PgoutputInteropGoopgToGoopgRefreshData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	repo := repoRoot(t)
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2g_refreshdata", pubsubcluster.Options{
+		RepoRoot:         repo,
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2g_refreshdata_sub",
+		PublicationName:  "dummy",
+		SubscriptionName: "g2g_refreshdata_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The subscription starts on a publication whose table exists
+	// everywhere but stays out of the refresh path's way; p1/p2 join
+	// later through ADD PUBLICATION, the refresh machinery's entry ramp.
+	psc.Publisher.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+	psc.Subscriber.Exec(t, "CREATE TABLE t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t") // opts.PublicationName = dummy FOR TABLE t
+	psc.CreateSubscription(t)
+
+	subrelCount := func() string {
+		t.Helper()
+		return psc.Subscriber.QueryScalar(t,
+			"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+				"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')")
+	}
+
+	// ADD p1: t's 5 pre-existing publisher rows reach the subscriber
+	// through the refresh's initial COPY (they predate the ADD, so
+	// streaming alone cannot deliver them), the pg_subscription_rel
+	// row reaches 'r', and the restarted worker keeps streaming the
+	// new list (post-ADD INSERT lands).
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p1 FOR TABLE t")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p1")
+	psc.WaitForRow(t, "t", "TRUE", 5, 20*time.Second)
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"1", 20*time.Second)
+	psc.Publisher.Exec(t, "INSERT INTO t VALUES (6,'f')")
+	psc.WaitForRow(t, "t", "TRUE", 6, 20*time.Second)
+
+	// ADD p2 publishes u, which the subscriber LACKS: 42P01. No row is
+	// seeded, no data copied — PG resolves every fetched name BEFORE
+	// touching pg_subscription_rel (:2163-2181), and the rel count
+	// above pins the statement left exactly one row behind.
+	psc.Publisher.Exec(t, "CREATE TABLE u (id int PRIMARY KEY)")
+	psc.Publisher.Exec(t, "INSERT INTO u VALUES (1),(2),(3)")
+	psc.Publisher.Exec(t, "CREATE PUBLICATION p2 FOR TABLE u")
+	if err := psc.Subscriber.ExecErr("ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p2"); err == nil ||
+		!strings.Contains(err.Error(), "does not exist on the subscriber") {
+		t.Fatalf("ADD PUBLICATION p2 (subscriber lacks u): err = %v, want 42P01 \"does not exist on the subscriber\"", err)
+	}
+	if got := subrelCount(); got != "1" {
+		t.Fatalf("pg_subscription_rel rows after the 42P01 abort = %s, want 1 (no row seeded for u)", got)
+	}
+
+	// Create u locally, retry the ADD: the row seeds, the COPY lands
+	// u's 3 pre-ADD rows, and the sweep leaves two 'r' rows.
+	psc.Subscriber.Exec(t, "CREATE TABLE u (id int PRIMARY KEY)")
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub ADD PUBLICATION p2")
+	psc.WaitForRow(t, "u", "TRUE", 3, 20*time.Second)
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"2", 20*time.Second)
+
+	// DROP p1: t remains published through dummy (FOR TABLE t), so the
+	// merged list {dummy,p2} still covers t and u — BOTH rows stay
+	// (fetch_table_list returns {t,u}; RemoveSubscriptionRel only fires
+	// for rows whose rel is in NO remaining publication).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub DROP PUBLICATION p1")
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"2", 20*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM t"); got != "6" {
+		t.Fatalf("t rows after DROP PUBLICATION p1 = %s, want 6 (copied data kept; TRUNCATE ledgered)", got)
+	}
+
+	// DROP p2: u now belongs to NO remaining publication ({dummy} =
+	// {t}), so u's row leaves the list: RemoveSubscriptionRel removes
+	// it; the copied data in u stays (TRUNCATE half ledgered).
+	psc.Subscriber.Exec(t, "ALTER SUBSCRIPTION g2g_refreshdata_sub DROP PUBLICATION p2")
+	psc.WaitForScalar(t,
+		"SELECT count(*)::text FROM pg_subscription_rel WHERE srsubid = "+
+			"(SELECT oid FROM pg_subscription WHERE subname = 'g2g_refreshdata_sub')",
+		"1", 20*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*)::text FROM u"); got != "3" {
+		t.Fatalf("u rows after DROP PUBLICATION p2 = %s, want 3 (data kept; TRUNCATE ledgered)", got)
+	}
+
+	psc.Subscriber.Exec(t, "DROP SUBSCRIPTION g2g_refreshdata_sub")
 }

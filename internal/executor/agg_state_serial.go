@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+
+	"github.com/goopg/goopg/internal/optimizer"
 )
 
 // aggStateFieldBelt reports whether st carries any field outside the
@@ -55,11 +57,40 @@ func aggStateFieldBelt(st *aggRuntime) error {
 // its merge rules: the decoder must reconstruct the same fields the
 // combine and finalize paths read.
 func serializeAggRuntime(name string, st *aggRuntime) (Datum, error) {
-	if err := aggStateFieldBelt(st); err != nil {
+	shadow := *st
+	switch normalizeAggName(name) {
+	case "string_agg":
+		// The unordered accumulator is this aggregate's own state; the
+		// ordered (strElems) form still refuses.
+		shadow.strAccum = nil
+	case "array_agg":
+		shadow.arrayElems = nil
+	}
+	if err := aggStateFieldBelt(&shadow); err != nil {
 		return Datum{}, err
 	}
 	var buf []byte
 	switch normalizeAggName(name) {
+	case "string_agg":
+		buf = append(buf, boolByte(st.hasValue), boolByte(st.boolResult))
+		buf = appendStr(buf, st.strFirstDelim)
+		buf = appendStr(buf, string(st.strAccum))
+
+	case "array_agg":
+		if len(st.arrayElemKeys) > 0 {
+			return Datum{}, fmt.Errorf("internal error: cannot serialise an ordered array_agg state")
+		}
+		buf = append(buf, boolByte(st.hasValue), boolByte(st.arrayOfArrays))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(st.arrayShape)))
+		for _, d := range st.arrayShape {
+			buf = binary.LittleEndian.AppendUint64(buf, uint64(int64(d)))
+		}
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(st.arrayElems)))
+		for i, e := range st.arrayElems {
+			buf = appendStr(buf, e)
+			buf = append(buf, boolByte(i < len(st.arrayElemNull) && st.arrayElemNull[i]))
+		}
+
 	case "count":
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(st.count))
 
@@ -116,6 +147,32 @@ func deserializeAggRuntime(name string, data []byte) (aggRuntime, error) {
 	var st aggRuntime
 	rd := &byteReader{data: data}
 	switch normalizeAggName(name) {
+	case "string_agg":
+		st.hasValue = rd.bool()
+		st.boolResult = rd.bool()
+		st.strFirstDelim = rd.str()
+		if acc := rd.str(); acc != "" {
+			st.strAccum = []byte(acc)
+		}
+
+	case "array_agg":
+		st.hasValue = rd.bool()
+		st.arrayOfArrays = rd.bool()
+		if n := int(rd.u32()); n > 0 && rd.err == nil {
+			st.arrayShape = make([]int, n)
+			for i := range st.arrayShape {
+				st.arrayShape[i] = int(int64(rd.u64()))
+			}
+		}
+		if n := int(rd.u32()); n > 0 && rd.err == nil {
+			st.arrayElems = make([]string, n)
+			st.arrayElemNull = make([]bool, n)
+			for i := 0; i < n && rd.err == nil; i++ {
+				st.arrayElems[i] = rd.str()
+				st.arrayElemNull[i] = rd.bool()
+			}
+		}
+
 	case "count":
 		st.count = int64(rd.u64())
 
@@ -328,4 +385,48 @@ func (r *byteReader) bigRat() *big.Rat {
 		return nil
 	}
 	return new(big.Rat).SetFrac(num, den)
+}
+
+// serializeAggCall is serializeAggRuntime keyed by the call: a user-defined
+// aggregate (CREATE AGGREGATE … COMBINEFUNC, M0148-0001i) ships its
+// transition-state Datum — PG ships a non-internal transition type as is,
+// and an internal one only through its SERIALFUNC, which the planner then
+// requires (optimizer.AggregateIsDecomposable) — plus hasValue and
+// userStateSet, the two flags the combine and finalize paths read.
+func serializeAggCall(call optimizer.AggregateCall, st *aggRuntime) (Datum, error) {
+	if call.UserAgg == nil {
+		return serializeAggRuntime(call.Name, st)
+	}
+	shadow := *st
+	shadow.userStateSet, shadow.userState = false, Datum{}
+	if err := aggStateFieldBelt(&shadow); err != nil {
+		return Datum{}, err
+	}
+	buf := []byte{boolByte(st.hasValue), boolByte(st.userStateSet)}
+	if st.userStateSet {
+		buf = encodeDatum(st.userState.MaterializeArena(), buf)
+	}
+	return NewBytesDatum(buf), nil
+}
+
+// deserializeAggCall is serializeAggCall's inverse.
+func deserializeAggCall(call optimizer.AggregateCall, data []byte) (aggRuntime, error) {
+	if call.UserAgg == nil {
+		return deserializeAggRuntime(call.Name, data)
+	}
+	var st aggRuntime
+	rd := &byteReader{data: data}
+	st.hasValue = rd.bool()
+	st.userStateSet = rd.bool()
+	if st.userStateSet {
+		st.userState = rd.datum()
+	}
+	if rd.err != nil {
+		return st, fmt.Errorf("internal error: truncated serialized state for aggregate %q: %v", call.Name, rd.err)
+	}
+	if rd.pos != len(data) {
+		return st, fmt.Errorf("internal error: %d trailing bytes in serialized state for aggregate %q",
+			len(data)-rd.pos, call.Name)
+	}
+	return st, nil
 }

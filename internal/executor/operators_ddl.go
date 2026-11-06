@@ -203,8 +203,18 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropSubscription(s)
 	case *parser.AlterPublicationOwnerStmt:
 		return nil, o.execAlterPublicationOwner(s)
+	case *parser.AlterPublicationTablesStmt:
+		return nil, o.execAlterPublicationTables(s)
+	case *parser.AlterPublicationOptionsStmt:
+		return nil, o.execAlterPublicationOptions(s)
 	case *parser.AlterSubscriptionOwnerStmt:
 		return nil, o.execAlterSubscriptionOwner(s)
+	case *parser.AlterSubscriptionEnableStmt:
+		return nil, o.execAlterSubscriptionEnable(s)
+	case *parser.AlterSubscriptionSetStmt:
+		return nil, o.execAlterSubscriptionSet(s)
+	case *parser.AlterSubscriptionPublicationsStmt:
+		return nil, o.execAlterSubscriptionPublications(s)
 	case *parser.CreateEventTriggerStmt:
 		return nil, o.execCreateEventTrigger(s)
 	case *parser.AlterEventTriggerStmt:
@@ -1189,24 +1199,8 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	}
 	opts := catalog.DefaultPublicationOptions()
 	opts.AllTables = s.AllTables
-	if pub, ok := s.With["publish"]; ok {
-		opts.PublishInsert = false
-		opts.PublishUpdate = false
-		opts.PublishDelete = false
-		for _, kind := range splitCommaList(pub) {
-			switch kind {
-			case "insert":
-				opts.PublishInsert = true
-			case "update":
-				opts.PublishUpdate = true
-			case "delete":
-				opts.PublishDelete = true
-			case "truncate":
-				// Out of scope: silently accept.
-			default:
-				return &ExecError{Code: "22023", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized publish action %q", kind)}
-			}
-		}
+	if err := applyPublicationOptions(s.With, &opts); err != nil {
+		return err
 	}
 	// Canonicalise each table reference to the qualified form the
 	// walsender's publication filter compares against
@@ -1264,19 +1258,39 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	// B3.3: capture the OID before the registry drop, then stamp xmax on
 	// the pg_publication row and its pg_publication_rel members (kind 51
 	// retired).
-	var pubOID uint32
+	// DROP PUBLICATION a, b (RemoveObjects): every name is resolved before
+	// any is dropped — PG's DROP is transactional and a missing name aborts
+	// it whole, while goopg's registry drop is not, so a missing name must
+	// fail the statement before the first drop. IF EXISTS skips a missing
+	// name with PG's NOTICE.
+	names := s.Names
+	if len(names) == 0 {
+		names = []string{s.Name}
+	}
 	pubDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name, pubDBOid); ok && pub != nil {
-		pubOID = pub.OID
+	type target struct {
+		name string
+		oid  uint32
 	}
-	if err := o.ctx.PubSub.DropPublication(s.Name, pubDBOid); err != nil {
-		if s.IfExists {
-			return nil
+	var targets []target
+	for _, name := range names {
+		pub, ok := o.ctx.PubSub.LookupPublication(name, pubDBOid)
+		if !ok || pub == nil {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("publication \"%s\" does not exist, skipping", name))
+				continue
+			}
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", name)}
 		}
-		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+		targets = append(targets, target{name, pub.OID})
 	}
-	if pubOID != 0 {
-		deletePublicationCatalogRows(o.ctx, pubOID)
+	for _, t := range targets {
+		if err := o.ctx.PubSub.DropPublication(t.name, pubDBOid); err != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+		}
+		if t.oid != 0 {
+			deletePublicationCatalogRows(o.ctx, t.oid)
+		}
 	}
 	return nil
 }
@@ -1317,6 +1331,18 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
 		return err
 	}
+	// CreateSubscription with connect = true and create_slot = true creates
+	// the slot on the publisher (walrcv_create_slot) and reports NOTICE
+	// "created replication slot \"%s\" on publisher". Without it the apply
+	// worker's START_REPLICATION finds no slot and exits on every retry.
+	// It runs before the registry insert: PG's catalog row rolls back with
+	// a failed CREATE SUBSCRIPTION, goopg's registry insert does not.
+	if opts.connect && opts.createSlot && o.ctx.CreateSubscriptionSlot != nil {
+		if err := o.ctx.CreateSubscriptionSlot(s.Name, s.Conninfo, slotName); err != nil {
+			return err
+		}
+		o.ctx.AddNotice(fmt.Sprintf("created replication slot \"%s\" on publisher", slotName))
+	}
 	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, opts.enabled, o.currentDDLOwnerOID(), subDBOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -1337,15 +1363,33 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	}
 	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
-	var dropOID uint32
-	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
-		dropOID = sub.OID
-	}
-	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
 		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("subscription \"%s\" does not exist, skipping", s.Name))
 			return nil
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription \"%s\" does not exist", s.Name)}
+	}
+	dropOID := sub.OID
+	// DropSubscription's order: the subscription goes away, its workers stop
+	// (the hook stops the apply worker, which the registry removal keeps
+	// from being restarted), then the slot is dropped on the publisher
+	// (ReplicationSlotDropAtPubNode, missing_ok = false). A failure rolls
+	// PG's whole DROP back; goopg restores the registry entry. A slot left
+	// behind would pin WAL on the publisher forever.
+	if err := o.ctx.PubSub.DropSubscription(s.Name, subDBOid); err != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	if sub.SlotName != "" && o.ctx.DropSubscriptionSlot != nil {
+		if err := o.ctx.DropSubscriptionSlot(s.Name, sub.Conninfo, sub.SlotName); err != nil {
+			o.ctx.PubSub.CreateSubscriptionDuringRecovery(sub)
+			if o.ctx.OnSubscriptionChange != nil {
+				o.ctx.OnSubscriptionChange()
+			}
+			return err
+		}
+		o.ctx.AddNotice(fmt.Sprintf("dropped replication slot \"%s\" on publisher", sub.SlotName))
 	}
 	// B4.4: xmax-stamp the pg_subscription heap row (replaces kind 54).
 	if err := syncSubscriptionRow(o.ctx, dropOID, nil); err != nil {
@@ -1373,6 +1417,167 @@ func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
 		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("role %q does not exist", newOwner)}
 	}
 	return oid, nil
+}
+
+// applyPublicationOptions is parse_publication_options (publicationcmds.c)
+// for the options goopg models: `publish` resets the four actions and sets
+// the listed ones (42601 "unrecognized value for publication option
+// \"publish\": \"%s\""; truncate is accepted and not tracked);
+// publish_via_partition_root and publish_generated_columns are accepted and
+// not tracked; any other name is 42601 "unrecognized publication parameter:
+// \"%s\"".
+func applyPublicationOptions(with map[string]string, opts *catalog.PublicationOptions) error {
+	for name, value := range with {
+		switch name {
+		case "publish":
+			opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete = false, false, false
+			for _, kind := range splitCommaList(value) {
+				switch kind {
+				case "insert":
+					opts.PublishInsert = true
+				case "update":
+					opts.PublishUpdate = true
+				case "delete":
+					opts.PublishDelete = true
+				case "truncate":
+				default:
+					return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized value for publication option \"publish\": \"%s\"", kind)}
+				}
+			}
+		case "publish_via_partition_root", "publish_generated_columns":
+		default:
+			return &ExecError{Code: "42601", Message: fmt.Sprintf("unrecognized publication parameter: \"%s\"", name)}
+		}
+	}
+	return nil
+}
+
+// execAlterPublicationOptions handles ALTER PUBLICATION name SET ( ... ) as
+// AlterPublicationOptions does: the options are re-parsed over the current
+// ones (an option not named keeps its value; `publish` resets all four
+// actions first), the registry is updated and the pg_publication row is
+// rewritten.
+func (o *ddlOp) execAlterPublicationOptions(s *parser.AlterPublicationOptionsStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	pub, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid)
+	if !ok {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
+	}
+	opts := catalog.PublicationOptions{AllTables: pub.AllTables, PublishInsert: pub.PublishInsert,
+		PublishUpdate: pub.PublishUpdate, PublishDelete: pub.PublishDelete}
+	if err := applyPublicationOptions(s.With, &opts); err != nil {
+		return err
+	}
+	updated, err := o.ctx.PubSub.SetPublicationOptions(s.Name, opts, dbOid)
+	if err != nil {
+		return &ExecError{Code: "42704", Message: err.Error()}
+	}
+	if err := upsertPublicationCatalogRow(o.ctx, updated); err != nil {
+		return fmt.Errorf("pg_publication journal: %w", err)
+	}
+	return nil
+}
+
+// execAlterPublicationTables handles ALTER PUBLICATION name { ADD | SET |
+// DROP } TABLE t [, ...] as AlterPublicationTables (publicationcmds.c) does:
+// the publication must exist and must not be FOR ALL TABLES (55000, "Tables
+// cannot be added to or dropped from FOR ALL TABLES publications."); every
+// table must exist (42P01); ADD refuses a member (42710 "relation \"%s\" is
+// already member of publication \"%s\"", publication_add_relation); DROP
+// refuses a non-member (42704 "relation \"%s\" is not part of the
+// publication"); SET replaces the list. A table named twice is one entry
+// (OpenTableList filters duplicates). Membership is journalled as
+// pg_publication_rel rows — written for added tables, xmax-stamped for dropped
+// ones — which the startup reload rebuilds the registry from.
+func (o *ddlOp) execAlterPublicationTables(s *parser.AlterPublicationTablesStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	pub, ok := o.ctx.PubSub.LookupPublication(s.Name, dbOid)
+	if !ok {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("publication \"%s\" does not exist", s.Name)}
+	}
+	if pub.AllTables {
+		return &ExecError{Code: "55000",
+			Message: fmt.Sprintf("publication \"%s\" is defined as FOR ALL TABLES", s.Name),
+			Detail:  "Tables cannot be added to or dropped from FOR ALL TABLES publications."}
+	}
+	type member struct{ qname, name string }
+	var listed []member
+	seen := map[string]bool{}
+	for _, t := range s.Tables {
+		tbl, ok := o.ctx.Catalog.LookupTable(t, dbOid)
+		if !ok && t.Schema == "" {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name}, dbOid)
+		}
+		if !ok {
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
+		}
+		if q := tbl.QualifiedName(); !seen[q] {
+			seen[q] = true
+			listed = append(listed, member{q, tbl.Name})
+		}
+	}
+	current := map[string]bool{}
+	for _, q := range pub.Tables {
+		current[q] = true
+	}
+	var next []string
+	switch s.Action {
+	case "add":
+		next = append(next, pub.Tables...)
+		for _, m := range listed {
+			if current[m.qname] {
+				return &ExecError{Code: "42710", Message: fmt.Sprintf("relation \"%s\" is already member of publication \"%s\"", m.name, s.Name)}
+			}
+			next = append(next, m.qname)
+		}
+	case "drop":
+		drop := map[string]bool{}
+		for _, m := range listed {
+			if !current[m.qname] {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("relation \"%s\" is not part of the publication", m.name)}
+			}
+			drop[m.qname] = true
+		}
+		for _, q := range pub.Tables {
+			if !drop[q] {
+				next = append(next, q)
+			}
+		}
+	default: // set
+		for _, m := range listed {
+			next = append(next, m.qname)
+		}
+	}
+	updated, err := o.ctx.PubSub.SetPublicationTables(s.Name, next, dbOid)
+	if err != nil {
+		return &ExecError{Code: "42704", Message: err.Error()}
+	}
+	nextSet := map[string]bool{}
+	for _, q := range next {
+		nextSet[q] = true
+	}
+	var added, removed []string
+	for _, q := range next {
+		if !current[q] {
+			added = append(added, q)
+		}
+	}
+	for _, q := range pub.Tables {
+		if !nextSet[q] {
+			removed = append(removed, q)
+		}
+	}
+	if err := writePublicationMemberRowsFor(o.ctx, updated, added); err != nil {
+		return fmt.Errorf("pg_publication_rel journal: %w", err)
+	}
+	deletePublicationMemberRows(o.ctx, updated.OID, removed)
+	return nil
 }
 
 // execAlterPublicationOwner handles ALTER PUBLICATION name OWNER TO newowner.
@@ -1423,6 +1628,275 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
 			return fmt.Errorf("pg_subscription heap write: %w", err)
 		}
+	}
+	return nil
+}
+
+// execAlterSubscriptionEnable handles ALTER SUBSCRIPTION name ENABLE /
+// DISABLE — AlterSubscription's ALTER_SUBSCRIPTION_ENABLED case
+// (subscriptioncmds.c:1337-1357). ENABLE on a subscription whose slot_name
+// is NONE is a prerequisite failure. The launcher kick (goopg's twin of
+// ApplyLauncherWakeupAtCommit) makes the reconcile pass stop the worker of
+// a DISABLED subscription and start one for an ENABLED one immediately;
+// PG leaves the disable-side stop to the launcher's next reload, goopg's
+// Wake stops it now, which is what releases the publisher slot ahead of a
+// following SET (slot_name = NONE) — the documented escape hatch (see
+// subscriptionSlotHooks' DROP 08006 hint).
+func (o *ddlOp) execAlterSubscriptionEnable(s *parser.AlterSubscriptionEnableStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	// subscriptioncmds.c:1344-1348.
+	if s.Enabled && sub.SlotName == "" {
+		return &ExecError{Code: "55000", Pos: s.Pos(), Message: "cannot enable subscription that does not have a slot name"}
+	}
+	if err := o.ctx.PubSub.SetSubscriptionEnabled(s.Name, s.Enabled, subDBOid); err != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subenabled.
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", err)
+		}
+	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
+	}
+	return nil
+}
+
+// execAlterSubscriptionSet handles ALTER SUBSCRIPTION name SET (...),
+// AlterSubscription's ALTER_SUBSCRIPTION_OPTIONS case
+// (subscriptioncmds.c:1157-1342). slot_name = NONE requires the
+// subscription to be disabled first (subscriptioncmds.c:1172-1178):
+// "The subscription must be disabled to allow slot_name as 'none',
+// otherwise, the apply worker will repeatedly try to stream the data
+// using that slot_name which neither exists on the publisher nor the
+// user will be allowed to create it." A name change is written straight
+// through (PG's namein write). The remaining options are validated and
+// accepted-not-modelled (parseAlterSubscriptionSetOptions). An empty list
+// is a no-op (PG rewrites the tuple unchanged).
+func (o *ddlOp) execAlterSubscriptionSet(s *parser.AlterSubscriptionSetStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	slotName, slotSet, err := parseAlterSubscriptionSetOptions(s.Options, s.Pos())
+	if err != nil {
+		return err
+	}
+	if !slotSet {
+		return nil
+	}
+	if slotName == "" && sub.Enabled {
+		return &ExecError{Code: "55000", Pos: s.Pos(), Message: "cannot set slot_name = NONE for enabled subscription"}
+	}
+	if serr := o.ctx.PubSub.SetSubscriptionSlotName(s.Name, slotName, subDBOid); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subslotname.
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if herr := syncSubscriptionRow(o.ctx, sub.OID, sub); herr != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", herr)
+		}
+	}
+	return nil
+}
+
+// execAlterSubscriptionPublications handles ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION name_list [WITH (...)] —
+// AlterSubscription's ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION arms
+// (subscriptioncmds.c:1374-1475). The list algebra is PG's verbatim
+// (merge_publications :2402): SET replaces (a duplicate in the new list
+// is 42710 via publicationListToArray → check_duplicates_in_publist),
+// ADD appends refusing names already present (42710 "publication %q is
+// already in subscription %q"), DROP removes refusing names absent from
+// the list (42704 "publication %q is not in subscription %q") and the
+// drop-to-empty case (42704 "cannot drop all the publications from a
+// subscription"). WITH carries the arms' supported_opts, refresh +
+// copy_data (subscriptioncmds.c:1380/1424); other keys are 42601.
+//
+// refresh = true (the default) passes PG's two gates — a disabled
+// subscription 55000 with the per-action hint (:1392-1408/1437-1456) and
+// an explicit transaction block 25001 (PreventInTransactionBlock) — then
+// runs AlterSubscription_refresh's publisher-connection half (dial +
+// check_publications, below) and lands the list change. The rest of
+// goopg's AlterSubscription_refresh — fetch_table_list, pg_subscription_rel
+// 'i' rows, the tablesync COPY — is not wired in production (ledgered), so
+// no table-sync work fires; the new list reaches the publisher on the
+// apply worker's next START_REPLICATION, where publication_names is
+// sent. copy_data validates and is accepted-not-modelled, as the SET
+// arm treats its accepted options.
+func (o *ddlOp) execAlterSubscriptionPublications(s *parser.AlterSubscriptionPublicationsStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid)
+	if !ok {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("subscription %q does not exist", s.Name)}
+	}
+	// parse_subscription_options over the arms' supported_opts. goopg's
+	// WITH clause is a map, so keys are validated in sorted order (the
+	// determinism convention parseAlterSubscriptionSetOptions uses).
+	refresh, copyData := true, true
+	names := make([]string, 0, len(s.Options))
+	for k := range s.Options {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name != "refresh" && name != "copy_data" {
+			return &ExecError{Code: "42601", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized subscription parameter: %q", name)}
+		}
+		b, berr := defGetSubscriptionBoolean(name, s.Options[name], s.Pos())
+		if berr != nil {
+			return berr
+		}
+		if name == "refresh" {
+			refresh = b
+		} else {
+			copyData = b
+		}
+	}
+
+	// PG's order: the list work (publicationListToArray /
+	// check_duplicates_in_publist for SET, merge_publications for
+	// ADD/DROP) runs before the refresh gates.
+	if err := checkDuplicatesInPublist(s.Publications, s.Pos()); err != nil {
+		return err
+	}
+	next := sub.Publications
+	switch s.Action {
+	case "set":
+		next = append([]string(nil), s.Publications...)
+	case "add", "drop":
+		isAdd := s.Action == "add"
+		next = append([]string(nil), sub.Publications...)
+		for _, pub := range s.Publications {
+			found := false
+			for i := range next {
+				if next[i] == pub {
+					found = true
+					if isAdd {
+						return &ExecError{Code: "42710", Pos: s.Pos(),
+							Message: fmt.Sprintf("publication %q is already in subscription %q", pub, s.Name)}
+					}
+					next = append(append([]string(nil), next[:i]...), next[i+1:]...)
+					break
+				}
+			}
+			if isAdd && !found {
+				next = append(next, pub)
+			} else if !isAdd && !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("publication %q is not in subscription %q", pub, s.Name)}
+			}
+		}
+		// merge_publications :2445 — the drop-to-empty refusal.
+		if !isAdd && len(next) == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: "cannot drop all the publications from a subscription"}
+		}
+	}
+
+	if refresh {
+		// subscriptioncmds.c:1392-1399 (SET) / :1440-1452 (ADD/DROP):
+		// the refresh machinery needs a live subscription; PG refuses the
+		// default and names the escape hatch in the hint.
+		if !sub.Enabled {
+			hint := "Use ALTER SUBSCRIPTION ... SET PUBLICATION ... WITH (refresh = false)."
+			switch s.Action {
+			case "add":
+				hint = "Use ALTER SUBSCRIPTION ... ADD PUBLICATION ... WITH (refresh = false) instead."
+			case "drop":
+				hint = "Use ALTER SUBSCRIPTION ... DROP PUBLICATION ... WITH (refresh = false) instead."
+			}
+			return &ExecError{Code: "55000", Pos: s.Pos(),
+				Message: "ALTER SUBSCRIPTION with refresh is not allowed for disabled subscriptions",
+				Hint:  hint}
+		}
+		// PreventInTransactionBlock (utility.c:4395), goopg's 25001 pattern.
+		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			return &ExecError{Code: "25001", Pos: s.Pos(),
+				Message: "ALTER SUBSCRIPTION with refresh cannot run inside a transaction block"}
+		}
+	}
+
+	// AlterSubscription_refresh's publisher half (refresh = true only,
+	// subscriptioncmds.c:820-880): walrcv_connect (connect failure is
+	// ERRCODE_CONNECTION_FAILURE 08006, "subscription %q could not connect
+	// to the publisher"), then check_publications (:443) over
+	// pg_publication for the validated names — SET's list, ADD's list;
+	// DROP passes NULL (PG validates no names there) and only needs the
+	// dial. A missing publication is a WARNING (:493-501), NOT an error:
+	// the statement lands and the refresh machinery skips that
+	// publication's tables. The data half (fetch_table_list, the
+	// pg_subscription_rel rows, the tablesync COPY, the worker kill)
+	// runs below, before the list write; the hook is nil in test
+	// contexts without a server, which keeps the list-write
+	// unit-testable.
+	if refresh && o.ctx.CheckPublicationsOnPublisher != nil {
+		validate := s.Publications
+		if s.Action == "drop" {
+			validate = nil
+		}
+		missing, cerr := o.ctx.CheckPublicationsOnPublisher(s.Name, sub.Conninfo, validate)
+		if cerr != nil {
+			return cerr
+		}
+		if len(missing) == 1 {
+			o.ctx.AddNotice(fmt.Sprintf("publication %q does not exist on the publisher", missing[0]))
+		} else if len(missing) > 1 {
+			quoted := make([]string, len(missing))
+			for i, m := range missing {
+				quoted[i] = `"` + m + `"`
+			}
+			o.ctx.AddNotice(fmt.Sprintf("publications %s do not exist on the publisher", strings.Join(quoted, ", ")))
+		}
+	}
+
+	// AlterSubscription_refresh's data half (subscriptioncmds.c:820-880)
+	// over the post-merge list: fetch_table_list, the pg_subscription_rel
+	// row swap, the tablesync COPY (skipped for WITH (copy_data = false),
+	// where PG marks the rows READY), and the apply-worker kill. PG runs
+	// the refresh BEFORE writing the pg_subscription tuple (the tuple
+	// update is the command's last step), so a fetch failure (XX000),
+	// connect failure (08006) or a published table missing locally
+	// (42P01) aborts with the subscription's publication list unchanged
+	// — a later ADD of the same publication retries cleanly. goopg's
+	// registry write is the commit point and sits after this call.
+	if refresh && o.ctx.RefreshSubscriptionOnPublisher != nil {
+		if rerr := o.ctx.RefreshSubscriptionOnPublisher(s.Name, sub.Conninfo, subDBOid, next, copyData); rerr != nil {
+			return rerr
+		}
+	}
+	if err := o.ctx.PubSub.SetSubscriptionPublications(s.Name, next, subDBOid); err != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	// B4.4: re-sync the pg_subscription heap row's subpublications text[].
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name, subDBOid); ok {
+		if herr := syncSubscriptionRow(o.ctx, sub.OID, sub); herr != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", herr)
+		}
+	}
+	// Launcher kick, as the ENABLE/DISABLE arms do (goopg's twin of
+	// ApplyLauncherWakeupAtCommit): it relaunches the apply worker the
+	// refresh killed, now dialing with the committed list. The
+	// kill-in-refresh + kick-relaunch split mirrors PG's
+	// kill-during-refresh / wake-after-commit ordering.
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
 	}
 	return nil
 }
@@ -3865,6 +4339,21 @@ afterExistsCheck:
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// The relation is registered from here on, but its rollback entry is
+	// recorded only further down (before the heap sync). A statement that
+	// fails in between — the inline FOREIGN KEY type check, a constraint
+	// validation — must not strand the half-built table: PG's CREATE TABLE
+	// is undone with its transaction. Record the undo entry on that error
+	// path too. M0148-0001j2 (the stranded table blocked DROP TYPE in
+	// regress enum).
+	createUndoRecorded := false
+	defer func() {
+		if retErr != nil && !createUndoRecorded {
+			if sess, ok := o.ctx.Session.(*BasicSession); ok {
+				sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow})
+			}
+		}
+	}()
 	// Stamp the creating role as owner (PG: tablecmds.c DefineRelation ->
 	// heap_create_with_catalog(ownerId = GetUserId())), so a non-superuser
 	// role's own CREATE TABLE (including CREATE TEMP TABLE, which shares this
@@ -4155,6 +4644,7 @@ afterExistsCheck:
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false, ShadowedTable: o.pendingDropShadow,
 			StorageScheduled: createdRelationStorage(o.ctx, o.ctx.Catalog.RelFileNode(tbl), true)})
 	}
+	createUndoRecorded = true
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -6511,6 +7001,25 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			return err
 		}
 	}
+	// DefineView creates an unqualified view in the creation namespace, the
+	// first schema on search_path (RangeVarGetCreationNamespace), as CREATE
+	// TABLE pre-resolves above. A view over a temporary relation becomes a
+	// temporary view instead (view.c isQueryUsingTempRelation), and goopg
+	// keys temporary relations bare, so it stays unqualified. Without this a
+	// view created under `search_path = s, public` landed in public, and
+	// DROP TABLE s.t CASCADE (scoped by schema since M0148-0001h) missed it.
+	viewIsTemp := s.Temporary
+	if !viewIsTemp && s.Name.Schema == "" && o.viewQueryUsesTempRelation(s.Query) {
+		// DefineView (view.c): "If the user didn't explicitly ask for a
+		// temporary view, check whether we need one implicitly."
+		viewIsTemp = true
+		o.ctx.AddNotice(fmt.Sprintf("view %q will be a temporary view", s.Name.Name))
+	}
+	if s.Name.Schema == "" && !viewIsTemp {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			s.Name.Schema = ws
+		}
+	}
 	if !s.OrReplace {
 		if existing, ok := o.ctx.Catalog.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing.View == nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
@@ -6620,6 +7129,17 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			vt.Owner = o.ctx.NonSuperuserRole
 		}
 		vt.ViewDef = s.RawDef
+		// A temporary view — declared TEMP, or implicitly temporary over a
+		// temporary relation — belongs to the session's temp namespace and is
+		// dropped at backend exit with the session's other temp relations
+		// (RemoveTempRelations; cleanupSessionTempObjects). Without the stamp
+		// create_view.sql's temporal1..4 outlived their session and
+		// aggregates.sql's `drop table t1 cascade` dropped them (M0148-0001h
+		// cause 4).
+		if viewIsTemp {
+			vt.Temp = true
+			vt.TempOwner = sessionTempOwner(o.ctx)
+		}
 		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
 		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
 		// `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (DU-002 slice 365).
@@ -6751,6 +7271,7 @@ func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectN
 func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 	dropped := make(map[string]bool)
 	for _, name := range s.Names {
+		name = o.resolveRelationBySearchPath(name)
 		// Before dropping, collect all transitive deps and emit ONE aggregate notice.
 		if s.Behavior == parser.DropCascade {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -7246,36 +7767,44 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				seen := map[string]bool{}
 
 				// Direct view dependents + all their transitive view/matview deps via BFS.
-				viewNames := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				// M0148-0001h: by the RESOLVED table identity, as the RESTRICT
+				// path does (M0134-0069). The raw parsed name has an empty
+				// Schema for an unqualified DROP TABLE, which disables the
+				// schema filter below — so dropping one t1 also dropped every
+				// other schema's views over a different t1 (aggregates.sql's
+				// temp t1 took create_view.sql's testviewschm2 views). PG walks
+				// pg_depend by OID (findDependentObjects).
+				resolvedCascade := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+				viewNames := viewsDependingOnTable(im, resolvedCascade, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, vn := range viewNames {
 					k := vn.String()
 					if !seen[k] {
 						seen[k] = true
-						deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
+						deps = append(deps, cascadeDep{kind: "view", display: "view " + dropCascadeObjectName(vn, o.ctx), viewName: vn})
 					}
 					// Transitively reachable views/matviews from this view.
 					for _, td := range collectAllViewTransitiveDeps(im, vn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
-							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + dropCascadeObjectName(td.name, o.ctx), viewName: td.name})
 						}
 					}
 				}
 				// Direct materialized view dependents + all their transitive deps via BFS.
-				matViewNames := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				matViewNames := matViewsDependingOnRelation(im, resolvedCascade, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, mvn := range matViewNames {
 					k := mvn.String()
 					if !seen[k] {
 						seen[k] = true
-						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + mvn.String(), viewName: mvn})
+						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + dropCascadeObjectName(mvn, o.ctx), viewName: mvn})
 					}
 					// Transitively reachable matviews from this matview.
 					for _, td := range collectAllViewTransitiveDeps(im, mvn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
-							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + dropCascadeObjectName(td.name, o.ctx), viewName: td.name})
 						}
 					}
 				}
@@ -7342,20 +7871,120 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName, dbOid uint32) []parser.ObjectName {
 	var deps []parser.ObjectName
 	tblLower := strings.ToLower(tableName.Name)
-	tblSchema := strings.ToLower(tableName.Schema)
+	tblSchema := normViewDepSchema(tableName.Schema)
 	for _, tbl := range im.AllUserViews(dbOid) {
 		if tbl.View == nil {
 			continue
 		}
-		// Only check views in the same schema (fast path to avoid scanning all views).
-		if tblSchema != "" && strings.ToLower(tbl.Schema) != tblSchema {
-			continue
-		}
-		if selectRefsViewName(tbl.View, tblLower) {
+		// M0148-0001h: an explicitly qualified reference matches only when
+		// its schema is the dropped table's (`vs2.t1` is not public.t1 — the
+		// catalog spells public as "", which the old filter read as "any
+		// schema", so dropping public.t1 took vs2's views over vs2.t1). An
+		// unqualified reference keeps the previous rule: any view when the
+		// table is in public, else views in the table's own schema. PG binds
+		// the dependency by OID at CREATE VIEW (pg_depend); this name
+		// heuristic is the ledgered stand-in.
+		if selectRefsRelation(tbl.View, tblSchema, tblLower, normViewDepSchema(tbl.Schema)) {
 			deps = append(deps, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
 		}
 	}
 	return deps
+}
+
+// normViewDepSchema maps the catalog's empty public schema to "public".
+func normViewDepSchema(s string) string {
+	if s == "" {
+		return "public"
+	}
+	return strings.ToLower(s)
+}
+
+// selectRefsRelation reports whether sel (or a sub-select, set-op branch or
+// join input) references schema.name: a qualified reference by its schema,
+// an unqualified one when the table is in public (any view) or the view is in the
+// table's schema.
+func selectRefsRelation(sel *parser.SelectStmt, schema, name, viewSchema string) bool {
+	if sel == nil {
+		return false
+	}
+	refs := func(rv *parser.RangeVar) bool {
+		if rv.Subquery != nil {
+			return selectRefsRelation(rv.Subquery, schema, name, viewSchema)
+		}
+		if !strings.EqualFold(rv.Name, name) {
+			return false
+		}
+		if rv.Schema != "" {
+			return normViewDepSchema(rv.Schema) == schema
+		}
+		return schema == "public" || viewSchema == schema
+	}
+	for i := range sel.From {
+		if refs(&sel.From[i]) {
+			return true
+		}
+	}
+	for _, fe := range sel.FromExprs {
+		if refs(&fe.Base) {
+			return true
+		}
+		for j := range fe.Joins {
+			if refs(&fe.Joins[j].Right) {
+				return true
+			}
+		}
+	}
+	if sel.SetOp != nil && selectRefsRelation(sel.SetOp.Right, schema, name, viewSchema) {
+		return true
+	}
+	return sel.SetOpOperand != nil && selectRefsRelation(sel.SetOpOperand, schema, name, viewSchema)
+}
+
+// viewQueryUsesTempRelation is isQueryUsingTempRelation over the FROM items
+// selectRefsRelation walks: true when one of them resolves to a temporary
+// relation.
+func (o *ddlOp) viewQueryUsesTempRelation(sel *parser.SelectStmt) bool {
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	return selectAnyRangeVar(sel, func(rv *parser.RangeVar) bool {
+		if rv.Name == "" {
+			return false
+		}
+		t, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}, dbOid)
+		return ok && t.Temp
+	})
+}
+
+// selectAnyRangeVar reports whether fn holds for a relation FROM item of sel,
+// its sub-selects, join inputs or set-operation branches.
+func selectAnyRangeVar(sel *parser.SelectStmt, fn func(*parser.RangeVar) bool) bool {
+	if sel == nil {
+		return false
+	}
+	visit := func(rv *parser.RangeVar) bool {
+		if rv.Subquery != nil {
+			return selectAnyRangeVar(rv.Subquery, fn)
+		}
+		return fn(rv)
+	}
+	for i := range sel.From {
+		if visit(&sel.From[i]) {
+			return true
+		}
+	}
+	for _, fe := range sel.FromExprs {
+		if visit(&fe.Base) {
+			return true
+		}
+		for j := range fe.Joins {
+			if visit(&fe.Joins[j].Right) {
+				return true
+			}
+		}
+	}
+	if sel.SetOp != nil && selectAnyRangeVar(sel.SetOp.Right, fn) {
+		return true
+	}
+	return sel.SetOpOperand != nil && selectAnyRangeVar(sel.SetOpOperand, fn)
 }
 
 // functionsDependingOnTable returns all routines whose TableDeps reference the given table/view name.
@@ -16885,18 +17514,30 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt, tempTables bool) error {
 	// empty table, where PostgreSQL resets to 0/-1 and estimates its 10-page
 	// floor (2550 on the same fixture).
 	//
-	// Clearing Stats returns the relation to the never-analyzed state, which is
-	// what makes the block-derived fallback fire and produce PG's answer. The
-	// zeroed size row is persisted for the same reason VACUUM's is (P1-03): an
-	// in-memory-only reset would come back stale after a restart.
+	// The reset is PG's new-relfilenode state exactly: the truncate replaces
+	// the relfilenode, and RelationSetNewRelfilenode writes the pg_class tuple
+	// with relpages=0, reltuples=-1 (the "never vacuumed or analyzed"
+	// sentinel), relallvisible=0. The per-column pg_statistic rows SURVIVE
+	// (they key on the relation OID, which the truncate keeps), so the
+	// planner's next probe of the empty relation uses the analyzed widths —
+	// the M-NIGHTLY post-TRUNCATE cost parity: PG probes `(id int, pad
+	// text)`@(101) at 61 rows/page (rows=610), where dropping the whole Stats
+	// struct probed at the type defaults (127 rows/page, rows=1270). The
+	// sentinel rides the sidecar as rowcount=-1 so a restart reloads the
+	// unanalyzed state (initdb/open.go decode arm), mirroring pg_class's own
+	// persistence.
 	for _, entry := range sortedTruncateTableSet(tableSet, nameOrder) {
-		if hasIM {
-			im.UpdateRelStats(entry.tbl, 0, 0)
+		if entry.tbl.Stats != nil {
+			// Pointer-replace (as UpdateRelStats does): a concurrent planner
+			// never sees a torn struct. Columns (pg_statistic) are kept.
+			merged := *entry.tbl.Stats
+			merged.RowCount, merged.Pages, merged.Analyzed = 0, 0, false
+			merged.AllVisible, merged.AllVisibleSet = 0, false
+			entry.tbl.Stats = &merged
 		}
-		entry.tbl.Stats = nil
 		// Non-fatal, as in the VACUUM path: a TRUNCATE that has already done
 		// its work must not fail on a statistics write.
-		_ = persistRelSize(o.ctx, entry.tbl, 0, 0)
+		_ = persistRelSize(o.ctx, entry.tbl, -1, 0)
 	}
 
 	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.
@@ -17176,6 +17817,17 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 			}
 		}
 	}
+	// PG's ExecuteTruncateGuts skips partitioned parents: "Skip partitioned
+	// tables as there is nothing to do" (tablecmds.c:2148-2150). A partitioned
+	// parent (relkind='p') carries no storage of its own in PG (relfilenode
+	// 0, no file), so all leaf truncation happens in the recursion above and
+	// the parent-level heap/FSM/VM/index work below must not run. goopg
+	// parents carry a synthesized relfilenode, so this guard is what keeps
+	// TRUNCATE from materialising a 0-byte file through the smgr
+	// (M-NIGHTLY 0-byte relfilenode-file class).
+	if len(tbl.PartitionKey) > 0 {
+		return nil
+	}
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
@@ -17195,7 +17847,11 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		sess.RecordTruncate(entry)
 	}
 
-	o.ctx.Pool.InvalidateRel(rel)
+	// AI-20261103-004134-005: TRUNCATE holds the relation exclusively, so a
+	// pinned buffer is a transient bgwriter/checkpointer/autovacuum pin —
+	// wait it out and discard the page (DropRelationBuffers), or its later
+	// eviction flush writes past the re-extended relation's end.
+	o.ctx.Pool.InvalidateRelForTruncate(rel)
 	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -17212,7 +17868,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	}
 	for _, idx := range idxs {
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-		o.ctx.Pool.InvalidateRel(idxRel)
+		o.ctx.Pool.InvalidateRelForTruncate(idxRel)
 		if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
@@ -21316,17 +21972,6 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				return &ExecError{Code: "3F000", Pos: s.Pos(),
 					Message: fmt.Sprintf("schema %q does not exist", schemaName)}
 			}
-			// Schema is registered; unregister it.
-			// B1.1: journal the drop as a pg_namespace heap DELETE
-			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
-			// is needed to locate the row. Replaces the bespoke
-			// RecordKindDropSchema record (M0110-0003, retired).
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
-				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
-					return fmt.Errorf("drop-schema catalog heap: %w", err)
-				}
-			}
-			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -21357,8 +22002,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						}
 					}
 					sort.Strings(droppedViews)
+					// One dropped set for the whole schema: a member view an
+					// earlier member's cascade already removed is skipped, not
+					// reported as missing.
+					dropped := map[string]bool{}
 					for _, vn := range droppedViews {
-						dropped := map[string]bool{}
 						_ = o.execDropOneView(parser.ObjectName{Schema: schemaName, Name: vn}, true, parser.DropCascade, s.Pos(), dropped)
 					}
 					// Collect operator classes in the schema. M0097-0022.
@@ -21389,8 +22037,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
 					}
 				}
-				// Drop each table in the schema.
+				// Drop each table in the schema. A listed name that no longer
+				// resolves is skipped: TablesInSchema can report a stale name
+				// for a table renamed after ALTER … SET SCHEMA (deferral
+				// ledger 2026-11-03), and the namespace is unregistered only
+				// after this loop, so failing here would strand the schema.
 				for _, tbl := range tables {
+					if _, ok := o.ctx.Catalog.LookupTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); !ok {
+						continue
+					}
 					if err := o.ctx.Catalog.DropTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
@@ -21409,6 +22064,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					)
 				}
 			}
+			// The namespace goes last, after its members (dependency.c
+			// deletes the dependents before the referenced object): the
+			// member views are dropped by schema-qualified name, and
+			// execDropOneView's IF EXISTS guard reports and skips a name
+			// whose schema is already gone — which left every view placed in
+			// the schema behind once CREATE VIEW honoured search_path.
+			// B1.1: journal the drop as a pg_namespace heap DELETE
+			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
+			// is needed to locate the row. Replaces the bespoke
+			// RecordKindDropSchema record (M0110-0003, retired).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
+				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
+					return fmt.Errorf("drop-schema catalog heap: %w", err)
+				}
+			}
+			o.ctx.Catalog.UnregisterSchema(schemaName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		return nil
 	}
@@ -25375,6 +26046,19 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}
 	}
+	agg.Parallel = s.Parallel
+	agg.SerialFunc = s.SerialFunc
+	// COMBINEFUNC strictness: a user routine reports its own; a builtin
+	// combine function (int8pl, float8pl, int4larger, …) is strict, as every
+	// pg_proc.dat entry usable as aggcombinefn is.
+	if s.CombineFunc != "" {
+		agg.CombineFuncStrict = true
+		if rs := routineRegistry(o.ctx); rs != nil {
+			if candidates := rs.LookupByName(parser.ObjectName{Name: s.CombineFunc}); len(candidates) > 0 {
+				agg.CombineFuncStrict = candidates[0].Strict
+			}
+		}
+	}
 	// Check if the sfunc is STRICT by looking it up in the routine registry.
 	// A strict sfunc skips NULL inputs (the aggregate state is unchanged on NULL rows). M0097-0035.
 	if rs := routineRegistry(o.ctx); rs != nil && s.SFunc != "" {
@@ -26475,8 +27159,15 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 			fields[idx].Collation = cmd.Collation
 		}
 	}
-	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
-	// single-subcommand branches for the per-relation rationale).
+	o.replaceCompositeFields(cat, ct, fields)
+	return nil
+}
+
+// replaceCompositeFields installs a composite type's new attribute list: one
+// xmax-stamp of its pg_type / pg_class / pg_attribute rows and one re-sync
+// (see execAlterType's single-subcommand branches for the per-relation
+// rationale). Shared with DROP TYPE … CASCADE's attribute drop (M0148-0001j2).
+func (o *ddlOp) replaceCompositeFields(cat *catalog.InMemory, ct *catalog.CompositeType, fields []catalog.CompositeField) {
 	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
 		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.OID, o.ctx.Tx.XID)
 		deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), ct.ArrayOID, o.ctx.Tx.XID)
@@ -26485,9 +27176,8 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 	}
-	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
+	ct2 := cat.RegisterCompositeTypeWithFields(ct.Name, fields, o.ctx.CurrentDatabaseOid)
 	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
-	return nil
 }
 
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
@@ -26500,6 +27190,22 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 			continue
 		}
 		n := name.Name
+		// M0148-0001j1: the functions and aggregates that depend on the
+		// type (dependency.c findDependentObjects): 2BP01 under RESTRICT,
+		// reported and dropped first under CASCADE.
+		var depOID, depArrayOID uint32
+		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok {
+			depOID, depArrayOID = et.OID, et.ArrayOID
+		} else if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil {
+			depOID, depArrayOID = ct.OID, ct.ArrayOID
+		} else if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok {
+			depOID, depArrayOID = rt.OID, rt.ArrayOID
+		}
+		if depOID != 0 {
+			if err := o.dropTypeDependents(strings.ToLower(n), depOID, depArrayOID, s.Cascade, s.Pos()); err != nil {
+				return err
+			}
+		}
 		// Try to drop as enum first, then as composite type. M0097-0064.
 		// Stamp pg_type row before in-memory delete (need OID while et still exists).
 		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE
@@ -27225,47 +27931,18 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
 		}
-		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
-		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
-		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
-			if o.ctx.MaterializeWriterXID() == nil {
-				deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.OID, o.ctx.Tx.XID)
-				// Also stamp the auto-generated array type row. DU-002 slice 251.
-				if d.ArrayOID != 0 {
-					deleteTypeFromCatalogHeap(o.ctx, tableCatalogHeapDBOid(o.ctx), d.ArrayOID, o.ctx.Tx.XID)
-				}
-				// B2.1b: the domain's pg_constraint rows die with it.
-				for _, chk := range d.Checks {
-					deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
-				}
-				mirrorTypeCatalogFiles(o.ctx)
-				mirrorConstraintCatalogFiles(o.ctx)
+		// M0148-0001j2: a domain's dependents are found the way DROP TYPE
+		// finds them (findDependentObjects): columns of the domain (the
+		// COLUMN is dropped under CASCADE, not its table), composite
+		// attributes, domains over it, functions. RESTRICT is 2BP01.
+		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok {
+			if err := o.dropTypeDependents(strings.ToLower(name.Name), d.OID, d.ArrayOID, s.Cascade, s.Pos()); err != nil {
+				return err
 			}
-		}
-		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
-		// B2.1b: no bespoke WAL record — the heap deletes above ARE the
-		// journal (kind 120 retired).
-		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
-		if err == nil {
-			for _, tblName := range names {
-				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
-			}
+			o.dropDomainObject(cat, d)
 			continue
 		}
-		if err.Error() == "dependent objects" {
-			// names contains the tables blocking the drop.
-			depName := ""
-			if len(names) > 0 {
-				depName = names[0]
-			}
-			return &ExecError{
-				Code:    "2BP01",
-				Pos:     s.Pos(),
-				Message: fmt.Sprintf("cannot drop type %s because other objects depend on it", name.Name),
-				Detail:  fmt.Sprintf("table %s depends on type %s", depName, name.Name),
-				Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
-			}
-		}
+		err := fmt.Errorf("type %q does not exist", name.Name)
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", name.Name))
 			continue
@@ -27288,12 +27965,23 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // Indexes referencing only the dropped column become empty orphans (harmless
 // for now; a future pass can DROP them explicitly).
 func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction, only bool) error {
+	return o.dropColumn(tbl, act, only, false)
+}
+
+// dropColumn is ALTER TABLE … DROP COLUMN's body. fromDependency marks a
+// column removed by a dependency cascade (DROP TYPE / DROP DOMAIN …
+// CASCADE): PG deletes it through doDeletion → RemoveAttributeById, which
+// runs none of ATPrepDropColumn / ATExecDropColumn's user-command checks —
+// a typed table's column and an inherited column (each partition's and
+// child's own pg_depend row is reached separately) are dropped too.
+// M0148-0001j2.
+func (o *ddlOp) dropColumn(tbl *catalog.Table, act parser.AlterTableAction, only, fromDependency bool) error {
 	// M0134-0183: a typed table may not lose a column outside its defining
 	// composite type. First check in ATPrepDropColumn
 	// (postgres/src/backend/commands/tablecmds.c:9260-9263), which runs in
 	// PG's prep pass before ATExecDropColumn's checks below — precedes even
 	// the IF EXISTS / column-existence check. 42809, no errposition.
-	if tbl.OfTypeOID != 0 {
+	if tbl.OfTypeOID != 0 && !fromDependency {
 		return &ExecError{Code: "42809", Pos: 0, Message: "cannot drop column from typed table"}
 	}
 	// Find the column to drop.
@@ -27323,7 +28011,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	// live-hierarchy check keeps the guard off stale Inherited flags (a
 	// parent-side DROP COLUMN leaves the child flag set). PG emits no errposition
 	// here, so Pos is 0. 42P16.
-	if tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
+	if !fromDependency && tbl.Columns[dropIdx].Inherited && o.colStillInherited(tbl, act.ColumnName) {
 		return &ExecError{Code: "42P16", Pos: 0, Message: fmt.Sprintf("cannot drop inherited column %q", act.ColumnName)}
 	}
 
@@ -28033,6 +28721,38 @@ func dropCascadeObjectName(name parser.ObjectName, ctx *Context) string {
 		}
 	}
 	return name.String()
+}
+
+// resolveRelationBySearchPath is RangeVarGetRelid's namespace search for an
+// unqualified relation name: a temporary relation (goopg keys those bare)
+// first, then each search_path schema in order. It returns the name
+// qualified with the schema it resolved in (public stays bare, matching the
+// catalog's keying), or name unchanged when nothing resolves. Views created
+// unqualified under a non-public search_path live in that schema, so DROP
+// VIEW must find them there rather than only in public.
+func (o *ddlOp) resolveRelationBySearchPath(name parser.ObjectName) parser.ObjectName {
+	if name.Schema != "" {
+		return name
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if t, ok := o.ctx.Catalog.LookupTable(name, dbOid); ok && t.Temp {
+		return name
+	}
+	for _, sc := range lockTableSearchSchemas(o.ctx) {
+		if strings.EqualFold(sc, "pg_catalog") || strings.EqualFold(sc, "information_schema") {
+			continue
+		}
+		if strings.EqualFold(sc, "public") {
+			if _, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: name.Name}, dbOid); ok {
+				return name
+			}
+			continue
+		}
+		if _, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid); ok {
+			return parser.ObjectName{Schema: sc, Name: name.Name}
+		}
+	}
+	return name
 }
 
 // lookupTableWithSearch finds a table by name, falling back to search_path schemas

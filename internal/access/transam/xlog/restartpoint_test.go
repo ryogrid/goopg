@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -270,5 +271,203 @@ func TestShutdownRestartPointStampsShutdownedInRecovery(t *testing.T) {
 	}
 	if cd, _ := control.ReadControlFile(none); cd.State != control.DBStateInArchiveRecovery {
 		t.Fatalf("non-shutdown flush with nothing to adopt changed state to %d", cd.State)
+	}
+}
+
+// TestRestartPointSkipRaisesMinRecoveryPointToReplay pins CreateRestartPoint's
+// skip arm: with no replayed checkpoint newer than pg_control's it flushes
+// nothing, yet still runs UpdateMinRecoveryPoint(InvalidXLogRecPtr, true), so
+// minRecoveryPoint rises to the replay position (GetCurrentReplayRecPtr). A
+// replay position behind minRecoveryPoint leaves it, and an unset
+// minRecoveryPoint stays unset (updateMinRecoveryPoint = false).
+func TestRestartPointSkipRaisesMinRecoveryPointToReplay(t *testing.T) {
+	cases := []struct {
+		name            string
+		minRecovery     uint64
+		replayEnd       uint64
+		wantMinRecovery uint64
+	}{
+		{"raised to the replay position", 9000, 12345, 12345},
+		{"replay behind minRecoveryPoint", 9000, 5000, 9000},
+		{"unset minRecoveryPoint stays unset", 0, 12345, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestControl(t, dir, control.DBStateInArchiveRecovery, 8192)
+			if err := control.UpdateControlFile(dir, func(cd *control.ControlFileData) {
+				cd.MinRecoveryPoint = tc.minRecovery
+				if tc.minRecovery != 0 {
+					cd.MinRecoveryPointTLI = 1
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: 1 << 16, PageHeaders: true, TimelineID: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			flusher := &fakeFlusher{}
+			cp := NewCheckpointer(flusher, w, CheckpointerConfig{DataDir: dir})
+			cp.SetRecoveryMode(true)
+			// pg_control already holds this checkpoint's redo: the skip arm.
+			cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+				return ReplayedCheckpoint{StartLSN: 8001, EndLSN: 8100, Fields: CheckPointFields{RedoLSN0: 8192, ThisTLI: 1}}, true
+			})
+			cp.SetReplayPositionSource(func() uint64 { return tc.replayEnd })
+			if err := cp.CheckpointNow(); err != nil {
+				t.Fatalf("recovery checkpoint: %v", err)
+			}
+			flusher.mu.Lock()
+			calls := flusher.calls
+			flusher.mu.Unlock()
+			if calls != 0 {
+				t.Errorf("the skip arm flushed %d time(s); PG returns before CheckPointGuts", calls)
+			}
+			cd, err := control.ReadControlFile(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cd.MinRecoveryPoint != tc.wantMinRecovery {
+				t.Errorf("minRecoveryPoint = %d, want %d", cd.MinRecoveryPoint, tc.wantMinRecovery)
+			}
+			if tc.wantMinRecovery != 0 && cd.MinRecoveryPointTLI != 1 {
+				t.Errorf("minRecoveryPointTLI = %d, want 1", cd.MinRecoveryPointTLI)
+			}
+			if cd.CheckPointCopyRedo != 8192 {
+				t.Errorf("the skip arm moved checkPointCopy.redo to %d", cd.CheckPointCopyRedo)
+			}
+		})
+	}
+}
+
+// TestReplacePercentPlaceholders pins PG's replace_percent_placeholders:
+// %% is a literal %, a known letter is substituted, and an unknown letter or
+// a trailing % is an invalid parameter value.
+func TestReplacePercentPlaceholders(t *testing.T) {
+	vals := map[byte]string{'r': "000000010000000000000003"}
+	for _, tc := range []struct{ in, want string }{
+		{"rm -f %r", "rm -f 000000010000000000000003"},
+		{"echo %%r %r", "echo %r 000000010000000000000003"},
+		{"no placeholders", "no placeholders"},
+	} {
+		got, err := ReplacePercentPlaceholders(tc.in, "archive_cleanup_command", vals)
+		if err != nil || got != tc.want {
+			t.Errorf("%q -> %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"echo %f", "echo %"} {
+		if _, err := ReplacePercentPlaceholders(bad, "archive_cleanup_command", vals); err == nil || !strings.Contains(err.Error(), `invalid value for parameter "archive_cleanup_command"`) {
+			t.Errorf("%q: err = %v, want PG's invalid-value error", bad, err)
+		}
+	}
+}
+
+// TestRestartPointRunsArchiveCleanupCommand pins CreateRestartPoint's last
+// step: a restartpoint that adopted a replayed checkpoint runs
+// archive_cleanup_command with %r = the WAL file holding that checkpoint's
+// redo (GetOldestRestartPoint after the pg_control update); the skip arm
+// returns before it and runs nothing.
+func TestRestartPointRunsArchiveCleanupCommand(t *testing.T) {
+	const segSize = 1 << 16
+	run := func(t *testing.T, controlRedo uint64) string {
+		dir := t.TempDir()
+		writeTestControl(t, dir, control.DBStateInArchiveRecovery, controlRedo)
+		w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: segSize, PageHeaders: true, TimelineID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		out := filepath.Join(dir, "cleanup.out")
+		cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{DataDir: dir, SegmentSize: segSize})
+		cp.SetRecoveryMode(true)
+		// Redo in the fourth 64 KiB segment: %r is segment 3 on timeline 1.
+		cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+			return ReplayedCheckpoint{StartLSN: 3*segSize + 0x101, EndLSN: 3*segSize + 0x200, Fields: CheckPointFields{RedoLSN0: 3*segSize + 0x10, ThisTLI: 1}}, true
+		})
+		cp.SetArchiveCleanupCommandSource(func() string { return "printf %%s %r > " + out })
+		if err := cp.CheckpointNow(); err != nil {
+			t.Fatalf("recovery checkpoint: %v", err)
+		}
+		b, err := os.ReadFile(out)
+		if os.IsNotExist(err) {
+			return ""
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if got := run(t, 16); got != "000000010000000000000003" {
+		t.Errorf("adopted restartpoint: archive_cleanup_command saw %%r = %q, want 000000010000000000000003", got)
+	}
+	if got := run(t, 3*segSize+0x10); got != "" {
+		t.Errorf("skip arm ran archive_cleanup_command (%%r = %q); PG returns before it", got)
+	}
+}
+
+// TestExecuteRecoveryCommandSignalClassification pins
+// wait_result_is_any_signal(rc, true) (src/common/wait_error.c), which
+// ExecuteRecoveryCommand's caller uses to pick the level for a
+// failOnSignal command (recovery_end_command): a plain non-zero exit is not
+// a signal (WARNING), a shell status above 125 (command not found: 127) and
+// a child killed by a signal are (FATAL).
+func TestExecuteRecoveryCommandSignalClassification(t *testing.T) {
+	for _, tc := range []struct {
+		cmd        string
+		wantErr    bool
+		wantSignal bool
+	}{
+		{"true", false, false},
+		{"exit 3", true, false},
+		{"exit 127", true, true},
+		{"kill -9 $$", true, true},
+	} {
+		sig, err := ExecuteRecoveryCommand(tc.cmd, "recovery_end_command", 0, 1, DefaultSegmentSize)
+		if (err != nil) != tc.wantErr || sig != tc.wantSignal {
+			t.Errorf("%q: signal=%v err=%v, want signal=%v err?=%v", tc.cmd, sig, err, tc.wantSignal, tc.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), `recovery_end_command "`+tc.cmd+`"`) {
+			t.Errorf("%q: error %q lacks PG's `%%s \"%%s\"` prefix", tc.cmd, err)
+		}
+	}
+}
+
+// TestRestartPointTruncatesSubtrans pins CreateRestartPoint's pg_subtrans
+// truncation (TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning()),
+// xlog.c): a restartpoint that adopted a replayed checkpoint truncates once,
+// after WAL retention; the skip arm returns before it. Without it a
+// long-running standby's subxact map and pg_subtrans segments grew without
+// bound — only the primary's checkpoint truncated them.
+func TestRestartPointTruncatesSubtrans(t *testing.T) {
+	const segSize = 1 << 16
+	run := func(t *testing.T, controlRedo uint64) int {
+		dir := t.TempDir()
+		writeTestControl(t, dir, control.DBStateInArchiveRecovery, controlRedo)
+		w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"), SegmentSize: segSize, PageHeaders: true, TimelineID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		calls := 0
+		cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+			DataDir: dir, SegmentSize: segSize,
+			TruncateSubtransFn: func() error { calls++; return nil },
+		})
+		cp.SetRecoveryMode(true)
+		cp.SetRestartPointSource(func() (ReplayedCheckpoint, bool) {
+			return ReplayedCheckpoint{StartLSN: 3*segSize + 0x101, EndLSN: 3*segSize + 0x200, Fields: CheckPointFields{RedoLSN0: 3*segSize + 0x10, ThisTLI: 1}}, true
+		})
+		if err := cp.CheckpointNow(); err != nil {
+			t.Fatalf("recovery checkpoint: %v", err)
+		}
+		return calls
+	}
+	if got := run(t, 16); got != 1 {
+		t.Errorf("adopted restartpoint truncated pg_subtrans %d times, want 1", got)
+	}
+	if got := run(t, 3*segSize+0x10); got != 0 {
+		t.Errorf("skip arm truncated pg_subtrans %d times; CreateRestartPoint returns before it", got)
 	}
 }

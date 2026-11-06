@@ -1032,7 +1032,14 @@ func (cs *parallelClaimSet) attachAll(op Operator) bool {
 // This mirrors the pattern of prebuildSharedHashJoins: the leader builds the bitmap
 // eagerly, publishes the sorted block list in a shared atomic allocator, and
 // workers claim disjoint pages from it.
-func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func(scope *instrumenter) (Operator, error)) error {
+//
+// scope (non-nil only under EXPLAIN ANALYZE) instruments each target's
+// bitmap-producing subtree, which runs exactly once, here: the participants
+// claim pages from the published bitmap and never build their own. PG's
+// parallel bitmap heap scan likewise runs the index scan once, in the first
+// participant to arrive (nodeBitmapHeapscan.c BitmapShouldInitializeSharedState),
+// and reports it with loops=1 (M0122-0021).
+func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Node, buildChild func(scope *instrumenter) (Operator, error), scope *instrumenter) error {
 	// Decide from the PLAN, before building anything.
 	if !optimizer.HasBitmapScan(planChild) {
 		return nil
@@ -1047,6 +1054,9 @@ func (cs *parallelClaimSet) prebuildBitmap(ctx *Context, planChild optimizer.Nod
 	}
 	for _, tgt := range cs.bitmapPrebuildTargets(tree) {
 		bm := tgt.bm
+		if scope != nil {
+			bm.setInstrumentScope(scope)
+		}
 		if err := bm.Open(ctx); err != nil {
 			return err
 		}

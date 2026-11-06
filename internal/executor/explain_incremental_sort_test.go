@@ -21,7 +21,7 @@ import (
 func TestExplainOrderByIncrementallySortsPresortedInput(t *testing.T) {
 	lines := cteExplainLines(t, `SELECT * FROM (SELECT a, b FROM t ORDER BY a OFFSET 0) s ORDER BY a, b`)
 	joined := strings.Join(lines, "\n")
-	if !strings.HasPrefix(lines[0], "Incremental Sort") || !strings.Contains(joined, "Presorted Key: a") {
+	if !strings.HasPrefix(lines[0], "Incremental Sort") || !strings.Contains(joined, "Presorted Key: t.a") {
 		t.Fatalf("want PG's Incremental Sort over the presorted input:\n%s", joined)
 	}
 	rows := formatRows(runQueryRows(t, explainIncrementalSortCtx(t), `SELECT * FROM (SELECT a, b FROM t ORDER BY a OFFSET 0) s ORDER BY a, b`))

@@ -122,7 +122,7 @@ func ParsePIDFile(dir string) (PIDFile, error) {
 	if err != nil {
 		return PIDFile{}, err
 	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	if len(lines) < 5 {
 		return PIDFile{}, fmt.Errorf("%s: expected at least 5 lines, got %d", path, len(lines))
 	}
@@ -160,6 +160,130 @@ func WritePIDFile(dir string, p PIDFile) error {
 		return fmt.Errorf("control: rename pidfile: %w", err)
 	}
 	return nil
+}
+
+// LockFileError is a CreateDataDirLockFile refusal that carries an
+// errhint: the data directory's postmaster.pid names a live process or
+// is empty (ERRCODE_LOCK_FILE_EXISTS), or a stale one cannot be
+// removed. Message and Hint are PG's errmsg/errhint text (CreateLockFile).
+type LockFileError struct {
+	Message string
+	Hint    string
+}
+
+func (e *LockFileError) Error() string { return e.Message }
+
+// CreateDataDirLockFile is PG's CreateDataDirLockFile (miscinit.c
+// CreateLockFile with isDDLock): it creates <dir>/postmaster.pid with
+// O_EXCL before the server touches the data directory, so a second
+// server started on a directory that a live one owns stops at once
+// instead of running crash recovery against it, checkpointing into its
+// WAL and overwriting (and on exit deleting) its pidfile. A lock file
+// whose pid is dead — or is our own, our parent's, or PG_GRANDPARENT_PID
+// (a pid recycled after a reboot) — is stale: it is removed and the
+// create retried, as upstream does. The file first holds only the pid,
+// data directory and start time; WritePIDFile later replaces it with the
+// listen address and socket path once the listener is bound.
+//
+// Upstream's orphaned-shared-memory probe (PGSharedMemoryIsInUse) has no
+// counterpart: goopg backends are goroutines of the server process, so a
+// dead server pid leaves no backend behind.
+func CreateDataDirLockFile(dir string, p PIDFile) error {
+	path := filepath.Join(dir, PIDFileName)
+	myPID := os.Getpid()
+	myParent := os.Getppid()
+	myGrandparent, _ := strconv.Atoi(os.Getenv("PG_GRANDPARENT_PID"))
+	for ntries := 0; ; ntries++ {
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			if _, werr := f.Write(p.Marshal()); werr != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return fmt.Errorf("could not write lock file %q: %w", PIDFileName, werr)
+			}
+			if serr := f.Sync(); serr != nil {
+				_ = f.Close()
+				_ = os.Remove(path)
+				return fmt.Errorf("could not write lock file %q: %w", PIDFileName, serr)
+			}
+			return f.Close()
+		}
+		if (!errors.Is(err, os.ErrExist) && !errors.Is(err, os.ErrPermission)) || ntries > 100 {
+			return fmt.Errorf("could not create lock file %q: %w", PIDFileName, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // removed since the create failed; try again
+			}
+			return fmt.Errorf("could not open lock file %q: %w", PIDFileName, err)
+		}
+		if len(data) == 0 {
+			return &LockFileError{
+				Message: fmt.Sprintf("lock file %q is empty", PIDFileName),
+				Hint:    "Either another server is starting, or the lock file is the remnant of a previous server startup crash.",
+			}
+		}
+		encoded := leadingInt(string(data))
+		otherPID := encoded
+		if otherPID < 0 {
+			otherPID = -otherPID
+		}
+		if otherPID <= 0 {
+			return fmt.Errorf("bogus data in lock file %q: %q", PIDFileName, string(data))
+		}
+		if otherPID != myPID && otherPID != myParent && otherPID != myGrandparent {
+			kerr := syscall.Kill(otherPID, 0)
+			if kerr == nil || (!errors.Is(kerr, syscall.ESRCH) && !errors.Is(kerr, syscall.EPERM)) {
+				who := "postmaster"
+				if encoded < 0 {
+					who = "postgres"
+				}
+				return &LockFileError{
+					Message: fmt.Sprintf("lock file %q already exists", PIDFileName),
+					Hint:    fmt.Sprintf("Is another %s (PID %d) running in data directory %q?", who, otherPID, dir),
+				}
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return &LockFileError{
+				Message: fmt.Sprintf("could not remove old lock file %q: %v", PIDFileName, err),
+				Hint:    "The file seems accidentally left over, but it could not be removed. Please remove the file by hand and try again.",
+			}
+		}
+	}
+}
+
+// leadingInt is atoi(3): the optionally signed decimal prefix of s after
+// leading whitespace, 0 when there is none.
+func leadingInt(s string) int {
+	s = strings.TrimLeft(s, " \t\n\v\f\r")
+	end := 0
+	if end < len(s) && (s[end] == '-' || s[end] == '+') {
+		end++
+	}
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	n, _ := strconv.Atoi(s[:end])
+	return n
+}
+
+// RemoveDataDirLockFile removes <dir>/postmaster.pid when it still names
+// this process — the lock file's on_proc_exit unlink (UnlinkLockFiles).
+// A file another process has since written is left alone.
+func RemoveDataDirLockFile(dir string) error {
+	data, err := os.ReadFile(filepath.Join(dir, PIDFileName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if leadingInt(string(data)) != os.Getpid() {
+		return nil
+	}
+	return RemovePIDFile(dir)
 }
 
 // RemovePIDFile clears the pidfile. Missing file is not an error —

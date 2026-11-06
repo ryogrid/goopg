@@ -1647,11 +1647,31 @@ func BuildDefaultRegistry() *Registry {
 	// Archive recovery: restore_command is the shell command used to fetch
 	// WAL segments from archival storage during archive recovery (triggered
 	// by recovery.signal). %f expands to the segment filename, %p to the
-	// destination path in pg_wal. Empty default disables archive fetch;
-	// ContextPostmaster because changing it requires a restart.
+	// destination path in pg_wal. PGC_SIGHUP as in PG 18 (guc_tables.c,
+	// WAL_ARCHIVE_RECOVERY): a reload reaches recovery (M0122-0013). An empty
+	// value with recovery.signal and no standby.signal is FATAL at start
+	// (validateRecoveryParameters, cmd/goopg).
 	r.MustRegister(NewVariable(Variable{
 		Name: "restore_command", Type: TypeString, BootVal: "",
-		Context: ContextPostmaster,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// archive_cleanup_command: the shell command a standby runs at every
+	// restartpoint, %r naming the oldest WAL file still needed (guc_tables.c,
+	// PGC_SIGHUP, WAL_ARCHIVE_RECOVERY; xlog.c CreateRestartPoint). Read by
+	// the checkpointer at each restartpoint (M0122-0013).
+	r.MustRegister(NewVariable(Variable{
+		Name: "archive_cleanup_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	// recovery_end_command: the shell command run once at the end of archive
+	// recovery — standby promotion or the end of recovery.signal recovery
+	// (guc_tables.c PGC_SIGHUP; xlog.c CleanupAfterArchiveRecovery). Read at
+	// promotion (M0122-0013).
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_end_command", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
@@ -1664,6 +1684,36 @@ func BuildDefaultRegistry() *Registry {
 		Name: "recovery_target_timeline", Type: TypeString, BootVal: "latest",
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetTimeline,
+	}))
+	// The recovery-target family (guc_tables.c WAL_RECOVERY_TARGET) that
+	// archive recovery honours: an LSN or xid target, whether the stop
+	// includes the target record, and what happens once it is reached. The
+	// name, time and 'immediate' targets are not registered — setting one
+	// is an unknown-parameter startup error rather than a target silently
+	// ignored.
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_lsn", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetLSN,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_xid", Type: TypeString, BootVal: "",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+		CheckFn: checkRecoveryTargetXid,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_inclusive", Type: TypeBool, BootVal: "on",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_action", Type: TypeEnum, BootVal: "pause",
+		EnumOptions: []string{"pause", "promote", "shutdown"},
+		Context:     ContextPostmaster,
+		Scope:       ScopeServer,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "hot_standby", Type: TypeBool, BootVal: "on",

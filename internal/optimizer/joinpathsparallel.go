@@ -434,7 +434,10 @@ func tryPartialMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, oute
 	// explicitly sorted outer is what fuzz-dominates the Parallel Hash
 	// Semi Join in add_partial_path.
 	if len(outerSortKeys) > 0 && !pathkeysContainedInRel(o.Rel, o.Pathkeys, outerSortKeys) {
-		so := sortPathFor(o, outerSortKeys, cp)
+		so := mergeOuterIncrementalSort(s, o, outerSortKeys, cp)
+		if so == nil {
+			so = sortPathFor(o, outerSortKeys, cp)
+		}
 		so.ParallelSafe = o.ParallelSafe
 		so.ParallelWorkers = o.ParallelWorkers
 		o = so

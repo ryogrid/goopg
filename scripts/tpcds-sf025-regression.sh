@@ -101,6 +101,12 @@
 #                           the old default was the SHARED tmp/goopg-bench-bin,
 #                           and rebuilding it under the live :65433 server left
 #                           that server's /proc/<pid>/exe "(deleted)".
+#   SF025_LOG=<path>        server + plan-channel log. Default (unset) is a
+#                           per-run file bench/tpcds/runtime_goopg/goopg.sf025-
+#                           <ts>.log, pruned to the 10 newest — the shared
+#                           default grew unbounded (159 GB in six weeks; owner
+#                           item closed 2026-10-30, see the rotation note by
+#                           the env source below).
 #
 # Exit codes / gate stamp (H2/H5): `sweep` exits 0 PASS, 1 FAIL (correctness
 # failure or operational error), 3 SKIP-BLOCKED (the sweep compared ZERO
@@ -120,6 +126,10 @@ cd "${REPO_ROOT}"
 # caller GOOPG_BIN still wins. (env_tpcds.sh's own default is now the
 # lane-private tmp/goopg-tpcds-bin; the nightly stage uses its own.)
 GOOPG_BIN="${GOOPG_BIN:-${REPO_ROOT}/tmp/goopg-sf025-bin}"
+# SF025 log rotation (owner item filed 2026-10-30 under M0122-0014): capture a
+# caller's SF025_LOG BEFORE sourcing env_tpcds.sh — its `${SF025_LOG:-…}`
+# default is indistinguishable from a caller value after the source.
+SF025_LOG_CALLER="${SF025_LOG:-}"
 # shellcheck source=/dev/null
 source "${REPO_ROOT}/bench/tpcds/env_tpcds.sh"
 # shellcheck source=lib/gate-stamp.sh
@@ -128,6 +138,32 @@ source "${SCRIPT_DIR}/lib/gate-stamp.sh"
 # sf025_planner_flags_line below.
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/planner-flags.sh"
+
+# sf025_prune_logs — retention for the per-run sweep logs: keep the 10 newest
+# goopg.sf025-<ts>.log (worst case ~10 x 138 MB = 1.4 GB), delete the rest.
+sf025_prune_logs() {
+    local keep=10 victim
+    while IFS= read -r victim; do
+        if [[ -n "${victim}" ]]; then
+            rm -f -- "${victim}"
+        fi
+    done < <(ls -1t "${TPCDS_RUNTIME_DIR}"/goopg.sf025-*.log 2>/dev/null | tail -n +$((keep + 1)))
+    return 0
+}
+
+# Log rotation (owner item filed 2026-10-30 under M0122-0014, closed same day):
+# the plan channel appends ~138 MB of planner DP trace per capture, so the
+# SHARED default log grew to 159 GB in six weeks — its `wc -l` alone outlasted
+# the loop's 60-minute command budget (1a7fddb3d). Each gate invocation now
+# logs to its OWN timestamped file, so a sweep's server writes, its restart
+# bounces and its plan-capture DP trace all land in one bounded artefact, and
+# sf025_prune_logs caps the accumulation. A caller-supplied SF025_LOG= keeps
+# the 1a7fddb3d manual-probe convention and is never pruned-restricted.
+if [[ -z "${SF025_LOG_CALLER}" ]]; then
+    SF025_LOG="${TPCDS_RUNTIME_DIR}/goopg.sf025-$(date +%Y%m%d-%H%M%S).log"
+    export SF025_LOG
+fi
+sf025_prune_logs
 
 # Dirs/ports come from env_tpcds.sh: TPCDS_TOOLS, SF025_DATA_DIR,
 # SF025_GOOPG_DATA, SF025_PORT (65437), SF025_PG_DB, SF025_LOG.
@@ -843,13 +879,16 @@ cmd_plans() {
 # explicit SF025_PLANS_BASELINE (unset baseline under the pin is itself a
 # FAIL; =none is the explicit one-run suppression).
 sf025_plan_channel() {
-    local report="$1" baseline plans trace trend old_nli old_dp rc=0 diff_rc=0 flow_rc=0 pinned=0 log_lines=0
+    local report="$1" baseline plans trace trend old_nli old_dp rc=0 diff_rc=0 flow_rc=0 pinned=0 log_bytes=0
     [[ "${SF025_PLAN_PIN:-0}" == "1" ]] && pinned=1
     baseline=$(sf025_plan_baseline)
     plans="${report%/*}/plans-${report##*/sweep-}"
     trace="${plans%.txt}.flow.log"
     trend="${report%/*}/flow-convergence.tsv"
-    log_lines=$(wc -l < "${SF025_LOG}" 2>/dev/null || echo 0)
+    # Byte offset, NOT `wc -l`: on the multi-GB shared log a line count is an
+    # O(log) full read (~50 min at 159 GB). stat is O(1), and tail -c streams
+    # from the recorded EOF so extraction cost scales with what was APPENDED.
+    log_bytes=$(stat -c %s "${SF025_LOG}" 2>/dev/null || echo 0)
     old_nli="${sf025_nli_census}"
     old_dp="${sf025_dp_trace}"
     sf025_nli_census=1
@@ -859,7 +898,7 @@ sf025_plan_channel() {
         sf025_capture_plans "${plans}"
         sf025_goopg_stop
     ) >> "${SF025_LOG}" 2>&1 || rc=$?
-    tail -n +$((log_lines + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
+    tail -c +$((log_bytes + 1)) "${SF025_LOG}" > "${trace}" 2>/dev/null || true
     # (The knob-arm flow lane — a second EXPLAIN pass under
     # GOOPG_JOINTREE_PIPELINE=0 as a legacy control — was deleted with the
     # legacy pipeline, M0145-0008.)

@@ -134,3 +134,64 @@ desc: END_OF_RECOVERY tli 2; prev tli 1; time …; wal_level replica
   into future new-timeline names; goopg removes them.
 - **Promotion checkpoint.** PG requests one after the end-of-recovery
   record; goopg's checkpointer runs on its own schedule.
+
+## Update 2026-10-29 — recovery.signal promotion (M0122-0013, P0-E17)
+
+The archive-recovery promotion now goes through the same switch. `switchWriterToNewTimeline` (cmd/goopg/standby.go) is
+shared by both promotions. Before it switches, `promoteAfterRecovery` brings the writer to EndOfLog with
+`adoptRestoredWAL`, feeding the segments `restore_command` supplied through `Writer.AppendRaw`. Before this change
+the writer resumed at its pre-archive end and overwrote restored, already-replayed WAL (S2). Details are in
+`0130-0009-recovery-signal-archive-recovery.md`.
+
+## Update 2026-10-29 — end-of-recovery checkpoint (M0122-0013)
+
+PG ends recovery with a checkpoint (xlog.c):
+- **Promotion:** `CreateEndOfRecoveryRecord`, then `StartupXLOG` requests an online checkpoint
+  (`RequestCheckpoint(CHECKPOINT_FORCE)`).
+- **Archive recovery ending without a promote trigger:** `PerformRecoveryXLogAction` waits for
+  `CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT`.
+
+goopg's promotions used to wait for the checkpoint schedule. Until then pg\_control kept the last restartpoint on the
+old timeline.
+
+`promotionCheckpoint` (cmd/goopg/standby.go) now runs `CheckpointNow`:
+- **Streaming promotion:** as its last step, after the `DB_IN_PRODUCTION` stamp.
+- **recovery.signal promotion:** right after the timeline switch and before `recovery_end_command`, in PG's order.
+
+Details:
+- It is synchronous in both cases. PG's promoted request does not wait, but goopg's checkpointer has no request queue
+  and does not serialise concurrent runs.
+- A failure is a WARNING, as with the crash-recovery `endOfRecoveryCheckpoint`.
+- It is skipped if the writer is still on the old timeline, because the checkpointer stamps the writer's TLI.
+
+Pins: `TestStandbyControllerPromoteTakesCheckpoint`, and `TestPromoteAfterRecoveryAdoptsRestoredWAL` (checkpoint copy on
+the new TLI, redo past EndOfLog). Both fail without the checkpoint.
+
+Still different (ledgered):
+- The recovery.signal path marks the timeline change with `XLOG_END_OF_RECOVERY`, where PG writes an end-of-recovery
+  shutdown checkpoint. Both are valid timeline-changing records.
+- The promoted checkpoint is waited for.
+
+## Update 2026-10-29 — end-of-recovery checkpoint on the recovery.signal path (M0122-0013, `a75b43cf0`)
+
+`PerformRecoveryXLogAction` (xlog.c) ends recovery in one of two ways:
+- **Promotion triggered:** the lightweight `XLOG_END_OF_RECOVERY` record.
+- **Archive recovery without a promote trigger:** `CHECKPOINT_END_OF_RECOVERY | IMMEDIATE | WAIT`. `CreateCheckPoint`
+  treats it as "really a shutdown checkpoint, just issued at a different time": an `XLOG_CHECKPOINT_SHUTDOWN` on the
+  new timeline whose `PrevTimeLineID` is the timeline recovery forked off from.
+
+goopg's recovery.signal path wrote `XLOG_END_OF_RECOVERY`, followed by an ordinary checkpoint. Now:
+- `checkpointOpts.endOfRecovery` / `prevTLI` select the shutdown record format: no `XLOG_CHECKPOINT_REDO`, no
+  running-xacts, and `PrevTimeLineID = prevTLI`. pg\_control is left in `DB_IN_PRODUCTION`. (PG stamps
+  `DB_SHUTDOWNED` here and `StartupXLOG` moves it to production right after, so the end state is the same.)
+- `Checkpointer.CheckpointEndOfRecovery(prevTLI)` runs it immediately and waits.
+- `endArchiveRecoveryOnNewTimeline` switches the writer and takes that checkpoint as the first record on the new
+  timeline. It falls back to `XLOG_END_OF_RECOVERY` only when there is no checkpointer. A failed checkpoint fails the
+  start, as an ERROR in PG's startup process does.
+- `promotionCheckpoint` is now only the streaming promotion's request.
+
+Pins:
+- `TestCheckpointerEndOfRecoveryCheckpoint`: exactly one record, shutdown type, This/Prev TLI 3/2, in production; an
+  ordinary checkpoint afterwards keeps Prev = This.
+- Both archive-promotion tests assert that the first record on the new timeline is this checkpoint. They fail with
+  `info 0x90` (`XLOG_END_OF_RECOVERY`) if the old path is restored.

@@ -1,10 +1,15 @@
 package xlog
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -70,7 +75,8 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := w.Append(make([]byte, 88)); err != nil {
+	_, recEnd, err := w.Append(make([]byte, 88))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -88,8 +94,18 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
-	if err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize); err != nil {
+	res, err := RunArchiveRecovery(mgr, dataDir, restoreCmd, segSize)
+	endOfLog, lastStart := res.EndOfLog, res.LastStart
+	if err != nil {
 		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	// EndOfLog — the promotion's timeline switch point — is the end of the
+	// last record replayed from the restored segment.
+	if endOfLog != recEnd {
+		t.Errorf("endOfLog = %X, want the archived record's end %X", endOfLog, recEnd)
+	}
+	if lastStart == 0 || lastStart >= endOfLog {
+		t.Errorf("lastStart = %X, want the archived record's start (< %X)", lastStart, endOfLog)
 	}
 	// Segment 0 came from the archive; segment 1 is absent there, which is
 	// how the loop learns the archive is exhausted.
@@ -98,6 +114,55 @@ func TestRunArchiveRecoveryFetchesThenStops(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "pg_wal", formatSegmentName(1))); !os.IsNotExist(err) {
 		t.Errorf("segment 1 should not exist (archive exhausted), stat err = %v", err)
+	}
+}
+
+// TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch pins that
+// restore_command (PGC_SIGHUP) is read before every archive fetch, as
+// RestoreArchivedFile reads recoveryRestoreCommand at each call: a reload
+// that changes it mid-recovery takes effect at the next fetch. The getter
+// hands out a failing command until the history probe has run and the
+// working one afterwards — a recovery that captured the first value would
+// restore nothing.
+func TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, recEnd, err := w.Append(make([]byte, 88))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	working := "cp " + filepath.Join(archive, "%f") + " %p"
+	calls := 0
+	getter := func() string {
+		calls++
+		if calls == 1 { // the 00000002.history probe
+			return "false"
+		}
+		return working
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, getter, segSize, TargetTimeline{}, RecoveryStop{})
+	if err != nil {
+		t.Fatalf("RunArchiveRecoveryWith: %v", err)
+	}
+	if res.EndOfLog != recEnd {
+		t.Errorf("EndOfLog = %X, want %X: the changed restore_command was not used", res.EndOfLog, recEnd)
+	}
+	// One read for the history probe, one per segment fetch (segment 0
+	// restored, segment 1 the end of the archive).
+	if calls < 3 {
+		t.Errorf("restore_command read %d times, want once per fetch (>= 3)", calls)
 	}
 }
 
@@ -128,5 +193,458 @@ func TestRestoreArchivedFileSucceeds(t *testing.T) {
 	// Verify the file exists.
 	if _, err := os.Stat(filepath.Join(dir, segName)); err != nil {
 		t.Errorf("segment file not created: %v", err)
+	}
+}
+
+// TestRunArchiveRecoveryFollowsTimelineHistory pins the timeline-following
+// archive recovery of PG's recovery_target_timeline = 'latest': the newest
+// timeline is found from the archive's history files (findNewestTimeLine),
+// its history gives the expected timelines (readTimeLineHistory), and each
+// segment is read from the newest timeline that has it and began at or
+// before it (XLogFileReadAnyTLI). The archive holds timeline 1 up to a
+// switch in segment 1 and timeline 2 from there. goopg used to fetch only
+// timeline-1 names, so it stopped at the switch and silently dropped every
+// record written on timeline 2.
+func TestRunArchiveRecoveryFollowsTimelineHistory(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switchLSN := w.WrittenLSN()
+	_, prev := w.InsertPosition()
+	if err := w.SwitchTimeline(2, switchLSN, prev); err != nil {
+		t.Fatal(err)
+	}
+	var end uint64
+	for w.WrittenLSN() < 3*uint64(segSize)+uint64(segSize)/2 {
+		if _, e, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		} else {
+			end = e
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecovery(mgr, dataDir, "cp "+filepath.Join(archive, "%f")+" %p", segSize)
+	if err != nil {
+		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	if res.NewestTLI != 2 || res.EndTLI != 2 {
+		t.Errorf("newest TLI %d, end TLI %d, want 2 and 2", res.NewestTLI, res.EndTLI)
+	}
+	if res.EndOfLog != end {
+		t.Errorf("EndOfLog = %X, want timeline 2's last record end %X", res.EndOfLog, end)
+	}
+	if len(res.Timelines) != 2 || res.Timelines[1] != (TimelineSpan{TLI: 2, Begin: switchLSN}) {
+		t.Errorf("expected timelines = %+v, want [{1 0} {2 %X}]", res.Timelines, switchLSN)
+	}
+	// readTimeLineHistory reads the target's history through RECOVERYHISTORY
+	// and does not keep it: restoreTimeLineHistoryFiles keeps only
+	// [checkpoint TLI, target). The entries are reported for the promotion.
+	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(2))); !os.IsNotExist(err) {
+		t.Errorf("the target timeline's history file was kept in pg_wal (err %v)", err)
+	}
+	if len(res.TargetHistory) != 1 || res.TargetHistory[0] != (TimelineHistoryEntry{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}) {
+		t.Errorf("TargetHistory = %+v, want timeline 2's file verbatim", res.TargetHistory)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, RecoveryHistoryName)); !os.IsNotExist(err) {
+		t.Errorf("RECOVERYHISTORY left in pg_wal (err %v)", err)
+	}
+	// Segment 1 holds the switch: timeline 2's copy is the one to read.
+	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 2))); err != nil {
+		t.Errorf("timeline 2's switch segment not restored: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, FormatSegmentNameTLI(1, 1))); !os.IsNotExist(err) {
+		t.Errorf("timeline 1's copy of the switch segment was restored (err %v); timeline 2's should win", err)
+	}
+}
+
+// TestRunArchiveRecoveryTargetTimeline pins recovery_target_timeline's
+// other goals (validateRecoveryParameters): 'current' and a numeric
+// timeline follow that timeline's history instead of the newest one; a
+// numeric timeline with no history file is FATAL "recovery target timeline
+// N does not exist" (timeline 1 never has one). Whatever the target, the
+// newest archived timeline is still found, so the promotion's new timeline
+// cannot collide with it. goopg only ever followed 'latest'.
+func TestRunArchiveRecoveryTargetTimeline(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switchLSN := w.WrittenLSN()
+	_, prev := w.InsertPosition()
+	if err := w.SwitchTimeline(2, switchLSN, prev); err != nil {
+		t.Fatal(err)
+	}
+	var end uint64
+	for w.WrittenLSN() < 3*uint64(segSize)+uint64(segSize)/2 {
+		if _, e, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		} else {
+			end = e
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switchLSN, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(target TargetTimeline) (ArchiveRecoveryResult, error) {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		return RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, target, RecoveryStop{})
+	}
+
+	for _, c := range []struct {
+		name   string
+		target TargetTimeline
+		tli    uint32
+		end    uint64
+	}{
+		{"current", TargetTimeline{Goal: TargetTimelineCurrent}, 1, switchLSN},
+		{"numeric 1", TargetTimeline{Goal: TargetTimelineNumeric, TLI: 1}, 1, switchLSN},
+		{"numeric 2", TargetTimeline{Goal: TargetTimelineNumeric, TLI: 2}, 2, end},
+		{"latest", TargetTimeline{}, 2, end},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := run(c.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.TargetTLI != c.tli || res.EndTLI != c.tli || res.EndOfLog != c.end {
+				t.Errorf("target %d, end TLI %d, EndOfLog %X; want target %d ending at %X on it",
+					res.TargetTLI, res.EndTLI, res.EndOfLog, c.tli, c.end)
+			}
+			if res.NewestTLI != 2 {
+				t.Errorf("newest TLI %d, want 2 (the archive's newest, whatever the target)", res.NewestTLI)
+			}
+		})
+	}
+	for _, tli := range []uint32{5, 0} {
+		_, err := run(TargetTimeline{Goal: TargetTimelineNumeric, TLI: tli})
+		var fatal *RestoreFatalError
+		if want := fmt.Sprintf("recovery target timeline %d does not exist", tli); !errors.As(err, &fatal) || fatal.Msg != want {
+			t.Errorf("target %d: err = %v, want FATAL %q", tli, err, want)
+		}
+	}
+}
+
+// TestRunArchiveRecoveryKeepsIntermediateHistoryFiles pins
+// restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI): with the
+// archive at timeline 3 (1 -> 2 -> 3) and recovery starting on timeline 1,
+// timeline 2's history file is copied into pg_wal and timeline 3's — the
+// target's, read through RECOVERYHISTORY — is not.
+func TestRunArchiveRecoveryKeepsIntermediateHistoryFiles(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 2000)
+	var switches []uint64
+	for tli := uint32(2); tli <= 3; tli++ {
+		for w.WrittenLSN() < uint64(tli-1)*uint64(segSize)+uint64(segSize)/2 {
+			if _, _, err := w.Append(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sw := w.WrittenLSN()
+		_, prev := w.InsertPosition()
+		if err := w.SwitchTimeline(tli, sw, prev); err != nil {
+			t.Fatal(err)
+		}
+		switches = append(switches, sw)
+	}
+	for w.WrittenLSN() < 2*uint64(segSize)+uint64(segSize)*3/4 {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h2 := []TimelineHistoryEntry{{TLI: 1, SwitchLSN: switches[0], Reason: "first"}}
+	h3 := append(append([]TimelineHistoryEntry(nil), h2...), TimelineHistoryEntry{TLI: 2, SwitchLSN: switches[1], Reason: "second"})
+	if err := WriteHistory(archive, 2, h2); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteHistory(archive, 3, h3); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "pg_wal")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	res, err := RunArchiveRecovery(mgr, dataDir, "cp "+filepath.Join(archive, "%f")+" %p", segSize)
+	if err != nil {
+		t.Fatalf("RunArchiveRecovery: %v", err)
+	}
+	if res.TargetTLI != 3 || res.EndTLI != 3 || len(res.TargetHistory) != 2 || res.TargetHistory[1].Reason != "second" {
+		t.Fatalf("target %d, end %d, history %+v; want timeline 3 with its two-line history", res.TargetTLI, res.EndTLI, res.TargetHistory)
+	}
+	if got, err := ReadHistory(walDir, 2); err != nil || len(got) != 1 || got[0] != h2[0] {
+		t.Errorf("timeline 2's history in pg_wal = %+v, %v; want it kept (restoreTimeLineHistoryFiles)", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(3))); !os.IsNotExist(err) {
+		t.Errorf("the target timeline 3's history file was kept in pg_wal (err %v)", err)
+	}
+}
+
+// TestRunArchiveRecoveryCheckpointMustPrecedeTheFork pins InitWalRecovery's
+// two checks of the start point against the target timeline's history:
+//   - the start (checkpoint) timeline must be in that history at all —
+//     tliSwitchPoint's "requested timeline N is not in this server's
+//     history";
+//   - the checkpoint must lie before the point where the target forked off
+//     from it (tliOfPointInHistory(CheckPointLoc) == CheckPointTLI) — the
+//     "is not a child" FATAL with PG's errdetail.
+//
+// goopg only checked the first, and with the second's message, so a
+// checkpoint past the fork point was replayed onto the target's history.
+func TestRunArchiveRecoveryCheckpointMustPrecedeTheFork(t *testing.T) {
+	archive := t.TempDir()
+	const fork = uint64(0x5000)
+	if err := WriteHistory(archive, 2, []TimelineHistoryEntry{{TLI: 1, SwitchLSN: fork, Reason: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(startTLI uint32, checkPoint uint64, target TargetTimeline) error {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestControl(t, dataDir, 0, checkPoint)
+		if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+			cd.CheckPointCopyThisTLI = startTLI
+			cd.CheckPoint = checkPoint
+		}); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		_, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, 1<<20, target, RecoveryStop{})
+		return err
+	}
+
+	err := run(1, 0x6000, TargetTimeline{})
+	var fatal *RestoreFatalError
+	if !errors.As(err, &fatal) || fatal.Msg != "requested timeline 2 is not a child of this server's history" ||
+		fatal.Detail != `Latest checkpoint in file "pg_control" is at 0/6000 on timeline 1, but in the history of the requested timeline, the server forked off from that timeline at 0/5000.` {
+		t.Errorf("checkpoint past the fork: err = %v (%+v)", err, fatal)
+	}
+	if err := run(1, 0x4000, TargetTimeline{}); err != nil {
+		t.Errorf("checkpoint before the fork: %v", err)
+	}
+	err = run(3, 0x4000, TargetTimeline{Goal: TargetTimelineNumeric, TLI: 2})
+	if !errors.As(err, &fatal) || fatal.Msg != "requested timeline 3 is not in this server's history" {
+		t.Errorf("start timeline off the target's history: err = %v", err)
+	}
+}
+
+// TestRunArchiveRecoveryStopsAtTargetLSN pins recoveryStopsBefore /
+// recoveryStopsAfter for recovery_target_lsn: the first record whose
+// ReadRecPtr reaches the target ends recovery — after applying it with
+// recovery_target_inclusive on, before it with off — and no later record is
+// replayed; StopReason is getRecoveryStopReason's "after|before LSN X/X\n".
+// A target past the end of the archive is not reached.
+func TestRunArchiveRecoveryStopsAtTargetLSN(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct{ start, end uint64 }
+	var recs []rec
+	for w.WrittenLSN() < uint64(segSize)+uint64(segSize)/2 {
+		s, e, err := w.Append(make([]byte, 2000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec{s, e})
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A record in the second segment; ReadRecPtr = internal start - 1.
+	k := len(recs) - 20
+	target := recs[k].start - 1
+	run := func(stop RecoveryStop) ArchiveRecoveryResult {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	lsn := func(v uint64) string { return fmt.Sprintf("%X/%X", uint32(v>>32), uint32(v)) }
+
+	res := run(RecoveryStop{Set: true, LSN: target, Inclusive: true})
+	if !res.ReachedTarget || !res.StopAfter || res.StopLSN != target || res.EndOfLog != recs[k].end || res.StopPoint != recs[k].end {
+		t.Errorf("inclusive: %+v; want stop after the record at %s, EndOfLog %X", res, lsn(target), recs[k].end)
+	}
+	if want := "after LSN " + lsn(target) + "\n"; res.StopReason() != want {
+		t.Errorf("inclusive reason %q, want %q", res.StopReason(), want)
+	}
+
+	res = run(RecoveryStop{Set: true, LSN: target, Inclusive: false})
+	if !res.ReachedTarget || res.StopAfter || res.StopLSN != target || res.EndOfLog != recs[k-1].end || res.StopPoint != target {
+		t.Errorf("exclusive: %+v; want stop before the record at %s, EndOfLog %X", res, lsn(target), recs[k-1].end)
+	}
+	if want := "before LSN " + lsn(target) + "\n"; res.StopReason() != want {
+		t.Errorf("exclusive reason %q, want %q", res.StopReason(), want)
+	}
+
+	// A target inside record k stops at the next record, the first whose
+	// ReadRecPtr reaches it.
+	res = run(RecoveryStop{Set: true, LSN: target + 8, Inclusive: false})
+	if res.StopLSN != recs[k+1].start-1 || res.EndOfLog != recs[k].end {
+		t.Errorf("mid-record target: stop %X EndOfLog %X; want stop at %X, EndOfLog %X", res.StopLSN, res.EndOfLog, recs[k+1].start-1, recs[k].end)
+	}
+
+	res = run(RecoveryStop{Set: true, LSN: recs[len(recs)-1].end + 0x1000, Inclusive: true})
+	if res.ReachedTarget || res.EndOfLog != recs[len(recs)-1].end {
+		t.Errorf("target past the archive: %+v; want not reached, whole archive replayed", res)
+	}
+	if got := res.StopReason(); got != "no recovery target specified" {
+		t.Errorf("unreached reason %q", got)
+	}
+}
+
+// TestRunArchiveRecoveryStopsAtTargetXid pins recoveryStopsBefore /
+// recoveryStopsAfter for recovery_target_xid: only the COMMIT or ABORT
+// record whose xl_xid equals the target ends recovery (equality — a later
+// commit of a lower or higher xid never does), before it or after applying
+// it; StopReason is "before|after transaction N" and StopMessage names
+// commit vs abort. Abort records stop it too.
+func TestRunArchiveRecoveryStopsAtTargetXid(t *testing.T) {
+	const segSize = int64(1 << 20)
+	archive := t.TempDir()
+	w, err := NewWriter(Config{WALDir: archive, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct{ start, end uint64 }
+	ends := map[uint32]rec{}
+	var last uint64
+	xids := []uint32{700, 702, 701, 705, 703} // completion order is not xid order
+	for i, xid := range xids {
+		for j := 0; j < 50; j++ {
+			if _, _, err := w.Append(make([]byte, 2000)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var framed []byte
+		if i == 3 {
+			framed, err = EncodeXactAbortPG(storage.TransactionID(xid))
+		} else {
+			framed, err = EncodeXactCommitPG(storage.TransactionID(xid), false)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, e, err := w.Append(framed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ends[xid] = rec{s, e}
+		last = e
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	run := func(stop RecoveryStop) ArchiveRecoveryResult {
+		dataDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dataDir, "pg_wal"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+		res, err := RunArchiveRecoveryWith(context.Background(), mgr, dataDir, func() string { return "cp " + filepath.Join(archive, "%f") + " %p" }, segSize, TargetTimeline{}, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	res := run(RecoveryStop{XidSet: true, Xid: 701, Inclusive: true})
+	if !res.ReachedTarget || res.StopKind != StopAtXid || res.StopXid != 701 || !res.StopIsCommit || res.EndOfLog != ends[701].end {
+		t.Errorf("inclusive xid 701: %+v; want stop after its commit at %X", res, ends[701].end)
+	}
+	if got := res.StopReason(); got != "after transaction 701" {
+		t.Errorf("reason %q", got)
+	}
+	if got := res.StopMessage(); !strings.HasPrefix(got, "recovery stopping after commit of transaction 701, time ") {
+		t.Errorf("message %q", got)
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 701, Inclusive: false})
+	if !res.ReachedTarget || res.StopAfter || res.StopPoint != ends[701].start-1 || res.EndOfLog >= ends[701].start {
+		t.Errorf("exclusive xid 701: %+v; want stop before its commit at %X", res, ends[701].start-1)
+	}
+	if got := res.StopReason(); got != "before transaction 701" {
+		t.Errorf("reason %q", got)
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 705, Inclusive: true})
+	if !res.ReachedTarget || res.StopIsCommit || res.EndOfLog != ends[705].end ||
+		!strings.HasPrefix(res.StopMessage(), "recovery stopping after abort of transaction 705") {
+		t.Errorf("abort target: %+v (%s)", res, res.StopMessage())
+	}
+
+	res = run(RecoveryStop{XidSet: true, Xid: 704, Inclusive: true})
+	if res.ReachedTarget || res.EndOfLog != last {
+		t.Errorf("absent xid 704: %+v; want not reached, whole archive replayed", res)
 	}
 }

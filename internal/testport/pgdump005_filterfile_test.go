@@ -59,8 +59,28 @@ import (
 // either way; the pg_dumpall positive arm, which really does dump sourcedb,
 // is NOT moved ahead of the fixture and is left out instead.
 //
-// WHAT IS NOT PORTED (23 assertions), each measured 2026-10-12 against goopg
-// with the fixture in upstream's order:
+// WHAT WAS NOT PORTED (23 assertions) as of 2026-10-12 has been ported down
+// to 5 on 2026-11-01, once the blockers below closed (defects 1 and 2 by
+// M0122-0015c/0015d, defect 3 by M0122-0015a):
+//
+//   - PORTED 2026-11-01 (18 assertions): the pg_dumpall "dump tables with
+//     exclusion of a database" arm and its two \connect checks
+//     (subtest pg_dumpall_exclude_database), and "test restore of other
+//     objects" minus the index/trigger arm (subtest
+//     restore_of_other_objects: the pg_dump -Fc sourcedb command_ok, the
+//     foo1(include function)/foo2(unwanted) pair, the foo3 whitespace arm,
+//     the include-schema-s1 trio and the exclude-schema-s1 quartet).
+//   - STILL NOT PORTED (5 assertions, measured 2026-11-01): the
+//     `include index t1_idx1` / `include trigger t1 trg1` arm's command_ok
+//     and its 4 like/unlike checks. The TOC lists INDEX/TRIGGER entries,
+//     but their archive bodies are EMPTY: goopg's pg_get_indexdef and
+//     pg_get_triggerdef return an empty string (pg_dump builds the DDL from
+//     them), so
+//     pg_restore --file emits a bare `;` per entry. Filed as M0122-0015h
+//     (S2: pg_dump loses index/trigger DDL for every dumped table).
+//
+// Historical record of what blocked the 23 (each measured 2026-10-12
+// against goopg with the fixture in upstream's order):
 //
 //   - pg_dumpall "dump tables with exclusion of a database" (command_ok) and
 //     its two checks (`^\\connect postgres` absent, `^\\connect template1`
@@ -506,5 +526,72 @@ func TestPort_PgDump005Filterfile(t *testing.T) {
 				t.Fatalf("sourcedb: %q: err=%v exit=%d stderr=%s", stmt, err, res.ExitCode, res.Stderr)
 			}
 		}
+	})
+
+	// ---- pg_dumpall: dumping all tables except one database (upstream's
+	// "dump tables with exclusion of a database" + its two \connect checks).
+	// UNBLOCKED 2026-11-01 (M0122-0015a): the exclusion arm dumps template1,
+	// whose child pg_dump used to die at `PREPARE dumpFunc(pg_catalog.oid)`
+	// (defect 1, closed by M0122-0015c) and at COPY-in-user-database
+	// (defect 3, closed by M0122-0015a). Measured pass 2026-11-01.
+	t.Run("pg_dumpall_exclude_database", func(t *testing.T) {
+		writeFilter(inputFile, "exclude database postgres\n")
+		commandOK("dump tables with exclusion of a database",
+			pgDumpall, "--file", plainFile, "--filter", inputFile)
+		dump := slurp()
+		unlike(dump, `(?m)^\\connect postgres`, "database postgres is not dumped")
+		like(dump, `(?m)^\\connect template1`, "database template1 is dumped")
+	})
+
+	// ---- upstream's "test restore of other objects" section, 15 of its 20
+	// assertions. UNBLOCKED 2026-11-01 by M0122-0015c (PREPARE qualified
+	// types — pg_dump's dumpFunc PREPAREs), M0122-0015d (per-database
+	// pg_proc — sourcedb's functions no longer leak into the dumps of the
+	// other databases pg_dumpall walks) and M0122-0015a (COPY resolves the
+	// connecting database, so the sourcedb data section works).
+	//
+	// NOT ported here: the `include index t1_idx1` / `include trigger
+	// t1 trg1` arm (1 command_ok + 4 checks). Measured 2026-11-01: goopg's
+	// pg_get_indexdef and pg_get_triggerdef return the EMPTY STRING, so the
+	// custom archive carries those TOC entries with empty bodies —
+	// pg_restore --file emits a bare `;` for each and no CREATE INDEX /
+	// CREATE TRIGGER text exists to match. Filed as M0122-0015h; the pg_dump
+	// data-fidelity consequence (a dumped table loses its index and trigger
+	// DDL) makes it an S2 escalation.
+	t.Run("restore_of_other_objects", func(t *testing.T) {
+		commandOK("dump all objects from sourcedb",
+			pgDump, "--file", customDump, "--format", "custom", "sourcedb")
+
+		// arm 1: include function foo1(integer) — upstream prints the filter
+		// line with NO trailing newline; faithful.
+		writeFilter(inputFile, "include function foo1(integer)")
+		restoreWithFilter("restore function with filter")
+		dump := slurp()
+		like(dump, `(?m)^CREATE FUNCTION public\.foo1`, "wanted function restored")
+		unlike(dump, `(?m)^CREATE TABLE public\.foo2`, "unwanted function is not restored")
+
+		// arm 2: whitespace tolerance ("against the -P argument")
+		writeFilter(inputFile, "include function  foo3 ( double  precision ,   integer)  ")
+		restoreWithFilter("restore function with filter")
+		like(slurp(), `(?m)^CREATE FUNCTION public\.foo3`, "wanted function restored")
+
+		// arm 3 (index + trigger): NOT PORTED — see the doc comment above.
+
+		// arm 4: include schema s1
+		writeFilter(inputFile, "include schema s1\n")
+		restoreWithFilter("restore function with filter")
+		dump = slurp()
+		like(dump, `(?m)^CREATE TABLE s1\.t1`, "wanted table from schema restored")
+		like(dump, `(?m)^CREATE SEQUENCE s1\.s1`, "wanted sequence from schema restored")
+		unlike(dump, `(?m)^CREATE TABLE s2\t2`, "unwanted table is not restored")
+
+		// arm 5: exclude schema s1
+		writeFilter(inputFile, "exclude schema s1\n")
+		restoreWithFilter("restore function with filter")
+		dump = slurp()
+		unlike(dump, `(?m)^CREATE TABLE s1\.t1`, "unwanted table from schema is not restored")
+		unlike(dump, `(?m)^CREATE SEQUENCE s1\.s1`, "unwanted sequence from schema is not restored")
+		like(dump, `(?m)^CREATE TABLE s2\.t2`, "wanted table restored")
+		like(dump, `(?m)^CREATE TABLE public\.t1`, "wanted table restored")
 	})
 }

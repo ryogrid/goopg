@@ -104,6 +104,11 @@ type PgOutput struct {
 	// catalog-only initial scaffolding before publications
 	// existed.
 	filter RelationFilter
+
+	// messages is pgoutput's "messages" option: logical decoding
+	// messages are written only when the subscriber asked for them
+	// (pgoutput_message returns early otherwise).
+	messages bool
 }
 
 // NewPgOutput constructs a plugin that writes pgoutput messages
@@ -182,6 +187,19 @@ func (p *PgOutput) Message(transactional bool, lsn uint64, prefix string, payloa
 	return err
 }
 
+// SetMessages sets pgoutput's "messages" option.
+func (p *PgOutput) SetMessages(on bool) { p.messages = on }
+
+// LogicalMessage is pgoutput_message: when the "messages" option is on it
+// writes the MESSAGE frame (logicalrep_write_message); otherwise it drops the
+// message. Implements MessagePlugin.
+func (p *PgOutput) LogicalMessage(_ storage.TransactionID, lsn uint64, transactional bool, prefix string, content []byte) error {
+	if !p.messages {
+		return nil
+	}
+	return p.Message(transactional, lsn, prefix, content)
+}
+
 // Change emits `R` (if not yet sent) followed by `I` or `D`.
 // Unknown relations (not present in the snapshot) are skipped —
 // they were created after slot creation and are out of v0's
@@ -218,29 +236,49 @@ func (p *PgOutput) Change(c Change) error {
 	return fmt.Errorf("pgoutput: unknown change kind %d", c.Kind)
 }
 
+// relationNamespace is logicalrep_write_namespace: pg_catalog is written as
+// the empty string, every other namespace by name. goopg records a table in
+// public with an empty Schema, which was written verbatim — and a PG
+// subscriber reads an empty namespace as pg_catalog
+// (logicalrep_read_namespace), so it looked for pg_catalog.<table>.
+func relationNamespace(schema string) string {
+	switch schema {
+	case "":
+		return "public"
+	case "pg_catalog":
+		return ""
+	}
+	return schema
+}
+
 func (p *PgOutput) writeRelation(rel *RelationDef) error {
 	buf := make([]byte, 0, 64)
 	buf = append(buf, pgoRelation)
 	buf = appendUint32(buf, rel.OID)
-	buf = appendCString(buf, rel.Schema)
+	buf = appendCString(buf, relationNamespace(rel.Schema))
 	buf = appendCString(buf, rel.Name)
-	// Replica identity: v0 always reports DEFAULT. Replica-
-	// identity catalog tracking lands with 0008-0003.
-	buf = append(buf, 'd')
+	// relreplident (logicalrep_write_rel).
+	ident := rel.ReplIdent
+	if ident == 0 {
+		ident = 'd'
+	}
+	buf = append(buf, ident)
 	buf = appendUint16(buf, uint16(len(rel.Columns)))
 	for _, col := range rel.Columns {
-		// flag byte: bit 0 = LOGICALREP_IS_REPLICA_IDENTITY.
-		// v0 marks every column as part of REPLICA IDENTITY
-		// DEFAULT — close enough that the apply worker's
-		// row-resolution path works for tables with primary
-		// keys; refines once 0008-0003 lands.
-		buf = append(buf, 1)
+		// flag byte: bit 0 = LOGICALREP_IS_REPLICA_IDENTITY, set only on
+		// the replica identity's columns (logicalrep_write_attrs). It
+		// used to be set on every column, and a subscriber locating a
+		// row for an old-tuple-less UPDATE by the flagged columns then
+		// searched for the NEW non-key values.
+		var flags byte
+		if col.ReplIdent {
+			flags = 1
+		}
+		buf = append(buf, flags)
 		buf = appendCString(buf, col.Name)
 		buf = appendUint32(buf, pgoColumnTypeOID(col.Type))
-		// atttypmod: v0 doesn't track typmod separately;
-		// upstream emits -1 (the "no modifier" sentinel)
-		// for that case.
-		buf = appendUint32(buf, ^uint32(0))
+		// atttypmod (logicalrep_write_attrs), -1 for none.
+		buf = appendUint32(buf, uint32(col.Typmod))
 	}
 	_, err := p.w.Write(buf)
 	return err

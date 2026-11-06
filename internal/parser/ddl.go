@@ -1609,8 +1609,12 @@ func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
 				stmt.CombineFunc = strings.ToLower(valStr)
 			case "finalfunc_modify":
 				stmt.FinalFuncModify = strings.ToLower(valStr)
+			case "parallel":
+				stmt.Parallel = strings.ToLower(valStr)
+			case "serialfunc":
+				stmt.SerialFunc = strings.ToLower(valStr)
 			// Accepted but ignored options.
-			case "parallel", "sspace", "serialfunc", "deserialfunc",
+			case "sspace", "deserialfunc",
 				"mstype", "msfunc", "minvfunc", "mfinalfunc", "minitcond",
 				"sortop", "hypothetical", "mspace":
 				// ignore
@@ -2442,17 +2446,31 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 			}
 			stmt.AllTables = true
 		} else if p.acceptKeyword(KwTable) {
-			tables, err := p.parseObjectList()
-			if err != nil {
-				return nil, err
+			// pub_obj_list TABLE items: [ONLY] name [*] (gram.y
+			// PublicationObjSpec relation_expr).
+			for {
+				p.acceptIdentKeyword("only")
+				obj, err := p.parseObjectName()
+				if err != nil {
+					return nil, err
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+					p.advance()
+				}
+				stmt.Tables = append(stmt.Tables, obj)
+				if !p.acceptSymbol(",") {
+					break
+				}
+				// pub_obj_list: a later item may repeat TABLE
+				// (`TABLE a, TABLE b`) or continue bare (`TABLE a, b`).
+				p.acceptKeyword(KwTable)
 			}
-			stmt.Tables = tables
 		} else {
 			return nil, p.errAtCur("expected ALL TABLES or TABLE after FOR")
 		}
 	}
 	if p.acceptKeyword(KwWith) {
-		opts, err := p.parsePubSubWithList()
+		opts, err := p.parsePubSubWithList(false)
 		if err != nil {
 			return nil, err
 		}
@@ -2496,11 +2514,37 @@ func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
 		p.advance()
 	}
 	if p.acceptKeyword(KwWith) {
-		opts, err := p.parsePubSubWithList()
+		opts, err := p.parsePubSubWithList(false)
 		if err != nil {
 			return nil, err
 		}
 		stmt.With = opts
+	}
+	return stmt, nil
+}
+
+// parseAlterSubscriptionPubsTail parses the name_list + optional WITH
+// block of ALTER SUBSCRIPTION name { SET | ADD | DROP } PUBLICATION,
+// sharing CREATE SUBSCRIPTION ... PUBLICATION's ident convention
+// (TokenIdent names, raw value — gram.y:10873-10901 name_list).
+func (p *parser) parseAlterSubscriptionPubsTail(pos int, name, action string) (Stmt, error) {
+	stmt := &AlterSubscriptionPublicationsStmt{pos: pos, Name: name, Action: action}
+	for {
+		if p.cur().Kind != TokenIdent {
+			return nil, p.errAtCur("expected publication name")
+		}
+		stmt.Publications = append(stmt.Publications, p.cur().Value)
+		p.advance()
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if p.acceptKeyword(KwWith) {
+		opts, err := p.parsePubSubWithList(false)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Options = opts
 	}
 	return stmt, nil
 }
@@ -2623,13 +2667,20 @@ func (p *parser) parseCreateAccessMethodTail(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
-// parsePubSubWithList parses `(key = value [, key = value …])`. Values
-// may be string literals, identifiers, or boolean keywords.
-func (p *parser) parsePubSubWithList() (map[string]string, error) {
+// parsePubSubWithList parses `(key = value [, key value …])`. Values
+// may be string literals, identifiers, or boolean keywords. allowEmpty
+// admits the empty list `()` — ALTER SUBSCRIPTION SET () is legal and a
+// no-op upstream (parse_subscription_options over an empty DefElem list);
+// CREATE WITH keeps it a parse error as before.
+func (p *parser) parsePubSubWithList(allowEmpty bool) (map[string]string, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after WITH")
 	}
 	out := map[string]string{}
+	if allowEmpty && p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		p.advance()
+		return out, nil
+	}
 	for {
 		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
 			return nil, p.errAtCur("expected option name in WITH list")
@@ -6033,7 +6084,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &DropPublicationStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
+		return &DropPublicationStmt{pos: t.Pos, IfExists: ifExists, Name: name, Names: []string{name}}, nil
 	case KwSubscription:
 		p.advance()
 		ifExists, name, err := p.parseDropPubSubTail("subscription")
@@ -8797,6 +8848,107 @@ func (p *parser) parseAlter() (Stmt, error) {
 				return &AlterPublicationOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
 			}
 			return &AlterSubscriptionOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
+		}
+		// ALTER SUBSCRIPTION name ENABLE | DISABLE (AlterSubscription's
+		// ALTER_SUBSCRIPTION_ENABLED kind; "enable"/"disable" are unreserved,
+		// taken as idents exactly like ALTER EVENT TRIGGER … ENABLE).
+		if pubSubKind == KwSubscription {
+			switch {
+			case p.acceptIdentKeyword("enable"):
+				return &AlterSubscriptionEnableStmt{pos: t.Pos, Name: name, Enabled: true}, nil
+			case p.acceptIdentKeyword("disable"):
+				return &AlterSubscriptionEnableStmt{pos: t.Pos, Name: name, Enabled: false}, nil
+			}
+			// ALTER SUBSCRIPTION name SET ( option = value [, ...] ) —
+			// ALTER_SUBSCRIPTION_OPTIONS — and SET PUBLICATION name_list
+			// [WITH (...)] — ALTER_SUBSCRIPTION_SET_PUBLICATION (gram.y
+			// :10895, bare name_list). "set" is a registered keyword
+			// (KwSet), so it arrives as a TokenKeyword, not an ident.
+			// SET ( takes the OPTIONS arm; SET PUBLICATION the list arm;
+			// SET OWNER TO and friends stay the compat no-op below.
+			if p.acceptKeyword(KwSet) {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					opts, err := p.parsePubSubWithList(true)
+					if err != nil {
+						return nil, err
+					}
+					return &AlterSubscriptionSetStmt{pos: t.Pos, Name: name, Options: opts}, nil
+				}
+				if p.acceptKeyword(KwPublication) {
+					return p.parseAlterSubscriptionPubsTail(t.Pos, name, "set")
+				}
+			}
+			// ALTER SUBSCRIPTION name { ADD | DROP } PUBLICATION
+			// name_list [WITH (...)] — ALTER_SUBSCRIPTION_{ADD,DROP}_
+			// PUBLICATION (gram.y:10873/10884; "add"/"drop" arrive as
+			// registered keywords exactly like ALTER PUBLICATION's TABLE
+			// arms below).
+			if pubSubKind == KwSubscription {
+				pubAction := ""
+				switch {
+				case p.acceptKeyword(KwAdd):
+					pubAction = "add"
+				case p.acceptKeyword(KwDrop):
+					pubAction = "drop"
+				}
+				if pubAction != "" && p.acceptKeyword(KwPublication) {
+					return p.parseAlterSubscriptionPubsTail(t.Pos, name, pubAction)
+				}
+			}
+		}
+		// ALTER PUBLICATION name { ADD | SET | DROP } TABLE [ONLY] t [*] [, ...].
+		// Other ADD/SET/DROP forms (SET (option ...), TABLES IN SCHEMA) stay
+		// the compat no-op below.
+		if pubSubKind == KwPublication {
+			action := ""
+			switch {
+			case p.acceptKeyword(KwAdd):
+				action = "add"
+			case p.acceptKeyword(KwSet):
+				action = "set"
+			case p.acceptKeyword(KwDrop):
+				action = "drop"
+			}
+			if action == "set" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts, err := p.parsePubSubWithList(false)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterPublicationOptionsStmt{pos: t.Pos, Name: name, With: opts}, nil
+			}
+			if action != "" && p.acceptKeyword(KwTable) {
+				stmt := &AlterPublicationTablesStmt{pos: t.Pos, Name: name, Action: action}
+				modelled := true
+				for modelled {
+					// A TABLES IN SCHEMA item, a column list `t (a, b)`
+					// or a row filter `t WHERE (...)` is a publication
+					// feature goopg does not model: the statement stays
+					// the compat no-op below, as before, rather than
+					// failing on syntax PG accepts.
+					if p.cur().Kind == TokenKeyword && Keyword(p.cur().Value) == KwTables {
+						modelled = false
+						break
+					}
+					p.acceptIdentKeyword("only")
+					obj, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+						p.advance()
+					}
+					stmt.Tables = append(stmt.Tables, obj)
+					switch {
+					case p.cur().Kind == TokenSymbol && p.cur().Value == ",":
+						p.advance()
+						continue
+					case p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";"):
+						return stmt, nil
+					default:
+						modelled = false
+					}
+				}
+			}
 		}
 		// Other ALTER PUBLICATION/SUBSCRIPTION forms: consume as no-op.
 		for p.cur().Kind != TokenEOF {

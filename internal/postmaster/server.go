@@ -206,6 +206,21 @@ type Config struct {
 	// M0106-0010 batched-34.
 	IsStandby func() bool
 
+	// HotStandbyDisabled is hot_standby = off (PGC_POSTMASTER, read at
+	// start). While IsStandby reports recovery, every connection — normal or
+	// replication — is refused after its startup packet, as PG's
+	// canAcceptConnections returns CAC_NOTHOTSTANDBY in PM_RECOVERY and
+	// backend_startup.c FATALs it; a promotion ends recovery and lifts the
+	// refusal (M0122-0013).
+	HotStandbyDisabled bool
+
+	// HotStandbyConsistent, when non-nil, reports whether the standby's
+	// replay has reached a consistent recovery state (CheckRecoveryConsistency
+	// → PMSIGNAL_BEGIN_HOT_STANDBY). Until it does, a standby in recovery
+	// refuses every connection — normal or replication — with
+	// CAC_NOTHOTSTANDBY's "not yet accepting connections" (M0122-0013).
+	HotStandbyConsistent func() bool
+
 	// RecoveryLSNs, when non-nil, reports the standby's received and
 	// replayed WAL positions for pg_last_wal_receive_lsn /
 	// pg_last_wal_replay_lsn (0 = none, returned as NULL).
@@ -361,6 +376,18 @@ type Server struct {
 	// handler before runCancel() fires, then read by Run() to bound the
 	// connWG.Wait() after the accept loop exits. See ShutdownDeadline.
 	shutdownDeadline time.Duration
+
+	// runCancel cancels Run's context; StopImmediate uses it. Set once Run
+	// has created the context.
+	runCancel atomic.Pointer[context.CancelFunc]
+	// runCtx is Run's context; shuttingDown reads it. A session's own
+	// context is also cancelled by a terminate or a disconnect, so it cannot
+	// tell a server shutdown apart.
+	runCtx atomic.Pointer[context.Context]
+	// immediateStopping is set by StopImmediate before it cancels Run's
+	// context: sessions then end the way quickdie does (PMQUIT_FOR_STOP),
+	// not with the fast-shutdown FATAL.
+	immediateStopping atomic.Bool
 
 	cancelReg *backendCancelRegistry
 
@@ -624,6 +651,8 @@ func (s *Server) Run(ctx context.Context) error {
 	// Optional — disabled when DataDir is empty (e.g. tests).
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
+	s.runCancel.Store(&runCancel)
+	s.runCtx.Store(&runCtx)
 	if s.cfg.DataDir != "" {
 		if err := s.startControlPlane(runCtx, runCancel, ln); err != nil {
 			return err
@@ -762,23 +791,7 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		return nil
 	}
 	cl.OnStopImmediate = func() error {
-		s.cfg.Logger.Info("control: immediate stop requested")
-		// Immediate shutdown: deliberately skip BOTH the OnStop
-		// CheckpointNow AND (via the runtime flag set by the wired
-		// callback) the final Runtime.Close shutdown checkpoint, so
-		// pg_control's State stays DB_IN_PRODUCTION. The cluster then
-		// looks unclean to pg_resetwal/pg_rewind/pg_controldata and is
-		// recovered via WAL replay on the next start. Mirrors upstream's
-		// immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
-		if s.cfg.OnStopImmediate != nil {
-			if err := s.cfg.OnStopImmediate(); err != nil {
-				s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
-			}
-		}
-		// Zero deadline: Run() logs and returns immediately without
-		// waiting for backends — mirrors upstream's SIGQUIT.
-		s.shutdownDeadline = 0
-		runCancel()
+		s.StopImmediate("control: immediate stop requested")
 		return nil
 	}
 	cl.OnReload = func() error {
@@ -828,6 +841,73 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 	return nil
 }
 
+// StopImmediate is the postmaster's immediate shutdown (SIGQUIT,
+// pg_ctl stop -m immediate; `goopg stop -mode immediate` over the control
+// socket): it deliberately skips BOTH the OnStop CheckpointNow AND (via the
+// runtime flag OnStopImmediate sets) the final Runtime.Close shutdown
+// checkpoint, so pg_control's State stays as the running server left it.
+// The cluster then looks unclean to pg_resetwal/pg_rewind/pg_controldata
+// and is recovered via WAL replay on the next start. (M0110-0004 / RW-002
+// b; SIGQUIT wiring M0122-0013.)
+func (s *Server) StopImmediate(reason string) {
+	s.cfg.Logger.Info(reason)
+	if s.cfg.OnStopImmediate != nil {
+		if err := s.cfg.OnStopImmediate(); err != nil {
+			s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
+		}
+	}
+	s.shutdownDeadline = 0
+	s.immediateStopping.Store(true)
+	if cancel := s.runCancel.Load(); cancel != nil {
+		(*cancel)()
+	}
+}
+
+// writeQuickdie is quickdie's message for an immediate-mode stop
+// (postgres.c, PMQUIT_FOR_STOP): a WARNING_CLIENT_ONLY notice — not an
+// ErrorResponse — with SQLSTATE 57P01, after which the backend exits and the
+// connection simply closes. The statement in progress gets no error of its
+// own.
+func (s *Server) writeQuickdie(w *libpq.FrameWriter) {
+	_ = w.WriteNoticeResponse([]libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "WARNING"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "WARNING"},
+		{Code: libpq.FieldSQLState, Value: string(errcodes.AdminShutdown)},
+		{Code: libpq.FieldMessage, Value: "terminating connection due to immediate shutdown command"},
+	})
+	_ = w.Flush()
+}
+
+// shuttingDown reports whether Run's context is cancelled — a fast or
+// immediate stop is under way.
+func (s *Server) shuttingDown() bool {
+	p := s.runCtx.Load()
+	return p != nil && (*p).Err() != nil
+}
+
+// shutdownEndsStatement reports a statement a server stop cut short the way
+// the backend's interrupt handling does, in place of the statement's own
+// error:
+//   - an immediate stop: quickdie's notice (writeQuickdie);
+//   - a fast stop: the statement's cancellation becomes die()'s FATAL 57P01
+//     "terminating connection due to administrator command" —
+//     ProcessInterrupts checks ProcDiePending before QueryCancelPending, so
+//     the client never sees "canceling statement due to user request".
+//
+// It returns errShutdownSent when it wrote the message (the caller closes
+// the connection without writing anything else), nil otherwise.
+func (s *Server) shutdownEndsStatement(w *libpq.FrameWriter, code errcodes.Code) error {
+	if s.immediateStopping.Load() {
+		s.writeQuickdie(w)
+		return errShutdownSent
+	}
+	if code == errcodes.QueryCanceled && s.shuttingDown() {
+		s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+		return errShutdownSent
+	}
+	return nil
+}
+
 // reloadConfig re-parses cfg.ConfigPath (if set) and re-applies its
 // entries to cfg.Registry, logging a summary of what changed and any
 // entries that could not be applied. Invoked by the control-socket
@@ -846,24 +926,15 @@ func (s *Server) reloadConfig() {
 		s.cfg.Logger.Warn("control: reload requested but no GUC registry is configured")
 		return
 	}
-	var entries []misc.ConfigEntry
-	if s.cfg.ConfigPath != "" {
-		parsed, err := misc.ParseConfigFile(s.cfg.ConfigPath)
-		if err != nil {
-			s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
-			return
-		}
-		entries = parsed
-	}
 	// postgresql.auto.conf after postgresql.conf, as at boot: ALTER SYSTEM's
 	// values win, and one it RESET is absent here, so ApplyReloadEntries
-	// reverts it to its default.
-	autoEntries, err := misc.AutoConfEntries(s.cfg.DataDir)
+	// reverts it to its default. The startup-phase reload in goopg start
+	// reads the same entries.
+	entries, err := misc.ReloadConfigEntries(s.cfg.ConfigPath, s.cfg.DataDir)
 	if err != nil {
-		s.cfg.Logger.Error("control: reload failed to parse "+misc.AutoConfFileName, "err", err)
+		s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
 		return
 	}
-	entries = append(entries, autoEntries...)
 	result := registry.ApplyReloadEntries(entries)
 	for _, w := range result.Warnings {
 		s.cfg.Logger.Warn("control: reload", "issue", w)
@@ -1010,6 +1081,26 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	params, err := s.handleStartup(r, w)
 	if err != nil {
 		logger.Info("startup failed", "err", err)
+		return
+	}
+	// canAcceptConnections (postmaster.c) → CAC_NOTHOTSTANDBY: a standby
+	// with hot_standby = off accepts no connection while in recovery; the
+	// refusal comes after the startup packet and before authentication
+	// (backend_startup.c), so a cancel request still works.
+	if s.cfg.HotStandbyDisabled && s.cfg.IsStandby != nil && s.cfg.IsStandby() {
+		s.writeFatalDetail(w, errcodes.CannotConnectNow,
+			"the database system is not accepting connections", "Hot standby mode is disabled.")
+		logger.Info("connection refused: hot standby mode is disabled")
+		return
+	}
+	// Hot standby is on but the startup process has not yet reached a
+	// consistent state: the postmaster is still in PM_RECOVERY, not
+	// PM_HOT_STANDBY, so canAcceptConnections again returns
+	// CAC_NOTHOTSTANDBY, reported with the consistency detail.
+	if s.cfg.HotStandbyConsistent != nil && s.cfg.IsStandby != nil && s.cfg.IsStandby() && !s.cfg.HotStandbyConsistent() {
+		s.writeFatalDetail(w, errcodes.CannotConnectNow,
+			"the database system is not yet accepting connections", "Consistent recovery state has not been yet reached.")
+		logger.Info("connection refused: consistent recovery state not yet reached")
 		return
 	}
 	// Clear the handshake deadline; idle-timeout policy is a separate concern.
@@ -1359,7 +1450,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum, user)
+	// replication=database (exact, as backend_startup.c compares it) makes a
+	// database-bound walsender (am_db_walsender).
+	replDatabase := isReplication && params["replication"] == "database"
+	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, replDatabase, app, params["database"], sessCtx, pid, procNum, user)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1664,7 +1758,7 @@ func (s *Server) cleanupSessionTempObjects(sess *misc.SessionRegistry) {
 	im.DropTempNamespace(owner)
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *libpq.FrameReader, w *libpq.FrameWriter, sess *misc.SessionRegistry, logger *slog.Logger, isReplication, replDatabase bool, appName, dbName string, sessCtx *mmgr.Context, pid uint32, procNum int32, loginUser string) {
 	extended := newExtendedState()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
@@ -1767,7 +1861,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 	var copyIn *copyInState
 	for {
 		if ctx.Err() != nil {
-			s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+			if s.immediateStopping.Load() {
+				s.writeQuickdie(w)
+			} else {
+				s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+			}
 			return
 		}
 		f, err := r.ReadFrame()
@@ -1789,6 +1887,19 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				logger.Info("connection read error", "err", err)
+			}
+			// The read was cut short by a shutdown (the connCtx watcher's
+			// deadline wakes an idle session): the backend still reports
+			// why it is going away before the socket closes — quickdie's
+			// notice for an immediate stop, die()'s FATAL 57P01 for a fast
+			// one — as PG's idle backend does on SIGQUIT / SIGTERM.
+			if ctx.Err() != nil {
+				_ = raw.SetWriteDeadline(time.Now().Add(time.Second))
+				if s.immediateStopping.Load() {
+					s.writeQuickdie(w)
+				} else {
+					s.writeFatal(w, errcodes.AdminShutdown, "terminating connection due to administrator command")
+				}
 			}
 			return
 		}
@@ -1835,7 +1946,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 				// connection's dbName down so the logical walsender can scope
 				// every catalog lookup to the slot's database instead of the
 				// DefaultDBOid fallback (DB 1).
-				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName)
+				handled, err := s.replHandler.HandleCommand(ctx, r, w, f.Payload, appName, dbName, replDatabase)
 				if err != nil {
 					entry.clearQueryCancel()
 					queryCancel()
@@ -1890,6 +2001,12 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw
 					break
 				}
 				logger.Info("query write error", "err", err)
+				// A statement an immediate stop cut short without reaching
+				// writeQueryError still gets quickdie's notice before the
+				// connection closes.
+				if s.immediateStopping.Load() && !errors.Is(err, errShutdownSent) {
+					s.writeQuickdie(w)
+				}
 				return
 			}
 			copyIn = nextCopyIn
@@ -2026,6 +2143,18 @@ func (s *Server) writeFatal(w *libpq.FrameWriter, code errcodes.Code, msg string
 		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
 		{Code: libpq.FieldSQLState, Value: string(code)},
 		{Code: libpq.FieldMessage, Value: msg},
+	})
+	_ = w.Flush()
+}
+
+// writeFatalDetail is writeFatal plus a DETAIL field.
+func (s *Server) writeFatalDetail(w *libpq.FrameWriter, code errcodes.Code, msg, detail string) {
+	_ = w.WriteErrorResponse([]libpq.ErrorField{
+		{Code: libpq.FieldSeverity, Value: "FATAL"},
+		{Code: libpq.FieldSeverityNonLocal, Value: "FATAL"},
+		{Code: libpq.FieldSQLState, Value: string(code)},
+		{Code: libpq.FieldMessage, Value: msg},
+		{Code: libpq.FieldDetail, Value: detail},
 	})
 	_ = w.Flush()
 }

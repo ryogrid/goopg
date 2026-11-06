@@ -427,7 +427,7 @@ func findScanLeaf(op Operator) (currentTIDProvider, error) {
 			if outer != nil {
 				return outer, nil
 			}
-			if bs, ok := v.inner.(*bitmapHeapScanOp); ok {
+			if bs, ok := unwrapNLIInner(v.inner).(*bitmapHeapScanOp); ok {
 				return bs, nil
 			}
 			return nliInnerIndexScan(v.inner), nil
@@ -616,7 +616,7 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode, ctx *Context
 				is.ctx.Catalog.RelFileNode(is.plan.Table) == targetRel {
 				return is, nil
 			}
-			if bs, ok := v.inner.(*bitmapHeapScanOp); ok &&
+			if bs, ok := unwrapNLIInner(v.inner).(*bitmapHeapScanOp); ok &&
 				(bs.rel == targetRel || (bs.tbl != nil && ctx != nil && ctx.Catalog.RelFileNode(bs.tbl) == targetRel)) {
 				return bs, nil
 			}

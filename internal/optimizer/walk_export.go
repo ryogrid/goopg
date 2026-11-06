@@ -147,24 +147,51 @@ func NodeSublinks(n Node) []SublinkRef {
 	}
 	var out []SublinkRef
 	seen := map[Node]struct{}{}
+	collect := func(sub Expr) {
+		for _, sp := range ExprSubplans(sub) {
+			if sp == nil {
+				continue
+			}
+			if _, ok := seen[sp]; ok {
+				continue
+			}
+			seen[sp] = struct{}{}
+			out = append(out, SublinkRef{Expr: sub, Plan: sp})
+		}
+	}
 	for _, e := range exprs {
 		if e == nil {
 			continue
 		}
-		walkExprTree(e, func(sub Expr) {
-			for _, sp := range ExprSubplans(sub) {
-				if sp == nil {
-					continue
-				}
-				if _, ok := seen[sp]; ok {
-					continue
-				}
-				seen[sp] = struct{}{}
-				out = append(out, SublinkRef{Expr: sub, Plan: sp})
-			}
-		})
+		// walkSameScopeExprs, not walkExprTree: the latter's hand list
+		// stops at an IN list / `= ANY (…)` operand, which hid
+		// `k = ANY (ARRAY(SELECT …))`'s initplan from initplan placement,
+		// charging and plan_id numbering (M0122-0021). seen de-duplicates.
+		walkSameScopeExprs(e, collect)
 	}
 	return out
+}
+
+// walkSameScopeExprs visits e and every expression evaluated in e's own
+// scope, pre-order: the slot walker (walkExprRefs, scopeIgnore) reaches
+// every same-scope child exprChildSlots enumerates — an IN list, the
+// operand of `= ANY (…)`, a sublink's argument expressions — where
+// walkExprTree's hand-written list stops. Inner plans are not entered;
+// callers that need a sublink's body read it off the sublink node they
+// are handed. When the slot walk aborts on a type exprChildSlots does not
+// enumerate, walkExprTree runs as well, so nothing the old walk visited is
+// lost (visit may then see a node twice; callers must be idempotent).
+func walkSameScopeExprs(e Expr, visit func(Expr)) {
+	if e == nil {
+		return
+	}
+	walked := walkExprRefs(e, scopeIgnore, exprVisitor{Visit: func(sub Expr) bool {
+		visit(sub)
+		return true
+	}})
+	if !walked {
+		walkExprTree(e, visit)
+	}
 }
 
 // nodeOwnExprs lists the expressions a plan node holds directly — the roots

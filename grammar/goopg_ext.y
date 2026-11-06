@@ -792,6 +792,12 @@ constraints_set_mode:
 		DEFERRED   { $$ = true }
 	| IMMEDIATE    { $$ = false }
 
+/* DROP PUBLICATION [IF EXISTS] name [, ...] (gram.y DropStmt's name_list
+ * form for OBJECT_PUBLICATION). */
+pub_name_list:
+		ColId                              { $$ = []string{$1} }
+	| pub_name_list ',' ColId              { $$ = append($1, $3) }
+
 constr_name_list:
 		constr_name                        { $$ = []string{$1} }
 	| constr_name_list ',' constr_name     { $$ = append($1, $3) }
@@ -3244,7 +3250,7 @@ drop_misc_stmt:
 			{ $$ = NewDropRuleStmt($<p>1, $4, objectNameFromQn($6), $3) }
 	| DROP POLICY opt_if_exists_drop ColId ON qualified_name opt_drop_behavior
 			{ $$ = NewDropPolicyStmt($<p>1, $4, objectNameFromQn($6), $3) }
-	| DROP PUBLICATION opt_if_exists_drop ColId opt_drop_behavior
+	| DROP PUBLICATION opt_if_exists_drop pub_name_list opt_drop_behavior
 			{ $$ = NewDropPublicationStmt($<p>1, $4, $3) }
 	| DROP SUBSCRIPTION opt_if_exists_drop ColId opt_drop_behavior
 			{ $$ = NewDropSubscriptionStmt($<p>1, $4, $3) }

@@ -363,6 +363,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// `goopg stop` once milestone 7 builds it.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	// SIGHUP is caught from here on, as the postmaster's handler is
+	// installed before the startup process runs: until the server's own
+	// reload handler is live, a SIGHUP (pg_ctl reload finds the pid in the
+	// lock file taken below) only flags a reload that the startup phase
+	// processes at its next check — never Go's default terminate-on-SIGHUP.
+	startupHup := newStartupReload(logger)
+	defer startupHup.stop()
+	// SIGQUIT is the immediate shutdown (pg_ctl stop -m immediate), caught
+	// for the whole of goopg start.
+	quit := newImmediateShutdown(logger, cancel)
+	defer quit.stop()
 
 	cfg := postmaster.Config{
 		Address: *addr,
@@ -430,6 +441,30 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			logger.Info("loaded "+misc.AutoConfFileName, "entries", len(autoEntries))
 		}
 	}
+	// CreateDataDirLockFile (PostmasterMain): postmaster.pid is created
+	// before the data directory is touched — before crash or archive
+	// recovery — so a second server on a directory a live one owns stops
+	// here. A directory that does not exist is left to initdb.Open's error.
+	if *dataDir != "" {
+		if st, err := os.Stat(*dataDir); err == nil && st.IsDir() {
+			lockErr := control.CreateDataDirLockFile(*dataDir, control.PIDFile{
+				PID:       os.Getpid(),
+				DataDir:   *dataDir,
+				StartedAt: time.Now(),
+			})
+			if lockErr != nil {
+				fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", lockErr)
+				var le *control.LockFileError
+				if errors.As(lockErr, &le) && le.Hint != "" {
+					fmt.Fprintf(stderr, "HINT: %s\n", le.Hint)
+				}
+				return 1
+			}
+			// The lock file's on_proc_exit unlink; the server's own teardown
+			// removes it first on a normal run.
+			defer func() { _ = control.RemoveDataDirLockFile(*dataDir) }()
+		}
+	}
 	var rt *initdb.Runtime
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
@@ -464,7 +499,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		transactionBuffers := intGUC(registry, "transaction_buffers", 0)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
-			DataDir:               *dataDir,
+			DataDir: *dataDir,
+			// A shutdown request (SIGTERM/SIGINT/SIGQUIT cancel ctx) stops
+			// crash replay at its next record.
+			Interrupted:           func() bool { return ctx.Err() != nil },
 			PoolSlots:             poolSlots,
 			WALInitZero:           walInitZero,
 			WALSenderMemoryBuffer: walSenderMemBuf,
@@ -488,9 +526,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			TrackIOTiming:         trackIOTiming,
 			TransactionBuffers:    transactionBuffers,
 		})
+		if err != nil && errors.Is(err, xlog.ErrRecoveryShutdown) {
+			return endInterruptedCrashRecovery(*dataDir, quit.Requested(), logger, stderr)
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
+		}
+		quit.setRuntime(rt)
+		if quit.Requested() {
+			// SIGQUIT during crash recovery: exit without a checkpoint.
+			return 0
 		}
 		recordClusterStateGUCs(registry, *dataDir)
 		// AIO engine startup line: surfaces the chosen method,
@@ -777,6 +823,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				rt.Checkpointer.SetMaxWALBytes(uint64(mb) * 1024 * 1024)
 			}
 		}
+		// archive_cleanup_command is PGC_SIGHUP: the restartpoint reads the
+		// registry's current value each time it runs (M0122-0013).
+		rt.Checkpointer.SetArchiveCleanupCommandSource(func() string {
+			if v, ok := registry.Get("archive_cleanup_command"); ok {
+				return v.Display()
+			}
+			return ""
+		})
 		if v, ok := registry.Get("checkpoint_completion_target"); ok {
 			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
 				rt.Checkpointer.SetCompletionTarget(f)
@@ -939,27 +993,60 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// recovery loop: restore_command fetches each segment, replay
 	// applies it, and when the archive is exhausted the server
 	// promotes.
+	//
+	// validateRecoveryParameters (xlogrecovery.c) runs first: archive
+	// recovery without a standby needs restore_command — FATAL, and
+	// recovery.signal stays — and a standby with neither primary_conninfo
+	// nor restore_command only warns.
+	if err := validateRecoveryParameters(rt, stringGUC(registry, "restore_command", ""), stringGUC(registry, "primary_conninfo", ""), logger); err != nil {
+		fmt.Fprintf(stderr, "goopg start: FATAL: %v\n", err)
+		return 1
+	}
 	if rt != nil && rt.Recovery && !rt.Standby {
-		restoreCmd := stringGUC(registry, "restore_command", "")
-		if restoreCmd == "" {
-			logger.Warn("recovery.signal present but restore_command is empty — archive recovery disabled; starting as primary")
-			if err := initdb.RemoveRecoverySignal(rt.DataDir); err != nil {
-				logger.Warn("failed to remove recovery.signal", "err", err)
+		logger.Info("archive recovery starting", "restore_command", stringGUC(registry, "restore_command", ""))
+		// restore_command is PGC_SIGHUP: each fetch first processes a
+		// pending reload (ProcessStartupProcInterrupts), then reads it.
+		// ctx is the shutdown request (SIGTERM/SIGINT): it stops recovery
+		// at the next fetch or segment and cancels a running restore_command.
+		if err := checkSingleRecoveryTarget(registry); err != nil {
+			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
+		}
+		stop := recoveryStop(registry)
+		// Crash replay in initdb.Open has already applied the local WAL; a
+		// stop point inside it cannot be honoured.
+		localEnd := uint64(0)
+		if rt.WAL != nil {
+			localEnd = rt.WAL.WrittenLSN()
+		}
+		recovered, err := xlog.RunArchiveRecoveryWith(ctx, rt.StorageMgr, rt.DataDir, func() string {
+			startupHup.process(registry, cfg.ConfigPath, *dataDir)
+			return stringGUC(registry, "restore_command", "")
+		}, 0, recoveryTargetTimeline(registry), stop)
+		if err == nil {
+			err = checkRecoveryTargetReached(stop, recovered, localEnd)
+		}
+		if err != nil {
+			return endInterruptedArchiveRecovery(rt, err, quit.Requested(), logger, stderr)
+		}
+		if recovered.ReachedTarget {
+			logger.Info(recovered.StopMessage())
+			// recovery_target_action: shutdown ends here, leaving recovery
+			// unfinished; pause becomes shutdown without hot_standby.
+			if action := recoveryTargetAction(registry); action != "promote" {
+				return shutdownAtRecoveryTarget(rt, action, logger, stderr)
 			}
-		} else {
-			logger.Info("archive recovery starting", "restore_command", restoreCmd)
-			if err := xlog.RunArchiveRecovery(rt.StorageMgr, rt.DataDir, restoreCmd, 0); err != nil {
-				fmt.Fprintf(stderr, "goopg start: archive recovery: %v\n", err)
-				return 1
-			}
-			logger.Info("archive recovery complete; promoting to primary")
-			// Promote: bump TLI, write history, update pg_control,
-			// and remove recovery.signal. Mirrors finalizePromotion
-			// in standby.go but without the standby controller.
-			if err := promoteAfterRecovery(rt, logger); err != nil {
-				fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
-				return 1
-			}
+		}
+		logger.Info("archive recovery complete; promoting to primary")
+		// Promote: bump TLI, write history, update pg_control,
+		// and remove recovery.signal. Mirrors finalizePromotion
+		// in standby.go but without the standby controller.
+		if err := promoteAfterRecovery(rt, archiveRecoveryEnd{
+			Recovery:           recovered,
+			RecoveryEndCommand: stringGUC(registry, "recovery_end_command", ""),
+			WalLevel:           walLevelEnum(stringGUC(registry, "wal_level", "replica")),
+		}, logger); err != nil {
+			fmt.Fprintf(stderr, "goopg start: promote after recovery: %v\n", err)
+			return 1
 		}
 	}
 
@@ -978,15 +1065,26 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// control-plane PROMOTE command. It must be wired into
 	// server.Config BEFORE srv.Run begins so the very first PROMOTE
 	// after startup has a handler.
+	// hot_standby (PGC_POSTMASTER): off refuses every connection while the
+	// server is a standby (canAcceptConnections, CAC_NOTHOTSTANDBY).
+	cfg.HotStandbyDisabled = !boolGUC(registry, "hot_standby", true)
 	var sc *standbyController
 	if rt != nil && rt.Standby {
 		sc = startStandby(ctx, rt, registry, logger)
 		cfg.Promote = boundPromoteToServer(sc)
 		cfg.IsStandby = func() bool { return sc.rt.Standby }
+		cfg.HotStandbyConsistent = sc.Consistent
 		cfg.RecoveryLSNs = sc.recoveryLSNs
 	}
 
+	// A reload that arrived during startup is applied before the server
+	// starts; the server's own SIGHUP handler takes over from here.
+	startupHup.process(registry, cfg.ConfigPath, *dataDir)
 	srv := postmaster.New(cfg)
+	quit.setServer(srv)
+	if quit.Requested() {
+		return 0
+	}
 	runErr := srv.Run(ctx)
 	cpCancel()
 	if sc != nil {
@@ -1251,14 +1349,32 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 	if strings.EqualFold(*mode, "immediate") {
 		stopCmd = "STOPIMMEDIATE"
 	}
-	reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
-	if err != nil {
-		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
-		return 1
-	}
-	if reply != "OK" {
-		fmt.Fprintf(stderr, "goopg stop: unexpected reply %q\n", reply)
-		return 1
+	if pf.SocketPath == "" {
+		// The server is still in its startup phase (crash or archive
+		// recovery): the lock file exists but the control socket is not
+		// bound yet. Signal it, as pg_ctl stop always does — SIGTERM for
+		// smart, SIGINT for fast, SIGQUIT for immediate.
+		sig := syscall.SIGINT
+		switch {
+		case strings.EqualFold(*mode, "smart"):
+			sig = syscall.SIGTERM
+		case stopCmd == "STOPIMMEDIATE":
+			sig = syscall.SIGQUIT
+		}
+		if err := syscall.Kill(pf.PID, sig); err != nil {
+			fmt.Fprintf(stderr, "goopg stop: could not send stop signal (PID: %d): %v\n", pf.PID, err)
+			return 1
+		}
+	} else {
+		reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg stop: %v\n", err)
+			return 1
+		}
+		if reply != "OK" {
+			fmt.Fprintf(stderr, "goopg stop: unexpected reply %q\n", reply)
+			return 1
+		}
 	}
 	// Wait for the process to actually exit so a follow-up
 	// `goopg start` doesn't race with the previous incarnation.
@@ -1375,6 +1491,18 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stderr, "goopg reload: %v\n", err)
 		return 1
+	}
+	// A server still in its startup phase (crash or archive recovery) has
+	// written the lock file but not yet bound the control socket, so its
+	// SocketPath line is empty: signal it directly, as pg_ctl reload always
+	// does (kill(pid, SIGHUP)). Its startup-phase handler applies the reload.
+	if pf.SocketPath == "" {
+		if err := syscall.Kill(pf.PID, syscall.SIGHUP); err != nil {
+			fmt.Fprintf(stderr, "goopg reload: could not send reload signal (PID: %d): %v\n", pf.PID, err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "goopg reload: configuration reload signalled")
+		return 0
 	}
 	reply, err := control.Send(pf.SocketPath, "RELOAD", 5*time.Second)
 	if err != nil {

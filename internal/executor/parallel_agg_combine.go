@@ -23,6 +23,7 @@ import (
 	"math/big"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 )
 
@@ -50,7 +51,11 @@ func aggregateIsDecomposable(call optimizer.AggregateCall) bool {
 // rule for — which should be unreachable, because the planner consults
 // aggregateIsDecomposable first, but an unreachable wrong answer is worse than
 // an unreachable error.
-func combineAggRuntime(name string, dst, src *aggRuntime, arg optimizer.Expr) error {
+func combineAggRuntime(call optimizer.AggregateCall, dst, src *aggRuntime, ctx *Context) error {
+	if call.UserAgg != nil {
+		return combineUserAggState(call.UserAgg, dst, src, ctx)
+	}
+	name, arg := call.Name, call.Arg
 	switch normalizeAggName(name) {
 	case "count":
 		dst.count += src.count
@@ -140,6 +145,47 @@ func combineAggRuntime(name string, dst, src *aggRuntime, arg optimizer.Expr) er
 		dst.regrSumXX += src.regrSumXX
 		dst.regrSumXY += src.regrSumXY
 		dst.regrSumYY += src.regrSumYY
+
+	case "string_agg":
+		// string_agg_combine (varlena.c): an empty side takes the other's
+		// state; otherwise the second state is appended WITH its leading
+		// delimiter (the first piece's), which the state still carries.
+		if !src.hasValue {
+			break
+		}
+		if !dst.hasValue {
+			dst.strAccum = append([]byte(nil), src.strAccum...)
+			dst.strFirstDelim = src.strFirstDelim
+			dst.boolResult = src.boolResult
+			dst.hasValue = true
+			break
+		}
+		dst.strAccum = append(dst.strAccum, src.strFirstDelim...)
+		dst.strAccum = append(dst.strAccum, src.strAccum...)
+		dst.boolResult = dst.boolResult || src.boolResult
+
+	case "array_agg":
+		// array_agg_combine / array_agg_array_combine (array_userfuncs.c):
+		// the second state's elements follow the first's; for array inputs
+		// the dimensions must agree.
+		if !src.hasValue {
+			break
+		}
+		if !dst.hasValue {
+			dst.arrayElems = append([]string(nil), src.arrayElems...)
+			dst.arrayElemNull = append([]bool(nil), src.arrayElemNull...)
+			dst.arrayOfArrays = src.arrayOfArrays
+			dst.arrayShape = append([]int(nil), src.arrayShape...)
+			dst.hasValue = true
+			break
+		}
+		if dst.arrayOfArrays || src.arrayOfArrays {
+			if !sameArrayShape(dst.arrayShape, src.arrayShape) {
+				return &ExecError{Code: "2202E", Message: "cannot accumulate arrays of different dimensionality"}
+			}
+		}
+		dst.arrayElems = append(dst.arrayElems, src.arrayElems...)
+		dst.arrayElemNull = append(dst.arrayElemNull, src.arrayElemNull...)
 
 	default:
 		return fmt.Errorf("internal error: no combine rule for aggregate %q; "+
@@ -285,4 +331,56 @@ func combineVariance(dst, src *aggRuntime) {
 	if src.hasValue {
 		dst.hasValue = true
 	}
+}
+
+// combineUserAggState is the combine phase of a user-defined aggregate
+// (CREATE AGGREGATE … COMBINEFUNC): the finalize side runs the COMBINEFUNC as
+// its transition function, as nodeAgg.c does under DO_AGGSPLIT_COMBINE
+// (build_pertrans_for_aggref substitutes aggcombinefn for aggtransfn and
+// keeps agginitval as the initial state).
+//
+//   - The combine state starts from INITCOND (NULL when there is none).
+//   - A worker that aggregated no rows still contributes its initial state:
+//     a partial plain Agg always emits one.
+//   - A strict COMBINEFUNC follows the strict-transition rules
+//     (execExprInterp.c EEOP_AGG_PLAIN_TRANS_INIT_STRICT_*): a NULL partial
+//     is skipped; with no state yet (NULL INITCOND) the first partial is
+//     copied in without a call; once the state is NULL it stays NULL.
+func combineUserAggState(ua *catalog.UserAggregate, dst, src *aggRuntime, ctx *Context) error {
+	if ua.CombineFunc == "" {
+		return fmt.Errorf("combine: aggregate %s has no combine function", ua.Name)
+	}
+	if !dst.userStateSet {
+		dst.userState = userAggInitState(ua)
+		dst.userStateSet = true
+		dst.userNoTrans = dst.userState.IsNull()
+	}
+	in := userAggInitState(ua)
+	if src.userStateSet {
+		in = src.userState.MaterializeArena()
+	}
+	if src.hasValue {
+		dst.hasValue = true
+	}
+	if ua.CombineFuncStrict {
+		if in.IsNull() {
+			return nil
+		}
+		if dst.userNoTrans {
+			dst.userState, dst.userNoTrans = in, false
+			return nil
+		}
+		if dst.userState.IsNull() {
+			return nil
+		}
+	}
+	out, err := executeSFuncCall(ua.CombineFunc, []Datum{dst.userState, in}, ctx)
+	if sfuncRaised(err) {
+		return err
+	}
+	if err == nil {
+		dst.userState = out
+	}
+	dst.userNoTrans = false
+	return nil
 }

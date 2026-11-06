@@ -561,6 +561,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *libpq.Fr
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+		ectx.CreateSubscriptionSlot, ectx.DropSubscriptionSlot, ectx.CheckPublicationsOnPublisher,
+			ectx.RefreshSubscriptionOnPublisher = s.subscriptionSlotHooks()
 	}
 	ectx.DataDir = s.cfg.DataDir
 	// Keep the connection-time role set + auth UserStore in sync when the
@@ -1906,6 +1908,7 @@ func plannerSettingsFrom(get func(string) (string, bool)) optimizer.PlannerSetti
 	readBool("enable_memoize", &ps.EnableMemoize)
 	readBool("enable_hashagg", &ps.EnableHashAgg)
 	readBool("enable_presorted_aggregate", &ps.EnablePresortedAggregate)
+	readBool("enable_group_by_reordering", &ps.EnableGroupByReordering)
 	readBool("geqo", &ps.Geqo)
 	// take2 P3-10: the five remaining GEQO knobs. Zero is MEANINGFUL for
 	// geqo_pool_size and geqo_generations (PG reads it as "derive me"), so they
@@ -2029,6 +2032,7 @@ func plannerCacheFingerprint(ps optimizer.PlannerSettings, disableSeqScan, disab
 		bit(ps.EnableBitmapScan),
 		bit(ps.EnableHashAgg),
 		bit(ps.EnablePresortedAggregate),
+		bit(ps.EnableGroupByReordering),
 		bit(ps.Geqo),
 		strconv.Itoa(ps.GeqoThreshold),
 		strconv.Itoa(ps.GeqoEffort),
@@ -4194,13 +4198,13 @@ func stmtCommandTag(stmt parser.Stmt) (string, bool) {
 		return "REFRESH MATERIALIZED VIEW", true
 	case *parser.CreatePublicationStmt:
 		return "CREATE PUBLICATION", true
-	case *parser.AlterPublicationOwnerStmt:
+	case *parser.AlterPublicationOwnerStmt, *parser.AlterPublicationTablesStmt, *parser.AlterPublicationOptionsStmt:
 		return "ALTER PUBLICATION", true
 	case *parser.DropPublicationStmt:
 		return "DROP PUBLICATION", true
 	case *parser.CreateSubscriptionStmt:
 		return "CREATE SUBSCRIPTION", true
-	case *parser.AlterSubscriptionOwnerStmt:
+	case *parser.AlterSubscriptionOwnerStmt, *parser.AlterSubscriptionEnableStmt, *parser.AlterSubscriptionSetStmt, *parser.AlterSubscriptionPublicationsStmt:
 		return "ALTER SUBSCRIPTION", true
 	case *parser.DropSubscriptionStmt:
 		return "DROP SUBSCRIPTION", true

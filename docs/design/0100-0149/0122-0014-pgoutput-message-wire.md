@@ -89,3 +89,90 @@ This is the wire half. SQL\-level `pg_logical_emit_message` requires
 `RM_LOGICALMSG` records to be created, classified and fed to the decoder in
 transactional order, and stays an open M0122\-0014 continuation with its own
 draft design \(`0122-0014-logical-message-producer.md`\).
+
+## Update 2026-10-30 — the Relation message's namespace, relreplident and atttypmod (`f0c7b6718`)
+
+PG 18.3 reference: `postgres/src/backend/replication/logical/proto.c` (logicalrep_write_rel,
+logicalrep_write_namespace, logicalrep_write_attrs, logicalrep_read_namespace).
+
+`PgOutput.writeRelation` used to write three fields that didn't follow the source table:
+
+| field | before | now | PG |
+|---|---|---|---|
+| namespace | `rel.Schema` verbatim: empty for a table created without a schema | `relationNamespace`: "public" for goopg's empty Schema, "" only for pg\_catalog | logicalrep_write_namespace |
+| relreplident | always `'d'` | the table's `catalog.ReplIdentOrDefault` | `rd_rel->relreplident` |
+| per-column typmod | always -1 | `ColumnDef.Typmod` | `att->atttypmod` |
+
+`ColumnDef.Typmod` comes from `nodes.ColumnTypmod`. `TestAttTypmodSiblingsAgree` pins it against the pg_attribute
+writer's `executor.pgAttTypmod`.
+
+The empty namespace was a real interop defect. A PG subscriber reads an empty namespace as pg_catalog
+(logicalrep_read_namespace), so it looked for `pg_catalog.t` and silently applied nothing.
+`TestPort_PgoutputInteropGoopgToPG` never saw this: it creates `public.t` explicitly, and goopg records an
+explicit schema verbatim.
+
+**Pins:**
+
+- `TestPgOutputRelationMessageFields`.
+- **Oracle**, `TestPort_PgoutputInteropGoopgToPGUnqualifiedTable`: a PG 18.3 subscriber applies an unqualified goopg
+  table. It fails with the mapping reverted.
+- The pg_recvlogical E2E checks for `public` in the stream.
+
+**Still open (ledgered):**
+
+- Every column is still flagged as replica identity. logicalrep_write_attrs flags only the identity columns: all
+  under FULL, the primary key under DEFAULT, the index columns under INDEX, none under NOTHING.
+- `nodes.ColumnTypmod` has no interval arm, so a qualified interval column sends -1 where pg_attribute has the packed
+  typmod.
+
+## Update 2026-10-30 — replica-identity column flags and CheckCmdReplicaIdentity (`4a0cf54cc`)
+
+PG 18.3 reference: `postgres/src/backend/replication/logical/proto.c` (logicalrep_write_attrs),
+`postgres/src/backend/utils/cache/relcache.c` (RelationGetIndexList's rd_replidindex selection,
+RelationGetIdentityKeyBitmap), `postgres/src/backend/executor/execReplication.c` (CheckCmdReplicaIdentity).
+
+### Relation message flags
+
+`ColumnDef.ReplIdent` drives the LOGICALREP_IS_REPLICA_IDENTITY flag. `xlog.identityColumns` builds the set:
+
+| relreplident | flagged columns |
+|---|---|
+| FULL | every column |
+| DEFAULT | the primary key's |
+| USING INDEX | the indisreplident index's |
+| NOTHING | none |
+
+A deferrable (non-immediate) index never counts, as rd_replidindex never names one.
+
+Every column used to be flagged. goopg's apply worker, like PG's, locates the row for an UPDATE sent without an old
+tuple by the flagged columns, and goopg sends HOT updates under DEFAULT without one. The subscriber therefore searched
+for the new non-key values and kept the stale row beside the new one. `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput`
+shows the result before the fix: `(7,alpha)`, `(8,gamma)`, `(7,beta)`. This is latent today, because goopg-to-goopg
+subscription does not yet deliver end to end.
+
+### CheckCmdReplicaIdentity
+
+Flagging no columns for a table with no identity is only correct because PG never streams such a change.
+`checkCmdReplicaIdentity`, called from `updateOp.Open` / `deleteOp.Open` once per result relation, refuses an
+UPDATE (DELETE) on a table that publishes it but has no replica identity. A replica identity here means the immediate
+primary key under DEFAULT, the immediate indisreplident index under USING INDEX, or FULL. The error is 55000 "cannot
+update table \"%s\" because it does not have a replica identity and publishes updates" (or the delete form), with
+PG's hint. Partitioned tables are skipped, as in PG. `hasReplicaIdentity` and `xlog.identityColumns` are siblings
+and pick the same index.
+
+Without the check, a PG subscriber that has a primary key would reject goopg's no-identity UPDATEs ("publisher did not
+send replica identity column expected by the logical replication target relation").
+
+**Pins:** `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput` and `TestCheckCmdReplicaIdentity` (deferrable
+mutation caught). A live probe shows PG's messages.
+
+**regress publication** stays at 2209 diff lines. Its replica-identity cases run after `ALTER PUBLICATION … ADD
+TABLE`, which goopg accepts as a no-op, or go through partitions and row filters.
+
+**Still open (ledgered):**
+
+- ALTER PUBLICATION ADD / SET / DROP TABLE is a no-op.
+- goopg-to-goopg subscription does not deliver.
+- Publication membership through a partitioned ancestor is not modelled.
+- Row filters and column lists are not supported.
+- REPLICA IDENTITY FULL UPDATEs send no old tuple.

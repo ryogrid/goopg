@@ -1842,9 +1842,24 @@ func quantifiedAny(l yyLexer, pos int, left Expr, op OpCode, sub *SelectStmt, li
 	case OpNe:
 		anyOp, notEq = OpUnknown, true
 	}
-	ie := NewInExpr(pos, left, false, anyOp, false, sub, unwrapAnyArray(l, list, listPos))
+	list, spliced := unwrapAnyArray(l, list, listPos)
+	ie := NewInExpr(pos, left, false, anyOp, false, sub, list)
 	ie.NotEqualAny = notEq
 	ie.Quantified = true
+	ie.SplicedArray = spliced
+	return ie
+}
+
+// quantifiedAll builds `x op ALL (...)` (gram.y's AEXPR_OP_ALL via
+// make_scalar_array_op): the operator is carried as-is in AnyOp (no `=`
+// demotion — ALL keeps the operator, unlike quantifiedAny) with AllOp
+// selecting the AND fold. A direct `ALL (ARRAY[...])` list is spliced like
+// quantifiedAny does, and InExpr.SplicedArray records that so the
+// M0122-0015f array-operand check exempts it.
+func quantifiedAll(l yyLexer, pos int, left Expr, op OpCode, list []Expr, listPos int) Expr {
+	spliced, wasSplice := unwrapAnyArray(l, list, listPos)
+	ie := NewInExpr(pos, left, false, op, true, nil, spliced)
+	ie.SplicedArray = wasSplice
 	return ie
 }
 
@@ -1856,12 +1871,25 @@ func quantifiedAny(l yyLexer, pos int, left Expr, op OpCode, sub *SelectStmt, li
 // there. The AST alone cannot tell those apart (the grammar's `'(' a_expr ')'`
 // leaves no node), which is why the check goes back to the token stream at
 // listPos, the position of the list's first terminal.
-func unwrapAnyArray(l yyLexer, list []Expr, listPos int) []Expr {
+// unwrapAnyArray reproduces parseAnyTail's treatment of `ANY (ARRAY[...])`
+// (select.go:2574-2606): when the right side is a DIRECT array constructor,
+// legacy splices its elements into InExpr.List and DISCARDS any trailing
+// `::type[]` casts. Legacy's test is TOKEN-literal — the two tokens after the
+// '(' are ARRAY and '[' — so `((ARRAY[1]))` stays an ordinary expression
+// there. The AST alone cannot tell those apart (the grammar's `'(' a_expr ')'`
+// leaves no node), which is why the check goes back to the token stream at
+// listPos, the position of the list's first terminal.
+//
+// The second result reports whether the splice happened. A spliced list is
+// scalar-element by construction yet is PG's legal `op ANY (ARRAY[...])`
+// (make_scalar_array_op takes the ARRAY syntax), so the caller records it on
+// InExpr.SplicedArray to exempt it from the M0122-0015f non-array rejection.
+func unwrapAnyArray(l yyLexer, list []Expr, listPos int) ([]Expr, bool) {
 	if len(list) != 1 {
-		return list
+		return list, false
 	}
 	if ls, ok := l.(*lexerState); ok && !ls.directArrayAt(listPos) {
-		return list
+		return list, false
 	}
 	e := list[0]
 	for {
@@ -1872,9 +1900,9 @@ func unwrapAnyArray(l yyLexer, list []Expr, listPos int) []Expr {
 		e = c.Operand
 	}
 	if ac, ok := e.(*ArrayConstructorExpr); ok && len(ac.Elements) > 0 {
-		return ac.Elements
+		return ac.Elements, true
 	}
-	return list
+	return list, false
 }
 
 // copyColConstraints moves the constraint carrier's per-column fields onto a

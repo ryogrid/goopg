@@ -38,15 +38,20 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 		// order, which parallel scans do not preserve.
 		return false
 	}
-	if call.UserAgg != nil {
-		// Never decomposable. goopg's combineAggRuntime has no rule to invoke
-		// a user combinefunc — it deep-merges the typed aggRuntime fields
-		// (count, intResult, floatSx, ...), not transition-state datums — so a
-		// user aggregate that declared COMBINEFUNC would still hit the
-		// combineAggRuntime default arm and error at combine time. Refuse
-		// fail-closed (M0134-0001 S10a); invoking the user combinefunc is a
-		// separate, deferred slice.
-		return false
+	if ua := call.UserAgg; ua != nil {
+		// A user aggregate splits as PG's can_partial_agg / get_agg_clause_costs
+		// allow (planner.c, clauses.c): it must declare a COMBINEFUNC, be
+		// PARALLEL SAFE (proparallel; unspecified means unsafe), and — with an
+		// internal state type — have a SERIALFUNC to ship the state. The
+		// executor combines the partial states by calling the COMBINEFUNC
+		// (combineUserAggState, M0148-0001i).
+		if ua.CombineFunc == "" || ua.Parallel != "safe" {
+			return false
+		}
+		if strings.EqualFold(ua.SType, "internal") && ua.SerialFunc == "" {
+			return false
+		}
+		return true
 	}
 
 	switch normalizeAggName(call.Name) {
@@ -58,9 +63,28 @@ func AggregateIsDecomposable(call AggregateCall) bool {
 		"regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
 		"covar_pop", "covar_samp", "regr_r2", "regr_slope", "regr_intercept", "corr":
 		return true
+	case "array_agg":
+		// prepagg.c: array_agg_serialize/deserialize use the input type's
+		// send/receive, and RECORD is disclaimed (parse_agg.c
+		// agg_args_support_sendreceive: record_recv needs the anonymous
+		// record's typmod) — so an anonymous-record argument keeps the
+		// aggregate whole (aggregates.sql: array_agg over a subquery row).
+		if strings.EqualFold(call.InputType.Name, "record") {
+			return false
+		}
+		return true
+	case "string_agg":
+		// PG 18 gives both a combine function (array_agg_combine,
+		// array_agg_array_combine, string_agg_combine) and marks them
+		// PARALLEL SAFE, so an unordered, non-DISTINCT call splits; the
+		// combined result concatenates the partial states in the order the
+		// combine phase receives them, which PG documents as unspecified
+		// for an aggregate without ORDER BY (aggregates.sql's v_pagg_test
+		// plans Partial HashAggregate over string_agg/array_agg). The
+		// ORDER BY and DISTINCT forms were refused above. M0148-0001i.
+		return true
 	default:
-		// Includes array_agg and string_agg (order-dependent), the
-		// WITHIN GROUP ordered-set aggregates, and anything new.
+		// Includes the WITHIN GROUP ordered-set aggregates and anything new.
 		return false
 	}
 }

@@ -318,6 +318,14 @@ type InExpr struct {
 	// transformAExprIn turns into a plain `=` (M0146-0005by); `= ANY
 	// (ARRAY[c])` stays a ScalarArrayOpExpr.
 	Quantified bool
+	// SplicedArray marks a Quantified list that came from a DIRECT
+	// `ANY (ARRAY[...])` / `ALL (ARRAY[...])` constructor — the elements
+	// were spliced into List by unwrapAnyArray / parseAnyTail. The list
+	// items are scalars of a legal array constructor (PG's
+	// make_scalar_array_op takes the ARRAY syntax itself), so the
+	// array-operand check of M0122-0015f — `op ANY (non-array-expr)` is
+	// 42809 — skips these. Only set with the splicing sites.
+	SplicedArray bool
 }
 
 func (e *InExpr) Pos() int { return e.pos }

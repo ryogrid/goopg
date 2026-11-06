@@ -555,3 +555,60 @@ func TestParallelNLIBitmapInnerIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestExplainAnalyzeMemoizeWorkerLines pins M0122-0021 residual 3: below a
+// Gather, each parallel worker's Memoize counters print as their own
+// `Worker N:  Hits: …` line, without VERBOSE, after the leader's main line —
+// PG's show_memoize_info walks MemoizeState.shared_info and writes one line
+// per worker that missed at least once. goopg kept each worker's counters in
+// the worker Context and dropped them at the join, so only the leader's line
+// survived. With leader participation off the leader never runs the Memoize:
+// PG then prints no main line (cache_misses == 0) and the worker lines carry
+// every probe, so their hits + misses add up to the outer row count.
+func TestExplainAnalyzeMemoizeWorkerLines(t *testing.T) {
+	ctx, cleanup := newMemoizeFixture(t)
+	defer cleanup()
+
+	const sql = "SELECT mo.pad, mi.v FROM mo JOIN mi ON mi.id = mo.k"
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if nli := findNLI(plan); nli == nil || nli.InnerMemo == nil {
+		t.Fatal("fixture no longer plans a memoized fused NLI")
+	}
+	ctx.MaxParallelWorkers = 8
+	ctx.ParallelLeaderParticipation = false
+	lines := runExplainOverChild(t, ctx, "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) "+sql, optimizer.NewGather(0, plan, 2))
+	out := strings.Join(lines, "\n")
+
+	var probes, workers, lastWorker int64 = 0, 0, -1
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "Hits: ") {
+			t.Errorf("leader never ran the Memoize, yet a main Hits line printed:\n%s", out)
+		}
+		var w, hits, misses, ev, ov int64
+		if n, _ := fmt.Sscanf(l, "Worker %d:  Hits: %d  Misses: %d  Evictions: %d  Overflows: %d", &w, &hits, &misses, &ev, &ov); n == 5 {
+			if w <= lastWorker {
+				t.Errorf("worker lines out of slot order:\n%s", out)
+			}
+			lastWorker = w
+			if misses == 0 {
+				t.Errorf("a worker with no misses printed a line (PG skips it):\n%s", out)
+			}
+			workers++
+			probes += hits + misses
+		}
+	}
+	if workers == 0 {
+		t.Fatalf("no `Worker N:  Hits:` line:\n%s", out)
+	}
+	if probes != 40 {
+		t.Errorf("worker lines account for %d probes, want 40 (every outer row):\n%s", probes, out)
+	}
+}

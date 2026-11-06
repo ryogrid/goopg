@@ -1098,6 +1098,35 @@ func evalExprSlot(e optimizer.Expr, slot SlotView, ctx *Context) (Datum, error) 
 			}
 			return NewStringDatum(intToBitTypmodString(v.Int, srcWidth, n)), nil
 		}
+		// string::bit / string::bit varying: the pg_cast castfuncs bit() and
+		// varbit() (varbit.c) run the FULL bit_in input scan — the b/B and
+		// x/X prefix arms included (M0148-0001: this arm silently
+		// stringified, so `'B0101'::bit(4)` printed the raw text) — and THEN
+		// the typmod check at CAST time: bit() is the 22026 exact-match arm
+		// (varbit.c:207-213), varbit() the 22001 upper bound
+		// (varbit.c:508-514), against the SCANNED bit count (hex digits
+		// expand ×4). The same scan guards the assignment chokepoint
+		// (coerceTextLikeDatum's bit arms); this is its cast-time sibling
+		// (pattern_sibling_paths_must_agree).
+		if v.Kind == KindString && (strings.EqualFold(castTargetType, "bit") || strings.EqualFold(castTargetType, "varbit") || strings.EqualFold(castTargetType, "bit varying")) {
+			digits, berr := scanBitInput(v.StringValue())
+			if berr != nil {
+				berr.Pos = x.Pos()
+				return Datum{}, berr
+			}
+			if n := int(x.Typmod); n > 0 {
+				if strings.EqualFold(castTargetType, "bit") {
+					if len(digits) != n {
+						return Datum{}, &ExecError{Code: "22026", Pos: x.Pos(),
+							Message: fmt.Sprintf("bit string length %d does not match type bit(%d)", len(digits), n)}
+					}
+				} else if len(digits) > n {
+					return Datum{}, &ExecError{Code: "22001", Pos: x.Pos(),
+						Message: fmt.Sprintf("bit string too long for type bit varying(%d)", n)}
+				}
+			}
+			return NewStringDatum(digits), nil
+		}
 		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
@@ -10654,7 +10683,7 @@ func evalRowConstructorInExpr(x *optimizer.InExpr, rowOp *optimizer.RowExpr, slo
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -10766,7 +10795,7 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []optimizer.Expr, s
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !sqOp.IsNonCorrelated)()
 
-	innerOp, err := Build(sqOp.Plan)
+	innerOp, err := buildNode(sqOp.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -11619,7 +11648,7 @@ func extractCorrSubqHashInfo(n optimizer.Node) (corrSubqHashInfo, bool) {
 // buildCorrSubqHashMap scans the inner SeqScan once and builds
 // key → value map where key = datumKey(scan[joinColIdx]) and value = eval(projExpr).
 func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum, error) {
-	scanOp, err := Build(info.scan)
+	scanOp, err := buildNode(info.scan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return nil, err
 	}
@@ -11688,11 +11717,36 @@ func evalArraySubquery(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (D
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 		}
 	}
+	// An uncorrelated ARRAY sublink is PG's initplan (subselect.c
+	// make_subplan): evaluated once and reused, so its subtree reports
+	// one loop. Cached under a constant key in the scoped store, as the
+	// non-correlated EXISTS is (M0122-0021).
+	if x.IsNonCorrelated {
+		stat := ctx.subPlanStat(x)
+		stat.Calls++
+		cacheKey := ctx.scopedSublinkKey(stat, x.Plan, nonCorrelatedCacheKey(x))
+		if cached, ok := ctx.subqCacheGet(cacheKey, true); ok && len(cached) == 1 {
+			stat.CacheHits++
+			return cached[0], nil
+		}
+		stat.CacheMisses++
+		val, err := evalArraySubqueryOnce(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		ctx.subqCachePut(cacheKey, true, []Datum{val})
+		return val, nil
+	}
+	return evalArraySubqueryOnce(x, row, ctx)
+}
+
+// evalArraySubqueryOnce runs the ARRAY sublink's plan for one outer row.
+func evalArraySubqueryOnce(x *optimizer.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
 
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -11742,7 +11796,7 @@ func evalMultiAssignSubqRow(x *optimizer.MultiAssignSubqRow, row Row, ctx *Conte
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	defer enterSublinkCTEWindow(ctx, !x.IsNonCorrelated)()
-	op, err := Build(x.Plan)
+	op, err := buildNode(x.Plan, deformBoundNone, ctx.explainScope)
 	if err != nil {
 		return nil, err
 	}
@@ -12447,6 +12501,18 @@ func evalFuncCall(x *optimizer.FuncCall, slot SlotView, ctx *Context) (Datum, er
 		}
 		if view == nil || view.View == nil || view.ViewDef == "" {
 			return NullDatum, nil
+		}
+		// M0148-0001g: deparse the stored body as ruleutils prints the
+		// analysed query (viewdef_deparse.go); outside its subset, fall back
+		// to the captured text below.
+		pretty := false
+		if len(x.Args) >= 2 {
+			if pv, perr := evalExprSlot(x.Args[1], slot, ctx); perr == nil && !pv.IsNull() {
+				pretty = pv.Kind != KindBool || pv.BoolValue()
+			}
+		}
+		if txt, ok := deparseViewDef(view, im, relationVisibleFunc(ctx, im), pretty); ok {
+			return NewStringDatum(txt), nil
 		}
 		def := view.ViewDef
 		// A `CREATE VIEW v (c1, c2, …) AS …` explicit column list renames the
@@ -18310,6 +18376,10 @@ case "pg_char_to_encoding":
 	// M-NIGHTLY AI-20260810-011258-003.
 	case "pg_create_physical_replication_slot":
 		return evalPgCreatePhysicalReplicationSlot(x, slot, ctx)
+	// pg_logical_emit_message(transactional, prefix, message[, flush]) —
+	// LogLogicalMessage. See expr_logicalmsg.go.
+	case "pg_logical_emit_message":
+		return evalPgLogicalEmitMessage(x, slot, ctx)
 	case "pg_drop_replication_slot":
 		return evalPgDropReplicationSlot(x, slot, ctx)
 	// currtid2(relname text, tid tid) → tid: returns the latest visible TID

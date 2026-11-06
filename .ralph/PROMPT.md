@@ -59,7 +59,9 @@ loop.
     `.ralph/working_set.md` (see "Working Set Carry" below)
 
 ## Key Principles
-- ONE task per loop - focus on the most important thing
+- ONE task per loop - focus on the most important thing. A banner S9
+  census pass is not a task: after it, select and work the next task in the
+  same loop (banner S9(4a), owner 2026-10-30)
 - TASKS_COMPLETED_THIS_LOOP must be 0 or 1 (never more than one task per loop)
 - Search the codebase before assuming something isn't implemented
 - For Go code navigation and refactors, prefer Serena MCP symbolic tools first (`mcp__serena__*`) before broad read/grep scans

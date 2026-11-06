@@ -243,4 +243,20 @@ func MergeWorkerContext(leader, worker *Context) {
 		cp.Worker = worker.workerSlot
 		leader.SortWorkerStats[node] = append(leader.SortWorkerStats[node], cp)
 	}
+
+	// M0122-0021 residual 3: the worker's Memoize counters, by the same
+	// slot discipline as the sort entries. PG keeps each worker's counters
+	// in MemoizeState.shared_info (ExecMemoizeRetrieveInstrumentation) and
+	// never adds them to the leader's own.
+	for node, ws := range worker.MemoizeStats {
+		if ws == nil {
+			continue
+		}
+		if leader.MemoizeWorkerStats == nil {
+			leader.MemoizeWorkerStats = make(map[*optimizer.Memoize][]MemoizeStats)
+		}
+		cp := *ws
+		cp.Worker = worker.workerSlot
+		leader.MemoizeWorkerStats[node] = append(leader.MemoizeWorkerStats[node], cp)
+	}
 }

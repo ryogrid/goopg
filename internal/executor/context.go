@@ -209,7 +209,9 @@ type Context struct {
 	// outer row, or reuse it?" — is invisible in EXPLAIN output
 	// otherwise, and was previously answered only by Fermi
 	// estimates (see the correlated-subquery-planning design
-	// bundle, gate V6). Surfaced by EXPLAIN ANALYZE.
+	// bundle, gate V6). Tests and diagnostics read it here; EXPLAIN
+	// ANALYZE no longer prints it on the SubPlan line, which PG prints
+	// bare (M0122-0021).
 	//
 	// Written on the single statement-executing goroutine, in the
 	// same style as the sublink result caches above; no synchronisation.
@@ -219,6 +221,15 @@ type Context struct {
 	// (Hits/Misses/Evictions/Overflows), keyed by plan node like
 	// SubPlanStats. Lazily allocated by memoizeStat. S7.
 	MemoizeStats map[*optimizer.Memoize]*MemoizeStats
+
+	// MemoizeWorkerStats carries one entry per parallel worker per
+	// executed Memoize node, tagged with the worker's fan-out slot and
+	// folded post-join by MergeWorkerContext — PG's
+	// MemoizeState.shared_info, rendered as `Worker N:  Hits: …` lines
+	// (explain.c show_memoize_info). The leader's own counters stay in
+	// MemoizeStats and render the main line, as PG's mstate->stats do.
+	// M0122-0021 residual 3.
+	MemoizeWorkerStats map[*optimizer.Memoize][]MemoizeStats
 
 	// HashJoinStats carries the per-hash-join ANALYZE counters
 	// (buckets / batches / peak memory), keyed by plan node like the two
@@ -239,6 +250,15 @@ type Context struct {
 	// for executed sites exist, so plans without a Gather render nothing.
 	// EX0-03b (new).
 	GatherWorkerStats workerNodeStatsTable
+
+	// explainScope is the EXPLAIN ANALYZE instrumenter for the statement
+	// being executed, set by explainOp for the duration of its run (nil
+	// otherwise). Subtrees built lazily during execution — a SubPlan's or
+	// InitPlan's inner plan (acquireSubPlanOp) — build under it, so they
+	// report actuals as PG's ExplainNode prints for every subplan
+	// (M0122-0021 slice 3). NewWorkerContext copies fields explicitly and
+	// leaves it nil: a worker never writes the leader's stats table.
+	explainScope *instrumenter
 
 	// SortStats carries the per-Sort ANALYZE counters (method / space),
 	// keyed by plan node like HashJoinStats. Published at the end of a
@@ -682,6 +702,30 @@ type Context struct {
 	// for its periodic poll. nil disables the wakeup (the launcher
 	// still converges via the timer). M0103-0002.
 	OnSubscriptionChange func()
+	// CreateSubscriptionSlot / DropSubscriptionSlot create and drop a
+	// subscription's slot on its publisher (CreateSubscription's
+	// walrcv_create_slot, DropSubscription's ReplicationSlotDropAtPubNode).
+	// They return a ready *ExecError (PG's message and SQLSTATE) on
+	// failure. nil — tests without a server — skips the publisher side.
+	CreateSubscriptionSlot func(subName, conninfo, slotName string) error
+	DropSubscriptionSlot   func(subName, conninfo, slotName string) error
+	// CheckPublicationsOnPublisher dials subName's publisher and reports
+	// which of pubs the publisher lacks — AlterSubscription_refresh's
+	// check_publications (subscriptioncmds.c:443, its SELECT over
+	// pg_publication), with pubs empty for the connect-only dial (PG's
+	// DROP PUBLICATION refresh validates no names). It returns a ready
+	// *ExecError (PG's message and SQLSTATE) on connect/query failure. nil
+	// — tests without a server — skips the publisher side. M0122-0014.
+	CheckPublicationsOnPublisher func(subName, conninfo string, pubs []string) (missing []string, err error)
+	// RefreshSubscriptionOnPublisher runs AlterSubscription_refresh's
+	// data half after the publication-list write: fetch_table_list, the
+	// pg_subscription_rel row swap (drop rows of tables that left the
+	// list, seed 'i' rows for tables that entered), the tablesync COPY
+	// (skipped for WITH (copy_data = false), where rows go straight to
+	// READY), and the apply-worker restart so the new list streams. It
+	// returns a ready *ExecError (PG's message and SQLSTATE). nil —
+	// tests without a server — skips the data half. M0122-0014.
+	RefreshSubscriptionOnPublisher func(subName, conninfo string, dbOid uint32, pubs []string, copyData bool) error
 
 	// DataDir is the cluster's data directory, used by DDL operators that
 	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,

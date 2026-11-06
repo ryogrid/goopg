@@ -789,6 +789,12 @@ func (s *Server) respondSelectOne(w *libpq.FrameWriter) error {
 // client received a clean error response and is ready for the next query).
 var errQueryErrorSent = errors.New("server: error response sent to client")
 
+// errShutdownSent reports that a server stop ended the statement: the
+// shutdown's own message (quickdie's notice, or die()'s FATAL) was sent
+// instead of the statement's error, and the connection must close (the
+// backend exits). See shutdownEndsStatement.
+var errShutdownSent = errors.New("server: shutdown message sent to client")
+
 // writeQueryError emits an ErrorResponse with the given SQLSTATE plus a
 // trailing ReadyForQuery, matching how upstream finishes a failed simple
 // Query (the parse error is reported and the connection stays open).
@@ -798,6 +804,11 @@ var errQueryErrorSent = errors.New("server: error response sent to client")
 // multi-statement loop can detect the error-and-stop condition without
 // sending a duplicate ReadyForQuery (M0097-0003 normalization fix).
 func (s *Server) writeQueryError(w *libpq.FrameWriter, code errcodes.Code, msg string, extra ...libpq.ErrorField) error {
+	// A server stop interrupted the statement: the shutdown's message
+	// replaces the statement's (cancellation) error.
+	if err := s.shutdownEndsStatement(w, code); err != nil {
+		return err
+	}
 	fields := []libpq.ErrorField{
 		{Code: libpq.FieldSeverity, Value: "ERROR"},
 		{Code: libpq.FieldSeverityNonLocal, Value: "ERROR"},

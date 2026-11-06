@@ -322,3 +322,35 @@ TAP utility-library doc under M0004.
   [root-0008-wal-and-recovery.md](../../root/root-0008-wal-and-recovery.md).
 - GUC system:
   [root-0004-configuration-and-guc.md](../../root/root-0004-configuration-and-guc.md).
+
+## Update 2026-10-29 — one checkpoint at a time; requests (M0122-0013, `250baa3d4`)
+
+PG runs checkpoints in a single checkpointer process (checkpointer.c):
+- Checkpoints never overlap.
+- `RequestCheckpoint` sets request flags and wakes the process. `CHECKPOINT_WAIT` callers wait for a checkpoint that
+  started after their request.
+- `CheckpointWriteDelay` stops throttling a spread checkpoint once an immediate request is queued
+  (`ImmediateCheckpointRequested`).
+
+goopg's `runCheckpoint` had no serialisation. The timer and volume triggers, SQL `CHECKPOINT`, base backup, promotion
+and the shutdown checkpoint could all run at the same time, and there was no way to request a checkpoint without
+running it.
+
+Changes:
+- **Serialisation.** `runMu` serialises every checkpoint (`runCheckpointOpts`). `checkpointOpts` separates the
+  pacing flag (`spread`), `shutdown`, and the pg\_stat\_checkpointer cause (`timed` vs requested).
+- **Immediate waiters.** `CheckpointNow` and `CheckpointShutdown` register as immediate waiters
+  (`pendingImmediate`) and wake the spread pacer (`immediateWake`). The pacer returns without sleeping while a waiter
+  is pending, so the running checkpoint finishes at full speed and the waiter's checkpoint follows.
+- **`RequestCheckpoint()`.** A forced, spread checkpoint that the `Run` loop serves without the caller waiting, as
+  PG's `CHECKPOINT_FORCE` without `IMMEDIATE`. Requests coalesce while one is pending. It returns false when no `Run`
+  loop is serving requests (tools, unit tests), and the caller decides what to do. It counts as a requested checkpoint.
+- **Promotion.** The streaming promotion now requests its checkpoint (PG: `RequestCheckpoint(CHECKPOINT_FORCE)` at the
+  end of `StartupXLOG`). The end of recovery.signal recovery still waits, as PG's `PerformRecoveryXLogAction` does.
+
+Pins: `TestCheckpointerSerialisesCheckpoints` and `TestCheckpointerImmediateRequestEndsSpreadPacing` (both
+mutation-checked), and `TestCheckpointerRequestCheckpoint`.
+
+Still different: a `CheckpointNow` caller that queues behind a running *immediate* checkpoint is served by its own
+next run, which is a full extra checkpoint. PG instead lets a waiter whose request was already covered by a checkpoint
+in progress (`ckpt_started` / `ckpt_done`) accept that one. goopg's behaviour costs time but is never unsafe.

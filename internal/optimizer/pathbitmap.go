@@ -124,7 +124,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	// against each of the leaf's conjuncts below.
 	var partialPredicate Expr
 	if idx.HasPredicate {
-		resolved, err := ResolveIndexPredicate(idx.Predicate, tbl)
+		resolved, err := ResolveIndexPredicateOf(idx, tbl)
 		if err != nil || resolved == nil {
 			// Predicate resolution failed — skip this index.
 			return nil

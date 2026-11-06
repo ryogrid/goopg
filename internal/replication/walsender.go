@@ -148,7 +148,9 @@ func extractCString(buf []byte) (string, error) {
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string) (bool, error) {
+// dbBound reports a database-bound walsender (replication=database,
+// am_db_walsender); IDENTIFY_SYSTEM then names dbName.
+func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *libpq.FrameWriter, payload []byte, appName, dbName string, dbBound bool) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -157,7 +159,7 @@ func (s *Handler) HandleCommand(ctx context.Context, r *libpq.FrameReader, w *li
 	upper := strings.ToUpper(trimmed)
 	switch {
 	case upper == "IDENTIFY_SYSTEM":
-		return true, s.replyIdentifySystem(w)
+		return true, s.replyIdentifySystem(w, dbName, dbBound)
 	case strings.HasPrefix(upper, "CREATE_REPLICATION_SLOT "):
 		return true, s.replyCreateReplicationSlot(w, trimmed[len("CREATE_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
@@ -245,7 +247,12 @@ func (s *Handler) replyTimelineHistory(w *libpq.FrameWriter, args string) error 
 //	timeline  : int4   — current timeline from pg_control (M0130-S8)
 //	xlogpos   : text   — current write LSN as `X/X` hex pair
 //	dbname    : text   — empty for physical replication
-func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
+//
+// dbname is the connection's database for a database-bound walsender
+// (IdentifySystem: MyDatabaseId is valid only under replication=database)
+// and NULL for a physical one — pg_recvlogical refuses a logical connection
+// without it, and pg_receivewal / pg_basebackup refuse a physical one with it.
+func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter, dbName string, dbBound bool) error {
 	systemID := s.cfg.SystemID
 	if systemID == "" {
 		// Mirror upstream's 64-bit decimal format. The real value
@@ -268,9 +275,12 @@ func (s *Handler) replyIdentifySystem(w *libpq.FrameWriter) error {
 	}
 	row := [][]byte{
 		[]byte(systemID),
-		[]byte(formatTimeline(s.cfg.Timeline)),
+		[]byte(formatTimeline(s.currentTimeline())),
 		[]byte(formatLSN(lsn)),
-		nil, // dbname is NULL for physical replication
+		nil, // dbname: NULL unless database-bound
+	}
+	if dbBound && dbName != "" {
+		row[3] = []byte(dbName)
 	}
 	if err := w.WriteDataRow(row); err != nil {
 		return err
@@ -438,8 +448,24 @@ func (s *Handler) replyDropReplicationSlot(w *libpq.FrameWriter, args string) er
 			"DROP_REPLICATION_SLOT requires a slot name")
 	}
 	name := unquoteIdent(tokens[0])
-	if err := s.cfg.Slots.Drop(name); err != nil {
-		return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
+	// DROP_REPLICATION_SLOT name WAIT (ReplicationSlotDrop with nowait =
+	// false) waits for the slot's current owner to release it instead of
+	// failing on an active slot. A dropping subscriber stops its apply
+	// worker first, but the publisher's walsender releases the slot only
+	// once that connection has wound down. goopg bounds the wait (PG's is
+	// interruptible but unbounded): this handler has no client context to
+	// notice a vanished client.
+	wait := len(tokens) > 1 && strings.EqualFold(tokens[1], "WAIT")
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		err := s.cfg.Slots.Drop(name)
+		if err == nil {
+			break
+		}
+		if !wait || !errors.Is(err, xlog.ErrSlotInUse) || time.Now().After(deadline) {
+			return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if err := w.WriteCommandComplete("DROP_REPLICATION_SLOT"); err != nil {
 		return err
@@ -494,7 +520,7 @@ func (s *Handler) replyReadReplicationSlot(w *libpq.FrameWriter, args string) er
 		if slot.RestartLSN != 0 {
 			row[1] = []byte(formatLSN(slot.RestartLSN))
 			// Reserved slot positions are on the current timeline (M0130-S8).
-			row[2] = []byte(formatTimeline(s.cfg.Timeline))
+			row[2] = []byte(formatTimeline(s.currentTimeline()))
 		}
 	}
 	if err := w.WriteDataRow(row); err != nil {
@@ -533,23 +559,25 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 	// M0130-S8: validate and resolve timeline. Zero means "current timeline"
 	// (the default when the client omits TIMELINE). An explicit TLI must not
 	// exceed the current timeline (PG rejects a TLI in the future).
-	curTLI := s.cfg.Timeline
-	if curTLI == 0 {
-		curTLI = 1 // server not configured with a TLI — default bootstrap
-	}
+	curTLI := s.currentTimeline()
 	if args.Timeline != 0 {
 		if args.Timeline > int(curTLI) {
 			return s.writeQueryError(w, errcodes.InternalError,
 				fmt.Sprintf("requested starting point %d is ahead of the current timeline %d",
 					args.Timeline, curTLI))
 		}
-		if args.Timeline < int(curTLI) {
-			// The standby is on an older timeline. PG serves WAL from
-			// that timeline up to the switch point recorded in the
-			// history file, then EOF. goopg currently stores all
-			// pre-switch segments under TLI=1 filenames, so this
-			// works naturally when the old TLI is 1. For TLI > 1,
-			// the segment-naming migration (M0130-S8.3x) is needed.
+	}
+	// StartReplication: a TIMELINE older than the current one is historic.
+	// WAL is streamed only up to the point where this server's history
+	// switched off it (tliSwitchPoint over the current timeline's history),
+	// and the stream then ends with the next timeline and its start.
+	var hist historicTimeline
+	if args.Mode != "LOGICAL" && args.Timeline != 0 && uint32(args.Timeline) != curTLI {
+		var code errcodes.Code
+		var err error
+		hist, code, err = s.historicTimeline(uint32(args.Timeline), curTLI, args.StartLSN)
+		if err != nil {
+			return s.writeQueryError(w, code, err.Error())
 		}
 	}
 	if args.SlotName != "" {
@@ -561,6 +589,12 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
 		}
 		defer func() { _ = s.cfg.Slots.SetActive(args.SlotName, false) }()
+	}
+
+	// "If there is nothing to stream, don't even enter COPY mode": the
+	// start point is already the end of the historic timeline.
+	if hist.set && args.StartLSN >= hist.validUpto {
+		return s.endHistoricStreaming(w, hist)
 	}
 
 	// Hand the connection over to CopyBoth streaming mode.
@@ -707,14 +741,14 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			<-receiveDone
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
-				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteCommandComplete("START_STREAMING")
 				_ = w.ReadyForQuery()
 			}
 			return nil
 		case <-receiveDone:
 			if clientSentCopyDone {
 				_ = w.WriteCopyDone()
-				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteCommandComplete("START_STREAMING")
 				_ = w.ReadyForQuery()
 			}
 			return nil
@@ -723,6 +757,18 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			// (XLogSendPhysical sends SendRqstPtr, the flush position), not
 			// the chunk's end; the data's end is StartLSN+len.
 			walEnd := max(chunk.EndLSN, s.cfg.WAL.FlushedLSN())
+			if hist.set {
+				// A historic timeline's WAL ends at its switch point,
+				// and SendRqstPtr is that point.
+				walEnd = hist.validUpto
+				if chunk.StartLSN >= hist.validUpto {
+					return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
+				}
+				if chunk.EndLSN > hist.validUpto {
+					chunk.Payload = chunk.Payload[:hist.validUpto-chunk.StartLSN]
+					chunk.EndLSN = hist.validUpto
+				}
+			}
 			frame := libpq.EncodeWALData(chunk.StartLSN, walEnd, time.Now().UTC(), chunk.Payload)
 			if err := w.WriteCopyData(frame); err != nil {
 				streamCancel()
@@ -734,6 +780,9 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			}
 			if senderHandle != nil {
 				senderHandle.SetSentLSN(chunk.EndLSN)
+			}
+			if hist.set && chunk.EndLSN >= hist.validUpto {
+				return s.finishHistoricCopy(w, hist, receiveDone, &clientSentCopyDone, streamCancel)
 			}
 			// Reset the keepalive timer — fresh WAL implies the
 			// standby has just heard from us.
@@ -760,7 +809,7 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 				<-receiveDone
 				if clientSentCopyDone {
 					_ = w.WriteCopyDone()
-					_ = w.WriteCommandComplete("START_REPLICATION")
+					_ = w.WriteCommandComplete("START_STREAMING")
 					_ = w.ReadyForQuery()
 				}
 				return nil
@@ -778,6 +827,84 @@ func (s *Handler) replyStartReplication(ctx context.Context, r *libpq.FrameReade
 			return s.writeStreamingError(w, errcodes.InternalError, err.Error())
 		}
 	}
+}
+
+// historicTimeline is StartReplication's sendTimeLineIsHistoric state: the
+// requested timeline's WAL ends at validUpto, where nextTLI begins.
+type historicTimeline struct {
+	set       bool
+	validUpto uint64
+	nextTLI   uint32
+}
+
+// historicTimeline resolves a START_REPLICATION TIMELINE older than the
+// current one: tliSwitchPoint over the current timeline's history file
+// gives the end of the requested timeline and the timeline that follows it.
+// The errors are StartReplication's (55000) and tliSwitchPoint's (an
+// elog-style ERROR, XX000).
+func (s *Handler) historicTimeline(tli, curTLI uint32, startLSN uint64) (historicTimeline, errcodes.Code, error) {
+	entries, err := xlog.ReadHistory(s.cfg.WALDirPath, curTLI)
+	if err != nil {
+		return historicTimeline{}, errcodes.InternalError, err
+	}
+	for i, e := range entries {
+		if e.TLI != tli {
+			continue
+		}
+		next := curTLI
+		if i+1 < len(entries) {
+			next = entries[i+1].TLI
+		}
+		if e.SwitchLSN < startLSN {
+			return historicTimeline{}, errcodes.ObjectNotInPrerequisiteState, fmt.Errorf("requested starting point %s on timeline %d is not in this server's history: This server's history forked from timeline %d at %s.",
+				formatLSN(startLSN), tli, tli, formatLSN(e.SwitchLSN))
+		}
+		return historicTimeline{set: true, validUpto: e.SwitchLSN, nextTLI: next}, "", nil
+	}
+	return historicTimeline{}, errcodes.InternalError, fmt.Errorf("requested timeline %d is not in this server's history", tli)
+}
+
+// finishHistoricCopy ends a historic timeline's stream once its switch
+// point has been sent, as XLogSendPhysical and WalSndLoop do: CopyDone,
+// then wait for the client's CopyDone (libpqrcv_endstreaming), then the
+// next-timeline result set.
+func (s *Handler) finishHistoricCopy(w *libpq.FrameWriter, hist historicTimeline, receiveDone <-chan struct{}, clientSentCopyDone *bool, streamCancel context.CancelFunc) error {
+	if err := w.WriteCopyDone(); err != nil {
+		streamCancel()
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		streamCancel()
+		return err
+	}
+	<-receiveDone
+	streamCancel()
+	if !*clientSentCopyDone {
+		return nil // the client went away
+	}
+	return s.endHistoricStreaming(w, hist)
+}
+
+// endHistoricStreaming sends StartReplication's closing result set for a
+// historic timeline — one row of next_tli (int8) and next_tli_startpos
+// (text) — then CommandComplete START_STREAMING.
+func (s *Handler) endHistoricStreaming(w *libpq.FrameWriter, hist historicTimeline) error {
+	if err := w.WriteRowDescription([]libpq.FieldDescription{
+		{Name: "next_tli", TypeOID: oidInt8, TypeSize: 8, TypeModifier: -1, Format: 0},
+		{Name: "next_tli_startpos", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+	if err := w.WriteDataRow([][]byte{
+		[]byte(strconv.FormatUint(uint64(hist.nextTLI), 10)),
+		[]byte(formatLSN(hist.validUpto)),
+	}); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("START_STREAMING"); err != nil {
+		return err
+	}
+	return w.ReadyForQuery()
 }
 
 // handleStandbyCopyData decodes a client-side CopyData payload and
@@ -1099,6 +1226,24 @@ func parseReplicationSlotOptions(raw string, kind xlog.SlotKind) error {
 		}
 	}
 	return nil
+}
+
+// currentTimeline is the timeline the server is writing WAL on — the WAL
+// writer's, which a promotion moves (walsender.c reports
+// GetWALInsertionTimeLine), else the configured one read at startup;
+// zero reads as timeline 1. Config.Timeline alone stayed on the old
+// timeline after an in-process promotion.
+func (s *Handler) currentTimeline() uint32 {
+	tli := s.cfg.Timeline
+	if s.cfg.WAL != nil {
+		if w := s.cfg.WAL.TimelineID(); w != 0 {
+			tli = w
+		}
+	}
+	if tli == 0 {
+		tli = 1
+	}
+	return tli
 }
 
 // formatTimeline returns the TLI as a decimal string for the IDENTIFY_SYSTEM

@@ -1,0 +1,63 @@
+SET
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=100.00 loops=1)
+   ->  Sort (actual rows=100.00 loops=1)
+         Sort Key: (count(*)) DESC, item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+         Sort Method: quicksort  Memory: 59kB
+         ->  GroupAggregate (actual rows=153.00 loops=1)
+               Group Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+               ->  Sort (actual rows=153.00 loops=1)
+                     Sort Key: item.i_item_desc, warehouse.w_warehouse_name, d1.d_week_seq
+                     Sort Method: quicksort  Memory: 59kB
+                     ->  Nested Loop Left Join (actual rows=153.00 loops=1)
+                           Join Filter: (catalog_sales.cs_promo_sk = promotion.p_promo_sk)
+                           Rows Removed by Join Filter: 45747
+                           ->  Nested Loop (actual rows=153.00 loops=1)
+                                 Join Filter: (d3.d_date > (d1.d_date + 5))
+                                 Rows Removed by Join Filter: 7
+                                 ->  Nested Loop (actual rows=160.00 loops=1)
+                                       Join Filter: (catalog_sales.cs_item_sk = item.i_item_sk)
+                                       ->  Nested Loop (actual rows=160.00 loops=1)
+                                             Join Filter: (inventory.inv_warehouse_sk = warehouse.w_warehouse_sk)
+                                             Rows Removed by Join Filter: 640
+                                             ->  Nested Loop (actual rows=160.00 loops=1)
+                                                   ->  Hash Join (actual rows=15295.00 loops=1)
+                                                         Hash Cond: (d2.d_week_seq = d1.d_week_seq)
+                                                         ->  Seq Scan on date_dim d2 (actual rows=73049.00 loops=1)
+                                                         ->  Hash (actual rows=2185.00 loops=1)
+                                                               Buckets: 1024  Batches: 1  Memory Usage: 1670kB  Build Time: 163.484 ms
+                                                               ->  Nested Loop (actual rows=2185.00 loops=1)
+                                                                     ->  Nested Loop (actual rows=11896.00 loops=1)
+                                                                           ->  Hash Join (actual rows=61015.00 loops=1)
+                                                                                 Hash Cond: (catalog_sales.cs_bill_hdemo_sk = household_demographics.hd_demo_sk)
+                                                                                 ->  Seq Scan on catalog_sales (actual rows=360397.00 loops=1)
+                                                                                 ->  Hash (actual rows=1200.00 loops=1)
+                                                                                       Buckets: 2048  Batches: 1  Memory Usage: 255kB  Build Time: 1.559 ms
+                                                                                       ->  Seq Scan on household_demographics (actual rows=1200.00 loops=1)
+                                                                                             Filter: (hd_buy_potential = '1001-5000'::bpchar)
+                                                                                             Rows Removed by Filter: 6000
+                                                                           ->  Memoize (actual rows=0.19 loops=61015)
+                                                                                 Cache Key: catalog_sales.cs_sold_date_sk
+                                                                                 Cache Mode: logical
+                                                                                 Hits: 59297  Misses: 1718  Evictions: 0  Overflows: 0
+                                                                                 ->  Index Scan using date_dim_pkey on date_dim d1 (actual rows=0.20 loops=1718)
+                                                                                       Index Cond: (d_date_sk = catalog_sales.cs_sold_date_sk)
+                                                                                       Filter: (d_year = 1998)
+                                                                     ->  Index Scan using customer_demographics_pkey on customer_demographics (actual rows=0.18 loops=11896)
+                                                                           Index Cond: (cd_demo_sk = catalog_sales.cs_bill_cdemo_sk)
+                                                                           Filter: (cd_marital_status = 'S'::bpchar)
+                                                   ->  Index Scan using inventory_pkey on inventory (actual rows=0.01 loops=15295)
+                                                         Index Cond: ((inv_date_sk = d2.d_date_sk) AND (inv_item_sk = catalog_sales.cs_item_sk))
+                                                         Filter: (inv_quantity_on_hand < catalog_sales.cs_quantity)
+                                                         Rows Removed by Filter: 0
+                                             ->  Seq Scan on warehouse (actual rows=5.00 loops=1)
+                                       ->  Index Scan using item_pkey on item (actual rows=1.00 loops=160)
+                                             Index Cond: (i_item_sk = inventory.inv_item_sk)
+                                 ->  Index Scan using date_dim_pkey on date_dim d3 (actual rows=1.00 loops=160)
+                                       Index Cond: (d_date_sk = catalog_sales.cs_ship_date_sk)
+                           ->  Seq Scan on promotion (actual rows=300.00 loops=1)
+ Planning Time: 56.802 ms
+ Execution Time: 230.377 ms
+(58 rows)
+

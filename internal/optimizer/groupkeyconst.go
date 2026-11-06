@@ -35,55 +35,153 @@ import (
 //   - grouping sets and GROUPING() calls never prune (the caller's gate).
 
 // redundantConstGroupKeys returns keep[i] == false for each group expression
-// equated to a constant by a top-level WHERE conjunct, plus the input-schema
-// indices of those columns; (nil, nil) when nothing can be dropped.
+// whose pathkey is redundant, plus the input-schema indices of those
+// columns; (nil, nil) when nothing can be dropped. pathkey_is_redundant
+// (pathkeys.c) has two arms, both ported:
+//
+//   - the key's equivalence class holds a constant (M0146-0005ak) — a top-level
+//     WHERE conjunct `col = const`, now also reached transitively through a
+//     column equality (`a = b AND b = 5` pins both, as PG's EC merging does);
+//   - the key's equivalence class is ALREADY in the pathkey list (M0148-0001d):
+//     a later GROUP BY column equated to an earlier one by a top-level WHERE or
+//     inner-join ON `col = col` conjunct groups nothing new. aggregates.sql's
+//     `t1 join t2 on t1.a = t2.x and t1.b = t2.y group by t1.a, t1.b, …, t2.x,
+//     t2.y` keeps `Group Key: t1.a, t1.b` (aggregates.out:1211-1236).
+//
+// Column-equality classes are fail-closed: they are built only when no FROM
+// item joins with LEFT/RIGHT/FULL (an outer join's ON clause merges no EC in
+// PG 16+, and a WHERE equality over a nullable side would need outer-join
+// reduction first), and only between columns of the same type (a cross-type
+// equality may still be one btree family in PG; left unmerged — ledgered).
 func redundantConstGroupKeys(groupExprs []Expr, s *parser.SelectStmt, ctx *resolveContext) ([]bool, map[int]bool) {
-	if s == nil || s.Where == nil || ctx == nil || len(groupExprs) < 1 {
+	if s == nil || ctx == nil || len(groupExprs) < 1 {
 		return nil, nil
+	}
+	parent := map[int]int{}
+	find := func(x int) int {
+		for {
+			p, ok := parent[x]
+			if !ok || p == x {
+				return x
+			}
+			parent[x] = parent[p]
+			x = p
+		}
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	resolveCol := func(e parser.Expr) (*ColumnRef, bool) {
+		pc, ok := e.(*parser.ColumnRef)
+		if !ok {
+			return nil, false
+		}
+		r, err := resolveExpr(pc, ctx)
+		if err != nil {
+			return nil, false
+		}
+		cr, ok := r.(*ColumnRef)
+		if !ok || cr.Index < 0 {
+			return nil, false
+		}
+		return cr, true
 	}
 	constInput := map[int]bool{}
-	for _, c := range splitParserAnd(s.Where) {
-		b, ok := c.(*parser.BinaryOp)
-		if !ok || b.Op != parser.OpEq {
-			continue
-		}
-		var side parser.Expr
-		switch {
-		case parserPseudoConstant(b.Right):
-			side = b.Left
-		case parserPseudoConstant(b.Left):
-			side = b.Right
-		default:
-			continue
-		}
-		pc, ok := side.(*parser.ColumnRef)
-		if !ok {
-			continue
-		}
-		e, err := resolveExpr(pc, ctx)
-		if err != nil {
-			continue
-		}
-		if cr, ok := e.(*ColumnRef); ok && cr.Index >= 0 {
-			constInput[cr.Index] = true
+	mergeCols := !fromHasOuterJoin(s)
+	consider := func(conj []parser.Expr, allowConst bool) {
+		for _, c := range conj {
+			b, ok := c.(*parser.BinaryOp)
+			if !ok || b.Op != parser.OpEq {
+				continue
+			}
+			switch {
+			case allowConst && parserPseudoConstant(b.Right):
+				if cr, ok := resolveCol(b.Left); ok {
+					constInput[cr.Index] = true
+				}
+			case allowConst && parserPseudoConstant(b.Left):
+				if cr, ok := resolveCol(b.Right); ok {
+					constInput[cr.Index] = true
+				}
+			case mergeCols:
+				l, lok := resolveCol(b.Left)
+				r, rok := resolveCol(b.Right)
+				if lok && rok && l.Index != r.Index && strings.EqualFold(l.Type.Name, r.Type.Name) &&
+					l.Type.IsArray == r.Type.IsArray {
+					union(l.Index, r.Index)
+				}
+			}
 		}
 	}
-	if len(constInput) == 0 {
+	if s.Where != nil {
+		consider(splitParserAnd(s.Where), true)
+	}
+	if mergeCols {
+		for _, fe := range s.FromExprs {
+			for _, j := range fe.Joins {
+				if j.Type == parser.JoinInner && j.On != nil {
+					consider(splitParserAnd(j.On), false)
+				}
+			}
+		}
+	}
+	if len(constInput) == 0 && len(parent) == 0 {
 		return nil, nil
 	}
+	constClass := map[int]bool{}
+	for idx := range constInput {
+		constClass[find(idx)] = true
+	}
+	// seenClass maps a class to the input column that represents it among
+	// the kept keys. A repeat of that SAME column (`GROUP BY a, a`) is not
+	// pruned: it is still a group key, so it must not turn into a
+	// passthrough — the slot it shares stays as before.
+	seenClass := map[int]int{}
 	keep := make([]bool, len(groupExprs))
 	pruned := map[int]bool{}
 	for i, g := range groupExprs {
 		keep[i] = true
-		if cr, ok := g.(*ColumnRef); ok && constInput[cr.Index] {
+		cr, ok := g.(*ColumnRef)
+		if !ok {
+			continue
+		}
+		root := find(cr.Index)
+		if constClass[root] {
 			keep[i] = false
 			pruned[cr.Index] = true
+			continue
 		}
+		if rep, seen := seenClass[root]; seen {
+			if rep != cr.Index {
+				keep[i] = false
+				pruned[cr.Index] = true
+			}
+			continue
+		}
+		seenClass[root] = cr.Index
 	}
 	if len(pruned) == 0 {
 		return nil, nil
 	}
 	return keep, pruned
+}
+
+// fromHasOuterJoin reports whether any FROM item joins with LEFT, RIGHT or
+// FULL — the case redundantConstGroupKeys builds no column-equality classes
+// for.
+func fromHasOuterJoin(s *parser.SelectStmt) bool {
+	for _, fe := range s.FromExprs {
+		for _, j := range fe.Joins {
+			switch j.Type {
+			case parser.JoinLeft, parser.JoinRight, parser.JoinFull:
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parserPseudoConstant reports whether e is a literal (possibly cast), or

@@ -65,7 +65,12 @@ type Subscription struct {
 	Owner        uint32
 	Publications []string
 	Enabled      bool
-	SlotName     string
+	// SlotName is pg_subscription.subslotname: "" is NULL, i.e.
+	// slot_name = NONE (no publisher-side slot — DROP SUBSCRIPTION then
+	// skips ReplicationSlotDropAtPubNode). The subscription-name default
+	// for an unspecified slot_name is applied by the executor
+	// (DefineSubscription), not stored here.
+	SlotName string
 	// DBOid is the database this subscription's apply worker resolves
 	// local relations against — the connection's real dbOid at CREATE
 	// SUBSCRIPTION time (catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)),
@@ -297,6 +302,38 @@ func (p *PubSub) LookupPublication(name string, dbOid ...uint32) (*Publication, 
 	return &out, true
 }
 
+// SetPublicationTables replaces a publication's member tables
+// (ALTER PUBLICATION ... ADD / SET / DROP TABLE; the caller computes the new
+// list). It returns the updated publication.
+func (p *PubSub) SetPublicationTables(name string, tables []string, dbOid ...uint32) (*Publication, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return nil, fmt.Errorf("publication %q does not exist", name)
+	}
+	pub.Tables = append([]string(nil), tables...)
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	return &out, nil
+}
+
+// SetPublicationOptions replaces a publication's publish actions (ALTER
+// PUBLICATION ... SET ( ... )). AllTables is not changed. It returns the
+// updated publication.
+func (p *PubSub) SetPublicationOptions(name string, opts PublicationOptions, dbOid ...uint32) (*Publication, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[pubMapKey(resolveDBOid(dbOid), name)]
+	if !ok {
+		return nil, fmt.Errorf("publication %q does not exist", name)
+	}
+	pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete = opts.PublishInsert, opts.PublishUpdate, opts.PublishDelete
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	return &out, nil
+}
+
 // PublicationsForDBOid returns every publication belonging to dbOid in name
 // order. Each entry is a deep copy. M0119-0004 (DU-002 per-DB publication
 // scoping).
@@ -373,9 +410,9 @@ func (p *PubSub) Publications() []*Publication {
 }
 
 // CreateSubscription registers a new subscription owned by the bootstrap
-// superuser. slotName defaults to name when empty (matches upstream).
-// Callers that know the connection's currently-effective role should use
-// CreateSubscriptionAsOwner instead.
+// superuser. slotName is stored as given — "" is slot_name = NONE; see
+// CreateSubscriptionAsOwner. Callers that know the connection's
+// currently-effective role should use CreateSubscriptionAsOwner instead.
 func (p *PubSub) CreateSubscription(name, conninfo string, publications []string, slotName string, enabled bool) (*Subscription, error) {
 	return p.CreateSubscriptionAsOwner(name, conninfo, publications, slotName, enabled, 10)
 }
@@ -397,9 +434,12 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 	if _, ok := p.subscriptions[key]; ok {
 		return nil, ErrSubscriptionExists
 	}
-	if slotName == "" {
-		slotName = name
-	}
+	// slotName is stored as given: "" means slot_name = NONE (PG's NULL
+	// subslotname). The subscription-name default for an unspecified
+	// slot_name is CreateSubscription's (DefineSubscription's), which the
+	// executor applies before calling here; defaulting again at this layer
+	// made NONE indistinguishable from the default and made DROP
+	// SUBSCRIPTION chase a slot the subscription never had.
 	sub := &Subscription{
 		Name:         name,
 		OID:          p.nextOID,
@@ -432,6 +472,62 @@ func (p *PubSub) SetSubscriptionOwner(name string, owner uint32, dbOid ...uint32
 		return ErrSubscriptionNotFound
 	}
 	sub.Owner = owner
+	return nil
+}
+
+// SetSubscriptionEnabled flips a subscription's enabled flag. Returns
+// ErrSubscriptionNotFound when name is unknown. Backs ALTER SUBSCRIPTION
+// name ENABLE / DISABLE (AlterSubscription's ALTER_SUBSCRIPTION_ENABLED
+// kind). The apply launcher's reconcile stops the worker of a disabled
+// subscription and launches one for an enabled subscription on its next
+// pass (Wake makes that immediate).
+// dbOid is variadic (mirrors LookupSubscription); omitted defaults to
+// DefaultDBOid. M0119-0004.
+func (p *PubSub) SetSubscriptionEnabled(name string, enabled bool, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Enabled = enabled
+	return nil
+}
+
+// SetSubscriptionSlotName rewrites a subscription's slot name; "" is
+// slot_name = NONE (PG's NULL subslotname — the disassociation that lets a
+// subscription survive its publisher being unreachable forever, cf.
+// DropSubscriptionSlot's 08006 hint). Returns ErrSubscriptionNotFound when
+// name is unknown. Backs ALTER SUBSCRIPTION name SET (slot_name = ...).
+// dbOid is variadic (mirrors LookupSubscription).
+func (p *PubSub) SetSubscriptionSlotName(name string, slotName string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.SlotName = slotName
+	return nil
+}
+
+// SetSubscriptionPublications replaces a subscription's publication list
+// (the subpublications column). Backs ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION: the executor runs PG's
+// merge_publications list algebra (subscriptioncmds.c:2402) and hands
+// the resolved list here. Returns ErrSubscriptionNotFound when name is
+// unknown. dbOid is variadic (mirrors SetSubscriptionSlotName).
+func (p *PubSub) SetSubscriptionPublications(name string, publications []string, dbOid ...uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	sub, ok := p.subscriptions[subMapKey(oid, name)]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Publications = append([]string(nil), publications...)
 	return nil
 }
 
@@ -638,6 +734,29 @@ func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*Subscriptio
 	p.subRels[subName][relOID] = rel
 	out := *rel
 	return &out, nil
+}
+
+// DropSubscriptionRel removes one tablesync row. Mirrors upstream's
+// RemoveSubscriptionRel — AlterSubscription_refresh drops the rows
+// of tables that left the publication list (PG also TRUNCATEs those
+// tables and drops their per-table slots/origins; goopg's refresh
+// records the row removal only, the TRUNCATE half is ledgered).
+// Returns ErrSubscriptionRelNotFound when the row is absent.
+func (p *PubSub) DropSubscriptionRel(subName string, relOID uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rels, ok := p.subRels[subName]
+	if !ok {
+		return ErrSubscriptionRelNotFound
+	}
+	if _, ok := rels[relOID]; !ok {
+		return ErrSubscriptionRelNotFound
+	}
+	delete(rels, relOID)
+	if len(rels) == 0 {
+		delete(p.subRels, subName)
+	}
+	return nil
 }
 
 // AdvanceSubscriptionRel transitions one tablesync row to a new

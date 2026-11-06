@@ -169,61 +169,71 @@ func TestRangeScanExclusiveUpperBoundTwin(t *testing.T) {
 	}
 }
 
-// TestRangeScanCompositeIndexKeepsFilter verifies the reviewer finding 2 guard
-// (M0134-0001 S4): a single-conjunct strict range over a COMPOSITE index
-// (e.g. btg_y_x_w on (y, x, w)) must KEEP its `Filter:` line — only
-// single-column indexes drop it, because a composite index's trailing columns
-// can leak on an exclusive-lo blob-padded bound. Row parity still holds: y<0
-// rows returned, boundary y=0 and NULL excluded (the exclusive scan is the
-// primary guard, the retained Filter the second).
-func TestRangeScanCompositeIndexKeepsFilter(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	defer cleanup()
-
-	// x and w are NOT NULL: `y < 0` leaves them unbound, and goopg only
-	// probes a composite index past its bound prefix when those columns
-	// cannot be NULL (it stores no NULL-keyed index entries).
-	if err := runDDL(t, ctx, "CREATE TABLE btg (y int, x int NOT NULL, w int NOT NULL)"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runDDL(t, ctx, "CREATE INDEX btg_y_x_w ON btg(y, x, w)"); err != nil {
-		t.Fatal(err)
-	}
-	for _, y := range []int{-2, -1, 0, 1, 2} {
-		if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO btg VALUES (%d, %d, %d)", y, y*10, y*100)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := runDDL(t, ctx, "INSERT INTO btg VALUES (NULL, 7, 8)"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Six rows: the seq scan is the cheaper plan, as in PG, so the index
-	// shape under test is requested with seq/bitmap scans off.
-	lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT x FROM btg WHERE y < 0", indexOnlySettings())
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "Index Cond: (y < 0)") {
-		t.Errorf("expected `Index Cond: (y < 0)`; got:\n%s", joined)
-	}
-	if !strings.Contains(joined, "Filter:") {
-		t.Errorf("composite index must KEEP its Filter (trailing-column leak guard); got:\n%s", joined)
-	}
-
-	rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT y FROM btg WHERE y < 0", indexOnlySettings()))
-	if len(rows) != 2 {
-		t.Fatalf("got %d rows, want 2 (y=-2,-1; boundary y=0 and NULL excluded)", len(rows))
-	}
-	for _, r := range rows {
-		if len(r) < 1 {
-			t.Fatalf("row has no columns: %v", r)
-		}
-		if r[0].IsNull() {
-			t.Fatal("NULL row emitted")
-		}
-		v := r[0].Int
-		if v >= 0 {
-			t.Fatalf("boundary/non-negative y=%d emitted", v)
-		}
+// TestRangeScanCompositeIndexDropsFilter: a leading-column range over a
+// COMPOSITE index is an index qual that the scan fully applies, so — as in PG
+// (create_indexscan_plan's qpqual minus is_redundant_with_indexclauses) — no
+// `Filter:` repeats it (M0148-0001e1, aggregates.sql btg). The guard this
+// replaces kept the Filter for fear that an exclusive bound's padded
+// composite key could admit entries sharing the bound value; the executor
+// pads by strictness since M0134-0001 S4, and the rows below pin that for
+// every bound kind on both key formats: the tuple format and the blob format
+// (an explicit operator class keeps an index on the blob byte keys).
+func TestRangeScanCompositeIndexDropsFilter(t *testing.T) {
+	for _, tc := range []struct{ name, ddl string }{
+		{"tuple", "CREATE INDEX btg_y_x_w ON btg(y, x, w)"},
+		{"blob", "CREATE INDEX btg_y_x_w ON btg(y int4_ops, x int4_ops, w int4_ops)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, cleanup := newDDLFixture(t)
+			defer cleanup()
+			// x and w are NOT NULL: `y < 0` leaves them unbound, and goopg
+			// only probes a composite index past its bound prefix when those
+			// columns cannot be NULL.
+			if err := runDDL(t, ctx, "CREATE TABLE btg (y int, x int NOT NULL, w int NOT NULL)"); err != nil {
+				t.Fatal(err)
+			}
+			if err := runDDL(t, ctx, tc.ddl); err != nil {
+				t.Fatal(err)
+			}
+			for _, y := range []int{-2, -1, 0, 0, 1, 2} {
+				for _, x := range []int{-5, 0, 5} {
+					if err := runDDL(t, ctx, fmt.Sprintf("INSERT INTO btg VALUES (%d, %d, %d)", y, x, y*100)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := runDDL(t, ctx, "INSERT INTO btg VALUES (NULL, 7, 8)"); err != nil {
+				t.Fatal(err)
+			}
+			lines := explainLinesWithSettings(t, ctx, "EXPLAIN (COSTS OFF) SELECT x FROM btg WHERE y < 0", indexOnlySettings())
+			joined := strings.Join(lines, "\n")
+			if !strings.Contains(joined, "Index Cond: (y < 0)") || strings.Contains(joined, "Filter:") {
+				t.Errorf("want `Index Cond: (y < 0)` and no Filter (PG 18.3); got:\n%s", joined)
+			}
+			// Under VERBOSE the index column is qualified (show_scan_qual's
+			// useprefix), as aggregates.sql prints `Index Cond: (btg.y < 0)`.
+			verbose := strings.Join(explainLinesWithSettings(t, ctx, "EXPLAIN (VERBOSE, COSTS OFF) SELECT x FROM btg WHERE y < 0", indexOnlySettings()), "\n")
+			if !strings.Contains(verbose, "Index Cond: (btg.y < 0)") {
+				t.Errorf("VERBOSE: want `Index Cond: (btg.y < 0)`; got:\n%s", verbose)
+			}
+			for _, q := range []struct {
+				where string
+				want  int
+			}{
+				{"y < 0", 6}, {"y <= 0", 12}, {"y > 0", 6}, {"y >= 0", 12},
+				{"y > -2 AND y < 1", 9}, {"y >= -1 AND y <= 0", 9}, {"y > 2", 0},
+			} {
+				rows := drainPlanRows(t, ctx, planWithSettings(t, ctx, "SELECT y FROM btg WHERE "+q.where, indexOnlySettings()))
+				if len(rows) != q.want {
+					t.Errorf("%s: got %d rows, want %d", q.where, len(rows), q.want)
+				}
+				for _, r := range rows {
+					if len(r) < 1 || r[0].IsNull() {
+						t.Errorf("%s: NULL row emitted", q.where)
+					}
+				}
+			}
+		})
 	}
 }
 

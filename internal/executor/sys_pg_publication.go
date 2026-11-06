@@ -125,17 +125,23 @@ func upsertPublicationCatalogRow(ctx *Context, pub *catalog.Publication) error {
 }
 
 // writePublicationMemberRows journals one pg_publication_rel row per member
-// table (FOR TABLE publications). Called only at CREATE — goopg has no
-// durable ALTER PUBLICATION ADD/DROP TABLE. prqual/prattrs are NULL.
+// table (FOR TABLE publications). prqual/prattrs are NULL.
 func writePublicationMemberRows(ctx *Context, pub *catalog.Publication) error {
-	if !catalogHeapSyncAvailable(ctx) || pub.AllTables {
+	return writePublicationMemberRowsFor(ctx, pub, pub.Tables)
+}
+
+// writePublicationMemberRowsFor journals pg_publication_rel rows for the
+// given member tables of pub (CREATE PUBLICATION's list, or the tables an
+// ALTER PUBLICATION added).
+func writePublicationMemberRowsFor(ctx *Context, pub *catalog.Publication, tables []string) error {
+	if !catalogHeapSyncAvailable(ctx) || pub.AllTables || len(tables) == 0 {
 		return nil
 	}
 	im, ok := ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
 	}
-	for _, qname := range pub.Tables {
+	for _, qname := range tables {
 		relOID := publicationTableOID(im, ctx, qname)
 		if relOID == 0 {
 			continue
@@ -208,6 +214,37 @@ func deletePublicationCatalogRows(ctx *Context, pubOID uint32) {
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 		im.DropPublicationHeapTID(pubOID)
 	}
+	mirrorPublicationCatalogFiles(ctx)
+}
+
+// deletePublicationMemberRows stamps xmax on the pg_publication_rel rows of
+// the given member tables of publication pubOID (ALTER PUBLICATION ... DROP /
+// SET TABLE).
+func deletePublicationMemberRows(ctx *Context, pubOID uint32, tables []string) {
+	if !catalogHeapSyncAvailable(ctx) || len(tables) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	rels := map[uint32]bool{}
+	for _, q := range tables {
+		if oid := publicationTableOID(im, ctx, q); oid != 0 {
+			rels[oid] = true
+		}
+	}
+	if len(rels) == 0 {
+		return
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return
+	}
+	// pg_publication_rel: prpubid at offset 4, prrelid at offset 8.
+	stampCatalogRows(ctx, pgPublicationRelRel(), ctx.Tx.XID, func(data []byte) bool {
+		return len(data) >= 12 && binary.LittleEndian.Uint32(data[4:8]) == pubOID &&
+			rels[binary.LittleEndian.Uint32(data[8:12])]
+	})
 	mirrorPublicationCatalogFiles(ctx)
 }
 

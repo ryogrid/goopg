@@ -2185,6 +2185,8 @@ type CreateAggregateStmt struct {
 	CombineFunc     string // combine function name (for parallel aggregation)
 	InitCond        string // initial condition string (e.g. "0" or "{0,0}")
 	FinalFuncModify string // FINALFUNC_MODIFY: "read_only"/"shareable"/"read_write" (lower-cased, "" if unspecified)
+	Parallel        string // PARALLEL: "safe"/"restricted"/"unsafe" (lower-cased, "" if unspecified = unsafe)
+	SerialFunc      string // SERIALFUNC name ("" if unspecified)
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }
@@ -3012,7 +3014,10 @@ func (s *CreatePublicationStmt) stmtNode() {}
 type DropPublicationStmt struct {
 	pos      int
 	IfExists bool
-	Name     string
+	Name     string // the first of Names
+	// Names lists every publication `DROP PUBLICATION a, b` names, in
+	// order.
+	Names []string
 }
 
 func (s *DropPublicationStmt) Pos() int  { return s.pos }
@@ -3041,6 +3046,32 @@ type DropSubscriptionStmt struct {
 func (s *DropSubscriptionStmt) Pos() int  { return s.pos }
 func (s *DropSubscriptionStmt) stmtNode() {}
 
+// AlterPublicationTablesStmt — `ALTER PUBLICATION name { ADD | SET | DROP }
+// TABLE [ONLY] t [*] [, ...]` (gram.y AlterPublicationStmt with a
+// pub_obj_list of TABLE objects; publicationcmds.c AlterPublicationTables).
+// Action is "add", "set" or "drop". pg_dump writes publication membership
+// as `ALTER PUBLICATION p ADD TABLE ONLY s.t;`.
+type AlterPublicationTablesStmt struct {
+	pos    int
+	Name   string
+	Action string
+	Tables []ObjectName
+}
+
+func (s *AlterPublicationTablesStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationTablesStmt) stmtNode() {}
+
+// AlterPublicationOptionsStmt — `ALTER PUBLICATION name SET ( option = value
+// [, ...] )` (publicationcmds.c AlterPublicationOptions).
+type AlterPublicationOptionsStmt struct {
+	pos  int
+	Name string
+	With map[string]string
+}
+
+func (s *AlterPublicationOptionsStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationOptionsStmt) stmtNode() {}
+
 // AlterPublicationOwnerStmt — `ALTER PUBLICATION name OWNER TO { new_owner |
 // CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER PUBLICATION
 // form goopg models (RENAME TO / SET / ADD|DROP|SET TABLE fall through to the
@@ -3067,6 +3098,50 @@ type AlterSubscriptionOwnerStmt struct {
 
 func (s *AlterSubscriptionOwnerStmt) Pos() int  { return s.pos }
 func (s *AlterSubscriptionOwnerStmt) stmtNode() {}
+
+// AlterSubscriptionEnableStmt — `ALTER SUBSCRIPTION name ENABLE | DISABLE`
+// (AlterSubscription's ALTER_SUBSCRIPTION_ENABLED kind, subscriptioncmds.c).
+// Enabled carries true for ENABLE, false for DISABLE.
+type AlterSubscriptionEnableStmt struct {
+	pos     int
+	Name    string
+	Enabled bool
+}
+
+func (s *AlterSubscriptionEnableStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionEnableStmt) stmtNode() {}
+
+// AlterSubscriptionSetStmt — `ALTER SUBSCRIPTION name SET ( option = value
+// [, ...] )` (ALTER_SUBSCRIPTION_OPTIONS). Options is the raw WITH-style
+// key/value map; slot_name is modelled (NONE disassociates the slot), the
+// remaining supported options are accepted-not-modelled like their CREATE
+// twins, and an unsupported key is 42601 "unrecognized subscription
+// parameter".
+type AlterSubscriptionSetStmt struct {
+	pos     int
+	Name    string
+	Options map[string]string
+}
+
+func (s *AlterSubscriptionSetStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionSetStmt) stmtNode() {}
+
+// AlterSubscriptionPublicationsStmt is ALTER SUBSCRIPTION name
+// { SET | ADD | DROP } PUBLICATION name_list [WITH (...)] —
+// AlterSubscription's ALTER_SUBSCRIPTION_{SET,ADD,DROP}_PUBLICATION kinds
+// (gram.y:10873-10901, bare name_list; subscriptioncmds.c:1374-1475).
+// Action is "set", "add" or "drop"; the WITH options carry refresh and
+// copy_data (the arms' supported_opts).
+type AlterSubscriptionPublicationsStmt struct {
+	pos          int
+	Name         string
+	Action       string
+	Publications []string
+	Options      map[string]string
+}
+
+func (s *AlterSubscriptionPublicationsStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionPublicationsStmt) stmtNode() {}
 
 // CreateEventTriggerStmt — `CREATE EVENT TRIGGER name ON event
 //

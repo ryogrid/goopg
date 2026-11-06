@@ -77,17 +77,27 @@ banner at the next `## ` line).
   while they hold an ungated actionable slice or a fileable census
   record of their own; nor do S7-carve-out/below-item-10 descendants
   — run ONE replenishment pass BEFORE item 10:
-  (1) Census freshness — reuse the newest
-  `analysis/m0146/m0146-0014/routing-*/` artifact iff its ROUTING.md's
-  recorded capture sha is an ancestor of HEAD AND no commit since
-  touches `internal/optimizer`, `internal/planner`, `internal/executor`
-  or `*cost*|*stat*|*selfuncs*` paths AND no corpus reload is recorded
-  after the artifact (e.g. the 2026-10-13 SF1 stale-load reload — a
-  corpus change does not move HEAD); otherwise capture fresh
-  (`scripts/jointree-parity-capture.sh` per corpus) and re-run
-  `scripts/pg-plan-parity-diff.py --verbose`. If the captures cannot
-  run (e.g. the source server is live and the capture refuses), item
-  10 is live FOR THIS LOOP.
+  (1) Census freshness (amended 2026-10-30, owner) — run
+  `scripts/s9-census-due.sh` bare from the repository root (protected;
+  the trigger set is in its header). Its verdict is the authority for
+  this S9 pass: do not re-census because a commit "could" move plans,
+  and do not skip a `DUE`. Any first line other than `REUSE …`, or a
+  non-zero exit, counts as `DUE`. Corpus reloads and rebuilds are in
+  the script too (the owner bumps its `CORPUS_EPOCH`).
+  - `REUSE` of an `exhausted` artifact: the S9 pass ends — no note, no
+    commit, no census — and item 10 is live.
+  - `REUSE` of an artifact that filed a task: apply (2)-(4) to the
+    records of the captures named by the script's `BASE` lines.
+  - `DUE`: capture fresh (`scripts/jointree-parity-capture.sh` per
+    corpus, output under `tmp/`) and re-run
+    `scripts/pg-plan-parity-diff.py --verbose`.
+  Put all three captures in ONE directory under `tmp/`. If the
+  captures cannot run (e.g. the source server is live and the
+  capture refuses), item 10 is live FOR THIS LOOP. This rule governs
+  the S9 pass only: a task's own capture gates (AGENT.md G-table, the
+  M0147 "S9 census unchanged" gate) run as their rules say, and they
+  compare against the script's `BASE` lines, not the newest routing
+  directory.
   (2) A record is ACTIONABLE when it is non-MATCH and its census route
   is not a live (`[ ]` or `[!]`) task and not the leaf-count/lateral
   classes owned by M0145-0003/0010. For TPC-H, each non-MATCH query is
@@ -114,18 +124,47 @@ banner at the next `## ` line).
   was cleared by owner verification 2026-10-16 — see (2)). The filed task
   inherits item-3 rank under S7 (named family + plan-instrument
   rationale) — it is selected before item 10.
-  (4) Bounds — ONE filing per pass, never a batch. A pass that files
-  nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
+  (4) Bounds — ONE filing per pass, never a batch. A `DUE` census
+  that files nothing leaves a dated `exhausted at <sha>` note in M0146-0014's
   entry — the note MUST list every open `[ ]` task ranked items 0-9
   and the gate making it non-actionable, as `id(gate)` tokens using
   the closed vocabulary `channel`, `below-item-10`, `owner-<what>`,
   `blocked-on <id>` (e.g. `M0146-0178(owner-reload SF0.25)`), so an
   owner gate such as a pending corpus reload is auditable in the
-  record — and re-runs only after HEAD advances past that sha in the
-  planner-relevant paths above — otherwise item 10 is live for that
-  loop. A replenishment task that closes `Movement: none` must name
+  record (or the one-line form in (4a)) — and re-runs only when
+  `scripts/s9-census-due.sh` says `DUE`; otherwise item 10 is live for
+  that loop. A replenishment task that closes `Movement: none` must name
   why its premise/record was stale; after TWO consecutive such closes
   without a landed fix, stop filing and write the S8 escalation.
+  (4a) Recording a census (owner 2026-10-30).
+  - ROUTING.md's first line is
+    `# M0146-0014 — census at <sha> (<date>): <verdict>`. Add
+    `tree=<git write-tree>` ONLY when the capture's binary was built
+    while `git diff --quiet -- internal cmd scripts bench go.mod go.sum`
+    held (working tree equal to the index); otherwise omit it. The
+    script falls back to the capture commit. The script parses both.
+  - An unchanged census is one where
+    `scripts/s9-census-due.sh --compare <capture-dir>` exits 0 (every
+    corpus `IDENTICAL` to its `BASE`, `#` header lines excluded) AND
+    the verdict (per-corpus match counts and the CATEGORIES-EXCL-MATCH
+    line) equals the previous one. For an unchanged census, commit
+    ONLY `ROUTING.md`. It carries the trigger, capture sha, `tree=`,
+    the match table, and per corpus the `--compare` line, the engine
+    binary's sha256 and the capture's repo head (AGENT.md G3: the
+    evidence that a new binary was measured). Delete the capture,
+    diff and class files from `tmp/`; they never enter `analysis/`.
+  - A changed plan text or verdict commits the full capture, as
+    before.
+  - For an unchanged exhausted census the M0146-0014 `exhausted at`
+    note is one line naming the previous note. That line satisfies
+    (4)'s `id(gate)` list while the list is unchanged. (The
+    working_set `Skip-rationale:` still enumerates its tokens per
+    PROMPT.md.)
+  - An S9 pass is not a task: it never counts toward
+    TASKS_COMPLETED_THIS_LOOP. After any S9 pass the same loop goes on
+    with normal selection: the task the pass filed, or item 10 after
+    an exhausted pass. PROMPT.md "ONE task per loop" counts that task,
+    not the census.
   (5) Plan-parity direction (owner directive 2026-10-16) — binds all
       parity work, S9-filed or owner-seeded:
       (a) Runtime is never a rejection reason. A change that moves a
@@ -419,6 +458,19 @@ OWNER DECISIONS 2026-10-20 — TPC-DS corpora REBUILT for M0146-0216 slices 4+5:
   corpus were removed (re-run the gates).
 - M0146-0216: the owner gate is cleared; the loop re-censuses and closes it
   once its open child M0146-0236 is resolved.
+
+OWNER DECISIONS 2026-10-30 — S9 census waste:
+- Under the old S9(1) path rule ("any commit touching internal/optimizer,
+  internal/planner, internal/executor or *cost*|*stat*|*selfuncs*"),
+  replication, WAL and executor-runtime commits re-ran the full
+  three-corpus census. Since routing-20261021a every census re-captured
+  byte-identical plan text (verdict 22/22·99/99·99/99) and committed
+  ~21k lines; 2026-10-26..30, about half were skippable even by path
+  (e.g. 9ba5792cb, 046833c3b after M0122-0014 replication slices).
+- S9(1) now defers to `scripts/s9-census-due.sh` (tree-keyed reuse, a
+  plan-input trigger set, 24 h backstop; harness-protected); S9(4a)
+  commits only ROUTING.md for an unchanged census, and an S9 pass is
+  not a task — the same loop goes on to item 10.
 
 OWNER DECISIONS 2026-10-21 — M0147 lever retirement filed:
 - Plan parity is complete on all three corpora (routing-20261021p: 22/22,
@@ -723,7 +775,272 @@ heuristic stays live.)
     - Ledgered: the re\-sent overlap is trimmed, not overwritten as XLogWalRcvWrite does; no divergence detection\.
   Movement: none — replication correctness — no plan instrument \(walreceiver/walsender only\)
 
+- [x] pgbench/nightly — pgbench nightly stage failed: `pgbench: error: PQendcopy failed` \(AI\-20261030\-002852\-001; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+  - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. pgbench\.log line 59 is `extendBatch …/base/5/16409: … no space
+    left on device` during `\-i \-s 50` — the host root filesystem was full \(120 MB free\) ~00:50–01:10\. 43 GB of stale
+    TPC\-DS SF1 capture clones \(tmp/s9\[q\-x\]\-…, tmp/m24…\) were removed at ~01:12; 41 GB free since\.
+  - Stale, environmental — passes at HEAD c6a3c5c76 \(2026\-10\-30 02:20–02:31, idle host, 42 GB free\): the stage repro
+    exited 0, `pgbench PASS \(0 failed txns; tps 4420/6728/10195\)`, data dir cleaned by the stage's trap\.
+- [x] testport/stage — stage testport FAILED with no parseable cause \(AI\-20261030\-002852\-002; repro: `bash ci/batch/stages/stage\-testport\.sh` with REPO\_ROOT/RUN\_DIR set\)\.
+  - Not a reopen of the 2026\-10\-22 testport/stage task \(that was a 2 h TestPort\_IsolationSuite timeout\)\.
+  - Diagnosis 2026\-10\-30 \(filing loop\): environmental\. regress\-diffs/prepare\_raw\.txt shows `DDL catalog sync: pg\_class:
+    wal: write …/pg\_wal/…: no space left on device` in TestPort\_RegressSuite — the same full\-disk window as the
+    pgbench item\.
+  - Stale, environmental — passes at HEAD c6a3c5c76 \(2026\-10\-30 02:31–03:03\): the stage repro exited 0,
+    `testport PASS`, `ok internal/testport 1745\.954s`\.
+
+- [x] units/internal/access/transam/xlog — TestCheckpointerVolumeTrigger: `volume trigger did not fire within 2s` \(AI\-20261031\-002109\-001; repro: `go test \-timeout 10m \./internal/access/transam/xlog/`\)\.
+  - Stale, load\-induced — passes at HEAD fc635ff66 \(this loop, idle host, whole package 27\.1 s\)\. The nightly lane ran
+    the full units suite concurrently \(58\.4 s package time vs 27\.1 s idle\); the 2 s trigger window is a timing bound
+    under load, same class as AI\-20261017\-005127\-001 above\.
+- [x] testport/TestE2E\_GoopgStandbyFollowsPGTimelineSwitch — `query did not reach count >= 1 within 30s` \(AI\-20261031\-002109\-002; repro: `go test \-v \-run \'^TestE2E\_GoopgStandbyFollowsPGTimelineSwitch$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 59\.9 s\)\.
+- [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 213\.29 s \(AI\-20261031\-002109\-003; repro: `go test \-v \-run \'^TestE2E\_PGReadsThreeLevelCatalogBtree$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 279\.2 s, beside the running units suite: no code change\)\.
+- [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — `create tables 5500\.\.: context deadline exceeded` \(129\.89 s; AI\-20261101\-010139\-002; also failed in the previous run; repro: `go test \-v \-run \'^TestE2E\_PGReadsThreeLevelCatalogBtree$\' \./internal/testport/`\)
+  - REOPENED — the AI\-20261031\-002109\-003 closure noted 279\.2 s under lane load, which already exceeds the test's ~120 s create\-tables deadline: the failure is the deadline vs. DDL throughput under load, failing two nightly runs in a row\.
+  - LANDED `75bc49273` — bulk\-create loop given a 60 s load\-tolerant per\-batch deadline \(the test measures btree level structure, not DDL latency; ~20× headroom over the worst observed batch\)\; repro PASS at HEAD 175\.84 s\. Next nightly confirms\.
+- [x] race/internal/initdb — `TestStatWALIOPreallocationCounters/preallocate-on: wal_segments_preallocated_total="2" want 1, wal_init_zero_bytes_total="16384" want 8192` \(exactly doubled; AI\-20261101\-010139\-001; first seen 20261101; repro: `go test \-race \-timeout 45m \./internal/initdb/`\)
+  - Root cause: "want exactly 1" pinned a scheduling race — eagerPreallocSegment\(segNo\+1\) \(M0007 eager\-lookahead, explicitly best\-effort\) zero\-fills the NEXT segment in a background goroutine and counts it, so 2/16384 is a legitimate outcome whenever the goroutine wins; nightly lane load made it win\. Counters self\-consistent \(sync fill \+ eager fill, each counted once\)\.
+  - LANDED `75bc49273` — test pins the deterministic invariant \(on ⇒ count ≥ 1 with bytes == count × SegmentSize; off ⇒ 0/0\)\; targeted \-race run passes 5×, full initdb package green\. Next nightly confirms\.
+- [x] testport/TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL — `fill: context deadline exceeded` \(AI\-20261031\-002109\-004; repro: `go test \-v \-run \'^TestE2E\_PhysicalStandbyRestartPointRemovesOldWAL$\' \./internal/testport/`\)\.
+  - Stale, load\-induced — passes at HEAD \(this loop: 41\.0 s, same lane run as \-002/\-003\)\.
+- [x] **pgbench/nightly — `flush victim: write …/base/5/16406 blk 2681: out of range \(nblocks=0\)` on the \-S workload; S2 data\-loss escalation** \(AI\-20261031\-002109\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`; also failed in the previous run\)
+  Kind: impl
+  Parent: none
+  - Reproduced at fc635ff66 \(this loop, idle host, full \-i s=50 \+ 3\-workload sequence, 1 in 2 stage\-equivalent runs\)\.
+  - Evidence: 16406 = pgbench\_history \(pgbench\_tellers=16407, pgbench\_accounts=16409\). A watcher caught the history
+    file at **0 bytes** at the moment of the client abort; accounts intact\. Autovacuum log timeline shows the history
+    file shrinking 1134→853 pages \(W1→W2 boundary window\) and →0 bytes \(W3 initial\-vacuum window\)\.
+  - Root cause \(stack\-instrumented debug build\): the truncates of 16406 during workloads are pgbench's own
+    `truncate pgbench\_history` at every workload start \(pgbench\.c:7375\)\. Legitimate; the defect is the race:
+    `claimVictim` evicts a dirty history page from the previous workload and its CAS clears valid+dirty, so
+    `InvalidateRel`'s CAS misses the in\-flight slot; the flush then writes a block past the truncate's new end and
+    smgr rejects it \(writeBlock nblocks gate\), aborting the next client statement\. PG prevents this via
+    DropRelationBuffers \(bufmgr\.c:4533\): content lock waits the I/O, dirty page DISCARDED, never written\.
+  - Fix \(this loop\): generation‑signal port of DropRelationBuffers — InvalidateRel/InvalidateBlock gen‑bump an
+    ioInflight slot; evictVictim re‑checks the claim generation pre‑write \(skip flush, retire as clean\) and
+    post‑flush‑failure \(discard\); flushBatch \(checkpoint\) skips slots invalidated after the dirty scan\.
+    Design `docs/design/0100-0149/m-nightly-truncate-eviction-flush-race.md`; tests
+    `internal/storage/truncate_invalidate_flush_test.go` \(deterministic via OnFlushWait; mutation check reproduces
+    the nightly error with the gen check removed\)\.
+  - Gates \(this loop\): storage+vacuum go test; \-race storage; units \(precommit scope=units\); full stage\-pgbench
+    repro; tpch\-spotcheck; commit‑hook pgbench smoke\.
+  - Closed 2026\-10\-31 \(fix loop\)\. Full stage\-pgbench repro with the fix: `pgbench PASS \(0 failed txns;
+    tps 1821\.728175/2185\.078638/5386\.402103\)`, stage exit 0 \(the race aborted the \-S workload in 2 of 2
+    nightlies and 1 in 2 pre\-fix repro runs\)\. `\-race` on internal/storage clean; units gate PASS \(first
+    attempt FAILed only in internal/initdb — TestWalCommitRecordOnDisk stuck in fsync while the pgbench
+    repro ran concurrently on the same host, the known load/swap class; PASS on idle re\-run\)\;
+    tpch\-spotcheck Q12 rows=2 / Q13 rows=35 PASS; testport 3\-E2E repro PASS \(59\.9/279\.2/41\.0 s\)\.
+    Movement: none — correctness fix — no plan instrument
+
+- [x] **testport/TestPort\_PgDumpConnectionSetup — pg\_dump view bodies no longer match the pins** \(AI\-20261103\-004134\-003; repro: `go test \-v \-run '^TestPort\_PgDumpConnectionSetup$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Filed 2026\-11\-03\. Caused by M0148\-0001g \(cc0d25b7f\): pg\_get\_viewdef now prints ruleutils layout, so the pins
+    for goopg's old one\-line body \(`SELECT id, name FROM public\.foo WHERE qty > 0;`\) fail\. The new text is also
+    wrong: pg\_dump runs with `search\_path = ''`, where PG's generate\_relation\_name qualifies a relation that is not
+    visible \(`FROM public\.foo`\); the deparser prints `FROM foo` unconditionally\. The fix is in the deparser
+    \(qualify when not visible on the session search\_path\), and the pins move to PG's text\.
+  - Fixed in f3f0d0d02: relationVisibleFunc ports RelationIsVisible \(effective search\_path, pg\_catalog implicit
+    first, shadowing by an earlier schema\) and the deparser qualifies an invisible relation; non\-public relations no
+    longer fall back\. Pins moved to PG's text; pin `TestPgGetViewdefQualifiesInvisibleRelations` \(PG 18\.3 scratch
+    oracle, mutation\-checked\)\. Repro PASS; TestPort\_PgDump\* PASS; regress matview 352 → 351 diff lines, five
+    other view suites byte\-identical\. Gates on code\_tree 92942f09cc6e: units, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness fix — no plan instrument \(pg\_get\_viewdef text; regress matview \-1 diff line\)\.
+- [x] testport/TestE2E\_PGCrashStartOnGoopgTornContrecord — hosted PG logged `FATAL: the database system is not yet accepting connections` during crash recovery of the goopg directory \(AI\-20261103\-004134\-001; repro: `go test \-v \-run '^TestE2E\_PGCrashStartOnGoopgTornContrecord$' \./internal/testport/`\)\.
+  - Filed 2026\-11\-03\. Recovery itself completed \(redo done, end\-of\-recovery checkpoint, ready\); the FATAL is a
+    client connecting before consistency — check stale \(load\) first, then whether the test's readiness probe races
+    PG's startup\.
+  - Root cause: a harness race, not recovery\. pgcluster\.Start returns when the port listens, before crash recovery
+    ends; WaitReady then connected at once and PG refused it with the logged FATAL that assertNoFatalInPGLog trips on\.
+  - Fixed in 3258bb18b: WaitReady first waits, as pg\_ctl \-w does \(pg\_ctl\.c:637\), for postmaster\.pid's PM\_STATUS line to
+    read `ready` or `standby`; pin TestPostmasterDoneStartingReadsPMStatusLine\. TestE2E\_PG\* family PASS except
+    ThreeLevelCatalogBtree \(below\)\. Gates: units, spotcheck, sf025 99/99\.
+  Movement: none — test harness only — no plan instrument\.
+- [x] testport/TestE2E\_PGReadsThreeLevelCatalogBtree — FAIL after 670\.53 s \(AI\-20261103\-004134\-002; repro: `go test \-v \-run '^TestE2E\_PGReadsThreeLevelCatalogBtree$' \./internal/testport/`\)\.
+  - REOPENED: the 75bc49273 per\-batch deadline \(AI\-20261101\-010139\-002\) did not hold — 670 s is the third failure
+    in four nightlies\. The log tail is continuous `bgwriter flush pages=100`\.
+  - 2026\-11\-03: NOT stale — fails at HEAD on a lightly loaded host \(642\.89 s, `create tables 7900\.\.: context deadline
+    exceeded`\)\. Not a code regression either: a CREATE TABLE probe \(fsync off, batches of 100\) at HEAD and at 75bc49273
+    trade places run to run \(4000 tables in 67–130 s\)\. The cost per batch grows with the relation count \(quadratic
+    total\), so the 60 s per\-batch deadline is crossed near 8000 relations once the host is busy\.
+  - Profile at 5000 relations \(600 creates in 21 s\): mirrorCatalogRelToPostgresDB 40 % \(walks EVERY block of every
+    mirrored catalog per DDL, allocating an 8 KB copy per block; MarkDirtyForceFPI on the changed pages\), pwrite 37 %\.
+    The changed\-page count is not constant: rebuildSysBtreeWithNewEntry rewrites a whole multi\-level catalog index when a
+    leaf is full, and buildBulkSysBtreeLayout packs non\-rightmost leaves 100 % full, so an insert into a middle leaf
+    \(e\.g\. the `\_lvl\_…` array type in pg\_type\_typname\_nsp\_index\) rebuilds the index again\. Owned by
+    M\-NIGHTLY\-catalog\-btree\-split below\.
+  - Fixed by M\-NIGHTLY\-catalog\-btree\-split \(ddce38f80\): the test passes in 45\.5 s \(was 643 s FAIL\)\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog DDL; probe 4000 CREATE TABLE 67–130 s → 11\.2 s\)\.
+- [x] **M\-NIGHTLY\-catalog\-btree\-split — catalog indexes rebuild wholesale on a full leaf instead of splitting it;
+  bulk layout packs leaves 100 % full** \(filed 2026\-11\-03 from AI\-20261103\-004134\-002\)\.
+  Kind: impl
+  Parent: none
+  - PG: catalog index inserts go through \_bt\_doinsert → \_bt\_split \(nbtinsert\.c\), touching the split pair and the
+    parent; nbtsort builds leaves at BTREE\_DEFAULT\_FILLFACTOR 90 \(nbtsort\.c \_bt\_buildadd\)\. goopg's
+    internal/executor/sys\_catalog\_btree\_multilevel\.go rebuilds every page \(rebuildSysBtreeWithNewEntry\) and packs at
+    100 % \(buildBulkSysBtreeLayout; initdb's pgBuildBtreeBulkLoadSized twin\)\.
+  - Effect: CREATE TABLE cost grows linearly with the catalog size \(quadratic bulk DDL; ThreeLevelCatalogBtree times
+    out near 8000 relations\)\. The base/5 mirror \(mirrorCatalogRelToPostgresDB\) then copies and FPIs every rewritten
+    page, and walks every catalog block per DDL\.
+  - Resume: split the full leaf in place \(the split pair \+ parent downlink; internal/access/nbtree has a split to model
+    on\), keeping the PG on\-disk format PG reads after a basebackup; pack bulk leaves at fillfactor 90 in BOTH twins
+    \(executor and initdb\); then measure the probe in tmp/ddl\-probe\.sh and the ThreeLevel test\. Mirror only the blocks
+    a DDL dirtied as a second step\.
+  - LANDED ddce38f80: in\-place \_bt\_split / \_bt\_insert\_parent / \_bt\_newroot port with \_bt\_findsplitloc's default strategy
+    \(fillfactor 90/70 on rightmost pages\); design `docs/design/0100\-0149/m\-nightly\-catalog\-btree\-split\.md`\.
+    - Pins TestSysBtreeSplitsInPlace, TestSysBtreeAscendingSplitsLeaveFillfactorPages \(mutation\-checked\)\.
+    - Probe 4000 tables 67–130 s → 11\.2 s; ThreeLevel 643 s → 45\.5 s; TestE2E\_ 34 PASS\.
+    - Gates on code\_tree f0bbb93a1291: units, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+    - Not done \(ledger\): bulk layouts still pack leaves 100 %; the base/5 mirror still walks every catalog block\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog DDL\)\.
+- [x] **M\-NIGHTLY\-0001h\-create\-function\-sql — must\-pass regress case create\_function\_sql regressed by 73b858090 \(M0148\-0001h\)**
+  \(filed 2026\-11\-03 from the TestPort\_RegressSuite gate of ddce38f80\)\.
+  Kind: impl
+  Parent: M0148\-0001h
+  - `DROP TABLE functest3 CASCADE` no longer reports/drops `view functestv3`: the view is created under
+    `search\_path = temp\_func\_test, public` but goopg places it in public \(0001h cause 3, execCreateView ignores
+    search\_path\), and 0001h's schema\-scoped matching no longer links it to temp\_func\_test\.functest3\. The nightly at
+    b11a5eca0 \(before 0001h\) passed it; fails at HEAD 3258bb18b and at ddce38f80\. 0001h's gates did not include the
+    regress suite\.
+  - Fix: 0001h slice 2 — execCreateView resolves an unqualified non\-temp view into `currentWritableSchema\(o\.ctx\)`
+    as CREATE TABLE does \(operators\_ddl\.go ~2618\); re\-run TestPort\_RegressSuite \(create\_function\_sql must
+    pass\) and the 0001h unit pin\.
+  - Fixed in 605d654ed \(0001h slice 2\): CREATE VIEW placement by search\_path \(temp\-relation views stay bare\), DROP
+    SCHEMA CASCADE drops members before the namespace, DROP VIEW resolves through search\_path, cascade notices name
+    visible views bare\. TestPort\_RegressSuite PASS; pins TestCreateViewPlacedBySearchPath,
+    TestDropSchemaCascadeDropsItsViews \(mutation\-checked\)\. Gates on code\_tree e8ab94f5adc4: units, spotcheck, sf025
+    99/99, acceptance 24 MATCH, fire\-set fires=none, TestPort\_PgDump\*\.
+  Movement: yes — regress runner diff lines create\_function\_sql 272 → 242, create\_view 2501 → 2467, alter\_table 3718 → 3679, aggregates 251 → 247
+- [x] regress/suite\-wedge — the `inherit` case hit the 120 s per\-case timeout \(AI\-20261103\-004134\-004; repro: `go test \-v \-run 'TestPort\_RegressSuite/inherit' \./internal/testport/`\)\.
+  - Filed 2026\-11\-03\. Nightly sha b11a5eca0 \(includes the M0148\-0001g view deparser\); check whether `inherit`
+    alone wedges at HEAD before blaming load\.
+  - 2026\-11\-03 05:45 at HEAD 3b6eefe46, idle host: `pg\-regress\-runner inherit` completes \(2 m 03 s including
+    setup; 3186\-line diff, same FAIL class\), no wedge\. Nightly wedge probe at 1 m: backend 103 active on
+    `alter table p1 drop constraint f1\_pos;`, another backend waiting on LWLock WALWriteLock, while the pgbench lane
+    ran beside it\. Next: whether a WAL\-write stall under co\-load can hold that ALTER past 120 s \(read the bundle's
+    goroutines\.txt in `tmp/nightly\-src\-20261103\-004134/tmp/regress\-wedge/inherit` if it still exists\)\.
+  - Diagnosis 2026\-11\-03 \(bundle gone\): the case cost grows with the catalog — 4 s fresh, 19 s in\-suite, 66 s after
+    3000 filler tables\. Its 50 psql `\\d` commands each re\-plan catalog queries after a DDL; buildVirtualValues built
+    one constant expression per virtual\-catalog cell and every plan walker visited them \(planning 64 % of the profile\),
+    though the executor re\-materialises virtual rows at Open\. The catalog btree rebuild \(ddce38f80\) was the other half
+    \(standalone runner 123 s → 64 s\)\.
+  - Fixed in a4584b7de: virtual Values carry VirtualRowCount only \(RowCount\(\) for estimates/EXPLAIN\)\. At 3000 relations
+    `\\d\+` after DDL 1\.26 → 0\.35 s, inherit\.sql 66 → 24 s, byte\-identical output\. Design
+    `docs/design/0100\-0149/m\-nightly\-virtual\-catalog\-plan\-rows\.md`\. Gates on code\_tree d65238311abf: units, RegressSuite \+
+    PgDump \+ Isolation families, spotcheck, sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness/performance fix — no plan instrument \(catalog query planning; TPC plans unchanged\)\.
+- [x] **pgbench/nightly\-reopen\-20261103 — `flush victim: write …/base/5/16406 blk 677: out of range \(nblocks=50\)`; S2 data\-loss class** \(AI\-20261103\-004134\-005; repro: `REPO\_ROOT=$PWD RUN\_DIR=$\(mktemp \-d\) bash ci/batch/stages/stage\-pgbench\.sh`\)\.
+  Kind: impl
+  Parent: none
+  - REOPENED: same signature as AI\-20261031\-002109\-005 \(16406 = pgbench\_history, truncate vs in\-flight eviction
+    flush\), whose generation\-signal fix \(m\-nightly\-truncate\-eviction\-flush\-race\) did not hold — this time
+    nblocks=50, not 0, so a partial truncate/re\-extend window remains\.
+  - Root cause: the stale page outlived the truncate as a VALID buffer — InvalidateRel skipped a pinned slot \(a
+    transient bgwriter/checkpointer/autovacuum pin under TRUNCATE's AccessExclusiveLock\) and silently dropped a slot
+    whose state CAS lost a race; the relation was re\-extended to 50 blocks and the page's eviction flush wrote blk 677\.
+  - Fixed in 2c6643a4c: invalidateSlot retries like PG's InvalidateBuffer; InvalidateRelForTruncate waits out a pin \(10 s
+    bound\) for the heap and its indexes; every invalidation retries a lost CAS\. Pin TestTruncateWaitsOutPinnedDirtyPage
+    \(mutation reproduces the nightly signature\)\. Design follow\-up 4 in m\-nightly\-truncate\-eviction\-flush\-race\.md\.
+  - Gates on code\_tree e1f8331e90ec: storage \-race, units, full stage\-pgbench repro PASS \(0 failed txns\), spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire\-set fires=none\.
+  Movement: none — correctness fix \(S2 data\-loss class\) — no plan instrument\.
+
 ### Manually discovered (not yet in a nightly `ci/logs/action-items.md` run)
+
+- [x] **Serial user aggregates with a COMBINEFUNC / a builtin int4\_sum SFUNC returned wrong values** \(S2 wrong\-result
+  class; found 2026\-11\-03 inside M0148\-0001i\)\.
+  Kind: impl
+  Parent: M0148\-0001i
+  - `CREATE AGGREGATE mysum8\(int4\) \(SFUNC = int4\_sum\(int8, int4\), STYPE = int8, COMBINEFUNC = int8pl, …\)` returned 0
+    for a 495000 sum \(PG 18.3: 495000 serial and parallel\); a strict SQL COMBINEFUNC turned the sum NULL\.
+  - Causes: the serial finish called COMBINEFUNC\(NULL, state\) \(M0097\-0122\), and int4\_sum/int2\_sum were missing
+    from executeSFuncCall's builtin table \(silent "not found" kept INITCOND\)\.
+  - Fixed in d4a5f0b30; pins TestSerialUserAggregateWithBuiltinSFuncAndCombineFunc \(mutation\-checked both ways\),
+    TestSerialAggregateNeverCallsCombineFunc \(PG returns 6\)\.
+  Movement: none — correctness fix — no plan instrument \(user\-aggregate values\)\.
+- [ ] **An expression with a NullTest over a split aggregate fails in the Finalize** \(filed 2026\-11\-03 from M0148\-0001i\)\.
+  Kind: impl
+  Parent: none
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\.
+  - With a parallel split forced \(parallel\_workers=4, parallel\_setup\_cost=0\), `SELECT sum\(hundred\) IS NULL FROM tenk1`
+    errors `column ref hundred/6 out of Slot range 1` \(at HEAD, builtins too\); `sum\(hundred\) \+ 1` works\. PG returns `f`\.
+  - Resume: the Finalize Aggregate's output evaluation of a NullTest wrapping an AggregateCall resolves the call's
+    argument against the transport row instead of the finalized aggregate value \(compare the `\+` path\)\.
+- [ ] **executeSFuncCall: an unknown builtin SFUNC/COMBINEFUNC falls through silently** \(filed 2026\-11\-03 from M0148\-0001i\)\.
+  Kind: impl
+  Parent: none
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\.
+  - The builtin table is hand\-written; a name missing from it returns errSFuncNotFound and the aggregate keeps its
+    state \(int4\_sum returned INITCOND until d4a5f0b30\)\. PG resolves any pg\_proc function\. Resume: route builtin names
+    through the scalar builtin\-function evaluator, or reject at CREATE AGGREGATE \(42883\) a SFUNC/COMBINEFUNC that
+    cannot be executed\.
+
+- [x] **testport/TestPort\_RegressSuite — index\_including, index\_including\_gist: every psql `\\d` failed 42809** \(AI\-20261102\-000225\-003; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Bisected to `91bc8262a` \(M0122\-0015f's `op ANY \(non\-array\)` 42809 gate\): psql reads extended statistics with
+    `'d' = any\(stxkind\)` and the planner's pg\_statistic\_ext stub typed stxkind `text`, so `\\d`, `\\d\+`, `\\dS`, `\\dX`
+    all failed\.
+  - Fixed in `359e35c97`: stxkind typed `char\[\]` \(as PG and the executor's PGStatisticExtColumnsPG18\) and populated
+    with CreateStatistics' kind array \(`statisticsObjKindArray`, d/f/m/e\); pin `TestPgStatisticExtStxkindIsCharArray`;
+    both subtests PASS again\.
+  - Remaining pre\-existing psql gaps seen while checking the meta\-command battery are filed as
+    M\-NIGHTLY\-psql\-meta below \(regnamespace output, `\\du`, `\\dx`, `\\dO`; `\\db` is M0134\-0176b\)\.
+  Movement: none — correctness fix — no plan instrument \(psql meta\-commands\)\.
+- [ ] **M\-NIGHTLY\-psql\-meta — psql meta\-commands still failing or diverging on a fresh goopg cluster** \(filed
+  2026\-11\-02 while verifying AI\-20261102\-000225\-003\)\.
+  Kind: impl
+  Parent: none
+  - `\\du`: `column r.rolinherit does not exist`; `\\dx`: `column ae.default_version does not exist`
+    \(pg\_available\_extensions\); `\\dO`: `function pg\_catalog.pg\_collation\_is\_visible does not exist`; `\\db` is
+    M0134\-0176b \(pg\_tablespace\_location\)\.
+  - `\\d`/`\\dX` print `stxnamespace::regnamespace` as the oid \(`2200.sq` vs PG `public.sq`\): regnamespace output
+    is not the namespace name \(see M0134\-0168d for the input side\)\.
+  - Correctness\-only \(S7 carve\-out: queues below item 10 unless placed\)\. Resume: the catalog stubs / builtins named
+    above; witness each against a scratch PG 18\.3 with the same meta\-command\.
+- [x] **units/internal/executor — TestCopyFromZonelessTimetzTakesSessionZone hard\-codes EDT** \(filed 2026\-11\-02;
+  AI\-20261102\-000225\-001 units/internal/executor and \-002 race/internal/executor — both this test only\)\.
+  Kind: impl
+  Parent: none
+  - Test\-side date sensitivity, documented as a flake in the M0148\-0001a/b notes \(loop \#16\) with no fix filed: a
+    zone\-less `10:00:00` resolves the session zone at today's date \(DecodeTimeOnly → GetCurrentDateTime\), so after US
+    DST ended 2026\-11\-01 the correct New York offset is \-18000 and the hard\-coded \-14400 failed every units run\.
+  - Fixed in `4af9db738` \(test\-only\): the expectation is derived from the tz database for the date the test runs on\.
+  Movement: none — correctness fix — no plan instrument \(test\-only\)\.
+- [x] **min\(x\) / max\(x\) over a DESC btree index return the opposite extreme** \(filed 2026\-11\-01 by the loop inside
+  M0148\-0001c slice \(c2\); S2 wrong\-result class\)\.
+  Kind: impl
+  Parent: none
+  - Repro: `create table dt\(x int\); create index on dt\(x desc\); insert into dt select generate\_series\(1,100\);
+    select max\(x\) from dt` returned 1 \(and `min\(x\)` 100\)\. The min/max InitPlan rewrite set the Index Only Scan's
+    `Backward = isMax` without consulting the index column's `ColDescending`; PG's build\_index\_pathkeys reads a DESC
+    column backward for ASC\.
+  - Fixed in `c4b80c6d6` \(`minmaxScanBackward`: `Backward = isMax != desc`, in the single\-column, composite\-prefix
+    and appendrel builders\); pin `TestMinMaxOverDescIndexDirection` \(mutation\-checked\)\. Fixed in the same commit
+    because slice \(c2\)'s `minmaxtest2i \(f1 desc\)` member needs exactly this rule\.
+  - Movement: none — correctness fix — no plan instrument \(no TPC\-H/TPC\-DS index is DESC\)\.
+- [x] **sf025 sweep server log grows without bound — 159 GB, disk at 97%** \(filed 2026\-10\-30 by the loop inside
+  M0122\-0014\)\.
+  Kind: impl
+  Parent: none
+  - `scripts/tpcds\-sf025\-regression\.sh` appends every server start and the plan channel's planner DP trace \(about
+    138 MB per sweep\) to `bench/tpcds/runtime\_goopg/goopg\.sf025\.log`, and nothing rotates it\. At 159 GB, the plan
+    channel's `wc \-l` took about 50 minutes, so two sweeps ran past the 60\-minute foreground limit before writing a
+    stamp\. The file is also a large share of the disk headroom; the disk was at 97% with 30 GB free\.
+  - Workaround landed \(`1a7fddb3d`\): `SF025\_LOG` is overridable \(`SF025\_LOG=tmp/<file> scripts/tpcds\-sf025\-regression\.sh
+    sweep`\)\.
+  - Owner decision needed: rotate or retire the 159 GB file, which the loop left untouched; per\-run log files; or
+    replace the `wc \-l` line count with a byte offset \(`stat \-c %s`\) so log size stops mattering\.
+  - Closed 2026\-10\-30 \(owner directed all three options\)\. The 159 GB file retired: manifest \+ head/tail 1 MiB
+    samples \+ SHA\-256s in `tmp/retired\_20261030/`; disk 97% → 82% \(31 GB → 179 GB free\)\. Per\-run sweep
+    logs: `scripts/tpcds\-sf025\-regression\.sh` now defaults `SF025\_LOG` to a per\-invocation
+    `goopg\.sf025\-<ts>\.log` in the runtime dir \(caller `SF025\_LOG=` still wins\), pruned to the 10 newest\.
+    `bench/tpcds/server\.sh start sf025` rotates the shared default through \.1\.\.\.5 \(the remaining
+    persistent writer\)\. Plan channel: `wc \-l` replaced by a `stat \-c %s` byte offset \+ `tail \-c`,
+    so extraction cost is O\(appended\) and log size stops mattering\.
 
 - [x] **P0\-E8 — concurrent sessions intermittently fail to resolve a CTE name: `relation "x" does not exist`**
   \(filed 2026\-10\-19 by the owner session; placed at banner item 0\)\.
@@ -929,6 +1246,342 @@ heuristic stays live.)
     through projectOp, slice 92's coopBorrowScan already refuses computed targets\)\.
   - Expected instrument: the repro identical to `analysis/p0e12/expected\.out`, serial and parallel; a regression
     test with a substr group key over a multi\-page text scan; TPC\-H/TPC\-DS values unchanged\.
+
+- [ ] **P0\-E16 — a row comparison against a multi\-column subquery errors instead of comparing**
+  \(filed 2026\-10\-29 by the loop, M0122\-0021 residual 2 probe; S2 — a valid query fails where PG returns rows\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-10\-29 \(S2\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop continues with the
+    > banner\. First filed as M0122\-0022, then withdrawn because the M0122 filing pause predates it\.
+  - Repro on any table: `SELECT k FROM mo WHERE \(k, pad\*100\) = \(SELECT id, v FROM mi WHERE mi\.id = 1\)` →
+    `ERROR: scalar subquery returned 2 columns, expected 1` \(42601\)\. The correlated form fails the same way\.
+    `ROW\(k, pad\) = \(SELECT id, v … WHERE mi\.id = mo\.k\)` fails with `SubPlan parameter $0 read before assignment`\.
+  - PG 18\.3 runs all three\. It plans a ROWCOMPARE\_SUBLINK \(parse\_expr\.c transformSubLink\) as
+    `\(\(k = \(SubPlan 1\)\.col1\) AND \(pad = \(SubPlan 1\)\.col2\)\)`, an InitPlan when uncorrelated \(subselect\.c
+    make\_subplan\)\.
+  - First step: find where the parenthesised row on the left reaches the scalar\-subquery path \(the
+    `scalar subquery returned` site, internal/executor/expr\.go evalSubquery\) and route it to
+    evalRowFuncCallVsSubqueryExpr; then fix the `ROW\(\)` form's parameter binding\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument \(PG's rows for the three repros\)\.
+
+- [x] **P0\-E17 — recovery\.signal promotion wrote over WAL restored from the archive**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013, whose ledgered residual it was; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: post\-promotion record at 0x3000029 inside replayed
+  WAL ending 0x4001060 → after the fix it starts at EndOfLog on the new timeline\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`02bf60de2`\)\.**
+    > The defect was M0122\-0013's ledgered residual \(2026\-10\-21 row item 1\) and its fix was the slice in progress,
+    > so it landed under that task; filed here so the S2 record is complete\.
+  - Symptom: after archive recovery \(`recovery\.signal` \+ `restore\_command`\) the running WAL writer stayed at its
+    pre\-archive end on the old timeline; the first post\-promotion record overwrote restored WAL whose changes replay
+    had already applied — a crash then leaves pages ahead of their WAL; the history file named a TLI the WAL lacked\.
+  - Fix: `adoptRestoredWAL` \(restored bytes through `Writer\.AppendRaw`\) \+ `switchWriterToNewTimeline` \(shared with
+    the streaming promotion\): new timeline at EndOfLog, XLOG\_END\_OF\_RECOVERY first \(PG StartupXLOG\)\.
+  - Pin: `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(fails with the adoption removed\)\.
+
+- [x] **P0\-E18 — archive recovery stopped at a timeline switch and dropped the later timeline's WAL**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013, whose ledgered residual it was; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(mutation run: recovery ended on TLI 1 exactly at the switch;
+  fixed: ends on TLI 2 past it, promotes to TLI 3\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`173eca961`\)\.**
+    > It was M0122\-0013's ledgered residual \("archive fetch hardcodes TLI 1"\) and its fix was the slice in progress\.
+  - Symptom: restoring a base backup of a server that had been promoted, `RunArchiveRecovery` fetched timeline\-1
+    names only, stopped at the switch and promoted — every transaction committed on the later timeline was lost\.
+  - Fix: PG's recovery\_target\_timeline = 'latest' — findNewestTimeLine, readTimeLineHistory, XLogFileReadAnyTLI
+    \(xlogrecovery\.c\); the writer crosses each switch; new TLI = newest \+ 1\.
+  - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory`, `TestPromoteAfterRecoveryFollowsTimelines` \(both fail with
+    the history ignored\)\.
+- [x] **P0\-E19 — a second goopg start on a live server's data directory ran recovery against it**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — corrupts a shared resource\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: the second start on another port ran crash
+  recovery, checkpointed into the live WAL, overwrote and then deleted the owner's postmaster\.pid; fixed: FATAL
+  "lock file "postmaster\.pid" already exists" before Open\)
+  - > **ESCALATION 2026\-10\-29 \(S2, shared\-resource corruption\) — RECORDED FOR THE OWNER; already fixed in\-task
+    > \(`ca0bde402`\)\.** Found while scoping M0122\-0013's restore\_command\-SIGHUP residual: a reload during
+    > recovery needs the pid file to exist then, and the lock it requires is this fix\.
+  - Symptom: goopg wrote postmaster\.pid only when the listener bound and never checked it at start\.
+  - Fix: PG's CreateDataDirLockFile \(miscinit\.c CreateLockFile\) before initdb\.Open — O\_EXCL, live owner refuses
+    with PG's errmsg/errhint, stale \(dead/own/parent/PG\_GRANDPARENT\_PID\) replaced; unlinked on exit while ours\.
+  - Pins: `TestCreateDataDirLockFile`, `TestStartRefusesLiveDataDirLock` \(fails with the lock skipped\)\.
+- [x] **P0\-E20 — a mistyped or signalled restore\_command ended archive recovery and promoted**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: restore\_command 'goopgcpx %f %p' — before: promoted
+  to TLI 2 at the local WAL end; fixed: FATAL "could not restore file … from archive: command not found",
+  recovery\.signal kept, no promotion\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`7d2f398fa`\)\.**
+    > Found while porting M0122\-0013's shutdown\-during\-recovery residual: the same RestoreArchivedFile
+    > classification decides both\.
+  - Symptom: every restore\_command failure read as the end of the archive, so a command\-not\-found \(exit 127\) or a
+    signalled child promoted and abandoned the rest of the archive\.
+  - Fix: RestoreArchivedFile's wait\_result\_is\_signal\(SIGTERM\) → shutdown and wait\_result\_is\_any\_signal → FATAL
+    \(xlogarchive\.c\); archive recovery returns the error instead of ending\.
+  - Pins: `TestRestoreArchivedFileFailureClassification`, `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`
+    \(both fail with the classification off\)\.
+- [x] **P0\-E21 — archive recovery read a base backup's partial local segment and skipped the rest of it**
+  \(found and fixed 2026\-10\-29 by the loop inside M0122\-0013; S2 — data loss\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(probe: local segment 0 cut at the backup end A0, archive
+  copy holding record B to 118 — before: EndOfLog A0, B never replayed; fixed: the archived copy is restored and
+  replayed\)
+  - > **ESCALATION 2026\-10\-29 \(S2, data loss\) — RECORDED FOR THE OWNER; already fixed in\-task \(`58b4511c2`\)\.**
+    > It was M0122\-0013's ledgered residual "pg\_wal read before the archive"; the probe showed it loses data\.
+  - Symptom: the local copy won, so recovery replayed the tail segment only to the backup end, then later segments
+    past the gap, and promoted on a history with a hole; Open also wrote a checkpoint record at the local end\.
+  - Fix: XLogFileReadAnyTLI's archive\-first order, RECOVERYXLOG \+ wrong\-size check \+ KeepFileRestoredFromArchive,
+    recovery\.signal treated as archive recovery in Open \(no WAL written before it ends\)\.
+  - Pins: `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment`, `TestRestoreArchivedFileThroughRecoveryXLog`\.
+- [x] **P0\-E22 — archive recovery accepted a checkpoint past the target timeline's fork point**
+  \(found and fixed 2026\-10\-30 by the loop inside M0122\-0013; S2 — data corruption\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  Movement: none — correctness fix — no plan instrument \(test: checkpoint 0/6000 on TLI 1, target TLI 2 forked at
+  0/5000 — before: accepted; fixed: FATAL "requested timeline 2 is not a child of this server's history" \+ DETAIL\)
+  - > **ESCALATION 2026\-10\-30 \(S2, data corruption\) — RECORDED FOR THE OWNER; already fixed in\-task \(`c9720ce9b`\)\.**
+    > Found while porting the "not a child" errdetail residual: goopg checked only that the start timeline appears in
+    > the target's history, not that the checkpoint precedes the fork\.
+  - Symptom: the target timeline's WAL replayed over data that already held the abandoned timeline's changes past the
+    fork point\.
+  - Fix: InitWalRecovery's tliSwitchPoint and tliOfPointInHistory checks \(xlogrecovery\.c\)\.
+  - Pin: `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork` \(fails with the fork check removed\)\.
+- [!] **P0\-E23 — a goopg standby loses replayed rows when it restarts after replaying its primary's shutdown checkpoint**
+  \(found 2026\-10\-30 by the loop inside M0122\-0013; S2 — data loss on the standby; NOT fixed\)\.
+  Kind: impl
+  Parent: M0122\-0013
+  - > **ESCALATION 2026\-10\-30 \(S2, data loss\) — OWNER PLACEMENT NEEDED\.** Pre\-existing; unrelated to the
+    > timeline work that found it\. Held `[!]` with its root: M0122\-0013 is held under S4 \(see its escalation\),
+    > and an S2 waits for the owner's placement anyway\.
+  - Repro \(deterministic, 8 s\):
+    - PG 18\.3 primary A, goopg standby C made with pg\_basebackup\.
+    - INSERT row 1 \(in the backup\) and row 2 \(replayed by C\); C shows both\.
+    - Stop A \(fast; C receives A's shutdown checkpoint\), stop C \(fast\), start A, start C\.
+    - INSERT row 3: C shows rows 1 and 3, not row 2\.
+    - Without stopping A first \(no shutdown checkpoint replayed\), all three rows survive\.
+    - Probe source: `tmp/p0\-e23\-repro/zz\_probe\_standby\_restart\_test\.go\.txt` \(run it with
+      `ZZ\_STOP\_A\_FIRST=1`\); log `tmp/p0\-e23\-repro/run\.log`\.
+  - Observed: after the restart, replay starts at the end of the received WAL \(`standby mode: starting continuous WAL
+    replay start\_lsn=` = written\_lsn \+ 1\)\. Row 2's change is not re\-replayed, and it is not visible from disk\.
+  - Not yet ruled out: runRecoveryFlush flushes buffers and CLOG before adopting a restartpoint, so a plain flush gap is
+    unlikely\. Next suspects:
+    - what sets the continuous\-replay start on restart \(pg\_control redo vs the received end\);
+    - whether the shutdown checkpoint's replay changes xid/clog state, so that row 2's xmin reads as not committed\.
+
+- [ ] **P0\-E24 — a partitioned table disappears after a server restart; its partitions survive as plain tables**
+  \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — a table and its routing are lost\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-04 \(S2, data loss\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing \(reproduced on a HEAD build, `406e379a4`\)\.
+  - Repro on a fresh cluster: `create table q (k int, v int) partition by range (k); create table q1 partition of
+    q for values from (0) to (10); insert into q values (1,2);` → restart → `select * from q` fails 42P01
+    `relation "q" does not exist`; `q1` still returns the row and `pg_class` shows only `q1` \(relkind `r`\)\.
+  - Cause \(read, not yet fixed\): internal/initdb/open.go loadUserTablesFromHeapForDB admits relkinds
+    `r m v S f` only — a partitioned parent \(relkind `p`\) is never re\-registered, and the partition's parent
+    link / bound \(pg\_inherits, relpartbound, pg\_partitioned\_table\) has nothing to attach to\.
+  - First step: admit relkind `p` in the reload and restore PartitionMethod / PartitionKey from
+    pg\_partitioned\_table, the partition bound from relpartbound and the parent link from pg\_inherits; prove with
+    a two\-restart test \(memory: JSON catalog cache retired — test with TWO restarts\)\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro returns PG's rows after
+    two restarts\)\.
+
+- [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
+  \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-04 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing\.
+  - Repro on a fresh cluster: `create type m as enum ('b','a'); create table em (v m); insert into em values
+    ('b'),('a');` → restart → `select v from em order by v` returns `a, b` \(PG: `b, a`, enum sort order\);
+    `insert into em values ('zzz')` succeeds \(PG: 22P02 invalid input value for enum m\);
+    `select pg_typeof(v) from em` is `text`\. `\\d em` still prints `m` because psql reads the pg\_attribute heap\.
+  - Cause \(read, not yet fixed\): loadUserTablesFromHeapForDB builds each column's Type with
+    `catalog.OIDToTypeName(atttypid)`, whose default arm returns `"text"` for any OID it does not know — every
+    user enum, composite, domain and range type\. A later catalog re\-sync of the table would then write
+    atttypid = text into the heap as well\.
+  - Also: DROP TYPE / DROP DOMAIN \(M0148\-0001j2\) cannot see such columns after a restart\.
+  - First step: resolve user type OIDs in the reload \(enum / composite / domain / range lookups by OID, after
+    those registries reload\) to their names, setting DeclaredTypeName \+ the base Type for a domain column as
+    CREATE TABLE does; prove with a two\-restart test per type kind\.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro matches PG after two
+    restarts\)\.
+
+- [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+  Kind: impl
+  Parent: none
+  - Stack\-instrumented pgbench \-i: the `drop table if exists pgbench\_accounts, pgbench\_branches, pgbench\_history,
+    pgbench\_tellers cascade` statement executes via `ddlOp.Next → execTruncate → truncateTableAndPartitions →
+    Manager.TruncateRelation` four times \(relfilenodes synthesized 16406/16407/16409/16411\)\. `TruncateRelation` opens
+    with O\_CREATE, so four 0\-byte files exist before `create tables`, and the created tables reuse exactly those
+    oids\. The name resolution of missing tables synthesizes the next oids and consumes them from the allocator\.
+  - Not data\-losing \(later CREATE/inserts land correctly; the nightly failures trace to the separate eviction\-flush
+    race, fixed same day\) — filing to record the routing\+side\-effect, not worked this loop\.
+  - CLOSED 2026\-10\-31 loop \#2: the filed routing **verified NOT reproducing at HEAD** \(executor fixture \+ fresh\-cluster
+    server probe: DROP IF EXISTS takes the NOTICE arm, consumes no OID, creates no file; 42P01 without IF EXISTS\)\.
+    Two real 0\-byte\-file mechanisms from the same diagnosis DID reproduce and landed:
+    - `Manager.TruncateRelation`/`TruncateRelationTo` opened `O_RDWR|O_CREATE` \+ `MkdirAll` — truncate of a
+      storage\-less relation materialised a 0\-byte file\. Now via `relFileForTruncate`: no `O_CREATE`, no
+      `MkdirAll`, missing file → no\-op, per `postgres/src/backend/storage/smgr/md.c:1291` \(mdtruncate walks
+      already\-open segments\)\.
+    - `truncateTableAndPartitions` ran parent\-level storage work on partitioned parents \(goopg parents have a
+      synthesized relfilenode\)\. Now skipped after the child recursion when `PartitionKey != nil`, per
+      `tablecmds.c:2148\-2150` "Skip partitioned tables as there is nothing to do"\.
+    - Tests: `internal/storage/smgr_truncate_nocreate_test\.go`, `internal/executor/drop_truncate_nostorage_test\.go`,
+      `internal/testport/drop_if_exists_no_storage_test\.go`\. Design doc: `docs/design/0100\-0149/m\-nightly\-truncate\-
+      eviction\-flush\-race\.md` "Follow\-up: 0\-byte relfilenode files" \+ README row\.
+    - Residuals to ledger \(2026\-10\-31\): partitioned\-parent relfilenode=0/no\-file at CREATE; VACUUM FULL/CLUSTER
+      sibling truncate sites \(operators_ddl\.go ~21373, ~27745\-27763, ~28067\)\; read\-path `relFile` O\_CREATE policy;
+      TRUNCATE ONLY partitioned SQLSTATE divergence \(goopg 0A000 vs PG 42809\)\.
+- [x] **autovacuum ANALYZE reports relpages far above the relation's block count** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
+  Kind: recon
+  Parent: none
+  - pgbench server logs \(nightly \+ local repro\): `analyze done table=.pgbench\_branches rows=50 pages=132` \(and
+    pages=205 at 01:56:16\) for a 1\-block file; `.pgbench\_tellers rows=500 pages=39` for a 3\-block file;
+    `.pgbench\_history rows=16093 pages=104` tracks nblocks closely, so the inflation is per\-table\.
+  - Consequence: inflated relpages flow into pg\_class/cost model \(M0146\-0009 statistics territory — interleaveable
+    when a first\-divergence is stats\-driven\)\. Not worked this loop; repro \(nightly stage\) was mid\-triage\.
+  - CLOSED 2026\-10\-31 loop \#3 \(recon\): **no relpages inflation defect reproduces**\. Instrumented pgbench\-trio
+    repros \(s=1 60s×3 and s=50 120s×3, launcher ticks live\) printed nBlocks / manager\-cached nblocks /
+    on\-disk file blocks at every ANALYZE: the three agreed at every sample \(99/99/99, 110/110/110,
+    1800/1800/1800, 4003/4003/4003 …\) — the analyzer's pages is the true block count AT SAMPLE TIME; a
+    mid\-workload `pages=132` reflects real dead\-tuple bloat, as PG's relpages would\.
+    - The "for a 1\-block file" half is an observation\-time artifact: pgbench's own lifecycle rebuilds the
+      tables after those log lines — `-i` \(drop\+create\+COPY\+vacuum analyze\) and `-S` init
+      `TRUNCATE pgbench_history` \(instrumented: `RECON-TRUNC-ZERO rel=16406 cachedBefore=4003` at
+      \-S init\) — and pgbench's init `VACUUM ANALYZE` re\-persists fresh stats\. The diagnosing loop
+      compared mid\-workload log lines against the later fresh/empty file state\.
+    - The launcher's `vacuum done pages=` field counts VISITED pages, not nBlocks \(VM\-skipped
+      all\-visible pages are not counted: visits=25 vs scanned=110, visits=1049 vs scanned=4003\) —
+      a log\-field naming artifact that made nightly numbers look inconsistent with the analyze lines\.
+    - TRUNCATE zeroes the stats \(operators\_ddl\.go:17179 `tbl.Stats = nil` \+ pgstat trigger reset\):
+      sampler confirmed `t=0 p=0 f=0` after the \-S init truncate — pg\_class/cost model never keep
+      inflated values past a TRUNCATE\. PG parity per trunc\.c:282\-285 \(vac\_update\_relstats\(0,0\)\)\.
+    - Files the findings below stay in fix\_plan; repro rigs: `tmp/mnightly\-\{relpages,trio,trunc,copy\}\-rig\.sh`
+      \(tmp, uncommitted\)\.
+  - Movement: none — plan instruments blind \(recon closed as not\-a\-defect; no code staged\)\.
+- [x] **COPY skips the pgstat row counters — n\_tup\_ins / n\_live\_tup undercount COPY loads, and autovacuum triggers miss COPY\-loaded data** \(filed 2026\-10\-31 by the relpages recon loop\)
+  Kind: impl
+  Parent: none
+  - Probe \(goopg vs PG 18\.3 temp cluster, 5000\-row `\copy` into an empty table\): goopg `n\_tup\_ins=0 n\_live\_tup=0`;
+    PG `n\_tup\_ins=5000 n\_live\_tup=5000`\.
+  - Consequence: pgbench \-i \(COPY\-loaded\) tables carry ins=0 → the insert\-growth autoanalyze/vacuum triggers
+    \(needsVacuum ins arm, anlThresh via mod\) never fire for COPY\-only changes; accounts sat un\-analyzed until
+    W1 updates fed the mod counter \(14:27:20 analyze accounts in the s=50 rig\)\.
+  - Resume: the COPY executor emit site \(internal/executor COPY path\) must call recordRelInsert\(ctx, oid, n\)
+    with the loaded row count per PG's copy\.c pgstat\_report\_copy \(pgstat count per batch\); keep the
+    abort\-staged semantics of recordRelInsert\.
+  - CLOSED 2026\-10\-31 loop \#4: COPY FROM now feeds the counters at the two heap\-write arms of
+    `storeCopyRow`, mirroring PG's counting inside the heap routines \(not copy\.c itself — PG 18 counts in
+    `heap_insert`/`heap\_multi\_insert`, heapam\.c:2251/2702\):
+    - `flushBatch` \(CIM\_MULTI, CopyMultiInsertBufferFlush twin\) emits `recordRelInsert\(ctx, tableOIDFromCatalog\(plan.Table\), len\(batch\)\)`
+      once per batch after placement — per\-tuple buffered rows land the batch count at flush, exactly as PG's
+      buffered tuples count at buffer flush; mid\-stream error leaves the unflushed tail uncounted \(PG parity\)\.
+    - the CIM\_SINGLE arm \(forced by BEFORE ROW triggers\) emits one tuple per stored row\.
+    - trigger\-suppressed rows \(BEFORE trigger RETURN NULL\) are not stored, not counted — asserted in the unit test\.
+    - second gap found on the way \(hard\-won rule 2, sibling wiring\): the hand\-built COPY `ectx` in
+      `postmaster/copy\.go` never set `AdvisorySessionIdentity`, so COPY counters folded into the id\-0 bucket
+      and the session's own `pg\_stat\_force\_next\_flush\(\)`/`pg\_stat\_get\_\*` getters could not reach them on a
+      live server\. Wired to `sess` \(same \*misc\.SessionRegistry dispatch wires every other statement;
+      same class as the M0119\-0006 GetSetting wiring\)\.
+  - Tests: `internal/executor/copy\_pgstat\_test\.go` \(multi/single/suppressed arms: TriggerSnapshot ins+mod
+    deltas, shared\-tier tuplesInserted/deltaLive/changedTuples/insSinceVacuum deltas, commit/abort tier math
+    twin\)\; `internal/testport/copy\_pgstat\_server\_test\.go` \(wire\-protocol CopyIn via lib/pq driver\.Stmt
+    path, one session: `pg\_stat\_get\_tuples\_inserted`/`live\_tuples`/`ins\_since\_vacuum`/`mod\_since\_analyze`
+    all read 5000 after `pg\_stat\_force\_next\_flush\(\)` — the filed probe's pair at the getter layer PG's view
+    itself is built on \(system\_views\.sql\)\)\. `testutil/cluster`: `DSN\(\)` accessor added for
+    single\-session tests\.
+  - Residuals to ledger \(2026\-10\-31\): the `pg\_stat\_\*\_tables` VIEW cells `n\_tup\_ins`/`n\_live\_tup` stay
+    honest\-0/reltuples renderers for every DML class \(M0122\-0003 design\)\; no statement\-end stats flush
+    \(pending reaches shared only via explicit `pg\_stat\_force\_next\_flush\(\)`\)\; COPY into a partitioned parent
+    counts the parent OID \(goopg writes parent storage; PG counts per partition\)\.
+  - Movement: none — plan instruments blind \(pgstat accounting; spotcheck Q12/Q13 canonical, acceptance arm
+    MATCH set, sf025 sweep same — see Gates\)\.
+- [x] **pgbench\_branches reltuples renders 1 \(10\-row table\) — analyzer and vacuum see 1 visible of 10 live rows on an idle pgbench table** \(filed 2026\-10\-31 by the relpages recon loop; CLOSED not\-a\-defect 2026\-10\-31 loop #5\)
+  Kind: recon
+  Parent: none
+  - s=1 trio rig: pgbench\_branches \(10 rows, 69 blocks after W1\) — launcher analyze logs `rows=1` at
+    15:04:01 and 15:05:06 \(W1 finished ≥60s prior, all clients exited\), and pgbench's \-S init SQL ANALYZE
+    persists reltuples=1 at 15:09:5x \(sampler `branches t=1` through the idle window\) while
+    `pg\_stat…seq\_scan` renders keep the file at 69 blocks\.
+  - Vacuum's live count matches \(15:04:01 pass live=1, dead=0 — the 9 latest versions are invisible AND not
+    counted dead, so nothing is pruned — no data loss, stats undercount\)\.
+  - Hypotheses to test: pgbench \-i's `ALTER TABLE … ADD PRIMARY KEY` rewrite \+ W1 HOT updates leave
+    committed versions invisible long after commit \(clog/commit\-ts visibility lag? snapshot minting in the
+    launcher tx? cmd‑id/cmin stamping in COPY\-then\-rewrite tables?\)\. Repro rig: `tmp/mnightly-trio-rig.sh`
+    \(SCALE=1\) \+ `tmp/mnightly-copy-probe.sh` pieces: reproduce at pure\-SQL level \(COPY 10 rows → UPDATE
+    9 rows → ANALYZE; check reltuples\) — likely a `COPY committed rows invisible to later snapshots` family;
+    the COPY probe above showed n\_live\_tup=0, consistent with COPY\-committed tuples judged invisible\.
+  - Resolution \(loop #5, rig `tmp/mnightly-reltuples-rig.sh`, goopg 5617 vs PG 18\.3 temp cluster 5618\):
+    - **The "10\-row table" premise is false\.`pgbench -i -s 1` creates pgbench\_branches with exactly 1 row**
+      \(pgbench scale semantics: branches = scale, tellers = 10×scale, accounts = 100000×scale\)\.
+      `SELECT count(*) FROM pgbench_branches` = 1 on goopg immediately after \-i; the PG 18\.3 oracle
+      \(stock initdb \+ stock pgbench \-i \-s 1\) renders branches=1, tellers=10, history=0,
+      reltuples=1 after ANALYZE — byte\-for\-byte the same numbers goopg produced\.
+    - So launcher `analyze rows=1`, `reltuples=1`, and vacuum `live=1, dead=0` are all HONEST for a
+      1\-row table; `dead=0` after 14k\-transaction W1 is consistent with HOT\-chain pruning at insert
+      \(heap\_prune keeps the latest version of each HOT chain\)\.
+    - Bisection ladder \(pure SQL, both engines\): INSERT\+ANALYZE / UPDATE 9 / COPY 10 / COPY\+UPDATE 9 /
+      COPY\+ALTER ADD PRIMARY KEY \(\+UPDATE\) — count\(\*\) and reltuples agree 10/10 at every step,
+      goopg == PG 18\.3\)\. No COPY/rewrite/update visibility defect exists at SQL level\.
+    - The trio\-rig "10 rows, 69 blocks" line was run conflation: the s=10 rig sampler shows
+      `branches t=10` \(correct\), the 15:04/15:05 `rows=1` logs came from the s=1 run \(1 row — correct\);
+      the filed entry merged the two runs\. The probe sampler `branches t=1 p=4` was a default\-SCALE=1
+      probe \(1 row, \~4 pages — correct\)\.
+    - Legacy probe n\_live\_tup=0 on COPY: explained by the loop #4 counters bug \(fixed, `9d0db8766`\)\.
+    - Rig SQL note for reuse: pgbench 16\+ DDL uses columns `bid`/`bbalance`/`filler` \(not the legacy
+      `branchid`\)\; `WHERE branchid` errors identically on PG 18\.3 — not a goopg divergence\.
+  - Movement: closed as **not\-a\-defect** \(parity verified against the PG 18\.3 oracle at every probe
+    point; no code change, no ledger row — nothing deferred\)\. Next M\-NIGHTLY in file order:
+    post\-TRUNCATE cost divergence \(Kind: impl, next entry\)\.
+- [x] **Post\-TRUNCATE empty\-table cost estimate diverges from PG — goopg rows=1270/cost 22.70, PG rows=610/cost 16.10; reltuples renders 0 where PG keeps −1** \(filed 2026\-10\-31 by the relpages recon loop; CLOSED landed 2026\-10\-31 loop #6\)
+  Kind: impl
+  Parent: none
+  - Rig \(200k\-row table, ANALYZE, TRUNCATE\): PG post\-TRUNCATE pg\_class \(reltuples,relpages\)=\(\-1,0\) →
+    `Seq Scan cost=0.00..16.10 rows=610`; goopg \(0,0\) → `Seq Scan cost=0.00..22.70 rows=1270`\.
+  - Two sub\-divergences: \(a\) TRUNCATE writes reltuples=0 where PG's new\-relfilenode relstuple stays the
+    \-1 "never analyzed" sentinel \(trunc\.c:282\-285 path renders \-1\)\; \(b\) the unanalyzed\-empty relation
+    estimator uses different defaults \(PG: 10\-block probe ⇒ 16\.10/610\; goopg ≈ 2270\-block shape ⇒
+    22\.70/1270\) — M0146\-0009 statistics territory, interleaveable when a first\-divergence is stats\-driven\.
+  - Resume: internal/executor/pg\_class relstats rendering \+ the estimate\_rel\_size twin's empty/unanalyzed
+    arm \(internal/optimizer/relsize\.go\)\; pin with a TPC‑free cost test \(two EXPLAINs vs PG \:65432\)\.
+  - Diagnosis \(loop #6, rig re\-run\)\:
+    - \(a\) root cause: the truncate loop \(operators_ddl\.go:17175\) wrote sidecar \(0,0\) and `Stats = nil` —
+      a MEASURED zero, where PG's RelationSetNewRelfilenode writes the pg\_class tuple with reltuples=\-1\.
+      The rig's "≈2270\-block shape" reading was wrong on the pages axis: cost 22\.70 = 10 pages \+
+      0\.01×1270 — goopg DID fire the 10\-page floor; the whole gap was rows \(density\)\.
+    - \(b\) root cause: probe tuple width\. PG keeps pg\_statistic across TRUNCATE \(keyed on the relation
+      OID, which truncate does not change\) → examine\_attribute feeds the ANALYZEd att\_avg\_widths into
+      get\_rel\_data\_width: fixture \(id int, pad text\)@(100 chars) = 4\+101\+28 overhead = 133 B/tuple →
+      61 rows/blk → 10 blk → 610\. goopg nil'ed the whole Stats struct, losing the widths → type
+      defaults 4\+32\+28 = 64 → 127/blk → 1270\. Verified against PG \(tb table 4\+51\+61\+4\+28=148 →
+      55 → EXPLAIN rows=550 exact\)\.
+    - pg\_stats avg\_width convention parity confirmed: goopg analyzeVarsizeAny \(payload\+1 short header\)
+      already equals PG's att\_avg\_width \(101/51/61\) — only the CONSUMER ignored it\.
+  - Fix \(three arms \+ pin\)\:
+    - operators_ddl\.go truncate loop: pointer\-replace Stats with RowCount/Pages=0, Analyzed=false,
+      AllVisible cleared, **Columns kept**; persistRelSize writes rowcount=\-1 \(the sentinel rides the
+      sidecar\) — UpdateRelStats dropped \(it forces Analyzed=true\)\.
+    - initdb/open\.go sidecar decode: rowcount<0 → Analyzed=false, RowCount stays 0 \(sentinel survives
+      restart like PG's pg\_class tuple\)\.
+    - optimizer/relsize\.go tableDataWidth: per\-column analyzed ColumnStats\.AvgWidth when \>0 \(examine\_attribute
+      arm\), typeWidth fallback per column \(get\_typavgwidth arm\)\.
+    - catalog\.go virtual pg\_class renderer: unanalyzed renders reltuples=\-1 \(was "0 historically,
+      avoid churn" — the churn is now the point\)\.
+  - Pin: `internal/testport/truncate_cost_parity_server_test.go` \(TestTruncateCostParityWithPG\): fixture
+    on goopg \+ stock PG 18\.3 temp cluster \(testutil/pgcluster — TPC‑free, :65432 untouched per R1\)\;
+    post\-TRUNCATE pg\_class pair \+ Seq Scan cost line equal, then goopg RESTART re\-checks both \(sentinel
+    sidecar \+ width restore\)\. 8\.6s PASS\.
+  - Rig post\-fix: goopg \-1\|0, cost 0\.00\.\.16\.10 rows=610, Aggregate 17\.62\.\.17\.64 == PG exactly;
+    post\-insert\-no\-analyze arm matches too \(floor stays until next analyze, PG identical\)\.
+  - Movement: landed; residuals \(a\) scan width column 36 vs 0, \(b\) TRUNCATE ROLLBACK stats undo,
+    \(c\) UPDATE pg\_class \-1 sidecar persistence, \(d\) index relstats reset on TRUNCATE → ledger
+    2026\-10\-31 "post\-TRUNCATE cost" row\. No M\-NIGHTLY items remain from the 20261031 run\.
 
 _(P0 incident tasks, nightly-run logs and completed manually-discovered
 tasks archived → `completed_milestones/completed_fix_plan_013.md`.)_
@@ -3898,7 +4551,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - Resume point: where the EXPLAIN path starts its planning timer relative to optimizer\.PlanWithSettings \(the
     CTE pre\-planning `preplanWithClause` → join search may run before the timer, or the figure is taken from a
     cached/second plan\)\.
-- [ ] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
+- [x] **M0122\-0021 — EXPLAIN ANALYZE inside a parallel worker subtree prints per\-worker lines without VERBOSE, drops the node's own actual line, and counts a probe's rows before its moved Filter**\.
   Kind: impl
   Parent: none
   - Filed 2026\-10\-28 \(loop \#245\) from the M0122\-0012 G3 rows census of TPC\-DS Q72 \(SF0\.25\)\. Captures:
@@ -3927,7 +4580,523 @@ Priority` banner at the head of this file currently says (item 10 tail as of
   - PG prints each node's own `\(actual … loops=…\)` everywhere, CTE bodies included \(ExplainNode recurses into
     `planstate\->initPlan` / CTE subplans with their own Instrumentation\); goopg's CTE body nodes are built lazily outside
     the instrumentation scope \(ledger 2026\-07\-04 M0122\-0003 rows describe the DML\-CTE variant\)\.
-- [ ] **M0122-0013 — Physical/streaming replication & standby**.
+  - Slice 1 done 2026\-10\-29 \(`fc4b696a3`\): worker instrumentation is aggregated onto the node line\.
+    - `aggregateWorkerInstrumentation` \(internal/executor/instrument\.go\) folds every site's counters \(workers \+
+      leader\) into one node entry before rendering — PG's InstrAggNode \(instrument\.c\) via
+      ExecParallelRetrieveInstrumentation; `Worker N:` lines print only with VERBOSE, never for the leader slot,
+      skip zero\-loop sites, honour TIMING OFF, and subtract the probe share per site \(`paramProbeRejectedAtSite`\)\.
+    - Q72 SF0\.25 \(private clone `tmp/q64\-clone` :5592\): node lines with actuals 8 → 24 of PG's 26; the inventory line
+      is identical to PG \(`actual rows=9\.88 loops=2185`, `Rows Removed by Filter: 191`\)\. Captures
+      `analysis/m0122/m0122\-0021/q72\-goopg\-slice1\{,\-verbose\}\.explain`\.
+    - Tests: `TestAggregateWorkerInstrumentationSumsSites`, `TestExplainAnalyzeParallelNodeLineAggregatesSites`;
+      `TestExplainAnalyzeParallelWorkerLinesShape` now runs under VERBOSE\.
+    - Gates: units, tpch\-spotcheck \(Q12=2, Q13=35\), tpch\-acceptance\-arm \(24 MATCH\), tpcds\-sf025 sweep PASS \(PLAN\-SHAPE same=99\)\.
+    - Design: `docs/design/0100\-0149/m0122\-0021\-worker\-instrumentation\-aggregate\.md`\.
+    - Movement \(slice\): yes — Q72 SF0\.25 EXPLAIN ANALYZE node lines with actuals 8→24 \(PG 26\)\.
+  - Remaining slices \(each ledgered 2026\-10\-29\), in order:
+    - Slice 2 done 2026\-10\-29 \(`28a5ff4c9`\): the cause was the NLI inner protocol, not the Gather — the probe and its
+      Memoize are driven through `nliInner` \(BindOuter/Rescan/Next\), so `maybeInstrument` never wrapped them, serially
+      too\.
+      - `instrumentedNLIInner` / `instrumentedMemoProbe` \(instrument\.go\): a loop per Rescan, rows/time per Next, keyed
+        on `NestedLoopIndexJoin\.Inner` / `InnerMemo` — PG's ExecReScanMemoize per outer row, probe only on a miss
+        \(nodeMemoize\.c ExecMemoize\); `unwrapNLIInner` keeps the FOR UPDATE TID walks on the concrete probe\.
+      - Q72 SF0\.25: `Memoize \(actual rows=0\.19 loops=61015\)` identical to PG; d1 probe loops 2954 \(PG 2852, per\-worker
+        cache fill\)\. Serial Q72: every node line carries actuals; probe loops = misses \(1718\)\.
+      - Test `TestMemoizeAnalyzeNodeActuals`; gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99;
+        census `routing\-20261029b` 22/22·99/99·99/99\.
+      - Residuals \(ledgered\): the `Hits:` line below a Gather shows one site, not PG's leader line \+ per\-worker lines;
+        the NLI probe's own Cond filter has no rejection counter \(no `Rows Removed by Filter`\)\.
+    - Slice 3 done 2026\-10\-29 \(`132bf92d2`\): CTE bodies, SubPlans/InitPlans and cooperative hash\-build inputs are
+      instrumented; zero\-loop nodes print `\(never executed\)`\.
+      - CTE body: `newCteScanOp` builds under the scan's scope\. SubPlan/InitPlan: `acquireSubPlanOp` builds under
+        `Context\.explainScope`, published by explainOp for its run \(nil in workers\)\. `scopeStats`: one record per plan
+        node per scope \(PG one Instrumentation per node\)\.
+      - Cooperative build \(E\-18\): per\-producer tables folded as ONE execution of the build input
+        \(`foldCoopBuildStats`\) — the input sat at loops=0 before \(main tree too\)\.
+      - `\(never executed\)` on node and Hash lines \(explain\.c, nloops = 0\); Memoize `Hits:` only when misses \> 0
+        \(show\_memoize\_info\); memoized probe keyed on `InnerMemo\.Child` \(the rendered node\)\.
+      - DS SF0\.25 serial: Q14 node lines with actuals 35 → 76 \(PG 76\); Q23 23 → 41 \+ 6 never executed, identical
+        to PG's node set\. Captures `analysis/m0122/m0122\-0021/ds\-g\{14,23\}\-serial\-slice3\.explain`\.
+      - Tests `TestExplainAnalyzeCTEBodyAndSubPlanActuals`, `TestExplainAnalyzeCoopBuildInputActuals`
+        \(mutation\-checked\); `TestExplainAnalyzeSubPlanScopeObservation` inverted \(it pinned the gap\)\.
+      - Gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99; census `routing\-20261029c`
+        22/22·99/99·99/99\.
+      - Residuals \(ledgered\): goopg\-only `\(calls=… rebuilds=…\)` SubPlan header annotation; SubPlan value cache
+        lowers loops vs PG; SubPlans in workers and ARRAY\(\)/row\-IN/multi\-assign/corr\-hash\-map subqueries uninstrumented\.
+    - Slice 4 done 2026\-10\-29 \(`b93ad5337`\): the Gather's shared hash prebuild builds under a fresh table and folds as
+      one leader\-flagged site \(`prebuildScope` / `foldPrebuildStats`\) — the input reports loops=1, every row\.
+      - Design call taken and recorded: PG \(parallel\_hash off\) has each participant build \(loops=4 on Q72\); goopg
+        builds once and shares, so it reports one loop — an execution difference, not imitated\.
+      - Worker Contexts get their site instrumenter as `explainScope` \(worker SubPlans, cooperative builds\); the site
+        aggregate now ADDS to an existing statement\-scope entry\.
+      - Q72 SF0\.25 node lines with actuals 24 → 26 \(PG 26\)\. Test `TestExplainAnalyzeSharedPrebuildInputActuals`
+        \(mutation\-checked; switches off only the runtime coop build\); \-race clean; gates PASS; census
+        `routing\-20261029d` 22/22·99/99·99/99\.
+    - Residual 1 done 2026\-10\-29 \(`04cc96f3b`\): the SubPlan/InitPlan label is PG's bare `SubPlan N` \(explain\.c
+      ExplainSubPlans\); goopg's `\(calls= rebuilds= rescans= hits= misses=\)` annotation dropped, counters kept in
+      `ctx\.SubPlanStats`\. Tests read them there\. Gates units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025
+      PASS=99; census `routing\-20261029e` 22/22·99/99·99/99\.
+    - Residual 2 done 2026\-10\-29 \(`d38dd96ed`\): expression\-level subqueries and bitmap producers report actuals\.
+      - ARRAY\(\), row IN, `ROW\(\) = \(SELECT\)`, multi\-assign SET and the corr hash map build in `ctx\.explainScope`
+        \(were `Build\(\)`\)\. The correlated ARRAY\(\) line is identical to a scratch PG 18\.3's\.
+      - Found on the way: Bitmap Index Scan / BitmapAnd / BitmapOr printed no actuals anywhere \(the heap scan built
+        the producer in Open with nil scope\)\. Now the bitmap ops carry the scope \(instrumentScopeCarrier, also via
+        the NLI probe sidecar\), and `instrumentedBitmapOp` counts PG's MultiExec semantics: one loop per
+        `buildBitmap`, rows = TIDs \(nodeBitmapIndexscan\.c nTuples\), 0 for And/Or\. The Gather's bitmap prebuild
+        folds as one leader site \(loops=1, as PG's parallel bitmap heap scan\)\. Serial and NLI\-probe lines identical
+        to scratch PG apart from `Heap Blocks:` / `Index Searches:`, which goopg does not print \(ledgered\)\.
+      - Tests `TestExplainAnalyzeExpressionSubqueryActuals` \(fails 4 assertions without the fix\),
+        `TestExplainAnalyzeBitmapProducerActuals` \(serial \+ Gather\)\.
+      - Gates units, tpch\-spotcheck \(Q12=2, Q13=35\), tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE
+        same=99\); census `routing\-20261029f` 22/22·99/99·99/99\.
+      - New residuals \(ledgered 2026\-10\-29\): DML \(Update/Delete\) child scans print no actuals and a MULTIEXPR
+        SubPlan is not rendered; an uncorrelated ARRAY\(\) prints `SubPlan 1` where PG prints `InitPlan 1`; no
+        `Heap Blocks:` line; the corr hash map scans once \(loops=1\) where PG re\-runs the SubPlan per call
+        \(execution difference\)\.
+      - Filed: M0122\-0022 \(row comparison against a multi\-column subquery errors\)\.
+    - Residual 4 done 2026\-10\-29 \(`c49bd9b71`\): index, index\-only and bitmap heap probes count their own Cond
+      rejections \(`filterRemoveCounter`; PG nfiltered1, execScan\.h InstrCountFiltered1\), so a nested\-loop probe
+      prints `Rows Removed by Filter`\.
+      - Taken ahead of the DML residual: no TPC\-H/TPC\-DS query is DML, and the DML path is a hand\-written heap
+        scanner \(`extractScan` → `scanMatching` / `updateViaIndex`\) with no operator tree to instrument\.
+      - The memoized probe is identical to a scratch PG 18\.3 \(`Rows Removed by Filter: 0` for 3 rejects over 10
+        loops\), apart from Memoize `Memory Usage` and `Index Searches`, which were already ledgered\.
+      - Test `TestExplainAnalyzeProbeCondRowsRemoved` \(mutation\-checked\)\. Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm
+        \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029g` 22/22·99/99·99/99\.
+    - Residual 3 done 2026\-10\-29 \(`910e30183`\): below a Gather each worker's Memoize counters print as a
+      `Worker N:  Hits: …` line\.
+      - `MergeWorkerContext` folds each worker Context's `MemoizeStats` into `Context\.MemoizeWorkerStats`, tagged
+        with the worker's slot \(the SortWorkerStats discipline\)\. Before this, the worker counters were dropped at
+        the join\. The leader's own counters stay the main line, as PG's `mstate\->stats` do\.
+      - The renderer prints one line per worker that missed at least once, sorted by slot, after
+        Buffers/WAL/Memory, and without VERBOSE \(explain\.c show\_memoize\_info over `shared\_info`\)\.
+      - TPC\-DS Q72 SF0\.25 \(private clone `tmp/q64\-clone`\): the leader line plus Worker 0\.\.2 lines\. Their hits \+
+        misses sum to loops=61015, the same shape and total as PG\. Capture
+        `analysis/m0122/m0122\-0021/q72\-goopg\-residual3\.explain`\.
+      - Test `TestExplainAnalyzeMemoizeWorkerLines` \(mutation\-checked; leader participation off, so PG prints no main
+        line\)\. Gates: units, `\-race` on the parallel/explain families, tpch\-spotcheck, tpch\-acceptance\-arm
+        \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029h` 22/22·99/99·99/99\.
+      - New residual \(ledgered\): the VERBOSE per\-worker block layout\. PG nests each worker's Hits / Sort Method
+        lines under its `Worker N:  actual …` line, after Buffers\. goopg prints them as flat lines, and its Sort
+        worker lines come before Buffers\.
+    - Residual 10 done 2026\-10\-29 \(`431cec8d7`\): Bitmap Heap Scan prints PG's `Heap Blocks: exact=N lossy=M`\.
+      - The op already counted pages but nothing reported them\. It now hands the counts to `nodeStats` through
+        `heapBlocksCounter` \(maybeInstrument and the NLI probe sidecar\)\. Text mode prints non\-zero counts only,
+        after Recheck Cond / Filter / Rows Removed \(explain\.c show\_tidbitmap\_info\)\.
+      - Below a Gather PG does not sum the pages: the main line is the leader's own, and every worker that fetched a
+        page gets a `Worker N:  Heap Blocks:` line\. goopg now matches: `workerNodeStat` carries
+        ExactPages/LossyPages, the aggregate adds only the leader site's, and the worker lines print at the node's
+        end\.
+      - Serial and NLI\-probe lines are identical to a scratch PG 18\.3\. At work\_mem=64kB goopg's TID bitmap goes
+        lossy where PG stays exact\. That is goopg's own lossify heuristic, an execution difference, ledgered\.
+      - Test `TestExplainAnalyzeBitmapHeapBlocks` \(serial; Gather with the leader on and off; mutation\-checked\)\.
+        Gates: units, `\-race`, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE
+        same=99\); census `routing\-20261029i` 22/22·99/99·99/99\.
+      - New residuals \(ledgered\): goopg's TID\-bitmap sizing / lossification is not PG's tidbitmap\.c;
+        `Rows Removed by Index Recheck` is not counted\.
+    - Residual 9 done 2026\-10\-29 \(`7ad6a9d6b`\): an uncorrelated ARRAY\(SELECT …\) is an initplan, as in PG
+      \(subselect\.c make\_subplan\)\.
+      - `SublinkIsInitPlan` classifies it, so it gets the `InitPlan N` label, placement with its level's initPlans
+        and PG's initplan cost charge \(`cost=1\.12\.\.2\.52`, PG's numbers\)\. The reference prints
+        `\(InitPlan N\)\.col1`\.
+      - `evalArraySubquery` caches the result in the scoped sublink store, so it runs once \(ANALYZE loops=1\)\.
+      - Root cause of the misplacement: `NodeSublinks` walked with `walkExprTree`, which never descends into
+        `InExpr`, so `= ANY \(ARRAY\(…\)\)` was invisible to the level\. It now uses the slot walker
+        \(`walkExprRefs`\) and falls back to `walkExprTree` when that walk aborts, so no sublink found before is
+        lost\. Pre\-order and CASE slot order are unchanged\.
+      - The probe's plain EXPLAIN is identical to PG 18\.3's\. Test `TestExplainUncorrelatedArraySublinkIsInitPlan`\.
+      - Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\),
+        tpcds\-fireset PASS \(no query fired\); census `routing\-20261029j` 22/22·99/99·99/99, plan text byte\-identical\.
+      - New residuals \(ledgered\): ARRAY target width estimate \(8 vs PG 36\); VERBOSE Output lines for Result
+        and sublink bodies; ARRAY result is a text string, not a typed array; `walkExprTree`'s other planner
+        callers still stop at InExpr\.
+    - Residual 14 done 2026\-10\-29 \(`28c6de6c8`\): a Bitmap Heap Scan counts the tuples its BitmapQual recheck
+      rejects \(PG nfiltered2\) and prints `Rows Removed by Index Recheck` directly under `Recheck Cond:`\.
+      - Carried per site like FilterRejected \(summed\); the coop and prebuild folds carry it too\.
+      - Line order identical to a scratch PG 18\.3 at work\_mem=64kB\. The counts differ because goopg's bitmap
+        goes fully lossy \(2942 pages\) where PG keeps 869 exact and 2073 lossy\. That is the ledgered tbmLossify
+        heuristic, now quantified in the ledger\.
+      - Test `TestExplainAnalyzeBitmapIndexRecheckRemoved` \(mutation\-checked\)\. Gates: units, `\-race`,
+        tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census
+        `routing\-20261029k` 22/22·99/99·99/99\.
+    - Residual 12 done 2026\-10\-29 \(`fdde69739`\): per\-worker lines print as PG's per\-worker blocks\.
+      - The VERBOSE `actual …` line and the Sort Method / Memoize Hits / Heap Blocks lines go into one `workerBlocks`
+        entry per slot\. The blocks are flushed after Buffers/WAL/Memory: first line `Worker N:  `, the rest indented
+        one level \(explain\.c ExplainOpenWorker / ExplainFlushWorkersState\)\. Non\-VERBOSE output is unchanged\.
+      - Layout identical to a scratch PG 18\.3 for a parallel Sort over a Parallel Bitmap Heap Scan\.
+      - Also: the BitmapHeapScan label honours the plan's Parallel flag \(`Parallel Bitmap Heap Scan`; the label half
+        of the open M0134\-0001 ledger row\)\.
+      - Test `TestExplainAnalyzeVerboseWorkerBlocks` \(mutation\-checked\)\. Gates: units, `\-race`, tpch\-spotcheck,
+        tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99 \(PLAN\-SHAPE same=99\); census `routing\-20261029l`
+        22/22·99/99·99/99, plan text byte\-identical\.
+      - Discoveries \(ledgered\): no bounded \(top\-N\) sort, i\.e\. no ExecSetTupleBound through Limit / Gather Merge;
+        VERBOSE `Output:` placement, qualification and narrowing differ from PG\.
+    - BUFFERS default done 2026\-10\-29 \(`ee57789ff`\): EXPLAIN ANALYZE now defaults BUFFERS on, as PG 18 does
+      \(explain\_state\.c `es\->buffers = buffers\_set ? es\->buffers : es\->analyze`\)\. An explicit BUFFERS OFF still
+      wins\.
+      - The old PG 17\-default test is inverted \(`TestExplainBuffersDefaultsToAnalyze` plus its JSON twin\)\.
+      - Pass\-required regress cases that run EXPLAIN ANALYZE without BUFFERS OFF \(select\_into\) print errors or
+        zero\-row plans only, so they are unaffected\.
+      - Gates: units, tpch\-spotcheck, tpch\-acceptance\-arm \(24 MATCH\), sf025 PASS=99; census
+        `routing\-20261029m` 22/22·99/99·99/99\.
+      - `make ea\-ratchet` FAILs: 8 NEW findings \(Q64 x7, Q99\)\. The binaries of the staged tree, HEAD and this
+        session's start \(997db829b\) all give the same result, so the failure is pre\-existing\. Ledgered with a bisect
+        resume point\.
+      - Ledgered: no `Planning:` Buffers section, because goopg's catalogs are not shared\-buffer pages\. The
+        per\-node Buffers numbers that now print by default are pool\-global deltas \(residual 5\)\.
+    - Remaining \(ledgered rows 2026\-10\-29, worked next in this order\): per\-site Buffers/WAL/memory \(now visible
+      by default, so next\); DML child actuals \+ MULTIEXPR SubPlan rendering \(last: no benchmark query is DML\)\. Execution differences \(record
+      only\): SubPlan value cache, shared/coop builds, corr hash map, TID\-bitmap lossify\. Adjacent renderer work
+      ledgered outside this task's actuals scope: VERBOSE Output lines\.
+    - Residuals: Buffers/WAL/memory not aggregated across sites \(pool\-global deltas\)\. \(`\(never executed\)` landed
+      in slice 3\.\)
+  - **Closed 2026\-10\-29 \(loop \#6 session\)\.** The stated scope is done: worker subtrees fold onto the node line,
+    and CTE bodies, SubPlans/InitPlans, Memoize, shared/coop builds, expression subqueries and bitmap producers report
+    actuals\. Added on top: `Heap Blocks:`, `Rows Removed by Index Recheck`, probe `Rows Removed by Filter`,
+    per\-worker Memoize and Heap Blocks lines in PG's per\-worker block layout, the bare SubPlan label, uncorrelated
+    ARRAY as an initplan, and BUFFERS defaulting to ANALYZE \(PG 18\)\.
+    - Not fixed here. Each item has a deferral\-ledger row dated 2026\-10\-29\. They were first filed as
+      M0122\-0022\.\.0030; those entries were withdrawn, because the owner's M0122 filing pause \(banner item 10,
+      `fd2491dab`, 2026\-10\-29\) predates them\.
+      - The row\-compare error became P0\-E16 \(M\-NIGHTLY, S2 filing\)\.
+      - The rest await owner placement — see the escalation below\.
+    - Wrong\-results regression from residual 9, found and fixed in the next loop \(`45b925ffd`\)\. `7ad6a9d6b` made an
+      uncorrelated ARRAY sublink an initplan computed once per statement\. The planner's escape check could not see an
+      outer reference inside an IN list or `= ANY \(…\)` operand \(walkExprTree\), so
+      `ARRAY\(SELECT v FROM mi WHERE mi\.id IN \(mo\.k, 99\)\)` returned the first row's array on every row\.
+      - Both escape walks now use `walkSameScopeExprs`\. Pin `TestEscapingOuterRefInsideInList`\.
+      - Gates incl\. fire\-set \(no fires\); census `routing\-20261029n` 22/22·99/99·99/99, plan text unchanged\.
+    - > **ESCALATION 2026\-10\-29 — OWNER PLACEMENT NEEDED \(M0122 filing pause\)\.** Ledgered, not filed:
+      > per\-backend/per\-site buffer usage for EXPLAIN BUFFERS; UPDATE/DELETE child actuals \+ MULTIEXPR SubPlan; bounded
+      > top\-N sort \(ExecSetTupleBound\); tidbitmap\.c sizing/lossify port; VERBOSE Output lines \+ ARRAY width/typed
+      > result; the remaining walkExprTree callers \(the escape check is fixed; ~105 other sites still stop at InExpr\);
+      > BitmapOr paths \+ `Disabled:` line; the pre\-existing ea\-ratchet drift \(8 NEW, same at 997db829b\)\. The EXPLAIN
+      > items fit M0148's `explain` suite when it is selected; the rest need a home\.
+    - Recorded, not imitated: execution differences — SubPlan value cache, the corr hash map, one shared/coop build
+      where PG builds per participant\.
+    - Movement: none — instrument artefact — EXPLAIN ANALYZE instrumentation is invisible to the plan instruments
+      \(the census captures plain EXPLAIN\); parity held 22/22·99/99·99/99 at every commit; rows\-census coverage:
+      TPC\-DS Q72 node lines with actuals 8→26 \(PG 26\), DS Q14 serial 35→76 \(PG 76\)\.
+- [!] **M0122-0013 — Physical/streaming replication & standby**. HELD by the loop 2026\-10\-30 under S4 \(lineage
+  budget\)\.
+  - > **ESCALATION 2026\-10\-30 \(S4 lineage budget\) — OWNER DECISION NEEDED to re\-open \(a `LINEAGE\-BASELINE`
+    > re\-pin\) or to leave M0122\-0013 held\.** The commit guard rejected filing P0\-E23 under this root\. Its last five
+    > completed descendants, P0\-E18 … P0\-E22, are all `Movement: none`\. They were S2 recovery defects fixed in\-task,
+    > and no S3 instrument \(PG match count, CATEGORIES, ea\-ratchet, regress diff counts\) can see standby or recovery
+    > work\.
+    - What was attempted: 38 slices \(the LANDED entries below\)\. They port PG's standby, recovery and replication
+      lifecycle:
+      - restartpoints and recovery commands;
+      - archive recovery: targets, timelines, restore classification;
+      - shutdown handling: interruptible replay, SIGQUIT, quickdie messages;
+      - timeline following: walreceiver preamble, walsender historic timeline, standby follow\.
+    - What each step proved: every slice is pinned by mutation\-checked unit tests\. The cross\-engine ones are pinned
+      by PG 18\.3 oracle E2Es \(PG standby follows goopg, goopg standby follows PG\)\. Five real S2 defects were found
+      and fixed \(P0\-E18 … E22\)\.
+    - Remaining blocker: S4 itself\. The work is correctness and feature parity with no plan\-parity instrument\. One
+      new S2 is open: P0\-E23, held below with this root\.
+    - Expected movement if unblocked: none on the S3 instruments\. The relevant instrument would be the PG recovery
+      TAP suite \(D\-003, `postgres/src/test/recovery`\), not yet ported\. Ported counterparts so far: 004\_timeline\_switch
+      in both directions\.
+    - Remaining size: the ledgered M0122\-0013 residuals \(about 20 rows\)\. Largest: P0\-E23\, recovery\_target\_time /
+      name / immediate \(executor\-side\)\, backup\_label / XLOG\_BACKUP\_END\, the standby start\-up timeline from
+      the history\, no WAL archiver\.
+  - **A goopg standby follows its upstream's timeline switch LANDED 2026\-10\-30 \(`8ea3e1d0e`\)**\. Movement: none —
+    replication protocol\. Before, the walreceiver read the server's CopyDone as a disconnect and reconnected on the
+    same timeline forever\.
+    - Walreceiver: libpqrcv\_endstreaming \(CopyDone, the next\_tli row, history fetch\), and the no\-COPY reply →
+      `\*EndOfTimeline`\. The launcher hands it to `OnEndOfTimeline`; when the timeline is unchanged it waits 5 s\.
+    - Standby: `followUpstreamTimeline` \(rescanLatestTimeLine / numeric target / 'current' stays\; not\-a\-child and
+      forked\-off checks\; SwitchTimeline at the fork \+ timeline\_id\)\.
+    - Pins: `TestWalReceiverEndsHistoricTimeline`, `TestFollowUpstreamTimeline` \(mutation\-checked\)\. Oracle
+      `TestE2E\_GoopgStandbyFollowsPGTimelineSwitch` \(a PG 18\.3 promotion; fails without the follow hook\)\. Gates:
+      units, replication E2E family 14/14, tpch\-spotcheck, sf025 99/99\.
+    - Found: P0\-E23 \(S2, filed above with an escalation\)\. Residuals ledgered\.
+  - **The walsender ends a historic timeline at its switch point LANDED 2026\-10\-30 \(`bd29bc303`\)**\. Movement:
+    none — replication protocol\. Before, a request for an older timeline streamed straight past its end\.
+    - tliSwitchPoint over the current history, with PG's two errors \(55000 / XX000\)\. No COPY at the switch point;
+      otherwise clamp at the switch point, CopyDone, then the \(next\_tli, next\_tli\_startpos\) row and START\_STREAMING\.
+    - Pins: `TestWalsenderEndsHistoricTimelineAtSwitchPoint` \(3 mutations\), `TestHistoricTimelineNotInHistory`\.
+      Oracle `TestE2E_PGStandbyFollowsGoopgTimelineSwitch`: a PG 18\.3 standby follows a goopg promotion to timeline 2
+      \(fails without the historic path\)\. Gates: units, replication E2E family, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): the goopg walreceiver side \(CopyDone handshake, writer switch, recovery\_target\_timeline\)\.
+  - **The walreceiver runs WalReceiverMain's preamble LANDED 2026\-10\-30 \(`7a5f06436`\)**\. Movement: none —
+    replication protocol\. Before, START\_REPLICATION went out straight after the startup handshake: no
+    IDENTIFY\_SYSTEM, no history fetch, no TIMELINE\.
+    - IDENTIFY\_SYSTEM checks: system identifier, and a primary timeline behind the start one\.
+      WalRcvFetchTimeLineHistoryFiles\. The command is libpqrcv\_startstreaming's \(`SLOT "x"`, `TIMELINE n`\)\.
+    - Promotion takes findNewestTimeLine \+ 1 \(`xlog\.FindNewestTimeline`\)\. The walsender reports the writer's live
+      timeline\.
+    - Pins: `TestWalReceiverFetchesMissingTimelineHistory`, `TestWalReceiverIdentifySystemChecks`,
+      `TestBuildStartReplicationCommand`, `TestStandbyControllerPromoteSkipsKnownTimelines` \(all mutation\-checked\)\.
+      Gates: units, replication/replcluster/xlog, 12 replication \+ failover E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): the end\-of\-timeline handshake on both sides and the timeline switch it drives\;
+      `\.done` markers for fetched history files\; TIMELINE\_HISTORY of a missing file\.
+  - **Sessions report why a stop ends them LANDED 2026\-10\-30 \(`f97dccda6`, `2bc45c8b3`\)**\. Movement: none —
+    session teardown messages\. Before, an idle session saw only "server closed the connection unexpectedly", and
+    a busy one got "canceling statement due to user request"\.
+    - Immediate stop: quickdie's WARNING 57P01 "terminating connection due to immediate shutdown command" to idle,
+      busy and extended\-protocol sessions\. Fast stop: die\(\)'s FATAL 57P01 alone \(no 57014 first\)\.
+      `shutdownEndsStatement` is shared by `writeQueryError` and `writeExtendedMessageError`\.
+    - Pins: `TestStopImmediateSendsQuickdieNotice`, `TestFastStopSendsAdminShutdownFatal`,
+      `TestShutdownReplacesStatementCancel` \(all mutation\-checked\); live psql probe \(simple \+ `\\bind`\)\. Gates:
+      units, postmaster, sigquit/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): the immediate path still waits for session goroutines \(connWG\)\.
+  - **Crash replay stops on a shutdown request LANDED 2026\-10\-30 \(`6c78ab6c4`\)**\. Movement: none — crash recovery\.
+    ProcessStartupProcInterrupts per record; goopg's crash replay could not be stopped\.
+    - `ReplayFromDirWithMgrAtInterruptible`, `OpenOptions\.Interrupted`, `endInterruptedCrashRecovery` \(fast →
+      DB\_SHUTDOWNED\_IN\_RECOVERY, immediate → untouched\)\.
+    - Pins: `TestOpenCrashReplayIsInterruptible` \(mutation\-checked\), `TestEndInterruptedCrashRecovery`\. Gates: units,
+      recovery/crash/durability E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): Open's post\-replay phases not interruptible\.
+  - **SIGQUIT is the immediate shutdown LANDED 2026\-10\-30 \(`108e7a630`\)**\. Movement: none — signal handling\.
+    pmdie SIGQUIT; goopg hit Go's default \(goroutine dump, exit 2, postmaster\.pid left\)\.
+    - `immediateShutdown` \(cmd/goopg, whole of goopg start\), `Server\.StopImmediate` \(shared with STOPIMMEDIATE\);
+      `goopg stop \-mode immediate` signals a starting server\.
+    - Pin: `TestE2E_GoopgSigquitIsImmediateShutdown` \(mutation\-checked\); probes: busy session stopped in 0\.1 s,
+      crash recovery on restart; archive recovery left in place\. Gates: units, postmaster, recovery/replication/crash
+      E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): quickdie client message; the immediate path still waits for sessions; crash replay not
+      interruptible\.
+  - **Hot standby waits for a consistent recovery state LANDED 2026\-10\-30 \(`8527ab50e`\)**\. Movement: none — connection
+    admission\. canAcceptConnections CAC\_NOTHOTSTANDBY in PM\_RECOVERY: FATAL 57P03 "not yet accepting connections" /
+    "Consistent recovery state has not been yet reached\."; goopg accepted reads at once\.
+    - consistency point = max\(minRecoveryPoint, checkpoint redo, backupEndPoint\); `standbyController\.Consistent`;
+      `Config\.HotStandbyConsistent`\.
+    - Pins: `TestHotStandbyNotConsistentRefusesConnections`, `TestStandbyConsistencyPoint` \(mutation\-checked\)\. Gates:
+      units, postmaster, replication/promotion E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): recovery\-snapshot readiness; XLOG\_BACKUP\_END; ReachedEndOfBackup pg\_control update\.
+  - **Commit/abort records carry xact\_time LANDED 2026\-10\-30 \(`b1cc9d108`\)**\. Movement: none — WAL record body\.
+    XactLogCommitRecord/XactLogAbortRecord store GetCurrentTransactionStopTimestamp; goopg wrote 0\.
+    - `EncodeXactCommitPGWithRelsAt` / `EncodeXactAbortPGWithRelsAt`, `TimestampTzNow`; the initdb xact\-marker hook
+      stamps the stop time\. pg\_waldump shows real COMMIT/ABORT times\.
+    - Pins: `TestWalXactRecordsCarryStopTimestamp` \(mutation\-checked\), `TestEncodeXactRecordsAtWriteXactTime`\. Gates:
+      units, replication/recovery/PG\-standby E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): recovery\_target\_time — needs a timestamptz parser outside internal/executor\.
+  - **recovery\_target\_xid \+ multiple\-targets FATAL LANDED 2026\-10\-30 \(`77e3f4ed5`\)**\. Movement: none — recovery
+    targets\. COMMIT/ABORT xl\_xid equality \(recoveryStopsBefore/After\), error\_multiple\_recovery\_targets\.
+    - Pins: `TestRunArchiveRecoveryStopsAtTargetXid`, `TestRecoveryStopXidAndSingleTarget` \(mutation\-checked\)\. Gates:
+      units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): two\-phase records; xact\_time = 0 in commit records blocks recovery\_target\_time;
+      recovery\_target\_name / 'immediate'\.
+  - **recovery\_target\_lsn / \_inclusive / \_action LANDED 2026\-10\-30 \(`d882de595`\)**\. Movement: none — recovery
+    targets\. recoveryStopsBefore/After \(LSN arm\), PerformWalRecovery's end\-of\-redo FATALs, getRecoveryStopReason
+    as the history reason; goopg had no target settings at all and wrote "archive recovery complete"\.
+    - GUCs \+ check hook \(ParsePGLSN\); `RecoveryStop`, `ArchiveRecoveryResult\.StopReason`; `checkRecoveryTargetReached`,
+      `recoveryTargetAction`, `shutdownAtRecoveryTarget`\.
+    - Pins: `TestRunArchiveRecoveryStopsAtTargetLSN`, `TestRecoveryTargetChecksAndAction`,
+      `TestPromoteAfterRecoveryToTargetLSN`, `TestStartRecoveryTargetLSNFatals` \(mutation\-checked\)\. Gates: units,
+      replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): xid/name/time/immediate targets; pause with hot\_standby on; targets on a standby;
+      consistency point = local\-WAL end\.
+  - **Checkpoint must precede the target's fork point \+ empty recovery\_target\_timeline LANDED 2026\-10\-30
+    \(`c9720ce9b`\)** — fixes P0\-E22 \(S2, recorded above\)\. Movement: none — recovery start validation\.
+    - Both InitWalRecovery checks \("not in this server's history" / "not a child" \+ errdetail\); DETAIL printed by
+      goopg start; `recoveryTargetTimeline` reads the raw GUC value\.
+    - Pins: `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork`, `TestRecoveryTargetTimelineReadsRawValue`
+      \(mutation\-checked\)\. Gates: units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): no backup\_label consumption at recovery; standby follows only the newest timeline\.
+  - **Recovery shell commands report wait events LANDED 2026\-10\-30 \(`be383bdfe`\)**\.
+    Movement: none — pg\_stat\_activity reporting\. PG wraps restore\_command / recovery\_end\_command /
+    archive\_cleanup\_command in pgstat\_report\_wait\_start; goopg reported nothing\.
+    - IPC events RestoreCommand / RecoveryEndCommand / ArchiveCleanupCommand; `reportCommandWait`; pg\_wait\_events rows\.
+    - Pin: `TestRecoveryCommandsReportWaitEvents` \(mutation\-checked\)\.
+    - Gate note: the code commit waited for the 2026\-10\-30 nightly batch — tpcds\-sf025 refuses while it runs; the
+      host disk was full ~00:50–01:10 \(43 GB of stale capture clones removed\), which also failed that nightly's
+      testport/pgbench stages\.
+    - Residual \(ledgered, needs owner placement — M0122 filing paused\): pg\_stat\_activity timestamp/id columns are
+      text, and its timestamps drift behind wall clock after host sleep \(monotonic\-clock derived\)\.
+  - **Timeline history through RECOVERYHISTORY LANDED 2026\-10\-30 \(`0603610a5`\)**\. Movement: none — recovery path\.
+    readTimeLineHistory/existsTimeLineHistory don't keep the file; restoreTimeLineHistoryFiles keeps
+    \[checkpoint TLI, target\); goopg kept every probed file, the target's included\.
+    - `RestoreArchivedFileTemp`, `historyPath`, `ArchiveRecoveryResult\.TargetHistory`; promotion copies the parent's
+      history from it\.
+    - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory` \(updated\), `TestRunArchiveRecoveryKeepsIntermediateHistoryFiles`,
+      `TestPromoteAfterRecoveryFollowsTimelines` \(mutation\-checked\)\.
+    - Gates: units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\. The units gate also hit a flaky
+      M0122\-0021 test \(`TestExplainAnalyzeVerboseWorkerBlocks`, ~1/6: a worker with no bitmap page has no Heap
+      Blocks line, as show\_tidbitmap\_info skips it\); the assertion was fixed in `132899357` \(12/12\)\.
+  - **recovery\_target\_timeline 'current' / numeric targets LANDED 2026\-10\-29 \(`4caa86ca8`\)**\. Movement: none —
+    recovery path\. validateRecoveryParameters / check\_recovery\_target\_timeline; goopg always followed 'latest'\.
+    - `misc\.ParseRecoveryTargetTimeline` \+ check hook; `RunArchiveRecoveryWith\(…, target\)`; NewestTLI stays
+      findNewestTimeLine\(target\)\.
+    - Pins: `TestRunArchiveRecoveryTargetTimeline`, `TestParseRecoveryTargetTimeline` \(mutation\-checked\)\. Gates:
+      units, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): standby follows only the newest timeline; empty value reads as 'latest'; "not a child"
+      errdetail\.
+  - **The writer reopens segments archive recovery replaced LANDED 2026\-10\-29 \(`6001f288f`\)**\. Movement: none —
+    promotion path\. KeepFileRestoredFromArchive renames the archived copy over the local segment; the writer's
+    descriptor still named the replaced inode \(PG opens no WAL for writing until recovery ends\)\.
+    - `Writer\.ReopenSegmentFiles` \(flush, drop cached descriptors\), called by promoteAfterRecovery before it
+      appends the restored WAL\.
+    - Pin: `TestReopenSegmentFilesWritesTheReplacedSegment` \(mutation\-checked\)\. Gates: units, `\-race` xlog,
+      replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+  - **Archive before pg\_wal \+ RECOVERYXLOG \+ recovery\.signal as archive recovery LANDED 2026\-10\-29
+    \(`58b4511c2`\)** — fixes P0\-E21 \(S2, recorded above\)\. Movement: none — recovery path\.
+    - `have\(\)` archive\-first; `RestoreArchivedFileContext` → RECOVERYXLOG/RECOVERYHISTORY, wrong\-size FATAL,
+      rename over the local copy; Open: DB\_IN\_ARCHIVE\_RECOVERY \+ recovery\-mode checkpoints for recovery\.signal;
+      promotion leaves recovery mode; wal\_init\_zero = off segments full\-size\.
+    - Pins: `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment`, `TestRestoreArchivedFileThroughRecoveryXLog`
+      \(mutation\-checked; the first mutation run exposed an EndOfLog\-only assertion that could not see the gap\)\.
+    - Gates: units, postmaster, `\-race` xlog, replication/recovery/crash\-start/resetwal/waldump ports,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): writer descriptor on the replaced tail segment; no restartpoints in start\-time archive
+      recovery; restored history files kept\.
+  - **Shutdown during archive recovery \+ FATAL restore failures LANDED 2026\-10\-29 \(`7d2f398fa`\)** — fixes P0\-E20
+    \(S2, recorded above\)\. Movement: none — recovery path\. PG's startup process exits on a fast shutdown
+    \(StartupProcShutdownHandler / ProcessStartupProcInterrupts\) and RestoreArchivedFile is FATAL on a signal or an
+    unrunnable command; goopg ignored the shutdown and read every failure as the end of the archive\.
+    - `RestoreArchivedFileContext` \(classification, %r/%%, process\-group SIGTERM on cancel\);
+      `RunArchiveRecoveryWith\(ctx, …\)`; `endInterruptedArchiveRecovery` \(no promotion, recovery\.signal kept,
+      DB\_SHUTDOWNED\_IN\_RECOVERY, no checkpoint\); `goopg stop` signals a starting server\.
+    - Pins: `TestRestoreArchivedFileFailureClassification`, `TestRestoreArchivedFilePlaceholders`,
+      `TestRestoreArchivedFileShutdownKillsCommand`, `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`,
+      `TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished` \(mutation\-checked\); live probes: stop in 60 ms →
+      "shut down in recovery"; missing command → FATAL\.
+    - Gates: units, postmaster, `\-race` xlog restore tests, replication/recovery E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): crash recovery ignores shutdown; immediate stop of a starting server \(SIGQUIT\);
+      shutdown restartpoint not adopted; DB\_IN\_PRODUCTION during recovery\.signal recovery; no RECOVERYXLOG /
+      wrong\-size check; pg\_wal read before the archive\.
+  - **Data\-directory lock before recovery \+ SIGHUP during recovery LANDED 2026\-10\-29 \(`ca0bde402`\)** — fixes
+    P0\-E19 \(S2, recorded above\)\. Movement: none — server startup\. PG CreateDataDirLockFile runs before the startup
+    process; the startup process applies SIGHUP reloads at ProcessStartupProcInterrupts and RestoreArchivedFile reads
+    restore\_command per call\. goopg had no lock until the listener bound, and a SIGHUP before then killed it\.
+    - `control\.CreateDataDirLockFile` / `RemoveDataDirLockFile`; `startupReload` \(flag \+ synchronous
+      ProcessConfigFile at the fetch boundary and before srv\.Run\); `RunArchiveRecoveryWith`; `goopg reload` signals a
+      still\-starting server; `misc\.ReloadConfigEntries` shared with the server's reload\.
+    - Pins: `TestCreateDataDirLockFile`, `TestRemoveDataDirLockFileOnlyOwn`, `TestStartRefusesLiveDataDirLock`,
+      `TestStartupReloadAppliesSIGHUP`, `TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch` \(mutation\-checked\);
+      live probe: reload during a slow restore\_command applied at the next fetch\.
+    - Gates: units, postmaster, cmd/goopg, replication/promotion/archive E2Es, crash\-start/resetwal/amcheck ports,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residuals \(ledgered\): goopg's 5\-line pid file vs PG's 8\-line one; SIGTERM during start\-time recovery only
+      cancels the context and `goopg stop` cannot reach a server with no control socket yet\.
+  - **hot\_standby = off refuses connections to a standby LANDED 2026\-10\-29 \(`1821d1af2`\)**\. Movement: none —
+    connection admission\. PG canAcceptConnections → CAC\_NOTHOTSTANDBY: FATAL 57P03 "the database system is not
+    accepting connections" / "Hot standby mode is disabled\." for every connection in recovery; goopg never read
+    hot\_standby\.
+    - `Config\.HotStandbyDisabled` \(from hot\_standby at start\); refusal right after handleStartup while IsStandby\(\)\.
+    - Pin: `TestHotStandbyDisabledRefusesConnections` \(mutation\-checked\)\. Gates: units, postmaster, cmd/goopg,
+      replication E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): with hot\_standby on, PG also refuses until consistency / the recovery snapshot is ready;
+      goopg accepts reads at once\.
+  - **Restartpoint truncates pg\_subtrans LANDED 2026\-10\-29 \(`8aa917e47`\)**\. Movement: none — standby checkpointer
+    path\. CreateRestartPoint's TruncateSUBTRANS \(xlog\.c\); goopg truncated only after a primary checkpoint, so a
+    standby's subxact map and pg\_subtrans grew without bound\.
+    - The adopted restartpoint arm calls `TruncateSubtransFn` after WAL retention, before archive\_cleanup\_command;
+      unconditional because goopg's standby is always hot \(hot\_standby unconsumed — ledgered\)\.
+    - Pin: `TestRestartPointTruncatesSubtrans` \(mutation\-checked\)\. Gates: units, `\-race` xlog, replication E2Es,
+      tpch\-spotcheck, sf025 99/99\.
+  - **recovery\.signal end takes an END\_OF\_RECOVERY shutdown checkpoint LANDED 2026\-10\-29 \(`a75b43cf0`\)**\.
+    Movement: none — recovery path\. PG PerformRecoveryXLogAction: without a promote trigger the timeline change is an
+    XLOG\_CHECKPOINT\_SHUTDOWN with PrevTimeLineID = old TLI, not XLOG\_END\_OF\_RECOVERY\.
+    - `checkpointOpts\.endOfRecovery`/`prevTLI` \+ `CheckpointEndOfRecovery`; `endArchiveRecoveryOnNewTimeline` takes it
+      as the first record on the new timeline \(EOR record only without a checkpointer\)\.
+    - Pins: `TestCheckpointerEndOfRecoveryCheckpoint`; both archive\-promotion tests assert the first record
+      \(mutation\-checked\)\.
+    - Gates: units, `\-race` xlog, cmd/goopg, initdb, postmaster, replication/promotion/checkpoint E2Es,
+      tpch\-spotcheck, sf025 99/99\.
+  - **Archive recovery follows the timeline history LANDED 2026\-10\-29 \(`173eca961`\)** — fixes P0\-E18 \(S2, recorded
+    above\)\. Movement: none — correctness fix — no plan instrument\.
+    - `RunArchiveRecovery` → `ArchiveRecoveryResult`: newest TLI from history files \(local or restore\_command\),
+      expected timelines, per\-segment newest\-TLI choice from the highest local segment; "not a child" check\.
+    - `adoptRestoredWAL` crosses each switch \(SwitchTimeline at the timeline's begin\) and appends per segment \(no
+      whole\-range buffer\); promotion parent = EndTLI, new TLI = NewestTLI \+ 1\.
+    - Pins: `TestRunArchiveRecoveryFollowsTimelineHistory`, `TestPromoteAfterRecoveryFollowsTimelines`
+      \(mutation\-checked\)\.
+    - Gates: units, `\-race` xlog \+ promotion, cmd/goopg, replication/promotion/checkpoint E2Es, tpch\-spotcheck,
+      sf025 99/99\.
+    - Residual \(ledgered\): only 'latest' \(no explicit recovery\_target\_timeline / 'current'\); local WAL past a
+      timeline switch is refused, PG would read the newer timeline there; restored parent history files are kept in
+      pg\_wal \(PG reads them to a temp name\)\.
+  - **Checkpoints serialised; immediate requests end spread pacing; RequestCheckpoint LANDED 2026\-10\-29 \(`250baa3d4`\)**\.
+    Movement: none — checkpointer path\. PG's single checkpointer: no overlap, RequestCheckpoint wakes it,
+    ImmediateCheckpointRequested stops a spread checkpoint's throttling\.
+    - `runMu` serialises runCheckpoint \(checkpointOpts: spread / shutdown / timed\); CheckpointNow/Shutdown announce an
+      immediate waiter \(pendingImmediate \+ immediateWake\); `RequestCheckpoint\(\)` is a no\-wait forced spread request
+      served by Run \(false without a loop\)\.
+    - The streaming promotion now requests its checkpoint \(PG CHECKPOINT\_FORCE\); the recovery\.signal end still waits\.
+    - Pins: `TestCheckpointerSerialisesCheckpoints`, `TestCheckpointerImmediateRequestEndsSpreadPacing` \(both
+      mutation\-checked\), `TestCheckpointerRequestCheckpoint`\.
+    - Gates: units, `\-race` xlog, initdb, postmaster, cmd/goopg, replication/promotion/checkpoint E2Es,
+      tpch\-spotcheck, sf025 99/99\.
+  - **End\-of\-recovery checkpoint after both promotions LANDED 2026\-10\-29 \(`ac119d315`\)**\. Movement: none —
+    recovery path\. PG: promotion → end\-of\-recovery record then RequestCheckpoint\(CHECKPOINT\_FORCE\); archive recovery
+    without a promote trigger → END\_OF\_RECOVERY \| IMMEDIATE \| WAIT checkpoint \(xlog\.c\)\. goopg waited for the
+    schedule, leaving pg\_control on the last restartpoint\.
+    - `promotionCheckpoint` runs CheckpointNow after the streaming promotion and right after the recovery\.signal
+      timeline switch \(before recovery\_end\_command\); skipped if the writer is still on the old TLI\.
+    - Pins: `TestStandbyControllerPromoteTakesCheckpoint`, `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(both
+      mutation\-checked\)\.
+    - Gates: units, `\-race` promotion, cmd/goopg, replication/promotion E2Es, tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): synchronous where PG's promoted request does not wait; recovery\.signal path uses
+      XLOG\_END\_OF\_RECOVERY where PG writes an end\-of\-recovery shutdown checkpoint\.
+  - **recovery\.signal promotion adopts the restored WAL and switches timeline LANDED 2026\-10\-29 \(`02bf60de2`\)** —
+    fixes P0\-E17 \(S2, data loss, recorded above\)\. Movement: none — correctness fix — no plan instrument\.
+    - The writer used to resume at its pre\-archive end on the old TLI and overwrite restored, already\-replayed WAL\.
+    - `RunArchiveRecovery` returns the last record's start too; `adoptRestoredWAL` feeds the restored bytes through
+      `Writer\.AppendRaw`; `switchWriterToNewTimeline` \(factored out of the streaming promotion\) switches at EndOfLog
+      and writes XLOG\_END\_OF\_RECOVERY\.
+    - Pins: `TestPromoteAfterRecoveryAdoptsRestoredWAL` \(byte\-identical restored segment, history = EndOfLog, new TLI,
+      new WAL ≥ EndOfLog, restart on the new TLI; mutation\-checked\), `TestPromoteAfterRecoveryHistorySwitchPoint`\.
+    - Gates: units, `\-race` xlog \+ cmd/goopg promotion, cmd/goopg, TestE2E\_Physical\* \+ NativeOnly…Promotion,
+      tpch\-spotcheck, sf025 99/99\.
+  - **Archive\-recovery promotion records EndOfLog as the switch point LANDED 2026\-10\-29 \(`69c31e230`\)**\.
+    Movement: none — recovery path\. PG writes the new timeline's history with EndOfLog \(end of the last replayed
+    record\); goopg used the writer's pre\-archive WrittenLSN, so restored segments were left out of the boundary\.
+    - `RunArchiveRecovery` returns endOfLog; `promoteAfterRecovery` uses the later of it and the writer's end\.
+    - Pins: `TestRunArchiveRecoveryFetchesThenStops` \(endOfLog\), `TestPromoteAfterRecoveryHistorySwitchPoint`\.
+    - Gates: units, `\-race` xlog, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Finding: goopg has no WAL archiver \(no archive\_mode/archive\_command, no \.ready/\.done\) — PG's
+      RemoveNonParentXlogFiles `.ready` exception and the `.partial` rename have nothing to act on; the standby
+      promotion's `Writer\.SwitchTimeline` already removes old\-timeline segments past the switch segment\.
+    - Residual \(ledgered 2026\-10\-21 item 1\): the writer is not repositioned/switched after archive recovery\.
+  - **Recovery parameters validated at start; restore\_command PGC\_SIGHUP LANDED 2026\-10\-29 \(`04b33fccf`\)**\.
+    Movement: none — recovery path\. PG's validateRecoveryParameters \(xlogrecovery\.c\): recovery\.signal without
+    standby mode and without restore\_command is FATAL; a standby with neither primary\_conninfo nor restore\_command
+    warns\.
+    - goopg used to delete recovery\.signal and start as a primary, opening a restored backup without its archived
+      WAL; now `goopg start` exits 1 with PG's message and recovery\.signal stays\.
+    - restore\_command registered PGC\_SIGHUP \(PG 18 guc\_tables\.c\) with PG's sample lines\.
+    - Pins: `TestValidateRecoveryParameters`, `TestStartRecoverySignalWithoutRestoreCommandIsFatal`\.
+    - Gates: units, misc, postmaster, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): archive recovery reads restore\_command once at start \(PG re\-reads on SIGHUP during
+      recovery\); rest of validateRecoveryParameters \(recovery\_target\_action / time / timeline\) not ported here\.
+  - **recovery\_end\_command at the end of archive recovery LANDED 2026\-10\-29 \(`7911ddeda`\)**\. Movement: none —
+    recovery path\. CleanupAfterArchiveRecovery's first step: ExecuteRecoveryCommand with failOnSignal true, `%r` =
+    pg\_control checkPointCopy redo file; a signal \(or shell status \> 125\) is FATAL, any other failure a WARNING\.
+    - GUC registered \(string, '', PGC\_SIGHUP, sample line\); `ExecuteRecoveryCommand` returns the any\-signal
+      classification \(wait\_result\_is\_any\_signal\)\.
+    - Runs from the standby promotion \(before the DB\_IN\_PRODUCTION stamp\) and from `promoteAfterRecovery` \(before
+      recovery\.signal is removed, so a FATAL retries recovery on next start\)\.
+    - Pins: `TestExecuteRecoveryCommandSignalClassification`, `TestStandbyControllerPromoteRunsRecoveryEndCommand`,
+      `TestPromoteAfterRecoveryRunsRecoveryEndCommand`\.
+    - Gates: units, `\-race` xlog, misc, postmaster, cmd/goopg, TestE2E\_Physical\* \+ NativeOnlyReplicationAndPromotion,
+      tpch\-spotcheck, sf025 99/99\.
+    - Residual \(ledgered\): RecoveryEndCommand wait event; RemoveNonParentXlogFiles and the old\-timeline `.partial`
+      rename; restore\_command context \(postmaster vs PGC\_SIGHUP\)\.
+  - **Restartpoint runs archive\_cleanup\_command LANDED 2026\-10\-29 \(`9ef148c9e`\)**\. Movement: none — recovery
+    path\. CreateRestartPoint's last step: ExecuteRecoveryCommand with `%r` = the oldest restartpoint's WAL file
+    \(pg\_control checkPointCopy\.redo \+ TLI\); a failure is a WARNING\. The GUC was not registered at all; it now is
+    \(string, '', PGC\_SIGHUP, sample line\), read at each restartpoint\.
+    - Ported helpers: `ReplacePercentPlaceholders` \(percentrepl\.c\), `ExecuteRecoveryCommand` \(xlogarchive\.c\)\.
+    - Pins: `TestReplacePercentPlaceholders`, `TestRestartPointRunsArchiveCleanupCommand` \(skip arm runs nothing\);
+      the latter fails with the call removed\.
+    - Gates: units, `\-race` xlog, misc, postmaster, replication E2Es, tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): recovery\_end\_command unregistered; restore\_command context postmaster vs PG SIGHUP;
+      no ArchiveCleanupCommand wait event; PreallocXlogFiles; TruncateSUBTRANS on a hot standby\.
+  - **Restartpoint skip arm raises minRecoveryPoint LANDED 2026\-10\-29 \(`28cdbd4a9`\)**\. Movement: none — recovery
+    path\. CreateRestartPoint's skip arm runs `UpdateMinRecoveryPoint\(InvalidXLogRecPtr, true\)` before returning\.
+    `runRecoveryFlush` now does the same through `raiseMinRecoveryPointToReplay`: minRecoveryPoint rises to the replay
+    position \(`StreamReplayer\.ApplyLSN` = PG's lastReplayedEndRecPtr\) when later; an unset one stays unset\.
+    - Pin: `TestRestartPointSkipRaisesMinRecoveryPointToReplay` \(raise / behind / unset; skip arm flushes nothing\);
+      fails with the call neutralised\.
+    - Gates: units, `\-race` xlog, TestE2E\_Physical\*, the standby / base\-backup / promotion / restartpoint E2Es,
+      tpch\-spotcheck, acceptance 24 MATCH, sf025 99/99\.
+    - Residual \(ledgered\): the replayer tracks no timeline, so the TLI stays pg\_control's; PreallocXlogFiles;
+      TruncateSUBTRANS on a hot standby; archive\_cleanup\_command\.
   - **Restartpoint requests follow the replayed WAL LANDED 2026\-10\-28 \(loop \#249, the M0122\-0012 one\-task
     yield\)**\. Movement: none — recovery path\. In recovery `volumeTriggerFires` measures the replayer's `ApplyLSN`
     \(`SetReplayPositionSource`, wired in `cmd/goopg/standby\.go`, cleared at promotion\) and fires once per replay
@@ -4032,6 +5201,204 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       attach roundtrip; tpch\-spotcheck Q12=2/Q13=33; tpcds\-sf025 `PASS=96
       MISMATCH=0 CKMISMATCH=0 ERROR=0 TIMEOUT=0`; pgbench smoke.
 - [ ] **M0122-0014 — Logical replication / decoding / subscription**.
+  - **Refresh data half \(fetch\_table\_list → 'i' rows → tablesync COPY → worker restart\) LANDED 2026-11-01 \(this commit\)**\.
+    Movement: none — subscription DDL + two replication-stream fixes, plan instruments blind \(tpch-spotcheck
+    Q12=2/Q13=35, acceptance arm 24 MATCH, sf025 sweep 99/99 plan-shape identical, fireset-scope OUT, s9 census
+    REUSE routing-20261101\)\.
+    - New `internal/postmaster/subscription_refresh.go::RefreshSubscriptionOnPublisher` \(slot-hook 4th arm,
+      ectx.RefreshSubscriptionOnPublisher, both dispatch build sites\): fetch\_table\_list
+      \(subscriptioncmds\.c:2103 — FetchPublicationTables/pg\_publication join over the dial, XX000 remote
+      refusal / 08006 dial failure\), all-names local resolution BEFORE any row write with the 42P01
+      "table %s does not exist on the subscriber" arm \(:2176-2181\), RemoveSubscriptionRel for leaving
+      tables \(TRUNCATE half ledgered\), create\_subscription\_rel 'i' seeds for entering tables,
+      copy\_data=false → READY marking \(i→s→r waypoints\), copy\_data=true → RunTableSyncManager
+      \(fresh publisher ConnPair + COPY <rel> TO STDOUT → CopyFromExecutor per non-'r' row; per-rel
+      failures aggregate to XX000 after the sweep\), sync-end 's'→'r' promotion \(LSN 1\) so the
+      relaunched worker's 's' gate doesn't eat the first streamed commit\.
+    - Ordering fix: the refresh hook runs BEFORE SetSubscriptionPublications \(PG updates the
+      pg\_subscription tuple only after AlterSubscription\_refresh returns, :834-879\) — a 42P01/XX000/08006
+      abort leaves subpublications unchanged and a retried ADD of the same publication no longer hits its
+      own 42710 guard \(closes the loop #9 "list-write-not-rolled-back" ledger note\)\. Restart split: hook
+      StopWorker \(PG kill-inside-refresh\) + executor's post-write OnSubscriptionChange kick
+      \(wake-after-commit, relaunched worker dials the committed list\)\.
+    - Replication-stream fixes \(both blocked the post-restart streaming pin\): \(a\) slot\_decoder
+      AdvanceConfirmedFlushLSN stores rec\.EndLSN+1 — ConfirmedFlushLSN is the EXCLUSIVE resume boundary
+      \(NewRecordIterator pos = startLSN − 1\); storing inclusive EndLSN made every relaunched stream read
+      its first header one byte early → "invalid record header: padding bytes nonzero" → decoder death on
+      every worker restart; pinned \(semantics updated\) in TestSlotDecoderRunsPlugin/TestSlotDecoderPgCommitAdvance\.
+      \(b\) logicalwalsender select arms: the streamCtx\.Done and runErr arms awaited receiveDone, but the
+      reader parks in ReadFrame on a LIVE socket \(subscriber survives an eager restart\) → session
+      deadlock, slot ACTIVE stuck, clean STOP hang; arms now cancel-and-return \(physical-loop convention\),
+      real decode errors surface via writeStreamingError\. isPermanent: "replication slot is active" \(55006\)
+      reclassified transient → reconnect backoff, pinned in TestIsPermanentClassifier case
+      slot-active-transient\.
+    - Pins: TestPort\_PgoutputInteropGoopgToGoopgRefreshData \(goopg→goopg: ADD p1 initial-COPY 5 rows +
+      'r' + post-ADD INSERT streams through the restarted worker; ADD p2 42P01 abort — zero rows, zero
+      data, list unchanged, retry lands cleanly; retry COPYs u's 3 rows, two 'r' rows; DROP p1 keeps both
+      rows \(t stays published via dummy\) + data intact; DROP p2 removes u's row, keeps u's data\)\;
+      TestAlterSubscriptionPublications hook arms re-verified against the new ordering\; ExecErr plumbing
+      \(pubsubcluster/pgcluster\) supports the 42P01 pin\.
+    - Deferred \(ledgered 2026-11-01\): CREATE SUBSCRIPTION initial sync \(launcher-side seeding today, not
+      commit-time rows+COPY\), ALTER … REFRESH PUBLICATION standalone arm, TRUNCATE on dropping tables,
+      subpublications/subrel heap persistence, real sync-LSN at 's' \(v0 transport writes 1\), the
+      eager-restart window \(PG drains the old stream first\), COPY/streamed-xact overlap
+      \(PK-dedup safety net, no sync-LSN skip-forward\)\.
+  - **ALTER SUBSCRIPTION publication-list refresh half (dial + check\_publications) LANDED 2026-10-31 \(this commit\)**\.
+    Movement: none — subscription DDL, plan instruments blind \(spotcheck, acceptance arm 24 MATCH, fireset no
+    fires, sf025 sweep 99/99\)\.
+    - Closes ledger item \(1\) of the 2026\-10\-31 refresh row: the refresh=true arms dial the publisher
+      \(walrcv\_connect twin replication\.CheckRemotePublications over the replication=database handshake;
+      08006 "subscription %q could not connect to the publisher"\) and run check\_publications' SELECT
+      \(subscriptioncmds\.c:447\-460\) over the publisher's virtual pg\_publication: SET/ADD validate the
+      statement list, DROP is connect\-only \(validate\_publications = NULL\)\. A publisher\-missing name is
+      PG's WARNING \(ereport\(WARNING\) :493\-501 — singular/plural "publication\(s\) %s do\(es\) not exist on
+      the publisher"\) and the statement LANDS; query failure → XX000 "could not receive list of publications
+      from the publisher"; connect/query failure aborts before the registry write \(PG updates the tuple only
+      after the arm's refresh returns\)\.
+    - Server hook: subscriptionSlotHooks' third arm ectx\.CheckPublicationsOnPublisher \(both build sites
+      wired\; nil in test contexts skips the publisher side, the slot hooks' convention\)\. Publisher side
+      needed no change — the walsender dispatcher falls non\-replication verbs through to the regular SQL
+      handler \(measured live, first try\)\.
+    - Pins: TestAlterSubscriptionPublications hook arms \(validate lists per action\, both WARNING texts via
+      TakeNotices\, the 08006 abort leaves the list untouched\, refresh=false never dials\) \+
+      TestPort\_PgoutputInteropGoopgToGoopgAlterPubsRefresh \(live goopg→goopg: publisher\-known ADD lands\;
+      publisher\-unknown ADD LANDS \(psc\.Exec fails on any ERROR — pins the non\-error shape\)\; DROP
+      connect\-only\; SET replaces\; observed via pg\_subscription\.subpublications\)\.
+    - Deferred \(ledgered 2026\-10\-31\): fetch\_table\_list over the open dial\, pg\_subscription\_rel 'i' rows
+      \+ initial COPY \+ i→d→s \(the tablesync library stays unwired in production\)\, the eager worker
+      restart\, copy\_data modelled\, the two\_phase\+copy\_data 55000 arms \(no two\_phase field\)\; the dead\-
+      publisher 08006 / XX000 live pins need a dead\-publisher cluster the pubsubcluster harness lacks.
+  - **ALTER SUBSCRIPTION SET / ADD / DROP PUBLICATION \(statement side\) LANDED 2026-10-31 \(`b48b79212`\)**\.
+    Movement: none — subscription DDL, plan instruments blind \(tpch\-spotcheck, acceptance arm 24 MATCH, fireset
+    no fires\)\.
+    - The three gram\.y:10873\-10901 publication\-list arms \(ALTER\_SUBSCRIPTION\_\{SET,ADD,DROP\}\_PUBLICATION,
+      subscriptioncmds\.c:1374\-1475\) leave the compat no\-op: parser `AlterSubscriptionPublicationsStmt` \(SET
+      branches on `\(` = options vs PUBLICATION = list; ADD/DROP take PUBLICATION only, so ALTER PUBLICATION …
+      ADD TABLE and the REFRESH/SKIP/RENAME tails are untouched\)\, PG's merge\_publications algebra verbatim
+      \(SET replaces / ADD appends / DROP removes; 42710 "publication name %q used more than once" +
+      "publication %q is already in subscription %q"; 42704 "publication %q is not in subscription %q" +
+      "cannot drop all the publications from a subscription"\)\, the refresh gates \(disabled 55000 + the
+      per\-action hints, explicit\-tx 25001 "ALTER SUBSCRIPTION with refresh cannot run inside a transaction
+      block"\)\, refresh/copy\_data validation \(42601 outside the arms' supported\_opts\)\, catalog
+      `SetSubscriptionPublications` \+ pg\_subscription subpublications heap re\-sync \+ launcher wake\.
+    - Found \(ordering pin\): PG runs merge\_publications BEFORE the refresh gates — a single\-publication
+      `DROP PUBLICATION` on a disabled subscription raises the 42704 drop\-to\-empty error, not the disabled
+      55000; pinned in `TestAlterSubscriptionPublications`\.
+    - Pins: `TestParseAlterSubscriptionPublications`, `TestAlterSubscriptionPublications` \(mutation\-style:
+      every arm re\-reads the registry snapshot\)\, 3 `TestDDLCommandTagMatchesPostgres` rows; two stale
+      CompatNoop expectations for `SET PUBLICATION p2` updated in the parser tests\.
+    - Deferred \(ledgered 2026\-10\-31\): the AlterSubscription\_refresh data half — the publisher\-side
+      `publication %s does not exist on the publisher` check \(subscriptioncmds\.c:498\)\, pg\_subscription\_rel
+      'i' rows \+ the tablesync initial COPY \(the internal/replication tablesync library is unwired in
+      production\)\, the eager apply\-worker restart on a list change \(PG's reason the refresh is
+      PreventInTransactionBlock\)\, copy\_data's modelled effect; REFRESH PUBLICATION itself stays a compat
+      no\-op\.
+  - **ALTER SUBSCRIPTION escape hatch LANDED 2026-10-31 \(`c8de1fe4c`\)**\. Movement: none — subscription DDL
+    \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH, fireset no fires, SF0\.25 99/99 \+ SF1 99/99 both arms\)\.
+    - AlterSubscription's ENABLE / DISABLE and SET \(options\) arms \(ALTER\_SUBSCRIPTION\_ENABLED /
+      ALTER\_SUBSCRIPTION\_OPTIONS, subscriptioncmds\.c:1339\-1357 and 1159\-1341\) — the escape hatch DROP's 08006
+      hint names: DISABLE \(launcher reconcile stops the worker, releasing the publisher slot\) → SET \(slot\_name =
+      NONE\) \(disassociated, "" = NULL subslotname\) → DROP SUBSCRIPTION completes against a publisher that never
+      answers\. Closes the 2026\-10\-30 residual "the PG escape hatch for an unreachable publisher is unavailable"\.
+    - Parser `AlterSubscriptionEnableStmt` / `AlterSubscriptionSetStmt` \(SET requires a following `\(`, so SET
+      PUBLICATION / REFRESH / SKIP / RENAME keep the compat no\-op; `SET \(\)` is the upstream no\-op, CREATE's
+      `WITH \(\)` stays an error\); catalog `SetSubscriptionEnabled` / `SetSubscriptionSlotName`; executor arms with
+      PG's 42704 / 55000 "cannot enable subscription that does not have a slot name" / 55000 "cannot set slot\_name =
+      NONE for enabled subscription" / 42601 per\-call supported\_opts / 22023 origin, values through CREATE's
+      defGet\* twins; subenabled / subslotname re\-synced to the pg\_subscription heap, round\-tripped by
+      `reloadSubscriptionsFromHeap`\. goopg wakes the launcher on DISABLE as well \(PG wakes only on ENABLE,
+      1355 — documented deviation: the sequence needs the worker and its slot lease released before the SET\)\.
+    - Pins: `TestAlterSubscriptionEscapeHatch` \(the DISABLE→NONE sequence + every error arm\),
+      `TestParseAlterSubscriptionEscapeHatch`, `TestPubSubSetSubscriptionEnabledAndSlot`, two ALTER SUBSCRIPTION
+      rows in `TestDDLCommandTagMatchesPostgres`\. Gates: units, tpch\-spotcheck Q12=2/Q13=35, tpch\-acceptance\-arm
+      24 MATCH, sf025 sweep PASS, fireset PASS \(no fires\), commit\-hook pgbench smoke PASS\.
+    - Residuals ledgered: REFRESH PUBLICATION / SET PUBLICATION / ADD / DROP PUBLICATION / RENAME / CONNECTION /
+      SKIP \(lsn\) stay compat no\-ops; the supported\-but\-unmodelled SET options validate then drop \(pg\_subscription
+      renders defaults\); synchronous\_commit is not validated through set\_config\_option; the namein 63\-byte
+      truncation and the "failover requires binary = true" check are not reproduced; the apply worker still sends no
+      status updates, so a live slot's confirmed\_flush never advances \(2026\-10\-30 item \(b\)\)\.
+    - **Item \(b\) CLOSED measured 2026\-10\-31 \(loop \#7\)**: the claim is stale — the receiver loop's
+      XLogWalRcvSendReply arms \(10 s StatusInterval ticker, keepalive reply\-request, eager push after each
+      applied commit; logicalreceiver\.go sendStatus\) and the walsender's 'r' parse into
+      Slots\.AdvanceConfirmedFlushLSN \(walsender\.go handleStandbyCopyData\) do advance the publisher slot's
+      confirmed\_flush\_lsn on the live wire\. Movement: none — measurement closure \(pins only, no code\;
+      census routing\-20261031c covers the tree\)\. Pins: `TestPort_PgoutputInteropGoopgToGoopgSlotConfirmedFlush`
+      \(goopg publisher advances past its post\-creation value, monotonically over two commits, 11\.8 s\) and
+      `TestPort_PgoutputInteropPGToGoopgSlotConfirmedFlush` — the parity oracle: a stock PG 18\.3 slot
+      advances on goopg's 'r' frames, proving the echoed pgoutput EndLSNs are real WAL LSNs \(PG moves
+      confirmed\_flush only via LogicalConfirmReceivedLocation\)\. Residual ledgered 2026\-10\-31: the goopg
+      publisher's decoder commit path also advances confirmed\_flush per decoded commit — PG's retention is
+      ack\-driven only, so a goopg publisher can release WAL ahead of a lagging subscriber\.
+  - **Publisher-side slot lifecycle LANDED 2026-10-30 \(`5657546d8`\)**\. Movement: none — subscription DDL /
+    replication \(sf025 PLAN\-SHAPE same=99, arm 24 MATCH\)\.
+    - CREATE SUBSCRIPTION creates the slot on the publisher \(walrcv\_create\_slot: CREATE\_REPLICATION\_SLOT
+      "s" LOGICAL pgoutput \(SNAPSHOT 'nothing'\)\) before the registry insert, with PG's NOTICE and the
+      08006 / 08P01 errors; DROP SUBSCRIPTION removes the registry row, stops the apply worker
+      \(logicalrep\_worker\_stop\), drops the slot on the publisher \(DROP\_REPLICATION\_SLOT "s" WAIT,
+      missing\_ok = false\) and restores the registry row when the publisher refuses\.
+    - goopg→goopg logical replication now DELIVERS \(the 2026-10-30 ledgered gap: no slot ever existed, so
+      START\_REPLICATION failed on every retry\)\. walsender: DROP\_REPLICATION\_SLOT … WAIT, bounded retry
+      while the slot is owned\.
+    - Fix: CreateSubscriptionAsOwner stored "" slotName as the subscription name — slot\_name = NONE became
+      indistinguishable from the default and DROP chased phantom slots; the name default now lives only in
+      the executor \(DefineSubscription\), the registry stores as given, pg\_subscription renders NULL\.
+    - Pins: TestSubscriptionPublisherSlotHooks, TestPgSubscriptionViewRendersRows \(NONE arm\); ports:
+      TestPort\_PgoutputInteropGoopgToGoopg, TestPort\_PgoutputInteropPGToGoopgSlotLifecycle\.
+      Gates: units, testport pgoutput\-interop \+ subscription families, tpch\-spotcheck, acceptance arm
+      24 MATCH, sf025 99/99 \(fire\-set out of scope\)\.
+    - Residuals ledgered: ALTER SUBSCRIPTION SET \(slot\_name = NONE\) / ENABLE / DISABLE / REFRESH not
+      implemented — the PG escape hatch for an unreachable publisher is unavailable\.
+  - **Publication DDL forms LANDED 2026\-10\-30 \(`32bbaaf04`\)**\. Movement: yes — regress publication 2213→2208\.
+    - ALTER PUBLICATION SET \(options\) \(was a no\-op\)\; DROP PUBLICATION name lists, validated before any drop, with
+      the IF EXISTS NOTICE\; CREATE … FOR TABLE \[ONLY\] t \[\*\]\. Shared applyPublicationOptions uses PG's 42601 errors\.
+    - Pins: `TestPublicationDDLForms` \(mutation\-checked\), `TestParsePublicationDDLForms`\. Goldens: 1 line \(Names\)\.
+      Gates: units, testport 28, tpch\-spotcheck, acceptance arm 24 MATCH, fire\-set PASS, sf025 99/99\.
+  - **ALTER PUBLICATION ADD / SET / DROP TABLE LANDED 2026\-10\-30 \(`2738001df`\)**\. Movement: none — regress publication
+    2209→2213 \(gains offset by cascades from unmodelled CREATE forms\)\. Before, every form except OWNER TO was a silent
+    no\-op, so pg\_dump's `ADD TABLE ONLY` restored no membership\.
+    - Parser → `AlterPublicationTablesStmt` \(column lists, row filters and TABLES IN SCHEMA stay no\-ops\)\. Executor:
+      PG's 42704 / 55000 / 42P01 / 42710 / 42704 errors, duplicate folding\. pg\_publication\_rel rows are journalled
+      and survive a restart\.
+    - Fixed alongside: pg\_publication\_rel prqual/prattrs were "" instead of NULL \(`\\dRp+` printed `() WHERE`\)\.
+    - Pins: `TestAlterPublicationTables`, `TestParseAlterPublicationTables`,
+      `TestParseAlterPublicationUnmodelledTableFormsStayNoop`\. Gates: units, parser/catalog/initdb, testport
+      publication/pgoutput/subscription 28, tpch\-spotcheck, acceptance arm 24 MATCH, fire\-set PASS \(no fires\),
+      sf025 99/99\.
+    - Found: `go test \./internal/postmaster` fails intermittently, the same way at HEAD and at 2bc45c8b3
+      \(ledgered\)\. Also the sf025 log growth, filed under M\-NIGHTLY\.
+  - **Replica\-identity column flags \+ CheckCmdReplicaIdentity LANDED 2026\-10\-30 \(`4a0cf54cc`\)**\. Movement: none — regress
+    publication 2209→2209 \(its RI cases sit behind the ALTER PUBLICATION ADD TABLE no\-op\)\.
+    - The Relation message flags only identity columns \(FULL all, DEFAULT PK, USING INDEX the index, NOTHING none\;
+      deferrable never\)\. Before, a goopg subscriber kept a stale row next to an updated one \(latent: goopg→goopg does
+      not deliver yet\)\.
+    - UPDATE/DELETE on a table publishing them without a replica identity → 55000 with PG's message and hint\.
+    - Pins: `TestApplyWorkerUpdatesNonKeyColumnOverPgoutput`, `TestCheckCmdReplicaIdentity` \(mutation\-checked\)\.
+      Gates: units, testport replication/pgoutput/subscription 41, tpch\-spotcheck, acceptance arm 24 MATCH, sf025
+      99/99\.
+    - Residuals ledgered\.
+  - **pgoutput Relation message fidelity LANDED 2026\-10\-30 \(`f0c7b6718`\)**\. Movement: none — logical replication
+    wire format\. A PG subscriber applied nothing for a goopg table created without a schema: the namespace was
+    written "" and logicalrep\_read\_namespace reads "" as pg\_catalog\.
+    - Namespace by name \(only pg\_catalog as ""\), relreplident from the table, per\-column atttypmod
+      \(nodes\.ColumnTypmod, pinned to executor\.pgAttTypmod\)\.
+    - Pins: `TestPgOutputRelationMessageFields`, `TestAttTypmodSiblingsAgree`\. Oracle
+      `TestPort\_PgoutputInteropGoopgToPGUnqualifiedTable` \(fails with the mapping reverted\)\.
+    - Gates: units, testport pgoutput\-interop \+ replication \(37\), tpch\-spotcheck, acceptance arm 24 MATCH, sf025
+      99/99\.
+    - Residuals ledgered \(replica\-identity column flags, interval typmod\)\.
+  - **pg\_logical\_emit\_message producer and decoding LANDED 2026\-10\-30 \(`a45162dc3`\)**\. Movement: none — logical
+    decoding messages \(sf025 PLAN\-SHAPE same=99, acceptance arm 24 MATCH\)\. Design:
+    `docs/design/0100-0149/0122-0014-logical-message-producer.md` \(draft → landed\)\.
+    - LogLogicalMessage → an RM\_LOGICALMSG record \(pg\_waldump decodes it as PG does\)\. logicalmsg\_decode /
+      ReorderBufferQueueMessage: transactional queued in the xact, non\-transactional immediate, database filter\.
+      pgoutput `messages` option\.
+    - Found and fixed: IDENTIFY\_SYSTEM's dbname was always NULL, so pg\_recvlogical could not connect\. It is now
+      named for replication=database connections\.
+    - Pins: `TestLogicalMessageDecoding` \(mutation\-checked\), `TestLogicalMessageCodec`, `TestPgOutputMessagesOption`\.
+      Oracle `TestE2E\_LogicalMessageReachesPgRecvlogical` \(PG 18\.3 pg\_recvlogical\; fails without the dbname fix\)\.
+    - Gates: units, postmaster, testport replication \+ pgoutput\-interop \+ pg\_basebackup/receivewal \(44\),
+      tpch\-spotcheck, tpch\-acceptance\-arm 24 MATCH, sf025 99/99\.
+    - Residuals ledgered\.
   - **MESSAGE wire half LANDED 2026\-09\-22 \(loop \#13\)** as `8170a6f29`.
     Movement: none — replication wire format.
     Design: `docs/design/0100-0149/0122-0014-pgoutput-message-wire.md`.
@@ -4087,7 +5454,7 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       are unimplemented; a WARNING preceding an ERROR in the same statement is
       lost; CREATE FOREIGN TABLE reports the command tag `CREATE TABLE`;
       foreign\-catalog heaps are single\-database across restarts\.
-  - [ ] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
+  - [x] **M0122-0015f — `x = ANY \(non\-array\)` is accepted**
     Kind: impl
     Parent: M0122-0015
     Found 2026\-10\-12 while testing M0122\-0015b\.
@@ -4096,7 +5463,27 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       make\_scalar\_array\_op\)\. Same for the OPERATOR\(\.\.\.\) spelling\.
     - First step: reject a non\-array right operand in the analyzer\'s
       ANY/ALL typing\.
-  - [ ] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
+    - LANDED 2026\-11\-01 \(this commit\) — the quantified desugar marks its
+      three ARRAY splice sites with `parser\.InExpr\.SplicedArray`
+      \(direct `ANY \(ARRAY\[\.\.\.\]\)` is scalar\-element by construction and
+      must stay legal\); `checkAnyAllArrayOperand` gates the resolved list at
+      both twin producers \(planInExpr + resolveInListAfterAggregate\),
+      rejecting statically\-resolved scalars with the oracle\'s exact
+      42809 message/caret/SQLSTATE and accepting the subquery/splice/
+      array\-typed/\(ARRAY\[1\]\)/NULL forms\. Bare string literals stay
+      status\-quo \(PG\'s UNKNOWN\->array coercion + the pre\-existing
+      `ANY \(a, b\)` expr\-list laxness ledgered 2026\-11\-01\)\.
+      Design `docs/design/0100\-0149/0122\-0015f\-any\-all\-array\-operand\.md`\.
+      - Pins: `TestAnyAllScalarOperandRejected` \(6 rejects + 7 accepts incl\.
+        `ANY \(ARRAY\[i\_flag\]\)` and `ANY \('\{1\}'\)`\)\;
+        `TestSAOPUnmovedShapes` swapped its PG\-rejected `= ANY \(i\_flag\)`
+        case for the legal `ANY \(ARRAY\[i\_flag\]\)` shape; 40 parser
+        goldens regenerated additive\-only \(all 16 splice `true` lines
+        reviewed\)\.
+    Movement: none — analyzer typing; the 42809 shape exists in no TPC
+    query \(fireset fires=none, 99/99 plans unchanged\; acceptance arm 24
+    MATCH\; sf025 sweep PASS\; spotcheck Q12=2/Q13=35\)\.
+  - [x] **M0122-0015a — `COPY` resolves relations in the DEFAULT database, so
     `pg_dump` of any user-created database has no data**
     Kind: impl
     Parent: M0122-0015
@@ -4127,6 +5514,87 @@ Priority` banner at the head of this file currently says (item 10 tail as of
       2026\-09\-22 — this task is committable again.** The port and the ledger
       rows landed; the fix itself is still open and is the durable\-fix
       sibling\-audit described above.
+    - LANDED 2026\-11\-01 \(this commit\) — both COPY plan sites now resolve
+      through the dispatch scoping, no fourth field\-by\-field patch:
+      `dispatchCopyViaExecutor` plans via `optimizer.PlanWithSettings` +
+      `sessionPlanCatalog`/`resolveConnDBOid`/`sessionPlannerSettings` \(the
+      dispatch PlanCatalog shape, M0122\-0007 slice 4c\) and stamps the
+      context through `wireExtensionRows` + `ectx.PlanCatalog`; the
+      Rule\-#2 twin `runInlineCopy` \(multi\-statement batch, borrows the
+      batch ectx\) plans via `ctxPlanCatalog`/`ctxPlannerSettings` \(the
+      executeOneSimpleStmt shape\).
+      - Live probe \(scratch cluster, PG 18\.3 client tools\): standalone
+        `COPY t1 TO STDOUT`/`FROM STDIN` in a `CREATE DATABASE` database
+        work \(42P01 gone\); `public\.`\-qualified spelling works; the
+        multi\-statement twin `BEGIN; COPY t1 TO STDOUT; COMMIT` works;
+        `pg_dump <userdb>` completes with its data section \(was dying at
+        the first COPY\), and the dump round\-trips through psql into a
+        fresh database \(3/3 rows\)\; the default\-database control and
+        inline FROM \+ ROLLBACK \(rows not persisted\) unchanged\.
+      - Pin: `TestCopyStandaloneResolvesNonDefaultDatabase`
+        \(postmaster/copy\_executor\_test\.go\): user\-db TO \(both
+        spellings\), FROM twin proven through a re\-read, the inline\-batch
+        twin, and the DefaultDBOid\-fallback control on the default
+        database\. Mutation\-checked: reverting the standalone plan line
+        fails it with the production 42P01\; reverting the twin line fails
+        it at the inline arm\.
+      - Sibling audit \(the task\'s own requirement\): every other
+        `executor.NewContext` site in postmaster is already scoped on
+        purpose — subscription refresh stamps the subscriber\'s dbOid
+        \(M0122\-0014\)\; `runAuthidHeapTxn` and the database\-DDL heap sync
+        guards stamp DefaultDBOid \(shared catalog\) or the created
+        database\'s oid; the extended path wires per\-DB via
+        `wireExtensionRows` \(dispatch\_extended\.go:241\)\;
+        `subscription refresh` passes the resolved table object
+        directly\. COPY was the last under\-scoped site\.
+      - Unblocks the test\-port tier: 18 of the 23 unported
+        `005_pg_dump_filterfile` assertions are PORTED \(this commit —
+        subtests `pg\_dumpall\_exclude\_database` \+
+        `restore\_of\_other\_objects`\)\; the ported pair closes defects
+        \(2\)\/\(3\) of that file\'s measured list \(pg\_proc leak by
+        M0122\-0015d, PREPARE by 0015c, COPY by this task\)\. CSV 69→87
+        of 92\; regen\-testport \+ check\-testport\-inventory PASS\.
+      - Newly measured \(filed as M0122\-0015h below, S2\): the remaining
+        5 assertions need `pg\_get\_indexdef`/`pg\_get\_triggerdef`, which
+        return empty strings — `pg_dump` archives INDEX/TRIGGER entries
+        with empty bodies, so restores lose index/trigger DDL\.
+      - Observed \(pre\-existing, not filed — no nightly subject\):
+        `TestSimpleQueryBatchAbortUndoesEarlierCreateTable`
+        \(dispatch\_batch\_atomicity\_test\.go\) flakes under
+        `go test \-parallel 4` load \(CREATE TABLE undo lost\) and passes
+        in isolation; reproduced IDENTICALLY on the unmodified tree twice\.
+    Movement: none — client\-tool/session correctness\; no plan instrument
+    \(fireset\-scope OUT on `internal/postmaster/copy\.go`\; tpch\-spotcheck
+    Q12=2/Q13=35\; acceptance arm 24 MATCH\; sf025 sweep 99/99
+    plan\-shape identical\; s9 census REUSE\)\.
+  - [ ] **M0122\-0015h — `pg\_get\_indexdef` / `pg\_get\_triggerdef` return the
+    empty string, so `pg\_dump` archives INDEX/TRIGGER entries with no DDL**
+    \(filed 2026\-11\-01 by the M0122\-0015a loop while unblocking the
+    `005\_pg\_dump\_filterfile` sourcedb arms\)\.
+    - > **ESCALATION 2026\-11\-01 \(S2, data loss on restore\).** The custom\-format
+      > dump of ANY table with an index or trigger archives those TOC entries
+      > with EMPTY bodies\; `pg\_restore` replays a bare `;` and the restored
+      > database silently lacks every index and trigger\. Measured on the
+      > `005` fixture: `pg\_restore --list filter\_test.dump` lists
+      > `251; 1259 16463 INDEX public t1_idx1` and `253; 2620 16465 TRIGGER
+      > public t1 trg1`, and `pg\_restore --file` emits comment blocks + `;`
+      > for each — no `CREATE INDEX`/`CREATE TRIGGER` text\.
+    - Cause: `SELECT pg\_get\_indexdef\(i\.indexrelid\) FROM pg\_index i` → empty
+      string\; `SELECT pg\_get\_triggerdef\(oid\) FROM pg\_trigger` → empty string
+      \(rows exist — `count\(\*\) FROM pg\_trigger WHERE tgname IN
+      \('trg1','trg2'\)` = 2\)\. pg\_dump\'s `collectIndexDefinitions` /
+      trigger collection build the archived DDL from exactly these functions
+      \(`pg\_dump\.sh`/`index\.c`/\`trigger\.c\`\)\.
+    - First step: implement `pg\_get\_indexdef\(oid\)` as PG\'s
+      `pg\_get\_indexdef\_internal` \(`catalog/pg\_index\.c` is the entry; the
+      deparse is `ruleutils\.c: pg\_get\_indexdef\_worker` — the same machinery
+      goopg\'s EXPLAIN index rendering already walks\) and `pg\_get\_triggerdef`
+      as PG\'s `pg\_get\_triggerdef\_worker` \(ruleutils\.c\)\; the pin is the
+      `005` index/trigger arm \(5 assertions\), ported with it\.
+    - Rank: below item 10 under the S7 correctness\-only carve\-out \(no plan
+      instrument\; expected `Movement: regress`/`none`\)\.
+    Kind: bug
+    Parent: M0122\-0015
   - [!] **BLOCKED — OWNER ACTION NEEDED \(2026\-09\-22, loop \#17\)**. The
     foreign\-table durability work below is complete, fully gated and
     **staged**, but `git commit` cannot land it: the `commit-msg` hook exits
@@ -6617,6 +8085,71 @@ Sequencing: the S9 replenishment rule in the banner.)
     `3d6366064` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
   - S9 re\-check 2026\-10\-28 \(loop \#262\) — **exhausted at `b54e7fa8d`**, census `routing\-20261028r/` reused:
     `b54e7fa8d` is ralph only\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `59adcaea7`**, fresh census `routing\-20261029a/` \(trigger `881b3e314`,
+    M0122\-0021 slice 1 changed internal/executor; TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0
+    everywhere\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `28a5ff4c9` \(M0122\-0021 slice 2 changed internal/executor\) — `routing\-20261029b/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `2ffd7717f`**, census `routing\-20261029b/` reused \(`2ffd7717f` is
+    ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `132bf92d2` \(M0122\-0021 slice 3 changed internal/executor\) — `routing\-20261029c/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `56a368db9`**, census `routing\-20261029c/` reused \(`56a368db9` is
+    ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `b93ad5337` \(M0122\-0021 slice 4 changed internal/executor\) — `routing\-20261029d/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - S9 re\-check 2026\-10\-29 — **exhausted at `f15a1ac3c`**, census `routing\-20261029d/` reused \(`f15a1ac3c` is
+    ralph/analysis only\)\. No task is filed\. Same items\-0\-9 tokens as the loop \#246 note\. Item 10 is live\.
+  - Census 2026\-10\-29 at `04cc96f3b` \(M0122\-0021 residual 1 changed internal/executor\) — `routing\-20261029e/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `d38dd96ed` \(M0122\-0021 residual 2 changed internal/executor\) — `routing\-20261029f/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `c49bd9b71` \(M0122\-0021 residual 4 changed internal/executor\) — `routing\-20261029g/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `910e30183` \(M0122\-0021 residual 3 changed internal/executor\) — `routing\-20261029h/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `431cec8d7` \(M0122\-0021 residual 10 changed internal/executor\) — `routing\-20261029i/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `7ad6a9d6b` \(M0122\-0021 residual 9 changed internal/optimizer \+ executor\) — `routing\-20261029j/`:
+    TPC\-H 22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029i\.
+  - Census 2026\-10\-29 at `28c6de6c8` \(M0122\-0021 residual 14 changed internal/executor\) — `routing\-20261029k/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. Captured in the same loop for the next S9 reuse\.
+  - Census 2026\-10\-29 at `fdde69739` \(M0122\-0021 residual 12 changed internal/executor\) — `routing\-20261029l/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical to routing\-20261029k\.
+  - Census 2026\-10\-29 at `ee57789ff` \(M0122\-0021 BUFFERS default changed internal/executor\) — `routing\-20261029m/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere\. ea\-ratchet FAIL \(8 NEW, pre\-existing at 997db829b, ledgered\)\.
+  - Census 2026\-10\-29 at `45b925ffd` \(IN\-list correlation fix changed internal/optimizer\) — `routing\-20261029n/`: TPC\-H
+    22/22, SF0\.25 99/99, SF1 99/99; CATEGORIES\-EXCL\-MATCH 0 everywhere; plan text byte\-identical; fire\-set no fires\.
+  - Census 2026\-10\-30, S9 exhausted at `8c85bc43d` \(M0122\-0014 `a45162dc3` changed internal/executor\) —
+    `routing\-20261030a/`: TPC\-H 22/22, SF0\.25 99/99, SF1 99/99\. CATEGORIES\-EXCL\-MATCH 0 everywhere; goopg plan text
+    byte\-identical to routing\-20261029n\. Nothing filed\. Open item 0\-9 tasks:
+    - M0146\-0014\(channel\), M0146\-0042\(channel\);
+    - M0146\-0007/0012b/0067/0175\(below\-item\-10\);
+    - M0146\-0153/0154/0160/0161/0162/0163/0164/0166/0167/0168/0173/0205/0238/0239/0243\(below\-item\-10\);
+    - M0142\-0008c\-1a/0008c\-3d/0008c\-4\(blocked\-on M0145\-0003\); M0146\-0010a and M0146\-0035 are held `\[\!\]`\.
+  - Census 2026\-10\-30, S9 exhausted at `f70664de8` \(`f0c7b6718` touched internal/executor with a \_test\.go file
+    only; re\-captured anyway so reuse holds strictly\) — `routing\-20261030b/`: 22/22·99/99·99/99, plan text
+    byte\-identical to routing\-20261030a\. Nothing filed; the open item 0\-9 tasks and their gates are as in the
+    20261030a note above\.
+  - Census 2026\-10\-30, S9 exhausted at `ed2227a64` \(`4a0cf54cc` changed internal/executor\) — `routing\-20261030c/`:
+    22/22·99/99·99/99, plan text identical to routing\-20261030b\. Nothing filed; open item 0\-9 tasks and gates as in the
+    20261030a note\.
+  - S9 exhausted at `e3598f114` \(2026\-10\-30; DUE after `2738001df`\) — `routing\-20261030d/ROUTING\.md` only \(unchanged
+    census, S9\(4a\)\); id\(gate\) list as in the 20261030a note above\.
+  - S9 exhausted at `cfc5b5497` \(2026\-10\-30; DUE after `32bbaaf04`\) — `routing\-20261030e/ROUTING\.md` only \(unchanged
+  - S9 exhausted at `5657546d8` \(2026\-10\-30; DUE after `5657546d8`, reason=plan\-relevant\-change\) —
+    `routing\-20261030f/ROUTING\.md` only \(unchanged census\)\; the id\(gate\) list is unchanged from the note above\.
+  - S9 exhausted at `56dea44e6` \(2026\-10\-31; DUE after `56dea44e6`, reason=plan\-relevant\-change — the
+    flush\-race fix touched `internal/storage/bufpool\.go`\, in the trigger set\) — `routing\-20261031a/ROUTING\.md`
+    only \(unchanged census\, S9\(4a\)\; `tree=` omitted: the capture ran with in\-progress ALTER SUBSCRIPTION edits
+    in the working tree\)\; the id\(gate\) list is unchanged from the note above\.
+    census\); id\(gate\) list as in the 20261030a note above\.
+  - S9 exhausted at `c8de1fe4c` \(2026\-10\-31; DUE after `c8de1fe4c`, reason=plan\-relevant\-change — the ALTER
+    SUBSCRIPTION slice touched `internal/optimizer/planner\.go`\, `internal/parser/ddl\.go` \+ `ast\.go`\,
+    `internal/catalog/pubsub\.go` and `internal/postmaster/dispatch\.go`, all in the trigger set\) —
+    `routing\-20261031b/ROUTING\.md` only \(unchanged census, S9\(4a\)\; capture at head `bd20cec5b` with
+    `tree=e3df993166e67fc78c7a8aecdbece6910db2c39a` — `git diff --quiet -- internal cmd scripts bench go.mod go.sum`
+    held at capture time\)\; the id\(gate\) list is unchanged from the note above\.
 - [ ] **M0146-0042 — EXPLAIN text-identity burn-down** (impl; owner
   decision 2026-10-02, split out of M0146-0005's scope — see banner
   item 3 and OWNER DECISIONS 2026-10-02). Work the `rendering`-category
@@ -9603,7 +11136,7 @@ open until its output matches PostgreSQL 18.3; every missing prerequisite is
 filed and implemented as that suite task's child. Ledger-only parking is not a
 completion path.
 
-- [ ] **M0148-0001 — aggregates.sql regress coverage closure**.
+- [x] **M0148-0001 — aggregates.sql regress coverage closure**.
   Kind: impl
   Parent: none
   - Baseline first: run `scripts/pg-regress-runner.sh -v aggregates` at HEAD
@@ -9613,3 +11146,1157 @@ completion path.
   - Complete only at byte-normalized expected-output parity, with the inventory
     row promoted to `pass` / `pass_required=yes`, regenerated coverage docs,
     and the next canonical M0148 suite task materialized.
+  - LANDED 2026-11-04 in 80c8249f9 (last slice M0148-0001f3a, typed
+    text-literal labels): `scripts/pg-regress-runner.sh aggregates` PASS
+    (100% parity, stable x3); TestPort_RegressSuite/aggregates PASS in the
+    full ordered run; inventory row → pass / pass_required=yes, coverage
+    docs regenerated, make check-testport-inventory OK. Open residue
+    children (c3a, c3b, e2, f3, g1, h1, i2, j2, k1) carry differences in
+    OTHER suites only; next suite materialized as M0148-0002 (copy).
+  Movement: yes — regress runner aggregates 40 hunks (baseline 5a43057d6) → PASS; inventory regress pass count +1
+  - Baseline run 2026-11-01 (loop #15) at `5a43057d6`: 40 hunks / 988 diff
+    lines (`tmp/m0148/aggregates-baseline-5a43057d6.log`,
+    `tmp/regress-diffs/aggregates.diff`). Classification: 4 FILTER-syntax
+    hunks (incl. the aggordview1 CREATE-view cascade), 1 WITHIN-GROUP wording
+    hunk, 2 bitwise COPY/bit-in hunks, 7 EXPLAIN-Output/format hunks, 11
+    plan-shape hunks (scalar-agg InitPlan, GROUP BY reduction, pathkey order,
+    Incremental Sort, parallel agg), 7 pg_get_viewdef hunks, 1 DROP-CASCADE
+    NOTICE hunk, 1 NOTICE-ordering hunk, rest parallel/format.
+  - - [x] **M0148-0001a — aggregate clause cross-product grammar arms.**
+      Kind: impl
+      Parent: M0148-0001
+      Landed loop #15: nine `name_or_call` arms (args-ORDER-BY × FILTER ±OVER,
+      DISTINCT-args-ORDER-BY × FILTER ±OVER, args-ORDER-BY × WITHIN GROUP
+      raising gram.y's production-time "cannot use multiple ORDER BY clauses
+      with WITHIN GROUP" (42601, caret at WITHIN), WITHIN GROUP × FILTER);
+      the FILTER pipeline itself already existed (M0097-0007/-0032/-0035).
+      Closed 6 hunks incl. the aggordview1 chain (its SELECT now matches PG:
+      rank/percentile_disc WITHIN GROUP + FILTER execute correctly).
+      Movement: none (no optimizer/planner files staged; fireset-scope OUT).
+  - - [x] **M0148-0001b — bit_in/varbit_in text prefix scan.**
+      Kind: impl
+      Parent: M0148-0001
+      Landed loop #15: `nodes.ScanBitInput` (varbit.c:147-276/452-577: b/B
+      binary, x/X hex ×4 MSB-first, bare binary from 0; rune-aware first
+      bad-char 22P02; VARBITMAXLEN 54000) shared by the codec assignment arms
+      (canonical digit text stored), `parseBitFromString` (pgwire consts) and
+      a new string→bit/varbit cast arm with cast-time 22026/22001. Closed
+      2 hunks (bitwise COPY row + BIT_AND/OR/XOR results).
+      Movement: none (postmaster units green; spotcheck Q12=2/Q13=35).
+  - Post-children state: 33 hunks remain; all map to the children below.
+    Runner diff `tmp/regress-diffs/aggregates.diff` (891 lines).
+- [x] **M0148-0001c — scalar group aggregates become InitPlan + Limit over an
+  index scan (min/max optimization)**.
+  Kind: impl
+  Parent: M0148-0001
+  `select max(unique2) from tenk1 order by 1` must plan InitPlan → Limit →
+  Index Only Scan Backward (tenk1_unique2), not Aggregate→Index Scan; same
+  for `max(unique2), generate_series(...)` (InitPlan + Result + ProjectSet),
+  inheritance-tree min/max (Merge Append + Limit, `minmaxtest`), and the
+  shared `InitPlan 1` + `SubPlan 2` shape for the correlated `distinct min`
+  subquery. PG: scalar-group-agg → InitPlan transform (PG13+
+  `optimizer/prep/prepagg.c`; `planner.c` scalar-group path) +
+  `createplan.c` `create_limit`/`create_indexscan` (backward scan) costing.
+  Also the `(InitPlan 1).col1` label rendering (see 0001f).
+  Verify: `scripts/pg-regress-runner.sh -v aggregates` hunks at
+  expected-lines 950-1108.
+  - LANDED loop #16 slice (a) `31b75104b` — label rendering at the Sort /
+    Group Key sites above a min/max-rewritten Result: the key chase
+    (`resolveKeySourceDepth` Result arm) lands on the initplan
+    `SubqueryExpr` target (fail-closed: name-checked index,
+    `SublinkIsInitPlan`, non-nil plan), and computed keys gain
+    `chaseKeyExprToInitPlanRef` (only columns landing on an InitPlan
+    sublink are replaced). The sites' existing S18 wrap + the
+    `formatExprQual` SubqueryExpr arm render
+    `Group Key: (InitPlan 1).col1`, `Sort Key: ((InitPlan 1).col1)`,
+    `Sort Key: (((InitPlan 1).col1 + 1))`. Closed 4 hunks (33 → 29:
+    expected-lines 950/967/984/1001). Pin:
+    `TestExplainKeyOverMinMaxResultInitPlanRef`.
+    Movement: spotcheck Q12=2/Q13=35, sf025 sweep 99/99 plans identical,
+    acceptance arm 24 MATCH (fireset-scope OUT: internal/executor, G9).
+  - LANDED loop #17 slice (b) — multi-target min/max tlist becomes
+    `Sort → ProjectSet → childless Result` (aggregates hunk 1016 closed
+    byte-exact, 29 → 28). The gate drops `len(s.Targets) != 1`:
+    planagg.c gates per AGG (`can_minmax_aggs`:236), not the tlist length,
+    and `create_minmaxagg_plan`'s `make_result(tlist, quals, NULL)`
+    (createplan.c:2546-2612) keeps every non-agg entry. New
+    `strictMinMaxTarget` finds the one strict min/max target; new
+    `minmaxTListSurvivor` admits only jointree-surviving extras — constants
+    and bare `generate_series` over constants, because `build_minmax_path`
+    moves the relation RTE into the InitPlan subquery and the main jointree
+    is emptied, leaving no RTE for a relation Var. (Trap the pin caught:
+    `isConstantExpr` recurses on args only, so a 0-arg FuncCall —
+    `count(*)` — reads "constant"; the helper dispatches on `*FuncCall`
+    first.) Assembly: InitPlan + surviving consts in the childless Result,
+    SRF targets become `SrfCols` with `OtherExprs` nil at SRF slots, and a
+    `ProjectSet` zips them above (const-only extras ⇒ no ProjectSet); the
+    executor's proven `openSelectSrfMode` path is reused unchanged.
+    `wrapMinMaxOrderByDistinct` re-scans for the agg (label from
+    `outSchema[aggIdx]`), resolves a declined ORDER BY item's RAW
+    expression against the rewritten output (that is `order by g`), and
+    declines ordinals over a multi-target tlist. New
+    `*optimizer.ProjectSet` chase arm: SRF slot ⇒ renderer-synthesised
+    `generate_series` FuncCall ⇒ `Sort Key: (generate_series(1, 3)) DESC`
+    via S18; non-SRF slot steps through `OtherExprs` into the Result (the
+    slice (a) arm ⇒ `(InitPlan 1).col1`). `InitPlan 1` lands on the Sort
+    for free: `LevelInitPlansOf` descends through the ProjectSet child.
+    Pins: `TestRewriteMinMaxAggMultiTargetProjectSet` +
+    `TestRewriteMinMaxAggMultiTargetDeclines` (the old
+    `TestRewriteMinMaxAggMultiTargetOrderByDeclines` pinned the decline
+    this slice replaces), `TestExplainMinMaxMultiTargetProjectSet`
+    (rendered block texts, InitPlan-above-ProjectSet order, rows
+    `20|3/20|2/20|1`, const-extra shape, scope bounds).
+    Movement: spotcheck Q12=2/Q13=35, sf025 sweep, acceptance arm 24 MATCH,
+    fireset gate SF0.25+SF1 (G9 IN-SCOPE, optimizer staged). Deferral
+    ledger: multi-agg tlist (N InitPlans), non-`generate_series` SRF extras
+    + Var/sublink/aggregate-bearing extras, ordinal ORDER BY over a
+    multi-target tlist.
+    Remaining 0001c slices: (c) inheritance-tree Merge Append
+    min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
+    sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
+  - LANDED loop #18-#20 slice (c) part 1 `91a958dd2` — multi-agg min/max
+    tlist lands as N InitPlans over the one childless Result: the gate
+    became the per-agg loop (`aggIdx []int`; a min/max-named call that is
+    NOT the strict `can_minmax_aggs` shape rejects the whole rewrite,
+    planagg.c:100-115), the per-agg body moved to `buildMinMaxInitPlan`
+    (WHERE re-resolved per agg — the IOS covered-index remap rewrites
+    ColumnRef space, so one resolved predicate must not serve two
+    InitPlans), the Result's targets carry one InitPlan Param per agg in
+    tlist order (createplan.c:2546-2612), and `wrapMinMaxOrderByDistinct`
+    substitutes per (FuncCall, label) pair with the slice (b) raw-name
+    fallback. Inheritance parents STAY declined (gate
+    `AccessibleInheritanceChildren`). Pins:
+    `TestRewriteMinMaxAggMultiInitPlans` (min forward / max Backward IOS)
+    + the executor EXPLAIN shape/rows in
+    `TestExplainMinMaxMultiTargetProjectSet`; the `min(x), max(x)`
+    declines-case moved to landing. aggregates stays at 28 hunks (the
+    corpus has no plain-table multi-agg EXPLAIN). Movement: fireset gate
+    SF0.25+SF1 99/99+99/99 `fires=none`, spotcheck Q12=2/Q13=35, sf025
+    sweep 99/99 identical, acceptance arm 24 MATCH, precommit smoke PASS.
+    Deferral ledger: the inheritance sub-slice (appendrel MergeAppend:
+    per-child IOS incl. DESC-index + partial-index predicate proof, each
+    `Index Cond: (f1 IS NOT NULL)`, merged by Merge Append — plus the
+    rendering half: child RTE aliases `minmaxtest_1..9` with GLOBAL
+    numbering across InitPlans, the Merge Append `Sort Key:` line
+    (explain arm TODO operators_explain.go:6741)) and the ordinal
+    ORDER-BY scope bound extended to the multi-agg tlist.
+    Remaining 0001c slices: (c2) inheritance-tree Merge Append
+    min/max hunk 1066, (d) correlated `distinct min` sublink InitPlan
+    sharing hunk 1108/1145 (SubPlan numbering + added `IS NOT NULL` qual).
+  - LANDED run-2 loop #2 slice (c2) `c4b80c6d6` — an inheritance parent's
+    min/max plans PG's appendrel shape: per agg, `Limit → Merge Append` of
+    one Index Only Scan per member (`buildMinMaxAppendRelMerge`, ordered
+    `SetOp` chain; partial index whose predicate is `col IS NOT NULL` ⇒ no
+    Index Cond via `minmaxMemberIndex`); `FROM ONLY` keeps the plain shape.
+    `SetOp.RTID`/`AppendRelName` are PG's apprelids: the parent claims the
+    bare name, members `_1`..`_4`, InitPlan 2 continues `_5`/`_6`..`_9`;
+    `appendRelMergeKeyParts` prints `Sort Key: minmaxtest_5.f1 DESC`;
+    `explainNames.labelSeen` now persists across collect calls (the
+    per-subplan collect relabelled InitPlan 2's members `_1`..`_4`).
+    `minmaxScanBackward` fixes the DESC-index direction (S2 wrong-result
+    record under M-NIGHTLY "Manually discovered").
+    Pins: `TestExplainMinMaxAppendRelMergeAppend` (aggregates.out:1225-1246
+    byte-exact + values), `TestMinMaxOverDescIndexDirection`.
+    Movement: yes — regress aggregates diff lines -185/+177 → -140/+163
+    (minmaxtest EXPLAIN block byte-exact; hunks 28 → 29 because old hunk
+    1066 split — the DISTINCT block's election remains, child
+    M0148-0001c1). Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99
+    MISMATCH=0 shapes 99 same, acceptance arm 24 MATCH, fireset
+    SF0.25+SF1 fires=none, pgbench smoke.
+    Remaining 0001c work: M0148-0001c1 (DISTINCT election over the
+    appendrel InitPlans — DONE `68997af77`, the hunk 1066 region closed),
+    (d) correlated `distinct min` hunk 1145, cost residuals M0148-0001c2.
+  - LANDED run-2 loop #9 slice (d) `359e35c97` (committed together with the
+    AI-20261102-000225-003 `\d` fix, one gated tree) — an equality pinning
+    the agg column to a literal, bind param or outer column makes the
+    min/max pathkey redundant (EC with a const), so with no presorted
+    index the InitPlan is `Limit → Seq Scan` with Filter `NullTest, other
+    quals, EC equalities last` and no Sort (`minmaxArgPinnedByEquality`;
+    scan carries the FROM alias). Closes hunk 1145 byte-exact; every 0001c
+    hunk in 950-1145 is closed.
+    - Pin `TestMinMaxEqualityPinnedSeqScan` (shapes + values incl. NULL
+      outer rows; forcing the decline fails it). Ledger row: expression
+      pseudo-constants (`t0.f1 + 1`) and the redundant-pathkey case with a
+      presorted index still take the old paths.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+  - CLOSED run-2 loop #9: all of 0001c's own hunks (950-1145) are closed;
+    the cost residuals stay open as child M0148-0001c2.
+  Movement: yes — regress aggregates 33 → 26 hunks over slices (a)-(d) (this
+  slice 27 → 26).
+- [x] **M0148-0001c1 — price the min/max InitPlan subpaths as PG does
+  (DISTINCT election over appendrel InitPlans)**.
+  Kind: impl
+  Parent: M0148-0001c
+  `select distinct min(f1), max(f1) from minmaxtest` must plan
+  `Unique → Sort (Sort Key: ((InitPlan 1).col1), ((InitPlan 2).col1)) →
+  Result` (aggregates.out:1254-1281); goopg plans `HashAggregate`. PG
+  oracle (scratch PG 18.3): each InitPlan costs `Limit 0.64..0.69` over
+  `Merge Append 0.64..394.50 rows=7865` (never-analyzed members: the
+  10-page heuristic, IOS 0.14..16.59 / 0.15..92.55), Result 1.38..1.39;
+  hash and Unique+Sort totals fall within add_path's 1% fuzz with
+  startups also within 1%, so the Unique's pathkeys dominate (with ONE key
+  the startup gap exceeds 1% and HashAggregate stays — the single-agg
+  `distinct max(unique2)` block). goopg prices the rewrite's IOS/Merge
+  Append/Limit with the legacy estimate (0.00..0.03), so the tie never
+  forms. PG: build_minmax_path's subpath cost (planagg.c:443-448
+  `get_cheapest_fractional_path_for_pathkeys` → cost_index index-only +
+  cost_merge_append + the Limit's fraction `path_fraction = 1/rows`),
+  `create_minmaxagg_path` (pathnode.c: initplan costs summed into the
+  Result's startup), then create_final_distinct_paths' add_path.
+  Verify: `scripts/pg-regress-runner.sh -v aggregates` — the two sub-hunks
+  at expected-lines ~1101/1124 close; single-agg `distinct max(unique2)`
+  keeps HashAggregate.
+  - DONE run-2 loop #3 `68997af77`: `stampMinMaxIndexOnlyCost` (cost_index
+    index-only per min/max IOS, single-column and appendrel branches),
+    `mergeAppendCost` on the appendrel top link, `chargeMinMaxResult`
+    (create_minmaxagg_path: the Result pre-charged with Σ InitPlan
+    pathcosts; `Result.minmaxCharged` keeps the tail charge walk from
+    counting them again below another level top). `select max(u) from big`
+    prices exactly as PG (Result 0.32..0.33); the appendrel prices 2.42 vs
+    PG 1.38 (member geometry, M0148-0001c2) inside the same fuzzy-tie
+    regime, so the two-key DISTINCT elects Unique → Sort → Result as PG.
+    - Pin `TestExplainMinMaxAppendRelDistinctElection` (mutation-checked);
+      the optimizer DISTINCT tests accept either elected strategy (their
+      storage-less one-row fixture prices the IOS at ~8; sorted wins, as in
+      PG).
+  Movement: yes — regress aggregates 29 → 27 hunks (diff lines
+  -140/+163 → -136/+160; the old hunk 1066 region closed byte-exact).
+  Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same, acceptance
+  arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+- [x] **M0148-0001c2 — min/max InitPlan cost residuals (member geometry and
+  the unpriced branches)**.
+  Kind: impl
+  Parent: M0148-0001c
+  Residuals of M0148-0001c1, measured on the minmaxtest fixture against a
+  scratch PG 18.3: (1) a never-analysed tiny btree's tree height is
+  estimated from the heap tuple count (`estimateIndexGeometry` → height 1,
+  IOS startup 0.28) where PG reads `_bt_getrootheight` off the metapage
+  (0, startup 0.14); (2) estimate_rel_size's 10-page floor still applies to
+  a plain inheritance parent (relhassubclass; `estimateTableRowsFallback`
+  sets `hasSubclass` only for partitioned parents) — parent 2537 rows vs
+  PG 254; (3) the composite-prefix IOS, the Sort-over-SeqScan fallback and
+  the constant-argument InitPlans are still legacy-priced; (4) witnessed:
+  the searched ordered IOS for `where f1 is not null order by f1` keeps the
+  NullTest as `Filter:` where PG makes it an `Index Cond`
+  (match_clause_to_indexcol's NullTest arm), and skips a partial index the
+  NullTest proves. Each arm moves index costs corpus-wide: census each.
+  Verify: scratch-PG cost comparison of the minmaxtest block (Result
+  1.38..1.39) and the TPC census unchanged.
+  - LANDED run-2 loop #12 arm (2) `0e11ec1de` — estimate\_rel\_size's
+    10-page floor skipped for any relhassubclass parent (inheritance too),
+    and a fan-out appendrel (inheritance / partitions) sized as the sum of
+    its members, each clamped to one row (`fanOutAppendRel`,
+    `appendRelMemberRows`; a known-empty relhassubclass parent reports
+    clamp\_row\_est's 1). minmaxtest parent member `rows=254
+    (0.14..16.59)` and Merge Append rows=7865 now equal PG; an empty
+    parent over an empty child plans PG's HashAggregate over `Append
+    rows=1851`. Pin `TestInheritanceParentRelSize`.
+    - Regress runner HEAD vs change on 9 suites (aggregates, inherit,
+      alter\_table, join, select\_parallel, union, partition\_join/prune/
+      aggregate): text-identical except join's nondeterministic ±1 line.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+    - Still open: arm (1) tree height from the metapage (member startup
+      0.28 vs 0.14 → minmaxtest Result 2.15 vs PG 1.38), arm (3) the
+      unpriced composite/SeqScan/const InitPlan branches, arm (4) the
+      searched IOS NullTest-as-Index-Cond.
+  - LANDED run-2 loop #13 arm (1) `5040c8c72` (+ pin `ac21e50d8`) — btree
+    tree\_height read off the metapage (`catalog.IndexTreeHeightFunc`,
+    wired in initdb: btm\_fastlevel, 0 for a rootless tree) and used by
+    `estimateIndexGeometry`; the tuple-count guess is the fallback.
+    minmaxtest members now equal PG except the partial-index member
+    (0.15..86.21 vs 0.14..74.79); minmaxtest Result 1.40 vs PG 1.38 (was
+    2.15). TPC-H Q2/Q11 `partsupp_supplier_fkidx` startup 0.30 → 0.42 = PG;
+    no plan shape changed (PLAN-PARITY 99/99, 99/99, 22/22). Regress runner
+    on 10 suites text-identical.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset fires=none (TPC-H Q2/Q11 cost-only),
+      pgbench smoke.
+    - Still open: arm (3) unpriced composite/SeqScan/const InitPlan
+      branches, arm (4) searched IOS NullTest-as-Index-Cond, and the
+      partial-index member geometry (ledgered).
+  - LANDED run-2 loop #14 arm (3) `91b5b6308` (+ pins `8c7aff0e8`) — the
+    remaining min/max InitPlan branches priced as PG, all exact vs scratch
+    PG 18.3: composite-prefix IOS (cost\_index over k+1 index quals, width
+    the agg column: `0.29..4.48 rows=10`), `max(100)`'s Seq Scan (plain
+    cost\_seqscan, constant width) under a gating Result that now copies
+    its child's cost (copy\_plan\_costsize; `Result 0.00..155.00`), and
+    slice (d)'s equality-pinned scan (the Filter carries cost\_seqscan with
+    the quals' operator cost: `0.00..1.06 rows=1`).
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset (3 corpora) fires=none, pgbench smoke.
+    - Still open: arm (4) searched IOS NullTest-as-Index-Cond (+ partial
+      index proof), the partial-index member geometry, and the outer scan
+      of a correlated min/max SubPlan (tlist SubPlan cost, ledgered).
+  - CLOSED run-2 loop #15: arms (1)-(3) landed (`5040c8c72`, `0e11ec1de`,
+    `91b5b6308`); arm (4) and the partial-index member geometry moved to
+    M0148-0001c3 (filed after the regress-closing children: it closes no
+    regress hunk).
+  Movement: none — instrument artefact — costs moved to PG's exactly (scratch-PG witnesses; TPC-H Q2/Q11 cost text in routing-20261102f) but no regress text, plan shape or census verdict depends on them.
+- [x] **M0148-0001d — GROUP BY column reduction via functional dependencies
+  and canonical pathkey key order**.
+  Kind: impl
+  Parent: M0148-0001
+  `group by t1.a,t1.b,t1.c,t1.d` over a unique-indexed join key reduces the
+  Group Key to `t1.a, t1.b` (partitioned p_t1 PK case: parent Vars, not
+  leaf-branch Vars); key ORDER is canonical pathkey order (`Group Key: x, y`
+  for `group by y, x` when the index presorts). PG:
+  `remove_useless_groupby_columns` (planner.c) + EC-driven grouping keys
+  (`optimizer/inherit/agg_group_keys`? no: `pathkeys.c`/`equivalences.c`
+  canonical ordering). Verify hunks 1172-1232.
+  - Recon run-2 loop #5 (2026-11-02, no code; the nightly batch held the
+    gates): current hunks 1211/1225 are this task. goopg already removes
+    t1.c/t1.d (PK, `pruneUselessGroupByColumns`) and t2.z (t2 PK covered),
+    but keeps `t2.x`/`t2.y`. PG drops them in standard\_qp\_callback
+    (planner.c:3502-3525): `make_pathkeys_for_sortclauses_extended(...,
+    remove_redundant = true)` removes from processed\_groupClause every item
+    whose pathkey is redundant — `pathkey_is_redundant` (pathkeys.c): its EC
+    holds a constant (ported: `redundantConstGroupKeys`,
+    groupkeyconst.go, M0146-0005ak) OR its EC is already in the pathkey list
+    (NOT ported). The inner-join ON `t1.a = t2.x and t1.b = t2.y` merges
+    {t1.a, t2.x} and {t1.b, t2.y}, so the later members go.
+    - Plan: beside the const arm (planner.go ~9823), union-find the input
+      column indices over top-level WHERE and INNER-join ON `col = col`
+      conjuncts (bare columns, same type; outer-join ON clauses form no
+      merged EC in PG 16+ and must not count), walk groupExprs in order and
+      drop a key whose class already had a kept member; the dropped column
+      rides the same functionally-determined passthrough the const arm uses
+      (`pruned` map).
+    - Expected: hunks 1211 (`Group Key: t1.a, t1.b`) and 1225
+      (`t1.a, t1.b, t2.z`) close. Hunks 1248/1271 are M0148-0001k's (member
+      aliases `t1_1`/`t1_2`; partitioned parent Var naming `p_t1.a` vs
+      goopg's `p_t1_1.a`).
+  - LANDED run-2 loop #10 slice 1 `5ae6f5416` — `redundantConstGroupKeys`
+    gains pathkey\_is\_redundant's duplicate-EC arm (union-find over WHERE +
+    inner-join ON `col = col`, same type, no outer join in FROM; a const pin
+    propagates through the class; a repeat of the SAME column stays a key).
+    Pin `TestGroupByKeysRedundantByEquivalence` (6 shapes vs scratch PG 18.3
+    + values; mutation-checked). Hunks 1211/1225 closed byte-exact.
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+    - Remaining in 0001d's scope: hunk 1271 — the partitioned `p_t1` group
+      key prints the first leaf's Var (`p_t1_1.a, p_t1_1.b`) where PG prints
+      the parent's (`p_t1.a, p_t1.b`): PG groups over the appendrel parent's
+      Vars (the Append's tlist is the parent rel's), goopg's key chase
+      descends into the first Append member. Hunk 1248 is 0001k's (member
+      aliases); 1341 is 0001h's (DROP CASCADE view notices).
+  Movement: yes — regress aggregates 26 → 24 hunks (slice 1).
+  - LANDED run-2 loop #11 slice 2 `896430e99` — hunk 1271: a multi-leaf
+    partition fan-out's top SetOp carries the parent RTE (SetOp.RTID /
+    AppendRelName, the c2 apprelids mechanism) and every leaf allocates a
+    fresh RTID, so Append-level columns print the partitioned parent's
+    Vars (`Group Key: p_t1.a, p_t1.b`). Pin
+    `TestPartitionedGroupKeyNamesParent`. Regress runner HEAD vs change:
+    aggregates 24 → 23, partition\_join −383/−376 lines, partition\_aggregate
+    −60/−65, inherit −7/−6, partition\_prune +6/−1 (member labels that
+    matched only through goopg's default-partition-first expansion order —
+    see M0148-0001k).
+    - Gates: spotcheck Q12=2/Q13=35, sf025 PASS=99 shapes 99 same,
+      acceptance arm 24 MATCH, fireset SF0.25+SF1 fires=none, pgbench smoke.
+  - CLOSED run-2 loop #11: every 0001d hunk is closed (1248 is 0001k's,
+    1341 is 0001h's).
+  Movement: yes — regress aggregates 26 → 23 hunks over slices 1-2.
+- [x] **M0148-0001e — Incremental Sort presorted-key plans and
+  GroupAggregate pathkey alignment**.
+  Kind: impl
+  Parent: M0148-0001
+  `GROUP BY z,y,w,x` over `btg_x_y_idx` → GroupAggregate + Incremental Sort
+  (Presorted Key: x, y) with Group Key reordered to index pathkeys; merge-join
+  presorted group input; the `HashAggregate` vs `GroupAggregate+Sort` election
+  for `group by g%10000` on `agg_data_20k`; Index Cond pushdown (no
+  duplicated Filter) and Subquery-Scan elision (`q1` case). PG:
+  `pathkeys.c`, `createplan.c create_incremental_sort`, `costsize.c
+  cost_incremental_sort`, projection-capable scan pathkeys. Verify hunks
+  2607-2759, 2847, 3129.
+  - LANDED slice 1 `fed4f53ed` (2026-11-02, run-2 loop #15): GROUP BY keys
+    reordered to the input's pathkeys (get_useful_group_keys_orderings /
+    group_keys_reorder_by_pathkeys) for the sorted GROUP_AGG arms;
+    `enable_group_by_reordering` consumed. btg `GROUP BY y, x` and
+    `GROUP BY z, y, w, x` now byte-identical; q1 lost its Sort + Subquery
+    Scan. Design: docs/design/0100-0149/0148-0001e-group-by-reordering.md.
+Movement: yes — regress aggregates diff lines -126/+150 → -105/+122
+  - LANDED slice 2 `f1709f7ab` (2026-11-02, run-2 loop #16): EXPLAIN
+    qualifies upper-node columns by the statement's range-table size
+    (es->rtable_size counts RTEs left with no plan node: pulled-up or
+    stripped subqueries, views, removed joins) via Explain.RtableSize. Fixes
+    q1 (PG prints `Group Key: btg.x, …`; slice 1's records had the direction
+    reversed). Regress: incremental_sort -66/-66, window -60/-60,
+    groupingsets -7/-7, aggregates -3/-3, subselect -3/-3, join -2/-2,
+    select_distinct -1/-1; 27 suites unchanged.
+Movement: yes — regress aggregates diff lines -217/+179 → -214/+176
+  - LANDED slice 3 `f26987104` (2026-11-02, run-2 loop #17): merge join
+    sorts a presorted outer with an Incremental Sort (PG 18
+    try_mergejoin_path outer_presorted_keys); the rotation election already
+    existed. btg merge-join block byte-identical; incremental_sort 326 → 307
+    diff lines.
+Movement: yes — regress aggregates diff lines 390 → 377
+  - LANDED slice 4 `058e52bae` (2026-11-02, run-2 loop #18): GROUP BY
+    reordering also over the presorted-aggregate keys (reorder the
+    num_groupby_pathkeys prefix, keep the aggregate keys behind it); the
+    array_agg(DISTINCT w) block lost its Sort and groups as `y, x`.
+Movement: yes — regress aggregates diff lines 377 → 372
+  - LANDED slice 5 `11579ae1d` (2026-11-02, run-2 loop #19): grouping Agg
+    paths carry their input's disabled_nodes (cost_agg's
+    input_disabled_nodes floor, in addAggPath); `group by g%10000` under
+    work_mem 64kB + enable_sort off is now PG's HashAggregate.
+Movement: yes — regress aggregates diff lines 372 → 362
+  - LANDED slice 6 `6d6fa7019` (2026-11-02, run-2 loop #20): EXPLAIN
+    VERBOSE qualifies quals and keys (show_scan_qual `SubqueryScan ||
+    verbose`, upper quals/keys `rtable_size > 1 || verbose`); resolves
+    ledger M0125-0039 arm a. 7 suites improved, 27 unchanged.
+Movement: yes — regress aggregates diff lines 362 → 360 (explain 592 → 578, subselect 1462 → 1438)
+  - CLOSED 2026-11-02 (run-2 loop #21): every btg-region plan gap the
+    task named is landed (slices 1-6). Residue moved, not dropped:
+    - the array_agg(DISTINCT …) block's Output line and the `Disabled:
+      true` lines → M0148-0001f (its stated scope);
+    - the Index Only Scan `Filter` repeating its Index Cond → filed as
+      M0148-0001e1 (an executor-sensitive composite-index range-scan
+      change; ledger row 2026-11-02);
+    - the `group by g%10000` election landed as slice 5; "hunks 2847,
+      3129" were stale expected-file numbers for the btg / g%10000 hunks,
+      both now closed.
+- [x] **M0148-0001f — EXPLAIN Output() targetlist rendering**.
+  Kind: impl
+  Parent: M0148-0001
+  PG's verbose/explain prints the PRUNED per-node targetlist with qualified
+  Vars (`tenk1_2.unique1`, not all columns bare), aggregate-expression labels
+  (`(sum((s1.s1 + s2.s2)))`, `ARRAY(SubPlan 1)`, `PARTIAL variance(...)`,
+  `(InitPlan 1).col1`), `ORDER BY`/`Group Key` operand parenthesization
+  (`(g % 10000)` not `((g % 10000))`), `Function Call:` before `Output:`, and
+  the merge-scan `Disabled: true` lines. PG: `explain.c` `show_tle`/
+  `explain_target_list` + `ruleutils.c` deparse context. Verify hunks
+  608-690, 1899-1929, 2910-2947, 3129 key-text lines.
+  - LANDED slice 1 `29d2af8d5` (2026-11-02, run-2 loop #22): `Disabled:
+    true` per PG 18 plan_is_disabled (PlanCost.Disabled stamped from the
+    producing path; prebuilt re-stamps keep the bit; JSON property), and
+    Incremental Sort no longer counts enable_sort (cost_incremental_sort).
+    The three merge-join blocks are byte-identical. Design:
+    docs/design/0100-0149/0148-0001f-explain-output-rendering.md.
+Movement: yes — regress aggregates hunks 24 → 21 (diff lines 360 → 348)
+  - LANDED slice 2 `2faedaef2` (2026-11-02, run-2 loop #23): VERBOSE
+    Output: printed right after the node line (before Inner Unique and every
+    qual/key) and its columns qualified by show_plan_tlist's
+    `rtable_size > 1` rule. Unmatched PG Output: lines 979 → 895 across 34
+    suites; 0 wrongly-qualified.
+Movement: yes — regress join diff lines 15034 → 14932 (subselect 1438 → 1384)
+  - LANDED slice 3 `52feaacf9` (2026-11-02, run-2 loop #24): an
+    Aggregate's VERBOSE Output: deparses its targetlist (grouping columns +
+    aggregate calls, via aggOutputKeyExpr). Unmatched PG Output: lines
+    895 → 889.
+Movement: yes — regress aggregates diff lines 348 → 344
+  - LANDED slice 4 `5d9870a21` (2026-11-02, run-2 loop #25):
+    generate_series FROM items carry their RTE's RTID, so EXPLAIN names
+    their columns (`s2.s2`). Unmatched PG Output: lines 889 → 884.
+Movement: yes — regress aggregates diff lines 344 → 328
+  - LANDED slice 5 `c2c98388e` (2026-11-02, run-2 loop #26): Output: of
+    an Aggregate and of a Sort/IncrementalSort/Limit over it follows the
+    select list (from the invisible Project) with resjunk grouping columns,
+    parenthesised on pass-through nodes. Unmatched PG Output: 884 → 881.
+Movement: yes — regress aggregates diff lines 328 → 322
+  - LANDED slice 6 `be7ff69eb` (2026-11-02, run-2 loop #27): Partial
+    Aggregate Output: prints `PARTIAL sum(a)` (get_agg_expr skip-final
+    marking), the Gather / Gather Merge above `(PARTIAL sum(a))`. Unmatched
+    PG Output: lines 242 → 238 on the 9 aggregate/Gather suites.
+Movement: yes — regress aggregates diff lines 169 → 161
+  - CLOSED 2026-11-02 (run-2 loop #27): the named items are landed —
+    Disabled lines (slice 1), Output placement + show_plan_tlist prefix
+    (slice 2), aggregate labels (slices 3, 6), function-RTE naming (slice 4),
+    select-list order + resjunk + parenthesisation over aggregates (slice 5);
+    `Function Call:` already prints after `Output:` as in PG, and the
+    `(g % 10000)` group-key parenthesisation matched with M0148-0001e slice 5.
+    Residue moved, not dropped: pruned per-node targetlists (planner-side,
+    the dominant remaining Output gap) → filed M0148-0001f1; cast deparsing,
+    other SRF kinds, resjunk sort keys and join outputs over aggregates are
+    ledgered (2026-11-02 rows) and listed in M0148-0001f1's scope.
+- [x] **M0148-0001g — pg_get_viewdef deparser fidelity**.
+  Kind: impl
+  Parent: M0148-0001
+  goopg echoes a lowercase near-verbatim view text; PG deparses the stored
+  parse tree: upper-case keywords, qualified column refs (`v.a`),
+  coerced-constant casts (`(0,NULL::integer,NULL::text)`,
+  `(0.5)::double precision`, `'AZZZZ'::name`), output AS names, function-RTE
+  column aliases (`i(i)`), `ORDER BY c USING ~<~ NULLS LAST` rendering, and
+  WITHIN GROUP/FILTER aggregate clauses. PG: `ruleutils.c
+  pg_get_viewdef_worker`/`generate_viewdef`/`get_rule_expr` (+
+  `transformRuleExpr` T_Aggref agg_order/agg_within_group/agg_filter arms).
+  Verify hunks 1637-1726, 2284.
+  - LANDED slice 1 `cc0d25b7f` (2026-11-02, run-2 loop #28): subset port of
+    get_query_def (viewdef_deparse.go): pretty-indent layout, qualification
+    by rtable size, output names, FROM aliases + column-alias lists, typed
+    VALUES constants, get_simple_values_rte, aggregate DISTINCT/ORDER
+    BY/USING/FILTER; stored text outside the subset. The seven agg_view1
+    hunks match. Design: docs/design/0100-0149/0148-0001g-viewdef-deparser.md.
+Movement: yes — regress aggregates hunks 21 → 14 (diff lines 314 → 266)
+  - LANDED slice 2 `025d72204` (2026-11-02, run-2 loop #29): ordered-set
+    aggregates (WITHIN GROUP) with coerced direct arguments
+    (`(0.5)::double precision`, hypothetical-set `'AZZZZ'::name`).
+    aggordview1 matches.
+Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
+  - CLOSED 2026-11-02 (run-2 loop #29): both hunk groups the task names
+    (1637-1726 agg_view1, 2284 aggordview1) match. Breadth residue filed as
+    M0148-0001g1 (pretty mode / psql \d+, joins, set ops, CTEs, windows,
+    CASE, casts, sublinks, literals outside VALUES, search-path schema
+    qualification) — ledgered 2026-11-02.
+- [x] **M0148-0001h — DROP … CASCADE records and reports view dependencies**.
+  Kind: impl
+  Parent: M0148-0001
+  `drop table t1 cascade` must emit "drop cascades to 8 other objects /
+  DETAIL: drop cascades to view nontemp1 … temporal4" — CREATE VIEW must
+  record AUTO dependencies on its referenced relations (pg_depend). PG:
+  `recordDependencyOn` from `parse_analysis` (dependency.c
+  reportDependentObjects). Verify hunk 1302.
+  - CORRECTION 2026-11-02 (run-2 loop #30): the hunk is the reverse of the
+    text above — PG prints only `drop cascades to table t1c`; goopg
+    additionally dropped create_view.sql's eight testviewschm2 views
+    (nontemp1 … temporal4) when aggregates.sql dropped its TEMP t1. A
+    data-loss defect: view dependencies are matched by NAME, not OID.
+    Root causes found: (1) the DROP TABLE CASCADE path passed the raw
+    unqualified name (empty schema = "any"), unlike RESTRICT (M0134-0069);
+    (2) qualified references were compared by name only; (3) CREATE VIEW
+    under `search_path = s, public` places the view in public, not s;
+    (4) a temp table resolves with the public-equivalent empty schema, so
+    its drop matches public views over an unqualified same name.
+  - Slice 1 LANDED 73b858090 (2026-11-03): (1)+(2) fixed in operators_ddl.go
+    viewsDependingOnTable / selectRefsRelation + the CASCADE call; pin
+    TestDropTableCascadeLeavesOtherSchemasViews (fails before the fix).
+    Gates on one code_tree 8d2a3340fd7a: units, tpch-spotcheck, sf025 (99),
+    acceptance arm (24 MATCH), fire-set (fires=none on all three corpora).
+    Design docs/design/0100-0149/0148-0001h-drop-cascade-view-scope.md.
+    (3)+(4) are the remaining causes of the aggregates hunk — next slices;
+    the faithful fix is OID-bound dependencies recorded at CREATE VIEW
+    (pg_depend).
+  Movement: none — correctness fix (data loss) — no plan instrument; the aggregates single-suite hunk stays until causes (3)+(4) land; pin TestDropTableCascadeLeavesOtherSchemasViews
+  - Slice 2 LANDED 605d654ed (2026-11-03): CREATE VIEW placement by search_path,
+    DROP SCHEMA CASCADE member-first order, DROP VIEW search_path resolution,
+    visibility-qualified cascade notices; also fixed the must-pass
+    create_function_sql regression slice 1 introduced.
+    - aggregates `drop table t1 cascade` hunk: the four nontemp views are
+      gone; the four temporal views remain — implicitly temporary views over
+      create_view's temp t1 that PG drops at that session's end (cause 4,
+      temp-object session scope). Next slice.
+  - Slice 3 LANDED 7dddb23c0 (2026-11-03) — CLOSED: temporary views are
+    session-scoped. A view declared TEMP, or unqualified over a temp relation
+    (implicit, with PG's `view "v" will be a temporary view` NOTICE), is
+    stamped Temp/TempOwner and dropped at backend exit. Pin
+    TestImplicitTempViewIsSessionScoped (mutation-checked). Gates on
+    code_tree aa857a73053a: units, RegressSuite + PgDump + Isolation,
+    spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none.
+    Residue filed as M0148-0001h1.
+  Movement: yes — regress runner aggregates 11 → 10 hunks / 247 → 231 diff lines (drop-cascade hunk matched), create_view 2467 → 2427
+- [x] **M0148-0001i — parallel-aggregation plan election (Finalize/Gather/
+  Partial over parallel scans)**.
+  Kind: impl
+  Parent: M0148-0001
+  `v_pagg_test` (view over GROUP BY agg) with `parallel_setup_cost=0`,
+  `max_parallel_workers_per_gather=4`, `parallel_workers=4` reloption:
+  Finalize HashAggregate → Gather → Partial HashAggregate → Parallel Seq
+  Scan (view-expanded), and `balk(hundred)` → Finalize Aggregate → Gather →
+  Partial → Parallel Index Only Scan. goopg has the split machinery
+  (parallel_agg_combine.go) but declines the election through the view /
+  for balk. PG: `createplan.c` (create_gatherwp) + `costsize.c
+  final_cost_agg`/`cost_gather` + reloption parallel workers
+  (`relation_get_parallel_workers`). Verify hunks 1899, 2847.
+  - Slice 1 LANDED d4a5f0b30 (2026-11-03): PARALLEL SAFE user aggregates with a
+    COMBINEFUNC split (Finalize/Gather/Partial); combineUserAggState is
+    nodeAgg's combine phase (INITCOND start, strict rules); the row
+    transport ships user states. The `balk(hundred)` hunk (~2880) now
+    matches. Design docs/design/0100-0149/0148-0001i-user-aggregate-combine.md.
+    - Fixed on the way (S2 class, PG 18.3-measured): the serial finish
+      called COMBINEFUNC(NULL, state) — PG never calls it outside a split
+      (p_csum returns 6; a strict SQL combinefn turned a sum NULL); and
+      int4_sum/int2_sum were missing as builtin SFUNCs (sum returned
+      INITCOND 0).
+    - Gates on code_tree 2c62d08629d2: units, RegressSuite + PgDump,
+      spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none.
+    - Remaining here: the `v_pagg_test` hunk (~1929) — PG elects Finalize
+      HashAggregate -> Gather -> Partial HashAggregate -> Parallel Seq Scan
+      under GroupAggregate/Sort/ProjectSet; goopg plans serially and adds a
+      top Sort.
+  Movement: yes — regress runner aggregates 10 → 9 hunks / 231 → 209 diff lines (balk hunk matched)
+  - Slice 2 LANDED 8397f3cdd (2026-11-03) — CLOSED: unordered array_agg /
+    string_agg split as in PG 18 (combine functions; RECORD argument refused
+    per agg_args_support_sendreceive), and a view's body is planned under
+    the session's PlannerSettings (Plan(tbl.View) used the defaults, so no
+    planner GUC reached a view). The v_pagg_test inner aggregate now plans
+    PG's Finalize HashAggregate -> Gather -> Partial HashAggregate split.
+    Gates on code_tree dc912175300d: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none. Residue (view pull-up) filed as M0148-0001i1.
+  Movement: yes — regress runner aggregates single-suite 209 → 208 diff lines (v_pagg_test hunk now differs only in view pull-up)
+- [x] **M0148-0001k — inheritance/partition appendrel scans: per-member
+  restriction pushdown and `<parent>_N` member aliases**.
+  Kind: impl
+  Parent: M0148-0001
+  Witnessed while scoping M0148-0001c (c2): `select * from minmaxtest where
+  f1 > 1` over an inheritance tree plans `Append  Filter: (minmaxtest.f1 >
+  1)` with members `Seq Scan on minmaxtest1`, where PG pushes the
+  translated restriction into every member (`Seq Scan on minmaxtest1
+  minmaxtest_2 / Filter: (f1 > 1)`); partitions likewise (`Seq Scan on pp1`
+  vs PG `pp1 pp_1`). PG: `set_append_rel_size` (allpaths.c, restriction
+  translation via `adjust_appendrel_attrs`), `expand_single_inheritance_child`
+  (child RTE alias = parent's eref aliasname), `ExplainPreScanNode`
+  apprelids. Resume: the fan-outs in `internal/optimizer/planner.go`
+  (~5277 inheritance, the partition-leaf loop above it); member naming can
+  reuse c2's `SetOp.RTID`/`AppendRelName`. Scope: also moves `inherit`,
+  `partition_*` regress EXPLAINs; record the affected-hunk census first.
+  - Found run-2 loop #11 (M0148-0001d slice 2): goopg expands a partitioned
+    table's DEFAULT partition first; PG orders the members by partition
+    bound with the default last (PartitionDesc order, expand_partitioned_rtentry).
+    With the parent now claiming the bare alias, members print `t2_1` for
+    `mc3p_default` where PG prints `t2_9` (partition\_prune). Resume:
+    collectAllPartitionLeaves' order (planner.go) against PG's bound order.
+  - LANDED c0c648b80 (2026-11-03) — CLOSED: members carry the parent's
+    refname (`Seq Scan on minmaxtest1 minmaxtest_2`; inheritance Append
+    takes the parent RTID); a restriction filters at every member scan
+    (appendrel_pushdown.go, set_append_rel_size; moved, not copied); keys
+    above the Append name the parent (resolveKeySourceDepth declines the
+    first-branch chase for an inheritance/partition appendrel). Locking /
+    modifying plans keep the Append Filter — their EPQ recheck reads the
+    qual above the scan chain (isolation eval-plan-qual returned a removed
+    row when it moved). Design
+    docs/design/0100-0149/0148-0001k-appendrel-member-quals.md. Pin
+    TestExplainAppendRelMembers (mutation-checked). Gates on code_tree
+    4d6897878bca: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none. Residue filed as
+    M0148-0001k1.
+  Movement: yes — regress runner aggregates 9 → 8 hunks (208 → 193 lines), partition_join 5974 → 5801, partition_aggregate 1540 → 1473, tablesample 5 → 4 hunks; partition_prune 6382 → 6785 (no plan-time pruning)
+
+- [x] **M0148-0001j — DISTINCT-aggregate transition call ordering (NOTICE
+  interleave) + group output order for `mode() within group`**.
+  Kind: impl
+  Parent: M0148-0001
+  PG transitions the DISTINCT-agg input through the sort/tuplestore per
+  aggregate: `my_avg(distinct one), my_sum(one)` prints
+  `avg_transfn called with 1,1,3,3` (per-agg drain), goopg interleaves
+  `1,3,1,3`; the `mode() within group` group rows come out sorted (PG's
+  GroupAggregate) vs goopg hash order. PG: `nodeAgg.c
+  process_ordered_aggregate_single/multi` (tuplestore drain per agg per
+  group). Verify hunks 2186, 2420.
+  - LANDED a4f88b4aa (2026-11-03) — CLOSED: a grouping with a DISTINCT /
+    ORDER BY / WITHIN GROUP aggregate is never hashed (groupingHashable =
+    PG numOrderedAggs == 0; sorted arms take the group-key order when no
+    presorted keys exist); the elected aggregate marks PG's aggpresorted
+    (AggregateCall.Presorted, markPresortedAggs — only when the winner's
+    input pathkeys carry group keys + the agg's sort list; also on the
+    winner's spec, which an ORDER BY above rebuilds) and applyAgg runs it
+    per row, a DISTINCT repeat skipped (NOTICE 1,1,3,3); the state-sharing
+    key covers all args and the ORDER BY clause (find_compatible_trans).
+    Design docs/design/0100-0149/0148-0001j-ordered-aggregate-strategy-and-presorted.md.
+    Pins TestOrderedSetAggregateGroupingIsNotHashed,
+    TestPresortedAggregatesAreMarked, TestSharedStateSlotSeparatesOrderBy,
+    executor TestPresortedUserAggTransitionOrder. Gates on code_tree
+    5cb5da4c30a4: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue filed
+    as M0148-0001j1.
+  Movement: yes — regress runner aggregates 605 → 567 lines (mode() group-order hunk and DISTINCT NOTICE-order hunk gone); 13 other suites byte-identical
+
+- [x] **M0148-0001j1 — ordered aggregates under grouping sets run sorted;
+  DROP TYPE CASCADE drops dependent functions**.
+  Kind: impl
+  Parent: M0148-0001j
+  Residue of M0148-0001j. (1) PG never hashes a grouping with an ordered
+  aggregate, grouping sets included: `select ten, count(distinct s) from jt
+  group by rollup(ten)` plans `GroupAggregate  Group Key: ten  Group Key:
+  ()` over `Sort`; goopg plans `MixedAggregate` (no sorted grouping-sets
+  executor; groupingHashable's callers OR in GroupingSets). PG:
+  planner.c consider_groupingsets_paths / nodeAgg.c AGG_SORTED phases.
+  (2) `DROP TYPE avg_state CASCADE` leaves functions whose signature uses
+  the type (PG drops them with "drop cascades to function
+  avg_finalfn(avg_state)"); a re-CREATE then fails "function already
+  exists" and the stale function returns NULL. PG: dependency.c
+  (pg_depend type → proc). Resume: internal/executor DROP TYPE cascade
+  path (operators_ddl.go).
+  - LANDED 41be0e3ca (2026-11-03) — CLOSED: the sorted-rollup arm admits
+    ordered aggregates with no Mixed path and groupingSetsHashable keeps
+    hashing only when no sorted rollup exists (rollup/cube/grouping sets
+    with count(distinct)/array_agg ORDER BY/mode() plan and return as PG);
+    drop_type_dependents.go rebuilds the pg_depend edges (functions,
+    array type internal, aggregates via their support functions not
+    stype, typed tables) and runs findDependentObjects' walk — 2BP01 with
+    PG's DETAIL under RESTRICT, reported + dropped under CASCADE (enum,
+    composite, range). Design
+    docs/design/0100-0149/0148-0001j1-sorted-grouping-sets-and-drop-type-dependents.md.
+    Pins TestGroupingSetsOrderedAggRunsSorted, TestDropTypeDependents.
+    Gates on code_tree d7155d26414d: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none x3. Residue filed as M0148-0001j2.
+  Movement: yes — regress runner groupingsets 1653 → 1614, typed_table 135 → 133
+
+- [x] **M0148-0001j2 — DROP TYPE: column / attribute / domain dependents,
+  OID order across catalogs; pg_proc array-arg OIDs**.
+  Kind: impl
+  Parent: M0148-0001j1
+  Residue of M0148-0001j1. (1) findDependentObjects also reaches columns
+  of ordinary tables (`drop cascades to column x of table t`, the column
+  dropped), attributes of other composite types and domains over the type
+  — drop_type_dependents.go covers functions, aggregates and typed tables
+  only. (2) goopg's routine OIDs come from a counter apart from relation
+  OIDs, so a mixed table/function dependent list reports in a different
+  order (regress typed_table: PG `persons, get_all_persons(), persons2`).
+  (3) pg_proc.proargtypes holds 0 for a composite-array argument (`st[]`;
+  ArgTypeOIDs unresolved). (4) Seen while probing: a SQL function using
+  `(s).total` on a composite parameter errors "column notation .total
+  applied to type unknown"; `CREATE TABLE … OF t (name WITH OPTIONS …)`
+  repeating a column is accepted where PG raises 42701 (typed_table
+  persons4). (5) Grouping sets that form no sorted rollup still hash with
+  an ordered aggregate (PG sorts or errors). Resume:
+  internal/executor/drop_type_dependents.go typeDependentObjects; catalog
+  OID allocation (routines vs relations); routine ArgTypeOIDs resolution
+  at CREATE FUNCTION.
+  - LANDED 2026-11-04 in 05b02362f — CLOSED (residue split to
+    M0148-0001j3): item (1). The walk reaches table columns (also through
+    the array type), composite attributes and domains, recursing through
+    the domain, in object_address_comparator order. CASCADE drops columns
+    (dropColumn fromDependency: no typed-table/inherited guard), attributes
+    (shared replaceCompositeFields) and domains (dropDomainObject).
+    execDropDomain uses the same walk; DROP DOMAIN CASCADE used to drop
+    whole TABLES. Also fixed: a CREATE TABLE failing after registration
+    (inline FK type check) left the relation behind, even under ROLLBACK.
+    Design docs/design/0100-0149/0148-0001j2-drop-type-column-dependents.md.
+    Pin TestDropTypeColumnDependents. Live probes byte-identical to a
+    scratch PG. Gates on code_tree 43a470fd: units, RegressSuite + PgDump
+    + Isolation, spotcheck, sf025 99/99, acceptance, fire-set fires=none x3.
+  Movement: regress — 37-suite A/B: alter_table 3648→3623, domain 1752→1718, create_table 639→615, plpgsql 4009→4000, insert 1057→1055; enum unchanged; create_type 402→406 and privileges 3879→3925 on residue (routine OID order, missing type USAGE checks)
+- [ ] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
+  type USAGE privilege checks, DROP TYPE of a domain, composite-array
+  pg\_proc OIDs**.
+  Kind: impl
+  Parent: M0148-0001j2
+  Residue of M0148-0001j2 (items 2-5 carried over plus new findings).
+  (1) Routine OIDs come from a counter apart from relation/type OIDs, so a
+  mixed function/column/domain dependent list reports out of PG order
+  (regress create\_type myvarchar: PG lists the domain last; typed\_table
+  `persons, get_all_persons(), persons2`). (2) pg\_proc.proargtypes holds 0
+  for a composite-array argument (`st[]`). (3) `(s).total` on a composite
+  SQL-function parameter errors "applied to type unknown"; `CREATE TABLE …
+  OF t (name WITH OPTIONS …)` repeating a column is accepted (PG 42701).
+  (4) Grouping sets with no sorted rollup hash an ordered aggregate. (5)
+  NEW: type USAGE privilege checks are missing (aclcheck\_error\_type:
+  CREATE TABLE / ALTER TABLE ADD COLUMN / ALTER COLUMN TYPE / CREATE TYPE /
+  ALTER TYPE ADD ATTRIBUTE / CREATE DOMAIN / CREATE FUNCTION / CREATE
+  AGGREGATE / CREATE CAST / CREATE OPERATOR) — regress privileges creates
+  objects PG refuses, which then block `DROP DOMAIN priv_testdomain1`.
+  (6) NEW: `DROP TYPE <domain>` is accepted by PG (RemoveObjects over
+  pg\_type); goopg's execDropType does not resolve domains. (7) NEW: view
+  columns over the type depend through the `_RETURN` rule, not modelled.
+  Resume: catalog OID allocation (one counter for routines and relations,
+  as PG's GetNewOidWithIndex); executor type-reference resolution for an
+  aclcheck on USAGE (pg_type typacl); execDropType domain arm.
+- [x] **M0148-0001c3 — searched index paths take a NullTest as an index
+  qual; NullTest-proven partial indexes; unanalysed partial-index size**.
+  Kind: impl
+  Parent: M0148-0001c
+  Split from M0148-0001c2 (arm 4 + residual). PG's match\_clause\_to\_indexcol
+  (indxpath.c) accepts `col IS [NOT] NULL` as an index clause on a btree
+  (amsearchnulls), so `WHERE x IS NOT NULL ORDER BY x` plans `Index Cond: (x IS
+  NOT NULL)`; goopg's searched ordered IOS keeps it as `Filter:` and skips a
+  partial index whose predicate the NullTest proves (check\_index\_predicates /
+  predicate\_implied\_by). Also: a never-analysed partial index's tuple count
+  (PG reads the index's own size; regress minmaxtest3i 0.14..74.79 vs goopg
+  0.15..86.21). Resume: internal/optimizer pathindexclauses.go /
+  pathindexordered.go (NullTest clause arm; predicate proof for the NullTest),
+  costindex.go estimateIndexGeometry (partial-index real tuples). Measure the
+  regress EXPLAIN movement (create\_index, select, btree\_index, inherit,
+  aggregates, join) HEAD vs change before landing; no aggregates hunk depends
+  on it, hence filed after the regress-closing M0148-0001 children.
+  - LANDED 0c056f9df (2026-11-03) — CLOSED (residue split): probing the
+    NullTest cases found partial indexes filed EVERY row after CREATE
+    INDEX — a partial UNIQUE index rejected rows outside its predicate and
+    ON CONFLICT treated them as conflicts. Now maintainUniqueIndexesForInsert,
+    the upsert maintenance, the unique checks and arbiterKey skip rows the
+    predicate rejects (ExecInsertIndexTuples); a restarted partial index
+    keeps its predicate (IndexPredicateExpr parses PredicateString); HOT is
+    refused on INCLUDE/predicate columns while the key-update classification
+    stays key-only (updateChangesIndexKeys; isolation
+    lock-update-traversal); the prover takes predtest.c's NullTest rules;
+    dropPartialIndexImpliedQuals removes predicate-implied quals over
+    index/IOS/single-index bitmap scans (not in locking/DML plans). Design
+    docs/design/0100-0149/0148-0001c3-partial-index-predicates.md. Pins
+    TestPartialUniqueIndexConstrainsOnlyAdmittedRows,
+    TestPartialIndexScanDropsImpliedQuals,
+    TestProvePartialIndexPredicateNullTest. Gates on code_tree
+    0007e7c6092a: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue:
+    M0148-0001c3a (NullTest index quals), M0148-0001c3b (IOS over partial
+    indexes, unanalysed partial-index size, expression columns in HOT).
+  Movement: none — correctness fix — no plan instrument (13-suite regress A/B byte-identical apart from join row-order noise; scratch-PG probe of partial unique/upsert/maintenance/restart now identical)
+
+- [ ] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
+  searched paths**.
+  Kind: impl
+  Parent: M0148-0001c3
+  PG's match\_clause\_to\_indexcol (indxpath.c) takes a NullTest on an
+  index column as an index clause (amsearchnulls): `WHERE x IS NOT NULL
+  ORDER BY x LIMIT 1` plans `Index Only Scan … Index Cond: (x IS NOT
+  NULL)`, `WHERE x IS NULL` `Index Cond: (x IS NULL)`, and `x IS NOT NULL
+  AND x < 5` `Index Cond: ((x IS NOT NULL) AND (x < 5))`; goopg keeps them
+  as `Filter:`. Needs: an indexPathClause NullTest kind on the restriction
+  / index-only / ordered producers (IS NULL only over an index with
+  NULL-keyed entries), selectivity (nulltestsel), the executor scan key
+  (SK_SEARCHNULL / SK_SEARCHNOTNULL over the NULLS-LAST btree range) and
+  Index Cond rendering in index-column order (PG orders indexquals by
+  indexcol, WHERE order within a column). Resume:
+  internal/optimizer/pathindexrestrict.go addOneRestrictionIndexPath,
+  createplanindex.go, executor operators_index.go,
+  operators_explain.go formatIndexCond.
+- [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
+  fail "does not exist"**.
+  Kind: impl
+  Parent: M0148-0001c3
+  Split from M0148-0001c3b item (4). A restart's pg_class / pg_index reload
+  keys relations `public.<name>` while a live session keys them bare;
+  LookupTable / lookupIndexLocked accept either, but DropView, DropTable,
+  RenameTable and DropIndex deleted by the exact key, so the executor's
+  existence check passed and the catalog delete missed. PG drops them.
+  - LANDED c544710da (2026-11-04) — CLOSED: lookupTableKeyLocked +
+    lookupIndexLocked give the mutators the key the relation lives under.
+    Design docs/design/0100-0149/0148-0001c3c-restart-catalog-key-resolution.md.
+    Pin TestDropResolvesRestartKeySpelling; live restart repro (DROP VIEW
+    bare/qualified, DROP INDEX, RENAME, drops persist across a further
+    restart).
+  Movement: none — correctness fix — no plan instrument (post-restart DDL; regress runs never restart)
+- [ ] **M0148-0001c3b — index-only scans over a proven partial index;
+  unanalysed partial-index size; expression columns block HOT**.
+  Kind: impl
+  Parent: M0148-0001c3
+  (1) indexCoversColumns (pathindexonly.go) refuses every partial index;
+  PG's check\_index\_only accepts a proven one and ignores the columns of
+  restrictions the predicate implies (`select y from nt where x is not null
+  and y < 10` → `Index Only Scan using nt_y_part`, `Index Cond: (y < 10)`).
+  (2) A never-analysed partial index's tuple count (PG reads the index's
+  own size; regress minmaxtest3i 0.14..74.79 vs goopg 0.15..86.21):
+  costindex.go estimateIndexGeometry. (3) hotUpdateEligible ignores
+  expression-index columns (Columns[i]==""; RelationGetIndexAttrBitmap adds
+  the expressions' Vars) — an update of a column used only inside an
+  index expression may go HOT and leave the expression index stale.
+  (4) MOVED to M0148-0001c3c (closed 2026-11-04). (5) Audit the other
+  exact-key catalog mutators (sequences, matviews, types, functions) for
+  the restart key spelling (c3c fixed DropView/DropTable/RenameTable/
+  DropIndex); and `\\di` on a fresh cluster lists pg_class_oid_index etc.
+  under schema public with no table (pre-existing, seen at HEAD). Seen while probing (2026-11-03; 2026-11-04: reproduced for views at
+  HEAD — create table + view, restart once, `DROP VIEW vv` → `view "vv"
+  does not exist` while \\dv still lists it): after two server
+  restarts `DROP INDEX nt_y_part` on a partial index created before them
+  failed `index "nt_y_part" does not exist` while `CREATE INDEX nt_y_part`
+  failed `relation "public.nt_y_part" already exists` — reproduce on a
+  fresh cluster (create table + partial index, restart twice, DROP INDEX)
+  before fixing; PG drops it.
+- [ ] **M0148-0001g1 — pg_get_viewdef deparser breadth (pretty mode,
+  joins, set operations, CTEs, coercions)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001g (closed). internal/executor/viewdef_deparse.go
+  deparses a subset of view queries and falls back to the stored body text
+  elsewhere. Missing PG behaviour (ruleutils.c): pretty mode
+  (pg_get_viewdef(v, true) and psql's \d+ — PRETTYFLAG_PAREN elides
+  parentheses by precedence via isSimpleNode / get_simple_binary_op_name);
+  JOIN syntax (get_from_clause_item JoinExpr arms, USING/NATURAL column
+  merging), set operations (get_setop_query), WITH (get_with_clause),
+  window functions and WINDOW clauses, CASE, explicit casts, sublinks,
+  string/numeric literals outside VALUES and function arguments (their
+  coercion labels need the analysed types), composite-returning FROM
+  functions (attribute alias lists). (Relations outside the search path —
+  generate_relation_name qualification — landed in f3f0d0d02 under
+  M-NIGHTLY AI-20261103-004134-003.) The rules and create_view suites
+  are the measurement targets (most of their viewdef lines come through
+  \d+, i.e. pretty mode). Measure with the regress runner HEAD vs change.
+- [x] **M0148-0001f1 — EXPLAIN VERBOSE Output: content: pruned per-node
+  targetlists and remaining deparse gaps**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001f (closed). PG prints each plan node's own
+  targetlist: scans and joins carry only the columns needed above them
+  (create_scan_plan / use_physical_tlist decides when a scan keeps its full
+  physical tlist; build_path_tlist otherwise), where goopg's `Output:` lists
+  the node's whole output schema — the dominant class of the ~880 unmatched
+  PG `Output:` lines across the 34 EXPLAIN-heavy regress suites. Also in
+  scope (ledgered 2026-11-02): implicit casts and typed literals in deparsed
+  expressions (`((sum(tenthous))::double precision + (random() *
+  '0'::double precision))`); RTIDs for the remaining SRF scan kinds (unnest,
+  generate_subscripts, user SRFs, ROWS FROM); resjunk sort-key entries;
+  join / Result nodes above an aggregate. Resume: the planner must carry a
+  per-node needed-column list (or the executor-side narrowing must expose
+  it) for explainOutputNames (internal/executor/operators_explain.go) to
+  print; measure `grep -c '^- *Output:'` across the 34 suites HEAD vs
+  change. Display only — no plan or result change expected; run the TPC
+  gates anyway.
+  - LANDED 4b447b223 (2026-11-03) — CLOSED (residue split): a scan's
+    Output is the statement projection above it (explainScanProjectionOutput;
+    through Filters / Sort — resjunk keys — / Limit, only when the Project
+    is a PG targetlist up to the root); Append / Merge Append print no
+    Output (show_plan_tlist); appendrel member scans print the Append
+    columns the consumer reads (explainAppendMemberOutput, CP_EXACT_TLIST).
+    Design docs/design/0100-0149/0148-0001f1-explain-verbose-scan-tlists.md.
+    Pin TestExplainVerboseScanOutputTlist. Gates on code_tree
+    122eb355af61: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue
+    filed as M0148-0001f2.
+  Movement: yes — regress runner aggregates 443 → 358 (unmatched PG Output lines 11 → 2; single-suite 5 → 2 hunks), inherit 3208 → 3192, subselect 2531 → 2518
+
+- [x] **M0148-0001f2 — EXPLAIN VERBOSE Output: joins over subqueries and
+  aggregates; sort-input expressions; join-input tlists**.
+  Kind: impl
+  Parent: M0148-0001f1
+  Residue of M0148-0001f1. (1) A join over a pulled-up subquery /
+  aggregate prints the subquery's column names (`Output: s1.s1, s2, sm`)
+  where PG deparses the referenced expressions (`s1.s1, s2.s2,
+  (sum((s1.s1 + s2.s2)))`) — aggregates.sql hunk 1 and the bulk of join's
+  361 unmatched PG Output lines; ruleutils resolves OUTER/INNER Vars
+  through the child plan's tlist (get_special_variable). (2)
+  make\_sort\_input\_target evaluates a non-volatile select-list
+  expression below the Sort (`Output: c, (a * 2), a` on the scan,
+  `((a * 2))` above); goopg computes it after the Sort (plan shape). (3)
+  Join inputs' physical vs projected tlists (use\_physical\_tlist) and the
+  missing `Inner Unique: true`. (4) 2026-11-02 ledger items: implicit casts
+  / typed literals, SRF RTIDs, Result above an aggregate. Resume:
+  internal/executor/operators_explain.go explainOutputNames (join arm:
+  resolve each output column through the child's projection, as
+  explainAggProjectionOutput does for aggregates).
+  - LANDED b5779a59e (2026-11-04) — CLOSED (residue split): a subquery
+    column (SourceTableIdx 0) above a join deparses through the child plan
+    to the expression computing it (explainDeparseThroughChildren:
+    join side / pass-through / renaming Project → Aggregate, formatted in
+    the aggregate's own scope). Design
+    docs/design/0100-0149/0148-0001f2-output-through-subquery-tlists.md.
+    Pin TestExplainVerboseOutputThroughSubquery. Gates on code_tree
+    ce499308b9a0: units, RegressSuite + PgDump + Isolation, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none x3. Residue filed
+    as M0148-0001f3.
+  Movement: yes — regress runner aggregates 48 → 31 (unmatched PG Output lines 2 → 0; single-suite: 1 hunk left, the v_pagg_test SRF Result)
+
+- [ ] **M0148-0001f3 — EXPLAIN VERBOSE Output: sort-input expressions,
+  join targetlists, Inner Unique**.
+  Kind: impl
+  Parent: M0148-0001f2
+  Residue of M0148-0001f2. (1) make\_sort\_input\_target evaluates a
+  non-volatile select-list expression below the Sort (`Output: c, (a *
+  2), a` on the scan, `((a * 2))` above); goopg evaluates it after the
+  Sort (plan shape). (2) Join inputs / joins carry columns not needed
+  above them (`Output: f1.a, f1.b, ft.b, …` vs PG `f1.a, ft.b, …`,
+  use\_physical\_tlist / build\_path\_tlist), some inner nodes print no
+  Output, `Inner Unique: true` missing — the bulk of join.sql's 361
+  unmatched PG Output lines. (3) 2026-11-02 ledger items: casts / typed
+  literals, SRF RTIDs, Result above an aggregate. Typed literals are now
+  aggregates.sql's ONLY remaining difference (2026-11-04): a string literal
+  argument of a text parameter prints `','` where PG prints `','::text`
+  (get\_const\_expr labels a text Const) — needs builtin function /
+  aggregate parameter types (catalog.builtinProcsByName is a hand-curated
+  handful; generate from pg\_proc.dat). Closing it closes the aggregates
+  suite (M0148-0001).
+  Text-parameter literals LANDED 2026-11-04 in 80c8249f9 as M0148-0001f3a
+  (catalog.BuiltinProcSignatures + literalArgIsText; aggregates closed).
+  Still open in (3): literals coerced to NON-text parameters (date,
+  interval: PG prints the canonical output text, `'3 mons'::interval` for
+  TPC-H Q15's `'3 month'`), operator operands, user-defined functions.
+  Resume:
+  internal/executor/operators_explain.go explainOutputNames (join arm:
+  needed columns from the parent), optimizer sort-input target placement.
+- [x] **M0148-0001e1 — composite-index range quals as Index Cond (no
+  repeated Filter)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001e (its "Index Cond pushdown" item). A range qual on
+  the leading column of a MULTI-column btree index keeps the whole WHERE as a
+  Filter above the scan (`Index Cond: (y < 3)` + `Filter: (y < 3)`), and a
+  clause on a later index column stays Filter-only (`a < 3 AND b > 5` on
+  (a, b, c, d) → `Index Cond: (a < 3)`, `Filter: ((a < 3) AND (b > 5))`)
+  where PG puts every index-matchable clause in `Index Cond` and drops the
+  quals the index clauses imply (createplan.c create\_indexscan\_plan:
+  qpqual = scan\_clauses minus is\_redundant\_with\_indexclauses; nbtree
+  \_bt\_checkkeys evaluates non-boundary scan keys per index tuple).
+  goopg's guard is deliberate: tryRangeIndexScan (planner.go) drops the
+  Filter only for a single-column index because "a composite index's
+  trailing columns can leak on an exclusive-lo blob-padded bound" (the
+  btree range scan compares encoded composite keys bytewise). Resume:
+  internal/access/nbtree/btree.go rangeScanPosLeaf — prove or fix prefix
+  semantics for strict/inclusive bounds on composite keys (PG's
+  \_bt\_first / \_bt\_compare treat a shorter scan key as a prefix);
+  then let the planner's index-scan builders (tryRangeIndexScan and the
+  searched index paths) drop the redundant Filter and carry the extra
+  index-column clauses as index quals the executor checks per tuple.
+  Measure the regress movement (create\_index, btree\_index, select,
+  aggregates, join, inherit) HEAD vs change and run the TPC gates (wrong
+  results here are row-count regressions).
+  - LANDED a147188c6 (2026-11-03) — CLOSED (residue split): a
+    leading-column range on a composite btree records `local`
+    (restrictionRangeOnColumn), so no Filter repeats it — the executor's
+    strictness-aware composite padding (M0134-0001 S4) already made the
+    bound exact; a 52-query differential probe (index / bitmap / seq,
+    NULLs + duplicates, tuple AND blob key formats) is identical. VERBOSE
+    qualifies the index-column side (indexCondColumnPrefix; `Index Cond:
+    (btg.y < 0)`). Design
+    docs/design/0100-0149/0148-0001e1-composite-range-index-quals.md. Pin
+    TestRangeScanCompositeIndexDropsFilter (replaces ...KeepsFilter).
+    Gates on code_tree 8c5a94c41cfa: units, RegressSuite + PgDump +
+    Isolation, spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set
+    fires=none x3. Residue filed as M0148-0001e2.
+  Movement: yes — regress runner aggregates 459 → 443 (btg hunk gone; 10 → 9 hunks), subselect 2492 → 2488, join 17855 → 17853
+
+- [ ] **M0148-0001e2 — clauses on later index columns as per-tuple Index
+  Cond; ranges behind an equality prefix without the Filter recheck**.
+  Kind: impl
+  Parent: M0148-0001e1
+  Residue of M0148-0001e1. (1) `a < 3 AND b > 5` on (a, b, c, d) prints
+  `Index Cond: (a < 3)` + `Filter: (b > 5)`; PG prints `Index Cond: ((a <
+  3) AND (b > 5))` — every index-matchable clause is an index qual, the
+  non-boundary ones checked per index tuple (nbtree \_bt\_checkkeys,
+  build\_index\_paths' index\_clauses over all columns). Needs the
+  executor's index scans to evaluate extra scan keys against the index
+  tuple. (2) `a = 1 AND b > 5`: the bound behind an equality prefix keeps
+  its Filter recheck (restrictionRangeOnColumn pos > 0 records no
+  `local`) because the open-ended scan runs to the prefix's padded upper
+  bound, past entries whose b is NULL; PG's strict scan keys stop at
+  NULLs (\_bt\_first / required-key end-of-scan). (3) The legacy rule
+  path tryRangeIndexScan (planner.go) keeps its composite guard. Resume:
+  internal/executor/operators_index.go (scan-key check per entry),
+  internal/optimizer/pathindexrestrict.go, createplanindex.go. Verify with
+  the e1 differential probe extended to later-column clauses + regress
+  create\_index / btree\_index.
+
+- Pre-existing gate flakes recorded (NOT caused by 0001a/b — reproduced on
+  the stashed clean HEAD under identical load):
+  `TestExplainSplitAggregateChainCosts` (2s absolute conn deadline from dial
+  covering ~1.2M in-process inserted rows; deterministic failure on the
+  loaded host 2026-11-01 noon, passed loop #14's morning run and nightly CI
+  on idle hosts), and the instant-fail family
+  `TestSimpleQueryBatchAbortUndoesEarlierCreate{Table,Type}` +
+  `TestConnTxSessionNilWhenNotExplicit` (fail under `-parallel 4`, pass
+  isolated; CreateTable already documented 2026-11-01 loop #14).
+  Pre-commit smoke excludes internal/postmaster (cluster-backed), so the
+  commit gate is unaffected.
+- Loop #16 adds a date-boundary flake of the same documentation class:
+  `internal/executor TestCopyFromZonelessTimetzTakesSessionZone` asserts a
+  \-14400 \(EDT\) zone offset "on today's date" for TimeZone="America/New_York";
+  US DST ended 2026-11-01 \(02:00 local\) so the offset is \-18000 \(EST\) and
+  the assertion inverts. Reproduced identically on the stashed clean HEAD
+  \(0.079s, no code change\); it goes green again as the host date moves
+  inside the DST period. Test-side date sensitivity, not a product defect;
+  no fix filed \(candidate: pin a fixed evaluation date in the test\).
+- [ ] **M0148-0001h1 — view/relation dependencies by OID, pg_temp placement,
+  DROP SCHEMA cascade listing**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001h (closed). goopg still matches view dependencies by
+  relation NAME at drop time (viewsDependingOnTable / selectRefsRelation /
+  matViewsDependingOnRelation / functionsDependingOnTable); PG records them
+  by OID in pg_depend at CREATE VIEW (recordDependencyOnExpr from
+  DefineView/StoreViewQuery) and walks them by OID (findDependentObjects).
+  Also open: temporary relations/views keep goopg's bare key instead of the
+  session's pg_temp namespace (so a temp t1 is matched as public);
+  `DROP SCHEMA … CASCADE` does not print PG's dependency-ordered list;
+  TablesInSchema reports a stale name after RENAME following SET SCHEMA;
+  ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
+  resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
+  namespace regress runner HEAD vs change.
+- [x] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
+  outer query (top Sort, Result node, unqualified names)**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001i (closed). planScanRangeVar plans a view body as a
+  separate statement and wraps it in a renaming Project; PG's rewriter
+  expands the view into a subquery RTE that the planner pulls up
+  (pull_up_subqueries), so the outer query sees the view's pathkeys and
+  rtable. aggregates.sql v_pagg_test (~1929) still differs by: a redundant
+  top `Sort Key: y` (the outer GroupAggregate already delivers y order), no
+  `Result` node between the Sort and the ProjectSet, `Group Key: y` instead
+  of `pagg_test.y` (separate rtable scope), and the sort key printed as `t`
+  instead of the cast expression. Resume: plan the view as a subquery
+  RangeVar in the outer statement's rtableScope (the derived-table path)
+  instead of Plan + Project. Measure: aggregates / create_view / rules /
+  select_views regress runner HEAD vs change, and the TPC-H Q15 plan (view
+  revenue0) on the fire-set.
+  - LANDED 86cd7eff0 (2026-11-04) — CLOSED (residue split): a view
+    reference is expanded into a subquery RTE (fireRIRrules) and planned by
+    planSubqueryRangeVar — the outer query sees its ordering (no redundant
+    top Sort) and its relations are named in the statement's range table
+    (`Group Key: pagg_test.y`); an unwrapped view numbers after its level
+    (rtableScope.pulledViewRoots, renumberRTIDsFlatRtableOrder). View-owner
+    tagging unchanged. Design
+    docs/design/0100-0149/0148-0001i1-views-as-subquery-rtes.md. Pin
+    TestViewPlansAsSubqueryRTE. Gates on code_tree 23b569bd3aa3: units,
+    RegressSuite + PgDump + Isolation, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire-set fires=none x3 (Q15 unchanged). Residue filed as
+    M0148-0001i2.
+  Movement: yes — regress runner aggregates −6 lines (v_pagg_test top Sort and qualification gone), select_views 1503 → 1502
+
+- [x] **M0148-0001i3 — a cast over an SRF prints as a Result above the
+  ProjectSet; the sort key deparses through it**.
+  Kind: impl
+  Parent: M0148-0001i2
+  Split from M0148-0001i2 part (2). PG's split\_pathtarget\_at\_srfs
+  evaluates `unnest(...)::integer` in a Result above the ProjectSet and a
+  sort key on it deparses as `(((unnest(...)))::integer)`; goopg's
+  ProjectSet evaluates both and printed `Sort Key: …, t`.
+  - LANDED 04def79cf (2026-11-04) — CLOSED: UnnestCol.ExplicitCast
+    (planner; CastType alone also carries the inferred element type),
+    srfNeedsResultAbove synthesises the Result in the text walkers,
+    resolveKeySourceDepth's ProjectSet arm deparses the key. Design
+    docs/design/0100-0149/0148-0001i3-srf-cast-result.md. Pin
+    TestExplainSRFCastResult. Gates on code_tree 6c307605ea21: units,
+    RegressSuite + PgDump + Isolation, spotcheck, sf025 99/99, acceptance
+    24 MATCH, fire-set fires=none x3.
+  Movement: yes — regress runner aggregates 31 → 20 (the v_pagg_test hunk now differs only by the `','::text` literal label)
+- [ ] **M0148-0001i2 — simple views pulled up into the parent join search;
+  SRF-targetlist Result with the cast sort key**.
+  Kind: impl
+  Parent: M0148-0001i1
+  Residue of M0148-0001i1. (1) pull\_up\_subqueries flattens a simple,
+  non-security-barrier view into the parent's join search; goopg plans
+  the expanded view as a derived leaf (expandDerivedPullups runs on the
+  syntactic FROM list, before view expansion) — the view-owner
+  checkAsUser must travel with the pulled-up RTEs (tagViewOwnerScans works
+  on the planned subtree). (2) aggregates.sql v\_pagg\_test: PG evaluates
+  `unnest(...)::integer` in a `Result` above the `ProjectSet` and sorts by
+  the full expression (`Sort Key: pagg_test.y,
+  (((unnest(...)))::integer)`); goopg sorts by the subquery column `t`
+  with no Result. — MOVED to M0148-0001i3 (closed 2026-11-04). Resume: internal/optimizer/derivedpullup.go (admit
+  view RangeVars), the ProjectSet / SRF target placement in the subquery
+  planner.
+- [ ] **M0148-0001k1 — appendrel residue: EPQ-aware member quals, plan-time
+  partition pruning, member order**.
+  Kind: impl
+  Parent: M0148-0001
+  Split from M0148-0001k (closed). (a) Locking / modifying plans (FOR
+  UPDATE/SHARE, UPDATE, DELETE, MERGE) keep the restriction on the Append:
+  lockRowsOp.findFilterPred and the DML EPQ rechecks read the qual above
+  the scan chain; teach them to recheck the member's own Filter, then drop
+  planTakesRowMarksOrModifies (appendrel_pushdown.go). (b) goopg scans
+  every partition: PG prunes at plan time (partprune.c
+  prune_append_rel_partitions / gen_partprune_steps), which is most of
+  partition_prune's 6785-line diff and the member numbering there. (c)
+  Member order: a partitioned table's DEFAULT partition expands first (PG:
+  PartitionDesc bound order, default last), and inheritance children came
+  back in a different order after a restart (InheritanceChildren reload
+  order; PG orders by inhseqno/child OID). Measure: partition_prune /
+  partition_join / inherit regress runner HEAD vs change, and isolation
+  eval-plan-qual for (a).
+- [ ] **M0148-0002 — copy.sql regress coverage closure**.
+  Kind: impl
+  Parent: none
+  - Canonical queue entry 2 (docs/milestones/0148-regress-coverage-closure.md),
+    materialized 2026-11-04 after M0148-0001 closed.
+  - Baseline 2026-11-04 at 80c8249f9: 7 hunks / 292 diff lines
+    (`tmp/m0148/copy-baseline/copy.diff`). Classification, each to be filed
+    as a `Kind: impl` child before implementing (PG oracle: copyfromparse.c,
+    copyfrom.c, copyto.c, copy.c ProcessCopyOptions):
+    (a) text/CSV line endings — a DOS `\r\n` file reads `abc\r`, and the
+        end-of-copy marker `\.` must be alone on its line ("end-of-copy
+        marker is not alone on its line", CopyReadLineText);
+    (b) COPY into a partitioned table routes no rows (`tableoid | count`
+        empty) and COPY FREEZE is not rejected on partitioned / foreign
+        tables (CopyFrom checks);
+    (c) COPY FROM ... WHERE (syntax error at `where`) and the
+        pg_stat_progress_copy INFO lines;
+    (d) ON_ERROR ignore ("N rows were skipped due to data type
+        incompatibility") and PG's input-error texts (goopg leaks
+        strconv.ParseInt);
+    (e) HEADER MATCH (column name mismatch / wrong number of fields in
+        header line, "match" rejected for COPY TO) and the dropped-column
+        header case;
+    (f) DEFAULT option (`option "default" not recognized`) and varchar(n)
+        length errors;
+    (g) unpopulated matview wording ("cannot copy from unpopulated
+        materialized view" + HINT).
+  - Complete only at runner parity with the inventory row promoted, coverage
+    docs regenerated, and M0148-0003 (copy2) materialized.

@@ -92,16 +92,27 @@ func TestPubSubDropPublication(t *testing.T) {
 	}
 }
 
-// TestPubSubCreateSubscription pins the round-trip and the
-// SlotName default (=name when empty).
+// TestPubSubCreateSubscription pins the round-trip and that SlotName is
+// stored as given ("" = slot_name = NONE; the name default is the executor's).
 func TestPubSubCreateSubscription(t *testing.T) {
 	ps := NewPubSub()
 	sub, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1", "p2"}, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.SlotName != "s1" {
-		t.Errorf("SlotName=%q want s1 (default to subscription name)", sub.SlotName)
+	// The registry stores slotName as given: "" is slot_name = NONE (PG's
+	// NULL subslotname). The "default to the subscription name" rule is
+	// DefineSubscription's (the executor's), pinned by the executor's
+	// subscription DDL tests; defaulting it here made NONE unrepresentable.
+	if sub.SlotName != "" {
+		t.Errorf("SlotName=%q want \"\" (stored as given; NONE)", sub.SlotName)
+	}
+	sub2, err := ps.CreateSubscription("s2", "host=remote dbname=app", []string{"p1"}, "myslot", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub2.SlotName != "myslot" {
+		t.Errorf("SlotName=%q want myslot", sub2.SlotName)
 	}
 	if sub.Conninfo != "host=remote dbname=app" {
 		t.Errorf("Conninfo=%q", sub.Conninfo)
@@ -123,6 +134,56 @@ func TestPubSubDuplicateSubscriptionName(t *testing.T) {
 	}
 	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); !errors.Is(err, ErrSubscriptionExists) {
 		t.Errorf("err=%v want ErrSubscriptionExists", err)
+	}
+}
+
+// TestPubSubSetSubscriptionEnabledAndSlot pins the two ALTER SUBSCRIPTION
+// mutators: SetSubscriptionEnabled (ENABLE / DISABLE) and
+// SetSubscriptionSlotName (SET (slot_name = ...), "" = NONE). Both return
+// ErrSubscriptionNotFound on an unknown name and leave the row untouched.
+func TestPubSubSetSubscriptionEnabledAndSlot(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1"}, "s1", true); err != nil {
+		t.Fatal(err)
+	}
+	// CreateSubscription returns a snapshot copy (the registry hands out
+	// pointers via LookupSubscription); re-look-up after each mutator.
+	lookup := func() *Subscription {
+		s, ok := ps.LookupSubscription("s1")
+		if !ok {
+			t.Fatal("s1 not registered")
+		}
+		return s
+	}
+	if err := ps.SetSubscriptionEnabled("s1", false); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().Enabled {
+		t.Error("Enabled=true after DISABLE, want false")
+	}
+	if err := ps.SetSubscriptionEnabled("s1", true); err != nil {
+		t.Fatal(err)
+	}
+	if !lookup().Enabled {
+		t.Error("Enabled=false after ENABLE, want true")
+	}
+	if err := ps.SetSubscriptionSlotName("s1", "new_slot"); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().SlotName != "new_slot" {
+		t.Errorf("SlotName=%q want new_slot", lookup().SlotName)
+	}
+	if err := ps.SetSubscriptionSlotName("s1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if lookup().SlotName != "" {
+		t.Errorf("SlotName=%q want \"\" (NONE)", lookup().SlotName)
+	}
+	if err := ps.SetSubscriptionEnabled("nosuch", true); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Errorf("SetSubscriptionEnabled nosuch: err=%v want ErrSubscriptionNotFound", err)
+	}
+	if err := ps.SetSubscriptionSlotName("nosuch", "x"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Errorf("SetSubscriptionSlotName nosuch: err=%v want ErrSubscriptionNotFound", err)
 	}
 }
 

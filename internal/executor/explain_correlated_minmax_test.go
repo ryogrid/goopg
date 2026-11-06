@@ -50,3 +50,200 @@ func TestCorrelatedMinMaxInitPlan(t *testing.T) {
 		}
 	}
 }
+
+// M0148-0001c slice (a): Sort / Group Key sites above a min/max-rewritten
+// Result print PG's initplan param label (the chase lands on the Result's
+// SubqueryExpr target, ruleutils get_special_variable prints it), not
+// goopg's output alias — aggregates.sql's
+//
+//	Group Key: (InitPlan 1).col1        (select distinct max(unique2) …)
+//	Sort Key: ((InitPlan 1).col1)       (order by 1 / order by max(unique2))
+//	Sort Key: (((InitPlan 1).col1 + 1)) (order by max(unique2)+1)
+//
+// The S18 force-paren wrap fires on the non-Var referent, so the bare label
+// carries its own pair and the Sort line carries the site's.
+func TestExplainKeyOverMinMaxResultInitPlanRef(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE mmk (u2 int)",
+		"INSERT INTO mmk SELECT g FROM generate_series(1, 20) g",
+		"CREATE INDEX mmk_u2 ON mmk (u2)",
+		"ANALYZE mmk",
+	} {
+		runSQL(t, ctx, q)
+	}
+	for _, tc := range []struct{ q, want string }{
+		{"EXPLAIN (COSTS OFF) select distinct max(u2) from mmk", "Group Key: (InitPlan 1).col1"},
+		{"EXPLAIN (COSTS OFF) select max(u2) from mmk order by 1", "Sort Key: ((InitPlan 1).col1)"},
+		{"EXPLAIN (COSTS OFF) select max(u2) from mmk order by max(u2)", "Sort Key: ((InitPlan 1).col1)"},
+		{"EXPLAIN (COSTS OFF) select max(u2) from mmk order by max(u2)+1", "Sort Key: (((InitPlan 1).col1 + 1))"},
+	} {
+		plan := strings.Join(renderRows(runSQL(t, ctx, tc.q)), "\n")
+		if !strings.Contains(plan, tc.want) {
+			t.Errorf("%s:\nwant %q in\n%s", tc.q, tc.want, plan)
+		}
+		if strings.Contains(plan, "Group Key: max\n") || strings.Contains(plan, "Sort Key: max\n") {
+			t.Errorf("%s:\nkey still renders the output alias in\n%s", tc.q, plan)
+		}
+	}
+}
+
+// TestExplainMinMaxMultiTargetProjectSet pins M0148-0001c slice (b): a
+// multi-target tlist holding exactly ONE strict min/max agg plus a Var-free
+// generate_series extra takes PG's create_minmaxagg_plan shape — the whole
+// surviving tlist sits in the childless Result's targets, the tlist SRF is
+// expanded by the ProjectSet above it, and the ORDER BY over the SRF's alias
+// renders the funcexpr itself (the block at
+// postgres/src/test/regress/expected/aggregates.out:1169-1180):
+//
+//	Sort
+//	  Sort Key: (generate_series(1, 3)) DESC
+//	  InitPlan 1
+//	    ->  Limit
+//	          ->  Index Only Scan Backward using tenk1_unique2 on tenk1
+//	                Index Cond: (unique2 IS NOT NULL)
+//	  ->  ProjectSet
+//	        ->  Result
+func TestExplainMinMaxMultiTargetProjectSet(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE mmt (u2 int)",
+		"INSERT INTO mmt SELECT g FROM generate_series(1, 20) g",
+		"CREATE INDEX mmt_u2 ON mmt (u2)",
+		"ANALYZE mmt",
+	} {
+		runSQL(t, ctx, q)
+	}
+	plan := strings.Join(renderRows(runSQL(t, ctx,
+		"EXPLAIN (COSTS OFF) select max(u2), generate_series(1,3) as g from mmt order by g desc")), "\n")
+	for _, want := range []string{
+		"Sort Key: (generate_series(1, 3)) DESC",
+		"InitPlan 1",
+		"->  Limit",
+		"->  Index Only Scan Backward using mmt_u2 on mmt",
+		"Index Cond: (u2 IS NOT NULL)",
+		"->  ProjectSet",
+		"->  Result",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("want %q, as PG prints:\n%s", want, plan)
+		}
+	}
+	if strings.Contains(plan, "Aggregate") {
+		t.Errorf("multi-target tlist fell back to the Aggregate path:\n%s", plan)
+	}
+	// PG prints the query level's initPlan list on the top node (the Sort),
+	// BEFORE the children; a Result-deep InitPlan line would land after the
+	// ProjectSet arrow.
+	if iInit, iPS := strings.Index(plan, "InitPlan 1"), strings.Index(plan, "->  ProjectSet"); iInit >= 0 && iPS >= 0 && iInit > iPS {
+		t.Errorf("InitPlan 1 must print on the Sort, above ProjectSet:\n%s", plan)
+	}
+	// The executed rows: the ProjectSet zips the SRF's 3 steps over the
+	// childless Result's one row, each carrying the InitPlan's max.
+	rows := renderRows(runSQL(t, ctx,
+		"select max(u2), generate_series(1,3) as g from mmt order by g desc"))
+	want := []string{"20|3", "20|2", "20|1"}
+	if len(rows) != len(want) {
+		t.Fatalf("want rows %v, got %v", want, rows)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Errorf("row %d: want %q, got %v", i, want[i], rows)
+		}
+	}
+
+	// Const-only extra: no SRF to expand, so no ProjectSet — the surviving
+	// tlist is the childless Result's own targets (createplan.c:2588-2612).
+	constPlan := strings.Join(renderRows(runSQL(t, ctx,
+		"EXPLAIN (COSTS OFF) select max(u2), 5 from mmt")), "\n")
+	if !strings.Contains(constPlan, "Result") || !strings.Contains(constPlan, "InitPlan 1") {
+		t.Errorf("want Result + InitPlan 1 for the const-extra rewrite:\n%s", constPlan)
+	}
+	if strings.Contains(constPlan, "ProjectSet") {
+		t.Errorf("no ProjectSet is due without a tlist SRF:\n%s", constPlan)
+	}
+	if got := renderRows(runSQL(t, ctx, "select max(u2), 5 from mmt")); len(got) != 1 || got[0] != "20|5" {
+		t.Errorf("want [20|5], got %v", got)
+	}
+
+	// M0148-0001c slice (c): the two-agg min/maxttest shape lands — TWO
+	// InitPlans (min forward, max Backward) over one childless Result, each
+	// InitPlan a Limit over the presorted IOS (aggregates.out:1069-1092).
+	pairPlan := strings.Join(renderRows(runSQL(t, ctx, "EXPLAIN (COSTS OFF) select min(u2), max(u2) from mmt")), "\n")
+	for _, want := range []string{"Result", "InitPlan 1", "InitPlan 2", "Limit", "Index Only Scan"} {
+		if !strings.Contains(pairPlan, want) {
+			t.Errorf("multi-agg EXPLAIN missing %q:\n%s", want, pairPlan)
+		}
+	}
+	if strings.Contains(pairPlan, "Aggregate") {
+		t.Errorf("multi-agg should be the InitPlan rewrite, not the Aggregate path:\n%s", pairPlan)
+	}
+	if got := renderRows(runSQL(t, ctx, "select min(u2), max(u2) from mmt")); len(got) != 1 || got[0] != "1|20" {
+		t.Errorf("multi-agg rows = %v, want [1|20]", got)
+	}
+
+	// Scope bounds (deferral ledger): an aggregate extra keeps the ordinary
+	// Aggregate path.
+	for _, q := range []string{
+		"EXPLAIN (COSTS OFF) select max(u2), count(*) from mmt",
+	} {
+		p := strings.Join(renderRows(runSQL(t, ctx, q)), "\n")
+		if !strings.Contains(p, "Aggregate") {
+			t.Errorf("%s: scope bound — want the Aggregate path:\n%s", q, p)
+		}
+	}
+}
+
+// M0148-0001c slice (d): an equality pinning the agg column to a
+// pseudo-constant — a literal, or an outer column (a Param inside the
+// sublink) — makes build_minmax_path's pathkey redundant, so PG plans the
+// InitPlan as `Limit → Seq Scan` with no Sort even without an index
+// (aggregates.out:1300-1316, bug #18465's DISTINCT case). goopg declined the
+// rewrite (no presorted index) and printed an Aggregate.
+func TestMinMaxEqualityPinnedSeqScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	t.Cleanup(cleanup)
+	for _, q := range []string{
+		"CREATE TABLE mmp (f1 int4)",
+		"INSERT INTO mmp VALUES (0), (123456), (-123456), (2147483647), (-2147483647), (NULL)",
+		"ANALYZE mmp",
+	} {
+		runSQL(t, ctx, q)
+	}
+	for _, tc := range []struct{ q, want string }{
+		{"EXPLAIN (COSTS OFF) SELECT f1, (SELECT min(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1) FROM mmp t0", strings.Join([]string{
+			"Seq Scan on mmp t0",
+			"  SubPlan 2",
+			"    ->  Result",
+			"          InitPlan 1",
+			"            ->  Limit",
+			"                  ->  Seq Scan on mmp t1",
+			"                        Filter: ((f1 IS NOT NULL) AND (f1 = t0.f1))",
+		}, "\n")},
+		{"EXPLAIN (COSTS OFF) SELECT max(f1) FROM mmp WHERE f1 = 5 AND f1 > 2", strings.Join([]string{
+			"Result",
+			"  InitPlan 1",
+			"    ->  Limit",
+			"          ->  Seq Scan on mmp",
+			"                Filter: ((f1 IS NOT NULL) AND (f1 > 2) AND (f1 = 5))",
+		}, "\n")},
+	} {
+		if got := strings.Join(renderRows(runSQL(t, ctx, tc.q)), "\n"); got != tc.want {
+			t.Errorf("%s:\n got:\n%s\nwant (PG 18.3):\n%s", tc.q, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ q, want string }{
+		{"SELECT f1, (SELECT DISTINCT min(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1) FROM mmp t0 ORDER BY f1",
+			"-2147483647|-2147483647;-123456|-123456;0|0;123456|123456;2147483647|2147483647;NULL|NULL"},
+		{"SELECT f1, (SELECT max(t1.f1) FROM mmp t1 WHERE t1.f1 = t0.f1 AND t1.f1 > 0) FROM mmp t0 ORDER BY f1",
+			"-2147483647|NULL;-123456|NULL;0|NULL;123456|123456;2147483647|2147483647;NULL|NULL"},
+		{"SELECT min(f1), max(f1) FROM mmp WHERE f1 = 0", "0|0"},
+		{"SELECT min(f1) FROM mmp WHERE f1 = 7", "NULL"},
+	} {
+		if got := strings.Join(renderRows(runSQL(t, ctx, tc.q)), ";"); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+		}
+	}
+}

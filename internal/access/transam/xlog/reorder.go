@@ -50,6 +50,11 @@ const (
 	// ChangeDelete is a row-level DELETE. OldTuple holds the
 	// deleted row's identifying columns (per replica identity).
 	ChangeDelete
+	// ChangeMessage is a transactional logical decoding message
+	// (pg_logical_emit_message with transactional = true), queued in
+	// its transaction like a row change (REORDER_BUFFER_CHANGE_MESSAGE).
+	// MsgPrefix / MsgContent carry it; it never folds.
+	ChangeMessage
 )
 
 // Change is one row-level event in flight through the reorder
@@ -64,6 +69,9 @@ type Change struct {
 	LineSlot uint16
 	OldTuple []byte
 	NewTuple []byte
+	// MsgPrefix and MsgContent are a ChangeMessage's prefix and bytes.
+	MsgPrefix  string
+	MsgContent []byte
 }
 
 // txn is the per-xact accumulator inside the reorder buffer.

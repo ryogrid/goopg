@@ -828,13 +828,16 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 	// sorted family for them and offer only the hashed one, so TPC-H Q16's
 	// `count(DISTINCT ps_suppkey)` elected `HashAggregate -> Gather` where
 	// PG runs `GroupAggregate -> Gather Merge -> Sort (…, ps_suppkey)`.
+	// M0148-0001j: without presorted keys the group keys alone are a valid
+	// sorted input too — the executor sorts each group's ordered-aggregate
+	// inputs (the serial twin's rule) — and such a grouping has no hashed
+	// arm at all.
 	gatheredKeys := groupKeysSortKeys(aggNode)
-	gatheredSortOK := !groupingHasSpecialAgg(aggNode)
 	presortedKeys, presorted := presortedAggKeysOrAbsent(aggNode, ps)
 	if presorted {
-		gatheredKeys, gatheredSortOK = presortedKeys, true
+		gatheredKeys = presortedKeys
 	}
-	if aggNode.GroupingSets == nil && gatheredSortOK {
+	if aggNode.GroupingSets == nil {
 		if keepGather {
 			sortedInput := sortPathForBounded(nsGather, pathkeysForSortKeys(gatheredKeys), cp, -1)
 			// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
@@ -880,7 +883,7 @@ func addPartialAggSplitPath(u *upperRels, grouped *RelOptInfo, seed *Path, aggNo
 			}, partialAggGatherMergeProducer)
 		}
 	}
-	if keepGather && (groupingHashable(aggNode, presorted) || aggNode.GroupingSets != nil) {
+	if keepGather && (groupingHashable(aggNode, presorted) || groupingSetsHashable(aggNode)) {
 		// R47 slice 1: per-candidate spec clone (see groupingpaths.go).
 		hashSpec := *aggNode
 		addPath(grouped, &Path{

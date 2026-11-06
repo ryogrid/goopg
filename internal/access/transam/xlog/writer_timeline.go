@@ -195,3 +195,34 @@ func syncDir(dir string) error {
 	defer d.Close()
 	return d.Sync()
 }
+
+// ReopenSegmentFiles drops every cached segment descriptor after flushing
+// what was written, so the next write opens each segment by its path again.
+// Archive recovery replaces a pg_wal segment with the archived copy by
+// rename (KeepFileRestoredFromArchive); a descriptor the writer opened before
+// recovery still names the replaced inode, and writes through it would land
+// in a file no longer in pg_wal. PG opens no WAL for writing until recovery
+// ends, so the promotion that follows always writes the restored file.
+//
+// Precondition as SwitchTimeline's: nothing appends concurrently.
+func (w *Writer) ReopenSegmentFiles() error {
+	s := w.stateRef
+	if s == nil {
+		return ErrClosed
+	}
+	if err := w.FlushUpTo(w.WrittenLSN()); err != nil {
+		return fmt.Errorf("wal: reopen segment files: flush: %w", err)
+	}
+	s.eagerWG.Wait()
+
+	s.writeMu.lock()
+	defer s.writeMu.release()
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+	for segNo, f := range s.files {
+		_ = f.Close()
+		delete(s.files, segNo)
+	}
+	clear(s.dirty)
+	return nil
+}

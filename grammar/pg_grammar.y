@@ -161,7 +161,7 @@
 %type <expr>	opt_paren_limit opt_paren_offset
 %type <exprs>	opt_execute_params
 
-%type <strs>	constr_name_list
+%type <strs>	constr_name_list pub_name_list
 %type <b>	constraints_set_mode opt_no_inherit opt_ctas_with_data
 %type <node>	trunc_name_list trunc_name
 %type <exprs>	opt_func_call_args
@@ -2613,7 +2613,7 @@ a_expr:
 	| a_expr like_op any_or_some '(' expr_list ')'
 			{ $$ = quantifiedAny(yylex, $<p>2, $1, OpCode($2), nil, $5, $<p>5) }
 	| a_expr like_op ALL '(' expr_list ')'
-			{ $$ = NewInExpr($<p>2, $1, false, OpCode($2), true, nil, unwrapAnyArray(yylex, $5, $<p>5)) }
+			{ $$ = quantifiedAll(yylex, $<p>2, $1, OpCode($2), $5, $<p>5) }
 	| a_expr subq_op ANY '(' expr_list ')'
 			{
 				$$ = quantifiedAny(yylex, $<p>2, $1, binOp(yylex, $2), nil, $5, $<p>5)
@@ -2624,7 +2624,7 @@ a_expr:
 			}
 	| a_expr subq_op ALL '(' expr_list ')'
 			{
-				$$ = NewInExpr($<p>2, $1, false, binOp(yylex, $2), true, nil, unwrapAnyArray(yylex, $5, $<p>5))
+				$$ = quantifiedAll(yylex, $<p>2, $1, binOp(yylex, $2), $5, $<p>5)
 			}
 	| a_expr subq_op ANY select_with_parens
 			{
@@ -3467,6 +3467,41 @@ name_or_call:
 				fc.OrderBy = $7
 				$$ = fc
 			}
+	/* gram.y's func_expr = func_application within_group_clause filter_clause
+	   over_clause, one rule with every clause optional; each cross-product
+	   cell below is one instantiation of it. aggregates.sql reaches
+	   `aggfns(distinct a,b,c order by a,c using ~<~,b) filter (where a > 1)`
+	   and `sum(two order by two) filter (where two > 1)`, so the
+	   args-ORDER-BY(+DISTINCT) × FILTER(+OVER) cells must exist. */
+	| qualified_name '(' DISTINCT expr_list ORDER BY sort_by_list ')' filter_clause
+			{
+				ft := splitFuncName($1)
+				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.OrderBy = $7
+				fc.Filter = $9.(Expr)
+				$$ = fc
+			}
+	| qualified_name '(' DISTINCT expr_list ORDER BY sort_by_list ')' filter_clause OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.OrderBy = $7
+				fc.Filter = $9.(Expr)
+				fc.Over = NewBareWindowRef($<p>10, $11)
+				$$ = fc
+			}
+	| qualified_name '(' DISTINCT expr_list ORDER BY sort_by_list ')' filter_clause OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := NewFuncCall($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $4, false)
+				fc.Distinct = true
+				fc.OrderBy = $7
+				fc.Filter = $9.(Expr)
+				fc.Over = windowAt($12, $<p>10)
+				$$ = fc
+			}
 	| qualified_name '(' opt_call_args ')' filter_clause
 			{
 				ft := splitFuncName($1)
@@ -3493,6 +3528,34 @@ name_or_call:
 				fc.Over = windowAt($8, $<p>6)
 				$$ = fc
 			}
+	/* args-ORDER-BY × FILTER (+OVER) cells — `sum(two order by two) filter
+	   (where two > 1)` (aggregates.sql presort check). */
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' filter_clause
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				fc.Filter = $8.(Expr)
+				$$ = fc
+			}
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' filter_clause OVER ColId
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				fc.Filter = $8.(Expr)
+				fc.Over = NewBareWindowRef($<p>9, $10)
+				$$ = fc
+			}
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' filter_clause OVER '(' opt_window_spec ')'
+			{
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
+				fc.Filter = $8.(Expr)
+				fc.Over = windowAt($11, $<p>9)
+				$$ = fc
+			}
 	| qualified_name '(' opt_call_args ')' within_group_clause
 			{
 				ft := splitFuncName($1)
@@ -3512,6 +3575,37 @@ name_or_call:
 				if wg, ok := $6.([]SortBy); ok {
 					fc.WithinGroup = wg
 				}
+				$$ = fc
+			}
+	/* within_group_clause × filter_clause cell — `percentile_disc(0.5)
+	   within group (order by thousand) filter (where hundred=1)`
+	   (aggordview1, aggregates.sql). gram.y attaches agg_filter after
+	   agg_order in the same production. */
+	| qualified_name '(' opt_call_args ')' within_group_clause filter_clause
+			{
+				ft := splitFuncName($1)
+				_ = ft
+				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				if wg, ok := $5.([]SortBy); ok {
+					fc.WithinGroup = wg
+				}
+				fc.Filter = $6.(Expr)
+				$$ = fc
+			}
+	/* args-ORDER-BY × within_group_clause: gram.y's func_expr action raises
+	   "cannot use multiple ORDER BY clauses with WITHIN GROUP" (42601, at
+	   parser_errposition(@2) = the WITHIN token) when agg_order was already
+	   set by func_application; reproduce the raise, not the merge. */
+	| qualified_name '(' call_arg_list ORDER BY sort_by_list ')' within_group_clause
+			{
+				raiseErr(yylex, &SyntaxError{
+					Pos:     $<p>8,
+					Message: "cannot use multiple ORDER BY clauses with WITHIN GROUP",
+					Raw:     true,
+				})
+				ft := splitFuncName($1)
+				fc := callFuncExpr($1.pos, ObjectName{pos: $1.pos, Schema: ft.schema, Name: ft.name}, $3.(*callArgs))
+				fc.OrderBy = $6
 				$$ = fc
 			}
 

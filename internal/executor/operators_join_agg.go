@@ -2497,6 +2497,13 @@ type aggRuntime struct {
 	// bytea mode's RAW bytes just as well as text mode's UTF-8 (finishAgg
 	// renders bytea through byteaOutMode at the end either way).
 	strAccum []byte
+	// strFirstDelim is the delimiter that came with string_agg's first
+	// unordered piece. PG's state keeps every piece's leading delimiter and
+	// skips the first only when finishing (string_agg_finalfn's cursor), so
+	// string_agg_combine joins two partial states with the SECOND state's
+	// first delimiter; strAccum drops it, so it is kept here for the
+	// combine phase (M0148-0001i).
+	strFirstDelim string
 	// arrayElems holds the accumulated element format-strings for
 	// array_agg(expr); arrayElemNull[i] marks element i as NULL
 	// (reserved — current applyAgg skips NULL inputs, so this is
@@ -2562,6 +2569,9 @@ type aggRuntime struct {
 	// Initialized from initcond; updated by sfunc on each row.
 	userState    Datum
 	userStateSet bool // true once userState has been initialized
+	// userNoTrans is nodeAgg's noTransValue for the combine phase: the
+	// state came from a NULL INITCOND and no partial has been combined yet.
+	userNoTrans bool
 	// withinGroupElems accumulates per-row values for WITHIN GROUP (ORDER BY ...)
 	// ordered-set aggregates (percentile_cont, percentile_disc, rank, dense_rank, mode).
 	// Each entry is [sortKey0, sortKey1, ..., valueExpr]. M0097-0035.
@@ -2578,6 +2588,9 @@ type aggRuntime struct {
 	// with DISTINCT (and optional ORDER BY). Deferred to finishAgg for correct
 	// multi-arg dedup and ORDER BY sort before sfunc calls. M0097-0035.
 	distinctUserAggRows [][]Datum // inner: [sortKey0..., arg0, arg1, ...]
+	// presortedSeen holds the argument keys a presorted DISTINCT user
+	// aggregate has already transitioned in this group (M0148-0001j).
+	presortedSeen map[string]struct{}
 }
 
 func newAggregateOp(plan *optimizer.Aggregate, child Operator) *aggregateOp {
@@ -3020,7 +3033,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			if gr == nil {
 				continue
 			}
-			if err := pub.merge(key, gr.groupValues, gr.passthroughVals, gr.aggs, o.plan.Aggs); err != nil {
+			if err := pub.merge(key, gr.groupValues, gr.passthroughVals, gr.aggs, o.plan.Aggs, o.ctx); err != nil {
 				return err
 			}
 		}
@@ -3444,7 +3457,7 @@ func (o *aggregateOp) emitPartialStateRows(groups map[string]*groupRuntime, orde
 		row = append(row, gr.groupValues...)
 		row = append(row, gr.passthroughVals...)
 		for i := range gr.aggs {
-			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i])
+			d, err := serializeAggCall(o.plan.Aggs[i], &gr.aggs[i])
 			if err != nil {
 				return err
 			}
@@ -3502,7 +3515,7 @@ func (o *aggregateOp) openSortedPartialEmit(ctx *Context) error {
 		row = append(row, cur.groupValues...)
 		row = append(row, cur.passthroughVals...)
 		for i := range cur.aggs {
-			d, err := serializeAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i])
+			d, err := serializeAggCall(o.plan.Aggs[i], &cur.aggs[i])
 			if err != nil {
 				return err
 			}
@@ -3631,7 +3644,7 @@ func (o *aggregateOp) decodePartialStateRow(row Row) (*partialStateRow, error) {
 					"want serialized bytes", i, sd.Kind),
 			}
 		}
-		st, err := deserializeAggRuntime(o.plan.Aggs[i].Name, sd.BytesValue())
+		st, err := deserializeAggCall(o.plan.Aggs[i], sd.BytesValue())
 		if err != nil {
 			return nil, err
 		}
@@ -3677,7 +3690,7 @@ func (o *aggregateOp) absorbPartialStateRow(slot TupleSlot, groups map[string]*g
 		*order = append(*order, key)
 	}
 	for i := range dr.states {
-		if err := combineAggRuntime(o.plan.Aggs[i].Name, &gr.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+		if err := combineAggRuntime(o.plan.Aggs[i], &gr.aggs[i], &dr.states[i], o.ctx); err != nil {
 			return err
 		}
 	}
@@ -3832,7 +3845,7 @@ func (o *aggregateOp) openSortedPartialTransport(ctx *Context) error {
 			curParts = dr.keyParts
 		}
 		for i := range dr.states {
-			if err := combineAggRuntime(o.plan.Aggs[i].Name, &cur.aggs[i], &dr.states[i], o.plan.Aggs[i].Arg); err != nil {
+			if err := combineAggRuntime(o.plan.Aggs[i], &cur.aggs[i], &dr.states[i], o.ctx); err != nil {
 				return err
 			}
 		}
@@ -3874,8 +3887,10 @@ func (o *aggregateOp) finalizeGroup(gr *groupRuntime) (Row, error) {
 		if call.SharedStateSlot < 0 || call.UserAgg == nil {
 			continue
 		}
-		if !(call.Distinct || len(call.OrderBy) > 0) {
-			// Non-DISTINCT sync: copy userState as before.
+		if !(call.Distinct || len(call.OrderBy) > 0) || call.Presorted {
+			// Non-DISTINCT sync: copy userState as before. A presorted
+			// DISTINCT / ORDER BY leader ran its transitions per row too
+			// (M0148-0001j), so its followers copy the same way.
 			if i == 0 {
 				continue
 			}
@@ -4637,6 +4652,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 			}
 			if st.hasValue {
 				st.strAccum = append(st.strAccum, delimRaw...)
+			} else {
+				st.strFirstDelim = delimRaw
 			}
 			st.strAccum = append(st.strAccum, raw...)
 			st.hasValue = true
@@ -4665,6 +4682,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 		}
 		if st.hasValue {
 			st.strAccum = append(st.strAccum, delim...)
+		} else {
+			st.strFirstDelim = delim
 		}
 		st.strAccum = append(st.strAccum, sv...)
 		st.hasValue = true
@@ -4728,7 +4747,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 			// deduplication and/or sorting in finishAgg. M0097-0035.
 			// Non-DISTINCT with ORDER BY also needs row accumulation so rows can
 			// be sorted before sfunc calls (PostgreSQL semantics). M0097-0113.
-			if call.Distinct || len(call.OrderBy) > 0 {
+			// M0148-0001j: a presorted aggregate (PG's aggpresorted) already
+			// receives its group's inputs in sort-list order, so it takes the
+			// per-row path below, dropping DISTINCT repeats there.
+			if (call.Distinct || len(call.OrderBy) > 0) && !call.Presorted {
 				// Build row: [sortKey0, ..., arg0, arg1, ...extraArgs].
 				// Sort keys first (for ORDER BY), then arg values for sfunc. M0097-0035.
 				nSortKeys := len(call.OrderBy)
@@ -4800,6 +4822,29 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call *optimizer.AggregateCall, sl
 						sfuncArgs = append(sfuncArgs, ev)
 					}
 				}
+			}
+			if call.Distinct && call.Presorted {
+				// nodeAgg's EEOP_AGG_PRESORTED_DISTINCT_* step: an input equal
+				// to one already seen in this group makes no transition call.
+				// Keyed like the buffered path's dedupe (datumKey per
+				// argument) and over the whole group, not just the previous
+				// row, so a mis-ordered input can only reorder calls.
+				var kb strings.Builder
+				for ai, d := range sfuncArgs[1:] {
+					if ai > 0 {
+						kb.WriteByte('\t')
+					}
+					kb.WriteString(datumKey(d))
+				}
+				k := kb.String()
+				if _, dup := st.presortedSeen[k]; dup {
+					st.hasValue = true
+					return nil
+				}
+				if st.presortedSeen == nil {
+					st.presortedSeen = map[string]struct{}{}
+				}
+				st.presortedSeen[k] = struct{}{}
 			}
 			newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
 			if sfuncRaised(serr) {
@@ -5594,19 +5639,12 @@ func (o *aggregateOp) finishAgg(st *aggRuntime, call *optimizer.AggregateCall) (
 			return NullDatum, nil
 		}
 		state := st.userState
-		// Apply CombineFunc when defined: combinefunc(NULL, partial_state).
-		// Even in non-parallel mode, PG calls the combine function once to merge
-		// the NULL initial combine-state with the single partial state. A STRICT
-		// combinefunc with a NULL first arg returns NULL (the balk aggregate pattern). M0097-0122.
-		if ua.CombineFunc != "" {
-			combined, cerr := executeSFuncCall(ua.CombineFunc, []Datum{NullDatum, state}, o.ctx)
-			if sfuncRaised(cerr) {
-				return NullDatum, cerr
-			}
-			if cerr == nil {
-				state = combined
-			}
-		}
+		// No combine call here. PG runs the COMBINEFUNC only in the combine
+		// phase of a split (Finalize) aggregate — combineUserAggState — never
+		// in a serial plan. The former serial combinefunc(NULL, state) call
+		// (M0097-0122) imitated the parallel balk() result and turned every
+		// serial user aggregate with a strict COMBINEFUNC wrong (int8pl → 0
+		// for a 495000 sum).
 		if ua.FinalFunc == "" {
 			return state, nil
 		}
@@ -6399,6 +6437,27 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 		}
 	case "int2pl":
 		if len(args) == 2 {
+			a, _ := datumInt64(args[0])
+			b, _ := datumInt64(args[1])
+			return NewIntDatum(a + b), nil
+		}
+	case "int2_sum", "int4_sum":
+		// int2_sum/int4_sum(int8, int2/int4) → int8 (numeric.c): NOT strict —
+		// a NULL state takes the first non-NULL input; a NULL input keeps the
+		// state. Missing from this table, a CREATE AGGREGATE … SFUNC =
+		// int4_sum fell through as "not found" and returned INITCOND for every
+		// input (0 for a 495000 sum; M0148-0001i).
+		if len(args) == 2 {
+			if args[0].IsNull() {
+				if args[1].IsNull() {
+					return NullDatum, nil
+				}
+				b, _ := datumInt64(args[1])
+				return NewIntDatum(b), nil
+			}
+			if args[1].IsNull() {
+				return args[0], nil
+			}
 			a, _ := datumInt64(args[0])
 			b, _ := datumInt64(args[1])
 			return NewIntDatum(a + b), nil

@@ -198,8 +198,8 @@ func TestPricedPartialAggKeepsTheDecomposabilityRefusals(t *testing.T) {
 
 	for _, sql := range []string{
 		"SELECT count(DISTINCT v) FROM pq_priced_low",
-		"SELECT array_agg(v) FROM pq_priced_low",
-		"SELECT string_agg(v::text, ',') FROM pq_priced_low",
+		"SELECT array_agg(v ORDER BY v) FROM pq_priced_low",
+		"SELECT string_agg(DISTINCT v::text, ',') FROM pq_priced_low",
 	} {
 		t.Run(sql, func(t *testing.T) {
 			if _, isSplit := runAggSplitPriced(t, ctx, sql, 4); isSplit {

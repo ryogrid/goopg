@@ -2535,11 +2535,13 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel, Quantified: true}, nil
 	}
 	var elems []Expr
+	spliced := false
 	// array[e1, e2, ...] constructor form.
 	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
 		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
 		p.advance() // array
 		p.advance() // [
+		spliced = true // the elements ARE the array constructor's: legal ANY/ALL list (M0122-0015f)
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
 			p.advance()
 			// Consume optional `::type[]` cast after empty ARRAY[]. M0097-0067.
@@ -2587,7 +2589,9 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
 	}
-	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems, Quantified: true}, nil
+	ie := &InExpr{pos: pos, Operand: left, Negated: false, List: elems, Quantified: true}
+	ie.SplicedArray = spliced
+	return ie, nil
 }
 
 // synthesizeBareCharTypmod mirrors parseColumnType's handling of the bare

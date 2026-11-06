@@ -70,6 +70,8 @@ var ErrNoPlugin = errors.New("wal: decoder has no output plugin")
 type Decoder struct {
 	buf    *ReorderBuffer
 	plugin OutputPlugin
+	// dbOid filters logical messages by their database (SetDatabase).
+	dbOid uint32
 }
 
 // NewDecoder constructs a decoder backed by `plugin`. The plugin
@@ -108,6 +110,16 @@ func (d *Decoder) ApplyCommit(xid storage.TransactionID, commitLSN uint64) error
 		return fmt.Errorf("wal: decoder Begin(xid=%d): %w", xid, err)
 	}
 	for _, c := range changes {
+		if c.Kind == ChangeMessage {
+			// A transactional logical message, in WAL order with the
+			// row changes (ReorderBufferApplyMessage).
+			if mp, ok := d.plugin.(MessagePlugin); ok {
+				if err := mp.LogicalMessage(xid, c.LSN, true, c.MsgPrefix, c.MsgContent); err != nil {
+					return fmt.Errorf("wal: decoder LogicalMessage(xid=%d, lsn=%d): %w", xid, c.LSN, err)
+				}
+			}
+			continue
+		}
 		if err := d.plugin.Change(c); err != nil {
 			return fmt.Errorf("wal: decoder Change(xid=%d, lsn=%d): %w", xid, c.LSN, err)
 		}

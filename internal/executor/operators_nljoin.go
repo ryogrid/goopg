@@ -119,12 +119,12 @@ type nliInner interface {
 // (identity for a bare probe, the child for a memoize wrapper). Used by
 // the FOR UPDATE TID-provider walks, which need the concrete scan.
 func nliInnerIndexScan(in nliInner) *indexScanOp {
-	switch x := in.(type) {
+	switch x := unwrapNLIInner(in).(type) {
 	case *indexScanOp:
 		return x
 	case *memoizeOp:
 		// An index-only child (M0146-0005bq) has no heap TID to provide.
-		is, _ := x.child.(*indexScanOp)
+		is, _ := unwrapNLIInner(x.child).(*indexScanOp)
 		return is
 	}
 	return nil

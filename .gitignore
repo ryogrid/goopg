@@ -126,6 +126,7 @@ bench/tpcds/runtime_goopg/tpcds-results-sf05/*
 !bench/tpcds/runtime_goopg/tpcds-results-sf05/oracle.txt
 bench/tpcds/runtime_goopg/*.pid
 bench/tpcds/runtime_goopg/*.log
+bench/tpcds/runtime_goopg/*.log.[0-9]
 
 # Nightly CI batch run outputs (ci/design/04)
 ci/logs/

@@ -51,9 +51,13 @@ func TestExplainBuffersAnalyzeTextLine(t *testing.T) {
 	}
 }
 
-// TestExplainBuffersOffByDefault confirms BUFFERS is opt-in: plain EXPLAIN
-// ANALYZE (no BUFFERS) never emits the line, matching upstream's default.
-func TestExplainBuffersOffByDefault(t *testing.T) {
+// TestExplainBuffersDefaultsToAnalyze pins PG 18's default: BUFFERS is on
+// whenever ANALYZE is, unless written (explain_state.c
+// ParseExplainOptionList: `es->buffers = buffers_set ? es->buffers :
+// es->analyze`). Plain EXPLAIN ANALYZE prints the Buffers line; an explicit
+// BUFFERS OFF suppresses it; plain EXPLAIN never has it. Before PG 18 (and in
+// goopg until M0122-0021) BUFFERS was opt-in, which this test used to pin.
+func TestExplainBuffersDefaultsToAnalyze(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
@@ -64,10 +68,19 @@ func TestExplainBuffersOffByDefault(t *testing.T) {
 	commitTx(t, ctx)
 	beginTx(t, ctx)
 
-	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE SELECT data FROM ebuf2")
-	joined := strings.Join(lines, "\n")
-	if strings.Contains(joined, "Buffers:") {
-		t.Errorf("EXPLAIN ANALYZE (no BUFFERS) unexpectedly emitted a Buffers line:\n%s", joined)
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"EXPLAIN ANALYZE SELECT data FROM ebuf2", true},
+		{"EXPLAIN (ANALYZE, BUFFERS OFF) SELECT data FROM ebuf2", false},
+		{"EXPLAIN SELECT data FROM ebuf2", false},
+	}
+	for _, tc := range cases {
+		joined := strings.Join(runExplainRows(t, ctx, tc.sql), "\n")
+		if got := strings.Contains(joined, "Buffers: shared "); got != tc.want {
+			t.Errorf("%s: Buffers line present=%v, want %v:\n%s", tc.sql, got, tc.want, joined)
+		}
 	}
 }
 
@@ -97,7 +110,9 @@ func TestExplainBuffersJSONAlwaysIncludesSharedBlocks(t *testing.T) {
 }
 
 // TestExplainBuffersJSONOmittedWithoutBuffersOption confirms the JSON/XML/YAML
-// "Shared Hit/Read Blocks" properties are opt-in, matching TEXT's BUFFERS gate.
+// "Shared Hit/Read Blocks" properties follow the same PG 18 default as TEXT:
+// present under plain ANALYZE (BUFFERS defaults to ANALYZE), absent once
+// BUFFERS OFF is written.
 func TestExplainBuffersJSONOmittedWithoutBuffersOption(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
@@ -106,10 +121,13 @@ func TestExplainBuffersJSONOmittedWithoutBuffersOption(t *testing.T) {
 	commitTx(t, ctx)
 	beginTx(t, ctx)
 
-	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT data FROM ebuf5")
-	out := strings.Join(lines, "\n")
+	out := strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS OFF, FORMAT JSON) SELECT data FROM ebuf5"), "\n")
 	if strings.Contains(out, "Shared Hit Blocks") || strings.Contains(out, "Shared Read Blocks") {
-		t.Errorf("EXPLAIN (ANALYZE, FORMAT JSON) without BUFFERS unexpectedly reported shared blocks:\n%s", out)
+		t.Errorf("EXPLAIN (ANALYZE, BUFFERS OFF, FORMAT JSON) unexpectedly reported shared blocks:\n%s", out)
+	}
+	out = strings.Join(runExplainRows(t, ctx, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT data FROM ebuf5"), "\n")
+	if !strings.Contains(out, `"Shared Hit Blocks"`) {
+		t.Errorf("EXPLAIN (ANALYZE, FORMAT JSON) should report shared blocks by default (PG 18):\n%s", out)
 	}
 }
 
@@ -440,7 +458,7 @@ func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
 func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
 		t.Errorf("Shared I/O Read Time = %v, want 2.0", obj["Shared I/O Read Time"])
 	}
@@ -459,7 +477,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 0 {
 		t.Errorf("Shared I/O Read Time = %v, want 0 (present)", obj["Shared I/O Read Time"])
 	}
@@ -477,7 +495,7 @@ func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *tes
 func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false, 0)
 	if _, ok := obj["Shared I/O Read Time"]; ok {
 		t.Errorf("Shared I/O Read Time present with trackIOTiming=false, want absent")
 	}
@@ -497,7 +515,7 @@ func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true, 0)
 	for _, key := range []string{
 		"Local I/O Read Time", "Local I/O Write Time",
 		"Temp I/O Read Time", "Temp I/O Write Time",
@@ -515,7 +533,7 @@ func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *test
 func TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff(t *testing.T) {
 	n := &optimizer.Values{}
 	stats := nodeStatsTable{n: {}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false, 0)
 	for _, key := range []string{
 		"Local I/O Read Time", "Local I/O Write Time",
 		"Temp I/O Read Time", "Temp I/O Write Time",

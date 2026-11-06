@@ -1546,6 +1546,15 @@ type AggregateCall struct {
 	// -1 means no sharing. When ≥ 0, applyAgg uses the shared slot instead of
 	// the per-call aggRuntime.userState. M0097-0035.
 	SharedStateSlot int
+	// Presorted is PG's Aggref.aggpresorted (M0148-0001j): the aggregate's
+	// input already arrives ordered by its DISTINCT / ORDER BY sort list
+	// within each group, so the executor runs the transition function per
+	// row, dropping a DISTINCT repeat, instead of buffering the group's
+	// inputs and sorting them at finish (nodeAgg.c build_pertrans_for_aggref,
+	// aggsortrequired = false). Set only by markPresortedAggs, once the
+	// winning grouping path's input ordering is known to cover the sort list.
+	// The zero value buffers, which is correct for any input order.
+	Presorted bool
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
@@ -2022,6 +2031,14 @@ type Result struct {
 	// Child: nil = childless single-emit Result; set = one row per child row.
 	Child  Node
 	schema Schema
+	// minmaxCharged marks the min/max rewrite's Result (M0148-0001c1): its
+	// InitPlanCharge already holds the InitPlans' path costs, as
+	// create_minmaxagg_path (pathnode.c) sums mminfo->pathcost into the
+	// MinMaxAggPath itself. PG builds those InitPlans at createplan time,
+	// after SS_charge_for_initplans ran, so they are charged exactly once;
+	// the tail charge walk therefore does not count them again for an
+	// enclosing level top (a DISTINCT / ORDER BY above the Result).
+	minmaxCharged bool
 }
 
 func (n *Result) Pos() int       { return n.pos }
@@ -2344,14 +2361,31 @@ func (n *Limit) Output() Schema { return n.Child.Output() }
 // by calling VirtualSource.VirtualRows() on Open so the cross-session
 // plan cache cannot serve a stale snapshot of a dynamic view
 // (M0094-0005).
+//
+// A virtual catalog's Values carries no plan-time Rows, only their count
+// (VirtualRowCount, for estimation): the executor never reads plan-time
+// cells of a VirtualSource, and building one constant expression per
+// catalog cell — then walking every one of them in each plan walker —
+// made re-planning a catalog query cost O(catalog size) after every DDL
+// (M-NIGHTLY regress/suite-wedge, `inherit`'s \d after DDL).
 type Values struct {
 	// M0146-0005dr: this node's query-level initPlan cost.
 	InitPlanCharge
 
-	pos           int
-	Rows          [][]Expr
-	schema        Schema
-	VirtualSource *catalog.Table
+	pos             int
+	Rows            [][]Expr
+	schema          Schema
+	VirtualSource   *catalog.Table
+	VirtualRowCount int
+}
+
+// RowCount is the number of rows the node produces as planned: the literal
+// rows, or a virtual catalog's row count at plan time.
+func (n *Values) RowCount() int {
+	if n.VirtualSource != nil && len(n.Rows) == 0 {
+		return n.VirtualRowCount
+	}
+	return len(n.Rows)
 }
 
 func (n *Values) Pos() int       { return n.pos }
@@ -2372,6 +2406,10 @@ type GenerateSeries struct {
 	// not specified. Consumed by the EXPLAIN Function Scan label.
 	Alias  string
 	schema Schema
+	// RTID is the function RTE's statement-unique range-table identity, so
+	// EXPLAIN names its columns (`s2.s2`) and counts it like any relation
+	// (set_rtable_names covers function RTEs too). M0148-0001f.
+	RTID int32
 }
 
 // UserSrfScan executes a user-defined SETOF SQL/plpgsql function in the FROM
@@ -2509,6 +2547,11 @@ type UnnestCol struct {
 	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
 	// Wrapped: see SrfCol.Wrapped. M0118-0008.
 	Wrapped bool
+	// ExplicitCast marks a CastType the SQL wrote over the unnest that
+	// changes the element type (`unnest(a)::integer` over text[]) — PG
+	// evaluates it in a Result above the ProjectSet. A CastType inferred
+	// from the array's element type is not (M0148-0001i3).
+	ExplicitCast bool
 }
 
 // RegexpMatchesCol describes one regexp_matches(string, pattern[, flags])
@@ -3230,6 +3273,12 @@ type Explain struct {
 	// EXPLAIN ANALYZE prints as "Planning Time" — PG's ExplainOneQuery
 	// times pg_plan_query alone (explain.c:350-356) (M0122-0019).
 	PlanningNs int64
+	// RtableSize is the explained statement's range-table size (PG's
+	// es->rtable_size), counting RTEs that left no plan node — a pulled-up
+	// or stripped subquery, a view, a removed join. EXPLAIN qualifies
+	// upper-node columns when it exceeds 1. Zero means unknown: the renderer
+	// then counts the relations visible in the plan.
+	RtableSize int
 }
 
 func (n *Explain) Pos() int { return n.pos }
@@ -3346,6 +3395,15 @@ type SetOp struct {
 	// one `Merge Append` with its `Sort Key:`. Built only serially, never
 	// under a Gather.
 	MergeKeys []SortKey
+	// RTID / AppendRelName name the inheritance parent an appendrel chain
+	// stands for — PG's Append/MergeAppend `apprelids`, which
+	// ExplainPreScanNode adds to rels_used so set_rtable_names names the
+	// parent RTE before its children (`Sort Key: minmaxtest.f1` over
+	// `minmaxtest minmaxtest_1`, …). Set only on the TOP link of the chain
+	// built by the min/max appendrel rewrite (M0148-0001c); 0 / "" leave the
+	// node nameless, as every other construction site does.
+	RTID          int32
+	AppendRelName string
 	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
 	// The zero value (parser.SetOpUnion) keeps the implicit
 	// partition/inheritance UNION ALL construction sites working

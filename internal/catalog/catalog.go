@@ -109,6 +109,24 @@ func IndexRealPages(idx *Index) (int64, bool) {
 	return RelNBlocksFunc(storage.RelFileNode{TblOid: idx.Tablespace, DBOid: dbOid, RelOid: idx.OID, Fork: storage.MainFork})
 }
 
+// IndexTreeHeightFunc reads a btree index's search-tree height from its
+// metapage — nbtpage.c _bt_getrootheight: btm_fastlevel, or 0 when the tree
+// has no root yet (btm_root == P_NONE). get_relation_info stores it as
+// IndexOptInfo.tree_height, which btcostestimate's descent cost reads
+// (selfuncs.c: (tree_height + 1) * 50 * cpu_operator_cost). ok=false when the
+// fork is absent or block 0 is not a btree metapage. Set by initdb with the
+// server's buffer pool; nil (unit tests, tools) leaves the estimate in place.
+var IndexTreeHeightFunc func(rel storage.RelFileNode) (int, bool)
+
+// IndexTreeHeightIn is IndexTreeHeightFunc for idx, its file located where
+// cat.IndexRelFileNode places it (as IndexRealPagesIn does).
+func IndexTreeHeightIn(cat Catalog, idx *Index) (int, bool) {
+	if idx == nil || IndexTreeHeightFunc == nil || cat == nil {
+		return 0, false
+	}
+	return IndexTreeHeightFunc(cat.IndexRelFileNode(idx))
+}
+
 // IndexRealPagesIn is IndexRealPages resolved through cat: the file is looked
 // up where cat.IndexRelFileNode places it. An index in the postgres database
 // carries DBOid 0 or the namespace key DefaultDBOid (1), and its file sits
@@ -3533,6 +3551,38 @@ type commentKey struct {
 }
 
 // StatisticsObject tracks one CREATE STATISTICS object. M0097-0023.
+// statisticsObjKindArray renders pg_statistic_ext.stxkind, the "char"[] of
+// enabled statistics kinds, as CreateStatistics (statscmds.c:385-507) builds
+// it: the requested kinds, or all of ndistinct/dependencies/mcv when none was
+// requested and the object spans two or more columns/expressions, then 'e'
+// whenever the ON list holds an expression — in d, f, m, e order. psql's
+// `\d` / `\dX` read it through `'d' = any(stxkind)`; the stub's empty
+// string answered NULL there.
+func statisticsObjKindArray(obj *StatisticsObject) string {
+	want := map[string]bool{}
+	for _, k := range obj.Kinds {
+		want[strings.ToLower(k)] = true
+	}
+	numcols := len(obj.Columns) + len(obj.Exprs)
+	if len(want) == 0 && numcols >= 2 {
+		want["ndistinct"], want["dependencies"], want["mcv"] = true, true, true
+	}
+	var kinds []string
+	if want["ndistinct"] {
+		kinds = append(kinds, "d")
+	}
+	if want["dependencies"] {
+		kinds = append(kinds, "f")
+	}
+	if want["mcv"] {
+		kinds = append(kinds, "m")
+	}
+	if obj.HasExpr || len(obj.Exprs) > 0 {
+		kinds = append(kinds, "e")
+	}
+	return "{" + strings.Join(kinds, ",") + "}"
+}
+
 type StatisticsObject struct {
 	Name     string // unqualified name
 	Schema   string // schema name (empty = public)
@@ -3865,6 +3915,16 @@ type UserAggregate struct {
 	InitCond        string   // initial condition string (may be empty)
 	FinalFuncModify string   // FINALFUNC_MODIFY: "", "read_only", "shareable", "read_write" (DU-002 slice 405)
 	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
+	// Parallel is the PARALLEL option ("safe"/"restricted"/"unsafe"; "" =
+	// unsafe, PG's default proparallel for CREATE AGGREGATE).
+	Parallel string
+	// SerialFunc is SERIALFUNC (""): PG splits an aggregate whose state
+	// type is internal only when it can serialise the state.
+	SerialFunc string
+	// CombineFuncStrict reports whether COMBINEFUNC is STRICT: the combine
+	// phase then follows the strict-transition rules (skip NULL partials;
+	// adopt the first partial into a NULL initial state).
+	CombineFuncStrict bool
 	Variadic        bool     // true when declared with VARIADIC input arg
 	Owner           uint32   // pg_proc.proowner (role OID); 0 means "unset, defaults to bootstrap superuser" — see OwnerOrDefault. M0119-0004.
 	NamespaceOID    uint32   // pg_proc.pronamespace (schema OID); 0 means "unset, defaults to public" — see NamespaceOIDOrDefault. DU-002 slice 405 resume point (a).
@@ -8153,16 +8213,19 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		if hasToastRel {
 			reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 		}
-		// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
-		// then the persisted block count and live-tuple estimate. Mirrors
-		// pg_class — a freshly created, never-analyzed relation reads back as
-		// relpages=0 / reltuples=-1 in real PG, but goopg has historically
-		// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
-		// every catalog-reading test; populate the real counts once Stats lands.
-		// M0118-0008 (vacuum-no-cleanup-lock).
+		// relpages / reltuples: PG's pg_class tuple for a relation that has
+		// never been vacuumed/analyzed — and for a TRUNCATEd one, whose
+		// relfilenode the truncate replaces (RelationSetNewRelfilenode writes
+		// relpages=0, reltuples=-1, relallvisible=0) — carries reltuples=-1,
+		// the "never vacuumed or analyzed" sentinel, with relpages=0. goopg's
+		// stand-in is Stats.Analyzed; once VACUUM/ANALYZE lands, the measured
+		// counts render. M0118-0008 (vacuum-no-cleanup-lock); the -1 sentinel
+		// arm is the M-NIGHTLY post-TRUNCATE parity fix (2026-10-31): the
+		// rig-measured PG pair is (-1,0), where goopg historically surfaced
+		// (0,0).
 		relpages := "0"
-		reltuples := "0"
-		if t.Stats != nil {
+		reltuples := "-1"
+		if t.Stats != nil && t.Stats.Analyzed {
 			relpages = strconv.Itoa(t.Stats.Pages)
 			reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
 		}
@@ -10873,7 +10936,12 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "stxstattarget", Type: Type{Name: "int4"}, Ordinal: 5},
 			{Name: "stxkeys", Type: Type{Name: "int2[]"}, Ordinal: 6},
 			{Name: "stxexprs", Type: Type{Name: "text"}, Ordinal: 7},
-			{Name: "stxkind", Type: Type{Name: "text"}, Ordinal: 8},
+			// PG's stxkind is "char"[] (pg_statistic_ext.h), as the
+			// executor's PGStatisticExtColumnsPG18 and pg_attribute already
+			// say. Typed `text` here, the planner rejected psql's
+			// `'d' = any(stxkind)` (every `\d <table>`) once M0122-0015f
+			// started enforcing make_scalar_array_op's array operand rule.
+			{Name: "stxkind", Type: Type{Name: "char[]"}, Ordinal: 8},
 		},
 		OID: 3381,
 	}
@@ -10914,7 +10982,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 			row[6] = "" // stxkeys
 			row[7] = "" // stxexprs
-			row[8] = "" // stxkind
+			row[8] = statisticsObjKindArray(obj) // stxkind
 			out = append(out, row)
 		}
 		return out
@@ -11065,9 +11133,12 @@ func (c *InMemory) registerSystemTables() {
 			{"BufferPin", "BufferPin", "Waiting to acquire an exclusive pin on a buffer."},
 			{"Extension", "Extension", "Waiting in an extension."},
 			{"IPC", "AppendReady", "Waiting for subplan nodes of an Append plan node to be ready."},
+			{"IPC", "ArchiveCleanupCommand", "Waiting for archive_cleanup_command to complete."},
 			{"IPC", "BackendTermination", "Waiting for the termination of another backend."},
 			{"IPC", "BgWorkerShutdown", "Waiting for background worker to shut down."},
 			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
+			{"IPC", "RecoveryEndCommand", "Waiting for recovery_end_command to complete."},
+			{"IPC", "RestoreCommand", "Waiting for restore_command to complete."},
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_wait_events"] = pgWaitEvents
@@ -13224,6 +13295,36 @@ func key(name parser.ObjectName) string {
 	return name.Schema + "." + name.Name
 }
 
+// lookupTableKeyLocked resolves name in ns the way LookupTable does and
+// returns the map key the relation actually lives under. A live session keys
+// an unqualified relation by its bare name while a restart's pg_class reload
+// keys it "public.<name>" (the lookupIndexLocked note), so a mutator that
+// deletes or re-keys by key(name) alone found the relation through
+// LookupTable yet missed its entry: after a restart, DROP VIEW of a view
+// created before it failed "view does not exist" while \dv still listed it
+// (M0148-0001c3b). Callers hold c.mu.
+func lookupTableKeyLocked(ns *tableNamespace, name parser.ObjectName) (*Table, string, bool) {
+	if t, ok := ns.tables[key(name)]; ok {
+		return t, key(name), true
+	}
+	if name.Schema == "" {
+		if t, ok := ns.tables["public."+name.Name]; ok {
+			return t, "public." + name.Name, true
+		}
+		return nil, "", false
+	}
+	if t, ok := ns.tables[name.Name]; ok {
+		tSchema := t.Schema
+		if tSchema == "" {
+			tSchema = "public"
+		}
+		if strings.EqualFold(tSchema, name.Schema) {
+			return t, name.Name, true
+		}
+	}
+	return nil, "", false
+}
+
 // LookupTable returns the table with the given name, or false when
 // the name doesn't resolve. Unqualified lookups fall back to the
 // `pg_catalog` schema so HammerDB's `SELECT FROM pg_indexes ...`
@@ -13479,11 +13580,10 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	oldK := key(old)
 	newK := key(new)
-	tbl, exists := ns.tables[oldK]
+	tbl, oldK, exists := lookupTableKeyLocked(ns, old)
 	if !exists {
-		return fmt.Errorf("relation %q does not exist", oldK)
+		return fmt.Errorf("relation %q does not exist", key(old))
 	}
 	if _, exists2 := ns.tables[newK]; exists2 {
 		// root-0031: report the BARE new relation name, not the schema-qualified
@@ -13684,13 +13784,12 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool, dbOid ...uint
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	t, ok := ns.tables[k]
+	t, k, ok := lookupTableKeyLocked(ns, name)
 	if !ok {
 		if ifExists {
 			return nil
 		}
-		return fmt.Errorf("view %q does not exist", k)
+		return fmt.Errorf("view %q does not exist", key(name))
 	}
 	if t.View == nil {
 		return fmt.Errorf("%q is not a view", k)
@@ -22465,10 +22564,9 @@ func (c *InMemory) DropTable(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	tbl, exists := ns.tables[k]
+	tbl, k, exists := lookupTableKeyLocked(ns, name)
 	if !exists {
-		return fmt.Errorf("relation %q does not exist", k)
+		return fmt.Errorf("relation %q does not exist", key(name))
 	}
 	if idxs, ok := ns.byTable[tbl.OID]; ok {
 		for idxKey := range idxs {
@@ -22573,10 +22671,11 @@ func (c *InMemory) DropIndex(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ns := c.ns(resolveDBOid(dbOid))
-	k := key(name)
-	idx, ok := ns.indexes[k]
+	// The key the index actually lives under (lookupIndexLocked: bare vs
+	// "public." across a restart), as for lookupTableKeyLocked.
+	idx, k, ok := c.lookupIndexLocked(name, resolveDBOid(dbOid))
 	if !ok {
-		return fmt.Errorf("index %q does not exist", k)
+		return fmt.Errorf("index %q does not exist", key(name))
 	}
 	delete(ns.indexes, k)
 	if idxs, ok := ns.byTable[idx.Table.OID]; ok {
@@ -24123,6 +24222,19 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 	}
 	ct.Fields = fields
 	return ct
+}
+
+// AllCompositeTypes returns a snapshot of every registered composite type
+// (every database), in no particular order. M0148-0001j2: DROP TYPE's
+// dependency walk reaches composite-type attributes through it.
+func (c *InMemory) AllCompositeTypes() []*CompositeType {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*CompositeType, 0, len(c.compositeTypes))
+	for _, ct := range c.compositeTypes {
+		out = append(out, ct)
+	}
+	return out
 }
 
 // LookupCompositeType returns the OID-bearing metadata for a composite type, or
@@ -25726,6 +25838,9 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ..
 			continue
 		}
 		for _, col := range tbl.Columns {
+			if col.Dropped {
+				continue
+			}
 			if strings.ToLower(col.Type.Name) == nameKey || strings.ToLower(col.DeclaredTypeName) == nameKey {
 				dependentTables = append(dependentTables, tbl.Name)
 				break

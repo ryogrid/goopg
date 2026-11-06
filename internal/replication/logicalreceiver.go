@@ -25,6 +25,7 @@
 package replication
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -201,7 +202,12 @@ func DialLogicalReceiver(ctx context.Context, cfg LogicalReceiverConfig) (*Logic
 // dial opens a fresh connection and walks through the v3 startup
 // and START_REPLICATION handshakes. The resulting r.conn / r.r /
 // r.w are owned by the current iteration of Run.
-func (r *LogicalReceiver) dial(ctx context.Context) error {
+// dial connects to the publisher and starts streaming.
+func (r *LogicalReceiver) dial(ctx context.Context) error { return r.dialAndStream(ctx) }
+
+// connect dials the publisher and completes the replication=database
+// startup handshake, leaving the connection in command mode.
+func (r *LogicalReceiver) connect(ctx context.Context) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -239,6 +245,14 @@ func (r *LogicalReceiver) dial(ctx context.Context) error {
 		r.closeConn()
 		return err
 	}
+	return nil
+}
+
+// dialAndStream connects (connect) and starts streaming.
+func (r *LogicalReceiver) dialAndStream(ctx context.Context) error {
+	if err := r.connect(ctx); err != nil {
+		return err
+	}
 	if err := r.startStreaming(); err != nil {
 		r.closeConn()
 		return err
@@ -249,6 +263,286 @@ func (r *LogicalReceiver) dial(ctx context.Context) error {
 // handshake performs the v3 startup with `replication=database`
 // and drains frames until ReadyForQuery. The publisher's side
 // is the existing goopg server.
+// ErrPublisherConnect marks a failure to reach or log into the publisher
+// (walrcv_connect returning NULL), as distinct from a replication command
+// the publisher refused (*RemoteCommandError).
+var ErrPublisherConnect = errors.New("could not connect to the publisher")
+
+// RemoteCommandError is an ErrorResponse a publisher returned for a
+// replication command (walrcv_exec's WALRCV_ERROR with res->sqlstate).
+type RemoteCommandError struct {
+	SQLState string
+	Message  string
+}
+
+func (e *RemoteCommandError) Error() string { return "ERROR:  " + e.Message }
+
+// runRemoteReplicationCommand connects to the publisher as a
+// replication=database client, runs one replication command, and reads its
+// reply up to ReadyForQuery.
+func runRemoteReplicationCommand(ctx context.Context, cfg LogicalReceiverConfig, cmd string) error {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	var cmdErr *RemoteCommandError
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+		}
+		switch f.Type {
+		case libpq.MsgErrorResponse:
+			cmdErr = &RemoteCommandError{}
+			for p := f.Payload; len(p) > 1; {
+				code := p[0]
+				end := bytes.IndexByte(p[1:], 0)
+				if end < 0 {
+					break
+				}
+				val := string(p[1 : 1+end])
+				switch code {
+				case 'C':
+					cmdErr.SQLState = val
+				case 'M':
+					cmdErr.Message = val
+				}
+				p = p[2+end:]
+			}
+		case libpq.MsgReadyForQuery:
+			if cmdErr != nil {
+				return cmdErr
+			}
+			return nil
+		}
+	}
+}
+
+// CreateRemoteLogicalSlot creates the subscription's logical slot on the
+// publisher, as CreateSubscription does through walrcv_create_slot with
+// CRS_NOEXPORT_SNAPSHOT: `CREATE_REPLICATION_SLOT "name" LOGICAL pgoutput
+// (SNAPSHOT 'nothing')`.
+func CreateRemoteLogicalSlot(ctx context.Context, cfg LogicalReceiverConfig) error {
+	return runRemoteReplicationCommand(ctx, cfg, fmt.Sprintf(`CREATE_REPLICATION_SLOT %s LOGICAL pgoutput (SNAPSHOT 'nothing')`, quoteSlotIdent(cfg.SlotName)))
+}
+
+// DropRemoteSlot drops the subscription's slot on the publisher, as
+// ReplicationSlotDropAtPubNode does: `DROP_REPLICATION_SLOT name WAIT`.
+func DropRemoteSlot(ctx context.Context, cfg LogicalReceiverConfig) error {
+	return runRemoteReplicationCommand(ctx, cfg, fmt.Sprintf(`DROP_REPLICATION_SLOT %s WAIT`, quoteSlotIdent(cfg.SlotName)))
+}
+
+// CheckRemotePublications dials the publisher and runs check_publications'
+// query (subscriptioncmds.c:447-460) —
+//
+//	SELECT t.pubname FROM pg_catalog.pg_publication t WHERE t.pubname IN ('a', 'b')
+//
+// (names through quote_literal_cstr) — and returns the requested names the
+// publisher does NOT report, in request order. A nil/empty pubs list is
+// connect-only: AlterSubscription_refresh always dials (fetch_table_list
+// follows it), so ALTER ... DROP PUBLICATION WITH (refresh = true) must
+// reach a live publisher before its list change lands, and PG validates no
+// names for DROP (validate_publications is NULL there).
+//
+// Error shapes for the caller's mapping: an unreachable publisher returns an
+// ErrPublisherConnect-wrapped error; the publisher's own ErrorResponse
+// returns a *RemoteCommandError (PG turns that into "could not receive list
+// of publications from the publisher: %s").
+func CheckRemotePublications(ctx context.Context, cfg LogicalReceiverConfig, pubs []string) ([]string, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	if len(pubs) == 0 {
+		return nil, nil // connect-only dial succeeded
+	}
+	var cmd strings.Builder
+	cmd.WriteString("SELECT t.pubname FROM\n pg_catalog.pg_publication t WHERE\n t.pubname IN (")
+	for i, p := range pubs {
+		if i > 0 {
+			cmd.WriteString(", ")
+		}
+		cmd.WriteString(quotePublicationLiteral(p))
+	}
+	cmd.WriteString(")")
+	rows, err := r.queryRows(cmd.String())
+	if err != nil {
+		return nil, err
+	}
+	present := map[string]bool{}
+	for _, row := range rows {
+		if len(row) > 0 && row[0] != nil {
+			present[string(row[0])] = true
+		}
+	}
+	var missing []string
+	for _, p := range pubs {
+		if !present[p] {
+			missing = append(missing, p)
+		}
+	}
+	return missing, nil
+}
+
+// queryRows runs one simple query on the already-connected receiver and
+// collects its result set up to ReadyForQuery — the walrcv_exec twin for
+// the tuple-returning subscriptioncmds.c queries (check_publications
+// :447-460, fetch_table_list :2103-2160). The publisher's own
+// ErrorResponse becomes a *RemoteCommandError; transport failures are
+// ErrPublisherConnect-wrapped.
+func (r *LogicalReceiver) queryRows(cmd string) ([][][]byte, error) {
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	var rows [][][]byte
+	var cmdErr *RemoteCommandError
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+		}
+		switch f.Type {
+		case libpq.MsgDataRow:
+			row, derr := decodeDataRow(f.Payload)
+			if derr != nil {
+				return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, derr)
+			}
+			rows = append(rows, row)
+		case libpq.MsgErrorResponse:
+			cmdErr = &RemoteCommandError{}
+			for p := f.Payload; len(p) > 1; {
+				code := p[0]
+				end := bytes.IndexByte(p[1:], 0)
+				if end < 0 {
+					break
+				}
+				val := string(p[1 : 1+end])
+				switch code {
+				case 'C':
+					cmdErr.SQLState = val
+				case 'M':
+					cmdErr.Message = val
+				}
+				p = p[2+end:]
+			}
+		case libpq.MsgReadyForQuery:
+			if cmdErr != nil {
+				return nil, cmdErr
+			}
+			return rows, nil
+		}
+	}
+}
+
+// PubTable is one published table reported by fetch_table_list: the
+// schema-qualified name. The third result column (attrs int2vector) is not
+// consumed — goopg publications publish whole tables.
+type PubTable struct {
+	Schema string
+	Name   string
+}
+
+// FetchPublicationTables dials the publisher and runs PG 16+'s
+// fetch_table_list query (subscriptioncmds.c:2103-2160) over pubs,
+// returning the published tables. The query is byte-verbatim PG's
+// server_version >= 160000 branch:
+//
+//	SELECT DISTINCT n.nspname, c.relname, gpt.attrs
+//	       FROM pg_class c
+//	         JOIN pg_namespace n ON n.oid = c.relnamespace
+//	         JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*
+//	                FROM pg_publication
+//	                WHERE pubname IN ( 'p', ... )) AS gpt
+//	             ON gpt.relid = c.oid
+func FetchPublicationTables(ctx context.Context, cfg LogicalReceiverConfig, pubs []string) ([]PubTable, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	defer r.closeConn()
+	var cmd strings.Builder
+	cmd.WriteString("SELECT DISTINCT n.nspname, c.relname, gpt.attrs\n" +
+		"       FROM pg_class c\n" +
+		"         JOIN pg_namespace n ON n.oid = c.relnamespace\n" +
+		"         JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*\n" +
+		"                FROM pg_publication\n" +
+		"                WHERE pubname IN ( ")
+	for i, p := range pubs {
+		if i > 0 {
+			cmd.WriteString(", ")
+		}
+		cmd.WriteString(quotePublicationLiteral(p))
+	}
+	cmd.WriteString(" )) AS gpt\n             ON gpt.relid = c.oid")
+	rows, err := r.queryRows(cmd.String())
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PubTable, 0, len(rows))
+	for _, row := range rows {
+		if len(row) < 2 || row[0] == nil || row[1] == nil {
+			continue
+		}
+		out = append(out, PubTable{Schema: string(row[0]), Name: string(row[1])})
+	}
+	return out, nil
+}
+
+// PublisherConn is an authenticated publisher connection parked at
+// ReadyForQuery with framed I/O — exactly the shape RunTableSyncManager's
+// OpenConn contract demands (upstream's fresh per-tablesync-worker
+// connection; RunTableSync drives COPY <rel> TO STDOUT over it).
+type PublisherConn struct {
+	Reader *libpq.FrameReader
+	Writer *libpq.FrameWriter
+	Close  func() error
+}
+
+// OpenPublisherConn dials and authenticates one publisher connection
+// (replication=database startup, like the slot / publication-check path —
+// the walsender falls plain verbs through to the regular handler, so COPY
+// rides it), without entering any replication stream.
+func OpenPublisherConn(ctx context.Context, cfg LogicalReceiverConfig) (*PublisherConn, error) {
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+	r := NewLogicalReceiver(cfg)
+	if err := r.connect(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrPublisherConnect, err)
+	}
+	return &PublisherConn{Reader: r.r, Writer: r.w, Close: func() error { r.closeConn(); return nil }}, nil
+}
+
+// quotePublicationLiteral mirrors quote_literal_cstr: single-quoted,
+// embedded single quotes doubled.
+func quotePublicationLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// quoteSlotIdent double-quotes a slot name (quote_identifier; slot names
+// are restricted to [a-z0-9_], so no escaping is needed).
+func quoteSlotIdent(name string) string { return `"` + name + `"` }
+
 func (r *LogicalReceiver) handshake() error {
 	params := map[string]string{
 		"user":        r.cfg.User,
@@ -633,6 +927,13 @@ func isPermanent(err error) bool {
 	}
 	msg := err.Error()
 	switch {
+	case strings.Contains(msg, "replication slot is active"):
+		// 55006: the publisher's walsender from a just-dead connection
+		// can still hold the slot for a moment — exactly the state an
+		// eager worker restart (ALTER SUBSCRIPTION ... refresh) meets.
+		// Transient: the loop retries with backoff and acquires the
+		// slot, as PG's launcher relaunches the slot-active worker.
+		return false
 	case strings.Contains(msg, "START_REPLICATION rejected"):
 		return true
 	case strings.Contains(msg, "server rejected startup"):

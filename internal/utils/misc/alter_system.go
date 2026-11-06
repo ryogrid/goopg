@@ -181,6 +181,28 @@ func AutoConfEntries(dataDir string) ([]ConfigEntry, error) {
 	return ParseConfigFile(path)
 }
 
+// ReloadConfigEntries reads the entries a SIGHUP reload applies
+// (ProcessConfigFile(PGC_SIGHUP)): postgresql.conf at configPath (skipped
+// when empty) followed by the data directory's postgresql.auto.conf, so
+// ALTER SYSTEM's values win and one it RESET is absent — ApplyReloadEntries
+// then reverts it to its default. A parse failure returns the error and no
+// entries: the caller keeps the old values, as upstream logs and carries on.
+func ReloadConfigEntries(configPath, dataDir string) ([]ConfigEntry, error) {
+	var entries []ConfigEntry
+	if configPath != "" {
+		parsed, err := ParseConfigFile(configPath)
+		if err != nil {
+			return nil, err
+		}
+		entries = parsed
+	}
+	autoEntries, err := AutoConfEntries(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", AutoConfFileName, err)
+	}
+	return append(entries, autoEntries...), nil
+}
+
 // AlterSystem runs ALTER SYSTEM against the session's global registry —
 // the variable definitions it validates against are process-wide, and the
 // file it rewrites is the cluster's. dataDir is the cluster data directory.

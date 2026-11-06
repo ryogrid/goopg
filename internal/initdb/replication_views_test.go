@@ -279,7 +279,12 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 	if err := registerSubscriptionViews(cat, ps); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1"}, "", true); err != nil {
+	if _, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1"}, "s1", true); err != nil {
+		t.Fatal(err)
+	}
+	// A slot_name = NONE subscription (registry SlotName "") renders
+	// subslotname NULL, as PG's subslotname IS NULL row does.
+	if _, err := ps.CreateSubscription("s2", "host=remote dbname=app", []string{"p2"}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_subscription"})
@@ -287,10 +292,17 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 		t.Fatal("pg_subscription view not registered")
 	}
 	rows := tbl.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("rows=%d want 1", len(rows))
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
 	}
-	row := rows[0]
+	byName := map[string][]string{}
+	for _, r := range rows {
+		byName[r[2]] = r
+	}
+	row := byName["s1"]
+	if row == nil {
+		t.Fatalf("no row for s1: %v", rows)
+	}
 	// oid, subdbid, subname, subowner, subenabled, subbinary,
 	// substream, subtwophasestate, subdisableonerr, subpasswordrequired,
 	// subrunasowner, suborigin, subfailover, subconninfo, subslotname,
@@ -305,10 +317,20 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 		t.Errorf("subconninfo=%q", row[13])
 	}
 	if row[14] != "s1" {
-		t.Errorf("subslotname=%q want s1 (default to name)", row[14])
+		t.Errorf("subslotname=%q want s1", row[14])
 	}
 	if row[16] != "{p1}" {
 		t.Errorf("subpublications=%q want {p1}", row[16])
+	}
+	none := byName["s2"]
+	if none == nil {
+		t.Fatalf("no row for s2: %v", rows)
+	}
+	if none[14] != "" {
+		t.Errorf("s2 subslotname=%q want \"\" (NULL: slot_name = NONE)", none[14])
+	}
+	if none[4] != "f" {
+		t.Errorf("s2 subenabled=%q want f", none[4])
 	}
 }
 

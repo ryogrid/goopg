@@ -135,7 +135,19 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 		}
 		return nil, nil
 	}
-	node, err := optimizer.Plan(stmts[0], s.cfg.Catalog)
+	// Resolve the plan through the SAME per-database scoping batch dispatch
+	// uses (dispatch.go's PlanCatalog site, M0122-0007 slice 4c): a
+	// search-path-aware catalog wrapper carrying the connecting database's
+	// real pg_database.oid, plus the session's planner settings. A raw
+	// s.cfg.Catalog keys relation lookup off DefaultDBOid's namespace, so
+	// `COPY t1 TO STDOUT` in a CREATE DATABASE–created database raised 42P01
+	// while SELECT in the same session saw the row (M0122-0015a).
+	connDBName := ""
+	if connTx != nil {
+		connDBName = connTx.DBName
+	}
+	planCat := sessionPlanCatalog(sess, s.cfg.Catalog, resolveConnDBOid(s.cfg.Catalog, connDBName))
+	node, err := optimizer.PlanWithSettings(stmts[0], planCat, sessionPlannerSettings(sess))
 	if err != nil {
 		code, msg := planErrorFields(err)
 		// Carry any planner hint (e.g. "Try the COPY (SELECT ...) TO
@@ -205,6 +217,17 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 	ectx.VM = s.cfg.VM
 	ectx.Tx = tx
 	ectx.Snap = snap
+	// Session identity, exactly as dispatch wires every other statement: the
+	// pgstat relation counters (COPY's recordRelInsert staging/pending tiers)
+	// are keyed by sessionStatsID(ectx), and pg_stat_force_next_flush() from
+	// this connection flushes the SAME id only if the hand-built COPY context
+	// carries it. Without this, COPY-loaded counters sat in the id-0 bucket,
+	// unreachable by the session's flush and the pg_stat_get_* getters
+	// (M-NIGHTLY COPY pgstat loop, same class as the M0119-0006 GetSetting
+	// wiring below).
+	if sess != nil {
+		ectx.AdvisorySessionIdentity = sess
+	}
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
 	// Thread session identity (M0134-0009 round 2, R5 — the named SELECT/COPY
@@ -268,6 +291,21 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 			_, eff, ok := sess.GetDisplay(name)
 			return eff, ok
 		}
+	}
+	// Per-database catalog view through wireExtensionRows — the SINGLE site
+	// dispatch wires for every other statement (M0110-0003/M0122-0007):
+	// CurrentDatabase/CurrentDatabaseOid plus the per-DB
+	// pg_extension/pg_class/pg_indexes/pg_tables/pg_constraint/pg_index/
+	// pg_attrdef/pg_depend row sources. This is the durable close of the
+	// hand-built-context class (third occurrence: M0119-0006 GetSetting,
+	// M0134-0009 R5 identity, M0122-0015a database); the sibling audit for
+	// this task found every other executor.NewContext site in the package
+	// already scoped on purpose (subscription refresh stamps the
+	// subscriber's dbOid; the DDL heap-sync guards stamp DefaultDBOid or the
+	// created database's oid for shared-catalog work).
+	ectx.PlanCatalog = planCat
+	if connTx != nil {
+		s.wireExtensionRows(ectx, connTx.DBName)
 	}
 
 	switch plan.Direction {
@@ -396,7 +434,15 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *libpq.FrameWrit
 // ErrorResponse + ReadyForQuery, so this returns errQueryErrorSent and the
 // caller aborts the rest of the batch without emitting a second RFQ.
 func (s *Server) runInlineCopy(r *libpq.FrameReader, w *libpq.FrameWriter, ectx *executor.Context, cs *parser.CopyStmt) error {
-	node, perr := optimizer.Plan(cs, s.cfg.Catalog)
+	// Plan through the batch context's own per-database scoping — the SAME
+	// call executeOneSimpleStmt uses (ctxPlanCatalog + ctxPlannerSettings,
+	// M0122-0007 slice 4c). The raw s.cfg.Catalog keys relation lookup off
+	// DefaultDBOid's namespace, so `COPY t1 TO STDOUT` inside a
+	// multi-statement batch raised 42P01 in a CREATE DATABASE–created
+	// database even though the standalone path (dispatchCopyViaExecutor,
+	// fixed the same loop) and every other statement in the batch resolved
+	// it (M0122-0015a Rule-#2 twin: `BEGIN; COPY t1 TO STDOUT; COMMIT`).
+	node, perr := optimizer.PlanWithSettings(cs, ctxPlanCatalog(ectx, s.cfg.Catalog), ctxPlannerSettings(ectx))
 	if perr != nil {
 		code, msg := planErrorFields(perr)
 		return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)

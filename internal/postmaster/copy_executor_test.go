@@ -95,6 +95,113 @@ func TestCopyFromExecutorEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCopyStandaloneResolvesNonDefaultDatabase pins M0122-0015a: the
+// standalone COPY path (dispatchCopyViaExecutor) built its executor.Context
+// by hand and planned the statement against the raw catalog, so relation
+// lookup keyed off DefaultDBOid's namespace. Inside a CREATE DATABASE–created
+// database, `COPY t1 TO STDOUT` raised 42P01 `relation "t1" does not exist`
+// while `SELECT count(*) FROM t1` in the SAME session returned rows — so
+// pg_dump of every user database died at its first `COPY public.<t> FROM
+// stdin` and no user database was dumpable. FAIL-pre: ErrorResponse on the
+// COPY TO (both unqualified and public.-qualified). The fix plans through
+// sessionPlanCatalog + resolveConnDBOid (the dispatch PlanCatalog site,
+// M0122-0007 slice 4c) and stamps the context through wireExtensionRows,
+// the single per-database site dispatch uses for every statement.
+func TestCopyStandaloneResolvesNonDefaultDatabase(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	setup := dialAndComplete(t, addr)
+	defer setup.Close()
+	writeQuery(t, setup, "CREATE DATABASE userdb")
+	readUntilReady(t, setup)
+
+	conn := dialAndCompleteDB(t, addr, "userdb")
+	defer conn.Close()
+	for _, q := range []string{
+		"CREATE TABLE t1(a int, b text)",
+		"INSERT INTO t1 VALUES (1, 'x'), (2, 'y')",
+	} {
+		writeQuery(t, conn, q)
+		for _, f := range readUntilReady(t, conn) {
+			if f.Type == libpq.MsgErrorResponse {
+				t.Fatalf("%s: ErrorResponse %s", q, f.Payload)
+			}
+		}
+	}
+
+	readCopy := func(q string) (tag, payload string) {
+		t.Helper()
+		writeQuery(t, conn, q)
+		for _, f := range readUntilReady(t, conn) {
+			switch f.Type {
+			case libpq.MsgErrorResponse:
+				t.Fatalf("%s: ErrorResponse %s — 42P01 regression: standalone COPY must resolve relations in the connecting database (M0122-0015a)", q, f.Payload)
+			case libpq.MsgCopyData:
+				payload += string(f.Payload)
+			case libpq.MsgCommandComplete:
+				tag = strings.TrimSuffix(string(f.Payload), "\x00")
+			}
+		}
+		return tag, payload
+	}
+
+	// COPY TO, unqualified and qualified: both failed pre-fix.
+	if tag, payload := readCopy("COPY t1 TO STDOUT"); tag != "COPY 2" || payload != "1\tx\n2\ty\n" {
+		t.Fatalf("COPY t1 TO STDOUT: tag=%q payload=%q, want COPY 2 / \"1\\tx\\n2\\ty\\n\"", tag, payload)
+	}
+	if tag, payload := readCopy("COPY public.t1 TO STDOUT"); tag != "COPY 2" || payload != "1\tx\n2\ty\n" {
+		t.Fatalf("COPY public.t1 TO STDOUT: tag=%q payload=%q, want COPY 2 / \"1\\tx\\n2\\ty\\n\"", tag, payload)
+	}
+
+	// COPY FROM, the twin direction (Rule #2 sibling): the rows must land
+	// in userdb — proven by re-reading them through COPY TO.
+	writeQuery(t, conn, "COPY t1 FROM STDIN")
+	writeFrontendFrame(t, conn, libpq.MsgCopyData, []byte("3\tz\n"))
+	writeFrontendFrame(t, conn, libpq.MsgCopyDone, nil)
+	for _, f := range readUntilReady(t, conn) {
+		if f.Type == libpq.MsgErrorResponse {
+			t.Fatalf("COPY t1 FROM STDIN: ErrorResponse %s", f.Payload)
+		}
+	}
+	if _, payload := readCopy("COPY t1 TO STDOUT"); payload != "1\tx\n2\ty\n3\tz\n" {
+		t.Fatalf("after COPY FROM: payload=%q, want \"1\\tx\\n2\\ty\\n3\\tz\\n\" (COPY FROM must write the connecting database's table)", payload)
+	}
+
+	// The Rule-#2 twin: the same COPY inside a multi-statement simple-query
+	// batch (runInlineCopy, borrowing the batch context). It planned against
+	// the raw catalog too and raised 42P01 in the user database while the
+	// standalone path of this very test passed — fixed by planning through
+	// ctxPlanCatalog/ctxPlannerSettings, the executeOneSimpleStmt shape.
+	writeQuery(t, conn, "BEGIN; COPY t1 TO STDOUT; COMMIT")
+	{
+		var tag, payload string
+		for _, f := range readUntilReady(t, conn) {
+			switch f.Type {
+			case libpq.MsgErrorResponse:
+				t.Fatalf("inline batch COPY t1 TO STDOUT: ErrorResponse %s — runInlineCopy must scope to the connecting database (M0122-0015a twin)", f.Payload)
+			case libpq.MsgCopyData:
+				payload += string(f.Payload)
+			case libpq.MsgCommandComplete:
+				tag = strings.TrimSuffix(string(f.Payload), "\x00")
+			}
+		}
+		if payload != "1\tx\n2\ty\n3\tz\n" || tag == "" {
+			t.Fatalf("inline batch COPY: tag=%q payload=%q, want rows 1..3", tag, payload)
+		}
+	}
+
+	// Control sibling: the DEFAULT database keeps resolving its own
+	// relations through the DefaultDBOid fallback (the harness's `items`).
+	defConn := dialAndComplete(t, addr)
+	defer defConn.Close()
+	writeQuery(t, defConn, "COPY items TO STDOUT")
+	for _, f := range readUntilReady(t, defConn) {
+		if f.Type == libpq.MsgErrorResponse {
+			t.Fatalf("default-database COPY items TO STDOUT: ErrorResponse %s", f.Payload)
+		}
+	}
+}
+
 // TestCopyToExecutorEndToEnd: after a COPY FROM populates `items`,
 // a follow-up COPY items TO STDOUT emits the rows back as CopyData
 // frames in declared order.

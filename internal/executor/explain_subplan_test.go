@@ -353,15 +353,14 @@ func TestJoinLabelPinsPGLabels(t *testing.T) {
 // the expectation is that SubPlan children are NOT instrumented today.
 // This test observes the real rendered output and pins it.
 //
-// Observed (2026-09-19): the SubPlan subtree executes (the header
-// renders `calls=N` from ctx.SubPlanStats, a separate channel from
-// nodeStatsTable instrumentation) yet its inner nodes carry NO
-// `(actual ...)` bracket — SubPlan children are never instrumented
-// today. Upstream PG's instrument.c does instrument them (its EXPLAIN
-// ANALYZE renders `(actual time=... rows=... loops=N)` on the subtree),
-// so this is both the answer to the task's open question — forcing nil
-// scope at acquireSubPlanOp's Build sites is a bug-for-bug-compatible
-// simplification — and a recorded PG-fidelity gap in its own right.
+// Observed (2026-09-19): the SubPlan subtree executed (the header then
+// rendered goopg's `calls=N` from ctx.SubPlanStats, a separate channel
+// from nodeStatsTable instrumentation) yet its inner nodes carried NO
+// `(actual ...)` bracket — upstream PG's instrument.c does instrument
+// them. M0122-0021 closed that gap: acquireSubPlanOp now builds under
+// ctx.explainScope, the EXPLAIN ANALYZE instrumenter explainOp publishes
+// for its run, so every SubPlan subtree line must carry actuals; and the
+// header is PG's bare `SubPlan N` label.
 func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 	pinCorrelatedSubPlanPath(t)
 	ctx, cleanup := explainSubPlanFixture(t)
@@ -391,10 +390,9 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 		"EXPLAIN ANALYZE SELECT * FROM t1 WHERE t1.a = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)")
 	t.Logf("EXPLAIN ANALYZE output:\n%s", plan)
 
-	// Locate the "SubPlan 1 (...)" header — the header line carries the
-	// per-call counters — then require: (a) calls>=1 so the subtree truly
-	// executed, and (b) every subtree line below it is estimate-only, i.e.
-	// carries a `(cost=...)` but no `(actual ...)` bracket.
+	// Locate the bare "SubPlan 1" header (PG prints no counters on it), then
+	// require every subtree line below it to carry an `(actual ...)` bracket
+	// — the subtree executing shows as its nodes' loops.
 	var headerIdx = -1
 	for i, l := range lines {
 		if strings.HasPrefix(strings.TrimSpace(l), "SubPlan 1") {
@@ -404,12 +402,8 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 	if headerIdx < 0 {
 		t.Fatalf("no `SubPlan 1` subtree header in ANALYZE output:\n%s", plan)
 	}
-	header := strings.TrimSpace(lines[headerIdx])
-	if !strings.Contains(header, "calls=") {
-		t.Fatalf("SubPlan header missing per-call counters (ctx.SubPlanStats): %q\n%s", header, plan)
-	}
-	if strings.Contains(header, "calls=0") {
-		t.Fatalf("SubPlan never executed — observation is vacuous:\n%s", plan)
+	if header := strings.TrimSpace(lines[headerIdx]); header != "SubPlan 1" {
+		t.Errorf("SubPlan header %q: want the bare PG label `SubPlan 1`", header)
 	}
 	var sawSubtree bool
 	for _, l := range lines[headerIdx+1:] {
@@ -417,8 +411,8 @@ func TestExplainAnalyzeSubPlanScopeObservation(t *testing.T) {
 			break
 		}
 		sawSubtree = true
-		if strings.Contains(l, "(actual") {
-			t.Errorf("SubPlan child unexpectedly instrumented (a non-nil scope leaked into its lazy build?):\n%s", plan)
+		if !strings.Contains(l, "(actual") {
+			t.Errorf("SubPlan child line %q carries no actuals (acquireSubPlanOp built it outside the EXPLAIN scope?):\n%s", strings.TrimSpace(l), plan)
 		}
 	}
 	if !sawSubtree {

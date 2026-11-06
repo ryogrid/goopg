@@ -477,21 +477,13 @@ func insertCanonicalSysBtreeLeafInDB(ctx *Context, dbOid, indexOID uint32, index
 		return insertIntoSingleLeafRoot(ctx, indexOID, rel, indexTuple, cmp)
 	}
 
-	// Multi-level path: descend to the target leaf, attempt in-place
-	// insert, and fall back to a full rebuild when the leaf is full
-	// (rebuild handles downlink propagation uniformly).
-	leafBlk, err := descendSysBtreeToLeaf(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], cmp)
-	if err != nil {
-		return fmt.Errorf("descend sys btree %d: %w", indexOID, err)
-	}
-	if err := insertIntoExistingLeaf(ctx, indexOID, rel, leafBlk, indexTuple, cmp); err != nil {
-		if errors.Is(err, storage.ErrNoSpaceInPage) {
-			if rebuildErr := rebuildSysBtreeWithNewEntry(ctx, indexOID, rel, indexTuple, cmp); rebuildErr != nil {
-				return fmt.Errorf("rebuild sys btree %d: %w", indexOID, rebuildErr)
-			}
-			return nil
-		}
-		return fmt.Errorf("insert leaf blk %d sys btree %d: %w", leafBlk, indexOID, err)
+	// Multi-level path: descend to the target leaf and insert, splitting
+	// the leaf (and its ancestors) in place when it is full, as _bt_split /
+	// _bt_insert_parent do (sys_catalog_btree_insert_split.go). The former
+	// whole-index rebuild made every insert into a full leaf rewrite the
+	// entire index (M-NIGHTLY-catalog-btree-split).
+	if err := insertSysBtreeMultiLevel(ctx, indexOID, rel, rootBlk, level, indexTuple, cmp); err != nil {
+		return fmt.Errorf("insert sys btree %d: %w", indexOID, err)
 	}
 	return nil
 }

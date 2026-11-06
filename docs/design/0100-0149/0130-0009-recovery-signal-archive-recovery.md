@@ -83,7 +83,7 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 
 | File | What |
 |------|------|
-| `internal/config/defaults.go` | Registered `restore_command` GUC (string, default `""`, `ContextPostmaster`) |
+| `internal/config/defaults.go` | Registered `restore_command` GUC (string, default `""`; `ContextPostmaster` at first, PGC\_SIGHUP since 2026-10-29 — see the update below) |
 | `internal/initdb/standby.go` | Added `IsRecovery()`, `RemoveRecoverySignal()` — mirror `IsStandby()`/`RemoveStandbySignal()` for `recovery.signal` |
 | `internal/initdb/open.go` | Added `Recovery bool` field to `Runtime`; check for `recovery.signal` at Open time |
 | `cmd/goopg/main.go` | Archive recovery path at startup: when `recovery.signal` present (and `standby.signal` absent), call `RunArchiveRecovery` → `promoteAfterRecovery` → become primary |
@@ -92,6 +92,426 @@ When `recovery.signal` exists at startup (and `standby.signal` does NOT):
 ### Deferred
 
 - `recovery_target_time` / `recovery_target_xid` / `recovery_target_name` (PITR targets)
-- `archive_cleanup_command`
+- ~~`archive_cleanup_command`~~ — landed 2026-10-29 (M0122-0013; design 0005-0001)
 - `recovery_target_timeline` beyond "latest"
-- TLI-aware segment fetch (`FormatSegmentNameTLI` currently hardcodes TLI=1 in the fetch loop)
+- ~~TLI-aware segment fetch (`FormatSegmentNameTLI` hardcoded TLI=1 in the fetch loop)~~ — landed 2026-10-29 (`173eca961`, below)
+
+## Updates (M0122-0013, 2026-10-29)
+
+- **Start-up validation.** `validateRecoveryParameters` (xlogrecovery.c) is ported: `recovery.signal` without
+  `standby.signal` and without `restore_command` is FATAL, and the signal file stays. Before this, goopg deleted the
+  signal file and started as a primary. `restore_command` is PGC\_SIGHUP (`04b33fccf`).
+- **`recovery_end_command`** runs at the end of archive recovery, inside `promoteAfterRecovery` and before
+  `recovery.signal` is removed (`7911ddeda`).
+- **Timeline switch point = EndOfLog** (`69c31e230`). PG writes the new timeline's history file with EndOfLog, the end
+  of the last replayed record (xlog.c `StartupXLOG` → `writeTimeLineHistory`). `promoteAfterRecovery` used the
+  running writer's `WrittenLSN`, which is the local end from before archive recovery. So whenever `restore_command`
+  supplied segments, the history file named a switch point earlier than the WAL actually replayed.
+  - `RunArchiveRecovery` now returns `endOfLog`: the `EndLSN` of the last record it replayed past the local end, or 0
+    when the archive supplied nothing.
+  - `promoteAfterRecovery` uses the later of `endOfLog` and the writer's end.
+  - Pins: `TestRunArchiveRecoveryFetchesThenStops` (`endOfLog` equals the archived record's end) and
+    `TestPromoteAfterRecoveryHistorySwitchPoint` (restored vs nothing restored).
+- **The writer adopts the restored WAL and switches timeline** (`02bf60de2`; P0-E17, S2 data loss).
+  - **Defect:** after archive recovery the running writer still sat at its pre-archive end on the old timeline. A
+    probe showed the first post-promotion record written at `0x3000029`, inside replayed WAL ending at `0x4001060`, on
+    TLI 1. That record overwrote WAL whose changes were already in the data pages.
+  - **Fix:**
+    - `RunArchiveRecovery` also returns the last record's start.
+    - `adoptRestoredWAL` feeds the restored byte range [writer end, EndOfLog) through `Writer.AppendRaw`. That is the
+      walreceiver's path, and it writes the identical bytes back into the same files. The writer then stands where a
+      streaming standby's would.
+    - `switchWriterToNewTimeline` is factored out of the streaming promotion, and both promotions call it. It runs
+      `SwitchTimeline` at EndOfLog, writes `XLOG_END_OF_RECOVERY`, flushes, and sets `minRecoveryPoint`, as PG's
+      `StartupXLOG` (`XLogInitNewTimeline`, `CreateEndOfRecoveryRecord`) does.
+  - **Pin:** `TestPromoteAfterRecoveryAdoptsRestoredWAL` restores real archived segments, then checks:
+    - the restored segment is byte-identical after promotion;
+    - the history file names EndOfLog;
+    - the writer is on the new TLI, and new WAL starts at EndOfLog or later;
+    - a restart reopens on the new TLI.
+    It fails if the adoption is removed.
+- **Still open:**
+  - The fetch loop still hardcodes TLI 1 (above).
+  - goopg has no WAL archiver (`archive_mode` / `archive_command`, `.ready` / `.done`). So PG's
+    `RemoveNonParentXlogFiles` exception for `.ready` segments and the old timeline's `.partial` rename, which needs
+    `XLogArchivingActive()`, have nothing to act on.
+
+## Update 2026-10-29 — timeline-following archive recovery (M0122-0013, `173eca961`; P0-E18)
+
+**Defect (S2, data loss).** The fetch loop named segments on TLI 1 only. Restoring a base backup of a server that had
+been promoted, recovery stopped at the timeline switch and promoted from there, silently dropping every record written
+on the later timeline. A mutation run of the new test shows exactly that: recovery ended on TLI 1 at the switch point.
+
+**PG behaviour** (`recovery_target_timeline = 'latest'`, the default; xlogrecovery.c):
+- `findNewestTimeLine` probes `<tli>.history` files upward from the start timeline.
+- `readTimeLineHistory` turns the newest one into the expected timelines.
+- `XLogFileReadAnyTLI` reads each segment from the newest expected timeline that has it and began at or before it, and
+  never goes back to a timeline older than the last segment's.
+
+**Ported:**
+- `RunArchiveRecovery` returns `ArchiveRecoveryResult`: `EndOfLog`, `LastStart`, `EndTLI`, `NewestTLI` and
+  `Timelines`.
+  - The start TLI comes from pg\_control.
+  - History files are probed locally or via `restore_command`, and restored into pg\_wal.
+  - The start timeline must appear on the newest timeline's history. Otherwise recovery fails with PG's "not a child of
+    this server's history" error.
+  - The loop starts at the highest local segment, not after it, so a newer timeline's copy of the switch segment is
+    read.
+- `adoptRestoredWAL` crosses each timeline switch in the restored range the way a following standby does: it appends
+  up to the timeline's begin, runs `SwitchTimeline` there, and goes on. It reads the restored bytes of the switch
+  segment before the switch zero-fills them. It also appends one segment at a time, which removes the previous
+  whole-range buffer.
+- `promoteAfterRecovery` takes the parent timeline as `EndTLI` and the new timeline as `NewestTLI + 1`, which can't
+  collide with any timeline in the archive (`StartupXLOG`). The history becomes 1 → 2 → 3.
+
+**Pins:** `TestRunArchiveRecoveryFollowsTimelineHistory` and `TestPromoteAfterRecoveryFollowsTimelines`. The second
+takes a base backup on TLI 1, promotes the primary to TLI 2, then checks that recovery plus promotion end on TLI 3 with
+the history chain and survive a restart. Both fail when the history is ignored.
+
+**Still open (ledgered):**
+- Only 'latest' is supported; an explicit `recovery_target_timeline` or 'current' is not.
+- Local WAL that extends past a timeline switch is refused, where PG would read the newer timeline from that point.
+- Restored parent history files stay in pg\_wal; PG reads them to a temporary name.
+
+## Update 2026-10-29 — data-directory lock and SIGHUP during recovery (M0122-0013, `ca0bde402`; P0-E19)
+
+**The defect (S2, P0-E19).** goopg wrote `postmaster.pid` only once the listener was bound, and nothing read it at
+start. A second `goopg start` on the data directory of a live server, on another port, therefore:
+
+- ran crash recovery against the live server's WAL and wrote a checkpoint into it;
+- overwrote the owner's `postmaster.pid`;
+- served connections;
+- deleted the owner's lock file when it stopped.
+
+PG refuses at once in `CreateDataDirLockFile` (miscinit.c `CreateLockFile`).
+
+**The port.**
+- `control.CreateDataDirLockFile` follows `CreateLockFile` with `isDDLock`:
+  - It creates the file with `O_EXCL`, retrying up to 100 times.
+  - It refuses when the existing file names a live process, with PG's errmsg and errhint: `lock file
+    "postmaster.pid" already exists` and `Is another postmaster (PID n) running in data directory "…"?`. A negative
+    pid gives the `postgres` hint.
+  - An empty file is refused with "is empty" and a non-numeric one with "bogus data".
+  - A dead pid, our own pid, our parent's or `PG_GRANDPARENT_PID` is stale: the file is unlinked and the create
+    retried.
+  - Upstream's orphaned-shared-memory probe has no counterpart, because goopg backends are goroutines of the server
+    process.
+- `goopg start` takes the lock before `initdb.Open`, so before crash and archive recovery. A missing directory is still
+  reported by `Open`. The file first holds only the pid, the data directory and the start time; `WritePIDFile` fills in
+  the listen address and socket path when the listener binds. On exit, `RemoveDataDirLockFile` unlinks the file only
+  while it still names this process.
+- `ParsePIDFile` keeps the empty trailing lines of a startup-phase lock file.
+
+**SIGHUP during recovery.** With the pid now discoverable during recovery, `pg_ctl reload` (a `kill -HUP`) would have
+hit Go's default action for SIGHUP and terminated the process.
+- `startupReload` registers SIGHUP before the lock is taken. Its signal goroutine only sets a flag, as the startup
+  process's handler sets `got_SIGHUP`.
+- `process` applies `ProcessConfigFile(PGC_SIGHUP)` synchronously:
+  - at the archive-recovery fetch boundary (`ProcessStartupProcInterrupts`);
+  - once more before the server starts, after which the server's own handler takes over.
+- `RunArchiveRecoveryWith` reads `restore_command` before every fetch, as `RestoreArchivedFile` reads
+  `recoveryRestoreCommand` on each call.
+- `goopg reload` sends SIGHUP directly to a server whose socket line is still empty, as `pg_ctl reload` always does.
+- `misc.ReloadConfigEntries` reads postgresql.conf and then postgresql.auto.conf for both the server's reload and the
+  startup phase.
+
+**Pins:**
+- `TestCreateDataDirLockFile` and `TestRemoveDataDirLockFileOnlyOwn`.
+- `TestStartRefusesLiveDataDirLock`: the FATAL and HINT text; the owner's lock file and pg\_control are left unchanged.
+- `TestStartRecoverySignalWithoutRestoreCommandIsFatal`: the lock is released on a FATAL exit.
+- `TestStartupReloadAppliesSIGHUP` and `TestRunArchiveRecoveryWithReadsRestoreCommandPerFetch`.
+- Each mechanism was mutation-checked.
+- A live probe sent `goopg reload` during a slow `restore_command`. The reload was applied at the next fetch, which then
+  used the new command.
+
+**Still open (ledgered):**
+- The lock file keeps goopg's 5-line format, not PG's 8-line `postmaster.pid` (port, socket directory, listen address,
+  shared-memory key, status line).
+- SIGTERM/SIGINT during start-time recovery cancels only the context. Recovery runs to the end, and `goopg stop` cannot
+  reach a server that has no control socket yet.
+
+## Update 2026-10-29 — shutdown during archive recovery and FATAL restore failures (M0122-0013, `7d2f398fa`; P0-E20)
+
+**The defects.** goopg read every `restore_command` failure as the end of the archive, and nothing in start-time archive
+recovery looked at SIGTERM/SIGINT.
+- **P0-E20 (S2, data loss):** a mistyped command (exit 127, "command not found") or a child killed by a signal ended
+  recovery at the local WAL end. goopg then promoted to a new timeline and abandoned the rest of the archive. PG
+  reports these at FATAL precisely so that recovery is not assumed complete.
+- **Fast shutdown:** a SIGTERM/SIGINT was ignored until the archive was exhausted. goopg then promoted, and exited only
+  afterwards.
+
+**The port (`RestoreArchivedFile`, xlogarchive.c; `StartupProcShutdownHandler` / `ProcessStartupProcInterrupts`,
+startup.c).**
+- `RestoreArchivedFileContext` classifies failures as upstream does:
+  - a child killed by SIGTERM, or the shell's exit 128\+15, returns `ErrRecoveryShutdown`;
+  - any other signal, or an exit status above 125, returns `RestoreFatalError` with `wait_result_to_str`'s text
+    ("command not found", "child process was terminated by signal 9: Killed", …);
+  - anything else is the normal end of the archive.
+- The command expands `BuildRestoreCommand`'s `%f`, `%p`, `%r` and `%%`; `%r` and `%%` used to be left verbatim.
+- A cancelled context sends SIGTERM to the command's process group, the way the postmaster signals the startup
+  process's group.
+- `RunArchiveRecoveryWith` takes the shutdown context and checks it before every fetch and every segment replay. It
+  returns shutdown and FATAL errors instead of reading them as an exhausted archive.
+- `endInterruptedArchiveRecovery` leaves recovery unfinished: no promotion, `recovery.signal` kept, and no shutdown
+  checkpoint, because a server in recovery writes no checkpoint record.
+  - A shutdown request stamps `DB_SHUTDOWNED_IN_RECOVERY` and exits 0.
+  - Anything else is FATAL with exit 1, as when the startup process dies FATAL.
+- `goopg stop` signals a server whose lock file has no control socket yet: SIGINT for fast, SIGTERM for smart, as
+  `pg_ctl stop` does.
+
+**Pins:**
+- `TestRestoreArchivedFileFailureClassification`, `TestRestoreArchivedFilePlaceholders` and
+  `TestRestoreArchivedFileShutdownKillsCommand`.
+- `TestRunArchiveRecoveryStopsOnFatalRestoreAndShutdown`.
+- `TestStopDuringArchiveRecoveryLeavesRecoveryUnfinished`: stop during a slow `restore_command` leaves no new
+  timeline, `recovery.signal` kept and pg\_control in "shut down in recovery"; the next start resumes recovery and
+  promotes.
+- Four mutations fail these tests: context not passed, signal classification off, group kill off, state not stamped.
+- Live probes:
+  - `goopg stop` returned in 60 ms, and `pg_controldata` reports "shut down in recovery".
+  - A missing command is FATAL, with no promotion and `recovery.signal` kept.
+
+**Still open (ledgered):**
+- `initdb.Open`'s crash recovery ignores a shutdown request.
+- `-mode immediate` cannot stop a server that is still starting, because SIGQUIT is unhandled.
+- The shutdown does not adopt the last replayed checkpoint as a restartpoint.
+- pg\_control shows `DB_IN_PRODUCTION`, not `DB_IN_ARCHIVE_RECOVERY`, during recovery.signal recovery.
+- There is no `RECOVERYXLOG` temporary name and no wrong-size check on a restored file.
+- pg\_wal is read before the archive.
+
+## Update 2026-10-29 — archive before pg\_wal, RECOVERYXLOG, recovery.signal is archive recovery (M0122-0013, `58b4511c2`; P0-E21)
+
+**The defect (P0-E21, S2 — data loss).** A base backup's last local segment holds WAL only up to the backup end; the
+archive's copy of the same segment also holds what the primary wrote afterwards. goopg read the local copy first.
+- It replayed that segment only up to the backup end, then went on to the next segments from the archive. Everything
+  in between was skipped.
+- `EndOfLog` still landed at the true end, so nothing looked wrong. The promotion then built the new timeline on a
+  history with a hole in it.
+- Opening the data directory also wrote an end-of-crash-recovery checkpoint record at the local end. That spot is where
+  the archived copy holds the primary's WAL.
+
+**The port.**
+- `have()` follows `XLogFileReadAnyTLI`: XLOG\_FROM\_ARCHIVE is tried before XLOG\_FROM\_PG\_WAL. The local copy is used
+  only when the archive lacks the file, because it "could be an old, un-filled or partly-filled version".
+- `RestoreArchivedFileContext` follows `RestoreArchivedFile` and `KeepFileRestoredFromArchive`:
+  - the command restores into `RECOVERYXLOG` (`RECOVERYHISTORY` for history files), after removing any leftover file of
+    that name, so a failed restore never touches the local copy;
+  - a segment of the wrong size is FATAL ("archive file … has wrong size");
+  - the restored file is renamed over the pg\_wal copy and the directory is synced;
+  - both temporary names are removed when recovery ends (`FinishWalRecovery`).
+- `initdb.Open` treats recovery.signal as archive recovery (`ArchiveRecoveryRequested`):
+  - pg\_control is `DB_IN_ARCHIVE_RECOVERY` from the start;
+  - the checkpointer runs in recovery mode, so the end-of-crash-recovery checkpoint becomes a restartpoint flush and no
+    WAL record is written before recovery ends.
+- `promoteAfterRecovery` leaves recovery mode before its end-of-recovery checkpoint, then stamps `DB_IN_PRODUCTION`.
+- With `wal_init_zero = off`, a new segment is still made full-size, as `XLogFileInitInternal` writes its last byte.
+  goopg used to leave the file short, which the size check and external tools reject.
+
+**Pins:**
+- `TestArchiveRecoveryPrefersArchivedCopyOfPartialLocalSegment` covers the base-backup shape. After recovery, pg\_wal's
+  tail segment is the archived copy and replays past the backup end. pg\_control goes from `DB_IN_ARCHIVE_RECOVERY` to
+  `DB_IN_PRODUCTION`, and a restart lands on the new timeline. The test fails with pg\_wal preferred, and fails with
+  Open's recovery mode off.
+- `TestRestoreArchivedFileThroughRecoveryXLog` checks that a failed restore leaves the local copy alone, that a short
+  restore is FATAL, and that a good restore replaces the local copy. It fails with the size check off.
+
+**Still open (ledgered):**
+- The writer keeps a descriptor for a tail segment that the restored copy replaces. This is correct only because the
+  bytes are identical.
+- Start-time archive recovery takes no restartpoints.
+- Restored history files are kept in pg\_wal.
+
+## Update 2026-10-29 — the writer reopens replaced segments (M0122-0013, `6001f288f`)
+
+Archive recovery puts the archived copy of a segment in place by rename. The WAL writer opened by `initdb.Open`
+still held a descriptor for the replaced local tail segment. Promotion's `adoptRestoredWAL` appends, and anything
+else written there, therefore went to the orphaned inode. That was correct only because those bytes equalled the
+archived copy. PG opens no WAL for writing until recovery ends.
+
+**Fix:**
+- `Writer.ReopenSegmentFiles` flushes and then drops every cached segment descriptor, quiesced like
+  `SwitchTimeline`. The next write opens each segment by its path.
+- `promoteAfterRecovery` calls it before it reads the writer's end and appends the restored WAL.
+
+**Pin:** `TestReopenSegmentFilesWritesTheReplacedSegment` writes a record after the open segment was renamed over,
+and checks that it is in pg\_wal's file. It fails when the descriptors are kept.
+
+**Still open (ledgered):** start-time archive recovery takes no restartpoints, and restored history files are kept in
+pg\_wal.
+
+## Update 2026-10-29 — recovery\_target\_timeline 'current' and numeric targets (M0122-0013, `4caa86ca8`)
+
+goopg registered `recovery_target_timeline` but always followed 'latest'.
+- `misc.ParseRecoveryTargetTimeline` and the GUC's check hook port `check_recovery_target_timeline`:
+  - "current" and "latest" are taken by name;
+  - anything else is read as `strtoul(s, NULL, 0)` (prefix base, longest digit prefix, 0 when there is none);
+  - only an overflow is rejected, with PG's errdetail.
+- `RunArchiveRecoveryWith` takes the target, following `validateRecoveryParameters`:
+  - 'current' follows pg\_control's timeline;
+  - a numeric N follows N's history, and is FATAL "recovery target timeline N does not exist" when N≠1 has no history
+    file;
+  - for every target, the start timeline must be on the target's history.
+- `NewestTLI` is still `findNewestTimeLine(target)`, so the promotion's new timeline cannot collide with an archived
+  one. `TargetTLI` is reported.
+
+**Pins:** `TestRunArchiveRecoveryTargetTimeline` and `TestParseRecoveryTargetTimeline` (mutation-checked).
+
+**Still open (ledgered):**
+- A standby follows only the newest timeline.
+- An empty value reads as 'latest'.
+- The "not a child" FATAL lacks PG's errdetail.
+
+## Update 2026-10-30 — timeline history through RECOVERYHISTORY (M0122-0013, `0603610a5`)
+
+goopg restored every probed history file into pg\_wal under its own name, including the target timeline's. PG handles
+history during archive recovery like this:
+- `readTimeLineHistory` and `existsTimeLineHistory` restore it into `RECOVERYHISTORY` and read it from there,
+  without keeping it.
+- `restoreTimeLineHistoryFiles(checkpoint TLI, recoveryTargetTLI)` copies into pg\_wal only the files for the timelines
+  between the start and the target, not the target's own.
+
+**The port.**
+- `RestoreArchivedFileTemp` is `RestoreArchivedFile` without `KeepFileRestoredFromArchive`.
+- `historyPath` restores into `RECOVERYHISTORY`, falling back to the pg\_wal copy. It serves `findNewestTimeLine`, the
+  numeric-target existence check and the target's history.
+- The target's entries are reported verbatim as `TargetHistory`.
+- The `[start, target)` history files are kept in pg\_wal.
+- `promoteAfterRecovery` copies the parent's history from `TargetHistory` when the parent is the target, as
+  `writeTimeLineHistory` reads it through `RECOVERYHISTORY` too. Reading pg\_wal alone would now drop every ancestor
+  line.
+
+**Pins:**
+- `TestRunArchiveRecoveryFollowsTimelineHistory` (updated): the target's history is not kept, and `TargetHistory` is
+  verbatim.
+- `TestRunArchiveRecoveryKeepsIntermediateHistoryFiles`: with timelines 1 → 2 → 3, timeline 2's file is kept and
+  timeline 3's is not.
+- `TestPromoteAfterRecoveryFollowsTimelines` catches a promotion that reads pg\_wal only.
+- All three were mutation-checked.
+
+**Still open (ledgered):** start-time archive recovery takes no restartpoints.
+
+## Update 2026-10-30 — recovery shell commands report wait events (M0122-0013, `be383bdfe`)
+
+goopg reported no wait event while a recovery shell command ran, so a checkpointer stuck in a slow
+`archive_cleanup_command` looked idle in pg\_stat\_activity. PG wraps every one of them in
+`pgstat_report_wait_start`:
+- `RestoreArchivedFile` (xlogarchive.c) uses `WAIT_EVENT_RESTORE_COMMAND`;
+- `ExecuteRecoveryCommand` (xlog.c) uses `WAIT_EVENT_RECOVERY_END_COMMAND` or `WAIT_EVENT_ARCHIVE_CLEANUP_COMMAND`.
+
+**The port.**
+- `activity` gains three IPC wait events, `RestoreCommand`, `RecoveryEndCommand` and `ArchiveCleanupCommand`,
+  following wait\_event\_names.txt.
+- `reportCommandWait` sets the event on the pg\_stat\_activity entry of the goroutine that runs the command, and clears
+  it when the child exits.
+- An unregistered caller reports nothing. Start-time archive recovery is one: it runs before the server registers any
+  backend.
+- `pg_wait_events` lists the three events, with PG's descriptions.
+
+**Pin:** `TestRecoveryCommandsReportWaitEvents`. Each command shows its IPC event while it runs and nothing afterwards.
+The test fails when reporting is turned off.
+
+## Update 2026-10-30 — the checkpoint must precede the target's fork point (M0122-0013, `c9720ce9b`; P0-E22)
+
+`InitWalRecovery` checks the start point against the target timeline's history twice:
+- `tliSwitchPoint` fails when the checkpoint's timeline is not in that history at all ("requested timeline N is not in
+  this server's history").
+- `tliOfPointInHistory(CheckPointLoc, expectedTLEs)` must equal `CheckPointTLI`, i.e. the checkpoint must precede the
+  point where the target forked off. Otherwise recovery fails with FATAL "requested timeline N is not a child of this
+  server's history" and an errdetail naming both positions.
+
+goopg did only the first check, with the second's message (P0-E22, S2). A checkpoint past the fork point was accepted,
+and the target timeline's WAL was replayed over data that already carried the abandoned timeline's changes.
+
+**The fix.**
+- `RunArchiveRecoveryWith` reads pg\_control's `CheckPoint` and applies both checks.
+- `RestoreFatalError` carries an errdetail, which `goopg start` prints as `DETAIL:`.
+- An empty `recovery_target_timeline` is read raw, so it is `strtoul("")` = timeline 0 ("recovery target timeline 0
+  does not exist"), not the default 'latest'.
+
+**Pins:** `TestRunArchiveRecoveryCheckpointMustPrecedeTheFork` and `TestRecoveryTargetTimelineReadsRawValue`. Each
+fails when its fix is removed.
+
+**Still open (ledgered):**
+- goopg reads no `backup_label` at recovery, so the start point and the errdetail always come from pg\_control.
+- A standby follows only the newest timeline.
+
+## Update 2026-10-30 — recovery\_target\_lsn, recovery\_target\_inclusive, recovery\_target\_action (M0122-0013, `d882de595`)
+
+goopg did not register the recovery-target settings; setting one was an unknown-parameter startup error. Point-in-time
+recovery to an LSN was therefore impossible. The new timeline's history also always said "archive recovery complete"
+where PG writes `getRecoveryStopReason()`.
+
+**The port.**
+- **Settings:**
+  - `recovery_target_lsn` accepts '' or a valid pg\_lsn (`check_recovery_target_lsn`; `ParsePGLSN` is
+    `pg_lsn_in_internal`);
+  - `recovery_target_inclusive` defaults to on;
+  - `recovery_target_action` is one of pause, promote or shutdown, defaulting to pause;
+  - postgresql.conf.sample has PG's lines.
+
+  The xid, name, time and 'immediate' targets stay unregistered, so setting one is still a startup error rather than a
+  target that is silently ignored.
+- **Stop logic** (`recoveryStopsBefore` / `recoveryStopsAfter`, LSN arm): the first record whose ReadRecPtr reaches the
+  target ends recovery, after that record when inclusive and before it otherwise. No later record is replayed. The
+  result carries `ReachedTarget`, `StopLSN`, `StopAfter` and `StopPoint`, and `StopReason()` returns
+  `"after|before LSN X/X\\n"` (the trailing newline is PG's) or "no recovery target specified".
+- **End of redo** (`PerformWalRecovery`):
+  - an unreached target is FATAL "recovery ended before configured recovery target was reached";
+  - a stop point inside the WAL that `initdb.Open` already replayed is FATAL "requested recovery stop point is before
+    consistent recovery point";
+  - the action then applies:
+    - promote promotes;
+    - shutdown leaves recovery unfinished, with `DB_SHUTDOWNED_IN_RECOVERY` and `recovery.signal` kept;
+    - pause becomes shutdown when hot\_standby is off, as `validateRecoveryParameters` does, and otherwise (unsupported
+      here) shuts down with a WARNING.
+- `promoteAfterRecovery` writes `StopReason()` as the history reason.
+
+**Pins:**
+- `TestRunArchiveRecoveryStopsAtTargetLSN`, `TestRecoveryTargetChecksAndAction` and
+  `TestPromoteAfterRecoveryToTargetLSN` (end to end: switch at the target record's end, PG's reason line).
+- `TestStartRecoveryTargetLSNFatals`.
+- All were mutation-checked.
+
+**Still open (ledgered):**
+- The xid, name, time and 'immediate' targets.
+- Pause with hot\_standby on.
+- Targets on a standby.
+- The consistency point is the local-WAL end, not minRecoveryPoint.
+
+## Update 2026-10-30 — recovery\_target\_xid and the single-target check (M0122-0013, `77e3f4ed5`)
+
+- `recovery_target_xid` is registered with `check_recovery_target_xid`: `strtou64(s, NULL, 0)`, rejected only on
+  ERANGE and truncated to a TransactionId.
+- **The stop rule** (`recoveryStopsBefore` / `recoveryStopsAfter`): only the COMMIT or ABORT record whose `xl_xid`
+  equals the target ends recovery. The test is equality only, because xids are assigned when a transaction starts, not
+  in completion order. Recovery stops before that record, or after applying it when inclusive.
+  - `StopReason` is "before|after transaction N".
+  - `StopMessage` is PG's LOG line, "recovery stopping before|after commit|abort of transaction N, time T".
+- **Single target:** setting `recovery_target_lsn` and `recovery_target_xid` together is FATAL "multiple recovery
+  targets specified", with `error_multiple_recovery_targets`' errdetail.
+
+**Pins:** `TestRunArchiveRecoveryStopsAtTargetXid` (the fixture's completion order differs from xid order; it covers
+an abort target and an absent xid) and `TestRecoveryStopXidAndSingleTarget`. Both were mutation-checked.
+
+**Still open (ledgered):**
+- `COMMIT PREPARED` / `ABORT PREPARED`: replay refuses the two-phase opcodes.
+- Commit records carry `xact_time = 0`, which blocks `recovery_target_time` and makes the LOG time 2000-01-01.
+- `recovery_target_name` and `'immediate'`.
+
+## Update 2026-10-30 — commit and abort records carry xact\_time (M0122-0013, `b1cc9d108`)
+
+goopg wrote `xact_time = 0` into every `xl_xact_commit` and `xl_xact_abort`. A PG standby, `pg_waldump` and any time
+target therefore saw every transaction end at 2000-01-01 00:00:00 UTC. PG's `XactLogCommitRecord` and
+`XactLogAbortRecord` store the transaction's stop timestamp (`GetCurrentTransactionStopTimestamp`).
+
+- `EncodeXactCommitPGWithRelsAt` and `EncodeXactAbortPGWithRelsAt` write the given TimestampTz. The un-timed encoders,
+  used by fixtures, keep writing 0.
+- `TimestampTzNow` is `GetCurrentTimestamp` (microseconds since 2000-01-01 UTC).
+- The xact-marker hook in `initdb.Open` stamps each end record with the transaction's stop time.
+- PG's `pg_waldump` on a goopg segment now prints, for example, "COMMIT 2026-10-30 04:21:12.164944 JST".
+
+**Pins:** `TestWalXactRecordsCarryStopTimestamp` (a real commit and rollback land inside the before/after window; fails
+with the time zeroed) and `TestEncodeXactRecordsAtWriteXactTime`.
+
+**Still open (ledgered):** `recovery_target_time` itself. goopg's timestamptz input parser is unexported inside
+`internal/executor`.

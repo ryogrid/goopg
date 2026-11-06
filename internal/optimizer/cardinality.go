@@ -142,7 +142,7 @@ func EstimateRows(n Node) int64 {
 		// an ordered full-range IOS with nil Key/Keys/LowKey/HighKey.
 		return indexScanRows(x.Table, x.Index, x.Key, x.Keys, x.LowKey, x.HighKey, x.LowOp, x.HighOp)
 	case *Values:
-		return int64(len(x.Rows))
+		return int64(x.RowCount())
 	case *Filter:
 		child := EstimateRows(x.Child)
 		if child <= 0 {
@@ -1088,9 +1088,76 @@ func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInf
 	info.isSmallDimension = smallDimensionSide(scan, binding.table)
 	if binding.table != nil {
 		info.baseRows = tableRows(binding.table)
+		// M0148-0001c2: a FROM item that fans out over an inheritance tree
+		// or a partition hierarchy is PG's appendrel, whose size is the SUM
+		// of its members' (set_append_rel_size: parent rel->tuples / rows =
+		// Σ childrel), each member estimated on its own (its own
+		// estimate_rel_size, with the 10-page floor). The parent table's
+		// own statistics describe only its own heap — 0 / 1 row for an
+		// empty inheritance parent or a storage-less partitioned one.
+		if fanOutAppendRel(binding.table, scan) {
+			info.baseRows = appendRelMemberRows(scan.(*SetOp))
+		}
 	}
 	info.filteredRows = applyLocalFilterSelectivity(info.baseRows, binding, scan, local)
 	return info
+}
+
+// appendRelMemberRows is set_append_rel_size's Σ over the members, each
+// clamped to one row as clamp_row_est leaves every rel (an empty
+// inheritance parent contributes 1, not "unknown" — estimateSetOp's 0-arm
+// guard would zero the whole tree).
+func appendRelMemberRows(so *SetOp) int64 {
+	var total int64
+	var walk func(n Node)
+	walk = func(n Node) {
+		if link, ok := n.(*SetOp); ok && link.All && link.Op == parser.SetOpUnion && len(link.MergeKeys) == 0 {
+			walk(link.Left)
+			walk(link.Right)
+			return
+		}
+		r := EstimateRows(n)
+		if r < 1 {
+			r = 1
+		}
+		total += r
+	}
+	walk(so)
+	return total
+}
+
+// fanOutAppendRel reports whether scan is the planner's inheritance /
+// partition fan-out of tbl — a UNION ALL chain whose member scans name tbl as
+// their inheritance parent (SeqScan.InheritParentOID) or partition root
+// (SeqScan.LockParentOID). A real UNION ALL subquery never matches: its
+// binding table is synthetic and its members name no parent.
+func fanOutAppendRel(tbl *catalog.Table, scan Node) bool {
+	if tbl == nil || tbl.Virtual {
+		return false
+	}
+	so, ok := scan.(*SetOp)
+	if !ok || !so.All || so.Op != parser.SetOpUnion {
+		return false
+	}
+	found := false
+	var walk func(n Node)
+	walk = func(n Node) {
+		if n == nil || found {
+			return
+		}
+		if ss, ok := n.(*SeqScan); ok {
+			if ss.InheritParentOID == tbl.OID || ss.LockParentOID == tbl.OID {
+				found = true
+			}
+			return
+		}
+		kids, _ := planChildNodes(n)
+		for _, k := range kids {
+			walk(k)
+		}
+	}
+	walk(so)
+	return found
 }
 
 // applyLocalFilterSelectivity is the second half of upstream's

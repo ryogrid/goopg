@@ -56,7 +56,13 @@ func TimelineHistoryFileName(tli uint32) string {
 // an error, and this matches that contract for any TLI whose history
 // hasn't been written yet.
 func ReadHistory(walDir string, tli uint32) ([]TimelineHistoryEntry, error) {
-	path := filepath.Join(walDir, TimelineHistoryFileName(tli))
+	return ReadHistoryFile(filepath.Join(walDir, TimelineHistoryFileName(tli)))
+}
+
+// ReadHistoryFile is ReadHistory for a history file at path — archive
+// recovery reads a restored history through RECOVERYHISTORY
+// (readTimeLineHistory). A missing file returns (nil, nil).
+func ReadHistoryFile(path string) ([]TimelineHistoryEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -119,12 +125,6 @@ func ReadHistory(walDir string, tli uint32) ([]TimelineHistoryEntry, error) {
 // not the most recent ancestor — i.e., when promoting a standby from
 // TLI 1 to TLI 2, call WriteHistory(walDir, 2, [{TLI:1, ...}]).
 func WriteHistory(walDir string, tli uint32, entries []TimelineHistoryEntry) error {
-	if err := os.MkdirAll(walDir, 0o700); err != nil {
-		return fmt.Errorf("wal: mkdir %s: %w", walDir, err)
-	}
-	path := filepath.Join(walDir, TimelineHistoryFileName(tli))
-	tmp := path + ".tmp"
-
 	var buf strings.Builder
 	for _, e := range entries {
 		// Format each line as `<TLI>\t<X/X switch LSN>\t<reason>\n`.
@@ -135,8 +135,33 @@ func WriteHistory(walDir string, tli uint32, entries []TimelineHistoryEntry) err
 			uint32(e.SwitchLSN>>32), uint32(e.SwitchLSN),
 			e.Reason)
 	}
+	return WriteHistoryContent(walDir, tli, []byte(buf.String()))
+}
 
-	if err := os.WriteFile(tmp, []byte(buf.String()), 0o600); err != nil {
+// FindNewestTimeline is findNewestTimeLine over pg_wal: the newest timeline
+// at or after start whose history file exists, probing start+1, start+2,
+// ... until one is missing. A promotion takes the result plus one.
+func FindNewestTimeline(walDir string, start uint32) uint32 {
+	newest := start
+	for probe := start + 1; probe != 0; probe++ {
+		if _, err := os.Stat(filepath.Join(walDir, TimelineHistoryFileName(probe))); err != nil {
+			break
+		}
+		newest = probe
+	}
+	return newest
+}
+
+// WriteHistoryContent atomically writes content verbatim as
+// `<walDir>/<tli>.history` — writeTimeLineHistoryFile, which the
+// walreceiver uses for a history file streamed from the primary.
+func WriteHistoryContent(walDir string, tli uint32, content []byte) error {
+	if err := os.MkdirAll(walDir, 0o700); err != nil {
+		return fmt.Errorf("wal: mkdir %s: %w", walDir, err)
+	}
+	path := filepath.Join(walDir, TimelineHistoryFileName(tli))
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, content, 0o600); err != nil {
 		return fmt.Errorf("wal: write timeline history %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {

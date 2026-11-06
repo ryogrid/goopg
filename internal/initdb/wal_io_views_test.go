@@ -81,9 +81,18 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 
 // TestStatWALIOPreallocationCounters pins the M0007 preallocation
 // counters follow-up: with Config.Preallocate on, opening the first
-// segment bumps wal_segments_preallocated_total to 1 and
-// wal_init_zero_bytes_total to the configured SegmentSize; with
-// Preallocate off (the default), both stay "0".
+// segment bumps wal_segments_preallocated_total past 0 and
+// wal_init_zero_bytes_total tracks it at exactly SegmentSize per
+// segment; with Preallocate off (the default), both stay "0".
+// AI-20261101-010139-001: the old "want exactly 1" pinned a race —
+// eagerPreallocSegment(segNo+1) preallocates the NEXT segment in a
+// background goroutine, legitimately adding a second counted segment
+// whenever the goroutine wins the scheduling race (it did under the
+// nightly lane load: 2/16384). The eager path is explicitly
+// best-effort timing, so the deterministic invariant is: on ⇒ count
+// ≥ 1 (the synchronous openSegment fill always counts) with
+// bytes == count × SegmentSize (both counters move together per
+// zero-fill, sync and eager); off ⇒ 0/0.
 func TestStatWALIOPreallocationCounters(t *testing.T) {
 	t.Run("preallocate-on", func(t *testing.T) {
 		const segSize = 8192
@@ -105,11 +114,15 @@ func TestStatWALIOPreallocationCounters(t *testing.T) {
 		}
 		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
 		row := tbl.VirtualRows()[0]
-		if row[8] != "1" {
-			t.Errorf("wal_segments_preallocated_total=%q, want 1", row[8])
+		segs, err := strconv.ParseInt(row[8], 10, 64)
+		if err != nil || segs < 1 {
+			t.Errorf("wal_segments_preallocated_total=%q, want >= 1 (err=%v)", row[8], err)
 		}
-		if row[9] != strconv.Itoa(segSize) {
-			t.Errorf("wal_init_zero_bytes_total=%q, want %d", row[9], segSize)
+		bytes, err := strconv.ParseInt(row[9], 10, 64)
+		if err != nil {
+			t.Errorf("wal_init_zero_bytes_total=%q, want integer (err=%v)", row[9], err)
+		} else if segs >= 1 && bytes != segs*segSize {
+			t.Errorf("wal_init_zero_bytes_total=%q, want %d (%d segments x SegmentSize)", bytes, segs*segSize, segs)
 		}
 	})
 	t.Run("preallocate-off", func(t *testing.T) {

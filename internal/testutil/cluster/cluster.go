@@ -164,6 +164,17 @@ func (c *Cluster) DataDir() string    { return c.dataDir }
 func (c *Cluster) ListenAddr() string { return c.listenAddr }
 func (c *Cluster) LogPath() string    { return c.logPath }
 
+// DSN returns a lib/pq connection string for the cluster's user/database.
+// QueryWithOptions builds this same string internally, but Cluster.Query opens
+// a FRESH connection per call; tests that need one session spanning several
+// statements — COPY FROM STDIN followed by pg_stat_force_next_flush() and the
+// pg_stat_get_* counters, which are per-session — build their database/sql
+// client from this.
+func (c *Cluster) DSN() string {
+	host, port, _ := splitHostPort(c.listenAddr)
+	return fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable", host, port, c.user, c.database)
+}
+
 // Init prepares the cluster's data directory: `goopg init -D <dir>` (plus any
 // configured InitArgs). Unless SyncInit is set, init runs with --no-sync (the
 // data dir is throwaway; upstream pg_regress/Cluster.pm do the same), and

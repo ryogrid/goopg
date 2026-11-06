@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goopg/goopg/internal/access/nbtree"
 	"github.com/goopg/goopg/internal/access/transam"
 	"github.com/goopg/goopg/internal/access/transam/control"
 	"github.com/goopg/goopg/internal/access/transam/xlog"
@@ -182,6 +183,13 @@ type OpenOptions struct {
 	// goopg init (PG_VERSION present). Open does not run init for
 	// you — that's a separate operator action.
 	DataDir string
+
+	// Interrupted, when non-nil, is asked before every crash-replay record
+	// (the redo loop's ProcessStartupProcInterrupts). Once it reports true,
+	// Open stops replaying and returns an error wrapping
+	// xlog.ErrRecoveryShutdown — a shutdown request during crash recovery
+	// (goopg start's SIGTERM / SIGINT / SIGQUIT).
+	Interrupted func() bool
 
 	// PoolSlots is the number of buffer pool slots to allocate.
 	// Defaults to 16384 when zero (128 MB at BlockSize=8 KB), which
@@ -420,11 +428,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// goopg and to anything reading the control file mid-replay.
 	// A standby's recovery is archive recovery (standby.signal is upstream's
 	// ArchiveRecoveryRequested), and pg_control says so (M0122-0013).
-	startStandby := false
+	// recovery.signal is ArchiveRecoveryRequested too: crash replay and the
+	// archive recovery that follows are one recovery, so pg_control shows
+	// DB_IN_ARCHIVE_RECOVERY from the start, as StartupXLOG stamps it.
+	startStandby, startRecovery := false, false
 	if abs != "" {
 		startStandby, _ = IsStandby(abs)
+		startRecovery, _ = IsRecovery(abs)
 	}
-	recov, err := beginRecovery(abs, startStandby)
+	recov, err := beginRecovery(abs, startStandby || startRecovery)
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: stamp pg_control DB_IN_CRASH_RECOVERY: %w", err)
@@ -450,7 +462,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// instead of being reconstructed by scanning the stream for a record
 	// goopg's own isCheckpointRecord recognises. The scan survives as the
 	// fallback for redo == 0 (fresh cluster / no control file).
-	if _, err := xlog.ReplayFromDirWithMgrAt(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN); err != nil {
+	if _, err := xlog.ReplayFromDirWithMgrAtInterruptible(mgr, filepath.Join(abs, "pg_wal"), 0, recov.redoLSN, opts.Interrupted); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
@@ -1244,6 +1256,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		defer commitStampMu.RUnlock()
 		var payload []byte
 		var perr error
+		// xact_time: the transaction's stop timestamp
+		// (GetCurrentTransactionStopTimestamp), taken as its end record is
+		// written.
+		stopTime := xlog.TimestampTzNow()
 		switch kind {
 		case transam.XactCommit:
 			// The relations the transaction dropped go into the commit record
@@ -1258,7 +1274,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
 				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
-				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, true)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -1276,12 +1292,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload, perr = xlog.EncodeXactCommitPGWithRels(xid, nil, dropped, false)
+				payload, perr = xlog.EncodeXactCommitPGWithRelsAt(stopTime, xid, nil, dropped, false)
 			}
 		case transam.XactAbort:
 			// The relations the transaction created go into the abort record;
 			// their files are removed once it is written (XactLogAbortRecord).
-			payload, perr = xlog.EncodeXactAbortPGWithRels(xid, nil, txnMgr.PendingAbortRelDeletes(xid))
+			payload, perr = xlog.EncodeXactAbortPGWithRelsAt(stopTime, xid, nil, txnMgr.PendingAbortRelDeletes(xid))
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
@@ -2791,7 +2807,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// but it must not append its own checkpoint records to the primary-owned
 	// WAL stream.  Its reconnect LSN is the received WAL tail, so a local
 	// marker would corrupt the stream position after a clean restart.
-	cp.SetRecoveryMode(standby)
+	//
+	// recovery.signal's archive recovery is recovery too: no checkpoint
+	// record may be written before it ends — the end-of-crash-recovery
+	// checkpoint below becomes a restartpoint flush, and a WAL record
+	// written at the local end would sit where the archived copy of that
+	// segment (which archive recovery prefers) holds the primary's WAL.
+	// The promotion leaves recovery mode before its end-of-recovery
+	// checkpoint.
+	cp.SetRecoveryMode(standby || recovery)
 
 	rt := &Runtime{
 		StorageMgr:     mgr,
@@ -2900,6 +2924,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return 0, false
 		}
 		return int64(n), true
+	}
+
+	// M0148-0001c2: _bt_getrootheight for the planner's btree descent cost —
+	// btm_fastlevel from the metapage (block 0), 0 for a rootless tree.
+	catalog.IndexTreeHeightFunc = func(rel storage.RelFileNode) (int, bool) {
+		if !pool.Exists(rel) {
+			return 0, false
+		}
+		if n, err := pool.NBlocks(rel); err != nil || n == 0 {
+			return 0, false
+		}
+		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+		if err != nil {
+			return 0, false
+		}
+		defer pool.Unpin(slot)
+		slot.RLock()
+		m := nbtree.ParseMeta(slot.Page())
+		slot.RUnlock()
+		if m.Magic != nbtree.BTreeMagicPG {
+			return 0, false
+		}
+		if m.Root == 0 { // P_NONE
+			return 0, true
+		}
+		return int(m.FastLevel), true
 	}
 
 	// M0146-0237: estimate_rel_size's RelationGetNumberOfBlocks for the
@@ -3043,7 +3093,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// DB_IN_PRODUCTION only at the end of StartupXLOG, after promotion
 	// (M0122-0013). goopg stamped DB_IN_PRODUCTION on a standby too.
 	stamp := stampInProduction
-	if standby {
+	if standby || recovery {
 		stamp = stampInArchiveRecovery
 	}
 	if err := stamp(abs); err != nil {
@@ -3911,7 +3961,7 @@ func (r *Runtime) Close() error {
 		// recovery, and goopg's own next start replays WAL. Mirrors
 		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
 		slog.Default().Info("immediate shutdown: skipping final checkpoint",
-			"note", "pg_control left at DB_IN_PRODUCTION; recovery on next start")
+			"note", "pg_control state left as it was; recovery on next start")
 	} else if r.Checkpointer != nil {
 		// Use the shutdown variant so pg_control's State lands on
 		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean
@@ -4511,7 +4561,17 @@ func loadStatisticsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// analyzed" and apply upstream's 10-page floor to it. M0125-0003.
 		stats := &catalog.TableStats{Columns: colStats, Analyzed: true}
 		if sz, ok := sizeMap[relid]; ok {
-			stats.RowCount = sz.rowCount
+			if sz.rowCount < 0 {
+				// pg_class's reltuples=-1 sentinel persisted by TRUNCATE
+				// (RelationSetNewRelfilenode's new-relation state): the
+				// relation is unanalyzed, so Analyzed flips back off and
+				// RowCount stays 0 — the planner's 10-page probe floor fires,
+				// on the restored column widths, exactly as PG probes a
+				// TRUNCATEd relation.
+				stats.Analyzed = false
+			} else {
+				stats.RowCount = sz.rowCount
+			}
 			stats.Pages = int(sz.pages)
 			if sz.allVisible >= 0 {
 				stats.AllVisible, stats.AllVisibleSet = int32(sz.allVisible), true
