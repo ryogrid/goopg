@@ -1,39 +1,36 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #19: census IDENTICAL; M0148-0001c3a2 slice 2 landed 21f23375c)
+# Working Set — loop end 2026-11-12 (run-2 loop #20: census IDENTICAL; M0148-0001c3a2 slice 3 landed c8807e4c1)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112e (label s9bp, BASELINE_REV=4faf82b2e) IDENTICAL ×3, committed.
-  - Code commit 21f23375c since → the next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bq, BASELINE_REV=89b29765c, as routing-20261112f.
-  - The fire-set A/B already showed fires=none on sf025 + sf1.
+- S9: DUE at loop start → routing-20261112f (label s9bq, BASELINE_REV=89b29765c) IDENTICAL ×3, committed.
+  - Code commit c8807e4c1 since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9br, BASELINE_REV=a478f112c, as routing-20261112g.
+  - The ROUTING.md BASELINE_REV convention is "head consumed by the previous census" = the capture repo head of routing-20261112f, which is a478f112c.
+  - Fire-set already showed fires=none.
 - Task: M0148-0001c3a2 — BitmapOr and five more c3a2 items. Stays OPEN.
-  - Slice 2 LANDED: bitmap SAOP carrier, PG 18 OR-arm grouping, predtest port.
+  - Slice 3 LANDED: plain-path OR→SAOP, and the AND/OR NULL-arm fold fix (S2 wrong results, fixed).
 - Files:
-  - optimizer/pathbitmapor.go: groupSimilarOrArgs, keyTypeTag, bitmapSAOPOnColumn, bitmapPathsForOrGroup, bitmapqualTotalCost, predicateClassify/predicateImpliedBy.
-  - pathbitmap.go: SAOP arm in buildBitmapIndexChild, numSAScans, IndexPathTotalCost.
-  - path.go: Path.IndexPathTotalCost.
-  - plan.go: BitmapIndexScan.SAOPKeys, BinaryOp.Nested.
-  - createplanbitmap.go: SAOP lowering.
-  - executor/operators_bitmap.go: buildSAOPBitmap.
-  - operators_explain.go: formatBitmapSAOPIndexCond, flattenBoolArmChild (Nested).
-  - Tests: bitmap_or_paths_test.go (+7 PG plans); saop_index_test.go (bitmap off, ledgered).
+  - optimizer/pathbitmapor.go: orEqualitySAOP, saopPricedClause.
+  - pathindexrestrict.go: restrictionLeadingSAOP accepts an OR; SAOP pricing.
+  - foldconst.go: tryFoldBinaryOp NULL-arm guard; reduceQualConstArms in foldQualConstants.
+  - executor/bitmap_or_paths_test.go: TestOrEqualitiesAsIndexSAOP.
+  - Design: docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md (slice 3 section).
 - Findings:
-  - PG keeps the OR in the Filter once any arm is a SAOP group (predtest OR⇒OR is item-wise), but drops it when the whole OR is one SAOP.
-  - A typed-nil `*ExecError` assigned to an `error` var panicked the backend (fixed before commit).
-  - Remember: stop the probe server before restarting it — a stale server kept answering on 5533.
-- Next step: S9 census (DUE), then c3a2 residue. Options:
-  - Preferred: the OR path as a chooseBitmapAnd candidate. PG builds BitmapAnd(t1_h, BitmapOr) for `hundred = 42 AND (thousand = 42 OR thousand = 99 OR unique1 < 2)`; chooseBitmapAnd reads Children[0].IndexInfo, so it needs a clause-usage redundancy check (PG's PathClauseUsage / classify_index_clause_usage).
-  - Or plain-path OR→SAOP (restrictionLeadingSAOP accepting an OR of equalities).
-  - Then items (2)-(6).
+  - The pre-existing fold bug made `WHERE x OR NULL` a One-Time Filter: false.
+  - goopg picks Bitmap where PG picks Index Only Scan, even for a plain `hundred = 3`. Probable cause: the scratch PG's autovacuum set the visibility map. This is an older IOS costing/VM gap, not c3a2.
+- Next step: S9 census (DUE), then c3a2 residue — the OR path as a chooseBitmapAnd candidate.
+  - Port PG choose_bitmap_and's clause-usage redundancy check (classify_index_clause_usage / find_indexpath_quals) in place of the index-column overlap.
+  - Expect fire-set movement on BitmapAnd choices; measure.
+  - Probe: `hundred = 42 AND (thousand = 42 OR thousand = 99 OR unique1 < 2)` → PG BitmapAnd(t1_h, BitmapOr).
 - Top-residual: M0148 residues. Open children: c3a2, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112e done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112f done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a2.
 - Gates run (all PASS):
-  - census s9bp: IDENTICAL ×3.
-  - regress A/B over 16 suites against the 1af538463 candidate run.
-  - units (second run; the first failed TestSAOPWithConjunctMoves → handled).
+  - census s9bq: IDENTICAL ×3.
+  - regress A/B over 22 suites (HEAD baselines): unchanged.
+  - units.
   - tpch-spotcheck.
-  - sf025: PASS=99, 99/99 plan shapes identical.
-  - fire-set c3a2bfs: fires=none.
+  - sf025: PASS=99, 99/99 shapes identical.
+  - fire-set c3a2cfs: fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
 - In-flight: none.

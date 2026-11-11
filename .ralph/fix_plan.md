@@ -12210,6 +12210,26 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     Children\[0\].IndexInfo-free redundancy check: PG's
     PathClauseUsage), or plain-path OR→SAOP; then items (2)-(6).
   Movement: yes — regress create\_index 3271→3235, join 17724→17655
+  - 2026-11-12 slice 3 LANDED (c8807e4c1):
+    - Leading-column OR→SAOP on the plain Index Scan / index-only paths
+      (restrictionLeadingSAOP via orEqualitySAOP).
+    - Found and fixed (S2 wrong results, already on HEAD):
+      tryFoldBinaryOp folded `x OR NULL` / `x AND NULL` to NULL.
+      `WHERE hundred = 3 OR NULL` returned 0 of 100 rows; select-list
+      `false AND NULL` gave NULL.
+    - foldQualConstants now applies find\_duplicate\_ors' qual-context
+      constant rules (reduceQualConstArms).
+  - Residue after slice 3:
+    - Inequality OR groups.
+    - OR→SAOP behind an equality prefix on plain paths (the plain SAOP
+      carrier is leading-column only).
+    - SAOP + range bound under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - The OR path in chooseBitmapAnd.
+    - Join OR clauses.
+  - Resume: the OR path as a chooseBitmapAnd candidate (PG's clause-usage
+    redundancy check), then items (2)-(6).
+  Movement: none — regress 22 suites unchanged (the NULL-arm fix is a correctness fix; no regress case had a NULL OR arm)
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
