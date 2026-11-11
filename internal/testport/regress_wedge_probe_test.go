@@ -301,12 +301,31 @@ func writeWedgeArtifact(dir, name, content string) {
 // in which case the server logs at Debug and silently has no endpoint, and the
 // probe would have no goroutine dump exactly when it is needed.
 func reserveLoopbackPort(t *testing.T) string {
+	return reserveLoopbackPortExcept(t, "")
+}
+
+// reserveLoopbackPortExcept is reserveLoopbackPort that never returns avoid
+// (an address already promised to someone else). Both this helper and
+// cluster.New's freePort pick a port by binding :0 and closing the socket,
+// so the kernel may hand the same ephemeral port out twice: the nightly of
+// 2026-11-12 (AI-20261112-000028-001) started a RegressSuite cluster whose
+// pprof endpoint took 127.0.0.1:45851 and whose own listener then failed
+// "bind: address already in use" on that same port. Callers pass the
+// cluster's ListenAddr, reserving the pprof port AFTER the cluster has its
+// own.
+func reserveLoopbackPortExcept(t *testing.T, avoid string) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve loopback port: %v", err)
+	for attempt := 0; attempt < 16; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve loopback port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		if addr != avoid {
+			return addr
+		}
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatalf("reserve loopback port: kept getting %s", avoid)
+	return ""
 }

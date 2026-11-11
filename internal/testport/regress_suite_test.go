@@ -55,10 +55,11 @@ func TestPort_RegressSuite(t *testing.T) {
 	// goroutine dump. The server's built-in default is a fixed 127.0.0.1:6060,
 	// which a bench cluster or a peer test may already hold — the bind then
 	// fails at Debug level and the endpoint silently does not exist.
-	pprofAddr := reserveLoopbackPort(t)
-	t.Setenv("GOOPG_PPROF_ADDR", pprofAddr)
-
 	c := newCluster(t, "regress_suite")
+	// Reserved after the cluster has its listen port, and never that port
+	// (AI-20261112-000028-001): GOOPG_PPROF_ADDR is read at server start.
+	pprofAddr := reserveLoopbackPortExcept(t, c.ListenAddr())
+	t.Setenv("GOOPG_PPROF_ADDR", pprofAddr)
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
