@@ -12118,6 +12118,12 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
     - Still open in c3a1: BitmapOr over OR clauses, a bitmap range behind
       an equality prefix, duplicate NullTests, backward scans, WHERE order,
       Recheck Cond literal type labels (`'TVAAAA'::name`).
+  - `name` literal labels LANDED (2026-11-12, 8cc9a4e51): Filter / Recheck
+    Cond print `'TVAAAA'::name` (implicit CastExpr to name). Regress select
+    270→256. Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99 (plan
+    shapes identical), acceptance 24 MATCH.
+    - Still open: Index Cond keys print literals without the column type's
+      label (formatIndexCondKey has no column type).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes

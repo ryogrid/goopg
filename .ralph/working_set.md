@@ -1,25 +1,24 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #14: census IDENTICAL; c3a1 literal-key Recheck Cond landed)
+# Working Set — loop end 2026-11-12 (run-2 loop #15: census IDENTICAL; c3a1 name literal labels landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 49bbd0613 → routing-20261112a (label s9bl, BASELINE_REV=edf954c49) IDENTICAL ×3. a78d7dd43 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 8ac73493e, the head routing-20261112a consumed.
-- Nightly 20261112-000028: AI-20261112-000028-001 already filed and fixed (b1928e91c). action-items unchanged since.
+- S9: DUE after a78d7dd43 → routing-20261112b (label s9bm, BASELINE_REV=8ac73493e) IDENTICAL ×3. 8cc9a4e51 touches internal/executor (EXPLAIN only); run `scripts/s9-census-due.sh` next loop and obey it. If DUE, BASELINE_REV = a56b50e03, the head routing-20261112b consumed.
 - Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS.
-  - Landed: bitmap NullTest (49bbd0613); exact literal bitmap keys join the Recheck Cond (a78d7dd43).
-- Files (a78d7dd43): optimizer/pathbitmap.go (matchBitmapIndexQuals takes cat, sets local after restrictionKeyUsable), pathindexrestrict_test.go (caller); design doc section + README.
-- Key symbols: matchBitmapIndexQuals, restrictionKeyUsable, createBitmapHeapScanPlan (recheck list from `local`).
+  - Landed: 49bbd0613 bitmap NullTest; a78d7dd43 literal-key Recheck Cond; 8cc9a4e51 `name` literal labels in Filter/Recheck Cond.
+- Files (8cc9a4e51): executor/operators_explain.go (CastExpr arm labels StringConst→name; coerceLiteralText name arm), explain_coerced_literal_test.go (+2 cases); design doc section.
+- Key symbols: formatExprQual CastExpr arm, coerceLiteralText, formatIndexCondKey (next).
 - Findings:
-  - Fire-set fires=none, so the corpora have no literal-key bitmap whose text changed.
-  - Regress: Recheck Cond lines now match PG's in create_index/subselect hunks.
-  - Remaining gaps there: BitmapOr shapes (absent in goopg), and literal type labels in Recheck Cond (`'TVAAAA'::name`).
-- Next step: S9 due-check. Then continue c3a1.
-  - Smallest PG-visible item next: the Recheck Cond literal type label. Find how Filter / Index Cond render typed StringConst (e.g. `::name`) and apply it in the BitmapHeapScan Recheck Cond arm (operators_explain.go `case *optimizer.BitmapHeapScan`).
-  - Then a bitmap range behind an equality prefix.
-  - BitmapOr (generate_bitmap_or_paths) is large; file it as its own child c3a2 when c3a1 closes.
+  - The planner wraps a literal compared with a name column in an implicit CastExpr; the renderer hid implicit casts.
+  - Index Cond keys go through formatIndexCondKey without the column type, so no labels (bpchar/text/name).
+- Next step: S9 due-check. Then continue c3a1 with Index Cond literal labels.
+  - Pass the key column's catalog.Type into formatIndexCondPartsPrefixed / formatIndexCondKey (the index's Table is on IndexScan/BitmapIndexScan) and label literal keys via coerceLiteralText.
+  - Check the fire-set and census: TPC-DS Index Conds with string/date literal keys may change text, which census and PG parity then judge.
+  - Remaining after that: BitmapOr (file as its own child), a bitmap prefix range, duplicate NullTests, backward scans, WHERE order.
 - Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112a exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112b exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for a78d7dd43):
-  - PASS: units, TestPort_RegressSuite + PgDump (392 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set lkfs fires=none ×3.
-  - Regress 16 suites vs HEAD worktree: subselect −25, create_index +2 (BitmapOr neighbours), rest unchanged.
-- In-flight: none. Scratch PG 5545 and goopg 5533 stopped; tmp/wt-head removed.
+- Gates run (staged code_tree for 8cc9a4e51):
+  - PASS: units, TestPort_RegressSuite + PgDump (345 s), tpch-spotcheck, sf025 99/99 (plan-shape 99 same), acceptance 24 MATCH.
+  - Fire-set not required (internal/executor).
+  - Regress: select −14, create_index −1, join −5 (variance), subselect/btree_index unchanged.
+- In-flight: none.
