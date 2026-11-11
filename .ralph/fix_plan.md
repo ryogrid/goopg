@@ -12186,6 +12186,30 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - Resume: the SAOP-grouped arm (needs a bitmap SAOP carrier — see the
     P2-09b note in the matchBitmapIndexQuals header), then items (2)-(6).
   Movement: yes — regress create\_index 3286→3271, join 17792→17724 (subselect 2452→2462: goopg's own VALUES→OR rewrite now plans a BitmapOr)
+  - 2026-11-12 slice 2 LANDED (21f23375c):
+    - Bitmap ScalarArrayOp carrier (BitmapIndexScan.SAOPKeys behind the
+      equality Keys): IN conjuncts, and same-column ORs via
+      match\_orclause\_to\_indexcol.
+    - PG 18 group\_similar\_or\_args (Nested sub-OR) and
+      make\_bitmap\_paths\_for\_or\_group, joint vs split compared by
+      IndexPath total\_cost.
+    - A verbatim predicate\_implied\_by\_recurse port for the Filter
+      split.
+    - Probe against PG: 7 of 10 plans identical; values identical, exact
+      and lossy.
+  - Residue after slice 2:
+    - Inequality OR groups (`< ANY`); these ORs are declined.
+    - Plain/IOS-path OR→SAOP (PG: an Index Scan for `thousand = 42 AND
+      (tenthous IN-like OR)`).
+    - SAOP + range bound under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - The OR path inside chooseBitmapAnd (PG: BitmapAnd(hundred,
+      BitmapOr)).
+    - Join OR clauses.
+  - Resume: the OR path as a chooseBitmapAnd candidate (needs a
+    Children\[0\].IndexInfo-free redundancy check: PG's
+    PathClauseUsage), or plain-path OR→SAOP; then items (2)-(6).
+  Movement: yes — regress create\_index 3271→3235, join 17724→17655
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
