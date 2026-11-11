@@ -1391,6 +1391,15 @@ heuristic stays live.)
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro returns PG's rows after
     two restarts\)\.
 
+- [x] **M\-NIGHTLY\-regress\-pprof\-port — testport/TestPort\_RegressSuite cluster start failed "bind: address already in use": the pprof endpoint took the server's own listen port** \(AI\-20261112\-000028\-001; repro: `go test \-v \-run '^TestPort\_RegressSuite$' \./internal/testport/`\)\.
+  Kind: impl
+  Parent: none
+  - Both ports were picked by bind\-to\-:0\-then\-close (reserveLoopbackPort before newCluster, cluster.New's freePort), so the
+    kernel handed 127\.0\.0\.1:45851 out twice; the server's pprof endpoint bound it first\.
+  - Fixed in `b1928e91c`: reserveLoopbackPortExcept runs after newCluster and excludes c\.ListenAddr\(\) \(RegressSuite and
+    RegressWedgeProbe\); TestPort\_RegressSuite \+ RegressWedgeProbe PASS\.
+  Movement: none — test\-only \(harness port allocation\)\.
+
 - [ ] **P0\-E25 — after a server restart, columns of user\-defined types \(enum, composite, domain\) reload as `text`**
   \(filed 2026\-11\-04 by the loop, found while probing M0148\-0001j2; S2 — wrong results and unvalidated data\)\.
   Kind: impl
@@ -12091,6 +12100,16 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
   Cond order follows the cost-sorted leaf Filter, not baserestrictinfo
   order (`x < 5 AND x IS NOT NULL`). Resume: (1) first —
   matchBitmapIndexQuals + the bitmap executor's indexRangeSpec (nullTest).
+  - Item (1) partly LANDED (2026-11-12, 49bbd0613): the bitmap producer
+    files the NullTest on the leading column or behind its equality Keys
+    (BitmapIndexScan.LeadingNullTest; exact conjunct → Recheck Cond).
+    Bitmap Index Scan Index Cond = PG's. Gates units, RegressSuite,
+    spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set fires=none ×3.
+    - Still open in (1): BitmapOr over OR clauses (generate\_bitmap\_or\_paths
+      — the create\_index `tenthous = 1 OR … OR tenthous IS NULL` case), a
+      range behind an equality prefix under a bitmap, and a literal
+      equality key kept as a Filter instead of joining the Recheck Cond
+      (M0146-0012 narrowing).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes

@@ -1,24 +1,25 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #12: census IDENTICAL; M0148-0001c3a slice 3 landed, c3a CLOSED)
+# Working Set — loop end 2026-11-12 (run-2 loop #13: census IDENTICAL; nightly AI filed+fixed; c3a1 item 1 bitmap slice landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after f303d61c7 → routing-20261111g (label s9bj, BASELINE_REV=3218fd9eb) IDENTICAL ×3. 96d734112 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 2cc8f8598, the head routing-20261111g consumed.
-- NIGHTLY fires 00:00 (2026-11-12) and runs ~80 min. The sf025 sweep and acceptance arm refuse while it runs, and a census/fire-set beside it starves the batch. Check `pgrep -fa run-nightly`, wait it out first (`timeout 3500 bash -c 'while ps -eo args | grep -qE "[c]i/batch/(run-nightly\.sh|stages/)"; do sleep 30; done'`), then triage ci/logs/action-items.md.
-- Task: M0148-0001c3a — CLOSED (89031bbc1, f303d61c7, 96d734112). Residue filed as M0148-0001c3a1:
-  - (1) bitmap producer;
-  - (2) duplicate NullTests;
-  - (3) backward ordered scans;
-  - (4) Index Cond WHERE order.
-- Files (96d734112): optimizer/pathindexrestrict.go (restrictionNullTestOnColumn, prefixRange arm, conjunct-order helper, selectivity split), pathindexonly.go, createplanindex.go, plan.go; executor/operators_explain.go (RangePrefix branch); test nulltest_index_qual_test.go; design doc + README.
-- Key symbols: restrictionNullTestOnColumn, withNullTestInConjunctOrder, IndexScan.LeadingNullTest (the range column, behind RangePrefix too).
+- S9: DUE after 96d734112 → routing-20261111h (bba5b4d01, label s9bk, BASELINE_REV=2cc8f8598) IDENTICAL ×3. 49bbd0613 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = edf954c49, the head routing-20261111h consumed.
+- Nightly 20261112-000028: status fail, 1 item, AI-20261112-000028-001 TestPort_RegressSuite.
+  - Cause: a harness port collision (pprof endpoint and listen port both 45851, bind:0-then-close twice).
+  - Filed under M-NIGHTLY [x] and fixed in b1928e91c (reserveLoopbackPortExcept after newCluster).
+- Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS. Item (1) is partly landed in 49bbd0613: the bitmap producer, leading column or behind the equality Keys.
+- Files (49bbd0613): optimizer/plan.go (BitmapIndexScan.LeadingNullTest/NullTestAfterBounds), pathbitmap.go (buildOneBitmapPath NullTest arms), createplanbitmap.go (lowering split), executor/operators_bitmap.go (lookupBounds via indexRangeBounds, Keys as prefix), operators_explain.go (formatBitmapNullTestIndexCond), test nulltest_index_qual_test.go (bitmap case executes and compares counts); design doc + README.
+- Key symbols: buildOneBitmapPath, createBitmapIndexScanPlan, bitmapIndexScanOp.lookupBounds, formatBitmapNullTestIndexCond, restrictionNullTestOnColumn.
 - Findings:
-  - PG picks Bitmap Heap Scans for `a = 3 AND b IS [NOT] NULL` (bitmap Index Cond carries the NullTest), so c3a1 item (1) is the next parity step.
-  - The RegressSuite flakes are hash_index and index_including. Both reproduce on a HEAD worktree; a VACUUM-timing IOS choice is the likely cause.
-- Next step: after the nightly, S9 due-check, then the topmost open M0148 child in file order. That is c3a1, filed directly after c3a; check the order.
+  - PG folds the literal `a = 3` into the Recheck Cond; goopg keeps it as a Filter (M0146-0012 narrowing in matchBitmapIndexQuals). Ledger.
+  - BitmapOr (generate_bitmap_or_paths) doesn't exist in goopg.
+- Next step: S9 due-check, then continue c3a1. Choose the smallest PG-visible item:
+  - (2) duplicate NullTests: return all NullTests per column; IndexScan/IOS/BitmapIndexScan carry a list; contradiction = empty scan.
+  - Or the literal-key Recheck Cond (matchBitmapIndexQuals: set `local` after restrictionKeyUsable), which needs a fire-set check since it changes every literal-key bitmap's rendering.
+  - BitmapOr is the largest; consider filing it as its own child.
 - Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261111g exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0 (last run 20261111-165815). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 96d734112):
-  - PASS: units, TestPort_RegressSuite (2nd run 458 s; 1st run hash_index/index_including flaked, same diff on HEAD), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3dfs fires=none ×3.
-  - Regress subset: create_index/btree_index/select/partition_prune unchanged; join and inherit moved on parallel-plan variance.
+  - Items 0-9: M0146-0014(channel; census routing-20261111h exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); tonight's AI-20261112-000028-001 is filed and fixed. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
+- Gates run:
+  - 49bbd0613: PASS units, TestPort_RegressSuite + RegressWedgeProbe, tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3a1fs fires=none ×3. Regress create_index/btree_index/select hunk-identical.
+  - The first spotcheck/arm stamps were FAIL only because the testport fix was unstaged; they PASSed after b1928e91c.
 - In-flight: none. Scratch PG 5545 and goopg 5533 stopped.
