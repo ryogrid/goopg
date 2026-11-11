@@ -1,7 +1,7 @@
 # M0148\-0001j4 — one OID counter for routines, relations and types; user type OIDs in pg\_proc
 
-**Parent:** M0148\-0001j3 · **Status:** items (1) to (3b) landed
-2026\-11\-11; the task stays open for items (4) and (5)
+**Parent:** M0148\-0001j3 · **Status:** items (1) to (4) landed
+2026\-11\-11; the task stays open for item (5)
 
 ## Divergence
 
@@ -249,12 +249,53 @@ PG 18.3 returns 5, 5, 7 and 5 for these calls. Regress rangefuncs
 - **Regress.** typed\_table 131 → 117. create\_table, create\_type and
   alter\_table are unchanged.
 
+## Item (4): grouping sets that no path can implement
+
+- **Divergence.** Regress groupingsets has two failure cases, over the
+  table `gstest4(…, unhashable_col bit(4), unsortable_col xid)`:
+  - `GROUP BY ROLLUP(unhashable_col, unsortable_col)`;
+  - `array_agg(v ORDER BY v) … GROUPING SETS ((id, unsortable_col), (id))`.
+
+  PG 18.3 fails both with 0A000 `could not implement GROUP BY`, DETAIL
+  `Some of the datatypes only support hashing, while others only support
+  sorting.` goopg returned rows for both.
+- **PG mechanism.**
+  - **Parse analysis.** `get_sort_group_operators` gives each SortGroupClause
+    a sort operator only if the type has a default btree opclass, and
+    marks it hashable only if the type has a default hash opclass.
+  - **`preprocess_grouping_sets`.** A set that contains an unsortable column
+    can only be hashed, so it must not also contain an unhashable column;
+    otherwise it errors.
+  - **`create_grouping_paths`.** Hashing is allowed only when
+    `numOrderedAggs == 0`, so an unsortable set beside an ordered or
+    DISTINCT aggregate leaves `pathlist` empty, which is the same error.
+- **Change** (internal/optimizer/groupingsets\_sortability.go):
+  - The one\-sided built\-in types come from pg\_opclass.dat's default
+    opclasses:
+    - unhashable: `bit`, `varbit`, `money`, `tsquery`, `tsvector`;
+    - unsortable: `xid`, `cid`, `aclitem`.
+  - `checkGroupingSetsImplementable` raises PG's error from
+    `createGroupingPaths` for both cases.
+  - The existing "no path" 0A000 gets the same DETAIL and no position.
+- **Tests.** `TestGroupingSetsUnsortableColumns` covers both errors. It also
+  checks that hashing the unsortable set (no ordered aggregate) and an
+  ordered aggregate over sortable sets still run.
+- **Regress.** groupingsets 1523 → 1472, exactly those two hunks.
+  aggregates still passes.
+- **Remaining** (ledger):
+  - sortability does not yet steer path choice: a set with an unsortable
+    column still gets a sorted rollup candidate, and an unhashable one a
+    hashed candidate;
+  - plain GROUP BY has no implementability check;
+  - domains over one\-sided types are not classified. Arrays already follow
+    their element type, because `catalog.Type` carries the element name
+    with `IsArray`.
+
 ## Not covered
 
 - **CREATE TABLE draws one OID; PG draws three.** PG draws the relation,
   its row type and the row type's array type. goopg's tables
   (`a`=16406, `b`=16408) draw one each. Absolute OIDs therefore drift from
   PG's, but the relative order of objects is now PG's. Ledger row.
-- **j4 items (4) and (5) are still open:**
-  - grouping sets that hash an ordered aggregate;
+- **j4 item (5) is still open:**
   - view `_RETURN` type dependencies.

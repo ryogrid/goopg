@@ -65,6 +65,9 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, having Expr, cat cata
 	if aggNode.Mode != AggModeSimple {
 		return aggNode, nil
 	}
+	if err := checkGroupingSetsImplementable(aggNode); err != nil {
+		return nil, err
+	}
 	cp := ps.costParams()
 	grouped := fetchUpperRel(u, UpperGroupAgg, 0, tupleFraction)
 	sizeGroupingRelFromAgg(grouped, aggNode)
@@ -147,8 +150,7 @@ func createGroupingPaths(u *upperRels, aggNode *Aggregate, having Expr, cat cata
 
 	best := getCheapestFractionalPath(grouped, tupleFraction)
 	if best == nil {
-		return nil, &PlanError{Pos: aggNode.Pos(), Code: "0A000",
-			Message: "could not implement GROUP BY"}
+		return nil, errCouldNotImplementGroupBy()
 	}
 	node, _ := createPlanNode(best)
 	built, ok := node.(*Aggregate)
