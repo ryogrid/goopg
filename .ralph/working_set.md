@@ -1,24 +1,23 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #15: census IDENTICAL; c3a1 name literal labels landed)
+# Working Set — loop end 2026-11-12 (run-2 loop #16: census IDENTICAL; c3a1 Index Cond literal labels landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after a78d7dd43 → routing-20261112b (label s9bm, BASELINE_REV=8ac73493e) IDENTICAL ×3. 8cc9a4e51 touches internal/executor (EXPLAIN only); run `scripts/s9-census-due.sh` next loop and obey it. If DUE, BASELINE_REV = a56b50e03, the head routing-20261112b consumed.
+- S9: DUE after 8cc9a4e51 → routing-20261112c (label s9bn, BASELINE_REV=a56b50e03) IDENTICAL ×3. 4092290f9 touches internal/executor (EXPLAIN only); run `scripts/s9-census-due.sh` next loop and obey it. If DUE, BASELINE_REV = 079d14643, the head routing-20261112c consumed.
 - Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS.
-  - Landed: 49bbd0613 bitmap NullTest; a78d7dd43 literal-key Recheck Cond; 8cc9a4e51 `name` literal labels in Filter/Recheck Cond.
-- Files (8cc9a4e51): executor/operators_explain.go (CastExpr arm labels StringConst→name; coerceLiteralText name arm), explain_coerced_literal_test.go (+2 cases); design doc section.
-- Key symbols: formatExprQual CastExpr arm, coerceLiteralText, formatIndexCondKey (next).
+  - Landed: 49bbd0613 bitmap NullTest; a78d7dd43 literal-key Recheck Cond; 8cc9a4e51 name labels in Filter/Recheck; 4092290f9 Index Cond literal labels.
+- Files (4092290f9): executor/operators_explain.go (indexKeyColumnType, formatIndexCondKeyTyped, threaded through IndexScan/IOS/Bitmap/NullTest Index Cond builders; formatIndexCondPartsPrefixed and formatNullTestIndexCond take the table), explain_coerced_literal_test.go (TestIndexCondLiteralPrintsAsCoercedConst); design doc section.
+- Key symbols: formatIndexCondKeyTyped, indexKeyColumnType, coerceLiteralText, coercibleLiteral.
 - Findings:
-  - The planner wraps a literal compared with a name column in an implicit CastExpr; the renderer hid implicit casts.
-  - Index Cond keys go through formatIndexCondKey without the column type, so no labels (bpchar/text/name).
-- Next step: S9 due-check. Then continue c3a1 with Index Cond literal labels.
-  - Pass the key column's catalog.Type into formatIndexCondPartsPrefixed / formatIndexCondKey (the index's Table is on IndexScan/BitmapIndexScan) and label literal keys via coerceLiteralText.
-  - Check the fire-set and census: TPC-DS Index Conds with string/date literal keys may change text, which census and PG parity then judge.
-  - Remaining after that: BitmapOr (file as its own child), a bitmap prefix range, duplicate NullTests, backward scans, WHERE order.
+  - The corpora's only literal Index Conds are SAOP arrays (a separate path), so their plan text didn't move.
+  - varchar needs a column-side `(v)::text` (ledger).
+- Next step: S9 due-check. Then decide on c3a1.
+  - Remaining items: varchar Index Cond cast; bitmap range behind prefix; BitmapOr (large); duplicate NullTests; backward scans; WHERE order.
+  - Suggest closing c3a1 now. File BitmapOr + backward scans + duplicates + WHERE order + varchar + bitmap prefix range as residue child c3a2 (j-series pattern), then take the next M0148 child in file order (c3b).
 - Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112b exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112c exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 8cc9a4e51):
-  - PASS: units, TestPort_RegressSuite + PgDump (345 s), tpch-spotcheck, sf025 99/99 (plan-shape 99 same), acceptance 24 MATCH.
+- Gates run (staged code_tree for 4092290f9):
+  - PASS: units, TestPort_RegressSuite + PgDump (341 s), tpch-spotcheck, sf025 99/99 (plan-shape 99 same), acceptance 24 MATCH.
   - Fire-set not required (internal/executor).
-  - Regress: select −14, create_index −1, join −5 (variance), subselect/btree_index unchanged.
-- In-flight: none.
+  - Regress: create_index −19; select/btree_index/join/subselect unchanged.
+- In-flight: none. Scratch PG 5545 stopped.

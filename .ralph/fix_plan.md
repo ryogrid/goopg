@@ -12124,6 +12124,14 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
     shapes identical), acceptance 24 MATCH.
     - Still open: Index Cond keys print literals without the column type's
       label (formatIndexCondKey has no column type).
+  - Index Cond literal labels LANDED (2026-11-12, 4092290f9): probe keys
+    print as the column-typed Const (`'TN'::bpchar`, `'5'::numeric`,
+    `'x'::name`, `'2002-05-01'::date`) on every Index Cond builder; all six
+    PG lines verified on a scratch PG 18.3. Regress create\_index
+    3305→3286. Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99
+    (plan shapes identical), acceptance 24 MATCH.
+    - Still open: varchar keys (PG `((v)::text = 'x'::text)`, column-side
+      cast).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes
