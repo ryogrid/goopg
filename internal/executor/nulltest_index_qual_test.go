@@ -1,13 +1,17 @@
 package executor
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestNullTestIndexQual pins M0148-0001c3a slices 1 and 2: a `col IS [NOT] NULL`
+// TestNullTestIndexQual pins M0148-0001c3a slices 1-3: a `col IS [NOT] NULL`
 // conjunct on an index's leading column is an index qual (PG's
 // match_clause_to_indexcol NullTest arm; btree amsearchnulls), executed as
 // SK_SEARCHNULL / SK_SEARCHNOTNULL bounds at the column's NULL group. Every
@@ -88,6 +92,80 @@ func TestNullTestIndexQual(t *testing.T) {
 	same("ios is-null count", "SELECT count(*) FROM ntq WHERE a IS NULL", "SELECT count(*) FROM ntq WHERE (a + 0) IS NULL")
 	same("ios not-null count", "SELECT count(*) FROM ntq WHERE a IS NOT NULL", "SELECT count(*) FROM ntq WHERE (a + 0) IS NOT NULL")
 	same("ios not-null range", "SELECT a FROM ntq WHERE a IS NOT NULL AND a < 5", "SELECT a FROM ntq WHERE (a + 0) IS NOT NULL AND a + 0 < 5")
+
+	// Slice 3: a NullTest on the column after an equality prefix, planned
+	// with bitmap and seq scans off so the plain index probe is exercised.
+	runSQL(t, ctx, "DROP INDEX IF EXISTS ntq_a")
+	runSQL(t, ctx, "CREATE INDEX ntq_ba ON ntq (b, a)")
+	runSQL(t, ctx, "ANALYZE ntq")
+	prefixPlan := func(q string) (*optimizer.IndexScan, []string) {
+		t.Helper()
+		stmts, err := parser.Parse(q)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", q, err)
+		}
+		ps := optimizer.DefaultPlannerSettings()
+		ps.EnableSeqScan, ps.EnableBitmapScan = false, false
+		advanceStmtCounter(ctx)
+		plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+		if err != nil {
+			t.Fatalf("Plan(%q): %v", q, err)
+		}
+		var is *optimizer.IndexScan
+		for n := plan; n != nil && is == nil; {
+			switch v := n.(type) {
+			case *optimizer.IndexScan:
+				is = v
+			case *optimizer.Project:
+				n = v.Child
+			case *optimizer.Filter:
+				n = v.Child
+			default:
+				n = nil
+			}
+		}
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatalf("Build(%q): %v", q, err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("Open(%q): %v", q, err)
+		}
+		defer op.Close()
+		var rows []string
+		for {
+			slot, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Next(%q): %v", q, err)
+			}
+			rows = append(rows, fmt.Sprint(slot.Materialize()))
+		}
+		sort.Strings(rows)
+		return is, rows
+	}
+	for _, tc := range []struct{ q, twin, cond string }{
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NULL", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NULL", "((b = 3) AND (a IS NULL))"},
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NOT NULL", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NOT NULL", "((b = 3) AND (a IS NOT NULL))"},
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NOT NULL AND a < 300", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NOT NULL AND a + 0 < 300", "((b = 3) AND (a IS NOT NULL) AND (a < 300))"},
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NULL AND a > 5", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NULL AND a + 0 > 5", ""},
+	} {
+		is, got := prefixPlan(tc.q)
+		if is == nil || len(is.RangePrefix) != 1 || is.LeadingNullTest == optimizer.IndexNullTestNone {
+			t.Errorf("%s: no prefix NullTest index probe (%+v)", tc.q, is)
+			continue
+		}
+		if tc.cond != "" {
+			if c := formatIndexCond(is, nil); c != tc.cond {
+				t.Errorf("%s: Index Cond %q, want %q", tc.q, c, tc.cond)
+			}
+		}
+		if want := sortedRowStrings(t, ctx, tc.twin); len(got) != len(want) {
+			t.Errorf("%s: %d rows through the prefix probe, twin %d", tc.q, len(got), len(want))
+		}
+	}
 
 	// Without NULL-keyed entries IS NULL cannot be an index qual.
 	catalog.SetNullKeyedIndexEntries(false)

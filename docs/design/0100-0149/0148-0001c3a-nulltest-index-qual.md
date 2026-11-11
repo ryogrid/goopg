@@ -1,8 +1,8 @@
 # M0148\-0001c3a — `col IS [NOT] NULL` as a btree index qual
 
-**Parent:** M0148\-0001c3 · **Status:** slices 1 and 2 landed 2026\-11\-11
-(plain and index\-only scans, leading column); open for the bitmap and
-behind\-equality producers
+**Parent:** M0148\-0001c3 · **Status:** slices 1 to 3 landed 2026\-11\-11
+(plain and index\-only scans, leading column, behind an equality prefix);
+closed — residue in M0148\-0001c3a1
 
 ## Divergence
 
@@ -105,7 +105,40 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
 - **Gates.** units, `TestPort_RegressSuite`, tpch\-spotcheck, sf025 99/99,
   acceptance 24 MATCH, fire\-set `fires=none` on all three corpora.
 
-## Not covered (still under M0148\-0001c3a)
+## Slice 3: a NullTest behind an equality prefix
+
+- **Shape.** `a = 3 AND b IS NULL` on `(a, b)`. PG's Index Cond is
+  `((a = 3) AND (b IS NULL))`.
+- **Producer.** `restrictionNullTestOnColumn` generalises the leading
+  NullTest to column n, the one after the equality prefix.
+  `addOneRestrictionIndexPath` files it beside that column's range bounds
+  (the `prefixRange` arm).
+- **Exact, unlike bounds.** Range bounds behind a prefix keep a Filter
+  recheck: an open bound runs past the NULL\-keyed entries. A NullTest bound
+  is exact, because IS NULL probes `[prefix, NULL]` and IS NOT NULL stops at
+  it in `indexRangeBounds`. So its conjunct leaves the Filter.
+- **Lowering and rendering.** `createRangeIndexScanPlan` puts it on
+  `IndexScan.LeadingNullTest`, which now means the range column
+  `Columns[len(RangePrefix)]`. EXPLAIN prints it in the RangePrefix form.
+- **Index\-only.** `plainRestrictionBindsOnlyPrefix` treats it as a
+  non\-prefix clause, so the plain path keeps the shape; IndexOnlyScan has
+  no RangePrefix.
+- **Order.** `withNullTestInConjunctOrder` finds a prefixed bound's source
+  conjunct by key identity, since such bounds carry no `local`.
+- **Probe vs PG.** Row counts identical. PG chooses a Bitmap Heap Scan for
+  these shapes, whose bitmap Index Cond carries the NullTest; goopg's bitmap
+  producer does not yet (c3a1).
+- **Tests.** `TestNullTestIndexQual` plans with bitmap and seq scans off and
+  checks the probe and Index Cond text, plus row counts against twins for
+  IS NULL, IS NOT NULL, IS NOT NULL with a bound, and IS NULL beside a bound
+  (empty).
+- **Gates.** units, `TestPort_RegressSuite`, tpch\-spotcheck, sf025 99/99,
+  acceptance 24 MATCH, fire\-set `fires=none` on all three corpora.
+  - The first RegressSuite run failed `hash_index` and `index_including`.
+  - The same diff appeared on a HEAD worktree (VACUUM\-timing\-dependent
+    index\-only choice), and the re\-run passed.
+
+## Not covered (M0148\-0001c3a1)
 
 - **Duplicated or contradictory NullTests on one column**
   (`unique1 IS NULL AND unique1 IS NULL`, regress create\_index). Only the
@@ -117,10 +150,11 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
   `IndexScanDir`), so goopg sorts.
 - **min/max rewrite.** Its `IndexOnlyScan.Cond` prints an `Index Cond` but
   is a residual per index row, not a scan key.
-- **Bitmap producer.** `Index Cond: ((thousand = 42) AND (tenthous IS NULL))`
-  under a BitmapOr.
-- **A NullTest behind an equality prefix** (`a = 1 AND b IS NULL`), or beside
-  an equality on the same column.
+- **Bitmap producer.** For example `Index Cond: ((thousand = 42) AND
+  (tenthous IS NULL))` under a BitmapOr in regress create\_index. PG
+  prefers bitmap scans for the behind\-prefix shapes, so their plans still
+  differ until the bitmap producer carries the NullTest.
+- **A NullTest beside an equality on the same column.**
 - **Index Cond order.** goopg's leaf Filter is already cost\-sorted
   (order\_qual\_clauses puts the NullTest first), so `x < 5 AND x IS NOT
   NULL` prints the NullTest first, where PG keeps WHERE order.

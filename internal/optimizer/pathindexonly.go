@@ -271,7 +271,8 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 // lowering does not carry yet (ledgered); the plain path keeps those.
 func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, n int) bool {
 	if n > 0 {
-		return n >= len(idx.Columns) || len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0
+		return n >= len(idx.Columns) || (len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 &&
+			restrictionNullTestOnColumn(idx, n, conjuncts) == nil)
 	}
 	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 ||
 		restrictionLeadingNullTest(idx, conjuncts) != nil {

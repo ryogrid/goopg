@@ -3838,6 +3838,17 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 			parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
 		}
 		col := prefix + p.Index.Columns[np]
+		// M0148-0001c3a slice 3: the NullTest on the column after the prefix.
+		nt := ""
+		if p.LeadingNullTest != optimizer.IndexNullTestNone {
+			nt = col + " IS NULL"
+			if p.LeadingNullTest == optimizer.IndexNullTestIsNotNull {
+				nt = col + " IS NOT NULL"
+			}
+		}
+		if nt != "" && !p.NullTestAfterBounds {
+			parts = append(parts, nt)
+		}
 		if p.LowKey != nil {
 			op := ">="
 			if p.LowOp == parser.OpGt {
@@ -3851,6 +3862,9 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 				op = "<"
 			}
 			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.HighKey, reg))
+		}
+		if nt != "" && p.NullTestAfterBounds {
+			parts = append(parts, nt)
 		}
 		return indexCondAndText(parts)
 	}

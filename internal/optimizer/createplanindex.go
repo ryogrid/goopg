@@ -663,10 +663,11 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 	}
 	for i, c := range p.IndexClauses[len(prefix):] {
 		if c.nullTest != IndexNullTestNone {
-			// M0148-0001c3a: the leading column's NullTest index qual —
-			// never behind an equality prefix (restrictionLeadingNullTest
-			// only runs when nothing else bound the column).
-			if len(prefix) > 0 || c.indexCol != 0 || is.LeadingNullTest != IndexNullTestNone {
+			// M0148-0001c3a: the NullTest index qual on the range column —
+			// the leading one, or (slice 3) the column after the equality
+			// prefix. It is exact either way, so its conjunct leaves the
+			// Filter.
+			if c.indexCol != len(prefix) || is.LeadingNullTest != IndexNullTestNone {
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
 			}
 			is.LeadingNullTest = c.nullTest

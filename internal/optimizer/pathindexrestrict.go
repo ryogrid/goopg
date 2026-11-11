@@ -342,7 +342,16 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 // non-NULL keys. The first matching conjunct wins (PG would take a duplicate
 // too; it is redundant). M0148-0001c3a.
 func restrictionLeadingNullTest(idx *catalog.Index, conjuncts []Expr) *indexPathClause {
-	if idx == nil || len(idx.Columns) == 0 || idx.Columns[0] == "" || idx.DeclaredHash {
+	return restrictionNullTestOnColumn(idx, 0, conjuncts)
+}
+
+// restrictionNullTestOnColumn is restrictionLeadingNullTest for index column
+// pos, which follows an equality prefix when pos > 0 (slice 3). Unlike a
+// range bound there, the NullTest is exact behind the prefix — IS NULL is
+// the [prefix, NULL] group and IS NOT NULL stops at it — so its conjunct
+// leaves the Filter like the leading one.
+func restrictionNullTestOnColumn(idx *catalog.Index, pos int, conjuncts []Expr) *indexPathClause {
+	if idx == nil || pos < 0 || pos >= len(idx.Columns) || idx.Columns[pos] == "" || idx.DeclaredHash {
 		return nil
 	}
 	for _, conj := range conjuncts {
@@ -351,7 +360,7 @@ func restrictionLeadingNullTest(idx *catalog.Index, conjuncts []Expr) *indexPath
 			continue
 		}
 		cr, ok := nt.Operand.(*ColumnRef)
-		if !ok || cr.Name != idx.Columns[0] {
+		if !ok || cr.Name != idx.Columns[pos] {
 			continue
 		}
 		kind := IndexNullTestIsNull
@@ -360,7 +369,7 @@ func restrictionLeadingNullTest(idx *catalog.Index, conjuncts []Expr) *indexPath
 		} else if !catalog.IndexHasNullKeyedEntries(idx) {
 			continue
 		}
-		return &indexPathClause{indexCol: 0, local: conj, nullTest: kind}
+		return &indexPathClause{indexCol: pos, local: conj, nullTest: kind}
 	}
 	return nil
 }
@@ -378,11 +387,25 @@ func withNullTestInConjunctOrder(rng []indexPathClause, nt indexPathClause, conj
 		}
 		return len(conjuncts)
 	}
+	// A bound behind an equality prefix records no `local` (it stays a
+	// Filter recheck); its source conjunct is found by key identity, as
+	// rangeIndexSelectivity does.
+	source := func(c indexPathClause) Expr {
+		if c.local != nil {
+			return c.local
+		}
+		for _, conj := range conjuncts {
+			if bin, ok := conj.(*BinaryOp); ok && c.key != nil && (bin.Left == c.key || bin.Right == c.key) {
+				return conj
+			}
+		}
+		return nil
+	}
 	ntPos := pos(nt.local)
 	out := make([]indexPathClause, 0, len(rng)+1)
 	placed := false
 	for _, c := range rng {
-		if !placed && c.local != nil && ntPos < pos(c.local) {
+		if src := source(c); !placed && src != nil && ntPos < pos(src) {
 			out = append(out, nt)
 			placed = true
 		}
@@ -530,7 +553,13 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// behind `a = 1` on `(a, b)`). The eq clauses become IndexScan.RangePrefix.
 	prefixRange := false
 	if n := len(clauses); n > 0 && n < len(idx.Columns) {
-		if rng := restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts); len(rng) > 0 {
+		rng := restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)
+		// M0148-0001c3a slice 3: a NullTest on the column after the prefix
+		// (`a = 1 AND b IS NULL`), bounded at the prefix's NULL group.
+		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
+			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		}
+		if len(rng) > 0 {
 			clauses = append(clauses, rng...)
 			prefixRange = true
 		}
@@ -601,7 +630,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	case prefixRange:
 		var eq, rng []indexPathClause
 		for _, c := range clauses {
-			if c.op == parser.OpUnknown {
+			if c.op == parser.OpUnknown && c.nullTest == IndexNullTestNone {
 				eq = append(eq, c)
 			} else {
 				rng = append(rng, c)
