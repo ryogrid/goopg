@@ -1,23 +1,19 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #16: census IDENTICAL; c3a1 Index Cond literal labels landed)
+# Working Set — loop end 2026-11-12 (run-2 loop #17: census IDENTICAL; M0148-0001c3a1 CLOSED, residue c3a2 filed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 8cc9a4e51 → routing-20261112c (label s9bn, BASELINE_REV=a56b50e03) IDENTICAL ×3. 4092290f9 touches internal/executor (EXPLAIN only); run `scripts/s9-census-due.sh` next loop and obey it. If DUE, BASELINE_REV = 079d14643, the head routing-20261112c consumed.
-- Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS.
-  - Landed: 49bbd0613 bitmap NullTest; a78d7dd43 literal-key Recheck Cond; 8cc9a4e51 name labels in Filter/Recheck; 4092290f9 Index Cond literal labels.
-- Files (4092290f9): executor/operators_explain.go (indexKeyColumnType, formatIndexCondKeyTyped, threaded through IndexScan/IOS/Bitmap/NullTest Index Cond builders; formatIndexCondPartsPrefixed and formatNullTestIndexCond take the table), explain_coerced_literal_test.go (TestIndexCondLiteralPrintsAsCoercedConst); design doc section.
-- Key symbols: formatIndexCondKeyTyped, indexKeyColumnType, coerceLiteralText, coercibleLiteral.
+- S9: DUE after 4092290f9 → routing-20261112d (label s9bo, BASELINE_REV=079d14643) IDENTICAL ×3. No code commit since, so the next loop's `scripts/s9-census-due.sh` should say REUSE; obey it.
+- Task: M0148-0001c3a1 — CLOSED (49bbd0613, a78d7dd43, 8cc9a4e51, 4092290f9). Residue filed as M0148-0001c3a2, directly after c3a1 in fix_plan.
+  - c3a2 items: BitmapOr first, then bitmap prefix range, duplicate NullTests, backward scans, WHERE order, varchar keys.
 - Findings:
-  - The corpora's only literal Index Conds are SAOP arrays (a separate path), so their plan text didn't move.
-  - varchar needs a column-side `(v)::text` (ledger).
-- Next step: S9 due-check. Then decide on c3a1.
-  - Remaining items: varchar Index Cond cast; bitmap range behind prefix; BitmapOr (large); duplicate NullTests; backward scans; WHERE order.
-  - Suggest closing c3a1 now. File BitmapOr + backward scans + duplicates + WHERE order + varchar + bitmap prefix range as residue child c3a2 (j-series pattern), then take the next M0148 child in file order (c3b).
-- Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - Regress carries 23 BitmapOr lines (create_index 11, join 8, partition_join 2, select 2) and only 1 varchar Index Cond hunk.
+- Next step: S9 due-check, then the topmost open M0148 child in file order (c3a2). Start with BitmapOr (PG generate_bitmap_or_paths, indxpath.c).
+  - Planner: for each OR restriction conjunct whose arms each match a bitmap index path, build a BitmapOr path (cost_bitmap_or_node: sum of arm costs + 100 * cpu_operator_cost * arms; selectivity = sum, capped at 1).
+  - Plan node: BitmapOr (does goopg have one already? grep optimizer/plan.go for BitmapOr / BitmapAnd).
+  - Executor: union the arms' TBMs (see BitmapAnd's intersect). Recheck Cond: the whole OR clause.
+  - Probe with regress create_index `stringu1 = 'TVAAAA' OR stringu1 = 'TVAAAB'` against the scratch PG (tmp/pgscratch-j4, port 5545).
+- Top-residual: M0148 residues. Open children: c3a2, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112c exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112d exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 4092290f9):
-  - PASS: units, TestPort_RegressSuite + PgDump (341 s), tpch-spotcheck, sf025 99/99 (plan-shape 99 same), acceptance 24 MATCH.
-  - Fire-set not required (internal/executor).
-  - Regress: create_index −19; select/btree_index/join/subselect unchanged.
-- In-flight: none. Scratch PG 5545 stopped.
+- Gates run: census routing-20261112d (fire-set s9bo fires=none ×3, IDENTICAL). No code change this loop.
+- In-flight: none.

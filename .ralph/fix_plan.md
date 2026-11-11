@@ -12081,7 +12081,7 @@ Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangef
     and index-only producers, nulltestsel, the SK\_SEARCHNULL /
     SK\_SEARCHNOTNULL executor bounds and Index Cond rendering are in place.
 Movement: none — regress line counts held (17 suites); probes vs PG identical for the leading-column and index-only shapes; corpora fires=none
-- [ ] **M0148-0001c3a1 — NullTest index quals: bitmap producer, duplicate
+- [x] **M0148-0001c3a1 — NullTest index quals: bitmap producer, duplicate
   NullTests, backward ordered scans, Index Cond WHERE order**.
   Kind: impl
   Parent: M0148-0001c3a
@@ -12132,6 +12132,32 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
     (plan shapes identical), acceptance 24 MATCH.
     - Still open: varchar keys (PG `((v)::text = 'x'::text)`, column-side
       cast).
+  - CLOSED 2026-11-12 (residue split to M0148-0001c3a2): landed the bitmap
+    NullTest (49bbd0613), exact literal bitmap keys in the Recheck Cond
+    (a78d7dd43), `name` literal labels (8cc9a4e51) and Index Cond literal
+    labels (4092290f9). Remaining items are separate producer features.
+Movement: yes — regress select 270→256, subselect 2477→2452, create\_index 3306→3286
+- [ ] **M0148-0001c3a2 — BitmapOr over OR clauses; bitmap range behind an
+  equality prefix; duplicate NullTests; backward ordered scans; Index Cond
+  WHERE order; varchar Index Cond keys**.
+  Kind: impl
+  Parent: M0148-0001c3a1
+  Residue of c3a1 (design doc
+  docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md "Not covered").
+  (1) BitmapOr — PG's generate\_bitmap\_or\_paths (indxpath.c) builds a
+  BitmapOr of per-arm bitmap index paths for an OR restriction whose every
+  arm is indexable (`thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR …)`,
+  `stringu1 = 'TVAAAA' OR stringu1 = 'TVAAAB'`); goopg has no OR arm (23
+  BitmapOr lines in regress create\_index / join / partition\_join /
+  select). (2) A range behind an equality prefix under a bitmap
+  (`a = 3 AND b IS NOT NULL AND b < 200`). (3) Duplicate / contradictory
+  NullTests on one column (only the first is an index qual). (4) Backward
+  path-based index scans (createplanindex.go refuses a non-forward
+  IndexScanDir). (5) Index Cond in baserestrictinfo (WHERE) order — the leaf
+  Filter is cost-sorted before the producers see it. (6) varchar keys:
+  PG `((v)::text = 'x'::text)`. Resume: (1) first — a BitmapOr path
+  producer in optimizer/pathbitmap.go (arms from bitmap index paths per OR
+  arm, cost_bitmap_or_node), BitmapOr plan node + executor (TBM union).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes
