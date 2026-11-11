@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); the other c3a2 items stay open
 
 ## Problem
 
@@ -160,14 +160,52 @@ partition\_join and select diffs.
   - 7 plans identical, and values identical, exact and lossy;
   - the 3 differences are listed below.
 
+## Slice 3 — plain\-path OR→SAOP and NULL arms in quals
+
+- **OR→SAOP on plain paths:** `restrictionLeadingSAOP`, shared by the plain
+  Index Scan and index\-only producers, accepts an OR of equalities on the
+  index's leading column. This is match\_orclause\_to\_indexcol outside
+  bitmaps, through the shared `orEqualitySAOP`.
+  - The OR is the probe's exact recheck and leaves the Filter.
+  - It is priced as the ScalarArrayOp it becomes (`saopPricedClause`).
+  - Hash indexes are skipped.
+  - With bitmap scans off, PG 18.3 and goopg both plan `unique2 = 3 OR
+    unique2 = 7` as `Index Scan … Index Cond: (unique2 = ANY
+    ('{3,7}'::integer[]))`.
+- **Defect found and fixed \(wrong results, already on HEAD\):**
+  `tryFoldBinaryOp` folded `x OR NULL` and `x AND NULL` to NULL. The
+  generic "a NULL operand makes the result NULL" rule caught AND / OR too,
+  despite its own comment.
+  - `WHERE hundred = 3 OR NULL` planned as `One\-Time Filter: false` and
+    returned 0 of 100 rows.
+  - A select\-list `false AND NULL` gave NULL, not false.
+  - AND / OR now keep a NULL arm beside a non\-constant one, as PG's
+    simplify\_or\_arguments / simplify\_and\_arguments do.
+- **Qual reduction:** `reduceQualConstArms`, applied by `foldQualConstants`,
+  the qual\-context fold, is find\_duplicate\_ors' constant handling with
+  is\_check = false.
+  - An OR drops FALSE and NULL arms; a TRUE arm makes it TRUE.
+  - An AND drops TRUE arms; a FALSE or NULL arm makes it FALSE.
+  - So `3 = unique2 OR unique2 = 7 OR unique2 = NULL` becomes the
+    two\-element SAOP PG plans.
+- **Verification:**
+  - `TestOrEqualitiesAsIndexSAOP` covers the plan, six NULL\-arm row counts
+    and the select\-list values; it fails without the fold fix.
+  - Regress over 22 suites \(the 16 plus boolean, case, predicate,
+    aggregates, select\_distinct, select\_having\): unchanged against the
+    HEAD baselines.
+  - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
+    acceptance 24 MATCH.
+
 ## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
 
 - **Inequality groups:** `col < ANY (…)` and the like. PG matches the group
   as one SAOP; goopg declines the whole OR, because its probe is
   equality\-only.
-- **OR→SAOP for plain and index\-only paths:** match\_orclause\_to\_indexcol
-  outside bitmaps. PG plans `thousand = 42 AND (tenthous = 1 OR tenthous =
-  3 OR tenthous = 42)` as an Index Scan with the SAOP; goopg uses a bitmap.
+- **OR→SAOP behind an equality prefix on plain paths:** the plain Index
+  Scan's SAOP carrier is leading\-column only. PG plans `thousand = 42 AND
+  (tenthous = 1 OR tenthous = 3 OR tenthous = 42)` as an Index Scan with
+  `((thousand = 42) AND (tenthous = ANY (…)))`; goopg uses a bitmap.
 - **SAOP followed by a range bound on the next column, under a bitmap:**
   `(thousand = ANY (…)) AND (tenthous > 500)`. The bound stays a Filter.
 - **`TestSAOPWithConjunctMoves` fixture:** the catalog\-only fixture prices

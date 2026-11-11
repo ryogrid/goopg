@@ -252,3 +252,71 @@ func TestBitmapOrOverOrClauses(t *testing.T) {
 		}
 	}
 }
+
+// TestOrEqualitiesAsIndexSAOP pins M0148-0001c3a2's plain-path
+// match_orclause_to_indexcol: an OR of equalities on an index's leading
+// column is the Index Scan's ScalarArrayOp qual (PG 18.3 with bitmap scans
+// off: `Index Cond: (unique2 = ANY ('{3,7}'::integer[]))`). It also pins the
+// qual-context NULL arm rules of find_duplicate_ors, which a NULL arm used to
+// break: `x OR NULL` folded to NULL, so `WHERE hundred = 3 OR NULL` planned as
+// `One-Time Filter: false` and returned nothing.
+func TestOrEqualitiesAsIndexSAOP(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE t2 (unique1 int NOT NULL, unique2 int NOT NULL, hundred int NOT NULL)")
+	runSQL(t, ctx, "INSERT INTO t2 SELECT g, (g*7919)%10000, g%100 FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX t2_u2 ON t2 (unique2)")
+	runSQL(t, ctx, "CREATE INDEX t2_h ON t2 (hundred)")
+	runSQL(t, ctx, "ANALYZE t2")
+
+	stmts, err := parser.Parse("SELECT * FROM t2 WHERE unique2 = 3 OR 7 = unique2 OR unique2 = NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := optimizer.DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	advanceStmtCounter(ctx)
+	plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var is *optimizer.IndexScan
+	for n := plan; n != nil && is == nil; {
+		switch v := n.(type) {
+		case *optimizer.IndexScan:
+			is = v
+		case *optimizer.Project:
+			n = v.Child
+		case *optimizer.Filter:
+			t.Errorf("the OR stayed a Filter (%s); it is the index qual's exact recheck", formatExprQual(v.Predicate, nil, false))
+			n = v.Child
+		default:
+			n = nil
+		}
+	}
+	if is == nil || len(is.SAOPKeys) != 2 {
+		t.Fatalf("want an Index Scan with a 2-element SAOP (the NULL arm dropped), got %T %+v", plan, is)
+	}
+
+	for _, c := range []struct {
+		q    string
+		want int
+	}{
+		{"SELECT * FROM t2 WHERE unique2 = 3 OR 7 = unique2 OR unique2 = NULL", 2},
+		{"SELECT * FROM t2 WHERE hundred = 3 OR NULL", 100},
+		{"SELECT * FROM t2 WHERE NULL OR hundred = 3", 100},
+		{"SELECT * FROM t2 WHERE hundred = 3 AND NULL", 0},
+		{"SELECT * FROM t2 WHERE NOT (hundred = 3 AND NULL)", 9900},
+		{"SELECT * FROM t2 WHERE NOT (hundred = 3 OR NULL)", 0},
+	} {
+		if got := len(sortedRowStrings(t, ctx, c.q)); got != c.want {
+			t.Errorf("%s: %d rows, want %d (PG 18.3)", c.q, got, c.want)
+		}
+	}
+	// Outside a qual NULL is not FALSE: `x OR NULL` is TRUE or NULL,
+	// `x AND NULL` FALSE or NULL.
+	got := sortedRowStrings(t, ctx, "SELECT unique1, (unique1 = 1) OR NULL, (unique1 = 1) AND NULL FROM t2 WHERE unique1 IN (1, 2)")
+	if want := []string{"1,1,NULL", "2,NULL,0"}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("select-list AND/OR with NULL: got %v, want %v", got, want)
+	}
+}

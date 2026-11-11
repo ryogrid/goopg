@@ -135,6 +135,51 @@ func keyTypeTag(e Expr) string {
 	return fmt.Sprintf("%T", e)
 }
 
+// orEqualitySAOP is match_orclause_to_indexcol's conversion (indxpath.c): an
+// OR whose every arm is `col = const` on the named column becomes the
+// ScalarArrayOp `col = ANY ('{…}')`, returned as the IN it is priced as
+// (scalararraysel, which btcostestimate applies to the converted qual). The
+// constants must be keys the btree encoder takes exactly
+// (restrictionKeyUsable), so the OR itself is the probe's exact recheck.
+// M0148-0001c3a2.
+func orEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, conj Expr) (*InExpr, bool) {
+	bin, ok := conj.(*BinaryOp)
+	if !ok || bin.Op != parser.OpOr {
+		return nil, false
+	}
+	var cr *ColumnRef
+	var elems []Expr
+	for _, arm := range flattenExprOr(conj) {
+		ab, ok := arm.(*BinaryOp)
+		if !ok || ab.Op != parser.OpEq {
+			return nil, false
+		}
+		c, val, _, ok := normalizeColumnIndexKey(ab.Left, ab.Right)
+		if !ok || c.Index < 0 || c.Index >= len(tbl.Columns) || tbl.Columns[c.Index].Name != colName ||
+			!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[c.Index], val) {
+			return nil, false
+		}
+		cr = c
+		elems = append(elems, val)
+	}
+	if len(elems) < 2 {
+		return nil, false
+	}
+	return &InExpr{pos: conj.Pos(), Operand: cr, List: elems}, true
+}
+
+// saopPricedClause is the clause a ScalarArrayOp index clause is priced by:
+// the IN conjunct itself, or for an OR of equalities the ScalarArrayOp it
+// was converted to (orEqualitySAOP).
+func saopPricedClause(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, c indexPathClause) Expr {
+	if c.indexCol >= 0 && c.indexCol < len(idx.Columns) {
+		if in, ok := orEqualitySAOP(cat, tbl, idx.Columns[c.indexCol], c.local); ok {
+			return in
+		}
+	}
+	return c.local
+}
+
 // bitmapSAOPOnColumn matches a ScalarArrayOp index qual on index column pos
 // for a bitmap path: a `col IN (consts)` / `col = ANY (…)` conjunct
 // (match_saopclause_to_indexcol), or an OR whose every arm is `col = const`
@@ -174,32 +219,9 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 			}
 			continue
 		}
-		bin, ok := conj.(*BinaryOp)
-		if !ok || bin.Op != parser.OpOr {
-			continue
+		if in, ok := orEqualitySAOP(cat, tbl, colName, conj); ok {
+			return &indexPathClause{indexCol: pos, saop: in.List, local: conj}, in
 		}
-		var cr *ColumnRef
-		var elems []Expr
-		for _, arm := range flattenExprOr(conj) {
-			ab, ok := arm.(*BinaryOp)
-			if !ok || ab.Op != parser.OpEq {
-				elems = nil
-				break
-			}
-			c, val, _, ok := normalizeColumnIndexKey(ab.Left, ab.Right)
-			if !ok || c.Index < 0 || c.Index >= len(tbl.Columns) || tbl.Columns[c.Index].Name != colName ||
-				!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[c.Index], val) {
-				elems = nil
-				break
-			}
-			cr = c
-			elems = append(elems, val)
-		}
-		if len(elems) < 2 {
-			continue
-		}
-		return &indexPathClause{indexCol: pos, saop: elems, local: conj},
-			&InExpr{pos: conj.Pos(), Operand: cr, List: elems}
 	}
 	return nil, nil
 }

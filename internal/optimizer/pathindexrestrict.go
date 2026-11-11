@@ -298,6 +298,18 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 		}
 		return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
 	}
+	// M0148-0001c3a2: an OR of equalities on the leading column is the same
+	// ScalarArrayOp probe (match_orclause_to_indexcol); the OR is its exact
+	// recheck and leaves the Filter like the IN does.
+	for _, conj := range conjuncts {
+		if idx.DeclaredHash {
+			// A hash index takes no ScalarArrayOp quals (amsearcharray).
+			break
+		}
+		if in, ok := orEqualitySAOP(cat, tbl, lead, conj); ok {
+			return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
+		}
+	}
 	return nil
 }
 
@@ -620,7 +632,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	case isSAOP:
 		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
 		// one descent per element (btcostestimate's num_sa_scans).
-		sel = clampSelectivity(clauseSelectivity(clauses[0].local, rel.baseLeaf))
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[0]), rel.baseLeaf))
 		if len(clauses) > 1 {
 			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[1:]))
 		}
