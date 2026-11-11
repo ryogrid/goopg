@@ -1,13 +1,37 @@
-# Working Set — loop end 2026-11-01 (loop #17: M0148-0001c slice (b) LANDED; census consumed)
+# Working Set — loop end 2026-11-04 (run-2 loop #52: census CHANGED-text/verdict same; M0148-0001j2 CLOSED)
 
-- Task: M0148-0001c slice (b) (item 10 suite) — multi-target scalar group agg `select max(unique2), generate_series(1,3) as g from tenk1 order by g desc` plans `Sort → (InitPlan 1: Limit → IOS Backward) → ProjectSet → childless Result`; hunks 29 → 28 (1016 closed byte-exact, none added). Code `e1f19ff73`, records `d36d05876`, census `be2248839`, baton `610e83572`+this; HEAD pushed, code tree clean.
-- Files: `internal/optimizer/planner.go` (gate `aggIdx` scan + `strictMinMaxTarget` + `minmaxTListSurvivor`; assembly = childless Result over the surviving tlist + `ProjectSet{SrfCols, OtherExprs}` above; `wrapMinMaxOrderByDistinct` re-scan/label/raw-name fallback/ordinal decline); `internal/executor/operators_explain.go` (new `*optimizer.ProjectSet` arm in `resolveKeySourceDepth`); pins `minmax_distinct_orderby_test.go` + `explain_correlated_minmax_test.go`; doc 0148-0001c + README row; fix_plan 0001c; 3 ledger rows; `analysis/m0146/m0146-0014/routing-20261101f/`.
-- Key symbols: `rewriteMinMaxAggregates` (gate ~12618, assembly ~13030); `strictMinMaxTarget` (= can_minmax_aggs shape); `minmaxTListSurvivor` dispatches on `*FuncCall` FIRST — `isConstantExpr` reads a 0-arg call (`count(*)`) as constant (the pin caught it); `SrfCol` + `OtherExprs` nil-slot marker; `openSelectSrfMode` zip executor (unchanged); the ProjectSet chase arm (synth `FuncCall{generate_series}` → S18 parens); `LevelInitPlansOf` descends the ProjectSet, so `InitPlan 1` prints on the Sort.
-- Findings: planagg gates per-AGG, not on tlist length; `create_minmaxagg_plan` = `make_result(tlist, quals, NULL)` keeps every non-agg entry; `build_minmax_path` EMPTIES the main jointree (the RTE moves into the InitPlan subquery) — why extras must be Var/sublink/agg-free. TPC-DS/TPC-H carry no multi-target min/max tlist ⇒ fires=none.
-- Next step: **M0148-0001c slice (c)** — inheritance/appendrel min/max (hunk 1066, 72→38 lines): planagg accepts a single RangeTblRef that is an appendrel (planagg.c:121-137), builds a path per child, and `create_minmaxagg_plan` puts Merge Append of the per-child index paths under the Limit.
-  Lift goopg's declines: planner.go ~12649 `len(tbl.PartitionKey) > 0`, ~12652 `AccessibleInheritanceChildren`. Then (d) hunk 1145 (correlated `distinct min` shares InitPlan 1 + SubPlan 2; M0146-0114 declines it today).
-- Top-residual: aggregates 28 hunks; largest single block = parallel-agg 7 hunks 1667-1756 (=0001i). Census EXHAUSTED at routing-20261101f (fires=none, 99/99+99/99+22/22, all cats 0).
-- Skip-rationale (bypassed items 0-9; item 10 selected): 0 channel (P0-E8 `[x]`), 1/2/2a discharged, 3 channel (`M0146-0005dp` banner mention has no filed entry; 0229/0229a `[x]`), 4-8 channel, 9 M0147 channel + 2 owner-gated `[!]`, 10: M0122-0015h self-records `Rank: below item 10` (S7 carve-out) → live M0148 queue head 0001c. Slice (c) over the 1667-1756 block: the suite queue advances in expected-line order; 1066 is the next queued hunk.
-  Five open M-NIGHTLY P0-E9/E10/E11/E13/E15 = ESCALATION, OWNER PLACEMENT NEEDED (no `[ ]` item ranked 0-9 is selectable).
-- Gates run: optimizer+executor units PASS (only the DST `timetz` flake — a pure COPY-decode test past the 2026-11-01 DST transition); runner 29→28; spotcheck Q12=2/Q13=35; sf025 sweep 99/99 plans; acceptance arm off 24 MATCH; fireset SF0.25+SF1 PASS fires=none (G9 IN-SCOPE: optimizer staged); pgbench smoke via hook; census consumed (routing-20261101f, fireset stamp code_tree 1f1ba3af18a3).
-- In-flight: none.
+- Anomaly: none (prev-loop check OK).
+- S9 census:
+  - DUE after 80c8249f9 → routing-20261104e (b931c2b4d), label s9bb, BASELINE_REV=456b0527b. Full capture committed: TPC-H Q15 filter text moved to PG's `'…'::text` labels.
+  - Verdict unchanged: 22/22, 99/99, 99/99, CATEGORIES all 0. routing-20261104e is the new TPC-H BASE.
+  - 05b02362f touches internal/executor + internal/catalog (DDL only). Run `scripts/s9-census-due.sh` next loop and obey its verdict. If DUE, BASELINE_REV = 406e379a4, the head routing-20261104e consumed.
+- Task: M0148-0001j2 (item 1: DROP TYPE / DROP DOMAIN column, attribute and domain dependents) — DONE in 05b02362f; records 8c1531f51. Residue filed as M0148-0001j3.
+- Files:
+  - internal/executor/drop_type_dependents.go: generic walker with type-like nodes; column / attribute / domain nodes; tableStillRegistered, dropCompositeAttribute, dropDomainObject.
+  - internal/executor/operators_ddl.go:
+    - dropColumn(fromDependency) wraps execAlterDropColumn.
+    - replaceCompositeFields is now shared.
+    - execDropDomain uses the walk.
+    - execCreateTable got a createUndoRecorded guard.
+  - internal/catalog/catalog.go: AllCompositeTypes; DropDomain skips Dropped columns.
+  - Test internal/executor/drop_type_columns_test.go; design doc 0148-0001j2 + README row.
+- Key symbols: typeDependentObjects, dropTypeDependents, dropColumn, replaceCompositeFields, dropDomainObject.
+- Findings:
+  - Tables are keyed by catalog.NamespaceDBOid(CurrentDatabaseOid). Composite types and domains are keyed by the raw db OID. The old DropDomain scan used the raw OID, so it never found a dependent table in a live server.
+  - New S2 filings with ESCALATION blocks, awaiting owner placement (not selected):
+    - P0-E24: partitioned parent lost at restart; the reload skips relkind p.
+    - P0-E25: user-type columns reload as text; OIDToTypeName defaults to "text".
+  - internal/postmaster failed once (flake), then passed uncached (149 s).
+- Next step: S9 due-check. Then the topmost open M0148 child in file order: M0148-0001j3 (suggest its item 5, type USAGE aclchecks, which closes the privileges regression). Residue children are selected before M0148-0002 (copy) per milestone rule 6.
+- Top-residual: M0148 residues. The open children are j3, c3a, c3b, g1, f3, e2, h1, i2, k1, then the M0148-0002 copy suite (7 hunks).
+- Skip-rationale (bypassed items 0-9; item 10 selected):
+  - Items 0-9: 0 channel (P0-E8 [x]); 1/2/2a discharged; 3 channel (census routing-20261104e, exhausted); 4-8 channel; 9 M0147 channel + 2 owner-gated [!].
+  - Item 10: M-NIGHTLY open S2 items awaiting owner placement: P0-E9/E10/E11/E13/E15/E16/E24/E25. Then M0148.
+- Gates run (code_tree 43a470fd):
+  - units PASS; TestPort_RegressSuite + PgDump* + Isolation* PASS.
+  - tpch-spotcheck PASS; sf025 99/99; acceptance values identical; fire-set fires=none ×3.
+  - Regress A/B, 37 suites, line counts:
+    - improved: alter_table −25, domain −34, create_table −24, plpgsql −9, insert −2;
+    - unchanged: enum;
+    - grew on residue: create_type +4, privileges +46.
+- In-flight: none. Scratch PG (5545) and goopg (5533/5534) stopped; worktree tmp/wt-head removed.

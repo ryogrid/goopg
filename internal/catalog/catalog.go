@@ -18162,6 +18162,18 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	byRole[owner] = privs
 }
 
+// HoldsGrantOption reports whether role's own aclitem on oid carries priv
+// WITH GRANT OPTION (the stored flag GrantTablePrivilegeAs records). Used by
+// GRANT/REVOKE's restrict_and_check_grant for a non-owner grantor
+// (M0148-0001j3).
+func (c *InMemory) HoldsGrantOption(oid uint32, role, priv string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tableACLs[oid][role][priv]
+}
+
 // HasTablePrivilege reports whether role holds priv on relOID. M0118-0008.
 //
 // This is goopg's aclmask() (postgres/src/backend/utils/adt/acl.c:1389), and

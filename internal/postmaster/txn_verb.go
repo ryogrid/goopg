@@ -114,6 +114,9 @@ func setLocalOutsideBlockNotice() []libpq.ErrorField {
 func (s *Server) endExplicitBlock(ctx *executor.Context, connTx *connTxState, undoEnumDDL bool) {
 	if undoEnumDDL {
 		undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
+		// AtEOXact_GUC(false): role changes made inside the aborted
+		// transaction revert (M0148-0001j3).
+		connTx.RestoreTxRoleForRollback()
 	}
 	connTx.End()
 	if ctx.EndLocalTransaction != nil {

@@ -34,6 +34,15 @@ func TestExecTypeACLChangeStampsActingRoleAsGrantor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterEnum: %v", err)
 	}
+	// A non-owner grantor needs the grant option (aclchk.c
+	// restrict_and_check_grant); without it PG grants nothing and warns
+	// (M0148-0001j3). The owner gives bob USAGE WITH GRANT OPTION first.
+	if err := (&ddlOp{ctx: &Context{Catalog: cat}}).execTypeACLChange(&parser.TypeACLChange{
+		Privileges: []string{"USAGE"}, TypeNames: []parser.ObjectName{{Name: "acl_grantor_enum"}},
+		Grantees: []string{"bob"}, WithGrantOption: true,
+	}); err != nil {
+		t.Fatalf("owner GRANT … WITH GRANT OPTION to bob: %v", err)
+	}
 	op := &ddlOp{ctx: &Context{Catalog: cat, NonSuperuserRole: "bob"}}
 
 	tc := &parser.TypeACLChange{
@@ -45,7 +54,7 @@ func TestExecTypeACLChangeStampsActingRoleAsGrantor(t *testing.T) {
 		t.Fatalf("execTypeACLChange: %v", err)
 	}
 
-	want := "{=U/postgres,postgres=U/postgres,charlie=U/bob}"
+	want := "{=U/postgres,postgres=U/postgres,bob=U*/postgres,charlie=U/bob}"
 	if got := cat.TypeACLText(et.OID); got != want {
 		t.Fatalf("typacl after impersonated GRANT = %q; want %q", got, want)
 	}
@@ -109,6 +118,15 @@ func TestExecACLChangeGrantedByCurrentUserIsNoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterEnum: %v", err)
 	}
+	// A non-owner grantor needs the grant option (aclchk.c
+	// restrict_and_check_grant); without it PG grants nothing and warns
+	// (M0148-0001j3). The owner gives bob USAGE WITH GRANT OPTION first.
+	if err := (&ddlOp{ctx: &Context{Catalog: cat}}).execTypeACLChange(&parser.TypeACLChange{
+		Privileges: []string{"USAGE"}, TypeNames: []parser.ObjectName{{Name: "acl_grantedby_enum"}},
+		Grantees: []string{"bob"}, WithGrantOption: true,
+	}); err != nil {
+		t.Fatalf("owner GRANT … WITH GRANT OPTION to bob: %v", err)
+	}
 	op := &ddlOp{ctx: &Context{Catalog: cat, NonSuperuserRole: "bob"}}
 
 	tc := &parser.TypeACLChange{
@@ -120,7 +138,7 @@ func TestExecACLChangeGrantedByCurrentUserIsNoop(t *testing.T) {
 	if err := op.execTypeACLChange(tc); err != nil {
 		t.Fatalf("execTypeACLChange with GRANTED BY bob (as bob): %v", err)
 	}
-	want := "{=U/postgres,postgres=U/postgres,charlie=U/bob}"
+	want := "{=U/postgres,postgres=U/postgres,bob=U*/postgres,charlie=U/bob}"
 	if got := cat.TypeACLText(et.OID); got != want {
 		t.Fatalf("typacl = %q; want %q", got, want)
 	}

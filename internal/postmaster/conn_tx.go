@@ -177,6 +177,15 @@ type connTxState struct {
 	// reverted (M0134-0009 round-2 review, R1/R11).
 	LocalSessionUserPriorValue     *string
 	LocalSetRoleIsActivePriorValue *bool
+	// txRolePrior is the (NonSuperuserRole, SessionUser, SetRoleIsActive)
+	// triple captured before the FIRST role change of any kind — SET or SET
+	// LOCAL, ROLE or SESSION AUTHORIZATION — inside the current explicit
+	// transaction. PostgreSQL's GUC stack (guc.c AtEOXact_GUC) reverts every
+	// setting made inside an aborted transaction, session-level SETs
+	// included, so a ROLLBACK restores this snapshot; a COMMIT discards it.
+	// M0148-0001j3 (regress create_operator: `BEGIN; SET ROLE r; …;
+	// ROLLBACK;` left r active for the next block).
+	txRolePrior *roleSnapshot
 	// AdvisoryID is the stable per-connection advisory-lock owner identity (the
 	// SessionRegistry). It is assigned once at connection start in
 	// runPostStartupLoop and matches advisorySessionIDFromContext's preferred
@@ -443,6 +452,7 @@ func (c *connTxState) Begin(tx transam.Transaction) {
 // SetRoleIsActive together — so partial revert would desync the
 // EffectiveUserName() invariant (see its doc comment).
 func (c *connTxState) SnapshotLocalRoleIfNeeded(local bool) {
+	c.snapshotTxRoleIfNeeded()
 	if !local || !c.active || c.LocalRolePriorValue != nil {
 		return
 	}
@@ -452,6 +462,39 @@ func (c *connTxState) SnapshotLocalRoleIfNeeded(local bool) {
 	c.LocalSessionUserPriorValue = &priorSessionUser
 	priorSetRoleIsActive := c.SetRoleIsActive
 	c.LocalSetRoleIsActivePriorValue = &priorSetRoleIsActive
+}
+
+// roleSnapshot is the role state a transaction-level revert restores.
+type roleSnapshot struct {
+	nonSuperuserRole string
+	sessionUser      string
+	setRoleIsActive  bool
+}
+
+// snapshotTxRoleIfNeeded captures the pre-transaction role state before the
+// first role change inside an explicit transaction (see txRolePrior).
+func (c *connTxState) snapshotTxRoleIfNeeded() {
+	if !c.active || c.txRolePrior != nil {
+		return
+	}
+	c.txRolePrior = &roleSnapshot{c.NonSuperuserRole, c.SessionUser, c.SetRoleIsActive}
+}
+
+// RestoreTxRoleForRollback reverts every role change made inside the
+// aborting transaction (AtEOXact_GUC with isCommit=false), superseding the
+// SET LOCAL snapshot End() would otherwise restore. Call before End() on
+// ROLLBACK paths.
+func (c *connTxState) RestoreTxRoleForRollback() {
+	if c.txRolePrior == nil {
+		return
+	}
+	c.NonSuperuserRole = c.txRolePrior.nonSuperuserRole
+	c.SessionUser = c.txRolePrior.sessionUser
+	c.SetRoleIsActive = c.txRolePrior.setRoleIsActive
+	c.txRolePrior = nil
+	c.LocalRolePriorValue = nil
+	c.LocalSessionUserPriorValue = nil
+	c.LocalSetRoleIsActivePriorValue = nil
 }
 
 // wireStatus computes the ReadyForQuery transaction-status byte for this
@@ -585,6 +628,7 @@ func (c *connTxState) End() {
 		c.SetRoleIsActive = *c.LocalSetRoleIsActivePriorValue
 		c.LocalSetRoleIsActivePriorValue = nil
 	}
+	c.txRolePrior = nil // COMMIT keeps session-level role changes
 	// Discard any NOTIFYs not yet published. On COMMIT the publish happens
 	// before End() is called; reaching here with a non-empty buffer means
 	// ROLLBACK (or commit-cleanup after publish), where the notifications must

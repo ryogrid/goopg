@@ -46,6 +46,7 @@ func setIsSuperuserGUC(sess *misc.SessionRegistry, isSuper bool) {
 // the same context/source, per the SQL spec; NOT miscinit.c
 // SetSessionAuthorization, which does not itself clear SetRoleIsActive).
 func applySetSessionAuthorization(connTx *connTxState, role string) {
+	connTx.snapshotTxRoleIfNeeded()
 	switch strings.ToUpper(strings.TrimSpace(role)) {
 	case "", "DEFAULT", "RESET":
 		role = connTx.LoginUser
@@ -66,6 +67,7 @@ func applySetSessionAuthorization(connTx *connTxState, role string) {
 // (current_user()/current_role), never session_user() (miscinit.c
 // GetSessionUserId is unaffected by SET ROLE).
 func applySetRole(connTx *connTxState, role string) {
+	connTx.snapshotTxRoleIfNeeded()
 	switch strings.ToUpper(strings.TrimSpace(role)) {
 	case "", "DEFAULT", "NONE":
 		// Only clear NonSuperuserRole if a SET ROLE was actually the thing

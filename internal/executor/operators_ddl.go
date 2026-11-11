@@ -2711,6 +2711,10 @@ afterExistsCheck:
 	// than attislocal — so no inheritance plumbing is needed. DU-002 slice 374.
 	var ofTypeOID uint32
 	if s.OfType != nil {
+		// check_of_type: USAGE on the row type (M0148-0001j3).
+		if err := checkTypeUsage(o.ctx, s.OfType.Name); err != nil {
+			return err
+		}
 		im, ok := o.ctx.Catalog.(*catalog.InMemory)
 		if !ok {
 			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "typed tables are not supported on this catalog"}
@@ -2968,6 +2972,10 @@ afterExistsCheck:
 			return false, nil
 		}
 		addCol := func(c parser.ColumnDef) error {
+			// BuildDescForRelation: USAGE on every column type (M0148-0001j3).
+			if err := checkTypeUsage(o.ctx, c.Type.Name); err != nil {
+				return err
+			}
 			typeName := strings.ToLower(c.Type.Name)
 			declaredTypeName := "" // non-empty only when a domain is resolved
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -5746,6 +5754,11 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		typeName := sc.Type.Name
 		if typeName == "" || typeName == "unknown" {
 			typeName = "text"
+		}
+		// create_ctas_internal → DefineRelation → BuildDescForRelation: USAGE
+		// on each result column type (M0148-0001j3).
+		if err := checkTypeUsage(o.ctx, typeName); err != nil {
+			return err
 		}
 		colName := sc.Name
 		if i < len(s.ColumnAliases) {
@@ -12634,6 +12647,10 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 	if tbl.OfTypeOID != 0 {
 		return &ExecError{Code: "42809", Pos: 0, Message: "cannot add column to typed table"}
 	}
+	// ATExecAddColumn: USAGE on the new column's type (M0148-0001j3).
+	if err := checkTypeUsage(o.ctx, col.Type.Name); err != nil {
+		return err
+	}
 	// M0134-0002 C9 residual (S1): PG refuses ADD COLUMN on a partition child
 	// with 42809 ERRCODE_WRONG_OBJECT_TYPE, no errdetail, no errhint, Pos 0.
 	// This is the FIRST check in ATExecAddColumn — before the system-column
@@ -18055,6 +18072,16 @@ func sameRoutineType(a, b parser.ColumnType) bool {
 }
 
 func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
+	// interpret_function_parameter_list / compute_return_type: USAGE on
+	// every argument type, then the result type (M0148-0001j3).
+	for _, a := range s.Args {
+		if err := checkTypeUsage(o.ctx, a.Type.Name); err != nil {
+			return err
+		}
+	}
+	if err := checkTypeUsage(o.ctx, s.ReturnType.Name); err != nil {
+		return err
+	}
 	rs := routineRegistry(o.ctx)
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
@@ -22578,7 +22605,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// which is PG's order too (the namespace is resolved before the type).
 		if len(s.ArgTypes) > 0 {
 			if argType := s.ArgTypes[0]; argType != "" && argType != "*" &&
-				!strings.Contains(argType, ".") && dropCompatCanonicalType(argType) == "" {
+				!strings.Contains(argType, ".") && dropCompatCanonicalType(argType) == "" &&
+				!o.isUserTypeName(argType) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", argType))
 					return nil
@@ -22655,7 +22683,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 				}
 				canonical := dropCompatCanonicalType(argType)
-				if canonical == "" {
+				if canonical == "" && !o.isUserTypeName(argType) {
 					if s.IfExists {
 						o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", argType))
 						return nil
@@ -22742,7 +22770,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 		// Validate left type (non-schema-qualified).
 		if leftType != "" && leftType != "none" {
-			if dropCompatCanonicalType(leftType) == "" {
+			if dropCompatCanonicalType(leftType) == "" && !o.isUserTypeName(leftType) {
 				if s.IfExists {
 					// Unknown type in operator args → PG says "type X does not exist, skipping"
 					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", leftType))
@@ -22754,7 +22782,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 		// Validate right type.
 		if rightType != "" && rightType != "none" {
-			if dropCompatCanonicalType(rightType) == "" {
+			if dropCompatCanonicalType(rightType) == "" && !o.isUserTypeName(rightType) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", rightType))
 					return nil
@@ -22792,12 +22820,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			if existing, found := im.LookupUserOperator(schema, opName, leftType, rightType); found {
+			// NONE spells the missing operand of a prefix operator, which
+			// CREATE OPERATOR registers with an empty LEFTARG (M0148-0001j3).
+			lt, rt := leftType, rightType
+			if _, found := im.LookupUserOperator(schema, opName, lt, rt); !found {
+				if strings.EqualFold(lt, "none") {
+					lt = ""
+				}
+				if strings.EqualFold(rt, "none") {
+					rt = ""
+				}
+			}
+			if existing, found := im.LookupUserOperator(schema, opName, lt, rt); found {
 				// Best-effort cleanup of the compat registry too; absent (e.g.
 				// after a restart) is expected and not an error.
 				key := opName + "(" + leftCanon + "," + rightCanon + ")"
 				im.DropCompatObject("operator", key)
-				im.DropUserOperator(schema, opName, leftType, rightType)
+				im.DropUserOperator(schema, opName, lt, rt)
 				// B2.2 slice 3: stamp xmax on the operator's pg_operator
 				// heap row (kind 84 retired).
 				deleteOperatorCatalogRow(o.ctx, existing.OID)
@@ -23286,7 +23325,11 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *
 		if nargs < 1 || nargs > 3 {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must take one to three arguments"}
 		}
-		if !castTypeOIDMatch(im, source, inArgs[0].Name) {
+		// IsBinaryCoercible reduces a domain source to its base type
+		// (getBaseType), so a cast from a domain over int takes an int
+		// function argument. M0148-0001j3.
+		if !castTypeOIDMatch(im, source, inArgs[0].Name) &&
+			!(castDomainBase(im, source) != "" && castTypeOIDMatch(im, castDomainBase(im, source), inArgs[0].Name)) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "argument of cast function must match or be binary-coercible from source data type"}
 		}
 		if nargs > 1 && catalog.TypeNameToOID(inArgs[1].Name) != catalog.OIDInt4 {
@@ -23295,7 +23338,8 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *
 		if nargs > 2 && catalog.TypeNameToOID(inArgs[2].Name) != catalog.OIDBool {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "third argument of cast function must be type boolean"}
 		}
-		if !castTypeOIDMatch(im, routine.ReturnType.Name, target) {
+		if !castTypeOIDMatch(im, routine.ReturnType.Name, target) &&
+			!(castDomainBase(im, routine.ReturnType.Name) != "" && castTypeOIDMatch(im, castDomainBase(im, routine.ReturnType.Name), target)) {
 			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "return data type of cast function must match or be binary-coercible to target data type"}
 		}
 		if routine.IsProcedure || routine.IsWindow {
@@ -23314,6 +23358,33 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine, im *
 		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
 	}
 	return nil
+}
+
+// isUserTypeName reports whether a DROP AGGREGATE / DROP OPERATOR argument
+// type names a user enum, domain or composite type (with an optional `[]`),
+// which dropCompatCanonicalType — builtin names only — does not know.
+// M0148-0001j3.
+func (o *ddlOp) isUserTypeName(name string) bool {
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
+	base, _ := depTypeRef(name)
+	return isKnownUserType(im, base)
+}
+
+// castDomainBase returns the base type name of the domain named name, or ""
+// when name is not a domain (or im is nil).
+func castDomainBase(im *catalog.InMemory, name string) string {
+	if im == nil {
+		return ""
+	}
+	base, _ := depTypeRef(name)
+	d, ok := im.LookupDomain(base)
+	if !ok || d == nil {
+		return ""
+	}
+	if d.Base.IsArray {
+		return d.Base.Name + "[]"
+	}
+	return d.Base.Name
 }
 
 // isKnownUserType reports whether name resolves to a user-registered type in
@@ -23861,6 +23932,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 					Message: "operator right argument type must be specified",
 					Detail:  "Postfix operators are not supported."}
 			}
+			// DefineOperator: USAGE on the left, then the right operand
+			// type (M0148-0001j3).
+			for _, t := range []string{leftArg, rightArg} {
+				if t == "" {
+					continue
+				}
+				if err := checkTypeUsage(o.ctx, t); err != nil {
+					return err
+				}
+			}
 			var funcOID uint32
 			var funcRetType string
 			if rs := im.Routines(); rs != nil {
@@ -24087,6 +24168,19 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				if routine != nil {
 					funcOID = routine.OID
 				}
+			}
+			// CreateCast: USAGE on the source, then the target type, before
+			// the cast function's checks (M0148-0001j3).
+			for _, t := range s.ArgTypes[:2] {
+				if err := checkTypeUsage(o.ctx, t); err != nil {
+					return err
+				}
+			}
+			// "Domains are allowed for historical reasons, but we warn."
+			if castDomainBase(im, s.ArgTypes[0]) != "" {
+				o.ctx.AddWarning("cast will be ignored because the source data type is a domain")
+			} else if castDomainBase(im, s.ArgTypes[1]) != "" {
+				o.ctx.AddWarning("cast will be ignored because the target data type is a domain")
 			}
 			// Enforce PG's CREATE CAST argument/return-type rules
 			// (functioncmds.c CreateCast) before registering. DU-002 slice 398.
@@ -24978,7 +25072,37 @@ func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 	for _, tn := range tc.TypeNames {
 		oid, kind := resolveUserTypeOID(im, tn.Name)
 		if oid == 0 {
+			// ExecGrant_Type: an array type's privileges are its element
+			// type's (0LP01 + HINT). M0148-0001j3.
+			if base := strings.ToLower(tn.Name); strings.HasPrefix(base, "_") {
+				if eoid, _ := resolveUserTypeOID(im, base[1:]); eoid != 0 {
+					return &ExecError{Code: "0LP01", Message: "cannot set privileges of array types",
+						Hint: "Set the privileges of the element type instead."}
+				}
+			}
 			continue
+		}
+		// ExecGrant_Type: ON DOMAIN names a domain (42809).
+		if tc.IsDomain && kind != typeKindDomain {
+			return &ExecError{Code: "42809", Message: fmt.Sprintf("%q is not a domain", tn.Name)}
+		}
+		// restrict_and_check_grant: a grantor that is neither superuser nor
+		// owner needs the grant option; holding no privilege at all is
+		// 42501, holding one without the option is a WARNING and a no-op.
+		if role := strings.ToLower(o.ctx.NonSuperuserRole); role != "" {
+			_, _, owner, _ := typeUsageTarget(im, tn.Name)
+			roid, _ := im.RoleOID(role)
+			if roid != owner && !im.HoldsGrantOption(oid, role, "USAGE") {
+				if ok, _ := typeUsagePermitted(o.ctx, tn.Name); !ok {
+					return &ExecError{Code: "42501", Message: fmt.Sprintf("permission denied for type %s", strings.ToLower(tn.Name))}
+				}
+				if tc.Revoke {
+					o.ctx.AddWarning(fmt.Sprintf("no privileges could be revoked for %q", strings.ToLower(tn.Name)))
+				} else {
+					o.ctx.AddWarning(fmt.Sprintf("no privileges were granted for %q", strings.ToLower(tn.Name)))
+				}
+				continue
+			}
 		}
 		if tc.Revoke {
 			// A type's acldefault grants USAGE to owner + PUBLIC; PG materializes
@@ -24996,7 +25120,12 @@ func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 			// Seed the implicit PUBLIC USAGE that acldefault('T', …) carries so the
 			// materialized typacl matches PG's array; the owner entry is supplied
 			// by the renderer's owner branch (TypeACLText / relaclTextLockedFor).
-			im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			// Only while typacl is still NULL: once a REVOKE … FROM PUBLIC has
+			// materialized the array, a later GRANT must not resurrect PUBLIC
+			// (M0148-0001j3).
+			if im.TypeACLText(oid) == "" {
+				im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			}
 			for _, role := range tc.Grantees {
 				im.GrantTablePrivilegeAs(oid, role, "USAGE", tc.WithGrantOption, o.ctx.NonSuperuserRole)
 			}
@@ -26007,6 +26136,12 @@ func dropCompatCanonicalType(typeName string) string {
 // It rejects missing basetype, then registers the aggregate in the catalog
 // so subsequent queries can invoke it. M0097-regress.
 func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
+	// DefineAggregate: USAGE on the argument type (M0148-0001j3).
+	if s.HasBaseType {
+		if err := checkTypeUsage(o.ctx, s.BaseType); err != nil {
+			return err
+		}
+	}
 	if !s.HasBaseType {
 		return &ExecError{Code: "42P13", Pos: s.Pos(),
 			Message: "aggregate input type must be specified"}
@@ -26631,6 +26766,11 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 					return &ExecError{Code: "42P16", Pos: s.Pos(),
 						Message: fmt.Sprintf("column %q has pseudo-type unknown", f.Name)}
 				}
+				// DefineCompositeType → BuildDescForRelation: USAGE on each
+				// attribute type (M0148-0001j3).
+				if err := checkTypeUsage(o.ctx, f.ColType); err != nil {
+					return err
+				}
 			}
 			fields := make([]catalog.CompositeField, len(s.CompositeFields))
 			for i, f := range s.CompositeFields {
@@ -26776,6 +26916,10 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 					Message: fmt.Sprintf("column %q of relation %q already exists", s.AddAttrName, s.Name)}
 			}
 		}
+		// ATExecAddColumn: USAGE on the attribute type (M0148-0001j3).
+		if err := checkTypeUsage(o.ctx, s.AddAttrType); err != nil {
+			return err
+		}
 		if strings.EqualFold(s.AddAttrType, "unknown") {
 			return &ExecError{Code: "42P16", Pos: s.Pos(),
 				Message: fmt.Sprintf("column %q has pseudo-type unknown", s.AddAttrName)}
@@ -26904,6 +27048,10 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if idx < 0 {
 			return &ExecError{Code: "42703", Pos: s.Pos(),
 				Message: fmt.Sprintf("column %q of relation %q does not exist", s.AlterAttrName, s.Name)}
+		}
+		// ATPrepAlterColumnType: USAGE on the new type (M0148-0001j3).
+		if err := checkTypeUsage(o.ctx, s.AlterAttrType); err != nil {
+			return err
 		}
 		if strings.EqualFold(s.AlterAttrType, "unknown") {
 			return &ExecError{Code: "42P16", Pos: s.Pos(),
@@ -27105,6 +27253,13 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 	fields := make([]catalog.CompositeField, len(ct.Fields))
 	copy(fields, ct.Fields)
 	for _, cmd := range s.AttrCmds {
+		// ALTER TYPE … ADD / ALTER ATTRIBUTE … TYPE: USAGE on the attribute
+		// type (ATExecAddColumn / ATPrepAlterColumnType; M0148-0001j3).
+		if cmd.Kind == "add" || cmd.Kind == "alter" {
+			if err := checkTypeUsage(o.ctx, cmd.Type); err != nil {
+				return err
+			}
+		}
 		switch cmd.Kind {
 		case "add":
 			for _, f := range fields {
@@ -27280,6 +27435,10 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 }
 
 func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
+	// DefineDomain: USAGE on the base type (M0148-0001j3).
+	if err := checkTypeUsage(o.ctx, s.BaseType); err != nil {
+		return err
+	}
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -28302,6 +28461,10 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	}
 
 	oldCatalogType := tbl.Columns[colIdx].Type
+	// ATPrepAlterColumnType: USAGE on the new type (M0148-0001j3).
+	if err := checkTypeUsage(o.ctx, act.NewType.Name); err != nil {
+		return err
+	}
 	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
 
 	// Resolve the USING expression against the OLD column schema BEFORE any

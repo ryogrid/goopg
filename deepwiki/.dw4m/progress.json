@@ -1,0 +1,580 @@
+{
+  "pages": [
+    {
+      "id": "1",
+      "file": "1-Overview.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "2",
+      "file": "2-Architecture.md",
+      "status": "done",
+      "attempts": 2
+    },
+    {
+      "id": "3",
+      "file": "3-Server.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4",
+      "file": "4-SQL-Parser.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5",
+      "file": "5-Query-Planner.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6",
+      "file": "6-Executor.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7",
+      "file": "7-Storage.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8",
+      "file": "8-Btree.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9",
+      "file": "9-Transactions.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10",
+      "file": "10-WAL.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11",
+      "file": "11-Replication.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12",
+      "file": "12-Catalog.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13",
+      "file": "13-Utilities.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "14",
+      "file": "14-Node-IR.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "15",
+      "file": "15-Build-and-Tooling.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "16",
+      "file": "16-Glossary.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "2.1",
+      "file": "2-Architecture/2.1-Process-and-Concurrency.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "2.2",
+      "file": "2-Architecture/2.2-Query-Pipeline.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "2.3",
+      "file": "2-Architecture/2.3-Data-Directory.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "2.4",
+      "file": "2-Architecture/2.4-Startup-Recovery.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.1",
+      "file": "3-Server/3.1-CLI-and-Lifecycle.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.2",
+      "file": "3-Server/3.2-Wire-Protocol.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.3",
+      "file": "3-Server/3.3-Authentication.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.4",
+      "file": "3-Server/3.4-Connection-Dispatch.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.5",
+      "file": "3-Server/3.5-COPY-and-Extended-Protocol.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "3.6",
+      "file": "3-Server/3.6-Background-Workers.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4.1",
+      "file": "4-SQL-Parser/4.1-Lexer.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4.2",
+      "file": "4-SQL-Parser/4.2-Grammar-and-Dispatch.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4.3",
+      "file": "4-SQL-Parser/4.3-AST-and-Expressions.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4.4",
+      "file": "4-SQL-Parser/4.4-Handwritten-DDL-DML.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "4.5",
+      "file": "4-SQL-Parser/4.5-Analyzer.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.1",
+      "file": "5-Query-Planner/5.1-Planner-Overview.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.2",
+      "file": "5-Query-Planner/5.2-Path-and-Cost.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.3",
+      "file": "5-Query-Planner/5.3-Join-Search.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.4",
+      "file": "5-Query-Planner/5.4-Subquery-Unnesting.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.5",
+      "file": "5-Query-Planner/5.5-Aggregate-and-Window.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.6",
+      "file": "5-Query-Planner/5.6-Parallel-Planning.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.7",
+      "file": "5-Query-Planner/5.7-Plan-Creation.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "5.8",
+      "file": "5-Query-Planner/5.8-Statistics-and-Selectivity.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.1",
+      "file": "6-Executor/6.1-Execution-Model.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.2",
+      "file": "6-Executor/6.2-Expression-Evaluation.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.3",
+      "file": "6-Executor/6.3-Scan-Operators.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.4",
+      "file": "6-Executor/6.4-Join-Operators.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.5",
+      "file": "6-Executor/6.5-Aggregate-Sort-Setop.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.6",
+      "file": "6-Executor/6.6-DML-and-Writes.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.7",
+      "file": "6-Executor/6.7-DDL-Execution.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.8",
+      "file": "6-Executor/6.8-Parallel-Execution.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.9",
+      "file": "6-Executor/6.9-System-Catalog-Sync.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.10",
+      "file": "6-Executor/6.10-Stored-Routines.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "6.11",
+      "file": "6-Executor/6.11-EXPLAIN.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.1",
+      "file": "7-Storage/7.1-Buffer-Pool.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.2",
+      "file": "7-Storage/7.2-Page-and-Heap.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.3",
+      "file": "7-Storage/7.3-Storage-Manager-and-AIO.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.4",
+      "file": "7-Storage/7.4-FSM-and-Visibility-Map.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.5",
+      "file": "7-Storage/7.5-Pruning-and-Freeze.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.6",
+      "file": "7-Storage/7.6-Vacuum-and-Analyze.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "7.7",
+      "file": "7-Storage/7.7-Lock-Manager.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8.1",
+      "file": "8-Btree/8.1-Btree-Structure.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8.2",
+      "file": "8-Btree/8.2-Insert-and-Split.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8.3",
+      "file": "8-Btree/8.3-Btree-Vacuum-and-Replay.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8.4",
+      "file": "8-Btree/8.4-Key-Encoding.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "8.5",
+      "file": "8-Btree/8.5-amcheck.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.1",
+      "file": "9-Transactions/9.1-Transaction-Manager.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.2",
+      "file": "9-Transactions/9.2-Snapshot-and-Visibility.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.3",
+      "file": "9-Transactions/9.3-CLOG-and-Subtransactions.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.4",
+      "file": "9-Transactions/9.4-Multixact-and-Row-Locks.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.5",
+      "file": "9-Transactions/9.5-SSI.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "9.6",
+      "file": "9-Transactions/9.6-Deadlock-Detection.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.1",
+      "file": "10-WAL/10.1-WAL-Format.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.2",
+      "file": "10-WAL/10.2-WAL-Writer.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.3",
+      "file": "10-WAL/10.3-Checkpoint.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.4",
+      "file": "10-WAL/10.4-Crash-Recovery.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.5",
+      "file": "10-WAL/10.5-Replication-Slots.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "10.6",
+      "file": "10-WAL/10.6-Logical-Decoding.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.1",
+      "file": "11-Replication/11.1-Physical-Streaming.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.2",
+      "file": "11-Replication/11.2-Standby-and-Promotion.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.3",
+      "file": "11-Replication/11.3-Logical-Replication.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.4",
+      "file": "11-Replication/11.4-Table-Sync.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.5",
+      "file": "11-Replication/11.5-Base-Backup.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "11.6",
+      "file": "11-Replication/11.6-WAL-Summary.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.1",
+      "file": "12-Catalog/12.1-In-Memory-Catalog.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.2",
+      "file": "12-Catalog/12.2-Catalog-Heaps.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.3",
+      "file": "12-Catalog/12.3-System-Views.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.4",
+      "file": "12-Catalog/12.4-Routines-and-PubSub.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.5",
+      "file": "12-Catalog/12.5-Relcache.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "12.6",
+      "file": "12-Catalog/12.6-Catalog-Bootstrap.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13.1",
+      "file": "13-Utilities/13.1-GUC.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13.2",
+      "file": "13-Utilities/13.2-ADT.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13.3",
+      "file": "13-Utilities/13.3-Errors-and-Memory.md",
+      "status": "done",
+      "attempts": 2
+    },
+    {
+      "id": "13.4",
+      "file": "13-Utilities/13.4-Encoding.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13.5",
+      "file": "13-Utilities/13.5-Runtime-Shim.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "13.6",
+      "file": "13-Utilities/13.6-PGLZ-and-TOAST.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "14.1",
+      "file": "14-Node-IR/14.1-Expression-IR.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "14.2",
+      "file": "14-Node-IR/14.2-PG-NodeTree.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "15.1",
+      "file": "15-Build-and-Tooling/15.1-Build-and-Codegen.md",
+      "status": "done",
+      "attempts": 1
+    },
+    {
+      "id": "15.2",
+      "file": "15-Build-and-Tooling/15.2-Development-Tools.md",
+      "status": "done",
+      "attempts": 1
+    }
+  ]
+}
