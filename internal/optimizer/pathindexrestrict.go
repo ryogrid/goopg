@@ -310,6 +310,14 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClause) float64 {
 	var quals []Expr
 	for _, c := range clauses {
+		if c.nullTest != IndexNullTestNone {
+			// The NullTest conjunct itself (nulltestsel through
+			// clauseSelectivity), M0148-0001c3a.
+			if c.local != nil {
+				quals = append(quals, c.local)
+			}
+			continue
+		}
 		for _, conj := range conjuncts {
 			bin, ok := conj.(*BinaryOp)
 			if ok && (bin.Left == c.key || bin.Right == c.key) {
@@ -322,6 +330,68 @@ func rangeIndexSelectivity(leaf Node, conjuncts []Expr, clauses []indexPathClaus
 		return 1
 	}
 	return clampSelectivity(conjunctionSelectivity(quals, leaf))
+}
+
+// restrictionLeadingNullTest is match_clause_to_indexcol's NullTest arm
+// (indxpath.c) for the leading index column: a `col IS [NOT] NULL` conjunct
+// on a plain key column becomes an index clause, since btree has
+// amsearchnulls. `IS NULL` needs an index that stores NULL-keyed entries
+// (catalog.IndexHasNullKeyedEntries) — in an older cluster the rows it asks
+// for are not in the index at all, so it stays a Filter there. `IS NOT NULL`
+// is always answerable: an index without NULL-keyed entries holds only
+// non-NULL keys. The first matching conjunct wins (PG would take a duplicate
+// too; it is redundant). M0148-0001c3a.
+func restrictionLeadingNullTest(idx *catalog.Index, conjuncts []Expr) *indexPathClause {
+	if idx == nil || len(idx.Columns) == 0 || idx.Columns[0] == "" || idx.DeclaredHash {
+		return nil
+	}
+	for _, conj := range conjuncts {
+		nt, ok := conj.(*IsNullExpr)
+		if !ok {
+			continue
+		}
+		cr, ok := nt.Operand.(*ColumnRef)
+		if !ok || cr.Name != idx.Columns[0] {
+			continue
+		}
+		kind := IndexNullTestIsNull
+		if nt.Negated {
+			kind = IndexNullTestIsNotNull
+		} else if !catalog.IndexHasNullKeyedEntries(idx) {
+			continue
+		}
+		return &indexPathClause{indexCol: 0, local: conj, nullTest: kind}
+	}
+	return nil
+}
+
+// withNullTestInConjunctOrder places the NullTest clause among the leading
+// column's range clauses in restriction-list order: PG lists one index
+// column's clauses in baserestrictinfo order, which is what Index Cond prints
+// (`((x IS NOT NULL) AND (x < 5))`).
+func withNullTestInConjunctOrder(rng []indexPathClause, nt indexPathClause, conjuncts []Expr) []indexPathClause {
+	pos := func(e Expr) int {
+		for i, c := range conjuncts {
+			if c == e {
+				return i
+			}
+		}
+		return len(conjuncts)
+	}
+	ntPos := pos(nt.local)
+	out := make([]indexPathClause, 0, len(rng)+1)
+	placed := false
+	for _, c := range rng {
+		if !placed && c.local != nil && ntPos < pos(c.local) {
+			out = append(out, nt)
+			placed = true
+		}
+		out = append(out, c)
+	}
+	if !placed {
+		out = append(out, nt)
+	}
+	return out
 }
 
 // restrictionKeyUsable admits the probe-key kinds the executor's btree key
@@ -479,6 +549,12 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		// M0148-0001c3a: a NullTest on the leading column is an index
+		// clause too (match_clause_to_indexcol's NullTest arm), on its own
+		// or beside the range bounds.
+		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil {
+			clauses = withNullTestInConjunctOrder(clauses, *nt, conjuncts)
+		}
 		isRange = true
 	}
 	// M0146-0005dg: nothing binds the leading column — an equality run on a

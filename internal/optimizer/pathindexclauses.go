@@ -134,6 +134,11 @@ type indexPathClause struct {
 	// element, lowered onto IndexScan.SAOPKeys. `key` is nil and `op` is
 	// equality when set.
 	saop []Expr
+	// nullTest marks a `indexcol IS [NOT] NULL` index qual (M0148-0001c3a,
+	// restrictionLeadingNullTest): `key` is nil, `op` equality, `local` the
+	// NullTest conjunct. createRangeIndexScanPlan lowers it onto
+	// IndexScan.LeadingNullTest.
+	nullTest IndexNullTest
 }
 
 // indexPathClauses is `build_index_paths`' `index_clauses` accumulation

@@ -551,6 +551,18 @@ type unnestParam struct {
 
 // ParamRef passes through a bind-parameter placeholder. The executor
 // supplies values at execute time.
+// IndexNullTest is the kind of a NullTest index qual (IndexScan.LeadingNullTest).
+type IndexNullTest uint8
+
+const (
+	// IndexNullTestNone: no NullTest index qual.
+	IndexNullTestNone IndexNullTest = iota
+	// IndexNullTestIsNull: `col IS NULL` (SK_SEARCHNULL).
+	IndexNullTestIsNull
+	// IndexNullTestIsNotNull: `col IS NOT NULL` (SK_SEARCHNOTNULL).
+	IndexNullTestIsNotNull
+)
+
 type ParamRef struct {
 	pos    int
 	Number int
@@ -951,6 +963,18 @@ type IndexScan struct {
 	// bound (M0134-0001 S4 class 8) so the redundant Filter can be dropped.
 	LowOp  parser.OpCode
 	HighOp parser.OpCode
+	// LeadingNullTest is a `col IS [NOT] NULL` index qual on the leading key
+	// column (M0148-0001c3a) — PG's match_clause_to_indexcol takes a NullTest
+	// as an index clause when the AM has amsearchnulls (btree), and
+	// _bt_preprocess_keys turns it into an SK_SEARCHNULL / SK_SEARCHNOTNULL
+	// scan key that bounds the descent at the column's NULL group. It
+	// combines with LowKey/HighKey on the same column (`x IS NOT NULL AND
+	// x < 5`), never with Key/Keys/SAOPKeys/RangePrefix/SkipPrefix.
+	LeadingNullTest IndexNullTest
+	// NullTestAfterBounds: the NullTest followed the range bounds in the
+	// relation's restriction list, so `Index Cond` prints it after them
+	// (PG lists one column's index clauses in baserestrictinfo order).
+	NullTestAfterBounds bool
 	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
 	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
 	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the

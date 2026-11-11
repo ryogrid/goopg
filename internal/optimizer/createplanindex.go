@@ -596,10 +596,12 @@ func createIndexScanPlan(p *Path) Node {
 	return rewrap(is)
 }
 
-// hasRangeClause reports whether any clause is a range bound.
+// hasRangeClause reports whether any clause is a range bound — or a
+// NullTest, which bounds the same leading column (M0148-0001c3a) and lowers
+// through the same range arm.
 func hasRangeClause(clauses []indexPathClause) bool {
 	for _, c := range clauses {
-		if c.op != parser.OpUnknown {
+		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone {
 			return true
 		}
 	}
@@ -631,7 +633,7 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 	// RangePrefix; every bound then sits on column n.
 	var prefix []Expr
 	for _, c := range p.IndexClauses {
-		if c.op != parser.OpUnknown {
+		if c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone {
 			break
 		}
 		if c.indexCol != len(prefix) || c.key == nil || len(c.saop) > 0 {
@@ -646,6 +648,20 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		is.RangePrefix = prefix
 	}
 	for i, c := range p.IndexClauses[len(prefix):] {
+		if c.nullTest != IndexNullTestNone {
+			// M0148-0001c3a: the leading column's NullTest index qual —
+			// never behind an equality prefix (restrictionLeadingNullTest
+			// only runs when nothing else bound the column).
+			if len(prefix) > 0 || c.indexCol != 0 || is.LeadingNullTest != IndexNullTestNone {
+				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
+			}
+			is.LeadingNullTest = c.nullTest
+			is.NullTestAfterBounds = is.LowKey != nil || is.HighKey != nil
+			if c.local != nil {
+				drop[c.local] = true
+			}
+			continue
+		}
 		if c.indexCol != len(prefix) || c.key == nil {
 			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
 		}

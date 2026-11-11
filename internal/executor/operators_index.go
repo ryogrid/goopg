@@ -1507,7 +1507,8 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	loKey, hiKey, o.rangeLoExcl, o.rangeHiExcl, ok, err = o.ctx.indexRangeBounds(indexRangeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix,
 		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
-		pos: o.plan.Pos(),
+		nullTest: o.plan.LeadingNullTest,
+		pos:      o.plan.Pos(),
 	}, o.outerSlot)
 	return loKey, hiKey, ok, err
 }
@@ -1522,7 +1523,11 @@ type indexRangeSpec struct {
 	prefix        []optimizer.Expr
 	low, high     optimizer.Expr
 	lowOp, highOp parser.OpCode
-	pos           int
+	// nullTest is a NullTest index qual on the same column
+	// (IndexScan.LeadingNullTest, M0148-0001c3a): IS NULL probes only the
+	// column's NULL group, IS NOT NULL stops the scan at it.
+	nullTest optimizer.IndexNullTest
+	pos      int
 }
 
 // indexRangeBounds computes the INDEX-ORDER bounds and their exclusivity for
@@ -1643,12 +1648,37 @@ func (ctx *Context) indexRangeBounds(sp indexRangeSpec, outerSlot SlotView) (loK
 		hiKey, hiExcl = ctx.compositeUpperBound(sp.index, k), false
 	}
 
+	// M0148-0001c3a: `col IS NULL` (SK_SEARCHNULL) is the column's NULL group
+	// — every entry whose key starts with the prefix and a NULL there,
+	// bounded inclusively on both ends like an equality-prefix probe. With a
+	// value bound beside it the qual is unsatisfiable (no NULL satisfies a
+	// comparison; _bt_preprocess_keys reports it so), and the scan is empty.
+	// The planner files the qual only for an index that stores NULL-keyed
+	// entries, so a cluster without them is a planner bug here.
+	if sp.nullTest == optimizer.IndexNullTestIsNull {
+		if sp.low != nil || sp.high != nil {
+			return nil, nil, false, false, false, nil
+		}
+		k, _, stop, nerr := ctx.nullStopRangeBound(sp.index, prefix, col, np)
+		if nerr != nil {
+			return nil, nil, false, false, false, nerr
+		}
+		if !stop {
+			return nil, nil, false, false, false, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf(
+				"indexRangeBounds: IS NULL index qual on index %q, which stores no NULL-keyed entries", sp.index.Name)}
+		}
+		return k, ctx.compositeUpperBound(sp.index, k), false, false, true, nil
+	}
+
 	// An open end must not run into the NULL-keyed entries a capable cluster
 	// stores: `a > 5` excludes NULL, but the NULL group sits at one end of the
 	// index order. Only when the column carries exactly ONE value bound: with
 	// none this is a full scan or an equality-prefix probe, and both must keep
-	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)).
-	if (vLo == nil) != (vHi == nil) {
+	// the NULL entries (`a = 10` on (a, b) includes (10, NULL)) — unless an
+	// `IS NOT NULL` index qual (SK_SEARCHNOTNULL, M0148-0001c3a) excludes
+	// them, which stops the unbounded scan at the NULL group the same way.
+	notNullOnly := sp.nullTest == optimizer.IndexNullTestIsNotNull && vLo == nil && vHi == nil
+	if (vLo == nil) != (vHi == nil) || notNullOnly {
 		if k, atHigh, stop, err := ctx.nullStopRangeBound(sp.index, prefix, col, np); err != nil {
 			return nil, nil, false, false, false, err
 		} else if stop {

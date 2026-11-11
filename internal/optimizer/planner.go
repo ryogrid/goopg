@@ -19440,6 +19440,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if len(idxScan.RangePrefix) > 0 {
 		return proj
 	}
+	// M0148-0001c3a: likewise a NullTest index qual. IndexOnlyScan has no
+	// LeadingNullTest, and the qual's Filter is already gone, so copying the
+	// other fields would drop the NullTest from the scan altogether.
+	if idxScan.LeadingNullTest != IndexNullTestNone {
+		return proj
+	}
 	// M0146-0005dg: likewise a skip probe. Copying Keys without SkipPrefix
 	// re-aims `inv_item_sk = 100` at the leading `inv_date_sk` (measured),
 	// and the promotion's re-costing has no num_sa_scans. PG 18 does make
