@@ -1,31 +1,33 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #10: M0148-0001c3a slice 1 landed)
+# Working Set — loop end 2026-11-11 (run-2 loop #11: census IDENTICAL; M0148-0001c3a slice 2 landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: REUSE of exhausted routing-20261111e at loop start (item 10 live). 89031bbc1 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 2a21c4185 (the head the next census A/Bs against).
-- Task: M0148-0001c3a (`col IS [NOT] NULL` as a btree index qual) — IN PROGRESS, slice 1 landed in 89031bbc1 (plain index scans, leading column).
-- Files (89031bbc1):
-  - optimizer/plan.go: IndexNullTest type, IndexScan.LeadingNullTest/NullTestAfterBounds.
-  - optimizer/pathindexclauses.go: indexPathClause.nullTest.
-  - optimizer/pathindexrestrict.go: restrictionLeadingNullTest, withNullTestInConjunctOrder, rangeIndexSelectivity arm.
-  - optimizer/createplanindex.go: hasRangeClause, createRangeIndexScanPlan arm.
-  - optimizer/planner.go: tryPromoteIndexOnlyScan guard.
-  - executor/operators_index.go: indexRangeSpec.nullTest, indexRangeBounds IS NULL / IS NOT NULL bounds.
-  - executor/operators_explain.go: Index Cond rendering.
-  - Test: executor/nulltest_index_qual_test.go. Design doc 0148-0001c3a + README row.
-- Key symbols: restrictionLeadingNullTest, IndexScan.LeadingNullTest, indexRangeBounds, nullStopRangeBound, formatIndexCondPrefixed.
+- S9: DUE after 89031bbc1 → routing-20261111f (label s9bi, BASELINE_REV=2a21c4185) IDENTICAL ×3. f303d61c7 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 3218fd9eb, the head routing-20261111f consumed.
+- Nightly fires at 00:00. Check `pgrep -fa run-nightly` before long gates; the sf025 sweep and acceptance arm refuse while it runs.
+- Task: M0148-0001c3a (`col IS [NOT] NULL` as a btree index qual) — IN PROGRESS.
+  - Slice 1 (89031bbc1): plain scans.
+  - Slice 2 (f303d61c7): index-only scans.
+- Files (f303d61c7):
+  - optimizer/plan.go: IndexOnlyScan.LeadingNullTest/NullTestAfterBounds.
+  - optimizer/pathindexonly.go: indexOnlyLeafClauses, plainRestrictionBindsOnlyPrefix, hasRangeClause sel/pathkeys.
+  - optimizer/createplanindex.go: the IOS lowering arm.
+  - optimizer/planner.go: tryPromoteIndexOnlyScan now copies the fields.
+  - executor/operators_indexonly.go: the lookupRangeBounds arm.
+  - executor/operators_explain.go: formatNullTestIndexCond, shared by both scan nodes.
+  - Test nulltest_index_qual_test.go (IOS cases); design doc + README.
+- Key symbols: restrictionLeadingNullTest, withNullTestInConjunctOrder, IndexOnlyScan.LeadingNullTest, indexOnlyScanOp.lookupRangeBounds, formatNullTestIndexCond.
 - Findings:
-  - nullStopRangeBound already gives the NULL-group key and its end. IS NULL = [k, compositeUpperBound(k)].
-  - A leaf's conjuncts are cost-sorted, so WHERE order is gone (ledger).
-  - Regress has no slice-1 shapes; its NullTest hunks are the IOS, bitmap and GiST producers.
-- Next step: S9 due-check, then c3a slice 2, the index-only producer (pathindexonly.go addIndexOnlyPaths / restrictionPathIsIndexOnly).
-  - File a NullTest clause there and add IndexOnlyScan.LeadingNullTest. Wire the executor IOS range arm (operators_indexonly.go: find its indexRangeSpec use) and formatIndexOnlyCondPrefixed.
-  - Then the ordered producer (pathindexordered.go) for `where x is not null order by x limit 1`.
-  - Target probe: create_index `SELECT unique1 FROM tenk1 WHERE unique1 IS NULL AND unique1 IS NULL` → `Index Only Scan … Index Cond: ((unique1 IS NULL) AND (unique1 IS NULL))`.
-- Top-residual: M0148 residues. Open children: c3a (slices 2-3), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - The IOS executor duplicates the range-bound code (now sibling-patched).
+  - Path-based index scans can't scan backward (createplanindex.go:333 refuses). Ledger.
+  - Duplicate NullTests: only the first is indexed. Ledger.
+- Next step: S9 due-check. Then c3a slice 3, the bitmap producer (pathbitmap.go / createplanbitmap.go).
+  - create_index: `thousand = 42 AND (tenthous = 1 OR … OR tenthous IS NULL)` → BitmapOr of `(thousand = 42) AND (tenthous = ANY …)` and `(thousand = 42) AND (tenthous IS NULL)`.
+  - That needs a NullTest behind an equality prefix (restrictionEqualityPrefix + NullTest on the next column), so do the plain-scan behind-prefix arm first.
+  - Or close c3a with slice 3 + duplicates + backward filed as residue child c3a1 (j-series pattern) if the bitmap arm proves large.
+- Top-residual: M0148 residues. Open children: c3a (bitmap, behind-prefix), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; REUSE exhausted routing-20261111e); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261111f exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 89031bbc1):
-  - PASS: units, TestPort_RegressSuite (312 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3afs fires=none ×3.
-  - Regress 17 suites hunk-identical vs a HEAD worktree.
-- In-flight: none. Scratch PG (5545) and goopg (5533) stopped; tmp/wt-head removed. tmp/pgscratch-j4 datadir kept for reuse (scratch, not a ref cluster).
+- Gates run (staged code_tree for f303d61c7):
+  - PASS: units, TestPort_RegressSuite (371 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3bfs fires=none ×3.
+  - Regress 17 suites neutral.
+- In-flight: none. Scratch PG 5545 and goopg 5533 stopped.

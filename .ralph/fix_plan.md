@@ -12054,11 +12054,16 @@ Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangef
     `where x is null` and `x is not null and x < 5` identical (ASC and DESC).
     Gates units, RegressSuite, spotcheck, sf025 99/99, acceptance 24 MATCH,
     fire-set fires=none ×3; regress 17 suites hunk-identical.
-    - Next slice: the index-only / ordered producers (pathindexonly.go,
-      pathindexordered.go): `select x … where x is not null order by x
-      limit 1` (PG Index Only Scan, Index Cond) and create\_index's `unique1
-      IS NULL AND unique1 IS NULL`; IndexOnlyScan needs LeadingNullTest too
-      (the executor's IOS range arm shares indexRangeBounds).
+  - Slice 2 LANDED (2026-11-11, f303d61c7): the index-only producer files
+    the NullTest too (indexOnlyLeafClauses, plainRestrictionBindsOnlyPrefix),
+    lowered onto IndexOnlyScan.LeadingNullTest; the IOS executor range code
+    got the sibling arm. `where x is not null order by x limit 1` = PG's
+    Index Only Scan + Index Cond. Gates units, RegressSuite, spotcheck,
+    sf025 99/99, acceptance 24 MATCH, fire-set fires=none ×3; regress neutral.
+    - Still open (ledger): duplicate/contradictory NullTests on one column
+      (create\_index `unique1 IS NULL AND unique1 IS NULL`); backward
+      path-based index scans (createplanindex refuses a non-forward
+      IndexScanDir — `order by x desc limit 1` sorts).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes
