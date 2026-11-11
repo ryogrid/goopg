@@ -1,37 +1,26 @@
-# Working Set — loop end 2026-11-04 (run-2 loop #52: census CHANGED-text/verdict same; M0148-0001j2 CLOSED)
+# Working Set — loop end 2026-11-11 (run-2 loop #2: S9 census IDENTICAL; M0148-0001j3 CLOSED)
 
-- Anomaly: none (prev-loop check OK).
-- S9 census:
-  - DUE after 80c8249f9 → routing-20261104e (b931c2b4d), label s9bb, BASELINE_REV=456b0527b. Full capture committed: TPC-H Q15 filter text moved to PG's `'…'::text` labels.
-  - Verdict unchanged: 22/22, 99/99, 99/99, CATEGORIES all 0. routing-20261104e is the new TPC-H BASE.
-  - 05b02362f touches internal/executor + internal/catalog (DDL only). Run `scripts/s9-census-due.sh` next loop and obey its verdict. If DUE, BASELINE_REV = 406e379a4, the head routing-20261104e consumed.
-- Task: M0148-0001j2 (item 1: DROP TYPE / DROP DOMAIN column, attribute and domain dependents) — DONE in 05b02362f; records 8c1531f51. Residue filed as M0148-0001j3.
+- Anomaly: prev-loop check flagged claude_output_2026-11-11_16-58-28 — a 1-turn `Credit balance is too low` api_error, no work lost. Separately, owner commit 88ef78511 ("doc(deepeiki)") carried an earlier loop's uncommitted M0148-0001j3 WIP (type USAGE ACL, ROLLBACK role revert); this loop verified and gated it.
+- S9 census: DUE (88ef78511 touched internal/catalog) → routing-20261111a (65afe1d10), label s9bd, BASELINE_REV=8c1531f51. IDENTICAL x3, 22/22·99/99·99/99. Next DUE baseline = d5a987211's parent records head.
+- Task: M0148-0001j3 — DONE (88ef78511 + d5a987211). Residue filed as M0148-0001j4.
 - Files:
-  - internal/executor/drop_type_dependents.go: generic walker with type-like nodes; column / attribute / domain nodes; tableStillRegistered, dropCompositeAttribute, dropDomainObject.
-  - internal/executor/operators_ddl.go:
-    - dropColumn(fromDependency) wraps execAlterDropColumn.
-    - replaceCompositeFields is now shared.
-    - execDropDomain uses the walk.
-    - execCreateTable got a createUndoRecorded guard.
-  - internal/catalog/catalog.go: AllCompositeTypes; DropDomain skips Dropped columns.
-  - Test internal/executor/drop_type_columns_test.go; design doc 0148-0001j2 + README row.
-- Key symbols: typeDependentObjects, dropTypeDependents, dropColumn, replaceCompositeFields, dropDomainObject.
+  - internal/executor/operators_ddl.go: execDropType resolves a domain first (dropTypeDependents + dropDomainObject).
+  - internal/executor/drop_type_domain_test.go: TestDropTypeOfDomain.
+  - docs/design/0100-0149/0148-0001j3-type-usage-privilege-and-drop-type-domain.md + README row.
+  - .ralph/fix_plan.md (j3 [x], j4 filed), .ralph/deferral_ledger.md (j3 row).
+- Key symbols: checkTypeUsage, typeUsagePermitted, typeUsageTarget, connTxState.RestoreTxRoleForRollback, execDropType.
 - Findings:
-  - Tables are keyed by catalog.NamespaceDBOid(CurrentDatabaseOid). Composite types and domains are keyed by the raw db OID. The old DropDomain scan used the raw OID, so it never found a dependent table in a live server.
-  - New S2 filings with ESCALATION blocks, awaiting owner placement (not selected):
-    - P0-E24: partitioned parent lost at restart; the reload skips relkind p.
-    - P0-E25: user-type columns reload as text; OIDToTypeName defaults to "text".
-  - internal/postmaster failed once (flake), then passed uncached (149 s).
-- Next step: S9 due-check. Then the topmost open M0148 child in file order: M0148-0001j3 (suggest its item 5, type USAGE aclchecks, which closes the privileges regression). Residue children are selected before M0148-0002 (copy) per milestone rule 6.
-- Top-residual: M0148 residues. The open children are j3, c3a, c3b, g1, f3, e2, h1, i2, k1, then the M0148-0002 copy suite (7 hunks).
+  - Regress A/B (19 suites, base 8c1531f51): privileges 3925→3781, create_operator 243→196, alter_generic 840→804, domain 1718→1717. plpgsql and polymorphism moved run-to-run (variance).
+  - privileges "types" block now matches PG. The remaining privileges hunks are listed in j4: the array-coercion EXECUTE check, and has_*_privilege "does not exist" in the default-privileges block.
+  - The nightly batch fired late (16:58) and blocks the sf025 sweep and the acceptance arm while it runs. Check `pgrep -fa run-nightly` before long gates.
+  - Its log-push stages ci/logs files in the shared index, so commit by pathspec.
+- Next step: run `scripts/s9-census-due.sh` (d5a987211 touched internal/executor DDL only; obey the verdict). Then take the topmost open M0148 child in file order. The baton suggests M0148-0001j4 or the earlier open children (c3a, c3b, g1, f3, e2, h1, i2, k1); verify the order in fix_plan.
+- Top-residual: M0148 residues. Open children: j4, c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: 0 channel (P0-E8 [x]); 1/2/2a discharged; 3 channel (census routing-20261104e, exhausted); 4-8 channel; 9 M0147 channel + 2 owner-gated [!].
-  - Item 10: M-NIGHTLY open S2 items awaiting owner placement: P0-E9/E10/E11/E13/E15/E16/E24/E25. Then M0148.
-- Gates run (code_tree 43a470fd):
-  - units PASS; TestPort_RegressSuite + PgDump* + Isolation* PASS.
-  - tpch-spotcheck PASS; sf025 99/99; acceptance values identical; fire-set fires=none ×3.
-  - Regress A/B, 37 suites, line counts:
-    - improved: alter_table −25, domain −34, create_table −24, plpgsql −9, insert −2;
-    - unchanged: enum;
-    - grew on residue: create_type +4, privileges +46.
-- In-flight: none. Scratch PG (5545) and goopg (5533/5534) stopped; worktree tmp/wt-head removed.
+  - Items 0-9: P0-E8(channel: already [x]); M0146-0014(channel; census routing-20261111a exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY S2 items P0-E9/E10/E11/E13/E15/E16/E24/E25 (owner-placement); nightly action-items 0. Then M0148.
+- Gates run (staged code_tree for d5a987211):
+  - PASS: units (warm cache), internal/postmaster (169 s), TestPort_RegressSuite;
+  - PASS: tpch-spotcheck (Q12=2, Q13=35), sf025 99/99, acceptance-arm 24 MATCH;
+  - PASS: nightly 20261111-165815 on 88ef78511 (testport, pgbench, tpcds).
+- In-flight: none. tmp/wt-base worktree removed. Regress diffs remain only in tmp/regress-ab-chg.

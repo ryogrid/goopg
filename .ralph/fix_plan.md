@@ -11858,7 +11858,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     scratch PG. Gates on code_tree 43a470fd: units, RegressSuite + PgDump
     + Isolation, spotcheck, sf025 99/99, acceptance, fire-set fires=none x3.
   Movement: regress — 37-suite A/B: alter_table 3648→3623, domain 1752→1718, create_table 639→615, plpgsql 4009→4000, insert 1057→1055; enum unchanged; create_type 402→406 and privileges 3879→3925 on residue (routine OID order, missing type USAGE checks)
-- [ ] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
+- [x] **M0148-0001j3 — DROP TYPE residue: OID order across catalogs,
   type USAGE privilege checks, DROP TYPE of a domain, composite-array
   pg\_proc OIDs**.
   Kind: impl
@@ -11883,6 +11883,41 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
   Resume: catalog OID allocation (one counter for routines and relations,
   as PG's GetNewOidWithIndex); executor type-reference resolution for an
   aclcheck on USAGE (pg_type typacl); execDropType domain arm.
+  - LANDED 88ef78511 + d5a987211 (2026-11-11) — CLOSED (residue split to
+    M0148-0001j4): items (5) and (6). Type USAGE aclchecks at every
+    aclcheck\_error\_type site (type\_usage\_acl.go checkTypeUsage; array
+    types use the element ACL, NULL typacl grants PUBLIC), ExecGrant\_Type
+    0LP01/42809 and restrict\_and\_check\_grant, ROLLBACK reverting
+    session-level SET ROLE / SESSION AUTHORIZATION (AtEOXact\_GUC;
+    connTxState.txRolePrior), CREATE CAST domain warning, user types in DROP
+    AGGREGATE/OPERATOR args; DROP TYPE resolves a domain. The 88ef78511 part
+    was committed together with the deepwiki docs, outside a loop.
+    Design doc docs/design/0100-0149/0148-0001j3-type-usage-privilege-and-drop-type-domain.md.
+  - Gates: units, postmaster, TestPort\_RegressSuite PASS; tpch-spotcheck
+    PASS; sf025 99/99; acceptance 24 MATCH; nightly 20261111-165815 PASS on
+    88ef78511; census routing-20261111a IDENTICAL x3.
+Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, alter\_generic 840→804, domain 1718→1717)
+- [ ] **M0148-0001j4 — DROP TYPE residue (2): OID order across catalogs,
+  composite-array pg\_proc OIDs, composite field-select on SQL-function
+  params, typed-table column options, view `_RETURN` type dependency**.
+  Kind: impl
+  Parent: M0148-0001j3
+  Residue of M0148-0001j3 items (1)-(4) and (7), unchanged in substance.
+  (1) Routine OIDs come from a counter apart from relation/type OIDs, so a
+  mixed function/column/domain dependent list reports out of PG order
+  (regress create\_type myvarchar; typed\_table `persons, get_all_persons(),
+  persons2`). (2) pg\_proc.proargtypes holds 0 for a composite-array
+  argument (`st[]`). (3) `(s).total` on a composite SQL-function parameter
+  errors "applied to type unknown"; `CREATE TABLE … OF t (name WITH OPTIONS
+  …)` repeating a column is accepted (PG 42701, transformOfType). (4)
+  Grouping sets with no sorted rollup hash an ordered aggregate. (5) View
+  columns over the type depend through the `_RETURN` rule, not modelled.
+  Also seen in regress privileges, outside type USAGE: the EXECUTE check
+  on an array-element coercion function (`'{1}'::int4[]::int8[]` as an
+  ungranted user), and `has_type_privilege` / `has_function_privilege`
+  failing "function … does not exist" in the default-privileges block.
+  Resume: catalog OID allocation (one GetNewOidWithIndex-style counter for
+  routines and relations/types); routine proargtypes for array-of-composite.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
