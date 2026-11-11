@@ -5246,6 +5246,12 @@ func formatExprQual(e optimizer.Expr, reg *subPlanReg, qualify bool) string {
 				return txt
 			}
 		}
+		// M0148-0001c3a1: an unknown literal coerced to name (namein at parse
+		// analysis) is a name-typed Const, which get_const_expr labels:
+		// `(stringu1 = 'TVAAAA'::name)`, regress create_index / select.
+		if sc, isStr := x.Operand.(*optimizer.StringConst); isStr && strings.EqualFold(x.TargetType, "name") {
+			return quoteLiteral(sc.Value) + "::name"
+		}
 		return formatExprQual(x.Operand, reg, qualify)
 	case *optimizer.FuncCall:
 		// Composite field selection's run-time form renders as the SQL it
@@ -5833,6 +5839,13 @@ func coerceLiteralText(lit optimizer.Expr, t catalog.Type) (otherCast, text stri
 	case "text":
 		if c, isStr := lit.(*optimizer.StringConst); isStr {
 			return "", quoteLiteral(c.Value) + "::text", true
+		}
+	case "name":
+		// The unknown literal resolves to name (namein), the operator is
+		// name's own (nameeq / namelt …): `(stringu1 = 'TVAAAA'::name)`,
+		// regress create_index / select. M0148-0001c3a1.
+		if c, isStr := lit.(*optimizer.StringConst); isStr {
+			return "", quoteLiteral(c.Value) + "::name", true
 		}
 	case "date":
 		// date_in's value prints as date_out's ISO text (M0146-0005cw,

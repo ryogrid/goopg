@@ -16,7 +16,7 @@ import (
 func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE ll (a int, b int8, c char(5), d text, e numeric, f varchar(9), h int2, ts timestamp, g date)")
+	runSQL(t, ctx, "CREATE TABLE ll (a int, b int8, c char(5), d text, e numeric, f varchar(9), h int2, ts timestamp, g date, n name)")
 	ps := optimizer.DefaultPlannerSettings()
 	ps.MaxParallelWorkersPerGather = 0
 	for _, c := range []struct{ where, want string }{
@@ -31,6 +31,8 @@ func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 		{"h = 3", "Filter: (h = 3)"},
 		{"c = 'TN'", "Filter: (c = 'TN'::bpchar)"},
 		{"d = 'x'", "Filter: (d = 'x'::text)"},
+		{"n = 'TVAAAA'", "Filter: (n = 'TVAAAA'::name)"},
+		{"n < 'B'", "Filter: (n < 'B'::name)"},
 		{"f = 'x'", "Filter: ((f)::text = 'x'::text)"},
 		{"g >= '2002-5-01'", "Filter: (g >= '2002-05-01'::date)"},
 		{"g = '2002-5-1'", "Filter: (g = '2002-05-01'::date)"},

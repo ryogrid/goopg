@@ -195,11 +195,31 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
   sf025 99/99, acceptance 24 MATCH, fire\-set `fires=none` on all three
   corpora.
 
+## M0148\-0001c3a1: `name` literal labels
+
+- **Divergence.** Parse analysis coerces an unknown literal compared with a
+  `name` column to a name\-typed Const, and `get_const_expr` prints it as
+  `'TVAAAA'::name`. goopg's planner holds it as an implicit
+  `CastExpr('TVAAAA' → name)`, which `formatExprQual` printed bare.
+- **Change.**
+  - `formatExprQual`'s CastExpr arm labels a string literal under an
+    implicit cast to `name`.
+  - `coerceLiteralText` gets the matching `name` arm, for a bare literal
+    operand.
+  - Only `name` is labelled. Labelling every implicit literal cast would
+    change corpus plan text for other types (dates, numerics) and is not
+    needed there.
+- **Result.** Filter and Recheck Cond now match PG, e.g.
+  `Recheck Cond: (stringu1 = 'TVAAAA'::name)`. Regress select 270 → 256,
+  create\_index 3306 → 3305.
+- **Tests.** `TestLiteralPrintsAsCoercedConst` adds `n = 'TVAAAA'` and
+  `n < 'B'`.
+
 ## Not covered (M0148\-0001c3a1)
 
-- **Literal type labels in the Recheck Cond.** goopg prints
-  `(stringu1 = 'TVAAAA')` where PG prints `'TVAAAA'::name`. This is a
-  rendering gap, not part of this change.
+- **Index Cond keys print literals without the column type's label**
+  (`Index Cond: (stringu1 = 'TVAAAA')`). `formatIndexCondKey` renders the
+  probe key without the column type.
 - **A range behind an equality prefix under a bitmap**, and **BitmapOr
   over OR clauses** (`thousand = 42 AND (tenthous = 1 OR … OR tenthous IS
   NULL)`): goopg's bitmap producer generates neither (PG's
