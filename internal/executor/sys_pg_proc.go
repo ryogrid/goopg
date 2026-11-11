@@ -90,24 +90,100 @@ func pgProcOidVectorBytes(oids []uint32) []byte {
 // a `char` parameter (ArgTypeOIDs is char-only non-zero), so a quoted
 // `"char"` is CHAROID(18) rather than TypeNameToOID's unconditional
 // BPCHAROID(1042). The i<len guard is OOB-safe for pre-change routines.
-func pgProcArgOIDs(r *catalog.Routine) []uint32 {
+func pgProcArgOIDs(cat catalog.Catalog, r *catalog.Routine) []uint32 {
 	argOIDs := make([]uint32, len(r.ArgTypes))
 	for i, t := range r.ArgTypes {
 		if i < len(r.ArgTypeOIDs) && r.ArgTypeOIDs[i] != 0 {
 			argOIDs[i] = r.ArgTypeOIDs[i]
 		} else {
-			argOIDs[i] = catalog.TypeNameToOID(t.Name)
+			argOIDs[i] = PGProcTypeOID(cat, t.Name, r.DBOid)
 		}
 	}
 	return argOIDs
+}
+
+// PGProcTypeOID resolves a routine parameter or result type spelling to the
+// pg_type OID that pg_proc's proargtypes / proallargtypes / prorettype carry.
+// A built-in name goes through catalog.TypeNameToOID; a user enum, domain,
+// composite or range type (or `t[]`, its array type) resolves through the
+// catalog registry of the routine's database. PG stores the OID that
+// LookupTypeName found at CREATE FUNCTION (interpret_function_parameter_list,
+// ProcedureCreate); goopg resolved only built-in names and wrote 0 for every
+// user type, so pg_proc rows of functions over a composite, enum or domain
+// had an invalid type OID (M0148-0001j4 item 2).
+//
+// routineDB is the routine's DBOid — the namespace key (NamespaceDBOid),
+// which folds the postgres database (PostgresDBOid) into DefaultDBOid —
+// while user types are keyed by the connection's raw database OID, so for
+// the default database every raw OID that folds into it is tried.
+//
+// TypeNameToOID maps every name it does not know to text (25), so a user
+// type used to be written as text in the heap row (and as 0 by the virtual
+// view). A non-text answer is a built-in and wins; a text answer for a name
+// other than `text` is TypeNameToOID's fallback, so the user registries are
+// consulted first and the text fallback is kept only when they know nothing
+// either.
+func PGProcTypeOID(cat catalog.Catalog, spelling string, routineDB uint32) uint32 {
+	builtin := catalog.TypeNameToOID(spelling)
+	base, isArray := depTypeRef(spelling)
+	if builtin != catalog.OIDText || base == "text" || base == "" {
+		return builtin
+	}
+	if oid := userTypeOID(cat, base, isArray, routineDB); oid != 0 {
+		return oid
+	}
+	return builtin
+}
+
+// userTypeOID is PGProcTypeOID's user-registry arm: the OID (or, for isArray,
+// the array type's OID) of user type base in the routine's database, else 0.
+func userTypeOID(cat catalog.Catalog, base string, isArray bool, routineDB uint32) uint32 {
+	var im *catalog.InMemory
+	switch c := cat.(type) {
+	case *catalog.InMemory:
+		im = c
+	case *catalog.SearchPathCatalog:
+		im, _ = c.Catalog.(*catalog.InMemory)
+	}
+	if im == nil {
+		return 0
+	}
+	dbs := []uint32{routineDB}
+	if routineDB == 0 || routineDB == catalog.DefaultDBOid {
+		// Every raw connection OID that NamespaceDBOid folds into the
+		// default namespace: postgres (5), the default key itself, and 0
+		// (a session-less context).
+		dbs = []uint32{catalog.PostgresDBOid, catalog.DefaultDBOid, 0}
+	}
+	pick := func(oid, arrayOID uint32) uint32 {
+		if isArray {
+			return arrayOID
+		}
+		return oid
+	}
+	for _, db := range dbs {
+		if et, ok := im.LookupEnum(base, db); ok && et != nil {
+			return pick(et.OID, et.ArrayOID)
+		}
+		if d, ok := im.LookupDomain(base, db); ok && d != nil {
+			return pick(d.OID, d.ArrayOID)
+		}
+		if ct := im.LookupCompositeType(base, db); ct != nil {
+			return pick(ct.OID, ct.ArrayOID)
+		}
+		if rt, ok := im.LookupRangeType(base, db); ok && rt != nil {
+			return pick(rt.OID, rt.ArrayOID)
+		}
+	}
+	return 0
 }
 
 // pgProcInputArgOIDs is proargtypes: the input parameters only (IN, INOUT,
 // VARIADIC). OUT parameters and RETURNS TABLE columns are results and are
 // listed only in proallargtypes (M0146-0165). The heap row and the
 // (proname, proargtypes, pronamespace) index key both use it.
-func pgProcInputArgOIDs(r *catalog.Routine) []uint32 {
-	all := pgProcArgOIDs(r)
+func pgProcInputArgOIDs(cat catalog.Catalog, r *catalog.Routine) []uint32 {
+	all := pgProcArgOIDs(cat, r)
 	in := make([]uint32, 0, len(all))
 	for i, o := range all {
 		if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
@@ -199,8 +275,8 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine, dbOid ...uint32) Ro
 			rows = int64(v)
 		}
 	}
-	argOIDs := pgProcArgOIDs(r)
-	inArgOIDs := pgProcInputArgOIDs(r)
+	argOIDs := pgProcArgOIDs(cat, r)
+	inArgOIDs := pgProcInputArgOIDs(cat, r)
 	// proallargtypes / proargmodes list every parameter, and are non-NULL only
 	// when some parameter is not a plain IN one (interpret_function_parameter_list).
 	allArgTypes, argModes := NullDatum, NullDatum
@@ -212,7 +288,7 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine, dbOid ...uint32) Ro
 	// (ReturnTypeOID is char-only non-zero), so a `RETURNS "char"` writes
 	// CHAROID(18) into prorettype instead of TypeNameToOID's unconditional
 	// BPCHAROID(1042) — sibling of the proargtypes handling above.
-	retTypeOID := catalog.TypeNameToOID(r.ReturnType.Name)
+	retTypeOID := PGProcTypeOID(cat, r.ReturnType.Name, r.DBOid)
 	if r.ReturnTypeOID != 0 {
 		retTypeOID = r.ReturnTypeOID
 	}
@@ -377,7 +453,7 @@ func insertPgProcIndexEntries(ctx *Context, r *catalog.Routine, tid storage.Item
 	if err := insertPgProcOidIndexEntry(ctx, r.OID, tid); err != nil {
 		return fmt.Errorf("pg_proc_oid_index: %w", err)
 	}
-	argOIDs := pgProcInputArgOIDs(r)
+	argOIDs := pgProcInputArgOIDs(ctx.Catalog, r)
 	nsp := namespaceOIDForSchema(ctx.Catalog, r.Schema, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if err := insertPgProcPronameArgsNspIndexEntry(ctx, r.Name, argOIDs, nsp, tid); err != nil {
 		return fmt.Errorf("pg_proc_proname_args_nsp_index: %w", err)

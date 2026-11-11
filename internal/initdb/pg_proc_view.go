@@ -130,6 +130,28 @@ func typeNameToOIDStr(typName string) string {
 	}
 }
 
+// userRoutineTypeOIDStr is a user routine's parameter / result type OID for
+// the view, agreeing with the pg_proc heap row (executor buildPGProcRow): the
+// CREATE-time resolved OID when there is one (the `char` spellings), else the
+// built-in name map, else executor.PGProcTypeOID, which resolves user enum,
+// domain, composite and range types and their arrays (M0148-0001j4 item 2 —
+// the view wrote 0 for them).
+func userRoutineTypeOIDStr(cat *catalog.InMemory, name string, resolved, routineDB uint32) string {
+	if resolved != 0 {
+		return fmt.Sprintf("%d", resolved)
+	}
+	if s := typeNameToOIDStr(name); s != "0" {
+		return s
+	}
+	oid := executor.PGProcTypeOID(cat, name, routineDB)
+	if oid == catalog.OIDText && !strings.EqualFold(strings.TrimSpace(name), "text") {
+		// PGProcTypeOID's text fallback for an unresolved name: the view's
+		// convention for an unmapped spelling stays 0.
+		return "0"
+	}
+	return fmt.Sprintf("%d", oid)
+}
+
 // langNameToOIDStr maps a procedural-language NAME to its pg_language OID string.
 // goopg's pg_proc view stores prolang as oid (matching PG's catalog) so pg_dump's
 // dumpFunc join `pg_language l ON l.oid = p.prolang` resolves. The 3 built-in
@@ -414,7 +436,11 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			// Convert arg type names to space-separated OID strings.
 			argOIDs := make([]string, len(r.ArgTypes))
 			for i, t := range r.ArgTypes {
-				argOIDs[i] = typeNameToOIDStr(t.Name)
+				var resolved uint32
+				if i < len(r.ArgTypeOIDs) {
+					resolved = r.ArgTypeOIDs[i]
+				}
+				argOIDs[i] = userRoutineTypeOIDStr(cat, t.Name, resolved, r.DBOid)
 			}
 			// pronamespace: use schema OID. public=2200, pg_catalog=11.
 			// For user-created schemas, look up the OID from the catalog.
@@ -516,7 +542,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				r.Name,
 				ns,
 				langNameToOIDStr(r.Language), // prolang: oid (matches PG; resolves dumpFunc join)
-				typeNameToOIDStr(r.ReturnType.Name),
+				userRoutineTypeOIDStr(cat, r.ReturnType.Name, r.ReturnTypeOID, r.DBOid),
 				strings.Join(inArgOIDs, " "),
 				fmt.Sprintf("%d", len(inArgOIDs)), // pronargs
 				cat.ProcACLText(r.OID), // proacl: materialized from the GRANT store (NULL until first GRANT). DU-002 slice 345.

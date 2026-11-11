@@ -1,7 +1,7 @@
-# M0148\-0001j4 — one OID counter for routines, relations and types
+# M0148\-0001j4 — one OID counter for routines, relations and types; user type OIDs in pg\_proc
 
-**Parent:** M0148\-0001j3 · **Status:** item (1) landed 2026\-11\-11; the task
-stays open for items (2) to (5)
+**Parent:** M0148\-0001j3 · **Status:** items (1) and (2) landed 2026\-11\-11;
+the task stays open for items (3) to (5)
 
 ## Divergence
 
@@ -88,14 +88,84 @@ Regress runner, HEAD (`d5a987211`) → change, 19 suites:
   movement here is variance.
 - The other 15 suites are line\-count identical.
 
+## Item (2): user type OIDs in pg\_proc
+
+### Divergence
+
+`create type st as (a int, b text);` followed by
+`create function f3(st, en, en[], dm, rg) returns st[] …`:
+
+- **PG 18.3** stores each type's OID in `proargtypes` / `proallargtypes` /
+  `prorettype`. It takes the OID that `LookupTypeName` found during
+  `interpret_function_parameter_list` and `ProcedureCreate`, so an array
+  of a user type gets the array type's OID.
+- **goopg before** stored a wrong OID for every user enum, domain,
+  composite or range type:
+  - The pg\_proc heap row and the `(proname, proargtypes, pronamespace)`
+    index key resolved names with `catalog.TypeNameToOID`, which maps any
+    unknown name to text (25).
+  - The virtual pg\_proc view, which is what SELECT reads, used its own
+    name map and wrote 0.
+
+### Change
+
+`executor.PGProcTypeOID(cat, spelling, routineDB)`
+(internal/executor/sys\_pg\_proc.go) resolves a type in this order:
+
+1. A non\-text answer from `TypeNameToOID` is a built\-in and wins.
+2. Otherwise the user enum, domain, composite and range registries of the
+   routine's database are consulted. `t[]` returns the array type's OID.
+3. The text fallback is kept only for a name that resolves nowhere.
+
+Database keys: routines carry the namespace key (`NamespaceDBOid`), but
+types are keyed by the raw connection OID. So for the default namespace the
+resolver tries every raw OID that folds into it: 5 (postgres), 1, and 0.
+
+Callers — all three producers now agree:
+
+- The heap row (`buildPGProcRow` via `pgProcArgOIDs`) and the index key
+  (`insertPgProcIndexEntries`) share `pgProcInputArgOIDs(cat, r)`.
+- The view (`userRoutineTypeOIDStr` in internal/initdb/pg\_proc\_view.go)
+  checks in this order:
+  1. the CREATE\-time resolved OID, which now also reaches the view for the
+     `char` spellings;
+  2. its own built\-in map;
+  3. the shared resolver.
+
+  It keeps 0 for an unresolved name.
+
+The routine reload reads its JSON metadata, not these OIDs, so the change
+is restart\-safe.
+
+### Tests and measurement
+
+- **`TestPGProcUserTypeOIDs` (executor)** checks every argument OID:
+  - composite, composite array, enum, enum array and domain resolve to
+    their registry OIDs;
+  - `int[]` and `text` keep their built\-in OIDs;
+  - the result type `st[]` resolves;
+  - the text fallback stays for an unknown name.
+- **Server probe.** Before this change, `proargtypes` of `f1(st[])` was 0.
+  It is now `16407` (`_st`). For `f3` it is
+  `16406 16409 16410 16412 16414`, with prorettype `_st`.
+  `f5("char", char, jsonb)` gives `18 1042 3802`.
+- **Regress (19 suites).** Line counts are neutral; only the known
+  nondeterministic suites moved, by a few lines.
+
+### Blocked by P0\-E26
+
+After a restart the composite type registry is empty: composite types are
+registered only by DDL, and nothing re\-registers them from pg\_type. Their
+OIDs therefore fall back to 0 in the view (and to 25 in a rewritten heap
+row) until P0\-E26 is fixed. Enum, domain and range OIDs survive a restart.
+
 ## Not covered
 
 - **CREATE TABLE draws one OID; PG draws three.** PG draws the relation,
   its row type and the row type's array type. goopg's tables
   (`a`=16406, `b`=16408) draw one each. Absolute OIDs therefore drift from
   PG's, but the relative order of objects is now PG's. Ledger row.
-- **j4 items (2) to (5) are still open:**
-  - composite\-array `proargtypes`;
+- **j4 items (3) to (5) are still open:**
   - field selection on a composite parameter, and the typed\-table
     column\-option duplicate;
   - grouping sets that hash an ordered aggregate;
