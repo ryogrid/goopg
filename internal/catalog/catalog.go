@@ -26060,6 +26060,9 @@ type SearchPathCatalog struct {
 	// to drop other-session temp inheritance children during expansion
 	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
 	TempOwnerToken string
+	// ParamTypes are the declared types of $1..$n when the statement is a SQL
+	// function body (see ParamDeclaredType); nil otherwise.
+	ParamTypes []Type
 	// SnapshotPartitionDetachEpoch is the querying statement's snapshot
 	// partition-detach epoch (mvcc.Snapshot.PartitionDetachEpoch). The planner
 	// reads it via CurrentPartitionDetachEpoch to drop partition children that
@@ -26112,6 +26115,20 @@ func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog 
 // planner discovers it via a tempOwnerCarrier interface walk over the catalog
 // wrapper chain. Design 0118-0036.
 func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// ParamDeclaredType reports the declared type of parameter $n (1-based) for a
+// statement planned inside a SQL-language function body: PG's
+// sql_fn_parser_setup hands the parser each argument's declared type, so a
+// Param is typed from the start and `($1).f` resolves against the argument's
+// composite type (transformIndirection / ParseFuncOrColumn). ParamTypes is
+// nil for every other statement. M0148-0001j4 item (3).
+func (c *SearchPathCatalog) ParamDeclaredType(n int) (Type, bool) {
+	if n < 1 || n > len(c.ParamTypes) {
+		return Type{}, false
+	}
+	t := c.ParamTypes[n-1]
+	return t, t.Name != ""
+}
 
 // SeqScanDisabled reports the querying session's `enable_seqscan = off` GUC so
 // the planner can promote an ordered covering index scan to an IndexOnlyScan

@@ -106,6 +106,14 @@ func fieldSelectOnArg(x *parser.FieldSelect, arg Expr, ctx *resolveContext) (Exp
 	}
 
 	typ := exprType(arg)
+	if p, isParam := arg.(*ParamRef); isParam && (typ.Name == "" || strings.EqualFold(typ.Name, "unknown")) {
+		// Inside a SQL function body $n carries the argument's declared type
+		// (sql_fn_parser_setup), so `($1).f` / `(s).f` selects from the
+		// argument's composite type. M0148-0001j4 item (3).
+		if declared, ok := paramDeclaredType(ctx.cat, p.Number); ok {
+			typ = declared
+		}
+	}
 	fields, ok := compositeTypeFields(ctx.cat, typ)
 	outRecord := false
 	if !ok {
@@ -331,4 +339,27 @@ func fieldSelectErrPos(x *parser.FieldSelect) int {
 		return x.Arg.Pos()
 	}
 	return x.Pos()
+}
+
+// paramDeclaredType walks the catalog wrapper chain (peeling Unwrap, like
+// currentTempOwner) for the declared type of parameter $n — set only while
+// a SQL function body is planned (catalog.SearchPathCatalog.ParamTypes).
+func paramDeclaredType(cat catalog.Catalog, n int) (catalog.Type, bool) {
+	type carrier interface {
+		ParamDeclaredType(n int) (catalog.Type, bool)
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for cat != nil {
+		if c, ok := cat.(carrier); ok {
+			if t, ok := c.ParamDeclaredType(n); ok {
+				return t, true
+			}
+		}
+		u, ok := cat.(unwrapper)
+		if !ok {
+			break
+		}
+		cat = u.Unwrap()
+	}
+	return catalog.Type{}, false
 }

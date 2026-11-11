@@ -85,20 +85,103 @@ func namedParamRE(name string) *regexp.Regexp {
 }
 
 func rewriteSQLNamedParams(body string, argNames []string) string {
+	return rewriteSQLNamedParamsFor(body, "", argNames)
+}
+
+// rewriteSQLNamedParamsFor is rewriteSQLNamedParams for the body of function
+// funcName, which also accepts PG's `funcname.param` qualification
+// (sql_fn_post_column_ref: a two- or three-part name whose first part is the
+// function's name and whose second part is a parameter).
+func rewriteSQLNamedParamsFor(body, funcName string, argNames []string) string {
 	for i, name := range argNames {
 		if name == "" {
 			continue
 		}
 		re := namedParamRE(name)
 		pos := i + 1 // 1-based
-		body = re.ReplaceAllStringFunc(body, func(m string) string {
-			if m[0] == '\'' {
-				return m // leave string literals unchanged
+		var b strings.Builder
+		last := 0
+		for _, loc := range re.FindAllStringIndex(body, -1) {
+			m := body[loc[0]:loc[1]]
+			start := loc[0]
+			if m[0] != '\'' && funcName != "" {
+				if q, ok := funcQualifierStart(body, loc[0], funcName); ok && q >= last {
+					start = q // `funcname.param`: drop the qualifier
+				}
 			}
-			return fmt.Sprintf("$%d", pos)
-		})
+			b.WriteString(body[last:start])
+			last = loc[1]
+			switch {
+			case m[0] == '\'':
+				b.WriteString(m) // leave string literals unchanged
+			case start == loc[0] && precededByDot(body, loc[0]):
+				// `x.name` is the second part of a qualified column
+				// reference, not the parameter (PG's
+				// sql_fn_post_column_ref binds a parameter only as the
+				// FIRST name, or second after the function's own name —
+				// handled above).
+				b.WriteString(m)
+			case followedByDot(body, loc[1]):
+				// `name.field`: a field of a composite parameter. `$1.field`
+				// is not valid syntax, so emit `($1).field` (PG's
+				// sql_fn_post_column_ref resolves the two-part name to a
+				// FieldSelect over the Param). M0148-0001j4 item (3).
+				fmt.Fprintf(&b, "($%d)", pos)
+			default:
+				fmt.Fprintf(&b, "$%d", pos)
+			}
+		}
+		b.WriteString(body[last:])
+		body = b.String()
 	}
 	return body
+}
+
+// funcQualifierStart reports where a `funcName.` qualifier directly before
+// the identifier at i begins, when there is one and it is itself the first
+// part of the name (not preceded by another `.`).
+func funcQualifierStart(s string, i int, funcName string) (int, bool) {
+	j := i
+	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	if j == 0 || s[j-1] != '.' {
+		return 0, false
+	}
+	j--
+	for j > 0 && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
+		j--
+	}
+	end := j
+	for j > 0 && isIdentByte(s[j-1]) {
+		j--
+	}
+	if j == end || !strings.EqualFold(s[j:end], funcName) {
+		return 0, false
+	}
+	if j > 0 && (isIdentByte(s[j-1]) || precededByDot(s, j)) {
+		return 0, false
+	}
+	return j, true
+}
+
+// precededByDot reports whether the identifier starting at i is directly
+// preceded by `.` (spaces allowed), i.e. it is a qualified name's later part.
+func precededByDot(s string, i int) bool {
+	for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\n' || s[i-1] == '\r') {
+		i--
+	}
+	return i > 0 && s[i-1] == '.'
+}
+
+// followedByDot reports whether the identifier ending at j is directly
+// followed by `.` and then an identifier or `*` (not `..`, nor a number).
+func followedByDot(s string, j int) bool {
+	if j >= len(s) || s[j] != '.' || j+1 >= len(s) {
+		return false
+	}
+	c := s[j+1]
+	return c == '*' || c == '"' || c == '_' || (c|0x20 >= 'a' && c|0x20 <= 'z')
 }
 
 // plpgsqlFrame is the local variable frame for one routine call.
@@ -677,13 +760,45 @@ func internalArityError(name string, want, got int, pos int) error {
 	return &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("function %s() does not exist: expected %d argument(s), got %d", name, want, got)}
 }
 
+// bindSQLRoutineParamTypes gives the statements of a SQL-language function
+// body the declared types of $1..$n, as PG's sql_fn_parser_setup does, so the
+// planner can resolve `($1).field` / `(param).field` against a composite
+// argument (catalog.SearchPathCatalog.ParamTypes). M0148-0001j4 item (3).
+//
+// child.PlanCatalog is inherited by nested calls, so a routine without
+// parameters clears the caller's types instead of keeping them.
+func bindSQLRoutineParamTypes(child *Context, types []catalog.Type) {
+	if len(types) == 0 {
+		if sp, ok := child.PlanCatalog.(*catalog.SearchPathCatalog); ok && sp.ParamTypes != nil {
+			cp := *sp
+			cp.ParamTypes = nil
+			child.PlanCatalog = &cp
+		}
+		return
+	}
+	declared := make([]catalog.Type, len(types))
+	for i, t := range types {
+		declared[i] = normalizeCatalogType(t)
+	}
+	base := ctxPlanCatalog(child)
+	if sp, ok := base.(*catalog.SearchPathCatalog); ok {
+		cp := *sp
+		cp.ParamTypes = declared
+		child.PlanCatalog = &cp
+		return
+	}
+	w := catalog.WithSearchPath(base, nil)
+	w.ParamTypes = declared
+	child.PlanCatalog = w
+}
+
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Call arguments, $n and parameter names refer to the input parameters
 	// only; OUT parameters and RETURNS TABLE columns are not arguments.
 	inTypes, inNames := routineInputParams(r)
 	body := r.Body
 	if len(inNames) > 0 {
-		body = rewriteSQLNamedParams(body, inNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -719,6 +834,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, inTypes)
 	// M0129-S8.3h: sync parent command counter after function body runs so
 	// the caller sees the higher command id and subsequent statements don't
 	// hide writes that happened inside the function (PG's CommandCounterIncrement
@@ -871,7 +987,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	defer restore()
 	body := r.Body
 	if len(r.ArgNames) > 0 {
-		body = rewriteSQLNamedParams(body, r.ArgNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, r.ArgNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -894,6 +1010,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, r.ArgTypes)
 	// M0129-S8.3h: sync parent command counter after procedure body runs.
 	// Only cmdCounter is synced, NOT CmdID — see executeSQLRoutine.
 	defer func() {
@@ -964,7 +1081,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	defer restore()
 	body := r.Body
 	if len(inNames) > 0 {
-		body = rewriteSQLNamedParams(body, inNames)
+		body = rewriteSQLNamedParamsFor(body, r.Name, inNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
@@ -996,6 +1113,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		}
 		child.Params[i] = coerced
 	}
+	bindSQLRoutineParamTypes(child, inTypes)
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
@@ -3024,6 +3142,18 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (optimizer.Expr, error
 		return &optimizer.BooleanConst{Value: x.Value}, nil
 	case *parser.ParamRef:
 		return &optimizer.ParamRef{Number: x.Number}, nil
+	case *parser.FieldSelect:
+		// `(v).field` over a composite variable or parameter is the same
+		// reference as `v.field` (PG's plpgsql resolves both through
+		// plpgsql_post_column_ref / the parser's FieldSelect over the
+		// variable's datum), so route it through the qualified-name arm
+		// below. M0148-0001j4 item (3).
+		if cr, ok := x.Arg.(*parser.ColumnRef); ok && cr.Table == "" && cr.Schema == "" {
+			if _, isComposite := frame.compositeVarFields[strings.ToLower(cr.Column)]; isComposite {
+				return lowerPLpgSQLExpr(&parser.ColumnRef{Table: cr.Column, Column: x.Field}, frame)
+			}
+		}
+		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	case *parser.ColumnRef:
 		// Handle OLD.col and NEW.col in trigger context by looking them up
 		// in the pre-injected trigger column variables. M0096-0012.

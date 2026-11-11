@@ -1,7 +1,7 @@
 # M0148\-0001j4 — one OID counter for routines, relations and types; user type OIDs in pg\_proc
 
-**Parent:** M0148\-0001j3 · **Status:** items (1) and (2) landed 2026\-11\-11;
-the task stays open for items (3) to (5)
+**Parent:** M0148\-0001j3 · **Status:** items (1), (2) and (3a) landed
+2026\-11\-11; the task stays open for items (3b), (4) and (5)
 
 ## Divergence
 
@@ -159,14 +159,88 @@ registered only by DDL, and nothing re\-registers them from pg\_type. Their
 OIDs therefore fall back to 0 in the view (and to 25 in a rewritten heap
 row) until P0\-E26 is fixed. Enum, domain and range OIDs survive a restart.
 
+## Item (3a): field selection on a composite SQL\-function parameter
+
+### Divergence
+
+`create type st as (total int, n int);` and then:
+
+- **`select (s).total`, `select ($1).total`, `return (s).total + (s).n`**
+  (SQL functions): goopg failed with `column notation .total applied to
+  type unknown`. PG returns the field.
+- **`select s.total`** failed with a syntax error at `.`.
+- **PL/pgSQL `return (s).total`** failed with `unsupported PL/pgSQL
+  expression *parser.FieldSelect`.
+
+PG 18.3 returns 5, 5, 7 and 5 for these calls. Regress rangefuncs
+`extractq2(t int8_tbl)` (`select t.q2`) and updatable\_views
+`rw_view1_aa` hit the same failure.
+
+### PG mechanism
+
+- **Typed Params.** `sql_fn_parser_setup` (executor/functions.c) installs
+  `sql_fn_param_ref`, so each Param carries its argument's declared type.
+  `transformIndirection` / `ParseFuncOrColumn` then build a FieldSelect
+  against that composite type.
+- **Name resolution.** `sql_fn_post_column_ref` resolves the names `s`,
+  `s.f` and `fn.s` (and `fn.s.f`) as the parameter or a field of it. A table
+  column always wins ("Never override a table\-column reference").
+
+### Change (three sibling paths)
+
+- **Planner.** `catalog.SearchPathCatalog.ParamTypes` and
+  `ParamDeclaredType(n)` carry the declared types.
+  - The optimizer's `fieldSelectOnArg` asks for them through
+    `paramDeclaredType`, which walks the catalog wrapper chain the way
+    `currentTempOwner` does.
+  - It does so only when the operand is an untyped `$n`.
+  - `bindSQLRoutineParamTypes` sets them on the body's plan catalog in
+    `executeSQLRoutine`, `executeSQLProcedureCore` and
+    `evalSQLFunctionSetof`.
+  - A routine without parameters clears types inherited from its caller.
+- **Named\-parameter rewrite** (`rewriteSQLNamedParamsFor`):
+  - `name.field` becomes `($n).field`;
+  - `x.name` (the parameter name as a later part) stays a column reference;
+  - `funcname.name` becomes `$n`, so `fcompos3.v.*` becomes `($1).*`.
+- **PL/pgSQL.** `lowerPLpgSQLExpr` gets a FieldSelect arm: `(v).field` over
+  a composite variable goes through the existing `v.field` path.
+
+### Tests and measurement
+
+- **`TestRewriteSQLNamedParamsQualified`** covers the qualified, column,
+  `.*`, string\-literal and function\-qualifier rewrites.
+- **`TestSQLFunctionCompositeParamFieldSelect`** checks the four SQL forms
+  and the PL/pgSQL form end to end.
+- **Probe.** Also correct: setof unions, nested calls, NULL arguments, and
+  `t.total + k` with a table alias.
+- **Regress, 32 suites:**
+  - rangefuncs 2289 → 2268, rowtypes 1298 → 1297, updatable\_views
+    4018 → 4017;
+  - every SQL\-function body that previously failed with "syntax error at
+    `.`" now parses (extractq2, fcompos3, rw\_view1\_aa);
+  - the other suites are unchanged or show only the known variance
+    (plpgsql, polymorphism, alter\_generic).
+
+### Remaining
+
+- **Column precedence is not modelled.** Text substitution cannot apply
+  PG's rule that a table column beats a parameter. `s.f` therefore binds
+  to parameter `s` even when a FROM item is also called `s`.
+- **A view's row type is not resolved.** `compositeTypeFields` excludes
+  views, so `rw_view1_aa(x rw_view1)` now fails with "not a composite type"
+  instead of a syntax error.
+- **`(param).*` as a function argument** fails with "unsupported expression
+  IndirectionStar" (regress rowtypes fcompos3).
+- **Item (3b) is still open:** `CREATE TABLE … OF t (col WITH OPTIONS …)`
+  repeating a column (transformOfType, 42701).
+
 ## Not covered
 
 - **CREATE TABLE draws one OID; PG draws three.** PG draws the relation,
   its row type and the row type's array type. goopg's tables
   (`a`=16406, `b`=16408) draw one each. Absolute OIDs therefore drift from
   PG's, but the relative order of objects is now PG's. Ledger row.
-- **j4 items (3) to (5) are still open:**
-  - field selection on a composite parameter, and the typed\-table
-    column\-option duplicate;
+- **j4 items (3b), (4) and (5) are still open:**
+  - the typed\-table column\-option duplicate;
   - grouping sets that hash an ordered aggregate;
   - view `_RETURN` type dependencies.
