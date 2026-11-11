@@ -12162,6 +12162,30 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes
       first — the leaf Filter is already cost-sorted (ledger).
+  - 2026-11-12 slice 1 LANDED: the core of item (1), a BitmapOr producer
+    (optimizer/pathbitmapor.go; design
+    docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md).
+    - Each OR arm is served by build\_paths\_for\_OR-style index paths
+      (arm clauses plus the other restriction clauses), with
+      choose\_bitmap\_and per arm.
+    - The Recheck Cond is the ORed arm quals; implied conjuncts leave the
+      Filter.
+  - Found and fixed on the way (S2 wrong results, already on HEAD): a
+    Parallel Bitmap Heap Scan returned one row per LOSSY page
+    (nextParallel).
+    - Regress bitmapops `a = 1` at work\_mem 64 gave 1273 of 1321 rows.
+    - BitmapOr would have made the passing bitmapops case return 1273 of
+      2485.
+  - Item (1) residue:
+    - PG 18 SAOP grouping (group\_similar\_or\_args /
+      make\_bitmap\_paths\_for\_or\_group); such ORs are declined for now.
+    - Sub-ORs in AND arms.
+    - useful\_predicate.
+    - The OR path as a chooseBitmapAnd candidate.
+    - Join OR clauses (bitjoinpaths).
+  - Resume: the SAOP-grouped arm (needs a bitmap SAOP carrier — see the
+    P2-09b note in the matchBitmapIndexQuals header), then items (2)-(6).
+  Movement: yes — regress create\_index 3286→3271, join 17792→17724 (subselect 2452→2462: goopg's own VALUES→OR rewrite now plans a BitmapOr)
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl

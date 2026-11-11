@@ -1,19 +1,33 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #17: census IDENTICAL; M0148-0001c3a1 CLOSED, residue c3a2 filed)
+# Working Set — loop end 2026-11-12 (run-2 loop #18: M0148-0001c3a2 slice 1 landed 1af538463)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 4092290f9 → routing-20261112d (label s9bo, BASELINE_REV=079d14643) IDENTICAL ×3. No code commit since, so the next loop's `scripts/s9-census-due.sh` should say REUSE; obey it.
-- Task: M0148-0001c3a1 — CLOSED (49bbd0613, a78d7dd43, 8cc9a4e51, 4092290f9). Residue filed as M0148-0001c3a2, directly after c3a1 in fix_plan.
-  - c3a2 items: BitmapOr first, then bitmap prefix range, duplicate NullTests, backward scans, WHERE order, varchar keys.
+- S9: REUSE at loop start (routing-20261112d). Code commit 1af538463 since → next loop's `scripts/s9-census-due.sh` should say DUE; capture with label s9bp, BASELINE_REV=74b53532d, as routing-20261112e. The fire-set A/B already showed fires=none on sf025 + sf1.
+- Task: M0148-0001c3a2 — BitmapOr over OR clauses + 5 more c3a2 items. Stays OPEN.
+  - Slice 1 LANDED: BitmapOr producer.
+  - Also fixed a pre-existing S2 wrong-results bug: a Parallel Bitmap Heap Scan dropped lossy-page rows.
+- Files:
+  - internal/optimizer/pathbitmapor.go (new: bitmapOrHeapPaths, bitmapOrArmPath, bitmapOrArmsWouldGroup, bitmapArmSubqual, bitmapOrRecheck, orOfAndsImplies).
+  - pathbitmap.go: buildOneBitmapPath split into buildBitmapIndexChild + bitmapHeapPathOver.
+  - costbitmap.go: costBitmapOrCost IndexPath exemption.
+  - createplanbitmap.go: BitmapOr recheck arm.
+  - executor/operators_bitmap.go: nextParallel lossy cursor.
+  - Test: executor/bitmap_or_paths_test.go.
+  - Design: docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md.
 - Findings:
-  - Regress carries 23 BitmapOr lines (create_index 11, join 8, partition_join 2, select 2) and only 1 varchar Index Cond hunk.
-- Next step: S9 due-check, then the topmost open M0148 child in file order (c3a2). Start with BitmapOr (PG generate_bitmap_or_paths, indxpath.c).
-  - Planner: for each OR restriction conjunct whose arms each match a bitmap index path, build a BitmapOr path (cost_bitmap_or_node: sum of arm costs + 100 * cpu_operator_cost * arms; selectivity = sum, capped at 1).
-  - Plan node: BitmapOr (does goopg have one already? grep optimizer/plan.go for BitmapOr / BitmapAnd).
-  - Executor: union the arms' TBMs (see BitmapAnd's intersect). Recheck Cond: the whole OR clause.
-  - Probe with regress create_index `stringu1 = 'TVAAAA' OR stringu1 = 'TVAAAB'` against the scratch PG (tmp/pgscratch-j4, port 5545).
+  - ORs that PG 18 groups into a SAOP (same column + same op, group_similar_or_args) are declined. They need a bitmap SAOP carrier (BitmapIndexScan multi-key; P2-09b note in the matchBitmapIndexQuals header).
+  - Ledgered: costBitmapTree double-charges 0.1*cpu_op*rows on index scans; the Bitmap node cost line differs (startup 0.29, width 84 vs PG 0.00/0).
+  - subselect +10: goopg rewrites `(a,b) IN (VALUES …)` into an OR, which now plans as a BitmapOr; PG plans a Nested Loop.
+- Next step: S9 census (DUE), then c3a2 item (1) residue — the SAOP-grouped arm. Use the regress join `(a.unique2 = 3 or a.unique2 = 7)` cases and create_index `thousand = 42 AND (tenthous = 1 OR …)`. Alternatively items (2)-(6) if the SAOP carrier proves big; split a child if so.
 - Top-residual: M0148 residues. Open children: c3a2, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112d exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run: census routing-20261112d (fire-set s9bo fires=none ×3, IDENTICAL). No code change this loop.
+  - Items 0-9: M0146-0014(channel; census routing-20261112d reused this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a2.
+- Gates run (all PASS):
+  - regress A/B over 16 suites: HEAD worktree vs candidate; bitmapops passes.
+  - units: cache warm, 7 min.
+  - tpch-spotcheck: Q12=2, Q13=35.
+  - sf025 sweep: 99/99 plan shapes identical.
+  - fire-set c3a2fs: fires=none on sf025 + sf1.
+  - acceptance arm: 24 MATCH.
+  - pgbench smoke (commit hook).
 - In-flight: none.
