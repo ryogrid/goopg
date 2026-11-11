@@ -12287,6 +12287,46 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     (`a IS NOT NULL AND a < 100 AND a IS NOT NULL`). Or item (4) /
     item (6).
   Movement: yes — regress create\_index 3166→3159
+  - 2026-11-12 slice 7 LANDED (0b245f9c2): item (5) — Index Cond keeps
+    one column's clauses in restriction-list order.
+    - conjunctPrecedes orders by source position; IndexCondOrder is
+      recorded on the scan nodes; rangeColumnCondParts renders it.
+    - Probe against PG: 10 ordering statements identical.
+  - Item (4), backward scans, is split to M0148-0001c3a3 (filed below):
+    it needs an access-method reverse leaf walk.
+  - Remaining here: item (6) varchar keys. The regress hunk once listed
+    for it (subselect `stringu1 = ("*VALUES*".column1)::text`) is a name
+    column against a VALUES param, so item (6) needs its own PG probe.
+    Plus the c3a2 residue: SAOP+range, inequality OR groups, plain-path
+    OR→SAOP behind a prefix, sub-ORs, useful\_predicate, join ORs.
+  Movement: none — regress 22 suites unchanged
+- [ ] **M0148-0001c3a3 — Backward ordered index scans (`Index Scan
+  Backward`, `Index Only Scan Backward`)**.
+  Kind: impl
+  Parent: M0148-0001c3a2
+  - Split from c3a2 item (4). PG builds a backward IndexPath beside the
+    forward one when the reversed pathkeys are useful (build\_index\_paths,
+    indxpath.c: index\_pathkeys built with ScanDirection backward). The
+    executor walks the btree right-to-left (\_bt\_first / \_bt\_steppage
+    with \_bt\_walk\_left, nbtsearch.c), which stays correct under
+    concurrent page splits.
+  - goopg today:
+    - indexPathOrdering can build backward pathkeys
+      (pathindexcarrier.go), but no producer asks for them.
+    - createIndexScanPlan panics on a non-forward IndexScanDir.
+    - The plain IndexScan executor has no reverse mode. The IOS
+      `Backward` flag only reverses a materialised max() rewrite.
+    - nbtree.ScanFromEnd walks left but tolerates skipped/repeated
+      entries under concurrent splits (fine for the endpoint probe, not
+      for query results).
+    - 26 `Index Scan Backward` lines in regress btree\_index /
+      create\_index / inherit / join / partition\_join.
+  - Resume:
+    - A correct reverse range cursor in internal/access/nbtree (left-link
+      walk with PG's move-right recovery after a concurrent split).
+    - Then IndexScan/IOS direction fields + executor reverse batches.
+    - Then producers emitting BackwardScanDirection paths, and EXPLAIN
+      ` Backward`.
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
