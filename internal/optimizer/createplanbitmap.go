@@ -102,8 +102,43 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	// createIndexScanPlan lowers them for the plain index scan.
 	var low, high Expr
 	var lowOp, highOp parser.OpCode
-	if len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown {
-		for _, c := range p.IndexClauses {
+	// M0148-0001c3a1: a NullTest clause lowers onto LeadingNullTest — on
+	// the leading column of a range probe, or on the column after the
+	// equality Keys.
+	var nullTest IndexNullTest
+	nullTestAfter := false
+	clauses := p.IndexClauses
+	if n := len(clauses); n > 0 && clauses[n-1].nullTest != IndexNullTestNone && (n == 1 || clauses[0].nullTest == IndexNullTestNone && clauses[0].op == parser.OpUnknown) {
+		// NullTest behind an equality prefix (or alone): strip it here.
+		nt := clauses[n-1]
+		if nt.indexCol != n-1 {
+			panic(fmt.Sprintf("createPlan: bitmap NullTest clause of %s does not follow its equality prefix", p.IndexInfo.Name))
+		}
+		nullTest, clauses = nt.nullTest, clauses[:n-1]
+	}
+	if hasRangeClause(clauses) {
+		var bounds []indexPathClause
+		for _, c := range clauses {
+			if c.nullTest != IndexNullTestNone {
+				if c.indexCol != 0 || nullTest != IndexNullTestNone {
+					panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries a misplaced NullTest", p.IndexInfo.Name))
+				}
+				nullTest, nullTestAfter = c.nullTest, len(bounds) > 0
+				continue
+			}
+			bounds = append(bounds, c)
+		}
+		clauses = bounds
+	}
+	if len(clauses) == 0 && nullTest != IndexNullTestNone {
+		// A NullTest alone on the leading column.
+		return &BitmapIndexScan{
+			pos: id.pos, Table: id.table, Alias: id.alias, Index: p.IndexInfo,
+			LeadingNullTest: nullTest, Pred: pred, schema: id.schema,
+		}
+	}
+	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown {
+		for _, c := range clauses {
 			if c.indexCol != 0 || c.op == parser.OpUnknown || c.key == nil {
 				panic(fmt.Sprintf("createPlan: bitmap range clause of %s is not a leading-column bound", p.IndexInfo.Name))
 			}
@@ -121,19 +156,21 @@ func createBitmapIndexScanPlan(p *Path) Node {
 			}
 		}
 		return &BitmapIndexScan{
-			pos:     id.pos,
-			Table:   id.table,
-			Alias:   id.alias,
-			Index:   p.IndexInfo,
-			LowKey:  low,
-			HighKey: high,
-			LowOp:   lowOp,
-			HighOp:  highOp,
-			Pred:    pred,
-			schema:  id.schema,
+			pos:                 id.pos,
+			Table:               id.table,
+			Alias:               id.alias,
+			Index:               p.IndexInfo,
+			LowKey:              low,
+			HighKey:             high,
+			LowOp:               lowOp,
+			HighOp:              highOp,
+			LeadingNullTest:     nullTest,
+			NullTestAfterBounds: nullTestAfter,
+			Pred:                pred,
+			schema:              id.schema,
 		}
 	}
-	for i, c := range p.IndexClauses {
+	for i, c := range clauses {
 		if c.indexCol != i {
 			panic(fmt.Sprintf("createPlan: bitmap index clause %d of %s claims index column %d; the index-column order was lost",
 				i, p.IndexInfo.Name, c.indexCol))
@@ -152,14 +189,15 @@ func createBitmapIndexScanPlan(p *Path) Node {
 	// clauses, Pred is nil.
 
 	bis := &BitmapIndexScan{
-		pos:    id.pos,
-		Table:  id.table,
-		Alias:  id.alias,
-		Index:  p.IndexInfo,
-		Key:    key,
-		Keys:   keys,
-		Pred:   pred,
-		schema: id.schema,
+		pos:             id.pos,
+		Table:           id.table,
+		Alias:           id.alias,
+		Index:           p.IndexInfo,
+		Key:             key,
+		Keys:            keys,
+		LeadingNullTest: nullTest,
+		Pred:            pred,
+		schema:          id.schema,
 	}
 	// Returned BARE: the leaf's `*Filter` wrappers must NOT be rebuilt here.
 	//

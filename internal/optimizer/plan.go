@@ -3707,6 +3707,12 @@ type BitmapIndexScan struct {
 	HighKey Expr
 	LowOp   parser.OpCode
 	HighOp  parser.OpCode
+	// LeadingNullTest / NullTestAfterBounds: a `col IS [NOT] NULL` index qual
+	// (M0148-0001c3a1) on Columns[len(Keys)] — the column after the equality
+	// Keys, or the leading column beside LowKey/HighKey — executed through
+	// the same SK_SEARCHNULL / SK_SEARCHNOTNULL bounds as IndexScan's.
+	LeadingNullTest     IndexNullTest
+	NullTestAfterBounds bool
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr

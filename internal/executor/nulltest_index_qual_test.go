@@ -11,7 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestNullTestIndexQual pins M0148-0001c3a slices 1-3: a `col IS [NOT] NULL`
+// TestNullTestIndexQual pins M0148-0001c3a slices 1-3 and c3a1's bitmap arm: a `col IS [NOT] NULL`
 // conjunct on an index's leading column is an index qual (PG's
 // match_clause_to_indexcol NullTest arm; btree amsearchnulls), executed as
 // SK_SEARCHNULL / SK_SEARCHNOTNULL bounds at the column's NULL group. Every
@@ -164,6 +164,68 @@ func TestNullTestIndexQual(t *testing.T) {
 		}
 		if want := sortedRowStrings(t, ctx, tc.twin); len(got) != len(want) {
 			t.Errorf("%s: %d rows through the prefix probe, twin %d", tc.q, len(got), len(want))
+		}
+	}
+
+	// c3a1: the bitmap producer files the NullTest too — planned with plain
+	// index and seq scans off, so the Bitmap Index Scan carries it.
+	bitmapPlan := func(q string) (*optimizer.BitmapIndexScan, int) {
+		t.Helper()
+		stmts, err := parser.Parse(q)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", q, err)
+		}
+		ps := optimizer.DefaultPlannerSettings()
+		ps.EnableSeqScan, ps.EnableIndexScan = false, false
+		advanceStmtCounter(ctx)
+		plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+		if err != nil {
+			t.Fatalf("Plan(%q): %v", q, err)
+		}
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatalf("Build(%q): %v", q, err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("Open(%q): %v", q, err)
+		}
+		rows := 0
+		for {
+			_, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Next(%q): %v", q, err)
+			}
+			rows++
+		}
+		_ = op.Close()
+		for n := plan; n != nil; {
+			switch v := n.(type) {
+			case *optimizer.BitmapHeapScan:
+				bis, _ := v.Outer.(*optimizer.BitmapIndexScan)
+				return bis, rows
+			case *optimizer.Project:
+				n = v.Child
+			case *optimizer.Filter:
+				n = v.Child
+			default:
+				return nil, rows
+			}
+		}
+		return nil, rows
+	}
+	for _, tc := range []struct{ q, twin string }{
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NULL", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NULL"},
+		{"SELECT * FROM ntq WHERE b = 3 AND a IS NOT NULL", "SELECT * FROM ntq WHERE b + 0 = 3 AND (a + 0) IS NOT NULL"},
+	} {
+		bis, rows := bitmapPlan(tc.q)
+		if bis == nil || len(bis.Keys) != 1 || bis.LeadingNullTest == optimizer.IndexNullTestNone {
+			t.Errorf("%s: no Bitmap Index Scan carrying the NullTest behind its prefix (%+v)", tc.q, bis)
+		}
+		if want := len(sortedRowStrings(t, ctx, tc.twin)); rows != want {
+			t.Errorf("%s: %d rows through the bitmap probe, twin %d", tc.q, rows, want)
 		}
 	}
 

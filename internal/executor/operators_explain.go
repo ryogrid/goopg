@@ -3101,7 +3101,11 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 		// leading-column bounds as the index scan arm does. A key-less
 		// bitmap renders nothing.
 		if p != nil && p.Index != nil {
-			if cond := formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg)); cond != "" {
+			cond := formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			if p.LeadingNullTest != optimizer.IndexNullTestNone {
+				cond = formatBitmapNullTestIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			}
+			if cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}
 		}
@@ -3916,6 +3920,28 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return formatNullTestIndexCond(p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+}
+
+// formatBitmapNullTestIndexCond renders a BitmapIndexScan's NullTest index
+// qual (M0148-0001c3a1): behind its equality Keys —
+// `((a = 3) AND (b IS NULL))` — or on the leading column beside its bounds.
+func formatBitmapNullTestIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, prefix string) string {
+	if len(p.Keys) == 0 {
+		return formatNullTestIndexCond(p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+	}
+	np := len(p.Keys)
+	if np >= len(p.Index.Columns) {
+		return ""
+	}
+	parts := make([]string, 0, np+1)
+	for i, k := range p.Keys {
+		parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKey(k, reg))
+	}
+	nt := prefix + p.Index.Columns[np] + " IS NULL"
+	if p.LeadingNullTest == optimizer.IndexNullTestIsNotNull {
+		nt = prefix + p.Index.Columns[np] + " IS NOT NULL"
+	}
+	return indexCondAndText(append(parts, nt))
 }
 
 // formatNullTestIndexCond renders a leading-column NullTest index qual

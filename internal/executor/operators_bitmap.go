@@ -223,6 +223,25 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey boo
 	}
 
 	o.rangeLoExcl, o.rangeHiExcl = false, false
+	// M0148-0001c3a1: a NullTest index qual — behind the equality Keys or on
+	// the leading column beside the bounds — probes through the same bound
+	// computation as the plain index scan (the Keys are its prefix).
+	if o.plan.LeadingNullTest != optimizer.IndexNullTestNone {
+		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys,
+			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
+			nullTest: o.plan.LeadingNullTest,
+			pos:      o.plan.Pos(),
+		}, o.outerSlot)
+		if rerr != nil {
+			return nil, nil, false, rerr
+		}
+		if !ok {
+			return nil, nil, true, nil
+		}
+		o.rangeLoExcl, o.rangeHiExcl = loExcl, hiExcl
+		return lo, hi, false, nil
+	}
 	if o.plan.LowKey != nil || o.plan.HighKey != nil {
 		// M0146-0061: a leading-column range probe, bounded exactly as the
 		// plain index scan bounds it (DESC swap, strictness, the NULL-keyed

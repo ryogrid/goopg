@@ -138,7 +138,45 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
   - The same diff appeared on a HEAD worktree (VACUUM\-timing\-dependent
     index\-only choice), and the re\-run passed.
 
+## M0148\-0001c3a1 item (1): the bitmap producer
+
+- **Producer** (`buildOneBitmapPath`, pathbitmap.go).
+  - After the equality prefix, a NullTest on the next column becomes an
+    index clause (`restrictionNullTestOnColumn`).
+  - With no prefix, the leading column's NullTest joins the leading
+    range (`withNullTestInConjunctOrder`).
+  - nulltestsel joins the selectivity.
+  - The clause's conjunct is exact, so `createBitmapHeapScanPlan` moves it
+    into the Recheck Cond (`bitmapqualorig`) rather than a Filter.
+- **Lowering** (`createBitmapIndexScanPlan`). The clause goes onto the new
+  `BitmapIndexScan.LeadingNullTest` / `NullTestAfterBounds`. It applies to
+  the column after the equality Keys, or to the leading column beside
+  LowKey/HighKey.
+- **Executor** (`bitmapIndexScanOp.lookupBounds`). NullTest probes go
+  through `indexRangeBounds`, with the Keys as the prefix.
+- **EXPLAIN.** `formatBitmapNullTestIndexCond` prints PG's text, e.g.
+  `Index Cond: ((a = 3) AND (b IS NULL))`.
+- **Probe vs PG.**
+  - The Bitmap Index Scan lines are identical, and so are the full plans
+    for the leading\-column shapes (`b IS NULL`, `b IS NOT NULL AND b <
+    300`).
+  - The heap node still differs for a literal equality key: goopg prints
+    `Recheck Cond: (b IS NULL)` plus `Filter: (a = 3)`, where PG puts both
+    in the Recheck Cond. That is M0146\-0012's narrowing: the bitmap arm
+    keeps a literal key as a Filter because it skips
+    `restrictionKeyUsable`'s cast checks.
+- **Tests.** `TestNullTestIndexQual` plans with plain index and seq scans
+  off, checks that the Bitmap Index Scan carries the NullTest behind its
+  prefix, and compares row counts with twins.
+
 ## Not covered (M0148\-0001c3a1)
+
+- **A literal equality key under a bitmap** stays a Filter instead of
+  joining the Recheck Cond (M0146\-0012).
+- **A range behind an equality prefix under a bitmap**, and **BitmapOr
+  over OR clauses** (`thousand = 42 AND (tenthous = 1 OR … OR tenthous IS
+  NULL)`): goopg's bitmap producer generates neither (PG's
+  `generate_bitmap_or_paths`).
 
 - **Duplicated or contradictory NullTests on one column**
   (`unique1 IS NULL AND unique1 IS NULL`, regress create\_index). Only the
@@ -150,10 +188,6 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
   `IndexScanDir`), so goopg sorts.
 - **min/max rewrite.** Its `IndexOnlyScan.Cond` prints an `Index Cond` but
   is a residual per index row, not a scan key.
-- **Bitmap producer.** For example `Index Cond: ((thousand = 42) AND
-  (tenthous IS NULL))` under a BitmapOr in regress create\_index. PG
-  prefers bitmap scans for the behind\-prefix shapes, so their plans still
-  differ until the bitmap producer carries the NullTest.
 - **A NullTest beside an equality on the same column.**
 - **Index Cond order.** goopg's leaf Filter is already cost\-sorted
   (order\_qual\_clauses puts the NullTest first), so `x < 5 AND x IS NOT

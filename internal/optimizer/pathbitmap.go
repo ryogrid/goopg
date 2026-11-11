@@ -147,6 +147,15 @@ func (s *searchCtx) buildOneBitmapPath(
 		return nil
 	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
+	// M0148-0001c3a1: a NullTest on the column after the equality prefix is
+	// an index clause too (match_clause_to_indexcol's NullTest arm). Exact,
+	// so its conjunct is the heap scan's recheck, not a Filter.
+	if n := len(indexClauses); n > 0 && n < len(idx.Columns) {
+		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
+			indexClauses = append(indexClauses, *nt)
+			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(nt.local, leaf))
+		}
+	}
 	// M0146-0061: with no equality on the leading column, a range bound on it
 	// is still an index clause. match_clause_to_indexcol takes any btree
 	// operator of the column's opfamily, so build_index_paths gives PG a
@@ -155,7 +164,13 @@ func (s *searchCtx) buildOneBitmapPath(
 	// bound into one band (rangeIndexSelectivity), as the plain index arm
 	// prices them.
 	if len(indexClauses) == 0 {
-		if rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts); len(rng) > 0 {
+		rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts)
+		// M0148-0001c3a1: the leading column's NullTest, alone or beside the
+		// bounds, as the plain restriction producer files it.
+		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil {
+			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		}
+		if len(rng) > 0 {
 			indexClauses = rng
 			qualSelectivity = rangeIndexSelectivity(leaf, conjuncts, rng)
 		}
