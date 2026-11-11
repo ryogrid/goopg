@@ -169,10 +169,37 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
   off, checks that the Bitmap Index Scan carries the NullTest behind its
   prefix, and compares row counts with twins.
 
+## M0148\-0001c3a1: literal bitmap keys join the Recheck Cond
+
+- **Divergence.** PG's `create_bitmap_scan_plan` lists every index qual in
+  the heap node's `Recheck Cond` (`bitmapqualorig`), for example
+  `Recheck Cond: ((a = 3) AND (b IS NULL))`. goopg kept a literal equality
+  key as a `Filter`.
+  - That was M0146\-0012's narrowing: `matchBitmapIndexQuals` did not run
+    the cast checks the plain producer applies.
+- **Change.** `matchBitmapIndexQuals` now takes the catalog. A literal key
+  that `restrictionKeyUsable` accepts sets `local`, so
+  `createBitmapHeapScanPlan` moves its conjunct into the recheck list.
+  - `restrictionKeyUsable` is the plain restriction producer's exactness
+    test. It refuses bool literals, numeric literals against integer
+    columns, and enum strings, so those keys stay a Filter.
+- **Probe vs PG.** Both `a = 3 AND b IS [NOT] NULL` plans are now
+  identical to PG.
+- **Regress (16 suites, HEAD worktree baseline).**
+  - subselect 2477 → 2452.
+  - create\_index: hunks now show `Recheck Cond: (thousand = 42)`, where
+    before they showed `Filter: ((thousand = 42) AND (…))`. The count moved
+    3304 → 3306 because the adjacent BitmapOr shapes are still missing.
+  - The rest are unchanged.
+- **Gates.** units, `TestPort_RegressSuite` + `PgDump`, tpch\-spotcheck,
+  sf025 99/99, acceptance 24 MATCH, fire\-set `fires=none` on all three
+  corpora.
+
 ## Not covered (M0148\-0001c3a1)
 
-- **A literal equality key under a bitmap** stays a Filter instead of
-  joining the Recheck Cond (M0146\-0012).
+- **Literal type labels in the Recheck Cond.** goopg prints
+  `(stringu1 = 'TVAAAA')` where PG prints `'TVAAAA'::name`. This is a
+  rendering gap, not part of this change.
 - **A range behind an equality prefix under a bitmap**, and **BitmapOr
   over OR clauses** (`thousand = 42 AND (tenthous = 1 OR … OR tenthous IS
   NULL)`): goopg's bitmap producer generates neither (PG's

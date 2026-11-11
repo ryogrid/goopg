@@ -146,7 +146,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	if partialPredicate != nil && !partialPredicateProvenBy(partialPredicate, conjuncts) {
 		return nil
 	}
-	indexClauses, qualSelectivity := matchBitmapIndexQuals(idx, tbl, conjuncts, id)
+	indexClauses, qualSelectivity := matchBitmapIndexQuals(s.cat, idx, tbl, conjuncts, id)
 	// M0148-0001c3a1: a NullTest on the column after the equality prefix is
 	// an index clause too (match_clause_to_indexcol's NullTest arm). Exact,
 	// so its conjunct is the heap scan's recheck, not a Filter.
@@ -318,6 +318,7 @@ func flattenExprAnd(expr Expr) []Expr {
 // id is the scanIdentity extracted from the leaf (via scanLeafFor); its
 // table provides the column-name→position mapping.
 func matchBitmapIndexQuals(
+	cat catalog.Catalog,
 	idx *catalog.Index, tbl *catalog.Table,
 	conjuncts []Expr,
 	id *scanIdentity,
@@ -367,8 +368,15 @@ func matchBitmapIndexQuals(
 				}
 				// M0146-0012: that same-type probe is exact, so the conjunct
 				// is the heap scan's recheck rather than a Filter beside it
-				// (createBitmapHeapScanPlan). A literal key keeps its Filter:
-				// this arm does not run restrictionKeyUsable's cast checks.
+				// (createBitmapHeapScanPlan).
+				local = conj
+			} else if restrictionKeyUsable(cat, tbl.Columns[cr.Index], val) {
+				// M0148-0001c3a1: a literal key the btree encoder takes
+				// exactly (restrictionKeyUsable — the plain restriction
+				// producer's test for dropping the conjunct from its Filter)
+				// is an exact probe too, so its conjunct joins the recheck
+				// list as PG's bitmapqualorig has it (create_bitmap_scan_plan):
+				// `Recheck Cond: (stringu1 = 'TVAAAA'::name)`, not a Filter.
 				local = conj
 			}
 			// Found an equality conjunct matching this index column.

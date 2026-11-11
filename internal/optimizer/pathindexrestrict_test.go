@@ -394,7 +394,7 @@ func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
 		}
 	}
 	eqFlag := &BinaryOp{Op: parser.OpEq, Left: &ColumnRef{Index: 2, Name: "i_flag"}, Right: &IntegerConst{Value: 7}}
-	if got, _ := matchBitmapIndexQuals(composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
+	if got, _ := matchBitmapIndexQuals(nil, composite, tbl, []Expr{eqFlag}, &scanIdentity{}); len(got) != 0 {
 		t.Fatalf("i_flag = 7 alone binds no prefix of (i_item_sk, i_flag); got %d clauses", len(got))
 	}
 }
