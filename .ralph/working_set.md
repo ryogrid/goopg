@@ -1,26 +1,25 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #2: S9 census IDENTICAL; M0148-0001j3 CLOSED)
+# Working Set — loop end 2026-11-11 (run-2 loop #3: M0148-0001j4 item 1 landed; task open)
 
-- Anomaly: prev-loop check flagged claude_output_2026-11-11_16-58-28 — a 1-turn `Credit balance is too low` api_error, no work lost. Separately, owner commit 88ef78511 ("doc(deepeiki)") carried an earlier loop's uncommitted M0148-0001j3 WIP (type USAGE ACL, ROLLBACK role revert); this loop verified and gated it.
-- S9 census: DUE (88ef78511 touched internal/catalog) → routing-20261111a (65afe1d10), label s9bd, BASELINE_REV=8c1531f51. IDENTICAL x3, 22/22·99/99·99/99. Next DUE baseline = d5a987211's parent records head.
-- Task: M0148-0001j3 — DONE (88ef78511 + d5a987211). Residue filed as M0148-0001j4.
+- Anomaly: none (prev-loop check OK).
+- S9: REUSE of exhausted routing-20261111a at loop start → item 10 live. e7f2dfa83 touches internal/catalog → the next loop's `scripts/s9-census-due.sh` will likely say DUE; obey it. Use BASELINE_REV=34e287597, the head that routing-20261111a's successor should A/B against.
+- Task: M0148-0001j4 (DROP TYPE residue 2) — IN PROGRESS. Item (1) landed in e7f2dfa83 (routine OIDs from the catalog's single counter). Items (2)-(5) open.
 - Files:
-  - internal/executor/operators_ddl.go: execDropType resolves a domain first (dropTypeDependents + dropDomainObject).
-  - internal/executor/drop_type_domain_test.go: TestDropTypeOfDomain.
-  - docs/design/0100-0149/0148-0001j3-type-usage-privilege-and-drop-type-domain.md + README row.
-  - .ralph/fix_plan.md (j3 [x], j4 filed), .ralph/deferral_ledger.md (j3 row).
-- Key symbols: checkTypeUsage, typeUsagePermitted, typeUsageTarget, connTxState.RestoreTxRoleForRollback, execDropType.
+  - internal/catalog/routines.go: allocOID/advanceOID hooks, shareOIDCounter, Create pre-draws the OID outside rs.mu, CreateDuringRecovery advances.
+  - internal/catalog/catalog.go: NewInMemory wires the hooks.
+  - internal/catalog/routines_shared_oid_test.go.
+  - docs/design/0100-0149/0148-0001j4-shared-oid-counter.md + README row; fix_plan j4 progress bullets; ledger row.
+- Key symbols: Routines.Create, Routines.CreateDuringRecovery, shareOIDCounter, InMemory.AllocOID/AdvanceNextOIDPast.
 - Findings:
-  - Regress A/B (19 suites, base 8c1531f51): privileges 3925→3781, create_operator 243→196, alter_generic 840→804, domain 1718→1717. plpgsql and polymorphism moved run-to-run (variance).
-  - privileges "types" block now matches PG. The remaining privileges hunks are listed in j4: the array-coercion EXECUTE check, and has_*_privilege "does not exist" in the default-privileges block.
-  - The nightly batch fired late (16:58) and blocks the sf025 sweep and the acceptance arm while it runs. Check `pgrep -fa run-nightly` before long gates.
-  - Its log-push stages ci/logs files in the shared index, so commit by pathspec.
-- Next step: run `scripts/s9-census-due.sh` (d5a987211 touched internal/executor DDL only; obey the verdict). Then take the topmost open M0148 child in file order. The baton suggests M0148-0001j4 or the earlier open children (c3a, c3b, g1, f3, e2, h1, i2, k1); verify the order in fix_plan.
-- Top-residual: M0148 residues. Open children: j4, c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - Lock order is c.mu → rs.mu (DropDatabase → DropAllInDB), so never call AllocOID under rs.mu.
+  - Regress: create_type 406→402, typed_table 133→131. plpgsql/alter_generic moved (variance).
+  - goopg CREATE TABLE draws 1 OID vs PG's 3 (relation, row type, array type). Ledger row; absolute OIDs drift.
+- Next step: S9 due-check. Then M0148-0001j4 item (2): pg_proc.proargtypes is 0 for a composite-array argument (`st[]`). Find where the pg_proc row's argtype OIDs are resolved (TypeNameToOID for `name[]` of a composite) and resolve the composite's ArrayOID.
+- Top-residual: M0148 residues. Open children: j4 (items 2-5), c3a, c3b, g1, f3, e2, h1, i2, k1; then M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: P0-E8(channel: already [x]); M0146-0014(channel; census routing-20261111a exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY S2 items P0-E9/E10/E11/E13/E15/E16/E24/E25 (owner-placement); nightly action-items 0. Then M0148.
-- Gates run (staged code_tree for d5a987211):
-  - PASS: units (warm cache), internal/postmaster (169 s), TestPort_RegressSuite;
-  - PASS: tpch-spotcheck (Q12=2, Q13=35), sf025 99/99, acceptance-arm 24 MATCH;
-  - PASS: nightly 20261111-165815 on 88ef78511 (testport, pgbench, tpcds).
-- In-flight: none. tmp/wt-base worktree removed. Regress diffs remain only in tmp/regress-ab-chg.
+  - Items 0-9: M0146-0014(channel; REUSE exhausted routing-20261111a); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are all below-item-10 carve-outs or S2 awaiting placement (P0-E9/E10/E11/E12/E13/E14/E15/E16/E24/E25); action-items 0. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
+- Gates run (staged code_tree for e7f2dfa83):
+  - PASS: units, TestPort_RegressSuite + TestPort_PgDump* (288 s), tpch-spotcheck, sf025 99/99 (ck 61).
+  - Not required: acceptance arm and fire-set (internal/catalog is outside both scopes).
+  - Two-restart manual probe OK.
+- In-flight: none. Probe server on 5533 stopped; tmp/j4-data is scratch.

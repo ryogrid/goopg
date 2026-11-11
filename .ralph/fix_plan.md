@@ -11918,6 +11918,15 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
   failing "function … does not exist" in the default-privileges block.
   Resume: catalog OID allocation (one GetNewOidWithIndex-style counter for
   routines and relations/types); routine proargtypes for array-of-composite.
+  - Item (1) LANDED (2026-11-11, ddl(M0148-0001j4) commit): Routines.Create
+    draws from InMemory's counter (shareOIDCounter in NewInMemory; recovery
+    advances it); create\_type 406→402, typed\_table 133→131. Design doc
+    docs/design/0100-0149/0148-0001j4-shared-oid-counter.md. Gates: units,
+    TestPort\_RegressSuite + PgDump PASS, tpch-spotcheck PASS, sf025 99/99.
+  - Found: goopg CREATE TABLE draws one OID; PG draws three (relation, row
+    type, array type), so absolute OIDs drift while relative order is PG's
+    (ledger row).
+  - Next: item (2) proargtypes for an array-of-composite argument.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
