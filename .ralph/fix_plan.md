@@ -12230,6 +12230,24 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - Resume: the OR path as a chooseBitmapAnd candidate (PG's clause-usage
     redundancy check), then items (2)-(6).
   Movement: none — regress 22 suites unchanged (the NULL-arm fix is a correctness fix; no regress case had a NULL OR arm)
+  - 2026-11-12 slice 4 LANDED (0617a1952):
+    - choose\_bitmap\_and ported: clause-usage redundancy via
+      find\_indexpath\_quals; OR paths are candidates.
+    - BitmapAnd costing fixes: the heap side prices on baserel tuples, and
+      the per-row charge is on path rows, charged once.
+    - PG's BitmapAnd and BitmapAnd(index, BitmapOr) plans now match, cost
+      for cost.
+  - Residue after slice 4:
+    - Inequality OR groups.
+    - OR→SAOP behind an equality prefix on plain paths.
+    - SAOP + range under a bitmap.
+    - Sub-ORs in AND arms; useful\_predicate.
+    - Join OR clauses (bitjoinpaths).
+    - The Bitmap Index Scan EXPLAIN cost line (startup 0.29 / width 84 vs
+      PG 0.00 / 0).
+  - Resume: c3a2 item (2) — a bitmap range behind an equality prefix (and
+    the SAOP + range form), then items (3)-(6).
+  Movement: yes — regress create\_index 3235→3166 (join +5 is a pre-existing Hash Right Join row-order flap)
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
