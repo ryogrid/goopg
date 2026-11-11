@@ -11920,7 +11920,7 @@ Movement: yes — regress aggregates hunks 14 → 13 (diff lines 266 → 251)
     PASS; sf025 99/99; acceptance 24 MATCH; nightly 20261111-165815 PASS on
     88ef78511; census routing-20261111a IDENTICAL x3.
 Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, alter\_generic 840→804, domain 1718→1717)
-- [ ] **M0148-0001j4 — DROP TYPE residue (2): OID order across catalogs,
+- [x] **M0148-0001j4 — DROP TYPE residue (2): OID order across catalogs,
   composite-array pg\_proc OIDs, composite field-select on SQL-function
   params, typed-table column options, view `_RETURN` type dependency**.
   Kind: impl
@@ -11980,8 +11980,13 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
     fire-set fires=none ×3.
     - Remaining (ledger): sortability does not yet steer path choice, plain
       GROUP BY has no check, domains over one-sided types are not classified.
-  - Next: item (5) view columns over a type depend through the view's
-    `_RETURN` rule (DROP TYPE reaching views); then close j4.
+  - CLOSED 2026-11-11: items (1)-(4) landed. Item (5) — DROP TYPE reaching
+    views — moved to M0148-0001h1, whose OID-recorded view dependencies
+    (recordDependencyOnExpr at CREATE VIEW) it needs; goopg's view edges are
+    found by FROM-clause name matching with no column or type edges, and a
+    name-based shortcut here would cut against h1. Oracle output recorded
+    under h1.
+Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangefuncs 2289→2268, groupingsets 1523→1472 (rowtypes −1, updatable\_views −1)
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
@@ -12288,6 +12293,18 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
   ALTER VIEW / COMMENT ON VIEW / GRANT on unqualified view names do not use
   resolveRelationBySearchPath. Measure: create_view / rules / alter_table /
   namespace regress runner HEAD vs change.
+  - Added 2026-11-11 from M0148-0001j4 item (5): DROP TYPE must reach views.
+    PG 18.3 (scratch oracle) for `create type t as (a int, b text); create
+    table tt (k int, x t); create view v as select k, x from tt; create view
+    v2 as select (x).a from tt; create view v3 as select null::t as c; drop
+    type t;` gives DETAIL `column x of table tt depends on type t` / `view v
+    depends on column x of table tt` / `view v2 depends on column x of table
+    tt` / `view v3 depends on type t`, and CASCADE drops `column x of table
+    tt`, `view v`, `view v2`, `view v3` (4 objects). goopg lists and drops only
+    the column. Needs view→column and view→type edges recorded at CREATE VIEW
+    (find\_expr\_references\_walker: Var → column, Const/typed expression →
+    type), then a view node in executor/drop\_type\_dependents.go
+    typeDependentObjects that follows column nodes to their dependent views.
 - [x] **M0148-0001i1 — views plan as opaque sub-plans: no pull-up into the
   outer query (top Sort, Result node, unqualified names)**.
   Kind: impl
