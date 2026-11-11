@@ -11971,9 +11971,17 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
     `col WITH OPTIONS` entry raises 42701 (MergeAttributes). Regress
     typed\_table 131→117. Gates units, RegressSuite, spotcheck, sf025 99/99,
     acceptance 24 MATCH.
-  - Next: item (4) grouping sets with no sorted rollup hash an ordered
-    aggregate (PG would sort or error), then (5) view `_RETURN` type
-    dependency.
+  - Item (4) LANDED (2026-11-11, 3ccf96d89): the residue was really the
+    unsortable-column case. Grouping sets mixing an unsortable (xid/cid/
+    aclitem) and an unhashable (bit/varbit/money/tsquery/tsvector) column,
+    or an unsortable set beside an ordered/DISTINCT aggregate, raise 0A000
+    could not implement GROUP BY (+DETAIL). Regress groupingsets 1523→1472.
+    Gates units, RegressSuite, spotcheck, sf025 99/99, acceptance 24 MATCH,
+    fire-set fires=none ×3.
+    - Remaining (ledger): sortability does not yet steer path choice, plain
+      GROUP BY has no check, domains over one-sided types are not classified.
+  - Next: item (5) view columns over a type depend through the view's
+    `_RETURN` rule (DROP TYPE reaching views); then close j4.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl

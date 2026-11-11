@@ -1,25 +1,27 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #7: census IDENTICAL; M0148-0001j4 item 3b landed)
+# Working Set — loop end 2026-11-11 (run-2 loop #8: M0148-0001j4 item 4 landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 608929548 → routing-20261111d (label s9bg, BASELINE_REV=2f0f6237e) IDENTICAL ×3, 22/22·99/99·99/99. 2b010424e touches internal/executor (DDL only); run `scripts/s9-census-due.sh` next loop and obey it. If DUE, BASELINE_REV = cffa4f7e7, the head routing-20261111d consumed.
+- S9: REUSE of exhausted routing-20261111d at loop start (item 10 live). 3ccf96d89 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 351779779 (this loop's fire-set baseline; also the head routing-20261111d's successor A/Bs against).
 - Task: M0148-0001j4 (DROP TYPE residue 2) — IN PROGRESS.
-  - Landed: items 1 (e7f2dfa83), 2 (9de6fc9a8), 3a (608929548), 3b (2b010424e).
-  - Open: 4, 5.
-- Files (2b010424e):
-  - internal/executor/operators_ddl.go: the execCreateTable typed-table option loop tracks merged type columns and raises 42701.
-  - internal/executor/typed_table_option_dup_test.go.
-  - Design doc 0148-0001j4 (item 3b section) + README row; fix_plan j4 bullet.
-- Key symbols: execCreateTable (s.OfTypeColumnOptions loop), mergedFromOptions.
-- Findings: PG raises 42701 without an error position (MergeAttributes ereport has no parser_errposition).
-- Next step: S9 due-check. Then j4 item (4): grouping sets that form no rollup the sorted arm can run still hash with an ordered aggregate.
-  - PG (planner.c consider_groupingsets_paths): when an aggregate has ORDER BY/DISTINCT (an unhashable aggregate), every grouping set must go through sorted rollups; it errors "could not implement GROUP BY" only when no sort path exists.
-  - Find the j1 design doc's repro: docs/design/0100-0149/0148-0001j1-sorted-grouping-sets-and-drop-type-dependents.md "Grouping-sets shapes".
-  - If item (4) proves large, close j4 with (4)+(5) as residue child j5, per the j2/j3 pattern.
-- Top-residual: M0148 residues. Open children: j4 (4, 5), c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - Landed: items 1 (e7f2dfa83), 2 (9de6fc9a8), 3a (608929548), 3b (2b010424e), 4 (3ccf96d89).
+  - Open: 5.
+- Files (3ccf96d89):
+  - internal/optimizer/groupingsets_sortability.go (new): one-sided type maps, checkGroupingSetsImplementable, errCouldNotImplementGroupBy.
+  - internal/optimizer/groupingpaths.go: call site; the no-path 0A000 now carries the DETAIL.
+  - internal/executor/groupingsets_unsortable_test.go.
+  - Design doc 0148-0001j4 (item 4 section) + README; fix_plan j4 bullet; ledger row.
+- Key symbols: checkGroupingSetsImplementable, groupingExprSortable/Hashable, groupingUnsortableTypes/groupingUnhashableTypes.
+- Findings:
+  - catalog.InMemory.ResolveIndexColumnOpclassOID is not a real per-AM opclass lookup (int4 hash returns the btree OID), so I derived the one-sided types from pg_opclass.dat instead.
+  - goopg previously hashed the regress gstest4 failure cases.
+- Next step: S9 due-check. Then j4 item (5): view columns over a type depend through the view's `_RETURN` rule (pg_depend refobj = the type, from the rewrite rule's targetlist).
+  - PG: DROP TYPE t RESTRICT lists `view v depends on type t`, and CASCADE drops the view.
+  - Probe: `create type t as (a int); create table tt(x t); create view v as select x from tt; drop type t;` → PG lists column x of table tt and view v.
+  - Hook it into drop_type_dependents.go typeDependentObjects as a view node; after that, close j4 (file any residue as j5).
+- Top-residual: M0148 residues. Open children: j4 (5), c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261111d exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; REUSE exhausted routing-20261111d); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 2b010424e):
-  - PASS: units, TestPort_RegressSuite (380 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH.
-  - Fire-set not required (internal/executor is outside its scope).
+- Gates run (staged code_tree for 3ccf96d89):
+  - PASS: units, TestPort_RegressSuite (331 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set j4gfs fires=none ×3.
 - In-flight: none.
