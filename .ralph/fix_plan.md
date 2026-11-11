@@ -1411,6 +1411,29 @@ heuristic stays live.)
     CREATE TABLE does; prove with a two\-restart test per type kind\.
   - Expected instrument: Movement: none — correctness fix — no plan instrument \(the repro matches PG after two
     restarts\)\.
+- [ ] **P0\-E26 — after a server restart, every composite type is gone from the type registry: field selection
+  fails, new columns of it become `text`, `DROP TYPE` says it does not exist** \(filed 2026\-11\-11 by the loop, found
+  while probing M0148\-0001j4 item 2; S2 — wrong results and unvalidated data\)\.
+  Kind: impl
+  Parent: none
+  - > **ESCALATION 2026\-11\-11 \(S2, wrong results\) — OWNER PLACEMENT NEEDED\.** Filed, not selected: the loop
+    > continues with the banner\. Pre\-existing\.
+  - Repro on a fresh cluster: `create type st as (a int, b text);` → restart →
+    - `select (row(1,'a')::st).b` errors `column notation .b applied to type st, which is not a composite type`
+      \(PG: `a`\);
+    - `create table tt (x st)` succeeds, but pg\_attribute.atttypid is 25 \(text\);
+    - `drop type st` errors `type "st" does not exist`, although its pg\_type row \(typtype `c`, typrelid set\)
+      is still there.
+  - Enum, domain and range types survive the restart. P0\-E25 \(columns reload as text\) assumes the type
+    registries reload, which does not hold for composites.
+  - Cause \(read, not yet fixed\): InMemory.compositeTypes / compositeTypeNames / compositeTypeFields are filled
+    only by RegisterCompositeType\[WithFields\] from DDL. No startup path re\-registers composites from the
+    pg\_type rows \(typtype `c`\) and the field list from the typrelid relation's pg\_attribute rows.
+  - First step: reload composites from pg\_type \+ pg\_attribute per database, with their stored OID, ArrayOID
+    and RelOID, before the user\-table reload. Then advance the OID counter and prove with a two\-restart test
+    that covers field access, a new column, DROP TYPE and pg\_proc OIDs.
+  - Expected instrument: Movement: none — correctness fix — no plan instrument.
+
 
 - [x] **`DROP TABLE IF EXISTS` of a missing relation routes through the TRUNCATE executor and creates 0\-byte relfilenode files** \(filed 2026\-10\-31 by the loop diagnosing AI\-20261031\-002109\-005\)
   Kind: impl
@@ -11926,7 +11949,17 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
   - Found: goopg CREATE TABLE draws one OID; PG draws three (relation, row
     type, array type), so absolute OIDs drift while relative order is PG's
     (ledger row).
-  - Next: item (2) proargtypes for an array-of-composite argument.
+  - Item (2) LANDED (2026-11-11, 9de6fc9a8): pg\_proc proargtypes /
+    proallargtypes / prorettype carry user enum/domain/composite/range OIDs
+    and their array OIDs (executor.PGProcTypeOID; heap row, index key and
+    virtual view agree). It was TypeNameToOID's text fallback (25) in the heap
+    and 0 in the view. Regress neutral; gates units, RegressSuite+PgDump,
+    spotcheck, sf025 99/99, acceptance 24 MATCH.
+    - Found P0-E26: composite types are not re-registered at restart, so their
+      OIDs fall back after a restart (filed S2, escalated).
+  - Next: item (3) `(s).total` on a composite SQL-function parameter
+    ("applied to type unknown"), then the typed-table WITH OPTIONS duplicate
+    (transformOfType 42701).
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
