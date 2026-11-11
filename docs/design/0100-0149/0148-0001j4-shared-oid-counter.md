@@ -1,7 +1,7 @@
 # M0148\-0001j4 — one OID counter for routines, relations and types; user type OIDs in pg\_proc
 
-**Parent:** M0148\-0001j3 · **Status:** items (1), (2) and (3a) landed
-2026\-11\-11; the task stays open for items (3b), (4) and (5)
+**Parent:** M0148\-0001j3 · **Status:** items (1) to (3b) landed
+2026\-11\-11; the task stays open for items (4) and (5)
 
 ## Divergence
 
@@ -231,8 +231,23 @@ PG 18.3 returns 5, 5, 7 and 5 for these calls. Regress rangefuncs
   instead of a syntax error.
 - **`(param).*` as a function argument** fails with "unsupported expression
   IndirectionStar" (regress rowtypes fcompos3).
-- **Item (3b) is still open:** `CREATE TABLE … OF t (col WITH OPTIONS …)`
-  repeating a column (transformOfType, 42701).
+
+## Item (3b): a repeated `WITH OPTIONS` column on a typed table
+
+- **PG.** `MergeAttributes` (tablecmds.c) merges the first `col WITH
+  OPTIONS …` entry into the column that came from the type, which clears
+  its `is_from_type`. A second entry for the same column then meets a
+  non\-type column and raises 42701 `column "name" specified more than
+  once`, with no error position.
+- **goopg before.** goopg merged both entries, so regress typed\_table's
+  `persons4` was created. It then also showed up in the later DROP TYPE
+  dependency lists.
+- **Change.** `execCreateTable`'s typed\-table option loop records which
+  type columns already took an entry and raises PG's 42701 on the second.
+- **Tests.** `TestTypedTableRepeatedWithOptions` checks the repeat (42701),
+  one entry per column (accepted), and an unknown column (42703).
+- **Regress.** typed\_table 131 → 117. create\_table, create\_type and
+  alter\_table are unchanged.
 
 ## Not covered
 
@@ -240,7 +255,6 @@ PG 18.3 returns 5, 5, 7 and 5 for these calls. Regress rangefuncs
   its row type and the row type's array type. goopg's tables
   (`a`=16406, `b`=16408) draw one each. Absolute OIDs therefore drift from
   PG's, but the relative order of objects is now PG's. Ledger row.
-- **j4 items (3b), (4) and (5) are still open:**
-  - the typed\-table column\-option duplicate;
+- **j4 items (4) and (5) are still open:**
   - grouping sets that hash an ordered aggregate;
   - view `_RETURN` type dependencies.

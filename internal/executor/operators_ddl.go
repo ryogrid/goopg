@@ -2741,6 +2741,12 @@ afterExistsCheck:
 		// so no further plumbing is needed. The column's Type/Collation stay
 		// derived from the composite field — WITH OPTIONS cannot redeclare a
 		// type. DU-002 slice 374 follow-up.
+		// MergeAttributes (tablecmds.c) merges the FIRST option entry into the
+		// type's column and clears its is_from_type; a second entry for the
+		// same column then meets a non-type column and raises 42701 "column
+		// %s specified more than once" (no error position). M0148-0001j4
+		// item (3b).
+		mergedFromOptions := make([]bool, len(derived))
 		for _, ov := range s.OfTypeColumnOptions {
 			idx := -1
 			for i := range derived {
@@ -2753,6 +2759,11 @@ afterExistsCheck:
 				return &ExecError{Code: "42703", Pos: s.Pos(),
 					Message: fmt.Sprintf("column %q does not exist", ov.Name)}
 			}
+			if mergedFromOptions[idx] {
+				return &ExecError{Code: "42701",
+					Message: fmt.Sprintf("column %q specified more than once", derived[idx].Name)}
+			}
+			mergedFromOptions[idx] = true
 			merged := ov
 			merged.Name = derived[idx].Name
 			merged.Type = derived[idx].Type
