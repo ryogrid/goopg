@@ -127,6 +127,25 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		}
 		nullTest, clauses = nt.nullTest, clauses[:n-1]
 	}
+	// M0148-0001c3a2: a ScalarArrayOp clause behind the equality prefix
+	// lowers onto SAOPKeys, the prefix onto Keys.
+	if n := len(clauses); n > 0 && len(clauses[n-1].saop) > 0 {
+		var prefix []Expr
+		for i, c := range clauses[:n-1] {
+			if c.indexCol != i || c.key == nil || c.op != parser.OpUnknown || c.nullTest != IndexNullTestNone || len(c.saop) > 0 {
+				panic(fmt.Sprintf("createPlan: bitmap ScalarArrayOp probe of %s has a non-equality prefix clause %d", p.IndexInfo.Name, i))
+			}
+			prefix = append(prefix, c.key)
+		}
+		if clauses[n-1].indexCol != n-1 {
+			panic(fmt.Sprintf("createPlan: bitmap ScalarArrayOp clause of %s does not follow its equality prefix", p.IndexInfo.Name))
+		}
+		return &BitmapIndexScan{
+			pos: id.pos, Table: id.table, Alias: id.alias, Index: p.IndexInfo,
+			Keys: prefix, SAOPKeys: append([]Expr(nil), clauses[n-1].saop...),
+			Pred: pred, schema: id.schema,
+		}
+	}
 	if hasRangeClause(clauses) {
 		var bounds []indexPathClause
 		for _, c := range clauses {

@@ -604,6 +604,11 @@ type BinaryOp struct {
 	Left       Expr
 	Right      Expr
 	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
+	// Nested marks an AND / OR the planner built after PG's flattening, as
+	// group_similar_or_args builds a sub-OR of similar arms (indxpath.c):
+	// it stays ONE argument of the enclosing same-kind clause, so EXPLAIN
+	// prints `((a = 1) OR ((b = 3) OR (b = 7)))` (M0148-0001c3a2).
+	Nested bool
 }
 
 // LikeEscapePattern is the optimizer-side mirror of parser.LikeEscapePattern.
@@ -3713,6 +3718,12 @@ type BitmapIndexScan struct {
 	// the same SK_SEARCHNULL / SK_SEARCHNOTNULL bounds as IndexScan's.
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
+	// SAOPKeys is a ScalarArrayOp equality index qual (`col = ANY (…)`,
+	// match_saopclause_to_indexcol / match_orclause_to_indexcol) on
+	// Columns[len(Keys)], behind the equality Keys: one probe per element,
+	// all into the one TID bitmap (M0148-0001c3a2). Never set together with
+	// Key, LowKey/HighKey or LeadingNullTest.
+	SAOPKeys []Expr
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr

@@ -144,6 +144,16 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	// Determine whether recheck is needed (prefix scan on composite index).
 	recheck := o.needsRecheck()
 
+	// M0148-0001c3a2: a ScalarArrayOp qual probes once per array element
+	// into the one bitmap — the union the index's array keys give PG.
+	if len(o.plan.SAOPKeys) > 0 {
+		if err := o.buildSAOPBitmap(tbm, recheck); err != nil {
+			return nil, err
+		}
+		tbmLossify(tbm)
+		return tbm, nil
+	}
+
 	// Compute the lo/hi key bounds (same logic as indexScanOp.Rescan).
 	loBytes, hiBytes, nullKey, err := o.lookupBounds()
 	if err != nil {
@@ -186,12 +196,85 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 	return tbm, nil
 }
 
+// buildSAOPBitmap fills tbm with the TIDs of every entry matching the
+// equality Keys followed by one of the SAOPKeys elements on the next index
+// column. A NULL element matches nothing under `=` and is skipped (a NULL
+// prefix key, nothing at all); a repeated element is probed once, as
+// _bt_preprocess_array_keys deduplicates the array.
+func (o *bitmapIndexScanOp) buildSAOPBitmap(tbm *TIDBitmap, recheck bool) error {
+	np := len(o.plan.Keys)
+	if np >= len(o.plan.Index.Columns) {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "bitmap ScalarArrayOp qual past the index's last column"}
+	}
+	parts := make([]indexProbeKeyPart, 0, np+1)
+	for i, keyExpr := range o.plan.Keys {
+		keyCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
+		if !found {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
+		}
+		val, err := evalExprSlot(keyExpr, o.outerSlot, o.ctx)
+		if err != nil {
+			return err
+		}
+		if val.IsNull() {
+			return nil
+		}
+		parts = append(parts, indexProbeKeyPart{col: keyCol, val: val, pos: o.plan.Pos()})
+	}
+	saopCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[np])
+	if !found {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
+	}
+	if tbm.entries == nil {
+		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
+	}
+	scanFn := func(_ []byte, ptr storage.ItemPointer, _ nbtree.ScanPos) (bool, error) {
+		if recheck {
+			tbm.recheckAny = true
+		}
+		tbm.addOne(ptr.Block, ptr.Offset, recheck)
+		o.lastTuples++
+		return true, nil
+	}
+	seen := make(map[string]bool, len(o.plan.SAOPKeys))
+	for _, elem := range o.plan.SAOPKeys {
+		val, err := evalExprSlot(elem, o.outerSlot, o.ctx)
+		if err != nil {
+			return err
+		}
+		if val.IsNull() {
+			continue
+		}
+		// encErr, not err: indexProbeKey returns a concrete *ExecError, and
+		// a nil one stored in the error-typed err would read non-nil.
+		key, encErr := o.ctx.indexProbeKey(o.plan.Index, append(parts[:np:np], indexProbeKeyPart{col: saopCol, val: val, pos: o.plan.Pos()}))
+		if encErr != nil {
+			return encErr
+		}
+		if seen[string(key)] {
+			continue
+		}
+		seen[string(key)] = true
+		hi := key
+		if np+1 < len(o.plan.Index.Columns) {
+			hi = o.ctx.compositeUpperBound(o.plan.Index, key)
+		}
+		if err := o.tree.RangeScanWithPos(key, hi, false, false, scanFn); err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+	}
+	return nil
+}
+
 // needsRecheck returns true when the index scan uses only a prefix of a
 // composite index key — the remaining key columns' conditions must be
 // rechecked against the heap tuple.
 func (o *bitmapIndexScanOp) needsRecheck() bool {
 	if len(o.plan.Index.Columns) == 0 {
 		return false
+	}
+	if len(o.plan.SAOPKeys) > 0 {
+		return len(o.plan.Keys)+1 < len(o.plan.Index.Columns)
 	}
 	// Key covers the first N columns; if there are more index columns,
 	// the trailing conditions need recheck.

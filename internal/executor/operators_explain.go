@@ -3105,6 +3105,9 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			if p.LeadingNullTest != optimizer.IndexNullTestNone {
 				cond = formatBitmapNullTestIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			}
+			if len(p.SAOPKeys) > 0 {
+				cond = formatBitmapSAOPIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			}
 			if cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 			}
@@ -3920,6 +3923,36 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+}
+
+// formatBitmapSAOPIndexCond renders a BitmapIndexScan's ScalarArrayOp index
+// qual behind its equality Keys (M0148-0001c3a2) —
+// `((thousand = 42) AND (tenthous = ANY ('{1,3,42}'::integer[])))` — with
+// the folded array Const formatIndexCondPrefixed prints for IndexScan's.
+func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, prefix string) string {
+	np := len(p.Keys)
+	if np >= len(p.Index.Columns) {
+		return ""
+	}
+	parts := make([]string, 0, np+1)
+	for i, k := range p.Keys {
+		parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+	}
+	col := prefix + p.Index.Columns[np]
+	elems := make([]string, 0, len(p.SAOPKeys))
+	for _, k := range p.SAOPKeys {
+		elems = append(elems, formatIndexCondKey(k, reg))
+	}
+	cond := col + " = ANY (" + strings.Join(elems, ", ") + ")"
+	if t := indexKeyColumnType(p.Table, p.Index, np); t != nil {
+		if cast, lit, ok := inListArrayConst(*t, p.SAOPKeys); ok {
+			if cast != "" {
+				col = "(" + col + ")::" + cast
+			}
+			cond = col + " = ANY (" + lit + ")"
+		}
+	}
+	return indexCondAndText(append(parts, cond))
 }
 
 // formatBitmapNullTestIndexCond renders a BitmapIndexScan's NullTest index
@@ -5704,10 +5737,20 @@ func formatInExprPG(x *optimizer.InExpr, reg *subPlanReg, qualify bool) string {
 // order, descending into nested nodes of the same op.
 func flattenBoolArms(e optimizer.Expr, op parser.OpCode, out []optimizer.Expr) []optimizer.Expr {
 	if b, ok := e.(*optimizer.BinaryOp); ok && b.Op == op {
-		out = flattenBoolArms(b.Left, op, out)
-		return flattenBoolArms(b.Right, op, out)
+		out = flattenBoolArmChild(b.Left, op, out)
+		return flattenBoolArmChild(b.Right, op, out)
 	}
 	return append(out, e)
+}
+
+// flattenBoolArmChild is flattenBoolArms for an arm: a Nested clause (a
+// group_similar_or_args sub-OR, M0148-0001c3a2) is one argument of its
+// parent and prints in its own parentheses.
+func flattenBoolArmChild(e optimizer.Expr, op parser.OpCode, out []optimizer.Expr) []optimizer.Expr {
+	if b, ok := e.(*optimizer.BinaryOp); ok && b.Nested {
+		return append(out, e)
+	}
+	return flattenBoolArms(e, op, out)
 }
 
 // intConstText is get_const_expr's text for an integer literal: an int4

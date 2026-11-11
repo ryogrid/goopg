@@ -534,6 +534,14 @@ type Path struct {
 	// for combinators.
 	BitmapSelectivity float64
 
+	// IndexPathTotalCost is a Bitmap Index Scan leaf's PG `IndexPath`
+	// total_cost: cost_index's whole-scan cost (index and heap side), which
+	// build_index_paths gives every index path, bitmap ones included —
+	// distinct from Cost, the index-side indextotalcost a bitmap tree is
+	// costed from. make_bitmap_paths_for_or_group compares candidate arms by
+	// it (M0148-0001c3a2). Zero on every other path.
+	IndexPathTotalCost float64
+
 	// PartialPredicate is the resolved planner expression for a partial
 	// index's WHERE predicate (PG's indpred). It is nil when the index is not
 	// partial and nil when the prover has proven the predicate is implied by

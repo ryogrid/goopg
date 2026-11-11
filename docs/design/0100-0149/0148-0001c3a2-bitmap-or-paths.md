@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); the other c3a2 items stay open
 
 ## Problem
 
@@ -111,12 +111,69 @@ partition\_join and select diffs.
 - **Test:** pinned by `TestBitmapOrOverOrClauses`'s parallel\-lossy cases,
   which fail with 1273 without the fix.
 
+## Slice 2 — bitmap ScalarArrayOp carrier and PG 18 OR grouping
+
+- **Carrier:** `BitmapIndexScan.SAOPKeys` holds a `col = ANY (…)` index qual
+  on `Columns[len(Keys)]`, behind the equality Keys.
+  - `bitmapIndexScanOp.buildSAOPBitmap` probes once per element into the
+    one TID bitmap. A NULL element matches nothing; repeated elements are
+    probed once, as `_bt_preprocess_array_keys` deduplicates.
+  - EXPLAIN prints the folded array Const (`formatBitmapSAOPIndexCond`):
+    `((thousand = 42) AND (tenthous = ANY ('{1,3}'::integer[])))`.
+- **Matcher** `bitmapSAOPOnColumn`, called from `buildBitmapIndexChild`
+  after the equality prefix:
+  - an `IN` / `= ANY` conjunct \(match\_saopclause\_to\_indexcol\);
+  - an OR whose every arm is `col = const` on that column
+    \(match\_orclause\_to\_indexcol\). The OR is priced as the
+    ScalarArrayOp it becomes \(scalararraysel\), and `num_sa_scans` is
+    charged per element.
+  - The conjunct is the recheck \(`local`\), so the plain bitmap path for
+    `unique2 = 3 OR unique2 = 7` prints `Recheck Cond: ((unique2 = 3) OR
+    (unique2 = 7))` over `Index Cond: (unique2 = ANY ('{3,7}'::integer[]))`,
+    as PG does.
+  - Hash indexes \(`DeclaredHash`; no amsearcharray\) are skipped.
+- **Grouping** `groupSimilarOrArgs` is group\_similar\_or\_args.
+  - Arms `indexkey op const` with the same column, operator and key literal
+    kind fold into a sub\-OR placed at the first member's position.
+  - The sub\-OR is marked `BinaryOp.Nested`. EXPLAIN keeps it as one
+    argument \(`((unique1 = 1) OR ((unique2 = 3) OR (unique2 = 7)))`\),
+    and the implication test treats it as one item.
+  - `bitmapPathsForOrGroup` is make\_bitmap\_paths\_for\_or\_group: the
+    group as one SAOP arm, or its arms one by one, compared by PG's
+    `bitmapqual->total_cost`. For an index leaf that is IndexPath
+    total\_cost, the whole `cost_index` scan, carried as
+    `Path.IndexPathTotalCost`. With no other restriction clause a joint
+    match is taken outright.
+  - A non\-equality group \(`unique1 < 1 OR unique1 < 3`\) declines the
+    OR, since goopg has no `< ANY` probe.
+- **Implication:** `predicateImpliedBy` ports predicate\_implied\_by\_recurse
+  verbatim \(strong form\). Its OR ⇒ OR rule needs each recheck arm to
+  imply ONE Filter arm. That is why PG keeps `((unique1 = 1) OR (unique2 =
+  3) OR (unique2 = 7))` in the Filter under a recheck whose second arm is
+  the group, yet drops the OR when the whole OR is one SAOP.
+  `bitmapOrRecheck` uses it.
+- **Defect fixed before commit:** `buildSAOPBitmap` first assigned
+  `indexProbeKey`'s concrete `*ExecError` into an `error`\-typed variable.
+  The nil pointer read as a non\-nil error, and the backend panicked in
+  `execErrCode`.
+- **Probe against PG** \(scratch PG port 5545, ten queries\):
+  - 7 plans identical, and values identical, exact and lossy;
+  - the 3 differences are listed below.
+
 ## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
 
-- **SAOP grouping:** PG 18's `group_similar_or_args` /
-  `make_bitmap_paths_for_or_group`, where similar arms become one
-  `col = ANY (…)` bitmap arm. The bitmap probe has no SAOP carrier, so such
-  an OR gets no BitmapOr at all.
+- **Inequality groups:** `col < ANY (…)` and the like. PG matches the group
+  as one SAOP; goopg declines the whole OR, because its probe is
+  equality\-only.
+- **OR→SAOP for plain and index\-only paths:** match\_orclause\_to\_indexcol
+  outside bitmaps. PG plans `thousand = 42 AND (tenthous = 1 OR tenthous =
+  3 OR tenthous = 42)` as an Index Scan with the SAOP; goopg uses a bitmap.
+- **SAOP followed by a range bound on the next column, under a bitmap:**
+  `(thousand = ANY (…)) AND (tenthous > 500)`. The bound stays a Filter.
+- **`TestSAOPWithConjunctMoves` fixture:** the catalog\-only fixture prices
+  the plain index path at 12.32 on item\_pkey without the i\_flag bound,
+  where a server and PG price 8.17 on idx\_item\_sk\_flag. The test now
+  plans with bitmap scans off.
 - **Sub\-ORs inside an AND arm:** the recursive `generate_bitmap_or_paths`
   call.
 - **useful\_predicate:** an arm that proves a partial predicate without any
@@ -156,3 +213,8 @@ partition\_join and select diffs.
 - TPC\-DS SF0.25 sweep: 99/99 plan shapes identical, PASS.
 - tpch\-spotcheck: Q12/Q13 PASS.
 - Unit gate: PASS.
+- Slice 2:
+  - regress create\_index 3271→3235, join 17724→17655, no result change;
+  - TPC\-DS SF0.25 99/99 plan shapes identical;
+  - fire\-set fires=none on sf025 \+ sf1;
+  - acceptance 24 MATCH; tpch\-spotcheck PASS; unit gate PASS.

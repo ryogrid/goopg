@@ -213,10 +213,25 @@ func (s *searchCtx) buildBitmapIndexChild(
 		return nil
 	}
 	indexClauses, qualSelectivity := matchBitmapIndexQuals(s.cat, idx, tbl, conjuncts, id)
+	// M0148-0001c3a2: a ScalarArrayOp qual — `col IN (…)`, or an OR of
+	// equalities on one column (match_orclause_to_indexcol) — on the column
+	// after the equality prefix (the leading column when there is none):
+	// one probe per element into the one bitmap, priced by scalararraysel
+	// and charged one descent per element (btcostestimate's num_sa_scans).
+	numSAScans := 0.0
+	saop := false
+	if n := len(indexClauses); n < len(idx.Columns) {
+		if sc, selExpr := bitmapSAOPOnColumn(s.cat, tbl, idx, n, conjuncts); sc != nil {
+			indexClauses = append(indexClauses, *sc)
+			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(selExpr, leaf))
+			numSAScans = float64(len(sc.saop))
+			saop = true
+		}
+	}
 	// M0148-0001c3a1: a NullTest on the column after the equality prefix is
 	// an index clause too (match_clause_to_indexcol's NullTest arm). Exact,
 	// so its conjunct is the heap scan's recheck, not a Filter.
-	if n := len(indexClauses); n > 0 && n < len(idx.Columns) {
+	if n := len(indexClauses); !saop && n > 0 && n < len(idx.Columns) {
 		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
 			indexClauses = append(indexClauses, *nt)
 			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(nt.local, leaf))
@@ -282,22 +297,24 @@ func (s *searchCtx) buildBitmapIndexChild(
 		// index-satisfied ones.
 		numQualOps:    localQualOpCount(leaf),
 		numIndexQuals: float64(len(indexClauses)),
+		numSAScans:    numSAScans,
 	}
 
 	// Cost the index-access side (bitmap index scan).
 	idxCost := costBitmapIndexScan(s.cp, in)
 
 	return &Path{
-		Kind:              PathBitmapIndexScan,
-		Rel:               rel,
-		Rows:              clampRowEst(selectivity * relTuples),
-		Cost:              idxCost,
-		BitmapSelectivity: selectivity,
-		IndexInfo:         idx,
-		IndexScanDir:      NoMovementScanDirection,
-		IndexClauses:      indexClauses,
-		PartialPredicate:  partialPredicate,
-		RequiredOuter:     0,
+		Kind:               PathBitmapIndexScan,
+		Rel:                rel,
+		Rows:               clampRowEst(selectivity * relTuples),
+		Cost:               idxCost,
+		IndexPathTotalCost: costIndexScan(s.cp, in).Total,
+		BitmapSelectivity:  selectivity,
+		IndexInfo:          idx,
+		IndexScanDir:       NoMovementScanDirection,
+		IndexClauses:       indexClauses,
+		PartialPredicate:   partialPredicate,
+		RequiredOuter:      0,
 		// create_bitmap_index_path: `rel->consider_parallel`. C-19a.
 		ParallelSafe: rel.ParallelSafeForPath(),
 	}
