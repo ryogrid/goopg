@@ -215,11 +215,42 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
 - **Tests.** `TestLiteralPrintsAsCoercedConst` adds `n = 'TVAAAA'` and
   `n < 'B'`.
 
+## M0148\-0001c3a1: Index Cond literal labels
+
+- **Divergence.** The probe key of an index qual is the Const that parse
+  analysis coerced the literal to, typed as the indexed column. PG 18.3
+  prints, for example:
+  - `(c = 'TN'::bpchar)`, `(d = 'x'::text)`, `(e = '5'::numeric)`,
+    `(n = 'TVAAAA'::name)`, `(g >= '2002-05-01'::date)`;
+  - an int key bare: `(a = 5)`.
+
+  goopg's `formatIndexCondKey` printed the bare literal. The planner's
+  `coercedLiteralKey` strips the cast, and the renderer had no column type.
+- **Change.**
+  - `indexKeyColumnType` resolves the key column's type from the scan's
+    table.
+  - `formatIndexCondKeyTyped` labels a literal key through
+    `coerceLiteralText`, the Filter path's labelling.
+  - The label is threaded through every Index Cond builder that knows its
+    table:
+    - IndexScan: keys, RangePrefix, skip and SAOP second\-column bounds;
+    - IndexOnlyScan;
+    - BitmapIndexScan;
+    - the NullTest forms.
+  - Only a coercion with no column\-side cast is labelled.
+- **Verified against a scratch PG 18.3:** all six lines identical.
+  `TestIndexCondLiteralPrintsAsCoercedConst` pins them.
+- **Regress.** create\_index 3305 → 3286; select, btree\_index, join and
+  subselect unchanged.
+- **Corpora.** The sf025 plan\-shape channel is 99/99 the same. The
+  corpora's only literal Index Conds are SAOP arrays, which take a
+  separate path.
+
 ## Not covered (M0148\-0001c3a1)
 
-- **Index Cond keys print literals without the column type's label**
-  (`Index Cond: (stringu1 = 'TVAAAA')`). `formatIndexCondKey` renders the
-  probe key without the column type.
+- **varchar Index Cond keys.** PG prints `((v)::text = 'x'::text)`, with
+  the cast on the index column side. goopg still prints `(v = 'x')`,
+  because the column text is built separately from the key.
 - **A range behind an equality prefix under a bitmap**, and **BitmapOr
   over OR clauses** (`thousand = 42 AND (tenthous = 1 OR … OR tenthous IS
   NULL)`): goopg's bitmap producer generates neither (PG's
