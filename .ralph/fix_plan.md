@@ -12026,7 +12026,7 @@ Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangef
     indexes, unanalysed partial-index size, expression columns in HOT).
   Movement: none — correctness fix — no plan instrument (13-suite regress A/B byte-identical apart from join row-order noise; scratch-PG probe of partial unique/upsert/maintenance/restart now identical)
 
-- [ ] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
+- [x] **M0148-0001c3a — `col IS [NOT] NULL` as a btree index qual on
   searched paths**.
   Kind: impl
   Parent: M0148-0001c3
@@ -12064,6 +12064,33 @@ Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangef
       (create\_index `unique1 IS NULL AND unique1 IS NULL`); backward
       path-based index scans (createplanindex refuses a non-forward
       IndexScanDir — `order by x desc limit 1` sorts).
+  - Slice 3 LANDED (2026-11-11, 96d734112): a NullTest behind an equality
+    prefix (`a = 3 AND b IS NULL`), exact there so it leaves the Filter.
+    Gates units, RegressSuite (flake re-run green), spotcheck, sf025 99/99,
+    acceptance 24 MATCH, fire-set fires=none ×3.
+  - CLOSED 2026-11-11 (residue split to M0148-0001c3a1): the restriction
+    and index-only producers, nulltestsel, the SK\_SEARCHNULL /
+    SK\_SEARCHNOTNULL executor bounds and Index Cond rendering are in place.
+Movement: none — regress line counts held (17 suites); probes vs PG identical for the leading-column and index-only shapes; corpora fires=none
+- [ ] **M0148-0001c3a1 — NullTest index quals: bitmap producer, duplicate
+  NullTests, backward ordered scans, Index Cond WHERE order**.
+  Kind: impl
+  Parent: M0148-0001c3a
+  Residue of c3a (design doc
+  docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md "Not covered").
+  (1) The bitmap producer (pathbitmap.go / createplanbitmap.go) files no
+  NullTest: regress create\_index `thousand = 42 AND (tenthous = 1 OR … OR
+  tenthous IS NULL)` is a BitmapOr with `Index Cond: ((thousand = 42) AND
+  (tenthous IS NULL))` in PG, and PG picks a Bitmap Heap Scan for `a = 3
+  AND b IS [NOT] NULL` where goopg plans a plain Index Scan or a
+  Filter-only bitmap. (2) Duplicate / contradictory NullTests on one
+  column (`unique1 IS NULL AND unique1 IS NULL`): only the first is an
+  index qual. (3) Backward path-based index scans: createplanindex.go
+  refuses a non-forward IndexScanDir, so `where x is not null order by x
+  desc limit 1` sorts where PG plans Index Only Scan Backward. (4) Index
+  Cond order follows the cost-sorted leaf Filter, not baserestrictinfo
+  order (`x < 5 AND x IS NOT NULL`). Resume: (1) first —
+  matchBitmapIndexQuals + the bitmap executor's indexRangeSpec (nullTest).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes

@@ -1,33 +1,24 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #11: census IDENTICAL; M0148-0001c3a slice 2 landed)
+# Working Set — loop end 2026-11-11 (run-2 loop #12: census IDENTICAL; M0148-0001c3a slice 3 landed, c3a CLOSED)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 89031bbc1 → routing-20261111f (label s9bi, BASELINE_REV=2a21c4185) IDENTICAL ×3. f303d61c7 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 3218fd9eb, the head routing-20261111f consumed.
-- Nightly fires at 00:00. Check `pgrep -fa run-nightly` before long gates; the sf025 sweep and acceptance arm refuse while it runs.
-- Task: M0148-0001c3a (`col IS [NOT] NULL` as a btree index qual) — IN PROGRESS.
-  - Slice 1 (89031bbc1): plain scans.
-  - Slice 2 (f303d61c7): index-only scans.
-- Files (f303d61c7):
-  - optimizer/plan.go: IndexOnlyScan.LeadingNullTest/NullTestAfterBounds.
-  - optimizer/pathindexonly.go: indexOnlyLeafClauses, plainRestrictionBindsOnlyPrefix, hasRangeClause sel/pathkeys.
-  - optimizer/createplanindex.go: the IOS lowering arm.
-  - optimizer/planner.go: tryPromoteIndexOnlyScan now copies the fields.
-  - executor/operators_indexonly.go: the lookupRangeBounds arm.
-  - executor/operators_explain.go: formatNullTestIndexCond, shared by both scan nodes.
-  - Test nulltest_index_qual_test.go (IOS cases); design doc + README.
-- Key symbols: restrictionLeadingNullTest, withNullTestInConjunctOrder, IndexOnlyScan.LeadingNullTest, indexOnlyScanOp.lookupRangeBounds, formatNullTestIndexCond.
+- S9: DUE after f303d61c7 → routing-20261111g (label s9bj, BASELINE_REV=3218fd9eb) IDENTICAL ×3. 96d734112 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 2cc8f8598, the head routing-20261111g consumed.
+- NIGHTLY fires 00:00 (2026-11-12) and runs ~80 min. The sf025 sweep and acceptance arm refuse while it runs, and a census/fire-set beside it starves the batch. Check `pgrep -fa run-nightly`, wait it out first (`timeout 3500 bash -c 'while ps -eo args | grep -qE "[c]i/batch/(run-nightly\.sh|stages/)"; do sleep 30; done'`), then triage ci/logs/action-items.md.
+- Task: M0148-0001c3a — CLOSED (89031bbc1, f303d61c7, 96d734112). Residue filed as M0148-0001c3a1:
+  - (1) bitmap producer;
+  - (2) duplicate NullTests;
+  - (3) backward ordered scans;
+  - (4) Index Cond WHERE order.
+- Files (96d734112): optimizer/pathindexrestrict.go (restrictionNullTestOnColumn, prefixRange arm, conjunct-order helper, selectivity split), pathindexonly.go, createplanindex.go, plan.go; executor/operators_explain.go (RangePrefix branch); test nulltest_index_qual_test.go; design doc + README.
+- Key symbols: restrictionNullTestOnColumn, withNullTestInConjunctOrder, IndexScan.LeadingNullTest (the range column, behind RangePrefix too).
 - Findings:
-  - The IOS executor duplicates the range-bound code (now sibling-patched).
-  - Path-based index scans can't scan backward (createplanindex.go:333 refuses). Ledger.
-  - Duplicate NullTests: only the first is indexed. Ledger.
-- Next step: S9 due-check. Then c3a slice 3, the bitmap producer (pathbitmap.go / createplanbitmap.go).
-  - create_index: `thousand = 42 AND (tenthous = 1 OR … OR tenthous IS NULL)` → BitmapOr of `(thousand = 42) AND (tenthous = ANY …)` and `(thousand = 42) AND (tenthous IS NULL)`.
-  - That needs a NullTest behind an equality prefix (restrictionEqualityPrefix + NullTest on the next column), so do the plain-scan behind-prefix arm first.
-  - Or close c3a with slice 3 + duplicates + backward filed as residue child c3a1 (j-series pattern) if the bitmap arm proves large.
-- Top-residual: M0148 residues. Open children: c3a (bitmap, behind-prefix), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - PG picks Bitmap Heap Scans for `a = 3 AND b IS [NOT] NULL` (bitmap Index Cond carries the NullTest), so c3a1 item (1) is the next parity step.
+  - The RegressSuite flakes are hash_index and index_including. Both reproduce on a HEAD worktree; a VACUUM-timing IOS choice is the likely cause.
+- Next step: after the nightly, S9 due-check, then the topmost open M0148 child in file order. That is c3a1, filed directly after c3a; check the order.
+- Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261111f exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for f303d61c7):
-  - PASS: units, TestPort_RegressSuite (371 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3bfs fires=none ×3.
-  - Regress 17 suites neutral.
+  - Items 0-9: M0146-0014(channel; census routing-20261111g exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0 (last run 20261111-165815). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
+- Gates run (staged code_tree for 96d734112):
+  - PASS: units, TestPort_RegressSuite (2nd run 458 s; 1st run hash_index/index_including flaked, same diff on HEAD), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3dfs fires=none ×3.
+  - Regress subset: create_index/btree_index/select/partition_prune unchanged; join and inherit moved on parallel-plan variance.
 - In-flight: none. Scratch PG 5545 and goopg 5533 stopped.
