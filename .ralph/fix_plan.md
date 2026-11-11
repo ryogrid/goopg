@@ -12044,6 +12044,25 @@ Movement: yes — regress create\_type 406→402, typed\_table 133→117, rangef
   internal/optimizer/pathindexrestrict.go addOneRestrictionIndexPath,
   createplanindex.go, executor operators_index.go,
   operators_explain.go formatIndexCond.
+  - Slice 1 LANDED (2026-11-11, 89031bbc1): plain index scans, leading
+    column. restrictionLeadingNullTest files the NullTest beside/instead of
+    the leading range (IS NULL only over an index with NULL-keyed entries),
+    lowered onto IndexScan.LeadingNullTest; indexRangeBounds bounds at the
+    NULL group (IS NULL = [k, upper(k)], empty beside a value bound; IS NOT
+    NULL = the exclusive NULL stop at either end). Design doc
+    docs/design/0100-0149/0148-0001c3a-nulltest-index-qual.md. Probe vs PG:
+    `where x is null` and `x is not null and x < 5` identical (ASC and DESC).
+    Gates units, RegressSuite, spotcheck, sf025 99/99, acceptance 24 MATCH,
+    fire-set fires=none ×3; regress 17 suites hunk-identical.
+    - Next slice: the index-only / ordered producers (pathindexonly.go,
+      pathindexordered.go): `select x … where x is not null order by x
+      limit 1` (PG Index Only Scan, Index Cond) and create\_index's `unique1
+      IS NULL AND unique1 IS NULL`; IndexOnlyScan needs LeadingNullTest too
+      (the executor's IOS range arm shares indexRangeBounds).
+    - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
+      (tenthous IS NULL)`), a NullTest behind an equality prefix.
+    - Found: Index Cond order can't follow WHERE when the comparison comes
+      first — the leaf Filter is already cost-sorted (ledger).
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
