@@ -1,33 +1,36 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #21: census IDENTICAL; M0148-0001c3a2 slice 4 landed 0617a1952)
+# Working Set — loop end 2026-11-12 (run-2 loop #22: census IDENTICAL; M0148-0001c3a2 slice 5 landed bd4ce891a)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112g (label s9br, BASELINE_REV=a478f112c) IDENTICAL ×3, committed.
-  - Code commit 0617a1952 since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bs, BASELINE_REV=c8b14ed30 (capture head of routing-20261112g), as routing-20261112h.
-  - The cost change was bitmap-wide; the fire-set showed fires=none on sf025 + sf1. TPC-H plans are verified only by the census.
-- Task: M0148-0001c3a2 — BitmapOr and five more c3a2 items. Stays OPEN.
-  - Slice 4 LANDED: choose_bitmap_and port + BitmapAnd costing fixes.
+- S9: DUE at loop start → routing-20261112h (label s9bs, BASELINE_REV=c8b14ed30) IDENTICAL ×3 (TPC-H too), committed.
+  - Code commit bd4ce891a since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bt, BASELINE_REV=81fdf350a (capture head of routing-20261112h), as routing-20261112i.
+- Task: M0148-0001c3a2 — c3a1 residue. Items (1) and (2) done; (3)-(6) open. Stays OPEN.
+  - Slice 5 LANDED: exact range bounds behind an equality prefix, plain and bitmap.
 - Files:
-  - optimizer/pathbitmap.go: chooseBitmapAnd rewritten, findIndexpathQuals, sameIDSet; OR paths are AND candidates; parameterized pathRows.
-  - costbitmap.go: costBitmapIndexScan(pathRows); costBitmapTree no double charge.
-  - pathbitmapor.go: bitmapOrRecheck serves AND trees; bitmapTreeExact.
-  - createplanbitmap.go: AND recheck branch.
-  - Tests: bitmap_or_paths_test.go (+4 PG BitmapAnd plans; fixture now has stringu1); costbitmap_test.go, pathbitmap_test.go, saop_index_test.go (new costBitmapIndexScan arg).
+  - optimizer/pathindexrestrict.go: restrictionRangeBehindPrefix / restrictionRangeOnColumnLocal.
+  - createplanindex.go: guard removed.
+  - pathbitmap.go: bitmap prefix bounds.
+  - createplanbitmap.go: createBitmapIndexScanPlan rewritten as one clause classification.
+  - executor/operators_bitmap.go: Keys prefix in the LowKey branch.
+  - operators_explain.go: formatPrefixRangeIndexCond shared.
+  - Tests: bitmap_or_paths_test.go TestRangeBehindEqualityPrefix; pathindexrestrict_test.go (2 tests now pin the exact form, bitmap-off).
 - Findings:
-  - The AND estimators priced on rel.Rows, not baserel tuples — the main reason ANDs never won.
-  - Regress join +5 is a nondeterministic Hash Right Join unmatched-row order (on HEAD too; ledgered).
-- Next step: S9 census (DUE), then c3a2 item (2) — a bitmap range behind an equality prefix (`a = 3 AND b < 200` under a bitmap; PG Index Cond `((a = 3) AND (b < 200))`), and SAOP + range (`(thousand = ANY (…)) AND (tenthous > 500)`).
-  - The bitmap executor already probes through indexRangeBounds with prefix Keys (NullTest path) — extend createBitmapIndexScanPlan and buildBitmapIndexChild.
+  - The "bound behind prefix stays a Filter recheck" rule (2026-09-23) was stale since the c3a prefix-aware nullStopRangeBound (2026-11-11).
+  - The SAOP+range form still has its own unstopped per-element bounds (ledgered).
+- Next step: S9 census (DUE), then c3a2 item (3).
+  - Duplicate / contradictory NullTests on one column: only the first is an index qual today. PG's _bt_preprocess_keys merges them, e.g. `b IS NULL AND b IS NOT NULL` → contradiction.
+  - Probe PG first: `a = 3 AND b IS NOT NULL AND b IS NOT NULL`, `b IS NULL AND b IS NOT NULL`.
+  - Alternatively SAOP+range per-element NULL stop.
 - Top-residual: M0148 residues. Open children: c3a2, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112g done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112h done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a2.
 - Gates run (all PASS):
-  - census s9br: IDENTICAL ×3.
-  - regress A/B over 22 suites: create_index -69; join +5 is the flap.
-  - units.
+  - census s9bs: IDENTICAL ×3.
+  - regress A/B over 22 suites: unchanged.
+  - units (second run; the first failed 2 tests that pinned the old rule → updated).
   - tpch-spotcheck.
-  - sf025: PASS=99, 99/99.
-  - fire-set c3a2dfs: fires=none.
+  - sf025: 99/99.
+  - fire-set c3a2efs: fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
 - In-flight: none.

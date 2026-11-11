@@ -12248,6 +12248,27 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - Resume: c3a2 item (2) — a bitmap range behind an equality prefix (and
     the SAOP + range form), then items (3)-(6).
   Movement: yes — regress create\_index 3235→3166 (join +5 is a pre-existing Hash Right Join row-order flap)
+  - 2026-11-12 slice 5 LANDED (bd4ce891a): item (2) — range bounds behind
+    an equality prefix.
+    - They are now exact index quals on the plain RangePrefix path and on
+      the bitmap Keys+bounds path.
+    - The old "bound stays a Filter recheck" rule predated the prefix-aware
+      NULL stop in indexRangeBounds.
+    - Probe against PG: 25 statements identical across ASC, DESC and NULLS
+      FIRST indexes with a 1/7-NULL bounded column.
+  - Residue after slice 5:
+    - SAOP + range bound (plain: still a Filter recheck; bitmap: the bound
+      is not an index qual).
+    - Inequality OR groups.
+    - Plain-path OR→SAOP behind a prefix.
+    - Sub-ORs; useful\_predicate.
+    - Join ORs.
+    - Items (3)-(6): duplicate NullTests, backward ordered scans, Index
+      Cond WHERE order, varchar keys.
+  - Resume: item (3), duplicate / contradictory NullTests on one column
+    (PG `_bt_preprocess_keys`), or SAOP + range with a per-element NULL
+    stop.
+  Movement: none — regress 22 suites unchanged
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
