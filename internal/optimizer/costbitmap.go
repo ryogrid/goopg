@@ -306,15 +306,27 @@ func costBitmapAndCost(cp costParams, paths []*Path) (Cost, float64) {
 // multiple bitmap paths. It is PG's cost_bitmap_or_node (costsize.c:1208-1253):
 // selectivities are summed (non-overlapping assumption, clamped to 1.0),
 // costs are summed, and each union after the first charges
-// 100 * cpu_operator_cost.
+// 100 * cpu_operator_cost — except where the input is a Bitmap Index Scan,
+// whose union PG optimises out (`!IsA(subpath, IndexPath)`).
+//
+// An index input's cost is cost_bitmap_tree_node's `indextotalcost + 0.1 *
+// cpu_operator_cost * rows`, which is the path's own Cost.Total
+// (costBitmapIndexScan already adds the per-tuple charge); costBitmapTree
+// adds that charge a second time (ledgered, M0148-0001c3a2), so the index
+// arm is read here directly.
 func costBitmapOrCost(cp costParams, paths []*Path) (Cost, float64) {
 	var totalCost float64
 	selec := 0.0
 	for i, sub := range paths {
-		subCost, subSelec := costBitmapTree(cp, sub)
+		var subCost, subSelec float64
+		if sub.Kind == PathBitmapIndexScan {
+			subCost, subSelec = sub.Cost.Total, sub.BitmapSelectivity
+		} else {
+			subCost, subSelec = costBitmapTree(cp, sub)
+		}
 		selec += subSelec
 		totalCost += subCost
-		if i > 0 {
+		if i > 0 && sub.Kind != PathBitmapIndexScan {
 			totalCost += 100.0 * cp.cpuOperatorCost
 		}
 	}

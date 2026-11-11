@@ -799,6 +799,15 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 				return slot, err
 			}
 		}
+		// Likewise a LOSSY page still being walked: the shared allocator
+		// hands each page out once, so claiming the next one here would
+		// drop the rest of this page's matches (M0148-0001c3a2).
+		if o.inLossyPage {
+			if slot, err := o.nextLossyTuple(o.pageBlock); err != nil || slot != nil {
+				return slot, err
+			}
+			o.inLossyPage = false
+		}
 		block, entry, ok := o.pbm.nextPage()
 		if !ok {
 			// Exhausted.
@@ -839,17 +848,20 @@ func (o *bitmapHeapScanOp) nextParallel() (TupleSlot, error) {
 			// does. The previous code `continue`d here and claimed to be
 			// matching the serial path — which was itself dropping lossy pages,
 			// so the two agreed only in being wrong together.
+			//
+			// The walk is a cursor across Next() calls (`inLossyPage` /
+			// `lossyOff`, resumed at the top of this loop), as the exact-page
+			// walk below is. This arm used to return the page's first match
+			// and fall out, so the next Next() claimed a NEW page and every
+			// other match on this one was LOST — one row per lossy page:
+			// regress bitmapops' `a = 1` under work_mem 64kB returned 1273 (its
+			// lossy page count) of 1321 rows once the scan ran parallel.
 			o.lossyOff = 0
-			for {
-				slot, err := o.nextLossyTuple(block)
-				if err != nil {
-					return nil, err
-				}
-				if slot == nil {
-					break
-				}
-				return slot, nil
+			o.inLossyPage = true
+			if slot, err := o.nextLossyTuple(block); err != nil || slot != nil {
+				return slot, err
 			}
+			o.inLossyPage = false
 			continue
 		}
 

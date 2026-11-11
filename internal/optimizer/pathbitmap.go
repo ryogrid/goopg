@@ -69,7 +69,16 @@ func (s *searchCtx) addBaseRelBitmapPaths(cat catalog.Catalog) {
 			}
 		}
 
+		// M0148-0001c3a2: BitmapOr paths over the leaf's OR conjuncts
+		// (generate_bitmap_or_paths over rel->baserestrictinfo).
+		orPaths := s.bitmapOrHeapPaths(rel, tbl, cat.IndexesOnTable(tbl), relPages, relTuples, T, totalPages, maxEntries, rel.baseLeaf)
+		for _, p := range orPaths {
+			addPath(rel, p, "bitmap.orclause")
+		}
 		if len(singlePaths) == 0 {
+			if len(orPaths) > 0 {
+				setCheapest(rel)
+			}
 			continue
 		}
 
@@ -108,6 +117,65 @@ func (s *searchCtx) buildOneBitmapPath(
 	relPages int64, relTuples, T, totalPages float64, maxEntries int,
 	leaf Node,
 ) *Path {
+	bitmapIdxPath := s.buildBitmapIndexChild(rel, tbl, idx, relPages, relTuples, totalPages, leaf, extractFilterConjuncts(leaf))
+	if bitmapIdxPath == nil {
+		return nil
+	}
+	// The index path's row count is the lossiness-corrected tuple count
+	// computeBitmapPages returns (the figure costBitmapTree charges the
+	// per-tuple bitmap manipulation against when chooseBitmapAnd compares
+	// paths).
+	_, bitmapIdxPath.Rows = computeBitmapPages(bitmapIdxPath.Rows, relTuples, T,
+		indexPagesForPath(s.cat, bitmapIdxPath, tbl, relTuples), totalPages, s.cp.effectiveCacheSize, maxEntries)
+	return s.bitmapHeapPathOver(rel, tbl, bitmapIdxPath, relTuples, T, totalPages, maxEntries, leaf)
+}
+
+// bitmapHeapPathOver wraps a bitmap qual path (a Bitmap Index Scan, or a
+// BitmapAnd / BitmapOr tree) in the BitmapHeapScan path that reads its heap
+// pages — create_bitmap_heap_path + cost_bitmap_heap_scan (pathnode.c,
+// costsize.c). The bitmap qual's own cost is the heap scan's startup cost.
+func (s *searchCtx) bitmapHeapPathOver(
+	rel *RelOptInfo, tbl *catalog.Table, bitmapqual *Path,
+	relTuples, T, totalPages float64, maxEntries int, leaf Node,
+) *Path {
+	tuplesFetched := clampRowEst(bitmapqual.BitmapSelectivity * relTuples)
+	// Compute how many distinct heap pages the bitmap visits.
+	indexPages := indexPagesForPath(s.cat, bitmapqual, tbl, relTuples)
+	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
+
+	// Total cost: index access (startup) + heap fetch (run). R1
+	// (plan-parity-fix-take2): the heap side rechecks every local
+	// conjunct, so the count is the leaf's full conjunct list.
+	totalCost := costBitmapHeapScan(s.cp, bitmapqual.Cost, pagesFetched, tuplesFetched, T, localQualOpCount(leaf))
+
+	// Build the bitmap heap scan path (the outer container).
+	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
+	// the index child's count (normally zero — the child carries no flag of
+	// its own). The producer always runs.
+	return &Path{
+		Kind:          PathBitmapHeapScan,
+		Rel:           rel,
+		Rows:          rel.Rows, // the rel's post-restriction row count
+		Cost:          totalCost,
+		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapqual),
+		Children:      []*Path{bitmapqual},
+		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
+		// bitmapqual's. C-19a.
+		ParallelSafe: parallelSafeWith(rel, bitmapqual),
+	}
+}
+
+// buildBitmapIndexChild builds the Bitmap Index Scan path of one index from
+// the restriction clauses in conjuncts — build_index_paths' ST_BITMAPSCAN
+// arm. conjuncts is the leaf's own conjunct list for a plain bitmap path, and
+// one OR arm's clauses plus the other restriction clauses for a BitmapOr arm
+// (build_paths_for_OR, M0148-0001c3a2). Returns nil when the index offers no
+// index clause and no proven partial predicate.
+func (s *searchCtx) buildBitmapIndexChild(
+	rel *RelOptInfo, tbl *catalog.Table, idx *catalog.Index,
+	relPages int64, relTuples, totalPages float64,
+	leaf Node, conjuncts []Expr,
+) *Path {
 	if idx == nil {
 		return nil
 	}
@@ -121,7 +189,7 @@ func (s *searchCtx) buildOneBitmapPath(
 	// (`onek2 WHERE unique1 = 50` over `onek2_u1_prtl ... WHERE stringu1 < 'B'`
 	// returned 0 rows, regress `portals_p2`). The proof is the narrow
 	// `Var op Const` prover the other producers use (M0134-0017b), checked
-	// against each of the leaf's conjuncts below.
+	// against each of the conjuncts below.
 	var partialPredicate Expr
 	if idx.HasPredicate {
 		resolved, err := ResolveIndexPredicateOf(idx, tbl)
@@ -137,12 +205,10 @@ func (s *searchCtx) buildOneBitmapPath(
 		return nil
 	}
 
-	// Extract local filter conjuncts from the leaf's Filter wrappers
-	// and match equality conjuncts against this index's columns.
-	// Matched conjuncts become index probe keys; their combined
-	// selectivity replaces the full-scan default of 1.0.
+	// Match the conjuncts against this index's columns. Matched conjuncts
+	// become index probe keys; their combined selectivity replaces the
+	// full-scan default of 1.0.
 	id, _, _ := scanLeafFor(leaf)
-	conjuncts := extractFilterConjuncts(leaf)
 	if partialPredicate != nil && !partialPredicateProvenBy(partialPredicate, conjuncts) {
 		return nil
 	}
@@ -217,24 +283,14 @@ func (s *searchCtx) buildOneBitmapPath(
 		numQualOps:    localQualOpCount(leaf),
 		numIndexQuals: float64(len(indexClauses)),
 	}
-	tuplesFetched := clampRowEst(selectivity * relTuples)
 
 	// Cost the index-access side (bitmap index scan).
 	idxCost := costBitmapIndexScan(s.cp, in)
 
-	// Compute how many distinct heap pages the bitmap visits.
-	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, totalPages, s.cp.effectiveCacheSize, maxEntries)
-
-	// Total cost: index access (startup) + heap fetch (run). R1
-	// (plan-parity-fix-take2): the heap side rechecks every local
-	// conjunct, so the count is the leaf's full conjunct list.
-	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, localQualOpCount(leaf))
-
-	// Build the bitmap index path (the child of the heap scan).
-	bitmapIdxPath := &Path{
+	return &Path{
 		Kind:              PathBitmapIndexScan,
 		Rel:               rel,
-		Rows:              tuplesFetched,
+		Rows:              clampRowEst(selectivity * relTuples),
 		Cost:              idxCost,
 		BitmapSelectivity: selectivity,
 		IndexInfo:         idx,
@@ -244,22 +300,6 @@ func (s *searchCtx) buildOneBitmapPath(
 		RequiredOuter:     0,
 		// create_bitmap_index_path: `rel->consider_parallel`. C-19a.
 		ParallelSafe: rel.ParallelSafeForPath(),
-	}
-
-	// Build the bitmap heap scan path (the outer container).
-	// B-17d: `cost_bitmap_heap_scan`'s own flag (costsize.c:1023), on top of
-	// the index child's count (normally zero — the child carries no flag of
-	// its own). The producer always runs.
-	return &Path{
-		Kind:     PathBitmapHeapScan,
-		Rel:      rel,
-		Rows:     rel.Rows, // the rel's post-restriction row count
-		Cost:     totalCost,
-		DisabledNodes: disabledNodesFor(!s.cp.enableBitmapScan, bitmapIdxPath),
-		Children: []*Path{bitmapIdxPath},
-		// create_bitmap_heap_path (pathnode.c:1149): the rel's flag AND the
-		// bitmapqual's. C-19a.
-		ParallelSafe: parallelSafeWith(rel, bitmapIdxPath),
 	}
 }
 

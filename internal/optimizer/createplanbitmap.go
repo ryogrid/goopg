@@ -29,6 +29,17 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 	// Build the bitmap qual subtree (outer) from the child path.
 	outer, _ := createPlanNode(p.Children[0])
 
+	// M0148-0001c3a2: a BitmapOr qual's recheck is its ORed arm quals, and
+	// the leaf conjuncts those imply leave the Filter (bitmapOrRecheck).
+	if p.Children[0].Kind == PathBitmapOr {
+		bitmapQual, drop := bitmapOrRecheck(p.Children[0], p.Rel.baseLeaf)
+		bhs := &BitmapHeapScan{
+			pos: id.pos, Table: id.table, Alias: id.alias, RTID: id.rtid,
+			BitmapQual: bitmapQual, Outer: outer, schema: id.schema,
+		}
+		return rewrapLeafDropping(p.Rel.baseLeaf, bhs, drop), nil
+	}
+
 	// Build the BitmapQual expression list from the index clauses.
 	// Each index clause becomes part of the recheck condition.
 	bitmapQual := bitmapQualExprs(p.Children[0])
