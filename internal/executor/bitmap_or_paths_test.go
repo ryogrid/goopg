@@ -20,8 +20,10 @@ func TestBitmapOrOverOrClauses(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
 
-	runSQL(t, ctx, "CREATE TABLE t1 (unique1 int NOT NULL, unique2 int NOT NULL, hundred int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL)")
-	runSQL(t, ctx, "INSERT INTO t1 SELECT g, (g*7919)%10000, g%100, g%1000, g FROM generate_series(0, 9999) g")
+	// The table PG 18.3 was probed on, column for column (the width sets the
+	// page count the bitmap costs read).
+	runSQL(t, ctx, "CREATE TABLE t1 (unique1 int NOT NULL, unique2 int NOT NULL, hundred int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL, stringu1 name)")
+	runSQL(t, ctx, "INSERT INTO t1 SELECT g, (g*7919)%10000, g%100, g%1000, g, 'S'||(g%500) FROM generate_series(0, 9999) g")
 	runSQL(t, ctx, "CREATE INDEX t1_u1 ON t1 (unique1)")
 	runSQL(t, ctx, "CREATE INDEX t1_u2 ON t1 (unique2)")
 	runSQL(t, ctx, "CREATE INDEX t1_h ON t1 (hundred)")
@@ -136,6 +138,54 @@ func TestBitmapOrOverOrClauses(t *testing.T) {
 			"        ->  Bitmap Index Scan on t1_u2",
 			"              Index Cond: (unique2 = 4)",
 		}},
+		// choose_bitmap_and (indxpath.c) over every restriction bitmap path,
+		// OR paths included: candidates are redundant only when they share
+		// a CLAUSE (classify_index_clause_usage), and priced on the
+		// relation's tuples. PG 18.3 plans each of these as a BitmapAnd.
+		{"SELECT * FROM t1 WHERE hundred = 42 AND unique2 < 3000", []string{
+			"Bitmap Heap Scan on t1",
+			"  Recheck Cond: ((hundred = 42) AND (unique2 < 3000))",
+			"  ->  BitmapAnd",
+			"        ->  Bitmap Index Scan on t1_h",
+			"              Index Cond: (hundred = 42)",
+			"        ->  Bitmap Index Scan on t1_u2",
+			"              Index Cond: (unique2 < 3000)",
+		}},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND (thousand = 42 OR thousand = 99 OR unique1 < 2)", []string{
+			"Bitmap Heap Scan on t1",
+			"  Recheck Cond: ((hundred = 42) AND (((thousand = 42) OR (thousand = 99)) OR (unique1 < 2)))",
+			"  Filter: ((thousand = 42) OR (thousand = 99) OR (unique1 < 2))",
+			"  ->  BitmapAnd",
+			"        ->  Bitmap Index Scan on t1_h",
+			"              Index Cond: (hundred = 42)",
+			"        ->  BitmapOr",
+			"              ->  Bitmap Index Scan on t1_tt",
+			"                    Index Cond: (thousand = ANY ('{42,99}'::integer[]))",
+			"              ->  Bitmap Index Scan on t1_u1",
+			"                    Index Cond: (unique1 < 2)",
+		}},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND (unique2 = 5 OR unique1 < 2000)", []string{
+			"Bitmap Heap Scan on t1",
+			"  Recheck Cond: ((hundred = 42) AND ((unique2 = 5) OR (unique1 < 2000)))",
+			"  ->  BitmapAnd",
+			"        ->  Bitmap Index Scan on t1_h",
+			"              Index Cond: (hundred = 42)",
+			"        ->  BitmapOr",
+			"              ->  Bitmap Index Scan on t1_u2",
+			"                    Index Cond: (unique2 = 5)",
+			"              ->  Bitmap Index Scan on t1_u1",
+			"                    Index Cond: (unique1 < 2000)",
+		}},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND thousand < 300 AND unique2 < 4000", []string{
+			"Bitmap Heap Scan on t1",
+			"  Recheck Cond: ((hundred = 42) AND (thousand < 300))",
+			"  Filter: (unique2 < 4000)",
+			"  ->  BitmapAnd",
+			"        ->  Bitmap Index Scan on t1_h",
+			"              Index Cond: (hundred = 42)",
+			"        ->  Bitmap Index Scan on t1_tt",
+			"              Index Cond: (thousand < 300)",
+		}},
 		{"SELECT * FROM t1 WHERE unique1 < 3 OR unique2 = 7", []string{
 			"Bitmap Heap Scan on t1",
 			"  Recheck Cond: ((unique1 < 3) OR (unique2 = 7))",
@@ -165,6 +215,10 @@ func TestBitmapOrOverOrClauses(t *testing.T) {
 		{"SELECT * FROM t1 WHERE unique1 IN (1, 5, 9, 9, NULL) OR unique2 = 4", "SELECT * FROM t1 WHERE unique1 + 0 IN (1, 5, 9) OR unique2 + 0 = 4"},
 		{"SELECT * FROM t1 WHERE unique2 IN (3, 7, 3)", "SELECT * FROM t1 WHERE unique2 + 0 IN (3, 7)"},
 		{"SELECT * FROM t1 WHERE hundred IN (1, 2, 3) OR thousand = 7 OR thousand = 8", "SELECT * FROM t1 WHERE hundred + 0 IN (1, 2, 3) OR thousand + 0 = 7 OR thousand + 0 = 8"},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND unique2 < 3000", "SELECT * FROM t1 WHERE hundred + 0 = 42 AND unique2 + 0 < 3000"},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND (thousand = 42 OR thousand = 99 OR unique1 < 2)", "SELECT * FROM t1 WHERE hundred + 0 = 42 AND (thousand + 0 = 42 OR thousand + 0 = 99 OR unique1 + 0 < 2)"},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND (unique2 = 5 OR unique1 < 2000)", "SELECT * FROM t1 WHERE hundred + 0 = 42 AND (unique2 + 0 = 5 OR unique1 + 0 < 2000)"},
+		{"SELECT * FROM t1 WHERE hundred = 42 AND thousand < 300 AND unique2 < 4000", "SELECT * FROM t1 WHERE hundred + 0 = 42 AND thousand + 0 < 300 AND unique2 + 0 < 4000"},
 	}
 	checkCases := func(label string) {
 		t.Helper()

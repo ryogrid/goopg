@@ -202,7 +202,7 @@ func TestBitmapPathCost_Positive(t *testing.T) {
 		totalTablePages: s.totalTablePages(),
 	}
 	tuplesFetched := clampRowEst(in.selectivity * relTuples)
-	idxCost := costBitmapIndexScan(s.cp, in)
+	idxCost := costBitmapIndexScan(s.cp, in, tuplesFetched)
 	pagesFetched, tuplesFetched := computeBitmapPages(tuplesFetched, relTuples, T, indexPages, s.totalTablePages(), s.cp.effectiveCacheSize, maxEntries)
 	totalCost := costBitmapHeapScan(s.cp, idxCost, pagesFetched, tuplesFetched, T, 0)
 

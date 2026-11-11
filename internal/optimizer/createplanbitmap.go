@@ -31,7 +31,10 @@ func createBitmapHeapScanPlan(p *Path) (Node, error) {
 
 	// M0148-0001c3a2: a BitmapOr qual's recheck is its ORed arm quals, and
 	// the leaf conjuncts those imply leave the Filter (bitmapOrRecheck).
-	if p.Children[0].Kind == PathBitmapOr {
+	// A BitmapAnd's recheck is its children's quals (create_bitmap_subplan's
+	// AND arm) — whenever every index clause in the tree is exact; an
+	// inexact one keeps the older single-index handling below.
+	if k := p.Children[0].Kind; k == PathBitmapOr || (k == PathBitmapAnd && bitmapTreeExact(p.Children[0])) {
 		bitmapQual, drop := bitmapOrRecheck(p.Children[0], p.Rel.baseLeaf)
 		bhs := &BitmapHeapScan{
 			pos: id.pos, Table: id.table, Alias: id.alias, RTID: id.rtid,

@@ -28,9 +28,11 @@ func TestCostBitmapIndexScan_AddsBitmapOverhead(t *testing.T) {
 	// the heap twice, once here invisibly and once where it belongs. It pinned
 	// the defect rather than guarding against it.
 	idxStartup, idxTotal := btreeIndexAMCost(cp, in)
-	bitmap := costBitmapIndexScan(cp, in)
-	tuplesFetched := clampRowEst(in.selectivity * in.relTuples) // 1000
-	overhead := 0.1 * cp.cpuOperatorCost * tuplesFetched        // 0.1 * 0.0025 * 1000 = 0.25
+	// The per-row charge is on the PATH's rows (cost_index: baserel->rows),
+	// which can be far below the tuples the index returns (M0148-0001c3a2).
+	const pathRows = 40.0
+	bitmap := costBitmapIndexScan(cp, in, pathRows)
+	overhead := 0.1 * cp.cpuOperatorCost * pathRows // 0.1 * 0.0025 * 40 = 0.01
 	if diff := bitmap.Total - idxTotal; math.Abs(diff-overhead) > 1e-9 {
 		t.Errorf("costBitmapIndexScan overhead over the index side = %v, want %v", diff, overhead)
 	}

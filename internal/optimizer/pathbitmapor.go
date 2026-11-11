@@ -421,7 +421,7 @@ func (s *searchCtx) bitmapOrArmPath(
 	var best *Path
 	bestCost := 0.0
 	for _, h := range heaps {
-		c := bitmapScanCostEst(s.cp, h, rel.Rows, T, indexPagesForPath(s.cat, h, tbl, relTuples), totalPages, maxEntries, relQualOpCount(rel)).Total
+		c := bitmapScanCostEst(s.cp, h, relTuples, T, indexPagesForPath(s.cat, h, tbl, relTuples), totalPages, maxEntries, relQualOpCount(rel)).Total
 		if best == nil || c < bestCost {
 			best, bestCost = h.Children[0], c
 		}
@@ -500,18 +500,30 @@ func bitmapArmSubqual(p *Path) ([]Expr, bool) {
 // recheck provably implies leaves the Filter (qpqual) — `thousand = 42`
 // repeated in every arm, or the OR clause itself when each arm's qual covers
 // one of its arms.
-func bitmapOrRecheck(orPath *Path, leaf Node) ([]Expr, map[Expr]bool) {
-	qual, ok := bitmapArmSubqual(orPath)
-	if !ok || len(qual) != 1 {
-		panic("createPlan: BitmapOr path with an inexact arm qual")
+//
+// It serves a BitmapAnd tree too, whose recheck list is its children's quals
+// (one item each, as PG's bitmapqualorig list): the implication test reads
+// the list as their AND, as predicate_implied_by reads indexquals.
+func bitmapOrRecheck(treePath *Path, leaf Node) ([]Expr, map[Expr]bool) {
+	qual, ok := bitmapArmSubqual(treePath)
+	if !ok || len(qual) == 0 || (treePath.Kind == PathBitmapOr && len(qual) != 1) {
+		panic("createPlan: bitmap tree path with an inexact qual")
 	}
+	all := combineAnd(qual)
 	drop := map[Expr]bool{}
 	for _, c := range extractFilterConjuncts(leaf) {
-		if predicateImpliedBy(qual[0], c) {
+		if predicateImpliedBy(all, c) {
 			drop[c] = true
 		}
 	}
 	return qual, drop
+}
+
+// bitmapTreeExact reports whether every index clause in a bitmap tree is
+// exact (bitmapArmSubqual can build its recheck qual).
+func bitmapTreeExact(p *Path) bool {
+	_, ok := bitmapArmSubqual(p)
+	return ok
 }
 
 // predClass is predtest.c's PredClass.

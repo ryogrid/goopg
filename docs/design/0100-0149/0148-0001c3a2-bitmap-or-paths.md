@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); the other c3a2 items stay open
 
 ## Problem
 
@@ -197,6 +197,49 @@ partition\_join and select diffs.
   - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
     acceptance 24 MATCH.
 
+## Slice 4 — choose\_bitmap\_and and BitmapAnd costing
+
+goopg never planned the BitmapAnd PG builds for `hundred = 42 AND unique2 <
+3000`, nor the BitmapAnd over a BitmapOr for `hundred = 42 AND (thousand =
+42 OR thousand = 99 OR unique1 < 2)`. Three defects, all fixed:
+
+- **Redundancy model:** `chooseBitmapAnd` is now PG's choose\_bitmap\_and.
+  - `findIndexpathQuals` is find\_indexpath\_quals. An OR path's quals are
+    its arms' index clauses, plus each index's partial predicate as AND
+    items.
+  - The clauses are numbered by `exprEqual` position, as
+    classify\_index\_clause\_usage does.
+  - Candidates with the same clause set keep the cheaper.
+  - path\_usage\_comparator sorts by cost, then selectivity.
+  - A candidate is skipped if it shares a clause with the group, or if the
+    group's quals imply one of its predicates.
+  - The old test skipped any pair of indexes sharing a COLUMN, and read
+    `Children[0].IndexInfo`, which a BitmapOr lacks.
+  - OR paths are now candidates: `addBaseRelBitmapPaths` passes
+    singles plus ORs, as create\_index\_paths hands choose\_bitmap\_and
+    every bitindexpath.
+- **Estimator tuple base:** bitmap\_scan\_cost\_est / bitmap\_and\_cost\_est
+  price the heap side on `selectivity * baserel->tuples`. goopg passed
+  `rel.Rows`, the post\-restriction rows: the leader fetched 0.3 tuples,
+  cost 9.06 against its real 143, and no AND could win.
+- **Per\-row bitmap charge:** cost\_bitmap\_tree\_node's `0.1 *
+  cpu_operator_cost * path->rows` is on the index PATH's rows, which
+  cost\_index sets to `baserel->rows` \(ppi\_rows when parameterised\).
+  goopg charged the fetched tuples, 100x on a wide range. `costBitmapTree`
+  then charged it a second time; both are fixed. The leaf now takes
+  `pathRows`, and the parameterised probe passes its row count.
+- **Recheck for BitmapAnd trees:** a BitmapAnd tree now gets its Recheck
+  Cond as its children's quals, through `bitmapOrRecheck`. The Filter drops
+  what the list implies.
+- **Result:**
+  - The four probes plan as PG's, costs identical
+    \(`cost=64.08..139.37`\).
+  - Regress create\_index 3235→3166.
+  - The TPC corpora are unmoved: sf025 PASS=99 99/99, fire\-set
+    fires=none on sf025 \+ sf1, acceptance 24 MATCH.
+  - join \+5 is a row\-order flap of a Hash Right Join's unmatched rows. It
+    shows on HEAD too, 5 of 6 runs \(ledgered\).
+
 ## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
 
 - **Inequality groups:** `col < ANY (…)` and the like. PG matches the group
@@ -216,16 +259,8 @@ partition\_join and select diffs.
   call.
 - **useful\_predicate:** an arm that proves a partial predicate without any
   index clause.
-- **Combining with single\-index paths:** the OR path is not a candidate in
-  `chooseBitmapAnd`, so `hundred = 42 AND (…)` cannot become
-  BitmapAnd\(index, BitmapOr\). chooseBitmapAnd reads
-  `Children[0].IndexInfo`.
 - **Join OR clauses:** `bitjoinpaths`, i.e. generate\_bitmap\_or\_paths over
   `joinorclauses`.
-- **Double per\-tuple charge:** `costBitmapTree` charges a Bitmap Index Scan
-  the `0.1 * cpu_operator_cost * rows` term a second time
-  \(costBitmapIndexScan already includes it\). This affects chooseBitmapAnd
-  comparisons.
 - **Bitmap node cost line:** Bitmap Index Scan EXPLAIN shows startup 0.29
   rather than PG's 0.00, a total that includes the per\-tuple charge, and
   width 84 rather than 0. BitmapOr width is also 84 rather than 0.
