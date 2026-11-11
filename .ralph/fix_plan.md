@@ -12269,6 +12269,24 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     (PG `_bt_preprocess_keys`), or SAOP + range with a per-element NULL
     stop.
   Movement: none — regress 22 suites unchanged
+  - 2026-11-12 slice 6 LANDED (8b902c2c2): item (3) — duplicate and
+    contradictory NullTests.
+    - Every NullTest on an index column is an index qual (ExtraNullTests on
+      IndexScan / IndexOnlyScan / BitmapIndexScan).
+    - `IS NULL AND IS NOT NULL` is an empty scan (NullTestsContradict, PG's
+      \_bt\_preprocess\_keys).
+    - Probe against PG: 36 statements, values identical; plans identical
+      except where WHERE order matters (item 5).
+  - Residue after slice 6:
+    - Items (4) backward ordered scans, (5) Index Cond WHERE order (the
+      cost-sorted leaf Filter), (6) varchar keys.
+    - SAOP+range; inequality OR groups; plain-path OR→SAOP behind a
+      prefix; sub-ORs; useful\_predicate; join ORs.
+  - Resume: item (5) — carry baserestrictinfo order to the index-clause
+    producers. It now also orders NullTests behind bounds
+    (`a IS NOT NULL AND a < 100 AND a IS NOT NULL`). Or item (4) /
+    item (6).
+  Movement: yes — regress create\_index 3166→3159
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
