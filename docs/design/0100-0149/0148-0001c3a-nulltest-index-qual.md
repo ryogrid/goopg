@@ -1,7 +1,7 @@
 # M0148\-0001c3a — `col IS [NOT] NULL` as a btree index qual
 
-**Parent:** M0148\-0001c3 · **Status:** slice 1 landed 2026\-11\-11 (plain
-index scans, leading column); open for the index\-only / ordered, bitmap and
+**Parent:** M0148\-0001c3 · **Status:** slices 1 and 2 landed 2026\-11\-11
+(plain and index\-only scans, leading column); open for the bitmap and
 behind\-equality producers
 
 ## Divergence
@@ -77,13 +77,46 @@ Table `nt (x int, y int)` with every tenth `x` NULL and an index on `x`:
 - **Gates:** units, `TestPort_RegressSuite`, tpch\-spotcheck, sf025 99/99,
   acceptance 24 MATCH, fire\-set `fires=none` on all three corpora.
 
+## Slice 2: index\-only scans
+
+- **Planner.** `indexOnlyLeafClauses` (pathindexonly.go) composes the
+  leading range with `restrictionLeadingNullTest`, exactly as the plain
+  producer does. `plainRestrictionBindsOnlyPrefix` counts a leading NullTest
+  as a non\-prefix clause, so the index\-only path stands in for the plain
+  one. Its selectivity and pathkeys follow `hasRangeClause`.
+  `createplanindex.go` lowers the clause onto the new
+  `IndexOnlyScan.LeadingNullTest` / `NullTestAfterBounds`.
+- **Promotion.** `tryPromoteIndexOnlyScan` now copies the fields instead of
+  refusing the scan.
+- **Executor.** The index\-only scan has its own copy of the range code,
+  so `indexOnlyScanOp.lookupRangeBounds` gets the same NullTest arm as
+  `indexRangeBounds`.
+- **EXPLAIN.** `formatIndexOnlyCondPrefixed` renders the qual through the
+  helper both scan nodes share, `formatNullTestIndexCond`.
+- **Probe vs PG.** These are now identical to PG:
+  - `select x from nt where x is not null order by x limit 1`: Index Only
+    Scan, `Index Cond: (x IS NOT NULL)`;
+  - `count(*) … where x is null` and `x is not null and x < 5`.
+- **Tests.** `TestNullTestIndexQual` adds the plan text and twin results for
+  those shapes.
+- **Regress.** Neutral. create\_index's duplicated NullTest now prints one
+  `Index Cond` plus one Filter (two more diff lines); join shows its known
+  row\-order variance.
+- **Gates.** units, `TestPort_RegressSuite`, tpch\-spotcheck, sf025 99/99,
+  acceptance 24 MATCH, fire\-set `fires=none` on all three corpora.
+
 ## Not covered (still under M0148\-0001c3a)
 
-- **Index\-only and ordered producers.** `select x … where x is not null
-  order by x limit 1` (PG: Index Only Scan with Index Cond) and regress
-  create\_index `unique1 IS NULL AND unique1 IS NULL`. The min/max rewrite's
-  `IndexOnlyScan.Cond` prints an `Index Cond` but is a residual per index
-  row, not a scan key.
+- **Duplicated or contradictory NullTests on one column**
+  (`unique1 IS NULL AND unique1 IS NULL`, regress create\_index). Only the
+  first becomes an index qual, and the rest stay a Filter; PG puts all of
+  them in Index Cond.
+- **Backward scans.** `order by x desc limit 1` with `IS NOT NULL` is an
+  Index Only Scan Backward in PG. goopg's path\-based index scans carry no
+  scan direction at all (createplanindex.go refuses a non\-forward
+  `IndexScanDir`), so goopg sorts.
+- **min/max rewrite.** Its `IndexOnlyScan.Cond` prints an `Index Cond` but
+  is a residual per index row, not a scan key.
 - **Bitmap producer.** `Index Cond: ((thousand = 42) AND (tenthous IS NULL))`
   under a BitmapOr.
 - **A NullTest behind an equality prefix** (`a = 1 AND b IS NULL`), or beside

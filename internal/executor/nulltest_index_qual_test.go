@@ -7,7 +7,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
-// TestNullTestIndexQual pins M0148-0001c3a slice 1: a `col IS [NOT] NULL`
+// TestNullTestIndexQual pins M0148-0001c3a slices 1 and 2: a `col IS [NOT] NULL`
 // conjunct on an index's leading column is an index qual (PG's
 // match_clause_to_indexcol NullTest arm; btree amsearchnulls), executed as
 // SK_SEARCHNULL / SK_SEARCHNOTNULL bounds at the column's NULL group. Every
@@ -69,6 +69,25 @@ func TestNullTestIndexQual(t *testing.T) {
 	runSQL(t, ctx, "DROP INDEX IF EXISTS ntq_ad")
 	runSQL(t, ctx, "CREATE INDEX ntq_ab ON ntq (a, b)")
 	same("composite is-null", "SELECT * FROM ntq WHERE a IS NULL", "SELECT * FROM ntq WHERE (a + 0) IS NULL")
+
+	// Slice 2: the index-only producer files the same NullTest index qual
+	// (covered columns; an all-visible heap after VACUUM).
+	runSQL(t, ctx, "DROP INDEX IF EXISTS ntq_ab")
+	runSQL(t, ctx, "CREATE INDEX ntq_a ON ntq (a)")
+	runSQL(t, ctx, "VACUUM ANALYZE ntq")
+	for _, tc := range []struct{ q, want string }{
+		{"SELECT a FROM ntq WHERE a IS NOT NULL ORDER BY a LIMIT 1", "Index Cond: (a IS NOT NULL)"},
+		{"SELECT count(*) FROM ntq WHERE a IS NULL", "Index Cond: (a IS NULL)"},
+		{"SELECT a FROM ntq WHERE a IS NOT NULL AND a < 5", "Index Cond: ((a IS NOT NULL) AND (a < 5))"},
+	} {
+		if p := plan(tc.q); !strings.Contains(p, "Index Only Scan") || !strings.Contains(p, tc.want) || strings.Contains(p, "Filter") {
+			t.Errorf("%s: plan\n%s\nwant an Index Only Scan with %q and no Filter", tc.q, p, tc.want)
+		}
+	}
+	same("ios not-null order limit", "SELECT a FROM ntq WHERE a IS NOT NULL ORDER BY a LIMIT 3", "SELECT a FROM ntq WHERE (a + 0) IS NOT NULL ORDER BY a LIMIT 3")
+	same("ios is-null count", "SELECT count(*) FROM ntq WHERE a IS NULL", "SELECT count(*) FROM ntq WHERE (a + 0) IS NULL")
+	same("ios not-null count", "SELECT count(*) FROM ntq WHERE a IS NOT NULL", "SELECT count(*) FROM ntq WHERE (a + 0) IS NOT NULL")
+	same("ios not-null range", "SELECT a FROM ntq WHERE a IS NOT NULL AND a < 5", "SELECT a FROM ntq WHERE (a + 0) IS NOT NULL AND a + 0 < 5")
 
 	// Without NULL-keyed entries IS NULL cannot be an index qual.
 	catalog.SetNullKeyedIndexEntries(false)

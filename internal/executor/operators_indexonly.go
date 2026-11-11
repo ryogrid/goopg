@@ -1233,10 +1233,30 @@ func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error
 		loExcl, hiExcl = hiExcl, loExcl
 	}
 	lo, hi = vLo, vHi
+	// M0148-0001c3a: the NullTest index qual, exactly as indexRangeBounds
+	// applies it for the plain index scan (sibling paths): IS NULL is the
+	// NULL group (empty beside a value bound), IS NOT NULL the NULL stop.
+	if o.plan.LeadingNullTest == optimizer.IndexNullTestIsNull {
+		if o.plan.LowKey != nil || o.plan.HighKey != nil {
+			return nil, nil, false, nil
+		}
+		k, _, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
+		if nerr != nil {
+			return nil, nil, false, nerr
+		}
+		if !stop {
+			return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"index-only scan: IS NULL index qual on index %q, which stores no NULL-keyed entries", o.plan.Index.Name)}
+		}
+		o.rangeLoExcl, o.rangeHiExcl, o.rangeBoundsSet = false, false, true
+		return k, o.ctx.compositeUpperBound(o.plan.Index, k), true, nil
+	}
+	notNullOnly := o.plan.LeadingNullTest == optimizer.IndexNullTestIsNotNull && vLo == nil && vHi == nil
 	// Same open-end NULL stop as the index scan (nullStopRangeBound), and
-	// only for a one-sided range: a bound-less index-only scan is a full scan
-	// and keeps every entry.
-	if (vLo == nil) != (vHi == nil) {
+	// only for a one-sided range — or an IS NOT NULL index qual: a
+	// bound-less index-only scan is otherwise a full scan and keeps every
+	// entry.
+	if (vLo == nil) != (vHi == nil) || notNullOnly {
 		k, atHigh, stop, nerr := o.ctx.nullStopRangeBound(o.plan.Index, nil, col, 0)
 		if nerr != nil {
 			return nil, nil, false, nerr

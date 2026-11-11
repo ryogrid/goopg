@@ -1231,6 +1231,11 @@ type IndexOnlyScan struct {
 	// first SkipPrefix key columns are enumerated by the executor.
 	SkipPrefix int
 	Covered []catalog.Column
+	// LeadingNullTest / NullTestAfterBounds mirror IndexScan's fields of
+	// the same name (M0148-0001c3a): a `col IS [NOT] NULL` index qual on the
+	// leading key column, executed as SK_SEARCHNULL / SK_SEARCHNOTNULL bounds.
+	LeadingNullTest     IndexNullTest
+	NullTestAfterBounds bool
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
 	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general

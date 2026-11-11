@@ -3870,33 +3870,7 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// beside its range bounds, in restriction-list order —
 	// `Index Cond: ((x IS NOT NULL) AND (x < 5))`.
 	if p.LeadingNullTest != optimizer.IndexNullTestNone && len(p.Index.Columns) > 0 {
-		col := prefix + p.Index.Columns[0]
-		nt := col + " IS NULL"
-		if p.LeadingNullTest == optimizer.IndexNullTestIsNotNull {
-			nt = col + " IS NOT NULL"
-		}
-		var parts []string
-		if !p.NullTestAfterBounds {
-			parts = append(parts, nt)
-		}
-		if p.LowKey != nil {
-			op := ">="
-			if p.LowOp == parser.OpGt {
-				op = ">"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.LowKey, reg))
-		}
-		if p.HighKey != nil {
-			op := "<="
-			if p.HighOp == parser.OpLt {
-				op = "<"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKey(p.HighKey, reg))
-		}
-		if p.NullTestAfterBounds {
-			parts = append(parts, nt)
-		}
-		return indexCondAndText(parts)
+		return formatNullTestIndexCond(p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 }
@@ -3924,7 +3898,46 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		}
 		return indexCondAndText(parts)
 	}
+	if p.LeadingNullTest != optimizer.IndexNullTestNone {
+		return formatNullTestIndexCond(p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+	}
 	return formatIndexCondPartsPrefixed(p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+}
+
+// formatNullTestIndexCond renders a leading-column NullTest index qual
+// with its range bounds (IndexScan and IndexOnlyScan share it, M0148-0001c3a).
+func formatNullTestIndexCond(index *catalog.Index, nullTest optimizer.IndexNullTest, afterBounds bool,
+	lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
+	if index == nil || len(index.Columns) == 0 {
+		return ""
+	}
+	col := prefix + index.Columns[0]
+	nt := col + " IS NULL"
+	if nullTest == optimizer.IndexNullTestIsNotNull {
+		nt = col + " IS NOT NULL"
+	}
+	var parts []string
+	if !afterBounds {
+		parts = append(parts, nt)
+	}
+	if lowKey != nil {
+		op := ">="
+		if lowOp == parser.OpGt {
+			op = ">"
+		}
+		parts = append(parts, col+" "+op+" "+formatIndexCondKey(lowKey, reg))
+	}
+	if highKey != nil {
+		op := "<="
+		if highOp == parser.OpLt {
+			op = "<"
+		}
+		parts = append(parts, col+" "+op+" "+formatIndexCondKey(highKey, reg))
+	}
+	if afterBounds {
+		parts = append(parts, nt)
+	}
+	return indexCondAndText(parts)
 }
 
 // indexCondColumnPrefix is the `<refname>.` an index qual's column side

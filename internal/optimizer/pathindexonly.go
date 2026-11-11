@@ -30,7 +30,6 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
-	"github.com/goopg/goopg/internal/parser"
 )
 
 // addIndexOnlyPaths generates, for every base relation, the index-only paths
@@ -228,6 +227,11 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		// (addOneRestrictionIndexPath's order) — the same clauses the
 		// index-only scan carries as LowKey/HighKey.
 		rng := restrictionLeadingRange(cat, tbl, idx, conjuncts)
+		// M0148-0001c3a: with the leading column's NullTest index qual, as
+		// the plain producer files it.
+		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil && len(clauses) == 0 {
+			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		}
 		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
 			return nil, false
 		}
@@ -269,7 +273,8 @@ func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, id
 	if n > 0 {
 		return n >= len(idx.Columns) || len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0
 	}
-	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 {
+	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 ||
+		restrictionLeadingNullTest(idx, conjuncts) != nil {
 		return false
 	}
 	skipClauses, _ := restrictionSkipRun(cat, tbl, idx, conjuncts)
@@ -332,9 +337,9 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
 	switch {
-	case len(clauses) > 0 && clauses[0].op != parser.OpUnknown:
-		// M0146-0061: leading-column bounds, priced as the plain range
-		// path prices them.
+	case hasRangeClause(clauses):
+		// M0146-0061: leading-column bounds (and M0148-0001c3a's NullTest),
+		// priced as the plain range path prices them.
 		sel = rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses)
 	case len(clauses) > 0:
 		sel, unique = restrictionIndexSelectivity(tbl, idx, clauses, relTuples)
@@ -408,7 +413,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
 	// it too — PG's build_index_paths computes one useful_pathkeys for the
 	// index whether the path is index-only or not.
-	if len(clauses) > 0 && clauses[0].op != parser.OpUnknown && len(colExprs) > 0 && indexIsOrderable(idx) {
+	if hasRangeClause(clauses) && len(colExprs) > 0 && indexIsOrderable(idx) {
 		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
 	}
 	// M0146-0188: the full-index shape carries the index's useful ordering as

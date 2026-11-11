@@ -350,8 +350,21 @@ func createIndexScanPlan(p *Path) Node {
 		// composite index's bounds carry no `local` and stay the Filter.
 		var ioLow, ioHigh Expr
 		var ioLowOp, ioHighOp parser.OpCode
-		ioRange := len(p.IndexClauses) > 0 && p.IndexClauses[0].op != parser.OpUnknown
+		ioRange := hasRangeClause(p.IndexClauses)
+		var ioNullTest IndexNullTest
+		ioNullTestAfter := false
 		for i, c := range p.IndexClauses {
+			if ioRange && c.nullTest != IndexNullTestNone {
+				// M0148-0001c3a: the leading column's NullTest index qual.
+				if c.indexCol != 0 || ioNullTest != IndexNullTestNone || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
+				}
+				ioNullTest, ioNullTestAfter = c.nullTest, ioLow != nil || ioHigh != nil
+				if c.local != nil {
+					ioDrop[c.local] = true
+				}
+				continue
+			}
 			if ioRange {
 				if c.indexCol != 0 || c.key == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s: clause %d is not a leading-column bound",
@@ -434,6 +447,7 @@ func createIndexScanPlan(p *Path) Node {
 		switch {
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
+			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 		case len(ioKeys) == 0:
 		case p.IndexSkipPrefix > 0:
 			ios.SkipPrefix = p.IndexSkipPrefix
