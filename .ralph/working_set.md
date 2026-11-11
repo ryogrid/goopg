@@ -1,25 +1,25 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #13: census IDENTICAL; nightly AI filed+fixed; c3a1 item 1 bitmap slice landed)
+# Working Set — loop end 2026-11-12 (run-2 loop #14: census IDENTICAL; c3a1 literal-key Recheck Cond landed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE after 96d734112 → routing-20261111h (bba5b4d01, label s9bk, BASELINE_REV=2cc8f8598) IDENTICAL ×3. 49bbd0613 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = edf954c49, the head routing-20261111h consumed.
-- Nightly 20261112-000028: status fail, 1 item, AI-20261112-000028-001 TestPort_RegressSuite.
-  - Cause: a harness port collision (pprof endpoint and listen port both 45851, bind:0-then-close twice).
-  - Filed under M-NIGHTLY [x] and fixed in b1928e91c (reserveLoopbackPortExcept after newCluster).
-- Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS. Item (1) is partly landed in 49bbd0613: the bitmap producer, leading column or behind the equality Keys.
-- Files (49bbd0613): optimizer/plan.go (BitmapIndexScan.LeadingNullTest/NullTestAfterBounds), pathbitmap.go (buildOneBitmapPath NullTest arms), createplanbitmap.go (lowering split), executor/operators_bitmap.go (lookupBounds via indexRangeBounds, Keys as prefix), operators_explain.go (formatBitmapNullTestIndexCond), test nulltest_index_qual_test.go (bitmap case executes and compares counts); design doc + README.
-- Key symbols: buildOneBitmapPath, createBitmapIndexScanPlan, bitmapIndexScanOp.lookupBounds, formatBitmapNullTestIndexCond, restrictionNullTestOnColumn.
+- S9: DUE after 49bbd0613 → routing-20261112a (label s9bl, BASELINE_REV=edf954c49) IDENTICAL ×3. a78d7dd43 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 8ac73493e, the head routing-20261112a consumed.
+- Nightly 20261112-000028: AI-20261112-000028-001 already filed and fixed (b1928e91c). action-items unchanged since.
+- Task: M0148-0001c3a1 (NullTest index-qual residue) — IN PROGRESS.
+  - Landed: bitmap NullTest (49bbd0613); exact literal bitmap keys join the Recheck Cond (a78d7dd43).
+- Files (a78d7dd43): optimizer/pathbitmap.go (matchBitmapIndexQuals takes cat, sets local after restrictionKeyUsable), pathindexrestrict_test.go (caller); design doc section + README.
+- Key symbols: matchBitmapIndexQuals, restrictionKeyUsable, createBitmapHeapScanPlan (recheck list from `local`).
 - Findings:
-  - PG folds the literal `a = 3` into the Recheck Cond; goopg keeps it as a Filter (M0146-0012 narrowing in matchBitmapIndexQuals). Ledger.
-  - BitmapOr (generate_bitmap_or_paths) doesn't exist in goopg.
-- Next step: S9 due-check, then continue c3a1. Choose the smallest PG-visible item:
-  - (2) duplicate NullTests: return all NullTests per column; IndexScan/IOS/BitmapIndexScan carry a list; contradiction = empty scan.
-  - Or the literal-key Recheck Cond (matchBitmapIndexQuals: set `local` after restrictionKeyUsable), which needs a fire-set check since it changes every literal-key bitmap's rendering.
-  - BitmapOr is the largest; consider filing it as its own child.
+  - Fire-set fires=none, so the corpora have no literal-key bitmap whose text changed.
+  - Regress: Recheck Cond lines now match PG's in create_index/subselect hunks.
+  - Remaining gaps there: BitmapOr shapes (absent in goopg), and literal type labels in Recheck Cond (`'TVAAAA'::name`).
+- Next step: S9 due-check. Then continue c3a1.
+  - Smallest PG-visible item next: the Recheck Cond literal type label. Find how Filter / Index Cond render typed StringConst (e.g. `::name`) and apply it in the BitmapHeapScan Recheck Cond arm (operators_explain.go `case *optimizer.BitmapHeapScan`).
+  - Then a bitmap range behind an equality prefix.
+  - BitmapOr (generate_bitmap_or_paths) is large; file it as its own child c3a2 when c3a1 closes.
 - Top-residual: M0148 residues. Open children: c3a1, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261111h exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); tonight's AI-20261112-000028-001 is filed and fixed. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run:
-  - 49bbd0613: PASS units, TestPort_RegressSuite + RegressWedgeProbe, tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set c3a1fs fires=none ×3. Regress create_index/btree_index/select hunk-identical.
-  - The first spotcheck/arm stamps were FAIL only because the testport fix was unstaged; they PASSed after b1928e91c.
-- In-flight: none. Scratch PG 5545 and goopg 5533 stopped.
+  - Items 0-9: M0146-0014(channel; census routing-20261112a exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
+- Gates run (staged code_tree for a78d7dd43):
+  - PASS: units, TestPort_RegressSuite + PgDump (392 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set lkfs fires=none ×3.
+  - Regress 16 suites vs HEAD worktree: subselect −25, create_index +2 (BitmapOr neighbours), rest unchanged.
+- In-flight: none. Scratch PG 5545 and goopg 5533 stopped; tmp/wt-head removed.

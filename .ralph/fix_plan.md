@@ -12110,6 +12110,14 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
       range behind an equality prefix under a bitmap, and a literal
       equality key kept as a Filter instead of joining the Recheck Cond
       (M0146-0012 narrowing).
+  - Literal-key Recheck Cond LANDED (2026-11-12, a78d7dd43): an exact
+    literal bitmap key (restrictionKeyUsable) joins the Recheck Cond. `a = 3
+    AND b IS [NOT] NULL` = PG's plan exactly. Regress subselect 2477→2452.
+    Gates units, RegressSuite+PgDump, spotcheck, sf025 99/99, acceptance 24
+    MATCH, fire-set fires=none ×3.
+    - Still open in c3a1: BitmapOr over OR clauses, a bitmap range behind
+      an equality prefix, duplicate NullTests, backward scans, WHERE order,
+      Recheck Cond literal type labels (`'TVAAAA'::name`).
     - Then: the bitmap producer (BitmapOr arm `(thousand = 42) AND
       (tenthous IS NULL)`), a NullTest behind an equality prefix.
     - Found: Index Cond order can't follow WHERE when the comparison comes
