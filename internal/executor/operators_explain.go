@@ -3107,6 +3107,10 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 			}
 			if len(p.SAOPKeys) > 0 {
 				cond = formatBitmapSAOPIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
+			} else if np := len(p.Keys); np > 0 && np < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
+				// M0148-0001c3a2: bounds behind the equality Keys.
+				cond = formatPrefixRangeIndexCond(p.Table, p.Index, p.Keys, p.LeadingNullTest, p.NullTestAfterBounds,
+					p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			}
 			if cond != "" {
 				*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
@@ -3840,40 +3844,8 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's
 	// multi-clause style.
 	if np := len(p.RangePrefix); np > 0 && np < len(p.Index.Columns) {
-		parts := make([]string, 0, np+2)
-		for i, k := range p.RangePrefix {
-			parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, i)))
-		}
-		col := prefix + p.Index.Columns[np]
-		// M0148-0001c3a slice 3: the NullTest on the column after the prefix.
-		nt := ""
-		if p.LeadingNullTest != optimizer.IndexNullTestNone {
-			nt = col + " IS NULL"
-			if p.LeadingNullTest == optimizer.IndexNullTestIsNotNull {
-				nt = col + " IS NOT NULL"
-			}
-		}
-		if nt != "" && !p.NullTestAfterBounds {
-			parts = append(parts, nt)
-		}
-		if p.LowKey != nil {
-			op := ">="
-			if p.LowOp == parser.OpGt {
-				op = ">"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, np)))
-		}
-		if p.HighKey != nil {
-			op := "<="
-			if p.HighOp == parser.OpLt {
-				op = "<"
-			}
-			parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, np)))
-		}
-		if nt != "" && p.NullTestAfterBounds {
-			parts = append(parts, nt)
-		}
-		return indexCondAndText(parts)
+		return formatPrefixRangeIndexCond(p.Table, p.Index, p.RangePrefix, p.LeadingNullTest, p.NullTestAfterBounds,
+			p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	// M0146-0005v: a skip probe binds Columns[SkipPrefix+i] — PG prints
 	// only the bound quals (`Index Cond: (inv_item_sk = ...)`); the
@@ -3923,6 +3895,50 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+}
+
+// formatPrefixRangeIndexCond renders an equality prefix followed by bounds
+// (and a NullTest) on the next column — PG's `Index Cond: ((a = 7) AND
+// (b > 90))`. IndexScan's RangePrefix probe and BitmapIndexScan's Keys plus
+// bounds (M0148-0001c3a2) share it, so the two print one text.
+func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefixKeys []optimizer.Expr,
+	nullTest optimizer.IndexNullTest, nullTestAfterBounds bool, lowKey, highKey optimizer.Expr,
+	lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
+	np := len(prefixKeys)
+	parts := make([]string, 0, np+2)
+	for i, k := range prefixKeys {
+		parts = append(parts, prefix+index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(tbl, index, i)))
+	}
+	col := prefix + index.Columns[np]
+	// M0148-0001c3a slice 3: the NullTest on the column after the prefix.
+	nt := ""
+	if nullTest != optimizer.IndexNullTestNone {
+		nt = col + " IS NULL"
+		if nullTest == optimizer.IndexNullTestIsNotNull {
+			nt = col + " IS NOT NULL"
+		}
+	}
+	if nt != "" && !nullTestAfterBounds {
+		parts = append(parts, nt)
+	}
+	if lowKey != nil {
+		op := ">="
+		if lowOp == parser.OpGt {
+			op = ">"
+		}
+		parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(lowKey, reg, indexKeyColumnType(tbl, index, np)))
+	}
+	if highKey != nil {
+		op := "<="
+		if highOp == parser.OpLt {
+			op = "<"
+		}
+		parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(highKey, reg, indexKeyColumnType(tbl, index, np)))
+	}
+	if nt != "" && nullTestAfterBounds {
+		parts = append(parts, nt)
+	}
+	return indexCondAndText(parts)
 }
 
 // formatBitmapSAOPIndexCond renders a BitmapIndexScan's ScalarArrayOp index

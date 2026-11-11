@@ -329,8 +329,9 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey boo
 		// M0146-0061: a leading-column range probe, bounded exactly as the
 		// plain index scan bounds it (DESC swap, strictness, the NULL-keyed
 		// entries an open end must not run into).
+		// M0148-0001c3a2: behind the equality Keys when there are any.
 		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
-			table: o.plan.Table, index: o.plan.Index,
+			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys,
 			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
 			pos: o.plan.Pos(),
 		}, o.outerSlot)

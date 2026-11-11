@@ -231,13 +231,25 @@ func (s *searchCtx) buildBitmapIndexChild(
 			saop = true
 		}
 	}
-	// M0148-0001c3a1: a NullTest on the column after the equality prefix is
-	// an index clause too (match_clause_to_indexcol's NullTest arm). Exact,
-	// so its conjunct is the heap scan's recheck, not a Filter.
+	// M0148-0001c3a1 / c3a2: on the column after the equality prefix, its
+	// bounds and its NullTest are index clauses too (build_index_paths binds
+	// every matching clause of each column). Exact — the probe bounds them
+	// through indexRangeBounds (restrictionRangeBehindPrefix) — so their
+	// conjuncts are the heap scan's recheck, not a Filter. Constant bounds
+	// only, as bitmapLeadingRange takes them.
 	if n := len(indexClauses); !saop && n > 0 && n < len(idx.Columns) {
+		var rng []indexPathClause
+		for _, c := range restrictionRangeBehindPrefix(s.cat, tbl, idx, n, conjuncts) {
+			if isConstExpr(c.key) {
+				rng = append(rng, c)
+			}
+		}
 		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
-			indexClauses = append(indexClauses, *nt)
-			qualSelectivity = clampSelectivity(qualSelectivity * clauseSelectivity(nt.local, leaf))
+			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		}
+		if len(rng) > 0 {
+			indexClauses = append(indexClauses, rng...)
+			qualSelectivity = clampSelectivity(qualSelectivity * rangeIndexSelectivity(leaf, conjuncts, rng))
 		}
 	}
 	// M0146-0061: with no equality on the leading column, a range bound on it

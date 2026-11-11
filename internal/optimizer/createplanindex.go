@@ -680,9 +680,6 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		if c.indexCol != len(prefix) || c.key == nil {
 			panic(fmt.Sprintf("createPlan: range clause %d of %s does not bound index column %d", i, p.IndexInfo.Name, len(prefix)))
 		}
-		if len(prefix) > 0 && c.local != nil {
-			panic(fmt.Sprintf("createPlan: range clause %d of %s behind an equality prefix must stay a Filter recheck", i, p.IndexInfo.Name))
-		}
 		switch c.op {
 		case parser.OpGt, parser.OpGe:
 			if is.LowKey != nil {

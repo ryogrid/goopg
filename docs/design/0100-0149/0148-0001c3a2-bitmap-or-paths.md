@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); the other c3a2 items stay open
 
 ## Problem
 
@@ -239,6 +239,49 @@ goopg never planned the BitmapAnd PG builds for `hundred = 42 AND unique2 <
     fires=none on sf025 \+ sf1, acceptance 24 MATCH.
   - join \+5 is a row\-order flap of a Hash Right Join's unmatched rows. It
     shows on HEAD too, 5 of 6 runs \(ledgered\).
+
+## Slice 5 — range bounds behind an equality prefix \(c3a2 item 2\)
+
+- **The rule it replaces:** behind an equality prefix, the plain Index Scan's
+  bounds (`IndexScan.RangePrefix` \+ LowKey/HighKey) recorded no `local`, so
+  the bound stayed as a Filter beside the Index Cond. The reason given: "an
+  open bound runs to the prefix's padded upper bound, past NULLs in the
+  bounded column". That rule \(2026\-09\-23\) predates the prefix\-aware NULL
+  stop \(M0148\-0001c3a, 2026\-11\-11\).
+- **Why the bounds are now exact:** the probe bounds through
+  `indexRangeBounds`, which swaps a DESC column and, with one open end,
+  stops at the column's NULL group within the prefix
+  \(`nullStopRangeBound`\). A cluster without NULL\-keyed entries stores
+  none to run into.
+  - `restrictionRangeBehindPrefix` records `local`, and the guard in
+    `createRangeIndexScanPlan` is gone.
+  - PG prints `Index Cond: ((a = 3) AND (b > 900))` and no Filter, and so
+    does goopg.
+  - The leading\-SAOP \+ range form keeps the old rule. Its per\-element
+    bounds \(indexScanOp's SAOP descent\) have neither the NULL stop nor
+    the DESC swap.
+- **Bitmap:**
+  - `buildBitmapIndexChild` adds the same constant bounds, and a NullTest,
+    on the column after its equality prefix.
+  - `createBitmapIndexScanPlan` now classifies its clause list once: an
+    equality prefix, then a SAOP, or bounds and/or a NullTest on the next
+    column. That shape lowers onto `Keys` \+ `LowKey`/`HighKey`.
+  - The executor passes `Keys` as the `indexRangeBounds` prefix.
+  - `formatPrefixRangeIndexCond` is now shared by IndexScan and Bitmap
+    Index Scan.
+- **Verification:**
+  - Probe against PG 18.3, 25 statements over a table whose bounded column
+    is 1/7 NULL, on (a, b), (a, b DESC) and (a, b NULLS FIRST), index and
+    bitmap paths: every plan and value identical.
+  - `TestRangeBehindEqualityPrefix` compares every answer to a
+    non\-indexable twin, with and without NULL\-keyed entries, plus PG's
+    plan text.
+  - The two producer tests that pinned the old recheck rule now pin the
+    exact form, bitmap\-off; the nullable\-unbound decline is checked on the
+    bitmap path too.
+  - Regress over 22 suites: unchanged.
+  - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
+    acceptance 24 MATCH.
 
 ## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
 

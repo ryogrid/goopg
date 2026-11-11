@@ -194,11 +194,29 @@ func restrictionLeadingRange(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 }
 
 // restrictionRangeOnColumn is restrictionLeadingRange for index column `pos`:
-// pos 0 is the leading-column range; pos > 0 follows an equality prefix
-// (slice 2b). Behind a prefix the bounds NEVER record `local`: the conjunct
-// stays in the Filter as a recheck, because an open-ended bound runs to the
-// prefix's padded upper bound, past entries whose bounded column is NULL.
+// pos 0 is the leading-column range; pos > 0 follows a leading ScalarArrayOp,
+// whose own per-element bounds (indexScanOp's SAOP descent) neither stop at
+// the column's NULL group nor swap for a DESC column, so those bounds record
+// no `local` and the conjunct stays in the Filter as a recheck. Bounds behind
+// an EQUALITY prefix are restrictionRangeBehindPrefix's.
 func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	return restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, pos == 0)
+}
+
+// restrictionRangeBehindPrefix is restrictionRangeOnColumn for the column
+// after an equality prefix (IndexScan.RangePrefix, BitmapIndexScan Keys plus
+// bounds). Those probes bound through indexRangeBounds, which swaps a DESC
+// column and — with one open end — stops at the column's NULL group within
+// the prefix (nullStopRangeBound, M0148-0001c3a), and a cluster without
+// NULL-keyed entries stores none to run into. So the bounds are exact and
+// record `local`: PG prints `Index Cond: ((a = 3) AND (b < 200))` and no
+// Filter (M0148-0001c3a2). This rule used to keep them a Filter recheck,
+// written before the prefix-aware NULL stop existed.
+func restrictionRangeBehindPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	return restrictionRangeOnColumnLocal(cat, tbl, idx, pos, conjuncts, true)
+}
+
+func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr, withLocal bool) []indexPathClause {
 	if pos < 0 || pos >= len(idx.Columns) {
 		return nil
 	}
@@ -229,7 +247,7 @@ func restrictionRangeOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *cata
 			op = swapInequalityOp(op)
 		}
 		c := &indexPathClause{indexCol: pos, key: val, op: op}
-		if pos == 0 {
+		if withLocal {
 			c.local = conj
 		}
 		switch op {
@@ -565,7 +583,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	// behind `a = 1` on `(a, b)`). The eq clauses become IndexScan.RangePrefix.
 	prefixRange := false
 	if n := len(clauses); n > 0 && n < len(idx.Columns) {
-		rng := restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)
+		rng := restrictionRangeBehindPrefix(cat, tbl, idx, n, conjuncts)
 		// M0148-0001c3a slice 3: a NullTest on the column after the prefix
 		// (`a = 1 AND b IS NULL`), bounded at the prefix's NULL group.
 		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {

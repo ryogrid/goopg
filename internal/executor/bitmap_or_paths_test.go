@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -373,4 +376,97 @@ func TestOrEqualitiesAsIndexSAOP(t *testing.T) {
 	if want := []string{"1,1,NULL", "2,NULL,0"}; strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("select-list AND/OR with NULL: got %v, want %v", got, want)
 	}
+}
+
+// TestRangeBehindEqualityPrefix pins M0148-0001c3a2 item (2): bounds on the
+// column after an equality prefix are exact index quals, for the plain Index
+// Scan (RangePrefix) and now the bitmap producer too — PG's `Index Cond:
+// ((a = 3) AND (b > 900))` with no Filter. They probe through
+// indexRangeBounds, which stops an open end at the column's NULL group, so
+// rows with b NULL never leak in; every answer must equal a non-indexable
+// twin's on ASC, DESC and NULLS FIRST indexes, with and without NULL-keyed
+// index entries.
+func TestRangeBehindEqualityPrefix(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		catalog.SetNullKeyedIndexEntries(capable)
+		ctx, cleanup := newVMFixture(t)
+		runSQL(t, ctx, "CREATE TABLE pr (a int, b int, c int)")
+		runSQL(t, ctx, "INSERT INTO pr SELECT g % 50, CASE WHEN g % 7 = 0 THEN NULL ELSE g % 1000 END, g FROM generate_series(1, 20000) g")
+		for _, ddl := range []string{"CREATE INDEX pr_i ON pr (a, b)", "CREATE INDEX pr_i ON pr (a, b DESC)", "CREATE INDEX pr_i ON pr (a, b NULLS FIRST)"} {
+			runSQL(t, ctx, "DROP INDEX IF EXISTS pr_i")
+			runSQL(t, ctx, ddl)
+			runSQL(t, ctx, "ANALYZE pr")
+			for _, c := range []struct{ indexed, twin string }{
+				{"SELECT c FROM pr WHERE a = 3 AND b > 900", "SELECT c FROM pr WHERE a + 0 = 3 AND b + 0 > 900"},
+				{"SELECT c FROM pr WHERE a = 3 AND b < 200", "SELECT c FROM pr WHERE a + 0 = 3 AND b + 0 < 200"},
+				{"SELECT c FROM pr WHERE a = 3 AND b >= 500 AND b < 520", "SELECT c FROM pr WHERE a + 0 = 3 AND b + 0 >= 500 AND b + 0 < 520"},
+				{"SELECT c FROM pr WHERE a = 3 AND b > 900 AND b IS NOT NULL", "SELECT c FROM pr WHERE a + 0 = 3 AND b + 0 > 900"},
+			} {
+				want := sortedRowStrings(t, ctx, c.twin)
+				if len(want) == 0 {
+					t.Fatalf("%s: twin returned no rows", c.twin)
+				}
+				for _, mode := range []string{"index", "bitmap"} {
+					stmts, err := parser.Parse(c.indexed)
+					if err != nil {
+						t.Fatal(err)
+					}
+					ps := optimizer.DefaultPlannerSettings()
+					ps.EnableSeqScan = false
+					if mode == "index" {
+						ps.EnableBitmapScan = false
+					} else {
+						ps.EnableIndexScan = false
+					}
+					advanceStmtCounter(ctx)
+					plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got []string
+					op, err := Build(plan)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := op.Open(ctx); err != nil {
+						t.Fatal(err)
+					}
+					for {
+						slot, err := op.Next()
+						if err == EOF {
+							break
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						got = append(got, fmt.Sprint(slot.Row()[0].Int))
+						slot.Release()
+					}
+					_ = op.Close()
+					sort.Strings(got)
+					wantInts := make([]string, len(want))
+					copy(wantInts, want)
+					sort.Strings(wantInts)
+					if strings.Join(got, ",") != strings.Join(wantInts, ",") {
+						t.Errorf("capable=%v %s %s [%s]: %d rows, want %d", capable, ddl, c.indexed, mode, len(got), len(wantInts))
+					}
+				}
+			}
+		}
+		// PG's plan text: both bounds in the Index Cond, no Filter.
+		runSQL(t, ctx, "DROP INDEX IF EXISTS pr_i")
+		runSQL(t, ctx, "CREATE INDEX pr_i ON pr (a, b)")
+		runSQL(t, ctx, "ANALYZE pr")
+		want := []string{
+			"Bitmap Heap Scan on pr",
+			"  Recheck Cond: ((a = 3) AND (b < 200))",
+			"  ->  Bitmap Index Scan on pr_i",
+			"        Index Cond: ((a = 3) AND (b < 200))",
+		}
+		if got := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT * FROM pr WHERE a = 3 AND b < 200"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Errorf("capable=%v plan:\n%s\nwant (PG 18.3):\n%s", capable, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+		cleanup()
+	}
+	catalog.SetNullKeyedIndexEntries(false)
 }

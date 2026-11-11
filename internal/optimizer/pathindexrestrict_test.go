@@ -337,9 +337,12 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 
 // Slice 2b: behind an equality prefix, range bounds on the NEXT index column
 // become IndexScan.RangePrefix + LowKey/HighKey (PG's
-// `Index Cond: ((i_item_sk = 2) AND (i_flag > 5))`). The prefix equality is
-// dropped from the Filter; the bound stays there as a recheck (an open bound
-// runs to the prefix's padded upper bound, past NULLs in the bounded column).
+// `Index Cond: ((i_item_sk = 2) AND (i_flag > 5))`). Both the prefix equality
+// and the bound leave the Filter: the probe bounds through indexRangeBounds,
+// whose open end stops at the column's NULL group (M0148-0001c3a2 — the
+// bound used to stay as a Filter recheck, from before that NULL stop).
+// Planned with bitmap scans off: this pins the index producer, and the
+// bitmap producer takes the same bounds since M0148-0001c3a2.
 func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 
 	c := catalog.NewInMemory()
@@ -356,7 +359,9 @@ func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 	}
 	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
 
-	node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+	ps := DefaultPlannerSettings()
+	ps.EnableBitmapScan = false
+	node, err := PlanWithSettings(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c, ps)
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -369,12 +374,8 @@ func TestRestrictionPrefixRangeIndexScanOnJointreePipeline(t *testing.T) {
 		t.Fatalf("want RangePrefix=[7] + LowKey > 90, got prefix=%d lo=%v/%v hi=%v key=%v keys=%d",
 			len(scan.RangePrefix), scan.LowKey, scan.LowOp, scan.HighKey, scan.Key, len(scan.Keys))
 	}
-	f := findFilterOver(node, scan)
-	if f == nil {
-		t.Fatal("the range bound must stay as a Filter recheck")
-	}
-	if bin, ok := f.Predicate.(*BinaryOp); !ok || bin.Op != parser.OpGt {
-		t.Fatalf("want the Filter to be exactly b > 90 (the prefix equality dropped), got %T", f.Predicate)
+	if f := findFilterOver(node, scan); f != nil {
+		t.Fatalf("both quals are exact index quals; want no Filter, got %T", f.Predicate)
 	}
 }
 
@@ -429,7 +430,16 @@ func TestRestrictionProbeDeclinesUnboundNullableKeyColumn(t *testing.T) {
 
 	for _, cNotNull := range []bool{false, true} {
 		c := prTestCatalog(t, []string{"a", "b", "c"}, cNotNull)
-		node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c)
+		// The bitmap producer applies the same NULL-key rule
+		// (indexUnboundKeysNotNull); with c nullable it must decline too.
+		if node, err := Plan(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c); err != nil {
+			t.Fatalf("Plan: %v", err)
+		} else if !cNotNull && planHasBitmapIndexScan(node) {
+			t.Fatal("c nullable: a bitmap probe binding (a, b) would miss (7, 95, NULL)")
+		}
+		ps := DefaultPlannerSettings()
+		ps.EnableBitmapScan = false
+		node, err := PlanWithSettings(parseOne(t, "SELECT c FROM pr WHERE a = 7 AND b > 90"), c, ps)
 		if err != nil {
 			t.Fatalf("Plan: %v", err)
 		}
@@ -461,4 +471,30 @@ func prTestCatalog(t *testing.T, idxCols []string, cNotNull bool) *catalog.InMem
 	}
 	tbl.Stats = &catalog.TableStats{RowCount: 100000, Pages: 10000, Analyzed: true}
 	return c
+}
+
+// planHasBitmapIndexScan reports whether a Bitmap Index Scan sits under n
+// (through the wrappers findFilterOver walks, and a bitmap heap scan).
+func planHasBitmapIndexScan(n Node) bool {
+	for n != nil {
+		switch v := n.(type) {
+		case *BitmapIndexScan:
+			return true
+		case *BitmapHeapScan:
+			n = v.Outer
+		case *BitmapAnd, *BitmapOr:
+			return true
+		case *Filter:
+			n = v.Child
+		case *Project:
+			n = v.Child
+		case *Sort:
+			n = v.Child
+		case *Limit:
+			n = v.Child
+		default:
+			return false
+		}
+	}
+	return false
 }
