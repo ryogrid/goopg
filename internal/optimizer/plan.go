@@ -576,6 +576,21 @@ type ExtraIndexNullTest struct {
 	AfterBounds bool
 }
 
+// IndexCondItem is one index clause on a scan's range column — its lower
+// bound, its upper bound, or the next of its NullTests (LeadingNullTest, then
+// ExtraNullTests). IndexCondOrder lists them in restriction-list order, the
+// order PG keeps one index column's clauses in (match_clauses_to_index walks
+// baserestrictinfo) and prints in Index Cond: `((a < 50) AND (a > 10))`
+// (M0148-0001c3a2). Empty means the legacy order: NullTests not after the
+// bounds, the lower bound, the upper bound, the rest.
+type IndexCondItem uint8
+
+const (
+	IndexCondLow IndexCondItem = iota + 1
+	IndexCondHigh
+	IndexCondNullTest
+)
+
 // NullTestsContradict reports whether a scan's NullTest index quals ask for
 // both a NULL and a non-NULL key on their column — the qual
 // _bt_preprocess_keys proves unsatisfiable, so the probe matches nothing.
@@ -1009,6 +1024,9 @@ type IndexScan struct {
 	// ExtraNullTests are the column's further NullTest index quals
 	// (ExtraIndexNullTest, M0148-0001c3a2).
 	ExtraNullTests []ExtraIndexNullTest
+	// IndexCondOrder is the range column's clauses in restriction-list
+	// order (IndexCondItem).
+	IndexCondOrder []IndexCondItem
 	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
 	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
 	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
@@ -1271,6 +1289,7 @@ type IndexOnlyScan struct {
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
 	ExtraNullTests      []ExtraIndexNullTest
+	IndexCondOrder      []IndexCondItem
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
 	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general
@@ -3748,6 +3767,7 @@ type BitmapIndexScan struct {
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
 	ExtraNullTests      []ExtraIndexNullTest
+	IndexCondOrder      []IndexCondItem
 	// SAOPKeys is a ScalarArrayOp equality index qual (`col = ANY (…)`,
 	// match_saopclause_to_indexcol / match_orclause_to_indexcol) on
 	// Columns[len(Keys)], behind the equality Keys: one probe per element,

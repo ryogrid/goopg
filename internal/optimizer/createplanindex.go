@@ -354,8 +354,10 @@ func createIndexScanPlan(p *Path) Node {
 		var ioNullTest IndexNullTest
 		ioNullTestAfter := false
 		var ioExtraNullTests []ExtraIndexNullTest
+		var ioCondOrder []IndexCondItem
 		for i, c := range p.IndexClauses {
 			if ioRange && c.nullTest != IndexNullTestNone {
+				ioCondOrder = append(ioCondOrder, IndexCondNullTest)
 				// M0148-0001c3a: the leading column's NullTest index qual.
 				if c.indexCol != 0 || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
@@ -382,11 +384,13 @@ func createIndexScanPlan(p *Path) Node {
 						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
 					}
 					ioLow, ioLowOp = c.key, c.op
+					ioCondOrder = append(ioCondOrder, IndexCondLow)
 				case parser.OpLt, parser.OpLe:
 					if ioHigh != nil {
 						panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
 					}
 					ioHigh, ioHighOp = c.key, c.op
+					ioCondOrder = append(ioCondOrder, IndexCondHigh)
 				default:
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
 				}
@@ -455,6 +459,9 @@ func createIndexScanPlan(p *Path) Node {
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
 			ios.ExtraNullTests = ioExtraNullTests
+			if len(ioCondOrder) > 1 {
+				ios.IndexCondOrder = ioCondOrder
+			}
 		case len(ioKeys) == 0:
 		case p.IndexSkipPrefix > 0:
 			ios.SkipPrefix = p.IndexSkipPrefix
@@ -668,8 +675,10 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 	if len(prefix) > 0 {
 		is.RangePrefix = prefix
 	}
+	var condOrder []IndexCondItem
 	for i, c := range p.IndexClauses[len(prefix):] {
 		if c.nullTest != IndexNullTestNone {
+			condOrder = append(condOrder, IndexCondNullTest)
 			// M0148-0001c3a: the NullTest index qual on the range column —
 			// the leading one, or (slice 3) the column after the equality
 			// prefix. It is exact either way, so its conjunct leaves the
@@ -699,17 +708,22 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
 			}
 			is.LowKey, is.LowOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondLow)
 		case parser.OpLt, parser.OpLe:
 			if is.HighKey != nil {
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
 			}
 			is.HighKey, is.HighOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondHigh)
 		default:
 			panic(fmt.Sprintf("createPlan: range PathIndexScan on %s mixes an equality clause into its bounds", p.IndexInfo.Name))
 		}
 		if c.local != nil {
 			drop[c.local] = true
 		}
+	}
+	if len(condOrder) > 1 {
+		is.IndexCondOrder = condOrder
 	}
 	if len(drop) > 0 {
 		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)

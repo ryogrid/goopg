@@ -19567,6 +19567,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		LeadingNullTest:     idxScan.LeadingNullTest,
 		NullTestAfterBounds: idxScan.NullTestAfterBounds,
 		ExtraNullTests:      idxScan.ExtraNullTests,
+		IndexCondOrder:      idxScan.IndexCondOrder,
 		Covered:             covered,
 		schema:              iosSchema,
 	}

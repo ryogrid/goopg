@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); slice 6 landed 2026\-11\-12 \(duplicate and contradictory NullTests\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); slice 6 landed 2026\-11\-12 \(duplicate and contradictory NullTests\); slice 7 landed 2026\-11\-12 \(Index Cond in restriction\-list order\); item \(4\) backward scans split to M0148\-0001c3a3; item \(6\) stays open
 
 ## Problem
 
@@ -313,6 +313,45 @@ goopg never planned the BitmapAnd PG builds for `hundred = 42 AND unique2 <
   - Regress create\_index 3166→3159.
   - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
     acceptance 24 MATCH.
+
+## Slice 7 — Index Cond in restriction\-list order \(c3a2 item 5\)
+
+- **PG behaviour:** PG keeps one index column's clauses in baserestrictinfo
+  order, because match\_clauses\_to\_index walks the list, and prints them
+  so: `((a < 50) AND (a > 10))`, `((a < 5) AND (a IS NOT NULL) AND (a >
+  1))`. Only the qpqual is cost\-sorted \(order\_qual\_clauses\).
+- **goopg before:** two problems.
+  - The leaf Filter is cost\-sorted when it is built, so the producers saw
+    NullTests, the cheaper clauses, first.
+  - Every renderer printed the lower bound first.
+- **Mechanism:** within one column the restriction\-list order is the
+  written order. The leaf's localized conjuncts keep their source position,
+  because `localizeExprToLeaf` is a shallow clone.
+  - `conjunctPrecedes` orders by `Pos()`, falling back to list order.
+  - `restrictionRangeOnColumnLocal` emits a column's bounds in that order,
+    and `withNullTestInConjunctOrder` places NullTests by it.
+- **Lowering:** the three lowering sites record `IndexCondOrder` \(low /
+  high / next NullTest\) on IndexScan, IndexOnlyScan \(copied at
+  promotion\) and BitmapIndexScan.
+- **Rendering:** `rangeColumnCondParts` renders a range column in that order
+  for every range renderer. An empty order keeps the legacy one.
+- **Verification:**
+  - Probe against PG 18.3: all 10 ordering statements identical. The
+    earlier probe sets still match; the c3a2f mixed\-order cases, previously
+    3 diffs, now match too.
+  - `TestIndexCondInRestrictionOrder` pins 7 PG Index Cond lines on the
+    bitmap path and the plain Index Scan.
+  - Regress unchanged.
+  - sf025 99/99; fire\-set fires=none on sf025, sf1 and TPC\-H; acceptance
+    24 MATCH.
+
+Item \(4\), backward ordered scans \(`Index Scan Backward`, 26 regress
+lines\), is split to **M0148\-0001c3a3**. It needs an access\-method feature:
+a btree reverse leaf walk that stays correct under concurrent page splits
+\(PG's \_bt\_walk\_left\). The existing `ScanFromEnd` tolerates skipped or
+repeated entries, which only the planner's endpoint probe can accept.
+Materializing a forward range and reversing it would read whole ranges
+under `ORDER BY … DESC LIMIT`.
 
 ## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
 

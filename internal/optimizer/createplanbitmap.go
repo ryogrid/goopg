@@ -149,11 +149,13 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		return bis
 	}
 	sawBound := false
+	var condOrder []IndexCondItem
 	for _, c := range rest {
 		if c.indexCol != np {
 			panic(fmt.Sprintf("createPlan: bitmap range clause of %s bounds index column %d, not %d", p.IndexInfo.Name, c.indexCol, np))
 		}
 		if c.nullTest != IndexNullTestNone {
+			condOrder = append(condOrder, IndexCondNullTest)
 			if bis.LeadingNullTest != IndexNullTestNone {
 				// M0148-0001c3a2: a further NullTest on the column.
 				bis.ExtraNullTests = append(bis.ExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: sawBound})
@@ -171,15 +173,20 @@ func createBitmapIndexScanPlan(p *Path) Node {
 				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two lower bounds", p.IndexInfo.Name))
 			}
 			bis.LowKey, bis.LowOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondLow)
 		case parser.OpLt, parser.OpLe:
 			if bis.HighKey != nil {
 				panic(fmt.Sprintf("createPlan: bitmap range probe of %s carries two upper bounds", p.IndexInfo.Name))
 			}
 			bis.HighKey, bis.HighOp = c.key, c.op
+			condOrder = append(condOrder, IndexCondHigh)
 		default:
 			panic(fmt.Sprintf("createPlan: bitmap range probe of %s mixes an equality clause into its bounds", p.IndexInfo.Name))
 		}
 		sawBound = true
+	}
+	if len(condOrder) > 1 {
+		bis.IndexCondOrder = condOrder
 	}
 	// Returned BARE: the leaf's `*Filter` wrappers must NOT be rebuilt here.
 	//

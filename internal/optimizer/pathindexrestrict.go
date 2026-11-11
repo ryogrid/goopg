@@ -268,7 +268,51 @@ func restrictionRangeOnColumnLocal(cat catalog.Catalog, tbl *catalog.Table, idx 
 	if hi != nil {
 		out = append(out, *hi)
 	}
+	// M0148-0001c3a2: one column's clauses in restriction-list order, as
+	// PG's match_clauses_to_index files them (`((a < 50) AND (a > 10))`).
+	if lo != nil && hi != nil && conjunctPrecedes(clauseSource(*hi, conjuncts), clauseSource(*lo, conjuncts), conjuncts) {
+		out[0], out[1] = out[1], out[0]
+	}
 	return out
+}
+
+// clauseSource is an index clause's restriction conjunct: its `local`, or —
+// for a bound that records none — the conjunct holding its key.
+func clauseSource(c indexPathClause, conjuncts []Expr) Expr {
+	if c.local != nil {
+		return c.local
+	}
+	for _, conj := range conjuncts {
+		if bin, ok := conj.(*BinaryOp); ok && c.key != nil && (bin.Left == c.key || bin.Right == c.key) {
+			return conj
+		}
+	}
+	return nil
+}
+
+// conjunctPrecedes reports whether restriction conjunct a comes before b in
+// the relation's restriction list as written — baserestrictinfo order, which
+// PG's index clauses keep. goopg's leaf Filter is cost-sorted
+// (order_qual_clauses, local_filters.go) before the producers see it, so the
+// written order is read off the conjuncts' source positions, which the leaf
+// localization keeps; equal or unknown positions fall back to list order.
+func conjunctPrecedes(a, b Expr, conjuncts []Expr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if pa, pb := a.Pos(), b.Pos(); pa > 0 && pb > 0 && pa != pb {
+		return pa < pb
+	}
+	ia, ib := len(conjuncts), len(conjuncts)
+	for i, c := range conjuncts {
+		if c == a {
+			ia = i
+		}
+		if c == b {
+			ib = i
+		}
+	}
+	return ia < ib
 }
 
 // restrictionLeadingSAOP binds the index's LEADING column to the first local
@@ -441,33 +485,10 @@ func withNullTestsInConjunctOrder(rng []indexPathClause, nts []indexPathClause, 
 // column's clauses in baserestrictinfo order, which is what Index Cond prints
 // (`((x IS NOT NULL) AND (x < 5))`).
 func withNullTestInConjunctOrder(rng []indexPathClause, nt indexPathClause, conjuncts []Expr) []indexPathClause {
-	pos := func(e Expr) int {
-		for i, c := range conjuncts {
-			if c == e {
-				return i
-			}
-		}
-		return len(conjuncts)
-	}
-	// A bound behind an equality prefix records no `local` (it stays a
-	// Filter recheck); its source conjunct is found by key identity, as
-	// rangeIndexSelectivity does.
-	source := func(c indexPathClause) Expr {
-		if c.local != nil {
-			return c.local
-		}
-		for _, conj := range conjuncts {
-			if bin, ok := conj.(*BinaryOp); ok && c.key != nil && (bin.Left == c.key || bin.Right == c.key) {
-				return conj
-			}
-		}
-		return nil
-	}
-	ntPos := pos(nt.local)
 	out := make([]indexPathClause, 0, len(rng)+1)
 	placed := false
 	for _, c := range rng {
-		if src := source(c); !placed && src != nil && ntPos < pos(src) {
+		if src := clauseSource(c, conjuncts); !placed && src != nil && conjunctPrecedes(nt.local, src, conjuncts) {
 			out = append(out, nt)
 			placed = true
 		}

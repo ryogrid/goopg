@@ -552,3 +552,64 @@ func TestDuplicateAndContradictoryNullTests(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexCondInRestrictionOrder pins M0148-0001c3a2 item (5): one index
+// column's clauses keep the restriction list's written order — PG's
+// match_clauses_to_index walks baserestrictinfo — not the cost-sorted order
+// of goopg's leaf Filter, nor a fixed lower-bound-first. The expected lines
+// are PG 18.3's for the same table; the plain Index Scan (bitmap off) must
+// print the same Index Cond as the bitmap one.
+func TestIndexCondInRestrictionOrder(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE wo (a int, b int, c int)")
+	runSQL(t, ctx, "INSERT INTO wo SELECT CASE WHEN g % 10 = 0 THEN NULL ELSE g % 1000 END, g % 37, g FROM generate_series(1, 20000) g")
+	runSQL(t, ctx, "CREATE INDEX wo_a ON wo (a)")
+	runSQL(t, ctx, "CREATE INDEX wo_ba ON wo (b, a)")
+	runSQL(t, ctx, "ANALYZE wo")
+	for _, tc := range []struct{ where, cond string }{
+		{"a < 50 AND a > 10", "((a < 50) AND (a > 10))"},
+		{"a > 10 AND a < 50", "((a > 10) AND (a < 50))"},
+		{"a < 50 AND a IS NOT NULL", "((a < 50) AND (a IS NOT NULL))"},
+		{"a IS NOT NULL AND a < 50", "((a IS NOT NULL) AND (a < 50))"},
+		{"a < 5 AND a IS NOT NULL AND a > 1", "((a < 5) AND (a IS NOT NULL) AND (a > 1))"},
+		{"b = 3 AND a < 50 AND a IS NOT NULL", "((b = 3) AND (a < 50) AND (a IS NOT NULL))"},
+		{"a < 50 AND b = 3 AND a > 10", "((b = 3) AND (a < 50) AND (a > 10))"},
+	} {
+		q := "SELECT * FROM wo WHERE " + tc.where
+		got := strings.Join(runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+q), "\n")
+		if !strings.Contains(got, "Index Cond: "+tc.cond) || !strings.Contains(got, "Recheck Cond: "+tc.cond) {
+			t.Errorf("%s:\n%s\nwant Index Cond and Recheck Cond %s (PG 18.3)", q, got, tc.cond)
+		}
+		stmts, err := parser.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ps := optimizer.DefaultPlannerSettings()
+		ps.EnableBitmapScan, ps.EnableSeqScan = false, false
+		advanceStmtCounter(ctx)
+		plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var is *optimizer.IndexScan
+		for n := plan; n != nil && is == nil; {
+			switch v := n.(type) {
+			case *optimizer.IndexScan:
+				is = v
+			case *optimizer.Project:
+				n = v.Child
+			case *optimizer.Filter:
+				n = v.Child
+			default:
+				n = nil
+			}
+		}
+		if is == nil {
+			t.Fatalf("%s: no Index Scan with bitmap scans off (%T)", q, plan)
+		}
+		if c := formatIndexCond(is, nil); c != tc.cond {
+			t.Errorf("%s [index scan]: Index Cond %s, want %s", q, c, tc.cond)
+		}
+	}
+}
