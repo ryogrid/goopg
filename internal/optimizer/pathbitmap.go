@@ -244,8 +244,8 @@ func (s *searchCtx) buildBitmapIndexChild(
 				rng = append(rng, c)
 			}
 		}
-		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
-			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		if nts := restrictionNullTestsOnColumn(idx, n, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
 		if len(rng) > 0 {
 			indexClauses = append(indexClauses, rng...)
@@ -263,8 +263,8 @@ func (s *searchCtx) buildBitmapIndexChild(
 		rng := bitmapLeadingRange(s.cat, tbl, idx, conjuncts)
 		// M0148-0001c3a1: the leading column's NullTest, alone or beside the
 		// bounds, as the plain restriction producer files it.
-		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil {
-			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
 		if len(rng) > 0 {
 			indexClauses = rng

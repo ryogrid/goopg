@@ -470,3 +470,85 @@ func TestRangeBehindEqualityPrefix(t *testing.T) {
 	}
 	catalog.SetNullKeyedIndexEntries(false)
 }
+
+// TestDuplicateAndContradictoryNullTests pins M0148-0001c3a2 item (3): every
+// `col IS [NOT] NULL` on an index column is an index qual, as PG's
+// match_clause_to_indexcol takes them (`Index Cond: ((a IS NULL) AND (a IS
+// NOT NULL))`); duplicates are redundant and `IS NULL AND IS NOT NULL` makes
+// the scan empty (_bt_preprocess_keys). Every answer, on the plain, bitmap
+// and index-only paths, must equal a non-indexable twin's.
+func TestDuplicateAndContradictoryNullTests(t *testing.T) {
+	catalog.SetNullKeyedIndexEntries(true)
+	defer catalog.SetNullKeyedIndexEntries(false)
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE ntd (a int, b int, c int)")
+	runSQL(t, ctx, "INSERT INTO ntd SELECT CASE WHEN g % 10 = 0 THEN NULL ELSE g END, g % 7, g FROM generate_series(1, 5000) g")
+	runSQL(t, ctx, "CREATE INDEX ntd_a ON ntd (a)")
+	runSQL(t, ctx, "CREATE INDEX ntd_ba ON ntd (b, a)")
+	runSQL(t, ctx, "ANALYZE ntd")
+
+	if got := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) SELECT * FROM ntd WHERE a IS NULL AND a IS NOT NULL"); len(got) < 2 ||
+		got[1] != "  Index Cond: ((a IS NULL) AND (a IS NOT NULL))" {
+		t.Errorf("contradictory NullTests: plan\n%s\nwant both as the Index Cond (PG 18.3)", strings.Join(got, "\n"))
+	}
+	for _, c := range []struct{ indexed, twin string }{
+		{"SELECT c FROM ntd WHERE a IS NULL AND a IS NULL", "SELECT c FROM ntd WHERE (a + 0) IS NULL"},
+		{"SELECT c FROM ntd WHERE a IS NULL AND a IS NOT NULL", "SELECT c FROM ntd WHERE c < 0"},
+		{"SELECT c FROM ntd WHERE a IS NOT NULL AND a IS NULL", "SELECT c FROM ntd WHERE c < 0"},
+		{"SELECT c FROM ntd WHERE a IS NOT NULL AND a IS NOT NULL AND a < 50", "SELECT c FROM ntd WHERE a + 0 < 50"},
+		{"SELECT c FROM ntd WHERE b = 3 AND a IS NULL AND a IS NOT NULL", "SELECT c FROM ntd WHERE c < 0"},
+		{"SELECT c FROM ntd WHERE b = 3 AND a IS NOT NULL AND a < 100 AND a IS NOT NULL", "SELECT c FROM ntd WHERE b + 0 = 3 AND a + 0 < 100"},
+		{"SELECT a FROM ntd WHERE a IS NULL AND a IS NOT NULL", "SELECT a FROM ntd WHERE c < 0"},
+	} {
+		want := sortedRowStrings(t, ctx, c.twin)
+		for _, mode := range []string{"index", "bitmap"} {
+			stmts, err := parser.Parse(c.indexed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ps := optimizer.DefaultPlannerSettings()
+			ps.EnableSeqScan = false
+			if mode == "index" {
+				ps.EnableBitmapScan = false
+			} else {
+				ps.EnableIndexScan = false
+			}
+			advanceStmtCounter(ctx)
+			plan, err := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			op, err := Build(plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := op.Open(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if d := slot.Row()[0]; d.IsNull() {
+					got = append(got, "NULL")
+				} else {
+					got = append(got, fmt.Sprint(d.Int))
+				}
+				slot.Release()
+			}
+			_ = op.Close()
+			sort.Strings(got)
+			w := append([]string(nil), want...)
+			sort.Strings(w)
+			if strings.Join(got, ",") != strings.Join(w, ",") {
+				t.Errorf("%s [%s]: %d rows, want %d", c.indexed, mode, len(got), len(w))
+			}
+		}
+	}
+}

@@ -1507,8 +1507,8 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	loKey, hiKey, o.rangeLoExcl, o.rangeHiExcl, ok, err = o.ctx.indexRangeBounds(indexRangeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix,
 		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
-		nullTest: o.plan.LeadingNullTest,
-		pos:      o.plan.Pos(),
+		nullTest: o.plan.LeadingNullTest, extraNullTests: o.plan.ExtraNullTests,
+		pos: o.plan.Pos(),
 	}, o.outerSlot)
 	return loKey, hiKey, ok, err
 }
@@ -1527,7 +1527,10 @@ type indexRangeSpec struct {
 	// (IndexScan.LeadingNullTest, M0148-0001c3a): IS NULL probes only the
 	// column's NULL group, IS NOT NULL stops the scan at it.
 	nullTest optimizer.IndexNullTest
-	pos      int
+	// extraNullTests are the column's further NullTest quals; a mix of IS
+	// NULL and IS NOT NULL matches nothing (M0148-0001c3a2).
+	extraNullTests []optimizer.ExtraIndexNullTest
+	pos            int
 }
 
 // indexRangeBounds computes the INDEX-ORDER bounds and their exclusivity for
@@ -1538,6 +1541,11 @@ func (ctx *Context) indexRangeBounds(sp indexRangeSpec, outerSlot SlotView) (loK
 	// onto the column after it; each bound is then the prefix's parts plus the
 	// bound's own part. With no prefix this is the leading-column range scan,
 	// byte for byte as before.
+	if optimizer.NullTestsContradict(sp.nullTest, sp.extraNullTests) {
+		// _bt_preprocess_keys: `IS NULL AND IS NOT NULL` on one column is
+		// unsatisfiable, and the scan returns nothing.
+		return nil, nil, false, false, false, nil
+	}
 	np := len(sp.prefix)
 	if np >= len(sp.index.Columns) {
 		return nil, nil, false, false, false, &ExecError{

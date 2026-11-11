@@ -353,13 +353,19 @@ func createIndexScanPlan(p *Path) Node {
 		ioRange := hasRangeClause(p.IndexClauses)
 		var ioNullTest IndexNullTest
 		ioNullTestAfter := false
+		var ioExtraNullTests []ExtraIndexNullTest
 		for i, c := range p.IndexClauses {
 			if ioRange && c.nullTest != IndexNullTestNone {
 				// M0148-0001c3a: the leading column's NullTest index qual.
-				if c.indexCol != 0 || ioNullTest != IndexNullTestNone || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+				if c.indexCol != 0 || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 					panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
 				}
-				ioNullTest, ioNullTestAfter = c.nullTest, ioLow != nil || ioHigh != nil
+				if ioNullTest != IndexNullTestNone {
+					// M0148-0001c3a2: a further NullTest on the column.
+					ioExtraNullTests = append(ioExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: ioLow != nil || ioHigh != nil})
+				} else {
+					ioNullTest, ioNullTestAfter = c.nullTest, ioLow != nil || ioHigh != nil
+				}
 				if c.local != nil {
 					ioDrop[c.local] = true
 				}
@@ -448,6 +454,7 @@ func createIndexScanPlan(p *Path) Node {
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
+			ios.ExtraNullTests = ioExtraNullTests
 		case len(ioKeys) == 0:
 		case p.IndexSkipPrefix > 0:
 			ios.SkipPrefix = p.IndexSkipPrefix
@@ -667,11 +674,17 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 			// the leading one, or (slice 3) the column after the equality
 			// prefix. It is exact either way, so its conjunct leaves the
 			// Filter.
-			if c.indexCol != len(prefix) || is.LeadingNullTest != IndexNullTestNone {
+			if c.indexCol != len(prefix) {
 				panic(fmt.Sprintf("createPlan: range PathIndexScan on %s carries a misplaced NullTest clause", p.IndexInfo.Name))
 			}
-			is.LeadingNullTest = c.nullTest
-			is.NullTestAfterBounds = is.LowKey != nil || is.HighKey != nil
+			afterBounds := is.LowKey != nil || is.HighKey != nil
+			if is.LeadingNullTest != IndexNullTestNone {
+				// M0148-0001c3a2: a further NullTest on the column.
+				is.ExtraNullTests = append(is.ExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: afterBounds})
+			} else {
+				is.LeadingNullTest = c.nullTest
+				is.NullTestAfterBounds = afterBounds
+			}
 			if c.local != nil {
 				drop[c.local] = true
 			}

@@ -563,6 +563,31 @@ const (
 	IndexNullTestIsNotNull
 )
 
+// ExtraIndexNullTest is a further `col IS [NOT] NULL` index qual on the
+// column a scan's LeadingNullTest is on, in restriction-list order. PG takes
+// every NullTest on the column as an index clause (match_clause_to_indexcol)
+// and prints each in Index Cond — `((a IS NULL) AND (a IS NULL))` — leaving
+// _bt_preprocess_keys to merge duplicates and to find `IS NULL AND IS NOT
+// NULL` contradictory, which makes the scan empty (M0148-0001c3a2).
+// AfterBounds places it after the column's range bounds, as
+// NullTestAfterBounds does the leading one.
+type ExtraIndexNullTest struct {
+	Kind        IndexNullTest
+	AfterBounds bool
+}
+
+// NullTestsContradict reports whether a scan's NullTest index quals ask for
+// both a NULL and a non-NULL key on their column — the qual
+// _bt_preprocess_keys proves unsatisfiable, so the probe matches nothing.
+func NullTestsContradict(lead IndexNullTest, extras []ExtraIndexNullTest) bool {
+	for _, x := range extras {
+		if x.Kind != lead {
+			return true
+		}
+	}
+	return false
+}
+
 type ParamRef struct {
 	pos    int
 	Number int
@@ -981,6 +1006,9 @@ type IndexScan struct {
 	// relation's restriction list, so `Index Cond` prints it after them
 	// (PG lists one column's index clauses in baserestrictinfo order).
 	NullTestAfterBounds bool
+	// ExtraNullTests are the column's further NullTest index quals
+	// (ExtraIndexNullTest, M0148-0001c3a2).
+	ExtraNullTests []ExtraIndexNullTest
 	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
 	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
 	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
@@ -1242,6 +1270,7 @@ type IndexOnlyScan struct {
 	// leading key column, executed as SK_SEARCHNULL / SK_SEARCHNOTNULL bounds.
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
+	ExtraNullTests      []ExtraIndexNullTest
 	// Cond is an additional filter evaluated per index row (S6 min/max
 	// rewrite: the `col IS NOT NULL` qual). IndexOnlyScan's primary probe
 	// (Key/Keys/LowKey/HighKey) is equality/range-shaped; this general
@@ -3718,6 +3747,7 @@ type BitmapIndexScan struct {
 	// the same SK_SEARCHNULL / SK_SEARCHNOTNULL bounds as IndexScan's.
 	LeadingNullTest     IndexNullTest
 	NullTestAfterBounds bool
+	ExtraNullTests      []ExtraIndexNullTest
 	// SAOPKeys is a ScalarArrayOp equality index qual (`col = ANY (…)`,
 	// match_saopclause_to_indexcol / match_orclause_to_indexcol) on
 	// Columns[len(Keys)], behind the equality Keys: one probe per element,

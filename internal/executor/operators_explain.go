@@ -3109,7 +3109,7 @@ func emitNodeDetailLines(n optimizer.Node, indent string, verbose bool, rows *[]
 				cond = formatBitmapSAOPIndexCond(p, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			} else if np := len(p.Keys); np > 0 && np < len(p.Index.Columns) && (p.LowKey != nil || p.HighKey != nil) {
 				// M0148-0001c3a2: bounds behind the equality Keys.
-				cond = formatPrefixRangeIndexCond(p.Table, p.Index, p.Keys, p.LeadingNullTest, p.NullTestAfterBounds,
+				cond = formatPrefixRangeIndexCond(p.Table, p.Index, p.Keys, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests,
 					p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, indexCondColumnPrefix(verbose, n, p.Table, p.Alias, reg))
 			}
 			if cond != "" {
@@ -3844,7 +3844,7 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's
 	// multi-clause style.
 	if np := len(p.RangePrefix); np > 0 && np < len(p.Index.Columns) {
-		return formatPrefixRangeIndexCond(p.Table, p.Index, p.RangePrefix, p.LeadingNullTest, p.NullTestAfterBounds,
+		return formatPrefixRangeIndexCond(p.Table, p.Index, p.RangePrefix, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests,
 			p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	// M0146-0005v: a skip probe binds Columns[SkipPrefix+i] — PG prints
@@ -3863,7 +3863,7 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	// beside its range bounds, in restriction-list order —
 	// `Index Cond: ((x IS NOT NULL) AND (x < 5))`.
 	if p.LeadingNullTest != optimizer.IndexNullTestNone && len(p.Index.Columns) > 0 {
-		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 }
@@ -3892,7 +3892,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return indexCondAndText(parts)
 	}
 	if p.LeadingNullTest != optimizer.IndexNullTestNone {
-		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 }
@@ -3902,7 +3902,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 // (b > 90))`. IndexScan's RangePrefix probe and BitmapIndexScan's Keys plus
 // bounds (M0148-0001c3a2) share it, so the two print one text.
 func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefixKeys []optimizer.Expr,
-	nullTest optimizer.IndexNullTest, nullTestAfterBounds bool, lowKey, highKey optimizer.Expr,
+	nullTest optimizer.IndexNullTest, nullTestAfterBounds bool, extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr,
 	lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
 	np := len(prefixKeys)
 	parts := make([]string, 0, np+2)
@@ -3910,17 +3910,9 @@ func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefix
 		parts = append(parts, prefix+index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(tbl, index, i)))
 	}
 	col := prefix + index.Columns[np]
-	// M0148-0001c3a slice 3: the NullTest on the column after the prefix.
-	nt := ""
-	if nullTest != optimizer.IndexNullTestNone {
-		nt = col + " IS NULL"
-		if nullTest == optimizer.IndexNullTestIsNotNull {
-			nt = col + " IS NOT NULL"
-		}
-	}
-	if nt != "" && !nullTestAfterBounds {
-		parts = append(parts, nt)
-	}
+	// M0148-0001c3a slice 3: the NullTests on the column after the prefix.
+	before, after := nullTestIndexCondTexts(col, nullTest, nullTestAfterBounds, extras)
+	parts = append(parts, before...)
 	if lowKey != nil {
 		op := ">="
 		if lowOp == parser.OpGt {
@@ -3935,10 +3927,7 @@ func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefix
 		}
 		parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(highKey, reg, indexKeyColumnType(tbl, index, np)))
 	}
-	if nt != "" && nullTestAfterBounds {
-		parts = append(parts, nt)
-	}
-	return indexCondAndText(parts)
+	return indexCondAndText(append(parts, after...))
 }
 
 // formatBitmapSAOPIndexCond renders a BitmapIndexScan's ScalarArrayOp index
@@ -3976,7 +3965,7 @@ func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, pr
 // `((a = 3) AND (b IS NULL))` — or on the leading column beside its bounds.
 func formatBitmapNullTestIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, prefix string) string {
 	if len(p.Keys) == 0 {
-		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
+		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix)
 	}
 	np := len(p.Keys)
 	if np >= len(p.Index.Columns) {
@@ -3986,29 +3975,20 @@ func formatBitmapNullTestIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg
 	for i, k := range p.Keys {
 		parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, i)))
 	}
-	nt := prefix + p.Index.Columns[np] + " IS NULL"
-	if p.LeadingNullTest == optimizer.IndexNullTestIsNotNull {
-		nt = prefix + p.Index.Columns[np] + " IS NOT NULL"
-	}
-	return indexCondAndText(append(parts, nt))
+	before, after := nullTestIndexCondTexts(prefix+p.Index.Columns[np], p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests)
+	return indexCondAndText(append(append(parts, before...), after...))
 }
 
 // formatNullTestIndexCond renders a leading-column NullTest index qual
 // with its range bounds (IndexScan and IndexOnlyScan share it, M0148-0001c3a).
 func formatNullTestIndexCond(tbl *catalog.Table, index *catalog.Index, nullTest optimizer.IndexNullTest, afterBounds bool,
-	lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
+	extras []optimizer.ExtraIndexNullTest, lowKey, highKey optimizer.Expr, lowOp, highOp parser.OpCode, reg *subPlanReg, prefix string) string {
 	if index == nil || len(index.Columns) == 0 {
 		return ""
 	}
 	col := prefix + index.Columns[0]
-	nt := col + " IS NULL"
-	if nullTest == optimizer.IndexNullTestIsNotNull {
-		nt = col + " IS NOT NULL"
-	}
-	var parts []string
-	if !afterBounds {
-		parts = append(parts, nt)
-	}
+	before, after := nullTestIndexCondTexts(col, nullTest, afterBounds, extras)
+	parts := append([]string(nil), before...)
 	if lowKey != nil {
 		op := ">="
 		if lowOp == parser.OpGt {
@@ -4023,10 +4003,36 @@ func formatNullTestIndexCond(tbl *catalog.Table, index *catalog.Index, nullTest 
 		}
 		parts = append(parts, col+" "+op+" "+formatIndexCondKeyTyped(highKey, reg, indexKeyColumnType(tbl, index, 0)))
 	}
-	if afterBounds {
-		parts = append(parts, nt)
+	return indexCondAndText(append(parts, after...))
+}
+
+// nullTestIndexCondTexts renders a column's NullTest index quals — the
+// leading one and its ExtraNullTests (M0148-0001c3a2), in restriction-list
+// order — split into those printed before the column's bounds and those
+// after, as PG prints every NullTest clause of the column.
+func nullTestIndexCondTexts(col string, lead optimizer.IndexNullTest, leadAfter bool, extras []optimizer.ExtraIndexNullTest) (before, after []string) {
+	text := func(k optimizer.IndexNullTest) string {
+		if k == optimizer.IndexNullTestIsNotNull {
+			return col + " IS NOT NULL"
+		}
+		return col + " IS NULL"
 	}
-	return indexCondAndText(parts)
+	if lead == optimizer.IndexNullTestNone {
+		return nil, nil
+	}
+	if leadAfter {
+		after = append(after, text(lead))
+	} else {
+		before = append(before, text(lead))
+	}
+	for _, x := range extras {
+		if x.AfterBounds {
+			after = append(after, text(x.Kind))
+		} else {
+			before = append(before, text(x.Kind))
+		}
+	}
+	return before, after
 }
 
 // indexCondColumnPrefix is the `<refname>.` an index qual's column side

@@ -313,8 +313,8 @@ func (o *bitmapIndexScanOp) lookupBounds() (loBytes, hiBytes []byte, nullKey boo
 		lo, hi, loExcl, hiExcl, ok, rerr := o.ctx.indexRangeBounds(indexRangeSpec{
 			table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys,
 			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
-			nullTest: o.plan.LeadingNullTest,
-			pos:      o.plan.Pos(),
+			nullTest: o.plan.LeadingNullTest, extraNullTests: o.plan.ExtraNullTests,
+			pos: o.plan.Pos(),
 		}, o.outerSlot)
 		if rerr != nil {
 			return nil, nil, false, rerr

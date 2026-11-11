@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); the other c3a2 items stay open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); slice 6 landed 2026\-11\-12 \(duplicate and contradictory NullTests\); the other c3a2 items stay open
 
 ## Problem
 
@@ -280,6 +280,37 @@ goopg never planned the BitmapAnd PG builds for `hundred = 42 AND unique2 <
     exact form, bitmap\-off; the nullable\-unbound decline is checked on the
     bitmap path too.
   - Regress over 22 suites: unchanged.
+  - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
+    acceptance 24 MATCH.
+
+## Slice 6 — duplicate and contradictory NullTests \(c3a2 item 3\)
+
+- **PG behaviour:** PG takes every `col IS [NOT] NULL` on an index column as
+  an index clause and prints each one in Index Cond.
+  - `((a IS NULL) AND (a IS NULL))`
+  - `((a IS NULL) AND (a IS NOT NULL))`
+  - \_bt\_preprocess\_keys then merges duplicates and proves `IS NULL AND IS
+    NOT NULL` unsatisfiable: an empty scan.
+- **goopg before:** it took the first NullTest only. The rest stayed a
+  Filter, and `a IS NOT NULL AND a IS NULL` fell back to a Seq Scan.
+- **Representation:** `ExtraIndexNullTest{Kind, AfterBounds}` lists on
+  IndexScan, IndexOnlyScan \(copied at promotion\) and BitmapIndexScan, beside
+  `LeadingNullTest`. `restrictionNullTestsOnColumn` and
+  `withNullTestsInConjunctOrder` file them.
+- **Execution:** `NullTestsContradict` makes `indexRangeBounds` return "matches
+  nothing", and the index\-only scan's own bound code does the same \(sibling
+  paths\).
+- **EXPLAIN:** every renderer prints all of a column's NullTests through
+  `nullTestIndexCondTexts`.
+- **Verification:**
+  - Probe against PG 18.3, 36 statements over plain, bitmap and index\-only
+    paths: values identical. Plans are identical except where a NullTest
+    follows a bound in WHERE order, which is item \(5\): goopg's leaf
+    Filter is cost\-sorted.
+  - `TestDuplicateAndContradictoryNullTests` compares every answer to a
+    twin. With the contradiction check removed it fails with 500, 4500 and
+    72 wrong rows.
+  - Regress create\_index 3166→3159.
   - sf025 PASS=99 with 99/99 shapes identical; fire\-set fires=none;
     acceptance 24 MATCH.
 

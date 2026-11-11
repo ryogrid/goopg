@@ -229,8 +229,8 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		rng := restrictionLeadingRange(cat, tbl, idx, conjuncts)
 		// M0148-0001c3a: with the leading column's NullTest index qual, as
 		// the plain producer files it.
-		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil && len(clauses) == 0 {
-			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 && len(clauses) == 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
 		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
 			return nil, false

@@ -155,7 +155,9 @@ func createBitmapIndexScanPlan(p *Path) Node {
 		}
 		if c.nullTest != IndexNullTestNone {
 			if bis.LeadingNullTest != IndexNullTestNone {
-				panic(fmt.Sprintf("createPlan: bitmap probe of %s carries two NullTests", p.IndexInfo.Name))
+				// M0148-0001c3a2: a further NullTest on the column.
+				bis.ExtraNullTests = append(bis.ExtraNullTests, ExtraIndexNullTest{Kind: c.nullTest, AfterBounds: sawBound})
+				continue
 			}
 			bis.LeadingNullTest, bis.NullTestAfterBounds = c.nullTest, sawBound
 			continue

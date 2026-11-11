@@ -404,6 +404,38 @@ func restrictionNullTestOnColumn(idx *catalog.Index, pos int, conjuncts []Expr) 
 	return nil
 }
 
+// restrictionNullTestsOnColumn is every NullTest index clause on index column
+// pos, in restriction-list order (restrictionNullTestOnColumn's first is the
+// head): PG takes each as an index clause, duplicates and contradictions
+// included, and _bt_preprocess_keys merges them at scan time
+// (M0148-0001c3a2).
+func restrictionNullTestsOnColumn(idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	var out []indexPathClause
+	for len(conjuncts) > 0 {
+		nt := restrictionNullTestOnColumn(idx, pos, conjuncts)
+		if nt == nil {
+			break
+		}
+		out = append(out, *nt)
+		for i, c := range conjuncts {
+			if c == nt.local {
+				conjuncts = conjuncts[i+1:]
+				break
+			}
+		}
+	}
+	return out
+}
+
+// withNullTestsInConjunctOrder is withNullTestInConjunctOrder for each of
+// the column's NullTest clauses in turn.
+func withNullTestsInConjunctOrder(rng []indexPathClause, nts []indexPathClause, conjuncts []Expr) []indexPathClause {
+	for _, nt := range nts {
+		rng = withNullTestInConjunctOrder(rng, nt, conjuncts)
+	}
+	return rng
+}
+
 // withNullTestInConjunctOrder places the NullTest clause among the leading
 // column's range clauses in restriction-list order: PG lists one index
 // column's clauses in baserestrictinfo order, which is what Index Cond prints
@@ -586,8 +618,8 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		rng := restrictionRangeBehindPrefix(cat, tbl, idx, n, conjuncts)
 		// M0148-0001c3a slice 3: a NullTest on the column after the prefix
 		// (`a = 1 AND b IS NULL`), bounded at the prefix's NULL group.
-		if nt := restrictionNullTestOnColumn(idx, n, conjuncts); nt != nil {
-			rng = withNullTestInConjunctOrder(rng, *nt, conjuncts)
+		if nts := restrictionNullTestsOnColumn(idx, n, conjuncts); len(nts) > 0 {
+			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
 		if len(rng) > 0 {
 			clauses = append(clauses, rng...)
@@ -611,8 +643,8 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// M0148-0001c3a: a NullTest on the leading column is an index
 		// clause too (match_clause_to_indexcol's NullTest arm), on its own
 		// or beside the range bounds.
-		if nt := restrictionLeadingNullTest(idx, conjuncts); nt != nil {
-			clauses = withNullTestInConjunctOrder(clauses, *nt, conjuncts)
+		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 {
+			clauses = withNullTestsInConjunctOrder(clauses, nts, conjuncts)
 		}
 		isRange = true
 	}

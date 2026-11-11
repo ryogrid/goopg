@@ -19566,6 +19566,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		// Filter is already gone).
 		LeadingNullTest:     idxScan.LeadingNullTest,
 		NullTestAfterBounds: idxScan.NullTestAfterBounds,
+		ExtraNullTests:      idxScan.ExtraNullTests,
 		Covered:             covered,
 		schema:              iosSchema,
 	}

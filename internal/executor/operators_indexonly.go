@@ -1184,6 +1184,11 @@ func (o *indexOnlyScanOp) lookupKey() ([]byte, bool, error) {
 }
 
 func (o *indexOnlyScanOp) lookupRangeBounds() (lo, hi []byte, ok bool, err error) {
+	// M0148-0001c3a2: contradictory NullTest quals match nothing, as in
+	// indexRangeBounds (sibling paths).
+	if optimizer.NullTestsContradict(o.plan.LeadingNullTest, o.plan.ExtraNullTests) {
+		return nil, nil, false, nil
+	}
 	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
 	if !found {
 		return nil, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
