@@ -1,7 +1,7 @@
 # M0148\-0001j4 — one OID counter for routines, relations and types; user type OIDs in pg\_proc
 
 **Parent:** M0148\-0001j3 · **Status:** items (1) to (4) landed
-2026\-11\-11; the task stays open for item (5)
+2026\-11\-11; closed. Item (5) moved to M0148\-0001h1.
 
 ## Divergence
 
@@ -297,5 +297,10 @@ PG 18.3 returns 5, 5, 7 and 5 for these calls. Regress rangefuncs
   its row type and the row type's array type. goopg's tables
   (`a`=16406, `b`=16408) draw one each. Absolute OIDs therefore drift from
   PG's, but the relative order of objects is now PG's. Ledger row.
-- **j4 item (5) is still open:**
-  - view `_RETURN` type dependencies.
+- **Item (5) moved to M0148\-0001h1.** DROP TYPE must also reach views
+  over the type. PG lists `view v depends on column x of table tt` for a
+  view over a column of the type, and `view v3 depends on type t` for a view
+  with a typed expression; CASCADE drops those views. goopg finds view
+  dependencies by FROM\-clause name matching and keeps no column or type
+  edges, so this needs h1's view dependencies recorded by OID at CREATE
+  VIEW (`recordDependencyOnExpr`). The PG output is recorded under h1.
