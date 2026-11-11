@@ -27345,6 +27345,18 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 			continue
 		}
 		n := name.Name
+		// M0148-0001j3: DROP TYPE also drops a domain. RemoveObjects resolves
+		// OBJECT_TYPE through get_object_address_type, which looks the name
+		// up in pg_type with no typtype check (only OBJECT_DOMAIN insists on
+		// TYPTYPE_DOMAIN), so `DROP TYPE vc4` removes domain vc4 exactly as
+		// DROP DOMAIN would — the same dependents and the same deletion.
+		if d, ok := cat.LookupDomain(n, o.ctx.CurrentDatabaseOid); ok {
+			if err := o.dropTypeDependents(strings.ToLower(n), d.OID, d.ArrayOID, s.Cascade, s.Pos()); err != nil {
+				return err
+			}
+			o.dropDomainObject(cat, d)
+			continue
+		}
 		// M0148-0001j1: the functions and aggregates that depend on the
 		// type (dependency.c findDependentObjects): 2BP01 under RESTRICT,
 		// reported and dropped first under CASCADE.
