@@ -1,6 +1,6 @@
 # M0148\-0001c3a — `col IS [NOT] NULL` as a btree index qual
 
-**Parent:** M0148\-0001c3 · **Status:** slices 1 to 3 landed 2026\-11\-11
+**Parent:** M0148\-0001c3 · **Status:** slices 1 to 3 landed 2026\-11\-11; follow\-up M0148\-0001c3a1 closed 2026\-11\-12, residue in M0148\-0001c3a2
 (plain and index\-only scans, leading column, behind an equality prefix);
 closed — residue in M0148\-0001c3a1
 
