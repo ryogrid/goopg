@@ -11967,9 +11967,13 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
       the text rewrite; a view row type is not a composite for
       compositeTypeFields (rw\_view1\_aa); `(param).*` as a function
       argument (IndirectionStar, rowtypes fcompos3).
-  - Next: item (3b) the typed-table `CREATE TABLE … OF t (col WITH OPTIONS
-    …)` repeated column (transformOfType 42701), then (4) grouping sets
-    hashing an ordered aggregate, (5) view `_RETURN` type dependency.
+  - Item (3b) LANDED (2026-11-11, 2b010424e): a typed table's repeated
+    `col WITH OPTIONS` entry raises 42701 (MergeAttributes). Regress
+    typed\_table 131→117. Gates units, RegressSuite, spotcheck, sf025 99/99,
+    acceptance 24 MATCH.
+  - Next: item (4) grouping sets with no sorted rollup hash an ordered
+    aggregate (PG would sort or error), then (5) view `_RETURN` type
+    dependency.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
