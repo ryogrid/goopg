@@ -1,28 +1,27 @@
-# Working Set — loop end 2026-11-11 (run-2 loop #4: census IDENTICAL; M0148-0001j4 item 2 landed; P0-E26 filed)
+# Working Set — loop end 2026-11-11 (run-2 loop #6: M0148-0001j4 item 3a landed)
 
-- Anomaly: none (prev-loop check OK).
-- S9: DUE after e7f2dfa83 → routing-20261111b (label s9be, BASELINE_REV=34e287597) IDENTICAL ×3, 22/22·99/99·99/99. 9de6fc9a8 touches internal/executor + internal/initdb, so the next loop runs `scripts/s9-census-due.sh` and obeys it. If DUE, use BASELINE_REV = the head routing-20261111b consumed (581d1a818).
+- Anomaly: the prev-loop check flagged claude_output_2026-11-11_19-30-25. That loop was killed mid-gate when the ralph loop restarted (~20:05); its testport go test got exit 137. No mem_guard PRESSURE line, no orphaned servers. Its staged item-3a work survived intact; this loop re-ran every gate on it and committed it.
+- S9: routing-20261111c (2f0f6237e) recorded after 9de6fc9a8, IDENTICAL ×3. 608929548 touches internal/optimizer, so the next loop's `scripts/s9-census-due.sh` will say DUE. Obey it; BASELINE_REV = 2f0f6237e (the head this loop's fire-set used as baseline).
 - Task: M0148-0001j4 (DROP TYPE residue 2) — IN PROGRESS.
-  - Items (1) and (2) landed: e7f2dfa83 (one OID counter) and 9de6fc9a8 (user type OIDs in pg_proc).
-  - Items (3)-(5) open.
-- Files this loop:
-  - internal/executor/sys_pg_proc.go: PGProcTypeOID + userTypeOID; pgProcArgOIDs/pgProcInputArgOIDs take cat.
-  - internal/initdb/pg_proc_view.go: userRoutineTypeOIDStr.
-  - internal/executor/pg_proc_user_type_oids_test.go.
-  - Design doc 0148-0001j4 (item 2 section) + README row.
-  - fix_plan: j4 bullets, P0-E26 filed after P0-E25. Ledger row.
-- Key symbols: PGProcTypeOID, userTypeOID, pgProcInputArgOIDs, buildPGProcRow, insertPgProcIndexEntries, userRoutineTypeOIDStr.
+  - Landed: items 1 (e7f2dfa83), 2 (9de6fc9a8), 3a (608929548).
+  - Open: 3b, 4, 5.
+- Files (608929548):
+  - internal/catalog/catalog.go: SearchPathCatalog.ParamTypes + ParamDeclaredType.
+  - internal/optimizer/fieldselect.go: paramDeclaredType; fieldSelectOnArg types an untyped $n.
+  - internal/executor/plpgsql_runtime.go: bindSQLRoutineParamTypes (×3 entries), rewriteSQLNamedParamsFor (+ funcQualifierStart, precededByDot, followedByDot), lowerPLpgSQLExpr FieldSelect arm.
+  - internal/executor/sql_func_composite_param_test.go.
+  - Design doc 0148-0001j4 (item 3a section) + README row.
+- Key symbols: ParamDeclaredType, paramDeclaredType, bindSQLRoutineParamTypes, rewriteSQLNamedParamsFor, lowerPLpgSQLExpr.
 - Findings:
-  - catalog.TypeNameToOID maps unknown names to text (25), so heap pg_proc rows had 25 for user types while the virtual view (what SELECT reads) had 0.
-  - Types are keyed by the raw connection db OID (5 for postgres, 0 in executor test fixtures); routines by NamespaceDBOid (1). Try 5, 1 and 0 for the default namespace.
-  - P0-E26 (S2, escalated, NOT selected): composite types are never re-registered at restart (pg_type rows survive). Field selection fails, new columns become text, DROP TYPE says "does not exist".
-- Next step: S9 due-check. Then j4 item (3): `(s).total` on a composite SQL-function parameter errors "applied to type unknown". Find the SQL-function parameter binding of a composite arg (grep "applied to type" in internal/executor). Then the typed-table `WITH OPTIONS` duplicate (transformOfType, 42701).
-- Top-residual: M0148 residues. Open children: j4 (items 3-5), c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - The planner's ParamRef has no type field. Declared types reach it only through the catalog-wrapper carrier, the same pattern as currentTempOwner.
+  - compositeTypeFields deliberately excludes views (tbl.View == nil).
+  - `(param).*` as a function argument = IndirectionStar, unsupported. Ledger row.
+- Next step: S9 due-check. Then j4 item (3b): CREATE TABLE … OF t (col WITH OPTIONS …) repeating a column must raise 42701 (PG transformOfType / transformTableLikeClause: "column \"%s\" specified more than once"). Find the OfType branch near operators_ddl.go execCreateTable (s.OfType).
+- Top-residual: M0148 residues. Open children: j4 (3b, 4, 5), c3a, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261111b exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261111c exhausted); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26); action-items 0. M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148.
-- Gates run (staged code_tree for 9de6fc9a8):
-  - PASS: units, TestPort_RegressSuite + PgDump (345 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH.
-  - Regress 19 suites neutral.
-  - Fire-set not required (outside its scope).
-- In-flight: none. Probe server 5533 stopped. tmp/j4b-data is scratch.
+- Gates run (staged code_tree for 608929548):
+  - PASS: units, TestPort_RegressSuite + PgDump (347 s), tpch-spotcheck, sf025 99/99, acceptance 24 MATCH, fire-set j4cfs fires=none ×3.
+  - Regress (32 suites): rangefuncs −21, rowtypes −1, updatable_views −1; the rest variance only.
+- In-flight: none. Scratch server 5533 stopped. tmp/wt-head worktree removed.

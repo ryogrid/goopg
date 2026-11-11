@@ -11957,9 +11957,19 @@ Movement: yes — regress privileges 3925→3781 (create\_operator 243→196, al
     spotcheck, sf025 99/99, acceptance 24 MATCH.
     - Found P0-E26: composite types are not re-registered at restart, so their
       OIDs fall back after a restart (filed S2, escalated).
-  - Next: item (3) `(s).total` on a composite SQL-function parameter
-    ("applied to type unknown"), then the typed-table WITH OPTIONS duplicate
-    (transformOfType 42701).
+  - Item (3a) LANDED (2026-11-11, 608929548): `(s).f`, `($1).f`, `s.f`,
+    `fn.s` over composite SQL-function parameters (typed Params through
+    SearchPathCatalog.ParamTypes, the sql\_fn\_parser\_setup analogue) and
+    PL/pgSQL `(v).f`. Regress rangefuncs 2289→2268, rowtypes −1,
+    updatable\_views −1. Gates units, RegressSuite+PgDump, spotcheck, sf025
+    99/99, acceptance 24 MATCH, fire-set fires=none ×3.
+    - Remaining (ledger): column-over-parameter precedence not modelled by
+      the text rewrite; a view row type is not a composite for
+      compositeTypeFields (rw\_view1\_aa); `(param).*` as a function
+      argument (IndirectionStar, rowtypes fcompos3).
+  - Next: item (3b) the typed-table `CREATE TABLE … OF t (col WITH OPTIONS
+    …)` repeated column (transformOfType 42701), then (4) grouping sets
+    hashing an ordered aggregate, (5) view `_RETURN` type dependency.
 - [x] **M0148-0001c3 — searched index paths take a NullTest as an index
   qual; NullTest-proven partial indexes; unanalysed partial-index size**.
   Kind: impl
