@@ -4572,6 +4572,9 @@ func NewInMemory() *InMemory {
 		extensions:         make(map[string]*extensionRow),
 		tablespaces:        make(map[string]*tablespaceRow),
 	}
+	// One OID counter for routines, relations and types (GetNewObjectId).
+	// M0148-0001j4.
+	c.routines.shareOIDCounter(c.AllocOID, c.AdvanceNextOIDPast)
 	c.registerSystemTables()
 	return c
 }
