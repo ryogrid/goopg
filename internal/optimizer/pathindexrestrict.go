@@ -766,7 +766,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	}
 	cost := costIndexScan(s.cp, in)
 	tgt, tgtKnown := scanPathTarget(rel)
-	addPath(rel, &Path{
+	fwd := &Path{
 		Kind:          PathIndexScan,
 		Rel:           rel,
 		ParallelSafe:  rel.ParallelSafeForPath(),
@@ -783,7 +783,18 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		TargetKnown:   tgtKnown,
 		// M0146-0005dg: clause i probes Columns[skip+i].
 		IndexSkipPrefix: skip,
-	}, "index.restrict")
+	}
+	addPath(rel, fwd, "index.restrict")
+	// M0148-0001c3a3: build_index_paths step 5, the backward twin, when the
+	// reversed order is useful. Not for a ScalarArrayOp or skip probe: the
+	// executor walks only the plain probe path backward.
+	if len(keys) > 0 && !isSAOP && skip == 0 {
+		if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+			back := *fwd
+			back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+			addPath(rel, &back, "index.restrict.backward")
+		}
+	}
 	return true
 }
 

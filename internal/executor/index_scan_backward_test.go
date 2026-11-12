@@ -124,3 +124,83 @@ func runIndexScanRows(t *testing.T, ctx *Context, q string, backward bool) []str
 	}
 	return out
 }
+
+// TestBackwardIndexPathsPlanned pins M0148-0001c3a3 slice 3: the planner
+// offers the backward twin of an ordered index path (build_index_paths step
+// 5) when the reversed order is useful, so ORDER BY … DESC — alone, behind
+// a restriction, or under a LIMIT — plans as PG 18.3's `Index Scan Backward`
+// with no Sort, and returns the same rows as the sorted twin.
+func TestBackwardIndexPathsPlanned(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE t1 (unique1 int NOT NULL, unique2 int NOT NULL, hundred int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL, stringu1 name)")
+	runSQL(t, ctx, "INSERT INTO t1 SELECT g, (g*7919)%10000, g%100, g%1000, g, 'S'||(g%500) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX t1_u1 ON t1 (unique1)")
+	runSQL(t, ctx, "CREATE INDEX t1_u2 ON t1 (unique2)")
+	runSQL(t, ctx, "CREATE INDEX t1_tt ON t1 (thousand, tenthous)")
+	runSQL(t, ctx, "ANALYZE t1")
+	for _, c := range []struct {
+		q, twin string
+		want    []string
+	}{
+		{"SELECT unique1, unique2 FROM t1 WHERE unique1 < 20 ORDER BY unique1 DESC",
+			"SELECT unique1, unique2 FROM t1 WHERE unique1 + 0 < 20 ORDER BY unique1 + 0 DESC",
+			[]string{"Index Scan Backward using t1_u1 on t1", "  Index Cond: (unique1 < 20)"}},
+		{"SELECT unique1, unique2 FROM t1 ORDER BY unique2 DESC LIMIT 5",
+			"SELECT unique1, unique2 FROM t1 ORDER BY unique2 + 0 DESC LIMIT 5",
+			[]string{"Limit", "  ->  Index Scan Backward using t1_u2 on t1"}},
+		{"SELECT thousand, tenthous FROM t1 WHERE thousand = 42 ORDER BY thousand DESC, tenthous DESC",
+			"SELECT thousand, tenthous FROM t1 WHERE thousand + 0 = 42 ORDER BY tenthous + 0 DESC",
+			// The backward path exists but loses to PG's own choice.
+			[]string{"Sort", "  Sort Key: tenthous DESC", "  ->  Bitmap Heap Scan on t1", "        Recheck Cond: (thousand = 42)",
+				"        ->  Bitmap Index Scan on t1_tt", "              Index Cond: (thousand = 42)"}},
+	} {
+		got := runExplainRows(t, ctx, "EXPLAIN (COSTS OFF) "+c.q)
+		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, strings.Join(got, "\n"), strings.Join(c.want, "\n"))
+		}
+		gotRows, wantRows := orderedRowStrings(t, ctx, c.q), orderedRowStrings(t, ctx, c.twin)
+		if strings.Join(gotRows, "|") != strings.Join(wantRows, "|") || len(wantRows) == 0 {
+			t.Errorf("%s: rows %v, want %v", c.q, gotRows, wantRows)
+		}
+	}
+}
+
+// orderedRowStrings runs q and returns its rows in output order.
+func orderedRowStrings(t *testing.T, ctx *Context, q string) []string {
+	t.Helper()
+	stmts, err := parser.Parse(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanceStmtCounter(ctx)
+	plan, err := optimizer.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer op.Close()
+	var out []string
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := slot.Row()
+		cells := make([]string, len(r))
+		for i, d := range r {
+			cells[i] = fmt.Sprint(d.Int)
+		}
+		out = append(out, strings.Join(cells, ","))
+		slot.Release()
+	}
+}

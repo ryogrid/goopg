@@ -263,13 +263,17 @@ func TestCreateIndexScanPlanPanics(t *testing.T) {
 			}(),
 			want: "names no index",
 		},
-		"backward direction": {
+		// M0148-0001c3a3: a plain backward path is lowered (IndexScan.Backward);
+		// one with a probe shape the executor cannot walk backward is a
+		// producer bug.
+		"backward skip probe": {
 			path: func() *Path {
 				p := cpiPath(&SeqScan{Table: tbl}, idx2, two, relsetOf(1))
 				p.IndexScanDir = BackwardScanDirection
+				p.IndexSkipPrefix = 1
 				return p
 			}(),
-			want: "no direction",
+			want: "index-only, skip or ScalarArrayOp",
 		},
 		// The dangerous one: empty means FULL SCAN, so building a
 		// parameterised path from it would turn a costed point probe into a

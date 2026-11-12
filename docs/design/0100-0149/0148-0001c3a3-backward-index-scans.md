@@ -1,6 +1,6 @@
 # M0148\-0001c3a3 — Backward ordered index scans
 
-**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); slice 2 landed 2026\-11\-12 \(executor `IndexScan.Backward` \+ EXPLAIN label\); planner slice open
+**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); slice 2 landed 2026\-11\-12 \(executor `IndexScan.Backward` \+ EXPLAIN label\); slice 3 landed 2026\-11\-12 \(planner backward paths\); Index Only Scan Backward open
 
 ## Problem
 
@@ -89,6 +89,43 @@ goopg could not produce one at any layer:
     NULL\-group stop.
 - **No caller yet:** no producer sets `Backward`, so no plan changed.
   sf025 99/99, fire\-set fires=none, acceptance 24 MATCH.
+
+## Slice 3 — planner backward paths
+
+- **Producers:** `usefulBackwardIndexPathkeys` is build\_index\_paths step 5,
+  "if the index is ordered, a backwards scan might be interesting". It builds
+  the index's pathkeys for BackwardScanDirection \(`indexPathOrdering(…,
+  true)`\) and truncates them to what the query can use
+  \(`truncateUselessPathkeys` over `pathkeyUsefulnessFor(rel.Relids)`: query
+  ordering, grouping, distinct and merge keys\). Empty means no path, as in
+  PG.
+  - The ordered \(full\-scan\) producer and the restriction producer add the
+    twin of their forward path with those keys and `BackwardScanDirection`,
+    at the same cost, since cost\_index prices both directions alike.
+  - Not for SAOP or skip probes, and no partial twin, because the executor
+    walks only the plain probe path backward.
+- **Lowering:** `createIndexScanPlan` sets `IndexScan.Backward` instead of
+  panicking. A backward index\-only, skip or SAOP path is still a producer
+  bug and panics.
+- **IOS promotion:** `tryPromoteIndexOnlyScan` declines a backward IndexScan.
+  `IndexOnlyScan.Backward` is the S6 max rewrite's materialised reverse, not
+  a reverse walk.
+- **Verification:**
+  - Probe against PG 18.3: 6 statements identical, plans and values —
+    `Index Scan Backward` under ORDER BY DESC, behind a restriction, and
+    under a LIMIT.
+  - `TestBackwardIndexPathsPlanned` pins three of PG's plans with rows equal
+    to a sorted twin's.
+  - Two producer tests updated:
+    - a merge clause now yields both directions of a DESC index, as PG's
+      pathkeys\_useful\_for\_merging is direction\-blind;
+    - the createplan panic case is now a backward skip probe.
+  - Regress btree\_index 499→457, create\_index 3159→3143; no spurious
+    backward plan anywhere.
+  - Of the 24 PG `… Backward` lines still missing, 15 are `Index Only Scan
+    Backward`.
+  - sf025 99/99; fire\-set fires=none on sf025, sf1 and TPC\-H; acceptance
+    24 MATCH.
 
 ## Next slices
 

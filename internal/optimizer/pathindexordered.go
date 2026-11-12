@@ -272,6 +272,16 @@ func (s *searchCtx) addOneOrderedIndexPath(rel *RelOptInfo, tbl *catalog.Table, 
 		TargetKnown:   tgtKnown,
 	}
 	addPath(rel, serial, "index.ordered")
+	// M0148-0001c3a3: build_index_paths step 5 — the backward scan of the
+	// same index, when its reversed pathkeys are useful (ORDER BY … DESC, a
+	// merge key in the other direction). Same cost: cost_index prices both
+	// directions alike. No partial twin: the executor has no parallel
+	// backward scan yet.
+	if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+		back := *serial
+		back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+		addPath(rel, &back, "index.ordered.backward")
+	}
 
 	// C-19c: the PARTIAL twin — build_index_paths' "if (index->amcanparallel
 	// && rel->consider_parallel && outer_relids == NULL && scantype !=
@@ -482,4 +492,20 @@ func leadingKeyStats(idx *catalog.Index, tbl *catalog.Table) *catalog.ColumnStat
 		return nil
 	}
 	return columnStatsByName(tbl, idx.Columns[0])
+}
+
+// usefulBackwardIndexPathkeys is build_index_paths' backward arm
+// (indxpath.c, "5. If the index is ordered, a backwards scan might be
+// interesting"): the index's pathkeys built for BackwardScanDirection,
+// truncated to what the query can use (truncate_useless_pathkeys); empty when
+// the reversed order serves nothing, in which case PG builds no backward path.
+func (s *searchCtx) usefulBackwardIndexPathkeys(rel *RelOptInfo, idx *catalog.Index, colExprs map[string]Expr) []PathKey {
+	if !indexIsOrderable(idx) || len(colExprs) == 0 {
+		return nil
+	}
+	keys, _ := indexPathOrdering(idx, colExprs, true)
+	if len(keys) == 0 {
+		return nil
+	}
+	return truncateUselessPathkeys(s.pathkeyUsefulnessFor(rel.Relids), keys)
 }

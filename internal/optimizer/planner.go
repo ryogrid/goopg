@@ -19447,6 +19447,12 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if idxScan.SkipPrefix > 0 {
 		return proj
 	}
+	// M0148-0001c3a3: likewise a backward scan. IndexOnlyScan.Backward is
+	// the S6 max rewrite's materialised reverse, not a reverse leaf walk;
+	// promoting would trade a lazy backward scan for a full materialisation.
+	if idxScan.Backward {
+		return proj
+	}
 	// M0134-0001 S4 (class 8): an EXCLUSIVE bound used to block promotion,
 	// because indexOnlyScanOp called the inclusive RangeScan and copied no
 	// LowOp/HighOp, so with the part-5 Filter drop the boundary value leaked

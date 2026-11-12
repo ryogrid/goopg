@@ -330,8 +330,15 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexInfo == nil {
 		panic(fmt.Sprintf("createPlan: PathIndexScan over relset %#08x names no index", uint32(p.Rel.Relids)))
 	}
-	if p.IndexScanDir != ForwardScanDirection {
-		panic(fmt.Sprintf("createPlan: PathIndexScan with %s; goopg's *IndexScan has no direction to set", p.IndexScanDir))
+	backward := p.IndexScanDir == BackwardScanDirection
+	if p.IndexScanDir != ForwardScanDirection && !backward {
+		panic(fmt.Sprintf("createPlan: PathIndexScan with %s", p.IndexScanDir))
+	}
+	if backward && (p.IndexOnly || p.IndexSkipPrefix > 0 || (len(p.IndexClauses) > 0 && len(p.IndexClauses[0].saop) > 0)) {
+		// M0148-0001c3a3: the executor walks backward only the plain
+		// probe path (indexScanOp, nbtree.ReverseScanCursor); the
+		// producers emit nothing else backward.
+		panic(fmt.Sprintf("createPlan: backward PathIndexScan on %s with an index-only, skip or ScalarArrayOp probe", p.IndexInfo.Name))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
 	// so it builds a different node with a NARROWER schema. It carries either
@@ -543,6 +550,8 @@ func createIndexScanPlan(p *Path) Node {
 	is := &IndexScan{
 		pos:   id.pos,
 		Table: id.table,
+		// M0148-0001c3a3: the path's scan direction.
+		Backward: p.IndexScanDir == BackwardScanDirection,
 		// The alias, the schema and the small-dimension answer are the leaf's,
 		// not re-derived — see the file header for what each one's loss costs.
 		Alias:      id.alias,
@@ -650,6 +659,7 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 		Alias:                 id.alias,
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
+		Backward:              p.IndexScanDir == BackwardScanDirection,
 		schema:                id.schema,
 		SmallDim:              id.smallDim,
 		UniqueKeys:            id.uniqueKeys,
