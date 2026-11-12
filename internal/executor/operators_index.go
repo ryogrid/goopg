@@ -314,6 +314,7 @@ type indexScanOp struct {
 	// first of those three). `isFullKeyProbe` is stashed for that
 	// deferred call; `ssiDone` makes it once-only.
 	cur            *nbtree.ScanCursor
+	rcur           *nbtree.ReverseScanCursor // IndexScan.Backward's cursor (M0148-0001c3a3); one of cur/rcur is live
 	scanDone       bool
 	sawTID         bool
 	isFullKeyProbe bool
@@ -491,6 +492,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.idx = 0
 	o.hasLast = false
 	o.cur = nil
+	o.rcur = nil
 	o.scanDone = true
 	o.sawTID = false
 	o.isFullKeyProbe = false
@@ -572,6 +574,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.idx = 0
 	o.hasLast = false
 	o.cur = nil
+	o.rcur = nil
 	o.scanDone = true
 	o.sawTID = false
 	o.ssiDone = false
@@ -612,6 +615,12 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// the SAOP arm on purpose: a plan carrying both shapes is a planner bug,
 	// and rescanSkip's shape check is what reports it rather than silently
 	// running the SAOP half.
+	if o.plan.Backward && (o.plan.SkipPrefix > 0 || len(o.plan.SAOPKeys) > 0 || o.pidx != nil) {
+		// PG runs these backward too (array keys and skip arrays in reverse,
+		// a parallel scan's backward seize); goopg's planner does not
+		// produce them yet, so one reaching here is a planner bug.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "backward index scan with a ScalarArrayOp, skip or parallel probe is not supported"}
+	}
 	if o.plan.SkipPrefix > 0 {
 		return o.rescanSkip()
 	}
@@ -728,13 +737,24 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// The cursor is re-aimed, not reallocated, per rescan (M0122-0012 slice
 	// 80): PG's btrescan reuses the scan's one BTScanOpaque, and a
 	// parameterised inner index scan rescans once per outer row.
-	if o.curSpare == nil {
-		o.curSpare = new(nbtree.ScanCursor)
+	if o.plan.Backward {
+		// M0148-0001c3a3: the same bounds, walked from the high end down
+		// (nbtree.ReverseScanCursor, _bt_lock_and_validate_left's
+		// concurrent-split recovery on every left step).
+		rcur, rerr := o.tree.NewReverseScanCursor(loBytes, hiBytes, loExcl, hiExcl)
+		if rerr != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: rerr.Error()}
+		}
+		o.cur, o.rcur = nil, rcur
+	} else {
+		if o.curSpare == nil {
+			o.curSpare = new(nbtree.ScanCursor)
+		}
+		if err := o.tree.ResetScanCursor(o.curSpare, loBytes, hiBytes, loExcl, hiExcl, leafFilter); err != nil {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		o.cur, o.rcur = o.curSpare, nil
 	}
-	if err := o.tree.ResetScanCursor(o.curSpare, loBytes, hiBytes, loExcl, hiExcl, leafFilter); err != nil {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
-	}
-	o.cur = o.curSpare
 	o.scanDone = false
 	if o.hashBucketScan {
 		if len(o.hashProbeFingerprint) > 0 {
@@ -1096,6 +1116,24 @@ func (o *indexScanOp) nextLeafBatch() (more bool, err error) {
 			}
 		}
 	}
+	for o.rcur != nil {
+		// M0148-0001c3a3: a backward scan reads one leaf per batch, its
+		// entries already in descending order.
+		o.tids = o.tids[:0]
+		o.poss = o.poss[:0]
+		o.idx = 0
+		ok, cerr := o.rcur.Next(o.scanAppendEntry)
+		if cerr != nil {
+			return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: cerr.Error()}
+		}
+		if !ok {
+			o.rcur = nil
+			return false, nil
+		}
+		if len(o.tids) > 0 {
+			return true, nil
+		}
+	}
 	for {
 		if o.cur == nil {
 			// Skip-scan (M0146-0005v): the active cursor is exhausted (or
@@ -1383,6 +1421,7 @@ func (o *indexScanOp) Close() error {
 	o.poss = o.poss[:0]
 	o.killList = nil
 	o.cur = nil
+	o.rcur = nil
 	o.saopBounds = nil
 	o.saopSeen = nil
 	o.skip.reset(true)

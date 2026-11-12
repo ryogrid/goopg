@@ -1,6 +1,6 @@
 # M0148\-0001c3a3 — Backward ordered index scans
 
-**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); executor, planner and EXPLAIN slices open
+**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); slice 2 landed 2026\-11\-12 \(executor `IndexScan.Backward` \+ EXPLAIN label\); planner slice open
 
 ## Problem
 
@@ -67,6 +67,28 @@ goopg could not produce one at any layer:
   `reverseScanLeftRecoveries` must show the recovery path ran. With the
   validation replaced by a naive left step, the test loses keys \(key 10200
   delivered 0 times\).
+
+## Slice 2 — executor \(`IndexScan.Backward`\)
+
+- **`IndexScan.Backward` \(plan.go\):** `indexScanOp`'s main probe path —
+  equality, equality prefix, range, NullTest — computes its bounds exactly as
+  forward. It then opens `tree.NewReverseScanCursor(lo, hi, loExcl, hiExcl)`
+  instead of `ResetScanCursor`. `nextLeafBatch` pulls one leaf per batch
+  from it; the entries are already descending.
+- **Refused for now:** SAOP, skip\-scan and parallel \(leaf\-filtered\)
+  backward scans return an `XX000` planner\-bug error. PG runs all three
+  backward, but no goopg producer emits them yet \(ledgered\).
+- **EXPLAIN:** prints `Index Scan Backward using …` \(`indexScanDirection`,
+  ExplainIndexScanDetails\).
+- **`TestIndexScanBackward`:** for each probe shape, a forward plan from the
+  planner, flipped by hand, must return exactly the forward rows reversed.
+  - The shapes are a leading range in each direction, a closed range, an
+    equality prefix with duplicates, prefix plus bound, a DESC index and an
+    equality.
+  - Each runs with and without NULL\-keyed entries; the open ends meet the
+    NULL\-group stop.
+- **No caller yet:** no producer sets `Backward`, so no plan changed.
+  sf025 99/99, fire\-set fires=none, acceptance 24 MATCH.
 
 ## Next slices
 

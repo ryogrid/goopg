@@ -1027,6 +1027,13 @@ type IndexScan struct {
 	// IndexCondOrder is the range column's clauses in restriction-list
 	// order (IndexCondItem).
 	IndexCondOrder []IndexCondItem
+	// Backward walks the index from its high end down — PG's
+	// BackwardScanDirection IndexScan (`Index Scan Backward`), the rows in
+	// the reverse of the index order (M0148-0001c3a3). The probe's bounds
+	// are the forward scan's; nbtree.ReverseScanCursor walks them right to
+	// left. Never set together with SAOPKeys or SkipPrefix, nor on a
+	// parallel-aware scan (not yet supported; the executor refuses them).
+	Backward bool
 	// Cond is a residual filter evaluated per HEAP TUPLE the probe returns —
 	// PostgreSQL's `Filter:` line on an Index Scan node, which sits alongside
 	// `Index Cond:` rather than in a separate node. Its ColumnRefs are in the
