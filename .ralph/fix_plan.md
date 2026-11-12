@@ -12333,6 +12333,22 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Then IndexScan/IOS direction fields + executor reverse batches.
     - Then producers emitting BackwardScanDirection paths, and EXPLAIN
       ` Backward`.
+  - 2026-11-12 slice 1 LANDED (e527d5ad2): nbtree ReverseScanCursor.
+    - A backward range scan, one leaf at a time.
+    - lockAndValidateLeft ports \_bt\_lock\_and\_validate\_left, with an
+      unbounded walk-right fallback where PG errors.
+    - The concurrent-split test proves the recovery: a naive left step loses
+      keys. Design docs/design/0100-0149/0148-0001c3a3-backward-index-scans.md.
+  - Resume: slice 2 (executor).
+    - IndexScan.Backward + indexScanOp reverse leaf batches from
+      ReverseScanCursor (range and equality-prefix probes via
+      indexRangeBounds).
+    - IndexOnlyScan.Backward currently means the S6 max-rewrite reverse;
+      reconcile it.
+    - Then slice 3 (producers via indexPathOrdering backward=true, and
+      createIndexScanPlan stops panicking).
+    - Then EXPLAIN ` Backward` + regress A/B.
+  Movement: none — access-method slice, no caller yet
 - [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
   behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
   useful\_predicate, join OR bitmap paths, bitmap node cost line**.
