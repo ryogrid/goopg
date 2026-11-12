@@ -520,8 +520,11 @@ func createIndexScanPlan(p *Path) Node {
 	// fills, which the executor and EXPLAIN already read.
 	// M0145-0029 slice 4: a ScalarArrayOp path — one clause on the leading
 	// column, lowered onto SAOPKeys (the executor's multi-descent arm).
-	if len(p.IndexClauses) >= 1 && len(p.IndexClauses[0].saop) > 0 {
-		return createSAOPIndexScanPlan(p, id, rewrap)
+	// M0148-0001c3a4 (b): the array may follow an equality prefix.
+	for _, ic := range p.IndexClauses {
+		if len(ic.saop) > 0 {
+			return createSAOPIndexScanPlan(p, id, rewrap)
+		}
 	}
 	if hasRangeClause(p.IndexClauses) {
 		return createRangeIndexScanPlan(p, id, rewrap)
@@ -747,25 +750,42 @@ func createRangeIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) 
 // (restrictionLeadingSAOP) onto IndexScan.SAOPKeys — exclusive of every other
 // probe shape, as the executor requires.
 func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) Node {
-	c := p.IndexClauses[0]
-	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != 0 || c.key != nil || c.op != parser.OpUnknown {
-		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be one leading-column clause on a plain unparameterised scan", p.IndexInfo.Name))
+	// M0148-0001c3a4 (b): an equality prefix may come first; the array then
+	// binds Columns[len(prefix)] and the bounds the column after it.
+	np := 0
+	for np < len(p.IndexClauses) && len(p.IndexClauses[np].saop) == 0 {
+		np++
 	}
-	var low, high Expr
-	var lowOp, highOp parser.OpCode
+	if np >= len(p.IndexClauses) {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s carries no ScalarArrayOp clause", p.IndexInfo.Name))
+	}
+	c := p.IndexClauses[np]
+	if p.IndexOnly || p.RequiredOuter != 0 || c.indexCol != np || c.key != nil || c.op != parser.OpUnknown {
+		panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s must be an equality prefix and one ScalarArrayOp clause on a plain unparameterised scan", p.IndexInfo.Name))
+	}
 	drop := map[Expr]bool{}
+	var prefix []Expr
+	for i, e := range p.IndexClauses[:np] {
+		if e.indexCol != i || e.key == nil || e.op != parser.OpUnknown || e.nullTest != IndexNullTestNone || e.local == nil {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: prefix clause %d is not a local equality on column %d", p.IndexInfo.Name, i, i))
+		}
+		prefix = append(prefix, e.key)
+		drop[e.local] = true
+	}
 	if c.local != nil {
 		drop[c.local] = true
 	}
-	for i, r := range p.IndexClauses[1:] {
-		// Bounds on the second column (restrictionRangeBehindPrefix(…, 1,
-		// …)): exact index quals since M0148-0001c3a4 (c), so a bound's
-		// own conjunct leaves the Filter.
+	var low, high Expr
+	var lowOp, highOp parser.OpCode
+	for i, r := range p.IndexClauses[np+1:] {
+		// Bounds on the column after the array (restrictionRangeBehindPrefix):
+		// exact index quals since M0148-0001c3a4 (c), so a bound's own
+		// conjunct leaves the Filter.
 		if r.local != nil {
 			drop[r.local] = true
 		}
-		if r.indexCol != 1 || r.key == nil || len(r.saop) > 0 {
-			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
+		if r.indexCol != np+1 || r.key == nil || len(r.saop) > 0 {
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a bound on the column after the array", p.IndexInfo.Name, np+1+i))
 		}
 		switch r.op {
 		case parser.OpGt, parser.OpGe:
@@ -779,7 +799,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 			}
 			high, highOp = r.key, r.op
 		default:
-			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, i+1))
+			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, np+1+i))
 		}
 	}
 	is := &IndexScan{
@@ -789,6 +809,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
 		SAOPKeys:              append([]Expr(nil), c.saop...),
+		RangePrefix:           prefix,
 		LowKey:                low,
 		LowOp:                 lowOp,
 		HighKey:               high,

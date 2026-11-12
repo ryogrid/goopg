@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** item \(c\) landed 2026\-11\-12; items \(a\), \(b\), \(d\)–\(g\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(c\) and \(b\) landed 2026\-11\-12; items \(a\), \(d\)–\(h\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -11,7 +11,8 @@ are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
 - \(d\) sub\-ORs inside AND arms;
 - \(e\) useful\\\_predicate arms;
 - \(f\) join OR bitmap paths;
-- \(g\) the bitmap node cost line.
+- \(g\) the bitmap node cost line;
+- \(h\) index\-only SAOP scans, and the bitmap SAOP carrier with bounds.
 
 ## Item \(c\) — a bound behind a leading ScalarArrayOp is an exact index qual
 
@@ -94,3 +95,75 @@ redundant for distinct elements but kept for safety.
   so the plain Index Scan stands in.
 - **Bitmap SAOP:** the bitmap SAOP carrier still takes no bound.
 - **Backward and parallel SAOP scans** are still refused.
+
+## Item \(b\) — an array behind an equality prefix
+
+PG plans `thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42)`
+\(or `tenthous IN (…)`\) on `(thousand, tenthous)` as a plain
+`Index Scan` with `Index Cond: ((thousand = 42) AND (tenthous = ANY
+('{1,3,42}'::integer[])))`. build\_index\_paths takes the second column's
+ScalarArrayOp clause behind the first column's equality. goopg's plain SAOP
+probe bound only the leading column, so the bitmap path won.
+
+### Change
+
+- **Plan shape:** `IndexScan.RangePrefix` \+ `SAOPKeys`. The array binds
+  `Columns[len(RangePrefix)]`, and LowKey/HighKey bound the column after it.
+  RangePrefix was chosen over a new field because every IndexScan
+  expression walker already visits it — subplan lowering, unnest, parallel
+  safety, deform, read sets and the NLI param quals.
+- **Producer \(`addOneRestrictionIndexPath`\):**
+  - With an equality prefix of n columns and no bound on column n, it looks
+    for an array on column n \(`restrictionSAOPOnColumn`, the leading\-column
+    builder generalised: an IN, `= ANY`, or an OR of equalities\).
+  - It also files bounds on column n\+1.
+  - Selectivity is the array's times the prefix equality's; one descent per
+    element.
+  - `plainRestrictionBindsOnlyPrefix` reports such an array, so the
+    index\-only producer, which has no SAOP probe, does not stand in for
+    the plain path.
+- **Lowering \(`createSAOPIndexScanPlan`\):** dispatched on any clause
+  carrying an array. It takes the prefix equalities into RangePrefix and
+  drops every consumed conjunct from the Filter.
+- **Executor \(`rescanSAOP`\):**
+  - Each element's probe key is the prefix's parts plus the element. A NULL
+    prefix value empties the scan.
+  - A bound goes through indexRangeBounds with prefix \+ element.
+  - The elements are still sorted and de\-duplicated in index order.
+- **EXPLAIN:** prints the prefix equalities, then the array, then the
+  bounds.
+- **`indexScanPredicate`** \(the DML fallback\) rebuilds the prefix
+  equalities before the IN. `lockRows` requires the prefix to be row\-local
+  too.
+
+### Verification
+
+- **Probe against PG 18.3:** 12 statements, plans and rows identical. They
+  cover OR and IN arrays, a duplicated array, a NULL element, a NULL
+  prefix, prefix \+ array \+ bound on `(thousand, tenthous, c)`, and DELETE
+  / UPDATE … RETURNING.
+  - One plan differs and predates this change: `thousand = 42 AND tenthous
+    IN (…) ORDER BY tenthous LIMIT 2` keeps a Sort.
+  - goopg's index pathkeys do not drop a leading column fixed by a constant
+    \(PG's pathkey\_is\_redundant\). Plain `thousand = 42 ORDER BY tenthous`
+    behaves the same way. This is M0148\-0001c3a5 \(d\).
+- **`TestSAOPBehindEqualityPrefix`:**
+  - covers both cluster capabilities;
+  - pins PG's two plans;
+  - compares rows with a `+ 0` twin under ORDER BY … LIMIT;
+  - checks that `indexScanPredicate` keeps the prefix equality. With the
+    prefix removed, that check fails.
+- **Regress:** create\_index 3137→3099 lines, with no new mismatch line.
+  join −5 is the Hash Right Join flap.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99 \(plan shapes identical\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Arrays elsewhere in the key:** goopg binds an array only on column
+  len\(prefix\). PG takes several arrays on several columns, and an array
+  ahead of further equalities \(`a IN (…) AND b = 1`\).
+- **DML:** DML plans a Seq Scan for these quals, so the rebuilt predicate is
+  defensive today.

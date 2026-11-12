@@ -3792,22 +3792,30 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 		return ""
 	}
 	// B-14 (P2-09a): ScalarArrayOp probe — PG renders
-	// `Index Cond: (col = ANY (...))`, and so does this.
-	if len(p.SAOPKeys) > 0 && len(p.Index.Columns) > 0 {
+	// `Index Cond: (col = ANY (...))`, and so does this. M0148-0001c3a4 (b):
+	// behind an equality prefix (RangePrefix) the array binds
+	// Columns[len(RangePrefix)], printed after the prefix's equalities
+	// (`((thousand = 42) AND (tenthous = ANY (…)))`).
+	if np := len(p.RangePrefix); len(p.SAOPKeys) > 0 && np < len(p.Index.Columns) {
+		var clauses []string
+		for i, k := range p.RangePrefix {
+			clauses = append(clauses, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+		}
 		parts := make([]string, 0, len(p.SAOPKeys))
 		for _, k := range p.SAOPKeys {
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
-		cond := prefix + p.Index.Columns[0] + " = ANY (" + strings.Join(parts, ", ") + ")"
+		arrCol := p.Index.Columns[np]
+		cond := prefix + arrCol + " = ANY (" + strings.Join(parts, ", ") + ")"
 		// M0146-0005ch: the same folded array Const the Filter-side
 		// formatInExprPG prints (sibling renderers of one SAOP).
 		if p.Table != nil {
 			for _, c := range p.Table.Columns {
-				if c.Name != p.Index.Columns[0] {
+				if c.Name != arrCol {
 					continue
 				}
 				if cast, lit, ok := inListArrayConst(c.Type, p.SAOPKeys); ok {
-					col := prefix + p.Index.Columns[0]
+					col := prefix + arrCol
 					if cast != "" {
 						col = "(" + col + ")::" + cast
 					}
@@ -3816,29 +3824,32 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 				break
 			}
 		}
-		// M0145-0029: bounds on the second column (PG
+		clauses = append(clauses, cond)
+		// M0145-0029: bounds on the column after the array (PG
 		// `Index Cond: ((a = ANY (...)) AND (b > 1))`).
-		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > 1 {
-			col := prefix + p.Index.Columns[1]
+		if (p.LowKey != nil || p.HighKey != nil) && len(p.Index.Columns) > np+1 {
+			col := prefix + p.Index.Columns[np+1]
 			if p.LowKey != nil {
 				op := ">="
 				if p.LowOp == parser.OpGt {
 					op = ">"
 				}
-				cond += ") AND (" + indexCondClause(col, op, p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
+				clauses = append(clauses, indexCondClause(col, op, p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, np+1)))
 			}
 			if p.HighKey != nil {
 				op := "<="
 				if p.HighOp == parser.OpLt {
 					op = "<"
 				}
-				cond += ") AND (" + indexCondClause(col, op, p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
+				clauses = append(clauses, indexCondClause(col, op, p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, np+1)))
 			}
-			// Each clause carries its own parens inside the AND list
-			// (make_ands_explicit), as the comment above shows.
-			return "((" + cond + "))"
 		}
-		return wrapParen(cond)
+		if len(clauses) == 1 {
+			return wrapParen(cond)
+		}
+		// Each clause carries its own parens inside the AND list
+		// (make_ands_explicit).
+		return "((" + strings.Join(clauses, ") AND (") + "))"
 	}
 	// M0145-0029 slice 2b: an equality prefix followed by bounds on the next
 	// column — PG's `Index Cond: ((a = 7) AND (b > 90))`, rendered in goopg's

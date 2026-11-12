@@ -983,7 +983,10 @@ type IndexScan struct {
 	// performs one point descent per element and unions the tids
 	// (B-14/P2-09a). Exactly one probe shape is ever set on a node
 	// (Key, Keys, LowKey/HighKey, or SAOPKeys); the executor checks SAOPKeys
-	// first. A node carrying SAOPKeys is never promoted to IndexOnlyScan
+	// first. With RangePrefix set the array binds Columns[len(RangePrefix)]
+	// behind that equality prefix, and LowKey/HighKey (if any) bound the
+	// column after the array (M0148-0001c3a4 (b)/(c)); the elements descend
+	// sorted and de-duplicated in index order. A node carrying SAOPKeys is never promoted to IndexOnlyScan
 	// (tryPromoteIndexOnlyScan declines: the IOS operator has no
 	// multi-descent) and DML falls back to its SeqScan+predicate path
 	// (updateViaIndex requires Key; indexScanPredicate rebuilds the IN
@@ -994,11 +997,11 @@ type IndexScan struct {
 	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
 	// [0, len(RangePrefix)) and moves LowKey/HighKey onto column
 	// len(RangePrefix) — PG's `a = 1 AND b > 5` probe on `(a, b)`
-	// (build_index_paths binds a range behind an equality prefix). Only ever
-	// set together with LowKey and/or HighKey, never with Key/Keys/SAOPKeys;
-	// the one producer (restriction paths, M0145-0029 slice 2b) keeps the
-	// range conjunct as a Filter recheck. A consumer that reinterprets
-	// LowKey/HighKey as leading-column bounds must refuse a node with it set.
+	// (build_index_paths binds a range behind an equality prefix). Set
+	// together with LowKey and/or HighKey, or with SAOPKeys (the array then
+	// binds column len(RangePrefix), M0148-0001c3a4 (b)); never with
+	// Key/Keys. A consumer that reinterprets LowKey/HighKey or SAOPKeys as
+	// leading-column quals must refuse a node with it set.
 	RangePrefix []Expr
 	// LowOp / HighOp preserve the ORIGINAL comparison operator in its canonical
 	// col-op-key form (see tryRangeIndexScan / flipRangeOp) for the low/high

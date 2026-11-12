@@ -271,8 +271,12 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 // lowering does not carry yet (ledgered); the plain path keeps those.
 func plainRestrictionBindsOnlyPrefix(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr, n int) bool {
 	if n > 0 {
+		// M0148-0001c3a4 (b): an array on column n is a clause the plain
+		// producer binds behind the prefix; the index-only lowering does not
+		// carry it yet (ledgered), so the plain path keeps it.
 		return n >= len(idx.Columns) || (len(restrictionRangeOnColumn(cat, tbl, idx, n, conjuncts)) == 0 &&
-			restrictionNullTestOnColumn(idx, n, conjuncts) == nil)
+			restrictionNullTestOnColumn(idx, n, conjuncts) == nil &&
+			(idx.DeclaredHash || len(restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts)) == 0))
 	}
 	if len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 || len(restrictionLeadingRange(cat, tbl, idx, conjuncts)) > 0 ||
 		restrictionLeadingNullTest(idx, conjuncts) != nil {

@@ -325,10 +325,17 @@ func conjunctPrecedes(a, b Expr, conjuncts []Expr) bool {
 // the union of the descents (the executor dedupes by TID), so it is recorded
 // in `local` and dropped from the Filter.
 func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, conjuncts []Expr) []indexPathClause {
-	if len(idx.Columns) == 0 {
+	return restrictionSAOPOnColumn(cat, tbl, idx, 0, conjuncts)
+}
+
+// restrictionSAOPOnColumn is restrictionLeadingSAOP on index column pos: the
+// array of a probe behind an equality prefix on the columns before it
+// (M0148-0001c3a4 (b), PG `((thousand = 42) AND (tenthous = ANY (…)))`).
+func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.Index, pos int, conjuncts []Expr) []indexPathClause {
+	if pos < 0 || pos >= len(idx.Columns) {
 		return nil
 	}
-	lead := idx.Columns[0]
+	lead := idx.Columns[pos]
 	for _, conj := range conjuncts {
 		in, ok := conj.(*InExpr)
 		if !ok || in.Subquery != nil || in.Plan != nil || len(in.List) == 0 {
@@ -358,7 +365,7 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 		if !usable {
 			continue
 		}
-		return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
+		return []indexPathClause{{indexCol: pos, saop: in.List, local: conj}}
 	}
 	// M0148-0001c3a2: an OR of equalities on the leading column is the same
 	// ScalarArrayOp probe (match_orclause_to_indexcol); the OR is its exact
@@ -369,7 +376,7 @@ func restrictionLeadingSAOP(cat catalog.Catalog, tbl *catalog.Table, idx *catalo
 			break
 		}
 		if in, ok := orEqualitySAOP(cat, tbl, lead, conj); ok {
-			return []indexPathClause{{indexCol: 0, saop: in.List, local: conj}}
+			return []indexPathClause{{indexCol: pos, saop: in.List, local: conj}}
 		}
 	}
 	return nil
@@ -648,6 +655,20 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		}
 	}
 	isSAOP := false
+	saopAt := 0
+	// M0148-0001c3a4 (b): no bound behind the equality prefix, but an array
+	// on the next column — build_index_paths takes the column's
+	// ScalarArrayOp clause behind the prefix's equalities, and the array may
+	// itself be followed by bounds on the column after it.
+	if n := len(clauses); n > 0 && n < len(idx.Columns) && !prefixRange && !idx.DeclaredHash {
+		if sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts); len(sa) > 0 {
+			clauses = append(clauses, sa...)
+			isSAOP, saopAt = true, n
+			if n+1 < len(idx.Columns) {
+				clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, n+1, conjuncts)...)
+			}
+		}
+	}
 	if len(clauses) == 0 {
 		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
 		isSAOP = len(clauses) > 0
@@ -704,11 +725,17 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 	case isSAOP:
 		// scalararraysel over the IN (clauseSelectivity's InExpr arm), and
 		// one descent per element (btcostestimate's num_sa_scans).
-		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[0]), rel.baseLeaf))
-		if len(clauses) > 1 {
-			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[1:]))
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[saopAt]), rel.baseLeaf))
+		if saopAt > 0 {
+			// The equality prefix's own selectivity (clauselist_selectivity
+			// multiplies the independent quals).
+			eqSel, _ := restrictionIndexSelectivity(tbl, idx, clauses[:saopAt], relTuples)
+			sel = clampSelectivity(sel * eqSel)
 		}
-		numSAScans = float64(len(clauses[0].saop))
+		if len(clauses) > saopAt+1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses[saopAt+1:]))
+		}
+		numSAScans = float64(len(clauses[saopAt].saop))
 	case isRange:
 		sel = rangeIndexSelectivity(rel.baseLeaf, conjuncts, clauses)
 	case prefixRange:

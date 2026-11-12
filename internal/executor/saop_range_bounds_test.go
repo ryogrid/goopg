@@ -6,6 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/optimizer"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestSAOPRangeBoundsExactAndElementOrder pins M0148-0001c3a4 (c) against
@@ -58,6 +59,99 @@ func TestSAOPRangeBoundsExactAndElementOrder(t *testing.T) {
 				}
 			}
 		}
+		cleanup()
+	}
+	catalog.SetNullKeyedIndexEntries(false)
+}
+
+// TestSAOPBehindEqualityPrefix pins M0148-0001c3a4 (b) against PG 18.3: an
+// array behind an equality prefix (`thousand = 42 AND (tenthous = 1 OR …)`,
+// or an IN) is a plain Index Scan with
+// `Index Cond: ((thousand = 42) AND (tenthous = ANY (…)))` — the prefix in
+// IndexScan.RangePrefix, the array on the next column — optionally bounded
+// on the column after it. Rows match a `+ 0` twin under ORDER BY … LIMIT,
+// and DML through indexScanPredicate's rebuilt qual touches only the probed
+// rows.
+func TestSAOPBehindEqualityPrefix(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		catalog.SetNullKeyedIndexEntries(capable)
+		ctx, cleanup := newVMFixture(t)
+		runSQL(t, ctx, "CREATE TABLE tk (unique1 int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL, c int, pad text)")
+		runSQL(t, ctx, "INSERT INTO tk SELECT g, g%1000, g, g%7, repeat('x', 100) FROM generate_series(0, 9999) g")
+		runSQL(t, ctx, "CREATE INDEX tk_tt ON tk (thousand, tenthous)")
+		runSQL(t, ctx, "VACUUM tk")
+		runSQL(t, ctx, "ANALYZE tk")
+		ps := optimizer.DefaultPlannerSettings()
+		plan := func(q string) string {
+			return strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n")
+		}
+		q := "SELECT * FROM tk WHERE thousand = 42 AND (tenthous = 1 OR tenthous = 3 OR tenthous = 42 OR tenthous = 0)"
+		if got, want := plan(q), "Index Scan using tk_tt on tk\n  Index Cond: ((thousand = 42) AND (tenthous = ANY ('{1,3,42,0}'::integer[])))"; got != want {
+			t.Errorf("capable=%v: plan\n%s\nwant (PG 18.3):\n%s", capable, got, want)
+		}
+		rowsEq := func(w string) {
+			t.Helper()
+			got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT unique1, tenthous FROM tk WHERE "+w+" ORDER BY tenthous LIMIT 3", ps)), ";")
+			tw := strings.NewReplacer("thousand =", "thousand + 0 =", "tenthous IN", "tenthous + 0 IN", "c >", "c + 0 >").Replace(w)
+			want := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT unique1, tenthous FROM tk WHERE "+tw+" ORDER BY tenthous LIMIT 3", ps)), ";")
+			if got != want || want == "" {
+				t.Errorf("capable=%v %s: rows %s, want %s", capable, w, got, want)
+			}
+		}
+		rowsEq("thousand = 42 AND tenthous IN (9042, 42, 1042, 42)")
+		rowsEq("thousand = 42 AND tenthous IN (9042, NULL, 1042)")
+		// indexScanPredicate (extractScan's DML fallback) must rebuild the
+		// prefix equality, or it would match `tenthous IN (…)` rows of every
+		// thousand. DML plans a Seq Scan today, so check the rebuilt qual
+		// directly on the planned IndexScan.
+		stmts, perr := parser.Parse("SELECT * FROM tk WHERE thousand = 43 AND tenthous IN (42, 1043)")
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		node, plerr := optimizer.PlanWithSettings(stmts[0], ctx.Catalog, ps)
+		if plerr != nil {
+			t.Fatal(plerr)
+		}
+		var ix *optimizer.IndexScan
+		for n := node; n != nil && ix == nil; {
+			switch x := n.(type) {
+			case *optimizer.IndexScan:
+				ix = x
+			case *optimizer.Project:
+				n = x.Child
+			case *optimizer.Filter:
+				n = x.Child
+			default:
+				n = nil
+			}
+		}
+		if ix == nil || len(ix.RangePrefix) != 1 || len(ix.SAOPKeys) != 2 {
+			t.Fatalf("capable=%v: want an IndexScan with RangePrefix + SAOPKeys, got %T:\n%s", capable, node, plan("SELECT * FROM tk WHERE thousand = 43 AND tenthous IN (42, 1043)"))
+		}
+		var prefixEq, in bool
+		optimizer.WalkExprTree(indexScanPredicate(ix), func(e optimizer.Expr) {
+			if b, ok := e.(*optimizer.BinaryOp); ok && b.Op == parser.OpEq {
+				if cr, ok := b.Left.(*optimizer.ColumnRef); ok && cr.Name == "thousand" {
+					prefixEq = true
+				}
+			}
+			if ie, ok := e.(*optimizer.InExpr); ok {
+				if cr, ok := ie.Operand.(*optimizer.ColumnRef); ok && cr.Name == "tenthous" {
+					in = true
+				}
+			}
+		})
+		if !prefixEq || !in {
+			t.Errorf("capable=%v: indexScanPredicate lost the prefix equality (%v) or the IN on tenthous (%v)", capable, prefixEq, in)
+		}
+		runSQL(t, ctx, "DROP INDEX tk_tt")
+		runSQL(t, ctx, "CREATE INDEX tk_ttc ON tk (thousand, tenthous, c)")
+		runSQL(t, ctx, "ANALYZE tk")
+		q = "SELECT * FROM tk WHERE thousand = 42 AND tenthous IN (42, 1042, 2042, 3042) AND c > 2"
+		if got, want := plan(q), "Index Scan using tk_ttc on tk\n  Index Cond: ((thousand = 42) AND (tenthous = ANY ('{42,1042,2042,3042}'::integer[])) AND (c > 2))"; got != want {
+			t.Errorf("capable=%v: plan\n%s\nwant (PG 18.3):\n%s", capable, got, want)
+		}
+		rowsEq("thousand = 42 AND tenthous IN (42, 1042, 2042, 3042) AND c > 2")
 		cleanup()
 	}
 	catalog.SetNullKeyedIndexEntries(false)

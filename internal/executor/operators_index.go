@@ -802,9 +802,33 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // its bucket-grain SIREAD on a hash index, and the gap lock is finalised
 // over the unioned TID set.
 func (o *indexScanOp) rescanSAOP() error {
-	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	// M0148-0001c3a4 (b): an equality prefix (RangePrefix) puts the array
+	// on Columns[len(RangePrefix)]; every element's probe key starts with
+	// the prefix's parts, as _bt_first's scan keys do.
+	np := len(o.plan.RangePrefix)
+	if np >= len(o.plan.Index.Columns) {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q: an equality prefix of %d keys leaves no array column", o.plan.Index.Name, np)}
+	}
+	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[np])
 	if !ok {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[np], o.plan.Table.Name)}
+	}
+	prefixParts := make([]indexProbeKeyPart, 0, np)
+	for i, pe := range o.plan.RangePrefix {
+		pcol, pfound := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
+		if !pfound {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[i], o.plan.Table.Name)}
+		}
+		pv, perr := evalExprSlot(pe, o.outerSlot, o.ctx)
+		if perr != nil {
+			return perr
+		}
+		if pv.IsNull() {
+			// `col = NULL` matches nothing.
+			o.finalizeIndexScanSSI()
+			return nil
+		}
+		prefixParts = append(prefixParts, indexProbeKeyPart{col: pcol, val: pv, pos: pe.Pos()})
 	}
 	// M0142-0005b: element keys are still evaluated and encoded eagerly at
 	// Rescan — preserving the pre-cursor eval timing and the eager
@@ -823,8 +847,8 @@ func (o *indexScanOp) rescanSAOP() error {
 	// swap and the NULL-group stop apply and the bounds are exact index
 	// quals (_bt_first per array element, nbtsearch.c).
 	bounded := o.plan.LowKey != nil || o.plan.HighKey != nil
-	if bounded && len(o.plan.Index.Columns) < 2 {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no second column", o.plan.Index.Name)}
+	if bounded && len(o.plan.Index.Columns) < np+2 {
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("SAOP probe on %q carries a bound but the index has no column after the array", o.plan.Index.Name)}
 	}
 	// M0148-0001c3a4: the elements descend in INDEX order, each once —
 	// _bt_preprocess_array_keys sorts the array with the column's ordering
@@ -845,7 +869,7 @@ func (o *indexScanOp) rescanSAOP() error {
 		if v.IsNull() {
 			continue
 		}
-		parts := []indexProbeKeyPart{{col: col, val: v, pos: ke.Pos()}}
+		parts := append(append(make([]indexProbeKeyPart, 0, np+1), prefixParts...), indexProbeKeyPart{col: col, val: v, pos: ke.Pos()})
 		key, encErr := o.ctx.indexProbeKey(o.plan.Index, parts)
 		if encErr != nil {
 			return encErr
@@ -866,13 +890,13 @@ func (o *indexScanOp) rescanSAOP() error {
 		ke, parts, key := el.ke, el.parts, el.key
 		o.hashProbeFingerprint = ssiHashProbeFingerprint(o.plan.Index, parts)
 		hiBytes := key
-		if len(o.plan.Index.Columns) > 1 {
+		if len(o.plan.Index.Columns) > np+1 {
 			hiBytes = o.ctx.compositeUpperBound(o.plan.Index, key)
 		}
 		loExcl, hiExcl := false, false
 		if bounded {
 			lo, hi, lx, hx, ok, berr := o.ctx.indexRangeBounds(indexRangeSpec{
-				table: o.plan.Table, index: o.plan.Index, prefix: []optimizer.Expr{ke},
+				table: o.plan.Table, index: o.plan.Index, prefix: append(append(make([]optimizer.Expr, 0, np+1), o.plan.RangePrefix...), ke),
 				low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp,
 				pos: o.plan.Pos(),
 			}, o.outerSlot)

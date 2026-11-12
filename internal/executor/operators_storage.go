@@ -3896,17 +3896,43 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		// declines this shape) still filters exactly the probed rows.
 		// The reconstructed InExpr carries ANY (OR) semantics by its
 		// zero value, matching the probe's union-of-descents.
-		col := ix.Index.Columns[0]
+		// M0148-0001c3a4 (b): an equality prefix (RangePrefix) puts the
+		// SAOP on Columns[len(RangePrefix)]; its equalities are rebuilt
+		// first, as the RangePrefix range arm below does, because the
+		// restriction path dropped them from the Filter.
+		np := len(ix.RangePrefix)
+		if np >= len(ix.Index.Columns) {
+			return nil
+		}
+		var combined optimizer.Expr
+		for i, key := range ix.RangePrefix {
+			pref, pok := indexScanColumnRef(ix, ix.Index.Columns[i])
+			if !pok {
+				return nil
+			}
+			eq := &optimizer.BinaryOp{Op: parser.OpEq, Left: pref, Right: key}
+			if combined == nil {
+				combined = eq
+			} else {
+				combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: eq}
+			}
+		}
+		col := ix.Index.Columns[np]
 		ref, ok := indexScanColumnRef(ix, col)
 		if !ok {
 			return nil
 		}
 		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
 		keys = append(keys, ix.SAOPKeys...)
-		var combined optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
-		// M0145-0029: a SAOP probe's bounds sit on the SECOND index column.
-		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > 1 {
-			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[1])
+		var in optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
+		if combined == nil {
+			combined = in
+		} else {
+			combined = &optimizer.BinaryOp{Op: parser.OpAnd, Left: combined, Right: in}
+		}
+		// M0145-0029: a SAOP probe's bounds sit on the index column after it.
+		if (ix.LowKey != nil || ix.HighKey != nil) && len(ix.Index.Columns) > np+1 {
+			ref2, ok2 := indexScanColumnRef(ix, ix.Index.Columns[np+1])
 			if !ok2 {
 				return nil
 			}
