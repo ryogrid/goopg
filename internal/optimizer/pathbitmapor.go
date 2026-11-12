@@ -53,11 +53,10 @@ func combineOr(arms []Expr) Expr {
 // one item to the implication test. A column counts only when an index that
 // takes ScalarArrayOp quals (amsearcharray: btree, not hash) has it as a key.
 //
-// ok is false when a group's operator is not equality: PG matches such a
-// group as `col < ANY (…)`, which goopg's bitmap probe cannot run yet, and
-// splitting it would build a BitmapOr PG does not (ledgered). The operand
-// type part of PG's key (opno, inputcollid) is approximated by the key's
-// literal kind (keyTypeTag).
+// An inequality group is matched as `col < ANY (…)` (orInequalitySAOP,
+// M0148-0001c3a4 (a)); ok is kept for the callers' contract and is always
+// true. The operand type part of PG's key (opno, inputcollid) is
+// approximated by the key's literal kind (keyTypeTag).
 func groupSimilarOrArgs(tbl *catalog.Table, indexes []*catalog.Index, arms []Expr) ([]Expr, bool) {
 	type armKey struct {
 		col, typ string
@@ -114,9 +113,9 @@ func groupSimilarOrArgs(tbl *catalog.Table, indexes []*catalog.Index, arms []Exp
 			out = append(out, arm)
 			continue
 		}
-		if keys[i].op != parser.OpEq {
-			return nil, false
-		}
+		// M0148-0001c3a4 (a): an inequality group is matched as
+		// `col < ANY (…)` (orInequalitySAOP) like an equality group as
+		// `col = ANY (…)`.
 		sub := combineOr(group).(*BinaryOp)
 		sub.Nested = true
 		out = append(out, sub)
@@ -168,6 +167,63 @@ func orEqualitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, con
 	return &InExpr{pos: conj.Pos(), Operand: cr, List: elems}, true
 }
 
+// orInequalitySAOP is match_orclause_to_indexcol's conversion for an OR whose
+// every arm is `col op const` with ONE inequality operator on the named
+// column (commuted to column-first: `43 > thousand` is `thousand < 43`) —
+// `thousand < ANY ('{42,99,43}')`, which nbtree runs as the range of the
+// extreme element (M0148-0001c3a4 (a)). The OR is the exact recheck.
+func orInequalitySAOP(cat catalog.Catalog, tbl *catalog.Table, colName string, conj Expr) (*InExpr, parser.OpCode, bool) {
+	bin, ok := conj.(*BinaryOp)
+	if !ok || bin.Op != parser.OpOr {
+		return nil, parser.OpUnknown, false
+	}
+	var cr *ColumnRef
+	var elems []Expr
+	op := parser.OpUnknown
+	for _, arm := range flattenExprOr(conj) {
+		ab, ok := arm.(*BinaryOp)
+		if !ok {
+			return nil, parser.OpUnknown, false
+		}
+		switch ab.Op {
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		default:
+			return nil, parser.OpUnknown, false
+		}
+		c, val, colOnRight, ok := normalizeColumnIndexKey(ab.Left, ab.Right)
+		if !ok || c.Index < 0 || c.Index >= len(tbl.Columns) || tbl.Columns[c.Index].Name != colName ||
+			!isConstExpr(val) || !restrictionKeyUsable(cat, tbl.Columns[c.Index], val) {
+			return nil, parser.OpUnknown, false
+		}
+		armOp := ab.Op
+		if colOnRight {
+			armOp = swapInequalityOp(armOp)
+		}
+		if op != parser.OpUnknown && armOp != op {
+			return nil, parser.OpUnknown, false
+		}
+		op, cr = armOp, c
+		elems = append(elems, val)
+	}
+	if len(elems) < 2 {
+		return nil, parser.OpUnknown, false
+	}
+	return &InExpr{pos: conj.Pos(), Operand: cr, List: elems, AnyOp: op}, op, true
+}
+
+// saopAnyInequality reports an explicit `col op ANY (list)` with an
+// inequality operator (`id1 >= ANY (array[1,5])`).
+func saopAnyInequality(in *InExpr) (parser.OpCode, bool) {
+	if in == nil || in.Negated || in.NotEqualAny || in.AllOp {
+		return parser.OpUnknown, false
+	}
+	switch in.AnyOp {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		return in.AnyOp, true
+	}
+	return parser.OpUnknown, false
+}
+
 // saopPricedClause is the clause a ScalarArrayOp index clause is priced by:
 // the IN conjunct itself, or for an OR of equalities the ScalarArrayOp it
 // was converted to (orEqualitySAOP).
@@ -196,8 +252,9 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 	colName := idx.Columns[pos]
 	for _, conj := range conjuncts {
 		if in, ok := conj.(*InExpr); ok {
+			ineqOp, ineq := saopAnyInequality(in)
 			if in.Subquery != nil || in.Plan != nil || len(in.List) == 0 || in.Negated || in.NotEqualAny || in.AllOp ||
-				(in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq) {
+				(in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq && !ineq) {
 				continue
 			}
 			cr, ok := in.Operand.(*ColumnRef)
@@ -215,12 +272,17 @@ func bitmapSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catalog.In
 				}
 			}
 			if usable {
-				return &indexPathClause{indexCol: pos, saop: in.List, local: conj}, conj
+				return &indexPathClause{indexCol: pos, saop: in.List, saopOp: ineqOp, local: conj}, conj
 			}
 			continue
 		}
 		if in, ok := orEqualitySAOP(cat, tbl, colName, conj); ok {
 			return &indexPathClause{indexCol: pos, saop: in.List, local: conj}, in
+		}
+		// M0148-0001c3a4 (a): an OR of one inequality on the column, priced
+		// as the OR itself (scalararraysel's useOr combination is the OR's).
+		if in, op, ok := orInequalitySAOP(cat, tbl, colName, conj); ok {
+			return &indexPathClause{indexCol: pos, saop: in.List, saopOp: op, local: conj}, conj
 		}
 	}
 	return nil, nil
@@ -642,7 +704,75 @@ func predicateImpliedBy(clause, predicate Expr) bool {
 			}
 			return false
 		default:
-			return exprEqual(clause, predicate) || provePartialIndexPredicate(predicate, clause)
+			return exprEqual(clause, predicate) || provePartialIndexPredicate(predicate, clause) ||
+				operatorPredicateProof(clause, predicate)
 		}
 	}
+}
+
+// operatorPredicateProof is the btree-inference core of predtest.c's
+// operator_predicate_proof for implication: clause `x op1 c1` implies
+// predicate `x op2 c2` on the same column with integer constants when the
+// strategy pair and the constants' comparison say so (BT_implic_table) —
+// `x < 1` implies `x < 3`, `x >= 5` implies `x > 4`. It is what lets PG drop
+// a restriction OR that a ScalarArrayOp recheck covers arm by arm
+// (`(u < 1) OR (u < 3)` ⇒ `u < 3`, M0148-0001c3a4 (a)). The rules hold
+// for any total order (no integer discreteness is assumed), and only
+// integer literal constants are compared, so the proof is sound by
+// construction.
+func operatorPredicateProof(clause, predicate Expr) bool {
+	cc, op1, c1, ok := intComparison(clause)
+	if !ok {
+		return false
+	}
+	pc, op2, c2, ok := intComparison(predicate)
+	if !ok || cc.Index != pc.Index || cc.Name != pc.Name {
+		return false
+	}
+	switch op2 {
+	case parser.OpLt:
+		return (op1 == parser.OpLt && c1 <= c2) || ((op1 == parser.OpLe || op1 == parser.OpEq) && c1 < c2)
+	case parser.OpLe:
+		return (op1 == parser.OpLt || op1 == parser.OpLe || op1 == parser.OpEq) && c1 <= c2
+	case parser.OpGt:
+		return (op1 == parser.OpGt && c1 >= c2) || ((op1 == parser.OpGe || op1 == parser.OpEq) && c1 > c2)
+	case parser.OpGe:
+		return (op1 == parser.OpGt || op1 == parser.OpGe || op1 == parser.OpEq) && c1 >= c2
+	case parser.OpEq:
+		return op1 == parser.OpEq && c1 == c2
+	}
+	return false
+}
+
+// intComparison reads `col op intconst` (either side), normalised to
+// column-first, for an integer-typed column — whose order is the
+// constants' numeric order (a text column compares `10` before `9`).
+func intComparison(e Expr) (*ColumnRef, parser.OpCode, int64, bool) {
+	b, ok := e.(*BinaryOp)
+	if !ok {
+		return nil, parser.OpUnknown, 0, false
+	}
+	switch b.Op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpEq:
+	default:
+		return nil, parser.OpUnknown, 0, false
+	}
+	intCol := func(cr *ColumnRef) bool {
+		switch cr.Type.Name {
+		case "int2", "int4", "int8", "smallint", "integer", "bigint", "int":
+			return !cr.Type.IsArray
+		}
+		return false
+	}
+	if cr, isCol := b.Left.(*ColumnRef); isCol && intCol(cr) {
+		if ic, isInt := b.Right.(*IntegerConst); isInt {
+			return cr, b.Op, ic.Value, true
+		}
+	}
+	if cr, isCol := b.Right.(*ColumnRef); isCol && intCol(cr) {
+		if ic, isInt := b.Left.(*IntegerConst); isInt {
+			return cr, swapInequalityOp(b.Op), ic.Value, true
+		}
+	}
+	return nil, parser.OpUnknown, 0, false
 }

@@ -3806,7 +3806,8 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 			parts = append(parts, formatIndexCondKey(k, reg))
 		}
 		arrCol := p.Index.Columns[np]
-		cond := prefix + arrCol + " = ANY (" + strings.Join(parts, ", ") + ")"
+		anyOp := saopOpText(p.SAOPOp)
+		cond := prefix + arrCol + " " + anyOp + " ANY (" + strings.Join(parts, ", ") + ")"
 		// M0146-0005ch: the same folded array Const the Filter-side
 		// formatInExprPG prints (sibling renderers of one SAOP).
 		if p.Table != nil {
@@ -3819,7 +3820,7 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 					if cast != "" {
 						col = "(" + col + ")::" + cast
 					}
-					cond = col + " = ANY (" + lit + ")"
+					cond = col + " " + anyOp + " ANY (" + lit + ")"
 				}
 				break
 			}
@@ -3896,7 +3897,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	// M0148-0001c3a4 (h): the index-only ScalarArrayOp probe renders exactly
 	// as the index scan's (one renderer for the one probe shape).
 	if len(p.SAOPKeys) > 0 {
-		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, SAOPKeys: p.SAOPKeys,
+		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, SAOPKeys: p.SAOPKeys, SAOPOp: p.SAOPOp,
 			LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
 	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
@@ -3967,16 +3968,34 @@ func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, pr
 	for _, k := range p.SAOPKeys {
 		elems = append(elems, formatIndexCondKey(k, reg))
 	}
-	cond := col + " = ANY (" + strings.Join(elems, ", ") + ")"
+	anyOp := saopOpText(p.SAOPOp)
+	cond := col + " " + anyOp + " ANY (" + strings.Join(elems, ", ") + ")"
 	if t := indexKeyColumnType(p.Table, p.Index, np); t != nil {
 		if cast, lit, ok := inListArrayConst(*t, p.SAOPKeys); ok {
 			if cast != "" {
 				col = "(" + col + ")::" + cast
 			}
-			cond = col + " = ANY (" + lit + ")"
+			cond = col + " " + anyOp + " ANY (" + lit + ")"
 		}
 	}
 	return indexCondAndText(append(parts, cond))
+}
+
+// saopOpText is a ScalarArrayOp index qual's operator: `=` for the equality
+// array, or the inequality an OR of one comparison became
+// (M0148-0001c3a4 (a), `thousand < ANY (…)`).
+func saopOpText(op parser.OpCode) string {
+	switch op {
+	case parser.OpLt:
+		return "<"
+	case parser.OpLe:
+		return "<="
+	case parser.OpGt:
+		return ">"
+	case parser.OpGe:
+		return ">="
+	}
+	return "="
 }
 
 // formatBitmapNullTestIndexCond renders a BitmapIndexScan's NullTest index

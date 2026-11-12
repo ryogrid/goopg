@@ -146,6 +146,7 @@ func createBitmapIndexScanPlan(p *Path) Node {
 			panic(fmt.Sprintf("createPlan: bitmap ScalarArrayOp clause of %s does not follow its equality prefix", p.IndexInfo.Name))
 		}
 		bis.SAOPKeys = append([]Expr(nil), rest[0].saop...)
+		bis.SAOPOp = rest[0].saopOp
 		return bis
 	}
 	sawBound := false

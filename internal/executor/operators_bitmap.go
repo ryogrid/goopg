@@ -202,28 +202,19 @@ func (o *bitmapIndexScanOp) buildBitmap(ctx *Context) (*TIDBitmap, error) {
 // prefix key, nothing at all); a repeated element is probed once, as
 // _bt_preprocess_array_keys deduplicates the array.
 func (o *bitmapIndexScanOp) buildSAOPBitmap(tbm *TIDBitmap, recheck bool) error {
-	np := len(o.plan.Keys)
-	if np >= len(o.plan.Index.Columns) {
+	if len(o.plan.Keys) >= len(o.plan.Index.Columns) {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "bitmap ScalarArrayOp qual past the index's last column"}
 	}
-	parts := make([]indexProbeKeyPart, 0, np+1)
-	for i, keyExpr := range o.plan.Keys {
-		keyCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[i])
-		if !found {
-			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
-		}
-		val, err := evalExprSlot(keyExpr, o.outerSlot, o.ctx)
-		if err != nil {
-			return err
-		}
-		if val.IsNull() {
-			return nil
-		}
-		parts = append(parts, indexProbeKeyPart{col: keyCol, val: val, pos: o.plan.Pos()})
-	}
-	saopCol, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[np])
-	if !found {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "column not found for index key"}
+	// M0148-0001c3a4: the same per-element windows as the index scans'
+	// (saopWindows: the equality Keys as the prefix, elements sorted and
+	// de-duplicated, an inequality array reduced to its extreme element),
+	// so the three ScalarArrayOp probes cannot disagree.
+	windows, err := o.ctx.saopWindows(saopProbeSpec{
+		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.Keys, elems: o.plan.SAOPKeys,
+		pos: o.plan.Pos(), op: o.plan.SAOPOp,
+	}, o.tree, o.outerSlot)
+	if err != nil {
+		return err
 	}
 	if tbm.entries == nil {
 		tbm.entries = make(map[storage.BlockNumber]*pageEntry)
@@ -236,30 +227,8 @@ func (o *bitmapIndexScanOp) buildSAOPBitmap(tbm *TIDBitmap, recheck bool) error 
 		o.lastTuples++
 		return true, nil
 	}
-	seen := make(map[string]bool, len(o.plan.SAOPKeys))
-	for _, elem := range o.plan.SAOPKeys {
-		val, err := evalExprSlot(elem, o.outerSlot, o.ctx)
-		if err != nil {
-			return err
-		}
-		if val.IsNull() {
-			continue
-		}
-		// encErr, not err: indexProbeKey returns a concrete *ExecError, and
-		// a nil one stored in the error-typed err would read non-nil.
-		key, encErr := o.ctx.indexProbeKey(o.plan.Index, append(parts[:np:np], indexProbeKeyPart{col: saopCol, val: val, pos: o.plan.Pos()}))
-		if encErr != nil {
-			return encErr
-		}
-		if seen[string(key)] {
-			continue
-		}
-		seen[string(key)] = true
-		hi := key
-		if np+1 < len(o.plan.Index.Columns) {
-			hi = o.ctx.compositeUpperBound(o.plan.Index, key)
-		}
-		if err := o.tree.RangeScanWithPos(key, hi, false, false, scanFn); err != nil {
+	for _, w := range windows {
+		if err := o.tree.RangeScanWithPos(w.lo, w.hi, w.loExcl, w.hiExcl, scanFn); err != nil {
 			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 		}
 	}

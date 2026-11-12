@@ -134,6 +134,9 @@ type indexPathClause struct {
 	// element, lowered onto IndexScan.SAOPKeys. `key` is nil and `op` is
 	// equality when set.
 	saop []Expr
+	// saopOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)).
+	saopOp parser.OpCode
 	// nullTest marks a `indexcol IS [NOT] NULL` index qual (M0148-0001c3a,
 	// restrictionLeadingNullTest): `key` is nil, `op` equality, `local` the
 	// NullTest conjunct. createRangeIndexScanPlan lowers it onto

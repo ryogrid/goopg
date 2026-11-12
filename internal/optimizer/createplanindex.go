@@ -367,13 +367,14 @@ func createIndexScanPlan(p *Path) Node {
 		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, optionally
 		// bounded on the second column — IndexOnlyScan.SAOPKeys.
 		var ioSAOP []Expr
+		ioSAOPOp := parser.OpUnknown
 		loopClauses := p.IndexClauses
 		if indexClausesHaveSAOP(p.IndexClauses) {
 			c0 := p.IndexClauses[0]
 			if len(c0.saop) == 0 || c0.indexCol != 0 || c0.local == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
 				panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s must be one leading-column array on an unparameterised scan", p.IndexInfo.Name))
 			}
-			ioSAOP = c0.saop
+			ioSAOP, ioSAOPOp = c0.saop, c0.saopOp
 			ioDrop[c0.local] = true
 			for i, r := range p.IndexClauses[1:] {
 				if r.indexCol != 1 || r.key == nil || len(r.saop) > 0 || r.nullTest != IndexNullTestNone {
@@ -502,6 +503,7 @@ func createIndexScanPlan(p *Path) Node {
 		switch {
 		case ioSAOP != nil:
 			ios.SAOPKeys = append([]Expr(nil), ioSAOP...)
+			ios.SAOPOp = ioSAOPOp
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
@@ -848,6 +850,7 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		RTID:                  id.rtid,
 		Index:                 p.IndexInfo,
 		SAOPKeys:              append([]Expr(nil), c.saop...),
+		SAOPOp:                c.saopOp,
 		RangePrefix:           prefix,
 		LowKey:                low,
 		LowOp:                 lowOp,

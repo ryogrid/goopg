@@ -992,6 +992,11 @@ type IndexScan struct {
 	// (updateViaIndex requires Key; indexScanPredicate rebuilds the IN
 	// qual for the fallback).
 	SAOPKeys []Expr
+	// SAOPOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`) — one range up to the extreme element
+	// (_bt_find_extreme_element, M0148-0001c3a4 (a)); LowKey/HighKey are
+	// then unset.
+	SAOPOp  parser.OpCode
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	// RangePrefix, when non-empty, is an EQUALITY prefix for index columns
@@ -1281,8 +1286,10 @@ type IndexOnlyScan struct {
 	// Key/Keys/SkipPrefix. The elements descend sorted and de-duplicated
 	// (saopWindows, shared with indexScanOp).
 	SAOPKeys []Expr
-	LowKey   Expr
-	HighKey  Expr
+	// SAOPOp mirrors IndexScan.SAOPOp.
+	SAOPOp  parser.OpCode
+	LowKey  Expr
+	HighKey Expr
 	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's
 	// strictness. `OpGt` (low) / `OpLt` (high) make that end of the range
 	// EXCLUSIVE; the zero value `OpUnknown` — what every producer other than
@@ -3794,6 +3801,10 @@ type BitmapIndexScan struct {
 	// all into the one TID bitmap (M0148-0001c3a2). Never set together with
 	// Key, LowKey/HighKey or LeadingNullTest.
 	SAOPKeys []Expr
+	// SAOPOp is the array's operator: OpUnknown for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) probed as the range of
+	// the extreme element. Shared with IndexScan / IndexOnlyScan.SAOPOp.
+	SAOPOp parser.OpCode
 	// Pred is the full index condition (for recheck). When Key/Keys
 	// cover only a prefix, Pred holds the remaining index quals.
 	Pred   []Expr

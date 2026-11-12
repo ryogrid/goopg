@@ -815,6 +815,7 @@ func (o *indexScanOp) rescanSAOP() error {
 	windows, err := o.ctx.saopWindows(saopProbeSpec{
 		table: o.plan.Table, index: o.plan.Index, prefix: o.plan.RangePrefix, elems: o.plan.SAOPKeys,
 		low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
+		op: o.plan.SAOPOp,
 	}, o.tree, o.outerSlot)
 	if err != nil {
 		return err
@@ -856,6 +857,11 @@ type saopProbeSpec struct {
 	low, high     optimizer.Expr
 	lowOp, highOp parser.OpCode
 	pos           int
+	// op is the array's operator: OpUnknown/OpEq for `= ANY`, or an
+	// inequality (`col < ANY (…)`, M0148-0001c3a4 (a)) — a union of
+	// half-open ranges, i.e. the one range of the extreme element
+	// (_bt_preprocess_array_keys' _bt_find_extreme_element).
+	op parser.OpCode
 }
 
 // saopWindow is one array element's index-order window and the key parts
@@ -941,6 +947,40 @@ func (ctx *Context) saopWindows(sp saopProbeSpec, tree *nbtree.BTree, outerSlot 
 			}
 		}
 		elems = uniq
+	}
+	switch sp.op {
+	case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		// `col < ANY (a, b)` is `col < max(a, b)`: the extreme element in
+		// VALUE order — the last in index order, or the first on a DESC
+		// column, whose index order is reversed.
+		if bounded {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: fmt.Sprintf("inequality ScalarArrayOp probe on %q carries a bound on the next column", sp.index.Name)}
+		}
+		if len(elems) == 0 {
+			return nil, nil
+		}
+		if tree == nil {
+			return nil, &ExecError{Code: "XX000", Pos: sp.pos, Message: "inequality ScalarArrayOp probe without an index tree to order its elements"}
+		}
+		wantMax := sp.op == parser.OpLt || sp.op == parser.OpLe
+		ext := elems[0]
+		if wantMax != rangeColumnReversed(ctx, sp.index, np) {
+			ext = elems[len(elems)-1]
+		}
+		spec := indexRangeSpec{table: sp.table, index: sp.index, prefix: sp.prefix, pos: sp.pos}
+		if wantMax {
+			spec.high, spec.highOp = ext.ke, sp.op
+		} else {
+			spec.low, spec.lowOp = ext.ke, sp.op
+		}
+		lo, hi, lx, hx, ok, berr := ctx.indexRangeBounds(spec, outerSlot)
+		if berr != nil {
+			return nil, berr
+		}
+		if !ok {
+			return nil, nil
+		}
+		return []saopWindow{{lo: lo, hi: hi, loExcl: lx, hiExcl: hx, parts: ext.parts}}, nil
 	}
 	out := make([]saopWindow, 0, len(elems))
 	for _, el := range elems {

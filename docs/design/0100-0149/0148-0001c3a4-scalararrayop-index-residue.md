@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(c\), \(b\) and \(h\) landed 2026\-11\-12; items \(a\), \(d\)–\(g\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(a\), \(b\), \(c\) and \(h\) landed 2026\-11\-12; items \(d\)–\(g\), \(i\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -238,3 +238,80 @@ refused any SAOP, so it used the plain Index Scan, or a bitmap path.
   - two arrays on one column.
 - **Parameterised arrays:** `thousand = ANY (ARRAY[t1.tenthous, …])` under a
   nested loop.
+
+## Item \(a\) — inequality OR groups as `col < ANY (…)`
+
+PG 18 matches `thousand < 42 OR thousand < 99 OR 43 > thousand` as the
+single index clause `thousand < ANY ('{42,99,43}')`. Two routes lead there:
+
+- `match_orclause_to_indexcol` for a whole OR conjunct;
+- `group_similar_or_args` for a group of OR arms inside a BitmapOr.
+
+PG also matches an explicit `id1 >= ANY (array[1,5])`. nbtree runs such an
+array as one range, up to the extreme element
+\(`_bt_preprocess_array_keys` → `_bt_find_extreme_element`\).
+`btcostestimate` still counts one descent per element. goopg declined every
+inequality group.
+
+### Change
+
+- **Clause:** `indexPathClause.saopOp` carries the operator.
+  - `orInequalitySAOP` matches an OR of one inequality on a column,
+    commuting `43 > thousand` to `thousand < 43`.
+  - `saopAnyInequality` matches an explicit `col op ANY (…)`.
+  - Both `restrictionSAOPOnColumn` and `bitmapSAOPOnColumn` take them.
+  - An inequality array files no bound on the next column; that qual stays
+    in the Filter.
+  - `groupSimilarOrArgs` now folds an inequality group into a Nested
+    sub\-OR, as it does an equality group.
+- **Plan:** `SAOPOp` on IndexScan, IndexOnlyScan and BitmapIndexScan,
+  printed as `col < ANY (…)`. `indexScanPredicate` rebuilds
+  `col op ANY (…)`.
+- **Executor:** `saopWindows` reduces an inequality array to one window
+  through indexRangeBounds, bounded by the extreme element in value order.
+  That is the last element in index order, or the first on a DESC column.
+  The bitmap ScalarArrayOp probe now uses `saopWindows` too, so all three
+  probes share one implementation.
+- **The Filter under a BitmapOr recheck.** For `unique1 < 1 OR unique1 < 3
+  OR hundred < 2`, PG drops the restriction OR and goopg kept it.
+  - PG's `predicate_implied_by` proves the OR item by item. The array arm
+    `(u < 1) OR (u < 3)` implies the single predicate item `u < 3`, by btree
+    operator inference \(`operator_predicate_proof`, BT\_implic\_table\).
+  - goopg's atom test only knew same\-operator, equal\-constant proofs.
+  - `operatorPredicateProof` adds the implication table for integer
+    constants on integer\-typed columns. It is sound for any total order, and
+    a text column is never inferred.
+  - A first attempt flattened the Nested sub\-ORs instead. It dropped
+    Filters PG keeps \(`thousand = 42 OR thousand = 41 OR …`, and the join
+    OR\-extraction cases\), because PG matches the sub\-OR item by item. It
+    was reverted.
+
+### Verification
+
+- **Probe against PG 18.3:** 12 statements identical, plans and rows. They
+  cover:
+  - the BitmapAnd and BitmapOr regress plans, and the explicit `>= ANY`;
+  - NULL elements, all\-NULL arrays, `<=` / `>` / `>=`;
+  - a DESC index.
+- **`TestInequalitySAOP`:**
+  - pins the three PG plans;
+  - compares counts with `+ 0` twins on ASC and DESC indexes.
+  - With the extreme\-element choice broken, 3 cases fail.
+- **`TestOperatorPredicateProof`:** the implication table, its boundary
+  cases, commuted constants, the text\-column refusal, and the OR\-clause
+  rule over it.
+- **Regress:** create\_index 3063→3015 lines, no new mismatch line. join
+  −5 is the flap.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99 \(plan shapes identical\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Wider operator inference:** `operatorPredicateProof` compares only
+  integer literals. PG compares any btree\-comparable constants through the
+  opfamily's comparison proc \(numeric, text with collation, dates\). It also
+  refutes, which goopg does not.
+- **Bounds behind an inequality array:** the next column's bounds stay in
+  the Filter.

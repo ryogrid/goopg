@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // addIndexOnlyPaths generates, for every base relation, the index-only paths
@@ -232,7 +233,7 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		// leading range) — PG's Index Only Scan with
 		// `((thousand = ANY (…)) AND (tenthous > 7550))`.
 		clauses = saop
-		if len(idx.Columns) > 1 {
+		if len(idx.Columns) > 1 && saop[0].saopOp == parser.OpUnknown {
 			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
 		}
 		bound = boundIndexColumns(clauses)

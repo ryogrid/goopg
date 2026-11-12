@@ -341,7 +341,8 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		if !ok || in.Subquery != nil || in.Plan != nil || len(in.List) == 0 {
 			continue
 		}
-		if in.Negated || in.NotEqualAny || in.AllOp || (in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq) {
+		ineqOp, ineq := saopAnyInequality(in)
+		if in.Negated || in.NotEqualAny || in.AllOp || (in.AnyOp != parser.OpUnknown && in.AnyOp != parser.OpEq && !ineq) {
 			continue
 		}
 		cr, ok := in.Operand.(*ColumnRef)
@@ -365,7 +366,7 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		if !usable {
 			continue
 		}
-		return []indexPathClause{{indexCol: pos, saop: in.List, local: conj}}
+		return []indexPathClause{{indexCol: pos, saop: in.List, saopOp: ineqOp, local: conj}}
 	}
 	// M0148-0001c3a2: an OR of equalities on the leading column is the same
 	// ScalarArrayOp probe (match_orclause_to_indexcol); the OR is its exact
@@ -377,6 +378,10 @@ func restrictionSAOPOnColumn(cat catalog.Catalog, tbl *catalog.Table, idx *catal
 		}
 		if in, ok := orEqualitySAOP(cat, tbl, lead, conj); ok {
 			return []indexPathClause{{indexCol: pos, saop: in.List, local: conj}}
+		}
+		// M0148-0001c3a4 (a): an OR of one inequality operator.
+		if in, op, ok := orInequalitySAOP(cat, tbl, lead, conj); ok {
+			return []indexPathClause{{indexCol: pos, saop: in.List, saopOp: op, local: conj}}
 		}
 	}
 	return nil
@@ -664,7 +669,9 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		if sa := restrictionSAOPOnColumn(cat, tbl, idx, n, conjuncts); len(sa) > 0 {
 			clauses = append(clauses, sa...)
 			isSAOP, saopAt = true, n
-			if n+1 < len(idx.Columns) {
+			// An inequality array is a range on its column; the next
+			// column's quals stay in the Filter (M0148-0001c3a4 (a)).
+			if n+1 < len(idx.Columns) && sa[0].saopOp == parser.OpUnknown {
 				clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, n+1, conjuncts)...)
 			}
 		}
@@ -677,7 +684,7 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		// M0148-0001c3a4 (c): exact index quals, as behind an equality
 		// prefix — the executor bounds each element's descent with
 		// indexRangeBounds (NULL stop, DESC swap), so no Filter recheck.
-		if isSAOP && len(idx.Columns) > 1 {
+		if isSAOP && len(idx.Columns) > 1 && clauses[0].saopOp == parser.OpUnknown {
 			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
 		}
 	}

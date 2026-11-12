@@ -3925,6 +3925,10 @@ func indexScanPredicate(ix *optimizer.IndexScan) optimizer.Expr {
 		keys := make([]optimizer.Expr, 0, len(ix.SAOPKeys))
 		keys = append(keys, ix.SAOPKeys...)
 		var in optimizer.Expr = &optimizer.InExpr{Operand: ref, List: keys}
+		if ix.SAOPOp != parser.OpUnknown && ix.SAOPOp != parser.OpEq {
+			// M0148-0001c3a4 (a): `col op ANY (keys)`.
+			in = &optimizer.InExpr{Operand: ref, List: keys, AnyOp: ix.SAOPOp}
+		}
 		if combined == nil {
 			combined = in
 		} else {

@@ -203,3 +203,66 @@ func TestIndexOnlySAOP(t *testing.T) {
 		t.Errorf("an all-NULL array matches nothing; got %s", got)
 	}
 }
+
+// TestInequalitySAOP pins M0148-0001c3a4 (a) against PG 18.3: an OR of one
+// inequality on a column is matched as `col < ANY (…)`
+// (match_orclause_to_indexcol / group_similar_or_args), as is an explicit
+// `col >= ANY (array[…])`, and nbtree runs it as the one range of the extreme
+// element (_bt_find_extreme_element) — on every probe (bitmap, plain, index
+// only) through saopWindows. Counts match a `+ 0` twin on ASC and DESC
+// indexes, with NULL elements ignored.
+func TestInequalitySAOP(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE tq (unique1 int NOT NULL, hundred int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO tq SELECT g, g%100, g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX tq_tt ON tq (thousand, tenthous)")
+	runSQL(t, ctx, "CREATE INDEX tq_h ON tq (hundred)")
+	runSQL(t, ctx, "CREATE INDEX tq_u ON tq (unique1)")
+	runSQL(t, ctx, "VACUUM tq")
+	runSQL(t, ctx, "ANALYZE tq")
+	ps := optimizer.DefaultPlannerSettings()
+	plan := func(q string) string {
+		return strings.Join(renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+q, ps)), "\n")
+	}
+	for _, c := range []struct{ q, want string }{
+		{"SELECT count(*) FROM tq WHERE hundred = 42 AND (thousand < 42 OR thousand < 99 OR 43 > thousand OR 42 > thousand)",
+			"Aggregate\n  ->  Bitmap Heap Scan on tq\n        Recheck Cond: ((hundred = 42) AND ((thousand < 42) OR (thousand < 99) OR (43 > thousand) OR (42 > thousand)))\n" +
+				"        ->  BitmapAnd\n              ->  Bitmap Index Scan on tq_h\n                    Index Cond: (hundred = 42)\n" +
+				"              ->  Bitmap Index Scan on tq_tt\n                    Index Cond: (thousand < ANY ('{42,99,43,42}'::integer[]))"},
+		{"SELECT * FROM tq WHERE unique1 < 1 OR unique1 < 3 OR hundred < 2",
+			"Bitmap Heap Scan on tq\n  Recheck Cond: (((unique1 < 1) OR (unique1 < 3)) OR (hundred < 2))\n  ->  BitmapOr\n" +
+				"        ->  Bitmap Index Scan on tq_u\n              Index Cond: (unique1 < ANY ('{1,3}'::integer[]))\n" +
+				"        ->  Bitmap Index Scan on tq_h\n              Index Cond: (hundred < 2)"},
+		{"SELECT * FROM tq WHERE unique1 >= ANY (array[9995, 9998])",
+			"Index Scan using tq_u on tq\n  Index Cond: (unique1 >= ANY ('{9995,9998}'::integer[]))"},
+	} {
+		if got := plan(c.q); got != c.want {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, got, c.want)
+		}
+	}
+	counts := func(w string) {
+		t.Helper()
+		got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT count(*) FROM tq WHERE "+w, ps)), ";")
+		tw := strings.NewReplacer("thousand <", "thousand + 0 <", "thousand >", "thousand + 0 >", "> thousand", "> thousand + 0",
+			"unique1 <", "unique1 + 0 <", "unique1 >", "unique1 + 0 >", "hundred <", "hundred + 0 <").Replace(w)
+		want := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT count(*) FROM tq WHERE "+tw, ps)), ";")
+		if got != want {
+			t.Errorf("%s: count %s, want %s (twin %s)", w, got, want, tw)
+		}
+	}
+	for _, idx := range []string{"", "CREATE INDEX tq_ttd ON tq (thousand DESC, tenthous)"} {
+		if idx != "" {
+			runSQL(t, ctx, "DROP INDEX tq_tt")
+			runSQL(t, ctx, idx)
+			runSQL(t, ctx, "ANALYZE tq")
+		}
+		counts("hundred = 42 AND (thousand < 42 OR thousand < 99 OR 43 > thousand OR 42 > thousand)")
+		counts("hundred = 7 AND (thousand > 990 OR thousand > 995)")
+		counts("hundred = 7 AND (thousand >= 990 OR thousand >= 995)")
+		counts("unique1 < 1 OR unique1 < 3 OR hundred < 2")
+		counts("unique1 >= ANY (array[9995, 9998])")
+		counts("unique1 > ANY (array[9997, NULL])")
+		counts("unique1 <= ANY ('{NULL,NULL}'::int[])")
+	}
+}
