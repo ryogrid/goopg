@@ -12349,6 +12349,23 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
       createIndexScanPlan stops panicking).
     - Then EXPLAIN ` Backward` + regress A/B.
   Movement: none — access-method slice, no caller yet
+  - 2026-11-12 slice 2 LANDED (c41356575): executor IndexScan.Backward over
+    ReverseScanCursor on the main probe path, plus the EXPLAIN `Index Scan
+    Backward` label.
+    - SAOP, skip and parallel backward scans are refused (XX000).
+    - TestIndexScanBackward flips planner-built plans: backward = forward
+      reversed, in both NULL-entry modes.
+  - Resume: slice 3 (planner).
+    - Where PG's build\_index\_paths makes a backward path
+      (index\_pathkeys built with ScanDirection backward when the reversed
+      order is useful — ORDER BY DESC, merge/min-max), goopg's ordered-index
+      producers (pathindexordered.go, pathindexrestrict.go indexPathOrdering
+      callers) should call indexPathOrdering(…, backward=true).
+    - createIndexScanPlan sets Backward instead of panicking.
+    - Then regress A/B on the 26 `Index Scan Backward` lines.
+    - IndexOnlyScan.Backward (S6 max-rewrite meaning) needs a real reverse
+      walk before IOS backward paths.
+  Movement: none — no producer emits a backward path yet
 - [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
   behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
   useful\_predicate, join OR bitmap paths, bitmap node cost line**.
