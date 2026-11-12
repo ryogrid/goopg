@@ -1,36 +1,35 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #32: census IDENTICAL; M0148-0001c3a4 item (h) landed 2bb850c31)
+# Working Set — loop end 2026-11-12 (run-2 loop #33: census IDENTICAL; M0148-0001c3a4 item (a) landed 2fbce36a9)
 
 - Anomaly: none (prev-loop check OK).
 - Nightly triage: the only item, AI-20261112-000028-001, is already filed and fixed. Nothing filed.
-- S9: DUE at loop start → routing-20261112r (label s9cc, BASELINE_REV=736f98b0a) IDENTICAL ×3, committed f2e0f46d6.
-  - Code commit 2bb850c31 since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9cd, BASELINE_REV=82f9d1882 (capture head of routing-20261112r), as routing-20261112s.
-  - The fire-set already ran on 2bb850c31's tree: fires=none ×3.
-- Task: M0148-0001c3a4 — c3a2 residue. Items (c), (b), (h) LANDED. Open: (a), (d)-(g), new (i).
-- Files (item h):
-  - executor/operators_index.go: Context.saopWindows + saopProbeSpec/saopWindow; rescanSAOP uses them.
-  - operators_indexonly.go: SAOP case + window drain. operators_explain.go: IOS SAOP Index Cond. scan_deform.go: deform keys.
-  - optimizer/plan.go: IndexOnlyScan.SAOPKeys. Walkers: walk_export.go, subplan_lower_walk.go, unnest.go, considerparallel.go, planner.go (rebase).
-  - createplanindex.go: IOS SAOP lowering; indexClausesHaveSAOP; backward panic exempts index-only SAOP.
-  - pathindexonly.go: indexOnlyLeafClauses SAOP branch; addOneIndexOnlyPath SAOP pricing and pathkeys.
-  - Tests: saop_range_bounds_test.go TestIndexOnlySAOP; saop_index_test.go helper accepts IOS.
+- S9: DUE at loop start → routing-20261112s (label s9cd, BASELINE_REV=82f9d1882) IDENTICAL ×3, committed d26b04df4.
+  - Code commit 2fbce36a9 since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9ce, BASELINE_REV=25c216b38 (capture head of routing-20261112s), as routing-20261112t.
+  - The fire-set already ran on 2fbce36a9's tree: fires=none ×3.
+- Task: M0148-0001c3a4 — c3a2 residue. Items (a), (b), (c), (h) LANDED. Open: (d)-(g), (i).
+- Files (item a):
+  - optimizer/pathbitmapor.go: orInequalitySAOP, saopAnyInequality, groupSimilarOrArgs (inequality groups now Nested), operatorPredicateProof + intComparison.
+  - pathindexclauses.go: indexPathClause.saopOp.
+  - pathindexrestrict.go / pathindexonly.go: inequality SAOP (no next-column bounds).
+  - createplanindex.go / createplanbitmap.go: SAOPOp lowering. plan.go: SAOPOp on IndexScan / IndexOnlyScan / BitmapIndexScan.
+  - executor operators_index.go saopWindows: extreme-element window. operators_bitmap.go buildSAOPBitmap → saopWindows. operators_explain.go saopOpText. operators_storage.go: indexScanPredicate AnyOp.
+  - Tests: executor TestInequalitySAOP; optimizer operator_predicate_proof_test.go.
 - Findings:
-  - A covered `SELECT id … IN` is now an Index Only Scan (PG's single path per index); old tests had pinned the plain scan.
-  - DISTINCT over an ordered IOS → HashAggregate, where PG takes Unique. Pre-existing (range IOS too); ledgered.
-- Next step: S9 census (DUE), then c3a4 (a): inequality OR groups.
-  - PG `hundred = 42 AND (thousand < 42 OR thousand < 99 OR 43 > thousand OR 42 > thousand)` → BitmapAnd with `thousand < ANY ('{42,99,43,42}')`.
-  - pathbitmapor.go group_similar_or_args non-equality groups + a `< ANY` probe reducing to the extreme element.
-  - Then (i).
+  - PG drops the BitmapOr restriction Filter by operator inference ((u<1) OR (u<3) ⇒ u<3), not by flattening.
+  - Flattening the Nested sub-OR dropped Filters PG keeps (equality groups, join-derived ORs) — tried and reverted.
+- Next step: S9 census (DUE), then c3a4 (i).
+  - Start with an array behind a leading range: PG `((thousand < 2) AND (tenthous = ANY ('{1001,3000}')))` on IOS / IOS Backward.
+  - That needs a range-prefix form in saopWindows (each element window inside the leading range) and the IOS / plain producers filing it.
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112r done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112s done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9cc: IDENTICAL ×3.
-  - regress A/B over 22 suites: btree_index -16, create_index -36; join +5 = flap.
-  - units (the first run of the SAOP tests failed 4 old plan pins → helper updated).
+  - census s9cd: IDENTICAL ×3.
+  - regress A/B over 22 suites: create_index -48, no new mismatch line; join -5 = flap; rowsecurity pointer-address lines are pre-existing noise.
+  - units.
   - tpch-spotcheck.
   - sf025: 99/99.
-  - fire-set c3a4hfs: ×3 fires=none.
+  - fire-set c3a4afs: ×3 fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
 - In-flight: none. tmp/c3a2-data is a stopped probe dir.
