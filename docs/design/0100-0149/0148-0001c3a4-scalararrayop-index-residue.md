@@ -1,6 +1,6 @@
 # M0148\-0001c3a4 — ScalarArrayOp and OR index\-path residue
 
-**Parent:** M0148\-0001c3a2 · **Status:** items \(c\) and \(b\) landed 2026\-11\-12; items \(a\), \(d\)–\(h\) open
+**Parent:** M0148\-0001c3a2 · **Status:** items \(c\), \(b\) and \(h\) landed 2026\-11\-12; items \(a\), \(d\)–\(g\) open
 
 This item collects what M0148\-0001c3a2 \(BitmapOr paths\) left open. The items
 are listed in `.ralph/fix_plan.md` under M0148\-0001c3a4:
@@ -167,3 +167,74 @@ probe bound only the leading column, so the bitmap path won.
   ahead of further equalities \(`a IN (…) AND b = 1`\).
 - **DML:** DML plans a Seq Scan for these quals, so the rebuilt predicate is
   defensive today.
+
+## Item \(h\) — index\-only ScalarArrayOp scans
+
+PG plans `thousand IN (182, 183) AND tenthous > 7550` as `Index Only Scan
+… Index Cond: ((thousand = ANY ('{182,183}'::integer[])) AND (tenthous >
+7550))`, and `unique1 IN (7, 1, 42) ORDER BY unique1 DESC` as `Index Only
+Scan Backward`. build\_index\_paths builds one path per index and makes it
+index\-only when the index covers the query. goopg's index\-only path
+refused any SAOP, so it used the plain Index Scan, or a bitmap path.
+
+### Change
+
+- **Shared windows.** The per\-element window computation moved out of
+  `indexScanOp.rescanSAOP` into `Context.saopWindows` \(`saopProbeSpec` →
+  `[]saopWindow`\). It covers the prefix, the encoding, the index\-order sort
+  and de\-duplication, and the per\-element `indexRangeBounds`. Both scans
+  call it, so the siblings cannot disagree.
+- **Plan:** `IndexOnlyScan.SAOPKeys` — the leading\-column array, with
+  LowKey/HighKey bounding the second column. It is added to every IOS
+  expression walker: plan exprs, subplan lowering, unnest, parallel safety,
+  deform keys, and the outer\-ref rebase.
+- **Executor:** `indexOnlyScanOp.Rescan` drains each window in order through
+  `RangeScanWithPosLeafFilter`. A backward IOS reverses the materialised
+  rows, so a backward SAOP is correct too, and `createIndexScanPlan` no
+  longer refuses an index\-only one.
+- **Producer:**
+  - `indexOnlyLeafClauses` takes a leading SAOP plus second\-column bounds,
+    in the plain producer's precedence \(ahead of a leading range\). The
+    index\-only path therefore stands in for the plain one when the index
+    covers the query, as PG's single path does.
+  - `addOneIndexOnlyPath` prices it as the plain SAOP path:
+    scalararraysel × the bounds, and num\_sa\_scans = the element count.
+  - It also carries the index pathkeys, so the backward twin follows.
+- **EXPLAIN:** the IOS renders through the Index Scan's SAOP formatter.
+
+### Verification
+
+- **Probe against PG 18.3:** 7 statements with plans and rows identical, and
+  costs equal \(24.14\). One difference predates this change:
+  - `SELECT DISTINCT hundred … IN (…)` keeps a HashAggregate where PG puts
+    Unique over the ordered IOS;
+  - a range IOS does the same, so it is the upper\-rel distinct election,
+    not this probe.
+- **`TestIndexOnlySAOP`:**
+  - pins 4 of PG's plans \(forward, two\-column bounded, backward, backward
+    under LIMIT\);
+  - checks rows against a `+ 0` twin, and an all\-NULL array.
+  - With the element sort disabled, 3 cases fail.
+- **`saop_index_test.go`'s helper** accepts the index\-only form. `SELECT id`
+  is covered, which is PG's own choice.
+- **Regress:**
+  - btree\_index 453→437, create\_index 3099→3063 lines.
+  - The only new lines are row\-count lines of existing mismatches whose plan
+    moved toward PG's. join \+5 is the flap.
+- **Gates:**
+  - units, tpch\-spotcheck, sf025 99/99 \(plan shapes identical\);
+  - fire\-set fires=none on sf025, sf1 and TPC\-H;
+  - acceptance 24 MATCH.
+
+### Not covered
+
+- **Index\-only SAOP behind an equality prefix:** IndexOnlyScan has no
+  RangePrefix yet.
+- **Other key positions:**
+  - an array behind a leading range \(`thousand < 2 AND tenthous IN (…)`,
+    PG `Index Cond: ((thousand < 2) AND (tenthous = ANY (…)))`\);
+  - a bound on the array's own column \(`unique1 IN (1, 42, 7) AND unique1
+    >= 42`\);
+  - two arrays on one column.
+- **Parameterised arrays:** `thousand = ANY (ARRAY[t1.tenthous, …])` under a
+  nested loop.

@@ -156,3 +156,50 @@ func TestSAOPBehindEqualityPrefix(t *testing.T) {
 	}
 	catalog.SetNullKeyedIndexEntries(false)
 }
+
+// TestIndexOnlySAOP pins M0148-0001c3a4 (h) against PG 18.3: a leading
+// ScalarArrayOp (optionally bounded on the second column) drives an Index
+// Only Scan — IndexOnlyScan.SAOPKeys over the same sorted, de-duplicated
+// element windows as the plain scan (saopWindows) — forward and backward
+// (the IOS reverses its materialised rows). Rows match a `+ 0` twin.
+func TestIndexOnlySAOP(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE th (unique1 int NOT NULL, hundred int NOT NULL, thousand int NOT NULL, tenthous int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO th SELECT g, g%100, g%1000, g, repeat('x', 100) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX th_tt ON th (thousand, tenthous)")
+	runSQL(t, ctx, "CREATE INDEX th_u ON th (unique1)")
+	runSQL(t, ctx, "VACUUM th")
+	runSQL(t, ctx, "ANALYZE th")
+	ps := optimizer.DefaultPlannerSettings()
+	for _, c := range []struct {
+		q, twin string
+		want    []string
+	}{
+		{"SELECT thousand, tenthous FROM th WHERE thousand IN (182, 183) AND tenthous > 7550 ORDER BY 1, 2",
+			"SELECT thousand, tenthous FROM th WHERE thousand + 0 IN (182, 183) AND tenthous + 0 > 7550 ORDER BY 1, 2",
+			[]string{"Index Only Scan using th_tt on th", "  Index Cond: ((thousand = ANY ('{182,183}'::integer[])) AND (tenthous > 7550))"}},
+		{"SELECT unique1 FROM th WHERE unique1 IN (7, 1, 42, 7) ORDER BY unique1",
+			"SELECT unique1 FROM th WHERE unique1 + 0 IN (7, 1, 42) ORDER BY unique1",
+			[]string{"Index Only Scan using th_u on th", "  Index Cond: (unique1 = ANY ('{7,1,42,7}'::integer[]))"}},
+		{"SELECT unique1 FROM th WHERE unique1 IN (7, 1, 42) ORDER BY unique1 DESC",
+			"SELECT unique1 FROM th WHERE unique1 + 0 IN (7, 1, 42) ORDER BY unique1 DESC",
+			[]string{"Index Only Scan Backward using th_u on th", "  Index Cond: (unique1 = ANY ('{7,1,42}'::integer[]))"}},
+		{"SELECT thousand, tenthous FROM th WHERE thousand IN (5, 3) ORDER BY thousand DESC, tenthous DESC LIMIT 3",
+			"SELECT thousand, tenthous FROM th WHERE thousand + 0 IN (5, 3) ORDER BY thousand DESC, tenthous DESC LIMIT 3",
+			[]string{"Limit", "  ->  Index Only Scan Backward using th_tt on th", "        Index Cond: (thousand = ANY ('{5,3}'::integer[]))"}},
+	} {
+		got := renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, ps))
+		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, strings.Join(got, "\n"), strings.Join(c.want, "\n"))
+		}
+		rows := strings.Join(renderRows(runSQLWith(t, ctx, c.q, ps)), ";")
+		want := strings.Join(renderRows(runSQLWith(t, ctx, c.twin, ps)), ";")
+		if rows != want || want == "" {
+			t.Errorf("%s: rows %s, want %s", c.q, rows, want)
+		}
+	}
+	if got := strings.Join(renderRows(runSQLWith(t, ctx, "SELECT unique1 FROM th WHERE unique1 = ANY ('{NULL,NULL}'::int[])", ps)), ";"); got != "" {
+		t.Errorf("an all-NULL array matches nothing; got %s", got)
+	}
+}

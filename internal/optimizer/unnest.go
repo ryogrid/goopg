@@ -921,6 +921,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, k := range n.Keys {
 			walkExprTree(k, visit)
 		}
+		for _, k := range n.SAOPKeys {
+			walkExprTree(k, visit)
+		}
 		if n.LowKey != nil {
 			walkExprTree(n.LowKey, visit)
 		}

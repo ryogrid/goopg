@@ -221,7 +221,22 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 	}
 	clauses := restrictionEqualityPrefix(cat, tbl, idx, conjuncts)
 	bound := len(clauses)
-	if !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)) {
+	var saop []indexPathClause
+	if len(clauses) == 0 {
+		saop = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
+	}
+	switch {
+	case len(saop) > 0:
+		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, bounded on the
+		// second column, in the plain producer's precedence (ahead of a
+		// leading range) — PG's Index Only Scan with
+		// `((thousand = ANY (…)) AND (tenthous > 7550))`.
+		clauses = saop
+		if len(idx.Columns) > 1 {
+			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
+		}
+		bound = boundIndexColumns(clauses)
+	case !plainRestrictionBindsOnlyPrefix(cat, tbl, idx, conjuncts, len(clauses)):
 		// M0146-0061: with no equality on the leading column, the plain
 		// producer binds a leading range when there is no leading SAOP
 		// (addOneRestrictionIndexPath's order) — the same clauses the
@@ -232,7 +247,7 @@ func (s *searchCtx) indexOnlyLeafClauses(cat catalog.Catalog, rel *RelOptInfo, t
 		if nts := restrictionNullTestsOnColumn(idx, 0, conjuncts); len(nts) > 0 && len(clauses) == 0 {
 			rng = withNullTestsInConjunctOrder(rng, nts, conjuncts)
 		}
-		if len(clauses) > 0 || len(rng) == 0 || len(restrictionLeadingSAOP(cat, tbl, idx, conjuncts)) > 0 {
+		if len(clauses) > 0 || len(rng) == 0 {
 			return nil, false
 		}
 		clauses, bound = rng, 1
@@ -341,7 +356,18 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// selectivity for an index path with no indexclauses is 1.0 ("An empty
 	// indexclauses list implies a full index scan", pathnodes.h:1817).
 	sel, unique := 1.0, false
+	numSAScans := 0.0
+	isSAOP := len(clauses) > 0 && len(clauses[0].saop) > 0
 	switch {
+	case isSAOP:
+		// M0148-0001c3a4 (h): scalararraysel over the array, times the
+		// second-column bounds, one descent per element — the plain
+		// producer's SAOP pricing.
+		sel = clampSelectivity(clauseSelectivity(saopPricedClause(cat, tbl, idx, clauses[0]), rel.baseLeaf))
+		if len(clauses) > 1 {
+			sel = clampSelectivity(sel * rangeIndexSelectivity(rel.baseLeaf, extractFilterConjuncts(rel.baseLeaf), clauses[1:]))
+		}
+		numSAScans = float64(len(clauses[0].saop))
 	case hasRangeClause(clauses):
 		// M0146-0061: leading-column bounds (and M0148-0001c3a's NullTest),
 		// priced as the plain range path prices them.
@@ -372,6 +398,7 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		// (costsize.c:806-820).
 		numQualOps:    qpquals,
 		numIndexQuals: float64(len(clauses)),
+		numSAScans:    numSAScans,
 	}
 	cost := costIndexScan(s.cp, in)
 	// take2 P4-01 Slice 1: the scan Target, computed from NeededCols at
@@ -418,7 +445,9 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 	// carries the index's ordering (addOneRestrictionIndexPath), so it carries
 	// it too — PG's build_index_paths computes one useful_pathkeys for the
 	// index whether the path is index-only or not.
-	if hasRangeClause(clauses) && len(colExprs) > 0 && indexIsOrderable(idx) {
+	if (hasRangeClause(clauses) || isSAOP) && len(colExprs) > 0 && indexIsOrderable(idx) {
+		// M0148-0001c3a4 (h): a SAOP probe delivers index order too (its
+		// elements descend sorted).
 		serial.Pathkeys, _ = indexPathOrdering(idx, colExprs, false)
 	}
 	// M0146-0188: the full-index shape carries the index's useful ordering as

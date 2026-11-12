@@ -58,12 +58,29 @@ func saopPlanAsserts(t *testing.T, ctx *Context, sql string, wantKeys int) []Row
 	if !ok {
 		t.Fatalf("%s: root=%T want *optimizer.Project", sql, plan)
 	}
-	idx, ok := proj.Child.(*optimizer.IndexScan)
-	if !ok {
-		t.Fatalf("%s: child=%T want *optimizer.IndexScan (SAOP probe)", sql, proj.Child)
+	// M0148-0001c3a4 (h): `SELECT id` is covered by the index, so PG's
+	// single path per index is index-only (check_index_only) — an
+	// IndexOnlyScan carrying the same SAOPKeys.
+	var saopKeys []optimizer.Expr
+	child := proj.Child
+	for {
+		// An index-only scan's narrowed output is re-based by a Project.
+		inner, isProj := child.(*optimizer.Project)
+		if !isProj {
+			break
+		}
+		child = inner.Child
 	}
-	if len(idx.SAOPKeys) != wantKeys {
-		t.Fatalf("%s: SAOPKeys=%d want %d", sql, len(idx.SAOPKeys), wantKeys)
+	switch idx := child.(type) {
+	case *optimizer.IndexScan:
+		saopKeys = idx.SAOPKeys
+	case *optimizer.IndexOnlyScan:
+		saopKeys = idx.SAOPKeys
+	default:
+		t.Fatalf("%s: child=%T want an IndexScan or IndexOnlyScan SAOP probe", sql, child)
+	}
+	if len(saopKeys) != wantKeys {
+		t.Fatalf("%s: SAOPKeys=%d want %d", sql, len(saopKeys), wantKeys)
 	}
 	op, err := Build(plan)
 	if err != nil {

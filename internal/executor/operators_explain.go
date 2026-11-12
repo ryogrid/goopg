@@ -3893,6 +3893,12 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	if p == nil || p.Index == nil {
 		return ""
 	}
+	// M0148-0001c3a4 (h): the index-only ScalarArrayOp probe renders exactly
+	// as the index scan's (one renderer for the one probe shape).
+	if len(p.SAOPKeys) > 0 {
+		return formatIndexCondPrefixed(&optimizer.IndexScan{Table: p.Table, Index: p.Index, SAOPKeys: p.SAOPKeys,
+			LowKey: p.LowKey, HighKey: p.HighKey, LowOp: p.LowOp, HighOp: p.HighOp}, reg, prefix)
+	}
 	// M0146-0005bt: the index-only skip probe, rendered as the index scan's
 	// (formatIndexCond) — only the bound quals, each under its own column.
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {

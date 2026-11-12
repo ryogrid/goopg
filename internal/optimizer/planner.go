@@ -4026,6 +4026,9 @@ func rebaseNLIProbeKeys(inner Node, outerMap []int, seen map[*ColumnRef]bool) {
 		for _, e := range in.Keys {
 			rebaseExprRefsSeen(e, outerMap, seen)
 		}
+		for _, e := range in.SAOPKeys {
+			rebaseExprRefsSeen(e, outerMap, seen)
+		}
 		rebaseExprRefsSeen(in.LowKey, outerMap, seen)
 		rebaseExprRefsSeen(in.HighKey, outerMap, seen)
 	case *BitmapHeapScan:

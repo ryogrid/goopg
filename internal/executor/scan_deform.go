@@ -940,8 +940,9 @@ func deformNLIOuterKeyExprs(inner optimizer.Node) []optimizer.Expr {
 		out = append(out, in.Key, in.LowKey, in.HighKey)
 		return append(out, in.Keys...)
 	case *optimizer.IndexOnlyScan:
-		out := make([]optimizer.Expr, 0, len(in.Keys)+3)
+		out := make([]optimizer.Expr, 0, len(in.Keys)+len(in.SAOPKeys)+3)
 		out = append(out, in.Key, in.LowKey, in.HighKey)
+		out = append(out, in.SAOPKeys...)
 		return append(out, in.Keys...)
 	default:
 		return nil

@@ -334,11 +334,12 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexScanDir != ForwardScanDirection && !backward {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s", p.IndexScanDir))
 	}
-	if backward && (p.IndexSkipPrefix > 0 || (len(p.IndexClauses) > 0 && len(p.IndexClauses[0].saop) > 0)) {
+	if backward && (p.IndexSkipPrefix > 0 || (!p.IndexOnly && indexClausesHaveSAOP(p.IndexClauses))) {
 		// M0148-0001c3a3: the executor walks backward only the plain
 		// probe path (indexScanOp's nbtree.ReverseScanCursor, and
 		// indexOnlyScanOp's reversed materialisation); the producers
-		// emit no skip or ScalarArrayOp probe backward.
+		// emit no skip or plain ScalarArrayOp probe backward (an index-only
+		// one is reversed with the rest of its materialised rows).
 		panic(fmt.Sprintf("createPlan: backward PathIndexScan on %s with a skip or ScalarArrayOp probe", p.IndexInfo.Name))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
@@ -363,7 +364,42 @@ func createIndexScanPlan(p *Path) Node {
 		ioNullTestAfter := false
 		var ioExtraNullTests []ExtraIndexNullTest
 		var ioCondOrder []IndexCondItem
-		for i, c := range p.IndexClauses {
+		// M0148-0001c3a4 (h): a leading-column ScalarArrayOp, optionally
+		// bounded on the second column — IndexOnlyScan.SAOPKeys.
+		var ioSAOP []Expr
+		loopClauses := p.IndexClauses
+		if indexClausesHaveSAOP(p.IndexClauses) {
+			c0 := p.IndexClauses[0]
+			if len(c0.saop) == 0 || c0.indexCol != 0 || c0.local == nil || p.RequiredOuter != 0 || p.IndexSkipPrefix != 0 {
+				panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s must be one leading-column array on an unparameterised scan", p.IndexInfo.Name))
+			}
+			ioSAOP = c0.saop
+			ioDrop[c0.local] = true
+			for i, r := range p.IndexClauses[1:] {
+				if r.indexCol != 1 || r.key == nil || len(r.saop) > 0 || r.nullTest != IndexNullTestNone {
+					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
+				}
+				switch r.op {
+				case parser.OpGt, parser.OpGe:
+					if ioLow != nil {
+						panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s carries two lower bounds", p.IndexInfo.Name))
+					}
+					ioLow, ioLowOp = r.key, r.op
+				case parser.OpLt, parser.OpLe:
+					if ioHigh != nil {
+						panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s carries two upper bounds", p.IndexInfo.Name))
+					}
+					ioHigh, ioHighOp = r.key, r.op
+				default:
+					panic(fmt.Sprintf("createPlan: index-only SAOP PathIndexScan on %s: clause %d is not a range bound", p.IndexInfo.Name, i+1))
+				}
+				if r.local != nil {
+					ioDrop[r.local] = true
+				}
+			}
+			loopClauses = nil
+		}
+		for i, c := range loopClauses {
 			if ioRange && c.nullTest != IndexNullTestNone {
 				ioCondOrder = append(ioCondOrder, IndexCondNullTest)
 				// M0148-0001c3a: the leading column's NullTest index qual.
@@ -421,11 +457,11 @@ func createIndexScanPlan(p *Path) Node {
 			}
 		}
 		if p.IndexSkipPrefix < 0 || (p.IndexSkipPrefix > 0 && p.RequiredOuter == 0) ||
-			(!ioRange && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
+			(!ioRange && ioSAOP == nil && p.IndexSkipPrefix+len(p.IndexClauses) > len(p.IndexInfo.Columns)) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s skips %d columns then binds %d clauses",
 				p.IndexInfo.Name, p.IndexSkipPrefix, len(p.IndexClauses)))
 		}
-		if !ioRange && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
+		if !ioRange && ioSAOP == nil && len(p.IndexClauses) > len(p.IndexInfo.Columns) {
 			panic(fmt.Sprintf("createPlan: index-only PathIndexScan on %s binds %d clauses to a %d-column index",
 				p.IndexInfo.Name, len(p.IndexClauses), len(p.IndexInfo.Columns)))
 		}
@@ -464,6 +500,9 @@ func createIndexScanPlan(p *Path) Node {
 		// Key vs Keys as on the plain scan below; the executor pads a short
 		// prefix (operators_indexonly.go lookupKeys).
 		switch {
+		case ioSAOP != nil:
+			ios.SAOPKeys = append([]Expr(nil), ioSAOP...)
+			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 		case ioRange:
 			ios.LowKey, ios.LowOp, ios.HighKey, ios.HighOp = ioLow, ioLowOp, ioHigh, ioHighOp
 			ios.LeadingNullTest, ios.NullTestAfterBounds = ioNullTest, ioNullTestAfter
@@ -882,4 +921,15 @@ func indexClausesAllLocal(clauses []indexPathClause) bool {
 		}
 	}
 	return true
+}
+
+// indexClausesHaveSAOP reports whether any index clause is a ScalarArrayOp
+// (an array may follow an equality prefix, M0148-0001c3a4 (b)).
+func indexClausesHaveSAOP(clauses []indexPathClause) bool {
+	for _, c := range clauses {
+		if len(c.saop) > 0 {
+			return true
+		}
+	}
+	return false
 }

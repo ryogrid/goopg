@@ -1274,9 +1274,15 @@ type IndexOnlyScan struct {
 	// (one Expr per Index.Columns entry, in declared order). When set,
 	// takes priority over Key. Carries the M0054-0006 composite probe
 	// across IOS promotion so multi-column equality stays index-only.
-	Keys    []Expr
-	LowKey  Expr
-	HighKey Expr
+	Keys []Expr
+	// SAOPKeys mirrors IndexScan.SAOPKeys: a ScalarArrayOp probe on the
+	// LEADING column, one element per descent, with LowKey/HighKey (if set)
+	// bounding the second column (M0148-0001c3a4 (h)). Never set with
+	// Key/Keys/SkipPrefix. The elements descend sorted and de-duplicated
+	// (saopWindows, shared with indexScanOp).
+	SAOPKeys []Expr
+	LowKey   Expr
+	HighKey  Expr
 	// LowOp / HighOp mirror IndexScan's fields of the same name: the bound's
 	// strictness. `OpGt` (low) / `OpLt` (high) make that end of the range
 	// EXCLUSIVE; the zero value `OpUnknown` — what every producer other than

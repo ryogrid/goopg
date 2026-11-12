@@ -251,7 +251,27 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// value of the skipped key prefix, all materialised here as every
 	// other shape is.
 	var skip *btreeSkipEnum
+	// M0148-0001c3a4 (h): an index-only ScalarArrayOp probe — the same
+	// per-element windows as indexScanOp's (saopWindows: sorted,
+	// de-duplicated, bounds on the second column), each drained in order.
+	var saopWins []saopWindow
 	switch {
+	case len(o.plan.SAOPKeys) > 0:
+		if isHashIdx || o.plan.SkipPrefix > 0 || o.plan.Key != nil || len(o.plan.Keys) > 0 {
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf(
+				"indexOnlyScanOp: ScalarArrayOp probe on index %q carries an incompatible probe shape", o.plan.Index.Name)}
+		}
+		wins, err := ctx.saopWindows(saopProbeSpec{
+			table: o.plan.Table, index: o.plan.Index, elems: o.plan.SAOPKeys,
+			low: o.plan.LowKey, high: o.plan.HighKey, lowOp: o.plan.LowOp, highOp: o.plan.HighOp, pos: o.plan.Pos(),
+		}, tree, o.outerSlot)
+		if err != nil {
+			return err
+		}
+		if len(wins) == 0 {
+			return nil
+		}
+		saopWins = wins
 	case o.plan.SkipPrefix > 0:
 		sp := o.plan.SkipPrefix
 		if isHashIdx || len(o.plan.Keys) == 0 || o.plan.Key != nil || o.plan.LowKey != nil ||
@@ -471,7 +491,13 @@ func (o *indexOnlyScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if o.rangeBoundsSet {
 		loExcl, hiExcl = o.rangeLoExcl, o.rangeHiExcl
 	}
-	if skip != nil && skip.canWalk() {
+	if saopWins != nil {
+		for _, w := range saopWins {
+			if err := tree.RangeScanWithPosLeafFilter(w.lo, w.hi, w.loExcl, w.hiExcl, leafFilter, scanPosFn); err != nil {
+				return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+			}
+		}
+	} else if skip != nil && skip.canWalk() {
 		// M0145-0008af: the skip scan's leaf walk (btree_skip.go walkLeaf) —
 		// the index scan's sibling walks the same groups lazily.
 		for {
