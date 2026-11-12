@@ -12438,8 +12438,21 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Probe against PG: 12 statements identical except the pre-existing
       constant-fixed-pathkey Sort (M0148-0001c3a5 (d)).
     Movement: yes — regress create\_index 3137→3099
-  - Resume: (h) — index-only SAOP (pathindexonly.go indexOnlyLeafClauses +
-    indexOnlyScanOp per-element windows); then (a).
+  - 2026-11-12 (h) LANDED (2bb850c31): index-only ScalarArrayOp scans,
+    forward and backward (IndexOnlyScan.SAOPKeys over the shared
+    Context.saopWindows).
+    - Probe against PG: 7 statements identical (costs too), except the
+      pre-existing DISTINCT election (HashAggregate vs PG's Unique over an
+      ordered IOS, also for a range IOS).
+    Movement: yes — regress btree\_index 453→437, create\_index 3099→3063
+  - (i) new, from the (h) regress diff: an array behind a leading range
+    (`thousand < 2 AND tenthous IN (…)` → PG `((thousand < 2) AND
+    (tenthous = ANY (…)))`), a bound on the array's own column
+    (`unique1 IN (…) AND unique1 >= 42`), two arrays on one column, and
+    index-only SAOP behind an equality prefix (IndexOnlyScan has no
+    RangePrefix).
+  - Resume: (a) — inequality OR groups (`col < ANY`, group\_similar\_or\_args
+    non-equality groups); then (i).
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
