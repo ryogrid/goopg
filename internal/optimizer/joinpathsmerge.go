@@ -347,7 +347,7 @@ func addMergeJoinPath(s *searchCtx, joinrel *RelOptInfo, o, i *Path, outer, inne
 	// sort keys ARE the result's pathkeys. The arm that consumes an ordering it
 	// did not choose (P5.4c-ii-c) passes a different pair, which is why
 	// `tryMergeJoinPath` takes the two separately.
-	tryMergeJoinPath(joinrel, o, i, outer.Relids, inner.Relids, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, residual, mergeTuplesFor, scanSelFor, paramSrc)
+	tryMergeJoinPath(joinrel, o, i, outer.Relids, inner.Relids, cp, jt, innerUnique, outerKeys, outerKeys, innerKeys, mergeClauses, nil, residual, mergeTuplesFor, scanSelFor, paramSrc)
 }
 
 // buildJoinPathkeys is the ONE rule of `build_join_pathkeys` (pathkeys.c:1295)
@@ -402,7 +402,7 @@ func buildJoinPathkeysRule(jt parser.JoinType, outerKeys []PathKey) []PathKey {
 // `outerSortKeys` / `innerSortKeys` are PG's `outersortkeys` / `innersortkeys`
 // with PG's NIL convention: an empty list means "this side needs no sort". The
 // explicit re-check below (:1091-1097) makes passing them harmless either way.
-func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
+func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids RelSet, cp costParams, jt parser.JoinType, innerUnique bool, resultKeys, outerSortKeys, innerSortKeys []PathKey, mergeClauses []*restrictInfo, mergeDesc []bool, residual []*restrictInfo, mergeTuplesFor func([]*restrictInfo) float64, scanSelFor func([]*restrictInfo) mergeScanSel, paramSrc RelSet) {
 	if o == nil || i == nil {
 		return
 	}
@@ -494,6 +494,7 @@ func tryMergeJoinPath(joinrel *RelOptInfo, o, i *Path, outerRelids, innerRelids 
 		OuterRelids:   outerRelids,
 		InnerRelids:   innerRelids,
 		HashKeys:      mergeClauses,
+		MergeDesc:     mergeDesc,
 		Residual:      residual,
 		RequiredOuter: req,
 			// create_mergejoin_path (pathnode.c:2660). C-19a.

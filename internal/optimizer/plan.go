@@ -1450,6 +1450,10 @@ type Join struct {
 	// predicate lists the merge pairs first, so fillJoinHashKeys keeps this
 	// prefix and the rest stay residual — `Join Filter:` as in PG.
 	MergeKeyCount int
+	// MergeKeyDesc marks the merge keys (HashKeys[:MergeKeyCount]) compared
+	// descending; nil is all ascending. M0148-0001c3a3 slice 4 — PG's
+	// mergestrategies (BTGreaterStrategyNumber for a DESC merge).
+	MergeKeyDesc []bool
 	BuildLeft bool // hash join: build on left input instead of right
 	// ParallelHash marks PG's `parallel_hash = true` hash join
 	// (try_partial_hashjoin_path, joinpath.c:1290-1297): the build side is a

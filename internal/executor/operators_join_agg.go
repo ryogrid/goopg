@@ -205,6 +205,9 @@ type joinOp struct {
 	// strings: they order as plain text whatever the values look like
 	// (M0146-0053). Filled by compileMergeExprs.
 	mergeKeyText []bool
+	// mergeKeyDesc marks the merge keys compared descending
+	// (JoinExecKeys.Desc, M0148-0001c3a3 slice 4); nil is all ascending.
+	mergeKeyDesc []bool
 
 	// M0127-P4.1 (07 §2): the streaming merge join. Non-nil for the whole
 	// life of a JoinAlgoMerge Open, and the reason Next has a third arm:

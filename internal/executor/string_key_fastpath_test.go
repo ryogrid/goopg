@@ -49,7 +49,7 @@ func TestSortStringKeyFastPathMatchesCompareDatumTyped(t *testing.T) {
 					}
 					plain := k == text
 					wantPlain, _ := compareDatumPlain(a, b, 0, plain)
-					gotPlain, err := compareMergeKeys([]Datum{a}, []Datum{b}, 0, []bool{plain})
+					gotPlain, err := compareMergeKeys([]Datum{a}, []Datum{b}, 0, []bool{plain}, nil)
 					if err != nil || sign(gotPlain) != sign(wantPlain) {
 						t.Fatalf("%s: compareMergeKeys(%q, %q) = %d (%v), compareDatumPlain %d", k.Type.Name, as, bs, gotPlain, err, wantPlain)
 					}

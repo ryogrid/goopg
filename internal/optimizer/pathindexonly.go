@@ -430,6 +430,18 @@ func (s *searchCtx) addOneIndexOnlyPath(cat catalog.Catalog, rel *RelOptInfo, tb
 		}
 	}
 	addPath(rel, serial, "indexonly")
+	// M0148-0001c3a3 slice 4: build_index_paths step 5 for the index-only
+	// path — its backward twin when the reversed pathkeys are useful, at the
+	// same cost (cost_index is direction-blind). Only an ordered shape (a
+	// range probe or the full scan) carries pathkeys to reverse; no partial
+	// twin, as for the plain scan's.
+	if len(serial.Pathkeys) > 0 {
+		if bkeys := s.usefulBackwardIndexPathkeys(rel, idx, colExprs); len(bkeys) > 0 {
+			back := *serial
+			back.Pathkeys, back.IndexScanDir = bkeys, BackwardScanDirection
+			addPath(rel, &back, "indexonly.backward")
+		}
+	}
 	// C-19c: the partial twin, `create_index_path(..., index_only_scan,
 	// ..., partial_path = true)` — the same build_index_paths arm as the
 	// plain scan's; cost_index sizes it on index pages alone

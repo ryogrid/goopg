@@ -41,6 +41,10 @@ type JoinExecKeys struct {
 	// so the executor may use its fixed-width int64 encoding instead of
 	// per-column datumKey strings.
 	Int64Keys bool
+
+	// Desc marks the merge keys compared descending, aligned with Keys
+	// (ExecMergeKeyPlan only; nil is all ascending).
+	Desc []bool
 }
 
 // ExecHashKeyPlan derives the executor's key/residual split for this join.
@@ -160,6 +164,15 @@ func (n *Join) ExecMergeKeyPlan() JoinExecKeys {
 			// sorted on since M0003, and an exotic-typed lead key keeps
 			// its per-pair residual re-check exactly as today.
 			keys = append(keys, p)
+			// M0148-0001c3a3 slice 4: the key's merge direction.
+			if i < len(n.MergeKeyDesc) && n.MergeKeyDesc[i] {
+				if out.Desc == nil {
+					out.Desc = make([]bool, len(keys)-1, len(pairs))
+				}
+				out.Desc = append(out.Desc, true)
+			} else if out.Desc != nil {
+				out.Desc = append(out.Desc, false)
+			}
 		}
 		if mergeSafe {
 			safe = append(safe, p)

@@ -20,7 +20,11 @@ package optimizer
 //  6. the "strictly cheaper" rule stops the loop from emitting a shorter-keyed
 //     path that buys nothing.
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // orderedPathRel is a rel with a cheap unordered path AND a dearer ordered one,
 // which is the shape P5.4c-ii-b actually produces: an ordered index scan prices
@@ -283,14 +287,49 @@ func TestFindMergeClausesForOuterPathkeys_TakesThePrefixOnly(t *testing.T) {
 		equiClauseOn(a, b, 30, 31),
 	}, a)
 
-	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 30), groups, nil); len(got) != 2 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 30), groups, nil, parser.JoinInner); len(got) != 2 {
 		t.Fatalf("both ordering positions have clauses, want 2 matches, got %d", len(got))
 	}
-	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 99, 30), groups, nil); len(got) != 1 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(10, 99, 30), groups, nil, parser.JoinInner); len(got) != 1 {
 		t.Fatalf("the run must stop at the unserved position, got %d matches", len(got))
 	}
-	if got := findMergeClausesForOuterPathkeys(ascKeys(99, 10), groups, nil); len(got) != 0 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(99, 10), groups, nil, parser.JoinInner); len(got) != 0 {
 		t.Fatalf("an ordering whose FIRST key has no clause is unusable, got %d matches", len(got))
+	}
+}
+
+// TestFindMergeClausesForOuterPathkeys_Direction pins M0148-0001c3a3 slice 4:
+// a descending outer ordering serves the merge (each clause compares in its
+// pathkey's direction, mergeDescFor), but a NULLS FIRST one does not for a
+// join that emits NULL-keyed outer rows, which goopg's merge files last.
+func TestFindMergeClausesForOuterPathkeys_Direction(t *testing.T) {
+	a, b := relsetOf(0), relsetOf(1)
+	groups := mergeKeyGroups([]*restrictInfo{
+		equiClauseOn(a, b, 10, 11),
+		equiClauseOn(a, b, 30, 31),
+	}, a)
+	descNF := []PathKey{{Expr: col(10), SortAsc: false, NullsFirst: true}, {Expr: col(30), SortAsc: true}}
+	got := findMergeClausesForOuterPathkeys(descNF, groups, nil, parser.JoinInner)
+	if len(got) != 2 {
+		t.Fatalf("an inner join merges on a DESC NULLS FIRST outer: want 2 matches, got %d", len(got))
+	}
+	if d := mergeDescFor(got); len(d) != 2 || !d[0] || d[1] {
+		t.Fatalf("mergeDescFor = %v, want [true false]", d)
+	}
+	if d := mergeDescFor(findMergeClausesForOuterPathkeys(ascKeys(10, 30), groups, nil, parser.JoinInner)); d != nil {
+		t.Fatalf("an ascending match must file no directions, got %v", d)
+	}
+	for _, jt := range []parser.JoinType{parser.JoinLeft, parser.JoinAnti, parser.JoinFull} {
+		if got := findMergeClausesForOuterPathkeys(descNF, groups, nil, jt); len(got) != 0 {
+			t.Fatalf("%v: a NULLS FIRST outer whose NULL-keyed rows are emitted must not merge, got %d matches", jt, len(got))
+		}
+	}
+	descNL := []PathKey{{Expr: col(10), SortAsc: false, NullsFirst: false}}
+	if got := findMergeClausesForOuterPathkeys(descNL, groups, nil, parser.JoinLeft); len(got) != 1 {
+		t.Fatalf("a DESC NULLS LAST outer merges for a LEFT join, got %d matches", len(got))
+	}
+	if d := mergeDescPrefix([]bool{true, false}, 1); len(d) != 1 || !d[0] {
+		t.Fatalf("mergeDescPrefix = %v", d)
 	}
 }
 
@@ -365,17 +404,17 @@ func TestFindMergeClausesForOuterPathkeys_MatchesThroughTheOuterClass(t *testing
 	a, b := relsetOf(0), relsetOf(1)
 	groups := mergeKeyGroups([]*restrictInfo{equiClauseOn(a, b, 10, 11)}, a)
 	// The outer is ordered on column 12, a different member of column 10's class.
-	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, nil); len(got) != 0 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, nil, parser.JoinInner); len(got) != 0 {
 		t.Fatalf("without the outer's classes, column 12 serves no clause; got %d matches", len(got))
 	}
 	u := &pathkeyUsefulness{classMembers: []classMember{{expr: col(10), id: 1}, {expr: col(12), id: 1}}}
-	got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u)
+	got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u, parser.JoinInner)
 	if len(got) != 1 || !exprEqual(got[0].outerKey.Expr, col(12)) {
 		t.Fatalf("an outer ordered on a class member must serve the clause, keeping its own pathkey; got %+v", got)
 	}
 	// A member of a DIFFERENT class does not.
 	u2 := &pathkeyUsefulness{classMembers: []classMember{{expr: col(10), id: 1}, {expr: col(12), id: 2}}}
-	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u2); len(got) != 0 {
+	if got := findMergeClausesForOuterPathkeys(ascKeys(12), groups, u2, parser.JoinInner); len(got) != 0 {
 		t.Fatalf("a member of another class serves nothing; got %d matches", len(got))
 	}
 }

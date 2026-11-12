@@ -1,6 +1,6 @@
 # M0148\-0001c3a3 — Backward ordered index scans
 
-**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); slice 2 landed 2026\-11\-12 \(executor `IndexScan.Backward` \+ EXPLAIN label\); slice 3 landed 2026\-11\-12 \(planner backward paths\); Index Only Scan Backward open
+**Parent:** M0148\-0001c3a2 · **Status:** slice 1 landed 2026\-11\-12 \(nbtree reverse range cursor\); slice 2 landed 2026\-11\-12 \(executor `IndexScan.Backward` \+ EXPLAIN label\); slice 3 landed 2026\-11\-12 \(planner backward paths\); slice 4 landed 2026\-11\-12 \(Index Only Scan Backward, descending merge join\); residue open
 
 ## Problem
 
@@ -126,6 +126,60 @@ goopg could not produce one at any layer:
     Backward`.
   - sf025 99/99; fire\-set fires=none on sf025, sf1 and TPC\-H; acceptance
     24 MATCH.
+
+## Slice 4 — Index Only Scan Backward and the descending merge
+
+- **Index Only Scan Backward:** `addOneIndexOnlyPath` adds the backward
+  twin of an ordered index\-only path \(a range probe or the full scan\),
+  under the same `usefulBackwardIndexPathkeys` rule and at the same cost; no
+  partial twin. `createIndexScanPlan` sets `IndexOnlyScan.Backward`, and its
+  panic now covers only backward skip and SAOP probes.
+  - The executor needs nothing new: `indexOnlyScanOp` materialises its
+    range at Open in both directions, and `Backward` emits it reversed — the
+    order a backward leaf walk would deliver. A lazy reverse walk is a
+    performance item, not a parity one; the forward IOS is not lazy either.
+- **The descending merge join.** The first regress run of the backward IOS
+  crashed `join`: PG merges `x.thousand = y.thousand` over an
+  `Index Only Scan Backward` outer, and goopg's merge comparator was fixed
+  ascending, so `createMergeJoinPlan`'s result\-pathkey guard panicked.
+  - `Path.MergeDesc` is the per\-mergeclause direction, taken from the outer
+    pathkey that selected each clause's group \(`mergeDescFor`; a truncated
+    clause list keeps the prefix\). It is lowered as `Join.MergeKeyDesc`,
+    carried through `ExecMergeKeyPlan` as `JoinExecKeys.Desc`, and
+    `compareMergeKeys` negates a descending key — PG's MJCompare with a
+    BTGreaterStrategyNumber key. The run sort, the merge step and the group
+    boundary use that one comparator, so they agree.
+  - NULL\-keyed rows are still filed after every real key. For a DESC NULLS
+    FIRST ordering that is exact whenever no NULL\-keyed outer row is
+    emitted, so `findMergeClausesForOuterPathkeys` refuses a NULLS FIRST key
+    only for LEFT, ANTI and FULL joins \(`mergeNullsFirstDeliverable`\), and
+    `createMergeJoinPlan` keeps a panic for that case alone.
+    `absorbMergeSort` no longer refuses a descending sort key.
+- **right\_merge\_direction by equivalence class.** With the merge in place,
+  PG's `Merge Join` over two `Index Only Scan Backward` inputs still did not
+  appear: the inner rel had no backward path. PG matches the query pathkey
+  by equivalence class \(`pk_eclass`\), so `ORDER BY y.thousand DESC` makes
+  x.thousand's descending order useful through `x.thousand = y.thousand`.
+  goopg compared expressions only; `rightMergeDirectionKeyed` now falls back
+  to the query\-wide class \(`ecClassOf`\).
+- **Verification:**
+  - Probe against PG 18.3 \(5 statements: two IOS Backward, a GROUP BY over
+    a descending merge with Incremental Sort, two merges over two backward
+    IOS\): plans, costs and rows identical. The join width differs \(16 vs
+    12\), which is the known width\-accounting gap.
+  - `TestBackwardIndexOnlyAndDescendingMerge` pins four of PG's plans and
+    their rows. With the class match disabled it fails.
+  - `TestFindMergeClausesForOuterPathkeys_Direction` pins the direction
+    rule; `TestCreateMergeJoinPlanPanics` now pins the NULLS FIRST LEFT case
+    and the direction\-count check.
+  - Regress create\_index 3143→3137, join 17655→17626; no panic, no
+    spurious backward line. Missing PG `… Backward` lines 24→21.
+  - The rest are other gaps:
+    - btree\_index: row\-comparison index quals on `pg_proc`;
+    - create\_index: boolean index quals \(`b`, `b IS TRUE` → `b = true`\);
+    - inherit and partition\_join: backward paths of appendrel children.
+  - units, tpch\-spotcheck, sf025 99/99 \(shapes identical\), fire\-set
+    fires=none on sf025, sf1 and TPC\-H, acceptance 24 MATCH.
 
 ## Next slices
 

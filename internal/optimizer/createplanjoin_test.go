@@ -595,21 +595,27 @@ func TestCreateMergeJoinPlanPanics(t *testing.T) {
 			want: "propagates a parameter rather than binding it",
 		},
 		{
-			name: "descending result ordering",
+			// M0148-0001c3a3 slice 4: a descending result is delivered
+			// (Path.MergeDesc); NULLS FIRST is not for a join that emits
+			// NULL-keyed outer rows, which the operator files last.
+			name: "nulls-first result ordering on a left join",
 			path: func() *Path {
-				return cpjMergePath(cpjLeafPath(b), cpjLeafPath(a), []*restrictInfo{key}, nil,
-					[]PathKey{{Expr: col(2), SortAsc: false}})
+				p := cpjMergePath(cpjLeafPath(b), cpjLeafPath(a), []*restrictInfo{key}, nil,
+					[]PathKey{{Expr: col(2), SortAsc: false, NullsFirst: true}})
+				p.Jointype = parser.JoinLeft
+				p.MergeDesc = []bool{true}
+				return p
 			},
-			want: "result pathkey 0 is descending, nulls last",
+			want: "result pathkey 0 is descending, nulls first",
 		},
 		{
-			name: "nulls-first sort child",
+			name: "more merge directions than merge clauses",
 			path: func() *Path {
-				sorted := cpjSortOver(cpjLeafPath(b), 2)
-				sorted.Pathkeys[0].NullsFirst = true
-				return cpjMergePath(sorted, cpjLeafPath(a), []*restrictInfo{key}, nil, asc)
+				p := cpjMergePath(cpjLeafPath(b), cpjLeafPath(a), []*restrictInfo{key}, nil, asc)
+				p.MergeDesc = []bool{false, true}
+				return p
 			},
-			want: "outer sort key 0 is ascending, nulls first",
+			want: "carries 2 merge directions for 1 merge clauses",
 		},
 	}
 

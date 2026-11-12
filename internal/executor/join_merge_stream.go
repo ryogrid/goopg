@@ -323,7 +323,7 @@ func (s *mergeSortedSource) less(a, b mergeStreamRow) bool {
 	if a.nullKey {
 		return false
 	}
-	cmp, err := compareMergeKeys(a.keys, b.keys, s.o.plan.Pos(), s.o.mergeKeyText)
+	cmp, err := compareMergeKeys(a.keys, b.keys, s.o.plan.Pos(), s.o.mergeKeyText, s.o.mergeKeyDesc)
 	if err != nil {
 		if s.sortErr == nil {
 			s.sortErr = err
@@ -628,7 +628,7 @@ func (m *mergeJoinStream) stepMerge() (Row, bool, error) {
 		m.phase = mjPhaseTailLeftReal
 		return nil, false, nil
 	}
-	cmp, err := compareMergeKeys(m.lr.keys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText)
+	cmp, err := compareMergeKeys(m.lr.keys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText, m.o.mergeKeyDesc)
 	if err != nil {
 		return nil, false, err
 	}
@@ -676,7 +676,7 @@ func (m *mergeJoinStream) bufferGroup() error {
 		if !m.haveR || m.rr.nullKey {
 			break
 		}
-		cmp, err := compareMergeKeys(m.groupKeys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText)
+		cmp, err := compareMergeKeys(m.groupKeys, m.rr.keys, m.o.plan.Pos(), m.o.mergeKeyText, m.o.mergeKeyDesc)
 		if err != nil {
 			return err
 		}
@@ -812,7 +812,7 @@ func (m *mergeJoinStream) advanceOuterInGroup() error {
 		return err
 	}
 	if m.haveL && !m.lr.nullKey {
-		cmp, err := compareMergeKeys(m.lr.keys, m.groupKeys, m.o.plan.Pos(), m.o.mergeKeyText)
+		cmp, err := compareMergeKeys(m.lr.keys, m.groupKeys, m.o.plan.Pos(), m.o.mergeKeyText, m.o.mergeKeyDesc)
 		if err != nil {
 			return err
 		}

@@ -334,11 +334,12 @@ func createIndexScanPlan(p *Path) Node {
 	if p.IndexScanDir != ForwardScanDirection && !backward {
 		panic(fmt.Sprintf("createPlan: PathIndexScan with %s", p.IndexScanDir))
 	}
-	if backward && (p.IndexOnly || p.IndexSkipPrefix > 0 || (len(p.IndexClauses) > 0 && len(p.IndexClauses[0].saop) > 0)) {
+	if backward && (p.IndexSkipPrefix > 0 || (len(p.IndexClauses) > 0 && len(p.IndexClauses[0].saop) > 0)) {
 		// M0148-0001c3a3: the executor walks backward only the plain
-		// probe path (indexScanOp, nbtree.ReverseScanCursor); the
-		// producers emit nothing else backward.
-		panic(fmt.Sprintf("createPlan: backward PathIndexScan on %s with an index-only, skip or ScalarArrayOp probe", p.IndexInfo.Name))
+		// probe path (indexScanOp's nbtree.ReverseScanCursor, and
+		// indexOnlyScanOp's reversed materialisation); the producers
+		// emit no skip or ScalarArrayOp probe backward.
+		panic(fmt.Sprintf("createPlan: backward PathIndexScan on %s with a skip or ScalarArrayOp probe", p.IndexInfo.Name))
 	}
 	// M0134-0187: an index-only path emits only the columns its index covers,
 	// so it builds a different node with a NARROWER schema. It carries either
@@ -456,6 +457,7 @@ func createIndexScanPlan(p *Path) Node {
 			Index:                 p.IndexInfo,
 			Covered:               append([]catalog.Column(nil), p.IndexOnlyCovered...),
 			schema:                schema,
+			Backward:              backward,
 			PrivilegeCheckRole:    id.privilegeCheckRole,
 			PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 		}

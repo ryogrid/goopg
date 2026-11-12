@@ -204,3 +204,60 @@ func orderedRowStrings(t *testing.T, ctx *Context, q string) []string {
 		slot.Release()
 	}
 }
+
+// TestBackwardIndexOnlyAndDescendingMerge pins M0148-0001c3a3 slice 4
+// against PG 18.3 (same table, same statements, plans and rows identical):
+// an Index Only Scan Backward (build_index_paths step 5 for the index-only
+// path), and a merge join in the descending direction over backward inputs
+// — the merge compares in the outer pathkey's direction (Path.MergeDesc),
+// and the inner's backward path is useful because right_merge_direction
+// matches ORDER BY y.thousand DESC through the x.thousand = y.thousand class.
+func TestBackwardIndexOnlyAndDescendingMerge(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	runSQL(t, ctx, "CREATE TABLE s4 (thousand int NOT NULL, tenthous int NOT NULL, twothousand int NOT NULL, pad text)")
+	runSQL(t, ctx, "INSERT INTO s4 SELECT g%1000, g, g%2000, repeat('x', 40) FROM generate_series(0, 9999) g")
+	runSQL(t, ctx, "CREATE INDEX s4_tt ON s4 (thousand, tenthous)")
+	runSQL(t, ctx, "VACUUM s4")
+	runSQL(t, ctx, "ANALYZE s4")
+	merge := optimizer.DefaultPlannerSettings()
+	merge.EnableHashJoin, merge.EnableNestLoop, merge.EnableHashAgg = false, false, false
+	for _, c := range []struct {
+		q    string
+		ps   *optimizer.PlannerSettings
+		want []string
+		rows string
+	}{
+		{"SELECT thousand, tenthous FROM s4 WHERE thousand < 3 ORDER BY thousand DESC, tenthous DESC LIMIT 12", nil,
+			[]string{"Limit", "  ->  Index Only Scan Backward using s4_tt on s4", "        Index Cond: (thousand < 3)"},
+			"2|9002;2|8002;2|7002;2|6002;2|5002;2|4002;2|3002;2|2002;2|1002;2|2;1|9001;1|8001"},
+		{"SELECT thousand, tenthous FROM s4 ORDER BY thousand DESC, tenthous DESC LIMIT 4", nil,
+			[]string{"Limit", "  ->  Index Only Scan Backward using s4_tt on s4"},
+			"999|9999;999|8999;999|7999;999|6999"},
+		{"SELECT x.thousand, x.twothousand, count(*) FROM s4 x INNER JOIN s4 y ON x.thousand = y.thousand GROUP BY x.thousand, x.twothousand ORDER BY x.thousand DESC, x.twothousand LIMIT 5", &merge,
+			[]string{"Limit", "  ->  GroupAggregate", "        Group Key: x.thousand, x.twothousand", "        ->  Incremental Sort",
+				"              Sort Key: x.thousand DESC, x.twothousand", "              Presorted Key: x.thousand",
+				"              ->  Merge Join", "                    Merge Cond: (x.thousand = y.thousand)",
+				"                    ->  Index Scan Backward using s4_tt on s4 x", "                    ->  Materialize",
+				"                          ->  Index Only Scan Backward using s4_tt on s4 y"},
+			"999|999|50;999|1999|50;998|998|50;998|1998|50;997|997|50"},
+		{"SELECT y.thousand, x.thousand FROM s4 y JOIN s4 x ON x.thousand = y.thousand WHERE y.thousand < 2 ORDER BY y.thousand DESC LIMIT 6", &merge,
+			[]string{"Limit", "  ->  Merge Join", "        Merge Cond: (y.thousand = x.thousand)",
+				"        ->  Index Only Scan Backward using s4_tt on s4 y", "              Index Cond: (thousand < 2)",
+				"        ->  Index Only Scan Backward using s4_tt on s4 x"},
+			"1|1;1|1;1|1;1|1;1|1;1|1"},
+	} {
+		ps := c.ps
+		if ps == nil {
+			d := optimizer.DefaultPlannerSettings()
+			ps = &d
+		}
+		got := renderRows(runSQLWith(t, ctx, "EXPLAIN (COSTS OFF) "+c.q, *ps))
+		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("%s:\ngot:\n%s\nwant (PG 18.3):\n%s", c.q, strings.Join(got, "\n"), strings.Join(c.want, "\n"))
+		}
+		if rows := strings.Join(renderRows(runSQLWith(t, ctx, c.q, *ps)), ";"); rows != c.rows {
+			t.Errorf("%s: rows %s, want %s", c.q, rows, c.rows)
+		}
+	}
+}

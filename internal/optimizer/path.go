@@ -476,6 +476,12 @@ type Path struct {
 	// expressions and its residual predicate.
 	HashKeys []*restrictInfo
 	Residual []*restrictInfo
+	// MergeDesc marks, per HashKeys clause of a merge path, a descending
+	// merge — PG's per-mergeclause sort strategy (MergePath's
+	// path_mergeclauses with the outer pathkey's pk_cmptype). Nil is all
+	// ascending. M0148-0001c3a3 slice 4: an outer ordered DESC (a backward
+	// index scan, a DESC index) merges in its own direction.
+	MergeDesc []bool
 
 	// IndexInfo / IndexScanDir are `IndexPath.indexinfo` and
 	// `IndexPath.indexscandir` (pathnodes.h:1845/1849), the two facts

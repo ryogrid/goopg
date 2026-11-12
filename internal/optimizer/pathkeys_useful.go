@@ -565,6 +565,20 @@ func (u *pathkeyUsefulness) rightMergeDirectionKeyed(pk PathKey, pkk string, pok
 			return q.SortAsc == pk.SortAsc
 		}
 	}
+	// PG matches the query pathkey by equivalence class
+	// (pathkey->pk_eclass == query_pathkey->pk_eclass): an ordering on
+	// x.thousand meets ORDER BY y.thousand DESC once x.thousand = y.thousand
+	// joins them, wherever that join is — the class is query-wide, not the
+	// rel's (M0148-0001c3a3 slice 4: the inner of a descending merge).
+	if len(u.queryPathkeys) > 0 {
+		if pc := u.ecClassOf(pk.Expr); pc >= 0 {
+			for _, q := range u.queryPathkeys {
+				if u.ecClassOf(q.Expr) == pc {
+					return q.SortAsc == pk.SortAsc
+				}
+			}
+		}
+	}
 	return pk.SortAsc
 }
 

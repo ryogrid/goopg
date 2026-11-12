@@ -273,7 +273,7 @@ func TestCreateIndexScanPlanPanics(t *testing.T) {
 				p.IndexSkipPrefix = 1
 				return p
 			}(),
-			want: "index-only, skip or ScalarArrayOp",
+			want: "a skip or ScalarArrayOp probe",
 		},
 		// The dangerous one: empty means FULL SCAN, so building a
 		// parameterised path from it would turn a costed point probe into a
