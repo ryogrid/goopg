@@ -12430,8 +12430,16 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - (h) new: index-only SAOP (PG `Index Only Scan` with `= ANY` and a
     bound; goopg's IOS path and indexOnlyScanOp have no SAOP probe), and
     the bitmap SAOP carrier with second-column bounds.
-  - Resume: (b) — an equality prefix before SAOPKeys in the plain lowering
-    and the executor's multi-descent; then (h).
+  - 2026-11-12 (b) LANDED (91b3bd618): an array behind an equality prefix
+    on a plain Index Scan (IndexScan.RangePrefix + SAOPKeys; PG
+    `((thousand = 42) AND (tenthous = ANY (…)))`).
+    - restrictionSAOPOnColumn generalises the leading builder; bounds on
+      the column after the array; indexScanPredicate rebuilds the prefix.
+    - Probe against PG: 12 statements identical except the pre-existing
+      constant-fixed-pathkey Sort (M0148-0001c3a5 (d)).
+    Movement: yes — regress create\_index 3137→3099
+  - Resume: (h) — index-only SAOP (pathindexonly.go indexOnlyLeafClauses +
+    indexOnlyScanOp per-element windows); then (a).
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl
