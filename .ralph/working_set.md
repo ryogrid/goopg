@@ -1,36 +1,35 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #28: census IDENTICAL; M0148-0001c3a3 slice 3 landed 7f773aa4b)
+# Working Set — loop end 2026-11-12 (run-2 loop #29: census IDENTICAL; M0148-0001c3a3 slice 4 landed 537cf8603 — c3a3 CLOSED)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112n (label s9by, BASELINE_REV=dd744c89d) IDENTICAL ×3, committed.
-  - Code commit 7f773aa4b since (planner) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bz, BASELINE_REV=ee781b38c (capture head of routing-20261112n), as routing-20261112o.
-  - The fire-set already ran sf025 + sf1 + tpch: fires=none.
-- Task: M0148-0001c3a3 — backward ordered index scans. Slices 1 (AM), 2 (executor) and 3 (planner) LANDED; slice 4 (Index Only Scan Backward) next.
-- Files:
-  - optimizer/pathindexordered.go: backward twin + usefulBackwardIndexPathkeys.
-  - pathindexrestrict.go: backward twin (fwd var).
-  - createplanindex.go: Backward lowering + panic for unsupported shapes.
-  - planner.go: IOS promotion declines Backward.
-  - Tests: executor/index_scan_backward_test.go (+TestBackwardIndexPathsPlanned, orderedRowStrings); optimizer createplanindex_test.go and pathindexordered_test.go updated.
-  - Design: c3a3 doc slice 3; README row.
+- S9: DUE at loop start → routing-20261112o (label s9bz, BASELINE_REV=ee781b38c) IDENTICAL ×3, committed 7f049fb54.
+  - Code commit 537cf8603 since (planner + executor merge) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9ca, BASELINE_REV=e850227a6 (capture head of routing-20261112o), as routing-20261112p.
+  - The fire-set already ran sf025 + sf1 + tpch on 537cf8603's tree: fires=none.
+- Task: M0148-0001c3a3 — backward ordered index scans. Slice 4 LANDED, item CLOSED [x]; residue filed as M0148-0001c3a5.
+- Files (slice 4):
+  - optimizer/pathindexonly.go: IOS backward twin. createplanindex.go: IndexOnlyScan.Backward; panic now only skip/SAOP.
+  - joinpathsmergeouter.go: mergeDescFor / mergeDescPrefix / mergeNullsFirstDeliverable; findMergeClausesForOuterPathkeys takes jt.
+  - joinpathsmerge.go + joinpathsparallel.go: tryMergeJoinPath / tryPartialMergeJoinPath take mergeDesc → Path.MergeDesc.
+  - createplanjoin.go: Join.MergeKeyDesc; guards relaxed. join_exec_keys.go: JoinExecKeys.Desc.
+  - executor join_merge_key.go / join_merge_stream.go: compareMergeKeys(…, desc) negates.
+  - pathkeys_useful.go: rightMergeDirectionKeyed falls back to ecClassOf (query-wide EC).
+  - Tests: executor TestBackwardIndexOnlyAndDescendingMerge; optimizer TestFindMergeClausesForOuterPathkeys_Direction, TestCreateMergeJoinPlanPanics cases.
 - Findings:
-  - PG's pathkeys_useful_for_merging is direction-blind, so a merge clause yields both directions' paths (as goopg now does).
-  - PG keeps Sort+bitmap for `thousand = 42 ORDER BY thousand DESC, tenthous DESC`; goopg matches.
-- Next step: S9 census (DUE), then c3a3 slice 4 — IndexOnlyScan reverse walk.
-  - operators_indexonly.go: see how IOS iterates (cursor? RangeScanWithPos?) and its existing Backward = S6 max-rewrite materialised reverse (line ~503).
-  - Give IOS a ReverseScanCursor arm. Either repoint the max rewrite onto it, or keep a separate flag (MaterialisedReverse) and make Backward mean the reverse walk.
-  - Then a pathindexonly.go backward twin (indexPathOrdering backward=true + truncateUselessPathkeys) and lift the createplan panic for IndexOnly backward.
-  - Regress target: 15 `Index Only Scan Backward` lines in btree_index/create_index.
-- Top-residual: M0148 residues. Open children: c3a3, c3a4, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - The merge executor re-sorts both inputs itself, so before this slice a DESC-ordered outer could only panic at createplan. NULL-keyed rows are always last; that is exact for INNER/SEMI.
+  - PG's right_merge_direction matches by pk_eclass. goopg matched by expression, so the inner of a DESC merge never got a backward path. Found by a temporary addPath trace (removed).
+- Next step: S9 census (DUE), then the next M0148 child in file order: M0148-0001c3a4.
+  - Resume (c): leading-SAOP + range, routing each SAOP element through indexRangeBounds; then (b).
+  - c3a5 (the 21 Backward lines' real blockers) follows c3a4; its resume is (d) match_boolean_index_clause.
+- Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112n done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112o done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a3.
 - Gates run (all PASS):
-  - census s9by: IDENTICAL ×3.
-  - regress A/B over 22 suites: btree_index -42, create_index -16.
-  - units (second run; the first failed 2 tests pinning the old behaviour → updated).
+  - census s9bz: IDENTICAL ×3.
+  - regress A/B over 22 suites: create_index -6, join -29; no panic; Backward lines missing 24→21.
+  - units (second run; the first failed 3 tests pinning the old panics → updated).
   - tpch-spotcheck.
   - sf025: 99/99.
-  - fire-set c3a3cfs: sf025 + sf1 + tpch fires=none.
+  - fire-set c3a3dfs: sf025 + sf1 + tpch fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
-- In-flight: none.
+- In-flight: none. tmp/c3a2-data is a throwaway goopg probe dir (stopped).

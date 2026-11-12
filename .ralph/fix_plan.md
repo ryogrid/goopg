@@ -12306,7 +12306,7 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - CLOSED 2026-11-12. Items (1)(2)(3)(5)(6) landed in 8 slices; item (4)
     is split to M0148-0001c3a3; the residue is filed as M0148-0001c3a4.
   Movement: yes — regress create\_index 3286→3159, join 17792→17655 over slices 1-8
-- [ ] **M0148-0001c3a3 — Backward ordered index scans (`Index Scan
+- [x] **M0148-0001c3a3 — Backward ordered index scans (`Index Scan
   Backward`, `Index Only Scan Backward`)**.
   Kind: impl
   Parent: M0148-0001c3a2
@@ -12381,6 +12381,19 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     reconcile with the S6 max-rewrite Backward) + pathindexonly.go
     backward twin. Then parameterized backward paths (pathparamindex.go).
   Movement: yes — regress btree\_index 499→457, create\_index 3159→3143
+  - 2026-11-12 slice 4 LANDED (537cf8603) — CLOSED.
+    - Index Only Scan Backward: backward twin in addOneIndexOnlyPath;
+      IndexOnlyScan.Backward's reversed materialisation is the backward
+      order.
+    - Descending merge join: Path.MergeDesc → Join.MergeKeyDesc →
+      JoinExecKeys.Desc, and compareMergeKeys negates a DESC key. A
+      NULLS FIRST outer key is refused only for LEFT/ANTI/FULL.
+    - right\_merge\_direction matches the query pathkey by equivalence
+      class, so the inner of a descending merge gets its backward path.
+    - Probe against PG: 5 statements, plans, costs and rows identical.
+  - The 21 PG `… Backward` lines left are other features, filed as
+    M0148-0001c3a5.
+  Movement: yes — regress create\_index 3143→3137, join 17655→17626
 - [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
   behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
   useful\_predicate, join OR bitmap paths, bitmap node cost line**.
@@ -12403,6 +12416,31 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     and width 84, where PG prints 0.00 and 0.
   - Resume: (c), routing each SAOP element through indexRangeBounds, then
     (b).
+- [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
+  `… Backward` regress lines**.
+  Kind: impl
+  Parent: M0148-0001c3a3
+  Backward scans themselves are done (c3a3). Each line below is missing
+  because another feature is missing; the forward plan is wrong too.
+  Ledgered 2026-11-12 (.ralph/deferral\_ledger.md, M0148-0001c3a3 slice 4
+  row):
+  - (a) inherit, 9 lines: the partition-ordered plain `Append`
+    (generate\_orderedappend\_paths with partitions\_are\_ordered) over
+    child index scans in either direction, including an expression index
+    (`mcrparted (a, abs(b), c)`); and min/max over partitions
+    (`parted_minmax`: per-child `Limit` + `Index Only Scan [Backward]`).
+  - (b) partition\_join, 4 lines: fractional partitionwise join — a Merge
+    Append of per-partition `Nested Loop Left Join`s over `Index Only Scan
+    [Backward]` under a LIMIT (`fract_t`).
+  - (c) btree\_index, 5 lines: row-comparison index quals
+    (`(proname, pronamespace) > ('abs', 0)` → `Index Cond: (ROW(...) >
+    ROW(...))`) on `pg_proc`.
+  - (d) create\_index, 3 lines: boolean index quals (`WHERE b`, `b IS
+    TRUE`, `b IS FALSE` → `Index Cond: (b = true)`,
+    match\_boolean\_index\_clause) and equality-prefix pathkeys
+    (`b = true ORDER BY i`).
+  - Resume: (d) — match\_boolean\_index\_clause in the restriction
+    producer, then the prefix pathkeys; then (a).
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
