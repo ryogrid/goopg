@@ -3825,14 +3825,14 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 				if p.LowOp == parser.OpGt {
 					op = ">"
 				}
-				cond += ") AND (" + col + " " + op + " " + formatIndexCondKeyTyped(p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
+				cond += ") AND (" + indexCondClause(col, op, p.LowKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
 			}
 			if p.HighKey != nil {
 				op := "<="
 				if p.HighOp == parser.OpLt {
 					op = "<"
 				}
-				cond += ") AND (" + col + " " + op + " " + formatIndexCondKeyTyped(p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
+				cond += ") AND (" + indexCondClause(col, op, p.HighKey, reg, indexKeyColumnType(p.Table, p.Index, 1))
 			}
 			// Each clause carries its own parens inside the AND list
 			// (make_ands_explicit), as the comment above shows.
@@ -3855,7 +3855,7 @@ func formatIndexCondPrefixed(p *optimizer.IndexScan, reg *subPlanReg, prefix str
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
+			parts[i] = indexCondClause(prefix+p.Index.Columns[s+i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
 		}
 		return indexCondAndText(parts)
 	}
@@ -3887,7 +3887,7 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 	if s := p.SkipPrefix; s > 0 && len(p.Keys) > 0 && s+len(p.Keys) <= len(p.Index.Columns) {
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = prefix + p.Index.Columns[s+i] + " = " + formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
+			parts[i] = indexCondClause(prefix+p.Index.Columns[s+i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, s+i))
 		}
 		return indexCondAndText(parts)
 	}
@@ -3895,6 +3895,23 @@ func formatIndexOnlyCondPrefixed(p *optimizer.IndexOnlyScan, reg *subPlanReg, pr
 		return formatNullTestIndexCond(p.Table, p.Index, p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder)
 	}
 	return formatIndexCondPartsPrefixed(p.Table, p.Index, p.Keys, p.Key, p.LowKey, p.HighKey, p.LowOp, p.HighOp, reg, prefix, p.IndexCondOrder...)
+}
+
+// indexCondClause renders one index clause `col op key`. A literal key is
+// printed as the Const PG's operator lookup makes of it (formatIndexCondKeyTyped);
+// when that operator belongs to another type — varchar's comparisons are
+// text's (texteq, via a binary-compatible RelabelType) — the column side
+// carries the relabel too: `((v)::text = 'v42'::text)` (M0148-0001c3a2).
+// A non-literal key keeps the plain rendering, its own type unknown here.
+func indexCondClause(col, op string, k optimizer.Expr, reg *subPlanReg, t *catalog.Type) string {
+	if t != nil && !t.IsArray {
+		if lit, ok := coercibleLiteral(k); ok {
+			if otherCast, text, ok := coerceLiteralText(lit, *t); ok && otherCast != "" {
+				return "(" + col + ")::" + otherCast + " " + op + " " + text
+			}
+		}
+	}
+	return col + " " + op + " " + formatIndexCondKeyTyped(k, reg, t)
 }
 
 // formatPrefixRangeIndexCond renders an equality prefix followed by bounds
@@ -3907,7 +3924,7 @@ func formatPrefixRangeIndexCond(tbl *catalog.Table, index *catalog.Index, prefix
 	np := len(prefixKeys)
 	parts := make([]string, 0, np+2)
 	for i, k := range prefixKeys {
-		parts = append(parts, prefix+index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(tbl, index, i)))
+		parts = append(parts, indexCondClause(prefix+index.Columns[i], "=", k, reg, indexKeyColumnType(tbl, index, i)))
 	}
 	// M0148-0001c3a slice 3 / c3a2: the range column's bounds and NullTests.
 	parts = append(parts, rangeColumnCondParts(tbl, index, np, prefix+index.Columns[np], order,
@@ -3926,7 +3943,7 @@ func formatBitmapSAOPIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg, pr
 	}
 	parts := make([]string, 0, np+1)
 	for i, k := range p.Keys {
-		parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+		parts = append(parts, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
 	}
 	col := prefix + p.Index.Columns[np]
 	elems := make([]string, 0, len(p.SAOPKeys))
@@ -3958,7 +3975,7 @@ func formatBitmapNullTestIndexCond(p *optimizer.BitmapIndexScan, reg *subPlanReg
 	}
 	parts := make([]string, 0, np+1)
 	for i, k := range p.Keys {
-		parts = append(parts, prefix+p.Index.Columns[i]+" = "+formatIndexCondKeyTyped(k, reg, indexKeyColumnType(p.Table, p.Index, i)))
+		parts = append(parts, indexCondClause(prefix+p.Index.Columns[i], "=", k, reg, indexKeyColumnType(p.Table, p.Index, i)))
 	}
 	before, after := nullTestIndexCondTexts(prefix+p.Index.Columns[np], p.LeadingNullTest, p.NullTestAfterBounds, p.ExtraNullTests)
 	return indexCondAndText(append(append(parts, before...), after...))
@@ -3990,14 +4007,14 @@ func rangeColumnCondParts(tbl *catalog.Table, index *catalog.Index, colPos int, 
 		if lowOp == parser.OpGt {
 			op = ">"
 		}
-		low = col + " " + op + " " + formatIndexCondKeyTyped(lowKey, reg, indexKeyColumnType(tbl, index, colPos))
+		low = indexCondClause(col, op, lowKey, reg, indexKeyColumnType(tbl, index, colPos))
 	}
 	if highKey != nil {
 		op := "<="
 		if highOp == parser.OpLt {
 			op = "<"
 		}
-		high = col + " " + op + " " + formatIndexCondKeyTyped(highKey, reg, indexKeyColumnType(tbl, index, colPos))
+		high = indexCondClause(col, op, highKey, reg, indexKeyColumnType(tbl, index, colPos))
 	}
 	if len(order) == 0 {
 		before, after := nullTestIndexCondTexts(col, lead, leadAfter, extras)
@@ -4247,17 +4264,17 @@ func formatIndexCondPartsPrefixed(tbl *catalog.Table, index *catalog.Index, keys
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {
-			return wrapParen(cols[0] + " = " + formatIndexCondKeyTyped(p.Keys[0], reg, indexKeyColumnType(tbl, index, 0)))
+			return wrapParen(indexCondClause(cols[0], "=", p.Keys[0], reg, indexKeyColumnType(tbl, index, 0)))
 		}
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = cols[i] + " = " + formatIndexCondKeyTyped(k, reg, indexKeyColumnType(tbl, index, i))
+			parts[i] = indexCondClause(cols[i], "=", k, reg, indexKeyColumnType(tbl, index, i))
 		}
 		return indexCondAndText(parts)
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
-		return wrapParen(cols[0] + " = " + formatIndexCondKeyTyped(p.Key, reg, indexKeyColumnType(tbl, index, 0)))
+		return wrapParen(indexCondClause(cols[0], "=", p.Key, reg, indexKeyColumnType(tbl, index, 0)))
 	}
 	// Range scan, its bounds in restriction-list order (M0148-0001c3a2).
 	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {

@@ -66,8 +66,8 @@ func TestLiteralPrintsAsCoercedConst(t *testing.T) {
 func TestIndexCondLiteralPrintsAsCoercedConst(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	t.Cleanup(cleanup)
-	runSQL(t, ctx, "CREATE TABLE li (a int, c char(5), d text, e numeric, n name, g date)")
-	for _, col := range []string{"a", "c", "d", "e", "n", "g"} {
+	runSQL(t, ctx, "CREATE TABLE li (a int, c char(5), d text, e numeric, n name, g date, v varchar(20))")
+	for _, col := range []string{"a", "c", "d", "e", "n", "g", "v"} {
 		runSQL(t, ctx, "CREATE INDEX li_"+col+" ON li ("+col+")")
 	}
 	ps := optimizer.DefaultPlannerSettings()
@@ -80,6 +80,11 @@ func TestIndexCondLiteralPrintsAsCoercedConst(t *testing.T) {
 		{"e = 5", "Index Cond: (e = '5'::numeric)"},
 		{"n = 'TVAAAA'", "Index Cond: (n = 'TVAAAA'::name)"},
 		{"g >= '2002-5-01'", "Index Cond: (g >= '2002-05-01'::date)"},
+		// M0148-0001c3a2: varchar compares with text's operators, so PG
+		// relabels the column too.
+		{"v = 'v42'", "Index Cond: ((v)::text = 'v42'::text)"},
+		{"v = 'v42'::varchar", "Index Cond: ((v)::text = 'v42'::text)"},
+		{"v < 'v1000' AND v > 'v0'", "Index Cond: (((v)::text < 'v1000'::text) AND ((v)::text > 'v0'::text))"},
 	} {
 		q := "SELECT * FROM li WHERE " + c.where
 		var lines []string

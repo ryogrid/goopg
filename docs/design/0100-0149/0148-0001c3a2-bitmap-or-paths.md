@@ -1,6 +1,6 @@
 # M0148\-0001c3a2 — BitmapOr paths over OR restriction clauses
 
-**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); slice 6 landed 2026\-11\-12 \(duplicate and contradictory NullTests\); slice 7 landed 2026\-11\-12 \(Index Cond in restriction\-list order\); item \(4\) backward scans split to M0148\-0001c3a3; item \(6\) stays open
+**Parent:** M0148\-0001c3a1 · **Status:** slice 1 landed 2026\-11\-12 \(BitmapOr producer \+ parallel lossy page fix\); slice 2 landed 2026\-11\-12 \(bitmap ScalarArrayOp carrier, PG 18 OR\-arm grouping, predtest port\); slice 3 landed 2026\-11\-12 \(plain\-path OR→SAOP, qual NULL arms\); slice 4 landed 2026\-11\-12 \(choose\_bitmap\_and port, BitmapAnd costing fixes\); slice 5 landed 2026\-11\-12 \(exact range bounds behind an equality prefix, plain and bitmap\); slice 6 landed 2026\-11\-12 \(duplicate and contradictory NullTests\); slice 7 landed 2026\-11\-12 \(Index Cond in restriction\-list order\); slice 8 landed 2026\-11\-12 \(varchar Index Cond relabel\); CLOSED 2026\-11\-12 — item \(4\) backward scans in M0148\-0001c3a3, the residue in M0148\-0001c3a4
 
 ## Problem
 
@@ -353,7 +353,30 @@ repeated entries, which only the planner's endpoint probe can accept.
 Materializing a forward range and reversing it would read whole ranges
 under `ORDER BY … DESC LIMIT`.
 
-## Not covered \(ledgered, M0148\-0001c3a2 stays open\)
+## Slice 8 — varchar keys \(c3a2 item 6\)
+
+- **PG behaviour:** varchar has no comparison operators of its own. Its
+  `=`/`<` are text's, reached through a binary\-compatible RelabelType, so
+  PG prints the column relabelled and the literal as a text Const:
+  `Index Cond: ((v)::text = 'v42'::text)`, `'v42'::varchar` included.
+- **The fix:** `coerceLiteralText` already returns that, as `otherCast =
+  "text"`, but the Index Cond formatter discarded any result carrying an
+  `otherCast`. `indexCondClause` now renders every Index Cond `col op key`
+  with the relabel on the column side.
+- **Scope:** literal keys only. A non\-literal key's own type is not known
+  at the renderer.
+- **Verification:**
+  - Probe against PG 18.3: varchar `=`, a range, and a varchar\-cast
+    literal now match PG. IN and same\-column ORs already matched, as did
+    `char(n)` and `text`.
+  - LIKE prefix differs only because of collation. The scratch PG's
+    database collation is `C.UTF\-8`, where PG makes no btree prefix
+    match; goopg's database is `C`.
+  - `TestIndexCondLiteralPrintsAsCoercedConst` gained three varchar cases.
+  - Regress unchanged; sf025 99/99; fire\-set fires=none on sf025, sf1 and
+    TPC\-H; acceptance 24 MATCH.
+
+## Not covered \(ledgered; open residue in M0148\-0001c3a4\)
 
 - **Inequality groups:** `col < ANY (…)` and the like. PG matches the group
   as one SAOP; goopg declines the whole OR, because its probe is
