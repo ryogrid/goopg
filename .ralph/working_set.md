@@ -1,34 +1,36 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #27: census IDENTICAL; M0148-0001c3a3 slice 2 landed c41356575)
+# Working Set — loop end 2026-11-12 (run-2 loop #28: census IDENTICAL; M0148-0001c3a3 slice 3 landed 7f773aa4b)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112m (label s9bx, BASELINE_REV=1d8f4598b) IDENTICAL ×3, committed.
-  - Code commit c41356575 since (plan.go, operators_index.go, operators_explain.go) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9by, BASELINE_REV=dd744c89d (capture head of routing-20261112m), as routing-20261112n.
-  - The fire-set A/B already showed fires=none (no producer emits Backward).
-- Task: M0148-0001c3a3 — backward ordered index scans. Slices 1 (AM) and 2 (executor) LANDED; slice 3 (planner) next.
+- S9: DUE at loop start → routing-20261112n (label s9by, BASELINE_REV=dd744c89d) IDENTICAL ×3, committed.
+  - Code commit 7f773aa4b since (planner) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bz, BASELINE_REV=ee781b38c (capture head of routing-20261112n), as routing-20261112o.
+  - The fire-set already ran sf025 + sf1 + tpch: fires=none.
+- Task: M0148-0001c3a3 — backward ordered index scans. Slices 1 (AM), 2 (executor) and 3 (planner) LANDED; slice 4 (Index Only Scan Backward) next.
 - Files:
-  - optimizer/plan.go: IndexScan.Backward.
-  - executor/operators_index.go: rcur field, reverse branch in Rescan, rcur loop in nextLeafBatch, SAOP/skip/parallel refusal.
-  - operators_explain.go: indexScanDirection label in both IndexScan arms.
-  - Test: executor/index_scan_backward_test.go TestIndexScanBackward.
-  - Design: docs/design/0100-0149/0148-0001c3a3-backward-index-scans.md slice 2; README row.
+  - optimizer/pathindexordered.go: backward twin + usefulBackwardIndexPathkeys.
+  - pathindexrestrict.go: backward twin (fwd var).
+  - createplanindex.go: Backward lowering + panic for unsupported shapes.
+  - planner.go: IOS promotion declines Backward.
+  - Tests: executor/index_scan_backward_test.go (+TestBackwardIndexPathsPlanned, orderedRowStrings); optimizer createplanindex_test.go and pathindexordered_test.go updated.
+  - Design: c3a3 doc slice 3; README row.
 - Findings:
-  - A comment line inside a struct field block splits gofmt's alignment section; a trailing comment keeps it in one block.
-- Next step: S9 census (DUE), then c3a3 slice 3 — planner.
-  - Read PG build_index_paths (indxpath.c: "index_pathkeys = build_index_pathkeys(root, index, BackwardScanDirection)" and has_useful_pathkeys / pathkeys_useful_for_ordering).
-  - Then goopg's ordered-index producer: grep pathindexordered.go / indexPathOrdering callers. Emit a backward path when the reversed index order is useful for the query pathkeys.
-  - createIndexScanPlan (createplanindex.go:333 panic) sets IndexScan.Backward.
-  - Then probe PG with `select * from t1 where unique1 < 10 order by unique1 desc` and the regress btree_index/create_index backward cases. Run fire-set on all three corpora (TPC ORDER BY DESC may move — check toward PG).
+  - PG's pathkeys_useful_for_merging is direction-blind, so a merge clause yields both directions' paths (as goopg now does).
+  - PG keeps Sort+bitmap for `thousand = 42 ORDER BY thousand DESC, tenthous DESC`; goopg matches.
+- Next step: S9 census (DUE), then c3a3 slice 4 — IndexOnlyScan reverse walk.
+  - operators_indexonly.go: see how IOS iterates (cursor? RangeScanWithPos?) and its existing Backward = S6 max-rewrite materialised reverse (line ~503).
+  - Give IOS a ReverseScanCursor arm. Either repoint the max rewrite onto it, or keep a separate flag (MaterialisedReverse) and make Backward mean the reverse walk.
+  - Then a pathindexonly.go backward twin (indexPathOrdering backward=true + truncateUselessPathkeys) and lift the createplan panic for IndexOnly backward.
+  - Regress target: 15 `Index Only Scan Backward` lines in btree_index/create_index.
 - Top-residual: M0148 residues. Open children: c3a3, c3a4, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112m done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Items 0-9: M0146-0014(channel; census routing-20261112n done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
   - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a3.
 - Gates run (all PASS):
-  - census s9bx: IDENTICAL ×3.
-  - units.
+  - census s9by: IDENTICAL ×3.
+  - regress A/B over 22 suites: btree_index -42, create_index -16.
+  - units (second run; the first failed 2 tests pinning the old behaviour → updated).
   - tpch-spotcheck.
   - sf025: 99/99.
-  - fire-set: fires=none.
-  - acceptance: 24 MATCH (all re-run after a gofmt-only restage).
-  - TestIndexScanBackward.
+  - fire-set c3a3cfs: sf025 + sf1 + tpch fires=none.
+  - acceptance: 24 MATCH.
   - pgbench smoke.
 - In-flight: none.

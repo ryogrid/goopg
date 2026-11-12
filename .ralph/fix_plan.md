@@ -12366,6 +12366,21 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - IndexOnlyScan.Backward (S6 max-rewrite meaning) needs a real reverse
       walk before IOS backward paths.
   Movement: none — no producer emits a backward path yet
+  - 2026-11-12 slice 3 LANDED (7f773aa4b): planner backward paths.
+    - build\_index\_paths step 5 via truncateUselessPathkeys in the
+      ordered and restriction producers.
+    - createIndexScanPlan sets Backward; backward IndexScans are not
+      promoted to IOS.
+    - Probe against PG: 6 statements identical.
+  - Remaining: 24 PG `… Backward` regress lines.
+    - 15 `Index Only Scan Backward`: the IOS reverse walk + IOS producer
+      backward twin.
+    - 9 `Index Scan Backward` in inherit / partition\_join / join contexts
+      (MergeAppend children, parameterized paths).
+  - Resume: slice 4 — IndexOnlyScan reverse walk (operators\_indexonly.go;
+    reconcile with the S6 max-rewrite Backward) + pathindexonly.go
+    backward twin. Then parameterized backward paths (pathparamindex.go).
+  Movement: yes — regress btree\_index 499→457, create\_index 3159→3143
 - [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
   behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
   useful\_predicate, join OR bitmap paths, bitmap node cost line**.
