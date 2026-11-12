@@ -309,6 +309,15 @@ func TestRestrictionSAOPIndexScanOnJointreePipeline(t *testing.T) {
 		t.Fatalf("%s: a second-column bound belongs exactly to the composite index (LowKey=%v)", scan.Index.Name, scan.LowKey)
 	}
 	f := findFilterOver(node, scan)
+	if scan.LowKey != nil {
+		// M0148-0001c3a4 (c): on the composite the bound is an exact index
+		// qual (each element's descent bounded by indexRangeBounds), so
+		// nothing is left to filter — PG prints no Filter either.
+		if f != nil {
+			t.Fatalf("i_flag > 1 is an exact index qual on %s; want no Filter, got %v", scan.Index.Name, f.Predicate)
+		}
+		return
+	}
 	if f == nil {
 		t.Fatal("i_flag > 1 is not an index qual; want it kept as a Filter over the scan")
 	}
@@ -402,7 +411,8 @@ func TestMatchBitmapIndexQualsIsGapless(t *testing.T) {
 
 // SAOP + range: `a IN (7, 8) AND b > 90` on (a, b) plans one IndexScan with
 // SAOPKeys on a and the bound on b (PG `Index Cond: ((a = ANY (...)) AND
-// (b > 90))`); the bound stays in the Filter as a recheck, the IN does not.
+// (b > 90))`). Since M0148-0001c3a4 (c) the bound is an exact index qual,
+// so no Filter remains, as in PG.
 func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
 
 	c := prTestCatalog(t, []string{"a", "b"}, true)
@@ -414,12 +424,8 @@ func TestRestrictionSAOPPlusRangeOnJointreePipeline(t *testing.T) {
 	if scan == nil || len(scan.SAOPKeys) != 2 || scan.LowKey == nil || scan.LowOp != parser.OpGt || scan.HighKey != nil {
 		t.Fatalf("want SAOPKeys=[7 8] + LowKey > 90, got %+v", scan)
 	}
-	f := findFilterOver(node, scan)
-	if f == nil {
-		t.Fatal("the bound must stay as a Filter recheck")
-	}
-	if _, isIn := f.Predicate.(*InExpr); isIn {
-		t.Fatal("the IN is applied by the descents; it must not stay in the Filter")
+	if f := findFilterOver(node, scan); f != nil {
+		t.Fatalf("both quals are index quals; want no Filter, got %v", f.Predicate)
 	}
 }
 

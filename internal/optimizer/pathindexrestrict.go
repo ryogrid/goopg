@@ -652,11 +652,12 @@ func (s *searchCtx) addOneRestrictionIndexPath(cat catalog.Catalog, rel *RelOptI
 		clauses = restrictionLeadingSAOP(cat, tbl, idx, conjuncts)
 		isSAOP = len(clauses) > 0
 		// A SAOP on the leading column may be followed by bounds on the
-		// second (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`). The bounds
-		// stay in the Filter as a recheck (restrictionRangeOnColumn records no
-		// `local` behind a leading column).
+		// second (PG `Index Cond: ((a = ANY (...)) AND (b > 1))`).
+		// M0148-0001c3a4 (c): exact index quals, as behind an equality
+		// prefix — the executor bounds each element's descent with
+		// indexRangeBounds (NULL stop, DESC swap), so no Filter recheck.
 		if isSAOP && len(idx.Columns) > 1 {
-			clauses = append(clauses, restrictionRangeOnColumn(cat, tbl, idx, 1, conjuncts)...)
+			clauses = append(clauses, restrictionRangeBehindPrefix(cat, tbl, idx, 1, conjuncts)...)
 		}
 	}
 	if len(clauses) == 0 {

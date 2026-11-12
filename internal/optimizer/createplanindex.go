@@ -753,10 +753,18 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 	}
 	var low, high Expr
 	var lowOp, highOp parser.OpCode
+	drop := map[Expr]bool{}
+	if c.local != nil {
+		drop[c.local] = true
+	}
 	for i, r := range p.IndexClauses[1:] {
-		// Bounds on the second column (restrictionRangeOnColumn(…, 1, …)):
-		// kept in the Filter, so they must carry no `local`.
-		if r.indexCol != 1 || r.key == nil || r.local != nil || len(r.saop) > 0 {
+		// Bounds on the second column (restrictionRangeBehindPrefix(…, 1,
+		// …)): exact index quals since M0148-0001c3a4 (c), so a bound's
+		// own conjunct leaves the Filter.
+		if r.local != nil {
+			drop[r.local] = true
+		}
+		if r.indexCol != 1 || r.key == nil || len(r.saop) > 0 {
 			panic(fmt.Sprintf("createPlan: SAOP PathIndexScan on %s: clause %d is not a second-column bound", p.IndexInfo.Name, i+1))
 		}
 		switch r.op {
@@ -791,8 +799,8 @@ func createSAOPIndexScanPlan(p *Path, id *scanIdentity, rewrap scanLeafRewrap) N
 		PrivilegeCheckRole:    id.privilegeCheckRole,
 		PrivilegeCheckRoleSet: id.privilegeCheckRoleSet,
 	}
-	if c.local != nil {
-		return rewrapLeafDropping(p.Rel.baseLeaf, is, map[Expr]bool{c.local: true})
+	if len(drop) > 0 {
+		return rewrapLeafDropping(p.Rel.baseLeaf, is, drop)
 	}
 	return rewrap(is)
 }
