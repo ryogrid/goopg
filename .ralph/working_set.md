@@ -1,36 +1,34 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #24: census IDENTICAL; M0148-0001c3a2 slice 7 landed 0b245f9c2; c3a3 filed)
+# Working Set — loop end 2026-11-12 (run-2 loop #25: census IDENTICAL; M0148-0001c3a2 CLOSED (slice 8 d60a1d93a); c3a4 residue filed)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112j (label s9bu, BASELINE_REV=cd361676f) IDENTICAL ×3, committed.
-  - Code commit 0b245f9c2 since → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9bv, BASELINE_REV=d43d6ddc6 (capture head of routing-20261112j), as routing-20261112k.
-  - The fire-set already ran all three corpora (TPC-H included): fires=none.
-- Task: M0148-0001c3a2 — c3a1 residue. Items (1)(2)(3)(5) done; (4) split to M0148-0001c3a3; (6) varchar keys open. Stays OPEN.
-  - Slice 7 LANDED: Index Cond in restriction-list order.
+- S9: DUE at loop start → routing-20261112k (label s9bv, BASELINE_REV=d43d6ddc6) IDENTICAL ×3, committed.
+  - Code commit d60a1d93a since → next loop's `scripts/s9-census-due.sh` should say DUE (operators_explain.go is a trigger). Capture with label s9bw, BASELINE_REV=6d786f583 (capture head of routing-20261112k), as routing-20261112l.
+  - The fire-set already ran sf025 + sf1 + tpch: fires=none.
+- Task: M0148-0001c3a2 — CLOSED this loop (TASKS_COMPLETED 1).
+  - Slice 8: varchar Index Cond relabel.
+  - Residue → M0148-0001c3a4 (filed after c3a3).
 - Files:
-  - optimizer/plan.go: IndexCondItem, IndexCondOrder on 3 nodes.
-  - planner.go: IOS copy.
-  - pathindexrestrict.go: clauseSource, conjunctPrecedes, range bound order.
-  - createplanindex.go / createplanbitmap.go: record order.
-  - executor/operators_explain.go: rangeColumnCondParts in every range renderer.
-  - Test: bitmap_or_paths_test.go TestIndexCondInRestrictionOrder.
+  - executor/operators_explain.go: indexCondClause at every Index Cond `col op key` site.
+  - Test: explain_coerced_literal_test.go (+3 varchar cases).
+  - Design: docs/design/0100-0149/0148-0001c3a2-bitmap-or-paths.md (slice 8; status CLOSED); README row closed.
 - Findings:
-  - Within one column baserestrictinfo order is the written order, and localized conjuncts keep their source pos (shallow clone), so no permutation needs threading.
-  - Item (6)'s once-cited regress hunk is really a name-vs-VALUES-param cast, not varchar.
-- Next step: S9 census (DUE), then c3a2 item (6).
-  - Probe PG with a varchar column + index: `create table v (s varchar(10)); create index on v(s); explain select * from v where s = 'x'`. PG: `Index Cond: ((s)::text = 'x'::text)`.
-  - If goopg prints `(s = 'x')`, render the RelabelType cast on the column side for varchar (and bpchar? PG: bpchar keeps `(c = 'x'::bpchar)`).
-  - If it already matches, close c3a2 (residue rows already ledgered) and move to c3a3.
-- Top-residual: M0148 residues. Open children: c3a2, c3a3 (new), c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
+  - coerceLiteralText already carried PG's varchar→text relabel as otherCast; the Index Cond path only dropped it.
+  - The LIKE-prefix diff vs the scratch PG is collation (scratch db C.UTF-8 vs goopg C), not a goopg bug; ledgered as the collation-aware LIKE-prefix gap.
+- Next step: S9 census (DUE), then the next M0148 child in file order: M0148-0001c3a3 backward ordered index scans.
+  - Start in internal/access/nbtree: a reverse range cursor (left-link walk; on a concurrent split re-find the position by moving right from the left sibling, PG _bt_walk_left / _bt_readpage backward).
+  - Then IndexScan.Backward + executor reverse batches, producers (indexPathOrdering backward=true), EXPLAIN " Backward".
+  - Read PG nbtsearch.c _bt_steppage/_bt_walk_left first.
+- Top-residual: M0148 residues. Open children: c3a3, c3a4, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112j done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a2.
+  - Items 0-9: M0146-0014(channel; census routing-20261112k done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a2 (closed) → c3a3 next.
 - Gates run (all PASS):
-  - census s9bu: IDENTICAL ×3.
+  - census s9bv: IDENTICAL ×3.
   - regress A/B over 22 suites: unchanged.
   - units.
   - tpch-spotcheck.
   - sf025: 99/99.
-  - fire-set c3a2gfs: sf025 + sf1 + tpch fires=none.
+  - fire-set c3a2hfs: sf025 + sf1 + tpch fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
 - In-flight: none.

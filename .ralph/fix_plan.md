@@ -12137,7 +12137,7 @@ Movement: none — regress line counts held (17 suites); probes vs PG identical 
     (a78d7dd43), `name` literal labels (8cc9a4e51) and Index Cond literal
     labels (4092290f9). Remaining items are separate producer features.
 Movement: yes — regress select 270→256, subselect 2477→2452, create\_index 3306→3286
-- [ ] **M0148-0001c3a2 — BitmapOr over OR clauses; bitmap range behind an
+- [x] **M0148-0001c3a2 — BitmapOr over OR clauses; bitmap range behind an
   equality prefix; duplicate NullTests; backward ordered scans; Index Cond
   WHERE order; varchar Index Cond keys**.
   Kind: impl
@@ -12300,6 +12300,12 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     Plus the c3a2 residue: SAOP+range, inequality OR groups, plain-path
     OR→SAOP behind a prefix, sub-ORs, useful\_predicate, join ORs.
   Movement: none — regress 22 suites unchanged
+  - 2026-11-12 slice 8 LANDED (d60a1d93a): item (6) — varchar Index Cond
+    relabels the column, `((v)::text = 'v42'::text)` (indexCondClause
+    applies coerceLiteralText's otherCast).
+  - CLOSED 2026-11-12. Items (1)(2)(3)(5)(6) landed in 8 slices; item (4)
+    is split to M0148-0001c3a3; the residue is filed as M0148-0001c3a4.
+  Movement: yes — regress create\_index 3286→3159, join 17792→17655 over slices 1-8
 - [ ] **M0148-0001c3a3 — Backward ordered index scans (`Index Scan
   Backward`, `Index Only Scan Backward`)**.
   Kind: impl
@@ -12327,6 +12333,28 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
     - Then IndexScan/IOS direction fields + executor reverse batches.
     - Then producers emitting BackwardScanDirection paths, and EXPLAIN
       ` Backward`.
+- [ ] **M0148-0001c3a4 — c3a2 residue: inequality OR groups, OR→SAOP
+  behind a prefix on plain paths, SAOP + range, sub-ORs in AND arms,
+  useful\_predicate, join OR bitmap paths, bitmap node cost line**.
+  Kind: impl
+  Parent: M0148-0001c3a2
+  Each item is ledgered with its resume point
+  (.ralph/deferral\_ledger.md, M0148-0001c3a2 rows, 2026-11-12):
+  - (a) `col < ANY (…)` groups: group\_similar\_or\_args'
+    non-equality groups. They are declined today and need a SAOP probe that
+    reduces to the extreme element.
+  - (b) match\_orclause\_to\_indexcol behind an equality prefix on plain
+    IndexScan paths: the plain SAOP carrier is leading-column only.
+  - (c) leading-SAOP + range: the plain SAOP descent's per-element bounds
+    lack the NULL stop and the DESC swap; the bitmap SAOP takes no bound.
+  - (d) the recursive generate\_bitmap\_or\_paths for sub-ORs inside AND
+    arms.
+  - (e) useful\_predicate arms (a partial index proved by the arm alone).
+  - (f) bitjoinpaths: BitmapOr over join OR clauses.
+  - (g) the Bitmap Index Scan / BitmapOr EXPLAIN cost line: startup 0.29
+    and width 84, where PG prints 0.00 and 0.
+  - Resume: (c), routing each SAOP element through indexRangeBounds, then
+    (b).
 - [x] **M0148-0001c3c — DROP VIEW / DROP INDEX / RENAME after a restart
   fail "does not exist"**.
   Kind: impl
