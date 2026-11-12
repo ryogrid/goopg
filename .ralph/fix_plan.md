@@ -12414,8 +12414,24 @@ Movement: yes — regress select 270→256, subselect 2477→2452, create\_index
   - (f) bitjoinpaths: BitmapOr over join OR clauses.
   - (g) the Bitmap Index Scan / BitmapOr EXPLAIN cost line: startup 0.29
     and width 84, where PG prints 0.00 and 0.
-  - Resume: (c), routing each SAOP element through indexRangeBounds, then
-    (b).
+  - 2026-11-12 (c) LANDED (ad771643c): a bound behind a leading SAOP is an
+    exact index qual.
+    - rescanSAOP bounds each element with indexRangeBounds (one-key
+      prefix: NULL stop, DESC swap, per-element exclusivity). The planner
+      files the bounds with restrictionRangeBehindPrefix, and
+      createSAOPIndexScanPlan drops them from the Filter.
+    - Pre-existing wrong-results bug fixed on the way: the elements
+      descended in IN-list order while the path claimed index order
+      (`IN (182, 183, 5) ORDER BY 1, 2 LIMIT 3` returned 182's rows). They
+      are now sorted and de-duplicated with the tree comparator
+      (\_bt\_sort\_array\_elements).
+    - Probe against PG: 13 statements identical.
+    Movement: yes — regress btree\_index 457→453
+  - (h) new: index-only SAOP (PG `Index Only Scan` with `= ANY` and a
+    bound; goopg's IOS path and indexOnlyScanOp have no SAOP probe), and
+    the bitmap SAOP carrier with second-column bounds.
+  - Resume: (b) — an equality prefix before SAOPKeys in the plain lowering
+    and the executor's multi-descent; then (h).
 - [ ] **M0148-0001c3a5 — c3a3 residue: the plans that hold the last 21
   `… Backward` regress lines**.
   Kind: impl

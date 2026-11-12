@@ -1,35 +1,33 @@
-# Working Set — loop end 2026-11-12 (run-2 loop #29: census IDENTICAL; M0148-0001c3a3 slice 4 landed 537cf8603 — c3a3 CLOSED)
+# Working Set — loop end 2026-11-12 (run-2 loop #30: census IDENTICAL; M0148-0001c3a4 item (c) landed ad771643c)
 
 - Anomaly: none (prev-loop check OK).
-- S9: DUE at loop start → routing-20261112o (label s9bz, BASELINE_REV=ee781b38c) IDENTICAL ×3, committed 7f049fb54.
-  - Code commit 537cf8603 since (planner + executor merge) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9ca, BASELINE_REV=e850227a6 (capture head of routing-20261112o), as routing-20261112p.
-  - The fire-set already ran sf025 + sf1 + tpch on 537cf8603's tree: fires=none.
-- Task: M0148-0001c3a3 — backward ordered index scans. Slice 4 LANDED, item CLOSED [x]; residue filed as M0148-0001c3a5.
-- Files (slice 4):
-  - optimizer/pathindexonly.go: IOS backward twin. createplanindex.go: IndexOnlyScan.Backward; panic now only skip/SAOP.
-  - joinpathsmergeouter.go: mergeDescFor / mergeDescPrefix / mergeNullsFirstDeliverable; findMergeClausesForOuterPathkeys takes jt.
-  - joinpathsmerge.go + joinpathsparallel.go: tryMergeJoinPath / tryPartialMergeJoinPath take mergeDesc → Path.MergeDesc.
-  - createplanjoin.go: Join.MergeKeyDesc; guards relaxed. join_exec_keys.go: JoinExecKeys.Desc.
-  - executor join_merge_key.go / join_merge_stream.go: compareMergeKeys(…, desc) negates.
-  - pathkeys_useful.go: rightMergeDirectionKeyed falls back to ecClassOf (query-wide EC).
-  - Tests: executor TestBackwardIndexOnlyAndDescendingMerge; optimizer TestFindMergeClausesForOuterPathkeys_Direction, TestCreateMergeJoinPlanPanics cases.
+- Nightly triage: AI-20261112-000028-001 (TestPort_RegressSuite pprof-port collision) is already filed and fixed: M-NIGHTLY-regress-pprof-port [x], b1928e91c. Nothing new filed.
+- S9: DUE at loop start → routing-20261112p (label s9ca, BASELINE_REV=e850227a6) IDENTICAL ×3, committed 3461d6558.
+  - Code commit ad771643c since (executor + planner SAOP) → next loop's `scripts/s9-census-due.sh` should say DUE. Capture with label s9cb, BASELINE_REV=f47409914 (capture head of routing-20261112p), as routing-20261112q.
+  - The fire-set already ran sf025 + sf1 + tpch on ad771643c's tree: fires=none.
+- Task: M0148-0001c3a4 — c3a2 residue. Item (c) LANDED (SAOP + range exact; elements in index order). Item stays open: (a), (b), (d)-(h).
+- Files:
+  - executor/operators_index.go rescanSAOP: elements are encoded, sorted (tree.CompareLowBound) and de-duplicated; bounded elements go through indexRangeBounds (prefix=[ke]); saopExcl carries per-element exclusivity.
+  - optimizer/pathindexrestrict.go: SAOP bounds via restrictionRangeBehindPrefix. createplanindex.go createSAOPIndexScanPlan: drops the bounds' conjuncts.
+  - Tests: executor/saop_range_bounds_test.go (new); optimizer pathindexrestrict_test.go (2 tests now expect no Filter).
+  - Design: docs/design/0100-0149/0148-0001c3a4-scalararrayop-index-residue.md (new) + README row.
 - Findings:
-  - The merge executor re-sorts both inputs itself, so before this slice a DESC-ordered outer could only panic at createplan. NULL-keyed rows are always last; that is exact for INNER/SEMI.
-  - PG's right_merge_direction matches by pk_eclass. goopg matched by expression, so the inner of a DESC merge never got a backward path. Found by a temporary addPath trace (removed).
-- Next step: S9 census (DUE), then the next M0148 child in file order: M0148-0001c3a4.
-  - Resume (c): leading-SAOP + range, routing each SAOP element through indexRangeBounds; then (b).
-  - c3a5 (the 21 Backward lines' real blockers) follows c3a4; its resume is (d) match_boolean_index_clause.
+  - A pre-existing wrong-results bug was fixed: SAOP descents ran in IN-list order under claimed index pathkeys (an ORDER BY … LIMIT over an elided Sort returned the wrong rows).
+  - PG uses an Index Only Scan for SAOP + bound; goopg's IOS has no SAOP probe → new sub-item (h).
+- Next step: S9 census (DUE), then M0148-0001c3a4 resume (b): an equality prefix before SAOPKeys.
+  - PG `((thousand = 42) AND (tenthous = ANY (…)))` on a plain Index Scan; createplanindex.go SAOP lowering plus executor rescanSAOP prefix parts; then restrictionLeadingSAOP → SAOP on column len(prefix).
+  - Then (h).
 - Top-residual: M0148 residues. Open children: c3a4, c3a5, c3b, g1, f3, e2, h1, i2, k1; then the M0148-0002 copy suite.
 - Skip-rationale (bypassed items 0-9; item 10 selected):
-  - Items 0-9: M0146-0014(channel; census routing-20261112o done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
-  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a3.
+  - Items 0-9: M0146-0014(channel; census routing-20261112p done this loop); M0146-0042(channel); M0146-0009(channel); M0146-0007(below-item-10); M0146-0010a(owner-held [!]); M0146-0035(owner-held [!]); M0140-0007(owner-held [!]); M0142-0005(owner-held [!]); M0142-0008a-3/0008c-1a/0008c-3d/0008c-4(blocked-on M0145-0003).
+  - Item 10: M-NIGHTLY open items are below-item-10 carve-outs or S2 awaiting owner placement (P0-E9..E16, E24, E25, E26). M0119 none; M0147-0000(channel); M0122-0009a/b/c/0010a(below-item-10). Then M0148 in file order → c3a4.
 - Gates run (all PASS):
-  - census s9bz: IDENTICAL ×3.
-  - regress A/B over 22 suites: create_index -6, join -29; no panic; Backward lines missing 24→21.
-  - units (second run; the first failed 3 tests pinning the old panics → updated).
+  - census s9ca: IDENTICAL ×3.
+  - regress A/B over 22 suites: btree_index -4; join +5 = the ledgered Hash Right Join flap; no panic.
+  - units (second run; the first failed 2 tests pinning the Filter recheck → updated).
   - tpch-spotcheck.
   - sf025: 99/99.
-  - fire-set c3a3dfs: sf025 + sf1 + tpch fires=none.
+  - fire-set c3a4cfs: sf025 + sf1 + tpch fires=none.
   - acceptance: 24 MATCH.
   - pgbench smoke.
-- In-flight: none. tmp/c3a2-data is a throwaway goopg probe dir (stopped).
+- In-flight: none. tmp/c3a2-data, tmp/c3a4h-data are stopped throwaway probe dirs.
